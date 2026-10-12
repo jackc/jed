@@ -97,7 +97,6 @@ test("VALUES body — errors / narrowings", () => {
     ["SELECT * FROM (VALUES (oops)) AS v", "42703"], // column ref (non-LATERAL)
     ["SELECT * FROM (VALUES (sum(1))) AS v", "42803"], // aggregate
     ["SELECT * FROM (VALUES ($1)) AS v", "42P18"], // bare $1, no type
-    ["SELECT * FROM (VALUES (1), (2) ORDER BY 1) AS v", "42601"], // trailing ORDER BY (deferred)
     ["SELECT * FROM (VALUES (1)) AS v(a, b)", "42P10"], // too many rename aliases
   ];
   for (const [sql, code] of cases) {

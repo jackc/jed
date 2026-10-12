@@ -43,7 +43,6 @@ import type {
   SelectItems,
   SeqOptions,
   SeqRestart,
-  SetOp,
   SetOpKind,
   Statement,
   SubscriptSpec,
@@ -333,6 +332,10 @@ class Parser {
   // none). A bare row is not a parenthesized base, so parsePostfix refuses `.field` on it
   // (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
   private bareRowEnd: number;
+  // Per token index, whether a PARENTHESIZED QUERY begins there (isQueryStartAtOffset, grammar.md
+  // §25). Precomputed once in one backward pass so every probe is O(1) — a long run of `(` costs
+  // linear time, not time per nesting level.
+  private parenQuery: boolean[];
 
   constructor(tokens: Token[]) {
     this.tokens = tokens;
@@ -340,6 +343,34 @@ class Parser {
     this.depth = 0;
     this.maxDepth = 0;
     this.bareRowEnd = 0;
+    this.parenQuery = [];
+    this.parenQuery = this.computeParenQuery();
+  }
+
+  // computeParenQuery builds the parenQuery table: the `(` at i begins a parenthesized query when
+  // what follows it is a query start (a SELECT, a WITH clause, or — recursively — another
+  // parenthesized query) AND its matching `)` is followed by a token that can only continue a query
+  // (isQueryFollowAtIndex). Computed back to front, so the recursion is a table lookup.
+  private computeParenQuery(): boolean[] {
+    const n = this.tokens.length;
+    const closeAt: number[] = new Array<number>(n).fill(n);
+    const open: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const kind = this.tokens[i].kind;
+      if (kind === "lparen") {
+        open.push(i);
+      } else if (kind === "rparen" && open.length > 0) {
+        closeAt[open.pop()!] = i;
+      }
+    }
+    const q: boolean[] = new Array<boolean>(n).fill(false);
+    for (let i = n - 1; i >= 0; i--) {
+      if (this.tokens[i].kind !== "lparen") continue;
+      const inner =
+        this.isSelectAtIndex(i + 1) || this.isWithClauseAtIndex(i + 1) || (i + 1 < n && q[i + 1]);
+      q[i] = inner && this.isQueryFollowAtIndex(closeAt[i] + 1);
+    }
+    return q;
   }
 
   // deepen descends one nesting level, enforcing MAX_EXPR_DEPTH (spec/design/cost.md §7). Call at
@@ -425,6 +456,8 @@ class Parser {
       case "rollback":
         return this.parseRollback();
       case "":
+        // A leading `(` can only begin a parenthesized query (grammar.md §25).
+        if (this.peek().kind === "lparen") return this.parseQueryExpr();
         throw engineError("syntax_error", "expected a SQL statement");
       default:
         throw engineError("syntax_error", `unexpected keyword '${this.peekKeyword()}'`);
@@ -694,7 +727,13 @@ class Parser {
     let lane = false;
     const seen = new Set<string>();
     let optionList = false;
-    if (this.peek().kind === "lparen") {
+    // A `(` opens the option list unless a parenthesized query follows (`EXPLAIN (SELECT 1)`,
+    // grammar.md §25): an option is a plain word, never `(`, SELECT, or a WITH clause.
+    const parenQuery =
+      this.peekKindAt(1) === "lparen" ||
+      this.peekKeywordAt(1) === "select" ||
+      this.isWithClauseAtOffset(1);
+    if (this.peek().kind === "lparen" && !parenQuery) {
       optionList = true;
       this.advance();
       for (;;) {
@@ -740,9 +779,9 @@ class Parser {
     return { kind: "explain", analyze, verbose, costs, lane, inner: this.parseExplainInner() };
   }
 
-  // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH) or a
-  // DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and a nested EXPLAIN have no
-  // query plan to render and are rejected 42601.
+  // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH / a
+  // parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and
+  // a nested EXPLAIN have no query plan to render and are rejected 42601.
   private parseExplainInner(): Statement {
     switch (this.peekKeyword()) {
       case "select":
@@ -756,6 +795,7 @@ class Parser {
       case "delete":
         return this.parseDelete();
       case "":
+        if (this.peek().kind === "lparen") return this.parseQueryExpr();
         throw engineError("syntax_error", "expected a statement after EXPLAIN");
       default:
         throw engineError("syntax_error", `EXPLAIN does not support '${this.peekKeyword()}'`);
@@ -2216,19 +2256,24 @@ class Parser {
   // applying to the whole result. A lone query (no set operator) folds the trailing clauses back
   // onto the single Select, leaving the plain-query path untouched; otherwise a SetOp is returned.
   private parseQueryExpr(): Statement {
-    return this.parseQueryExprNode();
+    const node = this.parseQueryExprNode();
+    if (node.kind === "withExpr") {
+      // A parenthesized `(WITH … query)` statement is the top-level WITH query itself (PostgreSQL:
+      // the parentheses add nothing — grammar.md §25).
+      return { kind: "with", ctes: node.ctes, body: node.body, recursive: node.recursive };
+    }
+    return node;
   }
 
   // parseQueryExprNode parses a top-level query_expr as a QueryExpr node — a set expression plus an
   // optional trailing ORDER BY / LIMIT / OFFSET folded onto it. The shared core of parseQueryExpr
   // (which returns it as a Statement) and a WITH clause's main body. Unlike parseSubquery it opens
   // no new nesting level — the body is at the statement top level.
-  private parseQueryExprNode(): Select | SetOp {
+  private parseQueryExprNode(): QueryExpr {
     const node = this.parseSetExpr();
     const orderBy = this.parseOrderBy(true);
     const { limit, offset } = this.parseLimitOffsetClauses();
-    // Both Select and SetOp carry orderBy/limit/offset; the spread keeps the `kind` discriminant.
-    return { ...node, orderBy, limit, offset };
+    return foldTrailing(node, orderBy, limit, offset);
   }
 
   // parseWithStatement parses `query_statement ::= with_clause? ( query_expr | insert | update |
@@ -2292,7 +2337,9 @@ class Parser {
     } else if (parenthesized) {
       return this.parseSubquery();
     } else {
-      return this.parseQueryExprNode();
+      const body = this.parseQueryExprNode();
+      rejectSecondWith(body);
+      return body;
     }
   }
 
@@ -2350,7 +2397,7 @@ class Parser {
     const node = this.parseSetExpr();
     const orderBy = this.parseOrderBy(true);
     const { limit, offset } = this.parseLimitOffsetClauses();
-    return { ...node, orderBy, limit, offset };
+    return foldTrailing(node, orderBy, limit, offset);
   }
 
   // parseWithQueryExpr parses a nested `WITH [RECURSIVE] cte (, cte)* query_expr` into a WithExpr
@@ -2374,6 +2421,7 @@ class Parser {
       break;
     }
     const body = this.parseSubqueryInner();
+    rejectSecondWith(body);
     return { kind: "withExpr", ctes, recursive, body };
   }
 
@@ -2390,10 +2438,47 @@ class Parser {
     return false;
   }
 
-  // isQueryStartAtOffset reports whether a query expression — a SELECT or a nested WITH clause
-  // (cte.md §7) — begins at this.pos + offset. The §26 leading-SELECT lookahead, extended with WITH.
+  // isQueryStartAtOffset reports whether a query expression — a SELECT, a nested WITH clause
+  // (cte.md §7), or a parenthesized query (grammar.md §25) — begins at this.pos + offset. The §26
+  // leading-SELECT lookahead, extended with WITH, and with a run of `(`s that ends at a SELECT/WITH
+  // where EVERY `(` in the run is closed by a `)` followed by a token that can only continue a
+  // query — UNION / INTERSECT / EXCEPT / ORDER / LIMIT / OFFSET or a further `)`. Thus
+  // `((SELECT 1) UNION SELECT 2)` and `((SELECT 1))` are subqueries but `((SELECT 1) + 1)` and
+  // `((SELECT 1), 2)` are expressions. Precomputed (computeParenQuery), so a long run of `(` can
+  // neither exhaust the stack nor cost time per probe; a §8 cross-core surface.
   private isQueryStartAtOffset(offset: number): boolean {
-    return this.peekKeywordAt(offset) === "select" || this.isWithClauseAtOffset(offset);
+    const i = this.pos + offset;
+    return this.isSelectAtIndex(i) || this.isWithClauseAtIndex(i) || this.parenQuery[i] === true;
+  }
+
+  // isSelectAtIndex reports whether a SELECT keyword sits at token index i.
+  private isSelectAtIndex(i: number): boolean {
+    const t = this.tokens[i];
+    return t !== undefined && t.kind === "word" && t.word === "select";
+  }
+
+  // isWithClauseAtIndex is isWithClauseAtOffset at an absolute token index.
+  private isWithClauseAtIndex(i: number): boolean {
+    return this.isWithClauseAtOffset(i - this.pos);
+  }
+
+  // isQueryFollowAtIndex reports whether the token at index i may follow a parenthesized query but
+  // never a parenthesized expression: a set operator, a trailing ORDER/LIMIT/OFFSET, or a `)`.
+  private isQueryFollowAtIndex(i: number): boolean {
+    const t = this.tokens[i];
+    if (t === undefined) return false;
+    if (t.kind === "rparen") return true;
+    if (t.kind !== "word") return false;
+    switch (t.word) {
+      case "union":
+      case "intersect":
+      case "except":
+      case "order":
+      case "limit":
+      case "offset":
+        return true;
+    }
+    return false;
   }
 
   // atSubqueryStart reports whether the NEXT token begins a query expression (a SELECT or nested
@@ -2410,7 +2495,7 @@ class Parser {
   // parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
   // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
   // `a UNION (b INTERSECT c)`.
-  private parseSetExpr(): Select | SetOp {
+  private parseSetExpr(): QueryExpr {
     const base = this.depth;
     let left = this.parseIntersectExpr();
     for (;;) {
@@ -2440,14 +2525,14 @@ class Parser {
   }
 
   // parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
-  private parseIntersectExpr(): Select | SetOp {
+  private parseIntersectExpr(): QueryExpr {
     const base = this.depth;
-    let left: QueryExpr = this.parseSelectCore();
+    let left: QueryExpr = this.parseSetOperand();
     while (this.peekKeyword() === "intersect") {
       this.deepen(); // each chained INTERSECT is one more set-op nesting level
       this.advance(); // INTERSECT
       const all = this.parseSetOpQuantifier();
-      const right = this.parseSelectCore();
+      const right = this.parseSetOperand();
       left = {
         kind: "setOp",
         op: "intersect",
@@ -2461,6 +2546,20 @@ class Parser {
     }
     this.depth = base;
     return left;
+  }
+
+  // parseSetOperand parses a set-operation operand (grammar.md §25): a select_core, or a
+  // parenthesized query — a full subquery_expr (its own WITH, set operations, and trailing ORDER
+  // BY/LIMIT/OFFSET) between `(` and `)`, one nesting level deeper. In operand position a `(` can only
+  // begin a query, so no lookahead is needed.
+  private parseSetOperand(): QueryExpr {
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      const q = this.parseSubquery();
+      this.expect("rparen");
+      return q;
+    }
+    return this.parseSelectCore();
   }
 
   // parseSetOpQuantifier consumes the optional ALL (multiset) or DISTINCT (explicit default)
@@ -2950,7 +3049,16 @@ class Parser {
     let values: Expr[][] | undefined;
     let group: Select | undefined;
     if (this.peekKeyword() === "values") {
-      values = this.parseValuesBody();
+      const rows = this.parseValuesBody();
+      // A trailing ORDER BY / LIMIT / OFFSET makes the body the query
+      // `SELECT * FROM (VALUES …) ORDER BY … LIMIT …` (valuesQuery).
+      const orderBy = this.parseOrderBy(true);
+      const { limit, offset } = this.parseLimitOffsetClauses();
+      if (orderBy.length === 0 && limit === null && offset === null) {
+        values = rows;
+      } else {
+        body = valuesQuery(rows, orderBy, limit, offset);
+      }
     } else if (this.atSubqueryStart()) {
       // A leading SELECT, or a nested WITH (cte.md §7), is a query_expr body.
       body = this.parseSubquery();
@@ -3011,8 +3119,8 @@ class Parser {
   // keyword is VALUES (here consumed). Each row is a parenthesized list of GENERAL expressions
   // (unlike the INSERT … VALUES slot, which is a literal/$N/DEFAULT); arity equality across rows and
   // per-column type unification are resolve-time concerns (the executor's planValues). At least one
-  // row, each with at least one value. NO trailing ORDER BY / LIMIT is consumed — the caller's `)`
-  // follows the last row.
+  // row, each with at least one value. A trailing ORDER BY / LIMIT / OFFSET is the caller's
+  // (parseDerivedTable).
   private parseValuesBody(): Expr[][] {
     this.expectKeyword("values");
     const rows: Expr[][] = [];
@@ -5175,5 +5283,74 @@ function renderToken(t: Token): string {
       return "!~*";
     case "eof": // never inside the parentheses
       return "";
+  }
+}
+
+// valuesQuery builds a VALUES body with trailing ORDER BY / LIMIT / OFFSET (grammar.md §42) as the
+// query `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an UNALIASED inner VALUES
+// relation: the keys resolve against column1, column2, … by name or ordinal (a qualified key has no
+// label to name, 42P01, as in PostgreSQL), and the enclosing derived table's alias and column-rename
+// list apply to the query's output unchanged.
+function valuesQuery(
+  rows: Expr[][],
+  orderBy: OrderKey[],
+  limit: bigint | null,
+  offset: bigint | null,
+): Select {
+  const inner: TableRef = { name: "", alias: null, args: null, values: rows };
+  return {
+    kind: "select",
+    distinct: false,
+    items: { kind: "all" },
+    from: inner,
+    joins: [],
+    filter: null,
+    groupBy: [],
+    having: null,
+    orderBy,
+    limit,
+    offset,
+    windows: [],
+  };
+}
+
+// foldTrailing folds a query expression's trailing ORDER BY / LIMIT / OFFSET onto its node
+// (grammar.md §25). A parenthesized query is the SAME query as its contents (PostgreSQL), so its own
+// trailing clauses are already set: giving one of them a second time — `(SELECT … ORDER BY a) ORDER
+// BY b`, `(SELECT … LIMIT 2) LIMIT 1` — is 42601, while a clause the contents lack is simply added. A
+// parenthesized nested WITH folds onto its main query.
+function foldTrailing(
+  node: QueryExpr,
+  orderBy: OrderKey[],
+  limit: bigint | null,
+  offset: bigint | null,
+): QueryExpr {
+  if (node.kind === "withExpr") {
+    return { ...node, body: foldTrailing(node.body, orderBy, limit, offset) };
+  }
+  if (orderBy.length > 0 && node.orderBy.length > 0) {
+    throw engineError("syntax_error", "multiple ORDER BY clauses not allowed");
+  }
+  if (offset !== null && node.offset !== null) {
+    throw engineError("syntax_error", "multiple OFFSET clauses not allowed");
+  }
+  if (limit !== null && node.limit !== null) {
+    throw engineError("syntax_error", "multiple LIMIT clauses not allowed");
+  }
+  // Both Select and SetOp carry orderBy/limit/offset; the spread keeps the `kind` discriminant.
+  return {
+    ...node,
+    orderBy: orderBy.length > 0 ? orderBy : node.orderBy,
+    limit: limit ?? node.limit,
+    offset: offset ?? node.offset,
+  };
+}
+
+// rejectSecondWith throws 42601 for a WITH clause whose main query is itself a parenthesized WITH
+// query — `WITH a AS (…) (WITH b AS (…) SELECT …)` (PostgreSQL: both clauses would attach to one
+// query). A parenthesized WITH query as a set-operation operand is a separate query and is fine.
+function rejectSecondWith(body: QueryExpr): void {
+  if (body.kind === "withExpr") {
+    throw engineError("syntax_error", "multiple WITH clauses not allowed");
   }
 }
