@@ -59,6 +59,11 @@ type scopeRel struct {
 	// view body records the columns resolved against it, so re-validation after CREATE OR REPLACE
 	// VIEW can tell whether a dependent binds a column the replacement appended (§8).
 	view string
+	// layer is the target of a write through a view (spec/design/views.md §15.2): the names this
+	// relation exposes are the layer's columns, not table's, and each resolves through the layer to a
+	// base column or a read-only select item. table stays the base table, so flat indices keep the
+	// base row's layout. Nil for every other relation.
+	layer *writeLayer
 }
 
 // resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
@@ -68,6 +73,12 @@ type scopeRel struct {
 type resolved struct {
 	level int
 	index int
+	// layered marks column col of the layered relation rel (a write through a view, views.md
+	// §15.2), found level scopes out; index is then unused. Resolved to an expression by
+	// resolveLayerRef.
+	layered bool
+	rel     int
+	col     int
 }
 
 // scope is the relations a query's FROM clause puts in scope, in FROM order, plus the enclosing
@@ -181,14 +192,19 @@ func emptyScope(catalog *engine) *scope {
 // Explicit WITH (OLD AS o, NEW AS n) aliases are installed first and hide that version's standard
 // name; an unaliased default is suppressed when its label is already occupied (including by the
 // target table). Explicit aliases may not collide with the target or each other (42712).
-func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *returningClause) (*scope, error) {
+func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *returningClause, vw *viewWrite) (*scope, error) {
 	n := len(t.Columns)
+	// A write through a view returns the view's columns under the view's name (views.md §15.2).
 	label := t.Name
+	var layer *writeLayer
+	if vw != nil {
+		label, layer = vw.view, vw.top
+	}
 	oldOffset, newOffset := n, 0
 	if baseIsOld {
 		oldOffset, newOffset = 0, n
 	}
-	rels := []scopeRel{{label: label, table: t, offset: 0}}
+	rels := []scopeRel{{label: label, table: t, offset: 0, layer: layer}}
 	for _, explicit := range []struct {
 		alias  *string
 		offset int
@@ -200,7 +216,7 @@ func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *ret
 					return nil, newError(DuplicateAlias, "table name "+alias+" specified more than once")
 				}
 			}
-			rels = append(rels, scopeRel{label: alias, table: t, offset: explicit.offset, qualifierOnly: true})
+			rels = append(rels, scopeRel{label: alias, table: t, offset: explicit.offset, qualifierOnly: true, layer: layer})
 		}
 	}
 	for _, pseudo := range []struct {
@@ -213,7 +229,7 @@ func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *ret
 			occupied = occupied || rel.label == pseudo.label
 		}
 		if !pseudo.aliased && !occupied {
-			rels = append(rels, scopeRel{label: pseudo.label, table: t, offset: pseudo.offset, qualifierOnly: true})
+			rels = append(rels, scopeRel{label: pseudo.label, table: t, offset: pseudo.offset, qualifierOnly: true, layer: layer})
 		}
 	}
 	return &scope{rels: rels, catalog: catalog, allowSubquery: true}, nil
@@ -237,7 +253,8 @@ func onConflictExcludedScope(catalog *engine, t *catTable) *scope {
 
 // outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
 func outerOf(r resolved) resolved {
-	return resolved{level: r.level + 1, index: r.index}
+	r.level++
+	return r
 }
 
 // resolveBare resolves a bare column name against THIS scope, then OUTWARD through the parent
@@ -258,8 +275,21 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 			break
 		}
 	}
-	for _, r := range s.rels {
+	var layered *resolved
+	for ri, r := range s.rels {
 		if r.qualifierOnly {
+			continue
+		}
+		// A write through a view exposes the view's columns (views.md §15.2).
+		if r.layer != nil {
+			for col, c := range r.layer.columns {
+				if c.Name == name {
+					if found >= 0 || layered != nil {
+						return resolved{}, ambiguousColumn(name)
+					}
+					layered = &resolved{layered: true, rel: ri, col: col}
+				}
+			}
 			continue
 		}
 		// Count EVERY matching column, not just the first per relation: a synthetic relation (a CTE
@@ -274,12 +304,15 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 				continue
 			}
 			if c.Name == name {
-				if found >= 0 {
+				if found >= 0 || layered != nil {
 					return resolved{}, ambiguousColumn(name)
 				}
 				found = idx
 			}
 		}
+	}
+	if layered != nil {
+		return *layered, nil
 	}
 	if found >= 0 {
 		s.traceFlat(found)
@@ -341,6 +374,23 @@ func (s *scope) traceFlat(idx int) {
 // unknown qualifier walks outward (42P01 if no ancestor has it).
 func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 	q := qualifier
+	for ri, r := range s.rels {
+		if r.label == q && r.layer != nil {
+			found := -1
+			for col, c := range r.layer.columns {
+				if c.Name == name {
+					if found >= 0 {
+						return resolved{}, ambiguousColumn(name)
+					}
+					found = col
+				}
+			}
+			if found < 0 {
+				return resolved{}, undefinedColumn(name)
+			}
+			return resolved{layered: true, rel: ri, col: found}, nil
+		}
+	}
 	for _, r := range s.rels {
 		if r.label == q {
 			// A synthetic relation (a derived table, an aliased parenthesized join) may carry two
@@ -445,6 +495,9 @@ func (s *scope) ancestor(level int) *scope {
 
 // columnOf returns the column a resolution refers to — local here, or outer in an ancestor.
 func (s *scope) columnOf(r resolved) *catColumn {
+	if r.layered {
+		return &s.ancestor(r.level).rels[r.rel].layer.columns[r.col]
+	}
 	return s.ancestor(r.level).columnAt(r.index)
 }
 
@@ -686,6 +739,28 @@ func resolvedTypeOfCol(ty dataType, snap *snapshot) resolvedType {
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8) and collation derivation (spec/design/collation.md §1).
 // `*` expands across ALL relations in FROM order, each relation's columns in catalog order (§15).
+// expandLayerColumns expands a layered relation's `*` (a write through a view, views.md §15.2): each
+// of the view's columns, by name, resolved through the layer.
+func expandLayerColumns(s *scope, rel int, ag *aggCtx) ([]*rExpr, []string, []resolvedType, []deriv, error) {
+	layer := s.rels[rel].layer
+	var ps []*rExpr
+	var names []string
+	var types []resolvedType
+	var derivs []deriv
+	for col := range layer.columns {
+		c := &layer.columns[col]
+		node, ty, err := resolveColumnRef(s, ag, resolved{layered: true, rel: rel, col: col}, c.Name)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		ps = append(ps, node)
+		names = append(names, c.Name)
+		types = append(types, ty)
+		derivs = append(derivs, catColumnDeriv(c))
+	}
+	return ps, names, types, derivs, nil
+}
+
 func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, []deriv, error) {
 	if items.All {
 		// `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
@@ -705,6 +780,12 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		var names []string
 		var types []resolvedType
 		var derivs []deriv
+		// A write through a view returns the view's columns (views.md §15.2).
+		for ri, r := range s.rels {
+			if r.layer != nil && !r.qualifierOnly {
+				return expandLayerColumns(s, ri, ag)
+			}
+		}
 		// The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
 		// grammar.md §15); a merge's underlying copies are hidden and so absent from it.
 		star := s.star
@@ -760,6 +841,23 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		// 42P01, exactly as a qualified column ref.
 		if it.Expr.Kind == exprQualifiedStar {
 			want := it.Expr.Qualifier
+			// `v.*` (or `old.*` / `new.*`) over a write through a view (views.md §15.2).
+			layered := false
+			for ri := range s.rels {
+				if s.rels[ri].label == want && s.rels[ri].layer != nil {
+					lps, lnames, ltypes, lderivs, err := expandLayerColumns(s, ri, ag)
+					if err != nil {
+						return nil, nil, nil, nil, err
+					}
+					ps, names = append(ps, lps...), append(names, lnames...)
+					types, derivs = append(types, ltypes...), append(derivs, lderivs...)
+					layered = true
+					break
+				}
+			}
+			if layered {
+				continue
+			}
 			var table *catTable
 			var slots []int
 			for i := range s.rels {
@@ -938,6 +1036,9 @@ func resolveBooleanFilter(s *scope, e *exprNode, params *paramTypes) (*rExpr, er
 // CONSTANT, so it bypasses that rule and resolves to an reOuterColumn reading the enclosing row at
 // eval; its type is the ancestor column's.
 func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, resolvedType, error) {
+	if r.layered {
+		return resolveLayerRef(s, ag, r, name)
+	}
 	if r.level == 0 {
 		return collectColumn(s, ag, r.index, name)
 	}

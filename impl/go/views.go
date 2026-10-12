@@ -382,28 +382,6 @@ func (db *engine) rejectAttachedView(q *string, name string) error {
 	return nil
 }
 
-// checkViewWrite refuses a DML target that is a view with 55000 (views.md §2): every view is
-// non-updatable in this slice. Checked when the target is resolved, before any column, value, or
-// RETURNING check.
-func (db *engine) checkViewWrite(q *string, name, verb string) error {
-	var snap *snapshot
-	if q == nil {
-		if _, ok := db.lkpTable(name); ok {
-			return nil
-		}
-		snap = db.readSnap()
-	} else {
-		snap = db.snapForScope(*q)
-		if snap == nil {
-			return nil
-		}
-	}
-	if _, ok := snap.table(name); !ok && snap.view(name) != nil {
-		return newError(ObjectNotInPrerequisiteState, fmt.Sprintf("cannot %s view \"%s\"", verb, name))
-	}
-	return nil
-}
-
 // viewsInDependencyOrder returns every view of the main database in dependency order: a view after
 // every view it reads, ties in name byte order (views.md §11 — the CLI dump order).
 func (db *engine) viewsInDependencyOrder() []*viewDef {
@@ -934,16 +912,22 @@ func (db *engine) walkReadViews(pending []relationRef, visit func(*viewDef, *pri
 	}
 }
 
-// collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads
-// (transitively) to its privilege requirements (views.md §9): function EXECUTE is the reader's, as
-// for a derived table. The relations inside a body are NOT added — the view is the privilege
-// boundary.
+// collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads or
+// writes through (transitively) to its privilege requirements (views.md §9, §15.4): function EXECUTE
+// is the reader's or writer's, as for a derived table. The relations inside a body are NOT added —
+// the view is the privilege boundary.
 func (db *engine) collectViewFunctionPrivs(req *privReq) {
 	if len(db.readSnap().views) == 0 {
 		return
 	}
+	pending := append([]relationRef(nil), req.relations...)
+	for _, t := range req.tables {
+		if t.priv == PrivInsert || t.priv == PrivUpdate || t.priv == PrivDelete {
+			pending = append(pending, relationRef{name: t.name})
+		}
+	}
 	var functions []string
-	db.walkReadViews(append([]relationRef(nil), req.relations...), func(_ *viewDef, body *privReq) bool {
+	db.walkReadViews(pending, func(_ *viewDef, body *privReq) bool {
 		functions = append(functions, body.functions...)
 		return false
 	})

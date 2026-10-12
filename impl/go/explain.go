@@ -452,6 +452,11 @@ func (db *engine) renderExplainWithDml(r *explainRender, wq *withQuery, depth in
 // source — a planned SELECT subtree (INSERT … SELECT) or a Values leaf (INSERT … VALUES). It resolves
 // the source but never writes.
 func (db *engine) explainInsert(r *explainRender, ins *insert, depth int, bindings []*cteBinding) error {
+	// A write through an updatable view renders its base-table statement (views.md §15.5).
+	ins, _, err := db.rewriteInsertTarget(ins)
+	if err != nil {
+		return err
+	}
 	if _, ok := db.lkpTable(ins.Table); !ok {
 		return newError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
@@ -483,16 +488,21 @@ func insertDetail(ins *insert) string {
 // Filter, then the target scan with its chosen access path. It resolves the WHERE and the scan bound
 // via the same detectors the executor uses, but never writes.
 func (db *engine) explainUpdate(r *explainRender, upd *update, depth int, bindings []*cteBinding) error {
+	// A write through an updatable view renders its base-table statement (views.md §15.5).
+	upd, vw, err := db.rewriteUpdateTarget(upd)
+	if err != nil {
+		return err
+	}
 	table, ok := db.lkpTable(upd.Table)
 	if !ok {
 		return newError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
-	filter, err := db.explainDmlFilter(table, upd.Filter, bindings)
+	filter, err := db.explainDmlFilter(table, upd.Filter, bindings, vw)
 	if err != nil {
 		return err
 	}
 	r.emit(depth, "Update "+upd.Table, fmt.Sprintf("sets=%d", len(upd.Assignments)))
-	mask, err := db.explainUpdateTouched(table, upd, filter, bindings)
+	mask, err := db.explainUpdateTouched(table, upd, filter, bindings, vw)
 	if err != nil {
 		return err
 	}
@@ -503,16 +513,21 @@ func (db *engine) explainUpdate(r *explainRender, upd *update, depth int, bindin
 // explainDelete renders a DELETE plan: the Delete root, the residual Filter, then the target scan
 // with its chosen access path. It resolves the WHERE and the scan bound but never writes.
 func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int, bindings []*cteBinding) error {
+	// A write through an updatable view renders its base-table statement (views.md §15.5).
+	del, vw, err := db.rewriteDeleteTarget(del)
+	if err != nil {
+		return err
+	}
 	table, ok := db.lkpTable(del.Table)
 	if !ok {
 		return newError(UndefinedTable, "table does not exist: "+del.Table)
 	}
-	filter, err := db.explainDmlFilter(table, del.Filter, bindings)
+	filter, err := db.explainDmlFilter(table, del.Filter, bindings, vw)
 	if err != nil {
 		return err
 	}
 	r.emit(depth, "Delete "+del.Table, "-")
-	mask, err := db.explainDeleteTouched(table, del, filter, bindings)
+	mask, err := db.explainDeleteTouched(table, del, filter, bindings, vw)
 	if err != nil {
 		return err
 	}
@@ -521,14 +536,13 @@ func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int, bi
 }
 
 // explainDmlFilter resolves an UPDATE/DELETE WHERE predicate against a single-table scope (the same
-// prologue the executors use), or returns nil for a bare (no-WHERE) statement.
-func (db *engine) explainDmlFilter(table *catTable, where *exprNode, bindings []*cteBinding) (*rExpr, error) {
-	if where == nil {
-		return nil, nil
-	}
-	s := singleScope(db, table)
+// prologue the executors use), or returns nil for a bare (no-WHERE) statement. A write through a
+// view puts its views' WHERE clauses first (views.md §15.2).
+func (db *engine) explainDmlFilter(table *catTable, where *exprNode, bindings []*cteBinding, vw *viewWrite) (*rExpr, error) {
+	s := writeTargetScope(db, table, vw)
 	s.ctes = bindings
-	return resolveBooleanFilter(s, where, &paramTypes{})
+	filter, _, err := db.resolveWriteFilter(s, table, vw, where, &paramTypes{})
+	return filter, err
 }
 
 // renderDmlScan emits the residual Filter (when present) and the target Scan for an UPDATE/DELETE,
@@ -551,13 +565,13 @@ func (db *engine) renderDmlScan(r *explainRender, table *catTable, name string, 
 	r.emit(d, "Scan "+name, db.scanDetail(name, db.dmlScanBound(table, filter), false, mask))
 }
 
-func (db *engine) explainDeleteTouched(table *catTable, del *deleteStmt, filter *rExpr, bindings []*cteBinding) ([]bool, error) {
+func (db *engine) explainDeleteTouched(table *catTable, del *deleteStmt, filter *rExpr, bindings []*cteBinding, vw *viewWrite) ([]bool, error) {
 	mask := make([]bool, len(table.Columns))
 	collectTouched(filter, 0, mask)
 	if del.Returning == nil {
 		return mask, nil
 	}
-	nodes, _, _, err := db.resolveReturning(table, *del.Returning, true, bindings, &paramTypes{})
+	nodes, _, _, err := db.resolveReturning(table, *del.Returning, true, bindings, &paramTypes{}, vw)
 	if err != nil {
 		return nil, err
 	}
@@ -571,10 +585,10 @@ func (db *engine) explainDeleteTouched(table *catTable, del *deleteStmt, filter 
 	return mask, nil
 }
 
-func (db *engine) explainUpdateTouched(table *catTable, upd *update, filter *rExpr, bindings []*cteBinding) ([]bool, error) {
+func (db *engine) explainUpdateTouched(table *catTable, upd *update, filter *rExpr, bindings []*cteBinding, vw *viewWrite) ([]bool, error) {
 	mask := make([]bool, len(table.Columns))
 	collectTouched(filter, 0, mask)
-	s := singleScope(db, table)
+	s := writeTargetScope(db, table, vw)
 	s.ctes = bindings
 	ptypes := &paramTypes{}
 	assigned := make([]bool, len(mask))
@@ -601,7 +615,7 @@ func (db *engine) explainUpdateTouched(table *catTable, upd *update, filter *rEx
 		collectTouched(node, 0, mask)
 	}
 	if upd.Returning != nil {
-		nodes, _, _, err := db.resolveReturning(table, *upd.Returning, false, bindings, ptypes)
+		nodes, _, _, err := db.resolveReturning(table, *upd.Returning, false, bindings, ptypes, vw)
 		if err != nil {
 			return nil, err
 		}

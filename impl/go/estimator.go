@@ -2144,7 +2144,11 @@ func (db *engine) estimateExplain(inner *statement) ([]planEstimate, error) {
 func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding, ctx *estimateCTECtx) ([]planEstimate, error) {
 	switch {
 	case inner.Insert != nil:
-		ins := inner.Insert
+		// A write through an updatable view estimates its base-table statement (views.md §15.5).
+		ins, _, err := db.rewriteInsertTarget(inner.Insert)
+		if err != nil {
+			return nil, err
+		}
 		if _, ok := db.lkpTableScoped(ins.DB, ins.Table); !ok {
 			return nil, newError(UndefinedTable, "table does not exist: "+ins.Table)
 		}
@@ -2162,12 +2166,15 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 		root := source.root
 		return parentEstimatedPlan(root, source).nodes, nil
 	case inner.Update != nil:
-		upd := inner.Update
+		upd, vw, err := db.rewriteUpdateTarget(inner.Update)
+		if err != nil {
+			return nil, err
+		}
 		table, ok := db.lkpTableScoped(upd.DB, upd.Table)
 		if !ok {
 			return nil, newError(UndefinedTable, "table does not exist: "+upd.Table)
 		}
-		filter, err := db.explainDmlFilter(table, upd.Filter, bindings)
+		filter, err := db.explainDmlFilter(table, upd.Filter, bindings, vw)
 		if err != nil {
 			return nil, err
 		}
@@ -2175,12 +2182,15 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 		root := scan.root
 		return parentEstimatedPlan(root, scan).nodes, nil
 	case inner.Delete != nil:
-		del := inner.Delete
+		del, vw, err := db.rewriteDeleteTarget(inner.Delete)
+		if err != nil {
+			return nil, err
+		}
 		table, ok := db.lkpTableScoped(del.DB, del.Table)
 		if !ok {
 			return nil, newError(UndefinedTable, "table does not exist: "+del.Table)
 		}
-		filter, err := db.explainDmlFilter(table, del.Filter, bindings)
+		filter, err := db.explainDmlFilter(table, del.Filter, bindings, vw)
 		if err != nil {
 			return nil, err
 		}

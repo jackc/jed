@@ -185,17 +185,27 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 		tableName, returning, baseIsOld = body.Delete.Table, body.Delete.Returning, true
 		dm.delete = body.Delete
 	}
-	// A view target is 55000, as for a top-level write (views.md §2).
-	verb := "delete from"
-	if body.Insert != nil {
-		verb = "insert into"
-	} else if body.Update != nil {
-		verb = "update"
+	// A write through an updatable view targets its base table, and its RETURNING projects the
+	// view's columns (views.md §15); a view that is not updatable is 55000. The CTE keeps the written
+	// statement, which its execution retargets again.
+	var vw *viewWrite
+	var err error
+	switch {
+	case body.Insert != nil:
+		_, vw, err = db.rewriteInsertTarget(body.Insert)
+	case body.Update != nil:
+		_, vw, err = db.rewriteUpdateTarget(body.Update)
+	default:
+		_, vw, err = db.rewriteDeleteTarget(body.Delete)
 	}
-	if err := db.checkViewWrite(nil, tableName, verb); err != nil {
+	if err != nil {
 		return nil, nil, err
 	}
-	tdef, ok := db.lkpTable(tableName) // temp-first (temp-tables.md §3)
+	target := tableName
+	if vw != nil {
+		target = vw.table
+	}
+	tdef, ok := db.lkpTable(target) // temp-first (temp-tables.md §3)
 	if !ok {
 		return nil, nil, newError(UndefinedTable, "table does not exist: "+tableName)
 	}
@@ -207,7 +217,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 		}
 		return table, dm, nil
 	}
-	s, err := returningScope(db, tdef, baseIsOld, returning)
+	s, err := returningScope(db, tdef, baseIsOld, returning, vw)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -865,6 +865,7 @@ var SupportedCapabilities = []string{
 	"ddl.view_rename",
 	"ddl.view_replace",
 	"ddl.view_alter",
+	"dml.view_write",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

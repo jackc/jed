@@ -874,9 +874,14 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if err := db.checkAttachmentWritable(ins.DB); err != nil {
 		return outcome{}, err
 	}
-	// A view is not automatically updatable in this slice (views.md §2): 55000.
-	if err := db.checkViewWrite(ins.DB, ins.Table, "insert into"); err != nil {
+	// A write through an updatable view inserts into its base table (views.md §15); a view that is
+	// not updatable is 55000. The retargeted copy is never cached.
+	ins, vw, err := db.rewriteInsertTarget(ins)
+	if err != nil {
 		return outcome{}, err
+	}
+	if vw != nil {
+		ic, allowCacheFill = nil, false
 	}
 	if err := db.checkTableQualifier(ins.DB, ins.Table); err != nil { // attached-databases.md §3
 		return outcome{}, err
@@ -889,7 +894,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	// Slice 2 caches only a top-level plain VALUES disposition. Writable CTE children reach this
 	// method without a cache slot; SELECT and ON CONFLICT retain the existing general path.
 	if ins.Select == nil && ins.OnConflict == nil {
-		return db.executeInsertValuesCached(ins, params, ctx, ic, allowCacheFill)
+		return db.executeInsertValuesCached(ins, params, ctx, ic, allowCacheFill, vw)
 	}
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
@@ -1000,7 +1005,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		var retNames []string
 		var retTypes []string
 		if ins.Returning != nil {
-			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); err != nil {
+			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw); err != nil {
 				return outcome{}, err
 			}
 		}
@@ -1158,7 +1163,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	var retTypes []string
 	if ins.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw); rerr != nil {
 			return outcome{}, rerr
 		}
 	}
@@ -1401,7 +1406,7 @@ func (db *engine) evalValueExpr(node *rExpr, params []Value, rng *stmtRng, ctes 
 // then performs all per-execution binding, gates, default/constraint/index/RETURNING evaluation and
 // writes against the current working snapshot. Planning is unmetered; the execution below is the
 // same one-row/batch path used before the cache existed.
-func (db *engine) executeInsertValuesCached(ins *insert, params []Value, ctx cteCtx, ic *insertStmtCache, allowCacheFill bool) (outcome, error) {
+func (db *engine) executeInsertValuesCached(ins *insert, params []Value, ctx cteCtx, ic *insertStmtCache, allowCacheFill bool, vw *viewWrite) (outcome, error) {
 	if ic != nil {
 		if cached := ic.p.Load(); cached != nil && db.insertTargetSignatureMatches(ins.DB, cached.sig) {
 			if err := db.ensureCollationsWritable(cached.plan.table.Columns); err != nil {
@@ -1411,7 +1416,7 @@ func (db *engine) executeInsertValuesCached(ins *insert, params []Value, ctx cte
 		}
 	}
 
-	plan, err := db.resolveInsertValuesPlan(ins, ctx)
+	plan, err := db.resolveInsertValuesPlan(ins, ctx, vw)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -1429,7 +1434,7 @@ func (db *engine) executeInsertValuesCached(ins *insert, params []Value, ctx cte
 	return out, nil
 }
 
-func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValuesPlan, error) {
+func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite) (*insertValuesPlan, error) {
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table)
 	if !ok {
 		return nil, newError(UndefinedTable, "table does not exist: "+ins.Table)
@@ -1539,7 +1544,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 	var retNames []string
 	var retTypes []string
 	if ins.Returning != nil {
-		if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); err != nil {
+		if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw); err != nil {
 			return nil, err
 		}
 	}
@@ -2725,8 +2730,8 @@ func defaultOrNull(col catColumn) Value {
 // The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
 // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
 // baseIsOld true for DELETE).
-func (db *engine) resolveReturning(table *catTable, returning returningClause, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
-	s, err := returningScope(db, table, baseIsOld, &returning)
+func (db *engine) resolveReturning(table *catTable, returning returningClause, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes, vw *viewWrite) ([]*rExpr, []string, []string, error) {
+	s, err := returningScope(db, table, baseIsOld, &returning, vw)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -3157,8 +3162,10 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	if err := db.checkAttachmentWritable(del.DB); err != nil {
 		return outcome{}, err
 	}
-	// A view is not automatically updatable in this slice (views.md §2): 55000.
-	if err := db.checkViewWrite(del.DB, del.Table, "delete from"); err != nil {
+	// A write through an updatable view deletes from its base table (views.md §15); a view that is
+	// not updatable is 55000.
+	del, vw, err := db.rewriteDeleteTarget(del)
+	if err != nil {
 		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(del.DB, del.Table); err != nil { // attached-databases.md §3
@@ -3180,23 +3187,19 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	// projection resolves after it (PostgreSQL's analysis order), against the same scope
 	// (grammar.md §32). The statement's CTE bindings (writable-cte.md) are visible so a WHERE /
 	// RETURNING sublink may reference an earlier CTE.
-	s := singleScope(db, table)
+	s := writeTargetScope(db, table, vw)
 	s.ctes = ctx.bindings
 	ptypes := &paramTypes{}
-	var filter *rExpr
-	if del.Filter != nil {
-		f, err := resolveBooleanFilter(s, del.Filter, ptypes)
-		if err != nil {
-			return outcome{}, err
-		}
-		filter = f
+	filter, stages, err := db.resolveWriteFilter(s, table, vw, del.Filter, ptypes)
+	if err != nil {
+		return outcome{}, err
 	}
 	var retNodes []*rExpr
 	var retNames []string
 	var retTypes []string
 	if del.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ctx.bindings, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ctx.bindings, ptypes, vw); rerr != nil {
 			return outcome{}, rerr
 		}
 	}
@@ -3308,12 +3311,12 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		keep := true
 		if filter != nil {
 			beforeFilter := meter.Accrued
-			v, err := filter.eval(row, env, meter)
+			k, err := evalWriteFilter(filter, stages, row, env, meter)
 			if err != nil {
 				return outcome{}, err
 			}
 			filterActual += meter.Accrued - beforeFilter
-			keep = v.IsTrue()
+			keep = k
 		}
 		if del.fkTarget != nil {
 			if _, keep, err = del.fkTarget.match(row); err != nil {
@@ -3415,8 +3418,10 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	if err := db.checkAttachmentWritable(upd.DB); err != nil {
 		return outcome{}, err
 	}
-	// A view is not automatically updatable in this slice (views.md §2): 55000.
-	if err := db.checkViewWrite(upd.DB, upd.Table, "update"); err != nil {
+	// A write through an updatable view updates its base table (views.md §15); a view that is not
+	// updatable is 55000.
+	upd, vw, err := db.rewriteUpdateTarget(upd)
+	if err != nil {
 		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(upd.DB, upd.Table); err != nil { // attached-databases.md §3
@@ -3445,7 +3450,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	// shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine). The
 	// statement's CTE bindings (writable-cte.md) are visible so a SET / WHERE / RETURNING sublink may
 	// reference an earlier CTE.
-	s := singleScope(db, table)
+	s := writeTargetScope(db, table, vw)
 	s.ctes = ctx.bindings
 	ptypes := &paramTypes{}
 
@@ -3551,13 +3556,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		return slices.Contains(pkMembers, p.idx)
 	})
 
-	var filter *rExpr
-	if upd.Filter != nil {
-		f, err := resolveBooleanFilter(s, upd.Filter, ptypes)
-		if err != nil {
-			return outcome{}, err
-		}
-		filter = f
+	filter, stages, err := db.resolveWriteFilter(s, table, vw, upd.Filter, ptypes)
+	if err != nil {
+		return outcome{}, err
 	}
 	// The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
 	// one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
@@ -3566,7 +3567,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	var retTypes []string
 	if upd.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ctx.bindings, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ctx.bindings, ptypes, vw); rerr != nil {
 			return outcome{}, rerr
 		}
 	}
@@ -3701,11 +3702,11 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		}
 		if filter != nil {
 			beforeFilter := meter.Accrued
-			v, err := filter.eval(row, env, meter)
+			matched, err := evalWriteFilter(filter, stages, row, env, meter)
 			if err != nil {
 				return outcome{}, err
 			}
-			if !v.IsTrue() {
+			if !matched {
 				filterActual += meter.Accrued - beforeFilter
 				continue
 			}

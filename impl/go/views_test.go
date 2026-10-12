@@ -287,8 +287,8 @@ func TestAttachedDatabaseViews(t *testing.T) {
 	}
 	for sql, want := range map[string]string{
 		"SELECT * FROM reports.v":                     "0A000",
-		"INSERT INTO reports.v VALUES (2)":            "55000",
-		"DELETE FROM reports.v":                       "55000",
+		"INSERT INTO reports.v VALUES (2)":            "0A000",
+		"DELETE FROM reports.v":                       "0A000",
 		"CREATE VIEW reports.w AS SELECT 1 AS one":    "0A000",
 		"CREATE VIEW w AS SELECT a FROM reports.t":    "0A000",
 		"DROP VIEW reports.v":                         "0A000",
