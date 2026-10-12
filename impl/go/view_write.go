@@ -266,8 +266,9 @@ func (db *engine) updatableShape(body *queryExpr, checkCols bool) (*selectStmt, 
 // prepareViewWrite validates a write through name and builds its layer chain (views.md §15.3 steps
 // 2–6), or returns nil when the target is not a view. targets are the statement's target view
 // columns: the INSERT column list (nil = every view column) or the UPDATE SET columns, in order;
-// DELETE has none.
-func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onConflict bool, targets []string) (*viewWrite, error) {
+// DELETE has none. targetPos holds each target's character position, index-aligned (nil when
+// unknown), for a 42703 (spec/design/error-fields.md §10.2).
+func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onConflict bool, targets []string, targetPos []srcPos) (*viewWrite, error) {
 	view, err := db.dmlTargetView(q, name)
 	if err != nil || view == nil {
 		return nil, err
@@ -295,7 +296,7 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 				cur = append(cur, i)
 			}
 		} else {
-			for _, t := range targets {
+			for ti, t := range targets {
 				idx := -1
 				for i, c := range view.Columns {
 					if c == t {
@@ -304,7 +305,8 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 					}
 				}
 				if idx < 0 {
-					return nil, newError(UndefinedColumn, fmt.Sprintf("column %s of relation %s does not exist", t, view.Name))
+					return nil, newError(UndefinedColumn, fmt.Sprintf("column %s of relation %s does not exist", t, view.Name)).
+						withPosition(srcPosOf(targetPos, ti))
 				}
 				for _, c := range cur {
 					if c == idx {
@@ -560,7 +562,7 @@ func resolveLayerRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, res
 // the statement (the written one is left intact) and the write, or the statement unchanged and nil
 // when the target is not a view.
 func (db *engine) rewriteInsertTarget(ins *insert) (*insert, *viewWrite, error) {
-	vw, err := db.prepareViewWrite(ins.DB, ins.Table, writeInsert, ins.OnConflict != nil, ins.Columns)
+	vw, err := db.prepareViewWrite(ins.DB, ins.Table, writeInsert, ins.OnConflict != nil, ins.Columns, ins.ColumnPos)
 	if err != nil || vw == nil {
 		return ins, nil, err
 	}
@@ -575,10 +577,12 @@ func (db *engine) rewriteInsertTarget(ins *insert) (*insert, *viewWrite, error) 
 // default, which is NULL (jed has no view column defaults).
 func (db *engine) rewriteUpdateTarget(upd *update) (*update, *viewWrite, error) {
 	targets := make([]string, len(upd.Assignments))
+	targetPos := make([]srcPos, len(upd.Assignments))
 	for i, a := range upd.Assignments {
 		targets[i] = a.Column
+		targetPos[i] = a.Pos
 	}
-	vw, err := db.prepareViewWrite(upd.DB, upd.Table, writeUpdate, false, targets)
+	vw, err := db.prepareViewWrite(upd.DB, upd.Table, writeUpdate, false, targets, targetPos)
 	if err != nil || vw == nil {
 		return upd, nil, err
 	}
@@ -599,7 +603,7 @@ func (db *engine) rewriteUpdateTarget(upd *update) (*update, *viewWrite, error) 
 // rewriteDeleteTarget retargets a DELETE through an updatable view at its base table (views.md
 // §15.2).
 func (db *engine) rewriteDeleteTarget(del *deleteStmt) (*deleteStmt, *viewWrite, error) {
-	vw, err := db.prepareViewWrite(del.DB, del.Table, writeDelete, false, nil)
+	vw, err := db.prepareViewWrite(del.DB, del.Table, writeDelete, false, nil, nil)
 	if err != nil || vw == nil {
 		return del, nil, err
 	}

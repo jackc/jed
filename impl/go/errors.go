@@ -33,6 +33,13 @@ type EngineError struct {
 	// exists.`) — set on the class-23 violations, subject to the session's SELECT privilege
 	// (spec/design/error-fields.md §9). Never part of the rendered message.
 	Detail string
+	// Position is the 1-based **character** offset into the statement text of the offending token —
+	// set for lexer/parser errors and name-resolution errors (spec/design/error-fields.md §10). 0 means
+	// "not set" (pgx's convention).
+	Position int32
+	// Hint is PostgreSQL's HINT suggestion (`Perhaps you meant to reference the column "t.name".`) —
+	// spec/design/error-fields.md §11. Never part of the rendered message.
+	Hint string
 }
 
 // newError builds an EngineError.
@@ -63,6 +70,43 @@ func (e *EngineError) withDataType(name string) *EngineError   { e.DataTypeName 
 // withDetail attaches a Detail (spec/design/error-fields.md §9). "" (a gated or inapplicable detail)
 // leaves the field absent, so a raise site can pass a helper's result straight through.
 func (e *EngineError) withDetail(detail string) *EngineError { e.Detail = detail; return e }
+
+// withPosition sets Position unless one is already set: the innermost site that knows a location
+// wins (spec/design/error-fields.md §10.2). A 0 position means "unknown" and is ignored.
+func (e *EngineError) withPosition(pos int32) *EngineError {
+	if e.Position == 0 && pos > 0 {
+		e.Position = pos
+	}
+	return e
+}
+
+// withHint sets Hint unless one is already set (spec/design/error-fields.md §11). "" leaves it absent.
+func (e *EngineError) withHint(hint string) *EngineError {
+	if e.Hint == "" {
+		e.Hint = hint
+	}
+	return e
+}
+
+// shiftPosition moves a statement error's Position by chars characters — into the coordinates of the
+// script that contains the statement (spec/design/error-fields.md §10.1). A no-op for an error with no
+// position, or one that is not an EngineError.
+func shiftPosition(err error, chars int32) error {
+	var e *EngineError
+	if errors.As(err, &e) && e.Position > 0 {
+		e.Position += chars
+	}
+	return err
+}
+
+// srcPosOf is the position at index i of an index-aligned position list, or 0 when the list does not
+// reach it (no positions were recorded).
+func srcPosOf(positions []srcPos, i int) int32 {
+	if i < len(positions) {
+		return int32(positions[i])
+	}
+	return 0
+}
 
 // stampTable annotates a column-store failure (23502 / 22003 / 22001) with the target
 // relation: the relation name is in scope at the DML boundary, not inside the coercion

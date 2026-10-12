@@ -147,9 +147,9 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 	if key.Expr != nil {
 		keyExpr = *key.Expr
 	} else if key.Qualifier != "" {
-		keyExpr = exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
+		keyExpr = exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column, Pos: key.Pos}
 	} else {
-		keyExpr = exprNode{Kind: exprColumn, Column: key.Column}
+		keyExpr = exprNode{Kind: exprColumn, Column: key.Column, Pos: key.Pos}
 	}
 	sub := &aggCtx{collecting: false}
 	operand, optype, err := resolve(s, keyExpr, nil, sub, params)
@@ -274,9 +274,9 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 		if key.Expr != nil {
 			keyExpr = *key.Expr
 		} else if key.Qualifier != "" {
-			keyExpr = exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column}
+			keyExpr = exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column, Pos: key.Pos}
 		} else {
-			keyExpr = exprNode{Kind: exprColumn, Column: key.Column}
+			keyExpr = exprNode{Kind: exprColumn, Column: key.Column, Pos: key.Pos}
 		}
 		sub := &aggCtx{collecting: false}
 		knode, ktype, err := resolve(s, keyExpr, nil, sub, params)
@@ -464,9 +464,9 @@ func resolveGrouping(s *scope, fc *funcCallExpr, ag *aggCtx) (*rExpr, resolvedTy
 		)
 		switch arg.Kind {
 		case exprColumn:
-			r, err = s.resolveBare(arg.Column)
+			r, err = s.resolveBareAt(arg.Column, arg.Pos)
 		case exprQualifiedColumn:
-			r, err = s.resolveQualified(arg.Qualifier, arg.Column)
+			r, err = s.resolveQualifiedAt(arg.Qualifier, arg.Column, arg.Pos)
 		default:
 			// A non-column argument is never a grouping column (jed groups by columns only).
 			return nil, resolvedType{}, groupingArgErr()

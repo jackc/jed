@@ -7,23 +7,25 @@ import (
 // exprEqual reports whether two parsed expression trees are STRUCTURALLY equal (spec/design/grammar.md
 // §10) — the Go equivalent of the Rust core's derived PartialEq on Expr. Used by the SELECT DISTINCT
 // ORDER BY restriction (and GROUP BY key matching) to decide whether an expression matches another.
-// Token positions (tokPos fields — recorded for view-definition rewrites, spec/design/views.md §5/§7)
+// Token positions (tokPos fields — recorded for view-definition rewrites, spec/design/views.md §5/§7 —
+// and srcPos character positions, spec/design/error-fields.md §10.4)
 // are ignored, so textually-identical fragments (`a + b` here and there) compare equal; everything
 // else is reflect.DeepEqual's recursive tree comparison.
 func exprEqual(a, b exprNode) bool { return astEqual(reflect.ValueOf(a), reflect.ValueOf(b)) }
 
 var (
 	tokPosType    = reflect.TypeOf(tokPos(0))
+	srcPosType    = reflect.TypeOf(srcPos(0))
 	nestDepthType = reflect.TypeOf(nestDepth(0))
 )
 
-// astEqual is reflect.DeepEqual over an acyclic AST, except that a tokPos or nestDepth value always
-// compares equal.
+// astEqual is reflect.DeepEqual over an acyclic AST, except that a tokPos, srcPos, or nestDepth value
+// always compares equal.
 func astEqual(a, b reflect.Value) bool {
 	if a.Type() != b.Type() {
 		return false
 	}
-	if a.Type() == tokPosType || a.Type() == nestDepthType {
+	if a.Type() == tokPosType || a.Type() == srcPosType || a.Type() == nestDepthType {
 		return true
 	}
 	switch a.Kind() {

@@ -453,6 +453,11 @@ type createView struct {
 	IfNotExists bool
 	Columns     []string // nil = no column list
 	Body        string
+	// BodyPositions is the character positions (spec/design/error-fields.md §10) of the body's tokens
+	// in the statement text, index-aligned with lex(Body) (its TokEof gets the position just past the
+	// body), so validating the body reports positions into the text the host wrote. Nil when the
+	// statement was itself stored text.
+	BodyPositions []int32
 	// CheckOption is a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH
 	// CHECK OPTION` is checkOptionCascaded.
 	CheckOption checkOption
@@ -499,6 +504,13 @@ type qualifiedName struct {
 // invisible to structural AST equality (exprEqual skips every tokPos field), so two references that
 // differ only in position compare equal.
 type tokPos int
+
+// srcPos is a 1-based **character** position in the statement text the host passed
+// (spec/design/error-fields.md §10), recorded on the AST nodes that name things so a resolution error
+// can carry Position. 0 is "no position" — a parse of stored text, or a node jed synthesized. Like a
+// tokPos it is invisible to structural AST equality (astEqual skips it): `a + b` written twice still
+// matches.
+type srcPos int32
 
 // nestDepth is the parser's nesting depth (maxExprDepth) at a FROM item, which a view reference adds
 // its body's depth to (spec/design/views.md §4.1). Like a tokPos it is invisible to structural AST
@@ -577,6 +589,9 @@ type insert struct {
 	// resolve at execution time (unknown → 42703, duplicate → 42701); an unlisted column takes
 	// its default else NULL.
 	Columns []string
+	// ColumnPos is each Columns name's character position (spec/design/error-fields.md §10.2),
+	// index-aligned; nil when there is no list or no positions were recorded.
+	ColumnPos []srcPos
 	// Overriding is the optional `OVERRIDING { SYSTEM | USER } VALUE` clause
 	// (spec/design/sequences.md §13), governing IDENTITY columns. nil is the default (no override).
 	Overriding *overridingKind
@@ -678,6 +693,8 @@ type update struct {
 // Assignment is one `SET <Column> = <Value>` clause; Value is a general expression.
 type assignment struct {
 	Column string
+	// Pos is the target name's character position (spec/design/error-fields.md §10.2).
+	Pos srcPos
 	// IsDefault marks the standalone UPDATE-only `SET column = DEFAULT` form. Value is a parser
 	// placeholder in that case and is never resolved; ON CONFLICT keeps its ordinary-expression
 	// RHS until its separate DEFAULT follow-on lands.
@@ -769,6 +786,9 @@ type tableRef struct {
 	AliasPos  tokPos
 	ListOpen  tokPos
 	ListClose tokPos
+	// Src is the table name's character position (spec/design/error-fields.md §10.2) — the database
+	// qualifier's for `db.t` — for a 42P01 on this reference. Invisible to AST equality.
+	Src srcPos
 	// Depth is the parser's nesting depth at the item (views.md §4.1).
 	Depth nestDepth
 }
@@ -1370,6 +1390,9 @@ type exprNode struct {
 	// StarPos is an ExprQualifiedStar's qualifier-token position (views.md §5: `rel . *` is a
 	// three-token span); invisible to equality.
 	StarPos tokPos
+	// Pos is a column reference's character position (spec/design/error-fields.md §10.2) — the
+	// qualifier's for an ExprQualifiedColumn; invisible to equality.
+	Pos srcPos
 }
 
 // InSubqueryExpr is `Lhs [NOT] IN ( Query )` (spec/design/grammar.md §26) — membership of Lhs in
@@ -1693,6 +1716,8 @@ type orderKey struct {
 	// a column-reference key (Ordinal and Expr both unset).
 	Qualifier string
 	Column    string
+	// Pos is the column-reference key's character position (spec/design/error-fields.md §10.2).
+	Pos srcPos
 	// Collation is an optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md
 	// §1); "" means the column's collation (the database default, C, until slice 1d). A non-C name
 	// orders this key by that collation's UCA sort key; an unknown name is 42704, a non-text column

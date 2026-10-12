@@ -728,7 +728,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, ptypes *par
 	for _, a := range oc.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
-			return nil, newError(UndefinedColumn, "column does not exist: "+a.Column)
+			return nil, newError(UndefinedColumn, "column does not exist: "+a.Column).withPosition(int32(a.Pos))
 		}
 		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways {
 			return nil, newError(GeneratedAlways,
@@ -940,7 +940,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 			if idx < 0 {
 				return outcome{}, newError(UndefinedColumn, fmt.Sprintf(
 					"column %s of relation %s does not exist", name, table.Name,
-				))
+				)).withPosition(srcPosOf(ins.ColumnPos, p))
 			}
 			if provided[idx] >= 0 {
 				return outcome{}, newError(DuplicateColumn,
@@ -1481,7 +1481,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 			if idx < 0 {
 				return nil, newError(UndefinedColumn, fmt.Sprintf(
 					"column %s of relation %s does not exist", name, table.Name,
-				))
+				)).withPosition(srcPosOf(ins.ColumnPos, p))
 			}
 			if provided[idx] >= 0 {
 				return nil, newError(DuplicateColumn,
@@ -3546,7 +3546,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	for _, a := range upd.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
-			return outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column)
+			return outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column).withPosition(int32(a.Pos))
 		}
 		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
 		// An ordinary assignment is 428C9; DEFAULT is allowed and advances the owned sequence.

@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 )
@@ -41,7 +42,71 @@ func scanExponent(b []byte, i int) (int64, bool, int) {
 // Lex tokenizes sql into tokens terminated by TokEof (CLAUDE.md §5: parsers are
 // per-language, not codegen'd). Integer literals may carry a leading '-'. Errors are
 // structured (SQLSTATE 42601 syntax error).
+//
+// This is the stored-text entry point (a view body, a CHECK expression, a rename rewrite), so an
+// error carries no position: it would point into text the host never wrote
+// (spec/design/error-fields.md §10.1).
 func lex(sql string) ([]token, error) {
+	tokens, _, err := lexWithPositions(sql)
+	if err != nil {
+		var e *EngineError
+		if errors.As(err, &e) {
+			e.Position = 0
+		}
+		return nil, err
+	}
+	return tokens, nil
+}
+
+// lexWithPositions is lex, also returning each token's 1-based **character** position in sql
+// (spec/design/error-fields.md §10.1), index-aligned with the tokens. TokEof's position is one past
+// the last character — PostgreSQL's "at end of input". An error carries the position of the lexeme
+// being scanned (spec/design/error-fields.md §10.2).
+func lexWithPositions(sql string) ([]token, []int32, error) {
+	var starts []int
+	tokStart := 0
+	tokens, err := lexRaw(sql, &starts, &tokStart)
+	if err != nil {
+		var e *EngineError
+		if errors.As(err, &e) {
+			e.withPosition(charPositions(sql, []int{tokStart})[0])
+		}
+		return nil, nil, err
+	}
+	return tokens, charPositions(sql, starts), nil
+}
+
+// charPositions converts ascending byte offsets into sql to 1-based character positions in one pass.
+// A character is a code point: count the bytes that are not UTF-8 continuation bytes.
+func charPositions(sql string, starts []int) []int32 {
+	out := make([]int32, 0, len(starts))
+	b, chars := 0, int32(0)
+	for _, s := range starts {
+		for b < s {
+			if sql[b]&0xC0 != 0x80 {
+				chars++
+			}
+			b++
+		}
+		out = append(out, chars+1)
+	}
+	return out
+}
+
+// charCount is the number of characters (code points, by the charPositions rule) in s.
+func charCount(s string) int32 {
+	n := int32(0)
+	for i := 0; i < len(s); i++ {
+		if s[i]&0xC0 != 0x80 {
+			n++
+		}
+	}
+	return n
+}
+
+// lexRaw is the lexer proper: it appends each token's start byte offset to starts, and keeps
+// tokStart at the byte where the lexeme being scanned began, so the caller can position an error.
+func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 	b := []byte(sql)
 	i := 0
 	var tokens []token
@@ -52,6 +117,11 @@ func lex(sql string) ([]token, error) {
 	}
 
 	for i < len(b) {
+		// The previous iteration's tokens started at its tokStart; this one's start at i.
+		for len(*starts) < len(tokens) {
+			*starts = append(*starts, *tokStart)
+		}
+		*tokStart = i
 		c := b[i]
 		switch {
 		case c == ' ' || c == '\t' || c == '\r' || c == '\n':
@@ -455,7 +525,12 @@ func lex(sql string) ([]token, error) {
 		}
 	}
 
+	for len(*starts) < len(tokens) {
+		*starts = append(*starts, *tokStart)
+	}
+	*tokStart = len(b)
 	tokens = append(tokens, token{Kind: tokEof})
+	*starts = append(*starts, len(b))
 	return tokens, nil
 }
 

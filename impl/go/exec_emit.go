@@ -2001,7 +2001,7 @@ func resolveGroupTerm(s *scope, term exprNode, items selectItems, params *paramT
 func resolveGroupNamed(s *scope, term exprNode, items selectItems, params *paramTypes) (groupKeyResolved, error) {
 	switch term.Kind {
 	case exprColumn:
-		r, err := s.resolveBare(term.Column)
+		r, err := s.resolveBareAt(term.Column, term.Pos)
 		if err != nil {
 			// No input column of this name: try an output alias (`SELECT a+b AS s … GROUP BY s`). If
 			// none matches either, propagate the original 42703.
@@ -2021,7 +2021,7 @@ func resolveGroupNamed(s *scope, term exprNode, items selectItems, params *param
 		}
 		return groupKeyResolved{isColumn: true, index: r.index}, nil
 	case exprQualifiedColumn:
-		r, err := s.resolveQualified(term.Qualifier, term.Column)
+		r, err := s.resolveQualifiedAt(term.Qualifier, term.Column, term.Pos)
 		if err != nil {
 			return groupKeyResolved{}, err
 		}

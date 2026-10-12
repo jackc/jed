@@ -449,7 +449,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
-	body, depth, err := parseViewDefinition(cv.Body)
+	body, depth, err := parseViewDefinitionAt(cv.Body, cv.BodyPositions)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -499,6 +499,14 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 			}
 		}
 		definition, body, depth, trace = frozen, refrozen, refrozenDepth, trace2
+	} else if len(cv.BodyPositions) > 0 {
+		// The stored body carries no positions: they point into this statement, not into the
+		// view's later uses (spec/design/error-fields.md §10.1).
+		stored, _, perr := parseViewDefinition(cv.Body)
+		if perr != nil {
+			return outcome{}, perr
+		}
+		body = stored
 	}
 	deps := db.traceDependencies(trace)
 	// 7. The creating session's SELECT privilege on every relation the body reads (§9).

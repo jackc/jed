@@ -210,10 +210,15 @@ func (db *engine) ExecuteScript(sql string) (ScriptSummary, error) {
 // ScriptSummary. Separated so ExecuteScript's wrapper commit/rollback runs once on either path.
 func (db *engine) runScriptBody(sql string) (ScriptSummary, error) {
 	var summary ScriptSummary
+	// The characters before the current statement, counted incrementally: a statement's error
+	// position is shifted into the script's coordinates (spec/design/error-fields.md §10.1).
+	counted, before := 0, int32(0)
 	for span := range SplitStatements(sql) {
+		before += charCount(sql[counted:span.Offset])
+		counted = span.Offset
 		ast, err := db.parse(span.Text)
 		if err != nil {
-			return ScriptSummary{}, err
+			return ScriptSummary{}, shiftPosition(err, before)
 		}
 		// Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
 		// wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
@@ -224,7 +229,7 @@ func (db *engine) runScriptBody(sql string) (ScriptSummary, error) {
 		}
 		out, err := db.ExecuteStmtParams(ast, nil)
 		if err != nil {
-			return ScriptSummary{}, err
+			return ScriptSummary{}, shiftPosition(err, before)
 		}
 		summary.StatementsRun++
 		if out.HasRowsAffected {

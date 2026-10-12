@@ -1174,7 +1174,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 	case exprColumn:
 		// Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
 		// (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
-		r, err := s.resolveBare(e.Column)
+		r, err := s.resolveBareAt(e.Column, e.Pos)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1185,7 +1185,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// **parens-required** `(col).field` form (spec/design/composite.md §1/§S4), an
 		// ExprFieldAccess, never this bare qualified-column path (PG raises 42P01 for the
 		// unparenthesized `col.field` / `t.col.field` spellings).
-		r, err := s.resolveQualified(e.Qualifier, e.Column)
+		r, err := s.resolveQualifiedAt(e.Qualifier, e.Column, e.Pos)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}

@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 )
@@ -257,6 +258,11 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				// Validate the qualifier against the implicit scope, then resolve through the temp-first
 				// funnel (which, by preclude-overlaps, lands in the validated scope).
 				if err := db.checkTableQualifier(tref.DB, tref.Name); err != nil {
+					// An unknown qualified relation is positioned at the name (error-fields.md §10.2).
+					var e *EngineError
+					if errors.As(err, &e) && e.State == UndefinedTable {
+						e.withPosition(int32(tref.Src))
+					}
 					return nil, err
 				}
 				// Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
@@ -264,7 +270,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				// attachment resolves in its own snapshot — where its table lives ONLY.
 				tbl, ok := db.lkpTableScoped(tref.DB, tref.Name)
 				if !ok {
-					return nil, newError(UndefinedTable, "table does not exist: "+*tref.DB+"."+tref.Name)
+					return nil, newError(UndefinedTable, "table does not exist: "+*tref.DB+"."+tref.Name).
+						withPosition(int32(tref.Src))
 				}
 				if err := db.traceTableItem(&tref, tbl); err != nil {
 					return nil, err
@@ -323,7 +330,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			} else {
 				tbl, ok := db.lkpTable(tref.Name) // temp-first (temp-tables.md §3)
 				if !ok {
-					return nil, newError(UndefinedTable, "table does not exist: "+tref.Name)
+					return nil, newError(UndefinedTable, "table does not exist: "+tref.Name).
+						withPosition(int32(tref.Src))
 				}
 				if err := db.traceTableItem(&tref, tbl); err != nil {
 					return nil, err
@@ -860,7 +868,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			orderExpr = key.Expr
 		} else if key.Qualifier != "" {
 			// A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
-			if slotRes, err = s.resolveQualified(key.Qualifier, key.Column); err != nil {
+			if slotRes, err = s.resolveQualifiedAt(key.Qualifier, key.Column, key.Pos); err != nil {
 				return nil, err
 			}
 		} else {
@@ -873,7 +881,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			switch {
 			case matched == nil:
-				if slotRes, err = s.resolveBare(key.Column); err != nil {
+				if slotRes, err = s.resolveBareAt(key.Column, key.Pos); err != nil {
 					return nil, err
 				}
 			case matched.Kind == exprColumn:

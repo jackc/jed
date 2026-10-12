@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -246,6 +247,94 @@ func TestErrorFieldsDetailSharedCases(t *testing.T) {
 		if e.Code() != c.code || e.Detail != c.detail {
 			failures = append(failures, fmt.Sprintf("%s: got %s %q (%s), want %s %q",
 				c.name, e.Code(), e.Detail, e.Message, c.code, c.detail))
+		}
+	}
+	if len(failures) > 0 {
+		t.Error(strings.Join(failures, "\n"))
+	}
+}
+
+// positionCase is one case of the shared Position/Hint fixture (spec/errors/position_cases.txt).
+type positionCase struct {
+	name     string
+	setup    []string
+	run      string
+	script   bool
+	code     string
+	position int32  // 0 = the Position must be absent (`no-position`)
+	hint     string // "" = the Hint must be absent
+}
+
+func parsePositionCases(t *testing.T, text string) []positionCase {
+	t.Helper()
+	var cases []positionCase
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if name, ok := strings.CutPrefix(line, "case: "); ok {
+			cases = append(cases, positionCase{name: name})
+			continue
+		}
+		if len(cases) == 0 {
+			t.Fatalf("a directive before the first case: %q", line)
+		}
+		c := &cases[len(cases)-1]
+		if v, ok := strings.CutPrefix(line, "setup: "); ok {
+			c.setup = append(c.setup, v)
+		} else if v, ok := strings.CutPrefix(line, "run: "); ok {
+			c.run = v
+		} else if v, ok := strings.CutPrefix(line, "script: "); ok {
+			c.run = v
+			c.script = true
+		} else if v, ok := strings.CutPrefix(line, "code: "); ok {
+			c.code = v
+		} else if v, ok := strings.CutPrefix(line, "position: "); ok {
+			n, err := strconv.ParseInt(v, 10, 32)
+			if err != nil || n <= 0 {
+				t.Fatalf("position_cases position: %q", v)
+			}
+			c.position = int32(n)
+		} else if v, ok := strings.CutPrefix(line, "hint: "); ok {
+			c.hint = v
+		} else if line != "no-position" {
+			t.Fatalf("unknown position_cases directive: %q", line)
+		}
+	}
+	return cases
+}
+
+// The Position and Hint fields (spec/design/error-fields.md §10, §11): every case of the shared,
+// language-neutral fixture — the same file the Rust and TS cores run.
+func TestErrorFieldsPositionHintSharedCases(t *testing.T) {
+	text, err := os.ReadFile("../../spec/errors/position_cases.txt")
+	if err != nil {
+		t.Fatalf("read position_cases.txt: %v", err)
+	}
+	cases := parsePositionCases(t, string(text))
+	if len(cases) == 0 {
+		t.Fatal("no position cases")
+	}
+	var failures []string
+	for _, c := range cases {
+		db := fkSetup(t, c.setup...)
+		if c.script {
+			_, err = db.ExecuteScript(c.run)
+		} else {
+			_, err = queryOutcome(db, c.run, nil)
+		}
+		if err == nil {
+			failures = append(failures, fmt.Sprintf("%s: expected %s but succeeded", c.name, c.code))
+			continue
+		}
+		var e *EngineError
+		if !errors.As(err, &e) {
+			failures = append(failures, fmt.Sprintf("%s: non-engine error %v", c.name, err))
+			continue
+		}
+		if e.Code() != c.code || e.Position != c.position || e.Hint != c.hint {
+			failures = append(failures, fmt.Sprintf("%s: got %s %d %q (%s), want %s %d %q",
+				c.name, e.Code(), e.Position, e.Hint, e.Message, c.code, c.position, c.hint))
 		}
 	}
 	if len(failures) > 0 {

@@ -2022,12 +2022,13 @@ func resolveSetopOrderKey(key *orderKey, names []string) (int, error) {
 		return int(ord - 1), nil
 	}
 	if key.Qualifier != "" {
-		return 0, newError(UndefinedTable, "missing FROM-clause entry for table "+key.Qualifier)
+		return 0, newError(UndefinedTable, "missing FROM-clause entry for table "+key.Qualifier).
+			withPosition(int32(key.Pos))
 	}
 	for i, n := range names {
 		if n == key.Column {
 			return i, nil
 		}
 	}
-	return 0, newError(UndefinedColumn, "column "+key.Column+" does not exist")
+	return 0, newError(UndefinedColumn, "column "+key.Column+" does not exist").withPosition(int32(key.Pos))
 }

@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -79,13 +80,47 @@ type parser struct {
 	// (isQueryStartAtOffset, grammar.md §25). Precomputed once in one backward pass so every probe is
 	// O(1) — a long run of `(` costs linear time, not time per nesting level.
 	parenQuery []bool
+	// positions is each token's 1-based character position in the statement text
+	// (spec/design/error-fields.md §10.1), index-aligned with tokens; nil for a parse of stored text,
+	// which records none.
+	positions []int32
+	// furthest is the furthest token index the parse has examined through peek / advance — the token
+	// a parse error is positioned at (spec/design/error-fields.md §10.3).
+	furthest int
 }
 
-// NewParser builds a parser over the given tokens.
+// NewParser builds a parser over the given tokens of stored text: no source positions are recorded
+// (spec/design/error-fields.md §10.1).
 func newParser(tokens []token) *parser {
 	p := &parser{tokens: tokens}
 	p.parenQuery = p.computeParenQuery()
 	return p
+}
+
+// newParserWithPositions builds a parser over host-written text, recording each token's character
+// position (lexWithPositions).
+func newParserWithPositions(tokens []token, positions []int32) *parser {
+	p := newParser(tokens)
+	p.positions = positions
+	return p
+}
+
+// srcPosAt is the character position of token i (0 for stored text).
+func (p *parser) srcPosAt(i int) srcPos {
+	if i < len(p.positions) {
+		return srcPos(p.positions[i])
+	}
+	return 0
+}
+
+// here is the character position of the current token.
+func (p *parser) here() srcPos { return p.srcPosAt(p.pos) }
+
+// note records that the parse examined token i (spec/design/error-fields.md §10.3).
+func (p *parser) note(i int) {
+	if i > p.furthest {
+		p.furthest = i
+	}
 }
 
 // computeParenQuery builds the parenQuery table: the `(` at i begins a parenthesized query when what
@@ -138,18 +173,24 @@ func (p *parser) deepen() error {
 // undeepen restores one nesting level taken by deepen (success path only).
 func (p *parser) undeepen() { p.depth-- }
 
-// ParseSQL parses a single complete statement from sql.
+// ParseSQL parses a single complete statement from sql. An error carries the character position of
+// the token the parse stopped at (spec/design/error-fields.md §10.2/§10.3), except a class-54
+// program limit.
 func parseSQL(sql string) (statement, error) {
-	tokens, err := lex(sql)
+	tokens, positions, err := lexWithPositions(sql)
 	if err != nil {
 		return statement{}, err
 	}
-	p := newParser(tokens)
+	p := newParserWithPositions(tokens, positions)
 	stmt, err := p.parseStatement()
-	if err != nil {
-		return statement{}, err
+	if err == nil {
+		err = p.expectEof()
 	}
-	if err := p.expectEof(); err != nil {
+	if err != nil {
+		var e *EngineError
+		if errors.As(err, &e) && !strings.HasPrefix(e.Code(), "54") {
+			e.withPosition(int32(p.srcPosAt(p.furthest)))
+		}
 		return statement{}, err
 	}
 	return stmt, nil
@@ -408,7 +449,13 @@ func (p *parser) parseCreateView() (*createView, error) {
 		return nil, newError(SyntaxError, "unexpected trailing input")
 	}
 	body := renderTokens(p.tokens[start:end])
-	return &createView{Name: name, DB: db, OrReplace: orReplace, IfNotExists: ifNotExists, Columns: columns, Body: body, CheckOption: option}, nil
+	// The body's token positions, through the token after it (the re-lexed body's TokEof), so
+	// validating the body reports positions into the statement (spec/design/error-fields.md §10.1).
+	var bodyPositions []int32
+	if end < len(p.positions) {
+		bodyPositions = append([]int32(nil), p.positions[start:end+1]...)
+	}
+	return &createView{Name: name, DB: db, OrReplace: orReplace, IfNotExists: ifNotExists, Columns: columns, Body: body, BodyPositions: bodyPositions, CheckOption: option}, nil
 }
 
 // parseAlterView parses `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }`
@@ -2524,9 +2571,11 @@ func (p *parser) parseInsert() (*insert, error) {
 	// Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
 	// first expectIdentifier errors 42601 on `)`).
 	var columns []string
+	var columnPos []srcPos
 	if p.peek().Kind == tokLParen {
 		p.advance() // '('
 		for {
+			columnPos = append(columnPos, p.here())
 			name, err := p.expectIdentifier()
 			if err != nil {
 				return nil, err
@@ -2601,7 +2650,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &insert{Table: table, DB: dbQualifier, Columns: columns, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, DB: dbQualifier, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
@@ -2629,7 +2678,7 @@ func (p *parser) parseInsert() (*insert, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &insert{Table: table, DB: dbQualifier, Columns: columns, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
+	return &insert{Table: table, DB: dbQualifier, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
 }
 
 // parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —
@@ -2690,6 +2739,7 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 		}
 		var assignments []assignment
 		for {
+			pos := p.here()
 			column, err := p.expectIdentifier()
 			if err != nil {
 				return nil, err
@@ -2701,7 +2751,7 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 			if err != nil {
 				return nil, err
 			}
-			assignments = append(assignments, assignment{Column: column, Value: value})
+			assignments = append(assignments, assignment{Column: column, Pos: pos, Value: value})
 			if p.peek().Kind == tokComma {
 				p.advance()
 				continue
@@ -3569,6 +3619,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		return p.parseJsonTable()
 	}
 	namePos := p.pos
+	src := p.here()
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return tableRef{}, err
@@ -3686,7 +3737,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
 	return tableRef{
 		Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnAliases: columnAliases, ColumnDefs: columnDefs, Lateral: lateral,
-		NamePos: tokPos(namePos), AliasPos: aliasPos, ListOpen: listOpen, ListClose: listClose,
+		NamePos: tokPos(namePos), AliasPos: aliasPos, ListOpen: listOpen, ListClose: listClose, Src: src,
 		Depth: nestDepth(p.depth),
 	}, nil
 }
@@ -4408,17 +4459,17 @@ func classifyOrderKey(expr exprNode, collation string, descending, nullsFirst, a
 			return orderKey{Ordinal: &ord, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 		}
 	case exprColumn:
-		return orderKey{Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+		return orderKey{Column: expr.Column, Pos: expr.Pos, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 	case exprQualifiedColumn:
-		return orderKey{Qualifier: expr.Qualifier, Column: expr.Column, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
+		return orderKey{Qualifier: expr.Qualifier, Column: expr.Column, Pos: expr.Pos, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
 	case exprCollate:
 		// parseExpr folds a trailing `COLLATE "x"` into the key (collation.md §1). When it wraps a bare
 		// column, unwrap back to a column key carrying that explicit collation — exactly the column-only
 		// OrderKey the old parser built, so the column fast path is byte-identical.
 		if inner := expr.Collate.Inner; inner.Kind == exprColumn {
-			return orderKey{Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
+			return orderKey{Column: inner.Column, Pos: inner.Pos, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
 		} else if inner.Kind == exprQualifiedColumn {
-			return orderKey{Qualifier: inner.Qualifier, Column: inner.Column, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
+			return orderKey{Qualifier: inner.Qualifier, Column: inner.Column, Pos: inner.Pos, Collation: expr.Collate.Collation, Descending: descending, NullsFirst: nullsFirst}
 		}
 	}
 	return orderKey{Expr: &expr, Collation: collation, Descending: descending, NullsFirst: nullsFirst}
@@ -4541,6 +4592,7 @@ func (p *parser) parseUpdate() (*update, error) {
 
 	var assignments []assignment
 	for {
+		pos := p.here()
 		column, err := p.expectIdentifier()
 		if err != nil {
 			return nil, err
@@ -4565,7 +4617,7 @@ func (p *parser) parseUpdate() (*update, error) {
 				return nil, err
 			}
 		}
-		assignments = append(assignments, assignment{Column: column, IsDefault: isDefault, Value: value})
+		assignments = append(assignments, assignment{Column: column, Pos: pos, IsDefault: isDefault, Value: value})
 		if p.peek().Kind == tokComma {
 			p.advance()
 			continue
@@ -5394,6 +5446,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// as literals or keyword-led expressions. Recognize the unambiguous `identifier.identifier`
 	// shape first so a relation alias such as `null`, `cast`, or `case` remains usable.
 	if p.atQualifiedColumnRef() {
+		pos := p.here()
 		qualifier, err := p.expectIdentifier()
 		if err != nil {
 			return exprNode{}, err
@@ -5405,7 +5458,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: name}, nil
+		return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: name, Pos: pos}, nil
 	}
 	if p.peek().Kind == tokLParen {
 		p.advance()
@@ -5844,14 +5897,15 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen {
 			return p.parseFunctionCall()
 		}
+		pos := p.here()
 		qualifier, name, err := p.parseColumnRef()
 		if err != nil {
 			return exprNode{}, err
 		}
 		if qualifier != "" {
-			return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: name}, nil
+			return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: name, Pos: pos}, nil
 		}
-		return exprNode{Kind: exprColumn, Column: name}, nil
+		return exprNode{Kind: exprColumn, Column: name, Pos: pos}, nil
 	default:
 		return exprNode{}, newError(SyntaxError, "expected an expression")
 	}
@@ -6252,7 +6306,10 @@ func (p *parser) parseQualifiedTableName() (*string, string, error) {
 }
 
 // peek returns the current token without consuming it.
-func (p *parser) peek() token { return p.tokens[p.pos] }
+func (p *parser) peek() token {
+	p.note(p.pos)
+	return p.tokens[p.pos]
+}
 
 // peekKeyword returns the current token if it is a bare word (already folded to lowercase by
 // the lexer), else "". A quoted identifier is never a keyword (grammar.md §3).
@@ -6352,6 +6409,7 @@ func (p *parser) atWithClause() bool { return p.isWithClauseAtOffset(0) }
 
 // advance consumes and returns the current token.
 func (p *parser) advance() token {
+	p.note(p.pos)
 	t := p.tokens[p.pos]
 	if p.pos+1 < len(p.tokens) {
 		p.pos++
@@ -6443,11 +6501,22 @@ func parseExpression(text string) (exprNode, error) {
 // (tableRef NamePos/AliasPos/List*, StarPos) is an index into lex(text), which is what the rename
 // rewrites and `*` freezing edit.
 func parseViewDefinition(text string) (*queryExpr, int, error) {
+	return parseViewDefinitionAt(text, nil)
+}
+
+// parseViewDefinitionAt is parseViewDefinition for a body just written by the host, recording
+// positions (one per token of lex(text), as createView.BodyPositions holds) on the AST so a
+// resolution error points into the statement (spec/design/error-fields.md §10.1). A position list
+// that does not line up with the tokens is ignored.
+func parseViewDefinitionAt(text string, positions []int32) (*queryExpr, int, error) {
 	tokens, err := lex(text)
 	if err != nil {
 		return nil, 0, err
 	}
-	p := newParser(tokens)
+	if len(positions) != len(tokens) {
+		positions = nil
+	}
+	p := newParserWithPositions(tokens, positions)
 	body, err := p.parseSubquery()
 	if err != nil {
 		return nil, 0, err
