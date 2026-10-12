@@ -938,16 +938,17 @@ func identityTableDB(t *testing.T) *Session {
 	return db
 }
 
-// viewTableDB (v38): three entry_kind = 5 view entries after the table entry, in name order (n, v,
-// w) — the frozen `*` expansion, a column-list rename with a view dependency, and a table dependency
-// with zero columns. Must match the Ruby reference's VIEW_TABLE (spec/fileformat/verify.rb),
+// viewTableDB (v38, check options v39): three entry_kind = 5 view entries after the table entry, in
+// name order (n, v, w) — the frozen `*` expansion with a CASCADED check option, a column-list rename
+// with a view dependency and a LOCAL check option, and a table dependency with zero columns and no
+// check option. Must match the Ruby reference's VIEW_TABLE (spec/fileformat/verify.rb),
 // spec/design/views.md §3.
 func viewTableDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)")
 	run(t, db, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
-	run(t, db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0")
-	run(t, db, "CREATE VIEW w (x) AS SELECT a FROM v")
+	run(t, db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0 WITH CHECK OPTION")
+	run(t, db, "CREATE VIEW w (x) AS SELECT a FROM v WITH LOCAL CHECK OPTION")
 	run(t, db, "CREATE VIEW n AS SELECT count(*) AS c FROM t")
 	return db
 }
@@ -1397,6 +1398,36 @@ func TestViewGoldenReadsBack(t *testing.T) {
 	}
 	if got := queryRows(t, loaded, "SELECT c FROM n"); !reflect.DeepEqual(got, [][]Value{{IntValue(2)}}) {
 		t.Fatalf("SELECT c FROM n = %v", got)
+	}
+	got = queryRows(t, loaded, "SELECT name, check_option FROM jed_views ORDER BY name")
+	want = [][]Value{
+		{TextValue("n"), TextValue("NONE")},
+		{TextValue("v"), TextValue("CASCADED")},
+		{TextValue("w"), TextValue("LOCAL")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("jed_views check_option = %v, want %v", got, want)
+	}
+}
+
+// A view entry's check_option byte outside 0–2 is corruption (XX001, format.md *View entry*).
+func TestViewUnknownCheckOptionIsRejected(t *testing.T) {
+	image := fixture(t, "view_table.jed")
+	// View n's entry ends with its one dependency (kind 0, "t", zero columns), then check_option 0.
+	def := []byte("select count ( * ) as c from t")
+	defAt := bytes.Index(image, def)
+	if defAt < 0 {
+		t.Fatal("locate view n's definition")
+	}
+	optionAt := defAt + len(def) + 2 + 6 // after dep_count and the dependency
+	if image[optionAt] != 0 {
+		t.Fatalf("unexpected check_option byte %d", image[optionAt])
+	}
+	image[optionAt] = 3
+	refreshGoldenPageCRC(image, optionAt)
+	_, err := loadEngine(image)
+	if err == nil || err.(*EngineError).Code() != "XX001" {
+		t.Fatalf("unknown view check option: want XX001, got %v", err)
 	}
 }
 

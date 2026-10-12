@@ -53,6 +53,7 @@ type insertValuesPlan struct {
 	colTypes       []colType
 	pk             []int
 	checks         []namedCheck
+	viewChecks     []viewCheck
 	defaultExprs   []*rExpr
 	rindexes       []resolvedIndex
 	colls          []*Collation
@@ -915,6 +916,12 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if err != nil {
 		return outcome{}, err
 	}
+	// The check-option checks of a write through a view (views.md §15.6), nearest the table first;
+	// insertRows evaluates them per candidate row after its UNIQUE checks.
+	viewChecks, err := db.resolveViewChecks(table, vw)
+	if err != nil {
+		return outcome{}, err
+	}
 	stmtRng := newStmtRng()
 
 	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
@@ -1038,6 +1045,10 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
 			return outcome{}, err
 		}
+		// A check option's uncorrelated subqueries fold once too (views.md §15.6).
+		if err := db.foldViewChecks(viewChecks, bound, ctx, meter); err != nil {
+			return outcome{}, err
+		}
 		q, err := db.execQueryPlan(&plan, nil, bound, ctx)
 		if err != nil {
 			return outcome{}, err
@@ -1094,7 +1105,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		// RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
 		// one ceiling over the whole statement.
 		meter.Charge(q.cost)
-		affected, returned, err := db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, ctx, meter)
+		affected, returned, err := db.runInsertRows(table, store, ins.DB, pk, checks, viewChecks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, ctx, meter)
 		if err != nil {
 			return outcome{}, err
 		}
@@ -1275,13 +1286,16 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
 		return outcome{}, err
 	}
+	if err := db.foldViewChecks(viewChecks, bound, ctx, meter); err != nil {
+		return outcome{}, err
+	}
 	var affected int64
 	var returned [][]Value
 	if useSingle {
-		returned, err = db.insertOne(table, store, ins.DB, pk, checks, defaultExprs, nil, nil, stmtRng, provided, singleValues, retNodes, bound, ctx, meter)
+		returned, err = db.insertOne(table, store, ins.DB, pk, checks, viewChecks, defaultExprs, nil, nil, stmtRng, provided, singleValues, retNodes, bound, ctx, meter)
 		affected = 1
 	} else {
-		affected, returned, err = db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
+		affected, returned, err = db.runInsertRows(table, store, ins.DB, pk, checks, viewChecks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
 	}
 	if err != nil {
 		return outcome{}, err
@@ -1448,6 +1462,12 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 	if err != nil {
 		return nil, err
 	}
+	// The check-option checks of a write through a view (views.md §15.6). A plan with any is never
+	// cached (a write through a view bypasses the cache), so they fold in place per execution.
+	viewChecks, err := db.resolveViewChecks(table, vw)
+	if err != nil {
+		return nil, err
+	}
 
 	n := len(table.Columns)
 	provided := make([]int, n)
@@ -1557,6 +1577,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 		colTypes:       append([]colType(nil), store.colTypes...),
 		pk:             table.PKIndices(),
 		checks:         checks,
+		viewChecks:     viewChecks,
 		defaultExprs:   defaultExprs,
 		rindexes:       rindexes,
 		colls:          db.columnCollations(table.Columns),
@@ -1649,14 +1670,18 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 			}
 		}
 	}
+	// A check option's uncorrelated subqueries fold once too (views.md §15.6).
+	if err := db.foldViewChecks(plan.viewChecks, bound, ctx, meter); err != nil {
+		return outcome{}, err
+	}
 	var affected int64
 	var returned [][]Value
 	if useSingle {
-		returned, err = db.insertOne(plan.table, store, ins.DB, plan.pk, plan.checks, plan.defaultExprs,
+		returned, err = db.insertOne(plan.table, store, ins.DB, plan.pk, plan.checks, plan.viewChecks, plan.defaultExprs,
 			plan.rindexes, plan.colls, stmtRng, plan.provided, singleValues, plan.retNodes, bound, ctx, meter)
 		affected = 1
 	} else {
-		returned, err = db.insertRows(plan.table, store, ins.DB, plan.pk, plan.checks, plan.defaultExprs,
+		returned, err = db.insertRows(plan.table, store, ins.DB, plan.pk, plan.checks, plan.viewChecks, plan.defaultExprs,
 			plan.rindexes, plan.colls, stmtRng, plan.provided, rows, plan.retNodes, bound, ctx, meter)
 		affected = int64(len(rows))
 	}
@@ -1682,7 +1707,7 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	n := len(table.Columns)
 	// The eval env for phase-1 index-expression evaluation (index eval is unmetered; params/CTEs
 	// are empty — an index expression cannot reference them). The per-statement rng is shared with
@@ -1824,6 +1849,13 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 				return nil, err
 			}
 			rowPrefixes[k] = eks
+		}
+		// The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
+		// checks and its index keys, before the batch FOREIGN KEY and EXCLUDE passes.
+		if len(viewChecks) > 0 {
+			if err := evalViewChecks(viewChecks, row, &evalEnv{exec: db, rng: rng}, meter); err != nil {
+				return nil, err
+			}
 		}
 		prepared = append(prepared, preparedRow{key: key, row: row, prefixes: rowPrefixes})
 	}
@@ -1978,7 +2010,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 // insertOne is the plain one-candidate INSERT ... VALUES specialization. It retains the general
 // path's validation and write order (constraints.md §7) but needs no within-batch maps, stringified
 // byte keys, prepared-row slice, or per-index write buffers.
-func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	n := len(table.Columns)
 	var err error
 	env := &evalEnv{exec: db, rng: rng}
@@ -2058,6 +2090,9 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if err != nil {
 			return nil, err
 		}
+	}
+	if err := evalViewChecks(viewChecks, row, env, meter); err != nil {
+		return nil, err
 	}
 
 	relation := table.Name
@@ -2194,7 +2229,7 @@ func (db *engine) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *i
 // runInsertRows dispatches the validated candidate rows to the plain or the ON CONFLICT insert
 // path, shared by both INSERT sources. Returns (rows affected, RETURNING rows): a plain insert
 // affects every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
-func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
+func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
 	if conflict != nil {
 		// ON CONFLICT is reached only for a reserved scope (an attachment target is 0A000 in
 		// executeInsert). Keep dbScope so generated parent-side FK actions retain main versus temp.
@@ -2204,7 +2239,7 @@ func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *str
 	if err != nil {
 		return 0, nil, err
 	}
-	returned, err := db.insertRows(table, store, dbScope, pk, checks, defaultExprs, rindexes,
+	returned, err := db.insertRows(table, store, dbScope, pk, checks, viewChecks, defaultExprs, rindexes,
 		db.columnCollations(table.Columns), rng, provided, rows, returning, params, ctes, meter)
 	if err != nil {
 		return 0, nil, err
@@ -3577,6 +3612,12 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	if err != nil {
 		return outcome{}, err
 	}
+	// The check-option checks of an UPDATE through a view (views.md §15.6), evaluated on the new rows
+	// after the end-state key checks.
+	viewChecks, err := db.resolveViewChecks(table, vw)
+	if err != nil {
+		return outcome{}, err
+	}
 	// All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
 	// any scan.
 	ptys, err := ptypes.finalize()
@@ -3612,6 +3653,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
 			return outcome{}, err
 		}
+	}
+	if err := db.foldViewChecks(viewChecks, bound, ctx, meter); err != nil {
+		return outcome{}, err
 	}
 	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
 	// The scan + per-row column resolution read the pin (readSnap) — under the writable-CTE read pin
@@ -3854,6 +3898,14 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				}
 				batch[string(prefix)] = struct{}{}
 			}
+		}
+	}
+
+	// The check option (views.md §15.6): each new row, in scan order, after the end-state PK and
+	// UNIQUE checks and before EXCLUDE and FOREIGN KEY.
+	for _, u := range updates {
+		if err := evalViewChecks(viewChecks, u.row, env, meter); err != nil {
+			return outcome{}, err
 		}
 	}
 

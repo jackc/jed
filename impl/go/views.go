@@ -462,6 +462,12 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 			return outcome{}, newError(UndefinedParameter, fmt.Sprintf("there is no parameter $%d", t.Int))
 		}
 	}
+	// A check option needs the view's own body to be updatable for INSERT / UPDATE (§15.6).
+	if cv.CheckOption != checkOptionNone {
+		if sel, _ := db.updatableShape(body, true); sel == nil {
+			return outcome{}, viewNotSupported("WITH CHECK OPTION is supported only on automatically updatable views")
+		}
+	}
 	// 5. Column-list arity, then duplicate final output names, from the body as planned.
 	bodyNames := append([]string(nil), plan.columnNames()...)
 	bodyTypes := append([]resolvedType(nil), plan.columnTypes()...)
@@ -534,7 +540,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 		}
 	}
 	// 9 (12 under OR REPLACE). Write the catalog entry; it must fit one catalog page.
-	def := &viewDef{Name: cv.Name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth}
+	def := &viewDef{Name: cv.Name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth, CheckOption: cv.CheckOption}
 	if err := db.checkViewEntryFits(def); err != nil {
 		return outcome{}, err
 	}
@@ -1109,7 +1115,7 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 		if definition != view.Definition || !viewDepsEqual(expected, view.Deps) {
 			updated := &viewDef{
 				Name: view.Name, Columns: view.Columns, Definition: definition, Deps: expected, Body: body,
-				Depth: depth,
+				Depth: depth, CheckOption: view.CheckOption,
 			}
 			if err := db.checkViewEntryFits(updated); err != nil {
 				return err

@@ -314,6 +314,8 @@ type viewDef struct {
 	Body *queryExpr
 	// Depth is the body's nesting depth (spec/design/views.md §4.1), from the same parse as Body.
 	Depth int
+	// CheckOption is the view's check option, if any (spec/design/views.md §15.6).
+	CheckOption checkOption
 }
 
 // viewDepKind is what a view dependency names (format.md *View entry* dep_kind).

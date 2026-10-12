@@ -453,7 +453,20 @@ type createView struct {
 	IfNotExists bool
 	Columns     []string // nil = no column list
 	Body        string
+	// CheckOption is a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH
+	// CHECK OPTION` is checkOptionCascaded.
+	CheckOption checkOption
 }
+
+// checkOption is a view's check option (spec/design/views.md §15.6). The values are the persisted
+// `check_option` byte (format.md *View entry*).
+type checkOption uint8
+
+const (
+	checkOptionNone     checkOption = 0
+	checkOptionLocal    checkOption = 1
+	checkOptionCascaded checkOption = 2
+)
 
 // alterView is `ALTER VIEW [IF EXISTS] [db.]name RENAME …` (spec/design/views.md §7.1): exactly one of
 // RenameTo / RenameColumn is set. `ALTER TABLE v RENAME …` on a view executes the same rename.

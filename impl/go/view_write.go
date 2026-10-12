@@ -11,7 +11,8 @@ package jed
 // resolution). An updatable column resolves to the base column itself; a read-only one to its
 // select item, resolved in the view body's isolated scope at the depth of the reference
 // (resolveLayerRef). The views' WHERE clauses resolve the same way and are AND-ed ahead of the
-// statement's own (resolveWriteFilter).
+// statement's own (resolveWriteFilter); the checked views' WHERE clauses become the statement's
+// check-option checks (resolveViewChecks, §15.6).
 
 import "fmt"
 
@@ -57,6 +58,8 @@ type writeLayer struct {
 	belowLabel string
 	// filter is the view's WHERE, written against below.
 	filter *exprNode
+	// check is the view's own check option (views.md §15.6); checkOptionNone for the table.
+	check checkOption
 }
 
 // follow returns where layer column col leads: a base table column (owner nil), or the read-only
@@ -99,6 +102,52 @@ type chainLevel struct {
 	label  string
 	cols   []layerCol
 	filter *exprNode
+}
+
+// viewCheck is one check-option check of a write through a view (views.md §15.6): the checked view's
+// name and its WHERE resolved over the base row.
+type viewCheck struct {
+	view string
+	expr *rExpr
+}
+
+// checkOptionViolation is the 44000 a new row that fails a checked view's WHERE raises (views.md
+// §15.6).
+func checkOptionViolation(view string) error {
+	return newError(WithCheckOptionViolation, fmt.Sprintf("new row violates check option for view \"%s\"", view))
+}
+
+// evalViewChecks evaluates the check-option checks (views.md §15.6) on one new row, nearest the table
+// first: each WHERE is a filter, so FALSE or NULL fails with 44000 naming the view. Metered
+// expression work.
+func evalViewChecks(checks []viewCheck, row storedRow, env *evalEnv, m *costMeter) error {
+	if len(checks) == 0 {
+		return nil
+	}
+	if err := m.Guard(); err != nil {
+		return err
+	}
+	for _, c := range checks {
+		keep, err := c.expr.evalFilter(row, env, m)
+		if err != nil {
+			return err
+		}
+		if !keep {
+			return checkOptionViolation(c.view)
+		}
+	}
+	return nil
+}
+
+// foldViewChecks folds the uncorrelated subqueries of the check-option checks once per statement
+// (cost.md §3), reading the pre-statement snapshot.
+func (db *engine) foldViewChecks(checks []viewCheck, bound []Value, ctx cteCtx, meter *costMeter) error {
+	for _, c := range checks {
+		if err := db.foldUncorrelatedInRExpr(c.expr, bound, ctx, &meter.Accrued); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func notUpdatable(kind writeKind, view string) error {
@@ -160,14 +209,15 @@ func (db *engine) dmlTargetView(q *string, name string) (*viewDef, error) {
 
 // updatableShape returns the single FROM item of an automatically updatable body (views.md §15.1),
 // or nil. For INSERT / UPDATE (checkCols) the body must also output at least one plain column
-// reference.
+// reference. A stored body has no `*`; at CREATE VIEW a `*` or `label.*` item counts as plain column
+// references, which it expands to (§1.1 step 4).
 func (db *engine) updatableShape(body *queryExpr, checkCols bool) (*selectStmt, *tableRef) {
 	sel := body.Select
 	if sel == nil {
 		return nil, nil
 	}
 	if sel.Distinct || len(sel.GroupBy) > 0 || sel.Having != nil || sel.Limit != nil || sel.Offset != nil ||
-		len(sel.Joins) > 0 || sel.JoinGroup || sel.Items.All {
+		len(sel.Joins) > 0 || sel.JoinGroup {
 		return nil, nil
 	}
 	levelHas := func(e exprNode) bool { return exprHasAggregate(e) || exprHasWindow(e) }
@@ -198,9 +248,10 @@ func (db *engine) updatableShape(body *queryExpr, checkCols bool) (*selectStmt, 
 		if tref.Alias != nil {
 			label = *tref.Alias
 		}
-		plain := false
+		plain := sel.Items.All
 		for _, it := range sel.Items.Items {
-			if it.Expr.Kind == exprColumn || (it.Expr.Kind == exprQualifiedColumn && it.Expr.Qualifier == label) {
+			if it.Expr.Kind == exprColumn ||
+				((it.Expr.Kind == exprQualifiedColumn || it.Expr.Kind == exprQualifiedStar) && it.Expr.Qualifier == label) {
 				plain = true
 				break
 			}
@@ -358,7 +409,7 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 		}
 		layer = &writeLayer{
 			view: level.view.Name, columns: synth.Columns, cols: level.cols, below: layer,
-			belowLabel: level.label, filter: level.filter,
+			belowLabel: level.label, filter: level.filter, check: level.view.CheckOption,
 		}
 	}
 	vw := &viewWrite{view: layer.view, table: table.Name, top: layer}
@@ -421,6 +472,35 @@ func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, u
 			return nil, err
 		}
 		join(node)
+	}
+	return out, nil
+}
+
+// resolveViewChecks returns the check-option checks of a write through a view (views.md §15.6): the
+// WHERE of every checked view — one with its own check option, or below a CASCADED one — nearest the
+// table first, each resolved in its body's isolated scope over the base row. Empty when the target is
+// a table or no view in the chain is checked.
+func (db *engine) resolveViewChecks(table *catTable, vw *viewWrite) ([]viewCheck, error) {
+	if vw == nil {
+		return nil, nil
+	}
+	var out []viewCheck
+	cascaded := false
+	for layer := vw.top; layer != nil; layer = layer.below {
+		if layer.view == "" {
+			continue
+		}
+		if (layer.check != checkOptionNone || cascaded) && layer.filter != nil {
+			ls := layerBodyScope(db, table, 0, layer.belowLabel, layer.below)
+			node, err := resolveBooleanFilter(ls, layer.filter, &paramTypes{})
+			if err != nil {
+				return nil, err
+			}
+			out = append([]viewCheck{{view: layer.view, expr: node}}, out...)
+		}
+		if layer.check == checkOptionCascaded {
+			cascaded = true
+		}
 	}
 	return out, nil
 }

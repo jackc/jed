@@ -652,6 +652,7 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "name", Type: scalarT(scalarText), NotNull: true},
 			{Name: "definition", Type: scalarT(scalarText), NotNull: true},
 			{Name: "columns", Type: textArr, NotNull: true},
+			{Name: "check_option", Type: scalarT(scalarText), NotNull: true},
 		}}
 	default: // srfJedStatistics
 		return &catTable{Name: "jed_statistics", Columns: []catColumn{
@@ -1075,8 +1076,9 @@ func (db *engine) jedTypeFieldsRows(sp *srfPlan, m *costMeter) ([]storedRow, err
 }
 
 // jedViewsRows generates the rows of the jed_views catalog relation (introspection.md §5.4): one row
-// per view of the scope's snapshot, in ascending name byte order — the stored definition text and the
-// output column names. Cost mirrors jedTablesRows.
+// per view of the scope's snapshot, in ascending name byte order — the stored definition text, the
+// output column names, and the check option (NONE / LOCAL / CASCADED, views.md §15.6). Cost mirrors
+// jedTablesRows.
 func (db *engine) jedViewsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 	snap := db.snapForScope(sp.introspectScope)
 	if snap == nil {
@@ -1092,7 +1094,14 @@ func (db *engine) jedViewsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 		for i, c := range v.Columns {
 			cols[i] = TextValue(c)
 		}
-		out = append(out, storedRow{TextValue(v.Name), TextValue(v.Definition), ArrayValue(cols)})
+		check := "NONE"
+		switch v.CheckOption {
+		case checkOptionLocal:
+			check = "LOCAL"
+		case checkOptionCascaded:
+			check = "CASCADED"
+		}
+		out = append(out, storedRow{TextValue(v.Name), TextValue(v.Definition), ArrayValue(cols), TextValue(check)})
 	}
 	return out, nil
 }

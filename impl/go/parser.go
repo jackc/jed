@@ -337,10 +337,9 @@ func (p *parser) atCreateView() bool {
 
 // parseCreateView parses `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS
 // subquery_expr` (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end of
-// the statement and is captured as its canonical token text. A `WITH ( … )` option list after the name
-// and a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option is
-// detected after the body is parsed, so a body syntax error is reported first. `OR REPLACE` with `IF
-// NOT EXISTS` is 42601.
+// the statement and is captured as its canonical token text. A trailing `WITH [CASCADED | LOCAL] CHECK
+// OPTION` is cut off before the body and gives the view a check option (§15.6). A `WITH ( … )` option
+// list after the name is a deferred form (0A000). `OR REPLACE` with `IF NOT EXISTS` is 42601.
 func (p *parser) parseCreateView() (*createView, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
@@ -395,24 +394,21 @@ func (p *parser) parseCreateView() (*createView, error) {
 		return nil, err
 	}
 	// A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed (an
-	// unreserved `with` would otherwise be read as a table alias) and refused after it.
-	checkOption := p.trailingCheckOption()
-	if checkOption >= 0 {
-		p.tokens[checkOption] = token{Kind: tokEof}
+	// unreserved `with` would otherwise be read as a table alias).
+	checkAt, option := p.trailingCheckOption()
+	if checkAt >= 0 {
+		p.tokens[checkAt] = token{Kind: tokEof}
 	}
 	start := p.pos
 	if _, err := p.parseSubquery(); err != nil {
 		return nil, err
 	}
 	end := p.pos
-	if checkOption >= 0 {
-		if end != checkOption {
-			return nil, newError(SyntaxError, "unexpected trailing input")
-		}
-		return nil, newError(FeatureNotSupported, "WITH CHECK OPTION is not supported")
+	if checkAt >= 0 && end != checkAt {
+		return nil, newError(SyntaxError, "unexpected trailing input")
 	}
 	body := renderTokens(p.tokens[start:end])
-	return &createView{Name: name, DB: db, OrReplace: orReplace, IfNotExists: ifNotExists, Columns: columns, Body: body}, nil
+	return &createView{Name: name, DB: db, OrReplace: orReplace, IfNotExists: ifNotExists, Columns: columns, Body: body, CheckOption: option}, nil
 }
 
 // parseAlterView parses `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }`
@@ -470,9 +466,10 @@ func (p *parser) parseAlterView() (*alterView, error) {
 	return av, nil
 }
 
-// trailingCheckOption returns the index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the
-// end of the token stream (views.md §12), or -1 if the statement does not end with one.
-func (p *parser) trailingCheckOption() int {
+// trailingCheckOption returns the index and option of a trailing `WITH [CASCADED | LOCAL] CHECK
+// OPTION` at the end of the token stream (views.md §15.6), or -1 and checkOptionNone if the statement
+// does not end with one. Bare `WITH CHECK OPTION` is CASCADED.
+func (p *parser) trailingCheckOption() (int, checkOption) {
 	end := len(p.tokens)
 	if end > 0 && p.tokens[end-1].Kind == tokEof {
 		end--
@@ -481,15 +478,20 @@ func (p *parser) trailingCheckOption() int {
 		return i >= 0 && i < len(p.tokens) && p.tokens[i].Kind == tokWord && p.tokens[i].Word == w
 	}
 	if end < p.pos+3 || !word(end-1, "option") || !word(end-2, "check") {
-		return -1
+		return -1, checkOptionNone
 	}
 	if word(end-3, "with") {
-		return end - 3
+		return end - 3, checkOptionCascaded
 	}
-	if end >= p.pos+4 && (word(end-3, "cascaded") || word(end-3, "local")) && word(end-4, "with") {
-		return end - 4
+	if end >= p.pos+4 && word(end-4, "with") {
+		if word(end-3, "cascaded") {
+			return end - 4, checkOptionCascaded
+		}
+		if word(end-3, "local") {
+			return end - 4, checkOptionLocal
+		}
 	}
-	return -1
+	return -1, checkOptionNone
 }
 
 // parseDropView parses `DROP VIEW [IF EXISTS] [db.]name [, …] [CASCADE | RESTRICT]` (views.md §1).
