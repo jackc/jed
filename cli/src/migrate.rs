@@ -123,8 +123,9 @@ fn run_apply(argv: &[String]) -> u8 {
     }
 }
 
-/// Step one version at a time toward each resolved target, printing each migration applied
-/// (per-step progress, since the library's OnStart hook is a deferred feature, design.md §11).
+/// Step one version at a time toward each resolved target, printing each migration once it has
+/// applied (the line confirms the step committed; the library's `on_start` hook, design.md §6.2,
+/// fires before a step runs, so it is not used here).
 fn apply_targets(m: &mut Migrator, targets: &[u32]) -> Result<(), MigrateError> {
     let mut cur = m.current_version()?;
     let mut steps = 0u32;
@@ -318,6 +319,7 @@ fn build_migrator(db: &Database, c: &Common) -> Result<Migrator, u8> {
         migrations,
         Options {
             version_table: c.version_table.clone(),
+            ..Options::default()
         },
     )
     .map_err(|e| {

@@ -23,11 +23,25 @@ export const DEFAULT_VERSION_TABLE = "schema_version";
 // into SQL, so validating it keeps the interpolation safe by construction.
 const VERSION_TABLE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
 
+// Direction is the direction of one migration step.
+export type Direction = "up" | "down";
+
+// OnStart is the progress callback of Options.onStart: called with the migration's sequence,
+// its file name, the direction, and the SQL of the half about to run.
+export type OnStart = (sequence: number, name: string, direction: Direction, sql: string) => void;
+
 // Options configures a Migrator.
 export type Options = {
   // versionTable overrides the default "schema_version". May be a bare name or a name
   // qualified by an attached-database name ("reports.schema_version").
   versionTable?: string;
+  // onStart, if set, is called once before each migration step runs (design.md §6.2, tern's
+  // OnStart) with the migration's sequence, its file name, the direction ("up" or "down"), and
+  // the SQL of the half about to run. A down step reports the migration's own sequence (the one
+  // being reversed), not the version it lands on. It is not called on the already-at-target fast
+  // path, for a refused target, or for a down step refused as irreversible, and it fires before
+  // the step's transaction opens.
+  onStart?: OnStart;
 };
 
 // Status is the result of Migrator.status.
@@ -44,6 +58,7 @@ export class Migrator {
   private readonly session: Session;
   private readonly _migrations: Migration[];
   private readonly _versionTable: string;
+  private readonly onStart: OnStart | undefined;
 
   // Build a Migrator over db and the (already loaded, e.g. via loadMigrations) migrations. It
   // mints one internal read-write session that every step runs on — load-bearing: jed's bare
@@ -60,6 +75,7 @@ export class Migrator {
     this.session = db.session();
     this._migrations = sorted;
     this._versionTable = table;
+    this.onStart = opts.onStart;
   }
 
   // close releases the Migrator's internal session. Idempotent.
@@ -133,7 +149,7 @@ export class Migrator {
   // up applies migration v's up half, then bumps the version to v — one atomic step.
   private up(v: number): void {
     const mg = this._migrations[v - 1];
-    this.runStep(mg.name, "up", mg.up, v);
+    this.runStep(mg, "up", mg.up, v);
   }
 
   // down applies migration v's down half, then bumps the version to v-1 — one atomic step. A
@@ -141,15 +157,18 @@ export class Migrator {
   private down(v: number): void {
     const mg = this._migrations[v - 1];
     if (isIrreversible(mg)) throw new IrreversibleMigrationError(mg.sequence, mg.name);
-    this.runStep(mg.name, "down", mg.down as string, v - 1);
+    this.runStep(mg, "down", mg.down as string, v - 1);
   }
 
   // runStep runs one migration half plus the version bump in a single write transaction
   // (design.md §6). Each statement runs via executeScript joining the open transaction, which
   // rejects in-script BEGIN/COMMIT/ROLLBACK (0A000) so the schema change and the version bump
   // are one atomic unit. On any error the transaction is rolled back (the step made no change)
-  // and a MigrationError naming the migration and failing statement is thrown.
-  private runStep(name: string, direction: string, sql: string, newVersion: number): void {
+  // and a MigrationError naming the migration and failing statement is thrown. The onStart
+  // callback, if set, fires first — before the transaction opens, so a throwing callback leaves
+  // no transaction behind.
+  private runStep(mg: Migration, direction: Direction, sql: string, newVersion: number): void {
+    this.onStart?.(mg.sequence, mg.name, direction, sql);
     this.session.begin(true);
     for (const span of splitStatements(sql)) {
       try {
@@ -157,7 +176,7 @@ export class Migrator {
       } catch (e) {
         this.session.rollback();
         if (e instanceof EngineError) {
-          throw new MigrationError(name, direction, span.text, e);
+          throw new MigrationError(mg.name, direction, span.text, e);
         }
         throw e;
       }

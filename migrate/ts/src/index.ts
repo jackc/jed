@@ -32,6 +32,13 @@ export {
 } from "./errors.ts";
 export { loadMigrations, loadMigrationsFromEntries } from "./load.ts";
 export { isIrreversible, type Migration, SEPARATOR } from "./migration.ts";
-export { DEFAULT_VERSION_TABLE, Migrator, type Options, type Status } from "./migrator.ts";
+export {
+  DEFAULT_VERSION_TABLE,
+  type Direction,
+  Migrator,
+  type OnStart,
+  type Options,
+  type Status,
+} from "./migrator.ts";
 export { newMigration } from "./scaffold.ts";
 export { resolveTargets } from "./target.ts";

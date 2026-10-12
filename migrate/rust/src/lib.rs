@@ -42,6 +42,6 @@ mod target;
 pub use error::MigrateError;
 pub use load::{load_migrations, load_migrations_from_entries};
 pub use migration::{Migration, SEPARATOR};
-pub use migrator::{DEFAULT_VERSION_TABLE, Migrator, Options, Status};
+pub use migrator::{DEFAULT_VERSION_TABLE, Migrator, OnStart, Options, Status};
 pub use scaffold::new_migration;
 pub use target::resolve_targets;

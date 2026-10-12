@@ -16,6 +16,7 @@ import {
   MigrationError,
   Migrator,
   newMigration,
+  type Options,
   resolveTargets,
 } from "../src/index.ts";
 
@@ -274,6 +275,95 @@ test("setVersion range-checks and repairs", () => {
     );
     m.setVersion(3);
     assert.deepEqual(m.status(), { current: 3, target: 3, pending: 0 });
+  } finally {
+    m.close();
+  }
+});
+
+// recordingOptions returns Options whose onStart records every call into the returned log as
+// [sequence, name, direction, sql].
+function recordingOptions(): { opts: Options; events: [number, string, string, string][] } {
+  const events: [number, string, string, string][] = [];
+  const opts: Options = {
+    onStart: (sequence, name, direction, sql) => {
+      events.push([sequence, name, direction, sql]);
+    },
+  };
+  return { opts, events };
+}
+
+test("onStart reports each step", () => {
+  const db = memDb();
+  const { opts, events } = recordingOptions();
+  const m = new Migrator(db, loadMigrations(testdata("blog")), opts);
+  try {
+    const mg = m.migrations;
+    // Up 0 → 3: one call per step, in order, each with that migration's up half.
+    m.migrate();
+    assert.deepEqual(events, [
+      [1, mg[0].name, "up", mg[0].up],
+      [2, mg[1].name, "up", mg[1].up],
+      [3, mg[2].name, "up", mg[2].up],
+    ]);
+    // The already-at-target fast path and a refused target run no step, so no call.
+    events.length = 0;
+    m.migrate();
+    assert.throws(() => m.migrateTo(4), BadVersionError);
+    m.setVersion(3);
+    assert.deepEqual(events, []);
+    // Down 3 → 1: each step reports the migration being reversed (its own sequence) and its
+    // down half.
+    m.migrateTo(1);
+    assert.deepEqual(events, [
+      [3, mg[2].name, "down", mg[2].down],
+      [2, mg[1].name, "down", mg[1].down],
+    ]);
+  } finally {
+    m.close();
+  }
+});
+
+test("onStart skips a refused irreversible step and precedes a failure", () => {
+  const { opts, events } = recordingOptions();
+  const m = new Migrator(memDb(), loadMigrations(testdata("irreversible")), opts);
+  try {
+    m.migrate();
+    // The down through the irreversible 002 is refused before the step starts: no call.
+    events.length = 0;
+    assert.throws(() => m.migrateTo(0), IrreversibleMigrationError);
+    assert.deepEqual(events, []);
+  } finally {
+    m.close();
+  }
+  // A step that then fails was already reported.
+  const up = "insert into nope (id) values (1);";
+  const bad = new Migrator(memDb(), [{ sequence: 1, name: "001_bad", up, down: null }], opts);
+  try {
+    assert.throws(() => bad.migrate(), MigrationError);
+    assert.deepEqual(events, [[1, "001_bad", "up", up]]);
+  } finally {
+    bad.close();
+  }
+});
+
+test("a throwing onStart aborts before the step's transaction opens", () => {
+  const db = memDb();
+  const boom = new Error("boom");
+  const m = new Migrator(db, loadMigrations(testdata("blog")), {
+    onStart: (sequence) => {
+      if (sequence === 2) throw boom;
+    },
+  });
+  try {
+    assert.throws(
+      () => m.migrate(),
+      (e: unknown) => e === boom,
+    );
+    // Step 1 committed; step 2 never began, so no transaction is left open and the migrator
+    // keeps working.
+    assert.equal(m.currentVersion(), 1);
+    m.migrateTo(0);
+    assert.equal(m.currentVersion(), 0);
   } finally {
     m.close();
   }

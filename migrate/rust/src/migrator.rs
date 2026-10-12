@@ -10,12 +10,33 @@ use crate::migration::Migration;
 /// There is no schema qualifier — jed has no schema namespace.
 pub const DEFAULT_VERSION_TABLE: &str = "schema_version";
 
+/// The progress callback type of [`Options::on_start`]: called with the migration's
+/// `sequence`, its file `name`, the `direction` (`"up"` or `"down"`), and the `sql` of the half
+/// about to run.
+pub type OnStart = Box<dyn FnMut(u32, &str, &str, &str)>;
+
 /// Configuration for a [`Migrator`].
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct Options {
     /// Overrides the default `schema_version` table name. May be a bare name or a name
     /// qualified by an attached-database name (`reports.schema_version`).
     pub version_table: Option<String>,
+    /// If set, called once before each migration step runs (design.md §6.2, tern's `OnStart`)
+    /// with the migration's sequence, its file name, the direction (`"up"` or `"down"`), and
+    /// the SQL of the half about to run. A down step reports the migration's own sequence (the
+    /// one being reversed), not the version it lands on. It is not called on the
+    /// already-at-target fast path, for a refused target, or for a down step refused as
+    /// irreversible, and it fires before the step's transaction opens.
+    pub on_start: Option<OnStart>,
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("version_table", &self.version_table)
+            .field("on_start", &self.on_start.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 /// The result of [`Migrator::status`].
@@ -36,6 +57,7 @@ pub struct Migrator {
     session: Session,
     migrations: Vec<Migration>,
     version_table: String,
+    on_start: Option<OnStart>,
 }
 
 impl Migrator {
@@ -64,6 +86,7 @@ impl Migrator {
             session: db.session(SessionOptions::default()),
             migrations,
             version_table: table,
+            on_start: opts.on_start,
         })
     }
 
@@ -173,7 +196,7 @@ impl Migrator {
     fn up(&mut self, v: u32) -> Result<(), MigrateError> {
         let mg = &self.migrations[(v - 1) as usize];
         let (name, sql) = (mg.name.clone(), mg.up.clone());
-        self.run_step(&name, "up", &sql, v)
+        self.run_step(v, &name, "up", &sql, v)
     }
 
     /// Apply migration `v`'s down half, then bump the version to `v - 1` — one atomic step. A
@@ -187,7 +210,7 @@ impl Migrator {
             }),
             Some(down) => {
                 let (name, sql) = (mg.name.clone(), down.clone());
-                self.run_step(&name, "down", &sql, v - 1)
+                self.run_step(v, &name, "down", &sql, v - 1)
             }
         }
     }
@@ -197,14 +220,19 @@ impl Migrator {
     /// transaction, which rejects in-script `BEGIN`/`COMMIT`/`ROLLBACK` (`0A000`) so the
     /// schema change and the version bump are one atomic unit. On any error the transaction
     /// is rolled back and a [`MigrateError::Migration`] naming the migration and failing
-    /// statement is returned.
+    /// statement is returned. The `on_start` callback, if set, fires first — before the
+    /// transaction opens, so a panicking callback leaves no transaction behind.
     fn run_step(
         &mut self,
+        sequence: u32,
         name: &str,
         direction: &'static str,
         sql: &str,
         new_version: u32,
     ) -> Result<(), MigrateError> {
+        if let Some(on_start) = self.on_start.as_mut() {
+            on_start(sequence, name, direction, sql);
+        }
         self.session.begin(true)?;
         for span in split_statements(sql) {
             if let Err(e) = self.session.execute_script(span.text()) {

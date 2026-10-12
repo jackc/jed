@@ -364,3 +364,116 @@ func TestSetVersionRangeAndRepair(t *testing.T) {
 		t.Fatalf("status after repair = %+v, want {3 3 0}", s)
 	}
 }
+
+// startEvent is one recorded OnStart call.
+type startEvent struct {
+	Sequence  int
+	Name      string
+	Direction string
+	SQL       string
+}
+
+func TestOnStartReportsEachStep(t *testing.T) {
+	db := memDB(t)
+	migrations, err := LoadMigrations(blogDir)
+	if err != nil {
+		t.Fatalf("LoadMigrations: %v", err)
+	}
+	var events []startEvent
+	m, err := NewMigrator(db, migrations, Options{OnStart: func(sequence int, name, direction, sql string) {
+		events = append(events, startEvent{sequence, name, direction, sql})
+	}})
+	if err != nil {
+		t.Fatalf("NewMigrator: %v", err)
+	}
+	defer m.Close()
+	mg := m.Migrations()
+
+	// Up 0 → 3: one call per step, in order, each with that migration's up half.
+	if err := m.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	want := []startEvent{
+		{1, mg[0].Name, "up", mg[0].Up},
+		{2, mg[1].Name, "up", mg[1].Up},
+		{3, mg[2].Name, "up", mg[2].Up},
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("up events = %+v; want %+v", events, want)
+	}
+
+	// The already-at-target fast path and a refused target run no step, so no call.
+	events = nil
+	if err := m.Migrate(); err != nil {
+		t.Fatalf("Migrate (no-op): %v", err)
+	}
+	var bv *BadVersion
+	if err := m.MigrateTo(4); !errors.As(err, &bv) {
+		t.Fatalf("MigrateTo(4) error = %v; want *BadVersion", err)
+	}
+	if err := m.SetVersion(3); err != nil {
+		t.Fatalf("SetVersion(3): %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events for no-op / refused / set-version = %+v; want none", events)
+	}
+
+	// Down 3 → 1: each step reports the migration being reversed (its own sequence) and its
+	// down half.
+	if err := m.MigrateTo(1); err != nil {
+		t.Fatalf("MigrateTo(1): %v", err)
+	}
+	want = []startEvent{
+		{3, mg[2].Name, "down", mg[2].Down},
+		{2, mg[1].Name, "down", mg[1].Down},
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("down events = %+v; want %+v", events, want)
+	}
+}
+
+func TestOnStartSkipsRefusedIrreversibleStepAndPrecedesFailure(t *testing.T) {
+	db := memDB(t)
+	migrations, err := LoadMigrations(irreversibleDir)
+	if err != nil {
+		t.Fatalf("LoadMigrations: %v", err)
+	}
+	var events []startEvent
+	m, err := NewMigrator(db, migrations, Options{OnStart: func(sequence int, name, direction, sql string) {
+		events = append(events, startEvent{sequence, name, direction, sql})
+	}})
+	if err != nil {
+		t.Fatalf("NewMigrator: %v", err)
+	}
+	defer m.Close()
+	if err := m.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	// The down through the irreversible 002 is refused before the step starts: no call.
+	events = nil
+	var im *IrreversibleMigration
+	if err := m.MigrateTo(0); !errors.As(err, &im) {
+		t.Fatalf("MigrateTo(0) error = %v; want *IrreversibleMigration", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events for refused irreversible down = %+v; want none", events)
+	}
+
+	// A step that then fails was already reported.
+	bad := []Migration{{Sequence: 1, Name: "001_bad", Up: "insert into nope (id) values (1);"}}
+	m2, err := NewMigrator(memDB(t), bad, Options{OnStart: func(sequence int, name, direction, sql string) {
+		events = append(events, startEvent{sequence, name, direction, sql})
+	}})
+	if err != nil {
+		t.Fatalf("NewMigrator: %v", err)
+	}
+	defer m2.Close()
+	var me *MigrationError
+	if err := m2.Migrate(); !errors.As(err, &me) {
+		t.Fatalf("Migrate error = %v; want *MigrationError", err)
+	}
+	want := []startEvent{{1, "001_bad", "up", bad[0].Up}}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events for failing step = %+v; want %+v", events, want)
+	}
+}

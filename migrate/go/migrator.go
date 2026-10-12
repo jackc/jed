@@ -29,6 +29,14 @@ type Options struct {
 	// VersionTable overrides the default DefaultVersionTable ("schema_version"). It may be a
 	// bare name or a name qualified by an attached-database name ("reports.schema_version").
 	VersionTable string
+
+	// OnStart, if non-nil, is called once before each migration step runs (design.md §6.2,
+	// tern's OnStart) with the migration's sequence, its file name, the direction ("up" or
+	// "down"), and the SQL of the half about to run. A down step reports the migration's own
+	// sequence (the one being reversed), not the version it lands on. It is not called on the
+	// already-at-target fast path, for a refused target, or for a down step refused as
+	// irreversible, and it fires before the step's transaction opens.
+	OnStart func(sequence int, name, direction, sql string)
 }
 
 // Migrator applies a set of migrations to a jed database, tracking progress in a
@@ -38,6 +46,7 @@ type Migrator struct {
 	session      *jed.Session
 	migrations   []Migration
 	versionTable string
+	onStart      func(sequence int, name, direction, sql string)
 }
 
 // NewMigrator builds a Migrator over db and the (already loaded, e.g. via LoadMigrations)
@@ -62,6 +71,7 @@ func NewMigrator(db *jed.Database, migrations []Migration, opts Options) (*Migra
 		session:      db.Session(jed.SessionOptions{}),
 		migrations:   sorted,
 		versionTable: table,
+		onStart:      opts.OnStart,
 	}, nil
 }
 
@@ -191,8 +201,12 @@ func (m *Migrator) down(v int) error {
 // transaction, which rejects in-script BEGIN/COMMIT/ROLLBACK (0A000) so the schema change
 // and the version bump are one atomic unit. On any error the transaction is rolled back
 // (the step made no change) and a *MigrationError naming the migration and failing
-// statement is returned.
+// statement is returned. The OnStart callback, if set, fires first — before the transaction
+// opens, so a panicking callback leaves no transaction behind.
 func (m *Migrator) runStep(mg Migration, direction, sql string, newVersion int) error {
+	if m.onStart != nil {
+		m.onStart(mg.Sequence, mg.Name, direction, sql)
+	}
 	if err := m.session.Begin(true); err != nil {
 		return err
 	}

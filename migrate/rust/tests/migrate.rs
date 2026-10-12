@@ -1,7 +1,9 @@
 //! Integration tests for the jed-migrate crate, driven through the public API against the
 //! shared `../testdata/` corpus (design.md §10).
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use jed::{CreateOptions, Database, SessionOptions};
 use jed_migrate::{
@@ -296,6 +298,7 @@ fn custom_version_table() {
         migrations,
         Options {
             version_table: Some("migration_state".to_string()),
+            ..Options::default()
         },
     )
     .unwrap();
@@ -315,6 +318,7 @@ fn invalid_version_table_name_is_rejected() {
             migrations,
             Options {
                 version_table: Some("bad name; drop table x".to_string()),
+                ..Options::default()
             },
         )
         .is_err()
@@ -361,4 +365,97 @@ fn new_migration_scaffolds_next_sequence() {
     assert!(load_migrations(&dir).is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One recorded `on_start` call: (sequence, name, direction, sql).
+type StartEvent = (u32, String, String, String);
+
+/// Options whose `on_start` records every call into the returned shared log.
+fn recording_options() -> (Options, Rc<RefCell<Vec<StartEvent>>>) {
+    let events: Rc<RefCell<Vec<StartEvent>>> = Rc::default();
+    let log = Rc::clone(&events);
+    let opts = Options {
+        on_start: Some(Box::new(move |seq, name, direction, sql| {
+            log.borrow_mut()
+                .push((seq, name.into(), direction.into(), sql.into()));
+        })),
+        ..Options::default()
+    };
+    (opts, events)
+}
+
+#[test]
+fn on_start_reports_each_step() {
+    let db = mem_db();
+    let migrations = load_migrations(&testdata("blog")).unwrap();
+    let (opts, events) = recording_options();
+    let mut m = Migrator::new(&db, migrations, opts).unwrap();
+    let mg = m.migrations().to_vec();
+    let ev = |seq: u32, direction: &str, sql: &str| -> StartEvent {
+        let name = mg[(seq - 1) as usize].name.clone();
+        (seq, name, direction.into(), sql.into())
+    };
+
+    // Up 0 → 3: one call per step, in order, each with that migration's up half.
+    m.migrate().unwrap();
+    assert_eq!(
+        *events.borrow(),
+        [
+            ev(1, "up", &mg[0].up),
+            ev(2, "up", &mg[1].up),
+            ev(3, "up", &mg[2].up)
+        ]
+    );
+
+    // The already-at-target fast path and a refused target run no step, so no call.
+    events.borrow_mut().clear();
+    m.migrate().unwrap();
+    assert!(matches!(
+        m.migrate_to(4),
+        Err(MigrateError::BadVersion { .. })
+    ));
+    m.set_version(3).unwrap();
+    assert!(events.borrow().is_empty());
+
+    // Down 3 → 1: each step reports the migration being reversed (its own sequence) and its
+    // down half.
+    m.migrate_to(1).unwrap();
+    let down = |i: usize| mg[i].down.clone().unwrap();
+    assert_eq!(
+        *events.borrow(),
+        [ev(3, "down", &down(2)), ev(2, "down", &down(1))]
+    );
+}
+
+#[test]
+fn on_start_skips_refused_irreversible_step_and_precedes_failure() {
+    let db = mem_db();
+    let migrations = load_migrations(&testdata("irreversible")).unwrap();
+    let (opts, events) = recording_options();
+    let mut m = Migrator::new(&db, migrations, opts).unwrap();
+    m.migrate().unwrap();
+    // The down through the irreversible 002 is refused before the step starts: no call.
+    events.borrow_mut().clear();
+    assert!(matches!(
+        m.migrate_to(0),
+        Err(MigrateError::Irreversible { .. })
+    ));
+    assert!(events.borrow().is_empty());
+
+    // A step that then fails was already reported.
+    let up = "insert into nope (id) values (1);".to_string();
+    let bad = vec![jed_migrate::Migration {
+        sequence: 1,
+        name: "001_bad".to_string(),
+        up: up.clone(),
+        down: None,
+    }];
+    let (opts, events) = recording_options();
+    let db = mem_db();
+    let mut m = Migrator::new(&db, bad, opts).unwrap();
+    assert!(matches!(m.migrate(), Err(MigrateError::Migration { .. })));
+    assert_eq!(
+        *events.borrow(),
+        [(1, "001_bad".to_string(), "up".to_string(), up)]
+    );
 }

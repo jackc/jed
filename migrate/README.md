@@ -69,6 +69,31 @@ const m = new Migrator(db, loadMigrations("migrations"));
 try { m.migrate(); } finally { m.close(); }
 ```
 
+## Progress callback
+
+Each package takes tern's `OnStart` progress callback in its options. It fires once before each
+migration step runs, with the migration's sequence, name, direction (`"up"`/`"down"`), and the SQL
+about to run ([`design.md`](design.md) §6.2):
+
+```go
+opts := migrate.Options{OnStart: func(sequence int, name, direction, sql string) {
+	log.Printf("migrating %s %s", direction, name)
+}}
+```
+
+```rust
+let opts = jed_migrate::Options {
+    on_start: Some(Box::new(|_seq, name, direction, _sql| eprintln!("migrating {direction} {name}"))),
+    ..Default::default()
+};
+```
+
+```ts
+const m = new Migrator(db, migrations, {
+  onStart: (_seq, name, direction) => console.log(`migrating ${direction} ${name}`),
+});
+```
+
 ## CLI
 
 The `jed` CLI bundles the Rust crate as the `jed migrate` subcommand:

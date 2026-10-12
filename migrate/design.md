@@ -258,6 +258,36 @@ that includes repairing a table whose value lies outside `0 … N` (which the wa
 leaves the schema untouched, so it is the caller's assertion that the schema matches, not something
 the library verifies (the high-water mark records only *how far*, §5).
 
+### 6.2 Progress: the `OnStart` callback
+
+The migrator takes an optional **progress callback** in its options — tern's `OnStart`, spelled
+per language (`Options.OnStart` in Go, `Options::on_start` in Rust, `Options.onStart` in TS). It is
+invoked **once per step of the walk** (§6 step 4), **immediately before that step runs**, with four
+arguments in tern's order:
+
+- **`sequence`** — the migration's own sequence number. A *down* step out of version `v` reports
+  `v` (the migration being reversed), not `v-1` (the version it lands on) — tern's convention.
+- **`name`** — the migration's name (its file name, as loaded).
+- **`direction`** — `"up"` or `"down"`.
+- **`sql`** — the half about to run, verbatim (the whole up or down text, before statement
+  splitting).
+
+When it fires, exactly:
+
+- **Only for a step that will run.** Never on the already-at-target fast path (§6 step 1), never
+  for a target or database `BadVersion` refusal (§6 step 3), never from `set-version` (§6.1, which
+  runs no migration). A down step refused as `IrreversibleMigration` is refused **before** the
+  callback, so it is not reported (as in tern).
+- **Before the step's transaction opens.** A step that then fails has already been reported, so the
+  last callback names the migration that failed. tern fires it just *after* `BEGIN`; the order is
+  unobservable to the callback (nothing has run yet), and firing first means a callback that panics
+  or throws aborts the run with **no transaction left open** — earlier steps stay committed, the
+  aborted step and every later one never start, exactly the resumable state of any other mid-run
+  failure (§8).
+
+It is purely observational: it returns nothing, cannot veto or alter the step, and has no effect
+on the database, the version table, or the result.
+
 ---
 
 ## 7. Loading migrations (the source seam)
@@ -385,9 +415,6 @@ Called out explicitly so they can be settled before or shortly after the first s
   `schema_version` unchanged.
 - **All-or-nothing run mode.** An option to wrap the entire run in one transaction rather than one
   per step (§6). Deferred; the per-step default is safer for large runs.
-- **A start/redo/`OnStart` hook.** tern exposes an `OnStart` callback (sequence, name, direction,
-  SQL) for progress reporting. A minimal callback is cheap to add to the library API; deferred to
-  keep the first slice minimal.
 - **Renumbering helper.** tern's `renumber start/finish` resolves sequence collisions from parallel
   branches. Nice-to-have tooling; deferred.
 - **CLI spelling.** §9 fixes the shape — a `migrate` subcommand with `status` / `new` sub-verbs — but
