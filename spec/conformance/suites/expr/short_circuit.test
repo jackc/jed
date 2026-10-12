@@ -1,0 +1,111 @@
+# AND / OR evaluate left to right with short-circuit (spec/design/cost.md §3): a FALSE left operand
+# decides AND, a TRUE one decides OR, and the right operand is then never evaluated — it charges
+# nothing and cannot trap. A NULL left operand decides neither, so the right operand runs. The
+# guard idiom `d <> 0 AND 10 / d > 1` therefore never divides by zero.
+#
+# PostgreSQL leaves the operand order unspecified: its planner sorts a WHERE's top-level conjuncts
+# by estimated cost (stable), and its executor stops a qual list at the first FALSE *or NULL*
+# conjunct. Every query here puts the guard first and makes it the cheaper conjunct, so PostgreSQL's
+# order is the source order too; the NULL-left case runs in the select list, where PostgreSQL's
+# boolean AND/OR, like jed's, continues past a NULL. Verified against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, dml.insert, dml.insert_multi_row, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, query.join_inner, query.table_alias, query.qualified_column, query.where_pushdown, expr.arithmetic, expr.in_list, expr.between, expr.comparison_value, error.division_by_zero, types.i32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE z (id i32 PRIMARY KEY, d i32, g i32)
+
+statement ok
+INSERT INTO z VALUES (1, 0, NULL), (2, 5, 1), (3, 20, 0), (4, NULL, 1)
+
+# The guard idiom: `d <> 0` is FALSE on row 1, so `10 / d` never runs there. Row 4's NULL guard
+# continues, and `10 / NULL` is NULL. 1 page + 4 rows + 4 `and` + 4 `<>` + the 2-node right operand
+# on rows 2-4 (6) + 1 produced = 20.
+# cost: 20
+query I nosort
+SELECT id FROM z WHERE d <> 0 AND 10 / d > 1 ORDER BY id
+----
+2
+
+# OR: `d = 0` is TRUE on row 1, so `10 / d` never runs there. 1 + 4 + 4 `or` + 4 `=` + 6 + 2 = 21.
+# cost: 21
+query I nosort
+SELECT id FROM z WHERE d = 0 OR 10 / d > 1 ORDER BY id
+----
+1
+2
+
+# The same connectives as values: FALSE AND …, TRUE OR …, and NULL AND NULL.
+query IBB nosort
+SELECT id, d <> 0 AND 10 / d > 1, d = 0 OR 10 / d > 1 FROM z ORDER BY id
+----
+1
+false
+true
+2
+true
+true
+3
+false
+false
+4
+NULL
+NULL
+
+# A NULL left operand does not decide AND: row 1's `g > 0` is NULL, so `10 / d` runs and traps.
+statement error 22012
+SELECT id, g > 0 AND 10 / d > 1 FROM z ORDER BY id
+
+# Nor does it decide OR.
+statement error 22012
+SELECT id, g = 0 OR 10 / d > 1 FROM z ORDER BY id
+
+# A chain `a AND b AND c` stops at its first FALSE conjunct: `d IS NOT NULL` keeps the rest off
+# row 4 and `d <> 0` keeps `100 / d` off row 1. Every `and` node still charges (both sit on the
+# left spine): 1 + 4 + 2 x 4 `and` + 4 `IS NOT NULL` + 3 `<>` + 2 x 2 for `100 / d > 10` + 1 = 25.
+# cost: 25
+query I nosort
+SELECT id FROM z WHERE d IS NOT NULL AND d <> 0 AND 100 / d > 10 ORDER BY id
+----
+2
+
+# IN (list) is a left-to-right OR chain, so it stops at the first matching element: row 1 matches
+# `0 = d` and never computes `10 / d`.
+query I nosort
+SELECT id FROM z WHERE 0 IN (d, 10 / d) ORDER BY id
+----
+1
+3
+
+# BETWEEN is an AND of its two bounds, so a FALSE lower bound skips the upper one (row 1: 0 >= 1).
+query I nosort
+SELECT id FROM z WHERE d BETWEEN 1 AND 100 / d ORDER BY id
+----
+2
+
+# A join's ON: the guard keeps `10 / b.d` off the d = 0 row.
+query II nosort
+SELECT a.id, b.d FROM z a JOIN z b ON a.id = b.id AND b.d <> 0 AND 10 / b.d > 1 ORDER BY a.id
+----
+2
+5
+
+# A CHECK constraint: `d = 0` decides the OR, so the zero row is admitted without dividing.
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, d i32 CHECK (d = 0 OR 100 / d > 1))
+
+statement ok
+INSERT INTO ck VALUES (1, 0), (2, 5)
+
+statement error 23514
+INSERT INTO ck VALUES (3, 200)
+
+# DML: the guarded DELETE removes only row 3 (10 / 20 = 0).
+statement ok
+DELETE FROM z WHERE d <> 0 AND 10 / d < 1
+
+query I nosort
+SELECT id FROM z ORDER BY id
+----
+1
+2
+4

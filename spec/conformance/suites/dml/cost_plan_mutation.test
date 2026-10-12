@@ -240,7 +240,7 @@ GiST bound: using g_span; touched=2
 4
 
 # g_span gathers the three overlapping spans (ids 1, 2, 5); the residual keeps ids 1 and 5.
-# cost: 25
+# cost: 23
 statement ok
 DELETE FROM g WHERE tags @> ARRAY[1] AND span && i32range(3, 4)
 

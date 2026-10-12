@@ -58,9 +58,10 @@ SELECT id FROM t WHERE a IN (NULL) ORDER BY id
 ----
 
 # In WHERE, only rows whose predicate is TRUE survive: a=10 and a=20 match; a=NULL is dropped
-# (UNKNOWN). Cost: 3 scanned, the desugared `Or(Eq(a,10),Eq(a,20))` is 3 interior nodes per
-# scanned row (1 or + 2 eq, leaf column/constant operands free) = 9, plus 2 produced = 14.
-# cost: 15
+# (UNKNOWN). Cost: 1 page + 3 scanned, the desugared `Or(Eq(a,10),Eq(a,20))` is 3 interior nodes per
+# scanned row (1 or + 2 eq, leaf column/constant operands free), 2 on a=10 where the TRUE first Eq
+# decides the OR = 8, plus 2 produced = 14.
+# cost: 14
 query I nosort
 SELECT id FROM t WHERE a IN (10, 20) ORDER BY id
 ----
@@ -114,14 +115,14 @@ CREATE TABLE big (id i32 PRIMARY KEY, v i64)
 statement ok
 INSERT INTO big VALUES (1, 10), (2, 20), (3, 5000000000)
 
-# cost: 15
+# cost: 14
 query I nosort
 SELECT id FROM big WHERE v IN (10, 20) ORDER BY id
 ----
 1
 2
 
-# cost: 14
+# cost: 13
 query I nosort
 SELECT id FROM big WHERE v IN (5000000000, 99) ORDER BY id
 ----

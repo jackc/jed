@@ -217,8 +217,9 @@ DELETE FROM mv WHERE x * 2 > 50 RETURNING id
 ----
 3
 
-# On the table, both conjuncts and the AND run on every row (the two rows left).
-# cost: 11
+# On the table, the AND runs on every row (the two rows left) and `x * 2 > 50` only where `y > 0` is
+# not FALSE.
+# cost: 9
 query I nosort
 DELETE FROM m WHERE y > 0 AND x * 2 > 50 RETURNING id
 ----

@@ -43,7 +43,7 @@ SELECT * FROM (SELECT id, v FROM t) d WHERE d.id + 0 = 7
 70
 
 # A renamed bare column moves too; the body's own WHERE is kept and the conjunct is appended.
-# cost: 23
+# cost: 22
 query II nosort
 SELECT d.n, d.val FROM (SELECT id AS n, v AS val FROM t WHERE v > 15) d WHERE d.n < 5 ORDER BY d.n
 ----

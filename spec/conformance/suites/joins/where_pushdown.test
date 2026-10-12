@@ -54,7 +54,7 @@ SELECT a.id, b.id FROM a CROSS JOIN b WHERE a.id <= 2 AND b.w > 4 ORDER BY a.id,
 13
 
 # LEFT: a single-relation OR over the PRESERVED side is pushed; a3's NULL-extension survives.
-# cost: 62
+# cost: 61
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE a.v IS NULL OR a.v < 15 ORDER BY a.id, b.id
 ----
@@ -127,7 +127,7 @@ SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v + 0 > 15 ORDER BY a.id, b
 
 # Kleene connectives and IS [NOT] DISTINCT FROM push as one filter per relation; a cross-relation OR
 # stays residual.
-# cost: 45
+# cost: 44
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE NOT (b.w IS DISTINCT FROM 7) OR a.v = 10 ORDER BY a.id, b.id
 ----

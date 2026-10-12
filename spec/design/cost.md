@@ -114,13 +114,34 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   cost track how many literals the parser happened to fold, an accidental property; cost
   must track genuine evaluation work. A **decimal** arithmetic/comparison node additionally
   charges size-scaled `decimal_work` — the dedicated subsection below.
-- **No short-circuit.** Both operands of every binary node (`and`, `or`, `compare`,
-  `arith`, `distinct`) are **always** evaluated before the node charges its own
-  `operator_eval`. This is already true — the Kleene helpers (`and3`/`or3`/`boolAnd`)
-  are pure functions over already-computed operand values, never control flow. The seam
-  **must not introduce** a short-circuit: skipping the RHS in one core when the LHS is
-  FALSE/NULL would drop that core's operand evals and diverge the count.
-- **`CASE` and `COALESCE` are the two deliberate exceptions to no-short-circuit.** A `CASE`
+- **Eager operands, except the sanctioned short-circuits.** Both operands of every other binary
+  node (`compare`, `arith`, `distinct`, …) are **always** evaluated. A core **must not introduce**
+  a short-circuit anywhere this section does not sanction one: skipping an operand in one core
+  would drop that core's operand evals and diverge the count. The sanctioned forms are `AND`/`OR`,
+  `CASE`, and `COALESCE` (below); each fixes *which* operands run by a left-to-right rule that every
+  core applies identically, so the skipped work — and the errors it would have raised — is itself
+  deterministic.
+- **`AND` / `OR` short-circuit left to right.** An `and` node charges its own `operator_eval`, then
+  evaluates its **left** operand; if that is **FALSE** the result is FALSE and the **right operand is
+  not evaluated** — it charges nothing and raises nothing. A TRUE or NULL left operand continues to
+  the right operand and the Kleene combination (`TRUE AND x = x`, `NULL AND FALSE = FALSE`, `NULL AND
+  TRUE = NULL`). `or` is the mirror image: a **TRUE** left operand decides it and skips the right; a
+  FALSE or NULL one continues. The node's own `operator_eval` is charged **whether or not** the right
+  operand runs (the node was evaluated — the same rule as `CASE`/`COALESCE`, which charge their node
+  once). So the guard idiom `WHERE d <> 0 AND 10 / d > 1` never divides on a `d = 0` row. A
+  left-deep chain `a AND b AND c` (the parser's shape, `(a AND b) AND c`) therefore charges every
+  `and` node — they all sit on the left spine — and evaluates the conjuncts in source order up to
+  the first FALSE; `IN (list)` (an `or` chain, grammar.md §20) stops at the first TRUE element, and
+  `BETWEEN` (an `and` of two comparisons, §21) skips its upper bound when the lower one is FALSE.
+  **PostgreSQL** documents the evaluation order of `AND`/`OR` operands as unspecified (its planner
+  may reorder a WHERE's top-level conjuncts by estimated cost), so a fixed left-to-right order is a
+  *stronger* promise than PostgreSQL's, not a divergence from it: every result jed returns is one
+  PostgreSQL could return. The observable gap is one-sided — when the trapping operand is written
+  *first* (`WHERE 10 / d > 1 AND d <> 0`), jed traps on the `d = 0` row where PostgreSQL's
+  cost-ordering may evaluate the cheaper guard first and succeed; write the guard first (or use
+  `CASE`). An **uncorrelated** subquery operand is still folded once at plan setup (§"Subqueries"
+  below) whether or not a row reaches it, exactly as inside a `CASE` arm.
+- **`CASE` and `COALESCE` short-circuit too.** A `CASE`
   ([grammar.md](grammar.md) §23) charges its own `operator_eval` for the node, then evaluates
   its `WHEN` conditions **in source order, stopping at the first one that is TRUE** — a FALSE
   or NULL/UNKNOWN condition falls through. Only the conditions tested **up to and including the
@@ -146,9 +167,9 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   size-scaled `decimal_work` / `varlen_compare` / `collate` a binary comparison would, so a fold
   over many large values cannot do unbounded comparison work under the ceiling — §6/§13.)
 - **Pre-order, LHS-before-RHS.** A node charges itself, then evaluates its left operand,
-  then its right. The order does not change the **total** (a sum is order-independent),
-  but it fixes the deterministic **abort point** for the cost ceiling (§6) identically
-  across cores.
+  then its right. For an eager node the order does not change the **total** (a sum is
+  order-independent), but it fixes the deterministic **abort point** for the cost ceiling (§6)
+  identically across cores; for `AND`/`OR` it also decides which operand may be skipped.
 - **Helpers are not separately charged.** `eval_arith`/`evalArith`, and the `<=`/`>=`
   comparisons' internal `lt3 OR eq3` combinators, are covered by their owning node's
   single `operator_eval`. They are not `RExpr` nodes.
@@ -1028,9 +1049,10 @@ is pinned here because, with no reference implementation, the count is a cross-c
   materializes zero. The bound never changes the result, only which rows are scanned.
 - **Nested-loop fallback `ON` cost is per candidate combination** — for an `INNER JOIN`, once per
   (running-row × right-row) pair, the `ON` tree's
-  interior nodes firing pre-order with **no short-circuit**, exactly like a WHERE. A `CROSS JOIN`
-  has no `ON` and charges no join `operator_eval` (it keeps every pair). So `ON` cost =
-  |running| × |right| × (interior nodes in the `ON`), deterministic and fan-out-explicit. The
+  interior nodes firing pre-order with `AND`/`OR` short-circuiting left to right, exactly like a
+  WHERE. A `CROSS JOIN` has no `ON` and charges no join `operator_eval` (it keeps every pair). So
+  `ON` cost is at most |running| × |right| × (interior nodes in the `ON`) — less by the right
+  operands a FALSE `AND` / TRUE `OR` left operand skips — deterministic and fan-out-explicit. The
   iteration order — running/left side outer in PK order, right side inner in PK order, left-deep —
   is fixed so the per-combination evals accrue in the same sequence in every core (a §8 surface;
   it fixes the cost-ceiling abort point even though only the total is asserted today).

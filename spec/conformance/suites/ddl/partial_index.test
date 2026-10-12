@@ -20,7 +20,7 @@ statement ok
 INSERT INTO pt VALUES (1,'active',10),(2,'inactive',20),(3,'active',30),(4,'active',10),(5,'inactive',30),(6,'active',50),(7,'active',30),(8,'inactive',30),(9,'active',70),(10,'active',30)
 
 # full-scan baseline: active rows with amt=30 are ids 3, 7, 10
-# cost: 94
+# cost: 91
 query I nosort
 SELECT id FROM pt WHERE status = 'active' AND amt = 30 ORDER BY id
 ----

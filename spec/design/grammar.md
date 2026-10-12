@@ -246,7 +246,10 @@ edits this grammar and [grammar.ebnf](../grammar/grammar.ebnf) in the *same chan
 adds the parser code in all cores and the conformance entries that exercise it
 (CLAUDE.md §10/§11). The general expression substrate — operator precedence,
 parenthesization, integer arithmetic, the `boolean` type, and the `AND`/`OR`/`NOT`
-connectives — landed together as the `expr` tower above; [../../TODO.md](../../TODO.md)
+connectives — landed together as the `expr` tower above (`AND`/`OR` are Kleene three-valued and
+evaluate **left to right with short-circuit**: a FALSE left operand decides `AND` and a TRUE one
+decides `OR` without evaluating the right operand, so `d <> 0 AND 10 / d > 1` never divides by
+zero — [cost.md](cost.md) §3, a stronger promise than PostgreSQL's unspecified operand order); [../../TODO.md](../../TODO.md)
 is the roadmap of what comes next (richer `ORDER BY`, more predicate forms, and onward).
 Because the parser is hand-written rather than
 generated, "conform to the grammar" is verified by cross-reading each production against
@@ -1323,10 +1326,12 @@ FROM`. `NOT IN` is the negation. The whole form is the first of the Phase-2 pred
   unobservable here because chaining comparisons (`a = b IN (…)`) is already a 42601 syntax
   error regardless of the relative precedence.
 - **Cost** ([cost.md](cost.md) §3): the desugared tree's interior nodes are charged normally —
-  `n` `eq` nodes + `n−1` `or` nodes (+1 `not` for `NOT IN`). Because the OR-chain re-uses `x`
-  in every comparison, **the LHS is evaluated once per list element** (a deliberate consequence
-  of the desugar model); for a bare-column `x` that is a free leaf, so the cost is just the
-  comparison/connective nodes. Output column name for a bare `SELECT x IN (…)` is the fixed
+  the `n−1` `or` nodes (+1 `not` for `NOT IN`) always, and the `eq` nodes **up to the first TRUE
+  one**: the left-deep OR-chain short-circuits left to right, so later elements are neither
+  compared nor charged (and an element expression past the match is never evaluated, so it
+  cannot trap). Because the OR-chain re-uses `x` in every comparison, **the LHS is evaluated
+  once per element compared** (a deliberate consequence of the desugar model); for a bare-column
+  `x` that is a free leaf, so the cost is just the comparison/connective nodes. Output column name for a bare `SELECT x IN (…)` is the fixed
   `?column?` (§8), like any non-column expression.
 
 ## 21. `BETWEEN` / `NOT BETWEEN`
@@ -1356,8 +1361,9 @@ comparison-level (precedence 35) postfix slot as `IN` (§20). `NOT BETWEEN` is t
   `x`'s type (a too-wide one traps **22003**), a cross-family bound is **42804**, decimal/int
   mixes promote, text compares by the `C` collation.
 - **Cost** ([cost.md](cost.md) §3): the desugared `And(Ge, Le)` is three interior nodes (1
-  `and` + 2 `compare`); **the LHS is evaluated twice** (once per bound — the desugar
-  consequence). Output name for a bare `SELECT x BETWEEN …` is `?column?` (§8).
+  `and` + 2 `compare`), but the short-circuit `AND` skips the `<=` (and its `hi` bound) when
+  `x >= lo` is FALSE; **the LHS is evaluated up to twice** (once per bound compared — the
+  desugar consequence). Output name for a bare `SELECT x BETWEEN …` is `?column?` (§8).
 
 ## 22. `LIKE` / `NOT LIKE`
 
@@ -1461,15 +1467,14 @@ two forms and is the **first deliberately lazy** expression in the engine.
   `x = v` at resolve, reusing the `=` operand pairing and comparability check (the value `v`
   adapts to `x`'s type; an incomparable `v` is `42804`). At least one `WHEN` is required (a
   `CASE … END` with none is a `42601` syntax error).
-- **Lazy first-match evaluation — the first sanctioned short-circuit (`COALESCE`, §51, is the
-  other).** Conditions are evaluated in source
+- **Lazy first-match evaluation — a sanctioned short-circuit (like `AND`/`OR` and `COALESCE`,
+  §51).** Conditions are evaluated in source
   order and evaluation **stops at the first TRUE** branch, returning that `THEN`. A FALSE or
   NULL/UNKNOWN condition falls through (a NULL `WHEN` is *not* true — like `WHERE`). With no
   matching branch, the `ELSE` result is returned, or **NULL** if there is no `ELSE` (an implicit
   `ELSE NULL`). Later arms are **never evaluated**, so `CASE WHEN a = 0 THEN 0 ELSE 1 / a END`
-  does not divide by zero on the `a = 0` rows — this is the sanctioned exception to the
-  no-short-circuit cost rule ([cost.md](cost.md) §3), and it stays deterministic because the
-  order is fixed.
+  does not divide by zero on the `a = 0` rows — one of the sanctioned short-circuits of the
+  cost rules ([cost.md](cost.md) §3), and it stays deterministic because the order is fixed.
 - **Result-arm type unification.** The `THEN` results and the `ELSE` (or NULL for an implicit
   ELSE) unify to one **common type** — the CASE's output type — by folding the **common-type rule
   of §25** (the same function set operations and `VALUES` use). NULL-typed arms are dropped (they
@@ -3058,8 +3063,7 @@ SELECT COALESCE(a, 1 / a) FROM t                          -- a ≠ NULL ⇒ 1/a 
   when the keyword is immediately followed by `(` (the `EXTRACT`/`JSON(` one-token lookahead,
   §8), so `coalesce` remains usable as a column name — observably PostgreSQL's
   `col_name_keyword` classification (a column name, never a function name).
-- **Lazy left-to-right evaluation — the second sanctioned short-circuit** ([cost.md](cost.md)
-  §3). Arguments are evaluated in source order and evaluation **stops at the first non-NULL**
+- **Lazy left-to-right evaluation — a sanctioned short-circuit** ([cost.md](cost.md) §3). Arguments are evaluated in source order and evaluation **stops at the first non-NULL**
   value, which is returned; later arguments are **never evaluated** — `COALESCE(1, 1/0)` is `1`,
   no `22012` — and each evaluated argument is evaluated exactly once. Required by PostgreSQL
   semantics, deterministic because the order is fixed.

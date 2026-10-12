@@ -88,9 +88,10 @@ nullk
 
 # The symmetric anti-join: `a.id IS NULL OR b.id IS NULL` keeps exactly the rows present on only
 # one side — a(3), a(4) (no b) and b(30) (no a). 6 combined rows; the WHERE has 3 interior nodes
-# (or + two is_null) → 18; 8 materialize + 16 ON + 18 WHERE + 3 produced = 45.
+# (or + two is_null), but on (NULL, b(30)) `a.id IS NULL` decides the OR → 5 x 3 + 2 = 17;
+# 2 page + 8 materialize + 16 ON + 17 WHERE + 3 produced = 46.
 # names: id, id
-# cost: 47
+# cost: 46
 query II nosort
 SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k WHERE a.id IS NULL OR b.id IS NULL ORDER BY a.id, b.id
 ----
@@ -131,10 +132,11 @@ orphan
 # fails it is simply unmatched — but FULL keeps unmatched rows from BOTH sides, so failing the
 # predicate moves a row from "matched pair" to "preserved on both sides". `a.k = 10` in ON leaves
 # only a(1)/b(10) matched; every other a row is left-preserved and every other b row is
-# right-preserved, so the cardinality GROWS to 7. 2 page + 8 materialize + 48 ON (16 pairs x 3 ops:
-# a.k=b.k, a.k=10, AND) + 7 produced = 65.
+# right-preserved, so the cardinality GROWS to 7. 2 page + 8 materialize + 42 ON (AND + a.k=b.k on
+# all 16 pairs; a.k=10 only on the 10 pairs where a.k=b.k is not FALSE — 3 TRUE, 7 NULL) + 7
+# produced = 59.
 # names: id, id
-# cost: 65
+# cost: 59
 query II nosort
 SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k AND a.k = 10 ORDER BY a.id, b.id
 ----

@@ -30,9 +30,9 @@ query I nosort
 SELECT id FROM t WHERE x = 1 AND x = 2
 ----
 
-# A touching closed range is satisfiable: the scan runs (1 page + 4 rows + 3 nodes x 4 rows) and
-# produces one row.
-# cost: 18
+# A touching closed range is satisfiable: the scan runs (1 page + 4 rows + the AND: 3 nodes, 2 where
+# `x >= 5` is FALSE = 10) and produces one row.
+# cost: 16
 query I nosort
 SELECT id FROM t WHERE x >= 5 AND x <= 5
 ----
@@ -51,7 +51,7 @@ SELECT id FROM t WHERE s = 'a' AND s = 'b'
 ----
 
 # Text ORDERING is not proven (a collation may order it), so this empty range still scans.
-# cost: 17
+# cost: 15
 query I nosort
 SELECT id FROM t WHERE s > 'b' AND s < 'a'
 ----
@@ -161,13 +161,13 @@ SELECT id FROM t WHERE x > 5 AND x < 3 UNION ALL SELECT id FROM t WHERE id = 2
 2
 
 # Not proven: a contradiction under OR, or over a non-column operand. These scan normally.
-# cost: 26
+# cost: 23
 query I nosort
 SELECT id FROM t WHERE (x > 5 AND x < 3) OR x = 1
 ----
 1
 
-# cost: 25
+# cost: 19
 query I nosort
 SELECT id FROM t WHERE x + 0 > 5 AND x + 0 < 3
 ----

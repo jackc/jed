@@ -55,14 +55,14 @@ SELECT id FROM t WHERE x >= 20 AND keep = 1 ORDER BY id LIMIT 2
 5
 
 # A PK interval set charges/pulls only its first interval when that fills the window.
-# cost: 6
+# cost: 5
 query I nosort
 SELECT id FROM t WHERE id <= 2 OR id >= 7 LIMIT 1
 ----
 1
 
 # OFFSET exhausts the first interval, so the second interval is started and charged.
-# cost: 15
+# cost: 13
 query I nosort
 SELECT id FROM t WHERE id <= 2 OR id >= 7 LIMIT 1 OFFSET 2
 ----
@@ -78,7 +78,7 @@ SELECT id FROM t WHERE id <= 2 OR id >= 7 ORDER BY id DESC LIMIT 2
 
 # At this small row count the whole-pipeline estimate prefers the naturally streaming PK full scan
 # over the secondary interval set. It reads id 1 (filtered) and id 2 (kept), then stops.
-# cost: 10
+# cost: 9
 query I nosort
 SELECT id FROM t WHERE x < 20 OR x >= 60 LIMIT 1
 ----

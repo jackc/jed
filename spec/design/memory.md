@@ -58,7 +58,8 @@ admission. A frozen streaming cursor captures the allowance and its limit; openi
 another cursor cannot reset it. A new statement gets a fresh allowance, including
 a statement after an error. A script gets one allowance per SQL statement.
 
-Strict NULL short-circuiting and unselected CASE branches reserve nothing.
+Strict NULL short-circuiting, unselected CASE branches, and the right operand an `AND`/`OR`
+short-circuit skips reserve nothing.
 Structural result limits run before output admission. Cost is charged and guarded
 before reserving output/scratch bytes; when both gates reject that step, the cost
 error wins. An allocation failure is an ordinary SQL statement failure: writes are

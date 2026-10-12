@@ -91,7 +91,12 @@ The contract every rewrite rule meets:
   structurally unable to trap; it may skip evaluations the unrewritten plan performs — exactly as a
   scan bound already does — so an error that plan would raise can go unraised. Error visitation, and
   the point where a cost ceiling aborts (54P01), are defined by the selected (rewritten) plan, as for
-  every physical choice ([estimator.md](estimator.md) §1).
+  every physical choice ([estimator.md](estimator.md) §1). This holds under the left-to-right
+  `AND`/`OR` short-circuit ([cost.md](cost.md) §3), whose skips depend on conjunct order: a moved
+  conjunct is structurally non-trapping, so running it ahead of an earlier conjunct cannot raise,
+  and it only removes rows; the conjuncts left behind keep their source order. So every conjunct
+  of the rewritten plan runs on a subset of the rows where the source-order AND would reach it —
+  reordering by pushdown can skip an error, never introduce one.
 - **Cost-identical, or an explicitly decided cost change.** Cost is an observable cross-core
   contract (CLAUDE.md §13, cost.md §1). Textbook rewrites — constant folding, CSE,
   short-circuiting — **drop `operator_eval` charges**, so each rule records its cost decision here

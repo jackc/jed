@@ -25,10 +25,10 @@ statement ok
 INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)
 
 # IN-list of three PK values → three point probes over the distinct sorted keys {1,3,5}. 3 page_read
-# (one per probe) + 3 storage_row_read + the residual `Or(Or(Eq,Eq),Eq)` = 5 interior nodes per
-# scanned row (2 or + 3 eq) × 3 = 15 + 3 row_produced + 0 projection (`a` is a leaf) = 24. A full scan
-# of the same query would be 1 + 6 + 30 + 3 = 40.
-# cost: 24
+# (one per probe) + 3 storage_row_read + the residual `Or(Or(Eq,Eq),Eq)` — 2 or + the Eqs up to the
+# first TRUE one: 3 for id 1, 4 for id 3, 5 for id 5 = 12 — + 3 row_produced + 0 projection (`a` is a
+# leaf) = 21. A full scan of the same query would be 1 + 6 + 27 + 3 = 37.
+# cost: 21
 query I rowsort
 SELECT a FROM t WHERE id IN (1, 3, 5)
 ----
@@ -37,8 +37,9 @@ SELECT a FROM t WHERE id IN (1, 3, 5)
 50
 
 # The OR spelling is identical after desugaring — a bare `pk = a OR pk = b` is the same merged bound.
-# 2 probes: 2 page + 2 scanned + `Or(Eq,Eq)` (3 nodes) × 2 = 6 + 2 produced = 12.
-# cost: 12
+# 2 probes: 2 page + 2 scanned + `Or(Eq,Eq)` (2 nodes for id 1, where the first Eq decides it; 3 for
+# id 6) = 5 + 2 produced = 11.
+# cost: 11
 query I rowsort
 SELECT a FROM t WHERE id = 1 OR id = 6
 ----
@@ -46,17 +47,18 @@ SELECT a FROM t WHERE id = 1 OR id = 6
 60
 
 # A probe that misses still visits the leaf it would live in (page_read 1) but reads no row: {2,99}
-# → 2 page + 1 scanned (only id=2) + `Or(Eq,Eq)` (3 nodes) × 1 = 3 + 1 produced = 7.
-# cost: 7
+# → 2 page + 1 scanned (only id=2) + `Or(Eq,Eq)` stopping at its TRUE first Eq = 2 + 1 produced = 6.
+# cost: 6
 query I rowsort
 SELECT a FROM t WHERE id IN (2, 99)
 ----
 20
 
 # Duplicate list elements de-duplicate to ONE probe (a bitmap-OR merges equal keys): {3,3,3} → {3}.
-# 1 page + 1 scanned + the residual STILL has all three Eq nodes (the desugar is not deduplicated) so
-# `Or(Or(Eq,Eq),Eq)` = 5 × 1 = 5 + 1 produced = 8. The bound merged; the residual did not.
-# cost: 8
+# 1 page + 1 scanned + the residual STILL has all three Eq nodes (the desugar is not deduplicated), but
+# `Or(Or(Eq,Eq),Eq)` stops at the first TRUE Eq = 3 + 1 produced = 6. The bound merged; the residual
+# did not.
+# cost: 6
 query I rowsort
 SELECT a FROM t WHERE id IN (3, 3, 3)
 ----
@@ -71,9 +73,9 @@ SELECT a FROM t WHERE id IN (99, 100)
 
 # The OR conjunct can sit inside an AND: `(id = 1 OR id = 4) AND a > 15` bounds by the disjunction
 # {1,4} (2 probes = 2 page, 2 rows scanned), and the WHOLE filter is the residual re-applied per
-# scanned row: `And(Or(Eq,Eq), Gt)` = 5 nodes × 2 = 10. Only id=4 (a=40>15) survives → 1 produced.
-# 2 + 2 + 10 + 1 = 15.
-# cost: 15
+# scanned row: `And(Or(Eq,Eq), Gt)` = 4 nodes for id 1 (its first Eq decides the OR) + 5 for id 4 = 9.
+# Only id=4 (a=40>15) survives → 1 produced. 2 + 2 + 9 + 1 = 14.
+# cost: 14
 query I rowsort
 SELECT id FROM t WHERE (id = 1 OR id = 4) AND a > 15
 ----
@@ -81,8 +83,9 @@ SELECT id FROM t WHERE (id = 1 OR id = 4) AND a > 15
 
 # A NULL element contributes no key (3VL-never-true), so `id IN (2, NULL, 4)` probes only {2,4} — the
 # residual re-checks and the NULL disjunct keeps no extra row. 2 page + 2 scanned + `Or(Or(Eq,Eq),Eq)`
-# where the middle Eq is `id = NULL` (still an interior node) = 5 × 2 = 10 + 2 produced = 16.
-# cost: 16
+# where the middle Eq is `id = NULL` (still an interior node): 3 for id 2 (its first Eq is TRUE), 5
+# for id 4 = 8 + 2 produced = 14.
+# cost: 14
 query I rowsort
 SELECT id FROM t WHERE id IN (2, NULL, 4)
 ----
@@ -91,9 +94,9 @@ SELECT id FROM t WHERE id IN (2, NULL, 4)
 
 # A mixed disjunction (one disjunct is NOT an equality on the key) does NOT lower to a point set — it
 # falls back to the full scan + residual filter (rows unchanged). `id = 2 OR a = 60` cannot bound by
-# the key alone (a row with a=60 has an unknown id). Full scan: 1 page + 6 scanned + `Or(Eq,Eq)` (3) ×
-# 6 = 18 + 2 produced = 27.
-# cost: 27
+# the key alone (a row with a=60 has an unknown id). Full scan: 1 page + 6 scanned + `Or(Eq,Eq)` (3,
+# but 2 on id 2 where `id = 2` decides it) = 17 + 2 produced = 26.
+# cost: 26
 query I rowsort
 SELECT id FROM t WHERE id = 2 OR a = 60
 ----
@@ -143,8 +146,8 @@ CREATE INDEX sx ON s (x)
 
 # `x IN (10, 30)` → 2 index probes. Value 10: index leaf (1 page) + two row lookups (rows 1,5: +2) =
 # 3 page, 2 rows. Value 30: index leaf (1) + one row lookup (row 3: +1) = 2 page, 1 row. So 5 page +
-# 3 storage_row_read + `Or(Eq,Eq)` (3) × 3 = 9 + 3 produced = 20.
-# cost: 20
+# 3 storage_row_read + `Or(Eq,Eq)` (2 on the x=10 rows, 3 on x=30) = 7 + 3 produced = 18.
+# cost: 18
 query I rowsort
 SELECT id FROM s WHERE x IN (10, 30)
 ----
@@ -153,8 +156,8 @@ SELECT id FROM s WHERE x IN (10, 30)
 5
 
 # The OR spelling over the index: `x = 20 OR x = 40` → 2 probes, each index leaf (1) + one row lookup
-# (1) = 2 page, so 4 page + 2 scanned + `Or(Eq,Eq)` (3) × 2 = 6 + 2 produced = 14.
-# cost: 14
+# (1) = 2 page, so 4 page + 2 scanned + `Or(Eq,Eq)` (2 for x=20, 3 for x=40) = 5 + 2 produced = 13.
+# cost: 13
 query I rowsort
 SELECT id FROM s WHERE x = 20 OR x = 40
 ----
@@ -193,9 +196,9 @@ carol
 
 # --- UPDATE / DELETE bound by the PK point set ---
 # A mutation lowers the same merged PK bound. DELETE {2,4}: 2 page + 2 storage_row_read +
-# `Or(Eq,Eq)` (3) × 2 = 6 = 10. No rows
+# `Or(Eq,Eq)` (2 for id 2, 3 for id 4) = 5 → 9. No rows
 # produced (a bare statement).
-# cost: 10
+# cost: 9
 statement ok
 DELETE FROM t WHERE id IN (2, 4)
 
@@ -207,9 +210,9 @@ SELECT id FROM t
 5
 6
 
-# UPDATE {1,6}: 2 page + 2 storage_row_read + the residual `Or(Eq,Eq)` (3) × 2 = 6 = 10 (the `0` RHS
-# is a leaf).
-# cost: 10
+# UPDATE {1,6}: 2 page + 2 storage_row_read + the residual `Or(Eq,Eq)` (2 for id 1, 3 for id 6) = 5
+# → 9 (the `0` RHS is a leaf).
+# cost: 9
 statement ok
 UPDATE t SET a = 0 WHERE id = 1 OR id = 6
 

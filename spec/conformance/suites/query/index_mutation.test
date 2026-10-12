@@ -163,16 +163,18 @@ SELECT id, w FROM idxmut_s WHERE id IN (2, 4) ORDER BY id
 4
 
 # Duplicate 20 and NULL add no probes. Two probes cost 4 pages + 2 reads; the four-element IN
-# residual has 7 nodes per row, the PK assignment one, and RETURNING produces two: 4+2+14+2+2=24.
-# cost: 24
+# residual (3 or + 4 eq) stops at its first TRUE element — 4 nodes for x=20, all 7 for x=40 — the
+# PK assignment is one per row, and RETURNING produces two: 4+2+11+2+2=21.
+# cost: 21
 query I rowsort
 UPDATE idxmut_s SET id = id + 100 WHERE x IN (20, 20, NULL, 40) RETURNING id
 ----
 102
 104
 
-# Non-unique x=10 admits two rows, x=30 one: 5 pages + 3 reads + 3 residual nodes × 3 = 17.
-# cost: 17
+# Non-unique x=10 admits two rows, x=30 one: 5 pages + 3 reads + residual 2 + 2 + 3 = 15 (the OR
+# stops at `x = 10` on the x=10 rows).
+# cost: 15
 statement ok
 DELETE FROM idxmut_s WHERE x IN (10, 30)
 

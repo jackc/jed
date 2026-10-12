@@ -156,7 +156,7 @@ SELECT d.k FROM (SELECT DISTINCT k, count(*) AS n FROM t GROUP BY k ORDER BY k) 
 3
 
 # The body's own WHERE is kept and the moved conjunct appended to it.
-# cost: 58
+# cost: 56
 query II nosort
 SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t WHERE v > 20 GROUP BY k) d WHERE d.k <= 2 ORDER BY d.k
 ----

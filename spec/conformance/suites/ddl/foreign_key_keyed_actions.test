@@ -115,11 +115,12 @@ statement ok
 INSERT INTO kcc VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 2, 1), (5, NULL, 1)
 
 # Deleting three parents gathers through kcc_yx once per tuple. The parent full scan is 1 page +
-# 4 rows + 4 x 3 evals (the `a = 1 OR b = 1` is three operators per row): 17. The three probes
-# (1, 1), (1, 2) and (2, 1) each charge 1 index page, and they admit rows 1, 2, 3, 4, each a 1-page
-# point lookup: 3 + 4 = 7. The four gathered rows are 4 row reads. 17 + 7 + 4 = 28. The (NULL, 1)
+# 4 rows + the `a = 1 OR b = 1` (three operators, two on the a=1 rows where `a = 1` decides the OR):
+# 2 + 2 + 3 + 3 = 10, so 15. The three probes (1, 1), (1, 2) and (2, 1) each charge 1 index page,
+# and they admit rows 1, 2, 3, 4, each a 1-page point lookup: 3 + 4 = 7. The four gathered rows are
+# 4 row reads. 15 + 7 + 4 = 26. The (NULL, 1)
 # child references nothing (MATCH SIMPLE) and survives.
-# cost: 28
+# cost: 26
 statement ok
 DELETE FROM kcp WHERE a = 1 OR b = 1
 

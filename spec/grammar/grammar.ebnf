@@ -935,6 +935,10 @@ where_clause   ::= "WHERE" expr
  */
 expr           ::= or_expr
 
+/* OR / AND are left-associative, Kleene three-valued, and evaluated LEFT TO RIGHT with
+ * short-circuit: a TRUE left operand decides OR and a FALSE one decides AND, and the right
+ * operand is then not evaluated (so it cannot trap) — ../design/cost.md §3. PostgreSQL leaves
+ * the operand order unspecified; jed's fixed order is a stronger promise. */
 or_expr        ::= and_expr ("OR" and_expr)*
 
 and_expr       ::= not_expr ("AND" not_expr)*
@@ -1140,7 +1144,7 @@ case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "E
  * 42601, PostgreSQL's shape). Argument types unify to one common type exactly like CASE's
  * result arms (42804 cross-family; an all-NULL COALESCE is text). LAZY like CASE — arguments
  * are evaluated left to right, each at most ONCE, and evaluation stops at the first non-NULL
- * (the second sanctioned short-circuit, ../design/cost.md §3) — which is why this is a grammar
+ * (a sanctioned short-circuit, like CASE and AND/OR, ../design/cost.md §3) — which is why this is a grammar
  * form with its own node, not a catalog function (a catalog call is eager and fixed-arity).
  * "COALESCE" stays non-reserved: the form is recognized ONLY when the next token is "(" (the
  * EXTRACT/JSON one-token lookahead, §8), so `coalesce` remains usable as a column name —

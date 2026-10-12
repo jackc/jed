@@ -320,7 +320,11 @@ weight; the owning base unit still counts the operation. Runtime metering remain
 ### 8.2 Expressions and size-dependent work
 
 `operator_eval` counts each interior resolved expression node for each estimated invocation,
-following [cost.md](cost.md)'s pre-order, eager-binary, CASE, and COALESCE rules. An access predicate
+following [cost.md](cost.md)'s pre-order rule. The estimator does not predict which branch a row
+takes, so it counts every node of a short-circuit form as evaluated — an `AND`/`OR` right operand,
+every `CASE` arm, every `COALESCE` argument. The actual meter charges only the operands that run,
+so this expression work is an upper bound; the left-to-right `AND`/`OR` short-circuit therefore
+left every estimate (and so every plan choice) unchanged. An access predicate
 still executes as residual and therefore retains its expression charges. Projection/order
 expressions use the row count at their real pipeline stage; final projection is after LIMIT/OFFSET.
 

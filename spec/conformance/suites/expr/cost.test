@@ -9,8 +9,8 @@
 # NEXT query/statement-ok record. All units weigh 1 this slice, so for every record:
 #   cost = (rows scanned from the store) + (rows produced) + (interior operator evals).
 # storage_row_read fires per row a scan reads (BEFORE the filter); row_produced per row
-# emitted; operator_eval per INTERIOR expression node (leaf column/constant = free); no
-# short-circuit, so both operands of AND/OR/compare are always counted. Format + the
+# emitted; operator_eval per INTERIOR expression node (leaf column/constant = free); AND/OR
+# short-circuit left to right, so a right operand they skip is not counted. Format + the
 # `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, expr.arithmetic, expr.precedence, query.logical_connectives, expr.comparison_value, types.i32, query.point_lookup, resource.cost_metering
 
@@ -54,21 +54,21 @@ SELECT a + b * 2 FROM t WHERE id = 2
 ----
 50
 
-# NO short-circuit, AND: the WHERE is And(a>0, b>0) = 3 interior nodes, evaluated for
-# EVERY scanned row even when the left operand is false (row 3: a=0). 3 scanned + 9 filter
-# (3 nodes x 3 rows) + 2 produced + 0 projection = 14. A core that short-circuited AND
-# would skip row 3's `b>0` and report 13 — this pins the count to 14.
-# cost: 15
+# Short-circuit AND: the WHERE is And(a>0, b>0) = 3 interior nodes, but a FALSE left operand
+# decides the AND and its right operand is never evaluated (row 3: a=0 skips `b>0`). 1 page +
+# 3 scanned + 8 filter (3 + 3 + 2) + 2 produced + 0 projection = 14. A core that evaluated both
+# operands would report 15 — this pins the skip.
+# cost: 14
 query I nosort
 SELECT id FROM t WHERE a > 0 AND b > 0 ORDER BY id
 ----
 1
 2
 
-# NO short-circuit, OR: Or(a>0, b>0) = 3 interior nodes per scanned row even when the left
-# operand is true (rows 1, 2). 3 scanned + 9 filter + 2 produced = 14. A core that
-# short-circuited OR would skip the right operand on rows 1 and 2 and report 12.
-# cost: 15
+# Short-circuit OR: Or(a>0, b>0) = 3 interior nodes, but a TRUE left operand (rows 1, 2) decides
+# the OR. 1 page + 3 scanned + 7 filter (2 + 2 + 3) + 2 produced = 13. A core that evaluated both
+# operands would report 15.
+# cost: 13
 query I nosort
 SELECT id FROM t WHERE a > 0 OR b > 0 ORDER BY id
 ----

@@ -95,7 +95,7 @@ NULL
 
 # LEFT with a conjunct on the PRESERVED side: `a.v >= 20` stays in the ON. a(1) and a(3) fail it and
 # are NULL-extended rather than removed.
-# cost: 76
+# cost: 59
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND a.v >= 20 ORDER BY a.id, b.id
 ----
@@ -112,7 +112,7 @@ NULL
 
 # RIGHT: `a.v > 10` filters the NULL-extended (left) side and moves to a; `b.w > 0` filters the
 # preserved side and stays in the ON. Every b row survives.
-# cost: 50
+# cost: 42
 query II rowsort
 SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k AND a.v > 10 AND b.w > 0
 ----
@@ -128,7 +128,7 @@ NULL
 15
 
 # FULL: both sides are preserved, so nothing moves.
-# cost: 119
+# cost: 84
 query II rowsort
 SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k AND a.v > 10 AND b.w > 4
 ----
@@ -152,7 +152,7 @@ NULL
 # Three relations. b is NULL-extended by the earlier LEFT JOIN, so the later INNER ON's `b.w IS NULL`
 # cannot move to b: filtering b first would NULL-extend a(1) and a(2), which the ON would then accept.
 # It stays in the second join's ON; `c.id > 21` moves to c.
-# cost: 68
+# cost: 61
 query III nosort
 SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.k = b.k JOIN c ON c.k = a.k AND b.w IS NULL AND c.id > 21 ORDER BY a.id, b.id, c.id
 ----
@@ -201,7 +201,7 @@ NULL
 NULL
 
 # ON and WHERE conjuncts on the same relation form one pushed filter (ON first, source order).
-# cost: 37
+# cost: 36
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.w > 0 WHERE b.w < 7 AND a.v > 0 ORDER BY a.id, b.id
 ----
@@ -209,7 +209,7 @@ SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.w > 0 WHERE b.w < 7 AND a.v >
 11
 
 # OR, NOT, and IS [NOT] DISTINCT FROM over one relation are pushdown-safe.
-# cost: 54
+# cost: 49
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND (b.w IS NULL OR NOT (b.w < 6)) AND b.id IS DISTINCT FROM 11 ORDER BY a.id, b.id
 ----
@@ -225,8 +225,9 @@ NULL
 NULL
 
 # Arithmetic is not pushdown-safe: `b.w + 0 > 4` stays in the ON (same rows as the pushed form above,
-# which cost 28). a 1 + 4; b 1 + 5; the 4-node ON over 4 x 5 pairs = 80; 4 produced. 5 + 6 + 80 + 4 = 95.
-# cost: 95
+# which cost 28). a 1 + 4; b 1 + 5; the ON over 4 x 5 pairs is 2 nodes on the 17 pairs where
+# `a.k = b.k` is FALSE and 4 on the 3 matches = 46; 4 produced. 5 + 6 + 46 + 4 = 61.
+# cost: 61
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.w + 0 > 4 ORDER BY a.id, b.id
 ----

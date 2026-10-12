@@ -49,6 +49,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     streaming/buffered/deferred lane tag; the DML touched-set count; `EXPLAIN` of a data-modifying `WITH`.
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ LIKE `ESCAPE 'c'`; `SIMILAR TO` (deliberately excluded — the SQL-standard surface); set-returning `regexp_matches` / `regexp_split_to_table`; the Oracle-compat `regexp_count`/`instr`/`substr`/`like`; Unicode-property char classes (`\p{…}`).
+- [x] **Left-to-right short-circuit `AND` / `OR`** — a FALSE left operand decides `AND` and a TRUE
+  one decides `OR`; the right operand is then neither evaluated nor charged, so the guard idiom
+  `d <> 0 AND 10 / d > 1` no longer traps `22012` (PostgreSQL returns the guarded rows). The node
+  still charges its `operator_eval`; estimates count every node (an upper bound), so plans are
+  unchanged. A fixed order is a stronger promise than PostgreSQL's unspecified one. →
+  [cost.md §3](spec/design/cost.md), `expr/short_circuit.test`
+  - [ ] _follow-on:_ PostgreSQL also stops a top-level WHERE/ON qual list at a NULL conjunct and
+    cost-sorts its conjuncts, so `WHERE g > 0 AND 10 / d > 1` with a NULL `g` (or a guard written
+    second) can succeed there and trap here. Matching that would make evaluation context-dependent.
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions. → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ a general implicit argument-coercion pass. (`ceil`/`floor`/`mod`/`sign` and text `length`/`lower`/`upper` have since landed in their own slices.)
 - [x] **Scalar string / text functions** — PG's string surface as built-ins with code-point semantics (`length`/`substr`/`lpad`/`btrim`/`replace`/`translate`/`repeat`/`strpos`/`split_part`/`encode`/`decode`/`quote_*`/…). → [string-functions.md](spec/design/string-functions.md)
@@ -174,7 +183,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > cost — it must recompute *identically* in all three cores and re-pin the affected `# cost:` entries;
 > (b) the estimator is itself a spec'd, deterministic, cross-core-identical artifact, so cost-based
 > plan choice *extends* the §8 contract rather than breaking it; (c) some textbook rewrites
-> (constant folding, CSE, short-circuit) are **not** cost-neutral here — they drop `operator_eval`
+> (constant folding, CSE) are **not** cost-neutral here — they drop `operator_eval`
 > charges — so each needs an explicit cost
 > decision, not a silent apply. Every optimization is a vertical slice carrying a **NoREC relation**
 > (the standing §7 obligation — the sweep does not discover new optimizations).
