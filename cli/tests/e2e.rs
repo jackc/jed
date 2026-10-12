@@ -88,7 +88,8 @@ fn script_stops_at_the_first_error_with_exit_2() {
     assert_eq!(r.stdout, "OK (cost 0)\nOK, 1 row (cost 0)\n");
     assert_eq!(
         r.stderr,
-        "<stdin>:3: ERROR 23505: duplicate key value violates unique constraint: t_pkey\n"
+        "<stdin>:3: ERROR 23505: duplicate key value violates unique constraint: t_pkey\n\
+         DETAIL:  Key (id)=(1) already exists.\n"
     );
 }
 

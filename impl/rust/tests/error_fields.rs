@@ -4,7 +4,7 @@
 //! never on a structured field — CLAUDE.md §10), so this is the host-API surface test.
 //! Mirrored in impl/go/error_fields_test.go and impl/ts/tests/error_fields.test.ts.
 
-use jed::{CreateOptions, Database, EngineError, Session, SessionOptions};
+use jed::{CreateOptions, Database, EngineError, Privilege, PrivilegeSet, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
     let mut db = Database::create(CreateOptions::default())
@@ -150,4 +150,110 @@ fn unrelated_error_has_no_fields() {
     assert_eq!(e.table_name, None);
     assert_eq!(e.column_name, None);
     assert_eq!(e.data_type_name, None);
+    assert_eq!(e.detail, None);
+}
+
+/// One case of the shared Detail fixture (spec/errors/detail_cases.txt).
+#[derive(Default)]
+struct DetailCase {
+    name: String,
+    setup: Vec<String>,
+    default_privileges: Option<String>,
+    grants: Vec<(String, String)>,
+    revokes: Vec<(String, String)>,
+    run: String,
+    code: String,
+    detail: Option<String>,
+}
+
+fn parse_detail_cases(text: &str) -> Vec<DetailCase> {
+    let mut cases: Vec<DetailCase> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("case: ") {
+            cases.push(DetailCase {
+                name: name.to_string(),
+                ..DetailCase::default()
+            });
+            continue;
+        }
+        let c = cases.last_mut().expect("a directive before the first case");
+        let priv_obj = |rest: &str| {
+            let (p, o) = rest.split_once(' ').expect("PRIV object");
+            (p.to_string(), o.to_string())
+        };
+        if let Some(v) = line.strip_prefix("setup: ") {
+            c.setup.push(v.to_string());
+        } else if let Some(v) = line.strip_prefix("default_privileges: ") {
+            c.default_privileges = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("grant: ") {
+            c.grants.push(priv_obj(v));
+        } else if let Some(v) = line.strip_prefix("revoke: ") {
+            c.revokes.push(priv_obj(v));
+        } else if let Some(v) = line.strip_prefix("run: ") {
+            c.run = v.to_string();
+        } else if let Some(v) = line.strip_prefix("code: ") {
+            c.code = v.to_string();
+        } else if let Some(v) = line.strip_prefix("detail: ") {
+            c.detail = Some(v.to_string());
+        } else if line != "no-detail" {
+            panic!("unknown detail_cases directive: {line}");
+        }
+    }
+    cases
+}
+
+fn privilege_set(list: &str) -> PrivilegeSet {
+    if list == "-" {
+        return PrivilegeSet::EMPTY;
+    }
+    list.split(',').fold(PrivilegeSet::EMPTY, |set, p| {
+        set.with(Privilege::from_name(p.trim()).expect("privilege name"))
+    })
+}
+
+/// The `Detail` field (spec/design/error-fields.md §9): every case of the shared, language-neutral
+/// fixture — the same file the Go and TS cores run, so the text is pinned byte-identical.
+#[test]
+fn detail_shared_cases() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/errors/detail_cases.txt"
+    );
+    let text = std::fs::read_to_string(path).expect("read detail_cases.txt");
+    let cases = parse_detail_cases(&text);
+    assert!(!cases.is_empty());
+    let mut failures = Vec::new();
+    for c in &cases {
+        let setup: Vec<&str> = c.setup.iter().map(String::as_str).collect();
+        let mut db = db_with(&setup);
+        if let Some(list) = &c.default_privileges {
+            db.set_default_privileges(privilege_set(list));
+        }
+        for (p, o) in &c.grants {
+            db.grant(privilege_set(p), o);
+        }
+        for (p, o) in &c.revokes {
+            db.revoke(privilege_set(p), o);
+        }
+        match db.query_outcome(&c.run, &[]) {
+            Ok(_) => failures.push(format!("{}: expected {} but succeeded", c.name, c.code)),
+            Err(e) => {
+                if e.code() != c.code || e.detail != c.detail {
+                    failures.push(format!(
+                        "{}: got {} {:?} ({}), want {} {:?}",
+                        c.name,
+                        e.code(),
+                        e.detail,
+                        e.message,
+                        c.code,
+                        c.detail
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

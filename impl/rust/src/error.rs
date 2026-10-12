@@ -34,6 +34,10 @@ pub struct EngineError {
     pub column_name: Option<String>,
     /// The data type at fault — set for 22003 / 22001.
     pub data_type_name: Option<String>,
+    /// PostgreSQL's DETAIL sentence naming the offending values (`Key (id)=(1) already exists.`) —
+    /// set on the class-23 violations, subject to the session's SELECT privilege
+    /// (spec/design/error-fields.md §9). Never part of the rendered message.
+    pub detail: Option<String>,
 }
 
 impl EngineError {
@@ -45,6 +49,7 @@ impl EngineError {
             table_name: None,
             column_name: None,
             data_type_name: None,
+            detail: None,
         }
     }
 
@@ -71,6 +76,14 @@ impl EngineError {
     #[must_use]
     pub(crate) fn with_column(mut self, name: impl Into<String>) -> Self {
         self.column_name = Some(name.into());
+        self
+    }
+
+    /// Attach a `Detail` (spec/design/error-fields.md §9). `None` (a gated or inapplicable detail)
+    /// leaves the field unset, so a raise site can pass a helper's result straight through.
+    #[must_use]
+    pub(crate) fn with_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail;
         self
     }
 

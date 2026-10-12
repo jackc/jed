@@ -3193,10 +3193,18 @@ impl Engine {
                         *key = encode_pk_key(&pk, &col_types, &colls, row)?;
                     }
                     if !seen_keys.insert(key.clone()) {
+                        let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
                         return Err(EngineError::unique_violation(
                             &table.name,
                             format!("{}_pkey", table.name),
-                        ));
+                        )
+                        .with_detail(self.pk_detail(
+                            &table.name,
+                            &table.columns,
+                            &pk_ords,
+                            row,
+                            DUPLICATED,
+                        )));
                     }
                 }
                 compress_units += crate::format::record_compress_units(
@@ -3298,13 +3306,15 @@ impl Engine {
                 }
                 store.resolve_inline_columns(&mut row)?;
                 for ck in &checks {
+                    // PostgreSQL's ADD CHECK validation carries no DETAIL (error-fields.md §9.2).
                     self.eval_checks(
                         std::slice::from_ref(ck),
                         &row,
                         &rng,
                         &table.name,
                         &mut meter,
-                    )?;
+                    )
+                    .map_err(|e| e.with_detail(None))?;
                 }
                 for ix in table
                     .indexes
@@ -3316,7 +3326,24 @@ impl Engine {
                         if let Some(p) = self.index_prefix(&col_types, &colls, &ri, &row)? {
                             let s = seen.entry(ix.name.to_string()).or_default();
                             if !s.insert(p) {
-                                return Err(EngineError::unique_violation(&table.name, &ix.name));
+                                let env = EvalEnv {
+                                    exec: self,
+                                    params: &[],
+                                    outer: &[],
+                                    rng: &rng,
+                                    ctes: CteCtx::empty(),
+                                    host_batch: None,
+                                };
+                                return Err(EngineError::unique_violation(&table.name, &ix.name)
+                                    .with_detail(self.index_detail(
+                                        &table.name,
+                                        &table.columns,
+                                        ix,
+                                        &ri,
+                                        &row,
+                                        &env,
+                                        DUPLICATED,
+                                    )));
                             }
                         }
                     }
@@ -3367,7 +3394,13 @@ impl Engine {
                             self.fk_probe_hits(&p, &parent.name)?
                         };
                         if !hit {
-                            return Err(EngineError::fk_violation_insert(&table.name, &fk.name));
+                            return Err(EngineError::fk_violation_insert(&table.name, &fk.name)
+                                .with_detail(self.fk_child_detail(
+                                    &table.name,
+                                    &table.columns,
+                                    fk,
+                                    &row,
+                                )));
                         }
                     }
                 }
@@ -3386,7 +3419,15 @@ impl Engine {
                         let mut b = rows[j].1.clone();
                         store.resolve_inline_columns(&mut b)?;
                         if exclusion_pair_conflicts(&table.columns, ex, &a, &b)? {
-                            return Err(EngineError::exclusion_violation(&table.name, &ex.name));
+                            return Err(EngineError::exclusion_violation(&table.name, &ex.name)
+                                .with_detail(self.exclusion_detail(
+                                    &table.name,
+                                    &table.columns,
+                                    ex,
+                                    &a,
+                                    &b,
+                                    false,
+                                )));
                         }
                     }
                 }
@@ -4659,7 +4700,19 @@ impl Engine {
                     && let Some(prefix) = index_prefix_key(&col_types, &colls, &rindex, &row, &env)?
                     && !seen_prefixes.insert(prefix)
                 {
-                    return Err(EngineError::unique_violation(&ci.table, &def.name));
+                    return Err(
+                        EngineError::unique_violation(&ci.table, &def.name).with_detail(
+                            self.index_detail(
+                                &table.name,
+                                &columns,
+                                &def,
+                                &rindex,
+                                &row,
+                                &env,
+                                DUPLICATED,
+                            ),
+                        ),
+                    );
                 }
                 entries.extend(index_entry_keys(
                     &columns, &col_types, &colls, &rindex, &key, &row, &env,

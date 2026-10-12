@@ -92,6 +92,10 @@ pub fn run(
                 }
                 Err(e) => {
                     let _ = writeln!(err, "{name}:{line}: ERROR {}: {}", e.code(), e.message);
+                    // The structured Detail as psql's second line (spec/design/cli.md §5).
+                    if let Some(detail) = &e.detail {
+                        let _ = writeln!(err, "DETAIL:  {detail}");
+                    }
                     if let Some(hint) = hint_for(e.code()) {
                         let _ = writeln!(err, "hint: {hint}");
                     }

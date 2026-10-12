@@ -1302,7 +1302,6 @@ impl Engine {
         ctes: CteCtx,
         meter: &mut Meter,
     ) -> Result<Option<Vec<Vec<Value>>>> {
-        let n = columns.len();
         // The canonical relation name for the 23514 message (the `table` argument is the
         // name as the statement spelled it), and the index definitions phase 2 maintains
         // (spec/design/indexes.md §4 — unmetered write work, like the row writes). Scope-aware so an
@@ -1336,35 +1335,19 @@ impl Engine {
             host_batch: None,
         };
         for values in &rows {
-            let mut row = Vec::with_capacity(n);
-            for (i, col) in columns.iter().enumerate() {
-                let candidate = match provided[i] {
-                    Some(p) => values[p].clone(),
-                    // An omitted column takes its default — a constant, or its expression
-                    // evaluated for this row through the shared per-statement seam/clock
-                    // (constraints.md §2). `eval_default` charges `operator_eval` for an
-                    // expression default; a constant (or no default → NULL) is free.
-                    None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
-                };
-                row.push(
-                    coerce_for_store(
-                        candidate,
-                        &col_types[i],
-                        col.decimal,
-                        col.varchar_len,
-                        col.not_null,
-                        &col.name,
-                        &self.input_zone(),
-                    )
-                    // Stamp the target relation onto a column-store failure (23502/22003/
-                    // 22001) — the relation name is in scope here, not inside the coercion
-                    // (spec/design/error-fields.md §4).
-                    .map_err(|e| e.with_table(&relation))?,
-                );
-            }
+            let row = self.build_insert_row(
+                columns,
+                col_types,
+                provided,
+                values,
+                default_exprs,
+                rng,
+                meter,
+                &relation,
+            )?;
 
             // CHECK constraints, in name order, on the fully-coerced candidate row — after
-            // NOT NULL (`store_value` above), before the key/duplicate check (PG's per-row
+            // NOT NULL (`build_insert_row` above), before the key/duplicate check (PG's per-row
             // order, constraints.md §4.4). TRUE and NULL pass; the first FALSE aborts the
             // whole statement (two-phase — nothing has been written). Evaluation is metered
             // expression work (operator_eval), so guard the ceiling per checked row. The
@@ -1373,7 +1356,8 @@ impl Engine {
                 meter.guard()?;
                 for (name, rexpr) in checks {
                     if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
-                        return Err(EngineError::check_violation(&relation, name));
+                        return Err(EngineError::check_violation(&relation, name)
+                            .with_detail(self.failing_row_detail(&relation, &row)));
                     }
                 }
             }
@@ -1389,10 +1373,12 @@ impl Engine {
                     // The PK's 23505 reports PostgreSQL's derived auto-name for the PK
                     // index, `<table>_pkey` — jed persists/reserves no such relation
                     // (constraints.md §5.4).
+                    let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
                     return Err(EngineError::unique_violation(
                         &relation,
                         format!("{}_pkey", relation),
-                    ));
+                    )
+                    .with_detail(self.pk_detail(&relation, columns, &pk_ords, &row, EXISTS)));
                 }
                 seen_keys.insert(k.clone());
                 Some(k)
@@ -1411,7 +1397,10 @@ impl Engine {
                     .range_entries(&unique_probe_bound(&prefix))?
                     .is_empty();
                 if stored || !seen_prefixes[u].insert(prefix) {
-                    return Err(EngineError::unique_violation(&relation, &rindex.name));
+                    return Err(EngineError::unique_violation(&relation, &rindex.name)
+                        .with_detail(self.index_detail_by_name(
+                            db_scope, &relation, rindex, &row, &env, EXISTS,
+                        )));
                 }
             }
             // Meter the row's disposition-plan compression attempts (value_compress, cost.md
@@ -1483,7 +1472,7 @@ impl Engine {
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                self.validate_insert_fk_stored(&relation, fk, &probe)?;
+                self.validate_insert_fk_stored(&relation, columns, fk, &probe, row)?;
             }
         }
 
@@ -1504,14 +1493,23 @@ impl Engine {
             for exc in &exclusions {
                 let ikey = exc.index.to_string();
                 for (_, row) in &prepared {
-                    if self.insert_exclusion_conflicts_stored(&tcols, exc, row, &ikey)? {
-                        return Err(EngineError::exclusion_violation(&relation, &exc.name));
+                    if let Some(other) =
+                        self.insert_exclusion_conflicts_stored(table, &tcols, exc, row, &ikey)?
+                    {
+                        return Err(EngineError::exclusion_violation(&relation, &exc.name)
+                            .with_detail(
+                                self.exclusion_detail(&relation, &tcols, exc, row, &other, true),
+                            ));
                     }
                 }
                 for i in 0..prepared.len() {
                     for j in 0..i {
-                        if exclusion_pair_conflicts(&tcols, exc, &prepared[i].1, &prepared[j].1)? {
-                            return Err(EngineError::exclusion_violation(&relation, &exc.name));
+                        let (new, other) = (&prepared[i].1, &prepared[j].1);
+                        if exclusion_pair_conflicts(&tcols, exc, new, other)? {
+                            return Err(EngineError::exclusion_violation(&relation, &exc.name)
+                                .with_detail(
+                                    self.exclusion_detail(&relation, &tcols, exc, new, other, true),
+                                ));
                         }
                     }
                 }
@@ -1601,30 +1599,20 @@ impl Engine {
         ctes: CteCtx,
         meter: &mut Meter,
     ) -> Result<Option<Vec<Vec<Value>>>> {
-        let n = columns.len();
         let (relation, indexes) = self
             .table_scoped(db_scope, table)
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
-        let mut row = Vec::with_capacity(n);
-        for (i, col) in columns.iter().enumerate() {
-            let candidate = match provided[i] {
-                Some(p) => values[p].clone(),
-                None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
-            };
-            row.push(
-                coerce_for_store(
-                    candidate,
-                    &col_types[i],
-                    col.decimal,
-                    col.varchar_len,
-                    col.not_null,
-                    &col.name,
-                    &self.input_zone(),
-                )
-                .map_err(|e| e.with_table(&relation))?,
-            );
-        }
+        let row = self.build_insert_row(
+            columns,
+            col_types,
+            provided,
+            &values,
+            default_exprs,
+            rng,
+            meter,
+            &relation,
+        )?;
 
         self.eval_checks(checks, &row, rng, &relation, meter)?;
 
@@ -1642,10 +1630,11 @@ impl Engine {
         } else {
             let key = encode_pk_key(pk, col_types, &colls, &row)?;
             if self.store_scoped(db_scope, table).get(&key)?.is_some() {
-                return Err(EngineError::unique_violation(
-                    &relation,
-                    format!("{}_pkey", relation),
-                ));
+                let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
+                return Err(
+                    EngineError::unique_violation(&relation, format!("{}_pkey", relation))
+                        .with_detail(self.pk_detail(&relation, columns, &pk_ords, &row, EXISTS)),
+                );
             }
             Some(key)
         };
@@ -1659,7 +1648,11 @@ impl Engine {
                 .range_entries(&unique_probe_bound(&prefix))?
                 .is_empty();
             if stored {
-                return Err(EngineError::unique_violation(&relation, &rindex.name));
+                return Err(
+                    EngineError::unique_violation(&relation, &rindex.name).with_detail(
+                        self.index_detail_by_name(db_scope, &relation, rindex, &row, &env, EXISTS),
+                    ),
+                );
             }
         }
 
@@ -1706,7 +1699,7 @@ impl Engine {
             if supplied.as_deref() == Some(probe.bytes()) {
                 continue;
             }
-            self.validate_insert_fk_stored(&relation, &fk, &probe)?;
+            self.validate_insert_fk_stored(&relation, columns, &fk, &probe, &row)?;
         }
 
         let exclusions: Vec<ExclusionConstraint> = self
@@ -1720,8 +1713,13 @@ impl Engine {
                 .unwrap_or_default();
             for exc in &exclusions {
                 let ikey = exc.index.to_string();
-                if self.insert_exclusion_conflicts_stored(&tcols, exc, &row, &ikey)? {
-                    return Err(EngineError::exclusion_violation(&relation, &exc.name));
+                if let Some(other) =
+                    self.insert_exclusion_conflicts_stored(table, &tcols, exc, &row, &ikey)?
+                {
+                    return Err(EngineError::exclusion_violation(&relation, &exc.name)
+                        .with_detail(
+                            self.exclusion_detail(&relation, &tcols, exc, &row, &other, true),
+                        ));
                 }
             }
         }
@@ -1976,28 +1974,16 @@ impl Engine {
         for values in &rows {
             // Build + coerce the candidate row, then CHECK — the INSERT per-row order
             // (NOT NULL before CHECK before conflict; constraints.md §4.4).
-            let mut row = Vec::with_capacity(n);
-            for (i, col) in columns.iter().enumerate() {
-                let candidate = match provided[i] {
-                    Some(p) => values[p].clone(),
-                    None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
-                };
-                row.push(
-                    coerce_for_store(
-                        candidate,
-                        &col_types[i],
-                        col.decimal,
-                        col.varchar_len,
-                        col.not_null,
-                        &col.name,
-                        &self.input_zone(),
-                    )
-                    // Stamp the target relation onto a column-store failure (23502/22003/
-                    // 22001) — the relation name is in scope here, not inside the coercion
-                    // (spec/design/error-fields.md §4).
-                    .map_err(|e| e.with_table(&relation))?,
-                );
-            }
+            let row = self.build_insert_row(
+                columns,
+                &col_types,
+                provided,
+                values,
+                default_exprs,
+                rng,
+                meter,
+                &relation,
+            )?;
             self.eval_checks(checks, &row, rng, &relation, meter)?;
 
             match &plan.arbiter {
@@ -2086,11 +2072,23 @@ impl Engine {
                                     }
                                 }
                                 let mut new_row = erow.clone();
+                                let mut null_col: Option<&str> = None;
                                 for ap in assignments {
                                     let raw = ap.source.eval(&combined, &env, meter)?;
+                                    // NOT NULL over the complete new row (error-fields.md §9.5).
+                                    if ap.not_null && matches!(raw, Value::Null) {
+                                        null_col.get_or_insert(&ap.name);
+                                        new_row[ap.idx] = Value::Null;
+                                        continue;
+                                    }
                                     new_row[ap.idx] = ap
                                         .check(raw, &self.input_zone())
                                         .map_err(|e| e.with_table(&relation))?;
+                                }
+                                if let Some(col) = null_col {
+                                    return Err(
+                                        self.not_null_row_violation(&relation, col, &new_row)
+                                    );
                                 }
                                 self.eval_checks(checks, &new_row, rng, &relation, meter)?;
                                 updates.push((ekey, new_row, erow));
@@ -2109,10 +2107,12 @@ impl Engine {
             for row in &inserts {
                 let k = encode_pk_key(pk, &col_types, &colls, row)?;
                 if self.store(table).get(&k)?.is_some() || !seen.insert(k) {
+                    let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
                     return Err(EngineError::unique_violation(
                         &relation,
                         format!("{}_pkey", relation),
-                    ));
+                    )
+                    .with_detail(self.pk_detail(&relation, columns, &pk_ords, row, EXISTS)));
                 }
             }
         }
@@ -2137,7 +2137,18 @@ impl Engine {
                             .iter()
                             .any(|(ekey, _)| !rewritten.contains(&ekey[prefix.len()..]));
                     if conflict {
-                        return Err(EngineError::unique_violation(&relation, &rindex.name));
+                        let env = EvalEnv {
+                            exec: self,
+                            params: &[],
+                            outer: &[],
+                            rng,
+                            ctes: CteCtx::empty(),
+                            host_batch: None,
+                        };
+                        return Err(EngineError::unique_violation(&relation, &rindex.name)
+                            .with_detail(self.index_detail_by_name(
+                                None, &relation, rindex, new_row, &env, EXISTS,
+                            )));
                     }
                 }
             }
@@ -2191,7 +2202,8 @@ impl Engine {
                     continue;
                 }
                 if !self.fk_probe_hits(&probe, &fk.ref_table)? {
-                    return Err(EngineError::fk_violation_insert(&relation, &fk.name));
+                    return Err(EngineError::fk_violation_insert(&relation, &fk.name)
+                        .with_detail(self.fk_child_detail(&relation, columns, fk, row)));
                 }
             }
         }
@@ -2346,11 +2358,14 @@ impl Engine {
     fn validate_insert_fk_stored(
         &self,
         relation: &str,
+        columns: &[Column],
         fk: &ForeignKeyConstraint,
         probe: &FkProbe,
+        row: &Row,
     ) -> Result<()> {
         if !self.fk_probe_hits(probe, &fk.ref_table)? {
-            return Err(EngineError::fk_violation_insert(relation, &fk.name));
+            return Err(EngineError::fk_violation_insert(relation, &fk.name)
+                .with_detail(self.fk_child_detail(relation, columns, fk, row)));
         }
         Ok(())
     }
@@ -2358,19 +2373,28 @@ impl Engine {
     /// Test one candidate against the resident rows for an exclusion constraint. Batch-only
     /// pairwise end-state checks remain in the batch caller; this stored probe is common to both
     /// INSERT paths (gist.md §7, constraints.md §7).
+    /// Returns the conflicting stored row (the least storage key among the matches, for a
+    /// deterministic `Detail` — error-fields.md §9.2), or `None` when nothing conflicts.
     fn insert_exclusion_conflicts_stored(
         &self,
+        table: &str,
         columns: &[Column],
         exc: &ExclusionConstraint,
         row: &Row,
         index_key: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<Row>> {
         let Some((query, strats)) = exclusion_probe_query(columns, exc, row)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(self
+        let Some(first) = self
             .gist_tree(index_key)
-            .is_some_and(|tree| !tree.search(&query, &strats).0.is_empty()))
+            .and_then(|tree| tree.search(&query, &strats).0.into_iter().min())
+        else {
+            return Ok(None);
+        };
+        // A matched entry always names a stored row; an empty row stands in should it not, which
+        // only omits the Detail (the 23P01 itself is decided by the match).
+        Ok(Some(self.store(table).get(&first)?.unwrap_or_default()))
     }
 
     /// Evaluate the table's CHECK constraints on one candidate row (constraints.md §4.4): TRUE
@@ -2398,10 +2422,74 @@ impl Engine {
         };
         for (name, rexpr) in checks {
             if matches!(rexpr.eval(row, &env, meter)?, Value::Bool(false)) {
-                return Err(EngineError::check_violation(relation, name));
+                return Err(EngineError::check_violation(relation, name)
+                    .with_detail(self.failing_row_detail(relation, row)));
             }
         }
         Ok(())
+    }
+
+    /// Build + coerce one INSERT candidate row in column order (constraints.md §7 step 1): an
+    /// omitted column takes its default — a constant, or its expression evaluated for this row
+    /// through the shared per-statement seam/clock (constraints.md §2; `eval_default` charges
+    /// `operator_eval` for an expression default). NOT NULL is enforced over the COMPLETE row, so a
+    /// later column's coercion/default error wins over an earlier NULL, and the 23502 can carry the
+    /// whole failing row (PostgreSQL's order — error-fields.md §9.5). A column-store failure
+    /// (23502/22003/22001) is stamped with the target relation, which is in scope here, not inside
+    /// the coercion (error-fields.md §4).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_insert_row(
+        &self,
+        columns: &[Column],
+        col_types: &[ColType],
+        provided: &[Option<usize>],
+        values: &[Value],
+        default_exprs: &[Option<RExpr>],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        meter: &mut Meter,
+        relation: &str,
+    ) -> Result<Row> {
+        let mut row = Vec::with_capacity(columns.len());
+        let mut null_col: Option<usize> = None;
+        for (i, col) in columns.iter().enumerate() {
+            let candidate = match provided[i] {
+                Some(p) => values[p].clone(),
+                None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
+            };
+            if col.not_null && matches!(candidate, Value::Null) {
+                null_col.get_or_insert(i);
+                row.push(Value::Null);
+                continue;
+            }
+            row.push(
+                coerce_for_store(
+                    candidate,
+                    &col_types[i],
+                    col.decimal,
+                    col.varchar_len,
+                    col.not_null,
+                    &col.name,
+                    &self.input_zone(),
+                )
+                .map_err(|e| e.with_table(relation))?,
+            );
+        }
+        if let Some(i) = null_col {
+            return Err(self.not_null_row_violation(relation, &columns[i].name, &row));
+        }
+        Ok(row)
+    }
+
+    /// 23502 for a NULL in NOT NULL `column` of the complete candidate `row` (error-fields.md §9.5).
+    pub(crate) fn not_null_row_violation(
+        &self,
+        relation: &str,
+        column: &str,
+        row: &Row,
+    ) -> EngineError {
+        EngineError::not_null_violation(column)
+            .with_table(relation)
+            .with_detail(self.failing_row_detail(relation, row))
     }
 
     /// Whether a candidate row conflicts with a COMMITTED row on the primary key or any unique
@@ -2803,7 +2891,13 @@ impl Engine {
                     &check.parent.name,
                     &check.fk.name,
                     &check.child_table,
-                ));
+                )
+                .with_detail(self.fk_parent_detail(
+                    &check.parent,
+                    &check.fk,
+                    &check.child_table,
+                    &check.values,
+                )));
             }
         }
         Ok(())
@@ -3647,6 +3741,7 @@ impl Engine {
             // column is always inline, so cost-free) so that maintenance sees resident values.
             store.resolve_inline_columns(&mut row)?;
             let mut new_row = row.clone();
+            let mut null_col: Option<&str> = None;
             for plan in &plans {
                 let mut raw = plan.source.eval(&row, &env, &mut meter)?;
                 if let (Some(mapped), Some(target)) = (mapped, &upd.fk_target) {
@@ -3659,22 +3754,32 @@ impl Engine {
                         .expect("a CASCADE assignment is one of the FK's local columns");
                     raw = mapped[slot].clone();
                 }
+                // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
+                if plan.not_null && matches!(raw, Value::Null) {
+                    null_col.get_or_insert(&plan.name);
+                    new_row[plan.idx] = Value::Null;
+                    continue;
+                }
                 new_row[plan.idx] = plan
                     .check(raw, &self.input_zone())
                     .map_err(|e| e.with_table(&relation))?;
+            }
+            if let Some(col) = null_col {
+                return Err(self.not_null_row_violation(&relation, col, &new_row));
             }
             // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
             // columns so its weight/disposition re-plan exactly as an eager writer's would —
             // unmetered, part of the rewrite like commit work (large-values.md §14).
             store.resolve_all(&mut new_row)?;
             // CHECK constraints, in name order, on the post-assignment row — after the
-            // assignments coerced (22003/23502 in `plan.check` above), on the fully-resident
-            // row (constraints.md §4.4). Every check evaluates (not only those mentioning
+            // assignments coerced (22003 in `plan.check`, then 23502 over the whole row, above),
+            // on the fully-resident row (constraints.md §4.4). Every check evaluates (not only those mentioning
             // assigned columns); TRUE and NULL pass, the first FALSE aborts the statement
             // (phase 1 — nothing has been written).
             for (name, rexpr) in &checks {
                 if matches!(rexpr.eval(&new_row, &env, &mut meter)?, Value::Bool(false)) {
-                    return Err(EngineError::check_violation(&relation, name));
+                    return Err(EngineError::check_violation(&relation, name)
+                        .with_detail(self.failing_row_detail(&relation, &new_row)));
                 }
             }
             // The row's NEW storage key: recomputed from the post-assignment row when a key
@@ -3704,14 +3809,17 @@ impl Engine {
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
             let store = self.store_scoped(upd.db.as_deref(), &upd.table);
             let mut batch: HashSet<&[u8]> = HashSet::new();
-            for (_, new_key, _, _) in &updates {
+            for (_, new_key, new_row, _) in &updates {
                 let collides = !batch.insert(new_key.as_slice())
                     || (store.get(new_key)?.is_some() && !rewritten.contains(new_key.as_slice()));
                 if collides {
+                    let pk_ords: Vec<usize> = pk_typed.iter().map(|(o, _)| *o).collect();
+                    let columns = self.relation_columns(upd.db.as_deref(), &upd.table);
                     return Err(EngineError::unique_violation(
                         &relation,
                         format!("{}_pkey", relation),
-                    ));
+                    )
+                    .with_detail(self.pk_detail(&relation, &columns, &pk_ords, new_row, EXISTS)));
                 }
             }
         }
@@ -3740,7 +3848,15 @@ impl Engine {
                             .iter()
                             .any(|(ekey, _)| !rewritten.contains(&ekey[prefix.len()..]));
                     if conflict {
-                        return Err(EngineError::unique_violation(&relation, &rindex.name));
+                        return Err(EngineError::unique_violation(&relation, &rindex.name)
+                            .with_detail(self.index_detail_by_name(
+                                upd.db.as_deref(),
+                                &relation,
+                                rindex,
+                                new_row,
+                                &env,
+                                EXISTS,
+                            )));
                     }
                 }
             }
@@ -3770,23 +3886,33 @@ impl Engine {
                 let ikey = exc.index.to_string();
                 for (_, _, new_row, _) in &updates {
                     if let Some((q, strats)) = exclusion_probe_query(&tcolumns, exc, new_row)? {
-                        let conflict = match self.gist_tree(&ikey) {
+                        // The least non-vacated stored match (a deterministic Detail, §9.2).
+                        let hit = match self.gist_tree(&ikey) {
                             Some(tree) => tree
                                 .search(&q, &strats)
                                 .0
-                                .iter()
-                                .any(|h| !rewritten.contains(h.as_slice())),
-                            None => false,
+                                .into_iter()
+                                .filter(|h| !rewritten.contains(h.as_slice()))
+                                .min(),
+                            None => None,
                         };
-                        if conflict {
-                            return Err(EngineError::exclusion_violation(&relation, &exc.name));
+                        if let Some(hit) = hit {
+                            let other = self.store(&upd.table).get(&hit)?.unwrap_or_default();
+                            return Err(EngineError::exclusion_violation(&relation, &exc.name)
+                                .with_detail(self.exclusion_detail(
+                                    &relation, &tcolumns, exc, new_row, &other, true,
+                                )));
                         }
                     }
                 }
                 for i in 0..updates.len() {
                     for j in 0..i {
-                        if exclusion_pair_conflicts(&tcolumns, exc, &updates[i].2, &updates[j].2)? {
-                            return Err(EngineError::exclusion_violation(&relation, &exc.name));
+                        let (new, other) = (&updates[i].2, &updates[j].2);
+                        if exclusion_pair_conflicts(&tcolumns, exc, new, other)? {
+                            return Err(EngineError::exclusion_violation(&relation, &exc.name)
+                                .with_detail(self.exclusion_detail(
+                                    &relation, &tcolumns, exc, new, other, true,
+                                )));
                         }
                     }
                 }
@@ -3833,7 +3959,9 @@ impl Engine {
                     continue;
                 }
                 if !self.fk_probe_hits(&probe, &fk.ref_table)? {
-                    return Err(EngineError::fk_violation_insert(&relation, &fk.name));
+                    let columns = self.relation_columns(upd.db.as_deref(), &upd.table);
+                    return Err(EngineError::fk_violation_insert(&relation, &fk.name)
+                        .with_detail(self.fk_child_detail(&relation, &columns, fk, new_row)));
                 }
             }
         }

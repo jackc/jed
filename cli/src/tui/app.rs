@@ -304,7 +304,15 @@ impl App {
                         "25P02" => "  (ROLLBACK to end the failed transaction)",
                         _ => "",
                     };
-                    self.set_message(format!("ERROR {}: {}{hint}", e.code(), e.message), true);
+                    // The one-line message log carries the structured Detail inline (cli.md §5).
+                    let detail = match &e.detail {
+                        Some(d) => format!("  DETAIL: {d}"),
+                        None => String::new(),
+                    };
+                    self.set_message(
+                        format!("ERROR {}: {}{detail}{hint}", e.code(), e.message),
+                        true,
+                    );
                     break;
                 }
             }
