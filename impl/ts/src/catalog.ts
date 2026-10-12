@@ -9,7 +9,7 @@ import {
   scalarIsKeyable,
   scalarTypeFromName,
 } from "./types.ts";
-import type { Value } from "./value.ts";
+import { type Value, sqlLiteral } from "./value.ts";
 
 // Column is a column definition: name, declared type, nullability, primary-key flag, default.
 // notNull is implied true for a PRIMARY KEY column.
@@ -210,6 +210,16 @@ export type IndexDef = {
 };
 
 // indexKeyColumn is the column ordinal of a plain column key element, else null (an expression key).
+// columnDefaultText is the column's DEFAULT as canonical SQL text (introspection.md §5
+// column_default): an expression default's persisted expression text verbatim, or a constant
+// default's stored value as a SQL literal (sqlLiteral). null for no default and for DEFAULT NULL
+// (PostgreSQL stores no default for it).
+export function columnDefaultText(c: Column): string | null {
+  if (c.defaultExpr !== null) return c.defaultExpr.exprText;
+  if (c.default === null || c.default.kind === "null") return null;
+  return sqlLiteral(c.default);
+}
+
 export function indexKeyColumn(k: IndexKey): number | null {
   return k.kind === "column" ? k.column : null;
 }

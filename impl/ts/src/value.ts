@@ -495,6 +495,21 @@ function bool3(b: boolean): ThreeValued {
   return b ? "true" : "false";
 }
 
+// sqlLiteral renders v as a SQL literal that re-parses to v when assigned to a column of its type
+// (introspection.md §5 column_default): an integer, decimal, or boolean renders bare by render;
+// every other value renders its canonical text quoted, ' doubled. NULL renders NULL.
+export function sqlLiteral(v: Value): string {
+  switch (v.kind) {
+    case "null":
+    case "int":
+    case "bool":
+    case "decimal":
+      return render(v);
+    default:
+      return `'${render(v).replaceAll("'", "''")}'`;
+  }
+}
+
 // render formats for conformance output: integers as shortest decimal, booleans as the
 // canonical "true"/"false", NULL (including a NULL/unknown boolean) as the literal
 // "NULL" (spec/design/conformance.md §1; the canonical spelling is a §8 decision).

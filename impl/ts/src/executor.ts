@@ -92,6 +92,7 @@ import {
   type ViewDef,
   type ViewDep,
   type ViewDepKind,
+  columnDefaultText,
   columnIndex,
   indexColumnOrdinals,
   indexFirstColumn,
@@ -16293,7 +16294,8 @@ export class Engine {
   // ordinal) order. ordinal is 1-based CREATE TABLE order; type is the canonical type text
   // (catalogTypeText); not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal
   // is the 1-based position in the PRIMARY KEY in KEY order (which may differ from declaration
-  // order — constraints.md §3), NULL for a non-member. Cost mirrors jedTablesRows.
+  // order — constraints.md §3), NULL for a non-member; column_default is the canonical DEFAULT
+  // text (columnDefaultText). Cost mirrors jedTablesRows.
   private jedColumnsRows(srf: SrfPlan, meter: Meter): Row[] {
     const snap = this.snapForScope(srf.introspectScope!);
     if (snap === undefined) {
@@ -16306,6 +16308,7 @@ export class Engine {
         meter.guard();
         meter.charge(COSTS.generatedRow);
         const k = t.pk.indexOf(i);
+        const columnDefault = columnDefaultText(c);
         out.push([
           textValue(t.name),
           textValue(c.name),
@@ -16313,6 +16316,7 @@ export class Engine {
           textValue(catalogTypeText(c.type, c.decimal, c.varcharLen)),
           boolValue(c.notNull || c.primaryKey),
           k >= 0 ? intValue(BigInt(k + 1)) : nullValue(),
+          columnDefault === null ? nullValue() : textValue(columnDefault),
         ]);
       }
     }
@@ -27818,6 +27822,8 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("type", "text", true),
         col("not_null", "boolean", true),
         col("pk_ordinal", "i32", false),
+        // The DEFAULT as canonical SQL text; NULL for none (introspection.md §5).
+        col("column_default", "text", false),
       ]);
     case "jed_indexes":
       return table("jed_indexes", [
