@@ -7,6 +7,7 @@ import {
   arrayOutZoned,
   arrayValue,
   boolAnd,
+  isTrue,
   boolNot,
   boolOr,
   boolValue,
@@ -193,6 +194,18 @@ import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import type { BinaryOp } from "./ast.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import { OPERATORS } from "./operators.ts";
+// evalFilter evaluates a predicate in a filter context — WHERE, ON, HAVING, a partial index's WHERE,
+// ON CONFLICT … WHERE — and reports whether it keeps the row (it is TRUE). The top-level AND chain
+// stops at the first conjunct that is not TRUE (FALSE or NULL: the predicate can no longer be TRUE),
+// PostgreSQL's qual-list rule; each AND node charges on entry as in evalExpr, and every other node
+// evaluates as a value (spec/design/cost.md §3).
+export function evalFilter(e: RExpr, row: Row, env: EvalEnv, m: Meter): boolean {
+  if (e.kind !== "and") return isTrue(evalExpr(e, row, env, m));
+  m.guard();
+  m.charge(operatorCost("and"));
+  return evalFilter(e.lhs, row, env, m) && evalFilter(e.rhs, row, env, m);
+}
+
 export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
   // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). evalExpr recurses once
   // per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot; it
@@ -1105,7 +1118,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return dateClockValue(env.exec, env.rng, env.seam, m, e.offsetDays);
     }
     case "case": {
-      // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
+      // CASE is a sanctioned short-circuit (cost.md §3), like AND / OR and COALESCE: conditions are
       // evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN
       // condition falls through, and later arms (and their results) are NOT evaluated. Required
       // for PG semantics (e.g. `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero).

@@ -15,7 +15,7 @@
 import type { Expr } from "./ast.ts";
 import type { Column } from "./catalog.ts";
 import type { Meter } from "./cost.ts";
-import { evalExpr } from "./eval.ts";
+import { evalExpr, evalFilter } from "./eval.ts";
 import type { EvalEnv, RExpr } from "./executor.ts";
 import type { Row } from "./storage.ts";
 import { isTrue } from "./value.ts";
@@ -106,8 +106,8 @@ export function evalWriteFilter(
   env: EvalEnv,
   m: Meter,
 ): boolean {
-  if (stages === 0) return isTrue(evalExpr(f, row, env, m));
+  if (stages === 0) return evalFilter(f, row, env, m);
   if (f.kind !== "and") throw new Error("a staged write filter joins its stages with AND");
   if (!evalWriteFilter(f.lhs, stages - 1, row, env, m)) return false;
-  return isTrue(evalExpr(f.rhs, row, env, m));
+  return evalFilter(f.rhs, row, env, m);
 }

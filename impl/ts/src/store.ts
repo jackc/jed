@@ -621,8 +621,9 @@ export const I64_MIN = -9223372036854775808n;
 //
 // Cost: each INTERIOR node charges operator_eval once, pre-order (the node, then its
 // operands LHS-before-RHS — JS evaluates arguments left-to-right); leaf nodes
-// (column/constants) charge nothing. Both operands are always evaluated — there is no
-// short-circuit, so the count never depends on operand values (spec/design/cost.md §3).
+// (column/constants) charge nothing. Operands are evaluated eagerly except where cost.md §3
+// sanctions a short-circuit (AND / OR, CASE, COALESCE), whose fixed left-to-right rule makes the
+// skipped work deterministic.
 // inMembership is three-valued `lhs IN (list)` membership (spec/design/grammar.md §26), charging
 // one operator_eval per element compared. An EMPTY list is `negated` (x IN () = FALSE, x NOT IN ()
 // = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)

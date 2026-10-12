@@ -411,7 +411,7 @@ import {
 // column. The resolved SCALAR type — for decimal the unconstrained "decimal", not the
 // numeric(p,s) typmod (spec/design/conformance.md §7).
 import type { AssignPlan } from "./window.ts";
-import { evalExpr, floatToIntHalfAway, subqueryRowValue, toDecimal } from "./eval.ts";
+import { evalExpr, evalFilter, floatToIntHalfAway, subqueryRowValue, toDecimal } from "./eval.ts";
 import {
   coerceForStore,
   dateClockValue,
@@ -11059,7 +11059,7 @@ export class Engine {
       };
       // An optional WHERE that is not TRUE skips the update (existing row unchanged, not returned)
       // — but the arbiter key was already proposed, so a second row still trips §4.
-      if (plan.filter !== null && !isTrue(evalExpr(plan.filter, combined, env, meter))) continue;
+      if (plan.filter !== null && !evalFilter(plan.filter, combined, env, meter)) continue;
       const newRow = existing.row.slice();
       for (const ap of plan.assignments) {
         try {
@@ -16985,7 +16985,7 @@ export class Engine {
         if (plan.filter !== null) {
           if (at >= 0) ra!.setRow(ra!.filter, at, env, meter);
           const before = meter.accrued;
-          const keep = isTrue(evalExpr(plan.filter, row, filterEnv, meter));
+          const keep = evalFilter(plan.filter, row, filterEnv, meter);
           filterWork += meter.accrued - before;
           if (!keep) return true;
         }
@@ -17320,7 +17320,7 @@ export class Engine {
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
         if (plan.filter !== null) {
           const before = meter.accrued;
-          const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+          const keep = evalFilter(plan.filter, row, env, meter);
           filterWork += meter.accrued - before;
           if (!keep) return true;
         }
@@ -17397,7 +17397,7 @@ export class Engine {
         const row = store.resolveColumns(u.row, plan.relMasks[0]!);
         if (plan.filter !== null) {
           const before = meter.accrued;
-          const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+          const keep = evalFilter(plan.filter, row, env, meter);
           filterWork += meter.accrued - before;
           if (!keep) return true;
         }
@@ -17486,7 +17486,7 @@ export class Engine {
           const row = store.resolveColumns(rawRow, mask);
           if (plan.filter !== null) {
             const before = meter.accrued;
-            const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+            const keep = evalFilter(plan.filter, row, env, meter);
             filterWork += meter.accrued - before;
             if (!keep) return true;
           }
@@ -17525,7 +17525,7 @@ export class Engine {
             const row = store.resolveColumns(rawRow, mask);
             if (plan.filter !== null) {
               const before = meter.accrued;
-              const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+              const keep = evalFilter(plan.filter, row, env, meter);
               filterWork += meter.accrued - before;
               if (!keep) return true;
             }
@@ -17660,11 +17660,11 @@ export class Engine {
             right,
           );
           // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
-          if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) continue;
+          if (on !== null && !evalFilter(on, combined, env, meter)) continue;
           // The residual WHERE over the combined row (per surviving pair).
           if (residual !== null) {
             before = meter.accrued;
-            const keep = isTrue(evalExpr(residual, combined, env, meter));
+            const keep = evalFilter(residual, combined, env, meter);
             filterWork += meter.accrued - before;
             if (!keep) continue;
           }
@@ -17778,7 +17778,7 @@ export class Engine {
           let keep = true;
           for (const onIndex of step.onIndices) {
             const on = joinOn(plan, onIndex);
-            if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+            if (on !== null && !evalFilter(on, combined, env, meter)) {
               keep = false;
               break;
             }
@@ -17786,7 +17786,7 @@ export class Engine {
           if (!keep) continue;
           if (residual !== null) {
             const before = meter.accrued;
-            const keep = isTrue(evalExpr(residual, combined, env, meter));
+            const keep = evalFilter(residual, combined, env, meter);
             filterWork += meter.accrued - before;
             if (!keep) continue;
           }
@@ -17908,7 +17908,7 @@ export class Engine {
     const mask = plan.relMasks[ri]!;
     const kept: Row[] = [];
     for (const row of rows) {
-      if (isTrue(evalExpr(pushed, row, env, meter))) kept.push(row);
+      if (evalFilter(pushed, row, env, meter)) kept.push(row);
       else meter.releaseRowMasked(row, mask);
     }
     return kept;
@@ -18179,7 +18179,7 @@ export class Engine {
     const pushed = pushedFilter(plan, ri).local;
     const tableRows: Row[] = [];
     for (const row of scanSource(rows, nodeCount, meter)) {
-      if (pushed !== null && !isTrue(evalExpr(pushed, row, env, meter))) continue;
+      if (pushed !== null && !evalFilter(pushed, row, env, meter)) continue;
       meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
       tableRows.push(row);
     }
@@ -18510,7 +18510,7 @@ export class Engine {
       } else {
         survivors = [];
         for (const r of rows) {
-          if (isTrue(evalExpr(plan.filter, r, env, meter))) survivors.push(r);
+          if (evalFilter(plan.filter, r, env, meter)) survivors.push(r);
           else meter.releaseRowMasked(r, mask);
         }
       }
@@ -18606,7 +18606,7 @@ export class Engine {
           for (let c = 0; c < mask.length; c++) {
             if (mask[c]) scratch[c] = colAt(n, i, c);
           }
-          if (!isTrue(evalExpr(plan.filter, scratch, env, meter))) return;
+          if (!evalFilter(plan.filter, scratch, env, meter)) return;
         }
         nsurv++;
         let accs: Acc[];
@@ -18714,7 +18714,7 @@ export class Engine {
           innerOrdinal,
           innerRow,
         );
-        if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+        if (on === null || evalFilter(on, combined, env, meter)) {
           meter.admitRowMasked(combined, mask);
           out.push(combined);
         }
@@ -18802,7 +18802,7 @@ export class Engine {
           let keep = true;
           for (const onIndex of step.onIndices) {
             const on = joinOn(plan, onIndex);
-            if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+            if (on !== null && !evalFilter(on, combined, env, meter)) {
               keep = false;
               break;
             }
@@ -18981,7 +18981,7 @@ export class Engine {
             meter.guard();
             meter.charge(COSTS.storageRowRead);
             const row = store.resolveColumns(raw, mask);
-            if (pushed !== null && !isTrue(evalExpr(pushed, row, env, meter))) return true;
+            if (pushed !== null && !evalFilter(pushed, row, env, meter)) return true;
             out.push(nullUntouched(row, mask));
             return true;
           });
@@ -19090,7 +19090,7 @@ export class Engine {
                 let keep = true;
                 for (const index of onIndices) {
                   const on = joinOn(plan, index);
-                  if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+                  if (on !== null && !evalFilter(on, combined, env, meter)) {
                     keep = false;
                     break;
                   }
@@ -19154,7 +19154,7 @@ export class Engine {
                 let keep = true;
                 for (const index of onIndices) {
                   const on = joinOn(plan, index);
-                  if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+                  if (on !== null && !evalFilter(on, combined, env, meter)) {
                     keep = false;
                     break;
                   }
@@ -19162,7 +19162,7 @@ export class Engine {
                 if (!keep) continue;
                 if (residual !== null) {
                   const before = meter.accrued;
-                  const pass = isTrue(evalExpr(residual, combined, env, meter));
+                  const pass = evalFilter(residual, combined, env, meter);
                   filterWork += meter.accrued - before;
                   if (!pass) continue;
                 }
@@ -19221,7 +19221,7 @@ export class Engine {
         // The WHERE pass always copies its survivors into a fresh spool (every row without a WHERE).
         const filtered = spool();
         for (const row of rows)
-          if (residual === null || isTrue(evalExpr(residual, row, env, meter)))
+          if (residual === null || evalFilter(residual, row, env, meter))
             filtered.push(row);
         rows.close();
         rows = filtered;
@@ -19359,7 +19359,7 @@ export class Engine {
         if (plan.having !== null) {
           const filtered = spool();
           for (const row of rows)
-            if (isTrue(evalExpr(plan.having, row, env, meter))) filtered.push(row);
+            if (evalFilter(plan.having, row, env, meter)) filtered.push(row);
           rows.close();
           rows = filtered;
         }
@@ -19685,7 +19685,7 @@ export class Engine {
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
-            if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+            if (on === null || evalFilter(on, combined, env, meter)) {
               meter.admitRowMasked(combined, memMask);
               next.push(combined);
               leftMatched = true;
@@ -19717,7 +19717,7 @@ export class Engine {
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
-            if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+            if (on === null || evalFilter(on, combined, env, meter)) {
               meter.admitRowMasked(combined, memMask);
               next.push(combined);
               leftMatched = true;
@@ -19752,7 +19752,7 @@ export class Engine {
           let leftMatched = false;
           for (const ri of candidates) {
             const combined = left.concat(rightRows[ri]!);
-            if (isTrue(evalExpr(on!, combined, env, meter))) {
+            if (evalFilter(on!, combined, env, meter)) {
               meter.admitRowMasked(combined, memMask);
               next.push(combined);
               leftMatched = true;
@@ -19774,7 +19774,7 @@ export class Engine {
         let leftMatched = false;
         for (let ri = 0; ri < rightRows.length; ri++) {
           const combined = left.concat(rightRows[ri]!);
-          if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+          if (on === null || evalFilter(on, combined, env, meter)) {
             meter.admitRowMasked(combined, memMask);
             next.push(combined);
             leftMatched = true;
@@ -19842,7 +19842,7 @@ export class Engine {
     const filter = postJoinFilter(plan);
     let rows: Row[] = [];
     for (const row of running) {
-      if (filter === null || isTrue(evalExpr(filter, row, env, meter))) rows.push(row);
+      if (filter === null || evalFilter(filter, row, env, meter)) rows.push(row);
       else meter.releaseRowMasked(row, memMask);
     }
     if (filter !== null) {
@@ -20070,7 +20070,7 @@ export class Engine {
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
       if (plan.having !== null) {
         groupRows = groupRows.filter((srow) => {
-          if (isTrue(evalExpr(plan.having!, srow, env, meter))) return true;
+          if (evalFilter(plan.having!, srow, env, meter)) return true;
           meter.releaseRow(srow);
           return false;
         });
@@ -23404,7 +23404,7 @@ export function indexEntryKey(
 // key expression's — cost.md §3), so a throwaway Meter absorbs its charge.
 export function indexRowQualifies(rindex: ResolvedIndex, row: Row, env: EvalEnv): boolean {
   if (rindex.predicate === undefined) return true;
-  return isTrue(evalExpr(rindex.predicate, row, env, env.exec.session.scratchMeter()));
+  return evalFilter(rindex.predicate, row, env, env.exec.session.scratchMeter());
 }
 
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly

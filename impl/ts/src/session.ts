@@ -26,8 +26,8 @@ import type { ClockFunc, RandomFill } from "./seam.ts";
 import type { Acc, AggSpec, EvalEnv, RExpr, ResolvedFrame, SelectPlan } from "./executor.ts";
 import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
-import { isTrue, nullValue } from "./value.ts";
-import { evalExpr } from "./eval.ts";
+import { nullValue } from "./value.ts";
+import { evalExpr, evalFilter } from "./eval.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { entryBytes } from "./memsize.ts";
@@ -506,7 +506,7 @@ export function filterColumnar(
     for (let c = 0; c < mask.length; c++) {
       if (mask[c]) scratch[c] = cols[c]![i]!;
     }
-    if (isTrue(evalExpr(filter, scratch, env, meter))) sel.push(i);
+    if (evalFilter(filter, scratch, env, meter)) sel.push(i);
   }
   return sel;
 }
@@ -694,7 +694,7 @@ export function* streamRows(
       const row = store.resolveColumns(rawRow, sp.relMasks[0]!);
       if (sp.filter !== null) {
         if (at >= 0) ra!.setRow(ra!.filter, at, env, meter);
-        if (!isTrue(evalExpr(sp.filter, row, filterEnv, meter))) continue;
+        if (!evalFilter(sp.filter, row, filterEnv, meter)) continue;
       }
       if (distinct) {
         // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even for a
