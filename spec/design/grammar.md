@@ -30,8 +30,8 @@ omit syntax a parser accepts.
 
 The grammar uses the EBNF dialect of the XML / XPath / XQuery specifications
 (`Symbol ::= expr`, juxtaposition for concatenation, `?` / `*` / `+`, `( ... )`
-grouping, `"..."` terminals, `[a-z]` character classes, slash-star comments) rather than
-ISO/IEC 14977. The W3C form reads closer to the railroad-style grammars common to SQL
+grouping, `"..."` terminals, `[a-z]` character classes, `A - B` exclusion, slash-star
+comments) rather than ISO/IEC 14977. The W3C form reads closer to the railroad-style grammars common to SQL
 references: optional/repeat postfix operators and juxtaposition are quieter on the page
 than 14977's comma-concatenation, `{ ... }` repetition, and `;` rule terminators. The
 notation legend is duplicated at the top of
@@ -168,11 +168,9 @@ Two lexer facts are easy to get subtly wrong across cores, so the grammar pins t
 The current surface is intentionally minimal. Every omission below is a future feature,
 tracked in [../../TODO.md](../../TODO.md), not an oversight:
 
-- **Column aliases via explicit `AS` only** (`expr AS name`); see §8 for the output-name
-  rule. Select-list **implicit** aliases (`expr name`, no `AS`) remain deferred, and `AS`
-  aliasing in `ORDER BY` is not yet visible (ORDER BY resolves a bare/qualified table column).
-  Before the joins slice the only `AS` in the surface was inside `CAST(expr AS type)` and a
-  select-item alias; `table_ref` now adds the optional `AS` of a **table** alias (§15).
+- **Column aliases** are `expr AS name` or a bare label `expr name` (PostgreSQL's
+  bare-label rule, with a fixed no-bare-label word set); see §8 for both and the output-name
+  rule. A qualified star `t.*` takes neither (§15).
 - **Single-table `UPDATE` / `DELETE`** — those two still take one table (no `JOIN`, no `USING`).
   `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON`, `CROSS JOIN`, the
   `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family, comma-`FROM`, `JOIN ... USING (cols)`, `NATURAL JOIN`,
@@ -263,8 +261,9 @@ here and asserted in the corpus via the `# names:` directive
 ([conformance.md](conformance.md) §1). The resolver derives each select item's name in
 this order:
 
-1. **`expr AS alias`** → the `alias` **name** — folded like any identifier (§3), so `AS Total`
-   names the column `total` and `AS "Total"` names it `Total` (PostgreSQL). The alias is a pure
+1. **`expr AS alias`** or **`expr alias`** (a bare label, below) → the `alias` **name** —
+   folded like any identifier (§3), so `AS Total` names the column `total` and `AS "Total"`
+   names it `Total` (PostgreSQL). The alias is a pure
    output label, *not* entered into the **input** resolution namespace —
    WHERE, HAVING, and sibling select items never see it (they resolve against the FROM
    columns). The one place an alias *is* visible is the trailing **`ORDER BY`** of the same
@@ -295,6 +294,41 @@ text. Echoing normalized SQL text (the SQLite behaviour) would require a canonic
 expression printer that is byte-identical across Rust, Go, and TS — a new §8 divergence
 hotspot for no present benefit. A column whose name matters can be given one with `AS`. A
 normalized-name printer remains a possible later refinement.
+
+**Bare labels (`AS` omitted).** A select item (and a `RETURNING` item, §32) may name its
+column without `AS` — `SELECT count(*) total`, `SELECT id "X"` — PostgreSQL's bare-label rule.
+After the item's **complete** expression the parser takes the next token as the label when it
+is a **quoted identifier** (never a keyword, §3) or a **bare word outside the no-bare-label
+set**; anything else ends the item. Because jed reserves no keyword, this set is the one place a
+bare word is refused, and it is fixed as **exactly PostgreSQL's `AS_LABEL` keywords** (PG 18
+`kwlist.h`), 39 words:
+
+> `array as char character create day except fetch filter for from grant group having hour
+> intersect into isnull limit minute month notnull offset on order over overlaps precision
+> returning second to union varying where window with within without year`
+
+They are the words that may legally follow a select item (the trailing clauses `from`, `where`,
+`group`, `having`, `window`, `order`, `limit`, `offset`, `fetch`, `for`, `into`, `returning`,
+`on` — an `INSERT … SELECT`'s `ON CONFLICT` — and the set operators), or that continue an
+expression in PostgreSQL's grammar (a type name's `precision`/`varying`/`with`/`without`/`array`,
+an interval field `day`…`second`/`to`, the `over`/`filter`/`within` postfixes, `overlaps`,
+`isnull`/`notnull`). Each needs `AS` (`SELECT 1 AS year`) or quoting (`SELECT 1 "year"`); a
+bare one after an expression is `42601`. Every other word — including keyword spellings like
+`select`, `case`, `null`, `end`, `desc`, `join`, `not`, `at` — is a label. A bare label is
+**one** identifier (`SELECT 1 x y` is `42601`), folds like any bare identifier, and binds a bare
+`ORDER BY` key exactly like an `AS` alias. The set is a CLAUDE.md §8 cross-core surface,
+hand-written in each parser and pinned word-by-word by `query/bare_alias.test`.
+
+Two documented divergences, both narrowings of pathological spellings (oracle-overridden):
+
+- **Operator words stay operators.** jed's expression parser is recursive descent: after an
+  operand it reads `and`, `or`, `is`, `in`, `between`, `like`, `ilike`, and `collate` as the
+  operator they begin, so a *dangling* one (`SELECT 1 and`) is `42601`. PostgreSQL's LR grammar
+  defers the choice and labels the column `and`. The conditional continuations are PG-identical:
+  `not` continues only before `in`/`between`/`like`/`ilike` and `at` only before `time zone`, so
+  `SELECT 1 not, 2 at` labels both, as PostgreSQL does.
+- **No postfix `ISNULL`/`NOTNULL`.** They are not a jed surface (`IS [NOT] NULL` is), so `SELECT
+  1 isnull` is `42601` where PostgreSQL evaluates the postfix operator.
 
 ## 9. `LIMIT` / `OFFSET`
 
@@ -772,9 +806,9 @@ parser recognizes it by the three-token shape `identifier "." "*"` *before* the 
 parser, so `t.col` (Dot then a word) and `a * b` (no Dot) are unaffected, and a bare `*` is still
 the standalone form. The qualifier resolves against the **local** FROM scope by label exactly as a
 qualified column does — an unknown label is `42P01`. Two deliberate narrowings diverge from
-PostgreSQL (both `42601`, recorded in `oracle_overrides.toml`): `t.*` takes **no `AS` alias**
-(`t.* AS x` is rejected; PG accepts it), and it is a **select-list / RETURNING construct only** —
-in a scalar position (`WHERE t.*`, `t.* + 1`, `count(t.*)`) the parser rejects it, where PG would
+PostgreSQL (both `42601`, recorded in `oracle_overrides.toml`): `t.*` takes **no alias**
+(`t.* AS x` and the bare-label `t.* x` are rejected; PG accepts both), and it is a
+**select-list / RETURNING construct only** — in a scalar position (`WHERE t.*`, `t.* + 1`, `count(t.*)`) the parser rejects it, where PG would
 treat `t.*` as a whole-row value (jed has no row-valued `t.*`). It is distinct from the composite
 whole-row expansion `(expr).*` (a postfix on a parenthesized base — composite.md §S4): `t.*` names
 a *relation*, `(c).*` a *composite value*; the bare-identifier shape selects the relation reading.

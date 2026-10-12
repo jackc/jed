@@ -130,6 +130,15 @@ test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
+test('the select page names a column with a bare label (no AS)', async ({ page }) => {
+  await page.goto('/docs/sql/select/');
+  // First LiveSql panel = the grouped demo: `count(*) items` labels its column without AS
+  // (spec/design/grammar.md §8) — office 2 / kitchen 2.
+  const panel = page.getByTestId('live-sql').first();
+  await expect(panel.locator('thead')).toContainText('items');
+  await expect(panel.getByTestId('result-rows')).toContainText('kitchen');
+});
+
 test('the select page runs the data-modifying CTE demo live', async ({ page }) => {
   await page.goto('/docs/sql/select/');
   // Fourth LiveSql panel = the data-modifying CTE demo (spec/design/writable-cte.md): an

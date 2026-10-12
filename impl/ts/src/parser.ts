@@ -82,6 +82,54 @@ function identName(t: Token | undefined): string | null {
   return null;
 }
 
+// BARE_LABEL_STOP_KEYWORDS holds the bare words (already folded) that may NOT be a select item's
+// bare output label — after a complete expression they need `AS`. Exactly PostgreSQL's AS_LABEL
+// keywords (kwlist.h): words that begin a clause after a select item, continue a type name, or
+// introduce an interval field or a window/aggregate postfix. Any other bare word after an
+// expression is the item's output label. This set is a CLAUDE.md §8 cross-core determinism
+// surface (spec/design/grammar.md §8).
+const BARE_LABEL_STOP_KEYWORDS: ReadonlySet<string> = new Set([
+  "array",
+  "as",
+  "char",
+  "character",
+  "create",
+  "day",
+  "except",
+  "fetch",
+  "filter",
+  "for",
+  "from",
+  "grant",
+  "group",
+  "having",
+  "hour",
+  "intersect",
+  "into",
+  "isnull",
+  "limit",
+  "minute",
+  "month",
+  "notnull",
+  "offset",
+  "on",
+  "order",
+  "over",
+  "overlaps",
+  "precision",
+  "returning",
+  "second",
+  "to",
+  "union",
+  "varying",
+  "where",
+  "window",
+  "with",
+  "within",
+  "without",
+  "year",
+]);
+
 // isTableRefStopKeyword reports whether kw (already folded by the lexer) is a keyword that may legally
 // follow a table_ref, and so must NOT be swallowed as an implicit table alias: a trailing clause
 // keyword (where/order/limit/offset) or any join-machinery keyword
@@ -3267,12 +3315,19 @@ class Parser {
         break;
       }
       const expr = this.parseExpr();
-      // Optional `AS alias` output label. `AS` is not reserved, so it is taken as an
-      // alias marker only here, after a complete expr (spec/grammar/grammar.ebnf
-      // `select_item`). The alias never enters resolution (grammar.md §8).
+      // Optional output label, `AS alias` or a bare label (spec/grammar/grammar.ebnf
+      // `select_item`). `AS` is not reserved, so it is taken as an alias marker only here,
+      // after a complete expr. Without `AS`, a quoted identifier, or a bare word outside the
+      // no-bare-label set, is the label (grammar.md §8). The alias never enters resolution.
       let alias: string | null = null;
-      if (this.peekKeyword() === "as") {
+      const t = this.peek();
+      if (t.kind === "word" && t.word === "as") {
         this.advance();
+        alias = this.expectIdentifier();
+      } else if (
+        t.kind === "quotedIdent" ||
+        (t.kind === "word" && !BARE_LABEL_STOP_KEYWORDS.has(t.word!))
+      ) {
         alias = this.expectIdentifier();
       }
       items.push({ expr, alias });

@@ -1140,6 +1140,11 @@ reason = "jed: a qualified star `t.*` takes no `AS` alias — 42601 (grammar.md 
 
 [[override]]
 file = "joins/qualified_star.test"
+sql = "SELECT a.* x FROM a"
+reason = "jed: a qualified star `t.*` takes no output label, bare or `AS` — 42601 (grammar.md §8/§15). PostgreSQL accepts the bare label as it accepts `a.* AS x`. The same deliberate narrowing as the `AS` form above."
+
+[[override]]
+file = "joins/qualified_star.test"
 sql = "SELECT id FROM a WHERE a.* = 1"
 reason = "jed: `t.*` is a select-list/RETURNING construct only; in a scalar expression position the parser rejects it 42601 (grammar.md §15 — jed has no row-valued `t.*`). PostgreSQL parses `a.*` as a whole-row value and reaches type resolution, reporting 42883 'operator does not exist: a = integer'. Same rejection (jed never supports row-valued `t.*` in an expression), different stage/SQLSTATE."
 
@@ -1258,3 +1263,60 @@ reason = "jed reports an unconvertible pair at a type-unification position as 42
 file = "setops/unify_types.test"
 sql = "SELECT x FROM (VALUES (ARRAY[1::i32]), (ARRAY[1.5])) v(x)"
 reason = "jed unifies array element types only across integer widths, the one widening that leaves every element value untouched (grammar.md §25 'Deliberate narrowing'); an i32[] with a decimal[] would need a per-element int -> decimal rewrite, so it is 42804. PostgreSQL unifies the pair to numeric[] and returns {1}, {1.5}. Deferred, not foreclosed."
+
+# --- bare select-list labels (grammar.md §8): jed's no-bare-label set is PostgreSQL's AS_LABEL
+# keywords, but two word groups still diverge. (1) jed has no postfix ISNULL / NOTNULL, so
+# `SELECT 1 isnull` is 42601 where PostgreSQL evaluates the postfix operator. (2) jed's
+# recursive-descent expression parser reads an operator word (and/or/is/in/between/like/ilike/
+# collate) after an operand as that operator, never as a bare label; PostgreSQL's LR grammar defers
+# the choice and labels a dangling one. Both are reachable with `AS` (or the IS [NOT] NULL form).
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 isnull"
+reason = "jed: postfix ISNULL / NOTNULL are not a jed surface (IS [NOT] NULL is), and both words are in the no-bare-label set (PostgreSQL's AS_LABEL keywords), so `SELECT 1 isnull` is 42601. PostgreSQL evaluates the postfix operator and returns false (grammar.md §8)."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 notnull"
+reason = "jed: postfix ISNULL / NOTNULL are not a jed surface (IS [NOT] NULL is), and both words are in the no-bare-label set (PostgreSQL's AS_LABEL keywords), so `SELECT 1 notnull` is 42601. PostgreSQL evaluates the postfix operator and returns true (grammar.md §8)."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 and"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `and` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `and`. A deliberate narrowing of a pathological spelling; `AS and` names the column in both."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 or"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `or` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `or`. A deliberate narrowing of a pathological spelling; `AS or` names the column in both."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 is"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `is` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `is`. A deliberate narrowing of a pathological spelling; `AS is` names the column in both."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 in"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `in` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `in`. A deliberate narrowing of a pathological spelling; `AS in` names the column in both."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 between"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `between` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `between`. A deliberate narrowing of a pathological spelling; `AS between` names the column in both."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 like"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `like` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `like`. A deliberate narrowing of a pathological spelling; `AS like` names the column in both."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 1 ilike"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `ilike` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `ilike`. A deliberate narrowing of a pathological spelling; `AS ilike` names the column in both."
+
+[[override]]
+file = "query/bare_alias.test"
+sql = "SELECT 'a' collate"
+reason = "jed: an operator word the expression grammar continues with is always read as that operator, never as a bare output label, so a dangling `collate` after an expression is 42601 (grammar.md §8). PostgreSQL's LR grammar defers the choice and labels the column `collate`. A deliberate narrowing of a pathological spelling; `AS collate` names the column in both."

@@ -16,6 +16,7 @@
  *   A*                     zero or more
  *   A+                     one or more
  *   ( ... )                grouping
+ *   A - B                  any A that is not a B (exclusion)
  *   "..."                  a literal terminal (see case rule below)
  *   [a-z]                  a character class (one character)
  *   comment                a slash-star ... star-slash block, as used here
@@ -784,29 +785,46 @@ join_type      ::= "INNER"
  * is not accepted). A qualified star "t.*" expands the FROM relation labeled "t" into one
  * column per column (catalog order); UNLIKE bare "*" it MAY be mixed with other items
  * ("SELECT t.*, u.x"). It is recognized by the three-token shape identifier "." "*" before
- * the general expr parser, so "t.col" and "a * b" are untouched, and it takes NO "AS" alias
- * (a deliberate 42601 narrowing; an unknown qualifier is 42P01). It is distinct from the
+ * the general expr parser, so "t.col" and "a * b" are untouched, and it takes NO alias, "AS" or
+ * bare (a deliberate 42601 narrowing; an unknown qualifier is 42P01). It is distinct from the
  * composite whole-row expansion "(expr).*" (a postfix on a parenthesized base, §S4).
- *   Aliasing an ordinary item requires the explicit "AS" keyword; there is no implicit alias
- * ("SELECT a b"). The alias is an OUTPUT LABEL only: it names the result column and is
- * invisible to WHERE and ORDER BY resolution (those still resolve against table columns).
- * "AS" is not reserved (a column may be named "as"); the parser takes it as an alias marker
- * only after a complete expr, exactly as CAST consumes its own inner "AS". The output name of
- * an item with no alias is the column's canonical name for a bare column reference, and the
- * fixed literal "?column?" for any other expression (see ../design/grammar.md §8). */
+ *   An ordinary item's alias is "AS" identifier, or a BARE LABEL with "AS" omitted ("SELECT
+ * count(*) total", "SELECT id "X""): after a complete expr, a quoted identifier, or a bare word
+ * NOT in the no-bare-label set, is the label (PostgreSQL's bare-label rule). The set is exactly
+ * PostgreSQL's 39 AS_LABEL keywords (bare_label_stop below); such a word after an expr ends the
+ * item and is 42601 unless the grammar continues with it. Operator words the expr grammar
+ * continues with (and, or, is, in, between, like, ilike, collate) are always read as the operator
+ * (../design/grammar.md §8 — a documented divergence). The alias is an OUTPUT LABEL only: it names
+ * the result column and is invisible to WHERE resolution; a bare ORDER BY key binds it. "AS" is
+ * not reserved (a column may be named "as"); the parser takes it as an alias marker only after a
+ * complete expr, exactly as CAST consumes its own inner "AS". The output name of an item with no
+ * alias is the column's canonical name for a bare column reference, the lowercased function name
+ * for an aggregate, and the fixed literal "?column?" for any other expression (see
+ * ../design/grammar.md §8). */
 select_items   ::= "*"
                  | select_item ("," select_item)*
 
 select_item    ::= identifier "." "*"
-                 | expr ("AS" identifier)?
+                 | expr ("AS" identifier | bare_label)?
+
+/* Any quoted_identifier, or a bare_identifier that is not a bare_label_stop word. */
+bare_label     ::= quoted_identifier
+                 | bare_identifier - bare_label_stop
+
+bare_label_stop ::= "ARRAY" | "AS" | "CHAR" | "CHARACTER" | "CREATE" | "DAY" | "EXCEPT"
+                  | "FETCH" | "FILTER" | "FOR" | "FROM" | "GRANT" | "GROUP" | "HAVING"
+                  | "HOUR" | "INTERSECT" | "INTO" | "ISNULL" | "LIMIT" | "MINUTE" | "MONTH"
+                  | "NOTNULL" | "OFFSET" | "ON" | "ORDER" | "OVER" | "OVERLAPS"
+                  | "PRECISION" | "RETURNING" | "SECOND" | "TO" | "UNION" | "VARYING"
+                  | "WHERE" | "WINDOW" | "WITH" | "WITHIN" | "WITHOUT" | "YEAR"
 
 /* ORDER BY is one or more sort terms, applied left to right (the first term is
  * primary, ties broken by the next, and a full tie keeps the primary-key scan
  * order via a stable sort). An order_term is a GENERAL EXPRESSION (ORDER BY a + 1,
  * ORDER BY abs(b), ORDER BY sum(x) in a grouped query) — a bare column being its
  * simplest form — OR an output-column ordinal (ORDER BY 1), an integer literal
- * naming the 1-based position of a select-list item (../design/grammar.md §10). An
- * output ALIAS (ORDER BY my_alias) is still deferred (../design/grammar.md §5). Each
+ * naming the 1-based position of a select-list item (../design/grammar.md §10). A bare
+ * sort-key name binds an output column's alias first (../design/grammar.md §10). Each
  * term carries an optional direction and an optional explicit NULL placement. Default
  * NULL placement follows direction: ASC => NULLS LAST, DESC => NULLS FIRST, because
  * the physical key order ratifies NULL as the LARGEST value (the PostgreSQL model;

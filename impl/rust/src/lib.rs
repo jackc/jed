@@ -474,6 +474,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Select-list output naming: SELECT *, AS aliases, and the ?column? rule (grammar.md §8).
     "query.select_star",
     "query.column_alias",
+    "query.bare_column_alias",
     // LIMIT / OFFSET row windowing, applied after ORDER BY, before projection (grammar.md §9).
     "query.limit",
     "query.offset",

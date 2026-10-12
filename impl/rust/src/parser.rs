@@ -3766,14 +3766,18 @@ impl Parser {
                 break;
             }
             let expr = self.parse_expr()?;
-            // Optional `AS alias` output label. `AS` is not reserved, so it is taken as
-            // an alias marker only here, after a complete expr (spec/grammar/grammar.ebnf
-            // `select_item`). The alias never enters resolution (grammar.md §8).
-            let alias = if self.peek_keyword().as_deref() == Some("as") {
-                self.advance();
-                Some(self.expect_identifier()?)
-            } else {
-                None
+            // Optional output label, `AS alias` or a bare label (spec/grammar/grammar.ebnf
+            // `select_item`). `AS` is not reserved, so it is taken as an alias marker only here,
+            // after a complete expr. Without `AS`, a quoted identifier, or a bare word outside the
+            // no-bare-label set, is the label (grammar.md §8). The alias never enters resolution.
+            let alias = match self.peek() {
+                Token::Word(w) if w == "as" => {
+                    self.advance();
+                    Some(self.expect_identifier()?)
+                }
+                Token::QuotedIdent(_) => Some(self.expect_identifier()?),
+                Token::Word(w) if !is_bare_label_stop_keyword(w) => Some(self.expect_identifier()?),
+                _ => None,
             };
             items.push(SelectItem { expr, alias });
             if matches!(self.peek(), Token::Comma) {
@@ -5460,6 +5464,56 @@ fn splice_leading_group(item: TableRef, joins: Vec<JoinClause>) -> (TableRef, Ve
     let mut out = group.joins;
     out.extend(joins);
     (group.from.expect("a join group has a FROM item"), out)
+}
+
+/// Whether `kw` (already folded) may NOT be a select item's bare output label — after a complete
+/// expression it needs `AS`. Exactly PostgreSQL's `AS_LABEL` keywords (kwlist.h): words that begin
+/// a clause after a select item, continue a type name, or introduce an interval field or a
+/// window/aggregate postfix. Any other bare word after an expression is the item's output label.
+/// This set is a CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §8).
+fn is_bare_label_stop_keyword(kw: &str) -> bool {
+    matches!(
+        kw,
+        "array"
+            | "as"
+            | "char"
+            | "character"
+            | "create"
+            | "day"
+            | "except"
+            | "fetch"
+            | "filter"
+            | "for"
+            | "from"
+            | "grant"
+            | "group"
+            | "having"
+            | "hour"
+            | "intersect"
+            | "into"
+            | "isnull"
+            | "limit"
+            | "minute"
+            | "month"
+            | "notnull"
+            | "offset"
+            | "on"
+            | "order"
+            | "over"
+            | "overlaps"
+            | "precision"
+            | "returning"
+            | "second"
+            | "to"
+            | "union"
+            | "varying"
+            | "where"
+            | "window"
+            | "with"
+            | "within"
+            | "without"
+            | "year"
+    )
 }
 
 /// Whether `kw` (already lower-cased) is a keyword that may legally follow a `table_ref`,

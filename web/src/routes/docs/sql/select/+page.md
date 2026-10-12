@@ -13,7 +13,7 @@ INSERT INTO product VALUES
   (3, 'Coffee',   'kitchen', 9.99),
   (4, 'Mug',      'kitchen', 12.50);`;
 
-	const grouped = `SELECT category, count(*) AS items, sum(price) AS total
+	const grouped = `SELECT category, count(*) items, sum(price) AS total
 FROM product
 GROUP BY category
 ORDER BY category;`;
@@ -200,6 +200,13 @@ The ordered-set aggregates `mode`, `percentile_cont`, and `percentile_disc` are 
 for the median), and the hypothetical-set aggregates `rank`, `dense_rank`, `percent_rank`, and
 `cume_dist` take a hypothetical row the same way (`rank(50) WITHIN GROUP (ORDER BY score)`).
 `FILTER (WHERE …)` and these aggregate forms also compose with window functions (`OVER`).
+
+A select-list (or `RETURNING`) item names its output column with `AS` (`count(*) AS items`) or, as
+in PostgreSQL, without it (`count(*) items`, `id "Id"`). Without `AS`, the label may be any word
+except the 39 that can continue a query or an expression in PostgreSQL — such as `from`, `where`,
+`order`, `limit`, `union`, `over`, `filter`, `year`, `day`, and `with`. Those need `AS` or
+quotes (`1 AS year`, `1 "year"`); the full list is in
+[grammar.md §8](https://github.com/jackc/jed/blob/master/spec/design/grammar.md).
 
 Grouping and aggregation:
 

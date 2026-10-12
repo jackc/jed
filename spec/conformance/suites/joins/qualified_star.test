@@ -118,6 +118,10 @@ SELECT z.* FROM a
 statement error 42601
 SELECT a.* AS x FROM a
 
+# nor a bare label
+statement error 42601
+SELECT a.* x FROM a
+
 # `t.*` is a select-list construct only; in a scalar position it is 42601 (a deliberate narrowing;
 # PostgreSQL treats `a.*` as a row value and reports 42883 "operator does not exist: a = integer").
 statement error 42601

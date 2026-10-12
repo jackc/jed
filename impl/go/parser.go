@@ -3790,6 +3790,24 @@ func (p *parser) parseJoinClause() (joinClause, bool, error) {
 	return joinClause{Kind: kind, Table: table, On: on, Using: using, Natural: natural}, true, nil
 }
 
+// isBareLabelStopKeyword reports whether kw (a bare word, already folded) may NOT be a select
+// item's bare output label — after a complete expression it needs `AS`. Exactly PostgreSQL's
+// AS_LABEL keywords (kwlist.h): words that begin a clause after a select item, continue a type
+// name, or introduce an interval field or a window/aggregate postfix. Any other bare word after an
+// expression is the item's output label. This set is a CLAUDE.md §8 cross-core determinism
+// surface (spec/design/grammar.md §8).
+func isBareLabelStopKeyword(kw string) bool {
+	switch kw {
+	case "array", "as", "char", "character", "create", "day", "except", "fetch", "filter",
+		"for", "from", "grant", "group", "having", "hour", "intersect", "into", "isnull",
+		"limit", "minute", "month", "notnull", "offset", "on", "order", "over", "overlaps",
+		"precision", "returning", "second", "to", "union", "varying", "where", "window",
+		"with", "within", "without", "year":
+		return true
+	}
+	return false
+}
+
 // isTableRefStopKeyword reports whether kw (a bare word, already folded) is a keyword that may legally
 // follow a table_ref, and so must NOT be swallowed as an implicit table alias: a trailing
 // clause keyword (where/order/limit/offset) or any join-machinery keyword
@@ -4336,12 +4354,20 @@ func (p *parser) parseSelectItems() (selectItems, error) {
 		if err != nil {
 			return selectItems{}, err
 		}
-		// Optional `AS alias` output label. `AS` is not reserved, so it is taken as an
-		// alias marker only here, after a complete expr (spec/grammar/grammar.ebnf
-		// `select_item`). The alias never enters resolution (grammar.md §8).
+		// Optional output label, `AS alias` or a bare label (spec/grammar/grammar.ebnf
+		// `select_item`). `AS` is not reserved, so it is taken as an alias marker only here,
+		// after a complete expr. Without `AS`, a quoted identifier, or a bare word outside the
+		// no-bare-label set, is the label (grammar.md §8). The alias never enters resolution.
 		var alias *string
-		if p.peekKeyword() == "as" {
+		t := p.peek()
+		if t.Kind == tokWord && t.Word == "as" {
 			p.advance()
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return selectItems{}, err
+			}
+			alias = &name
+		} else if t.Kind == tokQuotedIdent || (t.Kind == tokWord && !isBareLabelStopKeyword(t.Word)) {
 			name, err := p.expectIdentifier()
 			if err != nil {
 				return selectItems{}, err
