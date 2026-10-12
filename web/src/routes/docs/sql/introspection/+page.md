@@ -67,8 +67,9 @@ Nine relations ship today:
   `type_name`, `name`, `ordinal`, `type` (the same canonical type text), and `not_null`.
 - **`jed_views`** — one row per [view](../views/): `name`, `definition` (the stored query text,
   normalized: lowercase keywords, single-spaced tokens, `*` expanded into explicit columns, and
-  renames applied), and `columns` (a `text[]` of the output column names, in order). Views are not
-  listed in `jed_tables` or `jed_columns`.
+  renames applied), `columns` (a `text[]` of the output column names, in order), and
+  `check_option` (`NONE`, `LOCAL`, or `CASCADED`). Views are not listed in `jed_tables` or
+  `jed_columns`.
 
 <LiveSql {seed} {query} rows={10} />
 

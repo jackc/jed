@@ -422,6 +422,22 @@ test('the views page writes through an updatable view', async ({ page }) => {
   await expect(panel.getByTestId('error-code')).toHaveText('0A000');
 });
 
+test('the views page enforces WITH CHECK OPTION', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // INSERT through ada_tasks of a row the view shows succeeds (views.md §15.6).
+  const panel = livePanel(page, 'checkQuery');
+  await expect(panel.getByTestId('result-rows')).toContainText('blog post');
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+
+  // A row the view would hide, inserted or moved there by an UPDATE, is 44000.
+  await panel.getByTestId('sql-input').fill("INSERT INTO ada_tasks VALUES (4, 'triage', 'ken')");
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('44000');
+  await panel.getByTestId('sql-input').fill("UPDATE ada_tasks SET owner = 'ken' WHERE id = 1");
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('44000');
+});
+
 test('the queries API page wires up the idiomatic example for each language', async ({ page }) => {
   await page.goto('/docs/api/queries/');
   // Default (Rust): the rusqlite-style run/query_row methods.

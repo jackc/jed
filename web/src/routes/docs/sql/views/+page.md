@@ -66,11 +66,24 @@ CREATE VIEW open_tasks AS
 INSERT INTO open_tasks (id, title) VALUES (4, 'plan');
 DELETE FROM open_tasks WHERE owner_tag = 'KEN';
 SELECT * FROM task ORDER BY id;`;
+
+	const checkSeed = `CREATE TABLE task (
+  id    i32 PRIMARY KEY,
+  title text NOT NULL,
+  owner text
+);
+INSERT INTO task VALUES (1, 'write docs', 'ada'), (2, 'review', 'ken');
+CREATE VIEW ada_tasks AS
+  SELECT id, title, owner FROM task WHERE owner = 'ada'
+  WITH CHECK OPTION;`;
+
+	const checkQuery = `INSERT INTO ada_tasks VALUES (3, 'blog post', 'ada');
+SELECT * FROM ada_tasks ORDER BY id;`;
 </script>
 
 <svelte:head>
 	<title>Views — jed</title>
-	<meta name="description" content="CREATE [OR REPLACE] VIEW, ALTER VIEW, and DROP VIEW in jed — named, persisted queries that read exactly like the equivalent subquery, writable when they select from one table, with dependency tracking, rename rewriting, and per-view privileges." />
+	<meta name="description" content="CREATE [OR REPLACE] VIEW, ALTER VIEW, and DROP VIEW in jed — named, persisted queries that read exactly like the equivalent subquery, writable when they select from one table, WITH CHECK OPTION, dependency tracking, rename rewriting, and per-view privileges." />
 </svelte:head>
 
 # Views
@@ -107,6 +120,7 @@ Things to try in the panel above:
 
 ```sql
 CREATE [OR REPLACE] VIEW [IF NOT EXISTS] name [(column, …)] AS query
+  [WITH [CASCADED | LOCAL] CHECK OPTION]
 ```
 
 The query can be anything a subquery in `FROM` accepts: joins, aggregates, window functions,
@@ -278,7 +292,8 @@ write the table underneath:
   cannot change it.
 - `INSERT` fills every table column the view does not set with its default (`done` becomes
   `false`). The view's `WHERE` is not checked on insert, so an inserted row may be one the view
-  does not show (`WITH CHECK OPTION` is not supported yet).
+  does not show, and an `UPDATE` may move a row out of the view. `WITH CHECK OPTION`
+  ([below](#with-check-option)) prevents both.
 - `UPDATE v SET c = DEFAULT` sets `c` to `NULL`, as in PostgreSQL, because a view column has no
   default of its own.
 - `RETURNING` returns the view's columns, including computed ones.
@@ -293,6 +308,45 @@ delete from view …*). `INSERT … ON CONFLICT` on a view is not supported yet 
 
 `CREATE INDEX … ON` a view and a foreign key that references a view are `42809`. `ANALYZE` on a view
 succeeds and does nothing.
+
+<a id="with-check-option"></a>
+
+## `WITH CHECK OPTION`
+
+A view created `WITH CHECK OPTION` refuses an `INSERT` or `UPDATE` through it whose new row the view
+would not show:
+
+<LiveSql demo="checkQuery" seed={checkSeed} query={checkQuery} rows={2} />
+
+Things to try in the panel above:
+
+- Insert a row the view would hide — `INSERT INTO ada_tasks VALUES (4, 'triage', 'ken');` &rarr; error `44000`
+- Move a row out of the view — `UPDATE ada_tasks SET owner = 'ken' WHERE id = 1;` &rarr; error `44000`
+- Delete through the view — `DELETE FROM ada_tasks WHERE id = 1;` (`DELETE` is never checked)
+
+The new row must make the view's `WHERE` true. False **or NULL** fails, so an `INSERT` that leaves
+`owner` out is refused too. The check sees every column of the new row, including table columns the
+view does not show, which an `INSERT` fills with their defaults.
+
+When a view reads another view, the check option says which `WHERE` clauses are checked:
+
+- **`WITH CASCADED CHECK OPTION`** (the default for plain `WITH CHECK OPTION`) checks the view's own
+  `WHERE` and the `WHERE` of every view below it.
+- **`WITH LOCAL CHECK OPTION`** checks the view's own `WHERE`, plus the views below that have a check
+  option of their own.
+
+The views are checked from the one nearest the table up, and the error (`44000`, *new row violates
+check option for view …*) names the first one that fails. The table's own `NOT NULL`, `CHECK`,
+primary-key, and `UNIQUE` checks come first, as in PostgreSQL.
+
+Only an updatable view can have a check option: `CREATE VIEW` of any other view `WITH CHECK OPTION`
+is `0A000`. `CREATE OR REPLACE VIEW` replaces the check option along with the query, so leaving the
+clause out removes it. `jed_views.check_option` shows `NONE`, `LOCAL`, or `CASCADED`.
+
+The check evaluates the view's `WHERE` on each new row, so it adds that expression's cost to the
+write. Two orderings differ from PostgreSQL: a row that violates both an `EXCLUDE` constraint and the
+check option reports `44000`, and an `UPDATE` reports a later row's `CHECK` or `UNIQUE` failure
+before an earlier row's check-option failure.
 
 ## Privileges
 
@@ -315,7 +369,8 @@ Privileges are configured by the host. See [Authorization](../../api/authorizati
 ## Introspection
 
 `jed_views` lists each view's `name`, its stored `definition` (normalized: lowercase keywords,
-single-spaced tokens, `*` expanded, renames applied), and its output `columns` as a `text[]`. Views
+single-spaced tokens, `*` expanded, renames applied), its output `columns` as a `text[]`, and its
+`check_option` (`NONE`, `LOCAL`, or `CASCADED`). Views
 are not listed in `jed_tables` or `jed_columns`. To learn a view's column types, prepare
 `SELECT * FROM v`. See [Introspection](../introspection/).
 
@@ -324,7 +379,8 @@ are not listed in `jed_tables` or `jed_columns`. To learn a view's column types,
 Each of these is `0A000` today:
 
 - `ALTER VIEW` forms other than `RENAME`.
-- `WITH CHECK OPTION` and `WITH (options)`.
+- View options written as `WITH (…)`, including `WITH (check_option = local)`. Write the clause
+  form, `WITH LOCAL CHECK OPTION`, instead.
 - `INSERT … ON CONFLICT` on a view.
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW`.
 - Temporary views, and a view that reads a temporary table.
