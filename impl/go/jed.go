@@ -640,6 +640,7 @@ var SupportedCapabilities = []string{
 	"expr.between",
 	"expr.like",
 	"expr.ilike",
+	"expr.like_escape",
 	"expr.regex_match",
 	"expr.regex_imatch",
 	"expr.case",

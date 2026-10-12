@@ -156,11 +156,15 @@ name = "invalid_parameter_value"
 class = "data exception"
 template = "invalid parameter value: {detail}"
 
+# A LIKE/ILIKE escape problem (../design/grammar.md §22). Two messages, both PostgreSQL's: a pattern
+# whose escape character is its LAST character, reached while subject remains ("LIKE pattern must
+# not end with escape character"), and an ESCAPE string / like_escape() escape argument longer than
+# one character ("invalid escape string" — string-functions.md §3). {detail} carries the message.
 [[error]]
 code = "22025"
 name = "invalid_escape_sequence"
 class = "data exception"
-template = "LIKE pattern must not end with escape character"
+template = "{detail}"
 
 # A malformed regular-expression pattern given to `~`/`~*`/`!~`/`!~*` or a regexp_* function
 # (../design/regex.md §7): unbalanced parenthesis/bracket, a trailing backslash, an unknown

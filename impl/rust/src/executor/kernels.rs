@@ -341,6 +341,56 @@ pub(crate) fn base64_encode_wrapped(bytes: &[u8]) -> String {
     out
 }
 
+/// `like_escape(pattern, escape)` (string-functions.md §3): rewrite a LIKE pattern written with the
+/// escape character `escape` into the default-`\` form the matcher reads (PostgreSQL's
+/// `MB_do_like_escape`), by code point. `''` disables escaping (each `\` doubled); `\` returns the
+/// pattern unchanged; any other single code point becomes `\`, with a `\` after it a literal
+/// backslash. An escape of two or more code points traps 22025 (invalid escape string).
+pub(crate) fn like_escape_text(pattern: &str, escape: &str) -> Result<String> {
+    let mut esc_chars = escape.chars();
+    let esc = match (esc_chars.next(), esc_chars.next()) {
+        (None, _) => None,
+        (Some(c), None) => Some(c),
+        (Some(_), Some(_)) => {
+            return Err(EngineError::new(
+                SqlState::InvalidEscapeSequence,
+                "invalid escape string",
+            ));
+        }
+    };
+    let mut out = String::with_capacity(pattern.len() + 2);
+    match esc {
+        None => {
+            for c in pattern.chars() {
+                if c == '\\' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+        }
+        Some('\\') => out.push_str(pattern),
+        Some(e) => {
+            let mut after_escape = false;
+            for c in pattern.chars() {
+                if c == e && !after_escape {
+                    out.push('\\');
+                    after_escape = true;
+                } else if c == '\\' {
+                    out.push('\\');
+                    if !after_escape {
+                        out.push('\\');
+                    }
+                    after_escape = false;
+                } else {
+                    out.push(c);
+                    after_escape = false;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// `quote_literal(s)` (string-functions.md §3): wrap `s` as a SQL string literal — single-quoted,
 /// each internal `'` doubled; if `s` contains a backslash, each `\` is doubled and the literal is
 /// `E`-prefixed (matching PostgreSQL). Shared by `quote_literal` and `quote_nullable`.

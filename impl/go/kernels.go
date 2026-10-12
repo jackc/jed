@@ -405,6 +405,50 @@ func base64EncodeWrapped(bytes []byte) string {
 	return out.String()
 }
 
+// likeEscapeText is like_escape(pattern, escape) (string-functions.md §3): rewrite a LIKE pattern
+// written with the escape character escape into the default-\ form the matcher reads (PostgreSQL's
+// MB_do_like_escape), by code point. An empty escape disables escaping (each \ doubled); \ returns
+// the pattern unchanged; any other single code point becomes \, with a \ after it a literal
+// backslash. An escape of two or more code points traps 22025 (invalid escape string).
+func likeEscapeText(pattern, escape string) (string, error) {
+	if utf8.RuneCountInString(escape) > 1 {
+		return "", newError(InvalidEscapeSequence, "invalid escape string")
+	}
+	var b strings.Builder
+	b.Grow(len(pattern) + 2)
+	if escape == "" {
+		for _, c := range pattern {
+			if c == '\\' {
+				b.WriteRune('\\')
+			}
+			b.WriteRune(c)
+		}
+		return b.String(), nil
+	}
+	e, _ := utf8.DecodeRuneInString(escape)
+	if e == '\\' {
+		return pattern, nil
+	}
+	afterEscape := false
+	for _, c := range pattern {
+		switch {
+		case c == e && !afterEscape:
+			b.WriteRune('\\')
+			afterEscape = true
+		case c == '\\':
+			b.WriteRune('\\')
+			if !afterEscape {
+				b.WriteRune('\\')
+			}
+			afterEscape = false
+		default:
+			b.WriteRune(c)
+			afterEscape = false
+		}
+	}
+	return b.String(), nil
+}
+
 // quoteLiteralText is quote_literal(s) (string-functions.md §3): wrap s as a SQL string literal —
 // single-quoted, each internal ' doubled; if s contains a backslash, each \ is doubled and the
 // literal is E-prefixed (matching PostgreSQL). Shared by quote_literal and quote_nullable.

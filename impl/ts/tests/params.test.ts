@@ -274,3 +274,29 @@ test("lexer rejects bad param tokens", () => {
     assert.equal(code, "42601", `${sql} should be 42601`);
   }
 });
+
+// LIKE … ESCAPE desugars to like_escape(p, e) (grammar.md §22). A bare $N pattern or escape is typed
+// text — the type like_escape declares, as PostgreSQL infers it — so either may be bound, and a bound
+// pattern/escape charges exactly like the same literal (a parameter is a constant operand, so the
+// growth kernel charges no output bytes).
+test("LIKE … ESCAPE with a bound pattern or escape", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+    "INSERT INTO t VALUES (1, 'a%'), (2, 'ab'), (3, NULL)",
+  ]);
+  const cost = (sql: string, params: Value[]): bigint => {
+    const o = queryOutcome(db, sql, params);
+    if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
+    return o.cost;
+  };
+  const literal = "SELECT id FROM t WHERE s LIKE 'a#%' ESCAPE '#' ORDER BY id";
+  const byPattern = "SELECT id FROM t WHERE s LIKE $1 ESCAPE '#' ORDER BY id";
+  const byEscape = "SELECT id FROM t WHERE s LIKE 'a#%' ESCAPE $1 ORDER BY id";
+  assert.deepEqual(ints(rows(db, byPattern, [text("a#%")])), [1n]);
+  assert.deepEqual(ints(rows(db, byPattern, [text("a%")])), [1n, 2n]);
+  assert.deepEqual(ints(rows(db, byEscape, [text("#")])), [1n]);
+  assert.deepEqual(ints(rows(db, byEscape, [nullValue()])), []);
+  assert.equal(paramErrCode(db, byEscape, [text("xy")]), "22025");
+  assert.equal(cost(byPattern, [text("a#%")]), cost(literal, []));
+  assert.equal(cost(byEscape, [text("#")]), cost(literal, []));
+});

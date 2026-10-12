@@ -1996,7 +1996,7 @@ existing members.
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
 | jsonb `\|\|`, `jsonb_set`, `jsonb_insert`, `json[b]_build_array`/`_object` (spread or `VARIADIC`), `json[b]_object(text[] [, text[]])`, `to_json`, `to_jsonb`, `array_to_json`, `JSON_SCALAR`, `JSON_SERIALIZE`, `jsonb_path_query_array`, `JSON_QUERY` when a wrapper builds an array | growth | S2 | — | `payload(result)` |
 | `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
-| `encode`, `quote_literal`, `quote_ident`, `quote_nullable`; casts from an array, `bytea`, or `jsonb` to `text`, and from `jsonb` to `json` | growth | S3 | — | UTF-8 bytes of the result |
+| `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, `like_escape`; casts from an array, `bytea`, or `jsonb` to `text`, and from `jsonb` to `json` | growth | S3 | — | UTF-8 bytes of the result |
 | element-wise `bytea[]` → `text[]` cast | growth | S3 | — | `payload(array)` |
 
 The amplifiers' exact sizes:

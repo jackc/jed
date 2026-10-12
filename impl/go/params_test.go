@@ -331,3 +331,54 @@ func TestLexerRejectsBadParamTokens(t *testing.T) {
 		}
 	}
 }
+
+// LIKE … ESCAPE desugars to like_escape(p, e) (grammar.md §22). A bare $N pattern or escape is typed
+// text — the type like_escape declares, as PostgreSQL infers it — so either may be bound, and a bound
+// pattern/escape charges exactly like the same literal (a parameter is a constant operand, so the
+// growth kernel charges no output bytes).
+func TestLikeEscapeBoundParameters(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t,
+		"CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+		"INSERT INTO t VALUES (1, 'a%'), (2, 'ab'), (3, NULL)",
+	)
+	const literal = "SELECT id FROM t WHERE s LIKE 'a#%' ESCAPE '#' ORDER BY id"
+	const byPattern = "SELECT id FROM t WHERE s LIKE $1 ESCAPE '#' ORDER BY id"
+	const byEscape = "SELECT id FROM t WHERE s LIKE 'a#%' ESCAPE $1 ORDER BY id"
+	for _, tc := range []struct {
+		sql   string
+		param Value
+		want  []int64
+	}{
+		{byPattern, TextValue("a#%"), []int64{1}},
+		{byPattern, TextValue("a%"), []int64{1, 2}},
+		{byEscape, TextValue("#"), []int64{1}},
+		{byEscape, NullValue(), []int64{}},
+	} {
+		got := firstInts(queryRows(t, db, tc.sql, tc.param))
+		if len(got) != len(tc.want) {
+			t.Fatalf("%q %v: ids = %v, want %v", tc.sql, tc.param, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("%q %v: ids = %v, want %v", tc.sql, tc.param, got, tc.want)
+			}
+		}
+	}
+	if code := paramErrCode(t, db, byEscape, TextValue("xy")); code != "22025" {
+		t.Errorf("escape 'xy': code %s, want 22025", code)
+	}
+	lit := mustCost(t, db, literal)
+	for _, tc := range []struct {
+		sql   string
+		param Value
+	}{{byPattern, TextValue("a#%")}, {byEscape, TextValue("#")}} {
+		out, err := queryOutcome(db, tc.sql, []Value{tc.param})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Cost != lit {
+			t.Errorf("%q: parameter cost %d, literal cost %d", tc.sql, out.Cost, lit)
+		}
+	}
+}

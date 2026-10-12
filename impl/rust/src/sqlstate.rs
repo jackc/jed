@@ -50,7 +50,7 @@ pub enum SqlState {
     InvalidRowCountInOffsetClause,
     /// 22023 — invalid parameter value: {detail}
     InvalidParameterValue,
-    /// 22025 — LIKE pattern must not end with escape character
+    /// 22025 — {detail}
     InvalidEscapeSequence,
     /// 2201B — invalid regular expression: {detail}
     InvalidRegularExpression,

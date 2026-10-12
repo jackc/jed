@@ -3856,10 +3856,29 @@ class Parser {
       return { kind: "between", lhs, lo, hi, negated: predNegated };
     }
     // LIKE / ILIKE (case-insensitive) — grammar.md §22. `ilike` is just another peeked keyword.
+    // An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`. A bare NULL
+    // or `$N` pattern/escape is typed text, the type like_escape declares (grammar.md §22).
     if (this.peekKeyword() === "like" || this.peekKeyword() === "ilike") {
       const insensitive = this.peekKeyword() === "ilike";
       this.advance();
-      const rhs = this.parseConcat();
+      let rhs = this.parseConcat();
+      if (this.peekKeyword() === "escape") {
+        this.advance();
+        const escapeChar = this.parseConcat();
+        const textIfUntyped = (x: Expr): Expr =>
+          x.kind === "param" || (x.kind === "literal" && x.literal.kind === "null")
+            ? { kind: "cast", inner: x, typeName: "text", typeMod: null }
+            : x;
+        rhs = {
+          kind: "funcCall",
+          name: "like_escape",
+          args: [textIfUntyped(rhs), textIfUntyped(escapeChar)],
+          argNames: [],
+          star: false,
+          distinct: false,
+          variadic: false,
+        };
+      }
       return { kind: "like", lhs, rhs, negated: predNegated, insensitive };
     }
     // `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so

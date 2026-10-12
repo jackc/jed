@@ -1724,6 +1724,8 @@ func explainScalarFunc(f scalarFunc) string {
 		return "quote_ident"
 	case sfQuoteNullable:
 		return "quote_nullable"
+	case sfLikeEscape:
+		return "like_escape"
 	}
 	panic("unhandled scalar function in EXPLAIN")
 }

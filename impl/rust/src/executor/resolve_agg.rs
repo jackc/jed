@@ -606,6 +606,7 @@ pub(crate) fn scalar_func_id(name: &str) -> ScalarFunc {
         "quote_literal" => ScalarFunc::QuoteLiteral,
         "quote_ident" => ScalarFunc::QuoteIdent,
         "quote_nullable" => ScalarFunc::QuoteNullable,
+        "like_escape" => ScalarFunc::LikeEscape,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }

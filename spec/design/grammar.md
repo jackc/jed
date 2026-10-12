@@ -330,8 +330,9 @@ Two documented divergences, both narrowings of pathological spellings (oracle-ov
   operand it reads `and`, `or`, `is`, `in`, `between`, `like`, `ilike`, and `collate` as the
   operator they begin, so a *dangling* one (`SELECT 1 and`) is `42601`. PostgreSQL's LR grammar
   defers the choice and labels the column `and`. The conditional continuations are PG-identical:
-  `not` continues only before `in`/`between`/`like`/`ilike` and `at` only before `time zone`, so
-  `SELECT 1 not, 2 at` labels both, as PostgreSQL does.
+  `not` continues only before `in`/`between`/`like`/`ilike`, `at` only before `time zone`, and
+  `escape` only directly after a `LIKE`/`ILIKE` pattern (§22), so `SELECT 1 not, 2 at, 3 escape`
+  labels all three, and `SELECT 'a' LIKE 'b' escape` is `42601`, as in PostgreSQL.
 - **No postfix `ISNULL`/`NOTNULL`.** They are not a jed surface (`IS [NOT] NULL` is), so `SELECT
   1 isnull` is `42601` where PostgreSQL evaluates the postfix operator.
 
@@ -1400,13 +1401,47 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
   literal `%`, `_`, and `\`; a `\` before any other character matches that character literally
   (`'a' LIKE '\a'` is TRUE). String literals have no backslash escapes
   (`standard_conforming_strings`, §3 / [types.md](types.md) §11), so a `\` written in a
-  pattern literal is a literal backslash byte the matcher then interprets. The explicit
-  `ESCAPE 'c'` clause and `SIMILAR TO` are deferred (relaxable later).
+  pattern literal is a literal backslash byte the matcher then interprets. `SIMILAR TO` is
+  excluded (regex.md).
+- **`ESCAPE e` — choosing the escape character.** `s [NOT] LIKE p ESCAPE e` (and `ILIKE`) matches
+  with `e` as the escape character instead of `\`. The parser **desugars** it exactly as
+  PostgreSQL does: `s LIKE like_escape(p, e)`, where the built-in `like_escape(text, text) → text`
+  ([string-functions.md](string-functions.md) §3) rewrites `p` into the default backslash form. So
+  the clause adds no operator node, and every rule below follows from ordinary function evaluation
+  (all verified against PostgreSQL 18):
+  - `e` is any text expression (a column works); a non-text `e` is **42883** (no `like_escape`
+    function for those argument types — PostgreSQL's code). A bare `NULL` or `$N` pattern or escape
+    is typed `text`, the type `like_escape` declares — PostgreSQL's inference for an unknown-typed
+    argument — so `s LIKE $1 ESCAPE '#'` and `s LIKE 'a#%' ESCAPE $1` bind like `s LIKE $1`, and
+    `'a' LIKE NULL ESCAPE '#'` is NULL like `'a' LIKE NULL`. The parser does this as it desugars
+    (wrapping the operand in a cast to `text`); a direct `like_escape(NULL, …)` call keeps the
+    general function rule.
+  - `e = ''` turns escaping **off**: `\` is an ordinary character (`'a\b' LIKE 'a\b' ESCAPE ''` is
+    TRUE). Once any other escape is chosen, `\` is ordinary too (`'a\b' LIKE 'a\b' ESCAPE '#'` is
+    TRUE). The escape may be a wildcard: `'a%' LIKE 'a%%' ESCAPE '%'` is TRUE.
+  - `e` of two or more **code points** is **22025** *invalid escape string*. One code point is one
+    character, so `ESCAPE '😀'` is valid (the TS core counts code points, never `.length`).
+  - **NULL and error order.** `like_escape` is strict and is evaluated as the pattern operand,
+    *before* LIKE's NULL check — so a NULL pattern or a NULL escape yields NULL with no error, but a
+    NULL **subject** does not suppress an invalid escape (`NULL LIKE 'a' ESCAPE 'xy'` is 22025).
+  - The rewritten pattern keeps a trailing escape as a trailing `\`, so the lazy trailing-escape
+    22025 below is unchanged: `'ax' LIKE 'a#' ESCAPE '#'` traps, `'a' LIKE 'a#' ESCAPE '#'` is FALSE.
+  - **`ILIKE`:** the escape is recognized on the pattern **before** case-folding (the rewrite
+    precedes the fold), so it is case-sensitive: `'ax' ILIKE 'ax' ESCAPE 'X'` is TRUE (`x` is not
+    the escape), `'a%' ILIKE 'aX%' ESCAPE 'X'` is TRUE.
+  - **No constant folding.** jed folds no general expression (planner.md §3), so an invalid
+    constant escape is reported when the LIKE is first evaluated: over zero rows it raises nothing,
+    where PostgreSQL folds `like_escape` of two constants at plan time and raises 22025 — the
+    same class as `SELECT 1/0 FROM empty_table`.
+  - **Cost:** the `like_escape` call is an ordinary scalar function (one `operator_eval`) and a
+    growth kernel ([cost.md](cost.md) §8.1 — it can double backslashes, and nests), so a
+    non-constant one also charges `scalar_byte` per result byte; a constant pattern + escape
+    charges nothing extra.
 - **`ILIKE` — case-insensitive `LIKE`** (collation Slice 3e). `x ILIKE p` / `x NOT ILIKE p` is `LIKE`
   with both operands **simple-lowercased** first — ASCII-only when no Unicode property bundle is
   loaded, full simple (1:1) Unicode mappings when one is ([collation.md §16](collation.md)). Simple
   1:1 folding (never the expanding `ß`→`SS` form) keeps `_`/length semantics intact. Same precedence,
-  NULL propagation, `22025` trailing-escape, and non-text `42804` as `LIKE`.
+  NULL propagation, `ESCAPE` clause, `22025` trailing-escape, and non-text `42804` as `LIKE`.
 - **Code-point matching — a §8 determinism surface.** `_` matches one **Unicode code point**,
   not one byte and not one UTF-16 unit, so `'😀x' LIKE '_x'` is TRUE. Every core iterates the
   subject and pattern by code point (Rust `chars()`, Go `[]rune`, **TS `Array.from` / spread —

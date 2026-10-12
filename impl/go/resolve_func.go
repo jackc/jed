@@ -334,6 +334,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfQuoteIdent
 	case "quote_nullable":
 		return sfQuoteNullable
+	case "like_escape":
+		return sfLikeEscape
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}

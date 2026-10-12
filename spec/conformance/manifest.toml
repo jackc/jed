@@ -1143,6 +1143,10 @@ id = "expr.ilike"
 description = "text ILIKE / NOT ILIKE — case-insensitive LIKE (spec/design/collation.md §16, grammar.md §22). Same contract as LIKE; the matcher simple-lowercases (1:1) both operands first — ASCII-only when no Unicode property bundle is loaded, full simple Unicode mappings when one is. % matches any run, _ one code point, default \\ escape; NULL propagates; non-text 42804; trailing-escape 22025. Builds on expr.like"
 
 [[capability]]
+id = "expr.like_escape"
+description = "LIKE / ILIKE … ESCAPE e — choose the escape character (spec/design/grammar.md §22). Desugared, as in PostgreSQL, to the pattern like_escape(p, e), the strict built-in that rewrites p into the default-\\ form: '' disables escaping, any other single code point is the escape, two or more code points is 22025 (invalid escape string). A NULL pattern or escape is NULL with no error, but a NULL subject does not suppress an invalid escape; the escape is matched case-sensitively before ILIKE folds; like_escape is also callable directly and is a growth kernel (cost.md §8.1). Builds on expr.like + expr.ilike"
+
+[[capability]]
 id = "expr.regex_match"
 description = "text ~ pattern / text !~ pattern — regular-expression match (case-sensitive), jed's RE2-able subset (spec/design/regex.md, grammar.md §22b), NOT PostgreSQL-flavor-compatible. UNANCHORED (matches a substring; anchor with ^/$). Pattern surface: literals, . (any code point except newline), classes [...]/[^...], \\d \\w \\s + negations, anchors ^ $, alternation |, groups (...)/(?:...), quantifiers * + ? {n} {n,} {n,m} greedy + lazy, leftmost-first greedy semantics. Hand-written Pike VM (linear-time, no backtracking). text×text→boolean, NULL propagates, non-text 42804, malformed pattern 2201B. !~ is the AST-negated form. Code-point (not UTF-16) iteration"
 

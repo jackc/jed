@@ -2913,6 +2913,9 @@ pub(crate) enum ScalarFunc {
     QuoteIdent,
     /// quote_nullable(text) → text — like quote_literal but NON-STRICT (NULL → 'NULL', §3).
     QuoteNullable,
+    /// like_escape(pattern, escape) → text — rewrite a LIKE pattern to the default `\` escape; what
+    /// `LIKE … ESCAPE` desugars to (§3, grammar.md §22).
+    LikeEscape,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from

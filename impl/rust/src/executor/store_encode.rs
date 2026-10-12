@@ -1862,7 +1862,8 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         | ScalarFunc::Decode
         | ScalarFunc::QuoteLiteral
         | ScalarFunc::QuoteIdent
-        | ScalarFunc::QuoteNullable => {
+        | ScalarFunc::QuoteNullable
+        | ScalarFunc::LikeEscape => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json/string fns are handled before eval_float_func"
             )

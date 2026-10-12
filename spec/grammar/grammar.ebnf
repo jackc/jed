@@ -998,7 +998,10 @@ not_expr       ::= "NOT" not_expr
  * bounds are additive expressions: parsing them at the additive level (which never consumes
  * "AND", a looser level) is what lets the structural "AND" be matched here, so
  * "x BETWEEN a AND b AND c" is "(x BETWEEN a AND b) AND c". LIKE's pattern is one additive
- * expression. PostgreSQL binds IN/BETWEEN/LIKE slightly tighter than the comparison operators;
+ * expression, optionally followed by "ESCAPE" and one more (the escape string, §22). The parser
+ * desugars "x LIKE p ESCAPE e" to "x LIKE like_escape(p, e)" — PostgreSQL's own rewrite into the
+ * default backslash form — so the clause adds no operator node. "ESCAPE" is read as the clause
+ * only directly after a LIKE/ILIKE pattern (elsewhere it is an ordinary bare label). PostgreSQL binds IN/BETWEEN/LIKE slightly tighter than the comparison operators;
  * collapsing them into this one non-associative level is a documented narrowing (unobservable,
  * since chaining comparisons is already a syntax error here). Every comparison operand is a
  * `concat` expression, so the `||` operator (one rung tighter) is available inside them.
@@ -1016,7 +1019,7 @@ comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" ( subquery
                             | "IS" "NOT"? "DISTINCT" "FROM" concat
                             | "NOT"? "IN" "(" ( subquery_expr | concat ("," concat)* ) ")"
                             | "NOT"? "BETWEEN" concat "AND" concat
-                            | "NOT"? ("LIKE" | "ILIKE") concat
+                            | "NOT"? ("LIKE" | "ILIKE") concat ("ESCAPE" concat)?
                             | regex_op concat )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">=" | "<>" | "!="   /* "<>" and "!=" are one not-equal operator; the lexer folds "!=" to "<>" */

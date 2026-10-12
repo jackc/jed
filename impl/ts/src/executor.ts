@@ -1099,6 +1099,37 @@ export function quoteLiteralText(s: string): string {
   return hasBackslash ? `E'${inner}'` : `'${inner}'`;
 }
 
+// likeEscapeText is like_escape(pattern, escape) (string-functions.md §3): rewrite a LIKE pattern
+// written with the escape character escape into the default-\ form the matcher reads (PostgreSQL's
+// MB_do_like_escape), by CODE POINT — never UTF-16 units, so an astral escape is one character. ''
+// disables escaping (each \ doubled); \ returns the pattern unchanged; any other single code point
+// becomes \, with a \ after it a literal backslash. Two or more code points trap 22025.
+export function likeEscapeText(pattern: string, escapeChar: string): string {
+  const esc = Array.from(escapeChar);
+  if (esc.length > 1) throw engineError("invalid_escape_sequence", "invalid escape string");
+  let out = "";
+  if (esc.length === 0) {
+    for (const c of pattern) out += c === "\\" ? "\\\\" : c;
+    return out;
+  }
+  const e = esc[0]!;
+  if (e === "\\") return pattern;
+  let afterEscape = false;
+  for (const c of pattern) {
+    if (c === e && !afterEscape) {
+      out += "\\";
+      afterEscape = true;
+    } else if (c === "\\") {
+      out += afterEscape ? "\\" : "\\\\";
+      afterEscape = false;
+    } else {
+      out += c;
+      afterEscape = false;
+    }
+  }
+  return out;
+}
+
 // quoteIdentText is quote_ident(s) (string-functions.md §3): wrap s as a SQL identifier — returned
 // unchanged if it is already a safe unquoted identifier (^[a-z_][a-z0-9_]*$), else double-quoted
 // with each internal " doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword
@@ -27674,7 +27705,10 @@ export type ScalarFuncName =
   // quote_ident(text) → text — wrap as a SQL identifier (§3).
   | "quote_ident"
   // quote_nullable(text) → text — like quote_literal but NON-STRICT (NULL → 'NULL', §3).
-  | "quote_nullable";
+  | "quote_nullable"
+  // like_escape(pattern, escape) → text — rewrite a LIKE pattern to the default \ escape; what
+  // LIKE … ESCAPE desugars to (§3, grammar.md §22).
+  | "like_escape";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything

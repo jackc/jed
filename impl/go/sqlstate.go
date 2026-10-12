@@ -53,7 +53,7 @@ const (
 	InvalidRowCountInOffsetClause
 	// InvalidParameterValue is 22023 — invalid parameter value: {detail}.
 	InvalidParameterValue
-	// InvalidEscapeSequence is 22025 — LIKE pattern must not end with escape character.
+	// InvalidEscapeSequence is 22025 — {detail}.
 	InvalidEscapeSequence
 	// InvalidRegularExpression is 2201B — invalid regular expression: {detail}.
 	InvalidRegularExpression

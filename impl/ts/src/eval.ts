@@ -92,6 +92,7 @@ import {
   parseFloatLiteral,
   parseIntLiteral,
   quoteIdentText,
+  likeEscapeText,
   quoteLiteralText,
   regexpReplaceText,
   repeatText,
@@ -1664,6 +1665,15 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           e.args,
           textValue(quoteLiteralText((vals[0] as { text: string }).text)),
         );
+      }
+      if (e.func === "like_escape") {
+        // like_escape(pattern, escape) → text — the LIKE … ESCAPE rewrite (grammar.md §22). A growth
+        // kernel like quote_literal: it can double backslashes, and nests.
+        const out = likeEscapeText(
+          (vals[0] as { text: string }).text,
+          (vals[1] as { text: string }).text,
+        );
+        return growthResult(m, e.args, textValue(out));
       }
       if (e.func === "quote_ident") {
         // quote_ident(text) → text — wrap as a SQL identifier; a growth kernel like quote_literal.

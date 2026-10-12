@@ -408,3 +408,46 @@ fn lexer_rejects_bad_param_tokens() {
         );
     }
 }
+
+/// LIKE … ESCAPE desugars to like_escape(p, e) (grammar.md §22). A bare $N pattern or escape is typed
+/// text — the type like_escape declares, as PostgreSQL infers it — so either may be bound, and a bound
+/// pattern/escape charges exactly like the same literal (a parameter is a constant operand, so the
+/// growth kernel charges no output bytes).
+#[test]
+fn like_escape_bound_parameters() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+        "INSERT INTO t VALUES (1, 'a%'), (2, 'ab'), (3, NULL)",
+    ]);
+    let literal = "SELECT id FROM t WHERE s LIKE 'a#%' ESCAPE '#' ORDER BY id";
+    let by_pattern = "SELECT id FROM t WHERE s LIKE $1 ESCAPE '#' ORDER BY id";
+    let by_escape = "SELECT id FROM t WHERE s LIKE 'a#%' ESCAPE $1 ORDER BY id";
+    let text = |s: &str| Value::Text(s.to_string());
+    let cases: [(&str, Value, Vec<i64>); 4] = [
+        (by_pattern, text("a#%"), vec![1]),
+        (by_pattern, text("a%"), vec![1, 2]),
+        (by_escape, text("#"), vec![1]),
+        (by_escape, Value::Null, vec![]),
+    ];
+    for (sql, param, want) in cases {
+        let got: Vec<i64> = rows(&mut db, sql, &[param.clone()])
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(x) => x,
+                _ => panic!("expected an int"),
+            })
+            .collect();
+        assert_eq!(got, want, "{sql:?} {param:?}");
+    }
+    assert_eq!(err_code(&mut db, by_escape, &[text("xy")]), "22025");
+    let cost = |db: &mut Session, sql: &str, params: &[Value]| match db
+        .query_outcome(sql, params)
+        .unwrap()
+    {
+        Outcome::Query { cost, .. } => cost,
+        _ => panic!("expected a query result"),
+    };
+    let lit = cost(&mut db, literal, &[]);
+    assert_eq!(cost(&mut db, by_pattern, &[text("a#%")]), lit);
+    assert_eq!(cost(&mut db, by_escape, &[text("#")]), lit);
+}

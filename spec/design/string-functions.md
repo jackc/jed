@@ -335,6 +335,31 @@ The PostgreSQL quoting helpers for building SQL text.
   ('select') = 'select'`. The oracle corpus exercises the non-keyword cases (which match
   PostgreSQL); keyword-aware quoting is a deferred refinement, recorded here.
 
+### `like_escape(pattern, escape) → text`
+
+Rewrites a LIKE pattern written with the escape character `escape` into the equivalent pattern
+under LIKE's default `\` escape. It is what `s LIKE p ESCAPE e` desugars to — the parser emits
+`s LIKE like_escape(p, e)` ([grammar.md](grammar.md) §22) — and, as in PostgreSQL, it is also
+callable directly. PostgreSQL's `MB_do_like_escape`, walked by **code point**:
+
+- **`escape = ''`** — escaping is off: every `\` is doubled, so it matches itself.
+  `like_escape('a\b%', '') = 'a\\b%'`.
+- **`escape = '\'`** — the pattern is returned unchanged.
+- **any other single code point `c`** — left to right, with an "after escape" flag: an unescaped
+  `c` becomes `\` and sets the flag; a `\` becomes `\\`, or just `\` when it directly follows an
+  escape (the escaped character is then a literal backslash); every other character is copied.
+  Each non-escape character clears the flag. `like_escape('a#%b\c##d#', '#') = 'a\%b\\c\#d\'`. A
+  trailing `c` becomes a trailing `\`, so the matcher's lazy trailing-escape 22025 still applies.
+- **two or more code points** — **22025** *invalid escape string* (PostgreSQL's code and message;
+  its hint, "Escape string must be empty or one character.", is not carried — error-fields.md
+  §11). Counted in code points, so `like_escape('a😀%', '😀') = 'a\%'` — the TS core must not use
+  UTF-16 `.length`. An empty `pattern` is still checked: `like_escape('', 'xy')` is 22025.
+
+STRICT: a NULL `pattern` or `escape` is NULL, with no error. A **growth kernel** ([cost.md](cost.md)
+§8.1): the result is at most twice the pattern, but nested calls double again, so a call with any
+non-constant argument charges `scalar_byte` per result byte; an all-constant call charges only its
+`operator_eval`.
+
 ## 4. Binary string (bytea) functions
 
 PostgreSQL's binary-string surface (manual §9.5) over `bytea`. Every function counts and indexes

@@ -15,6 +15,9 @@ INSERT INTO account VALUES
 WHERE email LIKE '%@example.com'
 ORDER BY id;`;
 
+	const likeEscape = `SELECT '50% off' LIKE '%!%%' ESCAPE '!' AS has_percent,
+       '50 off'  LIKE '%!%%' ESCAPE '!' AS plain;`;
+
 	const regexOp = `SELECT id, email FROM account
 WHERE email ~ '@example\\.(com|org)$'
 ORDER BY id;`;
@@ -46,6 +49,13 @@ functions.
 `ILIKE` is the case-insensitive form. The match is by Unicode code point.
 
 <LiveSql {seed} query={like} rows={4} />
+
+To match a literal `%` or `_`, escape it. The default escape character is backslash (`\%`,
+`\_`, `\\`). `ESCAPE` picks a different one, which is handy when the pattern itself contains
+backslashes; `ESCAPE ''` turns escaping off. The escape must be a single character (`22025`
+otherwise).
+
+<LiveSql query={likeEscape} rows={1} />
 
 ## Regular expressions
 

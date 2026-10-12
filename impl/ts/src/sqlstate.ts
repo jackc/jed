@@ -29,7 +29,7 @@ export type SqlState =
   | "invalid_row_count_in_limit_clause" // 2201W — LIMIT must not be negative
   | "invalid_row_count_in_offset_clause" // 2201X — OFFSET must not be negative
   | "invalid_parameter_value" // 22023 — invalid parameter value: {detail}
-  | "invalid_escape_sequence" // 22025 — LIKE pattern must not end with escape character
+  | "invalid_escape_sequence" // 22025 — {detail}
   | "invalid_regular_expression" // 2201B — invalid regular expression: {detail}
   | "array_subscript_error" // 2202E — {detail}
   | "duplicate_json_object_key_value" // 22030 — duplicate JSON object key value

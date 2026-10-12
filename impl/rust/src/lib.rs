@@ -830,6 +830,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.between",
     "expr.like",
     "expr.ilike",
+    "expr.like_escape",
     "expr.regex_match",
     "expr.regex_imatch",
     "expr.case",

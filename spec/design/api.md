@@ -625,7 +625,9 @@ SET`, or a `CAST` target. The cast-target case covers **both** spellings — `CA
 and the postfix `$1 :: int` ([grammar.md](grammar.md) §37) — so `$1 :: int` types `$1` as int
 and `$1 :: numeric(10,2)` types it decimal and re-scales the bound value to `(10,2)`. A bare
 parameter in a `CASE` result arm or a `COALESCE`/`GREATEST`/`LEAST` argument adopts the
-expression's unified scalar result type. A parameter with **no derivable type** (e.g. a bare
+expression's unified scalar result type. A bare parameter as the pattern or the escape of a
+`LIKE`/`ILIKE … ESCAPE` is `text`, the type the `like_escape` desugar declares
+([grammar.md](grammar.md) §22). A parameter with **no derivable type** (e.g. a bare
 `SELECT $1`, or a gap in `$1..$N`) is `42P18 indeterminate_datatype`. Conflicting inferences for
 the same index (`i16` here, `text` there) are `42804 datatype_mismatch`. Two adaptable operands
 with no anchoring type (`$1 = $2`, `$1 = 5`) default the parameter to `i64`, matching the

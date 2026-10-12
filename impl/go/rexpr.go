@@ -886,6 +886,9 @@ const (
 	sfQuoteIdent
 	// quote_nullable(text) → text — like quote_literal but NON-STRICT (NULL → 'NULL', §3).
 	sfQuoteNullable
+	// like_escape(pattern, escape) → text — rewrite a LIKE pattern to the default \ escape; what
+	// LIKE … ESCAPE desugars to (§3, grammar.md §22).
+	sfLikeEscape
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is

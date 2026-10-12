@@ -2738,6 +2738,19 @@ impl RExpr {
                         }
                         Ok(out)
                     }
+                    // like_escape(pattern, escape) → text — the `LIKE … ESCAPE` rewrite (grammar.md §22). A
+                    // growth kernel like quote_literal: it can double backslashes, and nests.
+                    ScalarFunc::LikeEscape => {
+                        let (p, e) = match (&vals[0], &vals[1]) {
+                            (Value::Text(p), Value::Text(e)) => (p, e),
+                            _ => unreachable!("resolver restricts like_escape to text"),
+                        };
+                        let out = Value::Text(like_escape_text(p, e)?);
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
                     // quote_nullable is handled by the non-strict pre-check above (it returns before
                     // the strict short-circuit loop), so it never reaches this match.
                     ScalarFunc::QuoteNullable => {

@@ -3212,6 +3212,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfQuoteIdent:
 			// quote_ident(text) → text — wrap as a SQL identifier; a growth kernel like quote_literal.
 			return growthResult(m, e.sargs, TextValue(quoteIdentText(vals[0].str())))
+		case sfLikeEscape:
+			// like_escape(pattern, escape) → text — the LIKE … ESCAPE rewrite (grammar.md §22). A growth
+			// kernel like quote_literal: it can double backslashes, and nests.
+			out, err := likeEscapeText(vals[0].str(), vals[1].str())
+			if err != nil {
+				return Value{}, err
+			}
+			return growthResult(m, e.sargs, TextValue(out))
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.

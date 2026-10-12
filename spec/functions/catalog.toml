@@ -392,8 +392,9 @@ errors         = []
 # `NOT LIKE` is its negation (carried by the AST, not a separate operator). A pattern that
 # ENDS in a lone escape char, reached during matching while subject remains, traps 22025
 # (../design/grammar.md §22; verified against PostgreSQL 18). text vs a non-text operand is a
-# 42804 (compare.toml lists only text×text). ILIKE is the case-insensitive form (below); the
-# ESCAPE clause and SIMILAR TO remain deferred.
+# 42804 (compare.toml lists only text×text). ILIKE is the case-insensitive form (below). The
+# `ESCAPE e` clause is not an operand: the parser desugars `x LIKE p ESCAPE e` to
+# `x LIKE like_escape(p, e)` (the like_escape function below); SIMILAR TO is excluded.
 
 [[operator]]
 volatility     = "immutable"
@@ -4416,6 +4417,22 @@ arg_resolution = "none"
 result         = "text"
 null           = "none"
 errors         = []
+
+# like_escape(pattern, escape) → text — rewrites a LIKE pattern written with escape character
+# `escape` into the default-`\` form (PostgreSQL's MB_do_like_escape): '' disables escaping (each
+# `\` doubled), '\' returns the pattern unchanged, any other one code point becomes `\`. What
+# `x LIKE p ESCAPE e` desugars to (../design/grammar.md §22). An escape of two or more code points is
+# 22025 (invalid escape string). STRICT. A growth kernel (cost.md §8.1). (string-functions.md §3)
+[[operator]]
+volatility     = "immutable"
+name           = "like_escape"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22025"]
 
 # Regular-expression scalar functions (../design/regex.md §8). jed's RE2-able flavor (not PG-flavor-
 # compatible) over the hand-written Pike VM. STRICT (null = "propagates" — a NULL arg → NULL).
