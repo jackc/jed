@@ -1683,9 +1683,11 @@ export function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string
 export function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
   if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
   else if (qe.kind === "withExpr") {
-    // A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names.
+    // A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names
+    // (under RECURSIVE, each name is also visible inside its own body).
     const scope = new Set(locals);
     for (const cte of qe.ctes) {
+      if (qe.recursive) scope.add(cte.name);
       collectCteBodyPrivs(cte.body, req, scope);
       scope.add(cte.name);
     }
@@ -1701,10 +1703,11 @@ export function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>):
 export function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): void {
   // A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
   // added to the local scope and never privilege-checked. Forward-only visibility: each CTE body sees
-  // the CTE names declared before it. A data-modifying body / primary needs the write privilege on
-  // its target table (writable-cte.md).
+  // the CTE names declared before it, and under RECURSIVE also its own name (recursive-cte.md §3). A
+  // data-modifying body / primary needs the write privilege on its target table (writable-cte.md).
   const scope = new Set(locals);
   for (const cte of wq.ctes) {
+    if (wq.recursive) scope.add(cte.name);
     collectCteBodyPrivs(cte.body, req, scope);
     scope.add(cte.name);
   }
@@ -1744,8 +1747,9 @@ export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<stri
     collectQueryPrivs(t.subquery, req, locals);
   } else if (t.values !== undefined) {
     for (const row of t.values) for (const e of row) collectExprPrivs(e, req, locals);
-  } else if (!locals.has(t.name)) {
-    // A base-table reference (not a CTE / derived-table label) — needs SELECT.
+  } else if (t.db !== undefined || !locals.has(t.name)) {
+    // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified name
+    // never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
     req.tables.push({ name: t.name, priv: "select" });
   }
 }

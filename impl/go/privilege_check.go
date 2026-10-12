@@ -672,12 +672,16 @@ func collectQueryPrivs(qe *queryExpr, req *privReq, locals map[string]bool) {
 	} else if qe.SetOp != nil {
 		collectSetopPrivs(qe.SetOp, req, locals)
 	} else if qe.With != nil {
-		// A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names.
+		// A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names
+		// (under RECURSIVE, each name is also visible inside its own body).
 		scope := map[string]bool{}
 		for name := range locals {
 			scope[name] = true
 		}
 		for i := range qe.With.Ctes {
+			if qe.With.Recursive {
+				scope[qe.With.Ctes[i].Name] = true
+			}
 			collectCteBodyPrivs(&qe.With.Ctes[i].Body, req, scope)
 			scope[qe.With.Ctes[i].Name] = true
 		}
@@ -693,13 +697,17 @@ func collectSetopPrivs(so *setOp, req *privReq, locals map[string]bool) {
 func collectWithPrivs(wq *withQuery, req *privReq, locals map[string]bool) {
 	// A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
 	// added to the local scope and never privilege-checked. Forward-only visibility: each CTE body
-	// sees the CTE names declared before it. A data-modifying body / primary needs the write privilege
-	// on its target table (writable-cte.md).
+	// sees the CTE names declared before it, and under RECURSIVE also its own name (recursive-cte.md
+	// §3). A data-modifying body / primary needs the write privilege on its target table
+	// (writable-cte.md).
 	scope := map[string]bool{}
 	for k := range locals {
 		scope[k] = true
 	}
 	for i := range wq.Ctes {
+		if wq.Recursive {
+			scope[wq.Ctes[i].Name] = true
+		}
 		collectCteBodyPrivs(&wq.Ctes[i].Body, req, scope)
 		scope[wq.Ctes[i].Name] = true
 	}
@@ -765,8 +773,9 @@ func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 			}
 		}
 	default:
-		// A base-table reference (not a CTE / derived-table label) — needs SELECT.
-		if !locals[t.Name] {
+		// A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified name
+		// never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
+		if t.DB != nil || !locals[t.Name] {
 			req.needTable(t.Name, PrivSelect)
 		}
 	}

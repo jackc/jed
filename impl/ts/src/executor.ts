@@ -13149,7 +13149,6 @@ export class Engine {
     // Phase 1: resolve every name (42P01 / 42809) before any dependency check.
     const targets: string[] = [];
     for (const { db, name } of dv.names) {
-      if (targets.includes(name)) continue;
       if (isCatalogRelName(name)) {
         throw engineError("wrong_object_type", `cannot drop system relation "${name}"`);
       }
@@ -13166,6 +13165,9 @@ export class Engine {
         }
         throw viewNotSupported("views in an attached database are not supported");
       }
+      // Deduplicate only after the qualifier is validated, so a repeated name cannot skip a bad
+      // `temp.`/attachment qualifier.
+      if (targets.includes(name)) continue;
       if (this.isView(name)) {
         targets.push(name);
         continue;
@@ -13211,19 +13213,27 @@ export class Engine {
     if (inner.kind !== "select" && inner.kind !== "setOp" && inner.kind !== "with") return false;
     const req: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
     collectStmtPrivs(inner, req);
-    return req.tables.some((t) => this.viewCallsSeqMutator(t.name));
+    return this.viewsCallSeqMutator(req.tables.map((t) => t.name));
   }
 
-  // viewCallsSeqMutator reports whether the view `name` (of the main database) calls a
-  // sequence-mutating function in its body or in the body of any view it reads. Views are acyclic,
-  // so the recursion terminates.
-  private viewCallsSeqMutator(name: string): boolean {
-    const view = this.readSnap().view(name);
-    if (view === undefined) return false;
-    if (queryCallsSeqMutator(view.body)) return true;
-    const req: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
-    collectQueryPrivs(view.body, req, new Set());
-    return req.tables.some((t) => this.viewCallsSeqMutator(t.name));
+  // viewsCallSeqMutator reports whether any of the views named in `pending` (of the main database)
+  // calls a sequence-mutating function in its body or in the body of any view it reads. The walk
+  // visits each view once, so it terminates whatever names a body holds.
+  private viewsCallSeqMutator(pending: string[]): boolean {
+    const snap = this.readSnap();
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const name = pending.pop()!;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const view = snap.view(name);
+      if (view === undefined) continue;
+      if (queryCallsSeqMutator(view.body)) return true;
+      const body: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
+      collectQueryPrivs(view.body, body, new Set());
+      pending.push(...body.tables.map((t) => t.name));
+    }
+    return false;
   }
 
   // collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads

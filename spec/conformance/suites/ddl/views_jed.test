@@ -5,7 +5,7 @@
 # update, 0A000 for the deferred forms, temp scope, untracked dependencies, CASCADE to a view,
 # re-validation after ALTER TABLE (§8), the session privilege envelope (§9), and transactions.
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_data_modifying, types.i32, types.i64, types.text, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
+# requires: ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
 
 statement ok
 CREATE TABLE t (a i32 PRIMARY KEY, b text)
@@ -148,6 +148,13 @@ x
 statement error 0A000
 CREATE VIEW temp.tv AS SELECT a FROM t
 
+# a repeated name is deduplicated only after its qualifier is validated
+statement error 42P01
+DROP VIEW main.mv, temp.mv
+
+statement error 42P01
+DROP VIEW mv, nosuchdb.mv
+
 # --- sequence statements look up sequences only (as for a table) ------------------------------------
 
 statement error 42P01
@@ -211,6 +218,16 @@ BEGIN READ ONLY
 
 statement error 25006
 SELECT * FROM vs
+
+statement ok
+ROLLBACK
+
+# a database-qualified name never resolves to a CTE, so a same-named CTE cannot hide the view
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+WITH vs AS (SELECT 7 AS n) SELECT * FROM main.vs
 
 statement ok
 ROLLBACK
@@ -386,6 +403,19 @@ query I nosort
 SELECT * FROM pv2
 ----
 1
+
+# a same-named CTE cannot hide a database-qualified view from the privilege check
+# default_privileges: NONE
+statement error 42501
+WITH pv AS (SELECT 1 AS a) SELECT * FROM main.pv
+
+# a recursive CTE's self-reference is the CTE, so it needs no SELECT on the same-named table
+# default_privileges: NONE
+query I nosort
+WITH RECURSIVE t (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 2) SELECT n FROM t ORDER BY n
+----
+1
+2
 
 statement ok
 DROP VIEW pv2, pv, vn, v, mv

@@ -2747,10 +2747,14 @@ pub(crate) fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &Ha
     match qe {
         QueryExpr::Select(s) => collect_select_privs(s, req, locals),
         QueryExpr::SetOp(so) => collect_setop_privs(so, req, locals),
-        // A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names.
+        // A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names
+        // (under RECURSIVE, each name is also visible inside its own body).
         QueryExpr::With(we) => {
             let mut scope = locals.clone();
             for cte in &we.ctes {
+                if we.recursive {
+                    scope.insert(cte.name.to_string());
+                }
                 collect_cte_body_privs(&cte.body, req, &scope);
                 scope.insert(cte.name.to_string());
             }
@@ -2767,10 +2771,14 @@ pub(crate) fn collect_setop_privs(so: &SetOp, req: &mut PrivReq, locals: &HashSe
 pub(crate) fn collect_with_privs(wq: &WithQuery, req: &mut PrivReq, locals: &HashSet<String>) {
     // A CTE name shadows a base table inside the WITH (a `FROM <cte>` is not a catalog object), so
     // it is added to the local scope and never privilege-checked. Forward-only visibility: each CTE
-    // body sees the CTE names declared before it. A data-modifying body / primary needs the write
-    // privilege on its target table (writable-cte.md).
+    // body sees the CTE names declared before it, and under RECURSIVE also its own name
+    // (recursive-cte.md §3). A data-modifying body / primary needs the write privilege on its target
+    // table (writable-cte.md).
     let mut scope = locals.clone();
     for cte in &wq.ctes {
+        if wq.recursive {
+            scope.insert(cte.name.to_string());
+        }
         collect_cte_body_privs(&cte.body, req, &scope);
         scope.insert(cte.name.to_string());
     }
@@ -2827,8 +2835,9 @@ pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &
         for e in rows.iter().flatten() {
             collect_expr_privs(e, req, locals);
         }
-    } else if !locals.contains(&t.name.to_string()) {
-        // A base-table reference (not a CTE / derived-table label) — needs SELECT.
+    } else if t.db.is_some() || !locals.contains(&t.name.to_string()) {
+        // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified
+        // name never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
         req.need_table(&t.name, Privilege::Select);
     }
 }

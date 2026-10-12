@@ -529,9 +529,6 @@ impl Engine {
         // Phase 1: resolve every name (42P01 / 42809) before any dependency check.
         let mut targets: Vec<String> = Vec::new();
         for (db, name) in &dv.names {
-            if targets.contains(name) {
-                continue;
-            }
             if is_catalog_rel_name(name) {
                 return Err(EngineError::new(
                     SqlState::WrongObjectType,
@@ -566,6 +563,11 @@ impl Engine {
                         "views in an attached database are not supported",
                     ));
                 }
+            }
+            // Deduplicate only after the qualifier is validated, so a repeated name cannot skip a
+            // bad `temp.`/attachment qualifier.
+            if targets.contains(name) {
+                continue;
             }
             if self.is_view(name) {
                 targets.push(name.clone());
@@ -723,25 +725,30 @@ impl Engine {
         }
         let mut req = PrivReq::default();
         collect_stmt_privs(stmt, &mut req);
-        req.tables
-            .iter()
-            .any(|(name, _)| self.view_calls_seq_mutator(name))
+        self.views_call_seq_mutator(req.tables.into_iter().map(|(n, _)| n).collect())
     }
 
-    /// Whether the view `name` (of the main database) calls a sequence-mutating function in its
-    /// body or in the body of any view it reads. Views are acyclic, so the recursion terminates.
-    fn view_calls_seq_mutator(&self, name: &str) -> bool {
-        let Some(view) = self.read_snap().view(name) else {
-            return false;
-        };
-        if query_calls_seq_mutator(&view.body) {
-            return true;
+    /// Whether any of the views named in `pending` (of the main database) calls a sequence-mutating
+    /// function in its body or in the body of any view it reads. The walk visits each view once, so
+    /// it terminates whatever names a body holds.
+    fn views_call_seq_mutator(&self, mut pending: Vec<String>) -> bool {
+        let snap = self.read_snap();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(view) = snap.view(&name) else {
+                continue;
+            };
+            if query_calls_seq_mutator(&view.body) {
+                return true;
+            }
+            let mut body = PrivReq::default();
+            collect_query_privs(&view.body, &mut body, &HashSet::new());
+            pending.extend(body.tables.into_iter().map(|(n, _)| n));
         }
-        let mut req = PrivReq::default();
-        collect_query_privs(&view.body, &mut req, &HashSet::new());
-        req.tables
-            .iter()
-            .any(|(n, _)| self.view_calls_seq_mutator(n))
+        false
     }
 
     /// Add the functions called in the bodies of the views a statement reads (transitively) to its

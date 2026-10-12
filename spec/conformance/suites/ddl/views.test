@@ -238,6 +238,20 @@ SELECT * FROM vr ORDER BY n
 2
 3
 
+# a recursive CTE may share the view's name: its self-reference is the CTE, never the view
+statement ok
+CREATE VIEW rr AS WITH RECURSIVE rr (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM rr WHERE n < 3) SELECT n FROM rr
+
+query I nosort
+SELECT * FROM rr ORDER BY n
+----
+1
+2
+3
+
+statement ok
+DROP VIEW rr
+
 statement ok
 CREATE VIEW vu AS SELECT a FROM t WHERE a = 1 UNION SELECT a FROM t WHERE a = 3
 

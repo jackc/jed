@@ -520,9 +520,6 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 	var targets []string
 	for _, qn := range dv.Names {
 		name := qn.Name
-		if slices.Contains(targets, name) {
-			continue
-		}
 		if isCatalogRelName(name) {
 			return outcome{}, newError(WrongObjectType, fmt.Sprintf("cannot drop system relation \"%s\"", name))
 		}
@@ -543,6 +540,11 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 				}
 				return outcome{}, viewNotSupported("views in an attached database are not supported")
 			}
+		}
+		// Deduplicate only after the qualifier is validated, so a repeated name cannot skip a bad
+		// `temp.`/attachment qualifier.
+		if slices.Contains(targets, name) {
+			continue
 		}
 		if db.isView(name) {
 			targets = append(targets, name)
@@ -660,30 +662,37 @@ func (db *engine) stmtIsWriteWithViews(stmt statement) bool {
 	}
 	var req privReq
 	collectStmtPrivs(stmt, &req)
+	pending := make([]string, 0, len(req.tables))
 	for _, t := range req.tables {
-		if db.viewCallsSeqMutator(t.name) {
-			return true
-		}
+		pending = append(pending, t.name)
 	}
-	return false
+	return db.viewsCallSeqMutator(pending)
 }
 
-// viewCallsSeqMutator reports whether the view name (of the main database) calls a sequence-mutating
-// function in its body or in the body of any view it reads. Views are acyclic, so the recursion
-// terminates.
-func (db *engine) viewCallsSeqMutator(name string) bool {
-	view := db.readSnap().view(name)
-	if view == nil {
-		return false
-	}
-	if queryCallsSeqMutator(view.Body) {
-		return true
-	}
-	var req privReq
-	collectQueryPrivs(view.Body, &req, map[string]bool{})
-	for _, t := range req.tables {
-		if db.viewCallsSeqMutator(t.name) {
+// viewsCallSeqMutator reports whether any of the views named in pending (of the main database) calls
+// a sequence-mutating function in its body or in the body of any view it reads. The walk visits each
+// view once, so it terminates whatever names a body holds.
+func (db *engine) viewsCallSeqMutator(pending []string) bool {
+	snap := db.readSnap()
+	seen := map[string]bool{}
+	for len(pending) > 0 {
+		name := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		view := snap.view(name)
+		if view == nil {
+			continue
+		}
+		if queryCallsSeqMutator(view.Body) {
 			return true
+		}
+		var body privReq
+		collectQueryPrivs(view.Body, &body, map[string]bool{})
+		for _, t := range body.tables {
+			pending = append(pending, t.name)
 		}
 	}
 	return false
