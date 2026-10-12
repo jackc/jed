@@ -215,8 +215,10 @@ Grouping and aggregation:
 `AND` and `OR` evaluate their operands **left to right and stop early**: a `FALSE` left operand
 decides `AND` and a `TRUE` one decides `OR`, so the right operand is never evaluated. A guard
 written first therefore protects what follows it — `WHERE qty <> 0 AND total / qty > 5` never
-divides by zero. (A `NULL` left operand decides neither, so the right operand still runs.)
-PostgreSQL leaves this order unspecified; jed guarantees it.
+divides by zero. In a `WHERE`, `ON`, or `HAVING`, a `NULL` condition also stops the `AND` chain,
+since the row can no longer qualify; elsewhere (the select list, `CASE`, `CHECK`) a `NULL` left
+operand decides neither, so the right operand still runs. PostgreSQL leaves the order unspecified;
+jed guarantees it.
 
 Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
