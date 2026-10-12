@@ -113,6 +113,11 @@
 #              must return the same rows — a pushed-down predicate, a view over a view, a join with a
 #              table, an aggregate body, and a column alias list over the reference. Expected rows
 #              by construction; view_plan.test pins the matching cost and EXPLAIN.
+#   view_write — a write through an updatable view IS a write to its base table (spec/design/
+#              views.md §15): UPDATE / DELETE / INSERT through a view (and a view over it) and the
+#              same writes on an identically seeded table, with the views' conditions and read-only
+#              columns inlined, must return the same RETURNING rows and leave the same contents.
+#              Expected rows by construction; view_write_jed.test pins cost and EXPLAIN.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -372,6 +377,11 @@ VIEW_REQ = %w[ddl.view ddl.create_table ddl.primary_key dml.insert dml.insert_mu
               query.group_by query.is_null query.is_distinct_from query.derived_table
               query.derived_pushdown query.table_alias expr.arithmetic expr.between
               expr.comparison_value null.three_valued types.i32].freeze
+VIEW_WRITE_REQ = %w[ddl.view dml.view_write ddl.create_table ddl.primary_key dml.insert
+                    dml.insert_multi_row dml.insert_column_list dml.update dml.delete dml.returning
+                    query.select query.where_eq query.comparison_order query.logical_connectives
+                    query.order_by query.is_null query.is_distinct_from expr.arithmetic expr.between
+                    expr.comparison_value null.three_valued types.i32].freeze
 CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                        query.where_eq query.comparison_order query.logical_connectives query.order_by
                        query.aggregates query.qualified_column query.join_inner
@@ -2997,6 +3007,88 @@ def gen_view(seed)
   out.join("\n") + "\n"
 end
 
+# Writes through an updatable view against the same writes on its base table (spec/design/views.md
+# §15). Two identically seeded tables: `vt` is written through `wv` (and `wv2`, a view over `wv`), `bt`
+# directly, with the views' WHERE clauses AND-ed in and the read-only column `s` spelled out as
+# `v + k`. The predicate templates never trap, so the staged view WHERE and the plain AND agree.
+def gen_view_write(seed)
+  rng = Random.new(seed)
+  val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }
+  rows = (1..30).to_a.sample(10, random: rng).sort.map { |id| [id, rng.rand(1..5), val.call] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  plus = ->(a, b) { a.nil? || b.nil? ? nil : a + b }
+  # A predicate over the placeholder `@`, spelled over the view's column and over the base table's.
+  pick = lambda do |view_col, base_col|
+    sql, fn = WHERE_PUSHDOWN_TEMPLATES.sample(random: rng).call("@", rng)
+    [sql.gsub("@", view_col), sql.gsub("@", base_col), fn]
+  end
+  rowsort = lambda do |out, cols, sql, rs|
+    out << "query #{cols} rowsort" << sql << "----"
+    out.concat(rs.map { |r| r.map { |x| lit.call(x) } }.sort.flatten)
+    out << ""
+  end
+  pair = lambda do |out, cols, view_sql, base_sql, rs|
+    out << "# through the view"
+    rowsort.call(out, cols, view_sql, rs)
+    out << "# on the base table — MUST match"
+    rowsort.call(out, cols, base_sql, rs)
+  end
+  cut = rng.rand(1..4)
+  floor = rng.rand(0..15)
+  in_wv = ->(r) { r[1] > cut }
+  in_wv2 = ->(r) { in_wv.call(r) && r[0] > floor }
+
+  out = header(seed, VIEW_WRITE_REQ, "write through an updatable view vs the same write on its base table")
+  %w[vt bt].each do |name|
+    stmt(out, "CREATE TABLE #{name} (id i32 PRIMARY KEY, k i32, v i32)")
+    stmt(out, "INSERT INTO #{name} VALUES #{rows.map { |id, k, v| "(#{id}, #{k}, #{lit.call(v)})" }.join(', ')}")
+  end
+  stmt(out, "CREATE VIEW wv AS SELECT id, k, v, v + k AS s FROM vt WHERE k > #{cut}")
+  stmt(out, "CREATE VIEW wv2 (i, w) AS SELECT id, v FROM wv WHERE id > #{floor}")
+
+  # UPDATE with a predicate over the read-only column s.
+  vs, bs, fs = pick.call("s", "(v + k)")
+  hit = rows.select { |r| in_wv.call(r) && fs.call(plus.call(r[2], r[1])) == true }.map(&:first)
+  rows = rows.map { |id, k, v| hit.include?(id) ? [id, k, plus.call(v, 1)] : [id, k, v] }
+  out << "# UPDATE through a view, a predicate over its read-only column"
+  pair.call(out, "III", "UPDATE wv SET v = v + 1 WHERE #{vs} RETURNING id, v, s",
+            "UPDATE bt SET v = v + 1 WHERE k > #{cut} AND #{bs} RETURNING id, v, v + k",
+            rows.select { |id, _, _| hit.include?(id) }.map { |id, k, v| [id, v, plus.call(v, k)] })
+
+  # UPDATE through the view over a view, renamed by its column list.
+  vw, bw, fw = pick.call("w", "v")
+  hit = rows.select { |r| in_wv2.call(r) && fw.call(r[2]) == true }.map(&:first)
+  rows = rows.map { |id, k, v| hit.include?(id) ? [id, k, 7] : [id, k, v] }
+  out << "# UPDATE through a view over a view"
+  pair.call(out, "II", "UPDATE wv2 SET w = 7 WHERE #{vw} RETURNING i, w",
+            "UPDATE bt SET v = 7 WHERE k > #{cut} AND id > #{floor} AND #{bw} RETURNING id, v",
+            rows.select { |id, _, _| hit.include?(id) }.map { |id, _, v| [id, v] })
+
+  # DELETE through the view over a view.
+  vd, bd, fd = pick.call("w", "v")
+  gone = rows.select { |r| in_wv2.call(r) && fd.call(r[2]) == true }
+  rows -= gone
+  out << "# DELETE through a view over a view"
+  pair.call(out, "II", "DELETE FROM wv2 WHERE #{vd} RETURNING i, w",
+            "DELETE FROM bt WHERE k > #{cut} AND id > #{floor} AND #{bd} RETURNING id, v",
+            gone.map { |id, _, v| [id, v] })
+
+  # INSERT through the view: its WHERE is not checked, so a new row may be one it does not show.
+  fresh = (31..40).to_a.sample(3, random: rng).sort.map { |id| [id, rng.rand(1..5), val.call] }
+  values = fresh.map { |id, k, v| "(#{id}, #{k}, #{lit.call(v)})" }.join(", ")
+  rows = (rows + fresh).sort_by(&:first)
+  out << "# INSERT through a view"
+  pair.call(out, "II", "INSERT INTO wv (id, k, v) VALUES #{values} RETURNING id, s",
+            "INSERT INTO bt (id, k, v) VALUES #{values} RETURNING id, v + k",
+            fresh.map { |id, k, v| [id, plus.call(v, k)] })
+
+  out << "# both tables reach the same contents"
+  %w[vt bt].each do |name|
+    q(out, "III", "SELECT id, k, v FROM #{name} ORDER BY id", rows.flat_map { |r| r.map { |x| lit.call(x) } })
+  end
+  out.join("\n") + "\n"
+end
+
 # Pushdown into grouped bodies and set-operation arms (planner.md §3.2). A conjunct over a grouping
 # column moves below the grouping; a conjunct over a set operation's output moves into every arm. The
 # `+ 0` spelling never moves. Grouped bodies (with HAVING, and joined to u), a ROLLUP body (never
@@ -3147,6 +3239,7 @@ SCENARIOS = {
   "derived_pushdown" => method(:gen_derived_pushdown),
   "grouped_setop_pushdown" => method(:gen_grouped_setop_pushdown),
   "view" => method(:gen_view),
+  "view_write" => method(:gen_view_write),
 }.freeze
 
 # Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per
