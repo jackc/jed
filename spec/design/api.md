@@ -753,6 +753,15 @@ class-23 violations, renders each value through the result-cell text path (64-by
 is withheld when the session lacks `SELECT` on the table whose values it would show
 ([error-fields.md](error-fields.md) §9). It is never appended to the rendered message.
 
+Two more fields locate and explain a mistake in the query text. **`position`** (Rust
+`position: Option<u32>`, Go `Position int32` with `0` absent, TS `position?`) is the 1-based
+**character** offset of the offending token: set on lexer/parser errors (except the class-54 limits),
+on a column reference's `42703`/`42702`/`42P01`, on an unknown INSERT column or SET target, and on an
+unknown FROM table. For `execute_script` it counts from the start of the script. **`hint`** (Rust
+`hint: Option<String>`, Go `Hint`, TS `hint?`) carries PostgreSQL's misspelled-column and table-alias
+suggestions (`Perhaps you meant to reference the column "t.name".`). Both are additive metadata
+([error-fields.md](error-fields.md) §10, §11).
+
 ## 8. Cost ceiling (`max_cost`)
 
 A first-class use case is **safely evaluating untrusted, user-supplied queries** (CLAUDE.md

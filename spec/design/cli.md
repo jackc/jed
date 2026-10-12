@@ -219,8 +219,12 @@ sessions run in `UTC`, where the canonical render equals the session render the 
 unique constraint: t_pkey` — the SQLSTATE inline (errors are structured data, §5/§10),
 prefixed `FILE:LINE: ` in script mode. When the error carries a structured `Detail`
 ([error-fields.md](error-fields.md) §9), a psql-style second line follows, `DETAIL:  Key (id)=(1)
-already exists.` (two spaces after the colon, as psql prints it). The TUI's one-line message log
-appends it inline (`…  DETAIL: Key (id)=(1) already exists.`). CLI-generated hints (a second `hint: ...` line):
+already exists.` (two spaces after the colon, as psql prints it). When the error carries a
+`Position` ([error-fields.md](error-fields.md) §10), psql's error cursor comes first: `LINE n: <the
+statement line holding it>` (`n` counts lines within the statement) and a `^` under the character. An
+engine `Hint` (§11) follows any DETAIL as `HINT:  Perhaps you meant to reference the column "t.name".`.
+The TUI's one-line message log appends Detail and Hint inline (`…  DETAIL: Key (id)=(1) already
+exists.`, `…  HINT: …`). CLI-generated hints (a second `hint: ...` line):
 missing file → `pass --create`; `54P01` → `raise the ceiling with --max-cost`.
 
 ## 6. TUI mode

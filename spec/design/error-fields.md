@@ -10,8 +10,11 @@
 > adopts, modeled on the **pgx `pgconn.PgError`** struct, and how they populate without diverging
 > from PostgreSQL past what jed's design already requires. **Status: landed** (all three cores —
 > Rust `Option<String>` fields, Go `string`, TS optional — via typed constructors + a DML-boundary
-> table stamp, with per-core `error_fields` tests; additive, no format bump). The fifth field,
-> **`Detail`** (the offending values — `Key (id)=(1) already exists.`), is specified in §9.
+> table stamp, with per-core `error_fields` tests; additive, no format bump; `Detail`, `Position`,
+> and `Hint` likewise landed in all three cores, pinned by shared fixtures). The fifth field,
+> **`Detail`** (the offending values — `Key (id)=(1) already exists.`), is specified in §9; the sixth
+> and seventh, **`Position`** (a 1-based character offset into the query) and **`Hint`** (a
+> "Perhaps you meant …" suggestion), in §10 and §11.
 > [api.md](api.md) §7 owns the host-facing error surface; [../errors/registry.toml](../errors/registry.toml)
 > owns the code/template registry.
 
@@ -53,8 +56,8 @@ each mapped to a jed disposition:
 | `ColumnName` | `c` | **added** | column-specific errors (23502 not-null) know it |
 | `DataTypeName` | `d` | **added** | 22003/22001 already template `{type}` |
 | `Detail` | `D` | **added** (§9) | the offending *values*, PostgreSQL's sentences; a structured field only — the rendered message stays one line |
-| `Position` | `P` | **defer** (§7) | cursor offset into the query; real value for 42601, but needs the parser to thread byte positions |
-| `Hint` | `H` | **defer** (§7) | jed errors are terse by design; no hint corpus |
+| `Position` | `P` | **added** (§10) | 1-based character offset of the offending token; set for parse errors and name-resolution errors |
+| `Hint` | `H` | **added** (§11) | PostgreSQL's misspelled-column and misused-alias suggestions; a structured field only |
 | `SchemaName` | `s` | **omit** (map later) | jed has **no schemas** — the qualifier is a *database* ([attached-databases.md](attached-databases.md), [introspection.md](introspection.md) §3). A `DatabaseName` analog is the natural mapping if/when attachment-qualified errors need it. |
 | `Severity` | `S` | **exclude** | jed has one severity (error); no notice/warning channel |
 | `SeverityUnlocalized` | `V` | **exclude** | no localization (single language, determinism) |
@@ -79,8 +82,11 @@ the core's idiom:
 | column | `column_name: Option<String>` | `ColumnName string` | `columnName?: string` |
 | data type | `data_type_name: Option<String>` | `DataTypeName string` | `dataTypeName?: string` |
 | detail (§9) | `detail: Option<String>` | `Detail string` | `detail?: string` |
+| position (§10) | `position: Option<u32>` | `Position int32` | `position?: number` |
+| hint (§11) | `hint: Option<String>` | `Hint string` | `hint?: string` |
 
-**Absence representation is idiomatic per core** — Rust `None`, Go `""`, TS `undefined` — matching
+**Absence representation is idiomatic per core** — Rust `None`, Go `""` (and `0` for `Position`, as
+in pgx), TS `undefined` — matching
 pgx's own choice (`string` zero-value `""`) for Go. This is not a cross-core divergence in any
 observable sense: the conformance corpus matches on `code` only (§8), so the fields are never
 cross-checked byte-for-byte the way values on disk are; they are a host-API ergonomic, checked by
@@ -166,10 +172,9 @@ error surface.
 ## 7. Deferred and open
 
 - **`Detail`** — no longer deferred; specified in §9.
-- **`Position`.** A 1-based cursor offset into the query for syntax/name errors (42601/42703). High
-  value for tooling, but needs the hand-written parsers to thread byte positions through — a real
-  plumbing cost, separable from this note.
-- **`Hint`.** Deferred; jed's errors are intentionally terse and there is no hint corpus.
+- **`Position`** — no longer deferred; specified in §10.
+- **`Hint`** — no longer deferred; specified in §11 for the two suggestion families. Other PostgreSQL
+  hints (`42883`'s "You might need to add explicit type casts.", the LATERAL hints) remain open.
 - **`DatabaseName` (the `SchemaName` analog).** jed qualifies by database, not schema. If
   attachment-qualified errors ever need to name the database, this is the additive field to add;
   not motivated yet.
@@ -338,3 +343,153 @@ envelope, the failing statement, the expected code, and the expected `Detail` (o
 core's `error_fields` test runs every case. The fixture's expected texts were captured from
 PostgreSQL 18 wherever a PostgreSQL equivalent exists. The cases that differ by design (truncated keys,
 privilege-gated forms, expression labels) are marked in the fixture.
+
+## 10. `Position` — where in the query
+
+PostgreSQL's `P` field is a cursor into the statement: `SELECT nope FROM t` fails with `42703` at
+position 8. A query tool uses it to underline the offending text, which matters most for ad-hoc
+query surfaces (CLAUDE.md §13). jed adds it as a sixth structured field.
+
+### 10.1 Unit and origin
+
+- **1-based, in characters.** Position `1` is the first character of the statement text. A character
+  is a Unicode code point, so `é` counts once whatever its UTF-8 or UTF-16 width. This is
+  PostgreSQL's unit (the protocol's "positions are measured in characters not bytes"). Each core
+  converts its native index (Rust/Go bytes, TS UTF-16 code units) when it records a token.
+- **End of input is length + 1.** An error detected at end of input points one past the last
+  character, as PostgreSQL's `at end of input` does (`SELECT 1 +` → `11`).
+- **Relative to the text the host passed.** For `execute`, `query`, and `prepare` that is the one
+  statement. For `execute_script` it is the whole script: the statement's position is shifted by the
+  number of characters before the statement's span, as PostgreSQL does for a multi-statement simple
+  query. A host that runs `split_statements` itself gets positions relative to each span's text.
+- **Absent** (`None`/`0`/`undefined`) when the error has no source location. In particular, text jed
+  stored itself never yields a position: a view body, a CHECK, DEFAULT, or index expression, or any
+  other catalog text re-parsed from storage, is parsed without positions. A position into text the
+  host never wrote would be misleading. The one re-parse that keeps positions is `CREATE VIEW`'s
+  validation of the body it is creating: the canonical body text re-lexes to the statement's own
+  body tokens one for one, so each token keeps its position in the statement. The body jed then
+  stores is parsed again without positions.
+
+### 10.2 Which errors carry it
+
+| raised by | SQLSTATEs | position of |
+|---|---|---|
+| the lexer | every code except class 54 | the first character of the lexeme being scanned (the opening `'` of an unterminated string, the `/*` of an unterminated comment, the bad character) |
+| the parser | every code except class 54 | the token at which the parse stopped (§10.3) |
+| a column reference in an expression (select list, WHERE, ON, GROUP BY, HAVING, ORDER BY, RETURNING, SET values, …) | `42703`, `42702`, `42P01` | the reference's first character — the qualifier of `t.c` |
+| an `INSERT` column-list name or an `UPDATE … SET` / `ON CONFLICT DO UPDATE SET` target | `42703` | the column name |
+| a FROM-clause table or view name | `42P01` | the name — the database qualifier of `db.t` |
+
+The class-54 program limits (`54000` statement too long, `54001` nesting too deep) are resource
+limits, not mistakes at a place, and carry no position (PostgreSQL's stack-depth error has none).
+Every other error leaves the field absent. PostgreSQL positions more resolver errors than this
+(`42883` function lookup, `42804` operand types, `22P02` literal input); each is purely additive
+here, needing only the node's recorded position.
+
+A position is stamped by the **innermost** site that knows one. A column-reference error raised
+inside a subquery keeps the subquery's reference's position; an outer wrapper never overwrites it.
+
+### 10.3 The parser's error token
+
+PostgreSQL's grammar reports a syntax error "at or near" the lookahead token: the first token that
+cannot continue a valid statement prefix. jed's recursive-descent parsers identify the same token as
+the **furthest token the parser examined** before failing, counting the current token (`peek`) and
+each consumed token (`advance`) but not lookahead probes (`peek_at(n)` at any offset, including 0)
+or the precomputed parenthesized-query table. "Furthest" rather than "last" keeps backtracking honest: a
+speculative parse that rewinds (an INSERT value slot re-parsed as an expression) cannot pull the
+position backward.
+
+For an error the parser raises after reading a construct (a duplicate option, an out-of-range integer
+literal, a deferred `0A000` form), the same rule applies: the position is the furthest token read.
+That is usually the token just past the construct, where PostgreSQL would name the construct
+itself; the code and message are unaffected.
+
+The three parsers are hand-mirrored, so they examine tokens in the same order and agree on the
+position by construction. The shared fixture (§10.5) pins it.
+
+### 10.4 Representation in the AST
+
+Each core records, per token, its 1-based character position, beside the token stream. The parser
+copies a position into the AST nodes that name things: a column reference (bare and qualified), an
+`ORDER BY` column key, an `INSERT` column-list name, an `UPDATE` / `DO UPDATE` `SET` target, and a
+FROM table reference. These positions are **invisible to AST equality**, like the existing view-rewrite
+token positions (`TableRefPos`, `StarPos`, views.md §5): `a + b` written twice still matches as a GROUP
+BY expression. A parse of stored text records no positions (§10.1).
+
+A column-reference error is stamped where the resolver resolves that node: the error's position is
+set from the node when the error is `42703`, `42702`, or `42P01` and has no position yet.
+
+### 10.5 Testing
+
+The corpus cannot assert a structured field (§8). A shared fixture,
+[../errors/position_cases.txt](../errors/position_cases.txt), lists cases in the `detail_cases.txt`
+format with `position:` and `hint:` directives. Each core's `error_fields` test runs every case. The
+expected positions are PostgreSQL 18's for the same statement wherever jed rejects the statement at
+the same token; a case where jed's token surface differs is marked `# jed:`.
+
+## 11. `Hint` — "Perhaps you meant …"
+
+PostgreSQL attaches a HINT to an unknown column when a column of a similar name is in scope:
+`SELECT nme FROM t` → `Perhaps you meant to reference the column "t.name".`. It is the most useful hint
+for an ad-hoc query tool, and it is deterministic (an edit distance over the catalog names in scope).
+jed adds `Hint` as a seventh structured field and populates it for two families. Like `Detail`, it is
+never appended to the rendered message (§9.1); the CLI prints it as psql's `HINT:  …` line.
+
+### 11.1 Misspelled column (`42703` on a column reference)
+
+The hint uses PostgreSQL's `errorMissingColumn` search (`parse_relation.c`) exactly:
+
+1. **Candidates.** Walk the scope chain from the reference's own query level outward. At each level
+   visit the FROM relations in FROM order, then the inner relations of an unaliased parenthesized
+   join. Skip a relation with no label. Within a relation visit its columns in ordinal order (a write
+   through a view: the view's columns). Each candidate is `(label, column)`.
+2. **Relation penalty.** For a qualified reference `q.c`, a relation's penalty is the Levenshtein
+   distance (insert, delete, substitute all cost 1, over characters) from `q` to its label. For a bare
+   reference the penalty is 0.
+3. **State.** Start with `distance = 4` (PostgreSQL's `MAX_FUZZY_DISTANCE + 1`) and no first or second
+   match. For each candidate, in order:
+   - skip it when `penalty > distance`;
+   - let `d` be the Levenshtein distance from the candidate column to `c`; skip it when
+     `d > len(c) / 2` (integer division, `len` in **bytes**, as PostgreSQL's `strlen`);
+   - let `d' = d + penalty`;
+   - if `d' < distance`: `distance = d'`, first = this candidate, second = none;
+   - else if `d' == distance`: if there is a second match, clear both (three equal candidates are too
+     many; `distance` stays); else if there is a first match, second = this candidate.
+4. **An exact match.** A candidate with `penalty == 0` and `d == 0` exists only when the column is in
+   scope but unreachable from here (a qualifier-only relation). PostgreSQL then raises a different
+   error with its own detail; jed gives **no hint** for such a reference.
+5. **Text.** One match: `Perhaps you meant to reference the column "{label}.{column}".`. Two:
+   `Perhaps you meant to reference the column "{l1}.{c1}" or the column "{l2}.{c2}".`. None: no hint.
+   Names are inserted verbatim inside the double quotes (PostgreSQL's `"%s.%s"`, not `quote_ident`).
+
+A computed distance above the bound is never used, so an implementation may compute the full
+distance instead of PostgreSQL's bounded `varstr_levenshtein_less_equal`; the outcome is identical.
+
+Only a column-reference `42703` (the §10.2 expression row) gets this hint. A misspelled `INSERT`
+column-list name or `SET` target does not, matching PostgreSQL.
+
+### 11.2 Table name used instead of its alias (`42P01` on a qualifier)
+
+`SELECT t.a FROM t f` names the table, not its alias `f`. When a qualifier matches no relation label
+in the scope chain, but a base table or view reference in that chain has the qualifier as its
+**catalog name** and a different label, the hint is
+`Perhaps you meant to reference the table alias "{label}".` (the first such relation in the §11.1
+order). PostgreSQL also rewords this message to "invalid reference to FROM-clause entry for table";
+jed keeps its message (informational, and stable for the corpus).
+
+### 11.3 Determinism and divergences
+
+The hint is built after the error is decided, from names already in scope. It is unmetered and never
+changes the error code, cost, or abort point. Its text is cross-core identical: it depends only on
+catalog names and the fixed walk order.
+
+Recorded divergences from PostgreSQL:
+
+- jed's scope holds only relations a reference can see. PostgreSQL's range table also holds relations
+  the reference cannot see (a non-LATERAL sibling, a sibling join's inner table), which it searches and
+  reports with a LATERAL or "cannot be referenced from this part of the query" hint. jed offers no
+  hint in those cases.
+- PostgreSQL visits an unaliased join's inner relations at their place in the range table; jed visits
+  them after the level's FROM relations. This can change which of two equally close candidates is
+  named first.
+- Every other PostgreSQL hint is absent (§7).

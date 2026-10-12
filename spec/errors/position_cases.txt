@@ -1,0 +1,402 @@
+# Shared error Position + Hint cases (spec/design/error-fields.md §10.5, §11).
+#
+# Every core's error_fields test runs every case and asserts the failing statement's SQLSTATE, its
+# structured Position field, and its structured Hint field. The corpus cannot assert a structured
+# field, so this one language-neutral file stands in for three hand-mirrored test lists
+# (CLAUDE.md §5/§10).
+#
+# Format: line-oriented, like detail_cases.txt. A case starts at `case: <name>` and ends at the next
+# `case:` or end of file. Blank lines and lines starting with `#` are ignored. Directives:
+#
+#   setup: <sql>     run with the default session; repeatable
+#   run: <sql>       the statement that must fail (one statement, through `query`)
+#   script: <sql>    instead of `run:`: a multi-statement script run through `execute_script`
+#   code: <sqlstate> its SQLSTATE
+#   position: <n>    its exact 1-based character Position
+#   no-position      instead of `position:`: the Position field must be absent
+#   hint: <text>     its exact Hint (to end of line); when no `hint:` line is given, the Hint must be
+#                    absent
+#
+# Expected values are PostgreSQL 18's wherever PostgreSQL rejects the same statement at the same
+# token. A case marked `# jed:` has no PostgreSQL equivalent or differs from it by design.
+
+# --- lexer ----------------------------------------------------------------------------------------
+
+case: unterminated string literal
+run: SELECT 'abc
+code: 42601
+position: 8
+
+case: unterminated block comment
+run: SELECT 1 /* x
+code: 42601
+position: 10
+
+case: unterminated quoted identifier
+run: SELECT "abc
+code: 42601
+position: 8
+
+case: zero-length quoted identifier
+run: SELECT ""
+code: 42601
+position: 8
+
+# --- parser ---------------------------------------------------------------------------------------
+
+case: end of input
+run: SELECT 1 +
+code: 42601
+position: 11
+
+case: end of input after FROM
+run: SELECT * FROM
+code: 42601
+position: 14
+
+case: end of input after WHERE
+run: SELECT 1 FROM t WHERE
+code: 42601
+position: 22
+
+case: end of input in parentheses
+run: SELECT ( 1
+code: 42601
+position: 11
+
+case: end of input in VALUES
+run: INSERT INTO t VALUES (1,
+code: 42601
+position: 25
+
+case: end of input after ORDER
+run: SELECT a FROM t ORDER
+code: 42601
+position: 22
+
+case: end of input after SET
+run: UPDATE t SET a =
+code: 42601
+position: 17
+
+case: unexpected token
+run: SELECT 1 2
+code: 42601
+position: 10
+
+case: unknown leading keyword
+run: SELEC 1
+code: 42601
+position: 1
+
+case: trailing comma in a column list
+run: CREATE TABLE t (a int,)
+code: 42601
+position: 23
+
+case: positions count characters, not bytes
+run: SELECT 'é' + , 2
+code: 42601
+position: 14
+
+# jed: PostgreSQL reads 99999999999999999999 as a numeric literal; jed's integer literal is capped.
+case: integer literal out of range
+run: SELECT 99999999999999999999
+code: 42601
+position: 8
+
+# --- column references ----------------------------------------------------------------------------
+
+case: unknown bare column
+setup: CREATE TABLE t (a int, b int)
+run: SELECT nope FROM t
+code: 42703
+position: 8
+
+case: unknown qualified column
+setup: CREATE TABLE t (a int, b int)
+run: SELECT t.nope FROM t
+code: 42703
+position: 8
+
+case: unknown qualifier
+setup: CREATE TABLE t (a int, b int)
+run: SELECT x.a FROM t
+code: 42P01
+position: 8
+
+case: unknown qualifier later in WHERE
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t WHERE t.a = 1 AND x.b = 2
+code: 42P01
+position: 35
+
+case: ambiguous column
+setup: CREATE TABLE t (a int, b int)
+setup: CREATE TABLE u (a int, c int)
+run: SELECT a FROM t, u
+code: 42702
+position: 8
+
+case: column in WHERE
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t WHERE nope = 1
+code: 42703
+position: 23
+
+case: column in a scalar subquery
+setup: CREATE TABLE t (a int, b int)
+run: SELECT (SELECT nope) FROM t
+code: 42703
+position: 16
+
+case: column in JOIN ON
+setup: CREATE TABLE t (a int, b int)
+setup: CREATE TABLE u (c int)
+run: SELECT * FROM t JOIN u ON nope = 1
+code: 42703
+position: 27
+
+case: column in GROUP BY
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t GROUP BY nope
+code: 42703
+position: 26
+
+case: column in ORDER BY
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t ORDER BY nope
+code: 42703
+position: 26
+
+case: column in RETURNING
+setup: CREATE TABLE t (a int, b int)
+run: INSERT INTO t VALUES (1, 2) RETURNING nope
+code: 42703
+position: 39
+
+case: column in DELETE WHERE
+setup: CREATE TABLE t (a int, b int)
+run: DELETE FROM t WHERE nope = 1
+code: 42703
+position: 21
+
+case: column in a CHECK constraint
+run: CREATE TABLE c (a int CHECK (nope > 0))
+code: 42703
+position: 30
+
+case: column position counts characters
+setup: CREATE TABLE t (a int, b int)
+run: SELECT 'é', aa FROM t
+code: 42703
+position: 13
+hint: Perhaps you meant to reference the column "t.a".
+
+case: column in a view body
+setup: CREATE TABLE t (name int)
+run: CREATE VIEW v AS SELECT 1, nme FROM t
+code: 42703
+position: 28
+hint: Perhaps you meant to reference the column "t.name".
+
+case: column in a view body's WHERE with a star
+setup: CREATE TABLE t (name int)
+run: CREATE VIEW v AS SELECT * FROM t WHERE nme = 1
+code: 42703
+position: 40
+hint: Perhaps you meant to reference the column "t.name".
+
+case: column of a view
+setup: CREATE TABLE t (name int)
+setup: CREATE VIEW w AS SELECT name FROM t
+run: SELECT nme FROM w
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "w.name".
+
+# --- write targets --------------------------------------------------------------------------------
+
+case: INSERT column list
+setup: CREATE TABLE t (a int, b int)
+run: INSERT INTO t (a, nope) VALUES (1, 2)
+code: 42703
+position: 19
+
+case: INSERT column list gets no hint
+setup: CREATE TABLE t (abc int, b int)
+run: INSERT INTO t (abd) VALUES (1)
+code: 42703
+position: 16
+
+case: UPDATE SET target
+setup: CREATE TABLE t (a int, b int)
+run: UPDATE t SET nope = 1
+code: 42703
+position: 14
+
+case: UPDATE SET target gets no hint
+setup: CREATE TABLE t (abc int, b int)
+run: UPDATE t SET abd = 1
+code: 42703
+position: 14
+
+case: ON CONFLICT DO UPDATE SET target
+setup: CREATE TABLE t (id int PRIMARY KEY, abc int)
+run: INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET abd = 1
+code: 42703
+position: 60
+
+# --- FROM relations -------------------------------------------------------------------------------
+
+case: unknown relation
+run: SELECT * FROM nope
+code: 42P01
+position: 15
+
+# jed: `main` is jed's default database where PostgreSQL's equivalent is the `public` schema.
+case: unknown database-qualified relation
+run: SELECT * FROM main.nope
+code: 42P01
+position: 15
+
+case: unknown relation after a comma
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t, nope
+code: 42P01
+position: 18
+
+# --- misspelled-column hints ----------------------------------------------------------------------
+
+case: hint one close column
+setup: CREATE TABLE t (name int, b int)
+run: SELECT nme FROM t
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "t.name".
+
+case: hint two equally close columns
+setup: CREATE TABLE t (abc int, abd int)
+run: SELECT abx FROM t
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "t.abc" or the column "t.abd".
+
+case: hint three equally close columns is none
+setup: CREATE TABLE t (ab int, ac int, ad int)
+run: SELECT ax FROM t
+code: 42703
+position: 8
+
+case: hint over half the characters differ is none
+setup: CREATE TABLE t (a int)
+run: SELECT b FROM t
+code: 42703
+position: 8
+
+case: hint prefers the closer column
+setup: CREATE TABLE t (customer_id int, customer_name text)
+run: SELECT customer FROM t
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "t.customer_id".
+
+case: hint long misspelling
+setup: CREATE TABLE t (customer_name int, b int)
+run: SELECT customer_nam FROM t
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "t.customer_name".
+
+case: hint across relations
+setup: CREATE TABLE t (abc int, b int)
+setup: CREATE TABLE u (abd int)
+run: SELECT abx FROM t, u
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "t.abc" or the column "u.abd".
+
+case: hint qualified
+setup: CREATE TABLE t (name int, b int)
+run: SELECT t.nme FROM t
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "t.name".
+
+case: hint qualified by alias
+setup: CREATE TABLE t (abc int, b int)
+run: SELECT * FROM t x WHERE x.abd = 1
+code: 42703
+position: 25
+hint: Perhaps you meant to reference the column "x.abc".
+
+case: hint qualified names another relation
+setup: CREATE TABLE t (a int, b int)
+setup: CREATE TABLE u (c int)
+run: SELECT t.c FROM t, u
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "u.c".
+
+case: hint from an outer query level
+setup: CREATE TABLE t (name int)
+setup: CREATE TABLE u (c int)
+run: SELECT (SELECT nme FROM u) FROM t
+code: 42703
+position: 16
+hint: Perhaps you meant to reference the column "t.name".
+
+case: hint names both query levels
+setup: CREATE TABLE t (abc int, b int)
+run: SELECT abc FROM t WHERE abc IN (SELECT abd FROM t)
+code: 42703
+position: 40
+hint: Perhaps you meant to reference the column "t.abc" or the column "t.abc".
+
+case: hint inside a derived table
+setup: CREATE TABLE t (abc int, b int)
+run: SELECT * FROM (SELECT abd FROM t) s
+code: 42703
+position: 23
+hint: Perhaps you meant to reference the column "t.abc".
+
+case: hint on a derived table's columns
+setup: CREATE TABLE t (abc int, b int)
+run: SELECT s.abx FROM (SELECT abc FROM t) s
+code: 42703
+position: 8
+hint: Perhaps you meant to reference the column "s.abc".
+
+case: hint in ORDER BY
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t ORDER BY aa
+code: 42703
+position: 26
+hint: Perhaps you meant to reference the column "t.a".
+
+# --- table-alias hint -----------------------------------------------------------------------------
+
+case: hint table name instead of alias
+setup: CREATE TABLE t (abc int, b int)
+run: SELECT * FROM t x WHERE t.abc = 1
+code: 42P01
+position: 25
+hint: Perhaps you meant to reference the table alias "x".
+
+case: no alias hint for an unrelated qualifier
+setup: CREATE TABLE t (abc int, b int)
+run: SELECT * FROM t x WHERE y.abc = 1
+code: 42P01
+position: 25
+
+# --- scripts --------------------------------------------------------------------------------------
+
+case: script position counts from the start of the script
+script: CREATE TABLE s (a int); SELECT nope FROM s
+code: 42703
+position: 32
+
+case: script parse error position
+script: CREATE TABLE s (a int); SELECT 1 +
+code: 42601
+position: 35
