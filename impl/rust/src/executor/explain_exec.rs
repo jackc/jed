@@ -398,6 +398,10 @@ impl Engine {
         depth: i64,
         bindings: &[&CteBinding],
     ) -> Result<()> {
+        // A write through an updatable view renders its base-table statement (views.md §15.5).
+        let mut ins = ins.clone();
+        self.rewrite_insert_target(&mut ins)?;
+        let ins = &ins;
         if self.table(&ins.table).is_none() {
             return Err(EngineError::new(
                 SqlState::UndefinedTable,
@@ -429,19 +433,24 @@ impl Engine {
         depth: i64,
         bindings: &[&CteBinding],
     ) -> Result<()> {
+        // A write through an updatable view renders its base-table statement (views.md §15.5).
+        let mut upd = upd.clone();
+        let vw = self.rewrite_update_target(&mut upd)?;
+        let upd = &upd;
         let table = self.table(&upd.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", upd.table),
             )
         })?;
-        let filter = self.explain_dml_filter(table, upd.filter.as_ref(), bindings)?;
+        let filter = self.explain_dml_filter(table, upd.filter.as_ref(), bindings, vw.as_ref())?;
         r.emit(
             depth,
             format!("Update {}", upd.table),
             format!("sets={}", upd.assignments.len()),
         );
-        let mask = self.explain_update_touched(table, upd, filter.as_ref(), bindings)?;
+        let mask =
+            self.explain_update_touched(table, upd, filter.as_ref(), bindings, vw.as_ref())?;
         self.render_dml_scan(r, table, &upd.table, filter.as_ref(), &mask, depth + 1);
         Ok(())
     }
@@ -455,36 +464,40 @@ impl Engine {
         depth: i64,
         bindings: &[&CteBinding],
     ) -> Result<()> {
+        // A write through an updatable view renders its base-table statement (views.md §15.5).
+        let mut del = del.clone();
+        let vw = self.rewrite_delete_target(&mut del)?;
+        let del = &del;
         let table = self.table(&del.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", del.table),
             )
         })?;
-        let filter = self.explain_dml_filter(table, del.filter.as_ref(), bindings)?;
+        let filter = self.explain_dml_filter(table, del.filter.as_ref(), bindings, vw.as_ref())?;
         r.emit(depth, format!("Delete {}", del.table), "-");
-        let mask = self.explain_delete_touched(table, del, filter.as_ref(), bindings)?;
+        let mask =
+            self.explain_delete_touched(table, del, filter.as_ref(), bindings, vw.as_ref())?;
         self.render_dml_scan(r, table, &del.table, filter.as_ref(), &mask, depth + 1);
         Ok(())
     }
 
     /// Resolve an UPDATE/DELETE WHERE predicate against a single-table scope (the same prologue the
-    /// executors use), or `None` for a bare (no-WHERE) statement.
+    /// executors use), or `None` for a bare (no-WHERE) statement. A write through a view puts its
+    /// views' WHERE clauses first (views.md §15.2).
     pub(crate) fn explain_dml_filter(
         &self,
         table: &Table,
         where_: Option<&Expr>,
         bindings: &[&CteBinding],
+        vw: Option<&ViewWrite>,
     ) -> Result<Option<RExpr>> {
-        match where_ {
-            None => Ok(None),
-            Some(p) => {
-                let mut scope = Scope::single(self, table);
-                scope.ctes = bindings;
-                let mut ptypes = ParamTypes::default();
-                Ok(Some(resolve_boolean_filter(&scope, p, &mut ptypes)?))
-            }
-        }
+        let mut scope = Scope::write_target(self, table, vw);
+        scope.ctes = bindings;
+        let mut ptypes = ParamTypes::default();
+        Ok(self
+            .resolve_write_filter(&scope, table, vw, where_, &mut ptypes)?
+            .0)
     }
 
     /// Emit the residual Filter (when present) and the target Scan for an UPDATE/DELETE, choosing the
@@ -527,6 +540,7 @@ impl Engine {
         del: &Delete,
         filter: Option<&RExpr>,
         bindings: &[&CteBinding],
+        vw: Option<&ViewWrite>,
     ) -> Result<Vec<bool>> {
         let mut mask = vec![false; table.columns.len()];
         if let Some(filter) = filter {
@@ -539,6 +553,7 @@ impl Engine {
                 true,
                 bindings,
                 &mut ParamTypes::default(),
+                vw,
             )?;
             let mut ret_mask = vec![false; 2 * mask.len()];
             for node in &nodes {
@@ -557,12 +572,13 @@ impl Engine {
         upd: &Update,
         filter: Option<&RExpr>,
         bindings: &[&CteBinding],
+        vw: Option<&ViewWrite>,
     ) -> Result<Vec<bool>> {
         let mut mask = vec![false; table.columns.len()];
         if let Some(filter) = filter {
             collect_touched(filter, 0, &mut mask);
         }
-        let mut scope = Scope::single(self, table);
+        let mut scope = Scope::write_target(self, table, vw);
         scope.ctes = bindings;
         let mut ptypes = ParamTypes::default();
         let mut assigned = vec![false; mask.len()];
@@ -610,7 +626,7 @@ impl Engine {
         }
         if let Some(items) = &upd.returning {
             let (nodes, _, _) =
-                self.resolve_returning(&upd.table, items, false, bindings, &mut ptypes)?;
+                self.resolve_returning(&upd.table, items, false, bindings, &mut ptypes, vw)?;
             let n = mask.len();
             let mut ret_mask = vec![false; 2 * n];
             for node in &nodes {

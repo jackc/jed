@@ -1007,7 +1007,25 @@ pub(crate) fn resolve_projections(
             }
             // The RETURNING `old`/`new` pseudo-relations are qualifier-only: `*` expands the
             // real relations' columns exactly as before (grammar.md §32).
-            for rel in scope.rels.iter().filter(|r| !r.qualifier_only) {
+            for (ri, rel) in scope
+                .rels
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.qualifier_only)
+            {
+                // A write through a view returns the view's columns (views.md §15.2).
+                if rel.layer.is_some() {
+                    push_layer_columns(
+                        scope,
+                        ri,
+                        agg,
+                        &mut nodes,
+                        &mut names,
+                        &mut types,
+                        &mut derivs,
+                    )?;
+                    continue;
+                }
                 for (i, c) in rel.table.columns.iter().enumerate() {
                     let idx = rel.offset + i;
                     if scope.hidden.contains(&idx) {
@@ -1033,6 +1051,23 @@ pub(crate) fn resolve_projections(
                 // (like bare `*`); an unknown label is 42P01, exactly as a qualified column ref.
                 if let Expr::QualifiedStar { qualifier, pos } = &it.expr {
                     let want = qualifier.to_string();
+                    // `v.*` (or `old.*` / `new.*`) over a write through a view (views.md §15.2).
+                    if let Some(ri) = scope
+                        .rels
+                        .iter()
+                        .position(|r| r.label == want && r.layer.is_some())
+                    {
+                        push_layer_columns(
+                            scope,
+                            ri,
+                            agg,
+                            &mut nodes,
+                            &mut names,
+                            &mut types,
+                            &mut derivs,
+                        )?;
+                        continue;
+                    }
                     let (table, slots): (&Table, Vec<usize>) =
                         match scope.rels.iter().find(|r| r.label == want) {
                             Some(rel) => (
@@ -1124,6 +1159,29 @@ pub(crate) fn resolve_projections(
             Ok((nodes, names, types, derivs))
         }
     }
+}
+
+/// Expand a layered relation's `*` (a write through a view, views.md §15.2): each of the view's
+/// columns, by name, resolved through the layer.
+fn push_layer_columns(
+    scope: &Scope,
+    rel: usize,
+    agg: &mut AggCtx,
+    nodes: &mut Vec<RExpr>,
+    names: &mut Vec<String>,
+    types: &mut Vec<ResolvedType>,
+    derivs: &mut Vec<Deriv>,
+) -> Result<()> {
+    let layer = scope.rels[rel].layer.expect("a layered relation");
+    for (col, c) in layer.columns.iter().enumerate() {
+        let r = Resolved::Layer { level: 0, rel, col };
+        let (node, ty) = resolve_column_ref(scope, agg, r, &c.name)?;
+        nodes.push(node);
+        names.push(c.name.clone());
+        types.push(ty);
+        derivs.push(cat_column_deriv(c));
+    }
+    Ok(())
 }
 
 /// The output column name of an un-aliased select item (spec/design/grammar.md §8/§15): a
@@ -3144,6 +3202,7 @@ pub(crate) fn resolve_column_ref(
             let ty = resolved_type_of_col(&scope.column_of(r).ty, scope.catalog);
             Ok((RExpr::OuterColumn { level, index }, ty))
         }
+        Resolved::Layer { level, rel, col } => resolve_layer_ref(scope, agg, level, rel, col, name),
     }
 }
 

@@ -1821,6 +1821,7 @@ impl Engine {
                 base: false,
                 cte: None,
                 db: db.map(str::to_owned),
+                layer: None,
             };
             let candidates = inventory_scan_candidates(Some(f), &rel, self);
             let estimates = estimate_scan_candidates(&candidates, &rel, self, false);
@@ -6698,6 +6699,7 @@ mod candidate_inventory_tests {
             base: false,
             cte: None,
             db: None,
+            layer: None,
         };
         let candidates = inventory_scan_candidates(Some(&filter), &rel, &db);
         let got: Vec<String> = candidates

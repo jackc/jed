@@ -50,7 +50,7 @@ pub(crate) fn resolve_group_named(
     match term {
         Expr::Column(name) => match scope.resolve_bare(name) {
             Ok(Resolved::Local(idx)) => Ok(GroupKeyResolved::Column(idx)),
-            Ok(Resolved::Outer { .. }) => Err(EngineError::new(
+            Ok(Resolved::Outer { .. } | Resolved::Layer { .. }) => Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "GROUP BY may not reference an outer query column",
             )),
@@ -67,7 +67,7 @@ pub(crate) fn resolve_group_named(
         Expr::QualifiedColumn { qualifier, name } => {
             match scope.resolve_qualified(qualifier, name)? {
                 Resolved::Local(idx) => Ok(GroupKeyResolved::Column(idx)),
-                Resolved::Outer { .. } => Err(EngineError::new(
+                Resolved::Outer { .. } | Resolved::Layer { .. } => Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "GROUP BY may not reference an outer query column",
                 )),
@@ -1949,7 +1949,7 @@ pub(crate) fn resolve_grouping(
         };
         let idx = match r {
             Resolved::Local(idx) => idx,
-            Resolved::Outer { .. } => return Err(grouping_arg_err()),
+            Resolved::Outer { .. } | Resolved::Layer { .. } => return Err(grouping_arg_err()),
         };
         match group_keys.iter().position(|&g| g == idx) {
             Some(p) => positions.push(p),

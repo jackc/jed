@@ -404,30 +404,6 @@ impl Engine {
         Ok(())
     }
 
-    /// A DML target that is a view is 55000 (views.md §2): every view is non-updatable in this
-    /// slice. Checked when the target is resolved, before any column, value, or RETURNING check.
-    pub(crate) fn check_view_write(&self, db: Option<&str>, name: &str, verb: &str) -> Result<()> {
-        let snap = match db {
-            None => {
-                if self.table(name).is_some() {
-                    return Ok(());
-                }
-                self.read_snap()
-            }
-            Some(q) => match self.snap_for_scope(q) {
-                Some(snap) => snap,
-                None => return Ok(()),
-            },
-        };
-        if snap.table(name).is_none() && snap.view(name).is_some() {
-            return Err(EngineError::new(
-                SqlState::ObjectNotInPrerequisiteState,
-                format!("cannot {verb} view \"{name}\""),
-            ));
-        }
-        Ok(())
-    }
-
     /// Every view of the main database in dependency order: a view after every view it reads,
     /// ties in name byte order (views.md §11 — the CLI dump order).
     pub(crate) fn views_in_dependency_order(&self) -> Vec<ViewDef> {
@@ -1014,15 +990,22 @@ impl Engine {
         }
     }
 
-    /// Add the functions called in the bodies of the views a statement reads (transitively) to its
-    /// privilege requirements (views.md §9): function EXECUTE is the reader's, as for a derived
-    /// table. The relations inside a body are NOT added — the view is the privilege boundary.
+    /// Add the functions called in the bodies of the views a statement reads or writes through
+    /// (transitively) to its privilege requirements (views.md §9, §15.4): function EXECUTE is the
+    /// reader's or writer's, as for a derived table. The relations inside a body are NOT added — the
+    /// view is the privilege boundary.
     pub(crate) fn collect_view_function_privs(&self, req: &mut PrivReq) {
         if self.read_snap().views.is_empty() {
             return;
         }
+        let mut pending = req.relations.clone();
+        for (name, p) in &req.tables {
+            if matches!(p, Privilege::Insert | Privilege::Update | Privilege::Delete) {
+                pending.push((None, name.clone()));
+            }
+        }
         let mut functions = Vec::new();
-        self.walk_read_views(req.relations.clone(), |_, body| {
+        self.walk_read_views(pending, |_, body| {
             functions.extend(body.functions.iter().cloned());
             false
         });

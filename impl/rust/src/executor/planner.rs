@@ -472,6 +472,7 @@ impl Engine {
                 base: fr.src.is_base(),
                 cte: fr.src.cte(),
                 db: fr.db.clone(),
+                layer: None,
             })
             .collect();
 
@@ -661,6 +662,7 @@ impl Engine {
                             base: false,
                             cte: None,
                             db: None,
+                            layer: None,
                         })
                         .collect(),
                     parent: None,
@@ -1107,12 +1109,13 @@ impl Engine {
             };
 
             match target {
-                Target::Slot(Resolved::Outer { level, index }) => {
+                Target::Slot(r @ (Resolved::Outer { .. } | Resolved::Layer { .. })) => {
                     // A correlated (outer) column ORDER BY key — the local sort row has no slot for an
                     // enclosing-query column, so materialize it as an OuterColumn expression evaluated per
                     // row against the outer-row environment (query.order_by_correlated), exactly like a
                     // general-expression key. PostgreSQL accepts it (a degenerate constant leading key).
-                    let r = Resolved::Outer { level, index };
+                    // A column of a view being written through is its column or select item (views.md
+                    // §15.2), also an outer value here.
                     if scope.column_of(r).ty.is_json() {
                         return Err(EngineError::new(
                             SqlState::UndefinedFunction,
@@ -1131,14 +1134,31 @@ impl Engine {
                         }
                         None => column_collation(&scope, r)?,
                     };
+                    let node = match r {
+                        Resolved::Outer { level, index } => RExpr::OuterColumn { level, index },
+                        Resolved::Layer { level, rel, col } => {
+                            resolve_layer_ref(
+                                &scope,
+                                &AggCtx::Forbidden,
+                                level,
+                                rel,
+                                col,
+                                &key.column,
+                            )?
+                            .0
+                        }
+                        Resolved::Local(_) => unreachable!("matched above"),
+                    };
                     let k = order_exprs.len();
-                    order_exprs.push(RExpr::OuterColumn { level, index });
+                    order_exprs.push(node);
                     order.push((ORDER_EXPR_BASE + k, key.descending, key.nulls_first, coll));
                 }
                 Target::Slot(r) => {
                     let idx = match r {
                         Resolved::Local(i) => i,
-                        Resolved::Outer { .. } => unreachable!("the outer slot is handled above"),
+                        Resolved::Outer { .. } | Resolved::Layer { .. } => {
+                            unreachable!("the outer slot is handled above")
+                        }
                     };
                     // `json` has no ordering operator (PG ships no btree opclass — json.md §5): ORDER BY
                     // a json column is 42883. jsonb IS orderable (its btree total order, §5).

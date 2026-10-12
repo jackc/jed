@@ -213,6 +213,7 @@ impl Engine {
             base: false,
             cte: None,
             db: rel.db.clone(),
+            layer: None,
         })
     }
 
@@ -1262,6 +1263,7 @@ impl Engine {
             base: false,
             cte: None,
             db: db.map(str::to_owned),
+            layer: None,
         };
         let contradiction = where_contradicts(filter);
         let mutation = self.plan_mutation_scan(db, table, filter, contradiction);
@@ -1313,6 +1315,10 @@ impl Engine {
         let visible: Vec<&CteBinding> = bindings.iter().collect();
         let plan = match inner {
             Statement::Insert(insert) => {
+                // A write through an updatable view estimates its base-table statement (§15.5).
+                let mut insert = insert.clone();
+                self.rewrite_insert_target(&mut insert)?;
+                let insert = &insert;
                 if self
                     .table_scoped(insert.db.as_deref(), &insert.table)
                     .is_none()
@@ -1340,6 +1346,9 @@ impl Engine {
                 EstimatedPlan::parent(source.root.clone(), &[&source])
             }
             Statement::Update(update) => {
+                let mut update = update.clone();
+                let vw = self.rewrite_update_target(&mut update)?;
+                let update = &update;
                 let table = self
                     .table_scoped(update.db.as_deref(), &update.table)
                     .ok_or_else(|| {
@@ -1348,12 +1357,16 @@ impl Engine {
                             format!("table does not exist: {}", update.table),
                         )
                     })?;
-                let filter = self.explain_dml_filter(table, update.filter.as_ref(), &visible)?;
+                let filter =
+                    self.explain_dml_filter(table, update.filter.as_ref(), &visible, vw.as_ref())?;
                 let scan =
                     self.estimate_mutation_scan(table, update.db.as_deref(), filter.as_ref(), ctx);
                 EstimatedPlan::parent(scan.root.clone(), &[&scan])
             }
             Statement::Delete(delete) => {
+                let mut delete = delete.clone();
+                let vw = self.rewrite_delete_target(&mut delete)?;
+                let delete = &delete;
                 let table = self
                     .table_scoped(delete.db.as_deref(), &delete.table)
                     .ok_or_else(|| {
@@ -1362,7 +1375,8 @@ impl Engine {
                             format!("table does not exist: {}", delete.table),
                         )
                     })?;
-                let filter = self.explain_dml_filter(table, delete.filter.as_ref(), &visible)?;
+                let filter =
+                    self.explain_dml_filter(table, delete.filter.as_ref(), &visible, vw.as_ref())?;
                 let scan =
                     self.estimate_mutation_scan(table, delete.db.as_deref(), filter.as_ref(), ctx);
                 EstimatedPlan::parent(scan.root.clone(), &[&scan])

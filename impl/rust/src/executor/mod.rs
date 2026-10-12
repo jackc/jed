@@ -97,6 +97,8 @@ mod statistics;
 pub(crate) use statistics::*;
 mod views;
 pub(crate) use views::*;
+mod view_write;
+pub(crate) use view_write::*;
 // __SUBMODULES__
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -1453,6 +1455,11 @@ pub(crate) struct ScopeRel<'a> {
     /// name per-access). `None` for a bare (implicit-scope) name — then the scoped funnels fall through
     /// to the temp-first walk, so this is behavior-neutral for every unqualified query.
     db: Option<String>,
+    /// The target of a write through a view (spec/design/views.md §15.2): the names this relation
+    /// exposes are the layer's columns, not `table`'s, and each resolves through the layer to a
+    /// base column or a read-only select item. `table` stays the base table, so flat indices keep
+    /// the base row's layout. `None` for every other relation.
+    layer: Option<&'a WriteLayer>,
 }
 
 impl ScopeRel<'_> {
@@ -1593,6 +1600,7 @@ fn build_prefix_scope<'s>(
                 // relation reads its already-delivered row, so it adds no CTE reference here.
                 cte: None,
                 db: fr.db.clone(),
+                layer: None,
             })
             .collect(),
         parent,
@@ -1667,7 +1675,17 @@ pub(crate) struct RecursiveTerm {
 #[derive(Clone, Copy)]
 pub(crate) enum Resolved {
     Local(usize),
-    Outer { level: usize, index: usize },
+    Outer {
+        level: usize,
+        index: usize,
+    },
+    /// Column `col` of the layered relation `rel` (a write through a view, views.md §15.2), found
+    /// `level` scopes out (0 = this scope). Resolved to an expression by [`resolve_layer_ref`].
+    Layer {
+        level: usize,
+        rel: usize,
+        col: usize,
+    },
 }
 
 /// A `USING` / `NATURAL` **merged column** (spec/design/grammar.md §15): `name` is the (exact)
@@ -1786,6 +1804,7 @@ impl<'a> Scope<'a> {
                 base: false,
                 cte: None,
                 db: None,
+                layer: None,
             }],
             parent: None,
             catalog,
@@ -1798,6 +1817,58 @@ impl<'a> Scope<'a> {
             storage_collation: false,
             subquery_derivs: Default::default(),
         }
+    }
+
+    /// The target scope of a write (UPDATE / DELETE): [`Scope::single`], or, for a write through a
+    /// view, the base table relabeled with the view's name and exposing the view's columns
+    /// (spec/design/views.md §15.2).
+    pub(crate) fn write_target(
+        catalog: &'a Engine,
+        table: &'a Table,
+        vw: Option<&'a ViewWrite>,
+    ) -> Scope<'a> {
+        let mut scope = Scope::single(catalog, table);
+        if let Some(vw) = vw {
+            scope.rels[0].label = vw.view.clone();
+            scope.rels[0].layer = Some(&vw.top);
+        }
+        scope
+    }
+
+    /// A scope with no relations under `parent`: one level between a reference to a view's
+    /// read-only column and the view body's scope the column's select item resolves in (views.md
+    /// §15.2), so the item's names bind only there.
+    pub(crate) fn blank_child(parent: &'a Scope<'a>) -> Scope<'a> {
+        let mut scope = Scope::empty(parent.catalog);
+        scope.parent = Some(parent);
+        scope.allow_subquery = true;
+        scope
+    }
+
+    /// The isolated scope a view body's select items and WHERE resolve in during a write through
+    /// the view (views.md §4.1, §15.2): the body's single FROM item, labeled `label`, exposing
+    /// `layer`'s columns over the base row at flat `offset`. No parent and no CTEs.
+    pub(crate) fn layer_body(
+        catalog: &'a Engine,
+        table: &'a Table,
+        offset: usize,
+        label: &str,
+        layer: &'a WriteLayer,
+    ) -> Scope<'a> {
+        let mut scope = Scope::empty(catalog);
+        scope.allow_subquery = true;
+        scope.rels.push(ScopeRel {
+            label: label.to_string(),
+            table,
+            offset,
+            qualifier_only: false,
+            view: None,
+            base: false,
+            cte: None,
+            db: None,
+            layer: Some(layer),
+        });
+        scope
     }
 
     /// The scope a PERSISTED index expression (an expression key or a partial-index predicate)
@@ -1843,9 +1914,15 @@ impl<'a> Scope<'a> {
         table: &'a Table,
         base_is_old: bool,
         returning: &ReturningClause,
+        vw: Option<&'a ViewWrite>,
     ) -> Result<Scope<'a>> {
         let n = table.columns.len();
-        let label = table.name.to_string();
+        // A write through a view returns the view's columns under the view's name (views.md §15.2).
+        let label = match vw {
+            Some(vw) => vw.view.clone(),
+            None => table.name.to_string(),
+        };
+        let layer = vw.map(|vw| &vw.top);
         let (old_offset, new_offset) = if base_is_old { (0, n) } else { (n, 0) };
         let mut rels = vec![ScopeRel {
             label: label.clone(),
@@ -1856,6 +1933,7 @@ impl<'a> Scope<'a> {
             base: false,
             cte: None,
             db: None,
+            layer,
         }];
         for (alias, offset) in [
             (returning.old_alias.as_deref(), old_offset),
@@ -1878,6 +1956,7 @@ impl<'a> Scope<'a> {
                     base: false,
                     cte: None,
                     db: None,
+                    layer,
                 });
             }
         }
@@ -1895,6 +1974,7 @@ impl<'a> Scope<'a> {
                     base: false,
                     cte: None,
                     db: None,
+                    layer,
                 });
             }
         }
@@ -1931,6 +2011,7 @@ impl<'a> Scope<'a> {
             base: false,
             cte: None,
             db: None,
+            layer: None,
         }];
         if label != "excluded" {
             rels.push(ScopeRel {
@@ -1942,6 +2023,7 @@ impl<'a> Scope<'a> {
                 base: false,
                 cte: None,
                 db: None,
+                layer: None,
             });
         }
         Scope {
@@ -1971,8 +2053,25 @@ impl<'a> Scope<'a> {
         // which is why such a join column is unambiguous. A *non-hidden* column elsewhere with the
         // same name still makes the reference ambiguous (a third relation sharing the name).
         let mut found: Option<usize> = self.merges.iter().find(|m| m.name == name).map(|m| m.index);
-        for r in &self.rels {
+        let mut layered: Option<Resolved> = None;
+        for (ri, r) in self.rels.iter().enumerate() {
             if r.qualifier_only {
+                continue;
+            }
+            // A write through a view exposes the view's columns (views.md §15.2).
+            if let Some(layer) = r.layer {
+                for (col, c) in layer.columns.iter().enumerate() {
+                    if c.name == name {
+                        if found.is_some() || layered.is_some() {
+                            return Err(ambiguous_column(name));
+                        }
+                        layered = Some(Resolved::Layer {
+                            level: 0,
+                            rel: ri,
+                            col,
+                        });
+                    }
+                }
                 continue;
             }
             // Count EVERY matching column, not just the first per relation: a synthetic relation (a
@@ -1987,12 +2086,15 @@ impl<'a> Scope<'a> {
                     continue;
                 }
                 if c.name == name {
-                    if found.is_some() {
+                    if found.is_some() || layered.is_some() {
                         return Err(ambiguous_column(name));
                     }
                     found = Some(idx);
                 }
             }
+        }
+        if let Some(r) = layered {
+            return Ok(r);
         }
         if let Some(idx) = found {
             self.trace_flat(idx);
@@ -2050,6 +2152,27 @@ impl<'a> Scope<'a> {
     /// outward (42P01 if no ancestor has it).
     fn resolve_qualified(&self, qualifier: &str, name: &str) -> Result<Resolved> {
         let q = qualifier.to_string();
+        if let Some(ri) = self
+            .rels
+            .iter()
+            .position(|r| r.label == q && r.layer.is_some())
+        {
+            let layer = self.rels[ri].layer.expect("a layered relation");
+            let mut hits = layer
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.name == name);
+            return match (hits.next(), hits.next()) {
+                (None, _) => Err(undefined_column(name)),
+                (Some(_), Some(_)) => Err(ambiguous_column(name)),
+                (Some((col, _)), None) => Ok(Resolved::Layer {
+                    level: 0,
+                    rel: ri,
+                    col,
+                }),
+            };
+        }
         if let Some(rel) = self.rels.iter().find(|r| r.label == q) {
             // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
             // columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
@@ -2126,6 +2249,12 @@ impl<'a> Scope<'a> {
         match r {
             Resolved::Local(idx) => self.column_at(idx),
             Resolved::Outer { level, index } => self.ancestor(level).column_at(index),
+            Resolved::Layer { level, rel, col } => {
+                &self.ancestor(level).rels[rel]
+                    .layer
+                    .expect("a layered relation")
+                    .columns[col]
+            }
         }
     }
 }
@@ -2138,6 +2267,11 @@ fn outer_of(r: Resolved) -> Resolved {
         Resolved::Outer { level, index } => Resolved::Outer {
             level: level + 1,
             index,
+        },
+        Resolved::Layer { level, rel, col } => Resolved::Layer {
+            level: level + 1,
+            rel,
+            col,
         },
     }
 }

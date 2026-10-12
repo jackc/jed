@@ -174,15 +174,27 @@ impl Engine {
 
     pub(crate) fn execute_insert_cached(
         &mut self,
-        ins: Insert,
+        mut ins: Insert,
         params: &[Value],
         ctx: CteCtx,
         insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
         allow_cache_fill: bool,
     ) -> Result<Outcome> {
+        // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+        // checked by NAME before qualifier validation (the built-in resolves in every database).
+        check_catalog_rel_write(&ins.table)?;
+        // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+        // existence gate so a read-only attachment refuses the write deterministically (§4).
+        self.check_attachment_writable(ins.db.as_deref())?;
+        // A write through an updatable view inserts into its base table (views.md §15); a view that
+        // is not updatable is 55000. The rewritten statement takes the general path.
+        let vw = self.rewrite_insert_target(&mut ins)?;
         // Slice 2 caches only a plain VALUES disposition. Writable-CTE children reach this method
         // without a cache slot; SELECT and ON CONFLICT retain the existing general path.
-        if matches!(&ins.source, InsertSource::Values(_)) && ins.on_conflict.is_none() {
+        if vw.is_none()
+            && matches!(&ins.source, InsertSource::Values(_))
+            && ins.on_conflict.is_none()
+        {
             return self.execute_insert_values_cached(
                 &ins,
                 params,
@@ -201,14 +213,6 @@ impl Engine {
             returning,
         } = ins;
 
-        // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
-        // checked by NAME before qualifier validation (the built-in resolves in every database).
-        check_catalog_rel_write(&table)?;
-        // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
-        // existence gate so a read-only attachment refuses the write deterministically (§4).
-        self.check_attachment_writable(db.as_deref())?;
-        // A view is not automatically updatable in this slice (views.md §2): 55000.
-        self.check_view_write(db.as_deref(), &table, "insert into")?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(db.as_deref(), &table)?;
         // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md
@@ -398,6 +402,7 @@ impl Engine {
                         false,
                         ctx.bindings,
                         &mut ptypes,
+                        vw.as_ref(),
                     )?),
                     None => None,
                 };
@@ -504,8 +509,14 @@ impl Engine {
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
                 let returning_nodes = ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice());
                 let (affected, returned) = match single_values {
-                    Some(values) => (
-                        1,
+                    Some(values) => (1, {
+                        // The target's resolved indexes and per-column collations, as the cached
+                        // VALUES plan and `run_insert_rows` resolve them.
+                        let rindexes = match self.table_scoped(db.as_deref(), &table) {
+                            Some(t) => self.resolve_table_indexes(t)?,
+                            None => Vec::new(),
+                        };
+                        let colls = self.column_collations(&columns);
                         self.insert_one(
                             &table,
                             db.as_deref(),
@@ -513,8 +524,8 @@ impl Engine {
                             &pk,
                             &checks,
                             &default_exprs,
-                            &[],
-                            &[],
+                            &rindexes,
+                            &colls,
                             &col_types,
                             &stmt_rng,
                             &provided,
@@ -523,8 +534,8 @@ impl Engine {
                             &bound,
                             ctx,
                             &mut meter,
-                        )?,
-                    ),
+                        )?
+                    }),
                     None => self.run_insert_rows(
                         &table,
                         db.as_deref(),
@@ -590,6 +601,7 @@ impl Engine {
                         false,
                         ctx.bindings,
                         &mut ptypes,
+                        vw.as_ref(),
                     )?),
                     None => None,
                 };
@@ -850,7 +862,6 @@ impl Engine {
     ) -> Result<Outcome> {
         check_catalog_rel_write(&ins.table)?;
         self.check_attachment_writable(ins.db.as_deref())?;
-        self.check_view_write(ins.db.as_deref(), &ins.table, "insert into")?;
         self.check_table_qualifier(ins.db.as_deref(), &ins.table)?;
 
         if let Some(cell) = insert_cache {
@@ -1040,9 +1051,14 @@ impl Engine {
             }
         }
         let returning = match &ins.returning {
-            Some(items) => {
-                Some(self.resolve_returning(&ins.table, items, false, ctx.bindings, &mut ptypes)?)
-            }
+            Some(items) => Some(self.resolve_returning(
+                &ins.table,
+                items,
+                false,
+                ctx.bindings,
+                &mut ptypes,
+                None,
+            )?),
             None => None,
         };
         let cacheable = !ptypes.uncacheable;
@@ -2515,9 +2531,10 @@ impl Engine {
         base_is_old: bool,
         ctes: &[&CteBinding],
         ptypes: &mut ParamTypes,
+        vw: Option<&ViewWrite>,
     ) -> Result<(Vec<RExpr>, Vec<String>, Vec<String>)> {
         let tdef = self.table(table).expect("INSERT target resolved above");
-        let mut scope = Scope::returning(self, tdef, base_is_old, returning)?;
+        let mut scope = Scope::returning(self, tdef, base_is_old, returning, vw)?;
         scope.ctes = ctes;
         let (nodes, names, types, _) =
             resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
@@ -2953,7 +2970,7 @@ impl Engine {
     /// so the map is not modified while iterating.
     pub(crate) fn execute_delete(
         &mut self,
-        del: Delete,
+        mut del: Delete,
         params: &[Value],
         ctx: CteCtx,
     ) -> Result<Outcome> {
@@ -2962,7 +2979,9 @@ impl Engine {
         check_catalog_rel_write(&del.table)?;
         // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
         self.check_attachment_writable(del.db.as_deref())?;
-        self.check_view_write(del.db.as_deref(), &del.table, "delete from")?;
+        // A write through an updatable view deletes from its base table (views.md §15); a view
+        // that is not updatable is 55000.
+        let vw = self.rewrite_delete_target(&mut del)?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(del.db.as_deref(), &del.table)?;
         let table = self
@@ -3002,18 +3021,21 @@ impl Engine {
         // RETURNING projection resolves after it (PostgreSQL's analysis order), against the
         // same scope (grammar.md §32). The statement's CTE bindings (writable-cte.md) are visible
         // so a WHERE / RETURNING sublink may reference an earlier CTE.
-        let mut scope = Scope::single(self, table);
+        let mut scope = Scope::write_target(self, table, vw.as_ref());
         scope.ctes = ctx.bindings;
         let mut ptypes = ParamTypes::default();
-        let mut filter = match &del.filter {
-            Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
-            None => None,
-        };
+        let (mut filter, stages) = self.resolve_write_filter(
+            &scope,
+            table,
+            vw.as_ref(),
+            del.filter.as_ref(),
+            &mut ptypes,
+        )?;
         // RETURNING resolves against its own scope: DELETE's base row IS the old row
         // (bare = `old.` = the deleted values; `new.` is the all-NULL side — grammar.md §32).
         let mut ret = match &del.returning {
             Some(returning) => {
-                let mut rscope = Scope::returning(self, table, true, returning)?;
+                let mut rscope = Scope::returning(self, table, true, returning, vw.as_ref())?;
                 rscope.ctes = ctx.bindings;
                 let (nodes, names, types, _) = resolve_projections(
                     &rscope,
@@ -3131,7 +3153,7 @@ impl Engine {
                 None => true,
                 Some(f) => {
                     let before = meter.accrued;
-                    let keep = f.eval(&row, &env, &mut meter)?.is_true();
+                    let keep = eval_write_filter(f, stages, &row, &env, &mut meter)?;
                     filter_actual += meter.accrued - before;
                     keep
                 }
@@ -3232,7 +3254,7 @@ impl Engine {
     /// updates every row.
     pub(crate) fn execute_update(
         &mut self,
-        upd: Update,
+        mut upd: Update,
         params: &[Value],
         ctx: CteCtx,
     ) -> Result<Outcome> {
@@ -3241,7 +3263,9 @@ impl Engine {
         check_catalog_rel_write(&upd.table)?;
         // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
         self.check_attachment_writable(upd.db.as_deref())?;
-        self.check_view_write(upd.db.as_deref(), &upd.table, "update")?;
+        // A write through an updatable view updates its base table (views.md §15); a view that is
+        // not updatable is 55000.
+        let vw = self.rewrite_update_target(&mut upd)?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(upd.db.as_deref(), &upd.table)?;
         let table = self
@@ -3260,7 +3284,7 @@ impl Engine {
         // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
         // The statement's CTE bindings (writable-cte.md) are visible so a SET / WHERE / RETURNING
         // sublink may reference an earlier CTE.
-        let mut scope = Scope::single(self, table);
+        let mut scope = Scope::write_target(self, table, vw.as_ref());
         scope.ctes = ctx.bindings;
 
         // Resolve assignments up front (fail fast, deterministic). Assigning a key member is
@@ -3427,16 +3451,19 @@ impl Engine {
         let pk_changed =
             !pk_members.is_empty() && plans.iter().any(|p| pk_members.contains(&p.idx));
 
-        let mut filter = match &upd.filter {
-            Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
-            None => None,
-        };
+        let (mut filter, stages) = self.resolve_write_filter(
+            &scope,
+            table,
+            vw.as_ref(),
+            upd.filter.as_ref(),
+            &mut ptypes,
+        )?;
         // The RETURNING projection resolves last (PostgreSQL's analysis order), against its
         // own scope: UPDATE's base row is the NEW row (bare = `new.` = post-assignment), and
         // `old.` reads the pre-update half of [base | other] (grammar.md §32).
         let mut ret = match &upd.returning {
             Some(returning) => {
-                let mut rscope = Scope::returning(self, table, false, returning)?;
+                let mut rscope = Scope::returning(self, table, false, returning, vw.as_ref())?;
                 rscope.ctes = ctx.bindings;
                 let (nodes, names, types, _) = resolve_projections(
                     &rscope,
@@ -3566,7 +3593,7 @@ impl Engine {
                 None => true,
                 Some(f) => {
                     let before = meter.accrued;
-                    let matched = f.eval(&row, &env, &mut meter)?.is_true();
+                    let matched = eval_write_filter(f, stages, &row, &env, &mut meter)?;
                     filter_actual += meter.accrued - before;
                     matched
                 }

@@ -232,14 +232,17 @@ impl Engine {
             ),
             CteBody::Query(_) => unreachable!("plan_dm_cte requires a data-modifying body"),
         };
-        // A view target is 55000, as for a top-level write (views.md §2).
-        let verb = match body {
-            CteBody::Insert(_) => "insert into",
-            CteBody::Update(_) => "update",
-            _ => "delete from",
+        // A write through an updatable view targets its base table, and its RETURNING projects the
+        // view's columns (views.md §15); a view that is not updatable is 55000. The CTE keeps the
+        // written statement, which its execution retargets again.
+        let vw = match body {
+            CteBody::Insert(ins) => self.rewrite_insert_target(&mut (**ins).clone())?,
+            CteBody::Update(upd) => self.rewrite_update_target(&mut (**upd).clone())?,
+            CteBody::Delete(del) => self.rewrite_delete_target(&mut (**del).clone())?,
+            CteBody::Query(_) => None,
         };
-        self.check_view_write(None, table_name, verb)?;
-        let tdef = self.table(table_name).ok_or_else(|| {
+        let target = vw.as_ref().map_or(table_name, |vw| vw.table.as_str());
+        let tdef = self.table(target).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {table_name}"),
@@ -257,7 +260,7 @@ impl Engine {
                 ))
             }
             Some(returning) => {
-                let mut scope = Scope::returning(self, tdef, base_is_old, returning)?;
+                let mut scope = Scope::returning(self, tdef, base_is_old, returning, vw.as_ref())?;
                 scope.ctes = bindings;
                 let (_, names, types, derivs) =
                     resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;

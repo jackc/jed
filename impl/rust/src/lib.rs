@@ -1036,6 +1036,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "ddl.view_rename",
     "ddl.view_replace",
     "ddl.view_alter",
+    "dml.view_write",
 ];
 
 /// Parse and execute one SQL statement against a low-level [`Engine`] (no bind parameters).
