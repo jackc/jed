@@ -1125,6 +1125,12 @@ export type Select = {
   // USING/NATURAL copies after the star columns and records the inner labels' column positions
   // (SelectPlan.group). Never set by a written SELECT; an aliased group is an ordinary derived table.
   joinGroup?: boolean;
+  // parenJoin marks the synthesized body of ANY parenthesized-join FROM item, aliased or not
+  // (spec/design/grammar.md §15). PostgreSQL plans such a join in its enclosing FROM's namespace, so a
+  // LATERAL item (or table function) inside it sees the relations to the join's LEFT; the planner
+  // gives the body that view through a lateral fence (Scope.lateralView). Never set by a written
+  // SELECT.
+  parenJoin?: boolean;
 };
 
 // Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column re-keys

@@ -146,6 +146,17 @@ export class Scope {
   // without planning the body again. Keyed by identity: a lookup always follows the resolve of the
   // same node, which overwrites any stale entry.
   subqueryDerivs: Map<QueryExpr, Deriv> = new Map();
+  // Set on a LATERAL FENCE only (spec/design/grammar.md §15): the empty scope a parenthesized join's
+  // body is planned against when the join is not the first item of its FROM. The fence hides the
+  // relations to the join's left from the body's ON clauses and non-LATERAL items (PostgreSQL's
+  // lateral-only namespace entries), while this view — the prefix of those relations, at the same
+  // correlation level — is what the body's LATERAL items and table functions resolve against. Only a
+  // parenthesized-join body reads it; any other SELECT planned against a fence strips it.
+  lateralView: Scope | null = null;
+  // Set when a column reference resolves to one of THIS scope's relations. Read on a parenthesized
+  // join's lateral prefix to learn whether the join's body correlates to the relations on its left
+  // (grammar.md §15).
+  lateralHit = false;
   constructor(
     rels: ScopeRel[],
     catalog: Engine,
@@ -158,6 +169,27 @@ export class Scope {
     this.parent = parent;
     this.allowSubquery = allowSubquery;
     this.ctes = ctes;
+  }
+
+  // lateralFence is the fence a parenthesized join's body is planned against (spec/design/grammar.md
+  // §15): an empty level over parent, so the body's ON clauses and non-LATERAL items see no relation
+  // to the join's left, carrying view — the prefix of those relations, one scope at the same
+  // correlation level — for the body's LATERAL items and table functions.
+  static lateralFence(
+    parent: Scope | null,
+    view: Scope,
+    catalog: Engine,
+    ctes: CteBinding[],
+  ): Scope {
+    const fence = new Scope([], catalog, parent, true, ctes);
+    fence.lateralView = view;
+    return fence;
+  }
+
+  // withoutLateralView is this fence without its lateral view: the same empty level, read by a SELECT
+  // that is not the parenthesized join the fence was built for (§15).
+  withoutLateralView(): Scope {
+    return new Scope([], this.catalog, this.parent, true, this.ctes);
   }
 
   // single builds a one-relation scope with no parent (the single-table UPDATE / DELETE case).
@@ -357,9 +389,13 @@ export class Scope {
         }
       }
     }
-    if (layered !== null) return layered;
+    if (layered !== null) {
+      this.lateralHit = true;
+      return layered;
+    }
     if (found >= 0) {
       this.traceFlat(found);
+      this.lateralHit = true;
       return { level: 0, index: found };
     }
     if (this.parent !== null) return outerOf(this.parent.resolveBare(name));
@@ -418,6 +454,7 @@ export class Scope {
         found = col;
       }
       if (found < 0) throw undefinedColumn(name);
+      this.lateralHit = true;
       return { level: 0, index: -1, layer: { rel: ri, col: found } };
     }
     for (const r of this.rels) {
@@ -442,6 +479,7 @@ export class Scope {
         if (ambiguous) throw ambiguousColumn(name);
         const idx = visible >= 0 ? visible : found;
         this.traceFlat(idx);
+        this.lateralHit = true;
         return { level: 0, index: idx };
       }
     }
@@ -449,6 +487,7 @@ export class Scope {
       if (sr.label === q) {
         const local = columnIndex(sr.table, name);
         if (local < 0) throw undefinedColumn(name);
+        this.lateralHit = true;
         return { level: 0, index: sr.slots[local]! };
       }
     }

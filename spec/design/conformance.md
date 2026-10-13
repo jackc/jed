@@ -607,7 +607,10 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   INTERSECT / DISTINCT idempotence and a NULL-group DISTINCT collapse, driving the set-op dedup path
   against the same logic; **join_comm** — INNER-JOIN commutativity (`a JOIN b` ≡ `b JOIN a`) and the
   CROSS-JOIN-plus-filter equivalence (`a JOIN b ON a.k=b.k` ≡ `a CROSS JOIN b WHERE a.k=b.k`), the
-  same projected pairs through different execution shapes.
+  same projected pairs through different execution shapes; **paren_lateral** — a parenthesized join
+  whose `LATERAL` item or table function reaches the relation to its left (grammar.md §15) equals the
+  flat left-deep chain with the lateral item after both relations and the lateral-free join with the
+  lateral filter folded into its `ON`, for INNER, LEFT (NULL-extended), and aliased groups.
 - **NOT yet covered (needs a new relation):** any future optimization without a scenario in
   `scripts/norec_gen.rb`. Each is a future relation the sweep does **not** yet exercise — add a
   scenario when it lands.

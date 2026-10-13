@@ -3097,6 +3097,7 @@ class Parser {
       limit: null,
       offset: null,
       windows: [],
+      parenJoin: true,
     };
   }
 

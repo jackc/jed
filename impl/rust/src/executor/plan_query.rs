@@ -1036,6 +1036,8 @@ impl Engine {
             star: None,
             storage_collation: false,
             subquery_derivs: Default::default(),
+            lateral_view: None,
+            lateral_hit: Default::default(),
         };
         let mut resolved_rows: Vec<Vec<RExpr>> = Vec::with_capacity(rows.len());
         let mut col_types: Vec<ResolvedType> = Vec::with_capacity(arity);

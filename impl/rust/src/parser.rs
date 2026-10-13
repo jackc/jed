@@ -3067,6 +3067,7 @@ impl Parser {
             offset: None,
             windows,
             join_group: false,
+            paren_join: false,
         })
     }
 
@@ -3335,6 +3336,7 @@ impl Parser {
             offset: None,
             windows: Vec::new(),
             join_group: false,
+            paren_join: true,
         })))
     }
 
@@ -6327,6 +6329,7 @@ fn values_query(
         offset,
         windows: Vec::new(),
         join_group: false,
+        paren_join: false,
     }))
 }
 

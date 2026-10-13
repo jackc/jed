@@ -1064,7 +1064,21 @@ The parentheses set the **join tree**: `c LEFT JOIN (a JOIN b ON p) ON q` preser
 unless the *whole* inner join matches, whereas the left-deep `c LEFT JOIN a ON q JOIN b ON p` drops
 the `c` rows its trailing inner join cannot extend. The group's `ON`/`USING` clauses see only the
 group's own relations — a reference to an enclosing sibling is `42P01` (PG's "invalid reference to
-FROM-clause entry").
+FROM-clause entry"), as is one from a non-`LATERAL` derived table inside the group (§42).
+
+**`LATERAL` inside a group.** PostgreSQL resolves a parenthesized join in its enclosing FROM's
+namespace, where the relations to the join's **left** are lateral-only entries: a `LATERAL` item or
+table function (§44) anywhere inside the group — including a nested group, and including an
+**aliased** group, whose alias hides only the inner labels from the enclosing query — may reference
+them, while the group's `ON` clauses and its non-`LATERAL` items may not. So `FROM a JOIN (b JOIN
+LATERAL (SELECT a.x + b.y) s ON true) ON true` works, re-evaluating the group once per `a` row, and a
+non-`LATERAL` subquery *inside* the `LATERAL` item sees `a` too (the whole lateral item is in its
+scope). The usual join-type rule applies to a group that references a relation on its left: as the
+right side of a `RIGHT`/`FULL` join it is `42P10` (with §44's broader-than-PG narrowing — any
+reference to an earlier FROM relation counts, including one in an earlier comma item, and a `RIGHT`
+join *inside* the group whose lateral item references a relation outside the group is `42P10` too).
+A group whose lateral items reference only an enclosing query level is not correlated to its left and
+joins under any join type.
 
 - **Unaliased**, the group is one join-tree node whose inner relation labels stay visible: `a.x`,
   `b.*`, `WHERE`/`GROUP BY`/`ORDER BY`, a correlated subquery, and a later `LATERAL` item all reach
@@ -1089,7 +1103,21 @@ landed. The enclosing scope carries those labels as **qualifier-only views** ove
 the extra copies hidden (so `*` and bare resolution skip them, while `b.id` still reads `b`'s own
 column — NULL under a LEFT join where the merged `id` is `a`'s), and keeps each inner column's
 collation. Being a derived input, a right-hand group is a join-search fence; its body plans its own
-join. *(Fixed with this slice: a `USING` predicate binds the two chosen columns directly through
+join.
+
+*Lateral fence.* A right-hand group that holds a lateral-capable item (a `LATERAL` derived table, a
+table function, or a nested group holding one) is planned against a **lateral fence**: an empty scope
+at the correlation level of the relations to its left, so the group's `ON` clauses and non-`LATERAL`
+items see through it to the enclosing query only, carrying a view of those relations — the same prefix
+scope a top-level `LATERAL` item resolves against — which the group's own `LATERAL` items and table
+functions (including a first item, which has no sibling) resolve their outer references through. Only
+the group's body reads the view; a derived table planned against the fence strips it, so a `LATERAL`
+item nested in a non-`LATERAL` subquery cannot reach past the subquery. The body is first planned as a
+shape (planner.md §3.2) to learn whether any reference reached the prefix. If one did, the group is a
+**correlated lateral relation** (exactly as a top-level `LATERAL` item: re-materialized per combined
+left row, never pushed into, a join-search fence) planned for real against the fence; if none did, it
+is planned as an ordinary derived body, so its cost and plan are those of the group without the
+fence. *(Fixed with this slice: a `USING` predicate binds the two chosen columns directly through
 one-column pseudo relations at their flat slots, so a side that is an unlabeled relation — an
 unaliased derived table or join group — no longer resolves to the first unlabeled relation.)*
 
@@ -1098,9 +1126,6 @@ unaliased derived table or join group — no longer resolves to the first unlabe
 - **No `FULL JOIN ... USING`** / `NATURAL FULL JOIN` (its `COALESCE` merge — above). A **derived
   table** (`FROM (SELECT …) AS t`) and a **parenthesized join** are supported (§42, above); the
   **`t.*`** qualified star, **`USING`**, and **`NATURAL`** have landed (above).
-- **A `LATERAL` item inside a right-hand parenthesized join** cannot reference relations outside the
-  group (`42P01`; PostgreSQL allows it), because that group's body is planned as a derived body, which
-  sees enclosing query levels but no sibling (§42). Inside a *spliced* (chain-leading) group it sees earlier relations normally.
 - ~~**`((SELECT …)) AS s`**~~ — ✅ **landed** with parenthesized queries (§25): redundant
   parentheses around a derived-table subquery make its body a parenthesized query.
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
@@ -3095,9 +3120,12 @@ re-executed per outer row (§26). Cost is the sum of those per-row evaluations �
 - **`RIGHT`/`FULL JOIN LATERAL` rejection is slightly broader than PG.** jed raises `42P10` when the
   lateral item references **any** outer relation (a left sibling *or* an enclosing query); PG rejects
   only a reference to the **left side of that join**. The practical case — `RIGHT JOIN LATERAL` that
-  correlates to the left — matches PG exactly; the divergence is the exotic `RIGHT JOIN LATERAL (body
-  that references only an *enclosing* query)`, recorded in the override ledger. A `RIGHT`/`FULL JOIN` to
-  a fully **un**correlated lateral item is allowed (matches PG).
+  correlates to the left — matches PG exactly; the divergences are the exotic `RIGHT JOIN LATERAL (body
+  that references only an *enclosing* query)`, a `RIGHT JOIN` whose lateral side references an earlier
+  *comma* item rather than the join's own left side, and — inside a parenthesized join (§15) — a `RIGHT
+  JOIN LATERAL` whose body references a relation to the left of the enclosing group; the last two are
+  recorded in the override ledger. A `RIGHT`/`FULL JOIN` to a fully **un**correlated lateral item is
+  allowed (matches PG).
 - **comma-`FROM` `LATERAL`** (`FROM t, LATERAL (…)`) waits on comma-`FROM` (§15).
 
 ## 45. `CREATE SEQUENCE` / `DROP SEQUENCE` ([sequences.md](sequences.md))

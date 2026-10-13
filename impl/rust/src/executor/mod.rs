@@ -1625,6 +1625,54 @@ fn build_prefix_scope<'s>(
         star: None,
         storage_collation: false,
         subquery_derivs: Default::default(),
+        lateral_view: None,
+        lateral_hit: Default::default(),
+    }
+}
+
+impl<'a> Scope<'a> {
+    /// The lateral fence a parenthesized join's body is planned against (spec/design/grammar.md
+    /// §15): an empty level over `parent`, so the body's ON clauses and non-LATERAL items see no
+    /// relation to the join's left, carrying `view` — the prefix of those relations, one scope at the
+    /// same correlation level — for the body's LATERAL items and table functions.
+    pub(crate) fn lateral_fence(
+        parent: Option<&'a Scope<'a>>,
+        view: &'a Scope<'a>,
+        catalog: &'a Engine,
+        ctes: &'a [&'a CteBinding],
+    ) -> Scope<'a> {
+        let mut fence = Scope::empty_level(parent, catalog, ctes);
+        fence.lateral_view = Some(view);
+        fence
+    }
+
+    /// This fence without its lateral view: the same empty level, read by a SELECT that is not the
+    /// parenthesized join the fence was built for (§15).
+    pub(crate) fn without_lateral_view(&self) -> Scope<'a> {
+        Scope::empty_level(self.parent, self.catalog, self.ctes)
+    }
+
+    /// A correlation level with no relations of its own.
+    fn empty_level(
+        parent: Option<&'a Scope<'a>>,
+        catalog: &'a Engine,
+        ctes: &'a [&'a CteBinding],
+    ) -> Scope<'a> {
+        Scope {
+            rels: Vec::new(),
+            parent,
+            catalog,
+            allow_subquery: true,
+            ctes,
+            merges: Vec::new(),
+            hidden: Vec::new(),
+            sub_rels: Vec::new(),
+            star: None,
+            storage_collation: false,
+            subquery_derivs: Default::default(),
+            lateral_view: None,
+            lateral_hit: Default::default(),
+        }
     }
 }
 
@@ -1811,6 +1859,18 @@ pub(crate) struct Scope<'a> {
     /// it without planning the body again. Keyed by address: a lookup always follows the resolve of
     /// the same node, which overwrites any stale entry.
     subquery_derivs: std::cell::RefCell<Vec<(*const crate::ast::QueryExpr, Deriv)>>,
+    /// Set on a LATERAL FENCE only (spec/design/grammar.md §15): the empty scope a parenthesized
+    /// join's body is planned against when the join is not the first item of its FROM. The fence
+    /// hides the relations to the join's left from the body's ON clauses and non-LATERAL items
+    /// (PostgreSQL's lateral-only namespace entries), while this view — the prefix of those
+    /// relations, at the same correlation level — is what the body's LATERAL items and table
+    /// functions resolve against. Only a parenthesized-join body reads it; any other SELECT planned
+    /// against a fence strips it.
+    lateral_view: Option<&'a Scope<'a>>,
+    /// Set when a column reference resolves to one of THIS scope's relations. Read on a
+    /// parenthesized join's lateral prefix to learn whether the join's body correlates to the
+    /// relations on its left (grammar.md §15).
+    lateral_hit: std::cell::Cell<bool>,
 }
 
 /// One inner relation label of an unaliased parenthesized join (grammar.md §15): its table's
@@ -1883,6 +1943,8 @@ impl<'a> Scope<'a> {
             star: None,
             storage_collation: false,
             subquery_derivs: Default::default(),
+            lateral_view: None,
+            lateral_hit: Default::default(),
         }
     }
 
@@ -1963,6 +2025,8 @@ impl<'a> Scope<'a> {
             star: None,
             storage_collation: false,
             subquery_derivs: Default::default(),
+            lateral_view: None,
+            lateral_hit: Default::default(),
         }
     }
 
@@ -2045,6 +2109,8 @@ impl<'a> Scope<'a> {
             star: None,
             storage_collation: false,
             subquery_derivs: Default::default(),
+            lateral_view: None,
+            lateral_hit: Default::default(),
         })
     }
 
@@ -2116,6 +2182,8 @@ impl<'a> Scope<'a> {
             star: None,
             storage_collation: false,
             subquery_derivs: Default::default(),
+            lateral_view: None,
+            lateral_hit: Default::default(),
         }
     }
 
@@ -2172,10 +2240,12 @@ impl<'a> Scope<'a> {
             }
         }
         if let Some(r) = layered {
+            self.lateral_hit.set(true);
             return Ok(r);
         }
         if let Some(idx) = found {
             self.trace_flat(idx);
+            self.lateral_hit.set(true);
             return Ok(Resolved::Local(idx));
         }
         match self.parent {
@@ -2253,11 +2323,14 @@ impl<'a> Scope<'a> {
             return match (hits.next(), hits.next()) {
                 (None, _) => Err(undefined_column(name)),
                 (Some(_), Some(_)) => Err(ambiguous_column(name)),
-                (Some((col, _)), None) => Ok(Resolved::Layer {
-                    level: 0,
-                    rel: ri,
-                    col,
-                }),
+                (Some((col, _)), None) => {
+                    self.lateral_hit.set(true);
+                    Ok(Resolved::Layer {
+                        level: 0,
+                        rel: ri,
+                        col,
+                    })
+                }
             };
         }
         if let Some(rel) = self.rels.iter().find(|r| r.label == q) {
@@ -2285,6 +2358,7 @@ impl<'a> Scope<'a> {
                 _ if ambiguous => Err(ambiguous_column(name)),
                 (_, Some(idx)) | (Some(idx), None) => {
                     self.trace_flat(idx);
+                    self.lateral_hit.set(true);
                     Ok(Resolved::Local(idx))
                 }
             };
@@ -2294,6 +2368,7 @@ impl<'a> Scope<'a> {
                 .table
                 .column_index(name)
                 .ok_or_else(|| undefined_column(name))?;
+            self.lateral_hit.set(true);
             return Ok(Resolved::Local(sr.slots[local]));
         }
         match self.parent {

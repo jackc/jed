@@ -126,6 +126,32 @@ type scope struct {
 	// allocated); a lookup always follows the resolve of the same node, which overwrites any stale
 	// entry.
 	subqueryDerivs map[*queryExpr]deriv
+	// lateralView is set on a LATERAL FENCE only (spec/design/grammar.md §15): the empty scope a
+	// parenthesized join's body is planned against when the join is not the first item of its FROM.
+	// The fence hides the relations to the join's left from the body's ON clauses and non-LATERAL
+	// items (PostgreSQL's lateral-only namespace entries), while this view — the prefix of those
+	// relations, at the same correlation level — is what the body's LATERAL items and table
+	// functions resolve against. Only a parenthesized-join body reads it; any other SELECT planned
+	// against a fence strips it.
+	lateralView *scope
+	// lateralHit is set when a column reference resolves to one of THIS scope's relations. Read on a
+	// parenthesized join's lateral prefix to learn whether the join's body correlates to the
+	// relations on its left (grammar.md §15).
+	lateralHit bool
+}
+
+// lateralFence is the fence a parenthesized join's body is planned against (spec/design/grammar.md
+// §15): an empty level over parent, so the body's ON clauses and non-LATERAL items see no relation to
+// the join's left, carrying view — the prefix of those relations, one scope at the same correlation
+// level — for the body's LATERAL items and table functions.
+func lateralFence(parent, view *scope, catalog *engine, ctes []*cteBinding) *scope {
+	return &scope{parent: parent, catalog: catalog, allowSubquery: true, ctes: ctes, lateralView: view}
+}
+
+// withoutLateralView is this fence without its lateral view: the same empty level, read by a SELECT
+// that is not the parenthesized join the fence was built for (§15).
+func (s *scope) withoutLateralView() *scope {
+	return &scope{parent: s.parent, catalog: s.catalog, allowSubquery: true, ctes: s.ctes}
 }
 
 // subRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
@@ -331,10 +357,12 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 		}
 	}
 	if layered != nil {
+		s.lateralHit = true
 		return *layered, nil
 	}
 	if found >= 0 {
 		s.traceFlat(found)
+		s.lateralHit = true
 		return resolved{level: 0, index: found}, nil
 	}
 	if s.parent != nil {
@@ -419,6 +447,7 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 			if found < 0 {
 				return resolved{}, undefinedColumn(name)
 			}
+			s.lateralHit = true
 			return resolved{layered: true, rel: ri, col: found}, nil
 		}
 	}
@@ -448,9 +477,11 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 				return resolved{}, ambiguousColumn(name)
 			case visible >= 0:
 				s.traceFlat(visible)
+				s.lateralHit = true
 				return resolved{level: 0, index: visible}, nil
 			}
 			s.traceFlat(found)
+			s.lateralHit = true
 			return resolved{level: 0, index: found}, nil
 		}
 	}
@@ -460,6 +491,7 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 			if local < 0 {
 				return resolved{}, undefinedColumn(name)
 			}
+			s.lateralHit = true
 			return resolved{level: 0, index: sr.slots[local]}, nil
 		}
 	}

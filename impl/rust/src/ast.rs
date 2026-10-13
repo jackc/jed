@@ -1000,6 +1000,12 @@ pub struct Select {
     /// (`SelectPlan::group`). Never set by a written SELECT; an aliased group is an ordinary derived
     /// table.
     pub join_group: bool,
+    /// Marks the synthesized body of ANY parenthesized-join FROM item, aliased or not
+    /// (spec/design/grammar.md §15). PostgreSQL plans such a join in its enclosing FROM's namespace,
+    /// so a LATERAL item (or table function) inside it sees the relations to the join's LEFT; the
+    /// planner gives the body that view through a lateral fence (`Scope::lateral_view`). Never set
+    /// by a written SELECT.
+    pub paren_join: bool,
 }
 
 /// A query expression — the operand of a set operation (spec/design/grammar.md §25). Either a

@@ -113,6 +113,20 @@ impl Engine {
         // The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
         let mut group_subs: Vec<GroupSubRel> = Vec::new();
         let mut group_hidden: Vec<usize> = Vec::new();
+        // A lateral fence (§15) is read only by the parenthesized-join body it was built for: any
+        // other SELECT planned against one sees through it as the empty level it is.
+        let stripped;
+        let parent = match parent {
+            Some(p) if p.lateral_view.is_some() && !sel.paren_join => {
+                stripped = p.without_lateral_view();
+                Some(&stripped)
+            }
+            _ => parent,
+        };
+        // The scope this FROM's LATERAL items and table functions resolve their left relations
+        // against: `parent`, unless this is a parenthesized join's body planned against a fence — then
+        // the fence's view, so they also see the relations to the join's left (§15).
+        let lateral_parent = parent.map(|p| p.lateral_view.unwrap_or(p));
         for (i, tref) in from_items.iter().enumerate() {
             let is_derived = tref.subquery.is_some() || tref.values.is_some();
             // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table /
@@ -141,6 +155,7 @@ impl Engine {
                     }
                     _ => None,
                 };
+                let mut join_lateral = false;
                 let plan = if let Some(stand_in) = stand_in {
                     stand_in
                 } else if let Some((_, view_name, site)) = &view_items[i] {
@@ -152,8 +167,14 @@ impl Engine {
                         self.plan_view_reference(view_name, body, written_items[i], *site, ptypes)
                     })?
                 } else if lateral_eligible {
-                    let prefix =
-                        build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
+                    let prefix = build_prefix_scope(
+                        &finalized,
+                        &synthetic,
+                        &group_subs,
+                        lateral_parent,
+                        self,
+                        ctes,
+                    );
                     match (&tref.subquery, &tref.values) {
                         (Some(body), _) => {
                             let shape = self.plan_body_first(shape_bodies, || {
@@ -175,18 +196,52 @@ impl Engine {
                         )?),
                         _ => unreachable!(),
                     }
+                } else if i > 0 && paren_join_reaches_left(tref) {
+                    // A parenthesized join whose LATERAL items may reach the relations to its left
+                    // (§15): plan its body against a lateral fence — the left relations hidden from
+                    // its ON clauses and non-LATERAL items, visible to its LATERAL items. A first
+                    // planning, as a shape, learns whether any reference reached them. If so the
+                    // join is a correlated lateral relation, planned for real against the fence;
+                    // otherwise it is planned as any other derived body.
+                    let body = tref.subquery.as_deref().expect("a join body is a query");
+                    let prefix = build_prefix_scope(
+                        &finalized,
+                        &synthetic,
+                        &group_subs,
+                        lateral_parent,
+                        self,
+                        ctes,
+                    );
+                    let fence = Scope::lateral_fence(parent, &prefix, self, ctes);
+                    self.plan_body_first(true, || {
+                        self.plan_query(body, Some(&fence), ctes, ptypes)
+                    })?;
+                    if prefix.lateral_hit.get() {
+                        join_lateral = true;
+                        self.plan_again(ctes, || self.plan_query(body, Some(&fence), ctes, ptypes))?
+                    } else {
+                        self.plan_again(ctes, || {
+                            self.plan_body_first(shape_bodies, || {
+                                self.plan_query(body, parent, ctes, ptypes)
+                            })
+                        })?
+                    }
                 } else {
+                    // A LATERAL first item sees no sibling, but inside a fenced parenthesized join it
+                    // still sees the relations to the join's left (§15).
+                    let body_parent = if tref.lateral { lateral_parent } else { parent };
                     match (&tref.subquery, &tref.values) {
                         (Some(body), _) => self.plan_body_first(shape_bodies, || {
-                            self.plan_query(body, parent, ctes, ptypes)
+                            self.plan_query(body, body_parent, ctes, ptypes)
                         })?,
                         (None, Some(rows)) => {
-                            QueryPlan::Values(self.plan_values(rows, parent, ctes, ptypes)?)
+                            QueryPlan::Values(self.plan_values(rows, body_parent, ctes, ptypes)?)
                         }
                         _ => unreachable!(),
                     }
                 };
-                let lateral = lateral_eligible && query_plan_references_outer(&plan, 0);
+                let lateral =
+                    join_lateral || (lateral_eligible && query_plan_references_outer(&plan, 0));
                 shaped[i] = shape_bodies && tref.subquery.is_some() && !lateral;
                 lateral_flags.push(lateral);
                 let label = tref.alias.clone().unwrap_or_default().to_string();
@@ -213,10 +268,17 @@ impl Engine {
             } else if let Some(args) = &tref.args {
                 // A table function (SRF) — implicitly lateral. At i>0 its args resolve against the
                 // prefix scope (a sibling column then correlates); at i==0 against `parent` (the
-                // enclosing query / params), unchanged (functions.md §10).
+                // enclosing query / params — functions.md §10), or inside a fenced parenthesized join
+                // its lateral view (§15).
                 let (mut table, rargs, kind) = if lateral_eligible {
-                    let prefix =
-                        build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
+                    let prefix = build_prefix_scope(
+                        &finalized,
+                        &synthetic,
+                        &group_subs,
+                        lateral_parent,
+                        self,
+                        ctes,
+                    );
                     self.resolve_srf(
                         &tref.name,
                         args,
@@ -232,7 +294,7 @@ impl Engine {
                         args,
                         tref.alias.as_deref(),
                         tref.column_defs.as_deref(),
-                        parent,
+                        lateral_parent,
                         ctes,
                         ptypes,
                     )?
@@ -256,11 +318,17 @@ impl Engine {
                 let scope_parent;
                 let prefix;
                 let resolve_against = if lateral_eligible {
-                    prefix =
-                        build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
+                    prefix = build_prefix_scope(
+                        &finalized,
+                        &synthetic,
+                        &group_subs,
+                        lateral_parent,
+                        self,
+                        ctes,
+                    );
                     Some(&prefix)
                 } else {
-                    scope_parent = parent;
+                    scope_parent = lateral_parent;
                     scope_parent
                 };
                 let (table, rargs, plan) = self.resolve_json_table(
@@ -576,6 +644,8 @@ impl Engine {
                     star: None,
                     storage_collation: false,
                     subquery_derivs: Default::default(),
+                    lateral_view: None,
+                    lateral_hit: Default::default(),
                 };
                 let left_names: Vec<&str> = seg_star
                     .iter()
@@ -613,6 +683,8 @@ impl Engine {
                     star: None,
                     storage_collation: false,
                     subquery_derivs: Default::default(),
+                    lateral_view: None,
+                    lateral_hit: Default::default(),
                 };
                 // The synthesized predicate compares the two chosen columns through one-column pseudo
                 // relations at their flat slots, so it binds exactly those columns even when a side is
@@ -715,6 +787,8 @@ impl Engine {
                     star: None,
                     storage_collation: false,
                     subquery_derivs: Default::default(),
+                    lateral_view: None,
+                    lateral_hit: Default::default(),
                 };
                 Some(resolve_boolean_filter(
                     &pair,
@@ -734,6 +808,8 @@ impl Engine {
                     star: None,
                     storage_collation: false,
                     subquery_derivs: Default::default(),
+                    lateral_view: None,
+                    lateral_hit: Default::default(),
                 };
                 seg_star.extend(rel_star(k + 1));
                 Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
@@ -757,6 +833,8 @@ impl Engine {
             star: Some(star),
             storage_collation: false,
             subquery_derivs: Default::default(),
+            lateral_view: None,
+            lateral_hit: Default::default(),
         };
 
         // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,
@@ -1578,6 +1656,7 @@ impl Engine {
             &shaped,
             &cte_bodies,
             parent,
+            lateral_parent,
             ctes,
             ptypes,
         )?;
@@ -1641,6 +1720,7 @@ impl Engine {
         shaped: &[bool],
         cte_bodies: &[Option<usize>],
         parent: Option<&Scope<'a>>,
+        lateral_parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<()> {
@@ -1682,6 +1762,11 @@ impl Engine {
                     self.in_view_body(site, || replan(None, &[], ptypes))
                 } else if let Some(ci) = cte_bodies[i] {
                     replan(None, &ctes[..ci], ptypes)
+                } else if from_items[i].lateral {
+                    // A LATERAL body planned like any derived body (it correlates to no sibling)
+                    // keeps the scope it was first planned against: inside a fenced parenthesized
+                    // join, the lateral view (§15).
+                    replan(lateral_parent, ctes, ptypes)
                 } else {
                     replan(parent, ctes, ptypes)
                 }
@@ -1889,6 +1974,26 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
         .iter()
         .map(|r| touched[r.offset..r.offset + r.col_count].to_vec())
         .collect()
+}
+
+/// Whether a parenthesized join's body holds an item that may reach the relations to the join's left
+/// (spec/design/grammar.md §15): a LATERAL derived table, a table function (implicitly lateral), or
+/// a nested parenthesized join holding one. Only such a join is planned against a lateral fence.
+fn paren_join_reaches_left(tref: &TableRef) -> bool {
+    let Some(QueryExpr::Select(sel)) = tref.subquery.as_deref() else {
+        return false;
+    };
+    sel.paren_join
+        && sel
+            .from
+            .iter()
+            .chain(sel.joins.iter().map(|j| &j.table))
+            .any(|t| {
+                t.lateral
+                    || t.args.is_some()
+                    || t.json_table.is_some()
+                    || paren_join_reaches_left(t)
+            })
 }
 
 /// A one-column table named `name` holding `column` — the pseudo relation a USING/NATURAL join's

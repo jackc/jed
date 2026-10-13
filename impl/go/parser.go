@@ -3732,7 +3732,7 @@ func (p *parser) parseJoinGroup() (queryExpr, error) {
 			"a parenthesized FROM item must be a subquery, a VALUES list, or a join")
 	}
 	p.undeepen()
-	return queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &from, Joins: joins}}, nil
+	return queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &from, Joins: joins, ParenJoin: true}}, nil
 }
 
 // parseTableRef parses `table_ref ::= derived_table derived_alias? | joined_group derived_alias? |

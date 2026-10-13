@@ -809,7 +809,7 @@ func selectActualRelNode(rel planRel) string {
 		return "CTE Scan " + rel.tableName
 	}
 	if rel.derived != nil {
-		return "Subquery " + rel.tableName
+		return subqueryNode(rel.tableName)
 	}
 	return "Scan " + rel.tableName
 }
@@ -931,7 +931,7 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 		}
 		return nil
 	case rel.derived != nil:
-		r.emit(depth, "Subquery "+rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note))
+		r.emit(depth, subqueryNode(rel.tableName), withNote(pushedFilterDetail(sp, i, "", r.verbose), note))
 		return db.renderQueryPlan(r, *rel.derived, depth+1)
 	default:
 		// An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
@@ -1919,4 +1919,13 @@ func countTrue(mask []bool) int {
 		}
 	}
 	return n
+}
+
+// subqueryNode is a derived relation's node (spec/design/explain.md §4): `Subquery <alias>`, or a bare
+// `Subquery` for an unaliased derived table or parenthesized join, which has no label.
+func subqueryNode(label string) string {
+	if label == "" {
+		return "Subquery"
+	}
+	return "Subquery " + label
 }

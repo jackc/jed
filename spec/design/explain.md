@@ -93,7 +93,7 @@ The fixed node vocabulary is:
 | source | node |
 |---|---|
 | base/catalog scan | `Scan <table>` / `Catalog Scan <name>` |
-| SRF, CTE reference, derived relation, view reference | `SRF <name>` / `CTE Scan <name>` / `Subquery <alias>` (a view reference renders as its equivalent derived table, `Subquery <label>` — [views.md](views.md) §4) |
+| SRF, CTE reference, derived relation, view reference | `SRF <name>` / `CTE Scan <name>` / `Subquery <alias>` (a bare `Subquery` for an unaliased derived table or parenthesized join; a view reference renders as its equivalent derived table, `Subquery <label>` — [views.md](views.md) §4) |
 | joins | `Nested Loop` / `Hash Join` |
 | SELECT pipeline | `Filter`, `Aggregate`, `Window`, `Distinct`, `Sort`, `Limit`, `Result` |
 | relation/set wrappers | `Values`, `Union`, `Intersect`, `Except`, `WITH`, `CTE <name>` |

@@ -455,10 +455,14 @@ Linus, with no orders, still gets a row:
 <LiveSql demo="parenthesized" seed={parenSeed} query={parenthesized} rows={4} />
 
 Without an alias the inner tables' names stay visible (`o.customer_id`, `p.name`, `p.*`) and must not
-repeat another `FROM` name. With an alias, `(a JOIN b ON …) AS g` behaves exactly like the derived
-table `(SELECT * FROM a JOIN b ON …) AS g`: you reference its columns through `g` (an optional
-column list `AS g (x, y)` renames them), and the inner names are hidden. The join inside the
-parentheses sees only its own tables, and must contain at least one join — `FROM (a)` is an error.
+repeat another `FROM` name. With an alias, `(a JOIN b ON …) AS g` behaves like the derived table
+`(SELECT * FROM a JOIN b ON …) AS g`: you reference its columns through `g` (an optional column list
+`AS g (x, y)` renames them), and the inner names are hidden. The join's `ON` clauses see only its own
+tables, and it must contain at least one join — `FROM (a)` is an error. A `LATERAL` item or table
+function inside the parentheses also sees the tables to the group's **left**, aliased or not, as in
+PostgreSQL: in `FROM a JOIN (b JOIN LATERAL (SELECT a.x + b.y AS v) s ON true) ON true` the group is
+re-evaluated for each row of `a`. As with any `LATERAL` reference, the group may not be the right side
+of a `RIGHT` or `FULL` join to the table it references (`42P10`).
 
 ## Conditional expressions (`CASE`, `COALESCE`, `GREATEST`/`LEAST`)
 

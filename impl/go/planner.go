@@ -92,6 +92,18 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
 	var subRels []subRel
 	var groupHidden []int
+	// A lateral fence (§15) is read only by the parenthesized-join body it was built for: any other
+	// SELECT planned against one sees through it as the empty level it is.
+	if parent != nil && parent.lateralView != nil && !sel.ParenJoin {
+		parent = parent.withoutLateralView()
+	}
+	// The scope this FROM's LATERAL items and table functions resolve their left relations against:
+	// parent, unless this is a parenthesized join's body planned against a fence — then the fence's
+	// view, so they also see the relations to the join's left (§15).
+	lateralParentScope := parent
+	if parent != nil && parent.lateralView != nil {
+		lateralParentScope = parent.lateralView
+	}
 	for i, tref := range tableRefs {
 		var t *catTable
 		var cteIdx *int
@@ -109,17 +121,22 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// deeper). nil when not lateral-eligible.
 		var lateralParent *scope
 		if lateralEligible {
-			lateralParent = &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels}
+			lateralParent = &scope{rels: rels, parent: lateralParentScope, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels}
 		}
 		if isDerived {
 			// Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
 			// otherwise the ENCLOSING query's scope (§42): the body sees no sibling FROM item, but a
 			// column of an enclosing query level correlates in the same frame as this query's own
 			// outer references (PostgreSQL). A VALUES body resolves its values the same way.
+			// A LATERAL first item sees no sibling, but inside a fenced parenthesized join it still sees
+			// the relations to the join's left (§15).
 			bodyParent := parent
 			if lateralEligible {
 				bodyParent = lateralParent
+			} else if tref.Lateral {
+				bodyParent = lateralParentScope
 			}
+			joinLateral := false
 			//   A query body is first planned as a SHAPE (planner.md §3.2): stage 2 needs only its output
 			// columns and pushability, and the body is planned for real once stage 2 knows what it pushes
 			// into it. A correlated LATERAL body takes no pushdown, so it is planned for real right away,
@@ -139,6 +156,38 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					p, perr := db.planViewReference(viewNames[i], tref.Subquery, &writtenRefs[i], *isolated[i], ptypes)
 					plan = p
 					return perr
+				})
+				if err != nil {
+					return nil, err
+				}
+			} else if i > 0 && parenJoinReachesLeft(&tref) {
+				// A parenthesized join whose LATERAL items may reach the relations to its left (§15):
+				// plan its body against a lateral fence — the left relations hidden from its ON clauses
+				// and non-LATERAL items, visible to its LATERAL items. A first planning, as a shape,
+				// learns whether any reference reached them. If so the join is a correlated lateral
+				// relation, planned for real against the fence; otherwise it is planned as any other
+				// derived body.
+				prefix := &scope{rels: rels, parent: lateralParentScope, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels}
+				fence := lateralFence(parent, prefix, db, ctes)
+				err := db.planBodyFirst(true, func() error {
+					_, perr := db.planQuery(*tref.Subquery, fence, ctes, ptypes)
+					return perr
+				})
+				if err != nil {
+					return nil, err
+				}
+				joinLateral = prefix.lateralHit
+				err = db.planAgain(ctes, func() error {
+					if joinLateral {
+						p, perr := db.planQuery(*tref.Subquery, fence, ctes, ptypes)
+						plan = p
+						return perr
+					}
+					return db.planBodyFirst(shapeBodies, func() error {
+						p, perr := db.planQuery(*tref.Subquery, parent, ctes, ptypes)
+						plan = p
+						return perr
+					})
 				})
 				if err != nil {
 					return nil, err
@@ -169,7 +218,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				}
 				plan = queryPlan{values: vp}
 			}
-			lateralFlags[i] = lateralEligible && queryPlanReferencesOuter(&plan, 0)
+			lateralFlags[i] = joinLateral || (lateralEligible && queryPlanReferencesOuter(&plan, 0))
 			shaped[i] = shapeBodies && tref.Subquery != nil && !lateralFlags[i]
 			label := ""
 			if tref.Alias != nil {
@@ -188,8 +237,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		} else if tref.IsFunc {
 			// A table function (SRF) — implicitly lateral. At i>0 its args resolve against the prefix
 			// scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query
-			// / params), unchanged (functions.md §10).
-			srfParent := parent
+			// / params — functions.md §10), or inside a fenced parenthesized join its lateral view (§15).
+			srfParent := lateralParentScope
 			if lateralEligible {
 				srfParent = lateralParent
 			}
@@ -217,8 +266,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		} else if tref.JsonTable != nil {
 			// A JSON_TABLE source (T1, json-table.md §3) — implicitly lateral like an SRF; its ctx
 			// resolves against the prefix scope (so `JSON_TABLE(sibling.doc, …)` works), or `parent` at
-			// i==0.
-			jtParent := parent
+			// i==0 (inside a fenced parenthesized join, its lateral view — §15).
+			jtParent := lateralParentScope
 			if lateralEligible {
 				jtParent = lateralParent
 			}
@@ -1225,7 +1274,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	if shaping {
 		return plan, nil
 	}
-	if err := db.planDerivedBodies(plan, tableRefs, isolated, shaped, cteBodies, parent, ctes, ptypes); err != nil {
+	if err := db.planDerivedBodies(plan, tableRefs, isolated, shaped, cteBodies, parent, lateralParentScope, ctes, ptypes); err != nil {
 		return nil, err
 	}
 	//
@@ -1278,7 +1327,7 @@ func (db *engine) withoutCteExpansion(f func() error) error {
 // WHERE, so its own rewrite and access-path selection see them; any other body is planned as written.
 // A CTE reference that plans its CTE's body (cteBodies, planner.md §3.4) plans it from the CTE's
 // syntax against the earlier bindings and no parent scope.
-func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isolated []*viewSite, shaped []bool, cteBodies []int, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
+func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isolated []*viewSite, shaped []bool, cteBodies []int, parent, lateralParent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
 	var pushes [][]*rExpr
 	if plan.pushdown != nil {
 		pushes = plan.pushdown.bodyPushes
@@ -1316,6 +1365,13 @@ func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isol
 			if ci := cteBodies[i]; ci >= 0 {
 				// An inlined CTE's body is planned against the bindings before it (planner.md §3.4).
 				body, rerr = replan(nil, ctes[:ci:ci])
+				return rerr
+			}
+			if tableRefs[i].Lateral {
+				// A LATERAL body planned like any derived body (it correlates to no sibling) keeps the
+				// scope it was first planned against: inside a fenced parenthesized join, the lateral
+				// view (§15).
+				body, rerr = replan(lateralParent, ctes)
 				return rerr
 			}
 			body, rerr = replan(parent, ctes)
@@ -1546,6 +1602,27 @@ func joinGroupOutputs(s *scope, projections *[]*rExpr, names *[]string, types *[
 		group.subRels = append(group.subRels, subRel{label: sr.label, table: sr.table, slots: slots})
 	}
 	return group
+}
+
+// parenJoinReachesLeft reports whether a parenthesized join's body holds an item that may reach the
+// relations to the join's left (spec/design/grammar.md §15): a LATERAL derived table, a table function
+// (implicitly lateral), or a nested parenthesized join holding one. Only such a join is planned
+// against a lateral fence.
+func parenJoinReachesLeft(tref *tableRef) bool {
+	if tref.Subquery == nil || tref.Subquery.Select == nil || !tref.Subquery.Select.ParenJoin {
+		return false
+	}
+	sel := tref.Subquery.Select
+	items := []*tableRef{sel.From}
+	for k := range sel.Joins {
+		items = append(items, &sel.Joins[k].Table)
+	}
+	for _, t := range items {
+		if t != nil && (t.Lateral || t.IsFunc || t.JsonTable != nil || parenJoinReachesLeft(t)) {
+			return true
+		}
+	}
+	return false
 }
 
 // derivedJoinGroup is the layout of a FROM item's derived body when it is an unaliased parenthesized

@@ -5484,7 +5484,7 @@ export class Engine {
       return;
     }
     if (rel.derived !== undefined) {
-      r.emit(depth, "Subquery " + rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
+      r.emit(depth, subqueryNode(rel.tableName), withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
       this.renderQueryPlan(r, rel.derived, depth + 1);
       return;
     }
@@ -15003,6 +15003,15 @@ export class Engine {
     // The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
     const subRels: SubRel[] = [];
     const groupHidden: number[] = [];
+    // A lateral fence (§15) is read only by the parenthesized-join body it was built for: any other
+    // SELECT planned against one sees through it as the empty level it is.
+    if (parent !== null && parent.lateralView !== null && sel.parenJoin !== true) {
+      parent = parent.withoutLateralView();
+    }
+    // The scope this FROM's LATERAL items and table functions resolve their left relations against:
+    // parent, unless this is a parenthesized join's body planned against a fence — then the fence's
+    // view, so they also see the relations to the join's left (§15).
+    const lateralParentScope = parent?.lateralView ?? parent;
     for (let i = 0; i < tableRefs.length; i++) {
       const tref = tableRefs[i]!;
       let t: Table;
@@ -15028,7 +15037,7 @@ export class Engine {
       // deeper). null when not lateral-eligible.
       let lateralParent: Scope | null = null;
       if (lateralEligible) {
-        lateralParent = new Scope([...rels], this, parent, true, ctes);
+        lateralParent = new Scope([...rels], this, lateralParentScope, true, ctes);
         lateralParent.subRels = [...subRels];
       }
       if (isDerived) {
@@ -15036,7 +15045,14 @@ export class Engine {
         // otherwise the ENCLOSING query's scope (§42): the body sees no sibling FROM item, but a
         // column of an enclosing query level correlates in the same frame as this query's own outer
         // references (PostgreSQL). A VALUES body resolves its values the same way.
-        const bodyParent = lateralEligible ? lateralParent : parent;
+        // A LATERAL first item sees no sibling, but inside a fenced parenthesized join it still sees
+        // the relations to the join's left (§15).
+        const bodyParent = lateralEligible
+          ? lateralParent
+          : tref.lateral === true
+            ? lateralParentScope
+            : parent;
+        let joinLateral = false;
         //   A query body is first planned as a SHAPE (planner.md §3.2): stage 2 needs only its output
         // columns and pushability, and the body is planned for real once stage 2 knows what it pushes
         // into it. A correlated LATERAL body takes no pushdown, so it is planned for real right away,
@@ -15060,11 +15076,25 @@ export class Engine {
                   ptypes,
                 ),
               )
-            : tref.subquery !== undefined
-              ? this.planBodyFirst(shapeBodies, () =>
-                  this.planQuery(tref.subquery!, bodyParent, ctes, ptypes),
+            : i > 0 && parenJoinReachesLeft(tref)
+              ? this.planParenJoinBody(
+                  tref.subquery!,
+                  rels,
+                  subRels,
+                  lateralParentScope,
+                  parent,
+                  ctes,
+                  ptypes,
+                  shapeBodies,
+                  (hit) => {
+                    joinLateral = hit;
+                  },
                 )
-              : this.planValues(tref.values!, bodyParent, ctes, ptypes);
+              : tref.subquery !== undefined
+                ? this.planBodyFirst(shapeBodies, () =>
+                    this.planQuery(tref.subquery!, bodyParent, ctes, ptypes),
+                  )
+                : this.planValues(tref.values!, bodyParent, ctes, ptypes);
         if (
           shapeBodies &&
           lateralEligible &&
@@ -15073,7 +15103,7 @@ export class Engine {
         ) {
           plan = this.planAgain(ctes, () => this.planQuery(tref.subquery!, bodyParent, ctes, ptypes));
         }
-        lateral = lateralEligible && queryPlanReferencesOuter(plan, 0);
+        lateral = joinLateral || (lateralEligible && queryPlanReferencesOuter(plan, 0));
         shaped[i] = shapeBodies && tref.subquery !== undefined && !lateral;
         const label = tref.alias === null ? "" : tref.alias;
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
@@ -15094,8 +15124,8 @@ export class Engine {
       } else if (tref.args !== null) {
         // A table function (SRF) — implicitly lateral. At i>0 its args resolve against the prefix
         // scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query /
-        // params), unchanged (functions.md §10).
-        const srfParent = lateralEligible ? lateralParent : parent;
+        // params — functions.md §10), or inside a fenced parenthesized join its lateral view (§15).
+        const srfParent = lateralEligible ? lateralParent : lateralParentScope;
         const r = this.resolveSRF(
           tref.name,
           tref.args,
@@ -15112,7 +15142,7 @@ export class Engine {
       } else if (tref.jsonTable !== undefined) {
         // A JSON_TABLE source (T1, json-table.md §3) — implicitly lateral like an SRF; its `ctx`
         // resolves against the prefix scope (so `JSON_TABLE(sibling.doc, …)` works).
-        const jtParent = lateralEligible ? lateralParent : parent;
+        const jtParent = lateralEligible ? lateralParent : lateralParentScope;
         const r = this.resolveJsonTable(tref.jsonTable, tref.alias, jtParent, ctes, ptypes);
         t = r.table;
         srf = r.srf;
@@ -16009,7 +16039,17 @@ export class Engine {
     rewriteWhere(plan);
     // A shape is read for its outputs and pushability only, then discarded (planner.md §3.2).
     if (shaping) return plan;
-    this.planDerivedBodies(plan, tableRefs, isolated, shaped, cteBodies, parent, ctes, ptypes);
+    this.planDerivedBodies(
+      plan,
+      tableRefs,
+      isolated,
+      shaped,
+      cteBodies,
+      parent,
+      lateralParentScope,
+      ctes,
+      ptypes,
+    );
     //
     // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
     optimizeSelect(plan, scope.rels, this.readSnap(), this);
@@ -16063,6 +16103,36 @@ export class Engine {
   // WHERE, so its own rewrite and access-path selection see them; any other body is planned as
   // written. A CTE reference that plans its CTE's body (cteBodies, planner.md §3.4) plans it from the
   // CTE's syntax against the earlier bindings and no parent scope.
+  // planParenJoinBody plans the body of a parenthesized join whose LATERAL items may reach the
+  // relations to its left (spec/design/grammar.md §15): against a lateral fence — the left relations
+  // (rels, subRels over lateralParent) hidden from its ON clauses and non-LATERAL items, visible to
+  // its LATERAL items. A first planning, as a shape, learns whether any reference reached them. If so
+  // the join is a correlated lateral relation (setHit(true)), planned for real against the fence;
+  // otherwise it is planned against parent as any other derived body.
+  private planParenJoinBody(
+    body: QueryExpr,
+    rels: ScopeRel[],
+    subRels: SubRel[],
+    lateralParent: Scope | null,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+    shapeBodies: boolean,
+    setHit: (hit: boolean) => void,
+  ): QueryPlan {
+    const prefix = new Scope([...rels], this, lateralParent, true, ctes);
+    prefix.subRels = [...subRels];
+    const fence = Scope.lateralFence(parent, prefix, this, ctes);
+    this.planBodyFirst(true, () => this.planQuery(body, fence, ctes, ptypes));
+    const hit = prefix.lateralHit;
+    setHit(hit);
+    return this.planAgain(ctes, () =>
+      hit
+        ? this.planQuery(body, fence, ctes, ptypes)
+        : this.planBodyFirst(shapeBodies, () => this.planQuery(body, parent, ctes, ptypes)),
+    );
+  }
+
   private planDerivedBodies(
     plan: SelectPlan,
     tableRefs: TableRef[],
@@ -16070,6 +16140,7 @@ export class Engine {
     shaped: boolean[],
     cteBodies: (number | null)[],
     parent: Scope | null,
+    lateralParent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): void {
@@ -16103,6 +16174,9 @@ export class Engine {
       plan.rels[i]!.derived = this.planAgain(ctes, () => {
         if (site !== null) return this.inViewBody(site, () => replan(null, []));
         if (ci !== null) return replan(null, ctes.slice(0, ci));
+        // A LATERAL body planned like any derived body (it correlates to no sibling) keeps the scope
+        // it was first planned against: inside a fenced parenthesized join, the lateral view (§15).
+        if (tableRefs[i]!.lateral === true) return replan(lateralParent, ctes);
         return replan(parent, ctes);
       });
     });
@@ -26473,6 +26547,26 @@ function pseudoTable(name: string, column: Column): Table {
   return { name, columns: [column], pk: [], checks: [], indexes: [], fks: [], exclusions: [] };
 }
 
+// subqueryNode is a derived relation's node (spec/design/explain.md §4): `Subquery <alias>`, or a bare
+// `Subquery` for an unaliased derived table or parenthesized join, which has no label.
+function subqueryNode(label: string): string {
+  return label === "" ? "Subquery" : "Subquery " + label;
+}
+
+// parenJoinReachesLeft reports whether a parenthesized join's body holds an item that may reach the
+// relations to the join's left (spec/design/grammar.md §15): a LATERAL derived table, a table function
+// (implicitly lateral), or a nested parenthesized join holding one. Only such a join is planned
+// against a lateral fence.
+function parenJoinReachesLeft(tref: TableRef): boolean {
+  const sel = tref.subquery;
+  if (sel === undefined || sel.kind !== "select" || sel.parenJoin !== true) return false;
+  const items = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
+  return items.some(
+    (t) =>
+      t.lateral === true || t.args !== null || t.jsonTable !== undefined || parenJoinReachesLeft(t),
+  );
+}
+
 // joinGroupOutputs completes a joinGroup body: after its `*` columns it appends every slot the star
 // omitted (a USING/NATURAL copy superseded by a merge), so each inner relation's columns are all
 // present, and records where each inner label's columns landed. Every star output is a bare column.
@@ -29286,7 +29380,7 @@ function selectActualRelNode(rel: PlanRel): string {
     return "SRF " + rel.tableName;
   }
   if (rel.cte !== undefined) return "CTE Scan " + rel.tableName;
-  if (rel.derived !== undefined) return "Subquery " + rel.tableName;
+  if (rel.derived !== undefined) return subqueryNode(rel.tableName);
   return "Scan " + rel.tableName;
 }
 

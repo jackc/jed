@@ -77,7 +77,7 @@ pub(crate) fn select_actual_rel_node(rel: &PlanRel) -> String {
         return format!("CTE Scan {}", rel.table_name);
     }
     if rel.derived.is_some() {
-        return format!("Subquery {}", rel.table_name);
+        return subquery_node(&rel.table_name);
     }
     format!("Scan {}", rel.table_name)
 }
@@ -995,7 +995,7 @@ impl Engine {
         } else if let Some(derived) = &rel.derived {
             r.emit(
                 depth,
-                format!("Subquery {}", rel.table_name),
+                subquery_node(&rel.table_name),
                 with_note(pushed_filter_detail(sp, i, String::new(), r.verbose), note),
             );
             self.render_query_plan(r, derived, depth + 1)
@@ -1148,4 +1148,14 @@ fn render_pk_bound(bound: &PkBound) -> String {
         parts.push(render_bound_terms(&range.name, &range.terms));
     }
     parts.join(" and ")
+}
+
+/// A derived relation's node (spec/design/explain.md §4): `Subquery <alias>`, or a bare `Subquery`
+/// for an unaliased derived table or parenthesized join, which has no label.
+fn subquery_node(label: &str) -> String {
+    if label.is_empty() {
+        "Subquery".to_string()
+    } else {
+        format!("Subquery {label}")
+    }
 }
