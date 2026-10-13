@@ -1567,12 +1567,25 @@ checks (`SELECT 1 UNION SELECT 3000000000` is `i64`, assignable to an `i32` targ
 target — PostgreSQL resolves it to `text` first and rejects a non-text target (`42804`); jed's
 untyped-NULL rule makes the difference observable here (ledgered). Right after the target, a `(`
 is ambiguous between the column list and a parenthesized source; it **begins the query** when it is
-followed by another `(`, a `WITH` clause, or a bare `SELECT` that is not itself a listed column
-name — keywords are not reserved (§3), so `(select)` and `(select, b)` stay column lists
-(PostgreSQL reserves `SELECT` and rejects both; ledgered). A `VALUES` operand or a parenthesized
-`VALUES` source is not accepted (§25's deferred narrowing). The optional **column list** and **`DEFAULT`-for-omitted
-columns** (§16) apply unchanged; a `DEFAULT` *keyword* value slot is a `VALUES`-only thing and
-does not exist in the SELECT source.
+followed by another `(`, a `WITH` clause, `VALUES (`, or a bare `SELECT` that is not itself a listed
+column name — keywords are not reserved (§3), so `(select)` and `(select, b)` stay column lists
+(PostgreSQL reserves `SELECT` and rejects both; ledgered). The optional **column list** and
+**`DEFAULT`-for-omitted columns** (§16) apply unchanged; a `DEFAULT` *keyword* value slot is a
+`VALUES`-only thing and does not exist in the SELECT source.
+
+**`VALUES` — the INSERT's own list, or a `VALUES` query (PostgreSQL's `transformInsertStmt`).** A
+`VALUES` row list that stands alone — also wrapped in any number of parentheses, `INSERT INTO t
+(VALUES (1, DEFAULT))` — is the INSERT's own `VALUES` source (§12/§16): its slots take `DEFAULT` and
+adapt to their target columns, at its own cost. When a set operator or a trailing `ORDER BY` /
+`LIMIT` / `OFFSET` follows the list (inside or outside those parentheses), the whole source is
+instead a query whose operand is a **`VALUES` query** (§25): `INSERT INTO t VALUES (1, 'a') UNION
+ALL SELECT 2, 'b'`, `INSERT INTO t VALUES (2, 'b'), (1, 'a') ORDER BY 1 LIMIT 1`, `INSERT INTO t
+(VALUES (1, 'a')) UNION (VALUES (2, 'b'))`, and a `WITH`-prefixed `VALUES` main query. Such a list's
+columns are typed by the `VALUES` relation's own rules — a string or all-`NULL` column is `text` — and
+then gated by the assignability check below like any query column (`INSERT INTO t (i32_col) VALUES
+(NULL) UNION ALL SELECT NULL` is `42804`, as in PostgreSQL), and a `DEFAULT` in it is `42601`
+("DEFAULT is not allowed in this context"). The parser decides by parsing the list as the INSERT's
+own and rewinding when a set operator or trailing clause follows.
 
 **Arity — the query's output column count must match the target**, exactly as a `VALUES`
 row's arity must (§12): the number of projected columns must equal the column-list length, or
@@ -1766,26 +1779,51 @@ leaves the `UNION` as a leftover token, `42601`, as in PostgreSQL.
 - **Disambiguation (a §8 cross-core surface).** In operand and statement position a `(` can only
   begin a query. In an **expression or FROM position** — where `(` also begins a parenthesized
   expression, row, or join — the §26 leading-`SELECT`/`WITH` lookahead is extended: a `(` begins a
-  parenthesized query when a run of `(` ends at `SELECT` or a `WITH` clause and **every** `(` in the
-  run is closed by a `)` followed by `UNION`, `INTERSECT`, `EXCEPT`, `ORDER`, `LIMIT`, `OFFSET`, or
-  another `)` — tokens that can follow a query but never a parenthesized expression (all six are
-  stop keywords, never an implicit alias, §15). So `((SELECT 1) UNION SELECT 2)` and `((SELECT 1))`
+  parenthesized query when a run of `(` ends at `SELECT`, `VALUES (`, or a `WITH` clause and
+  **every** `(` in the run is closed by a `)` followed by `UNION`, `INTERSECT`, `EXCEPT`, `ORDER`,
+  `LIMIT`, `OFFSET`, or another `)` — tokens that can follow a query but never a parenthesized
+  expression (all six are stop keywords, never an implicit alias, §15). So `((SELECT 1) UNION SELECT 2)` and `((SELECT 1))`
   are subqueries, `x IN ((SELECT a FROM t))` is the subquery form (a multi-row result is fine — the
   oracle agrees), while `((SELECT 1) + 1)` and `((SELECT 1), 2)` stay expressions and `FROM ((SELECT
   1) AS a JOIN b ON …)` stays a parenthesized join (§15). After `EXPLAIN`, a `(` opens the option list
-  unless `(`, `SELECT`, or a `WITH` clause follows it. Each core precomputes the classification for
-  every token in one backward pass over a matching-parenthesis table, so a long run of `(` costs
-  linear time and no recursion.
+  unless `(`, `SELECT`, `VALUES (`, or a `WITH` clause follows it. Each core precomputes the
+  classification for every token in one backward pass over a matching-parenthesis table, so a long
+  run of `(` costs linear time and no recursion.
 - **Pushdown.** A predicate over a derived table is never moved into an arm that has its own
   `LIMIT`/`OFFSET` (the existing body-pushability rule, [planner.md](planner.md) §3.2): the arm is
   limited first, then filtered.
 
-**Deferred narrowings (each relaxable later).**
+**`VALUES` queries.** A `VALUES` list is a query wherever a `SELECT` core is (PostgreSQL's
+`values_clause` is a `simple_select`): a statement `VALUES (1, 'a'), (2, 'b')`, a set-operation
+operand (`SELECT a FROM t UNION VALUES (2), (4)`, `VALUES (1) EXCEPT SELECT …`, parenthesized
+`(VALUES …)`), a `WITH` main query, and a CTE, view, derived-table, scalar, `IN`, `EXISTS`, or
+`ANY`/`ALL` subquery body, plus an operand of an INSERT query source (§24).
 
-- **No `VALUES` operand** — `VALUES (1) UNION SELECT 2` and a top-level `VALUES` query are not
-  accepted; `VALUES` is only a derived-table body (§42).
+- **It is `SELECT * FROM (VALUES …)`.** The parser builds the query `SELECT *` over a `VALUES`
+  relation (§42) labeled `*VALUES*` — PostgreSQL's name for it — so the planner, the column typing,
+  and the cost are the derived-table `VALUES` machinery unchanged. Its columns are `column1`,
+  `column2`, …, each typed by the `VALUES` body's per-column unification: integer widths widen,
+  integer with `decimal` is `decimal`, `NULL` takes the other rows' type, and an all-`NULL` (or
+  all-string) column is **`text`** — resolved before any set operation sees it, so `SELECT 1 UNION
+  VALUES (NULL)` is `42804` (PostgreSQL: "UNION types integer and text cannot be matched") where
+  `SELECT 1 UNION SELECT NULL` is fine.
+- **Trailing clauses.** Like a `select_core`, a `VALUES` operand takes no trailing clause of its own
+  (`VALUES (1) ORDER BY 1 UNION …` is `42601`); a lone `VALUES` query's `ORDER BY` / `LIMIT` /
+  `OFFSET` fold onto it, so a key names `column1`, an ordinal (`42P10` out of range), an expression
+  over the columns, or `"*VALUES*".column1` (PostgreSQL); after a set operator the keys see only the
+  output columns (`"*VALUES*".column1` is `42P01` there, as in PostgreSQL).
+- **Values** are the §42 general expressions — a column reference only correlates to an enclosing
+  query, an aggregate is `42803`, a no-context `$N` is `42P18`. A value that is exactly the bare word
+  `DEFAULT` is **`42601`** ("DEFAULT is not allowed in this context"), as everywhere but an INSERT's
+  own `VALUES` list (§24); jed reserves no keywords, so the rule is positional, as in the INSERT slot.
+- **Disambiguation.** In statement and operand position the `VALUES` keyword begins the list; in an
+  expression or FROM position `VALUES (` after a `(` begins a query (the §26 lookahead), so a column
+  named `values` stays an expression. In FROM, a parenthesized `VALUES` list with no set operator
+  stays the §42 `VALUES` relation itself (its alias and rename list apply directly).
 
-**Cost** is `lhs + rhs`, the combine itself unmetered — see [cost.md](cost.md) §3.
+**Cost** is `lhs + rhs`, the combine itself unmetered — see [cost.md](cost.md) §3. A `VALUES` query
+costs its rows twice — once produced by the `VALUES` relation, once by the wrapping query's scan —
+the §42 derived-table charges, no new unit.
 
 ## 26. Subqueries (scalar / `IN` / `EXISTS`)
 
@@ -2757,13 +2795,17 @@ always-inlined single-reference CTE — so the alias rules, the column-rename li
   only runtime changes are `int`→`decimal` and `f32`→`f64`, as for a set operation).
 - **A trailing `ORDER BY` / `LIMIT` / `OFFSET` on the body.** `(VALUES (3),(1),(2) ORDER BY 1 LIMIT 2)
   AS v` sorts and windows the rows before the outer query sees them (PostgreSQL). The body is then the
-  query `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an **unaliased** inner VALUES
-  relation, so a key names `column1`, `column2`, … by name, by ordinal (`42P10` past the last
-  column), or in an expression — never the derived table's alias or rename list (`v.column1` is
-  `42P01`, a renamed `x` is `42703`; oracle-identical), and the alias and rename list apply to the
-  query's output unchanged. Its cost is the VALUES rows plus that query's scan and sort — the
-  ordinary derived-table and `ORDER BY` charges, no new unit ([cost.md](cost.md) §3). `LATERAL`
-  applies to the whole body.
+  §25 `VALUES` query `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an inner VALUES
+  relation labeled `*VALUES*`, so a key names `column1`, `column2`, … by name, as
+  `"*VALUES*".column1`, by ordinal (`42P10` past the last column), or in an expression — never the
+  derived table's alias or rename list (`v.column1` is `42P01`, a renamed `x` is `42703`;
+  oracle-identical), and the alias and rename list apply to the query's output unchanged. Its cost
+  is the VALUES rows plus that query's scan and sort — the ordinary derived-table and `ORDER BY`
+  charges, no new unit ([cost.md](cost.md) §3). `LATERAL` applies to the whole body. A body whose
+  `VALUES` list is followed by a set operator (`FROM (VALUES (1) UNION VALUES (2)) AS v`) is a query
+  with `VALUES` operands (§25).
+- **`DEFAULT`.** A value that is exactly the bare word `DEFAULT` is `42601` ("DEFAULT is not allowed
+  in this context", PostgreSQL) — only an INSERT's own `VALUES` list takes it (§24).
 
 **The body sees no sibling (no `LATERAL`), but does see enclosing query levels.** A derived-table
 body sees its own FROM, the catalog, and the statement's **CTE bindings** (so `WITH c AS (…) SELECT
@@ -2807,6 +2849,7 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 | Leading `(` in FROM not followed by `SELECT`, `VALUES`, or `WITH` | ✅ | **Landed** (§15): a parenthesized join. `FROM (a)` / `(a, b)` (no join inside) is `42601`, as in PG. |
 | Qualified reference to a duplicated body output column (`d.a`) | `42702` | Ambiguous, like the bare reference (PG). |
 | Nested `WITH` inside the body | ✅ | **Landed** (cte.md §7): a derived-table body may be a `WITH`-prefixed query, establishing a child scope over the enclosing visible CTEs. |
+| A bare `DEFAULT` value in a VALUES body | `42601` | `DEFAULT is not allowed in this context` (PG). |
 | VALUES-body rows of differing arity | `42601` | `VALUES lists must all be the same length` (the §12 rule). |
 | VALUES-body columns whose row types do not unify | `42804` | `datatype_mismatch`, the set-operation unification rule (§25). |
 | Column reference (not of an enclosing query level) / aggregate / no-context `$N` in a VALUES-body value | `42703` / `42803` / `42P18` | The body is a non-`LATERAL` relation with no FROM row. |

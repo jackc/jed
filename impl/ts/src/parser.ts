@@ -372,9 +372,9 @@ class Parser {
   }
 
   // computeParenQuery builds the parenQuery table: the `(` at i begins a parenthesized query when
-  // what follows it is a query start (a SELECT, a WITH clause, or — recursively — another
-  // parenthesized query) AND its matching `)` is followed by a token that can only continue a query
-  // (isQueryFollowAtIndex). Computed back to front, so the recursion is a table lookup.
+  // what follows it is a query start (a SELECT, a VALUES list, a WITH clause, or — recursively —
+  // another parenthesized query) AND its matching `)` is followed by a token that can only continue
+  // a query (isQueryFollowAtIndex). Computed back to front, so the recursion is a table lookup.
   private computeParenQuery(): boolean[] {
     const n = this.tokens.length;
     const closeAt: number[] = new Array<number>(n).fill(n);
@@ -391,7 +391,10 @@ class Parser {
     for (let i = n - 1; i >= 0; i--) {
       if (this.tokens[i].kind !== "lparen") continue;
       const inner =
-        this.isSelectAtIndex(i + 1) || this.isWithClauseAtIndex(i + 1) || (i + 1 < n && q[i + 1]);
+        this.isSelectAtIndex(i + 1) ||
+        this.isValuesAtIndex(i + 1) ||
+        this.isWithClauseAtIndex(i + 1) ||
+        (i + 1 < n && q[i + 1]);
       q[i] = inner && this.isQueryFollowAtIndex(closeAt[i] + 1);
     }
     return q;
@@ -460,6 +463,9 @@ class Parser {
       case "insert":
         return this.parseInsert();
       case "select":
+        return this.parseQueryExpr();
+      // A top-level VALUES query (grammar.md §25): `VALUES (…), (…) [ORDER BY …]`.
+      case "values":
         return this.parseQueryExpr();
       // `WITH …` at statement start can only begin a query with common table expressions
       // (spec/design/cte.md). `with` is non-reserved but unambiguous here.
@@ -763,10 +769,11 @@ class Parser {
     const seen = new Set<string>();
     let optionList = false;
     // A `(` opens the option list unless a parenthesized query follows (`EXPLAIN (SELECT 1)`,
-    // grammar.md §25): an option is a plain word, never `(`, SELECT, or a WITH clause.
+    // grammar.md §25): an option is a plain word, never `(`, SELECT, `VALUES (`, or a WITH clause.
     const parenQuery =
       this.peekKindAt(1) === "lparen" ||
       this.peekKeywordAt(1) === "select" ||
+      this.isValuesAtIndex(this.pos + 1) ||
       this.isWithClauseAtOffset(1);
     if (this.peek().kind === "lparen" && !parenQuery) {
       optionList = true;
@@ -814,12 +821,13 @@ class Parser {
     return { kind: "explain", analyze, verbose, costs, lane, inner: this.parseExplainInner() };
   }
 
-  // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH / a
-  // parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and
-  // a nested EXPLAIN have no query plan to render and are rejected 42601.
+  // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / VALUES /
+  // WITH / a parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction
+  // control, and a nested EXPLAIN have no query plan to render and are rejected 42601.
   private parseExplainInner(): Statement {
     switch (this.peekKeyword()) {
       case "select":
+      case "values":
         return this.parseQueryExpr();
       case "with":
         return this.parseWithStatement();
@@ -2070,9 +2078,17 @@ class Parser {
       };
     }
 
-    // A query source (§24): a SELECT, a set operation, a parenthesized query, or a WITH-prefixed
-    // query. After the column list a `(` can only begin a query.
-    if (this.isSelectAtIndex(this.pos) || this.atWithClause() || this.peek().kind === "lparen") {
+    // A plain VALUES list, possibly parenthesized, is the INSERT VALUES source.
+    const plainRows = this.parseInsertValuesSource();
+    // A query source (§24): a SELECT, a VALUES query, a set operation, a parenthesized query, or a
+    // WITH-prefixed query. After the column list a `(` can only begin a query.
+    if (
+      plainRows === null &&
+      (this.isSelectAtIndex(this.pos) ||
+        this.isValuesAtIndex(this.pos) ||
+        this.atWithClause() ||
+        this.peek().kind === "lparen")
+    ) {
       const query = this.parseInsertQuery();
       const onConflict = this.parseOnConflict();
       const returning = this.parseReturning();
@@ -2090,17 +2106,13 @@ class Parser {
       };
     }
 
-    this.expectKeyword("values");
-
-    const rows: InsertValue[][] = [];
-    for (;;) {
-      rows.push(this.parseInsertRow());
-      if (this.peek().kind === "comma") {
-        this.advance();
-        continue;
-      }
-      break;
+    // Neither a VALUES list nor a query: the error names the expected VALUES keyword (a VALUES here
+    // was already parsed above, so this always fails).
+    if (plainRows === null) {
+      this.expectKeyword("values");
+      throw engineError("syntax_error", "expected VALUES or a query");
     }
+    const rows: InsertValue[][] = plainRows;
     const onConflict = this.parseOnConflict();
     const returning = this.parseReturning();
     return {
@@ -2489,23 +2501,43 @@ class Parser {
     return false;
   }
 
-  // isQueryStartAtOffset reports whether a query expression — a SELECT, a nested WITH clause
-  // (cte.md §7), or a parenthesized query (grammar.md §25) — begins at this.pos + offset. The §26
-  // leading-SELECT lookahead, extended with WITH, and with a run of `(`s that ends at a SELECT/WITH
-  // where EVERY `(` in the run is closed by a `)` followed by a token that can only continue a
-  // query — UNION / INTERSECT / EXCEPT / ORDER / LIMIT / OFFSET or a further `)`. Thus
+  // isQueryStartAtOffset reports whether a query expression — a SELECT, a VALUES list, a nested WITH
+  // clause (cte.md §7), or a parenthesized query (grammar.md §25) — begins at this.pos + offset. The
+  // §26 leading-SELECT lookahead, extended with `VALUES (` and WITH, and with a run of `(`s that ends
+  // at a SELECT / `VALUES (` / WITH where EVERY `(` in the run is closed by a `)` followed by a token
+  // that can only continue a query — UNION / INTERSECT / EXCEPT / ORDER / LIMIT / OFFSET or a further
+  // `)`. Thus
   // `((SELECT 1) UNION SELECT 2)` and `((SELECT 1))` are subqueries but `((SELECT 1) + 1)` and
   // `((SELECT 1), 2)` are expressions. Precomputed (computeParenQuery), so a long run of `(` can
   // neither exhaust the stack nor cost time per probe; a §8 cross-core surface.
   private isQueryStartAtOffset(offset: number): boolean {
     const i = this.pos + offset;
-    return this.isSelectAtIndex(i) || this.isWithClauseAtIndex(i) || this.parenQuery[i] === true;
+    return (
+      this.isSelectAtIndex(i) ||
+      this.isValuesAtIndex(i) ||
+      this.isWithClauseAtIndex(i) ||
+      this.parenQuery[i] === true
+    );
   }
 
   // isSelectAtIndex reports whether a SELECT keyword sits at token index i.
   private isSelectAtIndex(i: number): boolean {
     const t = this.tokens[i];
     return t !== undefined && t.kind === "word" && t.word === "select";
+  }
+
+  // isValuesAtIndex reports whether a VALUES list (`VALUES (`) begins at token index i (grammar.md
+  // §25) — the VALUES keyword followed by a row's `(`, so a column named `values` stays an expression.
+  private isValuesAtIndex(i: number): boolean {
+    const t = this.tokens[i];
+    const next = this.tokens[i + 1];
+    return (
+      t !== undefined &&
+      t.kind === "word" &&
+      t.word === "values" &&
+      next !== undefined &&
+      next.kind === "lparen"
+    );
   }
 
   // isWithClauseAtIndex is isWithClauseAtOffset at an absolute token index.
@@ -2599,16 +2631,21 @@ class Parser {
     return left;
   }
 
-  // parseSetOperand parses a set-operation operand (grammar.md §25): a select_core, or a
-  // parenthesized query — a full subquery_expr (its own WITH, set operations, and trailing ORDER
+  // parseSetOperand parses a set-operation operand (grammar.md §25): a select_core, a VALUES list, or
+  // a parenthesized query — a full subquery_expr (its own WITH, set operations, and trailing ORDER
   // BY/LIMIT/OFFSET) between `(` and `)`, one nesting level deeper. In operand position a `(` can only
-  // begin a query, so no lookahead is needed.
+  // begin a query, so no lookahead is needed. A VALUES operand is the query `SELECT * FROM (VALUES …)`
+  // over a *VALUES* relation (valuesQuery), so its columns are column1, column2, … and a trailing ORDER
+  // BY folds onto it like a SELECT's.
   private parseSetOperand(): QueryExpr {
     if (this.peek().kind === "lparen") {
       this.advance();
       const q = this.parseSubquery();
       this.expect("rparen");
       return q;
+    }
+    if (this.peekKeyword() === "values") {
+      return valuesQuery(this.parseValuesBody(), [], null, null);
     }
     return this.parseSelectCore();
   }
@@ -2653,6 +2690,58 @@ class Parser {
     return { limit, offset };
   }
 
+  // parseInsertValuesSource parses the plain VALUES source of an INSERT (grammar.md §12/§24): `VALUES
+  // row [, row]*`, optionally wrapped in any number of parentheses (`INSERT INTO t (VALUES …)` is the
+  // same source — PostgreSQL), whose slots take DEFAULT and adapt to their target columns. It is that
+  // source only when the list stands alone: a set operator or a trailing ORDER BY / LIMIT / OFFSET
+  // after it (inside or outside the parentheses) makes the whole source a query whose operand is a
+  // VALUES query, so this rewinds and returns null for parseInsertQuery. null too when no VALUES list
+  // begins here. Each parenthesis is one nesting level, as for a query.
+  private parseInsertValuesSource(): InsertValue[][] | null {
+    const start = this.pos;
+    const depth = this.depth;
+    const furthest = this.furthest;
+    let parens = 0;
+    while (this.peekKindAt(parens) === "lparen") parens++;
+    if (this.peekKeywordAt(parens) !== "values") return null;
+    for (let i = 0; i < parens; i++) {
+      this.advance(); // '('
+      this.deepen();
+    }
+    this.expectKeyword("values");
+    const rows: InsertValue[][] = [];
+    for (;;) {
+      rows.push(this.parseInsertRow());
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      break;
+    }
+    // A set operator or ORDER/LIMIT/OFFSET (a query-follow token other than `)`) after the list or
+    // after one of its closing parentheses makes it a query operand.
+    const continuesQuery = (): boolean =>
+      this.isQueryFollowAtIndex(this.pos) && this.peek().kind !== "rparen";
+    let plain = true;
+    for (let i = 0; i < parens; i++) {
+      if (continuesQuery()) {
+        plain = false;
+        break;
+      }
+      this.expect("rparen");
+    }
+    if (plain && !continuesQuery()) {
+      this.depth = depth;
+      return rows;
+    }
+    // Rewind, forgetting what the abandoned parse examined so a later error is positioned by the
+    // re-parse (error-fields.md §10.3).
+    this.pos = start;
+    this.depth = depth;
+    this.furthest = furthest;
+    return null;
+  }
+
   // atInsertParenQuery reports whether the `(` at the current position begins a parenthesized query
   // source rather than an INSERT column list (grammar.md §24). A column list holds only identifiers,
   // so the `(` begins a query when it is followed by another `(`, by a WITH clause, or by a bare
@@ -2660,7 +2749,7 @@ class Parser {
   // keywords are not reserved, §3). A §8 cross-core surface.
   private atInsertParenQuery(): boolean {
     if (this.peekKindAt(1) === "lparen") return true;
-    if (this.isWithClauseAtOffset(1)) return true;
+    if (this.isWithClauseAtOffset(1) || this.isValuesAtIndex(this.pos + 1)) return true;
     if (this.isSelectAtIndex(this.pos + 1)) {
       const next = this.peekKindAt(2);
       return next !== "comma" && next !== "rparen";
@@ -3111,8 +3200,25 @@ class Parser {
     let body: QueryExpr | undefined;
     let values: Expr[][] | undefined;
     let group: Select | undefined;
+    // A set operator after a VALUES list makes the body a query with a VALUES operand (grammar.md
+    // §25): rewind and parse it as one.
+    const start = this.pos;
+    const depth = this.depth;
+    const furthest = this.furthest;
+    let valuesRows: Expr[][] | null = null;
     if (this.peekKeyword() === "values") {
       const rows = this.parseValuesBody();
+      const kw = this.peekKeyword();
+      if (kw === "union" || kw === "intersect" || kw === "except") {
+        this.pos = start;
+        this.depth = depth;
+        this.furthest = furthest;
+      } else {
+        valuesRows = rows;
+      }
+    }
+    if (valuesRows !== null) {
+      const rows = valuesRows;
       // A trailing ORDER BY / LIMIT / OFFSET makes the body the query
       // `SELECT * FROM (VALUES …) ORDER BY … LIMIT …` (valuesQuery).
       const orderBy = this.parseOrderBy(true);
@@ -3189,10 +3295,10 @@ class Parser {
     const rows: Expr[][] = [];
     for (;;) {
       this.expect("lparen");
-      const row: Expr[] = [this.parseExpr()];
+      const row: Expr[] = [this.parseValuesValue()];
       while (this.peek().kind === "comma") {
         this.advance();
-        row.push(this.parseExpr());
+        row.push(this.parseValuesValue());
       }
       this.expect("rparen");
       rows.push(row);
@@ -3200,6 +3306,18 @@ class Parser {
       this.advance();
     }
     return rows;
+  }
+
+  // parseValuesValue parses one value of a VALUES-body row: a general expression. A value that is
+  // exactly the bare word DEFAULT is the keyword, as in an INSERT slot, and is allowed only in the
+  // plain INSERT … VALUES source: here it is 42601 (PostgreSQL: "DEFAULT is not allowed in this
+  // context").
+  private parseValuesValue(): Expr {
+    const next = this.peekKindAt(1);
+    if (this.peekKeyword() === "default" && (next === "comma" || next === "rparen")) {
+      throw engineError("syntax_error", "DEFAULT is not allowed in this context");
+    }
+    return this.parseExpr();
   }
 
   // parseJsonTable parses `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md
@@ -5548,18 +5666,22 @@ function renderToken(t: Token): string {
   }
 }
 
-// valuesQuery builds a VALUES body with trailing ORDER BY / LIMIT / OFFSET (grammar.md §42) as the
-// query `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an UNALIASED inner VALUES
-// relation: the keys resolve against column1, column2, … by name or ordinal (a qualified key has no
-// label to name, 42P01, as in PostgreSQL), and the enclosing derived table's alias and column-rename
-// list apply to the query's output unchanged.
+// VALUES_LABEL is the label of a VALUES query's relation (PostgreSQL's "*VALUES*").
+const VALUES_LABEL = "*VALUES*";
+
+// valuesQuery builds a VALUES query (grammar.md §25) — a statement, a set-operation operand, or a
+// VALUES body with trailing ORDER BY / LIMIT / OFFSET (§42) — as the query `SELECT * FROM (VALUES …)
+// ORDER BY … LIMIT … OFFSET …` over an inner VALUES relation labeled *VALUES* (PostgreSQL's name for
+// it): the keys resolve against column1, column2, … by name, as "*VALUES*".column1, or by ordinal,
+// and an enclosing derived table's alias and column-rename list apply to the query's output unchanged
+// (v.column1 in the keys is 42P01, as in PostgreSQL).
 function valuesQuery(
   rows: Expr[][],
   orderBy: OrderKey[],
   limit: bigint | null,
   offset: bigint | null,
 ): Select {
-  const inner: TableRef = { name: "", alias: null, args: null, values: rows };
+  const inner: TableRef = { name: VALUES_LABEL, alias: VALUES_LABEL, args: null, values: rows };
   return {
     kind: "select",
     distinct: false,

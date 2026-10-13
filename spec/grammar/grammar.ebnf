@@ -74,8 +74,8 @@ sql_statement  ::= create_table
  * TRUE/FALSE/ON/OFF are accepted. An option may occur at most once. EXPLAIN and option words are
  * recognized POSITIONALLY and are NOT reserved (§3). The inner statement is restricted to a query or
  * DML (never DDL, transaction control, or a nested EXPLAIN). A "(" right after EXPLAIN opens the option
- * list unless "(", "SELECT", or a WITH clause follows it — then it begins a parenthesized query
- * ("EXPLAIN (SELECT 1)", ../design/grammar.md §25). */
+ * list unless "(", "SELECT", "VALUES (", or a WITH clause follows it — then it begins a parenthesized
+ * query ("EXPLAIN (SELECT 1)", ../design/grammar.md §25). */
 explain        ::= "EXPLAIN" ( "ANALYZE" | explain_options )? explainable
 explain_options ::= "(" explain_option ( "," explain_option )* ")"
 explain_option ::= ( "ANALYZE" | "VERBOSE" | "COSTS" | "LANE" ) explain_boolean?
@@ -437,11 +437,16 @@ type_word      ::= "character" "varying" | identifier
 /* --- DML ----------------------------------------------------------------- */
 
 /* INSERT's source is `DEFAULT VALUES`, a "VALUES" list of one or more parenthesized rows, OR a
- * subquery_expr (INSERT ... SELECT — ../design/grammar.md §24): a SELECT, a set operation, a
- * parenthesized query, or a WITH-prefixed query (a nested WITH — a data-modifying CTE there is 0A000).
+ * subquery_expr (INSERT ... SELECT — ../design/grammar.md §24): a SELECT, a VALUES query, a set
+ * operation, a parenthesized query, or a WITH-prefixed query (a nested WITH — a data-modifying CTE
+ * there is 0A000). The "VALUES" row list is the INSERT's own source — its slots take "DEFAULT" and
+ * adapt to their target columns — when it stands alone, also wrapped in any number of parentheses
+ * ("INSERT INTO t (VALUES …)", PostgreSQL); followed by a set operator or a trailing ORDER BY /
+ * LIMIT / OFFSET (inside or outside those parentheses) it is instead a values_body operand of the
+ * subquery_expr source (a VALUES query, ../design/grammar.md §25), where "DEFAULT" is 42601.
  * Right after the target a "(" begins the parenthesized query source, not a column list, when it is
- * followed by another "(", a WITH clause, or a bare SELECT that is not itself a listed column name
- * ("(select)" and "(select, b)" stay column lists — keywords are not reserved, §3). An optional column list names the target
+ * followed by another "(", a WITH clause, "VALUES (", or a bare SELECT that is not itself a listed
+ * column name ("(select)" and "(select, b)" stay column lists — keywords are not reserved, §3). An optional column list names the target
  * columns (`INSERT INTO t (a, c) VALUES ...` / `... SELECT ...`); with no list the values map
  * positionally to every column in declaration order. Each VALUES row's arity — or the SELECT's
  * output column count — must match the list (or the column count); a mismatch is 42601 (for the
@@ -599,8 +604,9 @@ query_expr     ::= set_expr order_by? limit_offset?
  * "WITH <name> (" / "WITH <name> AS" (so `with` stays a legal identifier elsewhere). A
  * data-modifying CTE in a nested WITH is rejected 0A000 (DML-WITH is top-level only — matching PG).
  *   DISAMBIGUATION at an expression or FROM position (a §8 cross-core surface,
- * ../design/grammar.md §25): the body after "(" is a subquery_expr when it starts with "SELECT", a
- * WITH clause, or a PARENTHESIZED QUERY — a run of "(" ending at "SELECT" / a WITH clause in which
+ * ../design/grammar.md §25): the body after "(" is a subquery_expr when it starts with "SELECT",
+ * "VALUES (", a WITH clause, or a PARENTHESIZED QUERY — a run of "(" ending at "SELECT" / "VALUES (" /
+ * a WITH clause in which
  * EVERY "(" is closed by a ")" followed by "UNION" / "INTERSECT" / "EXCEPT" / "ORDER" / "LIMIT" /
  * "OFFSET" or another ")". So "((SELECT 1) UNION SELECT 2)" and "((SELECT 1))" are subqueries,
  * while "((SELECT 1) + 1)" and "((SELECT 1), 2)" are expressions and "FROM ((SELECT 1) AS a JOIN
@@ -660,8 +666,14 @@ set_expr       ::= intersect_expr (("UNION" | "EXCEPT") ("ALL" | "DISTINCT")? in
 
 intersect_expr ::= set_operand ("INTERSECT" ("ALL" | "DISTINCT")? set_operand)*
 
-/* In operand position a "(" can only begin a parenthesized query, so no lookahead is needed. */
-set_operand    ::= select_core | "(" subquery_expr ")"
+/* In operand position a "(" can only begin a parenthesized query, so no lookahead is needed. A
+ * values_body operand is a VALUES QUERY (../design/grammar.md §25): the query "SELECT * FROM (VALUES
+ * …)" over a VALUES relation labeled "*VALUES*" (PostgreSQL's name), whose columns are column1,
+ * column2, … typed by the values_body rules (§42). Like a select_core it takes no trailing clause of
+ * its own; a lone VALUES query's ORDER BY / LIMIT / OFFSET fold onto it, so a key names columnN, an
+ * ordinal, an expression over them, or "*VALUES*".columnN. So "VALUES (1, 'a'), (2, 'b') ORDER BY
+ * 2" is a statement, and "SELECT … UNION VALUES (…)" / "VALUES (…) EXCEPT SELECT …" combine. */
+set_operand    ::= select_core | values_body | "(" subquery_expr ")"
 
 /* A SELECT core is one SELECT WITHOUT a trailing ORDER BY / LIMIT / OFFSET — the operand form of
  * a set operation. A lone query_expr (no set operator) folds the trailing clauses back onto this
@@ -810,13 +822,16 @@ joined_group   ::= "(" (table_ref join_clause+ | joined_group) ")"
 qualified_table ::= (identifier ".")? identifier
 
 /* A derived table's body is either a query_expr (SELECT / set op) or a VALUES list — a computed
- * relation of literal rows (../design/grammar.md §42). A VALUES body with a trailing ORDER BY /
- * LIMIT / OFFSET is the query "SELECT * FROM (VALUES …) ORDER BY … LIMIT …" over an UNALIASED
- * VALUES relation: keys name column1, column2, … or an ordinal, never the derived table's alias or
- * rename list (PostgreSQL). A values_row value
+ * relation of literal rows (../design/grammar.md §42). A VALUES body followed by a set operator is a
+ * subquery_expr with a VALUES operand (§25). A VALUES body with a trailing ORDER BY /
+ * LIMIT / OFFSET is the VALUES query "SELECT * FROM (VALUES …) ORDER BY … LIMIT …" over the
+ * "*VALUES*" relation: keys name column1, column2, … or an ordinal, never the derived table's alias
+ * or rename list (PostgreSQL). A values_row value
  * is a general expression resolved as a CONSTANT — non-LATERAL, so a column reference is 42703; an
- * aggregate is 42803; a $N with no inferable type is 42P18. All rows must have the same arity
- * (42601); the column types unify across rows like a set operation (42804 on a mismatch). */
+ * aggregate is 42803; a $N with no inferable type is 42P18. A value that is exactly the bare word
+ * "DEFAULT" is 42601 ("DEFAULT is not allowed in this context" — only an INSERT's own VALUES list
+ * takes it). All rows must have the same arity (42601); the column types unify across rows like a
+ * set operation (42804 on a mismatch). */
 derived_table  ::= "(" (subquery_expr | values_body order_by? limit_offset?) ")"
 
 values_body    ::= "VALUES" values_row ("," values_row)*

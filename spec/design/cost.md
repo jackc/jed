@@ -1388,6 +1388,13 @@ statement's cost is the set operation's `cost(a) + cost(b)` and the INSERT adds 
 `INSERT INTO t SELECT … UNION SELECT …` costs exactly what the same set operation costs as a
 query.
 
+A **`VALUES` query** (grammar.md §25) — a statement, a set-operation operand, or a subquery body — is
+the query `SELECT * FROM (VALUES …)`, so it costs exactly that: each row's value `operator_eval`s and
+`row_produced` in the `VALUES` relation, then one more `row_produced` per row from the wrapping
+query's scan (plus any `ORDER BY` / `LIMIT` it carries, charged as for any query). `VALUES (1, 'a'),
+(2, 'b')` costs **4**; as a set-operation operand it is one more independently metered `cost(a)`. An
+INSERT's own plain `VALUES` list (also parenthesized) is not a query and keeps its slot costs.
+
 **Worked example.** Tables `a` (3 rows) and `b` (2 rows), each a single leaf page;
 `SELECT x FROM a UNION SELECT x FROM b`. The left operand materializes `a` → 1 `page_read` +
 3 `storage_row_read` and emits 3 rows → 3 `row_produced` (a bare-column projection is a leaf,

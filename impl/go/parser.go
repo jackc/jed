@@ -124,8 +124,8 @@ func (p *parser) note(i int) {
 }
 
 // computeParenQuery builds the parenQuery table: the `(` at i begins a parenthesized query when what
-// follows it is a query start (a SELECT, a WITH clause, or — recursively — another parenthesized
-// query) AND its matching `)` is followed by a token that can only continue a query
+// follows it is a query start (a SELECT, a VALUES list, a WITH clause, or — recursively — another
+// parenthesized query) AND its matching `)` is followed by a token that can only continue a query
 // (isQueryFollowAt). Computed back to front, so the recursion is a table lookup.
 func (p *parser) computeParenQuery() []bool {
 	n := len(p.tokens)
@@ -148,7 +148,8 @@ func (p *parser) computeParenQuery() []bool {
 		if p.tokens[i].Kind != tokLParen {
 			continue
 		}
-		inner := p.isSelectAtIndex(i+1) || p.isWithClauseAtIndex(i+1) || (i+1 < n && q[i+1])
+		inner := p.isSelectAtIndex(i+1) || p.isValuesAtIndex(i+1) || p.isWithClauseAtIndex(i+1) ||
+			(i+1 < n && q[i+1])
 		q[i] = inner && p.isQueryFollowAtIndex(closeAt[i]+1)
 	}
 	return q
@@ -319,6 +320,9 @@ func (p *parser) parseStatement() (statement, error) {
 		}
 		return statement{Insert: ins}, nil
 	case "select":
+		return p.parseQueryExpr()
+	// A top-level VALUES query (grammar.md §25): `VALUES (…), (…) [ORDER BY …]`.
+	case "values":
 		return p.parseQueryExpr()
 	// `WITH …` at statement start can only begin a query with common table expressions
 	// (spec/design/cte.md). `with` is non-reserved but unambiguous here.
@@ -684,8 +688,9 @@ func (p *parser) parseExplain() (statement, error) {
 	seen := make(map[string]bool)
 	optionList := false
 	// A `(` opens the option list unless a parenthesized query follows (`EXPLAIN (SELECT 1)`,
-	// grammar.md §25): an option is a plain word, never `(`, SELECT, or a WITH clause.
-	parenQuery := p.peekKindAt(1) == tokLParen || p.peekKeywordAt(1) == "select" || p.isWithClauseAtOffset(1)
+	// grammar.md §25): an option is a plain word, never `(`, SELECT, `VALUES (`, or a WITH clause.
+	parenQuery := p.peekKindAt(1) == tokLParen || p.peekKeywordAt(1) == "select" ||
+		p.isValuesAtIndex(p.pos+1) || p.isWithClauseAtOffset(1)
 	if p.peek().Kind == tokLParen && !parenQuery {
 		optionList = true
 		p.advance()
@@ -743,12 +748,12 @@ func (p *parser) parseExplain() (statement, error) {
 	return statement{Explain: &explain{Analyze: analyze, Verbose: verbose, Costs: costs, Lane: lane, Inner: &inner}}, nil
 }
 
-// parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH / a
-// parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and
-// a nested EXPLAIN have no query plan to render and are rejected 42601.
+// parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / VALUES /
+// WITH / a parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction
+// control, and a nested EXPLAIN have no query plan to render and are rejected 42601.
 func (p *parser) parseExplainInner() (statement, error) {
 	switch p.peekKeyword() {
-	case "select":
+	case "select", "values":
 		return p.parseQueryExpr()
 	case "with":
 		return p.parseWithStatement()
@@ -2665,9 +2670,15 @@ func (p *parser) parseInsert() (*insert, error) {
 		}
 		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: []string{}, Rows: [][]insertValue{{}}, OnConflict: onConflict, Returning: returning}, nil
 	}
-	// A query source (§24): a SELECT, a set operation, a parenthesized query, or a WITH-prefixed
-	// query. After the column list a `(` can only begin a query.
-	if p.isSelectAtIndex(p.pos) || p.atWithClause() || p.peek().Kind == tokLParen {
+	// A plain VALUES list, possibly parenthesized, is the INSERT VALUES source.
+	rows, plain, err := p.parseInsertValuesSource()
+	if err != nil {
+		return nil, err
+	}
+	// A query source (§24): a SELECT, a VALUES query, a set operation, a parenthesized query, or a
+	// WITH-prefixed query. After the column list a `(` can only begin a query.
+	if !plain && (p.isSelectAtIndex(p.pos) || p.isValuesAtIndex(p.pos) || p.atWithClause() ||
+		p.peek().Kind == tokLParen) {
 		query, err := p.parseInsertQuery()
 		if err != nil {
 			return nil, err
@@ -2683,22 +2694,13 @@ func (p *parser) parseInsert() (*insert, error) {
 		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Query: &query, OnConflict: onConflict, Returning: returning}, nil
 	}
 
-	if err := p.expectKeyword("values"); err != nil {
-		return nil, err
-	}
-
-	var rows [][]insertValue
-	for {
-		row, err := p.parseInsertRow()
-		if err != nil {
+	if !plain {
+		// Neither a VALUES list nor a query: the error names the expected VALUES keyword (a VALUES
+		// here was already parsed above, so this always fails).
+		if err := p.expectKeyword("values"); err != nil {
 			return nil, err
 		}
-		rows = append(rows, row)
-		if p.peek().Kind == tokComma {
-			p.advance()
-			continue
-		}
-		break
+		return nil, newError(SyntaxError, "expected VALUES or a query")
 	}
 	onConflict, err := p.parseOnConflict()
 	if err != nil {
@@ -3311,10 +3313,12 @@ func (p *parser) parseIntersectExpr() (queryExpr, error) {
 	return left, nil
 }
 
-// parseSetOperand parses a set-operation operand (grammar.md §25): a select_core, or a parenthesized
-// query — a full subquery_expr (its own WITH, set operations, and trailing ORDER BY/LIMIT/OFFSET)
-// between `(` and `)`, one nesting level deeper. In operand position a `(` can only begin a query,
-// so no lookahead is needed.
+// parseSetOperand parses a set-operation operand (grammar.md §25): a select_core, a VALUES list, or a
+// parenthesized query — a full subquery_expr (its own WITH, set operations, and trailing ORDER
+// BY/LIMIT/OFFSET) between `(` and `)`, one nesting level deeper. In operand position a `(` can only
+// begin a query, so no lookahead is needed. A VALUES operand is the query `SELECT * FROM (VALUES …)`
+// over a *VALUES* relation (valuesQuery), so its columns are column1, column2, … and a trailing ORDER
+// BY folds onto it like a SELECT's.
 func (p *parser) parseSetOperand() (queryExpr, error) {
 	if p.peek().Kind == tokLParen {
 		p.advance()
@@ -3326,6 +3330,13 @@ func (p *parser) parseSetOperand() (queryExpr, error) {
 			return queryExpr{}, err
 		}
 		return q, nil
+	}
+	if p.peekKeyword() == "values" {
+		rows, err := p.parseValuesBody()
+		if err != nil {
+			return queryExpr{}, err
+		}
+		return valuesQuery(rows, &selectStmt{}), nil
 	}
 	core, err := p.parseSelectCore()
 	if err != nil {
@@ -3349,6 +3360,69 @@ func (p *parser) parseSetOpQuantifier() bool {
 	}
 }
 
+// parseInsertValuesSource parses the plain VALUES source of an INSERT (grammar.md §12/§24): `VALUES
+// row [, row]*`, optionally wrapped in any number of parentheses (`INSERT INTO t (VALUES …)` is the
+// same source — PostgreSQL), whose slots take DEFAULT and adapt to their target columns. It is that
+// source only when the list stands alone: a set operator or a trailing ORDER BY / LIMIT / OFFSET
+// after it (inside or outside the parentheses) makes the whole source a query whose operand is a
+// VALUES query, so this rewinds and returns ok=false for parseInsertQuery. ok=false too when no
+// VALUES list begins here. Each parenthesis is one nesting level, as for a query.
+func (p *parser) parseInsertValuesSource() ([][]insertValue, bool, error) {
+	start, depth, furthest := p.pos, p.depth, p.furthest
+	parens := 0
+	for p.peekKindAt(parens) == tokLParen {
+		parens++
+	}
+	if p.peekKeywordAt(parens) != "values" {
+		return nil, false, nil
+	}
+	for i := 0; i < parens; i++ {
+		p.advance() // '('
+		if err := p.deepen(); err != nil {
+			return nil, false, err
+		}
+	}
+	if err := p.expectKeyword("values"); err != nil {
+		return nil, false, err
+	}
+	var rows [][]insertValue
+	for {
+		row, err := p.parseInsertRow()
+		if err != nil {
+			return nil, false, err
+		}
+		rows = append(rows, row)
+		if p.peek().Kind == tokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	// A set operator or ORDER/LIMIT/OFFSET (a query-follow token other than `)`) after the list or
+	// after one of its closing parentheses makes it a query operand.
+	continuesQuery := func() bool { return p.isQueryFollowAtIndex(p.pos) && p.peek().Kind != tokRParen }
+	plain := true
+	for i := 0; i < parens; i++ {
+		if continuesQuery() {
+			plain = false
+			break
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return nil, false, err
+		}
+	}
+	if plain && !continuesQuery() {
+		p.depth = depth
+		return rows, true, nil
+	}
+	// Rewind, forgetting what the abandoned parse examined so a later error is positioned by the
+	// re-parse (error-fields.md §10.3).
+	p.pos = start
+	p.depth = depth
+	p.furthest = furthest
+	return nil, false, nil
+}
+
 // atInsertParenQuery reports whether the `(` at the current position begins a parenthesized query
 // source rather than an INSERT column list (grammar.md §24). A column list holds only identifiers,
 // so the `(` begins a query when it is followed by another `(`, by a WITH clause, or by a bare
@@ -3358,7 +3432,7 @@ func (p *parser) atInsertParenQuery() bool {
 	switch {
 	case p.peekKindAt(1) == tokLParen:
 		return true
-	case p.isWithClauseAtOffset(1):
+	case p.isWithClauseAtOffset(1), p.isValuesAtIndex(p.pos + 1):
 		return true
 	case p.isSelectAtIndex(p.pos + 1):
 		next := p.peekKindAt(2)
@@ -4007,12 +4081,25 @@ func (p *parser) parseDerivedTable(lateral bool) (tableRef, error) {
 	var body *queryExpr
 	var values [][]*exprNode
 	joinGroup := false
-	switch {
-	case p.peekKeyword() == "values":
+	// A set operator after a VALUES list makes the body a query with a VALUES operand (grammar.md
+	// §25): rewind and parse it as one.
+	start, depth, furthest := p.pos, p.depth, p.furthest
+	var valuesRows [][]*exprNode
+	if p.peekKeyword() == "values" {
 		v, err := p.parseValuesBody()
 		if err != nil {
 			return tableRef{}, err
 		}
+		switch p.peekKeyword() {
+		case "union", "intersect", "except":
+			p.pos, p.depth, p.furthest = start, depth, furthest
+		default:
+			valuesRows = v
+		}
+	}
+	switch {
+	case valuesRows != nil:
+		v := valuesRows
 		// A trailing ORDER BY / LIMIT / OFFSET makes the body the query
 		// `SELECT * FROM (VALUES …) ORDER BY … LIMIT …` (valuesQuery).
 		var trailing selectStmt
@@ -4112,7 +4199,7 @@ func (p *parser) parseValuesBody() ([][]*exprNode, error) {
 		}
 		var row []*exprNode
 		for {
-			e, err := p.parseExpr()
+			e, err := p.parseValuesValue()
 			if err != nil {
 				return nil, err
 			}
@@ -4132,6 +4219,17 @@ func (p *parser) parseValuesBody() ([][]*exprNode, error) {
 		p.advance()
 	}
 	return rows, nil
+}
+
+// parseValuesValue parses one value of a VALUES-body row: a general expression. A value that is
+// exactly the bare word DEFAULT is the keyword, as in an INSERT slot, and is allowed only in the
+// plain INSERT … VALUES source: here it is 42601 (PostgreSQL: "DEFAULT is not allowed in this
+// context").
+func (p *parser) parseValuesValue() (exprNode, error) {
+	if p.peekKeyword() == "default" && (p.peekKindAt(1) == tokComma || p.peekKindAt(1) == tokRParen) {
+		return exprNode{}, newError(SyntaxError, "DEFAULT is not allowed in this context")
+	}
+	return p.parseExpr()
 }
 
 // parseJoinClause parses one join_clause if a join keyword begins here (returns ok=false to end
@@ -6569,22 +6667,30 @@ func (p *parser) isWithClauseAtOffset(offset int) bool {
 	return false
 }
 
-// isQueryStartAtOffset reports whether a query expression — a SELECT, a nested WITH clause (cte.md
-// §7), or a parenthesized query (grammar.md §25) — begins at p.pos+offset. The §26 leading-SELECT
-// lookahead, extended with WITH, and with a run of `(`s that ends at a SELECT/WITH where EVERY `(` in
-// the run is closed by a `)` followed by a token that can only continue a query — UNION / INTERSECT /
-// EXCEPT / ORDER / LIMIT / OFFSET or a further `)`. Thus `((SELECT 1) UNION SELECT 2)` and
+// isQueryStartAtOffset reports whether a query expression — a SELECT, a VALUES list, a nested WITH
+// clause (cte.md §7), or a parenthesized query (grammar.md §25) — begins at p.pos+offset. The §26
+// leading-SELECT lookahead, extended with `VALUES (` and WITH, and with a run of `(`s that ends at a
+// SELECT / `VALUES (` / WITH where EVERY `(` in the run is closed by a `)` followed by a token that can
+// only continue a query — UNION / INTERSECT / EXCEPT / ORDER / LIMIT / OFFSET or a further `)`. Thus `((SELECT 1) UNION SELECT 2)` and
 // `((SELECT 1))` are subqueries but `((SELECT 1) + 1)` and `((SELECT 1), 2)` are expressions.
 // Precomputed (computeParenQuery), so a long run of `(` can neither exhaust the stack nor cost time
 // per probe; a §8 cross-core surface.
 func (p *parser) isQueryStartAtOffset(offset int) bool {
 	i := p.pos + offset
-	return p.isSelectAtIndex(i) || p.isWithClauseAtIndex(i) || (i < len(p.parenQuery) && p.parenQuery[i])
+	return p.isSelectAtIndex(i) || p.isValuesAtIndex(i) || p.isWithClauseAtIndex(i) ||
+		(i < len(p.parenQuery) && p.parenQuery[i])
 }
 
 // isSelectAtIndex reports whether a SELECT keyword sits at token index i.
 func (p *parser) isSelectAtIndex(i int) bool {
 	return i < len(p.tokens) && p.tokens[i].Kind == tokWord && p.tokens[i].Word == "select"
+}
+
+// isValuesAtIndex reports whether a VALUES list (`VALUES (`) begins at token index i (grammar.md §25)
+// — the VALUES keyword followed by a row's `(`, so a column named `values` stays an expression.
+func (p *parser) isValuesAtIndex(i int) bool {
+	return i+1 < len(p.tokens) && p.tokens[i].Kind == tokWord && p.tokens[i].Word == "values" &&
+		p.tokens[i+1].Kind == tokLParen
 }
 
 // isWithClauseAtIndex is isWithClauseAtOffset at an absolute token index.
@@ -7033,13 +7139,18 @@ func renderToken(t token) string {
 // identifier (grammar.md §3).
 func isIdentKind(k tokenKind) bool { return k == tokWord || k == tokQuotedIdent }
 
-// valuesQuery builds a VALUES body with trailing ORDER BY / LIMIT / OFFSET (grammar.md §42) as the
-// query `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an UNALIASED inner VALUES
-// relation: the keys resolve against column1, column2, … by name or ordinal (a qualified key has no
-// label to name, 42P01, as in PostgreSQL), and the enclosing derived table's alias and column-rename
-// list apply to the query's output unchanged. trailing carries the parsed clauses.
+// valuesLabel is the label of a VALUES query's relation (PostgreSQL's "*VALUES*").
+const valuesLabel = "*VALUES*"
+
+// valuesQuery builds a VALUES query (grammar.md §25) — a statement, a set-operation operand, or a
+// VALUES body with trailing ORDER BY / LIMIT / OFFSET (§42) — as the query `SELECT * FROM (VALUES …)
+// ORDER BY … LIMIT … OFFSET …` over an inner VALUES relation labeled *VALUES* (PostgreSQL's name for
+// it): the keys resolve against column1, column2, … by name, as "*VALUES*".column1, or by ordinal,
+// and an enclosing derived table's alias and column-rename list apply to the query's output unchanged
+// (v.column1 in the keys is 42P01, as in PostgreSQL). trailing carries the parsed clauses.
 func valuesQuery(rows [][]*exprNode, trailing *selectStmt) queryExpr {
-	inner := tableRef{Values: rows}
+	label := valuesLabel
+	inner := tableRef{Name: label, Alias: &label, Values: rows}
 	return queryExpr{Select: &selectStmt{
 		Items:   selectItems{All: true},
 		From:    &inner,

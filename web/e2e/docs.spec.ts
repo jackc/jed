@@ -304,6 +304,21 @@ test('the select page inserts the rows of a set operation live', async ({ page }
   await expect(panel.getByTestId('result-rows')).toContainText('Mug');
 });
 
+test('the select page runs a VALUES query as a set-operation operand live', async ({ page }) => {
+  await page.goto('/docs/sql/select/');
+  // A VALUES list as a query (spec/design/grammar.md §25): two literal rows appended to the office
+  // products with UNION ALL, ordered by price.
+  const panel = livePanel(page, 'valuesQuery');
+  await expect(panel.getByTestId('result-rows')).toContainText('Stapler');
+  await expect(panel.getByTestId('result-rows')).toContainText('Tape');
+  await panel
+    .getByTestId('sql-input')
+    .fill("VALUES (1, 'one'), (2, 'two'), (3, 'three') ORDER BY column2 LIMIT 1");
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('one');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('three');
+});
+
 test('the select page runs the data-modifying CTE demo live', async ({ page }) => {
   await page.goto('/docs/sql/select/');
   // The data-modifying CTE demo (spec/design/writable-cte.md): an

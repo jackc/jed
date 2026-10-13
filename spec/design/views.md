@@ -38,11 +38,12 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME TO new_name
 ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
 ```
 
-- **`query`** is a `subquery_expr`: an optional `WITH` clause, then a `SELECT`, set operation,
-  `ORDER BY`, and `LIMIT`/`OFFSET`. Anything a derived-table body accepts is accepted, including
-  joins, aggregates, window functions, recursive CTEs, `LATERAL`, set-returning functions, and the
-  `jed_` catalog relations. A top-level `VALUES` body is `42601`, because jed has no top-level
-  `VALUES` query (PostgreSQL accepts it; this is the general narrowing, not a view rule).
+- **`query`** is a `subquery_expr`: an optional `WITH` clause, then a `SELECT`, `VALUES` query
+  ([grammar.md](grammar.md) §25), set operation, `ORDER BY`, and `LIMIT`/`OFFSET`. Anything a
+  derived-table body accepts is accepted, including joins, aggregates, window functions, recursive
+  CTEs, `LATERAL`, set-returning functions, and the `jed_` catalog relations. A `VALUES` view
+  (`CREATE VIEW v AS VALUES (1, 'a')`) has the columns `column1`, `column2`, … and, having no base
+  relation, is read-only.
 - **The optional column list** renames the view's output columns left to right. A shorter list is
   a partial rename and the rest keep their query names. A longer list is **`42601`** (*CREATE VIEW
   specifies more column names than columns*, PostgreSQL's code).

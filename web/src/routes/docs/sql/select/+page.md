@@ -66,6 +66,11 @@ ORDER BY label;`;
 	const valuesLimited = `SELECT label
 FROM (VALUES ('a', 3), ('b', 1), ('c', 2) ORDER BY column2 LIMIT 2) AS v (label, qty);`;
 
+	const valuesQuery = `SELECT name, price FROM product WHERE category = 'office'
+UNION ALL
+VALUES ('Stapler', 7.25), ('Tape', 2.00)
+ORDER BY price;`;
+
 	const setOps = `(SELECT name, price FROM product WHERE category = 'office' ORDER BY price DESC LIMIT 1)
 UNION ALL
 (SELECT name, price FROM product WHERE category = 'kitchen' ORDER BY price DESC LIMIT 1)
@@ -381,6 +386,19 @@ the outer query sees them. Its keys name the `VALUES` columns `column1`, `column
 not the alias's renamed columns:
 
 <LiveSql demo="valuesLimited" {seed} query={valuesLimited} rows={2} />
+
+A `VALUES` list is also a query on its own, wherever a `SELECT` can go: a whole statement (`VALUES
+(1, 'one'), (2, 'two') ORDER BY column2`), an operand of `UNION` / `INTERSECT` / `EXCEPT`, a `WITH`
+or view body, or a subquery (`x IN (VALUES (1), (3))`). Its columns are again `column1`, `column2`,
+…, and a column of only strings or only `NULL`s is `text`, so `SELECT 1 UNION VALUES (NULL)` is a
+type error (`42804`) where `SELECT 1 UNION SELECT NULL` is not — as in PostgreSQL:
+
+<LiveSql demo="valuesQuery" {seed} query={valuesQuery} rows={4} />
+
+As an `INSERT` source, a `VALUES` list on its own (even parenthesized) is the `INSERT`'s own row list,
+whose slots may be `DEFAULT`. Followed by a set operator or a trailing `ORDER BY` / `LIMIT`, it becomes
+a query instead — `INSERT INTO t VALUES (1, 'a') UNION ALL SELECT id, name FROM u` — where `DEFAULT`
+is an error (`42601`).
 
 ## `LATERAL` joins
 

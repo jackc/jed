@@ -95,9 +95,9 @@ impl Parser {
     }
 
     /// Build the `paren_query` table: the `(` at `i` begins a parenthesized query when what follows
-    /// it is a query start (a `SELECT`, a `WITH` clause, or — recursively — another parenthesized
-    /// query) AND its matching `)` is followed by a token that can only continue a query
-    /// (`is_query_follow_at`). Computed back to front, so the recursion is a table lookup.
+    /// it is a query start (a `SELECT`, a `VALUES` list, a `WITH` clause, or — recursively — another
+    /// parenthesized query) AND its matching `)` is followed by a token that can only continue a
+    /// query (`is_query_follow_at`). Computed back to front, so the recursion is a table lookup.
     fn compute_paren_query(&self) -> Vec<bool> {
         let n = self.tokens.len();
         let mut close = vec![n; n];
@@ -119,6 +119,7 @@ impl Parser {
                 continue;
             }
             let inner = self.is_select_at(i + 1)
+                || self.is_values_at(i + 1)
                 || self.is_with_clause_at(i + 1)
                 || q.get(i + 1).copied().unwrap_or(false);
             q[i] = inner && self.is_query_follow_at(close[i] + 1);
@@ -249,6 +250,8 @@ impl Parser {
             }
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("select") => self.parse_query_expr(),
+            // A top-level `VALUES` query (grammar.md §25): `VALUES (…), (…) [ORDER BY …]`.
+            Some("values") => self.parse_query_expr(),
             // `WITH …` at statement start can only begin a query with common table expressions
             // (spec/design/cte.md). `with` is non-reserved but unambiguous here.
             Some("with") => self.parse_with_statement(),
@@ -580,9 +583,11 @@ impl Parser {
         let mut seen = std::collections::HashSet::new();
         let mut option_list = false;
         // A `(` opens the option list unless a parenthesized query follows (`EXPLAIN (SELECT 1)`,
-        // grammar.md §25): an option is a plain word, never `(`, `SELECT`, or a `WITH` clause.
+        // grammar.md §25): an option is a plain word, never `(`, `SELECT`, `VALUES (`, or a `WITH`
+        // clause.
         let paren_query = matches!(self.peek_at(1), Token::LParen)
             || self.is_select_at(self.pos + 1)
+            || self.is_values_at(self.pos + 1)
             || self.is_with_clause_at(self.pos + 1);
         if matches!(self.peek(), Token::LParen) && !paren_query {
             option_list = true;
@@ -647,12 +652,12 @@ impl Parser {
         })
     }
 
-    /// The statement EXPLAIN wraps — restricted to a query (`SELECT` / `WITH` / a parenthesized
-    /// query) or a DML statement (`INSERT` / `UPDATE` / `DELETE`). DDL, transaction control, and a
-    /// nested `EXPLAIN` have no query plan to render and are rejected `42601`.
+    /// The statement EXPLAIN wraps — restricted to a query (`SELECT` / `VALUES` / `WITH` / a
+    /// parenthesized query) or a DML statement (`INSERT` / `UPDATE` / `DELETE`). DDL, transaction
+    /// control, and a nested `EXPLAIN` have no query plan to render and are rejected `42601`.
     fn parse_explain_inner(&mut self) -> Result<Statement> {
         match self.peek_keyword().as_deref() {
-            Some("select") => self.parse_query_expr(),
+            Some("select") | Some("values") => self.parse_query_expr(),
             Some("with") => self.parse_with_statement(),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
@@ -2275,25 +2280,21 @@ impl Parser {
             self.expect_keyword("values")?;
             columns = Some(Vec::new());
             InsertSource::Values(vec![Vec::new()])
+        } else if let Some(rows) = self.parse_insert_values_source()? {
+            InsertSource::Values(rows)
         } else if self.is_select_at(self.pos)
+            || self.is_values_at(self.pos)
             || self.at_with_clause()
             || matches!(self.peek(), Token::LParen)
         {
-            // A query source (§24): a `SELECT`, a set operation, a parenthesized query, or a
-            // `WITH`-prefixed query. After the column list a `(` can only begin a query.
+            // A query source (§24): a `SELECT`, a `VALUES` query, a set operation, a parenthesized
+            // query, or a `WITH`-prefixed query. After the column list a `(` can only begin a query.
             InsertSource::Query(Box::new(self.parse_insert_query()?))
         } else {
+            // Neither a VALUES list nor a query: the error names the expected VALUES keyword (a
+            // `VALUES` here was already parsed above, so this always fails).
             self.expect_keyword("values")?;
-            let mut rows = Vec::new();
-            loop {
-                rows.push(self.parse_insert_row()?);
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                    continue;
-                }
-                break;
-            }
-            InsertSource::Values(rows)
+            return Err(syntax("expected VALUES or a query"));
         };
         let on_conflict = self.parse_on_conflict()?;
         let returning = self.parse_returning()?;
@@ -2310,6 +2311,60 @@ impl Parser {
         })
     }
 
+    /// The plain `VALUES` source of an INSERT (grammar.md §12/§24): `VALUES row [, row]*`, optionally
+    /// wrapped in any number of parentheses (`INSERT INTO t (VALUES …)` is the same source —
+    /// PostgreSQL), whose slots take `DEFAULT` and adapt to their target columns. It is that source
+    /// only when the list stands alone: a set operator or a trailing `ORDER BY` / `LIMIT` / `OFFSET`
+    /// after it (inside or outside the parentheses) makes the whole source a query whose operand is
+    /// a `VALUES` query, so this rewinds and returns `None` for `parse_insert_query`. `None` too when
+    /// no `VALUES` list begins here. Each parenthesis is one nesting level, as for a query.
+    fn parse_insert_values_source(&mut self) -> Result<Option<Vec<Vec<InsertValue>>>> {
+        let (start, depth, furthest) = (self.pos, self.depth, self.furthest.get());
+        let mut parens = 0;
+        while matches!(self.tokens.get(self.pos + parens), Some(Token::LParen)) {
+            parens += 1;
+        }
+        if self.peek_keyword_at(parens).as_deref() != Some("values") {
+            return Ok(None);
+        }
+        for _ in 0..parens {
+            self.advance(); // '('
+            self.deepen()?;
+        }
+        self.expect_keyword("values")?;
+        let mut rows = Vec::new();
+        loop {
+            rows.push(self.parse_insert_row()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        // A set operator or ORDER/LIMIT/OFFSET (a query-follow token other than `)`) after the list
+        // or after one of its closing parentheses makes it a query operand.
+        let continues_query =
+            |p: &Self| p.is_query_follow_at(p.pos) && !matches!(p.peek(), Token::RParen);
+        let mut plain = true;
+        for _ in 0..parens {
+            if continues_query(self) {
+                plain = false;
+                break;
+            }
+            self.expect(&Token::RParen)?;
+        }
+        if plain && !continues_query(self) {
+            self.depth = depth;
+            return Ok(Some(rows));
+        }
+        // Rewind, forgetting what the abandoned parse examined so a later error is positioned by
+        // the re-parse (error-fields.md §10.3).
+        self.pos = start;
+        self.depth = depth;
+        self.furthest.set(furthest);
+        Ok(None)
+    }
+
     /// Whether the `(` at the current position begins a parenthesized query source rather than an
     /// INSERT column list (grammar.md §24). A column list holds only identifiers, so the `(` begins
     /// a query when it is followed by another `(`, by a `WITH` clause, or by a bare `SELECT` that is
@@ -2319,7 +2374,7 @@ impl Parser {
         let next = self.pos + 1;
         match self.tokens.get(next) {
             Some(Token::LParen) => true,
-            _ if self.is_with_clause_at(next) => true,
+            _ if self.is_with_clause_at(next) || self.is_values_at(next) => true,
             _ if self.is_select_at(next) => !matches!(
                 self.tokens.get(next + 1),
                 Some(Token::Comma) | Some(Token::RParen)
@@ -2742,6 +2797,13 @@ impl Parser {
         matches!(self.tokens.get(idx), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select"))
     }
 
+    /// Whether a `VALUES` list (`VALUES (`) begins at token index `idx` (grammar.md §25) — the
+    /// `VALUES` keyword followed by a row's `(`, so a column named `values` stays an expression.
+    fn is_values_at(&self, idx: usize) -> bool {
+        matches!(self.tokens.get(idx), Some(Token::Word(w)) if w == "values")
+            && matches!(self.tokens.get(idx + 1), Some(Token::LParen))
+    }
+
     /// Whether a `WITH` clause (`WITH RECURSIVE …`, `WITH <name> ( …`, or `WITH <name> AS …`)
     /// begins at token index `idx` (spec/design/cte.md §7), as opposed to an ordinary expression or
     /// a column named `with`. The shape-based lookahead keeps the recognition unambiguous even where
@@ -2760,16 +2822,18 @@ impl Parser {
         }
     }
 
-    /// Whether a query expression — a `SELECT`, a nested `WITH` clause (cte.md §7), or a
-    /// parenthesized query (grammar.md §25) — begins at token index `idx`. The §26 leading-`SELECT`
-    /// lookahead, extended with `WITH`, and with a run of `(`s that ends at a `SELECT`/`WITH` where
-    /// EVERY `(` in the run is closed by a `)` followed by a token that can only continue a query —
-    /// `UNION`/`INTERSECT`/`EXCEPT`/`ORDER`/`LIMIT`/`OFFSET` or a further `)`. Thus
+    /// Whether a query expression — a `SELECT`, a `VALUES` list, a nested `WITH` clause (cte.md §7),
+    /// or a parenthesized query (grammar.md §25) — begins at token index `idx`. The §26
+    /// leading-`SELECT` lookahead, extended with `VALUES (` and `WITH`, and with a run of `(`s that
+    /// ends at a `SELECT`/`VALUES (`/`WITH` where EVERY `(` in the run is closed by a `)` followed by
+    /// a token that can only continue a query — `UNION`/`INTERSECT`/`EXCEPT`/`ORDER`/`LIMIT`/`OFFSET`
+    /// or a further `)`. Thus
     /// `((SELECT 1) UNION SELECT 2)` and `((SELECT 1))` are subqueries but `((SELECT 1) + 1)` and
     /// `((SELECT 1), 2)` are expressions. Precomputed (`compute_paren_query`), so a long run of `(`
     /// can neither exhaust the stack nor cost time per probe; a §8 cross-core surface.
     fn is_query_start_at(&self, idx: usize) -> bool {
         self.is_select_at(idx)
+            || self.is_values_at(idx)
             || self.is_with_clause_at(idx)
             || self.paren_query.get(idx).copied().unwrap_or(false)
     }
@@ -2884,16 +2948,22 @@ impl Parser {
         Ok(left)
     }
 
-    /// A set-operation operand (grammar.md §25): a `select_core`, or a parenthesized query — a full
-    /// `subquery_expr` (its own `WITH`, set operations, and trailing `ORDER BY`/`LIMIT`/`OFFSET`)
-    /// between `(` and `)`, one nesting level deeper. In operand position a `(` can only begin a
-    /// query, so no lookahead is needed.
+    /// A set-operation operand (grammar.md §25): a `select_core`, a `VALUES` list, or a
+    /// parenthesized query — a full `subquery_expr` (its own `WITH`, set operations, and trailing
+    /// `ORDER BY`/`LIMIT`/`OFFSET`) between `(` and `)`, one nesting level deeper. In operand
+    /// position a `(` can only begin a query, so no lookahead is needed. A `VALUES` operand is the
+    /// query `SELECT * FROM (VALUES …)` over a `*VALUES*` relation (`values_query`), so its
+    /// columns are `column1`, `column2`, … and a trailing `ORDER BY` folds onto it like a `SELECT`'s.
     fn parse_set_operand(&mut self) -> Result<QueryExpr> {
         if matches!(self.peek(), Token::LParen) {
             self.advance();
             let q = self.parse_subquery()?;
             self.expect(&Token::RParen)?;
             return Ok(q);
+        }
+        if self.peek_keyword().as_deref() == Some("values") {
+            let rows = self.parse_values_body()?;
+            return Ok(values_query(rows, Vec::new(), None, None));
         }
         Ok(QueryExpr::Select(Box::new(self.parse_select_core()?)))
     }
@@ -3413,8 +3483,24 @@ impl Parser {
         // parent = None). A trailing ORDER BY / LIMIT / OFFSET makes the body the query
         // `SELECT * FROM (VALUES …) ORDER BY … LIMIT …` (`values_query`).
         let mut join_group = false;
-        let (mut subquery, values) = if self.peek_keyword().as_deref() == Some("values") {
+        let (start, depth, furthest) = (self.pos, self.depth, self.furthest.get());
+        let mut values_rows = None;
+        if self.peek_keyword().as_deref() == Some("values") {
             let rows = self.parse_values_body()?;
+            // A set operator after the list makes the body a query with a VALUES operand
+            // (grammar.md §25): re-parse it as one.
+            if matches!(
+                self.peek_keyword().as_deref(),
+                Some("union") | Some("intersect") | Some("except")
+            ) {
+                self.pos = start;
+                self.depth = depth;
+                self.furthest.set(furthest);
+            } else {
+                values_rows = Some(rows);
+            }
+        }
+        let (mut subquery, values) = if let Some(rows) = values_rows {
             let order_by = self.parse_order_by(true)?;
             let (limit, offset) = self.parse_limit_offset()?;
             if order_by.is_empty() && limit.is_none() && offset.is_none() {
@@ -3671,10 +3757,10 @@ impl Parser {
         let mut rows = Vec::new();
         loop {
             self.expect(&Token::LParen)?;
-            let mut row = vec![self.parse_expr()?];
+            let mut row = vec![self.parse_values_value()?];
             while matches!(self.peek(), Token::Comma) {
                 self.advance();
-                row.push(self.parse_expr()?);
+                row.push(self.parse_values_value()?);
             }
             self.expect(&Token::RParen)?;
             rows.push(row);
@@ -3685,6 +3771,18 @@ impl Parser {
             break;
         }
         Ok(rows)
+    }
+
+    /// One value of a VALUES-body row: a general expression. A value that is exactly the bare word
+    /// `DEFAULT` is the keyword, as in an INSERT slot, and is allowed only in the plain `INSERT …
+    /// VALUES` source: here it is 42601 (PostgreSQL: "DEFAULT is not allowed in this context").
+    fn parse_values_value(&mut self) -> Result<Expr> {
+        if self.peek_keyword().as_deref() == Some("default")
+            && matches!(self.peek_at(1), Token::Comma | Token::RParen)
+        {
+            return Err(syntax("DEFAULT is not allowed in this context"));
+        }
+        self.parse_expr()
     }
 
     /// Parse one `join_clause` if a join keyword begins here, else `None` (ending the FROM
@@ -6130,11 +6228,15 @@ fn splice_leading_group(item: TableRef, joins: Vec<JoinClause>) -> (TableRef, Ve
     (group.from.expect("a join group has a FROM item"), out)
 }
 
-/// A VALUES body with trailing `ORDER BY` / `LIMIT` / `OFFSET` (grammar.md §42) as the query
-/// `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an UNALIASED inner VALUES relation:
-/// the keys resolve against `column1`, `column2`, … by name or ordinal (a qualified key has no
-/// label to name, 42P01, as in PostgreSQL), and the enclosing derived table's alias and
-/// column-rename list apply to the query's output unchanged.
+/// The label of a `VALUES` query's relation (PostgreSQL's `"*VALUES*"`).
+const VALUES_LABEL: &str = "*VALUES*";
+
+/// A `VALUES` query (grammar.md §25) — a statement, a set-operation operand, or a VALUES body with
+/// trailing `ORDER BY` / `LIMIT` / `OFFSET` (§42) — as the query `SELECT * FROM (VALUES …) ORDER BY …
+/// LIMIT … OFFSET …` over an inner VALUES relation labeled `*VALUES*` (PostgreSQL's name for it):
+/// the keys resolve against `column1`, `column2`, … by name, as `"*VALUES*".column1`, or by
+/// ordinal, and an enclosing derived table's alias and column-rename list apply to the query's
+/// output unchanged (`v.column1` in the keys is 42P01, as in PostgreSQL).
 fn values_query(
     rows: Vec<Vec<Expr>>,
     order_by: Vec<OrderKey>,
@@ -6142,9 +6244,9 @@ fn values_query(
     offset: Option<i64>,
 ) -> QueryExpr {
     let inner = TableRef {
-        name: String::new(),
+        name: VALUES_LABEL.to_string(),
         db: None,
-        alias: None,
+        alias: Some(VALUES_LABEL.to_string()),
         args: None,
         subquery: None,
         values: Some(rows),

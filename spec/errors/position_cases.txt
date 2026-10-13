@@ -69,6 +69,21 @@ run: INSERT INTO t VALUES (1,
 code: 42601
 position: 25
 
+case: DEFAULT in a VALUES query
+run: VALUES (DEFAULT)
+code: 42601
+position: 9
+
+case: DEFAULT in an INSERT's VALUES operand
+run: INSERT INTO t VALUES (DEFAULT, 1) UNION SELECT 1, 2
+code: 42601
+position: 23
+
+case: DEFAULT in a VALUES derived table
+run: SELECT * FROM (VALUES (1, DEFAULT)) v
+code: 42601
+position: 27
+
 case: end of input after ORDER
 run: SELECT a FROM t ORDER
 code: 42601

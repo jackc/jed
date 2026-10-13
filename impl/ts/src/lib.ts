@@ -504,6 +504,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.except",
   // Parenthesized set-operation operands / queries — spec/design/grammar.md §25.
   "query.setop_parenthesized",
+  // A `VALUES` list as a query: a statement, a set-operation operand, a subquery / CTE / view
+  // body, and an INSERT query-source operand — spec/design/grammar.md §25.
+  "query.values_query",
   // Subqueries: scalar / IN / EXISTS, both uncorrelated (folded once) and correlated
   // (re-executed per outer row, any depth) — spec/design/grammar.md §26.
   "query.subquery_scalar",

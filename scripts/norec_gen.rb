@@ -159,7 +159,8 @@
 #   setop_logic — connective ↔ set operation over a unique key: `WHERE p OR q` == `(WHERE p) UNION
 #                 (WHERE q)`, `WHERE p AND q` == `(WHERE p) INTERSECT (WHERE q)`, plus UNION/INTERSECT/
 #                 DISTINCT idempotence + a NULL-group DISTINCT collapse, and the same OR/AND pairs as
-#                 INSERT … SELECT sources (a set-op source stores what the connective source stores).
+#                 INSERT … SELECT sources (a set-op source stores what the connective source stores),
+#                 and with q's id-set written as a VALUES operand (UNION/INTERSECT/EXCEPT VALUES …).
 #                 Exercises the set-op dedup path against the same logic — catches a dedup/hash bug
 #                 all cores share.
 #   join_comm   — INNER JOIN commutes (`a JOIN b` == `b JOIN a`) and equals the CROSS JOIN filtered by
@@ -346,9 +347,9 @@ PREDICATE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_
                    expr.in_list expr.comparison_value types.i32 null.three_valued].freeze
 SETOP_LOGIC_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row
                      dml.insert_select dml.insert_select_setop query.select
-                     query.comparison_order query.order_by query.logical_connectives query.union
-                     query.intersect query.distinct expr.comparison_value types.i32
-                     null.three_valued].freeze
+                     query.comparison_order query.order_by query.offset query.logical_connectives
+                     query.union query.intersect query.except query.values_query query.distinct
+                     expr.comparison_value types.i32 null.three_valued].freeze
 JOIN_COMM_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                    query.comparison_order query.order_by query.order_by_keys query.qualified_column
                    query.where_eq query.join_inner query.cross_join expr.comparison_value
@@ -2583,6 +2584,15 @@ def gen_setop_logic(seed)
   stmt(out, "INSERT INTO ins_intersect SELECT id FROM t WHERE #{psql} INTERSECT SELECT id FROM t WHERE #{qsql}")
   q(out, "I", "SELECT id FROM ins_and ORDER BY id", ids.call(and_ids))
   q(out, "I", "SELECT id FROM ins_intersect ORDER BY id", ids.call(and_ids))
+
+  # q's TRUE id-set as a VALUES operand (grammar.md §25), led by the sentinel 0 (never an id, so a
+  # VALUES list is never empty); ORDER BY … OFFSET 1 drops the sentinel where it survives.
+  vq = "VALUES #{([0] + set_q).map { |id| "(#{id})" }.join(', ')}"
+  out << "# VALUES operands : (WHERE p) UNION / INTERSECT q's id-set, and q's id-set EXCEPT (WHERE p)"
+  q(out, "I", "SELECT id FROM t WHERE #{psql} UNION #{vq} ORDER BY id OFFSET 1", ids.call(or_ids))
+  q(out, "I", "SELECT id FROM t WHERE #{psql} INTERSECT #{vq} ORDER BY id", ids.call(and_ids))
+  q(out, "I", "#{vq} EXCEPT SELECT id FROM t WHERE #{psql} ORDER BY column1 OFFSET 1",
+    ids.call((set_q - set_p).sort))
 
   # DISTINCT no-op on the unique key (must not drop or alter rows), then a real dedup: DISTINCT over
   # the NON-unique nullable column a — NULL is a single group and ORDER BY a sorts it LAST (PG model).
