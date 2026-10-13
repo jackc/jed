@@ -3801,9 +3801,9 @@ export function resolveJsonSqlFn(
 // boolean, integer, decimal, or text value (a bare string literal is text) is the item directly, a
 // jsonb value is itself, and every other type is converted to jsonb — a json value parsed (last
 // duplicate key wins), anything else by to_jsonb. FORMAT JSON parses a text value as JSON instead
-// (22P02 on malformed text) and converts every other type by to_jsonb. Deferred (0A000): a
-// date/timestamp/timestamptz value, which PostgreSQL passes as a jsonpath datetime item (the
-// datetime item methods are deferred, jsonpath.md §3.1); a float, which PostgreSQL converts with
+// (22P02 on malformed text) and converts every other type by to_jsonb. 0A000: a
+// date/timestamp/timestamptz value, which PostgreSQL passes as a jsonpath datetime item (jed has
+// none, by decision, jsonpath.md §3.1); and, deferred, a float, which PostgreSQL converts with
 // float8_numeric (finite values) or passes as NaN/±Infinity, which jed's decimal cannot hold; and
 // FORMAT JSON on a bytea value (an encoded JSON text). Port of impl/rust `resolve_json_passing`.
 export function resolveJsonPassing(

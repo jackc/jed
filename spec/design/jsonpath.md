@@ -16,8 +16,9 @@
 
 > **Status: landed in part.** The type, the structural accessors, filters, top-level predicates,
 > the query functions (with their `vars` / `silent` arguments and `_tz` forms) and operators, the
-> item methods (except the datetime family), arithmetic with parenthesized expressions, and path
-> variables are implemented in all three cores; §9 lists what remains deferred (`0A000`).
+> item methods (except the datetime family, which is not supported by decision, §3.1), arithmetic
+> with parenthesized expressions, and path variables are implemented in all three cores; §9 lists
+> what remains deferred (`0A000`).
 
 ---
 
@@ -317,12 +318,30 @@ gives ids 12 and 72, and `$.keyvalue().value.keyvalue()` under `jsonb_path_query
 other step (`.key`, `.*`, `.type()`, filters, comparisons); it is built as `jsonb` only when it is
 returned.
 
-**Deferred (`0A000`).** The datetime methods `.datetime([template])`, `.date()`, `.time([p])`,
-`.time_tz([p])`, `.timestamp([p])`, and `.timestamp_tz([p])`. Even without a template PostgreSQL
-runs its `to_timestamp` engine over a fixed list of ISO templates, with that engine's field-reading
-rules (`"20-01-05"` is year 20, `"10:00:00.+05"` reads microseconds) and its time zone abbreviation
-table (`"10:00:00PST"`), which jed has not decided to load (timezones.md §15); the methods also
-produce date/time items that PostgreSQL compares across types. They need that engine first.
+**Not supported, by decision (`0A000`, decided 2026-10-13).** The datetime methods
+`.datetime([template])`, `.date()`, `.time([p])`, `.time_tz([p])`, `.timestamp([p])`, and
+`.timestamp_tz([p])` are not part of jed's surface ([CLAUDE.md §1](../../CLAUDE.md): we own our
+surface), and jed's jsonpath has no datetime items at all. To use a date or time held in JSON, extract it and cast it: `(doc->>'d')::timestamptz`, or
+`JSON_VALUE(doc, '$.d' RETURNING timestamptz)`. That is the whole answer in MySQL, SQL Server,
+DuckDB, and SQLite, none of which has these methods.
+
+Why. PostgreSQL implements the methods by reusing its `to_timestamp` engine, even without a
+template (it tries a fixed list of ISO templates), so exact compatibility means porting that
+engine's field-reading rules (`"20-01-05"` is year 20, `"10:00:00.+05"` reads microseconds) to every
+core, and loading PostgreSQL's time zone abbreviation table (`"10:00:00PST"`), which is a server
+setting rather than data and which jed does not load (timezones.md §15). The methods would also
+bring datetime items with their own `.type()` and cross-type comparison rules, a session-zone path
+for the `_tz` functions (§5.1), and a `time`/`timetz` type jed does not have. That is a large,
+quirk-bound surface for a convenience the extract-and-cast form already covers. Other options were
+weighed and set aside with it: a strict ISO 8601 subset that errors wherever PostgreSQL's reading
+differs (no abbreviations, numeric offsets only), optionally with the SQL standard's small template
+language for `.datetime(template)`. The conformance suite `json/json_datetime_extract.test` pins
+both the `0A000` and the extract-and-cast form.
+
+**Revisitable.** This is a scope decision, not a technical barrier. If a real need appears, the
+strict-subset option is the likely path, and it gets cheaper if SQL `to_timestamp` is built for its
+own sake. Reopening it also reopens the date/time `PASSING` value (json-sql-functions.md §5.4) and
+the `_tz` functions' session-zone comparisons (§5.1).
 
 ### 3.2 Arithmetic
 
@@ -505,12 +524,12 @@ duplicate key keeps its last value (`JSON_VALUE('{"a":1,"a":2}'::json, '$.a')` i
 same arguments. In PostgreSQL they differ from the plain functions only in allowing datetime
 comparisons and conversions that depend on the session time zone (the plain ones raise `0A000`
 `cannot convert value from … without time zone usage` instead), which makes them **STABLE** where the
-plain ones are **IMMUTABLE**. jed's datetime item methods are still deferred (§3.1), so no path can
-reach a datetime item and the `_tz` functions behave exactly like the plain ones. They keep
+plain ones are **IMMUTABLE**. jed has no datetime items (the datetime methods are not supported,
+§3.1), so no path can reach one and the `_tz` functions behave exactly like the plain ones. They keep
 PostgreSQL's volatility: an expression using one is nonimmutable, so it is `42P17` in an index
-expression or partial-index predicate ([index-dependencies.md](index-dependencies.md)). The time zone
-difference matters only once the datetime methods land, when the `_tz` forms will read the session
-zone through the host clock/tz seam ([entropy.md](entropy.md), [timezones.md](timezones.md)).
+expression or partial-index predicate ([index-dependencies.md](index-dependencies.md)), and they
+stay accepted so PostgreSQL queries that name them still run. The time zone difference would matter
+only if the §3.1 decision were revisited.
 
 ### 5.2 The `jsonb_path_query` SRF fit
 
@@ -698,7 +717,8 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     (§4.4), which `jsonb_path_match` and `@@` return as SQL NULL. A top-level predicate, queried, yields the boolean as a single item;
     it renders parenthesized (`($."a" == 1)`), which round-trips through compile. Capability
     `expr.jsonpath_match`.
-  - **Item methods** ✅ — every PostgreSQL 18 item method except the datetime family (§3.1),
+  - **Item methods** ✅ — every PostgreSQL 18 item method except the datetime family (not
+    supported by decision, §3.1),
     after `$`, `@`, or a literal; the depth-first evaluator (§3) with PostgreSQL's early stop for
     existence tests (§5) and silent `@?`/`@@` (§4.2); `.keyvalue()` ids from PostgreSQL's binary
     layout; a `json` context converted to `jsonb` (§5); PostgreSQL's strict subscript and
@@ -712,12 +732,12 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     twins (§5.1), and the SQL/JSON `PASSING` clause of `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` /
     `JSON_TABLE` (json-sql-functions.md §5.4); `.keyvalue()` ids count the variable base objects
     (§3.1). Capability `expr.jsonpath_vars`.
-    **Still deferred (`0A000`):** the datetime methods (they need PostgreSQL's `to_timestamp`
-    engine, §3.1), and with them the `_tz` functions' time zone use and `PASSING` a date/time value
-    (a datetime item); the §4.3 Pike-VM `like_regex` / `starts with` / `is unknown` / `exists`
-    predicates; `.**`; a float `PASSING` value — the remaining open P2/P3 follow-ons.
-- **P3** — the `_tz` variants (§5.1): ✅ as STABLE twins; routing their datetime comparisons through
-  the clock/tz seam waits on the datetime methods.
+    **Still deferred (`0A000`):** the §4.3 Pike-VM `like_regex` / `starts with` / `is unknown` /
+    `exists` predicates; `.**`; a float `PASSING` value — the remaining open P2/P3 follow-ons.
+    **Not supported, by decision (`0A000`, §3.1):** the datetime methods, and with them the `_tz`
+    functions' time zone use and `PASSING` a date/time value (a datetime item).
+- **P3** — the `_tz` variants (§5.1): ✅ as STABLE twins. They have no datetime comparisons to
+  route through the clock/tz seam, since jed has no datetime items (§3.1).
 
 **Riskiest, least-precedented:** the lax-mode auto-unwrapping + the navigation-vs-coercion
 error distinction (§4.2 rule 6) — the cross-core determinism contract makes any subtle

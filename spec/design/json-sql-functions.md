@@ -443,9 +443,10 @@ Each value becomes a jsonpath item the way PostgreSQL's `transformJsonPassingArg
 - `FORMAT JSON` parses a `text` value as JSON text (`22P02` when malformed) and leaves `json`/`jsonb`
   alone; any other type is converted by `to_jsonb`, so a `date` becomes a string.
 
-**Deferred (`0A000`), ledgered.** A `date`, `timestamp`, or `timestamptz` value without `FORMAT JSON`
-is a jsonpath *datetime item* in PostgreSQL, with its own `.type()` and comparison rules, which waits
-for the datetime item methods ([jsonpath.md §3.1](jsonpath.md)). A float value is converted by
+**Not supported (`0A000`), ledgered.** A `date`, `timestamp`, or `timestamptz` value without
+`FORMAT JSON` is a jsonpath *datetime item* in PostgreSQL, with its own `.type()` and comparison
+rules. jed's jsonpath has no datetime items, by decision ([jsonpath.md §3.1](jsonpath.md)); pass
+`d::text` (or use `FORMAT JSON`, which makes it a string) instead. **Deferred (`0A000`), ledgered.** A float value is converted by
 PostgreSQL's `float8_numeric` (or `float4_numeric`), and NaN/±Infinity become `numeric` NaN/Infinity
 items, which jed's finite `decimal` cannot hold; it waits with the other float-to-JSON conversions
 (§2.2). `FORMAT JSON` on a `bytea` value (encoded JSON text, with an optional `ENCODING`) is deferred

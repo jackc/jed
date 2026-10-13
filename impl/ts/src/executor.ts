@@ -16735,7 +16735,7 @@ export class Engine {
     // jsonb_path_query(target, path [, vars [, silent]]) (P2, jsonpath.md §5.2): the SRF form — one
     // `jsonb` row per item of the path's evaluation sequence over the context document. A bare string
     // literal adapts. `jsonb_path_query_tz` is PostgreSQL's STABLE twin (jsonpath.md §5.1); it reads
-    // no time zone until the datetime item methods land.
+    // no time zone, since jed has no datetime items (§3.1).
     if (lname === "jsonb_path_query" || lname === "jsonb_path_query_tz") {
       const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
       const rargs = resolveJsonpathArgs(argScope, lname, args, argNames, forbidden, ptypes);

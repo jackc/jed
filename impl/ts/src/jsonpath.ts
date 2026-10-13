@@ -6,7 +6,7 @@
 // methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
 // Path variables (`$name`, `$"name"`) are bound by the caller's Vars. Still deferred (a valid-PG
 // path using one → `0A000` at compile): `like_regex` / `starts with` / `is unknown` / `exists`
-// predicates, `.**`, and the datetime methods. A malformed path is `42601`. The compiled program is a pure function of the source — kept
+// predicates and `.**`. The datetime methods are `0A000` by decision (jsonpath.md §3.1). A malformed path is `42601`. The compiled program is a pure function of the source — kept
 // byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
 // codegenned).
 //
@@ -53,7 +53,7 @@ export type Index =
 // One subscript: a single index or an `i to j` slice.
 export type Subscript = { kind: "index"; index: Index } | { kind: "slice"; from: Index; to: Index };
 
-// An item method (jsonpath.md §3.1). The datetime family is still deferred (`0A000`).
+// An item method (jsonpath.md §3.1). The datetime family is not supported (`0A000`), by decision.
 export type MethodName =
   | "type"
   | "size"

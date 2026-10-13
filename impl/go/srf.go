@@ -97,7 +97,7 @@ func (db *engine) resolveSRF(name string, args []*exprNode, argNames []*string, 
 	// §5.2): one `jsonb` row per item of the path's evaluation sequence over the context document. A
 	// bare string literal adapts (the ctx to jsonb, the path to a compiled jsonpath). STRICT in the
 	// args; a NULL argument → zero rows at exec. jsonb_path_query_tz is PostgreSQL's STABLE twin
-	// (jsonpath.md §5.1); it reads no time zone until the datetime item methods land.
+	// (jsonpath.md §5.1); it reads no time zone, since jed has no datetime items (§3.1).
 	if pathQuery {
 		forbidden := &aggCtx{}
 		rargs, err := resolveJsonpathArgs(argScope, lname, args, argNames, forbidden, ptypes)

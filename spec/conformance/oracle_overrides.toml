@@ -1563,17 +1563,33 @@ file = "json/jsonpath_arith.test"
 sql = "SELECT '$ ? (($.a + 1).type() == \"number\")'::jsonpath, '$ ? ((-@.a).abs() > 1)'::jsonpath, '$[(last - 1).abs()]'::jsonpath"
 reason = "jed renders an arithmetic operator followed by accessors parenthesized wherever it appears: `$?(($.\"a\" + 1).type() == \"number\")`. PostgreSQL's printJsonPathItem brackets an operand only by operator priority, ignoring the accessors that follow it, so it prints `$?($.\"a\" + 1.type() == \"number\")` (which does not even parse) and `$?(-@.\"a\".abs() > 1)` (which parses as a different path, -(abs(a))). jed stores and evaluates a jsonpath as its canonical text (jsonpath.md §1), so that text must read back as the same path (jsonpath.md §2.3)."
 
+# --- jsonpath datetime item methods: not supported by decision (jsonpath.md §3.1).
+[[override]]
+file = "json/json_datetime_extract.test"
+sql = "SELECT jsonb_path_query_first('\"2020-01-05\"', '$.datetime()')"
+reason = "jed: the jsonpath datetime item methods are not supported, by decision (jsonpath.md §3.1): matching PostgreSQL means porting its to_timestamp engine and loading its time zone abbreviation table, for a convenience that extract-and-cast already covers ((doc->>'d')::date, or JSON_VALUE ... RETURNING date). PostgreSQL returns \"2020-01-05\" as a date item."
+
+[[override]]
+file = "json/json_datetime_extract.test"
+sql = "SELECT jsonb_path_query_first('\"2020-01-05\"', '$.date()')"
+reason = "jed: the same unsupported datetime item method as .datetime() (jsonpath.md §3.1). PostgreSQL returns \"2020-01-05\"."
+
+[[override]]
+file = "json/json_datetime_extract.test"
+sql = "SELECT jsonb_path_query_first('\"2020-01-05 10:30:00+02\"', '$.timestamp_tz()')"
+reason = "jed: the same unsupported datetime item method as .datetime() (jsonpath.md §3.1). PostgreSQL returns \"2020-01-05T10:30:00+02:00\"."
+
 # --- jsonpath PASSING values PostgreSQL passes as items jed cannot hold yet (json-sql-functions.md
 # §5.4).
 [[override]]
 file = "json/jsonpath_vars.test"
 sql = "SELECT JSON_VALUE('{}', '$x' PASSING date '2020-01-01' AS x)"
-reason = "jed: a date/time PASSING value is a deferred 0A000 (json-sql-functions.md §5.4). PostgreSQL's JsonItemFromDatum passes a date, time, timetz, timestamp, or timestamptz value as a jsonpath datetime item, which jed's evaluator does not have until the datetime item methods land (jsonpath.md §3.1): such an item reports its own .type() (\"date\") and compares only with other datetime items, so passing it as a string would give different answers. PostgreSQL returns 2020-01-01."
+reason = "jed: a date/time PASSING value is 0A000, not supported by decision (json-sql-functions.md §5.4). PostgreSQL's JsonItemFromDatum passes a date, time, timetz, timestamp, or timestamptz value as a jsonpath datetime item, which jed's evaluator does not have, since the datetime item methods are not supported (jsonpath.md §3.1): such an item reports its own .type() (\"date\") and compares only with other datetime items, so passing it as a string would give different answers. PostgreSQL returns 2020-01-01."
 
 [[override]]
 file = "json/jsonpath_vars.test"
 sql = "SELECT JSON_VALUE('{}', '$x' PASSING timestamptz '2020-01-01 00:00:00+00' AS x)"
-reason = "jed: a timestamptz PASSING value is the same deferred 0A000 as a date (a jsonpath datetime item in PostgreSQL, json-sql-functions.md §5.4). PostgreSQL returns the instant rendered in the session zone."
+reason = "jed: a timestamptz PASSING value is the same unsupported 0A000 as a date (a jsonpath datetime item in PostgreSQL, json-sql-functions.md §5.4). PostgreSQL returns the instant rendered in the session zone."
 
 [[override]]
 file = "json/jsonpath_vars.test"

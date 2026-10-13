@@ -530,10 +530,9 @@ Everything on the JSON path is deterministic and cross-core byte-identical:
 - **The dictionary door** (§3.3) pins deterministic id assignment + membership *before* the
   builder ships, so opening the door cannot introduce divergence.
 
-No part of the JSON surface reads the wall clock or entropy **except** the SQL/JSON path
-`.datetime()` method and the `_tz` path-query variants, which route through the existing
-host clock/tz seam ([entropy.md](entropy.md)) and are therefore deterministic-given-the-seam
-(detailed in [jsonpath.md](jsonpath.md)).
+No part of the JSON surface reads the wall clock or entropy. PostgreSQL's SQL/JSON path datetime
+methods and the session-zone use of its `_tz` path-query variants would, but jed does not support
+the methods, so its `_tz` variants read no zone ([jsonpath.md §3.1, §5.1](jsonpath.md)).
 
 ---
 

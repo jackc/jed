@@ -15,7 +15,7 @@ import (
 // .*, [subscripts] of any expression, [*], to slices, ?(filter), and the item methods of §3.1);
 // arithmetic (+ - * / %, unary + -, §3.2); a top-level comparison predicate. Still deferred (a
 // valid-PG path using one → 0A000 at compile): like_regex / starts with / is unknown / exists
-// predicates, .**, and the datetime methods. Path variables ($name, $"name") are bound by the caller's
+// predicates and .**; the datetime methods are 0A000 by decision (jsonpath.md §3.1). Path variables ($name, $"name") are bound by the caller's
 // jpVars. A malformed path is 42601. The
 // compiled program is a pure function of the source — kept byte-identical cross-core by the
 // conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned). Mirrors
@@ -143,7 +143,7 @@ type jpStep struct {
 	method jpMethod
 }
 
-// jpMethodKind tags an item method (jsonpath.md §3.1). The datetime family is still deferred (0A000).
+// jpMethodKind tags an item method (jsonpath.md §3.1). The datetime family is not supported (0A000), by decision.
 type jpMethodKind int
 
 const (

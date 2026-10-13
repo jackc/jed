@@ -6,7 +6,7 @@
 //! methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
 //! Path variables (`$name`, `$"name"`) are bound by the caller's [`Vars`]. Still deferred (a valid-PG
 //! path using one → `0A000` at compile): `like_regex` / `starts with` / `is unknown` / `exists`
-//! predicates, `.**`, and the datetime methods. A
+//! predicates and `.**`. The datetime methods are `0A000` by decision (jsonpath.md §3.1). A
 //! malformed path is `42601`. The compiled program is a pure function of the source — kept
 //! byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
 //! codegenned).
@@ -125,7 +125,7 @@ pub enum Step {
     Method(Method),
 }
 
-/// An item method (jsonpath.md §3.1). The datetime family is still deferred (`0A000`).
+/// An item method (jsonpath.md §3.1). The datetime family is not supported (`0A000`), by decision.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Method {
     Type,

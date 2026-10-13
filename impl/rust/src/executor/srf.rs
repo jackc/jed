@@ -150,7 +150,7 @@ impl Engine {
                 );
             }
             // `jsonb_path_query_tz` is PostgreSQL's STABLE twin (jsonpath.md §5.1); it reads no
-            // time zone until the datetime item methods land.
+            // time zone, since jed has no datetime items (§3.1).
             "jsonb_path_query" | "jsonb_path_query_tz" => {
                 let rargs = resolve_jsonpath_args(
                     &arg_scope,
