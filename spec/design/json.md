@@ -216,10 +216,14 @@ semantically-equal `json` values store different bytes (`'{"a":1}'` ≠ `'{ "a":
 is correct and PG-faithful.
 
 A `json` value reaches the structural node tree (§1) only when an operator needs structure
-(e.g. `->`): it is parsed on demand and dispatched to the same kernel as `jsonb`, except
-where PG observably differs (`json_object_keys` preserves duplicate keys; `json_each`
-preserves input order — recorded as data in the catalog, not branchy code; see
-[json-sql-functions.md](json-sql-functions.md)).
+(e.g. `json_typeof`): it is parsed on demand and dispatched to the same kernel as `jsonb`, except
+where PG observably differs (`json_object_keys` preserves duplicate keys and input order — recorded
+as data in the catalog, not branchy code; see [json-sql-functions.md](json-sql-functions.md)). The
+accessors and SRFs that *return* a sub-document — `-> ->> #> #>>`, `json_array_elements[_text]`,
+`json_each[_text]` — never build a tree: they scan the stored text and return the matched value's
+**exact sub-text** (whitespace, key order, duplicates, number spelling kept), mirroring PG's
+streaming walk, including its last-duplicate-wins and negative-index rules
+([json-sql-functions.md §1.1](json-sql-functions.md)).
 
 ### 4.1 Storage assignment
 

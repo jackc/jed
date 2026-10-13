@@ -1518,6 +1518,18 @@ const (
 	// srfJsonbEachText is jsonb_each_text(jsonb) — one `(key text, value text)` row per member (the
 	// `->>`-style value).
 	srfJsonbEachText
+	// srfJsonArrayElements is json_array_elements(json) — one `json` row per array element, its
+	// VERBATIM sub-text (json.md §4: whitespace, key order, duplicate keys kept).
+	srfJsonArrayElements
+	// srfJsonArrayElementsText is json_array_elements_text(json) — one `text` row per element (the
+	// `->>`-style render).
+	srfJsonArrayElementsText
+	// srfJsonEach is json_each(json) — one `(key text, value json)` row per top-level member in INPUT
+	// order (duplicate keys kept), the value its verbatim sub-text.
+	srfJsonEach
+	// srfJsonEachText is json_each_text(json) — one `(key text, value text)` row per member (the
+	// `->>`-style value).
+	srfJsonEachText
 	// srfJSONRecord is json[b]_to_record(doc) (R1, json-table.md §2) — ONE record row: map the JSON
 	// object's members to the C0 col-def-list columns by name, coercing each to its declared type.
 	srfJSONRecord

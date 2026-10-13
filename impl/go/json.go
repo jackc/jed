@@ -11,6 +11,8 @@ package jed
 // per-language), cross-checked across cores by the conformance corpus + golden fixtures.
 
 import (
+	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -908,8 +910,8 @@ func writeJSONString(s string, out *strings.Builder) {
 
 // ---------------------------------------------------------------------------------------------
 // Accessor operators (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1) — jsonb kernels over
-// the canonical node tree. (The `json` overloads, which preserve the verbatim sub-text, are a
-// deferred follow-on — json.md §4.)
+// the canonical node tree. (The `json` overloads, which return verbatim sub-text, are the
+// "Verbatim `json` navigation" section below — json.md §4.)
 // ---------------------------------------------------------------------------------------------
 
 // jsonGetField is `jsonb -> text`: an object field by key. nil (→ SQL NULL) if the node is not an
@@ -957,8 +959,8 @@ func jsonGetPath(node *JsonNode, path []string) *JsonNode {
 			}
 			cur = next
 		case JArray:
-			idx, err := strconv.ParseInt(strings.TrimSpace(step), 10, 64)
-			if err != nil {
+			idx, ok := jsonPathStepIndex(step)
+			if !ok {
 				return nil
 			}
 			next := jsonGetIndex(cur, idx)
@@ -985,6 +987,326 @@ func jsonNodeToText(node *JsonNode) (string, bool) {
 	default:
 		return jsonbOut(node), true
 	}
+}
+
+// jsonPathStepIndex parses a `#>` / `#>>` path step as an array index the way PostgreSQL does
+// (`strtoint(step, 10)` in get_path_all / get_jsonb_path_all): optional leading C-locale whitespace,
+// an optional sign, at least one digit, nothing trailing, and the value within i32. Anything else is
+// ok=false — a step that never matches an array element (PG's INT_MIN sentinel; '1 ' and an
+// out-of-i32 step miss).
+func jsonPathStepIndex(step string) (int64, bool) {
+	s := strings.TrimLeft(step, " \t\n\v\f\r")
+	digits := s
+	if len(digits) > 0 && (digits[0] == '+' || digits[0] == '-') {
+		digits = digits[1:]
+	}
+	if digits == "" {
+		return 0, false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v < math.MinInt32 || v > math.MaxInt32 {
+		return 0, false
+	}
+	return v, true
+}
+
+// ---------------------------------------------------------------------------------------------
+// Verbatim `json` navigation (spec/design/json.md §4, json-sql-functions.md §1/§3). A `json` value
+// is its validated input text; its accessors and SRFs return SUB-TEXT spans of that text exactly as
+// written (whitespace, key order, duplicate keys kept), mirroring PostgreSQL's streaming get_worker /
+// each_worker / elements_worker (jsonfuncs.c). The text is already well-formed (json_in validated
+// it), so the scanners below only skip, never re-validate.
+// ---------------------------------------------------------------------------------------------
+
+// verbatimStep is one step of a verbatim-json access path (PG's tpath[i] / ipath[i] pair): hasKey/key
+// matches an object member by its de-escaped name; hasIndex/index an array element.
+type verbatimStep struct {
+	key      string
+	hasKey   bool
+	index    int64
+	hasIndex bool
+}
+
+func isJSONWS(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+
+func skipJSONWS(b string, pos int) int {
+	for pos < len(b) && isJSONWS(b[pos]) {
+		pos++
+	}
+	return pos
+}
+
+// skipJSONString returns the end (exclusive) of the string token whose opening `"` is at pos.
+func skipJSONString(b string, pos int) int {
+	pos++
+	for pos < len(b) {
+		switch b[pos] {
+		case '"':
+			return pos + 1
+		case '\\':
+			pos += 2
+		default:
+			pos++
+		}
+	}
+	return pos
+}
+
+// skipJSONValue returns the end (exclusive) of the well-formed value starting at pos (no leading
+// whitespace).
+func skipJSONValue(b string, pos int) int {
+	switch b[pos] {
+	case '"':
+		return skipJSONString(b, pos)
+	case '{', '[':
+		depth := 0
+		p := pos
+		for p < len(b) {
+			switch b[p] {
+			case '"':
+				p = skipJSONString(b, p)
+				continue
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return p + 1
+				}
+			}
+			p++
+		}
+		return p
+	default:
+		// A number / true / false / null: runs to the next delimiter.
+		p := pos
+		for p < len(b) && !isJSONWS(b[p]) && b[p] != ',' && b[p] != ']' && b[p] != '}' {
+			p++
+		}
+		return p
+	}
+}
+
+// decodeJSONString decodes the string token at pos (its opening `"`) to its content, reusing the
+// parser's escape decoding. Returns (content, end).
+func decodeJSONString(b string, pos int) (string, int, error) {
+	end := skipJSONString(b, pos)
+	p := &jsonParser{buf: []byte(b[pos:end])}
+	s, err := p.parseString()
+	if err != nil {
+		return "", 0, err
+	}
+	return s, end, nil
+}
+
+// forEachJSONMember visits the members of the object whose `{` is at pos: f(key, valueStart) must
+// return the value's end. Returns the end of the object.
+func forEachJSONMember(b string, pos int, f func(key string, start int) (int, error)) (int, error) {
+	p := skipJSONWS(b, pos+1)
+	if b[p] == '}' {
+		return p + 1, nil
+	}
+	for {
+		key, kend, err := decodeJSONString(b, p)
+		if err != nil {
+			return 0, err
+		}
+		p = skipJSONWS(b, kend) + 1 // past ':'
+		p = skipJSONWS(b, p)
+		end, err := f(key, p)
+		if err != nil {
+			return 0, err
+		}
+		p = skipJSONWS(b, end)
+		if b[p] == ',' {
+			p = skipJSONWS(b, p+1)
+		} else {
+			return p + 1, nil // past '}'
+		}
+	}
+}
+
+// forEachJSONElement visits the elements of the array whose `[` is at pos: f(ordinal, valueStart)
+// must return the element's end. Returns the end of the array.
+func forEachJSONElement(b string, pos int, f func(ord int64, start int) (int, error)) (int, error) {
+	p := skipJSONWS(b, pos+1)
+	if b[p] == ']' {
+		return p + 1, nil
+	}
+	var i int64
+	for {
+		end, err := f(i, p)
+		if err != nil {
+			return 0, err
+		}
+		p = skipJSONWS(b, end)
+		i++
+		if b[p] == ',' {
+			p = skipJSONWS(b, p+1)
+		} else {
+			return p + 1, nil // past ']'
+		}
+	}
+}
+
+// verbatimGet is the verbatim `json` access `-> ->> #> #>>` with a NON-empty path (PG get_worker):
+// the sub-text of the LAST value, in document order, whose path matches steps — an object step
+// matches EVERY member of that name (duplicate keys included, so a later duplicate overrides an
+// earlier match), an array step the element at its index. A negative index is resolved PG's way: on
+// entering ANY array at that depth (matched or not), if the index is negative and in range it is
+// rebased onto that array's length, and the rebased index then carries to every later array at the
+// same depth (an observable PG quirk, pinned by the oracle). ok=false → SQL NULL.
+func verbatimGet(text string, steps []verbatimStep) (string, bool, error) {
+	w := &verbatimWalk{b: text, steps: steps, index: make([]int64, len(steps)), hasIndex: make([]bool, len(steps)), resStart: -1}
+	for i, s := range steps {
+		w.index[i], w.hasIndex[i] = s.index, s.hasIndex
+	}
+	if _, err := w.walk(skipJSONWS(text, 0), 0, true); err != nil {
+		return "", false, err
+	}
+	if w.resStart < 0 {
+		return "", false, nil
+	}
+	return text[w.resStart:w.resEnd], true, nil
+}
+
+type verbatimWalk struct {
+	b     string
+	steps []verbatimStep
+	// index / hasIndex: the per-depth array index, rebased in place on a negative subscript.
+	index            []int64
+	hasIndex         []bool
+	resStart, resEnd int
+}
+
+// walk walks the value at pos (nested in depth containers); pathOK = the path matched down to here.
+// Returns the value's end.
+func (w *verbatimWalk) walk(pos, depth int, pathOK bool) (int, error) {
+	n := len(w.steps)
+	if depth >= n {
+		return skipJSONValue(w.b, pos), nil
+	}
+	switch w.b[pos] {
+	case '{':
+		return forEachJSONMember(w.b, pos, func(key string, vstart int) (int, error) {
+			matched := pathOK && w.steps[depth].hasKey && w.steps[depth].key == key
+			vend, err := w.walk(vstart, depth+1, matched && depth+1 < n)
+			if err != nil {
+				return 0, err
+			}
+			if matched && depth+1 == n {
+				w.resStart, w.resEnd = vstart, vend
+			}
+			return vend, nil
+		})
+	case '[':
+		if w.hasIndex[depth] && w.index[depth] < 0 {
+			var count int64
+			if _, err := forEachJSONElement(w.b, pos, func(_ int64, s int) (int, error) {
+				count++
+				return skipJSONValue(w.b, s), nil
+			}); err != nil {
+				return 0, err
+			}
+			if i := w.index[depth]; i != math.MinInt64 && -i <= count {
+				w.index[depth] = i + count
+			}
+		}
+		return forEachJSONElement(w.b, pos, func(ord int64, vstart int) (int, error) {
+			matched := pathOK && w.hasIndex[depth] && w.index[depth] == ord
+			vend, err := w.walk(vstart, depth+1, matched && depth+1 < n)
+			if err != nil {
+				return 0, err
+			}
+			if matched && depth+1 == n {
+				w.resStart, w.resEnd = vstart, vend
+			}
+			return vend, nil
+		})
+	default:
+		return skipJSONValue(w.b, pos), nil
+	}
+}
+
+// verbatimWhole is the verbatim `json #> '{}'` / `#>> '{}'` (an EMPTY path) span — the whole
+// document as PG's get_worker returns it: an object/array without its surrounding whitespace, but a
+// SCALAR from the very start of the text (keeping any leading whitespace) to the end of its token.
+func verbatimWhole(text string) string {
+	start := skipJSONWS(text, 0)
+	end := skipJSONValue(text, start)
+	if text[start] == '{' || text[start] == '[' {
+		return text[start:end]
+	}
+	return text[:end]
+}
+
+// verbatimToText is the `->>` / `#>>` / `_text` render of a verbatim sub-text: a JSON string → its
+// de-escaped content, a JSON null → SQL NULL (ok=false), anything else → the sub-text verbatim.
+func verbatimToText(sub string) (string, bool, error) {
+	start := skipJSONWS(sub, 0)
+	switch sub[start] {
+	case '"':
+		s, _, err := decodeJSONString(sub, start)
+		if err != nil {
+			return "", false, err
+		}
+		return s, true, nil
+	case 'n':
+		return "", false, nil
+	default:
+		return sub, true, nil
+	}
+}
+
+// verbatimArrayElements is json_array_elements[_text](json) (PG elements_worker): the verbatim
+// sub-text of each top-level array element, in order. A non-array → 22023 with PG's message.
+func verbatimArrayElements(text, fn string) ([]string, error) {
+	start := skipJSONWS(text, 0)
+	switch text[start] {
+	case '[':
+	case '{':
+		return nil, newError(InvalidParameterValue, fmt.Sprintf("cannot call %s on a non-array", fn))
+	default:
+		return nil, newError(InvalidParameterValue, fmt.Sprintf("cannot call %s on a scalar", fn))
+	}
+	var out []string
+	_, err := forEachJSONElement(text, start, func(_ int64, s int) (int, error) {
+		e := skipJSONValue(text, s)
+		out = append(out, text[s:e])
+		return e, nil
+	})
+	return out, err
+}
+
+// verbatimMember is one json_each member: its de-escaped key and verbatim value sub-text.
+type verbatimMember struct {
+	key, value string
+}
+
+// verbatimObjectMembers is json_each[_text](json) (PG each_worker): each top-level object member as
+// its de-escaped key and verbatim value sub-text, in INPUT order with duplicate keys kept. A
+// non-object → 22023 with PG's message.
+func verbatimObjectMembers(text string) ([]verbatimMember, error) {
+	start := skipJSONWS(text, 0)
+	switch text[start] {
+	case '{':
+	case '[':
+		return nil, newError(InvalidParameterValue, "cannot deconstruct an array as an object")
+	default:
+		return nil, newError(InvalidParameterValue, "cannot deconstruct a scalar")
+	}
+	var out []verbatimMember
+	_, err := forEachJSONMember(text, start, func(key string, s int) (int, error) {
+		e := skipJSONValue(text, s)
+		out = append(out, verbatimMember{key: key, value: text[s:e]})
+		return e, nil
+	})
+	return out, err
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -139,6 +139,14 @@ test('the types page updates json/jsonb through the shared assignment rule', asy
   await expect(rows).toContainText('{"a": 1}');
 });
 
+test('the types page autoruns the verbatim json accessor demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // json -> keeps the last duplicate's exact text; jsonb -> is canonical; #>> renders 1.50 verbatim.
+  const rows = livePanel(page, 'jsonReadDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('{"b" :  1.50}');
+  await expect(rows).toContainText('{"b": 1.50}');
+});
+
 test('the tables page enforces a CHECK constraint live and resets to seed', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   const panel = page.getByTestId('live-sql');

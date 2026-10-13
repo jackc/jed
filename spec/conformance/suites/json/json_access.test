@@ -4,8 +4,8 @@
 # a negative index counts from the array end; a JSON null sub-value renders as SQL NULL under
 # `->>`/`#>>` (and as the `null` node under `->`). The operators are 'any other operator' precedence
 # (left-associative; `doc ->> 'a' = '1'` parses as `(doc ->> 'a') = '1'`); the `#>`/`#>>` path is a
-# text[] (a bare '{a,b}' literal adapts). NULL base/arg → SQL NULL (strict). The `json` overloads are
-# a deferred 0A000 follow-on (a per-core test). Output matches the postgres:18 oracle.
+# text[] (a bare '{a,b}' literal adapts). NULL base/arg → SQL NULL (strict). The verbatim `json`
+# overloads are json_verbatim.test. Output matches the postgres:18 oracle.
 # Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.jsonb, func.jsonb_access
 

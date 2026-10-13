@@ -2089,6 +2089,10 @@ impl Engine {
                 | SrfKind::JsonObjectKeys
                 | SrfKind::JsonbEach
                 | SrfKind::JsonbEachText
+                | SrfKind::JsonArrayElements
+                | SrfKind::JsonArrayElementsText
+                | SrfKind::JsonEach
+                | SrfKind::JsonEachText
                 | SrfKind::JsonRecord { .. }
                 | SrfKind::JsonbPathQuery => self.json_srf_rows(srf, &env, meter),
                 SrfKind::RegexpMatches | SrfKind::RegexpSplitToTable => {

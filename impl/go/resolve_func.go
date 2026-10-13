@@ -1765,24 +1765,24 @@ func resolveQuantifiedSubquery(s *scope, q *quantifiedSubqueryExpr, ag *aggCtx, 
 	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs, rowValued: rowValued, collation: coll}, resolvedType{kind: rtBool}, nil
 }
 
-// resolveJSONAccess resolves a jsonb accessor operator (`-> ->> #> #>>`,
-// spec/design/json-sql-functions.md §1). The base must be `jsonb` (a `json` base is the deferred
-// 0A000 follow-on — json.md §4; any other base is 42883). For `->`/`->>` the argument is a key
-// (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string literal
-// `'{a,b}'` adapts via array_in). The result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a missing
-// access yields SQL NULL at eval.
+// resolveJSONAccess resolves a json/jsonb accessor operator (`-> ->> #> #>>`,
+// spec/design/json-sql-functions.md §1). The base must be `jsonb` or `json` (any other base is
+// 42883); a `json` base navigates its verbatim text (json.md §4). For `->`/`->>` the argument is a
+// key (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string
+// literal `'{a,b}'` adapts via array_in). The result is the base's document type (`-> #>`) or `text`
+// (`->> #>>`); a missing access yields SQL NULL at eval.
 func resolveJSONAccess(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	rbase, baseTy, err := resolve(s, lhs, nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	// The base must be jsonb. json is a documented deferred follow-on (its operators preserve the
-	// verbatim sub-text — json.md §4); any other base type has no such operator (42883).
+	// The base must be jsonb or json (a json base returns verbatim sub-text — json.md §4); any other
+	// base type has no such operator (42883). The document result keeps the base's type.
+	docTy := resolvedType{kind: rtJsonb}
 	switch baseTy.kind {
 	case rtJsonb:
 	case rtJson:
-		return nil, resolvedType{}, newError(FeatureNotSupported,
-			"json accessor operators are not supported yet; cast to jsonb")
+		docTy = resolvedType{kind: rtJson}
 	case rtNull:
 		// a NULL base propagates (the access is NULL)
 	default:
@@ -1794,11 +1794,11 @@ func resolveJSONAccess(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, par
 	var path bool
 	switch op {
 	case opJsonGet:
-		jop, result, path = jgArrow, resolvedType{kind: rtJsonb}, false
+		jop, result, path = jgArrow, docTy, false
 	case opJsonGetText:
 		jop, result, path = jgArrowText, resolvedType{kind: rtText}, false
 	case opJsonGetPath:
-		jop, result, path = jgHashArrow, resolvedType{kind: rtJsonb}, true
+		jop, result, path = jgHashArrow, docTy, true
 	default: // OpJsonGetPathText
 		jop, result, path = jgHashArrowText, resolvedType{kind: rtText}, true
 	}
@@ -1837,7 +1837,7 @@ func resolveJSONAccess(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, par
 		case rtText, rtInt, rtNull:
 		default:
 			return nil, resolvedType{}, newError(UndefinedFunction,
-				fmt.Sprintf("operator does not exist: jsonb %s %s", jsonOpSymbol(op), rtName(argTy)))
+				fmt.Sprintf("operator does not exist: %s %s %s", rtName(docTy), jsonOpSymbol(op), rtName(argTy)))
 		}
 		rarg = ra
 	}

@@ -2740,12 +2740,12 @@ export function resolveSetOp(
   };
 }
 
-// resolveJsonAccess resolves a jsonb accessor operator (`-> ->> #> #>>`,
-// spec/design/json-sql-functions.md §1). The base must be `jsonb` (a `json` base is the deferred
-// 0A000 follow-on — json.md §4; any other base is 42883). For `->`/`->>` the argument is a key
-// (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string
-// literal `'{a,b}'` adapts via array_in). The result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a
-// missing access yields SQL NULL at eval.
+// resolveJsonAccess resolves a json/jsonb accessor operator (`-> ->> #> #>>`,
+// spec/design/json-sql-functions.md §1). The base must be `jsonb` or `json` (any other base is
+// 42883); a `json` base navigates its verbatim text (json.md §4). For `->`/`->>` the argument is a
+// key (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string
+// literal `'{a,b}'` adapts via array_in). The result is the base's document type (`-> #>`) or `text`
+// (`->> #>>`); a missing access yields SQL NULL at eval.
 export function resolveJsonAccess(
   scope: Scope,
   op: BinaryOp,
@@ -2755,16 +2755,15 @@ export function resolveJsonAccess(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   const rbase = resolve(scope, lhs, null, ag, params);
-  // The base must be jsonb. json is a documented deferred follow-on (its operators preserve the
-  // verbatim sub-text — json.md §4); any other base type has no such operator (42883).
+  // The base must be jsonb or json (a json base returns verbatim sub-text — json.md §4); any other
+  // base type has no such operator (42883). The document result keeps the base's type.
+  let docTy: ResolvedType = { kind: "jsonb" };
   switch (rbase.type.kind) {
     case "jsonb":
       break;
     case "json":
-      throw engineError(
-        "feature_not_supported",
-        "json accessor operators are not supported yet; cast to jsonb",
-      );
+      docTy = { kind: "json" };
+      break;
     case "null":
       break; // a NULL base propagates (the access is NULL)
     default:
@@ -2779,7 +2778,7 @@ export function resolveJsonAccess(
   switch (op) {
     case "jsonGet":
       jop = "arrow";
-      result = { kind: "jsonb" };
+      result = docTy;
       path = false;
       break;
     case "jsonGetText":
@@ -2789,7 +2788,7 @@ export function resolveJsonAccess(
       break;
     case "jsonGetPath":
       jop = "hashArrow";
-      result = { kind: "jsonb" };
+      result = docTy;
       path = true;
       break;
     default: // "jsonGetPathText"
@@ -2825,7 +2824,7 @@ export function resolveJsonAccess(
     if (argTy.kind !== "text" && argTy.kind !== "int" && argTy.kind !== "null") {
       throw engineError(
         "undefined_function",
-        `operator does not exist: jsonb ${jsonOpSymbol(op)} ${rtName(argTy)}`,
+        `operator does not exist: ${rtName(docTy)} ${jsonOpSymbol(op)} ${rtName(argTy)}`,
       );
     }
     rarg = ra.node;

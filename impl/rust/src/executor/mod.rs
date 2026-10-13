@@ -4703,6 +4703,16 @@ pub(crate) enum SrfKind {
     JsonbEach,
     /// `jsonb_each_text(jsonb)` — one `(key text, value text)` row per member (the `->>`-style value).
     JsonbEachText,
+    /// `json_array_elements(json)` — one `json` row per array element, its VERBATIM sub-text (json.md
+    /// §4: whitespace, key order, duplicate keys kept).
+    JsonArrayElements,
+    /// `json_array_elements_text(json)` — one `text` row per element (the `->>`-style render).
+    JsonArrayElementsText,
+    /// `json_each(json)` — one `(key text, value json)` row per top-level member in INPUT order
+    /// (duplicate keys kept), the value its verbatim sub-text.
+    JsonEach,
+    /// `json_each_text(json)` — one `(key text, value text)` row per member (the `->>`-style value).
+    JsonEachText,
     /// `json[b]_to_record` / `json[b]_to_recordset` (R1, json-table.md §2): map a JSON object's members
     /// to the C0 col-def-list columns by name, coercing each to its declared type. `set` = the
     /// recordset form (one row per array element); else one record row. `jsonb` selects the input type.

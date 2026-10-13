@@ -54,20 +54,21 @@ func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, colum
 	case name == "regexp_matches", name == "regexp_split_to_table":
 		return db.resolveRegexSRF(name, args, alias, argScope, ptypes)
 	}
-	// json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
-	// jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
-	// json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
+	// json/jsonb two-column SRFs (B3, json-sql-functions.md §3): json[b]_each → (key text, value
+	// json[b]), json[b]_each_text → (key text, value text). The json variants return each member's
+	// verbatim sub-text (json.md §4). Built on the C0 multi-column synthetic table.
 	switch lname {
 	case "jsonb_each":
-		return db.resolveJSONEach(lname, srfJsonbEach, scalarT(scalarJsonb), args, alias, argScope, ptypes)
+		return db.resolveJSONEach(lname, srfJsonbEach, scalarT(scalarJsonb), true, args, alias, argScope, ptypes)
 	case "jsonb_each_text":
-		return db.resolveJSONEach(lname, srfJsonbEachText, scalarT(scalarText), args, alias, argScope, ptypes)
-	case "json_each", "json_each_text":
-		return nil, nil, newError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
+		return db.resolveJSONEach(lname, srfJsonbEachText, scalarT(scalarText), true, args, alias, argScope, ptypes)
+	case "json_each":
+		return db.resolveJSONEach(lname, srfJsonEach, scalarT(scalarJson), false, args, alias, argScope, ptypes)
+	case "json_each_text":
+		return db.resolveJSONEach(lname, srfJsonEachText, scalarT(scalarText), false, args, alias, argScope, ptypes)
 	}
 	// json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
-	// variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
-	// the json accessor operators; the jsonb variants + `json_object_keys` ship here.
+	// variants return each element's verbatim sub-text (json.md §4).
 	switch lname {
 	case "jsonb_array_elements":
 		return db.resolveJSONSrf(lname, srfJsonbArrayElements, scalarT(scalarJsonb), true, args, alias, argScope, ptypes)
@@ -77,8 +78,10 @@ func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, colum
 		return db.resolveJSONSrf(lname, srfJsonbObjectKeys, scalarT(scalarText), true, args, alias, argScope, ptypes)
 	case "json_object_keys":
 		return db.resolveJSONSrf(lname, srfJsonObjectKeys, scalarT(scalarText), false, args, alias, argScope, ptypes)
-	case "json_array_elements", "json_array_elements_text":
-		return nil, nil, newError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
+	case "json_array_elements":
+		return db.resolveJSONSrf(lname, srfJsonArrayElements, scalarT(scalarJson), false, args, alias, argScope, ptypes)
+	case "json_array_elements_text":
+		return db.resolveJSONSrf(lname, srfJsonArrayElementsText, scalarT(scalarText), false, args, alias, argScope, ptypes)
 	}
 	// jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
 	// evaluation sequence over the context document. A bare string literal adapts (the ctx to jsonb,
@@ -121,17 +124,20 @@ func (db *engine) resolveJSONSrf(name string, kind srfKind, colTy dataType, json
 // json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts). The
 // synthetic relation has the fixed columns `key text` and `value <valueTy>` (the C0 multi-column
 // synthetic table). A non-object argument → 22023 at exec; a NULL → zero rows.
-func (db *engine) resolveJSONEach(name string, kind srfKind, valueTy dataType, args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
+func (db *engine) resolveJSONEach(name string, kind srfKind, valueTy dataType, jsonb bool, args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload(name)
 	}
-	want := scalarJsonb
+	want, docKind := scalarJsonb, rtJsonb
+	if !jsonb {
+		want, docKind = scalarJson, rtJson
+	}
 	forbidden := &aggCtx{}
 	r, t, err := resolve(argScope, *args[0], &want, forbidden, ptypes)
 	if err != nil {
 		return nil, nil, err
 	}
-	if t.kind != rtJsonb && t.kind != rtNull {
+	if t.kind != docKind && t.kind != rtNull {
 		return nil, nil, noFuncOverload(name)
 	}
 	table := srfTableCols(name, alias, []srfCol{{"key", scalarT(scalarText)}, {"value", valueTy}})
@@ -1270,6 +1276,12 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 	if arg.Kind == ValNull {
 		return nil, nil
 	}
+	// The json array_elements / each variants walk the verbatim text (json.md §4) instead of a parsed
+	// node tree, returning each element / member value as its exact sub-text.
+	switch sp.kind {
+	case srfJsonArrayElements, srfJsonArrayElementsText, srfJsonEach, srfJsonEachText:
+		return jsonVerbatimSrfRows(sp.kind, arg.str(), m)
+	}
 	node, err := jsonArgNode(arg)
 	if err != nil {
 		return nil, err
@@ -1871,4 +1883,66 @@ func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []boo
 	default:
 		panic("the resolver restricts unnest's argument to an array")
 	}
+}
+
+// jsonVerbatimSrfRows generates the rows of a verbatim-json SRF (json.md §4, json-sql-functions.md
+// §3): json_array_elements → one json row per array element's exact sub-text; _text → the ->>-style
+// render (a string de-escaped, a JSON null → SQL NULL, else the sub-text); json_each → (key, json
+// sub-text) per top-level member in INPUT order with duplicates kept; json_each_text → (key,
+// ->>-style text). Each produced row charges one generated_row, like the jsonb variants.
+func jsonVerbatimSrfRows(kind srfKind, text string, m *costMeter) ([]storedRow, error) {
+	render := func(sub string, asText bool) (Value, error) {
+		if !asText {
+			return JsonValue(sub), nil
+		}
+		s, ok, err := verbatimToText(sub)
+		if err != nil {
+			return Value{}, err
+		}
+		if !ok {
+			return NullValue(), nil
+		}
+		return TextValue(s), nil
+	}
+	var out []storedRow
+	switch kind {
+	case srfJsonArrayElements, srfJsonArrayElementsText:
+		asText := kind == srfJsonArrayElementsText
+		fn := "json_array_elements"
+		if asText {
+			fn = "json_array_elements_text"
+		}
+		elems, err := verbatimArrayElements(text, fn)
+		if err != nil {
+			return nil, err
+		}
+		for _, sub := range elems {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			v, err := render(sub, asText)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, storedRow{v})
+		}
+	default: // srfJsonEach, srfJsonEachText
+		members, err := verbatimObjectMembers(text)
+		if err != nil {
+			return nil, err
+		}
+		for _, mem := range members {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			v, err := render(mem.value, kind == srfJsonEachText)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, storedRow{TextValue(mem.key), v})
+		}
+	}
+	return out, nil
 }

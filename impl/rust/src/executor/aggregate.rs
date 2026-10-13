@@ -428,7 +428,7 @@ impl Acc {
                     // Both json_agg and jsonb_agg render the spaced canonical form (PG joins the
                     // element texts with ", "); the json variant is just typed `json`. (A json input
                     // element is canonicalized by `value_to_node`, a documented divergence from PG's
-                    // verbatim — the json_array_elements precedent.) `compact` = the json result.
+                    // verbatim element text.) `compact` = the json result.
                     let text = json::jsonb_out(&arr);
                     if compact {
                         Value::Json(text)

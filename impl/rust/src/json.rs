@@ -696,8 +696,8 @@ fn write_node(node: &JsonNode, out: &mut String) {
 
 // ---------------------------------------------------------------------------------------------
 // Accessor operators (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1) — jsonb kernels over
-// the canonical node tree. (The `json` overloads, which preserve the verbatim sub-text, are a
-// deferred follow-on — json.md §4.)
+// the canonical node tree. (The `json` overloads, which return verbatim sub-text, are the
+// "Verbatim `json` navigation" section below — json.md §4.)
 // ---------------------------------------------------------------------------------------------
 
 /// `jsonb -> text`: an object field by key. `None` (→ SQL NULL) if the node is not an object or
@@ -735,7 +735,7 @@ pub fn get_path<'a>(node: &'a JsonNode, path: &[String]) -> Option<&'a JsonNode>
         cur = match cur {
             JsonNode::Object(members) => members.iter().find(|(k, _)| k == step).map(|(_, v)| v)?,
             JsonNode::Array(elems) => {
-                let idx: i64 = step.trim().parse().ok()?;
+                let idx = path_step_index(step)?;
                 let len = elems.len() as i64;
                 let i = if idx < 0 { len + idx } else { idx };
                 if i >= 0 && i < len {
@@ -759,6 +759,317 @@ pub fn node_to_text(node: &JsonNode) -> Option<String> {
         JsonNode::String(s) => Some(s.clone()),
         other => Some(jsonb_out(other)),
     }
+}
+
+/// Parse a `#>` / `#>>` path step as an array index the way PostgreSQL does (`strtoint(step, 10)`
+/// in `get_path_all` / `get_jsonb_path_all`): optional leading C-locale whitespace, an optional
+/// sign, at least one digit, nothing trailing, and the value within `i32`. Anything else is `None`
+/// — a step that never matches an array element (PG's `INT_MIN` sentinel; `'1 '` and an
+/// out-of-`i32` step miss).
+pub fn path_step_index(step: &str) -> Option<i64> {
+    let s = step.trim_start_matches([' ', '\t', '\n', '\u{000B}', '\u{000C}', '\r']);
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v: i64 = s.strip_prefix('+').unwrap_or(s).parse().ok()?;
+    if v < i64::from(i32::MIN) || v > i64::from(i32::MAX) {
+        return None;
+    }
+    Some(v)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Verbatim `json` navigation (spec/design/json.md §4, json-sql-functions.md §1/§3). A `json` value
+// is its validated input text; its accessors and SRFs return SUB-TEXT spans of that text exactly
+// as written (whitespace, key order, duplicate keys kept), mirroring PostgreSQL's streaming
+// `get_worker` / `each_worker` / `elements_worker` (jsonfuncs.c). The text is already well-formed
+// (json_in validated it), so the scanners below only skip, never re-validate.
+// ---------------------------------------------------------------------------------------------
+
+/// One step of a verbatim-json access path (PG's `tpath[i]` / `ipath[i]` pair): `key` matches an
+/// object member by its de-escaped name; `index` an array element (`None` never matches).
+pub struct VerbatimStep {
+    pub key: Option<String>,
+    pub index: Option<i64>,
+}
+
+fn is_json_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn skip_json_ws(b: &[u8], mut pos: usize) -> usize {
+    while pos < b.len() && is_json_ws(b[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+/// The end (exclusive) of the string token whose opening `"` is at `pos`.
+fn skip_json_string(b: &[u8], mut pos: usize) -> usize {
+    pos += 1;
+    while pos < b.len() {
+        match b[pos] {
+            b'"' => return pos + 1,
+            b'\\' => pos += 2,
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+/// The end (exclusive) of the well-formed value starting at `pos` (no leading whitespace).
+fn skip_json_value(b: &[u8], pos: usize) -> usize {
+    match b[pos] {
+        b'"' => skip_json_string(b, pos),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut p = pos;
+            while p < b.len() {
+                match b[p] {
+                    b'"' => {
+                        p = skip_json_string(b, p);
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return p + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                p += 1;
+            }
+            p
+        }
+        _ => {
+            // A number / true / false / null: runs to the next delimiter.
+            let mut p = pos;
+            while p < b.len() && !is_json_ws(b[p]) && !matches!(b[p], b',' | b']' | b'}') {
+                p += 1;
+            }
+            p
+        }
+    }
+}
+
+/// Decode the string token at `pos` (its opening `"`) to its content, reusing the parser's
+/// escape decoding. Returns `(content, end)`.
+fn decode_json_string(b: &[u8], pos: usize) -> Result<(String, usize)> {
+    let mut p = Parser::new(b, false);
+    p.pos = pos;
+    let s = p.parse_string()?;
+    Ok((s, p.pos))
+}
+
+/// Visit the members of the object whose `{` is at `pos`: `f(key, value_start)` must return the
+/// value's end. Returns the end of the object.
+fn for_each_member(
+    b: &[u8],
+    pos: usize,
+    mut f: impl FnMut(String, usize) -> Result<usize>,
+) -> Result<usize> {
+    let mut p = skip_json_ws(b, pos + 1);
+    if b[p] == b'}' {
+        return Ok(p + 1);
+    }
+    loop {
+        let (key, kend) = decode_json_string(b, p)?;
+        p = skip_json_ws(b, kend) + 1; // past ':'
+        p = skip_json_ws(b, p);
+        p = skip_json_ws(b, f(key, p)?);
+        if b[p] == b',' {
+            p = skip_json_ws(b, p + 1);
+        } else {
+            return Ok(p + 1); // past '}'
+        }
+    }
+}
+
+/// Visit the elements of the array whose `[` is at `pos`: `f(ordinal, value_start)` must return
+/// the element's end. Returns the end of the array.
+fn for_each_element(
+    b: &[u8],
+    pos: usize,
+    mut f: impl FnMut(i64, usize) -> Result<usize>,
+) -> Result<usize> {
+    let mut p = skip_json_ws(b, pos + 1);
+    if b[p] == b']' {
+        return Ok(p + 1);
+    }
+    let mut i = 0i64;
+    loop {
+        p = skip_json_ws(b, f(i, p)?);
+        i += 1;
+        if b[p] == b',' {
+            p = skip_json_ws(b, p + 1);
+        } else {
+            return Ok(p + 1); // past ']'
+        }
+    }
+}
+
+/// The verbatim `json` access `-> ->> #> #>>` with a NON-empty path (PG `get_worker`): the
+/// sub-text of the LAST value, in document order, whose path matches `steps` — an object step
+/// matches EVERY member of that name (duplicate keys included, so a later duplicate overrides an
+/// earlier match), an array step the element at its index. A negative index is resolved PG's way:
+/// on entering ANY array at that depth (matched or not), if the index is negative and in range it
+/// is rebased onto that array's length, and the rebased index then carries to every later array at
+/// the same depth (an observable PG quirk, pinned by the oracle). `None` → SQL NULL.
+pub fn verbatim_get<'a>(text: &'a str, steps: &[VerbatimStep]) -> Result<Option<&'a str>> {
+    let b = text.as_bytes();
+    let mut walk = VerbatimWalk {
+        b,
+        steps,
+        index: steps.iter().map(|s| s.index).collect(),
+        result: None,
+    };
+    let start = skip_json_ws(b, 0);
+    walk.walk(start, 0, true)?;
+    Ok(walk.result.map(|(s, e)| &text[s..e]))
+}
+
+struct VerbatimWalk<'b, 's> {
+    b: &'b [u8],
+    steps: &'s [VerbatimStep],
+    /// The per-depth array index, rebased in place on a negative subscript (see [`verbatim_get`]).
+    index: Vec<Option<i64>>,
+    result: Option<(usize, usize)>,
+}
+
+impl VerbatimWalk<'_, '_> {
+    /// Walk the value at `pos` (nested in `depth` containers); `path_ok` = the path matched down to
+    /// here. Returns the value's end.
+    fn walk(&mut self, pos: usize, depth: usize, path_ok: bool) -> Result<usize> {
+        let n = self.steps.len();
+        if depth >= n {
+            return Ok(skip_json_value(self.b, pos));
+        }
+        match self.b[pos] {
+            b'{' => {
+                let b = self.b;
+                for_each_member(b, pos, |key, vstart| {
+                    let matched = path_ok && self.steps[depth].key.as_deref() == Some(key.as_str());
+                    let vend = self.walk(vstart, depth + 1, matched && depth + 1 < n)?;
+                    if matched && depth + 1 == n {
+                        self.result = Some((vstart, vend));
+                    }
+                    Ok(vend)
+                })
+            }
+            b'[' => {
+                let b = self.b;
+                if let Some(i) = self.index[depth] {
+                    if i < 0 {
+                        let mut count = 0i64;
+                        for_each_element(b, pos, |_, s| {
+                            count += 1;
+                            Ok(skip_json_value(b, s))
+                        })?;
+                        if i.checked_neg().is_some_and(|m| m <= count) {
+                            self.index[depth] = Some(i + count);
+                        }
+                    }
+                }
+                for_each_element(b, pos, |ord, vstart| {
+                    let matched = path_ok && self.index[depth] == Some(ord);
+                    let vend = self.walk(vstart, depth + 1, matched && depth + 1 < n)?;
+                    if matched && depth + 1 == n {
+                        self.result = Some((vstart, vend));
+                    }
+                    Ok(vend)
+                })
+            }
+            _ => Ok(skip_json_value(self.b, pos)),
+        }
+    }
+}
+
+/// The verbatim `json #> '{}'` / `#>> '{}'` (an EMPTY path) span — the whole document as PG's
+/// `get_worker` returns it: an object/array without its surrounding whitespace, but a SCALAR from
+/// the very start of the text (keeping any leading whitespace) to the end of its token.
+pub fn verbatim_whole(text: &str) -> &str {
+    let b = text.as_bytes();
+    let start = skip_json_ws(b, 0);
+    let end = skip_json_value(b, start);
+    if matches!(b[start], b'{' | b'[') {
+        &text[start..end]
+    } else {
+        &text[..end]
+    }
+}
+
+/// The `->>` / `#>>` / `_text` render of a verbatim sub-text: a JSON string → its de-escaped
+/// content, a JSON `null` → SQL NULL (`None`), anything else → the sub-text verbatim.
+pub fn verbatim_to_text(sub: &str) -> Result<Option<String>> {
+    let b = sub.as_bytes();
+    let start = skip_json_ws(b, 0);
+    match b[start] {
+        b'"' => Ok(Some(decode_json_string(b, start)?.0)),
+        b'n' => Ok(None),
+        _ => Ok(Some(sub.to_string())),
+    }
+}
+
+/// `json_array_elements[_text](json)` (PG `elements_worker`): the verbatim sub-text of each
+/// top-level array element, in order. A non-array → `22023` with PG's message.
+pub fn verbatim_array_elements<'a>(text: &'a str, func: &str) -> Result<Vec<&'a str>> {
+    let b = text.as_bytes();
+    let start = skip_json_ws(b, 0);
+    match b[start] {
+        b'[' => {}
+        b'{' => {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("cannot call {func} on a non-array"),
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("cannot call {func} on a scalar"),
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for_each_element(b, start, |_, s| {
+        let e = skip_json_value(b, s);
+        out.push(&text[s..e]);
+        Ok(e)
+    })?;
+    Ok(out)
+}
+
+/// `json_each[_text](json)` (PG `each_worker`): each top-level object member as its de-escaped key
+/// and verbatim value sub-text, in INPUT order with duplicate keys kept. A non-object → `22023`
+/// with PG's message.
+pub fn verbatim_object_members(text: &str) -> Result<Vec<(String, &str)>> {
+    let b = text.as_bytes();
+    let start = skip_json_ws(b, 0);
+    match b[start] {
+        b'{' => {}
+        b'[' => {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                "cannot deconstruct an array as an object",
+            ));
+        }
+        _ => {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                "cannot deconstruct a scalar",
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for_each_member(b, start, |key, s| {
+        let e = skip_json_value(b, s);
+        out.push((key, &text[s..e]));
+        Ok(e)
+    })?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------

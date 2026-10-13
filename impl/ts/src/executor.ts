@@ -393,6 +393,9 @@ import {
   jsonbOut,
   makeObject as jsonMakeObject,
   nodeToText,
+  verbatimArrayElements,
+  verbatimObjectMembers,
+  verbatimToText,
   pretty as jsonPretty,
   prettySize as jsonPrettySize,
 } from "./json.ts";
@@ -16083,15 +16086,16 @@ export class Engine {
     if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
     if (lname === "regexp_matches" || lname === "regexp_split_to_table")
       return this.resolveRegexSrf(lname, args, alias, argScope, ptypes);
-    // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
-    // jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
-    // json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
+    // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): json[b]_each → (key text, value
+    // json[b]), json[b]_each_text → (key text, value text). The json variants return each member's
+    // verbatim sub-text (json.md §4). Built on the C0 multi-column synthetic table.
     switch (lname) {
       case "jsonb_each":
         return this.resolveJsonEach(
           lname,
           "jsonb_each",
           scalarT("jsonb"),
+          true,
           args,
           alias,
           argScope,
@@ -16102,16 +16106,33 @@ export class Engine {
           lname,
           "jsonb_each_text",
           scalarT("text"),
+          true,
           args,
           alias,
           argScope,
           ptypes,
         );
       case "json_each":
+        return this.resolveJsonEach(
+          lname,
+          "json_each",
+          scalarT("json"),
+          false,
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
       case "json_each_text":
-        throw engineError(
-          "feature_not_supported",
-          lname + " is not supported yet; use the jsonb variant",
+        return this.resolveJsonEach(
+          lname,
+          "json_each_text",
+          scalarT("text"),
+          false,
+          args,
+          alias,
+          argScope,
+          ptypes,
         );
     }
     // jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): the SRF form — one `jsonb` row per
@@ -16123,8 +16144,7 @@ export class Engine {
       return { table, srf: { kind: "jsonb_path_query", args: [ctx, path] } };
     }
     // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
-    // variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
-    // the json accessor operators; the jsonb variants + `json_object_keys` ship here.
+    // variants return each element's verbatim sub-text (json.md §4).
     switch (lname) {
       case "jsonb_array_elements":
         return this.resolveJsonSrf(
@@ -16171,10 +16191,26 @@ export class Engine {
           ptypes,
         );
       case "json_array_elements":
+        return this.resolveJsonSrf(
+          lname,
+          "json_array_elements",
+          scalarT("json"),
+          false,
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
       case "json_array_elements_text":
-        throw engineError(
-          "feature_not_supported",
-          lname + " is not supported yet; use the jsonb variant",
+        return this.resolveJsonSrf(
+          lname,
+          "json_array_elements_text",
+          scalarT("text"),
+          false,
+          args,
+          alias,
+          argScope,
+          ptypes,
         );
     }
     throw engineError("undefined_function", "function does not exist: " + name);
@@ -16203,14 +16239,16 @@ export class Engine {
     return { table, srf: { kind, args: [node] } };
   }
 
-  // resolveJsonEach resolves a json/jsonb TWO-column SRF (B3 — jsonb_each / jsonb_each_text,
-  // json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts). The
-  // synthetic relation has the fixed columns `key text` and `value <valueTy>` (the C0 multi-column
-  // synthetic table). A non-object argument → 22023 at exec; a NULL → zero rows.
+  // resolveJsonEach resolves a json/jsonb TWO-column SRF (B3 — json[b]_each / json[b]_each_text,
+  // json-sql-functions.md §3): the one argument is a jsonb (`jsonb` = true) or json value (a bare
+  // string literal adapts). The synthetic relation has the fixed columns `key text` and
+  // `value <valueTy>` (the C0 multi-column synthetic table). A non-object argument → 22023 at exec;
+  // a NULL → zero rows.
   private resolveJsonEach(
     name: string,
     kind: SrfKind,
     valueTy: Type,
+    jsonb: boolean,
     args: Expr[],
     alias: string | null,
     argScope: Scope,
@@ -16218,8 +16256,10 @@ export class Engine {
   ): { table: Table; srf: SrfPlan } {
     if (args.length !== 1) throw noFuncOverload(name);
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-    const { node, type } = resolve(argScope, args[0]!, "jsonb", forbidden, ptypes);
-    if (type.kind !== "jsonb" && type.kind !== "null") throw noFuncOverload(name);
+    const { node, type } = resolve(argScope, args[0]!, jsonb ? "jsonb" : "json", forbidden, ptypes);
+    const ok =
+      type.kind === "null" || (jsonb && type.kind === "jsonb") || (!jsonb && type.kind === "json");
+    if (!ok) throw noFuncOverload(name);
     const table = srfTableCols(name, alias, [
       ["key", scalarT("text")],
       ["value", valueTy],
@@ -17055,6 +17095,16 @@ export class Engine {
     const arg = evalExpr(srf.args[0]!, [], env, meter);
     // A NULL argument → zero rows (PG; the empty_on_null discipline).
     if (arg.kind === "null") return [];
+    // The json array_elements / each variants walk the verbatim text (json.md §4) instead of a
+    // parsed node tree, returning each element / member value as its exact sub-text.
+    switch (srf.kind) {
+      case "json_array_elements":
+      case "json_array_elements_text":
+      case "json_each":
+      case "json_each_text":
+        if (arg.kind !== "json") throw new Error("resolver restricts a json SRF argument to json");
+        return jsonVerbatimSrfRows(srf.kind, arg.text, meter);
+    }
     const node = jsonArgNode(arg);
     const out: Row[] = [];
     switch (srf.kind) {
@@ -18599,6 +18649,10 @@ export class Engine {
         case "json_object_keys":
         case "jsonb_each":
         case "jsonb_each_text":
+        case "json_array_elements":
+        case "json_array_elements_text":
+        case "json_each":
+        case "json_each_text":
         case "json_record":
         case "jsonb_path_query":
           srfRows = this.jsonSrfRows(rel.srf, env, meter);
@@ -28114,6 +28168,10 @@ export type PlanRel = {
 //   "json_object_keys"          — one `text` row per object key, in INPUT order (duplicates kept).
 //   "jsonb_each"                — one `(key text, value jsonb)` row per object member, canonical order.
 //   "jsonb_each_text"           — one `(key text, value text)` row per member (the `->>`-style value).
+//   "json_array_elements"       — one `json` row per array element, its VERBATIM sub-text (json.md §4).
+//   "json_array_elements_text"  — one `text` row per element (the `->>`-style render).
+//   "json_each"                 — one `(key text, value json)` row per member, INPUT order, dupes kept.
+//   "json_each_text"            — one `(key text, value text)` row per member (the `->>`-style value).
 //   "json_record"               — json[b]_to_record / _recordset (R1, json-table.md §2): map a JSON
 //                                 object's members to the C0 col-def-list columns by name + coerce.
 //                                 The `recordSet`/`recordCols` fields on the plan carry the form +
@@ -28127,6 +28185,10 @@ export type SrfKind =
   | "json_object_keys"
   | "jsonb_each"
   | "jsonb_each_text"
+  | "json_array_elements"
+  | "json_array_elements_text"
+  | "json_each"
+  | "json_each_text"
   | "json_record"
   // jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
   // evaluation sequence over the context document. `args` is `[ctx, path]`.
@@ -34247,4 +34309,33 @@ function insertDefaultNeeds(
     if (rows === null) return false;
     return rows.some((values) => p < values.length && values[p]!.kind === "default");
   });
+}
+
+// jsonVerbatimSrfRows generates the rows of a verbatim-json SRF (json.md §4, json-sql-functions.md
+// §3): json_array_elements → one json row per array element's exact sub-text; _text → the ->>-style
+// render (a string de-escaped, a JSON null → SQL NULL, else the sub-text); json_each → (key, json
+// sub-text) per top-level member in INPUT order with duplicates kept; json_each_text → (key,
+// ->>-style text). Each produced row charges one generatedRow, like the jsonb variants.
+function jsonVerbatimSrfRows(kind: SrfKind, text: string, meter: Meter): Row[] {
+  const render = (sub: string, asText: boolean): Value => {
+    if (!asText) return jsonValue(sub);
+    const t = verbatimToText(sub);
+    return t === null ? nullValue() : textValue(t);
+  };
+  const out: Row[] = [];
+  if (kind === "json_array_elements" || kind === "json_array_elements_text") {
+    const asText = kind === "json_array_elements_text";
+    for (const sub of verbatimArrayElements(text, kind)) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([render(sub, asText)]);
+    }
+  } else {
+    for (const mem of verbatimObjectMembers(text)) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([textValue(mem.key), render(mem.value, kind === "json_each_text")]);
+    }
+  }
+  return out;
 }

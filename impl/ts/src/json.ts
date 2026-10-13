@@ -393,6 +393,11 @@ class JsonParser {
   // parseString parses a JSON string token (the leading `"` is at this.pos), decoding escapes to the
   // actual UTF-8 content. RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (with surrogate pairs).
   // Unescaped control characters (< 0x20) are rejected.
+  // decodeStringToken decodes a buffer holding exactly one string token (verbatim navigation).
+  decodeStringToken(): string {
+    return this.parseString();
+  }
+
   private parseString(): string {
     this.pos++; // consume opening '"'
     let out = "";
@@ -771,8 +776,8 @@ export function writeJsonString(s: string, out: string[]): void {
 
 // ---------------------------------------------------------------------------------------------
 // Accessor operators (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1) — jsonb kernels over
-// the canonical node tree. (The `json` overloads, which preserve the verbatim sub-text, are a
-// deferred follow-on — json.md §4.)
+// the canonical node tree. (The `json` overloads, which return verbatim sub-text, are the
+// "Verbatim `json` navigation" section below — json.md §4.)
 // ---------------------------------------------------------------------------------------------
 
 // getField is `jsonb -> text`: an object field by key. null (→ SQL NULL) if the node is not an
@@ -807,7 +812,7 @@ export function getPath(node: JsonNode, path: string[]): JsonNode | null {
       if (next === null) return null;
       cur = next;
     } else if (cur.kind === "array") {
-      const idx = parseIntStep(step);
+      const idx = pathStepIndex(step);
       if (idx === null) return null;
       const next = getIndex(cur, idx);
       if (next === null) return null;
@@ -819,17 +824,17 @@ export function getPath(node: JsonNode, path: string[]): JsonNode | null {
   return cur;
 }
 
-// parseIntStep parses a #>-path step as a base-10 integer index (the Rust `step.trim().parse()` /
-// Go `strconv.ParseInt(TrimSpace(...))` analogue): leading/trailing ASCII whitespace is trimmed, an
-// optional leading sign is allowed, and the remainder must be all digits. null on a non-integer.
-function parseIntStep(step: string): bigint | null {
-  const t = step.trim();
-  if (!/^[+-]?[0-9]+$/.test(t)) return null;
-  try {
-    return BigInt(t);
-  } catch {
-    return null;
-  }
+// pathStepIndex parses a `#>` / `#>>` path step as an array index the way PostgreSQL does
+// (`strtoint(step, 10)` in get_path_all / get_jsonb_path_all): optional leading C-locale whitespace,
+// an optional sign, at least one digit, nothing trailing, and the value within i32. Anything else is
+// null — a step that never matches an array element (PG's INT_MIN sentinel; '1 ' and an out-of-i32
+// step miss).
+export function pathStepIndex(step: string): bigint | null {
+  const m = /^[ \t\n\v\f\r]*([+-]?[0-9]+)$/.exec(step);
+  if (m === null) return null;
+  const v = BigInt(m[1]!);
+  if (v < -2147483648n || v > 2147483647n) return null;
+  return v;
 }
 
 // nodeToText is the `->>` / `#>>` text rendering of an accessed node: a STRING node yields its raw
@@ -839,6 +844,223 @@ export function nodeToText(node: JsonNode): string | null {
   if (node.kind === "null") return null;
   if (node.kind === "string") return node.value;
   return jsonbOut(node);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Verbatim `json` navigation (spec/design/json.md §4, json-sql-functions.md §1/§3). A `json` value is
+// its validated input text; its accessors and SRFs return SUB-TEXT spans of that text exactly as
+// written (whitespace, key order, duplicate keys kept), mirroring PostgreSQL's streaming get_worker /
+// each_worker / elements_worker (jsonfuncs.c). The text is already well-formed (json_in validated
+// it), so the scanners below only skip, never re-validate. Positions are UTF-16 code-unit offsets;
+// every structural character is ASCII, so they slice the JS string exactly.
+// ---------------------------------------------------------------------------------------------
+
+// VerbatimStep is one step of a verbatim-json access path (PG's tpath[i] / ipath[i] pair): `key`
+// matches an object member by its de-escaped name; `index` an array element (null never matches).
+export type VerbatimStep = { key: string | null; index: bigint | null };
+
+function isJsonWs(c: number): boolean {
+  return c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d;
+}
+
+function skipJsonWs(t: string, pos: number): number {
+  while (pos < t.length && isJsonWs(t.charCodeAt(pos))) pos++;
+  return pos;
+}
+
+// skipJsonString returns the end (exclusive) of the string token whose opening `"` is at pos.
+function skipJsonString(t: string, pos: number): number {
+  pos++;
+  while (pos < t.length) {
+    const c = t.charCodeAt(pos);
+    if (c === 0x22 /* " */) return pos + 1;
+    pos += c === 0x5c /* \ */ ? 2 : 1;
+  }
+  return pos;
+}
+
+// skipJsonValue returns the end (exclusive) of the well-formed value starting at pos (no leading
+// whitespace).
+function skipJsonValue(t: string, pos: number): number {
+  const c = t.charCodeAt(pos);
+  if (c === 0x22 /* " */) return skipJsonString(t, pos);
+  if (c === 0x7b /* { */ || c === 0x5b /* [ */) {
+    let depth = 0;
+    let p = pos;
+    while (p < t.length) {
+      const d = t.charCodeAt(p);
+      if (d === 0x22) {
+        p = skipJsonString(t, p);
+        continue;
+      }
+      if (d === 0x7b || d === 0x5b) depth++;
+      else if (d === 0x7d /* } */ || d === 0x5d /* ] */) {
+        depth--;
+        if (depth === 0) return p + 1;
+      }
+      p++;
+    }
+    return p;
+  }
+  // A number / true / false / null: runs to the next delimiter.
+  let p = pos;
+  while (p < t.length) {
+    const d = t.charCodeAt(p);
+    if (isJsonWs(d) || d === 0x2c /* , */ || d === 0x5d || d === 0x7d) break;
+    p++;
+  }
+  return p;
+}
+
+// decodeJsonString decodes the string token at pos (its opening `"`) to its content, reusing the
+// parser's escape decoding. Returns [content, end].
+function decodeJsonString(t: string, pos: number): [string, number] {
+  const end = skipJsonString(t, pos);
+  const s = new JsonParser(UTF8.encode(t.slice(pos, end)), false).decodeStringToken();
+  return [s, end];
+}
+
+// forEachJsonMember visits the members of the object whose `{` is at pos: f(key, valueStart) must
+// return the value's end. Returns the end of the object.
+function forEachJsonMember(
+  t: string,
+  pos: number,
+  f: (key: string, start: number) => number,
+): number {
+  let p = skipJsonWs(t, pos + 1);
+  if (t.charCodeAt(p) === 0x7d /* } */) return p + 1;
+  for (;;) {
+    const [key, kend] = decodeJsonString(t, p);
+    p = skipJsonWs(t, kend) + 1; // past ':'
+    p = skipJsonWs(t, p);
+    p = skipJsonWs(t, f(key, p));
+    if (t.charCodeAt(p) === 0x2c /* , */) p = skipJsonWs(t, p + 1);
+    else return p + 1; // past '}'
+  }
+}
+
+// forEachJsonElement visits the elements of the array whose `[` is at pos: f(ordinal, valueStart)
+// must return the element's end. Returns the end of the array.
+function forEachJsonElement(
+  t: string,
+  pos: number,
+  f: (ord: bigint, start: number) => number,
+): number {
+  let p = skipJsonWs(t, pos + 1);
+  if (t.charCodeAt(p) === 0x5d /* ] */) return p + 1;
+  let i = 0n;
+  for (;;) {
+    p = skipJsonWs(t, f(i, p));
+    i++;
+    if (t.charCodeAt(p) === 0x2c /* , */) p = skipJsonWs(t, p + 1);
+    else return p + 1; // past ']'
+  }
+}
+
+// verbatimGet is the verbatim `json` access `-> ->> #> #>>` with a NON-empty path (PG get_worker):
+// the sub-text of the LAST value, in document order, whose path matches steps — an object step
+// matches EVERY member of that name (duplicate keys included, so a later duplicate overrides an
+// earlier match), an array step the element at its index. A negative index is resolved PG's way: on
+// entering ANY array at that depth (matched or not), if the index is negative and in range it is
+// rebased onto that array's length, and the rebased index then carries to every later array at the
+// same depth (an observable PG quirk, pinned by the oracle). null → SQL NULL.
+export function verbatimGet(text: string, steps: VerbatimStep[]): string | null {
+  const n = steps.length;
+  // The per-depth array index, rebased in place on a negative subscript.
+  const index = steps.map((s) => s.index);
+  let result: [number, number] | null = null;
+  // walk walks the value at pos (nested in depth containers); pathOk = the path matched down to
+  // here. Returns the value's end.
+  const walk = (pos: number, depth: number, pathOk: boolean): number => {
+    if (depth >= n) return skipJsonValue(text, pos);
+    const c = text.charCodeAt(pos);
+    if (c === 0x7b /* { */) {
+      return forEachJsonMember(text, pos, (key, vstart) => {
+        const matched = pathOk && steps[depth]!.key === key;
+        const vend = walk(vstart, depth + 1, matched && depth + 1 < n);
+        if (matched && depth + 1 === n) result = [vstart, vend];
+        return vend;
+      });
+    }
+    if (c === 0x5b /* [ */) {
+      const i = index[depth]!;
+      if (i !== null && i < 0n) {
+        let count = 0n;
+        forEachJsonElement(text, pos, (_, s) => {
+          count++;
+          return skipJsonValue(text, s);
+        });
+        if (-i <= count) index[depth] = i + count;
+      }
+      return forEachJsonElement(text, pos, (ord, vstart) => {
+        const matched = pathOk && index[depth] === ord;
+        const vend = walk(vstart, depth + 1, matched && depth + 1 < n);
+        if (matched && depth + 1 === n) result = [vstart, vend];
+        return vend;
+      });
+    }
+    return skipJsonValue(text, pos);
+  };
+  walk(skipJsonWs(text, 0), 0, true);
+  const r = result as [number, number] | null;
+  return r === null ? null : text.slice(r[0], r[1]);
+}
+
+// verbatimWhole is the verbatim `json #> '{}'` / `#>> '{}'` (an EMPTY path) span — the whole
+// document as PG's get_worker returns it: an object/array without its surrounding whitespace, but a
+// SCALAR from the very start of the text (keeping any leading whitespace) to the end of its token.
+export function verbatimWhole(text: string): string {
+  const start = skipJsonWs(text, 0);
+  const end = skipJsonValue(text, start);
+  const c = text.charCodeAt(start);
+  return c === 0x7b || c === 0x5b ? text.slice(start, end) : text.slice(0, end);
+}
+
+// verbatimToText is the `->>` / `#>>` / `_text` render of a verbatim sub-text: a JSON string → its
+// de-escaped content, a JSON null → SQL NULL (null), anything else → the sub-text verbatim.
+export function verbatimToText(sub: string): string | null {
+  const start = skipJsonWs(sub, 0);
+  const c = sub.charCodeAt(start);
+  if (c === 0x22 /* " */) return decodeJsonString(sub, start)[0];
+  if (c === 0x6e /* n */) return null;
+  return sub;
+}
+
+// verbatimArrayElements is json_array_elements[_text](json) (PG elements_worker): the verbatim
+// sub-text of each top-level array element, in order. A non-array → 22023 with PG's message.
+export function verbatimArrayElements(text: string, fn: string): string[] {
+  const start = skipJsonWs(text, 0);
+  const c = text.charCodeAt(start);
+  if (c === 0x7b /* { */)
+    throw engineError("invalid_parameter_value", `cannot call ${fn} on a non-array`);
+  if (c !== 0x5b /* [ */)
+    throw engineError("invalid_parameter_value", `cannot call ${fn} on a scalar`);
+  const out: string[] = [];
+  forEachJsonElement(text, start, (_, s) => {
+    const e = skipJsonValue(text, s);
+    out.push(text.slice(s, e));
+    return e;
+  });
+  return out;
+}
+
+// verbatimObjectMembers is json_each[_text](json) (PG each_worker): each top-level object member as
+// its de-escaped key and verbatim value sub-text, in INPUT order with duplicate keys kept. A
+// non-object → 22023 with PG's message.
+export function verbatimObjectMembers(text: string): { key: string; value: string }[] {
+  const start = skipJsonWs(text, 0);
+  const c = text.charCodeAt(start);
+  if (c === 0x5b /* [ */)
+    throw engineError("invalid_parameter_value", "cannot deconstruct an array as an object");
+  if (c !== 0x7b /* { */)
+    throw engineError("invalid_parameter_value", "cannot deconstruct a scalar");
+  const out: { key: string; value: string }[] = [];
+  forEachJsonMember(text, start, (key, s) => {
+    const e = skipJsonValue(text, s);
+    out.push({ key, value: text.slice(s, e) });
+    return e;
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------

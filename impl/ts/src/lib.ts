@@ -142,8 +142,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // (json-sql-functions.md §3).
   "func.json_srf",
   // json/jsonb two-column SRFs (B3) — jsonb_each / jsonb_each_text (json-sql-functions.md §3); the
-  // C0 multi-column synthetic table. The json variants are a deferred 0A000 follow-on.
+  // C0 multi-column synthetic table.
   "func.json_each",
+  // the verbatim-json accessors + SRFs — the json overloads of -> ->> #> #>> and
+  // json_array_elements[_text] / json_each[_text] (json.md §4, json-sql-functions.md §1/§3).
+  "func.json_verbatim",
   // The FROM-clause column-definition list `AS t(col type, …)` (C0, json-table.md §1) — the typed
   // output columns a record-returning function declares; the shared parseFieldDefList body.
   "func.coldeflist",

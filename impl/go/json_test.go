@@ -101,27 +101,6 @@ func TestInvalidJSONCastSourceIs42804(t *testing.T) {
 	}
 }
 
-// TestJSONAccessorOperatorsAreDeferred: the `json` overloads of the accessor operators
-// (`-> ->> #> #>>`) are a deferred 0A000 follow-on — they would have to preserve the verbatim
-// sub-text (json.md §4), unlike the jsonb operators that work over the canonical node tree.
-// PostgreSQL supports them, so this is a documented divergence (the jsonb operators are oracle-clean
-// in suites/json/json_access.test). Mirrors impl/rust/tests/json.rs.
-func TestJSONAccessorOperatorsAreDeferred(t *testing.T) {
-	t.Parallel()
-	db := memDB().Session(SessionOptions{})
-	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
-	run(t, db, `INSERT INTO t VALUES (1, '{"a":1}')`)
-	if got := errJSON(t, db, "SELECT j -> 'a' FROM t"); got != "0A000" {
-		t.Errorf("j -> 'a': got %s, want 0A000", got)
-	}
-	if got := errJSON(t, db, "SELECT j ->> 'a' FROM t"); got != "0A000" {
-		t.Errorf("j ->> 'a': got %s, want 0A000", got)
-	}
-	if got := errJSON(t, db, "SELECT j #> '{a}' FROM t"); got != "0A000" {
-		t.Errorf("j #> '{a}': got %s, want 0A000", got)
-	}
-}
-
 // TestLargeJsonbSpillsAndRoundTrips: a large jsonb document (a long string node well past
 // RECORD_MAX) spills onto an overflow chain and round-trips through a whole-image serialize + reload
 // — exercising the jsonb body's spill/value_payload/value_from_payload (the tree decoded from a
@@ -230,35 +209,6 @@ func TestJsonbPrettyMatchesPG(t *testing.T) {
 	}
 }
 
-// TestJSONArrayElementsSrfIsDeferred: the `json` set-returning variants `json_array_elements` /
-// `json_array_elements_text` are a deferred 0A000 follow-on (they would have to preserve the verbatim
-// element sub-text — json.md §4); the jsonb variants + `json_object_keys` are oracle-clean in
-// suites/json/json_srf.test. Mirrors impl/rust/tests/json.rs.
-func TestJSONArrayElementsSrfIsDeferred(t *testing.T) {
-	t.Parallel()
-	db := memDB().Session(SessionOptions{})
-	if got := errJSON(t, db, "SELECT * FROM json_array_elements('[1,2]'::json)"); got != "0A000" {
-		t.Errorf("json_array_elements: got %s, want 0A000", got)
-	}
-	if got := errJSON(t, db, "SELECT * FROM json_array_elements_text('[1,2]'::json)"); got != "0A000" {
-		t.Errorf("json_array_elements_text: got %s, want 0A000", got)
-	}
-}
-
-// TestJSONEachSrfIsDeferred: the `json` two-column variants `json_each` / `json_each_text` are a
-// deferred 0A000 follow-on (verbatim sub-text — json.md §4); the jsonb variants jsonb_each /
-// jsonb_each_text are oracle-clean in suites/json/json_each.test. Mirrors impl/rust/tests/json.rs.
-func TestJSONEachSrfIsDeferred(t *testing.T) {
-	t.Parallel()
-	db := memDB().Session(SessionOptions{})
-	if got := errJSON(t, db, `SELECT * FROM json_each('{"a":1}'::json)`); got != "0A000" {
-		t.Errorf("json_each: got %s, want 0A000", got)
-	}
-	if got := errJSON(t, db, `SELECT * FROM json_each_text('{"a":1}'::json)`); got != "0A000" {
-		t.Errorf("json_each_text: got %s, want 0A000", got)
-	}
-}
-
 // TestToJsonbUnsupportedSourcesAreDeferred: `to_jsonb` over the type-info-dependent / float-divergent
 // sources (float, composite, datetime, uuid, bytea, interval, multidim array) is a deferred 0A000
 // follow-on; the supported set (scalars/jsonb/json/1-D arrays) is oracle-clean in
@@ -350,8 +300,8 @@ func TestJsonBuildObjectNonScalarKeyIs0A000(t *testing.T) {
 // TestJsonAggCanonicalizesJsonElements: json_agg over a `json` element CANONICALIZES it (the element
 // conversion runs through the jsonb node tree via valueToNode), dropping the input whitespace — a
 // documented divergence from PostgreSQL, which preserves the verbatim sub-text (`[{ "a" : 1 }]`).
-// This is the same verbatim divergence the json SRFs / accessor operators carry (json.md §4); it
-// can't live in the PG-clean corpus. Mirrors impl/rust/tests/json.rs json_agg_canonicalizes_json_elements.
+// (The json SRFs / accessor operators do return verbatim sub-text — json.md §4.) It can't live in
+// the PG-clean corpus. Mirrors impl/rust/tests/json.rs json_agg_canonicalizes_json_elements.
 func TestJsonAggCanonicalizesJsonElements(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})

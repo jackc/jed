@@ -4,8 +4,8 @@
 # jsonb_object_keys → setof text in canonical key order, json_object_keys → setof text in INPUT order
 # (duplicate keys kept). A non-array (array_elements) / non-object (object_keys) is 22023; a NULL
 # argument yields zero rows. Implicitly lateral (an SRF). The json array_elements[_text] variants
-# (verbatim sub-text, json.md §4) are deferred (a per-core test). Output matches the postgres:18
-# oracle. Format: ../../../design/conformance.md.
+# (verbatim sub-text, json.md §4) are json_verbatim.test. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, func.json_srf
 
 # jsonb_array_elements — one jsonb row per element (a JSON null element is the `null` node).

@@ -1,4 +1,4 @@
-import type { EvalEnv, RExpr, ScalarFuncName } from "./executor.ts";
+import type { EvalEnv, JsonGetOp, RExpr, ScalarFuncName } from "./executor.ts";
 import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
@@ -169,6 +169,11 @@ import {
   getField,
   getIndex,
   getPath,
+  pathStepIndex,
+  verbatimGet,
+  verbatimToText,
+  verbatimWhole,
+  type VerbatimStep,
   hasDuplicateKeys as jsonHasDuplicateKeys,
   hasKey as jsonHasKeyKernel,
   insertPath as jsonInsertPathKernel,
@@ -602,8 +607,9 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const av = evalExpr(e.arg, row, env, m);
       m.guard();
       if (bv.kind === "null" || av.kind === "null") return nullValue();
+      if (bv.kind === "json") return jsonGetVerbatim(e.op, bv.text, av);
       if (bv.kind !== "jsonb")
-        throw new Error("resolver guarantees a jsonb base for an accessor operator");
+        throw new Error("resolver guarantees a json/jsonb base for an accessor operator");
       const node = bv.node;
       // Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
       // `#> #>>`. A NULL element inside the path array misses (PG).
@@ -3050,4 +3056,30 @@ export function evalDecimalArith(op: BinaryOp, a: Decimal, b: Decimal): Decimal 
     default: // "mod"
       return a.rem(b);
   }
+}
+
+// jsonGetVerbatim is a `json` accessor operator over a verbatim-text base (json.md §4,
+// json-sql-functions.md §1): `-> ->>` take a key (text) or index (int), `#> #>>` a text[] path (a
+// NULL element misses, PG). `-> #>` return the matched sub-text as json exactly as written; `->> #>>`
+// render it as text (a string de-escaped, a JSON null → SQL NULL). An EMPTY `#>` path returns the
+// whole document.
+function jsonGetVerbatim(op: JsonGetOp, text: string, arg: Value): Value {
+  const steps: VerbatimStep[] = [];
+  if (op === "arrow" || op === "arrowText") {
+    if (arg.kind === "text") steps.push({ key: arg.text, index: null });
+    else if (arg.kind === "int") steps.push({ key: null, index: arg.int });
+    else throw new Error("resolver guarantees a text/int arg for -> / ->>");
+  } else {
+    if (arg.kind !== "array") throw new Error("resolver guarantees a text[] arg for #> / #>>");
+    for (const el of arg.elements) {
+      if (el.kind === "null") return nullValue();
+      if (el.kind !== "text") throw new Error("a text[] path has text/NULL elements");
+      steps.push({ key: el.text, index: pathStepIndex(el.text) });
+    }
+  }
+  const sub = steps.length === 0 ? verbatimWhole(text) : verbatimGet(text, steps);
+  if (sub === null) return nullValue();
+  if (op === "arrow" || op === "hashArrow") return jsonValue(sub);
+  const t = verbatimToText(sub);
+  return t === null ? nullValue() : textValue(t);
 }

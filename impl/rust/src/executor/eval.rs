@@ -617,7 +617,13 @@ impl RExpr {
                 let node = match &bv {
                     Value::Null => return Ok(Value::Null),
                     Value::Jsonb(n) => n,
-                    _ => unreachable!("resolver guarantees a jsonb base for an accessor operator"),
+                    Value::Json(text) => {
+                        if matches!(av, Value::Null) {
+                            return Ok(Value::Null);
+                        }
+                        return json_get_verbatim(*op, text, &av);
+                    }
+                    _ => unreachable!("resolver guarantees a json/jsonb accessor base"),
                 };
                 if matches!(av, Value::Null) {
                     return Ok(Value::Null);
@@ -3161,6 +3167,54 @@ impl RExpr {
                 let av = array.eval(row, env, m)?;
                 quantified_membership(*op, *all, *row_wise, &lv, &av, collation.as_deref(), m)
             }
+        }
+    }
+}
+
+/// A `json` accessor operator over a verbatim-text base (json.md §4, json-sql-functions.md §1):
+/// `-> ->>` take a key (text) or index (int), `#> #>>` a `text[]` path (a NULL element misses, PG).
+/// `-> #>` return the matched sub-text as `json` exactly as written; `->> #>>` render it as text (a
+/// string de-escaped, a JSON null → SQL NULL). An EMPTY `#>` path returns the whole document.
+fn json_get_verbatim(op: JsonGetOp, text: &str, arg: &Value) -> Result<Value> {
+    let steps: Vec<json::VerbatimStep> = match (op, arg) {
+        (JsonGetOp::Arrow | JsonGetOp::ArrowText, Value::Text(k)) => vec![json::VerbatimStep {
+            key: Some(k.clone()),
+            index: None,
+        }],
+        (JsonGetOp::Arrow | JsonGetOp::ArrowText, Value::Int(i)) => vec![json::VerbatimStep {
+            key: None,
+            index: Some(*i),
+        }],
+        (JsonGetOp::HashArrow | JsonGetOp::HashArrowText, Value::Array(arr)) => {
+            let mut steps = Vec::with_capacity(arr.elements.len());
+            for e in &arr.elements {
+                match e {
+                    Value::Text(s) => steps.push(json::VerbatimStep {
+                        key: Some(s.clone()),
+                        index: json::path_step_index(s),
+                    }),
+                    Value::Null => return Ok(Value::Null),
+                    _ => unreachable!("a text[] path has text/NULL elements"),
+                }
+            }
+            steps
+        }
+        _ => {
+            unreachable!("resolver guarantees a text/int arg for -> / ->> and text[] for #> / #>>")
+        }
+    };
+    let sub = if steps.is_empty() {
+        Some(json::verbatim_whole(text))
+    } else {
+        json::verbatim_get(text, &steps)?
+    };
+    let Some(sub) = sub else {
+        return Ok(Value::Null);
+    };
+    match op {
+        JsonGetOp::Arrow | JsonGetOp::HashArrow => Ok(Value::Json(sub.to_string())),
+        JsonGetOp::ArrowText | JsonGetOp::HashArrowText => {
+            Ok(json::verbatim_to_text(sub)?.map_or(Value::Null, Value::Text))
         }
     }
 }

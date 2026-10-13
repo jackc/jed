@@ -46,6 +46,34 @@ recorded as data, not branchy code — except where PG observably differs, §3).
 accelerates ([gin.md](gin.md) — the seam already seats it); J5 ships them as sequential
 predicates, GIN pushdown a deferred follow-on.
 
+### 1.1 The `json` accessor overloads (verbatim)
+
+`->`, `->>`, `#>` and `#>>` also take a `json` base (result `json` for `->`/`#>`). Unlike every
+other `json` overload, they do **not** parse to a node tree: a `json` value is its validated input
+text ([json.md §4](json.md)), and PostgreSQL's `get_worker` (jsonfuncs.c) returns the matched
+**sub-text exactly as written** — inner whitespace, key order, number spelling (`1.50`, `1e2`) and
+escapes kept, surrounding whitespace dropped. Each core walks the text with a small span scanner
+(hand-written, json.md §4) that mirrors the streaming walk, so the observable rules are PG's:
+
+- **Duplicate keys.** An object step matches *every* member of that name, and the result is the
+  **last** match in document order. So `'{"a":1,"a":2}'::json -> 'a'` is `2`, and a path walks every
+  duplicate: `'{"a":{"b":1}, "a":{"c":2}}'::json #> '{a,b}'` is `1` (the later `a` has no `b`).
+- **Text forms.** `->>` / `#>>` de-escape a matched string and turn a matched JSON `null` into SQL
+  NULL; anything else is the sub-text verbatim (`'{"n": 1.50}'::json ->> 'n'` is `1.50`).
+- **Empty path.** `#> '{}'` returns the whole document: a container without its surrounding
+  whitespace, but a *scalar* from the start of the text (PG keeps the leading whitespace, trims the
+  trailing).
+- **Negative path index — a PG quirk, matched.** A negative index is rebased onto the length of the
+  **first array met at its depth, matched or not**, and the rebased index then carries to every later
+  array at that depth: `'{"a":[1,2,3], "b":[4,5]}'::json #> '{b,-1}'` is SQL NULL (it looks for
+  `b[2]`), while the same `jsonb` path is `5`. The quirk is deterministic and oracle-pinned, so jed
+  follows it (CLAUDE.md §1) rather than ledgering a divergence.
+- **Path step → index** (both `json` and `jsonb`). A step parses as an array index by PG's
+  `strtoint` rule: optional leading whitespace, an optional sign, digits, nothing trailing, within
+  `i32` — so `'1 '` or an out-of-range step never matches.
+
+Cost is the jsonb accessors' (one `operator_eval`); the scan is bounded by the input text.
+
 ---
 
 ## 2. Scalar processing & builder functions
@@ -94,6 +122,14 @@ shared **multi-column synthetic table** built by C0 ([json-table.md §1](json-ta
 
 All are `empty_on_null` (SQL NULL or empty input → 0 rows) and `immutable`, and — being SRFs
 — **implicitly lateral**, so a correlated `json_each(t.doc)` works with no LATERAL slice.
+
+The `json` variants of `array_elements[_text]` and `each[_text]` are verbatim like the `json`
+accessors (§1.1): `json_array_elements` yields each element's exact sub-text, `json_each` yields
+every top-level member in **input order with duplicate keys kept** (keys de-escaped, values their
+exact sub-text), and the `_text` forms de-escape a string / map a JSON `null` to SQL NULL. A
+non-array / non-object argument is `22023` with PG's messages (`cannot call json_array_elements on a
+non-array` / `… on a scalar`, `cannot deconstruct an array as an object` / `cannot deconstruct a
+scalar`). Each row charges one `generated_row`, like the jsonb forms.
 
 ---
 

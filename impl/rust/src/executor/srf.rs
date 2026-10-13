@@ -79,9 +79,9 @@ impl Engine {
         if name == "regexp_matches" || name == "regexp_split_to_table" {
             return self.resolve_regex_srf(name, args, alias, &arg_scope, ptypes);
         }
-        // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
-        // jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
-        // json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
+        // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): json[b]_each → (key text, value
+        // json[b]), json[b]_each_text → (key text, value text). The json variants return each
+        // member's verbatim sub-text (json.md §4). Built on the C0 multi-column synthetic table.
         let lname = name.to_string();
         match lname.as_str() {
             "jsonb_each" => {
@@ -89,6 +89,7 @@ impl Engine {
                     &lname,
                     SrfKind::JsonbEach,
                     Type::Scalar(ScalarType::Jsonb),
+                    true,
                     args,
                     alias,
                     &arg_scope,
@@ -100,17 +101,36 @@ impl Engine {
                     &lname,
                     SrfKind::JsonbEachText,
                     Type::Scalar(ScalarType::Text),
+                    true,
                     args,
                     alias,
                     &arg_scope,
                     ptypes,
                 );
             }
-            "json_each" | "json_each_text" => {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!("{lname} is not supported yet; use the jsonb variant"),
-                ));
+            "json_each" => {
+                return self.resolve_json_each(
+                    &lname,
+                    SrfKind::JsonEach,
+                    Type::Scalar(ScalarType::Json),
+                    false,
+                    args,
+                    alias,
+                    &arg_scope,
+                    ptypes,
+                );
+            }
+            "json_each_text" => {
+                return self.resolve_json_each(
+                    &lname,
+                    SrfKind::JsonEachText,
+                    Type::Scalar(ScalarType::Text),
+                    false,
+                    args,
+                    alias,
+                    &arg_scope,
+                    ptypes,
+                );
             }
             "jsonb_path_query" => {
                 let (ctx, path) = resolve_jsonpath_args(
@@ -137,8 +157,7 @@ impl Engine {
             _ => {}
         }
         // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
-        // variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on,
-        // like the json accessor operators; the jsonb variants + `json_object_keys` ship here.
+        // variants return each element's verbatim sub-text (json.md §4).
         if let Some((kind, col_ty, jsonb)) = match lname.as_str() {
             "jsonb_array_elements" => Some((
                 SrfKind::JsonbArrayElements,
@@ -160,12 +179,16 @@ impl Engine {
                 Type::Scalar(ScalarType::Text),
                 false,
             )),
-            "json_array_elements" | "json_array_elements_text" => {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!("{lname} is not supported yet; use the jsonb variant"),
-                ));
-            }
+            "json_array_elements" => Some((
+                SrfKind::JsonArrayElements,
+                Type::Scalar(ScalarType::Json),
+                false,
+            )),
+            "json_array_elements_text" => Some((
+                SrfKind::JsonArrayElementsText,
+                Type::Scalar(ScalarType::Text),
+                false,
+            )),
             _ => None,
         } {
             return self
@@ -249,16 +272,18 @@ impl Engine {
         Ok((table, vec![rarg], kind))
     }
 
-    /// Resolve a json/jsonb TWO-column SRF (B3 — `jsonb_each` / `jsonb_each_text`,
-    /// json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts).
-    /// The synthetic relation has the fixed columns `key text` and `value <value_ty>` (the C0
-    /// multi-column synthetic table). A non-object argument → `22023` at exec; a NULL → zero rows.
+    /// Resolve a json/jsonb TWO-column SRF (B3 — `json[b]_each` / `json[b]_each_text`,
+    /// json-sql-functions.md §3): the one argument is a jsonb (`jsonb` = true) or json value (a bare
+    /// string literal adapts). The synthetic relation has the fixed columns `key text` and
+    /// `value <value_ty>` (the C0 multi-column synthetic table). A non-object argument → `22023` at
+    /// exec; a NULL → zero rows.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_json_each(
         &self,
         name: &str,
         kind: SrfKind,
         value_ty: Type,
+        jsonb: bool,
         args: &[Expr],
         alias: Option<&str>,
         arg_scope: &Scope,
@@ -267,14 +292,23 @@ impl Engine {
         if args.len() != 1 {
             return Err(no_func_overload(name));
         }
+        let want = if jsonb {
+            ScalarType::Jsonb
+        } else {
+            ScalarType::Json
+        };
         let (rarg, t) = resolve(
             arg_scope,
             &args[0],
-            Some(ScalarType::Jsonb),
+            Some(want),
             &mut AggCtx::Forbidden,
             ptypes,
         )?;
-        if !matches!(t, ResolvedType::Jsonb | ResolvedType::Null) {
+        let ok = matches!(
+            (&t, jsonb),
+            (ResolvedType::Jsonb, true) | (ResolvedType::Json, false) | (ResolvedType::Null, _)
+        );
+        if !ok {
             return Err(no_func_overload(name));
         }
         let table = srf_table_cols(
@@ -1268,6 +1302,20 @@ impl Engine {
         if matches!(arg, Value::Null) {
             return Ok(Vec::new());
         }
+        // The json array_elements / each variants walk the verbatim text (json.md §4) instead of
+        // a parsed node tree, returning each element / member value as its exact sub-text.
+        if matches!(
+            srf.kind,
+            SrfKind::JsonArrayElements
+                | SrfKind::JsonArrayElementsText
+                | SrfKind::JsonEach
+                | SrfKind::JsonEachText
+        ) {
+            let Value::Json(text) = &arg else {
+                unreachable!("resolver restricts a json SRF argument to json");
+            };
+            return json_verbatim_srf_rows(srf.kind, text, meter);
+        }
         let node = json_arg_node(&arg)?;
         let mut out: Vec<Row> = Vec::new();
         match srf.kind {
@@ -1422,4 +1470,47 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+/// The rows of a verbatim-json SRF (json.md §4, json-sql-functions.md §3): `json_array_elements`
+/// → one `json` row per array element's exact sub-text; `_text` → the `->>`-style render (a string
+/// de-escaped, a JSON null → SQL NULL, else the sub-text); `json_each` → `(key, json sub-text)` per
+/// top-level member in INPUT order with duplicates kept; `json_each_text` → `(key, ->>-style text)`.
+/// Each produced row charges one `generated_row`, like the jsonb variants.
+fn json_verbatim_srf_rows(kind: SrfKind, text: &str, meter: &mut Meter) -> Result<Vec<Row>> {
+    let mut out: Vec<Row> = Vec::new();
+    match kind {
+        SrfKind::JsonArrayElements | SrfKind::JsonArrayElementsText => {
+            let text_form = matches!(kind, SrfKind::JsonArrayElementsText);
+            let func = if text_form {
+                "json_array_elements_text"
+            } else {
+                "json_array_elements"
+            };
+            for sub in json::verbatim_array_elements(text, func)? {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                let v = if text_form {
+                    json::verbatim_to_text(sub)?.map_or(Value::Null, Value::Text)
+                } else {
+                    Value::Json(sub.to_string())
+                };
+                out.push(vec![v]);
+            }
+        }
+        SrfKind::JsonEach | SrfKind::JsonEachText => {
+            for (key, sub) in json::verbatim_object_members(text)? {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                let v = if matches!(kind, SrfKind::JsonEachText) {
+                    json::verbatim_to_text(sub)?.map_or(Value::Null, Value::Text)
+                } else {
+                    Value::Json(sub.to_string())
+                };
+                out.push(vec![Value::Text(key), v]);
+            }
+        }
+        _ => unreachable!("json_verbatim_srf_rows only handles the json verbatim SRF kinds"),
+    }
+    Ok(out)
 }

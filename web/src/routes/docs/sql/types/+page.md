@@ -85,6 +85,11 @@ SET body = body || '{"active":true}',
 WHERE id = 1
 RETURNING body, raw;`;
 
+	const jsonReadDemo = `SELECT
+  '{"a" : [1,  2], "a": {"b" :  1.50}}'::json  -> 'a'      AS json_member,
+  '{"a" : [1,  2], "a": {"b" :  1.50}}'::jsonb -> 'a'      AS jsonb_member,
+  '{"a" : [1,  2], "a": {"b" :  1.50}}'::json #>> '{a,b}'  AS b_text;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -324,6 +329,15 @@ order, and duplicate keys. In a multi-column `UPDATE`, every right-hand side rea
 `raw = body` below captures the pre-update canonical document:
 
 <LiveSql demo="jsonUpdateDemo" query={jsonUpdateDemo} rows={1} />
+
+Reading a `json` value keeps its spelling too. `->` and `#>` on `json` return the matched value's
+exact original text — whitespace, key order, duplicate keys, and number spelling intact — where
+`jsonb` returns the canonical value. With duplicate keys, `json` takes the last match in document
+order. `->>` and `#>>` de-escape a string and turn a JSON `null` into SQL `NULL`. The set-returning
+functions `json_array_elements[_text]` and `json_each[_text]` work the same way, and `json_each`
+lists every member in input order, duplicates included:
+
+<LiveSql demo="jsonReadDemo" query={jsonReadDemo} rows={1} />
 
 A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper document, or
 building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with

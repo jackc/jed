@@ -45,30 +45,6 @@ test("invalid json cast source is 42804", () => {
   );
 });
 
-// The `json` overloads of the accessor operators (`-> ->> #> #>>`) are a deferred 0A000 follow-on
-// — they would have to preserve the verbatim sub-text (json.md §4), unlike the jsonb operators that
-// work over the canonical node tree. PostgreSQL supports them, so this is a documented divergence
-// (the jsonb operators are oracle-clean in suites/json/json_access.test). Mirrors
-// impl/rust/tests/json.rs and impl/go/json_test.go.
-test("json accessor operators are deferred", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id i32 PRIMARY KEY, j json)",
-    `INSERT INTO t VALUES (1, '{"a":1}')`,
-  ]);
-  assert.equal(
-    errCode(() => db.execute("SELECT j -> 'a' FROM t")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("SELECT j ->> 'a' FROM t")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("SELECT j #> '{a}' FROM t")),
-    "0A000",
-  );
-});
-
 // jsonb_pretty renders the PG indented multi-line form (4-space indent, one space after `:`, a
 // container ALWAYS multi-lines — an empty `{}` is `{` newline `}`). Pinned against the postgres:18
 // oracle; the multi-line output can't live in the line-based corpus. Mirrors impl/rust/tests/json.rs
@@ -85,40 +61,6 @@ test("jsonb_pretty matches PG", () => {
   assert.equal(
     pretty(`SELECT jsonb_pretty('{"a":{},"b":[]}'::jsonb)`),
     '{\n    "a": {\n    },\n    "b": [\n    ]\n}',
-  );
-});
-
-// The `json` set-returning variants `json_array_elements` / `json_array_elements_text` are a
-// deferred 0A000 follow-on (they would have to preserve the verbatim element sub-text — json.md §4);
-// the jsonb variants + `json_object_keys` are oracle-clean in suites/json/json_srf.test. Mirrors
-// impl/rust/tests/json.rs json_array_elements_srf_is_deferred and impl/go/json_test.go
-// TestJSONArrayElementsSrfIsDeferred.
-test("json_array_elements SRF is deferred", () => {
-  const db = dbWith([]);
-  assert.equal(
-    errCode(() => db.execute("SELECT * FROM json_array_elements('[1,2]'::json)")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("SELECT * FROM json_array_elements_text('[1,2]'::json)")),
-    "0A000",
-  );
-});
-
-// The `json` two-column SRFs `json_each` / `json_each_text` are a deferred 0A000 follow-on (they
-// would have to preserve the verbatim member sub-text — json.md §4); the jsonb variants are
-// oracle-clean in suites/json/json_each.test. PostgreSQL supports the json variants, so this is a
-// documented divergence (the json_array_elements precedent). Mirrors impl/rust/tests/json.rs
-// json_each_srf_is_deferred and impl/go/json_test.go TestJSONEachSrfIsDeferred.
-test("json_each SRF is deferred", () => {
-  const db = dbWith([]);
-  assert.equal(
-    errCode(() => db.execute(`SELECT * FROM json_each('{"a":1}'::json)`)),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute(`SELECT * FROM json_each_text('{"a":1}'::json)`)),
-    "0A000",
   );
 });
 
@@ -224,8 +166,8 @@ test("json_object_agg deferred value source is 0A000", () => {
 
 // `json_agg` over a `json` element CANONICALIZES it (the element conversion runs through the jsonb
 // node tree), dropping the input whitespace — a documented divergence from PostgreSQL, which
-// preserves the verbatim sub-text (`[{ "a" : 1 }]`). This is the same verbatim divergence the json
-// SRFs / accessor operators carry (json.md §4); it can't live in the PG-clean corpus. Mirrors
+// preserves the verbatim sub-text (`[{ "a" : 1 }]`). (The json SRFs / accessor operators do return
+// verbatim sub-text — json.md §4.) It can't live in the PG-clean corpus. Mirrors
 // impl/rust/tests/json.rs json_agg_canonicalizes_json_elements and impl/go/json_test.go.
 test("json_agg canonicalizes json elements", () => {
   const db = dbWith([

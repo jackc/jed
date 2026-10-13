@@ -1722,7 +1722,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if bv.Kind == ValNull || av.Kind == ValNull {
 			return NullValue(), nil
 		}
-		node := bv.jsonb() // resolver guarantees a jsonb base for an accessor operator
+		if bv.Kind == ValJson {
+			return jsonGetVerbatim(e.jgop, bv.str(), av)
+		}
+		node := bv.jsonb() // resolver guarantees a json/jsonb base for an accessor operator
 		// Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
 		// `#> #>>`. A NULL element inside the path array misses (PG).
 		var accessed *JsonNode
@@ -4642,4 +4645,57 @@ func evalDecimalArith(op binaryOp, a, b Decimal) (Value, error) {
 		return Value{}, err
 	}
 	return DecimalValue(r), nil
+}
+
+// jsonGetVerbatim is a `json` accessor operator over a verbatim-text base (json.md §4,
+// json-sql-functions.md §1): `-> ->>` take a key (text) or index (int), `#> #>>` a text[] path (a
+// NULL element misses, PG). `-> #>` return the matched sub-text as json exactly as written; `->> #>>`
+// render it as text (a string de-escaped, a JSON null → SQL NULL). An EMPTY `#>` path returns the
+// whole document.
+func jsonGetVerbatim(op jsonGetOp, text string, arg Value) (Value, error) {
+	var steps []verbatimStep
+	switch op {
+	case jgArrow, jgArrowText:
+		if arg.Kind == ValText {
+			steps = []verbatimStep{{key: arg.str(), hasKey: true}}
+		} else { // ValInt — resolver guarantees a text/int arg for -> / ->>
+			steps = []verbatimStep{{index: arg.Int, hasIndex: true}}
+		}
+	default: // jgHashArrow, jgHashArrowText — a text[] path
+		arr := arg.arrayVal()
+		steps = make([]verbatimStep, 0, len(arr.Elements))
+		for _, el := range arr.Elements {
+			if el.Kind == ValNull {
+				return NullValue(), nil
+			}
+			idx, ok := jsonPathStepIndex(el.str())
+			steps = append(steps, verbatimStep{key: el.str(), hasKey: true, index: idx, hasIndex: ok})
+		}
+	}
+	var sub string
+	if len(steps) == 0 {
+		sub = verbatimWhole(text)
+	} else {
+		found, ok, err := verbatimGet(text, steps)
+		if err != nil {
+			return Value{}, err
+		}
+		if !ok {
+			return NullValue(), nil
+		}
+		sub = found
+	}
+	switch op {
+	case jgArrow, jgHashArrow:
+		return JsonValue(sub), nil
+	default: // jgArrowText, jgHashArrowText
+		s, ok, err := verbatimToText(sub)
+		if err != nil {
+			return Value{}, err
+		}
+		if !ok {
+			return NullValue(), nil
+		}
+		return TextValue(s), nil
+	}
 }

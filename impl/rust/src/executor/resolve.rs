@@ -314,11 +314,12 @@ pub(crate) fn resolve_binary(
     }
 }
 
-/// Resolve a jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). The
-/// base must be `jsonb` (a `json` base is the deferred 0A000 follow-on — json.md §4; any other base
-/// is 42883). For `->`/`->>` the argument is a key (`text`) or an array index (`integer`); for
-/// `#>`/`#>>` it is a `text[]` path (a bare string literal `'{a,b}'` adapts via `array_in`). The
-/// result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a missing access yields SQL NULL at eval.
+/// Resolve a json/jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1).
+/// The base must be `jsonb` or `json` (any other base is 42883); a `json` base navigates its verbatim
+/// text (json.md §4). For `->`/`->>` the argument is a key (`text`) or an array index (`integer`);
+/// for `#>`/`#>>` it is a `text[]` path (a bare string literal `'{a,b}'` adapts via `array_in`).
+/// The result is the base's document type (`-> #>`) or `text` (`->> #>>`); a missing access yields
+/// SQL NULL at eval.
 pub(crate) fn resolve_json_access(
     scope: &Scope,
     op: BinaryOp,
@@ -328,17 +329,12 @@ pub(crate) fn resolve_json_access(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     let (rbase, base_ty) = resolve(scope, lhs, None, agg, params)?;
-    // The base must be jsonb. json is a documented deferred follow-on (its operators preserve the
-    // verbatim sub-text — json.md §4); any other base type has no such operator (42883).
-    match base_ty {
-        ResolvedType::Jsonb => {}
-        ResolvedType::Json => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "json accessor operators are not supported yet; cast to jsonb",
-            ));
-        }
-        ResolvedType::Null => {} // a NULL base propagates (the access is NULL)
+    // The base must be jsonb or json (a json base returns verbatim sub-text — json.md §4); any
+    // other base type has no such operator (42883). The document result keeps the base's type.
+    let doc_ty = match base_ty {
+        ResolvedType::Jsonb => ResolvedType::Jsonb,
+        ResolvedType::Json => ResolvedType::Json,
+        ResolvedType::Null => ResolvedType::Jsonb, // a NULL base propagates (the access is NULL)
         _ => {
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
@@ -349,11 +345,11 @@ pub(crate) fn resolve_json_access(
                 ),
             ));
         }
-    }
+    };
     let (jop, result, path) = match op {
-        BinaryOp::JsonGet => (JsonGetOp::Arrow, ResolvedType::Jsonb, false),
+        BinaryOp::JsonGet => (JsonGetOp::Arrow, doc_ty, false),
         BinaryOp::JsonGetText => (JsonGetOp::ArrowText, ResolvedType::Text, false),
-        BinaryOp::JsonGetPath => (JsonGetOp::HashArrow, ResolvedType::Jsonb, true),
+        BinaryOp::JsonGetPath => (JsonGetOp::HashArrow, doc_ty, true),
         BinaryOp::JsonGetPathText => (JsonGetOp::HashArrowText, ResolvedType::Text, true),
         _ => unreachable!("resolve_json_access only handles the four accessor operators"),
     };
@@ -391,7 +387,12 @@ pub(crate) fn resolve_json_access(
                 return Err(EngineError::new(
                     SqlState::UndefinedFunction,
                     format!(
-                        "operator does not exist: jsonb {} {}",
+                        "operator does not exist: {} {} {}",
+                        if matches!(base_ty, ResolvedType::Json) {
+                            "json"
+                        } else {
+                            "jsonb"
+                        },
                         json_op_symbol(op),
                         arg_ty.type_name()
                     ),

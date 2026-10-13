@@ -109,43 +109,6 @@ fn invalid_json_cast_source_is_42804() {
     assert_eq!(err(&mut db, "SELECT true::jsonb"), "42804");
 }
 
-/// The `json` overloads of the accessor operators (`-> ->> #> #>>`) are a deferred `0A000`
-/// follow-on — they would have to preserve the verbatim sub-text (json.md §4), unlike the jsonb
-/// operators that work over the canonical node tree. PostgreSQL supports them, so this is a
-/// documented divergence (the jsonb operators are oracle-clean in suites/json/json_access.test).
-#[test]
-fn json_accessor_operators_are_deferred() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
-    run(&mut db, "INSERT INTO t VALUES (1, '{\"a\":1}')");
-    assert_eq!(err(&mut db, "SELECT j -> 'a' FROM t"), "0A000");
-    assert_eq!(err(&mut db, "SELECT j ->> 'a' FROM t"), "0A000");
-    assert_eq!(err(&mut db, "SELECT j #> '{a}' FROM t"), "0A000");
-}
-
-/// The `json` set-returning variants `json_array_elements` / `json_array_elements_text` are a
-/// deferred `0A000` follow-on (they would have to preserve the verbatim element sub-text — json.md
-/// §4); the jsonb variants + `json_object_keys` are oracle-clean in suites/json/json_srf.test.
-#[test]
-fn json_array_elements_srf_is_deferred() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        err(&mut db, "SELECT * FROM json_array_elements('[1,2]'::json)"),
-        "0A000"
-    );
-    assert_eq!(
-        err(
-            &mut db,
-            "SELECT * FROM json_array_elements_text('[1,2]'::json)"
-        ),
-        "0A000"
-    );
-}
-
 /// `to_jsonb` over the type-info-dependent / float-divergent sources (float, composite, datetime,
 /// uuid, bytea, interval, multidim array) is a deferred `0A000` follow-on; the supported set
 /// (scalars/jsonb/json/1-D arrays) is oracle-clean in suites/json/json_to_jsonb.test.
@@ -273,25 +236,6 @@ fn jsonb_set_null_path_element_propagates_null() {
             "SELECT jsonb_insert('{\"a\":1}', ARRAY[NULL], '99')"
         )[0][0],
         "NULL"
-    );
-}
-
-/// The `json` two-column SRFs `json_each` / `json_each_text` are a deferred `0A000` follow-on (they
-/// would have to preserve the verbatim member sub-text — json.md §4); the jsonb variants are
-/// oracle-clean in suites/json/json_each.test. PostgreSQL supports the json variants, so this is a
-/// documented divergence (the json_array_elements precedent).
-#[test]
-fn json_each_srf_is_deferred() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        err(&mut db, "SELECT * FROM json_each('{\"a\":1}'::json)"),
-        "0A000"
-    );
-    assert_eq!(
-        err(&mut db, "SELECT * FROM json_each_text('{\"a\":1}'::json)"),
-        "0A000"
     );
 }
 
@@ -463,8 +407,8 @@ fn json_object_agg_deferred_value_source_is_0a000() {
 
 /// `json_agg` over a `json` element CANONICALIZES it (the element conversion runs through the
 /// jsonb node tree), dropping the input whitespace — a documented divergence from PostgreSQL, which
-/// preserves the verbatim sub-text (`[{ "a" : 1 }]`). This is the same verbatim divergence the json
-/// SRFs / accessor operators carry (json.md §4); it can't live in the PG-clean corpus.
+/// preserves the verbatim sub-text (`[{ "a" : 1 }]`). (The json SRFs / accessor operators do return
+/// verbatim sub-text — json.md §4.) It can't live in the PG-clean corpus.
 #[test]
 fn json_agg_canonicalizes_json_elements() {
     let mut db = Database::create(CreateOptions::default())
