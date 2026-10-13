@@ -2177,10 +2177,19 @@ pub(crate) fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Resul
             "cannot compare a range value with a value of a different type",
         )),
         // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff
-        // their element types are comparable (recursively). A bare NULL is always comparable; an
-        // array vs any non-array is 42804.
+        // they share the SAME element type, or their element types differ only in integer width
+        // (the one difference that leaves every element value untouched — what lets a bare
+        // `ARRAY[1,2]`, an i64[], compare with an i32[] column). Any other pair (f32[] × f64[],
+        // i32[] × decimal[]) is 42804, even where the scalar pair is comparable — PostgreSQL has no
+        // cross-element-type array operator. The element pair is still classified, so a json[]
+        // stays 42883. A bare NULL is always comparable; an array vs any non-array is 42804.
         (Array(_), Null) | (Null, Array(_)) => Ok(()),
-        (Array(a), Array(b)) => classify_comparable(a, b),
+        (Array(a), Array(b)) if a == b || matches!((&**a, &**b), (Int(_), Int(_))) => {
+            classify_comparable(a, b)
+        }
+        (Array(_), Array(_)) => Err(type_error(
+            "cannot compare arrays of different element types",
+        )),
         (Array(_), _) | (_, Array(_)) => Err(type_error(
             "cannot compare an array value with a value of a different type",
         )),

@@ -99,6 +99,8 @@ lossless** (every binary32 is an exact binary64), so it is also an **implicit ca
 float analogue of `i16 → i64`, and matching PG (`real` promotes to `double`). `f64 →
 f32` is lossy and **explicit**. Crossing *out of* the float family (int/decimal ↔ float)
 stays **explicit** either way (§6) — within-family widening is the *only* implicit float edge.
+The widening is scalar-only: an `f32[]` never compares with an `f64[]` (`42804`, array.md §5 —
+PostgreSQL has no `real[] = double precision[]` operator either).
 
 **Everything below applies to each width** (the total order §3, the trap model §3, the kernel
 §5, the exact-sum aggregates §7, the functions §8, rendering §9), differing only by width:
@@ -169,7 +171,15 @@ existing literal machinery — types.md §6, grammar.md §36):
   the other operand of float arithmetic — it coerces **decimal → f64** at resolve time
   (the nearest binary64 to the exact decimal, round-ties-to-even, the IEEE conversion). An
   integer literal adapts the same way. This is *literal adaptation*, not an implicit
-  cross-family cast (§6): a bare literal carries no type until its context names one.
+  cross-family cast (§6): a bare literal carries no type until its context names one. The
+  context **width** is the float operand's — an `f32` column, or the element of an `f32[]` in
+  `x = ANY(arr)` (array-functions.md §11.3), makes it the nearest **binary32** — so
+  `real_col = 0.1` and `0.1 = ANY(real_arr)` match a stored `0.1`. **A documented divergence at
+  `f32`:** PostgreSQL types `0.1` as `numeric`, has no `real = numeric` operator, and compares both
+  sides as `double precision`, where the widened binary32 nearest 0.1 (`0.10000000149011612`) never
+  equals the double nearest 0.1 — so PG returns FALSE. jed keeps the rule (a literal takes its
+  context's type, exactly as an integer literal takes an `i16` column's width); ledgered in
+  `oracle_overrides.toml` (`suites/types/float_literal_adaptation.test`). At `f64` the engines agree.
 - **The typed literal `float '…'`** (and `f64 '…'`, `CAST('…' AS f64)`) — the
   `type 'string'` form (grammar.md §36). The string is parsed by f64's input function:
   an optional sign, decimal digits with an optional point and **`e`-notation** (`1.5e10`,

@@ -1213,13 +1213,21 @@ func classifyComparable(lt, rt resolvedType) error {
 		return typeError("cannot compare a composite value with a value of a different type")
 	}
 	// Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff
-	// their element types are comparable (recursively). A bare NULL is always comparable; an array
-	// vs any non-array is 42804.
+	// they share the SAME element type, or their element types differ only in integer width (the
+	// one difference that leaves every element value untouched — what lets a bare ARRAY[1,2], an
+	// i64[], compare with an i32[] column). Any other pair (f32[] × f64[], i32[] × decimal[]) is
+	// 42804, even where the scalar pair is comparable — PostgreSQL has no cross-element-type array
+	// operator. The element pair is still classified, so a json[] stays 42883. A bare NULL is
+	// always comparable; an array vs any non-array is 42804.
 	arrL, arrR := lt.kind == rtArray, rt.kind == rtArray
 	switch {
 	case arrL && rt.kind == rtNull, lt.kind == rtNull && arrR:
 		return nil
 	case arrL && arrR:
+		sameElem := resolvedTypeEqual(*lt.elem, *rt.elem) || (lt.elem.kind == rtInt && rt.elem.kind == rtInt)
+		if !sameElem {
+			return typeError("cannot compare arrays of different element types")
+		}
 		return classifyComparable(*lt.elem, *rt.elem)
 	case arrL || arrR:
 		return typeError("cannot compare an array value with a value of a different type")
@@ -1292,13 +1300,16 @@ func classifyComparable(lt, rt resolvedType) error {
 }
 
 // isAdaptableOperand reports whether e is an adaptable operand — one that takes its type from
-// its sibling: an integer or string literal, or a bind parameter $N (spec/design/api.md §5).
-// NULL, boolean, and decimal literals do not take a sibling's context here.
+// its sibling: an integer, decimal, or string literal, or a bind parameter $N (spec/design/api.md
+// §5, float.md §4). NULL and boolean literals do not take a sibling's context. A DECIMAL literal is
+// adaptable so it can adopt a FLOAT sibling's context (`f = 1.5`, `f + 0.5`, `0.5 = ANY(fs)` —
+// float.md §4); in any other context the decimal resolve arm ignores the context and stays decimal.
 func isAdaptableOperand(e exprNode) bool {
 	if e.Kind == exprParam {
 		return true
 	}
-	return e.Kind == exprLiteral && (e.Literal.Kind == literalInt || e.Literal.Kind == literalText)
+	return e.Kind == exprLiteral &&
+		(e.Literal.Kind == literalInt || e.Literal.Kind == literalDecimal || e.Literal.Kind == literalText)
 }
 
 // decodeByteaLiteral decodes a text value as a bytea value — PostgreSQL's byteain (types.md §13).

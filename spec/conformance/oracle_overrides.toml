@@ -335,6 +335,20 @@ file = "types/float.test"
 sql = "CREATE TABLE bad (k f64 PRIMARY KEY)"
 reason = "jed: a float PRIMARY KEY is rejected this slice (0A000), the documented narrowing every non-integer type takes — the float-order-preserving key encoding is authored but unexercised (float.md §10, encoding.md §2.8). PostgreSQL allows a double precision primary key."
 
+# --- a bare decimal literal against an f32 operand: jed's literal adaptation (float.md §4) types the
+# literal at the CONTEXT width, so `real_col = 0.1` compares two binary32 values. PostgreSQL has no
+# `real = numeric` operator; it compares both sides as double precision, where the widened binary32
+# nearest 0.1 never equals the double nearest 0.1. (At f64 the two engines agree.)
+[[override]]
+file = "types/float_literal_adaptation.test"
+sql = "SELECT id FROM t WHERE c = 0.1"
+reason = "jed: a bare decimal literal compared with an f32 operand adapts to f32 (float.md §4 literal adaptation: the nearest binary value at the context width), so the stored f32 0.1 equals it and row 1 matches. PostgreSQL resolves real = numeric as double precision = double precision, comparing 0.10000000149011612 with 0.1, and returns no row. A documented literal-typing divergence."
+
+[[override]]
+file = "types/float_literal_adaptation.test"
+sql = "SELECT id FROM t WHERE 0.1 = ANY(a)"
+reason = "jed: the bare decimal scalar of `x = ANY(f32[])` adapts to the f32 element type (float.md §4; array-functions.md §11.3 — the comparison operators' literal adaptation), so the stored f32 0.1 element matches and row 1 is returned. PostgreSQL compares numeric with real as double precision, where the widened binary32 0.1 differs from the double 0.1, and returns no row. A documented literal-typing divergence."
+
 # --- DROP TYPE ... CASCADE is not supported this slice (RESTRICT-only — composite.md §7). PG drops
 # the type and everything depending on it; jed rejects CASCADE 0A000 (RESTRICT is the only behavior).
 [[override]]
@@ -495,6 +509,50 @@ reason = "jed: log10 of zero traps 22003 (jed's single numeric range/domain code
 file = "types/array.test"
 sql = "SELECT id FROM t WHERE xs = tags"
 reason = "jed: comparing i32[] to text[] is a cross-type error 42804 (the strict type system, §4 — like bool = int). PostgreSQL has no such operator and raises 42883 (undefined_function). Both reject; the codes differ."
+
+# --- array_element_compare.test: two arrays compare only over the same element type, or element
+# types that differ only in integer width (array.md §5). Every other pair is jed's 42804 where
+# PostgreSQL raises 42883 (no cross-element-type array operator); the typed integer-width pair is
+# the one jed compares and PostgreSQL rejects.
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT id FROM t WHERE a = b"
+reason = "jed: f32[] = f64[] is a cross-element-type array comparison, 42804 (array.md §5 — arrays compare only over the same element type, up to integer width; no element-wise float widening). PostgreSQL has no real[] = double precision[] operator and raises 42883. Both reject; the codes differ."
+
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT id FROM t WHERE b <> a"
+reason = "jed: f64[] <> f32[] is a cross-element-type array comparison, 42804 (array.md §5). PostgreSQL has no double precision[] <> real[] operator and raises 42883. Both reject; the codes differ."
+
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT id FROM t WHERE a < b"
+reason = "jed: f32[] < f64[] is a cross-element-type array comparison, 42804 (array.md §5). PostgreSQL has no real[] < double precision[] operator and raises 42883. Both reject; the codes differ."
+
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT id FROM t WHERE a IS DISTINCT FROM b"
+reason = "jed: f32[] IS DISTINCT FROM f64[] is a cross-element-type array comparison, 42804 (array.md §5). PostgreSQL finds no real[] = double precision[] operator and raises 42883. Both reject; the codes differ."
+
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT '{1.5}'::f32[] = '{1.5}'::f64[]"
+reason = "jed: f32[] = f64[] is a cross-element-type array comparison, 42804 (array.md §5). PostgreSQL has no real[] = double precision[] operator and raises 42883. Both reject; the codes differ."
+
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT id FROM t WHERE d = g"
+reason = "jed: i32[] = decimal[] is a cross-element-type array comparison, 42804 (array.md §5 — no element-wise int -> decimal promotion inside an array). PostgreSQL has no integer[] = numeric[] operator and raises 42883. Both reject; the codes differ."
+
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT '{1}'::i32[] = '{1}'::decimal[]"
+reason = "jed: i32[] = decimal[] is a cross-element-type array comparison, 42804 (array.md §5). PostgreSQL has no integer[] = numeric[] operator and raises 42883. Both reject; the codes differ."
+
+[[override]]
+file = "types/array_element_compare.test"
+sql = "SELECT d = e FROM t"
+reason = "jed: arrays whose element types differ only in integer width compare by value (array.md §5) — the rule that lets a bare ARRAY[1,2], an i64[] because a bare integer literal defaults to i64 (types.md §6), compare with an i32[] column the way PostgreSQL's int4-typed literal does — so i32[] = i64[] is TRUE. PostgreSQL has no integer[] = bigint[] operator and raises 42883."
 
 [[override]]
 file = "types/array.test"

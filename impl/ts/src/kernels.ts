@@ -206,12 +206,19 @@ export function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if ((compL || compR) && lt.kind !== "null" && rt.kind !== "null") {
     throw typeError("cannot compare a composite value with a value of a different type");
   }
-  // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff their
-  // element types are comparable (recursively). A bare NULL is always comparable; an array vs any
-  // non-array is 42804.
+  // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff they
+  // share the SAME element type, or their element types differ only in integer width (the one
+  // difference that leaves every element value untouched — what lets a bare ARRAY[1,2], an i64[],
+  // compare with an i32[] column). Any other pair (f32[] × f64[], i32[] × decimal[]) is 42804, even
+  // where the scalar pair is comparable — PostgreSQL has no cross-element-type array operator. The
+  // element pair is still classified, so a json[] stays 42883. A bare NULL is always comparable; an
+  // array vs any non-array is 42804.
   const arrL = lt.kind === "array";
   const arrR = rt.kind === "array";
   if (arrL && arrR) {
+    const sameElem =
+      resolvedTypeEqual(lt.elem, rt.elem) || (lt.elem.kind === "int" && rt.elem.kind === "int");
+    if (!sameElem) throw typeError("cannot compare arrays of different element types");
     classifyComparable(lt.elem, rt.elem);
     return;
   }

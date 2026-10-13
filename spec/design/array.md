@@ -202,8 +202,9 @@ needs self-delimiting + terminator framing.
 `store_array` path INSERT uses — so the stored value round-trips identically (capability
 `dml.update_container`). The RHS adapts like INSERT's: a bare `ARRAY[…]` constructor adapts its
 literal elements to the column's element type (the resolver is given the element scalar as the hint,
-exactly as `col = ARRAY[…]` does — so a bare-int `ARRAY[1,2]` reaches a narrower `i32[]`/`i16[]`
-column), a bare `'{…}'` string literal via `array_in`, and a bare `NULL` to the typed NULL; any other
+so a bare-int `ARRAY[1,2]` reaches a narrower `i32[]`/`i16[]` column; a comparison `col = ARRAY[1,2]`
+reaches the same answer through §5's integer-width rule instead), a bare `'{…}'` string literal via
+`array_in`, and a bare `NULL` to the typed NULL; any other
 expression must resolve to the **same** array type (a different element type, or a scalar RHS, is
 `42804`). A GIN index over the column is maintained over the new value (the same per-term entry
 move as INSERT/DELETE). A top-level `$N` parameter into an array column stays `0A000` (INSERT's
@@ -221,8 +222,19 @@ Array comparison is **recursive / structural**, so — like composite — it is 
 case in the value module's `eq3` / `lt3` / `gt3`, not a [../functions/catalog.toml](../functions/catalog.toml)
 operator row (the catalog cannot express "recurse over N elements"; CLAUDE.md §5 forbids
 codegenning it). [compare.toml](../types/compare.toml) stays scalar-only. Two array values are
-comparable iff they share the **same element type**; any other pair is `42804` at resolve time
-(`i32[]` vs `text[]` is not comparable, exactly as `i32` vs `text` is not).
+comparable iff they share the **same element type**, or their element types differ **only in integer
+width**; any other pair is `42804` at resolve time, for every comparison form (`= <> < <= > >=`,
+`IS [NOT] DISTINCT FROM`, `IN`, `CASE`, `BETWEEN`). `i32[]` vs `text[]` is not comparable, exactly as
+`i32` vs `text` is not — and neither is `f32[]` vs `f64[]` nor `i32[]` vs `decimal[]`, **even though
+the scalar pairs compare** (`f32` widens to `f64`, `i32` promotes to `decimal`): PostgreSQL has no
+cross-element-type array operator (`real[] = double precision[]` is its `42883` — the code difference
+is ledgered), so jed does not invent an element-wise widening. The integer-width exception is the one
+difference that leaves every element value untouched (the same one set-operation unification admits,
+[grammar.md](grammar.md) §25), and it is what lets a bare `ARRAY[1,2]` — an `i64[]`, because a bare
+integer literal defaults to `i64` ([types.md](types.md) §6) — compare with an `i32[]` column
+(`xs = ARRAY[1,2]`) the way PostgreSQL's `int4`-typed literal does. Its one visible divergence: two
+*typed* integer-width arrays (`'{1}'::i32[] = '{1}'::i64[]`) compare by value, where PostgreSQL has no
+`integer[] = bigint[]` operator (ledgered; `suites/types/array_element_compare.test`).
 
 **The load-bearing difference from composite: arrays do NOT use 3VL for NULL elements.** PostgreSQL
 array comparison (`array_eq` / `array_cmp`) is built on the element type's **btree** comparison, in
@@ -483,7 +495,7 @@ corpus lands.
 | Failure | Code |
 |---|---|
 | Unknown element type in a `T[]` declaration | `42704` undefined_object |
-| Non-unifiable elements in `ARRAY[…]` / array vs array of a different element type | `42804` datatype_mismatch |
+| Non-unifiable elements in `ARRAY[…]` / comparing an array with an array of a different element type (other than an integer-width difference, §5) | `42804` datatype_mismatch |
 | Subscripting a non-array base | `42804` datatype_mismatch |
 | Element value out of range (via element coercion) | `22003` numeric_value_out_of_range |
 | Malformed array text literal (`array_in`), incl. non-rectangular `'{{…},{…}}'` / declared-dims mismatch | `22P02` invalid_text_representation |

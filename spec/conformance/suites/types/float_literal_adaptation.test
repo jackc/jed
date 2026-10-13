@@ -1,0 +1,65 @@
+# A bare decimal literal ADAPTS to a float context (spec/design/float.md §4): compared with an f64/f32
+# operand, as the other operand of float arithmetic, or as the scalar of `x = ANY(float_array)`, it is
+# converted at resolve time to the nearest binary value at the CONTEXT width — literal adaptation, not
+# an implicit cross-family cast (a decimal/int VALUE never meets a float implicitly, §6).
+#
+# At f64 this agrees with PostgreSQL, which casts the numeric literal to double precision. At f32 it
+# deliberately does not: PostgreSQL has no `real = numeric` operator and compares both sides as
+# double precision, so the stored binary32 nearest 0.1 (0.10000000149011612 widened) never equals the
+# double nearest 0.1 and `real_col = 0.1` is FALSE. jed types the literal as f32, so the stored 0.1
+# matches. Those rows are ledgered (oracle_overrides.toml). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.comparison_order, expr.arithmetic, expr.comparison_value, func.array_quantified, types.array, types.f32, types.f64, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, f f64, c f32, b f64[], a f32[])
+
+statement ok
+INSERT INTO t VALUES (1, 0.1, 0.1, '{0.1,1.5}', '{0.1,1.5}'), (2, 2.5, 2.5, '{2.5}', '{2.5}')
+
+# --- f64 context: the literal becomes the double nearest the decimal (PostgreSQL agrees) ----------
+query I nosort
+SELECT id FROM t WHERE f = 0.1
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE 0.1 = f
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE f < 1.0
+----
+1
+
+query R nosort
+SELECT f + 0.5 FROM t WHERE id = 1
+----
+0.6
+
+query I nosort
+SELECT id FROM t WHERE 0.1 = ANY(b)
+----
+1
+
+# --- f32 context: the literal becomes the binary32 nearest the decimal (ledgered vs PostgreSQL) -----
+query I nosort
+SELECT id FROM t WHERE c = 0.1
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE 0.1 = ANY(a)
+----
+1
+
+# A decimal exactly representable at f32 agrees with PostgreSQL at either width.
+query I nosort
+SELECT id FROM t WHERE c = 2.5
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE 1.5 = ANY(a)
+----
+1
