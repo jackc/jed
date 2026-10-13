@@ -1254,3 +1254,11 @@ exact-pinned safe-Rust `napi = 3.10.5`, `napi-derive = 3.5.10`, and build-only `
 graph to expose whole-file try-lock/unlock operations that Node does not provide. It performs no
 database I/O or SQL work, keeps Go pure and the TS engine independent, and is excluded from browser
 bundles. No broader native surface inherits this exception.
+
+**Approved digest libraries (2026-10-13, clause 3).** The digest functions `md5` / `sha224` /
+`sha256` / `sha384` / `sha512` (`spec/design/string-functions.md` §4) use Go's standard library,
+RustCrypto's exact-pinned `md-5 = 0.11.0` and `sha2 = 0.11.0`, and, in the TS core, the
+exact-pinned `@noble/hashes = 2.4.0`. That is the TS core's first runtime dependency: pure
+JavaScript with no transitive dependencies, synchronous in Node and the browser alike. `sha2`'s
+SHA-NI/SIMD backends use `unsafe` intrinsics, chosen at runtime by `cpufeatures`; its portable
+fallback is safe Rust. That use of `unsafe` was accepted knowingly, and nothing else inherits it.

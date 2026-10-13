@@ -1,0 +1,138 @@
+# The digest functions (spec/design/string-functions.md §4; PostgreSQL's "Binary String Functions
+# and Operators", manual §9.5): md5(text | bytea) → text (32 lowercase hex digits) and
+# sha224 / sha256 / sha384 / sha512(bytea) → bytea (the raw digest). A text argument to md5 is
+# hashed as its UTF-8 bytes. All STRICT (a NULL argument → NULL). The expected digests are the
+# published RFC 1321 / FIPS 180-4 values. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.text, types.bytea
+
+statement ok
+CREATE TABLE h (id i32 PRIMARY KEY, t text, b bytea)
+
+statement ok
+INSERT INTO h VALUES (1, '', '\x'), (2, 'abc', '\x616263'), (3, 'héllo', '\x0001ff'), (4, NULL, NULL)
+
+# === md5(text) / md5(bytea) → text =========================================================
+
+# the RFC 1321 test vectors for "" and "abc"
+query TT nosort
+SELECT md5(''), md5('abc')
+----
+d41d8cd98f00b204e9800998ecf8427e
+900150983cd24fb0d6963f7d28e17f72
+
+# text hashes its UTF-8 bytes, so it agrees with the same bytes as bytea; 'héllo' is 6 bytes
+query TTT nosort
+SELECT md5(bytea '\x616263'), md5('héllo'), md5(bytea '\x68c3a96c6c6f')
+----
+900150983cd24fb0d6963f7d28e17f72
+be50e8478cf24ff3595bc7307fb91b50
+be50e8478cf24ff3595bc7307fb91b50
+
+query ITT nosort
+SELECT id, md5(t), md5(b) FROM h ORDER BY id
+----
+1
+d41d8cd98f00b204e9800998ecf8427e
+d41d8cd98f00b204e9800998ecf8427e
+2
+900150983cd24fb0d6963f7d28e17f72
+900150983cd24fb0d6963f7d28e17f72
+3
+be50e8478cf24ff3595bc7307fb91b50
+ffbb8cd5a232b7d906904533e9609f48
+4
+NULL
+NULL
+
+# an input longer than one 64-byte block
+query T nosort
+SELECT md5(repeat('a', 1000))
+----
+cabe45dcc9ae5b66ba86600cca6b8ba8
+
+# the result is text: it concatenates, compares, and measures as text
+query TIB nosort
+SELECT 'x' || md5('abc'), length(md5('')), md5('abc') = md5(bytea '\x616263')
+----
+x900150983cd24fb0d6963f7d28e17f72
+32
+true
+
+# a bare NULL resolves to the text overload and propagates
+query T nosort
+SELECT md5(NULL)
+----
+NULL
+
+# === sha224 / sha256 / sha384 / sha512(bytea) → bytea =========================================
+
+query T nosort
+SELECT sha224(bytea '\x')
+----
+\xd14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f
+
+query T nosort
+SELECT sha256(bytea '\x')
+----
+\xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+query T nosort
+SELECT sha384(bytea '\x')
+----
+\x38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b
+
+query T nosort
+SELECT sha512(bytea '\x')
+----
+\xcf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e
+
+# the FIPS 180-4 "abc" vectors, rendered through encode(…, 'hex')
+query TTTT nosort
+SELECT encode(sha224(bytea '\x616263'), 'hex'), encode(sha256(bytea '\x616263'), 'hex'), encode(sha384(bytea '\x616263'), 'hex'), encode(sha512(bytea '\x616263'), 'hex')
+----
+23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7
+ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
+
+# the digest widths, in bytes
+query IIII nosort
+SELECT length(sha224(bytea '\x01')), length(sha256(bytea '\x01')), length(sha384(bytea '\x01')), length(sha512(bytea '\x01'))
+----
+28
+32
+48
+64
+
+query IT nosort
+SELECT id, sha256(b) FROM h ORDER BY id
+----
+1
+\xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+2
+\xba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+3
+\x26a66b061e8f48f39927c312f25293959729eee95978e2892d49d3512a5cc092
+4
+NULL
+
+# inputs longer than one block: SHA-256's is 64 bytes, SHA-512's 128
+query TT nosort
+SELECT encode(sha256(decode(repeat('ab', 100), 'hex')), 'hex'), encode(sha512(decode(repeat('ab', 200), 'hex')), 'hex')
+----
+bfca652f5e96a3de2157627a800b350e7798ded367fb74a7eb52ef0aa35d9cfb
+1ed7bdcf30985a4ecb2924cbe831982ecc05d9c8a22db84963e51a8768c9ccffaad7f5d3691ab6612afb31fcea2d490a765649f63b781958b4c911033a08e76e
+
+# a bare NULL adopts the lone bytea overload and propagates
+query TT nosort
+SELECT sha256(NULL), sha512(NULL)
+----
+NULL
+NULL
+
+# the SHA-2 functions take bytea only: there is no text overload, as in PostgreSQL
+statement error 42883
+SELECT sha256(t) FROM h
+
+statement error 42883
+SELECT sha512(1)

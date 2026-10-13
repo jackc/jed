@@ -41,15 +41,20 @@ Targets modern Node (≥ 22.18 / ≥ 23.6; pinned to `node 24` in `../../mise.to
 constructor parameter properties; string-literal unions and discriminated unions instead.
 Relative imports carry an explicit `.ts` extension.
 
-Dev-dependencies are **type-check only** (no npm runtime footprint): `typescript` and
-`@types/node`. The engine, the unit tests, and the conformance harness run on **bare Node with no
-`npm install`**. File-backed Node use additionally needs the matching first-party prebuilt lock
-artifact; repository tests build it from exact-pinned safe Rust sources with `mise run ts:lock_build`.
+The engine has **one runtime dependency**, the exact-pinned `@noble/hashes`, which supplies the
+digest functions `md5` / `sha224` / `sha256` / `sha384` / `sha512` (CLAUDE.md §14 clause 3: no
+hand-rolled crypto). It is pure JavaScript with no dependencies of its own and runs in Node and the
+browser. The dev-dependencies are **type-check and browser-test only**: `typescript`,
+`@types/node`, `vite`, and `@playwright/test`. The engine, the unit tests, and the conformance
+harness run on bare Node after one `npm ci`, with no build step. File-backed Node use additionally
+needs the matching first-party prebuilt lock artifact; repository tests build it from exact-pinned
+safe Rust sources with `mise run ts:lock_build`, which also runs that `npm ci`.
 
 ```sh
-mise exec -- node src/bin/conformance.ts   # run the shared conformance corpus (no install)
-mise exec -- node --test tests/*.test.ts   # unit tests (no install)
-mise exec -- npm install && mise exec -- npx tsc --noEmit   # type-check (the one install)
+mise exec -- npm ci                        # install @noble/hashes (+ the dev tools)
+mise exec -- node src/bin/conformance.ts   # run the shared conformance corpus
+mise exec -- node --test tests/*.test.ts   # unit tests
+mise exec -- npx tsc --noEmit              # type-check
 mise run ts:lock_build                     # build the local Node OS-lock host
 ```
 

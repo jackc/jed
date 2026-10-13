@@ -77,6 +77,12 @@
   get_bit('\\x0102'::bytea, 9)                                    AS bit9,
   btrim('\\x0001020100'::bytea, '\\x0001'::bytea)                 AS trimmed;`;
 
+	const byteaHashDemo = `SELECT
+  md5('abc')                                  AS md5_text,
+  md5('\\x616263'::bytea)                     AS md5_bytea,
+  encode(sha256('\\x616263'::bytea), 'hex')   AS sha256_hex,
+  length(sha512('\\x'::bytea))                AS sha512_bytes;`;
+
 	const arrayCastDemo = `SELECT
   (ARRAY[1, 2, 3])::text                     AS array_to_text,
   ('{10,20,30}'::text)::i32[]                AS text_to_array,
@@ -374,6 +380,14 @@ changed (bits count from the least-significant bit of each byte, so bit 9 is bit
 `overlay` work the same way on `text`, counting characters:
 
 <LiveSql demo="byteaEditDemo" query={byteaEditDemo} rows={1} />
+
+The digest functions hash a value. `md5` takes `text` or `bytea` and returns 32 lowercase hex
+digits as `text`, hashing a `text` argument as its UTF-8 bytes. `sha224`, `sha256`, `sha384`, and
+`sha512` take `bytea` and return the raw digest as `bytea` (28, 32, 48, or 64 bytes); wrap them in
+`encode(…, 'hex')` for hex text. As with the other `bytea` functions, a bare string literal is
+`text`, so write `sha256('abc'::bytea)`, not `sha256('abc')`:
+
+<LiveSql demo="byteaHashDemo" query={byteaHashDemo} rows={1} />
 
 ## Array casts
 

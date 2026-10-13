@@ -38,9 +38,16 @@ jobs:
         with:
           node-version: '24.16.0'
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            impl/ts/package-lock.json
 
       - run: npm ci
+
+      # The site bundles the TS core from ../impl/ts/src, which imports its one runtime dependency
+      # (@noble/hashes) from impl/ts/node_modules.
+      - run: npm ci --omit=dev
+        working-directory: impl/ts
 
       - name: Type check
         run: npm run check

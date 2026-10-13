@@ -2122,6 +2122,9 @@ Rules for both classes:
   casts from them, `to_hex`, `chr`): bounded by a constant or by a digit count that
   `decimal_work` already charges. A `timestamptz` render additionally charges one
   `timezone` unit per finite instant for its session-zone lookup.
+- The digest functions `md5`, `sha224`, `sha256`, `sha384`, and `sha512`: the
+  output is a constant 28 to 64 bytes whatever the input, so no chain of them
+  can grow a value. They read their operand once, as `upper` or `length` do.
 - Casts that return their input's text unchanged (`json` and `jsonpath` to `text`),
   and renders that jed does not implement yet (casts to `text` from composites and
   ranges). The missing renders join the table when they land: each escapes its

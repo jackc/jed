@@ -1959,6 +1959,11 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         | ScalarFunc::SetByte
         | ScalarFunc::GetBit
         | ScalarFunc::SetBit
+        | ScalarFunc::Md5
+        | ScalarFunc::Sha224
+        | ScalarFunc::Sha256
+        | ScalarFunc::Sha384
+        | ScalarFunc::Sha512
         | ScalarFunc::Overlay
         | ScalarFunc::ByteaConcat
         | ScalarFunc::TextConcat

@@ -136,7 +136,7 @@ run = "biome lint --write impl/ts impl/node bench/ts migrate/ts"
 # catching drift at that downstream boundary as well as errors in the Svelte application.
 [tasks."web:check"]
 description = "Type-check the website and its browser-consumed TypeScript core modules"
-run = ["ruby scripts/npm_ci.rb web", "npm run --silent --prefix web check"]
+run = ["ruby scripts/npm_ci.rb impl/ts", "ruby scripts/npm_ci.rb web", "npm run --silent --prefix web check"]
 
 # --- Real-browser e2e (Playwright + headless Chromium) ------------------------------------------
 # Two suites, both in `ci`: the TS core's Browser/OPFS host (spec/design/hosts.md §5 — a real
@@ -160,6 +160,7 @@ npm run --silent --prefix impl/ts test:browser || { echo "e2e:ts failed (if Chro
 [tasks."e2e:web"]
 description = "Build the website and run its Playwright interactive-feature suite in headless Chromium"
 run = '''
+ruby scripts/npm_ci.rb impl/ts
 ruby scripts/npm_ci.rb web
 CI=1 npm run --silent --prefix web test:browser || { echo "e2e:web failed (if Chromium is missing: mise run dev:browsers)" >&2; exit 1; }
 '''
@@ -343,8 +344,11 @@ run = "node --test impl/node/test/*.test.ts"
 # (spec/design/locking.md §8). It exposes no SQL/storage behavior; the TypeScript engine remains an
 # independent conformance voice.
 [tasks."ts:lock_build"]
-description = "Build the TypeScript core's narrow native OS-lock adapter"
+description = "Build the TypeScript core's narrow native OS-lock adapter (and install its npm deps)"
 run = '''
+# Every task that runs the TS core depends on this one, so it also installs the core's runtime npm
+# dependency (@noble/hashes, CLAUDE.md §14) before any of them starts.
+ruby scripts/npm_ci.rb impl/ts
 cargo build --release --manifest-path impl/ts/native-lock/Cargo.toml
 case "$(uname -s)" in
   Darwin) lib=libjed_lock.dylib ;;
@@ -469,6 +473,7 @@ run = [
   "cd bench/go && CGO_ENABLED=0 go build -o bin/ ./cmd/bench-setup ./cmd/bench-jed ./cmd/bench-pg ./cmd/bench-sqlite",
   "cd bench/go && CGO_ENABLED=1 go build -o bin/ ./cmd/bench-sqlite-cgo",
   "cargo build --release --quiet --manifest-path bench/rust/Cargo.toml",
+  "ruby scripts/npm_ci.rb impl/ts",
   "ruby scripts/npm_ci.rb bench/ts",
   "cargo build --release --quiet --manifest-path impl/ruby/ext/Cargo.toml",
   "cargo build --release --quiet --target wasm32-wasip1 --manifest-path impl/wasm/Cargo.toml",
@@ -514,6 +519,7 @@ description = "Compare every jed benchmark through pure TS, Node/Rust wrap, and 
 depends = ["node:build"]
 usage = 'arg "[filter]" help="Run only benchmarks whose name contains this substring"'
 run = '''
+ruby scripts/npm_ci.rb impl/ts
 ruby scripts/npm_ci.rb bench/ts
 cargo build --release --quiet --manifest-path bench/rust/Cargo.toml --bin bench-jed
 dir="bench/results/$(date -u +%Y%m%d-%H%M%S)-node-compare"

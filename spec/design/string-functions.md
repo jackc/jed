@@ -453,15 +453,31 @@ are STRICT and ride the scalar-function mold (§1), except `||`, which has its o
   one-argument bytea form (`42883`, as in PostgreSQL). The result is a slice of the operand, so it
   charges no output bytes.
 
+- **`md5(text)`, `md5(bytea)` → text** — the RFC 1321 digest as 32 lowercase hex digits
+  (`md5('abc') = 900150983cd24fb0d6963f7d28e17f72`). A text argument is hashed as its **UTF-8
+  bytes**, so `md5('héllo') = md5(bytea '\x68c3a96c6c6f')`; the TS core encodes its UTF-16 string
+  first. A bare literal or untyped NULL resolves to the text overload (functions.md §9.1), as PG's
+  unknown-literal rule picks the string category. The result carries the argument's collation like
+  any text-result function.
+- **`sha224(bytea)`, `sha256(bytea)`, `sha384(bytea)`, `sha512(bytea)` → bytea** — the FIPS 180-4
+  digest as raw bytes: 28, 32, 48, or 64 bytes. There is no text overload (`42883`, as in
+  PostgreSQL); render the digest with `encode(…, 'hex')`.
+
+  The digests come from a vetted library in each core, never a hand-rolled algorithm (CLAUDE.md §14
+  clause 3): Go's standard library (`crypto/md5`, `crypto/sha256`, `crypto/sha512`), RustCrypto's
+  `md-5` and `sha2` crates, and `@noble/hashes` in TS, which is pure JavaScript and synchronous in
+  Node and the browser alike (WebCrypto's `digest` is async-only, so it cannot serve a synchronous
+  evaluator). Both algorithms are standardized, so the cores agree byte-for-byte without a shared
+  fixture beyond the corpus's published test vectors. The output has a constant size, so these
+  charge only `operator_eval` ([cost.md](cost.md) §8.1 *Not covered*).
+
 `set_byte` and `set_bit` return a value exactly the size of their operand, so like the slices they
 are not growth kernels and charge only their `operator_eval` ([cost.md](cost.md) §8.1 *Not
 covered*): applying them again cannot grow a value.
 
 The argument must already be `bytea`: as with `encode`, a bare string literal argument resolves as
 `text`, so `get_byte('\x01', 0)` is `42883` (write `bytea '\x01'` or `'\x01'::bytea`), and likewise
-`position('\x02' IN b)`. Only `||` adapts a literal, through its operand hint. Not implemented yet:
-the hash functions (`md5`, `sha256`, …), which need a cryptography dependency decision
-(CLAUDE.md §14).
+`position('\x02' IN b)` and `sha256('abc')`. Only `||` adapts a literal, through its operand hint.
 
 ## 5. Text concatenation (`||`)
 

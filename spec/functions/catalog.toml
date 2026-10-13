@@ -4682,6 +4682,80 @@ result         = "bytea"
 null           = "propagates"
 errors         = ["2202E", "22023"]
 
+# md5(text) → text / md5(bytea) → text — the MD5 digest as 32 lowercase hex digits. A text argument
+# is hashed as its UTF-8 bytes, so md5('abc') = md5('\x616263'::bytea). A bare literal resolves to
+# the text overload, as PG's unknown-literal rule picks the string category. The digest comes from
+# each core's vetted library, never a hand-rolled algorithm (CLAUDE.md §14 clause 3); MD5 is
+# standardized (RFC 1321), so the cores agree byte-for-byte. NULL propagates. (string-functions.md §4)
+[[operator]]
+volatility     = "immutable"
+name           = "md5"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "md5"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+# sha224/sha256/sha384/sha512(bytea) → bytea — the SHA-2 digest (FIPS 180-4) as raw bytes: 28, 32,
+# 48, or 64 bytes. bytea only, as in PG: there is no text overload. Library-backed like md5. NULL
+# propagates. (string-functions.md §4)
+[[operator]]
+volatility     = "immutable"
+name           = "sha224"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "sha256"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "sha384"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "sha512"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
 # quote_literal(text) → text — the string wrapped as a SQL string literal: surrounded by single
 # quotes with each internal quote doubled, and (if it contains a backslash) doubled backslashes plus
 # an E-string prefix. quote_literal('a''b') = '''a''''b'''. STRICT (NULL → NULL — distinct from

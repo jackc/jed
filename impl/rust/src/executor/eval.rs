@@ -2886,6 +2886,20 @@ impl RExpr {
                         )?)),
                         _ => unreachable!("resolver restricts set_bit to (bytea, int, int)"),
                     },
+                    // md5(text | bytea) → text — 32 lowercase hex digits; text hashes its UTF-8.
+                    ScalarFunc::Md5 => match &vals[0] {
+                        Value::Text(s) => Ok(Value::Text(md5_hex(s.as_bytes()))),
+                        Value::Bytea(b) => Ok(Value::Text(md5_hex(b))),
+                        _ => unreachable!("resolver restricts md5 to text/bytea"),
+                    },
+                    // sha224/sha256/sha384/sha512(bytea) → bytea — the raw SHA-2 digest.
+                    ScalarFunc::Sha224
+                    | ScalarFunc::Sha256
+                    | ScalarFunc::Sha384
+                    | ScalarFunc::Sha512 => match &vals[0] {
+                        Value::Bytea(b) => Ok(Value::Bytea(sha2_digest(*func, b))),
+                        _ => unreachable!("resolver restricts the sha2 functions to bytea"),
+                    },
                     // overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice;
                     // count defaults to length(new) (characters for text, bytes for bytea). A growth
                     // kernel (cost.md §8.1), free over constant operands.

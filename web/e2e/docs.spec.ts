@@ -142,6 +142,18 @@ test('the types page autoruns the bytea position / overlay demo', async ({ page 
   await expect(rows).toContainText('\\x02');
 });
 
+test('the types page autoruns the bytea digest demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // md5 of text and of the same bytes agree; sha256('abc') is the FIPS 180-4 vector; sha512 is 64 bytes.
+  const panel = livePanel(page, 'byteaHashDemo');
+  const rows = panel.getByTestId('result-rows');
+  await expect(rows).toContainText('900150983cd24fb0d6963f7d28e17f72');
+  await expect(rows).toContainText(
+    'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+  );
+  await expect(rows).toContainText('64');
+});
+
 test('the types page autoruns the array cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and

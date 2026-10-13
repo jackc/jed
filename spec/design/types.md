@@ -705,11 +705,14 @@ over-`RECORD_MAX` bytea key is rejected `0A000` (the same node-fit limit as text
 
 **Deferred bytea sub-features** (relaxable narrowings, each its own follow-up):
 
-- **The hash functions** (`md5`, `sha256`, …). The rest of PostgreSQL's binary-string surface has
-  landed: `length` / `octet_length` / `bit_length`, `||`, `substr` / `substring`, `get_byte` /
-  `set_byte`, `get_bit` / `set_bit`, `overlay`, `position`, and `btrim` / `ltrim` / `rtrim`
-  ([string-functions.md](string-functions.md) §4). (The `text ⇄ bytea` casts and `uuid ⇄ bytea` have landed — §5, §14; every other bytea cast is a
-  forbidden pair, `42804`.)
+- **Untyped-literal adaptation for bytea function arguments.** PostgreSQL's whole binary-string
+  surface has landed — `length` / `octet_length` / `bit_length`, `||`, `substr` / `substring`,
+  `get_byte` / `set_byte`, `get_bit` / `set_bit`, `overlay`, `position`, `btrim` / `ltrim` /
+  `rtrim`, and the digests `md5` / `sha224` / `sha256` / `sha384` / `sha512`
+  ([string-functions.md](string-functions.md) §4) — but a bare string literal argument resolves as
+  `text`, so `sha256('abc')` is `42883` where PG reads the literal as bytea input. (The `text ⇄
+  bytea` casts and `uuid ⇄ bytea` have landed — §5, §14; every other bytea cast is a forbidden
+  pair, `42804`.)
 
 **Practical size note.** As for text (§11), a single stored bytea value (or row) larger than one
 page trips the whole-image `0A000` oversized-item narrowing until overflow pages land.

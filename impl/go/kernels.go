@@ -2,6 +2,10 @@ package jed
 
 import (
 	"bytes"
+	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
@@ -380,6 +384,33 @@ func chrText(n int64) (string, error) {
 
 // base64Alphabet is the standard RFC 4648 base64 alphabet (string-functions.md §3, encode/decode).
 const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// md5Hex is md5(bytes) (string-functions.md §4): the RFC 1321 digest as 32 lowercase hex digits,
+// from the standard library (CLAUDE.md §14 clause 3 — never hand-rolled).
+func md5Hex(b []byte) string {
+	sum := md5.Sum(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// sha2Digest is sha224/sha256/sha384/sha512(bytes) (string-functions.md §4): the FIPS 180-4 digest
+// at the function's width, from the standard library.
+func sha2Digest(f scalarFunc, b []byte) []byte {
+	switch f {
+	case sfSha224:
+		sum := sha256.Sum224(b)
+		return sum[:]
+	case sfSha256:
+		sum := sha256.Sum256(b)
+		return sum[:]
+	case sfSha384:
+		sum := sha512.Sum384(b)
+		return sum[:]
+	case sfSha512:
+		sum := sha512.Sum512(b)
+		return sum[:]
+	}
+	panic("sha2Digest: not a sha2 function")
+}
 
 // encodeBytea is encode(bytes, format) (string-functions.md §3): render binary as text. hex = two
 // lowercase hex digits per byte; base64 = RFC 4648 wrapped at 76 chars with \n (PostgreSQL's style);

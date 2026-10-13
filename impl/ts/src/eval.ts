@@ -3,6 +3,7 @@ import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
 import { resolveUnfetchedSelf } from "./format.ts";
+import { md5Hex, sha2Digest } from "./digest.ts";
 import {
   arrayOutZoned,
   arrayValue,
@@ -1819,6 +1820,20 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
         const n = (vals[1] as { int: bigint }).int;
         return byteaValue(setBit(bytes, n, (vals[2] as { int: bigint }).int));
+      }
+      if (e.func === "md5") {
+        // md5(text | bytea) → text — 32 lowercase hex digits; text hashes its UTF-8 bytes.
+        const v = vals[0]!;
+        return textValue(md5Hex(v.kind === "bytea" ? v.bytes : (v as { text: string }).text));
+      }
+      if (
+        e.func === "sha224" ||
+        e.func === "sha256" ||
+        e.func === "sha384" ||
+        e.func === "sha512"
+      ) {
+        // sha224/sha256/sha384/sha512(bytea) → bytea — the raw SHA-2 digest.
+        return byteaValue(sha2Digest(e.func, (vals[0] as { bytes: Uint8Array }).bytes));
       }
       if (e.func === "overlay") {
         // overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice; count

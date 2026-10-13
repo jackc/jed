@@ -456,6 +456,16 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfGetBit
 	case "set_bit":
 		return sfSetBit
+	case "md5":
+		return sfMd5
+	case "sha224":
+		return sfSha224
+	case "sha256":
+		return sfSha256
+	case "sha384":
+		return sfSha384
+	case "sha512":
+		return sfSha512
 	case "overlay":
 		return sfOverlay
 	case "quote_literal":

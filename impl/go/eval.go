@@ -3376,6 +3376,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return ByteaValue(r), nil
+		case sfMd5:
+			// md5(text | bytea) → text — 32 lowercase hex digits. Text is held as UTF-8 and bytea as
+			// raw bytes, both in Str, so one kernel serves both overloads.
+			return TextValue(md5Hex([]byte(vals[0].str()))), nil
+		case sfSha224, sfSha256, sfSha384, sfSha512:
+			// sha224/sha256/sha384/sha512(bytea) → bytea — the raw SHA-2 digest.
+			return ByteaValue(sha2Digest(e.sfunc, []byte(vals[0].str()))), nil
 		case sfOverlay:
 			// overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice; count
 			// defaults to length(new) (characters for text, bytes for bytea). A growth kernel

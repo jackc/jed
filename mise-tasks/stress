@@ -30,6 +30,7 @@ sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Carg
 sh? "bench/rust/target/release/stress", STRESS_DIR, File.join(dir, "rust.jsonl"), *filter
 
 puts "ts: the seeded-sequential interleaver"
+npm_ci_if_stale("impl/ts")
 npm_ci_if_stale("bench/ts")
 sh? "node", "bench/ts/src/stress.ts", STRESS_DIR, File.join(dir, "ts.jsonl"), *filter
 

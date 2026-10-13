@@ -1738,6 +1738,16 @@ func explainScalarFunc(f scalarFunc) string {
 		return "get_bit"
 	case sfSetBit:
 		return "set_bit"
+	case sfMd5:
+		return "md5"
+	case sfSha224:
+		return "sha224"
+	case sfSha256:
+		return "sha256"
+	case sfSha384:
+		return "sha384"
+	case sfSha512:
+		return "sha512"
 	case sfOverlay:
 		return "overlay"
 	case sfQuoteLiteral:

@@ -24,6 +24,11 @@ path = "src/bin/conformance.rs"
 # (tests inject a fixed seed and never touch this). Approved under CLAUDE.md §14 (the user's
 # "engine reads OS entropy" decision); Go/TS use their stdlib (crypto/rand, node:crypto).
 getrandom = "0.3"
+# The digest functions md5 / sha224 / sha256 / sha384 / sha512 (spec/design/string-functions.md §4).
+# Approved under CLAUDE.md §14 clause 3 (no hand-rolled crypto): RustCrypto's vetted implementations.
+# Both are standardized, so the output matches Go's stdlib and TS's @noble/hashes byte-for-byte.
+md-5 = "=0.11.0"
+sha2 = "=0.11.0"
 
 [dev-dependencies]
 # TOML is a TEST-TIME ONLY dependency (CLAUDE.md §5): the cross-check tests read the

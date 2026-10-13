@@ -361,6 +361,29 @@ pub(crate) fn encode_bytea(bytes: &[u8], format: &str) -> Result<String> {
     }
 }
 
+/// `md5(bytes)` (string-functions.md §4): the RFC 1321 digest of `bytes` as 32 lowercase hex
+/// digits. The digest is RustCrypto's (CLAUDE.md §14 clause 3), never hand-rolled.
+pub(crate) fn md5_hex(bytes: &[u8]) -> String {
+    use md5::Digest;
+    md5::Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `sha224`/`sha256`/`sha384`/`sha512(bytes)` (string-functions.md §4): the FIPS 180-4 digest of
+/// `bytes` at the requested width, from RustCrypto (CLAUDE.md §14 clause 3).
+pub(crate) fn sha2_digest(func: ScalarFunc, bytes: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    match func {
+        ScalarFunc::Sha224 => sha2::Sha224::digest(bytes).to_vec(),
+        ScalarFunc::Sha256 => sha2::Sha256::digest(bytes).to_vec(),
+        ScalarFunc::Sha384 => sha2::Sha384::digest(bytes).to_vec(),
+        ScalarFunc::Sha512 => sha2::Sha512::digest(bytes).to_vec(),
+        _ => unreachable!("sha2_digest is called only for the sha2 functions"),
+    }
+}
+
 /// RFC 4648 base64 of `bytes`, wrapped at 76 characters with `\n` between chunks (no trailing
 /// newline) — PostgreSQL's `encode(…, 'base64')` layout.
 pub(crate) fn base64_encode_wrapped(bytes: &[u8]) -> String {

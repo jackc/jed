@@ -3338,6 +3338,17 @@ pub(crate) enum ScalarFunc {
     GetBit,
     /// set_bit(bytea, n, v) → bytea — a copy with the n-th bit set to v (0/1, else 22023); 2202E (§4).
     SetBit,
+    /// md5(text | bytea) → text — the MD5 digest as 32 lowercase hex digits; text hashes its UTF-8
+    /// bytes (§4).
+    Md5,
+    /// sha224(bytea) → bytea — the 28-byte SHA-224 digest (§4).
+    Sha224,
+    /// sha256(bytea) → bytea — the 32-byte SHA-256 digest (§4).
+    Sha256,
+    /// sha384(bytea) → bytea — the 48-byte SHA-384 digest (§4).
+    Sha384,
+    /// sha512(bytea) → bytea — the 64-byte SHA-512 digest (§4).
+    Sha512,
     /// overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice: count units from
     /// start replaced by new (count defaults to length(new)); start ≤ 0 is 22011, a start + count
     /// past int4 is 22003. A growth kernel (cost.md §8.1; string-functions.md §3/§4).

@@ -53,6 +53,14 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT bytea '\x01' || bytea '\x02', substring(by
 Result
 output=[('\\x01' || '\\x02'), substr('\\x0102', 2), get_byte('\\x01', 0)]
 
+# the digest functions print under their SQL names
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT md5('a'), md5(bytea '\x01'), sha224(bytea '\x01'), sha256(bytea '\x01'), sha384(bytea '\x01'), sha512(bytea '\x01')
+----
+0
+Result
+output=[md5('a'), md5('\\x01'), sha224('\\x01'), sha256('\\x01'), sha384('\\x01'), sha512('\\x01')]
+
 # width_bucket's array-threshold variant prints as its call.
 query ITT nosort
 EXPLAIN (VERBOSE, COSTS FALSE) SELECT width_bucket(v, ARRAY[1, 5]) FROM t
