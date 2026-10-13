@@ -1496,7 +1496,9 @@ func renderRExpr(e *rExpr) string {
 		return explainExprCall(family+"_build_"+explainJSONBuildKind(e.jbKind), e.sargs)
 	case reJsonSetInsert:
 		name := "jsonb_set"
-		if e.psMode == psInsert {
+		if e.psLax {
+			name = "jsonb_set_lax"
+		} else if e.psMode == psInsert {
 			name = "jsonb_insert"
 		}
 		return explainExprCall(name, e.sargs)

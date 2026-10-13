@@ -139,6 +139,15 @@ test('the types page updates json/jsonb through the shared assignment rule', asy
   await expect(rows).toContainText('{"a": 1}');
 });
 
+test('the types page autoruns the jsonb_set_lax demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // jsonb_set replaces a; jsonb_set_lax stores a JSON null by default, or deletes the key by name.
+  const rows = livePanel(page, 'jsonSetLaxDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('{"a": 99, "b": 2}');
+  await expect(rows).toContainText('{"a": null, "b": 2}');
+  await expect(rows).toContainText('{"b": 2}');
+});
+
 test('the types page autoruns the verbatim json accessor demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // json -> keeps the last duplicate's exact text; jsonb -> is canonical; #>> renders 1.50 verbatim.

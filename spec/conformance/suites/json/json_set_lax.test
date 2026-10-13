@@ -1,0 +1,146 @@
+# jsonb_set_lax — jsonb_set that is not strict in its replacement (spec/design/json-sql-functions.md
+# §2). A non-NULL replacement behaves exactly as jsonb_set; a SQL NULL replacement follows
+# null_value_treatment ('use_json_null' by default, 'delete_key', 'return_target', or
+# 'raise_exception'). A NULL target, path, or create_if_missing → SQL NULL; a NULL treatment, or an
+# unrecognized one met by a NULL replacement → 22023. Named notation uses PostgreSQL's parameter
+# names (jsonb_set / jsonb_insert too). Output matches the postgres:18 oracle. Format:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, func.json_set, func.json_set_lax
+
+# A non-NULL replacement is jsonb_set: replace, create (by default), or leave a missing key alone.
+query TTT nosort
+SELECT jsonb_set_lax('{"a": 1, "b": 2}', '{a}', '99'), jsonb_set_lax('{"a": 1}', '{c}', '[1, 2]'), jsonb_set_lax('{"a": 1}', '{c}', '99', false)
+----
+{"a": 99, "b": 2}
+{"a": 1, "c": [1, 2]}
+{"a": 1}
+
+# A SQL NULL replacement defaults to 'use_json_null': set a JSON null (and create a missing key).
+query TTT nosort
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL), jsonb_set_lax('{"a": 1}', '{b}', NULL), jsonb_set_lax('[0, 1, 2]', '{-1}', NULL, true, 'use_json_null')
+----
+{"a": null}
+{"a": 1, "b": null}
+[0, 1, null]
+
+# create_if_missing still applies under use_json_null.
+query T nosort
+SELECT jsonb_set_lax('{"a": 1}', '{b}', NULL, false)
+----
+{"a": 1}
+
+# 'delete_key' deletes the path, as #- does — create_if_missing is ignored.
+query TTTT nosort
+SELECT jsonb_set_lax('{"a": 1, "b": 2}', '{a}', NULL, true, 'delete_key'), jsonb_set_lax('{"a": {"x": 1, "y": 2}}', '{a,x}', NULL, false, 'delete_key'), jsonb_set_lax('[0, 1, 2]', '{1}', NULL, true, 'delete_key'), jsonb_set_lax('{"a": 1}', '{zz}', NULL, true, 'delete_key')
+----
+{"b": 2}
+{"a": {"y": 2}}
+[0, 2]
+{"a": 1}
+
+# 'return_target' returns the target unchanged.
+query TT nosort
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'return_target'), jsonb_set_lax('[1, 2]', '{0}', NULL, true, 'return_target')
+----
+{"a": 1}
+[1, 2]
+
+# 'raise_exception' rejects a SQL NULL replacement.
+statement error 22004 JSON value must not be null
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'raise_exception')
+
+# ... but not a JSON null replacement.
+query T nosort
+SELECT jsonb_set_lax('{"a": 1}', '{a}', 'null', true, 'raise_exception')
+----
+{"a": null}
+
+# An unrecognized treatment is rejected only when it is consulted (a NULL replacement); the match
+# is case-sensitive.
+statement error 22023 null_value_treatment must be "delete_key", "return_target", "use_json_null", or "raise_exception"
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'bogus')
+
+statement error 22023
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'Delete_Key')
+
+query T nosort
+SELECT jsonb_set_lax('{"a": 1}', '{a}', '2', true, 'bogus')
+----
+{"a": 2}
+
+# An explicit NULL treatment is always rejected, even for a non-NULL replacement.
+statement error 22023 null_value_treatment must be
+SELECT jsonb_set_lax('{"a": 1}', '{a}', '2', true, NULL)
+
+# A NULL target, path, or create_if_missing → SQL NULL, checked before the treatment.
+query TTTT nosort
+SELECT jsonb_set_lax(NULL, '{a}', '1'), jsonb_set_lax('{"a": 1}', NULL, '1'), jsonb_set_lax('{"a": 1}', '{a}', '1', NULL), jsonb_set_lax('{"a": 1}', '{a}', NULL, NULL, 'raise_exception')
+----
+NULL
+NULL
+NULL
+NULL
+
+query T nosort
+SELECT jsonb_set_lax(NULL, '{a}', NULL, true, NULL)
+----
+NULL
+
+# A scalar target: return_target returns it; the set and delete paths reject it.
+query T nosort
+SELECT jsonb_set_lax('5', '{a}', NULL, true, 'return_target')
+----
+5
+
+statement error 22023 cannot set path in scalar
+SELECT jsonb_set_lax('5', '{a}', NULL)
+
+statement error 22023 cannot delete path in scalar
+SELECT jsonb_set_lax('5', '{a}', NULL, true, 'delete_key')
+
+# Named notation: PostgreSQL's parameter names, in any order after the positional arguments.
+query TTT nosort
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, null_value_treatment => 'delete_key'), jsonb_set_lax(path => '{b}', jsonb_in => '{"a": 1}', replacement => NULL, create_if_missing => false), jsonb_set_lax('{"a": 1}', '{a}', replacement => '7')
+----
+{}
+{"a": 1}
+{"a": 7}
+
+# jsonb_set and jsonb_insert take named notation too.
+query TT nosort
+SELECT jsonb_set('{"a": 1}', '{b}', '1', create_if_missing => false), jsonb_insert('[0, 1]', '{0}', '9', insert_after => true)
+----
+{"a": 1}
+[0, 9, 1]
+
+statement error 42883
+SELECT jsonb_set('{"a": 1}', '{b}', '1', insert_after => true)
+
+statement error 42883
+SELECT jsonb_set_lax('{"a": 1}', '{b}', null_value_treatment => 'delete_key')
+
+statement error 42601
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, create_if_missing => true, create_if_missing => false)
+
+# Over a stored column: NULL replacements per row, deleting the member.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb, v jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '{"n": 1, "m": 2}', '10'), (2, '{"n": 2, "m": 3}', NULL)
+
+query IT nosort
+SELECT id, jsonb_set_lax(doc, '{n}', v, true, 'delete_key') FROM t ORDER BY id
+----
+1
+{"m": 2, "n": 10}
+2
+{"m": 3}
+
+query IT nosort
+SELECT id, jsonb_set_lax(doc, '{n}', v) FROM t ORDER BY id
+----
+1
+{"m": 2, "n": 10}
+2
+{"m": 3, "n": null}

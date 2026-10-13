@@ -380,9 +380,9 @@ over a value therefore recurses at most 256 levels.
    `json[b]_build_array` / `json[b]_build_object`, `to_json[b]` / `array_to_json` (an array of
    JSON elements; a composite with JSON fields too, once composite sources land), `json[b]_agg[_strict]` and
    `json[b]_object_agg[_unique]`, `jsonb || jsonb` (which wraps a non-array operand in an
-   array), `jsonb_set` / `jsonb_insert` (which insert a document at a path inside another),
-   `jsonb_path_query_array`, and `JSON_QUERY … WITH [CONDITIONAL] WRAPPER`. A `jsonb` result is
-   checked with a depth walk that stops after level 257. A textual `json` result is checked
+   array), `jsonb_set` / `jsonb_set_lax` / `jsonb_insert` (which insert a document at a path inside
+   another), `jsonb_path_query_array`, and `JSON_QUERY … WITH [CONDITIONAL] WRAPPER`. A `jsonb`
+   result is checked with a depth walk that stops after level 257. A textual `json` result is checked
    with a non-recursive bracket scan of the produced text. Operations that only select or remove
    parts of a document (`->`, `#>`, `-`, `#-`, `jsonb_strip_nulls`, the path-query results,
    `JSON_TABLE`, the record functions) can never return a deeper document, so they need no check.

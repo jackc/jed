@@ -1231,6 +1231,25 @@ export function deleteKeys(node: JsonNode, keys: string[]): JsonNode {
   return cur;
 }
 
+// badNullValueTreatment is jsonb_set_lax's 22023 for a NULL or unrecognized null_value_treatment
+// (PostgreSQL's exact text).
+export function badNullValueTreatment(): EngineError {
+  return engineError(
+    "invalid_parameter_value",
+    'null_value_treatment must be "delete_key", "return_target", "use_json_null", or "raise_exception"',
+  );
+}
+
+// nullValueRaised is jsonb_set_lax's 22004 for a SQL NULL value under null_value_treatment =>
+// 'raise_exception', with PostgreSQL's Detail and Hint (error-fields.md §9.2, §11.4).
+export function nullValueRaised(): EngineError {
+  return engineError("null_value_not_allowed", "JSON value must not be null")
+    .withDetail('Exception was raised because null_value_treatment is "raise_exception".')
+    .withHint(
+      "To avoid, either change the null_value_treatment argument or ensure that an SQL NULL is not passed.",
+    );
+}
+
 // deletePath is `jsonb #- text[]` — delete the element at a path. An empty path is a no-op (even on a
 // scalar); otherwise navigate to the parent and delete the last step (a key from an object, an index
 // from an array, negative from the end, out of range a no-op; a missing intermediate step a no-op). A

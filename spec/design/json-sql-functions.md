@@ -92,11 +92,40 @@ already built.
 | `json_typeof(json)` / `jsonb_typeof(jsonb)` | any | `text` | `object`/`array`/`string`/`number`/`boolean`/`null` (SQL NULL → SQL NULL) |
 | `json_strip_nulls(json[, bool])` / `jsonb_strip_nulls(jsonb[, bool])` | any | `json`/`jsonb` | remove object members whose value is JSON null |
 | `jsonb_set(jsonb, text[], jsonb [, create_if_missing bool])` | object/array | `jsonb` | set at path |
-| `jsonb_set_lax(jsonb, text[], jsonb, create_if_missing bool, null_value_treatment text)` | | `jsonb` | adds the `null_value_treatment` enum (`raise_exception`/`use_json_null`/`delete_key`/`return_target`) |
+| `jsonb_set_lax(jsonb, text[], jsonb [, create_if_missing bool [, null_value_treatment text]])` | | `jsonb` | `jsonb_set` that is not strict in the value; a SQL NULL value follows `null_value_treatment` (below) |
 | `jsonb_insert(jsonb, text[], jsonb [, insert_after bool])` | | `jsonb` | insert at path |
 | `jsonb_pretty(jsonb)` | any | `text` | indented render |
 | `row_to_json(record [, pretty bool])` | composite | `json` | composite value → object |
 | `array_to_json(anyarray [, pretty bool])` | array | `json` | array value → JSON array |
+
+**The path mutators' signatures.** `jsonb_set`, `jsonb_set_lax`, and `jsonb_insert` are resolved by
+name, not from catalog rows: the `text[]` path takes a bare `'{a,b}'` literal, the value takes a bare
+string literal as `jsonb`, and `jsonb_set_lax`'s text DEFAULT is outside the catalog's integer-only
+`arg_defaults` ([functions.md §11](functions.md)). They still take PostgreSQL's named notation, with
+PostgreSQL's parameter names: `jsonb_in`, `path`, `replacement`, then `create_if_missing`
+(`jsonb_set`, `jsonb_set_lax`, default `true`) or `insert_after` (`jsonb_insert`, default `false`), then
+`null_value_treatment` (`jsonb_set_lax`, default `'use_json_null'`).
+
+**`jsonb_set_lax`.** PostgreSQL's `jsonb_set_lax` is not STRICT, and jed follows its order of checks
+exactly:
+
+1. A NULL `jsonb_in`, `path`, or `create_if_missing` → SQL NULL.
+2. A NULL `null_value_treatment` → `22023` `null_value_treatment must be "delete_key",
+   "return_target", "use_json_null", or "raise_exception"`, even when the value is not NULL.
+3. A non-NULL `replacement` → exactly `jsonb_set`. The treatment is not consulted, so an unrecognized
+   one is accepted.
+4. A SQL NULL `replacement` → by treatment (matched case-sensitively):
+   `'use_json_null'` sets a JSON `null` (as `jsonb_set` with `'null'`, honoring `create_if_missing`);
+   `'delete_key'` deletes the path (as `#-`, ignoring `create_if_missing`); `'return_target'` returns
+   `jsonb_in` unchanged, even a scalar; `'raise_exception'` → `22004` `JSON value must not be null`, with
+   PostgreSQL's Detail and Hint ([error-fields.md](error-fields.md) §9.2, §11.4); anything else → the
+   step-2 `22023`.
+
+Each branch inherits its kernel's behavior: the scalar-target `22023`s, the `22P02` non-integer array
+step, and the NULL path element (SQL NULL, as for `jsonb_set` and `#-`). Cost follows the branch:
+the set branches are a growth kernel like `jsonb_set` ([cost.md](cost.md) §8.1) and check the result's
+depth ([json.md](json.md) §6.4); `delete_key` and `return_target` only remove from or return the target,
+so like `#-` they charge one `operator_eval` and no output bytes.
 
 The json-vs-jsonb observable differences (where they exist) are recorded as catalog data:
 `json_typeof`/`json_array_length` parse the textual form; the json builders preserve insertion

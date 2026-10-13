@@ -2625,7 +2625,7 @@ export function renderRExpr(e: RExpr): string {
     case "jsonObjectFromArrays":
       return explainCall(e.json ? "json_object" : "jsonb_object", e.args);
     case "jsonSetInsert":
-      return explainCall(`jsonb_${e.mode}`, e.args);
+      return explainCall(e.lax ? "jsonb_set_lax" : `jsonb_${e.mode}`, e.args);
     case "jsonBuild":
       return explainCall(`${e.json ? "json" : "jsonb"}_build_${e.buildKind}`, e.args);
     case "case": {

@@ -27711,9 +27711,12 @@ export type RExpr =
   // `[target jsonb, path text[], value jsonb, flag boolean]` — STRICT (any NULL → SQL NULL). `mode`
   // selects replace-or-create ("set") vs insert ("insert"); the boolean flag is create_if_missing
   // (set) / insert_after (insert), defaulting to true / false respectively (supplied at resolve).
+  // `lax` is `jsonb_set_lax` (mode "set"): a fifth `null_value_treatment text` arg, and NOT strict
+  // in the value — a SQL NULL value is handled by the treatment.
   | {
       kind: "jsonSetInsert";
       mode: PathSetMode;
+      lax: boolean;
       args: RExpr[];
     }
   // `json_object` / `jsonb_object` (json-sql-functions.md §2): build an object from text array(s).
@@ -32679,15 +32682,24 @@ export function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveGrouping(scope, e, ag);
   }
-  // jsonb_set / jsonb_insert (json-sql-functions.md §2) take a jsonb target, a text[] path (a bare
-  // `'{a,b}'` literal adapts, like `#>`), a jsonb new value, and an optional boolean flag.
-  // Hand-resolved (like the accessor operators) — the text[] + adapting-literal + optional-flag
-  // signature is outside the catalog family mold.
-  if (lname === "jsonb_set" || lname === "jsonb_insert") {
-    rejectNamed(lname, e.argNames);
+  // jsonb_set / jsonb_set_lax / jsonb_insert (json-sql-functions.md §2) take a jsonb target, a
+  // text[] path (a bare `'{a,b}'` literal adapts, like `#>`), a jsonb new value, an optional boolean
+  // flag, and (jsonb_set_lax) an optional null_value_treatment text. Hand-resolved (like the
+  // accessor operators) — the text[] + adapting-literal + text-default signature is outside the
+  // catalog family mold — but with PostgreSQL's parameter names, so named notation works.
+  if (lname === "jsonb_set" || lname === "jsonb_set_lax" || lname === "jsonb_insert") {
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-    const mode: PathSetMode = lname === "jsonb_set" ? "set" : "insert";
-    return resolveJsonbSetInsert(scope, lname, mode, e.args, ag, params);
+    const mode: PathSetMode = lname === "jsonb_insert" ? "insert" : "set";
+    return resolveJsonbSetInsert(
+      scope,
+      lname,
+      mode,
+      lname === "jsonb_set_lax",
+      e.args,
+      e.argNames,
+      ag,
+      params,
+    );
   }
   // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
   // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
@@ -32996,17 +33008,20 @@ export function defaultExpr(lit: string): Expr {
   return { kind: "literal", literal: { kind: "int", int: BigInt(lit) } };
 }
 
-// normalizeNamedArgs maps a call's positional + named arguments onto a function's positional
-// parameter slots, filling omitted trailing slots from desc.argDefaults (PostgreSQL named notation
-// + DEFAULTs, functions.md §11). Returns the positional Expr array of length desc.arity. Errors:
-// 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
-// unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
-export function normalizeNamedArgs(
-  desc: OperatorDesc,
+// placeNamedArgs places a call's positional + named arguments into a function's parameter slots by
+// PostgreSQL's named-notation rules (functions.md §11): positional args fill their index in order;
+// each named arg goes to its paramNames slot (matched byte-exactly on the folded name). An unfilled
+// slot is null — the caller fills it from a default or rejects it. Errors: 42601 a positional arg
+// after a named one (also caught at parse) or a duplicated name; 42883 an unknown parameter name or
+// too many arguments (no overload). Shared by the catalog path (normalizeNamedArgs) and the
+// hand-resolved named functions (jsonb_set / jsonb_set_lax / jsonb_insert).
+export function placeNamedArgs(
+  fname: string,
+  paramNames: readonly string[],
   args: Expr[],
   argNames: (string | null)[],
-): Expr[] {
-  const arity = desc.arity;
+): (Expr | null)[] {
+  const arity = paramNames.length;
   const slots: (Expr | null)[] = new Array(arity).fill(null);
   const namesEmpty = argNames.length === 0;
   let seenNamed = false;
@@ -33016,16 +33031,16 @@ export function normalizeNamedArgs(
       if (seenNamed) {
         throw engineError("syntax_error", "positional argument cannot follow named argument");
       }
-      if (i >= arity) throw noFuncOverload(desc.name); // too many positional arguments
+      if (i >= arity) throw noFuncOverload(fname); // too many positional arguments
       slots[i] = args[i]!;
       continue;
     }
     seenNamed = true;
-    const idx = desc.argNames.findIndex((p) => p === nm);
+    const idx = paramNames.findIndex((p) => p === nm);
     if (idx < 0) {
       throw engineError(
         "undefined_function",
-        "function " + desc.name + ' has no parameter named "' + nm + '"',
+        "function " + fname + ' has no parameter named "' + nm + '"',
       );
     }
     if (slots[idx] !== null) {
@@ -33033,11 +33048,25 @@ export function normalizeNamedArgs(
     }
     slots[idx] = args[i]!;
   }
+  return slots;
+}
+
+// normalizeNamedArgs maps a call's positional + named arguments onto a function's positional
+// parameter slots, filling omitted trailing slots from desc.argDefaults (PostgreSQL named notation
+// + DEFAULTs, functions.md §11). Returns the positional Expr array of length desc.arity. Errors:
+// those of placeNamedArgs, plus 42883 for a missing non-defaulted slot (no overload).
+export function normalizeNamedArgs(
+  desc: OperatorDesc,
+  args: Expr[],
+  argNames: (string | null)[],
+): Expr[] {
+  const arity = desc.arity;
+  const slots = placeNamedArgs(desc.name, desc.argNames, args, argNames);
   const firstDefaulted = arity - desc.argDefaults.length;
   const out: Expr[] = [];
   for (let i = 0; i < arity; i++) {
     const slot = slots[i];
-    if (slot !== null) {
+    if (slot !== null && slot !== undefined) {
       out.push(slot);
     } else if (i >= firstDefaulted) {
       out.push(defaultExpr(desc.argDefaults[i - firstDefaulted]!));

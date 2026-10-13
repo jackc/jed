@@ -3816,44 +3816,85 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 	case reJsonSetInsert:
 		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
 		// (or a NULL path element) → SQL NULL. One operator_eval; the args charge their own.
+		// jsonb_set_lax is jsonb_set that is not strict in the value: a SQL NULL value is handled by
+		// its null_value_treatment.
 		m.Charge(costs.OperatorEval)
-		target, err := e.sargs[0].eval(row, env, m)
-		if err != nil {
-			return Value{}, err
-		}
-		pathV, err := e.sargs[1].eval(row, env, m)
-		if err != nil {
-			return Value{}, err
-		}
-		valueV, err := e.sargs[2].eval(row, env, m)
-		if err != nil {
-			return Value{}, err
-		}
-		flagV, err := e.sargs[3].eval(row, env, m)
-		if err != nil {
-			return Value{}, err
+		args := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			args[i] = v
 		}
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		if target.Kind == ValNull || pathV.Kind == ValNull || valueV.Kind == ValNull || flagV.Kind == ValNull {
-			return NullValue(), nil
-		}
+		target, pathV, valueV, flagV := args[0], args[1], args[2], args[3]
 		// Extract the text[] path (a NULL element propagates a SQL NULL, like the `#-` path).
-		if pathV.Kind != ValArray {
-			return NullValue(), nil
-		}
-		path := make([]string, 0, len(pathV.arrayVal().Elements))
-		for _, el := range pathV.arrayVal().Elements {
-			if el.Kind != ValText {
-				return NullValue(), nil // a NULL path element propagates
+		textPath := func() ([]string, bool) {
+			if pathV.Kind != ValArray {
+				return nil, false
 			}
-			path = append(path, el.str())
+			path := make([]string, 0, len(pathV.arrayVal().Elements))
+			for _, el := range pathV.arrayVal().Elements {
+				if el.Kind != ValText {
+					return nil, false // a NULL path element propagates
+				}
+				path = append(path, el.str())
+			}
+			return path, true
+		}
+		var valueNode JsonNode
+		if e.psLax {
+			if target.Kind == ValNull || pathV.Kind == ValNull || flagV.Kind == ValNull {
+				return NullValue(), nil
+			}
+			// An explicit NULL treatment is rejected even for a non-NULL value (PG).
+			if args[4].Kind != ValText {
+				return Value{}, badNullValueTreatment()
+			}
+			if valueV.Kind == ValNull {
+				switch args[4].str() {
+				case "raise_exception":
+					return Value{}, nullValueRaised()
+				case "use_json_null":
+					valueNode = JsonNode{Kind: JNull}
+				case "delete_key":
+					// `#-` (jsonb_delete_path): removing a member never grows the document, so no
+					// output charge and no depth check.
+					path, ok := textPath()
+					if !ok {
+						return NullValue(), nil
+					}
+					out, err := jsonDeletePath(target.jsonb(), path)
+					if err != nil {
+						return Value{}, err
+					}
+					return JsonbValue(out), nil
+				case "return_target":
+					return target, nil
+				default:
+					return Value{}, badNullValueTreatment()
+				}
+			} else {
+				// A non-NULL value (whatever the treatment says): jsonb_set.
+				valueNode = *valueV.jsonb()
+			}
+		} else {
+			if target.Kind == ValNull || pathV.Kind == ValNull || valueV.Kind == ValNull || flagV.Kind == ValNull {
+				return NullValue(), nil
+			}
+			valueNode = *valueV.jsonb()
+		}
+		path, ok := textPath()
+		if !ok {
+			return NullValue(), nil
 		}
 		node := *target.jsonb() // resolver guarantees a jsonb target
-		valueNode := *valueV.jsonb()
 		flag := flagV.Kind == ValBool && flagV.boolVal()
 		var out JsonNode
+		var err error
 		if e.psMode == psSet {
 			out, err = setPath(&node, path, &valueNode, flag)
 		} else {

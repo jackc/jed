@@ -166,6 +166,8 @@ import {
   deleteKey as jsonDeleteKey,
   deleteKeys as jsonDeleteKeys,
   deletePath as jsonDeletePathKernel,
+  badNullValueTreatment as jsonBadNullValueTreatment,
+  nullValueRaised as jsonNullValueRaised,
   getField,
   getIndex,
   getPath,
@@ -2112,30 +2114,67 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     }
     case "jsonSetInsert": {
       // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
-      // (or a NULL path element) → SQL NULL.
+      // (or a NULL path element) → SQL NULL. jsonb_set_lax is jsonb_set that is not strict in the
+      // value: a SQL NULL value is handled by its null_value_treatment.
       m.charge(COSTS.operatorEval);
-      const target = evalExpr(e.args[0]!, row, env, m);
-      const pathV = evalExpr(e.args[1]!, row, env, m);
-      const valueV = evalExpr(e.args[2]!, row, env, m);
-      const flagV = evalExpr(e.args[3]!, row, env, m);
+      const vals = e.args.map((a) => evalExpr(a, row, env, m));
       m.guard();
-      if (
-        target.kind === "null" ||
-        pathV.kind === "null" ||
-        valueV.kind === "null" ||
-        flagV.kind === "null"
-      ) {
-        return nullValue();
-      }
+      const [target, pathV, valueV, flagV] = vals as [Value, Value, Value, Value];
       // Extract the text[] path (a NULL element propagates a SQL NULL result, like the `#-` path).
-      if (pathV.kind !== "array") throw new Error("resolver guarantees a text[] path");
-      const path: string[] = [];
-      for (const el of pathV.elements) {
-        if (el.kind !== "text") return nullValue(); // a NULL path element propagates
-        path.push(el.text);
+      const textPath = (): string[] | null => {
+        if (pathV.kind !== "array") throw new Error("resolver guarantees a text[] path");
+        const path: string[] = [];
+        for (const el of pathV.elements) {
+          if (el.kind !== "text") return null; // a NULL path element propagates
+          path.push(el.text);
+        }
+        return path;
+      };
+      let valueNode: JsonNode;
+      if (e.lax) {
+        if (target.kind === "null" || pathV.kind === "null" || flagV.kind === "null") {
+          return nullValue();
+        }
+        const treatmentV = vals[4]!;
+        // An explicit NULL treatment is rejected even for a non-NULL value (PG).
+        if (treatmentV.kind !== "text") throw jsonBadNullValueTreatment();
+        if (valueV.kind === "null") {
+          switch (treatmentV.text) {
+            case "raise_exception":
+              throw jsonNullValueRaised();
+            case "use_json_null":
+              valueNode = { kind: "null" };
+              break;
+            case "delete_key": {
+              // `#-` (jsonb_delete_path): removing a member never grows the document, so no
+              // output charge and no depth check.
+              const path = textPath();
+              if (path === null) return nullValue();
+              return jsonbValue(jsonDeletePathKernel(jsonArgNode(target), path));
+            }
+            case "return_target":
+              return target;
+            default:
+              throw jsonBadNullValueTreatment();
+          }
+        } else {
+          // A non-NULL value (whatever the treatment says): jsonb_set.
+          valueNode = jsonArgNode(valueV);
+        }
+      } else {
+        if (
+          target.kind === "null" ||
+          pathV.kind === "null" ||
+          valueV.kind === "null" ||
+          flagV.kind === "null"
+        ) {
+          return nullValue();
+        }
+        valueNode = jsonArgNode(valueV);
       }
+      const path = textPath();
+      if (path === null) return nullValue();
       const node = jsonArgNode(target);
-      const valueNode = jsonArgNode(valueV);
       const flag = flagV.kind === "bool" && flagV.value;
       const out =
         e.mode === "set"

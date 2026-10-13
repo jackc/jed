@@ -525,7 +525,9 @@ const (
 	// reJsonSetInsert is `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): a jsonb path
 	// mutation. `sargs` is `[target jsonb, path text[], value jsonb, flag boolean]` — STRICT (any
 	// NULL → SQL NULL, including a NULL path element). `psMode` selects replace-or-create (Set) vs
-	// insert (Insert); the boolean flag is create_if_missing (Set) / insert_after (Insert).
+	// insert (Insert); the boolean flag is create_if_missing (Set) / insert_after (Insert). `psLax`
+	// is `jsonb_set_lax` (psSet): a fifth `null_value_treatment text` arg, and NOT strict in the
+	// value — a SQL NULL value is handled by the treatment.
 	reJsonSetInsert
 	// reJsonObject is `json_object` / `jsonb_object` (json-sql-functions.md §2): build an object from
 	// text array(s). `sargs` is one `text[]` of alternating keys/values, or two `text[]` (keys,
@@ -1154,9 +1156,11 @@ type rExpr struct {
 	jsOnEmpty    jsonOnBehavior
 	jsOnError    jsonOnBehavior
 
-	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert). Argument nodes are in
-	// `sargs` = [target, path, value, flag] (json-sql-functions.md §2).
+	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert), and whether it is
+	// jsonb_set_lax. Argument nodes are in `sargs` = [target, path, value, flag (, treatment)]
+	// (json-sql-functions.md §2).
 	psMode pathSetMode
+	psLax  bool
 
 	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
 	// arrays, stacked into one higher dimension — spec/design/array.md §4).

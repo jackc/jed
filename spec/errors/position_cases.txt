@@ -427,3 +427,11 @@ case: script parse error position
 script: CREATE TABLE s (a int); SELECT 1 +
 code: 42601
 position: 35
+
+# --- jsonb_set_lax's raise_exception hint (error-fields.md §11.4) ---------------------------------
+
+case: jsonb_set_lax raise_exception hint
+run: SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'raise_exception')
+code: 22004
+no-position
+hint: To avoid, either change the null_value_treatment argument or ensure that an SQL NULL is not passed.

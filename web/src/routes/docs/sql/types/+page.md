@@ -85,6 +85,12 @@ SET body = body || '{"active":true}',
 WHERE id = 1
 RETURNING body, raw;`;
 
+	const jsonSetLaxDemo = `SELECT
+  jsonb_set('{"a":1,"b":2}', '{a}', '99')      AS set_a,
+  jsonb_set_lax('{"a":1,"b":2}', '{a}', NULL)  AS json_null,
+  jsonb_set_lax('{"a":1,"b":2}', '{a}', NULL,
+                null_value_treatment => 'delete_key') AS deleted;`;
+
 	const jsonReadDemo = `SELECT
   '{"a" : [1,  2], "a": {"b" :  1.50}}'::json  -> 'a'      AS json_member,
   '{"a" : [1,  2], "a": {"b" :  1.50}}'::jsonb -> 'a'      AS jsonb_member,
@@ -329,6 +335,15 @@ order, and duplicate keys. In a multi-column `UPDATE`, every right-hand side rea
 `raw = body` below captures the pre-update canonical document:
 
 <LiveSql demo="jsonUpdateDemo" query={jsonUpdateDemo} rows={1} />
+
+`jsonb_set(target, path, value)` replaces the value at a `text[]` path, creating a missing final key
+by default. Like PostgreSQL's, it returns SQL `NULL` when `value` is `NULL`. `jsonb_set_lax` instead
+applies its `null_value_treatment`: `'use_json_null'` (the default) stores a JSON `null`,
+`'delete_key'` removes the path, `'return_target'` returns the document unchanged, and
+`'raise_exception'` fails with `22004`. `jsonb_set`, `jsonb_set_lax`, and `jsonb_insert` accept
+PostgreSQL's named arguments:
+
+<LiveSql demo="jsonSetLaxDemo" query={jsonSetLaxDemo} rows={1} />
 
 Reading a `json` value keeps its spelling too. `->` and `#>` on `json` return the matched value's
 exact original text — whitespace, key order, duplicate keys, and number spelling intact — where

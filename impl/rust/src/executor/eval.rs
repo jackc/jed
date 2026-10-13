@@ -798,14 +798,48 @@ impl RExpr {
                 Ok(Value::Jsonb(result))
             }
             // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL
-            // argument (or a NULL path element) → SQL NULL.
-            RExpr::JsonSetInsert { mode, args } => {
+            // argument (or a NULL path element) → SQL NULL. jsonb_set_lax is jsonb_set that is not
+            // strict in the value: a SQL NULL value is handled by its null_value_treatment.
+            RExpr::JsonSetInsert { mode, lax, args } => {
                 m.charge(COSTS.operator_eval);
                 let target = args[0].eval(row, env, m)?;
                 let path_v = args[1].eval(row, env, m)?;
                 let value_v = args[2].eval(row, env, m)?;
                 let flag_v = args[3].eval(row, env, m)?;
-                if matches!(target, Value::Null)
+                let mut value_node = None;
+                if *lax {
+                    let treatment_v = args[4].eval(row, env, m)?;
+                    if matches!(target, Value::Null)
+                        || matches!(path_v, Value::Null)
+                        || matches!(flag_v, Value::Null)
+                    {
+                        return Ok(Value::Null);
+                    }
+                    let treatment = match &treatment_v {
+                        Value::Text(t) => t.as_str(),
+                        // An explicit NULL treatment is rejected even for a non-NULL value (PG).
+                        _ => return Err(json::bad_null_value_treatment()),
+                    };
+                    if matches!(value_v, Value::Null) {
+                        match treatment {
+                            "raise_exception" => return Err(json::null_value_raised()),
+                            "use_json_null" => value_node = Some(JsonNode::Null),
+                            "delete_key" => {
+                                // `#-` (jsonb_delete_path): removing a member never grows the
+                                // document, so no output charge and no depth check.
+                                let path = match value_to_text_path(&path_v) {
+                                    Some(p) => p,
+                                    None => return Ok(Value::Null), // a NULL path element
+                                };
+                                let node = json_arg_node(&target)?;
+                                return Ok(Value::Jsonb(json::delete_path(&node, &path)?));
+                            }
+                            "return_target" => return Ok(target),
+                            _ => return Err(json::bad_null_value_treatment()),
+                        }
+                    }
+                    // A non-NULL value (whatever the treatment says) or use_json_null: jsonb_set.
+                } else if matches!(target, Value::Null)
                     || matches!(path_v, Value::Null)
                     || matches!(value_v, Value::Null)
                     || matches!(flag_v, Value::Null)
@@ -817,7 +851,10 @@ impl RExpr {
                     None => return Ok(Value::Null), // a NULL path element propagates
                 };
                 let node = json_arg_node(&target)?;
-                let value_node = json_arg_node(&value_v)?;
+                let value_node = match value_node {
+                    Some(n) => n,
+                    None => json_arg_node(&value_v)?,
+                };
                 let flag = matches!(flag_v, Value::Bool(true));
                 let out = match mode {
                     json::PathSetMode::Set => json::set_path(&node, &path, &value_node, flag)?,

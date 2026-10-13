@@ -800,6 +800,8 @@ var SupportedCapabilities = []string{
 	"func.json_builders",
 	// jsonb_set / jsonb_insert (B1) — the jsonb path-mutation builders (json-sql-functions.md §2).
 	"func.json_set",
+	// jsonb_set_lax — jsonb_set with a null_value_treatment for a SQL NULL value (§2).
+	"func.json_set_lax",
 	// json_object / jsonb_object (B1) — build an object from text array(s): one array of alternating
 	// keys/values, or two equal-length arrays (keys, values). Every value is a JSON string; jsonb
 	// canonicalizes, json keeps insertion order + dups + " : " spacing (json-sql-functions.md §2).

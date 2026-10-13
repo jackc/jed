@@ -321,3 +321,15 @@ grant: INSERT v
 run: INSERT INTO v VALUES (1, 2)
 code: 23505
 no-detail
+
+# --- 22004 jsonb_set_lax --------------------------------------------------------------------------
+
+case: jsonb_set_lax raise_exception
+run: SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'raise_exception')
+code: 22004
+detail: Exception was raised because null_value_treatment is "raise_exception".
+
+case: jsonb_set_lax bad treatment has no detail
+run: SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'bogus')
+code: 22023
+no-detail

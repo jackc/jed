@@ -542,6 +542,15 @@ parameters (PG's exact `year`/`month`/`day`), none defaulted, the same shared re
 window traps `22008`. Built on the same `days_from_civil` core as the date literal
 ([date.md §6](date.md)); `immutable` — legal in an index expression.
 
+**Hand-resolved named functions — the jsonb path mutators.** `jsonb_set`, `jsonb_set_lax`, and
+`jsonb_insert` have no catalog row (their `text[]` path and adapting literals are outside the family
+mold, [json-sql-functions.md §2](json-sql-functions.md)), and `jsonb_set_lax`'s
+`null_value_treatment DEFAULT 'use_json_null'` is a text default the integer-only `arg_defaults` cannot
+hold. Their resolver supplies PostgreSQL's parameter names and defaults itself and places the
+arguments through the same slot-placement step `normalize_named_args` uses, so their named notation
+has the same errors and rules. Every other hand-resolved function still rejects named notation
+(`42883`).
+
 **Deferred (sequenced follow-ons).** General DEFAULT values for *arbitrary* (non-integer)
 literals and user-defined functions are not built (jed has no UDFs; built-ins use overloads or
 `make_interval`-style 0-defaults). **`VARIADIC`** was blocked

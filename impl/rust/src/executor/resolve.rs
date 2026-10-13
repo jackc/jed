@@ -968,44 +968,74 @@ pub(crate) fn resolve_text_array_arg(
     }
 }
 
-/// Resolve `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): `(target jsonb, path text[],
-/// value jsonb [, flag boolean])` → jsonb. A bare `'{a,b}'` path literal adapts to text[] and a bare
-/// string `value` literal adapts to jsonb. STRICT (the eval propagates any NULL). The optional flag
-/// defaults to `true` for jsonb_set (create_if_missing) / `false` for jsonb_insert (insert_after).
+/// Resolve `jsonb_set` / `jsonb_set_lax` / `jsonb_insert` (json-sql-functions.md §2): `(jsonb_in
+/// jsonb, path text[], replacement jsonb [, flag boolean [, null_value_treatment text]])` → jsonb,
+/// in positional or named notation (PostgreSQL's parameter names, functions.md §11). A bare
+/// `'{a,b}'` path literal adapts to text[] and a bare string `replacement` literal adapts to jsonb.
+/// The flag defaults to `true` for jsonb_set / jsonb_set_lax (create_if_missing) and `false` for
+/// jsonb_insert (insert_after); jsonb_set_lax's null_value_treatment defaults to `'use_json_null'`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_jsonb_set_insert(
     scope: &Scope,
     name: &str,
     mode: json::PathSetMode,
+    lax: bool,
     args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    if args.len() != 3 && args.len() != 4 {
-        return Err(no_func_overload(name));
+    let flag_name = if mode == json::PathSetMode::Set {
+        "create_if_missing"
+    } else {
+        "insert_after"
+    };
+    let mut param_names = vec!["jsonb_in", "path", "replacement", flag_name];
+    if lax {
+        param_names.push("null_value_treatment");
     }
-    let (target, t0) = resolve(scope, &args[0], Some(ScalarType::Jsonb), agg, params)?;
+    let slots = place_named_args(name, &param_names, args, arg_names)?;
+    // The first three parameters have no DEFAULT.
+    let required = |i: usize| slots[i].as_ref().ok_or_else(|| no_func_overload(name));
+    let (target, t0) = resolve(scope, required(0)?, Some(ScalarType::Jsonb), agg, params)?;
     if !matches!(t0, ResolvedType::Jsonb | ResolvedType::Null) {
         return Err(no_func_overload(name));
     }
-    let path = resolve_text_array_arg(scope, &args[1], name, agg, params)?;
-    let (value, t2) = resolve(scope, &args[2], Some(ScalarType::Jsonb), agg, params)?;
+    let path = resolve_text_array_arg(scope, required(1)?, name, agg, params)?;
+    let (value, t2) = resolve(scope, required(2)?, Some(ScalarType::Jsonb), agg, params)?;
     if !matches!(t2, ResolvedType::Jsonb | ResolvedType::Null) {
         return Err(no_func_overload(name));
     }
-    let flag = if args.len() == 4 {
-        let (f, tf) = resolve(scope, &args[3], Some(ScalarType::Bool), agg, params)?;
-        if !matches!(tf, ResolvedType::Bool | ResolvedType::Null) {
-            return Err(no_func_overload(name));
+    let flag = match &slots[3] {
+        Some(e) => {
+            let (f, tf) = resolve(scope, e, Some(ScalarType::Bool), agg, params)?;
+            if !matches!(tf, ResolvedType::Bool | ResolvedType::Null) {
+                return Err(no_func_overload(name));
+            }
+            f
         }
-        f
-    } else {
-        // Default: jsonb_set create_if_missing = true; jsonb_insert insert_after = false.
-        value_to_rexpr(&Value::Bool(mode == json::PathSetMode::Set))
+        // Default: create_if_missing = true; insert_after = false.
+        None => value_to_rexpr(&Value::Bool(mode == json::PathSetMode::Set)),
     };
+    let mut rargs = vec![target, path, value, flag];
+    if lax {
+        let treatment = match &slots[4] {
+            Some(e) => {
+                let (t, tt) = resolve(scope, e, Some(ScalarType::Text), agg, params)?;
+                if !matches!(tt, ResolvedType::Text | ResolvedType::Null) {
+                    return Err(no_func_overload(name));
+                }
+                t
+            }
+            None => value_to_rexpr(&Value::Text("use_json_null".to_string())),
+        };
+        rargs.push(treatment);
+    }
     Ok((
         RExpr::JsonSetInsert {
             mode,
-            args: vec![target, path, value, flag],
+            lax,
+            args: rargs,
         },
         ResolvedType::Jsonb,
     ))

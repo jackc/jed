@@ -3370,11 +3370,14 @@ pub(crate) enum RExpr {
         arg: Box<RExpr>,
     },
     /// `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): a jsonb path mutation. `args` is
-    /// `[target jsonb, path text[], value jsonb, (flag boolean)]` — STRICT (any NULL → SQL NULL).
-    /// `mode` selects replace-or-create (Set) vs insert (Insert); the optional flag is
-    /// create_if_missing (Set) / insert_after (Insert), defaulting to true / false respectively.
+    /// `[target jsonb, path text[], value jsonb, flag boolean]` — STRICT (any NULL → SQL NULL).
+    /// `mode` selects replace-or-create (Set) vs insert (Insert); the flag is create_if_missing
+    /// (Set) / insert_after (Insert), defaulting to true / false respectively. `lax` is
+    /// `jsonb_set_lax` (mode Set): a fifth `null_value_treatment text` arg, and NOT strict in the
+    /// value — a SQL NULL value is handled by the treatment.
     JsonSetInsert {
         mode: json::PathSetMode,
+        lax: bool,
         args: Vec<RExpr>,
     },
     /// `json_object` / `jsonb_object` (json-sql-functions.md §2): build an object from text array(s).

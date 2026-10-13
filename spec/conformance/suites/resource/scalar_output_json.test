@@ -5,7 +5,7 @@
 # before rendering. payload(jsonb) = 32 per node beyond the root, plus key and string UTF-8 bytes and
 # 4 per decimal digit group; payload(json/text) = UTF-8 bytes.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.jsonb_mutate, func.json_processing, func.json_ctor, func.jsonb_path, func.json_object, func.json_set, func.json_builders, expr.json_query_fns, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.jsonb_mutate, func.json_processing, func.json_ctor, func.jsonb_path, func.json_object, func.json_set, func.json_set_lax, func.json_builders, expr.json_query_fns, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, j jsonb, s text, a i32[])
@@ -68,6 +68,22 @@ SELECT jsonb_set(j, '{b}', j), jsonb_object(ARRAY['k', s]) FROM t
 ----
 {"a": 1, "b": {"a": 1}}
 {"k": "q\"x"}
+
+# jsonb_set_lax charges like jsonb_set when it sets — here use_json_null's {"a": null}: one member
+# of 1 + 32 → payload 33.
+# cost: 37
+query T nosort
+SELECT jsonb_set_lax(j, '{a}', NULL) FROM t
+----
+{"a": null}
+
+# Its delete_key (as #-) and return_target only remove from or return the target: no output charge.
+# cost: 5
+query TT nosort
+SELECT jsonb_set_lax(j, '{a}', NULL, true, 'delete_key'), jsonb_set_lax(j, '{a}', NULL, true, 'return_target') FROM t
+----
+{}
+{"a": 1}
 
 # jsonb_path_query_array collects its items into a new array: [1] → payload 36.
 # cost: 46

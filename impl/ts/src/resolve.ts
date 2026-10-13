@@ -18,6 +18,7 @@ import {
   matchPoly,
   noAggOverload,
   noFuncOverload,
+  placeNamedArgs,
   polyResultType,
   queryPlanColumnDerivs,
   rangeBoundAssignable,
@@ -3242,36 +3243,65 @@ export function resolveTextArrayArg(
   throw engineError("undefined_function", `the ${sym} operator's right argument must be text[]`);
 }
 
-// resolveJsonbSetInsert resolves jsonb_set / jsonb_insert (json-sql-functions.md §2): `(target jsonb,
-// path text[], value jsonb [, flag boolean])` → jsonb. A bare `'{a,b}'` path literal adapts to text[]
-// and a bare string `value` literal adapts to jsonb (the `Some(ScalarType::Jsonb)` hint). STRICT (the
-// eval propagates any NULL). The optional flag defaults to `true` for jsonb_set (create_if_missing) /
-// `false` for jsonb_insert (insert_after).
+// resolveJsonbSetInsert resolves jsonb_set / jsonb_set_lax / jsonb_insert (json-sql-functions.md
+// §2): `(jsonb_in jsonb, path text[], replacement jsonb [, flag boolean [, null_value_treatment
+// text]])` → jsonb, in positional or named notation (PostgreSQL's parameter names, functions.md
+// §11). A bare `'{a,b}'` path literal adapts to text[] and a bare string `replacement` literal adapts
+// to jsonb. The flag defaults to `true` for jsonb_set / jsonb_set_lax (create_if_missing) and
+// `false` for jsonb_insert (insert_after); jsonb_set_lax's null_value_treatment defaults to
+// 'use_json_null'.
 export function resolveJsonbSetInsert(
   scope: Scope,
   name: string,
   mode: PathSetMode,
+  lax: boolean,
   args: Expr[],
+  argNames: (string | null)[],
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (args.length !== 3 && args.length !== 4) throw noFuncOverload(name);
-  const target = resolve(scope, args[0]!, "jsonb", ag, params);
+  const paramNames = [
+    "jsonb_in",
+    "path",
+    "replacement",
+    mode === "set" ? "create_if_missing" : "insert_after",
+  ];
+  if (lax) paramNames.push("null_value_treatment");
+  const slots = placeNamedArgs(name, paramNames, args, argNames);
+  // The first three parameters have no DEFAULT.
+  const required = (i: number): Expr => {
+    const a = slots[i];
+    if (a === null || a === undefined) throw noFuncOverload(name);
+    return a;
+  };
+  const target = resolve(scope, required(0), "jsonb", ag, params);
   if (target.type.kind !== "jsonb" && target.type.kind !== "null") throw noFuncOverload(name);
-  const path = resolveTextArrayArg(scope, args[1]!, name, ag, params);
-  const value = resolve(scope, args[2]!, "jsonb", ag, params);
+  const path = resolveTextArrayArg(scope, required(1), name, ag, params);
+  const value = resolve(scope, required(2), "jsonb", ag, params);
   if (value.type.kind !== "jsonb" && value.type.kind !== "null") throw noFuncOverload(name);
   let flag: RExpr;
-  if (args.length === 4) {
-    const f = resolve(scope, args[3]!, "boolean", ag, params);
+  const flagArg = slots[3];
+  if (flagArg !== null && flagArg !== undefined) {
+    const f = resolve(scope, flagArg, "boolean", ag, params);
     if (f.type.kind !== "bool" && f.type.kind !== "null") throw noFuncOverload(name);
     flag = f.node;
   } else {
-    // Default: jsonb_set create_if_missing = true; jsonb_insert insert_after = false.
+    // Default: create_if_missing = true; insert_after = false.
     flag = { kind: "constBool", value: mode === "set" };
   }
+  const rargs: RExpr[] = [target.node, path, value.node, flag];
+  if (lax) {
+    const treatmentArg = slots[4];
+    if (treatmentArg !== null && treatmentArg !== undefined) {
+      const t = resolve(scope, treatmentArg, "text", ag, params);
+      if (t.type.kind !== "text" && t.type.kind !== "null") throw noFuncOverload(name);
+      rargs.push(t.node);
+    } else {
+      rargs.push({ kind: "constText", value: "use_json_null" });
+    }
+  }
   return {
-    node: { kind: "jsonSetInsert", mode, args: [target.node, path, value.node, flag] },
+    node: { kind: "jsonSetInsert", mode, lax, args: rargs },
     type: { kind: "jsonb" },
   };
 }

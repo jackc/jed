@@ -2386,28 +2386,46 @@ func evalJsonpath(ctx, path Value, m *costMeter) ([]JsonNode, bool, error) {
 	return seq, true, nil
 }
 
-// resolveJSONSetInsert resolves jsonb_set / jsonb_insert (json-sql-functions.md §2): `(target jsonb,
-// path text[], value jsonb [, flag boolean])` → jsonb. A bare `'{a,b}'` path literal adapts to text[]
-// and a bare string `value` literal adapts to jsonb. STRICT (the eval propagates any NULL). The
-// optional flag defaults to `true` for jsonb_set (create_if_missing) / `false` for jsonb_insert
-// (insert_after).
+// resolveJSONSetInsert resolves jsonb_set / jsonb_set_lax / jsonb_insert (json-sql-functions.md
+// §2): `(jsonb_in jsonb, path text[], replacement jsonb [, flag boolean [, null_value_treatment
+// text]])` → jsonb, in positional or named notation (PostgreSQL's parameter names, functions.md
+// §11). A bare `'{a,b}'` path literal adapts to text[] and a bare string `replacement` literal
+// adapts to jsonb. The flag defaults to `true` for jsonb_set / jsonb_set_lax (create_if_missing)
+// and `false` for jsonb_insert (insert_after); jsonb_set_lax's null_value_treatment defaults to
+// 'use_json_null'.
 func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	if len(fc.Args) != 3 && len(fc.Args) != 4 {
-		return nil, resolvedType{}, noFuncOverload(name)
+	lax := name == "jsonb_set_lax"
+	flagName := "create_if_missing"
+	if mode == psInsert {
+		flagName = "insert_after"
+	}
+	paramNames := []string{"jsonb_in", "path", "replacement", flagName}
+	if lax {
+		paramNames = append(paramNames, "null_value_treatment")
+	}
+	slots, err := placeNamedArgs(name, paramNames, fc.Args, fc.ArgNames)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// The first three parameters have no DEFAULT.
+	for i := 0; i < 3; i++ {
+		if slots[i] == nil {
+			return nil, resolvedType{}, noFuncOverload(name)
+		}
 	}
 	jsonbHint := scalarJsonb
-	target, t0, err := resolve(s, *fc.Args[0], &jsonbHint, ag, params)
+	target, t0, err := resolve(s, *slots[0], &jsonbHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
 	if t0.kind != rtJsonb && t0.kind != rtNull {
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
-	path, err := resolveTextArrayArg(s, *fc.Args[1], name, ag, params)
+	path, err := resolveTextArrayArg(s, *slots[1], name, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	value, t2, err := resolve(s, *fc.Args[2], &jsonbHint, ag, params)
+	value, t2, err := resolve(s, *slots[2], &jsonbHint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -2415,9 +2433,9 @@ func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *funcCallE
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
 	var flag *rExpr
-	if len(fc.Args) == 4 {
+	if slots[3] != nil {
 		boolHint := scalarBool
-		f, tf, err := resolve(s, *fc.Args[3], &boolHint, ag, params)
+		f, tf, err := resolve(s, *slots[3], &boolHint, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2426,10 +2444,28 @@ func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *funcCallE
 		}
 		flag = f
 	} else {
-		// Default: jsonb_set create_if_missing = true; jsonb_insert insert_after = false.
+		// Default: create_if_missing = true; insert_after = false.
 		flag = valueToRExpr(BoolValue(mode == psSet))
 	}
-	return &rExpr{kind: reJsonSetInsert, psMode: mode, sargs: []*rExpr{target, path, value, flag}},
+	sargs := []*rExpr{target, path, value, flag}
+	if lax {
+		var treatment *rExpr
+		if slots[4] != nil {
+			textHint := scalarText
+			t, tt, err := resolve(s, *slots[4], &textHint, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if tt.kind != rtText && tt.kind != rtNull {
+				return nil, resolvedType{}, noFuncOverload(name)
+			}
+			treatment = t
+		} else {
+			treatment = valueToRExpr(TextValue("use_json_null"))
+		}
+		sargs = append(sargs, treatment)
+	}
+	return &rExpr{kind: reJsonSetInsert, psMode: mode, psLax: lax, sargs: sargs},
 		resolvedType{kind: rtJsonb}, nil
 }
 
@@ -2702,14 +2738,12 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveGrouping(s, fc, ag)
 	}
-	// jsonb_set / jsonb_insert (json-sql-functions.md §2) take a jsonb target, a text[] path (a bare
-	// `'{a,b}'` literal adapts, like `#>`), a jsonb new value, and an optional boolean flag.
-	// Hand-resolved (like the accessor operators) — the text[] + adapting-literal + optional-flag
-	// signature is outside the catalog family mold.
-	if name == "jsonb_set" || name == "jsonb_insert" {
-		if err := rejectNamed(name, fc.ArgNames); err != nil {
-			return nil, resolvedType{}, err
-		}
+	// jsonb_set / jsonb_set_lax / jsonb_insert (json-sql-functions.md §2) take a jsonb target, a
+	// text[] path (a bare `'{a,b}'` literal adapts, like `#>`), a jsonb new value, an optional boolean
+	// flag, and (jsonb_set_lax) an optional null_value_treatment text. Hand-resolved (like the
+	// accessor operators) — the text[] + adapting-literal + text-default signature is outside the
+	// catalog family mold — but with PostgreSQL's parameter names, so named notation works.
+	if name == "jsonb_set" || name == "jsonb_set_lax" || name == "jsonb_insert" {
 		if fc.Star {
 			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
@@ -2963,13 +2997,15 @@ func newDefaultExpr(lit string) exprNode {
 	return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: n}}
 }
 
-// normalizeNamedArgs maps a call's positional + named arguments onto a function's positional
-// parameter slots, filling omitted trailing slots from desc.ArgDefaults (PostgreSQL named notation
-// + DEFAULTs, functions.md §11). Returns the positional Expr slice of length desc.Arity. Errors:
-// 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
-// unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
-func normalizeNamedArgs(desc *operatorDesc, args []*exprNode, argNames []*string) ([]*exprNode, error) {
-	arity := desc.Arity
+// placeNamedArgs places a call's positional + named arguments into a function's parameter slots by
+// PostgreSQL's named-notation rules (functions.md §11): positional args fill their index in order;
+// each named arg goes to its paramNames slot (matched byte-exactly on the folded name). An unfilled
+// slot is nil — the caller fills it from a default or rejects it. Errors: 42601 a positional arg
+// after a named one (also caught at parse) or a duplicated name; 42883 an unknown parameter name or
+// too many arguments (no overload). Shared by the catalog path (normalizeNamedArgs) and the
+// hand-resolved named functions (jsonb_set / jsonb_set_lax / jsonb_insert).
+func placeNamedArgs(fname string, paramNames []string, args []*exprNode, argNames []*string) ([]*exprNode, error) {
+	arity := len(paramNames)
 	slots := make([]*exprNode, arity)
 	seenNamed := false
 	for i, a := range args {
@@ -2982,26 +3018,39 @@ func normalizeNamedArgs(desc *operatorDesc, args []*exprNode, argNames []*string
 				return nil, newError(SyntaxError, "positional argument cannot follow named argument")
 			}
 			if i >= arity {
-				return nil, noFuncOverload(desc.Name) // too many positional arguments
+				return nil, noFuncOverload(fname) // too many positional arguments
 			}
 			slots[i] = a
 			continue
 		}
 		seenNamed = true
 		idx := -1
-		for j, pn := range desc.ArgNames {
+		for j, pn := range paramNames {
 			if pn == *nm {
 				idx = j
 				break
 			}
 		}
 		if idx < 0 {
-			return nil, newError(UndefinedFunction, "function "+desc.Name+" has no parameter named \""+*nm+"\"")
+			return nil, newError(UndefinedFunction, "function "+fname+" has no parameter named \""+*nm+"\"")
 		}
 		if slots[idx] != nil {
 			return nil, newError(SyntaxError, "argument name \""+*nm+"\" used more than once")
 		}
 		slots[idx] = a
+	}
+	return slots, nil
+}
+
+// normalizeNamedArgs maps a call's positional + named arguments onto a function's positional
+// parameter slots, filling omitted trailing slots from desc.ArgDefaults (PostgreSQL named notation
+// + DEFAULTs, functions.md §11). Returns the positional Expr slice of length desc.Arity. Errors:
+// those of placeNamedArgs, plus 42883 for a missing non-defaulted slot (no overload).
+func normalizeNamedArgs(desc *operatorDesc, args []*exprNode, argNames []*string) ([]*exprNode, error) {
+	arity := desc.Arity
+	slots, err := placeNamedArgs(desc.Name, desc.ArgNames, args, argNames)
+	if err != nil {
+		return nil, err
 	}
 	firstDefaulted := arity - len(desc.ArgDefaults)
 	out := make([]*exprNode, 0, arity)

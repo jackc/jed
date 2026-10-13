@@ -1144,6 +1144,26 @@ fn cannot_delete(msg: &'static str) -> EngineError {
     EngineError::new(SqlState::InvalidParameterValue, msg)
 }
 
+/// `jsonb_set_lax`'s `22023` for a NULL or unrecognized `null_value_treatment` (PG's exact text).
+pub fn bad_null_value_treatment() -> EngineError {
+    EngineError::new(
+        SqlState::InvalidParameterValue,
+        "null_value_treatment must be \"delete_key\", \"return_target\", \"use_json_null\", or \"raise_exception\"",
+    )
+}
+
+/// `jsonb_set_lax`'s `22004` for a SQL NULL value under `null_value_treatment => 'raise_exception'`,
+/// with PostgreSQL's Detail and Hint (error-fields.md §9.2, §11.4).
+pub fn null_value_raised() -> EngineError {
+    EngineError::new(SqlState::NullValueNotAllowed, "JSON value must not be null")
+        .with_detail(Some(
+            "Exception was raised because null_value_treatment is \"raise_exception\".".to_string(),
+        ))
+        .with_hint(Some(
+            "To avoid, either change the null_value_treatment argument or ensure that an SQL NULL is not passed.".to_string(),
+        ))
+}
+
 /// `a || b` — concatenate / shallow-merge (PG): two objects merge with the RIGHT side winning on a
 /// key conflict (result re-canonicalized); otherwise each operand is treated as an array (an array
 /// stays, a non-array becomes a one-element array) and the two are concatenated.

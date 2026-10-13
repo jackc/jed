@@ -110,24 +110,25 @@ pub(crate) fn resolve_func_call(
         reject_named(&lname, arg_names)?;
         return resolve_grouping(scope, args, star, agg, params);
     }
-    // `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2) take a jsonb target, a text[] path (a
-    // bare `'{a,b}'` literal adapts, like `#>`), a jsonb new value, and an optional boolean flag.
-    // Hand-resolved (like the accessor operators) — the text[] + adapting-literal + optional-flag
-    // signature is outside the catalog family mold.
-    if lname == "jsonb_set" || lname == "jsonb_insert" {
-        reject_named(&lname, arg_names)?;
+    // `jsonb_set` / `jsonb_set_lax` / `jsonb_insert` (json-sql-functions.md §2) take a jsonb target,
+    // a text[] path (a bare `'{a,b}'` literal adapts, like `#>`), a jsonb new value, an optional
+    // boolean flag, and (jsonb_set_lax) an optional null_value_treatment text. Hand-resolved (like the
+    // accessor operators) — the text[] + adapting-literal + text-default signature is outside the
+    // catalog family mold — but with PostgreSQL's parameter names, so named notation works.
+    if lname == "jsonb_set" || lname == "jsonb_set_lax" || lname == "jsonb_insert" {
         if star {
             return Err(EngineError::new(
                 SqlState::SyntaxError,
                 "* is only valid as the argument of COUNT",
             ));
         }
-        let mode = if lname == "jsonb_set" {
-            json::PathSetMode::Set
-        } else {
+        let mode = if lname == "jsonb_insert" {
             json::PathSetMode::Insert
+        } else {
+            json::PathSetMode::Set
         };
-        return resolve_jsonb_set_insert(scope, &lname, mode, args, agg, params);
+        let lax = lname == "jsonb_set_lax";
+        return resolve_jsonb_set_insert(scope, &lname, mode, lax, args, arg_names, agg, params);
     }
     // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
     // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
@@ -530,17 +531,20 @@ pub(crate) fn default_expr(lit: &str) -> Expr {
     Expr::Literal(Literal::Int(n))
 }
 
-/// Map a call's positional + named arguments onto a function's positional parameter slots,
-/// filling omitted trailing slots from `desc.arg_defaults` (PostgreSQL named notation + DEFAULTs,
-/// functions.md §11). Returns the positional `Expr` vector of length `desc.arity`. Errors: 42601 a
-/// positional arg after a named one (also caught at parse) or a duplicated name; 42883 an unknown
-/// parameter name, too many arguments, or a missing non-defaulted slot (no matching overload).
-pub(crate) fn normalize_named_args(
-    desc: &OperatorDesc,
+/// Place a call's positional + named arguments into a function's parameter slots by PostgreSQL's
+/// named-notation rules (functions.md §11): positional args fill their index in order; each named
+/// arg goes to its `param_names` slot (matched byte-exactly on the folded name). An unfilled slot is
+/// `None` — the caller fills it from a default or rejects it. Errors: 42601 a positional arg after a
+/// named one (also caught at parse) or a duplicated name; 42883 an unknown parameter name or too many
+/// arguments (no matching overload). Shared by the catalog path (`normalize_named_args`) and the
+/// hand-resolved named functions (`jsonb_set` / `jsonb_set_lax` / `jsonb_insert`).
+pub(crate) fn place_named_args(
+    fname: &str,
+    param_names: &[&str],
     args: &[Expr],
     arg_names: Option<&[Option<String>]>,
-) -> Result<Vec<Expr>> {
-    let arity = desc.arity as usize;
+) -> Result<Vec<Option<Expr>>> {
+    let arity = param_names.len();
     let mut slots: Vec<Option<Expr>> = vec![None; arity];
     let mut seen_named = false;
     for (i, a) in args.iter().enumerate() {
@@ -553,16 +557,16 @@ pub(crate) fn normalize_named_args(
                     ));
                 }
                 if i >= arity {
-                    return Err(no_func_overload(desc.name)); // too many positional arguments
+                    return Err(no_func_overload(fname)); // too many positional arguments
                 }
                 slots[i] = Some(a.clone());
             }
             Some(pn) => {
                 seen_named = true;
-                let idx = desc.arg_names.iter().position(|p| p == pn).ok_or_else(|| {
+                let idx = param_names.iter().position(|p| p == pn).ok_or_else(|| {
                     EngineError::new(
                         SqlState::UndefinedFunction,
-                        format!("function {} has no parameter named \"{pn}\"", desc.name),
+                        format!("function {fname} has no parameter named \"{pn}\""),
                     )
                 })?;
                 if slots[idx].is_some() {
@@ -575,6 +579,21 @@ pub(crate) fn normalize_named_args(
             }
         }
     }
+    Ok(slots)
+}
+
+/// Map a call's positional + named arguments onto a function's positional parameter slots,
+/// filling omitted trailing slots from `desc.arg_defaults` (PostgreSQL named notation + DEFAULTs,
+/// functions.md §11). Returns the positional `Expr` vector of length `desc.arity`. Errors: those of
+/// [`place_named_args`], plus 42883 for a missing non-defaulted slot (no matching overload).
+pub(crate) fn normalize_named_args(
+    desc: &OperatorDesc,
+    args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
+) -> Result<Vec<Expr>> {
+    let arity = desc.arity as usize;
+    debug_assert_eq!(desc.arg_names.len(), arity);
+    let slots = place_named_args(desc.name, desc.arg_names, args, arg_names)?;
     let first_defaulted = arity - desc.arg_defaults.len();
     let mut out = Vec::with_capacity(arity);
     for (i, slot) in slots.into_iter().enumerate() {
@@ -2069,8 +2088,10 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             if *kind == DeleteKind::Path { "#-" } else { "-" },
             arg,
         ),
-        RExpr::JsonSetInsert { mode, args } => explain_call(
-            if *mode == json::PathSetMode::Set {
+        RExpr::JsonSetInsert { mode, lax, args } => explain_call(
+            if *lax {
+                "jsonb_set_lax"
+            } else if *mode == json::PathSetMode::Set {
                 "jsonb_set"
             } else {
                 "jsonb_insert"

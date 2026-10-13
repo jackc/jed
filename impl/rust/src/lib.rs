@@ -998,6 +998,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_builders",
     // jsonb path-mutation builders (B1) — jsonb_set / jsonb_insert (json-sql-functions.md §2).
     "func.json_set",
+    // jsonb_set_lax — jsonb_set with a null_value_treatment for a SQL NULL value (§2).
+    "func.json_set_lax",
     // json/jsonb object-from-text-array builders (B1) — json[b]_object (json-sql-functions.md §2).
     "func.json_object",
     // the jsonpath scalar type (P1a) — literal + compile + canonical render (jsonpath.md).

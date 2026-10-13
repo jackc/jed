@@ -1421,6 +1421,20 @@ func jsonHasKey(node *JsonNode, key string) bool {
 // Mutation operators (`|| - #-`, spec/design/json-sql-functions.md §1, J6).
 // ---------------------------------------------------------------------------------------------
 
+// badNullValueTreatment is jsonb_set_lax's 22023 for a NULL or unrecognized null_value_treatment
+// (PostgreSQL's exact text).
+func badNullValueTreatment() *EngineError {
+	return newError(InvalidParameterValue, `null_value_treatment must be "delete_key", "return_target", "use_json_null", or "raise_exception"`)
+}
+
+// nullValueRaised is jsonb_set_lax's 22004 for a SQL NULL value under null_value_treatment =>
+// 'raise_exception', with PostgreSQL's Detail and Hint (error-fields.md §9.2, §11.4).
+func nullValueRaised() *EngineError {
+	return newError(NullValueNotAllowed, "JSON value must not be null").
+		withDetail(`Exception was raised because null_value_treatment is "raise_exception".`).
+		withHint("To avoid, either change the null_value_treatment argument or ensure that an SQL NULL is not passed.")
+}
+
 // cannotDelete builds the 22023 (invalid_parameter_value) error for an illegal delete target.
 func cannotDelete(msg string) *EngineError {
 	return newError(InvalidParameterValue, msg)
