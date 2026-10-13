@@ -3068,8 +3068,8 @@ volatility     = "stable"
 # MIDNIGHT and the TIMESTAMP field matrix applies (PG defines date_part(text, date) as a SQL
 # wrapper over ::timestamp) — so date_part('hour', a_date) is 0 where EXTRACT(hour FROM a_date)
 # is 0A000, matching PG exactly; a date beyond the timestamp range traps 22008 on the widen.
-# `julian` stays the deferred 0A000 EXTRACT carries (PG computes it — the same documented
-# divergence). The timestamptz overload decomposes in the SESSION zone (stable; the
+# `julian` is PG's own float8 formula, jd + seconds/86400.0 (not EXTRACT's numeric converted —
+# timezones.md §9.2), so it is PG's to the bit. The timestamptz overload decomposes in the SESSION zone (stable; the
 # zone-consulting fields charge one timezone unit, `epoch` does not — exactly EXTRACT's charging);
 # the other overloads are immutable, matching PG's catalog. NULL propagates.
 [[operator]]

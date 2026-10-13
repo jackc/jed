@@ -2833,6 +2833,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			default:
 				panic("resolver restricts date_part to date/ts/tstz/interval")
 			}
+			if field == "julian" && src.kind != srcIv {
+				// PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
+				f, err := datePartJulian(src.local)
+				if err != nil {
+					return Value{}, err
+				}
+				return Float64Value(f), nil
+			}
 			d, err := extractField(field, src)
 			if err != nil {
 				return Value{}, err

@@ -330,8 +330,8 @@ The three remaining date functions (each oracle-checked / corpus-pinned; the cap
   conversion. The `field` is a **runtime text value** validated per row at eval (`22023` /
   `0A000`, like `date_trunc`'s unit). The `date` overload **widens to midnight** and uses the
   *timestamp* field matrix — PG's own catalog definition — so `date_part('hour', d)` is `0`
-  where `EXTRACT(hour FROM d)` is `0A000`; `julian` stays EXTRACT's deferred `0A000` (ledgered —
-  PG computes it). The `timestamptz` overload decomposes in the session zone (stable); the
+  where `EXTRACT(hour FROM d)` is `0A000`; `date_part('julian', d)` is the day number as a float
+  (`EXTRACT(julian FROM d)` is the integer day number, `days + 2440588`). The `timestamptz` overload decomposes in the session zone (stable); the
   others are immutable.
 
 ### Still deferred

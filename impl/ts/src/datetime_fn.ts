@@ -8,6 +8,7 @@
 // PostgreSQL's BC-aware year numbering (no year 0); jed stores astronomical years (0 = 1 BC), so
 // toPgYear / fromPgYear convert at the boundary. The exact integer formulas are oracle-pinned.
 
+import { DATE_NEG_INFINITY, DATE_POS_INFINITY } from "./date.ts";
 import { Decimal } from "./decimal.ts";
 import { engineError } from "./errors.ts";
 import type { Interval } from "./interval.ts";
@@ -27,6 +28,8 @@ const MICROS_PER_HOUR = 3_600n * MICROS_PER_SEC;
 // 365.25 days/year * 86400 s/day = 31_557_600 s (integral — PG's interval-epoch year).
 const SECS_PER_INTERVAL_YEAR = 31_557_600n;
 const SECS_PER_INTERVAL_MONTH = 30n * SECS_PER_DAY;
+// The Julian Day number of 1970-01-01 (PG's UNIX_EPOCH_JDATE).
+const UNIX_EPOCH_JD = 2_440_588n;
 
 function floorDiv(a: bigint, b: bigint): bigint {
   const q = a / b;
@@ -205,6 +208,38 @@ export function dateTruncInterval(unit: string, iv: Interval): Interval {
   }
 }
 
+// julianParts splits wall-clock micros into the Julian Day number of its date (PG's date2j) and the
+// microseconds into that day.
+function julianParts(micros: bigint): [bigint, bigint] {
+  const days = floorDiv(micros, MICROS_PER_DAY);
+  return [days + UNIX_EPOCH_JD, micros - days * MICROS_PER_DAY];
+}
+
+// extractJulian is EXTRACT(julian FROM timestamp) over finite wall-clock micros: the Julian Day
+// number plus the fraction of the day, exactly as PG's numeric path computes it — jd +
+// (time-of-day micros / 86400000000), the division at numeric's select_div_scale.
+function extractJulian(micros: bigint): Decimal {
+  const [jd, todUs] = julianParts(micros);
+  const frac = Decimal.fromBigInt(todUs).div(Decimal.fromBigInt(MICROS_PER_DAY));
+  return Decimal.fromBigInt(jd).add(frac);
+}
+
+// datePartJulian is date_part('julian', timestamp) over wall-clock micros — PG's float8 formula
+// verbatim (jd + (seconds + fsec/1e6) / 86400.0, not the numeric value rounded), so the result is
+// PG's to the bit. An infinite source traps like every other field (22003).
+export function datePartJulian(micros: bigint): number {
+  if (micros === POS_INFINITY || micros === NEG_INFINITY) {
+    throw engineError(
+      "numeric_value_out_of_range",
+      "cannot extract field from an infinite timestamp",
+    );
+  }
+  const [jd, todUs] = julianParts(micros);
+  const secs = todUs / MICROS_PER_SEC;
+  const fsec = todUs % MICROS_PER_SEC;
+  return Number(jd) + (Number(secs) + Number(fsec) / 1000000.0) / Number(SECS_PER_DAY);
+}
+
 // ExtractSrc is the source value of an EXTRACT(field FROM source). For a timestamptz the caller
 // supplies the wall-clock `local` micros (already converted into the session zone), the raw
 // `instant` (for `epoch`), and the zone `offsetSecs` (for the timezone* fields); for a timestamp
@@ -216,7 +251,7 @@ export type ExtractSrc =
   | { kind: "interval"; iv: Interval };
 
 // extractField returns EXTRACT(field FROM source) as numeric. An unsupported field for the type is
-// 0A000; an unrecognized field is 22023; julian is a deferred field (0A000).
+// 0A000; an unrecognized field is 22023.
 export function extractField(field: string, src: ExtractSrc): Decimal {
   const f = field.toLowerCase();
   switch (src.kind) {
@@ -300,7 +335,7 @@ function extractDatetime(
       return Decimal.fromBigInt((offsetSecs % 3600n) / 60n);
     }
     case "julian":
-      throw engineError("feature_not_supported", 'unit "julian" not supported yet (jed deferred)');
+      return extractJulian(micros);
     default:
       throw engineError(
         "invalid_parameter_value",
@@ -310,6 +345,11 @@ function extractDatetime(
 }
 
 function extractDate(field: string, days: bigint): Decimal {
+  if (days === DATE_POS_INFINITY || days === DATE_NEG_INFINITY) {
+    // As for an infinite timestamp: jed's decimal is finite-only, so 22003 where PG returns
+    // ±Infinity or NULL (timezones.md §9.2).
+    throw engineError("numeric_value_out_of_range", "cannot extract field from an infinite date");
+  }
   const [y, mo, d] = civilFromDays(days);
   switch (field) {
     case "day":
@@ -338,6 +378,8 @@ function extractDate(field: string, days: bigint): Decimal {
       return Decimal.fromBigInt(toPgYear(isoWeekYear(y, mo, d)[1]));
     case "epoch":
       return Decimal.fromBigInt(days * SECS_PER_DAY);
+    case "julian":
+      return Decimal.fromBigInt(days + UNIX_EPOCH_JD);
     case "microseconds":
     case "milliseconds":
     case "second":
@@ -346,7 +388,6 @@ function extractDate(field: string, days: bigint): Decimal {
     case "timezone":
     case "timezone_hour":
     case "timezone_minute":
-    case "julian":
       throw engineError("feature_not_supported", `unit "${field}" not supported for type date`);
     default:
       throw engineError("invalid_parameter_value", `unit "${field}" not recognized for type date`);

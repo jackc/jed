@@ -2348,6 +2348,19 @@ impl RExpr {
                                 "resolver restricts date_part to date/ts/tstz/interval"
                             ),
                         };
+                        if field == "julian" {
+                            // PG's float8 julian formula, not the numeric value converted
+                            // (timezones.md §9.2).
+                            match src {
+                                ExtractSrc::Timestamp(local)
+                                | ExtractSrc::Timestamptz { local, .. } => {
+                                    return Ok(Value::Float64(
+                                        crate::datetime_fn::date_part_julian(local)?,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
                         let d = crate::datetime_fn::extract_field(&field, src)?;
                         decimal_to_float(&d, ScalarType::Float64)
                     }

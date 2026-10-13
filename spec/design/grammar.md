@@ -3222,12 +3222,13 @@ SELECT (tstz)::date                                          -- cross-family cas
   only when `EXTRACT` is immediately followed by `(` (a one-token lookahead, §8; `EXTRACT` stays usable as
   a column / function name otherwise). It is validated at **resolve** time.
 - **Result type.** `EXTRACT` → `numeric` (PG 14+, matchable exactly; jed has exact `decimal`). The
-  function spelling `date_part('field', src)` is **deferred** — PG defines it to return `double
-  precision`, and jed has no `float` type ([timezones.md §9.2](timezones.md)).
+  function spelling `date_part('field', src)` returns `double precision`
+  ([timezones.md §9.2](timezones.md)).
 - **Source types & field validity.** `source` is `timestamp` / `timestamptz` / `date` / `interval` (any
   other → `42883`). The field-validity matrix matches PG ([timezones.md §9.2](timezones.md)): an
   unsupported field for the source type is **`0A000`** (e.g. `EXTRACT(hour FROM date)`), an unrecognized
-  field is **`22023`**. `julian` is a documented deferred field (`0A000`). For a `timestamptz` source
+  field is **`22023`**. `julian` is the Julian Day (date: the integer day number; timestamp: plus the
+  exact fraction of the day). For a `timestamptz` source
   every field is computed **in the session zone** except `epoch` (the instant).
 - **`date_trunc`.** `date_trunc(unit, source)` (2-arg) over `timestamp` / `timestamptz` / `interval`,
   plus `date_trunc(unit, timestamptz, zone)` (3-arg) — `unit` is a runtime `text` value (case-

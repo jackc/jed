@@ -4,11 +4,10 @@
 //! datetime_cast}.test` and runs on every core; these per-core tests cover only what the oracle
 //! corpus CANNOT express (CLAUDE.md §10) — the cases where jed deliberately differs from PG:
 //!
-//!   * `EXTRACT(julian …)` — jed defers the field (`0A000`); PG returns a value (timezones.md §9.2).
-//!   * `date_part('field', …)` — jed has no such function (`42883`); PG returns `double precision`,
-//!     and jed has no `float` type, so the function is deferred (timezones.md §9.2).
-//!   * `EXTRACT(field FROM ±infinity)` — jed's decimal is finite-only, so it traps `22003`; PG
-//!     returns numeric `±Infinity` (timezones.md §9.2).
+//!   * `EXTRACT(field FROM ±infinity)` (timestamp, timestamptz, or date) — jed's decimal is
+//!     finite-only, so it traps `22003`; PG returns numeric `±Infinity` (or NULL for an oscillating
+//!     field). `date_part` follows EXTRACT (`22003` where PG returns float `±Infinity`)
+//!     (timezones.md §9.2).
 //!   * a non-datetime, non-text source to a datetime target — jed `42804` (PG `42846`)
 //!     (timezones.md §9.3, casts.toml).
 
@@ -21,44 +20,8 @@ fn err_code(db: &mut Session, sql: &str) -> String {
     }
 }
 
-/// EXTRACT(julian …) is a deferred field on every type: jed 0A000, PG returns a value.
-#[test]
-fn extract_julian_is_deferred() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        err_code(
-            &mut db,
-            "SELECT EXTRACT(julian FROM timestamp '2024-03-15 00:00:00')"
-        ),
-        "0A000"
-    );
-    assert_eq!(
-        err_code(&mut db, "SELECT EXTRACT(julian FROM date '2024-03-15')"),
-        "0A000"
-    );
-}
-
-/// date_part has LANDED (suites/expr/date_part.test); `julian` stays EXTRACT's deferred field on
-/// it too — 0A000 where PG computes a value (the documented divergence the oracle_overrides
-/// ledger records; the timestamp overload cannot live in the PG-clean corpus).
-#[test]
-fn date_part_julian_is_deferred() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        err_code(
-            &mut db,
-            "SELECT date_part('julian', timestamp '2024-03-15 13:00:00')"
-        ),
-        "0A000"
-    );
-}
-
-/// EXTRACT over an infinite timestamp traps 22003 (jed's decimal is finite-only); PG returns
-/// numeric ±Infinity.
+/// EXTRACT (and date_part) over an infinite timestamp/timestamptz/date traps 22003 (jed's decimal
+/// is finite-only); PG returns ±Infinity (or NULL for an oscillating field).
 #[test]
 fn extract_from_infinity_traps() {
     let mut db = Database::create(CreateOptions::default())
@@ -75,6 +38,17 @@ fn extract_from_infinity_traps() {
         ),
         "22003"
     );
+    for sql in [
+        "SELECT EXTRACT(julian FROM timestamp 'infinity')",
+        "SELECT EXTRACT(julian FROM date '-infinity')",
+        "SELECT EXTRACT(year FROM date 'infinity')",
+        "SELECT EXTRACT(day FROM date '-infinity')",
+        "SELECT date_part('julian', timestamp '-infinity')",
+        "SELECT date_part('julian', timestamptz 'infinity')",
+        "SELECT date_part('julian', date 'infinity')",
+    ] {
+        assert_eq!(err_code(&mut db, sql), "22003", "{sql}");
+    }
 }
 
 /// A non-datetime source to a datetime target is a forbidden pair in jed (42804; PG 42846). The

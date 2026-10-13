@@ -1,0 +1,265 @@
+# EXTRACT(julian FROM …) and date_part('julian', …) — the Julian Day of a date / timestamp /
+# timestamptz (spec/design/timezones.md §9.2), ported from PostgreSQL 18's date.c extract_date and
+# timestamp.c timestamp_part_common. EXTRACT over a date is the integer Julian Day number; over a
+# timestamp it is that number plus the fraction of the day as numeric — jd + (time-of-day micros /
+# 86400000000), the division at numeric's select_div_scale, so the scale follows PG (28 digits at
+# midnight, 20 at noon). A timestamptz is decomposed in the SESSION zone (local midnight is .0).
+# date_part returns PG's float8 formula (jd + seconds/86400.0); its date overload widens to midnight.
+# julian of an interval is 0A000. Oracle-checked against postgres:18. (±infinity — jed 22003, PG
+# ±Infinity — is a per-core divergence test, not here: the oracle corpus is PG-clean.)
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, expr.extract, func.date_part, session.timezone, resource.cost_metering
+# load-timezone: America/New_York
+# load-timezone: Asia/Kolkata
+# load-timezone: Australia/Lord_Howe
+
+# --- EXTRACT over a date: the integer Julian Day number ------------------------
+
+query D nosort
+SELECT EXTRACT(julian FROM DATE '2024-01-15')
+----
+2460325
+
+query D nosort
+SELECT EXTRACT(julian FROM DATE '1970-01-01')
+----
+2440588
+
+query D nosort
+SELECT EXTRACT(julian FROM DATE '2000-01-01')
+----
+2451545
+
+# the Julian epoch (day 0), the last BC day, the first AD day, and the date range's top
+query DDDD nosort
+SELECT EXTRACT(julian FROM DATE '4714-11-24 BC'), EXTRACT(julian FROM DATE '0001-12-31 BC'), EXTRACT(julian FROM DATE '0001-01-01'), EXTRACT(julian FROM DATE '5874897-12-31')
+----
+0
+1721425
+1721426
+2147483493
+
+query D nosort
+SELECT EXTRACT(julian FROM DATE '1000-03-01 BC')
+----
+1356242
+
+# --- EXTRACT over a timestamp: day number + exact fraction of the day ----------
+
+# midnight: a zero fraction still carries numeric's division scale
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2000-01-01 00:00:00')
+----
+2451545.0000000000000000000000000000
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2000-01-01 12:00:00')
+----
+2451545.50000000000000000000
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2000-01-01 06:00:00')
+----
+2451545.25000000000000000000
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2000-01-01 00:00:00.000001')
+----
+2451545.0000000000115740740740740741
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2000-01-01 23:59:59.999999')
+----
+2451545.99999999998842592593
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2024-03-15 13:47:23.456789')
+----
+2460385.57457704616898148148
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2024-03-15 00:00:01')
+----
+2460385.000011574074074074074074
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '2024-03-15 08:00:00')
+----
+2460385.33333333333333333333
+
+# BC timestamps, the Julian epoch, and near the top of jed's timestamp range (jed's i64-microsecond
+# range ends in 294247 AD, before PG's 294276 — timestamp.md §1)
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '4714-11-24 00:00:00 BC')
+----
+0.0000000000000000000000000000
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '4714-11-24 18:30:00 BC')
+----
+0.77083333333333333333
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '0001-12-31 21:00:00 BC')
+----
+1721425.87500000000000000000
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '0044-03-15 10:15:00.5 BC')
+----
+1705428.42708912037037037037
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMP '294000-12-31 23:59:59.999999')
+----
+109102720.99999999998842592593
+
+# the field is case-insensitive and may be a string literal
+query DD nosort
+SELECT EXTRACT(JULIAN FROM TIMESTAMP '2024-03-15 18:00:00'), EXTRACT('julian' FROM DATE '2024-03-15')
+----
+2460385.75000000000000000000
+2460385
+
+# a NULL source is NULL
+query D nosort
+SELECT EXTRACT(julian FROM CAST(NULL AS timestamp))
+----
+NULL
+
+# --- EXTRACT over a timestamptz: the day and fraction in the SESSION zone ------
+
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMPTZ '2000-01-01 00:00:00+00')
+----
+2451545.0000000000000000000000000000
+
+# 00:00 UTC is 19:00 the previous day in New York (EST -05)
+# timezone: America/New_York
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMPTZ '2000-01-01 00:00:00+00')
+----
+2451544.79166666666666666667
+
+# 18:30 UTC is 00:00 the next day in Kolkata (+05:30): local midnight is .0
+# timezone: Asia/Kolkata
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMPTZ '2024-03-14 18:30:00+00')
+----
+2460385.0000000000000000000000000000
+
+# timezone: Asia/Kolkata
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMPTZ '2024-03-15 02:30:00.25+00')
+----
+2460385.33333622685185185185
+
+# across a DST change: 2024-03-10 07:30 UTC is 03:30 EDT
+# timezone: America/New_York
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMPTZ '2024-03-10 07:30:00+00')
+----
+2460380.14583333333333333333
+
+# timezone: Australia/Lord_Howe
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMPTZ '2024-12-31 11:00:00+00')
+----
+2460676.91666666666666666667
+
+# a BC instant under a zone whose LMT offset is not a whole minute
+# timezone: America/New_York
+query D nosort
+SELECT EXTRACT(julian FROM TIMESTAMPTZ '1000-06-15 12:00:00+00 BC')
+----
+1356348.29442129629629629630
+
+# --- julian of an interval is 0A000 --------------------------------------------
+
+statement error 0A000
+SELECT EXTRACT(julian FROM INTERVAL '3 days')
+
+statement error 0A000
+SELECT date_part('julian', INTERVAL '3 days')
+
+# --- date_part: PG's float8 formula --------------------------------------------
+
+# cost: 2
+query R nosort
+SELECT date_part('julian', TIMESTAMP '2000-01-01 13:00:00')
+----
+2451545.5416666665
+
+query R nosort
+SELECT date_part('julian', TIMESTAMP '2024-03-15 13:47:23.456789')
+----
+2460385.574577046
+
+query R nosort
+SELECT date_part('julian', TIMESTAMP '2000-01-01 00:00:00.000001')
+----
+2451545
+
+query R nosort
+SELECT date_part('julian', TIMESTAMP '0044-03-15 10:15:00.5 BC')
+----
+1705428.4270891203
+
+query R nosort
+SELECT date_part('julian', TIMESTAMP '4714-11-24 06:00:00 BC')
+----
+0.25
+
+query R nosort
+SELECT date_part('julian', TIMESTAMP '294000-12-31 23:59:59.999999')
+----
+109102721
+
+# the date overload widens to midnight: the whole Julian Day number
+query R nosort
+SELECT date_part('julian', DATE '2024-01-15')
+----
+2460325
+
+query R nosort
+SELECT date_part('JULIAN', DATE '0001-12-31 BC')
+----
+1721425
+
+query R nosort
+SELECT date_part('julian', TIMESTAMPTZ '2000-01-01 00:00:00+00')
+----
+2451545
+
+# timezone: America/New_York
+query R nosort
+SELECT date_part('julian', TIMESTAMPTZ '2000-01-01 00:00:00+00')
+----
+2451544.7916666665
+
+# timezone: Asia/Kolkata
+query R nosort
+SELECT date_part('julian', TIMESTAMPTZ '2024-03-15 02:30:00.25+00')
+----
+2460385.3333362266
+
+# --- over a column ---------------------------------------------------------------
+
+statement ok
+CREATE TABLE jt (id i32 PRIMARY KEY, ts timestamp, d date)
+
+statement ok
+INSERT INTO jt VALUES (1, TIMESTAMP '2024-03-15 06:00:00', DATE '2024-03-15'), (2, TIMESTAMP '1999-12-31 18:00:00', DATE '0001-01-01 BC'), (3, NULL, NULL)
+
+query DDR nosort
+SELECT EXTRACT(julian FROM ts), EXTRACT(julian FROM d), date_part('julian', ts) FROM jt ORDER BY id
+----
+2460385.25000000000000000000
+2460385
+2460385.25
+2451544.75000000000000000000
+1721060
+2451544.75
+NULL
+NULL
+NULL

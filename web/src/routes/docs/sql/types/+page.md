@@ -462,6 +462,11 @@ Over an `interval`, `EXTRACT` reads its separate fields, each keeping its sign: 
 from the months, `day`/`week` from the days, `hour`/`minute`/`second` from the time, and `epoch` counts
 a year as 365.25 days and a month as 30.
 
+`EXTRACT(julian FROM value)` is the Julian Day: over a `date` the day number (`2000-01-01` is
+`2451545`), and over a `timestamp` / `timestamptz` the day number plus the exact fraction of the
+(session-local) day, at PostgreSQL's numeric scale — `EXTRACT(julian FROM timestamp '2000-01-01
+12:00')` is `2451545.50000000000000000000`.
+
 `date_part(field, source)` is the `double precision` twin of `EXTRACT` — same fields, but the field
 name is a runtime string, and over a `date` the timestamp fields exist (`date_part('hour', d)` is
 `0`), exactly as in PostgreSQL. (A runtime `text` value casts to every datetime type, and every

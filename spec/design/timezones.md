@@ -383,8 +383,9 @@ correctly-rounded parse — the `R` tolerant render applies). Its `field` is a *
 unrecognized / `0A000` unsupported, zero rows raise nothing). Its **`date` overload widens to
 midnight** and uses the *timestamp* matrix below — PG's own catalog definition (`date_part(text,
 date)` is a SQL wrapper over `::timestamp`), so `date_part('hour', d)` is `0` where `EXTRACT(hour
-FROM d)` is `0A000` and the `0A000` message names the widened type; `julian` stays the deferred
-`0A000` below (ledgered — PG computes it). Its `timestamptz` overload decomposes in the session
+FROM d)` is `0A000` and the `0A000` message names the widened type. `julian` is the one field not
+converted from EXTRACT's decimal: it is PG's own float8 formula, `jd + (seconds + fsec/1e6) / 86400.0`
+(`timestamp_part_common`), so the value is PostgreSQL's to the bit. Its `timestamptz` overload decomposes in the session
 zone (volatility **stable**, matching PG; EXTRACT's selective `timezone` charge); the
 date/timestamp/interval overloads are **immutable** (suites/expr/date_part.test, oracle-checked).
 
@@ -401,12 +402,21 @@ interval)` → `0A000`, etc.):
 | `dow` `isodow` `doy` `isoyear` | ✓ | ✓ | `0A000` |
 | `epoch` | ✓ | ✓ | ✓ |
 | `timezone` `timezone_hour` `timezone_minute` | tstz ✓ / ts `0A000` | `0A000` | `0A000` |
-| `julian` | **`0A000` (deferred)** | **`0A000` (deferred)** | `0A000` |
+| `julian` | ✓ | ✓ | `0A000` |
 
 An unsupported field-for-type is **`0A000`** (`feature_not_supported`, PG's "unit X not supported for
 type Y"); an **unrecognized** field name is **`22023`** (PG's "unit X not recognized for type Y").
-`julian` is a **deferred** field on all types (PG supports it on date/timestamp; for timestamp it is a non-terminating
-decimal whose exact scale is PG-internal — a documented divergence, revisit if needed). Field formulas:
+`julian` is the Julian Day (PG's `date2j`; 4714-11-24 BC is day 0, 1970-01-01 is 2440588). Over a `date` it
+is the integer day number, `days + 2440588`. Over a `timestamp` it adds the fraction of the day, computed
+as PostgreSQL's numeric path does: `jd + (time-of-day µs / 86400000000)`, the division at numeric's
+`select_div_scale` ([decimal.md §4](decimal.md)) — so the scale is PG's (`.0000000000000000000000000000`,
+28 digits, at midnight; 20 at noon; `2000-01-01 00:00:00.000001` is
+`2451545.0000000000115740740740740741`). A `timestamptz` decomposes in the session zone like every other
+wall-clock field, so local midnight is `.0` (oracle-checked in `suites/expr/extract_julian.test`).
+`EXTRACT` of **any** field from an infinite `timestamp`, `timestamptz`, or `date` is `22003` ("cannot
+extract field from an infinite timestamp" / "… date") — jed's `decimal` is finite-only, where PG returns
+`±Infinity` for a monotonic field (`year`, `epoch`, `julian`, …) or NULL for an oscillating one;
+`date_part` follows `EXTRACT` (a documented divergence, per-core tested). Field formulas:
 `second`/`milliseconds`/`microseconds` carry the fractional seconds (exact decimal); an `interval`'s
 fields follow PG's `interval_part_common` — its months/days/micros decompose independently, each keeping
 its own sign (`year = months/12`, `month = months%12`, truncating; `week = days/7`; `hour` = whole hours of
@@ -648,10 +658,8 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   every `timestamptz` → text renders in (§9.5): the `::text` cast, `array → text`, and a result cell
   through the host's session render. The canonical value render stays zone-free (UTC), and EXPLAIN
   keeps that canonical spelling (a documented divergence, §9.5).
-- **`date_part` and `julian` excluded by jed's type system.** `date_part` returns `double precision` and
-  jed has no `float` type (§9.2); `EXTRACT(julian …)` on a timestamp is a non-terminating PG-internal
-  decimal (§9.2) — both deferred, documented divergences (a `date` argument to `date_trunc`/an implicit
-  `date`→`timestamp` cast is `42883`, §9.1).
+- **`date_part` and `julian` have landed** (§9.2). A `date` argument to `date_trunc` / an implicit
+  `date`→`timestamp` cast is `42883` (§9.1).
 
 **Resolved at implementation (Slice 1/2):**
 

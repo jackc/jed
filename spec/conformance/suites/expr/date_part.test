@@ -9,8 +9,7 @@
 # date_part(text, date) as a SQL wrapper over ::timestamp), so date_part('hour', a_date) is 0
 # where EXTRACT(hour FROM a_date) is 0A000 — matching PG exactly. The timestamptz overload
 # decomposes in the SESSION zone (here the default UTC). Oracle-checked against postgres:18;
-# `julian` (0A000, the deferred EXTRACT field — PG computes it) is a documented divergence kept
-# OUT of this oracle file (per-core date_part tests).
+# `julian` (PG's own float8 formula, not the numeric value converted) is in extract_julian.test.
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.derived_table, query.where_eq, query.order_by, types.i32, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.text, func.date_part, resource.cost_metering
 
@@ -167,11 +166,6 @@ SELECT date_part('dow', INTERVAL '1 day')
 # an unrecognized unit over an interval is 22023 too
 statement error 22023
 SELECT date_part('nosuch', INTERVAL '1 day')
-
-# julian stays EXTRACT's deferred field (0A000 — PG computes it; the documented divergence the
-# oracle_overrides ledger records)
-statement error 0A000
-SELECT date_part('julian', DATE '2024-01-15')
 
 # ... and over zero rows the per-row validation never fires
 statement ok

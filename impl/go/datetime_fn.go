@@ -24,6 +24,8 @@ const (
 	// 365.25 days/year * 86400 s/day = 31_557_600 s (integral — PG's interval-epoch year).
 	secsPerIntervalYear  int64 = 31_557_600
 	secsPerIntervalMonth int64 = 30 * secsPerDayDT
+	// unixEpochJD is the Julian Day number of 1970-01-01 (PG's UNIX_EPOCH_JDATE).
+	unixEpochJD int64 = 2_440_588
 )
 
 // toPgYear converts an astronomical year (0 = 1 BC) to PostgreSQL's year numbering (no year 0;
@@ -220,6 +222,38 @@ func dateTruncInterval(unit string, iv Interval) (Interval, error) {
 	}
 }
 
+// julianParts splits wall-clock micros into the Julian Day number of its date (PG's date2j) and
+// the microseconds into that day.
+func julianParts(micros int64) (jd, todUs int64) {
+	days := floorDiv(micros, microsPerDayDT)
+	return days + unixEpochJD, micros - days*microsPerDayDT
+}
+
+// extractJulian is EXTRACT(julian FROM timestamp) over finite wall-clock micros: the Julian Day
+// number plus the fraction of the day, exactly as PG's numeric path computes it — jd +
+// (time-of-day micros / 86400000000), the division at numeric's select_div_scale.
+func extractJulian(micros int64) (Decimal, error) {
+	jd, todUs := julianParts(micros)
+	frac, err := decimalFromInt64(todUs).Div(decimalFromInt64(microsPerDayDT))
+	if err != nil {
+		return Decimal{}, err
+	}
+	return decimalFromInt64(jd).Add(frac)
+}
+
+// datePartJulian is date_part('julian', timestamp) over wall-clock micros — PG's float8 formula
+// verbatim (jd + (seconds + fsec/1e6) / 86400.0, not the numeric value rounded), so the result is
+// PG's to the bit. An infinite source traps like every other field (22003).
+func datePartJulian(micros int64) (float64, error) {
+	if micros == posInfinity || micros == negInfinity {
+		return 0, newError(NumericValueOutOfRange, "cannot extract field from an infinite timestamp")
+	}
+	jd, todUs := julianParts(micros)
+	secs := todUs / microsPerSecDT
+	fsec := todUs % microsPerSecDT
+	return float64(jd) + (float64(secs)+float64(fsec)/1000000.0)/float64(secsPerDayDT), nil
+}
+
 // extractSrc is the source value of an EXTRACT(field FROM source). For a timestamptz the caller
 // supplies the wall-clock Local micros (already converted into the session zone), the raw Instant
 // (for `epoch`), and the zone OffsetSecs (for the timezone* fields); for a timestamp only the wall
@@ -241,7 +275,7 @@ const (
 )
 
 // extractField returns EXTRACT(field FROM source) as numeric. An unsupported field for the type is
-// 0A000; an unrecognized field is 22023; julian is a deferred field (0A000).
+// 0A000; an unrecognized field is 22023.
 func extractField(field string, src extractSrc) (Decimal, error) {
 	f := strings.ToLower(field)
 	switch src.kind {
@@ -322,7 +356,7 @@ func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs 
 			return decimalFromInt64((offsetSecs % 3600) / 60), nil
 		}
 	case "julian":
-		return Decimal{}, newError(FeatureNotSupported, "unit \"julian\" not supported yet (jed deferred)")
+		return extractJulian(micros)
 	default:
 		typ := "timestamp without time zone"
 		if isTz {
@@ -333,6 +367,11 @@ func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs 
 }
 
 func extractDate(field string, days int64) (Decimal, error) {
+	if days == int64(datePosInfinity) || days == int64(dateNegInfinity) {
+		// As for an infinite timestamp: jed's decimal is finite-only, so 22003 where PG returns
+		// ±Infinity or NULL (timezones.md §9.2).
+		return Decimal{}, newError(NumericValueOutOfRange, "cannot extract field from an infinite date")
+	}
 	y, mo, d := civilFromDays(days)
 	switch field {
 	case "day":
@@ -363,8 +402,10 @@ func extractDate(field string, days int64) (Decimal, error) {
 		return decimalFromInt64(toPgYear(iy)), nil
 	case "epoch":
 		return decimalFromInt64(days * secsPerDayDT), nil
+	case "julian":
+		return decimalFromInt64(days + unixEpochJD), nil
 	case "microseconds", "milliseconds", "second", "minute", "hour",
-		"timezone", "timezone_hour", "timezone_minute", "julian":
+		"timezone", "timezone_hour", "timezone_minute":
 		return Decimal{}, newError(FeatureNotSupported, "unit \""+field+"\" not supported for type date")
 	default:
 		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized for type date")

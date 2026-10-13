@@ -27,6 +27,8 @@ const MICROS_PER_HOUR: i64 = 3_600 * MICROS_PER_SEC;
 // 365.25 days/year * 86400 s/day = 31_557_600 s (integral — PG's interval-epoch year).
 const SECS_PER_INTERVAL_YEAR: i64 = 31_557_600;
 const SECS_PER_INTERVAL_MONTH: i64 = 30 * SECS_PER_DAY; // PG's interval-epoch 30-day month.
+/// The Julian Day number of 1970-01-01 (PG's `UNIX_EPOCH_JDATE`).
+const UNIX_EPOCH_JD: i64 = 2_440_588;
 
 fn feature(detail: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::FeatureNotSupported, detail.into())
@@ -222,9 +224,40 @@ pub enum ExtractSrc {
     Interval(Interval),
 }
 
+/// Split wall-clock micros into the Julian Day number of its date (PG's `date2j`) and the
+/// microseconds into that day.
+fn julian_parts(micros: i64) -> (i64, i64) {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    (days + UNIX_EPOCH_JD, micros - days * MICROS_PER_DAY)
+}
+
+/// `EXTRACT(julian FROM timestamp)` over finite wall-clock micros: the Julian Day number plus the
+/// fraction of the day, exactly as PG's numeric path computes it — `jd + (time-of-day micros /
+/// 86400000000)`, the division at numeric's `select_div_scale`.
+fn extract_julian(micros: i64) -> Result<Decimal> {
+    let (jd, tod_us) = julian_parts(micros);
+    let frac = Decimal::from_i64(tod_us).div(&Decimal::from_i64(MICROS_PER_DAY))?;
+    Decimal::from_i64(jd).add(&frac)
+}
+
+/// `date_part('julian', timestamp)` over wall-clock micros — PG's float8 formula verbatim
+/// (`jd + (seconds + fsec/1e6) / 86400.0`, not the numeric value rounded), so the result is PG's to
+/// the bit. An infinite source traps like every other field (`22003`).
+pub fn date_part_julian(micros: i64) -> Result<f64> {
+    if micros == POS_INFINITY || micros == NEG_INFINITY {
+        return Err(EngineError::new(
+            SqlState::NumericValueOutOfRange,
+            "cannot extract field from an infinite timestamp",
+        ));
+    }
+    let (jd, tod_us) = julian_parts(micros);
+    let secs = tod_us / MICROS_PER_SEC;
+    let fsec = tod_us % MICROS_PER_SEC;
+    Ok(jd as f64 + (secs as f64 + fsec as f64 / 1000000.0) / SECS_PER_DAY as f64)
+}
+
 /// `EXTRACT(field FROM source)` → `numeric`. The field-validity matrix matches PostgreSQL: an
-/// unsupported field for the source type is `0A000`, an unrecognized field is `22023`. `julian` is a
-/// deferred field on every type (`0A000`). For a `timestamptz` source every field is computed in the
+/// unsupported field for the source type is `0A000`, an unrecognized field is `22023`. For a `timestamptz` source every field is computed in the
 /// (already-applied) session zone except `epoch` (the instant) and the `timezone*` fields (the zone
 /// offset).
 pub fn extract_field(field: &str, src: ExtractSrc) -> Result<Decimal> {
@@ -291,11 +324,7 @@ fn extract_datetime(field: &str, micros: i64, tz: Option<(i64, i64)>) -> Result<
                 )));
             }
         },
-        "julian" => {
-            return Err(feature(
-                "unit \"julian\" not supported yet (jed deferred)".to_string(),
-            ));
-        }
+        "julian" => extract_julian(micros)?,
         _ => {
             return Err(invalid_param(format!(
                 "unit \"{field}\" not recognized for type {}",
@@ -317,6 +346,14 @@ fn extract_datetime_tz(field: &str, local: i64, instant: i64, offset_secs: i64) 
 /// `EXTRACT(field FROM date)`: the calendar fields only — the time fields (`hour`/`minute`/… and
 /// `timezone*`) are `0A000` (PG: "unit X not supported for type date"). `epoch` is `days * 86400`.
 fn extract_date(field: &str, days: i32) -> Result<Decimal> {
+    if days == crate::date::POS_INFINITY || days == crate::date::NEG_INFINITY {
+        // As for an infinite timestamp: jed's decimal is finite-only, so 22003 where PG returns
+        // ±Infinity or NULL (timezones.md §9.2).
+        return Err(EngineError::new(
+            SqlState::NumericValueOutOfRange,
+            "cannot extract field from an infinite date",
+        ));
+    }
     let days = days as i64;
     let (y, mo, d) = civil_from_days(days);
     let v = match field {
@@ -333,8 +370,9 @@ fn extract_date(field: &str, days: i32) -> Result<Decimal> {
         "doy" => Decimal::from_i64(days - days_from_civil(y, 1, 1) + 1),
         "isoyear" => Decimal::from_i64(to_pg_year(iso_week_year(y, mo, d).1)),
         "epoch" => Decimal::from_i64(days * SECS_PER_DAY),
+        "julian" => Decimal::from_i64(days + UNIX_EPOCH_JD),
         "microseconds" | "milliseconds" | "second" | "minute" | "hour" | "timezone"
-        | "timezone_hour" | "timezone_minute" | "julian" => {
+        | "timezone_hour" | "timezone_minute" => {
             return Err(feature(format!(
                 "unit \"{field}\" not supported for type date"
             )));

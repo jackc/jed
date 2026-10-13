@@ -210,7 +210,7 @@ import {
   renderTimestamptzIn,
   resolveZone,
 } from "./timezone.ts";
-import { dateTruncInterval, dateTruncMicros, extractField } from "./datetime_fn.ts";
+import { dateTruncInterval, dateTruncMicros, datePartJulian, extractField } from "./datetime_fn.ts";
 import type { ZoneRef } from "./timezone.ts";
 import type { ExtractSrc } from "./datetime_fn.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
@@ -1376,6 +1376,10 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           }
         } else {
           throw new Error("unreachable: resolver restricts date_part to date/ts/tstz/interval");
+        }
+        if (field === "julian" && src.kind !== "interval") {
+          // PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
+          return float64Value(datePartJulian(src.kind === "ts" ? src.micros : src.local));
         }
         const d = extractField(field, src);
         const f = Number(d.render());

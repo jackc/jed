@@ -636,9 +636,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The field is a RUNTIME text value validated per row (22023 unrecognized / 0A000
   // unsupported-for-type, at evaluation like date_trunc's unit). The date overload widens to
   // midnight and uses the TIMESTAMP matrix (PG's own definition — 'hour' is 0 where EXTRACT
-  // over a date is 0A000); julian stays EXTRACT's deferred 0A000 (a documented divergence —
-  // PG computes it). The timestamptz overload decomposes in the session zone (stable; EXTRACT's
-  // selective timezone charge); the others are immutable.
+  // over a date is 0A000); julian is PG's float8 formula. The timestamptz overload decomposes
+  // in the session zone (stable; EXTRACT's selective timezone charge); the others are immutable.
   "func.date_part",
   // The COLLATE expression operator + ORDER BY … COLLATE over a VENDORED collation (collation slice
   // 1c, spec/design/collation.md §14): a vendored collation orders text by its UCA sort key in the
@@ -658,7 +657,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "expr.at_time_zone",
   // The tz conversion surface (spec/design/timezones.md §9): date_trunc / EXTRACT / the cross-family
   // datetime casts, all consuming the session time_zone slot (the zone a timestamptz is decomposed
-  // in). date_part / julian / text-casts / make_timestamptz deferred; rendering stays UTC (§9.5).
+  // in). date_part / julian / text-casts / make_timestamptz landed since; rendering stays UTC (§9.5).
   "expr.date_trunc",
   "expr.extract",
   "cast.datetime",
