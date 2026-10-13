@@ -338,16 +338,18 @@ JSON object per line, keys in exactly this order, no whitespace, hashes as 16 lo
 {"i":N,"op":"rollback","sid":S}   {"i":N,"op":"close","sid":S}
 {"i":N,"op":OP,"sid":S,"skip":true}                          the session no longer exists
 {"i":N,"op":"fault","kind":K}   {"i":N,"op":"clock"}
-{"i":N,"op":"check","version":V,"digest":D,"live":L,"pages":P,"free":F}
+{"i":N,"op":"check","version":V,"digest":D,"live":L,"pages":P,"free":F,"image":I}
 {"i":N,"op":"reopen","version":V,"digest":D}
-{"i":N,"op":"crash","fired":X,"recovered":V,"digest":D,"live":L,"pages":P,"free":F}
+{"i":N,"op":"crash","fired":X,"recovered":V,"digest":D,"live":L,"pages":P,"free":F,"image":I}
 ```
 
 `hash` folds the statement's rendered rows, sorted (row order is not what this harness tests), with
 FNV-1a 64; `fired` is `barrier`, `write`, `sync`, `end`, or `none` (a standalone `crash` step). The
 `live`/`pages`/`free` counts come from the meta page and persisted free list, which are byte-exact
-across cores. For faults marked "image" in §6.3, the driver also requires a **byte-identical
-logical post-crash image**: pages below the high-water, ignoring preallocated tails.
+across cores. `image` is the FNV-1a 64 of the **logical image** — the first `pages × page_size`
+bytes, ignoring preallocated tails — of the disk at a `check`, or of the post-crash disk recovery
+opened. Equal transcripts therefore mean **byte-identical crash images** across cores, which the
+content-keyed fault decisions (§6.2) make possible for the faults marked "image" in §6.3.
 
 This tier carries the CLAUDE.md §2 cross-core comparison into histories nobody wrote by hand. Three
 independently written recovery paths look at the same torn bytes and must make the same decision.

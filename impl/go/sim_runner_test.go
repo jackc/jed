@@ -729,12 +729,14 @@ func (r *simRunner) stepCheck(i int) {
 		r.fail(i, "live integrity: %v", err)
 		return
 	}
-	live, pages, free, err := simIntegrity(append([]byte(nil), r.disk.cache...), r.version)
+	image := append([]byte(nil), r.disk.cache...)
+	live, pages, free, err := simIntegrity(image, r.version)
 	if err != nil {
 		r.fail(i, "integrity: %v", err)
 		return
 	}
-	r.emit(`{"i":%d,"op":"check","version":%d,"digest":%q,"live":%d,"pages":%d,"free":%d}`, i, r.version, d, live, pages, free)
+	r.emit(`{"i":%d,"op":"check","version":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"}`,
+		i, r.version, d, live, pages, free, simImageHash(image, pages, r.pageSize))
 }
 
 // stepReopen ends every session cleanly, closes the Database, and reopens it: the result must be
@@ -811,6 +813,19 @@ func (r *simRunner) recover(i int, fired string) bool {
 		return false
 	}
 	r.version, r.lastDigest = v, d
-	r.emit(`{"i":%d,"op":"crash","fired":%q,"recovered":%d,"digest":%q,"live":%d,"pages":%d,"free":%d}`, i, fired, v, d, live, pages, free)
+	r.emit(`{"i":%d,"op":"crash","fired":%q,"recovered":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"}`,
+		i, fired, v, d, live, pages, free, simImageHash(image, pages, r.pageSize))
 	return true
+}
+
+// simImageHash folds the logical image — the pages below the high-water — into FNV-1a 64 (§8.4).
+// Preallocated tails past the high-water are host policy and excluded.
+func simImageHash(image []byte, pages, pageSize uint32) uint64 {
+	n := int(pages) * int(pageSize)
+	if n > len(image) {
+		n = len(image)
+	}
+	h := fnv.New64a()
+	h.Write(image[:n])
+	return h.Sum64()
 }
