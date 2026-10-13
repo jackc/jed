@@ -12,6 +12,7 @@
 //! [`to_pg_year`] / [`from_pg_year`] convert at the boundary. The exact integer formulas (incl. the
 //! quirky BC cases) are oracle-pinned against `postgres:18`.
 
+use crate::datetime_units_gen::{DATE_TOKENS, DELTA_TOKENS, DtToken, TOKEN_MAX_LEN};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::interval::Interval;
@@ -95,16 +96,109 @@ fn iso_week_year(y: i64, mo: u32, d: u32) -> (i64, i64) {
     }
 }
 
+// --- unit names --------------------------------------------------------------
+
+/// What a unit name means to `EXTRACT` / `date_part` (spec/design/timezones.md §9.6).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FieldName {
+    /// a unit or field, by its canonical name (`hours` → `hour`, `jd` → `julian`, `epoch`)
+    Unit(&'static str),
+    /// a reserved word other than `epoch` (`infinity`, `now`, `today`, …)
+    Reserved,
+    /// anything else
+    Unknown,
+}
+
+/// The unit name as PostgreSQL's error messages print it: ASCII-lowercased
+/// (`downcase_truncate_identifier`; a non-ASCII letter keeps its case).
+fn lower_unit(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// PostgreSQL's `datebsearch`: the entry whose token equals the first `TOKEN_MAX_LEN` bytes of the
+/// lowercased `name` (so `microseconds` finds `microsecon`).
+fn search_tokens(table: &'static [DtToken], name: &str) -> Option<&'static DtToken> {
+    let key = &name.as_bytes()[..name.len().min(TOKEN_MAX_LEN)];
+    table
+        .binary_search_by(|t| t.token.as_bytes().cmp(key))
+        .ok()
+        .map(|i| &table[i])
+}
+
+/// PostgreSQL's `DecodeUnits` over a lowercased name: the canonical unit a `deltatktbl` units entry
+/// names (`hrs` → `hour`), else `None`. `date_trunc` reads unit names this way.
+fn decode_units(name: &str) -> Option<&'static str> {
+    match search_tokens(DELTA_TOKENS, name) {
+        Some(t) if t.kind == "units" => Some(t.value),
+        _ => None,
+    }
+}
+
+/// `EXTRACT` / `date_part`'s field lookup over a lowercased name: PostgreSQL's `DecodeUnits`, then
+/// `DecodeSpecial` (`datetktbl`) when the name is not in `deltatktbl` at all.
+fn decode_field(name: &str) -> FieldName {
+    if let Some(t) = search_tokens(DELTA_TOKENS, name) {
+        return if t.kind == "units" {
+            FieldName::Unit(t.value)
+        } else {
+            FieldName::Unknown
+        };
+    }
+    match search_tokens(DATE_TOKENS, name) {
+        Some(t) if t.kind == "units" => FieldName::Unit(t.value),
+        Some(t) if t.kind == "reserv" && t.value == "epoch" => FieldName::Unit("epoch"),
+        Some(t) if t.kind == "reserv" => FieldName::Reserved,
+        _ => FieldName::Unknown,
+    }
+}
+
+/// The canonical field an `EXTRACT` / `date_part` field name resolves to (`jd` → `julian`), or
+/// `None` when it names no field.
+pub fn canonical_field(field: &str) -> Option<&'static str> {
+    match decode_field(&lower_unit(field)) {
+        FieldName::Unit(u) => Some(u),
+        _ => None,
+    }
+}
+
+fn not_recognized(name: &str, type_name: &str) -> EngineError {
+    invalid_param(format!(
+        "unit \"{name}\" not recognized for type {type_name}"
+    ))
+}
+
+fn not_supported(name: &str, type_name: &str) -> EngineError {
+    feature(format!(
+        "unit \"{name}\" not supported for type {type_name}"
+    ))
+}
+
+/// A timestamp family's type name, as PostgreSQL's unit messages print it.
+fn timestamp_type_name(tz: bool) -> &'static str {
+    if tz {
+        "timestamp with time zone"
+    } else {
+        "timestamp without time zone"
+    }
+}
+
 // --- date_trunc --------------------------------------------------------------
 
 /// `date_trunc(unit, timestamp)` / the wall-clock half of `date_trunc(unit, timestamptz[, zone])`:
-/// truncate the wall-clock instant `micros` down to the start of `unit`. `±infinity` passes through
-/// unchanged (PG). An unrecognized unit is `22023` (`invalid_parameter_value`).
-pub fn date_trunc_micros(unit: &str, micros: i64) -> Result<i64> {
+/// truncate the wall-clock instant `micros` down to the start of `unit` (`tz` names the source type
+/// in messages). The unit is resolved first, as PostgreSQL does: an unrecognized unit is `22023`
+/// (`invalid_parameter_value`) and a `timezone*` unit `0A000`, even over `±infinity`, which
+/// otherwise passes through unchanged.
+pub fn date_trunc_micros(unit: &str, micros: i64, tz: bool) -> Result<i64> {
+    let name = lower_unit(unit);
+    let Some(u) = decode_units(&name) else {
+        return Err(not_recognized(&name, timestamp_type_name(tz)));
+    };
     if micros == POS_INFINITY || micros == NEG_INFINITY {
+        // Validate the unit against a finite probe, then pass the infinity through.
+        date_trunc_micros(unit, 0, tz)?;
         return Ok(micros);
     }
-    let u = unit.to_ascii_lowercase();
     let (y, mo, d, h, mi, s, us) = civil_from_micros(micros);
     // Recompose a wall-clock instant from civil fields (floor-consistent with civil_from_micros).
     let rebuild = |y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32, us: u32| -> i64 {
@@ -114,7 +208,7 @@ pub fn date_trunc_micros(unit: &str, micros: i64) -> Result<i64> {
             + s as i64 * MICROS_PER_SEC
             + us as i64
     };
-    let out = match u.as_str() {
+    let out = match u {
         "microseconds" => micros,
         "milliseconds" => rebuild(y, mo, d, h, mi, s, (us / 1000) * 1000),
         "second" => rebuild(y, mo, d, h, mi, s, 0),
@@ -145,16 +239,19 @@ pub fn date_trunc_micros(unit: &str, micros: i64) -> Result<i64> {
             let start_tm = if m >= 1 { (m - 1) * 1000 + 1 } else { m * 1000 };
             rebuild(from_pg_year(start_tm), 1, 1, 0, 0, 0, 0)
         }
-        _ => return Err(invalid_param(format!("unit \"{unit}\" not recognized"))),
+        _ => return Err(not_supported(&name, timestamp_type_name(tz))),
     };
     Ok(out)
 }
 
-/// `date_trunc(unit, interval)` — truncate an interval's fields down to `unit`. `week` is `0A000`
-/// (PG does not support `week` truncation for intervals); the year-group units truncate the months
-/// field to a multiple of 10/100/1000 years. An unrecognized unit is `22023`.
+/// `date_trunc(unit, interval)` — truncate an interval's fields down to `unit`. `week` and the
+/// `timezone*` units are `0A000` (PG does not support them for intervals); the year-group units
+/// truncate the months field to a multiple of 10/100/1000 years. An unrecognized unit is `22023`.
 pub fn date_trunc_interval(unit: &str, iv: Interval) -> Result<Interval> {
-    let u = unit.to_ascii_lowercase();
+    let name = lower_unit(unit);
+    let Some(u) = decode_units(&name) else {
+        return Err(not_recognized(&name, "interval"));
+    };
     let months = iv.months as i64;
     let days = iv.days as i64;
     let micros = iv.micros;
@@ -163,14 +260,17 @@ pub fn date_trunc_interval(unit: &str, iv: Interval) -> Result<Interval> {
         days: iv.days,
         micros,
     };
-    let out = match u.as_str() {
+    let out = match u {
         "microseconds" => iv,
         "milliseconds" => keep_md((micros / 1000) * 1000),
         "second" => keep_md((micros / MICROS_PER_SEC) * MICROS_PER_SEC),
         "minute" => keep_md((micros / MICROS_PER_MIN) * MICROS_PER_MIN),
         "hour" => keep_md((micros / MICROS_PER_HOUR) * MICROS_PER_HOUR),
         "day" => keep_md(0),
-        "week" => return Err(feature("unit \"week\" not supported for type interval")),
+        "week" => {
+            return Err(not_supported(&name, "interval")
+                .with_detail(Some("Months usually have fractional weeks.".to_string())));
+        }
         "month" => Interval {
             months: iv.months,
             days: 0,
@@ -201,7 +301,7 @@ pub fn date_trunc_interval(unit: &str, iv: Interval) -> Result<Interval> {
             days: 0,
             micros: 0,
         },
-        _ => return Err(invalid_param(format!("unit \"{unit}\" not recognized"))),
+        _ => return Err(not_supported(&name, "interval")),
     };
     let _ = days;
     Ok(out)
@@ -256,31 +356,55 @@ pub fn date_part_julian(micros: i64) -> Result<f64> {
     Ok(jd as f64 + (secs as f64 + fsec as f64 / 1000000.0) / SECS_PER_DAY as f64)
 }
 
-/// `EXTRACT(field FROM source)` → `numeric`. The field-validity matrix matches PostgreSQL: an
-/// unsupported field for the source type is `0A000`, an unrecognized field is `22023`. For a `timestamptz` source every field is computed in the
-/// (already-applied) session zone except `epoch` (the instant) and the `timezone*` fields (the zone
-/// offset).
+/// `EXTRACT(field FROM source)` → `numeric`. The field name is resolved first, through PostgreSQL's
+/// unit tables (so `hours`, `msec`, `jd` are `hour`, `milliseconds`, `julian` — timezones.md §9.6);
+/// the field-validity matrix then matches PostgreSQL: an unsupported field for the source type is
+/// `0A000`, an unrecognized field is `22023`, and both take precedence over the infinite-source
+/// trap. For a `timestamptz` source every field is computed in the (already-applied) session zone
+/// except `epoch` (the instant) and the `timezone*` fields (the zone offset).
 pub fn extract_field(field: &str, src: ExtractSrc) -> Result<Decimal> {
-    let f = field.to_ascii_lowercase();
+    let name = lower_unit(field);
+    let type_name = match src {
+        ExtractSrc::Timestamp(_) => timestamp_type_name(false),
+        ExtractSrc::Timestamptz { .. } => timestamp_type_name(true),
+        ExtractSrc::Date(_) => "date",
+        ExtractSrc::Interval(_) => "interval",
+    };
+    let unit = match decode_field(&name) {
+        FieldName::Unit(u) => u,
+        // A reserved word other than `epoch` is unsupported for the date/time types but
+        // unrecognized for an interval — PostgreSQL's interval_part_common checks only epoch.
+        FieldName::Reserved if !matches!(src, ExtractSrc::Interval(_)) => {
+            return Err(not_supported(&name, type_name));
+        }
+        _ => return Err(not_recognized(&name, type_name)),
+    };
     match src {
-        ExtractSrc::Timestamp(micros) => extract_datetime(&f, micros, None),
+        ExtractSrc::Timestamp(micros) => extract_datetime(unit, &name, micros, None),
         ExtractSrc::Timestamptz {
             instant,
             local,
             offset_secs,
-        } => extract_datetime_tz(&f, local, instant, offset_secs),
-        ExtractSrc::Date(days) => extract_date(&f, days),
-        ExtractSrc::Interval(iv) => extract_interval(&f, iv),
+        } => extract_datetime(unit, &name, local, Some((instant, offset_secs))),
+        ExtractSrc::Date(days) => extract_date(unit, &name, days),
+        ExtractSrc::Interval(iv) => extract_interval(unit, &name, iv),
     }
 }
 
-/// Shared timestamp/timestamptz field extraction over the wall-clock `micros`. `tz` carries
-/// `(instant, offset_secs)` for a `timestamptz` (so `epoch`/`timezone*` use the instant/offset);
-/// `None` for a `timestamp` (those fields are then `0A000` / use the wall micros for `epoch`).
-fn extract_datetime(field: &str, micros: i64, tz: Option<(i64, i64)>) -> Result<Decimal> {
+/// Shared timestamp/timestamptz field extraction of the canonical `unit` over the wall-clock
+/// `micros` (`name` is the field as written, for messages). `tz` carries `(instant, offset_secs)`
+/// for a `timestamptz` (so `epoch`/`timezone*` use the instant/offset); `None` for a `timestamp`
+/// (those fields are then `0A000` / use the wall micros for `epoch`).
+fn extract_datetime(
+    unit: &str,
+    name: &str,
+    micros: i64,
+    tz: Option<(i64, i64)>,
+) -> Result<Decimal> {
     if micros == POS_INFINITY || micros == NEG_INFINITY {
-        // jed's decimal is finite-only (decimal.md §2); PG returns ±Infinity here — a documented
-        // divergence (timezones.md §9.2).
+        // Every unit is accepted here (PG's NonFiniteTimestampTzPart, even `timezone` of a
+        // timestamp); jed's decimal is finite-only (decimal.md §2), so 22003 where PG returns
+        // ±Infinity or NULL — a documented divergence (timezones.md §9.2).
         return Err(EngineError::new(
             SqlState::NumericValueOutOfRange,
             "cannot extract field from an infinite timestamp",
@@ -289,7 +413,7 @@ fn extract_datetime(field: &str, micros: i64, tz: Option<(i64, i64)>) -> Result<
     let (y, mo, d, h, mi, s, us) = civil_from_micros(micros);
     let sec_us = s as i64 * MICROS_PER_SEC + us as i64;
     let days = days_from_civil(y, mo as i64, d as i64);
-    let v = match field {
+    let v = match unit {
         "microseconds" => decimal_scaled(sec_us, 0),
         "milliseconds" => decimal_scaled(sec_us, 3),
         "second" => decimal_scaled(sec_us, 6),
@@ -313,42 +437,26 @@ fn extract_datetime(field: &str, micros: i64, tz: Option<(i64, i64)>) -> Result<
             decimal_scaled(inst, 6)
         }
         "timezone" | "timezone_hour" | "timezone_minute" => match tz {
-            Some((_, off)) => match field {
+            Some((_, off)) => match unit {
                 "timezone" => Decimal::from_i64(off),
                 "timezone_hour" => Decimal::from_i64(off / 3600),
                 _ => Decimal::from_i64((off % 3600) / 60),
             },
-            None => {
-                return Err(feature(format!(
-                    "unit \"{field}\" not supported for type timestamp without time zone"
-                )));
-            }
+            None => return Err(not_supported(name, timestamp_type_name(false))),
         },
         "julian" => extract_julian(micros)?,
-        _ => {
-            return Err(invalid_param(format!(
-                "unit \"{field}\" not recognized for type {}",
-                if tz.is_some() {
-                    "timestamp with time zone"
-                } else {
-                    "timestamp without time zone"
-                }
-            )));
-        }
+        _ => return Err(not_supported(name, timestamp_type_name(tz.is_some()))),
     };
     Ok(v)
 }
 
-fn extract_datetime_tz(field: &str, local: i64, instant: i64, offset_secs: i64) -> Result<Decimal> {
-    extract_datetime(field, local, Some((instant, offset_secs)))
-}
-
 /// `EXTRACT(field FROM date)`: the calendar fields only — the time fields (`hour`/`minute`/… and
 /// `timezone*`) are `0A000` (PG: "unit X not supported for type date"). `epoch` is `days * 86400`.
-fn extract_date(field: &str, days: i32) -> Result<Decimal> {
+fn extract_date(unit: &str, name: &str, days: i32) -> Result<Decimal> {
     if days == crate::date::POS_INFINITY || days == crate::date::NEG_INFINITY {
-        // As for an infinite timestamp: jed's decimal is finite-only, so 22003 where PG returns
-        // ±Infinity or NULL (timezones.md §9.2).
+        // As for an infinite timestamp: an unsupported field is still 0A000, else 22003 where PG
+        // returns ±Infinity or NULL (jed's decimal is finite-only — timezones.md §9.2).
+        extract_date(unit, name, 0)?;
         return Err(EngineError::new(
             SqlState::NumericValueOutOfRange,
             "cannot extract field from an infinite date",
@@ -356,7 +464,7 @@ fn extract_date(field: &str, days: i32) -> Result<Decimal> {
     }
     let days = days as i64;
     let (y, mo, d) = civil_from_days(days);
-    let v = match field {
+    let v = match unit {
         "day" => Decimal::from_i64(d as i64),
         "month" => Decimal::from_i64(mo as i64),
         "quarter" => Decimal::from_i64(((mo - 1) / 3 + 1) as i64),
@@ -371,17 +479,7 @@ fn extract_date(field: &str, days: i32) -> Result<Decimal> {
         "isoyear" => Decimal::from_i64(to_pg_year(iso_week_year(y, mo, d).1)),
         "epoch" => Decimal::from_i64(days * SECS_PER_DAY),
         "julian" => Decimal::from_i64(days + UNIX_EPOCH_JD),
-        "microseconds" | "milliseconds" | "second" | "minute" | "hour" | "timezone"
-        | "timezone_hour" | "timezone_minute" => {
-            return Err(feature(format!(
-                "unit \"{field}\" not supported for type date"
-            )));
-        }
-        _ => {
-            return Err(invalid_param(format!(
-                "unit \"{field}\" not recognized for type date"
-            )));
-        }
+        _ => return Err(not_supported(name, "date")),
     };
     Ok(v)
 }
@@ -390,14 +488,14 @@ fn extract_date(field: &str, days: i32) -> Result<Decimal> {
 /// components decompose independently (the time component is NOT carried into days). The date-of-the
 /// fields (`dow`/`doy`/`isodow`/`isoyear`/`julian`/`timezone*`) are `0A000`. `epoch` uses PG's
 /// 365.25-day year / 30-day month.
-fn extract_interval(field: &str, iv: Interval) -> Result<Decimal> {
+fn extract_interval(unit: &str, name: &str, iv: Interval) -> Result<Decimal> {
     let months = iv.months as i64;
     let days = iv.days as i64;
     let micros = iv.micros;
     let years = months / 12; // trunc toward zero
     let mo = months % 12; // trunc remainder (signed)
     let time_sec_us = micros % MICROS_PER_MIN; // micros within the minute (signed)
-    let v = match field {
+    let v = match unit {
         "microseconds" => decimal_scaled(time_sec_us, 0),
         "milliseconds" => decimal_scaled(time_sec_us, 3),
         "second" => decimal_scaled(time_sec_us, 6),
@@ -418,17 +516,7 @@ fn extract_interval(field: &str, iv: Interval) -> Result<Decimal> {
                 years * SECS_PER_INTERVAL_YEAR + mo * SECS_PER_INTERVAL_MONTH + days * SECS_PER_DAY;
             return Decimal::from_i64(int_secs).add(&decimal_scaled(micros, 6));
         }
-        "dow" | "isodow" | "doy" | "isoyear" | "julian" | "timezone" | "timezone_hour"
-        | "timezone_minute" => {
-            return Err(feature(format!(
-                "unit \"{field}\" not supported for type interval"
-            )));
-        }
-        _ => {
-            return Err(invalid_param(format!(
-                "unit \"{field}\" not recognized for type interval"
-            )));
-        }
+        _ => return Err(not_supported(name, "interval")),
     };
     Ok(v)
 }
@@ -504,7 +592,7 @@ mod tests {
         .render()
     }
     fn dt(unit: &str, micros: i64) -> String {
-        render_timestamp(date_trunc_micros(unit, micros).unwrap())
+        render_timestamp(date_trunc_micros(unit, micros, false).unwrap())
     }
 
     #[test]
@@ -679,7 +767,10 @@ mod tests {
                 .code(),
             "22023"
         );
-        assert_eq!(date_trunc_micros("bogus", t).unwrap_err().code(), "22023");
+        assert_eq!(
+            date_trunc_micros("bogus", t, false).unwrap_err().code(),
+            "22023"
+        );
         assert_eq!(
             extract_field(
                 "dow",

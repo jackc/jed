@@ -21,6 +21,7 @@ CHECKS = [
   ["cost codegen (drift)", "scripts/gen_costs.rb", "--check"],
   ["estimator codegen (drift)", "scripts/gen_estimator.rb", "--check"],
   ["error codegen (drift)", "scripts/gen_errors.rb", "--check"],
+  ["datetime unit codegen (drift)", "scripts/gen_datetime_units.rb", "--check"],
 ].freeze
 
 failures = CHECKS.reject do |name, script, *args|

@@ -210,7 +210,14 @@ import {
   renderTimestamptzIn,
   resolveZone,
 } from "./timezone.ts";
-import { dateTruncInterval, dateTruncMicros, datePartJulian, extractField } from "./datetime_fn.ts";
+import {
+  canonicalField,
+  dateTruncInterval,
+  dateTruncMicros,
+  datePartJulian,
+  extractField,
+  lowerUnit,
+} from "./datetime_fn.ts";
 import type { ZoneRef } from "./timezone.ts";
 import type { ExtractSrc } from "./datetime_fn.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
@@ -1089,12 +1096,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (uv.kind !== "text") throw new Error("unreachable: resolver requires a text unit");
       const unitS = uv.text;
-      if (vv.kind === "timestamp") return timestampValue(dateTruncMicros(unitS, vv.micros));
+      if (vv.kind === "timestamp") return timestampValue(dateTruncMicros(unitS, vv.micros, false));
       if (vv.kind === "interval") return intervalValue(dateTruncInterval(unitS, vv.iv));
       if (vv.kind === "timestamptz") {
         const mc = vv.micros;
         if (mc === POS_INFINITY || mc === NEG_INFINITY) {
-          dateTruncMicros(unitS, mc); // still validate the unit
+          dateTruncMicros(unitS, mc, true); // still validate the unit
           return timestamptzValue(mc);
         }
         let zr: ZoneRef;
@@ -1111,7 +1118,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         m.charge(COSTS.timezone);
         m.guard();
         const local = instantToLocalMicros(zr, mc);
-        const trunc = dateTruncMicros(unitS, local);
+        const trunc = dateTruncMicros(unitS, local, true);
         return timestamptzValue(localToInstantMicros(zr, trunc));
       }
       throw new Error("unreachable: resolver restricts date_trunc to ts/tstz/interval");
@@ -1352,7 +1359,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // EXTRACT over a date is 0A000); the widen traps 22008 past the timestamp range. A
         // timestamptz source decomposes in the session zone with EXTRACT's exact selective
         // timezone charge. NULL propagation is the blanket case above.
-        const field = (vals[0] as { text: string }).text.toLowerCase();
+        const field = lowerUnit((vals[0] as { text: string }).text);
         const sv = vals[1]!;
         let src: ExtractSrc;
         if (sv.kind === "date") {
@@ -1377,7 +1384,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         } else {
           throw new Error("unreachable: resolver restricts date_part to date/ts/tstz/interval");
         }
-        if (field === "julian" && src.kind !== "interval") {
+        if (canonicalField(field) === "julian" && src.kind !== "interval") {
           // PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
           return float64Value(datePartJulian(src.kind === "ts" ? src.micros : src.local));
         }

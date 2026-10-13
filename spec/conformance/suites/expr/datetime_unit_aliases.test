@@ -1,0 +1,411 @@
+# PostgreSQL's datetime unit-name aliases for EXTRACT(field FROM …), date_part(text, …), and
+# date_trunc(text, …) (spec/design/timezones.md §9.6). A unit name is ASCII-lowercased, then looked
+# up in PostgreSQL 18's deltatktbl (`hours`, `msec`, `y`, `mon`, …) and, for EXTRACT/date_part only,
+# its datetktbl (`dow`, `jd`, `mm`, `epoch`, …), comparing at most 10 bytes — so `microseconds`,
+# `millisecondsXYZ`, and `timezone_hours` are `microsecon`, `millisecon`, and `timezone_h`. The
+# alias then behaves exactly like its canonical unit. The tables are shared spec data
+# (spec/types/datetime_units.toml). An unrecognized name is 22023; a recognized unit (or a reserved
+# word like `infinity`) the source type does not support is 0A000 — except that a reserved word
+# other than `epoch` is 22023 for an interval, as in PG. Both checks precede the ±infinity handling.
+# Oracle-checked against postgres:18.
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.derived_table, types.i32, types.f64, types.text, types.date, types.timestamp, types.timestamptz, types.interval, expr.extract, expr.date_trunc, func.date_part
+# load-timezone: America/New_York
+
+# ============================================================================================
+# EXTRACT over a timestamp (2024-08-15 13:47:23.456789, a Thursday): every deltatktbl alias
+# ============================================================================================
+
+# microseconds: us, usec, usecs, usecond, useconds, and anything starting `microsecon`
+query DDDDDDDD nosort
+SELECT EXTRACT(us FROM t), EXTRACT(usec FROM t), EXTRACT(usecs FROM t), EXTRACT(usecond FROM t), EXTRACT(useconds FROM t), EXTRACT(microsecon FROM t), EXTRACT(microsecond FROM t), EXTRACT('microsecondsXYZ' FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+23456789
+23456789
+23456789
+23456789
+23456789
+23456789
+23456789
+23456789
+
+# milliseconds: ms, msec, msecs, msecond, mseconds, and anything starting `millisecon`
+query DDDDDDDD nosort
+SELECT EXTRACT(ms FROM t), EXTRACT(msec FROM t), EXTRACT(msecs FROM t), EXTRACT(msecond FROM t), EXTRACT(mseconds FROM t), EXTRACT(millisecon FROM t), EXTRACT(millisecond FROM t), EXTRACT('millisecondsXYZ' FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+23456.789
+23456.789
+23456.789
+23456.789
+23456.789
+23456.789
+23456.789
+23456.789
+
+# second: s, sec, secs, seconds
+query DDDD nosort
+SELECT EXTRACT(s FROM t), EXTRACT(sec FROM t), EXTRACT(secs FROM t), EXTRACT(seconds FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+23.456789
+23.456789
+23.456789
+23.456789
+
+# minute: m (deltatktbl's minute shadows datetktbl's month), min, mins, minutes, and mm (datetktbl)
+query DDDDD nosort
+SELECT EXTRACT(m FROM t), EXTRACT(min FROM t), EXTRACT(mins FROM t), EXTRACT(minutes FROM t), EXTRACT(mm FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+47
+47
+47
+47
+47
+
+# hour: h, hr, hrs, hours
+query DDDD nosort
+SELECT EXTRACT(h FROM t), EXTRACT(hr FROM t), EXTRACT(hrs FROM t), EXTRACT(hours FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+13
+13
+13
+13
+
+# day: d, days; week: w, weeks; month: mon, mons, months; quarter: qtr
+query DDDDDDDD nosort
+SELECT EXTRACT(d FROM t), EXTRACT(days FROM t), EXTRACT(w FROM t), EXTRACT(weeks FROM t), EXTRACT(mon FROM t), EXTRACT(mons FROM t), EXTRACT(months FROM t), EXTRACT(qtr FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+15
+15
+33
+33
+8
+8
+8
+3
+
+# year: y, yr, yrs, years; decade: 'dec' (a keyword, so only as a string), decs, decades
+query DDDDDDD nosort
+SELECT EXTRACT(y FROM t), EXTRACT(yr FROM t), EXTRACT(yrs FROM t), EXTRACT(years FROM t), EXTRACT('dec' FROM t), EXTRACT(decs FROM t), EXTRACT(decades FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+2024
+2024
+2024
+2024
+202
+202
+202
+
+# century: c, cent, centuries; millennium: mil, mils, millennia, and anything starting `millennium`
+query DDDDDDD nosort
+SELECT EXTRACT(c FROM t), EXTRACT(cent FROM t), EXTRACT(centuries FROM t), EXTRACT(mil FROM t), EXTRACT(mils FROM t), EXTRACT(millennia FROM t), EXTRACT('millenniums' FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+21
+21
+21
+3
+3
+3
+3
+
+# the datetktbl fields: julian as j and jd; dow, doy, isodow, isoyear under their own names
+query DDDDDD nosort
+SELECT EXTRACT(j FROM t), EXTRACT(jd FROM t), EXTRACT(dow FROM t), EXTRACT(doy FROM t), EXTRACT(isodow FROM t), EXTRACT(isoyear FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+2460538.57457704616898148148
+2460538.57457704616898148148
+4
+228
+4
+2024
+
+# ============================================================================================
+# Case folding: the keyword form is folded by the lexer, the string form by the lookup
+# ============================================================================================
+
+query DDDDD nosort
+SELECT EXTRACT(HOURS FROM t), EXTRACT('HrS' FROM t), EXTRACT('MiLLiSeCoNdS' FROM t), EXTRACT('Jd' FROM t), EXTRACT('EPOCH' FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+13
+13
+23456.789
+2460538.57457704616898148148
+1723729643.456789
+
+# ============================================================================================
+# EXTRACT over a timestamptz (session zone UTC): the timezone* units truncate to timezone_h/_m
+# ============================================================================================
+
+query DDDDD nosort
+SELECT EXTRACT(timezone FROM t), EXTRACT(timezone_h FROM t), EXTRACT(timezone_hours FROM t), EXTRACT(timezone_m FROM t), EXTRACT('Timezone_Minutes' FROM t) FROM (SELECT timestamptz '2024-08-15 13:47:23.456789+00' AS t) s
+----
+0
+0
+0
+0
+0
+
+query DDD nosort
+SELECT EXTRACT(hrs FROM t), EXTRACT(mons FROM t), EXTRACT(jd FROM t) FROM (SELECT timestamptz '2024-08-15 13:47:23.456789+00' AS t) s
+----
+13
+8
+2460538.57457704616898148148
+
+# ============================================================================================
+# EXTRACT over a date and an interval
+# ============================================================================================
+
+query DDDDDD nosort
+SELECT EXTRACT(d FROM t), EXTRACT(mon FROM t), EXTRACT(y FROM t), EXTRACT(c FROM t), EXTRACT(jd FROM t), EXTRACT(w FROM t) FROM (SELECT date '2024-08-15' AS t) s
+----
+15
+8
+2024
+21
+2460538
+33
+
+query DDDDDDDD nosort
+SELECT EXTRACT(us FROM t), EXTRACT(ms FROM t), EXTRACT(s FROM t), EXTRACT(m FROM t), EXTRACT(h FROM t), EXTRACT(d FROM t), EXTRACT(w FROM t), EXTRACT(mon FROM t) FROM (SELECT interval '1234 years 5 mons 17 days 13:47:23.456789' AS t) s
+----
+23456789
+23456.789
+23.456789
+47
+13
+17
+2
+5
+
+query DDDDD nosort
+SELECT EXTRACT(qtr FROM t), EXTRACT(y FROM t), EXTRACT(decs FROM t), EXTRACT(c FROM t), EXTRACT(mil FROM t) FROM (SELECT interval '1234 years 5 mons 17 days 13:47:23.456789' AS t) s
+----
+2
+1234
+123
+12
+1
+
+# ============================================================================================
+# EXTRACT errors: unrecognized (22023) vs unsupported for the source type (0A000)
+# ============================================================================================
+
+# not a table token (only a 10-byte token matches by prefix)
+statement error 22023
+SELECT EXTRACT('millis' FROM timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT EXTRACT('epochs' FROM date '2024-08-15')
+
+statement error 22023
+SELECT EXTRACT(hourss FROM timestamp '2024-08-15 13:47:23')
+
+# deltatktbl's non-unit tokens and datetktbl's month/weekday names are not units
+statement error 22023
+SELECT EXTRACT(ago FROM timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT EXTRACT('@' FROM timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT EXTRACT(jan FROM timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT EXTRACT(monday FROM date '2024-08-15')
+
+# an alias of a field the type does not support is 0A000
+statement error 0A000
+SELECT EXTRACT(hours FROM date '2024-08-15')
+
+statement error 0A000
+SELECT EXTRACT(jd FROM interval '1 day')
+
+statement error 0A000
+SELECT EXTRACT(timezone_hours FROM timestamp '2024-08-15 13:47:23')
+
+# a reserved word other than epoch is unsupported for the date/time types ...
+statement error 0A000
+SELECT EXTRACT('infinity' FROM timestamp '2024-08-15 13:47:23')
+
+statement error 0A000
+SELECT EXTRACT(now FROM timestamptz '2024-08-15 13:47:23+00')
+
+statement error 0A000
+SELECT EXTRACT(today FROM date '2024-08-15')
+
+# ... but unrecognized for an interval
+statement error 22023
+SELECT EXTRACT(now FROM interval '1 day')
+
+# the unit is checked before the source's infinity
+statement error 22023
+SELECT EXTRACT(foo FROM date 'infinity')
+
+statement error 0A000
+SELECT EXTRACT(hrs FROM date 'infinity')
+
+statement error 22023
+SELECT EXTRACT(foo FROM timestamp 'infinity')
+
+statement error 0A000
+SELECT EXTRACT(now FROM timestamp '-infinity')
+
+# ============================================================================================
+# date_part: a runtime text unit, resolved the same way per row
+# ============================================================================================
+
+query RRRR nosort
+SELECT date_part('usecs', timestamp '2024-08-15 13:47:23.456789'), date_part('MSecS', interval '1 min 2.5 sec'), date_part('Yrs', timestamptz '2024-08-15 13:47:23+00'), date_part('qtr', date '2024-08-15')
+----
+23456789
+2500
+2024
+3
+
+# date_part's date overload widens to a timestamp, so an hour alias is 0 there
+query R nosort
+SELECT date_part('hours', date '2024-08-15')
+----
+0
+
+# jd/j are julian, so date_part uses PG's float8 julian formula
+query RR nosort
+SELECT date_part('jd', timestamp '2024-08-15 12:00:00'), date_part('J', date '2024-08-15')
+----
+2460538.5
+2460538
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, unit text)
+
+statement ok
+INSERT INTO u VALUES (1, 'y'), (2, 'MON'), (3, 'd'), (4, 'hr'), (5, 'mins'), (6, 'secs'), (7, 'ms'), (8, 'usec'), (9, 'mm'), (10, 'doy'), (11, 'isodow'), (12, 'epoch')
+
+query IR rowsort
+SELECT id, date_part(unit, timestamp '2024-08-15 13:47:23.456789') FROM u
+----
+1
+2024
+10
+228
+11
+4
+12
+1723729643.456789
+2
+8
+3
+15
+4
+13
+5
+47
+6
+23.456789
+7
+23456.789
+8
+23456789
+9
+47
+
+statement error 22023
+SELECT date_part('now', interval '1 day')
+
+statement error 0A000
+SELECT date_part('today', date '2024-08-15')
+
+statement error 22023
+SELECT date_part('jan', timestamp '2024-08-15 13:47:23')
+
+# ============================================================================================
+# date_trunc: deltatktbl only (no dow/doy/julian/mm/epoch)
+# ============================================================================================
+
+query TTTT nosort
+SELECT date_trunc('us', t), date_trunc('msec', t), date_trunc('millisecondsXYZ', t), date_trunc('secs', t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+2024-08-15 13:47:23.456789
+2024-08-15 13:47:23.456
+2024-08-15 13:47:23.456
+2024-08-15 13:47:23
+
+query TTTTT nosort
+SELECT date_trunc('MiN', t), date_trunc('hrs', t), date_trunc('d', t), date_trunc('w', t), date_trunc('mons', t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+2024-08-15 13:47:00
+2024-08-15 13:00:00
+2024-08-15 00:00:00
+2024-08-12 00:00:00
+2024-08-01 00:00:00
+
+query TTTTT nosort
+SELECT date_trunc('qtr', t), date_trunc('Y', t), date_trunc('decs', t), date_trunc('c', t), date_trunc('mils', t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+2024-07-01 00:00:00
+2024-01-01 00:00:00
+2020-01-01 00:00:00
+2001-01-01 00:00:00
+2001-01-01 00:00:00
+
+query TT nosort
+SELECT date_trunc('hours', timestamptz '2024-08-15 13:47:23+00'), date_trunc('days', timestamptz '2024-08-15 02:30:00+00', 'America/New_York')
+----
+2024-08-15 13:00:00+00
+2024-08-14 04:00:00+00
+
+query TTTT nosort
+SELECT date_trunc('secs', t), date_trunc('h', t), date_trunc('d', t), date_trunc('yrs', t) FROM (SELECT interval '3 years 5 mons 17 days 13:47:23.456789' AS t) s
+----
+3 years 5 mons 17 days 13:47:23
+3 years 5 mons 17 days 13:00:00
+3 years 5 mons 17 days
+3 years
+
+# an alias passes ±infinity through like its canonical unit
+query TT nosort
+SELECT date_trunc('hrs', timestamp 'infinity'), date_trunc('Y', timestamptz '-infinity')
+----
+infinity
+-infinity
+
+# datetktbl-only names, and reserved words, are unrecognized for date_trunc
+statement error 22023
+SELECT date_trunc('mm', timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT date_trunc('dow', timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT date_trunc('jd', timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT date_trunc('epoch', timestamp '2024-08-15 13:47:23')
+
+# the timezone* units are recognized but unsupported (0A000) for every source type
+statement error 0A000
+SELECT date_trunc('timezone', timestamp '2024-08-15 13:47:23')
+
+statement error 0A000
+SELECT date_trunc('timezone_m', timestamptz '2024-08-15 13:47:23+00')
+
+statement error 0A000
+SELECT date_trunc('timezone_hour', interval '1 day')
+
+# week is unsupported for an interval under any of its names
+statement error 0A000
+SELECT date_trunc('weeks', interval '1 day')
+
+statement error 0A000
+SELECT date_trunc('w', interval '1 day')
+
+# the unit is checked before ±infinity passes through
+statement error 22023
+SELECT date_trunc('foo', timestamp 'infinity')
+
+statement error 22023
+SELECT date_trunc('foo', timestamptz 'infinity')
+
+statement error 0A000
+SELECT date_trunc('timezone', timestamp 'infinity')

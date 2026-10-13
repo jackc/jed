@@ -1587,19 +1587,20 @@ impl RExpr {
                 };
                 match vv {
                     Value::Timestamp(mc) => Ok(Value::Timestamp(
-                        crate::datetime_fn::date_trunc_micros(unit_s, mc)?,
+                        crate::datetime_fn::date_trunc_micros(unit_s, mc, false)?,
                     )),
                     Value::Interval(iv) => Ok(Value::Interval(
                         crate::datetime_fn::date_trunc_interval(unit_s, iv)?,
                     )),
                     Value::Timestamptz(mc) => {
-                        // ±infinity passes through (PG), no zone consulted.
+                        // ±infinity passes through (PG), no zone consulted — the kernel still
+                        // validates the unit (22023 / 0A000 even at ±inf).
                         if mc == crate::timestamp::POS_INFINITY
                             || mc == crate::timestamp::NEG_INFINITY
                         {
-                            // Still validate the unit (an unrecognized unit is 22023 even at ±inf).
-                            crate::datetime_fn::date_trunc_micros(unit_s, mc)?;
-                            return Ok(Value::Timestamptz(mc));
+                            return Ok(Value::Timestamptz(crate::datetime_fn::date_trunc_micros(
+                                unit_s, mc, true,
+                            )?));
                         }
                         // Truncate in the explicit zone (3-arg) or the session zone (2-arg).
                         let zr = match &zv {
@@ -1618,7 +1619,7 @@ impl RExpr {
                         m.guard()?;
                         let local = crate::timezone::instant_to_local_micros(&zr, mc)
                             .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
-                        let trunc = crate::datetime_fn::date_trunc_micros(unit_s, local)?;
+                        let trunc = crate::datetime_fn::date_trunc_micros(unit_s, local, true)?;
                         Ok(Value::Timestamptz(
                             crate::timezone::local_to_instant_micros(&zr, trunc)
                                 .ok_or_else(crate::timestamp::zone_shift_out_of_range)?,
@@ -2348,7 +2349,7 @@ impl RExpr {
                                 "resolver restricts date_part to date/ts/tstz/interval"
                             ),
                         };
-                        if field == "julian" {
+                        if crate::datetime_fn::canonical_field(&field) == Some("julian") {
                             // PG's float8 julian formula, not the numeric value converted
                             // (timezones.md §9.2).
                             match src {

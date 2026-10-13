@@ -472,6 +472,11 @@ name is a runtime string, and over a `date` the timestamp fields exist (`date_pa
 `0`), exactly as in PostgreSQL. (A runtime `text` value casts to every datetime type, and every
 datetime casts to `text` — a `timestamptz` in the session time zone.)
 
+Unit names are case-insensitive and accept PostgreSQL's aliases: `date_trunc('hrs', ts)`,
+`EXTRACT(mons FROM ts)`, and `date_part('msec', ts)` work, as do `y`/`yr`/`years`, `d`/`days`,
+`w`/`weeks`, `qtr`, `us`/`usec`, `c`/`cent`, and the rest. `EXTRACT` and `date_part` also take `jd`/`j`
+for `julian` and `mm` for `minute`.
+
 An `interval` keeps its months, days, and time as separate fields, so `interval '50 hours'` stays
 `50:00:00`. PostgreSQL's `justify_hours` moves whole 24-hour chunks into days, `justify_days` moves
 whole 30-day chunks into months, and `justify_interval` does both and gives every field the same

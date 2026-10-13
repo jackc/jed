@@ -3237,7 +3237,8 @@ SELECT (tstz)::date                                          -- cross-family cas
 ```
 
 - **Grammar.** `EXTRACT "(" ( identifier | string ) "FROM" expr ")"` ([grammar.ebnf](../grammar/grammar.ebnf)).
-  The **field is syntactic** — a bare identifier or a single-quoted string, case-insensitive — recognized
+  The **field is syntactic** — a bare identifier or a single-quoted string, case-insensitive, spelled
+  with any of PostgreSQL's unit aliases (`hours`, `msec`, `y`, `jd`, …, [timezones.md §9.6](timezones.md)) — recognized
   only when `EXTRACT` is immediately followed by `(` (a one-token lookahead, §8; `EXTRACT` stays usable as
   a column / function name otherwise). It is validated at **resolve** time.
 - **Result type.** `EXTRACT` → `numeric` (PG 14+, matchable exactly; jed has exact `decimal`). The
@@ -3251,7 +3252,7 @@ SELECT (tstz)::date                                          -- cross-family cas
   every field is computed **in the session zone** except `epoch` (the instant).
 - **`date_trunc`.** `date_trunc(unit, source)` (2-arg) over `timestamp` / `timestamptz` / `interval`,
   plus `date_trunc(unit, timestamptz, zone)` (3-arg) — `unit` is a runtime `text` value (case-
-  insensitive; an unrecognized unit is `22023` **at evaluation**). A `timestamptz` is truncated in the
+  insensitive, with PostgreSQL's aliases; an unrecognized unit is `22023` **at evaluation**). A `timestamptz` is truncated in the
   session zone (2-arg) or the explicit zone (3-arg); a `date` argument is `42883` (no implicit
   `date`→`timestamp` cast — [timezones.md §9.1](timezones.md)).
 - **Cross-family casts.** The `timestamp` / `timestamptz` / `date` cast matrix

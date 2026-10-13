@@ -9,6 +9,7 @@
 // toPgYear / fromPgYear convert at the boundary. The exact integer formulas are oracle-pinned.
 
 import { DATE_NEG_INFINITY, DATE_POS_INFINITY } from "./date.ts";
+import { DATE_TOKENS, DELTA_TOKENS, type DtToken, TOKEN_MAX_LEN } from "./datetime_units_gen.ts";
 import { Decimal } from "./decimal.ts";
 import { engineError } from "./errors.ts";
 import type { Interval } from "./interval.ts";
@@ -101,14 +102,85 @@ function intervalQuarter(months: bigint): bigint {
   return -((-months % 12n) / 3n + 1n);
 }
 
-const unrecognizedUnit = (u: string) =>
-  engineError("invalid_parameter_value", `unit "${u}" not recognized`);
+// What a unit name means to EXTRACT / date_part (spec/design/timezones.md §9.6): a canonical unit,
+// a reserved word other than `epoch` (`infinity`, `now`, …), or unknown.
+type FieldName = { kind: "unit"; unit: string } | { kind: "reserved" } | { kind: "unknown" };
 
-// dateTruncMicros truncates a wall-clock instant `micros` down to the start of `unit`. ±infinity
-// passes through; an unrecognized unit is 22023.
-export function dateTruncMicros(unit: string, micros: bigint): bigint {
-  if (micros === POS_INFINITY || micros === NEG_INFINITY) return micros;
-  const u = unit.toLowerCase();
+// The unit name as PostgreSQL's messages print it: ASCII-lowercased (downcase_truncate_identifier;
+// a non-ASCII letter keeps its case).
+export function lowerUnit(name: string): string {
+  return name.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+// PostgreSQL's datebsearch: the entry whose token equals the first TOKEN_MAX_LEN bytes of the
+// lowercased name (so `microseconds` finds `microsecon`). Tokens are ASCII, so comparing the first
+// TOKEN_MAX_LEN UTF-16 units is the same test.
+function searchTokens(table: readonly DtToken[], name: string): DtToken | undefined {
+  const key = name.slice(0, TOKEN_MAX_LEN);
+  let lo = 0;
+  let hi = table.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const t = table[mid]!;
+    if (t.token === key) return t;
+    if (t.token < key) lo = mid + 1;
+    else hi = mid;
+  }
+  return undefined;
+}
+
+// PostgreSQL's DecodeUnits over a lowercased name: the canonical unit a deltatktbl units entry
+// names (`hrs` → `hour`). date_trunc reads unit names this way.
+function decodeUnits(name: string): string | undefined {
+  const t = searchTokens(DELTA_TOKENS, name);
+  return t !== undefined && t.kind === "units" ? t.value : undefined;
+}
+
+// EXTRACT / date_part's field lookup over a lowercased name: PostgreSQL's DecodeUnits, then
+// DecodeSpecial (datetktbl) when the name is not in deltatktbl at all.
+function decodeField(name: string): FieldName {
+  const dt = searchTokens(DELTA_TOKENS, name);
+  if (dt !== undefined) {
+    return dt.kind === "units" ? { kind: "unit", unit: dt.value } : { kind: "unknown" };
+  }
+  const t = searchTokens(DATE_TOKENS, name);
+  if (t === undefined) return { kind: "unknown" };
+  if (t.kind === "units") return { kind: "unit", unit: t.value };
+  if (t.kind === "reserv" && t.value === "epoch") return { kind: "unit", unit: "epoch" };
+  if (t.kind === "reserv") return { kind: "reserved" };
+  return { kind: "unknown" };
+}
+
+// canonicalField is the canonical field an EXTRACT / date_part field name resolves to
+// (`jd` → `julian`), or undefined when it names no field.
+export function canonicalField(field: string): string | undefined {
+  const f = decodeField(lowerUnit(field));
+  return f.kind === "unit" ? f.unit : undefined;
+}
+
+const unitNotRecognized = (name: string, typeName: string) =>
+  engineError("invalid_parameter_value", `unit "${name}" not recognized for type ${typeName}`);
+
+const unitNotSupported = (name: string, typeName: string) =>
+  engineError("feature_not_supported", `unit "${name}" not supported for type ${typeName}`);
+
+// A timestamp family's type name, as PostgreSQL's unit messages print it.
+const timestampTypeName = (tz: boolean): string =>
+  tz ? "timestamp with time zone" : "timestamp without time zone";
+
+// dateTruncMicros truncates a wall-clock instant `micros` down to the start of `unit` (`tz` names
+// the source type in messages). The unit is resolved first, as PostgreSQL does: an unrecognized
+// unit is 22023 and a timezone* unit 0A000, even over ±infinity, which otherwise passes through
+// unchanged.
+export function dateTruncMicros(unit: string, micros: bigint, tz: boolean): bigint {
+  const name = lowerUnit(unit);
+  const u = decodeUnits(name);
+  if (u === undefined) throw unitNotRecognized(name, timestampTypeName(tz));
+  if (micros === POS_INFINITY || micros === NEG_INFINITY) {
+    // Validate the unit against a finite probe, then pass the infinity through.
+    dateTruncMicros(unit, 0n, tz);
+    return micros;
+  }
   const [y, mo, d, h, mi, s, us] = civilFromMicros(micros);
   const rebuild = (
     y: bigint,
@@ -164,14 +236,16 @@ export function dateTruncMicros(unit: string, micros: bigint): bigint {
       return rebuild(fromPgYear(startTm), 1n, 1n, 0n, 0n, 0n, 0n);
     }
     default:
-      throw unrecognizedUnit(unit);
+      throw unitNotSupported(name, timestampTypeName(tz));
   }
 }
 
-// dateTruncInterval truncates an interval's fields down to `unit`. `week` is 0A000; an unrecognized
-// unit is 22023.
+// dateTruncInterval truncates an interval's fields down to `unit`. `week` and the timezone* units
+// are 0A000; an unrecognized unit is 22023.
 export function dateTruncInterval(unit: string, iv: Interval): Interval {
-  const u = unit.toLowerCase();
+  const name = lowerUnit(unit);
+  const u = decodeUnits(name);
+  if (u === undefined) throw unitNotRecognized(name, "interval");
   const months = BigInt(iv.months);
   const micros = iv.micros;
   const keepMd = (m: bigint): Interval => ({ months: iv.months, days: iv.days, micros: m });
@@ -190,7 +264,7 @@ export function dateTruncInterval(unit: string, iv: Interval): Interval {
     case "day":
       return keepMd(0n);
     case "week":
-      throw engineError("feature_not_supported", 'unit "week" not supported for type interval');
+      throw unitNotSupported(name, "interval").withDetail("Months usually have fractional weeks.");
     case "month":
       return monthsOnly(months);
     case "quarter":
@@ -204,7 +278,7 @@ export function dateTruncInterval(unit: string, iv: Interval): Interval {
     case "millennium":
       return monthsOnly((months / 12000n) * 12000n);
     default:
-      throw unrecognizedUnit(unit);
+      throw unitNotSupported(name, "interval");
   }
 }
 
@@ -250,32 +324,51 @@ export type ExtractSrc =
   | { kind: "date"; days: bigint }
   | { kind: "interval"; iv: Interval };
 
-// extractField returns EXTRACT(field FROM source) as numeric. An unsupported field for the type is
-// 0A000; an unrecognized field is 22023.
+// extractField returns EXTRACT(field FROM source) as numeric. The field name is resolved first,
+// through PostgreSQL's unit tables (so `hours`, `msec`, `jd` are hour, milliseconds, julian —
+// timezones.md §9.6); then an unsupported field for the type is 0A000 and an unrecognized field
+// 22023, both ahead of the infinite-source trap.
 export function extractField(field: string, src: ExtractSrc): Decimal {
-  const f = field.toLowerCase();
+  const name = lowerUnit(field);
+  const typeName =
+    src.kind === "ts"
+      ? timestampTypeName(false)
+      : src.kind === "tstz"
+        ? timestampTypeName(true)
+        : src.kind;
+  const f = decodeField(name);
+  if (f.kind === "reserved" && src.kind !== "interval") {
+    // A reserved word other than epoch is unsupported for the date/time types but unrecognized for
+    // an interval — PostgreSQL's interval_part_common checks only epoch.
+    throw unitNotSupported(name, typeName);
+  }
+  if (f.kind !== "unit") throw unitNotRecognized(name, typeName);
   switch (src.kind) {
     case "ts":
-      return extractDatetime(f, src.micros, false, 0n, 0n);
+      return extractDatetime(f.unit, name, src.micros, false, 0n, 0n);
     case "tstz":
-      return extractDatetime(f, src.local, true, src.instant, src.offsetSecs);
+      return extractDatetime(f.unit, name, src.local, true, src.instant, src.offsetSecs);
     case "date":
-      return extractDate(f, src.days);
+      return extractDate(f.unit, name, src.days);
     case "interval":
-      return extractInterval(f, src.iv);
+      return extractInterval(f.unit, name, src.iv);
   }
 }
 
+// extractDatetime extracts the canonical `unit` (written as `name`, for messages) from the
+// wall-clock micros of a timestamp / timestamptz.
 function extractDatetime(
-  field: string,
+  unit: string,
+  name: string,
   micros: bigint,
   isTz: boolean,
   instant: bigint,
   offsetSecs: bigint,
 ): Decimal {
   if (micros === POS_INFINITY || micros === NEG_INFINITY) {
-    // jed's decimal is finite-only (decimal.md §2); PG returns ±Infinity — a documented divergence
-    // (timezones.md §9.2).
+    // Every unit is accepted here (PG's NonFiniteTimestampTzPart, even timezone of a timestamp);
+    // jed's decimal is finite-only (decimal.md §2), so 22003 where PG returns ±Infinity or NULL — a
+    // documented divergence (timezones.md §9.2).
     throw engineError(
       "numeric_value_out_of_range",
       "cannot extract field from an infinite timestamp",
@@ -284,7 +377,7 @@ function extractDatetime(
   const [y, mo, d, h, mi, s, us] = civilFromMicros(micros);
   const secUs = s * MICROS_PER_SEC + us;
   const days = daysFromCivil(y, mo, d);
-  switch (field) {
+  switch (unit) {
     case "microseconds":
       return decimalScaled(secUs, 0);
     case "milliseconds":
@@ -324,34 +417,28 @@ function extractDatetime(
     case "timezone":
     case "timezone_hour":
     case "timezone_minute": {
-      if (!isTz) {
-        throw engineError(
-          "feature_not_supported",
-          `unit "${field}" not supported for type timestamp without time zone`,
-        );
-      }
-      if (field === "timezone") return Decimal.fromBigInt(offsetSecs);
-      if (field === "timezone_hour") return Decimal.fromBigInt(offsetSecs / 3600n);
+      if (!isTz) throw unitNotSupported(name, timestampTypeName(false));
+      if (unit === "timezone") return Decimal.fromBigInt(offsetSecs);
+      if (unit === "timezone_hour") return Decimal.fromBigInt(offsetSecs / 3600n);
       return Decimal.fromBigInt((offsetSecs % 3600n) / 60n);
     }
     case "julian":
       return extractJulian(micros);
     default:
-      throw engineError(
-        "invalid_parameter_value",
-        `unit "${field}" not recognized for type ${isTz ? "timestamp with time zone" : "timestamp without time zone"}`,
-      );
+      throw unitNotSupported(name, timestampTypeName(isTz));
   }
 }
 
-function extractDate(field: string, days: bigint): Decimal {
+// extractDate extracts the canonical `unit` (written as `name`, for messages) from a date.
+function extractDate(unit: string, name: string, days: bigint): Decimal {
   if (days === DATE_POS_INFINITY || days === DATE_NEG_INFINITY) {
-    // As for an infinite timestamp: jed's decimal is finite-only, so 22003 where PG returns
-    // ±Infinity or NULL (timezones.md §9.2).
+    // As for an infinite timestamp: an unsupported field is still 0A000 (checked on a finite
+    // probe), else 22003 where PG returns ±Infinity or NULL (timezones.md §9.2).
+    extractDate(unit, name, 0n);
     throw engineError("numeric_value_out_of_range", "cannot extract field from an infinite date");
   }
   const [y, mo, d] = civilFromDays(days);
-  switch (field) {
+  switch (unit) {
     case "day":
       return Decimal.fromBigInt(d);
     case "month":
@@ -380,28 +467,20 @@ function extractDate(field: string, days: bigint): Decimal {
       return Decimal.fromBigInt(days * SECS_PER_DAY);
     case "julian":
       return Decimal.fromBigInt(days + UNIX_EPOCH_JD);
-    case "microseconds":
-    case "milliseconds":
-    case "second":
-    case "minute":
-    case "hour":
-    case "timezone":
-    case "timezone_hour":
-    case "timezone_minute":
-      throw engineError("feature_not_supported", `unit "${field}" not supported for type date`);
     default:
-      throw engineError("invalid_parameter_value", `unit "${field}" not recognized for type date`);
+      throw unitNotSupported(name, "date");
   }
 }
 
-function extractInterval(field: string, iv: Interval): Decimal {
+// extractInterval extracts the canonical `unit` (written as `name`, for messages) from an interval.
+function extractInterval(unit: string, name: string, iv: Interval): Decimal {
   const months = BigInt(iv.months);
   const days = BigInt(iv.days);
   const micros = iv.micros;
   const years = months / 12n;
   const mo = months % 12n;
   const timeSecUs = micros % MICROS_PER_MIN;
-  switch (field) {
+  switch (unit) {
     case "microseconds":
       return decimalScaled(timeSecUs, 0);
     case "milliseconds":
@@ -433,19 +512,7 @@ function extractInterval(field: string, iv: Interval): Decimal {
         years * SECS_PER_INTERVAL_YEAR + mo * SECS_PER_INTERVAL_MONTH + days * SECS_PER_DAY;
       return Decimal.fromBigInt(intSecs).add(decimalScaled(micros, 6));
     }
-    case "dow":
-    case "isodow":
-    case "doy":
-    case "isoyear":
-    case "julian":
-    case "timezone":
-    case "timezone_hour":
-    case "timezone_minute":
-      throw engineError("feature_not_supported", `unit "${field}" not supported for type interval`);
     default:
-      throw engineError(
-        "invalid_parameter_value",
-        `unit "${field}" not recognized for type interval`,
-      );
+      throw unitNotSupported(name, "interval");
   }
 }

@@ -353,7 +353,8 @@ is the §8 indexability decision, made when expression indexes land.
 ### 9.1 `date_trunc`
 
 `date_trunc(unit, source)` rounds a value **down** to the start of `unit`. `unit` is a `text` value
-(evaluated per row, case-insensitive); an unrecognized unit is **`22023`** (`invalid_parameter_value`),
+(evaluated per row, case-insensitive, with PostgreSQL's aliases — `hrs`, `mons`, `y`, … — §9.6); an
+unrecognized unit is **`22023`** (`invalid_parameter_value`, "unit "x" not recognized for type Y"),
 raised **at evaluation** like PG (so `date_trunc('nope', ts)` over zero rows raises nothing). Overloads:
 
 | Form | Returns | Zone |
@@ -366,7 +367,9 @@ raised **at evaluation** like PG (so `date_trunc('nope', ts)` over zero rows rai
 Units for `timestamp`/`timestamptz`: `microseconds`, `milliseconds`, `second`, `minute`, `hour`, `day`,
 `week` (back to Monday), `month`, `quarter`, `year`, `decade`, `century`, `millennium`. For `interval`
 the same units **except `week`** (`0A000`, matching PG); the year-group units (`decade`/`century`/
-`millennium`) truncate the months field to a multiple of 10/100/1000 years. A `date` argument is
+`millennium`) truncate the months field to a multiple of 10/100/1000 years. The `timezone*` units are
+recognized but unsupported for every source type (`0A000`). The unit is checked before a `±infinity`
+source passes through unchanged, as in PG. A `date` argument is
 **`42883`** (no overload) — jed has no implicit `date`→`timestamp` cast (PG accepts it via that implicit
 cast; a documented divergence, cast explicitly with `::timestamp`). The session-zone form charges the
 `timezone` cost unit (§10); the zone-free forms do not.
@@ -404,8 +407,11 @@ interval)` → `0A000`, etc.):
 | `timezone` `timezone_hour` `timezone_minute` | tstz ✓ / ts `0A000` | `0A000` | `0A000` |
 | `julian` | ✓ | ✓ | `0A000` |
 
+A field may be spelled with any of PostgreSQL's aliases (`hours`, `msec`, `y`, `jd`, `mm`, …, §9.6).
 An unsupported field-for-type is **`0A000`** (`feature_not_supported`, PG's "unit X not supported for
-type Y"); an **unrecognized** field name is **`22023`** (PG's "unit X not recognized for type Y").
+type Y"); an **unrecognized** field name is **`22023`** (PG's "unit X not recognized for type Y"). A
+reserved word other than `epoch` (`infinity`, `now`, `today`, …) is `0A000` for a date/time source
+and `22023` for an interval, as in PG. Both checks precede the infinite-source trap below.
 `julian` is the Julian Day (PG's `date2j`; 4714-11-24 BC is day 0, 1970-01-01 is 2440588). Over a `date` it
 is the integer day number, `days + 2440588`. Over a `timestamp` it adds the fraction of the day, computed
 as PostgreSQL's numeric path does: `jd + (time-of-day µs / 86400000000)`, the division at numeric's
@@ -413,8 +419,8 @@ as PostgreSQL's numeric path does: `jd + (time-of-day µs / 86400000000)`, the d
 28 digits, at midnight; 20 at noon; `2000-01-01 00:00:00.000001` is
 `2451545.0000000000115740740740740741`). A `timestamptz` decomposes in the session zone like every other
 wall-clock field, so local midnight is `.0` (oracle-checked in `suites/expr/extract_julian.test`).
-`EXTRACT` of **any** field from an infinite `timestamp`, `timestamptz`, or `date` is `22003` ("cannot
-extract field from an infinite timestamp" / "… date") — jed's `decimal` is finite-only, where PG returns
+`EXTRACT` of **any** field PG accepts from an infinite `timestamp`, `timestamptz`, or `date` is `22003`
+("cannot extract field from an infinite timestamp" / "… date") — jed's `decimal` is finite-only, where PG returns
 `±Infinity` for a monotonic field (`year`, `epoch`, `julian`, …) or NULL for an oscillating one;
 `date_part` follows `EXTRACT` (a documented divergence, per-core tested). Field formulas:
 `second`/`milliseconds`/`microseconds` carry the fractional seconds (exact decimal); an `interval`'s
@@ -548,6 +554,58 @@ computation (§9.4), input (§9.3), and output alike. Oracle-checked in
   zone. jed's plan text is its own context-free spelling (structural column slots, not a SQL
   deparse — [explain.md](explain.md)), so the same plan prints identically under every session; the
   explicit `+00` keeps the constant unambiguous.
+
+### 9.6 Unit names and their aliases
+
+`EXTRACT(field FROM …)`, `date_part(text, …)`, and `date_trunc(text, …)` read a unit name the way
+PostgreSQL 18 does (`datetime.c`'s `DecodeUnits` / `DecodeSpecial`), so every PostgreSQL alias works
+and then behaves exactly like its canonical unit. The two keyword tables, `deltatktbl` and
+`datetktbl`, are copied entry for entry into shared spec data,
+[spec/types/datetime_units.toml](../types/datetime_units.toml), and codegen'd into each core
+(`datetime_units_gen.{rs,go,ts}`, `scripts/gen_datetime_units.rb`). The lookup is hand-written:
+
+1. **Fold.** The name is ASCII-lowercased (`downcase_truncate_identifier`; a non-ASCII letter keeps
+   its case). The keyword form `EXTRACT(HOURS FROM …)` is already folded by the lexer; a string
+   `'HrS'` is folded here. Error messages print the folded name.
+2. **Truncate.** A lookup compares at most 10 bytes (`TOKMAXLEN`): a name matches a token when its
+   first 10 bytes equal it. So a token shorter than 10 bytes must match the whole name, and any name
+   starting with a 10-byte token is that token: `microseconds` and `microsecondsXYZ` are
+   `microsecon`, `millisecond` is `millisecon`, `millenniums` is `millennium`, `timezone_hour` and
+   `timezone_hours` are `timezone_h`. `millis` matches nothing.
+3. **Search.** `date_trunc` searches `deltatktbl` only; a `units` entry is its unit, anything else
+   is `22023`. `EXTRACT` / `date_part` search `deltatktbl` and, only when the name is absent there,
+   `datetktbl`; a `units` entry is the field, the reserved word `epoch` is the `epoch` field, any
+   other reserved word is unsupported (`0A000`, but `22023` for an interval), and anything else —
+   `ago`, `@`, month and weekday names — is `22023`.
+
+The aliases, by canonical unit:
+
+| unit | aliases (`deltatktbl`) | `EXTRACT` / `date_part` only (`datetktbl`) |
+|---|---|---|
+| `microseconds` | `us` `usec` `usecs` `usecond` `useconds` `microsecon…` | |
+| `milliseconds` | `ms` `msec` `msecs` `msecond` `mseconds` `millisecon…` | |
+| `second` | `s` `sec` `secs` `seconds` | |
+| `minute` | `m` `min` `mins` `minutes` | `mm` |
+| `hour` | `h` `hr` `hrs` `hours` | |
+| `day` | `d` `days` | |
+| `week` | `w` `weeks` | |
+| `month` | `mon` `mons` `months` | |
+| `quarter` | `qtr` | |
+| `year` | `y` `yr` `yrs` `years` | |
+| `decade` | `dec` `decs` `decades` | |
+| `century` | `c` `cent` `centuries` | |
+| `millennium` | `mil` `mils` `millennia` `millennium…` | |
+| `timezone` `timezone_hour` `timezone_minute` | `timezone_h…` `timezone_m…` | |
+| `julian` | | `j` `jd` `julian` |
+| `dow` `doy` `isodow` `isoyear` `epoch` | | (their own names only) |
+
+PostgreSQL's shadowing carries over: `m` is the minute (`deltatktbl`) although `datetktbl` reads it as
+a month, and `mm` exists only in `datetktbl`, so `EXTRACT(mm FROM ts)` is the minute while
+`date_trunc('mm', ts)` is `22023`. `EXTRACT`'s field is a bare word or a string (grammar.md §50). `dec`
+is a keyword in PostgreSQL, so there only the string `EXTRACT('dec' FROM …)` works, where jed's bare
+word also accepts `EXTRACT(dec FROM …)`; PostgreSQL also accepts a quoted identifier
+(`EXTRACT("HOURS" FROM …)`), which jed's grammar rejects (`42601`). Oracle-checked in
+`suites/expr/datetime_unit_aliases.test`.
 
 ## 10. Untrusted-query safety, cost, and the determinism ledger
 

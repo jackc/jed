@@ -3061,7 +3061,8 @@ volatility     = "stable"
 # source) computes the SAME field value as EXTRACT (the shared extract kernel, exact decimal) and
 # converts it to f64 (the landed decimal→float conversion — one correctly-rounded parse of the
 # decimal's text, ../design/float.md). Unlike EXTRACT's syntactic field, `field` is a RUNTIME text
-# value (a column works), validated per row at eval — case-insensitive; an unrecognized unit is
+# value (a column works), validated per row at eval — case-insensitive, with PostgreSQL's unit
+# aliases (`hours`, `msec`, `jd`, …, ../design/timezones.md §9.6); an unrecognized unit is
 # 22023 ("unit X not recognized"), a recognized-but-unsupported unit for the source type 0A000
 # ("unit X not supported for type Y") — raised AT EVALUATION like date_trunc's unit (so zero rows
 # raise nothing). The (text, date) overload follows PG's own definition — the date WIDENS TO

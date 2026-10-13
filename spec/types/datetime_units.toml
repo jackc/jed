@@ -1,0 +1,188 @@
+# Datetime unit-name tables — CANONICAL DATA (CLAUDE.md §5).
+#
+# PostgreSQL 18's two datetime keyword tables, copied entry for entry from
+# src/backend/utils/adt/datetime.c: `deltatktbl` (searched by `DecodeUnits`) and `datetktbl`
+# (searched by `DecodeSpecial`). They are the vocabulary of the unit name that
+# `EXTRACT(field FROM …)`, `date_part(text, …)`, and `date_trunc(text, …)` take, including
+# PostgreSQL's aliases (`hours`, `msec`, `y`, `mon`, `jd`, …). Reasoning:
+# ../design/timezones.md §9.6 — read it before editing this file.
+#
+# Build-time input to per-language codegen (scripts/gen_datetime_units.rb → the per-core
+# `DELTA_TOKENS` / `DATE_TOKENS` tables); never parsed at runtime. Only the tables are shared
+# data: the lookup (case-fold, truncate, search) and what each function does with the result
+# are hand-written per core.
+#
+# --- conventions -------------------------------------------------------------
+# token_max_len  PostgreSQL's TOKMAXLEN. A lookup compares at most this many bytes of the
+#                (ASCII-lowercased) name, so a name longer than a 10-byte token still matches
+#                it: `microseconds` and `microsecondsXYZ` are `microsecon`, `timezone_hour` is
+#                `timezone_h`. A token shorter than this must match the whole name.
+# token          the table key, lowercase ASCII, at most token_max_len bytes. Each table is
+#                in strictly ascending byte order (PostgreSQL binary-searches it); the
+#                generator checks this.
+# type           PostgreSQL's token type, lowercased: `units` (a unit), `reserv` (a reserved
+#                word), or another type (`ago`, `ignore_dtf`, `month`, `dow`, `ampm`, `adbc`,
+#                `isotime`, `dtzmod`) that no unit lookup accepts.
+# value          for `units`, the canonical jed unit the token names (the names the kernels
+#                match on: `microseconds`, `milliseconds`, `second`, `minute`, `hour`, `day`,
+#                `week`, `month`, `quarter`, `year`, `decade`, `century`, `millennium`,
+#                `timezone`, `timezone_hour`, `timezone_minute`, `julian`, `dow`, `doy`,
+#                `isodow`, `isoyear`); for `reserv`, the reserved meaning (`epoch` is the one
+#                EXTRACT field; `late`, `early`, `now`, `today`, `tomorrow`, `yesterday`, `zulu`
+#                are not fields). Omitted for the other types, whose PostgreSQL values (month
+#                and weekday numbers, …) no unit lookup reads.
+#
+# The lookups (timezones.md §9.6):
+#   date_trunc            delta only: a `units` entry is the unit; anything else is unrecognized.
+#   EXTRACT / date_part   delta first; on a miss, date. A `units` entry is the unit; `reserv`
+#                         `epoch` is the `epoch` field; any other `reserv` word is unsupported
+#                         (0A000) for a date/timestamp/timestamptz and unrecognized (22023) for an
+#                         interval. A non-`units` delta entry (`@`, `ago`) stops the search
+#                         unrecognized, as in PostgreSQL.
+# Shadowing is PostgreSQL's: `m` is `minute` (delta) though datetktbl reads it as month; `mm` (date
+# only) is `minute`, so `EXTRACT(mm …)` is the minute while `date_trunc('mm', …)` is unrecognized.
+# -----------------------------------------------------------------------------
+
+schema_version = 1
+token_max_len = 10
+
+# PostgreSQL's deltatktbl.
+delta = [
+  { token = "@", type = "ignore_dtf" },
+  { token = "ago", type = "ago" },
+  { token = "c", type = "units", value = "century" },
+  { token = "cent", type = "units", value = "century" },
+  { token = "centuries", type = "units", value = "century" },
+  { token = "century", type = "units", value = "century" },
+  { token = "d", type = "units", value = "day" },
+  { token = "day", type = "units", value = "day" },
+  { token = "days", type = "units", value = "day" },
+  { token = "dec", type = "units", value = "decade" },
+  { token = "decade", type = "units", value = "decade" },
+  { token = "decades", type = "units", value = "decade" },
+  { token = "decs", type = "units", value = "decade" },
+  { token = "h", type = "units", value = "hour" },
+  { token = "hour", type = "units", value = "hour" },
+  { token = "hours", type = "units", value = "hour" },
+  { token = "hr", type = "units", value = "hour" },
+  { token = "hrs", type = "units", value = "hour" },
+  { token = "m", type = "units", value = "minute" },
+  { token = "microsecon", type = "units", value = "microseconds" },
+  { token = "mil", type = "units", value = "millennium" },
+  { token = "millennia", type = "units", value = "millennium" },
+  { token = "millennium", type = "units", value = "millennium" },
+  { token = "millisecon", type = "units", value = "milliseconds" },
+  { token = "mils", type = "units", value = "millennium" },
+  { token = "min", type = "units", value = "minute" },
+  { token = "mins", type = "units", value = "minute" },
+  { token = "minute", type = "units", value = "minute" },
+  { token = "minutes", type = "units", value = "minute" },
+  { token = "mon", type = "units", value = "month" },
+  { token = "mons", type = "units", value = "month" },
+  { token = "month", type = "units", value = "month" },
+  { token = "months", type = "units", value = "month" },
+  { token = "ms", type = "units", value = "milliseconds" },
+  { token = "msec", type = "units", value = "milliseconds" },
+  { token = "msecond", type = "units", value = "milliseconds" },
+  { token = "mseconds", type = "units", value = "milliseconds" },
+  { token = "msecs", type = "units", value = "milliseconds" },
+  { token = "qtr", type = "units", value = "quarter" },
+  { token = "quarter", type = "units", value = "quarter" },
+  { token = "s", type = "units", value = "second" },
+  { token = "sec", type = "units", value = "second" },
+  { token = "second", type = "units", value = "second" },
+  { token = "seconds", type = "units", value = "second" },
+  { token = "secs", type = "units", value = "second" },
+  { token = "timezone", type = "units", value = "timezone" },
+  { token = "timezone_h", type = "units", value = "timezone_hour" },
+  { token = "timezone_m", type = "units", value = "timezone_minute" },
+  { token = "us", type = "units", value = "microseconds" },
+  { token = "usec", type = "units", value = "microseconds" },
+  { token = "usecond", type = "units", value = "microseconds" },
+  { token = "useconds", type = "units", value = "microseconds" },
+  { token = "usecs", type = "units", value = "microseconds" },
+  { token = "w", type = "units", value = "week" },
+  { token = "week", type = "units", value = "week" },
+  { token = "weeks", type = "units", value = "week" },
+  { token = "y", type = "units", value = "year" },
+  { token = "year", type = "units", value = "year" },
+  { token = "years", type = "units", value = "year" },
+  { token = "yr", type = "units", value = "year" },
+  { token = "yrs", type = "units", value = "year" },
+]
+
+# PostgreSQL's datetktbl.
+date = [
+  { token = "+infinity", type = "reserv", value = "late" },
+  { token = "-infinity", type = "reserv", value = "early" },
+  { token = "ad", type = "adbc" },
+  { token = "allballs", type = "reserv", value = "zulu" },
+  { token = "am", type = "ampm" },
+  { token = "apr", type = "month" },
+  { token = "april", type = "month" },
+  { token = "at", type = "ignore_dtf" },
+  { token = "aug", type = "month" },
+  { token = "august", type = "month" },
+  { token = "bc", type = "adbc" },
+  { token = "d", type = "units", value = "day" },
+  { token = "dec", type = "month" },
+  { token = "december", type = "month" },
+  { token = "dow", type = "units", value = "dow" },
+  { token = "doy", type = "units", value = "doy" },
+  { token = "dst", type = "dtzmod" },
+  { token = "epoch", type = "reserv", value = "epoch" },
+  { token = "feb", type = "month" },
+  { token = "february", type = "month" },
+  { token = "fri", type = "dow" },
+  { token = "friday", type = "dow" },
+  { token = "h", type = "units", value = "hour" },
+  { token = "infinity", type = "reserv", value = "late" },
+  { token = "isodow", type = "units", value = "isodow" },
+  { token = "isoyear", type = "units", value = "isoyear" },
+  { token = "j", type = "units", value = "julian" },
+  { token = "jan", type = "month" },
+  { token = "january", type = "month" },
+  { token = "jd", type = "units", value = "julian" },
+  { token = "jul", type = "month" },
+  { token = "julian", type = "units", value = "julian" },
+  { token = "july", type = "month" },
+  { token = "jun", type = "month" },
+  { token = "june", type = "month" },
+  { token = "m", type = "units", value = "month" },
+  { token = "mar", type = "month" },
+  { token = "march", type = "month" },
+  { token = "may", type = "month" },
+  { token = "mm", type = "units", value = "minute" },
+  { token = "mon", type = "dow" },
+  { token = "monday", type = "dow" },
+  { token = "nov", type = "month" },
+  { token = "november", type = "month" },
+  { token = "now", type = "reserv", value = "now" },
+  { token = "oct", type = "month" },
+  { token = "october", type = "month" },
+  { token = "on", type = "ignore_dtf" },
+  { token = "pm", type = "ampm" },
+  { token = "s", type = "units", value = "second" },
+  { token = "sat", type = "dow" },
+  { token = "saturday", type = "dow" },
+  { token = "sep", type = "month" },
+  { token = "sept", type = "month" },
+  { token = "september", type = "month" },
+  { token = "sun", type = "dow" },
+  { token = "sunday", type = "dow" },
+  { token = "t", type = "isotime" },
+  { token = "thu", type = "dow" },
+  { token = "thur", type = "dow" },
+  { token = "thurs", type = "dow" },
+  { token = "thursday", type = "dow" },
+  { token = "today", type = "reserv", value = "today" },
+  { token = "tomorrow", type = "reserv", value = "tomorrow" },
+  { token = "tue", type = "dow" },
+  { token = "tues", type = "dow" },
+  { token = "tuesday", type = "dow" },
+  { token = "wed", type = "dow" },
+  { token = "wednesday", type = "dow" },
+  { token = "weds", type = "dow" },
+  { token = "y", type = "units", value = "year" },
+  { token = "yesterday", type = "reserv", value = "yesterday" },
+]

@@ -96,6 +96,13 @@ eval *logic* they dispatch to stays hand-written (§2).
   `error.rs`/`errors.go`/`errors.ts` (which re-export `SqlState`, so consumers' import paths are
   unchanged). The boundary (§2) holds: the enum is data; nothing that *interprets* an error is
   generated.
+- **Datetime unit names — done** ([../../scripts/gen_datetime_units.rb](../../scripts/gen_datetime_units.rb)).
+  PostgreSQL's `deltatktbl` / `datetktbl` keyword tables, copied into
+  [../types/datetime_units.toml](../types/datetime_units.toml), are generated per core as
+  `datetime_units_gen.{rs,go,ts}` (`DELTA_TOKENS` / `DATE_TOKENS`). The generator also checks the
+  tables' invariants (strict byte order for the binary search, tokens at most `TOKMAXLEN` bytes,
+  known units). The lookup that reads them — case-fold, truncate, search — and what `EXTRACT` /
+  `date_part` / `date_trunc` do with the result stay hand-written ([timezones.md](timezones.md) §9.6).
 - **Scalar types — remaining.** Extend the generator to the scalar set, replacing its hand-mirror
   (§1 option 2). Harder than errors: `scalars.toml` is ragged (integer-only / decimal-only /
   text-only fields) and `ScalarType`'s variant identity is threaded through the codec/comparator,

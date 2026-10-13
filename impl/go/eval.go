@@ -2411,7 +2411,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		unitS := uv.str()
 		switch vv.Kind {
 		case ValTimestamp:
-			r, err := dateTruncMicros(unitS, vv.Int)
+			r, err := dateTruncMicros(unitS, vv.Int, false)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2425,7 +2425,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case ValTimestamptz:
 			mc := vv.Int
 			if mc == posInfinity || mc == negInfinity {
-				if _, err := dateTruncMicros(unitS, mc); err != nil { // still validate the unit
+				if _, err := dateTruncMicros(unitS, mc, true); err != nil { // still validate the unit
 					return Value{}, err
 				}
 				return TimestamptzValue(mc), nil
@@ -2449,7 +2449,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if !ok {
 				return Value{}, errZoneShiftOutOfRange()
 			}
-			trunc, err := dateTruncMicros(unitS, local)
+			trunc, err := dateTruncMicros(unitS, local, true)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2833,7 +2833,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			default:
 				panic("resolver restricts date_part to date/ts/tstz/interval")
 			}
-			if field == "julian" && src.kind != srcIv {
+			if canonicalField(field) == "julian" && src.kind != srcIv {
 				// PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
 				f, err := datePartJulian(src.local)
 				if err != nil {

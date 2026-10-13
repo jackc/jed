@@ -31,6 +31,7 @@ mod costs;
 mod cursor;
 mod date;
 mod datetime_fn;
+mod datetime_units_gen;
 mod decimal;
 mod encoding;
 mod ergonomic;

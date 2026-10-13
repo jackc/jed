@@ -12,7 +12,6 @@ package jed
 
 import (
 	"strconv"
-	"strings"
 )
 
 const (
@@ -122,13 +121,120 @@ func intervalQuarter(months int64) int64 {
 	return -(((-months)%12)/3 + 1)
 }
 
-// DateTruncMicros truncates a wall-clock instant `micros` down to the start of `unit`. ±infinity
-// passes through; an unrecognized unit is 22023.
-func dateTruncMicros(unit string, micros int64) (int64, error) {
+// fieldName is what a unit name means to EXTRACT / date_part (spec/design/timezones.md §9.6):
+// a canonical unit, a reserved word other than epoch, or unknown.
+type fieldName struct {
+	kind int    // fieldUnit, fieldReserved, fieldUnknown
+	unit string // the canonical unit, for fieldUnit
+}
+
+const (
+	fieldUnit = iota
+	fieldReserved
+	fieldUnknown
+)
+
+// lowerUnit is the unit name as PostgreSQL's messages print it: ASCII-lowercased
+// (downcase_truncate_identifier; a non-ASCII letter keeps its case).
+func lowerUnit(name string) string { return asciiLower(name) }
+
+// searchTokens is PostgreSQL's datebsearch: the entry whose token equals the first dtTokenMaxLen
+// bytes of the lowercased name (so "microseconds" finds "microsecon"), or nil.
+func searchTokens(table []dtToken, name string) *dtToken {
+	key := name
+	if len(key) > dtTokenMaxLen {
+		key = key[:dtTokenMaxLen]
+	}
+	lo, hi := 0, len(table)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		switch {
+		case table[mid].token == key:
+			return &table[mid]
+		case table[mid].token < key:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return nil
+}
+
+// decodeUnits is PostgreSQL's DecodeUnits over a lowercased name: the canonical unit a deltatktbl
+// units entry names ("hrs" -> "hour"). date_trunc reads unit names this way.
+func decodeUnits(name string) (string, bool) {
+	if t := searchTokens(dtDeltaTokens, name); t != nil && t.kind == "units" {
+		return t.value, true
+	}
+	return "", false
+}
+
+// decodeField is EXTRACT / date_part's field lookup over a lowercased name: PostgreSQL's
+// DecodeUnits, then DecodeSpecial (datetktbl) when the name is not in deltatktbl at all.
+func decodeField(name string) fieldName {
+	if t := searchTokens(dtDeltaTokens, name); t != nil {
+		if t.kind == "units" {
+			return fieldName{kind: fieldUnit, unit: t.value}
+		}
+		return fieldName{kind: fieldUnknown}
+	}
+	t := searchTokens(dtDateTokens, name)
+	switch {
+	case t == nil:
+		return fieldName{kind: fieldUnknown}
+	case t.kind == "units":
+		return fieldName{kind: fieldUnit, unit: t.value}
+	case t.kind == "reserv" && t.value == "epoch":
+		return fieldName{kind: fieldUnit, unit: "epoch"}
+	case t.kind == "reserv":
+		return fieldName{kind: fieldReserved}
+	default:
+		return fieldName{kind: fieldUnknown}
+	}
+}
+
+// canonicalField is the canonical field an EXTRACT / date_part field name resolves to
+// ("jd" -> "julian"), or "" when it names no field.
+func canonicalField(field string) string {
+	f := decodeField(lowerUnit(field))
+	if f.kind != fieldUnit {
+		return ""
+	}
+	return f.unit
+}
+
+func unitNotRecognized(name, typeName string) error {
+	return newError(InvalidParameterValue, "unit \""+name+"\" not recognized for type "+typeName)
+}
+
+func unitNotSupported(name, typeName string) *EngineError {
+	return newError(FeatureNotSupported, "unit \""+name+"\" not supported for type "+typeName)
+}
+
+// timestampTypeName is a timestamp family's type name, as PostgreSQL's unit messages print it.
+func timestampTypeName(tz bool) string {
+	if tz {
+		return "timestamp with time zone"
+	}
+	return "timestamp without time zone"
+}
+
+// dateTruncMicros truncates a wall-clock instant `micros` down to the start of `unit` (tz names the
+// source type in messages). The unit is resolved first, as PostgreSQL does: an unrecognized unit is
+// 22023 and a timezone* unit 0A000, even over ±infinity, which otherwise passes through unchanged.
+func dateTruncMicros(unit string, micros int64, tz bool) (int64, error) {
+	name := lowerUnit(unit)
+	u, ok := decodeUnits(name)
+	if !ok {
+		return 0, unitNotRecognized(name, timestampTypeName(tz))
+	}
 	if micros == posInfinity || micros == negInfinity {
+		// Validate the unit against a finite probe, then pass the infinity through.
+		if _, err := dateTruncMicros(unit, 0, tz); err != nil {
+			return 0, err
+		}
 		return micros, nil
 	}
-	u := strings.ToLower(unit)
 	y, mo, d, h, mi, s, us := civilFromMicros(micros)
 	rebuild := func(y, mo, d, h, mi, s, us int64) int64 {
 		return daysFromCivil(y, mo, d)*microsPerDayDT +
@@ -179,14 +285,18 @@ func dateTruncMicros(unit string, micros int64) (int64, error) {
 		}
 		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0), nil
 	default:
-		return 0, newError(InvalidParameterValue, "unit \""+unit+"\" not recognized")
+		return 0, unitNotSupported(name, timestampTypeName(tz))
 	}
 }
 
-// dateTruncInterval truncates an interval's fields down to `unit`. `week` is 0A000; an unrecognized
-// unit is 22023.
+// dateTruncInterval truncates an interval's fields down to `unit`. `week` and the timezone* units
+// are 0A000; an unrecognized unit is 22023.
 func dateTruncInterval(unit string, iv Interval) (Interval, error) {
-	u := strings.ToLower(unit)
+	name := lowerUnit(unit)
+	u, ok := decodeUnits(name)
+	if !ok {
+		return Interval{}, unitNotRecognized(name, "interval")
+	}
 	months := int64(iv.Months)
 	micros := iv.Micros
 	keepMd := func(m int64) Interval { return Interval{Months: iv.Months, Days: iv.Days, Micros: m} }
@@ -204,7 +314,7 @@ func dateTruncInterval(unit string, iv Interval) (Interval, error) {
 	case "day":
 		return keepMd(0), nil
 	case "week":
-		return Interval{}, newError(FeatureNotSupported, "unit \"week\" not supported for type interval")
+		return Interval{}, unitNotSupported(name, "interval").withDetail("Months usually have fractional weeks.")
 	case "month":
 		return Interval{Months: iv.Months}, nil
 	case "quarter":
@@ -218,7 +328,7 @@ func dateTruncInterval(unit string, iv Interval) (Interval, error) {
 	case "millennium":
 		return Interval{Months: int32((months / 12000) * 12000)}, nil
 	default:
-		return Interval{}, newError(InvalidParameterValue, "unit \""+unit+"\" not recognized")
+		return Interval{}, unitNotSupported(name, "interval")
 	}
 }
 
@@ -274,32 +384,57 @@ const (
 	srcIv   = 3
 )
 
-// extractField returns EXTRACT(field FROM source) as numeric. An unsupported field for the type is
-// 0A000; an unrecognized field is 22023.
+// extractField returns EXTRACT(field FROM source) as numeric. The field name is resolved first,
+// through PostgreSQL's unit tables (so "hours", "msec", "jd" are hour, milliseconds, julian —
+// timezones.md §9.6); then an unsupported field for the type is 0A000 and an unrecognized field
+// 22023, both ahead of the infinite-source trap.
 func extractField(field string, src extractSrc) (Decimal, error) {
-	f := strings.ToLower(field)
+	name := lowerUnit(field)
+	var typeName string
 	switch src.kind {
 	case srcTs:
-		return extractDatetime(f, src.local, false, 0, 0)
+		typeName = timestampTypeName(false)
 	case srcTstz:
-		return extractDatetime(f, src.local, true, src.instant, src.offsetSecs)
+		typeName = timestampTypeName(true)
 	case srcDate:
-		return extractDate(f, int64(src.days))
+		typeName = "date"
 	default:
-		return extractInterval(f, src.iv)
+		typeName = "interval"
+	}
+	f := decodeField(name)
+	switch {
+	case f.kind == fieldReserved && src.kind != srcIv:
+		// A reserved word other than epoch is unsupported for the date/time types but unrecognized
+		// for an interval — PostgreSQL's interval_part_common checks only epoch.
+		return Decimal{}, unitNotSupported(name, typeName)
+	case f.kind != fieldUnit:
+		return Decimal{}, unitNotRecognized(name, typeName)
+	}
+	switch src.kind {
+	case srcTs:
+		return extractDatetime(f.unit, name, src.local, false, 0, 0)
+	case srcTstz:
+		return extractDatetime(f.unit, name, src.local, true, src.instant, src.offsetSecs)
+	case srcDate:
+		return extractDate(f.unit, name, int64(src.days))
+	default:
+		return extractInterval(f.unit, name, src.iv)
 	}
 }
 
-func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs int64) (Decimal, error) {
+// extractDatetime extracts the canonical `unit` (written as `name`, for messages) from the
+// wall-clock micros of a timestamp / timestamptz.
+func extractDatetime(unit, name string, micros int64, isTz bool, instant, offsetSecs int64) (Decimal, error) {
 	if micros == posInfinity || micros == negInfinity {
-		// jed's decimal is finite-only (decimal.md §2); PG returns ±Infinity — a documented
-		// divergence (timezones.md §9.2).
+		// Every unit is accepted here (PG's NonFiniteTimestampTzPart, even timezone of a
+		// timestamp); jed's decimal is finite-only (decimal.md §2), so 22003 where PG returns
+		// ±Infinity or NULL — a documented divergence (timezones.md §9.2).
 		return Decimal{}, newError(NumericValueOutOfRange, "cannot extract field from an infinite timestamp")
 	}
 	y, mo, d, h, mi, s, us := civilFromMicros(micros)
 	secUs := s*microsPerSecDT + us
 	days := daysFromCivil(y, mo, d)
-	switch field {
+	switch unit {
 	case "microseconds":
 		return decimalScaled(secUs, 0), nil
 	case "milliseconds":
@@ -344,10 +479,9 @@ func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs 
 		return decimalScaled(inst, 6), nil
 	case "timezone", "timezone_hour", "timezone_minute":
 		if !isTz {
-			return Decimal{}, newError(FeatureNotSupported,
-				"unit \""+field+"\" not supported for type timestamp without time zone")
+			return Decimal{}, unitNotSupported(name, timestampTypeName(false))
 		}
-		switch field {
+		switch unit {
 		case "timezone":
 			return decimalFromInt64(offsetSecs), nil
 		case "timezone_hour":
@@ -358,22 +492,22 @@ func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs 
 	case "julian":
 		return extractJulian(micros)
 	default:
-		typ := "timestamp without time zone"
-		if isTz {
-			typ = "timestamp with time zone"
-		}
-		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized for type "+typ)
+		return Decimal{}, unitNotSupported(name, timestampTypeName(isTz))
 	}
 }
 
-func extractDate(field string, days int64) (Decimal, error) {
+// extractDate extracts the canonical `unit` (written as `name`, for messages) from a date.
+func extractDate(unit, name string, days int64) (Decimal, error) {
 	if days == int64(datePosInfinity) || days == int64(dateNegInfinity) {
-		// As for an infinite timestamp: jed's decimal is finite-only, so 22003 where PG returns
-		// ±Infinity or NULL (timezones.md §9.2).
+		// As for an infinite timestamp: an unsupported field is still 0A000 (checked on a finite
+		// probe), else 22003 where PG returns ±Infinity or NULL (timezones.md §9.2).
+		if _, err := extractDate(unit, name, 0); err != nil {
+			return Decimal{}, err
+		}
 		return Decimal{}, newError(NumericValueOutOfRange, "cannot extract field from an infinite date")
 	}
 	y, mo, d := civilFromDays(days)
-	switch field {
+	switch unit {
 	case "day":
 		return decimalFromInt64(d), nil
 	case "month":
@@ -404,22 +538,20 @@ func extractDate(field string, days int64) (Decimal, error) {
 		return decimalFromInt64(days * secsPerDayDT), nil
 	case "julian":
 		return decimalFromInt64(days + unixEpochJD), nil
-	case "microseconds", "milliseconds", "second", "minute", "hour",
-		"timezone", "timezone_hour", "timezone_minute":
-		return Decimal{}, newError(FeatureNotSupported, "unit \""+field+"\" not supported for type date")
 	default:
-		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized for type date")
+		return Decimal{}, unitNotSupported(name, "date")
 	}
 }
 
-func extractInterval(field string, iv Interval) (Decimal, error) {
+// extractInterval extracts the canonical `unit` (written as `name`, for messages) from an interval.
+func extractInterval(unit, name string, iv Interval) (Decimal, error) {
 	months := int64(iv.Months)
 	days := int64(iv.Days)
 	micros := iv.Micros
 	years := months / 12
 	mo := months % 12
 	timeSecUs := micros % microsPerMinDT
-	switch field {
+	switch unit {
 	case "microseconds":
 		return decimalScaled(timeSecUs, 0), nil
 	case "milliseconds":
@@ -449,10 +581,7 @@ func extractInterval(field string, iv Interval) (Decimal, error) {
 	case "epoch":
 		intSecs := years*secsPerIntervalYear + mo*secsPerIntervalMonth + days*secsPerDayDT
 		return decimalFromInt64(intSecs).Add(decimalScaled(micros, 6))
-	case "dow", "isodow", "doy", "isoyear", "julian",
-		"timezone", "timezone_hour", "timezone_minute":
-		return Decimal{}, newError(FeatureNotSupported, "unit \""+field+"\" not supported for type interval")
 	default:
-		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized for type interval")
+		return Decimal{}, unitNotSupported(name, "interval")
 	}
 }
