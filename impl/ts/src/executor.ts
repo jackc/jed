@@ -372,6 +372,7 @@ import {
   intValue,
   isTrue,
   nullValue,
+  decodeHexPairs,
   renderByteaHex,
   renderFloat,
   renderUuid,
@@ -1219,8 +1220,8 @@ export function quoteIdentText(s: string): string {
 }
 
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
-// ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
-// 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
+// skip a space, tab, newline, or carriage return (hex only between digit pairs); a malformed
+// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
 // bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
 export function decodeText(s: string, format: string): Uint8Array {
   const bytes = SQL_BYTE_ENCODER.encode(s);
@@ -1230,41 +1231,24 @@ export function decodeText(s: string, format: string): Uint8Array {
   throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);
 }
 
-export function hexNibble(c: number): number | null {
-  if (c >= 48 && c <= 57) return c - 48; // 0-9
-  if (c >= 97 && c <= 102) return c - 97 + 10; // a-f
-  if (c >= 65 && c <= 70) return c - 65 + 10; // A-F
-  return null;
-}
-
-export function isAsciiWhitespace(c: number): boolean {
-  return c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
-}
-
-// decodeHex: pairs of hex digits (case-insensitive); whitespace ignored; non-hex / odd → 22023.
+// decodeHex is PostgreSQL's hex_decode_safe (decodeHexPairs, shared with bytea hex input): hex
+// digit pairs, with a space, tab, newline, or carriage return skipped between pairs; an invalid
+// digit (whitespace inside a pair included) or an odd digit count traps 22023.
 export function decodeHex(bytes: Uint8Array): Uint8Array {
-  const nibbles: number[] = [];
-  for (const b of bytes) {
-    if (isAsciiWhitespace(b)) continue;
-    const v = hexNibble(b);
-    if (v === null) throw engineError("invalid_parameter_value", "invalid hexadecimal digit");
-    nibbles.push(v);
-  }
-  if (nibbles.length % 2 !== 0)
-    throw engineError("invalid_parameter_value", "invalid hexadecimal data: odd number of digits");
-  const out = new Uint8Array(nibbles.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = (nibbles[2 * i]! << 4) | nibbles[2 * i + 1]!;
-  return out;
+  const r = decodeHexPairs(bytes);
+  if ("error" in r) throw engineError("invalid_parameter_value", r.error);
+  return r.bytes;
 }
 
-// decodeBase64 (RFC 4648); whitespace ignored; out-of-alphabet / data-after-pad → 22023.
+// decodeBase64 (RFC 4648); a space, tab, newline, or carriage return is ignored (PostgreSQL's
+// pg_base64_decode set); out-of-alphabet / data-after-pad → 22023.
 export function decodeBase64(bytes: Uint8Array): Uint8Array {
   const out: number[] = [];
   let acc = 0;
   let nbits = 0;
   let padded = false;
   for (const b of bytes) {
-    if (isAsciiWhitespace(b)) continue;
+    if (b === 32 || b === 9 || b === 10 || b === 13) continue; // ' ' '\t' '\n' '\r'
     if (b === 61) {
       padded = true;
       continue;

@@ -1255,9 +1255,10 @@ pub(crate) fn type_error(msg: impl Into<String>) -> EngineError {
 }
 
 /// Decode a text value as a bytea value — PostgreSQL's `byteain` (types.md §13). A string that
-/// begins with `\x` is the hex input form (`value::parse_bytea_hex`; malformed hex is a `22P02`
-/// carrying the reason); any other string is the traditional escape form, decoded exactly as
-/// `decode(s, 'escape')` (`kernels::decode_escape`: `\\` is one backslash, `\nnn` with three octal
+/// begins with `\x` is the hex input form (`value::parse_bytea_hex`, PostgreSQL's
+/// `hex_decode_safe`: whitespace between digit pairs is skipped; malformed hex is a `22P02` with
+/// PostgreSQL's message — PostgreSQL's code is `22023`); any other string is the traditional escape
+/// form, decoded exactly as `decode(s, 'escape')` (`kernels::decode_escape`: `\\` is one backslash, `\nnn` with three octal
 /// digits ≤ `\377` is one byte, every other byte is itself, and any other backslash is `22P02`).
 /// Used by a string literal adapting to a bytea context (types.md §6), where the trap is
 /// deterministic and fires at resolve time before any scan, and by the per-row text → bytea cast.
@@ -1265,12 +1266,7 @@ pub(crate) fn decode_bytea_literal(s: &str) -> Result<Vec<u8>> {
     if !s.starts_with("\\x") {
         return kernels::decode_escape(s.as_bytes());
     }
-    parse_bytea_hex(s).map_err(|detail| {
-        EngineError::new(
-            SqlState::InvalidTextRepresentation,
-            format!("invalid input syntax for type bytea: {detail}"),
-        )
-    })
+    parse_bytea_hex(s).map_err(|msg| EngineError::new(SqlState::InvalidTextRepresentation, msg))
 }
 
 /// Decode a single-quoted literal's content as a uuid value via PostgreSQL-flexible input

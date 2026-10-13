@@ -315,10 +315,14 @@ RFC-4648-standardized so it agrees byte-for-byte across cores; jed hand-writes i
 three different library deps).
 
 - **`hex`** — two lowercase hex digits per byte. `encode('\x616263'::bytea, 'hex') = '616263'`;
-  `decode` reads pairs of hex digits (case-insensitive), erroring `22023` on an odd length or a
-  non-hex digit.
+  `decode` reads pairs of hex digits (case-insensitive), skipping a space, tab, newline, or
+  carriage return **between** pairs only (PostgreSQL's `hex_decode_safe`, the same decoder as bytea
+  hex input — [types.md](types.md) §13), erroring `22023` on an odd digit count (*"invalid
+  hexadecimal data: odd number of digits"*) or an invalid digit — whitespace inside a pair or any
+  other character (*"invalid hexadecimal digit: "<c>""*).
 - **`base64`** — RFC 4648, and on *encode* PostgreSQL wraps the output at **76 characters** with a
-  `\n` between chunks (no trailing newline); *decode* ignores whitespace. `encode('\x616263'::bytea,
+  `\n` between chunks (no trailing newline); *decode* ignores a space, tab, newline, or carriage
+  return (PostgreSQL's set — a form feed or vertical tab is an invalid symbol). `encode('\x616263'::bytea,
   'base64') = 'YWJj'`. (The corpus pins short values directly and the 76-char wrap via `length`,
   since the harness cannot carry an embedded newline in an expected row.)
 - **`escape`** — a printable byte (`0x01`–`0x7f`) is emitted **verbatim** (including control bytes
@@ -334,7 +338,7 @@ The encode half of the pair above.
 ### `decode(text, format) → bytea`
 
 The decode half — `decode(encode(b, fmt), fmt) = b` for each format. `hex` and `base64` **ignore
-whitespace** (so `decode` round-trips the 76-char-wrapped base64 `encode` produces); a malformed
+a space, tab, newline, or carriage return** (`hex` only between digit pairs; so `decode` round-trips the 76-char-wrapped base64 `encode` produces); a malformed
 hex/base64 string traps `22023`. `escape` decodes over the input's UTF-8 bytes (`\\` → backslash,
 `\nnn` for exactly three octal digits ≤ 255 → that byte, any other byte verbatim); a malformed escape
 (a lone/short backslash, or an octal > 255) traps **`22P02`** — PostgreSQL's distinct code for the

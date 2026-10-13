@@ -79,7 +79,8 @@ test('the types page autoruns the text concatenation demo', async ({ page }) => 
 
 test('the types page autoruns the bytea input demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
-  // hex input \xdeadbeef, escape-format 'abc' = \x616263, 'a\\b\101' = \x615c6241.
+  // hex input '\xdead beef' (whitespace between pairs) = \xdeadbeef, escape-format 'abc' =
+  // \x616263, 'a\\b\101' = \x615c6241.
   const panel = livePanel(page, 'byteaInputDemo');
   const rows = panel.getByTestId('result-rows');
   await expect(rows).toContainText('\\xdeadbeef');

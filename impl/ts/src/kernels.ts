@@ -317,8 +317,9 @@ export function intTypeOf(t: ResolvedType): ScalarType | null {
 }
 
 // decodeByteaLiteral decodes a text value as a bytea value — PostgreSQL's byteain (types.md §13).
-// A string that begins with `\x` is the hex input form (parseByteaHex; malformed hex is a 22P02
-// carrying the reason); any other string is the traditional escape form, decoded exactly as
+// A string that begins with `\x` is the hex input form (parseByteaHex, PostgreSQL's hex_decode_safe:
+// whitespace between digit pairs is skipped; malformed hex is a 22P02 with PostgreSQL's message —
+// PostgreSQL's code is 22023); any other string is the traditional escape form, decoded exactly as
 // decode(s, 'escape') over its UTF-8 bytes (decodeEscape: `\\` is one backslash, `\nnn` with three
 // octal digits ≤ `\377` is one byte, every other byte is itself, and any other backslash is 22P02).
 // Used by a string literal adapting to a bytea context (types.md §6), where the trap is
@@ -327,10 +328,7 @@ export function decodeByteaLiteral(str: string): Uint8Array {
   if (!str.startsWith("\\x")) return decodeEscape(SQL_BYTE_ENCODER.encode(str));
   const r = parseByteaHex(str);
   if ("error" in r) {
-    throw engineError(
-      "invalid_text_representation",
-      "invalid input syntax for type bytea: " + r.error,
-    );
+    throw engineError("invalid_text_representation", r.error);
   }
   return r.bytes;
 }

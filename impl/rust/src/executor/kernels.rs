@@ -486,9 +486,10 @@ pub(crate) fn quote_ident_text(s: &str) -> String {
     out
 }
 
-/// `decode(s, format)` (string-functions.md §3): the inverse of `encode`. `hex` and `base64` ignore
-/// whitespace; a malformed hex/base64 string traps `22023`; a malformed `escape` sequence traps
-/// `22P02` (PostgreSQL's split). An unrecognized format traps `22023`.
+/// `decode(s, format)` (string-functions.md §3): the inverse of `encode`. `hex` and `base64` skip a
+/// space, tab, newline, or carriage return (`hex` only between digit pairs); a malformed hex/base64
+/// string traps `22023`; a malformed `escape` sequence traps `22P02` (PostgreSQL's split). An
+/// unrecognized format traps `22023`.
 pub(crate) fn decode_text(s: &str, format: &str) -> Result<Vec<u8>> {
     match format {
         "hex" => decode_hex(s.as_bytes()),
@@ -501,39 +502,18 @@ pub(crate) fn decode_text(s: &str, format: &str) -> Result<Vec<u8>> {
     }
 }
 
-pub(crate) fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Decode `hex`: pairs of hex digits (case-insensitive); whitespace is ignored; a non-hex byte or an
-/// odd digit count traps `22023`.
+/// Decode `hex`: PostgreSQL's `hex_decode_safe` (`value::decode_hex_pairs`, shared with bytea hex
+/// input) — hex digit pairs, with a space, tab, newline, or carriage return skipped between pairs;
+/// an invalid digit (whitespace inside a pair included) or an odd digit count traps `22023`.
 pub(crate) fn decode_hex(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut nibbles: Vec<u8> = Vec::with_capacity(bytes.len());
-    for &b in bytes {
-        if b.is_ascii_whitespace() {
-            continue;
-        }
-        nibbles.push(hex_nibble(b).ok_or_else(|| {
-            EngineError::new(SqlState::InvalidParameterValue, "invalid hexadecimal digit")
-        })?);
-    }
-    if nibbles.len() % 2 != 0 {
-        return Err(EngineError::new(
-            SqlState::InvalidParameterValue,
-            "invalid hexadecimal data: odd number of digits",
-        ));
-    }
-    Ok(nibbles.chunks(2).map(|p| (p[0] << 4) | p[1]).collect())
+    crate::value::decode_hex_pairs(bytes)
+        .map_err(|msg| EngineError::new(SqlState::InvalidParameterValue, msg))
 }
 
-/// Decode `base64` (RFC 4648); whitespace is ignored; an out-of-alphabet byte (or data after the
-/// `=` padding) traps `22023`. Bit-accumulation: each 6-bit symbol feeds a buffer that emits a byte
-/// per full 8 bits (the trailing <8 bits implied by padding are discarded).
+/// Decode `base64` (RFC 4648); a space, tab, newline, or carriage return is ignored (PostgreSQL's
+/// `pg_base64_decode` set); an out-of-alphabet byte (or data after the `=` padding) traps `22023`.
+/// Bit-accumulation: each 6-bit symbol feeds a buffer that emits a byte per full 8 bits (the
+/// trailing <8 bits implied by padding are discarded).
 pub(crate) fn decode_base64(bytes: &[u8]) -> Result<Vec<u8>> {
     let bad = || {
         EngineError::new(
@@ -546,7 +526,7 @@ pub(crate) fn decode_base64(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut nbits = 0;
     let mut padded = false;
     for &b in bytes {
-        if b.is_ascii_whitespace() {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
             continue;
         }
         if b == b'=' {

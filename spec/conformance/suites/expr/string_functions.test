@@ -5,7 +5,7 @@
 # character-indexing functions count UNICODE CODE POINTS (matching PG's UTF8 character semantics —
 # NOT UTF-8 bytes nor UTF-16 units, the cross-core trap exercised by the astral 😀 below);
 # octet_length / bit_length count UTF-8 bytes / bits. PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, expr.text_concat, resource.cost_metering
 
 # === length(text) → int: the number of characters (code points) ========================
 
@@ -845,6 +845,34 @@ SELECT decode('xyz', 'hex')
 
 statement error 22023
 SELECT decode('616', 'hex')
+
+# decode(s, 'hex') shares bytea input's hex decoder (PostgreSQL hex_decode_safe): a space, tab,
+# newline, or carriage return is skipped between digit pairs only ...
+query T
+SELECT decode(' 61 62' || chr(9) || '63' || chr(10) || chr(13), 'hex')
+----
+\x616263
+
+# ... inside a pair it is an invalid digit (22023) ...
+statement error 22023
+SELECT decode('6 1', 'hex')
+
+# ... and a form feed is no whitespace
+statement error 22023
+SELECT decode('61' || chr(12) || '62', 'hex')
+
+# base64 decode skips exactly the same four characters: a form feed or vertical tab is an invalid
+# symbol (22023)
+query T
+SELECT decode('YW' || chr(13) || chr(10) || 'Jj', 'base64')
+----
+\x616263
+
+statement error 22023
+SELECT decode('YW' || chr(12) || 'Jj', 'base64')
+
+statement error 22023
+SELECT decode('YW' || chr(11) || 'Jj', 'base64')
 
 statement error 22P02
 SELECT decode('\1', 'escape')

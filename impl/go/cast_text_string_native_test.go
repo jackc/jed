@@ -93,3 +93,33 @@ func TestParamCastToIntervalTypesTheParameter(t *testing.T) {
 		t.Fatalf("$1::interval = %s, want 3 days", got)
 	}
 }
+
+func TestByteaHexErrorMessagesArePostgreSQLs(t *testing.T) {
+	t.Parallel()
+	// PostgreSQL's hex_decode_safe messages, shared by bytea hex input on the literal and per-row
+	// paths (jed's code 22P02, PG's 22023) and decode(s, 'hex') (22023, as PG). The corpus checks
+	// only the SQLSTATE, so the message — part of the cross-core contract — is pinned here.
+	cases := []struct{ s, want string }{
+		{`\x0 1`, `invalid hexadecimal digit: " "`},
+		{`\x 0`, "invalid hexadecimal data: odd number of digits"},
+		{`\xzz1`, `invalid hexadecimal digit: "z"`},
+		{`\x0é`, `invalid hexadecimal digit: "é"`},
+	}
+	for _, c := range cases {
+		db := seededText(t, c.s)
+		for _, q := range []struct{ sql, code string }{
+			{"SELECT '" + c.s + "' :: bytea", "22P02"},
+			{"SELECT s :: bytea FROM t", "22P02"},
+			{"SELECT decode('" + c.s[2:] + "', 'hex')", "22023"},
+		} {
+			_, err := queryOutcome(db, q.sql, nil)
+			var ee *EngineError
+			if !asEngineError(err, &ee) {
+				t.Fatalf("%s: expected an EngineError, got %v", q.sql, err)
+			}
+			if ee.Code() != q.code || ee.Message != c.want {
+				t.Fatalf("%s: got %s %q, want %s %q", q.sql, ee.Code(), ee.Message, q.code, c.want)
+			}
+		}
+	}
+}

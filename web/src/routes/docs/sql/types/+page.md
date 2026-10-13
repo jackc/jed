@@ -60,7 +60,7 @@
   '\\x550e8400e29b41d4a716446655440000'::bytea::uuid    AS bytea_to_uuid;`;
 
 	const byteaInputDemo = `SELECT
-  '\\xdeadbeef'::bytea   AS hex,
+  '\\xdead beef'::bytea  AS hex,
   'abc'::bytea          AS plain,
   'a\\\\b\\101'::bytea    AS escaped;`;
 
@@ -305,9 +305,10 @@ casts are a jed convenience PostgreSQL does not offer at all.
 ## Binary strings (bytea)
 
 A `bytea` value is written as a string, read the way PostgreSQL reads it. A string that starts with
-`\x` is **hex**: two hex digits per byte, either case. Any other string is the traditional **escape
-format**: each character is its own UTF-8 bytes, `\\` is one backslash, and `\nnn` (three octal
-digits, `\000` to `\377`) is one byte. Any other backslash raises `22P02`. Output is always hex, as
+`\x` is **hex**: two hex digits per byte, either case, with spaces, tabs, or newlines allowed
+between (not inside) the pairs. Any other string is the traditional **escape format**: each
+character is its own UTF-8 bytes, `\\` is one backslash, and `\nnn` (three octal digits, `\000` to
+`\377`) is one byte. Any other backslash raises `22P02`. Output is always hex, as
 in PostgreSQL by default:
 
 <LiveSql demo="byteaInputDemo" query={byteaInputDemo} rows={1} />

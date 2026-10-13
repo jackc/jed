@@ -1623,30 +1623,66 @@ fn render_bytea_hex(bytes: &[u8]) -> String {
 }
 
 /// Decode a bytea literal from its hex input form (spec/design/types.md §13): a `\x`
-/// prefix followed by an even count of hexadecimal digits (case-insensitive), each pair
-/// one byte; `\x` alone is the empty byte string. This is the inverse of
-/// `render_bytea_hex`, so a value round-trips. On malformed input returns the reason string;
-/// the caller raises it as a `22P02` (invalid_text_representation). The executor's
-/// `decode_bytea_literal` routes here only a string that begins with `\x`; any other string is
-/// the traditional escape input form, decoded by `decode(s, 'escape')`'s kernel instead.
-pub fn parse_bytea_hex(s: &str) -> Result<Vec<u8>, &'static str> {
+/// prefix followed by hexadecimal digit pairs (case-insensitive), each pair one byte, with
+/// whitespace allowed between pairs (`decode_hex_pairs`); `\x` alone is the empty byte string.
+/// This is the inverse of `render_bytea_hex`, so a value round-trips. On malformed input returns
+/// PostgreSQL's message; the caller raises it as a `22P02` (invalid_text_representation). The
+/// executor's `decode_bytea_literal` routes here only a string that begins with `\x`; any other
+/// string is the traditional escape input form, decoded by `decode(s, 'escape')`'s kernel instead.
+pub fn parse_bytea_hex(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'\\' || bytes[1] != b'x' {
-        return Err("bytea hex input must begin with \\x");
+        return Err("bytea hex input must begin with \\x".to_string());
     }
-    let hex = &bytes[2..];
-    if hex.len() % 2 != 0 {
-        return Err("bytea hex input has an odd number of digits");
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
+    decode_hex_pairs(&bytes[2..])
+}
+
+/// PostgreSQL's `hex_decode_safe` (encode.c), shared by bytea hex input and `decode(s, 'hex')`:
+/// hexadecimal digit pairs (case-insensitive), each pair one byte. A space, tab, newline, or
+/// carriage return is skipped *between* pairs only — inside a pair it is an invalid digit. The
+/// scan is left to right, so the first failure wins: a non-hex byte is `invalid hexadecimal digit:
+/// "<c>"` (the whole UTF-8 character starting there, as `pg_mblen_range` takes it), and a final
+/// lone digit is `invalid hexadecimal data: odd number of digits`. Returns PostgreSQL's message;
+/// each caller picks the SQLSTATE.
+pub fn decode_hex_pairs(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut i = 0;
-    while i < hex.len() {
-        let hi = hex_val(hex[i]).ok_or("invalid hexadecimal digit in bytea input")?;
-        let lo = hex_val(hex[i + 1]).ok_or("invalid hexadecimal digit in bytea input")?;
+    while i < bytes.len() {
+        if matches!(bytes[i], b' ' | b'\n' | b'\t' | b'\r') {
+            i += 1;
+            continue;
+        }
+        let hi = hex_val(bytes[i]).ok_or_else(|| invalid_hex_digit(bytes, i))?;
+        i += 1;
+        if i >= bytes.len() {
+            return Err("invalid hexadecimal data: odd number of digits".to_string());
+        }
+        let lo = hex_val(bytes[i]).ok_or_else(|| invalid_hex_digit(bytes, i))?;
+        i += 1;
         out.push((hi << 4) | lo);
-        i += 2;
     }
     Ok(out)
+}
+
+/// PostgreSQL's `invalid hexadecimal digit: "<c>"` message for the character starting at
+/// `bytes[i]`: its UTF-8 sequence length by lead byte (`pg_utf_mblen`), clamped to the input's end
+/// (`pg_mblen_range`).
+fn invalid_hex_digit(bytes: &[u8], i: usize) -> String {
+    let lead = bytes[i];
+    let len = if lead & 0xe0 == 0xc0 {
+        2
+    } else if lead & 0xf0 == 0xe0 {
+        3
+    } else if lead & 0xf8 == 0xf0 {
+        4
+    } else {
+        1
+    };
+    let end = (i + len).min(bytes.len());
+    format!(
+        "invalid hexadecimal digit: \"{}\"",
+        String::from_utf8_lossy(&bytes[i..end])
+    )
 }
 
 /// One hex digit's value (0–15), or None if `b` is not `[0-9a-fA-F]`.

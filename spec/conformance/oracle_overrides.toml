@@ -705,6 +705,26 @@ reason = "jed: malformed bytea hex input (non-hex digit) is 22P02. PostgreSQL re
 
 [[override]]
 file = "types/bytea.test"
+sql = '''SELECT '\x0 1' :: bytea'''
+reason = "jed: whitespace inside a bytea hex digit pair is an invalid hexadecimal digit, 22P02. PostgreSQL reports 22023 invalid_parameter_value (same message). jed owns its bytea-input error surface; a code divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = '''SELECT '\x 0' :: bytea'''
+reason = "jed: malformed bytea hex input (odd digit count, whitespace skipped) is 22P02. PostgreSQL reports 22023 invalid_parameter_value (same message). jed owns its bytea-input error surface; a code divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = '''SELECT ('\x01' || chr(12) || '02') :: bytea'''
+reason = "jed: a form feed in bytea hex input is an invalid hexadecimal digit (only space/tab/newline/CR are skipped), 22P02. PostgreSQL reports 22023 invalid_parameter_value (same message). jed owns its bytea-input error surface; a code divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = '''SELECT ('\x01' || chr(11) || '02') :: bytea'''
+reason = "jed: a vertical tab in bytea hex input is an invalid hexadecimal digit (only space/tab/newline/CR are skipped), 22P02. PostgreSQL reports 22023 invalid_parameter_value (same message). jed owns its bytea-input error surface; a code divergence."
+
+[[override]]
+file = "types/bytea.test"
 sql = "SELECT k, n FROM bk"
 reason = "jed: a full scan iterates the bytea PRIMARY KEY in unsigned-byte (key) order — '' < '\\x61' < '\\x6100ff62' < '\\x6161' < '\\x62' (encoding.md §2.6, bytea-terminated-escape). bytea's byte order matches PostgreSQL's, but with no ORDER BY the row order is unspecified (CLAUDE.md §8) and PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical."
 

@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { EngineError } from "../src/tooling.ts";
 import { intervalValue, render } from "../src/value.ts";
 import { dbWith, errCode, query, queryOutcome } from "./util.ts";
 
@@ -89,4 +90,31 @@ test("$1::interval types the parameter as interval", () => {
   ]);
   if (o.kind !== "query") throw new Error("expected a query result");
   assert.equal(render(o.rows[0][0]), "3 days");
+});
+
+test("bytea hex error messages are PostgreSQL's", () => {
+  // PostgreSQL's hex_decode_safe messages, shared by bytea hex input on the literal and per-row
+  // paths (jed's code 22P02, PG's 22023) and decode(s, 'hex') (22023, as PG). The corpus checks
+  // only the SQLSTATE, so the message — part of the cross-core contract — is pinned here.
+  const cases: [string, string][] = [
+    ["\\x0 1", 'invalid hexadecimal digit: " "'],
+    ["\\x 0", "invalid hexadecimal data: odd number of digits"],
+    ["\\xzz1", 'invalid hexadecimal digit: "z"'],
+    ["\\x0é", 'invalid hexadecimal digit: "é"'],
+  ];
+  for (const [s, want] of cases) {
+    const db = seeded([s]);
+    for (const [sql, code] of [
+      [`SELECT '${s}' :: bytea`, "22P02"],
+      ["SELECT s :: bytea FROM t", "22P02"],
+      [`SELECT decode('${s.slice(2)}', 'hex')`, "22023"],
+    ]) {
+      assert.throws(
+        () => db.execute(sql!),
+        (e: unknown) =>
+          e instanceof EngineError && e.code() === code && e.message === `${code}: ${want}`,
+        sql,
+      );
+    }
+  }
 });

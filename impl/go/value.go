@@ -351,31 +351,69 @@ func (v Value) asF64() float64 {
 // IsFloat reports whether the value is one of the two float widths.
 func (v Value) IsFloat() bool { return v.Kind == ValFloat32 || v.Kind == ValFloat64 }
 
-// ParseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
-// a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
-// pair one byte; `\x` alone is the empty byte string. The inverse of the bytea render form,
-// so a value round-trips. On success the reason is ""; on malformed input the bytes are nil and
-// the reason explains why (the caller raises it as a 22P02). decodeByteaLiteral routes here only
-// a string that begins with `\x`; any other string is the traditional escape input form, decoded
-// by decode(s, 'escape')'s kernel instead.
+// parseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
+// a `\x` prefix followed by hexadecimal digit pairs (case-insensitive), each pair one byte, with
+// whitespace allowed between pairs (decodeHexPairs); `\x` alone is the empty byte string. The
+// inverse of the bytea render form, so a value round-trips. On success the reason is ""; on
+// malformed input the bytes are nil and the reason is PostgreSQL's message (the caller raises it
+// as a 22P02). decodeByteaLiteral routes here only a string that begins with `\x`; any other
+// string is the traditional escape input form, decoded by decode(s, 'escape')'s kernel instead.
 func parseByteaHex(s string) (b []byte, reason string) {
 	if len(s) < 2 || s[0] != '\\' || s[1] != 'x' {
 		return nil, "bytea hex input must begin with \\x"
 	}
-	digits := s[2:]
-	if len(digits)%2 != 0 {
-		return nil, "bytea hex input has an odd number of digits"
-	}
-	out := make([]byte, len(digits)/2)
-	for i := 0; i < len(digits); i += 2 {
-		hi, okHi := hexVal(digits[i])
-		lo, okLo := hexVal(digits[i+1])
-		if !okHi || !okLo {
-			return nil, "invalid hexadecimal digit in bytea input"
+	return decodeHexPairs([]byte(s[2:]))
+}
+
+// decodeHexPairs is PostgreSQL's hex_decode_safe (encode.c), shared by bytea hex input and
+// decode(s, 'hex'): hexadecimal digit pairs (case-insensitive), each pair one byte. A space, tab,
+// newline, or carriage return is skipped *between* pairs only — inside a pair it is an invalid
+// digit. The scan is left to right, so the first failure wins: a non-hex byte is `invalid
+// hexadecimal digit: "<c>"` (the whole UTF-8 character starting there, as pg_mblen_range takes it),
+// and a final lone digit is `invalid hexadecimal data: odd number of digits`. On failure the bytes
+// are nil and the reason is PostgreSQL's message; each caller picks the SQLSTATE.
+func decodeHexPairs(bytes []byte) (b []byte, reason string) {
+	out := make([]byte, 0, len(bytes)/2)
+	i := 0
+	for i < len(bytes) {
+		if c := bytes[i]; c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+			i++
+			continue
 		}
-		out[i/2] = hi<<4 | lo
+		hi, ok := hexVal(bytes[i])
+		if !ok {
+			return nil, invalidHexDigit(bytes, i)
+		}
+		i++
+		if i >= len(bytes) {
+			return nil, "invalid hexadecimal data: odd number of digits"
+		}
+		lo, ok := hexVal(bytes[i])
+		if !ok {
+			return nil, invalidHexDigit(bytes, i)
+		}
+		i++
+		out = append(out, hi<<4|lo)
 	}
 	return out, ""
+}
+
+// invalidHexDigit is PostgreSQL's `invalid hexadecimal digit: "<c>"` message for the character
+// starting at bytes[i]: its UTF-8 sequence length by lead byte (pg_utf_mblen), clamped to the
+// input's end (pg_mblen_range).
+func invalidHexDigit(bytes []byte, i int) string {
+	lead := bytes[i]
+	n := 1
+	switch {
+	case lead&0xe0 == 0xc0:
+		n = 2
+	case lead&0xf0 == 0xe0:
+		n = 3
+	case lead&0xf8 == 0xf0:
+		n = 4
+	}
+	end := min(i+n, len(bytes))
+	return `invalid hexadecimal digit: "` + string(bytes[i:end]) + `"`
 }
 
 // hexVal returns one hex digit's value (0–15) and ok, or (0, false) if b is not [0-9a-fA-F].

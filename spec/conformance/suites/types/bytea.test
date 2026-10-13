@@ -6,7 +6,7 @@
 # context (§6) and decodes as PostgreSQL's byteain does: \x hex input, otherwise the traditional
 # escape format; malformed input traps 22P02. A literal in a NON-bytea context is never decoded (it
 # stays text). Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.bytea, types.array, cast.explicit, cast.operator, cast.string_literal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.bytea, types.array, expr.text_concat, cast.explicit, cast.operator, cast.string_literal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, b bytea)
@@ -108,6 +108,49 @@ INSERT INTO t VALUES (9, '\y00')
 # ... and a comparison literal traps the same way (pre-scan)
 statement error 22P02
 SELECT id FROM t WHERE b = '\xgg'
+
+# --- whitespace in hex input (PostgreSQL hex_decode_safe) ---------------------------------
+# A space, tab, newline, or carriage return is skipped BETWEEN hex digit pairs (and before the
+# first or after the last), on every bytea text-input path: a bytea-context literal ...
+query I nosort
+SELECT id FROM t WHERE b = '\x de ad  be ef '
+----
+1
+
+# ... a literal cast, where whitespace-only hex input is the empty byte string ...
+query TT nosort
+SELECT '\x 01 02' :: bytea, '\x ' :: bytea
+----
+\x0102
+\x
+
+# ... the per-row text -> bytea cast (tab, newline, carriage return) ...
+query T nosort
+SELECT ('\x01' || chr(9) || '02' || chr(10) || chr(13) || '03') :: bytea
+----
+\x010203
+
+# ... and an array element
+query T nosort
+SELECT '{"\\x 01 02"}' :: bytea[]
+----
+{"\\x0102"}
+
+# whitespace INSIDE a digit pair is an invalid digit (22P02) ...
+statement error 22P02
+SELECT '\x0 1' :: bytea
+
+# ... a lone final digit is still an odd digit count, whitespace aside ...
+statement error 22P02
+SELECT '\x 0' :: bytea
+
+# ... and only those four characters are whitespace: a form feed or vertical tab is an invalid
+# digit
+statement error 22P02
+SELECT ('\x01' || chr(12) || '02') :: bytea
+
+statement error 22P02
+SELECT ('\x01' || chr(11) || '02') :: bytea
 
 # --- the traditional escape input format (PostgreSQL byteain) ------------------------------
 # A string that does NOT begin with \x is read in escape format: \\ is one backslash, \nnn (three

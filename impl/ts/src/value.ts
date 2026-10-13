@@ -373,30 +373,61 @@ export function renderByteaHex(bytes: Uint8Array): string {
 }
 
 // parseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
-// a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
-// pair one byte; `\x` alone is the empty byte string. The inverse of renderByteaHex, so a
-// value round-trips. Returns the bytes on success, or { error } describing malformed input (the
-// caller raises it as a 22P02). decodeByteaLiteral routes here only a string that begins with
-// `\x`; any other string is the traditional escape input form, decoded by decode(s, 'escape')'s
-// kernel instead.
+// a `\x` prefix followed by hexadecimal digit pairs (case-insensitive), each pair one byte, with
+// whitespace allowed between pairs (decodeHexPairs, over the string's UTF-8 bytes); `\x` alone is
+// the empty byte string. The inverse of renderByteaHex, so a value round-trips. Returns the bytes
+// on success, or { error } carrying PostgreSQL's message (the caller raises it as a 22P02).
+// decodeByteaLiteral routes here only a string that begins with `\x`; any other string is the
+// traditional escape input form, decoded by decode(s, 'escape')'s kernel instead.
 export function parseByteaHex(s: string): { bytes: Uint8Array } | { error: string } {
   if (s.length < 2 || s[0] !== "\\" || s[1] !== "x") {
     return { error: "bytea hex input must begin with \\x" };
   }
-  const digits = s.slice(2);
-  if (digits.length % 2 !== 0) {
-    return { error: "bytea hex input has an odd number of digits" };
-  }
-  const out = new Uint8Array(digits.length / 2);
-  for (let i = 0; i < digits.length; i += 2) {
-    const hi = hexVal(digits.charCodeAt(i));
-    const lo = hexVal(digits.charCodeAt(i + 1));
-    if (hi < 0 || lo < 0) {
-      return { error: "invalid hexadecimal digit in bytea input" };
+  return decodeHexPairs(HEX_INPUT_ENCODER.encode(s.slice(2)));
+}
+
+const HEX_INPUT_ENCODER = new TextEncoder();
+const HEX_ERROR_DECODER = new TextDecoder();
+
+// decodeHexPairs is PostgreSQL's hex_decode_safe (encode.c), shared by bytea hex input and
+// decode(s, 'hex'): hexadecimal digit pairs (case-insensitive), each pair one byte. A space, tab,
+// newline, or carriage return is skipped *between* pairs only — inside a pair it is an invalid
+// digit. The scan is left to right, so the first failure wins: a non-hex byte is `invalid
+// hexadecimal digit: "<c>"` (the whole UTF-8 character starting there, as pg_mblen_range takes it),
+// and a final lone digit is `invalid hexadecimal data: odd number of digits`. Returns the bytes, or
+// { error } carrying PostgreSQL's message; each caller picks the SQLSTATE.
+export function decodeHexPairs(bytes: Uint8Array): { bytes: Uint8Array } | { error: string } {
+  const out: number[] = [];
+  let i = 0;
+  while (i < bytes.length) {
+    const c = bytes[i]!;
+    if (c === 32 || c === 10 || c === 9 || c === 13) {
+      i++; // ' ' '\n' '\t' '\r'
+      continue;
     }
-    out[i / 2] = (hi << 4) | lo;
+    const hi = hexVal(c);
+    if (hi < 0) return { error: invalidHexDigit(bytes, i) };
+    i++;
+    if (i >= bytes.length) return { error: "invalid hexadecimal data: odd number of digits" };
+    const lo = hexVal(bytes[i]!);
+    if (lo < 0) return { error: invalidHexDigit(bytes, i) };
+    i++;
+    out.push((hi << 4) | lo);
   }
-  return { bytes: out };
+  return { bytes: Uint8Array.from(out) };
+}
+
+// invalidHexDigit is PostgreSQL's `invalid hexadecimal digit: "<c>"` message for the character
+// starting at bytes[i]: its UTF-8 sequence length by lead byte (pg_utf_mblen), clamped to the
+// input's end (pg_mblen_range).
+function invalidHexDigit(bytes: Uint8Array, i: number): string {
+  const lead = bytes[i]!;
+  let n = 1;
+  if ((lead & 0xe0) === 0xc0) n = 2;
+  else if ((lead & 0xf0) === 0xe0) n = 3;
+  else if ((lead & 0xf8) === 0xf0) n = 4;
+  const end = Math.min(i + n, bytes.length);
+  return `invalid hexadecimal digit: "${HEX_ERROR_DECODER.decode(bytes.subarray(i, end))}"`;
 }
 
 // hexVal returns one hex digit's value (0–15) from its char code, or -1 if not [0-9a-fA-F].

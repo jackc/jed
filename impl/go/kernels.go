@@ -542,8 +542,9 @@ func quoteIdentText(s string) string {
 }
 
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
-// ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
-// 22P02 (PostgreSQL's split). An unrecognized format traps 22023.
+// skip a space, tab, newline, or carriage return (hex only between digit pairs); a malformed
+// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split). An
+// unrecognized format traps 22023.
 func decodeText(s, format string) ([]byte, error) {
 	switch format {
 	case "hex":
@@ -557,48 +558,19 @@ func decodeText(s, format string) ([]byte, error) {
 	}
 }
 
-func hexNibble(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	default:
-		return 0, false
-	}
-}
-
-func isASCIIWhitespace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
-}
-
-// decodeHex: pairs of hex digits (case-insensitive); whitespace is ignored; a non-hex byte or an odd
-// digit count traps 22023.
+// decodeHex is PostgreSQL's hex_decode_safe (decodeHexPairs, shared with bytea hex input): hex
+// digit pairs, with a space, tab, newline, or carriage return skipped between pairs; an invalid
+// digit (whitespace inside a pair included) or an odd digit count traps 22023.
 func decodeHex(bytes []byte) ([]byte, error) {
-	var nibbles []byte
-	for _, b := range bytes {
-		if isASCIIWhitespace(b) {
-			continue
-		}
-		v, ok := hexNibble(b)
-		if !ok {
-			return nil, newError(InvalidParameterValue, "invalid hexadecimal digit")
-		}
-		nibbles = append(nibbles, v)
+	b, reason := decodeHexPairs(bytes)
+	if reason != "" {
+		return nil, newError(InvalidParameterValue, reason)
 	}
-	if len(nibbles)%2 != 0 {
-		return nil, newError(InvalidParameterValue, "invalid hexadecimal data: odd number of digits")
-	}
-	out := make([]byte, 0, len(nibbles)/2)
-	for i := 0; i < len(nibbles); i += 2 {
-		out = append(out, nibbles[i]<<4|nibbles[i+1])
-	}
-	return out, nil
+	return b, nil
 }
 
-// decodeBase64 (RFC 4648); whitespace is ignored; an out-of-alphabet byte (or data after the =
+// decodeBase64 (RFC 4648); a space, tab, newline, or carriage return is ignored (PostgreSQL's
+// pg_base64_decode set); an out-of-alphabet byte (or data after the =
 // padding) traps 22023. Bit-accumulation emits a byte per full 8 bits.
 func decodeBase64(bytes []byte) ([]byte, error) {
 	bad := func() error { return newError(InvalidParameterValue, "invalid base64 end sequence") }
@@ -607,7 +579,7 @@ func decodeBase64(bytes []byte) ([]byte, error) {
 	nbits := 0
 	padded := false
 	for _, b := range bytes {
-		if isASCIIWhitespace(b) {
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
 			continue
 		}
 		if b == '=' {
@@ -1328,8 +1300,9 @@ func isAdaptableOperand(e exprNode) bool {
 }
 
 // decodeByteaLiteral decodes a text value as a bytea value — PostgreSQL's byteain (types.md §13).
-// A string that begins with `\x` is the hex input form (parseByteaHex; malformed hex is a 22P02
-// carrying the reason); any other string is the traditional escape form, decoded exactly as
+// A string that begins with `\x` is the hex input form (parseByteaHex, PostgreSQL's hex_decode_safe:
+// whitespace between digit pairs is skipped; malformed hex is a 22P02 with PostgreSQL's message —
+// PostgreSQL's code is 22023); any other string is the traditional escape form, decoded exactly as
 // decode(s, 'escape') (decodeEscape: `\\` is one backslash, `\nnn` with three octal digits ≤ `\377`
 // is one byte, every other byte is itself, and any other backslash is 22P02). Used by a string
 // literal adapting to a bytea context (types.md §6), where the trap is deterministic and fires at
@@ -1340,7 +1313,7 @@ func decodeByteaLiteral(s string) ([]byte, error) {
 	}
 	b, reason := parseByteaHex(s)
 	if reason != "" {
-		return nil, newError(InvalidTextRepresentation, "invalid input syntax for type bytea: "+reason)
+		return nil, newError(InvalidTextRepresentation, reason)
 	}
 	return b, nil
 }

@@ -656,12 +656,18 @@ context** (§6) — `INSERT INTO t VALUES (1, '\xdeadbeef')`, `UPDATE t SET b = 
 `WHERE b = '\xab'`. The string is decoded exactly as PostgreSQL's `byteain` decodes it, in one of
 two formats chosen by its first two characters:
 
-- **Hex** — a string beginning with `\x` (lowercase `x`): an **even** count of hexadecimal digits
-  (case-insensitive) follows, each pair one byte; `'\x'` alone is the empty byte string. This is
-  the same form as the render output (below), so it round-trips exactly. An odd digit count or a
-  non-hex character traps **`22P02`** (`invalid_text_representation`) — PostgreSQL reports
-  `22023` for these two, a ledgered code divergence. PostgreSQL also skips whitespace between
-  hex digit pairs; jed does not yet (a `22P02`, a deferred sub-feature below).
+- **Hex** — a string beginning with `\x` (lowercase `x`): pairs of hexadecimal digits
+  (case-insensitive) follow, each pair one byte; `'\x'` alone is the empty byte string. This is
+  the same form as the render output (below), so it round-trips exactly. Exactly as PostgreSQL's
+  `hex_decode_safe`, a space, tab, newline, or carriage return is skipped **between** pairs (and
+  before the first or after the last: `'\x de ad '` is `\xdead`), but not inside one — there it
+  is an invalid digit, like a form feed, a vertical tab, or any other non-hex character. The scan is
+  left to right and the first failure wins: an invalid digit traps with PostgreSQL's message
+  *invalid hexadecimal digit: "<c>"* (the whole character), and a final lone digit with
+  *invalid hexadecimal data: odd number of digits*. jed's code for both is **`22P02`**
+  (`invalid_text_representation`) — PostgreSQL reports `22023`, a ledgered code divergence. The
+  decoder is the one `decode(s, 'hex')` uses (string-functions.md §4), which reports `22023` as
+  PostgreSQL does.
 - **Escape** — any other string, PostgreSQL's traditional escape format: `\\` is one backslash
   byte, `\nnn` (exactly three octal digits, the first `0`–`3`, so `\000`–`\377`) is the one byte
   of that value, and every other character stands for its own UTF-8 bytes (`'abc'` is
@@ -699,8 +705,6 @@ over-`RECORD_MAX` bytea key is rejected `0A000` (the same node-fit limit as text
 
 **Deferred bytea sub-features** (relaxable narrowings, each its own follow-up):
 
-- **Whitespace inside hex input** (`'\x de ad'`) — PostgreSQL's `hex_decode` skips whitespace
-  between digit pairs; jed's hex input does not (`22P02`).
 - **The hash functions** (`md5`, `sha256`, …). The rest of PostgreSQL's binary-string surface has
   landed: `length` / `octet_length` / `bit_length`, `||`, `substr` / `substring`, `get_byte` /
   `set_byte`, `get_bit` / `set_bit`, `overlay`, `position`, and `btrim` / `ltrim` / `rtrim`

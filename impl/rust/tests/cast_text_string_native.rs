@@ -118,3 +118,32 @@ fn param_cast_to_interval_types_the_parameter() {
         "3 days"
     );
 }
+
+#[test]
+fn bytea_hex_error_messages_are_postgresqls() {
+    // PostgreSQL's hex_decode_safe messages, shared by bytea hex input on the literal and per-row
+    // paths (jed's code 22P02, PG's 22023) and decode(s, 'hex') (22023, as PG). The corpus checks
+    // only the SQLSTATE, so the message — part of the cross-core contract — is pinned here.
+    let cases = [
+        (r"\x0 1", r#"invalid hexadecimal digit: " ""#),
+        (r"\x 0", "invalid hexadecimal data: odd number of digits"),
+        (r"\xzz1", r#"invalid hexadecimal digit: "z""#),
+        (r"\x0é", r#"invalid hexadecimal digit: "é""#),
+    ];
+    for (s, want) in cases {
+        let mut db = seeded(&[s]);
+        for (sql, code) in [
+            (format!("SELECT '{s}' :: bytea"), "22P02"),
+            ("SELECT s :: bytea FROM t".to_string(), "22P02"),
+            (format!("SELECT decode('{}', 'hex')", &s[2..]), "22023"),
+        ] {
+            match db.query_outcome(&sql, &[]) {
+                Err(e) => {
+                    assert_eq!(e.code(), code, "{sql}");
+                    assert_eq!(e.message, want, "{sql}");
+                }
+                Ok(_) => panic!("expected error for {sql}"),
+            }
+        }
+    }
+}
