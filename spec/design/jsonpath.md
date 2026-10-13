@@ -88,6 +88,30 @@ named variables `$name` (bound by the `vars` argument, §5), `.datetime(template
 as obsolete; the only narrowing is the `like_regex` flag set (§4.3), a consequence of jed's
 deliberate regex subset.
 
+### 2.1 String escapes
+
+A quoted string (a `."key"` member or a string literal) takes PostgreSQL's jsonpath scanner escapes
+(`jsonpath_scan.l`), which are wider than JSON's:
+
+- `\b \f \n \r \t \v` are the control characters.
+- `\uXXXX` (exactly four hex digits) and `\u{X…}` (one to six) are code points. A run of consecutive
+  `\u` escapes is one token: a high surrogate must be followed, within the run, by a low surrogate,
+  and the pair combines (`\ud83d\ude00`, `\u{D800}\u{DC00}`).
+- `\xHH` (exactly two hex digits) is a code point.
+- A backslash before any other character is that character (`\"`, `\\`, `\/`, `\q`).
+
+The errors are PostgreSQL's. A malformed `\u` or `\x`, or a backslash ending the input, is `42601`.
+Because the run is lexed whole first, a malformed escape anywhere in it wins over a decode error
+earlier in it. A code point above U+10FFFF is `42601` (`invalid Unicode code point`). An unpaired
+surrogate is `22P02` `invalid input syntax for type jsonpath` with the Detail `Unicode low surrogate
+must follow a high surrogate.` or `Unicode high surrogate must not follow a high surrogate.`. A NUL,
+however spelled (`\u0000`, `\u{0}`, `\x00`), is `22P05` `unsupported Unicode escape sequence` with
+the Detail `\u0000 cannot be converted to text.`, as for JSON input ([json.md](json.md) §4.2).
+
+An *unquoted* member name (`$.key`) still takes only ASCII letters, digits, `_`, and `$`, and no
+escapes. PostgreSQL's scanner admits any character outside its special set there (`$.é`, `$.a~b`)
+and the same backslash escapes (`$.a\u0041`); that wider lexing is a follow-on.
+
 ---
 
 ## 3. Evaluation model — an ordered sequence of `jsonb` items
@@ -369,7 +393,8 @@ Register the SQL/JSON class-22 subcodes in [../errors/registry.toml](../errors/r
 Reuse existing codes where PG does: **`42601`** for a malformed path *literal* (syntax-error
 class, at resolve), **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
 unsupported `s`/`m`/`x` regex flags (§4.3), and **`22P02`** for malformed JSON in the
-`json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)).
+`json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)). A string escape that decodes
+to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1).
 
 **Nesting limit — `54001`.** The compiler counts program nesting (+1 per filter `?(`,
 parenthesized predicate group, `!`, and `&&`/`||` chain step) and rejects a path past

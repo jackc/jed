@@ -333,3 +333,50 @@ case: jsonb_set_lax bad treatment has no detail
 run: SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'bogus')
 code: 22023
 no-detail
+
+# --- 22P05 / 22P02 JSON and jsonpath \u escapes (json.md §4.2, jsonpath.md §2.1) -------------------
+
+case: jsonb NUL escape
+run: SELECT '"\u0000"'::jsonb
+code: 22P05
+detail: \u0000 cannot be converted to text.
+
+case: jsonb lone low surrogate
+run: SELECT '"\udc00"'::jsonb
+code: 22P02
+detail: Unicode low surrogate must follow a high surrogate.
+
+case: jsonb unpaired high surrogate
+run: SELECT '"\ud800x"'::jsonb
+code: 22P02
+detail: Unicode low surrogate must follow a high surrogate.
+
+case: jsonb doubled high surrogate
+run: SELECT '"\ud800\ud800"'::jsonb
+code: 22P02
+detail: Unicode high surrogate must not follow a high surrogate.
+
+case: jsonb malformed hex escape
+run: SELECT '"\u00zz"'::jsonb
+code: 22P02
+detail: "\u" must be followed by four hexadecimal digits.
+
+case: json accessor NUL escape
+run: SELECT '{"a": "\u0000"}'::json ->> 'a'
+code: 22P05
+detail: \u0000 cannot be converted to text.
+
+case: jsonpath NUL escape
+run: SELECT '$ ? (@ == "\u0000")'::jsonpath
+code: 22P05
+detail: \u0000 cannot be converted to text.
+
+case: jsonpath lone high surrogate
+run: SELECT '$ ? (@ == "\ud800")'::jsonpath
+code: 22P02
+detail: Unicode low surrogate must follow a high surrogate.
+
+case: jsonpath doubled high surrogate
+run: SELECT '$ ? (@ == "\ud800\ud800")'::jsonpath
+code: 22P02
+detail: Unicode high surrogate must not follow a high surrogate.

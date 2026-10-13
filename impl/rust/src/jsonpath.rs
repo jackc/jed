@@ -811,7 +811,11 @@ impl Parser<'_> {
         }
     }
 
-    /// Parse a `"…"` jsonpath string (JSON escapes).
+    /// Parse a `"…"` jsonpath string — a port of PostgreSQL's jsonpath scanner escapes
+    /// (jsonpath_scan.l, jsonpath.md §2.1): `\b \f \n \r \t \v`; a run of `\uXXXX` / `\u{X…}`
+    /// (1–6 hex digits) escapes, within which a surrogate pair combines; `\xHH`; and a backslash
+    /// before any other character is that character. A decoded NUL is `22P05`, an unpaired surrogate
+    /// `22P02` (PG's Detail), and a malformed `\u` / `\x` or a code point above U+10FFFF `42601`.
     fn parse_quoted(&mut self) -> Result<String> {
         self.i += 1; // opening "
         let mut out = String::new();
@@ -822,42 +826,104 @@ impl Parser<'_> {
                     self.i += 1;
                     return Ok(out);
                 }
-                Some(b'\\') => {
-                    self.i += 1;
-                    match self.peek() {
-                        Some(b'"') => out.push('"'),
-                        Some(b'\\') => out.push('\\'),
-                        Some(b'/') => out.push('/'),
-                        Some(b'n') => out.push('\n'),
-                        Some(b'r') => out.push('\r'),
-                        Some(b't') => out.push('\t'),
-                        Some(b'b') => out.push('\u{08}'),
-                        Some(b'f') => out.push('\u{0c}'),
-                        Some(b'u') => {
-                            let hex = self.s.get(self.i + 1..self.i + 5);
-                            let cp = hex
-                                .and_then(|h| std::str::from_utf8(h).ok())
-                                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                                .ok_or_else(|| malformed("invalid \\u escape"))?;
-                            out.push(
-                                char::from_u32(cp)
-                                    .ok_or_else(|| malformed("invalid \\u escape"))?,
-                            );
-                            self.i += 4;
-                        }
-                        _ => return Err(malformed("invalid escape")),
+                Some(b'\\') => match self.s.get(self.i + 1).copied() {
+                    None => return Err(malformed("unexpected end after backslash")),
+                    Some(b'u') => self.parse_unicode_run(&mut out)?,
+                    Some(b'x') => {
+                        let hex = self.s.get(self.i + 2..self.i + 4);
+                        let ch = hex
+                            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                            .and_then(|h| std::str::from_utf8(h).ok())
+                            .and_then(|h| u32::from_str_radix(h, 16).ok())
+                            .ok_or_else(|| malformed("invalid hexadecimal character sequence"))?;
+                        push_code_point(ch, &mut out)?;
+                        self.i += 4;
                     }
-                    self.i += 1;
-                }
-                Some(_) => {
-                    // Copy one UTF-8 char.
-                    let start = self.i;
-                    let len = utf8_len(self.s[self.i]);
-                    self.i += len;
-                    out.push_str(&String::from_utf8_lossy(&self.s[start..self.i]));
-                }
+                    Some(c) => {
+                        self.i += 1; // the backslash; the escaped character follows
+                        match c {
+                            b'b' => out.push('\u{08}'),
+                            b'f' => out.push('\u{0c}'),
+                            b'n' => out.push('\n'),
+                            b'r' => out.push('\r'),
+                            b't' => out.push('\t'),
+                            b'v' => out.push('\u{0b}'),
+                            _ => {
+                                self.push_char(&mut out);
+                                continue;
+                            }
+                        }
+                        self.i += 1;
+                    }
+                },
+                Some(_) => self.push_char(&mut out),
             }
         }
+    }
+
+    /// Copy the one UTF-8 character at the cursor.
+    fn push_char(&mut self, out: &mut String) {
+        let start = self.i;
+        self.i += utf8_len(self.s[self.i]);
+        out.push_str(&String::from_utf8_lossy(&self.s[start..self.i]));
+    }
+
+    /// A run of consecutive `\u` escapes (the cursor at the first `\`) — PG's `{unicode}+` token,
+    /// lexed whole before any is decoded, so a malformed escape anywhere in the run is `42601` ahead
+    /// of a decode error. Decoding is PG's `addUnicode`: a high surrogate must be followed, within the
+    /// run, by a low one (the pair combines); a lone or doubled surrogate is `22P02`.
+    fn parse_unicode_run(&mut self, out: &mut String) -> Result<()> {
+        let mut units = Vec::new();
+        while self.s.get(self.i) == Some(&b'\\') && self.s.get(self.i + 1) == Some(&b'u') {
+            self.i += 2;
+            let braced = self.eat(b'{');
+            let start = self.i;
+            let max = if braced { 6 } else { 4 };
+            while self.i - start < max && self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                self.i += 1;
+            }
+            let digits = self.i - start;
+            if (braced && (digits == 0 || !self.eat(b'}'))) || (!braced && digits < 4) {
+                return Err(malformed("invalid Unicode escape sequence"));
+            }
+            let hex =
+                std::str::from_utf8(&self.s[start..start + digits]).expect("ASCII hex digits");
+            units.push(u32::from_str_radix(hex, 16).expect("1-6 hex digits fit a u32"));
+        }
+        let mut hi_surrogate: Option<u32> = None;
+        for mut ch in units {
+            if (0xD800..=0xDBFF).contains(&ch) {
+                if hi_surrogate.is_some() {
+                    return Err(crate::json::escape_syntax_error(
+                        "jsonpath",
+                        crate::json::HIGH_SURROGATE_DETAIL,
+                    ));
+                }
+                hi_surrogate = Some(ch);
+                continue;
+            } else if (0xDC00..=0xDFFF).contains(&ch) {
+                let Some(hi) = hi_surrogate.take() else {
+                    return Err(crate::json::escape_syntax_error(
+                        "jsonpath",
+                        crate::json::LOW_SURROGATE_DETAIL,
+                    ));
+                };
+                ch = 0x10000 + (((hi - 0xD800) << 10) | (ch - 0xDC00));
+            } else if hi_surrogate.is_some() {
+                return Err(crate::json::escape_syntax_error(
+                    "jsonpath",
+                    crate::json::LOW_SURROGATE_DETAIL,
+                ));
+            }
+            push_code_point(ch, out)?;
+        }
+        if hi_surrogate.is_some() {
+            return Err(crate::json::escape_syntax_error(
+                "jsonpath",
+                crate::json::LOW_SURROGATE_DETAIL,
+            ));
+        }
+        Ok(())
     }
 
     /// Parse a `[…]` subscript list (the opening `[` consumed, not the wildcard form). Each subscript
@@ -1136,6 +1202,24 @@ impl Parser<'_> {
         } else {
             false
         }
+    }
+}
+
+/// Append a decoded escape's code point — PG's `addUnicodeChar`: NUL is `22P05` (text cannot hold
+/// it), a value above U+10FFFF `42601` ("invalid Unicode code point").
+fn push_code_point(ch: u32, out: &mut String) -> Result<()> {
+    if ch == 0 {
+        return Err(crate::json::unicode_zero_error());
+    }
+    match char::from_u32(ch) {
+        Some(c) => {
+            out.push(c);
+            Ok(())
+        }
+        None => Err(EngineError::new(
+            SqlState::SyntaxError,
+            "invalid Unicode code point",
+        )),
     }
 }
 

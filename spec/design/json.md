@@ -241,6 +241,51 @@ divergence. A bare string literal still adapts through `json_in` / `jsonb_in`, a
 Composite-column UPDATE, `jsonpath` columns, and the separately documented container-parameter /
 upsert limitations are unaffected by this scalar rule.
 
+### 4.2 `\u` escapes: lexed vs. decoded
+
+Text cannot hold the NUL character, and a string is a sequence of code points, so two `\u` escapes
+have no text value: `\u0000`, and a UTF-16 surrogate that is not one half of a high-then-low pair.
+jed follows PostgreSQL's lexer (`json_lex_string` in `src/common/jsonapi.c`), which checks them only
+when it **decodes** string contents (its `need_escapes` mode). Each core's JSON parser carries the
+same flag:
+
+- **Decoding** combines `\uD83D\uDE00` into one code point. A high surrogate followed by anything but
+  a `\u` low surrogate, a low surrogate with no high one before it, or a string ending on a high
+  surrogate is `22P02` `invalid input syntax for type json`. A decoded `\u0000` is `22P05`
+  `unsupported Unicode escape sequence`. Both carry PostgreSQL's Detail
+  ([error-fields.md](error-fields.md) §9.2): `Unicode low surrogate must follow a high surrogate.`,
+  `Unicode high surrogate must not follow a high surrogate.`, or `\u0000 cannot be converted to text.`
+- **Lexing only** checks that `\u` has four hex digits (else `22P02` with the Detail
+  `"\u" must be followed by four hexadecimal digits.`, in either mode). It accepts `\u0000` and
+  unpaired surrogates.
+
+Where each mode applies is PostgreSQL's per-function choice:
+
+| decodes (whole document) | lexes only |
+|---|---|
+| `jsonb_in` (literal, cast, column), `json → jsonb`, `to_jsonb(json)` | `json_in` (literal, cast, column): the escape is stored verbatim |
+| `-> ->> #> #>>` on `json` | `json_typeof`, `json_array_length` |
+| `json_each[_text]`, `json_array_elements_text`, `json_object_keys` | `json_array_elements` |
+| `json_strip_nulls`, `json_to_record[set]`, `json_populate_record[set]` | `JSON(text)` and `IS JSON` without `UNIQUE KEYS` |
+| `JSON_VALUE` / `JSON_QUERY` / `JSON_EXISTS` / `JSON_TABLE` over a `json` context | |
+| `JSON(text WITH UNIQUE KEYS)`; `IS JSON WITH UNIQUE KEYS` (an error makes it false) | |
+
+A decoding function checks the **whole** document, not just the matched path:
+`'{"a": 1, "b": "\u0000"}'::json -> 'a'` is `22P05`. Errors surface in document order. One rule
+follows from PostgreSQL's streaming parse: a function that raises a `22023` kind error on its root
+raises it at the root's opening bracket, before lexing anything inside it, but lexes a scalar root
+before raising. So `json_each('["\u0000"]')` is `22023` and `json_each('"\u0000"')` is `22P05`.
+`json_to_recordset` meets its array elements one at a time: an earlier element's conversion error
+comes before a later element's escape error, and a non-object element raises at its bracket (an
+array) or after its token (a scalar). Reading a `json` context for the SQL/JSON query functions is
+the context's conversion, not path evaluation, so `ON ERROR` does not catch it.
+
+The `json` builders that canonicalize a `json` argument instead of embedding its text (`to_json`,
+`array_to_json`, and the json aggregates — an existing documented divergence,
+[json-sql-functions.md](json-sql-functions.md) §2) decode it as `jsonb_in` does, so they raise on these
+escapes where PostgreSQL embeds them unchanged. jsonpath string literals follow the same two rules
+with jsonpath's own escape set ([jsonpath.md](jsonpath.md) §2.1).
+
 ---
 
 ## 5. Comparison / ordering
@@ -317,10 +362,11 @@ them too).
 ### 6.2 Text I/O
 
 - **`json_in`** — validate RFC-8259 well-formedness; store verbatim UTF-8 (§4). Malformed
-  input → `22P02`.
+  input → `22P02`. It only lexes `\u` escapes, so `\u0000` and unpaired surrogates are stored (§4.2).
 - **`json_out`** — return the stored bytes verbatim.
 - **`jsonb_in`** — parse to the node tree (numbers→`decimal`, keys deduped last-wins then
-  sorted length-then-bytewise §2.3), encode the §2 body. Malformed input → `22P02`.
+  sorted length-then-bytewise §2.3), encode the §2 body. Malformed input → `22P02`; it decodes
+  escapes, so an unpaired surrogate is `22P02` and `\u0000` is `22P05` (§4.2).
 - **`jsonb_out`** — render the **canonical** PG style: one space after each `:` and `,`
   (`{"a": 1, "b": [1, 2]}`), keys in canonical order, numbers via the `decimal` renderer
   (scale preserved, e.g. `1.50`), strings JSON-escaped, `true`/`false`/`null` lowercase.
@@ -333,6 +379,8 @@ them too).
 | failure | code |
 |---|---|
 | malformed JSON in `json_in` / `jsonb_in` (incl. literal cast) | `22P02` invalid_text_representation |
+| an unpaired surrogate `\u` escape, where escapes are decoded (§4.2) | `22P02` invalid_text_representation |
+| a `\u0000` escape, where escapes are decoded (§4.2) | `22P05` untranslatable_character |
 | `json`/`jsonb` value too large to store after compress + spill | `0A000` (the existing oversized narrowing) |
 | `=` / `<` / `ORDER BY` / `DISTINCT` on `json` (non-comparable) | `42883` undefined_function |
 | `json`/`jsonb` `PRIMARY KEY` / index / `UNIQUE` (`json` always; `jsonb` until the key slice) | `0A000` feature_not_supported |
@@ -341,7 +389,7 @@ them too).
 | a document (or a constructor result) nested deeper than `MAX_JSON_DEPTH` (§6.4) | `54001` statement_too_complex |
 | a stored `jsonb` body nested deeper than `MAX_JSON_DEPTH` (§6.4) | `XX001` data_corrupted |
 
-`22P02`, `42883`, `0A000`, `XX001`, `54001` are already registered. `22032` (and the rest of the
+`22P02`, `22P05`, `42883`, `0A000`, `XX001`, `54001` are registered. `22032` (and the rest of the
 `2203x` SQL/JSON class) is registered by the path surface — see
 [jsonpath.md §error-codes](jsonpath.md) and [json-sql-functions.md](json-sql-functions.md).
 

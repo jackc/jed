@@ -1311,7 +1311,21 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 	case srfJsonArrayElements, srfJsonArrayElementsText, srfJsonEach, srfJsonEachText:
 		return jsonVerbatimSrfRows(sp.kind, arg.str(), m)
 	}
-	node, err := jsonArgNode(arg)
+	// A json argument is de-escaped (PG lexes it with need_escapes), but PG raises a root
+	// container's kind error at its opening bracket, before lexing inside it (json.md §4.2).
+	var node JsonNode
+	switch {
+	case arg.Kind == ValJson && (sp.kind == srfJsonObjectKeys || sp.kind == srfJSONRecord):
+		node, err = parsePreservingJSONUnlessRoot(arg.str(), '[')
+	case arg.Kind == ValJson && sp.kind == srfJSONRecordset:
+		text := arg.str()
+		if start := skipJSONWS(text, 0); start < len(text) && text[start] == '[' {
+			return jsonRecordsetRowsVerbatim(sp, text, env, m)
+		}
+		node, err = parsePreservingJSONUnlessRoot(text, '{')
+	default:
+		node, err = jsonArgNode(arg)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1914,6 +1928,36 @@ func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []boo
 	}
 }
 
+// jsonRecordsetRowsVerbatim is json_to_recordset / json_populate_recordset over a json ARRAY,
+// element by element the way PostgreSQL's streaming parse meets them (json.md §4.2): each element's
+// escapes are checked (a `\u0000` / unpaired surrogate raises) and its row built — so an earlier
+// element's conversion error precedes a later element's escape error — while a non-object element
+// raises its kind error at its opening bracket (an array, unlexed) or after its token (a scalar,
+// lexed first).
+func jsonRecordsetRowsVerbatim(sp *srfPlan, text string, env *evalEnv, m *costMeter) ([]storedRow, error) {
+	elems, err := verbatimArrayElements(text, "json_to_recordset", false)
+	if err != nil {
+		return nil, err
+	}
+	var out []storedRow
+	for _, sub := range elems {
+		e, err := parsePreservingJSONUnlessRoot(sub, '[')
+		if err != nil {
+			return nil, err
+		}
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		row, err := jsonRecordRow(&e, sp.recordCols, env, m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 // jsonVerbatimSrfRows generates the rows of a verbatim-json SRF (json.md §4, json-sql-functions.md
 // §3): json_array_elements → one json row per array element's exact sub-text; _text → the ->>-style
 // render (a string de-escaped, a JSON null → SQL NULL, else the sub-text); json_each → (key, json
@@ -1941,7 +1985,7 @@ func jsonVerbatimSrfRows(kind srfKind, text string, m *costMeter) ([]storedRow, 
 		if asText {
 			fn = "json_array_elements_text"
 		}
-		elems, err := verbatimArrayElements(text, fn)
+		elems, err := verbatimArrayElements(text, fn, asText)
 		if err != nil {
 			return nil, err
 		}

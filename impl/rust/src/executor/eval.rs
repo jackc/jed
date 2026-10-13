@@ -988,16 +988,14 @@ impl RExpr {
                 if matches!(cv, Value::Null) || matches!(pv, Value::Null) {
                     return Ok(Value::Null);
                 }
-                // A SQL/JSON (data-exception) error — from a malformed json context or from path
-                // navigation — is caught by ON ERROR; anything else (a cost abort, etc.) propagates.
-                let (node, compiled) = match jsonpath_operands(&cv, &pv, m) {
-                    Ok(Some(ops)) => ops,
-                    Ok(None) => return Ok(Value::Null),
-                    Err(e) if is_sqljson_error(&e) => {
-                        return apply_json_behavior(*on_error, e, *returning, env, m);
-                    }
-                    Err(e) => return Err(e),
+                // Reading a `json` context as jsonb (a `\u0000` / unpaired surrogate raises) is the
+                // context's conversion, not path evaluation, so ON ERROR does not catch it — as in
+                // PostgreSQL (json.md §4.2).
+                let Some((node, compiled)) = jsonpath_operands(&cv, &pv, m)? else {
+                    return Ok(Value::Null);
                 };
+                // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR;
+                // anything else (a cost abort, etc.) propagates.
                 let seq = match crate::jsonpath::eval(&compiled, &node, m) {
                     Ok(s) => s,
                     Err(e) if is_sqljson_error(&e) => {
@@ -1055,7 +1053,14 @@ impl RExpr {
                     // jsonb is always well-formed with unique keys; only the kind can fail.
                     Value::Jsonb(node) => json_pred_kind_matches(&node, *kind),
                     // A string / json operand: parse (preserving duplicate keys); malformed → false.
-                    Value::Json(s) | Value::Text(s) => match json::parse_preserving(&s) {
+                    // Only the UNIQUE KEYS check reads string contents, so only it de-escapes (PG's
+                    // `need_escapes = check_unique_keys`): a `\u0000` or unpaired surrogate is then
+                    // a parse failure → false (json.md §4.2).
+                    Value::Json(s) | Value::Text(s) => match if *unique_keys {
+                        json::parse_preserving(&s)
+                    } else {
+                        json::parse_shape(&s)
+                    } {
                         Err(_) => false,
                         Ok(node) => {
                             json_pred_kind_matches(&node, *kind)
@@ -1078,9 +1083,14 @@ impl RExpr {
                     Value::Null => Ok(Value::Null),
                     Value::Text(s) => {
                         // Validate the string is well-formed JSON (22P02 on malformed), preserving
-                        // duplicate keys so the optional UNIQUE KEYS check (22030) can see them.
+                        // duplicate keys so the optional UNIQUE KEYS check (22030) can see them. Only
+                        // that check de-escapes (PG's `need_escapes = unique_keys`, json.md §4.2).
+                        if !*unique_keys {
+                            json::parse_shape(&s)?;
+                            return Ok(Value::Json(s));
+                        }
                         let node = json::parse_preserving(&s)?;
-                        if *unique_keys && json::has_duplicate_keys(&node) {
+                        if json::has_duplicate_keys(&node) {
                             return Err(EngineError::new(
                                 SqlState::DuplicateJsonObjectKeyValue,
                                 "duplicate JSON object key value",
@@ -2555,11 +2565,11 @@ impl RExpr {
                     // arg is parsed from its verbatim text on demand (json.md §4), then dispatched to
                     // the same kernel.
                     ScalarFunc::JsonbTypeof | ScalarFunc::JsonTypeof => {
-                        let node = json_arg_node(&vals[0])?;
+                        let node = json_arg_shape(&vals[0])?;
                         Ok(Value::Text(json::typeof_name(&node).to_string()))
                     }
                     ScalarFunc::JsonbArrayLength | ScalarFunc::JsonArrayLength => {
-                        let node = json_arg_node(&vals[0])?;
+                        let node = json_arg_shape(&vals[0])?;
                         Ok(Value::Int(json::array_length(&node)?))
                     }
                     ScalarFunc::JsonbStripNulls => {
@@ -3320,6 +3330,9 @@ fn json_get_verbatim(op: JsonGetOp, text: &str, arg: &Value) -> Result<Value> {
             unreachable!("resolver guarantees a text/int arg for -> / ->> and text[] for #> / #>>")
         }
     };
+    // PG's get_worker lexes the WHOLE document with `need_escapes`, so a `\u0000` or an unpaired
+    // surrogate anywhere in it raises, matched or not (json.md §4.2).
+    json::check_escapes(text)?;
     let sub = if steps.is_empty() {
         Some(json::verbatim_whole(text))
     } else {

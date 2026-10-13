@@ -293,7 +293,9 @@ jsonb-number → `decimal` path; a failed coercion under `ERROR ON ERROR` is `22
 (`ERROR`/`NULL`/`TRUE`/`FALSE`/`UNKNOWN`/`EMPTY ARRAY|OBJECT`), `RETURNING type`, and
 `JSON_QUERY`'s `WITH/WITHOUT [COND|UNCOND] ARRAY WRAPPER` + `KEEP QUOTES` are implemented.
 The result type is fixed at resolve (`RExpr::JsonSqlFn`); a SQL/JSON (class-`22`) evaluation
-error honors `ON ERROR`, while a resource/cost abort propagates. The exact PG codes match on
+error honors `ON ERROR`, while a resource/cost abort propagates. Reading a `json` context as jsonb is
+the context's conversion, not evaluation, so its `22P05` / `22P02` escape errors
+([json.md §4.2](json.md)) propagate past `ON ERROR`, as in PostgreSQL. The exact PG codes match on
 `ERROR ON ERROR` (`2203F` non-scalar, `22034` >1 item).
 
 Still **deferred** (each `0A000`, a documented divergence):

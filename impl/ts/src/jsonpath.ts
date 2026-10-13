@@ -19,7 +19,17 @@ import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { workLinear } from "./decimal.ts";
 import { utf8Length } from "./memsize.ts";
-import { MAX_JSON_DEPTH, jsonbIn, jsonCompactOut, jsonNodeCmp, type JsonNode } from "./json.ts";
+import {
+  HIGH_SURROGATE_DETAIL,
+  LOW_SURROGATE_DETAIL,
+  MAX_JSON_DEPTH,
+  escapeSyntaxError,
+  jsonbIn,
+  jsonCompactOut,
+  jsonNodeCmp,
+  type JsonNode,
+  unicodeZeroError,
+} from "./json.ts";
 
 // A subscript index: a non-negative integer literal or the `last` sentinel.
 export type Index = { kind: "number"; value: number } | { kind: "last" };
@@ -73,6 +83,14 @@ function unsupported(what: string): EngineError {
 }
 
 // A malformed jsonpath literal: `42601` (PostgreSQL's syntax-error class for a bad path literal).
+// codePointText is a decoded escape's code point as text — PG's addUnicodeChar: NUL is 22P05 (text
+// cannot hold it), a value above U+10FFFF 42601 ("invalid Unicode code point").
+function codePointText(ch: number): string {
+  if (ch === 0) throw unicodeZeroError();
+  if (ch > 0x10ffff) throw engineError("syntax_error", "invalid Unicode code point");
+  return String.fromCodePoint(ch);
+}
+
 function malformed(detail: string): EngineError {
   return engineError("syntax_error", `invalid jsonpath: ${detail}`);
 }
@@ -489,7 +507,11 @@ class Parser {
     return this.s.slice(start, this.i);
   }
 
-  // Parse a `"…"` jsonpath string (JSON escapes).
+  // Parse a `"…"` jsonpath string — a port of PostgreSQL's jsonpath scanner escapes
+  // (jsonpath_scan.l, jsonpath.md §2.1): `\b \f \n \r \t \v`; a run of `\uXXXX` / `\u{X…}` (1–6 hex
+  // digits) escapes, within which a surrogate pair combines; `\xHH`; and a backslash before any other
+  // character is that character. A decoded NUL is 22P05, an unpaired surrogate 22P02 (PG's Detail),
+  // and a malformed `\u` / `\x` or a code point above U+10FFFF 42601.
   private parseQuoted(): string {
     this.i += 1; // opening "
     let out = "";
@@ -502,55 +524,90 @@ class Parser {
         this.i += 1;
         return out;
       }
-      if (c === "\\") {
-        this.i += 1;
-        const e = this.peek();
-        switch (e) {
-          case '"':
-            out += '"';
-            break;
-          case "\\":
-            out += "\\";
-            break;
-          case "/":
-            out += "/";
-            break;
-          case "n":
-            out += "\n";
-            break;
-          case "r":
-            out += "\r";
-            break;
-          case "t":
-            out += "\t";
-            break;
-          case "b":
-            out += "\b";
-            break;
-          case "f":
-            out += "\f";
-            break;
-          case "u": {
-            const hex = this.s.slice(this.i + 1, this.i + 5);
-            if (hex.length !== 4 || !/^[0-9a-fA-F]{4}$/.test(hex)) {
-              throw malformed("invalid \\u escape");
-            }
-            const cp = Number.parseInt(hex, 16);
-            out += String.fromCharCode(cp);
-            this.i += 4;
-            break;
-          }
-          default:
-            throw malformed("invalid escape");
-        }
-        this.i += 1;
-      } else {
+      if (c !== "\\") {
         // Copy one character (a JS string char; surrogate pairs copy as two units — byte-equivalent
         // to Rust copying a UTF-8 char, since the renderer re-escapes by code point identically).
         out += c;
         this.i += 1;
+        continue;
       }
+      const e = this.s[this.i + 1];
+      if (e === undefined) throw malformed("unexpected end after backslash");
+      if (e === "u") {
+        out += this.parseUnicodeRun();
+        continue;
+      }
+      if (e === "x") {
+        const hex = this.s.slice(this.i + 2, this.i + 4);
+        if (!/^[0-9a-fA-F]{2}$/.test(hex))
+          throw malformed("invalid hexadecimal character sequence");
+        out += codePointText(Number.parseInt(hex, 16));
+        this.i += 4;
+        continue;
+      }
+      this.i += 1; // the backslash; the escaped character follows
+      switch (e) {
+        case "b":
+          out += "\b";
+          break;
+        case "f":
+          out += "\f";
+          break;
+        case "n":
+          out += "\n";
+          break;
+        case "r":
+          out += "\r";
+          break;
+        case "t":
+          out += "\t";
+          break;
+        case "v":
+          out += "\v";
+          break;
+        default:
+          out += e; // any other escaped character is itself (a pair's low half copies next)
+      }
+      this.i += 1;
     }
+  }
+
+  // A run of consecutive `\u` escapes (the cursor at the first `\`) — PG's `{unicode}+` token, lexed
+  // whole before any is decoded, so a malformed escape anywhere in the run is 42601 ahead of a decode
+  // error. Decoding is PG's addUnicode: a high surrogate must be followed, within the run, by a low
+  // one (the pair combines); a lone or doubled surrogate is 22P02.
+  private parseUnicodeRun(): string {
+    const units: number[] = [];
+    while (this.s[this.i] === "\\" && this.s[this.i + 1] === "u") {
+      this.i += 2;
+      const braced = this.eat("{");
+      const start = this.i;
+      const max = braced ? 6 : 4;
+      while (this.i - start < max && /^[0-9a-fA-F]$/.test(this.s[this.i] ?? "")) this.i += 1;
+      const digits = this.i - start;
+      if ((braced && (digits === 0 || !this.eat("}"))) || (!braced && digits < 4)) {
+        throw malformed("invalid Unicode escape sequence");
+      }
+      units.push(Number.parseInt(this.s.slice(start, start + digits), 16));
+    }
+    let out = "";
+    let hiSurrogate = -1;
+    for (let ch of units) {
+      if (ch >= 0xd800 && ch <= 0xdbff) {
+        if (hiSurrogate !== -1) throw escapeSyntaxError("jsonpath", HIGH_SURROGATE_DETAIL);
+        hiSurrogate = ch;
+        continue;
+      } else if (ch >= 0xdc00 && ch <= 0xdfff) {
+        if (hiSurrogate === -1) throw escapeSyntaxError("jsonpath", LOW_SURROGATE_DETAIL);
+        ch = 0x10000 + (((hiSurrogate - 0xd800) << 10) | (ch - 0xdc00));
+        hiSurrogate = -1;
+      } else if (hiSurrogate !== -1) {
+        throw escapeSyntaxError("jsonpath", LOW_SURROGATE_DETAIL);
+      }
+      out += codePointText(ch);
+    }
+    if (hiSurrogate !== -1) throw escapeSyntaxError("jsonpath", LOW_SURROGATE_DETAIL);
+    return out;
   }
 
   // Parse a `[…]` subscript list (the opening `[` consumed, not the wildcard form). Each subscript

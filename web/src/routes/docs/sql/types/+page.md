@@ -373,6 +373,14 @@ lists every member in input order, duplicates included:
 
 <LiveSql demo="jsonReadDemo" query={jsonReadDemo} rows={1} />
 
+Text cannot hold the escape `\u0000` or a UTF-16 surrogate escape that is not half of a pair, so, as
+in PostgreSQL, a function that decodes JSON strings rejects them: `jsonb` input, a cast to `jsonb`,
+the `json` accessors and set-returning functions above, and the SQL/JSON query functions. A decoded
+`\u0000` fails with `22P05`, an unpaired surrogate with `22P02`. These functions check the whole
+document, not just the part they return. `json` input only checks syntax, so it stores either escape
+unchanged, and `json_typeof`, `json_array_length`, `json_array_elements`, and `IS JSON` read such a
+value without error. jsonpath string literals reject the same two escapes.
+
 A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper document, or
 building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with
 `54001`. PostgreSQL's limit depends on its stack size and is much higher (about 10 000 levels by

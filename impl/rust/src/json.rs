@@ -176,28 +176,116 @@ fn malformed(detail: &str) -> EngineError {
     )
 }
 
+/// PostgreSQL's `22P02` `invalid input syntax for type {type_name}` carrying one of its
+/// `json_errdetail` / jsonpath-scanner sentences as the Detail (error-fields.md §9.2) — the
+/// `\u`-escape family, whose text jed matches byte-for-byte.
+pub fn escape_syntax_error(type_name: &str, detail: &str) -> EngineError {
+    EngineError::new(
+        SqlState::InvalidTextRepresentation,
+        format!("invalid input syntax for type {type_name}"),
+    )
+    .with_detail(Some(detail.to_string()))
+}
+
+/// A `\u` escape not followed by four hex digits (PG `JSON_UNICODE_ESCAPE_FORMAT`).
+fn escape_format_error() -> EngineError {
+    escape_syntax_error(
+        "json",
+        "\"\\u\" must be followed by four hexadecimal digits.",
+    )
+}
+
+/// The Detail of a high surrogate followed by another high surrogate (PG
+/// `JSON_UNICODE_HIGH_SURROGATE`, and the jsonpath scanner's same sentence).
+pub const HIGH_SURROGATE_DETAIL: &str = "Unicode high surrogate must not follow a high surrogate.";
+
+/// The Detail of a low surrogate without a preceding high one, or a high surrogate not followed by
+/// a low one (PG `JSON_UNICODE_LOW_SURROGATE`, and the jsonpath scanner's same sentence).
+pub const LOW_SURROGATE_DETAIL: &str = "Unicode low surrogate must follow a high surrogate.";
+
+/// `22P05` for a decoded `\u0000` (PG `JSON_UNICODE_CODE_POINT_ZERO`; the jsonpath scanner raises the
+/// same): text cannot hold the NUL character (json.md §6.2).
+pub fn unicode_zero_error() -> EngineError {
+    EngineError::new(
+        SqlState::UntranslatableCharacter,
+        "unsupported Unicode escape sequence",
+    )
+    .with_detail(Some("\\u0000 cannot be converted to text.".to_string()))
+}
+
 /// Parse + canonicalize JSON text into a `jsonb` node tree (`jsonb_in` — spec/design/json.md
 /// §6.2): numbers → `Decimal`, object keys deduped last-wins then sorted length-then-bytewise.
-/// Malformed input → `22P02`.
+/// Malformed input → `22P02`; a `\u0000` escape → `22P05`.
 pub fn jsonb_in(input: &str) -> Result<JsonNode> {
-    let mut p = Parser::new(input.as_bytes(), true);
+    let mut p = Parser::new(input.as_bytes(), true, true);
     let node = p.parse_document()?;
     Ok(node)
 }
 
 /// Validate JSON text well-formedness (`json_in` — spec/design/json.md §4); the caller stores
-/// the original bytes verbatim. Malformed input → `22P02`.
+/// the original bytes verbatim. Malformed input → `22P02`. Like PostgreSQL's `json_in` this only
+/// lexes: a `\u` escape must have four hex digits, but `\u0000` and an unpaired surrogate are
+/// accepted (they fail later, in a function that de-escapes the string — json.md §4.2).
 pub fn validate_json(input: &str) -> Result<()> {
-    let mut p = Parser::new(input.as_bytes(), false);
+    let mut p = Parser::new(input.as_bytes(), false, false);
     p.parse_document()?;
     Ok(())
 }
 
 /// Parse JSON text into a node tree WITHOUT canonicalizing (object key order + duplicates
 /// preserved) — the on-demand structural parse a `json` operator needs (spec/design/json.md §4).
+/// Strings are de-escaped, so a `\u0000` (`22P05`) or an unpaired surrogate (`22P02`) anywhere in
+/// the document raises (PG's `need_escapes` parse, json.md §4.2).
 pub fn parse_preserving(input: &str) -> Result<JsonNode> {
-    let mut p = Parser::new(input.as_bytes(), false);
+    let mut p = Parser::new(input.as_bytes(), false, true);
     p.parse_document()
+}
+
+/// The node SHAPE of JSON text, for a consumer that never reads string contents (`json_typeof`,
+/// `json_array_length`, `IS JSON` without `UNIQUE KEYS` — PG lexes these without `need_escapes`):
+/// every string (member names included) is left EMPTY, and `\u` escapes are only lexed, never
+/// decoded or checked (json.md §4.2).
+pub fn parse_shape(input: &str) -> Result<JsonNode> {
+    let mut p = Parser::new(input.as_bytes(), false, false);
+    p.parse_document()
+}
+
+/// The node tree of a `json` argument to a de-escaping function that raises a kind error on a root
+/// container of the wrong kind (`wrong_root` is `b'['` or `b'{'`). PostgreSQL raises that error at
+/// the root's opening bracket, before lexing anything inside it, so such a root is returned as its
+/// [`parse_shape`] (the caller raises the kind error and reads no string); any other root is
+/// [`parse_preserving`]d, its escapes checked first (json.md §4.2).
+pub fn parse_preserving_unless_root(input: &str, wrong_root: u8) -> Result<JsonNode> {
+    let b = input.as_bytes();
+    if b.get(skip_json_ws(b, 0)) == Some(&wrong_root) {
+        parse_shape(input)
+    } else {
+        parse_preserving(input)
+    }
+}
+
+/// Check the escapes of every string token of well-formed JSON text the way a de-escaping parse
+/// would (PG lexes a `json` argument with `need_escapes` for every function that reads string
+/// contents): the first `\u0000` (`22P05`) or unpaired surrogate (`22P02`) in document order raises
+/// (json.md §4.2).
+pub fn check_escapes(text: &str) -> Result<()> {
+    // Only a `\u` escape can fail the check, so a document without one skips the scan.
+    if !text.contains("\\u") {
+        return Ok(());
+    }
+    let b = text.as_bytes();
+    let mut p = Parser::new(b, false, true);
+    let mut pos = 0;
+    while pos < b.len() {
+        if b[pos] == b'"' {
+            p.pos = pos;
+            p.parse_string()?;
+            pos = p.pos;
+        } else {
+            pos += 1;
+        }
+    }
+    Ok(())
 }
 
 struct Parser<'a> {
@@ -206,17 +294,22 @@ struct Parser<'a> {
     /// When true (jsonb), objects dedup last-wins and sort keys; when false (json validation /
     /// on-demand parse), members are kept in input order with duplicates.
     canonicalize: bool,
+    /// PostgreSQL's `need_escapes` (json.md §4.2): when true, strings are de-escaped — surrogate
+    /// pairs combined, and `\u0000` (`22P05`) or an unpaired surrogate (`22P02`) rejected; when
+    /// false (`json_in`, [`parse_shape`]), escapes are only lexed and strings are left empty.
+    need_escapes: bool,
     /// The current container nesting depth (spec/design/json.md §6.4): entering the
     /// `MAX_JSON_DEPTH + 1`-th `[`/`{` aborts `54001` before parsing anything inside it.
     depth: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(buf: &'a [u8], canonicalize: bool) -> Parser<'a> {
+    fn new(buf: &'a [u8], canonicalize: bool, need_escapes: bool) -> Parser<'a> {
         Parser {
             buf,
             pos: 0,
             canonicalize,
+            need_escapes,
             depth: 0,
         }
     }
@@ -364,18 +457,26 @@ impl<'a> Parser<'a> {
         Ok(JsonNode::Array(elems))
     }
 
-    /// Parse a JSON string token (the leading `"` is at `self.pos`), decoding escapes to the
-    /// actual UTF-8 content. RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (with surrogate
-    /// pairs). Unescaped control characters (< 0x20) are rejected.
+    /// Parse a JSON string token (the leading `"` is at `self.pos`) — a port of PostgreSQL's
+    /// `json_lex_string` (src/common/jsonapi.c). RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX`;
+    /// unescaped control characters (< 0x20) are rejected. With `need_escapes` the content is decoded:
+    /// a high surrogate must be followed directly by a `\u` low surrogate (the pair combines), anything
+    /// else after it — and a low surrogate without one — is `22P02` with PG's Detail, and a decoded
+    /// `\u0000` is `22P05`. Without it the content is not built (an empty string is returned).
     fn parse_string(&mut self) -> Result<String> {
         self.pos += 1; // consume opening '"'
         let mut out = String::new();
+        // A pending high surrogate awaiting its low half (PG's `hi_surrogate`).
+        let mut hi_surrogate: Option<u32> = None;
         loop {
             let c = self
                 .peek()
                 .ok_or_else(|| malformed("unterminated string"))?;
             match c {
                 b'"' => {
+                    if hi_surrogate.is_some() {
+                        return Err(escape_syntax_error("json", LOW_SURROGATE_DETAIL));
+                    }
                     self.pos += 1;
                     return Ok(out);
                 }
@@ -384,51 +485,56 @@ impl<'a> Parser<'a> {
                     let e = self
                         .peek()
                         .ok_or_else(|| malformed("unterminated escape"))?;
-                    match e {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            self.pos += 1;
-                            let cp = self.parse_hex4()?;
-                            // Surrogate pair handling (UTF-16 escapes).
-                            if (0xD800..=0xDBFF).contains(&cp) {
-                                // High surrogate: must be followed by \uDC00..\uDFFF.
-                                if self.peek() != Some(b'\\') {
-                                    return Err(malformed("unpaired high surrogate in \\u escape"));
-                                }
-                                self.pos += 1;
-                                if self.peek() != Some(b'u') {
-                                    return Err(malformed("unpaired high surrogate in \\u escape"));
-                                }
-                                self.pos += 1;
-                                let lo = self.parse_hex4()?;
-                                if !(0xDC00..=0xDFFF).contains(&lo) {
-                                    return Err(malformed("invalid low surrogate in \\u escape"));
-                                }
-                                let combined = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
-                                match char::from_u32(combined) {
-                                    Some(ch) => out.push(ch),
-                                    None => return Err(malformed("invalid surrogate pair")),
-                                }
-                            } else if (0xDC00..=0xDFFF).contains(&cp) {
-                                return Err(malformed("unpaired low surrogate in \\u escape"));
-                            } else {
-                                match char::from_u32(cp) {
-                                    Some(ch) => out.push(ch),
-                                    None => return Err(malformed("invalid \\u escape")),
-                                }
-                            }
-                            continue; // parse_hex4 already advanced pos past the 4 digits
+                    if e == b'u' {
+                        self.pos += 1;
+                        let mut ch = self.parse_hex4()?;
+                        if !self.need_escapes {
+                            continue;
                         }
+                        if (0xD800..=0xDBFF).contains(&ch) {
+                            if hi_surrogate.is_some() {
+                                return Err(escape_syntax_error("json", HIGH_SURROGATE_DETAIL));
+                            }
+                            hi_surrogate = Some(ch);
+                            continue;
+                        } else if (0xDC00..=0xDFFF).contains(&ch) {
+                            let Some(hi) = hi_surrogate.take() else {
+                                return Err(escape_syntax_error("json", LOW_SURROGATE_DETAIL));
+                            };
+                            ch = 0x10000 + (((hi - 0xD800) << 10) | (ch - 0xDC00));
+                        }
+                        if hi_surrogate.is_some() {
+                            return Err(escape_syntax_error("json", LOW_SURROGATE_DETAIL));
+                        }
+                        if ch == 0 {
+                            return Err(unicode_zero_error());
+                        }
+                        out.push(
+                            char::from_u32(ch).expect("a non-surrogate code point ≤ 0x10FFFF"),
+                        );
+                        continue; // parse_hex4 already advanced pos past the 4 digits
+                    }
+                    if hi_surrogate.is_some() {
+                        return Err(escape_syntax_error("json", LOW_SURROGATE_DETAIL));
+                    }
+                    let decoded = match e {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{0008}',
+                        b'f' => '\u{000C}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
                         _ => return Err(malformed("invalid escape sequence")),
+                    };
+                    if self.need_escapes {
+                        out.push(decoded);
                     }
                     self.pos += 1;
+                }
+                _ if hi_surrogate.is_some() => {
+                    return Err(escape_syntax_error("json", LOW_SURROGATE_DETAIL));
                 }
                 0x00..=0x1F => {
                     return Err(malformed("control character in string must be escaped"));
@@ -441,7 +547,8 @@ impl<'a> Parser<'a> {
                         return Err(malformed("truncated UTF-8 sequence in string"));
                     }
                     match std::str::from_utf8(&self.buf[self.pos..end]) {
-                        Ok(s) => out.push_str(s),
+                        Ok(s) if self.need_escapes => out.push_str(s),
+                        Ok(_) => {}
                         Err(_) => return Err(malformed("invalid UTF-8 in string")),
                     }
                     self.pos = end;
@@ -450,19 +557,20 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read exactly four hex digits as a u32 code-unit (the cursor is just past `\u`).
+    /// Read exactly four hex digits as a u32 code-unit (the cursor is just past `\u`). A non-hex
+    /// digit is PG's `JSON_UNICODE_ESCAPE_FORMAT` (`22P02` with its Detail); running out of input
+    /// first is a truncated token.
     fn parse_hex4(&mut self) -> Result<u32> {
-        if self.pos + 4 > self.buf.len() {
-            return Err(malformed("truncated \\u escape"));
-        }
         let mut v: u32 = 0;
         for i in 0..4 {
-            let d = self.buf[self.pos + i];
+            let Some(&d) = self.buf.get(self.pos + i) else {
+                return Err(malformed("truncated \\u escape"));
+            };
             let nib = match d {
                 b'0'..=b'9' => (d - b'0') as u32,
                 b'a'..=b'f' => (d - b'a' + 10) as u32,
                 b'A'..=b'F' => (d - b'A' + 10) as u32,
-                _ => return Err(malformed("invalid hex digit in \\u escape")),
+                _ => return Err(escape_format_error()),
             };
             v = (v << 4) | nib;
         }
@@ -798,6 +906,11 @@ fn is_json_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
+/// [`is_json_ws`] for a `char` (a `str::trim_start_matches` predicate).
+pub fn is_json_ws_char(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
 fn skip_json_ws(b: &[u8], mut pos: usize) -> usize {
     while pos < b.len() && is_json_ws(b[pos]) {
         pos += 1;
@@ -858,7 +971,7 @@ fn skip_json_value(b: &[u8], pos: usize) -> usize {
 /// Decode the string token at `pos` (its opening `"`) to its content, reusing the parser's
 /// escape decoding. Returns `(content, end)`.
 fn decode_json_string(b: &[u8], pos: usize) -> Result<(String, usize)> {
-    let mut p = Parser::new(b, false);
+    let mut p = Parser::new(b, false, true);
     p.pos = pos;
     let s = p.parse_string()?;
     Ok((s, p.pos))
@@ -1014,24 +1127,31 @@ pub fn verbatim_to_text(sub: &str) -> Result<Option<String>> {
 }
 
 /// `json_array_elements[_text](json)` (PG `elements_worker`): the verbatim sub-text of each
-/// top-level array element, in order. A non-array → `22023` with PG's message.
-pub fn verbatim_array_elements<'a>(text: &'a str, func: &str) -> Result<Vec<&'a str>> {
+/// top-level array element, in order. A non-array → `22023` with PG's message. The `_text` form
+/// (`de_escape`) lexes with `need_escapes`, so a `\u0000` / unpaired surrogate raises — but an object
+/// root's error comes first (PG raises it at the `{`), while a scalar root is lexed before its own
+/// error (json.md §4.2).
+pub fn verbatim_array_elements<'a>(
+    text: &'a str,
+    func: &str,
+    de_escape: bool,
+) -> Result<Vec<&'a str>> {
     let b = text.as_bytes();
     let start = skip_json_ws(b, 0);
-    match b[start] {
-        b'[' => {}
-        b'{' => {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!("cannot call {func} on a non-array"),
-            ));
-        }
-        _ => {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!("cannot call {func} on a scalar"),
-            ));
-        }
+    if b[start] == b'{' {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("cannot call {func} on a non-array"),
+        ));
+    }
+    if de_escape {
+        check_escapes(text)?;
+    }
+    if b[start] != b'[' {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("cannot call {func} on a scalar"),
+        ));
     }
     let mut out = Vec::new();
     for_each_element(b, start, |_, s| {
@@ -1044,24 +1164,23 @@ pub fn verbatim_array_elements<'a>(text: &'a str, func: &str) -> Result<Vec<&'a 
 
 /// `json_each[_text](json)` (PG `each_worker`): each top-level object member as its de-escaped key
 /// and verbatim value sub-text, in INPUT order with duplicate keys kept. A non-object → `22023`
-/// with PG's message.
+/// with PG's message. Both forms lex with `need_escapes`, so a `\u0000` / unpaired surrogate raises —
+/// after an array root's error (PG raises it at the `[`), before a scalar root's (json.md §4.2).
 pub fn verbatim_object_members(text: &str) -> Result<Vec<(String, &str)>> {
     let b = text.as_bytes();
     let start = skip_json_ws(b, 0);
-    match b[start] {
-        b'{' => {}
-        b'[' => {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                "cannot deconstruct an array as an object",
-            ));
-        }
-        _ => {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                "cannot deconstruct a scalar",
-            ));
-        }
+    if b[start] == b'[' {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "cannot deconstruct an array as an object",
+        ));
+    }
+    check_escapes(text)?;
+    if b[start] != b'{' {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "cannot deconstruct a scalar",
+        ));
     }
     let mut out = Vec::new();
     for_each_member(b, start, |key, s| {

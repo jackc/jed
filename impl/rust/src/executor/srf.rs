@@ -1344,7 +1344,24 @@ impl Engine {
             };
             return json_verbatim_srf_rows(srf.kind, text, meter);
         }
-        let node = json_arg_node(&arg)?;
+        // A `json` argument is de-escaped (PG lexes it with `need_escapes`), but PG raises a root
+        // container's kind error at its opening bracket, before lexing inside it (json.md §4.2).
+        let node = match (&arg, srf.kind) {
+            (
+                Value::Json(text),
+                SrfKind::JsonObjectKeys | SrfKind::JsonRecord { set: false, .. },
+            ) => json::parse_preserving_unless_root(text, b'[')?,
+            (Value::Json(text), SrfKind::JsonRecord { set: true, .. }) => {
+                if text
+                    .trim_start_matches(json::is_json_ws_char)
+                    .starts_with('[')
+                {
+                    return json_recordset_rows_verbatim(srf, text, env, meter);
+                }
+                json::parse_preserving_unless_root(text, b'{')?
+            }
+            _ => json_arg_node(&arg)?,
+        };
         let mut out: Vec<Row> = Vec::new();
         match srf.kind {
             SrfKind::JsonbArrayElements | SrfKind::JsonbArrayElementsText => {
@@ -1500,6 +1517,27 @@ impl Engine {
     }
 }
 
+/// `json_to_recordset` / `json_populate_recordset` over a `json` ARRAY, element by element the way
+/// PostgreSQL's streaming parse meets them (json.md §4.2): each element's escapes are checked (a
+/// `\u0000` / unpaired surrogate raises) and its row built — so an earlier element's conversion
+/// error precedes a later element's escape error — while a non-object element raises its kind error
+/// at its opening bracket (an array, unlexed) or after its token (a scalar, lexed first).
+fn json_recordset_rows_verbatim(
+    srf: &SrfPlan,
+    text: &str,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<Vec<Row>> {
+    let mut out: Vec<Row> = Vec::new();
+    for sub in json::verbatim_array_elements(text, "json_to_recordset", false)? {
+        let e = json::parse_preserving_unless_root(sub, b'[')?;
+        meter.guard()?;
+        meter.charge(COSTS.generated_row);
+        out.push(json_record_row(&e, &srf.record_cols, env, meter)?);
+    }
+    Ok(out)
+}
+
 /// The rows of a verbatim-json SRF (json.md §4, json-sql-functions.md §3): `json_array_elements`
 /// → one `json` row per array element's exact sub-text; `_text` → the `->>`-style render (a string
 /// de-escaped, a JSON null → SQL NULL, else the sub-text); `json_each` → `(key, json sub-text)` per
@@ -1515,7 +1553,7 @@ fn json_verbatim_srf_rows(kind: SrfKind, text: &str, meter: &mut Meter) -> Resul
             } else {
                 "json_array_elements"
             };
-            for sub in json::verbatim_array_elements(text, func)? {
+            for sub in json::verbatim_array_elements(text, func, text_form)? {
                 meter.guard()?;
                 meter.charge(COSTS.generated_row);
                 let v = if text_form {

@@ -405,6 +405,8 @@ import {
   nodeToText,
   verbatimArrayElements,
   verbatimObjectMembers,
+  parsePreservingJsonUnlessRoot,
+  skipJsonWs,
   verbatimToText,
   pretty as jsonPretty,
   prettySize as jsonPrettySize,
@@ -17622,7 +17624,22 @@ export class Engine {
         if (arg.kind !== "json") throw new Error("resolver restricts a json SRF argument to json");
         return jsonVerbatimSrfRows(srf.kind, arg.text, meter);
     }
-    const node = jsonArgNode(arg);
+    // A json argument is de-escaped (PG lexes it with need_escapes), but PG raises a root container's
+    // kind error at its opening bracket, before lexing inside it (json.md §4.2).
+    let node: JsonNode;
+    if (
+      arg.kind === "json" &&
+      (srf.kind === "json_object_keys" || (srf.kind === "json_record" && srf.recordSet !== true))
+    ) {
+      node = parsePreservingJsonUnlessRoot(arg.text, "[");
+    } else if (arg.kind === "json" && srf.kind === "json_record") {
+      if (arg.text[skipJsonWs(arg.text, 0)] === "[") {
+        return jsonRecordsetRowsVerbatim(srf, arg.text, env, meter);
+      }
+      node = parsePreservingJsonUnlessRoot(arg.text, "{");
+    } else {
+      node = jsonArgNode(arg);
+    }
     const out: Row[] = [];
     switch (srf.kind) {
       case "jsonb_array_elements":
@@ -35452,6 +35469,24 @@ function insertDefaultNeeds(
   });
 }
 
+// jsonRecordsetRowsVerbatim generates json_to_recordset / json_populate_recordset over a json ARRAY,
+// element by element the way PostgreSQL's streaming parse meets them (json.md §4.2): each element's
+// escapes are checked (a `\u0000` / unpaired surrogate raises) and its row built — so an earlier
+// element's conversion error precedes a later element's escape error — while a non-object element
+// raises its kind error at its opening bracket (an array, unlexed) or after its token (a scalar,
+// lexed first).
+function jsonRecordsetRowsVerbatim(srf: SrfPlan, text: string, env: EvalEnv, meter: Meter): Row[] {
+  const cols = srf.recordCols ?? [];
+  const out: Row[] = [];
+  for (const sub of verbatimArrayElements(text, "json_to_recordset", false)) {
+    const e = parsePreservingJsonUnlessRoot(sub, "[");
+    meter.guard();
+    meter.charge(COSTS.generatedRow);
+    out.push(jsonRecordRow(e, cols, env, meter));
+  }
+  return out;
+}
+
 // jsonVerbatimSrfRows generates the rows of a verbatim-json SRF (json.md §4, json-sql-functions.md
 // §3): json_array_elements → one json row per array element's exact sub-text; _text → the ->>-style
 // render (a string de-escaped, a JSON null → SQL NULL, else the sub-text); json_each → (key, json
@@ -35466,7 +35501,7 @@ function jsonVerbatimSrfRows(kind: SrfKind, text: string, meter: Meter): Row[] {
   const out: Row[] = [];
   if (kind === "json_array_elements" || kind === "json_array_elements_text") {
     const asText = kind === "json_array_elements_text";
-    for (const sub of verbatimArrayElements(text, kind)) {
+    for (const sub of verbatimArrayElements(text, kind, asText)) {
       meter.guard();
       meter.charge(COSTS.generatedRow);
       out.push([render(sub, asText)]);

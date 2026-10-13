@@ -134,7 +134,14 @@ import { parseTimestamp } from "./timestamp.ts";
 import type { InputZone } from "./timezone.ts";
 import { dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval } from "./interval.ts";
-import { jsonCompactOut, jsonbIn, jsonbOut, parsePreservingJson, validateJson } from "./json.ts";
+import {
+  jsonCompactOut,
+  jsonbIn,
+  jsonbOut,
+  parsePreservingJson,
+  parseShapeJson,
+  validateJson,
+} from "./json.ts";
 import {
   compile as jsonPathCompile,
   compileMetered as jsonPathCompileMetered,
@@ -3157,16 +3164,29 @@ export function jsonArgNode(v: Value): JsonNode {
   throw new Error("jsonArgNode: a json/jsonb function argument must be json/jsonb");
 }
 
+// jsonArgShape is jsonArgNode for a function that never reads string contents (json_typeof,
+// json_array_length): a json value is only lexed, as PostgreSQL does without need_escapes, so a
+// `\u0000` or an unpaired surrogate inside it does not raise (json.md §4.2).
+export function jsonArgShape(v: Value): JsonNode {
+  if (v.kind === "jsonb") return v.node;
+  if (v.kind === "json") return parseShapeJson(v.text);
+  throw new Error("jsonArgShape: a json/jsonb function argument must be json/jsonb");
+}
+
 // evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb` context
 // value (the shared kernel of the jsonpath query functions). A NULL context or path yields `null`
 // (→ SQL NULL / zero rows). Port of impl/rust/src/executor.rs `eval_jsonpath`.
 export function evalJsonpath(ctx: Value, path: Value, m: Meter): JsonNode[] | null {
   if (ctx.kind === "null" || path.kind === "null") return null;
-  const node = jsonArgNode(ctx);
+  return evalJsonpathOn(jsonArgNode(ctx), path, m);
+}
+
+// evalJsonpathOn evaluates a non-NULL jsonpath over an already-read context node: recompiling the
+// path's canonical text charges jsonpath_compile (jsonpath.md §7).
+export function evalJsonpathOn(node: JsonNode, path: Value, m: Meter): JsonNode[] {
   if (path.kind !== "jsonpath") {
     throw new Error("resolver restricts a jsonpath argument to jsonpath");
   }
-  // Compiling and evaluating are metered (jsonpath.md §7).
   return jsonPathEval(jsonPathCompileMetered(path.text, m), node, m);
 }
 

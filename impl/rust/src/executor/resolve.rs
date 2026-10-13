@@ -424,6 +424,17 @@ pub(crate) fn json_arg_node(v: &Value) -> Result<JsonNode> {
     }
 }
 
+/// [`json_arg_node`] for a function that never reads string contents (`json_typeof`,
+/// `json_array_length`): a `json` value is only lexed, as PostgreSQL does without `need_escapes`, so
+/// a `\u0000` or an unpaired surrogate inside it does not raise (json.md §4.2).
+pub(crate) fn json_arg_shape(v: &Value) -> Result<JsonNode> {
+    match v {
+        Value::Jsonb(n) => Ok(n.clone()),
+        Value::Json(s) => json::parse_shape(s),
+        _ => unreachable!("resolver restricts a json/jsonb function argument to json/jsonb"),
+    }
+}
+
 /// Whether a parsed JSON node matches an `IS JSON [kind]` predicate's kind (json-sql-functions.md §5).
 pub(crate) fn json_pred_kind_matches(node: &JsonNode, kind: JsonPredicateKind) -> bool {
     match kind {

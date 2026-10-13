@@ -43,6 +43,7 @@ export type SqlState =
   | "non_numeric_sql_json_item" // 22036 — {detail}
   | "singleton_sql_json_item_required" // 22038 — {detail}
   | "invalid_text_representation" // 22P02 — invalid input syntax for type {type}: {detail}
+  | "untranslatable_character" // 22P05 — unsupported Unicode escape sequence
   | "not_null_violation" // 23502 — null value in column {name} violates not-null constraint
   | "unique_violation" // 23505 — duplicate key value violates unique constraint: {name}
   | "check_violation" // 23514 — new row for relation {table} violates check constraint {name}
@@ -138,6 +139,7 @@ const CODES: Record<SqlState, string> = {
   non_numeric_sql_json_item: "22036",
   singleton_sql_json_item_required: "22038",
   invalid_text_representation: "22P02",
+  untranslatable_character: "22P05",
   not_null_violation: "23502",
   unique_violation: "23505",
   check_violation: "23514",
@@ -249,6 +251,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "22036", name: "non_numeric_sql_json_item", class: "data exception" },
   { code: "22038", name: "singleton_sql_json_item_required", class: "data exception" },
   { code: "22P02", name: "invalid_text_representation", class: "data exception" },
+  { code: "22P05", name: "untranslatable_character", class: "data exception" },
   { code: "23502", name: "not_null_violation", class: "integrity constraint violation" },
   { code: "23505", name: "unique_violation", class: "integrity constraint violation" },
   { code: "23514", name: "check_violation", class: "integrity constraint violation" },

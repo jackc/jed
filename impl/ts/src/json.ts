@@ -204,24 +204,88 @@ function malformed(detail: string): Error {
   );
 }
 
+// escapeSyntaxError is PostgreSQL's 22P02 `invalid input syntax for type {typeName}` carrying one of
+// its json_errdetail / jsonpath-scanner sentences as the Detail (error-fields.md §9.2) — the
+// `\u`-escape family, whose text jed matches byte-for-byte.
+export function escapeSyntaxError(typeName: string, detail: string): EngineError {
+  return engineError(
+    "invalid_text_representation",
+    "invalid input syntax for type " + typeName,
+  ).withDetail(detail);
+}
+
+// escapeFormatError is a `\u` escape not followed by four hex digits (PG
+// JSON_UNICODE_ESCAPE_FORMAT).
+function escapeFormatError(): EngineError {
+  return escapeSyntaxError("json", '"\\u" must be followed by four hexadecimal digits.');
+}
+
+// HIGH_SURROGATE_DETAIL is the Detail of a high surrogate followed by another high surrogate (PG
+// JSON_UNICODE_HIGH_SURROGATE, and the jsonpath scanner's same sentence).
+export const HIGH_SURROGATE_DETAIL = "Unicode high surrogate must not follow a high surrogate.";
+
+// LOW_SURROGATE_DETAIL is the Detail of a low surrogate without a preceding high one, or a high
+// surrogate not followed by a low one (PG JSON_UNICODE_LOW_SURROGATE, and the jsonpath scanner's).
+export const LOW_SURROGATE_DETAIL = "Unicode low surrogate must follow a high surrogate.";
+
+// unicodeZeroError is 22P05 for a decoded `\u0000` (PG JSON_UNICODE_CODE_POINT_ZERO; the jsonpath
+// scanner raises the same): text cannot hold the NUL character (json.md §6.2).
+export function unicodeZeroError(): EngineError {
+  return engineError("untranslatable_character", "unsupported Unicode escape sequence").withDetail(
+    "\\u0000 cannot be converted to text.",
+  );
+}
+
 // jsonbIn parses + canonicalizes JSON text into a jsonb node tree (`jsonb_in` — spec/design/json.md
 // §6.2): numbers → Decimal, object keys deduped last-wins then sorted length-then-bytewise.
-// Malformed input → 22P02.
+// Malformed input → 22P02; a `\u0000` escape → 22P05.
 export function jsonbIn(input: string): JsonNode {
-  return new JsonParser(UTF8.encode(input), true).parseDocument();
+  return new JsonParser(UTF8.encode(input), true, true).parseDocument();
 }
 
 // validateJson validates JSON text well-formedness (`json_in` — spec/design/json.md §4); the caller
-// stores the original bytes verbatim. Malformed input → 22P02.
+// stores the original bytes verbatim. Malformed input → 22P02. Like PostgreSQL's json_in this only
+// lexes: a `\u` escape must have four hex digits, but `\u0000` and an unpaired surrogate are accepted
+// (they fail later, in a function that de-escapes the string — json.md §4.2).
 export function validateJson(input: string): void {
-  new JsonParser(UTF8.encode(input), false).parseDocument();
+  new JsonParser(UTF8.encode(input), false, false).parseDocument();
 }
 
 // parsePreservingJson parses JSON text into a node tree WITHOUT canonicalizing (object key order +
 // duplicates preserved) — the on-demand structural parse a `json` operator needs
-// (spec/design/json.md §4).
+// (spec/design/json.md §4). Strings are de-escaped, so a `\u0000` (22P05) or an unpaired surrogate
+// (22P02) anywhere in the document raises (PG's need_escapes parse, json.md §4.2).
 export function parsePreservingJson(input: string): JsonNode {
-  return new JsonParser(UTF8.encode(input), false).parseDocument();
+  return new JsonParser(UTF8.encode(input), false, true).parseDocument();
+}
+
+// parseShapeJson is the node SHAPE of JSON text, for a consumer that never reads string contents
+// (json_typeof, json_array_length, IS JSON without UNIQUE KEYS — PG lexes these without
+// need_escapes): every string (member names included) is left EMPTY, and `\u` escapes are only
+// lexed, never decoded or checked (json.md §4.2).
+export function parseShapeJson(input: string): JsonNode {
+  return new JsonParser(UTF8.encode(input), false, false).parseDocument();
+}
+
+// parsePreservingJsonUnlessRoot is the node tree of a `json` argument to a de-escaping function that
+// raises a kind error on a root container of the wrong kind (wrongRoot is "[" or "{"). PostgreSQL
+// raises that error at the root's opening bracket, before lexing anything inside it, so such a root
+// is returned as its parseShapeJson (the caller raises the kind error and reads no string); any other
+// root is parsePreservingJson'd, its escapes checked first (json.md §4.2).
+export function parsePreservingJsonUnlessRoot(input: string, wrongRoot: "[" | "{"): JsonNode {
+  const start = skipJsonWs(input, 0);
+  if (input[start] === wrongRoot) return parseShapeJson(input);
+  return parsePreservingJson(input);
+}
+
+// checkJsonEscapes checks the escapes of every string token of well-formed JSON text the way a
+// de-escaping parse would (PG lexes a `json` argument with need_escapes for every function that reads
+// string contents): the first `\u0000` (22P05) or unpaired surrogate (22P02) in document order raises
+// (json.md §4.2).
+export function checkJsonEscapes(text: string): void {
+  // Only a `\u` escape can fail the check, so a document without one skips the scan.
+  if (!text.includes("\\u")) return;
+  new JsonParser(UTF8.encode(text), false, true).checkStringEscapes();
 }
 
 // utf8Len is the UTF-8 lead-byte length (1..4). A continuation/invalid lead byte returns 1 so the
@@ -242,13 +306,26 @@ class JsonParser {
   // canonicalize: when true (jsonb), objects dedup last-wins and sort keys; when false (json
   // validation / on-demand parse), members are kept in input order with duplicates.
   private canonicalize: boolean;
+  // needEscapes: PostgreSQL's need_escapes (json.md §4.2) — when true, strings are de-escaped
+  // (surrogate pairs combined, and `\u0000` (22P05) or an unpaired surrogate (22P02) rejected); when
+  // false (json_in, parseShapeJson), escapes are only lexed and strings are left empty.
+  private needEscapes: boolean;
   // depth: the current container nesting depth (spec/design/json.md §6.4) — entering the
   // MAX_JSON_DEPTH + 1-th `[`/`{` aborts 54001 before parsing anything inside it.
   private depth = 0;
 
-  constructor(buf: Uint8Array, canonicalize: boolean) {
+  constructor(buf: Uint8Array, canonicalize: boolean, needEscapes: boolean) {
     this.buf = buf;
     this.canonicalize = canonicalize;
+    this.needEscapes = needEscapes;
+  }
+
+  // checkStringEscapes de-escapes every string token of well-formed JSON (checkJsonEscapes).
+  checkStringEscapes(): void {
+    while (this.pos < this.buf.length) {
+      if (this.buf[this.pos] === 0x22 /* " */) this.parseString();
+      else this.pos++;
+    }
   }
 
   // parseDocument: a full JSON document — one value, surrounded by optional whitespace, nothing
@@ -390,21 +467,27 @@ class JsonParser {
     return { kind: "array", elements };
   }
 
-  // parseString parses a JSON string token (the leading `"` is at this.pos), decoding escapes to the
-  // actual UTF-8 content. RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (with surrogate pairs).
-  // Unescaped control characters (< 0x20) are rejected.
   // decodeStringToken decodes a buffer holding exactly one string token (verbatim navigation).
   decodeStringToken(): string {
     return this.parseString();
   }
 
+  // parseString parses a JSON string token (the leading `"` is at this.pos) — a port of PostgreSQL's
+  // json_lex_string (src/common/jsonapi.c). RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX`;
+  // unescaped control characters (< 0x20) are rejected. With needEscapes the content is decoded: a
+  // high surrogate must be followed directly by a `\u` low surrogate (the pair combines), anything
+  // else after it — and a low surrogate without one — is 22P02 with PG's Detail, and a decoded
+  // `\u0000` is 22P05. Without it the content is not built (an empty string is returned).
   private parseString(): string {
     this.pos++; // consume opening '"'
     let out = "";
+    // hiSurrogate: a pending high surrogate awaiting its low half (PG's hi_surrogate); -1 = none.
+    let hiSurrogate = -1;
     for (;;) {
       const c = this.peek();
       if (c === -1) throw malformed("unterminated string");
       if (c === 0x22 /* " */) {
+        if (hiSurrogate !== -1) throw escapeSyntaxError("json", LOW_SURROGATE_DETAIL);
         this.pos++;
         return out;
       }
@@ -412,59 +495,58 @@ class JsonParser {
         this.pos++;
         const e = this.peek();
         if (e === -1) throw malformed("unterminated escape");
+        if (e === 0x75 /* u */) {
+          this.pos++;
+          let ch = this.parseHex4();
+          if (!this.needEscapes) continue;
+          if (ch >= 0xd800 && ch <= 0xdbff) {
+            if (hiSurrogate !== -1) throw escapeSyntaxError("json", HIGH_SURROGATE_DETAIL);
+            hiSurrogate = ch;
+            continue;
+          } else if (ch >= 0xdc00 && ch <= 0xdfff) {
+            if (hiSurrogate === -1) throw escapeSyntaxError("json", LOW_SURROGATE_DETAIL);
+            ch = 0x10000 + (((hiSurrogate - 0xd800) << 10) | (ch - 0xdc00));
+            hiSurrogate = -1;
+          }
+          if (hiSurrogate !== -1) throw escapeSyntaxError("json", LOW_SURROGATE_DETAIL);
+          if (ch === 0) throw unicodeZeroError();
+          out += String.fromCodePoint(ch);
+          continue; // parseHex4 already advanced pos past the 4 digits
+        }
+        if (hiSurrogate !== -1) throw escapeSyntaxError("json", LOW_SURROGATE_DETAIL);
+        let decoded: string;
         switch (e) {
           case 0x22: // "
-            out += '"';
+            decoded = '"';
             break;
           case 0x5c: // backslash
-            out += "\\";
+            decoded = "\\";
             break;
           case 0x2f: // /
-            out += "/";
+            decoded = "/";
             break;
           case 0x62: // b
-            out += "\b";
+            decoded = "\b";
             break;
           case 0x66: // f
-            out += "\f";
+            decoded = "\f";
             break;
           case 0x6e: // n
-            out += "\n";
+            decoded = "\n";
             break;
           case 0x72: // r
-            out += "\r";
+            decoded = "\r";
             break;
           case 0x74: // t
-            out += "\t";
+            decoded = "\t";
             break;
-          case 0x75: {
-            // u
-            this.pos++;
-            const cp = this.parseHex4();
-            // Surrogate pair handling (UTF-16 escapes).
-            if (cp >= 0xd800 && cp <= 0xdbff) {
-              // High surrogate: must be followed by \uDC00..\uDFFF.
-              if (this.peek() !== 0x5c) throw malformed("unpaired high surrogate in \\u escape");
-              this.pos++;
-              if (this.peek() !== 0x75) throw malformed("unpaired high surrogate in \\u escape");
-              this.pos++;
-              const lo = this.parseHex4();
-              if (lo < 0xdc00 || lo > 0xdfff) {
-                throw malformed("invalid low surrogate in \\u escape");
-              }
-              const combined = 0x10000 + (((cp - 0xd800) << 10) | (lo - 0xdc00));
-              out += String.fromCodePoint(combined);
-            } else if (cp >= 0xdc00 && cp <= 0xdfff) {
-              throw malformed("unpaired low surrogate in \\u escape");
-            } else {
-              out += String.fromCodePoint(cp);
-            }
-            continue; // parseHex4 already advanced pos past the 4 digits
-          }
           default:
             throw malformed("invalid escape sequence");
         }
+        if (this.needEscapes) out += decoded;
         this.pos++;
+      } else if (hiSurrogate !== -1) {
+        throw escapeSyntaxError("json", LOW_SURROGATE_DETAIL);
       } else if (c <= 0x1f) {
         throw malformed("control character in string must be escaped");
       } else {
@@ -473,21 +555,25 @@ class JsonParser {
         const len = utf8Len(c);
         const end = this.pos + len;
         if (end > this.buf.length) throw malformed("truncated UTF-8 sequence in string");
+        let text: string;
         try {
-          out += ASCII_DECODER.decode(this.buf.subarray(this.pos, end));
+          text = ASCII_DECODER.decode(this.buf.subarray(this.pos, end));
         } catch {
           throw malformed("invalid UTF-8 in string");
         }
+        if (this.needEscapes) out += text;
         this.pos = end;
       }
     }
   }
 
-  // parseHex4 reads exactly four hex digits as a code-unit (the cursor is just past `\u`).
+  // parseHex4 reads exactly four hex digits as a code-unit (the cursor is just past `\u`). A non-hex
+  // digit is PG's JSON_UNICODE_ESCAPE_FORMAT (22P02 with its Detail); running out of input first is a
+  // truncated token.
   private parseHex4(): number {
-    if (this.pos + 4 > this.buf.length) throw malformed("truncated \\u escape");
     let v = 0;
     for (let i = 0; i < 4; i++) {
+      if (this.pos + i >= this.buf.length) throw malformed("truncated \\u escape");
       const d = this.buf[this.pos + i]!;
       let nib: number;
       if (d >= 0x30 && d <= 0x39)
@@ -496,7 +582,7 @@ class JsonParser {
         nib = d - 0x61 + 10; // a-f
       else if (d >= 0x41 && d <= 0x46)
         nib = d - 0x41 + 10; // A-F
-      else throw malformed("invalid hex digit in \\u escape");
+      else throw escapeFormatError();
       v = (v << 4) | nib;
     }
     this.pos += 4;
@@ -863,7 +949,7 @@ function isJsonWs(c: number): boolean {
   return c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d;
 }
 
-function skipJsonWs(t: string, pos: number): number {
+export function skipJsonWs(t: string, pos: number): number {
   while (pos < t.length && isJsonWs(t.charCodeAt(pos))) pos++;
   return pos;
 }
@@ -916,7 +1002,7 @@ function skipJsonValue(t: string, pos: number): number {
 // parser's escape decoding. Returns [content, end].
 function decodeJsonString(t: string, pos: number): [string, number] {
   const end = skipJsonString(t, pos);
-  const s = new JsonParser(UTF8.encode(t.slice(pos, end)), false).decodeStringToken();
+  const s = new JsonParser(UTF8.encode(t.slice(pos, end)), false, true).decodeStringToken();
   return [s, end];
 }
 
@@ -1027,12 +1113,16 @@ export function verbatimToText(sub: string): string | null {
 }
 
 // verbatimArrayElements is json_array_elements[_text](json) (PG elements_worker): the verbatim
-// sub-text of each top-level array element, in order. A non-array → 22023 with PG's message.
-export function verbatimArrayElements(text: string, fn: string): string[] {
+// sub-text of each top-level array element, in order. A non-array → 22023 with PG's message. The
+// _text form (deEscape) lexes with need_escapes, so a `\u0000` / unpaired surrogate raises — but an
+// object root's error comes first (PG raises it at the `{`), while a scalar root is lexed before its
+// own error (json.md §4.2).
+export function verbatimArrayElements(text: string, fn: string, deEscape: boolean): string[] {
   const start = skipJsonWs(text, 0);
   const c = text.charCodeAt(start);
   if (c === 0x7b /* { */)
     throw engineError("invalid_parameter_value", `cannot call ${fn} on a non-array`);
+  if (deEscape) checkJsonEscapes(text);
   if (c !== 0x5b /* [ */)
     throw engineError("invalid_parameter_value", `cannot call ${fn} on a scalar`);
   const out: string[] = [];
@@ -1046,12 +1136,15 @@ export function verbatimArrayElements(text: string, fn: string): string[] {
 
 // verbatimObjectMembers is json_each[_text](json) (PG each_worker): each top-level object member as
 // its de-escaped key and verbatim value sub-text, in INPUT order with duplicate keys kept. A
-// non-object → 22023 with PG's message.
+// non-object → 22023 with PG's message. Both forms lex with need_escapes, so a `\u0000` / unpaired
+// surrogate raises — after an array root's error (PG raises it at the `[`), before a scalar root's
+// (json.md §4.2).
 export function verbatimObjectMembers(text: string): { key: string; value: string }[] {
   const start = skipJsonWs(text, 0);
   const c = text.charCodeAt(start);
   if (c === 0x5b /* [ */)
     throw engineError("invalid_parameter_value", "cannot deconstruct an array as an object");
+  checkJsonEscapes(text);
   if (c !== 0x7b /* { */)
     throw engineError("invalid_parameter_value", "cannot deconstruct a scalar");
   const out: { key: string; value: string }[] = [];

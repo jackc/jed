@@ -1669,3 +1669,25 @@ run: SELECT jsonb_insert('{"a": 1}', '{a}', '2')
 code: 22023
 no-position
 hint: Try using the function jsonb_set to replace key value.
+
+# --- JSON and jsonpath \u escapes (json.md §4.2, jsonpath.md §2.1) --------------------------------
+
+case: jsonb literal NUL escape
+run: SELECT '"\u0000"'::jsonb
+code: 22P05
+position: 8
+
+case: jsonb literal lone surrogate
+run: SELECT '"\ud800"'::jsonb
+code: 22P02
+position: 8
+
+case: jsonpath literal NUL escape
+run: SELECT '$ ? (@ == "\u0000")'::jsonpath
+code: 22P05
+position: 8
+
+case: json accessor NUL escape at evaluation
+run: SELECT '{"a": "\u0000"}'::json ->> 'a'
+code: 22P05
+no-position

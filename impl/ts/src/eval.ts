@@ -66,6 +66,7 @@ import {
   evalDateConvert,
   evalJsonSqlResult,
   evalJsonpath,
+  evalJsonpathOn,
   evalRangeCtor,
   evalRangeFunc,
   evalRangeOp,
@@ -79,6 +80,7 @@ import {
   initcapAscii,
   isSqljsonError,
   jsonArgNode,
+  jsonArgShape,
   jsonPredKindMatches,
   lcmBigint,
   lcmDecimalValue,
@@ -188,7 +190,9 @@ import {
   jsonbOut,
   makeObject as jsonMakeObject,
   nodeToText,
+  checkJsonEscapes,
   parsePreservingJson,
+  parseShapeJson,
   setPath as jsonSetPathKernel,
   stripNulls as jsonStripNulls,
   typeofName as jsonTypeofName,
@@ -772,12 +776,15 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         case "jsonb":
           ok = jsonPredKindMatches(v.node, e.jsonKind);
           break;
-        // A string / json operand: parse (preserving duplicate keys); malformed → false.
+        // A string / json operand: parse (preserving duplicate keys); malformed → false. Only the
+        // UNIQUE KEYS check reads string contents, so only it de-escapes (PG's need_escapes =
+        // check_unique_keys): a `\u0000` or unpaired surrogate is then a parse failure → false
+        // (json.md §4.2).
         case "json":
         case "text": {
           let node: JsonNode;
           try {
-            node = parsePreservingJson(v.text);
+            node = e.uniqueKeys ? parsePreservingJson(v.text) : parseShapeJson(v.text);
           } catch {
             ok = false;
             break;
@@ -801,9 +808,14 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         throw new Error("BUG: resolver restricts JSON() to a text operand");
       }
       // Validate the string is well-formed JSON (22P02 on malformed — propagated), preserving
-      // duplicate keys so the optional UNIQUE KEYS check (22030) can see them.
+      // duplicate keys so the optional UNIQUE KEYS check (22030) can see them. Only that check
+      // de-escapes (PG's need_escapes = unique_keys, json.md §4.2).
+      if (!e.uniqueKeys) {
+        parseShapeJson(v.text);
+        return jsonValue(v.text);
+      }
       const node = parsePreservingJson(v.text);
-      if (e.uniqueKeys && jsonHasDuplicateKeys(node)) {
+      if (jsonHasDuplicateKeys(node)) {
         throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
       }
       // The result is the verbatim input text as a `json` value (PG).
@@ -1516,10 +1528,11 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // directly; a json arg is parsed from its verbatim text on demand (json.md §4), then dispatched
       // to the same kernel. The NULL-input case was already handled by the blanket propagation above.
       if (e.func === "jsonb_typeof" || e.func === "json_typeof") {
-        return textValue(jsonTypeofName(jsonArgNode(vals[0]!)));
+        // Neither reads string contents, so a json arg is only lexed (jsonArgShape, json.md §4.2).
+        return textValue(jsonTypeofName(jsonArgShape(vals[0]!)));
       }
       if (e.func === "jsonb_array_length" || e.func === "json_array_length") {
-        return intValue(jsonArrayLength(jsonArgNode(vals[0]!)));
+        return intValue(jsonArrayLength(jsonArgShape(vals[0]!)));
       }
       if (e.func === "jsonb_strip_nulls") {
         return jsonbValue(jsonStripNulls(jsonArgNode(vals[0]!)));
@@ -2319,19 +2332,21 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const cv = evalExpr(e.args[0]!, row, env, m);
       const pv = evalExpr(e.args[1]!, row, env, m);
       if (cv.kind === "null" || pv.kind === "null") return nullValue();
-      let seq: JsonNode[] | null;
+      // Reading a json context as jsonb (a `\u0000` / unpaired surrogate raises) is the context's
+      // conversion, not path evaluation, so ON ERROR does not catch it — as in PostgreSQL
+      // (json.md §4.2).
+      const node = jsonArgNode(cv);
+      let seq: JsonNode[];
       try {
-        seq = evalJsonpath(cv, pv, m);
+        seq = evalJsonpathOn(node, pv, m);
       } catch (err) {
-        // A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost abort,
-        // etc.) propagates.
+        // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
+        // else (a cost abort, etc.) propagates.
         if (isSqljsonError(err)) {
           return applyJsonBehavior(e.onError, err, e.returning, env, m);
         }
         throw err;
       }
-      // A NULL ctx/path already returned above; evalJsonpath can still report no match as null.
-      if (seq === null) return nullValue();
       m.charge(COSTS.operatorEval * BigInt(seq.length));
       m.guard();
       return evalJsonSqlResult(
@@ -3234,6 +3249,9 @@ function jsonGetVerbatim(op: JsonGetOp, text: string, arg: Value): Value {
       steps.push({ key: el.text, index: pathStepIndex(el.text) });
     }
   }
+  // PG's get_worker lexes the WHOLE document with need_escapes, so a `\u0000` or an unpaired
+  // surrogate anywhere in it raises, matched or not (json.md §4.2).
+  checkJsonEscapes(text);
   const sub = steps.length === 0 ? verbatimWhole(text) : verbatimGet(text, steps);
   if (sub === null) return nullValue();
   if (op === "arrow" || op === "hashArrow") return jsonValue(sub);

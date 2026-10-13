@@ -252,6 +252,15 @@ name = "invalid_text_representation"
 class = "data exception"
 template = "invalid input syntax for type {type}: {detail}"
 
+# A `\u0000` escape decoded from `jsonb` / `jsonpath` input or from a `json` value read by a
+# de-escaping function: text cannot hold the NUL character (PostgreSQL's code, message, and Detail
+# "\u0000 cannot be converted to text." — ../design/json.md §6.2).
+[[error]]
+code = "22P05"
+name = "untranslatable_character"
+class = "data exception"
+template = "unsupported Unicode escape sequence"
+
 # --- integrity constraint violation (class 23) ------------------------------
 [[error]]
 code = "23502"

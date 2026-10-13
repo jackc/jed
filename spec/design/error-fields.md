@@ -236,6 +236,9 @@ when `Detail` is set ([cli.md](cli.md) §5).
 | 23514 | INSERT / UPDATE | `Failing row contains ({row}).` |
 | 23502 | INSERT / UPDATE | `Failing row contains ({row}).` |
 | 22004 | `jsonb_set_lax` with a SQL NULL value and `null_value_treatment` `'raise_exception'` ([json-sql-functions.md](json-sql-functions.md) §2) | `Exception was raised because null_value_treatment is "raise_exception".` |
+| 22P05 | a decoded `\u0000` in JSON input, a de-escaping `json` function, or a jsonpath string ([json.md](json.md) §4.2, [jsonpath.md](jsonpath.md) §2.1) | `\u0000 cannot be converted to text.` |
+| 22P02 | an unpaired surrogate `\u` escape, decoded (same sites) | `Unicode low surrogate must follow a high surrogate.` / `Unicode high surrogate must not follow a high surrogate.` |
+| 22P02 | a JSON `\u` escape without four hex digits ([json.md](json.md) §4.2) | `"\u" must be followed by four hexadecimal digits.` |
 
 `{row}` is every column of the target table in ordinal order, from the candidate (new) row.
 

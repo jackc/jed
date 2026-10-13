@@ -901,7 +901,11 @@ func (p *jpParser) parseMember() (string, error) {
 	return string(p.s[start:p.i]), nil
 }
 
-// parseQuoted parses a "…" jsonpath string (JSON escapes).
+// parseQuoted parses a `"…"` jsonpath string — a port of PostgreSQL's jsonpath scanner escapes
+// (jsonpath_scan.l, jsonpath.md §2.1): `\b \f \n \r \t \v`; a run of `\uXXXX` / `\u{X…}` (1–6 hex
+// digits) escapes, within which a surrogate pair combines; `\xHH`; and a backslash before any other
+// character is that character. A decoded NUL is 22P05, an unpaired surrogate 22P02 (PG's Detail), and
+// a malformed `\u` / `\x` or a code point above U+10FFFF 42601.
 func (p *jpParser) parseQuoted() (string, error) {
 	p.i++ // opening "
 	var out strings.Builder
@@ -915,58 +919,123 @@ func (p *jpParser) parseQuoted() (string, error) {
 			p.i++
 			return out.String(), nil
 		case '\\':
-			p.i++
-			ec, ok := p.peek()
-			if !ok {
-				return "", jpMalformed("invalid escape")
+			if p.i+1 >= len(p.s) {
+				return "", jpMalformed("unexpected end after backslash")
 			}
-			switch ec {
-			case '"':
-				out.WriteByte('"')
-			case '\\':
-				out.WriteByte('\\')
-			case '/':
-				out.WriteByte('/')
-			case 'n':
-				out.WriteByte('\n')
-			case 'r':
-				out.WriteByte('\r')
-			case 't':
-				out.WriteByte('\t')
-			case 'b':
-				out.WriteByte('\b')
-			case 'f':
-				out.WriteByte('\f')
+			switch ec := p.s[p.i+1]; ec {
 			case 'u':
-				if p.i+5 > len(p.s) {
-					return "", jpMalformed("invalid \\u escape")
+				if err := p.parseUnicodeRun(&out); err != nil {
+					return "", err
 				}
-				hex := string(p.s[p.i+1 : p.i+5])
-				cp, err := strconv.ParseUint(hex, 16, 32)
-				if err != nil {
-					return "", jpMalformed("invalid \\u escape")
+			case 'x':
+				if p.i+4 > len(p.s) || !isHexDigit(p.s[p.i+2]) || !isHexDigit(p.s[p.i+3]) {
+					return "", jpMalformed("invalid hexadecimal character sequence")
 				}
-				r := rune(cp)
-				if !utf8.ValidRune(r) {
-					return "", jpMalformed("invalid \\u escape")
+				ch, _ := strconv.ParseUint(string(p.s[p.i+2:p.i+4]), 16, 32)
+				if err := jpPushCodePoint(rune(ch), &out); err != nil {
+					return "", err
 				}
-				out.WriteRune(r)
 				p.i += 4
 			default:
-				return "", jpMalformed("invalid escape")
+				p.i++ // the backslash; the escaped character follows
+				switch ec {
+				case 'b':
+					out.WriteByte('\b')
+				case 'f':
+					out.WriteByte('\f')
+				case 'n':
+					out.WriteByte('\n')
+				case 'r':
+					out.WriteByte('\r')
+				case 't':
+					out.WriteByte('\t')
+				case 'v':
+					out.WriteByte('\v')
+				default:
+					p.copyChar(&out)
+					continue
+				}
+				p.i++
 			}
-			p.i++
 		default:
-			// Copy one UTF-8 char.
-			start := p.i
-			n := utf8Len(p.s[p.i])
-			if p.i+n > len(p.s) {
-				n = len(p.s) - p.i
-			}
-			p.i += n
-			out.Write(p.s[start:p.i])
+			p.copyChar(&out)
 		}
 	}
+}
+
+// copyChar copies the one UTF-8 character at the cursor.
+func (p *jpParser) copyChar(out *strings.Builder) {
+	start := p.i
+	n := utf8Len(p.s[p.i])
+	if p.i+n > len(p.s) {
+		n = len(p.s) - p.i
+	}
+	p.i += n
+	out.Write(p.s[start:p.i])
+}
+
+// parseUnicodeRun parses a run of consecutive `\u` escapes (the cursor at the first `\`) — PG's
+// `{unicode}+` token, lexed whole before any is decoded, so a malformed escape anywhere in the run is
+// 42601 ahead of a decode error. Decoding is PG's addUnicode: a high surrogate must be followed,
+// within the run, by a low one (the pair combines); a lone or doubled surrogate is 22P02.
+func (p *jpParser) parseUnicodeRun(out *strings.Builder) error {
+	var units []int
+	for p.i+1 < len(p.s) && p.s[p.i] == '\\' && p.s[p.i+1] == 'u' {
+		p.i += 2
+		braced := p.eat('{')
+		start := p.i
+		max := 4
+		if braced {
+			max = 6
+		}
+		for p.i-start < max && p.i < len(p.s) && isHexDigit(p.s[p.i]) {
+			p.i++
+		}
+		digits := p.i - start
+		if (braced && (digits == 0 || !p.eat('}'))) || (!braced && digits < 4) {
+			return jpMalformed("invalid Unicode escape sequence")
+		}
+		v, _ := strconv.ParseUint(string(p.s[start:start+digits]), 16, 32)
+		units = append(units, int(v))
+	}
+	hiSurrogate := -1
+	for _, ch := range units {
+		if ch >= 0xD800 && ch <= 0xDBFF {
+			if hiSurrogate != -1 {
+				return jsonEscapeSyntaxError("jsonpath", jsonHighSurrogateDetail)
+			}
+			hiSurrogate = ch
+			continue
+		} else if ch >= 0xDC00 && ch <= 0xDFFF {
+			if hiSurrogate == -1 {
+				return jsonEscapeSyntaxError("jsonpath", jsonLowSurrogateDetail)
+			}
+			ch = 0x10000 + (((hiSurrogate - 0xD800) << 10) | (ch - 0xDC00))
+			hiSurrogate = -1
+		} else if hiSurrogate != -1 {
+			return jsonEscapeSyntaxError("jsonpath", jsonLowSurrogateDetail)
+		}
+		if err := jpPushCodePoint(rune(ch), out); err != nil {
+			return err
+		}
+	}
+	if hiSurrogate != -1 {
+		return jsonEscapeSyntaxError("jsonpath", jsonLowSurrogateDetail)
+	}
+	return nil
+}
+
+// jpPushCodePoint appends a decoded escape's code point — PG's addUnicodeChar: NUL is 22P05 (text
+// cannot hold it), a value above U+10FFFF 42601 ("invalid Unicode code point").
+func jpPushCodePoint(ch rune, out *strings.Builder) error {
+	if ch == 0 {
+		return jsonUnicodeZeroError()
+	}
+	if ch > utf8.MaxRune {
+		return newError(SyntaxError, "invalid Unicode code point")
+	}
+	out.WriteRune(ch)
+	return nil
 }
 
 // parseSubscripts parses a [...] subscript list (the opening `[` consumed, not the wildcard form).

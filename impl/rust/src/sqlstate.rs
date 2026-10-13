@@ -78,6 +78,8 @@ pub enum SqlState {
     SingletonSqlJsonItemRequired,
     /// 22P02 — invalid input syntax for type {type}: {detail}
     InvalidTextRepresentation,
+    /// 22P05 — unsupported Unicode escape sequence
+    UntranslatableCharacter,
     /// 23502 — null value in column {name} violates not-null constraint
     NotNullViolation,
     /// 23505 — duplicate key value violates unique constraint: {name}
@@ -237,6 +239,7 @@ impl SqlState {
             SqlState::NonNumericSqlJsonItem => "22036",
             SqlState::SingletonSqlJsonItemRequired => "22038",
             SqlState::InvalidTextRepresentation => "22P02",
+            SqlState::UntranslatableCharacter => "22P05",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
             SqlState::CheckViolation => "23514",
@@ -338,6 +341,7 @@ impl SqlState {
             "22036" => Some(SqlState::NonNumericSqlJsonItem),
             "22038" => Some(SqlState::SingletonSqlJsonItemRequired),
             "22P02" => Some(SqlState::InvalidTextRepresentation),
+            "22P05" => Some(SqlState::UntranslatableCharacter),
             "23502" => Some(SqlState::NotNullViolation),
             "23505" => Some(SqlState::UniqueViolation),
             "23514" => Some(SqlState::CheckViolation),
@@ -448,6 +452,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "22036", name: "non_numeric_sql_json_item", class: "data exception" },
     ErrorDesc { code: "22038", name: "singleton_sql_json_item_required", class: "data exception" },
     ErrorDesc { code: "22P02", name: "invalid_text_representation", class: "data exception" },
+    ErrorDesc { code: "22P05", name: "untranslatable_character", class: "data exception" },
     ErrorDesc { code: "23502", name: "not_null_violation", class: "integrity constraint violation" },
     ErrorDesc { code: "23505", name: "unique_violation", class: "integrity constraint violation" },
     ErrorDesc { code: "23514", name: "check_violation", class: "integrity constraint violation" },

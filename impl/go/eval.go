@@ -1991,8 +1991,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// jsonb is always well-formed with unique keys; only the kind can fail.
 			ok = jsonPredKindMatches(v.jsonb(), e.jpKind)
 		case ValJson, ValText:
-			// A string / json operand: parse (preserving duplicate keys); malformed → false.
-			node, perr := parsePreservingJSON(v.str())
+			// A string / json operand: parse (preserving duplicate keys); malformed → false. Only the
+			// UNIQUE KEYS check reads string contents, so only it de-escapes (PG's need_escapes =
+			// check_unique_keys): a `\u0000` or unpaired surrogate is then a parse failure → false
+			// (json.md §4.2).
+			parse := parseShapeJSON
+			if e.jpUnique {
+				parse = parsePreservingJSON
+			}
+			node, perr := parse(v.str())
 			if perr != nil {
 				ok = false
 			} else {
@@ -2013,12 +2020,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil // a NULL operand → SQL NULL
 		case ValText:
 			// Validate the string is well-formed JSON (22P02 on malformed), preserving duplicate keys
-			// so the optional UNIQUE KEYS check (22030) can see them.
+			// so the optional UNIQUE KEYS check (22030) can see them. Only that check de-escapes (PG's
+			// need_escapes = unique_keys, json.md §4.2).
+			if !e.jpUnique {
+				if _, perr := parseShapeJSON(v.str()); perr != nil {
+					return Value{}, perr
+				}
+				return JsonValue(v.str()), nil
+			}
 			node, perr := parsePreservingJSON(v.str())
 			if perr != nil {
 				return Value{}, perr
 			}
-			if e.jpUnique && hasDuplicateKeys(&node) {
+			if hasDuplicateKeys(&node) {
 				return Value{}, newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
 			}
 			// The result is the verbatim input text as a `json` value (PG).
@@ -3066,14 +3080,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// json/jsonb processing functions (B1, json-sql-functions.md §2). A jsonb arg is the node
 			// directly; a json arg is parsed from its verbatim text on demand (json.md §4), then
 			// dispatched to the same kernel. The NULL-input case is handled by the blanket
-			// propagation above.
-			node, err := jsonArgNode(vals[0])
+			// propagation above. Neither reads string contents, so a json arg is only lexed
+			// (jsonArgShape, json.md §4.2).
+			node, err := jsonArgShape(vals[0])
 			if err != nil {
 				return Value{}, err
 			}
 			return TextValue(jsonTypeofName(&node)), nil
 		case sfJsonbArrayLength, sfJsonArrayLength:
-			node, err := jsonArgNode(vals[0])
+			node, err := jsonArgShape(vals[0])
 			if err != nil {
 				return Value{}, err
 			}
@@ -4058,17 +4073,21 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if cv.Kind == ValNull || pv.Kind == ValNull {
 			return NullValue(), nil
 		}
-		seq, ok, err := evalJsonpath(cv, pv, m)
+		// Reading a json context as jsonb (a `\u0000` / unpaired surrogate raises) is the context's
+		// conversion, not path evaluation, so ON ERROR does not catch it — as in PostgreSQL
+		// (json.md §4.2).
+		node, err := jsonArgNode(cv)
 		if err != nil {
-			// A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost abort,
-			// etc.) propagates.
+			return Value{}, err
+		}
+		seq, err := evalJsonpathOn(node, pv, m)
+		if err != nil {
+			// A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
+			// else (a cost abort, etc.) propagates.
 			if isSQLJSONError(err) {
 				return applyJSONBehavior(e.jsOnError, err, e.result, env, m)
 			}
 			return Value{}, err
-		}
-		if !ok {
-			return NullValue(), nil
 		}
 		// Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
 		m.Charge(costs.OperatorEval * int64(len(seq)))
@@ -4811,6 +4830,11 @@ func jsonGetVerbatim(op jsonGetOp, text string, arg Value) (Value, error) {
 			idx, ok := jsonPathStepIndex(el.str())
 			steps = append(steps, verbatimStep{key: el.str(), hasKey: true, index: idx, hasIndex: ok})
 		}
+	}
+	// PG's get_worker lexes the WHOLE document with need_escapes, so a `\u0000` or an unpaired
+	// surrogate anywhere in it raises, matched or not (json.md §4.2).
+	if err := checkJSONEscapes(text); err != nil {
+		return Value{}, err
 	}
 	var sub string
 	if len(steps) == 0 {

@@ -238,28 +238,105 @@ func jsonMalformed(detail string) error {
 	return newError(InvalidTextRepresentation, "invalid input syntax for type json: "+detail)
 }
 
+// jsonEscapeSyntaxError is PostgreSQL's 22P02 `invalid input syntax for type {typeName}` carrying one
+// of its json_errdetail / jsonpath-scanner sentences as the Detail (error-fields.md §9.2) — the
+// `\u`-escape family, whose text jed matches byte-for-byte.
+func jsonEscapeSyntaxError(typeName, detail string) error {
+	return newError(InvalidTextRepresentation, "invalid input syntax for type "+typeName).withDetail(detail)
+}
+
+// jsonEscapeFormatError is a `\u` escape not followed by four hex digits (PG
+// JSON_UNICODE_ESCAPE_FORMAT).
+func jsonEscapeFormatError() error {
+	return jsonEscapeSyntaxError("json", `"\u" must be followed by four hexadecimal digits.`)
+}
+
+// jsonHighSurrogateDetail is the Detail of a high surrogate followed by another high surrogate (PG
+// JSON_UNICODE_HIGH_SURROGATE, and the jsonpath scanner's same sentence).
+const jsonHighSurrogateDetail = "Unicode high surrogate must not follow a high surrogate."
+
+// jsonLowSurrogateDetail is the Detail of a low surrogate without a preceding high one, or a high
+// surrogate not followed by a low one (PG JSON_UNICODE_LOW_SURROGATE, and the jsonpath scanner's).
+const jsonLowSurrogateDetail = "Unicode low surrogate must follow a high surrogate."
+
+// jsonUnicodeZeroError is 22P05 for a decoded `\u0000` (PG JSON_UNICODE_CODE_POINT_ZERO; the jsonpath
+// scanner raises the same): text cannot hold the NUL character (json.md §6.2).
+func jsonUnicodeZeroError() error {
+	return newError(UntranslatableCharacter, "unsupported Unicode escape sequence").
+		withDetail(`\u0000 cannot be converted to text.`)
+}
+
 // jsonbIn parses + canonicalizes JSON text into a jsonb node tree (`jsonb_in` — spec/design/json.md
 // §6.2): numbers → Decimal, object keys deduped last-wins then sorted length-then-bytewise.
-// Malformed input → 22P02.
+// Malformed input → 22P02; a `\u0000` escape → 22P05.
 func jsonbIn(input string) (JsonNode, error) {
-	p := &jsonParser{buf: []byte(input), canonicalize: true}
+	p := &jsonParser{buf: []byte(input), canonicalize: true, needEscapes: true}
 	return p.parseDocument()
 }
 
 // validateJSON validates JSON text well-formedness (`json_in` — spec/design/json.md §4); the caller
-// stores the original bytes verbatim. Malformed input → 22P02.
+// stores the original bytes verbatim. Malformed input → 22P02. Like PostgreSQL's json_in this only
+// lexes: a `\u` escape must have four hex digits, but `\u0000` and an unpaired surrogate are accepted
+// (they fail later, in a function that de-escapes the string — json.md §4.2).
 func validateJSON(input string) error {
-	p := &jsonParser{buf: []byte(input), canonicalize: false}
+	p := &jsonParser{buf: []byte(input)}
 	_, err := p.parseDocument()
 	return err
 }
 
 // parsePreservingJSON parses JSON text into a node tree WITHOUT canonicalizing (object key order +
 // duplicates preserved) — the on-demand structural parse a `json` operator needs
-// (spec/design/json.md §4).
+// (spec/design/json.md §4). Strings are de-escaped, so a `\u0000` (22P05) or an unpaired surrogate
+// (22P02) anywhere in the document raises (PG's need_escapes parse, json.md §4.2).
 func parsePreservingJSON(input string) (JsonNode, error) {
-	p := &jsonParser{buf: []byte(input), canonicalize: false}
+	p := &jsonParser{buf: []byte(input), needEscapes: true}
 	return p.parseDocument()
+}
+
+// parseShapeJSON is the node SHAPE of JSON text, for a consumer that never reads string contents
+// (json_typeof, json_array_length, IS JSON without UNIQUE KEYS — PG lexes these without
+// need_escapes): every string (member names included) is left EMPTY, and `\u` escapes are only
+// lexed, never decoded or checked (json.md §4.2).
+func parseShapeJSON(input string) (JsonNode, error) {
+	p := &jsonParser{buf: []byte(input)}
+	return p.parseDocument()
+}
+
+// parsePreservingJSONUnlessRoot is the node tree of a `json` argument to a de-escaping function that
+// raises a kind error on a root container of the wrong kind (wrongRoot is '[' or '{'). PostgreSQL
+// raises that error at the root's opening bracket, before lexing anything inside it, so such a root
+// is returned as its parseShapeJSON (the caller raises the kind error and reads no string); any other
+// root is parsePreservingJSON'd, its escapes checked first (json.md §4.2).
+func parsePreservingJSONUnlessRoot(input string, wrongRoot byte) (JsonNode, error) {
+	if start := skipJSONWS(input, 0); start < len(input) && input[start] == wrongRoot {
+		return parseShapeJSON(input)
+	}
+	return parsePreservingJSON(input)
+}
+
+// checkJSONEscapes checks the escapes of every string token of well-formed JSON text the way a
+// de-escaping parse would (PG lexes a `json` argument with need_escapes for every function that reads
+// string contents): the first `\u0000` (22P05) or unpaired surrogate (22P02) in document order raises
+// (json.md §4.2).
+func checkJSONEscapes(text string) error {
+	// Only a `\u` escape can fail the check, so a document without one skips the scan.
+	if !strings.Contains(text, `\u`) {
+		return nil
+	}
+	p := &jsonParser{buf: []byte(text), needEscapes: true}
+	pos := 0
+	for pos < len(text) {
+		if text[pos] == '"' {
+			p.pos = pos
+			if _, err := p.parseString(); err != nil {
+				return err
+			}
+			pos = p.pos
+		} else {
+			pos++
+		}
+	}
+	return nil
 }
 
 type jsonParser struct {
@@ -268,6 +345,10 @@ type jsonParser struct {
 	// canonicalize: when true (jsonb), objects dedup last-wins and sort keys; when false (json
 	// validation / on-demand parse), members are kept in input order with duplicates.
 	canonicalize bool
+	// needEscapes is PostgreSQL's need_escapes (json.md §4.2): when true, strings are de-escaped —
+	// surrogate pairs combined, and `\u0000` (22P05) or an unpaired surrogate (22P02) rejected; when
+	// false (json_in, parseShapeJSON), escapes are only lexed and strings are left empty.
+	needEscapes bool
 	// depth is the current container nesting depth (spec/design/json.md §6.4): entering the
 	// maxJSONDepth+1-th `[`/`{` aborts 54001 before parsing anything inside it.
 	depth int
@@ -449,12 +530,17 @@ func (p *jsonParser) parseArray() (JsonNode, error) {
 	}
 }
 
-// parseString parses a JSON string token (the leading `"` is at p.pos), decoding escapes to the
-// actual UTF-8 content. RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (with surrogate pairs).
-// Unescaped control characters (< 0x20) are rejected.
+// parseString parses a JSON string token (the leading `"` is at p.pos) — a port of PostgreSQL's
+// json_lex_string (src/common/jsonapi.c). RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX`; unescaped
+// control characters (< 0x20) are rejected. With needEscapes the content is decoded: a high surrogate
+// must be followed directly by a `\u` low surrogate (the pair combines), anything else after it — and
+// a low surrogate without one — is 22P02 with PG's Detail, and a decoded `\u0000` is 22P05. Without it
+// the content is not built (an empty string is returned).
 func (p *jsonParser) parseString() (string, error) {
 	p.pos++ // consume opening '"'
 	var out strings.Builder
+	// hiSurrogate is a pending high surrogate awaiting its low half (PG's hi_surrogate); -1 = none.
+	hiSurrogate := -1
 	for {
 		c, ok := p.peek()
 		if !ok {
@@ -462,6 +548,9 @@ func (p *jsonParser) parseString() (string, error) {
 		}
 		switch {
 		case c == '"':
+			if hiSurrogate != -1 {
+				return "", jsonEscapeSyntaxError("json", jsonLowSurrogateDetail)
+			}
 			p.pos++
 			return out.String(), nil
 		case c == '\\':
@@ -470,65 +559,63 @@ func (p *jsonParser) parseString() (string, error) {
 			if !ok {
 				return "", jsonMalformed("unterminated escape")
 			}
-			switch e {
-			case '"':
-				out.WriteByte('"')
-			case '\\':
-				out.WriteByte('\\')
-			case '/':
-				out.WriteByte('/')
-			case 'b':
-				out.WriteByte('\b')
-			case 'f':
-				out.WriteByte('\f')
-			case 'n':
-				out.WriteByte('\n')
-			case 'r':
-				out.WriteByte('\r')
-			case 't':
-				out.WriteByte('\t')
-			case 'u':
+			if e == 'u' {
 				p.pos++
-				cp, err := p.parseHex4()
+				ch, err := p.parseHex4()
 				if err != nil {
 					return "", err
 				}
-				// Surrogate pair handling (UTF-16 escapes).
-				if cp >= 0xD800 && cp <= 0xDBFF {
-					// High surrogate: must be followed by \uDC00..\uDFFF.
-					if c2, ok := p.peek(); !ok || c2 != '\\' {
-						return "", jsonMalformed("unpaired high surrogate in \\u escape")
-					}
-					p.pos++
-					if c2, ok := p.peek(); !ok || c2 != 'u' {
-						return "", jsonMalformed("unpaired high surrogate in \\u escape")
-					}
-					p.pos++
-					lo, err := p.parseHex4()
-					if err != nil {
-						return "", err
-					}
-					if lo < 0xDC00 || lo > 0xDFFF {
-						return "", jsonMalformed("invalid low surrogate in \\u escape")
-					}
-					combined := 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00))
-					if combined > utf8.MaxRune {
-						return "", jsonMalformed("invalid surrogate pair")
-					}
-					out.WriteRune(rune(combined))
-				} else if cp >= 0xDC00 && cp <= 0xDFFF {
-					return "", jsonMalformed("unpaired low surrogate in \\u escape")
-				} else {
-					if cp > utf8.MaxRune {
-						return "", jsonMalformed("invalid \\u escape")
-					}
-					out.WriteRune(rune(cp))
+				if !p.needEscapes {
+					continue
 				}
+				if ch >= 0xD800 && ch <= 0xDBFF {
+					if hiSurrogate != -1 {
+						return "", jsonEscapeSyntaxError("json", jsonHighSurrogateDetail)
+					}
+					hiSurrogate = ch
+					continue
+				} else if ch >= 0xDC00 && ch <= 0xDFFF {
+					if hiSurrogate == -1 {
+						return "", jsonEscapeSyntaxError("json", jsonLowSurrogateDetail)
+					}
+					ch = 0x10000 + (((hiSurrogate - 0xD800) << 10) | (ch - 0xDC00))
+					hiSurrogate = -1
+				}
+				if hiSurrogate != -1 {
+					return "", jsonEscapeSyntaxError("json", jsonLowSurrogateDetail)
+				}
+				if ch == 0 {
+					return "", jsonUnicodeZeroError()
+				}
+				out.WriteRune(rune(ch))
 				continue // parseHex4 already advanced pos past the 4 digits
+			}
+			if hiSurrogate != -1 {
+				return "", jsonEscapeSyntaxError("json", jsonLowSurrogateDetail)
+			}
+			var decoded byte
+			switch e {
+			case '"', '\\', '/':
+				decoded = e
+			case 'b':
+				decoded = '\b'
+			case 'f':
+				decoded = '\f'
+			case 'n':
+				decoded = '\n'
+			case 'r':
+				decoded = '\r'
+			case 't':
+				decoded = '\t'
 			default:
 				return "", jsonMalformed("invalid escape sequence")
 			}
+			if p.needEscapes {
+				out.WriteByte(decoded)
+			}
 			p.pos++
+		case hiSurrogate != -1:
+			return "", jsonEscapeSyntaxError("json", jsonLowSurrogateDetail)
 		case c <= 0x1F:
 			return "", jsonMalformed("control character in string must be escaped")
 		default:
@@ -542,19 +629,23 @@ func (p *jsonParser) parseString() (string, error) {
 			if r == utf8.RuneError && size <= 1 {
 				return "", jsonMalformed("invalid UTF-8 in string")
 			}
-			out.Write(p.buf[p.pos:end])
+			if p.needEscapes {
+				out.Write(p.buf[p.pos:end])
+			}
 			p.pos = end
 		}
 	}
 }
 
-// parseHex4 reads exactly four hex digits as a code-unit (the cursor is just past `\u`).
+// parseHex4 reads exactly four hex digits as a code-unit (the cursor is just past `\u`). A non-hex
+// digit is PG's JSON_UNICODE_ESCAPE_FORMAT (22P02 with its Detail); running out of input first is a
+// truncated token.
 func (p *jsonParser) parseHex4() (int, error) {
-	if p.pos+4 > len(p.buf) {
-		return 0, jsonMalformed("truncated \\u escape")
-	}
 	v := 0
 	for i := 0; i < 4; i++ {
+		if p.pos+i >= len(p.buf) {
+			return 0, jsonMalformed("truncated \\u escape")
+		}
 		d := p.buf[p.pos+i]
 		var nib int
 		switch {
@@ -565,7 +656,7 @@ func (p *jsonParser) parseHex4() (int, error) {
 		case d >= 'A' && d <= 'F':
 			nib = int(d-'A') + 10
 		default:
-			return 0, jsonMalformed("invalid hex digit in \\u escape")
+			return 0, jsonEscapeFormatError()
 		}
 		v = (v << 4) | nib
 	}
@@ -1096,7 +1187,7 @@ func skipJSONValue(b string, pos int) int {
 // parser's escape decoding. Returns (content, end).
 func decodeJSONString(b string, pos int) (string, int, error) {
 	end := skipJSONString(b, pos)
-	p := &jsonParser{buf: []byte(b[pos:end])}
+	p := &jsonParser{buf: []byte(b[pos:end]), needEscapes: true}
 	s, err := p.parseString()
 	if err != nil {
 		return "", 0, err
@@ -1264,14 +1355,21 @@ func verbatimToText(sub string) (string, bool, error) {
 }
 
 // verbatimArrayElements is json_array_elements[_text](json) (PG elements_worker): the verbatim
-// sub-text of each top-level array element, in order. A non-array → 22023 with PG's message.
-func verbatimArrayElements(text, fn string) ([]string, error) {
+// sub-text of each top-level array element, in order. A non-array → 22023 with PG's message. The
+// _text form (deEscape) lexes with need_escapes, so a `\u0000` / unpaired surrogate raises — but an
+// object root's error comes first (PG raises it at the `{`), while a scalar root is lexed before its
+// own error (json.md §4.2).
+func verbatimArrayElements(text, fn string, deEscape bool) ([]string, error) {
 	start := skipJSONWS(text, 0)
-	switch text[start] {
-	case '[':
-	case '{':
+	if text[start] == '{' {
 		return nil, newError(InvalidParameterValue, fmt.Sprintf("cannot call %s on a non-array", fn))
-	default:
+	}
+	if deEscape {
+		if err := checkJSONEscapes(text); err != nil {
+			return nil, err
+		}
+	}
+	if text[start] != '[' {
 		return nil, newError(InvalidParameterValue, fmt.Sprintf("cannot call %s on a scalar", fn))
 	}
 	var out []string
@@ -1290,14 +1388,18 @@ type verbatimMember struct {
 
 // verbatimObjectMembers is json_each[_text](json) (PG each_worker): each top-level object member as
 // its de-escaped key and verbatim value sub-text, in INPUT order with duplicate keys kept. A
-// non-object → 22023 with PG's message.
+// non-object → 22023 with PG's message. Both forms lex with need_escapes, so a `\u0000` / unpaired
+// surrogate raises — after an array root's error (PG raises it at the `[`), before a scalar root's
+// (json.md §4.2).
 func verbatimObjectMembers(text string) ([]verbatimMember, error) {
 	start := skipJSONWS(text, 0)
-	switch text[start] {
-	case '{':
-	case '[':
+	if text[start] == '[' {
 		return nil, newError(InvalidParameterValue, "cannot deconstruct an array as an object")
-	default:
+	}
+	if err := checkJSONEscapes(text); err != nil {
+		return nil, err
+	}
+	if text[start] != '{' {
 		return nil, newError(InvalidParameterValue, "cannot deconstruct a scalar")
 	}
 	var out []verbatimMember

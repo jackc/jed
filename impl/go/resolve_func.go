@@ -1941,6 +1941,20 @@ func jsonArgNode(v Value) (JsonNode, error) {
 	}
 }
 
+// jsonArgShape is jsonArgNode for a function that never reads string contents (json_typeof,
+// json_array_length): a json value is only lexed, as PostgreSQL does without need_escapes, so a
+// `\u0000` or an unpaired surrogate inside it does not raise (json.md §4.2).
+func jsonArgShape(v Value) (JsonNode, error) {
+	switch v.Kind {
+	case ValJsonb:
+		return *v.jsonb(), nil
+	case ValJson:
+		return parseShapeJSON(v.str())
+	default:
+		panic("jsonArgShape: a json/jsonb function argument must be json/jsonb")
+	}
+}
+
 // valueToNode is the JSON image of any value — the to_jsonb kernel (json-sql-functions.md §2), also
 // reused by the json aggregates (B4). Numbers stay exact (decimal, never float); a json/jsonb value
 // canonicalizes; a 1-D array maps to a JSON array recursively (a NULL element → JSON null). The
@@ -2441,16 +2455,22 @@ func evalJsonpath(ctx, path Value, m *costMeter) ([]JsonNode, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
-	compiled, err := compileMetered(path.str(), m)
-	if err != nil {
-		return nil, false, err
-	}
-	seq, err := compiled.Eval(node, m)
+	seq, err := evalJsonpathOn(node, path, m)
 	if err != nil {
 		return nil, false, err
 	}
 	return seq, true, nil
+}
+
+// evalJsonpathOn evaluates a non-NULL jsonpath over an already-read context node: recompiling the
+// path's canonical text charges jsonpath_compile (jsonpath.md §7).
+func evalJsonpathOn(node JsonNode, path Value, m *costMeter) ([]JsonNode, error) {
+	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
+	compiled, err := compileMetered(path.str(), m)
+	if err != nil {
+		return nil, err
+	}
+	return compiled.Eval(node, m)
 }
 
 // resolveJSONSetInsert resolves jsonb_set / jsonb_set_lax / jsonb_insert (json-sql-functions.md

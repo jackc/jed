@@ -81,6 +81,8 @@ const (
 	SingletonSqlJsonItemRequired
 	// InvalidTextRepresentation is 22P02 — invalid input syntax for type {type}: {detail}.
 	InvalidTextRepresentation
+	// UntranslatableCharacter is 22P05 — unsupported Unicode escape sequence.
+	UntranslatableCharacter
 	// NotNullViolation is 23502 — null value in column {name} violates not-null constraint.
 	NotNullViolation
 	// UniqueViolation is 23505 — duplicate key value violates unique constraint: {name}.
@@ -272,6 +274,8 @@ func (s SqlState) Code() string {
 		return "22038"
 	case InvalidTextRepresentation:
 		return "22P02"
+	case UntranslatableCharacter:
+		return "22P05"
 	case NotNullViolation:
 		return "23502"
 	case UniqueViolation:
@@ -441,6 +445,7 @@ var errorDescs = []errorDesc{
 	{Code: "22036", Name: "non_numeric_sql_json_item", Class: "data exception"},
 	{Code: "22038", Name: "singleton_sql_json_item_required", Class: "data exception"},
 	{Code: "22P02", Name: "invalid_text_representation", Class: "data exception"},
+	{Code: "22P05", Name: "untranslatable_character", Class: "data exception"},
 	{Code: "23502", Name: "not_null_violation", Class: "integrity constraint violation"},
 	{Code: "23505", Name: "unique_violation", Class: "integrity constraint violation"},
 	{Code: "23514", Name: "check_violation", Class: "integrity constraint violation"},
