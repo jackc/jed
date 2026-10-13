@@ -412,8 +412,9 @@ table alias is not available: build the row with `ROW(t.a, t.b)` or use a compos
 <LiveSql demo="rowToJsonDemo" query={rowToJsonDemo} rows={1} />
 
 Every other conversion to JSON uses the same rule: `to_json`, `to_jsonb`, `array_to_json(array [,
-pretty])`, `json_build_array`, `json_build_object`, and the `json_agg` and `json_object_agg`
-aggregates, each with its `jsonb` variant. A `jsonb` result keeps an object's keys in canonical order.
+pretty])`, `JSON_SCALAR(value)` (the same `json` result as `to_json`), `json_build_array`,
+`json_build_object`, and the `json_agg` and `json_object_agg` aggregates, each with its `jsonb`
+variant. A `jsonb` result keeps an object's keys in canonical order.
 An object key is always a string: a date or timestamp key takes the same ISO 8601 form, and an array,
 composite, or JSON key is an error (`22023`). Converting a float (`f32`/`f64`) value to JSON is not
 supported yet (`0A000`):

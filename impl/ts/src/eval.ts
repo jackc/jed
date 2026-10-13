@@ -1550,35 +1550,6 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "jsonb_pretty") {
         return textValue(jsonbPrettyText(vals[0]!, m));
       }
-      if (e.func === "json_scalar") {
-        // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string), rendered
-        // compact (json-sql-functions.md §5). STRICT (NULL handled above). The datetime/uuid/bytea/
-        // interval/float sources are a deferred 0A000 follow-on.
-        const v0 = vals[0]!;
-        let node: JsonNode;
-        switch (v0.kind) {
-          case "int":
-            // JSON_SCALAR of an integer wraps the bigint via the Decimal-from-i64 path (to_jsonb's Int).
-            node = { kind: "number", dec: Decimal.fromBigInt(v0.int) };
-            break;
-          case "decimal":
-            node = { kind: "number", dec: v0.dec };
-            break;
-          case "bool":
-            node = { kind: "bool", value: v0.value };
-            break;
-          case "text":
-            node = { kind: "string", value: v0.text };
-            break;
-          default:
-            throw engineError(
-              "feature_not_supported",
-              "JSON_SCALAR of this type is not supported yet",
-            );
-        }
-        // A growth kernel: escaping can expand a string (cost.md §8.1).
-        return growthResult(m, e.args, jsonValue(jsonCompactOut(node)));
-      }
       if (e.func === "json_serialize") {
         // JSON_SERIALIZE(v) → the value's text serialization: a json value verbatim, a jsonb value its
         // canonical (jsonbOut) render (json-sql-functions.md §5). STRICT (NULL handled above).
@@ -2249,8 +2220,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     }
     case "jsonImage": {
       // A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
-      // row_to_json. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
-      // guarded before rendering (the array → text cast's rule, timezones.md §9.5).
+      // row_to_json / JSON_SCALAR. STRICT. A finite timestamptz at any depth charges one timezone
+      // unit, charged and guarded before rendering (the array → text cast's rule, timezones.md §9.5).
       m.charge(COSTS.operatorEval);
       const vals = e.args.map((a) => evalExpr(a, row, env, m));
       if (vals.some((v) => v.kind === "null")) return nullValue();

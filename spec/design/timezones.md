@@ -538,7 +538,8 @@ computation (§9.4), input (§9.3), and output alike. Oracle-checked in
   renders zone-free and stays admissible. (PostgreSQL marks `array_out` STABLE for every element type;
   jed's per-operation dependency rule, [index-dependencies.md](index-dependencies.md), admits the
   zone-free ones.) The composite → text and range → text casts remain `0A000`. The JSON conversions
-  (`to_json`, `to_jsonb`, `array_to_json`, `row_to_json`, the json[b] builders and aggregates) render a
+  (`to_json`, `to_jsonb`, `array_to_json`, `row_to_json`, `JSON_SCALAR`, the json[b] builders and
+  aggregates) render a
   `timestamptz` at any depth in the session zone in PostgreSQL's ISO form
   (`"2024-01-15T17:30:00+05:30"`), with the same per-instant `timezone` charge and the same
   STABLE-iff-it-holds-`timestamptz` rule ([json-sql-functions.md](json-sql-functions.md) §2.2).

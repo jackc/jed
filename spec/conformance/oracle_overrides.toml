@@ -1544,3 +1544,15 @@ reason = "jed: a float object key is the same deferred 0A000 (json-sql-functions
 file = "json/to_json_sources.test"
 sql = "SELECT jsonb_agg(x) FROM (VALUES (1.5::f64)) v(x)"
 reason = "jed: a float aggregate input is the same deferred 0A000 (json-sql-functions.md §2.2, §4). PostgreSQL aggregates the jsonb number ([1.5])."
+
+# --- JSON_SCALAR: the to_json conversion, so a float source keeps the same deferral
+# (json-sql-functions.md §2.2, §5.2).
+[[override]]
+file = "json/json_scalar_sources.test"
+sql = "SELECT JSON_SCALAR(1.5::f64)"
+reason = "jed: JSON_SCALAR is to_json's conversion, and a float source is its deferred 0A000 (json-sql-functions.md §2.2): binary floats stay out of jed's byte-identical text outputs (CLAUDE.md §8, float.md), and the float-render-layout determinism entry does not cover JSON text. PostgreSQL renders the float8out text as a JSON number (1.5)."
+
+[[override]]
+file = "json/json_scalar_sources.test"
+sql = "SELECT JSON_SCALAR(ARRAY[1.5::f64])"
+reason = "jed: a float array element is the same deferred 0A000 as a float source (json-sql-functions.md §2.2). PostgreSQL renders [1.5]."

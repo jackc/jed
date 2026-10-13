@@ -1405,7 +1405,10 @@ mod registry_tests {
     #[test]
     pub(crate) fn registry_covers_catalog() {
         for o in OPERATORS.iter().filter(|o| o.kind == "function") {
-            if matches!(o.name, "to_json" | "to_jsonb" | "array_to_json") {
+            if matches!(
+                o.name,
+                "to_json" | "to_jsonb" | "array_to_json" | "json_scalar"
+            ) {
                 // A JSON-image function (json-sql-functions.md §2.2): no kernel id — the kernel is the
                 // `RExpr::JsonImage` eval, reached from `resolve_json_image`. Its result is json/jsonb.
                 assert!(

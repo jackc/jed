@@ -2585,28 +2585,6 @@ impl RExpr {
                         ))))
                     }
                     ScalarFunc::JsonbPretty => Ok(Value::Text(jsonb_pretty_text(&vals[0], m)?)),
-                    // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string). The
-                    // datetime/uuid/bytea/interval/float sources are a deferred 0A000 follow-on.
-                    ScalarFunc::JsonScalar => {
-                        let node = match &vals[0] {
-                            Value::Int(n) => JsonNode::Number(Decimal::from_i64(*n)),
-                            Value::Decimal(d) => JsonNode::Number(d.clone()),
-                            Value::Bool(b) => JsonNode::Bool(*b),
-                            Value::Text(s) => JsonNode::String(s.clone()),
-                            _ => {
-                                return Err(EngineError::new(
-                                    SqlState::FeatureNotSupported,
-                                    "JSON_SCALAR of this type is not supported yet",
-                                ));
-                            }
-                        };
-                        let out = Value::Json(json::json_compact_out(&node));
-                        // A growth kernel: escaping can expand a string (cost.md §8.1).
-                        if !args.iter().all(rexpr_is_constant) {
-                            charge_output(m, &out)?;
-                        }
-                        Ok(out)
-                    }
                     // JSON_SERIALIZE(v) → the value's text serialization: json verbatim, jsonb canonical.
                     ScalarFunc::JsonSerialize => {
                         let out = Value::Text(match &vals[0] {
@@ -3059,7 +3037,7 @@ impl RExpr {
                 Ok(Value::Int(count as i64))
             }
             // A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
-            // row_to_json. STRICT. A finite timestamptz at any depth charges one `timezone` unit,
+            // row_to_json / JSON_SCALAR. STRICT. A finite timestamptz at any depth charges one `timezone` unit,
             // charged and guarded before rendering (the array → text cast's rule, timezones.md §9.5).
             RExpr::JsonImage { func, args, ty } => {
                 m.charge(COSTS.operator_eval);
@@ -3095,7 +3073,9 @@ impl RExpr {
                             Value::Array(a),
                             ResolvedType::Array(elem),
                         ) => array_to_json(a, elem, pretty, zone, &mut text)?,
-                        (JsonImageFunc::ToJson, v, ty) => datum_to_json(v, ty, zone, &mut text)?,
+                        (JsonImageFunc::ToJson | JsonImageFunc::JsonScalar, v, ty) => {
+                            datum_to_json(v, ty, zone, &mut text)?
+                        }
                         _ => unreachable!("resolver restricts the JSON-image argument types"),
                     }
                     // A jsonb element or field can nest a deep document (json.md §6.4).

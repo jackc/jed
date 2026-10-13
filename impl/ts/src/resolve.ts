@@ -3560,7 +3560,8 @@ export function resolveJsonObject(
 }
 
 // resolveJsonImage resolves a JSON-image function (json-sql-functions.md §2.2) → json (to_jsonb:
-// jsonb): to_json(anyelement) / to_jsonb(anyelement) take any value; array_to_json(anyarray [, pretty])
+// jsonb): to_json(anyelement) / to_jsonb(anyelement) / JSON_SCALAR(expr) take any value (JSON_SCALAR
+// reads a bare string literal as text, PG's coerce_to_specific_type); array_to_json(anyarray [, pretty])
 // an array; row_to_json(record [, pretty]) any composite (named or an anonymous ROW(…)). An untyped
 // NULL is accepted (STRICT → NULL). For row_to_json a bare string literal is PG's anonymous `record`,
 // which has no input function (0A000); any other wrong type is 42883. The optional flag is a boolean
@@ -3581,7 +3582,8 @@ export function resolveJsonImage(
       "input of anonymous composite types is not implemented",
     );
   }
-  const value = resolve(scope, args[0], null, ag, params);
+  const hint = func === "json_scalar" && isStringLiteral(args[0]) ? "text" : null;
+  const value = resolve(scope, args[0], hint, ag, params);
   const k = value.type.kind;
   const admitted =
     func === "array_to_json"

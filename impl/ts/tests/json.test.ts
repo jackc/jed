@@ -76,22 +76,6 @@ test("JSON_SERIALIZE of jsonb diverges from pg", () => {
   ]);
 });
 
-// JSON_SCALAR over a non-basic scalar (date / float / uuid / …) is a deferred 0A000 — only
-// integer/decimal/boolean/text coerce this slice. PostgreSQL renders any scalar's text as a JSON
-// string, so this is a documented divergence (the basic scalars are oracle-clean in the suite).
-// Mirrors impl/rust/tests/json.rs json_scalar_deferred_types_are_0a000 and impl/go/json_test.go.
-test("JSON_SCALAR of deferred types is 0A000", () => {
-  const db = dbWith([]);
-  assert.equal(
-    errCode(() => db.execute("SELECT JSON_SCALAR('2020-01-01'::date)")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("SELECT JSON_SCALAR(1.5::f64)")),
-    "0A000",
-  );
-});
-
 // A composite or array COLUMN in a record function's column-definition list (R1) is a deferred 0A000
 // (only scalar / json / jsonb columns coerce this slice). PostgreSQL supports them, so this is a
 // documented divergence; the scalar columns are oracle-clean in suites/json/json_record.test.

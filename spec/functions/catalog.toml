@@ -5396,10 +5396,10 @@ result         = "json"
 null           = "propagates"
 errors         = ["0A000"]
 
-# JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (S1, json-sql-functions.md §5): an
-# integer/decimal → a JSON number, a boolean → a JSON boolean, text → a JSON string. STRICT. The
-# datetime/uuid/bytea/interval/float sources (which PG renders as a JSON string of their text) are a
-# deferred 0A000 follow-on. Reachable as the JSON_SCALAR(expr) standard syntax (a plain function call).
+# JSON_SCALAR(expr) → the value's json image (S1, json-sql-functions.md §5.2): exactly to_json's
+# conversion (PG's JSCTOR_JSON_SCALAR runs datum_to_json), except a bare string literal is text.
+# STRICT. Hand-resolved like to_json; a float source is a deferred 0A000 (json-sql-functions.md §2.2).
+# Reachable as the JSON_SCALAR(expr) standard syntax (a plain function call).
 [[operator]]
 volatility     = "immutable"
 name           = "json_scalar"

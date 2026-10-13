@@ -974,7 +974,8 @@ pub(crate) fn resolve_json_object(
 }
 
 /// Resolve a JSON-image function (json-sql-functions.md §2.2) → json (`to_jsonb`: jsonb):
-/// `to_json(anyelement)` / `to_jsonb(anyelement)` take any value; `array_to_json(anyarray [, pretty])`
+/// `to_json(anyelement)` / `to_jsonb(anyelement)` / `JSON_SCALAR(expr)` take any value (JSON_SCALAR
+/// reads a bare string literal as `text`, PG's coerce_to_specific_type); `array_to_json(anyarray [, pretty])`
 /// an array; `row_to_json(record [, pretty])` any composite (named or an anonymous `ROW(…)`). An
 /// untyped NULL is accepted (STRICT → NULL). For `row_to_json` a bare string literal is PG's anonymous
 /// `record`, which has no input function (0A000); any other wrong type is 42883. The optional flag is a
@@ -992,6 +993,7 @@ pub(crate) fn resolve_json_image(
         JsonImageFunc::ToJsonb => "to_jsonb",
         JsonImageFunc::ArrayToJson => "array_to_json",
         JsonImageFunc::RowToJson => "row_to_json",
+        JsonImageFunc::JsonScalar => "json_scalar",
     };
     let takes_flag = matches!(func, JsonImageFunc::ArrayToJson | JsonImageFunc::RowToJson);
     if args.is_empty() || args.len() > if takes_flag { 2 } else { 1 } {
@@ -1003,9 +1005,14 @@ pub(crate) fn resolve_json_image(
             "input of anonymous composite types is not implemented",
         ));
     }
-    let (value, ty) = resolve(scope, &args[0], None, agg, params)?;
+    let hint = if func == JsonImageFunc::JsonScalar && is_string_literal(&args[0]) {
+        Some(ScalarType::Text)
+    } else {
+        None
+    };
+    let (value, ty) = resolve(scope, &args[0], hint, agg, params)?;
     let admitted = match func {
-        JsonImageFunc::ToJson | JsonImageFunc::ToJsonb => true,
+        JsonImageFunc::ToJson | JsonImageFunc::ToJsonb | JsonImageFunc::JsonScalar => true,
         JsonImageFunc::ArrayToJson => matches!(ty, ResolvedType::Array(_) | ResolvedType::Null),
         JsonImageFunc::RowToJson => matches!(ty, ResolvedType::Composite(_) | ResolvedType::Null),
     };

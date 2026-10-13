@@ -3261,8 +3261,6 @@ pub(crate) enum ScalarFunc {
     JsonStripNulls,
     /// jsonb_pretty → an indented multi-line render.
     JsonbPretty,
-    /// JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
-    JsonScalar,
     /// JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
     JsonSerialize,
     // --- string / text functions (spec/design/string-functions.md). All STRICT (NULL propagates,
@@ -3567,6 +3565,9 @@ pub(crate) enum JsonImageFunc {
     ArrayToJson,
     /// `row_to_json(record [, pretty])` → the composite's `json` object.
     RowToJson,
+    /// `JSON_SCALAR(expr)` → the value's `json` image, as `to_json` (PG's JSCTOR_JSON_SCALAR); a bare
+    /// string literal is `text`.
+    JsonScalar,
 }
 
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single

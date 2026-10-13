@@ -396,8 +396,6 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfJsonStripNulls
 	case "jsonb_pretty":
 		return sfJsonbPretty
-	case "json_scalar":
-		return sfJsonScalar
 	case "json_serialize":
 		return sfJsonSerialize
 	// string / text functions (string-functions.md). char_length/character_length are
@@ -2483,12 +2481,15 @@ func jsonImageClassify(name string) (jsonImageFunc, bool) {
 		return jiArrayToJson, true
 	case "row_to_json":
 		return jiRowToJson, true
+	case "json_scalar":
+		return jiJsonScalar, true
 	}
 	return 0, false
 }
 
 // resolveJSONImage resolves a JSON-image function (json-sql-functions.md §2.2) → json (to_jsonb:
-// jsonb): to_json(anyelement) / to_jsonb(anyelement) take any value; array_to_json(anyarray [, pretty])
+// jsonb): to_json(anyelement) / to_jsonb(anyelement) / JSON_SCALAR(expr) take any value (JSON_SCALAR
+// reads a bare string literal as text, PG's coerce_to_specific_type); array_to_json(anyarray [, pretty])
 // an array; row_to_json(record [, pretty]) any composite (named or an anonymous ROW(…)). An untyped
 // NULL is accepted (STRICT → NULL). For row_to_json a bare string literal is PG's anonymous `record`,
 // which has no input function (0A000); any other wrong type is 42883. The optional flag is a boolean
@@ -2506,7 +2507,12 @@ func resolveJSONImage(s *scope, fn jsonImageFunc, name string, fc *funcCallExpr,
 	if fn == jiRowToJson && isStringLiteral(*fc.Args[0]) {
 		return nil, resolvedType{}, newError(FeatureNotSupported, "input of anonymous composite types is not implemented")
 	}
-	value, ty, err := resolve(s, *fc.Args[0], nil, ag, params)
+	var hint *scalarType
+	if fn == jiJsonScalar && isStringLiteral(*fc.Args[0]) {
+		textHint := scalarText
+		hint = &textHint
+	}
+	value, ty, err := resolve(s, *fc.Args[0], hint, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -2822,8 +2828,9 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	}
 	// The JSON-image functions (json-sql-functions.md §2.2) carry their argument's static type to
 	// eval (a composite's field names key its members), so they are hand-resolved: row_to_json takes
-	// any composite (the catalog has no `record` family); to_json / to_jsonb / array_to_json keep
-	// their catalog rows as data.
+	// any composite (the catalog has no `record` family); to_json / to_jsonb / array_to_json /
+	// json_scalar keep their catalog rows as data. JSON_SCALAR(expr) is PostgreSQL's
+	// JSCTOR_JSON_SCALAR, the same conversion as to_json.
 	if fn, ok := jsonImageClassify(name); ok {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err

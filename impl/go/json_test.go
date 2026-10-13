@@ -222,22 +222,6 @@ func TestJsonSerializeJsonbDivergesFromPG(t *testing.T) {
 	}
 }
 
-// TestJsonScalarDeferredTypesAre0A000: JSON_SCALAR over a non-basic scalar (date / float / uuid / …)
-// is a deferred 0A000 — only integer/decimal/boolean/text coerce this slice. PostgreSQL renders any
-// scalar's text as a JSON string, so this is a documented divergence (the basic scalars are
-// oracle-clean in suites/json/json_ctor.test). Mirrors impl/rust/tests/json.rs
-// json_scalar_deferred_types_are_0a000.
-func TestJsonScalarDeferredTypesAre0A000(t *testing.T) {
-	t.Parallel()
-	db := memDB().Session(SessionOptions{})
-	if got := errJSON(t, db, "SELECT JSON_SCALAR('2020-01-01'::date)"); got != "0A000" {
-		t.Errorf("JSON_SCALAR(date): got %s, want 0A000", got)
-	}
-	if got := errJSON(t, db, "SELECT JSON_SCALAR(1.5::f64)"); got != "0A000" {
-		t.Errorf("JSON_SCALAR(f64): got %s, want 0A000", got)
-	}
-}
-
 // TestJsonRecordCompositeArrayColumnIs0A000: a composite or array COLUMN in a record function's
 // column-definition list is a deferred 0A000 (only scalar / json / jsonb columns coerce this slice).
 // PostgreSQL supports them, so this is a documented divergence; the scalar columns are oracle-clean

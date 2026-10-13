@@ -165,13 +165,14 @@ json overloads, §1.1) return SQL NULL when the path holds any NULL element.
 
 ### 2.2 The JSON image of a value
 
-`to_json`, `to_jsonb`, `array_to_json`, `row_to_json`, the builders, and the aggregates (§4) convert
-their arguments with one rule, a port of PostgreSQL's `datum_to_json` (json.c) and `datum_to_jsonb`
-(jsonb.c). Each core implements it once (`row_json.rs` / `row_json.go` / `row_json.ts`). The
-conversion reads the argument's static type, because a composite's field names key its members. So
-the four functions are hand-resolved, and the builders and aggregates carry their arguments' types to
-evaluation. The catalog rows of `to_json`, `to_jsonb`, and `array_to_json` remain as data; `row_to_json`
-has none, because the catalog has no `record` family.
+`to_json`, `to_jsonb`, `array_to_json`, `row_to_json`, `JSON_SCALAR` (§5.2), the builders, and the
+aggregates (§4) convert their arguments with one rule, a port of PostgreSQL's `datum_to_json`
+(json.c) and `datum_to_jsonb` (jsonb.c). Each core implements it once (`row_json.rs` /
+`row_json.go` / `row_json.ts`). The conversion reads the argument's static type, because a
+composite's field names key its members. So the five functions are hand-resolved, and the builders
+and aggregates carry their arguments' types to evaluation. The catalog rows of `to_json`, `to_jsonb`,
+`array_to_json`, and `json_scalar` remain as data; `row_to_json` has none, because the catalog has no
+`record` family.
 
 **The value's JSON image:**
 
@@ -245,10 +246,12 @@ is `0A000`. This divergence is recorded in the override ledger.
 
 **Session zone.** A `timestamptz` anywhere in an argument's type (the value itself, an array element,
 a field, a range bound, at any depth) is rendered in the session zone. Such a call to `to_json`,
-`to_jsonb`, `array_to_json`, `row_to_json`, or a builder is nonimmutable: it is `42P17` in an index
-expression or predicate. Other calls are admitted, under the per-operation dependency rule of
-[index-dependencies.md](index-dependencies.md). PostgreSQL marks these functions STABLE for every
-argument.
+`to_jsonb`, `array_to_json`, `row_to_json`, `JSON_SCALAR`, or a builder is nonimmutable: it is
+`42P17` in an index expression or predicate. Other calls are admitted, under the per-operation
+dependency rule of [index-dependencies.md](index-dependencies.md). PostgreSQL marks these functions
+STABLE for every argument. Its `JSON_SCALAR` is checked per argument type instead
+(`to_json_is_immutable`), and also rejects a `date` or `timestamp`, whose text output follows
+`DateStyle` there. jed's ISO form follows no setting, so jed admits them.
 
 **Cost.** Each function charges one `operator_eval` for the call; a builder also charges one
 `operator_eval` per argument value. Then each finite `timestamptz` rendered charges one `timezone`
@@ -376,7 +379,13 @@ over the context item ([jsonpath.md §3](jsonpath.md)), then:
   `WITHOUT` requires a singleton); `QUOTES` controls scalar-string de-quoting; `ON EMPTY` /
   `ON ERROR` default `NULL`.
 - **`JSON()`** — parse text to `jsonb`/`json`; `WITH UNIQUE KEYS` → `22030` on a duplicate
-  key (shared kernel §6.2). **`JSON_SCALAR(expr)`** — a jed scalar → its JSON scalar.
+  key (shared kernel §6.2). **`JSON_SCALAR(expr)`** — the value's `json` image, exactly `to_json`'s
+  (§2.2): PostgreSQL's executor converts a `JSCTOR_JSON_SCALAR` argument with `datum_to_json`. So a
+  `date`/`timestamp`/`timestamptz` is an ISO 8601 string (a `timestamptz` in the session zone, which
+  makes the call nonimmutable), an `interval`/`uuid`/`bytea`/range/`jsonpath` the string of its text
+  output, and PostgreSQL does not restrict it to scalars: an array is a JSON array, a composite an
+  object, a `json` value verbatim. A bare string literal is `text`. A float source is §2.2's deferred
+  `0A000`. It costs as `to_json`. PG 18 has no `RETURNING` clause here, so the result is always `json`.
   **`JSON_SERIALIZE(expr RETURNING text)`** — a JSON value → its text serialization.
 - **`IS JSON`** — tests well-formedness (and the optional `VALUE`/`SCALAR`/`ARRAY`/`OBJECT`
   kind and `WITH UNIQUE KEYS`); a non-text/json operand → false (PG); never raises.

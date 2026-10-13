@@ -212,21 +212,6 @@ fn json_serialize_jsonb_diverges_from_pg() {
     );
 }
 
-/// `JSON_SCALAR` over a non-basic scalar (date / float / uuid / …) is a deferred `0A000` — only
-/// integer/decimal/boolean/text coerce this slice. PostgreSQL renders any scalar's text as a JSON
-/// string, so this is a documented divergence (the basic scalars are oracle-clean in the suite).
-#[test]
-fn json_scalar_deferred_types_are_0a000() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        err(&mut db, "SELECT JSON_SCALAR('2020-01-01'::date)"),
-        "0A000"
-    );
-    assert_eq!(err(&mut db, "SELECT JSON_SCALAR(1.5::f64)"), "0A000");
-}
-
 /// `json[b]_populate_record` over a NON-composite base argument is `42804` (jed's datatype-mismatch
 /// convention); a composite whose field is an array/nested composite is `0A000` (the same
 /// coerce-to-field deferral as the record functions). PostgreSQL handles both, so these are

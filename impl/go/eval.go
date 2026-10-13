@@ -3103,26 +3103,6 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
-		case sfJsonScalar:
-			// JSON_SCALAR(v) → the value's JSON scalar as `json`, rendered compact (json-sql-functions.md
-			// §5): an integer/decimal → a JSON number, a boolean → a JSON boolean, text → a JSON string.
-			// The datetime/uuid/bytea/interval/float sources are a deferred 0A000 follow-on. STRICT: the
-			// NULL-input case is handled by the blanket propagation above.
-			var node JsonNode
-			switch vals[0].Kind {
-			case ValInt:
-				node = JsonNode{Kind: JNumber, Num: decimalFromInt64(vals[0].Int)}
-			case ValDecimal:
-				node = JsonNode{Kind: JNumber, Num: *vals[0].decimal()}
-			case ValBool:
-				node = JsonNode{Kind: JBool, B: vals[0].boolVal()}
-			case ValText:
-				node = JsonNode{Kind: JString, S: vals[0].str()}
-			default:
-				return Value{}, newError(FeatureNotSupported, "JSON_SCALAR of this type is not supported yet")
-			}
-			// A growth kernel: escaping can expand a string (cost.md §8.1).
-			return growthResult(m, e.sargs, JsonValue(jsonCompactOut(&node)))
 		case sfJsonSerialize:
 			// JSON_SERIALIZE(v) → the value's text serialization (json-sql-functions.md §5): a json input
 			// is its verbatim text, a jsonb input its canonical render (jsonbOut). STRICT: the NULL-input
@@ -3918,7 +3898,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		return growthResult(m, e.sargs, JsonbValue(makeObject(members)))
 	case reJsonImage:
 		// A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
-		// row_to_json. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
+		// row_to_json / JSON_SCALAR. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
 		// guarded before rendering (the array → text cast's rule, timezones.md §9.5).
 		m.Charge(costs.OperatorEval)
 		vals := make([]Value, len(e.sargs))
@@ -3960,7 +3940,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			err = compositeToJSON(*vals[0].composite(), e.jiType.comp, pretty, zone, &b)
 		case jiArrayToJson:
 			err = arrayToJSON(vals[0].arrayVal(), *e.jiType.elem, pretty, zone, &b)
-		default: // jiToJson
+		default: // jiToJson, jiJsonScalar
 			err = datumToJSON(vals[0], *e.jiType, zone, &b)
 		}
 		if err != nil {

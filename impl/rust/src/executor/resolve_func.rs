@@ -147,12 +147,14 @@ pub(crate) fn resolve_func_call(
     // The JSON-image functions (json-sql-functions.md §2.2) carry their argument's static type to
     // eval (a composite's field names key its members), so they are hand-resolved: `row_to_json`
     // takes any composite (the catalog has no `record` family); `to_json` / `to_jsonb` /
-    // `array_to_json` keep their catalog rows as data.
+    // `array_to_json` / `json_scalar` keep their catalog rows as data. `JSON_SCALAR(expr)` is
+    // PostgreSQL's JSCTOR_JSON_SCALAR, the same conversion as `to_json`.
     let image = match lname.as_str() {
         "to_json" => Some(JsonImageFunc::ToJson),
         "to_jsonb" => Some(JsonImageFunc::ToJsonb),
         "array_to_json" => Some(JsonImageFunc::ArrayToJson),
         "row_to_json" => Some(JsonImageFunc::RowToJson),
+        "json_scalar" => Some(JsonImageFunc::JsonScalar),
         _ => None,
     };
     if let Some(func) = image {
@@ -2192,6 +2194,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
                 JsonImageFunc::ToJsonb => "to_jsonb",
                 JsonImageFunc::ArrayToJson => "array_to_json",
                 JsonImageFunc::RowToJson => "row_to_json",
+                JsonImageFunc::JsonScalar => "json_scalar",
             },
             args,
         ),

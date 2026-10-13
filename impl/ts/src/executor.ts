@@ -28789,8 +28789,6 @@ export type ScalarFuncName =
   | "json_strip_nulls"
   // jsonb_pretty → an indented multi-line render.
   | "jsonb_pretty"
-  // JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
-  | "json_scalar"
   // JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
   | "json_serialize"
   // --- string / text functions (spec/design/string-functions.md). All STRICT (NULL propagates via
@@ -28962,7 +28960,13 @@ export type VariadicFuncName = "num_nulls" | "num_nonnulls";
 export type JsonBuildKind = "array" | "object";
 
 // Which JSON-image function a `jsonImage` node is (json-sql-functions.md §2.2).
-export type JsonImageFunc = "to_json" | "to_jsonb" | "array_to_json" | "row_to_json";
+export type JsonImageFunc =
+  | "to_json"
+  | "to_jsonb"
+  | "array_to_json"
+  | "row_to_json"
+  // JSON_SCALAR(expr) → the value's json image, as to_json (a bare string literal is text).
+  | "json_scalar";
 
 // JsonPathFnKind selects which scalar jsonpath query function a "jsonPathFn" RExpr node is
 // (jsonpath.md §5): "exists" — jsonb_path_exists → boolean (the sequence is non-empty);
@@ -33829,13 +33833,15 @@ export function resolveFuncCall(
   }
   // The JSON-image functions (json-sql-functions.md §2.2) carry their argument's static type to eval
   // (a composite's field names key its members), so they are hand-resolved: row_to_json takes any
-  // composite (the catalog has no `record` family); to_json / to_jsonb / array_to_json keep their
-  // catalog rows as data.
+  // composite (the catalog has no `record` family); to_json / to_jsonb / array_to_json / json_scalar
+  // keep their catalog rows as data. JSON_SCALAR(expr) is PostgreSQL's JSCTOR_JSON_SCALAR, the same
+  // conversion as to_json.
   if (
     lname === "to_json" ||
     lname === "to_jsonb" ||
     lname === "array_to_json" ||
-    lname === "row_to_json"
+    lname === "row_to_json" ||
+    lname === "json_scalar"
   ) {
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");

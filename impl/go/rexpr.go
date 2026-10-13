@@ -833,9 +833,6 @@ const (
 	sfJsonStripNulls
 	// jsonb_pretty → an indented multi-line render.
 	sfJsonbPretty
-	// json_scalar(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
-	// Other source types (date/timestamp/uuid/bytea/interval/float) are a deferred 0A000.
-	sfJsonScalar
 	// json_serialize(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
 	sfJsonSerialize
 	// --- string / text functions (spec/design/string-functions.md). All STRICT (NULL propagates via
@@ -1045,6 +1042,7 @@ const (
 	jiToJsonb                          // to_jsonb(anyelement) → the value's jsonb image
 	jiArrayToJson                      // array_to_json(anyarray [, pretty]) → the array's json image
 	jiRowToJson                        // row_to_json(record [, pretty]) → the composite's json object
+	jiJsonScalar                       // JSON_SCALAR(expr) → the value's json image, as to_json (a bare string literal is text)
 )
 
 // jsonSqlKind selects which SQL/JSON query function an reJsonSqlFn node is (json-sql-functions.md §5).

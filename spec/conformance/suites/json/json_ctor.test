@@ -1,7 +1,7 @@
 # The SQL/JSON constructor functions (S1, spec/design/json-sql-functions.md §5): JSON(text [WITH
-# UNIQUE KEYS]) → a json value (verbatim, validated); JSON_SCALAR(anyelement) → the value's JSON
-# scalar; JSON_SERIALIZE(json|jsonb) → its text serialization. All STRICT. Output matches the
-# postgres:18 oracle. Format: ../../../design/conformance.md.
+# UNIQUE KEYS]) → a json value (verbatim, validated); JSON_SCALAR(expr) → the value's json image
+# (to_json's; every source type in json_scalar_sources.test); JSON_SERIALIZE(json|jsonb) → its text
+# serialization. All STRICT. Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, func.json_ctor
 
 # JSON(text) → a json value, VERBATIM (duplicate keys kept without UNIQUE).

@@ -670,7 +670,6 @@ pub(crate) fn scalar_func_id(name: &str) -> ScalarFunc {
         "jsonb_strip_nulls" => ScalarFunc::JsonbStripNulls,
         "json_strip_nulls" => ScalarFunc::JsonStripNulls,
         "jsonb_pretty" => ScalarFunc::JsonbPretty,
-        "json_scalar" => ScalarFunc::JsonScalar,
         "json_serialize" => ScalarFunc::JsonSerialize,
         // string / text functions (string-functions.md). char_length/character_length are
         // SQL-standard aliases of length (same code-point-count kernel).

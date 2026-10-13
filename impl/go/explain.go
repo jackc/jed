@@ -1674,8 +1674,6 @@ func explainScalarFunc(f scalarFunc) string {
 		return "json_strip_nulls"
 	case sfJsonbPretty:
 		return "jsonb_pretty"
-	case sfJsonScalar:
-		return "json_scalar"
 	case sfJsonSerialize:
 		return "json_serialize"
 	case sfLength:
@@ -1781,6 +1779,8 @@ func explainJSONImageFunc(f jsonImageFunc) string {
 		return "to_jsonb"
 	case jiArrayToJson:
 		return "array_to_json"
+	case jiJsonScalar:
+		return "json_scalar"
 	default: // jiRowToJson
 		return "row_to_json"
 	}

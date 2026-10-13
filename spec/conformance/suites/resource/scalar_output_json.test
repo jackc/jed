@@ -91,6 +91,13 @@ SELECT to_json(ROW(s, id)) FROM t
 ----
 {"f1":"q\"x","f2":1}
 
+# JSON_SCALAR is to_json: 3 + 1 (ROW) + 1 + 1 timezone + 41 bytes.
+# cost: 47
+query T nosort
+SELECT JSON_SCALAR(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
+----
+{"f1":"2024-01-15T12:00:00+00:00","f2":1}
+
 # cost: 103
 query T nosort
 SELECT to_jsonb(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
