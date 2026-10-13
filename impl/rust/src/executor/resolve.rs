@@ -2140,7 +2140,9 @@ pub(crate) fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Resul
         (Composite(_), Null) | (Null, Composite(_)) => Ok(()),
         (Composite(a), Composite(b)) => {
             if a.fields.len() != b.fields.len() {
-                return Err(type_error("cannot compare rows of different sizes"));
+                // PostgreSQL's row comparison of unequal sizes is a different error (42601), with
+                // no operator hint (spec/design/error-fields.md §11.7).
+                return Err(type_error("cannot compare rows of different sizes").no_hint());
             }
             for ((_, fa), (_, fb)) in a.fields.iter().zip(b.fields.iter()) {
                 classify_comparable(fa, fb)?;

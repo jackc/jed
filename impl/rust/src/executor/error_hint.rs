@@ -2,6 +2,41 @@
 //! (`errorMissingColumn` in `parse_relation.c`) and its table-alias suggestion. Pure functions over
 //! the names in scope; the [`Scope`](super::Scope) gathers the candidates in the §11.1 walk order.
 
+// PostgreSQL 18's fixed hint sentences (spec/design/error-fields.md §11.7–§11.8), byte-for-byte.
+
+/// `42883` — no function matches a call's name and argument types (`parse_func.c`).
+pub(crate) const FUNCTION_NO_MATCH: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
+/// `42725` — several functions match and none is best (`parse_func.c`).
+pub(crate) const FUNCTION_AMBIGUOUS: &str =
+    "Could not choose a best candidate function. You might need to add explicit type casts.";
+/// `42883` — no binary operator matches its operand types (`parse_oper.c` `op_error`).
+pub(crate) const OPERATOR_NO_MATCH: &str = "No operator matches the given name and argument types. You might need to add explicit type casts.";
+/// `42883` — no prefix operator matches its operand type (`op_error`, one argument).
+pub(crate) const OPERATOR_NO_MATCH_PREFIX: &str = "No operator matches the given name and argument type. You might need to add an explicit type cast.";
+/// `42725` — several operators match and none is best (`op_error`).
+pub(crate) const OPERATOR_AMBIGUOUS: &str =
+    "Could not choose a best candidate operator. You might need to add explicit type casts.";
+/// `42883` — a sort key's type has no ordering operator (`get_sort_group_operators`).
+pub(crate) const NO_ORDERING_OPERATOR: &str =
+    "Use an explicit ordering operator or modify the query.";
+/// `42804` — a value of the wrong type for its column or default (`transformAssignedExpr`,
+/// `cookDefault`).
+pub(crate) const ASSIGNMENT_MISMATCH: &str = "You will need to rewrite or cast the expression.";
+/// `42804` — a recursive CTE column whose recursive term changes its type (`parse_cte.c`).
+pub(crate) const RECURSIVE_TERM_TYPE: &str =
+    "Cast the output of the non-recursive term to the correct type.";
+/// `42703` — the column is in a FROM item to the left of a non-LATERAL subquery (`errorMissingColumn`).
+pub(crate) const LATERAL_COLUMN: &str =
+    "To reference that column, you must mark this subquery with LATERAL.";
+/// `42P01` — the table is a FROM item to the left of a non-LATERAL subquery (`errorMissingRTE`).
+pub(crate) const LATERAL_TABLE: &str =
+    "To reference that table, you must mark this subquery with LATERAL.";
+/// `42703` — the column's relation is visible only by its qualifier (`errorMissingColumn`).
+pub(crate) const QUALIFY_COLUMN: &str =
+    "To reference that column, you must use a table-qualified name.";
+/// `42703` — several unreachable relations have the column (`errorMissingColumn`).
+pub(crate) const TRY_QUALIFIED: &str = "Try using a table-qualified name.";
+
 /// PostgreSQL's `MAX_FUZZY_DISTANCE`; the search starts one above it.
 const MAX_FUZZY_DISTANCE: usize = 3;
 

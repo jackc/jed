@@ -1129,7 +1129,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 						))
 					}
 					if src.kind != rtNull && !resolvedTypeEqual(src, resolvedTypeOfCol(col.Type, db.readSnap())) {
-						return outcome{}, typeError(fmt.Sprintf(
+						return outcome{}, assignmentError(fmt.Sprintf(
 							"column %s is of type %s but expression is of type %s",
 							col.Name, col.Type.CanonicalName(), rtName(src),
 						))
@@ -1137,7 +1137,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 					continue
 				}
 				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) {
-					return outcome{}, positionError(typeError(fmt.Sprintf(
+					return outcome{}, positionError(assignmentError(fmt.Sprintf(
 						"column %s is of type %s but expression is of type %s",
 						col.Name, col.Type.CanonicalName(), rtName(q.columnTypes[p]),
 					)), outputColumnLocation(*ins.Query, p))
@@ -1308,7 +1308,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 					// (composite-aware — spec/design/composite.md §1/§4).
 					mv, err := materializeInsertValue(iv, store.colTypes[i], bound, db.inputZone())
 					if err != nil {
-						return outcome{}, err
+						return outcome{}, assignmentHint(err)
 					}
 					rv[p] = mv
 				}
@@ -1405,7 +1405,7 @@ func (db *engine) resolveInsertRowExprs(values []insertValue, columns []catColum
 				))
 			case resolvedTypeEqual(ty, resolvedTypeOfCol(col.Type, db.readSnap())):
 			default:
-				return nil, positionError(typeError(fmt.Sprintf(
+				return nil, positionError(assignmentError(fmt.Sprintf(
 					"column %s is of type %s but expression is of type %s",
 					col.Name, col.Type.CanonicalName(), rtName(ty),
 				)), exprLocation(*v.Expr))
@@ -1418,7 +1418,7 @@ func (db *engine) resolveInsertRowExprs(values []insertValue, columns []catColum
 				return nil, err
 			}
 			if !assignableTo(ty, target) {
-				return nil, positionError(typeError(fmt.Sprintf(
+				return nil, positionError(assignmentError(fmt.Sprintf(
 					"column %s is of type %s but expression is of type %s",
 					col.Name, col.Type.CanonicalName(), rtName(ty),
 				)), exprLocation(*v.Expr))
@@ -1693,7 +1693,7 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 				} else {
 					mv, err := materializeInsertValue(iv, plan.colTypes[i], bound, db.inputZone())
 					if err != nil {
-						return outcome{}, err
+						return outcome{}, assignmentHint(err)
 					}
 					rv[p] = mv
 				}
@@ -2239,7 +2239,7 @@ func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided [
 		}
 		v, err := coerceForStore(candidate, colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
 		if err != nil {
-			return nil, stampTable(err, table.Name)
+			return nil, assignmentHint(stampTable(err, table.Name))
 		}
 		row[i] = v
 	}

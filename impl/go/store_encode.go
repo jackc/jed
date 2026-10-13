@@ -378,9 +378,9 @@ func storeComposite(v Value, typeName string, fields []colField, notNull bool, c
 	case ValComposite:
 		vals := *v.composite()
 		if len(vals) != len(fields) {
-			return Value{}, typeError(fmt.Sprintf(
+			return Value{}, newError(DatatypeMismatch, fmt.Sprintf(
 				"row has %d fields but composite type %s has %d", len(vals), typeName, len(fields),
-			))
+			)).noHint()
 		}
 		out := make([]Value, len(vals))
 		for i, f := range fields {
@@ -585,9 +585,9 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value, iz *input
 		panic("a VALUES expression slot is evaluated by the caller")
 	case iv.IsRow:
 		if len(iv.Row) != len(ty.Fields) {
-			return Value{}, typeError(fmt.Sprintf(
+			return Value{}, newError(DatatypeMismatch, fmt.Sprintf(
 				"ROW has %d fields but composite type %s has %d", len(iv.Row), ty.Name, len(ty.Fields),
-			))
+			)).noHint()
 		}
 		vals := make([]Value, len(ty.Fields))
 		for i, f := range ty.Fields {

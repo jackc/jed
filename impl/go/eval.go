@@ -957,7 +957,7 @@ func coerceCase(v Value, toDecimal bool) Value {
 // defaults; storeValue performs the value coercion after evaluation.
 func requireAssignable(t resolvedType, colTy scalarType, col string) error {
 	if !assignableTo(t, colTy) {
-		return typeError("cannot assign a value to column " + col + " of type " + colTy.CanonicalName())
+		return assignmentError("cannot assign a value to column " + col + " of type " + colTy.CanonicalName())
 	}
 	return nil
 }
@@ -1045,6 +1045,12 @@ func overflowErr(ty scalarType) error {
 }
 
 func typeError(msg string) error { return newError(DatatypeMismatch, msg) }
+
+// assignmentError is a 42804 for a value of the wrong type for its column or default, with
+// PostgreSQL's assignment hint (spec/design/error-fields.md §11.7).
+func assignmentError(msg string) error {
+	return newError(DatatypeMismatch, msg).hinted(hintAssignmentMismatch)
+}
 
 // eval evaluates against a row, accruing cost into m, and returns a Value (a boolean for
 // comparisons / connectives). Arithmetic traps 22003 on overflow and 22012 on a zero

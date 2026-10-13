@@ -139,6 +139,9 @@ type scope struct {
 	// parenthesized join's lateral prefix to learn whether the join's body correlates to the
 	// relations on its left (grammar.md §15).
 	lateralHit bool
+	// hints is what a name-resolution hint needs beyond the visible relations (error-fields.md
+	// §11.8). It never affects resolution.
+	hints scopeHints
 }
 
 // lateralFence is the fence a parenthesized join's body is planned against (spec/design/grammar.md
@@ -1288,9 +1291,10 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 }
 
 // locateNodeError decides the position of an error leaving node e's resolution
-// (spec/design/error-fields.md §10.2). A function call's 42883 points at its name; an operator's
-// 42883 / 42804 (no operator for these operand types) points at the operator. AND / OR / NOT name the
-// offending operand instead, at their raise site. A string literal's input error points at the
+// (spec/design/error-fields.md §10.2). A function call's 42883 / 42725 points at its name; an
+// operator's 42883 / 42804 (no operator for these operand types) points at the operator and carries
+// PostgreSQL's operator hint (§11.7). AND / OR / NOT name the offending operand instead, at their
+// raise site. A string literal's input error points at the
 // literal. An error an operand raised was already decided by that operand's own resolution, so the
 // enclosing node never claims it.
 func locateNodeError(err error, e exprNode) error {
@@ -1300,21 +1304,31 @@ func locateNodeError(err error, e exprNode) error {
 	}
 	operatorError := ee.State == UndefinedFunction || ee.State == DatatypeMismatch
 	var pos srcPos
+	operatorHint := ""
 	switch e.Kind {
 	case exprFuncCall:
-		if ee.State == UndefinedFunction {
+		if ee.State == UndefinedFunction || ee.State == AmbiguousFunction {
 			pos = e.Pos
 		}
 	case exprBinary:
 		if operatorError && e.Binary.Op != opAnd && e.Binary.Op != opOr {
+			operatorHint = hintOperatorNoMatch
+			if isUnknownLiteral(e.Binary.Lhs) && isUnknownLiteral(e.Binary.Rhs) {
+				operatorHint = hintOperatorAmbiguous
+			}
 			pos = e.Pos
 		}
 	case exprUnary:
 		if operatorError && e.Unary.Op == opNeg {
+			operatorHint = hintOperatorNoMatchPrefix
+			if isUnknownLiteral(e.Unary.Operand) {
+				operatorHint = hintOperatorAmbiguous
+			}
 			pos = e.Pos
 		}
 	case exprIsDistinct, exprLike, exprRegex, exprInSubquery, exprQuantified, exprQuantifiedSubquery:
 		if operatorError {
+			operatorHint = hintOperatorNoMatch
 			pos = e.Pos
 		}
 	case exprLiteral:
@@ -1324,7 +1338,19 @@ func locateNodeError(err error, e exprNode) error {
 			pos = e.Pos
 		}
 	}
+	// The operator's own type error — not one an operand decided, nor one positioned inside a
+	// subquery — is PostgreSQL's "operator does not exist" (§11.7).
+	if operatorHint != "" && !ee.located && ee.Position == 0 {
+		ee.defaultHint(operatorHint)
+	}
 	return locateError(err, pos)
+}
+
+// isUnknownLiteral reports whether e is an operand PostgreSQL types as unknown: a bare string literal
+// or NULL. An operator over only such operands that has no implementation is PostgreSQL's
+// ambiguous-operator case (spec/design/error-fields.md §11.7).
+func isUnknownLiteral(e exprNode) bool {
+	return e.Kind == exprLiteral && (e.Literal.Kind == literalText || e.Literal.Kind == literalNull)
 }
 
 // exprLocation is an expression's location for an error that names the whole expression —
@@ -1859,7 +1885,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				probe = extractSrc{kind: srcIv}
 			default:
 				return nil, resolvedType{}, newError(UndefinedFunction,
-					"function extract(text, "+rtName(srcT)+") does not exist")
+					"function extract(text, "+rtName(srcT)+") does not exist").hinted(hintFunctionNoMatch)
 			}
 			if _, err := extractField(e.Extract.Field, probe); err != nil {
 				return nil, resolvedType{}, err

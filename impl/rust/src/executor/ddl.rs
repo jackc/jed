@@ -915,15 +915,18 @@ impl Engine {
                     None => (None, None, None),
                     Some(d) => match &d.expr {
                         Expr::Literal(lit, _) if !clock_default => (
-                            Some(store_value(
-                                literal_to_value_for(lit, sty)?,
-                                sty,
-                                decimal,
-                                varchar_len,
-                                false,
-                                &def.name,
-                                &self.input_zone(),
-                            )?),
+                            Some(
+                                store_value(
+                                    literal_to_value_for(lit, sty)?,
+                                    sty,
+                                    decimal,
+                                    varchar_len,
+                                    false,
+                                    &def.name,
+                                    &self.input_zone(),
+                                )
+                                .map_err(assignment_hint)?,
+                            ),
                             None,
                             None,
                         ),
@@ -938,7 +941,7 @@ impl Engine {
                                 &mut ParamTypes::default(),
                             )?;
                             if !rty.assignable_to(sty) {
-                                return Err(type_error(format!(
+                                return Err(assignment_error(format!(
                                     "column {} is of type {} but default expression is of type {}",
                                     def.name,
                                     sty.canonical_name(),
@@ -3593,15 +3596,18 @@ impl Engine {
             && !clock_default
         {
             return Ok((
-                Some(store_value(
-                    literal_to_value_for(lit, sty)?,
-                    sty,
-                    col.decimal,
-                    col.varchar_len,
-                    false,
-                    &col.name,
-                    &self.input_zone(),
-                )?),
+                Some(
+                    store_value(
+                        literal_to_value_for(lit, sty)?,
+                        sty,
+                        col.decimal,
+                        col.varchar_len,
+                        false,
+                        &col.name,
+                        &self.input_zone(),
+                    )
+                    .map_err(assignment_hint)?,
+                ),
                 None,
             ));
         }
@@ -3615,7 +3621,7 @@ impl Engine {
             &mut ParamTypes::default(),
         )?;
         if !rt.assignable_to(sty) {
-            return Err(type_error(format!(
+            return Err(assignment_error(format!(
                 "column {} is of type {} but default expression is of type {}",
                 col.name,
                 sty.canonical_name(),

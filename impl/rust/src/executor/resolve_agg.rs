@@ -1586,7 +1586,8 @@ pub(crate) fn reject_json_distinct(t: &ResolvedType) -> Result<()> {
         return Err(EngineError::new(
             SqlState::UndefinedFunction,
             "could not identify an equality operator for type json",
-        ));
+        )
+        .no_hint());
     }
     Ok(())
 }
@@ -1691,7 +1692,8 @@ pub(crate) fn resolve_agg_order(
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 "could not identify an ordering operator for type json",
-            ));
+            )
+            .hinted(error_hint::NO_ORDERING_OPERATOR));
         }
         if distinct {
             let kexpr = agg_sort_key_expr(key);
@@ -2226,7 +2228,8 @@ pub(crate) fn expect_arg(args: &[Expr]) -> Result<&Expr> {
         _ => Err(EngineError::new(
             SqlState::UndefinedFunction,
             "no aggregate function matches the given argument count",
-        )),
+        )
+        .hinted(error_hint::FUNCTION_NO_MATCH)),
     }
 }
 
@@ -2236,6 +2239,7 @@ pub(crate) fn no_agg_overload(func: &str) -> EngineError {
         SqlState::UndefinedFunction,
         format!("no {func} aggregate for that argument type"),
     )
+    .hinted(error_hint::FUNCTION_NO_MATCH)
 }
 
 /// Whether `name` (exact, grammar.md §3) is a registered aggregate surface (COUNT/SUM/MIN/MAX/AVG).
@@ -2352,7 +2356,8 @@ pub(crate) fn resolve_window_call(
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 format!("{lname} takes no arguments"),
-            ));
+            )
+            .hinted(error_hint::FUNCTION_NO_MATCH));
         }
         (p, ResolvedType::Int(ScalarType::Int64))
     } else if let Some(p) = no_arg_ratio {
@@ -2360,7 +2365,8 @@ pub(crate) fn resolve_window_call(
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 format!("{lname} takes no arguments"),
-            ));
+            )
+            .hinted(error_hint::FUNCTION_NO_MATCH));
         }
         (p, ResolvedType::Float(ScalarType::Float64))
     } else if lname == "ntile" {
@@ -2370,11 +2376,13 @@ pub(crate) fn resolve_window_call(
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 "ntile takes exactly one argument",
-            ));
+            )
+            .hinted(error_hint::FUNCTION_NO_MATCH));
         }
         let (anode, aty) = resolve(scope, &args[0], None, &mut sub, params)?;
         if !matches!(aty, ResolvedType::Int(_) | ResolvedType::Null) {
-            return Err(type_error("argument of ntile must be integer"));
+            return Err(type_error("argument of ntile must be integer")
+                .hinted(error_hint::FUNCTION_NO_MATCH));
         }
         wargs.push(anode);
         (WindowPlan::Ntile, ResolvedType::Int(ScalarType::Int64))
@@ -2386,7 +2394,8 @@ pub(crate) fn resolve_window_call(
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 format!("{lname} takes 1 to 3 arguments"),
-            ));
+            )
+            .hinted(error_hint::FUNCTION_NO_MATCH));
         }
         let (vnode, vty) = resolve(scope, &args[0], None, &mut sub, params)?;
         let hint = match &vty {
@@ -2397,16 +2406,18 @@ pub(crate) fn resolve_window_call(
         if args.len() >= 2 {
             let (onode, oty) = resolve(scope, &args[1], None, &mut sub, params)?;
             if !matches!(oty, ResolvedType::Int(_) | ResolvedType::Null) {
-                return Err(type_error(format!("offset of {lname} must be integer")));
+                return Err(type_error(format!("offset of {lname} must be integer"))
+                    .hinted(error_hint::FUNCTION_NO_MATCH));
             }
             wargs.push(onode);
         }
         if args.len() == 3 {
             let (dnode, dty) = resolve(scope, &args[2], hint, &mut sub, params)?;
             if dty != ResolvedType::Null && dty != vty {
-                return Err(type_error(format!(
-                    "default of {lname} must match the value type"
-                )));
+                return Err(
+                    type_error(format!("default of {lname} must match the value type"))
+                        .hinted(error_hint::FUNCTION_NO_MATCH),
+                );
             }
             wargs.push(dnode);
         }
@@ -2452,7 +2463,8 @@ pub(crate) fn resolve_window_call(
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 format!("{lname} takes {want} argument(s)"),
-            ));
+            )
+            .hinted(error_hint::FUNCTION_NO_MATCH));
         }
         let (vnode, vty) = resolve(scope, &args[0], None, &mut sub, params)?;
         wargs.push(vnode);
@@ -2463,17 +2475,27 @@ pub(crate) fn resolve_window_call(
         } else {
             let (nnode, nty) = resolve(scope, &args[1], None, &mut sub, params)?;
             if !matches!(nty, ResolvedType::Int(_) | ResolvedType::Null) {
-                return Err(type_error("position of nth_value must be integer"));
+                return Err(type_error("position of nth_value must be integer")
+                    .hinted(error_hint::FUNCTION_NO_MATCH));
             }
             wargs.push(nnode);
             WindowPlan::NthValue
         };
         (plan, vty)
     } else {
-        return Err(EngineError::new(
+        // A known non-window function is PostgreSQL's 42809 (no hint); an unknown name is its
+        // function-lookup failure (error-fields.md §11.7).
+        let err = EngineError::new(
             SqlState::UndefinedFunction,
             format!("{lname} is not a window function"),
-        ));
+        );
+        let known =
+            is_scalar_func_name(&lname) || scope.catalog.session.extensions.has_function(&lname);
+        return Err(if known {
+            err.no_hint()
+        } else {
+            err.hinted(error_hint::FUNCTION_NO_MATCH)
+        });
     };
     // Resolve the window definition (PARTITION BY / ORDER BY expressions → slots, explicit frame).
     // Keys resolve in `sub` (the grouped Collect, so a bare grouping column → its grouped-row slot
@@ -2806,6 +2828,7 @@ pub(crate) fn no_func_overload(func: &str) -> EngineError {
         SqlState::UndefinedFunction,
         format!("no {func} function for those argument types"),
     )
+    .hinted(error_hint::FUNCTION_NO_MATCH)
 }
 
 /// The 42725 raised when an unknown-typed argument leaves several overloads of `func` standing
@@ -2815,4 +2838,5 @@ pub(crate) fn ambiguous_func_overload(func: &str) -> EngineError {
         SqlState::AmbiguousFunction,
         format!("function {func} is not unique for those argument types"),
     )
+    .hinted(error_hint::FUNCTION_AMBIGUOUS)
 }

@@ -770,8 +770,9 @@ Two more fields locate and explain a mistake in the query text. **`position`** (
 **character** offset of the offending token: set on lexer/parser errors (except the class-54 limits),
 on a column reference's `42703`/`42702`/`42P01`, on an unknown INSERT column or SET target, and on an
 unknown FROM table. For `execute_script` it counts from the start of the script. **`hint`** (Rust
-`hint: Option<String>`, Go `Hint`, TS `hint?`) carries PostgreSQL's misspelled-column and table-alias
-suggestions (`Perhaps you meant to reference the column "t.name".`). Both are additive metadata
+`hint: Option<String>`, Go `Hint`, TS `hint?`) carries PostgreSQL's hints: the misspelled-column and
+table-alias suggestions (`Perhaps you meant to reference the column "t.name".`), the LATERAL hints, and
+the fixed function-lookup, operator-lookup, and assignment sentences. Both are additive metadata
 ([error-fields.md](error-fields.md) §10, §11).
 
 ## 8. Cost ceiling (`max_cost`)

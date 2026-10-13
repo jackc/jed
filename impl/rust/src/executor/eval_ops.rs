@@ -877,6 +877,7 @@ pub(crate) fn require_setop_equality(t: &ResolvedType) -> Result<()> {
                 t.type_name()
             ),
         )
+        .no_hint()
     })
 }
 
@@ -1109,7 +1110,7 @@ pub(crate) fn require_assignable(ty: &ResolvedType, col_ty: ScalarType, col: &st
     if ty.assignable_to(col_ty) {
         Ok(())
     } else {
-        Err(type_error(format!(
+        Err(assignment_error(format!(
             "cannot assign a value to column {col} of type {}",
             col_ty.canonical_name()
         )))
@@ -1252,6 +1253,22 @@ pub(crate) fn overflow(ty: ScalarType) -> EngineError {
 
 pub(crate) fn type_error(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::DatatypeMismatch, msg.into())
+}
+
+/// A `42804` for a value of the wrong type for its column or default, with PostgreSQL's
+/// assignment hint (spec/design/error-fields.md §11.7).
+pub(crate) fn assignment_error(msg: impl Into<String>) -> EngineError {
+    type_error(msg).hinted(error_hint::ASSIGNMENT_MISMATCH)
+}
+
+/// Give a store-time `42804` (a value of the wrong type for its column or default) PostgreSQL's
+/// assignment hint, unless its raise site decided otherwise (spec/design/error-fields.md §11.7).
+pub(crate) fn assignment_hint(e: EngineError) -> EngineError {
+    if e.state == SqlState::DatatypeMismatch {
+        e.default_hint(error_hint::ASSIGNMENT_MISMATCH)
+    } else {
+        e
+    }
 }
 
 /// Decode a text value as a bytea value — PostgreSQL's `byteain` (types.md §13). A string that
@@ -1429,7 +1446,7 @@ pub(crate) fn resolve_container_assign(
     // Ranges/arrays compare equal only over equal element types (ResolvedType's derived Eq compares
     // the boxed element), matching the comparison rule (ranges.md §6 / array.md §5).
     if ty != col_rt {
-        return Err(type_error(format!(
+        return Err(assignment_error(format!(
             "column {} is of type {} but expression is of type {}",
             col.name,
             col.ty.canonical_name(),

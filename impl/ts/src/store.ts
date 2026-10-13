@@ -5,7 +5,8 @@
 // boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
 import type { ArrayInResult, Value } from "./value.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
-import { engineError, notNullViolation } from "./errors.ts";
+import { EngineError, engineError, notNullViolation } from "./errors.ts";
+import { ASSIGNMENT_MISMATCH } from "./error_hint.ts";
 import {
   arrayValue,
   boolNot,
@@ -363,7 +364,7 @@ export function storeComposite(
         typeName +
         " has " +
         fields.length,
-    );
+    ).noHint();
   }
   const out: Value[] = new Array(fields.length);
   for (let i = 0; i < fields.length; i++) {
@@ -470,7 +471,7 @@ export function materializeInsertValue(
             ty.name +
             " has " +
             ty.fields.length,
-        );
+        ).noHint();
       }
       const vals: Value[] = new Array(ty.fields.length);
       for (let i = 0; i < ty.fields.length; i++)
@@ -608,8 +609,34 @@ export function overflow(ty: ScalarType): Error {
   ).withDataType(canonicalName(ty));
 }
 
-export function typeError(msg: string): Error {
+export function typeError(msg: string): EngineError {
   return engineError("datatype_mismatch", msg);
+}
+
+// assignmentError is a 42804 for a value of the wrong type for its column or default, with
+// PostgreSQL's assignment hint (spec/design/error-fields.md §11.7).
+export function assignmentError(msg: string): EngineError {
+  return typeError(msg).hinted(ASSIGNMENT_MISMATCH);
+}
+
+// assignmentHint gives a store-time 42804 (a value of the wrong type for its column or default)
+// PostgreSQL's assignment hint, unless its raise site decided otherwise (spec/design/error-fields.md
+// §11.7). Any other error passes through; rethrow the result.
+export function assignmentHint(err: unknown): unknown {
+  if (err instanceof EngineError && err.state === "datatype_mismatch") {
+    err.defaultHint(ASSIGNMENT_MISMATCH);
+  }
+  return err;
+}
+
+// withAssignmentHint runs a store-time coercion f, giving a 42804 it throws the assignment hint
+// (assignmentHint).
+export function withAssignmentHint<T>(f: () => T): T {
+  try {
+    return f();
+  } catch (err) {
+    throw assignmentHint(err);
+  }
 }
 
 export const I64_MIN = -9223372036854775808n;

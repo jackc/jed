@@ -3014,7 +3014,8 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveScalarFunc(s, fc, ag, params)
 	}
-	return nil, resolvedType{}, newError(UndefinedFunction, "function does not exist: "+fc.Name)
+	return nil, resolvedType{}, newError(UndefinedFunction, "function does not exist: "+fc.Name).
+		hinted(hintFunctionNoMatch)
 }
 
 // rejectNamed errors 42883 if any argument is named — named notation is valid only for a function
@@ -3022,7 +3023,8 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 func rejectNamed(name string, argNames []*string) error {
 	for _, n := range argNames {
 		if n != nil {
-			return newError(UndefinedFunction, "function "+name+" has no parameter named \""+*n+"\"")
+			return newError(UndefinedFunction, "function "+name+" has no parameter named \""+*n+"\"").
+				hinted(hintFunctionNoMatch)
 		}
 	}
 	return nil
@@ -3118,7 +3120,8 @@ func placeNamedArgs(fname string, paramNames []string, args []*exprNode, argName
 			}
 		}
 		if idx < 0 {
-			return nil, newError(UndefinedFunction, "function "+fname+" has no parameter named \""+*nm+"\"")
+			return nil, newError(UndefinedFunction, "function "+fname+" has no parameter named \""+*nm+"\"").
+				hinted(hintFunctionNoMatch)
 		}
 		if slots[idx] != nil {
 			return nil, newError(SyntaxError, "argument name \""+*nm+"\" used more than once")

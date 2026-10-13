@@ -23,8 +23,10 @@ import (
 // when one is given (generate_series(1,5) AS g ⇒ column g), else the function name.
 func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, columnDefs []typeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
-	// inherited so an arg subquery can reference a CTE (cte.md §2).
-	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+	// inherited so an arg subquery can reference a CTE (cte.md §2). Arguments are resolved with
+	// PostgreSQL's p_lateral_active set, so a hint never suggests LATERAL from here (error-fields.md
+	// §11.8).
+	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, hints: scopeHints{lateralActive: true}}
 	lname := name
 	// Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
 	// json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
@@ -94,7 +96,7 @@ func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, colum
 		}
 		return srfTable(lname, alias, scalarT(scalarJsonb)), &srfPlan{kind: srfJsonbPathQuery, args: []*rExpr{ctx, path}}, nil
 	}
-	return nil, nil, newError(UndefinedFunction, "function does not exist: "+name)
+	return nil, nil, newError(UndefinedFunction, "function does not exist: "+name).hinted(hintFunctionNoMatch)
 }
 
 // resolveJSONSrf resolves a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one
@@ -257,7 +259,9 @@ func (db *engine) resolveJSONPopulate(name string, jsonb, set bool, args []*expr
 // root path see only params + the lateral prefix (never sibling columns of THIS relation) — an
 // empty-local-rels scope chained to `parent`, exactly like an SRF (grammar.md §44).
 func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*catTable, *srfPlan, error) {
-	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+	// Arguments are resolved with PostgreSQL's p_lateral_active set, so a hint never suggests LATERAL
+	// from here (error-fields.md §11.8).
+	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, hints: scopeHints{lateralActive: true}}
 	forbidden := &aggCtx{}
 	// The context item (json / jsonb / text, coerced to a jsonb document at eval).
 	jsonbHint := scalarJsonb

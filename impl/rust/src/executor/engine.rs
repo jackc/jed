@@ -50,6 +50,7 @@ impl Engine {
             cte_expansion_off: std::cell::Cell::new(false),
             view_expansions: std::cell::Cell::new(0),
             view_columns: std::cell::RefCell::new(HashMap::new()),
+            unseen_frames: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -88,6 +89,7 @@ impl Engine {
             cte_expansion_off: std::cell::Cell::new(false),
             view_expansions: std::cell::Cell::new(0),
             view_columns: std::cell::RefCell::new(HashMap::new()),
+            unseen_frames: std::cell::RefCell::new(Vec::new()),
         }
     }
 

@@ -383,7 +383,8 @@ pub(crate) fn resolve_func_call(
     Err(EngineError::new(
         SqlState::UndefinedFunction,
         format!("function does not exist: {name}"),
-    ))
+    )
+    .hinted(error_hint::FUNCTION_NO_MATCH))
 }
 
 /// Resolve `regexp_replace`/`regexp_match` (regex.md §8) and the Oracle-compat `regexp_like`/
@@ -509,7 +510,8 @@ pub(crate) fn reject_named(name: &str, arg_names: Option<&[Option<String>]>) -> 
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 format!("function {name} has no parameter named \"{pn}\""),
-            ));
+            )
+            .hinted(error_hint::FUNCTION_NO_MATCH));
         }
     }
     Ok(())
@@ -594,6 +596,7 @@ pub(crate) fn place_named_args(
                         SqlState::UndefinedFunction,
                         format!("function {fname} has no parameter named \"{pn}\""),
                     )
+                    .hinted(error_hint::FUNCTION_NO_MATCH)
                 })?;
                 if slots[idx].is_some() {
                     return Err(EngineError::new(
@@ -3657,28 +3660,48 @@ pub(crate) fn resolve(
 }
 
 /// Decide the position of an error leaving node `e`'s resolution (spec/design/error-fields.md
-/// §10.2). A function call's `42883` points at its name; an operator's `42883` / `42804` (no operator
-/// for these operand types) points at the operator. AND / OR / NOT name the offending operand
-/// instead, at their raise site. A string literal's input error points at the literal. An error an
-/// operand raised was already decided by that operand's own resolution, so the enclosing node never
-/// claims it.
+/// §10.2). A function call's `42883` / `42725` points at its name; an operator's `42883` / `42804`
+/// (no operator for these operand types) points at the operator and carries PostgreSQL's operator
+/// hint (§11.7). AND / OR / NOT name the offending operand instead, at their raise site. A string
+/// literal's input error points at the literal. An error an operand raised was already decided by
+/// that operand's own resolution, so the enclosing node never claims it.
 fn locate_node_error(err: EngineError, e: &Expr) -> EngineError {
     let operator_error = matches!(
         err.state,
         SqlState::UndefinedFunction | SqlState::DatatypeMismatch
     );
+    let mut operator_hint = None;
     let pos = match e {
-        Expr::FuncCall { pos, .. } if err.state == SqlState::UndefinedFunction => *pos,
-        Expr::Binary { op, pos, .. }
+        Expr::FuncCall { pos, .. }
+            if matches!(
+                err.state,
+                SqlState::UndefinedFunction | SqlState::AmbiguousFunction
+            ) =>
+        {
+            *pos
+        }
+        Expr::Binary { op, lhs, rhs, pos }
             if operator_error && !matches!(op, BinaryOp::And | BinaryOp::Or) =>
         {
+            operator_hint = Some(if is_unknown_literal(lhs) && is_unknown_literal(rhs) {
+                error_hint::OPERATOR_AMBIGUOUS
+            } else {
+                error_hint::OPERATOR_NO_MATCH
+            });
             *pos
         }
         Expr::Unary {
             op: UnaryOp::Neg,
+            operand,
             pos,
-            ..
-        } if operator_error => *pos,
+        } if operator_error => {
+            operator_hint = Some(if is_unknown_literal(operand) {
+                error_hint::OPERATOR_AMBIGUOUS
+            } else {
+                error_hint::OPERATOR_NO_MATCH_PREFIX
+            });
+            *pos
+        }
         Expr::IsDistinctFrom { pos, .. }
         | Expr::Like { pos, .. }
         | Expr::Regex { pos, .. }
@@ -3687,6 +3710,7 @@ fn locate_node_error(err: EngineError, e: &Expr) -> EngineError {
         | Expr::QuantifiedSubquery { pos, .. }
             if operator_error =>
         {
+            operator_hint = Some(error_hint::OPERATOR_NO_MATCH);
             *pos
         }
         // A string literal adapting to its context (a uuid / bytea / date / json … sibling) is
@@ -3695,7 +3719,20 @@ fn locate_node_error(err: EngineError, e: &Expr) -> EngineError {
         Expr::Literal(Literal::Text(_), pos) => *pos,
         _ => SrcPos::NONE,
     };
+    // The operator's own type error — not one an operand decided, nor one positioned inside a
+    // subquery — is PostgreSQL's "operator does not exist" (§11.7).
+    let err = match operator_hint {
+        Some(hint) if !err.located && err.position.is_none() => err.default_hint(hint),
+        _ => err,
+    };
     err.locate(pos.0)
+}
+
+/// Whether `e` is an operand PostgreSQL types as `unknown`: a bare string literal or `NULL`. An
+/// operator over only such operands that has no implementation is PostgreSQL's ambiguous-operator
+/// case (spec/design/error-fields.md §11.7).
+fn is_unknown_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(Literal::Text(_) | Literal::Null, _))
 }
 
 fn resolve_node(
@@ -4292,7 +4329,8 @@ fn resolve_node(
                                 "function extract(text, {}) does not exist",
                                 src_t.type_name()
                             ),
-                        ));
+                        )
+                        .hinted(error_hint::FUNCTION_NO_MATCH));
                     }
                 };
                 // Validate field-for-type (0A000 / 22023); the value is discarded.

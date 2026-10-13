@@ -40,6 +40,7 @@ import type {
   IndexKeyElem,
   Insert,
   InsertValue,
+  JoinClause,
   JoinKind,
   JsonOnBehavior,
   JsonPredicateKind,
@@ -251,6 +252,7 @@ import {
   stampTable,
   uniqueViolation,
 } from "./errors.ts";
+import { FUNCTION_AMBIGUOUS, FUNCTION_NO_MATCH, NO_ORDERING_OPERATOR } from "./error_hint.ts";
 import {
   DETAIL_DUPLICATED,
   DETAIL_EXISTS,
@@ -443,6 +445,8 @@ import {
 import type { AssignPlan } from "./window.ts";
 import { evalExpr, evalFilter, floatToIntHalfAway, subqueryRowValue, toDecimal } from "./eval.ts";
 import {
+  assignmentError,
+  assignmentHint,
   coerceForStore,
   dateClockValue,
   literalToValue,
@@ -450,6 +454,7 @@ import {
   overflow,
   storeValue,
   typeError,
+  withAssignmentHint,
 } from "./store.ts";
 import { dateClockIsRelative, dateClockSpecial } from "./date.ts";
 import {
@@ -567,6 +572,7 @@ import {
   resolvedTypeOfCol,
   rtCollatable,
   rtName,
+  scopeDepth,
   serialPseudoType,
   setOpNodeName,
   setSyntheticCollation,
@@ -577,7 +583,7 @@ import {
   withHasDml,
   withNote,
 } from "./scope.ts";
-import type { ExplainRow, PrivReq } from "./scope.ts";
+import type { ExplainRow, PrivReq, UnseenFrame, UnseenRel } from "./scope.ts";
 import type { ActiveTx, TxStatus } from "./snapshot.ts";
 import { Snapshot, txStatusOf } from "./snapshot.ts";
 import type { AttachmentCore, LaneAt, ReadPin } from "./session.ts";
@@ -1705,6 +1711,9 @@ export class Engine {
   // (planner.md §3.2), so a chain of d views is planned in O(d). Cleared when the outermost
   // expansion ends.
   private viewColumns = new Map<string, ValuesPlan>();
+  // The FROM relations hidden from the derived bodies being planned right now, innermost last
+  // (spec/design/error-fields.md §11.8). Read only to build a hint.
+  unseenFrames: UnseenFrame[] = [];
   // Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
   // reached its fixed point (§6.6). Empty between statements.
   private fkDeferredChecks: {
@@ -6077,14 +6086,9 @@ export class Engine {
           def.default.expr.literal.kind === "text" &&
           dateClockIsRelative(def.default.expr.literal.text);
         if (def.default.expr.kind === "literal" && !clockDefault) {
-          def_default = storeValue(
-            literalToValue(def.default.expr.literal),
-            sty,
-            decimal,
-            varcharLen,
-            false,
-            def.name,
-            this.inputZone(),
+          const lit = literalToValue(def.default.expr.literal);
+          def_default = withAssignmentHint(() =>
+            storeValue(lit, sty, decimal, varcharLen, false, def.name, this.inputZone()),
           );
         } else {
           rejectDefaultStructure(def.default.expr);
@@ -6096,7 +6100,7 @@ export class Engine {
             new ParamTypes(),
           );
           if (!assignableTo(rt, sty)) {
-            throw typeError(
+            throw assignmentError(
               `column ${def.name} is of type ${canonicalName(sty)} but default expression is of type ${rtName(rt)}`,
             );
           }
@@ -6923,7 +6927,7 @@ export class Engine {
           this.inputZone(),
         );
       } catch (e) {
-        throw stampTable(e, table.name);
+        throw assignmentHint(stampTable(e, table.name));
       }
     }
     if (nullCol >= 0) throw this.notNullRowViolation(table.name, table.columns[nullCol]!.name, row);
@@ -8452,16 +8456,11 @@ export class Engine {
       def.expr.literal.kind === "text" &&
       dateClockIsRelative(def.expr.literal.text);
     if (def.expr.kind === "literal" && !clockDefault) {
+      const lit = literalToValue(def.expr.literal);
       return {
         ...col,
-        default: storeValue(
-          literalToValue(def.expr.literal),
-          sty,
-          col.decimal,
-          col.varcharLen,
-          false,
-          col.name,
-          this.inputZone(),
+        default: withAssignmentHint(() =>
+          storeValue(lit, sty, col.decimal, col.varcharLen, false, col.name, this.inputZone()),
         ),
         defaultExpr: null,
       };
@@ -8475,7 +8474,7 @@ export class Engine {
       new ParamTypes(),
     );
     if (!assignableTo(rt, sty))
-      throw typeError(
+      throw assignmentError(
         `column ${col.name} is of type ${canonicalName(sty)} but default expression is of type ${rtName(rt)}`,
       );
     return { ...col, default: null, defaultExpr: { exprText: def.text, expr: def.expr } };
@@ -10126,7 +10125,7 @@ export class Engine {
         const { node, type } = resolve(scope, value.expr, col.type.scalar, forbidden, ptypes);
         if (!assignableTo(type, col.type.scalar)) {
           throw positionedAt(
-            typeError(
+            assignmentError(
               `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
             ),
             exprLocation(value.expr),
@@ -10145,7 +10144,7 @@ export class Engine {
         }
         if (type.kind !== "null" && !resolvedTypeEqual(type, resolvedTypeOfCol(col.type, this))) {
           throw positionedAt(
-            typeError(
+            assignmentError(
               `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
             ),
             exprLocation(value.expr),
@@ -10400,7 +10399,7 @@ export class Engine {
             ? dateValue(0n)
             : dateClockValue(this, rng, this.session.seam, meter, sp.offsetDays);
         } else {
-          rv[p] = materializeInsertValue(iv, ct, bound, this.inputZone());
+          rv[p] = withAssignmentHint(() => materializeInsertValue(iv, ct, bound, this.inputZone()));
         }
       }
       if (useSingle) singleValues = rv;
@@ -10639,7 +10638,7 @@ export class Engine {
             );
           }
           if (src.kind !== "null" && !resolvedTypeEqual(src, resolvedTypeOfCol(col.type, this))) {
-            throw typeError(
+            throw assignmentError(
               `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(src)}`,
             );
           }
@@ -10647,7 +10646,7 @@ export class Engine {
         }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
           throw positionedAt(
-            typeError(
+            assignmentError(
               `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
             ),
             outputColumnLocation(ins.source.query, p),
@@ -10787,7 +10786,9 @@ export class Engine {
               ? dateValue(0n)
               : dateClockValue(this, stmtRng, this.session.seam, meter, sp.offsetDays);
           } else {
-            rv[p] = materializeInsertValue(iv, ct, bound, this.inputZone());
+            rv[p] = withAssignmentHint(() =>
+              materializeInsertValue(iv, ct, bound, this.inputZone()),
+            );
           }
         }
       }
@@ -15355,12 +15356,23 @@ export class Engine {
                   (hit) => {
                     joinLateral = hit;
                   },
+                  // The relations to the join's left, for a hint (error-fields.md §11.8).
+                  (unseenParent) =>
+                    unseenFrame(tableRefs, sel.joins, rels, subRels, i, unseenParent),
                 )
-              : tref.subquery !== undefined
-                ? this.planBodyFirst(shapeBodies, () =>
-                    this.planQuery(tref.subquery!, bodyParent, ctes, ptypes),
-                  )
-                : this.planValues(tref.values!, bodyParent, ctes, ptypes);
+              : // A non-LATERAL item to the right of others cannot see them; a hint can
+                // (error-fields.md §11.8).
+                this.withUnseenFrame(
+                  i > 0 && tref.lateral !== true
+                    ? unseenFrame(tableRefs, sel.joins, rels, subRels, i, bodyParent)
+                    : null,
+                  () =>
+                    tref.subquery !== undefined
+                      ? this.planBodyFirst(shapeBodies, () =>
+                          this.planQuery(tref.subquery!, bodyParent, ctes, ptypes),
+                        )
+                      : this.planValues(tref.values!, bodyParent, ctes, ptypes),
+                );
         if (
           shapeBodies &&
           lateralEligible &&
@@ -15712,6 +15724,13 @@ export class Engine {
       } else if (j.on !== null) {
         const partial = mkScope(seg, k + 1);
         partial.subRels = subRelsWithin(subRels, seg, k + 1);
+        // An ON clause cannot see the comma items to its left; a hint searches them
+        // (error-fields.md §11.8).
+        partial.hints = {
+          unseen: onClauseUnseen(tableRefs, rels, subRels, seg),
+          onClause: true,
+          lateralActive: false,
+        };
         joinPreds.push(resolveBooleanFilter(partial, j.on, ptypes));
         segStar.push(...rightStar);
       } else {
@@ -15757,7 +15776,7 @@ export class Engine {
             throw engineError(
               "undefined_function",
               "could not identify an equality operator for type json",
-            );
+            ).noHint();
           }
           const idx = gr.index;
           if (!groupKeys.includes(idx)) {
@@ -15773,7 +15792,7 @@ export class Engine {
           throw engineError(
             "undefined_function",
             "could not identify an equality operator for type json",
-          );
+          ).noHint();
         }
         // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
         const pos = groupKeyExprs.findIndex((gk) => gk !== null && exprEqual(gk.canon, gr.canon));
@@ -15899,7 +15918,7 @@ export class Engine {
       throw engineError(
         "undefined_function",
         "could not identify an equality operator for type json",
-      );
+      ).noHint();
     }
     // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
     // (spec/design/collation.md §1 "A sort or grouping target").
@@ -16024,7 +16043,7 @@ export class Engine {
             throw engineError(
               "undefined_function",
               "could not identify an ordering operator for type json",
-            );
+            ).hinted(NO_ORDERING_OPERATOR);
           }
           let oCollation: Collation | null = null;
           if (key.collation !== null) {
@@ -16058,7 +16077,7 @@ export class Engine {
           throw engineError(
             "undefined_function",
             "could not identify an ordering operator for type json",
-          );
+          ).hinted(NO_ORDERING_OPERATOR);
         }
         const idx = r.index;
         // The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
@@ -16118,7 +16137,7 @@ export class Engine {
         throw engineError(
           "undefined_function",
           "could not identify an ordering operator for type json",
-        );
+        ).hinted(NO_ORDERING_OPERATOR);
       }
       // The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
       // parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
@@ -16370,6 +16389,18 @@ export class Engine {
     }
   }
 
+  // withUnseenFrame runs f with frame (when given) recording the relations hidden from the body f
+  // plans, for a hint (spec/design/error-fields.md §11.8).
+  private withUnseenFrame<T>(frame: UnseenFrame | null, f: () => T): T {
+    if (frame === null) return f();
+    this.unseenFrames.push(frame);
+    try {
+      return f();
+    } finally {
+      this.unseenFrames.pop();
+    }
+  }
+
   // withoutCteExpansion runs f with CTE reference expansion off (planner.md §3.4): the definition of
   // a CTE that its reference may plan again.
   private withoutCteExpansion<T>(f: () => T): T {
@@ -16403,17 +16434,25 @@ export class Engine {
     ptypes: ParamTypes,
     shapeBodies: boolean,
     setHit: (hit: boolean) => void,
+    unseen: (bodyParent: Scope | null) => UnseenFrame,
   ): QueryPlan {
     const prefix = new Scope([...rels], this, lateralParent, true, ctes);
     prefix.subRels = [...subRels];
     const fence = Scope.lateralFence(parent, prefix, this, ctes);
-    this.planBodyFirst(true, () => this.planQuery(body, fence, ctes, ptypes));
+    this.withUnseenFrame(unseen(fence), () =>
+      this.planBodyFirst(true, () => this.planQuery(body, fence, ctes, ptypes)),
+    );
     const hit = prefix.lateralHit;
     setHit(hit);
-    return this.planAgain(ctes, () =>
-      hit
-        ? this.planQuery(body, fence, ctes, ptypes)
-        : this.planBodyFirst(shapeBodies, () => this.planQuery(body, parent, ctes, ptypes)),
+    if (hit) {
+      return this.withUnseenFrame(unseen(fence), () =>
+        this.planAgain(ctes, () => this.planQuery(body, fence, ctes, ptypes)),
+      );
+    }
+    return this.withUnseenFrame(unseen(parent), () =>
+      this.planAgain(ctes, () =>
+        this.planBodyFirst(shapeBodies, () => this.planQuery(body, parent, ctes, ptypes)),
+      ),
     );
   }
 
@@ -16513,6 +16552,9 @@ export class Engine {
     // The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
     // inherited so an arg subquery can reference a CTE (cte.md §2).
     const argScope = new Scope([], this, parent, true, ctes);
+    // Arguments are resolved with PostgreSQL's p_lateral_active set, so a hint never suggests LATERAL
+    // from here (error-fields.md §11.8).
+    argScope.hints = { unseen: [], onClause: false, lateralActive: true };
     const lname = name;
     // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
     // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
@@ -16678,7 +16720,9 @@ export class Engine {
           ptypes,
         );
     }
-    throw engineError("undefined_function", "function does not exist: " + name);
+    throw engineError("undefined_function", "function does not exist: " + name).hinted(
+      FUNCTION_NO_MATCH,
+    );
   }
 
   // resolveJsonSrf resolves a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one
@@ -16881,6 +16925,9 @@ export class Engine {
     // The ctx / root path see only params + the lateral prefix (never sibling columns of THIS
     // relation) — an empty-local-rels scope chained to `parent`, exactly like an SRF (§44).
     const argScope = new Scope([], this, parent, true, ctes);
+    // Arguments are resolved with PostgreSQL's p_lateral_active set, so a hint never suggests LATERAL
+    // from here (error-fields.md §11.8).
+    argScope.hints = { unseen: [], onClause: false, lateralActive: true };
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     // The context item (json / jsonb / text, coerced to a jsonb document at eval).
     const rctx = resolve(argScope, jt.ctx, "jsonb", forbidden, ptypes);
@@ -17743,6 +17790,7 @@ export class Engine {
     e.cteExpansionOff = false;
     e.viewExpansions = 0;
     e.viewColumns = new Map();
+    e.unseenFrames = [];
     // Not profiling EXPLAIN ANALYZE: the lane gates test `explainActualProfile === null`, so leaving it
     // undefined would silently disable the vectorized/columnar lanes on every cursor — a lane choice
     // that must match the other cores (memory.md §5.4).
@@ -26887,6 +26935,111 @@ function parenJoinReachesLeft(tref: TableRef): boolean {
   );
 }
 
+// isParenJoin reports whether FROM item tref is a parenthesized join (spec/design/grammar.md §15).
+function isParenJoin(tref: TableRef): boolean {
+  const sel = tref.subquery;
+  return sel !== undefined && sel.kind === "select" && sel.parenJoin === true;
+}
+
+// relCatalogName is the base table or view a FROM relation names (spec/design/error-fields.md
+// §11.2), else undefined.
+function relCatalogName(r: ScopeRel): string | undefined {
+  if (r.view !== undefined) return r.view;
+  return r.base === true ? r.table.name : undefined;
+}
+
+// unseenFrame is the relations to the left of FROM item i (i ≥ 1), which a non-LATERAL derived table
+// or parenthesized join there cannot see, as PostgreSQL's hint search sees them
+// (spec/design/error-fields.md §11.8). A relation before i's join segment (a comma item) would be
+// visible to a LATERAL item; one in the segment would be unless the join to i is RIGHT or FULL, and
+// then, past the segment's first join, it is reachable only by its qualifier. An aliased
+// parenthesized join hides its inner relations and is itself a join, so it adds none; an unaliased
+// one adds its inner relations. rels and subRels are the FROM relations built so far.
+function unseenFrame(
+  fromItems: TableRef[],
+  joins: JoinClause[],
+  rels: ScopeRel[],
+  subRels: SubRel[],
+  i: number,
+  bodyParent: Scope | null,
+): UnseenFrame {
+  let seg = i;
+  if (joins[i - 1]!.comma !== true) {
+    seg = i - 1;
+    while (seg > 0 && joins[seg - 1]!.comma !== true) seg--;
+  }
+  const joinKind = joins[i - 1]!.kind;
+  const segLateralOk = joinKind !== "right" && joinKind !== "full";
+  const out: UnseenRel[] = [];
+  for (let k = 0; k < i; k++) {
+    const tref = fromItems[k]!;
+    const lateralOk = k < seg || segLateralOk;
+    if (isParenJoin(tref)) {
+      if (tref.alias !== null) continue;
+      for (const sr of subRels) {
+        if (sr.rel !== k) continue;
+        out.push({
+          label: sr.label,
+          columns: sr.table.columns.map((c) => c.name),
+          catalog: undefined,
+          lateralOk,
+          qualifiedOnly: !lateralOk,
+        });
+      }
+      continue;
+    }
+    const r = rels[k]!;
+    if (r.label === "") continue;
+    out.push({
+      label: r.label,
+      columns: r.table.columns.map((c) => c.name),
+      catalog: relCatalogName(r),
+      lateralOk,
+      qualifiedOnly: !lateralOk && i - seg >= 2,
+    });
+  }
+  return { depth: scopeDepth(bodyParent), parenJoin: isParenJoin(fromItems[i]!), rels: out };
+}
+
+// onClauseUnseen is the comma items to the left of an ON clause's join segment starting at FROM
+// item seg, which the clause cannot see (spec/design/error-fields.md §11.8). LATERAL cannot reach
+// them.
+function onClauseUnseen(
+  fromItems: TableRef[],
+  rels: ScopeRel[],
+  subRels: SubRel[],
+  seg: number,
+): UnseenRel[] {
+  const out: UnseenRel[] = [];
+  for (let k = 0; k < seg; k++) {
+    const tref = fromItems[k]!;
+    if (isParenJoin(tref)) {
+      if (tref.alias !== null) continue;
+      for (const sr of subRels) {
+        if (sr.rel !== k) continue;
+        out.push({
+          label: sr.label,
+          columns: sr.table.columns.map((c) => c.name),
+          catalog: undefined,
+          lateralOk: false,
+          qualifiedOnly: false,
+        });
+      }
+      continue;
+    }
+    const r = rels[k]!;
+    if (r.label === "") continue;
+    out.push({
+      label: r.label,
+      columns: r.table.columns.map((c) => c.name),
+      catalog: relCatalogName(r),
+      lateralOk: false,
+      qualifiedOnly: false,
+    });
+  }
+  return out;
+}
+
 // joinGroupOutputs completes a joinGroup body: after its `*` columns it appends every slot the star
 // omitted (a USING/NATURAL copy superseded by a merge), so each inner relation's columns are all
 // present, and records where each inner label's columns landed. Every star output is a bare column.
@@ -32146,7 +32299,7 @@ export function resolveAggregate(
       throw engineError(
         "undefined_function",
         "no aggregate function matches the given argument count",
-      );
+      ).hinted(FUNCTION_NO_MATCH);
     }
     // An aggregate's argument may not contain a window function (PG 42803 — window.md §7): the window
     // stage runs AFTER aggregation, so a window result cannot be folded into an aggregate.
@@ -32198,7 +32351,10 @@ export function resolveAggregate(
 // the same rule SELECT DISTINCT applies to a json output column.
 function rejectJsonDistinct(t: ResolvedType): void {
   if (t.kind === "json") {
-    throw engineError("undefined_function", "could not identify an equality operator for type json");
+    throw engineError(
+      "undefined_function",
+      "could not identify an equality operator for type json",
+    ).noHint();
   }
 }
 
@@ -32281,7 +32437,7 @@ function resolveAggOrder(
       throw engineError(
         "undefined_function",
         "could not identify an ordering operator for type json",
-      );
+      ).hinted(NO_ORDERING_OPERATOR);
     }
     if (distinct) {
       const kexpr = aggSortKeyExpr(key);
@@ -32680,18 +32836,26 @@ export function collectColumn(
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
 export function noAggOverload(fn: string): EngineError {
-  return engineError("undefined_function", "no " + fn + " aggregate for that argument type");
+  return engineError("undefined_function", "no " + fn + " aggregate for that argument type").hinted(
+    FUNCTION_NO_MATCH,
+  );
 }
 
 // noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
 export function noFuncOverload(fn: string): EngineError {
-  return engineError("undefined_function", "no " + fn + " function for those argument types");
+  return engineError(
+    "undefined_function",
+    "no " + fn + " function for those argument types",
+  ).hinted(FUNCTION_NO_MATCH);
 }
 
 // ambiguousFuncOverload is the 42725 raised when an unknown-typed argument leaves several overloads
 // of fn standing (functions.md §9.1) — the caller writes a cast to choose one.
 export function ambiguousFuncOverload(fn: string): EngineError {
-  return engineError("ambiguous_function", "function " + fn + " is not unique for those argument types");
+  return engineError(
+    "ambiguous_function",
+    "function " + fn + " is not unique for those argument types",
+  ).hinted(FUNCTION_AMBIGUOUS);
 }
 
 // isWindowOnlyName reports whether name is a registered WINDOW-only function surface
@@ -32755,13 +32919,17 @@ export function resolveWindowCall(
     : { collecting: false, groupKeys: [], specs: [] };
   if (lname in noArgI64) {
     if (e.star || e.args.length !== 0) {
-      throw engineError("undefined_function", `${lname} takes no arguments`);
+      throw engineError("undefined_function", `${lname} takes no arguments`).hinted(
+        FUNCTION_NO_MATCH,
+      );
     }
     plan = noArgI64[lname]!;
     result = { kind: "int", ty: "i64" };
   } else if (lname in noArgRatio) {
     if (e.star || e.args.length !== 0) {
-      throw engineError("undefined_function", `${lname} takes no arguments`);
+      throw engineError("undefined_function", `${lname} takes no arguments`).hinted(
+        FUNCTION_NO_MATCH,
+      );
     }
     plan = noArgRatio[lname]!;
     result = { kind: "float", ty: "f64" };
@@ -32770,11 +32938,13 @@ export function resolveWindowCall(
     // sub-context (no aggregate/window nesting in a window argument). The argument must be int or
     // null (42804).
     if (e.star || e.args.length !== 1) {
-      throw engineError("undefined_function", "ntile takes exactly one argument");
+      throw engineError("undefined_function", "ntile takes exactly one argument").hinted(
+        FUNCTION_NO_MATCH,
+      );
     }
     const r = resolve(scope, e.args[0]!, null, sub, params);
     if (r.type.kind !== "int" && r.type.kind !== "null") {
-      throw typeError("argument of ntile must be integer");
+      throw typeError("argument of ntile must be integer").hinted(FUNCTION_NO_MATCH);
     }
     wargs.push(r.node);
     plan = "ntile";
@@ -32784,7 +32954,9 @@ export function resolveWindowCall(
     // result; offset is an integer (default 1); default (returned when the offset leaves the
     // partition) must match the value type. Args resolved in a fresh Forbidden sub-context.
     if (e.star || e.args.length === 0 || e.args.length > 3) {
-      throw engineError("undefined_function", `${lname} takes 1 to 3 arguments`);
+      throw engineError("undefined_function", `${lname} takes 1 to 3 arguments`).hinted(
+        FUNCTION_NO_MATCH,
+      );
     }
     const vr = resolve(scope, e.args[0]!, null, sub, params);
     const vty = vr.type;
@@ -32795,14 +32967,14 @@ export function resolveWindowCall(
     if (e.args.length >= 2) {
       const or = resolve(scope, e.args[1]!, null, sub, params);
       if (or.type.kind !== "int" && or.type.kind !== "null") {
-        throw typeError(`offset of ${lname} must be integer`);
+        throw typeError(`offset of ${lname} must be integer`).hinted(FUNCTION_NO_MATCH);
       }
       wargs.push(or.node);
     }
     if (e.args.length === 3) {
       const dr = resolve(scope, e.args[2]!, hint, sub, params);
       if (dr.type.kind !== "null" && !resolvedTypeEqual(dr.type, vty)) {
-        throw typeError(`default of ${lname} must match the value type`);
+        throw typeError(`default of ${lname} must match the value type`).hinted(FUNCTION_NO_MATCH);
       }
       wargs.push(dr.node);
     }
@@ -32829,7 +33001,7 @@ export function resolveWindowCall(
         throw engineError(
           "undefined_function",
           "no aggregate function matches the given argument count",
-        );
+        ).hinted(FUNCTION_NO_MATCH);
       }
       const r = resolve(scope, e.args[0]!, null, sub, params);
       const desc = lookupAggregateOverload(lname, r.type);
@@ -32889,7 +33061,9 @@ export function resolveWindowCall(
     }
     const want = lname === "nth_value" ? 2 : 1;
     if (e.args.length !== want) {
-      throw engineError("undefined_function", `${lname} takes ${want} argument(s)`);
+      throw engineError("undefined_function", `${lname} takes ${want} argument(s)`).hinted(
+        FUNCTION_NO_MATCH,
+      );
     }
     const vr = resolve(scope, e.args[0]!, null, sub, params);
     wargs.push(vr.node);
@@ -32900,14 +33074,19 @@ export function resolveWindowCall(
     } else {
       const nr = resolve(scope, e.args[1]!, null, sub, params);
       if (nr.type.kind !== "int" && nr.type.kind !== "null") {
-        throw typeError("position of nth_value must be integer");
+        throw typeError("position of nth_value must be integer").hinted(FUNCTION_NO_MATCH);
       }
       wargs.push(nr.node);
       plan = "nthValue";
     }
     result = vr.type;
   } else {
-    throw engineError("undefined_function", `${lname} is not a window function`);
+    // A known non-window function is PostgreSQL's 42809 (no hint); an unknown name is its
+    // function-lookup failure (error-fields.md §11.7).
+    const err = engineError("undefined_function", `${lname} is not a window function`);
+    const known =
+      isScalarFuncName(lname) || (scope.catalog.session.extensions?.hasFunction(lname) ?? false);
+    throw known ? err.noHint() : err.hinted(FUNCTION_NO_MATCH);
   }
   // Resolve the window definition (PARTITION BY / ORDER BY expressions → slots, explicit frame).
   // Keys resolve in `sub` (the grouped collecting ctx sharing ag.specs, or plain Forbidden); a
@@ -33656,7 +33835,9 @@ export function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);
   }
-  throw engineError("undefined_function", "function does not exist: " + e.name);
+  throw engineError("undefined_function", "function does not exist: " + e.name).hinted(
+    FUNCTION_NO_MATCH,
+  );
 }
 
 // resolveRegexFunc resolves regexp_replace/regexp_match (regex.md §8) → a regexFunc node whose result
@@ -33790,7 +33971,7 @@ export function rejectNamed(name: string, argNames: (string | null)[]): void {
       throw engineError(
         "undefined_function",
         "function " + name + ' has no parameter named "' + n + '"',
-      );
+      ).hinted(FUNCTION_NO_MATCH);
     }
   }
 }
@@ -33860,7 +34041,7 @@ export function placeNamedArgs(
       throw engineError(
         "undefined_function",
         "function " + fname + ' has no parameter named "' + nm + '"',
-      );
+      ).hinted(FUNCTION_NO_MATCH);
     }
     if (slots[idx] !== null) {
       throw engineError("syntax_error", 'argument name "' + nm + '" used more than once');

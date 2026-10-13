@@ -41,7 +41,15 @@ import {
   seqDataTypeRange,
 } from "./catalog.ts";
 import { EngineError, engineError } from "./errors.ts";
-import { FuzzyColumnMatch, aliasHint } from "./error_hint.ts";
+import {
+  FuzzyColumnMatch,
+  LATERAL_COLUMN,
+  LATERAL_TABLE,
+  QUALIFY_COLUMN,
+  RECURSIVE_TERM_TYPE,
+  TRY_QUALIFIED,
+  aliasHint,
+} from "./error_hint.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import {
   arrayT,
@@ -113,6 +121,65 @@ export function subRelsWithin(subs: SubRel[], lo: number, hi: number): SubRel[] 
   return subs.filter((sr) => sr.rel >= lo && sr.rel <= hi);
 }
 
+// UnseenRel is a relation of a query level's FROM clause that a reference there cannot see.
+// PostgreSQL's range table holds such relations, and its 42703 / 42P01 hints search them
+// (spec/design/error-fields.md §11.8).
+export type UnseenRel = {
+  label: string;
+  columns: string[];
+  // The base table or view the relation names (the §11.2 search), else undefined.
+  catalog: string | undefined;
+  // Marking the reference's subquery LATERAL would make the relation visible.
+  lateralOk: boolean;
+  // The relation is an inner relation of a completed unaliased join, so its columns are reachable
+  // only through its qualifier.
+  qualifiedOnly: boolean;
+};
+
+// UnseenFrame is the relations to the left of a non-LATERAL derived table or parenthesized join,
+// recorded while its body is planned (spec/design/error-fields.md §11.8). depth is the scope-chain
+// depth of the scope the body is planned against, so the hint walk visits the relations right after
+// the body's own outermost level. parenJoin marks a parenthesized join's body: its ON clauses cannot
+// reach these relations even with LATERAL.
+export type UnseenFrame = {
+  depth: number;
+  parenJoin: boolean;
+  rels: UnseenRel[];
+};
+
+// ScopeHints is a scope's hint-only facts (spec/design/error-fields.md §11.8). They never affect
+// resolution.
+export type ScopeHints = {
+  // This level's FROM relations the scope cannot see, before its own: a JOIN's ON clause cannot see
+  // the comma items to its left.
+  unseen: UnseenRel[];
+  // The scope resolves a JOIN's ON clause.
+  onClause: boolean;
+  // The scope resolves a table function's arguments (PostgreSQL's p_lateral_active): a hint never
+  // suggests LATERAL from here.
+  lateralActive: boolean;
+};
+
+// NO_SCOPE_HINTS is the hint facts of an ordinary scope. Shared, never mutated.
+const NO_SCOPE_HINTS: ScopeHints = { unseen: [], onClause: false, lateralActive: false };
+
+// HintEntry is one relation the hint walk visits (spec/design/error-fields.md §11.8), in walk order.
+type HintEntry = {
+  label: string;
+  columns: string[];
+  catalog: string | undefined;
+  visible: boolean;
+  lateralOk: boolean;
+  qualifiedOnly: boolean;
+};
+
+// scopeDepth is the number of levels in a scope chain (0 for none).
+export function scopeDepth(scope: Scope | null): number {
+  let depth = 0;
+  for (let s = scope; s !== null; s = s.parent) depth++;
+  return depth;
+}
+
 export class Scope {
   rels: ScopeRel[];
   // parent is the enclosing query's scope, for correlated resolution (null at top level).
@@ -166,6 +233,8 @@ export class Scope {
   // join's lateral prefix to learn whether the join's body correlates to the relations on its left
   // (grammar.md §15).
   lateralHit = false;
+  // What a name-resolution hint needs beyond the visible relations (error-fields.md §11.8).
+  hints: ScopeHints = NO_SCOPE_HINTS;
   constructor(
     rels: ScopeRel[],
     catalog: Engine,
@@ -570,8 +639,9 @@ export class Scope {
   }
 
   // locateColumnError stamps a column reference's 42703 / 42702 / 42P01 / 42P09 with its position, and adds
-  // the misspelled-column (§11.1) or table-alias (§11.2) hint. An error already positioned came from
-  // an inner site, which wins. Returns the (possibly annotated) error for the caller to rethrow.
+  // the misspelled-column (§11.1), table-alias (§11.2), or LATERAL (§11.8) hint. An error already
+  // positioned came from an inner site, which wins. Returns the (possibly annotated) error for the
+  // caller to rethrow.
   private locateColumnError(
     e: unknown,
     qualifier: string | null,
@@ -582,54 +652,107 @@ export class Scope {
     const code = e.code();
     if (code !== "42703" && code !== "42702" && code !== "42P01" && code !== "42P09") return e;
     let hint: string | undefined;
-    if (code === "42703") hint = this.fuzzyColumnHint(qualifier, name);
-    else if (code === "42P01" && qualifier !== null) hint = this.tableAliasHint(qualifier);
+    if (code === "42703") hint = this.columnHint(qualifier, name);
+    else if (code === "42P01" && qualifier !== null) hint = this.tableHint(qualifier);
     return e.withPosition(loc).withHint(hint);
   }
 
-  // hintRelations is the labeled relations of the §11.1 walk at this level: the FROM relations in
-  // order, then the inner relations of an unaliased parenthesized join. Each yields its label and
-  // column names (a write through a view: the view's columns).
-  private hintRelations(): { label: string; cols: string[] }[] {
-    const out: { label: string; cols: string[] }[] = [];
+  // hintRelations is the labeled relations this level can see, in the §11.1 walk order: the FROM
+  // relations in order, then the inner relations of an unaliased parenthesized join. Each yields its
+  // label, column names (a write through a view: the view's columns), and the base table or view it
+  // names (§11.2).
+  private hintRelations(): { label: string; cols: string[]; catalog: string | undefined }[] {
+    const out: { label: string; cols: string[]; catalog: string | undefined }[] = [];
     for (const r of this.rels) {
       if (r.label === "") continue;
       const cols = r.layer !== undefined ? r.layer.columns : r.table.columns;
-      out.push({ label: r.label, cols: cols.map((c) => c.name) });
+      const catalog = r.view !== undefined ? r.view : r.base === true ? r.table.name : undefined;
+      out.push({ label: r.label, cols: cols.map((c) => c.name), catalog });
     }
     for (const sr of this.subRels) {
       if (sr.label === "") continue;
-      out.push({ label: sr.label, cols: sr.table.columns.map((c) => c.name) });
+      out.push({ label: sr.label, cols: sr.table.columns.map((c) => c.name), catalog: undefined });
     }
     return out;
   }
 
-  // fuzzyColumnHint is PostgreSQL's misspelled-column hint over the scope chain
-  // (spec/design/error-fields.md §11.1).
-  private fuzzyColumnHint(qualifier: string | null, name: string): string | undefined {
-    const m = new FuzzyColumnMatch(qualifier, name);
-    for (let s: Scope | null = this; s !== null; s = s.parent) {
-      for (const { label, cols } of s.hintRelations()) {
-        const penalty = m.penalty(label);
-        for (const col of cols) m.offer(label, penalty, col);
-      }
-    }
-    return m.hint();
+  // depth is the scope-chain depth of this scope (1 for a scope with no parent).
+  depth(): number {
+    return scopeDepth(this);
   }
 
-  // tableAliasHint is the table-alias hint (spec/design/error-fields.md §11.2): the first base table
-  // or view reference in the scope chain whose catalog name is `qualifier` under a different label.
-  private tableAliasHint(qualifier: string): string | undefined {
+  // hintWalk is every relation a hint searches, in PostgreSQL's range-table walk order
+  // (spec/design/error-fields.md §11.1, §11.8): at each level outward, the relations this level
+  // cannot see to the left of an ON clause, the visible relations, then the relations hidden from the
+  // derived bodies planned against the level's parent (innermost first).
+  private hintWalk(): HintEntry[] {
+    const frames = this.catalog.unseenFrames;
+    const lateralActive = this.hints.lateralActive;
+    const unseen = (u: UnseenRel, blocked: boolean): HintEntry => ({
+      label: u.label,
+      columns: u.columns,
+      catalog: u.catalog,
+      visible: false,
+      lateralOk: u.lateralOk && !blocked && !lateralActive,
+      qualifiedOnly: u.qualifiedOnly && !blocked,
+    });
+    const out: HintEntry[] = [];
+    let depth = this.depth();
     for (let s: Scope | null = this; s !== null; s = s.parent) {
-      for (const r of s.rels) {
-        const catalogName =
-          r.view !== undefined ? r.view : r.base === true ? r.table.name : undefined;
-        if (catalogName === qualifier && r.label !== qualifier && r.label !== "") {
-          return aliasHint(r.label);
-        }
+      for (const u of s.hints.unseen) out.push(unseen(u, true));
+      for (const { label, cols, catalog } of s.hintRelations()) {
+        out.push({
+          label,
+          columns: cols,
+          catalog,
+          visible: true,
+          lateralOk: false,
+          qualifiedOnly: false,
+        });
+      }
+      depth--;
+      for (let fi = frames.length - 1; fi >= 0; fi--) {
+        const f = frames[fi]!;
+        if (f.depth !== depth) continue;
+        // A parenthesized join's ON clause cannot see the relations to the join's left.
+        const blocked = s.hints.onClause && f.parenJoin;
+        for (const u of f.rels) out.push(unseen(u, blocked));
       }
     }
-    return undefined;
+    return out;
+  }
+
+  // columnHint is PostgreSQL's errorMissingColumn hint (spec/design/error-fields.md §11.1, §11.8): a
+  // relation that has the column but cannot be seen from here yields the LATERAL or qualified-name
+  // hint; otherwise the misspelled-column suggestion.
+  private columnHint(qualifier: string | null, name: string): string | undefined {
+    const entries = this.hintWalk();
+    const m = new FuzzyColumnMatch(qualifier, name);
+    const exact: HintEntry[] = [];
+    for (const e of entries) {
+      const penalty = m.penalty(e.label);
+      for (const col of e.columns) m.offer(e.label, penalty, col);
+      if (penalty === 0 && e.columns.includes(name)) exact.push(e);
+    }
+    if (exact.length === 0) return m.hint();
+    if (exact.length === 1) {
+      const e = exact[0]!;
+      if (e.lateralOk) return LATERAL_COLUMN;
+      if (qualifier === null && e.qualifiedOnly) return QUALIFY_COLUMN;
+      return undefined;
+    }
+    return qualifier === null ? TRY_QUALIFIED : undefined;
+  }
+
+  // tableHint is PostgreSQL's errorMissingRTE hint (spec/design/error-fields.md §11.2, §11.8): the
+  // first relation in the walk labeled `qualifier`, or naming that base table or view. A visible one
+  // under a different label is the table-alias hint; one hidden from a non-LATERAL subquery is the
+  // LATERAL hint.
+  private tableHint(qualifier: string): string | undefined {
+    const e = this.hintWalk().find((h) => h.label === qualifier || h.catalog === qualifier);
+    if (e === undefined) return undefined;
+    if (e.visible) return e.label !== qualifier ? aliasHint(e.label) : undefined;
+    return e.lateralOk ? LATERAL_TABLE : undefined;
   }
 
   // columnAt returns the column at a flat index in THIS scope (index known valid).
@@ -1218,7 +1341,7 @@ export function checkRecursiveColumnTypes(
       throw engineError(
         "datatype_mismatch",
         `recursive query "${name}" column ${i + 1} has type ${rtName(a[i]!)} in non-recursive term but type ${rtName(unified)} overall`,
-      );
+      ).hinted(RECURSIVE_TERM_TYPE);
     }
     // The non-recursive term also fixed the column's typmod, so the overall common typmod must
     // equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
@@ -1228,7 +1351,7 @@ export function checkRecursiveColumnTypes(
       throw engineError(
         "datatype_mismatch",
         `recursive query "${name}" column ${i + 1} has type ${typmodTypeName(a[i]!, atMod)} in non-recursive term but type ${typmodTypeName(a[i]!, overallMod)} overall`,
-      );
+      ).hinted(RECURSIVE_TERM_TYPE);
     }
     if (!unionAll) requireSetopEquality(a[i]!);
     // The non-recursive term fixed the relation's collation, so the UNION's overall common

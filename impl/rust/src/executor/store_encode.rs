@@ -410,7 +410,8 @@ pub(crate) fn store_composite(
                     "row has {} fields but composite type {type_name} has {}",
                     vals.len(),
                     fields.len()
-                )));
+                ))
+                .no_hint());
             }
             let mut out = Vec::with_capacity(vals.len());
             for (val, f) in vals.into_iter().zip(fields.iter()) {
@@ -549,7 +550,8 @@ pub(crate) fn materialize_insert_value(
                         "ROW has {} fields but composite type {name} has {}",
                         field_ivs.len(),
                         fields.len()
-                    )));
+                    ))
+                    .no_hint());
                 }
                 let mut vals = Vec::with_capacity(fields.len());
                 for (fiv, f) in field_ivs.iter().zip(fields.iter()) {

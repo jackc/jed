@@ -68,6 +68,12 @@ import type {
 import type { Meter } from "./cost.ts";
 import { EngineError, atPosition, engineError, positionedAt } from "./errors.ts";
 import {
+  FUNCTION_NO_MATCH,
+  OPERATOR_AMBIGUOUS,
+  OPERATOR_NO_MATCH,
+  OPERATOR_NO_MATCH_PREFIX,
+} from "./error_hint.ts";
+import {
   exprEqual,
   exprLocation,
   mismatchLocation,
@@ -609,23 +615,33 @@ export function resolve(
 }
 
 // locateNodeError decides the position of an error leaving node e's resolution
-// (spec/design/error-fields.md §10.2). A function call's 42883 points at its name; an operator's
-// 42883 / 42804 (no operator for these operand types) points at the operator. AND / OR / NOT name
-// the offending operand instead, at their raise site. A string literal's input error points at the
-// literal. An error an operand raised was already decided by that operand's own resolution, so the
-// enclosing node never claims it.
+// (spec/design/error-fields.md §10.2). A function call's 42883 / 42725 points at its name; an
+// operator's 42883 / 42804 (no operator for these operand types) points at the operator and carries
+// PostgreSQL's operator hint (§11.7). AND / OR / NOT name the offending operand instead, at their
+// raise site. A string literal's input error points at the literal. An error an operand raised was
+// already decided by that operand's own resolution, so the enclosing node never claims it.
 function locateNodeError(err: EngineError, e: Expr): EngineError {
   const operatorError = err.state === "undefined_function" || err.state === "datatype_mismatch";
+  let operatorHint: string | undefined;
   let pos: number | undefined;
   switch (e.kind) {
     case "funcCall":
-      if (err.state === "undefined_function") pos = e.loc;
+      if (err.state === "undefined_function" || err.state === "ambiguous_function") pos = e.loc;
       break;
     case "binary":
-      if (operatorError && e.op !== "and" && e.op !== "or") pos = e.loc;
+      if (operatorError && e.op !== "and" && e.op !== "or") {
+        operatorHint =
+          isUnknownLiteral(e.lhs) && isUnknownLiteral(e.rhs)
+            ? OPERATOR_AMBIGUOUS
+            : OPERATOR_NO_MATCH;
+        pos = e.loc;
+      }
       break;
     case "unary":
-      if (operatorError && e.op === "neg") pos = e.loc;
+      if (operatorError && e.op === "neg") {
+        operatorHint = isUnknownLiteral(e.operand) ? OPERATOR_AMBIGUOUS : OPERATOR_NO_MATCH_PREFIX;
+        pos = e.loc;
+      }
       break;
     case "isDistinct":
     case "like":
@@ -633,7 +649,10 @@ function locateNodeError(err: EngineError, e: Expr): EngineError {
     case "inSubquery":
     case "quantified":
     case "quantifiedSubquery":
-      if (operatorError) pos = e.loc;
+      if (operatorError) {
+        operatorHint = OPERATOR_NO_MATCH;
+        pos = e.loc;
+      }
       break;
     case "literal":
       // A string literal adapting to its context (a uuid / bytea / date / json … sibling) is
@@ -641,7 +660,19 @@ function locateNodeError(err: EngineError, e: Expr): EngineError {
       if (e.literal.kind === "text") pos = e.loc;
       break;
   }
+  // The operator's own type error — not one an operand decided, nor one positioned inside a
+  // subquery — is PostgreSQL's "operator does not exist" (§11.7).
+  if (operatorHint !== undefined && err.located !== true && err.position === undefined) {
+    err.defaultHint(operatorHint);
+  }
   return err.locate(pos);
+}
+
+// isUnknownLiteral reports whether e is an operand PostgreSQL types as `unknown`: a bare string
+// literal or NULL. An operator over only such operands that has no implementation is PostgreSQL's
+// ambiguous-operator case (spec/design/error-fields.md §11.7).
+function isUnknownLiteral(e: Expr): boolean {
+  return e.kind === "literal" && (e.literal.kind === "text" || e.literal.kind === "null");
 }
 
 function resolveNode(
@@ -1206,7 +1237,7 @@ function resolveNode(
             throw engineError(
               "undefined_function",
               `function extract(text, ${rtName(src.type)}) does not exist`,
-            );
+            ).hinted(FUNCTION_NO_MATCH);
         }
         extractField(e.field, probe); // validate field-for-type (0A000 / 22023); value discarded
       }

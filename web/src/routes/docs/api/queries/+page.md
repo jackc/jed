@@ -141,16 +141,19 @@ wrong type for its column or for its `CASE` / `COALESCE` / `ARRAY` / `VALUES` / 
 the query — a cast of a column's value, say — has none. It
 counts characters, not bytes, and a syntax error at end of input points one past the last
 character. For `execute_script` it counts from the start of the whole script. It is absent
-(`None` / `0` / `undefined`) otherwise. **`hint`** (`Hint`) carries PostgreSQL's suggestion for a
-misspelled column or a table name used in place of its alias:
+(`None` / `0` / `undefined`) otherwise. **`hint`** (`Hint`) carries PostgreSQL's suggestion, in its
+exact words: for a misspelled column, a table name used in place of its alias, a column or table of
+a FROM item to the left of a subquery not marked `LATERAL`, a function or operator with no
+implementation for its argument types, and a value of the wrong type for its column:
 
 | Statement | `code` | `position` | `hint` |
 |---|---|---|---|
 | `SELECT 1 +` | `42601` | `11` | |
-| `SELECT nofunc(1)` | `42883` | `8` | |
+| `SELECT nofunc(1)` | `42883` | `8` | `No function matches the given name and argument types. You might need to add explicit type casts.` |
 | `SELECT 'abc'::int` | `22P02` | `8` | |
 | `SELECT nme FROM users` | `42703` | `8` | `Perhaps you meant to reference the column "users.name".` |
 | `SELECT users.id FROM users u` | `42P01` | `8` | `Perhaps you meant to reference the table alias "u".` |
+| `SELECT * FROM users, (SELECT id) s` | `42703` | `30` | `To reference that column, you must mark this subquery with LATERAL.` |
 
 ```ts
 // TypeScript: underline the offending character. Positions count code points, so index

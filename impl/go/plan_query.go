@@ -1244,7 +1244,7 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 			return newError(DatatypeMismatch, fmt.Sprintf(
 				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
 				name, i+1, rtName(a[i]), rtName(unified),
-			))
+			)).hinted(hintRecursiveTermType)
 		}
 		// The non-recursive term also fixed the column's typmod, so the overall common typmod must
 		// equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
@@ -1254,7 +1254,7 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 			return newError(DatatypeMismatch, fmt.Sprintf(
 				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
 				name, i+1, typmodTypeName(a[i], atMod), typmodTypeName(a[i], overallMod),
-			))
+			)).hinted(hintRecursiveTermType)
 		}
 		if !unionAll {
 			if err := requireSetopEquality(a[i]); err != nil {
@@ -1929,7 +1929,7 @@ func unifyValuesColumn(a, b resolvedType) (resolvedType, error) {
 // decides it.
 func requireSetopEquality(t resolvedType) error {
 	if classifyComparable(t, t) != nil {
-		return newError(UndefinedFunction, "could not identify an equality operator for type "+rtName(t))
+		return newError(UndefinedFunction, "could not identify an equality operator for type "+rtName(t)).noHint()
 	}
 	return nil
 }

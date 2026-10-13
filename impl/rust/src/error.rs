@@ -48,6 +48,10 @@ pub struct EngineError {
     /// deliberately left absent), so an enclosing node never claims an error raised inside one of
     /// its operands (spec/design/error-fields.md §10.2). Internal bookkeeping, not a field.
     pub(crate) located: bool,
+    /// Set once a raise site has decided this error's `Hint` (set it, or deliberately left it absent),
+    /// so an enclosing context never adds its default hint (spec/design/error-fields.md §11.7).
+    /// Internal bookkeeping, not a field.
+    pub(crate) hint_decided: bool,
 }
 
 impl EngineError {
@@ -63,6 +67,7 @@ impl EngineError {
             position: None,
             hint: None,
             located: false,
+            hint_decided: false,
         }
     }
 
@@ -149,6 +154,32 @@ impl EngineError {
             self.hint = hint;
         }
         self
+    }
+
+    /// Set the fixed `Hint` `text` and mark the hint decided (spec/design/error-fields.md §11.7).
+    #[must_use]
+    pub(crate) fn hinted(mut self, text: &str) -> Self {
+        self = self.with_hint(Some(text.to_string()));
+        self.hint_decided = true;
+        self
+    }
+
+    /// Decide that this error carries no `Hint`, so no enclosing context adds one (§11.7).
+    #[must_use]
+    pub(crate) fn no_hint(mut self) -> Self {
+        self.hint_decided = true;
+        self
+    }
+
+    /// An enclosing context's default `Hint` (§11.7): set `text` unless the raise site already
+    /// decided the hint.
+    #[must_use]
+    pub(crate) fn default_hint(self, text: &str) -> Self {
+        if self.hint_decided || self.hint.is_some() {
+            self
+        } else {
+            self.hinted(text)
+        }
     }
 
     #[must_use]

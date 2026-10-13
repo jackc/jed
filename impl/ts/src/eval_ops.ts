@@ -57,7 +57,7 @@ import {
   rangeUnion,
 } from "./range.ts";
 import { engineError } from "./errors.ts";
-import { storeValue, typeError } from "./store.ts";
+import { assignmentError, storeValue, typeError } from "./store.ts";
 import type { InputZone } from "./timezone.ts";
 import { valueCmp } from "./window.ts";
 import type { Row } from "./storage.ts";
@@ -818,7 +818,7 @@ export function requireSetopEquality(t: ResolvedType): void {
     throw engineError(
       "undefined_function",
       `could not identify an equality operator for type ${rtName(t)}`,
-    );
+    ).noHint();
   }
 }
 
@@ -1106,7 +1106,9 @@ export function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
 
 export function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
   if (!assignableTo(t, colTy)) {
-    throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
+    throw assignmentError(
+      "cannot assign a value to column " + col + " of type " + canonicalName(colTy),
+    );
   }
 }
 

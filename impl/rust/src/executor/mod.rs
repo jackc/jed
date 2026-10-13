@@ -590,6 +590,9 @@ pub struct Engine {
     /// again (planner.md §3.2), so a chain of `d` views is planned in `O(d)`. Cleared when the
     /// outermost expansion ends.
     pub(crate) view_columns: std::cell::RefCell<HashMap<String, ViewColumns>>,
+    /// The FROM relations hidden from the derived bodies being planned right now, innermost last
+    /// (spec/design/error-fields.md §11.8). Read only to build a hint.
+    pub(crate) unseen_frames: std::cell::RefCell<Vec<UnseenFrame>>,
 }
 
 /// A view body's output columns: names, types, and collation derivations.
@@ -1641,6 +1644,7 @@ fn build_prefix_scope<'s>(
         subquery_derivs: Default::default(),
         lateral_view: None,
         lateral_hit: Default::default(),
+        hints: Default::default(),
     }
 }
 
@@ -1686,6 +1690,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            hints: Default::default(),
         }
     }
 }
@@ -1886,6 +1891,69 @@ pub(crate) struct Scope<'a> {
     /// parenthesized join's lateral prefix to learn whether the join's body correlates to the
     /// relations on its left (grammar.md §15).
     lateral_hit: std::cell::Cell<bool>,
+    /// What a name-resolution hint needs beyond the visible relations (error-fields.md §11.8).
+    hints: ScopeHints,
+}
+
+/// A relation of a query level's FROM clause that a reference there cannot see. PostgreSQL's
+/// range table holds such relations, and its `42703` / `42P01` hints search them
+/// (spec/design/error-fields.md §11.8).
+#[derive(Clone)]
+pub(crate) struct UnseenRel {
+    label: String,
+    columns: Vec<String>,
+    /// The base table or view the relation names (the §11.2 search), else `None`.
+    catalog: Option<String>,
+    /// Marking the reference's subquery `LATERAL` would make the relation visible.
+    lateral_ok: bool,
+    /// The relation is an inner relation of a completed unaliased join, so its columns are
+    /// reachable only through its qualifier.
+    qualified_only: bool,
+}
+
+/// The relations to the left of a non-LATERAL derived table or parenthesized join, recorded while
+/// its body is planned (spec/design/error-fields.md §11.8). `depth` is the scope-chain depth of the
+/// scope the body is planned against, so the hint walk visits the relations right after the body's
+/// own outermost level. `paren_join` marks a parenthesized join's body: its ON clauses cannot reach
+/// these relations even with `LATERAL`.
+pub(crate) struct UnseenFrame {
+    depth: usize,
+    paren_join: bool,
+    rels: Vec<UnseenRel>,
+}
+
+/// A scope's hint-only facts (spec/design/error-fields.md §11.8). They never affect resolution.
+#[derive(Default)]
+pub(crate) struct ScopeHints {
+    /// This level's FROM relations the scope cannot see, before its own: a JOIN's ON clause cannot
+    /// see the comma items to its left.
+    unseen: Vec<UnseenRel>,
+    /// The scope resolves a JOIN's ON clause.
+    on_clause: bool,
+    /// The scope resolves a table function's arguments (PostgreSQL's `p_lateral_active`): a hint
+    /// never suggests `LATERAL` from here.
+    lateral_active: bool,
+}
+
+/// One relation the hint walk visits (spec/design/error-fields.md §11.8), in walk order.
+struct HintEntry {
+    label: String,
+    columns: Vec<String>,
+    catalog: Option<String>,
+    visible: bool,
+    lateral_ok: bool,
+    qualified_only: bool,
+}
+
+/// The number of levels in a scope chain (0 for none).
+pub(crate) fn scope_depth(scope: Option<&Scope>) -> usize {
+    let mut depth = 0;
+    let mut level = scope;
+    while let Some(s) = level {
+        depth += 1;
+        level = s.parent;
+    }
+    depth
 }
 
 /// One inner relation label of an unaliased parenthesized join (grammar.md §15): its table's
@@ -1960,6 +2028,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            hints: Default::default(),
         }
     }
 
@@ -2042,6 +2111,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            hints: Default::default(),
         }
     }
 
@@ -2126,6 +2196,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            hints: Default::default(),
         })
     }
 
@@ -2199,6 +2270,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            hints: Default::default(),
         }
     }
 
@@ -2456,8 +2528,8 @@ impl<'a> Scope<'a> {
     }
 
     /// Stamp a column reference's `42703` / `42702` / `42P01` with its position, and add the
-    /// misspelled-column (§11.1) or table-alias (§11.2) hint. An error already positioned came from
-    /// an inner site, which wins.
+    /// misspelled-column (§11.1), table-alias (§11.2), or LATERAL (§11.8) hint. An error already
+    /// positioned came from an inner site, which wins.
     fn locate_column_error(
         &self,
         e: EngineError,
@@ -2477,16 +2549,17 @@ impl<'a> Scope<'a> {
             return e;
         }
         let hint = match (e.state, qualifier) {
-            (SqlState::UndefinedColumn, _) => self.fuzzy_column_hint(qualifier, name),
-            (SqlState::UndefinedTable, Some(q)) => self.table_alias_hint(q),
+            (SqlState::UndefinedColumn, _) => self.column_hint(qualifier, name),
+            (SqlState::UndefinedTable, Some(q)) => self.table_hint(q),
             _ => None,
         };
         e.with_position(pos.0).with_hint(hint)
     }
 
-    /// The labeled relations of the §11.1 walk at this level: the FROM relations in order, then the
-    /// inner relations of an unaliased parenthesized join. Each yields its label and column names.
-    fn hint_relations(&self) -> Vec<(&str, Vec<&str>)> {
+    /// The labeled relations this level can see, in the §11.1 walk order: the FROM relations in
+    /// order, then the inner relations of an unaliased parenthesized join. Each yields its label,
+    /// column names, and the base table or view it names (§11.2).
+    fn hint_relations(&self) -> Vec<(&str, Vec<&str>, Option<&str>)> {
         let mut out = Vec::new();
         for r in &self.rels {
             if r.label.is_empty() {
@@ -2496,51 +2569,115 @@ impl<'a> Scope<'a> {
                 Some(layer) => layer.columns.iter().map(|c| c.name.as_str()).collect(),
                 None => r.table.columns.iter().map(|c| c.name.as_str()).collect(),
             };
-            out.push((r.label.as_str(), cols));
+            let catalog = match &r.view {
+                Some(v) => Some(v.as_str()),
+                None if r.base => Some(r.table.name.as_str()),
+                None => None,
+            };
+            out.push((r.label.as_str(), cols, catalog));
         }
         for sr in &self.sub_rels {
             if !sr.label.is_empty() {
                 let cols = sr.table.columns.iter().map(|c| c.name.as_str()).collect();
-                out.push((sr.label.as_str(), cols));
+                out.push((sr.label.as_str(), cols, None));
             }
         }
         out
     }
 
-    /// PostgreSQL's misspelled-column hint over the scope chain (spec/design/error-fields.md §11.1).
-    fn fuzzy_column_hint(&self, qualifier: Option<&str>, name: &str) -> Option<String> {
-        let mut m = error_hint::FuzzyColumnMatch::new(qualifier, name);
-        let mut level = Some(self);
-        while let Some(s) = level {
-            for (label, cols) in s.hint_relations() {
-                let penalty = m.penalty(label);
-                for col in cols {
-                    m.offer(label, penalty, col);
-                }
-            }
-            level = s.parent;
-        }
-        m.hint()
+    /// The scope-chain depth of this scope (1 for a scope with no parent).
+    fn depth(&self) -> usize {
+        scope_depth(Some(self))
     }
 
-    /// The table-alias hint (spec/design/error-fields.md §11.2): the first base table or view
-    /// reference in the scope chain whose catalog name is `qualifier` under a different label.
-    fn table_alias_hint(&self, qualifier: &str) -> Option<String> {
+    /// Every relation a hint searches, in PostgreSQL's range-table walk order (spec/design/
+    /// error-fields.md §11.1, §11.8): at each level outward, the relations this level cannot see to
+    /// the left of an ON clause, the visible relations, then the relations hidden from the derived
+    /// bodies planned against the level's parent (innermost first).
+    fn hint_walk(&self) -> Vec<HintEntry> {
+        let frames = self.catalog.unseen_frames.borrow();
+        let lateral_active = self.hints.lateral_active;
+        let unseen = |u: &UnseenRel, blocked: bool| HintEntry {
+            label: u.label.clone(),
+            columns: u.columns.clone(),
+            catalog: u.catalog.clone(),
+            visible: false,
+            lateral_ok: u.lateral_ok && !blocked && !lateral_active,
+            qualified_only: u.qualified_only && !blocked,
+        };
+        let mut out = Vec::new();
+        let mut depth = self.depth();
         let mut level = Some(self);
         while let Some(s) = level {
-            for r in &s.rels {
-                let catalog_name = match &r.view {
-                    Some(v) => Some(v.as_str()),
-                    None if r.base => Some(r.table.name.as_str()),
-                    None => None,
-                };
-                if catalog_name == Some(qualifier) && r.label != qualifier && !r.label.is_empty() {
-                    return Some(error_hint::alias_hint(&r.label));
+            for u in &s.hints.unseen {
+                out.push(unseen(u, true));
+            }
+            for (label, cols, catalog) in s.hint_relations() {
+                out.push(HintEntry {
+                    label: label.to_string(),
+                    columns: cols.into_iter().map(str::to_string).collect(),
+                    catalog: catalog.map(str::to_string),
+                    visible: true,
+                    lateral_ok: false,
+                    qualified_only: false,
+                });
+            }
+            depth -= 1;
+            for f in frames.iter().rev().filter(|f| f.depth == depth) {
+                // A parenthesized join's ON clause cannot see the relations to the join's left.
+                let blocked = s.hints.on_clause && f.paren_join;
+                for u in &f.rels {
+                    out.push(unseen(u, blocked));
                 }
             }
             level = s.parent;
         }
-        None
+        out
+    }
+
+    /// PostgreSQL's `errorMissingColumn` hint (spec/design/error-fields.md §11.1, §11.8): a
+    /// relation that has the column but cannot be seen from here yields the LATERAL or qualified-name
+    /// hint; otherwise the misspelled-column suggestion.
+    fn column_hint(&self, qualifier: Option<&str>, name: &str) -> Option<String> {
+        let entries = self.hint_walk();
+        let mut m = error_hint::FuzzyColumnMatch::new(qualifier, name);
+        let mut exact: Vec<&HintEntry> = Vec::new();
+        for e in &entries {
+            let penalty = m.penalty(&e.label);
+            for col in &e.columns {
+                m.offer(&e.label, penalty, col);
+            }
+            if penalty == 0 && e.columns.iter().any(|c| c == name) {
+                exact.push(e);
+            }
+        }
+        match exact.as_slice() {
+            [] => m.hint(),
+            [e] if e.lateral_ok => Some(error_hint::LATERAL_COLUMN.to_string()),
+            [e] if qualifier.is_none() && e.qualified_only => {
+                Some(error_hint::QUALIFY_COLUMN.to_string())
+            }
+            [_] => None,
+            _ => qualifier
+                .is_none()
+                .then(|| error_hint::TRY_QUALIFIED.to_string()),
+        }
+    }
+
+    /// PostgreSQL's `errorMissingRTE` hint (spec/design/error-fields.md §11.2, §11.8): the first
+    /// relation in the walk labeled `qualifier`, or naming that base table or view. A visible one
+    /// under a different label is the table-alias hint; one hidden from a non-LATERAL subquery is the
+    /// LATERAL hint.
+    fn table_hint(&self, qualifier: &str) -> Option<String> {
+        let entries = self.hint_walk();
+        let e = entries
+            .iter()
+            .find(|e| e.label == qualifier || e.catalog.as_deref() == Some(qualifier))?;
+        if e.visible {
+            (e.label != qualifier).then(|| error_hint::alias_hint(&e.label))
+        } else {
+            e.lateral_ok.then(|| error_hint::LATERAL_TABLE.to_string())
+        }
     }
 
     /// The column at a flat index in THIS scope (the index is known valid — resolution made it).
@@ -4180,7 +4317,8 @@ fn check_recursive_column_types(
                     at.type_name(),
                     unified.type_name(),
                 ),
-            ));
+            )
+            .hinted(error_hint::RECURSIVE_TERM_TYPE));
         }
         // The non-recursive term also fixed the column's typmod, so the overall common typmod must
         // equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
@@ -4195,7 +4333,8 @@ fn check_recursive_column_types(
                     typmod_type_name(at, at_mod),
                     typmod_type_name(at, overall_mod),
                 ),
-            ));
+            )
+            .hinted(error_hint::RECURSIVE_TERM_TYPE));
         }
         if !union_all {
             require_setop_equality(at)?;

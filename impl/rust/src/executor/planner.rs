@@ -213,16 +213,36 @@ impl Engine {
                         ctes,
                     );
                     let fence = Scope::lateral_fence(parent, &prefix, self, ctes);
-                    self.plan_body_first(true, || {
-                        self.plan_query(body, Some(&fence), ctes, ptypes)
+                    // The relations to the join's left, for a hint (error-fields.md §11.8).
+                    let unseen = |body_parent: Option<&Scope>| {
+                        Some(unseen_frame(
+                            &from_items,
+                            &sel.joins,
+                            &finalized,
+                            &synthetic,
+                            &group_subs,
+                            i,
+                            body_parent,
+                        ))
+                    };
+                    self.with_unseen_frame(unseen(Some(&fence)), || {
+                        self.plan_body_first(true, || {
+                            self.plan_query(body, Some(&fence), ctes, ptypes)
+                        })
                     })?;
                     if prefix.lateral_hit.get() {
                         join_lateral = true;
-                        self.plan_again(ctes, || self.plan_query(body, Some(&fence), ctes, ptypes))?
+                        self.with_unseen_frame(unseen(Some(&fence)), || {
+                            self.plan_again(ctes, || {
+                                self.plan_query(body, Some(&fence), ctes, ptypes)
+                            })
+                        })?
                     } else {
-                        self.plan_again(ctes, || {
-                            self.plan_body_first(shape_bodies, || {
-                                self.plan_query(body, parent, ctes, ptypes)
+                        self.with_unseen_frame(unseen(parent), || {
+                            self.plan_again(ctes, || {
+                                self.plan_body_first(shape_bodies, || {
+                                    self.plan_query(body, parent, ctes, ptypes)
+                                })
                             })
                         })?
                     }
@@ -230,15 +250,31 @@ impl Engine {
                     // A LATERAL first item sees no sibling, but inside a fenced parenthesized join it
                     // still sees the relations to the join's left (§15).
                     let body_parent = if tref.lateral { lateral_parent } else { parent };
-                    match (&tref.subquery, &tref.values) {
+                    // A non-LATERAL item to the right of others cannot see them; a hint can
+                    // (error-fields.md §11.8).
+                    let frame = (i > 0 && !tref.lateral).then(|| {
+                        unseen_frame(
+                            &from_items,
+                            &sel.joins,
+                            &finalized,
+                            &synthetic,
+                            &group_subs,
+                            i,
+                            body_parent,
+                        )
+                    });
+                    self.with_unseen_frame(frame, || match (&tref.subquery, &tref.values) {
                         (Some(body), _) => self.plan_body_first(shape_bodies, || {
                             self.plan_query(body, body_parent, ctes, ptypes)
-                        })?,
-                        (None, Some(rows)) => {
-                            QueryPlan::Values(self.plan_values(rows, body_parent, ctes, ptypes)?)
-                        }
+                        }),
+                        (None, Some(rows)) => Ok(QueryPlan::Values(self.plan_values(
+                            rows,
+                            body_parent,
+                            ctes,
+                            ptypes,
+                        )?)),
                         _ => unreachable!(),
-                    }
+                    })?
                 };
                 let lateral =
                     join_lateral || (lateral_eligible && query_plan_references_outer(&plan, 0));
@@ -649,6 +685,7 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    hints: Default::default(),
                 };
                 let left_names: Vec<&str> = seg_star
                     .iter()
@@ -688,6 +725,7 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    hints: Default::default(),
                 };
                 // The synthesized predicate compares the two chosen columns through one-column pseudo
                 // relations at their flat slots, so it binds exactly those columns even when a side is
@@ -793,6 +831,7 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    hints: Default::default(),
                 };
                 Some(resolve_boolean_filter(
                     &pair,
@@ -800,6 +839,13 @@ impl Engine {
                     ptypes,
                 )?)
             } else if let Some(on_expr) = &j.on {
+                // An ON clause cannot see the comma items to its left; a hint searches them
+                // (error-fields.md §11.8).
+                let on_hints = ScopeHints {
+                    unseen: on_clause_unseen(&from_items, &rels, &group_subs, seg),
+                    on_clause: true,
+                    lateral_active: false,
+                };
                 let partial = Scope {
                     rels: rels[seg..=k + 1].to_vec(),
                     parent,
@@ -814,6 +860,7 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    hints: on_hints,
                 };
                 seg_star.extend(rel_star(k + 1));
                 Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
@@ -839,6 +886,7 @@ impl Engine {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            hints: Default::default(),
         };
 
         // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,
@@ -873,7 +921,8 @@ impl Engine {
                             return Err(EngineError::new(
                                 SqlState::UndefinedFunction,
                                 "could not identify an equality operator for type json",
-                            ));
+                            )
+                            .no_hint());
                         }
                         if !group_keys.contains(&idx) {
                             group_keys.push(idx);
@@ -891,7 +940,8 @@ impl Engine {
                             return Err(EngineError::new(
                                 SqlState::UndefinedFunction,
                                 "could not identify an equality operator for type json",
-                            ));
+                            )
+                            .no_hint());
                         }
                         // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
                         match group_key_exprs
@@ -1082,7 +1132,8 @@ impl Engine {
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 "could not identify an equality operator for type json",
-            ));
+            )
+            .no_hint());
         }
         // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
         // (spec/design/collation.md §1 "A sort or grouping target").
@@ -1251,7 +1302,8 @@ impl Engine {
                         return Err(EngineError::new(
                             SqlState::UndefinedFunction,
                             "could not identify an ordering operator for type json",
-                        ));
+                        )
+                        .hinted(error_hint::NO_ORDERING_OPERATOR));
                     }
                     let coll = match &key.collation {
                         Some(name) => {
@@ -1297,7 +1349,8 @@ impl Engine {
                         return Err(EngineError::new(
                             SqlState::UndefinedFunction,
                             "could not identify an ordering operator for type json",
-                        ));
+                        )
+                        .hinted(error_hint::NO_ORDERING_OPERATOR));
                     }
                     // The sort key's collation (collation.md §1/§7). An explicit `COLLATE` must be on a
                     // text / text[] column (42804) and name a loaded collation ("C" → byte order, else 42704);
@@ -1405,7 +1458,8 @@ impl Engine {
                         return Err(EngineError::new(
                             SqlState::UndefinedFunction,
                             "could not identify an ordering operator for type json",
-                        ));
+                        )
+                        .hinted(error_hint::NO_ORDERING_OPERATOR));
                     }
                     // The collation of an expression key (collation.md §1): an explicit trailing
                     // `COLLATE` (rare — `parse_expr` usually absorbs one into the key) must be on a text
@@ -1711,6 +1765,22 @@ impl Engine {
         out
     }
 
+    /// Run `f` with `frame` (when given) recording the relations hidden from the body `f` plans, for a
+    /// hint (spec/design/error-fields.md §11.8).
+    pub(crate) fn with_unseen_frame<T>(
+        &self,
+        frame: Option<UnseenFrame>,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(frame) = frame else {
+            return f();
+        };
+        self.unseen_frames.borrow_mut().push(frame);
+        let out = f();
+        self.unseen_frames.borrow_mut().pop();
+        out
+    }
+
     /// Run `f` with CTE reference expansion off (planner.md §3.4): the definition of a CTE that its
     /// reference may plan again.
     pub(crate) fn without_cte_expansion<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -1995,6 +2065,122 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
 /// Whether a parenthesized join's body holds an item that may reach the relations to the join's left
 /// (spec/design/grammar.md §15): a LATERAL derived table, a table function (implicitly lateral), or
 /// a nested parenthesized join holding one. Only such a join is planned against a lateral fence.
+/// Whether FROM item `tref` is a parenthesized join (spec/design/grammar.md §15).
+fn is_paren_join(tref: &TableRef) -> bool {
+    matches!(tref.subquery.as_deref(), Some(QueryExpr::Select(sel)) if sel.paren_join)
+}
+
+/// The relations to the left of FROM item `i` (i ≥ 1), which a non-LATERAL derived table or
+/// parenthesized join there cannot see, as PostgreSQL's hint search sees them
+/// (spec/design/error-fields.md §11.8). A relation before `i`'s join segment (a comma item) would
+/// be visible to a LATERAL item; one in the segment would be unless the join to `i` is RIGHT or FULL,
+/// and then, past the segment's first join, it is reachable only by its qualifier. An aliased
+/// parenthesized join hides its inner relations and is itself a join, so it adds none; an unaliased
+/// one adds its inner relations.
+fn unseen_frame(
+    from_items: &[&TableRef],
+    joins: &[crate::ast::JoinClause],
+    finalized: &[FinalRel],
+    synthetic: &[Box<Table>],
+    group_subs: &[GroupSubRel],
+    i: usize,
+    body_parent: Option<&Scope>,
+) -> UnseenFrame {
+    let mut seg = i;
+    if !joins[i - 1].comma {
+        seg = i - 1;
+        while seg > 0 && !joins[seg - 1].comma {
+            seg -= 1;
+        }
+    }
+    let seg_lateral_ok = !matches!(joins[i - 1].kind, JoinKind::Right | JoinKind::Full);
+    let mut rels = Vec::new();
+    for (k, tref) in from_items.iter().enumerate().take(i) {
+        let lateral_ok = k < seg || seg_lateral_ok;
+        if is_paren_join(tref) {
+            if tref.alias.is_some() {
+                continue;
+            }
+            for gs in group_subs.iter().filter(|gs| gs.rel == k) {
+                rels.push(UnseenRel {
+                    label: gs.label.clone(),
+                    columns: gs.table.columns.iter().map(|c| c.name.clone()).collect(),
+                    catalog: None,
+                    lateral_ok,
+                    qualified_only: !lateral_ok,
+                });
+            }
+            continue;
+        }
+        let fr = &finalized[k];
+        if fr.label.is_empty() {
+            continue;
+        }
+        let table = fr.table(synthetic);
+        let catalog = match &fr.view {
+            Some(v) => Some(v.clone()),
+            None if fr.src.is_base() => Some(table.name.clone()),
+            None => None,
+        };
+        rels.push(UnseenRel {
+            label: fr.label.clone(),
+            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+            catalog,
+            lateral_ok,
+            qualified_only: !lateral_ok && i - seg >= 2,
+        });
+    }
+    UnseenFrame {
+        depth: scope_depth(body_parent),
+        paren_join: is_paren_join(from_items[i]),
+        rels,
+    }
+}
+
+/// The comma items to the left of an ON clause's join segment starting at FROM item `seg`, which
+/// the clause cannot see (spec/design/error-fields.md §11.8). `LATERAL` cannot reach them.
+fn on_clause_unseen(
+    from_items: &[&TableRef],
+    rels: &[ScopeRel],
+    group_subs: &[GroupSubRel],
+    seg: usize,
+) -> Vec<UnseenRel> {
+    let mut out = Vec::new();
+    for (k, tref) in from_items.iter().enumerate().take(seg) {
+        if is_paren_join(tref) {
+            if tref.alias.is_none() {
+                for gs in group_subs.iter().filter(|gs| gs.rel == k) {
+                    out.push(UnseenRel {
+                        label: gs.label.clone(),
+                        columns: gs.table.columns.iter().map(|c| c.name.clone()).collect(),
+                        catalog: None,
+                        lateral_ok: false,
+                        qualified_only: false,
+                    });
+                }
+            }
+            continue;
+        }
+        let r = &rels[k];
+        if r.label.is_empty() {
+            continue;
+        }
+        let catalog = match &r.view {
+            Some(v) => Some(v.clone()),
+            None if r.base => Some(r.table.name.clone()),
+            None => None,
+        };
+        out.push(UnseenRel {
+            label: r.label.clone(),
+            columns: r.table.columns.iter().map(|c| c.name.clone()).collect(),
+            catalog,
+            lateral_ok: false,
+            qualified_only: false,
+        });
+    }
+    out
+}
+
 fn paren_join_reaches_left(tref: &TableRef) -> bool {
     let Some(QueryExpr::Select(sel)) = tref.subquery.as_deref() else {
         return false;

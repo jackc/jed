@@ -1199,7 +1199,9 @@ func classifyComparable(lt, rt resolvedType) error {
 	case compL && compR:
 		a, b := lt.comp.fields, rt.comp.fields
 		if len(a) != len(b) {
-			return typeError("cannot compare rows of different sizes")
+			// PostgreSQL's row comparison of unequal sizes is a different error (42601), with no
+			// operator hint (spec/design/error-fields.md §11.7).
+			return newError(DatatypeMismatch, "cannot compare rows of different sizes").noHint()
 		}
 		for i := range a {
 			if err := classifyComparable(a[i].ty, b[i].ty); err != nil {
@@ -1485,7 +1487,7 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 		return node, nil // a NULL-typed expression (e.g. a CASE that may be NULL)
 	}
 	if !containerAssignable(ty, colRT) {
-		return nil, positionError(typeError("column "+col.Name+" is of type "+col.Type.CanonicalName()+
+		return nil, positionError(assignmentError("column "+col.Name+" is of type "+col.Type.CanonicalName()+
 			" but expression is of type "+rtName(ty)), exprLocation(e))
 	}
 	return node, nil

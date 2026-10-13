@@ -505,7 +505,8 @@ impl Engine {
                                     &col_types[i],
                                     &bound,
                                     &self.input_zone(),
-                                )?,
+                                )
+                                .map_err(assignment_hint)?,
                             };
                         }
                     }
@@ -683,7 +684,7 @@ impl Engine {
                         match &col.ty {
                             Type::Scalar(s) => {
                                 if !q.column_types[p].assignable_to(*s) {
-                                    return Err(type_error(format!(
+                                    return Err(assignment_error(format!(
                                         "column {} is of type {} but expression is of type {}",
                                         col.name,
                                         col.ty.canonical_name(),
@@ -712,7 +713,7 @@ impl Engine {
                                 if !matches!(src, ResolvedType::Null)
                                     && *src != resolved_type_of_col(&col.ty, self)
                                 {
-                                    return Err(type_error(format!(
+                                    return Err(assignment_error(format!(
                                         "column {} is of type {} but expression is of type {}",
                                         col.name,
                                         col.ty.canonical_name(),
@@ -804,7 +805,7 @@ impl Engine {
                     let (node, ty) =
                         resolve(&scope, e, Some(*target), &mut AggCtx::Forbidden, ptypes)?;
                     if !ty.assignable_to(*target) {
-                        return Err(type_error(format!(
+                        return Err(assignment_error(format!(
                             "column {} is of type {} but expression is of type {}",
                             col.name,
                             col.ty.canonical_name(),
@@ -832,7 +833,7 @@ impl Engine {
                         }
                         _ if ty == resolved_type_of_col(&col.ty, self) => {}
                         _ => {
-                            return Err(type_error(format!(
+                            return Err(assignment_error(format!(
                                 "column {} is of type {} but expression is of type {}",
                                 col.name,
                                 col.ty.canonical_name(),
@@ -1205,7 +1206,8 @@ impl Engine {
                             &plan.col_types[i],
                             bound,
                             &self.input_zone(),
-                        )?,
+                        )
+                        .map_err(assignment_hint)?,
                     };
                 }
             }
@@ -2566,7 +2568,7 @@ impl Engine {
                     &col.name,
                     &self.input_zone(),
                 )
-                .map_err(|e| e.with_table(relation))?,
+                .map_err(|e| assignment_hint(e.with_table(relation)))?,
             );
         }
         if let Some(i) = null_col {

@@ -136,7 +136,7 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 // the same rule SELECT DISTINCT applies to a json output column.
 func rejectJSONDistinct(t resolvedType) error {
 	if t.kind == rtJson {
-		return newError(UndefinedFunction, "could not identify an equality operator for type json")
+		return newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
 	}
 	return nil
 }
@@ -221,7 +221,8 @@ func resolveAggOrder(s *scope, keys []orderKey, distinct bool, args []*exprNode,
 			return nil, err
 		}
 		if ktype.kind == rtJson {
-			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
+			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
+				hinted(hintNoOrderingOperator)
 		}
 		if distinct {
 			kexpr := aggSortKeyExpr(key)
@@ -644,13 +645,15 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 	switch {
 	case isNoArg:
 		if fc.Star || len(fc.Args) != 0 {
-			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes no arguments")
+			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes no arguments").
+				hinted(hintFunctionNoMatch)
 		}
 		plan = noArgI64
 		result = resolvedType{kind: rtInt, intTy: scalarInt64}
 	case isNoArgRatio:
 		if fc.Star || len(fc.Args) != 0 {
-			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes no arguments")
+			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes no arguments").
+				hinted(hintFunctionNoMatch)
 		}
 		plan = noArgRatio
 		result = resolvedType{kind: rtFloat64}
@@ -658,14 +661,16 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		// ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh
 		// Forbidden sub-context (no aggregate/window nesting in a window argument).
 		if fc.Star || len(fc.Args) != 1 {
-			return nil, resolvedType{}, newError(UndefinedFunction, "ntile takes exactly one argument")
+			return nil, resolvedType{}, newError(UndefinedFunction, "ntile takes exactly one argument").
+				hinted(hintFunctionNoMatch)
 		}
 		anode, aty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		if aty.kind != rtInt && aty.kind != rtNull {
-			return nil, resolvedType{}, typeError("argument of ntile must be integer")
+			return nil, resolvedType{}, newError(DatatypeMismatch, "argument of ntile must be integer").
+				hinted(hintFunctionNoMatch)
 		}
 		wargs = append(wargs, anode)
 		plan = planNtile
@@ -675,7 +680,8 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		// result; offset is an integer (default 1); default (returned when the offset leaves the
 		// partition) must match the value type. Args resolved in a fresh Forbidden sub-context.
 		if fc.Star || len(fc.Args) == 0 || len(fc.Args) > 3 {
-			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes 1 to 3 arguments")
+			return nil, resolvedType{}, newError(UndefinedFunction, name+" takes 1 to 3 arguments").
+				hinted(hintFunctionNoMatch)
 		}
 		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
@@ -702,7 +708,8 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 				return nil, resolvedType{}, err
 			}
 			if oty.kind != rtInt && oty.kind != rtNull {
-				return nil, resolvedType{}, typeError("offset of " + name + " must be integer")
+				return nil, resolvedType{}, newError(DatatypeMismatch, "offset of "+name+" must be integer").
+					hinted(hintFunctionNoMatch)
 			}
 			wargs = append(wargs, onode)
 		}
@@ -712,7 +719,8 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 				return nil, resolvedType{}, err
 			}
 			if dty.kind != rtNull && !resolvedTypeEqual(dty, vty) {
-				return nil, resolvedType{}, typeError("default of " + name + " must match the value type")
+				return nil, resolvedType{}, newError(DatatypeMismatch, "default of "+name+" must match the value type").
+					hinted(hintFunctionNoMatch)
 			}
 			wargs = append(wargs, dnode)
 		}
@@ -770,7 +778,7 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		}
 		if len(fc.Args) != want {
 			return nil, resolvedType{}, newError(UndefinedFunction,
-				fmt.Sprintf("%s takes %d argument(s)", name, want))
+				fmt.Sprintf("%s takes %d argument(s)", name, want)).hinted(hintFunctionNoMatch)
 		}
 		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
@@ -787,14 +795,21 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 				return nil, resolvedType{}, err
 			}
 			if nty.kind != rtInt && nty.kind != rtNull {
-				return nil, resolvedType{}, typeError("position of nth_value must be integer")
+				return nil, resolvedType{}, newError(DatatypeMismatch, "position of nth_value must be integer").
+					hinted(hintFunctionNoMatch)
 			}
 			wargs = append(wargs, nnode)
 			plan = planNthValue
 		}
 		result = vty
 	default:
-		return nil, resolvedType{}, newError(UndefinedFunction, name+" is not a window function")
+		// A known non-window function is PostgreSQL's 42809 (no hint); an unknown name is its
+		// function-lookup failure (error-fields.md §11.7).
+		err := newError(UndefinedFunction, name+" is not a window function")
+		if isScalarFuncName(name) || s.catalog.session.extensions.hasFunction(name) {
+			return nil, resolvedType{}, err.noHint()
+		}
+		return nil, resolvedType{}, err.hinted(hintFunctionNoMatch)
 	}
 	// Resolve the window definition (PARTITION BY / ORDER BY expressions → slots, explicit frame).
 	// Keys resolve in `sub` (the grouped collecting ctx — a bare grouping column → its grouped-row
@@ -1122,23 +1137,25 @@ func resolveRangeBound(b frameBound, kt dataType) (resolvedBound, error) {
 // exactly one argument; a different count matches no aggregate overload and is 42883 (PG).
 func aggArg(fc *funcCallExpr) (exprNode, error) {
 	if len(fc.Args) != 1 {
-		return exprNode{}, newError(UndefinedFunction, "no aggregate function matches the given argument count")
+		return exprNode{}, newError(UndefinedFunction, "no aggregate function matches the given argument count").
+			hinted(hintFunctionNoMatch)
 	}
 	return *fc.Args[0], nil
 }
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
 func noAggOverload(fn string) error {
-	return newError(UndefinedFunction, "no "+fn+" aggregate for that argument type")
+	return newError(UndefinedFunction, "no "+fn+" aggregate for that argument type").hinted(hintFunctionNoMatch)
 }
 
 // noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
 func noFuncOverload(fn string) error {
-	return newError(UndefinedFunction, "no "+fn+" function for those argument types")
+	return newError(UndefinedFunction, "no "+fn+" function for those argument types").hinted(hintFunctionNoMatch)
 }
 
 // ambiguousFuncOverload is the 42725 raised when an unknown-typed argument leaves several overloads
 // of fn standing (functions.md §9.1) — the caller writes a cast to choose one.
 func ambiguousFuncOverload(fn string) error {
-	return newError(AmbiguousFunction, "function "+fn+" is not unique for those argument types")
+	return newError(AmbiguousFunction, "function "+fn+" is not unique for those argument types").
+		hinted(hintFunctionAmbiguous)
 }

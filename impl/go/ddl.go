@@ -750,7 +750,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			if def.Default.Expr.Kind == exprLiteral && !clockDefault {
 				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, varcharLen, false, def.Name, db.inputZone())
 				if err != nil {
-					return outcome{}, err
+					return outcome{}, assignmentHint(err)
 				}
 				defaultVal = &dv
 			} else {
@@ -762,7 +762,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 					return outcome{}, err
 				}
 				if !assignableTo(rt, ty) {
-					return outcome{}, typeError(fmt.Sprintf(
+					return outcome{}, assignmentError(fmt.Sprintf(
 						"column %s is of type %s but default expression is of type %s",
 						def.Name, ty.CanonicalName(), rtName(rt),
 					))
@@ -2809,7 +2809,7 @@ func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *de
 	if def.Expr.Kind == exprLiteral && !clockDefault {
 		v, err := storeValue(literalToValue(*def.Expr.Literal), ty, col.Decimal, col.VarcharLen, false, col.Name, db.inputZone())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, assignmentHint(err)
 		}
 		return &v, nil, nil
 	}
@@ -2821,7 +2821,7 @@ func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *de
 		return nil, nil, err
 	}
 	if !assignableTo(rt, ty) {
-		return nil, nil, typeError(fmt.Sprintf("column %s is of type %s but default expression is of type %s", col.Name, ty.CanonicalName(), rtName(rt)))
+		return nil, nil, assignmentError(fmt.Sprintf("column %s is of type %s but default expression is of type %s", col.Name, ty.CanonicalName(), rtName(rt)))
 	}
 	return nil, &defaultExprDef{ExprText: def.Text, Expr: def.Expr}, nil
 }

@@ -141,6 +141,9 @@ type engine struct {
 	// view body again (planner.md §3.2), so a chain of d views is planned in O(d). Cleared when the
 	// outermost expansion ends.
 	viewColumns map[string]*valuesPlan
+	// unseenFrames are the FROM relations hidden from the derived bodies being planned right now,
+	// innermost last (spec/design/error-fields.md §11.8). Read only to build a hint.
+	unseenFrames []unseenFrame
 }
 
 type estimatorTouchedRelation struct {

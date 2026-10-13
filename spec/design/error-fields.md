@@ -13,8 +13,9 @@
 > table stamp, with per-core `error_fields` tests; additive, no format bump; `Detail`, `Position`,
 > and `Hint` likewise landed in all three cores, pinned by shared fixtures). The fifth field,
 > **`Detail`** (the offending values — `Key (id)=(1) already exists.`), is specified in §9; the sixth
-> and seventh, **`Position`** (a 1-based character offset into the query) and **`Hint`** (a
-> "Perhaps you meant …" suggestion), in §10 and §11.
+> and seventh, **`Position`** (a 1-based character offset into the query) and **`Hint`**
+> (PostgreSQL's suggestion — "Perhaps you meant …", "You might need to add explicit type casts.",
+> the LATERAL hints), in §10 and §11.
 > [api.md](api.md) §7 owns the host-facing error surface; [../errors/registry.toml](../errors/registry.toml)
 > owns the code/template registry.
 
@@ -173,8 +174,11 @@ error surface.
 
 - **`Detail`** — no longer deferred; specified in §9.
 - **`Position`** — no longer deferred; specified in §10.
-- **`Hint`** — no longer deferred; specified in §11 for the two suggestion families and three fixed
-  sentences (§11.4–§11.6). Other PostgreSQL hints (`42883`'s "You might need to add explicit type casts.", the LATERAL hints) remain open.
+- **`Hint`** — no longer deferred; specified in §11: the two suggestion families, the LATERAL hints
+  (§11.8), and PostgreSQL's fixed sentences for the conditions jed shares (§11.4–§11.7). PostgreSQL's
+  remaining hints on surfaces jed implements remain open: the collation hints (`42P21` / `42P22`
+  "…applying the COLLATE clause…"), and the DETAIL sentences that accompany the §11.8 hints ("There is
+  a column named …, but it cannot be referenced from this part of the query.").
 - **`DatabaseName` (the `SchemaName` analog).** jed qualifies by database, not schema. If
   attachment-qualified errors ever need to name the database, this is the additive field to add;
   not motivated yet.
@@ -383,7 +387,7 @@ query surfaces (CLAUDE.md §13). jed adds it as a sixth structured field.
 | an `INSERT` column-list name or an `UPDATE … SET` / `ON CONFLICT DO UPDATE SET` target | `42703` | the column name |
 | a FROM-clause table or view name | `42P01` | the name — the database qualifier of `db.t` |
 | an `INSERT` / `UPDATE` / `DELETE` target, also in a writable CTE or under `EXPLAIN` | `42P01` | the name — the database qualifier of `db.t` |
-| a function call, aggregate, window function, or FROM-clause table function with no implementation for its arguments | `42883` | the function name; for a special form the keyword PostgreSQL rewrites from (`SUBSTRING`, `POSITION`, `OVERLAY`, the `AT` of `AT TIME ZONE`, the `LIKE` of `LIKE … ESCAPE`) |
+| a function call, aggregate, window function, or FROM-clause table function with no implementation for its arguments, or with several and none best | `42883`, `42725` | the function name; for a special form the keyword PostgreSQL rewrites from (`SUBSTRING`, `POSITION`, `OVERLAY`, the `AT` of `AT TIME ZONE`, the `LIKE` of `LIKE … ESCAPE`) |
 | an operator with no implementation for its operand types | `42883`, `42804` | the operator token; the `NOT` of `NOT IN` / `NOT BETWEEN` / `NOT LIKE`, else the `IN` / `BETWEEN` / `LIKE` / `ILIKE` keyword; the `IS` of `IS [NOT] DISTINCT FROM`; the comparison of `op ANY` / `op ALL` |
 | a non-boolean argument of `WHERE`, `JOIN … ON`, `HAVING`, `AND`, `OR`, `NOT`, a searched `CASE WHEN`, `FILTER`, or `CHECK` | `42804` | the argument's location (below) |
 | a set of expressions with no common type: `CASE` results, `COALESCE`, `GREATEST` / `LEAST`, `ARRAY[…]` elements, a `VALUES` column, a set-operation column | `42804` | the location of the first expression that does not unify with those before it, in PostgreSQL's order: a `CASE`'s `ELSE` result first, then its `THEN` results; a set operation's right operand's column |
@@ -468,9 +472,10 @@ the same token; a case where jed's token surface differs is marked `# jed:`.
 PostgreSQL attaches a HINT to an unknown column when a column of a similar name is in scope:
 `SELECT nme FROM t` → `Perhaps you meant to reference the column "t.name".`. It is the most useful hint
 for an ad-hoc query tool, and it is deterministic (an edit distance over the catalog names in scope).
-jed adds `Hint` as a seventh structured field and populates it for two families, plus three fixed
-sentences (§11.4–§11.6). Like `Detail`, it is
-never appended to the rendered message (§9.1); the CLI prints it as psql's `HINT:  …` line.
+jed adds `Hint` as a seventh structured field and populates it for two suggestion families (§11.1,
+§11.2), the LATERAL hints (§11.8), and PostgreSQL's fixed sentences for the conditions jed shares
+(§11.4–§11.7). Like `Detail`, it is never appended to the rendered message (§9.1); the CLI prints it
+as psql's `HINT:  …` line.
 
 ### 11.1 Misspelled column (`42703` on a column reference)
 
@@ -478,8 +483,9 @@ The hint uses PostgreSQL's `errorMissingColumn` search (`parse_relation.c`) exac
 
 1. **Candidates.** Walk the scope chain from the reference's own query level outward. At each level
    visit the FROM relations in FROM order, then the inner relations of an unaliased parenthesized
-   join. Skip a relation with no label. Within a relation visit its columns in ordinal order (a write
-   through a view: the view's columns). Each candidate is `(label, column)`.
+   join; the walk also visits the relations the reference cannot see, in §11.8's order. Skip a
+   relation with no label. Within a relation visit its columns in ordinal order (a write through a
+   view: the view's columns). Each candidate is `(label, column)`.
 2. **Relation penalty.** For a qualified reference `q.c`, a relation's penalty is the Levenshtein
    distance (insert, delete, substitute all cost 1, over characters) from `q` to its label. For a bare
    reference the penalty is 0.
@@ -493,8 +499,8 @@ The hint uses PostgreSQL's `errorMissingColumn` search (`parse_relation.c`) exac
    - else if `d' == distance`: if there is a second match, clear both (three equal candidates are too
      many; `distance` stays); else if there is a first match, second = this candidate.
 4. **An exact match.** A candidate with `penalty == 0` and `d == 0` exists only when the column is in
-   scope but unreachable from here (a qualifier-only relation). PostgreSQL then raises a different
-   error with its own detail; jed gives **no hint** for such a reference.
+   the walk but unreachable from here: a relation the reference cannot see (§11.8), or a
+   qualifier-only relation. §11.8 decides the hint then; the fuzzy suggestion is not used.
 5. **Text.** One match: `Perhaps you meant to reference the column "{label}.{column}".`. Two:
    `Perhaps you meant to reference the column "{l1}.{c1}" or the column "{l2}.{c2}".`. None: no hint.
    Names are inserted verbatim inside the double quotes (PostgreSQL's `"%s.%s"`, not `quote_ident`).
@@ -508,11 +514,13 @@ column-list name or `SET` target does not, matching PostgreSQL.
 ### 11.2 Table name used instead of its alias (`42P01` on a qualifier)
 
 `SELECT t.a FROM t f` names the table, not its alias `f`. When a qualifier matches no relation label
-in the scope chain, but a base table or view reference in that chain has the qualifier as its
-**catalog name** and a different label, the hint is
-`Perhaps you meant to reference the table alias "{label}".` (the first such relation in the §11.1
-order). PostgreSQL also rewords this message to "invalid reference to FROM-clause entry for table";
-jed keeps its message (informational, and stable for the corpus).
+in the scope chain, the hint comes from the first relation in the §11.1 walk (§11.8 relations
+included) that is labeled with the qualifier or is a base table or view reference whose **catalog
+name** is the qualifier (PostgreSQL's `searchRangeTableForRel`). A visible relation found by its
+catalog name under a different label gives
+`Perhaps you meant to reference the table alias "{label}".`; a relation the reference cannot see gives
+§11.8's hint or none. PostgreSQL also rewords this message to "invalid reference to FROM-clause entry
+for table"; jed keeps its message (informational, and stable for the corpus).
 
 ### 11.3 Determinism and divergences
 
@@ -522,14 +530,13 @@ catalog names and the fixed walk order.
 
 Recorded divergences from PostgreSQL:
 
-- jed's scope holds only relations a reference can see. PostgreSQL's range table also holds relations
-  the reference cannot see (a non-LATERAL sibling, a sibling join's inner table), which it searches and
-  reports with a LATERAL or "cannot be referenced from this part of the query" hint. jed offers no
-  hint in those cases.
 - PostgreSQL visits an unaliased join's inner relations at their place in the range table; jed visits
-  them after the level's FROM relations. This can change which of two equally close candidates is
-  named first.
-- Every other PostgreSQL hint is absent (§7), except §11.4's, §11.5's, and §11.6's.
+  a level's visible ones after its FROM relations. This can change which of two equally close
+  candidates is named first.
+- An aliased parenthesized join hides its inner relations, and jed does not record them among the
+  relations a reference cannot see (§11.8). PostgreSQL still offers them as misspelled-column
+  candidates; jed does not.
+- Every other PostgreSQL hint is absent (§7), except those of §11.4–§11.8.
 
 ### 11.4 `jsonb_set_lax`'s `raise_exception` (`22004`)
 
@@ -558,3 +565,100 @@ character, as PostgreSQL does. The other Unicode-escape errors (escape value, su
 `Try using the function jsonb_set to replace key value.` Constant text, so cross-core identical; the
 error carries no Position (raised at evaluation), and the shared position fixture pins it
 ([../errors/position_cases.txt](../errors/position_cases.txt)).
+
+### 11.7 Function, operator, and assignment hints
+
+PostgreSQL attaches a fixed sentence to each of these conditions. jed attaches the same sentence,
+byte-for-byte, wherever it raises the same condition, including where jed's SQLSTATE differs from
+PostgreSQL's for it (the operator mismatches jed reports as `42804`, §10.2). The sentence is constant
+text, so it is cross-core identical, unmetered, and changes no code, cost, or abort point.
+
+| condition | SQLSTATE | `Hint` (PostgreSQL source) |
+|---|---|---|
+| a function call, aggregate, window function, or FROM-clause table function with no implementation for its name and arguments (unknown name, wrong argument count or types, an unknown named parameter, a special form's rewritten function) | `42883`; a window function's argument-type check: `42804` | `No function matches the given name and argument types. You might need to add explicit type casts.` (`parse_func.c`) |
+| several functions match an unknown-typed argument and none is best | `42725` | `Could not choose a best candidate function. You might need to add explicit type casts.` |
+| an infix operator with no implementation for its operand types (`+`, `=`, `\|\|`, `->`, `@>`, `LIKE`, `IN`, `BETWEEN`, `IS DISTINCT FROM`, `op ANY` / `ALL`, …) | `42883`, `42804` | `No operator matches the given name and argument types. You might need to add explicit type casts.` (`parse_oper.c`) |
+| prefix `-` with no implementation for its operand type | `42804` | `No operator matches the given name and argument type. You might need to add an explicit type cast.` |
+| an operator whose every operand is an untyped string literal or `NULL` (`'1' + '2'`) | `42804` | `Could not choose a best candidate operator. You might need to add explicit type casts.` (PostgreSQL reports these as `42725`: several operators match `unknown` operands) |
+| a sort key whose type has no ordering operator (`ORDER BY` a `json` column) | `42883` | `Use an explicit ordering operator or modify the query.` (`get_sort_group_operators`) |
+| a value of the wrong type for its column: an `INSERT … VALUES` expression or literal slot, an `INSERT … SELECT` column, an `UPDATE … SET` / `DO UPDATE SET` value, a column `DEFAULT` (`CREATE TABLE`, `ADD COLUMN`, `SET DEFAULT`) | `42804` | `You will need to rewrite or cast the expression.` (`transformAssignedExpr`, `cookDefault`) |
+| a recursive CTE whose recursive term changes a column's type or typmod | `42804` | `Cast the output of the non-recursive term to the correct type.` (`parse_cte.c`) |
+
+**Which errors.** The hint belongs to the condition, not to the code: the raise site that detects the
+condition sets it. The function sentence is set where function lookup fails. The operator sentences
+are set by the operator node whose own resolution fails (the node that also positions the error,
+§10.2), not by an error an operand raised. The assignment sentence is set where the value is checked
+against its column, at resolve time or, for a literal slot or a constant default, when it is stored.
+A raise site can also decide that its error carries no hint, and an enclosing context never adds one
+then. These conditions carry **no** hint, as in PostgreSQL:
+
+- a known function used as a window function (`abs(1) OVER ()`; PostgreSQL's `42809`, jed's `42883`);
+  an unknown name used that way is a lookup failure and carries the function sentence;
+- a grouping or `DISTINCT` key, or a set operation's column, whose type has no equality operator
+  (`could not identify an equality operator for type json`);
+- a row comparison of unequal sizes (PostgreSQL's `42601`, jed's `42804`);
+- a composite value with the wrong number of fields for its column (PostgreSQL's `42846` cast error).
+
+**Recorded divergences.**
+
+- jed applies the operator and assignment sentences to every operator and assignment mismatch it
+  reports, including those PostgreSQL accepts through an implicit cast that jed's strict type system
+  omits (`1::float8 = 1::int`, `INSERT INTO t (int_col) VALUES (1.5)`). The sentence's advice holds in
+  jed.
+- jed has no `NULLIF`, so `NULLIF(1, 'a'::text)` is jed's unknown-function error with the function
+  sentence; PostgreSQL rewrites it to `=` and gives the operator sentence.
+- PostgreSQL's `ALTER TABLE … ALTER COLUMN … TYPE` hints (`You might need to specify "USING x::t".`,
+  `You might need to add an explicit cast.`) are not attached: jed converts a column with an explicit
+  cast ([alter.md](alter.md) §3.3), so the condition PostgreSQL hints about — a type with no
+  assignment cast — is not the one jed reports, and suggesting the cast jed already applied would
+  mislead.
+
+### 11.8 LATERAL hints — relations a reference cannot see
+
+PostgreSQL's range table at each query level holds every FROM relation processed so far, including
+ones a reference there cannot see. Its hint search (`errorMissingColumn`, `errorMissingRTE`) walks
+them too. jed reproduces that walk for the two places it hides relations at a level:
+
+- **A non-LATERAL derived table, `VALUES` list, or parenthesized join at FROM position `i > 0`.** While
+  its body is planned, the relations to its left are recorded: base tables, views, CTE references,
+  table functions, derived tables, and the inner relations of an unaliased parenthesized join (an
+  aliased one hides its inner relations and is itself a join, which PostgreSQL's search skips). The
+  walk visits them right after the body's outermost level, innermost body first.
+- **A JOIN's `ON` clause**, which cannot see the comma items to the left of its join segment. The
+  walk visits them before the clause's own relations.
+
+Each such relation is marked **LATERAL-reachable** when marking the subquery `LATERAL` would make it
+visible: a comma item to the left of the item's join segment, or an item of the segment when the join
+to the item is not `RIGHT` or `FULL`. It is marked **qualifier-only** when it is an inner relation of
+a completed join (an item of the segment past the segment's first join, or an inner relation of an
+unaliased parenthesized join) that LATERAL cannot reach. Neither mark applies from an `ON` clause:
+the clause's hidden comma items, and a parenthesized join's left relations seen from its own `ON`
+clause, are in the walk but not reachable. A table function's arguments are resolved with
+PostgreSQL's `p_lateral_active` set, so a reference there never gets the LATERAL hint.
+
+Then, for a `42703` (`errorMissingColumn`): let the **exact matches** be the walked relations with
+penalty 0 (§11.1 step 2) that have the column.
+
+| exact matches | `Hint` |
+|---|---|
+| none | the §11.1 suggestion over every walked relation |
+| one, LATERAL-reachable | `To reference that column, you must mark this subquery with LATERAL.` |
+| one, qualifier-only, bare reference | `To reference that column, you must use a table-qualified name.` |
+| one, otherwise | none |
+| two or more, bare reference | `Try using a table-qualified name.` |
+| two or more, qualified reference | none |
+
+For a `42P01` qualifier (`errorMissingRTE`, §11.2): the first walked relation labeled with the
+qualifier or naming it gives, when hidden and LATERAL-reachable,
+`To reference that table, you must mark this subquery with LATERAL.`; when hidden otherwise, no
+hint.
+
+PostgreSQL also gives these errors a DETAIL (`There is a column named "a" in table "t", but it cannot
+be referenced from this part of the query.`) and rewords the `42P01` message; jed keeps its message
+and adds no Detail yet (§7). PostgreSQL's other LATERAL condition, a reference from a `LATERAL` item
+across a `RIGHT` or `FULL` join (`42P10`), carries a DETAIL and no hint, except for an `UPDATE … FROM`
+/ `DELETE … USING` target, which jed does not support.
+
+The walk is built only on the error path from names already resolved, so it is unmetered and
+deterministic. The shared fixture ([../errors/position_cases.txt](../errors/position_cases.txt))
+pins every form against PostgreSQL 18.

@@ -44,6 +44,10 @@ type EngineError struct {
 	// or deliberately left absent), so an enclosing node never claims an error raised inside one of its
 	// operands (spec/design/error-fields.md §10.2). Internal bookkeeping, not a field.
 	located bool
+	// hintDecided is set once a raise site has decided this error's Hint (set it, or deliberately left
+	// it absent), so an enclosing context never adds its default hint (spec/design/error-fields.md
+	// §11.7). Internal bookkeeping, not a field.
+	hintDecided bool
 }
 
 // newError builds an EngineError.
@@ -92,6 +96,28 @@ func (e *EngineError) withHint(hint string) *EngineError {
 	return e
 }
 
+// hinted sets the fixed Hint text and marks the hint decided (spec/design/error-fields.md §11.7).
+func (e *EngineError) hinted(text string) *EngineError {
+	e.withHint(text)
+	e.hintDecided = true
+	return e
+}
+
+// noHint decides that this error carries no Hint, so no enclosing context adds one (§11.7).
+func (e *EngineError) noHint() *EngineError {
+	e.hintDecided = true
+	return e
+}
+
+// defaultHint is an enclosing context's default Hint (§11.7): set text unless the raise site already
+// decided the hint.
+func (e *EngineError) defaultHint(text string) *EngineError {
+	if e.hintDecided || e.Hint != "" {
+		return e
+	}
+	return e.hinted(text)
+}
+
 // locateError stamps an error leaving an expression node's resolution with pos unless an inner node
 // already decided its position, then marks it decided (spec/design/error-fields.md §10.2). A no-op for
 // a non-EngineError.
@@ -100,6 +126,17 @@ func locateError(err error, pos srcPos) error {
 	if errors.As(err, &e) && !e.located {
 		e.withPosition(int32(pos))
 		e.located = true
+	}
+	return err
+}
+
+// assignmentHint gives a store-time 42804 (a value of the wrong type for its column or default)
+// PostgreSQL's assignment hint, unless its raise site decided otherwise (spec/design/error-fields.md
+// §11.7). Any other error passes through.
+func assignmentHint(err error) error {
+	var e *EngineError
+	if errors.As(err, &e) && e.State == DatatypeMismatch {
+		e.defaultHint(hintAssignmentMismatch)
 	}
 	return err
 }

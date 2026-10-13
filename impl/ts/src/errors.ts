@@ -38,6 +38,10 @@ export class EngineError extends Error {
   // deliberately left absent), so an enclosing node never claims an error raised inside one of its
   // operands (spec/design/error-fields.md §10.2). Internal bookkeeping, not a field.
   located?: boolean;
+  // Set once a raise site has decided this error's Hint (set it, or deliberately left it absent), so
+  // an enclosing context never adds its default hint (spec/design/error-fields.md §11.7). Internal
+  // bookkeeping, not a field.
+  hintDecided?: boolean;
 
   constructor(state: SqlState, message: string) {
     super(`${sqlStateCode(state)}: ${message}`);
@@ -108,6 +112,23 @@ export class EngineError extends Error {
   withHint(hint: string | undefined): this {
     if (this.hint === undefined) this.hint = hint;
     return this;
+  }
+  // hinted sets the fixed Hint `text` and marks the hint decided (spec/design/error-fields.md §11.7).
+  hinted(text: string): this {
+    this.withHint(text);
+    this.hintDecided = true;
+    return this;
+  }
+  // noHint decides that this error carries no Hint, so no enclosing context adds one (§11.7).
+  noHint(): this {
+    this.hintDecided = true;
+    return this;
+  }
+  // defaultHint is an enclosing context's default Hint (§11.7): set `text` unless the raise site
+  // already decided the hint.
+  defaultHint(text: string): this {
+    if (this.hintDecided === true || this.hint !== undefined) return this;
+    return this.hinted(text);
   }
 }
 

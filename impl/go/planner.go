@@ -136,6 +136,14 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			} else if tref.Lateral {
 				bodyParent = lateralParentScope
 			}
+			// A non-LATERAL item to the right of others cannot see them; a hint can (error-fields.md
+			// §11.8).
+			bodyFrame := func() *unseenFrame {
+				if i > 0 && !tref.Lateral {
+					return buildUnseenFrame(tableRefs, sel.Joins, rels, subRels, i, bodyParent)
+				}
+				return nil
+			}
 			joinLateral := false
 			//   A query body is first planned as a SHAPE (planner.md §3.2): stage 2 needs only its output
 			// columns and pushability, and the body is planned for real once stage 2 knows what it pushes
@@ -169,34 +177,45 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				// derived body.
 				prefix := &scope{rels: rels, parent: lateralParentScope, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels}
 				fence := lateralFence(parent, prefix, db, ctes)
-				err := db.planBodyFirst(true, func() error {
-					_, perr := db.planQuery(*tref.Subquery, fence, ctes, ptypes)
-					return perr
-				})
-				if err != nil {
-					return nil, err
-				}
-				joinLateral = prefix.lateralHit
-				err = db.planAgain(ctes, func() error {
-					if joinLateral {
-						p, perr := db.planQuery(*tref.Subquery, fence, ctes, ptypes)
-						plan = p
-						return perr
-					}
-					return db.planBodyFirst(shapeBodies, func() error {
-						p, perr := db.planQuery(*tref.Subquery, parent, ctes, ptypes)
-						plan = p
+				// The relations to the join's left, for a hint (error-fields.md §11.8).
+				err := db.withUnseenFrame(buildUnseenFrame(tableRefs, sel.Joins, rels, subRels, i, fence), func() error {
+					return db.planBodyFirst(true, func() error {
+						_, perr := db.planQuery(*tref.Subquery, fence, ctes, ptypes)
 						return perr
 					})
 				})
 				if err != nil {
 					return nil, err
 				}
+				joinLateral = prefix.lateralHit
+				againParent := parent
+				if joinLateral {
+					againParent = fence
+				}
+				err = db.withUnseenFrame(buildUnseenFrame(tableRefs, sel.Joins, rels, subRels, i, againParent), func() error {
+					return db.planAgain(ctes, func() error {
+						if joinLateral {
+							p, perr := db.planQuery(*tref.Subquery, fence, ctes, ptypes)
+							plan = p
+							return perr
+						}
+						return db.planBodyFirst(shapeBodies, func() error {
+							p, perr := db.planQuery(*tref.Subquery, parent, ctes, ptypes)
+							plan = p
+							return perr
+						})
+					})
+				})
+				if err != nil {
+					return nil, err
+				}
 			} else if tref.Subquery != nil {
-				err := db.planBodyFirst(shapeBodies, func() error {
-					p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
-					plan = p
-					return perr
+				err := db.withUnseenFrame(bodyFrame(), func() error {
+					return db.planBodyFirst(shapeBodies, func() error {
+						p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
+						plan = p
+						return perr
+					})
 				})
 				if err != nil {
 					return nil, err
@@ -212,11 +231,14 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					}
 				}
 			} else {
-				vp, verr := db.planValues(tref.Values, bodyParent, ctes, ptypes)
-				if verr != nil {
-					return nil, verr
+				err := db.withUnseenFrame(bodyFrame(), func() error {
+					vp, verr := db.planValues(tref.Values, bodyParent, ctes, ptypes)
+					plan = queryPlan{values: vp}
+					return verr
+				})
+				if err != nil {
+					return nil, err
 				}
-				plan = queryPlan{values: vp}
 			}
 			lateralFlags[i] = joinLateral || (lateralEligible && queryPlanReferencesOuter(&plan, 0))
 			shaped[i] = shapeBodies && tref.Subquery != nil && !lateralFlags[i]
@@ -606,7 +628,10 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			joinPreds[k] = pred
 		case j.On != nil:
-			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden, subRels: subRelsWithin(subRels, seg, k+1)}
+			// An ON clause cannot see the comma items to its left; a hint searches them
+			// (error-fields.md §11.8).
+			onHints := scopeHints{unseen: onClauseUnseen(tableRefs, rels, subRels, seg), onClause: true}
+			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden, subRels: subRelsWithin(subRels, seg, k+1), hints: onHints}
 			pred, perr := resolveBooleanFilter(partial, j.On, ptypes)
 			if perr != nil {
 				return nil, perr
@@ -662,7 +687,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				// `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md
 				// §5), so GROUP BY a json column is 42883. jsonb IS groupable.
 				if s.columnAt(gr.index).Type.IsJson() {
-					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
+					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
 				}
 				idx = gr.index
 				found := false
@@ -689,7 +714,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					}
 				}
 				if gr.ty.kind == rtJson {
-					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
+					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
 				}
 				// Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
 				pos := -1
@@ -824,7 +849,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	if sel.Distinct {
 		for _, t := range columnTypes {
 			if t.kind == rtJson {
-				return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
+				return nil, newError(UndefinedFunction, "could not identify an equality operator for type json").noHint()
 			}
 		}
 		// Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
@@ -994,7 +1019,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					return nil, rerr
 				}
 				if ty.kind == rtJson {
-					return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
+					return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
+						hinted(hintNoOrderingOperator)
 				}
 				var coll *Collation
 				if key.Collation != "" {
@@ -1015,7 +1041,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
 			// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
 			if s.columnOf(r).Type.IsJson() {
-				return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
+				return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
+					hinted(hintNoOrderingOperator)
 			}
 			idx := r.index
 			// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
@@ -1081,7 +1108,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// runs. PostgreSQL accepts it; it is a degenerate (constant) leading key.
 		// A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
 		if ty.kind == rtJson {
-			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
+			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
+				hinted(hintNoOrderingOperator)
 		}
 		// The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
 		// parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
@@ -1317,6 +1345,17 @@ func (db *engine) planAgain(ctes []*cteBinding, f func() error) error {
 		b.refs = refs[ci]
 	}
 	return err
+}
+
+// withUnseenFrame runs f with frame (when non-nil) recording the relations hidden from the body f
+// plans, for a hint (spec/design/error-fields.md §11.8).
+func (db *engine) withUnseenFrame(frame *unseenFrame, f func() error) error {
+	if frame == nil {
+		return f()
+	}
+	db.unseenFrames = append(db.unseenFrames, *frame)
+	defer func() { db.unseenFrames = db.unseenFrames[:len(db.unseenFrames)-1] }()
+	return f()
 }
 
 // withoutCteExpansion runs f with CTE reference expansion off (planner.md §3.4): the definition of a
@@ -1610,6 +1649,101 @@ func joinGroupOutputs(s *scope, projections *[]*rExpr, names *[]string, types *[
 		group.subRels = append(group.subRels, subRel{label: sr.label, table: sr.table, slots: slots})
 	}
 	return group
+}
+
+// isParenJoin reports whether FROM item tref is a parenthesized join (spec/design/grammar.md §15).
+func isParenJoin(tref *tableRef) bool {
+	return tref.Subquery != nil && tref.Subquery.Select != nil && tref.Subquery.Select.ParenJoin
+}
+
+// buildUnseenFrame is the relations to the left of FROM item i (i ≥ 1), which a non-LATERAL derived
+// table or parenthesized join there cannot see, as PostgreSQL's hint search sees them
+// (spec/design/error-fields.md §11.8). rels and subRels are the relations finalized so far. A
+// relation before i's join segment (a comma item) would be visible to a LATERAL item; one in the
+// segment would be unless the join to i is RIGHT or FULL, and then, past the segment's first join, it
+// is reachable only by its qualifier. An aliased parenthesized join hides its inner relations and is
+// itself a join, so it adds none; an unaliased one adds its inner relations.
+func buildUnseenFrame(tableRefs []tableRef, joins []joinClause, rels []scopeRel, subRels []subRel, i int, bodyParent *scope) *unseenFrame {
+	seg := i
+	if !joins[i-1].Comma {
+		seg = i - 1
+		for seg > 0 && !joins[seg-1].Comma {
+			seg--
+		}
+	}
+	segLateralOK := joins[i-1].Kind != joinRight && joins[i-1].Kind != joinFull
+	var out []unseenRel
+	for k := 0; k < i; k++ {
+		lateralOK := k < seg || segLateralOK
+		if isParenJoin(&tableRefs[k]) {
+			if tableRefs[k].Alias != nil {
+				continue
+			}
+			for _, sr := range subRels {
+				if sr.rel == k {
+					out = append(out, unseenRel{label: sr.label, columns: tableColumnNames(sr.table), lateralOK: lateralOK, qualifiedOnly: !lateralOK})
+				}
+			}
+			continue
+		}
+		r := &rels[k]
+		if r.label == "" {
+			continue
+		}
+		out = append(out, unseenRel{
+			label:         r.label,
+			columns:       tableColumnNames(r.table),
+			catalog:       relCatalogName(r),
+			lateralOK:     lateralOK,
+			qualifiedOnly: !lateralOK && i-seg >= 2,
+		})
+	}
+	return &unseenFrame{depth: scopeDepth(bodyParent), parenJoin: isParenJoin(&tableRefs[i]), rels: out}
+}
+
+// onClauseUnseen is the comma items to the left of an ON clause's join segment starting at FROM item
+// seg, which the clause cannot see (spec/design/error-fields.md §11.8). LATERAL cannot reach them.
+func onClauseUnseen(tableRefs []tableRef, rels []scopeRel, subRels []subRel, seg int) []unseenRel {
+	var out []unseenRel
+	for k := 0; k < seg; k++ {
+		if isParenJoin(&tableRefs[k]) {
+			if tableRefs[k].Alias == nil {
+				for _, sr := range subRels {
+					if sr.rel == k {
+						out = append(out, unseenRel{label: sr.label, columns: tableColumnNames(sr.table)})
+					}
+				}
+			}
+			continue
+		}
+		r := &rels[k]
+		if r.label == "" {
+			continue
+		}
+		out = append(out, unseenRel{label: r.label, columns: tableColumnNames(r.table), catalog: relCatalogName(r)})
+	}
+	return out
+}
+
+// tableColumnNames is a relation's column names in ordinal order.
+func tableColumnNames(t *catTable) []string {
+	out := make([]string, len(t.Columns))
+	for c, col := range t.Columns {
+		out[c] = col.Name
+	}
+	return out
+}
+
+// relCatalogName is the base table or view a FROM relation names (spec/design/error-fields.md §11.2),
+// else "".
+func relCatalogName(r *scopeRel) string {
+	switch {
+	case r.view != "":
+		return r.view
+	case r.base:
+		return r.table.Name
+	}
+	return ""
 }
 
 // parenJoinReachesLeft reports whether a parenthesized join's body holds an item that may reach the

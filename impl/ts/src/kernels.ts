@@ -18,6 +18,7 @@ import {
   widthBucketErr,
 } from "./executor.ts";
 import {
+  assignmentError,
   coerceStringToArray,
   overflow,
   rexprConstToValue,
@@ -193,7 +194,9 @@ export function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   const compR = rt.kind === "composite";
   if (compL && compR) {
     if (lt.fields.length !== rt.fields.length) {
-      throw typeError("cannot compare rows of different sizes");
+      // PostgreSQL's row comparison of unequal sizes is a different error (42601), with no operator
+      // hint (spec/design/error-fields.md §11.7).
+      throw typeError("cannot compare rows of different sizes").noHint();
     }
     for (let i = 0; i < lt.fields.length; i++) {
       classifyComparable(lt.fields[i]!.type, rt.fields[i]!.type);
@@ -438,7 +441,7 @@ export function resolveContainerAssign(
   // element recursively), matching the comparison rule (ranges.md §6 / array.md §5).
   if (!resolvedTypeEqual(type, colRT)) {
     throw positionedAt(
-      typeError(
+      assignmentError(
         `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
       ),
       exprLocation(e),
