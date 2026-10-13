@@ -333,15 +333,20 @@ GIN this release covers a focused surface (it grows from here):
 
 - **A `jsonb` column** — the `jsonb_ops` operator class above, for `@>`, `<@`, `?`, `?|`, and `?&`.
 
-- **Or one column, an array** of the integers (`i16[]`, `i32[]`, `i64[]`), `text[]`, `uuid[]`,
-  `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`, `interval[]`, or the binary floats
-  (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding. `numeric[]` and `bytea[]` are
-  rejected (`0A000`) for now, as is a multi-column GIN.
+- **Or one column, an array** of the integers (`i16[]`, `i32[]`, `i64[]`), `text[]`, `bytea[]`,
+  `numeric[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`, `interval[]`, or
+  the binary floats (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding. Arrays of
+  composite or `jsonb` elements are rejected (`0A000`) for now, as is a multi-column GIN.
 - **Text elements match byte for byte** — `'Red' = ANY(tags)` does not find `{red}`, under any
   collation, as with text `=`. A `text[]` column with a `COLLATE` clause indexes the same way. An
   element longer than 128 bytes is indexed by its first 128 bytes, so very long elements that share
   a prefix share an index entry; the recheck tells them apart, and a long element never makes its
   row unindexable.
+- **Numeric elements match by value** — `1.5`, `1.50`, and `1.500` are one term, so
+  `1.5 = ANY(prices)` finds a stored `{1.50}`. An integer works against a `numeric[]` column
+  (`2 = ANY(prices)` finds `{2.0}`), and a numeric against an integer array (`2.0 = ANY(ids)` finds
+  `{2}`, while `2.5` matches nothing). `bytea` elements match byte for byte. As with text, an element
+  whose key is longer than 128 bytes is indexed by its first 128 bytes and rechecked.
 - **Float elements match like float `=`** — `-0` and `0` are one term and every `NaN` is one term
   (PostgreSQL's float order: `-0 = 0`, `NaN = NaN`), so `0 = ANY(col)` finds a stored `{-0}` and
   `'NaN'::f64 = ANY(col)` finds a stored `{NaN}`. A query value of the other float width works too:

@@ -376,8 +376,8 @@ impl Engine {
                 // GIN needs an operator class for the column type (gin.md §3): `jsonb_ops` for a
                 // jsonb column (§2.1); `array_ops` for an array whose element is an admitted
                 // key-encodable type (is_gin_element_type — the integers, boolean, uuid, date,
-                // timestamp, timestamptz, f32, f64, interval, text), else 0A000. Any other type has
-                // no GIN operator class (42704).
+                // timestamp, timestamptz, f32, f64, interval, text, bytea, decimal), else 0A000. Any
+                // other type has no GIN operator class (42704).
                 if ty.is_jsonb() {
                     return Ok(());
                 }

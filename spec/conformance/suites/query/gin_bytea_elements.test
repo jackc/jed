@@ -1,0 +1,161 @@
+# GIN over bytea element arrays — a `USING gin` index, and every GIN-bounded scan it accelerates
+# (`@>`, `&&`, `= ANY`, array `=`, and the GIN-bounded UPDATE/DELETE), admit a `bytea[]` column
+# (spec/design/gin.md §3/§4.3). A term is the element's `bytea-terminated-escape` key (encoding.md
+# §2.6) over its first 128 raw bytes; an embedded 0x00 is escaped, so it never ends a term early.
+# Elements sharing their first 128 bytes share a term and the residual recheck separates them; the
+# `# cost:` lines pin that cut cross-core (CLAUDE.md §8).
+#
+# The rows and end state match PostgreSQL's bytea[] array_ops GIN (index presence never changes
+# results). query/gin_decimal_bytea_explain.test pins the plan.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_element_types, query.gin_bytea_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, func.array, expr.text_concat, types.bytea, types.text, types.i32, types.array, cast.operator, resource.cost_metering
+
+statement ok
+CREATE TABLE tb (id i32 PRIMARY KEY, b bytea[])
+
+statement ok
+CREATE INDEX tb_b_gin ON tb USING gin (b)
+
+statement ok
+INSERT INTO tb VALUES
+  (1, ARRAY['\x61'::bytea, '\x6162'::bytea]),
+  (2, ARRAY['\x61'::bytea]),
+  (3, ARRAY['\x00'::bytea, '\x0000'::bytea, '\x00'::bytea]),
+  (4, ARRAY['\x'::bytea, NULL]),
+  (5, '{}'),
+  (6, NULL),
+  (7, ARRAY['\x6100'::bytea, '\x610001'::bytea]),
+  (8, ARRAY['\xff'::bytea, '\x41'::bytea])
+
+statement ok
+INSERT INTO tb VALUES
+  (9, ARRAY[('\x' || repeat('6b', 128) || '31')::bytea]),
+  (10, ARRAY[('\x' || repeat('6b', 128) || '32')::bytea]),
+  (11, ARRAY[('\x' || repeat('6b', 127) || '7a')::bytea]),
+  (12, ARRAY[('\x' || repeat('00', 129))::bytea]),
+  (13, ARRAY[('\x' || repeat('00', 128) || '01')::bytea])
+
+query I nosort
+SELECT id FROM tb WHERE b @> ARRAY['\x61'::bytea] ORDER BY id
+----
+1
+2
+
+# cost: 10
+query I nosort
+SELECT id FROM tb WHERE b @> ARRAY['\x6162'::bytea, '\x61'::bytea] ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM tb WHERE b && ARRAY['\x0000'::bytea, '\xff'::bytea] ORDER BY id
+----
+3
+8
+
+# cost: 13
+query I nosort
+SELECT id FROM tb WHERE '\x61'::bytea = ANY(b) ORDER BY id
+----
+1
+2
+
+# bytea equality is byte identity: 0x41 is not 0x61
+query I nosort
+SELECT id FROM tb WHERE '\x41'::bytea = ANY(b) ORDER BY id
+----
+8
+
+# the empty bytea is a term like any other
+query I nosort
+SELECT id FROM tb WHERE '\x'::bytea = ANY(b) ORDER BY id
+----
+4
+
+# an embedded or trailing zero byte is part of the term, never its end
+query I nosort
+SELECT id FROM tb WHERE '\x6100'::bytea = ANY(b) ORDER BY id
+----
+7
+
+query I nosort
+SELECT id FROM tb WHERE '\x00'::bytea = ANY(b) ORDER BY id
+----
+3
+
+query I nosort
+SELECT id FROM tb WHERE b = ARRAY['\x61'::bytea] ORDER BY id
+----
+2
+
+# cost: 9
+query I nosort
+SELECT id FROM tb WHERE b = ARRAY['\x00'::bytea, '\x0000'::bytea, '\x00'::bytea] ORDER BY id
+----
+3
+
+query I nosort
+SELECT id FROM tb WHERE b @> ARRAY['\x61'::bytea, NULL] ORDER BY id
+----
+
+# rows 9 and 10 share their first 128 bytes, so one term gathers both and the recheck keeps row 9
+# cost: 536
+query I nosort
+SELECT id FROM tb WHERE ('\x' || repeat('6b', 128) || '31')::bytea = ANY(b) ORDER BY id
+----
+9
+
+# row 11 is exactly 128 bytes and differs from rows 9 and 10 in its last byte: its own term
+# cost: 267
+query I nosort
+SELECT id FROM tb WHERE ('\x' || repeat('6b', 127) || '7a')::bytea = ANY(b) ORDER BY id
+----
+11
+
+# 128 zero bytes escape to 256 bytes and share their term
+# cost: 536
+query I nosort
+SELECT id FROM tb WHERE ('\x' || repeat('00', 128) || '01')::bytea = ANY(b) ORDER BY id
+----
+13
+
+# ---- GIN-bounded mutations and maintenance ----------------------------------------------------
+
+statement ok
+UPDATE tb SET b = b || ARRAY['\x6e6577'::bytea] WHERE '\x61'::bytea = ANY(b)
+
+query I nosort
+SELECT id FROM tb WHERE b @> ARRAY['\x6e6577'::bytea, '\x61'::bytea] ORDER BY id
+----
+1
+2
+
+statement ok
+DELETE FROM tb WHERE b && ARRAY['\x00'::bytea, '\x41'::bytea]
+
+query I nosort
+SELECT id FROM tb WHERE b && ARRAY['\x61'::bytea, '\x'::bytea, '\x6100'::bytea] ORDER BY id
+----
+1
+2
+4
+7
+
+# the index built over existing rows
+statement ok
+DROP INDEX tb_b_gin
+
+# cost: 12
+statement ok
+CREATE INDEX tb_b_gin ON tb USING gin (b)
+
+query I nosort
+SELECT id FROM tb WHERE b @> ARRAY['\x6e6577'::bytea] ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM tb WHERE ('\x' || repeat('6b', 128) || '32')::bytea = ANY(b) ORDER BY id
+----
+10

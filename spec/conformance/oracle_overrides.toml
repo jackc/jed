@@ -1609,8 +1609,8 @@ reason = "jed: FORMAT JSON on a bytea PASSING value is a deferred 0A000 (json-sq
 # are the CREATE INDEX narrowings, reached through a retype.
 [[override]]
 file = "ddl/alter_column_type_index_gate.test"
-sql = "ALTER TABLE t ALTER COLUMN a TYPE decimal[]"
-reason = "jed: a GIN index over a decimal[] column is deferred 0A000 (gin.md §3/§10), so a retype that would need one is rejected as CREATE INDEX would be. PostgreSQL's array_ops GIN covers numeric[] and rebuilds the index."
+sql = "ALTER TABLE t ALTER COLUMN a TYPE jsonb[] USING NULL"
+reason = "jed: a GIN index over a jsonb[] column is deferred 0A000 (gin.md §3/§10), so a retype that would need one is rejected as CREATE INDEX would be. PostgreSQL's array_ops GIN covers jsonb[] and rebuilds the index."
 [[override]]
 file = "ddl/alter_column_type_index_gate.test"
 sql = "ALTER TABLE t ALTER COLUMN n TYPE json USING NULL"

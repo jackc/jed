@@ -1765,15 +1765,11 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 	isEmpty := false
 	if gb.strategy == ginMember {
 		// `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
-		// so the bound is provably empty (gin.md §6). c is in the element type's domain by resolution
-		// (jed coerces c to the element type, rejecting an out-of-range integer constant 22003 before
-		// exec); InRange is a defensive guard against silently truncating an out-of-range integer into
-		// a wrong term.
+		// so the bound is provably empty (gin.md §6). c may be a different numeric type than the
+		// elements (an integer against decimal[], a decimal against i32[]); ginQueryTerm converts it to
+		// the element type or reports that no element can equal it.
 		if qv.Kind == ValNull {
 			return nil, 0, 0, nil
-		}
-		if qv.Kind == ValInt && !gb.elemType.InRange(qv.Int) {
-			return nil, 0, 0, nil // out-of-range guard
 		}
 		t, ok := ginQueryTerm(gb.elemType, qv)
 		if !ok {
@@ -1960,10 +1956,27 @@ func (db *engine) ginJsonbBoundRows(store *tableStore, gb *ginBoundPlan, qv Valu
 // converted to the element width: an f32 value widens exactly; an f64 value narrows only when it is
 // exactly an f32 (or NaN — every NaN is one value, float.md §3), else no f32 element can equal it.
 // The float key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so term equality is exactly
-// SQL float =. Every other value takes the shared element term (ginElementTerm), which never
-// collates or fails.
+// SQL float =. Integer and decimal compare by value (2 = 2.0), so a value of one against elements of
+// the other is converted too (gin.md §2 Numeric terms): an integer becomes a decimal exactly; a
+// decimal becomes an integer only when it is integral and in the element's range, else no element can
+// equal it. An integer outside a narrower element's range equals no element either. Every other value
+// takes the shared element term (ginElementTerm), which never collates or fails.
 func ginQueryTerm(elem scalarType, v Value) ([]byte, bool) {
 	switch {
+	case elem == scalarDecimal && v.Kind == ValInt:
+		return ginElementTerm(elem, DecimalValue(decimalFromInt64(v.Int))), true
+	case elem.IsInteger() && v.Kind == ValDecimal:
+		d := *v.decimal()
+		if d.TruncToScale(0).CmpValue(d) != 0 {
+			return nil, false
+		}
+		n, ok := d.ToInt64Round()
+		if !ok || !elem.InRange(n) {
+			return nil, false
+		}
+		return ginElementTerm(elem, IntValue(n)), true
+	case elem.IsInteger() && v.Kind == ValInt && !elem.InRange(v.Int):
+		return nil, false
 	case elem == scalarFloat32 && v.Kind == ValFloat64:
 		x := v.F64()
 		narrowed := float32(x)

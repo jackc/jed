@@ -407,7 +407,8 @@ func rejectParamsForDDL(params []Value) error {
 //   - GIN needs an operator class: a jsonb column takes jsonb_ops (gin.md §2.1); any other non-array
 //     type has none (42704); an array takes array_ops only over an admitted key-encodable element
 //     type (isGinElementType, else 0A000) — the integers, boolean, uuid, date, timestamp,
-//     timestamptz, f32, f64, interval, text (the GIN term IS that element's key encoding, gin.md §4);
+//     timestamptz, f32, f64, interval, text, bytea, decimal (the GIN term IS that element's
+//     key encoding, gin.md §4);
 //   - GiST: range_ops over a range column, or the in-core btree_gist-equivalent scalar `=` opclass
 //     over a FIXED-WIDTH keyable scalar (integers / boolean / uuid / date / timestamp / timestamptz);
 //     a keyable-but-deferred scalar (text / bytea / decimal / interval) is 0A000, any other type

@@ -3235,10 +3235,13 @@ pub(crate) fn exclusion_pair_conflicts(
 /// `-0 → +0`, every NaN → one NaN), and an interval term the 16-byte `interval-span-i128` span key
 /// (encoding.md §2.10: `1 mon`, `30 days`, `720:00:00` share one key), so term equality is exactly
 /// SQL `=` for both. A text term is the `C` (byte) key of its first 128 bytes (§4.2) whatever the
-/// column's collation — every collation is deterministic, so text `=` is byte identity. `bytea` and
-/// `decimal` — though valid ordered-index / PK keys — are 0A000 here.
+/// column's collation — every collation is deterministic, so text `=` is byte identity. A bytea term
+/// is its key over its first 128 bytes, and a decimal term its value-based key (`1.5` and `1.50`
+/// share it) cut at 128 bytes (§4.3).
 pub(crate) fn is_gin_element_type(elem: &Type) -> bool {
     elem.is_text()
+        || elem.is_bytea()
+        || elem.is_decimal()
         || elem.is_integer()
         || elem.is_bool()
         || elem.is_uuid()
@@ -3318,15 +3321,23 @@ pub(crate) fn gin_entries(
 /// The `array_ops` term of one non-NULL element (gin.md §4): the element type's order-preserving key
 /// encoding. A text element keys its `C` (byte) form over its first [`GIN_MAX_TERM_BYTES`] bytes
 /// (§4.2) — never the column collation's sort key, since text `=` is byte identity under every
-/// collation — so the key encoding never collates and is infallible.
+/// collation — so the key encoding never collates and is infallible. A bytea element keys its first
+/// [`GIN_MAX_TERM_BYTES`] raw bytes the same way, and a decimal element keeps the first
+/// [`GIN_MAX_TERM_BYTES`] bytes of its value-based key (§4.3).
 ///
 /// [`GIN_MAX_TERM_BYTES`]: crate::encoding::GIN_MAX_TERM_BYTES
 pub(crate) fn gin_element_term(elem: ScalarType, v: &Value) -> Vec<u8> {
+    const MAX: usize = crate::encoding::GIN_MAX_TERM_BYTES;
     match v {
         Value::Text(s) => {
             let bytes = s.as_bytes();
-            let cut = bytes.len().min(crate::encoding::GIN_MAX_TERM_BYTES);
-            crate::encoding::encode_terminated(&bytes[..cut])
+            crate::encoding::encode_terminated(&bytes[..bytes.len().min(MAX)])
+        }
+        Value::Bytea(b) => crate::encoding::encode_terminated(&b[..b.len().min(MAX)]),
+        Value::Decimal(d) => {
+            let mut key = d.encode_key();
+            key.truncate(MAX);
+            key
         }
         _ => encode_key_value(elem, v, None)
             .expect("a GIN element key is infallible (no collation, a bounded width)"),

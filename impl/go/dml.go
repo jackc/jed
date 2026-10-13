@@ -451,10 +451,11 @@ func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b s
 // key (encoding.md §2.8: -0 → +0, every NaN → one NaN), and an interval term the 16-byte
 // interval-span-i128 span key (encoding.md §2.10: 1 mon, 30 days, 720:00:00 share one key), so term
 // equality is exactly SQL = for both. A text term is the C (byte) key of its first 128 bytes (§4.2)
-// whatever the column's collation — every collation is deterministic, so text = is byte identity.
-// bytea and decimal — valid ordered-index / PK keys — are 0A000 here.
+// whatever the column's collation — every collation is deterministic, so text = is byte identity. A
+// bytea term is its key over its first 128 bytes, and a decimal term its value-based key (1.5 and 1.50
+// share it) cut at 128 bytes (§4.3).
 func isGinElementType(elem scalarType) bool {
-	return elem.IsText() || elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
+	return elem.IsText() || elem.IsBytea() || elem.IsDecimal() || elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
 		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate() || elem.IsFloat() ||
 		elem.IsInterval()
 }
@@ -526,14 +527,23 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 // ginElementTerm is the array_ops term of one non-NULL element (gin.md §4): the element type's
 // order-preserving key encoding. A text element keys its C (byte) form over its first
 // ginMaxTermBytes bytes (§4.2) — never the column collation's sort key, since text = is byte
-// identity under every collation — so the key encoding never collates and is infallible.
+// identity under every collation — so the key encoding never collates and is infallible. A bytea
+// element keys its first ginMaxTermBytes raw bytes the same way, and a decimal element keeps the first
+// ginMaxTermBytes bytes of its value-based key (§4.3).
 func ginElementTerm(elem scalarType, v Value) []byte {
-	if v.Kind == ValText {
+	switch v.Kind {
+	case ValText, ValBytea:
 		b := []byte(v.str())
 		if len(b) > ginMaxTermBytes {
 			b = b[:ginMaxTermBytes]
 		}
 		return encodeTerminated(b)
+	case ValDecimal:
+		key := v.decimal().EncodeKey()
+		if len(key) > ginMaxTermBytes {
+			key = key[:ginMaxTermBytes]
+		}
+		return key
 	}
 	t, err := encodeKeyValue(elem, v, nil)
 	if err != nil {

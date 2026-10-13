@@ -1,0 +1,210 @@
+# GIN over decimal element arrays — a `USING gin` index, and every GIN-bounded scan it accelerates
+# (`@>`, `&&`, `= ANY`, array `=`, and the GIN-bounded UPDATE/DELETE), admit a `decimal[]` column
+# (spec/design/gin.md §3/§4.3). A term is the element's value-based `decimal-order-preserving` key
+# (encoding.md §2.5), so `1.5`, `1.50`, and `1.500` are one term, cut to its first 128 bytes. Keys
+# sharing their first 128 bytes (more than 244 significant digits) share a term and the residual
+# recheck separates them; the `# cost:` lines pin that cut cross-core (CLAUDE.md §8). An integer
+# compares with a decimal by value, so an integer against `decimal[]` and a decimal against an
+# integer array are converted to the element type before their term is taken (gin.md §2).
+#
+# The rows and end state match PostgreSQL's numeric[] array_ops GIN (index presence never changes
+# results). query/gin_decimal_bytea_explain.test pins the plan.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_element_types, query.gin_decimal_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.gin_index_nested_loop, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, query.join_inner, func.array_containment, func.array_quantified, func.array, expr.text_concat, types.decimal, types.text, types.i32, types.i64, types.array, cast.operator, resource.cost_metering
+
+statement ok
+CREATE TABLE td (id i32 PRIMARY KEY, d decimal[])
+
+statement ok
+CREATE INDEX td_d_gin ON td USING gin (d)
+
+statement ok
+INSERT INTO td VALUES
+  (1, '{1.5,2}'),
+  (2, '{1.50}'),
+  (3, '{-7,0.00,100}'),
+  (4, '{0,NULL}'),
+  (5, '{}'),
+  (6, NULL),
+  (7, '{2.000,2.0001,1e20}'),
+  (8, '{-1.5,0.001}')
+
+statement ok
+INSERT INTO td VALUES
+  (9, ARRAY[('0.' || repeat('1', 246) || '1')::decimal]),
+  (10, ARRAY[('0.' || repeat('1', 246) || '2')::decimal]),
+  (11, ARRAY[('0.' || repeat('1', 244) || '12')::decimal]),
+  (12, ARRAY[('-0.' || repeat('1', 246) || '1')::decimal]),
+  (13, ARRAY[('-0.' || repeat('1', 246) || '2')::decimal])
+
+# the display scale is not part of the term: 1.5, 1.50, and 1.500 are one value
+query I nosort
+SELECT id FROM td WHERE d @> '{1.500}'::decimal[] ORDER BY id
+----
+1
+2
+
+# cost: 9
+query I nosort
+SELECT id FROM td WHERE d @> '{2,1.5}'::decimal[] ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM td WHERE d && '{100,0.0010}'::decimal[] ORDER BY id
+----
+3
+8
+
+# zero at any scale is one term
+query I nosort
+SELECT id FROM td WHERE 0 = ANY(d) ORDER BY id
+----
+3
+4
+
+# cost: 14
+query I nosort
+SELECT id FROM td WHERE 2.0 = ANY(d) ORDER BY id
+----
+1
+7
+
+query I nosort
+SELECT id FROM td WHERE -1.50 = ANY(d) ORDER BY id
+----
+8
+
+query I nosort
+SELECT id FROM td WHERE 1e20 = ANY(d) ORDER BY id
+----
+7
+
+# an integer against decimal elements compares by value
+query I nosort
+SELECT id FROM td WHERE 2 = ANY(d) ORDER BY id
+----
+1
+7
+
+query I nosort
+SELECT id FROM td WHERE (-7)::i64 = ANY(d) ORDER BY id
+----
+3
+
+query I nosort
+SELECT id FROM td WHERE d = '{1.5}'::decimal[] ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM td WHERE d = '{2,2.0001,100000000000000000000.0}'::decimal[] ORDER BY id
+----
+7
+
+query I nosort
+SELECT id FROM td WHERE d @> '{0,NULL}'::decimal[] ORDER BY id
+----
+
+# rows 9 and 10 share their first 246 digits, so their keys share the first 128 bytes: one term
+# gathers both and the recheck keeps row 9
+# cost: 636
+query I nosort
+SELECT id FROM td WHERE ('0.' || repeat('1', 246) || '1')::decimal = ANY(d) ORDER BY id
+----
+9
+
+# row 11's key is 129 bytes and its 123rd digit pair differs from rows 9 and 10: its own term
+# cost: 317
+query I nosort
+SELECT id FROM td WHERE ('0.' || repeat('1', 244) || '12')::decimal = ANY(d) ORDER BY id
+----
+11
+
+# a negative key's body is complemented, and cuts the same way
+# cost: 636
+query I nosort
+SELECT id FROM td WHERE ('-0.' || repeat('1', 246) || '2')::decimal = ANY(d) ORDER BY id
+----
+13
+
+# ---- a decimal against an integer array: equal only when integral and in range ------------------
+
+statement ok
+CREATE TABLE ti (id i32 PRIMARY KEY, a i32[])
+
+statement ok
+CREATE INDEX ti_a_gin ON ti USING gin (a)
+
+statement ok
+INSERT INTO ti VALUES (1, '{2,3}'), (2, '{5}'), (3, '{-2147483648}')
+
+query I nosort
+SELECT id FROM ti WHERE 2.0 = ANY(a) ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM ti WHERE 5.000 = ANY(a) ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM ti WHERE 2.5 = ANY(a) ORDER BY id
+----
+
+query I nosort
+SELECT id FROM ti WHERE -2147483648.0 = ANY(a) ORDER BY id
+----
+3
+
+query I nosort
+SELECT id FROM ti WHERE 2147483648.0 = ANY(a) ORDER BY id
+----
+
+# an integer sibling column probes the decimal index
+query II rowsort
+SELECT ti.id, td.id FROM ti JOIN td ON ti.id = ANY(td.d)
+----
+2
+1
+2
+7
+
+# ---- GIN-bounded mutations and maintenance ----------------------------------------------------
+
+statement ok
+UPDATE td SET d = d || '{42}'::decimal[] WHERE 1.5 = ANY(d)
+
+query I nosort
+SELECT id FROM td WHERE d @> '{42.0,1.50}'::decimal[] ORDER BY id
+----
+1
+2
+
+statement ok
+DELETE FROM td WHERE d && '{-7,-1.5}'::decimal[]
+
+query I nosort
+SELECT id FROM td WHERE d && '{0,0.001,100}'::decimal[] ORDER BY id
+----
+4
+
+# the index built over existing rows
+statement ok
+DROP INDEX td_d_gin
+
+# cost: 12
+statement ok
+CREATE INDEX td_d_gin ON td USING gin (d)
+
+query I nosort
+SELECT id FROM td WHERE d @> '{42}'::decimal[] ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM td WHERE ('0.' || repeat('1', 246) || '2')::decimal = ANY(d) ORDER BY id
+----
+10

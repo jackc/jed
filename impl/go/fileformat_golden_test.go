@@ -449,6 +449,22 @@ func ginTextTableDB(t *testing.T) *Session {
 	return db
 }
 
+// ginDecimalByteaTableDB is the decimal / bytea GIN element golden (gin.md §4.3): 1.5 and 1.50 are
+// one decimal term, a duplicate bytea one entry, an embedded 0x00 and the empty bytea are terms, NULL
+// elements and empty / NULL arrays have none. An ordered index i_n sits beside them. Must match
+// verify.rb's GIN_DECIMAL_BYTEA_TABLE.
+func ginDecimalByteaTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d decimal[], b bytea[], n i32)")
+	run(t, db, "INSERT INTO t VALUES (1, '{1.5,2,1.50}', ARRAY['\\x61'::bytea, '\\x61'::bytea], 1), "+
+		"(2, '{-7,0.00,NULL}', ARRAY['\\x00ff'::bytea, '\\x'::bytea, NULL], 2), "+
+		"(3, '{}', '{}', 3), (4, NULL, NULL, 4), (5, '{100,1.5}', ARRAY['\\x0000'::bytea], 5)")
+	run(t, db, "CREATE INDEX i_n ON t (n)")
+	run(t, db, "CREATE INDEX i_d_gin ON t USING gin (d)")
+	run(t, db, "CREATE INDEX i_b_gin ON t USING gin (b)")
+	return db
+}
+
 // ginJsonbTableDB is the jsonb_ops GIN golden (gin.md §2.1/§4.1): keys at two levels, an array
 // string element (a KEY term) beside a member string value, every scalar kind, 1.5/1.50 as one number
 // term, a duplicate term, a top-level string, {}, a SQL NULL, and a negative number. Must match
@@ -1130,6 +1146,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gin_interval_table.jed", ginIntervalTableDB},
 		{"gin_jsonb_table.jed", ginJsonbTableDB},
 		{"gin_text_table.jed", ginTextTableDB},
+		{"gin_decimal_bytea_table.jed", ginDecimalByteaTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"composite_key_table.jed", compositeKeyTableDB},
@@ -1215,6 +1232,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gin_interval_table.jed", ginIntervalTableDB, "t"},
 		{"gin_jsonb_table.jed", ginJsonbTableDB, "t"},
 		{"gin_text_table.jed", ginTextTableDB, "t"},
+		{"gin_decimal_bytea_table.jed", ginDecimalByteaTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"composite_key_table.jed", compositeKeyTableDB, "t"},

@@ -308,6 +308,10 @@ var SupportedCapabilities = []string{
 	"query.gin_interval_elements",
 	// GIN over text[] — the C text key of each element's first 128 bytes as the term (gin.md §4.2).
 	"query.gin_text_elements",
+	// GIN over decimal[] / bytea[] — the value-based decimal key and the bytea key, each over its
+	// first 128 bytes, as the term (gin.md §4.3).
+	"query.gin_decimal_elements",
+	"query.gin_bytea_elements",
 	// GIN over a jsonb column — the jsonb_ops opclass: key/value terms (flag ‖ terminated body, cut at
 	// 128 bytes), accelerating @> / <@ / ? / ?| / ?& (gin.md §2.1/§4.1).
 	"query.gin_jsonb_ops",

@@ -32,12 +32,13 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   class is implied by the column type — there is no explicit opclass syntax and none is persisted.
   For an array, a single column whose element type is one of the integers (`i16[]` / `i32[]` /
   `i64[]`), `boolean[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, the binary floats
-  `f32[]` / `f64[]`, `interval[]`, or `text[]` — element types whose order-preserving key encoding
-  has landed ([encoding.md §2.1](encoding.md), [§2.4](encoding.md) for text, [§2.8](encoding.md)
-  for floats, [§2.10](encoding.md) for interval), the keys an ordered-index / `PRIMARY KEY` column
-  accepts. A multi-column GIN, and `decimal[]` / `bytea[]` / composite-element arrays, are `0A000`
-  this slice (§3, §10). A `json` column has no GIN operator
-  class (`42704`, as in PostgreSQL).
+  `f32[]` / `f64[]`, `interval[]`, `text[]`, `bytea[]`, or `decimal[]` — every scalar element type
+  whose order-preserving key encoding has landed ([encoding.md §2.1](encoding.md), [§2.4](encoding.md)
+  for text, [§2.5](encoding.md) for decimal, [§2.6](encoding.md) for bytea, [§2.8](encoding.md) for
+  floats, [§2.10](encoding.md) for interval), the keys an ordered-index / `PRIMARY KEY` column
+  accepts. A multi-column GIN, and arrays of composite, `jsonb`, or other non-scalar elements, are
+  `0A000` this slice (§3, §10). A `json` column has no GIN operator class (`42704`, as in
+  PostgreSQL).
 - **Accelerates `@>`, `&&`, `const = ANY(col)` membership, and array `=`.** A `WHERE`
   conjunct `col @> const` (contains), `col && const` (overlaps), `const = ANY(col)` (the
   array spelling of membership — semantically `col @> ARRAY[const]`), or `col = const`
@@ -131,6 +132,18 @@ contract are shared. Only term extraction and the accelerated operator shapes di
   interval, so there is no cross-type query value to convert. The interval key width (16) is not
   its value-codec width — the gather recovers each storage key by skipping the *term's* own length
   (§4), never a per-type value width.
+- **Numeric terms.** A decimal element's term is its value-based `decimal-order-preserving` key
+  ([encoding.md §2.5](encoding.md)), so `1.5`, `1.50`, and `1.500` are one term (§4.3), as
+  PostgreSQL's `numeric` equality makes them one value. An integer and a decimal compare by value
+  (`2 = 2.0`), and jed resolves `c = ANY(col)` with `c` an integer against a `decimal[]` column, or a
+  decimal against an integer array, without converting the operand. So the query value is converted
+  to the element type before its term is taken: an integer becomes the decimal of the same value
+  exactly; a decimal becomes an integer only when it is integral and within the element's range
+  (`2.0` → `2`), and otherwise equals no element, so `= ANY` is provably empty. An integer outside a
+  narrower integer element's range (`5000000000` against `i32[]` from a sibling column) likewise
+  equals no element. Only `= ANY` reaches this: array `@>`, `&&`, and `=` across integer and decimal
+  element types do not resolve (`42883` / `42804`), and floats do not compare with integers or
+  decimals at all.
 - `consistent` is **the residual operator itself** — see §6: this slice always re-applies
   the original `@>`/`&&` predicate to each candidate row as the residual `WHERE` filter
   (the standard bounded-scan contract — [indexes.md §5](indexes.md)), rather than trusting
@@ -205,11 +218,12 @@ like a type name.
      code, house-style message);
    - an array whose element type is **not admitted** is **0A000** this slice. The admitted
      element types are the integers (`i16`/`i32`/`i64`), `boolean`, `uuid`, `date`, `timestamp`,
-     `timestamptz`, `f32`, `f64`, `interval`, and `text` — keys a `PRIMARY KEY` / ordered-index key
-     column accepts ([indexes.md §1](indexes.md)), because a GIN term is that key encoding (§4,
-     §4.2). `decimal[]`, `bytea[]`, and composite-element arrays stay **0A000** (§10; PG *would*
-     build them, a documented divergence recorded in the oracle override ledger). A `text[]` column
-     with any collation is admitted; its terms do not depend on the collation (§4.2).
+     `timestamptz`, `f32`, `f64`, `interval`, `text`, `bytea`, and `decimal` — the scalar keys a
+     `PRIMARY KEY` / ordered-index key column accepts ([indexes.md §1](indexes.md)), because a GIN
+     term is that key encoding (§4, §4.2, §4.3). Arrays of composite, `jsonb`, and other non-scalar
+     elements stay **0A000** (§10; PG *would* build them, a documented divergence recorded in the
+     oracle override ledger). A `text[]` column with any collation is admitted; its terms do not
+     depend on the collation (§4.2).
 4. **`UNIQUE` with `USING gin`** is **0A000** (uniqueness is undefined for an inverted
    index — §1; PG raises `0A000` too: "access method gin does not support unique indexes").
 5. **More than one key column** with `USING gin` is **0A000** this slice (PG *would* build a
@@ -241,15 +255,16 @@ entry_key = encode_element(term) ‖ row_storage_key
 ```
 
 - For `array_ops`, `encode_element(term)` is the element type's order-preserving key encoding
-  ([encoding.md §2.1](encoding.md)) — fixed-width for every admitted element type but `text`, whose
-  terminated key self-delimits too (§4.2), so the term needs **no presence tag and no extra
-  framing** (a GIN term is never NULL — §2). It is the *same* per-type key encoder a `PRIMARY KEY` /
+  ([encoding.md §2.1](encoding.md)) — fixed-width for every admitted element type but `text`,
+  `bytea`, and `decimal`, whose keys self-delimit too, also after the 128-byte cut (§4.2, §4.3), so
+  the term needs **no presence tag and no extra framing** (a GIN term is never NULL — §2). It is the *same* per-type key encoder a `PRIMARY KEY` /
   ordered-index key column uses, so a `uuid[]` term is the 16 raw bytes, a `date[]` term the
   i32 sign-flipped day count, a `timestamp[]` term the i64 sign-flipped microseconds, an
   `f64[]`/`f32[]` term the canonicalized `float-order-preserving` bits (§2 *Float terms*), an
   `interval[]` term the 16-byte `interval-span-i128` span (§2 *Interval terms*) — each
   already byte-pinned by that type's key-encoding vectors and PK goldens; a `text[]` term is the
-  `C` text key of the element's first 128 bytes (§4.2).
+  `C` text key of the element's first 128 bytes (§4.2); a `bytea[]` term the bytea key of its first
+  128 bytes and a `decimal[]` term the first 128 bytes of its value-based key (§4.3).
 - The **row storage key** (the encoded PK, or the synthetic-rowid key) is the **suffix**,
   exactly as in an ordered index: it makes every entry unique, names the row, and — since
   every term self-delimits — is recovered by skipping the term. So all rows
@@ -318,6 +333,37 @@ term = text-terminated-escape(utf8(element)[0 .. min(n, 128)])
   separates them. PostgreSQL's `array_ops` stores whole elements and has no cut.
 - **Self-delimiting.** The `0x00 0x01` terminator never occurs inside an escaped body, so no term is
   a proper prefix of another; the posting list and storage-key suffix rules are the ones above.
+
+### 4.3 `bytea[]` and `decimal[]` element terms
+
+Both are variable-width keys cut, like text, so an entry always fits a node:
+
+```
+bytea term   = bytea-terminated-escape(element[0 .. min(n, 128)])
+decimal term = decimal-order-preserving(element)[0 .. min(k, 128)]
+```
+
+- **`bytea`** ([encoding.md §2.6](encoding.md)) is text's rule over raw bytes: the first 128 bytes of
+  the value, each `0x00` escaped to `0x00 0xFF`, then the `0x00 0x01` terminator. bytea `=` is byte
+  identity, so the term is exact up to the cut. An embedded or trailing `0x00` byte is part of the
+  term, never its end, and the empty value `\x` is a term (`00 01`). A term is at most `2·128 + 2`
+  bytes.
+- **`decimal`** ([encoding.md §2.5](encoding.md)) keeps the first 128 bytes of the element's whole
+  key, with no re-escaping. The key encodes the value, not the display scale, so `1.5`, `1.50`, and
+  `1.500` share a term and `0` at any scale is the one byte `04`. A key is 5 header bytes, one byte per
+  base-100 digit pair, and a terminator, so a value with up to 244 significant digits keeps its whole
+  key; a longer one keeps its first 123 pairs (246 digits) and loses its terminator. Values that agree
+  on sign, exponent, and those digits share the term, and the recheck separates them.
+- **Self-delimiting after the cut.** A bytea term ends in its terminator, as text's does. A decimal
+  term is either a whole key, which ends in its terminator (`00`, or `FF` for a negative), or exactly
+  128 bytes. A whole key cannot be a prefix of a cut one, because the cut key's byte at that position
+  is a digit pair, never the terminator (pairs are `01`–`64`, `9B`–`FE` complemented). A cut key
+  cannot be a prefix of a whole key, which is at most 128 bytes. So no term is a proper prefix of
+  another, and the posting-list and storage-key rules of §4 hold.
+- **No flag**, as for text: a cut term and a whole key with the same 128 bytes cannot both occur for
+  decimal (a whole key of exactly 128 bytes ends in its terminator), and for bytea the recheck
+  separates the 128-byte value from its longer extensions. PostgreSQL's `array_ops` stores whole
+  elements and has no cut.
 
 **Term extraction is a SET (dedup is mandatory, not an optimization).** A row
 `{1, 1, 2}` yields the terms `{1, 2}` — one entry each. Two `1` entries for one row would
@@ -547,7 +593,10 @@ zero-entry cases), beside one ordinary ordered index (`index_kind = 0`) in the s
 (the per-index kind byte). Byte-identical across Rust, Go, TS, and the Ruby reference (the §8
 cross-core round-trip). `fixtures/gin_uuid_table.jed`, `fixtures/gin_float_table.jed`, and
 `fixtures/gin_interval_table.jed` (and `fixtures/gin_text_table.jed` — empty, multibyte, duplicate, and NULL elements, §4.2; the cut form cannot fit the 256-byte page's
-record limit and is pinned cross-core by the `query/gin_text_elements.test` costs) pin the
+record limit and is pinned cross-core by the `query/gin_text_elements.test` costs; and
+`fixtures/gin_decimal_bytea_table.jed` — `1.5`/`1.50` as one decimal term, a zero at scale 2, an
+embedded `0x00`, the empty bytea, and a duplicate, §4.3, whose cut forms are pinned by the
+`query/gin_decimal_elements.test` and `query/gin_bytea_elements.test` costs) pin the
 non-integer element terms the same way — the float one
 the canonicalizing float key (§2 *Float terms*): `{1.5,-0,0}` stores three values but two entries,
 `{NaN,Infinity,NaN}` two; the interval one the span key (§2 *Interval terms*): `{1 mon,30
@@ -576,12 +625,13 @@ final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
 - **No system-catalog surface** — PG exposes GIN indexes via `pg_indexes` / `pg_am`; jed has
   none (auto-names are observable via `DROP INDEX`/collisions and the host catalog in
   per-core tests), as for the ordered index ([indexes.md §7](indexes.md)).
-- **Element-type subset** — PG's `array_ops` GIN indexes an array of any element type; jed
-  covers the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`,
-  `interval`, and `text` (§3); `decimal[]`, `bytea[]`, and composite elements are `0A000` until
-  their GIN slices land (PG builds, jed `0A000`), oracle-override-ledgered.
-- **`text[]` terms are cut at 128 bytes** (§4.2) — PG keeps the whole element. Lossy and rechecked;
-  unobservable in results.
+- **Element-type subset** — PG's `array_ops` GIN indexes an array of any element type with a
+  btree operator class; jed covers every scalar key type: the integers, `boolean`, `uuid`, `date`,
+  `timestamp`, `timestamptz`, `f32`, `f64`, `interval`, `text`, `bytea`, and `decimal` (§3).
+  Arrays of composite, `jsonb`, and other non-scalar elements are `0A000` (PG builds, jed `0A000`),
+  oracle-override-ledgered.
+- **`text[]`, `bytea[]`, and `decimal[]` terms are cut at 128 bytes** (§4.2, §4.3) — PG keeps the
+  whole element. Lossy and rechecked; unobservable in results.
 - **Single-column only** — PG supports multicolumn GIN; jed is `0A000` this slice (§3).
 - **`<@` / `IN` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a broad scan +
   recheck); jed runs `<@` and `IN`-over-a-scalar-list by full scan this slice (a cost/plan
@@ -633,9 +683,11 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   term is their existing key encoding, so the inverted core was unchanged — only the DDL gate
   and the per-element encoder generalized. The binary floats `f32[]`/`f64[]` have landed the same
   way, plus the cross-width query-value conversion (§2 *Float terms*), and `interval[]` over its
-  span key (§2 *Interval terms*), and `text[]` over its cut `C` key (§4.2). `decimal[]` and
-  `bytea[]` remain `0A000`: both have self-delimiting keys ([encoding.md §2.5/§2.6](encoding.md)),
-  so each needs only the element-term cut rule §4.2 applies to text. Composite-element arrays too.
+  span key (§2 *Interval terms*), `text[]` over its cut `C` key (§4.2), and `bytea[]` and
+  `decimal[]` over their cut keys (§4.3), with integer↔decimal query-value conversion (§2 *Numeric
+  terms*). Every scalar key type is now admitted. Arrays of composite or `jsonb` elements remain
+  `0A000`: each needs a term rule for a non-scalar value (a composite key exists,
+  [encoding.md §2.15](encoding.md); `jsonb` has none).
 - **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
   scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
 - **Multi-column GIN** and general correlated / expression / same-or-later-relation query operands.

@@ -590,13 +590,11 @@ fn array_query_terms(strategy: GinStrategy, elem: ScalarType, qv: &Value) -> Gin
     let mut is_empty = false;
     if strategy == GinStrategy::Member {
         // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL `c` can equal no
-        // element, so the bound is provably empty (gin.md §6). `c` is in the element type's
-        // domain by resolution (jed coerces `c` to the element type, rejecting an out-of-range
-        // integer constant 22003 before exec); the integer range check is a defensive guard
-        // against silently truncating an out-of-range value into a wrong term.
+        // element, so the bound is provably empty (gin.md §6). `c` may be a different numeric
+        // type than the elements (an integer against `decimal[]`, a decimal against `i32[]`);
+        // gin_query_term converts it to the element type or reports that no element can equal it.
         match qv {
             Value::Null => return GinQuery::Empty,
-            Value::Int(n) if *n < elem.min() || *n > elem.max() => return GinQuery::Empty,
             v => match gin_query_term(elem, v) {
                 Some(term) => terms.push(term),
                 None => return GinQuery::Empty,
@@ -693,8 +691,12 @@ fn jsonb_query_terms(strategy: GinStrategy, qv: &Value) -> GinQuery {
 /// converted to the element width: an `f32` value widens exactly; an `f64` value narrows only when
 /// it is exactly an `f32` (or NaN — every NaN is one value, float.md §3), else no `f32` element can
 /// equal it. The float key canonicalizes `-0 → +0` and every NaN (encoding.md §2.8), so term
-/// equality is exactly SQL float `=`. Every other value takes the shared element term
-/// ([`gin_element_term`]), which never collates or fails.
+/// equality is exactly SQL float `=`. Integer and decimal compare by value (`2 = 2.0`), so a
+/// value of one against elements of the other is converted too (gin.md §2 *Numeric terms*): an
+/// integer becomes a decimal exactly; a decimal becomes an integer only when it is integral and in
+/// the element's range, else no element can equal it. An integer outside a narrower element's range
+/// equals no element either. Every other value takes the shared element term ([`gin_element_term`]),
+/// which never collates or fails.
 fn gin_query_term(elem: ScalarType, v: &Value) -> Option<Vec<u8>> {
     match (elem, v) {
         (ScalarType::Float32, Value::Float64(x)) => {
@@ -702,6 +704,16 @@ fn gin_query_term(elem: ScalarType, v: &Value) -> Option<Vec<u8>> {
             (x.is_nan() || f64::from(narrowed) == *x).then(|| encode_f32_key(narrowed))
         }
         (ScalarType::Float64, Value::Float32(x)) => Some(encode_f64_key(f64::from(*x))),
+        (ScalarType::Decimal, Value::Int(n)) => Some(gin_element_term(
+            elem,
+            &Value::Decimal(Decimal::from_i64(*n)),
+        )),
+        (_, Value::Decimal(d)) if elem.is_integer() => {
+            let integral = d.trunc_to_scale(0).cmp_value(d) == std::cmp::Ordering::Equal;
+            let n = d.to_i64_round().filter(|_| integral)?;
+            (n >= elem.min() && n <= elem.max()).then(|| gin_element_term(elem, &Value::Int(n)))
+        }
+        (_, Value::Int(n)) if elem.is_integer() && (*n < elem.min() || *n > elem.max()) => None,
         _ => Some(gin_element_term(elem, v)),
     }
 }

@@ -4,7 +4,7 @@
 # under the new type and fails the same way (42704 "has no default operator class"). A rejected ALTER
 # changes nothing: the index still serves its queries afterwards.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, ddl.alter_table, query.gin_jsonb_ops, dml.insert, query.select, query.order_by, expr.arithmetic, types.i32, types.text, types.json, types.jsonb, types.i64, types.decimal, types.array, types.range, func.jsonb_contains, func.array_containment, cast.operator
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, ddl.alter_table, query.gin_jsonb_ops, dml.insert, query.select, query.order_by, expr.arithmetic, types.i32, types.text, types.json, types.jsonb, types.i64, types.array, types.range, func.jsonb_contains, func.array_containment, cast.operator
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32[], d jsonb, r int4range, n i32)
@@ -59,11 +59,11 @@ SELECT id FROM t WHERE d ? 'k' ORDER BY id
 1
 2
 
-# --- jed narrowings, kept LAST (PG accepts both: a numeric[] GIN and a json-free btree retype) ----
+# --- jed narrowings, kept LAST (PG accepts both: a jsonb[] GIN and a json-free btree retype) ------
 
 # a deferred GIN element type is 0A000, as at CREATE INDEX
 statement error 0A000
-ALTER TABLE t ALTER COLUMN a TYPE decimal[]
+ALTER TABLE t ALTER COLUMN a TYPE jsonb[] USING NULL
 
 statement ok
 CREATE INDEX t_n ON t (n)

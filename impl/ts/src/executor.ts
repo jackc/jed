@@ -2846,9 +2846,9 @@ export class Engine {
   // keys a retyped column (alter.md §3.3):
   //   - gin: a `jsonb` column takes jsonb_ops; an array of an admitted key-encodable element takes
   //     array_ops (the GIN term IS that element's key encoding — the integers, boolean, uuid, date,
-  //     timestamp, timestamptz, f32, f64, interval, text; isGinElementType); any other array (bytea,
-  //     decimal, …) is 0A000; any other type
-  //     (including `json`) has no GIN operator class — 42704.
+  //     timestamp, timestamptz, f32, f64, interval, text, bytea, decimal; isGinElementType); any
+  //     other array (jsonb, composite, …) is 0A000; any other type (including `json`) has no GIN
+  //     operator class — 42704.
   //   - gist: range_ops over a range column, or the in-core btree_gist-equivalent scalar `=` opclass
   //     over a fixed-width keyable scalar; a keyable-but-deferred scalar (text / bytea / decimal /
   //     interval) is 0A000; any other type has no GiST opclass — 42704 (PG's wording).
@@ -9945,13 +9945,10 @@ export class Engine {
       }
     } else if (gb.strategy === "member") {
       // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
-      // so the bound is provably empty (gin.md §6). c is in the element type's domain by resolution
-      // (jed coerces c to the element type, rejecting an out-of-range integer constant 22003 before
-      // exec); inRange is a defensive guard against silently truncating an out-of-range integer into
-      // a wrong term.
+      // so the bound is provably empty (gin.md §6). c may be a different numeric type than the
+      // elements (an integer against decimal[], a decimal against i32[]); ginQueryTerm converts it to
+      // the element type or reports that no element can equal it.
       if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
-      if (qv.kind === "int" && !inRange(gb.elemType, qv.int))
-        return { entries: [], pages: 0, slabs: 0 };
       const t = ginQueryTerm(gb.elemType, qv);
       if (t === null) return { entries: [], pages: 0, slabs: 0 }; // c equals no element of the type
       terms.push(t);
@@ -25237,11 +25234,14 @@ export function exclusionPairConflicts(
 // key (encoding.md §2.8: -0 → +0, every NaN → one NaN), and an interval term the 16-byte
 // interval-span-i128 span key (encoding.md §2.10: 1 mon, 30 days, 720:00:00 share one key), so term
 // equality is exactly SQL = for both. A text term is the C (byte) key of its first 128 bytes (§4.2)
-// whatever the column's collation — every collation is deterministic, so text = is byte identity.
-// bytea and decimal — valid ordered-index / PK keys — are 0A000 here.
+// whatever the column's collation — every collation is deterministic, so text = is byte identity. A
+// bytea term is its key over its first 128 bytes, and a decimal term its value-based key (1.5 and 1.50
+// share it) cut at 128 bytes (§4.3).
 export function isGinElementType(elem: Type): boolean {
   return (
     typeIsText(elem) ||
+    typeIsBytea(elem) ||
+    typeIsDecimal(elem) ||
     typeIsInteger(elem) ||
     typeIsBoolean(elem) ||
     typeIsUuid(elem) ||
@@ -25260,7 +25260,11 @@ export function isGinElementType(elem: Type): boolean {
 // converted to the element width: an f32 value widens exactly; an f64 value narrows only when it is
 // exactly an f32 (or NaN — every NaN is one value, float.md §3), else no f32 element can equal it.
 // The float key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so term equality is exactly
-// SQL float =. Every other value takes the shared element term (ginElementTerm), which never collates.
+// SQL float =. Integer and decimal compare by value (2 = 2.0), so a value of one against elements of
+// the other is converted too (gin.md §2 Numeric terms): an integer becomes a decimal exactly; a
+// decimal becomes an integer only when it is integral and in the element's range, else no element can
+// equal it. An integer outside a narrower element's range equals no element either. Every other value
+// takes the shared element term (ginElementTerm), which never collates.
 function ginQueryTerm(elem: ScalarType, v: Value): Uint8Array | null {
   if (elem === "f32" && v.kind === "f64") {
     const narrowed = Math.fround(v.value);
@@ -25268,6 +25272,15 @@ function ginQueryTerm(elem: ScalarType, v: Value): Uint8Array | null {
     return encodeFloat32Key(narrowed);
   }
   if (elem === "f64" && v.kind === "f32") return encodeFloat64Key(v.value);
+  if (elem === "decimal" && v.kind === "int")
+    return ginElementTerm(elem, { kind: "decimal", dec: Decimal.fromBigInt(v.int) });
+  if (isInteger(elem) && v.kind === "decimal") {
+    if (v.dec.truncToScale(0).cmpValue(v.dec) !== 0) return null;
+    const n = v.dec.toBigIntRound();
+    if (n === null || !inRange(elem, n)) return null;
+    return ginElementTerm(elem, { kind: "int", int: n });
+  }
+  if (isInteger(elem) && v.kind === "int" && !inRange(elem, v.int)) return null;
   return ginElementTerm(elem, v);
 }
 
@@ -25275,13 +25288,19 @@ function ginQueryTerm(elem: ScalarType, v: Value): Uint8Array | null {
 // order-preserving key encoding. A text element keys its C (byte) form over its first
 // GIN_MAX_TERM_BYTES UTF-8 bytes (§4.2) — the cut is over the TextEncoder bytes, never UTF-16 code
 // units, and may split a character — never the column collation's sort key, since text = is byte
-// identity under every collation. So the key encoding never collates.
+// identity under every collation. So the key encoding never collates. A bytea element keys its first
+// GIN_MAX_TERM_BYTES raw bytes the same way, and a decimal element keeps the first GIN_MAX_TERM_BYTES
+// bytes of its value-based key (§4.3).
 export function ginElementTerm(elem: ScalarType, v: Value): Uint8Array {
-  if (v.kind === "text") {
-    const bytes = SQL_BYTE_ENCODER.encode(v.text);
+  if (v.kind === "text" || v.kind === "bytea") {
+    const bytes = v.kind === "text" ? SQL_BYTE_ENCODER.encode(v.text) : v.bytes;
     return encodeTerminated(
       bytes.length > GIN_MAX_TERM_BYTES ? bytes.subarray(0, GIN_MAX_TERM_BYTES) : bytes,
     );
+  }
+  if (v.kind === "decimal") {
+    const key = v.dec.encodeKey();
+    return key.length > GIN_MAX_TERM_BYTES ? key.subarray(0, GIN_MAX_TERM_BYTES) : key;
   }
   return encodeKeyValue(elem, v, null);
 }

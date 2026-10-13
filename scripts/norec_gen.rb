@@ -167,6 +167,13 @@
 #              C text key cut at 128 bytes (long elements sharing a prefix share a term); the
 #              equivalent `Q <@ tags` / `ARRAY[k] <@ tags` are NOT GIN-accelerated (full scan). Both
 #              must return the by-construction rows of byte-exact text equality.
+#   gin_dec  — GIN over decimal[] (gin.md §4.3): `d @> Q` / `c = ANY(d)` gather through each element's
+#              value-based key cut at 128 bytes (1.5 and 1.50 one term; an integer `c` converted to
+#              decimal); the equivalent `Q <@ d` / `ARRAY[c] <@ d` are NOT GIN-accelerated (full scan).
+#              Both must return the by-construction rows of numeric equality.
+#   gin_bytea — GIN over bytea[] (gin.md §4.3): the same pair over each element's bytea key cut at 128
+#              bytes (embedded 0x00 bytes, the empty value, long values sharing a prefix). Both must
+#              return the by-construction rows of byte-exact equality.
 #   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
 #              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
@@ -399,6 +406,14 @@ GIN_TEXT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan 
                   query.gin_element_types query.gin_text_elements dml.insert dml.insert_multi_row
                   query.select query.order_by types.i32 types.text types.array func.array
                   func.array_containment func.array_quantified cast.operator].freeze
+GIN_DEC_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_any_eq
+                 query.gin_element_types query.gin_decimal_elements dml.insert dml.insert_multi_row
+                 query.select query.order_by types.i32 types.decimal types.array func.array
+                 func.array_containment func.array_quantified cast.operator].freeze
+GIN_BYTEA_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_any_eq
+                   query.gin_element_types query.gin_bytea_elements dml.insert dml.insert_multi_row
+                   query.select query.order_by types.i32 types.bytea types.array func.array
+                   func.array_containment func.array_quantified cast.operator].freeze
 GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
               dml.insert_multi_row query.select query.order_by types.i32 types.range
               func.range_constructors func.range_operators].freeze
@@ -2050,6 +2065,94 @@ def gen_gin_text(seed)
   q(out, "I", "SELECT id FROM t WHERE tags @> #{arr.call(pair)} ORDER BY id", contains.call(pair))
   out << "# full scan — MUST match"
   q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair)} <@ tags ORDER BY id", contains.call(pair))
+  out.join("\n") + "\n"
+end
+
+# A decimal element's GIN term is its value-based key over the first 128 bytes (spec/design/gin.md
+# §4.3), so the vocabulary mixes one value at several display scales, zero, negatives, an integer-valued
+# decimal, and long fractions sharing their first 246 digits (one term, separated by the recheck).
+# Expected rows: containment under numeric equality (Rational), known by construction.
+GIN_DEC_WORDS = ["1.5", "1.50", "1.500", "2", "2.0", "-7", "0", "0.00", "100", "0.001", "-1.5",
+                 "0.#{'1' * 246}1", "0.#{'1' * 246}2", "0.#{'1' * 244}12"].freeze
+
+def gen_gin_decimal(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(14, random: rng).sort
+  null_id = ids.sample(random: rng)
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { rng.rand(8).zero? ? nil : GIN_DEC_WORDS.sample(random: rng) }]
+  end
+  # a '{…}' literal: ARRAY[2, 1.5] would not unify its integer and decimal elements (grammar.md §25)
+  arr = ->(ws) { "'{#{ws.map { |w| w.nil? ? 'NULL' : w }.join(',')}}'::decimal[]" }
+  has = ->(t, w) { t.any? { |e| !e.nil? && Rational(e) == Rational(w) } }
+  contains = ->(q) { rows.select { |_id, t| !t.nil? && q.all? { |w| has.call(t, w) } }.map { |id, _| id.to_s } }
+
+  out = header(seed, GIN_DEC_REQ, "GIN over decimal[] (@> / = ANY via the GIN index vs <@ full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, d decimal[])")
+  stmt(out, "CREATE INDEX t_d_gin ON t USING gin (d)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{t.nil? ? 'NULL' : arr.call(t)})" }.join(', ')}")
+
+  present = rows.filter_map { |_id, t| t }.flatten.compact
+  words = [present.sample(random: rng) || "1.5", GIN_DEC_WORDS.sample(random: rng), GIN_DEC_WORDS[11]]
+  words.each do |w|
+    out << "# = ANY #{w[0, 20]}"
+    q(out, "I", "SELECT id FROM t WHERE #{w} = ANY(d) ORDER BY id", contains.call([w]))
+    out << "# full scan (ARRAY[c] <@ col is the same predicate, not GIN-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE #{arr.call([w])} <@ d ORDER BY id", contains.call([w]))
+  end
+  # an integer against decimal elements compares by value
+  n = [2, -7, 0, 100, 3].sample(random: rng)
+  out << "# integer = ANY #{n}"
+  q(out, "I", "SELECT id FROM t WHERE #{n} = ANY(d) ORDER BY id", contains.call([n.to_s]))
+  q(out, "I", "SELECT id FROM t WHERE #{arr.call([n.to_s])} <@ d ORDER BY id", contains.call([n.to_s]))
+  pair = [present.sample(random: rng) || "1.5", present.sample(random: rng) || "2"]
+  out << "# @> #{pair.map { |w| w[0, 12] }.inspect}"
+  q(out, "I", "SELECT id FROM t WHERE d @> #{arr.call(pair)} ORDER BY id", contains.call(pair))
+  out << "# full scan — MUST match"
+  q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair)} <@ d ORDER BY id", contains.call(pair))
+  out.join("\n") + "\n"
+end
+
+# A bytea element's GIN term is its key over the first 128 raw bytes (spec/design/gin.md §4.3), so the
+# vocabulary (hex) mixes a case pair, the empty value, embedded and trailing 0x00 bytes, and long
+# values sharing their first 128 bytes (one term, separated by the recheck). Expected rows: byte-exact
+# containment, known by construction.
+GIN_BYTEA_WORDS = ["61", "41", "", "00", "0000", "6100", "610001", "ff", "6b" * 128 + "31",
+                   "6b" * 128 + "32", "6b" * 127 + "7a", "00" * 129, "00" * 128 + "01"].freeze
+
+def gen_gin_bytea(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(14, random: rng).sort
+  null_id = ids.sample(random: rng)
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { rng.rand(8).zero? ? nil : GIN_BYTEA_WORDS.sample(random: rng) }]
+  end
+  lit = ->(w) { w.nil? ? "NULL" : "'\\x#{w}'::bytea" }
+  arr = ->(ws) { ws.empty? ? "'{}'::bytea[]" : "ARRAY[#{ws.map(&lit).join(', ')}]" }
+  contains = ->(q) { rows.select { |_id, t| !t.nil? && q.all? { |w| t.include?(w) } }.map { |id, _| id.to_s } }
+
+  out = header(seed, GIN_BYTEA_REQ, "GIN over bytea[] (@> / = ANY via the GIN index vs <@ full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, b bytea[])")
+  stmt(out, "CREATE INDEX t_b_gin ON t USING gin (b)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{t.nil? ? 'NULL' : arr.call(t)})" }.join(', ')}")
+
+  present = rows.filter_map { |_id, t| t }.flatten.compact
+  words = [present.sample(random: rng) || "61", GIN_BYTEA_WORDS.sample(random: rng), GIN_BYTEA_WORDS[8]]
+  words.each do |w|
+    out << "# = ANY #{w[0, 20].inspect}"
+    q(out, "I", "SELECT id FROM t WHERE #{lit.call(w)} = ANY(b) ORDER BY id", contains.call([w]))
+    out << "# full scan (ARRAY[k] <@ col is the same predicate, not GIN-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE #{arr.call([w])} <@ b ORDER BY id", contains.call([w]))
+  end
+  pair = [present.sample(random: rng) || "61", present.sample(random: rng) || "00"]
+  out << "# @> #{pair.map { |w| w[0, 12] }.inspect}"
+  q(out, "I", "SELECT id FROM t WHERE b @> #{arr.call(pair)} ORDER BY id", contains.call(pair))
+  out << "# full scan — MUST match"
+  q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair)} <@ b ORDER BY id", contains.call(pair))
   out.join("\n") + "\n"
 end
 
@@ -4159,6 +4262,8 @@ SCENARIOS = {
   "gin_jsonb" => method(:gen_gin_jsonb),
   "gin_skip" => method(:gen_gin_skip),
   "gin_text" => method(:gen_gin_text),
+  "gin_dec" => method(:gen_gin_decimal),
+  "gin_bytea" => method(:gen_gin_bytea),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),
   "tlp" => method(:gen_tlp),

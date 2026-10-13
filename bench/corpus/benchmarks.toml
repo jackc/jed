@@ -1565,6 +1565,56 @@ gen = "int_uniform"
 min = 0
 max = 96
 
+# GIN over decimal[] and bytea[] (spec/design/gin.md §4.3; query.gin_decimal_elements,
+# query.gin_bytea_elements). 100k-row scratch tables behind an array GIN index, each row holding a
+# term shared by every row, one of 97 values (~1031 rows each), and one of 1000 (100 rows each). The
+# decimal query asks for 0.005 where the rows store 0.0050: a term is the value, not the display scale.
+# Before these slices jed rejected the index (0A000) and both queries full-scanned. PostgreSQL's
+# numeric[] / bytea[] array_ops GIN answers the same rows.
+[[bench]]
+name = "gin_decimal_contains"
+description = "GIN decimal[] @>: rows whose prices contain 0.005 and $1 * 0.01 — a common term (stored as 0.0050) intersected with a 100-row term over a 100k-row decimal[] column"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM tprices WHERE prices @> ARRAY[0.005, $1::bigint * 0.01] ORDER BY id"
+warmup = 200
+iterations = 2000
+seed = 4294
+setup_sql = [
+  "DROP TABLE IF EXISTS tprices",
+  "CREATE TABLE tprices (id bigint PRIMARY KEY, prices decimal[])",
+  "INSERT INTO tprices SELECT g, ARRAY[0.0050, (g % 97) + 100.25, (g % 1000) * 0.01] FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tprices_prices_gin ON tprices USING gin (prices)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 999
+
+[[bench]]
+name = "gin_bytea_contains"
+description = "GIN bytea[] @>: rows whose blobs contain \\x00 and 'u<$1>' — a common term intersected with a 100-row term over a 100k-row bytea[] column"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM tblobs WHERE blobs @> ARRAY['\\x00'::bytea, ('u' || ($1::bigint)::text)::bytea] ORDER BY id"
+warmup = 200
+iterations = 2000
+seed = 4295
+setup_sql = [
+  "DROP TABLE IF EXISTS tblobs",
+  "CREATE TABLE tblobs (id bigint PRIMARY KEY, blobs bytea[])",
+  "INSERT INTO tblobs SELECT g, ARRAY['\\x00'::bytea, ('t' || (g % 97)::text)::bytea, ('u' || (g % 1000)::text)::bytea] FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tblobs_blobs_gin ON tblobs USING gin (blobs)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 999
+
 # GIN jsonb_ops (spec/design/gin.md §2.1; query.gin_jsonb_ops). A 100k-row scratch table of small
 # documents behind a jsonb GIN index: `n` takes 1000 values (100 rows each) and the `tag<g % 97>`
 # key 97 values (~1031 rows each). `doc @> {"n": $1}` gathers the posting list of one number term

@@ -483,6 +483,25 @@ function ginTextTableDB(): Engine {
   return db;
 }
 
+// ginDecimalByteaTableDB has GIN indexes over a decimal[] and a bytea[] column (the decimal / bytea
+// GIN element golden, spec/design/gin.md §4.3): 1.5 and 1.50 are one decimal term, a duplicate bytea
+// one entry, an embedded 0x00 and the empty bytea are terms, NULL elements and empty / NULL arrays have
+// none. An ordered index i_n sits beside them.
+function ginDecimalByteaTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d decimal[], b bytea[], n i32)");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, '{1.5,2,1.50}', ARRAY['\\x61'::bytea, '\\x61'::bytea], 1), " +
+      "(2, '{-7,0.00,NULL}', ARRAY['\\x00ff'::bytea, '\\x'::bytea, NULL], 2), " +
+      "(3, '{}', '{}', 3), (4, NULL, NULL, 4), (5, '{100,1.5}', ARRAY['\\x0000'::bytea], 5)",
+  );
+  run(db, "CREATE INDEX i_n ON t (n)");
+  run(db, "CREATE INDEX i_d_gin ON t USING gin (d)");
+  run(db, "CREATE INDEX i_b_gin ON t USING gin (b)");
+  return db;
+}
+
 // ginJsonbTableDB has a GIN index over a jsonb column (kind 1, the jsonb_ops opclass — spec/design/
 // gin.md §2.1/§4.1): keys at two levels, an array string element (a KEY term) beside a member string
 // value (a STRING term), 1.5/1.50 as ONE number term, a top-level string, `{}` and a SQL NULL (no
@@ -1175,6 +1194,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "gin_interval_table.jed", build: ginIntervalTableDB },
     { name: "gin_jsonb_table.jed", build: ginJsonbTableDB },
     { name: "gin_text_table.jed", build: ginTextTableDB },
+    { name: "gin_decimal_bytea_table.jed", build: ginDecimalByteaTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "composite_key_table.jed", build: compositeKeyTableDB },
@@ -1258,6 +1278,7 @@ test("read goldens reproduces rows", () => {
     { name: "gin_interval_table.jed", build: ginIntervalTableDB, table: "t" },
     { name: "gin_jsonb_table.jed", build: ginJsonbTableDB, table: "t" },
     { name: "gin_text_table.jed", build: ginTextTableDB, table: "t" },
+    { name: "gin_decimal_bytea_table.jed", build: ginDecimalByteaTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "composite_key_table.jed", build: compositeKeyTableDB, table: "t" },

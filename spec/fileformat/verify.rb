@@ -1119,6 +1119,35 @@ GIN_TEXT_TABLE = {
          [5, ["a b", "red"], 5]]
 }.freeze
 
+# GIN indexes over a decimal[] and a bytea[] column (the decimal / bytea GIN element golden,
+# spec/design/gin.md §4.3): a decimal term is the element's value-based decimal-order-preserving key,
+# a bytea term its bytea-terminated-escape key. Row 1 holds 1.5 and 1.50 (ONE entry; the stored values
+# keep their scales) and a duplicate bytea (one entry); row 2 a negative, a zero at scale 2, an embedded
+# 0x00 byte, the empty bytea, and NULL elements (no term); rows 3/4 empty and NULL whole-value arrays
+# (no entries); row 5 shares row 1's 1.5 and has a bytea of two zero bytes. The over-128-byte cut cannot
+# fit this page's record limit; the query/gin_decimal_elements.test and query/gin_bytea_elements.test
+# costs pin it cross-core. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, d decimal[], b bytea[], n i32)
+#   INSERT (1, '{1.5,2,1.50}', ARRAY['\x61'::bytea, '\x61'::bytea], 1),
+#          (2, '{-7,0.00,NULL}', ARRAY['\x00ff'::bytea, '\x'::bytea, NULL], 2),
+#          (3, '{}', '{}', 3), (4, NULL, NULL, 4), (5, '{100,1.5}', ARRAY['\x0000'::bytea], 5)
+#   CREATE INDEX i_n ON t (n);  CREATE INDEX i_d_gin ON t USING gin (d)
+#   CREATE INDEX i_b_gin ON t USING gin (b)
+GIN_DECIMAL_BYTEA_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("d", "decimal[]"), col("b", "bytea[]"), col("n", "i32")],
+  indexes: [
+    { name: "i_b_gin", cols: [2], kind: "gin" },
+    { name: "i_d_gin", cols: [1], kind: "gin" },
+    { name: "i_n", cols: [3] }
+  ],
+  rows: [[1, %w[1.5 2 1.50], ["a", "a"], 1],
+         [2, ["-7", "0.00", nil], ["\x00\xff".b, "".b, nil], 2],
+         [3, [], [], 3],
+         [4, nil, nil, 4],
+         [5, %w[100 1.5], ["\x00\x00".b], 5]]
+}.freeze
+
 # A GIN index over a jsonb column (the jsonb_ops golden, spec/design/gin.md §2.1/§4.1): row 1 holds
 # keys at two levels, an array string element (a KEY term) beside a member string value (a STRING
 # term), a boolean and a JSON null; row 2 a top-level array whose 1.5 and 1.50 are ONE number term
@@ -1527,6 +1556,7 @@ FIXTURES = ([
   { file: "gin_interval_table.jed", page_size: 256, tables: [GIN_INTERVAL_TABLE] },
   { file: "gin_jsonb_table.jed", page_size: 256, tables: [GIN_JSONB_TABLE] },
   { file: "gin_text_table.jed", page_size: 256, tables: [GIN_TEXT_TABLE] },
+  { file: "gin_decimal_bytea_table.jed", page_size: 256, tables: [GIN_DECIMAL_BYTEA_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
@@ -2542,12 +2572,15 @@ def gin_index_entries(table, ix)
   pairs.sort_by { |key, _| key }
 end
 
-# An array_ops term (spec/design/gin.md §4/§4.2): the element's key body, a text element's over its
-# first 128 bytes (the C key — never a collation sort key; the cut is at a byte).
+# An array_ops term (spec/design/gin.md §4/§4.2/§4.3): the element's key body, a text or bytea
+# element's over its first 128 bytes (the C key — never a collation sort key; the cut is at a byte),
+# and a decimal element's value-based key cut to its first 128 bytes.
 def gin_element_term(elem_type, e)
-  return enc_terminated(e.b.byteslice(0, GIN_JSONB_MAX_TERM_BYTES)) if elem_type == "text"
-
-  key_body(elem_type, e)
+  case elem_type
+  when "text", "bytea" then enc_terminated(e.b.byteslice(0, GIN_JSONB_MAX_TERM_BYTES))
+  when "decimal" then key_body(elem_type, e).byteslice(0, GIN_JSONB_MAX_TERM_BYTES)
+  else key_body(elem_type, e)
+  end
 end
 
 # GIN `jsonb_ops` index terms of a tagged jsonb node (spec/design/gin.md §2.1/§4.1): a KEY term
