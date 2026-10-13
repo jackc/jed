@@ -103,14 +103,27 @@ The statement runs inside one autocommit (or block) transaction
 ([transactions.md](transactions.md) §4): a `working` snapshot is forked from `committed` and every
 sub-statement's writes land in it, exactly as a lone DML statement's do. The new piece is a
 **read pin**: for the duration of a `WITH` statement that contains any data-modifying part, the
-executor's read path is pinned to the **pre-statement snapshot** (a clone of the working set taken
-before the first sub-statement runs, i.e. equal to `committed`). So:
+executor's read path is pinned to the **pre-statement snapshot** of **every database domain** — the
+main database, the session-local temp domain ([temp-tables.md](temp-tables.md) §2), and each host
+attachment ([attached-databases.md](attached-databases.md) §5) — a clone of each domain's read
+snapshot taken before the first sub-statement runs. So:
 
 - **Reads** — every base-table scan, point lookup, `WHERE`/`SET`/`RETURNING` subquery, and
-  constraint-existence probe (PK / `UNIQUE` / `FOREIGN KEY` parent) — resolve against the **pin**.
-  A sub-statement therefore sees neither an earlier sub-statement's inserts/updates/deletes nor its
-  own (a single DML's two-phase pass already needs no read-your-writes — §6 of [grammar.md](grammar.md)).
-- **Writes** accumulate into `working` in sub-statement order (§3).
+  PK / `UNIQUE` existence probe — resolve against the **pin**, whichever database the table lives
+  in. A sub-statement therefore sees neither an earlier sub-statement's inserts/updates/deletes nor
+  its own (a single DML's two-phase pass already needs no read-your-writes — §6 of
+  [grammar.md](grammar.md)). A key collision the pin hides is still caught when the write meets the
+  earlier sub-statement's row in `working` (`23505`, §7).
+- **Foreign keys are the exception: they are checked against the working state, not the pin.**
+  PostgreSQL runs its RI checks as end-of-statement triggers that see the statement's writes, so a
+  parent a CTE inserts satisfies a child the primary writes (`WITH p AS (INSERT INTO parent …
+  RETURNING id) INSERT INTO child SELECT … FROM p`), and a parent a CTE deletes no longer satisfies
+  one (`23503` — checking against the pin would commit an orphan). jed checks each sub-statement's
+  child-side probes (constraints.md §6.4) and parent-side `NO ACTION`/`RESTRICT` searches and
+  referential actions (§6.5–§6.6) against the transaction's working state when that sub-statement
+  validates, so they see every **earlier** sub-statement's writes. See §7 for the one ordering this
+  cannot reproduce.
+- **Writes** accumulate into each domain's working set in sub-statement order (§3).
 - The pin is cleared when the statement finishes (success or error), so the next statement reads
   normally.
 
@@ -160,7 +173,7 @@ completion, §3); only its *count* is invisible.
 | Condition | Code | Notes |
 |---|---|---|
 | `FROM` reference to a data-modifying CTE with no `RETURNING` | `0A000` | *WITH query "name" does not have a RETURNING clause* — matches PostgreSQL (it has no columns to scan). The CTE still executes for its effect. |
-| Data-modifying statement targets a relation that is not a base table (e.g. a CTE name with no base table) | `42P01` | The target resolves against the catalog only (§1). |
+| Data-modifying statement targets a relation that is not a base table (e.g. a CTE name with no base table) | `42P01` | The target resolves against the catalog only (§1). A `db.table` target resolves in that database — `main`, `temp`, or a host attachment — like a standalone statement's (an unknown attachment is `42P01` *database … is not attached*). |
 | Two data-modifying parts insert the same key | `23505` | A staged write colliding with an earlier staged write of the same statement (§7). Matches PostgreSQL. |
 | `WITH RECURSIVE` with a data-modifying CTE | — | **Allowed.** `RECURSIVE` only *enables* self-reference ([recursive-cte.md](recursive-cte.md) §1); a non-self-referencing data-modifying CTE in a `RECURSIVE` list is an ordinary data-modifying CTE (a data-modifying body is never the `anchor UNION recursive` shape, so it is never analyzed as recursive). PostgreSQL agrees. |
 | Data-modifying CTE in a nested `WITH` | `0A000` | Data-modifying CTEs remain statement-top-level only; a query-only nested `WITH` is supported with inherited enclosing CTE visibility ([cte.md](cte.md) §7). |
@@ -202,6 +215,18 @@ A delete and an insert that do **not** overlap on a key compose without conflict
 pattern across two tables; a delete of a pre-existing key and an insert of a new key in the same
 table).
 
+### Foreign keys across sub-statements
+
+A foreign key satisfied only by a **later** sub-statement is a known divergence, not yet removed:
+jed raises `23503` where PostgreSQL accepts. jed checks a sub-statement's foreign keys when that
+sub-statement validates (§2), against the writes of the sub-statements before it, while PostgreSQL
+defers every RI check to the end of the whole statement. So `WITH c AS (INSERT INTO child VALUES
+(5, 5)), p AS (INSERT INTO parent VALUES (5)) SELECT 1` and `WITH d AS (DELETE FROM parent WHERE
+id = 1), u AS (UPDATE child SET pid = 2 WHERE pid = 1) SELECT 1` fail in jed and succeed in
+PostgreSQL. Listing the sub-statement that makes the reference valid first (the parent insert before
+the child insert, the child re-point before the parent delete) gives PostgreSQL's result. Deferring
+these checks to the end of the statement is a tracked follow-on ([TODO.md](../../TODO.md)).
+
 ## 8. Cost
 
 No new cost unit. A data-modifying CTE charges its **intrinsic** DML cost once into the running
@@ -219,8 +244,9 @@ The [cte.md](cte.md) §5 contract points hold, plus:
 
 1. **Sub-statement order** is the lexical `WITH`-list order, data-modifying CTEs then the primary
    (§3) — identical across cores, so the committed end state and every buffer are byte-identical.
-2. **The read pin** is the same pre-statement snapshot in every core, so every sub-statement reads
-   the identical rows (§2) and a write/write conflict resolves identically (§7).
+2. **The read pin** is the same pre-statement snapshot of every database domain in every core, so
+   every sub-statement reads the identical rows (§2) and a write/write conflict resolves
+   identically (§7); foreign keys read the identical working state.
 3. **Buffer order** for a data-modifying CTE is its `RETURNING` output order — the affected-row
    order of the underlying DML, already a cross-core contract ([grammar.md §32](grammar.md);
    unspecified to the *user* without `ORDER BY`, but byte-identical across cores, compared `rowsort`

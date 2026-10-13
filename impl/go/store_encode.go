@@ -1079,12 +1079,14 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 // fkSnap is the snapshot a foreign key's tables live in (spec/design/temp-tables.md §8): an FK never
 // crosses databases, so its child and parent are both in the session-local temp domain (temp) or both
 // in the main database. Explicit, so a same-named table of the other domain can never capture an FK
-// lookup.
+// lookup. It ignores a writable-CTE read pin: a foreign key is checked against the statement's end
+// state, which includes an earlier sub-statement's writes (spec/design/writable-cte.md §2,
+// PostgreSQL's end-of-statement RI triggers).
 func (db *engine) fkSnap(temp bool) *snapshot {
 	if temp {
-		return db.tempSnap()
+		return db.tempUnpinnedSnap()
 	}
-	return db.readSnap()
+	return db.mainUnpinnedSnap()
 }
 
 // fkDomain is a DML target's FK domain (temp-tables.md §8): temp reports a session-local temp table,

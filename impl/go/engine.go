@@ -351,12 +351,13 @@ type sessionState struct {
 	// the evaluator reads it via the active session. SESSION state (no storage effect).
 	timeZone ZoneRef
 	// readPin is the read pin for a data-modifying WITH statement (spec/design/writable-cte.md §2):
-	// the single pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the
-	// primary cannot observe each other's table writes (their writes still accumulate into the
-	// transaction's working). Set by the writable-CTE orchestrator before the first sub-statement runs
-	// and cleared when it finishes (success or error); nil for every other statement, where reads fall
-	// through to working/committed as usual (readSnap).
-	readPin *snapshot
+	// the single pre-statement snapshot of every database domain (main, session-local temp, each host
+	// attachment) that every sub-statement reads, so the data-modifying CTEs and the primary cannot
+	// observe each other's table writes (their writes still accumulate into the transaction's working
+	// sets). Set by the writable-CTE orchestrator before the first sub-statement runs and cleared when
+	// it finishes (success or error); nil for every other statement, where reads fall through to the
+	// working/committed snapshots as usual (readSnap, tempSnap, attachReadSnap).
+	readPin *readPin
 	// extensions is the frozen host extension registry (spec/design/extensibility.md §7): the scalar
 	// functions the host registered at open/create. Set from sharedCore.extensions at session mint;
 	// snapshotEngine's sessionState struct-copy shares the same pointer (so a streaming cursor sees
@@ -517,8 +518,38 @@ func (db *engine) inputZone() *inputZone {
 // read-only tx), else the committed snapshot.
 func (db *engine) readSnap() *snapshot {
 	if db.session.readPin != nil {
-		return db.session.readPin
+		return db.session.readPin.main
 	}
+	return db.mainUnpinnedSnap()
+}
+
+// readPin is a writable-CTE read pin (spec/design/writable-cte.md §2): the pre-statement snapshot of
+// each database domain a statement can read. A statement cannot attach or detach a database, so the
+// attachment set is fixed for the pin's lifetime.
+type readPin struct {
+	main     *snapshot
+	temp     *snapshot
+	attached map[string]*snapshot
+}
+
+// captureReadPin captures the writable-CTE read pin: the current read snapshot of main, the
+// session-local temp domain, and every host attachment.
+func (db *engine) captureReadPin() *readPin {
+	attached := make(map[string]*snapshot, len(db.attachedCommitted))
+	for name := range db.attachedCommitted {
+		attached[name] = db.attachUnpinnedSnap(name).clone()
+	}
+	return &readPin{
+		main:     db.mainUnpinnedSnap().clone(),
+		temp:     db.tempUnpinnedSnap().clone(),
+		attached: attached,
+	}
+}
+
+// mainUnpinnedSnap is the main snapshot ignoring any writable-CTE read pin: the open transaction's
+// working, else the committed snapshot. Foreign-key checks read it (and its temp analogue) so they see
+// the statement's end state rather than the pre-statement pin (writable-cte.md §2).
+func (db *engine) mainUnpinnedSnap() *snapshot {
 	if db.session.tx != nil {
 		return db.session.tx.working
 	}
@@ -648,10 +679,19 @@ func (db *engine) working() *snapshot {
 	return db.session.tx.working
 }
 
-// tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
-// transaction's tempWorking, else the session's committed temp state. The temp analogue of readSnap
-// (it does not consult readPin — a writable-CTE pins only the main snapshot).
+// tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the temp
+// half of the writable-CTE read pin if one is set (writable-cte.md §2), else the open transaction's
+// tempWorking, else the session's committed temp state. The temp analogue of readSnap.
 func (db *engine) tempSnap() *snapshot {
+	if db.session.readPin != nil {
+		return db.session.readPin.temp
+	}
+	return db.tempUnpinnedSnap()
+}
+
+// tempUnpinnedSnap is the temp snapshot ignoring any writable-CTE read pin — the temp analogue of
+// mainUnpinnedSnap.
+func (db *engine) tempUnpinnedSnap() *snapshot {
 	if db.session.tx != nil {
 		return db.session.tx.tempWorking
 	}
@@ -752,6 +792,14 @@ func (rel scopeRel) isAttachment() bool { return isAttachmentScope(rel.db) }
 // transaction's working clone if this tx wrote it, else the pinned committed root (attachedCommitted).
 // nil when no attachment is named `name` (the caller raises 42P01). name is the exact name.
 func (db *engine) attachReadSnap(name string) *snapshot {
+	if db.session.readPin != nil {
+		return db.session.readPin.attached[name]
+	}
+	return db.attachUnpinnedSnap(name)
+}
+
+// attachUnpinnedSnap is an attachment's READ snapshot ignoring any writable-CTE read pin.
+func (db *engine) attachUnpinnedSnap(name string) *snapshot {
 	if db.session.tx != nil {
 		if ws := db.session.tx.attachWorking[name]; ws != nil {
 			return ws

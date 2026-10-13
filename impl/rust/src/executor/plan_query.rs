@@ -276,20 +276,35 @@ impl Engine {
         // A write through an updatable view targets its base table, and its RETURNING projects the
         // view's columns (views.md §15); a view that is not updatable is 55000. The CTE keeps the
         // written statement, which its execution retargets again.
-        let vw = match body {
-            CteBody::Insert(ins) => self.rewrite_insert_target(&mut (**ins).clone())?,
-            CteBody::Update(upd) => self.rewrite_update_target(&mut (**upd).clone())?,
-            CteBody::Delete(del) => self.rewrite_delete_target(&mut (**del).clone())?,
-            CteBody::Query(_) => None,
+        // The rewrite clears the database qualifier of a view target (views live in main); a base
+        // target keeps its own, so a qualified attachment table resolves in its database.
+        let (vw, target_db) = match body {
+            CteBody::Insert(ins) => {
+                let mut ins = (**ins).clone();
+                (self.rewrite_insert_target(&mut ins)?, ins.db)
+            }
+            CteBody::Update(upd) => {
+                let mut upd = (**upd).clone();
+                (self.rewrite_update_target(&mut upd)?, upd.db)
+            }
+            CteBody::Delete(del) => {
+                let mut del = (**del).clone();
+                (self.rewrite_delete_target(&mut del)?, del.db)
+            }
+            CteBody::Query(_) => (None, None),
         };
         let target = vw.as_ref().map_or(table_name, |vw| vw.table.as_str());
-        let tdef = self.table(target).ok_or_else(|| {
-            EngineError::new(
-                SqlState::UndefinedTable,
-                format!("table does not exist: {table_name}"),
-            )
-            .at_target(table_pos.0)
-        })?;
+        self.check_table_qualifier(target_db.as_deref(), target)
+            .map_err(|e| e.at_target(table_pos.0))?;
+        let tdef = self
+            .table_scoped(target_db.as_deref(), target)
+            .ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("table does not exist: {table_name}"),
+                )
+                .at_target(table_pos.0)
+            })?;
         match returning {
             None => {
                 let table = cte_synthetic_table_cols(lname, &[], &[], None, None, rename)?;
@@ -565,10 +580,11 @@ impl Engine {
     /// primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or
     /// block) wrapper publishes the accumulated `working` only if this returns `Ok` (§6).
     pub(crate) fn execute_with_dml(&mut self, wq: WithQuery, params: &[Value]) -> Result<Outcome> {
-        // Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
-        // opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
-        // every exit path so the next statement reads normally.
-        let pin = self.read_snap().clone();
+        // Pin the pre-statement snapshot of every database domain (main, temp, each attachment). A
+        // write statement runs with a transaction open (autocommit opened one), and nothing is
+        // written yet, so each pin equals that domain's working state. Cleared on every exit path
+        // so the next statement reads normally.
+        let pin = self.capture_read_pin();
         self.session.read_pin = Some(pin);
         let result = self.run_with_dml(wq, params);
         self.session.read_pin = None;

@@ -127,8 +127,15 @@ impl Engine {
     /// a read-only tx), else the committed snapshot.
     pub(crate) fn read_snap(&self) -> &Snapshot {
         if let Some(pin) = &self.session.read_pin {
-            return pin;
+            return &pin.main;
         }
+        self.main_unpinned_snap()
+    }
+
+    /// The main snapshot ignoring any writable-CTE read pin: the open transaction's `working`, else
+    /// the committed snapshot. Foreign-key checks read it (and its temp analogue) so they see the
+    /// statement's end state rather than the pre-statement pin (writable-cte.md §2).
+    pub(crate) fn main_unpinned_snap(&self) -> &Snapshot {
         match &self.session.tx {
             Some(tx) => &tx.working,
             None => &self.committed,
@@ -259,11 +266,20 @@ impl Engine {
         &mut tx.working
     }
 
-    /// The session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
-    /// transaction's `temp_working`, else the session's committed temp state. The temp analogue of
-    /// [`read_snap`](Engine::read_snap) (it does not consult `read_pin` — a writable-CTE pins only
-    /// the main snapshot).
+    /// The session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the temp half of
+    /// the writable-CTE read pin if one is set (writable-cte.md §2), else the open transaction's
+    /// `temp_working`, else the session's committed temp state. The temp analogue of
+    /// [`read_snap`](Engine::read_snap).
     pub(crate) fn temp_read_snap(&self) -> &Snapshot {
+        if let Some(pin) = &self.session.read_pin {
+            return &pin.temp;
+        }
+        self.temp_unpinned_snap()
+    }
+
+    /// The temp snapshot ignoring any writable-CTE read pin — the temp analogue of
+    /// [`main_unpinned_snap`](Engine::main_unpinned_snap).
+    pub(crate) fn temp_unpinned_snap(&self) -> &Snapshot {
         match &self.session.tx {
             Some(tx) => &tx.temp_working,
             None => &self.session.temp_committed,
@@ -395,12 +411,40 @@ impl Engine {
     /// working clone if this tx wrote it, else the pinned committed root (`attached_committed`). `None`
     /// when no attachment is named `name` (the caller raises 42P01). `name` is the exact attachment name.
     pub(crate) fn attach_read_snap(&self, name: &str) -> Option<&Snapshot> {
+        if let Some(pin) = &self.session.read_pin {
+            return pin.attached.get(name);
+        }
+        self.attach_unpinned_snap(name)
+    }
+
+    /// An attachment's READ snapshot ignoring any writable-CTE read pin.
+    fn attach_unpinned_snap(&self, name: &str) -> Option<&Snapshot> {
         if let Some(tx) = &self.session.tx
             && let Some(ws) = tx.attach_working.get(name)
         {
             return Some(ws);
         }
         self.attached_committed.get(name).map(|a| a.as_ref())
+    }
+
+    /// Capture the writable-CTE read pin (writable-cte.md §2): the current read snapshot of main,
+    /// the session-local temp domain, and every host attachment.
+    pub(crate) fn capture_read_pin(&self) -> ReadPin {
+        let attached = self
+            .attached_committed
+            .keys()
+            .map(|name| {
+                let snap = self
+                    .attach_unpinned_snap(name)
+                    .expect("an attached database has a read snapshot");
+                (name.clone(), snap.clone())
+            })
+            .collect();
+        ReadPin {
+            main: self.main_unpinned_snap().clone(),
+            temp: self.temp_unpinned_snap().clone(),
+            attached,
+        }
     }
 
     /// The WRITE snapshot of a host-attached database, cloning the pinned committed root into the

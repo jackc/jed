@@ -1,0 +1,90 @@
+# Foreign keys inside a data-modifying (writable) WITH (spec/design/writable-cte.md §2,
+# constraints.md §6.4/§6.5). Every sub-statement READS the pre-statement snapshot, but a foreign key
+# is checked against the state the earlier sub-statements produced, like PostgreSQL's
+# end-of-statement RI checks: a parent a CTE inserts satisfies a child the primary writes, and a
+# parent a CTE deletes no longer does. Rows verified against the live PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, dml.with_clause, query.select, query.where_eq, query.order_by, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32
+
+statement ok
+CREATE TABLE fp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE fc (id i32 PRIMARY KEY, pid i32 REFERENCES fp)
+
+statement ok
+INSERT INTO fp VALUES (1), (2)
+
+# A parent inserted by a CTE satisfies a child inserted by the primary.
+statement ok
+WITH p AS (INSERT INTO fp VALUES (3) RETURNING id) INSERT INTO fc SELECT id * 10, id FROM p
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+3
+
+# ... and by a later CTE.
+statement ok
+WITH p AS (INSERT INTO fp VALUES (5) RETURNING id),
+     c AS (INSERT INTO fc SELECT id * 10, id FROM p RETURNING id)
+SELECT 1
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+3
+50
+5
+
+# A child re-pointed by the primary at a parent the CTE inserted.
+statement ok
+WITH p AS (INSERT INTO fp VALUES (4) RETURNING id) UPDATE fc SET pid = (SELECT id FROM p) WHERE id = 30
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+4
+50
+5
+
+# A parent deleted by a CTE does not satisfy a child the primary inserts, though the primary's own
+# read of fp still sees it.
+statement error 23503
+WITH d AS (DELETE FROM fp WHERE id = 1 RETURNING id) INSERT INTO fc SELECT 10, id FROM fp WHERE id = 1
+
+# ... nor a child the primary re-points at it.
+statement error 23503
+WITH d AS (DELETE FROM fp WHERE id = 1 RETURNING id) UPDATE fc SET pid = 1 WHERE id = 50
+
+# ... nothing changed.
+query I nosort
+SELECT id FROM fp ORDER BY id
+----
+1
+2
+3
+4
+5
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+4
+50
+5
+
+# Deleting a parent that a CTE's inserted child references fails the parent-side check.
+statement error 23503
+WITH c AS (INSERT INTO fc VALUES (20, 2) RETURNING id) DELETE FROM fp WHERE id = 2
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+4
+50
+5

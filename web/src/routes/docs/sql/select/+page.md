@@ -304,10 +304,13 @@ WITH moved AS (DELETE FROM inbox WHERE ready RETURNING *)
 INSERT INTO archive SELECT * FROM moved;
 ```
 
-Every part of the statement reads **one pre-statement snapshot** — the parts cannot see each other's
-effects on the target tables, so data crosses only through a CTE's `RETURNING` buffer (`SELECT
-count(*) FROM inbox` next to the `DELETE` above still sees the rows). The data-modifying parts run
-once each, in order, and the whole statement is one all-or-nothing transaction.
+Every part of the statement reads **one pre-statement snapshot** — of every table it touches,
+temporary and attached-database tables included — so the parts cannot see each other's effects on
+the target tables, and data crosses only through a CTE's `RETURNING` buffer (`SELECT count(*) FROM
+inbox` next to the `DELETE` above still sees the rows). The data-modifying parts run once each, in
+order, and the whole statement is one all-or-nothing transaction. Foreign keys are checked against
+the earlier parts' writes: a parent row a CTE inserts satisfies a child row the statement inserts
+after it.
 
 ### Recursive CTEs (`WITH RECURSIVE`)
 

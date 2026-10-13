@@ -1666,12 +1666,14 @@ impl Engine {
     /// The snapshot a foreign key's tables live in (spec/design/temp-tables.md §8): an FK never
     /// crosses databases, so both its child and parent are in the session-local temp domain
     /// (`temp`) or both in the main database. Explicit, so a same-named table of the other domain
-    /// can never capture an FK lookup.
+    /// can never capture an FK lookup. It ignores a writable-CTE read pin: a foreign key is checked
+    /// against the statement's end state, which includes an earlier sub-statement's writes
+    /// (spec/design/writable-cte.md §2, PostgreSQL's end-of-statement RI triggers).
     pub(crate) fn fk_snap(&self, temp: bool) -> &Snapshot {
         if temp {
-            self.temp_read_snap()
+            self.temp_unpinned_snap()
         } else {
-            self.read_snap()
+            self.main_unpinned_snap()
         }
     }
 

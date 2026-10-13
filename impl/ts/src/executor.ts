@@ -579,7 +579,7 @@ import {
 import type { ExplainRow, PrivReq } from "./scope.ts";
 import type { ActiveTx, TxStatus } from "./snapshot.ts";
 import { Snapshot, txStatusOf } from "./snapshot.ts";
-import type { AttachmentCore, LaneAt } from "./session.ts";
+import type { AttachmentCore, LaneAt, ReadPin } from "./session.ts";
 import {
   SessionState,
   filterColumnar,
@@ -1981,9 +1981,30 @@ export class Engine {
   // read-only tx), else the committed snapshot.
   private readSnap(): Snapshot {
     if (this.session.readPin !== null) {
-      return this.session.readPin;
+      return this.session.readPin.main;
     }
+    return this.mainUnpinnedSnap();
+  }
+
+  // mainUnpinnedSnap is the main snapshot ignoring any writable-CTE read pin: the open transaction's
+  // working, else the committed snapshot. Foreign-key checks read it (and its temp analogue) so they
+  // see the statement's end state rather than the pre-statement pin (writable-cte.md §2).
+  private mainUnpinnedSnap(): Snapshot {
     return this.session.tx !== null ? this.session.tx.working : this.committed;
+  }
+
+  // captureReadPin captures the writable-CTE read pin: the current read snapshot of main, the
+  // session-local temp domain, and every host attachment.
+  private captureReadPin(): ReadPin {
+    const attached = new Map<string, Snapshot>();
+    for (const name of this.attachedCommitted.keys()) {
+      attached.set(name, this.attachUnpinnedSnap(name)!.clone());
+    }
+    return {
+      main: this.mainUnpinnedSnap().clone(),
+      temp: this.tempUnpinnedSnap().clone(),
+      attached,
+    };
   }
 
   // working is the snapshot a write mutates — the open transaction's working. A write only ever
@@ -1995,10 +2016,19 @@ export class Engine {
     return this.session.tx!.working;
   }
 
-  // tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
-  // transaction's tempWorking, else the session's committed temp state. The temp analogue of readSnap
-  // (it does not consult readPin — a writable-CTE pins only the main snapshot).
+  // tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the temp
+  // half of the writable-CTE read pin if one is set (writable-cte.md §2), else the open transaction's
+  // tempWorking, else the session's committed temp state. The temp analogue of readSnap.
   private tempSnap(): Snapshot {
+    if (this.session.readPin !== null) {
+      return this.session.readPin.temp;
+    }
+    return this.tempUnpinnedSnap();
+  }
+
+  // tempUnpinnedSnap is the temp snapshot ignoring any writable-CTE read pin — the temp analogue of
+  // mainUnpinnedSnap.
+  private tempUnpinnedSnap(): Snapshot {
     return this.session.tx !== null ? this.session.tx.tempWorking : this.session.tempCommitted;
   }
 
@@ -2090,6 +2120,14 @@ export class Engine {
   // (attachedCommitted). undefined when no attachment is named `name` (the caller raises 42P01). name
   // is the exact attachment name.
   private attachReadSnap(name: string): Snapshot | undefined {
+    if (this.session.readPin !== null) {
+      return this.session.readPin.attached.get(name);
+    }
+    return this.attachUnpinnedSnap(name);
+  }
+
+  // attachUnpinnedSnap is an attachment's READ snapshot ignoring any writable-CTE read pin.
+  private attachUnpinnedSnap(name: string): Snapshot | undefined {
     const tx = this.session.tx;
     if (tx !== null && tx.attachWorking !== undefined) {
       const ws = tx.attachWorking.get(name);
@@ -8629,9 +8667,11 @@ export class Engine {
   // fkSnap is the snapshot a foreign key's tables live in (spec/design/temp-tables.md §8): an FK never
   // crosses databases, so its child and parent are both in the session-local temp domain (`temp`) or
   // both in the main database. Explicit, so a same-named table of the other domain can never capture
-  // an FK lookup.
+  // an FK lookup. It ignores a writable-CTE read pin: a foreign key is checked against the statement's
+  // end state, which includes an earlier sub-statement's writes (spec/design/writable-cte.md §2,
+  // PostgreSQL's end-of-statement RI triggers).
   private fkSnap(temp: boolean): Snapshot {
-    return temp ? this.tempSnap() : this.readSnap();
+    return temp ? this.tempUnpinnedSnap() : this.mainUnpinnedSnap();
   }
 
   // fkDomain is a DML target's FK domain (temp-tables.md §8): true for a session-local temp table,
@@ -13210,13 +13250,26 @@ export class Engine {
     // A write through an updatable view targets its base table, and its RETURNING projects the
     // view's columns (views.md §15); a view that is not updatable is 55000. The CTE keeps the written
     // statement, which its execution retargets again.
-    const vw =
-      body.kind === "insert"
-        ? this.rewriteInsertTarget(body).vw
-        : body.kind === "update"
-          ? this.rewriteUpdateTarget(body).vw
-          : this.rewriteDeleteTarget(body).vw;
-    const tdef = this.lkpTable(vw === null ? tableName : vw.table); // temp-first (temp-tables.md §3)
+    // The rewrite clears the database qualifier of a view target (views live in main); a base target
+    // keeps its own, so a qualified attachment table resolves in its database.
+    let vw: ViewWrite | null;
+    let targetDb: string | undefined;
+    if (body.kind === "insert") {
+      const r = this.rewriteInsertTarget(body);
+      vw = r.vw;
+      targetDb = r.ins.db;
+    } else if (body.kind === "update") {
+      const r = this.rewriteUpdateTarget(body);
+      vw = r.vw;
+      targetDb = r.upd.db;
+    } else {
+      const r = this.rewriteDeleteTarget(body);
+      vw = r.vw;
+      targetDb = r.del.db;
+    }
+    const target = vw === null ? tableName : vw.table;
+    this.checkTargetQualifier(targetDb, target, body.tableLoc);
+    const tdef = this.lkpTableScoped(targetDb, target); // a bare name is temp-first (temp-tables.md §3)
     if (tdef === undefined) {
       throw engineError("undefined_table", "table does not exist: " + tableName).atTarget(
         body.tableLoc,
@@ -13460,11 +13513,11 @@ export class Engine {
   // primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or
   // block) wrapper publishes the accumulated working only if this returns without throwing (§6).
   private executeWithDml(wq: WithQuery, params: Value[]): Outcome {
-    // Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
-    // opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
-    // every exit path so the next statement reads normally.
-    const pin = this.readSnap().clone();
-    this.session.readPin = pin;
+    // Pin the pre-statement snapshot of every database domain (main, temp, each attachment). A write
+    // statement runs with a transaction open (autocommit opened one), and nothing is written yet, so
+    // each pin equals that domain's working state. Cleared on every exit path so the next statement
+    // reads normally.
+    this.session.readPin = this.captureReadPin();
     try {
       return this.runWithDml(wq, params);
     } finally {

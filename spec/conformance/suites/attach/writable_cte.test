@@ -1,0 +1,137 @@
+# skip: disk — in-memory host attachments do not survive the disk-mode per-record reopen (a fresh
+# Database handle is opened from the file, and an in-memory attachment lives only on the old handle;
+# spec/design/conformance.md §3, attached-databases.md §5).
+# Data-modifying (writable) CTEs over host-attached databases (spec/design/writable-cte.md §2,
+# attached-databases.md §3): a data-modifying CTE may target a `db.table` in an attachment, and the
+# read pin covers every attachment exactly as it covers main and temp, so each sub-statement reads
+# the attachment's PRE-statement state and data crosses only through a CTE's RETURNING buffer.
+# jed-specific (PostgreSQL has no embedded multi-database model), so CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked; the same statements over plain tables are oracle-checked in
+# cte/data_modifying.test.
+# attach: mydb
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.temp_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, dml.with_clause, query.select, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.join_inner, query.table_alias, query.qualified_column, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32, session.allow_temp_ddl
+
+statement ok
+CREATE TABLE mydb.t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO mydb.t VALUES (1, 10), (2, 20), (3, 30)
+
+# The primary reads the pre-statement attachment table: the CTE's delete is invisible to it.
+query I nosort
+WITH d AS (DELETE FROM mydb.t WHERE id = 1 RETURNING id) SELECT count(*) FROM mydb.t
+----
+3
+
+query II nosort
+SELECT id, v FROM mydb.t ORDER BY id
+----
+2
+20
+3
+30
+
+# A sibling query CTE does not see an INSERT-CTE's row.
+query II nosort
+WITH a AS (INSERT INTO mydb.t VALUES (4, 40) RETURNING id),
+     b AS (SELECT count(*) AS n FROM mydb.t)
+SELECT n, (SELECT count(*) FROM a) FROM b
+----
+2
+1
+
+# UPDATE visibility: the buffer carries the new values, the table read shows the old ones.
+query III nosort
+WITH u AS (UPDATE mydb.t SET v = v + 1 WHERE id <= 3 RETURNING id, v)
+SELECT t.id, t.v, u.v FROM mydb.t t JOIN u ON u.id = t.id ORDER BY t.id
+----
+2
+20
+21
+3
+30
+31
+
+query II nosort
+SELECT id, v FROM mydb.t ORDER BY id
+----
+2
+21
+3
+31
+4
+40
+
+# Move rows from main into the attachment and on into a temp table; each part reads its own
+# database's pre-statement state.
+statement ok
+CREATE TABLE inbox (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO inbox VALUES (7, 70), (8, 80)
+
+statement ok
+CREATE TEMP TABLE seen (id i32 PRIMARY KEY)
+
+query III nosort
+WITH moved AS (DELETE FROM inbox RETURNING id, v),
+     ins AS (INSERT INTO mydb.t SELECT id, v FROM moved RETURNING id),
+     log AS (INSERT INTO seen SELECT id FROM ins RETURNING id)
+SELECT (SELECT count(*) FROM inbox), (SELECT count(*) FROM mydb.t), (SELECT count(*) FROM seen)
+----
+2
+3
+0
+
+query II nosort
+SELECT id, v FROM mydb.t ORDER BY id
+----
+2
+21
+3
+31
+4
+40
+7
+70
+8
+80
+
+query I nosort
+SELECT count(*) FROM inbox
+----
+0
+
+query I nosort
+SELECT id FROM seen ORDER BY id
+----
+7
+8
+
+# A data-modifying primary on the attachment fed by a CTE over it.
+statement ok
+WITH d AS (DELETE FROM mydb.t WHERE id >= 7 RETURNING id, v) INSERT INTO inbox SELECT id, v FROM d
+
+query II nosort
+SELECT id, v FROM inbox ORDER BY id
+----
+7
+70
+8
+80
+
+# Two parts inserting the same attachment key collide, and the statement is all-or-nothing.
+statement error 23505
+WITH a AS (INSERT INTO mydb.t VALUES (9, 90) RETURNING id) INSERT INTO mydb.t VALUES (9, 91)
+
+query I nosort
+SELECT count(*) FROM mydb.t
+----
+3
+
+# A data-modifying CTE naming an unknown attachment, or a table its attachment lacks, is 42P01.
+statement error 42P01
+WITH d AS (DELETE FROM nodb.t RETURNING id) SELECT count(*) FROM d
+
+statement error 42P01
+WITH d AS (DELETE FROM mydb.inbox RETURNING id) SELECT count(*) FROM d

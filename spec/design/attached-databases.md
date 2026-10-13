@@ -207,7 +207,9 @@ The existing model generalizes with one genuinely new constraint.
   attachment it reads**, and a write transaction builds a `working` snapshot **per attachment it
   writes** — the exact generalization of temp's "a reader pins both roots together" (temp-tables.md
   §5) from two roots to N. Read-your-writes holds within the transaction for every attachment; a
-  reader's view is consistent across all of them.
+  reader's view is consistent across all of them. A data-modifying `WITH` may target `db.table`, and
+  its read pin covers every attachment ([writable-cte.md](writable-cte.md) §2): each sub-statement
+  reads each attachment's pre-statement state.
 - **Single writer, unchanged.** One write lock per `Database` handle (transactions.md §10) still
   serializes all writers; there are still no write-write conflicts and no retry loop. Cross-attachment
   writes in one transaction are serialized like any other write.

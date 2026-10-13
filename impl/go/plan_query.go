@@ -269,15 +269,30 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	// A write through an updatable view targets its base table, and its RETURNING projects the
 	// view's columns (views.md §15); a view that is not updatable is 55000. The CTE keeps the written
 	// statement, which its execution retargets again.
+	// The rewrite clears the database qualifier of a view target (views live in main); a base target
+	// keeps its own, so a qualified attachment table resolves in its database.
 	var vw *viewWrite
+	var targetDB *string
 	var err error
 	switch {
 	case body.Insert != nil:
-		_, vw, err = db.rewriteInsertTarget(body.Insert)
+		var ins *insert
+		ins, vw, err = db.rewriteInsertTarget(body.Insert)
+		if err == nil {
+			targetDB = ins.DB
+		}
 	case body.Update != nil:
-		_, vw, err = db.rewriteUpdateTarget(body.Update)
+		var upd *update
+		upd, vw, err = db.rewriteUpdateTarget(body.Update)
+		if err == nil {
+			targetDB = upd.DB
+		}
 	default:
-		_, vw, err = db.rewriteDeleteTarget(body.Delete)
+		var del *deleteStmt
+		del, vw, err = db.rewriteDeleteTarget(body.Delete)
+		if err == nil {
+			targetDB = del.DB
+		}
 	}
 	if err != nil {
 		return nil, nil, err
@@ -286,7 +301,10 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	if vw != nil {
 		target = vw.table
 	}
-	tdef, ok := db.lkpTable(target) // temp-first (temp-tables.md §3)
+	if err := db.checkTableQualifier(targetDB, target); err != nil {
+		return nil, nil, atTarget(err, tablePos)
+	}
+	tdef, ok := db.lkpTableScoped(targetDB, target) // a bare name is temp-first (temp-tables.md §3)
 	if !ok {
 		return nil, nil, newError(UndefinedTable, "table does not exist: "+tableName).withPosition(int32(tablePos))
 	}
@@ -554,10 +572,11 @@ func releaseCteBuffers(acct queryAccount, buffers [][]storedRow) {
 // primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or block)
 // wrapper publishes the accumulated working only if this returns nil error (§6).
 func (db *engine) executeWithDml(wq *withQuery, params []Value) (outcome, error) {
-	// Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
-	// opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
-	// every exit path so the next statement reads normally.
-	db.session.readPin = db.readSnap().clone()
+	// Pin the pre-statement snapshot of every database domain (main, temp, each attachment). A write
+	// statement runs with a transaction open (autocommit opened one), and nothing is written yet, so
+	// each pin equals that domain's working state. Cleared on every exit path so the next statement
+	// reads normally.
+	db.session.readPin = db.captureReadPin()
 	out, err := db.runWithDml(wq, params)
 	db.session.readPin = nil
 	return out, err

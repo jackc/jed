@@ -866,6 +866,15 @@ impl TxStatus {
     }
 }
 
+/// A writable-CTE read pin (spec/design/writable-cte.md §2): the pre-statement snapshot of each
+/// database domain a statement can read. A statement cannot attach or detach a database, so the
+/// attachment set is fixed for the pin's lifetime.
+pub(crate) struct ReadPin {
+    pub(crate) main: Snapshot,
+    pub(crate) temp: Snapshot,
+    pub(crate) attached: HashMap<String, Snapshot>,
+}
+
 /// The per-connection **session** state (spec/design/session.md §2.1): the configured, stateful
 /// context a host runs statements through, un-fused from the committed storage on [`Engine`]. It
 /// owns the open transaction (the `Idle`/`Open`/`Failed` machine), the relocated handle settings,
@@ -992,12 +1001,14 @@ pub struct SessionState {
     /// here and a ROLLBACK discards.
     pub(crate) temp_committed: Snapshot,
     /// The **read pin** for a data-modifying `WITH` statement (spec/design/writable-cte.md §2): the
-    /// single pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the
-    /// primary cannot observe each other's table writes (their writes still accumulate into the
-    /// transaction's `working`). Set by the writable-CTE orchestrator before the first sub-statement
-    /// runs and cleared when it finishes (success or error); `None` for every other statement, where
-    /// reads fall through to `working`/`committed` as usual ([`Engine::read_snap`]).
-    pub(crate) read_pin: Option<Snapshot>,
+    /// single pre-statement snapshot of every database domain (main, session-local temp, each host
+    /// attachment) that every sub-statement reads, so the data-modifying CTEs and the primary cannot
+    /// observe each other's table writes (their writes still accumulate into the transaction's
+    /// working sets). Set by the writable-CTE orchestrator before the first sub-statement runs and
+    /// cleared when it finishes (success or error); `None` for every other statement, where reads
+    /// fall through to the working/committed snapshots as usual ([`Engine::read_snap`],
+    /// [`Engine::temp_read_snap`], [`Engine::attach_read_snap`]).
+    pub(crate) read_pin: Option<ReadPin>,
     /// Current recursive referential-action depth (constraints.md §6.6). A schema can assemble an
     /// arbitrarily long FK chain across cheap DDL statements, so generated child DML is capped at
     /// 256 nested calls to keep every core's native stack bounded (`54001`).

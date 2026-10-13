@@ -33,6 +33,16 @@ import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { entryBytes } from "./memsize.ts";
 import type { TableStore } from "./storage.ts";
 import type { KeyBound } from "./pmap.ts";
+
+// ReadPin is a writable-CTE read pin (spec/design/writable-cte.md §2): the pre-statement snapshot of
+// each database domain a statement can read. A statement cannot attach or detach a database, so the
+// attachment set is fixed for the pin's lifetime.
+export interface ReadPin {
+  main: Snapshot;
+  temp: Snapshot;
+  attached: Map<string, Snapshot>;
+}
+
 export class SessionState {
   maxScalarBytes: bigint;
   scalarBytes = { used: 0n };
@@ -121,12 +131,13 @@ export class SessionState {
   // evaluator reads it via the active session. SESSION state (no storage effect).
   timeZone: ZoneRef;
   // The read pin for a data-modifying WITH statement (spec/design/writable-cte.md §2): the single
-  // pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the primary
-  // cannot observe each other's table writes (their writes still accumulate into the transaction's
-  // working). Set by the writable-CTE orchestrator before the first sub-statement runs and cleared
-  // when it finishes (success or error); null for every other statement, where reads fall through to
-  // working/committed as usual (readSnap).
-  readPin: Snapshot | null;
+  // pre-statement snapshot of every database domain (main, session-local temp, each host attachment)
+  // that every sub-statement reads, so the data-modifying CTEs and the primary cannot observe each
+  // other's table writes (their writes still accumulate into the transaction's working sets). Set by
+  // the writable-CTE orchestrator before the first sub-statement runs and cleared when it finishes
+  // (success or error); null for every other statement, where reads fall through to the
+  // working/committed snapshots as usual (readSnap, tempSnap, attachReadSnap).
+  readPin: ReadPin | null;
 
   constructor(opts: SessionOptions = {}) {
     this.tx = null;

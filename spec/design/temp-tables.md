@@ -180,7 +180,10 @@ property a host wants when handing an untrusted, `{SELECT}`-only session a scrat
 inside a write transaction accumulates in the session's private temp staging alongside any persistent
 working set; commit folds it into the session's durable-for-session temp state (its own
 `MemoryBlockStore` domain, §6) and `ROLLBACK` discards it. Read-your-own-writes within the transaction
-works for the temp table exactly as it does for a persistent one. Commit publishes a **single** durable
+works for the temp table exactly as it does for a persistent one. So does a data-modifying `WITH`'s
+read pin ([writable-cte.md](writable-cte.md) §2): every sub-statement reads the temp domain's
+pre-statement state, as it does main's, and only foreign keys among temp tables see the earlier
+sub-statements' writes. Commit publishes a **single** durable
 root — the file snapshot root (fsynced per `synchronous`, §9 of transactions.md); the session-local
 temp domain is materialized into its own in-RAM store with **no fsync, nothing written to the main
 file** (§6). A transaction that touches *only* session-local temp tables takes **no** global writer
@@ -235,7 +238,7 @@ discard needs one.
 Two invariants follow, and they are all the observable behavior: **a committed temp state never holds
 an `ON COMMIT DROP` table, and an `ON COMMIT DELETE ROWS` table is always empty when a transaction
 starts.** So under autocommit, rows written to a `DELETE ROWS` table are visible only within the
-writing statement itself (its `RETURNING` rows, a writable CTE's readers), and a `CREATE TEMP TABLE
+writing statement itself (its `RETURNING` rows, which a writable CTE passes on), and a `CREATE TEMP TABLE
 … ON COMMIT DROP` is dropped as soon as its statement commits. Inside an explicit block both tables
 behave like ordinary temp tables until `COMMIT`. A `DROP`-table's action survives renames and other
 `ALTER TABLE` edits within its transaction, since it is part of the table's catalog entry.
