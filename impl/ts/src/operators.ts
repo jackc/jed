@@ -6374,8 +6374,10 @@ export const AGGREGATES: readonly AggregateDesc[] = [
 // One set-returning function's metadata, mirroring a [[set_returning]] entry in
 // catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate value);
 // `result` is a reserved set id (set_of_promoted), `column` is the fixed output column
-// name, and `null` = "empty_on_null" (any NULL arg → zero rows). The uniqueness key is
-// (name, arity). See spec/design/functions.md §10.
+// name, `columnSource` says whether that name is the function's named OUT parameter
+// ("out_param" — a table alias does not rename it) or the function name ("function" — a
+// table alias replaces it), and `null` = "empty_on_null" (any NULL arg → zero rows). The
+// uniqueness key is (name, arity). See spec/design/functions.md §10.
 export interface SetReturningDesc {
   name: string;
   surface: string;
@@ -6384,6 +6386,7 @@ export interface SetReturningDesc {
   argResolution: string;
   result: string;
   column: string;
+  columnSource: string;
   null: string;
   errors: readonly string[];
 }
@@ -6398,6 +6401,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "promote",
     result: "set_of_promoted",
     column: "generate_series",
+    columnSource: "function",
     null: "empty_on_null",
     errors: [],
   },
@@ -6409,6 +6413,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "promote",
     result: "set_of_promoted",
     column: "generate_series",
+    columnSource: "function",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6420,6 +6425,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "set_of_element",
     column: "unnest",
+    columnSource: "function",
     null: "empty_on_null",
     errors: [],
   },
@@ -6431,6 +6437,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "jsonb",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6442,6 +6449,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6453,6 +6461,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "json",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6464,6 +6473,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6475,6 +6485,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "jsonb_object_keys",
+    columnSource: "function",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6486,6 +6497,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "json_object_keys",
+    columnSource: "function",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6497,6 +6509,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "jsonb",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6508,6 +6521,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6519,6 +6533,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "json",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
@@ -6530,10 +6545,23 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "value",
+    columnSource: "out_param",
     null: "empty_on_null",
     errors: ["22023"],
   },
   {
+    name: "jsonb_path_query",
+    surface: "jsonb_path_query",
+    arity: 2,
+    argFamilies: ["jsonb", "jsonpath"],
+    argResolution: "none",
+    result: "jsonb",
+    column: "jsonb_path_query",
+    columnSource: "function",
+    null: "empty_on_null",
+    errors: ["22033", "22038", "2203A", "2203C"],
+  },
+  {
     name: "regexp_matches",
     surface: "regexp_matches",
     arity: 2,
@@ -6541,6 +6569,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text[]",
     column: "regexp_matches",
+    columnSource: "function",
     null: "empty_on_null",
     errors: ["2201B"],
   },
@@ -6552,6 +6581,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text[]",
     column: "regexp_matches",
+    columnSource: "function",
     null: "empty_on_null",
     errors: ["2201B"],
   },
@@ -6563,6 +6593,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "regexp_split_to_table",
+    columnSource: "function",
     null: "empty_on_null",
     errors: ["2201B"],
   },
@@ -6574,6 +6605,7 @@ export const SET_RETURNING: readonly SetReturningDesc[] = [
     argResolution: "none",
     result: "text",
     column: "regexp_split_to_table",
+    columnSource: "function",
     null: "empty_on_null",
     errors: ["2201B", "22023"],
   },

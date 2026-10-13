@@ -32,7 +32,9 @@ pub(crate) use crate::encoding::{encode_bool, encode_int, encode_terminated};
 pub(crate) use crate::error::{EngineError, Result, SqlState};
 pub(crate) use crate::interval::{self, Interval, parse_interval};
 pub(crate) use crate::json::{self, JsonNode};
-pub(crate) use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc, WINDOWS};
+pub(crate) use crate::operators::{
+    AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc, SET_RETURNING, WINDOWS,
+};
 pub(crate) use crate::pmap::KeyBound;
 pub(crate) use crate::privileges::{Privilege, PrivilegeSet};
 pub(crate) use crate::storage::{Row, TableStore};
@@ -2189,13 +2191,57 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// Resolve a bare name in expression position: a column ([`resolve_bare_column`]) when any
+    /// scope in the chain has one, else a WHOLE-ROW reference to a scalar function relation of that
+    /// label ([`resolve_scalar_func_row`]) — PostgreSQL's `transformColumnRef` order, which tries
+    /// every level for a column before trying the name as a relation. 42703 when neither matches.
+    ///
+    /// [`resolve_bare_column`]: Scope::resolve_bare_column
+    /// [`resolve_scalar_func_row`]: Scope::resolve_scalar_func_row
+    fn resolve_bare(&self, name: &str) -> Result<Resolved> {
+        match self.resolve_bare_column(name) {
+            Err(e) if e.state == SqlState::UndefinedColumn => {
+                self.resolve_scalar_func_row(name).ok_or(e)
+            }
+            r => r,
+        }
+    }
+
+    /// Resolve a bare name that labels a scalar set-returning function's relation as a whole-row
+    /// reference to it (spec/design/functions.md §10): a scalar function's row IS its one column,
+    /// so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
+    /// `makeWholeRowVar` for a scalar function). Searched THIS scope, then outward (nearest wins).
+    /// No other relation kind has a whole-row value in jed (no implicit per-table row types).
+    fn resolve_scalar_func_row(&self, name: &str) -> Option<Resolved> {
+        for r in &self.rels {
+            if r.qualifier_only || r.layer.is_some() || r.label != name || !r.table.scalar_func {
+                continue;
+            }
+            self.lateral_hit.set(true);
+            return Some(Resolved::Local(r.offset));
+        }
+        // An unaliased parenthesized join keeps its inner function relation's label visible.
+        if let Some(sr) = self
+            .sub_rels
+            .iter()
+            .find(|sr| sr.label == name && sr.table.scalar_func)
+        {
+            self.lateral_hit.set(true);
+            return Some(Resolved::Local(sr.slots[0]));
+        }
+        self.parent
+            .and_then(|p| p.resolve_scalar_func_row(name))
+            .map(outer_of)
+    }
+
     /// Resolve a bare column name against THIS scope, then OUTWARD through the parent chain.
     /// Within one scope: two+ relations have it → 42702 ambiguous; exactly one → `Local`; none
     /// → fall through to the parent. A name found only in an ancestor is an `Outer` reference
     /// (nearest scope wins — an inner match shadows an outer one, matching PostgreSQL). 42703
     /// only if no scope in the chain has it. A qualifier-only rel (the RETURNING `old`/`new`
-    /// pseudo-relations) is invisible here — no new ambiguity (grammar.md §32).
-    fn resolve_bare(&self, name: &str) -> Result<Resolved> {
+    /// pseudo-relations) is invisible here — no new ambiguity (grammar.md §32). A column only,
+    /// never a whole-row reference: a `USING` column resolves through this directly.
+    fn resolve_bare_column(&self, name: &str) -> Result<Resolved> {
         // A USING/NATURAL MERGE column resolves to its surviving side (grammar.md §15), seeded here
         // so the bare name binds the merged column rather than its two (hidden) underlying copies —
         // which is why such a join column is unambiguous. A *non-hidden* column elsewhere with the
@@ -2251,7 +2297,7 @@ impl<'a> Scope<'a> {
             return Ok(Resolved::Local(idx));
         }
         match self.parent {
-            Some(p) => Ok(outer_of(p.resolve_bare(name)?)),
+            Some(p) => Ok(outer_of(p.resolve_bare_column(name)?)),
             None => Err(undefined_column(name)),
         }
     }
@@ -4590,6 +4636,7 @@ fn cte_synthetic_table_cols(
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
         on_commit: crate::catalog::OnCommit::PreserveRows,
+        scalar_func: false,
     }))
 }
 
@@ -5078,6 +5125,7 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
             on_commit: crate::catalog::OnCommit::PreserveRows,
+            scalar_func: false,
         })
     };
     match kind {
@@ -5187,11 +5235,6 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
     }
 }
 
-/// Build a set-returning function's **synthetic one-column relation** (spec/design/functions.md
-/// §10). The table's `name` is the function name (the un-aliased label fallback); the lone column's
-/// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
-/// else the function name — and its TYPE is `col_ty` (the promoted integer for `generate_series`,
-/// the bound element type for `unnest`).
 /// Map a parsed referential action to its persisted form (constraints.md §6.6).
 fn fk_action(a: RefAction, _clause: &str) -> Result<FkAction> {
     Ok(match a {
@@ -5212,11 +5255,15 @@ fn sorted_unique(v: &[usize]) -> Vec<usize> {
     s
 }
 
+/// A set-returning function's SYNTHETIC one-column relation (spec/design/functions.md §10). The
+/// table's name is the function name (the un-aliased label fallback); the lone column's name is
+/// [`srf_column_name`]'s and its type is `col_ty`. The relation is marked as a scalar function's, so
+/// its label also works as a whole-row reference to its column ([`Scope::resolve_bare`]).
 fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
     Box::new(Table {
         name: func_name.to_string(),
         columns: vec![Column {
-            name: alias.unwrap_or(func_name).to_string(),
+            name: srf_column_name(func_name, alias),
             ty: col_ty,
             decimal: None,
             varchar_len: None,
@@ -5235,7 +5282,22 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
         on_commit: crate::catalog::OnCommit::PreserveRows,
+        scalar_func: true,
     })
+}
+
+/// A single-column SRF's output column name — PostgreSQL's `chooseScalarFunctionAlias`, driven by
+/// the catalog's `column`/`column_source` (functions.md §10): a function with a named OUT parameter
+/// (`jsonb_array_elements` → `value`) is named by it even under a table alias; any other is named
+/// by the table alias when one is given, else by the function name. A column-alias list renames
+/// the result afterwards.
+fn srf_column_name(func_name: &str, alias: Option<&str>) -> String {
+    if let Some(d) = SET_RETURNING.iter().find(|d| d.name == func_name) {
+        if d.column_source == "out_param" {
+            return d.column.to_string();
+        }
+    }
+    alias.unwrap_or(func_name).to_string()
 }
 
 /// Apply a table function's optional rename-only column-alias list (grammar.md §35). Names replace
@@ -5824,6 +5886,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
         on_commit: crate::catalog::OnCommit::PreserveRows,
+        scalar_func: false,
     })
 }
 

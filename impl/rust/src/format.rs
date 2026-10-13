@@ -5180,6 +5180,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             foreign_keys,
             exclusions,
             on_commit: crate::catalog::OnCommit::PreserveRows,
+            scalar_func: false,
         },
         root_data_page,
         row_count,
@@ -6292,6 +6293,7 @@ mod tests {
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
             on_commit: crate::catalog::OnCommit::PreserveRows,
+            scalar_func: false,
         };
         let valid = table_entry_bytes(&table, 2, &[], 3);
 

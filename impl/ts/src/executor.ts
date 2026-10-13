@@ -350,6 +350,7 @@ import {
   type AggregateDesc,
   OPERATORS,
   type OperatorDesc,
+  SET_RETURNING,
   WINDOWS,
 } from "./operators.ts";
 import {
@@ -15484,7 +15485,7 @@ export class Engine {
           const name = usingCols[n]!;
           let li = -1;
           try {
-            const lr = left.resolveBare(name);
+            const lr = left.resolveBareColumn(name);
             if (lr.level === 0) li = lr.index;
           } catch {
             // fall through to the USING-specific error below
@@ -16322,8 +16323,8 @@ export class Engine {
   // scope whose parent is the enclosing query, so $N and correlated outer columns resolve while a
   // sibling FROM table does not (42703/42P01). The produced column is typed at the PROMOTED
   // integer type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows
-  // PostgreSQL's single-column function-alias rule: the table alias when one is given
-  // (generate_series(1,5) AS g ⇒ column g), else the function name generate_series.
+  // PostgreSQL's single-column function-alias rule (srfColumnName): a named OUT parameter, else the
+  // table alias when one is given (generate_series(1,5) AS g ⇒ column g), else the function name.
   private resolveSRF(
     name: string,
     args: Expr[],
@@ -28892,15 +28893,15 @@ export type JtCol =
 
 // srfTable builds a set-returning function's SYNTHETIC one-column relation (spec/design/functions.md
 // §10). The table's name is the function name (the un-aliased label fallback); the lone column's
-// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
-// else the function name — and its TYPE is colTy (the promoted integer for generate_series, the
-// bound element type for unnest).
+// NAME is srfColumnName's, and its TYPE is colTy (the promoted integer for generate_series, the
+// bound element type for unnest). The relation is marked as a scalar function's, so its label also
+// works as a whole-row reference to its column (Scope.resolveBare).
 export function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
   return {
     name: funcName,
     columns: [
       {
-        name: alias ?? funcName,
+        name: srfColumnName(funcName, alias),
         type: colTy,
         decimal: null,
         varcharLen: null,
@@ -28917,7 +28918,19 @@ export function srfTable(funcName: string, alias: string | null, colTy: Type): T
     indexes: [],
     fks: [],
     exclusions: [],
+    scalarFunc: true,
   };
+}
+
+// srfColumnName is a single-column SRF's output column name — PostgreSQL's
+// chooseScalarFunctionAlias, driven by the catalog's column/column_source (functions.md §10): a
+// function with a named OUT parameter (jsonb_array_elements → value) is named by it even under a
+// table alias; any other is named by the table alias when one is given, else by the function name.
+// A column-alias list renames the result afterwards (applySrfColumnAliases).
+function srfColumnName(funcName: string, alias: string | null): string {
+  const d = SET_RETURNING.find((desc) => desc.name === funcName);
+  if (d !== undefined && d.columnSource === "out_param") return d.column;
+  return alias ?? funcName;
 }
 
 // applySrfColumnAliases applies a table function's optional rename-only column-alias list

@@ -196,6 +196,7 @@ test("set-returning functions match spec/functions/catalog.toml", () => {
     assert.equal(d.argResolution, row.str("arg_resolution"), `${name}: arg_resolution`);
     assert.equal(d.result, row.str("result"), `${name}: result`);
     assert.equal(d.column, row.str("column"), `${name}: column`);
+    assert.equal(d.columnSource, row.str("column_source"), `${name}: column_source`);
     assert.equal(d.null, row.str("null"), `${name}: null`);
     assert.deepEqual([...d.errors], row.strs("errors"), `${name}: errors`);
   }

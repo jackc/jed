@@ -352,13 +352,59 @@ export class Scope {
     return new Scope(rels, catalog, null, true);
   }
 
-  // resolveBare resolves a bare column name against THIS scope, then OUTWARD through the parent
-  // chain. Within one scope: two+ relations have it → 42702 ambiguous; exactly one → local; none
-  // → fall through to the parent. A name found only in an ancestor is an outer reference (nearest
-  // scope wins). 42703 only if no scope in the chain has it.
-  // A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no
-  // new ambiguity (grammar.md §32).
+  // resolveBare resolves a bare name in expression position: a column (resolveBareColumn) when any
+  // scope in the chain has one, else a WHOLE-ROW reference to a scalar function relation of that
+  // label (resolveScalarFuncRow) — PostgreSQL's transformColumnRef order, which tries every level
+  // for a column before trying the name as a relation. 42703 when neither matches.
   resolveBare(name: string): Resolved {
+    try {
+      return this.resolveBareColumn(name);
+    } catch (e) {
+      if (!(e instanceof EngineError) || e.state !== "undefined_column") throw e;
+      const r = this.resolveScalarFuncRow(name);
+      if (r === null) throw e;
+      return r;
+    }
+  }
+
+  // resolveScalarFuncRow resolves a bare name that labels a scalar set-returning function's relation
+  // as a whole-row reference to it (spec/design/functions.md §10): a scalar function's row IS its
+  // one column, so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
+  // makeWholeRowVar for a scalar function). Searched THIS scope, then outward (nearest wins). No
+  // other relation kind has a whole-row value in jed (no implicit per-table row types).
+  resolveScalarFuncRow(name: string): Resolved | null {
+    for (const r of this.rels) {
+      if (
+        r.qualifierOnly ||
+        r.layer !== undefined ||
+        r.label !== name ||
+        r.table.scalarFunc !== true
+      ) {
+        continue;
+      }
+      this.lateralHit = true;
+      return { level: 0, index: r.offset };
+    }
+    // An unaliased parenthesized join keeps its inner function relation's label visible.
+    for (const sr of this.subRels) {
+      if (sr.label === name && sr.table.scalarFunc === true) {
+        this.lateralHit = true;
+        return { level: 0, index: sr.slots[0]! };
+      }
+    }
+    if (this.parent === null) return null;
+    const r = this.parent.resolveScalarFuncRow(name);
+    return r === null ? null : outerOf(r);
+  }
+
+  // resolveBareColumn resolves a bare column name against THIS scope, then OUTWARD through the
+  // parent chain. Within one scope: two+ relations have it → 42702 ambiguous; exactly one → local;
+  // none → fall through to the parent. A name found only in an ancestor is an outer reference
+  // (nearest scope wins). 42703 only if no scope in the chain has it.
+  // A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no
+  // new ambiguity (grammar.md §32). A column only, never a whole-row reference: a USING column
+  // resolves through this directly.
+  resolveBareColumn(name: string): Resolved {
     const lower = name;
     // A USING/NATURAL MERGE column resolves to its surviving side (grammar.md §15), seeded here so
     // the bare name binds the merged column rather than its two (hidden) underlying copies — which is
@@ -407,7 +453,7 @@ export class Scope {
       this.lateralHit = true;
       return { level: 0, index: found };
     }
-    if (this.parent !== null) return outerOf(this.parent.resolveBare(name));
+    if (this.parent !== null) return outerOf(this.parent.resolveBareColumn(name));
     throw undefinedColumn(name);
   }
 

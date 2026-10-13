@@ -547,7 +547,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			var predAST *exprNode
 			var merged, leftDrop, rightDrop []int
 			for n, name := range usingCols {
-				lr, lerr := left.resolveBare(name)
+				lr, lerr := left.resolveBareColumn(name)
 				if lerr != nil || lr.level != 0 {
 					return nil, newError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in left table")
 				}

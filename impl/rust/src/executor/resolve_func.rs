@@ -1283,7 +1283,9 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
     match e {
         // A bare/qualified column takes the catalog's canonical name, whether it resolves to a
         // local relation or (correlated) an enclosing one — `column_of` handles both.
-        Expr::Column(name, _) => match scope.resolve_bare(name) {
+        // A whole-row reference to a scalar function relation (no column of the name) is named by
+        // the reference itself (PG).
+        Expr::Column(name, _) => match scope.resolve_bare_column(name) {
             Ok(r) => scope.column_of(r).name.clone(),
             Err(_) => name.clone(),
         },

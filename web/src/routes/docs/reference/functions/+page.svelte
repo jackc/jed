@@ -78,8 +78,11 @@
 <p>
   Called in <code>FROM</code> position as a computed row source — they <em>expand</em> their
   arguments into a set of rows. <code>generate_series</code> yields an integer series;
-  <code>unnest</code> (polymorphic over <code>anyarray</code>) yields one row per array element.
-  Fixed output columns can be renamed with <code>AS relation(column, …)</code>.
+  <code>unnest</code> (polymorphic over <code>anyarray</code>) yields one row per array element. A
+  function with a named output parameter (<code>jsonb_array_elements</code> → <code>value</code>)
+  keeps that column name under a table alias; any other single-column function's column takes the
+  table alias, else the function name. Fixed output columns can be renamed with
+  <code>AS relation(column, …)</code>.
 </p>
 <div class="not-prose overflow-x-auto rounded-lg border border-slate-200">
   <table class="w-full border-collapse text-sm">
@@ -87,7 +90,8 @@
       <tr>
         <th class="px-3 py-2 font-semibold">Name</th>
         <th class="px-3 py-2 font-semibold">Argument types</th>
-        <th class="px-3 py-2 font-semibold">Result column</th>
+        <th class="px-3 py-2 font-semibold">Result type</th>
+        <th class="px-3 py-2 font-semibold">Output column</th>
         <th class="px-3 py-2 font-semibold">NULL</th>
       </tr>
     </thead>
@@ -97,6 +101,9 @@
           <td class="px-3 py-1.5 font-mono font-medium text-jed-ink">{srf.name}</td>
           <td class="px-3 py-1.5 font-mono text-slate-600">{args(srf.arg_families)}</td>
           <td class="px-3 py-1.5 font-mono text-slate-600">{srf.result}</td>
+          <td class="px-3 py-1.5 text-slate-600">
+            <code>{srf.column}</code>{#if srf.column_source === 'function'}&nbsp;or the alias{/if}
+          </td>
           <td class="px-3 py-1.5 text-slate-600">{srf.null}</td>
         </tr>
       {/each}

@@ -106,6 +106,11 @@ export type Table = {
   // absent means "preserveRows", always the case for a persistent or attached table. Never serialized
   // (temp catalog entries never reach a file).
   onCommit?: OnCommitAction;
+  // scalarFunc marks the synthetic one-column relation of a scalar set-returning function in FROM
+  // (spec/design/functions.md §10): its label is also a whole-row reference to its one column
+  // (PostgreSQL's makeWholeRowVar for a scalar function). Absent on a catalog table; never
+  // serialized.
+  scalarFunc?: boolean;
 };
 
 // OnCommitAction is what a commit does to a temporary table (spec/design/temp-tables.md §5.1): keep

@@ -1,0 +1,271 @@
+# The output column name of a single-column set-returning function in FROM (spec/design/functions.md
+# §10, grammar.md §35) — PostgreSQL's chooseScalarFunctionAlias, driven by the catalog's
+# column/column_source fields. A function that declares a named OUT parameter
+# (json[b]_array_elements[_text] → `value`) is named by it, EVEN under a table alias; every other
+# SRF (generate_series, unnest, json[b]_object_keys, jsonb_path_query, regexp_matches,
+# regexp_split_to_table) is named by the table alias when one is given, else by the function name.
+# A column-alias list `AS e(x)` renames either. A bare name that labels a scalar function relation
+# but names none of its columns is a WHOLE-ROW reference — a scalar function's row is its one
+# column (PostgreSQL's makeWholeRowVar), named by the reference. Output matches the postgres:18
+# oracle. Format: ../../../design/conformance.md.
+# requires: query.select, query.order_by, query.set_returning, query.table_alias, query.join_inner, query.join_using, query.join_parenthesized, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.group_by, query.cross_join, func.unnest, func.array, func.json_srf, func.json_verbatim, func.jsonb_path, func.regexp_matches, func.regexp_split_to_table, types.i32, types.i64, types.text, types.array, types.json, types.jsonb, types.jsonpath
+
+# --- functions with a named OUT parameter: the column is `value` ------------------------------
+
+# names: value
+query T rowsort
+SELECT * FROM jsonb_array_elements('[1, 2]')
+----
+1
+2
+
+# The table alias renames the relation, not the column.
+# names: value
+query T rowsort
+SELECT * FROM jsonb_array_elements('[1, 2]') AS e
+----
+1
+2
+
+# names: value
+query T rowsort
+SELECT e.value FROM jsonb_array_elements('[1, 2]') AS e
+----
+1
+2
+
+# names: value
+query T rowsort
+SELECT value FROM jsonb_array_elements('[1, 2]')
+----
+1
+2
+
+# A column-alias list renames it.
+# names: x
+query T rowsort
+SELECT * FROM jsonb_array_elements('[1, 2]') AS e(x)
+----
+1
+2
+
+statement error 42703
+SELECT e.value FROM jsonb_array_elements('[1, 2]') AS e(x)
+
+statement error 42P10
+SELECT * FROM jsonb_array_elements('[1, 2]') AS e(x, y)
+
+# names: value
+query T rowsort
+SELECT * FROM jsonb_array_elements_text('["a", "b"]') AS e
+----
+a
+b
+
+# names: value
+query T rowsort
+SELECT value FROM json_array_elements('[1, 2]')
+----
+1
+2
+
+# names: value
+query T rowsort
+SELECT * FROM json_array_elements_text('["a", "b"]') AS e
+----
+a
+b
+
+# --- functions without one: the alias, else the function name -------------------------------
+
+# names: generate_series
+query I rowsort
+SELECT * FROM generate_series(1, 2)
+----
+1
+2
+
+# names: g
+query I rowsort
+SELECT * FROM generate_series(1, 2) AS g
+----
+1
+2
+
+# names: x
+query I rowsort
+SELECT * FROM generate_series(1, 2) AS g(x)
+----
+1
+2
+
+# names: unnest
+query I rowsort
+SELECT * FROM unnest(ARRAY[1, 2])
+----
+1
+2
+
+# names: u
+query I rowsort
+SELECT * FROM unnest(ARRAY[1, 2]) u
+----
+1
+2
+
+# names: jsonb_object_keys
+query T rowsort
+SELECT * FROM jsonb_object_keys('{"a": 1, "b": 2}')
+----
+a
+b
+
+# names: k
+query T rowsort
+SELECT * FROM jsonb_object_keys('{"a": 1, "b": 2}') AS k
+----
+a
+b
+
+# names: json_object_keys
+query T rowsort
+SELECT json_object_keys FROM json_object_keys('{"a": 1, "b": 2}')
+----
+a
+b
+
+# names: jsonb_path_query
+query T rowsort
+SELECT * FROM jsonb_path_query('[1, 2]', '$[*]')
+----
+1
+2
+
+# names: p
+query T rowsort
+SELECT * FROM jsonb_path_query('[1, 2]', '$[*]') AS p
+----
+1
+2
+
+# names: regexp_matches
+query T rowsort
+SELECT * FROM regexp_matches('a1b2', '\d', 'g')
+----
+{1}
+{2}
+
+# names: r
+query T rowsort
+SELECT * FROM regexp_matches('a1b2', '\d', 'g') AS r
+----
+{1}
+{2}
+
+# names: regexp_split_to_table
+query T rowsort
+SELECT * FROM regexp_split_to_table('a,b', ',')
+----
+a
+b
+
+# names: s
+query T rowsort
+SELECT * FROM regexp_split_to_table('a,b', ',') s
+----
+a
+b
+
+# The function name is no column once an alias renames it.
+statement error 42703
+SELECT generate_series FROM generate_series(1, 2) AS g
+
+# --- the two-column json_each family: always key, value ---------------------------------------
+
+# names: key, value
+query TT rowsort
+SELECT * FROM jsonb_each('{"a": 1}') AS e
+----
+a
+1
+
+# names: k, value
+query TT rowsort
+SELECT * FROM json_each_text('{"a": 1}') AS e(k)
+----
+a
+1
+
+# --- whole-row references to a scalar function relation ---------------------------------------
+
+# The relation label reads the function's one column, named by the reference.
+# names: e
+query T rowsort
+SELECT e FROM jsonb_array_elements('[1, 2]') AS e
+----
+1
+2
+
+# names: jsonb_array_elements
+query T rowsort
+SELECT jsonb_array_elements FROM jsonb_array_elements('[1, 2]')
+----
+1
+2
+
+# names: e
+query T rowsort
+SELECT e FROM jsonb_array_elements('[1, 2]') AS e(x)
+----
+1
+2
+
+# names: g
+query I nosort
+SELECT g FROM generate_series(1, 3) AS g(x) WHERE g > 1 ORDER BY g DESC
+----
+3
+2
+
+# names: r
+query T nosort
+SELECT r FROM regexp_split_to_table('b,a,b', ',') AS r(piece) GROUP BY r ORDER BY r
+----
+a
+b
+
+# Correlated: the label of an enclosing query's function relation.
+# names: s
+query I nosort
+SELECT (SELECT g + 10) AS s FROM generate_series(1, 2) AS g(x) ORDER BY 1
+----
+11
+12
+
+# A column of that name wins over the relation label (columns are tried first, at every level).
+# names: g
+query I nosort
+SELECT (SELECT g FROM generate_series(5, 5) AS g(y)) AS g FROM generate_series(1, 2) AS t(g) ORDER BY 1
+----
+1
+2
+
+# A qualified reference stays a column reference.
+statement error 42703
+SELECT e.e FROM jsonb_array_elements('[1]') AS e(x)
+
+# An unaliased parenthesized join keeps its inner function relations' labels visible.
+# names: e, g
+query TI rowsort
+SELECT e, g FROM (jsonb_array_elements('[1]') AS e CROSS JOIN generate_series(5, 5) AS g(x))
+----
+1
+5
+
+# ... but an aliased one hides them.
+statement error 42703
+SELECT e FROM (jsonb_array_elements('[1]') AS e CROSS JOIN generate_series(5, 5) AS g(x)) AS j
+
+# A USING column must be a real column on both sides — never a whole-row reference.
+statement error 42703
+SELECT * FROM generate_series(1, 2) AS g(x) JOIN generate_series(2, 3) AS h(x) USING (g)

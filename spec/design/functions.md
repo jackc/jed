@@ -380,7 +380,7 @@ Because it produces rows, an SRF fits neither the operator/scalar result mold no
 aggregate fold. It lives in its own catalog array
 ([catalog.toml](../functions/catalog.toml) `[[set_returning]]`, `kind = "set_returning"`)
 with its own field set — `arity`, `arg_families`, `arg_resolution`, a reserved `result`, a
-fixed output `column` name, and `null = "empty_on_null"`. Two reserved SRF result codes exist:
+fixed output `column` name with its `column_source`, and `null = "empty_on_null"`. Two reserved SRF result codes exist:
 `set_of_promoted` ("a row set of one column at the promoted integer type of the args" —
 `generate_series`) and `set_of_element` ("a row set of one column at the element type bound from
 the `anyarray` argument" — `unnest`, the polymorphic SRF, [array-functions.md §9](array-functions.md)).
@@ -411,7 +411,7 @@ inclusive, stepping by `step` (default `1`); **any NULL argument yields zero row
 `22023` (`invalid_parameter_value`, *"step size cannot be equal to zero"*); and an **i64
 overflow** while stepping **stops the series cleanly** (no trap — the last representable
 element is emitted, then the loop ends). The output column name follows PG's single-column
-function-alias rule (§35). The arguments are **implicitly `LATERAL`** (§44): a `$N`, a correlated
+function-alias rule (§35, below). The arguments are **implicitly `LATERAL`** (§44): a `$N`, a correlated
 outer column, **and** a column of an earlier sibling FROM relation (`FROM t CROSS JOIN
 generate_series(1, t.n) g`) are all legal — a sibling reference re-evaluates the SRF once per
 left-hand row. Its fixed output columns accept PostgreSQL's column-alias-list form
@@ -431,6 +431,27 @@ array → zero rows; a NULL element → a NULL row), rather than a counted serie
 same machinery. Their single resolved argument is the regexp call node itself: it does the whole
 match and charges `regexp_match`'s cost, and the producer emits one `generated_row` per match
 (`text[]`) or per split piece (`text`).
+
+**Output column names (PostgreSQL's `chooseScalarFunctionAlias`).** A one-column SRF's column is
+named by catalog data, the same in every core: `column` is the name with no table alias, and
+`column_source` says where it comes from. `"out_param"` means the function declares a named OUT
+parameter in PostgreSQL (`pg_proc.proargnames`), and that name wins even under a table alias;
+`"function"` means it does not, so a table alias replaces the function name. Each core reads the
+generated `SET_RETURNING` table when it builds the synthetic relation; an explicit column-alias list
+`AS e(x)` renames either afterwards ([grammar.md](grammar.md) §35). The rows, oracle-checked against
+PostgreSQL 18 (`query/srf_column_names.test`):
+
+| function | `SELECT *` column | `… AS e` column |
+|---|---|---|
+| `json[b]_array_elements`, `json[b]_array_elements_text` | `value` | `value` |
+| `generate_series`, `unnest`, `json[b]_object_keys`, `jsonb_path_query`, `regexp_matches`, `regexp_split_to_table` | the function name | `e` |
+| `json[b]_each`, `json[b]_each_text` (two columns) | `key`, `value` | `key`, `value` |
+
+The record-returning functions (`json[b]_to_record[set]`, `json[b]_populate_record[set]`) and
+`JSON_TABLE` take their column names from the column-definition list, the composite type, or the
+`COLUMNS` clause, so they carry no catalog column name. A one-column relation is also marked as a
+scalar function's, so its label works as a whole-row reference to its one column
+([grammar.md](grammar.md) §35).
 
 **Cost.** Each generated element charges one **`generated_row`** ([cost.md](cost.md) §3),
 guarded so a `max_cost` ceiling aborts a runaway `generate_series(1, 10^18)` (or an over-cap

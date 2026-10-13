@@ -140,6 +140,7 @@ def rust_srf_entry(sf)
     "        arg_resolution: #{rust_str(sf['arg_resolution'])},",
     "        result: #{rust_str(sf['result'])},",
     "        column: #{rust_str(sf['column'])},",
+    "        column_source: #{rust_str(sf['column_source'])},",
     "        null: #{rust_str(sf['null'])},",
     "        errors: #{rust_slice(sf['errors'])},",
     "    },",
@@ -229,8 +230,10 @@ def rust_file(ops, aggs, srfs, wins)
     /// One set-returning function's metadata, mirroring a `[[set_returning]]` entry in
     /// catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate value);
     /// `result` is a reserved set id (set_of_promoted), `column` is the fixed output column
-    /// name, and `null` = "empty_on_null" (any NULL arg → zero rows). The uniqueness key is
-    /// (name, arity). See spec/design/functions.md §10.
+    /// name, `column_source` says whether that name is the function's named OUT parameter
+    /// ("out_param" — a table alias does not rename it) or the function name ("function" — a
+    /// table alias replaces it), and `null` = "empty_on_null" (any NULL arg → zero rows). The
+    /// uniqueness key is (name, arity). See spec/design/functions.md §10.
     pub struct SetReturningDesc {
         pub name: &'static str,
         pub surface: &'static str,
@@ -239,6 +242,7 @@ def rust_file(ops, aggs, srfs, wins)
         pub arg_resolution: &'static str,
         pub result: &'static str,
         pub column: &'static str,
+        pub column_source: &'static str,
         pub null: &'static str,
         pub errors: &'static [&'static str],
     }
@@ -366,6 +370,7 @@ def go_srf_entry(sf)
     ["ArgResolution", go_str(sf["arg_resolution"])],
     ["Result",        go_str(sf["result"])],
     ["Column",        go_str(sf["column"])],
+    ["ColumnSource",  go_str(sf["column_source"])],
     ["Null",          go_str(sf["null"])],
     ["Errors",        go_slice(sf["errors"])],
   ]
@@ -458,8 +463,10 @@ def go_file(ops, aggs, srfs, wins)
     // SetReturningDesc is one set-returning function's metadata, mirroring a [[set_returning]]
     // entry in catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate
     // value); Result is a reserved set id (set_of_promoted), Column is the fixed output column
-    // name, and Null = "empty_on_null" (any NULL arg -> zero rows). The uniqueness key is
-    // (Name, Arity). See spec/design/functions.md §10.
+    // name, ColumnSource says whether that name is the function's named OUT parameter
+    // ("out_param" -- a table alias does not rename it) or the function name ("function" -- a
+    // table alias replaces it), and Null = "empty_on_null" (any NULL arg -> zero rows). The
+    // uniqueness key is (Name, Arity). See spec/design/functions.md §10.
     type setReturningDesc struct {
     \tName          string
     \tSurface       string
@@ -468,6 +475,7 @@ def go_file(ops, aggs, srfs, wins)
     \tArgResolution string
     \tResult        string
     \tColumn        string
+    \tColumnSource  string
     \tNull          string
     \tErrors        []string
     }
@@ -591,6 +599,7 @@ def ts_srf_entry(sf)
   lines << "    argResolution: #{ts_str(sf['arg_resolution'])},"
   lines << "    result: #{ts_str(sf['result'])},"
   lines << "    column: #{ts_str(sf['column'])},"
+  lines << "    columnSource: #{ts_str(sf['column_source'])},"
   lines << "    null: #{ts_str(sf['null'])},"
   lines << "    errors: #{ts_arr(sf['errors'])},"
   lines << "  },"
@@ -677,8 +686,10 @@ def ts_file(ops, aggs, srfs, wins)
     // One set-returning function's metadata, mirroring a [[set_returning]] entry in
     // catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate value);
     // `result` is a reserved set id (set_of_promoted), `column` is the fixed output column
-    // name, and `null` = "empty_on_null" (any NULL arg → zero rows). The uniqueness key is
-    // (name, arity). See spec/design/functions.md §10.
+    // name, `columnSource` says whether that name is the function's named OUT parameter
+    // ("out_param" — a table alias does not rename it) or the function name ("function" — a
+    // table alias replaces it), and `null` = "empty_on_null" (any NULL arg → zero rows). The
+    // uniqueness key is (name, arity). See spec/design/functions.md §10.
     export interface SetReturningDesc {
       name: string;
       surface: string;
@@ -687,6 +698,7 @@ def ts_file(ops, aggs, srfs, wins)
       argResolution: string;
       result: string;
       column: string;
+      columnSource: string;
       null: string;
       errors: readonly string[];
     }

@@ -6630,8 +6630,10 @@ var aggregates = []aggregateDesc{
 // SetReturningDesc is one set-returning function's metadata, mirroring a [[set_returning]]
 // entry in catalog.toml. An SRF expands its args into a row SET (not a scalar/aggregate
 // value); Result is a reserved set id (set_of_promoted), Column is the fixed output column
-// name, and Null = "empty_on_null" (any NULL arg -> zero rows). The uniqueness key is
-// (Name, Arity). See spec/design/functions.md §10.
+// name, ColumnSource says whether that name is the function's named OUT parameter
+// ("out_param" -- a table alias does not rename it) or the function name ("function" -- a
+// table alias replaces it), and Null = "empty_on_null" (any NULL arg -> zero rows). The
+// uniqueness key is (Name, Arity). See spec/design/functions.md §10.
 type setReturningDesc struct {
 	Name          string
 	Surface       string
@@ -6640,6 +6642,7 @@ type setReturningDesc struct {
 	ArgResolution string
 	Result        string
 	Column        string
+	ColumnSource  string
 	Null          string
 	Errors        []string
 }
@@ -6654,6 +6657,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "promote",
 		Result:        "set_of_promoted",
 		Column:        "generate_series",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{},
 	},
@@ -6665,6 +6669,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "promote",
 		Result:        "set_of_promoted",
 		Column:        "generate_series",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6676,6 +6681,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "set_of_element",
 		Column:        "unnest",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{},
 	},
@@ -6687,6 +6693,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "jsonb",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6698,6 +6705,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6709,6 +6717,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "json",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6720,6 +6729,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6731,6 +6741,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "jsonb_object_keys",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6742,6 +6753,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "json_object_keys",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6753,6 +6765,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "jsonb",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6764,6 +6777,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6775,6 +6789,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "json",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
@@ -6786,10 +6801,23 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "value",
+		ColumnSource:  "out_param",
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
 	{
+		Name:          "jsonb_path_query",
+		Surface:       "jsonb_path_query",
+		Arity:         2,
+		ArgFamilies:   []string{"jsonb", "jsonpath"},
+		ArgResolution: "none",
+		Result:        "jsonb",
+		Column:        "jsonb_path_query",
+		ColumnSource:  "function",
+		Null:          "empty_on_null",
+		Errors:        []string{"22033", "22038", "2203A", "2203C"},
+	},
+	{
 		Name:          "regexp_matches",
 		Surface:       "regexp_matches",
 		Arity:         2,
@@ -6797,6 +6825,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text[]",
 		Column:        "regexp_matches",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{"2201B"},
 	},
@@ -6808,6 +6837,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text[]",
 		Column:        "regexp_matches",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{"2201B"},
 	},
@@ -6819,6 +6849,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "regexp_split_to_table",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{"2201B"},
 	},
@@ -6830,6 +6861,7 @@ var setReturning = []setReturningDesc{
 		ArgResolution: "none",
 		Result:        "text",
 		Column:        "regexp_split_to_table",
+		ColumnSource:  "function",
 		Null:          "empty_on_null",
 		Errors:        []string{"2201B", "22023"},
 	},

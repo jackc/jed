@@ -437,6 +437,11 @@ fn set_returning_match_spec() {
             row["column"].as_str().unwrap(),
             "{name} column"
         );
+        assert_eq!(
+            desc.column_source,
+            row["column_source"].as_str().unwrap(),
+            "{name} column_source"
+        );
         assert_eq!(desc.null, row["null"].as_str().unwrap(), "{name} null");
 
         let errs: Vec<&str> = row["errors"]

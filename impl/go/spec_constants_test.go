@@ -369,6 +369,9 @@ func TestSetReturningMatchSpec(t *testing.T) {
 		if desc.Column != row.str("column") {
 			t.Errorf("%s: column mismatch", name)
 		}
+		if desc.ColumnSource != row.str("column_source") {
+			t.Errorf("%s: column_source mismatch", name)
+		}
 		if desc.Null != row.str("null") {
 			t.Errorf("%s: null mismatch", name)
 		}

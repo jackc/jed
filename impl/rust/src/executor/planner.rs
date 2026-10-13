@@ -257,6 +257,7 @@ impl Engine {
                         foreign_keys: Vec::new(),
                         exclusions: Vec::new(),
                         on_commit: crate::catalog::OnCommit::PreserveRows,
+                        scalar_func: false,
                     });
                 }
                 synthetic.push(table);
@@ -694,7 +695,7 @@ impl Engine {
                 let (mut merged, mut left_drop, mut right_drop) =
                     (Vec::new(), Vec::new(), Vec::new());
                 for (n, name) in cols.iter().enumerate() {
-                    let li = match left.resolve_bare(name) {
+                    let li = match left.resolve_bare_column(name) {
                         Ok(Resolved::Local(i)) => i,
                         _ => {
                             return Err(EngineError::new(
@@ -2017,6 +2018,7 @@ fn one_column_table(name: &str, column: Column) -> Table {
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
         on_commit: crate::catalog::OnCommit::PreserveRows,
+        scalar_func: false,
     }
 }
 

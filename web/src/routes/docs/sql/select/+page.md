@@ -493,7 +493,10 @@ A `FROM` item can be a set-returning function — a computed row source instead 
 `generate_series(start, stop[, step])` yields an integer series; `unnest(anyarray)` expands an array
 into one row per element (a multidimensional array flattens, a `NULL` element becomes a `NULL` row,
 and a `NULL` or empty array yields no rows). The produced relation has one column, named after the
-function or its alias by default. Add a column-alias list when the output deserves a clearer name:
+function or its alias by default — except that a function with a named output parameter keeps that
+name, so `jsonb_array_elements(doc) AS e` exposes `e.value`, as in PostgreSQL. The alias alone also
+reads that one column, so `SELECT e FROM jsonb_array_elements(doc) AS e` works too. Add a
+column-alias list when the output deserves a clearer name:
 `unnest(tags) AS expanded(tag)` exposes `expanded.tag`. Multi-column table functions accept the same
 left-to-right renaming, and a shorter list leaves the remaining output names unchanged. The relation
 composes with `WHERE` / `ORDER BY` / `LIMIT` / joins like any other:

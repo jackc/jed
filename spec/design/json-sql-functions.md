@@ -152,6 +152,11 @@ shared **multi-column synthetic table** built by C0 ([json-table.md §1](json-ta
 All are `empty_on_null` (SQL NULL or empty input → 0 rows) and `immutable`, and — being SRFs
 — **implicitly lateral**, so a correlated `json_each(t.doc)` works with no LATERAL slice.
 
+The `value` / `key` column names are PostgreSQL's declared OUT parameters, so a table alias renames
+only the relation (`jsonb_array_elements(doc) AS e` exposes `e.value`); `json[b]_object_keys` and
+`jsonb_path_query` declare none, so their single column takes the alias, else the function name
+([functions.md](functions.md) §10).
+
 The `json` variants of `array_elements[_text]` and `each[_text]` are verbatim like the `json`
 accessors (§1.1): `json_array_elements` yields each element's exact sub-text, `json_each` yields
 every top-level member in **input order with duplicate keys kept** (keys de-escaped, values their

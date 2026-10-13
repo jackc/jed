@@ -309,13 +309,59 @@ func outerOf(r resolved) resolved {
 	return r
 }
 
-// resolveBare resolves a bare column name against THIS scope, then OUTWARD through the parent
+// resolveBare resolves a bare name in expression position: a column (resolveBareColumn) when any
+// scope in the chain has one, else a WHOLE-ROW reference to a scalar function relation of that
+// label (resolveScalarFuncRow) — PostgreSQL's transformColumnRef order, which tries every level for
+// a column before trying the name as a relation. 42703 when neither matches.
+func (s *scope) resolveBare(name string) (resolved, error) {
+	r, err := s.resolveBareColumn(name)
+	if err == nil {
+		return r, nil
+	}
+	if e, ok := err.(*EngineError); !ok || e.State != UndefinedColumn {
+		return resolved{}, err
+	}
+	if r, ok := s.resolveScalarFuncRow(name); ok {
+		return r, nil
+	}
+	return resolved{}, err
+}
+
+// resolveScalarFuncRow resolves a bare name that labels a scalar set-returning function's relation
+// as a whole-row reference to it (spec/design/functions.md §10): a scalar function's row IS its one
+// column, so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
+// makeWholeRowVar for a scalar function). Searched THIS scope, then outward (nearest wins). No other
+// relation kind has a whole-row value in jed (no implicit per-table row types).
+func (s *scope) resolveScalarFuncRow(name string) (resolved, bool) {
+	for _, r := range s.rels {
+		if r.qualifierOnly || r.layer != nil || r.label != name || !r.table.ScalarFunc {
+			continue
+		}
+		s.lateralHit = true
+		return resolved{level: 0, index: r.offset}, true
+	}
+	// An unaliased parenthesized join keeps its inner function relation's label visible.
+	for _, sr := range s.subRels {
+		if sr.label == name && sr.table.ScalarFunc {
+			s.lateralHit = true
+			return resolved{level: 0, index: sr.slots[0]}, true
+		}
+	}
+	if s.parent != nil {
+		if r, ok := s.parent.resolveScalarFuncRow(name); ok {
+			return outerOf(r), true
+		}
+	}
+	return resolved{}, false
+}
+
+// resolveBareColumn resolves a bare column name against THIS scope, then OUTWARD through the parent
 // chain. Within one scope: two+ relations have it → 42702 ambiguous; exactly one → local; none
 // → fall through to the parent. A name found only in an ancestor is an outer reference (nearest
 // scope wins — an inner match shadows an outer one). 42703 only if no scope in the chain has it.
 // A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no new
-// ambiguity (grammar.md §32).
-func (s *scope) resolveBare(name string) (resolved, error) {
+// ambiguity (grammar.md §32). A USING column resolves through this directly (a column only).
+func (s *scope) resolveBareColumn(name string) (resolved, error) {
 	// A USING/NATURAL MERGE column resolves to its surviving side (grammar.md §15), seeded here so
 	// the bare name binds the merged column rather than its two (hidden) underlying copies — which
 	// is why such a join column is unambiguous. A non-hidden column elsewhere with the same name
@@ -373,7 +419,7 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 		return resolved{level: 0, index: found}, nil
 	}
 	if s.parent != nil {
-		r, err := s.parent.resolveBare(name)
+		r, err := s.parent.resolveBareColumn(name)
 		if err != nil {
 			return resolved{}, err
 		}
@@ -1040,7 +1086,9 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 func outputName(s *scope, e exprNode) string {
 	switch e.Kind {
 	case exprColumn:
-		if r, err := s.resolveBare(e.Column); err == nil {
+		// A whole-row reference to a scalar function relation (no column of the name) is named by
+		// the reference itself (PG).
+		if r, err := s.resolveBareColumn(e.Column); err == nil {
 			return s.columnOf(r).Name
 		}
 		return e.Column

@@ -34,12 +34,14 @@
 #      (name, arg_families) is unique. Aggregates are NOT operators (no symbol/precedence/
 #      arg_resolution/arity), so they skip the operator-only checks above (functions.md).
 #  12. each [[set_returning]] (kind = "set_returning") has its own field set (name/kind/
-#      surface/arity/arg_families/arg_resolution/result/column/null/errors); arity ==
+#      surface/arity/arg_families/arg_resolution/result/column/column_source/null/errors); arity ==
 #      arg_families length; result is a scalar id, a concrete array `<scalar>[]`, or a
 #      reserved set id (set_of_promoted);
 #      null is "empty_on_null"; column is a non-empty string. "promote" requires each
 #      operand family to have a promotion rule (NOT a comparable pair — an SRF widens its
 #      own args among themselves, it never compares two families). (name, arity) is unique.
+#      column_source is out_param|function; a "function" column equals the surface; every
+#      overload of one name agrees on column + column_source (the cores look it up by name).
 #  13. OPTIONAL named/default args (scalar functions — functions.md §11): if present,
 #      arg_names is a string array of length == arity with no duplicates; arg_defaults is a
 #      string array of integer literals, length ≤ arity, filling only TRAILING slots. Across
@@ -102,7 +104,10 @@ AGG_REQUIRED_FIELDS  = %w[name kind surface arg result null errors].freeze
 #   set_of_element  — a row set of one column at the ELEM bound from the anyarray arg (unnest).
 RESERVED_SRF_RESULTS = %w[set_of_promoted set_of_element].to_set
 SRF_NULL_BEHAVIORS   = %w[empty_on_null].to_set
-SRF_REQUIRED_FIELDS  = %w[name kind surface arity arg_families arg_resolution result column null errors].freeze
+SRF_REQUIRED_FIELDS  = %w[name kind surface arity arg_families arg_resolution result column column_source null errors].freeze
+# Where an SRF's output column name comes from (functions.md §10): a named OUT parameter (a table
+# alias does not rename it) or the function name (a table alias replaces it).
+SRF_COLUMN_SOURCES   = %w[out_param function].to_set
 
 # Window functions (kind = "window") use a distinct field set and validation branch — per-row
 # AND a fold over a frame (window.md). `result` accepts a scalar id or "same_as_input"; `args` is
@@ -333,6 +338,7 @@ def main
   # SRFs are neither operators nor aggregates, so they skip the operator/aggregate checks above.
   set_returning = catalog["set_returning"] || []
   srf_sigs = [] # [name, arity] — unique per overload (the 2-arg and 3-arg forms share a name)
+  srf_columns = {} # name -> [column, column_source] — must agree across a name's overloads
   set_returning.each do |sf|
     id = sf["name"] || "(unnamed)"
 
@@ -342,6 +348,16 @@ def main
     fail!("set_returning #{id}: kind must be \"set_returning\"") unless sf["kind"] == "set_returning"
     fail!("set_returning #{id}: surface must be a non-empty string") unless sf["surface"].is_a?(String) && !sf["surface"].empty?
     fail!("set_returning #{id}: column must be a non-empty string") unless sf["column"].is_a?(String) && !sf["column"].empty?
+    unless SRF_COLUMN_SOURCES.include?(sf["column_source"])
+      fail!("set_returning #{id}: column_source #{sf['column_source'].inspect} not in (#{SRF_COLUMN_SOURCES.to_a.join('|')})")
+    end
+    if sf["column_source"] == "function" && sf["column"] != sf["surface"]
+      fail!("set_returning #{id}: a column_source = \"function\" column must equal the surface")
+    end
+    first = srf_columns[sf["name"]] ||= [sf["column"], sf["column_source"]]
+    unless first == [sf["column"], sf["column_source"]]
+      fail!("set_returning #{id}: overloads disagree on column/column_source")
+    end
 
     args = sf["arg_families"]
     fail!("set_returning #{id}: arg_families must be an array") unless args.is_a?(Array)

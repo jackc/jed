@@ -1097,6 +1097,7 @@ impl Engine {
             exclusions: Vec::new(),
             // A temp table's end-of-transaction action (42P16 above for any other) — temp-tables.md §5.1.
             on_commit: ct.on_commit.unwrap_or_default(),
+            scalar_func: false,
         };
         let mut check_deps: Vec<Vec<HostFuncDep>> = Vec::with_capacity(ct.checks.len());
         for def in &ct.checks {
@@ -1975,6 +1976,7 @@ impl Engine {
                                 foreign_keys: Vec::new(),
                                 exclusions: Vec::new(),
                                 on_commit: crate::catalog::OnCommit::PreserveRows,
+                                scalar_func: false,
                             })?
                             .pop()
                             .unwrap();
@@ -2863,6 +2865,7 @@ impl Engine {
                                     foreign_keys: Vec::new(),
                                     exclusions: Vec::new(),
                                     on_commit: crate::catalog::OnCommit::PreserveRows,
+                                    scalar_func: false,
                                 };
                                 let default_cast = Expr::Cast {
                                     inner: Box::new(Expr::Column(

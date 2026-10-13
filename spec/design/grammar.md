@@ -2580,9 +2580,21 @@ alias is `table_function_alias ::= "AS"? identifier ("(" identifier ("," identif
 
 **Labeling and column aliases.** The relation's **label** is the alias, or the function name when
 there is none. Without a column list, a one-column function follows PostgreSQL's
-single-column function-alias rule: the relation alias also becomes the column name
+single-column function-alias rule (`chooseScalarFunctionAlias`): a function that declares a named
+OUT parameter is named by it, alias or not (`jsonb_array_elements(doc) AS e` ⇒ column `value`, so
+`e.value` resolves); any other one-column function takes the relation alias as its column name
 (`generate_series(1, 5) AS g` ⇒ column `g`, so `g.g` resolves and `g.generate_series` is
-`42703`), while an unaliased function uses its catalog column name (`generate_series`).
+`42703`), and an unaliased one its catalog column name (`generate_series`). Which functions declare
+an OUT parameter is catalog data (`column` / `column_source`, [functions.md](functions.md) §10).
+
+A bare name that labels a one-column function relation but names no column in scope is a
+**whole-row reference**, which for a scalar function is its one column (PostgreSQL's
+`makeWholeRowVar`): `SELECT e FROM jsonb_array_elements(doc) AS e` and `SELECT g FROM
+generate_series(1, 3) AS g(n)` read the produced value, and the output column is named by the
+reference (`e`, `g`). Columns win: every scope level is searched for a column before the name is
+tried as a relation label (nearest level first). A `USING` column, a qualified `g.g`, and any other
+relation kind (a table, derived table, CTE, multi-column or record function) never take this
+reading — jed has no implicit per-table row types.
 
 An explicit list overrides output names left-to-right: `generate_series(1, 5) AS g(n)` exposes
 the column as `g.n`, and `jsonb_each(doc) AS e(k, v)` exposes `e.k` / `e.v`. It applies to every

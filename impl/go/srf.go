@@ -19,8 +19,8 @@ import (
 // scope whose parent is the enclosing query, so $N and correlated outer columns resolve while a
 // sibling FROM table does not (42703/42P01). The produced column is typed at the PROMOTED integer
 // type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows PostgreSQL's
-// single-column function-alias rule: the table alias when one is given (generate_series(1,5) AS g
-// ⇒ column g), else the function name generate_series.
+// single-column function-alias rule (srfColumnName): a named OUT parameter, else the table alias
+// when one is given (generate_series(1,5) AS g ⇒ column g), else the function name.
 func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, columnDefs []typeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
 	// inherited so an arg subquery can reference a CTE (cte.md §2).
@@ -482,18 +482,36 @@ func (db *engine) resolveRegexSRF(name string, args []*exprNode, alias *string, 
 
 // srfTable builds a set-returning function's SYNTHETIC one-column relation (spec/design/functions.md
 // §10). The table's Name is the function name (the un-aliased label fallback); the lone column's
-// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
-// else the function name — and its TYPE is colTy (the promoted integer for generate_series, the
-// bound element type for unnest).
+// NAME is srfColumnName's, and its TYPE is colTy (the promoted integer for generate_series, the
+// bound element type for unnest). The relation is marked as a scalar function's, so its label also
+// works as a whole-row reference to its column (scope.resolveBare).
 func srfTable(funcName string, alias *string, colTy dataType) *catTable {
-	colName := funcName
-	if alias != nil {
-		colName = *alias
-	}
 	return &catTable{
-		Name:    funcName,
-		Columns: []catColumn{{Name: colName, Type: colTy}},
+		Name:       funcName,
+		Columns:    []catColumn{{Name: srfColumnName(funcName, alias), Type: colTy}},
+		ScalarFunc: true,
 	}
+}
+
+// srfColumnName is a single-column SRF's output column name — PostgreSQL's
+// chooseScalarFunctionAlias, driven by the catalog's column/column_source (functions.md §10): a
+// function with a named OUT parameter (jsonb_array_elements → value) is named by it even under a
+// table alias; any other is named by the table alias when one is given, else by the function name.
+// A column-alias list renames the result afterwards (applySRFColumnAliases).
+func srfColumnName(funcName string, alias *string) string {
+	for _, d := range setReturning {
+		if d.Name != funcName {
+			continue
+		}
+		if d.ColumnSource == "out_param" {
+			return d.Column
+		}
+		break
+	}
+	if alias != nil {
+		return *alias
+	}
+	return funcName
 }
 
 // applySRFColumnAliases applies a table function's optional rename-only column-alias list

@@ -5888,8 +5888,16 @@ errors         = ["22016"]
 #               integer type of the args (the SRF analogue of the aggregates' sum_widen);
 #               "set_of_element" = a row set of ONE column whose type is the ELEM bound from the
 #               `anyarray` argument (unnest — the SRF analogue of the `anyelement` result code).
-# column        the fixed output column NAME of the produced relation (PG names it after the
-#               function: generate_series / unnest). Authored data, not computed.
+# column        the fixed output column NAME of the produced relation, PostgreSQL's
+#               chooseScalarFunctionAlias result with no table alias: the function's single named
+#               OUT parameter when pg_proc declares one (proargnames — jsonb_array_elements → value),
+#               else the function name (generate_series / unnest). Authored data, not computed.
+# column_source where `column` comes from, which decides whether a table alias renames it:
+#               "out_param" = a declared OUT parameter name — it names the column even under a
+#               table alias (`FROM jsonb_array_elements(…) AS e` → column value); "function" = the
+#               function name — a table alias replaces it (`FROM generate_series(1,3) AS g` →
+#               column g). A column-alias list `AS e(x)` renames either. For the two-column
+#               json[b]_each[_text] rows both columns are OUT parameters (key, value).
 # null          "empty_on_null" = any NULL argument yields ZERO rows (PG generate_series; a NULL
 #               array → zero rows for unnest), as opposed to a scalar function's "propagates". A
 #               NULL *element* of a non-NULL array is still produced as a NULL row (unnest).
@@ -5908,6 +5916,7 @@ arg_families   = ["integer", "integer"]
 arg_resolution = "promote"
 result         = "set_of_promoted"
 column         = "generate_series"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = []
 
@@ -5920,6 +5929,7 @@ arg_families   = ["integer", "integer", "integer"]
 arg_resolution = "promote"
 result         = "set_of_promoted"
 column         = "generate_series"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -5940,6 +5950,7 @@ arg_families   = ["anyarray"]
 arg_resolution = "none"
 result         = "set_of_element"
 column         = "unnest"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = []
 
@@ -5960,6 +5971,7 @@ arg_families   = ["jsonb"]
 arg_resolution = "none"
 result         = "jsonb"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -5972,6 +5984,7 @@ arg_families   = ["jsonb"]
 arg_resolution = "none"
 result         = "text"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -5984,6 +5997,7 @@ arg_families   = ["json"]
 arg_resolution = "none"
 result         = "json"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -5996,6 +6010,7 @@ arg_families   = ["json"]
 arg_resolution = "none"
 result         = "text"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -6008,6 +6023,7 @@ arg_families   = ["jsonb"]
 arg_resolution = "none"
 result         = "text"
 column         = "jsonb_object_keys"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -6020,6 +6036,7 @@ arg_families   = ["json"]
 arg_resolution = "none"
 result         = "text"
 column         = "json_object_keys"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -6040,6 +6057,7 @@ arg_families   = ["jsonb"]
 arg_resolution = "none"
 result         = "jsonb"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -6052,6 +6070,7 @@ arg_families   = ["jsonb"]
 arg_resolution = "none"
 result         = "text"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -6064,6 +6083,7 @@ arg_families   = ["json"]
 arg_resolution = "none"
 result         = "json"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -6076,6 +6096,7 @@ arg_families   = ["json"]
 arg_resolution = "none"
 result         = "text"
 column         = "value"
+column_source  = "out_param"
 null           = "empty_on_null"
 errors         = ["22023"]
 
@@ -6089,6 +6110,24 @@ errors         = ["22023"]
 # 22023, PG). Each produced row charges one generated_row on top of the call's regex work (the
 # operator_eval + regex_compile + regex_step regexp_match charges). `result = "text[]"` is a concrete
 # array id (the operator precedent). FROM-clause only, implicitly lateral, like every SRF.
+# jsonb_path_query(jsonb, jsonpath) → setof jsonb (P2, jsonpath.md §5.2): one jsonb row per item of
+# the path's evaluation sequence over the context document. A NULL argument yields zero rows; each
+# produced row charges one generated_row on top of the path evaluation. PG declares no OUT parameter
+# (its parameters are target/path/vars/silent, all IN), so the column is named after the function.
+# The 4-arg vars/silent forms are deferred. The errors are the strict-mode evaluation errors.
+[[set_returning]]
+name           = "jsonb_path_query"
+kind           = "set_returning"
+surface        = "jsonb_path_query"
+arity          = 2
+arg_families   = ["jsonb", "jsonpath"]
+arg_resolution = "none"
+result         = "jsonb"
+column         = "jsonb_path_query"
+column_source  = "function"
+null           = "empty_on_null"
+errors         = ["22033", "22038", "2203A", "2203C"]
+
 [[set_returning]]
 name           = "regexp_matches"
 kind           = "set_returning"
@@ -6098,6 +6137,7 @@ arg_families   = ["text", "text"]
 arg_resolution = "none"
 result         = "text[]"
 column         = "regexp_matches"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = ["2201B"]
 
@@ -6110,6 +6150,7 @@ arg_families   = ["text", "text", "text"]
 arg_resolution = "none"
 result         = "text[]"
 column         = "regexp_matches"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = ["2201B"]
 
@@ -6122,6 +6163,7 @@ arg_families   = ["text", "text"]
 arg_resolution = "none"
 result         = "text"
 column         = "regexp_split_to_table"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = ["2201B"]
 
@@ -6134,5 +6176,6 @@ arg_families   = ["text", "text", "text"]
 arg_resolution = "none"
 result         = "text"
 column         = "regexp_split_to_table"
+column_source  = "function"
 null           = "empty_on_null"
 errors         = ["2201B", "22023"]

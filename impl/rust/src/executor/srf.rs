@@ -12,8 +12,8 @@ impl Engine {
     /// `42883`. Non-LATERAL: the args resolve against an EMPTY-local-rels scope whose `parent` is
     /// the enclosing query, so `$N` and correlated outer columns resolve while a sibling FROM table
     /// does not (42703/42P01). The produced column's NAME follows PostgreSQL's single-column
-    /// function-alias rule: the table alias when one is given (`unnest(xs) AS g` ⇒ column `g`),
-    /// else the function name. Returns `(synthetic table, resolved args, kind)`.
+    /// function-alias rule (`srf_column_name`): a named OUT parameter, else the table alias when one
+    /// is given (`unnest(xs) AS g` ⇒ column `g`), else the function name. Returns `(synthetic table, resolved args, kind)`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_srf<'a>(
         &'a self,
@@ -399,6 +399,7 @@ impl Engine {
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
             on_commit: crate::catalog::OnCommit::PreserveRows,
+            scalar_func: false,
         });
         Ok((table, vec![rarg], SrfKind::JsonRecord { jsonb, set }))
     }
@@ -488,6 +489,7 @@ impl Engine {
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
             on_commit: crate::catalog::OnCommit::PreserveRows,
+            scalar_func: false,
         });
         // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
         Ok((table, vec![doc], SrfKind::JsonRecord { jsonb, set }))
@@ -575,6 +577,7 @@ impl Engine {
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
             on_commit: crate::catalog::OnCommit::PreserveRows,
+            scalar_func: false,
         });
         Ok((
             table,

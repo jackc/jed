@@ -319,9 +319,11 @@ export function outputName(scope: Scope, e: Expr): string {
   // A bare/qualified column takes the catalog's canonical name, whether it resolves to a local
   // relation or (correlated) an enclosing one — columnOf handles both. A qualifier that names no
   // relation (the column.field ambiguity fallback) takes the written name (PG; matching Rust).
+  // A whole-row reference to a scalar function relation (no column of the name) is named by the
+  // reference itself (PG).
   if (e.kind === "column") {
     try {
-      return scope.columnOf(scope.resolveBare(e.name)).name;
+      return scope.columnOf(scope.resolveBareColumn(e.name)).name;
     } catch {
       return e.name;
     }
