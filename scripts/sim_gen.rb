@@ -578,12 +578,15 @@ module SimGen
       emit("on #{sid} #{read_sql(@rng.pick(names))}")
     end
 
+    # The last two shapes sort and group on a non-key expression, so a small work_mem spills them.
     def read_sql(table)
-      case @rng.range(0, 3)
+      case @rng.range(0, 5)
       when 0 then "SELECT count(*), sum(id) FROM #{table}"
       when 1 then "SELECT * FROM #{table} WHERE id = #{@rng.range(1, 300)}"
       when 2 then "SELECT * FROM #{table} WHERE id BETWEEN #{(lo = @rng.range(1, 300))} AND #{lo + 20} ORDER BY id"
-      else "SELECT * FROM #{table} ORDER BY id LIMIT #{@rng.range(1, 10)}"
+      when 3 then "SELECT * FROM #{table} ORDER BY id LIMIT #{@rng.range(1, 10)}"
+      when 4 then "SELECT * FROM #{table} ORDER BY md5(id::text) LIMIT #{@rng.range(5, 40)}"
+      else "SELECT id % #{@rng.range(2, 9)} AS k, count(*), max(id) FROM #{table} GROUP BY 1"
       end
     end
   end

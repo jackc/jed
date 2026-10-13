@@ -17,6 +17,7 @@ package jed
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -216,7 +217,13 @@ func (r simResult) json() string {
 		status = "fail"
 	}
 	return fmt.Sprintf(`{"trace":%s,"core":"go","status":%q,"steps":%d,"violation":%s,"violation_step":%d,"transcript_hash":"%016x","ops_hash":"%016x"}`,
-		strconv.Quote(r.name), status, r.steps, strconv.Quote(r.violation), r.violationStep, r.transcriptHash, r.opsHash)
+		simJSONString(r.name), status, r.steps, simJSONString(r.violation), r.violationStep, r.transcriptHash, r.opsHash)
+}
+
+// simJSONString encodes s as a JSON string (a violation message may hold any character).
+func simJSONString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // simRunFile runs one trace twice — the second run is the self-determinism check (§8.5) — and

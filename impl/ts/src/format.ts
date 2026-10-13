@@ -3199,7 +3199,7 @@ function unassignTreePages(n: PNode | null, assigned: Set<number>): void {
 // set-once page, and each OnDisk child leaf's page (walked without faulting it — the page id is on the
 // child ref). A page-0 node is a dirty node not yet persisted (never on a committed tree at compaction
 // time); it is skipped so page 0 (a meta slot) is never marked.
-function collectTreePages(n: PNode | null, reached: Set<number>): void {
+export function collectTreePages(n: PNode | null, reached: Set<number>): void {
   if (n === null) return;
   if (n.page !== 0) reached.add(n.page);
   for (const c of n.children) {
@@ -4485,7 +4485,11 @@ export function resolveUnfetchedSelf(ref: Unfetched): Value {
 // `first`, following next_page hops and reading HEADERS only — no payload assembly, no
 // decompression (spec/design/large-values.md §14). The open-time reachability walk marks live
 // chains with this, so opening a file never materializes its large values.
-function chainPages(first: number, length: number, fetch: (page: number) => Uint8Array): number[] {
+export function chainPages(
+  first: number,
+  length: number,
+  fetch: (page: number) => Uint8Array,
+): number[] {
   const out: number[] = [];
   let gathered = 0;
   let p = first;

@@ -378,6 +378,16 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   shared OS-lock protocol, crash release, meta recovery, and cross-core interoperability. It joins
   `mise run ci` with the `file.shared_process` capability and is release-blocking for shared file access;
   this behavior must not live only in three mirrored per-core tests.
+- **Deterministic simulation testing covers the storage state machine** (`spec/design/simulation-testing.md`).
+  A seeded generator (`scripts/sim_gen.rb`) writes multi-session histories; each core's runner executes
+  them over a simulated disk whose power losses, process crashes, torn sectors, and I/O errors are
+  decided by a content-keyed function, so a run replays exactly from its seed and the three cores must
+  produce **byte-identical transcripts and crash images**. Oracles: recovery lands between the durability
+  floor and the newest attempted commit and matches a recorded generation; a reader sees its pinned
+  version; no `XX001`; image and live integrity checks; and `spec/fileformat/verify.rb --check-image`
+  re-decides every recovery independently. `mise run ci` runs the regression traces and a fixed sweep;
+  `mise run sim:sweep` explores further and `sim:shrink` minimizes a failure. When a storage feature
+  lands (a page type, commit path, host operation, or setting), grow the generator and checkers with it.
 - **Bootstrap the corpus via differential testing against PostgreSQL.** The real PG
   service is the **result oracle** (§1): run a supported-subset query against it, capture
   output, emit a corpus entry. Generates a large, *correct* corpus cheaply. Where our

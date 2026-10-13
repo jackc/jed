@@ -39,7 +39,7 @@ module Sim
       run: [["target/release/sim"], File.join(REPO, "impl/rust")]
     },
     "ts" => {
-      build: nil,
+      build: [["ruby", File.join(REPO, "scripts/npm_ci.rb"), "impl/ts"], REPO],
       run: [["node", "src/bin/sim.ts"], File.join(REPO, "impl/ts")]
     }
   }.freeze

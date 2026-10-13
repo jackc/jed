@@ -254,27 +254,27 @@ run = [
 
 # Deterministic simulation testing (spec/design/simulation-testing.md): seeded multi-session
 # histories over a fault-injecting simulated disk, checked by recovery, durability, isolation, and
-# integrity oracles. A sweep is bench-family and stays outside `ci`; the committed regression traces
-# (spec/conformance/sim/regress) are the part a gate runs.
+# integrity oracles. `ci` runs the committed regression traces (spec/conformance/sim/regress) and a
+# fixed eight-seed sweep of every profile; longer sweeps are bench-family and stay outside it.
 [tasks."sim:sweep"]
 description = "Simulation sweep: generate traces, run them on the cores; fails on any oracle violation or disagreement"
 usage = '''
 arg "[seeds]" default="1..50" help="Seed range, e.g. 1..200"
 arg "[profile]" default="all" help="A profile under spec/conformance/sim/profiles, or all"
-arg "[cores]" default="go" help="Comma-separated subset of go,rust,ts"
+arg "[cores]" default="go,rust,ts" help="Comma-separated subset of go,rust,ts"
 '''
 run = 'ruby scripts/sim.rb sweep --seeds "${usage_seeds}" --profile "${usage_profile}" --cores "${usage_cores}"'
 
 [tasks."sim:regress"]
 description = "Run the committed simulation regression traces on the cores"
-usage = 'arg "[cores]" default="go" help="Comma-separated subset of go,rust,ts"'
+usage = 'arg "[cores]" default="go,rust,ts" help="Comma-separated subset of go,rust,ts"'
 run = 'ruby scripts/sim.rb regress --cores "${usage_cores}"'
 
 [tasks."sim:replay"]
 description = "Rerun one simulation trace and keep its transcripts"
 usage = '''
 arg "<trace>" help="The .sim file"
-arg "[cores]" default="go" help="Comma-separated subset of go,rust,ts"
+arg "[cores]" default="go,rust,ts" help="Comma-separated subset of go,rust,ts"
 '''
 run = 'ruby scripts/sim.rb replay "${usage_trace}" --cores "${usage_cores}"'
 

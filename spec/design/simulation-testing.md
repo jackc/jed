@@ -1,6 +1,6 @@
 # Deterministic simulation testing — design
 
-> **Status: S1 landed (Go runner); S2–S6 not yet built** (§14). A seeded simulator that runs long, randomized
+> **Status: S1–S3 and S6 landed in all three cores; S4 and S5 in progress** (§14). A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -422,13 +422,17 @@ oracles are what the test means.
 - **Runners:** one per core, test-only, reading many traces per process so startup cost is
   amortized. A runner needs to open an engine over a caller-supplied `BlockStore`. Go runs it as an
   internal test compiled once (`go test -c`), as the existing crash tests do:
-  `impl/go/sim_{disk,runner,check}_test.go`. Rust exposes the hook behind a non-default `sim` cargo
-  feature. TypeScript already exports the interface. A runner reads `JED_SIM_IN` (a trace, a
-  directory, or a list file) and writes transcripts under `JED_SIM_OUT`.
+  `impl/go/sim_{disk,runner,check}_test.go`. Rust's runner is `impl/rust/src/sim/`, a library module
+  behind the non-default `sim` cargo feature (run by `src/bin/sim.rs`), so it reaches crate-internal
+  state through a few feature-gated accessors. TypeScript's is `impl/ts/src/sim/` with
+  `src/bin/sim.ts`, imported by nothing the library or browser build loads. A runner reads
+  `JED_SIM_IN` (a trace, a directory, or a list file) and writes transcripts under `JED_SIM_OUT`.
 - **Tasks:**
-  - `mise run sim:sweep [seeds] [profile] [cores]` runs a seed sweep **outside** `mise run ci`, like
-    `stress`. 1,050 traces across all profiles take about 90 seconds on Go.
-  - `mise run sim:regress [cores]` runs the regression corpus; it joins the gate in S2.
+  - `mise run sim:sweep [seeds] [profile] [cores]` runs a seed sweep. `mise run ci` runs a fixed
+    eight-seed sweep of every profile on all three cores (about 15 seconds); longer sweeps are
+    bench-family, like `stress`.
+  - `mise run sim:regress [cores]` runs the regression corpus and the independent image checker on
+    every crash image it produces; it is in `mise run ci`.
   - `mise run sim:replay <trace> [cores]` and `mise run sim:shrink <trace> [core]`.
   - `mise run sim:plant [seeds]` re-runs the planted-bug check (§14), an analysis tool like mutation
     testing.
@@ -441,7 +445,7 @@ oracles are what the test means.
 | Existing | Status alongside the simulator |
 |---|---|
 | Per-core exhaustive crash tests | **Keep.** They enumerate every subset of small commits, an exhaustiveness random search cannot promise. The simulator covers the long histories they cannot express. |
-| `spec/fileformat/verify.rb` | **Extended in slice S6** with `--check-image`, an independent fourth voice for §8.3 and for which generation recovery should select, run on regression-corpus crash images. |
+| `spec/fileformat/verify.rb` | **Extended in slice S6** with `--check-image`, an independent fourth voice for §8.3 and for which generation recovery should select. |
 | Concurrency Layers 1–3 | **Keep.** The race-detector modes test real threads. The simulator tests faults over logical interleavings. |
 | Process corpus (Layer 4) | **Keep, release-blocking.** Real kernel lock semantics and real process death cannot be simulated. Slice S5 explores the same protocol state machine randomly. |
 | Durability benchmarks | **Keep.** Only real hardware says whether the barrier contract holds on a real device (§6.4). |
@@ -486,12 +490,16 @@ primitive) gets a simulated implementation.
      multi-leaf table shrank back to one leaf, a commit rewrote the leaf's spilled values into fresh
      chains; the next commit that reused the freed pages corrupted the table. No fault was needed —
      the simulator's reopen and long histories reached it.
-2. **S2 — Rust and TS runners, cross-core tier.** The content-keyed decision vectors in `prng.toml`,
-   transcript and image comparison (§8.4), the regression corpus, and `sim:regress` in CI.
-3. **S3 — Resource knobs.** Buffer-pool eviction under tiny `cache_bytes`, spill under tiny
-   `work_mem`, temp spill, `max_storage_bytes`, and `max_query_memory_bytes`. Go and Rust spill
-   straight to `os`/`std` temp files today, so this slice gives them the `SpillSink` seam TypeScript
-   already has, letting `io_error` target spill. `read_error` (per-core) lands here.
+2. **S2 — Rust and TS runners, cross-core tier. Landed.** Both runners reproduce Go's transcripts
+   byte for byte on every profile; a TS sweep of 700 traces also produced 22,643 crash images
+   byte-identical to Go's. The decision function is pinned in `prng.toml` ([[sim_decide]]) and
+   recomputed by `prng_verify.rb`. `sim:regress` and a fixed sweep run in `mise run ci`. Each port
+   also caught the planted stabilization and watermark bugs in its own engine.
+3. **S3 — Resource knobs. Landed, except spill faults.** The `resource` profile: tiny caches force
+   buffer-pool eviction, small `work_mem` spills the generator's sorting and grouping reads, and
+   storage and query-memory limits fail commits and statements mid-history. `read_error` and
+   `enospc` are per-core faults (§6.3). Not done: giving Go and Rust the `SpillSink` seam TypeScript
+   has, so a fault could target spill I/O itself, and temp-table spill.
 4. **S4 — Simulated filesystem.** A `SimFs` beneath `SimDisk`: named files, `rename`, `unlink`, and a
    directory barrier, where a rename becomes durable only after its directory sync. This covers
    `compact` (`.jedtmp` plus rename), file attachments with the N-root commit, and `create`.
@@ -501,7 +509,10 @@ primitive) gets a simulated implementation.
    does. The presence probe and lock timeouts run on the simulated clock. This explores alone↔shared
    transitions, append-only co-resident commits, and foreign-generation adoption randomly.
    Layer 4 stays the authority for real kernel behavior.
-6. **S6 — Independent checker.** `verify.rb --check-image`, run on regression crash images (§12).
+6. **S6 — Independent checker. Landed.** `verify.rb --check-image` decodes a crash image as a fourth
+   voice: it selects the generation recovery must select and checks the live count and free list.
+   The driver compares its decision with every recovery a core reports (`sim:regress` always,
+   sweeps with `--check-images`); in testing it agreed on every one of tens of thousands of images.
 
 ## 15. Open questions
 
