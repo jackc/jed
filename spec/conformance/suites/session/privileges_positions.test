@@ -42,6 +42,10 @@ SELECT count(*) FILTER (WHERE abs(v) > 0) OVER () FROM t
 statement error 42501
 SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY abs(v)) FROM t
 
+# revoke: SELECT ON s
+statement error 42501
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY v + (SELECT min(v) FROM s)) FROM t
+
 # --- window definitions --------------------------------------------------------------------------
 
 # revoke: EXECUTE ON abs
@@ -52,10 +56,22 @@ SELECT sum(v) OVER (PARTITION BY abs(v)) FROM t
 statement error 42501
 SELECT sum(v) OVER (ORDER BY abs(v)) FROM t
 
+# revoke: SELECT ON s
+statement error 42501
+SELECT sum(v) OVER (PARTITION BY v > (SELECT min(v) FROM s)) FROM t
+
+# revoke: SELECT ON s
+statement error 42501
+SELECT sum(v) OVER (ORDER BY v + (SELECT min(v) FROM s)) FROM t
+
 # a named WINDOW clause's definition
 # revoke: EXECUTE ON abs
 statement error 42501
 SELECT sum(v) OVER w FROM t WINDOW w AS (PARTITION BY abs(v))
+
+# revoke: SELECT ON s
+statement error 42501
+SELECT sum(v) OVER w FROM t WINDOW w AS (ORDER BY v + (SELECT min(v) FROM s))
 
 # --- the query's ORDER BY ------------------------------------------------------------------------
 
