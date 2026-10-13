@@ -18,7 +18,7 @@ type Bench struct {
 	Name              string              `toml:"name"`
 	Description       string              `toml:"description"`
 	Dataset           string              `toml:"dataset"`
-	Kind              string              `toml:"kind"` // query | write_rollback | write_durable | concurrent_read
+	Kind              string              `toml:"kind"` // query | write_rollback | write_durable | concurrent_read | cold_open
 	SQL               string              `toml:"sql"`
 	Warmup            int                 `toml:"warmup"`
 	Iterations        int                 `toml:"iterations"`
@@ -91,9 +91,12 @@ func LoadCorpus(corpusDir string) (*Corpus, error) {
 	for i := range c.Bench {
 		b := &c.Bench[i]
 		switch b.Kind {
-		case "query", "write_rollback", "write_durable", "concurrent_read":
+		case "query", "write_rollback", "write_durable", "concurrent_read", "cold_open":
 		default:
 			return nil, fmt.Errorf("bench %q: unknown kind %q", b.Name, b.Kind)
+		}
+		if b.Kind == "cold_open" && (b.Dataset == "scratch" || len(b.SetupSQL) > 0 || len(b.SetupSQLOverride) > 0) {
+			return nil, fmt.Errorf("bench %q: cold_open needs a generated dataset and no setup_sql", b.Name)
 		}
 		if b.Kind == "write_rollback" && b.Batch <= 0 {
 			return nil, fmt.Errorf("bench %q: write_rollback requires batch > 0", b.Name)

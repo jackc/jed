@@ -541,6 +541,12 @@ fn run_one(
             return Err(stale_err(&b.dataset, cfg.engine));
         }
     }
+    if b.kind == "cold_open" {
+        // The fingerprint handle is dropped (closed) before measuring, so every iteration opens a
+        // file no handle in this process holds (benchmarks.md §8.3).
+        drop(eng);
+        return run_cold_open(cfg, b, data_dir, want).map(Some);
+    }
     for sql in b.setup_sql_for(cfg.engine) {
         eng.exec(sql)
             .map_err(|e| format!("setup_sql {sql:?}: {e}"))?;
@@ -649,6 +655,59 @@ fn run_one(
         fingerprint: want.to_string(),
         started_at,
     }))
+}
+
+/// run_cold_open runs a cold_open bench (benchmarks.md §8.3): every iteration opens a fresh handle
+/// onto the dataset through the driver's own `open`, prepares the bench SQL, and runs it once — the
+/// time to a first answer. The handle is dropped (closed) after the timed span, so close cost is not
+/// measured and no two handles are ever open at once.
+fn run_cold_open(cfg: &Config, b: &Bench, data_dir: &str, want: &str) -> BoxResult<ResultLine> {
+    let started_at = utc_now_rfc3339();
+    let mut stream = ParamStream::new(b);
+    let mut sum = Checksum::new();
+    let mut elapsed: Vec<i64> = Vec::with_capacity(b.iterations);
+    let mut rows_total: i64 = 0;
+    let sql = b.sql_for(cfg.engine);
+
+    for i in 0..(b.warmup + b.iterations) {
+        let measured = i >= b.warmup;
+        let args = stream.next_args();
+        let start = Instant::now();
+        let mut eng = (cfg.open)(data_dir, &b.dataset)?;
+        eng.prepare(sql)?;
+        let n = eng.query_prepared(&args, if measured { Some(&mut sum) } else { None })?;
+        let d = start.elapsed().as_nanos() as i64;
+        drop(eng);
+        if measured {
+            elapsed.push(d);
+            rows_total += n as i64;
+            if let Some(expect) = b.expect_rows_per_iter
+                && n != expect
+            {
+                return Err(format!("expected {expect} rows per iteration, got {n}").into());
+            }
+        }
+    }
+
+    elapsed.sort_unstable();
+    let total_ns: i64 = elapsed.iter().sum();
+    Ok(ResultLine {
+        bench: b.name.clone(),
+        dataset: b.dataset.clone(),
+        iterations: b.iterations,
+        warmup: b.warmup,
+        readers: 0,
+        total_ns,
+        ns_per_op: total_ns / b.iterations as i64,
+        min_ns: elapsed[0],
+        p50_ns: percentile(&elapsed, 50),
+        p90_ns: percentile(&elapsed, 90),
+        p99_ns: percentile(&elapsed, 99),
+        rows_total,
+        checksum: sum.hex(),
+        fingerprint: want.to_string(),
+        started_at,
+    })
 }
 
 /// partition tiles items into n contiguous blocks (the first len%n get one extra) — the

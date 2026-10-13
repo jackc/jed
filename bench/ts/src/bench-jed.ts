@@ -9,6 +9,7 @@ import {
   type Engine as JedDb,
   type PreparedStatement,
   type Session,
+  close as closeDb,
   create,
   executeParams,
   executePrepared,
@@ -96,6 +97,9 @@ class JedEngine implements Engine {
   }
 
   async close(): Promise<void> {
+    // Release the file descriptor and buffer pool: the cold_open kind opens a fresh handle per
+    // iteration (benchmarks.md §8.3), so a handle must not outlive its bench.
+    closeDb(this.db);
     if (this.scratch !== null) {
       rmSync(this.scratch, { recursive: true, force: true });
     }

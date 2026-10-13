@@ -836,7 +836,7 @@ schema_version = 1
 name        = "point_lookup_pk"     # fully-hot lane; point_lookup_pk_ramp keeps the short warmup
 description = "Fully-hot PK point lookup on 1M rows after warming the leaf working set"
 dataset     = "large"               # "small" | "large" | "scratch" (§8)
-kind        = "query"               # "query" | "write_rollback" | "write_durable" | "concurrent_read" (§8.1)
+kind        = "query"               # "query" | "write_rollback" | "write_durable" | "concurrent_read" (§8.1) | "cold_open" (§8.3)
 sql         = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
 warmup      = 50000                 # enough random probes to touch essentially every leaf
 iterations  = 50000                 # timed iterations
@@ -1405,6 +1405,42 @@ identical to `jed/rust/core`:
   JNI, P/Invoke, UniFFI) avoids libffi's generic trampoline, though a managed runtime still pays its
   own thread-attach / safepoint and marshalling costs.
 
+## 8.3 Cold-open benchmarks (the `cold_open` kind)
+
+`cold_open` measures the **time to a first answer** from a closed database file. The runner opens
+one handle to check the dataset fingerprint and closes it. Each warmup and measured iteration then
+calls the driver's own open, prepares the bench SQL, runs it once with the next parameter draw,
+stops the clock, and closes the handle. A sample therefore covers open + prepare + first query;
+close is untimed, and no two handles on the file are ever open at once (the jed public APIs reject a
+second in-process open of a coordinated path). The checksum folds each measured answer as `query`
+does. A `cold_open` bench names a generated dataset and carries no `setup_sql`.
+
+"Cold" means a fresh handle, not a cold OS page cache: harnesses cannot drop the kernel's cache
+without privileges, so the file stays cached and the lane measures each engine's own open work.
+jed reads the meta page, validates the selected commit's dirty pages, then reads the catalog,
+persisted free list, and each tree's interior spine (CLAUDE.md §9). On Go and Rust it also acquires
+the multi-process lock bundle under `locking = auto` ([locking.md](locking.md)). SQLite opens the
+file and reads its schema on the first statement; the harness's two durability PRAGMAs run inside its
+open. Driver differences carried into the number: the TS core driver opens through the low-level
+file open, which takes no lock bundle; the wasm wrap instantiates a fresh WebAssembly instance per
+open and opens with `locking = none` (§7.2); the Node/Rust and Ruby wraps open through the Rust public
+API. The corpus pairs `cold_open_pk_small` (10k rows) with `cold_open_pk` (1M rows plus three
+secondary indexes).
+
+**The datasets' last commit is a bulk index build.** Open-time validation is proportional to the
+selected commit's dirty set ([validated-cow.md](validated-cow.md) §4), and `bench-setup` ends each
+jed file with a `CREATE INDEX`. Every open of `large.jed` therefore re-validates the pages of its
+last index. The lanes measure that file as generated: an open after a bulk load, not a steady-state
+open after a small write. On a copy of `large.jed` whose last commit was a one-table `CREATE`, the TS
+core's open + first lookup fell from 9.1 ms to 1.3 ms (p50 of 30). SQLite has no such term.
+
+**Scope — jed and SQLite.** PostgreSQL is excluded (`engines = ["jed", "sqlite"]`): its databases
+stay open inside the server, and a new connection would measure backend startup, not opening a file.
+
+First run (2026-10-12, on a machine shared with concurrent builds, so indicative only): jed 0.4–0.9 ms
+on the small file and 3.6–7.8 ms on the large one across the native cores and wraps; SQLite
+30–130 µs on both.
+
 ## 9. Running and reporting
 
 ```
@@ -1490,7 +1526,8 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
   `concurrent_read_pk_cold_r{1,4}` over cold population of the cache-fitting `large` dataset,
   jed-only. Remaining concurrency follow-ons: a truly larger-than-pool eviction/thrashing variant,
   and a cross-*engine* comparison (PG/SQLite connection pools);
-- cold-open time;
+- ✅ **cold-open time** — `cold_open_pk_small` / `cold_open_pk`, the `cold_open` kind (§8.3),
+  jed and SQLite;
 - durable-commit batch-size sweep (1 vs 100 vs 1000 rows per commit).
 
 **Standing obligation** (CLAUDE.md §10): a perf-relevant feature lands with a benchmark

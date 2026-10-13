@@ -416,6 +416,17 @@ async function runOne(
 ): Promise<ResultLine | null> {
   const startedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   const eng = await cfg.open(dataDir, b.dataset);
+  if (b.kind === "cold_open") {
+    // The fingerprint handle is closed before measuring, so every iteration opens a file no handle
+    // in this process holds (benchmarks.md §8.3).
+    try {
+      const stored = await eng.storedFingerprint();
+      if (stored !== want) throw staleErr(b.dataset, cfg.engine);
+    } finally {
+      await eng.close();
+    }
+    return runColdOpen(cfg, b, dataDir, want, startedAt);
+  }
   try {
     if (b.dataset !== "scratch") {
       const stored = await eng.storedFingerprint();
@@ -572,6 +583,72 @@ async function runOne(
   } finally {
     await eng.close();
   }
+}
+
+// runColdOpen runs a cold_open bench (benchmarks.md §8.3): every iteration opens a fresh handle onto
+// the dataset through the driver's own open, prepares the bench SQL, and runs it once — the time to
+// a first answer. The handle is closed after the timed span, so close cost is not measured and no
+// two handles are ever open at once.
+async function runColdOpen(
+  cfg: Config,
+  b: Bench,
+  dataDir: string,
+  want: string,
+  startedAt: string,
+): Promise<ResultLine> {
+  const stream = new ParamStream(b);
+  const sum = new Checksum();
+  const elapsed: bigint[] = [];
+  let rowsTotal = 0;
+  const sql = sqlFor(b, cfg.engine);
+
+  for (let i = 0; i < b.warmup + b.iterations; i++) {
+    const measured = i >= b.warmup;
+    const args = stream.next();
+    const start = process.hrtime.bigint();
+    const eng = await cfg.open(dataDir, b.dataset);
+    let n: number;
+    let d: bigint;
+    try {
+      await eng.prepare(sql);
+      n = await eng.queryPrepared(args, measured ? sum : null);
+      d = process.hrtime.bigint() - start;
+    } finally {
+      await eng.close();
+    }
+    if (measured) {
+      elapsed.push(d);
+      rowsTotal += n;
+      if (b.expectRowsPerIter > 0 && n !== b.expectRowsPerIter) {
+        throw new Error(`expected ${b.expectRowsPerIter} rows per iteration, got ${n}`);
+      }
+    }
+  }
+
+  elapsed.sort((a, z) => (a < z ? -1 : a > z ? 1 : 0));
+  let totalNs = 0n;
+  for (const d of elapsed) totalNs += d;
+  return {
+    schema: 2,
+    bench: b.name,
+    dataset: b.dataset,
+    engine: cfg.engine,
+    lang: cfg.lang,
+    variant: cfg.variant,
+    iterations: b.iterations,
+    warmup: b.warmup,
+    readers: 0,
+    total_ns: Number(totalNs),
+    ns_per_op: Number(totalNs / BigInt(b.iterations)),
+    min_ns: Number(elapsed[0]),
+    p50_ns: Number(percentile(elapsed, 50)),
+    p90_ns: Number(percentile(elapsed, 90)),
+    p99_ns: Number(percentile(elapsed, 99)),
+    rows_total: rowsTotal,
+    checksum: sum.hex(),
+    fingerprint: want,
+    started_at: startedAt,
+  };
 }
 
 // Lower sample percentile from an already-sorted, non-empty distribution. This

@@ -2005,3 +2005,43 @@ gen = "int_window"
 base = 0
 off_min = 999
 off_max = 999
+
+# Cold open (benchmarks.md §8.3): each iteration opens a fresh handle onto a dataset file, runs one
+# PK point lookup, and closes it — the time to a first answer, close untimed. jed reads the meta page,
+# catalog, persisted free list, and each tree's interior spine, never a leaf it does not need; SQLite
+# reads its schema on the first statement. The 10k-row lane is the fixed per-open cost; the 1M-row
+# lane adds what grows with the file. PostgreSQL is excluded: a server connection is not the opening
+# of a database file.
+[[bench]]
+name = "cold_open_pk_small"
+description = "Open the 10k-row database file and run one PK point lookup (time to first answer)"
+dataset = "small"
+kind = "cold_open"
+engines = ["jed", "sqlite"]
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 10
+iterations = 200
+seed = 4293
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 10000
+
+[[bench]]
+name = "cold_open_pk"
+description = "Open the 1M-row database file and run one PK point lookup (time to first answer)"
+dataset = "large"
+kind = "cold_open"
+engines = ["jed", "sqlite"]
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 10
+iterations = 200
+seed = 4292
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000

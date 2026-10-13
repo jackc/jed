@@ -216,6 +216,12 @@ module Bench
     if w.dataset != "scratch" && eng.stored_fingerprint != want
       raise "stale benchmark data for #{w.dataset}/#{cfg[:engine]}: run 'mise run bench:setup'"
     end
+    if w.kind == "cold_open"
+      # The fingerprint handle is closed before measuring, so every iteration opens a file no handle
+      # in this process holds (benchmarks.md §8.3).
+      eng.close
+      return run_cold_open(cfg, w, data_dir, want)
+    end
 
     w.setup_sql_for(cfg[:engine]).each { |sql| eng.exec(sql) }
     # A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
@@ -287,6 +293,52 @@ module Bench
     p90 = percentile(elapsed, 90)
     p99 = percentile(elapsed, 99)
     warn "  → #{ns_per_op} ns/op, #{allocs_per_op} allocs/op (p50/p90/p99 #{p50}/#{p90}/#{p99})"
+    ResultLine.new(
+      w.name, w.dataset, w.iterations, w.warmup, total_ns, ns_per_op,
+      elapsed[0], p50, p90, p99, rows_total, sum.hex, want, started_at
+    )
+  end
+
+  # run_cold_open runs a cold_open bench (benchmarks.md §8.3): every iteration opens a fresh handle
+  # onto the dataset through the driver's own open, prepares the bench SQL, and runs it once — the
+  # time to a first answer. The handle is closed after the timed span, so close cost is not measured
+  # and no two handles are ever open at once.
+  def run_cold_open(cfg, w, data_dir, want)
+    started_at = Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    stream = ParamStream.new(w)
+    sum = Checksum.new
+    elapsed = []
+    rows_total = 0
+    sql = w.sql_for(cfg[:engine])
+
+    (w.warmup + w.iterations).times do |i|
+      measured = i >= w.warmup
+      args = stream.next_args
+      t0 = now_ns
+      eng = cfg[:open].call(data_dir, w.dataset)
+      begin
+        eng.prepare(sql)
+        n = eng.query_prepared(args, measured ? sum : nil)
+        d = now_ns - t0
+      ensure
+        eng.close
+      end
+      next unless measured
+
+      elapsed << d
+      rows_total += n
+      if w.expect_rows_per_iter && n != w.expect_rows_per_iter
+        raise "expected #{w.expect_rows_per_iter} rows per iteration, got #{n}"
+      end
+    end
+
+    elapsed.sort!
+    total_ns = elapsed.sum
+    ns_per_op = total_ns / w.iterations
+    p50 = percentile(elapsed, 50)
+    p90 = percentile(elapsed, 90)
+    p99 = percentile(elapsed, 99)
+    warn "  → #{ns_per_op} ns/op (p50/p90/p99 #{p50}/#{p90}/#{p99})"
     ResultLine.new(
       w.name, w.dataset, w.iterations, w.warmup, total_ns, ns_per_op,
       elapsed[0], p50, p90, p99, rows_total, sum.hex, want, started_at

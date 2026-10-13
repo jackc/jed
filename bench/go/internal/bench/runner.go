@@ -153,17 +153,28 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 	if err != nil {
 		return res, err
 	}
-	defer eng.Close()
 
 	if b.Dataset != "scratch" {
 		stored, err := eng.StoredFingerprint()
 		if err != nil {
+			eng.Close()
 			return res, err
 		}
 		if stored != want {
+			eng.Close()
 			return res, StaleErr(b.Dataset, cfg.Engine)
 		}
 	}
+	if b.Kind == "cold_open" {
+		// The fingerprint handle is closed before measuring, so every iteration opens a file no
+		// handle in this process holds (benchmarks.md §8.3).
+		if err := eng.Close(); err != nil {
+			return res, err
+		}
+		return runColdOpen(cfg, b, dataDir, res)
+	}
+	defer eng.Close()
+
 	for _, sql := range b.SetupSQLFor(cfg.Engine) {
 		if err := eng.Exec(sql); err != nil {
 			return res, fmt.Errorf("setup_sql %q: %w", sql, err)
@@ -414,6 +425,75 @@ func runConcurrent(cfg Config, b *Bench, ce ConcurrentEngine, res Result) (Resul
 	res.P99Ns = percentile(all, 99)
 	res.RowsTotal = rowsTotal
 	res.Checksum = combined.Hex()
+	return res, nil
+}
+
+// runColdOpen runs a cold_open bench (spec/design/benchmarks.md §8.3): every iteration opens a
+// fresh handle onto the dataset through the driver's own Open, prepares the bench SQL, and runs it
+// once — the time to a first answer. The handle is closed after the timed span, so close cost is not
+// measured and no two handles are ever open at once.
+func runColdOpen(cfg Config, b *Bench, dataDir string, res Result) (Result, error) {
+	stream := NewParamStream(b)
+	sum := NewChecksum()
+	elapsed := make([]int64, 0, b.Iterations)
+	sql := b.SQLFor(cfg.Engine)
+
+	iter := func(measured bool) error {
+		var s *Checksum
+		if measured {
+			s = sum
+		}
+		args := stream.Next()
+		start := time.Now()
+		eng, err := cfg.Open(dataDir, b.Dataset)
+		if err != nil {
+			return err
+		}
+		stmt, err := eng.Prepare(sql)
+		if err != nil {
+			eng.Close()
+			return err
+		}
+		n, err := stmt.Query(args, s)
+		d := time.Since(start)
+		stmt.Close()
+		if cerr := eng.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+		if measured {
+			elapsed = append(elapsed, d.Nanoseconds())
+			res.RowsTotal += int64(n)
+			if b.ExpectRowsPerIter > 0 && n != b.ExpectRowsPerIter {
+				return fmt.Errorf("expected %d rows per iteration, got %d", b.ExpectRowsPerIter, n)
+			}
+		}
+		return nil
+	}
+
+	for i := 0; i < b.Warmup; i++ {
+		if err := iter(false); err != nil {
+			return res, fmt.Errorf("warmup: %w", err)
+		}
+	}
+	for i := 0; i < b.Iterations; i++ {
+		if err := iter(true); err != nil {
+			return res, err
+		}
+	}
+
+	slices.Sort(elapsed)
+	for _, d := range elapsed {
+		res.TotalNs += d
+	}
+	res.NsPerOp = res.TotalNs / int64(b.Iterations)
+	res.MinNs = elapsed[0]
+	res.P50Ns = percentile(elapsed, 50)
+	res.P90Ns = percentile(elapsed, 90)
+	res.P99Ns = percentile(elapsed, 99)
+	res.Checksum = sum.Hex()
 	return res, nil
 }
 
