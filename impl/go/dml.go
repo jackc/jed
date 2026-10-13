@@ -293,8 +293,8 @@ func indexRowQualifies(rindex *resolvedIndex, row storedRow, env *evalEnv) (bool
 // uniformly as "a row maps to a set of entries." A PARTIAL index contributes the EMPTY set for a row
 // whose predicate is not TRUE (spec/design/indexes.md §9), which is what makes INSERT/DELETE/UPDATE
 // maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
-// free). colls (column-ordinal-indexed) selects each text key column's collated form (§2.12); GIN
-// elements are fixed-width, so a GIN index never collates.
+// free). colls (column-ordinal-indexed) selects each text key column's collated form (§2.12); a GIN
+// term is always the C key (gin.md §4.2), so a GIN index never collates.
 func indexEntryKeys(columns []catColumn, colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([][]byte, error) {
 	if ok, err := indexRowQualifies(rindex, row, env); err != nil {
 		return nil, err
@@ -445,15 +445,16 @@ func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b s
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
-// the integers, boolean, uuid, date, timestamp, timestamptz, f32, f64, interval (spec/design/gin.md
-// §3): a GIN term IS the element's order-preserving key encoding (§4) and a term carries no
-// length/terminator framing, so only the FIXED-WIDTH keyables qualify. A float term is the
-// canonicalizing float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN),
-// and an interval term the 16-byte interval-span-i128 span key (encoding.md §2.10: 1 mon,
-// 30 days, 720:00:00 share one key), so term equality is exactly SQL = for both. The
-// variable-width keyables (text, bytea, decimal) — valid ordered-index / PK keys — are 0A000 here.
+// the integers, boolean, uuid, date, timestamp, timestamptz, f32, f64, interval, and text
+// (spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding (§4),
+// self-delimiting for every one of them. A float term is the canonicalizing float-order-preserving
+// key (encoding.md §2.8: -0 → +0, every NaN → one NaN), and an interval term the 16-byte
+// interval-span-i128 span key (encoding.md §2.10: 1 mon, 30 days, 720:00:00 share one key), so term
+// equality is exactly SQL = for both. A text term is the C (byte) key of its first 128 bytes (§4.2)
+// whatever the column's collation — every collation is deterministic, so text = is byte identity.
+// bytea and decimal — valid ordered-index / PK keys — are 0A000 here.
 func isGinElementType(elem scalarType) bool {
-	return elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
+	return elem.IsText() || elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
 		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate() || elem.IsFloat() ||
 		elem.IsInterval()
 }
@@ -461,7 +462,7 @@ func isGinElementType(elem scalarType) bool {
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
-// isGinElementType's set minus the floats and interval, kept a separate predicate so the two
+// isGinElementType's set minus the floats, interval, and text, kept a separate predicate so the two
 // surfaces evolve independently.
 func isGistScalarType(ty dataType) bool {
 	return ty.IsInteger() || ty.IsBool() || ty.IsUuid() ||
@@ -479,8 +480,8 @@ func isGistDeferredScalarType(ty dataType) bool {
 // DISTINCT non-NULL array element — encode(element) ‖ storage_key, NO presence tag (a term is never
 // NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
 // they appear in no posting list). Returned sorted by encoded term (= key-encoding byte order, which
-// is order-preserving for every admitted element type). array_ops over any fixed-width key-encodable
-// element type.
+// is order-preserving for every admitted element type). array_ops over any admitted element type
+// (§3).
 //
 // A jsonb column (jsonb_ops, gin.md §2.1/§4.1) contributes one entry per DISTINCT term of its
 // document (ginJsonbIndexTerms) instead; a NULL document yields none.
@@ -512,12 +513,7 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 		if el.Kind == ValNull {
 			continue // a NULL element carries no term; a non-keyable element is impossible under the gate
 		}
-		// a GIN element is fixed-width (isGinElementType excludes text), so it never collates and
-		// the key encoding is infallible.
-		t, err := encodeKeyValue(elemTy, el, nil)
-		if err != nil {
-			panic("a GIN element key is infallible (fixed-width, no collation)")
-		}
+		t := ginElementTerm(elemTy, el)
 		if !seen[string(t)] {
 			seen[string(t)] = true
 			terms = append(terms, t)
@@ -525,6 +521,25 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 	}
 	slices.SortFunc(terms, bytes.Compare)
 	return ginEntriesFromTerms(terms, storageKey), nil
+}
+
+// ginElementTerm is the array_ops term of one non-NULL element (gin.md §4): the element type's
+// order-preserving key encoding. A text element keys its C (byte) form over its first
+// ginMaxTermBytes bytes (§4.2) — never the column collation's sort key, since text = is byte
+// identity under every collation — so the key encoding never collates and is infallible.
+func ginElementTerm(elem scalarType, v Value) []byte {
+	if v.Kind == ValText {
+		b := []byte(v.str())
+		if len(b) > ginMaxTermBytes {
+			b = b[:ginMaxTermBytes]
+		}
+		return encodeTerminated(b)
+	}
+	t, err := encodeKeyValue(elem, v, nil)
+	if err != nil {
+		panic("a GIN element key is infallible (no collation, a bounded width)")
+	}
+	return t
 }
 
 // ginEntriesFromTerms appends the row's storage key to each term of a deduplicated, byte-sorted term

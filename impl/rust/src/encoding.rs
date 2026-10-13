@@ -61,6 +61,11 @@ pub fn encode_terminated(content: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The longest source a variable-width GIN term keeps (spec/design/gin.md §4.1/§4.2): a longer
+/// string (or `jsonb` number key) is cut to its first `GIN_MAX_TERM_BYTES` bytes, so a GIN entry
+/// always fits a node. The cut is at a byte, never decoded.
+pub const GIN_MAX_TERM_BYTES: usize = 128;
+
 /// Encode a nullable key slot: a 1-byte presence tag (0x00 present, 0x01 NULL),
 /// with the value bytes following the tag when present. Because `0x00 < 0x01`,
 /// present values sort before NULL, so NULLs sort **last** in ascending order;

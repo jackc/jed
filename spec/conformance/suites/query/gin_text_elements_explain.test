@@ -1,0 +1,74 @@
+# GIN over text[] — the selected plan (jed-only: EXPLAIN is jed's own rendering, never
+# oracle-imported). Pins that a text-element GIN index bounds `@>`, `&&`, `= ANY`, array `=`, and a
+# mutation's target-row scan (spec/design/gin.md §3/§4.2/§6). The rows themselves are oracle-checked
+# in query/gin_text_elements.test.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_text_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.explain, dml.insert, dml.insert_multi_row, dml.delete, query.select, func.array_containment, func.array_quantified, cast.operator, types.text, types.i32, types.array
+
+statement ok
+CREATE TABLE tx (id i32 PRIMARY KEY, tags text[])
+
+statement ok
+CREATE INDEX tx_tags_gin ON tx USING gin (tags)
+
+statement ok
+INSERT INTO tx VALUES
+  (1, '{red,blue}'),
+  (2, '{red}'),
+  (3, '{green}'),
+  (4, '{}'),
+  (5, NULL),
+  (6, '{blue,x}')
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM tx WHERE tags @> '{red,blue}'::text[]
+----
+0
+Filter
+conjuncts=1
+1
+Scan tx
+GIN bound: using tx_tags_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM tx WHERE tags && '{green,x}'::text[]
+----
+0
+Filter
+conjuncts=1
+1
+Scan tx
+GIN bound: using tx_tags_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM tx WHERE 'red' = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+1
+Scan tx
+GIN bound: using tx_tags_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM tx WHERE tags = '{red}'::text[]
+----
+0
+Filter
+conjuncts=1
+1
+Scan tx
+GIN bound: using tx_tags_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) DELETE FROM tx WHERE 'x' = ANY(tags)
+----
+0
+Delete tx
+-
+1
+Filter
+conjuncts=1
+2
+Scan tx
+GIN bound: using tx_tags_gin; touched=1

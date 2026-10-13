@@ -1,0 +1,187 @@
+# GIN over text element arrays — a `USING gin` index, and every GIN-bounded scan it accelerates
+# (`@>`, `&&`, `= ANY`, array `=`, and the GIN-bounded UPDATE/DELETE), admit a `text[]` column
+# (spec/design/gin.md §3/§4.2). A term is the element's `C` text key — text-terminated-escape over
+# its UTF-8 — cut to the first 128 bytes, whatever the column's collation (every collation is
+# deterministic, so text `=` is byte identity). Elements sharing their first 128 bytes share a term
+# and the residual recheck separates them; the `# cost:` lines pin that cut cross-core (CLAUDE.md
+# §8): a shared term gathers both rows, a 128-byte string differing in its last byte does not, and a
+# cut inside a two-byte character still shares a term.
+#
+# The rows and end state match PostgreSQL's text[] array_ops GIN (index presence never changes
+# results). query/gin_text_elements_explain.test pins the plan.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_element_types, query.gin_text_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, func.array, expr.text_concat, ddl.collate_column, types.array_collation, types.text, types.i32, types.array, cast.operator, resource.cost_metering
+
+statement ok
+CREATE TABLE tx (id i32 PRIMARY KEY, tags text[])
+
+statement ok
+CREATE INDEX tx_tags_gin ON tx USING gin (tags)
+
+statement ok
+INSERT INTO tx VALUES
+  (1, '{red,blue}'),
+  (2, '{red}'),
+  (3, '{blue,green,blue}'),
+  (4, '{"",NULL}'),
+  (5, '{}'),
+  (6, NULL),
+  (7, '{café,Red}'),
+  (8, '{"a b",é}')
+
+statement ok
+INSERT INTO tx VALUES
+  (9, ARRAY[repeat('k', 128) || '1']),
+  (10, ARRAY[repeat('k', 128) || '2']),
+  (11, ARRAY[repeat('k', 127) || 'z']),
+  (12, ARRAY[repeat('é', 65)]),
+  (13, ARRAY[repeat('é', 64) || 'ex'])
+
+query I nosort
+SELECT id FROM tx WHERE tags @> '{red}'::text[] ORDER BY id
+----
+1
+2
+
+# cost: 10
+query I nosort
+SELECT id FROM tx WHERE tags @> '{red,blue}'::text[] ORDER BY id
+----
+1
+
+# a duplicate query element is one term
+query I nosort
+SELECT id FROM tx WHERE tags @> '{blue,blue}'::text[] ORDER BY id
+----
+1
+3
+
+# cost: 17
+query I nosort
+SELECT id FROM tx WHERE tags && '{green,red}'::text[] ORDER BY id
+----
+1
+2
+3
+
+# cost: 13
+query I nosort
+SELECT id FROM tx WHERE 'red' = ANY(tags) ORDER BY id
+----
+1
+2
+
+# text equality is byte identity: 'Red' is not 'red'
+query I nosort
+SELECT id FROM tx WHERE 'Red' = ANY(tags) ORDER BY id
+----
+7
+
+# the empty string is a term like any other
+query I nosort
+SELECT id FROM tx WHERE '' = ANY(tags) ORDER BY id
+----
+4
+
+query I nosort
+SELECT id FROM tx WHERE 'é' = ANY(tags) ORDER BY id
+----
+8
+
+query I nosort
+SELECT id FROM tx WHERE tags = '{red}'::text[] ORDER BY id
+----
+2
+
+# cost: 9
+query I nosort
+SELECT id FROM tx WHERE tags = '{blue,green,blue}'::text[] ORDER BY id
+----
+3
+
+query I nosort
+SELECT id FROM tx WHERE tags @> '{red,NULL}'::text[] ORDER BY id
+----
+
+# rows 9 and 10 share their first 128 bytes, so one term gathers both and the recheck keeps row 9
+# cost: 274
+query I nosort
+SELECT id FROM tx WHERE (repeat('k', 128) || '1') = ANY(tags) ORDER BY id
+----
+9
+
+# row 11 is exactly 128 bytes and differs from rows 9 and 10 in its last byte: its own term
+# cost: 137
+query I nosort
+SELECT id FROM tx WHERE (repeat('k', 127) || 'z') = ANY(tags) ORDER BY id
+----
+11
+
+# 65 two-byte characters cut at 128 bytes inside the 65th: the term is 64 of them, which row 13's
+# first 128 bytes also are
+# cost: 278
+query I nosort
+SELECT id FROM tx WHERE repeat('é', 65) = ANY(tags) ORDER BY id
+----
+12
+
+# ---- GIN-bounded mutations and maintenance ----------------------------------------------------
+
+statement ok
+UPDATE tx SET tags = tags || '{new}'::text[] WHERE 'red' = ANY(tags)
+
+query I nosort
+SELECT id FROM tx WHERE tags @> '{new,red}'::text[] ORDER BY id
+----
+1
+2
+
+statement ok
+DELETE FROM tx WHERE tags && '{green,é}'::text[]
+
+query I nosort
+SELECT id FROM tx WHERE tags && '{blue,é,"a b"}'::text[] ORDER BY id
+----
+1
+
+# the index built over existing rows
+statement ok
+DROP INDEX tx_tags_gin
+
+# cost: 12
+statement ok
+CREATE INDEX tx_tags_gin ON tx USING gin (tags)
+
+query I nosort
+SELECT id FROM tx WHERE tags @> '{new}'::text[] ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM tx WHERE (repeat('k', 128) || '2') = ANY(tags) ORDER BY id
+----
+10
+
+# ---- a collated column: the terms stay the C bytes, and equality is still byte identity ---------
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE ct (id i32 PRIMARY KEY, tags text[] COLLATE "unicode")
+
+statement ok
+CREATE INDEX ct_tags_gin ON ct USING gin (tags)
+
+statement ok
+INSERT INTO ct VALUES (1, '{a,B}'), (2, '{b,A}'), (3, '{A,B}')
+
+query I nosort
+SELECT id FROM ct WHERE tags @> '{A}'::text[] ORDER BY id
+----
+2
+3
+
+query I nosort
+SELECT id FROM ct WHERE 'b' = ANY(tags) ORDER BY id
+----
+2

@@ -12,7 +12,7 @@ import (
 
 // The jsonb_ops term flag bytes (PostgreSQL's JGINFLAG_KEY / NULL / BOOL / NUM / STR) and the
 // truncation bit (JGINFLAG_HASHED's role): a key / number / string body source longer than
-// ginJsonbMaxTermBytes keeps only its first ginJsonbMaxTermBytes bytes and sets the bit.
+// ginMaxTermBytes keeps only its first ginMaxTermBytes bytes and sets the bit.
 const (
 	ginJsonbFlagKey       byte = 0x01
 	ginJsonbFlagNull      byte = 0x02
@@ -20,16 +20,15 @@ const (
 	ginJsonbFlagNum       byte = 0x04
 	ginJsonbFlagStr       byte = 0x05
 	ginJsonbFlagTruncated byte = 0x10
-	ginJsonbMaxTermBytes       = 128
 )
 
 // ginJsonbFramed is a key / number / string term: flag ‖ text-terminated-escape (encoding.md §2.4)
 // of the first min(n, 128) bytes of content, the flag's 0x10 bit set when content was cut (at a byte,
 // never a character boundary — a term is bytes, gin.md §4.1).
 func ginJsonbFramed(flag byte, content []byte) []byte {
-	if len(content) > ginJsonbMaxTermBytes {
+	if len(content) > ginMaxTermBytes {
 		flag |= ginJsonbFlagTruncated
-		content = content[:ginJsonbMaxTermBytes]
+		content = content[:ginMaxTermBytes]
 	}
 	return append([]byte{flag}, encodeTerminated(content)...)
 }

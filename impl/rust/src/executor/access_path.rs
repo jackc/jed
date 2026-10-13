@@ -294,8 +294,8 @@ impl Engine {
 
         // Gather each term's posting list: the entry range [term, successor) of the GIN tree
         // (gin.md §4). The entry is `term ‖ storage_key` and every term self-delimits — an
-        // `array_ops` element key is fixed-width per element type, a `jsonb_ops` term is a flag byte
-        // plus a fixed or terminated body (§4.1) — so the range holds exactly this term's entries
+        // `array_ops` element key is fixed-width or terminated (text, §4.2), a `jsonb_ops` term is a
+        // flag byte plus a fixed or terminated body (§4.1) — so the range holds exactly this term's entries
         // and the storage key is the suffix after the term's own length.
         let istore = self.index_store(&gb.name_key);
         let mut gather = GinGather::default();
@@ -693,8 +693,8 @@ fn jsonb_query_terms(strategy: GinStrategy, qv: &Value) -> GinQuery {
 /// converted to the element width: an `f32` value widens exactly; an `f64` value narrows only when
 /// it is exactly an `f32` (or NaN — every NaN is one value, float.md §3), else no `f32` element can
 /// equal it. The float key canonicalizes `-0 → +0` and every NaN (encoding.md §2.8), so term
-/// equality is exactly SQL float `=`. A GIN element is fixed-width (no text), so the encoding never
-/// collates / fails.
+/// equality is exactly SQL float `=`. Every other value takes the shared element term
+/// ([`gin_element_term`]), which never collates or fails.
 fn gin_query_term(elem: ScalarType, v: &Value) -> Option<Vec<u8>> {
     match (elem, v) {
         (ScalarType::Float32, Value::Float64(x)) => {
@@ -702,9 +702,6 @@ fn gin_query_term(elem: ScalarType, v: &Value) -> Option<Vec<u8>> {
             (x.is_nan() || f64::from(narrowed) == *x).then(|| encode_f32_key(narrowed))
         }
         (ScalarType::Float64, Value::Float32(x)) => Some(encode_f64_key(f64::from(*x))),
-        _ => Some(
-            encode_key_value(elem, v, None)
-                .expect("a GIN element key is infallible (fixed-width, no collation)"),
-        ),
+        _ => Some(gin_element_term(elem, v)),
     }
 }

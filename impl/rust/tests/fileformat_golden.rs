@@ -710,6 +710,30 @@ fn gin_interval_table_db() -> Session {
     db
 }
 
+/// A GIN index over a text[] column (the text GIN element golden, spec/design/gin.md §4.2): each term
+/// is the element's C text key; a duplicate, the empty string, a two-byte character, NULL elements,
+/// and empty / NULL arrays. An ordered index i_n sits beside it.
+fn gin_text_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, tags text[], n i32)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '{red,blue,red}', 1), (2, '{\"\",é,NULL}', 2), (3, '{}', 3), \
+         (4, NULL, 4), (5, '{\"a b\",red}', 5)",
+    );
+    run(&mut db, "CREATE INDEX i_n ON t (n)");
+    run(&mut db, "CREATE INDEX i_tags_gin ON t USING gin (tags)");
+    db
+}
+
 /// A GIN index over a jsonb column (the jsonb_ops golden, spec/design/gin.md §2.1/§4.1): keys at two
 /// levels, an array string element (KEY term) beside a member string value (STRING term), a boolean
 /// and a JSON null; a top-level array whose 1.5 and 1.50 are ONE number term; a top-level string; `{}`
@@ -1837,6 +1861,7 @@ fn write_matches_goldens() {
         ("gin_float_table.jed", gin_float_table_db),
         ("gin_interval_table.jed", gin_interval_table_db),
         ("gin_jsonb_table.jed", gin_jsonb_table_db),
+        ("gin_text_table.jed", gin_text_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("composite_key_table.jed", composite_key_table_db),
@@ -1942,6 +1967,7 @@ fn read_goldens_reproduces_rows() {
         ("gin_float_table.jed", gin_float_table_db, "t"),
         ("gin_interval_table.jed", gin_interval_table_db, "t"),
         ("gin_jsonb_table.jed", gin_jsonb_table_db, "t"),
+        ("gin_text_table.jed", gin_text_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("composite_key_table.jed", composite_key_table_db, "t"),

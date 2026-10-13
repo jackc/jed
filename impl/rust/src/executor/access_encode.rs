@@ -95,7 +95,7 @@ impl GinStrategy {
 }
 
 /// A GIN index's operator class, implied by its column's type (gin.md §2): `array_ops` over an array
-/// of a fixed-width key-encodable element (carrying the element type, whose key encoding is each
+/// of an admitted key-encodable element (carrying the element type, whose key encoding is each
 /// term), or `jsonb_ops` over a `jsonb` column (§2.1).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GinOpclass {
@@ -3032,7 +3032,7 @@ fn index_row_qualifies(rindex: &ResolvedIndex, row: &Row, env: &EvalEnv) -> Resu
 /// predicate is not TRUE (spec/design/indexes.md §9), which is what makes INSERT/DELETE/UPDATE
 /// maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
 /// free). `colls` (column-ordinal-indexed) selects each text key column's collated form (§2.12);
-/// GIN elements are fixed-width, so a GIN index never collates. `env` evaluates any expression key
+/// a GIN term is always the `C` key (gin.md §4.2), so a GIN index never collates. `env` evaluates any expression key
 /// element or the partial predicate (B-tree only — GIN/GiST are plain-column, this slice).
 pub(crate) fn index_entry_keys(
     columns: &[Column],
@@ -3229,16 +3229,17 @@ pub(crate) fn exclusion_pair_conflicts(
 }
 
 /// Is `elem` an element type a GIN (`array_ops`) index admits? The integers, `boolean`, `uuid`,
-/// `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval` (spec/design/gin.md §3): the GIN
-/// term IS the element's order-preserving key encoding (§4) and a term carries no
-/// length/terminator framing, so only the FIXED-WIDTH keyables qualify. A float term is the
-/// canonicalizing `float-order-preserving` key (encoding.md §2.8: `-0 → +0`, every NaN → one NaN),
-/// and an interval term the 16-byte `interval-span-i128` span key (encoding.md §2.10: `1 mon`,
-/// `30 days`, `720:00:00` share one key), so term equality is exactly SQL `=` for both. The
-/// VARIABLE-width keyables (`text`, `bytea`, `decimal`) — though valid ordered-index / PK keys —
-/// are 0A000 here.
+/// `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval`, and `text` (spec/design/gin.md §3):
+/// the GIN term IS the element's order-preserving key encoding (§4), self-delimiting for every one
+/// of them. A float term is the canonicalizing `float-order-preserving` key (encoding.md §2.8:
+/// `-0 → +0`, every NaN → one NaN), and an interval term the 16-byte `interval-span-i128` span key
+/// (encoding.md §2.10: `1 mon`, `30 days`, `720:00:00` share one key), so term equality is exactly
+/// SQL `=` for both. A text term is the `C` (byte) key of its first 128 bytes (§4.2) whatever the
+/// column's collation — every collation is deterministic, so text `=` is byte identity. `bytea` and
+/// `decimal` — though valid ordered-index / PK keys — are 0A000 here.
 pub(crate) fn is_gin_element_type(elem: &Type) -> bool {
-    elem.is_integer()
+    elem.is_text()
+        || elem.is_integer()
         || elem.is_bool()
         || elem.is_uuid()
         || elem.is_timestamp()
@@ -3251,8 +3252,7 @@ pub(crate) fn is_gin_element_type(elem: &Type) -> bool {
 /// Does the scalar `=` GiST opclass admit this column type (spec/design/gist.md §6)? The FIXED-WIDTH
 /// keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is `[min, max]`
 /// over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
-/// `is_gin_element_type`'s set minus the floats and interval (both stage on the fixed-width
-/// key-encodable scalars), kept a separate predicate so the two surfaces evolve independently.
+/// `is_gin_element_type`'s set minus the floats, interval, and text, kept a separate predicate so the two surfaces evolve independently.
 pub(crate) fn is_gist_scalar_type(ty: &Type) -> bool {
     ty.is_integer()
         || ty.is_bool()
@@ -3275,7 +3275,7 @@ pub(crate) fn is_gist_deferred_scalar_type(ty: &Type) -> bool {
 /// NULL) and an empty payload. A NULL array column value and an empty array both yield no entries
 /// (so they never appear in any posting list — correct for `@>`/`&&`). Returned sorted by encoded
 /// term (= key-encoding byte order, which is order-preserving for every admitted element type), so
-/// the per-row order is deterministic. `array_ops` over any fixed-width key-encodable element type.
+/// the per-row order is deterministic. `array_ops` over any admitted element type (§3).
 pub(crate) fn gin_entries(
     columns: &[Column],
     cols: &[usize],
@@ -3303,12 +3303,7 @@ pub(crate) fn gin_entries(
         for el in &arr.elements {
             // a NULL element contributes no term; a non-keyable element is impossible under the gate
             if !matches!(el, Value::Null) {
-                // a GIN element is fixed-width (is_gin_element_type excludes text), so it never
-                // collates and the key encoding is infallible.
-                terms.push(
-                    encode_key_value(elem_ty, el, None)
-                        .expect("a GIN element key is infallible (fixed-width, no collation)"),
-                );
+                terms.push(gin_element_term(elem_ty, el));
             }
         }
     }
@@ -3318,6 +3313,24 @@ pub(crate) fn gin_entries(
     terms.sort_unstable();
     terms.dedup();
     Ok(gin_entry_keys(terms, storage_key))
+}
+
+/// The `array_ops` term of one non-NULL element (gin.md §4): the element type's order-preserving key
+/// encoding. A text element keys its `C` (byte) form over its first [`GIN_MAX_TERM_BYTES`] bytes
+/// (§4.2) — never the column collation's sort key, since text `=` is byte identity under every
+/// collation — so the key encoding never collates and is infallible.
+///
+/// [`GIN_MAX_TERM_BYTES`]: crate::encoding::GIN_MAX_TERM_BYTES
+pub(crate) fn gin_element_term(elem: ScalarType, v: &Value) -> Vec<u8> {
+    match v {
+        Value::Text(s) => {
+            let bytes = s.as_bytes();
+            let cut = bytes.len().min(crate::encoding::GIN_MAX_TERM_BYTES);
+            crate::encoding::encode_terminated(&bytes[..cut])
+        }
+        _ => encode_key_value(elem, v, None)
+            .expect("a GIN element key is infallible (no collation, a bounded width)"),
+    }
 }
 
 /// `term ‖ storage_key` for each (sorted, distinct) term — a GIN index's entry keys for one row.

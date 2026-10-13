@@ -163,6 +163,10 @@
 #              mixing a term in every row, frequent, rare, and absent terms reads only the shortest
 #              posting list whole and probes the rest leaf by leaf; the equivalent `Q <@ tags` is NOT
 #              GIN-accelerated (full scan). Both must return the by-construction count and id sum.
+#   gin_text — GIN over text[] (gin.md §4.2): `tags @> Q` / `k = ANY(tags)` gather through each element's
+#              C text key cut at 128 bytes (long elements sharing a prefix share a term); the
+#              equivalent `Q <@ tags` / `ARRAY[k] <@ tags` are NOT GIN-accelerated (full scan). Both
+#              must return the by-construction rows of byte-exact text equality.
 #   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
 #              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
@@ -391,6 +395,10 @@ GIN_JSONB_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan
 GIN_SKIP_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.insert
                   dml.insert_select query.select query.aggregates query.set_returning types.i64
                   types.array func.array_containment expr.arithmetic cast.operator].freeze
+GIN_TEXT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_any_eq
+                  query.gin_element_types query.gin_text_elements dml.insert dml.insert_multi_row
+                  query.select query.order_by types.i32 types.text types.array func.array
+                  func.array_containment func.array_quantified cast.operator].freeze
 GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
               dml.insert_multi_row query.select query.order_by types.i32 types.range
               func.range_constructors func.range_operators].freeze
@@ -2000,6 +2008,48 @@ def gen_gin(seed)
   gpair.call("@> {#{absent}} (absent -> empty)", [absent], matches.call([absent]))
   gpair.call("@> {#{present},#{k2}} (intersection)", [present, k2], matches.call([present, k2]))
 
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GIN over text[] (@> / = ANY via the GIN index vs <@ full scan) --------------------
+# A text element's GIN term is its C key over the first 128 bytes (spec/design/gin.md §4.2), so the
+# vocabulary mixes short words, the empty string, a multibyte word, case variants, and long strings
+# that share their first 128 bytes (one term, separated by the recheck). `Q <@ tags` is the same
+# predicate and full scans. Expected rows: byte-exact containment, known by construction.
+GIN_TEXT_WORDS = ["red", "Red", "blue", "", "café", "a b", "x" * 128 + "1", "x" * 128 + "2",
+                  "x" * 127 + "z", "é" * 65, "é" * 64 + "ex"].freeze
+
+def gen_gin_text(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(14, random: rng).sort
+  null_id = ids.sample(random: rng)
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { GIN_TEXT_WORDS.sample(random: rng) }]
+  end
+  sql_str = ->(w) { "'#{w.gsub("'", "''")}'" }
+  arr = ->(ws) { ws.empty? ? "'{}'::text[]" : "ARRAY[#{ws.map(&sql_str).join(', ')}]::text[]" }
+  contains = ->(q) { rows.select { |_id, t| !t.nil? && q.uniq.all? { |w| t.include?(w) } }.map { |id, _| id.to_s } }
+
+  out = header(seed, GIN_TEXT_REQ, "GIN over text[] (@> / = ANY via the GIN index vs <@ full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, tags text[])")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{t.nil? ? 'NULL' : arr.call(t)})" }.join(', ')}")
+
+  present = rows.filter_map { |_id, t| t }.flatten
+  words = [present.sample(random: rng) || "red", GIN_TEXT_WORDS.sample(random: rng), "x" * 128 + "1"]
+  words.each do |w|
+    out << "# = ANY #{w[0, 20].inspect}"
+    q(out, "I", "SELECT id FROM t WHERE #{sql_str.call(w)} = ANY(tags) ORDER BY id", contains.call([w]))
+    out << "# full scan (ARRAY[k] <@ col is the same predicate, not GIN-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE #{arr.call([w])} <@ tags ORDER BY id", contains.call([w]))
+  end
+  pair = [present.sample(random: rng) || "red", present.sample(random: rng) || "blue"]
+  out << "# @> #{pair.map { |w| w[0, 12] }.inspect}"
+  q(out, "I", "SELECT id FROM t WHERE tags @> #{arr.call(pair)} ORDER BY id", contains.call(pair))
+  out << "# full scan — MUST match"
+  q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair)} <@ tags ORDER BY id", contains.call(pair))
   out.join("\n") + "\n"
 end
 
@@ -4108,6 +4158,7 @@ SCENARIOS = {
   "gin_mut" => method(:gen_gin_mutation),
   "gin_jsonb" => method(:gen_gin_jsonb),
   "gin_skip" => method(:gen_gin_skip),
+  "gin_text" => method(:gen_gin_text),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),
   "tlp" => method(:gen_tlp),

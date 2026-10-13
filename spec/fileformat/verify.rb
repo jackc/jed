@@ -1095,6 +1095,30 @@ GIN_FLOAT_TABLE = {
          [5, [-Float::INFINITY, nil, -2.5], [100.25, nil, 100.25], 5]]
 }.freeze
 
+# A GIN index over a text[] column (the text GIN element golden, spec/design/gin.md §4.2): each term
+# is the element's C text key (text-terminated-escape over its UTF-8). Row 1 holds a duplicate (one
+# entry); row 2 the empty string, a two-byte character, and a NULL element (no term); rows 3/4 an
+# empty and a NULL whole-value array (no entries); row 5 an element with a space beside row 1's
+# "red" (one term in two rows). The over-128-byte cut cannot fit this page's record limit; the
+# query/gin_text_elements.test costs pin it cross-core. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, tags text[], n i32)
+#   INSERT (1, '{red,blue,red}', 1), (2, '{"",é,NULL}', 2), (3, '{}', 3), (4, NULL, 4),
+#          (5, '{"a b",red}', 5)
+#   CREATE INDEX i_n ON t (n);  CREATE INDEX i_tags_gin ON t USING gin (tags)
+GIN_TEXT_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("tags", "text[]"), col("n", "i32")],
+  indexes: [
+    { name: "i_n", cols: [2] },
+    { name: "i_tags_gin", cols: [1], kind: "gin" }
+  ],
+  rows: [[1, %w[red blue red], 1],
+         [2, ["", "é", nil], 2],
+         [3, [], 3],
+         [4, nil, 4],
+         [5, ["a b", "red"], 5]]
+}.freeze
+
 # A GIN index over a jsonb column (the jsonb_ops golden, spec/design/gin.md §2.1/§4.1): row 1 holds
 # keys at two levels, an array string element (a KEY term) beside a member string value (a STRING
 # term), a boolean and a JSON null; row 2 a top-level array whose 1.5 and 1.50 are ONE number term
@@ -1502,6 +1526,7 @@ FIXTURES = ([
   { file: "gin_float_table.jed", page_size: 256, tables: [GIN_FLOAT_TABLE] },
   { file: "gin_interval_table.jed", page_size: 256, tables: [GIN_INTERVAL_TABLE] },
   { file: "gin_jsonb_table.jed", page_size: 256, tables: [GIN_JSONB_TABLE] },
+  { file: "gin_text_table.jed", page_size: 256, tables: [GIN_TEXT_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
@@ -2507,7 +2532,7 @@ def gin_index_entries(table, ix)
               gin_jsonb_terms(av)
             else
               elems = av.is_a?(Hash) ? av[:elements] : av
-              elems.compact.map { |e| key_body(elem_type, e) }
+              elems.compact.map { |e| gin_element_term(elem_type, e) }
             end
     terms.uniq.each do |term|
       key = (term + storage_key).b
@@ -2515,6 +2540,14 @@ def gin_index_entries(table, ix)
     end
   end
   pairs.sort_by { |key, _| key }
+end
+
+# An array_ops term (spec/design/gin.md §4/§4.2): the element's key body, a text element's over its
+# first 128 bytes (the C key — never a collation sort key; the cut is at a byte).
+def gin_element_term(elem_type, e)
+  return enc_terminated(e.b.byteslice(0, GIN_JSONB_MAX_TERM_BYTES)) if elem_type == "text"
+
+  key_body(elem_type, e)
 end
 
 # GIN `jsonb_ops` index terms of a tagged jsonb node (spec/design/gin.md §2.1/§4.1): a KEY term

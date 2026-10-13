@@ -14,11 +14,8 @@
 // taken over the TextEncoder UTF-8 bytes — never over code units — and may split a character (a term
 // is bytes, never decoded).
 
-import { encodeTerminated } from "./encoding.ts";
+import { encodeTerminated, GIN_MAX_TERM_BYTES } from "./encoding.ts";
 import type { JsonNode } from "./json.ts";
-
-// GIN_JSONB_MAX is the byte cut for a key / string / number body source (gin.md §4.1).
-const GIN_JSONB_MAX = 128;
 
 const FLAG_KEY = 0x01;
 const FLAG_NULL = 0x02;
@@ -34,9 +31,9 @@ const UTF8 = new TextEncoder();
 function framed(flag: number, content: Uint8Array): Uint8Array {
   let src = content;
   let f = flag;
-  if (src.length > GIN_JSONB_MAX) {
+  if (src.length > GIN_MAX_TERM_BYTES) {
     f |= FLAG_CUT;
-    src = src.subarray(0, GIN_JSONB_MAX);
+    src = src.subarray(0, GIN_MAX_TERM_BYTES);
   }
   const body = encodeTerminated(src);
   const out = new Uint8Array(1 + body.length);

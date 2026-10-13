@@ -6,7 +6,7 @@
 > column narrows its scan to matching rows instead of reading the whole table. Two operator
 > classes ship: **`array_ops`**, accelerating the array **containment `@>`**, **overlap `&&`**,
 > membership, and equality operators ([array-functions.md §10](array-functions.md)) over an array
-> column of a **fixed-width key-encodable element** type (§1), and **`jsonb_ops`** (§2.1),
+> column of an admitted key-encodable element type (§1), and **`jsonb_ops`** (§2.1),
 > accelerating the `jsonb` containment `@>` and key-existence `?` / `?|` / `?&` operators
 > ([json-sql-functions.md §1](json-sql-functions.md)) over a `jsonb` column. This doc is the
 > contract all three cores implement in lockstep (CLAUDE.md §2); the grammar is in
@@ -28,17 +28,15 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   ([indexes.md §2/§6](indexes.md)); only **how entries are derived from a row** and **how a
   query uses it** differ. The default kind (no `USING`, or `USING btree`) is the ordered
   B-tree; `USING gin` selects this one.
-- **One column: a `jsonb` column (`jsonb_ops`, §2.1) or a fixed-width-key-encodable-element
-  array (`array_ops`).** The operator class is implied by the column type — there is no explicit
-  opclass syntax and none is persisted. For an array, a single column whose element
-  type is one of the engine's fixed-width keyable scalars — the integers (`i16[]` / `i32[]` /
+- **One column: a `jsonb` column (`jsonb_ops`, §2.1) or an array (`array_ops`).** The operator
+  class is implied by the column type — there is no explicit opclass syntax and none is persisted.
+  For an array, a single column whose element type is one of the integers (`i16[]` / `i32[]` /
   `i64[]`), `boolean[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, the binary floats
-  `f32[]` / `f64[]`, and `interval[]` — i.e. element types whose fixed-width order-preserving key
-  encoding has landed ([encoding.md §2.1](encoding.md), [§2.8](encoding.md) for floats,
-  [§2.10](encoding.md) for interval), the keys an ordered-index / `PRIMARY KEY` column accepts. A
-  multi-column GIN, and an array of a variable-width element type (`text[]`, `decimal[]`,
-  `bytea[]`), are `0A000` this slice (§3, §10) — the same "lift it when its key encoding lands"
-  narrowing the ordered index makes for text/decimal keys. A `json` column has no GIN operator
+  `f32[]` / `f64[]`, `interval[]`, or `text[]` — element types whose order-preserving key encoding
+  has landed ([encoding.md §2.1](encoding.md), [§2.4](encoding.md) for text, [§2.8](encoding.md)
+  for floats, [§2.10](encoding.md) for interval), the keys an ordered-index / `PRIMARY KEY` column
+  accepts. A multi-column GIN, and `decimal[]` / `bytea[]` / composite-element arrays, are `0A000`
+  this slice (§3, §10). A `json` column has no GIN operator
   class (`42704`, as in PostgreSQL).
 - **Accelerates `@>`, `&&`, `const = ANY(col)` membership, and array `=`.** A `WHERE`
   conjunct `col @> const` (contains), `col && const` (overlaps), `const = ANY(col)` (the
@@ -205,13 +203,13 @@ like a type name.
    - any other **non-array** column (including `json`) has no GIN operator class — **42704**
      (PG's "data type … has no default operator class for access method gin"; jed matches the
      code, house-style message);
-   - an array whose element type is **not an admitted fixed-width key-encodable scalar** is
-     **0A000** this slice. The admitted element types are the integers (`i16`/`i32`/`i64`),
-     `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval` — fixed-width
-     keys a `PRIMARY KEY` / ordered-index key column accepts ([indexes.md §1](indexes.md)), because
-     a GIN term is exactly that key encoding (§4). A **variable-width** element type — `text[]`,
-     `decimal[]`, `bytea[]` — stays **0A000** (the lift-when-encoded narrowing — §1, §10; PG
-     *would* build it, a documented divergence recorded in the oracle override ledger).
+   - an array whose element type is **not admitted** is **0A000** this slice. The admitted
+     element types are the integers (`i16`/`i32`/`i64`), `boolean`, `uuid`, `date`, `timestamp`,
+     `timestamptz`, `f32`, `f64`, `interval`, and `text` — keys a `PRIMARY KEY` / ordered-index key
+     column accepts ([indexes.md §1](indexes.md)), because a GIN term is that key encoding (§4,
+     §4.2). `decimal[]`, `bytea[]`, and composite-element arrays stay **0A000** (§10; PG *would*
+     build them, a documented divergence recorded in the oracle override ledger). A `text[]` column
+     with any collation is admitted; its terms do not depend on the collation (§4.2).
 4. **`UNIQUE` with `USING gin`** is **0A000** (uniqueness is undefined for an inverted
    index — §1; PG raises `0A000` too: "access method gin does not support unique indexes").
 5. **More than one key column** with `USING gin` is **0A000** this slice (PG *would* build a
@@ -243,21 +241,18 @@ entry_key = encode_element(term) ‖ row_storage_key
 ```
 
 - For `array_ops`, `encode_element(term)` is the element type's order-preserving key encoding
-  ([encoding.md §2.1](encoding.md)) — fixed-width for every element type this slice admits
-  (the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval` —
-  §3), so the term
-  needs **no presence tag and no terminator** (a GIN term is never NULL — §2 — and a
-  fixed-width term self-delimits). It is the *same* per-type key encoder a `PRIMARY KEY` /
+  ([encoding.md §2.1](encoding.md)) — fixed-width for every admitted element type but `text`, whose
+  terminated key self-delimits too (§4.2), so the term needs **no presence tag and no extra
+  framing** (a GIN term is never NULL — §2). It is the *same* per-type key encoder a `PRIMARY KEY` /
   ordered-index key column uses, so a `uuid[]` term is the 16 raw bytes, a `date[]` term the
   i32 sign-flipped day count, a `timestamp[]` term the i64 sign-flipped microseconds, an
   `f64[]`/`f32[]` term the canonicalized `float-order-preserving` bits (§2 *Float terms*), an
   `interval[]` term the 16-byte `interval-span-i128` span (§2 *Interval terms*) — each
-  already byte-pinned by that type's key-encoding vectors and PK goldens. The future
-  variable-width element types reuse the terminated/escaped encodings
-  ([encoding.md §2.4–§2.6](encoding.md)) when they lift.
+  already byte-pinned by that type's key-encoding vectors and PK goldens; a `text[]` term is the
+  `C` text key of the element's first 128 bytes (§4.2).
 - The **row storage key** (the encoded PK, or the synthetic-rowid key) is the **suffix**,
   exactly as in an ordered index: it makes every entry unique, names the row, and — since
-  the fixed-width term self-delimits — is recovered by skipping the term. So all rows
+  every term self-delimits — is recovered by skipping the term. So all rows
   carrying a term `t` are the **contiguous entry range** `[encode_element(t),
   byte-successor(encode_element(t)))` — the term's *posting list*, read by one prefix range
   scan. No separate posting-tree structure exists; the inverted index *is* the ordered
@@ -297,6 +292,32 @@ the `0x00 0x01` terminator that never occurs inside an escaped body, so no term 
 another. The posting list of a term `t` is therefore the entry range `[t, byte-successor(t))`, and
 the storage key is the entry's suffix after `t` — exactly the `array_ops` gather (§6), now with
 variable-width terms.
+
+### 4.2 `text[]` element terms
+
+A `text` element's term is its `C` text key — `text-terminated-escape` over the UTF-8 bytes
+([encoding.md §2.4](encoding.md)) — taken over at most its **first 128 bytes**:
+
+```
+term = text-terminated-escape(utf8(element)[0 .. min(n, 128)])
+```
+
+- **Not the collation's sort key.** A collated `text[]` column (`COLLATE "unicode"`) still keys its
+  terms by raw bytes. Every collation jed ships is deterministic, so text `=` — and therefore `@>`,
+  `&&`, `= ANY`, and array `=` element matching — is byte identity under any collation
+  ([collation.md §6/§7](collation.md)), and byte terms are exact for it. A GIN index therefore never
+  depends on a collation table: a collation upgrade leaves its entries unchanged, and the skew
+  guard has nothing to check. (A future non-deterministic collation would need a different term,
+  [collation.md §14](collation.md).)
+- **The 128-byte cut.** For an element of at most 128 bytes the term is exactly its text key. A
+  longer element keeps its first 128 bytes, cut at a byte, never a character boundary. Every element
+  sharing those bytes shares the term, including the 128-byte string that equals them. The gather
+  is then a superset that the residual operator rechecks, and an entry always fits a node, so a
+  long string never makes its row unindexable. Unlike `jsonb_ops` (§4.1) there is no truncation
+  flag: a cut term and the term of the identical 128-byte prefix are the same, and the recheck
+  separates them. PostgreSQL's `array_ops` stores whole elements and has no cut.
+- **Self-delimiting.** The `0x00 0x01` terminator never occurs inside an escaped body, so no term is
+  a proper prefix of another; the posting list and storage-key suffix rules are the ones above.
 
 **Term extraction is a SET (dedup is mandatory, not an optimization).** A row
 `{1, 1, 2}` yields the terms `{1, 2}` — one entry each. Two `1` entries for one row would
@@ -525,7 +546,9 @@ multi-element / duplicate-element / empty / NULL arrays (exercising term dedup a
 zero-entry cases), beside one ordinary ordered index (`index_kind = 0`) in the same catalog
 (the per-index kind byte). Byte-identical across Rust, Go, TS, and the Ruby reference (the §8
 cross-core round-trip). `fixtures/gin_uuid_table.jed`, `fixtures/gin_float_table.jed`, and
-`fixtures/gin_interval_table.jed` pin the non-integer element terms the same way — the float one
+`fixtures/gin_interval_table.jed` (and `fixtures/gin_text_table.jed` — empty, multibyte, duplicate, and NULL elements, §4.2; the cut form cannot fit the 256-byte page's
+record limit and is pinned cross-core by the `query/gin_text_elements.test` costs) pin the
+non-integer element terms the same way — the float one
 the canonicalizing float key (§2 *Float terms*): `{1.5,-0,0}` stores three values but two entries,
 `{NaN,Infinity,NaN}` two; the interval one the span key (§2 *Interval terms*): `{1 mon,30
 days,720:00:00}` stores three distinct values but ONE entry.
@@ -554,10 +577,11 @@ final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
   none (auto-names are observable via `DROP INDEX`/collisions and the host catalog in
   per-core tests), as for the ordered index ([indexes.md §7](indexes.md)).
 - **Element-type subset** — PG's `array_ops` GIN indexes an array of any element type; jed
-  covers the **fixed-width key-encodable** elements (the integers, `boolean`, `uuid`, `date`,
-  `timestamp`, `timestamptz`, `f32`, `f64`, `interval` — §3), the variable-width rest `0A000`
-  until their GIN slices land. A divergence on `text[]`/`decimal[]`/etc. (PG builds, jed
-  `0A000`), oracle-override-ledgered.
+  covers the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`,
+  `interval`, and `text` (§3); `decimal[]`, `bytea[]`, and composite elements are `0A000` until
+  their GIN slices land (PG builds, jed `0A000`), oracle-override-ledgered.
+- **`text[]` terms are cut at 128 bytes** (§4.2) — PG keeps the whole element. Lossy and rechecked;
+  unobservable in results.
 - **Single-column only** — PG supports multicolumn GIN; jed is `0A000` this slice (§3).
 - **`<@` / `IN` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a broad scan +
   recheck); jed runs `<@` and `IN`-over-a-scalar-list by full scan this slice (a cost/plan
@@ -567,10 +591,23 @@ final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
   index; same rows either way). PG's `ginarrayconsistent` *also* marks the `=` strategy
   **lossy → recheck** (its comment: `array_eq` and `array_contain_compare` handle NULLs
   differently), so jed's always-recheck posture (§2) aligns with PG here exactly — unlike
-  `@>`/`&&`, which PG marks non-lossy. **`const = ANY(col)` membership IS accelerated** (§1/§6), a single-term
-  `@>` gather; here PG does *not* rewrite `= ANY(array)` onto a GIN array index (it leaves it a
-  full scan), so that one is a jed *acceleration* divergence — same rows, lower cost — not a
-  result difference.
+  `@>`/`&&`, which PG marks non-lossy.
+- **`const = ANY(col)` membership IS accelerated** (§1/§6) — a single-term `@>` gather; PostgreSQL
+  full-scans it (oracle-verified: a sequential scan even with `enable_seqscan = off`). A jed
+  *acceleration* divergence — same rows, lower cost — not a result difference. **Why PG cannot:** its
+  planner matches a clause to an index only as `indexed_column OP value` with `OP` in the index's
+  operator class. `c = ANY(col)` is a scalar `=` with the indexed column as `ANY`'s array argument,
+  and `array_ops` holds only the whole-array `@>`/`<@`/`&&`/`=`. Nothing rewrites it to
+  `col @> ARRAY[c]`, the spelling PostgreSQL users are told to write. **Why a rewrite would be
+  wrong, and jed's bound is not:** the two differ under NULL (`42 = ANY('{1,NULL}')` is NULL,
+  `'{1,NULL}' @> '{42}'` is false), so swapping one for the other changes `NOT (…)` or a
+  select-list value. jed rewrites nothing. It applies the bound only to a `WHERE` conjunct, where
+  NULL and FALSE both drop the row, and keeps `c = ANY(col)` as the residual recheck (§6). The gather
+  is a superset because a TRUE row has an element equal to `c` and so is in `c`'s posting list.
+  Exactness rests on two jed facts: `c` is converted to the element type before its term is taken
+  (§2 *Float terms*), and every collation is deterministic, so text `=` is byte identity (§4.2).
+  PostgreSQL's non-deterministic ICU collations would break a byte-term gather, and jed would have
+  to revisit this when it adds one.
 - **Recheck always** — jed re-applies the residual predicate to every candidate even though
   the `array_ops` gather is exact (§2); an overriding-reason simplification that also seats
   the future lossy opclasses. (PG marks `array_ops` `@>`/`&&` as non-lossy and can skip the
@@ -596,10 +633,9 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   term is their existing key encoding, so the inverted core was unchanged — only the DDL gate
   and the per-element encoder generalized. The binary floats `f32[]`/`f64[]` have landed the same
   way, plus the cross-width query-value conversion (§2 *Float terms*), and `interval[]` over its
-  span key (§2 *Interval terms*). The **variable-width** elements —
-  `text[]`, `decimal[]`, `bytea[]` — remain `0A000` until GIN term framing for their
-  terminated/escaped key encodings lands ([encoding.md §2.4–§2.6](encoding.md)); composite-element
-  arrays too.
+  span key (§2 *Interval terms*), and `text[]` over its cut `C` key (§4.2). `decimal[]` and
+  `bytea[]` remain `0A000`: both have self-delimiting keys ([encoding.md §2.5/§2.6](encoding.md)),
+  so each needs only the element-term cut rule §4.2 applies to text. Composite-element arrays too.
 - **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
   scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
 - **Multi-column GIN** and general correlated / expression / same-or-later-relation query operands.

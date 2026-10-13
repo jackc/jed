@@ -1266,9 +1266,6 @@ pub fn has_key(node: &JsonNode, key: &str) -> bool {
 // GIN `jsonb_ops` terms (spec/design/gin.md §2.1/§4.1).
 // ---------------------------------------------------------------------------------------------
 
-/// The longest body source (string UTF-8 / number key bytes) a `jsonb_ops` term keeps; a longer one
-/// is cut to this many bytes and its flag gains [`GIN_JSONB_TRUNCATED`] (gin.md §4.1).
-pub const GIN_JSONB_MAX_TERM_BYTES: usize = 128;
 const GIN_JSONB_KEY: u8 = 0x01;
 const GIN_JSONB_NULL: u8 = 0x02;
 const GIN_JSONB_BOOL: u8 = 0x03;
@@ -1276,13 +1273,12 @@ const GIN_JSONB_NUM: u8 = 0x04;
 const GIN_JSONB_STR: u8 = 0x05;
 const GIN_JSONB_TRUNCATED: u8 = 0x10;
 
-/// `flag ‖ text-terminated-escape(source cut to 128 bytes)`, the cut setting the truncated bit.
+/// `flag ‖ text-terminated-escape(source cut to 128 bytes)`, the cut setting the truncated bit
+/// (gin.md §4.1).
 fn gin_jsonb_framed(flag: u8, source: &[u8]) -> Vec<u8> {
-    let (flag, body) = if source.len() > GIN_JSONB_MAX_TERM_BYTES {
-        (
-            flag | GIN_JSONB_TRUNCATED,
-            &source[..GIN_JSONB_MAX_TERM_BYTES],
-        )
+    use crate::encoding::GIN_MAX_TERM_BYTES;
+    let (flag, body) = if source.len() > GIN_MAX_TERM_BYTES {
+        (flag | GIN_JSONB_TRUNCATED, &source[..GIN_MAX_TERM_BYTES])
     } else {
         (flag, source)
     };

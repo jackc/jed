@@ -333,12 +333,15 @@ GIN this release covers a focused surface (it grows from here):
 
 - **A `jsonb` column** — the `jsonb_ops` operator class above, for `@>`, `<@`, `?`, `?|`, and `?&`.
 
-- **Or one column, an array of a fixed-width key-encodable element type** — the integers (`i16[]`,
-  `i32[]`, `i64[]`), plus `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`,
-  `interval[]`, and the binary floats (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding
-  and carries no length/terminator framing, so only the fixed-width keyables qualify: the
-  *variable-width* keyables (`text[]`, `numeric[]`, `bytea[]`) — though their elements are valid
-  ordered-index / `PRIMARY KEY` keys — are rejected `0A000` here, as is a multi-column GIN.
+- **Or one column, an array** of the integers (`i16[]`, `i32[]`, `i64[]`), `text[]`, `uuid[]`,
+  `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`, `interval[]`, or the binary floats
+  (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding. `numeric[]` and `bytea[]` are
+  rejected (`0A000`) for now, as is a multi-column GIN.
+- **Text elements match byte for byte** — `'Red' = ANY(tags)` does not find `{red}`, under any
+  collation, as with text `=`. A `text[]` column with a `COLLATE` clause indexes the same way. An
+  element longer than 128 bytes is indexed by its first 128 bytes, so very long elements that share
+  a prefix share an index entry; the recheck tells them apart, and a long element never makes its
+  row unindexable.
 - **Float elements match like float `=`** — `-0` and `0` are one term and every `NaN` is one term
   (PostgreSQL's float order: `-0 = 0`, `NaN = NaN`), so `0 = ANY(col)` finds a stored `{-0}` and
   `'NaN'::f64 = ANY(col)` finds a stored `{NaN}`. A query value of the other float width works too:

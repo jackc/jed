@@ -250,7 +250,7 @@ import {
   type StorageBudget,
 } from "./persist.ts";
 import { Decimal, workLinear } from "./decimal.ts";
-import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
+import { encodeBool, encodeInt, encodeTerminated, GIN_MAX_TERM_BYTES } from "./encoding.ts";
 import {
   checkViolation,
   EngineError,
@@ -2844,9 +2844,10 @@ export class Engine {
   // checkIndexColumnType is the CREATE INDEX per-kind column-type gate (indexes.md §1, gin.md §3,
   // gist.md §6), shared with ALTER COLUMN … TYPE, which re-applies it to every surviving index that
   // keys a retyped column (alter.md §3.3):
-  //   - gin: a `jsonb` column takes jsonb_ops; an array of a FIXED-WIDTH KEY-ENCODABLE element takes
+  //   - gin: a `jsonb` column takes jsonb_ops; an array of an admitted key-encodable element takes
   //     array_ops (the GIN term IS that element's key encoding — the integers, boolean, uuid, date,
-  //     timestamp, timestamptz, f32, f64, interval); any other array is 0A000; any other type
+  //     timestamp, timestamptz, f32, f64, interval, text; isGinElementType); any other array (bytea,
+  //     decimal, …) is 0A000; any other type
   //     (including `json`) has no GIN operator class — 42704.
   //   - gist: range_ops over a range column, or the in-core btree_gist-equivalent scalar `=` opclass
   //     over a fixed-width keyable scalar; a keyable-but-deferred scalar (text / bytea / decimal /
@@ -10005,10 +10006,10 @@ export class Engine {
     }
 
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
-    // (gin.md §4). The entry is encode(term) ‖ storage_key; the element's KEY encoding is
-    // fixed-width, so the storage key is the suffix after the term's own length (the query term and
-    // every stored term of one element type share that width; widthBytes is 0 for interval, whose
-    // 16-byte span key is not its value encoding — encoding.md §2.10).
+    // (gin.md §4). The entry is encode(term) ‖ storage_key and every term self-delimits — an
+    // array_ops element key is fixed-width or terminated (text, §4.2), a jsonb_ops term is a flag
+    // byte plus a fixed or terminated body (§4.1) — so the range holds exactly this term's entries
+    // and the storage key is the suffix after the term's own length.
     const istore = this.lkpIndexStore(gb.nameKey);
     const gather = new GinGather(istore);
     // The candidate storage keys, ascending byte (= storage-key) order, so the point lookups and
@@ -25230,15 +25231,17 @@ export function exclusionPairConflicts(
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits — the
-// integers, boolean, uuid, date, timestamp, timestamptz, f32, f64, interval (spec/design/gin.md
-// §3): a GIN term IS the element's order-preserving key encoding (§4) and a term carries no
-// length/terminator framing, so only the FIXED-WIDTH keyables qualify. A float term is the
-// canonicalizing float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN),
-// and an interval term the 16-byte interval-span-i128 span key (encoding.md §2.10: 1 mon,
-// 30 days, 720:00:00 share one key), so term equality is exactly SQL = for both. The
-// variable-width keyables (text, bytea, decimal) — valid ordered-index / PK keys — are 0A000 here.
+// integers, boolean, uuid, date, timestamp, timestamptz, f32, f64, interval, and text
+// (spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding (§4),
+// self-delimiting for every one of them. A float term is the canonicalizing float-order-preserving
+// key (encoding.md §2.8: -0 → +0, every NaN → one NaN), and an interval term the 16-byte
+// interval-span-i128 span key (encoding.md §2.10: 1 mon, 30 days, 720:00:00 share one key), so term
+// equality is exactly SQL = for both. A text term is the C (byte) key of its first 128 bytes (§4.2)
+// whatever the column's collation — every collation is deterministic, so text = is byte identity.
+// bytea and decimal — valid ordered-index / PK keys — are 0A000 here.
 export function isGinElementType(elem: Type): boolean {
   return (
+    typeIsText(elem) ||
     typeIsInteger(elem) ||
     typeIsBoolean(elem) ||
     typeIsUuid(elem) ||
@@ -25257,7 +25260,7 @@ export function isGinElementType(elem: Type): boolean {
 // converted to the element width: an f32 value widens exactly; an f64 value narrows only when it is
 // exactly an f32 (or NaN — every NaN is one value, float.md §3), else no f32 element can equal it.
 // The float key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so term equality is exactly
-// SQL float =. A GIN element is fixed-width (no text), so the encoding never collates.
+// SQL float =. Every other value takes the shared element term (ginElementTerm), which never collates.
 function ginQueryTerm(elem: ScalarType, v: Value): Uint8Array | null {
   if (elem === "f32" && v.kind === "f64") {
     const narrowed = Math.fround(v.value);
@@ -25265,6 +25268,21 @@ function ginQueryTerm(elem: ScalarType, v: Value): Uint8Array | null {
     return encodeFloat32Key(narrowed);
   }
   if (elem === "f64" && v.kind === "f32") return encodeFloat64Key(v.value);
+  return ginElementTerm(elem, v);
+}
+
+// ginElementTerm is the array_ops term of one non-NULL element (gin.md §4): the element type's
+// order-preserving key encoding. A text element keys its C (byte) form over its first
+// GIN_MAX_TERM_BYTES UTF-8 bytes (§4.2) — the cut is over the TextEncoder bytes, never UTF-16 code
+// units, and may split a character — never the column collation's sort key, since text = is byte
+// identity under every collation. So the key encoding never collates.
+export function ginElementTerm(elem: ScalarType, v: Value): Uint8Array {
+  if (v.kind === "text") {
+    const bytes = SQL_BYTE_ENCODER.encode(v.text);
+    return encodeTerminated(
+      bytes.length > GIN_MAX_TERM_BYTES ? bytes.subarray(0, GIN_MAX_TERM_BYTES) : bytes,
+    );
+  }
   return encodeKeyValue(elem, v, null);
 }
 
@@ -25325,7 +25343,7 @@ function resolveExclusionDefinition(
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
-// isGinElementType's set minus the floats and interval, kept a separate predicate so the two
+// isGinElementType's set minus the floats, interval, and text, kept a separate predicate so the two
 // surfaces evolve independently.
 export function isGistScalarType(ty: Type): boolean {
   return (
@@ -25385,8 +25403,8 @@ export function ginEntries(
   const terms: Uint8Array[] = [];
   for (const el of v.elements) {
     if (el.kind === "null") continue; // a NULL element carries no term; a non-keyable element is impossible
-    // a GIN element is fixed-width (isGinElementType excludes text), so it never collates.
-    const term = encodeKeyValue(elemTy, el, null);
+    // the shared element term — a text element is its C key (gin.md §4.2), so it never collates.
+    const term = ginElementTerm(elemTy, el);
     const k = byteKey(term);
     if (!seen.has(k)) {
       seen.add(k);

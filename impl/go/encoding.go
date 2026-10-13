@@ -55,6 +55,11 @@ func encodeTerminated(content []byte) []byte {
 	return append(out, 0x00, 0x01)
 }
 
+// ginMaxTermBytes is the longest source a variable-width GIN term keeps (spec/design/gin.md
+// §4.1/§4.2): a longer string (or jsonb number key) is cut to its first ginMaxTermBytes bytes, so a
+// GIN entry always fits a node. The cut is at a byte, never decoded.
+const ginMaxTermBytes = 128
+
 // DecodeInt is the inverse of EncodeInt. len(b) must equal the type's width.
 func decodeInt(t scalarType, b []byte) int64 {
 	width := t.WidthBytes()

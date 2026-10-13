@@ -436,6 +436,19 @@ func ginIntervalTableDB(t *testing.T) *Session {
 	return db
 }
 
+// ginTextTableDB is the text GIN element golden (gin.md §4.2): each term is the element's C text key;
+// a duplicate, the empty string, a two-byte character, NULL elements, and empty / NULL arrays. An
+// ordered index i_n sits beside it. Must match verify.rb's GIN_TEXT_TABLE.
+func ginTextTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, tags text[], n i32)")
+	run(t, db, "INSERT INTO t VALUES (1, '{red,blue,red}', 1), (2, '{\"\",é,NULL}', 2), (3, '{}', 3), "+
+		"(4, NULL, 4), (5, '{\"a b\",red}', 5)")
+	run(t, db, "CREATE INDEX i_n ON t (n)")
+	run(t, db, "CREATE INDEX i_tags_gin ON t USING gin (tags)")
+	return db
+}
+
 // ginJsonbTableDB is the jsonb_ops GIN golden (gin.md §2.1/§4.1): keys at two levels, an array
 // string element (a KEY term) beside a member string value, every scalar kind, 1.5/1.50 as one number
 // term, a duplicate term, a top-level string, {}, a SQL NULL, and a negative number. Must match
@@ -1116,6 +1129,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gin_float_table.jed", ginFloatTableDB},
 		{"gin_interval_table.jed", ginIntervalTableDB},
 		{"gin_jsonb_table.jed", ginJsonbTableDB},
+		{"gin_text_table.jed", ginTextTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"composite_key_table.jed", compositeKeyTableDB},
@@ -1200,6 +1214,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gin_float_table.jed", ginFloatTableDB, "t"},
 		{"gin_interval_table.jed", ginIntervalTableDB, "t"},
 		{"gin_jsonb_table.jed", ginJsonbTableDB, "t"},
+		{"gin_text_table.jed", ginTextTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"composite_key_table.jed", compositeKeyTableDB, "t"},

@@ -1849,8 +1849,8 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 
 // ginGather is the shared inverted gather (gin.md §6 steps 2–4) over a non-empty, deduplicated,
 // byte-sorted query term set: each term's posting list is the entry range [term, successor(term)) of
-// the GIN tree — a term self-delimits (fixed-width array_ops keys; jsonb_ops terms end in a
-// terminator or are a fixed 1–2 bytes, gin.md §4.1), so the storage key is the entry's suffix after
+// the GIN tree — a term self-delimits (array_ops keys are fixed-width or terminated — text, §4.2;
+// jsonb_ops terms end in a terminator or are a fixed 1–2 bytes, §4.1), so the storage key is the entry's suffix after
 // the term's own length. The posting sets combine by mode (any → union, else intersection) into the
 // candidate storage keys, ascending byte (= storage-key) order, each point-looked-up so lookups and
 // emitted rows follow storage order exactly as a full scan (gin.md §6/§8). gin_entry (per posting
@@ -1960,7 +1960,8 @@ func (db *engine) ginJsonbBoundRows(store *tableStore, gb *ginBoundPlan, qv Valu
 // converted to the element width: an f32 value widens exactly; an f64 value narrows only when it is
 // exactly an f32 (or NaN — every NaN is one value, float.md §3), else no f32 element can equal it.
 // The float key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so term equality is exactly
-// SQL float =. A GIN element is fixed-width (no text), so the encoding never collates / fails.
+// SQL float =. Every other value takes the shared element term (ginElementTerm), which never
+// collates or fails.
 func ginQueryTerm(elem scalarType, v Value) ([]byte, bool) {
 	switch {
 	case elem == scalarFloat32 && v.Kind == ValFloat64:
@@ -1973,11 +1974,7 @@ func ginQueryTerm(elem scalarType, v Value) ([]byte, bool) {
 	case elem == scalarFloat64 && v.Kind == ValFloat32:
 		return encodeFloat64Key(math.Float64bits(float64(v.F32()))), true
 	}
-	t, err := encodeKeyValue(elem, v, nil)
-	if err != nil {
-		panic("a GIN element key is infallible (fixed-width, no collation)")
-	}
-	return t, true
+	return ginElementTerm(elem, v), true
 }
 
 // gistBoundRows gathers a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the
