@@ -724,13 +724,34 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 	}
 	s := onConflictExcludedScope(db, table, alias)
 	pkMembers := table.PKIndices()
+	// SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once, exactly as
+	// standalone UPDATE does (constraints.md §2): a constant/no default becomes a constant node
+	// (free), an expression default is evaluated per updated row through the statement meter and
+	// RNG. An unknown column is left to the per-assignment 42703 below.
+	var defaultExprs []*rExpr
+	if slices.ContainsFunc(oc.Assignments, func(a assignment) bool { return a.IsDefault }) {
+		need := make([]bool, len(table.Columns))
+		for _, a := range oc.Assignments {
+			if idx := table.ColumnIndex(a.Column); a.IsDefault && idx >= 0 {
+				need[idx] = true
+			}
+		}
+		var err error
+		defaultExprs, err = db.resolveDefaultExprsFor(table, need, &paramTypes{})
+		if err != nil {
+			return nil, err
+		}
+	}
 	plans := make([]assignPlan, 0, len(oc.Assignments))
 	for _, a := range oc.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
 			return nil, newError(UndefinedColumn, "column does not exist: "+a.Column).withPosition(int32(a.Pos))
 		}
-		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways {
+		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4): an
+		// ordinary assignment is 428C9 (before the PK 0A000); the DEFAULT form advances the owned
+		// sequence through its expression default.
+		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways && !a.IsDefault {
 			return nil, newError(GeneratedAlways,
 				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
 		}
@@ -761,12 +782,21 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 				"updating "+noun+" column "+a.Column+" is not supported yet")
 		}
 		colScalar := col.Type.ScalarTy()
-		src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
-		if err != nil {
-			return nil, err
-		}
-		if err := requireAssignable(ty, colScalar, a.Column); err != nil {
-			return nil, err
+		var src *rExpr
+		if a.IsDefault {
+			src = defaultExprs[idx]
+			if src == nil {
+				src = valueToRExpr(defaultOrNull(col))
+			}
+		} else {
+			resolved, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
+				return nil, err
+			}
+			src = resolved
 		}
 		plans = append(plans, assignPlan{
 			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,

@@ -689,9 +689,8 @@ pub struct Assignment {
     pub column: String,
     /// The target name's character position (spec/design/error-fields.md §10.2).
     pub pos: SrcPos,
-    /// `true` for the standalone UPDATE-only `SET column = DEFAULT` form. The `value` field is
-    /// a parser placeholder in that case and is never resolved; ON CONFLICT keeps parsing its RHS
-    /// as an ordinary expression until its separate DEFAULT follow-on lands.
+    /// `true` for the `SET column = DEFAULT` form (standalone UPDATE and ON CONFLICT DO UPDATE).
+    /// The `value` field is a parser placeholder in that case and is never resolved.
     pub is_default: bool,
     pub value: Expr,
 }

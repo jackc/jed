@@ -1810,13 +1810,29 @@ impl Engine {
                 }
                 let scope = Scope::on_conflict_excluded(self, tdef, alias);
                 let pk_members = tdef.pk_indices();
+                // SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once,
+                // exactly as standalone UPDATE does (constraints.md §2): a constant/no default
+                // becomes a constant node (free), an expression default is evaluated per updated
+                // row through the statement meter and RNG. An unknown column is left to the
+                // per-assignment 42703 below.
+                let mut default_exprs = if assignments.iter().any(|a| a.is_default) {
+                    let mut need = vec![false; tdef.columns.len()];
+                    for a in assignments.iter().filter(|a| a.is_default) {
+                        if let Some(idx) = tdef.column_index(&a.column) {
+                            need[idx] = true;
+                        }
+                    }
+                    self.resolve_default_exprs_for(tdef, Some(&need), &mut ParamTypes::default())?
+                } else {
+                    Vec::new()
+                };
                 let mut plans: Vec<AssignPlan> = Vec::with_capacity(assignments.len());
                 for a in assignments {
                     let idx = col_idx(tdef, &a.column).map_err(|e| e.with_position(a.pos.0))?;
                     // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md
-                    // §13.4). This conflict-action path has no DEFAULT form yet, so any assignment
-                    // here is 428C9 (before the PK 0A000).
-                    if tdef.columns[idx].identity == Some(IdentityKind::Always) {
+                    // §13.4): an ordinary assignment is 428C9 (before the PK 0A000); the DEFAULT
+                    // form advances the owned sequence through its expression default.
+                    if tdef.columns[idx].identity == Some(IdentityKind::Always) && !a.is_default {
                         return Err(EngineError::new(
                             SqlState::GeneratedAlways,
                             format!("column {} can only be updated to DEFAULT", a.column),
@@ -1854,14 +1870,21 @@ impl Engine {
                         ));
                     };
                     let target_scalar = *target_scalar;
-                    let (source, ty) = resolve(
-                        &scope,
-                        &a.value,
-                        Some(target_scalar),
-                        &mut AggCtx::Forbidden,
-                        ptypes,
-                    )?;
-                    require_assignable(&ty, target_scalar, &a.column)?;
+                    let source = if a.is_default {
+                        default_exprs[idx].take().unwrap_or_else(|| {
+                            value_to_rexpr(col.default.as_ref().unwrap_or(&Value::Null))
+                        })
+                    } else {
+                        let (source, ty) = resolve(
+                            &scope,
+                            &a.value,
+                            Some(target_scalar),
+                            &mut AggCtx::Forbidden,
+                            ptypes,
+                        )?;
+                        require_assignable(&ty, target_scalar, &a.column)?;
+                        source
+                    };
                     plans.push(AssignPlan {
                         idx,
                         name: col.name.clone(),

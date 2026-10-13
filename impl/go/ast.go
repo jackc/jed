@@ -704,9 +704,8 @@ type assignment struct {
 	Column string
 	// Pos is the target name's character position (spec/design/error-fields.md §10.2).
 	Pos srcPos
-	// IsDefault marks the standalone UPDATE-only `SET column = DEFAULT` form. Value is a parser
-	// placeholder in that case and is never resolved; ON CONFLICT keeps its ordinary-expression
-	// RHS until its separate DEFAULT follow-on lands.
+	// IsDefault marks the `SET column = DEFAULT` form (standalone UPDATE and ON CONFLICT DO
+	// UPDATE). Value is a parser placeholder in that case and is never resolved.
 	IsDefault bool
 	Value     exprNode
 }

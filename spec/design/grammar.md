@@ -1047,13 +1047,14 @@ inserts exactly one row, applying every column's default else NULL. It takes the
 validation path as a one-row VALUES insert and may be followed by `ON CONFLICT` and `RETURNING`.
 Matching PostgreSQL, it cannot be combined with an explicit column list or `OVERRIDING` (`42601`).
 
-The standalone UPDATE assignment form likewise recognizes `UPDATE t SET x = DEFAULT`: the RHS is
-the target column's declared default else NULL, applied per matched row. `DEFAULT` is recognized
-positionally after `=` **only when it is the complete assignment RHS**; it remains non-reserved
-elsewhere, so `SET x = default + 1` is an ordinary expression referencing a column named `default`.
-The semantics and cost are in
-[constraints.md](constraints.md) §2. The shared ON CONFLICT `assignment` intentionally remains a
-general expression only; its `SET col = DEFAULT` form is still deferred ([upsert.md](upsert.md) §10).
+The UPDATE assignment form likewise recognizes `UPDATE t SET x = DEFAULT`, and so does the
+`ON CONFLICT … DO UPDATE SET` action (one shared `update_assignment` production): the RHS is the
+target column's declared default else NULL, applied per updated row. `DEFAULT` is recognized
+positionally after `=` **only when it is the complete assignment RHS** — the next token is `,`,
+`)` (the end of a writable-CTE body), `WHERE`, `RETURNING`, or the end of the statement; it remains
+non-reserved elsewhere, so `SET x = default + 1` is an ordinary expression referencing a column
+named `default`. The semantics and cost are in [constraints.md](constraints.md) §2 and, for the
+conflict action, [upsert.md](upsert.md) §5.
 
 **Errors, resolved deterministically left-to-right.** Statement-level, once before the rows: an
 unknown column name in the list is `42703` (`undefined_column`), a column named twice is `42701`
@@ -2998,9 +2999,9 @@ name as the qualifier for the existing row in `SET`/`WHERE` (and in `RETURNING`)
 - **`DO NOTHING`** skips the offending row; **`DO UPDATE SET … [WHERE …]`** updates the
   existing conflicting row. In `DO UPDATE`, the **`excluded`** pseudo-relation names the row
   *proposed for insertion* (`excluded.col`), while a **bare or table-qualified** column names
-  the **existing** row — the `SET`/`WHERE` reuse the `UPDATE` `assignment`/`where_clause`
-  productions, and `excluded` is a **qualifier-only** pseudo-relation exactly like `old`/`new`
-  in `RETURNING` (§32).
+  the **existing** row — the `SET`/`WHERE` reuse the `UPDATE` `update_assignment`/`where_clause`
+  productions (so `SET col = DEFAULT` resets the existing row's column to its default, §16), and
+  `excluded` is a **qualifier-only** pseudo-relation exactly like `old`/`new` in `RETURNING` (§32).
 - The optional **conflict target** names the **arbiter** constraint. A **column list** is
   matched as an order-independent **set** against a unique index / the primary key
   (`ON CONFLICT (b, a)` matches `UNIQUE (a, b)`); no match is **`42P10`**. **`ON CONSTRAINT

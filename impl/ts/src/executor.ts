@@ -12,6 +12,7 @@ import {
 import type {
   AlterTable,
   AlterSequence,
+  Assignment,
   Analyze,
   BinaryOp,
   CreateIndex,
@@ -3405,12 +3406,13 @@ export class Engine {
     }
   }
 
-  // Add named functions reached through UPDATE SET column = DEFAULT. Ordinary assignment
-  // expressions are covered by collectStmtPrivs; this catalog-dependent walk includes top-level,
-  // writable-CTE, and EXPLAIN-contained UPDATEs. Missing targets are skipped so execution retains
-  // its existing 42P01/42703 error precedence.
+  // Add named functions reached through SET column = DEFAULT — standalone UPDATE and INSERT … ON
+  // CONFLICT DO UPDATE. Ordinary assignment expressions are covered by collectStmtPrivs; this
+  // catalog-dependent walk includes top-level, writable-CTE, and EXPLAIN-contained statements.
+  // Missing targets are skipped so execution retains its existing 42P01/42703 error precedence.
   private collectUpdateDefaultPrivs(stmt: Statement, req: PrivReq): void {
     if (stmt.kind === "update") this.collectOneUpdateDefaultPrivs(stmt, req);
+    else if (stmt.kind === "insert") this.collectOneUpsertDefaultPrivs(stmt, req);
     else if (stmt.kind === "with") {
       for (const cte of stmt.ctes) this.collectCteDefaultPrivs(cte.body, req);
       this.collectCteDefaultPrivs(stmt.body, req);
@@ -3419,13 +3421,30 @@ export class Engine {
 
   private collectCteDefaultPrivs(body: CteBody, req: PrivReq): void {
     if (body.kind === "update") this.collectOneUpdateDefaultPrivs(body, req);
+    else if (body.kind === "insert") this.collectOneUpsertDefaultPrivs(body, req);
   }
 
   private collectOneUpdateDefaultPrivs(upd: Update, req: PrivReq): void {
-    const table = this.lkpTableScoped(upd.db, upd.table);
+    this.collectAssignmentDefaultPrivs(upd.db, upd.table, upd.assignments, req);
+  }
+
+  private collectOneUpsertDefaultPrivs(ins: Insert, req: PrivReq): void {
+    if (ins.onConflict !== null && ins.onConflict.doUpdate) {
+      this.collectAssignmentDefaultPrivs(ins.db, ins.table, ins.onConflict.assignments, req);
+    }
+  }
+
+  private collectAssignmentDefaultPrivs(
+    db: string | undefined,
+    tableName: string,
+    assignments: Assignment[],
+    req: PrivReq,
+  ): void {
+    if (!assignments.some((a) => a.isDefault)) return;
+    const table = this.lkpTableScoped(db, tableName);
     if (table === undefined) return;
     const locals = new Set<string>();
-    for (const assignment of upd.assignments) {
+    for (const assignment of assignments) {
       if (!assignment.isDefault) continue;
       const col = table.columns.find(
         (candidate) => candidate.name === assignment.column,
@@ -11046,6 +11065,19 @@ export class Engine {
     }
     const scope = Scope.onConflictExcluded(this, table, alias);
     const pkMembers = pkIndices(table);
+    // SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once, exactly as
+    // standalone UPDATE does (constraints.md §2): a constant/no default becomes a constant node
+    // (free), an expression default is evaluated per updated row through the statement meter and
+    // RNG. An unknown column is left to the per-assignment 42703 below.
+    let defaultExprs: (RExpr | null)[] = [];
+    if (oc.assignments.some((a) => a.isDefault)) {
+      const need = table.columns.map(() => false);
+      for (const a of oc.assignments) {
+        const idx = columnIndex(table, a.column);
+        if (a.isDefault && idx >= 0) need[idx] = true;
+      }
+      defaultExprs = this.resolveDefaultExprsFor(table, need);
+    }
     const plans: AssignPlan[] = [];
     for (const a of oc.assignments) {
       const idx = columnIndex(table, a.column);
@@ -11054,7 +11086,10 @@ export class Engine {
           a.loc,
         );
       }
-      if (table.columns[idx]!.identity === "always") {
+      // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4): an
+      // ordinary assignment is 428C9 (before the PK 0A000); the DEFAULT form advances the owned
+      // sequence through its expression default.
+      if (table.columns[idx]!.identity === "always" && !a.isDefault) {
         throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
       }
       // Assigning a PRIMARY KEY member in DO UPDATE remains deferred (0A000, upsert.md §5/§9):
@@ -11091,14 +11126,20 @@ export class Engine {
         );
       }
       const targetScalar = col.type.scalar;
-      const { node, type } = resolve(
-        scope,
-        a.value,
-        targetScalar,
-        { collecting: false, groupKeys: [], specs: [] },
-        ptypes,
-      );
-      requireAssignable(type, targetScalar, a.column);
+      let source: RExpr;
+      if (a.isDefault) {
+        source = defaultExprs[idx] ?? valueToRExpr(col.default ?? nullValue());
+      } else {
+        const { node, type } = resolve(
+          scope,
+          a.value,
+          targetScalar,
+          { collecting: false, groupKeys: [], specs: [] },
+          ptypes,
+        );
+        requireAssignable(type, targetScalar, a.column);
+        source = node;
+      }
       plans.push({
         idx,
         name: col.name,
@@ -11106,7 +11147,7 @@ export class Engine {
         decimal: col.decimal,
         varcharLen: col.varcharLen,
         notNull: col.notNull,
-        source: node,
+        source,
       });
     }
     const filter = oc.filter !== null ? resolveBooleanFilter(scope, oc.filter, ptypes) : null;

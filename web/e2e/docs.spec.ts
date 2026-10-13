@@ -192,6 +192,26 @@ test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
+test('the tables page upserts with DO UPDATE SET col = DEFAULT live', async ({ page }) => {
+  await page.goto('/docs/sql/tables/');
+  const panel = page.getByTestId('live-sql');
+  await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+
+  // The conflicting job keeps its key, takes the proposed state, and resets attempts to its
+  // declared default 0 (upsert.md §5).
+  await panel
+    .getByTestId('sql-input')
+    .fill(
+      "CREATE TABLE job (id i32 PRIMARY KEY, state text NOT NULL DEFAULT 'queued', attempts i32 DEFAULT 0); INSERT INTO job VALUES (1, 'running', 3); INSERT INTO job (id, state) VALUES (1, 'retry') ON CONFLICT (id) DO UPDATE SET state = excluded.state, attempts = DEFAULT RETURNING state, attempts"
+    );
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+  await expect(panel.getByTestId('result-rows').locator('td')).toHaveText(['retry', '0']);
+
+  await panel.getByTestId('reset-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+});
+
 test('the tables page upserts through an INSERT target alias live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   const panel = page.getByTestId('live-sql');

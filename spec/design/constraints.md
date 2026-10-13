@@ -182,7 +182,8 @@ and every assignment still reads the old row, just like an ordinary multi-assign
 constant/no default adds no expression cost; an expression default accrues its ordinary per-row
 evaluation cost. Privilege preflight includes every named function in the selected default expression,
 so each still requires the session's ordinary `EXECUTE` privilege before any row is evaluated.
-`ON CONFLICT DO UPDATE SET x = DEFAULT` remains a separate deferred follow-on.
+`INSERT … ON CONFLICT … DO UPDATE SET x = DEFAULT` applies the same rule to the conflicting row,
+evaluating the default only for rows actually updated ([upsert.md](upsert.md) §5).
 
 ## 3. Composite `PRIMARY KEY` (the table constraint)
 

@@ -2343,11 +2343,11 @@ impl Parser {
                     let pos = self.here();
                     let column = self.expect_identifier()?;
                     self.expect(&Token::Eq)?;
-                    let value = self.parse_expr()?;
+                    let (is_default, value) = self.parse_assignment_rhs()?;
                     assignments.push(Assignment {
                         column,
                         pos,
-                        is_default: false,
+                        is_default,
                         value,
                     });
                     if matches!(self.peek(), Token::Comma) {
@@ -3991,6 +3991,24 @@ impl Parser {
         }
     }
 
+    /// The RHS of one `SET col = …` assignment — shared by standalone UPDATE and ON CONFLICT DO
+    /// UPDATE. Returns `(true, placeholder)` for the `DEFAULT` form, which is special only when it is
+    /// the complete RHS: keywords are legal identifiers, so `SET x = default + 1` parses `default`
+    /// as a column reference (grammar.md §16). The placeholder is never resolved.
+    fn parse_assignment_rhs(&mut self) -> Result<(bool, Expr)> {
+        let next_is_terminator =
+            matches!(self.peek_at(1), Token::Comma | Token::RParen | Token::Eof)
+                || matches!(
+                    self.peek_keyword_at(1).as_deref(),
+                    Some("where" | "returning")
+                );
+        if self.peek_keyword().as_deref() == Some("default") && next_is_terminator {
+            self.advance();
+            return Ok((true, Expr::Literal(Literal::Null)));
+        }
+        Ok((false, self.parse_expr()?))
+    }
+
     /// `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
     fn parse_update(&mut self) -> Result<Update> {
         self.expect_keyword("update")?;
@@ -4002,22 +4020,7 @@ impl Parser {
             let pos = self.here();
             let column = self.expect_identifier()?;
             self.expect(&Token::Eq)?;
-            // `DEFAULT` is special only when it is the complete assignment RHS. Keywords are
-            // legal identifiers, so `SET x = default + 1` must parse `default` as a column
-            // reference (grammar.md §16).
-            let next_is_terminator = matches!(self.peek_at(1), Token::Comma | Token::Eof)
-                || matches!(
-                    self.peek_keyword_at(1).as_deref(),
-                    Some("where" | "returning")
-                );
-            let is_default =
-                self.peek_keyword().as_deref() == Some("default") && next_is_terminator;
-            let value = if is_default {
-                self.advance();
-                Expr::Literal(Literal::Null)
-            } else {
-                self.parse_expr()?
-            };
+            let (is_default, value) = self.parse_assignment_rhs()?;
             assignments.push(Assignment {
                 column,
                 pos,

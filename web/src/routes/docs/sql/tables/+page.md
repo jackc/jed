@@ -92,7 +92,7 @@ with `jed_` are reserved for jed's own catalog relations (error `42939`).
 
 Omitting a column or using `DEFAULT` in a VALUES slot applies its declared default. To insert one
 row using defaults for every column, use `DEFAULT VALUES`; to reset an existing value, assign
-`DEFAULT` in an UPDATE:
+`DEFAULT` in an UPDATE — or in the `DO UPDATE` action of an upsert (see below):
 
 ```sql
 CREATE TABLE job (
@@ -102,10 +102,14 @@ CREATE TABLE job (
 );
 INSERT INTO job DEFAULT VALUES;
 UPDATE job SET state = DEFAULT, attempts = DEFAULT WHERE id = 1;
+INSERT INTO job (id, state) VALUES (1, 'retry')
+  ON CONFLICT (id) DO UPDATE SET state = excluded.state, attempts = DEFAULT;
 ```
 
 A column with no declared default takes `NULL`, so the ordinary `NOT NULL` check still applies.
-Expression defaults are evaluated separately for each inserted or updated row.
+Expression defaults are evaluated separately for each inserted or updated row; in an upsert, a
+`DEFAULT` assignment is evaluated only for rows the `DO UPDATE` actually updates, so a sequence-backed
+default advances only for those.
 
 ## Expressions in VALUES
 
@@ -286,6 +290,8 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
 - **A filtered update** — add `WHERE excluded.balance > account.balance` to a `DO UPDATE` to apply it
   only when the proposed balance is larger; otherwise the row is left untouched.
 - **`RETURNING`** — append `RETURNING id, balance` to see the affected (inserted or updated) rows.
+- **Resetting to a default** — `DO UPDATE SET col = DEFAULT` assigns the column's declared default
+  (or `NULL`), exactly like `UPDATE … SET col = DEFAULT` (see Applying defaults above).
 - **A target alias** — `INSERT INTO account AS a VALUES (1, 'Ada', 5.00) ON CONFLICT (id) DO UPDATE
   SET balance = a.balance + excluded.balance RETURNING a.balance;` names the existing row `a`. Once
   aliased, the table is referred to only by its alias (`account.balance` would be `42P01`), in the

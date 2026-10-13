@@ -2166,8 +2166,8 @@ class Parser {
         const loc = this.here();
         const column = this.expectIdentifier();
         this.expect("eq");
-        const value = this.parseExpr();
-        assignments.push({ column, loc, isDefault: false, value });
+        const [isDefault, value] = this.parseAssignmentRhs();
+        assignments.push({ column, loc, isDefault, value });
         if (this.peek().kind === "comma") {
           this.advance();
           continue;
@@ -3545,6 +3545,27 @@ class Parser {
     return v;
   }
 
+  // parseAssignmentRhs parses the RHS of one `SET col = …` assignment — shared by standalone UPDATE
+  // and ON CONFLICT DO UPDATE. It returns [true, placeholder] for the DEFAULT form, which is special
+  // only when it is the complete RHS: keywords are legal identifiers, so `SET x = default + 1` parses
+  // `default` as a column reference (grammar.md §16). The placeholder is never resolved.
+  private parseAssignmentRhs(): [boolean, Expr] {
+    const nextKeyword = this.peekKeywordAt(1);
+    const nextKind = this.peekKindAt(1);
+    if (
+      this.peekKeyword() === "default" &&
+      (nextKind === "comma" ||
+        nextKind === "rparen" ||
+        nextKind === "eof" ||
+        nextKeyword === "where" ||
+        nextKeyword === "returning")
+    ) {
+      this.advance();
+      return [true, { kind: "literal", literal: { kind: "null" } }];
+    }
+    return [false, this.parseExpr()];
+  }
+
   // parseUpdate parses
   // `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
   private parseUpdate(): Update {
@@ -3557,24 +3578,7 @@ class Parser {
       const loc = this.here();
       const column = this.expectIdentifier();
       this.expect("eq");
-      // DEFAULT is special only when it is the complete assignment RHS. Keywords are legal
-      // identifiers, so `SET x = default + 1` must parse `default` as a column reference
-      // (grammar.md §16).
-      const nextKeyword = this.peekKeywordAt(1);
-      const nextKind = this.peekKindAt(1);
-      const isDefault =
-        this.peekKeyword() === "default" &&
-        (nextKind === "comma" ||
-          nextKind === "eof" ||
-          nextKeyword === "where" ||
-          nextKeyword === "returning");
-      let value: Expr;
-      if (isDefault) {
-        this.advance();
-        value = { kind: "literal", literal: { kind: "null" } };
-      } else {
-        value = this.parseExpr();
-      }
+      const [isDefault, value] = this.parseAssignmentRhs();
       assignments.push({ column, loc, isDefault, value });
       if (this.peek().kind === "comma") {
         this.advance();

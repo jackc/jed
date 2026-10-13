@@ -273,6 +273,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "dml.update",
   // UPDATE SET col = DEFAULT — reset through the column's default/no-default path.
   "dml.update_default",
+  // ON CONFLICT DO UPDATE SET col = DEFAULT — the conflict-action form (upsert.md §5).
+  "dml.insert_on_conflict_default",
   // Assigning a range/array (container) column in an UPDATE (ranges.md §4 / array.md §4).
   "dml.update_container",
   "dml.delete",

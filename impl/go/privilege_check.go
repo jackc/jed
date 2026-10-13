@@ -2,6 +2,7 @@ package jed
 
 import (
 	"fmt"
+	"slices"
 )
 
 // Per-statement admission checks: privilege enforcement, budgets, and lane gating (session.md,
@@ -466,13 +467,17 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	return nil
 }
 
-// collectUpdateDefaultPrivs adds named functions reached through UPDATE SET column = DEFAULT.
-// Ordinary assignment expressions are handled by collectStmtPrivs; this catalog-dependent second
-// walk covers top-level, writable-CTE, and EXPLAIN-contained UPDATEs without changing missing-table
-// or missing-column error precedence (an unresolved target is left to execution).
+// collectUpdateDefaultPrivs adds named functions reached through SET column = DEFAULT — standalone
+// UPDATE and INSERT … ON CONFLICT DO UPDATE. Ordinary assignment expressions are handled by
+// collectStmtPrivs; this catalog-dependent second walk covers top-level, writable-CTE, and
+// EXPLAIN-contained statements without changing missing-table or missing-column error precedence
+// (an unresolved target is left to execution).
 func (db *engine) collectUpdateDefaultPrivs(stmt statement, req *privReq) {
 	if stmt.Update != nil {
 		db.collectOneUpdateDefaultPrivs(stmt.Update, req)
+	}
+	if stmt.Insert != nil {
+		db.collectOneUpsertDefaultPrivs(stmt.Insert, req)
 	}
 	if stmt.With != nil {
 		for i := range stmt.With.Ctes {
@@ -489,16 +494,32 @@ func (db *engine) collectCteDefaultPrivs(body *cteBody, req *privReq) {
 	if body.Update != nil {
 		db.collectOneUpdateDefaultPrivs(body.Update, req)
 	}
+	if body.Insert != nil {
+		db.collectOneUpsertDefaultPrivs(body.Insert, req)
+	}
 }
 
 func (db *engine) collectOneUpdateDefaultPrivs(upd *update, req *privReq) {
-	table, ok := db.lkpTableScoped(upd.DB, upd.Table)
+	db.collectAssignmentDefaultPrivs(upd.DB, upd.Table, upd.Assignments, req)
+}
+
+func (db *engine) collectOneUpsertDefaultPrivs(ins *insert, req *privReq) {
+	if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
+		db.collectAssignmentDefaultPrivs(ins.DB, ins.Table, ins.OnConflict.Assignments, req)
+	}
+}
+
+func (db *engine) collectAssignmentDefaultPrivs(dbName *string, tableName string, assignments []assignment, req *privReq) {
+	if !slices.ContainsFunc(assignments, func(a assignment) bool { return a.IsDefault }) {
+		return
+	}
+	table, ok := db.lkpTableScoped(dbName, tableName)
 	if !ok {
 		return
 	}
 	locals := map[string]bool{}
-	for i := range upd.Assignments {
-		a := &upd.Assignments[i]
+	for i := range assignments {
+		a := &assignments[i]
 		if !a.IsDefault {
 			continue
 		}

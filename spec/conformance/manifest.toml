@@ -202,7 +202,7 @@ description = "UPDATE ... SET ... [WHERE] — two-phase/all-or-nothing value rep
 
 [[capability]]
 id = "dml.update_default"
-description = "UPDATE ... SET col = DEFAULT — replace each matched row's column with its declared constant/expression default else NULL, using the same per-row evaluation, statement RNG/clock seam, storage coercion, NOT NULL/CHECK/uniqueness/FK validation, cost, index maintenance, and PK re-keying as ordinary UPDATE/INSERT default application. GENERATED ALWAYS identity columns accept this sole update form and advance their owned sequence. ON CONFLICT DO UPDATE SET col = DEFAULT remains its separate deferred follow-on (constraints.md §2, sequences.md §13.4)"
+description = "UPDATE ... SET col = DEFAULT — replace each matched row's column with its declared constant/expression default else NULL, using the same per-row evaluation, statement RNG/clock seam, storage coercion, NOT NULL/CHECK/uniqueness/FK validation, cost, index maintenance, and PK re-keying as ordinary UPDATE/INSERT default application. GENERATED ALWAYS identity columns accept this sole update form and advance their owned sequence. DEFAULT is recognized only as the complete assignment RHS (constraints.md §2, sequences.md §13.4)"
 
 [[capability]]
 id = "dml.update_container"
@@ -223,6 +223,10 @@ description = "The old./new. row-version qualifiers and optional WITH (OLD AS o,
 [[capability]]
 id = "dml.insert_on_conflict"
 description = "INSERT ... ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] } — UPSERT (spec/design/upsert.md, grammar.md §46). A candidate row that would violate a UNIQUE/PRIMARY KEY constraint takes the conflict action instead of trapping 23505: DO NOTHING skips it; DO UPDATE updates the existing conflicting row, with the proposed row exposed as the qualifier-only `excluded` pseudo-relation (a bare/qualified column = the existing row). The arbiter target is a column SET matched order-independently against a unique index / the PK (no match 42P10), or ON CONSTRAINT name (a unique-index name or the synthesized <table>_pkey; miss 42704); DO UPDATE requires a target (42601 without one), DO NOTHING may omit it (any conflict skipped). A non-arbiter conflict still traps 23505; two proposed rows sharing the arbiter key are 21000 under DO UPDATE, skipped under DO NOTHING. Two-phase / all-or-nothing with sequential planning; RETURNING projects the affected (inserted + updated) rows. Reuses existing error codes (no registry change) and adds no on-disk format change. Divergences: DO UPDATE assigning a PK column is 0A000, end-state (not per-row transient) uniqueness (upsert.md §9)"
+
+[[capability]]
+id = "dml.insert_on_conflict_default"
+description = "INSERT ... ON CONFLICT ... DO UPDATE SET col = DEFAULT — the conflict action resets a column of the existing row to its declared constant/expression default else NULL, through the same resolution, per-row evaluation (statement RNG/clock seam, cost), storage coercion, and NOT NULL/CHECK/uniqueness/FK validation as standalone UPDATE SET col = DEFAULT. The default is evaluated once per UPDATED row only (an inserted or WHERE-skipped row draws nothing), so a nextval/identity default advances its sequence only then; a GENERATED ALWAYS identity column accepts this sole DO UPDATE form. Privilege preflight walks the selected default expression's named functions. The standing DO UPDATE narrowings (PK column 0A000, container column 0A000) apply to this form too (upsert.md §5). Builds on dml.insert_on_conflict + dml.update_default"
 
 [[capability]]
 id = "dml.insert_alias"

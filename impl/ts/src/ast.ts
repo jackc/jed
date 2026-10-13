@@ -487,9 +487,8 @@ export type ColumnDef = {
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
 // evaluated against the pre-update row (so `SET a = b, b = a` swaps).
-// isDefault marks the standalone UPDATE-only `SET column = DEFAULT` form. `value` is a parser
-// placeholder in that case and is never resolved; ON CONFLICT keeps its ordinary-expression RHS
-// until its separate DEFAULT follow-on lands.
+// isDefault marks the `SET column = DEFAULT` form (standalone UPDATE and ON CONFLICT DO UPDATE).
+// `value` is a parser placeholder in that case and is never resolved.
 // `loc` is the target name's source character position (SrcLoc).
 export type Assignment = { column: string; loc?: SrcLoc; isDefault: boolean; value: Expr };
 

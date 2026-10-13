@@ -1211,13 +1211,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Add named functions reached through `UPDATE SET column = DEFAULT`. Ordinary assignment
-    /// expressions are covered by `collect_stmt_privs`; this catalog-dependent walk includes
-    /// top-level, writable-CTE, and EXPLAIN-contained UPDATEs. Missing targets are deliberately
-    /// skipped so execution retains its existing 42P01/42703 error precedence.
+    /// Add named functions reached through `SET column = DEFAULT` — standalone UPDATE and
+    /// `INSERT … ON CONFLICT DO UPDATE`. Ordinary assignment expressions are covered by
+    /// `collect_stmt_privs`; this catalog-dependent walk includes top-level, writable-CTE, and
+    /// EXPLAIN-contained statements. Missing targets are deliberately skipped so execution retains
+    /// its existing 42P01/42703 error precedence.
     fn collect_update_default_privs(&self, stmt: &Statement, req: &mut PrivReq) {
         match stmt {
             Statement::Update(upd) => self.collect_one_update_default_privs(upd, req),
+            Statement::Insert(ins) => self.collect_one_upsert_default_privs(ins, req),
             Statement::With(wq) => {
                 for cte in &wq.ctes {
                     self.collect_cte_default_privs(&cte.body, req);
@@ -1230,17 +1232,42 @@ impl Engine {
     }
 
     fn collect_cte_default_privs(&self, body: &CteBody, req: &mut PrivReq) {
-        if let CteBody::Update(upd) = body {
-            self.collect_one_update_default_privs(upd, req);
+        match body {
+            CteBody::Update(upd) => self.collect_one_update_default_privs(upd, req),
+            CteBody::Insert(ins) => self.collect_one_upsert_default_privs(ins, req),
+            _ => {}
         }
     }
 
     fn collect_one_update_default_privs(&self, upd: &Update, req: &mut PrivReq) {
-        let Some(table) = self.table_scoped(upd.db.as_deref(), &upd.table) else {
+        self.collect_assignment_default_privs(upd.db.as_deref(), &upd.table, &upd.assignments, req);
+    }
+
+    fn collect_one_upsert_default_privs(&self, ins: &Insert, req: &mut PrivReq) {
+        if let Some(OnConflict {
+            action: ConflictAction::DoUpdate { assignments, .. },
+            ..
+        }) = &ins.on_conflict
+        {
+            self.collect_assignment_default_privs(ins.db.as_deref(), &ins.table, assignments, req);
+        }
+    }
+
+    fn collect_assignment_default_privs(
+        &self,
+        db: Option<&str>,
+        table: &str,
+        assignments: &[crate::ast::Assignment],
+        req: &mut PrivReq,
+    ) {
+        if !assignments.iter().any(|a| a.is_default) {
+            return;
+        }
+        let Some(table) = self.table_scoped(db, table) else {
             return;
         };
         let locals = HashSet::new();
-        for assignment in &upd.assignments {
+        for assignment in assignments {
             if !assignment.is_default {
                 continue;
             }

@@ -2768,11 +2768,11 @@ func (p *parser) parseOnConflict() (*onConflict, error) {
 			if err := p.expect(tokEq); err != nil {
 				return nil, err
 			}
-			value, err := p.parseExpr()
+			isDefault, value, err := p.parseAssignmentRHS()
 			if err != nil {
 				return nil, err
 			}
-			assignments = append(assignments, assignment{Column: column, Pos: pos, Value: value})
+			assignments = append(assignments, assignment{Column: column, Pos: pos, IsDefault: isDefault, Value: value})
 			if p.peek().Kind == tokComma {
 				p.advance()
 				continue
@@ -4597,6 +4597,22 @@ func (p *parser) parseCount(isLimit bool) (int64, error) {
 	return v, nil
 }
 
+// parseAssignmentRHS parses the RHS of one `SET col = …` assignment — shared by standalone UPDATE
+// and ON CONFLICT DO UPDATE. It reports isDefault for the DEFAULT form, which is special only when
+// it is the complete RHS: keywords are legal identifiers, so `SET x = default + 1` keeps parsing
+// `default` as a column reference (grammar.md §16). The placeholder value is never resolved.
+func (p *parser) parseAssignmentRHS() (bool, exprNode, error) {
+	nextKeyword := p.peekKeywordAt(1)
+	nextKind := p.peekKindAt(1)
+	if p.peekKeyword() == "default" && (nextKind == tokComma || nextKind == tokRParen ||
+		nextKind == tokEof || nextKeyword == "where" || nextKeyword == "returning") {
+		p.advance()
+		return true, exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}, nil
+	}
+	value, err := p.parseExpr()
+	return false, value, err
+}
+
 // parseUpdate parses
 // `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
 func (p *parser) parseUpdate() (*update, error) {
@@ -4621,22 +4637,9 @@ func (p *parser) parseUpdate() (*update, error) {
 		if err := p.expect(tokEq); err != nil {
 			return nil, err
 		}
-		// DEFAULT is the assignment special form only when it is the complete RHS. Because
-		// keywords are legal identifiers, `SET x = default + 1` must keep parsing `default` as
-		// a column reference (grammar.md §16).
-		nextKeyword := p.peekKeywordAt(1)
-		nextKind := p.peekKindAt(1)
-		isDefault := p.peekKeyword() == "default" &&
-			(nextKind == tokComma || nextKind == tokEof || nextKeyword == "where" || nextKeyword == "returning")
-		var value exprNode
-		if isDefault {
-			p.advance()
-			value = exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}
-		} else {
-			value, err = p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
+		isDefault, value, err := p.parseAssignmentRHS()
+		if err != nil {
+			return nil, err
 		}
 		assignments = append(assignments, assignment{Column: column, Pos: pos, IsDefault: isDefault, Value: value})
 		if p.peek().Kind == tokComma {

@@ -502,19 +502,18 @@ conflict_target ::= "(" identifier ("," identifier)* ")"
                   | "ON" "CONSTRAINT" identifier
 
 conflict_action ::= "DO" "NOTHING"
-                  | "DO" "UPDATE" "SET" assignment ("," assignment)* where_clause?
+                  | "DO" "UPDATE" "SET" update_assignment ("," update_assignment)* where_clause?
 
 update         ::= "UPDATE" qualified_table "SET"
                    update_assignment ("," update_assignment)*
                    where_clause?
                    returning_clause?
 
-assignment     ::= identifier "=" expr
-
-/* Standalone UPDATE additionally accepts DEFAULT as a COMPLETE assignment source (constraints.md
- * §2). If the RHS continues (`default + 1`), DEFAULT is an ordinary non-reserved identifier in
- * `expr`. The special form applies the target column's declared default else NULL per matched row.
- * ON CONFLICT keeps the general-expression-only `assignment` production until its follow-on. */
+/* UPDATE — standalone and the ON CONFLICT DO UPDATE action — additionally accepts DEFAULT as a
+ * COMPLETE assignment source (constraints.md §2, ../design/upsert.md §5). If the RHS continues
+ * (`default + 1`), DEFAULT is an ordinary non-reserved identifier in `expr`; it is the complete RHS
+ * when the next token is ",", ")", "WHERE", "RETURNING", or the end of the statement. The special
+ * form applies the target column's declared default else NULL per updated row. */
 update_assignment ::= identifier "=" (expr | "DEFAULT")
 
 delete         ::= "DELETE" "FROM" qualified_table where_clause? returning_clause?

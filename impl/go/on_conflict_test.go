@@ -51,29 +51,6 @@ func TestOnConflictDoUpdatePKColumnUnsupported(t *testing.T) {
 	}
 }
 
-// DIVERGENCE: `DO UPDATE SET col = DEFAULT` is not supported — the RHS is a general expression, and
-// DEFAULT is not reserved (§3), so a bare DEFAULT resolves as a column reference → 42703. PostgreSQL
-// supports SET col = DEFAULT.
-func TestOnConflictDoUpdateSetDefaultUnsupported(t *testing.T) {
-	t.Parallel()
-	db := ocDB(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)", "INSERT INTO t VALUES (1, 10)")
-	if got := ocErr(t, db, "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = DEFAULT"); got != "42703" {
-		t.Fatalf("got %s, want 42703", got)
-	}
-}
-
-// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT, and the conflict-action
-// path has no DEFAULT form yet, so any DO UPDATE assignment to one is 428C9.
-func TestOnConflictDoUpdateGeneratedAlwaysRejected(t *testing.T) {
-	t.Parallel()
-	db := ocDB(t,
-		"CREATE TABLE t (id i32 GENERATED ALWAYS AS IDENTITY, k i32 PRIMARY KEY, v i32)",
-		"INSERT INTO t (k, v) VALUES (1, 10)")
-	if got := ocErr(t, db, "INSERT INTO t (k, v) VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET id = 99"); got != "428C9" {
-		t.Fatalf("got %s, want 428C9", got)
-	}
-}
-
 // The affected-row count (api.md §4) the corpus's `statement ok` cannot assert: an ON CONFLICT
 // counts the inserted + updated rows; rows skipped by DO NOTHING (or a DO UPDATE WHERE that is
 // false) are not counted.

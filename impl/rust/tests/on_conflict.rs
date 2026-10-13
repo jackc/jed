@@ -55,42 +55,6 @@ fn do_update_pk_column_assignment_is_unsupported() {
     );
 }
 
-/// DIVERGENCE: `DO UPDATE SET col = DEFAULT` is not supported on the conflict-action path, so its
-/// assignment RHS remains a general expression. `DEFAULT` is not reserved (§3),
-/// so a bare `DEFAULT` there resolves as a column reference → `42703` (no column named `default`).
-/// PostgreSQL supports `SET col = DEFAULT` (probed: it resets the column to its default).
-#[test]
-fn do_update_set_default_is_unsupported() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)",
-        "INSERT INTO t VALUES (1, 10)",
-    ]);
-    assert_eq!(
-        err(
-            &mut db,
-            "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = DEFAULT"
-        ),
-        "42703"
-    );
-}
-
-/// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT, and the conflict-action
-/// path has no DEFAULT form yet, so any DO UPDATE assignment to one is `428C9`.
-#[test]
-fn do_update_generated_always_is_rejected() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id i32 GENERATED ALWAYS AS IDENTITY, k i32 PRIMARY KEY, v i32)",
-        "INSERT INTO t (k, v) VALUES (1, 10)",
-    ]);
-    assert_eq!(
-        err(
-            &mut db,
-            "INSERT INTO t (k, v) VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET id = 99"
-        ),
-        "428C9"
-    );
-}
-
 /// The affected-row count (api.md §4) the corpus's `statement ok` cannot assert: an ON CONFLICT
 /// counts the inserted + updated rows; rows skipped by DO NOTHING (or a DO UPDATE WHERE that is
 /// false) are not counted.

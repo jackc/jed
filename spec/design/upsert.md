@@ -178,15 +178,25 @@ uses (range `22003`, `NOT NULL` `23502`, decimal typmod). The post-assignment ro
 then validated like any `UPDATE` row: every `CHECK` (`23514`), end-state uniqueness over the
 non-arbiter unique indexes (`23505`), and the FK child-side (`23503`).
 
+**`SET col = DEFAULT`** (PostgreSQL semantics, probed) resets `col` of the existing row to its
+declared default, or NULL when it has none — the standalone `UPDATE … SET col = DEFAULT` rule
+(constraints.md §2), recognized by the same parse rule (`DEFAULT` as the complete RHS; grammar.md
+§16). The default is resolved once per statement and **evaluated once per updated row**, after
+the `WHERE` passes: an inserted row or a row the `WHERE` skips evaluates nothing, so a
+`nextval`/identity default advances its sequence only for the rows actually updated (interleaved,
+per row, after the proposed row's own default draws). The value takes the same storage coercion,
+`NOT NULL`, `CHECK`, and end-state validation as any assignment. A constant/no default is free; an
+expression default is metered like INSERT's application of it (`operator_eval` per node, §7).
+Privilege preflight walks the selected default expression's named functions (session.md §5.3).
+
 **Narrowings on `SET` (each relaxable, §9):** assigning a **primary-key column** is
 **`0A000`** — a deferred follow-on (the standalone `UPDATE` re-keying has landed, CLAUDE.md §11
 step 6, but extending it to the conflict path is separate); assigning a
-**`GENERATED ALWAYS AS IDENTITY`** column is **`428C9`** (the standing
-`UPDATE` rule, sequences.md §13); `SET col = DEFAULT` is not supported on this conflict-action
-path (standalone UPDATE now supports it, but this RHS remains a general expression, and `DEFAULT`
-is not reserved (grammar.md §3), so a bare `DEFAULT` there resolves as a column reference →
-**`42703`**, a documented divergence from PG, which supports `SET col = DEFAULT`). An unknown
-`col` is also `42703`.
+**`GENERATED ALWAYS AS IDENTITY`** column anything but `DEFAULT` is **`428C9`** (the standing
+`UPDATE` rule, sequences.md §13.4 — `SET id = DEFAULT` is accepted and advances the owned
+sequence); assigning a **composite / range / array** column is **`0A000`** on this path, in either
+form (the standalone `UPDATE` container assignment has not been extended here). Both narrowings
+apply to the `DEFAULT` form too. An unknown `col` is `42703`.
 
 ## 6. `RETURNING`
 
@@ -248,7 +258,7 @@ except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes
 
 ## 10. Deferred (each its own later slice)
 
-`SET col = DEFAULT` on the conflict-action path;
+Assigning a primary-key or container column on the conflict-action path (§5);
 the partial-index `WHERE index_predicate` in a conflict target (jed has no partial indexes)
 and `COLLATE`/opclass inference decorations; multi-column `SET (a,b) = (...)`; and the GIN /
 ordered-index acceleration of the arbiter probe (the probe reuses the unique-index point/range
