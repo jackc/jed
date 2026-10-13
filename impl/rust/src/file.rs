@@ -15,6 +15,7 @@ use crate::blockstore::FileBlockStore;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Engine, Snapshot};
 use crate::extension::ExtensionRegistry;
+use crate::filehost::FileHost;
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
 
@@ -468,6 +469,7 @@ fn write_atomic(path: &Path, bytes: &[u8], no_sync: bool) -> Result<()> {
 /// the new file fails, `old` stays closed and poisoned, so the handle must be reopened. Returns the
 /// replacement paging context, a pool of `capacity` leaves over the new file.
 pub(crate) fn compact_file(
+    files: &dyn FileHost,
     path: &Path,
     snap: &Snapshot,
     page_size: u32,
@@ -476,60 +478,38 @@ pub(crate) fn compact_file(
     capacity: usize,
 ) -> Result<Arc<SharedPaging>> {
     use crate::blockstore::ClosedBlockStore;
-    use std::io::{Seek, SeekFrom};
 
     let no_sync = old.pager().skips_sync();
     // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
-    let path = fs::canonicalize(path).map_err(io_error)?;
+    let path = files.real_path(path)?;
     let tmp = tmp_path(&path);
-    let written = (|| {
-        let mut file = File::create(&tmp).map_err(io_error)?;
+    if let Err(error) = files.write_file(&tmp, &path, no_sync, &mut |write_at| {
         snap.write_image(page_size, txid, &mut |index, page| {
-            file.seek(SeekFrom::Start(index as u64 * page_size as u64))
-                .map_err(io_error)?;
-            file.write_all(page).map_err(io_error)
-        })?;
-        let permissions = fs::metadata(&path).map_err(io_error)?.permissions();
-        fs::set_permissions(&tmp, permissions).map_err(io_error)?;
-        if !no_sync {
-            file.sync_all().map_err(io_error)?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = written {
-        let _ = fs::remove_file(&tmp);
+            write_at(index as u64 * page_size as u64, page)
+        })
+        .map(|_| ())
+    }) {
+        files.remove(&tmp);
         return Err(error);
     }
 
     // Close the old file before the rename: Windows cannot replace a file that is still open.
     drop(old.pager().swap_store(Box::new(ClosedBlockStore)));
-    if let Err(error) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        match fs::OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(file) => {
-                drop(
-                    old.pager()
-                        .swap_store(Box::new(FileBlockStore::new(file, no_sync))),
-                );
-            }
+    if let Err(error) = files.rename(&tmp, &path) {
+        files.remove(&tmp);
+        match files.open_store(&path, no_sync) {
+            Ok(store) => drop(old.pager().swap_store(store)),
             Err(_) => old.pager().poison(),
         }
-        return Err(io_error(error));
+        return Err(error);
     }
     old.pager().poison();
     if !no_sync {
-        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if let Ok(d) = File::open(dir) {
-                let _ = d.sync_all();
-            }
+        if let Some(dir) = path.parent() {
+            files.sync_dir(dir);
         }
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(io_error)?;
-    let pager = Pager::from_store(Box::new(FileBlockStore::new(file, no_sync)))?;
+    let pager = Pager::from_store(files.open_store(&path, no_sync)?)?;
     Ok(SharedPaging::new(pager, capacity))
 }
 

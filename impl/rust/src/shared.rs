@@ -287,6 +287,9 @@ pub(crate) struct Storage {
     /// The live-page accounting of a file-backed domain's committed state (memory.md §8.7); unused
     /// for an in-memory domain.
     live: crate::format::LiveCount,
+    /// The file host a file-backed domain's compaction goes through ([`crate::filehost`]); `None`
+    /// is the OS. Only the deterministic simulator sets another.
+    files: Option<Arc<dyn crate::filehost::FileHost>>,
 }
 
 /// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
@@ -381,6 +384,7 @@ impl Storage {
             free_gen_txid: 0,
             budget: StorageBudget::default(),
             live: crate::format::LiveCount::default(),
+            files: None,
         }
     }
 
@@ -870,7 +874,20 @@ impl Storage {
         let capacity = self.paging.capacity();
         let paging = match &self.path {
             Some(path) => {
-                crate::file::compact_file(path, snap, self.page_size, txid, &self.paging, capacity)?
+                let os = crate::filehost::OsFileHost;
+                let files: &dyn crate::filehost::FileHost = match &self.files {
+                    Some(files) => files.as_ref(),
+                    None => &os,
+                };
+                crate::file::compact_file(
+                    files,
+                    path,
+                    snap,
+                    self.page_size,
+                    txid,
+                    &self.paging,
+                    capacity,
+                )?
             }
             None => {
                 let image = snap.to_image(self.page_size, txid)?;
@@ -2025,6 +2042,7 @@ impl Database {
             free_gen_txid: engine.free_gen_txid,
             budget: StorageBudget::default(),
             live: engine.live,
+            files: None,
         };
         let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -2393,6 +2411,7 @@ impl Database {
                     ..StorageBudget::default()
                 },
                 live: engine.live,
+                files: None,
             };
             Some((storage, engine.committed, coordinator))
         } else {
