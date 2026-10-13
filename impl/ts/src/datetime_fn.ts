@@ -298,16 +298,10 @@ function extractJulian(micros: bigint): Decimal {
   return Decimal.fromBigInt(jd).add(frac);
 }
 
-// datePartJulian is date_part('julian', timestamp) over wall-clock micros — PG's float8 formula
-// verbatim (jd + (seconds + fsec/1e6) / 86400.0, not the numeric value rounded), so the result is
-// PG's to the bit. An infinite source traps like every other field (22003).
+// datePartJulian is date_part('julian', timestamp) over finite wall-clock micros — PG's float8
+// formula verbatim (jd + (seconds + fsec/1e6) / 86400.0, not the numeric value rounded), so the
+// result is PG's to the bit. The caller handles an infinite source through extractPart.
 export function datePartJulian(micros: bigint): number {
-  if (micros === POS_INFINITY || micros === NEG_INFINITY) {
-    throw engineError(
-      "numeric_value_out_of_range",
-      "cannot extract field from an infinite timestamp",
-    );
-  }
   const [jd, todUs] = julianParts(micros);
   const secs = todUs / MICROS_PER_SEC;
   const fsec = todUs % MICROS_PER_SEC;
@@ -324,11 +318,73 @@ export type ExtractSrc =
   | { kind: "date"; days: bigint }
   | { kind: "interval"; iv: Interval };
 
-// extractField returns EXTRACT(field FROM source) as numeric. The field name is resolved first,
-// through PostgreSQL's unit tables (so `hours`, `msec`, `jd` are hour, milliseconds, julian —
-// timezones.md §9.6); then an unsupported field for the type is 0A000 and an unrecognized field
-// 22023, both ahead of the infinite-source trap.
-export function extractField(field: string, src: ExtractSrc): Decimal {
+// ExtractOut is the result of the shared EXTRACT / date_part kernel: a finite value, or — over a
+// ±infinity source — PostgreSQL's NonFiniteTimestampTzPart answer (timezones.md §9.2): NULL for an
+// oscillating field (month, hour, dow, …), ±Infinity with the source's sign for a
+// monotonically-increasing one (year, decade, century, millennium, julian, isoyear, epoch).
+export type ExtractOut =
+  | { kind: "value"; dec: Decimal }
+  | { kind: "null" }
+  | { kind: "infinite"; negative: boolean };
+
+// extractField returns EXTRACT(field FROM source) as numeric, or null for NULL. The kernel's
+// ±Infinity traps 22003: jed's decimal is finite-only (decimal.md §2), where PostgreSQL returns
+// numeric ±Infinity — a documented divergence (timezones.md §9.2). An oscillating field over an
+// infinite source is NULL, as in PG.
+export function extractField(field: string, src: ExtractSrc): Decimal | null {
+  const out = extractPart(field, src);
+  if (out.kind === "value") return out.dec;
+  if (out.kind === "null") return null;
+  throw engineError(
+    "numeric_value_out_of_range",
+    `cannot extract field from an infinite ${src.kind === "date" ? "date" : "timestamp"}`,
+  );
+}
+
+// isMonotonicField reports whether unit increases monotonically with time — PostgreSQL's
+// NonFiniteTimestampTzPart split: these fields of a ±infinity source are ±Infinity; every other
+// field it accepts oscillates and is NULL.
+function isMonotonicField(unit: string): boolean {
+  return (
+    unit === "year" ||
+    unit === "decade" ||
+    unit === "century" ||
+    unit === "millennium" ||
+    unit === "julian" ||
+    unit === "isoyear" ||
+    unit === "epoch"
+  );
+}
+
+// The ExtractOut of an infinite timestamp / timestamptz source (PG's NonFiniteTimestampTzPart: every
+// unit is accepted, even timezone of a timestamp — oscillating, so NULL).
+function nonFiniteTimestampPart(unit: string, micros: bigint): ExtractOut {
+  if (isMonotonicField(unit)) return { kind: "infinite", negative: micros === NEG_INFINITY };
+  return { kind: "null" };
+}
+
+// The ExtractOut of an infinite date (PG's extract_date): the monotonic fields are ±Infinity, the
+// date's oscillating fields NULL, and every other field (the time and timezone fields) still 0A000.
+function nonFiniteDatePart(unit: string, name: string, days: bigint): ExtractOut {
+  switch (unit) {
+    case "day":
+    case "month":
+    case "quarter":
+    case "week":
+    case "dow":
+    case "isodow":
+    case "doy":
+      return { kind: "null" };
+  }
+  if (isMonotonicField(unit)) return { kind: "infinite", negative: days === DATE_NEG_INFINITY };
+  throw unitNotSupported(name, "date");
+}
+
+// extractPart is the shared EXTRACT / date_part kernel. The field name is resolved first, through
+// PostgreSQL's unit tables (so `hours`, `msec`, `jd` are hour, milliseconds, julian — timezones.md
+// §9.6); then an unsupported field for the type is 0A000 and an unrecognized field 22023, both
+// decided before an infinite source is (PG decodes the unit first).
+export function extractPart(field: string, src: ExtractSrc): ExtractOut {
   const name = lowerUnit(field);
   const typeName =
     src.kind === "ts"
@@ -345,17 +401,29 @@ export function extractField(field: string, src: ExtractSrc): Decimal {
   if (f.kind !== "unit") throw unitNotRecognized(name, typeName);
   switch (src.kind) {
     case "ts":
-      return extractDatetime(f.unit, name, src.micros, false, 0n, 0n);
+      if (src.micros === POS_INFINITY || src.micros === NEG_INFINITY) {
+        return nonFiniteTimestampPart(f.unit, src.micros);
+      }
+      return { kind: "value", dec: extractDatetime(f.unit, name, src.micros, false, 0n, 0n) };
     case "tstz":
-      return extractDatetime(f.unit, name, src.local, true, src.instant, src.offsetSecs);
+      if (src.local === POS_INFINITY || src.local === NEG_INFINITY) {
+        return nonFiniteTimestampPart(f.unit, src.local);
+      }
+      return {
+        kind: "value",
+        dec: extractDatetime(f.unit, name, src.local, true, src.instant, src.offsetSecs),
+      };
     case "date":
-      return extractDate(f.unit, name, src.days);
+      if (src.days === DATE_POS_INFINITY || src.days === DATE_NEG_INFINITY) {
+        return nonFiniteDatePart(f.unit, name, src.days);
+      }
+      return { kind: "value", dec: extractDate(f.unit, name, src.days) };
     case "interval":
-      return extractInterval(f.unit, name, src.iv);
+      return { kind: "value", dec: extractInterval(f.unit, name, src.iv) };
   }
 }
 
-// extractDatetime extracts the canonical `unit` (written as `name`, for messages) from the
+// extractDatetime extracts the canonical `unit` (written as `name`, for messages) from the finite
 // wall-clock micros of a timestamp / timestamptz.
 function extractDatetime(
   unit: string,
@@ -365,15 +433,6 @@ function extractDatetime(
   instant: bigint,
   offsetSecs: bigint,
 ): Decimal {
-  if (micros === POS_INFINITY || micros === NEG_INFINITY) {
-    // Every unit is accepted here (PG's NonFiniteTimestampTzPart, even timezone of a timestamp);
-    // jed's decimal is finite-only (decimal.md §2), so 22003 where PG returns ±Infinity or NULL — a
-    // documented divergence (timezones.md §9.2).
-    throw engineError(
-      "numeric_value_out_of_range",
-      "cannot extract field from an infinite timestamp",
-    );
-  }
   const [y, mo, d, h, mi, s, us] = civilFromMicros(micros);
   const secUs = s * MICROS_PER_SEC + us;
   const days = daysFromCivil(y, mo, d);
@@ -429,14 +488,8 @@ function extractDatetime(
   }
 }
 
-// extractDate extracts the canonical `unit` (written as `name`, for messages) from a date.
+// extractDate extracts the canonical `unit` (written as `name`, for messages) from a finite date.
 function extractDate(unit: string, name: string, days: bigint): Decimal {
-  if (days === DATE_POS_INFINITY || days === DATE_NEG_INFINITY) {
-    // As for an infinite timestamp: an unsupported field is still 0A000 (checked on a finite
-    // probe), else 22003 where PG returns ±Infinity or NULL (timezones.md §9.2).
-    extractDate(unit, name, 0n);
-    throw engineError("numeric_value_out_of_range", "cannot extract field from an infinite date");
-  }
   const [y, mo, d] = civilFromDays(days);
   switch (unit) {
     case "day":

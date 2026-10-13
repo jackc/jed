@@ -3,8 +3,8 @@
 # at resolve. Source is timestamp / timestamptz / date / interval; the field-validity matrix matches
 # PostgreSQL (an unsupported field for the type is 0A000, an unrecognized field is 22023). For a
 # timestamptz source every field is computed in the SESSION zone except `epoch`. Oracle-checked
-# against postgres:18. `julian` is in extract_julian.test. (The divergence — EXTRACT of ±infinity — is
-# a per-core unit test, not here: the oracle corpus is PG-clean.)
+# against postgres:18. `julian` is in extract_julian.test; ±infinity sources are in
+# extract_infinity.test.
 #
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: query.select, query.select_no_from, query.derived_table, types.timestamp, types.timestamptz, types.date, types.interval, expr.extract, session.timezone

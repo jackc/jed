@@ -351,17 +351,14 @@ func extractJulian(micros int64) (Decimal, error) {
 	return decimalFromInt64(jd).Add(frac)
 }
 
-// datePartJulian is date_part('julian', timestamp) over wall-clock micros — PG's float8 formula
-// verbatim (jd + (seconds + fsec/1e6) / 86400.0, not the numeric value rounded), so the result is
-// PG's to the bit. An infinite source traps like every other field (22003).
-func datePartJulian(micros int64) (float64, error) {
-	if micros == posInfinity || micros == negInfinity {
-		return 0, newError(NumericValueOutOfRange, "cannot extract field from an infinite timestamp")
-	}
+// datePartJulian is date_part('julian', timestamp) over finite wall-clock micros — PG's float8
+// formula verbatim (jd + (seconds + fsec/1e6) / 86400.0, not the numeric value rounded), so the
+// result is PG's to the bit. The caller handles an infinite source through extractPart.
+func datePartJulian(micros int64) float64 {
 	jd, todUs := julianParts(micros)
 	secs := todUs / microsPerSecDT
 	fsec := todUs % microsPerSecDT
-	return float64(jd) + (float64(secs)+float64(fsec)/1000000.0)/float64(secsPerDayDT), nil
+	return float64(jd) + (float64(secs)+float64(fsec)/1000000.0)/float64(secsPerDayDT)
 }
 
 // extractSrc is the source value of an EXTRACT(field FROM source). For a timestamptz the caller
@@ -384,11 +381,70 @@ const (
 	srcIv   = 3
 )
 
-// extractField returns EXTRACT(field FROM source) as numeric. The field name is resolved first,
-// through PostgreSQL's unit tables (so "hours", "msec", "jd" are hour, milliseconds, julian —
-// timezones.md §9.6); then an unsupported field for the type is 0A000 and an unrecognized field
-// 22023, both ahead of the infinite-source trap.
-func extractField(field string, src extractSrc) (Decimal, error) {
+// The kind of an extractOut: a finite value, or — over a ±infinity source — PostgreSQL's
+// NonFiniteTimestampTzPart answer (timezones.md §9.2): NULL for an oscillating field (month, hour,
+// dow, …), ±Infinity with the source's sign for a monotonically-increasing one (year, decade,
+// century, millennium, julian, isoyear, epoch).
+const (
+	extractValue = iota
+	extractNull
+	extractPosInf
+	extractNegInf
+)
+
+// extractOut is the result of the shared EXTRACT / date_part kernel.
+type extractOut struct {
+	kind int
+	dec  Decimal // set when kind == extractValue
+}
+
+// extractField returns EXTRACT(field FROM source) as numeric; ok is false for NULL. The kernel's
+// ±Infinity traps 22003: jed's decimal is finite-only (decimal.md §2), where PostgreSQL returns
+// numeric ±Infinity — a documented divergence (timezones.md §9.2). An oscillating field over an
+// infinite source is NULL, as in PG.
+func extractField(field string, src extractSrc) (d Decimal, ok bool, err error) {
+	out, err := extractPart(field, src)
+	if err != nil {
+		return Decimal{}, false, err
+	}
+	switch out.kind {
+	case extractValue:
+		return out.dec, true, nil
+	case extractNull:
+		return Decimal{}, false, nil
+	default:
+		what := "timestamp"
+		if src.kind == srcDate {
+			what = "date"
+		}
+		return Decimal{}, false, newError(NumericValueOutOfRange, "cannot extract field from an infinite "+what)
+	}
+}
+
+// isMonotonicField reports whether unit increases monotonically with time — PostgreSQL's
+// NonFiniteTimestampTzPart split: these fields of a ±infinity source are ±Infinity; every other
+// field it accepts oscillates and is NULL.
+func isMonotonicField(unit string) bool {
+	switch unit {
+	case "year", "decade", "century", "millennium", "julian", "isoyear", "epoch":
+		return true
+	}
+	return false
+}
+
+// nonFinite is the extractOut of a monotonic field over a ±infinity source.
+func nonFinite(negative bool) extractOut {
+	if negative {
+		return extractOut{kind: extractNegInf}
+	}
+	return extractOut{kind: extractPosInf}
+}
+
+// extractPart is the shared EXTRACT / date_part kernel. The field name is resolved first, through
+// PostgreSQL's unit tables (so "hours", "msec", "jd" are hour, milliseconds, julian — timezones.md
+// §9.6); then an unsupported field for the type is 0A000 and an unrecognized field 22023, both
+// decided before an infinite source is (PG decodes the unit first).
+func extractPart(field string, src extractSrc) (extractOut, error) {
 	name := lowerUnit(field)
 	var typeName string
 	switch src.kind {
@@ -406,31 +462,50 @@ func extractField(field string, src extractSrc) (Decimal, error) {
 	case f.kind == fieldReserved && src.kind != srcIv:
 		// A reserved word other than epoch is unsupported for the date/time types but unrecognized
 		// for an interval — PostgreSQL's interval_part_common checks only epoch.
-		return Decimal{}, unitNotSupported(name, typeName)
+		return extractOut{}, unitNotSupported(name, typeName)
 	case f.kind != fieldUnit:
-		return Decimal{}, unitNotRecognized(name, typeName)
+		return extractOut{}, unitNotRecognized(name, typeName)
 	}
+	var d Decimal
+	var err error
 	switch src.kind {
-	case srcTs:
-		return extractDatetime(f.unit, name, src.local, false, 0, 0)
-	case srcTstz:
-		return extractDatetime(f.unit, name, src.local, true, src.instant, src.offsetSecs)
+	case srcTs, srcTstz:
+		if src.local == posInfinity || src.local == negInfinity {
+			// PG's NonFiniteTimestampTzPart: every unit is accepted here, even timezone of a
+			// timestamp (oscillating, so NULL).
+			if isMonotonicField(f.unit) {
+				return nonFinite(src.local == negInfinity), nil
+			}
+			return extractOut{kind: extractNull}, nil
+		}
+		d, err = extractDatetime(f.unit, name, src.local, src.kind == srcTstz, src.instant, src.offsetSecs)
 	case srcDate:
-		return extractDate(f.unit, name, int64(src.days))
+		if src.days == datePosInfinity || src.days == dateNegInfinity {
+			// PG's extract_date: the monotonic fields are ±Infinity, the date's oscillating fields
+			// NULL, and every other field (the time and timezone fields) still 0A000.
+			switch {
+			case f.unit == "day" || f.unit == "month" || f.unit == "quarter" || f.unit == "week" ||
+				f.unit == "dow" || f.unit == "isodow" || f.unit == "doy":
+				return extractOut{kind: extractNull}, nil
+			case isMonotonicField(f.unit):
+				return nonFinite(src.days == dateNegInfinity), nil
+			default:
+				return extractOut{}, unitNotSupported(name, "date")
+			}
+		}
+		d, err = extractDate(f.unit, name, int64(src.days))
 	default:
-		return extractInterval(f.unit, name, src.iv)
+		d, err = extractInterval(f.unit, name, src.iv)
 	}
+	if err != nil {
+		return extractOut{}, err
+	}
+	return extractOut{kind: extractValue, dec: d}, nil
 }
 
-// extractDatetime extracts the canonical `unit` (written as `name`, for messages) from the
+// extractDatetime extracts the canonical `unit` (written as `name`, for messages) from the finite
 // wall-clock micros of a timestamp / timestamptz.
 func extractDatetime(unit, name string, micros int64, isTz bool, instant, offsetSecs int64) (Decimal, error) {
-	if micros == posInfinity || micros == negInfinity {
-		// Every unit is accepted here (PG's NonFiniteTimestampTzPart, even timezone of a
-		// timestamp); jed's decimal is finite-only (decimal.md §2), so 22003 where PG returns
-		// ±Infinity or NULL — a documented divergence (timezones.md §9.2).
-		return Decimal{}, newError(NumericValueOutOfRange, "cannot extract field from an infinite timestamp")
-	}
 	y, mo, d, h, mi, s, us := civilFromMicros(micros)
 	secUs := s*microsPerSecDT + us
 	days := daysFromCivil(y, mo, d)
@@ -496,16 +571,8 @@ func extractDatetime(unit, name string, micros int64, isTz bool, instant, offset
 	}
 }
 
-// extractDate extracts the canonical `unit` (written as `name`, for messages) from a date.
+// extractDate extracts the canonical `unit` (written as `name`, for messages) from a finite date.
 func extractDate(unit, name string, days int64) (Decimal, error) {
-	if days == int64(datePosInfinity) || days == int64(dateNegInfinity) {
-		// As for an infinite timestamp: an unsupported field is still 0A000 (checked on a finite
-		// probe), else 22003 where PG returns ±Infinity or NULL (timezones.md §9.2).
-		if _, err := extractDate(unit, name, 0); err != nil {
-			return Decimal{}, err
-		}
-		return Decimal{}, newError(NumericValueOutOfRange, "cannot extract field from an infinite date")
-	}
 	y, mo, d := civilFromDays(days)
 	switch unit {
 	case "day":

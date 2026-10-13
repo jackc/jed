@@ -1639,9 +1639,11 @@ impl RExpr {
                     }
                     _ => unreachable!("resolver restricts EXTRACT to ts/tstz/date/interval"),
                 };
-                Ok(Value::Decimal(crate::datetime_fn::extract_field(
-                    field, src,
-                )?))
+                // An oscillating field of a ±infinity source is NULL (timezones.md §9.2).
+                Ok(match crate::datetime_fn::extract_field(field, src)? {
+                    Some(d) => Value::Decimal(d),
+                    None => Value::Null,
+                })
             }
             RExpr::DateConvert { inner, to } => {
                 m.charge(COSTS.operator_eval);
@@ -2327,16 +2329,33 @@ impl RExpr {
                             // (timezones.md §9.2).
                             match src {
                                 ExtractSrc::Timestamp(local)
-                                | ExtractSrc::Timestamptz { local, .. } => {
+                                | ExtractSrc::Timestamptz { local, .. }
+                                    if local != crate::timestamp::POS_INFINITY
+                                        && local != crate::timestamp::NEG_INFINITY =>
+                                {
                                     return Ok(Value::Float64(
-                                        crate::datetime_fn::date_part_julian(local)?,
+                                        crate::datetime_fn::date_part_julian(local),
                                     ));
                                 }
                                 _ => {}
                             }
                         }
-                        let d = crate::datetime_fn::extract_field(&field, src)?;
-                        decimal_to_float(&d, ScalarType::Float64)
+                        // Over a ±infinity source PG's float8 result carries what EXTRACT's
+                        // numeric cannot: ±Infinity for a monotonic field, NULL for an
+                        // oscillating one (timezones.md §9.2).
+                        match crate::datetime_fn::extract_part(&field, src)? {
+                            crate::datetime_fn::ExtractOut::Value(d) => {
+                                decimal_to_float(&d, ScalarType::Float64)
+                            }
+                            crate::datetime_fn::ExtractOut::Null => Ok(Value::Null),
+                            crate::datetime_fn::ExtractOut::Infinite { negative } => {
+                                Ok(Value::Float64(if negative {
+                                    f64::NEG_INFINITY
+                                } else {
+                                    f64::INFINITY
+                                }))
+                            }
+                        }
                     }
                     // interval normalizers (spec/design/interval.md §5.1). The NULL-input case is
                     // already handled above.

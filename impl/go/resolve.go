@@ -1887,7 +1887,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				return nil, resolvedType{}, newError(UndefinedFunction,
 					"function extract(text, "+rtName(srcT)+") does not exist").hinted(hintFunctionNoMatch)
 			}
-			if _, err := extractField(e.Extract.Field, probe); err != nil {
+			if _, _, err := extractField(e.Extract.Field, probe); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}

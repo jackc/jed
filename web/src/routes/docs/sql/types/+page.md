@@ -475,6 +475,15 @@ name is a runtime string, and over a `date` the timestamp fields exist (`date_pa
 `0`), exactly as in PostgreSQL. (A runtime `text` value casts to every datetime type, and every
 datetime casts to `text` — a `timestamptz` in the session time zone.)
 
+Over `infinity` or `-infinity`, a field that only grows with time — `year`, `decade`, `century`,
+`millennium`, `julian`, `isoyear`, `epoch` — is `Infinity` or `-Infinity`, and every other field
+(`month`, `day`, `hour`, `dow`, …) is NULL: `date_part('year', date 'infinity')` is `Infinity` and
+`date_part('month', date 'infinity')` is NULL, as in PostgreSQL. `EXTRACT` returns the same NULLs,
+but jed's `numeric` has no infinity, so where PostgreSQL returns `Infinity` it raises `22003`.
+EXTRACT's field is also checked against the type before the value is seen, so
+`EXTRACT(timezone FROM timestamp 'infinity')` is `0A000`, as for any `timestamp`, where PostgreSQL
+returns NULL.
+
 Unit names are case-insensitive and accept PostgreSQL's aliases: `date_trunc('hrs', ts)`,
 `EXTRACT(mons FROM ts)`, and `date_part('msec', ts)` work, as do `y`/`yr`/`years`, `d`/`days`,
 `w`/`weeks`, `qtr`, `us`/`usec`, `c`/`cent`, and the rest. `EXTRACT` and `date_part` also take `jd`/`j`

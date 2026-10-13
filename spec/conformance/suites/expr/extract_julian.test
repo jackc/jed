@@ -5,8 +5,8 @@
 # 86400000000), the division at numeric's select_div_scale, so the scale follows PG (28 digits at
 # midnight, 20 at noon). A timestamptz is decomposed in the SESSION zone (local midnight is .0).
 # date_part returns PG's float8 formula (jd + seconds/86400.0); its date overload widens to midnight.
-# julian of an interval is 0A000. Oracle-checked against postgres:18. (±infinity — jed 22003, PG
-# ±Infinity — is a per-core divergence test, not here: the oracle corpus is PG-clean.)
+# julian of an interval is 0A000. Oracle-checked against postgres:18. (±infinity sources are in
+# extract_infinity.test.)
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, expr.extract, func.date_part, session.timezone, resource.cost_metering
 # load-timezone: America/New_York

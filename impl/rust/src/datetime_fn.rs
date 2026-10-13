@@ -340,29 +340,53 @@ fn extract_julian(micros: i64) -> Result<Decimal> {
     Decimal::from_i64(jd).add(&frac)
 }
 
-/// `date_part('julian', timestamp)` over wall-clock micros — PG's float8 formula verbatim
+/// `date_part('julian', timestamp)` over finite wall-clock micros — PG's float8 formula verbatim
 /// (`jd + (seconds + fsec/1e6) / 86400.0`, not the numeric value rounded), so the result is PG's to
-/// the bit. An infinite source traps like every other field (`22003`).
-pub fn date_part_julian(micros: i64) -> Result<f64> {
-    if micros == POS_INFINITY || micros == NEG_INFINITY {
-        return Err(EngineError::new(
-            SqlState::NumericValueOutOfRange,
-            "cannot extract field from an infinite timestamp",
-        ));
-    }
+/// the bit. The caller handles an infinite source through `extract_part`.
+pub fn date_part_julian(micros: i64) -> f64 {
     let (jd, tod_us) = julian_parts(micros);
     let secs = tod_us / MICROS_PER_SEC;
     let fsec = tod_us % MICROS_PER_SEC;
-    Ok(jd as f64 + (secs as f64 + fsec as f64 / 1000000.0) / SECS_PER_DAY as f64)
+    jd as f64 + (secs as f64 + fsec as f64 / 1000000.0) / SECS_PER_DAY as f64
 }
 
-/// `EXTRACT(field FROM source)` → `numeric`. The field name is resolved first, through PostgreSQL's
-/// unit tables (so `hours`, `msec`, `jd` are `hour`, `milliseconds`, `julian` — timezones.md §9.6);
-/// the field-validity matrix then matches PostgreSQL: an unsupported field for the source type is
-/// `0A000`, an unrecognized field is `22023`, and both take precedence over the infinite-source
-/// trap. For a `timestamptz` source every field is computed in the (already-applied) session zone
-/// except `epoch` (the instant) and the `timezone*` fields (the zone offset).
-pub fn extract_field(field: &str, src: ExtractSrc) -> Result<Decimal> {
+/// The result of extracting a field: a finite value, or — over a `±infinity` source — PostgreSQL's
+/// `NonFiniteTimestampTzPart` answer (timezones.md §9.2): NULL for an oscillating field (`month`,
+/// `hour`, `dow`, …), `±Infinity` with the source's sign for a monotonically-increasing one
+/// (`year`, `decade`, `century`, `millennium`, `julian`, `isoyear`, `epoch`).
+pub enum ExtractOut {
+    Value(Decimal),
+    Null,
+    Infinite { negative: bool },
+}
+
+/// `EXTRACT(field FROM source)` → `numeric` (NULL is `None`). The shared kernel's `±Infinity` traps
+/// `22003`: jed's `decimal` is finite-only (decimal.md §2), where PostgreSQL returns numeric
+/// `±Infinity` — a documented divergence (timezones.md §9.2). An oscillating field over an infinite
+/// source is NULL, as in PG.
+pub fn extract_field(field: &str, src: ExtractSrc) -> Result<Option<Decimal>> {
+    let what = match src {
+        ExtractSrc::Date(_) => "date",
+        _ => "timestamp",
+    };
+    match extract_part(field, src)? {
+        ExtractOut::Value(d) => Ok(Some(d)),
+        ExtractOut::Null => Ok(None),
+        ExtractOut::Infinite { .. } => Err(EngineError::new(
+            SqlState::NumericValueOutOfRange,
+            format!("cannot extract field from an infinite {what}"),
+        )),
+    }
+}
+
+/// The shared `EXTRACT` / `date_part` kernel. The field name is resolved first, through
+/// PostgreSQL's unit tables (so `hours`, `msec`, `jd` are `hour`, `milliseconds`, `julian` —
+/// timezones.md §9.6); the field-validity matrix then matches PostgreSQL: an unsupported field for
+/// the source type is `0A000`, an unrecognized field is `22023`, and both are decided before an
+/// infinite source is (PG decodes the unit first). For a `timestamptz` source every field is
+/// computed in the (already-applied) session zone except `epoch` (the instant) and the `timezone*`
+/// fields (the zone offset).
+pub fn extract_part(field: &str, src: ExtractSrc) -> Result<ExtractOut> {
     let name = lower_unit(field);
     let type_name = match src {
         ExtractSrc::Timestamp(_) => timestamp_type_name(false),
@@ -387,8 +411,18 @@ pub fn extract_field(field: &str, src: ExtractSrc) -> Result<Decimal> {
             offset_secs,
         } => extract_datetime(unit, &name, local, Some((instant, offset_secs))),
         ExtractSrc::Date(days) => extract_date(unit, &name, days),
-        ExtractSrc::Interval(iv) => extract_interval(unit, &name, iv),
+        ExtractSrc::Interval(iv) => extract_interval(unit, &name, iv).map(ExtractOut::Value),
     }
+}
+
+/// Whether `unit` increases monotonically with time — PostgreSQL's `NonFiniteTimestampTzPart`
+/// split: these fields of a `±infinity` source are `±Infinity`; every other field it accepts
+/// oscillates and is NULL.
+fn is_monotonic_field(unit: &str) -> bool {
+    matches!(
+        unit,
+        "year" | "decade" | "century" | "millennium" | "julian" | "isoyear" | "epoch"
+    )
 }
 
 /// Shared timestamp/timestamptz field extraction of the canonical `unit` over the wall-clock
@@ -400,15 +434,16 @@ fn extract_datetime(
     name: &str,
     micros: i64,
     tz: Option<(i64, i64)>,
-) -> Result<Decimal> {
+) -> Result<ExtractOut> {
     if micros == POS_INFINITY || micros == NEG_INFINITY {
-        // Every unit is accepted here (PG's NonFiniteTimestampTzPart, even `timezone` of a
-        // timestamp); jed's decimal is finite-only (decimal.md §2), so 22003 where PG returns
-        // ±Infinity or NULL — a documented divergence (timezones.md §9.2).
-        return Err(EngineError::new(
-            SqlState::NumericValueOutOfRange,
-            "cannot extract field from an infinite timestamp",
-        ));
+        // PG's NonFiniteTimestampTzPart: every unit is accepted here, even `timezone` of a
+        // timestamp (oscillating, so NULL).
+        if is_monotonic_field(unit) {
+            return Ok(ExtractOut::Infinite {
+                negative: micros == NEG_INFINITY,
+            });
+        }
+        return Ok(ExtractOut::Null);
     }
     let (y, mo, d, h, mi, s, us) = civil_from_micros(micros);
     let sec_us = s as i64 * MICROS_PER_SEC + us as i64;
@@ -447,20 +482,22 @@ fn extract_datetime(
         "julian" => extract_julian(micros)?,
         _ => return Err(not_supported(name, timestamp_type_name(tz.is_some()))),
     };
-    Ok(v)
+    Ok(ExtractOut::Value(v))
 }
 
 /// `EXTRACT(field FROM date)`: the calendar fields only — the time fields (`hour`/`minute`/… and
 /// `timezone*`) are `0A000` (PG: "unit X not supported for type date"). `epoch` is `days * 86400`.
-fn extract_date(unit: &str, name: &str, days: i32) -> Result<Decimal> {
+fn extract_date(unit: &str, name: &str, days: i32) -> Result<ExtractOut> {
     if days == crate::date::POS_INFINITY || days == crate::date::NEG_INFINITY {
-        // As for an infinite timestamp: an unsupported field is still 0A000, else 22003 where PG
-        // returns ±Infinity or NULL (jed's decimal is finite-only — timezones.md §9.2).
-        extract_date(unit, name, 0)?;
-        return Err(EngineError::new(
-            SqlState::NumericValueOutOfRange,
-            "cannot extract field from an infinite date",
-        ));
+        // PG's extract_date: the monotonic fields are ±Infinity, the date's oscillating fields
+        // NULL, and every other field (the time and timezone fields) still 0A000.
+        return match unit {
+            "day" | "month" | "quarter" | "week" | "dow" | "isodow" | "doy" => Ok(ExtractOut::Null),
+            _ if is_monotonic_field(unit) => Ok(ExtractOut::Infinite {
+                negative: days == crate::date::NEG_INFINITY,
+            }),
+            _ => Err(not_supported(name, "date")),
+        };
     }
     let days = days as i64;
     let (y, mo, d) = civil_from_days(days);
@@ -481,7 +518,7 @@ fn extract_date(unit: &str, name: &str, days: i32) -> Result<Decimal> {
         "julian" => Decimal::from_i64(days + UNIX_EPOCH_JD),
         _ => return Err(not_supported(name, "date")),
     };
-    Ok(v)
+    Ok(ExtractOut::Value(v))
 }
 
 /// `EXTRACT(field FROM interval)` (spec/design/timezones.md §9.2). The interval's months/days/micros
@@ -572,10 +609,12 @@ mod tests {
     fn ex(field: &str, micros: i64) -> String {
         extract_field(field, ExtractSrc::Timestamp(micros))
             .unwrap()
+            .unwrap()
             .render()
     }
     fn ex_date(field: &str, days: i32) -> String {
         extract_field(field, ExtractSrc::Date(days))
+            .unwrap()
             .unwrap()
             .render()
     }
@@ -588,6 +627,7 @@ mod tests {
                 micros,
             }),
         )
+        .unwrap()
         .unwrap()
         .render()
     }

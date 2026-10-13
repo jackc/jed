@@ -331,7 +331,10 @@ The three remaining date functions (each oracle-checked / corpus-pinned; the cap
   `0A000`, like `date_trunc`'s unit). The `date` overload **widens to midnight** and uses the
   *timestamp* field matrix — PG's own catalog definition — so `date_part('hour', d)` is `0`
   where `EXTRACT(hour FROM d)` is `0A000`; `date_part('julian', d)` is the day number as a float
-  (`EXTRACT(julian FROM d)` is the integer day number, `days + 2440588`). The `timestamptz` overload decomposes in the session zone (stable); the
+  (`EXTRACT(julian FROM d)` is the integer day number, `days + 2440588`). Over `±infinity` a
+  monotonic field (`year`, `epoch`, `julian`, …) is `±Infinity` and every other field NULL, as in
+  PG; `EXTRACT` returns the NULLs but traps `22003` for the `±Infinity` (finite-only `decimal` —
+  [timezones.md §9.2](timezones.md)). The `timestamptz` overload decomposes in the session zone (stable); the
   others are immutable.
 
 ### Still deferred

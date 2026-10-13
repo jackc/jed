@@ -4,10 +4,13 @@
 //! datetime_cast}.test` and runs on every core; these per-core tests cover only what the oracle
 //! corpus CANNOT express (CLAUDE.md §10) — the cases where jed deliberately differs from PG:
 //!
-//!   * `EXTRACT(field FROM ±infinity)` (timestamp, timestamptz, or date) — jed's decimal is
-//!     finite-only, so it traps `22003`; PG returns numeric `±Infinity` (or NULL for an oscillating
-//!     field). `date_part` follows EXTRACT (`22003` where PG returns float `±Infinity`)
-//!     (timezones.md §9.2).
+//!   * `EXTRACT(field FROM ±infinity)` of a monotonic field (`year`, `decade`, `century`,
+//!     `millennium`, `julian`, `isoyear`, `epoch`) over a timestamp, timestamptz, or date — jed's
+//!     decimal is finite-only, so it traps `22003`; PG returns numeric `±Infinity`. (The oscillating
+//!     fields are NULL, as in PG, and `date_part`'s float8 carries the `±Infinity` — both
+//!     oracle-checked in `suites/expr/extract_infinity.test`.) (timezones.md §9.2)
+//!   * `EXTRACT(timezone* FROM ±infinity timestamp)` — jed validates EXTRACT's field at resolve, so
+//!     it is `0A000` as for a finite timestamp; PG decides per value and returns NULL.
 //!   * a non-datetime, non-text source to a datetime target — jed `42804` (PG `42846`)
 //!     (timezones.md §9.3, casts.toml).
 
@@ -20,34 +23,41 @@ fn err_code(db: &mut Session, sql: &str) -> String {
     }
 }
 
-/// EXTRACT (and date_part) over an infinite timestamp/timestamptz/date traps 22003 (jed's decimal
-/// is finite-only); PG returns ±Infinity (or NULL for an oscillating field).
+/// EXTRACT of a monotonic field over an infinite timestamp/timestamptz/date traps 22003 (jed's
+/// decimal is finite-only); PG returns numeric ±Infinity.
 #[test]
-fn extract_from_infinity_traps() {
+fn extract_monotonic_field_from_infinity_traps() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    assert_eq!(
-        err_code(&mut db, "SELECT EXTRACT(year FROM timestamp 'infinity')"),
-        "22003"
-    );
-    assert_eq!(
-        err_code(
-            &mut db,
-            "SELECT EXTRACT(epoch FROM timestamptz '-infinity')"
-        ),
-        "22003"
-    );
-    for sql in [
-        "SELECT EXTRACT(julian FROM timestamp 'infinity')",
-        "SELECT EXTRACT(julian FROM date '-infinity')",
-        "SELECT EXTRACT(year FROM date 'infinity')",
-        "SELECT EXTRACT(day FROM date '-infinity')",
-        "SELECT date_part('julian', timestamp '-infinity')",
-        "SELECT date_part('julian', timestamptz 'infinity')",
-        "SELECT date_part('julian', date 'infinity')",
+    for field in [
+        "year",
+        "decade",
+        "century",
+        "millennium",
+        "julian",
+        "isoyear",
+        "epoch",
     ] {
-        assert_eq!(err_code(&mut db, sql), "22003", "{sql}");
+        for ty in ["timestamp", "timestamptz", "date"] {
+            for inf in ["infinity", "-infinity"] {
+                let sql = format!("SELECT EXTRACT({field} FROM {ty} '{inf}')");
+                assert_eq!(err_code(&mut db, &sql), "22003", "{sql}");
+            }
+        }
+    }
+}
+
+/// EXTRACT(timezone* FROM an infinite timestamp) is 0A000 at resolve, like a finite timestamp's;
+/// PG returns NULL (its NonFiniteTimestampTzPart accepts every unit).
+#[test]
+fn extract_timezone_from_infinite_timestamp_is_unsupported() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    for field in ["timezone", "timezone_hour", "timezone_minute"] {
+        let sql = format!("SELECT EXTRACT({field} FROM timestamp 'infinity')");
+        assert_eq!(err_code(&mut db, &sql), "0A000", "{sql}");
     }
 }
 

@@ -218,6 +218,7 @@ import {
   dateTruncMicros,
   datePartJulian,
   extractField,
+  extractPart,
   lowerUnit,
 } from "./datetime_fn.ts";
 import type { ZoneRef } from "./timezone.ts";
@@ -1136,7 +1137,9 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       } else {
         throw new Error("unreachable: resolver restricts EXTRACT to ts/tstz/date/interval");
       }
-      return decimalValue(extractField(e.field, src));
+      // An oscillating field of a ±infinity source is NULL (timezones.md §9.2).
+      const d = extractField(e.field, src);
+      return d === null ? nullValue() : decimalValue(d);
     }
     case "dateConvert": {
       m.charge(COSTS.operatorEval);
@@ -1371,12 +1374,23 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         } else {
           throw new Error("unreachable: resolver restricts date_part to date/ts/tstz/interval");
         }
-        if (canonicalField(field) === "julian" && src.kind !== "interval") {
-          // PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
-          return float64Value(datePartJulian(src.kind === "ts" ? src.micros : src.local));
+        if (src.kind === "ts" || src.kind === "tstz") {
+          const local = src.kind === "ts" ? src.micros : src.local;
+          if (
+            canonicalField(field) === "julian" &&
+            local !== POS_INFINITY &&
+            local !== NEG_INFINITY
+          ) {
+            // PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
+            return float64Value(datePartJulian(local));
+          }
         }
-        const d = extractField(field, src);
-        const f = Number(d.render());
+        // Over a ±infinity source PG's float8 result carries what EXTRACT's numeric cannot:
+        // ±Infinity for a monotonic field, NULL for an oscillating one (timezones.md §9.2).
+        const out = extractPart(field, src);
+        if (out.kind === "null") return nullValue();
+        if (out.kind === "infinite") return float64Value(out.negative ? -Infinity : Infinity);
+        const f = Number(out.dec.render());
         if (!Number.isFinite(f)) throw overflow("f64");
         return float64Value(f);
       }

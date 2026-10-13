@@ -4,37 +4,42 @@
 // cover only what the oracle corpus CANNOT express (CLAUDE.md §10) — the cases where jed deliberately
 // differs from PG. Mirrors impl/rust/tests/datetime_conversions.rs.
 //
-//   - EXTRACT(field FROM ±infinity) (timestamp, timestamptz, or date) — jed's decimal is finite-only,
-//     so 22003; PG returns ±Infinity (or NULL for an oscillating field). date_part follows EXTRACT
-//     (22003 where PG returns float ±Infinity).
+//   - EXTRACT(field FROM ±infinity) of a monotonic field (year, decade, century, millennium, julian,
+//     isoyear, epoch) over a timestamp, timestamptz, or date — jed's decimal is finite-only, so
+//     22003; PG returns numeric ±Infinity. (The oscillating fields are NULL, as in PG, and
+//     date_part's float8 carries the ±Infinity — both oracle-checked in
+//     suites/expr/extract_infinity.test.)
+//   - EXTRACT(timezone* FROM ±infinity timestamp) — jed validates EXTRACT's field at resolve, so it
+//     is 0A000 as for a finite timestamp; PG decides per value and returns NULL.
 //   - a non-datetime, non-text source to a datetime target — jed 42804 (PG 42846).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { dbWith, errCode } from "./util.ts";
 
-test("EXTRACT / date_part over an infinite datetime traps (22003 — jed decimal is finite)", () => {
+test("EXTRACT of a monotonic field over an infinite datetime traps (22003 — jed decimal is finite)", () => {
   const db = dbWith([]);
-  assert.equal(
-    errCode(() => db.execute("SELECT EXTRACT(year FROM timestamp 'infinity')")),
-    "22003",
-  );
-  assert.equal(
-    errCode(() => db.execute("SELECT EXTRACT(epoch FROM timestamptz '-infinity')")),
-    "22003",
-  );
-  for (const sql of [
-    "SELECT EXTRACT(julian FROM timestamp 'infinity')",
-    "SELECT EXTRACT(julian FROM date '-infinity')",
-    "SELECT EXTRACT(year FROM date 'infinity')",
-    "SELECT EXTRACT(day FROM date '-infinity')",
-    "SELECT date_part('julian', timestamp '-infinity')",
-    "SELECT date_part('julian', timestamptz 'infinity')",
-    "SELECT date_part('julian', date 'infinity')",
-  ]) {
+  for (const field of ["year", "decade", "century", "millennium", "julian", "isoyear", "epoch"]) {
+    for (const ty of ["timestamp", "timestamptz", "date"]) {
+      for (const inf of ["infinity", "-infinity"]) {
+        const sql = `SELECT EXTRACT(${field} FROM ${ty} '${inf}')`;
+        assert.equal(
+          errCode(() => db.execute(sql)),
+          "22003",
+          sql,
+        );
+      }
+    }
+  }
+});
+
+test("EXTRACT(timezone* FROM an infinite timestamp) is 0A000 at resolve (PG: NULL)", () => {
+  const db = dbWith([]);
+  for (const field of ["timezone", "timezone_hour", "timezone_minute"]) {
+    const sql = `SELECT EXTRACT(${field} FROM timestamp 'infinity')`;
     assert.equal(
       errCode(() => db.execute(sql)),
-      "22003",
+      "0A000",
       sql,
     );
   }

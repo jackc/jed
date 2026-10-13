@@ -411,7 +411,7 @@ A field may be spelled with any of PostgreSQL's aliases (`hours`, `msec`, `y`, `
 An unsupported field-for-type is **`0A000`** (`feature_not_supported`, PG's "unit X not supported for
 type Y"); an **unrecognized** field name is **`22023`** (PG's "unit X not recognized for type Y"). A
 reserved word other than `epoch` (`infinity`, `now`, `today`, …) is `0A000` for a date/time source
-and `22023` for an interval, as in PG. Both checks precede the infinite-source trap below.
+and `22023` for an interval, as in PG. Both checks precede the infinite-source rule below.
 `julian` is the Julian Day (PG's `date2j`; 4714-11-24 BC is day 0, 1970-01-01 is 2440588). Over a `date` it
 is the integer day number, `days + 2440588`. Over a `timestamp` it adds the fraction of the day, computed
 as PostgreSQL's numeric path does: `jd + (time-of-day µs / 86400000000)`, the division at numeric's
@@ -419,10 +419,20 @@ as PostgreSQL's numeric path does: `jd + (time-of-day µs / 86400000000)`, the d
 28 digits, at midnight; 20 at noon; `2000-01-01 00:00:00.000001` is
 `2451545.0000000000115740740740740741`). A `timestamptz` decomposes in the session zone like every other
 wall-clock field, so local midnight is `.0` (oracle-checked in `suites/expr/extract_julian.test`).
-`EXTRACT` of **any** field PG accepts from an infinite `timestamp`, `timestamptz`, or `date` is `22003`
-("cannot extract field from an infinite timestamp" / "… date") — jed's `decimal` is finite-only, where PG returns
-`±Infinity` for a monotonic field (`year`, `epoch`, `julian`, …) or NULL for an oscillating one;
-`date_part` follows `EXTRACT` (a documented divergence, per-core tested). Field formulas:
+**An infinite source** follows PostgreSQL 18's `NonFiniteTimestampTzPart` (timestamp/timestamptz) and
+`extract_date` (date), after the field is decoded as above. A **monotonically-increasing** field — `year`,
+`decade`, `century`, `millennium`, `julian`, `isoyear`, `epoch` — is `±Infinity` with the source's sign;
+every other field PG accepts **oscillates** and is **NULL**. For a `timestamp`/`timestamptz` every unit is
+one or the other — even `timezone*` of a `timestamp`, which is NULL — and the session zone is never
+consulted. For a `date` the oscillating fields are `day`/`month`/`quarter`/`week`/`dow`/`isodow`/`doy`;
+the time and `timezone*` fields stay `0A000`. `date_part` returns both answers (its float8 has
+`±Infinity`, [float.md](float.md)); its `date` overload widens to an infinite timestamp, so
+`date_part('hour', date 'infinity')` is NULL. `EXTRACT` returns the NULLs, but its `±Infinity` traps
+**`22003`** ("cannot extract field from an infinite timestamp" / "… date") — jed's `decimal` is
+finite-only ([decimal.md](decimal.md) §2), where PG returns numeric `±Infinity`. And because `EXTRACT`'s
+field is validated at resolve against a finite value, `EXTRACT(timezone* FROM timestamp 'infinity')` is
+`0A000` like a finite timestamp's, where PG returns NULL. Both are documented divergences, per-core
+tested; the rest is oracle-checked in `suites/expr/extract_infinity.test`. Field formulas:
 `second`/`milliseconds`/`microseconds` carry the fractional seconds (exact decimal); an `interval`'s
 fields follow PG's `interval_part_common` — its months/days/micros decompose independently, each keeping
 its own sign (`year = months/12`, `month = months%12`, truncating; `week = days/7`; `hour` = whole hours of

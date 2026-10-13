@@ -2517,9 +2517,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		default:
 			panic("resolver restricts EXTRACT to ts/tstz/date/interval")
 		}
-		d, err := extractField(field, src)
+		d, ok, err := extractField(field, src)
 		if err != nil {
 			return Value{}, err
+		}
+		if !ok {
+			// An oscillating field of a ±infinity source is NULL (timezones.md §9.2).
+			return NullValue(), nil
 		}
 		return DecimalValue(d), nil
 	case reDateConvert:
@@ -2850,19 +2854,26 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			default:
 				panic("resolver restricts date_part to date/ts/tstz/interval")
 			}
-			if canonicalField(field) == "julian" && src.kind != srcIv {
+			if canonicalField(field) == "julian" && src.kind != srcIv &&
+				src.local != posInfinity && src.local != negInfinity {
 				// PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
-				f, err := datePartJulian(src.local)
-				if err != nil {
-					return Value{}, err
-				}
-				return Float64Value(f), nil
+				return Float64Value(datePartJulian(src.local)), nil
 			}
-			d, err := extractField(field, src)
+			// Over a ±infinity source PG's float8 result carries what EXTRACT's numeric cannot:
+			// ±Infinity for a monotonic field, NULL for an oscillating one (timezones.md §9.2).
+			out, err := extractPart(field, src)
 			if err != nil {
 				return Value{}, err
 			}
-			f, err := decimalToFloat64(d)
+			switch out.kind {
+			case extractNull:
+				return NullValue(), nil
+			case extractPosInf:
+				return Float64Value(math.Inf(1)), nil
+			case extractNegInf:
+				return Float64Value(math.Inf(-1)), nil
+			}
+			f, err := decimalToFloat64(out.dec)
 			if err != nil {
 				return Value{}, err
 			}
