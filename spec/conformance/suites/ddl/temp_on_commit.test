@@ -1,0 +1,325 @@
+# skip: disk — session-local temp tables and multi-record transactions do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# CREATE TEMP TABLE … ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } (spec/design/temp-tables.md
+# §5.1, grammar.md §13): a temporary table's end-of-transaction action. PRESERVE ROWS (the default)
+# keeps the table; DELETE ROWS empties its rows and index entries at every commit (an autocommit
+# statement's implicit commit included) but does not reset an owned sequence; DROP drops it, with its
+# indexes and owned sequences, when its creating transaction commits. ROLLBACK and a failed block run
+# no action. Any ON COMMIT on a non-temporary table is 42P16, decided after the IF NOT EXISTS skip.
+# PostgreSQL-faithful, checked by hand against PostgreSQL 18; not oracle-imported, because the
+# importer replays a file inside one rolled-back transaction, where no commit ever happens.
+# Format: ../../../design/conformance.md.
+# requires: ddl.temp_on_commit, ddl.temp_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, ddl.unique, ddl.drop_table, ddl.serial, ddl.secondary_index, ddl.alter_table, func.sequence, txn.explicit, dml.insert, dml.insert_column_list, dml.insert_multi_row, dml.returning, query.cte, query.cte_data_modifying, query.select, query.order_by, query.qualified_table, types.i32, types.text
+
+# --- ON COMMIT is for temporary tables only: 42P16, PRESERVE ROWS included --------------------------
+
+statement error 42P16
+CREATE TABLE p (a i32) ON COMMIT DELETE ROWS
+
+statement error 42P16
+CREATE TABLE p (a i32) ON COMMIT PRESERVE ROWS
+
+statement error 42P16
+CREATE TABLE p (a i32) ON COMMIT DROP
+
+# a `main.`-qualified table is persistent
+statement error 42P16
+CREATE TABLE main.p (a i32) ON COMMIT DROP
+
+# the clause is checked before the columns: the duplicate column is never reached
+statement error 42P16
+CREATE TABLE p (a i32, a i32) ON COMMIT DROP
+
+statement ok
+CREATE TABLE p (a i32 PRIMARY KEY)
+
+# IF NOT EXISTS skips a taken name before the ON COMMIT check (PostgreSQL's order)
+statement ok
+CREATE TABLE IF NOT EXISTS p (a i32) ON COMMIT DROP
+
+# --- grammar: the three actions only ------------------------------------------------------------------
+
+statement error 42601
+CREATE TEMP TABLE bad (a i32) ON COMMIT
+
+statement error 42601
+CREATE TEMP TABLE bad (a i32) ON COMMIT DELETE
+
+statement error 42601
+CREATE TEMP TABLE bad (a i32) ON COMMIT PRESERVE
+
+statement error 42601
+CREATE TEMP TABLE bad (a i32) ON COMMIT TRUNCATE
+
+statement error 42601
+CREATE TEMP TABLE bad (a i32) ON ROLLBACK DROP
+
+# --- PRESERVE ROWS is the default behavior -------------------------------------------------------------
+
+statement ok
+CREATE TEMPORARY TABLE keep (a i32) on commit preserve rows
+
+statement ok
+INSERT INTO keep VALUES (1), (2)
+
+query I rowsort
+SELECT a FROM keep
+----
+1
+2
+
+# --- DELETE ROWS: every commit empties the table --------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE d (id serial PRIMARY KEY, v i32 UNIQUE) ON COMMIT DELETE ROWS
+
+# an autocommit INSERT commits, so its rows are gone by the next statement
+statement ok
+INSERT INTO d (v) VALUES (1), (2)
+
+query II rowsort
+SELECT id, v FROM d
+----
+
+# the writing statement itself still sees them
+query II rowsort
+INSERT INTO d (v) VALUES (3), (4) RETURNING id, v
+----
+3
+3
+4
+4
+
+query II rowsort
+WITH i AS (INSERT INTO d (v) VALUES (5) RETURNING id, v) SELECT id, v FROM i
+----
+5
+5
+
+query I rowsort
+SELECT v FROM d
+----
+
+# the owned sequence is not reset: ids keep counting
+query I rowsort
+SELECT currval('d_id_seq')
+----
+5
+
+# the UNIQUE index was emptied too, so v = 1 can be inserted again
+statement ok
+INSERT INTO d (v) VALUES (1)
+
+# inside a block the rows stay visible until COMMIT
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d (v) VALUES (10), (20)
+
+statement ok
+INSERT INTO d (v) VALUES (30)
+
+query II nosort
+SELECT id, v FROM d ORDER BY id
+----
+7
+10
+8
+20
+9
+30
+
+statement ok
+COMMIT
+
+query I rowsort
+SELECT v FROM d
+----
+
+# ROLLBACK discards them as usual
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d (v) VALUES (40)
+
+statement ok
+ROLLBACK
+
+query I rowsort
+SELECT v FROM d
+----
+
+# a failed block's COMMIT is a ROLLBACK
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d (v) VALUES (50)
+
+statement error 23505
+INSERT INTO d (v) VALUES (50)
+
+statement ok
+COMMIT
+
+query I rowsort
+SELECT v FROM d
+----
+
+# only the DELETE ROWS table is emptied; other changes in the same transaction commit
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO d (v) VALUES (60)
+
+statement ok
+INSERT INTO keep VALUES (3)
+
+statement ok
+INSERT INTO p VALUES (1)
+
+statement ok
+COMMIT
+
+query I rowsort
+SELECT v FROM d
+----
+
+query I rowsort
+SELECT a FROM keep
+----
+1
+2
+3
+
+query I rowsort
+SELECT a FROM p
+----
+1
+
+# --- DROP: the creating transaction's commit drops the table --------------------------------------
+
+# under autocommit the CREATE commits at once, so the table is already gone
+statement ok
+CREATE TEMP TABLE x (a i32) ON COMMIT DROP
+
+statement error 42P01
+SELECT a FROM x
+
+# and the name is free again
+statement ok
+CREATE TEMP TABLE x (a i32) ON COMMIT DROP
+
+statement error 42P01
+SELECT a FROM x
+
+# inside a block the table is usable until COMMIT; its index and owned sequence go with it
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE y (id serial PRIMARY KEY, v i32) ON COMMIT DROP
+
+statement ok
+CREATE INDEX y_v ON y (v)
+
+statement ok
+INSERT INTO y (v) VALUES (7)
+
+query II rowsort
+SELECT id, v FROM y
+----
+1
+7
+
+statement ok
+COMMIT
+
+statement error 42P01
+SELECT v FROM y
+
+statement error 42P01
+SELECT nextval('y_id_seq')
+
+statement ok
+CREATE TEMP TABLE y_v (a i32)
+
+statement ok
+DROP TABLE y_v
+
+# a rolled-back CREATE leaves nothing behind
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE y (a i32) ON COMMIT DROP
+
+statement ok
+ROLLBACK
+
+statement error 42P01
+SELECT a FROM y
+
+# the action belongs to the table, so it survives a rename
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE y (a i32) ON COMMIT DROP
+
+statement ok
+ALTER TABLE y RENAME TO z
+
+statement ok
+INSERT INTO z VALUES (1)
+
+statement ok
+COMMIT
+
+statement error 42P01
+SELECT a FROM z
+
+# an explicit DROP before COMMIT is fine
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE y (a i32) ON COMMIT DROP
+
+statement ok
+DROP TABLE y
+
+statement ok
+COMMIT
+
+statement error 42P01
+SELECT a FROM y
+
+# the `temp.` qualifier names a temporary table
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE temp.w (a i32) ON COMMIT DROP
+
+statement ok
+INSERT INTO w VALUES (1)
+
+statement ok
+COMMIT
+
+statement error 42P01
+SELECT a FROM w
+
+# an IF NOT EXISTS no-op keeps the existing table's own action (keep preserves rows)
+statement ok
+CREATE TEMP TABLE IF NOT EXISTS keep (a i32) ON COMMIT DROP
+
+query I rowsort
+SELECT a FROM keep
+----
+1
+2
+3

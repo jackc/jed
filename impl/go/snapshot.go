@@ -1034,6 +1034,55 @@ func (s *snapshot) removeTable(key string) {
 	delete(s.estimatorRevisions, key)
 }
 
+// applyOnCommitActions runs the temporary tables' ON COMMIT actions on a committing transaction's
+// working temp snapshot (spec/design/temp-tables.md §5.1): each DELETE ROWS table is emptied, then each
+// DROP table is dropped as DROP TABLE drops it — with its indexes and the sequences it owns
+// (PostgreSQL's truncate-then-drop order). The actions touch disjoint tables, so the map's visiting
+// order cannot change the result. Reports whether anything changed.
+func (s *snapshot) applyOnCommitActions() bool {
+	changed := false
+	var drops []string
+	for name, t := range s.tables {
+		switch t.OnCommit {
+		case onCommitDeleteRows:
+			if s.truncateTable(t) {
+				changed = true
+			}
+		case onCommitDrop:
+			drops = append(drops, name)
+		}
+	}
+	for _, name := range drops {
+		for _, sk := range s.sequencesOwnedBy(name) {
+			s.removeSequence(sk)
+		}
+		s.removeTable(name)
+		changed = true
+	}
+	return changed
+}
+
+// truncateTable empties a table's rows and every index's entries, keeping its definition (ON COMMIT
+// DELETE ROWS, temp-tables.md §5.1); its statistics stay, marked stale as after any write. A table
+// that is already empty is left untouched, so reports false.
+func (s *snapshot) truncateTable(t *catTable) bool {
+	empty := s.stores[t.Name].treeRoot() == nil
+	for _, ix := range t.Indexes {
+		if s.indexStores[ix.Name].treeRoot() != nil {
+			empty = false
+		}
+	}
+	if empty {
+		return false
+	}
+	s.stores[t.Name] = s.stores[t.Name].truncated()
+	for _, ix := range t.Indexes {
+		s.indexStores[ix.Name] = s.indexStores[ix.Name].truncated()
+	}
+	s.markStatisticsStale(t.Name)
+	return true
+}
+
 // indexStore returns a secondary index's store (the index is known to exist). nameKey is
 // the exact index name.
 func (s *snapshot) indexStore(nameKey string) *tableStore { return s.indexStores[nameKey] }

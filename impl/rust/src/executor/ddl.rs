@@ -562,6 +562,15 @@ impl Engine {
                 rows_affected: None,
             });
         }
+        // ON COMMIT belongs to temporary tables only — any clause, PRESERVE ROWS included, on a
+        // persistent or attached table is 42P16, checked after the IF NOT EXISTS skip and before any
+        // column work (PostgreSQL's DefineRelation order; temp-tables.md §5.1).
+        if ct.on_commit.is_some() && !target_temp {
+            return Err(EngineError::new(
+                SqlState::InvalidTableDefinition,
+                "ON COMMIT can only be used on temporary tables",
+            ));
+        }
         if target_temp && !ct.excludes.is_empty() {
             // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred
             // with the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000
@@ -1061,6 +1070,8 @@ impl Engine {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
+            // A temp table's end-of-transaction action (42P16 above for any other) — temp-tables.md §5.1.
+            on_commit: ct.on_commit.unwrap_or_default(),
         };
         let mut check_deps: Vec<Vec<HostFuncDep>> = Vec::with_capacity(ct.checks.len());
         for def in &ct.checks {
@@ -1968,6 +1979,7 @@ impl Engine {
                                 indexes: Vec::new(),
                                 foreign_keys: Vec::new(),
                                 exclusions: Vec::new(),
+                                on_commit: crate::catalog::OnCommit::PreserveRows,
                             })?
                             .pop()
                             .unwrap();
@@ -2888,6 +2900,7 @@ impl Engine {
                                     indexes: Vec::new(),
                                     foreign_keys: Vec::new(),
                                     exclusions: Vec::new(),
+                                    on_commit: crate::catalog::OnCommit::PreserveRows,
                                 };
                                 let default_cast = Expr::Cast {
                                     inner: Box::new(Expr::Column(

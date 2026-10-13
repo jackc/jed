@@ -196,6 +196,10 @@ pub struct CreateTable {
     /// (the implicit scope: temp if `temp`, else main). Creating INTO an attachment routes the new
     /// table into that attachment's working snapshot at execution (attached-databases.md §6).
     pub db: Option<String>,
+    /// The trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` clause
+    /// (spec/design/temp-tables.md §5.1), `None` when absent. Any clause — `PRESERVE ROWS` included —
+    /// on a table that is not temporary is 42P16 at execution (PostgreSQL's `ONCOMMIT_NOOP`).
+    pub on_commit: Option<crate::catalog::OnCommit>,
 }
 
 /// A referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md §6.6).

@@ -803,6 +803,46 @@ export class Snapshot {
     this.estimatorRevisions.delete(key);
   }
 
+  // applyOnCommitActions runs the temporary tables' ON COMMIT actions on a committing transaction's
+  // working temp snapshot (spec/design/temp-tables.md §5.1): each DELETE ROWS table is emptied, then
+  // each DROP table is dropped as DROP TABLE drops it — with its indexes and the sequences it owns
+  // (PostgreSQL's truncate-then-drop order). The actions touch disjoint tables, so the map's visiting
+  // order cannot change the result. Reports whether anything changed.
+  applyOnCommitActions(): boolean {
+    let changed = false;
+    const drops: string[] = [];
+    for (const [name, t] of this.tables) {
+      if (t.onCommit === "deleteRows") {
+        if (this.truncateTable(t)) changed = true;
+      } else if (t.onCommit === "drop") {
+        drops.push(name);
+      }
+    }
+    for (const name of drops) {
+      for (const sk of this.sequencesOwnedBy(name)) this.removeSequence(sk);
+      this.removeTable(name);
+      changed = true;
+    }
+    return changed;
+  }
+
+  // truncateTable empties a table's rows and every index's entries, keeping its definition (ON COMMIT
+  // DELETE ROWS, temp-tables.md §5.1); its statistics stay, marked stale as after any write. A table
+  // that is already empty is left untouched, so reports false.
+  private truncateTable(t: Table): boolean {
+    let empty = this.stores.get(t.name)!.treeRoot() === null;
+    for (const ix of t.indexes) {
+      if (this.indexStores.get(ix.name)!.treeRoot() !== null) empty = false;
+    }
+    if (empty) return false;
+    this.stores.set(t.name, this.stores.get(t.name)!.truncated());
+    for (const ix of t.indexes) {
+      this.indexStores.set(ix.name, this.indexStores.get(ix.name)!.truncated());
+    }
+    this.markStatisticsStale(t.name);
+    return true;
+  }
+
   // indexStore returns a secondary index's store (the index is known to exist). nameKey
   // is the exact index name.
   indexStore(nameKey: string): TableStore {

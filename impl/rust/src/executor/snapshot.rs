@@ -850,6 +850,63 @@ impl Snapshot {
         std::sync::Arc::make_mut(&mut self.statistics).remove(key);
     }
 
+    /// Run the temporary tables' `ON COMMIT` actions on a committing transaction's working temp
+    /// snapshot (spec/design/temp-tables.md §5.1): each `DELETE ROWS` table is emptied, then each
+    /// `DROP` table is dropped as `DROP TABLE` drops it — with its indexes and the sequences it owns
+    /// (PostgreSQL's truncate-then-drop order). The actions touch disjoint tables, so the map's
+    /// visiting order cannot change the result. Reports whether anything changed.
+    pub(crate) fn apply_on_commit_actions(&mut self) -> bool {
+        let mut truncates = Vec::new();
+        let mut drops = Vec::new();
+        for (name, t) in self.tables.iter() {
+            match t.on_commit {
+                crate::catalog::OnCommit::PreserveRows => {}
+                crate::catalog::OnCommit::DeleteRows => truncates.push(name.clone()),
+                crate::catalog::OnCommit::Drop => drops.push(name.clone()),
+            }
+        }
+        let mut changed = false;
+        for name in &truncates {
+            changed |= self.truncate_table(name);
+        }
+        for name in &drops {
+            for sk in self.sequences_owned_by(name) {
+                self.remove_sequence(&sk);
+            }
+            self.remove_table(name);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Empty a table's rows and every index's entries, keeping its definition (`ON COMMIT DELETE
+    /// ROWS`, temp-tables.md §5.1); its statistics stay, marked stale as after any write. A table that
+    /// is already empty is left untouched, so reports false.
+    fn truncate_table(&mut self, name: &str) -> bool {
+        let index_names: Vec<String> = self.tables[name]
+            .indexes
+            .iter()
+            .map(|ix| ix.name.clone())
+            .collect();
+        let empty = self.stores[name].tree_root().is_none()
+            && index_names
+                .iter()
+                .all(|ix| self.index_stores[ix].tree_root().is_none());
+        if empty {
+            return false;
+        }
+        let stores = std::sync::Arc::make_mut(&mut self.stores);
+        let store = stores.get_mut(name).expect("a table has a store");
+        *store = store.truncated();
+        let index_stores = std::sync::Arc::make_mut(&mut self.index_stores);
+        for ix in &index_names {
+            let store = index_stores.get_mut(ix).expect("an index has a store");
+            *store = store.truncated();
+        }
+        self.mark_statistics_stale(name);
+        true
+    }
+
     /// The store of a secondary index (panics if absent — callers resolve the index first).
     pub(crate) fn index_store(&self, name_key: &str) -> &TableStore {
         self.index_stores

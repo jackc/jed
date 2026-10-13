@@ -219,6 +219,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // (spec/design/temp-tables.md §8). The capability gate is session.allow_temp_ddl; the storage budget
     // is resource.temp_budget.
     "ddl.temp_table",
+    "ddl.temp_on_commit",
     // CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write
     // and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
     "ddl.secondary_index",

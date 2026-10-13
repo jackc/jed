@@ -58,6 +58,13 @@ func (s *tableStore) clone() *tableStore {
 
 func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneration() }
 
+// truncated returns an empty store with this store's shape and paging — the commit-time emptying of
+// an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
+// carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
+func (s *tableStore) truncated() *tableStore {
+	return &tableStore{nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging}
+}
+
 // attachPaging attaches this database's shared paging context (the demand-paged file load, format.go):
 // the store's OnDisk leaves now fault through the pool. One pool per database, shared by every store
 // and snapshot.

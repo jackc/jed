@@ -204,6 +204,10 @@ type createTable struct {
 	// implicit scope: temp if Temp, else main). Creating INTO an attachment routes putTable at
 	// execution into that attachment's working snapshot (attached-databases.md §6).
 	DB *string
+	// OnCommit is the trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` clause
+	// (spec/design/temp-tables.md §5.1), nil when absent. Any clause — PRESERVE ROWS included — on a
+	// table that is not temporary is 42P16 at execution (PostgreSQL's ONCOMMIT_NOOP distinction).
+	OnCommit *onCommitAction
 }
 
 // ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional

@@ -930,6 +930,13 @@ impl Engine {
                 rows_affected: None,
             });
         }
+        // The temp tables' ON COMMIT actions (temp-tables.md §5.1) — DELETE ROWS empties, DROP drops —
+        // apply to the working temp snapshot first, so they commit (or are discarded) atomically with
+        // the rest of the transaction and the refinement, budget precheck, and staging below all see
+        // their result.
+        if tx.temp_working.apply_on_commit_actions() {
+            tx.temp_dirty = true;
+        }
         // Writable-store access alone does not prove a mutation (transactions.md §2.1). Refine before
         // the budget precheck and the durable-writer count, so an unchanged domain is neither checked
         // nor persisted.

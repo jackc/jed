@@ -62,6 +62,7 @@ import type {
 } from "./ast.ts";
 import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
+import type { OnCommitAction } from "./catalog.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { lex, lexWithPositions } from "./lexer.ts";
 import type { Token, TokenKind } from "./token.ts";
@@ -902,6 +903,7 @@ class Parser {
     if (columns.length === 0) {
       throw engineError("syntax_error", "a table must have at least one column");
     }
+    const onCommit = this.parseOnCommit();
     return {
       kind: "createTable",
       name,
@@ -914,7 +916,37 @@ class Parser {
       uniques,
       fks,
       excludes,
+      ...(onCommit === undefined ? {} : { onCommit }),
     };
+  }
+
+  // parseOnCommit parses the optional trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` of a
+  // CREATE TABLE (grammar.ebnf `on_commit`, spec/design/temp-tables.md §5.1), undefined when absent.
+  // The words are recognized positionally after the closing parenthesis, so none is reserved.
+  private parseOnCommit(): OnCommitAction | undefined {
+    if (this.peekKeyword() !== "on") return undefined;
+    this.advance();
+    this.expectKeyword("commit");
+    let action: OnCommitAction;
+    switch (this.peekKeyword()) {
+      case "preserve":
+        action = "preserveRows";
+        break;
+      case "delete":
+        action = "deleteRows";
+        break;
+      case "drop":
+        this.advance();
+        return "drop";
+      default:
+        throw engineError(
+          "syntax_error",
+          "expected PRESERVE ROWS, DELETE ROWS, or DROP after ON COMMIT",
+        );
+    }
+    this.advance();
+    this.expectKeyword("rows");
+    return action;
   }
 
   // atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:

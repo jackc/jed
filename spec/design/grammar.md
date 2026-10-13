@@ -652,6 +652,15 @@ with a persistent `p` is a **no-op**, where PostgreSQL would create a `pg_temp` 
 are recognized by a **two-token lookahead** (`IF NOT`), so `CREATE TABLE if (...)` still creates a
 table named `if`.
 
+**`CREATE TEMP TABLE … ON COMMIT`.** An optional `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }`
+after the closing parenthesis picks a temporary table's end-of-transaction action
+([temp-tables.md](temp-tables.md) §5.1): keep it (the default), empty it at every commit, or drop it
+when its creating transaction commits. As in PostgreSQL, any `ON COMMIT` clause on a table that is
+not temporary — `PRESERVE ROWS` included, and a `main.`- or attachment-qualified table — is `42P16`
+*"ON COMMIT can only be used on temporary tables"*, checked after the `IF NOT EXISTS` skip and
+before any column or constraint work. The words are recognized positionally after `)`, so none
+becomes reserved; anything else there is `42601`.
+
 **Multi-table drop.** `DROP TABLE a, b, c` removes several tables in one statement. It is
 **two-phase / all-or-nothing** (the discipline §12 uses for multi-row work): every name is
 resolved and validated *first* — a missing one is `42P01` (unless `IF EXISTS`, which skips

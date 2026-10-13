@@ -117,8 +117,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     deliberately out of scope, `0A000` (alter.md §6).
 - [x] **Temporary tables** — session-local temp relations with zero writes to the database file,
   each domain a per-session `MemoryBlockStore` + pager with within-session compaction; CREATE/DROP
-  INDEX, serial/IDENTITY, composite columns; `allow_temp_ddl`; the `max_temp_storage_bytes` `54P03`
-  ceiling over the domain's page bytes. **Spill-to-disk (slice 3) landed:** past `temp_buffers` (the
+  INDEX, serial/IDENTITY, composite columns; `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }`;
+  `allow_temp_ddl`; the `max_temp_storage_bytes` `54P03` ceiling over the domain's page bytes. **Spill-to-disk (slice 3) landed:** past `temp_buffers` (the
   resident budget) a file host migrates the domain into an unlinked scratch file in its spill directory
   with a page cache bounded by `temp_buffers` — residency only, results/cost/`54P03`-neutral, run over
   the whole temp corpus by `mise run conformance:spill`. (The database-wide `SHARED` kind was removed
@@ -126,7 +126,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   → [temp-tables.md](spec/design/temp-tables.md)
   - [ ] _follow-on:_ a host-configurable spill directory (shared with the external sort) so WASI/OPFS
     hosts can offer a temp spill target; migrating a shrunken spilled domain back into RAM.
-  - [ ] _follow-on:_ `ON COMMIT DELETE ROWS`/`DROP`; `CREATE TEMP TABLE … AS SELECT`; FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
+  - [ ] _follow-on:_ `CREATE TEMP TABLE … AS SELECT`; FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
 - [x] **Views** (`CREATE [OR REPLACE] VIEW` / `ALTER VIEW … RENAME` / `DROP VIEW`, writes through
   updatable views) — a named persisted query read as the equivalent derived table (identical rows,
   cost, plan);

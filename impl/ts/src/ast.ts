@@ -10,6 +10,7 @@
 // is expression-only this slice (it cannot be stored).
 import type { Decimal } from "./decimal.ts";
 import type { FkKeyedTarget } from "./executor.ts";
+import type { OnCommitAction } from "./catalog.ts";
 
 export type Literal =
   | { kind: "null" }
@@ -540,6 +541,10 @@ export type CreateTable = {
   // element (42703/42701/42704/0A000), builds the backing multi-column GiST index, and names the
   // unnamed ones (42P07/42710).
   excludes: ExcludeDef[];
+  // The trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` clause
+  // (spec/design/temp-tables.md §5.1), undefined when absent. Any clause — PRESERVE ROWS included — on
+  // a table that is not temporary is 42P16 at execution (PostgreSQL's ONCOMMIT_NOOP distinction).
+  onCommit?: OnCommitAction;
 };
 
 // ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional

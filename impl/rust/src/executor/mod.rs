@@ -4463,6 +4463,7 @@ fn cte_synthetic_table_cols(
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
+        on_commit: crate::catalog::OnCommit::PreserveRows,
     }))
 }
 
@@ -4950,6 +4951,7 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
+            on_commit: crate::catalog::OnCommit::PreserveRows,
         })
     };
     match kind {
@@ -5106,6 +5108,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
+        on_commit: crate::catalog::OnCommit::PreserveRows,
     })
 }
 
@@ -5694,6 +5697,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
+        on_commit: crate::catalog::OnCommit::PreserveRows,
     })
 }
 

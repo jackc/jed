@@ -45,6 +45,7 @@ var SupportedCapabilities = []string{
 	// Collated columns and FK on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
 	// session.allow_temp_ddl; storage budget resource.temp_budget.
 	"ddl.temp_table",
+	"ddl.temp_on_commit",
 	// CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write
 	// and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
 	"ddl.secondary_index",

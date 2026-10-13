@@ -396,6 +396,7 @@ impl Engine {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
+            on_commit: crate::catalog::OnCommit::PreserveRows,
         });
         Ok((table, vec![rarg], SrfKind::JsonRecord { jsonb, set }))
     }
@@ -484,6 +485,7 @@ impl Engine {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
+            on_commit: crate::catalog::OnCommit::PreserveRows,
         });
         // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
         Ok((table, vec![doc], SrfKind::JsonRecord { jsonb, set }))
@@ -568,6 +570,7 @@ impl Engine {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
+            on_commit: crate::catalog::OnCommit::PreserveRows,
         });
         Ok((
             table,

@@ -547,6 +547,20 @@ pub struct Table {
     /// on-disk order — spec/design/gist.md §7/§8). Each is backed by a GiST index in `indexes`.
     /// Empty for a table with none.
     pub exclusions: Vec<ExclusionConstraint>,
+    /// A temporary table's end-of-transaction action (spec/design/temp-tables.md §5.1). Always
+    /// [`OnCommit::PreserveRows`] for a persistent or attached table; never serialized (temp catalog
+    /// entries never reach a file).
+    pub on_commit: OnCommit,
+}
+
+/// What a commit does to a temporary table (spec/design/temp-tables.md §5.1): keep it (the default),
+/// empty it, or drop it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OnCommit {
+    #[default]
+    PreserveRows,
+    DeleteRows,
+    Drop,
 }
 
 /// A fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar, or a

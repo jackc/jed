@@ -118,7 +118,21 @@ type catTable struct {
 	// catalog's on-disk order — spec/design/gist.md §7/§8). Each is backed by a GiST index in
 	// Indexes. Empty for a table with none.
 	Exclusions []exclusionConstraint
+	// OnCommit is a temporary table's end-of-transaction action (spec/design/temp-tables.md §5.1).
+	// Always onCommitPreserveRows for a persistent or attached table; never serialized (temp catalog
+	// entries never reach a file).
+	OnCommit onCommitAction
 }
+
+// onCommitAction is what a commit does to a temporary table (spec/design/temp-tables.md §5.1):
+// keep it (the default), empty it, or drop it.
+type onCommitAction uint8
+
+const (
+	onCommitPreserveRows onCommitAction = iota
+	onCommitDeleteRows
+	onCommitDrop
+)
 
 // ExclusionOp is one element's operator in an EXCLUDE constraint (spec/design/gist.md §7) — the
 // WITH operator of a (column WITH op) pair. ExclOverlaps is && (a range column, range_ops);

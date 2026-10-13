@@ -105,6 +105,13 @@ export class TableStore {
     return store;
   }
 
+  // truncated returns an empty store with this store's shape and paging — the commit-time emptying of
+  // an ON COMMIT DELETE ROWS temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter
+  // carries over (it is monotonic, never reused); nothing is staged, since nothing is written.
+  truncated(): TableStore {
+    return new TableStore(this.cap, this.colTypes, new PMap(), this.nextRowid, this.paging);
+  }
+
   // stagedBytes is the stored bytes written since this store was last published (memory.md §7).
   stagedBytes(): number {
     return this.staged;

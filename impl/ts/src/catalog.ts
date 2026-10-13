@@ -102,7 +102,15 @@ export type Table = {
   // order — spec/design/gist.md §7/§8). Each is backed by a GiST index in `indexes`. Empty for a
   // table with none.
   exclusions: ExclusionConstraint[];
+  // onCommit is a temporary table's end-of-transaction action (spec/design/temp-tables.md §5.1);
+  // absent means "preserveRows", always the case for a persistent or attached table. Never serialized
+  // (temp catalog entries never reach a file).
+  onCommit?: OnCommitAction;
 };
+
+// OnCommitAction is what a commit does to a temporary table (spec/design/temp-tables.md §5.1): keep
+// it (the default), empty it, or drop it.
+export type OnCommitAction = "preserveRows" | "deleteRows" | "drop";
 
 // ExclusionOp is one element's operator in an EXCLUDE constraint (spec/design/gist.md §7) — the WITH
 // operator of a (column WITH op) pair. "overlaps" is && (a range column, range_ops); "equal" is = (a

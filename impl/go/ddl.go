@@ -481,6 +481,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	if ct.IfNotExists && db.createTableNameTaken(ct.Name, attachName) {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
+	// ON COMMIT belongs to temporary tables only — any clause, PRESERVE ROWS included, on a persistent
+	// or attached table is 42P16, checked after the IF NOT EXISTS skip and before any column work
+	// (PostgreSQL's DefineRelation order; temp-tables.md §5.1).
+	if ct.OnCommit != nil && !targetTemp {
+		return outcome{}, newError(InvalidTableDefinition, "ON COMMIT can only be used on temporary tables")
+	}
 	if targetTemp && len(ct.Excludes) > 0 {
 		// An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
 		// the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
@@ -869,6 +875,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// before a 42710 between earlier ones. Resolution needs a catalog *Table, so build it
 	// now (checks attach below, before putTable).
 	table := &catTable{Name: ct.Name, Columns: columns, PK: pk}
+	if ct.OnCommit != nil {
+		table.OnCommit = *ct.OnCommit // a temp table (42P16 above otherwise) — temp-tables.md §5.1
+	}
 	checkDeps := make([][]hostFuncDep, len(ct.Checks))
 	for i := range ct.Checks {
 		def := &ct.Checks[i]

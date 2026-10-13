@@ -3068,6 +3068,11 @@ export class Engine {
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     const working = tx.working;
+    // The temp tables' ON COMMIT actions (temp-tables.md §5.1) — DELETE ROWS empties, DROP drops —
+    // apply to the working temp snapshot first, so they commit (or are discarded) atomically with the
+    // rest of the transaction and the refinement, budget precheck, and staging below all see their
+    // result.
+    if (tx.tempWorking.applyOnCommitActions()) tx.tempDirty = true;
     // A requested writable store need not have been mutated (transactions.md §2.1). Refine before the
     // budget precheck and the durable-writer count, so an unchanged domain is neither checked nor
     // persisted.
@@ -5631,6 +5636,15 @@ export class Engine {
     if (ct.ifNotExists && this.createTableNameTaken(ct.name, attachName)) {
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
+    // ON COMMIT belongs to temporary tables only — any clause, PRESERVE ROWS included, on a persistent
+    // or attached table is 42P16, checked after the IF NOT EXISTS skip and before any column work
+    // (PostgreSQL's DefineRelation order; temp-tables.md §5.1).
+    if (ct.onCommit !== undefined && !targetTemp) {
+      throw engineError(
+        "invalid_table_definition",
+        "ON COMMIT can only be used on temporary tables",
+      );
+    }
     if (targetTemp && ct.excludes.length > 0) {
       // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
       // the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
@@ -6053,6 +6067,8 @@ export class Engine {
       indexes: [],
       fks: [],
       exclusions: [],
+      // A temp table's end-of-transaction action (42P16 above for any other) — temp-tables.md §5.1.
+      ...(ct.onCommit === undefined ? {} : { onCommit: ct.onCommit }),
     };
     const checkDeps: (HostFuncDep[] | undefined)[] = [];
     for (const def of ct.checks) {

@@ -180,6 +180,21 @@ impl TableStore {
         }
     }
 
+    /// An empty store with this store's shape and paging — the commit-time emptying of an `ON COMMIT
+    /// DELETE ROWS` temp table (spec/design/temp-tables.md §5.1). The synthetic rowid counter carries
+    /// over (it is monotonic, never reused); nothing is staged, since nothing is written.
+    pub(crate) fn truncated(&self) -> TableStore {
+        TableStore {
+            rows: PMap::new(),
+            next_rowid: self.next_rowid,
+            cap: self.cap,
+            col_types: self.col_types.clone(),
+            shape: self.shape,
+            paging: self.paging.clone(),
+            staged: 0,
+        }
+    }
+
     /// Attach this database's shared paging context (the demand-paged file load, format.rs): the
     /// store's `OnDisk` leaves now fault through the pool. One pool per database, shared by every
     /// store and snapshot.

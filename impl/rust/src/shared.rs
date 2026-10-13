@@ -3990,6 +3990,132 @@ mod temp_reclaim_internal_tests {
         }
         let _ = std::fs::remove_file(&path);
     }
+
+    // CREATE TEMP TABLE … ON COMMIT (spec/design/temp-tables.md §5.1): the SQL-visible behavior is the
+    // corpus's (ddl/temp_on_commit.test); these cover the host transaction and prepared-statement
+    // surfaces, the zero-main-file-write invariant, and the footprint under max_temp_storage_bytes.
+    // Mirrors the Go temp_on_commit_test.go and the TS temp_on_commit test.
+
+    #[test]
+    fn temp_on_commit_host_transaction() {
+        let db = Database::create(CreateOptions::default()).unwrap();
+        let mut sess = db.session(SessionOptions::default());
+        sess.query_outcome(
+            "CREATE TEMP TABLE d (id i32 PRIMARY KEY) ON COMMIT DELETE ROWS",
+            &[],
+        )
+        .unwrap();
+        // A Session::update closure commits through the same path as SQL COMMIT.
+        sess.update(|tx| {
+            tx.execute("INSERT INTO d VALUES (1), (2)", &[])?;
+            assert_eq!(tx.query("SELECT id FROM d", &[])?.count(), 2);
+            tx.execute("CREATE TEMP TABLE x (a i32) ON COMMIT DROP", &[])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows(&mut sess, "SELECT id FROM d").len(), 0);
+        let err = sess.query_outcome("SELECT a FROM x", &[]).unwrap_err();
+        assert_eq!(err.code(), "42P01");
+
+        // A prepared SELECT over an ON COMMIT DROP table re-resolves after the commit drops it (temp
+        // relations are never plan-cached).
+        sess.query_outcome("BEGIN", &[]).unwrap();
+        sess.query_outcome("CREATE TEMP TABLE y (a i32) ON COMMIT DROP", &[])
+            .unwrap();
+        sess.query_outcome("INSERT INTO y VALUES (7)", &[]).unwrap();
+        let sel = sess.prepare("SELECT a FROM y").unwrap();
+        assert_eq!(sess.query_prepared(&sel, &[]).unwrap().count(), 1);
+        sess.query_outcome("COMMIT", &[]).unwrap();
+        match sess.query_prepared(&sel, &[]) {
+            Err(e) => assert_eq!(e.code(), "42P01"),
+            Ok(_) => panic!("prepared SELECT after the drop should be 42P01"),
+        }
+    }
+
+    #[test]
+    fn temp_on_commit_makes_zero_file_writes() {
+        // The commit-time truncate and drop touch only the temp domain (temp-tables.md §2 D1).
+        let path = std::env::temp_dir().join("jed_temp_on_commit_zerofile.jed");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Engine::create(
+            &path,
+            DatabaseOptions {
+                page_size: 256,
+                no_sync: false,
+            },
+        )
+        .unwrap();
+        crate::execute(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY)").unwrap();
+        let base_txid = db.txid();
+        let base_pages = db.page_count();
+
+        crate::execute(
+            &mut db,
+            "CREATE TEMP TABLE d (id i32 PRIMARY KEY, pad text) ON COMMIT DELETE ROWS",
+        )
+        .unwrap();
+        let pad = "q".repeat(40);
+        for i in 1..=20 {
+            crate::execute(&mut db, &format!("INSERT INTO d VALUES ({i}, '{pad}')")).unwrap();
+        }
+        crate::execute(
+            &mut db,
+            "CREATE TEMP TABLE x (a serial PRIMARY KEY) ON COMMIT DROP",
+        )
+        .unwrap();
+        for sql in [
+            "BEGIN",
+            "CREATE TEMP TABLE y (a i32) ON COMMIT DROP",
+            "INSERT INTO y VALUES (1)",
+            "INSERT INTO d VALUES (1, 'x')",
+            "COMMIT",
+        ] {
+            crate::execute(&mut db, sql).unwrap();
+        }
+        assert_eq!(
+            db.txid(),
+            base_txid,
+            "ON COMMIT actions advanced the file txid"
+        );
+        assert_eq!(
+            db.page_count(),
+            base_pages,
+            "ON COMMIT actions grew the file high-water",
+        );
+        match crate::execute(&mut db, "SELECT id FROM d").unwrap() {
+            Outcome::Query { rows, .. } => assert_eq!(rows.len(), 0),
+            other => panic!("expected a query, got {other:?}"),
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn temp_on_commit_delete_rows_stays_under_budget() {
+        // Rows written to an ON COMMIT DELETE ROWS table count against max_temp_storage_bytes only until
+        // their commit empties the table; compaction reclaims the freed pages, so many autocommit inserts
+        // never reach the ceiling the same inserts into an ordinary temp table cross
+        // (multi_leaf_temp_past_page_budget_aborts_54p03).
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut opts = SessionOptions::default();
+        opts.max_temp_storage_bytes = 20 * 256;
+        let mut sess = db.session(opts);
+        sess.query_outcome(
+            "CREATE TEMP TABLE d (id i32 PRIMARY KEY, pad text) ON COMMIT DELETE ROWS",
+            &[],
+        )
+        .unwrap();
+        let pad = "z".repeat(40);
+        for i in 1..=400 {
+            sess.query_outcome(&format!("INSERT INTO d VALUES ({i}, 'r-{pad}')"), &[])
+                .unwrap();
+        }
+        assert_eq!(rows(&mut sess, "SELECT id FROM d").len(), 0);
+    }
 }
 
 #[cfg(test)]

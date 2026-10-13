@@ -65,6 +65,31 @@ still an ordinary persistent table:
 CREATE TABLE temp (id i32 PRIMARY KEY);     -- a persistent table called "temp"
 ```
 
+## End-of-transaction behavior (`ON COMMIT`)
+
+An optional `ON COMMIT` clause after the column list chooses what happens to a temp table each time
+a transaction commits, exactly as in PostgreSQL:
+
+- `ON COMMIT PRESERVE ROWS` — the default: nothing happens.
+- `ON COMMIT DELETE ROWS` — every commit empties the table (its rows and index entries). The table
+  itself stays, and an auto-numbered column keeps counting from where it was.
+- `ON COMMIT DROP` — the table, its indexes, and its auto-numbered sequences are dropped when the
+  transaction that created it commits.
+
+```sql
+BEGIN;
+CREATE TEMP TABLE batch (id i32 PRIMARY KEY, n i32) ON COMMIT DROP;
+INSERT INTO batch VALUES (1, 10), (2, 20);
+SELECT sum(n) FROM batch;   -- 30
+COMMIT;                     -- batch is gone
+```
+
+Outside a `BEGIN … COMMIT` block every statement commits on its own, so an `ON COMMIT DELETE ROWS`
+table is emptied right after each statement (only that statement's own `RETURNING` rows see what it
+wrote), and an `ON COMMIT DROP` table disappears as soon as its `CREATE` finishes. `ROLLBACK`
+discards a transaction's changes as usual, so no action runs. `ON COMMIT` is only for temporary
+tables; on any other table it is error `42P16`.
+
 ## Bounded storage
 
 Temp tables retain rows across statements, which the per-statement cost ceiling does not bound — so

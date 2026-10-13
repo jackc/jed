@@ -743,6 +743,7 @@ impl Parser {
         if columns.is_empty() {
             return Err(syntax("a table must have at least one column"));
         }
+        let on_commit = self.parse_on_commit()?;
         Ok(CreateTable {
             name,
             temp,
@@ -754,7 +755,36 @@ impl Parser {
             foreign_keys,
             excludes,
             db,
+            on_commit,
         })
+    }
+
+    /// Parse the optional trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` of a CREATE TABLE
+    /// (grammar.ebnf `on_commit`, spec/design/temp-tables.md §5.1), `None` when absent. The words are
+    /// recognized positionally after the closing parenthesis, so none is reserved.
+    fn parse_on_commit(&mut self) -> Result<Option<crate::catalog::OnCommit>> {
+        use crate::catalog::OnCommit;
+        if self.peek_keyword().as_deref() != Some("on") {
+            return Ok(None);
+        }
+        self.advance();
+        self.expect_keyword("commit")?;
+        let action = match self.peek_keyword().as_deref() {
+            Some("preserve") => OnCommit::PreserveRows,
+            Some("delete") => OnCommit::DeleteRows,
+            Some("drop") => {
+                self.advance();
+                return Ok(Some(OnCommit::Drop));
+            }
+            _ => {
+                return Err(syntax(
+                    "expected PRESERVE ROWS, DELETE ROWS, or DROP after ON COMMIT",
+                ));
+            }
+        };
+        self.advance();
+        self.expect_keyword("rows")?;
+        Ok(Some(action))
     }
 
     /// Whether the cursor sits on a table-level `EXCLUDE` constraint: the keyword `EXCLUDE`, or

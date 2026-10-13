@@ -201,6 +201,7 @@ impl Engine {
                         indexes: Vec::new(),
                         foreign_keys: Vec::new(),
                         exclusions: Vec::new(),
+                        on_commit: crate::catalog::OnCommit::PreserveRows,
                     });
                 }
                 synthetic.push(table);
@@ -1895,6 +1896,7 @@ fn one_column_table(name: &str, column: Column) -> Table {
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
+        on_commit: crate::catalog::OnCommit::PreserveRows,
     }
 }
 

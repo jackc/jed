@@ -18,7 +18,9 @@
 > `MemoryBlockStore` + pager with within-session free-list compaction, and its `54P03` ceiling is the
 > domain's committed **page** bytes (§6/§7). **Slice 3 (spill-to-disk) has landed:** past
 > `temp_buffers` a file host migrates the domain to a scratch file in its spill directory and bounds
-> the domain's page cache by `temp_buffers` (§6). This doc was written first, spec-first (CLAUDE.md §11).
+> the domain's page cache by `temp_buffers` (§6). **`ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }`
+> has landed** (§5.1), PostgreSQL's end-of-transaction actions. This doc was written first, spec-first
+> (CLAUDE.md §11).
 >
 > **A database-wide `SHARED` temp kind was designed and briefly shipped (former slice 2), then REMOVED**
 > — Slice 0 of the attached-databases plan (2026-07-03). Its `Database`-scoped, *in-process* sharing
@@ -39,12 +41,14 @@ overriding reason" rule.
 
 ```sql
 CREATE [ TEMP | TEMPORARY ] TABLE name ( table_element [, ...] )
+    [ ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } ]
 ```
 
 ```ebnf
 create_table   ::= "CREATE" table_scope? "TABLE" identifier
-                   "(" table_element ("," table_element)* ")"
+                   "(" table_element ("," table_element)* ")" on_commit?
 table_scope    ::= "TEMPORARY" | "TEMP"
+on_commit      ::= "ON" "COMMIT" ( "PRESERVE" "ROWS" | "DELETE" "ROWS" | "DROP" )
 ```
 
 - `TEMP`/`TEMPORARY` are synonyms (PG), **not reserved** (grammar.md §3), recognized **positionally**
@@ -57,10 +61,12 @@ table_scope    ::= "TEMPORARY" | "TEMP"
   - **session-local temp** — `CREATE [TEMP|TEMPORARY] TABLE` — private to the creating session.
 - `DROP TABLE name` drops a temp table exactly as it drops a persistent one (it resolves through
   the same namespace, §3). No grammar change for `DROP`.
-- **Deferred surface** (each simply absent from the grammar this slice, none foreclosed — §14):
-  `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` (default is **`PRESERVE ROWS`**, the only
-  behavior implemented — `DELETE ROWS`/`DROP` are `0A000`); and `CREATE TEMP TABLE … AS
-  SELECT` (CTAS does not exist yet for any table kind).
+- `ON COMMIT` chooses what happens to a temp table when a transaction commits (§5.1): `PRESERVE
+  ROWS` (the default) keeps it, `DELETE ROWS` empties it, `DROP` drops it. Writing any `ON COMMIT`
+  clause on a table that is not temporary, `PRESERVE ROWS` included, is **`42P16`** *"ON COMMIT can
+  only be used on temporary tables"* (PostgreSQL).
+- **Deferred surface** (absent from the grammar, not foreclosed — §14): `CREATE TEMP TABLE … AS
+  SELECT`.
 - `CREATE [TEMP|TEMPORARY] TABLE IF NOT EXISTS` is supported exactly as for a persistent table
   ([grammar.md](grammar.md) §13): a collision under the preclude-overlaps namespace (§3) — a temp
   name already taken by a temp **or** persistent relation — is a no-op success rather than `42P07`.
@@ -192,6 +198,62 @@ default-deny posture intact (an untrusted `{SELECT}`-only session has `allow_ddl
 off too until the host deliberately opts in) and relaxes the documented "one boolean" `allow_ddl`
 narrowing (session.md §5.3) only for temp tables. The gate is configured per record by the directives
 `# allow_ddl:` / `# allow_temp_ddl:` (§13).
+
+### 5.1 `ON COMMIT` — end-of-transaction actions
+
+`ON COMMIT` follows PostgreSQL (`PreCommit_on_commit_actions`). It records one of three actions on the
+temp table's (never-serialized) catalog entry:
+
+- **`PRESERVE ROWS`** (the default, and the only behavior before this slice) — nothing happens at
+  commit.
+- **`DELETE ROWS`** — every commit empties the table: its rows and every index's entries go. The
+  table, its constraints, and indexes stay; its `ANALYZE` statistics stay too, marked stale as after
+  any other write. Owned `serial`/IDENTITY sequences are **not** reset, as PostgreSQL's
+  commit-time truncation does not restart them; the no-PK synthetic rowid counter is not reset either
+  (it is internal and monotonic, §7 of transactions.md).
+- **`DROP`** — the commit drops the table exactly as `DROP TABLE` would: its indexes and the sequences
+  it owns go with it. PostgreSQL's drop is `CASCADE`, but no jed object can depend on a temp table
+  (temp FKs and views over temp relations are `0A000`), so the cascade removes nothing else.
+
+**When the actions run.** At every successful commit of a read-write transaction — `COMMIT`, an
+autocommit statement's implicit commit, a host `commit()`/`update` closure, and the implicit
+transaction around a script — the commit applies them to the transaction's working temp snapshot,
+**before** the temp domain stages (§6) and before any budget precheck, truncations first and then
+drops (PostgreSQL's order). The result is then committed like any other temp change, so the actions
+are atomic with the transaction: if the commit itself fails, the whole transaction is discarded
+(including the actions). A rolled-back or failed transaction (a failed block's `COMMIT` is a
+`ROLLBACK`) and a read-only transaction publish no temp changes, so they run no action — nothing they
+discard needs one.
+
+Two invariants follow, and they are all the observable behavior: **a committed temp state never holds
+an `ON COMMIT DROP` table, and an `ON COMMIT DELETE ROWS` table is always empty when a transaction
+starts.** So under autocommit, rows written to a `DELETE ROWS` table are visible only within the
+writing statement itself (its `RETURNING` rows, a writable CTE's readers), and a `CREATE TEMP TABLE
+… ON COMMIT DROP` is dropped as soon as its statement commits. Inside an explicit block both tables
+behave like ordinary temp tables until `COMMIT`. A `DROP`-table's action survives renames and other
+`ALTER TABLE` edits within its transaction, since it is part of the table's catalog entry.
+
+**Interactions.**
+
+- **Cost:** none. Commit is unmetered, and neither action reads a row, so a statement's cost is the
+  same whatever its target's `ON COMMIT` action.
+- **`max_temp_storage_bytes`:** the per-statement check (§7) runs before the commit, so rows written to
+  a `DELETE ROWS` table count against the ceiling for the statement that writes them, and in an
+  explicit block until `COMMIT`. The commit-time truncation or drop frees their pages, which the
+  within-session compaction (§6) reclaims; repeated autocommit writes to a `DELETE ROWS` table
+  therefore do not accumulate.
+- **Prepared statements:** temp relations are never plan-cached, so a statement prepared against an
+  `ON COMMIT DROP` table that has since been dropped fails `42P01` on its next execution, as after an
+  explicit `DROP TABLE`.
+- **`IF NOT EXISTS`:** a no-op create leaves the existing table's action unchanged.
+- **Ordering of `42P16`:** like PostgreSQL (`transformCreateStmt` checks existence before
+  `DefineRelation` checks `ON COMMIT`), the check runs after the `IF NOT EXISTS` skip and before any
+  column or constraint is examined. A `main.`- or attachment-qualified table is not temporary (`42P16`);
+  a `temp.`-qualified one is.
+- **Savepoints** do not exist in jed (transactions.md §11). If they land, an action must belong to
+  the subtransaction that created the table, as in PostgreSQL. Likewise, if FKs among temp tables land
+  (§14), a `DELETE ROWS` table that another table's FK references must follow PostgreSQL's
+  `heap_truncate_check_FKs` rule.
 
 ## 6. Storage model — a per-domain MemoryBlockStore that spills to a scratch file
 
@@ -411,7 +473,8 @@ bytes), the two firing independently, mirroring the depth-vs-cost independence i
 | `42P07` *(reuse)* | `CREATE [TEMP] TABLE` whose name collides with any relation in the creating scope (§3). |
 | `42P01` *(reuse)* | `DROP`/reference of a temp name that resolves to nothing (§3). |
 | `42501` *(reuse)* | temp DDL on a session without `allow_ddl` (§5). |
-| `0A000` *(reuse)* | deferred temp surface — `ON COMMIT DELETE ROWS`/`DROP`, FK touching a temp table (§1, §8). |
+| `0A000` *(reuse)* | deferred temp surface — FK touching a temp table (§8). |
+| `42P16` *(reuse)* | an `ON COMMIT` clause on a table that is not temporary (§1, §5.1). |
 | **`54P03`** *(new)* | `temp_storage_limit_exceeded` — the temp domain's page bytes (resident or spilled) exceeded `max_temp_storage_bytes` (§7). |
 | `58030` *(reuse)* | a scratch-file I/O failure while spilling or writing a spilled temp domain (§6); the transaction commits nothing. |
 
@@ -435,15 +498,13 @@ The code lands in [../errors/registry.toml](../errors/registry.toml) with slice 
   `temp_file_limit` over spilled file bytes (residency-dependent); jed adds a deterministic,
   host-configured ceiling over all temp pages, resident or spilled (§7). `temp_buffers` keeps PG's
   meaning (resident temp memory).
-- **D6 — `ON COMMIT PRESERVE ROWS` only (this slice).** `DELETE ROWS` / `DROP` are deferred `0A000`
-  (§1). Largely moot until cross-statement transactions are common (autocommit makes `ON COMMIT`
-  semantics rarely observable).
 
-*(Removed divergences: **D3** — a `SHARED` kind that shared *data* across sessions, unlike PG's
+*(Removed divergences: **D6** — `ON COMMIT PRESERVE ROWS` only; `DELETE ROWS` and `DROP` now follow
+PostgreSQL (§5.1). **D3** — a `SHARED` kind that shared *data* across sessions, unlike PG's
 per-session `GLOBAL TEMPORARY` — and **D5** — that shared kind being ephemeral / never recovered. Both
 described the database-wide shared temp table, removed in Slice 0 in favor of a `Database`-scoped
-in-memory attachment, [attached-databases.md](attached-databases.md) §6. The `D3`/`D5` numbers are
-retired, not reused.)*
+in-memory attachment, [attached-databases.md](attached-databases.md) §6. The `D3`/`D5`/`D6` numbers
+are retired, not reused.)*
 
 ## 13. Slicing (the build plan — TODO.md tracks it)
 
@@ -482,12 +543,16 @@ and memory-only per the design decision:
   results/cost/`54P03` neutrality of spilling (the corpus runs in-memory databases, which have no spill
   target). No `format_version` change.
 
+- **`ON COMMIT` slice (landed).** `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` (§5.1): the
+  grammar, `42P16` on a non-temporary table, and the commit-time truncate/drop applied to the working
+  temp snapshot before it stages. All three cores; no `format_version` change (temp catalog entries
+  are never serialized). Driven by a new `ddl.temp_on_commit` conformance capability.
+
 ## 14. Deferred / follow-ons (none foreclosed)
 
 - **Database-wide shared temp — removed, not a follow-on.** The former `SHARED` kind (slice 2) is
   retired (Slice 0, §13); a `Database`-scoped in-memory **attachment** is its replacement
   ([attached-databases.md](attached-databases.md) §6). Not deferred — deliberately not part of temp.
-- `ON COMMIT DELETE ROWS` / `ON COMMIT DROP` (§1, D6).
 - `CREATE TEMP TABLE … AS SELECT` (§1).
 - `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.
 - A host-configurable spill directory (shared with the external sort — spill.md), so a WASI or OPFS

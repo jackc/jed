@@ -197,6 +197,12 @@ func (db *engine) commitTx() (outcome, error) {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 	working := tx.working
+	// The temp tables' ON COMMIT actions (temp-tables.md §5.1) — DELETE ROWS empties, DROP drops — apply
+	// to the working temp snapshot first, so they commit (or are discarded) atomically with the rest of
+	// the transaction and the refinement, budget precheck, and staging below all see their result.
+	if tx.tempWorking.applyOnCommitActions() {
+		tx.tempDirty = true
+	}
 	// Write-store access is only a candidate mutation (transactions.md §2.1). Refine before the budget
 	// precheck and the durable-writer check, so an unchanged domain is neither checked nor persisted.
 	tx.mainDirty = tx.mainDirty && working.changedSince(db.committed)

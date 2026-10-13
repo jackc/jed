@@ -886,7 +886,42 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	if len(columns) == 0 {
 		return nil, newError(SyntaxError, "a table must have at least one column")
 	}
-	return &createTable{Name: name, Temp: temp, IfNotExists: ifNotExists, DB: dbQualifier, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
+	onCommit, err := p.parseOnCommit()
+	if err != nil {
+		return nil, err
+	}
+	return &createTable{Name: name, Temp: temp, IfNotExists: ifNotExists, DB: dbQualifier, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes, OnCommit: onCommit}, nil
+}
+
+// parseOnCommit parses the optional trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` of a
+// CREATE TABLE (grammar.ebnf `on_commit`, spec/design/temp-tables.md §5.1), returning nil when absent.
+// The words are recognized positionally after the closing parenthesis, so none is reserved.
+func (p *parser) parseOnCommit() (*onCommitAction, error) {
+	if p.peekKeyword() != "on" {
+		return nil, nil
+	}
+	p.advance()
+	if err := p.expectKeyword("commit"); err != nil {
+		return nil, err
+	}
+	var action onCommitAction
+	switch p.peekKeyword() {
+	case "preserve":
+		action = onCommitPreserveRows
+	case "delete":
+		action = onCommitDeleteRows
+	case "drop":
+		p.advance()
+		action = onCommitDrop
+		return &action, nil
+	default:
+		return nil, newError(SyntaxError, "expected PRESERVE ROWS, DELETE ROWS, or DROP after ON COMMIT")
+	}
+	p.advance()
+	if err := p.expectKeyword("rows"); err != nil {
+		return nil, err
+	}
+	return &action, nil
 }
 
 // atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:
