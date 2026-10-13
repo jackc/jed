@@ -48,6 +48,7 @@
 // itself (TS needs no Rust-style !Send split — single-threaded), so the same Database both drives the
 // single-handle path and mints additional sessions.
 
+import type { FileHost } from "./filehost.ts";
 import {
   type Attachment,
   type CollationInfo,
@@ -642,7 +643,7 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
   const capacity = old.capacity();
   let paging: SharedPaging;
   if (st.path !== null) {
-    paging = fileCompactor!(st.path, snap, st.pageSize, txid, old, capacity);
+    paging = fileCompactor!(st.fileHost, st.path, snap, st.pageSize, txid, old, capacity);
   } else {
     const image = toImageBytes(snap, st.pageSize, txid);
     paging = new SharedPaging(Pager.fromStore(new MemoryBlockStore(image)), capacity);
@@ -672,6 +673,7 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
 // Node host (file.ts) registers compactFile at load, so shared.ts stays browser-clean. null until a host
 // registers one; a file-backed storage cannot exist without file.ts, which registers it.
 type FileCompactor = (
+  files: FileHost | null,
   path: string,
   snap: Snapshot,
   pageSize: number,

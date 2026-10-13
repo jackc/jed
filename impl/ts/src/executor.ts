@@ -281,6 +281,7 @@ import {
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
 import type { ExtensionRegistry, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
+import type { FileHost } from "./filehost.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
   MAX_EXPR_DEPTH,
@@ -1709,6 +1710,9 @@ export class Engine {
   // import keeps the executor free of any node:* dependency (the Node `fs` impl lives in spillfile.ts),
   // so the engine runs in a browser bundle (the OPFS host).
   spillSink: SpillSink | null;
+  // fileHost is the file host a file database's compaction goes through (filehost.ts); null is the
+  // OS. Only the deterministic simulator sets another.
+  fileHost: FileHost | null;
   // reclaimWithinSession turns on within-session free-list compaction (persist.ts maybeCompact): the
   // never-reopened in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their
   // copy-on-write orphans are reclaimed rather than leaked. The main file/in-memory domain ALSO sets it
@@ -1815,6 +1819,7 @@ export class Engine {
     this.paging = null;
     this.readOnly = false;
     this.spillSink = null;
+    this.fileHost = null;
     this.reclaimWithinSession = false;
     this.liveAtCompaction = 0;
     this.freeGenTxid = 0n;

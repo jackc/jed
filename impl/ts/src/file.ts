@@ -23,11 +23,12 @@ import {
 import { tmpdir } from "node:os";
 import { dirname } from "node:path";
 
-import { ClosedBlockStore } from "./blockstore.ts";
+import { type BlockStore, ClosedBlockStore } from "./blockstore.ts";
 import { FileBlockStore } from "./fileblockstore.ts";
 import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { ExtensionRegistry } from "./extension.ts";
+import type { FileHost, WriteAt } from "./filehost.ts";
 import { loadEnginePaged, ROOT_PAGE, toImage, writeImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
@@ -246,6 +247,7 @@ registerFileAttachOpener((source, readOnly) => {
 // and poisoned, so the handle must be reopened. Returns the replacement paging context, a pool of
 // capacity leaves over the new file.
 export function compactFile(
+  host: FileHost | null,
   path: string,
   snap: Snapshot,
   pageSize: number,
@@ -253,36 +255,18 @@ export function compactFile(
   old: SharedPaging,
   capacity: number,
 ): SharedPaging {
+  const files = host ?? osFiles;
   const noSync = old.skipsSync();
-  let real: string;
-  try {
-    // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
-    real = realpathSync(path);
-  } catch (e) {
-    throw ioError(e);
-  }
+  // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
+  const real = files.realPath(path);
   const tmp = real + ".jedtmp";
   try {
-    const fd = openSync(tmp, "w");
-    try {
-      writeImage(snap, pageSize, txid, (index, page) => {
-        const offset = index * pageSize;
-        let done = 0;
-        while (done < page.length) {
-          const count = writeSync(fd, page, done, page.length - done, offset + done);
-          if (count <= 0) throw engineError("io_error", "file write made no progress");
-          done += count;
-        }
-      });
-      chmodSync(tmp, statSync(real).mode & 0o7777);
-      if (!noSync) fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
+    files.writeFile(tmp, real, noSync, (writeAt) => {
+      writeImage(snap, pageSize, txid, (index, page) => writeAt(index * pageSize, page));
+    });
   } catch (e) {
-    removeQuietly(tmp);
-    if (e instanceof Error && e.name === "EngineError") throw e;
-    throw ioError(e);
+    files.remove(tmp);
+    throw e;
   }
 
   // Close the old file before the rename: Windows cannot replace a file that is still open.
@@ -293,21 +277,78 @@ export function compactFile(
     // The descriptor is released either way; a close error loses nothing the rename needs.
   }
   try {
-    renameSync(tmp, real);
+    files.rename(tmp, real);
   } catch (e) {
-    removeQuietly(tmp);
+    files.remove(tmp);
     try {
-      old.swapStore(new FileBlockStore(openSync(real, "r+"), noSync));
+      old.swapStore(files.openStore(real, noSync));
     } catch {
       old.poison();
     }
-    throw ioError(e);
+    throw e;
   }
   old.poison();
-  if (!noSync) {
+  if (!noSync) files.syncDir(dirname(real));
+  const store = files.openStore(real, noSync);
+  try {
+    return new SharedPaging(Pager.fromStore(store), capacity);
+  } catch (e) {
+    store.close();
+    throw e;
+  }
+}
+
+// osFiles is the Node file host (filehost.ts): compaction's temp file, rename, directory barrier, and
+// reopen on the real filesystem. Every OS error surfaces as io_error.
+export const osFiles: FileHost = {
+  realPath(path: string): string {
+    try {
+      return realpathSync(path);
+    } catch (e) {
+      throw ioError(e);
+    }
+  },
+  writeFile(
+    path: string,
+    modeFrom: string,
+    noSync: boolean,
+    fill: (writeAt: WriteAt) => void,
+  ): void {
+    try {
+      const fd = openSync(path, "w");
+      try {
+        fill((offset, bytes) => {
+          let done = 0;
+          while (done < bytes.length) {
+            const count = writeSync(fd, bytes, done, bytes.length - done, offset + done);
+            if (count <= 0) throw engineError("io_error", "file write made no progress");
+            done += count;
+          }
+        });
+        chmodSync(path, statSync(modeFrom).mode & 0o7777);
+        if (!noSync) fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch (e) {
+      if (e instanceof Error && e.name === "EngineError") throw e;
+      throw ioError(e);
+    }
+  },
+  rename(from: string, to: string): void {
+    try {
+      renameSync(from, to);
+    } catch (e) {
+      throw ioError(e);
+    }
+  },
+  remove(path: string): void {
+    removeQuietly(path);
+  },
+  syncDir(dir: string): void {
     // Best-effort, as in writeAtomic: not every platform can fsync a directory.
     try {
-      const dfd = openSync(dirname(real), "r");
+      const dfd = openSync(dir, "r");
       try {
         fsyncSync(dfd);
       } finally {
@@ -316,20 +357,17 @@ export function compactFile(
     } catch {
       // directory fsync unsupported on this platform — acceptable (api.md §3)
     }
-  }
-  let fd: number;
-  try {
-    fd = openSync(real, "r+");
-  } catch (e) {
-    throw ioError(e);
-  }
-  try {
-    return new SharedPaging(Pager.fromStore(new FileBlockStore(fd, noSync)), capacity);
-  } catch (e) {
-    closeSync(fd);
-    throw e;
-  }
-}
+  },
+  openStore(path: string, noSync: boolean): BlockStore {
+    let fd: number;
+    try {
+      fd = openSync(path, "r+");
+    } catch (e) {
+      throw ioError(e);
+    }
+    return new FileBlockStore(fd, noSync);
+  },
+};
 
 // Register the Node file host as the file compactor (spec/design/api.md §2.6), the same injection as the
 // attach opener above: shared.ts stays browser-clean and reaches compactFile only through this hook.
