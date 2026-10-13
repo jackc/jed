@@ -964,6 +964,66 @@ func (p *regexProgram) regexpMatch(matchInput, origInput []rune, m *costMeter) (
 	return groups, true, nil
 }
 
+// allMatches returns the capture arrays of regexp_matches (regex.md §8c): the first match only, or
+// every non-overlapping match when global (the same advance as replaceMatches — an empty match
+// continues one character on). Each entry is shaped like regexpMatch's result: groups 1..n (an unset
+// group nil), or the whole match when the pattern has no group.
+func (p *regexProgram) allMatches(matchInput, origInput []rune, global bool, m *costMeter) ([][]*string, error) {
+	found, err := p.replaceMatches(matchInput, global, m)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]*string, len(found))
+	for i, saves := range found {
+		if p.ngroups == 0 {
+			out[i] = []*string{sliceGroup(origInput, saves[0], saves[1])}
+			continue
+		}
+		groups := make([]*string, p.ngroups)
+		for g := 1; g <= p.ngroups; g++ {
+			groups[g-1] = sliceGroup(origInput, saves[2*g], saves[2*g+1])
+		}
+		out[i] = groups
+	}
+	return out, nil
+}
+
+// splitPieces returns the pieces of regexp_split_to_array / regexp_split_to_table (regex.md §8c):
+// the text between consecutive matches, found with the global advance, then the text after the
+// last. PostgreSQL's DEGENERATE matches split nothing: an empty match at the start or end of the
+// subject, or one that ends no later than the previous match — so ” splits into characters and a
+// split of the empty string is one empty piece. The pieces are sliced from the ORIGINAL-case subject
+// (same length as the matched one).
+func (p *regexProgram) splitPieces(matchInput, origInput []rune, m *costMeter) ([]string, error) {
+	length := len(matchInput)
+	var pieces []string
+	pos := 0
+	prevEnd := 0    // the end of the previous match, degenerate or not
+	pieceStart := 0 // the end of the previous SPLITTING match
+	for pos <= length {
+		saves, err := p.search(matchInput, pos, m)
+		if err != nil {
+			return nil, err
+		}
+		if saves == nil {
+			break
+		}
+		s, e := int(saves[0]), int(saves[1])
+		if s < length && e > prevEnd {
+			pieces = append(pieces, string(origInput[pieceStart:s]))
+			pieceStart = e
+		}
+		prevEnd = e
+		if e > s {
+			pos = e
+		} else {
+			pos = e + 1
+		}
+	}
+	pieces = append(pieces, string(origInput[pieceStart:length]))
+	return pieces, nil
+}
+
 // replaceMatches finds the matches regexp_replace(source, pattern, replacement, …) (regex.md §8)
 // replaces: the first match, or every non-overlapping match when global. Each entry is a match's
 // capture slots. The VM matches over matchInput (possibly case-folded); this is the kernel's whole

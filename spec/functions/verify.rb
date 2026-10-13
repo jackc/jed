@@ -35,7 +35,8 @@
 #      arg_resolution/arity), so they skip the operator-only checks above (functions.md).
 #  12. each [[set_returning]] (kind = "set_returning") has its own field set (name/kind/
 #      surface/arity/arg_families/arg_resolution/result/column/null/errors); arity ==
-#      arg_families length; result is a scalar id or a reserved set id (set_of_promoted);
+#      arg_families length; result is a scalar id, a concrete array `<scalar>[]`, or a
+#      reserved set id (set_of_promoted);
 #      null is "empty_on_null"; column is a non-empty string. "promote" requires each
 #      operand family to have a promotion rule (NOT a comparable pair — an SRF widens its
 #      own args among themselves, it never compares two families). (name, arity) is unique.
@@ -92,7 +93,8 @@ AGG_REQUIRED_FIELDS  = %w[name kind surface arg result null errors].freeze
 
 # Set-returning functions (kind = "set_returning") use a distinct field set and validation
 # branch — they expand args into a row set, fitting neither operator nor aggregate (functions.md
-# §10). `result` accepts a scalar id or a reserved set id; `null` is the single "empty_on_null"
+# §10). `result` accepts a scalar id, a concrete array `<scalar>[]`, or a reserved set id; `null`
+# is the single "empty_on_null"
 # discipline; the uniqueness key is (name, arity). An SRF arg_family may also be a polymorphic
 # pseudo-family (anyarray/anyelement — unnest, array-functions.md §2), interpreted by the
 # hand-written resolver exactly as for the array functions. The reserved set results:
@@ -364,8 +366,11 @@ def main
     end
 
     result = sf["result"]
-    unless scalar_ids.include?(result) || RESERVED_SRF_RESULTS.include?(result)
-      fail!("set_returning #{id}: result #{result.inspect} is neither a scalar id nor a reserved set result (#{RESERVED_SRF_RESULTS.to_a.join('|')})")
+    # A concrete array result `<scalar>[]` (regexp_matches → "text[]") is a row set of one array
+    # column, read exactly as the operator array result (4).
+    srf_array_result = result.is_a?(String) && result.end_with?("[]") && scalar_ids.include?(result[0..-3])
+    unless scalar_ids.include?(result) || RESERVED_SRF_RESULTS.include?(result) || srf_array_result
+      fail!("set_returning #{id}: result #{result.inspect} is neither a scalar id, a concrete array `<scalar>[]`, nor a reserved set result (#{RESERVED_SRF_RESULTS.to_a.join('|')})")
     end
 
     fail!("set_returning #{id}: null #{sf['null'].inspect} must be \"empty_on_null\"") unless SRF_NULL_BEHAVIORS.include?(sf["null"])

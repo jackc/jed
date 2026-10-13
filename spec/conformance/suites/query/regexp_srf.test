@@ -1,0 +1,341 @@
+# The regular-expression set-returning functions and their array sibling (spec/design/regex.md §8c),
+# over the same Pike VM as regexp_match. regexp_matches(string, pattern [, flags]) → setof text[]:
+# one row per match, each regexp_match's capture array (groups 1..n, or [whole match] with no group;
+# an unset group → NULL); without the `g` flag at most one row, with `g` every non-overlapping match
+# (an empty match advances one character). regexp_split_to_table(string, pattern [, flags]) → setof
+# text and regexp_split_to_array(...) → text[] split at every match, skipping PostgreSQL's degenerate
+# (empty, at an edge or right after the previous match) matches. A NULL argument yields zero rows /
+# NULL. `g` on a split function is 22023. FROM-clause SRFs, implicitly lateral. Verified against
+# PostgreSQL 18 (the flavor-divergent rows are ledgered in oracle_overrides.toml).
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.set_returning, func.regexp_matches, func.regexp_split_to_table, func.regexp_split_to_array, types.i32, types.text, types.array, null.three_valued, resource.cost_metering
+
+# --- regexp_matches -------------------------------------------------------------------------------
+
+# Without `g`: the FIRST match's capture groups, one row.
+query T nosort
+SELECT * FROM regexp_matches('foobarbequebaz', '(bar)(beque)')
+----
+{bar,beque}
+
+# With `g`: every non-overlapping match, in subject order.
+query T nosort
+SELECT * FROM regexp_matches('foobarbequebazilbarfbonk', '(b[^b]+)(b[^b]+)', 'g')
+----
+{bar,beque}
+{bazil,barf}
+
+# No capture group: a one-element array of the whole match.
+query T nosort
+SELECT * FROM regexp_matches('a1b22c333', '\d+', 'g')
+----
+{1}
+{22}
+{333}
+
+# No match: zero rows (regexp_match would return NULL).
+query T nosort
+SELECT * FROM regexp_matches('abc', 'x')
+----
+
+query T nosort
+SELECT * FROM regexp_matches('abc', 'x', 'g')
+----
+
+# A group that does not participate in the match is a NULL element.
+query T nosort
+SELECT * FROM regexp_matches('abc', '(x)?b')
+----
+{NULL}
+
+# Empty matches with `g`: one before each character and one at the end; a non-empty match is
+# followed by an empty one right at its end (PostgreSQL's advance rule).
+# Cost (regex.md §8c): the call node's operator_eval (1) + regex_compile ('b*' = 9 instructions,
+# once) + regex_step (33, four searches) + 4 generated_row + 4 row_produced = 51.
+# cost: 51
+query T nosort
+SELECT * FROM regexp_matches('abc', 'b*', 'g')
+----
+{""}
+{b}
+{""}
+{""}
+
+query T nosort
+SELECT * FROM regexp_matches('abc', '')
+----
+{""}
+
+# The `i` flag (alone or with `g`) matches case-insensitively; the captured text keeps its case.
+query T nosort
+SELECT * FROM regexp_matches('aBcAbC', '(b)(c)', 'ig')
+----
+{B,c}
+{b,C}
+
+# Code-point semantics: a multi-byte / astral character is one character.
+query T nosort
+SELECT * FROM regexp_matches('é😀x', '(.)(.)')
+----
+{é,😀}
+
+# A NULL argument yields zero rows.
+query T nosort
+SELECT * FROM regexp_matches(NULL, 'a')
+----
+
+query T nosort
+SELECT * FROM regexp_matches('a', NULL)
+----
+
+query T nosort
+SELECT * FROM regexp_matches('a', 'a', NULL)
+----
+
+# The column is named after the function, or after a table alias, or by a column-alias list.
+query T nosort
+SELECT regexp_matches FROM regexp_matches('abc', 'b')
+----
+{b}
+
+query T nosort
+SELECT m FROM regexp_matches('abc', 'b') AS m
+----
+{b}
+
+query T nosort
+SELECT x[1] FROM regexp_matches('k=v', '(\w)=(\w)') AS m(x)
+----
+k
+
+# --- regexp_split_to_table ------------------------------------------------------------------------
+
+query T nosort
+SELECT * FROM regexp_split_to_table('hello  world', '\s+')
+----
+hello
+world
+
+# Adjacent and edge separators produce empty pieces (bracketed to show them).
+query T nosort
+SELECT '<' || p || '>' FROM regexp_split_to_table(',a,,b,', ',') AS p
+----
+<>
+<a>
+<>
+<b>
+<>
+
+# The empty pattern (and any pattern matching only empty strings) splits into characters: its empty
+# matches at the start and end of the subject are degenerate and split nothing.
+# Cost — operator_eval 1 + regex_compile 6 + regex_step 20 (four searches of 5 states) + 3
+# generated_row + 3 row_produced = 33.
+# cost: 33
+query T nosort
+SELECT * FROM regexp_split_to_table('abc', '')
+----
+a
+b
+c
+
+query T nosort
+SELECT * FROM regexp_split_to_table('abc', 'x*')
+----
+a
+b
+c
+
+# An empty match right after a non-empty one is degenerate too: 'b*' splits 'abc' only at the b.
+query T nosort
+SELECT * FROM regexp_split_to_table('abc', 'b*')
+----
+a
+c
+
+# The empty string is one empty piece; a subject with no match is itself.
+query T nosort
+SELECT '<' || p || '>' FROM regexp_split_to_table('', 'x') AS p
+----
+<>
+
+query T nosort
+SELECT * FROM regexp_split_to_table('abc', 'x')
+----
+abc
+
+query T nosort
+SELECT * FROM regexp_split_to_table('aXbxc', 'x', 'i')
+----
+a
+b
+c
+
+query T nosort
+SELECT * FROM regexp_split_to_table(NULL, ',')
+----
+
+query T nosort
+SELECT s FROM regexp_split_to_table('a b', ' ') AS s
+----
+a
+b
+
+# --- regexp_split_to_array -----------------------------------------------------------------------
+
+query T nosort
+SELECT regexp_split_to_array('hello  world', '\s+')
+----
+{hello,world}
+
+query T nosort
+SELECT regexp_split_to_array('abc', '')
+----
+{a,b,c}
+
+# Cost — the same search as regexp_matches('abc', 'b*', 'g') above — operator_eval 1 +
+# regex_compile 9 + regex_step 33 — plus 1 row_produced = 44 (no generated_row: a scalar).
+# cost: 44
+query T nosort
+SELECT regexp_split_to_array('abc', 'b*')
+----
+{a,c}
+
+query T nosort
+SELECT regexp_split_to_array('', '')
+----
+{""}
+
+# Capture groups make no difference to a split.
+query T nosort
+SELECT regexp_split_to_array('a b', '(\s)')
+----
+{a,b}
+
+query T nosort
+SELECT regexp_split_to_array('AxBXc', 'x', 'i')
+----
+{A,B,c}
+
+query T nosort
+SELECT regexp_split_to_array(NULL, 'x')
+----
+NULL
+
+query I nosort
+SELECT array_length(regexp_split_to_array('a,b,,c', ','), 1)
+----
+4
+
+# --- errors --------------------------------------------------------------------------------------
+
+# The split functions find every match already; the `g` flag is 22023 (PostgreSQL's
+# 'regexp_split_to_table() does not support the "global" option').
+statement error 22023
+SELECT * FROM regexp_split_to_table('abc', 'b', 'g')
+
+statement error 22023
+SELECT regexp_split_to_array('abc', 'b', 'g')
+
+statement error 22023
+SELECT regexp_match('abc', 'b', 'g')
+
+# A SELECT-list set-returning function is deferred for every SRF (functions.md §10): jed has no scalar
+# regexp_matches / regexp_split_to_table, so they are 42883 there. PostgreSQL returns the rows — a
+# documented divergence (oracle_overrides ledger); write them in FROM (implicitly lateral, below).
+statement error 42883
+SELECT regexp_matches('abc', 'b')
+
+statement error 42883
+SELECT regexp_split_to_table('a b', ' ')
+
+# A malformed pattern is 2201B.
+statement error 2201B
+SELECT * FROM regexp_matches('abc', '(')
+
+statement error 2201B
+SELECT * FROM regexp_split_to_table('abc', '[')
+
+# --- implicitly lateral over a table column ------------------------------------------------------
+
+statement ok
+CREATE TABLE kv (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO kv VALUES (1, 'a=1;b=2'), (2, 'c=3'), (3, ''), (4, NULL)
+
+# Each row's pairs: row 1 twice, row 2 once, row 3 (no match) and row 4 (NULL) never.
+# Cost — the constant pattern compiles ONCE for the statement although the lateral call runs per kv
+# row; each call charges its own operator_eval + regex_step, each produced match a generated_row.
+# cost: 145
+query IT rowsort
+SELECT kv.id, m FROM kv CROSS JOIN regexp_matches(kv.s, '(\w)=(\d)', 'g') AS m
+----
+1
+{a,1}
+1
+{b,2}
+2
+{c,3}
+
+query IT nosort
+SELECT kv.id, '<' || p || '>' FROM kv CROSS JOIN regexp_split_to_table(kv.s, ';') AS p ORDER BY kv.id, p
+----
+1
+<a=1>
+1
+<b=2>
+2
+<c=3>
+3
+<>
+
+query IT nosort
+SELECT id, regexp_split_to_array(s, ';') FROM kv ORDER BY id
+----
+1
+{a=1,b=2}
+2
+{c=3}
+3
+{""}
+4
+NULL
+
+# A per-row (non-constant) pattern and flags compile on every call.
+statement ok
+CREATE TABLE pats (id i32 PRIMARY KEY, s text, p text, f text)
+
+statement ok
+INSERT INTO pats VALUES (1, 'a-b-c', '-', ''), (2, 'x1Y2z', 'y', 'i'), (3, 'a😀b😀c', '😀', '')
+
+query IT rowsort
+SELECT pats.id, piece FROM pats CROSS JOIN regexp_split_to_table(pats.s, pats.p, pats.f) AS piece
+----
+1
+a
+1
+b
+1
+c
+2
+2z
+2
+x1
+3
+a
+3
+b
+3
+c
+
+# Cost — the flags are per-row, so the (constant) pattern compiles on every call — 3 × regex_compile.
+# cost: 232
+query IT rowsort
+SELECT pats.id, m FROM pats CROSS JOIN regexp_matches(pats.s, '(.)(.)$', pats.f) AS m
+----
+1
+{-,c}
+2
+{2,z}
+3
+{😀,c}

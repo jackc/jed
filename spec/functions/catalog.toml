@@ -4662,9 +4662,11 @@ errors         = ["22025"]
 #  - regexp_match(source, pattern [, flags]) → text[]: the capture array of the FIRST match (groups
 #    1..n, or a 1-element [whole match] when the pattern has no group); an unset group element is
 #    NULL; NO match → NULL (the whole result).
-# `flags` is a short text: `i` (case-insensitive, = the `~*` fold), `g` (global, regexp_replace only);
-# an unknown flag is 2201B. These are the first text- and text[]-returning functions, resolved via a
-# dedicated RegexFunc node (the array/range-function precedent) rather than the scalar-result path.
+# `flags` is a short text: `i` (case-insensitive, = the `~*` fold), `g` (global — regexp_replace and the
+# set-returning regexp_matches only); an unknown flag is 2201B, and `g` on a function that does not
+# take it is PostgreSQL's 22023 ("regexp_match() does not support the "global" option"). These are the
+# first text- and text[]-returning functions, resolved via a dedicated RegexFunc node (the
+# array/range-function precedent) rather than the scalar-result path.
 [[operator]]
 name           = "regexp_replace"
 kind           = "function"
@@ -4706,7 +4708,34 @@ arg_families   = ["text", "text", "text"]
 arg_resolution = "none"
 result         = "text[]"
 null           = "propagates"
+errors         = ["2201B", "22023"]
+volatility     = "immutable"
+
+# regexp_split_to_array(string, pattern [, flags]) → text[] (../design/regex.md §8c): the pieces of
+# `string` between the matches of `pattern` — every match, ignoring PostgreSQL's DEGENERATE ones (an
+# empty match at the start or end of the string or right after the previous match), so the empty
+# pattern splits into single characters. Same RegexFunc node as regexp_match. Only the `i` flag;
+# `g` is 22023 (PG — the split already finds every match). STRICT.
+[[operator]]
+name           = "regexp_split_to_array"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+null           = "propagates"
 errors         = ["2201B"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "regexp_split_to_array"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+null           = "propagates"
+errors         = ["2201B", "22023"]
 volatility     = "immutable"
 
 # Oracle-compatibility regex scalar functions (../design/regex.md §8b, Slice 3). Same Pike VM and
@@ -4721,8 +4750,9 @@ volatility     = "immutable"
 #    1-based position of the N-th match's subexpr span (endoption 0 = first char, 1 = after last char);
 #    no match / out-of-range subexpr / unset group → 0.
 # Argument validation (before the pattern compiles): start<1, N<1, subexpr<0, endoption∉{0,1} → 22023.
-# Only the `i` flag is meaningful; any other (incl. `g`) → 2201B (jed's RE2 flavor, a documented
-# divergence). Resolved via resolveRegexFunc, not the scalar-result path.
+# Only the `i` flag is meaningful; `g` → 22023 (PG: "regexp_count() does not support the "global"
+# option"), any other → 2201B (jed's RE2 flavor, a documented divergence). Resolved via
+# resolveRegexFunc, not the scalar-result path.
 [[operator]]
 name           = "regexp_like"
 kind           = "function"
@@ -4742,7 +4772,7 @@ arg_families   = ["text", "text", "text"]
 arg_resolution = "none"
 result         = "boolean"
 null           = "propagates"
-errors         = ["2201B"]
+errors         = ["2201B", "22023"]
 volatility     = "immutable"
 
 [[operator]]
@@ -5942,3 +5972,61 @@ result         = "text"
 column         = "value"
 null           = "empty_on_null"
 errors         = ["22023"]
+
+# The regular-expression SRFs (../design/regex.md §8c), over the same Pike VM and RegexFunc node as
+# regexp_match. regexp_matches(string, pattern [, flags]) → setof text[]: one row per match, each the
+# regexp_match-shaped capture array (groups 1..n, or [whole match] with no group; an unset group →
+# NULL); WITHOUT the `g` flag at most one row (the first match — no match → zero rows), WITH `g`
+# every non-overlapping match (an empty match advances one character). regexp_split_to_table(string,
+# pattern [, flags]) → setof text: one row per piece of regexp_split_to_array. A NULL argument yields
+# zero rows; flags as regexp_match (`i`; `g` only on regexp_matches — on regexp_split_to_table it is
+# 22023, PG). Each produced row charges one generated_row on top of the call's regex work (the
+# operator_eval + regex_compile + regex_step regexp_match charges). `result = "text[]"` is a concrete
+# array id (the operator precedent). FROM-clause only, implicitly lateral, like every SRF.
+[[set_returning]]
+name           = "regexp_matches"
+kind           = "set_returning"
+surface        = "regexp_matches"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+column         = "regexp_matches"
+null           = "empty_on_null"
+errors         = ["2201B"]
+
+[[set_returning]]
+name           = "regexp_matches"
+kind           = "set_returning"
+surface        = "regexp_matches"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text[]"
+column         = "regexp_matches"
+null           = "empty_on_null"
+errors         = ["2201B"]
+
+[[set_returning]]
+name           = "regexp_split_to_table"
+kind           = "set_returning"
+surface        = "regexp_split_to_table"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text"
+column         = "regexp_split_to_table"
+null           = "empty_on_null"
+errors         = ["2201B"]
+
+[[set_returning]]
+name           = "regexp_split_to_table"
+kind           = "set_returning"
+surface        = "regexp_split_to_table"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text"
+column         = "regexp_split_to_table"
+null           = "empty_on_null"
+errors         = ["2201B", "22023"]

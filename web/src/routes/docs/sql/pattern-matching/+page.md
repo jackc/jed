@@ -34,14 +34,24 @@ ORDER BY id;`;
 
 	const match = `SELECT regexp_match('carol+news@example.com', '^([^@]+)@(.+)$') AS parts;`;
 
+	const matches = `SELECT m[1] AS key, m[2] AS value
+FROM regexp_matches('host=db1 port=5432 user=app', '(\\w+)=(\\w+)', 'g') AS m;`;
+
+	const splitTable = `SELECT word
+FROM regexp_split_to_table('the quick  brown fox', '\\s+') AS word;`;
+
+	const splitArray = `SELECT id, regexp_split_to_array(email, '[@.]') AS parts
+FROM account
+ORDER BY id;`;
+
 	const redos = `SELECT 'aaaaaaaaaaaaaaaaaaaa!' ~ '(a+)+\$' AS matched;`;
 </script>
 
 # Pattern matching
 
 jed offers three ways to match text against a pattern: SQL `LIKE` / `ILIKE`, the
-regular-expression operators `~` `~*` `!~` `!~*`, and the `regexp_replace` / `regexp_match`
-functions.
+regular-expression operators `~` `~*` `!~` `!~*`, and the `regexp_*` functions
+(`regexp_replace`, `regexp_match`, `regexp_matches`, and the split functions).
 
 ## `LIKE` / `ILIKE`
 
@@ -110,5 +120,26 @@ Reordering with capture groups:
 
 <LiveSql query={match} rows={1} />
 
-The `i` flag makes any of these case-insensitive; for `regexp_replace`, `g` makes it global.
-A malformed pattern raises `2201B` (`invalid_regular_expression`).
+## `regexp_matches`
+
+`regexp_matches(source, pattern [, flags])` is the set-returning form: one `text[]` row per match,
+each shaped like `regexp_match`'s result. Without the `g` flag it returns at most one row (zero
+rows when there is no match); with `g` it returns every match. It is a table function, so call it
+in `FROM` (a `FROM t CROSS JOIN regexp_matches(t.col, …)` runs it once per row of `t`).
+
+<LiveSql demo="regexpMatches" query={matches} rows={2} />
+
+## `regexp_split_to_table` / `regexp_split_to_array`
+
+These split the source at every match of the pattern. `regexp_split_to_table` returns one row per
+piece, and `regexp_split_to_array` returns the pieces as a `text[]`. As in PostgreSQL, an empty match
+at the start or end of the string, or right after the previous match, does not split, so the empty
+pattern `''` splits a string into its characters.
+
+<LiveSql demo="regexpSplitTable" query={splitTable} rows={2} />
+
+<LiveSql demo="regexpSplitArray" {seed} query={splitArray} rows={3} />
+
+The `i` flag makes any of these case-insensitive. `g` makes `regexp_replace` replace every match
+and `regexp_matches` return every match. The other functions reject it with `22023`, as PostgreSQL
+does. A malformed pattern raises `2201B` (`invalid_regular_expression`).

@@ -427,6 +427,11 @@ only in (a) its column type — the **bound element type** of its `anyarray` arg
 its generator — one row per element in the value's flattened row-major order (a NULL array or empty
 array → zero rows; a NULL element → a NULL row), rather than a counted series.
 
+**The regexp SRFs — `regexp_matches` and `regexp_split_to_table`** ([regex.md](regex.md) §8c) use the
+same machinery. Their single resolved argument is the regexp call node itself: it does the whole
+match and charges `regexp_match`'s cost, and the producer emits one `generated_row` per match
+(`text[]`) or per split piece (`text`).
+
 **Cost.** Each generated element charges one **`generated_row`** ([cost.md](cost.md) §3),
 guarded so a `max_cost` ceiling aborts a runaway `generate_series(1, 10^18)` (or an over-cap
 `unnest`) with `54P01` **mid-generation**, before the whole series materializes (CLAUDE.md §13). An

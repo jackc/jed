@@ -76,6 +76,9 @@ impl Engine {
         if name == "unnest" {
             return self.resolve_unnest(args, alias, &arg_scope, ptypes);
         }
+        if name == "regexp_matches" || name == "regexp_split_to_table" {
+            return self.resolve_regex_srf(name, args, alias, &arg_scope, ptypes);
+        }
         // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
         // jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
         // json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
@@ -172,6 +175,35 @@ impl Engine {
             SqlState::UndefinedFunction,
             format!("function does not exist: {name}"),
         ))
+    }
+
+    /// Resolve `regexp_matches` / `regexp_split_to_table` (regex.md §8c). The call resolves exactly
+    /// like the scalar regexp functions (text args, a constant pattern precompiled once per
+    /// statement) into ONE [`RExpr::RegexFunc`] node — the relation's single arg — whose eval does
+    /// the whole match and charges its operator_eval / regex_compile / regex_step; the producer then
+    /// emits one row per match (a `text[]` column) or per split piece (a `text` column). Like any
+    /// function returning a collatable type, the column takes the combined collation of the args.
+    pub(crate) fn resolve_regex_srf(
+        &self,
+        name: &str,
+        args: &[Expr],
+        alias: Option<&str>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        let (call, _) = resolve_regex_func(arg_scope, name, args, &mut AggCtx::Forbidden, ptypes)?;
+        let (kind, col_ty) = if name == "regexp_matches" {
+            (
+                SrfKind::RegexpMatches,
+                Type::Array(Box::new(Type::Scalar(ScalarType::Text))),
+            )
+        } else {
+            (SrfKind::RegexpSplitToTable, Type::Scalar(ScalarType::Text))
+        };
+        let mut table = srf_table(name, alias, col_ty);
+        let d = combine_derivs(arg_scope, args)?;
+        set_synthetic_collation(&mut table.columns[0], &d);
+        Ok((table, vec![call], kind))
     }
 
     /// Resolve a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one argument is a
@@ -1339,6 +1371,30 @@ impl Engine {
                 }
             }
             _ => unreachable!("json_srf_rows only handles the json SRF kinds"),
+        }
+        Ok(out)
+    }
+
+    /// Generate the rows of `regexp_matches` / `regexp_split_to_table` (regex.md §8c). The single
+    /// arg is the call node: a NULL argument makes it NULL → zero rows; otherwise it yields the
+    /// per-row values (each match's `text[]`, or each split piece) and each charges one
+    /// `generated_row`, guarded.
+    pub(crate) fn regex_srf_rows(
+        &self,
+        srf: &SrfPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<Vec<Row>> {
+        let items = match srf.args[0].eval(&[], env, meter)? {
+            Value::Null => return Ok(Vec::new()),
+            Value::Array(a) => a.elements,
+            _ => unreachable!("a regexp SRF call yields an array of its rows"),
+        };
+        let mut out: Vec<Row> = Vec::with_capacity(items.len());
+        for v in items {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            out.push(vec![v]);
         }
         Ok(out)
     }

@@ -837,6 +837,60 @@ export function replaceMatches(
   return found;
 }
 
+// regexpAllMatches returns the capture arrays of regexp_matches (regex.md §8c): the first match only,
+// or every non-overlapping match when global (the same advance as replaceMatches — an empty match
+// continues one character on). Each entry is shaped like regexpMatch's result: groups 1..n (an unset
+// group null), or the whole match when the pattern has no group.
+export function regexpAllMatches(
+  p: RegexProgram,
+  matchInput: number[],
+  origInput: number[],
+  global: boolean,
+  m: Meter,
+): (string | null)[][] {
+  return replaceMatches(p, matchInput, global, m).map((saves) => {
+    if (p.ngroups === 0) return [sliceGroup(origInput, saves[0], saves[1])];
+    const groups: (string | null)[] = [];
+    for (let g = 1; g <= p.ngroups; g++) {
+      groups.push(sliceGroup(origInput, saves[2 * g], saves[2 * g + 1]));
+    }
+    return groups;
+  });
+}
+
+// regexpSplitPieces returns the pieces of regexp_split_to_array / regexp_split_to_table (regex.md
+// §8c): the text between consecutive matches, found with the global advance, then the text after the
+// last. PostgreSQL's DEGENERATE matches split nothing: an empty match at the start or end of the
+// subject, or one that ends no later than the previous match — so '' splits into characters and a
+// split of the empty string is one empty piece. The pieces are sliced from the ORIGINAL-case subject
+// (same length as the matched one).
+export function regexpSplitPieces(
+  p: RegexProgram,
+  matchInput: number[],
+  origInput: number[],
+  m: Meter,
+): string[] {
+  const len = matchInput.length;
+  const pieces: string[] = [];
+  let pos = 0;
+  let prevEnd = 0; // the end of the previous match, degenerate or not
+  let pieceStart = 0; // the end of the previous SPLITTING match
+  while (pos <= len) {
+    const saves = regexSearch(p, matchInput, pos, m);
+    if (saves === null) break;
+    const s = saves[0];
+    const e = saves[1];
+    if (s < len && e > prevEnd) {
+      pieces.push(cpSlice(origInput, pieceStart, s));
+      pieceStart = e;
+    }
+    prevEnd = e;
+    pos = e > s ? e : e + 1;
+  }
+  pieces.push(cpSlice(origInput, pieceStart, len));
+  return pieces;
+}
+
 // regexpCount counts the non-overlapping matches at or after code-point position `start`
 // (regexp_count, regex.md §8b). The advance is regexpReplace's global rule: after a match [s,e)
 // continue at e, or at e+1 for an EMPTY match so a nullable pattern terminates. `start` may be up to
@@ -885,7 +939,17 @@ export function regexpNthMatch(
 // sliceGroup slices orig[start..end] to a string, or null for an unset (-1) group.
 function sliceGroup(orig: number[], start: number, end: number): string | null {
   if (start < 0 || end < 0) return null;
-  return String.fromCodePoint(...orig.slice(start, end));
+  return cpSlice(orig, start, end);
+}
+
+// cpSlice converts the code points orig[start..end] to a string in bounded chunks: spreading a large
+// array into String.fromCodePoint overflows the stack (the replaceBuild precedent).
+function cpSlice(orig: number[], start: number, end: number): string {
+  const parts: string[] = [];
+  for (let i = start; i < end; i += 8192) {
+    parts.push(String.fromCodePoint(...orig.slice(i, Math.min(i + 8192, end))));
+  }
+  return parts.join("");
 }
 
 // A piece of an expanded replacement: a literal code point (lo < 0), or the [lo, hi) span of the

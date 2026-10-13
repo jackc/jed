@@ -3,8 +3,9 @@
 > Status: **Slice 1 (this doc)** — the engine + the four match operators `~ ~* !~ !~*`.
 > **Slice 2** — the scalar functions `regexp_replace` / `regexp_match`. **Slice 3** — the
 > Oracle-compat scalar functions `regexp_count` / `regexp_instr` / `regexp_substr` /
-> `regexp_like` (§8b). Set-returning functions (`regexp_matches`, `regexp_split_to_table`) and
-> the rest of PG's `regexp_*` family are **deferred** (§10). Stores nothing on disk → **no
+> `regexp_like` (§8b). **Slice 4** — the set-returning `regexp_matches` /
+> `regexp_split_to_table` and the scalar `regexp_split_to_array` (§8c). That completes PG's
+> `regexp_*` family; §10 lists what stays deferred. Stores nothing on disk → **no
 > `format_version` bump**.
 
 jed adds POSIX-style regular-expression matching with PostgreSQL's core operators (`~ ~* !~ !~*`)
@@ -357,6 +358,7 @@ compile (resolve for a constant pattern, eval for a per-row pattern).
 | `54001` `statement_too_complex` | a well-formed pattern whose compiled program exceeds `MAX_REGEX_PROGRAM` (§6) |
 | `54P01` `cost_limit_exceeded` | accrued `regex_compile`/`regex_step` (plus the statement's other cost) reaches the handle's `max_cost` (§6) |
 | `42804` | a non-text operand to `~ ~* !~ !~*` |
+| `22023` `invalid_parameter_value` | the `g` flag on a function that does not take it — all but `regexp_replace` / `regexp_matches` (§8c) — and the §8b numeric-argument checks |
 
 `2201B` borrows PostgreSQL's SQLSTATE for the same condition (the LIKE/`22025` precedent of reusing
 PG codes for the analogous condition). Its message is `invalid regular expression: {detail}` with a
@@ -387,7 +389,8 @@ them):
   empty array).
 
 `flags` is a short text: `'i'` (case-insensitive, = the `~*` fold), `'g'` (global, `regexp_replace`
-only). Unknown flag → `2201B`. These are jed's first **text-returning** and **text[]-returning**
+and the set-returning `regexp_matches` only). Unknown flag → `2201B`; `'g'` on `regexp_match` is
+PostgreSQL's `22023` (§8c). These are jed's first **text-returning** and **text[]-returning**
 functions; they resolve through a dedicated `RExpr::RegexFunc` node carrying the result in the
 surrounding `ResolvedType` (the array/range-function precedent), not the scalar-`result` `ScalarFunc`
 path. Cost: `operator_eval` (the call node) + `regex_compile` (once, constant pattern) + `regex_step`
@@ -434,13 +437,73 @@ constant pattern surfaces its `2201B` before any per-row argument check — a de
 ordering divergence from PG for the (pattern-invalid **and** argument-invalid) case only; every
 single-error case agrees.
 
-**Flags.** Only `'i'` (case-insensitive) is meaningful here; `'g'` is `regexp_replace`-only, so any
-flag other than `'i'` — including `'g'` — is `2201B` (jed's RE2 flavor owns a smaller flag set than
-PG, regex.md §1; PG accepts `c/g/m/n/p/q/s/t/w/x` and rejects `'g'` on these with a different message
-— a documented flavor divergence). The numeric arguments are **strictly typed** integers: a non-integer
+**Flags.** Only `'i'` (case-insensitive) is meaningful here. `'g'` is rejected with PostgreSQL's
+`22023` (§8c); any other flag is `2201B` (jed's RE2 flavor owns a smaller flag set than PG, §1 — PG
+accepts `c/m/n/p/q/s/t/w/x` and rejects an unknown one with `22023`, a documented flavor
+divergence). The numeric arguments are **strictly typed** integers: a non-integer
 in a numeric slot is `42883` (no matching overload), jed's strict-typing stance rather than PG's
 implicit text→int cast. Cost is unchanged from Slice 2: `operator_eval` + `regex_compile` (once for a
 constant pattern) + `regex_step` per match step explored across the iteration.
+
+---
+
+## 8c. Slice 4 — `regexp_matches` / `regexp_split_to_table` / `regexp_split_to_array`
+
+PostgreSQL's remaining `regexp_*` functions, over the same Pike VM and the same `RExpr::RegexFunc`
+node. Two are **set-returning** (FROM-clause row sources on the SRF machinery of
+[functions.md](functions.md) §10); the third is their scalar array sibling. All three are STRICT and
+take `(string, pattern [, flags])`. The behavior is PostgreSQL 18's (`setup_regexp_matches` and
+`build_regexp_split_result` in PG's `regexp.c`), and every corpus row is oracle-checked.
+
+- **`regexp_matches(string, pattern [, flags])` → setof `text[]`.** One row per match. Each row is
+  shaped like `regexp_match`'s result (§8): groups 1..n, or a one-element array of the whole match
+  when the pattern has no group, with an unset group element NULL. Without `'g'` the function
+  returns at most one row, the first match. With `'g'` it returns every non-overlapping match, using
+  `regexp_replace`'s global advance: after a match `[s,e)` the next search starts at `e`, or at
+  `e+1` when the match was empty. So an empty match can follow a non-empty one at its end:
+  `regexp_matches('abc', 'b*', 'g')` yields `{""}`, `{b}`, `{""}`, `{""}`. No match means zero rows,
+  where `regexp_match` returns NULL.
+- **`regexp_split_to_array(string, pattern [, flags])` → `text[]`.** The pieces of `string`
+  between the matches of `pattern`, found with the same global advance, then the text after the
+  last match. Capture groups do not matter. PostgreSQL ignores **degenerate** matches, and so does
+  jed. A match is degenerate when it starts at the end of the subject (`s = len`), or when it ends
+  no later than the previous match, degenerate or not (`e ≤ previous e`, taking the previous end as
+  0 before the first match). Such a match splits nothing. So an empty match at the start, at the
+  end, or right after another match splits nothing: `''` splits `'abc'` into `{a,b,c}`, `'b*'`
+  splits it into `{a,c}`, and the empty string is `{""}` (one empty piece).
+- **`regexp_split_to_table(string, pattern [, flags])` → setof `text`.** One row per piece of
+  `regexp_split_to_array`.
+
+**Flags.** `'i'` works as everywhere else: the matching folds both sides, and the returned text is
+the original-case substring. `'g'` is meaningful only to `regexp_matches` (and `regexp_replace`).
+Every other function rejects it with PostgreSQL's `22023`, `<name>() does not support the "global"
+option`. This includes `regexp_match`, the split functions, which find every match anyway, and the
+Oracle-compat functions of §8b. The check runs after the unknown-flag check (`2201B`, §1), which is
+PG's order. An earlier slice had folded `'g'` into the unknown-flag `2201B`; that divergence had no
+overriding reason, so it is gone.
+
+**NULLs.** A NULL argument makes `regexp_split_to_array` NULL and makes the two SRFs produce zero
+rows (`null = "empty_on_null"`).
+
+**Plan shape.** An SRF call resolves through the same `resolve_regex_func` as the scalars, with the
+same text slots and the same constant-pattern precompilation (§5), into one `RegexFunc` node with
+the internal kind `Matches` / `SplitToTable`. That node is the relation's single argument. Its eval
+runs the whole match and returns an internal one-dimensional array of the row values: each match's
+`text[]`, or each split piece. The SRF producer unpacks that array into rows. The array is a
+transport between the call node and the producer and never reaches SQL. The produced column is
+named after the function, or after the alias or `AS m(c)`, by the single-column function-alias
+rule. It is typed `text[]` / `text` and takes the combined collation of the arguments, like any
+function with a collatable result. The arguments are implicitly lateral, so
+`FROM t CROSS JOIN regexp_matches(t.s, …)` runs once per row of `t`. A constant pattern still
+compiles once per statement. The SELECT-list position stays deferred for every SRF, so
+`SELECT regexp_matches(…)` is `42883` (ledgered).
+
+**Cost.** The call node charges what `regexp_match` charges: one `operator_eval`, `regex_compile`
+(once per statement for a constant pattern with constant flags, else per call), and `regex_step`
+for every search. Each produced row then charges one `generated_row`
+([cost.md](cost.md) §3 "`generated_row`"). `regexp_split_to_array` is a scalar, so it charges no
+`generated_row`. Like `regexp_match`, none of these charge `scalar_byte` for their output. The
+split pieces partition the subject, so their text never exceeds it.
 
 ---
 
@@ -464,10 +527,9 @@ corpus (§11).
 ## 10. Deferred / excluded
 
 **Deferred follow-ons** (each a later slice; `0A000` if attempted before then):
-- Set-returning `regexp_matches` (setof text[]), `regexp_split_to_table` (setof text) — feasible on
-  the existing SRF machinery, just out of this scope.
-- `regexp_split_to_array` (PG's other Oracle-compat addition). The scalar Oracle-compat functions
-  `regexp_count` / `regexp_instr` / `regexp_substr` / `regexp_like` **landed in Slice 3** (§8b).
+- The SELECT-list position of `regexp_matches` / `regexp_split_to_table` (deferred for every SRF,
+  [functions.md](functions.md) §10). The functions themselves **landed in Slice 4** (§8c), and the
+  Oracle-compat functions in Slice 3 (§8b).
 - `\b` word boundary, POSIX `[[:class:]]`, numeric escapes `\xHH`/`\x{…}`, Unicode-property classes
   `\p{…}` (ties into the collation Unicode-property work), the `s`/`m`/`x` flags and inline `(?i)`.
 - A lazy-DFA fast path (perf only — same semantics); regex-driven index acceleration (anchored
@@ -484,10 +546,12 @@ backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups. And
 - Capabilities ([manifest.toml](../conformance/manifest.toml)): `expr.regex_match` (`~`/`!~`),
   `expr.regex_imatch` (`~*`/`!~*`, builds on `expr.regex_match`), `resource.regex_program_limit`;
   Slice 2 adds `func.regexp_replace`, `func.regexp_match`; Slice 3 adds `func.regexp_count`,
-  `func.regexp_instr`, `func.regexp_substr`, `func.regexp_like`.
+  `func.regexp_instr`, `func.regexp_substr`, `func.regexp_like`; Slice 4 adds
+  `func.regexp_matches`, `func.regexp_split_to_table`, `func.regexp_split_to_array`.
 - Corpus: `suites/expr/regex.test` (operators, NULL/42804/2201B, code-point/astral, `# cost:` pins),
   `suites/resource/regex_program_limit.test` (`54001` boundary, jed-specific — not oracle-checked),
-  `suites/expr/regexp_functions.test` (Slice 2), `suites/expr/regexp_oracle_functions.test` (Slice 3).
+  `suites/expr/regexp_functions.test` (Slice 2), `suites/expr/regexp_oracle_functions.test` (Slice 3),
+  `suites/query/regexp_srf.test` (Slice 4).
 - **Oracle divergence** (§7 conformance): jed's flavor is the RE2 subset, so only the **PG-agreeing
   subset** is oracle-checkable (`mise run corpus:check`); flavor-divergent cases (a pattern PG accepts
   via a backref, greedy-edge differences) get **hand-authored expected output + an

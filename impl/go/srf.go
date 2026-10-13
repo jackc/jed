@@ -51,6 +51,8 @@ func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, colum
 		return db.resolveGenerateSeries(args, alias, argScope, ptypes)
 	case name == "unnest":
 		return db.resolveUnnest(args, alias, argScope, ptypes)
+	case name == "regexp_matches", name == "regexp_split_to_table":
+		return db.resolveRegexSRF(name, args, alias, argScope, ptypes)
 	}
 	// json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
 	// jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
@@ -445,6 +447,31 @@ func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope
 	default:
 		return nil, nil, noFuncOverload("unnest")
 	}
+}
+
+// resolveRegexSRF resolves regexp_matches / regexp_split_to_table (regex.md §8c). The call resolves
+// exactly like the scalar regexp functions (text args, a constant pattern precompiled once per
+// statement) into ONE reRegexFunc node — the relation's single arg — whose eval does the whole match
+// and charges its operator_eval / regex_compile / regex_step; the producer then emits one row per
+// match (a `text[]` column) or per split piece (a `text` column). Like any function returning a
+// collatable type, the column takes the combined collation of the args.
+func (db *engine) resolveRegexSRF(name string, args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
+	forbidden := &aggCtx{}
+	call, _, err := resolveRegexFunc(argScope, &funcCallExpr{Name: name, Args: args}, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	kind, colTy := srfRegexpSplitToTable, scalarT(scalarText)
+	if name == "regexp_matches" {
+		kind, colTy = srfRegexpMatches, arrayT(scalarT(scalarText))
+	}
+	table := srfTable(name, alias, colTy)
+	d, err := combineDerivPtrs(argScope, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	setSyntheticCollation(&table.Columns[0], d)
+	return table, &srfPlan{kind: kind, args: []*rExpr{call}}, nil
 }
 
 // srfTable builds a set-returning function's SYNTHETIC one-column relation (spec/design/functions.md
@@ -1795,6 +1822,29 @@ func evalJtExists(item *JsonNode, c *jtColExists, m *costMeter) (Value, error) {
 // flattens; a NULL element is produced as a NULL row). Each produced element charges one generated_row AT
 // THE SOURCE, guarded so a max_cost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like
 // generate_series (CLAUDE.md §13).
+// regexSrfRows generates the rows of regexp_matches / regexp_split_to_table (regex.md §8c). The single
+// arg is the call node: a NULL argument makes it NULL → zero rows; otherwise it yields the per-row
+// values (each match's text[], or each split piece) and each charges one generated_row, guarded.
+func (db *engine) regexSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
+	v, err := sp.args[0].eval(nil, env, m)
+	if err != nil {
+		return nil, err
+	}
+	if v.Kind == ValNull {
+		return nil, nil
+	}
+	items := v.arrayVal().Elements
+	out := make([]storedRow, 0, len(items))
+	for _, item := range items {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		out = append(out, storedRow{item})
+	}
+	return out, nil
+}
+
 func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []bool) ([]storedRow, error) {
 	v, err := sp.args[0].eval(nil, env, m)
 	if err != nil {

@@ -1227,6 +1227,9 @@ but charges no `row_produced`. Worked examples (all asserted in the corpus):
   `operator_eval` (the `>` per generated row) + 3 `row_produced` = **13**.
 - `SELECT * FROM generate_series(1, 5) ORDER BY generate_series DESC LIMIT 2` — 5 `generated_row`
   + 2 `row_produced` = **7** (the SRF takes the eager path; the sort/limit are unmetered).
+- `SELECT * FROM regexp_matches('abc', 'b*', 'g')` — the call node's `operator_eval` +
+  `regex_compile` + `regex_step` (what `regexp_match` charges, [regex.md](regex.md) §8c) + 4
+  `generated_row` + 4 `row_produced` = **51**.
 - `SELECT * FROM t CROSS JOIN generate_series(1, 3)` over a 3-row `t` — `t`'s scan block
   (`page_read` + 3 `storage_row_read`) **+ 3 `generated_row`** (the series is materialized once,
   like any join operand) + 9 `row_produced` for the product.

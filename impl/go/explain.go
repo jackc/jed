@@ -1753,7 +1753,7 @@ func explainRangeFunc(f rangeFunc) string {
 }
 
 func explainRegexFunc(f regexFunc) string {
-	return [...]string{"regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr"}[f]
+	return [...]string{"regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr", "regexp_split_to_array", "regexp_matches", "regexp_split_to_table"}[f]
 }
 
 func explainRangeOp(op rangeOp) string {

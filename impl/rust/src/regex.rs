@@ -1026,6 +1026,65 @@ impl Program {
         Ok(count)
     }
 
+    /// The capture arrays of `regexp_matches` (regex.md §8c): the first match only, or every
+    /// non-overlapping match when `global` (the same advance as [`replace_matches`](Self::replace_matches)
+    /// — an empty match continues one character on). Each entry is shaped like [`regexp_match`](Self::regexp_match)'s
+    /// result: groups 1..n (an unset group `None`), or the whole match when the pattern has no group.
+    pub fn all_matches(
+        &self,
+        match_input: &[char],
+        orig_input: &[char],
+        global: bool,
+        m: &mut Meter,
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        let found = self.replace_matches(match_input, global, m)?;
+        Ok(found
+            .iter()
+            .map(|saves| {
+                if self.ngroups == 0 {
+                    vec![slice_group(orig_input, saves[0], saves[1])]
+                } else {
+                    (1..=self.ngroups)
+                        .map(|g| slice_group(orig_input, saves[2 * g], saves[2 * g + 1]))
+                        .collect()
+                }
+            })
+            .collect())
+    }
+
+    /// The pieces of `regexp_split_to_array` / `regexp_split_to_table` (regex.md §8c): the text
+    /// between consecutive matches, found with the global advance, then the text after the last.
+    /// PostgreSQL's DEGENERATE matches split nothing: an empty match at the start or end of the
+    /// subject, or one that ends no later than the previous match — so `''` splits into characters
+    /// and a split of the empty string is one empty piece. The pieces are sliced from the
+    /// ORIGINAL-case subject (same length as the matched one).
+    pub fn split_pieces(
+        &self,
+        match_input: &[char],
+        orig_input: &[char],
+        m: &mut Meter,
+    ) -> Result<Vec<String>> {
+        let len = match_input.len();
+        let mut pieces = Vec::new();
+        let mut pos = 0usize;
+        let mut prev_end = 0usize; // the end of the previous match, degenerate or not
+        let mut piece_start = 0usize; // the end of the previous SPLITTING match
+        while pos <= len {
+            let Some(saves) = self.search(match_input, pos, m)? else {
+                break;
+            };
+            let (s, e) = (saves[0] as usize, saves[1] as usize);
+            if s < len && e > prev_end {
+                pieces.push(orig_input[piece_start..s].iter().collect());
+                piece_start = e;
+            }
+            prev_end = e;
+            pos = if e > s { e } else { e + 1 };
+        }
+        pieces.push(orig_input[piece_start..len].iter().collect());
+        Ok(pieces)
+    }
+
     /// The capture slots of the N-th (1-based) non-overlapping match at or after `start`
     /// (`regexp_substr` / `regexp_instr`, regex.md §8b), or `None` when fewer than N matches exist.
     /// Same non-overlapping advance as [`regexp_count`](Self::regexp_count).

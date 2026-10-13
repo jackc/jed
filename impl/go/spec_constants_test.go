@@ -556,7 +556,8 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			continue
 		}
 		switch o.Name {
-		case "regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr":
+		case "regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr",
+			"regexp_split_to_array":
 			// A regex scalar function (regex.md §8 / §8b): no scalar kernel id — the kernel is the
 			// reRegexFunc eval, reached from resolveRegexFunc. Its result is a scalar (text / boolean /
 			// i32) or a concrete text[] code.

@@ -467,6 +467,7 @@ import {
   collatedSortKey,
   columnCollation,
   commonCollation,
+  combineDerivs,
   deriveCollation,
   elemJsonText,
   jsonArgNode,
@@ -15998,6 +15999,8 @@ export class Engine {
     if (lname === "generate_series")
       return this.resolveGenerateSeries(args, alias, argScope, ptypes);
     if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
+    if (lname === "regexp_matches" || lname === "regexp_split_to_table")
+      return this.resolveRegexSrf(lname, args, alias, argScope, ptypes);
     // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
     // jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
     // json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
@@ -16502,6 +16505,27 @@ export class Engine {
     throw noFuncOverload("unnest");
   }
 
+  // resolveRegexSrf resolves regexp_matches / regexp_split_to_table (regex.md §8c). The call resolves
+  // exactly like the scalar regexp functions (text args, a constant pattern precompiled once per
+  // statement) into ONE regexFunc node — the relation's single arg — whose eval does the whole match
+  // and charges its operator_eval / regex_compile / regex_step; the producer then emits one row per
+  // match (a `text[]` column) or per split piece (a `text` column). Like any function returning a
+  // collatable type, the column takes the combined collation of the args.
+  private resolveRegexSrf(
+    name: "regexp_matches" | "regexp_split_to_table",
+    args: Expr[],
+    alias: string | null,
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const { node } = resolveRegexFunc(argScope, { name, args, star: false }, forbidden, ptypes);
+    const colTy = name === "regexp_matches" ? arrayT(scalarT("text")) : scalarT("text");
+    const table = srfTable(name, alias, colTy);
+    setSyntheticCollation(table.columns[0]!, combineDerivs(argScope, args));
+    return { table, srf: { kind: name, args: [node] } };
+  }
+
   // generateSeriesRows generates the rows of a generate_series(start, stop[, step]) FROM-clause
   // source (spec/design/functions.md §10), as one-column rows. The args evaluate ONCE against the
   // outer environment with no local row (non-LATERAL). PostgreSQL semantics: any NULL arg → zero
@@ -16921,6 +16945,23 @@ export class Engine {
       const row = [e];
       meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
       out.push(row);
+    }
+    return out;
+  }
+
+  // regexSrfRows generates the rows of regexp_matches / regexp_split_to_table (regex.md §8c). The
+  // single arg is the call node: a NULL argument makes it NULL → zero rows; otherwise it yields the
+  // per-row values (each match's text[], or each split piece) and each charges one generatedRow,
+  // guarded.
+  private regexSrfRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+    const v = evalExpr(srf.args[0]!, [], env, meter);
+    if (v.kind === "null") return [];
+    if (v.kind !== "array") throw new Error("a regexp SRF call yields an array of its rows");
+    const out: Row[] = [];
+    for (const item of v.elements) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([item]);
     }
     return out;
   }
@@ -18479,6 +18520,10 @@ export class Engine {
         case "json_record":
         case "jsonb_path_query":
           srfRows = this.jsonSrfRows(rel.srf, env, meter);
+          break;
+        case "regexp_matches":
+        case "regexp_split_to_table":
+          srfRows = this.regexSrfRows(rel.srf, env, meter);
           break;
         case "json_table":
           srfRows = this.jsonTableRows(rel.srf, env, meter);
@@ -27437,7 +27482,12 @@ export type RExpr =
   // the one-shot flag charging its regex_compile cost once per execution.
   | {
       kind: "regexFunc";
-      func: "replace" | "match" | "like" | "count" | "substr" | "instr";
+      // split_to_array is regexp_split_to_array → text[] (regex.md §8c). matches / split_to_table are
+      // the set-returning regexp_matches / regexp_split_to_table, reached only as the single arg of a
+      // regexpMatches / regexpSplitToTable SRF: their eval yields an internal array of the produced
+      // row values (each match's text[] capture array, or each split piece) — a transport the SRF
+      // producer unpacks, never a SQL value.
+      func: RegexFuncName;
       args: RExpr[];
       program: RegexProgram | null;
       compileCharged: boolean;
@@ -27854,6 +27904,18 @@ export type ArrayFuncName =
 // (spec/design/range-functions.md §1, RF1). Each name is single-arity; the kernel recovers
 // everything from the operand range value (self-describing). lower/upper yield the bound value
 // (ELEM) or NULL when empty/unbounded; the rest yield boolean. All are STRICT (a NULL range → NULL).
+// The regex function kernels (spec/design/regex.md §8 / §8b / §8c); EXPLAIN renders `regexp_<name>`.
+export type RegexFuncName =
+  | "replace"
+  | "match"
+  | "like"
+  | "count"
+  | "substr"
+  | "instr"
+  | "split_to_array"
+  | "matches"
+  | "split_to_table";
+
 export type RangeFuncName =
   | "lower"
   | "upper"
@@ -27987,6 +28049,12 @@ export type SrfKind =
   // jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
   // evaluation sequence over the context document. `args` is `[ctx, path]`.
   | "jsonb_path_query"
+  // regexp_matches(string, pattern [, flags]) (regex.md §8c): one `text[]` row per match (at most one
+  // without the `g` flag). `args` is the single regexFunc call node.
+  | "regexp_matches"
+  // regexp_split_to_table(string, pattern [, flags]) (regex.md §8c): one `text` row per split piece.
+  // `args` is the single regexFunc call node.
+  | "regexp_split_to_table"
   // JSON_TABLE(ctx, path COLUMNS (…)) (T1, json-table.md §3): a multi-column relation produced by the
   // recursive default-plan expansion. `args` is `[ctx]`; the resolved column tree is the SrfPlan's
   // `jtPlan` field.
@@ -32501,7 +32569,8 @@ export function resolveFuncCall(
     lname === "regexp_like" ||
     lname === "regexp_count" ||
     lname === "regexp_substr" ||
-    lname === "regexp_instr"
+    lname === "regexp_instr" ||
+    lname === "regexp_split_to_array"
   ) {
     rejectNamed(lname, e.argNames);
     return resolveRegexFunc(scope, e, ag, params);
@@ -32589,7 +32658,7 @@ export function resolveRegexFunc(
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const name = e.name;
-  let func: "replace" | "match" | "like" | "count" | "substr" | "instr";
+  let func: RegexFuncName;
   let flagsIdx = -1;
   // intPositions are the integer-typed argument indices; source(0) and pattern(1) are always text.
   let intPositions: number[] = [];
@@ -32647,6 +32716,19 @@ export function resolveRegexFunc(
     func = "instr";
     flagsIdx = 5;
     intPositions = [2, 3, 4, 6];
+  } else if (name === "regexp_split_to_array" && n === 2) func = "split_to_array";
+  else if (name === "regexp_split_to_array" && n === 3) {
+    func = "split_to_array";
+    flagsIdx = 2;
+    // The set-returning forms (regex.md §8c), reached from resolveSRF only.
+  } else if (name === "regexp_matches" && n === 2) func = "matches";
+  else if (name === "regexp_matches" && n === 3) {
+    func = "matches";
+    flagsIdx = 2;
+  } else if (name === "regexp_split_to_table" && n === 2) func = "split_to_table";
+  else if (name === "regexp_split_to_table" && n === 3) {
+    func = "split_to_table";
+    flagsIdx = 2;
   } else throw noFuncOverload(name);
 
   const rargs: RExpr[] = [];
@@ -32677,7 +32759,11 @@ export function resolveRegexFunc(
   if (program !== null) params.uncacheable = true;
   let type: ResolvedType;
   if (func === "replace" || func === "substr") type = { kind: "text" };
-  else if (func === "match") type = { kind: "array", elem: { kind: "text" } };
+  else if (func === "match" || func === "split_to_array" || func === "split_to_table")
+    type = { kind: "array", elem: { kind: "text" } };
+  // The SRF transport: an array of the per-match text[] captures (the SRF types its column).
+  else if (func === "matches")
+    type = { kind: "array", elem: { kind: "array", elem: { kind: "text" } } };
   else if (func === "like") type = { kind: "bool" };
   else type = { kind: "int", ty: "i32" }; // count, instr
   return { node: { kind: "regexFunc", func, args: rargs, program, compileCharged: false }, type };

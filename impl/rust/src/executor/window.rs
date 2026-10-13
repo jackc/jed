@@ -1459,6 +1459,7 @@ mod registry_tests {
                     | "regexp_count"
                     | "regexp_substr"
                     | "regexp_instr"
+                    | "regexp_split_to_array"
             ) {
                 // A regex scalar function (regex.md §8 / §8b): no scalar kernel id — the kernel is the
                 // `RExpr::RegexFunc` eval, reached from `resolve_regex_func`. Its result is a scalar

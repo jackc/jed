@@ -2120,7 +2120,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if len(vals) > 3 {
 				flags = vals[3].str()
 			}
-		case rxMatch, rxLike:
+		case rxMatch, rxLike, rxSplitToArray, rxMatches, rxSplitToTable:
 			if len(vals) > 2 {
 				flags = vals[2].str()
 			}
@@ -2196,15 +2196,21 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, badParam("subexpr", subexpr)
 			}
 		}
-		// Validate flags: `i` (all), `g` (replace only); anything else is 2201B.
+		// Validate flags: `i` and `g` are known, anything else is 2201B. Then (PG order) `g` on a
+		// function that does not take it — all but regexp_replace / regexp_matches — is PostgreSQL's
+		// 22023 (regex.md §8c).
 		for _, c := range flags {
-			if !(c == 'i' || (c == 'g' && e.rxFunc == rxReplace)) {
+			if c != 'i' && c != 'g' {
 				return Value{}, newError(InvalidRegularExpression,
 					fmt.Sprintf("invalid regular expression: invalid option %q", string(c)))
 			}
 		}
 		insensitive := strings.ContainsRune(flags, 'i')
 		global := strings.ContainsRune(flags, 'g')
+		if global && e.rxFunc != rxReplace && e.rxFunc != rxMatches {
+			return Value{}, newError(InvalidParameterValue,
+				fmt.Sprintf("%s() does not support the \"global\" option", explainRegexFunc(e.rxFunc)))
+		}
 		// The original-case subject (for output/captures) and the matched subject (folded when
 		// case-insensitive — same length, so offsets carry over, regex.md §8).
 		origRunes := []rune(source)
@@ -2276,6 +2282,35 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return BoolValue(matched), nil
+		case rxSplitToArray, rxSplitToTable:
+			pieces, err := prog.splitPieces(matchRunes, origRunes, m)
+			if err != nil {
+				return Value{}, err
+			}
+			elems := make([]Value, len(pieces))
+			for i, p := range pieces {
+				elems[i] = TextValue(p)
+			}
+			return ArrayValue(elems), nil
+		case rxMatches:
+			// The SRF transport: one text[] capture array per match.
+			found, err := prog.allMatches(matchRunes, origRunes, global, m)
+			if err != nil {
+				return Value{}, err
+			}
+			rows := make([]Value, len(found))
+			for i, groups := range found {
+				elems := make([]Value, len(groups))
+				for j, g := range groups {
+					if g == nil {
+						elems[j] = NullValue()
+					} else {
+						elems[j] = TextValue(*g)
+					}
+				}
+				rows[i] = ArrayValue(elems)
+			}
+			return ArrayValue(rows), nil
 		case rxCount:
 			cnt, err := prog.regexpCount(matchRunes, int(start0), m)
 			if err != nil {

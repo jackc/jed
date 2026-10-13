@@ -1231,7 +1231,11 @@ impl RExpr {
                             flags = text(v);
                         }
                     }
-                    RegexFunc::Match | RegexFunc::Like => {
+                    RegexFunc::Match
+                    | RegexFunc::Like
+                    | RegexFunc::SplitToArray
+                    | RegexFunc::Matches
+                    | RegexFunc::SplitToTable => {
                         if let Some(v) = vals.get(2) {
                             flags = text(v);
                         }
@@ -1315,12 +1319,18 @@ impl RExpr {
                             return Err(bad_param("subexpr", subexpr));
                         }
                     }
-                    RegexFunc::Replace | RegexFunc::Match | RegexFunc::Like => {}
+                    RegexFunc::Replace
+                    | RegexFunc::Match
+                    | RegexFunc::Like
+                    | RegexFunc::SplitToArray
+                    | RegexFunc::Matches
+                    | RegexFunc::SplitToTable => {}
                 }
-                // Validate flags: `i` (all), `g` (replace only); anything else is 2201B.
+                // Validate flags: `i` and `g` are known, anything else is 2201B. Then (PG order) `g`
+                // on a function that does not take it — all but regexp_replace / regexp_matches — is
+                // PostgreSQL's 22023 (regex.md §8c).
                 for c in flags.chars() {
-                    let ok = c == 'i' || (c == 'g' && *func == RegexFunc::Replace);
-                    if !ok {
+                    if c != 'i' && c != 'g' {
                         return Err(EngineError::new(
                             SqlState::InvalidRegularExpression,
                             format!("invalid regular expression: invalid option \"{c}\""),
@@ -1329,6 +1339,15 @@ impl RExpr {
                 }
                 let insensitive = flags.contains('i');
                 let global = flags.contains('g');
+                if global && !matches!(func, RegexFunc::Replace | RegexFunc::Matches) {
+                    return Err(EngineError::new(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "{}() does not support the \"global\" option",
+                            explain_regex_func(*func)
+                        ),
+                    ));
+                }
                 // The original-case subject (for output/captures) and the matched subject (folded
                 // when case-insensitive — same length, so offsets carry over, regex.md §8).
                 let orig_chars: Vec<char> = source.chars().collect();
@@ -1395,6 +1414,28 @@ impl RExpr {
                         }
                     },
                     RegexFunc::Like => Ok(Value::Bool(prog.is_match(&match_chars, m)?)),
+                    RegexFunc::SplitToArray | RegexFunc::SplitToTable => {
+                        let pieces = prog.split_pieces(&match_chars, &orig_chars, m)?;
+                        Ok(Value::Array(ArrayVal::one_dim(
+                            pieces.into_iter().map(Value::Text).collect(),
+                        )))
+                    }
+                    // The SRF transport (RegexFunc::Matches): one text[] capture array per match.
+                    RegexFunc::Matches => {
+                        let found = prog.all_matches(&match_chars, &orig_chars, global, m)?;
+                        let rows: Vec<Value> = found
+                            .into_iter()
+                            .map(|groups| {
+                                Value::Array(ArrayVal::one_dim(
+                                    groups
+                                        .into_iter()
+                                        .map(|g| g.map_or(Value::Null, Value::Text))
+                                        .collect(),
+                                ))
+                            })
+                            .collect();
+                        Ok(Value::Array(ArrayVal::one_dim(rows)))
+                    }
                     RegexFunc::Count => {
                         Ok(Value::Int(prog.regexp_count(&match_chars, start0, m)?))
                     }

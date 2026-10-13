@@ -3037,6 +3037,17 @@ pub(crate) enum RegexFunc {
     /// regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer
     /// (regex.md §8b).
     Instr,
+    /// regexp_split_to_array(string, pattern [, flags]) → text[] (regex.md §8c).
+    SplitToArray,
+    /// regexp_matches(string, pattern [, flags]) — the set-returning form (regex.md §8c), reached
+    /// only as the single arg of a [`SrfKind::RegexpMatches`] relation. Its eval yields an internal
+    /// one-dimensional array whose elements are the per-match `text[]` capture arrays (one per
+    /// produced row; empty for no match) — a transport the SRF producer unpacks, never a SQL value.
+    Matches,
+    /// regexp_split_to_table(string, pattern [, flags]) — the set-returning split (regex.md §8c),
+    /// reached only as the single arg of a [`SrfKind::RegexpSplitToTable`] relation. Its eval yields
+    /// the `regexp_split_to_array` pieces, which the SRF producer unpacks one row each.
+    SplitToTable,
 }
 
 /// The range BOOLEAN operators (spec/design/range-functions.md §3, RF3). Each is a binary infix
@@ -4675,6 +4686,12 @@ pub(crate) enum SrfKind {
     /// to the C0 col-def-list columns by name, coercing each to its declared type. `set` = the
     /// recordset form (one row per array element); else one record row. `jsonb` selects the input type.
     JsonRecord { jsonb: bool, set: bool },
+    /// `regexp_matches(string, pattern [, flags])` (regex.md §8c): one `text[]` row per match (at most
+    /// one without the `g` flag). `args` is the single [`RExpr::RegexFunc`] call node.
+    RegexpMatches,
+    /// `regexp_split_to_table(string, pattern [, flags])` (regex.md §8c): one `text` row per split
+    /// piece. `args` is the single [`RExpr::RegexFunc`] call node.
+    RegexpSplitToTable,
     /// `jsonb_path_query(jsonb, jsonpath)` (P2, jsonpath.md §5.2): one `jsonb` row per item of the
     /// path's evaluation sequence over the context document. `args` is `[ctx, path]`.
     JsonbPathQuery,

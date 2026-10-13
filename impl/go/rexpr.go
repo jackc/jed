@@ -955,12 +955,22 @@ const (
 type regexFunc int
 
 const (
-	rxReplace regexFunc = iota // regexp_replace(source, pattern, replacement [, flags]) → text
-	rxMatch                    // regexp_match(source, pattern [, flags]) → text[]
-	rxLike                     // regexp_like(string, pattern [, flags]) → boolean (regex.md §8b)
-	rxCount                    // regexp_count(string, pattern [, start [, flags]]) → integer
-	rxSubstr                   // regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text
-	rxInstr                    // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer
+	rxReplace      regexFunc = iota // regexp_replace(source, pattern, replacement [, flags]) → text
+	rxMatch                         // regexp_match(source, pattern [, flags]) → text[]
+	rxLike                          // regexp_like(string, pattern [, flags]) → boolean (regex.md §8b)
+	rxCount                         // regexp_count(string, pattern [, start [, flags]]) → integer
+	rxSubstr                        // regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text
+	rxInstr                         // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer
+	rxSplitToArray                  // regexp_split_to_array(string, pattern [, flags]) → text[] (regex.md §8c)
+	// rxMatches is regexp_matches (regex.md §8c), reached only as the single arg of an srfRegexpMatches
+	// relation. Its eval yields an internal one-dimensional array whose elements are the per-match
+	// text[] capture arrays (one per produced row; empty for no match) — a transport the SRF producer
+	// unpacks, never a SQL value.
+	rxMatches
+	// rxSplitToTable is regexp_split_to_table (regex.md §8c), reached only as the single arg of an
+	// srfRegexpSplitToTable relation. Its eval yields the regexp_split_to_array pieces, which the SRF
+	// producer unpacks one row each.
+	rxSplitToTable
 )
 
 // rangeOp selects a range BOOLEAN operator (spec/design/range-functions.md §3, RF3). Each is a binary
@@ -1517,6 +1527,12 @@ const (
 	// srfJsonbPathQuery is jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2) — one `jsonb` row
 	// per item of the path's evaluation sequence over the context document. `args` is `[ctx, path]`.
 	srfJsonbPathQuery
+	// srfRegexpMatches is regexp_matches(string, pattern [, flags]) (regex.md §8c) — one `text[]` row
+	// per match (at most one without the `g` flag). `args` is the single reRegexFunc call node.
+	srfRegexpMatches
+	// srfRegexpSplitToTable is regexp_split_to_table(string, pattern [, flags]) (regex.md §8c) — one
+	// `text` row per split piece. `args` is the single reRegexFunc call node.
+	srfRegexpSplitToTable
 	// srfJsonTable is JSON_TABLE(ctx, path COLUMNS (…)) (T1, json-table.md §3) — a multi-column
 	// relation produced by the recursive default-plan expansion. `args` is `[ctx]`; the resolved column
 	// tree is the srfPlan's `jsonTable` field.

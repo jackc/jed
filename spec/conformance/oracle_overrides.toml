@@ -582,6 +582,16 @@ sql = "SELECT unnest(ARRAY[1,2])"
 reason = "jed: a SELECT-list set-returning function is deferred (array-functions.md §6) — jed has no scalar `unnest`, so it is 42883 undefined_function. PostgreSQL allows a SELECT-list SRF and returns the rows. A documented deferral."
 
 [[override]]
+file = "query/regexp_srf.test"
+sql = "SELECT regexp_matches('abc', 'b')"
+reason = "jed: a SELECT-list set-returning function is deferred (functions.md §10, the unnest/generate_series precedent) — jed has no scalar `regexp_matches`, so it is 42883 undefined_function. PostgreSQL allows a SELECT-list SRF and returns the row. A documented deferral; FROM regexp_matches(...) is the supported form."
+
+[[override]]
+file = "query/regexp_srf.test"
+sql = "SELECT regexp_split_to_table('a b', ' ')"
+reason = "jed: a SELECT-list set-returning function is deferred (functions.md §10, the unnest/generate_series precedent) — jed has no scalar `regexp_split_to_table`, so it is 42883 undefined_function. PostgreSQL allows a SELECT-list SRF and returns the rows. A documented deferral; FROM regexp_split_to_table(...) is the supported form."
+
+[[override]]
 file = "query/unnest.test"
 sql = "SELECT * FROM unnest(ARRAY[1,2]) WITH ORDINALITY"
 reason = "jed: WITH ORDINALITY is deferred (array-functions.md §6) — the trailing keyword is a 42601 syntax error. PostgreSQL supports it. A documented deferral."
@@ -1113,21 +1123,17 @@ file = "expr/numeric_functions.test"
 sql = "SELECT trunc(5)"
 reason = "jed: trunc() over a single integer argument returns decimal/numeric (the catalog trunc integer overload — the `D` tag), like round(int). PostgreSQL has no single-arg trunc(integer); it resolves the call to trunc(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
 
-# --- regexp_* flag set: jed's RE2-able flavor (regex.md §1/§8b) accepts only the `i` flag (and `g`
-# for regexp_replace), unlike PostgreSQL's larger c/g/m/n/p/q/s/t/w/x set. A flag other than `i` is
-# 2201B (invalid_regular_expression) across ALL of jed's regexp functions — consistent with the
-# existing regexp_replace/regexp_match. PostgreSQL accepts `q` (quote) and so RETURNS a row, and uses
-# 22023 (with a different message) for `z`/`g`, so these statement-error records diverge. A deliberate,
-# documented flavor narrowing, not a semantic disagreement on the supported (`i`) surface.
+# --- regexp_* flag set: jed's RE2-able flavor (regex.md §1/§8b) knows only the `i` and `g` flags,
+# unlike PostgreSQL's larger c/g/m/n/p/q/s/t/w/x set. Any other flag is 2201B
+# (invalid_regular_expression) across ALL of jed's regexp functions. PostgreSQL accepts `q` (quote)
+# and so RETURNS a row, and uses 22023 (with a different message) for an unknown option like `z`, so
+# these statement-error records diverge. A deliberate, documented flavor narrowing, not a semantic
+# disagreement on the supported surface. (`g` on a function that does not take it is PG's 22023 in
+# jed too — regex.md §8c.)
 [[override]]
 file = "expr/regexp_oracle_functions.test"
 sql = "SELECT regexp_like('abc', 'a', 'z') FROM one"
 reason = "jed: a regexp flag other than `i` is 2201B (jed's RE2 flavor owns a smaller flag set than PG — regex.md §1/§8b, consistent with regexp_replace/regexp_match). PostgreSQL knows the `z` option and raises 22023 'invalid regular expression option: z'. The codes differ (jed folds an unknown option into invalid_regular_expression); a documented flavor narrowing."
-
-[[override]]
-file = "expr/regexp_oracle_functions.test"
-sql = "SELECT regexp_count('abc', 'a', 1, 'g') FROM one"
-reason = "jed: the `g` (global) flag is regexp_replace-only, so on regexp_count it is 2201B (regex.md §8b). PostgreSQL raises 22023 'regexp_count() does not support the global option'. Same rejection, different SQLSTATE/message — jed's RE2 flag set is narrower and uniform across the regexp_* family."
 
 # --- qualified star `t.*` parser narrowings (grammar.md §15). jed's `t.*` is a select-list
 # construct only, recognized by the identifier-dot-star token shape; two deliberate narrowings

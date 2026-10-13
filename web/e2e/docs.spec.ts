@@ -675,3 +675,18 @@ test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('cost=');
 });
+
+test('the pattern-matching page autoruns the regexp_matches and split demos', async ({ page }) => {
+  await page.goto('/docs/sql/pattern-matching/');
+  // regexp_matches with `g`: one row per key=value pair.
+  const matchesRows = livePanel(page, 'regexpMatches').getByTestId('result-rows');
+  await expect(matchesRows).toContainText('port');
+  await expect(matchesRows).toContainText('5432');
+  // regexp_split_to_table: the runs of whitespace split the words.
+  const tableRows = livePanel(page, 'regexpSplitTable').getByTestId('result-rows');
+  await expect(tableRows).toContainText('quick');
+  await expect(tableRows).toContainText('brown');
+  // regexp_split_to_array over a seeded column.
+  const arrayRows = livePanel(page, 'regexpSplitArray').getByTestId('result-rows');
+  await expect(arrayRows).toContainText('{bob,work,example,org}');
+});

@@ -280,5 +280,13 @@ SELECT regexp_substr('a', '[') FROM one
 statement error 2201B
 SELECT regexp_like('abc', 'a', 'z') FROM one
 
-statement error 2201B
+# The `g` flag is a known option these functions reject: PostgreSQL's 22023 ('regexp_count() does
+# not support the "global" option'), raised after an unknown option would be (PG's order).
+statement error 22023
 SELECT regexp_count('abc', 'a', 1, 'g') FROM one
+
+statement error 22023
+SELECT regexp_like('abc', 'a', 'g') FROM one
+
+statement error 22023
+SELECT regexp_substr('abc', 'a', 1, 1, 'ig') FROM one

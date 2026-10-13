@@ -2091,6 +2091,9 @@ impl Engine {
                 | SrfKind::JsonbEachText
                 | SrfKind::JsonRecord { .. }
                 | SrfKind::JsonbPathQuery => self.json_srf_rows(srf, &env, meter),
+                SrfKind::RegexpMatches | SrfKind::RegexpSplitToTable => {
+                    self.regex_srf_rows(srf, &env, meter)
+                }
                 SrfKind::JsonTable => self.json_table_rows(srf, &env, meter),
                 SrfKind::JedTables => self.jed_tables_rows(srf, meter),
                 SrfKind::JedColumns => self.jed_columns_rows(srf, meter),

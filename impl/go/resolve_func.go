@@ -933,6 +933,19 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		rfn, flagsIdx, intPositions = rxInstr, 5, []int{2, 3, 4}
 	case name == "regexp_instr" && len(fc.Args) == 7:
 		rfn, flagsIdx, intPositions = rxInstr, 5, []int{2, 3, 4, 6}
+	case name == "regexp_split_to_array" && len(fc.Args) == 2:
+		rfn = rxSplitToArray
+	case name == "regexp_split_to_array" && len(fc.Args) == 3:
+		rfn, flagsIdx = rxSplitToArray, 2
+	// The set-returning forms (regex.md §8c), reached from resolveSRF only.
+	case name == "regexp_matches" && len(fc.Args) == 2:
+		rfn = rxMatches
+	case name == "regexp_matches" && len(fc.Args) == 3:
+		rfn, flagsIdx = rxMatches, 2
+	case name == "regexp_split_to_table" && len(fc.Args) == 2:
+		rfn = rxSplitToTable
+	case name == "regexp_split_to_table" && len(fc.Args) == 3:
+		rfn, flagsIdx = rxSplitToTable, 2
 	default:
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
@@ -992,8 +1005,13 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	switch rfn {
 	case rxReplace, rxSubstr:
 		result = resolvedType{kind: rtText}
-	case rxMatch:
+	case rxMatch, rxSplitToArray, rxSplitToTable:
 		elem := resolvedType{kind: rtText}
+		result = resolvedType{kind: rtArray, elem: &elem}
+	case rxMatches:
+		// The SRF transport: an array of the per-match text[] captures (the SRF types its column).
+		inner := resolvedType{kind: rtText}
+		elem := resolvedType{kind: rtArray, elem: &inner}
 		result = resolvedType{kind: rtArray, elem: &elem}
 	case rxLike:
 		result = resolvedType{kind: rtBool}
@@ -2770,7 +2788,8 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	// The regex scalar functions (regex.md §8 / §8b) are Kind=="function" too, but return via a
 	// dedicated reRegexFunc node, so they are intercepted before the generic scalar path.
 	switch name {
-	case "regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr":
+	case "regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr",
+		"regexp_split_to_array":
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}

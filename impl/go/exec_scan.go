@@ -2125,6 +2125,8 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 			return db.unnestRows(rel.srf, env, meter, mask)
 		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText, srfJSONRecord, srfJSONRecordset, srfJsonbPathQuery:
 			rows, err = db.jsonSrfRows(rel.srf, env, meter)
+		case srfRegexpMatches, srfRegexpSplitToTable:
+			rows, err = db.regexSrfRows(rel.srf, env, meter)
 		case srfJsonTable:
 			rows, err = db.jsonTableRows(rel.srf, env, meter)
 		case srfJedTables:

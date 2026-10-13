@@ -214,6 +214,7 @@ pub(crate) fn resolve_func_call(
             | "regexp_count"
             | "regexp_substr"
             | "regexp_instr"
+            | "regexp_split_to_array"
     ) {
         reject_named(&lname, arg_names)?;
         if star {
@@ -396,6 +397,13 @@ pub(crate) fn resolve_regex_func(
             ("regexp_instr", 5) => (RegexFunc::Instr, None, &[2, 3, 4]),
             ("regexp_instr", 6) => (RegexFunc::Instr, Some(5), &[2, 3, 4]),
             ("regexp_instr", 7) => (RegexFunc::Instr, Some(5), &[2, 3, 4, 6]),
+            ("regexp_split_to_array", 2) => (RegexFunc::SplitToArray, None, &[]),
+            ("regexp_split_to_array", 3) => (RegexFunc::SplitToArray, Some(2), &[]),
+            // The set-returning forms (regex.md §8c), reached from `resolve_srf` only.
+            ("regexp_matches", 2) => (RegexFunc::Matches, None, &[]),
+            ("regexp_matches", 3) => (RegexFunc::Matches, Some(2), &[]),
+            ("regexp_split_to_table", 2) => (RegexFunc::SplitToTable, None, &[]),
+            ("regexp_split_to_table", 3) => (RegexFunc::SplitToTable, Some(2), &[]),
             _ => return Err(no_func_overload(name)),
         };
     let mut rargs = Vec::with_capacity(args.len());
@@ -435,7 +443,13 @@ pub(crate) fn resolve_regex_func(
     }
     let result = match func {
         RegexFunc::Replace | RegexFunc::Substr => ResolvedType::Text,
-        RegexFunc::Match => ResolvedType::Array(Box::new(ResolvedType::Text)),
+        RegexFunc::Match | RegexFunc::SplitToArray | RegexFunc::SplitToTable => {
+            ResolvedType::Array(Box::new(ResolvedType::Text))
+        }
+        // The SRF transport: an array of the per-match text[] captures (the SRF types its column).
+        RegexFunc::Matches => {
+            ResolvedType::Array(Box::new(ResolvedType::Array(Box::new(ResolvedType::Text))))
+        }
         RegexFunc::Like => ResolvedType::Bool,
         RegexFunc::Count | RegexFunc::Instr => ResolvedType::Int(ScalarType::Int32),
     };
@@ -1804,7 +1818,7 @@ fn explain_range_func(func: RangeFunc) -> &'static str {
     }
 }
 
-fn explain_regex_func(func: RegexFunc) -> &'static str {
+pub(crate) fn explain_regex_func(func: RegexFunc) -> &'static str {
     match func {
         RegexFunc::Replace => "regexp_replace",
         RegexFunc::Match => "regexp_match",
@@ -1812,6 +1826,9 @@ fn explain_regex_func(func: RegexFunc) -> &'static str {
         RegexFunc::Count => "regexp_count",
         RegexFunc::Substr => "regexp_substr",
         RegexFunc::Instr => "regexp_instr",
+        RegexFunc::SplitToArray => "regexp_split_to_array",
+        RegexFunc::Matches => "regexp_matches",
+        RegexFunc::SplitToTable => "regexp_split_to_table",
     }
 }
 
@@ -5203,7 +5220,7 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
 
 /// Combine the derivations of a node's inputs, starting from none — so a lone conflicted input
 /// yields (PostgreSQL gives such a node its default collation).
-fn combine_derivs(scope: &Scope, args: &[Expr]) -> Result<Deriv> {
+pub(crate) fn combine_derivs(scope: &Scope, args: &[Expr]) -> Result<Deriv> {
     let mut d = Deriv::None;
     for a in args {
         d = combine_deriv(d, derive_collation(scope, a)?)?;

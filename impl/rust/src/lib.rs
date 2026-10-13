@@ -304,6 +304,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.regexp_count",
     "func.regexp_substr",
     "func.regexp_instr",
+    "func.regexp_split_to_array",
+    "func.regexp_matches",
+    "func.regexp_split_to_table",
     // Array function surface AF3 (array-functions.md §9): the polymorphic SRF unnest(anyarray) — a
     // FROM-clause row source expanding an array into one row per element (functions.md §10).
     "func.unnest",

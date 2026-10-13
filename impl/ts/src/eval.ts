@@ -187,9 +187,11 @@ import {
   compileRegex,
   regexIsMatch,
   regexNinst,
+  regexpAllMatches,
   regexpCount,
   regexpMatch,
   regexpNthMatch,
+  regexpSplitPieces,
 } from "./regex.ts";
 import type { RegexProgram } from "./regex.ts";
 import { NEG_INFINITY, POS_INFINITY, makeTimestamp } from "./timestamp.ts";
@@ -910,6 +912,9 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           break;
         case "match":
         case "like":
+        case "split_to_array":
+        case "matches":
+        case "split_to_table":
           if (vals[2]) flags = text(vals[2]);
           break;
         case "count":
@@ -944,9 +949,11 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         throw badParam("endoption", endoption);
       if ((e.func === "substr" || e.func === "instr") && subexpr < 0)
         throw badParam("subexpr", subexpr);
-      // Validate flags: `i` (all), `g` (replace only); anything else is 2201B.
+      // Validate flags: `i` and `g` are known, anything else is 2201B. Then (PG order) `g` on a
+      // function that does not take it — all but regexp_replace / regexp_matches — is PostgreSQL's
+      // 22023 (regex.md §8c).
       for (const c of flags) {
-        if (!(c === "i" || (c === "g" && e.func === "replace"))) {
+        if (c !== "i" && c !== "g") {
           throw engineError(
             "invalid_regular_expression",
             `invalid regular expression: invalid option "${c}"`,
@@ -955,6 +962,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       const insensitive = flags.includes("i");
       const global = flags.includes("g");
+      if (global && e.func !== "replace" && e.func !== "matches") {
+        throw engineError(
+          "invalid_parameter_value",
+          `regexp_${e.func}() does not support the "global" option`,
+        );
+      }
       // The original-case subject (for output/captures) and the matched subject (folded when
       // case-insensitive — same length, so offsets carry over, regex.md §8).
       const origCps = Array.from(source, (ch) => ch.codePointAt(0) as number);
@@ -996,6 +1009,20 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
         case "like":
           return boolValue(regexIsMatch(prog, matchCps, m));
+        case "split_to_array":
+        case "split_to_table":
+          return arrayValue(
+            regexpSplitPieces(prog, matchCps, origCps, m).map(
+              (p): Value => ({ kind: "text", text: p }),
+            ),
+          );
+        case "matches":
+          // The SRF transport: one text[] capture array per match.
+          return arrayValue(
+            regexpAllMatches(prog, matchCps, origCps, global, m).map((groups) =>
+              arrayValue(groups.map((g) => (g === null ? nullValue() : { kind: "text", text: g }))),
+            ),
+          );
         case "count":
           return intValue(BigInt(regexpCount(prog, matchCps, start0, m)));
         default: {

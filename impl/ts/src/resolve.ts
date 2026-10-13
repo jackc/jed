@@ -2048,7 +2048,7 @@ function castTargetCollatable(name: string): boolean {
 
 // combineDerivs combines the derivations of a node's inputs, starting from none — so a lone
 // conflicted input yields (PostgreSQL gives such a node its default collation).
-function combineDerivs(scope: Scope, args: Expr[]): Deriv {
+export function combineDerivs(scope: Scope, args: Expr[]): Deriv {
   let d: Deriv = { kind: "none" };
   for (const a of args) d = combineDeriv(d, deriveCollation(scope, a));
   return d;
