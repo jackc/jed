@@ -115,6 +115,15 @@ import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { optimizeSelect } from "./optimize.ts";
 import { ctasColumns, rejectPseudoType } from "./create_table_as.ts";
 import {
+  notRecursiveError,
+  planSearchCycle,
+  resolveCycleMark,
+  type SearchCyclePlan,
+  searchCycleRows,
+  starHiddenCount,
+  withCarriedColumns,
+} from "./search_cycle.ts";
+import {
   type WherePushdown,
   accessPredicate,
   joinOn,
@@ -13181,15 +13190,33 @@ export class Engine {
         throw engineError("duplicate_alias", `WITH query name ${lname} specified more than once`);
       }
       const bodyQuery = cteBodyAsQuery(cte.body);
+      const searchCycle = cte.search !== null || cte.cycle !== null;
       const shape =
         recursive && bodyQuery !== null
-          ? analyzeRecursiveCte(lname, bodyQuery)
+          ? analyzeRecursiveCte(lname, bodyQuery, searchCycle)
           : { recursive: false as const, unionAll: false };
       if (shape.recursive) {
         // The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
         const so = bodyQuery as SetOp;
+        // A SEARCH / CYCLE clause types its cycle mark before the body is planned (PostgreSQL's
+        // order — recursive-cte.md §9).
+        const mark = cte.cycle !== null ? resolveCycleMark(this, cte.cycle, ptypes) : null;
         const anchorPlan = this.planQuery(so.lhs, parent, [...inherited, ...bindings], ptypes);
-        const table = cteSyntheticTable(lname, anchorPlan, cte.columns);
+        let table = cteSyntheticTable(lname, anchorPlan, cte.columns);
+        // SEARCH / CYCLE add columns after the CTE's own (recursive-cte.md §9).
+        let sc: SearchCyclePlan | null = null;
+        if (searchCycle) {
+          sc = planSearchCycle(this, cte, table, anchorPlan.columnTypes, mark, ptypes);
+          table = cteSyntheticTableCols(
+            lname,
+            [...table.columns.map((c) => c.name), ...sc.names],
+            [...anchorPlan.columnTypes, ...sc.types],
+            [...queryPlanColumnDerivs(anchorPlan), ...sc.types.map((): Deriv => ({ kind: "none" }))],
+            [...queryPlanColumnTypmods(anchorPlan), ...sc.types.map(() => TYPMOD_NONE)],
+            null,
+          );
+        }
+        const added = sc === null ? 0 : sc.names.length;
         bindings.push({
           name: lname,
           table,
@@ -13200,15 +13227,20 @@ export class Engine {
           atReference: false,
           bodyAst: null,
           expanded: false,
+          starHidden: added,
         });
         const bi = bindings.length - 1;
-        const rhsPlan = this.planQuery(so.rhs, parent, [...inherited, ...bindings], ptypes);
+        // Under SEARCH / CYCLE the recursive term carries the self-reference's added columns as
+        // hidden trailing outputs — the parent row's, from which the executor computes the child's.
+        const rhs = sc === null ? so.rhs : withCarriedColumns(so.rhs, cte.name, sc.names);
+        const rhsPlan = this.planQuery(rhs, parent, [...inherited, ...bindings], ptypes);
+        bindings[bi]!.starHidden = 0;
         const anchorSrc = bindings[bi]!.source;
         if (anchorSrc.kind !== "query") {
           throw new Error("the anchor binding was just pushed as a query source");
         }
-        checkRecursiveColumnTypes(anchorSrc.plan, rhsPlan, lname, shape.unionAll);
-        bindings[bi]!.recursive = { plan: rhsPlan, unionAll: shape.unionAll };
+        checkRecursiveColumnTypes(anchorSrc.plan, rhsPlan, lname, shape.unionAll, added);
+        bindings[bi]!.recursive = { plan: rhsPlan, unionAll: shape.unionAll, searchCycle: sc };
         continue;
       }
       if (bodyQuery !== null) {
@@ -13237,6 +13269,7 @@ export class Engine {
           bodyAst: atReference ? bodyQuery : null,
           expanded: false,
         });
+        if (searchCycle) throw notRecursiveError(cte);
       } else {
         // A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
         // relation + capture the statement to run later.
@@ -13258,6 +13291,7 @@ export class Engine {
           bodyAst: null,
           expanded: false,
         });
+        if (searchCycle) throw notRecursiveError(cte);
       }
     }
     return bindings;
@@ -13486,6 +13520,25 @@ export class Engine {
     );
     totalCost.value += ar.cost;
     guard(totalCost.value);
+    // SEARCH / CYCLE: the expressions read only the row (recursive-cte.md §9).
+    const scEnv: EvalEnv = {
+      params,
+      outer,
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, EMPTY_CTE_CTX),
+      seam: this.session.seam,
+      rng: new StmtRng(),
+      ctes: EMPTY_CTE_CTX,
+      exec: this,
+    };
+    let anchorRows = ar.rows;
+    // SEARCH / CYCLE: each anchor row gets its added columns (recursive-cte.md §9).
+    const sc = rt.searchCycle;
+    if (sc !== null) {
+      const r = searchCycleRows(this, scEnv, sc, sc.anchor, null, anchorRows);
+      totalCost.value += r.cost;
+      guard(totalCost.value);
+      anchorRows = r.rows;
+    }
 
     // For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
     // NULL-safe distinctRowKey the set operators use.
@@ -13503,7 +13556,7 @@ export class Engine {
     };
     const result: Row[] = [];
     let working: Row[] = [];
-    for (const row of ar.rows) {
+    for (const row of anchorRows) {
       if (keep(row)) {
         acct.admitRow(row);
         result.push(row);
@@ -13541,7 +13594,16 @@ export class Engine {
       const beforeCoerce = acct.measureRows(rr.rows);
       coerceSetopRows(rr.rows, rhsTypes, anchorTypes);
       acct.reserve(acct.measureRows(rr.rows) - beforeCoerce);
-      for (const row of rr.rows) {
+      let newRows = rr.rows;
+      // SEARCH / CYCLE: drop a row whose parent closed a cycle, then replace the carried parent
+      // columns with the row's own (recursive-cte.md §9).
+      if (sc !== null) {
+        const r = searchCycleRows(this, scEnv, sc, sc.recursive, sc.filter, newRows);
+        totalCost.value += r.cost;
+        guard(totalCost.value);
+        newRows = r.rows;
+      }
+      for (const row of newRows) {
         if (keep(row)) {
           acct.admitRow(row);
           result.push(row);
@@ -15716,7 +15778,8 @@ export class Engine {
     const flat = new Scope(rels, this, null, false, ctes);
     const relStar = (i: number): number[] => {
       const out: number[] = [];
-      for (let c = 0; c < rels[i]!.table.columns.length; c++) {
+      const shown = rels[i]!.table.columns.length - starHiddenCount(rels[i]!, ctes);
+      for (let c = 0; c < shown; c++) {
         const idx = rels[i]!.offset + c;
         if (!groupHidden.includes(idx)) out.push(idx);
       }
@@ -15995,6 +16058,15 @@ export class Engine {
       derivs: columnDerivs,
       typmods: columnTypmods,
     } = resolveProjections(scope, itemsRef, projAgg, ptypes);
+    // A SEARCH / CYCLE recursive term's hidden trailing outputs (recursive-cte.md §9).
+    for (const e of sel.tail ?? []) {
+      const r = resolve(scope, e, null, projAgg, ptypes);
+      projections.push(r.node);
+      columnNames.push(e.kind === "qualifiedColumn" ? e.name : "?column?");
+      columnTypes.push(r.type);
+      columnDerivs.push({ kind: "none" });
+      columnTypmods.push(TYPMOD_NONE);
+    }
     const group =
       sel.joinGroup === true
         ? joinGroupOutputs(
@@ -30381,7 +30453,12 @@ export type CteMode = "inline" | "materialize";
 // (its own references to other such CTEs stay unexpanded), which runs only if the reference was
 // never expanded. `expanded` records that the reference was: a binding is expanded at most once per
 // statement, and an expanded binding is always inlined.
-export type RecursiveTerm = { plan: QueryPlan; unionAll: boolean };
+// searchCycle is the SEARCH / CYCLE columns the executor adds to each row (recursive-cte.md §9).
+export type RecursiveTerm = {
+  plan: QueryPlan;
+  unionAll: boolean;
+  searchCycle: SearchCyclePlan | null;
+};
 export type CteBinding = {
   name: string;
   table: Table;
@@ -30392,6 +30469,10 @@ export type CteBinding = {
   atReference: boolean;
   bodyAst: QueryExpr | null;
   expanded: boolean;
+  // starHidden is how many trailing columns `*` and `rel.*` skip: a recursive CTE's SEARCH / CYCLE
+  // columns while its own recursive term is planned, so `SELECT * FROM self` keeps the anchor's arity
+  // (recursive-cte.md §9). Zero (or absent) otherwise.
+  starHidden?: number;
 };
 
 // CteSource is what a CTE binding evaluates to (spec/design/cte.md, writable-cte.md). A plain CTE

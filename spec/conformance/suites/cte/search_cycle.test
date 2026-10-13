@@ -1,0 +1,489 @@
+# A recursive CTE's SEARCH and CYCLE clauses (spec/design/recursive-cte.md §9) — the SQL-standard
+# ordering and cycle-detection columns, as PostgreSQL defines them (rewriteSearchCycle.c):
+#   SEARCH DEPTH FIRST BY cols SET seq     — seq is a record[] path; ORDER BY seq is depth-first
+#   SEARCH BREADTH FIRST BY cols SET seq   — seq is ROW(depth, cols); ORDER BY seq is breadth-first
+#   CYCLE cols SET mark [TO v DEFAULT d] USING path
+#                                          — path is a record[] of the rows visited; a row repeating
+#                                            one on its path gets mark = v (TRUE), every other row d
+#                                            (FALSE), and a marked row is not expanded further.
+# The added columns follow the CTE's own; the recursive term may reference them, but `*` over the
+# self-reference does not expand them. The mark constants take a common type and need equality.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.create_table_as, ddl.view, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.order_by, query.where_eq, query.is_null, query.table_alias, query.qualified_column, query.join_inner, query.union, query.cte, query.cte_recursive, query.cte_search_cycle, query.derived_table, types.record_column, types.array, types.array_composite, types.composite, types.i32, types.text, types.decimal, expr.array_subscript, func.array, func.array_quantified, resource.cost_metering
+
+statement ok
+CREATE TABLE tree (id i32 PRIMARY KEY, parent i32, name text)
+
+statement ok
+INSERT INTO tree VALUES (1, NULL, 'root'), (2, 1, 'b'), (3, 1, 'a'), (4, 2, 'x'), (5, 3, 'y'), (6, 2, 'z')
+
+statement ok
+CREATE TABLE edge (src i32, dst i32, PRIMARY KEY (src, dst))
+
+statement ok
+INSERT INTO edge VALUES (1, 2), (2, 3), (3, 1), (3, 4)
+
+# --- SEARCH ------------------------------------------------------------------------------------
+
+# The cost is the recursion's (190 without the clause) plus each row's added-column expressions;
+# the path arrays are growth kernels, charged by the bytes each step builds (cost.md §8.1).
+# cost: 1599
+query IT nosort
+WITH RECURSIVE r(id) AS (
+  SELECT id FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT tree.id FROM tree JOIN r ON tree.parent = r.id
+) SEARCH DEPTH FIRST BY id SET ord
+SELECT * FROM r ORDER BY ord
+----
+1
+{(1)}
+2
+{(1),(2)}
+4
+{(1),(2),(4)}
+6
+{(1),(2),(6)}
+3
+{(1),(3)}
+5
+{(1),(3),(5)}
+
+# cost: 206
+query IT nosort
+WITH RECURSIVE r(id) AS (
+  SELECT id FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT tree.id FROM tree JOIN r ON tree.parent = r.id
+) SEARCH BREADTH FIRST BY id SET ord
+SELECT * FROM r ORDER BY ord
+----
+1
+(0,1)
+2
+(1,2)
+3
+(1,3)
+4
+(2,4)
+5
+(2,5)
+6
+(2,6)
+
+# Several search columns, of different types; the self-reference under an alias.
+query ITT nosort
+WITH RECURSIVE r(id, name) AS (
+  SELECT id, name FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT t.id, t.name FROM tree t JOIN r AS w ON t.parent = w.id
+) SEARCH BREADTH FIRST BY name, id SET ord
+SELECT id, name, ord FROM r ORDER BY ord
+----
+1
+root
+(0,root,1)
+3
+a
+(1,a,3)
+2
+b
+(1,b,2)
+4
+x
+(2,x,4)
+5
+y
+(2,y,5)
+6
+z
+(2,z,6)
+
+query IT nosort
+WITH RECURSIVE r(id, name) AS (
+  SELECT id, name FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT t.id, t.name FROM tree t JOIN r AS w ON t.parent = w.id
+) SEARCH DEPTH FIRST BY name SET ord
+SELECT id, ord FROM r ORDER BY ord
+----
+1
+{(root)}
+3
+{(root),(a)}
+5
+{(root),(a),(y)}
+2
+{(root),(b)}
+4
+{(root),(b),(x)}
+6
+{(root),(b),(z)}
+
+# Ordering by the column without projecting it, and comparing it.
+query I nosort
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+SEARCH DEPTH FIRST BY n SET ord
+SELECT n FROM r WHERE ord = ARRAY[ROW(1), ROW(2)]
+----
+2
+
+# The recursive term may read the column; `SELECT *` over the self-reference keeps the CTE's own
+# columns only.
+query IT nosort
+WITH RECURSIVE r(id) AS (
+  SELECT id FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT tree.id FROM tree JOIN r ON tree.parent = r.id WHERE cardinality(r.ord) < 2
+) SEARCH DEPTH FIRST BY id SET ord
+SELECT * FROM r ORDER BY ord
+----
+1
+{(1)}
+2
+{(1),(2)}
+3
+{(1),(3)}
+
+query IT nosort
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.* FROM r WHERE false)
+SEARCH DEPTH FIRST BY n SET ord
+SELECT * FROM r
+----
+1
+{(1)}
+
+query IT nosort
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT * FROM r WHERE false)
+SEARCH DEPTH FIRST BY n SET ord
+SELECT * FROM r
+----
+1
+{(1)}
+
+# --- CYCLE -------------------------------------------------------------------------------------
+
+# cost: 1395
+query IBT nosort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) CYCLE node SET is_cycle USING path
+SELECT * FROM g ORDER BY path
+----
+1
+false
+{(1)}
+2
+false
+{(1),(2)}
+3
+false
+{(1),(2),(3)}
+1
+true
+{(1),(2),(3),(1)}
+4
+false
+{(1),(2),(3),(4)}
+
+# No column list: the CTE's columns are its anchor's output names.
+query IBT nosort
+WITH RECURSIVE g AS (
+  SELECT 1 AS node
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) CYCLE node SET is_cycle USING path
+SELECT node, is_cycle, path FROM g ORDER BY path
+----
+1
+false
+{(1)}
+2
+false
+{(1),(2)}
+3
+false
+{(1),(2),(3)}
+1
+true
+{(1),(2),(3),(1)}
+4
+false
+{(1),(2),(3),(4)}
+
+# Written marks: text, integer, and a decimal / integer pair (decimal).
+query ITT nosort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) CYCLE node SET c TO 'Y' DEFAULT 'N' USING p
+SELECT node, c, p FROM g ORDER BY p
+----
+1
+N
+{(1)}
+2
+N
+{(1),(2)}
+3
+N
+{(1),(2),(3)}
+1
+Y
+{(1),(2),(3),(1)}
+4
+N
+{(1),(2),(3),(4)}
+
+query II nosort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) CYCLE node SET c TO 1 DEFAULT 0 USING p
+SELECT node, c FROM g ORDER BY p
+----
+1
+0
+2
+0
+3
+0
+1
+1
+4
+0
+
+query ID nosort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) CYCLE node SET c TO 1.5 DEFAULT 0 USING p
+SELECT node, c FROM g ORDER BY p
+----
+1
+0
+2
+0
+3
+0
+1
+1.5
+4
+0
+
+# A NULL mark: `mark <> NULL` is never true, so nothing past the anchor is expanded.
+query II nosort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) CYCLE node SET c TO NULL DEFAULT 0 USING p
+SELECT node, c FROM g
+----
+1
+0
+
+# UNION (distinct) compares the added columns too.
+query IBT rowsort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) CYCLE node SET is_cycle USING path
+SELECT * FROM g
+----
+1
+false
+{(1)}
+1
+true
+{(1),(2),(3),(1)}
+2
+false
+{(1),(2)}
+3
+false
+{(1),(2),(3)}
+4
+false
+{(1),(2),(3),(4)}
+
+# The recursive term may read the mark and the path.
+query IBT nosort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node WHERE NOT g.is_cycle AND cardinality(g.path) < 3
+) CYCLE node SET is_cycle USING path
+SELECT * FROM g ORDER BY path
+----
+1
+false
+{(1)}
+2
+false
+{(1),(2)}
+3
+false
+{(1),(2),(3)}
+
+query TI nosort
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+CYCLE n SET c USING p
+SELECT p[2], cardinality(p) FROM r ORDER BY n
+----
+NULL
+1
+(2)
+2
+(2)
+3
+
+query I rowsort
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+CYCLE n SET c USING p
+SELECT n FROM r WHERE ROW(2) = ANY (p)
+----
+2
+3
+
+# --- SEARCH and CYCLE together: the search column comes first --------------------------------
+
+query ITBT nosort
+WITH RECURSIVE g(node) AS (
+  SELECT 1
+  UNION ALL
+  SELECT edge.dst FROM edge JOIN g ON edge.src = g.node
+) SEARCH DEPTH FIRST BY node SET ord CYCLE node SET is_cycle USING path
+SELECT * FROM g ORDER BY ord
+----
+1
+{(1)}
+false
+{(1)}
+2
+{(1),(2)}
+false
+{(1),(2)}
+3
+{(1),(2),(3)}
+false
+{(1),(2),(3)}
+1
+{(1),(2),(3),(1)}
+true
+{(1),(2),(3),(1)}
+4
+{(1),(2),(3),(4)}
+false
+{(1),(2),(3),(4)}
+
+# --- Stored: a view may order by the column; a table cannot store it --------------------------
+
+statement ok
+CREATE VIEW walk AS WITH RECURSIVE r(id) AS (
+  SELECT id FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT tree.id FROM tree JOIN r ON tree.parent = r.id
+) SEARCH DEPTH FIRST BY id SET ord CYCLE id SET cyc TO 'y' DEFAULT 'n' USING path
+SELECT id, cyc FROM r ORDER BY ord
+
+query IT nosort
+SELECT * FROM walk
+----
+1
+n
+2
+n
+4
+n
+6
+n
+3
+n
+5
+n
+
+statement error 42P16
+CREATE TABLE bad AS WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+SEARCH DEPTH FIRST BY n SET ord SELECT * FROM r
+
+# --- Errors ------------------------------------------------------------------------------------
+
+# The CTE must reference itself.
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1) SEARCH DEPTH FIRST BY n SET ord SELECT * FROM r
+
+# Each side of the UNION must be one SELECT.
+statement error 0A000
+WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT 2 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+SEARCH DEPTH FIRST BY n SET ord SELECT * FROM r
+
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM r WHERE n < 2 UNION ALL SELECT 5))
+SEARCH DEPTH FIRST BY n SET ord SELECT * FROM r
+
+# A column list names columns of the CTE, once each.
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+SEARCH DEPTH FIRST BY x SET ord SELECT * FROM r
+
+statement error 42701
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+SEARCH DEPTH FIRST BY n, n SET ord SELECT * FROM r
+
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+CYCLE x SET c USING p SELECT * FROM r
+
+statement error 42701
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+CYCLE n, n SET c USING p SELECT * FROM r
+
+# An added column's name must be new.
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 FROM r WHERE false)
+SEARCH DEPTH FIRST BY n SET n SELECT * FROM r
+
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 FROM r WHERE false)
+CYCLE n SET n USING p SELECT * FROM r
+
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 FROM r WHERE false)
+CYCLE n SET c USING n SELECT * FROM r
+
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+CYCLE n SET c USING c SELECT * FROM r
+
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+SEARCH DEPTH FIRST BY n SET c CYCLE n SET c USING p SELECT * FROM r
+
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+SEARCH DEPTH FIRST BY n SET p CYCLE n SET c USING p SELECT * FROM r
+
+# The mark constants: a string reads as the other's type; they need a common type and equality.
+statement error 22P02
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 FROM r WHERE false)
+CYCLE n SET c TO 1 DEFAULT 'N' USING p SELECT * FROM r
+
+statement error 42804
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 FROM r WHERE false)
+CYCLE n SET c TO 1 DEFAULT true USING p SELECT * FROM r
+
+statement error 42883
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 FROM r WHERE false)
+CYCLE n SET c TO json '{}' DEFAULT json '[]' USING p SELECT * FROM r
+
+# A mark is a constant: a sign is an operator, not part of it.
+statement error 42601
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2)
+CYCLE n SET c TO -1 DEFAULT 0 USING p SELECT * FROM r

@@ -714,7 +714,8 @@ impl Engine {
         // left-deep chain the NEWEST join's merges come first. `star` holds the completed comma
         // items; `seg_star` the current one.
         let rel_star = |i: usize| -> Vec<usize> {
-            (rels[i].offset..rels[i].offset + rels[i].table.columns.len())
+            let shown = rels[i].table.columns.len() - star_hidden_count(&rels[i], ctes);
+            (rels[i].offset..rels[i].offset + shown)
                 .filter(|idx| !group_hidden.contains(idx))
                 .collect()
         };
@@ -1164,6 +1165,19 @@ impl Engine {
             mut column_derivs,
             mut column_typmods,
         ) = resolve_projections(&scope, items_ref, &mut agg_ctx, ptypes)?;
+        // A SEARCH / CYCLE recursive term's hidden trailing outputs (recursive-cte.md §9).
+        for e in &sel.tail {
+            let (node, ty) = resolve(&scope, e, None, &mut agg_ctx, ptypes)?;
+            let name = match e {
+                Expr::QualifiedColumn { name, .. } => name.clone(),
+                _ => "?column?".to_string(),
+            };
+            projections.push(node);
+            column_names.push(name);
+            column_types.push(ty);
+            column_derivs.push(Deriv::None);
+            column_typmods.push(Typmod::NONE);
+        }
         let group = if sel.join_group {
             Some(join_group_outputs(
                 &scope,

@@ -1061,7 +1061,8 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 				if r.qualifierOnly {
 					continue
 				}
-				for i := range r.table.Columns {
+				shown := len(r.table.Columns) - starHiddenCount(&r, s.ctes)
+				for i := range shown {
 					idx := r.offset + i
 					if slices.Contains(s.hidden, idx) {
 						continue
@@ -1130,7 +1131,7 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			for i := range s.rels {
 				if s.rels[i].label == want {
 					table = s.rels[i].table
-					for c := range table.Columns {
+					for c := range len(table.Columns) - starHiddenCount(&s.rels[i], s.ctes) {
 						slots = append(slots, s.rels[i].offset+c)
 					}
 					break
@@ -1145,7 +1146,7 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			if table == nil {
 				return nil, nil, nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
 			}
-			for i := range table.Columns {
+			for i := range slots {
 				ps = append(ps, &rExpr{kind: reColumn, index: slots[i]})
 				names = append(names, table.Columns[i].Name)
 				types = append(types, resolvedTypeOfCol(table.Columns[i].Type, s.catalog.readSnap()))
@@ -1155,8 +1156,8 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			}
 			// A written `rel.*` in a view body is frozen into `"rel" . "col"` references (views.md §5).
 			if it.Expr.StarPos != 0 && s.catalog != nil && s.catalog.viewTracing() {
-				cols := make([]starColumn, len(table.Columns))
-				for i := range table.Columns {
+				cols := make([]starColumn, len(slots))
+				for i := range slots {
 					cols[i] = starColumn{label: want, hasLabel: true, column: table.Columns[i].Name}
 				}
 				s.catalog.traceStar(it.Expr.StarPos, true, cols)

@@ -18,6 +18,7 @@ use crate::ast::{
     WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
+use crate::ast::{CycleClause, SearchClause};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::{lex, lex_with_positions};
@@ -2981,12 +2982,103 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let body = self.parse_cte_body(true)?;
         self.expect(&Token::RParen)?;
+        let search = if self.peek_keyword().as_deref() == Some("search") {
+            Some(self.parse_search_clause()?)
+        } else {
+            None
+        };
+        let cycle = if self.peek_keyword().as_deref() == Some("cycle") {
+            Some(Box::new(self.parse_cycle_clause()?))
+        } else {
+            None
+        };
         Ok(Cte {
             name,
             columns,
             materialized,
             body,
+            search,
+            cycle,
         })
+    }
+
+    /// `SEARCH { DEPTH | BREADTH } FIRST BY col, … SET seq_col` (spec/design/recursive-cte.md §9).
+    fn parse_search_clause(&mut self) -> Result<SearchClause> {
+        let pos = self.here();
+        self.expect_keyword("search")?;
+        let breadth_first = match self.peek_keyword().as_deref() {
+            Some("depth") => false,
+            Some("breadth") => true,
+            _ => return Err(syntax("expected DEPTH or BREADTH after SEARCH".to_string())),
+        };
+        self.advance();
+        self.expect_keyword("first")?;
+        self.expect_keyword("by")?;
+        let columns = self.parse_identifier_list()?;
+        self.expect_keyword("set")?;
+        let set_column = self.expect_identifier()?;
+        Ok(SearchClause {
+            breadth_first,
+            columns,
+            set_column,
+            pos,
+        })
+    }
+
+    /// `CYCLE col, … SET mark_col [TO value DEFAULT default] USING path_col`
+    /// (spec/design/recursive-cte.md §9).
+    fn parse_cycle_clause(&mut self) -> Result<CycleClause> {
+        let pos = self.here();
+        self.expect_keyword("cycle")?;
+        let columns = self.parse_identifier_list()?;
+        self.expect_keyword("set")?;
+        let mark_column = self.expect_identifier()?;
+        let (mark_value, mark_default) = if self.peek_keyword().as_deref() == Some("to") {
+            self.advance();
+            let value = self.parse_cycle_mark_constant()?;
+            self.expect_keyword("default")?;
+            let default = self.parse_cycle_mark_constant()?;
+            (Some(value), Some(default))
+        } else {
+            (None, None)
+        };
+        self.expect_keyword("using")?;
+        let path_column = self.expect_identifier()?;
+        Ok(CycleClause {
+            columns,
+            mark_column,
+            mark_value,
+            mark_default,
+            path_column,
+            pos,
+        })
+    }
+
+    /// A cycle mark constant (PostgreSQL's `AexprConst`): a number, string, `TRUE` / `FALSE` /
+    /// `NULL`, or a typed string literal (`date '…'`). A sign is not part of a constant, so `-1` is
+    /// a syntax error, as in PostgreSQL.
+    fn parse_cycle_mark_constant(&mut self) -> Result<Expr> {
+        if matches!(self.peek(), Token::Minus | Token::LParen) {
+            return Err(syntax(format!(
+                "expected a constant in a CYCLE clause, found {:?}",
+                self.peek()
+            )));
+        }
+        let e = self.parse_primary()?;
+        match e {
+            Expr::Literal(..) | Expr::TypedLiteral { .. } => Ok(e),
+            _ => Err(syntax("expected a constant in a CYCLE clause".to_string())),
+        }
+    }
+
+    /// A comma-separated list of one or more identifiers.
+    fn parse_identifier_list(&mut self) -> Result<Vec<String>> {
+        let mut names = vec![self.expect_identifier()?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            names.push(self.expect_identifier()?);
+        }
+        Ok(names)
     }
 
     /// Parse a parenthesized subquery's inner `query_expr` (grammar.md §26): a full set-expression
@@ -3264,6 +3356,7 @@ impl Parser {
             windows,
             join_group: false,
             paren_join: false,
+            tail: Vec::new(),
         })
     }
 
@@ -6523,6 +6616,7 @@ fn join_group_body(from: TableRef, joins: Vec<JoinClause>) -> QueryExpr {
         windows: Vec::new(),
         join_group: false,
         paren_join: true,
+        tail: Vec::new(),
     }))
 }
 
@@ -6606,6 +6700,7 @@ fn values_query(
         windows: Vec::new(),
         join_group: false,
         paren_join: false,
+        tail: Vec::new(),
     }))
 }
 

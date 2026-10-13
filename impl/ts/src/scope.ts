@@ -1032,6 +1032,7 @@ export function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | und
 export function analyzeRecursiveCte(
   name: string,
   body: QueryExpr,
+  searchCycle = false,
 ): { recursive: boolean; unionAll: boolean } {
   if (countSelfRefsQuery(body, name) === 0) {
     return { recursive: false, unionAll: false };
@@ -1053,6 +1054,21 @@ export function analyzeRecursiveCte(
       "invalid_recursion",
       `recursive reference to query "${name}" must not appear within its non-recursive term`,
     );
+  }
+  // SEARCH / CYCLE need each side of the UNION to be one SELECT (PostgreSQL's messages and codes).
+  if (searchCycle) {
+    if (body.lhs.kind === "setOp") {
+      throw engineError(
+        "feature_not_supported",
+        "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT",
+      );
+    }
+    if (body.rhs.kind === "setOp") {
+      throw engineError(
+        "syntax_error",
+        "with a SEARCH or CYCLE clause, the right side of the UNION must be a SELECT",
+      );
+    }
   }
   if (body.rhs.kind === "withExpr") {
     throw engineError(
@@ -1425,9 +1441,10 @@ export function checkRecursiveColumnTypes(
   recursive: QueryPlan,
   name: string,
   unionAll: boolean,
+  carried = 0,
 ): void {
   const a = anchor.columnTypes;
-  const r = recursive.columnTypes;
+  const r = recursive.columnTypes.slice(0, recursive.columnTypes.length - carried);
   if (a.length !== r.length) {
     throw engineError("syntax_error", "each UNION query must have the same number of columns");
   }

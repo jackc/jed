@@ -1045,6 +1045,11 @@ pub struct Select {
     /// planner gives the body that view through a lateral fence (`Scope::lateral_view`). Never set
     /// by a written SELECT.
     pub paren_join: bool,
+    /// Hidden trailing output items, resolved after the select list (`*` included) and appended
+    /// to its outputs. Set only on a recursive CTE's recursive term with a `SEARCH` / `CYCLE`
+    /// clause, to carry the self-reference's added columns forward (spec/design/recursive-cte.md
+    /// §9). Never set by a written SELECT.
+    pub tail: Vec<Expr>,
 }
 
 /// A query expression — the operand of a set operation (spec/design/grammar.md §25). Either a
@@ -1135,13 +1140,41 @@ impl CteBody {
 /// a count mismatch is 42P10). `materialized` is the explicit evaluation hint: `Some(true)` =
 /// `MATERIALIZED`, `Some(false)` = `NOT MATERIALIZED`, `None` = PostgreSQL's default (inline a
 /// single-reference CTE, materialize a multi-reference one — cost.md §3; a data-modifying CTE is
-/// always materialized, the hint inert). The body is a `cte_body`.
+/// always materialized, the hint inert). The body is a `cte_body`. `search` / `cycle` are a
+/// recursive CTE's optional `SEARCH` / `CYCLE` clauses (spec/design/recursive-cte.md §9).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cte {
     pub name: String,
     pub columns: Option<Vec<String>>,
     pub materialized: Option<bool>,
     pub body: CteBody,
+    pub search: Option<SearchClause>,
+    pub cycle: Option<Box<CycleClause>>,
+}
+
+/// A recursive CTE's `SEARCH { DEPTH | BREADTH } FIRST BY col, … SET seq_col` clause
+/// (spec/design/recursive-cte.md §9): adds the ordering column `set_column` — a `record[]` path
+/// for depth-first, a `record` of (depth, cols) for breadth-first. `pos` is the `SEARCH` keyword.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SearchClause {
+    pub breadth_first: bool,
+    pub columns: Vec<String>,
+    pub set_column: String,
+    pub pos: SrcPos,
+}
+
+/// A recursive CTE's `CYCLE col, … SET mark_col [TO value DEFAULT default] USING path_col` clause
+/// (spec/design/recursive-cte.md §9): adds the cycle mark column and the `record[]` path column,
+/// and stops expanding a row whose mark is `value`. `mark_value` / `mark_default` are the written
+/// constants (`None` for the `TRUE` / `FALSE` defaults). `pos` is the `CYCLE` keyword.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CycleClause {
+    pub columns: Vec<String>,
+    pub mark_column: String,
+    pub mark_value: Option<Expr>,
+    pub mark_default: Option<Expr>,
+    pub path_column: String,
+    pub pos: SrcPos,
 }
 
 /// A top-level query prefixed by a `WITH` clause (spec/design/cte.md). `ctes` is the non-empty

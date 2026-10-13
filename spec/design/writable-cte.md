@@ -263,7 +263,7 @@ change — a CTE is a query-plan construct.
 
 **Deferred (unchanged from [cte.md](cte.md) §6 / [TODO.md](../../TODO.md)):**
 
-- The recursive-CTE deferrals ([recursive-cte.md](recursive-cte.md) §8) — `SEARCH`/`CYCLE`, a
-  set-op / `FROM`-subquery recursive term, mutual recursion.
+- The recursive-CTE deferrals ([recursive-cte.md](recursive-cte.md) §8) — a set-op /
+  `FROM`-subquery recursive term, mutual recursion. (`SEARCH` / `CYCLE` has since landed, §9.)
 - `ON CONFLICT` referential-action follow-ons are inherited from their own slices unchanged; a
   data-modifying CTE may use `ON CONFLICT` exactly as a standalone `INSERT` does.

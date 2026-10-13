@@ -1182,6 +1182,11 @@ export type Select = {
   // gives the body that view through a lateral fence (Scope.lateralView). Never set by a written
   // SELECT.
   parenJoin?: boolean;
+  // tail holds hidden trailing output items, resolved after the select list (`*` included) and
+  // appended to its outputs. Set only on a recursive CTE's recursive term with a SEARCH / CYCLE
+  // clause, to carry the self-reference's added columns forward (spec/design/recursive-cte.md §9).
+  // Never set by a written SELECT.
+  tail?: Expr[];
 };
 
 // Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column re-keys
@@ -1323,12 +1328,38 @@ export function cteBodyIsDataModifying(body: CteBody): boolean {
 // mismatch with MORE aliases is 42P10). `materialized` is the explicit evaluation hint: true =
 // MATERIALIZED, false = NOT MATERIALIZED, null = PostgreSQL's default (inline a single-reference CTE,
 // materialize a multi-reference one — cost.md §3; a data-modifying CTE is always materialized, the
-// hint inert). The body is a cte_body.
+// hint inert). The body is a cte_body. `search` / `cycle` are a recursive CTE's optional SEARCH /
+// CYCLE clauses (spec/design/recursive-cte.md §9).
 export type Cte = {
   name: string;
   columns: string[] | null;
   materialized: boolean | null;
   body: CteBody;
+  search: SearchClause | null;
+  cycle: CycleClause | null;
+};
+
+// SearchClause is a recursive CTE's `SEARCH { DEPTH | BREADTH } FIRST BY col, … SET seq_col`
+// (spec/design/recursive-cte.md §9): adds the ordering column setColumn — a record[] path for
+// depth-first, a record of (depth, cols) for breadth-first. loc is the SEARCH keyword.
+export type SearchClause = {
+  breadthFirst: boolean;
+  columns: string[];
+  setColumn: string;
+  loc?: SrcLoc;
+};
+
+// CycleClause is a recursive CTE's `CYCLE col, … SET mark_col [TO value DEFAULT default] USING
+// path_col` (spec/design/recursive-cte.md §9): adds the cycle mark column and the record[] path
+// column, and stops expanding a row whose mark is the value. markValue / markDefault are the written
+// constants (null for the TRUE / FALSE defaults). loc is the CYCLE keyword.
+export type CycleClause = {
+  columns: string[];
+  markColumn: string;
+  markValue: Expr | null;
+  markDefault: Expr | null;
+  pathColumn: string;
+  loc?: SrcLoc;
 };
 
 // WithQuery is a top-level statement prefixed by a WITH clause (spec/design/cte.md). `ctes` is the

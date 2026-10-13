@@ -85,10 +85,11 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 					"WITH query name "+lname+" specified more than once")
 			}
 		}
+		searchCycle := cte.Search != nil || cte.Cycle != nil
 		isRecursive, unionAll := false, false
 		if recursive {
 			if q := cte.Body.AsQuery(); q != nil {
-				rec, ua, err := analyzeRecursiveCte(lname, *q)
+				rec, ua, err := analyzeRecursiveCte(lname, *q, searchCycle)
 				if err != nil {
 					return nil, err
 				}
@@ -106,6 +107,16 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 					"recursive reference to query %q must not appear within its non-recursive term", lname,
 				))
 			}
+			// A SEARCH / CYCLE clause types its cycle mark before the body is planned (PostgreSQL's
+			// order — recursive-cte.md §9).
+			var mark *cycleMark
+			if cte.Cycle != nil {
+				m, err := db.resolveCycleMark(cte.Cycle, ptypes)
+				if err != nil {
+					return nil, err
+				}
+				mark = m
+			}
 			visible := append(append([]*cteBinding{}, inherited...), bindings...)
 			anchorPlan, err := db.planQuery(so.Lhs, parent, visible, ptypes)
 			if err != nil {
@@ -115,21 +126,57 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 			if err != nil {
 				return nil, err
 			}
+			// SEARCH / CYCLE add columns after the CTE's own (recursive-cte.md §9).
+			var sc *searchCyclePlan
+			if searchCycle {
+				sc, err = db.planSearchCycle(cte, table, anchorPlan.columnTypes(), mark, ptypes)
+				if err != nil {
+					return nil, err
+				}
+				names := make([]string, 0, len(table.Columns)+len(sc.names))
+				for _, c := range table.Columns {
+					names = append(names, c.Name)
+				}
+				names = append(names, sc.names...)
+				types := append(append([]resolvedType{}, anchorPlan.columnTypes()...), sc.types...)
+				derivs := append([]deriv{}, anchorPlan.columnDerivs()...)
+				typmods := append([]typmod{}, anchorPlan.columnTypmods()...)
+				for range sc.types {
+					derivs = append(derivs, deriv{})
+					typmods = append(typmods, typmod{})
+				}
+				table, err = cteSyntheticTableCols(lname, names, types, derivs, typmods, nil)
+				if err != nil {
+					return nil, err
+				}
+			}
+			added := 0
+			if sc != nil {
+				added = len(sc.names)
+			}
 			bindings = append(bindings, &cteBinding{
-				name: lname, table: table, plan: anchorPlan, hint: cte.Materialized,
+				name: lname, table: table, plan: anchorPlan, hint: cte.Materialized, starHidden: added,
 			})
 			bi := len(bindings) - 1
 			visible = append(append([]*cteBinding{}, inherited...), bindings...)
-			rhsPlan, err := db.planQuery(so.Rhs, parent, visible, ptypes)
+			// Under SEARCH / CYCLE the recursive term carries the self-reference's added columns as
+			// hidden trailing outputs — the parent row's, from which the executor computes the child's.
+			rhs := so.Rhs
+			if sc != nil {
+				rhs = withCarriedColumns(so.Rhs, cte.Name, sc.names)
+			}
+			rhsPlan, err := db.planQuery(rhs, parent, visible, ptypes)
 			if err != nil {
 				return nil, err
 			}
-			if err := checkRecursiveColumnTypes(&bindings[bi].plan, &rhsPlan, lname, unionAll); err != nil {
+			bindings[bi].starHidden = 0
+			if err := checkRecursiveColumnTypes(&bindings[bi].plan, &rhsPlan, lname, unionAll, added); err != nil {
 				return nil, err
 			}
-			bindings[bi].recursive = &recursiveTerm{plan: rhsPlan, unionAll: unionAll}
+			bindings[bi].recursive = &recursiveTerm{plan: rhsPlan, unionAll: unionAll, searchCycle: sc}
 			continue
 		}
+
 		if q := cte.Body.AsQuery(); q != nil {
 			visible := append(append([]*cteBinding{}, inherited...), bindings...)
 			// Named exactly once, by a query part, and not MATERIALIZED: a candidate to be inlined at
@@ -169,6 +216,9 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 				binding.bodyAst = q
 			}
 			bindings = append(bindings, binding)
+			if searchCycle {
+				return nil, notRecursiveError(cte)
+			}
 			continue
 		}
 		// A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
@@ -181,8 +231,23 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 		bindings = append(bindings, &cteBinding{
 			name: lname, table: table, dm: dm, hint: cte.Materialized,
 		})
+		if searchCycle {
+			return nil, notRecursiveError(cte)
+		}
 	}
 	return bindings, nil
+}
+
+// notRecursiveError is SEARCH / CYCLE on a CTE that does not reference itself (recursive-cte.md §9),
+// reported after its body is planned, as in PostgreSQL.
+func notRecursiveError(c *cte) error {
+	var pos srcPos
+	if c.Search != nil {
+		pos = c.Search.Pos
+	} else if c.Cycle != nil {
+		pos = c.Cycle.Pos
+	}
+	return newError(SyntaxError, "WITH query is not recursive").withPosition(int32(pos))
 }
 
 // ctePrimary is the query that owns a WITH list — its main body, which (with the later CTE bodies)
@@ -458,6 +523,19 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	if err := guard(*totalCost); err != nil {
 		return nil, err
 	}
+	anchorRows := ar.rows
+	// SEARCH / CYCLE: each anchor row gets its added columns (recursive-cte.md §9).
+	if sc := rt.searchCycle; sc != nil {
+		rows, cost, err := db.searchCycleRows(sc, sc.anchor, nil, anchorRows, params, outer)
+		if err != nil {
+			return nil, err
+		}
+		*totalCost += cost
+		if err := guard(*totalCost); err != nil {
+			return nil, err
+		}
+		anchorRows = rows
+	}
 
 	// For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
 	// NULL-safe distinctRowKey the set operators use.
@@ -482,7 +560,7 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	seenCharge := newStateCharge(acct)
 	defer seenCharge.releaseAll()
 	var result, working []storedRow
-	for _, row := range ar.rows {
+	for _, row := range anchorRows {
 		if keep(row) {
 			if !rt.unionAll && seenCharge.active() {
 				if err := seenCharge.reserveDirect(memEntryBytes(row)); err != nil {
@@ -528,6 +606,19 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 		coerceSetopRows(rr.rows, rhsTypes, anchorTypes)
 		if err := acct.reserve(measureRows(acct, rr.rows) - before); err != nil {
 			return nil, err
+		}
+		// SEARCH / CYCLE: drop a row whose parent closed a cycle, then replace the carried parent
+		// columns with the row's own (recursive-cte.md §9).
+		if sc := rt.searchCycle; sc != nil {
+			rows, cost, err := db.searchCycleRows(sc, sc.recursive, sc.filter, rr.rows, params, outer)
+			if err != nil {
+				return nil, err
+			}
+			*totalCost += cost
+			if err := guard(*totalCost); err != nil {
+				return nil, err
+			}
+			rr.rows = rows
 		}
 		for _, vrow := range rr.rows {
 			row := storedRow(vrow)
@@ -761,7 +852,7 @@ func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx c
 // (false, _, nil) when the body does not reference name (an ordinary CTE, even under RECURSIVE);
 // otherwise it validates the recursive shape and returns (true, unionAll, nil), or an error (42P19
 // for a malformed recursion, 0A000 for a deferred shape).
-func analyzeRecursiveCte(name string, body queryExpr) (bool, bool, error) {
+func analyzeRecursiveCte(name string, body queryExpr, searchCycle bool) (bool, bool, error) {
 	if countSelfRefsQuery(body, name) == 0 {
 		return false, false, nil
 	}
@@ -781,6 +872,17 @@ func analyzeRecursiveCte(name string, body queryExpr) (bool, bool, error) {
 		return false, false, newError(InvalidRecursion, fmt.Sprintf(
 			"recursive reference to query %q must not appear within its non-recursive term", name,
 		))
+	}
+	// SEARCH / CYCLE need each side of the UNION to be one SELECT (PostgreSQL's messages and codes).
+	if searchCycle {
+		if so.Lhs.SetOp != nil {
+			return false, false, newError(FeatureNotSupported,
+				"with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT")
+		}
+		if so.Rhs.SetOp != nil {
+			return false, false, newError(SyntaxError,
+				"with a SEARCH or CYCLE clause, the right side of the UNION must be a SELECT")
+		}
 	}
 	if so.Rhs.With != nil {
 		return false, false, newError(FeatureNotSupported,
@@ -1241,9 +1343,10 @@ func selectExprs(s *selectStmt) []exprNode {
 // assignable to them — a literal adapts, an equal type passes, a WIDER type is 42804 (matching
 // PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
 // of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
-func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionAll bool) error {
+func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionAll bool, carried int) error {
 	a := anchor.columnTypes()
-	r := recursive.columnTypes()
+	all := recursive.columnTypes()
+	r := all[:len(all)-carried]
 	if len(a) != len(r) {
 		return newError(SyntaxError, "each UNION query must have the same number of columns")
 	}

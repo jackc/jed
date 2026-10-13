@@ -84,6 +84,7 @@ import {
   scalarForParamHint,
   unifyCaseTypes,
 } from "./eval_ops.ts";
+import { starHiddenCount } from "./search_cycle.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import { followLayer } from "./view_write.ts";
@@ -224,9 +225,10 @@ export function resolveProjections(
         expandLayerColumns(scope, ri, ag, { nodes, names, types, derivs, typmods });
         continue;
       }
+      const shown = r.table.columns.length - starHiddenCount(r, scope.ctes);
       r.table.columns.forEach((c, i) => {
         const idx = r.offset + i;
-        if (scope.hidden.includes(idx)) return;
+        if (i >= shown || scope.hidden.includes(idx)) return;
         nodes.push({ kind: "column", index: idx });
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
@@ -259,7 +261,8 @@ export function resolveProjections(
       const rel = scope.rels.find((r) => r.label === want);
       if (rel !== undefined) {
         table = rel.table;
-        slots = rel.table.columns.map((_c, i) => rel.offset + i);
+        const shown = rel.table.columns.length - starHiddenCount(rel, scope.ctes);
+        slots = rel.table.columns.slice(0, shown).map((_c, i) => rel.offset + i);
       } else {
         // An inner label of an unaliased parenthesized join expands to its own columns (§15).
         const sub = scope.subRels.find((sr) => sr.label === want);
@@ -274,7 +277,7 @@ export function resolveProjections(
           "missing FROM-clause entry for table " + it.expr.qualifier,
         );
       }
-      table.columns.forEach((c, i) => {
+      table.columns.slice(0, slots.length).forEach((c, i) => {
         nodes.push({ kind: "column", index: slots[i]! });
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
@@ -287,7 +290,7 @@ export function resolveProjections(
         scope.catalog.traceStar(
           it.expr.pos,
           true,
-          table.columns.map((c): [string | null, string] => [want, c.name]),
+          table.columns.slice(0, slots.length).map((c): [string | null, string] => [want, c.name]),
         );
       }
       continue;

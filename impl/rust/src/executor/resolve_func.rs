@@ -1150,7 +1150,8 @@ pub(crate) fn resolve_projections(
                     )?;
                     continue;
                 }
-                for (i, c) in rel.table.columns.iter().enumerate() {
+                let shown = rel.table.columns.len() - star_hidden_count(rel, scope.ctes);
+                for (i, c) in rel.table.columns.iter().enumerate().take(shown) {
                     let idx = rel.offset + i;
                     if scope.hidden.contains(&idx) {
                         continue;
@@ -1199,7 +1200,7 @@ pub(crate) fn resolve_projections(
                         match scope.rels.iter().find(|r| r.label == want) {
                             Some(rel) => (
                                 rel.table,
-                                (0..rel.table.columns.len())
+                                (0..rel.table.columns.len() - star_hidden_count(rel, scope.ctes))
                                     .map(|c| rel.offset + c)
                                     .collect(),
                             ),
@@ -1214,7 +1215,7 @@ pub(crate) fn resolve_projections(
                                 (sr.table, sr.slots.clone())
                             }
                         };
-                    for (i, c) in table.columns.iter().enumerate() {
+                    for (i, c) in table.columns.iter().enumerate().take(slots.len()) {
                         nodes.push(RExpr::Column(slots[i]));
                         names.push(c.name.clone());
                         types.push(resolved_type_of_col(&c.ty, scope.catalog));
@@ -1229,6 +1230,7 @@ pub(crate) fn resolve_projections(
                             let cols = table
                                 .columns
                                 .iter()
+                                .take(slots.len())
                                 .map(|c| (Some(want.clone()), c.name.clone()))
                                 .collect();
                             scope.catalog.trace_star(pos, true, cols);

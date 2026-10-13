@@ -986,6 +986,11 @@ type selectStmt struct {
 	// gives the body that view through a lateral fence (scope.lateralView). Never set by a written
 	// SELECT.
 	ParenJoin bool
+	// Tail holds hidden trailing output items, resolved after the select list (`*` included) and
+	// appended to its outputs. Set only on a recursive CTE's recursive term with a SEARCH / CYCLE
+	// clause, to carry the self-reference's added columns forward (spec/design/recursive-cte.md §9).
+	// Never set by a written SELECT.
+	Tail []exprNode
 }
 
 // NamedWindow is one `name AS (definition)` entry of a WINDOW clause (spec/design/window.md §5).
@@ -1118,6 +1123,33 @@ type cte struct {
 	Columns      []string
 	Materialized *bool
 	Body         cteBody
+	// Search / Cycle are a recursive CTE's optional SEARCH / CYCLE clauses
+	// (spec/design/recursive-cte.md §9).
+	Search *searchClause
+	Cycle  *cycleClause
+}
+
+// SearchClause is a recursive CTE's `SEARCH { DEPTH | BREADTH } FIRST BY col, … SET seq_col`
+// (spec/design/recursive-cte.md §9): adds the ordering column SetColumn — a record[] path for
+// depth-first, a record of (depth, cols) for breadth-first. Pos is the SEARCH keyword.
+type searchClause struct {
+	BreadthFirst bool
+	Columns      []string
+	SetColumn    string
+	Pos          srcPos
+}
+
+// CycleClause is a recursive CTE's `CYCLE col, … SET mark_col [TO value DEFAULT default] USING
+// path_col` (spec/design/recursive-cte.md §9): adds the cycle mark column and the record[] path
+// column, and stops expanding a row whose mark is the value. MarkValue / MarkDefault are the written
+// constants (nil for the TRUE / FALSE defaults). Pos is the CYCLE keyword.
+type cycleClause struct {
+	Columns     []string
+	MarkColumn  string
+	MarkValue   *exprNode
+	MarkDefault *exprNode
+	PathColumn  string
+	Pos         srcPos
 }
 
 // WithQuery is a top-level statement prefixed by a WITH clause (spec/design/cte.md). Ctes is the

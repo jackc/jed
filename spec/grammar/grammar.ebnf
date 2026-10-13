@@ -664,7 +664,14 @@ subquery_expr  ::= with_clause? query_expr
  * does NOT reference itself is an ordinary non-recursive CTE. Structural ill-formedness is 42P19
  * (invalid_recursion); deferred shapes (ORDER BY/LIMIT in a recursive query, a set-op recursive
  * term, a self-ref inside a FROM subquery, mutual recursion) are 0A000/42P01. RECURSIVE is the
- * keyword right after WITH (PG reserves it, so a CTE may not be named "recursive"). */
+ * keyword right after WITH (PG reserves it, so a CTE may not be named "recursive").
+ *   A recursive CTE may carry SEARCH and/or CYCLE (../design/recursive-cte.md §9), PostgreSQL's
+ * SQL-standard ordering and cycle-detection columns, added after the CTE's own columns (search
+ * first). SEARCH DEPTH FIRST adds a record[] path, SEARCH BREADTH FIRST a ROW(depth, cols);
+ * CYCLE adds a mark (TO / DEFAULT constants, TRUE / FALSE when omitted) and a record[] path, and
+ * stops expanding a marked row. The mark constants are cycle_mark_constant (PostgreSQL's
+ * AexprConst — no sign, so "-1" is 42601). SEARCH / CYCLE on a CTE that does not reference itself
+ * is 42601; SEARCH, DEPTH, BREADTH, FIRST, CYCLE, TO, and USING are not reserved here. */
 query_statement ::= with_clause? cte_body
                   | "(" subquery_expr ")" order_by? limit_offset?
 
@@ -672,6 +679,15 @@ with_clause    ::= "WITH" "RECURSIVE"? cte ("," cte)*
 
 cte            ::= identifier ("(" identifier ("," identifier)* ")")?
                    "AS" ("NOT"? "MATERIALIZED")? "(" cte_body ")"
+                   search_clause? cycle_clause?
+
+search_clause  ::= "SEARCH" ("DEPTH" | "BREADTH") "FIRST" "BY" identifier ("," identifier)*
+                   "SET" identifier
+
+cycle_clause   ::= "CYCLE" identifier ("," identifier)* "SET" identifier
+                   ("TO" cycle_mark_constant "DEFAULT" cycle_mark_constant)? "USING" identifier
+
+cycle_mark_constant ::= number | string | "TRUE" | "FALSE" | "NULL" | typed_literal
 
 /* The body of a CTE, and the WITH-prefixed primary, is an ordinary query expression OR a
  * data-modifying statement (the writable-CTE surface, ../design/writable-cte.md). A bare query

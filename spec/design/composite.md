@@ -416,10 +416,9 @@ first-class **query values**: every expression form already worked on them (comp
 `DISTINCT`, `GROUP BY`, field access, `ARRAY[ROW(…)]`, `||`, `= ANY`, subscripts, `record_out` /
 `array_out`). This slice lets them be a **column of a derived relation** — a derived table, an
 inline or `MATERIALIZED` CTE, a recursive CTE's working table, or a `VALUES` list — which used to be
-`0A000`. It is the substrate recursive-CTE `SEARCH` / `CYCLE` desugar to: a `record[]` path
-accumulated per step (`path || ROW(id)`), ordered for depth-first order or tested with
-`ROW(id) = ANY(path)` for cycle detection ([recursive-cte.md](recursive-cte.md) §8). Corpus:
-`suites/types/record_column.test`.
+`0A000`. It is the substrate of recursive-CTE `SEARCH` / `CYCLE`: a `record[]` path accumulated
+per step (`path || ROW(id)`), ordered for depth-first order or tested with `ROW(id) = ANY(path)` for
+cycle detection ([recursive-cte.md](recursive-cte.md) §9). Corpus: `suites/types/record_column.test`.
 
 - **The type.** A derived relation's synthetic column takes the `Record` type arm (§2), carrying
   the row's resolved field list inline; a reference to the column resolves back to the same nameless

@@ -190,19 +190,115 @@ recursive-term*, the recursive self-reference as a direct `FROM`/`JOIN` relation
 tables and earlier CTEs), `UNION`/`UNION ALL` semantics, the anchor-fixed column types (`42804`),
 the structural `42P19` checks, cost-ceiling termination, and ordinary (non-self-referencing) CTEs in
 a `RECURSIVE` list. No on-disk format change (a CTE is a query-plan construct — no `format_version`
-bump).
+bump). **Since landed:** the `SEARCH` / `CYCLE` clauses (§9).
 
 **Deferred (each its own slice):**
 
-- **`SEARCH` / `CYCLE` clauses** — PostgreSQL's breadth/depth ordering and cycle-detection sugar.
-  The substrate they desugar to has landed: a recursive CTE's working table carries `record` and
-  `record[]` columns, so the hand-written equivalents — a `path || ROW(id)` column ordered for
-  depth-first, `ROW(depth, id)` for breadth-first, and `ROW(id) = ANY(path)` for cycle detection —
-  run today ([composite.md](composite.md) §13, `suites/types/record_column.test`). `||` widens a
-  record element's integer fields ([array-functions.md](array-functions.md) §2.1), so an `i64`
-  anchor path accepts an `i32` recursive-term element; the path column's type is still fixed by the
-  anchor (§2).
 - **Recursive reference inside a `FROM` derived table** or **a set-operation recursive term**
   (`0A000` today; PostgreSQL allows both).
 - **Mutual recursion** between WITH items (`0A000` in PostgreSQL; `42P01` in jed today).
 - **`ORDER BY` / `LIMIT` in a recursive query** (`0A000` in both engines today).
+
+## 9. `SEARCH` and `CYCLE`
+
+A recursive CTE may carry PostgreSQL's SQL-standard ordering and cycle-detection clauses, after its
+body (grammar: `search_clause`, `cycle_clause`; corpus `suites/cte/search_cycle.test`,
+oracle-clean against `postgres:18`, capability `query.cte_search_cycle`):
+
+```sql
+WITH RECURSIVE r(id) AS (
+    SELECT id FROM tree WHERE parent IS NULL
+  UNION ALL
+    SELECT tree.id FROM tree JOIN r ON tree.parent = r.id
+) SEARCH DEPTH FIRST BY id SET ord          -- ord: {(1)}, {(1),(2)}, …
+  CYCLE id SET is_cycle USING path           -- is_cycle: false/true; path: {(1)}, {(1),(2)}, …
+SELECT * FROM r ORDER BY ord;
+```
+
+### 9.1 The added columns
+
+PostgreSQL defines the clauses by a rewrite of the CTE (`rewriteSearchCycle.c`); jed adds the same
+columns with the same values. They follow the CTE's own columns, the search column first:
+
+| Clause | Column | Anchor row | Recursive-term row |
+|---|---|---|---|
+| `SEARCH DEPTH FIRST BY c… SET s` | `s` — `record[]` | `ARRAY[ROW(c…)]` | `parent.s \|\| ARRAY[ROW(c…)]` |
+| `SEARCH BREADTH FIRST BY c… SET s` | `s` — `record` | `ROW(0, c…)` | `ROW((parent.s).f1 + 1, c…)` |
+| `CYCLE c… SET m [TO v DEFAULT d] USING p` | `m` — the mark type | `d` | `CASE WHEN ROW(c…) = ANY (parent.p) THEN v ELSE d END` |
+| | `p` — `record[]` | `ARRAY[ROW(c…)]` | `parent.p \|\| ARRAY[ROW(c…)]` |
+
+and `CYCLE` keeps a recursive-term row only when `parent.m <> v` is TRUE — a row whose parent closed
+a cycle is not expanded. The depth is `i64` (PostgreSQL's `int8`). `ORDER BY s` is then depth- or
+breadth-first, because record arrays and records order lexicographically
+([composite.md](composite.md) §13, [array.md](array.md) §5). A `UNION` (not `ALL`) compares the
+added columns too, as in PostgreSQL. A `NULL` mark (`TO NULL`) never compares `<>` TRUE, so nothing
+past the anchor is expanded.
+
+**The mark constants** (`cycle_mark_constant`, PostgreSQL's `AexprConst` — a number, string,
+`TRUE`/`FALSE`/`NULL`, or typed literal; no sign) default to `TRUE` / `FALSE`. They are typed before
+the body is planned, PostgreSQL's order: a bare string literal takes the other constant's type, read
+through that type's input (`TO 1 DEFAULT 'N'` is `22P02`); the pair takes the common type of the
+set-operation rule ([grammar.md](grammar.md) §25 — `TO 1.5 DEFAULT 0` is `decimal`), else `42804`
+*CYCLE types X and Y cannot be matched*; and the type needs an equality operator (`json` is `42883`).
+Two untyped `NULL`s are `text`.
+
+### 9.2 How jed computes them
+
+Rather than rewrite the SQL, jed resolves the table's expressions once at plan time and evaluates them
+per produced row — the clean fit for jed's recursive term, which (unlike PostgreSQL's rewrite) cannot
+be wrapped in a derived table (§6):
+
+- **Anchor rows.** After the non-recursive term runs, each row's added columns are the anchor
+  expressions over its own columns.
+- **Recursive-term rows.** The recursive term is planned with hidden trailing outputs — the
+  self-reference's added columns, `self.s`, `self.m`, `self.p` (the parent row's) — so each produced
+  row carries its parent's. After the produced rows are coerced to the anchor's column types (§4
+  step 2b), `CYCLE`'s filter drops a row whose parent closed a cycle, and the recursive-term
+  expressions replace the carried parent columns with the row's own. The record fields therefore
+  have the anchor's column types, as in PostgreSQL, whose recursive term is coerced the same way.
+- **Visibility.** The recursive term may reference the added columns by name (`r.is_cycle`,
+  `cardinality(r.path)`); `*` and `r.*` over the self-reference expand only the CTE's own columns, so
+  `SELECT * FROM r` keeps the anchor's arity. Every other reference — the main query, a later CTE, a
+  subquery — sees all of the columns.
+
+**Cost.** Each produced row is a cost-ceiling check point, and the expressions charge their ordinary
+evaluation cost — notably the path arrays, growth kernels charged by the bytes each step builds
+([cost.md](cost.md) §8.1), so a deep walk's quadratic path building is bounded by the ceiling. Rows
+`CYCLE` drops were charged by the recursive term that produced them and are released from query
+memory. The corpus pins the totals cross-core (`# cost:`).
+
+### 9.3 Errors
+
+PostgreSQL's checks, codes, and messages:
+
+| Condition | Code |
+|---|---|
+| `SEARCH` / `CYCLE` on a CTE that does not reference itself | `42601` *WITH query is not recursive* |
+| The `UNION`'s left side is itself a set operation | `0A000` |
+| The `UNION`'s right side is a set operation | `42601` |
+| A column list names a column the CTE does not have | `42601` |
+| A column list repeats a column | `42701` |
+| An added column's name is one of the CTE's, or two added columns share a name | `42601` |
+| Mark constants with no common type / no equality operator / a malformed string | `42804` / `42883` / `22P02` |
+| A signed mark constant (`TO -1`) | `42601` |
+
+The self-reference must be a direct `FROM` / `JOIN` relation of the recursive term, which §6 already
+requires (PostgreSQL's *must be at the top level of its right-hand SELECT*, `0A000`).
+
+### 9.4 Deliberate divergences
+
+- **`*` in a later CTE or a subquery expands the added columns.** PostgreSQL hides them from `*`
+  wherever the CTE is referenced from a deeper query level than the `WITH` itself — inside the
+  CTE's own body, but also in a later CTE of the same list or any subquery (`SELECT * FROM (SELECT
+  * FROM r) s` has no `ord` in PostgreSQL). jed hides them only for the recursive term's
+  self-reference, the case that keeps the term's arity; tracking PostgreSQL's query levels for every
+  CTE reference would plumb a level through every planning path for a quirk. Named references agree.
+- **The clause checks run before the recursive term is planned.** jed needs the added columns'
+  types to plan the term, so a body that also has an error reports the clause error first; in
+  particular an added column named like one of the CTE's (`SET n` with a column `n`) is the clause's
+  `42601` even when the body also references `n`, where PostgreSQL reports the body's ambiguous
+  reference (`42702`).
+- **Field access on the breadth-first column works.** `(ord).f1` reads the depth; PostgreSQL fails
+  with an internal error (`XX000`, *CTE r does not have attribute 2*). jed's record column is
+  statically typed ([composite.md](composite.md) §13).
+

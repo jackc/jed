@@ -457,6 +457,9 @@ var SupportedCapabilities = []string{
 	// recursive_term) <query>: the iterate-to-fixpoint (working-table) executor; cost-ceiling
 	// termination (spec/design/recursive-cte.md).
 	"query.cte_recursive",
+	// A recursive CTE's SEARCH / CYCLE clauses (recursive-cte.md §9): the ordering column and the
+	// cycle mark + path, computed per produced row.
+	"query.cte_search_cycle",
 	// Data-modifying (writable) CTEs — a WITH item's body may be an INSERT/UPDATE/DELETE with its own
 	// optional RETURNING, feeding its RETURNING rows forward; every sub-statement reads one
 	// pre-statement snapshot (a read pin), the parts run in lexical order all-or-nothing

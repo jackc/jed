@@ -90,6 +90,8 @@ mod store_encode;
 pub(crate) use store_encode::*;
 mod eval_ops;
 pub(crate) use eval_ops::*;
+mod search_cycle;
+pub(crate) use search_cycle::*;
 mod resolve;
 pub(crate) use resolve::*;
 mod resolve_func;
@@ -1737,6 +1739,10 @@ pub(crate) struct CteBinding {
     at_reference: bool,
     body_ast: Option<QueryExpr>,
     expanded: std::cell::Cell<bool>,
+    /// How many trailing columns `*` and `rel.*` skip: a recursive CTE's `SEARCH` / `CYCLE` columns
+    /// while its own recursive term is planned, so `SELECT * FROM self` keeps the anchor's arity
+    /// (recursive-cte.md §9). Zero otherwise.
+    star_hidden: std::cell::Cell<usize>,
 }
 
 /// The query that owns a `WITH` list — its main body, which (with the later CTE bodies) holds the
@@ -1813,6 +1819,8 @@ pub(crate) enum DmStmt {
 pub(crate) struct RecursiveTerm {
     plan: QueryPlan,
     union_all: bool,
+    /// The `SEARCH` / `CYCLE` columns the executor adds to each row (recursive-cte.md §9).
+    search_cycle: Option<SearchCyclePlan>,
 }
 
 /// How a column reference resolved against the scope CHAIN (spec/design/grammar.md §26).
@@ -4309,8 +4317,9 @@ pub(crate) enum CteShape {
 /// Classify a CTE body for `WITH RECURSIVE` (recursive-cte.md §6). Returns `NonRecursive` when the
 /// body does not reference `name`; otherwise validates the recursive shape and returns
 /// `Recursive { union_all }`, or an error (`42P19` for a malformed recursion, `0A000` for a
-/// deferred shape).
-fn analyze_recursive_cte(name: &str, body: &QueryExpr) -> Result<CteShape> {
+/// deferred shape). With a `SEARCH` / `CYCLE` clause (`search_cycle`) each side of the `UNION` must
+/// be a single SELECT (recursive-cte.md §9).
+fn analyze_recursive_cte(name: &str, body: &QueryExpr, search_cycle: bool) -> Result<CteShape> {
     if count_self_refs_query(body, name) == 0 {
         return Ok(CteShape::NonRecursive);
     }
@@ -4347,6 +4356,21 @@ fn analyze_recursive_cte(name: &str, body: &QueryExpr) -> Result<CteShape> {
                 "recursive reference to query \"{name}\" must not appear within its non-recursive term"
             ),
         ));
+    }
+    // SEARCH / CYCLE need each side of the UNION to be one SELECT (PostgreSQL's messages and codes).
+    if search_cycle {
+        if matches!(so.lhs, QueryExpr::SetOp(_)) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT",
+            ));
+        }
+        if matches!(so.rhs, QueryExpr::SetOp(_)) {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "with a SEARCH or CYCLE clause, the right side of the UNION must be a SELECT",
+            ));
+        }
     }
     // The recursive term — the UNION's right — must be a plain SELECT (a set-operation recursive
     // term is a jed narrowing, 0A000) referencing the CTE exactly once, in a valid position.
@@ -4437,14 +4461,18 @@ fn count_sublink_self_refs(s: &Select, name: &str) -> usize {
 /// the would-be UNION unified type must EQUAL the anchor type; any widening of the anchor is the
 /// error. An arity mismatch is `42601`, like a plain UNION. A `UNION` (not `UNION ALL`) recursive
 /// CTE dedups its rows, so each column also needs an equality operator (42883 for json/jsonpath).
+/// `carried` is the number of hidden trailing outputs a SEARCH / CYCLE recursive term carries
+/// (recursive-cte.md §9), which are not compared.
 fn check_recursive_column_types(
     anchor: &QueryPlan,
     recursive: &QueryPlan,
     name: &str,
     union_all: bool,
+    carried: usize,
 ) -> Result<()> {
     let a = anchor.column_types();
-    let r = recursive.column_types();
+    let all = recursive.column_types();
+    let r = &all[..all.len() - carried];
     if a.len() != r.len() {
         return Err(EngineError::new(
             SqlState::SyntaxError,

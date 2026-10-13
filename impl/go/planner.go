@@ -564,7 +564,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	flat := &scope{rels: rels}
 	relStar := func(i int) []int {
 		var out []int
-		for c := range rels[i].table.Columns {
+		shown := len(rels[i].table.Columns) - starHiddenCount(&rels[i], ctes)
+		for c := range shown {
 			if idx := rels[i].offset + c; !slices.Contains(groupHidden, idx) {
 				out = append(out, idx)
 			}
@@ -884,6 +885,18 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	projections, columnNames, columnTypes, columnDerivs, columnTypmods, err := resolveProjections(s, items, projAgg, ptypes)
 	if err != nil {
 		return nil, err
+	}
+	// A SEARCH / CYCLE recursive term's hidden trailing outputs (recursive-cte.md §9).
+	for _, e := range sel.Tail {
+		node, ty, err := resolve(s, e, nil, projAgg, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		projections = append(projections, node)
+		columnNames = append(columnNames, e.Column)
+		columnTypes = append(columnTypes, ty)
+		columnDerivs = append(columnDerivs, deriv{})
+		columnTypmods = append(columnTypmods, typmod{})
 	}
 	var group *joinGroupLayout
 	if sel.JoinGroup {

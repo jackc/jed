@@ -110,8 +110,9 @@ impl Engine {
                     format!("WITH query name {lname} specified more than once"),
                 ));
             }
+            let search_cycle = cte.search.is_some() || cte.cycle.is_some();
             let shape = match (recursive, cte.body.as_query()) {
-                (true, Some(q)) => analyze_recursive_cte(&lname, q)?,
+                (true, Some(q)) => analyze_recursive_cte(&lname, q, search_cycle)?,
                 _ => CteShape::NonRecursive,
             };
             match shape {
@@ -125,11 +126,49 @@ impl Engine {
                         QueryExpr::SetOp(so) => (&so.lhs, &so.rhs),
                         _ => unreachable!("analyze_recursive_cte ensures a UNION body"),
                     };
+                    // A SEARCH / CYCLE clause types its cycle mark before the body is planned
+                    // (PostgreSQL's order — recursive-cte.md §9).
+                    let mark = match &cte.cycle {
+                        Some(c) => Some(self.resolve_cycle_mark(c, ptypes)?),
+                        None => None,
+                    };
                     // Plan the anchor (self NOT in scope) — its column types fix the relation.
                     let visible: Vec<&CteBinding> =
                         inherited.iter().copied().chain(bindings.iter()).collect();
                     let anchor_plan = self.plan_query(anchor, parent, &visible, ptypes)?;
-                    let table = cte_synthetic_table(&lname, &anchor_plan, cte.columns.as_deref())?;
+                    let mut table =
+                        cte_synthetic_table(&lname, &anchor_plan, cte.columns.as_deref())?;
+                    // SEARCH / CYCLE add columns after the CTE's own (recursive-cte.md §9).
+                    let sc = if search_cycle {
+                        let sc = self.plan_search_cycle(
+                            cte,
+                            &table,
+                            anchor_plan.column_types(),
+                            mark.as_ref(),
+                            ptypes,
+                        )?;
+                        let mut names: Vec<String> =
+                            table.columns.iter().map(|c| c.name.clone()).collect();
+                        names.extend(sc.names.iter().cloned());
+                        let mut types = anchor_plan.column_types().to_vec();
+                        types.extend(sc.types.iter().cloned());
+                        let mut derivs = anchor_plan.column_derivs().to_vec();
+                        derivs.extend(sc.types.iter().map(|_| Deriv::None));
+                        let mut typmods = anchor_plan.column_typmods().to_vec();
+                        typmods.extend(sc.types.iter().map(|_| Typmod::NONE));
+                        table = cte_synthetic_table_cols(
+                            &lname,
+                            &names,
+                            &types,
+                            Some(&derivs),
+                            Some(&typmods),
+                            None,
+                        )?;
+                        Some(sc)
+                    } else {
+                        None
+                    };
+                    let added = sc.as_ref().map_or(0, |sc| sc.names.len());
                     bindings.push(CteBinding {
                         name: lname,
                         table,
@@ -140,12 +179,24 @@ impl Engine {
                         at_reference: false,
                         body_ast: None,
                         expanded: std::cell::Cell::new(false),
+                        star_hidden: std::cell::Cell::new(added),
                     });
-                    // Plan the recursive term with the self-binding now visible.
+                    // Plan the recursive term with the self-binding now visible. Under SEARCH /
+                    // CYCLE it carries the self-reference's added columns as hidden trailing
+                    // outputs — the parent row's, from which the executor computes the child's.
                     let i = bindings.len() - 1;
                     let visible: Vec<&CteBinding> =
                         inherited.iter().copied().chain(bindings.iter()).collect();
+                    let carried;
+                    let recursive_term = match &sc {
+                        Some(sc) => {
+                            carried = with_carried_columns(recursive_term, &cte.name, &sc.names);
+                            &carried
+                        }
+                        None => recursive_term,
+                    };
                     let rhs_plan = self.plan_query(recursive_term, parent, &visible, ptypes)?;
+                    bindings[i].star_hidden.set(0);
                     let CteSource::Query(anchor_ref) = &bindings[i].source else {
                         unreachable!("the anchor binding was just pushed as a query source")
                     };
@@ -154,10 +205,12 @@ impl Engine {
                         &rhs_plan,
                         &bindings[i].name,
                         union_all,
+                        added,
                     )?;
                     bindings[i].recursive = Some(RecursiveTerm {
                         plan: rhs_plan,
                         union_all,
+                        search_cycle: sc,
                     });
                 }
                 CteShape::NonRecursive => match &cte.body {
@@ -194,6 +247,7 @@ impl Engine {
                             at_reference,
                             body_ast: at_reference.then(|| q.clone()),
                             expanded: std::cell::Cell::new(false),
+                            star_hidden: std::cell::Cell::new(0),
                         });
                     }
                     dm_body => {
@@ -218,9 +272,22 @@ impl Engine {
                             at_reference: false,
                             body_ast: None,
                             expanded: std::cell::Cell::new(false),
+                            star_hidden: std::cell::Cell::new(0),
                         });
                     }
                 },
+            }
+            // SEARCH / CYCLE on a CTE that does not reference itself (recursive-cte.md §9), reported
+            // after its body is planned, as in PostgreSQL.
+            if search_cycle && bindings.last().is_some_and(|b| b.recursive.is_none()) {
+                let pos = cte.search.as_ref().map_or_else(
+                    || cte.cycle.as_ref().map_or(SrcPos::NONE, |c| c.pos),
+                    |s| s.pos,
+                );
+                return Err(
+                    EngineError::new(SqlState::SyntaxError, "WITH query is not recursive")
+                        .with_position(pos.0),
+                );
             }
         }
         Ok(bindings)
@@ -502,6 +569,15 @@ impl Engine {
         };
         *total_cost += ar.cost;
         guard(*total_cost)?;
+        let mut anchor_rows = ar.rows;
+        // SEARCH / CYCLE: each anchor row gets its added columns (recursive-cte.md §9).
+        if let Some(sc) = &rt.search_cycle {
+            let (rows, cost) =
+                self.search_cycle_rows(sc, &sc.anchor, None, anchor_rows, params, outer)?;
+            *total_cost += cost;
+            guard(*total_cost)?;
+            anchor_rows = rows;
+        }
 
         // For UNION (distinct) a `seen` set drops rows duplicating any already-emitted row.
         let mut seen: HashSet<Row> = HashSet::new();
@@ -510,7 +586,7 @@ impl Engine {
         let mut seen_charge = crate::cost::StateCharge::new(acct.clone());
         let mut result: Vec<Row> = Vec::new();
         let mut working: Vec<Row> = Vec::new();
-        for row in ar.rows {
+        for row in anchor_rows {
             if rt.union_all || seen.insert(row.clone()) {
                 if !rt.union_all && seen_charge.active() {
                     seen_charge.reserve_direct(crate::memsize::entry_bytes(&row))?;
@@ -553,6 +629,21 @@ impl Engine {
             let before = acct.measure_rows(&new_rows);
             coerce_setop_rows(&mut new_rows, &rhs_types, &anchor_types);
             acct.reserve(acct.measure_rows(&new_rows) - before)?;
+            // SEARCH / CYCLE: drop a row whose parent closed a cycle, then replace the carried parent
+            // columns with the row's own (recursive-cte.md §9).
+            if let Some(sc) = &rt.search_cycle {
+                let (rows, cost) = self.search_cycle_rows(
+                    sc,
+                    &sc.recursive,
+                    sc.filter.as_ref(),
+                    new_rows,
+                    params,
+                    outer,
+                )?;
+                *total_cost += cost;
+                guard(*total_cost)?;
+                new_rows = rows;
+            }
             for row in new_rows {
                 if rt.union_all || seen.insert(row.clone()) {
                     if !rt.union_all && seen_charge.active() {

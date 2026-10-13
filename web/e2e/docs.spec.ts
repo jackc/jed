@@ -430,11 +430,11 @@ test('the select page runs the WITH RECURSIVE series demo live', async ({ page }
   await expect(panel.getByTestId('result-rows')).toContainText('5');
 });
 
-test('the select page runs the recursive path-and-cycle demo live', async ({ page }) => {
+test('the select page runs the SEARCH / CYCLE demo live', async ({ page }) => {
   await page.goto('/docs/sql/select/');
-  // A record[] path column (spec/design/composite.md §13): the walk 1 → 2 → 3 revisits 1, which is
-  // flagged as a cycle and not expanded; 3 → 4 is the other branch.
-  const panel = livePanel(page, 'recursivePath');
+  // SEARCH DEPTH FIRST + CYCLE (spec/design/recursive-cte.md §9): the walk 1 → 2 → 3 revisits 1,
+  // which is flagged as a cycle and not expanded; 3 → 4 is the other branch.
+  const panel = livePanel(page, 'searchCycle');
   await expect(panel.getByTestId('result-rows')).toContainText('{(1),(2),(3),(1)}');
   await expect(panel.getByTestId('result-rows')).toContainText('{(1),(2),(3),(4)}');
 });

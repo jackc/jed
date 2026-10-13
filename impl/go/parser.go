@@ -3345,7 +3345,136 @@ func (p *parser) parseCte() (cte, error) {
 	if err := p.expect(tokRParen); err != nil {
 		return cte{}, err
 	}
-	return cte{Name: name, Columns: columns, Materialized: materialized, Body: body}, nil
+	c := cte{Name: name, Columns: columns, Materialized: materialized, Body: body}
+	if p.peekKeyword() == "search" {
+		s, err := p.parseSearchClause()
+		if err != nil {
+			return cte{}, err
+		}
+		c.Search = s
+	}
+	if p.peekKeyword() == "cycle" {
+		cy, err := p.parseCycleClause()
+		if err != nil {
+			return cte{}, err
+		}
+		c.Cycle = cy
+	}
+	return c, nil
+}
+
+// parseSearchClause parses `SEARCH { DEPTH | BREADTH } FIRST BY col, … SET seq_col`
+// (spec/design/recursive-cte.md §9).
+func (p *parser) parseSearchClause() (*searchClause, error) {
+	pos := p.here()
+	if err := p.expectKeyword("search"); err != nil {
+		return nil, err
+	}
+	var breadth bool
+	switch p.peekKeyword() {
+	case "depth":
+	case "breadth":
+		breadth = true
+	default:
+		return nil, newError(SyntaxError, "expected DEPTH or BREADTH after SEARCH")
+	}
+	p.advance()
+	if err := p.expectKeyword("first"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("by"); err != nil {
+		return nil, err
+	}
+	cols, err := p.parseIdentifierList()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("set"); err != nil {
+		return nil, err
+	}
+	set, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	return &searchClause{BreadthFirst: breadth, Columns: cols, SetColumn: set, Pos: pos}, nil
+}
+
+// parseCycleClause parses `CYCLE col, … SET mark_col [TO value DEFAULT default] USING path_col`
+// (spec/design/recursive-cte.md §9).
+func (p *parser) parseCycleClause() (*cycleClause, error) {
+	pos := p.here()
+	if err := p.expectKeyword("cycle"); err != nil {
+		return nil, err
+	}
+	cols, err := p.parseIdentifierList()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("set"); err != nil {
+		return nil, err
+	}
+	mark, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	c := &cycleClause{Columns: cols, MarkColumn: mark, Pos: pos}
+	if p.peekKeyword() == "to" {
+		p.advance()
+		v, err := p.parseCycleMarkConstant()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("default"); err != nil {
+			return nil, err
+		}
+		d, err := p.parseCycleMarkConstant()
+		if err != nil {
+			return nil, err
+		}
+		c.MarkValue, c.MarkDefault = &v, &d
+	}
+	if err := p.expectKeyword("using"); err != nil {
+		return nil, err
+	}
+	if c.PathColumn, err = p.expectIdentifier(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// parseCycleMarkConstant parses a cycle mark constant (PostgreSQL's AexprConst): a number, string,
+// TRUE / FALSE / NULL, or a typed string literal (`date '…'`). A sign is not part of a constant, so
+// -1 is a syntax error, as in PostgreSQL.
+func (p *parser) parseCycleMarkConstant() (exprNode, error) {
+	if k := p.peek().Kind; k == tokMinus || k == tokLParen {
+		return exprNode{}, newError(SyntaxError, "expected a constant in a CYCLE clause")
+	}
+	e, err := p.parsePrimary()
+	if err != nil {
+		return exprNode{}, err
+	}
+	if e.Kind != exprLiteral && e.Kind != exprTypedLiteral {
+		return exprNode{}, newError(SyntaxError, "expected a constant in a CYCLE clause")
+	}
+	return e, nil
+}
+
+// parseIdentifierList parses a comma-separated list of one or more identifiers.
+func (p *parser) parseIdentifierList() ([]string, error) {
+	first, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	names := []string{first}
+	for p.peek().Kind == tokComma {
+		p.advance()
+		next, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, next)
+	}
+	return names, nil
 }
 
 // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full

@@ -1433,6 +1433,10 @@ type cteBinding struct {
 	atReference bool
 	bodyAst     *queryExpr
 	expanded    bool
+	// starHidden is how many trailing columns `*` and `rel.*` skip: a recursive CTE's SEARCH / CYCLE
+	// columns while its own recursive term is planned, so `SELECT * FROM self` keeps the anchor's
+	// arity (recursive-cte.md §9). Zero otherwise.
+	starHidden int
 }
 
 // isDml reports whether this binding is a data-modifying CTE (its source is a statement, not a query
@@ -1456,6 +1460,8 @@ type dmCte struct {
 type recursiveTerm struct {
 	plan     queryPlan
 	unionAll bool
+	// searchCycle is the SEARCH / CYCLE columns the executor adds to each row (recursive-cte.md §9).
+	searchCycle *searchCyclePlan
 }
 
 // cteCtx is the per-statement CTE execution context, threaded through exec* and evalEnv so a FROM

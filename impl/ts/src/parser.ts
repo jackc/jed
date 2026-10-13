@@ -12,6 +12,8 @@ import type {
   CheckOption,
   Cte,
   CteBody,
+  CycleClause,
+  SearchClause,
   DefaultDef,
   ExcludeDef,
   ForeignKeyDef,
@@ -2605,7 +2607,73 @@ class Parser {
     this.expect("lparen");
     const body = this.parseCteBody(true);
     this.expect("rparen");
-    return { name, columns, materialized, body };
+    const search = this.peekKeyword() === "search" ? this.parseSearchClause() : null;
+    const cycle = this.peekKeyword() === "cycle" ? this.parseCycleClause() : null;
+    return { name, columns, materialized, body, search, cycle };
+  }
+
+  // parseSearchClause parses `SEARCH { DEPTH | BREADTH } FIRST BY col, … SET seq_col`
+  // (spec/design/recursive-cte.md §9).
+  private parseSearchClause(): SearchClause {
+    const loc = this.here();
+    this.expectKeyword("search");
+    const kw = this.peekKeyword();
+    if (kw !== "depth" && kw !== "breadth") {
+      throw engineError("syntax_error", "expected DEPTH or BREADTH after SEARCH");
+    }
+    this.advance();
+    this.expectKeyword("first");
+    this.expectKeyword("by");
+    const columns = this.parseIdentifierList();
+    this.expectKeyword("set");
+    const setColumn = this.expectIdentifier();
+    return { breadthFirst: kw === "breadth", columns, setColumn, loc };
+  }
+
+  // parseCycleClause parses `CYCLE col, … SET mark_col [TO value DEFAULT default] USING path_col`
+  // (spec/design/recursive-cte.md §9).
+  private parseCycleClause(): CycleClause {
+    const loc = this.here();
+    this.expectKeyword("cycle");
+    const columns = this.parseIdentifierList();
+    this.expectKeyword("set");
+    const markColumn = this.expectIdentifier();
+    let markValue: Expr | null = null;
+    let markDefault: Expr | null = null;
+    if (this.peekKeyword() === "to") {
+      this.advance();
+      markValue = this.parseCycleMarkConstant();
+      this.expectKeyword("default");
+      markDefault = this.parseCycleMarkConstant();
+    }
+    this.expectKeyword("using");
+    const pathColumn = this.expectIdentifier();
+    return { columns, markColumn, markValue, markDefault, pathColumn, loc };
+  }
+
+  // parseCycleMarkConstant parses a cycle mark constant (PostgreSQL's AexprConst): a number, string,
+  // TRUE / FALSE / NULL, or a typed string literal (`date '…'`). A sign is not part of a constant, so
+  // -1 is a syntax error, as in PostgreSQL.
+  private parseCycleMarkConstant(): Expr {
+    const k = this.peek().kind;
+    if (k === "minus" || k === "lparen") {
+      throw engineError("syntax_error", "expected a constant in a CYCLE clause");
+    }
+    const e = this.parsePrimary();
+    if (e.kind !== "literal" && e.kind !== "typedLiteral") {
+      throw engineError("syntax_error", "expected a constant in a CYCLE clause");
+    }
+    return e;
+  }
+
+  // parseIdentifierList parses a comma-separated list of one or more identifiers.
+  private parseIdentifierList(): string[] {
+    const names = [this.expectIdentifier()];
+    while (this.peek().kind === "comma") {
+      this.advance();
+      names.push(this.expectIdentifier());
+    }
+    return names;
   }
 
   // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full

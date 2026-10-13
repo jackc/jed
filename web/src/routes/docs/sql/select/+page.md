@@ -43,14 +43,13 @@ SELECT n FROM series ORDER BY n;`;
 	const graphSeed = `CREATE TABLE edge (src i32, dst i32, PRIMARY KEY (src, dst));
 INSERT INTO edge VALUES (1, 2), (2, 3), (3, 1), (3, 4);`;
 
-	const recursivePath = `WITH RECURSIVE walk(node, is_cycle, path) AS (
-  SELECT 1::i32, false, ARRAY[ROW(1::i32)]
+	const searchCycle = `WITH RECURSIVE walk(node) AS (
+  SELECT 1
   UNION ALL
-  SELECT edge.dst, ROW(edge.dst) = ANY (walk.path), walk.path || ROW(edge.dst)
-  FROM edge JOIN walk ON edge.src = walk.node
-  WHERE NOT walk.is_cycle
-)
-SELECT node, is_cycle, path FROM walk ORDER BY path;`;
+  SELECT edge.dst FROM edge JOIN walk ON edge.src = walk.node
+) SEARCH DEPTH FIRST BY node SET ord
+  CYCLE node SET is_cycle USING path
+SELECT node, is_cycle, path FROM walk ORDER BY ord;`;
 
 	const nestedWith = `WITH prices AS (
   SELECT category, price FROM product
@@ -336,17 +335,19 @@ against the rows the previous step produced until it yields none:
 `UNION ALL` keeps every row; `UNION` drops rows that duplicate one already produced (which is what
 makes a cyclic graph walk terminate). The column types are fixed by the non-recursive term. A
 recursion with no stopping condition runs until it hits the statement's
-[cost ceiling](../../api/resource-limits/) — set one when running untrusted queries. `SEARCH` /
-`CYCLE` clauses and mutual recursion are not yet supported.
+[cost ceiling](../../api/resource-limits/) — set one when running untrusted queries. Mutual
+recursion is not yet supported.
 
-What those clauses do can be written by hand: a CTE column may hold an anonymous `ROW(…)` or an
-array of them, so each step can carry the path it took. Ordering by the path gives depth-first
-order, and `ROW(…) = ANY (path)` stops a walk that revisits a node:
+A recursive CTE may end with `SEARCH` and `CYCLE` clauses, as in PostgreSQL. `SEARCH DEPTH FIRST BY
+cols SET ord` adds a column whose order is depth-first (`BREADTH FIRST` for breadth-first), and
+`CYCLE cols SET is_cycle USING path` adds the path of rows visited and a flag that marks a row
+repeating one on its path — a marked row is not expanded, so a walk over a cyclic graph ends. Use
+`TO value DEFAULT value` to choose the flag's values instead of `true` / `false`:
 
-<LiveSql demo="recursivePath" seed={graphSeed} query={recursivePath} rows={5} />
+<LiveSql demo="searchCycle" seed={graphSeed} query={searchCycle} rows={5} />
 
-Such a `record` or `record[]` column lives only in the query: a `CREATE TABLE … AS` or view column
-of that type is an error (`42P16`), as in PostgreSQL.
+The added columns are anonymous `record` and `record[]` values. They live only in the query: a
+`CREATE TABLE … AS` or view column of that type is an error (`42P16`), as in PostgreSQL.
 
 ### Nested `WITH`
 
