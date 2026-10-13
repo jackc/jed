@@ -828,30 +828,26 @@ const (
 	capFan     = 1 << capFanBits
 )
 
-// capNode is a node of a thread's capture slots, a persistent array (regex.md §4.1). A Save makes a
-// new version by copying only the nodes on the path to the slot it sets, at most capFan entries per
-// level, so its work is bounded however many groups the pattern has; the older version stays intact
-// for the threads still holding it. A leaf holds slot values (code-point offsets; -1 = unset), an
-// interior node its subtrees. A nil node means every slot under it is unset, so a search starts from
-// a nil root. A match has set slots 0 and 1, so its root is never nil.
+// regexCaps is a thread's or match's capture slots (code-point offsets; -1 = unset), a persistent
+// array (regex.md §4.1): a Save makes a new version and leaves the old one intact for the threads
+// still holding it. A pattern whose slots fit in one capFan-slot leaf keeps them flat, and a Save
+// copies all of them; the array holds no pointers, so it is the cheapest allocation the collector
+// has. A larger pattern keeps a tree, and a Save copies only the path to the slot it sets, so its
+// work is bounded however many groups the pattern has. The zero value has every slot unset.
+type regexCaps struct {
+	flat []int64
+	tree *capNode
+}
+
+// capNode is a node of a capture-slot tree. A leaf holds slot values, an interior node its subtrees;
+// a nil node means every slot under it is unset.
 type capNode struct {
 	vals []int64
 	kids []*capNode
 }
 
-// The capLeaf and capInner types allocate a node together with the array its slice views, so a
-// level of a Save is one allocation. A one-level tree's leaf holds just the pattern's slots, so its
-// array comes in three sizes.
-type capLeaf4 struct {
-	node capNode
-	buf  [4]int64
-}
-
-type capLeaf8 struct {
-	node capNode
-	buf  [8]int64
-}
-
+// capLeaf and capInner allocate a node together with the array its slice views, so a level of a
+// Save is one allocation.
 type capLeaf struct {
 	node capNode
 	buf  [capFan]int64
@@ -863,7 +859,7 @@ type capInner struct {
 }
 
 // capShape returns the depth of the capture-slot tree for nslots slots and the length of its leaves:
-// a one-level tree is a single leaf of exactly nslots slots, a deeper one has full leaves.
+// a one-level tree is a single leaf of exactly nslots slots, kept flat; a deeper one has full leaves.
 func capShape(nslots int) (depth, leafLen int) {
 	depth = 1
 	for span := capFan; span < nslots; span *= capFan {
@@ -876,8 +872,14 @@ func capShape(nslots int) (depth, leafLen int) {
 }
 
 // slot returns capture slot i of a thread's or match's slots (-1 = unset).
-func (p *regexProgram) slot(caps *capNode, i int) int64 {
-	n := caps
+func (p *regexProgram) slot(caps regexCaps, i int) int64 {
+	if p.capDepth == 1 {
+		if caps.flat == nil {
+			return -1
+		}
+		return caps.flat[i]
+	}
+	n := caps.tree
 	for shift := capFanBits * (p.capDepth - 1); shift > 0 && n != nil; shift -= capFanBits {
 		n = n.kids[(i>>shift)&(capFan-1)]
 	}
@@ -887,14 +889,12 @@ func (p *regexProgram) slot(caps *capNode, i int) int64 {
 	return n.vals[i&(capFan-1)]
 }
 
-// withSlot returns the version of caps with slot i set to v, sharing every node off the path to it.
-func (p *regexProgram) withSlot(caps *capNode, i int, v int64) *capNode {
-	return p.withSlotAt(caps, capFanBits*(p.capDepth-1), i, v)
-}
-
+// withSlotAt returns the version of the subtree n with slot i set to v, sharing every node off the
+// path to it.
 func (p *regexProgram) withSlotAt(n *capNode, shift, i int, v int64) *capNode {
 	if shift == 0 {
-		node, vals := p.newLeaf()
+		leaf := &capLeaf{}
+		vals := leaf.buf[:]
 		if n != nil {
 			copy(vals, n.vals)
 		} else {
@@ -903,7 +903,8 @@ func (p *regexProgram) withSlotAt(n *capNode, shift, i int, v int64) *capNode {
 			}
 		}
 		vals[i&(capFan-1)] = v
-		return node
+		leaf.node.vals = vals
+		return &leaf.node
 	}
 	inner := &capInner{}
 	kids := inner.buf[:]
@@ -916,27 +917,8 @@ func (p *regexProgram) withSlotAt(n *capNode, shift, i int, v int64) *capNode {
 	return &inner.node
 }
 
-// newLeaf allocates a leaf and the capLeafLen slots it holds, in one allocation.
-func (p *regexProgram) newLeaf() (*capNode, []int64) {
-	var node *capNode
-	var buf []int64
-	switch {
-	case p.capLeafLen <= 4:
-		leaf := &capLeaf4{}
-		node, buf = &leaf.node, leaf.buf[:]
-	case p.capLeafLen <= 8:
-		leaf := &capLeaf8{}
-		node, buf = &leaf.node, leaf.buf[:]
-	default:
-		leaf := &capLeaf{}
-		node, buf = &leaf.node, leaf.buf[:]
-	}
-	node.vals = buf[:p.capLeafLen]
-	return node, node.vals
-}
-
 // slots returns every capture slot of caps as a flat array.
-func (p *regexProgram) slots(caps *capNode) []int64 {
+func (p *regexProgram) slots(caps regexCaps) []int64 {
 	out := make([]int64, 2*(p.ngroups+1))
 	for i := range out {
 		out[i] = p.slot(caps, i)
@@ -948,9 +930,44 @@ func (p *regexProgram) slots(caps *capNode) []int64 {
 // Pike VM (regex.md §4)
 // ---------------------------------------------------------------------------
 
-type regexThread struct {
+// capRep is how the VM keeps a thread's capture slots (regex.md §4.1): flatCaps for a pattern whose
+// slots fit in one leaf, treeCaps for a larger one. The VM is instantiated once per representation,
+// so a thread is a pc and one field, and a small pattern's slots stay a pointer-free array.
+type capRep[C any] interface {
+	with(p *regexProgram, caps C, i int, v int64) C
+	result(caps C) regexCaps
+}
+
+// flatCaps keeps the slots as one array, copied whole on a Save: at most capFan slots.
+type flatCaps struct{}
+
+func (flatCaps) with(p *regexProgram, caps []int64, i int, v int64) []int64 {
+	flat := make([]int64, p.capLeafLen)
+	if caps != nil {
+		copy(flat, caps)
+	} else {
+		for j := range flat {
+			flat[j] = -1
+		}
+	}
+	flat[i] = v
+	return flat
+}
+
+func (flatCaps) result(caps []int64) regexCaps { return regexCaps{flat: caps} }
+
+// treeCaps keeps the slots as a capture-slot tree; a Save copies the path to the slot it sets.
+type treeCaps struct{}
+
+func (treeCaps) with(p *regexProgram, caps *capNode, i int, v int64) *capNode {
+	return p.withSlotAt(caps, capFanBits*(p.capDepth-1), i, v)
+}
+
+func (treeCaps) result(caps *capNode) regexCaps { return regexCaps{tree: caps} }
+
+type regexThread[C any] struct {
 	pc   int
-	caps *capNode
+	caps C
 }
 
 // regexSeen is the per-position dedup set (regex.md §4): marks[pc] == generation means pc was visited
@@ -984,13 +1001,13 @@ func (p *regexProgram) takeSeen() *regexSeen {
 
 // isMatch reports whether the pattern matches somewhere in input (the `~` operator).
 func (p *regexProgram) isMatch(input []rune, m *costMeter) (bool, error) {
-	caps, err := p.run(input, m)
-	return caps != nil, err
+	_, ok, err := p.run(input, m)
+	return ok, err
 }
 
 // run executes the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
 // capture slots on a match, or nil.
-func (p *regexProgram) run(input []rune, m *costMeter) (*capNode, error) {
+func (p *regexProgram) run(input []rune, m *costMeter) (regexCaps, bool, error) {
 	seen := p.takeSeen()
 	defer p.seenPool.Put(seen)
 	return p.search(seen, input, 0, m)
@@ -1000,14 +1017,25 @@ func (p *regexProgram) run(input []rune, m *costMeter) (*capNode, error) {
 // later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
 // input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
 // guards once per input position.
-func (p *regexProgram) search(seen *regexSeen, input []rune, start int, m *costMeter) (*capNode, error) {
-	length := len(input)
-	clist := []regexThread{}
-	nlist := []regexThread{}
-	var matched *capNode
+func (p *regexProgram) search(seen *regexSeen, input []rune, start int, m *costMeter) (regexCaps, bool, error) {
+	if p.capDepth == 1 {
+		return pikeSearch[[]int64, flatCaps](p, seen, input, start, m)
+	}
+	return pikeSearch[*capNode, treeCaps](p, seen, input, start, m)
+}
 
-	if err := p.addThread(&clist, seen, seen.next(), 0, nil, start, length, m); err != nil {
-		return nil, err
+// pikeSearch is search over the capture representation R.
+func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []rune, start int, m *costMeter) (regexCaps, bool, error) {
+	var rep R
+	var unset C
+	length := len(input)
+	clist := []regexThread[C]{}
+	nlist := []regexThread[C]{}
+	var matched C
+	found := false
+
+	if err := pikeAddThread[C, R](p, &clist, seen, seen.next(), 0, unset, start, length, m); err != nil {
+		return regexCaps{}, false, err
 	}
 
 	for sp := start; sp <= length; sp++ {
@@ -1020,44 +1048,45 @@ func (p *regexProgram) search(seen *regexSeen, input []rune, start int, m *costM
 			switch in.op {
 			case opChar:
 				if sp < length && input[sp] == in.ch {
-					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
-						return nil, err
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
+						return regexCaps{}, false, err
 					}
 				}
 			case opAny:
 				if sp < length && input[sp] != '\n' {
-					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
-						return nil, err
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
+						return regexCaps{}, false, err
 					}
 				}
 			case opClass:
 				if sp < length && p.classes[in.x].admits(input[sp]) {
-					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
-						return nil, err
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
+						return regexCaps{}, false, err
 					}
 				}
 			case opMatch:
-				matched = th.caps
+				matched, found = th.caps, true
 				break inner // cut lower-priority threads (leftmost-first, regex.md §4)
 			}
 		}
 		clist, nlist = nlist, clist
 		if err := m.Guard(); err != nil { // §6 ceiling, once per input position
-			return nil, err
+			return regexCaps{}, false, err
 		}
 		if len(clist) == 0 {
 			break
 		}
 	}
-	return matched, nil
+	return rep.result(matched), found, nil
 }
 
-// addThread performs the epsilon-closure: follow Jmp/Split/Save/Assert from pc, appending
+// pikeAddThread performs the epsilon-closure: follow Jmp/Split/Save/Assert from pc, appending
 // consuming/Match threads to *list, deduping by pc within this generation. Iterative (explicit
 // stack) so a long Jmp/Split chain cannot overflow the native stack; the y arm of a Split is pushed
 // before x so x is processed first (higher priority). Charges regex_step per explored state.
-func (p *regexProgram) addThread(list *[]regexThread, seen *regexSeen, generation uint32, pc0 int, caps0 *capNode, sp, length int, m *costMeter) error {
-	stack := []regexThread{{pc0, caps0}}
+func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], seen *regexSeen, generation uint32, pc0 int, caps0 C, sp, length int, m *costMeter) error {
+	var rep R
+	stack := []regexThread[C]{{pc0, caps0}}
 	for len(stack) > 0 {
 		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -1069,20 +1098,20 @@ func (p *regexProgram) addThread(list *[]regexThread, seen *regexSeen, generatio
 		in := p.insts[top.pc]
 		switch in.op {
 		case opJmp:
-			stack = append(stack, regexThread{in.x, top.caps})
+			stack = append(stack, regexThread[C]{in.x, top.caps})
 		case opSplit:
 			// Push y first, then x, so x pops first = higher priority.
-			stack = append(stack, regexThread{in.y, top.caps})
-			stack = append(stack, regexThread{in.x, top.caps})
+			stack = append(stack, regexThread[C]{in.y, top.caps})
+			stack = append(stack, regexThread[C]{in.x, top.caps})
 		case opSave:
-			stack = append(stack, regexThread{top.pc + 1, p.withSlot(top.caps, in.x, int64(sp))})
+			stack = append(stack, regexThread[C]{top.pc + 1, rep.with(p, top.caps, in.x, int64(sp))})
 		case opAssertStart:
 			if sp == 0 {
-				stack = append(stack, regexThread{top.pc + 1, top.caps})
+				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
 			}
 		case opAssertEnd:
 			if sp == length {
-				stack = append(stack, regexThread{top.pc + 1, top.caps})
+				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
 			}
 		default:
 			// Char / Any / Class / Match — parked for the consume loop.
@@ -1106,7 +1135,7 @@ func (p *regexProgram) reportedGroups() (lo, hi int) {
 // a match's slots, computed from the spans without building it (cost.md §8.1): ARRAY_DIM, plus VALUE
 // and the span's UTF-8 bytes per reported group (an unset group is a bare VALUE). utf8At is
 // utf8Offsets of the subject, so each span is measured in O(1).
-func (p *regexProgram) captureArraySize(caps *capNode, utf8At []int64) int64 {
+func (p *regexProgram) captureArraySize(caps regexCaps, utf8At []int64) int64 {
 	size := memoryArrayDim
 	lo, hi := p.reportedGroups()
 	for g := lo; g <= hi; g++ {
@@ -1121,7 +1150,7 @@ func (p *regexProgram) captureArraySize(caps *capNode, utf8At []int64) int64 {
 
 // captureArray returns the capture array for a match's slots, sliced from the ORIGINAL-case subject:
 // the reported groups' substrings, an unset group nil.
-func (p *regexProgram) captureArray(caps *capNode, orig []rune) []*string {
+func (p *regexProgram) captureArray(caps regexCaps, orig []rune) []*string {
 	lo, hi := p.reportedGroups()
 	groups := make([]*string, 0, hi-lo+1)
 	for g := lo; g <= hi; g++ {
@@ -1166,11 +1195,11 @@ func (p *regexProgram) splitPieces(matchInput, origInput []rune, m *costMeter) (
 	prevEnd := 0    // the end of the previous match, degenerate or not
 	pieceStart := 0 // the end of the previous SPLITTING match
 	for pos <= length {
-		caps, err := p.search(seen, matchInput, pos, m)
+		caps, ok, err := p.search(seen, matchInput, pos, m)
 		if err != nil {
 			return nil, err
 		}
-		if caps == nil {
+		if !ok {
 			break
 		}
 		s, e := int(p.slot(caps, 0)), int(p.slot(caps, 1))
@@ -1196,17 +1225,17 @@ func (p *regexProgram) splitPieces(matchInput, origInput []rune, m *costMeter) (
 // and splice from these slots without searching again (cost.md §8.1).
 // regexp_match (never global) and regexp_matches run the same search, then size and slice their
 // capture arrays from the slots (captureArraySize, captureArray).
-func (p *regexProgram) replaceMatches(matchInput []rune, global bool, m *costMeter) ([]*capNode, error) {
+func (p *regexProgram) replaceMatches(matchInput []rune, global bool, m *costMeter) ([]regexCaps, error) {
 	seen := p.takeSeen()
 	defer p.seenPool.Put(seen)
-	var found []*capNode
+	var found []regexCaps
 	pos := 0
 	for {
-		caps, err := p.search(seen, matchInput, pos, m)
+		caps, ok, err := p.search(seen, matchInput, pos, m)
 		if err != nil {
 			return nil, err
 		}
-		if caps == nil {
+		if !ok {
 			break
 		}
 		s := int(p.slot(caps, 0))
@@ -1241,11 +1270,11 @@ func (p *regexProgram) regexpCount(input []rune, start int, m *costMeter) (int64
 	pos := start
 	var count int64
 	for pos <= length {
-		caps, err := p.search(seen, input, pos, m)
+		caps, ok, err := p.search(seen, input, pos, m)
 		if err != nil {
 			return 0, err
 		}
-		if caps == nil {
+		if !ok {
 			break
 		}
 		count++
@@ -1262,23 +1291,23 @@ func (p *regexProgram) regexpCount(input []rune, start int, m *costMeter) (int64
 // nthMatch returns the capture slots of the N-th (1-based) non-overlapping match at or after `start`
 // (regexp_substr / regexp_instr, regex.md §8b), or nil when fewer than N matches exist. Same
 // non-overlapping advance as regexpCount.
-func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *costMeter) (*capNode, error) {
+func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *costMeter) (regexCaps, bool, error) {
 	seen := p.takeSeen()
 	defer p.seenPool.Put(seen)
 	length := len(input)
 	pos := start
 	var count int64
 	for pos <= length {
-		caps, err := p.search(seen, input, pos, m)
+		caps, ok, err := p.search(seen, input, pos, m)
 		if err != nil {
-			return nil, err
+			return regexCaps{}, false, err
 		}
-		if caps == nil {
+		if !ok {
 			break
 		}
 		count++
 		if count == n {
-			return caps, nil
+			return caps, true, nil
 		}
 		s, e := int(p.slot(caps, 0)), int(p.slot(caps, 1))
 		if e > s {
@@ -1287,7 +1316,7 @@ func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *costMeter) 
 			pos = e + 1
 		}
 	}
-	return nil, nil
+	return regexCaps{}, false, nil
 }
 
 // sliceGroup slices orig[start:end] to a string pointer, or nil for an unset (-1) group.
@@ -1303,7 +1332,7 @@ func sliceGroup(orig []rune, start, end int64) *string {
 // (literal backslash), and \<other> (the literal <other>). A trailing lone \ is literal, and an unset
 // or absent group expands to nothing. Each piece is a literal rune (lo < 0) or the [lo, hi) span of
 // the original input. Sizing and building share this walk so they cannot disagree.
-func (p *regexProgram) forEachPiece(repl []rune, caps *capNode, f func(r rune, lo, hi int)) {
+func (p *regexProgram) forEachPiece(repl []rune, caps regexCaps, f func(r rune, lo, hi int)) {
 	span := func(start, end int64) {
 		if start >= 0 && end >= 0 {
 			f(0, int(start), int(end))
@@ -1333,7 +1362,7 @@ func (p *regexProgram) forEachPiece(repl []rune, caps *capNode, f func(r rune, l
 
 // forEachOutput walks the pieces of a replacement in output order: unmatched source text, each match's
 // expanded template, and, for an empty match, the rune after it.
-func (p *regexProgram) forEachOutput(orig, repl []rune, found []*capNode, f func(r rune, lo, hi int)) {
+func (p *regexProgram) forEachOutput(orig, repl []rune, found []regexCaps, f func(r rune, lo, hi int)) {
 	pos := 0
 	for _, caps := range found {
 		s := int(p.slot(caps, 0))
@@ -1356,7 +1385,7 @@ func (p *regexProgram) forEachOutput(orig, repl []rune, found []*capNode, f func
 
 // replaceSize is the exact UTF-8 byte length of regexp_replace's result for the matches replaceMatches
 // found, computed without building it (cost.md §8.1).
-func (p *regexProgram) replaceSize(orig, repl []rune, found []*capNode) int64 {
+func (p *regexProgram) replaceSize(orig, repl []rune, found []regexCaps) int64 {
 	var size int64
 	p.forEachOutput(orig, repl, found, func(r rune, lo, hi int) {
 		if lo < 0 {
@@ -1371,7 +1400,7 @@ func (p *regexProgram) replaceSize(orig, repl []rune, found []*capNode) int64 {
 }
 
 // replaceBuild builds regexp_replace's result of size bytes from the matches replaceMatches found.
-func (p *regexProgram) replaceBuild(orig, repl []rune, found []*capNode, size int64) string {
+func (p *regexProgram) replaceBuild(orig, repl []rune, found []regexCaps, size int64) string {
 	var b strings.Builder
 	b.Grow(int(size))
 	p.forEachOutput(orig, repl, found, func(r rune, lo, hi int) {

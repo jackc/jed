@@ -677,6 +677,11 @@ export function compileRegex(pattern: string): RegexProgram {
 const CAP_FAN_BITS = 4;
 const CAP_FAN = 1 << CAP_FAN_BITS;
 
+// The entries of a node no save has reached, copied to start one: every slot unset, every subtree
+// missing. Built packed (Array.from), since slicing a packed array is the cheapest copy.
+const UNSET_SLOTS: readonly number[] = Array.from({ length: CAP_FAN }, () => -1);
+const NO_SUBTREES: readonly (CapNode | null)[] = Array.from({ length: CAP_FAN }, () => null);
+
 // A node of a thread's capture slots, a persistent array (regex.md §4.1). A save makes a new version
 // by copying only the nodes on the path to the slot it sets, at most CAP_FAN entries per level, so its
 // work is bounded however many groups the pattern has; the older version stays intact for the threads
@@ -708,6 +713,12 @@ export function regexSlot(p: RegexProgram, caps: CapNode | null, i: number): num
 
 // withSlot returns the version of caps with slot i set to v, sharing every node off the path to it.
 function withSlot(p: RegexProgram, caps: CapNode | null, i: number, v: number): CapNode {
+  if (p.capDepth === 1) {
+    // A one-leaf pattern's slots are one flat array, copied whole.
+    const flat = caps === null ? UNSET_SLOTS.slice(0, p.capLeafLen) : (caps as number[]).slice();
+    flat[i] = v;
+    return flat;
+  }
   return withSlotAt(p, caps, CAP_FAN_BITS * (p.capDepth - 1), i, v);
 }
 
@@ -719,12 +730,11 @@ function withSlotAt(
   v: number,
 ): CapNode {
   if (shift === 0) {
-    const vals = n === null ? new Array<number>(p.capLeafLen).fill(-1) : (n as number[]).slice();
+    const vals = n === null ? UNSET_SLOTS.slice(0, p.capLeafLen) : (n as number[]).slice();
     vals[i & (CAP_FAN - 1)] = v;
     return vals;
   }
-  const kids =
-    n === null ? new Array<CapNode | null>(CAP_FAN).fill(null) : (n as (CapNode | null)[]).slice();
+  const kids = n === null ? NO_SUBTREES.slice() : (n as (CapNode | null)[]).slice();
   const k = (i >> shift) & (CAP_FAN - 1);
   kids[k] = withSlotAt(p, kids[k], shift - CAP_FAN_BITS, i, v);
   return kids;
@@ -747,24 +757,29 @@ type Thread = { pc: number; caps: CapNode | null };
 // current position, so moving to the next position is an increment, not a clear. A program keeps its
 // set and reuses it across searches and rows, so a search does no setup work in proportion to the
 // program, only the states it explores, which regex_step meters (§4.2).
-export type RegexSeen = { marks: Uint32Array; generation: number };
+export type RegexSeen = { marks: Int32Array; generation: number };
 
 // nextGeneration starts a new generation. When the counter wraps, the stale marks could alias the new
 // generation, so they are cleared.
 function nextGeneration(seen: RegexSeen): number {
-  seen.generation = (seen.generation + 1) >>> 0;
-  if (seen.generation === 0) {
+  if (seen.generation === 0x7fffffff) {
     seen.marks.fill(0);
-    seen.generation = 1;
+    seen.generation = 0;
   }
-  return seen.generation;
+  return ++seen.generation;
 }
 
-// withSeen runs f with a dedup set for one call's searches, taken from the program when it holds one
-// and returned to it afterwards.
-function withSeen<T>(p: RegexProgram, f: (seen: RegexSeen) => T): T {
-  const seen = p.seen ?? { marks: new Uint32Array(p.insts.length), generation: 0 };
+// takeSeen returns a dedup set for one call's searches, the program's own when it holds one. The
+// caller gives it back by assigning p.seen.
+function takeSeen(p: RegexProgram): RegexSeen {
+  const seen = p.seen ?? { marks: new Int32Array(p.insts.length), generation: 0 };
   p.seen = null;
+  return seen;
+}
+
+// withSeen runs f with a dedup set for one call's searches (takeSeen) and gives it back afterwards.
+function withSeen<T>(p: RegexProgram, f: (seen: RegexSeen) => T): T {
+  const seen = takeSeen(p);
   try {
     return f(seen);
   } finally {
@@ -780,7 +795,12 @@ export function regexIsMatch(p: RegexProgram, input: number[], m: Meter): boolea
 // regexRun executes the Pike VM from the start of the input (regex.md §4). Returns the winning
 // thread's capture slots on a match, or null.
 export function regexRun(p: RegexProgram, input: number[], m: Meter): CapNode | null {
-  return withSeen(p, (seen) => regexSearch(p, seen, input, 0, m));
+  const seen = takeSeen(p);
+  try {
+    return regexSearch(p, seen, input, 0, m);
+  } finally {
+    p.seen = seen;
+  }
 }
 
 // regexSearch runs the Pike VM, considering only matches that START at code-point position `start` or
@@ -799,7 +819,8 @@ function regexSearch(
   let nlist: Thread[] = [];
   let matched: CapNode | null = null;
 
-  addThread(p, clist, seen, nextGeneration(seen), 0, null, start, len, m);
+  const marks = seen.marks;
+  addThread(p, clist, marks, nextGeneration(seen), 0, null, start, len, m);
 
   for (let sp = start; sp <= len; sp++) {
     const generation = nextGeneration(seen);
@@ -810,17 +831,17 @@ function regexSearch(
       switch (inst.op) {
         case "char":
           if (sp < len && input[sp] === inst.ch) {
-            addThread(p, nlist, seen, generation, th.pc + 1, th.caps, sp + 1, len, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, len, m);
           }
           break;
         case "any":
           if (sp < len && input[sp] !== 0x0a) {
-            addThread(p, nlist, seen, generation, th.pc + 1, th.caps, sp + 1, len, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, len, m);
           }
           break;
         case "class":
           if (sp < len && classAdmits(p.classes[inst.x], input[sp])) {
-            addThread(p, nlist, seen, generation, th.pc + 1, th.caps, sp + 1, len, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, len, m);
           }
           break;
         case "match":
@@ -844,7 +865,7 @@ function regexSearch(
 function addThread(
   p: RegexProgram,
   list: Thread[],
-  seen: RegexSeen,
+  marks: Int32Array,
   generation: number,
   pc0: number,
   caps0: CapNode | null,
@@ -855,8 +876,8 @@ function addThread(
   const stack: Thread[] = [{ pc: pc0, caps: caps0 }];
   while (stack.length > 0) {
     const top = stack.pop() as Thread;
-    if (seen.marks[top.pc] === generation) continue;
-    seen.marks[top.pc] = generation;
+    if (marks[top.pc] === generation) continue;
+    marks[top.pc] = generation;
     m.charge(COSTS.regexStep);
     const inst = p.insts[top.pc];
     switch (inst.op) {

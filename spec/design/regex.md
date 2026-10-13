@@ -310,8 +310,16 @@ it. Every core uses the same shape: a tree whose leaves hold 16 slots and whose 
 16 subtrees, with depth the smallest `d` such that `16^d ≥ 2·(ngroups+1)` (1 to 4 under
 `MAX_REGEX_PROGRAM`). A missing subtree means every slot under it is unset, so a search starts from
 an empty tree. `with(n, sp)` copies the nodes on the path from the root to slot `n`, at most four
-nodes of 16 entries, and shares every other node. A one-level tree is a single leaf of exactly
-`2·(ngroups+1)` slots, so a pattern of up to 7 groups copies what it always did.
+nodes of 16 entries, and shares every other node.
+
+A one-level tree is a single leaf of exactly `2·(ngroups+1)` slots, and a pattern of up to 7 groups
+keeps it as a plain flat array, copied whole on a `Save` (at most 16 slots) as before the tree
+existed. That case is nearly every real pattern, and the per-row cost of a regex filter is mostly
+its `Save` copies, so it must stay as cheap as a flat copy. A tree node adds a pointer and an object
+header per version, and costs a garbage-collected core more than a pointer-free array. Each core
+therefore compiles its VM once per representation (Go and Rust generics; a branch in TS), so a
+small pattern's thread is a pc and its flat array. Against the flat-copy engine, per-row filter and
+capture workloads run at the same speed or faster in every core.
 
 The representation is not observable. Matches, capture spans, `regex_step` counts, and abort points
 are those of the copying description above; the fixtures (§9) pin them, and

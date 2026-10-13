@@ -169,20 +169,20 @@ func TestRegexMatchVectors(t *testing.T) {
 			t.Fatalf("compile %q: %v", pattern, err)
 		}
 		m := newMeter()
-		caps, err := prog.run([]rune(subj), m)
+		caps, ok, err := prog.run([]rune(subj), m)
 		if err != nil {
 			t.Fatalf("run %q/%q: %v", pattern, input, err)
 		}
 		wantMatched := c["matched"] == "true"
-		if (caps != nil) != wantMatched {
-			t.Errorf("matched for %q/%q: got %v want %v", pattern, input, caps != nil, wantMatched)
+		if ok != wantMatched {
+			t.Errorf("matched for %q/%q: got %v want %v", pattern, input, ok, wantMatched)
 		}
 		var wantCaps []int64
 		if wantMatched {
 			wantCaps = parsePairs(c["caps"])
 		}
 		var gotCaps []int64
-		if caps != nil {
+		if ok {
 			gotCaps = prog.slots(caps)
 		}
 		if !reflect.DeepEqual(gotCaps, wantCaps) {

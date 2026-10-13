@@ -797,13 +797,20 @@ pub fn compile(pattern: &str) -> Result<Program> {
 const CAP_FAN_BITS: usize = 4;
 const CAP_FAN: usize = 1 << CAP_FAN_BITS;
 
-/// A node of a thread's capture slots, a persistent array (regex.md §4.1). A Save makes a new
-/// version by copying only the nodes on the path to the slot it sets, at most `CAP_FAN` entries per
-/// level, so its work is bounded however many groups the pattern has; the older version stays intact
-/// for the threads still holding it. A leaf holds slot values (code-point offsets; `-1` = unset), an
-/// interior node its subtrees. A missing node means every slot under it is unset, so a search starts
-/// from no root. A match has set slots 0 and 1, so it always has a root. Each node is one shared
-/// slice of exactly its entries, so a level of a Save is one allocation.
+/// A match's capture slots (code-point offsets; `-1` = unset), a persistent array (regex.md §4.1): a
+/// Save makes a new version and leaves the old one intact for the threads still holding it. A pattern
+/// whose slots fit in one `CAP_FAN`-slot leaf keeps them flat, and a Save copies all of them. A larger
+/// pattern keeps a tree of [`CapNode`]s, and a Save copies only the path to the slot it sets, so its
+/// work is bounded however many groups the pattern has.
+#[derive(Clone, Debug)]
+pub enum Captures {
+    Flat(Rc<Vec<i64>>),
+    Tree(CapNode),
+}
+
+/// A node of a capture-slot tree. A leaf holds slot values, an interior node its subtrees; a missing
+/// node means every slot under it is unset. Each node is one shared slice of exactly its entries, so
+/// a level of a Save is one allocation.
 #[derive(Clone, Debug)]
 pub enum CapNode {
     Leaf(Rc<[i64]>),
@@ -815,7 +822,7 @@ const UNSET_SLOTS: [i64; CAP_FAN] = [-1; CAP_FAN];
 const NO_SUBTREES: [Option<CapNode>; CAP_FAN] = [const { None }; CAP_FAN];
 
 /// The depth of the capture-slot tree for `nslots` slots and the length of its leaves: a one-level
-/// tree is a single leaf of exactly `nslots` slots, a deeper one has full leaves.
+/// tree is a single leaf of exactly `nslots` slots, kept flat; a deeper one has full leaves.
 fn cap_shape(nslots: usize) -> (usize, usize) {
     let mut depth = 1;
     let mut span = CAP_FAN;
@@ -832,8 +839,11 @@ fn cap_shape(nslots: usize) -> (usize, usize) {
 
 impl Program {
     /// Capture slot `i` of a match's slots (`-1` = unset).
-    pub fn slot(&self, caps: &CapNode, i: usize) -> i64 {
-        self.slot_in(Some(caps), i)
+    pub fn slot(&self, caps: &Captures, i: usize) -> i64 {
+        match caps {
+            Captures::Flat(flat) => flat[i],
+            Captures::Tree(tree) => self.slot_in(Some(tree), i),
+        }
     }
 
     fn slot_in(&self, caps: Option<&CapNode>, i: usize) -> i64 {
@@ -852,7 +862,7 @@ impl Program {
         }
     }
 
-    /// The version of `caps` with slot `i` set to `v`, sharing every node off the path to it.
+    /// The version of the tree `caps` with slot `i` set to `v`, sharing every node off the path to it.
     fn with_slot(&self, caps: Option<&CapNode>, i: usize, v: i64) -> CapNode {
         self.with_slot_at(caps, CAP_FAN_BITS * (self.cap_depth - 1), i, v)
     }
@@ -878,7 +888,7 @@ impl Program {
     }
 
     /// Every capture slot of a match as a flat array.
-    pub fn slots(&self, caps: &CapNode) -> Vec<i64> {
+    pub fn slots(&self, caps: &Captures) -> Vec<i64> {
         (0..2 * (self.ngroups + 1))
             .map(|i| self.slot(caps, i))
             .collect()
@@ -889,9 +899,54 @@ impl Program {
 // Pike VM (regex.md §4)
 // ---------------------------------------------------------------------------
 
-struct Thread {
+/// How the VM keeps a thread's capture slots (regex.md §4.1): [`FlatCaps`] for a pattern whose slots
+/// fit in one leaf, [`TreeCaps`] for a larger one. The VM is compiled once per representation, so a
+/// small pattern's thread is a pc and one pointer to its array.
+trait CapRep {
+    type Caps: Clone;
+    /// The version of `caps` (`None` = every slot unset) with slot `i` set to `v`.
+    fn with(prog: &Program, caps: Option<&Self::Caps>, i: usize, v: i64) -> Self::Caps;
+    fn result(caps: Self::Caps) -> Captures;
+}
+
+/// The slots as one array, copied whole on a Save: at most `CAP_FAN` slots.
+struct FlatCaps;
+
+impl CapRep for FlatCaps {
+    type Caps = Rc<Vec<i64>>;
+
+    fn with(prog: &Program, caps: Option<&Rc<Vec<i64>>>, i: usize, v: i64) -> Rc<Vec<i64>> {
+        let mut flat = match caps {
+            Some(caps) => (**caps).clone(),
+            None => vec![-1; prog.cap_leaf_len],
+        };
+        flat[i] = v;
+        Rc::new(flat)
+    }
+
+    fn result(caps: Rc<Vec<i64>>) -> Captures {
+        Captures::Flat(caps)
+    }
+}
+
+/// The slots as a capture-slot tree; a Save copies the path to the slot it sets.
+struct TreeCaps;
+
+impl CapRep for TreeCaps {
+    type Caps = CapNode;
+
+    fn with(prog: &Program, caps: Option<&CapNode>, i: usize, v: i64) -> CapNode {
+        prog.with_slot(caps, i, v)
+    }
+
+    fn result(caps: CapNode) -> Captures {
+        Captures::Tree(caps)
+    }
+}
+
+struct Thread<C> {
     pc: usize,
-    caps: Option<CapNode>,
+    caps: Option<C>,
 }
 
 /// The per-position dedup set (regex.md §4): `marks[pc] == generation` means `pc` was visited at the
@@ -957,7 +1012,7 @@ impl Program {
 
     /// Run the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
     /// capture slots on a match, or `None`.
-    pub fn run(&self, input: &[char], m: &mut Meter) -> Result<Option<CapNode>> {
+    pub fn run(&self, input: &[char], m: &mut Meter) -> Result<Option<Captures>> {
         self.with_seen(|seen| self.search(seen, input, 0, m))
     }
 
@@ -967,21 +1022,36 @@ impl Program {
     /// Charges `regex_step` per explored state and guards once per input position.
     // `sp` is a logical input POSITION that must reach `len` (one past the end) so the final
     // epsilon-closure can fire `AssertEnd`/`Match` — enumerate() cannot express `start..=len`.
-    #[allow(clippy::needless_range_loop)]
     fn search(
         &self,
         seen: &mut Seen,
         input: &[char],
         start: usize,
         m: &mut Meter,
-    ) -> Result<Option<CapNode>> {
+    ) -> Result<Option<Captures>> {
+        if self.cap_depth == 1 {
+            self.pike_search::<FlatCaps>(seen, input, start, m)
+        } else {
+            self.pike_search::<TreeCaps>(seen, input, start, m)
+        }
+    }
+
+    /// [`Program::search`] over the capture representation `R`.
+    #[allow(clippy::needless_range_loop)]
+    fn pike_search<R: CapRep>(
+        &self,
+        seen: &mut Seen,
+        input: &[char],
+        start: usize,
+        m: &mut Meter,
+    ) -> Result<Option<Captures>> {
         let len = input.len();
-        let mut clist: Vec<Thread> = Vec::new();
-        let mut nlist: Vec<Thread> = Vec::new();
-        let mut matched: Option<CapNode> = None;
+        let mut clist: Vec<Thread<R::Caps>> = Vec::new();
+        let mut nlist: Vec<Thread<R::Caps>> = Vec::new();
+        let mut matched: Option<R::Caps> = None;
 
         let generation = seen.next();
-        self.add_thread(&mut clist, seen, generation, 0, None, start, len, m)?;
+        self.add_thread::<R>(&mut clist, seen, generation, 0, None, start, len, m)?;
 
         for sp in start..=len {
             let generation = seen.next();
@@ -1001,7 +1071,16 @@ impl Program {
                 };
                 if advances {
                     let caps = clist[i].caps.clone();
-                    self.add_thread(&mut nlist, seen, generation, pc + 1, caps, sp + 1, len, m)?;
+                    self.add_thread::<R>(
+                        &mut nlist,
+                        seen,
+                        generation,
+                        pc + 1,
+                        caps,
+                        sp + 1,
+                        len,
+                        m,
+                    )?;
                 }
                 i += 1;
             }
@@ -1011,7 +1090,7 @@ impl Program {
                 break;
             }
         }
-        Ok(matched)
+        Ok(matched.map(R::result))
     }
 
     /// Epsilon-closure: follow Jmp/Split/Save/Assert from `pc`, appending consuming/Match threads to
@@ -1019,18 +1098,18 @@ impl Program {
     /// Jmp/Split chain cannot overflow the native stack; the `y` arm of a Split is pushed before
     /// `x` so `x` is processed first (higher priority). Charges `regex_step` per explored state.
     #[allow(clippy::too_many_arguments)]
-    fn add_thread(
+    fn add_thread<R: CapRep>(
         &self,
-        list: &mut Vec<Thread>,
+        list: &mut Vec<Thread<R::Caps>>,
         seen: &mut Seen,
         generation: u32,
         pc0: usize,
-        caps0: Option<CapNode>,
+        caps0: Option<R::Caps>,
         sp: usize,
         len: usize,
         m: &mut Meter,
     ) -> Result<()> {
-        let mut stack: Vec<Thread> = vec![Thread {
+        let mut stack: Vec<Thread<R::Caps>> = vec![Thread {
             pc: pc0,
             caps: caps0,
         }];
@@ -1051,7 +1130,7 @@ impl Program {
                     stack.push(Thread { pc: *x, caps });
                 }
                 Inst::Save(n) => {
-                    let caps = self.with_slot(caps.as_ref(), *n, sp as i64);
+                    let caps = R::with(self, caps.as_ref(), *n, sp as i64);
                     stack.push(Thread {
                         pc: pc + 1,
                         caps: Some(caps),
@@ -1075,7 +1154,7 @@ impl Program {
     }
 
     /// The start and end of a match's whole span (group 0) as positions.
-    fn span(&self, caps: &CapNode) -> (usize, usize) {
+    fn span(&self, caps: &Captures) -> (usize, usize) {
         (self.slot(caps, 0) as usize, self.slot(caps, 1) as usize)
     }
 
@@ -1092,7 +1171,7 @@ impl Program {
         match_input: &[char],
         global: bool,
         m: &mut Meter,
-    ) -> Result<Vec<CapNode>> {
+    ) -> Result<Vec<Captures>> {
         self.with_seen(|seen| {
             let mut found = Vec::new();
             let mut pos = 0usize;
@@ -1152,7 +1231,7 @@ impl Program {
     /// match's slots, computed from the spans without building it (cost.md §8.1): `ARRAY_DIM`, plus
     /// `VALUE` and the span's UTF-8 bytes per reported group (an unset group is a bare `VALUE`).
     /// `utf8_at` is [`utf8_offsets`] of the subject, so each span is measured in O(1).
-    pub fn capture_array_size(&self, caps: &CapNode, utf8_at: &[i64]) -> i64 {
+    pub fn capture_array_size(&self, caps: &Captures, utf8_at: &[i64]) -> i64 {
         let mut size = crate::costs::MEMORY_ARRAY_DIM;
         for g in self.reported_groups() {
             let (s, e) = (self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1));
@@ -1166,7 +1245,7 @@ impl Program {
 
     /// The capture array for a match's slots, sliced from the ORIGINAL-case subject: the reported
     /// groups' substrings, an unset group `None`.
-    pub fn capture_array(&self, caps: &CapNode, orig: &[char]) -> Vec<Option<String>> {
+    pub fn capture_array(&self, caps: &Captures, orig: &[char]) -> Vec<Option<String>> {
         self.reported_groups()
             .map(|g| slice_group(orig, self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1)))
             .collect()
@@ -1216,7 +1295,7 @@ impl Program {
         start: usize,
         n: i64,
         m: &mut Meter,
-    ) -> Result<Option<CapNode>> {
+    ) -> Result<Option<Captures>> {
         self.with_seen(|seen| {
             let len = input.len();
             let mut pos = start;
@@ -1240,7 +1319,7 @@ impl Program {
     /// (literal backslash), and `\<other>` (the literal `<other>`). A trailing lone `\` is literal,
     /// and an unset or absent group expands to nothing. Sizing and building share this walk so they
     /// cannot disagree.
-    fn for_each_piece(&self, repl: &[char], caps: &CapNode, mut f: impl FnMut(Piece)) {
+    fn for_each_piece(&self, repl: &[char], caps: &Captures, mut f: impl FnMut(Piece)) {
         // An unset (`-1`) group expands to nothing.
         let span = |start: i64, end: i64| {
             (start >= 0 && end >= 0).then(|| Piece::Span(start as usize, end as usize))
@@ -1278,7 +1357,7 @@ impl Program {
         &self,
         orig: &[char],
         repl: &[char],
-        found: &[CapNode],
+        found: &[Captures],
         mut f: impl FnMut(Piece),
     ) {
         let mut pos = 0usize;
@@ -1302,7 +1381,7 @@ impl Program {
 
     /// The exact UTF-8 byte length of `regexp_replace`'s result for the matches
     /// [`Program::replace_matches`] found, computed without building it (cost.md §8.1).
-    pub fn replace_size(&self, orig: &[char], repl: &[char], found: &[CapNode]) -> i64 {
+    pub fn replace_size(&self, orig: &[char], repl: &[char], found: &[Captures]) -> i64 {
         let mut size = 0i64;
         self.for_each_output(orig, repl, found, |p| match p {
             Piece::Char(c) => size += c.len_utf8() as i64,
@@ -1319,7 +1398,7 @@ impl Program {
         &self,
         orig: &[char],
         repl: &[char],
-        found: &[CapNode],
+        found: &[Captures],
         size: i64,
     ) -> String {
         let mut out = String::with_capacity(size as usize);
