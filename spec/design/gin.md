@@ -408,9 +408,12 @@ relation scanned by a **`SELECT`, `UPDATE`, or `DELETE`**, if the `WHERE` AND-ch
 `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)` (membership), or `col = Q`
 (exact array equality) where `col` is a GIN-indexed array column — or `col @> Q` / `Q <@ col` /
 `col ? k` / `col ?| K` / `col ?& K` where `col` is a GIN-indexed `jsonb` column (§2.1) — and **the
-query operand is a constant** (`Q` a literal/`$N`-param array or `jsonb`, `c`/`k` a literal/`$N`-param
-scalar or key, `K` a literal/`$N`-param `text[]`), the plan bounds the scan through the GIN
-index. **`UPDATE`/`DELETE` apply the identical bound to their target-row scan** (the gather +
+query operand is a constant** — row-independent, built only from literals and `$N` parameters
+(`Q` an array literal, an `ARRAY[…]` constructor such as `ARRAY['a', $1]`, or a literal/`$N`-param
+`jsonb`; `c`/`k` a literal/`$N`-param scalar or key; `K` a literal or `ARRAY[…]`-constructed
+`text[]`) — the plan bounds the scan through the GIN index. A bare `$N` cannot be a whole array
+operand (`col @> $1`, `col ?| $1`): a bind parameter of array type is the container-parameter
+narrowing ([array.md](array.md) §4, [api.md](api.md) §5), so such a query fails before planning. **`UPDATE`/`DELETE` apply the identical bound to their target-row scan** (the gather +
 residual filter that finds the rows to rewrite/remove), so the same conjunct that bounds a
 `SELECT` bounds the mutation, chosen against the other candidates by the same estimate and
 canonical tie order ([estimator.md §9.3](estimator.md)). The bound is over the

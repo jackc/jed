@@ -296,6 +296,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `42883` there today); the dedicated resolvers (array, range-constructor, json-set functions)
     still type their own arguments; a parameter already typed by an earlier occurrence still counts
     as unknown in a later function argument.
+- [ ] **Container-typed bind parameters** — a `$N` of array, range, or composite type. PostgreSQL
+  types `tags @> $1` as `text[]` from context and accepts `$1::i32[]`; jed's parameter typing is
+  scalar-only (`ParamTypes` holds a `ScalarType`), so every container `$N` fails, with four
+  different errors today: `col @> $1` is `42P18`, `id = ANY($1)` is `42809`, `$1::i32[]` and
+  `UPDATE … SET arr = $1` are `0A000`, and `INSERT … VALUES (…, $1)` into an array column is
+  `42601` "expects 0, got 1" (the parameter is not counted at all, which looks like a bug of its
+  own). Embedded hosts hit this constantly: `WHERE id = ANY($1)` with a host array is the usual
+  way to bind a list. Lifting it means parameter inference over the open `Type`; the binder
+  coercing a host value into a container (`Value::Array`/range/composite, and the per-language
+  ergonomic mappings, api.md §6 follow-up (a)); and the INSERT/UPDATE/`DO UPDATE` assignment
+  paths. All three cores. Scalar parameters inside a constructor (`ARRAY[$1, $2]`,
+  `$1 = ANY(col)`) already work and bound GIN scans. → [array.md §4/§7](spec/design/array.md),
+  [ranges.md](spec/design/ranges.md), [composite.md](spec/design/composite.md), [api.md §5](spec/design/api.md)
 - [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, a Playwright real-browser e2e run inside `mise run ci`). **Open:** OPFS disk-spill. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **jed-migrate — the schema-migration library** — tern-modeled, opt-in migration packages at
   `/migrate` (Go + Rust + TS; a NON-CORE consumer per language) over one shared contract +
