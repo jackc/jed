@@ -20,8 +20,8 @@ INSERT INTO scratch VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 30);`
 
 `CREATE TEMP TABLE` (or `CREATE TEMPORARY TABLE` — they are synonyms) declares a **session-local**
 scratch table. It behaves like an ordinary table — full `INSERT` / `SELECT` / `UPDATE` / `DELETE`,
-plus `PRIMARY KEY`, `NOT NULL`, `DEFAULT`, `CHECK`, and `UNIQUE` constraints — with three deliberate
-differences:
+plus `PRIMARY KEY`, `NOT NULL`, `DEFAULT`, `CHECK`, `UNIQUE`, and `FOREIGN KEY` constraints (a
+foreign key between temp tables only, below) — with three deliberate differences:
 
 - **It makes zero writes to the database file.** A temp table lives outside the durable on-disk
   image — in memory, or in a private scratch file once it grows large — so creating or filling one
@@ -162,7 +162,27 @@ comparison/ordering all behave exactly as on a persistent column. A composite co
 `PRIMARY KEY` (or a `UNIQUE` / indexed column) on a temp table too, keyed by the composite value.
 Dropping a type that a temp table still references is blocked (`2BP01`), just as for a permanent table.
 
+## Foreign keys
+
+A temp table may reference another temp table of the same session, or itself, and the foreign key
+behaves exactly as between permanent tables — every write is checked (`23503`), `ON DELETE` /
+`ON UPDATE` actions (`CASCADE`, `SET NULL`, `SET DEFAULT`) run, and `DROP TABLE` refuses to drop a
+referenced table without `CASCADE`:
+
+```sql
+CREATE TEMP TABLE batch (id i32 PRIMARY KEY);
+CREATE TEMP TABLE item (id i32 PRIMARY KEY, batch_id i32 REFERENCES batch ON DELETE CASCADE);
+```
+
+A foreign key never crosses between temp and permanent tables: a temp table referencing a permanent
+one, or a permanent table referencing a temp one, is rejected with `42P16`, as in PostgreSQL.
+
+`ON COMMIT` follows PostgreSQL too. Committing would empty an `ON COMMIT DELETE ROWS` table, so a
+table that references it must also be `ON COMMIT DELETE ROWS`; otherwise the commit fails with
+`0A000` and the transaction is rolled back. When an `ON COMMIT DROP` table is dropped, a remaining
+table's foreign key to it is dropped with it.
+
 ## Not yet supported on a temp table
 
-This release keeps a few things off temp tables (each reported as `0A000`, *feature not supported*),
-to be lifted in later releases: `FOREIGN KEY` constraints and `COLLATE` columns.
+This release keeps `COLLATE` columns off temp tables (reported as `0A000`, *feature not supported*),
+to be lifted in a later release.

@@ -482,9 +482,8 @@ func (db *engine) createTableTarget(ct *createTable) (bool, string, error) {
 func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) (outcome, error) {
 	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
 	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
-	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
-	// parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
-	// columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+	// The other temp narrowings (composite/collated columns, serial/IDENTITY) are checked just before
+	// registration, once the columns are built.
 	//
 	// Resolve the optional database qualifier (attached-databases.md §3, Slice 1b).
 	targetTemp, attachName, err := db.createTableTarget(ct)
@@ -513,9 +512,6 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		// An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
 		// the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
 		return outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on a temporary table is not yet supported")
-	}
-	if targetTemp && len(ct.ForeignKeys) > 0 {
-		return outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
 	}
 	// Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
 	// clean 0A000 before any column work: FOREIGN KEY and EXCLUDE (their probe/backing structures would
@@ -1078,15 +1074,21 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			}
 			local = append(local, idx)
 		}
-		// 2. Parent table — a self-reference resolves against the in-progress definition.
+		// 2. Parent table — a self-reference resolves against the in-progress definition; any other
+		// name takes the temp-first resolution walk, and the parent must be of the child's own kind
+		// (42P16, PostgreSQL's ATAddForeignKeyConstraint): an FK never crosses from the session-local
+		// temp domain to the main database or back (temp-tables.md §8).
 		selfRef := fk.RefTable == table.Name
 		var parent *catTable
 		if selfRef {
 			parent = table
 		} else {
-			p, ok := db.Table(fk.RefTable)
+			p, ok := db.lkpTable(fk.RefTable)
 			if !ok {
 				return outcome{}, fkParentMissing(db.readSnap(), fk.RefTable)
+			}
+			if err := checkFkPersistence(targetTemp, db.isTempTable(fk.RefTable)); err != nil {
+				return outcome{}, err
 			}
 			parent = p
 		}
@@ -1743,27 +1745,34 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 		seen[key] = true
 		targets = append(targets, dropTarget{key: key, scope: scope})
 	}
-	// ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). Only a persistent
-	// table can be an FK parent (a temp table never is, §8), so the scan runs over the persistent
-	// snapshot; a dependent whose referencing table is itself in the drop set does not count (the
-	// drop-set exclusion is the whole seen set, so `DROP TABLE parent, child` succeeds even under
-	// RESTRICT).
+	// ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). An FK never crosses
+	// domains (temp-tables.md §8), so each domain's drop set is scanned in its own snapshot — the main
+	// database first, then the session-local temp domain; a dependent whose referencing table is itself
+	// in the drop set does not count (so `DROP TABLE parent, child` succeeds even under RESTRICT).
 	// A view depending on a table being dropped blocks the statement under RESTRICT; CASCADE drops
 	// it, with every view depending on it (views.md §6).
 	var persistent []string
+	persistentSeen := make(map[string]bool)
+	tempSeen := make(map[string]bool)
 	for _, tgt := range targets {
 		if tgt.scope == dropPersistent {
 			persistent = append(persistent, tgt.key)
+			persistentSeen[tgt.key] = true
+		} else {
+			tempSeen[tgt.key] = true
 		}
 	}
 	cascadeViews, err := db.dropTableViews(persistent, dt.Cascade)
 	if err != nil {
 		return outcome{}, err
 	}
-	deps := db.readSnap().foreignKeyDependentsExcluding(seen)
-	var cascadeRemovals []fkDependent
+	mainDeps := db.readSnap().foreignKeyDependentsExcluding(persistentSeen)
+	tempDeps := db.tempSnap().foreignKeyDependentsExcluding(tempSeen)
+	var cascadeRemovals, tempCascadeRemovals []fkDependent
+	deps := append(append([]fkDependent(nil), mainDeps...), tempDeps...)
 	if dt.Cascade {
-		cascadeRemovals = deps
+		cascadeRemovals = mainDeps
+		tempCascadeRemovals = tempDeps
 	} else if len(deps) > 0 {
 		// RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks the
 		// drop with 2BP01 — the same message the single-table check produced.
@@ -1773,14 +1782,19 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 				d.fkName+" on table "+d.refTableName)
 	}
 	// ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
-	// now-dangling FK constraint (in place, preserving its rows). Views and FKs only ever live in the
-	// main database (temp tables reject FKs at CREATE, and views cannot read them), so the removals
-	// route to the main working snapshot.
+	// now-dangling FK constraint (in place, preserving its rows), each in its own domain: views live
+	// only in the main database, and an FK in its tables' domain.
 	for _, name := range cascadeViews {
 		db.working().removeView(name)
 	}
 	for _, d := range cascadeRemovals {
 		db.working().removeForeignKey(d.refTableKey, d.fkName)
+	}
+	if len(tempCascadeRemovals) > 0 {
+		db.session.tx.tempDirty = true
+		for _, d := range tempCascadeRemovals {
+			db.tempSnap().removeForeignKey(d.refTableKey, d.fkName)
+		}
 	}
 	// Then remove every target from its own scope, auto-dropping the sequences it owns — a
 	// serial/IDENTITY column's owned sequence (spec/design/sequences.md §12; an owned sequence is
@@ -2082,7 +2096,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					}
 					return outcome{}, newError(DuplicateColumn, "column already exists: "+add.Column.Name)
 				}
-				if len(add.ForeignKeys) > 0 && (snap == db.tempSnap() || isAttachmentScope(at.DB)) {
+				if len(add.ForeignKeys) > 0 && isAttachmentScope(at.DB) {
 					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported in this table scope")
 				}
 				// Earlier index actions already live in table; named inline UNIQUE constraints are
@@ -2241,7 +2255,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				continue
 			}
 			if a.Add != nil {
-				if (snap == db.tempSnap()) && (a.Add.Foreign != nil || a.Add.Exclude != nil) {
+				if (snap == db.tempSnap()) && a.Add.Exclude != nil {
 					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported on a temporary table")
 				}
 				if isAttachmentScope(at.DB) && (a.Add.Foreign != nil || a.Add.Exclude != nil) {
@@ -3230,6 +3244,19 @@ func serialPseudoType(name string) (scalarType, bool) {
 // (exact name).
 func (db *engine) findIndex(name string) (string, indexDef, bool) {
 	return db.readSnap().findIndex(name)
+}
+
+// checkFkPersistence: a foreign key never crosses between the session-local temp domain and the main
+// database (spec/design/temp-tables.md §8) — PostgreSQL's ATAddForeignKeyConstraint persistence rule,
+// 42P16, checked once the parent resolves.
+func checkFkPersistence(childTemp, parentTemp bool) error {
+	if childTemp && !parentTemp {
+		return newError(InvalidTableDefinition, "constraints on temporary tables may reference only temporary tables")
+	}
+	if !childTemp && parentTemp {
+		return newError(InvalidTableDefinition, "constraints on permanent tables may reference only permanent tables")
+	}
+	return nil
 }
 
 // fkParentMissing is the error for a FOREIGN KEY parent that is not a table of the parent's

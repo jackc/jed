@@ -216,7 +216,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // temp snapshot, gated by the same allow_temp_ddl), serial/IDENTITY columns (the OWNED sequence
     // lives in the temp snapshot — zero file writes — and is auto-dropped with the table), and
     // composite-typed columns (resolved against the persistent type catalog; DROP TYPE of a referenced
-    // type is 2BP01). Collated columns and FK on a temp table are deferred 0A000
+    // type is 2BP01), and FOREIGN KEYs among the session's temp tables (an FK crossing to or from a
+    // persistent table is 42P16). Collated columns on a temp table are deferred 0A000
     // (spec/design/temp-tables.md §8). The capability gate is session.allow_temp_ddl; the storage budget
     // is resource.temp_budget.
     "ddl.temp_table",

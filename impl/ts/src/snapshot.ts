@@ -805,17 +805,26 @@ export class Snapshot {
 
   // applyOnCommitActions runs the temporary tables' ON COMMIT actions on a committing transaction's
   // working temp snapshot (spec/design/temp-tables.md §5.1): each DELETE ROWS table is emptied, then
-  // each DROP table is dropped as DROP TABLE drops it — with its indexes and the sequences it owns
-  // (PostgreSQL's truncate-then-drop order). The actions touch disjoint tables, so the map's visiting
-  // order cannot change the result. Reports whether anything changed.
+  // each DROP table is dropped as DROP TABLE … CASCADE drops it — with its indexes, the sequences it
+  // owns, and every surviving table's FK that references it (PostgreSQL's truncate-then-drop order).
+  // Before anything changes, a table outside the DELETE ROWS set that references one inside it fails
+  // the commit (0A000, PostgreSQL's heap_truncate_check_FKs). The actions touch disjoint tables, so
+  // the map's visiting order cannot change the result. Reports whether anything changed.
   applyOnCommitActions(): boolean {
-    let changed = false;
-    const drops: string[] = [];
+    const truncates = new Set<string>();
+    const drops = new Set<string>();
     for (const [name, t] of this.tables) {
-      if (t.onCommit === "deleteRows") {
-        if (this.truncateTable(t)) changed = true;
-      } else if (t.onCommit === "drop") {
-        drops.push(name);
+      if (t.onCommit === "deleteRows") truncates.add(name);
+      else if (t.onCommit === "drop") drops.add(name);
+    }
+    this.checkTruncateForeignKeys(truncates);
+    let changed = false;
+    for (const name of truncates) {
+      if (this.truncateTable(this.tables.get(name)!)) changed = true;
+    }
+    if (drops.size > 0) {
+      for (const d of this.fkDependentsExcluding(drops)) {
+        this.removeForeignKey(d.refTableKey, d.fkName);
       }
     }
     for (const name of drops) {
@@ -824,6 +833,30 @@ export class Snapshot {
       changed = true;
     }
     return changed;
+  }
+
+  // checkTruncateForeignKeys is PostgreSQL's heap_truncate_check_FKs for the ON COMMIT DELETE ROWS set
+  // (temp-tables.md §5.1): emptying a table that a table outside the set references would strand that
+  // table's rows, so the commit fails with 0A000. The reported pair is the first truncated parent,
+  // then its first outside referencing table, each in ascending name order (jed has no OIDs to order
+  // by).
+  private checkTruncateForeignKeys(truncates: Set<string>): void {
+    for (const parent of [...truncates].sort(compareTextC)) {
+      const children = [...this.tables.keys()]
+        .filter(
+          (key) =>
+            !truncates.has(key) && this.tables.get(key)!.fks.some((fk) => fk.refTable === parent),
+        )
+        .sort(compareTextC);
+      if (children.length > 0) {
+        throw engineError(
+          "feature_not_supported",
+          "unsupported ON COMMIT and foreign key combination",
+        ).withDetail(
+          `Table "${this.tables.get(children[0]!)!.name}" references "${this.tables.get(parent)!.name}", but they do not have the same ON COMMIT setting.`,
+        );
+      }
+    }
   }
 
   // truncateTable empties a table's rows and every index's entries, keeping its definition (ON COMMIT

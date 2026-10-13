@@ -23,10 +23,12 @@ INSERT INTO work.add_target VALUES (1)
 statement ok
 INSERT INTO temp.scope_target VALUES (1, 20)
 
-# CREATE's unsupported-scope boundary also applies to ALTER, before constraint resolution.
-statement error 0A000
+# A temp table may reference itself (temp-tables.md §8): the FK resolves within the temp domain, and
+# its existing row (v = 20, no id 20) fails validation.
+statement error 23503
 ALTER TABLE temp.scope_target ADD FOREIGN KEY (v) REFERENCES scope_target (id)
 
+# CREATE's unsupported-scope boundary also applies to ALTER, before constraint resolution.
 statement error 0A000
 ALTER TABLE temp.scope_target ADD EXCLUDE USING gist (v WITH =)
 

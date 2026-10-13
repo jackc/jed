@@ -324,14 +324,23 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 			local = append(local, ci)
 		}
+		// The parent takes the temp-first resolution walk and must be of the table's own kind (42P16,
+		// temp-tables.md §8).
 		var parent *catTable
 		if d.RefTable == t.Name {
 			parent = t
+		} else if p, ok := db.tempSnap().table(d.RefTable); ok {
+			if err := checkFkPersistence(snap == db.tempSnap(), true); err != nil {
+				return err
+			}
+			parent = p
+		} else if p, ok := db.readSnap().table(d.RefTable); ok {
+			if err := checkFkPersistence(snap == db.tempSnap(), false); err != nil {
+				return err
+			}
+			parent = p
 		} else {
-			parent, _ = snap.table(d.RefTable)
-		}
-		if parent == nil {
-			return fkParentMissing(snap, d.RefTable)
+			return fkParentMissing(db.readSnap(), d.RefTable)
 		}
 		var refs []int
 		if d.RefColumns == nil {
@@ -735,7 +744,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 					}
 				}
 			} else {
-				hit, err = db.fkProbeHits(probe, parent.Name)
+				hit, err = db.fkProbeHits(probe, parent.Name, snap == db.tempSnap())
 				if err != nil {
 					return nil, err
 				}

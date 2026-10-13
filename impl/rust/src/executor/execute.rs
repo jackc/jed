@@ -935,8 +935,15 @@ impl Engine {
         // apply to the working temp snapshot first, so they commit (or are discarded) atomically with
         // the rest of the transaction and the refinement, budget precheck, and staging below all see
         // their result.
-        if tx.temp_working.apply_on_commit_actions() {
-            tx.temp_dirty = true;
+        // A DELETE ROWS table referenced from outside the set fails the commit (0A000), which then
+        // discards the transaction like any other failed commit.
+        match tx.temp_working.apply_on_commit_actions() {
+            Ok(true) => tx.temp_dirty = true,
+            Ok(false) => {}
+            Err(e) => {
+                self.restore_session_state(tx);
+                return Err(e);
+            }
         }
         // Writable-store access alone does not prove a mutation (transactions.md §2.1). Refine before
         // the budget precheck and the durable-writer count, so an unchanged domain is neither checked

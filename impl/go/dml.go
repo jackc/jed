@@ -1890,11 +1890,13 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 	// validation, like the PK/UNIQUE probes, and before any write (all-or-nothing). MATCH SIMPLE: a
 	// row with any NULL local column is exempt; MATCH FULL exempts only an all-NULL tuple (§6.3).
 	relation := table.Name
+	fkTemp, _ := db.fkDomain(dbScope, table.Name)
 	for fki := range table.ForeignKeys {
 		fk := &table.ForeignKeys[fki]
 		// The parent exists (validated at CREATE TABLE; DROP TABLE refuses to drop a referenced
-		// table — §6.10), so a consistent catalog always finds it.
-		parent, ok := db.Table(fk.RefTable)
+		// table — §6.10), so a consistent catalog always finds it, in the FK's own domain
+		// (temp-tables.md §8).
+		parent, ok := db.fkSnap(fkTemp).table(fk.RefTable)
 		if !ok {
 			continue
 		}
@@ -1930,7 +1932,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, pr.row); err != nil {
+			if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, pr.row, fkTemp); err != nil {
 				return nil, err
 			}
 		}
@@ -2116,9 +2118,10 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 	}
 
 	relation := table.Name
+	fkTemp, _ := db.fkDomain(dbScope, table.Name)
 	for fki := range table.ForeignKeys {
 		fk := &table.ForeignKeys[fki]
-		parent, ok := db.Table(fk.RefTable)
+		parent, ok := db.fkSnap(fkTemp).table(fk.RefTable)
 		if !ok {
 			continue
 		}
@@ -2145,7 +2148,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if suppliedOK && bytes.Equal(supplied.bytes, probe.bytes) {
 			continue
 		}
-		if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, row); err != nil {
+		if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, row, fkTemp); err != nil {
 			return nil, err
 		}
 	}
@@ -2248,8 +2251,8 @@ func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided [
 
 // validateInsertFKStored completes one child-side FK check after the caller handles the statement
 // end-state match. The batch and one-row paths share the stored probe and violation construction.
-func (db *engine) validateInsertFKStored(relation string, columns []catColumn, fk *foreignKey, probe fkProbe, row storedRow) error {
-	hit, err := db.fkProbeHits(probe, fk.RefTable)
+func (db *engine) validateInsertFKStored(relation string, columns []catColumn, fk *foreignKey, probe fkProbe, row storedRow, temp bool) error {
+	hit, err := db.fkProbeHits(probe, fk.RefTable, temp)
 	if err != nil {
 		return err
 	}
@@ -2627,9 +2630,10 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			assigned[ap.idx] = struct{}{}
 		}
 	}
+	fkTemp, _ := db.fkDomain(dbScope, table.Name)
 	for fki := range table.ForeignKeys {
 		fk := &table.ForeignKeys[fki]
-		parent, ok := db.Table(fk.RefTable)
+		parent, ok := db.fkSnap(fkTemp).table(fk.RefTable)
 		if !ok {
 			continue
 		}
@@ -2687,7 +2691,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			hit, err := db.fkProbeHits(probe, fk.RefTable)
+			hit, err := db.fkProbeHits(probe, fk.RefTable, fkTemp)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -2850,7 +2854,8 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			}
 		}
 	}
-	if err := db.applyFkUpdateActions(table, fkUpdates, meter, db.mainDmlTarget(dbScope, table.Name)); err != nil {
+	fkTemp, hasFKs := db.fkDomain(dbScope, table.Name)
+	if err := db.applyFkUpdateActions(table, fkUpdates, meter, fkTemp, hasFKs); err != nil {
 		return 0, nil, err
 	}
 	return affected, returned, nil
@@ -2958,6 +2963,7 @@ type fkDeferredCheck struct {
 	probe      fkProbe
 	values     []Value // the parent tuple in FK slot order, for the child-key reverse probe
 	update     bool
+	temp       bool // the FK's domain (session-local temp or main — temp-tables.md §8)
 }
 
 // runFkActionUpdate/Delete execute generated work through the ordinary DML pipeline. The nested
@@ -3015,18 +3021,28 @@ func (db *engine) runFkActionDelete(stmt *deleteStmt, params []Value, meter *cos
 	return meter.Guard()
 }
 
-func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, oldTuples [][]Value, meter *costMeter) error {
+// fkActionScope is the qualifier a generated action names its child with: the FK's own domain
+// (temp-tables.md §8).
+func fkActionScope(temp bool) *string {
+	scope := "main"
+	if temp {
+		scope = "temp"
+	}
+	return &scope
+}
+
+func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, oldTuples [][]Value, temp bool, meter *costMeter) error {
 	if len(oldTuples) == 0 {
 		return nil
 	}
-	target, err := db.newFkKeyedTarget(parent, fk, oldTuples, nil)
+	target, err := db.newFkKeyedTarget(parent, fk, oldTuples, nil, temp)
 	if err != nil {
 		return err
 	}
-	main := "main"
+	scope := fkActionScope(temp)
 	switch fk.OnDelete {
 	case fkCascade:
-		return db.runFkActionDelete(&deleteStmt{Table: child.Name, DB: &main, fkTarget: target}, nil, meter)
+		return db.runFkActionDelete(&deleteStmt{Table: child.Name, DB: scope, fkTarget: target}, nil, meter)
 	case fkSetNull, fkSetDefault:
 		assignments := make([]assignment, 0, len(fk.Columns))
 		for _, column := range fk.Columns {
@@ -3035,13 +3051,13 @@ func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, old
 				Value: exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}},
 			})
 		}
-		return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, fkTarget: target}, nil, meter)
+		return db.runFkActionUpdate(&update{Table: child.Name, DB: scope, Assignments: assignments, fkTarget: target}, nil, meter)
 	default:
 		return nil
 	}
 }
 
-func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, transitions [][2][]Value, meter *costMeter) error {
+func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, transitions [][2][]Value, temp bool, meter *costMeter) error {
 	if len(transitions) == 0 {
 		return nil
 	}
@@ -3077,12 +3093,11 @@ func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, tra
 	default:
 		return nil
 	}
-	target, err := db.newFkKeyedTarget(parent, fk, oldTuples, newTuples)
+	target, err := db.newFkKeyedTarget(parent, fk, oldTuples, newTuples, temp)
 	if err != nil {
 		return err
 	}
-	main := "main"
-	return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, fkTarget: target}, nil, meter)
+	return db.runFkActionUpdate(&update{Table: child.Name, DB: fkActionScope(temp), Assignments: assignments, fkTarget: target}, nil, meter)
 }
 
 // fkTupleValues copies a parent row's referenced tuple in FK slot order.
@@ -3100,7 +3115,7 @@ func (db *engine) flushFkDeferredChecks(meter *costMeter) error {
 	for i := range db.session.fkDeferredChecks {
 		check := &db.session.fkDeferredChecks[i]
 		if check.update {
-			present, err := db.fkProbeHits(check.probe, check.parent.Name)
+			present, err := db.fkProbeHits(check.probe, check.parent.Name, check.temp)
 			if err != nil {
 				return err
 			}
@@ -3108,7 +3123,7 @@ func (db *engine) flushFkDeferredChecks(meter *costMeter) error {
 				continue
 			}
 		}
-		referenced, err := db.fkChildReferences(check.childTable, &check.fk, check.parent, check.values, check.probe.bytes, meter)
+		referenced, err := db.fkChildReferences(check.childTable, &check.fk, check.parent, check.values, check.probe.bytes, check.temp, meter)
 		if err != nil {
 			return err
 		}
@@ -3123,12 +3138,12 @@ func (db *engine) flushFkDeferredChecks(meter *costMeter) error {
 // applyFkDeleteActions runs generated write actions first, then validates NO ACTION/RESTRICT
 // against the resulting action closure. Generated work temporarily sees the working snapshot even
 // when the originating statement belongs to a writable CTE.
-func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter *costMeter, mainTarget bool) (err error) {
+func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter *costMeter, temp, hasFKs bool) (err error) {
 	if len(rows) == 0 {
 		return nil
 	}
-	if !mainTarget {
-		return nil // foreign keys involving temp/attached tables are not supported (temp-tables.md §8)
+	if !hasFKs {
+		return nil // an attached-database table has no foreign keys (attached-databases.md §8)
 	}
 	root := db.session.fkActionDepth == 0
 	if root {
@@ -3140,14 +3155,14 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 	savedPin := db.session.readPin
 	db.session.readPin = nil
 	defer func() { db.session.readPin = savedPin }()
-	referencers := db.fkReferencers(parent.Name)
+	referencers := db.fkReferencers(parent.Name, temp)
 	parentColls := db.columnCollations(parent.Columns)
 	for i := range referencers {
 		r := &referencers[i]
 		if r.fk.OnDelete == fkNoAction || r.fk.OnDelete == fkRestrict {
 			continue
 		}
-		child, ok := db.readSnap().table(r.childTable)
+		child, ok := db.fkSnap(temp).table(r.childTable)
 		if !ok {
 			panic("foreign-key child exists")
 		}
@@ -3163,7 +3178,7 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 				oldTuples = append(oldTuples, tuple)
 			}
 		}
-		if err := db.runFkDeleteAction(parent, child, &r.fk, oldTuples, meter); err != nil {
+		if err := db.runFkDeleteAction(parent, child, &r.fk, oldTuples, temp, meter); err != nil {
 			return err
 		}
 	}
@@ -3182,7 +3197,7 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 			}
 			db.session.fkDeferredChecks = append(db.session.fkDeferredChecks, fkDeferredCheck{
 				parent: parent, childTable: r.childTable, fk: r.fk, probe: probe,
-				values: fkTupleValues(row, r.fk.RefColumns),
+				values: fkTupleValues(row, r.fk.RefColumns), temp: temp,
 			})
 		}
 	}
@@ -3192,12 +3207,12 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 	return nil
 }
 
-func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTransition, meter *costMeter, mainTarget bool) (err error) {
+func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTransition, meter *costMeter, temp, hasFKs bool) (err error) {
 	if len(updates) == 0 {
 		return nil
 	}
-	if !mainTarget {
-		return nil
+	if !hasFKs {
+		return nil // an attached-database table has no foreign keys (attached-databases.md §8)
 	}
 	root := db.session.fkActionDepth == 0
 	if root {
@@ -3209,14 +3224,14 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 	savedPin := db.session.readPin
 	db.session.readPin = nil
 	defer func() { db.session.readPin = savedPin }()
-	referencers := db.fkReferencers(parent.Name)
+	referencers := db.fkReferencers(parent.Name, temp)
 	parentColls := db.columnCollations(parent.Columns)
 	for i := range referencers {
 		r := &referencers[i]
 		if r.fk.OnUpdate == fkNoAction || r.fk.OnUpdate == fkRestrict {
 			continue
 		}
-		child, ok := db.readSnap().table(r.childTable)
+		child, ok := db.fkSnap(temp).table(r.childTable)
 		if !ok {
 			panic("foreign-key child exists")
 		}
@@ -3245,7 +3260,7 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 			}
 			transitions = append(transitions, transition)
 		}
-		if err := db.runFkUpdateAction(parent, child, &r.fk, transitions, meter); err != nil {
+		if err := db.runFkUpdateAction(parent, child, &r.fk, transitions, temp, meter); err != nil {
 			return err
 		}
 	}
@@ -3271,7 +3286,7 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 			}
 			db.session.fkDeferredChecks = append(db.session.fkDeferredChecks, fkDeferredCheck{
 				parent: parent, childTable: r.childTable, fk: r.fk, probe: oldProbe,
-				values: fkTupleValues(u.oldRow, r.fk.RefColumns), update: true,
+				values: fkTupleValues(u.oldRow, r.fk.RefColumns), update: true, temp: temp,
 			})
 		}
 	}
@@ -3279,16 +3294,6 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 		return db.flushFkDeferredChecks(meter)
 	}
 	return nil
-}
-
-// mainDmlTarget reports whether a target resolves to the persistent main catalog. FKs involving
-// temp/attached tables are rejected at DDL, while an explicit main qualifier must survive a
-// same-named session-temp overlap.
-func (db *engine) mainDmlTarget(scope *string, table string) bool {
-	if scope != nil {
-		return *scope == "main"
-	}
-	return !db.isTempTable(table)
 }
 
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
@@ -3539,7 +3544,8 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	for i := range matched {
 		deletedRows[i] = matched[i].row
 	}
-	if err := db.applyFkDeleteActions(table, deletedRows, meter, db.mainDmlTarget(del.DB, del.Table)); err != nil {
+	fkTemp, hasFKs := db.fkDomain(del.DB, del.Table)
+	if err := db.applyFkDeleteActions(table, deletedRows, meter, fkTemp, hasFKs); err != nil {
 		return outcome{}, err
 	}
 	return dmlOutcome(retNames, retTypes, returned, int64(len(matched)), meter.Accrued), nil
@@ -4095,6 +4101,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	for _, p := range plans {
 		assigned[p.idx] = struct{}{}
 	}
+	fkTemp, hasFKs := db.fkDomain(upd.DB, upd.Table)
 	for fki := range table.ForeignKeys {
 		fk := &table.ForeignKeys[fki]
 		touched := false
@@ -4107,7 +4114,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		if !touched {
 			continue // this FK's local columns were not assigned
 		}
-		parent, ok := db.Table(fk.RefTable)
+		parent, ok := db.fkSnap(fkTemp).table(fk.RefTable)
 		if !ok {
 			continue
 		}
@@ -4141,7 +4148,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			hit, err := db.fkProbeHits(probe, fk.RefTable)
+			hit, err := db.fkProbeHits(probe, fk.RefTable, fkTemp)
 			if err != nil {
 				return outcome{}, err
 			}
@@ -4294,7 +4301,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	for i := range updates {
 		fkUpdates[i] = fkUpdateTransition{newRow: updates[i].row, oldRow: updates[i].oldRow}
 	}
-	if err := db.applyFkUpdateActions(table, fkUpdates, meter, db.mainDmlTarget(upd.DB, upd.Table)); err != nil {
+	if err := db.applyFkUpdateActions(table, fkUpdates, meter, fkTemp, hasFKs); err != nil {
 		return outcome{}, err
 	}
 	return dmlOutcome(retNames, retTypes, returned, int64(len(updates)), meter.Accrued), nil

@@ -165,6 +165,25 @@ fn host_dep_matches(hf: &crate::extension::HostFunction, deps: &[HostFuncDep]) -
     })
 }
 
+/// A foreign key never crosses between the session-local temp domain and the main database
+/// (spec/design/temp-tables.md §8): PostgreSQL's ATAddForeignKeyConstraint persistence rule, 42P16,
+/// checked once the parent resolves.
+fn check_fk_persistence(child_temp: bool, parent_temp: bool) -> Result<()> {
+    if child_temp && !parent_temp {
+        return Err(EngineError::new(
+            SqlState::InvalidTableDefinition,
+            "constraints on temporary tables may reference only temporary tables",
+        ));
+    }
+    if !child_temp && parent_temp {
+        return Err(EngineError::new(
+            SqlState::InvalidTableDefinition,
+            "constraints on permanent tables may reference only permanent tables",
+        ));
+    }
+    Ok(())
+}
+
 /// The error for a FOREIGN KEY parent that is not a table of the parent's database: a view is the
 /// wrong object kind (42809, views.md §2); any other name is missing (42P01).
 fn fk_parent_missing(snap: &Snapshot, name: &str) -> EngineError {
@@ -568,9 +587,7 @@ impl Engine {
     ) -> Result<Outcome> {
         // A session-local temporary table (spec/design/temp-tables.md) is built exactly like a
         // persistent one but registered into the session temp snapshot at the end (§2), so it makes
-        // zero file writes. FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE,
-        // before any persistent parent resolves, so the error is a clean 0A000 (not a 42P01 from
-        // resolving a parent). The other temp narrowings (composite/collated columns, serial/IDENTITY)
+        // zero file writes. The other temp narrowings (composite/collated columns, serial/IDENTITY)
         // are checked just before registration, once the columns are built.
         // Resolve the optional database qualifier (attached-databases.md §3, Slice 1b).
         let (target_temp, attach_name) = self.create_table_target(&ct)?;
@@ -603,12 +620,6 @@ impl Engine {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "an EXCLUDE constraint on a temporary table is not yet supported",
-            ));
-        }
-        if target_temp && !ct.foreign_keys.is_empty() {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "FOREIGN KEY on a temporary table is not yet supported",
             ));
         }
         // Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
@@ -1287,17 +1298,19 @@ impl Engine {
                 }
                 local.push(idx);
             }
-            // 2. Parent table — a self-reference resolves against the in-progress definition. The
-            // parent must be PERSISTENT (resolve against the main snapshot, not the temp-aware funnel):
-            // a persistent table may not reference a temp parent, and a temp table has no FK at all
-            // (rejected above) — so a temp parent reads as "does not exist" here (temp-tables.md §8).
+            // 2. Parent table — a self-reference resolves against the in-progress definition;
+            // any other name takes the temp-first resolution walk, and the parent must be of the
+            // child's own kind (42P16, PostgreSQL's ATAddForeignKeyConstraint): an FK never crosses
+            // from the session-local temp domain to the main database or back (temp-tables.md §8).
             let self_ref = fk.ref_table == table.name;
             let parent: &Table = if self_ref {
                 &table
             } else {
-                self.read_snap()
+                let parent = self
                     .table(&fk.ref_table)
-                    .ok_or_else(|| fk_parent_missing(self.read_snap(), &fk.ref_table))?
+                    .ok_or_else(|| fk_parent_missing(self.read_snap(), &fk.ref_table))?;
+                check_fk_persistence(target_temp, self.is_temp_table(&fk.ref_table))?;
+                parent
             };
             // 3. Referenced columns into the parent (default to the parent's primary key).
             let refs: Vec<usize> = match &fk.ref_columns {
@@ -1934,9 +1947,7 @@ impl Engine {
                                 format!("column already exists: {}", column.name),
                             ));
                         }
-                        if (!foreign_keys.is_empty() && temp_scope)
-                            || (!foreign_keys.is_empty() && attachment_scope)
-                        {
+                        if !foreign_keys.is_empty() && attachment_scope {
                             return Err(EngineError::new(
                                 SqlState::FeatureNotSupported,
                                 "this constraint is not supported in this table scope",
@@ -2314,7 +2325,7 @@ impl Engine {
                             &def,
                             AlterConstraintDef::ForeignKey(_) | AlterConstraintDef::Exclude(_)
                         ) {
-                            if temp_scope {
+                            if temp_scope && matches!(&def, AlterConstraintDef::Exclude(_)) {
                                 return Err(EngineError::new(
                                     SqlState::FeatureNotSupported,
                                     "this constraint is not supported on a temporary table",
@@ -2476,12 +2487,18 @@ impl Engine {
                                     }
                                     local.push(ci)
                                 }
+                                // The parent takes the temp-first resolution walk and must be of
+                                // the table's own kind (42P16, temp-tables.md §8).
                                 let parent = if d.ref_table == table.name {
                                     table.clone()
+                                } else if let Some(p) = temp_namespace.table(&d.ref_table) {
+                                    check_fk_persistence(temp_scope, true)?;
+                                    p.clone()
+                                } else if let Some(p) = main_namespace.table(&d.ref_table) {
+                                    check_fk_persistence(temp_scope, false)?;
+                                    p.clone()
                                 } else {
-                                    snap.table(&d.ref_table)
-                                        .cloned()
-                                        .ok_or_else(|| fk_parent_missing(&snap, &d.ref_table))?
+                                    return Err(fk_parent_missing(&main_namespace, &d.ref_table));
                                 };
                                 let refs = if let Some(ns) = d.ref_columns {
                                     let mut r = Vec::new();
@@ -3383,7 +3400,7 @@ impl Engine {
                             }
                             found
                         } else {
-                            self.fk_probe_hits(&p, &parent.name)?
+                            self.fk_probe_hits(&p, &parent.name, temp_scope)?
                         };
                         if !hit {
                             return Err(EngineError::fk_violation_insert(&table.name, &fk.name)
@@ -4196,10 +4213,10 @@ impl Engine {
             seen.insert(key.clone());
             targets.push((key, scope));
         }
-        // ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). Only a
-        // persistent table can be an FK parent (a temp table never is, §8), so the scan runs over the
-        // persistent snapshot; a dependent whose referencing table is itself in the drop set does not
-        // count (the drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child`
+        // ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). An FK never
+        // crosses domains (temp-tables.md §8), so each domain's drop set is scanned in its own
+        // snapshot — the main database first, then the session-local temp domain; a dependent whose
+        // referencing table is itself in the drop set does not count (so `DROP TABLE parent, child`
         // succeeds even under RESTRICT).
         // A view depending on a table being dropped blocks the statement under RESTRICT; CASCADE
         // drops it, with every view depending on it (views.md §6).
@@ -4209,10 +4226,22 @@ impl Engine {
             .map(|(key, _)| key.clone())
             .collect();
         let cascade_views = self.drop_table_views(&persistent, dt.cascade)?;
-        let deps = self.read_snap().foreign_key_dependents_excluding(&seen);
-        let cascade_removals = if dt.cascade {
-            deps
+        let temp_seen: BTreeSet<String> = targets
+            .iter()
+            .filter(|(_, scope)| matches!(scope, Scope::Temp))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let persistent_seen: BTreeSet<String> = persistent.iter().cloned().collect();
+        let main_deps = self
+            .read_snap()
+            .foreign_key_dependents_excluding(&persistent_seen);
+        let temp_deps = self
+            .temp_read_snap()
+            .foreign_key_dependents_excluding(&temp_seen);
+        let (cascade_removals, temp_cascade_removals) = if dt.cascade {
+            (main_deps, temp_deps)
         } else {
+            let deps: Vec<&FkDependent> = main_deps.iter().chain(&temp_deps).collect();
             // RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks
             // the drop with 2BP01 — the same message the single-table check produced.
             if let Some(d) = deps.first() {
@@ -4224,17 +4253,20 @@ impl Engine {
                     ),
                 ));
             }
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         // ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
-        // now-dangling FK constraint (in place, preserving its rows). Views and FKs only ever live
-        // in the main database (temp tables reject FKs at CREATE, and views cannot read them), so
-        // the removals route to the main working snapshot.
+        // now-dangling FK constraint (in place, preserving its rows), each in its own domain: views
+        // live only in the main database, and an FK in its tables' domain.
         for name in &cascade_views {
             self.working_mut().remove_view(name);
         }
         for d in &cascade_removals {
             self.working_mut()
+                .remove_foreign_key(&d.ref_table_key, &d.fk_name);
+        }
+        for d in &temp_cascade_removals {
+            self.temp_working_mut()
                 .remove_foreign_key(&d.ref_table_key, &d.fk_name);
         }
         // Then remove every target from its own scope, auto-dropping the sequences it owns — a

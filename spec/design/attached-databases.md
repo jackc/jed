@@ -336,8 +336,9 @@ A jed file must be reopenable by **any** core with **no external code and no ext
 Kept deliberately narrow, and each consistent with an existing jed deferral:
 
 - **No cross-database foreign keys.** An FK's parent and child live in the **same** database. SQLite
-  forbids cross-database FKs; jed already defers FK-on-temp (temp-tables.md §8); the persisted-linkage
-  rule (§7) forbids it structurally anyway. → `0A000`.
+  forbids cross-database FKs; an FK between a temp and a persistent table is PostgreSQL's `42P16`
+  (temp-tables.md §8, FKs among temp tables are supported); the persisted-linkage rule (§7) forbids
+  it structurally anyway. → `0A000`.
 - **No cross-database catalog references.** A table in database A may not use a **composite type** or
   **sequence** defined in database B; types/sequences resolve within the table's own database. (Same
   self-describing reason as §7.)

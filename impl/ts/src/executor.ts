@@ -829,6 +829,24 @@ export function compareName(a: { name: string }, b: { name: string }): number {
 // the check sits with each site's namespace-collision check so established validation orders
 // (42P01/42703 before name checks) are preserved. kind is the object word in the message: table /
 // index / sequence / type / constraint.
+// checkFkPersistence: a foreign key never crosses between the session-local temp domain and the main
+// database (spec/design/temp-tables.md §8) — PostgreSQL's ATAddForeignKeyConstraint persistence rule,
+// 42P16, checked once the parent resolves.
+function checkFkPersistence(childTemp: boolean, parentTemp: boolean): void {
+  if (childTemp && !parentTemp) {
+    throw engineError(
+      "invalid_table_definition",
+      "constraints on temporary tables may reference only temporary tables",
+    );
+  }
+  if (!childTemp && parentTemp) {
+    throw engineError(
+      "invalid_table_definition",
+      "constraints on permanent tables may reference only permanent tables",
+    );
+  }
+}
+
 // fkParentMissing is the error for a FOREIGN KEY parent that is not a table of the parent's
 // database: a view is the wrong object kind (42809, views.md §2); any other name is missing (42P01).
 function fkParentMissing(snap: Snapshot, name: string): EngineError {
@@ -1712,6 +1730,8 @@ export class Engine {
     // The parent tuple in FK slot order, for the child-key reverse probe.
     values: Value[];
     update: boolean;
+    // The FK's domain (session-local temp or main — temp-tables.md §8).
+    temp: boolean;
   }[] = [];
 
   constructor() {
@@ -3097,7 +3117,16 @@ export class Engine {
     // apply to the working temp snapshot first, so they commit (or are discarded) atomically with the
     // rest of the transaction and the refinement, budget precheck, and staging below all see their
     // result.
-    if (tx.tempWorking.applyOnCommitActions()) tx.tempDirty = true;
+    // A DELETE ROWS table referenced from outside the set fails the commit (0A000), which then
+    // discards the transaction like any other failed commit.
+    let changed: boolean;
+    try {
+      changed = tx.tempWorking.applyOnCommitActions();
+    } catch (e) {
+      this.restoreSessionState(tx);
+      throw e;
+    }
+    if (changed) tx.tempDirty = true;
     // A requested writable store need not have been mutated (transactions.md §2.1). Refine before the
     // budget precheck and the durable-writer count, so an unchanged domain is neither checked nor
     // persisted.
@@ -5738,9 +5767,8 @@ export class Engine {
   createTableWithColumns(ct: CreateTable, prebuilt: Column[] | null): Outcome {
     // A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
     // one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
-    // FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
-    // parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
-    // columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+    // The other temp narrowings (composite/collated columns, serial/IDENTITY) are checked just before
+    // registration, once the columns are built.
     //
     // Resolve the optional database qualifier (attached-databases.md §3, Slice 1b).
     const { targetTemp, attachName } = this.createTableTarget(ct);
@@ -5769,12 +5797,6 @@ export class Engine {
       throw engineError(
         "feature_not_supported",
         "an EXCLUDE constraint on a temporary table is not yet supported",
-      );
-    }
-    if (targetTemp && ct.fks.length > 0) {
-      throw engineError(
-        "feature_not_supported",
-        "FOREIGN KEY on a temporary table is not yet supported",
       );
     }
     // Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
@@ -6330,14 +6352,18 @@ export class Engine {
         }
         local.push(idx);
       }
-      // 2. Parent table — a self-reference resolves against the in-progress definition.
+      // 2. Parent table — a self-reference resolves against the in-progress definition; any other
+      // name takes the temp-first resolution walk, and the parent must be of the child's own kind
+      // (42P16, PostgreSQL's ATAddForeignKeyConstraint): an FK never crosses from the session-local
+      // temp domain to the main database or back (temp-tables.md §8).
       const selfRef = fk.refTable === table.name;
       let parent: Table;
       if (selfRef) {
         parent = table;
       } else {
-        const found = this.table(fk.refTable);
+        const found = this.lkpTable(fk.refTable);
         if (found === undefined) throw fkParentMissing(this.readSnap(), fk.refTable);
+        checkFkPersistence(targetTemp, this.isTempTable(fk.refTable));
         parent = found;
       }
       // 3. Referenced columns into the parent (default to the parent's primary key).
@@ -6932,10 +6958,10 @@ export class Engine {
       seen.add(key);
       targets.push({ key, scope });
     }
-    // ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). Only a persistent
-    // table can be an FK parent (a temp table never is, §8), so the scan runs over the persistent
-    // snapshot; a dependent whose referencing table is itself in the drop set does not count (the
-    // drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child` succeeds even under
+    // ---- Phase 2: FK dependency check (RESTRICT) / removal collection (CASCADE). An FK never crosses
+    // domains (temp-tables.md §8), so each domain's drop set is scanned in its own snapshot — the main
+    // database first, then the session-local temp domain; a dependent whose referencing table is
+    // itself in the drop set does not count (so `DROP TABLE parent, child` succeeds even under
     // RESTRICT).
     // A view depending on a table being dropped blocks the statement under RESTRICT; CASCADE drops
     // it, with every view depending on it (views.md §6).
@@ -6943,10 +6969,18 @@ export class Engine {
       targets.filter((t) => t.scope === "persistent").map((t) => t.key),
       dt.cascade,
     );
-    const deps = this.readSnap().fkDependentsExcluding(seen);
+    const persistentSeen = new Set(
+      targets.filter((t) => t.scope === "persistent").map((t) => t.key),
+    );
+    const tempSeen = new Set(targets.filter((t) => t.scope === "temp").map((t) => t.key));
+    const mainDeps = this.readSnap().fkDependentsExcluding(persistentSeen);
+    const tempDeps = this.tempSnap().fkDependentsExcluding(tempSeen);
+    const deps = [...mainDeps, ...tempDeps];
     let cascadeRemovals: FkDependent[] = [];
+    let tempCascadeRemovals: FkDependent[] = [];
     if (dt.cascade) {
-      cascadeRemovals = deps;
+      cascadeRemovals = mainDeps;
+      tempCascadeRemovals = tempDeps;
     } else if (deps.length > 0) {
       // RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks the
       // drop with 2BP01 — the same message the single-table check produced.
@@ -6962,12 +6996,17 @@ export class Engine {
       );
     }
     // ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
-    // now-dangling FK constraint (in place, preserving its rows). Views and FKs only ever live in the
-    // main database (temp tables reject FKs at CREATE, and views cannot read them), so the removals
-    // route to the main working snapshot.
+    // now-dangling FK constraint (in place, preserving its rows), each in its own domain: views live
+    // only in the main database, and an FK in its tables' domain.
     for (const name of cascadeViews) this.working().removeView(name);
     for (const d of cascadeRemovals) {
       this.working().removeForeignKey(d.refTableKey, d.fkName);
+    }
+    if (tempCascadeRemovals.length > 0) {
+      this.session.tx!.tempDirty = true;
+      for (const d of tempCascadeRemovals) {
+        this.tempSnap().removeForeignKey(d.refTableKey, d.fkName);
+      }
     }
     // Then remove every target from its own scope, auto-dropping the sequences it owns — a
     // serial/IDENTITY column's owned sequence (spec/design/sequences.md §12; an owned sequence is
@@ -7243,7 +7282,7 @@ export class Engine {
                 `column already exists: ${action.column.name}`,
               );
             }
-            if (action.foreignKeys.length > 0 && (tempScope || attachmentScope))
+            if (action.foreignKeys.length > 0 && attachmentScope)
               throw engineError(
                 "feature_not_supported",
                 "this constraint is not supported in this table scope",
@@ -7528,7 +7567,7 @@ export class Engine {
           if (action.kind === "addConstraint") {
             const c = action.constraint;
             if (c.kind === "foreignKey" || c.kind === "exclude") {
-              if (tempScope)
+              if (tempScope && c.kind === "exclude")
                 throw engineError(
                   "feature_not_supported",
                   "this constraint is not supported on a temporary table",
@@ -7635,11 +7674,15 @@ export class Engine {
                   );
                 local.push(ci);
               }
-              const parent =
-                d.refTable === table.name
-                  ? table
-                  : snap.table(d.refTable);
-              if (!parent) throw fkParentMissing(snap, d.refTable);
+              // The parent takes the temp-first resolution walk and must be of the table's own kind
+              // (42P16, temp-tables.md §8).
+              let parent: Table | undefined;
+              if (d.refTable === table.name) parent = table;
+              else if ((parent = this.tempSnap().table(d.refTable)) !== undefined)
+                checkFkPersistence(tempScope, true);
+              else if ((parent = this.readSnap().table(d.refTable)) !== undefined)
+                checkFkPersistence(tempScope, false);
+              else throw fkParentMissing(this.readSnap(), d.refTable);
               let refs: number[];
               if (d.refColumns === null) refs = [...parent.pk];
               else {
@@ -8266,7 +8309,7 @@ export class Engine {
                   );
                   return pp !== null && compareBytes(fkProbeBytes(p), fkProbeBytes(pp)) === 0;
                 });
-              } else hit = this.fkProbeHits(p, parent.name);
+              } else hit = this.fkProbeHits(p, parent.name, tempScope);
               if (!hit)
                 throw fkViolationInsert(table.name, fk.name).withDetail(
                   fkChildDetail(this.session, table.name, table.columns, fk, row),
@@ -8599,16 +8642,35 @@ export class Engine {
     );
   }
 
+  // fkSnap is the snapshot a foreign key's tables live in (spec/design/temp-tables.md §8): an FK never
+  // crosses databases, so its child and parent are both in the session-local temp domain (`temp`) or
+  // both in the main database. Explicit, so a same-named table of the other domain can never capture
+  // an FK lookup.
+  private fkSnap(temp: boolean): Snapshot {
+    return temp ? this.tempSnap() : this.readSnap();
+  }
+
+  // fkDomain is a DML target's FK domain (temp-tables.md §8): true for a session-local temp table,
+  // false for a main-database table, null for an attached database, whose tables have no foreign
+  // keys. An explicit main/temp qualifier survives a same-named table in the other domain; a bare
+  // name takes the temp-first resolution walk.
+  private fkDomain(scope: string | undefined, table: string): boolean | null {
+    if (scope === undefined) return this.isTempTable(table);
+    if (scope === "temp") return true;
+    if (scope === "main") return false;
+    return null;
+  }
+
   // fkProbeHits reports whether the parent currently holds the key/prefix `probe` (committed +
   // working state) — the child-side foreign-key existence test (spec/design/constraints.md §6.4).
-  // `parentTable` is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
-  private fkProbeHits(probe: FkProbe, parentTable: string): boolean {
+  // `parentTable` is the referenced table's name, in the FK's domain (`temp`). Unmetered, like the
+  // PK/UNIQUE probes (cost.md §3).
+  private fkProbeHits(probe: FkProbe, parentTable: string, temp: boolean): boolean {
     if (probe.kind === "pk") {
-      return this.readSnap().store(parentTable).get(probe.bytes) !== undefined;
+      return this.fkSnap(temp).store(parentTable).get(probe.bytes) !== undefined;
     }
-    return (
-      this.readSnap().indexStore(probe.index).rangeEntries(uniqueProbeBound(probe.prefix)).length > 0
-    );
+    const index = this.fkSnap(temp).indexStore(probe.index);
+    return index.rangeEntries(uniqueProbeBound(probe.prefix)).length > 0;
   }
 
   // fkChildReferences reports whether any row of `childTable` references the parent tuple via `fk` —
@@ -8618,15 +8680,17 @@ export class Engine {
   // child PK/index is probed for the prefix; otherwise the child is scanned in storage-key order
   // (MATCH SIMPLE: a child row with any NULL FK column references nothing). Metered and guarded
   // before the work it pays for (constraints.md §6.11, cost.md §3 "Foreign-key reverse match").
+  // `temp` is the FK's domain (fkSnap).
   private fkChildReferences(
     childTable: string,
     fk: ForeignKey,
     parent: Table,
     values: Value[],
     target: Uint8Array,
+    temp: boolean,
     meter: Meter,
   ): boolean {
-    const snap = this.readSnap();
+    const snap = this.fkSnap(temp);
     const child = snap.table(childTable);
     if (child === undefined) throw new Error("foreign-key child exists");
     const store = snap.store(childTable);
@@ -8690,14 +8754,17 @@ export class Engine {
   }
 
   // newFkKeyedTarget de-duplicates old (and pairs each with its new tuple when next is non-null).
-  // Every tuple is complete (non-NULL) — the callers drop MATCH SIMPLE-exempt parent rows.
+  // Every tuple is complete (non-NULL) — the callers drop MATCH SIMPLE-exempt parent rows. `temp` is
+  // the FK's domain, where the action's child lives.
   private newFkKeyedTarget(
     parent: Table,
     fk: ForeignKey,
     old: Value[][],
     next: Value[][] | null,
+    temp: boolean,
   ): FkKeyedTarget {
     const t: FkKeyedTarget = {
+      temp,
       parent,
       parentColls: this.columnCollations(parent.columns),
       fk,
@@ -8723,7 +8790,7 @@ export class Engine {
   // (or the full-scan block); the caller charges it, then storageRowRead per entry, then applies
   // fkKeyedMatch as the row filter.
   private fkKeyedScan(t: FkKeyedTarget, childTable: string, mask: boolean[]): MutationScanBatch {
-    const snap = this.readSnap();
+    const snap = this.fkSnap(t.temp);
     const child = snap.table(childTable);
     if (child === undefined) throw new Error("foreign-key child exists");
     const store = snap.store(childTable);
@@ -8770,13 +8837,16 @@ export class Engine {
     return out;
   }
 
-  // fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
-  // references `parentName` (exact), including a self-reference — the inbound FKs a
+  // fkReferencers returns every (child table name, FK) pair in the parent's domain snapshot (`temp`)
+  // whose FK references `parentName` (exact), including a self-reference — the inbound FKs a
   // parent DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (exact
   // child table, FK name) for a deterministic report order. The FK objects are the snapshot's
   // (the caller probes stores without mutating the catalog).
-  private fkReferencers(parentName: string): { childTable: string; fk: ForeignKey }[] {
-    const snap = this.readSnap();
+  private fkReferencers(
+    parentName: string,
+    temp: boolean,
+  ): { childTable: string; fk: ForeignKey }[] {
+    const snap = this.fkSnap(temp);
     const key = parentName;
     const out: { childTable: string; fk: ForeignKey }[] = [];
     const tkeys = [...snap.tables.keys()].sort(compareTextC);
@@ -10896,11 +10966,12 @@ export class Engine {
     // validation, like the PK/UNIQUE probes, and before any write (all-or-nothing). MATCH SIMPLE: a
     // row with any NULL local column is exempt.
     const relation = table.name;
-    const fks = this.table(table.name)?.fks ?? [];
+    const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, table.name);
     for (const fk of fks) {
       // The parent exists (validated at CREATE TABLE; DROP TABLE refuses to drop a referenced
-      // table — §6.10), so a consistent catalog always finds it.
-      const parent = this.table(fk.refTable);
+      // table — §6.10), so a consistent catalog always finds it, in the FK's own domain
+      // (temp-tables.md §8).
+      const parent = this.fkSnap(fkTemp).table(fk.refTable);
       if (parent === undefined) continue;
       // The probe matches the parent's stored key, so a collated parent key column uses the
       // PARENT's collation (§2.12).
@@ -10922,7 +10993,7 @@ export class Engine {
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        this.validateInsertFkStored(relation, table.columns, fk, probe, pr.row);
+        this.validateInsertFkStored(relation, table.columns, fk, probe, pr.row, fkTemp);
       }
     }
 
@@ -11101,8 +11172,9 @@ export class Engine {
     evalViewChecks(viewChecks, row, maintenanceEnv, meter);
 
     const relation = table.name;
-    for (const fk of this.table(table.name)?.fks ?? []) {
-      const parent = this.table(fk.refTable);
+    const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, table.name);
+    for (const fk of fks) {
+      const parent = this.fkSnap(fkTemp).table(fk.refTable);
       if (parent === undefined) continue;
       const parentColls = this.columnCollations(parent.columns);
       const supplied =
@@ -11118,7 +11190,7 @@ export class Engine {
       if (supplied !== null && cmpBytes(fkProbeBytes(supplied), fkProbeBytes(probe)) === 0) {
         continue;
       }
-      this.validateInsertFkStored(relation, table.columns, fk, probe, row);
+      this.validateInsertFkStored(relation, table.columns, fk, probe, row, fkTemp);
     }
 
     for (const exc of this.table(table.name)?.exclusions ?? []) {
@@ -11169,8 +11241,9 @@ export class Engine {
     fk: ForeignKey,
     probe: FkProbe,
     row: Row,
+    temp: boolean,
   ): void {
-    if (!this.fkProbeHits(probe, fk.refTable))
+    if (!this.fkProbeHits(probe, fk.refTable, temp))
       throw fkViolationInsert(relation, fk.name).withDetail(
         fkChildDetail(this.session, relation, columns, fk, row),
       );
@@ -11675,9 +11748,9 @@ export class Engine {
     // assigned an FK local column, must reference an existing parent key — the committed parent
     // state plus (for a self-reference) the statement's end state.
     const assigned = new Set<number>(plan.doUpdate ? plan.assignments.map((a) => a.idx) : []);
-    const fks = this.table(relation)?.fks ?? [];
+    const { fks, temp: fkTemp } = this.targetForeignKeys(dbScope, relation);
     for (const fk of fks) {
-      const parent = this.table(fk.refTable);
+      const parent = this.fkSnap(fkTemp).table(fk.refTable);
       if (parent === undefined) continue;
       // The probe matches the parent's stored key, so a collated parent key column uses the
       // PARENT's collation (§2.12).
@@ -11703,7 +11776,7 @@ export class Engine {
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        if (!this.fkProbeHits(probe, fk.refTable)) {
+        if (!this.fkProbeHits(probe, fk.refTable, fkTemp)) {
           throw fkViolationInsert(relation, fk.name).withDetail(
             fkChildDetail(this.session, relation, table.columns, fk, row),
           );
@@ -11795,7 +11868,7 @@ export class Engine {
         }
       }
     }
-    this.applyFkUpdateActions(table, fkUpdates, meter, this.mainDmlTarget(dbScope, table.name));
+    this.applyFkUpdateActions(table, fkUpdates, meter, this.fkDomain(dbScope, table.name));
     return { affected, returned };
   }
 
@@ -11908,18 +11981,22 @@ export class Engine {
     meter.guard();
   }
 
+  // runFkDeleteAction applies one inbound FK's generated DELETE-side action to `oldTuples`. `temp` is
+  // the FK's domain: the generated statement names the child there (temp-tables.md §8).
   private runFkDeleteAction(
     parent: Table,
     child: Table,
     fk: ForeignKey,
     oldTuples: Value[][],
+    temp: boolean,
     meter: Meter,
   ): void {
     if (oldTuples.length === 0) return;
-    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, null);
+    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, null, temp);
+    const db = temp ? "temp" : "main";
     if (fk.onDelete === "cascade") {
       this.runFkActionDelete(
-        { kind: "delete", table: child.name, db: "main", filter: null, returning: null, fkTarget },
+        { kind: "delete", table: child.name, db, filter: null, returning: null, fkTarget },
         [],
         meter,
       );
@@ -11928,7 +12005,7 @@ export class Engine {
         {
           kind: "update",
           table: child.name,
-          db: "main",
+          db,
           assignments: fk.columns.map((column) => ({
             column: child.columns[column]!.name,
             isDefault: fk.onDelete === "setDefault",
@@ -11949,6 +12026,7 @@ export class Engine {
     child: Table,
     fk: ForeignKey,
     transitions: [Value[], Value[]][],
+    temp: boolean,
     meter: Meter,
   ): void {
     if (transitions.length === 0) return;
@@ -11977,12 +12055,12 @@ export class Engine {
     } else {
       return;
     }
-    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, newTuples);
+    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, newTuples, temp);
     this.runFkActionUpdate(
       {
         kind: "update",
         table: child.name,
-        db: "main",
+        db: temp ? "temp" : "main",
         assignments,
         filter: null,
         returning: null,
@@ -11999,7 +12077,7 @@ export class Engine {
     const checks = this.fkDeferredChecks;
     this.fkDeferredChecks = [];
     for (const check of checks) {
-      if (check.update && this.fkProbeHits(check.probe, check.parent.name)) continue;
+      if (check.update && this.fkProbeHits(check.probe, check.parent.name, check.temp)) continue;
       if (
         this.fkChildReferences(
           check.childTable,
@@ -12007,6 +12085,7 @@ export class Engine {
           check.parent,
           check.values,
           fkProbeBytes(check.probe),
+          check.temp,
           meter,
         )
       ) {
@@ -12017,20 +12096,28 @@ export class Engine {
     }
   }
 
-  // Whether a DML target resolves to the persistent main catalog. FKs involving temp/attached
-  // tables are rejected at DDL; an explicit main qualifier survives a same-named temp overlap.
-  private mainDmlTarget(scope: string | undefined, table: string): boolean {
-    return scope === undefined ? !this.isTempTable(table) : scope === "main";
+  // targetForeignKeys is a DML target's foreign keys and their domain (temp-tables.md §8): the
+  // table's own FKs read from its domain snapshot, so an explicit main/temp qualifier survives a
+  // same-named table of the other domain. An attached-database table has none.
+  private targetForeignKeys(
+    scope: string | undefined,
+    table: string,
+  ): { fks: ForeignKey[]; temp: boolean } {
+    const temp = this.fkDomain(scope, table);
+    if (temp === null) return { fks: [], temp: false };
+    return { fks: this.fkSnap(temp).table(table)?.fks ?? [], temp };
   }
 
   private applyFkDeleteActions(
     parent: Table,
     rows: Row[],
     meter: Meter,
-    mainTarget: boolean,
+    domain: boolean | null,
   ): void {
     if (rows.length === 0) return;
-    if (!mainTarget) return;
+    // An attached-database table has no foreign keys (attached-databases.md §8).
+    if (domain === null) return;
+    const temp = domain;
     const root = this.session.fkActionDepth === 0;
     if (root && this.fkDeferredChecks.length !== 0) {
       throw new Error("foreign-key deferred-check queue leaked across statements");
@@ -12038,18 +12125,18 @@ export class Engine {
     const savedPin = this.session.readPin;
     this.session.readPin = null;
     try {
-      const referencers = this.fkReferencers(parent.name);
+      const referencers = this.fkReferencers(parent.name, temp);
       const parentColls = this.columnCollations(parent.columns);
       for (const { childTable, fk } of referencers) {
         if (fk.onDelete === "noAction" || fk.onDelete === "restrict") continue;
-        const child = this.readSnap().table(childTable);
+        const child = this.fkSnap(temp).table(childTable);
         if (child === undefined) throw new Error("foreign-key child exists");
         const oldTuples: Value[][] = [];
         for (const row of rows) {
           if (fkProbe(fk, parent, parentColls, row, fk.refColumns) !== null)
             oldTuples.push(fk.refColumns.map((column) => row[column]!));
         }
-        this.runFkDeleteAction(parent, child, fk, oldTuples, meter);
+        this.runFkDeleteAction(parent, child, fk, oldTuples, temp, meter);
       }
       for (const { childTable, fk } of referencers) {
         if (fk.onDelete !== "noAction" && fk.onDelete !== "restrict") continue;
@@ -12063,6 +12150,7 @@ export class Engine {
               probe,
               values: fk.refColumns.map((column) => row[column]!),
               update: false,
+              temp,
             });
           }
         }
@@ -12078,10 +12166,12 @@ export class Engine {
     parent: Table,
     updates: { row: Row; oldRow: Row }[],
     meter: Meter,
-    mainTarget: boolean,
+    domain: boolean | null,
   ): void {
     if (updates.length === 0) return;
-    if (!mainTarget) return;
+    // An attached-database table has no foreign keys (attached-databases.md §8).
+    if (domain === null) return;
+    const temp = domain;
     const root = this.session.fkActionDepth === 0;
     if (root && this.fkDeferredChecks.length !== 0) {
       throw new Error("foreign-key deferred-check queue leaked across statements");
@@ -12089,11 +12179,11 @@ export class Engine {
     const savedPin = this.session.readPin;
     this.session.readPin = null;
     try {
-      const referencers = this.fkReferencers(parent.name);
+      const referencers = this.fkReferencers(parent.name, temp);
       const parentColls = this.columnCollations(parent.columns);
       for (const { childTable, fk } of referencers) {
         if (fk.onUpdate === "noAction" || fk.onUpdate === "restrict") continue;
-        const child = this.readSnap().table(childTable);
+        const child = this.fkSnap(temp).table(childTable);
         if (child === undefined) throw new Error("foreign-key child exists");
         const transitions: [Value[], Value[]][] = [];
         for (const u of updates) {
@@ -12106,7 +12196,7 @@ export class Engine {
             fk.refColumns.map((column) => u.row[column]!),
           ]);
         }
-        this.runFkUpdateAction(parent, child, fk, transitions, meter);
+        this.runFkUpdateAction(parent, child, fk, transitions, temp, meter);
       }
       for (const { childTable, fk } of referencers) {
         if (fk.onUpdate !== "noAction" && fk.onUpdate !== "restrict") continue;
@@ -12122,6 +12212,7 @@ export class Engine {
             probe: oldProbe,
             values: fk.refColumns.map((column) => u.oldRow[column]!),
             update: true,
+            temp,
           });
         }
       }
@@ -12319,7 +12410,7 @@ export class Engine {
       table,
       matched.map((m) => m.row),
       meter,
-      this.mainDmlTarget(del.db, del.table),
+      this.fkDomain(del.db, del.table),
     );
     return dmlOutcome(
       ret?.names ?? null,
@@ -12771,10 +12862,10 @@ export class Engine {
     // supplies. Unmetered, phase 1, before any write.
     const relation = table.name;
     const assigned = new Set<number>(plans.map((p) => p.idx));
-    const updFks = this.table(upd.table)?.fks ?? [];
+    const { fks: updFks, temp: fkTemp } = this.targetForeignKeys(upd.db, upd.table);
     for (const fk of updFks) {
       if (!fk.columns.some((c) => assigned.has(c))) continue; // this FK's local columns were not assigned
-      const parent = this.table(fk.refTable);
+      const parent = this.fkSnap(fkTemp).table(fk.refTable);
       if (parent === undefined) continue;
       // The probe matches the parent's stored key, so a collated parent key column uses the
       // PARENT's collation (§2.12).
@@ -12794,7 +12885,7 @@ export class Engine {
           continue;
         }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        if (!this.fkProbeHits(probe, fk.refTable)) {
+        if (!this.fkProbeHits(probe, fk.refTable, fkTemp)) {
           throw fkViolationInsert(relation, fk.name).withDetail(
             fkChildDetail(this.session, relation, table.columns, fk, u.row),
           );
@@ -12898,7 +12989,7 @@ export class Engine {
       }
     }
     if (updates.length > 0) this.markEstimatorMutation(upd.db, upd.table);
-    this.applyFkUpdateActions(table, updates, meter, this.mainDmlTarget(upd.db, upd.table));
+    this.applyFkUpdateActions(table, updates, meter, this.fkDomain(upd.db, upd.table));
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -25099,6 +25190,8 @@ function fkChooseReversePath(
 // distinct, complete old parent tuples (FK slot order), keyed by their parent-space probe bytes.
 // For ON UPDATE CASCADE, next[i] is tuples[i]'s new tuple; null for DELETE / SET NULL / SET DEFAULT.
 export type FkKeyedTarget = {
+  // The FK's domain: the child (and parent) are session-local temp tables (temp-tables.md §8).
+  temp: boolean;
   parent: Table;
   parentColls: (Collation | null)[];
   fk: ForeignKey;

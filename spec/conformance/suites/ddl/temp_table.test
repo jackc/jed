@@ -136,7 +136,7 @@ SELECT id FROM temp.t ORDER BY id
 1
 2
 
-# the skip precedes the temp narrowings (a FOREIGN KEY on a temp table is 0A000 on a create)
+# the skip precedes the FK checks (a temp table referencing the persistent p is 42P16 on a create)
 statement ok
 CREATE TEMP TABLE IF NOT EXISTS t (id i32 PRIMARY KEY, pid i32 REFERENCES p)
 
@@ -163,9 +163,11 @@ SELECT id FROM t
 
 # --- deferred narrowings on a temp table are clean 0A000 (temp-tables.md §8) ------------------
 # (serial/IDENTITY — see ddl/temp_serial_identity.test — and composite-typed columns — see
-# ddl/temp_composite.test — on a temp table are now SUPPORTED; FK and COLLATE columns remain deferred.)
+# ddl/temp_composite.test — on a temp table are now SUPPORTED; COLLATE columns remain deferred. A
+# FOREIGN KEY among temp tables is supported — ddl/temp_foreign_key.test — but one referencing the
+# persistent p is PostgreSQL's 42P16.)
 
-statement error 0A000
+statement error 42P16
 CREATE TEMP TABLE bad (id i32 PRIMARY KEY, pid i32 REFERENCES p)
 
 # --- the allow_temp_ddl capability gate (temp-tables.md §5) ------------------------------------

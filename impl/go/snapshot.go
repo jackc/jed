@@ -1036,30 +1036,78 @@ func (s *snapshot) removeTable(key string) {
 
 // applyOnCommitActions runs the temporary tables' ON COMMIT actions on a committing transaction's
 // working temp snapshot (spec/design/temp-tables.md §5.1): each DELETE ROWS table is emptied, then each
-// DROP table is dropped as DROP TABLE drops it — with its indexes and the sequences it owns
-// (PostgreSQL's truncate-then-drop order). The actions touch disjoint tables, so the map's visiting
-// order cannot change the result. Reports whether anything changed.
-func (s *snapshot) applyOnCommitActions() bool {
-	changed := false
-	var drops []string
+// DROP table is dropped as DROP TABLE … CASCADE drops it — with its indexes, the sequences it owns, and
+// every surviving table's FK that references it (PostgreSQL's truncate-then-drop order). Before
+// anything changes, a table outside the DELETE ROWS set that references one inside it fails the commit
+// (0A000, PostgreSQL's heap_truncate_check_FKs). The actions touch disjoint tables, so the map's
+// visiting order cannot change the result. Reports whether anything changed.
+func (s *snapshot) applyOnCommitActions() (bool, error) {
+	truncates := make(map[string]bool)
+	drops := make(map[string]bool)
 	for name, t := range s.tables {
 		switch t.OnCommit {
 		case onCommitDeleteRows:
-			if s.truncateTable(t) {
-				changed = true
-			}
+			truncates[name] = true
 		case onCommitDrop:
-			drops = append(drops, name)
+			drops[name] = true
 		}
 	}
-	for _, name := range drops {
+	if err := s.checkTruncateForeignKeys(truncates); err != nil {
+		return false, err
+	}
+	changed := false
+	for name := range truncates {
+		if s.truncateTable(s.tables[name]) {
+			changed = true
+		}
+	}
+	if len(drops) > 0 {
+		for _, d := range s.foreignKeyDependentsExcluding(drops) {
+			s.removeForeignKey(d.refTableKey, d.fkName)
+		}
+	}
+	for name := range drops {
 		for _, sk := range s.sequencesOwnedBy(name) {
 			s.removeSequence(sk)
 		}
 		s.removeTable(name)
 		changed = true
 	}
-	return changed
+	return changed, nil
+}
+
+// checkTruncateForeignKeys is PostgreSQL's heap_truncate_check_FKs for the ON COMMIT DELETE ROWS set
+// (temp-tables.md §5.1): emptying a table that a table outside the set references would strand that
+// table's rows, so the commit fails with 0A000. The reported pair is the first truncated parent, then
+// its first outside referencing table, each in ascending name order (jed has no OIDs to order by).
+func (s *snapshot) checkTruncateForeignKeys(truncates map[string]bool) error {
+	parents := make([]string, 0, len(truncates))
+	for name := range truncates {
+		parents = append(parents, name)
+	}
+	sort.Strings(parents)
+	for _, parent := range parents {
+		var children []string
+		for key, t := range s.tables {
+			if truncates[key] {
+				continue
+			}
+			for _, fk := range t.ForeignKeys {
+				if fk.RefTable == parent {
+					children = append(children, key)
+					break
+				}
+			}
+		}
+		if len(children) == 0 {
+			continue
+		}
+		sort.Strings(children)
+		return newError(FeatureNotSupported, "unsupported ON COMMIT and foreign key combination").
+			withDetail(`Table "` + s.tables[children[0]].Name + `" references "` + s.tables[parent].Name +
+				`", but they do not have the same ON COMMIT setting.`)
+	}
+	return nil
 }
 
 // truncateTable empties a table's rows and every index's entries, keeping its definition (ON COMMIT

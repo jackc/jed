@@ -508,7 +508,11 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
    created — a **self-reference** — in which case it resolves against the in-progress definition
    (its columns, its just-resolved PK, its just-named unique indexes). A missing parent is
    **`42P01`** (`table does not exist: <name>`). A parent that is a **view** is **`42809`**
-   (*referenced relation "v" is not a table*, PostgreSQL's code; [views.md](views.md) §2).
+   (*referenced relation "v" is not a table*, PostgreSQL's code; [views.md](views.md) §2). The name
+   takes the temp-first resolution walk, and the parent must be of the child's kind — a session-local
+   temp table references only temp tables, a persistent table only persistent ones, else **`42P16`**
+   (PostgreSQL's persistence rule; [temp-tables.md](temp-tables.md) §8). Every later step and all
+   enforcement then stay within that one domain.
 3. **Referenced columns.** An omitted `(refcol …)` list defaults to the **parent's primary key**
    (in PK key order); a parent with no primary key is **`42704`**
    (`there is no primary key for referenced table <parent>`) — PG's code for the omitted-list case

@@ -852,22 +852,35 @@ impl Snapshot {
 
     /// Run the temporary tables' `ON COMMIT` actions on a committing transaction's working temp
     /// snapshot (spec/design/temp-tables.md §5.1): each `DELETE ROWS` table is emptied, then each
-    /// `DROP` table is dropped as `DROP TABLE` drops it — with its indexes and the sequences it owns
-    /// (PostgreSQL's truncate-then-drop order). The actions touch disjoint tables, so the map's
-    /// visiting order cannot change the result. Reports whether anything changed.
-    pub(crate) fn apply_on_commit_actions(&mut self) -> bool {
-        let mut truncates = Vec::new();
-        let mut drops = Vec::new();
+    /// `DROP` table is dropped as `DROP TABLE … CASCADE` drops it — with its indexes, the sequences
+    /// it owns, and every surviving table's FK that references it (PostgreSQL's truncate-then-drop
+    /// order). Before anything changes, a table outside the `DELETE ROWS` set that references one
+    /// inside it fails the commit (0A000, PostgreSQL's `heap_truncate_check_FKs`). The actions touch
+    /// disjoint tables, so the map's visiting order cannot change the result. Reports whether
+    /// anything changed.
+    pub(crate) fn apply_on_commit_actions(&mut self) -> Result<bool> {
+        let mut truncates = BTreeSet::new();
+        let mut drops = BTreeSet::new();
         for (name, t) in self.tables.iter() {
             match t.on_commit {
                 crate::catalog::OnCommit::PreserveRows => {}
-                crate::catalog::OnCommit::DeleteRows => truncates.push(name.clone()),
-                crate::catalog::OnCommit::Drop => drops.push(name.clone()),
+                crate::catalog::OnCommit::DeleteRows => {
+                    truncates.insert(name.clone());
+                }
+                crate::catalog::OnCommit::Drop => {
+                    drops.insert(name.clone());
+                }
             }
         }
+        self.check_truncate_foreign_keys(&truncates)?;
         let mut changed = false;
         for name in &truncates {
             changed |= self.truncate_table(name);
+        }
+        if !drops.is_empty() {
+            for d in self.foreign_key_dependents_excluding(&drops) {
+                self.remove_foreign_key(&d.ref_table_key, &d.fk_name);
+            }
         }
         for name in &drops {
             for sk in self.sequences_owned_by(name) {
@@ -876,7 +889,38 @@ impl Snapshot {
             self.remove_table(name);
             changed = true;
         }
-        changed
+        Ok(changed)
+    }
+
+    /// PostgreSQL's `heap_truncate_check_FKs` for the `ON COMMIT DELETE ROWS` set (temp-tables.md
+    /// §5.1): emptying a table that a table outside the set references would strand that table's
+    /// rows, so the commit fails with 0A000. The reported pair is the first truncated parent, then
+    /// its first outside referencing table, each in ascending name order (jed has no OIDs to order
+    /// by).
+    fn check_truncate_foreign_keys(&self, truncates: &BTreeSet<String>) -> Result<()> {
+        for parent in truncates {
+            let mut children: Vec<&String> = self
+                .tables
+                .iter()
+                .filter(|(key, t)| {
+                    !truncates.contains(*key)
+                        && t.foreign_keys.iter().any(|fk| fk.ref_table == *parent)
+                })
+                .map(|(key, _)| key)
+                .collect();
+            children.sort();
+            if let Some(child) = children.first() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "unsupported ON COMMIT and foreign key combination",
+                )
+                .with_detail(Some(format!(
+                    "Table \"{}\" references \"{}\", but they do not have the same ON COMMIT setting.",
+                    self.tables[*child].name, self.tables[parent].name
+                ))));
+            }
+        }
+        Ok(())
     }
 
     /// Empty a table's rows and every index's entries, keeping its definition (`ON COMMIT DELETE

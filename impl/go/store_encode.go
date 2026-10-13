@@ -1076,16 +1076,45 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: idx.Name}, true, nil
 }
 
+// fkSnap is the snapshot a foreign key's tables live in (spec/design/temp-tables.md §8): an FK never
+// crosses databases, so its child and parent are both in the session-local temp domain (temp) or both
+// in the main database. Explicit, so a same-named table of the other domain can never capture an FK
+// lookup.
+func (db *engine) fkSnap(temp bool) *snapshot {
+	if temp {
+		return db.tempSnap()
+	}
+	return db.readSnap()
+}
+
+// fkDomain is a DML target's FK domain (temp-tables.md §8): temp reports a session-local temp table,
+// and ok is false for an attached database, whose tables have no foreign keys. An explicit main/temp
+// qualifier survives a same-named table in the other domain; a bare name takes the temp-first walk.
+func (db *engine) fkDomain(scope *string, table string) (temp, ok bool) {
+	if scope == nil {
+		return db.isTempTable(table), true
+	}
+	switch *scope {
+	case "temp":
+		return true, true
+	case "main":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // fkProbeHits reports whether the parent currently holds the key/prefix probe (committed +
 // working state) — the child-side foreign-key existence test (spec/design/constraints.md §6.4).
-// parentTable is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
-func (db *engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
+// parentTable is the referenced table's name, in the FK's domain (temp). Unmetered, like the
+// PK/UNIQUE probes (cost.md §3).
+func (db *engine) fkProbeHits(probe fkProbe, parentTable string, temp bool) (bool, error) {
 	switch probe.kind {
 	case fkProbePk:
-		_, ok, err := db.readSnap().store(parentTable).Get(probe.bytes)
+		_, ok, err := db.fkSnap(temp).store(parentTable).Get(probe.bytes)
 		return ok, err
 	default: // fkProbeUnique
-		entries, err := db.readSnap().indexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
+		entries, err := db.fkSnap(temp).indexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
 		if err != nil {
 			return false, err
 		}
@@ -1202,8 +1231,9 @@ func fkChooseReversePath(snap *snapshot, fk *foreignKey, child, parent *catTable
 // usable child PK/index is probed for the prefix; otherwise the child is scanned in storage-key
 // order (MATCH SIMPLE: a child row with any NULL FK column references nothing). Metered and guarded
 // before the work it pays for (constraints.md §6.11, cost.md §3 "Foreign-key reverse match").
-func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *catTable, values []Value, target []byte, meter *costMeter) (bool, error) {
-	snap := db.readSnap()
+// temp is the FK's domain (fkSnap).
+func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *catTable, values []Value, target []byte, temp bool, meter *costMeter) (bool, error) {
+	snap := db.fkSnap(temp)
 	child, ok := snap.table(childTable)
 	if !ok {
 		panic("foreign-key child exists")
@@ -1274,6 +1304,7 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 // distinct, complete old parent tuples (FK slot order), keyed by their parent-space probe bytes.
 // For ON UPDATE CASCADE, next[i] is tuples[i]'s new tuple; nil for DELETE / SET NULL / SET DEFAULT.
 type fkKeyedTarget struct {
+	temp        bool // the FK's domain: the child (and parent) are session-local temp tables (temp-tables.md §8)
 	parent      *catTable
 	parentColls []*Collation
 	fk          *foreignKey
@@ -1283,9 +1314,11 @@ type fkKeyedTarget struct {
 }
 
 // newFkKeyedTarget de-duplicates old (and pairs each with its new tuple when next is non-nil).
-// Every tuple is complete (non-NULL) — the callers drop MATCH SIMPLE-exempt parent rows.
-func (db *engine) newFkKeyedTarget(parent *catTable, fk *foreignKey, old, next [][]Value) (*fkKeyedTarget, error) {
+// Every tuple is complete (non-NULL) — the callers drop MATCH SIMPLE-exempt parent rows. temp is the
+// FK's domain, where the action's child lives.
+func (db *engine) newFkKeyedTarget(parent *catTable, fk *foreignKey, old, next [][]Value, temp bool) (*fkKeyedTarget, error) {
 	t := &fkKeyedTarget{
+		temp:   temp,
 		parent: parent, parentColls: db.columnCollations(parent.Columns), fk: fk,
 		keys: make(map[string]int, len(old)),
 	}
@@ -1336,7 +1369,7 @@ func (t *fkKeyedTarget) match(row storedRow) (int, bool, error) {
 // (or the full-scan block); the caller charges it, then storage_row_read per entry, then applies
 // match as the row filter.
 func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) (mutationScanBatch, error) {
-	snap := db.readSnap()
+	snap := db.fkSnap(t.temp)
 	child, ok := snap.table(childTable)
 	if !ok {
 		panic("foreign-key child exists")
@@ -1372,8 +1405,8 @@ func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) 
 		if path.index == "" {
 			entries, pages, slabs, err = store.RangeScanWithUnits(bound, mask)
 		} else {
-			// The FK child is always a main table: resolve its stores in the main snapshot, never through
-			// the temp-first name walk a same-named session-local temp table would capture.
+			// Resolve the child's stores in the FK's own domain snapshot, never through the temp-first
+			// name walk a same-named table of the other domain would capture.
 			entries, pages, slabs, err = indexStoreBoundEntries(snap.indexStore(path.index), store, suffix, bound, len(prefix), mask)
 		}
 		if err != nil {
@@ -1399,13 +1432,13 @@ type fkReferencer struct {
 	fk         foreignKey
 }
 
-// fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
-// references parentName (exact name), including a self-reference — the inbound FKs a parent
+// fkReferencers returns every (child table name, FK) pair in the parent's domain snapshot (temp)
+// whose FK references parentName (exact name), including a self-reference — the inbound FKs a parent
 // DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (child
 // table, FK name) for a deterministic report order; the FK is copied so the caller can probe
 // stores without a snapshot borrow.
-func (db *engine) fkReferencers(parentName string) []fkReferencer {
-	snap := db.readSnap()
+func (db *engine) fkReferencers(parentName string, temp bool) []fkReferencer {
+	snap := db.fkSnap(temp)
 	key := parentName
 	tableKeys := make([]string, 0, len(snap.tables))
 	for k := range snap.tables {

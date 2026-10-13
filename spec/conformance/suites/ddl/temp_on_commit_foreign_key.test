@@ -1,0 +1,249 @@
+# skip: disk — session-local temp tables and multi-record transactions do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# FOREIGN KEY constraints among temp tables meet ON COMMIT (spec/design/temp-tables.md §5.1/§8).
+# PostgreSQL's commit-time truncation (heap_truncate_check_FKs): a commit fails with 0A000 when a
+# table outside the ON COMMIT DELETE ROWS set references a table inside it — even one the same
+# commit then drops, because truncation precedes the drops — and the failed commit discards the
+# transaction. ON COMMIT DROP drops as DROP TABLE … CASCADE does, so a surviving table loses its FK
+# to a dropped one. Also covers temp./main.-qualified FK writes and the temp scope's jed_constraints.
+# PostgreSQL-faithful, checked by hand against PostgreSQL 18; not oracle-imported, because the
+# importer replays a file inside one rolled-back transaction (no commit ever happens) and has no
+# temp./main. qualifiers. Format: ../../../design/conformance.md.
+# requires: ddl.temp_on_commit, ddl.temp_table, ddl.foreign_key, ddl.create_table, ddl.primary_key, ddl.drop_table, txn.explicit, dml.insert, dml.insert_multi_row, dml.returning, dml.update, dml.delete, query.cte, query.cte_data_modifying, query.select, query.order_by, query.qualified_table, introspect.constraints, query.aggregates, query.where_eq, types.i32, types.text
+
+# --- a table outside the DELETE ROWS set referencing one inside it fails the commit -------------
+
+statement ok
+CREATE TEMP TABLE p (id i32 PRIMARY KEY) ON COMMIT DELETE ROWS
+
+# under autocommit the CREATE's own commit fails, so the child is never created
+statement error 0A000
+CREATE TEMP TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p)
+
+statement error 42P01
+SELECT id FROM c
+
+# in a block the COMMIT fails and discards the whole transaction, ending the block
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO p VALUES (1)
+
+statement ok
+CREATE TEMP TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p)
+
+statement ok
+INSERT INTO c VALUES (1, 1)
+
+statement error 0A000
+COMMIT
+
+statement error 42P01
+SELECT id FROM c
+
+query I nosort
+SELECT count(*) FROM p
+----
+0
+
+# truncation precedes the drops, so an ON COMMIT DROP child of a DELETE ROWS parent fails too
+statement error 0A000
+CREATE TEMP TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p) ON COMMIT DROP
+
+# ALTER TABLE ADD FOREIGN KEY reaches the same commit-time check
+statement ok
+CREATE TEMP TABLE keep (id i32 PRIMARY KEY, pid i32)
+
+statement error 0A000
+ALTER TABLE keep ADD FOREIGN KEY (pid) REFERENCES p
+
+statement ok
+INSERT INTO keep VALUES (1, 99)
+
+# --- a DELETE ROWS set that references only itself or kept tables commits ----------------------
+
+statement ok
+CREATE TEMP TABLE cd (id i32 PRIMARY KEY, pid i32 REFERENCES p) ON COMMIT DELETE ROWS
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO p VALUES (1), (2)
+
+statement ok
+INSERT INTO cd VALUES (10, 1), (20, 2)
+
+statement error 23503
+DELETE FROM p WHERE id = 2
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO p VALUES (1)
+
+statement ok
+INSERT INTO cd VALUES (10, 1)
+
+statement ok
+COMMIT
+
+query II nosort
+SELECT (SELECT count(*) FROM p), (SELECT count(*) FROM cd)
+----
+0
+0
+
+statement ok
+CREATE TEMP TABLE sr (id i32 PRIMARY KEY, parent i32 REFERENCES sr) ON COMMIT DELETE ROWS
+
+query II nosort
+INSERT INTO sr VALUES (1, NULL), (2, 1) RETURNING id, parent
+----
+1
+NULL
+2
+1
+
+query I nosort
+SELECT count(*) FROM sr
+----
+0
+
+# a DELETE ROWS child of a kept parent: its rows live only within the writing statement
+statement ok
+CREATE TEMP TABLE pp (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO pp VALUES (1)
+
+statement ok
+CREATE TEMP TABLE cpp (id i32 PRIMARY KEY, pid i32 REFERENCES pp ON DELETE CASCADE) ON COMMIT DELETE ROWS
+
+query II nosort
+WITH x AS (INSERT INTO cpp VALUES (1, 1) RETURNING id, pid) SELECT id, pid FROM x
+----
+1
+1
+
+statement error 23503
+INSERT INTO cpp VALUES (2, 9)
+
+query I nosort
+SELECT count(*) FROM cpp
+----
+0
+
+# --- ON COMMIT DROP drops as DROP TABLE ... CASCADE ----------------------------------------------
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE dp (id i32 PRIMARY KEY) ON COMMIT DROP
+
+statement ok
+CREATE TEMP TABLE dc (id i32 PRIMARY KEY, pid i32 REFERENCES dp)
+
+statement ok
+CREATE TEMP TABLE dd (id i32 PRIMARY KEY, pid i32 REFERENCES dp) ON COMMIT DROP
+
+statement ok
+INSERT INTO dp VALUES (5)
+
+statement ok
+INSERT INTO dc VALUES (1, 5)
+
+statement ok
+INSERT INTO dd VALUES (1, 5)
+
+statement ok
+COMMIT
+
+statement error 42P01
+SELECT id FROM dp
+
+statement error 42P01
+SELECT id FROM dd
+
+# the surviving child keeps its rows and has lost its FK to the dropped parent
+query II nosort
+SELECT id, pid FROM dc
+----
+1
+5
+
+statement ok
+INSERT INTO dc VALUES (2, 77)
+
+query I nosort
+SELECT count(*) FROM temp.jed_constraints WHERE table_name = 'dc'
+----
+0
+
+# --- temp./main.-qualified writes stay in their own domain --------------------------------------
+
+statement ok
+CREATE TEMP TABLE qp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE qc (id i32 PRIMARY KEY, pid i32 REFERENCES qp ON DELETE CASCADE)
+
+statement ok
+INSERT INTO temp.qp VALUES (1), (2)
+
+statement ok
+INSERT INTO temp.qc VALUES (10, 1), (20, 2)
+
+statement error 23503
+INSERT INTO temp.qc VALUES (30, 3)
+
+statement error 23503
+UPDATE temp.qc SET pid = 3 WHERE id = 10
+
+statement ok
+DELETE FROM temp.qp WHERE id = 1
+
+query II nosort
+SELECT id, pid FROM temp.qc ORDER BY id
+----
+20
+2
+
+query TTT nosort
+SELECT name, table_name, type FROM temp.jed_constraints WHERE table_name = 'qc'
+----
+qc_pid_fkey
+qc
+foreign_key
+
+statement ok
+CREATE TABLE mp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE mc (id i32 PRIMARY KEY, pid i32 REFERENCES mp ON DELETE CASCADE)
+
+statement ok
+INSERT INTO main.mp VALUES (1)
+
+statement ok
+INSERT INTO main.mc VALUES (1, 1)
+
+statement error 23503
+INSERT INTO main.mc VALUES (2, 2)
+
+statement ok
+DELETE FROM main.mp
+
+query I nosort
+SELECT count(*) FROM main.mc
+----
+0
+
+# a permanent table may not reference a temp one through a qualified ALTER either
+statement error 42P16
+ALTER TABLE main.mc ADD FOREIGN KEY (pid) REFERENCES qp

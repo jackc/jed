@@ -74,6 +74,8 @@ pub(super) struct FkDeferredCheck {
     /// The parent tuple in FK slot order, for the child-key reverse probe.
     values: Vec<Value>,
     update: bool,
+    /// The FK's domain (session-local temp or main — temp-tables.md §8).
+    temp: bool,
 }
 
 impl Engine {
@@ -1467,14 +1469,12 @@ impl Engine {
         // semantics). Unmetered validation, like the PK/UNIQUE probes, and before any write
         // (all-or-nothing). MATCH SIMPLE: a row with any NULL local column is exempt; MATCH FULL
         // exempts only an all-NULL tuple and rejects a partly-NULL one (§6.3).
-        let fks: Vec<ForeignKeyConstraint> = self
-            .table(table)
-            .map(|t| t.foreign_keys.clone())
-            .unwrap_or_default();
+        let (fks, fk_temp) = self.target_foreign_keys(db_scope, table);
         for fk in &fks {
             // The parent exists (validated at CREATE TABLE; DROP TABLE refuses to drop a
-            // referenced table — §6.10), so a consistent catalog always finds it.
-            let Some(parent) = self.table(&fk.ref_table) else {
+            // referenced table — §6.10), so a consistent catalog always finds it, in the FK's own
+            // domain (temp-tables.md §8).
+            let Some(parent) = self.fk_snap(fk_temp).table(&fk.ref_table) else {
                 continue;
             };
             // The probe must match the parent's stored key, so a collated parent key column uses
@@ -1504,7 +1504,7 @@ impl Engine {
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                self.validate_insert_fk_stored(&relation, columns, fk, &probe, row)?;
+                self.validate_insert_fk_stored(&relation, columns, fk, &probe, row, fk_temp)?;
             }
         }
 
@@ -1710,12 +1710,9 @@ impl Engine {
         }
         eval_view_checks(view_checks, &row, &env, meter)?;
 
-        for fk in self
-            .table(table)
-            .map(|t| t.foreign_keys.clone())
-            .unwrap_or_default()
-        {
-            let Some(parent) = self.table(&fk.ref_table) else {
+        let (fks, fk_temp) = self.target_foreign_keys(db_scope, table);
+        for fk in fks {
+            let Some(parent) = self.fk_snap(fk_temp).table(&fk.ref_table) else {
                 continue;
             };
             let parent_colls = self.column_collations(&parent.columns);
@@ -1735,7 +1732,7 @@ impl Engine {
             if supplied.as_deref() == Some(probe.bytes()) {
                 continue;
             }
-            self.validate_insert_fk_stored(&relation, columns, &fk, &probe, &row)?;
+            self.validate_insert_fk_stored(&relation, columns, &fk, &probe, &row, fk_temp)?;
         }
 
         let exclusions: Vec<ExclusionConstraint> = self
@@ -2256,12 +2253,9 @@ impl Engine {
             }
             ConflictActionPlan::DoNothing => HashSet::new(),
         };
-        let fks: Vec<ForeignKeyConstraint> = self
-            .table(table)
-            .map(|t| t.foreign_keys.clone())
-            .unwrap_or_default();
+        let (fks, fk_temp) = self.target_foreign_keys(db_scope, table);
         for fk in &fks {
-            let Some(parent) = self.table(&fk.ref_table) else {
+            let Some(parent) = self.fk_snap(fk_temp).table(&fk.ref_table) else {
                 continue;
             };
             // The probe matches the parent's stored key, so a collated parent key column uses the
@@ -2298,7 +2292,7 @@ impl Engine {
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                if !self.fk_probe_hits(&probe, &fk.ref_table)? {
+                if !self.fk_probe_hits(&probe, &fk.ref_table, fk_temp)? {
                     return Err(EngineError::fk_violation_insert(&relation, &fk.name)
                         .with_detail(self.fk_child_detail(&relation, columns, fk, row)));
                 }
@@ -2306,7 +2300,10 @@ impl Engine {
         }
 
         // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE.
-        let fk_parent = self.table(table).expect("insert target exists").clone();
+        let fk_parent = self
+            .table_scoped(db_scope, table)
+            .expect("insert target exists")
+            .clone();
         let fk_updates: Vec<(Vec<u8>, Vec<u8>, Row, Row)> = updates
             .iter()
             .map(|(key, new_row, old_row)| {
@@ -2444,7 +2441,7 @@ impl Engine {
             &fk_parent,
             &fk_updates,
             meter,
-            self.main_dml_target(db_scope, table),
+            self.fk_domain(db_scope, table),
         )?;
         Ok((affected, returned))
     }
@@ -2459,8 +2456,9 @@ impl Engine {
         fk: &ForeignKeyConstraint,
         probe: &FkProbe,
         row: &Row,
+        temp: bool,
     ) -> Result<()> {
-        if !self.fk_probe_hits(probe, &fk.ref_table)? {
+        if !self.fk_probe_hits(probe, &fk.ref_table, temp)? {
             return Err(EngineError::fk_violation_insert(relation, &fk.name)
                 .with_detail(self.fk_child_detail(relation, columns, fk, row)));
         }
@@ -2863,27 +2861,31 @@ impl Engine {
         meter.guard()
     }
 
-    /// Apply one inbound FK's generated DELETE-side action to `old_tuples`.
+    /// Apply one inbound FK's generated DELETE-side action to `old_tuples`. `temp` is the FK's
+    /// domain.
     fn run_fk_delete_action(
         &mut self,
         parent: &Table,
         child: &Table,
         fk: &ForeignKeyConstraint,
         old_tuples: &[Vec<Value>],
+        temp: bool,
         meter: &mut Meter,
     ) -> Result<()> {
         if old_tuples.is_empty() {
             return Ok(());
         }
         let target = FkTarget(std::sync::Arc::new(
-            self.new_fk_keyed_target(parent, fk, old_tuples, None)?,
+            self.new_fk_keyed_target(parent, fk, old_tuples, None, temp)?,
         ));
+        // The generated statement names the child in the FK's own domain (temp-tables.md §8).
+        let db = Some(if temp { "temp" } else { "main" }.to_string());
         match fk.on_delete {
             FkAction::Cascade => self.run_fk_action_delete(
                 Delete {
                     table: child.name.clone(),
                     table_pos: SrcPos::NONE,
-                    db: Some("main".to_string()),
+                    db,
                     filter: None,
                     returning: None,
                     fk_target: Some(target),
@@ -2906,7 +2908,7 @@ impl Engine {
                     Update {
                         table: child.name.clone(),
                         table_pos: SrcPos::NONE,
-                        db: Some("main".to_string()),
+                        db,
                         assignments,
                         filter: None,
                         returning: None,
@@ -2921,13 +2923,15 @@ impl Engine {
     }
 
     /// Apply one inbound FK's generated UPDATE-side action. `transitions` is the parent batch's
-    /// positional old/new referenced values, already filtered to rows whose tuple changed.
+    /// positional old/new referenced values, already filtered to rows whose tuple changed. `temp`
+    /// is the FK's domain.
     fn run_fk_update_action(
         &mut self,
         parent: &Table,
         child: &Table,
         fk: &ForeignKeyConstraint,
         transitions: &[(Vec<Value>, Vec<Value>)],
+        temp: bool,
         meter: &mut Meter,
     ) -> Result<()> {
         if transitions.is_empty() {
@@ -2967,12 +2971,13 @@ impl Engine {
             fk,
             &old_tuples,
             new_tuples.as_deref(),
+            temp,
         )?));
         self.run_fk_action_update(
             Update {
                 table: child.name.clone(),
                 table_pos: SrcPos::NONE,
-                db: Some("main".to_string()),
+                db: Some(if temp { "temp" } else { "main" }.to_string()),
                 assignments,
                 filter: None,
                 returning: None,
@@ -2988,7 +2993,7 @@ impl Engine {
     fn flush_fk_deferred_checks(&mut self, meter: &mut Meter) -> Result<()> {
         let checks = std::mem::take(&mut self.session.fk_deferred_checks);
         for check in checks {
-            if check.update && self.fk_probe_hits(&check.probe, &check.parent.name)? {
+            if check.update && self.fk_probe_hits(&check.probe, &check.parent.name, check.temp)? {
                 continue;
             }
             if self.fk_child_references(
@@ -2997,6 +3002,7 @@ impl Engine {
                 &check.parent,
                 &check.values,
                 check.probe.bytes(),
+                check.temp,
                 meter,
             )? {
                 return Err(EngineError::fk_violation_delete(
@@ -3015,12 +3021,23 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether a DML target resolves to the persistent main catalog. FKs involving temp/attached
-    /// tables are rejected at DDL; an explicit main qualifier survives a same-named temp overlap.
-    fn main_dml_target(&self, scope: Option<&str>, table: &str) -> bool {
-        match scope {
-            Some(scope) => scope == "main",
-            None => !self.is_temp_table(table),
+    /// A DML target's foreign keys and their domain (temp-tables.md §8): the table's own FKs read
+    /// from its domain snapshot, so an explicit `main`/`temp` qualifier survives a same-named
+    /// table of the other domain. An attached-database table has none.
+    fn target_foreign_keys(
+        &self,
+        scope: Option<&str>,
+        table: &str,
+    ) -> (Vec<ForeignKeyConstraint>, bool) {
+        match self.fk_domain(scope, table) {
+            None => (Vec::new(), false),
+            Some(temp) => (
+                self.fk_snap(temp)
+                    .table(table)
+                    .map(|t| t.foreign_keys.clone())
+                    .unwrap_or_default(),
+                temp,
+            ),
         }
     }
 
@@ -3032,14 +3049,15 @@ impl Engine {
         parent: &Table,
         rows: &[(Vec<u8>, Row)],
         meter: &mut Meter,
-        main_target: bool,
+        domain: Option<bool>,
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
-        if !main_target {
+        // An attached-database table has no foreign keys (attached-databases.md §8).
+        let Some(temp) = domain else {
             return Ok(());
-        }
+        };
         let root = self.session.fk_action_depth == 0;
         if root {
             assert!(
@@ -3049,14 +3067,14 @@ impl Engine {
         }
         let saved_pin = self.session.read_pin.take();
         let mut result = (|| {
-            let referencers = self.fk_referencers(&parent.name);
+            let referencers = self.fk_referencers(&parent.name, temp);
             let parent_colls = self.column_collations(&parent.columns);
             for (child_name, fk) in &referencers {
                 if matches!(fk.on_delete, FkAction::NoAction | FkAction::Restrict) {
                     continue;
                 }
                 let child = self
-                    .read_snap()
+                    .fk_snap(temp)
                     .table(child_name)
                     .expect("foreign-key child exists")
                     .clone();
@@ -3066,7 +3084,7 @@ impl Engine {
                         old_tuples.push(fk.ref_columns.iter().map(|&i| row[i].clone()).collect());
                     }
                 }
-                self.run_fk_delete_action(parent, &child, fk, &old_tuples, meter)?;
+                self.run_fk_delete_action(parent, &child, fk, &old_tuples, temp, meter)?;
             }
             for (child_name, fk) in &referencers {
                 if !matches!(fk.on_delete, FkAction::NoAction | FkAction::Restrict) {
@@ -3084,6 +3102,7 @@ impl Engine {
                         probe,
                         values: fk.ref_columns.iter().map(|&i| row[i].clone()).collect(),
                         update: false,
+                        temp,
                     });
                 }
             }
@@ -3105,14 +3124,15 @@ impl Engine {
         parent: &Table,
         updates: &[(Vec<u8>, Vec<u8>, Row, Row)],
         meter: &mut Meter,
-        main_target: bool,
+        domain: Option<bool>,
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
-        if !main_target {
+        // An attached-database table has no foreign keys (attached-databases.md §8).
+        let Some(temp) = domain else {
             return Ok(());
-        }
+        };
         let root = self.session.fk_action_depth == 0;
         if root {
             assert!(
@@ -3122,14 +3142,14 @@ impl Engine {
         }
         let saved_pin = self.session.read_pin.take();
         let mut result = (|| {
-            let referencers = self.fk_referencers(&parent.name);
+            let referencers = self.fk_referencers(&parent.name, temp);
             let parent_colls = self.column_collations(&parent.columns);
             for (child_name, fk) in &referencers {
                 if matches!(fk.on_update, FkAction::NoAction | FkAction::Restrict) {
                     continue;
                 }
                 let child = self
-                    .read_snap()
+                    .fk_snap(temp)
                     .table(child_name)
                     .expect("foreign-key child exists")
                     .clone();
@@ -3152,7 +3172,7 @@ impl Engine {
                         fk.ref_columns.iter().map(|&i| new_row[i].clone()).collect(),
                     ));
                 }
-                self.run_fk_update_action(parent, &child, fk, &transitions, meter)?;
+                self.run_fk_update_action(parent, &child, fk, &transitions, temp, meter)?;
             }
             for (child_name, fk) in &referencers {
                 if !matches!(fk.on_update, FkAction::NoAction | FkAction::Restrict) {
@@ -3178,6 +3198,7 @@ impl Engine {
                         probe: old_probe,
                         values: fk.ref_columns.iter().map(|&i| old_row[i].clone()).collect(),
                         update: true,
+                        temp,
                     });
                 }
             }
@@ -3459,7 +3480,7 @@ impl Engine {
             &fk_parent,
             &matched,
             &mut meter,
-            self.main_dml_target(del.db.as_deref(), &del.table),
+            self.fk_domain(del.db.as_deref(), &del.table),
         )?;
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {
@@ -4043,15 +4064,12 @@ impl Engine {
         // self-reference) the updated rows' new referenced values, so a row may reference a value
         // another updated row now supplies. Unmetered, phase 1, before any write.
         let assigned: HashSet<usize> = plans.iter().map(|p| p.idx).collect();
-        let fks: Vec<ForeignKeyConstraint> = self
-            .table(&upd.table)
-            .map(|t| t.foreign_keys.clone())
-            .unwrap_or_default();
+        let (fks, fk_temp) = self.target_foreign_keys(upd.db.as_deref(), &upd.table);
         for fk in &fks {
             if !fk.columns.iter().any(|c| assigned.contains(c)) {
                 continue; // this FK's local columns were not assigned
             }
-            let Some(parent) = self.table(&fk.ref_table) else {
+            let Some(parent) = self.fk_snap(fk_temp).table(&fk.ref_table) else {
                 continue;
             };
             // The probe matches the parent's stored key, so a collated parent key column uses the
@@ -4080,7 +4098,7 @@ impl Engine {
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                if !self.fk_probe_hits(&probe, &fk.ref_table)? {
+                if !self.fk_probe_hits(&probe, &fk.ref_table, fk_temp)? {
                     let columns = self.relation_columns(upd.db.as_deref(), &upd.table);
                     return Err(EngineError::fk_violation_insert(&relation, &fk.name)
                         .with_detail(self.fk_child_detail(&relation, &columns, fk, new_row)));
@@ -4219,7 +4237,7 @@ impl Engine {
             &fk_parent,
             &updates,
             &mut meter,
-            self.main_dml_target(upd.db.as_deref(), &upd.table),
+            self.fk_domain(upd.db.as_deref(), &upd.table),
         )?;
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {

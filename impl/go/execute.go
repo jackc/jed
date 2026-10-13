@@ -200,7 +200,14 @@ func (db *engine) commitTx() (outcome, error) {
 	// The temp tables' ON COMMIT actions (temp-tables.md §5.1) — DELETE ROWS empties, DROP drops — apply
 	// to the working temp snapshot first, so they commit (or are discarded) atomically with the rest of
 	// the transaction and the refinement, budget precheck, and staging below all see their result.
-	if tx.tempWorking.applyOnCommitActions() {
+	// A DELETE ROWS table referenced from outside the set fails the commit (0A000), which then discards
+	// the transaction like any other failed commit.
+	changed, err := tx.tempWorking.applyOnCommitActions()
+	if err != nil {
+		db.restoreSessionState(tx)
+		return outcome{}, err
+	}
+	if changed {
 		tx.tempDirty = true
 	}
 	// Write-store access is only a candidate mutation (transactions.md §2.1). Refine before the budget

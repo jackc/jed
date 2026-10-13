@@ -59,7 +59,7 @@ on_commit      ::= "ON" "COMMIT" ( "PRESERVE" "ROWS" | "DELETE" "ROWS" | "DROP" 
   `TABLE` is always the table name, so `CREATE TABLE temp (...)` is an ordinary persistent table named
   `temp`.
 - Two table kinds result, both sharing the existing `table_element` grammar (columns, `PRIMARY
-  KEY`, `CHECK`, `UNIQUE`, `FOREIGN KEY` — with the FK narrowing of §8):
+  KEY`, `CHECK`, `UNIQUE`, `FOREIGN KEY` — an FK stays within its kind, §8):
   - **persistent** — `CREATE TABLE` (unchanged; the only kind that touches the file).
   - **session-local temp** — `CREATE [TEMP|TEMPORARY] TABLE` — private to the creating session.
 - `DROP TABLE name` drops a temp table exactly as it drops a persistent one (it resolves through
@@ -217,9 +217,10 @@ temp table's (never-serialized) catalog entry:
   any other write. Owned `serial`/IDENTITY sequences are **not** reset, as PostgreSQL's
   commit-time truncation does not restart them; the no-PK synthetic rowid counter is not reset either
   (it is internal and monotonic, §7 of transactions.md).
-- **`DROP`** — the commit drops the table exactly as `DROP TABLE` would: its indexes and the sequences
-  it owns go with it. PostgreSQL's drop is `CASCADE`, but no jed object can depend on a temp table
-  (temp FKs and views over temp relations are `0A000`), so the cascade removes nothing else.
+- **`DROP`** — the commit drops the table exactly as `DROP TABLE … CASCADE` would (PostgreSQL's drop
+  is `CASCADE`): its indexes and the sequences it owns go with it, and a surviving temp table's
+  `FOREIGN KEY` that references it is dropped (§8). Views over temp relations are `0A000`, so nothing
+  else can depend on it.
 
 **When the actions run.** At every successful commit of a read-write transaction — `COMMIT`, an
 autocommit statement's implicit commit, a host `commit()`/`update` closure, and the implicit
@@ -256,10 +257,23 @@ behave like ordinary temp tables until `COMMIT`. A `DROP`-table's action survive
   `DefineRelation` checks `ON COMMIT`), the check runs after the `IF NOT EXISTS` skip and before any
   column or constraint is examined. A `main.`- or attachment-qualified table is not temporary (`42P16`);
   a `temp.`-qualified one is.
+- **Foreign keys** (§8) follow PostgreSQL's `heap_truncate_check_FKs`. Before any action runs, if a
+  table **outside** the `DELETE ROWS` set has an FK referencing a table **inside** it, the commit fails
+  with **`0A000`** *"unsupported ON COMMIT and foreign key combination"* (detail: *Table "c" references
+  "p", but they do not have the same ON COMMIT setting.*), and the transaction is discarded like any
+  other failed commit. A `DELETE ROWS` table may reference itself, another `DELETE ROWS` table, or any
+  other temp table; only an inbound reference from outside the set fails. Truncation precedes the
+  drops, so an `ON COMMIT DROP` table referencing a `DELETE ROWS` one fails too, although the same
+  commit would drop it — PostgreSQL's order. The check runs whether or not the tables hold rows, and
+  in practice fails the very commit that creates the combination (a `CREATE TEMP TABLE … REFERENCES`
+  or `ALTER TABLE … ADD FOREIGN KEY`), so a committed temp state never holds one; this is why running
+  the actions at every read-write commit is observably the same as PostgreSQL running them only when
+  the transaction touched a temp relation. When several pairs qualify, the error names the first
+  truncated parent and then its first outside referencing table, each in ascending name byte order;
+  PostgreSQL orders by OID (creation order), which jed does not have — a difference only in which pair
+  the detail names.
 - **Savepoints** do not exist in jed (transactions.md §11). If they land, an action must belong to
-  the subtransaction that created the table, as in PostgreSQL. Likewise, if FKs among temp tables land
-  (§14), a `DELETE ROWS` table that another table's FK references must follow PostgreSQL's
-  `heap_truncate_check_FKs` rule.
+  the subtransaction that created the table, as in PostgreSQL.
 
 ## 6. Storage model — a per-domain MemoryBlockStore that spills to a scratch file
 
@@ -447,10 +461,29 @@ Temp tables reuse the full `table_element` machinery; everything is held in the 
   exactly as a persistent column's does (another session's private session-local reference is invisible
   by design — and its self-contained `ColType` keeps working regardless). The DDL is gated by the
   temp-scoped split (§5) like any temp `CREATE TABLE`.
-- **`FOREIGN KEY` involving a temp table — `0A000` this slice (deferred).** A reference *between* a
-  temp and a persistent table is semantically fraught (a permanent table outliving the temp it points
-  at) and PG itself restricts it; jed defers all FK constraints touching a temp table in either
-  direction. FKs *among* temp tables of the same kind are a clean follow-on (§14).
+- **`FOREIGN KEY` among temp tables** — fully supported, identical semantics to persistent tables
+  (constraints.md §6): a temp table may reference another temp table of its session, or itself, via
+  `CREATE TEMP TABLE` or `ALTER TABLE … ADD [COLUMN … REFERENCES | FOREIGN KEY]`. MATCH SIMPLE/FULL,
+  the child-side `23503` at every write site, NO ACTION/RESTRICT, the CASCADE/SET NULL/SET DEFAULT
+  actions (recursive, metered exactly as in the main database), ALTER TABLE validation, and `DROP
+  TABLE`'s `2BP01`/`CASCADE` all reuse the main-database machinery. An FK never crosses databases, so
+  its child and parent live in the same **domain**: every FK lookup — the child-side parent probe, the
+  parent-side reverse match, the inbound-referencer scan, a generated action's keyed child scan —
+  reads that domain's snapshot explicitly (never the temp-first name walk), and a generated action
+  names its child with the domain's qualifier (`temp.`/`main.`). The DML target's domain is its
+  explicit `temp`/`main` qualifier or, for a bare name, the resolution walk. `DROP TABLE` scans each
+  domain's drop set for FK dependents in that domain's snapshot (the main database first). Like every
+  temp catalog fact, the FK is never serialized (no `format_version` change).
+  - **An FK never crosses between the temp domain and the main database: `42P16`** (PostgreSQL's
+    `ATAddForeignKeyConstraint`). The parent name takes the temp-first resolution walk; a temp table
+    whose parent resolves to a persistent table is *"constraints on temporary tables may reference
+    only temporary tables"*, and a persistent table whose parent resolves to a temp table is
+    *"constraints on permanent tables may reference only permanent tables"* — at `CREATE TABLE` and
+    `ALTER TABLE` alike, checked as soon as the parent resolves. A missing parent is still `42P01`.
+    PostgreSQL's third case (a temp table of *another* session) cannot arise: another session's temp
+    tables are invisible. An FK on an attached-database table stays `0A000`
+    ([attached-databases.md](attached-databases.md) §8).
+  - **`ON COMMIT`** interacts through PostgreSQL's truncation rule — §5.1.
 
 ## 9. Cost
 
@@ -479,8 +512,8 @@ bytes), the two firing independently, mirroring the depth-vs-cost independence i
 | `42P07` *(reuse)* | `CREATE [TEMP] TABLE` whose name collides with any relation in the creating scope (§3). |
 | `42P01` *(reuse)* | `DROP`/reference of a temp name that resolves to nothing (§3). |
 | `42501` *(reuse)* | temp DDL on a session without `allow_ddl` (§5). |
-| `0A000` *(reuse)* | deferred temp surface — FK touching a temp table (§8). |
-| `42P16` *(reuse)* | an `ON COMMIT` clause on a table that is not temporary (§1, §5.1). |
+| `0A000` *(reuse)* | deferred temp surface (§8); a commit whose `ON COMMIT DELETE ROWS` set is referenced by a foreign key from outside it (§5.1). |
+| `42P16` *(reuse)* | an `ON COMMIT` clause on a table that is not temporary (§1, §5.1); a foreign key between a temp and a persistent table (§8). |
 | **`54P03`** *(new)* | `temp_storage_limit_exceeded` — the temp domain's page bytes (resident or spilled) exceeded `max_temp_storage_bytes` (§7). |
 | `58030` *(reuse)* | a scratch-file I/O failure while spilling or writing a spilled temp domain (§6); the transaction commits nothing. |
 
@@ -563,7 +596,6 @@ and memory-only per the design decision:
 - **Database-wide shared temp — removed, not a follow-on.** The former `SHARED` kind (slice 2) is
   retired (Slice 0, §13); a `Database`-scoped in-memory **attachment** is its replacement
   ([attached-databases.md](attached-databases.md) §6). Not deferred — deliberately not part of temp.
-- `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.
 - A host-configurable spill directory (shared with the external sort — spill.md), so a WASI or OPFS
   host could offer a temp spill target; and migrating a shrunken spilled domain back into RAM.
 - Temporary **views** / a session-local relation namespace object beyond tables. Persistent views

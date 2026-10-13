@@ -1381,8 +1381,8 @@ func (db *engine) indexScanBoundEntries(tableName, nameKey string, suffixTypes [
 }
 
 // indexStoreBoundEntries is indexScanBoundEntries over already-resolved index and table stores, for
-// a caller that must not take the temp-first name walk (a main-scoped FK action, constraints.md
-// §6.6).
+// a caller that must not take the temp-first name walk (an FK action scoped to its own domain,
+// constraints.md §6.6).
 func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
 	// The index store has no payload columns, so its mask is empty and its fused scan contributes
 	// only the index-tree page_read count (no spill/compress units).

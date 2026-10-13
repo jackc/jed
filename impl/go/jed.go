@@ -41,8 +41,9 @@ var SupportedCapabilities = []string{
 	// preclude-overlaps (42P07), standalone CREATE INDEX / DROP INDEX (the index in the temp snapshot,
 	// gated by the same allow_temp_ddl), serial/IDENTITY columns (the OWNED sequence lives in the temp
 	// snapshot — zero file writes — and is auto-dropped with the table), and composite-typed columns
-	// (resolved against the persistent type catalog; DROP TYPE of a referenced type is 2BP01).
-	// Collated columns and FK on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
+	// (resolved against the persistent type catalog; DROP TYPE of a referenced type is 2BP01), and
+	// FOREIGN KEYs among the session's temp tables (an FK crossing to or from a persistent table is
+	// 42P16). Collated columns on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
 	// session.allow_temp_ddl; storage budget resource.temp_budget.
 	"ddl.temp_table",
 	"ddl.temp_on_commit",

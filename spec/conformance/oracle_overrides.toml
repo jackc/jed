@@ -1242,6 +1242,16 @@ file = "ddl/foreign_key_lazy_child.test"
 sql = "UPDATE codes SET code='orphan' WHERE id=1"
 reason = "jed: NO ACTION and RESTRICT share final action-closure validation and its 23503 error; PostgreSQL 18 raises 23001 for RESTRICT. The single validation/error path is the documented simplification in constraints.md §6.7."
 
+[[override]]
+file = "ddl/temp_foreign_key.test"
+sql = "DELETE FROM rp"
+reason = "jed: NO ACTION and RESTRICT share final action-closure validation and its 23503 error, among temp tables as among main-database tables; PostgreSQL 18 raises 23001 for RESTRICT. The single validation/error path is the documented simplification in constraints.md §6.7."
+
+[[override]]
+file = "ddl/temp_foreign_key.test"
+sql = "UPDATE rp SET id = 2"
+reason = "jed: NO ACTION and RESTRICT share final action-closure validation and its 23503 error, among temp tables as among main-database tables; PostgreSQL 18 raises 23001 for RESTRICT. The single validation/error path is the documented simplification in constraints.md §6.7."
+
 # --- type unification (setops/unify_types.test, grammar.md §25): a pair with no common type is
 # 42804 in jed where PostgreSQL reports 42846 for a same-category unconvertible pair; and jed
 # unifies array elements only across integer widths (no per-element int -> decimal rewrite).

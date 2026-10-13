@@ -1663,14 +1663,45 @@ impl Engine {
         self.working_mut().index_store_mut(name_key)
     }
 
+    /// The snapshot a foreign key's tables live in (spec/design/temp-tables.md §8): an FK never
+    /// crosses databases, so both its child and parent are in the session-local temp domain
+    /// (`temp`) or both in the main database. Explicit, so a same-named table of the other domain
+    /// can never capture an FK lookup.
+    pub(crate) fn fk_snap(&self, temp: bool) -> &Snapshot {
+        if temp {
+            self.temp_read_snap()
+        } else {
+            self.read_snap()
+        }
+    }
+
+    /// The FK domain of a DML target (temp-tables.md §8): `Some(true)` for a session-local temp
+    /// table, `Some(false)` for a main-database table, `None` for an attached database, whose
+    /// tables have no foreign keys. An explicit `main`/`temp` qualifier survives a same-named
+    /// table in the other domain; a bare name takes the temp-first resolution walk.
+    pub(crate) fn fk_domain(&self, scope: Option<&str>, table: &str) -> Option<bool> {
+        match scope.map(str::to_string).as_deref() {
+            None => Some(self.is_temp_table(table)),
+            Some("temp") => Some(true),
+            Some("main") => Some(false),
+            Some(_) => None,
+        }
+    }
+
     /// Whether the parent currently holds the key/prefix `probe` (committed + working state) — the
     /// child-side foreign-key existence test (spec/design/constraints.md §6.4). `parent_table` is
-    /// the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
-    pub(crate) fn fk_probe_hits(&self, probe: &FkProbe, parent_table: &str) -> Result<bool> {
+    /// the referenced table's name, in the FK's domain (`temp`). Unmetered, like the PK/UNIQUE
+    /// probes (cost.md §3).
+    pub(crate) fn fk_probe_hits(
+        &self,
+        probe: &FkProbe,
+        parent_table: &str,
+        temp: bool,
+    ) -> Result<bool> {
         match probe {
-            FkProbe::Pk(key) => Ok(self.read_snap().store(parent_table).get(key)?.is_some()),
+            FkProbe::Pk(key) => Ok(self.fk_snap(temp).store(parent_table).get(key)?.is_some()),
             FkProbe::Unique { index, prefix } => Ok(!self
-                .read_snap()
+                .fk_snap(temp)
                 .index_store(index)
                 .range_entries(&unique_probe_bound(prefix))?
                 .is_empty()),
@@ -1684,6 +1715,8 @@ impl Engine {
     /// child PK/index is probed for the prefix; otherwise the child is scanned in storage-key order
     /// (MATCH SIMPLE: a child row with any NULL FK column references nothing). Metered and guarded
     /// before the work it pays for (constraints.md §6.11, cost.md §3 "Foreign-key reverse match").
+    /// `temp` is the FK's domain ([`fk_snap`](Engine::fk_snap)).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fk_child_references(
         &self,
         child_table: &str,
@@ -1691,9 +1724,10 @@ impl Engine {
         parent: &Table,
         values: &[Value],
         target: &[u8],
+        temp: bool,
         meter: &mut Meter,
     ) -> Result<bool> {
-        let snap = self.read_snap();
+        let snap = self.fk_snap(temp);
         let child = snap.table(child_table).expect("foreign-key child exists");
         let store = snap.store(child_table);
         if let Some(path) = fk_choose_reverse_path(snap, fk, child, parent) {
@@ -1744,15 +1778,17 @@ impl Engine {
     /// Build a generated referential action's keyed target (constraints.md §6.6): de-duplicate
     /// `old` by parent-space probe bytes, pairing each kept tuple with its new tuple when `next` is
     /// given (ON UPDATE CASCADE). Every tuple is complete (non-NULL) — the callers drop MATCH
-    /// SIMPLE-exempt parent rows.
+    /// SIMPLE-exempt parent rows. `temp` is the FK's domain, where the action's child lives.
     pub(crate) fn new_fk_keyed_target(
         &self,
         parent: &Table,
         fk: &ForeignKeyConstraint,
         old: &[Vec<Value>],
         next: Option<&[Vec<Value>]>,
+        temp: bool,
     ) -> Result<FkKeyedTarget> {
         let mut t = FkKeyedTarget {
+            temp,
             parent: parent.clone(),
             parent_colls: self.column_collations(&parent.columns),
             fk: fk.clone(),
@@ -1790,7 +1826,7 @@ impl Engine {
         child_table: &str,
         mask: &[bool],
     ) -> Result<MutationScanBatch> {
-        let snap = self.read_snap();
+        let snap = self.fk_snap(t.temp);
         let child = snap.table(child_table).expect("foreign-key child exists");
         let store = snap.store(child_table);
         let Some(path) = fk_choose_reverse_path(snap, &t.fk, child, &t.parent) else {
@@ -1833,8 +1869,8 @@ impl Engine {
             let (entries, pages, slabs) = match &path.index {
                 None => store.range_scan_with_units(&bound, mask)?,
                 Some(name) => {
-                    // Both stores come from the main snapshot: a session-local temp table
-                    // shadowing the child's name must not capture the lookups (§6.6).
+                    // Both stores come from the FK's own domain snapshot: a same-named table
+                    // of the other domain must not capture the lookups (§6.6).
                     let (entries, (pages, slabs)) = index_store_bound_entries(
                         snap.index_store(name),
                         store,
@@ -1858,12 +1894,17 @@ impl Engine {
         Ok(out)
     }
 
-    /// Every (child table name, FK) pair in the visible snapshot whose FK references `parent_name`
-    /// (exact name), including a self-reference — the inbound FKs a parent DELETE/UPDATE must
-    /// not strand (spec/design/constraints.md §6.5). Sorted by (child table name, FK name) for
-    /// a deterministic report order; cloned so the caller can probe stores without a snapshot borrow.
-    pub(crate) fn fk_referencers(&self, parent_name: &str) -> Vec<(String, ForeignKeyConstraint)> {
-        let snap = self.read_snap();
+    /// Every (child table name, FK) pair in the parent's domain snapshot (`temp`) whose FK
+    /// references `parent_name` (exact name), including a self-reference — the inbound FKs a
+    /// parent DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (child
+    /// table name, FK name) for a deterministic report order; cloned so the caller can probe
+    /// stores without a snapshot borrow.
+    pub(crate) fn fk_referencers(
+        &self,
+        parent_name: &str,
+        temp: bool,
+    ) -> Vec<(String, ForeignKeyConstraint)> {
+        let snap = self.fk_snap(temp);
         let key = parent_name.to_string();
         let mut out: Vec<(String, ForeignKeyConstraint)> = Vec::new();
         let mut tkeys: Vec<&String> = snap.tables.keys().collect();
@@ -1924,6 +1965,8 @@ impl Engine {
 /// old parent tuples (FK slot order), keyed by their parent-space probe bytes. For ON UPDATE
 /// CASCADE, `next[i]` is `tuples[i]`'s new tuple; `None` for DELETE / SET NULL / SET DEFAULT.
 pub(crate) struct FkKeyedTarget {
+    /// The FK's domain: the child (and parent) are session-local temp tables (temp-tables.md §8).
+    pub(crate) temp: bool,
     pub(crate) parent: Table,
     pub(crate) parent_colls: Vec<Option<std::sync::Arc<Collation>>>,
     pub(crate) fk: ForeignKeyConstraint,
