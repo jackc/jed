@@ -4,7 +4,7 @@
 # each object member a `.key` lookup examines, and each comparison pair tested, plus a SQL
 # comparison's size extra. The query function still charges one operator_eval per result item.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, query.aggregates, func.json_agg, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.json_query_fns, func.json_table, types.i32, resource.cost_metering, resource.cost_limit, expr.jsonpath_arith, expr.jsonpath_vars
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, query.aggregates, func.json_agg, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.json_query_fns, func.json_table, types.i32, resource.cost_metering, resource.cost_limit, expr.jsonpath_arith, expr.jsonpath_vars, expr.jsonpath_predicates, expr.jsonpath_any
 
 statement ok
 CREATE TABLE d (id i32 PRIMARY KEY, j jsonb)
@@ -179,3 +179,72 @@ query T nosort
 SELECT JSON_VALUE(j, '$.a[0] + $n' PASSING id AS n) FROM d
 ----
 2
+
+# starts with tests one pair against the literal: 1, plus varlen_compare for the shorter length
+# beyond one code point (2 - 1 = 1). `$."s"?(@ starts with "ab")` is 26 bytes; `.s` examines 3
+# members.
+# cost: 40
+query B nosort
+SELECT jsonb_path_exists(j, '$.s ? (@ starts with "ab")') FROM d
+----
+true
+
+# like_regex tests one item (1) plus its regex_step units, and compiling the path charges the
+# pattern's 7 instructions as regex_compile.
+# cost: 60
+query B nosort
+SELECT jsonb_path_exists(j, '$.s ? (@ like_regex "b")') FROM d
+----
+true
+
+# A non-string item is unknown without running the regex: 3 items tested, no regex_step.
+# cost: 44
+query B nosort
+SELECT jsonb_path_exists(j, '$.a ? (@ like_regex "b")') FROM d
+----
+false
+
+# exists charges only its operand's steps; a lax test stops at the operand's first item, so `[*]`
+# emits one element of three.
+# cost: 27
+query B nosort
+SELECT jsonb_path_match(j, 'exists($.a[*])') FROM d
+----
+true
+
+# strict exists evaluates the whole operand: all three elements are emitted.
+# cost: 36
+query B nosort
+SELECT jsonb_path_match(j, 'strict exists($.a[*])') FROM d
+----
+true
+
+# is unknown charges nothing beyond its predicate.
+# cost: 33
+query B nosort
+SELECT jsonb_path_match(j, '($.s > 1) is unknown') FROM d
+----
+true
+
+# .** applies once (1), visits each of the 7 descendants (7), and emits the item and its 7
+# descendants (8).
+# cost: 40
+query I nosort
+SELECT count(*) FROM jsonb_path_query((SELECT j FROM d), '$.**')
+----
+8
+
+# Bounded levels still visit every descendant down to the last level but emit only those in range:
+# {1} visits the 3 children and emits them.
+# cost: 24
+query I nosort
+SELECT count(*) FROM jsonb_path_query((SELECT j FROM d), '$.**{1}')
+----
+3
+
+# A lax existence test stops at the first item `.**` emits.
+# cost: 11
+query B nosort
+SELECT jsonb_path_exists(j, '$.**') FROM d
+----
+true

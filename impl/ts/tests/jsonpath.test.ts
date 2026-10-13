@@ -1,19 +1,18 @@
 // The `jsonpath` type (spec/design/jsonpath.md) — the per-core checks the conformance corpus cannot
-// express (CLAUDE.md §10): the deliberate PG divergences (the deferred constructs are 0A000, where PG
-// compiles them; a jsonpath is non-comparable / a jsonpath column is 0A000; an item method reads a
-// string with jed's own number grammar). The agreeing behavior (the canonical render, malformed →
+// express (CLAUDE.md §10): the deliberate PG divergences (the unsupported constructs are 0A000 and
+// ARE-only like_regex patterns 2201B, where PG compiles them; a jsonpath is non-comparable / a
+// jsonpath column is 0A000; an item method reads a string with jed's own number grammar). The agreeing behavior (the canonical render, malformed →
 // 42601, the item methods) is oracle-clean in suites/json/jsonpath_literal.test and
 // jsonpath_methods.test. Mirrors impl/rust/tests/jsonpath.rs.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dbWith, errCode } from "./util.ts";
+import { dbWith, errCode, query } from "./util.ts";
 
-// The still-deferred path-expression constructs — the datetime item methods, like_regex / starts
-// with / is unknown / exists predicates, .** — are a 0A000 at compile. PostgreSQL
-// compiles them, so each is a documented divergence; the supported subset is oracle-clean in
-// suites/json/jsonpath_literal.test, jsonpath_query.test, and jsonpath_methods.test.
-test("jsonpath P1b constructs are 0A000", () => {
+// The datetime item methods are 0A000 at compile, by decision (jsonpath.md §3.1), and so is the
+// like_regex `m` flag (jsonpath.md §4.3) unless `q` makes it moot. PostgreSQL compiles them, so each
+// is a documented divergence; the supported surface is oracle-clean in suites/json/.
+test("jsonpath unsupported constructs are 0A000", () => {
   const db = dbWith([]);
   for (const path of [
     "$.a.datetime()", // a datetime item method
@@ -23,41 +22,56 @@ test("jsonpath P1b constructs are 0A000", () => {
     "$.a.time_tz()",
     "$.a.timestamp()",
     "$.a.timestamp_tz(2)",
-    '$.a like_regex "x"', // a like_regex top-level predicate
-    '$.a starts with "x"', // a starts-with top-level predicate
-    "($.a == 1) is unknown", // an is-unknown predicate
-    "$ ? (exists (@.a))", // an exists predicate
-    "$.**", // the any-level accessor
+    '$ ? (@ like_regex "^a" flag "m")', // the multi-line flag
+    '$ ? (@ like_regex "^a" flag "ims")',
   ]) {
     assert.equal(
       errCode(() => db.execute(`SELECT '${path}'::jsonpath`)),
       "0A000",
-      `path \`${path}\` should defer 0A000`,
+      `path \`${path}\` should be 0A000`,
+    );
+  }
+  // Under `q` the pattern is a literal and `m` is ignored, as XQuery specifies.
+  assert.deepStrictEqual(
+    query(db, `SELECT jsonb_path_exists('"a^b"', '$ ? (@ like_regex "^b" flag "mq")')`),
+    [["true"]],
+  );
+});
+
+// A like_regex pattern is jed's regex subset (regex.md §2), not PostgreSQL's ARE: a construct only
+// ARE has is 2201B when the path compiles, where PostgreSQL accepts it (jsonpath.md §4.3).
+test("jsonpath like_regex subset", () => {
+  const db = dbWith([]);
+  for (const pattern of ["\\\\y", "\\\\u0041", "(?i)a", "a\\\\b"]) {
+    assert.equal(
+      errCode(() => db.execute(`SELECT '$ ? (@ like_regex "${pattern}")'::jsonpath`)),
+      "2201B",
+      `like_regex ${pattern} should be 2201B`,
     );
   }
 });
 
-// A jsonpath using a STILL-deferred construct (a datetime method, like_regex) is 0A000 — it fails to
-// compile. PostgreSQL evaluates these, so each is a documented divergence; the supported filter +
-// query + match + method behavior is oracle-clean in suites/json/jsonpath_query.test and
-// jsonpath_methods.test.
+// A jsonpath using a datetime method is 0A000 — it fails to compile. PostgreSQL evaluates it, so it
+// is a documented divergence (jsonpath.md §3.1).
 test("jsonpath deferred constructs are 0A000", () => {
   const db = dbWith([]);
-  // A datetime item method.
   assert.equal(
     errCode(() => db.execute(`SELECT jsonb_path_query_array('["2020-01-01"]', '$[*].datetime()')`)),
     "0A000",
   );
-  // like_regex inside a filter (a non-comparison predicate).
-  assert.equal(
-    errCode(() => db.execute(`SELECT jsonb_path_exists('["x"]', '$[*] ? (@ like_regex "x")')`)),
-    "0A000",
-  );
-  // like_regex as a top-level predicate.
-  assert.equal(
-    errCode(() => db.execute(`SELECT jsonb_path_match('["x"]', '$ like_regex "x"')`)),
-    "0A000",
-  );
+});
+
+// A `.**` level is an integer literal without PostgreSQL 16+'s `_` separators and radix prefixes, as
+// for jsonpath numbers (jsonpath.md §2): 42601 where PostgreSQL accepts them.
+test("jsonpath any-level literal", () => {
+  const db = dbWith([]);
+  for (const path of ["$.**{1_000}", "$.**{0x10}", "$.**{2 to 0b11}"]) {
+    assert.equal(
+      errCode(() => db.execute(`SELECT '${path}'::jsonpath`)),
+      "42601",
+      `${path} should be 42601`,
+    );
+  }
 });
 
 // A `jsonpath` value is NOT comparable — every comparison / ORDER BY is 42883 (PG ships no opclass).

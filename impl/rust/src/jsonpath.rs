@@ -1,15 +1,14 @@
 //! The `jsonpath` type's compiler, canonical renderer, and evaluator (spec/design/jsonpath.md).
 //!
 //! The compiled surface: lax/strict mode; a primary (`$`, `@` inside a filter, a scalar literal,
-//! `last` inside a subscript, or a parenthesized expression or predicate) followed by accessor steps
-//! (`.key`, `.*`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the item
-//! methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
-//! Path variables (`$name`, `$"name"`) are bound by the caller's [`Vars`]. Still deferred (a valid-PG
-//! path using one → `0A000` at compile): `like_regex` / `starts with` / `is unknown` / `exists`
-//! predicates and `.**`. The datetime methods are `0A000` by decision (jsonpath.md §3.1). A
-//! malformed path is `42601`. The compiled program is a pure function of the source — kept
-//! byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
-//! codegenned).
+//! `last` inside a subscript, or a parenthesized expression or predicate) followed by accessor
+//! steps (`.key`, `.*`, `.**`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`,
+//! and the item methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level
+//! predicate (comparison, `exists`, `like_regex`, `starts with`, `is unknown`, §4.4). Path
+//! variables (`$name`, `$"name"`) are bound by the caller's [`Vars`]. The datetime methods and the
+//! `like_regex` `m` flag are `0A000` (jsonpath.md §3.1, §4.3). A malformed path is `42601`. The
+//! compiled program is a pure function of the source — kept byte-identical cross-core by the
+//! conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
 
 use crate::cost::Meter;
 use crate::costs::COSTS;
@@ -27,6 +26,9 @@ use std::rc::Rc;
 pub struct JsonPath {
     pub strict: bool,
     pub body: PathBody,
+    /// The instruction count of every `like_regex` program in the path, which a metered compile
+    /// charges as `regex_compile` (jsonpath.md §7).
+    regex_insts: i64,
 }
 
 /// A jsonpath body: an accessor path (produces a sequence) or a top-level boolean predicate
@@ -123,7 +125,13 @@ pub enum Step {
     Filter(Box<Pred>),
     /// `.name(…)` — an item method (§3.1).
     Method(Method),
+    /// `.**{first to last}` — the item and its descendants within the level bounds (§3.3); a bound
+    /// of `last` is [`LEVEL_LAST`].
+    Any { first: u32, last: u32 },
 }
+
+/// A `.**` level bound of `last`: PostgreSQL stores it as the largest `uint32`.
+pub const LEVEL_LAST: u32 = u32::MAX;
 
 /// An item method (jsonpath.md §3.1). The datetime family is not supported (`0A000`), by decision.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -174,7 +182,42 @@ pub enum Pred {
     Not(Box<Pred>),
     /// `lhs cmp rhs` — an existential comparison (true if SOME pair of items compares true).
     Compare(PathExpr, CmpOp, PathExpr),
+    /// `exists (e)` — `e`'s sequence is non-empty.
+    Exists(PathExpr),
+    /// `(p) is unknown`.
+    IsUnknown(Box<Pred>),
+    /// `lhs starts with rhs` — `rhs` a string literal or a variable.
+    StartsWith(PathExpr, PathExpr),
+    /// `lhs like_regex "pattern" flag "flags"`.
+    LikeRegex(PathExpr, Box<LikeRegex>),
 }
+
+/// A `like_regex` predicate's pattern as written, its flag bits, and its compiled program.
+#[derive(Clone, Debug)]
+pub struct LikeRegex {
+    pub pattern: String,
+    pub flags: u8,
+    program: Rc<crate::regex::Program>,
+}
+
+/// The program is a pure function of the pattern and flags, so they decide equality.
+impl PartialEq for LikeRegex {
+    fn eq(&self, other: &LikeRegex) -> bool {
+        self.pattern == other.pattern && self.flags == other.flags
+    }
+}
+
+impl Eq for LikeRegex {}
+
+/// `like_regex` flag bits, in PostgreSQL's print order (jsonpath.md §2.3).
+const REGEX_I: u8 = 1 << 0;
+const REGEX_S: u8 = 1 << 1;
+const REGEX_M: u8 = 1 << 2;
+const REGEX_X: u8 = 1 << 3;
+const REGEX_Q: u8 = 1 << 4;
+
+/// The flag characters in bit order.
+const REGEX_FLAG_CHARS: &[u8; 5] = b"ismxq";
 
 /// A jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -236,6 +279,7 @@ impl JsonPath {
             depth: 0,
             in_filter: 0,
             in_subscript: 0,
+            regex_insts: 0,
         };
         p.skip_ws()?;
         // Nothing but whitespace and comments: PostgreSQL's grammar yields no path, `22P02`.
@@ -256,13 +300,17 @@ impl JsonPath {
         // (`$.a == 1`, for jsonb_path_match / @@) — PostgreSQL's `expr_or_predicate`.
         let body = match p.parse_or()? {
             Parsed::Expr(e) => PathBody::Path(e),
-            Parsed::Pred(pred) => PathBody::Predicate(Box::new(pred)),
+            Parsed::Pred(pred) | Parsed::ParenPred(pred) => PathBody::Predicate(Box::new(pred)),
         };
         p.skip_ws()?;
         if p.peek().is_some() {
             return Err(malformed("unexpected trailing input"));
         }
-        Ok(JsonPath { strict, body })
+        Ok(JsonPath {
+            strict,
+            body,
+            regex_insts: p.regex_insts,
+        })
     }
 
     /// The canonical render (spec/design/jsonpath.md §2.2): `strict` kept / `lax` omitted; member
@@ -298,8 +346,8 @@ fn pred_priority(pred: &Pred) -> u8 {
     match pred {
         Pred::Or(..) => 0,
         Pred::And(..) => 1,
-        Pred::Compare(..) => 2,
-        Pred::Not(_) => 6,
+        Pred::Compare(..) | Pred::StartsWith(..) => 2,
+        Pred::Not(_) | Pred::Exists(_) | Pred::IsUnknown(_) | Pred::LikeRegex(..) => 6,
     }
 }
 
@@ -350,7 +398,17 @@ fn write_expr(e: &PathExpr, brackets: bool, out: &mut String) {
                 out.push(')');
             }
         }
-        Primary::Pred(pred) => write_pred(pred, brackets, out),
+        // A predicate that prints without its own brackets (`!(…)`, `exists (…)`, `(…) is unknown`)
+        // keeps the parentheses that make it an operand of the accessors after it (jsonpath.md
+        // §2.3).
+        Primary::Pred(pred) => match **pred {
+            Pred::Not(_) | Pred::Exists(_) | Pred::IsUnknown(_) => {
+                out.push('(');
+                write_pred(pred, false, out);
+                out.push(')');
+            }
+            _ => write_pred(pred, brackets, out),
+        },
     }
     write_steps(&e.steps, out);
 }
@@ -402,7 +460,29 @@ fn write_steps(steps: &[Step], out: &mut String) {
                 }
                 out.push(')');
             }
+            Step::Any { first, last } => write_any_levels(*first, *last, out),
         }
+    }
+}
+
+/// Render a `.**` step as PostgreSQL's `printJsonPathItem` does: `{0 to last}` is bare, equal
+/// bounds print once.
+fn write_any_levels(first: u32, last: u32, out: &mut String) {
+    let level = |v: u32| {
+        if v == LEVEL_LAST {
+            "last".to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    out.push_str(".**");
+    if first == 0 && last == LEVEL_LAST {
+        return;
+    }
+    if first == last {
+        out.push_str(&format!("{{{}}}", level(first)));
+    } else {
+        out.push_str(&format!("{{{} to {}}}", level(first), level(last)));
     }
 }
 
@@ -443,6 +523,49 @@ fn write_pred(pred: &Pred, brackets: bool, out: &mut String) {
             });
             out.push(' ');
             write_expr(r, expr_priority(r) <= 2, out);
+            if brackets {
+                out.push(')');
+            }
+        }
+        Pred::Exists(e) => {
+            out.push_str("exists (");
+            write_expr(e, false, out);
+            out.push(')');
+        }
+        Pred::IsUnknown(p) => {
+            out.push('(');
+            write_pred(p, false, out);
+            out.push_str(") is unknown");
+        }
+        Pred::StartsWith(l, r) => {
+            if brackets {
+                out.push('(');
+            }
+            write_expr(l, expr_priority(l) <= 2, out);
+            out.push_str(" starts with ");
+            write_expr(r, expr_priority(r) <= 2, out);
+            if brackets {
+                out.push(')');
+            }
+        }
+        Pred::LikeRegex(l, re) => {
+            // PostgreSQL brackets the operand by priority against like_regex's 6, so an operator
+            // operand is always wrapped.
+            if brackets {
+                out.push('(');
+            }
+            write_expr(l, true, out);
+            out.push_str(" like_regex ");
+            write_quoted(&re.pattern, out);
+            if re.flags != 0 {
+                out.push_str(" flag \"");
+                for (i, &c) in REGEX_FLAG_CHARS.iter().enumerate() {
+                    if re.flags & (1 << i) != 0 {
+                        out.push(c as char);
+                    }
+                }
+                out.push('"');
+            }
             if brackets {
                 out.push(')');
             }
@@ -541,7 +664,11 @@ pub fn compile_metered(src: &str, m: &mut Meter) -> Result<JsonPath> {
     m.guard()?;
     // The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
     // `compile` at resolve.
-    JsonPath::parse(src)
+    let path = JsonPath::parse(src)?;
+    // Each like_regex pattern was compiled with the path (jsonpath.md §7).
+    m.charge(COSTS.regex_compile * path.regex_insts);
+    m.guard()?;
+    Ok(path)
 }
 
 /// Evaluate a compiled path over a jsonb context item → the ordered SQL/JSON sequence
@@ -592,6 +719,7 @@ fn eval_items<'d>(
         root: ctx,
         vars: opts.vars,
         strict: path.strict,
+        ignore: false,
         m,
         next_gen: 1 + opts.vars.count(),
         offsets: HashMap::new(),
@@ -701,6 +829,9 @@ struct Ctx<'d, 'm> {
     root: &'d JsonNode,
     vars: Vars<'d>,
     strict: bool,
+    /// Suppresses navigation errors while the rest of a path below `.**` runs, in either mode
+    /// (jsonpath.md §3.3) — PostgreSQL's `ignoreStructuralErrors`, which lax always sets.
+    ignore: bool,
     m: &'m mut Meter,
     /// The next `.keyvalue()` object number, assigned in evaluation order.
     next_gen: i64,
@@ -717,6 +848,11 @@ impl Ctx<'_, '_> {
     fn charge(&mut self, n: i64) -> Result<()> {
         self.m.charge(COSTS.jsonpath_step * n);
         self.m.guard()
+    }
+
+    /// Whether a navigation failure raises: strict, and not below a `.**` (§3.3, §4.2).
+    fn structural(&self) -> bool {
+        self.strict && !self.ignore
     }
 }
 
@@ -745,6 +881,18 @@ struct Frame<'d> {
     last: Option<i64>,
     /// A subscript step's array size: its own outputs' `last`.
     size: i64,
+    /// This frame runs below a `.**`, suppressing navigation errors (§3.3).
+    ignore: bool,
+    /// A `.**` step's descent: the containers being walked, innermost last.
+    walk: Vec<AnyWalk<'d>>,
+}
+
+/// One container a `.**` step is walking: its children are at `level`, and `next` is the next
+/// child's position.
+struct AnyWalk<'d> {
+    item: Item<'d>,
+    level: u32,
+    next: usize,
 }
 
 impl<'d> Frame<'d> {
@@ -754,6 +902,7 @@ impl<'d> Frame<'d> {
         base: Base<'d>,
         unwrap: bool,
         last: Option<i64>,
+        ignore: bool,
     ) -> Frame<'d> {
         Frame {
             step,
@@ -767,6 +916,8 @@ impl<'d> Frame<'d> {
             kv_id: 0,
             last,
             size: 0,
+            ignore,
+            walk: Vec::new(),
         }
     }
 }
@@ -815,11 +966,17 @@ fn run_expr<'d>(
                     return Ok(());
                 }
             } else {
-                stack.push(Frame::new(0, item, item_base, unwrap, last));
+                stack.push(Frame::new(0, item, item_base, unwrap, last, cx.ignore));
             }
             continue;
         };
-        match next_out(cx, steps, current, top)? {
+        // The frame's step runs with its own suppression of navigation errors, which reaches any
+        // filter operand it evaluates (§3.3).
+        let saved = cx.ignore;
+        cx.ignore = top.ignore;
+        let produced = next_out(cx, steps, current, top);
+        cx.ignore = saved;
+        match produced? {
             Out::Item(item, base) => {
                 let next = top.step + 1;
                 if next == steps.len() {
@@ -834,7 +991,10 @@ fn run_expr<'d>(
                         Step::Subscripts(_) => Some(top.size),
                         _ => top.last,
                     };
-                    stack.push(Frame::new(next, item, base, unwrap, last));
+                    // Every item a `.**` emits runs the rest of the path with navigation errors
+                    // suppressed.
+                    let ignore = top.ignore || matches!(steps[top.step], Step::Any { .. });
+                    stack.push(Frame::new(next, item, base, unwrap, last, ignore));
                 }
             }
             Out::Sub(frame) => stack.push(frame),
@@ -1020,7 +1180,7 @@ fn not_single_numeric(side: &str, op: ArithOp) -> EngineError {
 fn unwraps(step: &Step) -> bool {
     match step {
         Step::Member(_) | Step::WildcardMember | Step::Filter(_) => true,
-        Step::Subscripts(_) | Step::WildcardElement => false,
+        Step::Subscripts(_) | Step::WildcardElement | Step::Any { .. } => false,
         Step::Method(m) => !matches!(m, Method::Type | Method::Size),
     }
 }
@@ -1048,6 +1208,7 @@ fn next_out<'d>(
                 f.base.clone(),
                 false,
                 f.last,
+                f.ignore,
             )));
         }
         return Ok(Out::Done);
@@ -1067,7 +1228,7 @@ fn next_out<'d>(
                 f.started = true;
                 cx.charge(1)?;
                 if f.item.type_name() != "object" {
-                    if strict {
+                    if cx.structural() {
                         return Err(EngineError::new(
                             SqlState::SqlJsonObjectNotFound,
                             "jsonpath wildcard member accessor can only be applied to an object",
@@ -1089,10 +1250,14 @@ fn next_out<'d>(
                 f.started = true;
                 cx.charge(1)?;
                 if strict && !matches!(f.item.doc(), Some(JsonNode::Array(_))) {
-                    return Err(EngineError::new(
-                        SqlState::SqlJsonArrayNotFound,
-                        "jsonpath array accessor can only be applied to an array",
-                    ));
+                    if cx.structural() {
+                        return Err(EngineError::new(
+                            SqlState::SqlJsonArrayNotFound,
+                            "jsonpath array accessor can only be applied to an array",
+                        ));
+                    }
+                    // Strict below `.**`: no singleton, no item (§3.3).
+                    return Ok(Out::Done);
                 }
             }
             // A non-array is a singleton array in lax (§4.1 rule 2).
@@ -1132,11 +1297,15 @@ fn next_out<'d>(
                 f.started = true;
                 cx.charge(1)?;
                 if !matches!(f.item.doc(), Some(JsonNode::Array(_))) {
-                    if strict {
+                    if cx.structural() {
                         return Err(EngineError::new(
                             SqlState::SqlJsonArrayNotFound,
                             "jsonpath wildcard array accessor can only be applied to an array",
                         ));
+                    }
+                    if strict {
+                        // Strict below `.**`: no singleton, no item (§3.3).
+                        return Ok(Out::Done);
                     }
                     // lax: the item is a singleton array.
                     f.a = 1;
@@ -1201,12 +1370,21 @@ fn next_out<'d>(
             cx.charge(1)?;
             return Ok(Out::Item(Item::Kv(kv.clone()), Base::Kv(kv)));
         }
+        Step::Any { first, last } => return next_any(cx, *first, *last, f),
         Step::Method(method) => {
             if f.started {
                 return Ok(Out::Done);
             }
             f.started = true;
             cx.charge(1)?;
+            if matches!(method, Method::Size)
+                && strict
+                && !cx.structural()
+                && !matches!(f.item.doc(), Some(JsonNode::Array(_)))
+            {
+                // Strict `.size()` of a non-array below `.**`: no item (§3.3).
+                return Ok(Out::Done);
+            }
             Some(apply_method(method, &f.item, strict)?)
         }
     };
@@ -1216,6 +1394,70 @@ fn next_out<'d>(
             Ok(Out::Item(item, f.base.clone()))
         }
         None => Ok(Out::Done),
+    }
+}
+
+/// Produce a `.**` frame's next output (jsonpath.md §3.3): the item itself when the first level is
+/// 0, then its descendants in preorder — a child is emitted (when its level is in bounds) before
+/// the walk descends into it. Applying the step charges 1, each descendant visited 1, and each
+/// emitted item 1 (§7 rule 8).
+fn next_any<'d>(cx: &mut Ctx<'d, '_>, first: u32, last: u32, f: &mut Frame<'d>) -> Result<Out<'d>> {
+    if !f.started {
+        f.started = true;
+        cx.charge(1)?;
+        if last >= 1 && is_container(&f.item) {
+            f.walk.push(AnyWalk {
+                item: f.item.clone(),
+                level: 1,
+                next: 0,
+            });
+        }
+        if first == 0 {
+            cx.charge(1)?;
+            return Ok(Out::Item(f.item.clone(), f.base.clone()));
+        }
+    }
+    while let Some(top) = f.walk.last_mut() {
+        let Some(child) = child_at(&top.item, top.next) else {
+            f.walk.pop();
+            continue;
+        };
+        top.next += 1;
+        let level = top.level;
+        cx.charge(1)?;
+        let container = is_container(&child);
+        if level < last && container {
+            f.walk.push(AnyWalk {
+                item: child.clone(),
+                level: level + 1,
+                next: 0,
+            });
+        }
+        // `{last}` (both bounds the largest level) is PostgreSQL's leaves-only walk.
+        if level >= first || (first == LEVEL_LAST && last == LEVEL_LAST && !container) {
+            cx.charge(1)?;
+            return Ok(Out::Item(child, f.base.clone()));
+        }
+    }
+    Ok(Out::Done)
+}
+
+/// Whether an item has children for `.**`: a document array or object, or a `.keyvalue()` object.
+fn is_container(item: &Item<'_>) -> bool {
+    matches!(
+        item,
+        Item::Kv(_) | Item::Doc(JsonNode::Array(_) | JsonNode::Object(_))
+    )
+}
+
+/// A container's `i`th child in stored order: an element, a member value, or a `.keyvalue()`
+/// object's id, key, value.
+fn child_at<'d>(item: &Item<'d>, i: usize) -> Option<Item<'d>> {
+    match item {
+        Item::Kv(kv) => kv_member(kv, i),
+        Item::Doc(JsonNode::Array(elems)) => elems.get(i).map(Item::Doc),
+        Item::Doc(JsonNode::Object(members)) => members.get(i).map(|(_, v)| Item::Doc(v)),
+        _ => None,
     }
 }
 
@@ -1246,7 +1488,7 @@ fn member_of<'d>(cx: &mut Ctx<'d, '_>, item: &Item<'d>, key: &str) -> Result<Opt
             cx.charge(at.map_or(KV_KEYS.len(), |i| i + 1) as i64)?;
             at.and_then(|i| kv_member(kv, i))
         }
-        _ if cx.strict => {
+        _ if cx.structural() => {
             return Err(EngineError::new(
                 SqlState::SqlJsonMemberNotFound,
                 "jsonpath member accessor can only be applied to an object",
@@ -1254,7 +1496,7 @@ fn member_of<'d>(cx: &mut Ctx<'d, '_>, item: &Item<'d>, key: &str) -> Result<Opt
         }
         _ => return Ok(None),
     };
-    if found.is_none() && cx.strict {
+    if found.is_none() && cx.structural() {
         return Err(EngineError::new(
             SqlState::SqlJsonMemberNotFound,
             format!("JSON object does not contain key \"{key}\""),
@@ -1285,7 +1527,7 @@ fn subscript_range<'d>(
             index_value(cx, b, size, current, base)?,
         ),
     };
-    if cx.strict && (from < 0 || from > to || to >= size) {
+    if cx.structural() && (from < 0 || from > to || to >= size) {
         return Err(EngineError::new(
             SqlState::InvalidSqlJsonSubscript,
             "jsonpath array subscript is out of bounds",
@@ -1364,6 +1606,125 @@ fn eval_pred<'d>(
         }
         Pred::Not(p) => eval_pred(cx, p, current, base, last)?.map(|b| !b),
         Pred::Compare(l, op, r) => eval_compare(cx, l, *op, r, current, base, last)?,
+        Pred::IsUnknown(p) => Some(eval_pred(cx, p, current, base, last)?.is_none()),
+        Pred::Exists(e) => eval_exists(cx, e, current, base, last)?,
+        Pred::StartsWith(l, r) => eval_starts_with(cx, l, r, current, base, last)?,
+        Pred::LikeRegex(l, re) => eval_like_regex(cx, l, re, current, base, last)?,
+    })
+}
+
+/// `exists (e)` (§4.4 rule 6): true when `e`'s sequence is non-empty, unknown when evaluating it
+/// raises a SQL/JSON error. Lax stops at the first item; strict evaluates them all.
+fn eval_exists<'d>(
+    cx: &mut Ctx<'d, '_>,
+    e: &PathExpr,
+    current: &Item<'d>,
+    base: &Base<'d>,
+    last: Option<i64>,
+) -> Result<Option<bool>> {
+    let mut seq = Vec::new();
+    let stop_at_first = !cx.strict;
+    match run_expr(cx, e, current, base, last, stop_at_first, &mut seq) {
+        Ok(()) => Ok(Some(!seq.is_empty())),
+        Err(err) if is_soft(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Combine an existential predicate's `n` pair results in order (§4.4 rule 3): lax is true at the
+/// first true pair, else unknown if any pair was, else false; strict is unknown at the first
+/// unknown pair, else true if any pair was, else false. A pair test charges its own work.
+fn combine_pairs<'d, 'm>(
+    cx: &mut Ctx<'d, 'm>,
+    n: usize,
+    mut test: impl FnMut(&mut Ctx<'d, 'm>, usize) -> Result<Option<bool>>,
+) -> Result<Option<bool>> {
+    let strict = cx.strict;
+    let mut found = false;
+    let mut any_unknown = false;
+    for k in 0..n {
+        match test(cx, k)? {
+            None if strict => return Ok(None),
+            None => any_unknown = true,
+            Some(true) if !strict => return Ok(Some(true)),
+            Some(true) => found = true,
+            Some(false) => {}
+        }
+    }
+    Ok(if found {
+        Some(true)
+    } else if any_unknown {
+        None
+    } else {
+        Some(false)
+    })
+}
+
+/// Charge a SQL comparison's size extra for two strings: `varlen_compare` per code point of the
+/// shorter one beyond the first (§7 rule 4).
+fn charge_string_compare(cx: &mut Ctx<'_, '_>, a: &str, b: &str) -> Result<()> {
+    let w = a.chars().count().min(b.chars().count()).max(1);
+    cx.m.charge(COSTS.varlen_compare * (w as i64 - 1));
+    cx.m.guard()
+}
+
+/// `l starts with r` (§4.4 rule 5): `l`'s items (lax-unwrapped) against `r`'s (not unwrapped); a
+/// pair of strings is true when the left begins with the right, any other pair unknown.
+fn eval_starts_with<'d>(
+    cx: &mut Ctx<'d, '_>,
+    l: &PathExpr,
+    r: &PathExpr,
+    current: &Item<'d>,
+    base: &Base<'d>,
+    last: Option<i64>,
+) -> Result<Option<bool>> {
+    let Some(ls) = eval_operand(cx, l, current, base, last)? else {
+        return Ok(None);
+    };
+    let rs = match eval_seq(cx, r, current, base, last, false) {
+        Ok(seq) => seq,
+        Err(err) if is_soft(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    combine_pairs(cx, ls.len() * rs.len(), |cx, k| {
+        cx.charge(1)?;
+        let (a, b) = (&ls[k / rs.len()], &rs[k % rs.len()]);
+        let (Some(JsonNode::String(x)), Some(JsonNode::String(y))) = (a.node(), b.node()) else {
+            return Ok(None);
+        };
+        charge_string_compare(cx, x, y)?;
+        Ok(Some(x.starts_with(y.as_str())))
+    })
+}
+
+/// `l like_regex "p"` (§4.4 rule 5): each of `l`'s items (lax-unwrapped) is true when it is a
+/// string the pattern matches, false when a string it does not, unknown otherwise. The match
+/// charges its `regex_step` units (regex.md §6).
+fn eval_like_regex<'d>(
+    cx: &mut Ctx<'d, '_>,
+    l: &PathExpr,
+    re: &LikeRegex,
+    current: &Item<'d>,
+    base: &Base<'d>,
+    last: Option<i64>,
+) -> Result<Option<bool>> {
+    let Some(ls) = eval_operand(cx, l, current, base, last)? else {
+        return Ok(None);
+    };
+    combine_pairs(cx, ls.len(), |cx, k| {
+        cx.charge(1)?;
+        let Some(JsonNode::String(subject)) = ls[k].node() else {
+            return Ok(None);
+        };
+        let chars: Vec<char> = if re.flags & REGEX_I != 0 {
+            let prop = crate::collation::loaded_property();
+            crate::collation::fold_lower_simple(subject, prop.as_deref())
+                .chars()
+                .collect()
+        } else {
+            subject.chars().collect()
+        };
+        Ok(Some(re.program.is_match(&chars, cx.m)?))
     })
 }
 
@@ -1387,39 +1748,20 @@ fn eval_compare<'d>(
     let Some(rs) = eval_operand(cx, r, current, base, last)? else {
         return Ok(None);
     };
-    let strict = cx.strict;
-    let mut found = false;
-    let mut any_unknown = false;
-    for a in &ls {
-        for b in &rs {
-            cx.charge(1)?;
-            match (a.node(), b.node()) {
-                (Some(JsonNode::String(x)), Some(JsonNode::String(y))) => {
-                    let w = x.chars().count().min(y.chars().count()).max(1);
-                    cx.m.charge(COSTS.varlen_compare * (w as i64 - 1));
-                    cx.m.guard()?;
-                }
-                (Some(JsonNode::Number(x)), Some(JsonNode::Number(y))) => {
-                    cx.m.charge(COSTS.decimal_work * (decimal::work_linear(x, y) as i64 - 1));
-                    cx.m.guard()?;
-                }
-                _ => {}
+    combine_pairs(cx, ls.len() * rs.len(), |cx, k| {
+        cx.charge(1)?;
+        let (a, b) = (&ls[k / rs.len()], &rs[k % rs.len()]);
+        match (a.node(), b.node()) {
+            (Some(JsonNode::String(x)), Some(JsonNode::String(y))) => {
+                charge_string_compare(cx, x, y)?;
             }
-            match compare_items(a, op, b) {
-                Some(true) if !strict => return Ok(Some(true)),
-                Some(true) => found = true,
-                Some(false) => {}
-                None if strict => return Ok(None),
-                None => any_unknown = true,
+            (Some(JsonNode::Number(x)), Some(JsonNode::Number(y))) => {
+                cx.m.charge(COSTS.decimal_work * (decimal::work_linear(x, y) as i64 - 1));
+                cx.m.guard()?;
             }
+            _ => {}
         }
-    }
-    Ok(if found {
-        Some(true)
-    } else if any_unknown {
-        None
-    } else {
-        Some(false)
+        Ok(compare_items(a, op, b))
     })
 }
 
@@ -2028,14 +2370,16 @@ struct Parser<'a> {
     s: &'a [u8],
     i: usize,
     /// The program nesting depth (spec/design/json.md §6.4): +1 per filter `?(`, parenthesized
-    /// group, `!`, `&&`/`||` chain step, arithmetic operator, and subscript list, bounded by
-    /// [`MAX_JSON_DEPTH`] → `54001`. Bounding it at the compiler bounds every derived walk (render,
-    /// evaluate, `Clone`/`Drop`).
+    /// group, `exists (`, `!`, `&&`/`||` chain step, arithmetic operator, and subscript list,
+    /// bounded by [`MAX_JSON_DEPTH`] → `54001`. Bounding it at the compiler bounds every derived
+    /// walk (render, evaluate, `Clone`/`Drop`).
     depth: usize,
     /// How many filters enclose the cursor — `@` is valid only inside one.
     in_filter: usize,
     /// How many subscripts enclose the cursor — `last` is valid only inside one.
     in_subscript: usize,
+    /// The instruction count of the `like_regex` programs compiled so far.
+    regex_insts: i64,
 }
 
 /// A parsed operand: an expression or a predicate — PostgreSQL's `expr_or_predicate`. A
@@ -2043,20 +2387,24 @@ struct Parser<'a> {
 enum Parsed {
     Expr(PathExpr),
     Pred(Pred),
+    /// A predicate that is exactly `( predicate )`, the only operand of `is unknown`.
+    ParenPred(Pred),
 }
 
 /// Require an expression where the grammar takes one (`42601` for a bare predicate).
 fn need_expr(p: Parsed) -> Result<PathExpr> {
     match p {
         Parsed::Expr(e) => Ok(e),
-        Parsed::Pred(_) => Err(malformed("expected an expression, not a predicate")),
+        Parsed::Pred(_) | Parsed::ParenPred(_) => {
+            Err(malformed("expected an expression, not a predicate"))
+        }
     }
 }
 
 /// Require a predicate where the grammar takes one (`42601` for an expression).
 fn need_pred(p: Parsed) -> Result<Pred> {
     match p {
-        Parsed::Pred(pred) => Ok(pred),
+        Parsed::Pred(pred) | Parsed::ParenPred(pred) => Ok(pred),
         Parsed::Expr(_) => Err(malformed("expected a predicate")),
     }
 }
@@ -2371,14 +2719,17 @@ impl Parser<'_> {
             }
             let steps = self.parse_steps()?;
             if steps.is_empty() {
-                return Ok(inner);
+                return Ok(match inner {
+                    Parsed::Pred(pred) | Parsed::ParenPred(pred) => Parsed::ParenPred(pred),
+                    expr => expr,
+                });
             }
             return Ok(Parsed::Expr(match inner {
                 Parsed::Expr(mut e) => {
                     e.steps.extend(steps);
                     e
                 }
-                Parsed::Pred(pred) => PathExpr {
+                Parsed::Pred(pred) | Parsed::ParenPred(pred) => PathExpr {
                     primary: Primary::Pred(Box::new(pred)),
                     steps,
                 },
@@ -2439,7 +2790,8 @@ impl Parser<'_> {
                     }
                     Primary::Last
                 } else if keyword_is(&word, "exists") {
-                    return Err(unsupported("exists predicates"));
+                    // No accessors follow `exists (…)`: it is a predicate, not an expression.
+                    return Ok(Parsed::Pred(self.parse_exists()?));
                 } else {
                     return Err(malformed("a name is not an operand"));
                 }
@@ -2543,11 +2895,11 @@ impl Parser<'_> {
                     }
                     self.skip_ws()?;
                     if self.eat(b'*') {
-                        // `.**` — the any-level accessor — is a deferred follow-on.
-                        if self.peek() == Some(b'*') {
-                            return Err(unsupported("the .** accessor"));
+                        if self.eat(b'*') {
+                            steps.push(self.parse_any_levels()?);
+                        } else {
+                            steps.push(Step::WildcardMember);
                         }
-                        steps.push(Step::WildcardMember);
                     } else if self.peek() == Some(b'"') {
                         steps.push(Step::Member(self.parse_quoted()?));
                     } else if self.word_ahead() {
@@ -2599,6 +2951,60 @@ impl Parser<'_> {
             }
         }
         Ok(steps)
+    }
+
+    /// Parse the optional `{level}` / `{level to level}` after `.**` (jsonpath.md §2).
+    fn parse_any_levels(&mut self) -> Result<Step> {
+        let save = self.i;
+        self.skip_ws()?;
+        if !self.eat(b'{') {
+            self.i = save;
+            return Ok(Step::Any {
+                first: 0,
+                last: LEVEL_LAST,
+            });
+        }
+        let first = self.parse_any_level()?;
+        let mut last = first;
+        self.skip_ws()?;
+        if self.eat_keyword("to") {
+            last = self.parse_any_level()?;
+            self.skip_ws()?;
+        }
+        if !self.eat(b'}') {
+            return Err(malformed("expected `}` after a .** level"));
+        }
+        Ok(Step::Any { first, last })
+    }
+
+    /// Parse one `.**` level: an unsigned integer literal (PostgreSQL's `INT_P`, at most
+    /// 2147483647, else `22003`) or `last`.
+    fn parse_any_level(&mut self) -> Result<u32> {
+        self.skip_ws()?;
+        if self.eat_keyword("last") {
+            return Ok(LEVEL_LAST);
+        }
+        let start = self.i;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        let digits = std::str::from_utf8(&self.s[start..self.i]).expect("ASCII digits");
+        if digits.is_empty() {
+            return Err(malformed("expected a .** level"));
+        }
+        // A number running into a name character, a leading zero, or a fraction is not an integer.
+        if self.peek().is_some_and(|c| c == b'.' || is_other(c))
+            || (digits.len() > 1 && digits.starts_with('0'))
+        {
+            return Err(malformed("trailing junk after numeric literal"));
+        }
+        match digits.parse::<u32>() {
+            Ok(v) if v <= i32::MAX as u32 => Ok(v),
+            _ => Err(EngineError::new(
+                SqlState::NumericValueOutOfRange,
+                format!("value \"{digits}\" is out of range for type integer"),
+            )),
+        }
     }
 
     /// Parse an item method's argument list (the cursor is at its `(`). Method names are matched
@@ -2728,7 +3134,8 @@ impl Parser<'_> {
             self.i += 1;
             self.skip_ws()?;
             if self.eat_keyword("exists") {
-                return Err(unsupported("exists predicates"));
+                let inner = self.parse_exists()?;
+                return Ok(Parsed::Pred(Pred::Not(Box::new(inner))));
             }
             if !self.eat(b'(') {
                 return Err(malformed("expected `(` after `!`"));
@@ -2745,20 +3152,46 @@ impl Parser<'_> {
         self.parse_comparison()
     }
 
-    /// `expr cmp expr`, or a lone expression or parenthesized predicate. The word predicates
-    /// (`like_regex`, `starts with`, `is unknown`) are a deferred follow-on.
+    /// Parse `exists (expr)` after its keyword (jsonpath.md §2): the operand is an expression, not
+    /// a predicate.
+    fn parse_exists(&mut self) -> Result<Pred> {
+        self.skip_ws()?;
+        if !self.eat(b'(') {
+            return Err(malformed("expected `(` after exists"));
+        }
+        self.deepen()?;
+        let e = need_expr(self.parse_or()?)?;
+        self.depth -= 1;
+        self.skip_ws()?;
+        if !self.eat(b')') {
+            return Err(malformed("expected `)` after exists ("));
+        }
+        Ok(Pred::Exists(e))
+    }
+
+    /// `expr cmp expr`, `expr starts with s`, `expr like_regex "p" [flag "f"]`, `(predicate) is
+    /// unknown`, or a lone expression or predicate.
     fn parse_comparison(&mut self) -> Result<Parsed> {
         let left = match self.parse_additive()? {
-            Parsed::Pred(pred) => {
+            Parsed::Pred(pred) => return Ok(Parsed::Pred(pred)),
+            // `is unknown` applies only to a parenthesized predicate. Its result is not one, so
+            // `(p) is unknown is unknown` is not PostgreSQL's grammar; only a parenthesized one
+            // nests.
+            Parsed::ParenPred(pred) => {
                 self.skip_ws()?;
-                if self.word_ahead() {
-                    let start = self.i;
-                    if keyword_is(&self.scan_word()?, "is") {
-                        return Err(unsupported("is unknown predicates"));
-                    }
-                    self.i = start;
+                if !self.word_ahead() {
+                    return Ok(Parsed::Pred(pred));
                 }
-                return Ok(Parsed::Pred(pred));
+                let start = self.i;
+                if !keyword_is(&self.scan_word()?, "is") {
+                    self.i = start;
+                    return Ok(Parsed::Pred(pred));
+                }
+                self.skip_ws()?;
+                if !self.eat_keyword("unknown") {
+                    return Err(malformed("expected `unknown` after `is`"));
+                }
+                return Ok(Parsed::Pred(Pred::IsUnknown(Box::new(pred))));
             }
             Parsed::Expr(e) => e,
         };
@@ -2776,15 +3209,16 @@ impl Parser<'_> {
         } else if self.eat(b'>') {
             CmpOp::Gt
         } else {
-            // A word predicate operator is a deferred follow-on. The name is lexed first, so its
-            // escape error wins; any other name is trailing input.
+            // A word predicate operator. The name is lexed first, so its escape error wins; any
+            // other name is trailing input.
             if self.word_ahead() {
                 let start = self.i;
                 let word = self.scan_word()?;
-                if keyword_is(&word, "like_regex") || keyword_is(&word, "starts") {
-                    return Err(unsupported(
-                        "predicates other than a comparison (like_regex / starts with)",
-                    ));
+                if keyword_is(&word, "starts") {
+                    return self.parse_starts_with(left);
+                }
+                if keyword_is(&word, "like_regex") {
+                    return self.parse_like_regex(left);
                 }
                 self.i = start;
             }
@@ -2792,6 +3226,84 @@ impl Parser<'_> {
         };
         let right = need_expr(self.parse_additive()?)?;
         Ok(Parsed::Pred(Pred::Compare(left, op, right)))
+    }
+
+    /// Parse the rest of `expr starts with s` after `starts`: `s` is a string literal or a variable
+    /// (jsonpath.md §2).
+    fn parse_starts_with(&mut self, left: PathExpr) -> Result<Parsed> {
+        self.skip_ws()?;
+        if !self.eat_keyword("with") {
+            return Err(malformed("expected `with` after `starts`"));
+        }
+        self.skip_ws()?;
+        let right = match self.peek() {
+            Some(b'"') => PathExpr {
+                primary: Primary::Lit(JsonNode::String(self.parse_quoted()?)),
+                steps: Vec::new(),
+            },
+            Some(b'$') => match self.parse_postfix()? {
+                Parsed::Expr(
+                    e @ PathExpr {
+                        primary: Primary::Var(_),
+                        ..
+                    },
+                ) if e.steps.is_empty() => e,
+                _ => return Err(malformed("starts with takes a string or a variable")),
+            },
+            _ => return Err(malformed("starts with takes a string or a variable")),
+        };
+        Ok(Parsed::Pred(Pred::StartsWith(left, right)))
+    }
+
+    /// Parse the rest of `expr like_regex "pattern" [flag "flags"]` after `like_regex` and compile
+    /// the pattern (jsonpath.md §4.3): an unknown flag is `42601`, `x` or `m` without `q` `0A000`,
+    /// a malformed pattern `2201B`.
+    fn parse_like_regex(&mut self, left: PathExpr) -> Result<Parsed> {
+        self.skip_ws()?;
+        if self.peek() != Some(b'"') {
+            return Err(malformed("like_regex takes a string pattern"));
+        }
+        let pattern = self.parse_quoted()?;
+        let mut flags: u8 = 0;
+        let save = self.i;
+        self.skip_ws()?;
+        if self.eat_keyword("flag") {
+            self.skip_ws()?;
+            if self.peek() != Some(b'"') {
+                return Err(malformed("flag takes a string"));
+            }
+            for c in self.parse_quoted()?.chars() {
+                let Some(i) = REGEX_FLAG_CHARS.iter().position(|&f| f as char == c) else {
+                    return Err(malformed(&format!(
+                        "unrecognized flag character \"{c}\" in LIKE_REGEX predicate"
+                    )));
+                };
+                flags |= 1 << i;
+            }
+        } else {
+            self.i = save;
+        }
+        if flags & REGEX_Q == 0 {
+            if flags & REGEX_X != 0 {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "XQuery \"x\" flag (expanded regular expressions) is not implemented",
+                ));
+            }
+            if flags & REGEX_M != 0 {
+                return Err(unsupported("like_regex \"m\" flag"));
+            }
+        }
+        let program = compile_like_regex(&pattern, flags)?;
+        self.regex_insts += program.ninst() as i64;
+        Ok(Parsed::Pred(Pred::LikeRegex(
+            left,
+            Box::new(LikeRegex {
+                pattern,
+                flags,
+                program: Rc::new(program),
+            }),
+        )))
     }
 
     /// `+` and `-`, left-associative.
@@ -2890,6 +3402,37 @@ impl Parser<'_> {
             false
         }
     }
+}
+
+/// Compile a `like_regex` pattern under its flags (jsonpath.md §4.3, regex.md §8d): `i` folds the
+/// pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+fn compile_like_regex(pattern: &str, flags: u8) -> Result<crate::regex::Program> {
+    let folded;
+    let pattern = if flags & REGEX_I != 0 {
+        let prop = crate::collation::loaded_property();
+        folded = crate::collation::fold_lower_simple(pattern, prop.as_deref());
+        folded.as_str()
+    } else {
+        pattern
+    };
+    if flags & REGEX_Q != 0 {
+        return crate::regex::compile_mode(
+            &crate::regex::quote_regex(pattern),
+            crate::regex::Mode::default(),
+        );
+    }
+    let mode = if flags & REGEX_S != 0 {
+        crate::regex::Mode {
+            dot_all: true,
+            nl_stop: false,
+        }
+    } else {
+        crate::regex::Mode {
+            dot_all: false,
+            nl_stop: true,
+        }
+    };
+    crate::regex::compile_mode(pattern, mode)
 }
 
 /// A binary arithmetic expression.

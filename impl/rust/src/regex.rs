@@ -163,6 +163,29 @@ struct Parser {
     chars: Vec<char>,
     pos: usize,
     ngroups: usize,
+    mode: Mode,
+}
+
+/// A compile mode of jsonpath `like_regex` (regex.md §8d); the default is the SQL operators' mode.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Mode {
+    /// Keep a negated bracket class from matching a newline (PostgreSQL's `REG_NLSTOP`).
+    pub nl_stop: bool,
+    /// Let `.` match a newline (the XQuery `s` flag).
+    pub dot_all: bool,
+}
+
+/// Escape every metacharacter of a pattern so it compiles to the literal string (the XQuery `q`
+/// flag, regex.md §8d).
+pub fn quote_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    for c in pattern.chars() {
+        if is_meta(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl Parser {
@@ -326,6 +349,13 @@ impl Parser {
             '[' => self.parse_class(),
             '.' => {
                 self.bump();
+                if self.mode.dot_all {
+                    // An empty negated class admits every code point (regex.md §8d).
+                    return Ok(Node::Class(CharClass {
+                        negated: true,
+                        ranges: Vec::new(),
+                    }));
+                }
                 Ok(Node::Any)
             }
             '^' => {
@@ -457,6 +487,10 @@ impl Parser {
                 }
             }
             first = false;
+        }
+        if negated && self.mode.nl_stop {
+            // Newline-sensitive: `[^…]` does not match a newline (regex.md §8d).
+            ranges.push(('\n' as u32, '\n' as u32));
         }
         Ok(Node::Class(CharClass {
             negated,
@@ -752,10 +786,16 @@ fn clone_node(n: &Node) -> Node {
 /// program.ninst()` (the precompilation contract, regex.md §5). For `~*` the pattern must already be
 /// case-folded by the caller.
 pub fn compile(pattern: &str) -> Result<Program> {
+    compile_mode(pattern, Mode::default())
+}
+
+/// [`compile`] under a jsonpath `like_regex` compile mode (regex.md §8d).
+pub fn compile_mode(pattern: &str, mode: Mode) -> Result<Program> {
     let mut parser = Parser {
         chars: pattern.chars().collect(),
         pos: 0,
         ngroups: 0,
+        mode,
     };
     let root = parser.parse_alt()?;
     if parser.pos != parser.chars.len() {

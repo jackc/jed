@@ -12,10 +12,10 @@ import (
 //
 // The compiled surface: lax/strict mode; a primary ($, @ inside a filter, a scalar literal, last
 // inside a subscript, or a parenthesized expression or predicate) followed by accessor steps (.key,
-// .*, [subscripts] of any expression, [*], to slices, ?(filter), and the item methods of §3.1);
-// arithmetic (+ - * / %, unary + -, §3.2); a top-level comparison predicate. Still deferred (a
-// valid-PG path using one → 0A000 at compile): like_regex / starts with / is unknown / exists
-// predicates and .**; the datetime methods are 0A000 by decision (jsonpath.md §3.1). Path variables ($name, $"name") are bound by the caller's
+// .*, .**, [subscripts] of any expression, [*], to slices, ?(filter), and the item methods of §3.1);
+// arithmetic (+ - * / %, unary + -, §3.2); a top-level predicate (comparison, exists, like_regex,
+// starts with, is unknown, §4.4). The datetime methods and the like_regex `m` flag are 0A000
+// (jsonpath.md §3.1, §4.3). Path variables ($name, $"name") are bound by the caller's
 // jpVars. A malformed path is 42601. The
 // compiled program is a pure function of the source — kept byte-identical cross-core by the
 // conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned). Mirrors
@@ -29,6 +29,9 @@ type jsonPath struct {
 	// Exactly one is meaningful (Go has no sum types).
 	Path jpPathExpr
 	Pred *jpPred
+	// regexInsts is the instruction count of every like_regex program in the path, which a metered
+	// compile charges as regex_compile (jsonpath.md §7).
+	regexInsts int64
 }
 
 // jpPrimaryKind tags where a path starts.
@@ -128,7 +131,13 @@ const (
 	jpFilter
 	// jpMethodStep is `.name(…)` — an item method (§3.1).
 	jpMethodStep
+	// jpAnyStep is `.**{first to last}` — the item and its descendants within the level bounds
+	// (§3.3).
+	jpAnyStep
 )
+
+// jpLevelLast is a `.**` level bound of `last`: PostgreSQL stores it as the largest uint32.
+const jpLevelLast = int64(4294967295)
 
 // jpStep is one accessor step.
 type jpStep struct {
@@ -141,6 +150,8 @@ type jpStep struct {
 	pred *jpPred
 	// method holds the item method when kind == jpMethodStep.
 	method jpMethod
+	// first/last hold the level bounds when kind == jpAnyStep (jpLevelLast for `last`).
+	first, last int64
 }
 
 // jpMethodKind tags an item method (jsonpath.md §3.1). The datetime family is not supported (0A000), by decision.
@@ -192,16 +203,42 @@ const (
 	jpPredNot
 	// jpPredCompare is `lhs cmp rhs` — an existential comparison (true if SOME pair compares true).
 	jpPredCompare
+	// jpPredExists is `exists (e)` — e's sequence is non-empty.
+	jpPredExists
+	// jpPredIsUnknown is `(p) is unknown`.
+	jpPredIsUnknown
+	// jpPredStartsWith is `lhs starts with rhs` — rhs a string literal or a variable.
+	jpPredStartsWith
+	// jpPredLikeRegex is `lhs like_regex "pattern" flag "flags"`.
+	jpPredLikeRegex
 )
+
+// like_regex flag bits, in PostgreSQL's print order (jsonpath.md §2.3).
+const (
+	jpRegexI uint8 = 1 << iota
+	jpRegexS
+	jpRegexM
+	jpRegexX
+	jpRegexQ
+)
+
+// jpRegexFlagChars is the flag characters in bit order.
+const jpRegexFlagChars = "ismxq"
 
 // jpPred is a filter predicate. kind selects which fields are meaningful (Go has no sum types).
 type jpPred struct {
 	kind jpPredKind
-	// left/right hold operand predicates for Or/And; left holds the inner predicate for Not.
+	// left/right hold operand predicates for Or/And; left holds the inner predicate for Not and
+	// IsUnknown.
 	left, right *jpPred
-	// cmpLeft/cmpRight/cmpOp hold the comparison operands and operator when kind == jpPredCompare.
+	// cmpLeft/cmpRight/cmpOp hold the comparison operands and operator when kind == jpPredCompare;
+	// cmpLeft/cmpRight the operands of StartsWith; cmpLeft the operand of Exists and LikeRegex.
 	cmpLeft, cmpRight jpPathExpr
 	cmpOp             jpCmpOp
+	// pattern/flags/regex hold a LikeRegex's pattern as written, its flag bits, and its program.
+	pattern string
+	flags   uint8
+	regex   *regexProgram
 }
 
 // jpCmpOp is a jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
@@ -291,9 +328,9 @@ func parseJsonPath(src string) (jsonPath, error) {
 		return jsonPath{}, jpMalformed("unexpected trailing input")
 	}
 	if body.pred != nil {
-		return jsonPath{Strict: strict, Pred: body.pred}, nil
+		return jsonPath{Strict: strict, Pred: body.pred, regexInsts: p.regexInsts}, nil
 	}
-	return jsonPath{Strict: strict, Path: *body.expr}, nil
+	return jsonPath{Strict: strict, Path: *body.expr, regexInsts: p.regexInsts}, nil
 }
 
 // Render is the canonical render (spec/design/jsonpath.md §2.2): strict kept / lax omitted; member
@@ -335,7 +372,7 @@ func jpPredPriority(pred *jpPred) int {
 		return 0
 	case jpPredAnd:
 		return 1
-	case jpPredCompare:
+	case jpPredCompare, jpPredStartsWith:
 		return 2
 	default:
 		return 6
@@ -383,7 +420,16 @@ func writeExpr(e *jpPathExpr, brackets bool, out *strings.Builder) {
 		writeExpr(e.right, jpExprPriority(e.right) <= e.arithOp.priority(), out)
 		closeB()
 	case jpPredHead:
-		writePred(e.pred, brackets, out)
+		// A predicate that prints without its own brackets (`!(…)`, `exists (…)`, `(…) is unknown`)
+		// keeps the parentheses that make it an operand of the accessors after it (jsonpath.md §2.3).
+		switch e.pred.kind {
+		case jpPredNot, jpPredExists, jpPredIsUnknown:
+			out.WriteByte('(')
+			writePred(e.pred, false, out)
+			out.WriteByte(')')
+		default:
+			writePred(e.pred, brackets, out)
+		}
 	default:
 		if e.lit.Kind == JNumber && len(e.steps) > 0 {
 			out.WriteByte('(')
@@ -426,6 +472,8 @@ func writeSteps(steps []jpStep, out *strings.Builder) {
 			out.WriteString("?(")
 			writePred(step.pred, false, out)
 			out.WriteByte(')')
+		case jpAnyStep:
+			writeAnyLevels(step.first, step.last, out)
 		case jpMethodStep:
 			out.WriteByte('.')
 			out.WriteString(step.method.name())
@@ -439,6 +487,25 @@ func writeSteps(steps []jpStep, out *strings.Builder) {
 			}
 			out.WriteByte(')')
 		}
+	}
+}
+
+// writeAnyLevels renders a `.**` step as PostgreSQL's printJsonPathItem does: `{0 to last}` is bare,
+// equal bounds print once.
+func writeAnyLevels(first, last int64, out *strings.Builder) {
+	level := func(v int64) string {
+		if v == jpLevelLast {
+			return "last"
+		}
+		return strconv.FormatInt(v, 10)
+	}
+	out.WriteString(".**")
+	switch {
+	case first == 0 && last == jpLevelLast:
+	case first == last:
+		out.WriteString("{" + level(first) + "}")
+	default:
+		out.WriteString("{" + level(first) + " to " + level(last) + "}")
 	}
 }
 
@@ -471,6 +538,37 @@ func writePred(pred *jpPred, brackets bool, out *strings.Builder) {
 		out.WriteString("!(")
 		writePred(pred.left, false, out)
 		out.WriteByte(')')
+	case jpPredExists:
+		out.WriteString("exists (")
+		writeExpr(&pred.cmpLeft, false, out)
+		out.WriteByte(')')
+	case jpPredIsUnknown:
+		out.WriteByte('(')
+		writePred(pred.left, false, out)
+		out.WriteString(") is unknown")
+	case jpPredStartsWith:
+		open()
+		writeExpr(&pred.cmpLeft, jpExprPriority(&pred.cmpLeft) <= 2, out)
+		out.WriteString(" starts with ")
+		writeExpr(&pred.cmpRight, jpExprPriority(&pred.cmpRight) <= 2, out)
+		closeB()
+	case jpPredLikeRegex:
+		// PostgreSQL brackets the operand by priority against like_regex's 6, so an operator operand
+		// is always wrapped.
+		open()
+		writeExpr(&pred.cmpLeft, true, out)
+		out.WriteString(" like_regex ")
+		writeQuoted(pred.pattern, out)
+		if pred.flags != 0 {
+			out.WriteString(` flag "`)
+			for i := 0; i < len(jpRegexFlagChars); i++ {
+				if pred.flags&(1<<i) != 0 {
+					out.WriteByte(jpRegexFlagChars[i])
+				}
+			}
+			out.WriteByte('"')
+		}
+		closeB()
 	default: // jpPredCompare
 		open()
 		writeExpr(&pred.cmpLeft, jpExprPriority(&pred.cmpLeft) <= 2, out)
@@ -609,7 +707,16 @@ func compileMetered(src string, m *costMeter) (jsonPath, error) {
 	}
 	// The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
 	// compile at resolve.
-	return parseJsonPath(src)
+	jp, err := parseJsonPath(src)
+	if err != nil {
+		return jsonPath{}, err
+	}
+	// Each like_regex pattern was compiled with the path (jsonpath.md §7).
+	m.Charge(costs.RegexCompile * jp.regexInsts)
+	if err := m.Guard(); err != nil {
+		return jsonPath{}, err
+	}
+	return jp, nil
 }
 
 // Eval evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
@@ -756,6 +863,9 @@ type jpCtx struct {
 	root   *JsonNode
 	vars   jpVars
 	strict bool
+	// ignore suppresses navigation errors while the rest of a path below `.**` runs, in either mode
+	// (jsonpath.md §3.3) — PostgreSQL's ignoreStructuralErrors, which lax always sets.
+	ignore bool
 	m      *costMeter
 	// nextGen is the next .keyvalue() object number, assigned in evaluation order.
 	nextGen int64
@@ -764,6 +874,9 @@ type jpCtx struct {
 	// on the first .keyvalue() that needs one.
 	offsets map[*JsonNode]map[*JsonNode]int64
 }
+
+// structural is whether a navigation failure raises: strict, and not below a `.**` (§3.3, §4.2).
+func (cx *jpCtx) structural() bool { return cx.strict && !cx.ignore }
 
 // charge charges n units of jsonpath_step and guards (jsonpath.md §7).
 func (cx *jpCtx) charge(n int64) error {
@@ -796,6 +909,18 @@ type jpFrame struct {
 	last int64
 	// size is a subscript step's array size: its own outputs' last.
 	size int64
+	// ignore is whether this frame runs below a `.**`, suppressing navigation errors (§3.3).
+	ignore bool
+	// walk is a `.**` step's descent: the containers being walked, innermost last.
+	walk []jpAnyWalk
+}
+
+// jpAnyWalk is one container a `.**` step is walking: its children are at level, and next is the
+// next child's position.
+type jpAnyWalk struct {
+	item  jpItem
+	level int64
+	next  int
 }
 
 // jpOutKind is what a frame produces next.
@@ -831,12 +956,17 @@ func (cx *jpCtx) runExpr(e *jpPathExpr, current jpItem, base jpBase, last int64,
 					return nil
 				}
 			} else {
-				stack = append(stack, &jpFrame{step: 0, item: item, base: itemBase, unwrap: unwrap, last: last})
+				stack = append(stack, &jpFrame{step: 0, item: item, base: itemBase, unwrap: unwrap, last: last, ignore: cx.ignore})
 			}
 			continue
 		}
 		top := stack[len(stack)-1]
+		// The frame's step runs with its own suppression of navigation errors, which reaches any
+		// filter operand it evaluates (§3.3).
+		saved := cx.ignore
+		cx.ignore = top.ignore
 		kind, item, itemBase, sub, err := cx.nextOut(steps, current, top)
+		cx.ignore = saved
 		if err != nil {
 			return err
 		}
@@ -854,7 +984,9 @@ func (cx *jpCtx) runExpr(e *jpPathExpr, current jpItem, base jpBase, last int64,
 				if steps[top.step].kind == jpSubscripts {
 					childLast = top.size
 				}
-				stack = append(stack, &jpFrame{step: next, item: item, base: itemBase, unwrap: unwrap, last: childLast})
+				// Every item a `.**` emits runs the rest of the path with navigation errors suppressed.
+				ignore := top.ignore || steps[top.step].kind == jpAnyStep
+				stack = append(stack, &jpFrame{step: next, item: item, base: itemBase, unwrap: unwrap, last: childLast, ignore: ignore})
 			}
 		case jpOutSub:
 			stack = append(stack, sub)
@@ -1071,7 +1203,7 @@ func (cx *jpCtx) nextOut(steps []jpStep, current jpItem, f *jpFrame) (jpOutKind,
 		if f.a < len(elems) {
 			e := &elems[f.a]
 			f.a++
-			return jpOutSub, jpItem{}, jpBase{}, &jpFrame{step: f.step, item: jpDocItem(e), base: f.base, last: f.last}, nil
+			return jpOutSub, jpItem{}, jpBase{}, &jpFrame{step: f.step, item: jpDocItem(e), base: f.base, last: f.last, ignore: f.ignore}, nil
 		}
 		return done()
 	}
@@ -1099,7 +1231,7 @@ func (cx *jpCtx) nextOut(steps []jpStep, current jpItem, f *jpFrame) (jpOutKind,
 				return fail(err)
 			}
 			if f.item.typeName() != "object" {
-				if strict {
+				if cx.structural() {
 					return fail(newError(SqlJsonObjectNotFound,
 						"jsonpath wildcard member accessor can only be applied to an object"))
 				}
@@ -1122,7 +1254,11 @@ func (cx *jpCtx) nextOut(steps []jpStep, current jpItem, f *jpFrame) (jpOutKind,
 				return fail(err)
 			}
 			if strict && !f.item.isDocKind(JArray) {
-				return fail(newError(SqlJsonArrayNotFound, "jsonpath array accessor can only be applied to an array"))
+				if cx.structural() {
+					return fail(newError(SqlJsonArrayNotFound, "jsonpath array accessor can only be applied to an array"))
+				}
+				// Strict below `.**`: no singleton, no item (§3.3).
+				return done()
 			}
 		}
 		// A non-array is a singleton array in lax (§4.1 rule 2).
@@ -1164,9 +1300,13 @@ func (cx *jpCtx) nextOut(steps []jpStep, current jpItem, f *jpFrame) (jpOutKind,
 				return fail(err)
 			}
 			if !f.item.isDocKind(JArray) {
-				if strict {
+				if cx.structural() {
 					return fail(newError(SqlJsonArrayNotFound,
 						"jsonpath wildcard array accessor can only be applied to an array"))
+				}
+				if strict {
+					// Strict below `.**`: no singleton, no item (§3.3).
+					return done()
 				}
 				// lax: the item is a singleton array.
 				if err := cx.charge(1); err != nil {
@@ -1196,6 +1336,8 @@ func (cx *jpCtx) nextOut(steps []jpStep, current jpItem, f *jpFrame) (jpOutKind,
 		if isTrue(truth) {
 			child, found = f.item, true
 		}
+	case jpAnyStep:
+		return cx.nextAny(step, f)
 	default: // jpMethodStep
 		if step.method.kind == jmKeyValue {
 			return cx.nextKeyValue(f)
@@ -1206,6 +1348,10 @@ func (cx *jpCtx) nextOut(steps []jpStep, current jpItem, f *jpFrame) (jpOutKind,
 		f.started = true
 		if err := cx.charge(1); err != nil {
 			return fail(err)
+		}
+		if step.method.kind == jmSize && strict && !cx.structural() && !f.item.isDocKind(JArray) {
+			// Strict .size() of a non-array below `.**`: no item (§3.3).
+			return done()
 		}
 		c, err := jpApplyMethod(step.method, f.item, strict)
 		if err != nil {
@@ -1220,6 +1366,77 @@ func (cx *jpCtx) nextOut(steps []jpStep, current jpItem, f *jpFrame) (jpOutKind,
 		return fail(err)
 	}
 	return jpOutItem, child, f.base, nil, nil
+}
+
+// nextAny produces a `.**` frame's next output (jsonpath.md §3.3): the item itself when the first
+// level is 0, then its descendants in preorder — a child is emitted (when its level is in bounds)
+// before the walk descends into it. Applying the step charges 1, each descendant visited 1, and each
+// emitted item 1 (§7 rule 8).
+func (cx *jpCtx) nextAny(step *jpStep, f *jpFrame) (jpOutKind, jpItem, jpBase, *jpFrame, error) {
+	if !f.started {
+		f.started = true
+		if err := cx.charge(1); err != nil {
+			return jpOutDone, jpItem{}, jpBase{}, nil, err
+		}
+		if step.last >= 1 && jpIsContainer(f.item) {
+			f.walk = append(f.walk, jpAnyWalk{item: f.item, level: 1})
+		}
+		if step.first == 0 {
+			if err := cx.charge(1); err != nil {
+				return jpOutDone, jpItem{}, jpBase{}, nil, err
+			}
+			return jpOutItem, f.item, f.base, nil, nil
+		}
+	}
+	for len(f.walk) > 0 {
+		top := &f.walk[len(f.walk)-1]
+		child, ok := jpChildAt(top.item, top.next)
+		if !ok {
+			f.walk = f.walk[:len(f.walk)-1]
+			continue
+		}
+		top.next++
+		level := top.level
+		if err := cx.charge(1); err != nil {
+			return jpOutDone, jpItem{}, jpBase{}, nil, err
+		}
+		container := jpIsContainer(child)
+		if level < step.last && container {
+			f.walk = append(f.walk, jpAnyWalk{item: child, level: level + 1})
+		}
+		// `{last}` (both bounds the largest level) is PostgreSQL's leaves-only walk.
+		if level >= step.first || (step.first == jpLevelLast && step.last == jpLevelLast && !container) {
+			if err := cx.charge(1); err != nil {
+				return jpOutDone, jpItem{}, jpBase{}, nil, err
+			}
+			return jpOutItem, child, f.base, nil, nil
+		}
+	}
+	return jpOutDone, jpItem{}, jpBase{}, nil, nil
+}
+
+// jpIsContainer is whether an item has children for `.**`: a document array or object, or a
+// .keyvalue() object.
+func jpIsContainer(item jpItem) bool {
+	return item.kind == jpItemKv || item.isDocKind(JArray) || item.isDocKind(JObject)
+}
+
+// jpChildAt is a container's i-th child in stored order: an element, a member value, or a
+// .keyvalue() object's id, key, value.
+func jpChildAt(item jpItem, i int) (jpItem, bool) {
+	switch {
+	case item.kind == jpItemKv:
+		return jpKvMember(item.kv, i)
+	case item.isDocKind(JArray):
+		if i < len(item.node.Arr) {
+			return jpDocItem(&item.node.Arr[i]), true
+		}
+	case item.isDocKind(JObject):
+		if i < len(item.node.Obj) {
+			return jpDocItem(&item.node.Obj[i].Val), true
+		}
+	}
+	return jpItem{}, false
 }
 
 // nextKeyValue produces a .keyvalue() frame's next pair object: one per member, each the base of its
@@ -1317,12 +1534,12 @@ func (cx *jpCtx) memberOf(item jpItem, key string) (jpItem, bool, error) {
 		if err := cx.charge(int64(examined)); err != nil {
 			return jpItem{}, false, err
 		}
-	case cx.strict:
+	case cx.structural():
 		return jpItem{}, false, newError(SqlJsonMemberNotFound, "jsonpath member accessor can only be applied to an object")
 	default:
 		return jpItem{}, false, nil
 	}
-	if !found && cx.strict {
+	if !found && cx.structural() {
 		return jpItem{}, false, newError(SqlJsonMemberNotFound, "JSON object does not contain key \""+key+"\"")
 	}
 	return child, found, nil
@@ -1344,7 +1561,7 @@ func (cx *jpCtx) subscriptRange(sub *jpSubscript, size int64, current jpItem, ba
 			return 0, 0, err
 		}
 	}
-	if cx.strict && (from < 0 || from > to || to >= size) {
+	if cx.structural() && (from < 0 || from > to || to >= size) {
 		return 0, 0, newError(InvalidSqlJsonSubscript, "jsonpath array subscript is out of bounds")
 	}
 	return max(from, 0), min(to, size-1), nil
@@ -1416,9 +1633,130 @@ func (cx *jpCtx) evalPred(pred *jpPred, current jpItem, base jpBase, last int64)
 			return nil, err
 		}
 		return boolPtr(!*v), nil
+	case jpPredIsUnknown:
+		v, err := cx.evalPred(pred.left, current, base, last)
+		if err != nil {
+			return nil, err
+		}
+		return boolPtr(v == nil), nil
+	case jpPredExists:
+		return cx.evalExists(&pred.cmpLeft, current, base, last)
+	case jpPredStartsWith:
+		return cx.evalStartsWith(pred, current, base, last)
+	case jpPredLikeRegex:
+		return cx.evalLikeRegex(pred, current, base, last)
 	default:
 		return cx.evalCompare(&pred.cmpLeft, pred.cmpOp, &pred.cmpRight, current, base, last)
 	}
+}
+
+// evalExists is `exists (e)` (§4.4 rule 6): true when e's sequence is non-empty, unknown when
+// evaluating it raises a SQL/JSON error. Lax stops at the first item; strict evaluates them all.
+func (cx *jpCtx) evalExists(e *jpPathExpr, current jpItem, base jpBase, last int64) (*bool, error) {
+	var seq []jpItem
+	if err := cx.runExpr(e, current, base, last, !cx.strict, &seq); err != nil {
+		if isSQLJSONError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return boolPtr(len(seq) > 0), nil
+}
+
+// combinePairs combines an existential predicate's n pair results in order (§4.4 rule 3): lax is
+// true at the first true pair, else unknown if any pair was, else false; strict is unknown at the
+// first unknown pair, else true if any pair was, else false. A pair test charges its own work.
+func (cx *jpCtx) combinePairs(n int, test func(k int) (*bool, error)) (*bool, error) {
+	found, anyUnknown := false, false
+	for k := 0; k < n; k++ {
+		c, err := test(k)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case c == nil && cx.strict:
+			return nil, nil
+		case c == nil:
+			anyUnknown = true
+		case *c && !cx.strict:
+			return boolPtr(true), nil
+		case *c:
+			found = true
+		}
+	}
+	switch {
+	case found:
+		return boolPtr(true), nil
+	case anyUnknown:
+		return nil, nil
+	default:
+		return boolPtr(false), nil
+	}
+}
+
+// chargeStringCompare charges a SQL comparison's size extra for two strings: varlen_compare per
+// code point of the shorter one beyond the first (§7 rule 4).
+func (cx *jpCtx) chargeStringCompare(a, b string) error {
+	w := min(utf8.RuneCountInString(a), utf8.RuneCountInString(b))
+	cx.m.Charge(costs.VarlenCompare * int64(max(w, 1)-1))
+	return cx.m.Guard()
+}
+
+// evalStartsWith is `l starts with r` (§4.4 rule 5): l's items (lax-unwrapped) against r's (not
+// unwrapped); a pair of strings is true when the left begins with the right, any other pair unknown.
+func (cx *jpCtx) evalStartsWith(pred *jpPred, current jpItem, base jpBase, last int64) (*bool, error) {
+	ls, ok, err := cx.evalOperand(&pred.cmpLeft, current, base, last)
+	if err != nil || !ok {
+		return nil, err
+	}
+	rs, err := cx.evalSeq(&pred.cmpRight, current, base, last, false)
+	if err != nil {
+		if isSQLJSONError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return cx.combinePairs(len(ls)*len(rs), func(k int) (*bool, error) {
+		if err := cx.charge(1); err != nil {
+			return nil, err
+		}
+		a, b := ls[k/len(rs)].scalarNode(), rs[k%len(rs)].scalarNode()
+		if a == nil || b == nil || a.Kind != JString || b.Kind != JString {
+			return nil, nil
+		}
+		if err := cx.chargeStringCompare(a.S, b.S); err != nil {
+			return nil, err
+		}
+		return boolPtr(strings.HasPrefix(a.S, b.S)), nil
+	})
+}
+
+// evalLikeRegex is `l like_regex "p"` (§4.4 rule 5): each of l's items (lax-unwrapped) is true when it
+// is a string the pattern matches, false when a string it does not, unknown otherwise. The match
+// charges its regex_step units (regex.md §6).
+func (cx *jpCtx) evalLikeRegex(pred *jpPred, current jpItem, base jpBase, last int64) (*bool, error) {
+	ls, ok, err := cx.evalOperand(&pred.cmpLeft, current, base, last)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return cx.combinePairs(len(ls), func(k int) (*bool, error) {
+		if err := cx.charge(1); err != nil {
+			return nil, err
+		}
+		a := ls[k].scalarNode()
+		if a == nil || a.Kind != JString {
+			return nil, nil
+		}
+		subject := a.S
+		if pred.flags&jpRegexI != 0 {
+			subject = foldLowerSimple(subject, loadedProperty())
+		}
+		matched, err := pred.regex.isMatch([]rune(subject), cx.m)
+		if err != nil {
+			return nil, err
+		}
+		return boolPtr(matched), nil
+	})
 }
 
 // evalCompare is an existential comparison (§4.4) over every pair (a in lhs-seq, b in rhs-seq), left
@@ -1435,49 +1773,25 @@ func (cx *jpCtx) evalCompare(l *jpPathExpr, op jpCmpOp, r *jpPathExpr, current j
 	if err != nil || !ok {
 		return nil, err
 	}
-	strict := cx.strict
-	found := false
-	anyUnknown := false
-	for i := range ls {
-		for j := range rs {
-			if err := cx.charge(1); err != nil {
+	return cx.combinePairs(len(ls)*len(rs), func(k int) (*bool, error) {
+		if err := cx.charge(1); err != nil {
+			return nil, err
+		}
+		x, y := ls[k/len(rs)], rs[k%len(rs)]
+		a, b := x.scalarNode(), y.scalarNode()
+		switch {
+		case a != nil && b != nil && a.Kind == JString && b.Kind == JString:
+			if err := cx.chargeStringCompare(a.S, b.S); err != nil {
 				return nil, err
 			}
-			a, b := ls[i].scalarNode(), rs[j].scalarNode()
-			switch {
-			case a != nil && b != nil && a.Kind == JString && b.Kind == JString:
-				w := min(utf8.RuneCountInString(a.S), utf8.RuneCountInString(b.S))
-				cx.m.Charge(costs.VarlenCompare * int64(max(w, 1)-1))
-				if err := cx.m.Guard(); err != nil {
-					return nil, err
-				}
-			case a != nil && b != nil && a.Kind == JNumber && b.Kind == JNumber:
-				cx.m.Charge(costs.DecimalWork * (workLinear(a.Num, b.Num) - 1))
-				if err := cx.m.Guard(); err != nil {
-					return nil, err
-				}
-			}
-			c := jpCompareItems(ls[i], op, rs[j])
-			switch {
-			case c == nil && strict:
-				return nil, nil
-			case c == nil:
-				anyUnknown = true
-			case *c && !strict:
-				return boolPtr(true), nil
-			case *c:
-				found = true
+		case a != nil && b != nil && a.Kind == JNumber && b.Kind == JNumber:
+			cx.m.Charge(costs.DecimalWork * (workLinear(a.Num, b.Num) - 1))
+			if err := cx.m.Guard(); err != nil {
+				return nil, err
 			}
 		}
-	}
-	switch {
-	case found:
-		return boolPtr(true), nil
-	case anyUnknown:
-		return nil, nil
-	default:
-		return boolPtr(false), nil
-	}
+		return jpCompareItems(x, op, y), nil
+	})
 }
 
 // evalOperand evaluates a comparison operand to its item sequence, an array item unwrapped one level
@@ -2187,13 +2501,17 @@ type jpParser struct {
 	inFilter int
 	// inSubscript is how many subscripts enclose the cursor — `last` is valid only inside one.
 	inSubscript int
+	// regexInsts is the instruction count of the like_regex programs compiled so far.
+	regexInsts int64
 }
 
 // jpParsed is a parsed operand: an expression or a predicate — PostgreSQL's expr_or_predicate.
 // Exactly one is non-nil. A parenthesized predicate is an expression only when accessors follow it.
+// parenPred marks a predicate that is exactly `( predicate )`, the only operand of `is unknown`.
 type jpParsed struct {
-	expr *jpPathExpr
-	pred *jpPred
+	expr      *jpPathExpr
+	pred      *jpPred
+	parenPred bool
 }
 
 // needExpr requires an expression where the grammar takes one (42601 for a bare predicate).
@@ -2594,6 +2912,9 @@ func (p *jpParser) parsePostfix() (jpParsed, error) {
 			return jpParsed{}, err
 		}
 		if len(steps) == 0 {
+			if inner.pred != nil {
+				inner.parenPred = true
+			}
 			return inner, nil
 		}
 		if inner.pred != nil {
@@ -2671,7 +2992,12 @@ func (p *jpParser) parsePostfix() (jpParsed, error) {
 			}
 			e.primary = jpLast
 		case jpKeywordIs(word, "exists"):
-			return jpParsed{}, jpUnsupported("exists predicates")
+			pred, err := p.parseExists()
+			if err != nil {
+				return jpParsed{}, err
+			}
+			// No accessors follow `exists (…)`: it is a predicate, not an expression.
+			return jpParsed{pred: pred}, nil
 		default:
 			return jpParsed{}, jpMalformed("a name is not an operand")
 		}
@@ -2797,11 +3123,15 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			nc, ok := p.peek()
 			switch {
 			case p.eat('*'):
-				// `.**` — the any-level accessor — is a deferred follow-on.
-				if c, ok := p.peek(); ok && c == '*' {
-					return nil, jpUnsupported("the .** accessor")
+				if p.eat('*') {
+					step, err := p.parseAnyLevels()
+					if err != nil {
+						return nil, err
+					}
+					steps = append(steps, step)
+				} else {
+					steps = append(steps, jpStep{kind: jpWildcardMember})
 				}
-				steps = append(steps, jpStep{kind: jpWildcardMember})
 			case ok && nc == '"':
 				k, err := p.parseQuoted()
 				if err != nil {
@@ -2880,6 +3210,71 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			return steps, nil
 		}
 	}
+}
+
+// parseAnyLevels parses the optional `{level}` / `{level to level}` after `.**` (jsonpath.md §2).
+func (p *jpParser) parseAnyLevels() (jpStep, error) {
+	step := jpStep{kind: jpAnyStep, first: 0, last: jpLevelLast}
+	save := p.i
+	if err := p.skipWs(); err != nil {
+		return jpStep{}, err
+	}
+	if !p.eat('{') {
+		p.i = save
+		return step, nil
+	}
+	first, err := p.parseAnyLevel()
+	if err != nil {
+		return jpStep{}, err
+	}
+	last := first
+	if err := p.skipWs(); err != nil {
+		return jpStep{}, err
+	}
+	if p.eatKeyword("to") {
+		if last, err = p.parseAnyLevel(); err != nil {
+			return jpStep{}, err
+		}
+		if err := p.skipWs(); err != nil {
+			return jpStep{}, err
+		}
+	}
+	if !p.eat('}') {
+		return jpStep{}, jpMalformed("expected `}` after a .** level")
+	}
+	step.first, step.last = first, last
+	return step, nil
+}
+
+// parseAnyLevel parses one `.**` level: an unsigned integer literal (PostgreSQL's INT_P, at most
+// 2147483647, else 22003) or `last`.
+func (p *jpParser) parseAnyLevel() (int64, error) {
+	if err := p.skipWs(); err != nil {
+		return 0, err
+	}
+	if p.eatKeyword("last") {
+		return jpLevelLast, nil
+	}
+	start := p.i
+	for p.i < len(p.s) && isASCIIDigit(p.s[p.i]) {
+		p.i++
+	}
+	digits := string(p.s[start:p.i])
+	if digits == "" {
+		return 0, jpMalformed("expected a .** level")
+	}
+	// A number running into a name character, a leading zero, or a fraction is not an integer.
+	if c, ok := p.peek(); ok && (c == '.' || jpIsOther(c)) {
+		return 0, jpMalformed("trailing junk after numeric literal")
+	}
+	if len(digits) > 1 && digits[0] == '0' {
+		return 0, jpMalformed("trailing junk after numeric literal")
+	}
+	v, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil || v > 2147483647 {
+		return 0, newError(NumericValueOutOfRange, `value "`+digits+`" is out of range for type integer`)
+	}
+	return v, nil
 }
 
 // parseMethod parses an item method's argument list (the cursor is at its `(`). Method names are
@@ -3043,7 +3438,11 @@ func (p *jpParser) parseNot() (jpParsed, error) {
 				return jpParsed{}, err
 			}
 			if p.eatKeyword("exists") {
-				return jpParsed{}, jpUnsupported("exists predicates")
+				inner, err := p.parseExists()
+				if err != nil {
+					return jpParsed{}, err
+				}
+				return jpParsed{pred: &jpPred{kind: jpPredNot, left: inner}}, nil
 			}
 			if !p.eat('(') {
 				return jpParsed{}, jpMalformed("expected `(` after `!`")
@@ -3068,29 +3467,67 @@ func (p *jpParser) parseNot() (jpParsed, error) {
 	return p.parseComparison()
 }
 
-// parseComparison parses `expr cmp expr`, or a lone expression or parenthesized predicate. The word
-// predicates (`like_regex`, `starts with`, `is unknown`) are a deferred follow-on.
+// parseExists parses `exists (expr)` after its keyword (jsonpath.md §2): the operand is an
+// expression, not a predicate.
+func (p *jpParser) parseExists() (*jpPred, error) {
+	if err := p.skipWs(); err != nil {
+		return nil, err
+	}
+	if !p.eat('(') {
+		return nil, jpMalformed("expected `(` after exists")
+	}
+	if err := p.deepen(); err != nil {
+		return nil, err
+	}
+	e, err := needExpr(p.parseOr())
+	if err != nil {
+		return nil, err
+	}
+	p.depth--
+	if err := p.skipWs(); err != nil {
+		return nil, err
+	}
+	if !p.eat(')') {
+		return nil, jpMalformed("expected `)` after exists (")
+	}
+	return &jpPred{kind: jpPredExists, cmpLeft: *e}, nil
+}
+
+// parseComparison parses `expr cmp expr`, `expr starts with s`, `expr like_regex "p" [flag "f"]`,
+// `(predicate) is unknown` (repeatable), or a lone expression or predicate.
 func (p *jpParser) parseComparison() (jpParsed, error) {
 	left, err := p.parseAdditive()
 	if err != nil {
 		return jpParsed{}, err
 	}
 	if left.pred != nil {
-		if err := p.skipWs(); err != nil {
-			return jpParsed{}, err
-		}
-		if p.wordAhead() {
+		// `is unknown` applies only to a parenthesized predicate, and its result is one too.
+		for left.parenPred {
+			if err := p.skipWs(); err != nil {
+				return jpParsed{}, err
+			}
+			if !p.wordAhead() {
+				break
+			}
 			start := p.i
 			word, err := p.scanWord()
 			if err != nil {
 				return jpParsed{}, err
 			}
-			if jpKeywordIs(word, "is") {
-				return jpParsed{}, jpUnsupported("is unknown predicates")
+			if !jpKeywordIs(word, "is") {
+				p.i = start
+				break
 			}
-			p.i = start
+			if err := p.skipWs(); err != nil {
+				return jpParsed{}, err
+			}
+			if !p.eatKeyword("unknown") {
+				return jpParsed{}, jpMalformed("expected `unknown` after `is`")
+			}
+			left = jpParsed{pred: &jpPred{kind: jpPredIsUnknown, left: left.pred}}
+			// `(p) is unknown is unknown` is not PostgreSQL's grammar; only a parenthesized one nests.
 		}
-		return left, nil
+		return jpParsed{pred: left.pred}, nil
 	}
 	if err := p.skipWs(); err != nil {
 		return jpParsed{}, err
@@ -3110,16 +3547,19 @@ func (p *jpParser) parseComparison() (jpParsed, error) {
 	case p.eat('>'):
 		op = jpCmpGt
 	default:
-		// A word predicate operator is a deferred follow-on. The name is lexed first, so its escape
-		// error wins; any other name is trailing input.
+		// A word predicate operator. The name is lexed first, so its escape error wins; any other
+		// name is trailing input.
 		if p.wordAhead() {
 			start := p.i
 			word, err := p.scanWord()
 			if err != nil {
 				return jpParsed{}, err
 			}
-			if jpKeywordIs(word, "like_regex") || jpKeywordIs(word, "starts") {
-				return jpParsed{}, jpUnsupported("predicates other than a comparison (like_regex / starts with)")
+			switch {
+			case jpKeywordIs(word, "starts"):
+				return p.parseStartsWith(left.expr)
+			case jpKeywordIs(word, "like_regex"):
+				return p.parseLikeRegex(left.expr)
 			}
 			p.i = start
 		}
@@ -3130,6 +3570,113 @@ func (p *jpParser) parseComparison() (jpParsed, error) {
 		return jpParsed{}, err
 	}
 	return jpParsed{pred: &jpPred{kind: jpPredCompare, cmpLeft: *left.expr, cmpOp: op, cmpRight: *right}}, nil
+}
+
+// parseStartsWith parses the rest of `expr starts with s` after `starts`: s is a string literal or a
+// variable (jsonpath.md §2).
+func (p *jpParser) parseStartsWith(left *jpPathExpr) (jpParsed, error) {
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
+	if !p.eatKeyword("with") {
+		return jpParsed{}, jpMalformed("expected `with` after `starts`")
+	}
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
+	right := jpPathExpr{}
+	c, ok := p.peek()
+	switch {
+	case ok && c == '"':
+		str, err := p.parseQuoted()
+		if err != nil {
+			return jpParsed{}, err
+		}
+		right.primary, right.lit = jpLiteral, JsonNode{Kind: JString, S: str}
+	case ok && c == '$':
+		v, err := p.parsePostfix()
+		if err != nil {
+			return jpParsed{}, err
+		}
+		if v.expr == nil || v.expr.primary != jpVar || len(v.expr.steps) > 0 {
+			return jpParsed{}, jpMalformed("starts with takes a string or a variable")
+		}
+		right = *v.expr
+	default:
+		return jpParsed{}, jpMalformed("starts with takes a string or a variable")
+	}
+	return jpParsed{pred: &jpPred{kind: jpPredStartsWith, cmpLeft: *left, cmpRight: right}}, nil
+}
+
+// parseLikeRegex parses the rest of `expr like_regex "pattern" [flag "flags"]` after `like_regex`
+// and compiles the pattern (jsonpath.md §4.3): an unknown flag is 42601, `x` or `m` without `q`
+// 0A000, a malformed pattern 2201B.
+func (p *jpParser) parseLikeRegex(left *jpPathExpr) (jpParsed, error) {
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
+	if c, ok := p.peek(); !ok || c != '"' {
+		return jpParsed{}, jpMalformed("like_regex takes a string pattern")
+	}
+	pattern, err := p.parseQuoted()
+	if err != nil {
+		return jpParsed{}, err
+	}
+	var flags uint8
+	save := p.i
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
+	if p.eatKeyword("flag") {
+		if err := p.skipWs(); err != nil {
+			return jpParsed{}, err
+		}
+		if c, ok := p.peek(); !ok || c != '"' {
+			return jpParsed{}, jpMalformed("flag takes a string")
+		}
+		text, err := p.parseQuoted()
+		if err != nil {
+			return jpParsed{}, err
+		}
+		for _, c := range text {
+			i := strings.IndexRune(jpRegexFlagChars, c)
+			if i < 0 {
+				return jpParsed{}, jpMalformed(`unrecognized flag character "` + string(c) + `" in LIKE_REGEX predicate`)
+			}
+			flags |= 1 << i
+		}
+	} else {
+		p.i = save
+	}
+	if flags&jpRegexQ == 0 {
+		if flags&jpRegexX != 0 {
+			return jpParsed{}, newError(FeatureNotSupported, `XQuery "x" flag (expanded regular expressions) is not implemented`)
+		}
+		if flags&jpRegexM != 0 {
+			return jpParsed{}, jpUnsupported(`like_regex "m" flag`)
+		}
+	}
+	prog, err := jpCompileLikeRegex(pattern, flags)
+	if err != nil {
+		return jpParsed{}, err
+	}
+	p.regexInsts += int64(prog.ninst())
+	return jpParsed{pred: &jpPred{kind: jpPredLikeRegex, cmpLeft: *left, pattern: pattern, flags: flags, regex: prog}}, nil
+}
+
+// jpCompileLikeRegex compiles a like_regex pattern under its flags (jsonpath.md §4.3, regex.md §8d):
+// `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+func jpCompileLikeRegex(pattern string, flags uint8) (*regexProgram, error) {
+	if flags&jpRegexI != 0 {
+		pattern = foldLowerSimple(pattern, loadedProperty())
+	}
+	if flags&jpRegexQ != 0 {
+		return compileRegexMode(quoteRegex(pattern), regexMode{})
+	}
+	if flags&jpRegexS != 0 {
+		return compileRegexMode(pattern, regexMode{dotAll: true})
+	}
+	return compileRegexMode(pattern, regexMode{nlStop: true})
 }
 
 // parseAdditive parses `+` and `-`, left-associative.

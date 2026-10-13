@@ -2,11 +2,12 @@
 //
 // The compiled surface: lax/strict mode; a primary (`$`, `@` inside a filter, a scalar literal,
 // `last` inside a subscript, or a parenthesized expression or predicate) followed by accessor steps
-// (`.key`, `.*`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the item
-// methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
-// Path variables (`$name`, `$"name"`) are bound by the caller's Vars. Still deferred (a valid-PG
-// path using one → `0A000` at compile): `like_regex` / `starts with` / `is unknown` / `exists`
-// predicates and `.**`. The datetime methods are `0A000` by decision (jsonpath.md §3.1). A malformed path is `42601`. The compiled program is a pure function of the source — kept
+// (`.key`, `.*`, `.**`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the
+// item methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level predicate
+// (comparison, `exists`, `like_regex`, `starts with`, `is unknown`, §4.4). Path variables (`$name`,
+// `$"name"`) are bound by the caller's Vars. The datetime methods and the `like_regex` `m` flag are
+// `0A000` (jsonpath.md §3.1, §4.3). A malformed path is `42601`. The compiled program is a pure
+// function of the source — kept
 // byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
 // codegenned).
 //
@@ -28,6 +29,14 @@ import { EngineError, engineError } from "./errors.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { utf8Length } from "./memsize.ts";
+import { foldLowerSimple, loadedProperty } from "./collation.ts";
+import {
+  type RegexProgram,
+  compileRegexMode,
+  quoteRegex,
+  regexIsMatch,
+  regexNinst,
+} from "./regex.ts";
 import { compareTextC } from "./value.ts";
 import {
   HIGH_SURROGATE_DETAIL,
@@ -94,7 +103,13 @@ export type Step =
   | { kind: "subscripts"; subs: Subscript[] } // `[s, …]` — one or more subscripts.
   | { kind: "wildcardElement" } // `[*]` — the wildcard element accessor.
   | { kind: "filter"; pred: Pred } // `?(predicate)` — a filter (§4).
-  | { kind: "method"; method: Method }; // `.name(…)` — an item method (§3.1).
+  | { kind: "method"; method: Method } // `.name(…)` — an item method (§3.1).
+  // `.**{first to last}` — the item and its descendants within the level bounds (§3.3); a bound of
+  // `last` is LEVEL_LAST.
+  | { kind: "any"; first: number; last: number };
+
+// LEVEL_LAST is a `.**` level bound of `last`: PostgreSQL stores it as the largest uint32.
+const LEVEL_LAST = 4294967295;
 
 // Where a path starts: `$` (the context item), `@` (the item a filter is testing), a scalar literal,
 // `last` (the innermost subscripted array's last index — subscript expressions only), unary
@@ -126,8 +141,9 @@ function arithPriority(op: ArithOp): number {
 export type PathExpr = { primary: Primary; steps: Step[] };
 
 // A parsed operand: an expression or a predicate — PostgreSQL's expr_or_predicate. A parenthesized
-// predicate is an expression only when accessors follow it.
-type Parsed = { kind: "expr"; expr: PathExpr } | { kind: "pred"; pred: Pred };
+// predicate is an expression only when accessors follow it. parenPred marks a predicate that is
+// exactly `( predicate )`, the only operand of `is unknown`.
+type Parsed = { kind: "expr"; expr: PathExpr } | { kind: "pred"; pred: Pred; parenPred?: boolean };
 
 // needExpr requires an expression where the grammar takes one (42601 for a bare predicate).
 function needExpr(p: Parsed): PathExpr {
@@ -148,7 +164,25 @@ export type Pred =
   | { kind: "and"; a: Pred; b: Pred }
   | { kind: "not"; p: Pred }
   // `lhs cmp rhs` — an existential comparison (true if SOME pair of items compares true).
-  | { kind: "compare"; lhs: PathExpr; op: CmpOp; rhs: PathExpr };
+  | { kind: "compare"; lhs: PathExpr; op: CmpOp; rhs: PathExpr }
+  // `exists (e)` — e's sequence is non-empty.
+  | { kind: "exists"; e: PathExpr }
+  // `(p) is unknown`.
+  | { kind: "isUnknown"; p: Pred }
+  // `lhs starts with rhs` — rhs a string literal or a variable.
+  | { kind: "startsWith"; lhs: PathExpr; rhs: PathExpr }
+  // `lhs like_regex "pattern" flag "flags"` — the pattern as written, its flag bits, and its program.
+  | { kind: "likeRegex"; lhs: PathExpr; pattern: string; flags: number; regex: RegexProgram };
+
+// like_regex flag bits, in PostgreSQL's print order (jsonpath.md §2.3).
+const REGEX_I = 1;
+const REGEX_S = 2;
+const REGEX_M = 4;
+const REGEX_X = 8;
+const REGEX_Q = 16;
+
+// REGEX_FLAG_CHARS is the flag characters in bit order.
+const REGEX_FLAG_CHARS = "ismxq";
 
 // A jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
 export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
@@ -162,7 +196,9 @@ export type PathBody =
   | { kind: "predicate"; pred: Pred };
 
 // A compiled jsonpath: a mode flag + a body that is EITHER an accessor path OR a top-level predicate.
-export type JsonPath = { strict: boolean; body: PathBody };
+// regexInsts is the instruction count of every like_regex program in the path, which a metered
+// compile charges as regex_compile (jsonpath.md §7).
+export type JsonPath = { strict: boolean; body: PathBody; regexInsts: number };
 
 // A jsonpath construct that is valid in PostgreSQL but not yet supported by jed (a deferred
 // follow-on): `0A000`, a documented divergence.
@@ -294,6 +330,8 @@ class Parser {
   private inFilter: number;
   // inSubscript: how many subscripts enclose the cursor — `last` is valid only inside one.
   private inSubscript: number;
+  // regexInsts: the instruction count of the like_regex programs compiled so far.
+  private regexInsts: number;
 
   constructor(src: string) {
     this.s = src;
@@ -301,6 +339,7 @@ class Parser {
     this.depth = 0;
     this.inFilter = 0;
     this.inSubscript = 0;
+    this.regexInsts = 0;
   }
 
   // deepen descends one program nesting level, enforcing MAX_JSON_DEPTH (json.md §6.4). The caller
@@ -438,9 +477,10 @@ class Parser {
     const body = this.parseOr();
     this.skipWs();
     if (this.peek() !== undefined) throw malformed("unexpected trailing input");
+    const regexInsts = this.regexInsts;
     return body.kind === "expr"
-      ? { strict, body: { kind: "path", expr: body.expr } }
-      : { strict, body: { kind: "predicate", pred: body.pred } };
+      ? { strict, body: { kind: "path", expr: body.expr }, regexInsts }
+      : { strict, body: { kind: "predicate", pred: body.pred }, regexInsts };
   }
 
   // parsePostfix parses a primary and its accessor steps (PostgreSQL's accessor_expr). A
@@ -456,7 +496,9 @@ class Parser {
       this.skipWs();
       if (!this.eat(")")) throw malformed("expected `)`");
       const steps = this.parseSteps();
-      if (steps.length === 0) return inner;
+      if (steps.length === 0) {
+        return inner.kind === "pred" ? { kind: "pred", pred: inner.pred, parenPred: true } : inner;
+      }
       if (inner.kind === "pred") {
         return { kind: "expr", expr: { primary: { kind: "pred", pred: inner.pred }, steps } };
       }
@@ -509,7 +551,8 @@ class Parser {
         if (this.inSubscript === 0) throw malformed("LAST is allowed only in array subscripts");
         primary = { kind: "last" };
       } else if (keywordIs(word, "exists")) {
-        throw unsupported("exists predicates");
+        // No accessors follow `exists (…)`: it is a predicate, not an expression.
+        return { kind: "pred", pred: this.parseExists() };
       } else {
         throw malformed("a name is not an operand");
       }
@@ -597,9 +640,7 @@ class Parser {
         this.skipWs();
         const next = this.peek();
         if (this.eat("*")) {
-          // `.**` — the any-level accessor — is a deferred follow-on.
-          if (this.peek() === "*") throw unsupported("the .** accessor");
-          steps.push({ kind: "wildcardMember" });
+          steps.push(this.eat("*") ? this.parseAnyLevels() : { kind: "wildcardMember" });
         } else if (next === '"') {
           steps.push({ kind: "member", key: this.parseQuoted() });
         } else if (this.wordAhead()) {
@@ -649,6 +690,50 @@ class Parser {
       }
     }
     return steps;
+  }
+
+  // parseAnyLevels parses the optional `{level}` / `{level to level}` after `.**` (jsonpath.md §2).
+  private parseAnyLevels(): Step {
+    const save = this.i;
+    this.skipWs();
+    if (!this.eat("{")) {
+      this.i = save;
+      return { kind: "any", first: 0, last: LEVEL_LAST };
+    }
+    const first = this.parseAnyLevel();
+    let last = first;
+    this.skipWs();
+    if (this.eatKeyword("to")) {
+      last = this.parseAnyLevel();
+      this.skipWs();
+    }
+    if (!this.eat("}")) throw malformed("expected `}` after a .** level");
+    return { kind: "any", first, last };
+  }
+
+  // parseAnyLevel parses one `.**` level: an unsigned integer literal (PostgreSQL's INT_P, at most
+  // 2147483647, else 22003) or `last`.
+  private parseAnyLevel(): number {
+    this.skipWs();
+    if (this.eatKeyword("last")) return LEVEL_LAST;
+    const start = this.i;
+    while (isAsciiDigit(this.peek())) this.i += 1;
+    const digits = this.s.slice(start, this.i);
+    if (digits === "") throw malformed("expected a .** level");
+    // A number running into a name character, a leading zero, or a fraction is not an integer.
+    const c = this.peek();
+    if (c === "." || isOther(c)) throw malformed("trailing junk after numeric literal");
+    if (digits.length > 1 && digits.startsWith("0")) {
+      throw malformed("trailing junk after numeric literal");
+    }
+    const v = BigInt(digits);
+    if (v > 2147483647n) {
+      throw engineError(
+        "numeric_value_out_of_range",
+        `value "${digits}" is out of range for type integer`,
+      );
+    }
+    return Number(v);
   }
 
   // Parse an item method's argument list (the cursor is at its `(`). Method names are matched
@@ -763,7 +848,9 @@ class Parser {
     if (this.peek() === "!" && this.peekAt(1) !== "=") {
       this.i += 1;
       this.skipWs();
-      if (this.eatKeyword("exists")) throw unsupported("exists predicates");
+      if (this.eatKeyword("exists")) {
+        return { kind: "pred", pred: { kind: "not", p: this.parseExists() } };
+      }
       if (!this.eat("(")) {
         throw malformed("expected `(` after `!`");
       }
@@ -779,18 +866,39 @@ class Parser {
     return this.parseComparison();
   }
 
-  // parseComparison parses `expr cmp expr`, or a lone expression or parenthesized predicate. The
-  // word predicates (`like_regex`, `starts with`, `is unknown`) are a deferred follow-on.
+  // parseExists parses `exists (expr)` after its keyword (jsonpath.md §2): the operand is an
+  // expression, not a predicate.
+  private parseExists(): Pred {
+    this.skipWs();
+    if (!this.eat("(")) throw malformed("expected `(` after exists");
+    this.deepen();
+    const e = needExpr(this.parseOr());
+    this.depth -= 1;
+    this.skipWs();
+    if (!this.eat(")")) throw malformed("expected `)` after exists (");
+    return { kind: "exists", e };
+  }
+
+  // parseComparison parses `expr cmp expr`, `expr starts with s`, `expr like_regex "p" [flag "f"]`,
+  // `(predicate) is unknown` (repeatable), or a lone expression or predicate.
   private parseComparison(): Parsed {
-    const left = this.parseAdditive();
+    let left = this.parseAdditive();
     if (left.kind === "pred") {
-      this.skipWs();
-      if (this.wordAhead()) {
+      // `is unknown` applies only to a parenthesized predicate, and its result is one too.
+      while (left.kind === "pred" && left.parenPred === true) {
+        this.skipWs();
+        if (!this.wordAhead()) break;
         const start = this.i;
-        if (keywordIs(this.scanWord(), "is")) throw unsupported("is unknown predicates");
-        this.i = start;
+        if (!keywordIs(this.scanWord(), "is")) {
+          this.i = start;
+          break;
+        }
+        this.skipWs();
+        if (!this.eatKeyword("unknown")) throw malformed("expected `unknown` after `is`");
+        // `(p) is unknown is unknown` is not PostgreSQL's grammar; only a parenthesized one nests.
+        left = { kind: "pred", pred: { kind: "isUnknown", p: left.pred } };
       }
-      return left;
+      return { kind: "pred", pred: left.pred };
     }
     this.skipWs();
     let op: CmpOp;
@@ -807,20 +915,81 @@ class Parser {
     } else if (this.eat(">")) {
       op = "gt";
     } else {
-      // A word predicate operator is a deferred follow-on. The name is lexed first, so its escape
-      // error wins; any other name is trailing input.
+      // A word predicate operator. The name is lexed first, so its escape error wins; any other
+      // name is trailing input.
       if (this.wordAhead()) {
         const start = this.i;
         const word = this.scanWord();
-        if (keywordIs(word, "like_regex") || keywordIs(word, "starts")) {
-          throw unsupported("predicates other than a comparison (like_regex / starts with)");
-        }
+        if (keywordIs(word, "starts")) return this.parseStartsWith(left.expr);
+        if (keywordIs(word, "like_regex")) return this.parseLikeRegex(left.expr);
         this.i = start;
       }
       return left;
     }
     const rhs = needExpr(this.parseAdditive());
     return { kind: "pred", pred: { kind: "compare", lhs: left.expr, op, rhs } };
+  }
+
+  // parseStartsWith parses the rest of `expr starts with s` after `starts`: s is a string literal or
+  // a variable (jsonpath.md §2).
+  private parseStartsWith(lhs: PathExpr): Parsed {
+    this.skipWs();
+    if (!this.eatKeyword("with")) throw malformed("expected `with` after `starts`");
+    this.skipWs();
+    let rhs: PathExpr;
+    const c = this.peek();
+    if (c === '"') {
+      rhs = {
+        primary: { kind: "lit", node: { kind: "string", value: this.parseQuoted() } },
+        steps: [],
+      };
+    } else if (c === "$") {
+      const v = this.parsePostfix();
+      if (v.kind !== "expr" || v.expr.primary.kind !== "var" || v.expr.steps.length > 0) {
+        throw malformed("starts with takes a string or a variable");
+      }
+      rhs = v.expr;
+    } else {
+      throw malformed("starts with takes a string or a variable");
+    }
+    return { kind: "pred", pred: { kind: "startsWith", lhs, rhs } };
+  }
+
+  // parseLikeRegex parses the rest of `expr like_regex "pattern" [flag "flags"]` after `like_regex`
+  // and compiles the pattern (jsonpath.md §4.3): an unknown flag is 42601, `x` or `m` without `q`
+  // 0A000, a malformed pattern 2201B.
+  private parseLikeRegex(lhs: PathExpr): Parsed {
+    this.skipWs();
+    if (this.peek() !== '"') throw malformed("like_regex takes a string pattern");
+    const pattern = this.parseQuoted();
+    let flags = 0;
+    const save = this.i;
+    this.skipWs();
+    if (this.eatKeyword("flag")) {
+      this.skipWs();
+      if (this.peek() !== '"') throw malformed("flag takes a string");
+      for (const c of this.parseQuoted()) {
+        const i = REGEX_FLAG_CHARS.indexOf(c);
+        if (i < 0) {
+          throw malformed(`unrecognized flag character "${c}" in LIKE_REGEX predicate`);
+        }
+        flags |= 1 << i;
+      }
+    } else {
+      this.i = save;
+    }
+    if ((flags & REGEX_Q) === 0) {
+      if ((flags & REGEX_X) !== 0) {
+        throw engineError(
+          "feature_not_supported",
+          'XQuery "x" flag (expanded regular expressions) is not implemented',
+        );
+      }
+      if ((flags & REGEX_M) !== 0) throw unsupported('like_regex "m" flag');
+    }
+    const regex = compileLikeRegex(pattern, flags);
+    this.regexInsts += regexNinst(regex);
+    return { kind: "pred", pred: { kind: "likeRegex", lhs, pattern, flags, regex } };
   }
 
   // parseAdditive parses `+` and `-`, left-associative.
@@ -1043,6 +1212,17 @@ class Parser {
   }
 }
 
+// compileLikeRegex compiles a like_regex pattern under its flags (jsonpath.md §4.3, regex.md §8d):
+// `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+function compileLikeRegex(pattern: string, flags: number): RegexProgram {
+  const p = (flags & REGEX_I) !== 0 ? foldLowerSimple(pattern, loadedProperty()) : pattern;
+  if ((flags & REGEX_Q) !== 0) {
+    return compileRegexMode(quoteRegex(p), { nlStop: false, dotAll: false });
+  }
+  if ((flags & REGEX_S) !== 0) return compileRegexMode(p, { nlStop: false, dotAll: true });
+  return compileRegexMode(p, { nlStop: true, dotAll: false });
+}
+
 // compile compiles a jsonpath source string. Malformed → `42601`; a valid-PG but unsupported
 // construct → `0A000`.
 export function compile(src: string): JsonPath {
@@ -1087,6 +1267,7 @@ function predPriority(pred: Pred): number {
     case "and":
       return 1;
     case "compare":
+    case "startsWith":
       return 2;
     default:
       return 6;
@@ -1135,7 +1316,13 @@ function writeExpr(e: PathExpr, brackets: boolean): string {
       break;
     }
     case "pred":
-      out = writePred(p.pred, wrap);
+      // A predicate that prints without its own brackets (`!(…)`, `exists (…)`, `(…) is unknown`)
+      // keeps the parentheses that make it an operand of the accessors after it (jsonpath.md §2.3).
+      if (p.pred.kind === "not" || p.pred.kind === "exists" || p.pred.kind === "isUnknown") {
+        out = "(" + writePred(p.pred, false) + ")";
+      } else {
+        out = writePred(p.pred, wrap);
+      }
       break;
   }
   return out + writeSteps(e.steps);
@@ -1185,9 +1372,21 @@ function writeSteps(steps: Step[]): string {
         if (step.method.scale !== null) out += "," + step.method.scale.render();
         out += ")";
         break;
+      case "any":
+        out += writeAnyLevels(step.first, step.last);
+        break;
     }
   }
   return out;
+}
+
+// writeAnyLevels renders a `.**` step as PostgreSQL's printJsonPathItem does: `{0 to last}` is bare,
+// equal bounds print once.
+function writeAnyLevels(first: number, last: number): string {
+  const level = (v: number): string => (v === LEVEL_LAST ? "last" : String(v));
+  if (first === 0 && last === LEVEL_LAST) return ".**";
+  if (first === last) return `.**{${level(first)}}`;
+  return `.**{${level(first)} to ${level(last)}}`;
 }
 
 // writePred renders a predicate (PostgreSQL's form: `&&`/`||` and `a op b` spaced, `!(…)`),
@@ -1206,6 +1405,29 @@ function writePred(pred: Pred, brackets: boolean): string {
     }
     case "not":
       return "!(" + writePred(pred.p, false) + ")";
+    case "exists":
+      return "exists (" + writeExpr(pred.e, false) + ")";
+    case "isUnknown":
+      return "(" + writePred(pred.p, false) + ") is unknown";
+    case "startsWith":
+      out =
+        writeExpr(pred.lhs, exprPriority(pred.lhs) <= 2) +
+        " starts with " +
+        writeExpr(pred.rhs, exprPriority(pred.rhs) <= 2);
+      break;
+    case "likeRegex": {
+      // PostgreSQL brackets the operand by priority against like_regex's 6, so an operator operand
+      // is always wrapped.
+      out = writeExpr(pred.lhs, true) + " like_regex " + writeQuoted(pred.pattern);
+      if (pred.flags !== 0) {
+        out += ' flag "';
+        for (let i = 0; i < REGEX_FLAG_CHARS.length; i++) {
+          if ((pred.flags & (1 << i)) !== 0) out += REGEX_FLAG_CHARS[i];
+        }
+        out += '"';
+      }
+      break;
+    }
     case "compare":
       out =
         writeExpr(pred.lhs, exprPriority(pred.lhs) <= 2) +
@@ -1361,7 +1583,11 @@ export function compileMetered(src: string, m: Meter): JsonPath {
   m.guard();
   // The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
   // compile at resolve.
-  return new Parser(src).compile();
+  const path = new Parser(src).compile();
+  // Each like_regex pattern was compiled with the path (jsonpath.md §7).
+  m.charge(COSTS.regexCompile * BigInt(path.regexInsts));
+  m.guard();
+  return path;
 }
 
 // evalPath evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
@@ -1404,6 +1630,7 @@ function evalItems(path: JsonPath, ctx: JsonNode, opts: EvalOpts, m: Meter, out:
     root: ctx,
     vars: opts.vars,
     strict: path.strict,
+    ignore: false,
     m,
     nextGen: 1n + BigInt(varsCount(opts.vars)),
     offsets: new Map(),
@@ -1460,12 +1687,20 @@ interface Ctx {
   root: JsonNode;
   vars: Vars;
   strict: boolean;
+  // ignore suppresses navigation errors while the rest of a path below `.**` runs, in either mode
+  // (jsonpath.md §3.3) — PostgreSQL's ignoreStructuralErrors, which lax always sets.
+  ignore: boolean;
   m: Meter;
   // The next .keyvalue() object number, assigned in evaluation order.
   nextGen: bigint;
   // Per base object (the document or a variable's), each container's byte offset in PostgreSQL's
   // binary jsonb layout of it, computed for a base object on the first .keyvalue() that needs one.
   offsets: Map<JsonNode, Map<JsonNode, number>>;
+}
+
+// structural is whether a navigation failure raises: strict, and not below a `.**` (§3.3, §4.2).
+function structural(cx: Ctx): boolean {
+  return cx.strict && !cx.ignore;
 }
 
 // charge charges n units of jsonpath_step and guards (jsonpath.md §7).
@@ -1523,6 +1758,18 @@ interface Frame {
   last: number | null;
   // A subscript step's array size: its own outputs' `last`.
   size: number;
+  // Whether this frame runs below a `.**`, suppressing navigation errors (§3.3).
+  ignore: boolean;
+  // A `.**` step's descent: the containers being walked, innermost last.
+  walk: AnyWalk[];
+}
+
+// One container a `.**` step is walking: its children are at `level`, and `next` is the next
+// child's position.
+interface AnyWalk {
+  item: Item;
+  level: number;
+  next: number;
 }
 
 function newFrame(
@@ -1531,6 +1778,7 @@ function newFrame(
   base: Base,
   unwrap: boolean,
   last: number | null,
+  ignore: boolean,
 ): Frame {
   return {
     step,
@@ -1544,6 +1792,8 @@ function newFrame(
     kvId: 0n,
     last,
     size: 0,
+    ignore,
+    walk: [],
   };
 }
 
@@ -1583,11 +1833,20 @@ function runExpr(
         out.push(h.item);
         if (stopAtFirst) return;
       } else {
-        stack.push(newFrame(0, h.item, h.base, unwrap, last));
+        stack.push(newFrame(0, h.item, h.base, unwrap, last, cx.ignore));
       }
       continue;
     }
-    const o = nextOut(cx, steps, current, top);
+    // The frame's step runs with its own suppression of navigation errors, which reaches any filter
+    // operand it evaluates (§3.3).
+    const saved = cx.ignore;
+    cx.ignore = top.ignore;
+    let o: Out;
+    try {
+      o = nextOut(cx, steps, current, top);
+    } finally {
+      cx.ignore = saved;
+    }
     if (o.kind === "item") {
       const next = top.step + 1;
       if (next === steps.length) {
@@ -1596,7 +1855,9 @@ function runExpr(
       } else {
         // A subscript step's outputs run their continuations with `last` naming its array.
         const childLast = steps[top.step]!.kind === "subscripts" ? top.size : top.last;
-        stack.push(newFrame(next, o.item, o.base, unwrap, childLast));
+        // Every item a `.**` emits runs the rest of the path with navigation errors suppressed.
+        const ignore = top.ignore || steps[top.step]!.kind === "any";
+        stack.push(newFrame(next, o.item, o.base, unwrap, childLast, ignore));
       }
     } else if (o.kind === "sub") {
       stack.push(o.frame);
@@ -1801,7 +2062,7 @@ function nextOut(cx: Ctx, steps: Step[], current: Item, f: Frame): Out {
       f.a += 1;
       return {
         kind: "sub",
-        frame: newFrame(f.step, { kind: "doc", node: e }, f.base, false, f.last),
+        frame: newFrame(f.step, { kind: "doc", node: e }, f.base, false, f.last, f.ignore),
       };
     }
     return DONE;
@@ -1821,7 +2082,7 @@ function nextOut(cx: Ctx, steps: Step[], current: Item, f: Frame): Out {
         f.started = true;
         charge(cx, 1);
         if (typeName(f.item) !== "object") {
-          if (strict) {
+          if (structural(cx)) {
             throw engineError(
               "sql_json_object_not_found",
               "jsonpath wildcard member accessor can only be applied to an object",
@@ -1845,10 +2106,14 @@ function nextOut(cx: Ctx, steps: Step[], current: Item, f: Frame): Out {
         f.started = true;
         charge(cx, 1);
         if (strict && docArray(f.item) === null) {
-          throw engineError(
-            "sql_json_array_not_found",
-            "jsonpath array accessor can only be applied to an array",
-          );
+          if (structural(cx)) {
+            throw engineError(
+              "sql_json_array_not_found",
+              "jsonpath array accessor can only be applied to an array",
+            );
+          }
+          // Strict below `.**`: no singleton, no item (§3.3).
+          return DONE;
         }
       }
       // A non-array is a singleton array in lax (§4.1 rule 2).
@@ -1880,12 +2145,14 @@ function nextOut(cx: Ctx, steps: Step[], current: Item, f: Frame): Out {
         f.started = true;
         charge(cx, 1);
         if (array === null) {
-          if (strict) {
+          if (structural(cx)) {
             throw engineError(
               "sql_json_array_not_found",
               "jsonpath wildcard array accessor can only be applied to an array",
             );
           }
+          // Strict below `.**`: no singleton, no item (§3.3).
+          if (strict) return DONE;
           // lax: the item is a singleton array.
           charge(cx, 1);
           return { kind: "item", item: f.item, base: f.base };
@@ -1911,13 +2178,82 @@ function nextOut(cx: Ctx, steps: Step[], current: Item, f: Frame): Out {
       if (f.started) return DONE;
       f.started = true;
       charge(cx, 1);
+      if (step.method.name === "size" && strict && !structural(cx) && docArray(f.item) === null) {
+        // Strict .size() of a non-array below `.**`: no item (§3.3).
+        return DONE;
+      }
       child = applyMethod(step.method, f.item, strict);
       break;
     }
+    case "any":
+      return nextAny(cx, step, f);
   }
   if (child === null) return DONE;
   charge(cx, 1);
   return { kind: "item", item: child, base: f.base };
+}
+
+// nextAny produces a `.**` frame's next output (jsonpath.md §3.3): the item itself when the first
+// level is 0, then its descendants in preorder — a child is emitted (when its level is in bounds)
+// before the walk descends into it. Applying the step charges 1, each descendant visited 1, and each
+// emitted item 1 (§7 rule 8).
+function nextAny(cx: Ctx, step: { first: number; last: number }, f: Frame): Out {
+  if (!f.started) {
+    f.started = true;
+    charge(cx, 1);
+    if (step.last >= 1 && isContainer(f.item)) f.walk.push({ item: f.item, level: 1, next: 0 });
+    if (step.first === 0) {
+      charge(cx, 1);
+      return { kind: "item", item: f.item, base: f.base };
+    }
+  }
+  for (;;) {
+    const top = f.walk[f.walk.length - 1];
+    if (top === undefined) return DONE;
+    const child = childAt(top.item, top.next);
+    if (child === null) {
+      f.walk.pop();
+      continue;
+    }
+    top.next += 1;
+    const level = top.level;
+    charge(cx, 1);
+    const container = isContainer(child);
+    if (level < step.last && container) f.walk.push({ item: child, level: level + 1, next: 0 });
+    // `{last}` (both bounds the largest level) is PostgreSQL's leaves-only walk.
+    if (
+      level >= step.first ||
+      (step.first === LEVEL_LAST && step.last === LEVEL_LAST && !container)
+    ) {
+      charge(cx, 1);
+      return { kind: "item", item: child, base: f.base };
+    }
+  }
+}
+
+// isContainer is whether an item has children for `.**`: a document array or object, or a
+// .keyvalue() object.
+function isContainer(item: Item): boolean {
+  return (
+    item.kind === "kv" ||
+    (item.kind === "doc" && (item.node.kind === "array" || item.node.kind === "object"))
+  );
+}
+
+// childAt is a container's i-th child in stored order: an element, a member value, or a .keyvalue()
+// object's id, key, value.
+function childAt(item: Item, i: number): Item | null {
+  if (item.kind === "kv") return kvMember(item.kv, i);
+  if (item.kind !== "doc") return null;
+  if (item.node.kind === "array") {
+    const e = item.node.elements[i];
+    return e === undefined ? null : { kind: "doc", node: e };
+  }
+  if (item.node.kind === "object") {
+    const member = item.node.members[i];
+    return member === undefined ? null : { kind: "doc", node: member.value };
+  }
+  return null;
 }
 
 // nextKeyValue produces a .keyvalue() frame's next pair object: one per member, each the base of its
@@ -1988,7 +2324,7 @@ function memberOf(cx: Ctx, item: Item, key: string): Item | null {
     const at = (KV_KEYS as readonly string[]).indexOf(key);
     charge(cx, at < 0 ? KV_KEYS.length : at + 1);
     if (at >= 0) found = kvMember(item.kv, at);
-  } else if (cx.strict) {
+  } else if (structural(cx)) {
     throw engineError(
       "sql_json_member_not_found",
       "jsonpath member accessor can only be applied to an object",
@@ -1996,7 +2332,7 @@ function memberOf(cx: Ctx, item: Item, key: string): Item | null {
   } else {
     return null;
   }
-  if (found === null && cx.strict) {
+  if (found === null && structural(cx)) {
     throw engineError("sql_json_member_not_found", `JSON object does not contain key "${key}"`);
   }
   return found;
@@ -2016,7 +2352,7 @@ function subscriptRange(
 ): [number, number] {
   const from = indexValue(cx, sub.kind === "index" ? sub.index : sub.from, size, current, base);
   const to = sub.kind === "index" ? from : indexValue(cx, sub.to, size, current, base);
-  if (cx.strict && (from < 0 || from > to || to >= size)) {
+  if (structural(cx) && (from < 0 || from > to || to >= size)) {
     throw engineError("invalid_sql_json_subscript", "jsonpath array subscript is out of bounds");
   }
   return [Math.max(from, 0), Math.min(to, size - 1)];
@@ -2082,9 +2418,120 @@ function evalPred(
       const x = evalPred(cx, pred.p, current, base, last);
       return x === null ? null : !x;
     }
+    case "isUnknown":
+      return evalPred(cx, pred.p, current, base, last) === null;
+    case "exists":
+      return evalExists(cx, pred.e, current, base, last);
+    case "startsWith":
+      return evalStartsWith(cx, pred.lhs, pred.rhs, current, base, last);
+    case "likeRegex":
+      return evalLikeRegex(cx, pred, current, base, last);
     case "compare":
       return evalCompare(cx, pred.lhs, pred.op, pred.rhs, current, base, last);
   }
+}
+
+// evalExists is `exists (e)` (§4.4 rule 6): true when e's sequence is non-empty, unknown when
+// evaluating it raises a SQL/JSON error. Lax stops at the first item; strict evaluates them all.
+function evalExists(
+  cx: Ctx,
+  e: PathExpr,
+  current: Item,
+  base: Base,
+  last: number | null,
+): boolean | null {
+  const seq: Item[] = [];
+  try {
+    runExpr(cx, e, current, base, last, !cx.strict, seq);
+  } catch (err) {
+    if (isSoft(err)) return null;
+    throw err;
+  }
+  return seq.length > 0;
+}
+
+// combinePairs combines an existential predicate's n pair results in order (§4.4 rule 3): lax is
+// true at the first true pair, else unknown if any pair was, else false; strict is unknown at the
+// first unknown pair, else true if any pair was, else false. A pair test charges its own work.
+function combinePairs(cx: Ctx, n: number, test: (k: number) => boolean | null): boolean | null {
+  let found = false;
+  let anyUnknown = false;
+  for (let k = 0; k < n; k++) {
+    const r = test(k);
+    if (r === null) {
+      if (cx.strict) return null;
+      anyUnknown = true;
+    } else if (r) {
+      if (!cx.strict) return true;
+      found = true;
+    }
+  }
+  if (found) return true;
+  return anyUnknown ? null : false;
+}
+
+// chargeStringCompare charges a SQL comparison's size extra for two strings: varlen_compare per code
+// point of the shorter one beyond the first (§7 rule 4).
+function chargeStringCompare(cx: Ctx, a: string, b: string): void {
+  const w = Math.max(Math.min(codePoints(a), codePoints(b)), 1);
+  cx.m.charge(COSTS.varlenCompare * BigInt(w - 1));
+  cx.m.guard();
+}
+
+// evalStartsWith is `l starts with r` (§4.4 rule 5): l's items (lax-unwrapped) against r's (not
+// unwrapped); a pair of strings is true when the left begins with the right, any other pair unknown.
+// A UTF-16 prefix of a well-formed string is a code-point prefix, so startsWith is the spec's test.
+function evalStartsWith(
+  cx: Ctx,
+  lhs: PathExpr,
+  rhs: PathExpr,
+  current: Item,
+  base: Base,
+  last: number | null,
+): boolean | null {
+  const ls = evalOperand(cx, lhs, current, base, last);
+  if (ls === null) return null;
+  let rs: Item[];
+  try {
+    rs = evalSeq(cx, rhs, current, base, last, false);
+  } catch (err) {
+    if (isSoft(err)) return null;
+    throw err;
+  }
+  return combinePairs(cx, ls.length * rs.length, (k) => {
+    charge(cx, 1);
+    const a = scalarNode(ls[Math.floor(k / rs.length)]!);
+    const b = scalarNode(rs[k % rs.length]!);
+    if (a === null || b === null || a.kind !== "string" || b.kind !== "string") return null;
+    chargeStringCompare(cx, a.value, b.value);
+    return a.value.startsWith(b.value);
+  });
+}
+
+// evalLikeRegex is `l like_regex "p"` (§4.4 rule 5): each of l's items (lax-unwrapped) is true when
+// it is a string the pattern matches, false when a string it does not, unknown otherwise. The match
+// charges its regex_step units (regex.md §6).
+function evalLikeRegex(
+  cx: Ctx,
+  pred: { lhs: PathExpr; flags: number; regex: RegexProgram },
+  current: Item,
+  base: Base,
+  last: number | null,
+): boolean | null {
+  const ls = evalOperand(cx, pred.lhs, current, base, last);
+  if (ls === null) return null;
+  return combinePairs(cx, ls.length, (k) => {
+    charge(cx, 1);
+    const a = scalarNode(ls[k]!);
+    if (a === null || a.kind !== "string") return null;
+    const subject =
+      (pred.flags & REGEX_I) !== 0 ? foldLowerSimple(a.value, loadedProperty()) : a.value;
+    return regexIsMatch(
+      pred.regex,
+      Array.from(subject, (c) => c.codePointAt(0) as number),
+      cx.m,
+    );
+  });
 }
 
 function codePoints(s: string): number {
@@ -2111,34 +2558,20 @@ function evalCompare(
   if (ls === null) return null;
   const rs = evalOperand(cx, rhs, current, base, last);
   if (rs === null) return null;
-  const strict = cx.strict;
-  let found = false;
-  let anyUnknown = false;
-  for (const x of ls) {
-    for (const y of rs) {
-      charge(cx, 1);
-      const a = scalarNode(x);
-      const b = scalarNode(y);
-      if (a !== null && b !== null && a.kind === "string" && b.kind === "string") {
-        const w = Math.max(Math.min(codePoints(a.value), codePoints(b.value)), 1);
-        cx.m.charge(COSTS.varlenCompare * BigInt(w - 1));
-        cx.m.guard();
-      } else if (a !== null && b !== null && a.kind === "number" && b.kind === "number") {
-        cx.m.charge(COSTS.decimalWork * BigInt(workLinear(a.dec, b.dec) - 1));
-        cx.m.guard();
-      }
-      const r = compareItems(x, op, y);
-      if (r === null) {
-        if (strict) return null;
-        anyUnknown = true;
-      } else if (r) {
-        if (!strict) return true;
-        found = true;
-      }
+  return combinePairs(cx, ls.length * rs.length, (k) => {
+    charge(cx, 1);
+    const x = ls[Math.floor(k / rs.length)]!;
+    const y = rs[k % rs.length]!;
+    const a = scalarNode(x);
+    const b = scalarNode(y);
+    if (a !== null && b !== null && a.kind === "string" && b.kind === "string") {
+      chargeStringCompare(cx, a.value, b.value);
+    } else if (a !== null && b !== null && a.kind === "number" && b.kind === "number") {
+      cx.m.charge(COSTS.decimalWork * BigInt(workLinear(a.dec, b.dec) - 1));
+      cx.m.guard();
     }
-  }
-  if (found) return true;
-  return anyUnknown ? null : false;
+    return compareItems(x, op, y);
+  });
 }
 
 // evalOperand evaluates a comparison operand to its item sequence, an array item unwrapped one level

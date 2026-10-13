@@ -146,13 +146,33 @@ type Node =
 // Parser: pattern text -> AST (chars are code-point strings via Array.from)
 // ---------------------------------------------------------------------------
 
+// A compile mode of jsonpath like_regex (regex.md §8d); NO_MODE is the SQL operators' mode.
+export type RegexMode = {
+  // nlStop keeps a negated bracket class from matching a newline (PostgreSQL's REG_NLSTOP).
+  nlStop: boolean;
+  // dotAll lets `.` match a newline (the XQuery `s` flag).
+  dotAll: boolean;
+};
+
+const NO_MODE: RegexMode = { nlStop: false, dotAll: false };
+
+// quoteRegex escapes every metacharacter of a pattern so it compiles to the literal string (the
+// XQuery `q` flag, regex.md §8d).
+export function quoteRegex(pattern: string): string {
+  let out = "";
+  for (const c of pattern) out += isRegexMeta(c) ? "\\" + c : c;
+  return out;
+}
+
 class RegexParser {
   private chars: string[];
   private pos = 0;
+  private readonly mode: RegexMode;
   ngroups = 0;
 
-  constructor(pattern: string) {
+  constructor(pattern: string, mode: RegexMode) {
     this.chars = Array.from(pattern);
+    this.mode = mode;
   }
 
   private peek(): string | undefined {
@@ -304,6 +324,8 @@ class RegexParser {
         return this.parseClass();
       case ".":
         this.bump();
+        // Dot-all: an empty negated class admits every code point (regex.md §8d).
+        if (this.mode.dotAll) return { kind: "class", class: { negated: true, ranges: [] } };
         return { kind: "any" };
       case "^":
         this.bump();
@@ -410,6 +432,8 @@ class RegexParser {
       ranges.push([lo, lo]);
       first = false;
     }
+    // Newline-sensitive: `[^…]` does not match a newline (regex.md §8d).
+    if (negated && this.mode.nlStop) ranges.push([0x0a, 0x0a]);
     return { kind: "class", class: { negated, ranges: normalizeRanges(ranges) } };
   }
 
@@ -650,7 +674,12 @@ class RegexCompiler {
 // regex_compile × regexNinst() (the precompilation contract, regex.md §5). For ~* the pattern must
 // already be case-folded by the caller.
 export function compileRegex(pattern: string): RegexProgram {
-  const parser = new RegexParser(pattern);
+  return compileRegexMode(pattern, NO_MODE);
+}
+
+// compileRegexMode is compileRegex under a jsonpath like_regex compile mode (regex.md §8d).
+export function compileRegexMode(pattern: string, mode: RegexMode): RegexProgram {
+  const parser = new RegexParser(pattern, mode);
   const root = parser.parseAlt();
   if (!parser.atEnd()) throw regexInvalid("unbalanced parenthesis");
   const ngroups = parser.ngroups;

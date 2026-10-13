@@ -18,11 +18,10 @@ func jpErr(t *testing.T, db dbHandle, sql string) string {
 	return err.(*EngineError).Code()
 }
 
-// The still-deferred path-expression constructs — the datetime item methods, like_regex / starts with
-// / is unknown / exists predicates, .** — are a deferred 0A000 at compile.
-// PostgreSQL compiles them, so each is a documented divergence; the supported subset is oracle-clean
-// in suites/json/jsonpath_literal.test, jsonpath_query.test, and jsonpath_methods.test.
-func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
+// The datetime item methods are 0A000 at compile, by decision (jsonpath.md §3.1), and so is the
+// like_regex `m` flag (jsonpath.md §4.3) unless `q` makes it moot. PostgreSQL compiles them, so each
+// is a documented divergence; the supported surface is oracle-clean in suites/json/.
+func TestJsonpathUnsupportedConstructsAre0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, path := range []string{
@@ -33,14 +32,40 @@ func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
 		"$.a.time_tz()",
 		"$.a.timestamp()",
 		"$.a.timestamp_tz(2)",
-		`$.a like_regex "x"`,    // a like_regex top-level predicate
-		`$.a starts with "x"`,   // a starts-with top-level predicate
-		"($.a == 1) is unknown", // an is-unknown predicate
-		"$ ? (exists (@.a))",    // an exists predicate
-		"$.**",                  // the any-level accessor
+		`$ ? (@ like_regex "^a" flag "m")`, // the multi-line flag
+		`$ ? (@ like_regex "^a" flag "ims")`,
 	} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "0A000" {
-			t.Errorf("path %q should defer 0A000, got %s", path, got)
+			t.Errorf("path %q should be 0A000, got %s", path, got)
+		}
+	}
+	// Under `q` the pattern is a literal and `m` is ignored, as XQuery specifies.
+	rows := queryRows(t, db, `SELECT jsonb_path_exists('"a^b"', '$ ? (@ like_regex "^b" flag "mq")')`)
+	if v := rows[0][0]; v.Kind != ValBool || !v.boolVal() {
+		t.Errorf("flag mq should match the literal ^b, got %v", v)
+	}
+}
+
+// A like_regex pattern is jed's regex subset (regex.md §2), not PostgreSQL's ARE: a construct only
+// ARE has is 2201B when the path compiles, where PostgreSQL accepts it (jsonpath.md §4.3).
+func TestJsonpathLikeRegexSubset(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	for _, pattern := range []string{`\\y`, `\\u0041`, `(?i)a`, `a\\b`} {
+		if got := jpErr(t, db, `SELECT '$ ? (@ like_regex "`+pattern+`")'::jsonpath`); got != "2201B" {
+			t.Errorf("like_regex %q should be 2201B, got %s", pattern, got)
+		}
+	}
+}
+
+// A `.**` level is an integer literal without PostgreSQL 16+'s `_` separators and radix prefixes, as
+// for jsonpath numbers (jsonpath.md §2): 42601 where PostgreSQL accepts them.
+func TestJsonpathAnyLevelLiteral(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	for _, path := range []string{"$.**{1_000}", "$.**{0x10}", "$.**{2 to 0b11}"} {
+		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "42601" {
+			t.Errorf("path %q should be 42601, got %s", path, got)
 		}
 	}
 }
@@ -68,24 +93,13 @@ func TestJsonpathColumnIsUnsupported(t *testing.T) {
 	}
 }
 
-// A jsonpath using a STILL-deferred construct (a datetime method, like_regex in a filter, like_regex
-// as a top-level predicate) is 0A000 — it fails to compile. PostgreSQL evaluates these, so each is a
-// documented divergence; the supported filter + query + match + method behavior is oracle-clean in
-// suites/json/jsonpath_query.test and jsonpath_methods.test.
+// A jsonpath using a datetime method is 0A000 — it fails to compile. PostgreSQL evaluates it, so it
+// is a documented divergence (jsonpath.md §3.1).
 func TestJsonpathDeferredConstructsAre0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
-	// A datetime item method.
 	if got := jpErr(t, db, `SELECT jsonb_path_query_array('["2020-01-01"]', '$[*].datetime()')`); got != "0A000" {
 		t.Errorf("jsonb_path_query_array with a datetime method should be 0A000, got %s", got)
-	}
-	// like_regex inside a filter (a non-comparison predicate).
-	if got := jpErr(t, db, "SELECT jsonb_path_exists('[\"x\"]', '$[*] ? (@ like_regex \"x\")')"); got != "0A000" {
-		t.Errorf("like_regex inside a filter should be 0A000, got %s", got)
-	}
-	// like_regex as a top-level predicate.
-	if got := jpErr(t, db, "SELECT jsonb_path_match('[\"x\"]', '$ like_regex \"x\"')"); got != "0A000" {
-		t.Errorf("a like_regex top-level predicate should be 0A000, got %s", got)
 	}
 }
 

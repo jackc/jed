@@ -180,6 +180,29 @@ type regexParser struct {
 	chars   []rune
 	pos     int
 	ngroups int
+	mode    regexMode
+}
+
+// regexMode is a compile mode of jsonpath like_regex (regex.md §8d); the zero value is the SQL
+// operators' mode.
+type regexMode struct {
+	// nlStop keeps a negated bracket class from matching a newline (PostgreSQL's REG_NLSTOP).
+	nlStop bool
+	// dotAll lets `.` match a newline (the XQuery `s` flag).
+	dotAll bool
+}
+
+// quoteRegex escapes every metacharacter of a pattern so it compiles to the literal string (the
+// XQuery `q` flag, regex.md §8d).
+func quoteRegex(pattern string) string {
+	var b strings.Builder
+	for _, c := range pattern {
+		if isRegexMeta(c) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
 }
 
 func (p *regexParser) peek() (rune, bool) {
@@ -365,6 +388,10 @@ func (p *regexParser) parseAtom() (*regexNode, error) {
 		return p.parseClass()
 	case '.':
 		p.bump()
+		if p.mode.dotAll {
+			// An empty negated class admits every code point (regex.md §8d).
+			return &regexNode{kind: nClass, class: regexClass{negated: true}}, nil
+		}
 		return &regexNode{kind: nAny}, nil
 	case '^':
 		p.bump()
@@ -494,6 +521,10 @@ func (p *regexParser) parseClass() (*regexNode, error) {
 		}
 		ranges = append(ranges, [2]rune{lo, lo})
 		first = false
+	}
+	if negated && p.mode.nlStop {
+		// Newline-sensitive: `[^…]` does not match a newline (regex.md §8d).
+		ranges = append(ranges, [2]rune{'\n', '\n'})
 	}
 	return &regexNode{kind: nClass, class: regexClass{negated: negated, ranges: normalizeRanges(ranges)}}, nil
 }
@@ -780,7 +811,12 @@ func (c *regexCompiler) emitRepeat(n *regexNode) error {
 // regex_compile × program.ninst() (the precompilation contract, regex.md §5). For ~* the pattern
 // must already be case-folded by the caller.
 func compileRegex(pattern string) (*regexProgram, error) {
-	p := &regexParser{chars: []rune(pattern)}
+	return compileRegexMode(pattern, regexMode{})
+}
+
+// compileRegexMode is compileRegex under a jsonpath like_regex compile mode (regex.md §8d).
+func compileRegexMode(pattern string, mode regexMode) (*regexProgram, error) {
+	p := &regexParser{chars: []rune(pattern), mode: mode}
 	root, err := p.parseAlt()
 	if err != nil {
 		return nil, err

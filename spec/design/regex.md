@@ -562,6 +562,26 @@ no `scalar_byte`: their pieces partition the subject, so their text never exceed
 
 ---
 
+## 8d. Compile modes for jsonpath `like_regex`
+
+The jsonpath `like_regex` predicate ([jsonpath.md](jsonpath.md) §4.3) compiles its pattern with
+PostgreSQL's XQuery flag translation, which needs three compile modes the SQL operators do not use.
+Each is a transform at parse time; the instruction set, the VM, and the costs are unchanged.
+
+- **Newline-sensitive** (the default for `like_regex`, PostgreSQL's `REG_NLSTOP`). A negated
+  bracket class `[^…]` does not match `\n`: the parser adds `\n` to its range list before
+  normalizing. `.` already excludes `\n`, and the predefined escapes (`\D \W \S` included) are
+  unchanged, as in PostgreSQL.
+- **Dot-all** (the `s` flag). `.` matches every code point, `\n` included: it compiles to a `Class`
+  instruction over an empty negated class instead of `Any` (one instruction either way). A negated
+  bracket class matches `\n`, the SQL operators' behavior.
+- **Quote** (the `q` flag). The whole pattern is a literal: every metacharacter of §2 is escaped
+  with `\` before parsing, so the program is a sequence of `Char` instructions.
+
+Case-insensitive matching (`i`) is the `~*` fold of §1, applied before the quote transform.
+
+---
+
 ## 9. Cross-core fixtures
 
 Two TOML fixture families in [`spec/regex/`](../regex/) (the `spec/encoding/` precedent), the
@@ -586,7 +606,8 @@ corpus (§11).
   [functions.md](functions.md) §10). The functions themselves **landed in Slice 4** (§8c), and the
   Oracle-compat functions in Slice 3 (§8b).
 - `\b` word boundary, POSIX `[[:class:]]`, numeric escapes `\xHH`/`\x{…}`, Unicode-property classes
-  `\p{…}` (ties into the collation Unicode-property work), the `s`/`m`/`x` flags and inline `(?i)`.
+  `\p{…}` (ties into the collation Unicode-property work), the `m`/`x` flags and inline `(?i)`.
+  (The `s` flag exists only for jsonpath `like_regex`, §8d.)
 - A lazy-DFA fast path (perf only — same semantics); regex-driven index acceleration (anchored
   `~ '^literal'` → a PK/index bound, the point-lookup precedent).
 

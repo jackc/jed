@@ -81,7 +81,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ the hash functions (`md5`/`sha256` — a crypto-dependency decision, CLAUDE.md §14); untyped-literal adaptation for bytea function arguments (`get_byte('\x01', 0)` is `42883`, PG accepts it).
 - [x] **`f32` + `f64` (IEEE 754)** — two-width promotion tower, the first types narrowly exempted from byte-identity (the `R` tolerant compare + exception ledger), type code 12; **float in a PK/index** via the `float-order-preserving` key; the float math functions. → [float.md](spec/design/float.md), [determinism.md](spec/design/determinism.md)
 - [x] **`json` / `jsonb` + SQL/JSON** — the committed XL headline feature: all non-deferred slices across all three cores, oracle-clean; spec'd across [json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md), [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md); type codes 18/19/20, one `format_version` bump (v18→v19).
-  - [ ] _follow-ons (deferred `0A000`, hoisted from the done slices):_ the string-**dictionary builder** (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index ([encoding.md §2.13](spec/design/encoding.md)); GIN **`jsonb_ops`** opclass for `@>`/`?`; `JSON_TABLE` explicit `PLAN` (T2); `ON ERROR/EMPTY DEFAULT <expr>` (S3); the remaining **jsonpath** surface (`like_regex` → Pike VM, the `exists` / `starts with` / `is unknown` predicates, `.**` — P2/P3); `PASSING … FORMAT JSON` of a `bytea` value ([json-sql-functions.md §5.4](spec/design/json-sql-functions.md)); and a NaN or ±Infinity float `PASSING` value (a `numeric` NaN/Infinity item in PG, which jed's finite `decimal` cannot hold, [json-sql-functions.md §5.4](spec/design/json-sql-functions.md)).
+  - [ ] _follow-ons (deferred `0A000`, hoisted from the done slices):_ the string-**dictionary builder** (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index ([encoding.md §2.13](spec/design/encoding.md)); GIN **`jsonb_ops`** opclass for `@>`/`?`; `JSON_TABLE` explicit `PLAN` (T2); `ON ERROR/EMPTY DEFAULT <expr>` (S3); the jsonpath `like_regex` `m` flag (needs line anchors in the regex VM, [jsonpath.md §4.3](spec/design/jsonpath.md)); `PASSING … FORMAT JSON` of a `bytea` value ([json-sql-functions.md §5.4](spec/design/json-sql-functions.md)); and a NaN or ±Infinity float `PASSING` value (a `numeric` NaN/Infinity item in PG, which jed's finite `decimal` cannot hold, [json-sql-functions.md §5.4](spec/design/json-sql-functions.md)).
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — COMPLETE (S0–S6): the open `Type { Scalar | Composite(catalog-ref) }`, `CREATE`/`DROP TYPE`, nested + recursive types, storable composite column + recursive codec (`format_version` 9), `ROW(…)`, field access, element-wise compare/ORDER BY/DISTINCT/GROUP BY; array- and range-typed fields (the range field is `format_version` 41). Named composites only. → [composite.md](spec/design/composite.md)
   - [ ] _still narrowed (relaxable later):_ an anonymous `ROW(…)` *expression* (non-literal fields) assigned to a composite column — an `INSERT … VALUES` slot or an `UPDATE`/`ON CONFLICT DO UPDATE` RHS — and a `$N` composite `UPDATE` RHS; an **array-of-composite** field as a key + a composite **FK** pairing (the remaining `0A000` key axes); a non-NULL `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` + anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor.
 
@@ -398,15 +398,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `JSON_TABLE NESTED PATH` counts toward `MAX_EXPR_DEPTH`, and `array_in` stops at the 7th brace.
   This closes the native-stack crash from untrusted deeply nested JSON. See
   [json.md §6.4](spec/design/json.md) and `resource/json_depth_limit.test`.
-  - [ ] _follow-on:_ when jsonpath `.**` lands, keep its recursive descent bounded by document
-    depth; when a storable `jsonpath` column lands, its decoder must re-run the compiler's
-    nesting gate (`XX001` on a crafted body).
-- [ ] **Regex capture-slot copies are unmetered.** Each Pike-VM `Save` copies the thread's whole
-  capture-slot vector (O(groups) work) but charges one `regex_step` (regex.md §6), so a pattern with
-  thousands of nested groups does about groups× more work per cost unit: a 4000-group pattern spends
-  about 8 s of Go time on 1M units. Either charge the slots a `Save` copies, or make a `Save` O(1)
-  (a shared/persistent slot representation); the first changes cost in every core. (The output side,
-  `regexp_match`/`regexp_matches` capture arrays, is charged and reserved: cost.md §8.1.)
+  - [ ] _follow-on:_ when a storable `jsonpath` column lands, its decoder must re-run the compiler's
+    nesting gate (`XX001` on a crafted body). (`.**` walks an explicit stack, so its descent is
+    bounded by document depth.)
 - [x] **Q2 — operator state.** Hash-join, group, DISTINCT, set-operation and recursive-CTE
   tables (`ENTRY` 32 + key), retained aggregate inputs, window partitions, sort state,
   columnar lanes, and spill structures' resident elements; spill residency is measured on

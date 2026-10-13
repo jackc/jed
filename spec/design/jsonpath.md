@@ -14,11 +14,12 @@
 > [json.md](json.md). PostgreSQL semantics are the default (CLAUDE.md §1), pinned against the
 > live `postgres:18` oracle; the lax/strict edge cases (§4) are subtle and oracle-pinned.
 
-> **Status: landed in part.** The type, the structural accessors, filters, top-level predicates,
-> the query functions (with their `vars` / `silent` arguments and `_tz` forms) and operators, the
-> item methods (except the datetime family, which is not supported by decision, §3.1), arithmetic
-> with parenthesized expressions, and path variables are implemented in all three cores; §9 lists
-> what remains deferred (`0A000`).
+> **Status: landed.** The type, the structural accessors and the any-level accessor `.**`, filters,
+> top-level predicates and every predicate form (`exists`, `like_regex`, `starts with`,
+> `is unknown`), the query functions (with their `vars` / `silent` arguments and `_tz` forms) and
+> operators, the item methods (except the datetime family, which is not supported by decision,
+> §3.1), arithmetic with parenthesized expressions, and path variables are implemented in all three
+> cores; §9 lists what remains deferred (`0A000`).
 
 ---
 
@@ -69,6 +70,7 @@ primary      ::= "$"                              (* root document *)
                | "last"                           (* inside a subscript only *)
 accessor     ::= "." member                       (* .key  or  ."key with spaces" *)
                | ".*"                             (* wildcard member *)
+               | "." "**" ( "{" level ( "to" level )? "}" )?   (* any level, §3.3 *)
                | "[" subscript ( "," subscript )* "]"
                | "[" "*" "]"                      (* wildcard element *)
                | "." method "(" ")"               (* item method, §3.1 *)
@@ -77,6 +79,7 @@ accessor     ::= "." member                       (* .key  or  ."key with spaces
                | "." ( "time" | "time_tz" | "timestamp" | "timestamp_tz" ) "(" uint? ")"
                | "?" "(" predicate ")"            (* filter, §4 *)
 int          ::= ( "+" | "-" )? uint              (* an integer literal: 0, or no leading zero *)
+level        ::= uint | "last"                    (* uint at most 2147483647 *)
 subscript    ::= path_expr ( "to" path_expr )?    (* index, or idx TO idx slice; "last" allowed *)
 arith_op     ::= "+" | "-" | "*" | "/" | "%"
 predicate    ::= predicate "||" predicate
@@ -87,7 +90,7 @@ predicate    ::= predicate "||" predicate
                | path_expr comparison path_expr
                | path_expr "like_regex" string ( "flag" string )?
                | path_expr "starts" "with" ( string | "$" varname )
-               | path_expr "is" "unknown"
+               | "(" predicate ")" "is" "unknown"
 comparison   ::= "==" | "!=" | "<>" | "<" | "<=" | ">" | ">="
 method       ::= "type" | "size" | "double" | "ceiling" | "floor" | "abs" | "keyvalue"
                | "bigint" | "boolean" | "integer" | "number" | "string" | "date"
@@ -118,11 +121,31 @@ predicate unless accessors follow it, when it is an expression whose one item is
 `last` names the subscripted array's last index (`$[last - 1]`, `$[$.i to last]`); `last` outside a
 subscript is `42601`.
 
+The predicate keywords (`exists`, `like_regex`, `flag`, `starts`, `with`, `is`, `unknown`) are
+matched case-insensitively and may be separated by whitespace or comments (`@ STARTS  WITH "a"`). Each
+predicate form takes PostgreSQL's operands exactly: `exists` an expression in parentheses (not a
+predicate: `exists($ == 1)` is `42601`); `like_regex` a string literal pattern and an optional string
+literal flag string (a variable in either place is `42601`); `starts with` a string literal or a
+variable (`@ starts with @.a`, `starts with 1`, `starts with ("a")` are `42601`); `is unknown` a
+parenthesized predicate directly before it (`@ > 1 is unknown`, `!(@ > 1) is unknown`,
+`exists(@) is unknown` are `42601`, while `((@ > 1) is unknown) is unknown` is accepted). `!` applies
+to a parenthesized predicate or to `exists (…)` (`!exists(@.a)`).
+
+The any-level accessor is `.` then `**` (whitespace between them is allowed, `$ . **`), optionally
+followed by `{level}` or `{level to level}`, where a level is an unsigned integer literal or `last`
+(`$.** {2 to last}`; `{}`, `{1,2}`, `{1 to}`, `{+1}`, `{1.0}`, `{1e1}`, `{$x}` are `42601`, and `{01}`
+is trailing junk, `42601`). Like a number literal, a level takes no `_` digit separators and no
+hex/octal/binary prefix (`{1_000}`, `{0x10}` are `42601`; PostgreSQL 16+ accepts them — the same
+divergence as the number literals above). A level above 2147483647 is **`22003`** (`value "…" is out of range for
+type integer`), PostgreSQL's `pg_strtoint32` error, raised at compile. `**` after anything but `.`
+(`$**`, `$.a**`, `**`) is `42601`. `**` is one token, so `$.***` is `$.**` followed by a stray `*`
+(`42601`), and `$.*** 2` is `$.** * 2`, as in PostgreSQL.
+
 Faithful inclusions: `last` (array-length-minus-1 sentinel inside a subscript), `to` slices,
 named variables `$name` (bound by the `vars` argument, §5), `.datetime(template?)`,
-`like_regex` with an optional `flag` clause (§4.3). Nothing in PG's path grammar is excluded
-as obsolete; the only narrowing is the `like_regex` flag set (§4.3), a consequence of jed's
-deliberate regex subset.
+`like_regex` with an optional `flag` clause (§4.3), `.**` with its level bounds (§3.3). Nothing in
+PG's path grammar is excluded as obsolete; the only narrowings are the `like_regex` flag set and
+pattern language (§4.3), consequences of jed's deliberate regex subset.
 
 ### 2.1 String escapes
 
@@ -191,12 +214,26 @@ tighter than its parent's, by priority `||` 0, `&&` 1, comparisons 2, `+ -` 3, `
 (`((1 + 2) + 3)`, `(1 - (2 - 3))`, `(1 + 2 * 3)`, `(-(1 + 2))`, `((a || b) && c)`). Filter
 predicates and subscripts are not wrapped at their own top level (`$?(@ + 1 > 2)`, `$[last - 1]`).
 
+The predicate forms print as `printJsonPathItem` does. `starts with` is a comparison (priority 2):
+`($ starts with "a")` at the top level, `$?(@ starts with $"p")`, and its left operand bracketed by
+priority (`($ + 1 starts with "a")`). `like_regex` is wrapped like an operator at the top level
+(`($."a" like_regex "x")`) and wraps its operand whenever that operand is an operator
+(`$?(($."a" + 1) like_regex "x")`); the pattern prints as a quoted string (§2.1) and the flags, when
+any are set, as ` flag "…"` in the fixed order `i s m x q` with duplicates dropped (`flag "qiqi"` prints
+`flag "iq"`, `flag ""` prints nothing). `exists` prints `exists (…)` and `is unknown` prints
+`(…) is unknown`; neither is wrapped further, even at the top level (`exists ($."a")`,
+`(1 > "a") is unknown`). `.**` prints `.**`, `.**{n}`, `.**{n to m}`, `.**{last}`, `.**{n to last}`, or
+`.**{last to n}`, with `{0 to last}` collapsing to `.**` and `{n to n}` to `{n}`.
+
 **Divergence: an operator followed by accessors is always parenthesized.** PostgreSQL decides the
 brackets by priority alone, so as an operand it prints `($.a + 1).type() == "number"` as
 `$."a" + 1.type() == "number"` (which does not parse) and `(-@.a).abs()` as `-@."a".abs()` (which
 parses as a different path). jed evaluates a path from its canonical text (§1, §7), so that text
 must read back as the same path; it renders `($."a" + 1).type()` and `(-@."a").abs()` wherever they
-appear (an oracle override).
+appear (an oracle override). The same holds for the predicates that print without their own brackets:
+PostgreSQL prints `(exists ($[*])).type()` as `exists ($[*]).type()`, `(($ > 1) is unknown).type()` as
+`($ > 1) is unknown.type()`, and `(!($ > 1)).type()` as `!($ > 1).type()`, none of which parse; jed
+keeps the outer parentheses.
 
 ### 2.4 Comments and empty input
 
@@ -236,6 +273,7 @@ items. This single abstraction unifies accessors, methods, filters, and the quer
   - `.key` maps each **object** item to its member value (and, in lax, unwraps an array
     first — §4.1); a missing key contributes no item (lax) or raises (strict).
   - `.*` maps each object item to all its member values.
+  - `.**` maps each item to itself and its descendants, within level bounds (§3.3).
   - `[i]` selects element `i` (negative / `last` allowed); `[i to j]` a contiguous slice;
     `[*]` all elements; on a non-array, lax treats the item as a singleton array (§4.1),
     strict raises.
@@ -372,6 +410,40 @@ the context item (`$`) of the enclosing expression.
   subscript is not a single numeric value`. An index, literal or computed, is truncated toward zero
   (`$[1.9]` is `$[1]`) and must fit the integer range (`22033`).
 
+### 3.3 The any-level accessor `.**`
+
+`.**{first to last}` emits the item it is applied to and its descendants whose **level** lies in
+`[first, last]`: the item is level 0, its elements or member values level 1, theirs level 2, and so
+on. Bare `.**` is `{0 to last}`, `{n}` is `{n to n}`, and `last` as a bound means unbounded. Order is
+PostgreSQL's `executeAnyItem`: the item first (when `first` is 0), then a depth-first preorder walk
+in stored order (array elements in order, object members in canonical key order): each child is
+emitted before the walk descends into it, and each emitted item runs through the rest of the path
+before the walk continues (§3, depth-first). The walk descends into a child only when the child's
+level is below `last`, so `{1}` visits only the item's children.
+
+- **Containers.** A document array or object, or a `.keyvalue()` object (whose members `id`, `key`,
+  `value` are its level-1 children), is a container; any other item has no descendants. A scalar
+  context item is not a container (`jsonb_path_query('1', '$.**')` is one `1`).
+- **`{last}` means leaves.** PostgreSQL stores `last` as the largest level, so `{last}` (and
+  `{last to last}`) emits every descendant that is not a container, at any level ≥ 1, and never
+  the item itself (`'1'` gives nothing). `{last to n}` emits nothing, and neither does `{n to m}`
+  with `n > m`.
+- **No unwrapping of the step.** `.**` applies to an array as it is (lax does not unwrap it first,
+  §4.1), but every emitted item runs the rest of the path with lax's usual unwrapping, so
+  `lax $.**.a` over `{"a":[{"a":1}]}` emits `[{"a":1}]`, `1`, `1`: once from the unwrapped array,
+  once from the object inside it.
+- **Structural errors are suppressed below it, in either mode.** Every item `.**` emits runs the
+  rest of its path with navigation errors suppressed (§4.2 rule 5 as in lax), even in strict:
+  `strict $.**.a` over `{"a":{"a":1}}` is `{"a":1}`, `1`, with no error for the object that has no
+  `a` or the number that is not an object. In strict the suppressed step emits nothing — a
+  subscript or `[*]` on a non-array does not treat it as a singleton, `.size()` of a non-array emits
+  nothing, and an out-of-bounds subscript is clamped. The suppression covers filter operands too:
+  `strict $.** ? (!(@.x == 1))` keeps every item that has no `x`, because a missing `x` is an empty
+  operand (false) rather than an error (unknown). Everything else keeps strict's meaning — array
+  unwrapping, the comparison pairing of §4.4, an existence test's evaluation of all items — and
+  item-method coercion errors, `.keyvalue()` of a non-object, and an out-of-integer-range subscript
+  still raise (`strict $.**.double()` over `[1]` raises for the array).
+
 ---
 
 ## 4. `lax` (default) vs `strict`
@@ -415,6 +487,7 @@ as-is).
    integer range is `22033` in both modes.
 6. **Item-method coercion failures are NOT suppressed** even in lax (§3.1). Lax suppresses
    *navigation* failures, not *coercion* failures.
+7. **Below `.**`, strict suppresses navigation failures too** (§3.3).
 
 **Silent mode** is **orthogonal**: it suppresses the SQL/JSON (class `22`) errors that remain,
 ending the evaluation at the first one. `@?` then returns SQL NULL; `@@` decides on the items found
@@ -425,24 +498,32 @@ errors. The query functions' `silent => true` argument (§5) selects the same mo
 
 ### 4.3 `like_regex` onto the Pike VM
 
-`like_regex` maps to jed's regex VM: `regex::compile(pattern)` + `Program::is_match` (boolean
-result, captures ignored — exactly how the `~` operator already uses it). The XQuery `flag`
-string is constrained by jed's flagless VM ([regex.md](regex.md)):
+`like_regex` maps to jed's regex VM ([regex.md](regex.md)): the pattern is compiled once when the
+path is compiled, and each string item is tested with `Program::is_match` (captures ignored, the `~`
+operator's use). The pattern language is jed's regex subset (regex.md §2), not PostgreSQL's ARE, so a
+pattern using an ARE-only construct (`[[:alpha:]]`, `\y`, `\uHHHH`, `(?i)`) is **`2201B`** where
+PostgreSQL accepts it — the same documented divergence as the `~` operator. A malformed pattern is
+`2201B` and an oversized program `54001`, both raised when the path is compiled (at resolve for a
+literal), as PostgreSQL validates the pattern in its grammar.
 
-- **`i`** (case-insensitive) — supported via the existing `~*`/ILIKE simple-lowercase path
-  (lowercase the input item and compile a lowercased pattern).
-- **`q`** (quote / literal) — supported as a compile mode that treats the whole pattern as a
-  literal string (no metacharacters).
-- **`s`** (dotall), **`m`** (multiline), **`x`** (extended whitespace) — **unsupported**:
-  jed's VM is single-line, `.` excludes `\n`, `^`/`$` are whole-subject anchors, and there is
-  no extended mode. A path using `s`/`m`/`x` raises **`0A000`** (feature not supported), a
-  documented divergence driven by jed's deliberate ReDoS-immune regex subset — **not**
-  obsolescence (it owns its regex surface; the `~` operator is already explicitly a jed
-  subset).
+The XQuery `flag` string is translated as PostgreSQL's `jspConvertRegexFlags` does:
 
-A malformed regex pattern is the existing **`2201B`**. `starts with` is a plain prefix test
-on string items (no regex). `is unknown` tests whether a predicate evaluated to the third
-truth value.
+- **No flag** — the newline-sensitive mode (regex.md §8d, PostgreSQL's `REG_NLSTOP`): `.` and a
+  negated bracket class `[^…]` do not match `\n`; `^`/`$` anchor the whole string. (The `~` operator
+  lets `[^…]` match `\n`.)
+- **`i`** (case-insensitive) — the `~*` simple-lowercase fold of the pattern and of each item
+  (regex.md §1).
+- **`s`** (dot-all) — `.` and `[^…]` match `\n` (regex.md §8d).
+- **`q`** (quote) — the pattern is a literal string (regex.md §8d); `s`, `m`, and `x` are then
+  ignored, as XQuery specifies.
+- **`m`** (multi-line `^`/`$`) — **unsupported, `0A000`**, raised at compile unless `q` is also set: jed's
+  VM has no line anchors. A documented divergence; PostgreSQL supports it.
+- **`x`** (XQuery whitespace) — **`0A000`** unless `q` is set, as in PostgreSQL (`XQuery "x" flag
+  (expanded regular expressions) is not implemented`).
+
+Any other flag character is **`42601`** (`Unrecognized flag character "z" in LIKE_REGEX predicate.`).
+Duplicate flags are allowed. The canonical text keeps the flags as a set (§2.3), so `flag "m"` with
+`q` reads back with both.
 
 ### 4.4 Predicate truth values
 
@@ -467,7 +548,22 @@ path's items, unwrapped one level in lax — §4.1 rule 4 — or a single litera
    otherwise true if any pair is true; otherwise false.
 4. **Connectives.** `&&`, `||`, and `!` are Kleene (`unknown || true` is true, `unknown && false`
    is false, `!unknown` is unknown).
-5. **Results.** A filter keeps an item only when its predicate is true. A top-level predicate
+5. **`starts with` and `like_regex`** are existential like a comparison (PostgreSQL's
+   `executePredicate`): the left operand is evaluated to its sequence (lax unwraps an array item one
+   level), an error in it makes the predicate unknown, and the pairs are combined by rule 3. For
+   `starts with` each pair is (left item, right item), the right operand — a string literal or a
+   variable — is **not** unwrapped, and a pair is true when both are strings and the left begins with
+   the right (code point by code point, so `""` is a prefix of every string), false when both are
+   strings otherwise, and unknown otherwise (a non-string item, or an array variable). For
+   `like_regex` each left item alone is a pair: true when it is a string the pattern matches, false
+   when it is a string it does not, unknown otherwise. A missing variable is `42704` (§5), never
+   unknown.
+6. **`exists (e)`** is true when `e`'s sequence is non-empty, false when empty, and unknown when
+   evaluating it raises a SQL/JSON error. Lax stops at the first item (§5's early stop: an error in a
+   later item is never reached, so `lax exists(@[*].double())` over `[1, "a"]` is true); strict
+   evaluates the whole sequence, so any error makes it unknown. The operand is not unwrapped.
+7. **`(p) is unknown`** is true when `p` is unknown and false otherwise; it is never unknown.
+8. **Results.** A filter keeps an item only when its predicate is true. A top-level predicate
    yields one item: `true`, `false`, or JSON `null` for unknown; `jsonb_path_match` and `@@` turn
    that `null` into SQL NULL.
 
@@ -625,6 +721,20 @@ it compiles it again and charges.
    number it emits. A subscript expression charges its own steps each time it is evaluated; a
    literal or bare `last` index charges nothing.
 
+7. **Predicate forms (§4.4).** `starts with` charges its operands' steps like a comparison, then
+   1 per pair it tests plus `varlen_compare × (W − 1)` when both items are strings, W the shorter
+   length in code points; lax stops at the first true pair and strict at the first unknown one, as
+   in rule 4. `like_regex` charges its operand's steps, then 1 per item it tests plus the match's
+   own `regex_step` units ([regex.md](regex.md) §6), with the same stops. `exists` and `is unknown`
+   charge nothing beyond their operand's steps; a lax `exists` stops at its operand's first item.
+8. **`.**` (§3.3).** Applying it charges 1 (rule 1); each descendant it visits — every descendant
+   down to level `last`, whether or not it is emitted — charges 1, and each item it emits charges 1
+   more (rule 2).
+
+**Compiling a `like_regex` pattern** charges `regex_compile` per instruction of its program
+([regex.md](regex.md) §6), each time the path is compiled for an evaluation — after the path's own
+`jsonpath_compile` charge, before evaluation.
+
 A cost-ceiling, lifetime-budget, or cancellation error raised inside a filter operand
 propagates. Only SQL/JSON navigation errors make a comparison unknown (§4.2).
 
@@ -668,17 +778,18 @@ A path variable with no binding is **`42704`** (`undefined_object`, `could not f
 error, so silent mode and `ON ERROR` do not suppress them (§5).
 
 Reuse existing codes where PG does: **`42601`** for a malformed path *literal* (syntax-error
-class, at resolve), **`22023`** for a `.decimal()` precision or scale outside PostgreSQL's
-`numeric` typmod ranges, **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
-unsupported `s`/`m`/`x` regex flags (§4.3), and **`22P02`** for malformed JSON in the
+class, at resolve) and an unrecognized `like_regex` flag character, **`22023`** for a `.decimal()`
+precision or scale outside PostgreSQL's `numeric` typmod ranges, **`2201B`** for a malformed
+`like_regex` pattern (`54001` for an oversized one), **`0A000`** for the unsupported `m`/`x` regex
+flags (§4.3), **`22003`** for a `.**` level above 2147483647 (§2), and **`22P02`** for malformed JSON in the
 `json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)). A string escape that decodes
 to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1), and a path with no tokens
 **`22P02`** (§2.4). Arithmetic raises the
 `decimal` errors: **`22012`** for a zero divisor, **`22003`** past the format cap (§3.2).
 
 **Nesting limit — `54001`.** The compiler counts program nesting (+1 per filter `?(`,
-parenthesized group, `!`, `&&`/`||` chain step, binary arithmetic chain step, unary operator, and
-subscript list) and rejects a path past `MAX_JSON_DEPTH = 256` with **`54001`**
+parenthesized group, `exists (`, `!`, `&&`/`||` chain step, binary arithmetic chain step, unary
+operator, and subscript list) and rejects a path past `MAX_JSON_DEPTH = 256` with **`54001`**
 (`statement_too_complex`), the same gate as SQL expressions ([cost.md §7](cost.md)), so the compile,
 render, and evaluation walks are stack-safe. A path is evaluated from its canonical text (§2.3),
 whose parentheses can nest deeper than the source (`$ + 1 + 1` renders `(($ + 1) + 1)`, a unary
@@ -732,10 +843,15 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     twins (§5.1), and the SQL/JSON `PASSING` clause of `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` /
     `JSON_TABLE` (json-sql-functions.md §5.4); `.keyvalue()` ids count the variable base objects
     (§3.1). Capability `expr.jsonpath_vars`.
-    **Still deferred (`0A000`):** the §4.3 Pike-VM `like_regex` / `starts with` / `is unknown` /
-    `exists` predicates; `.**`; a float `PASSING` value — the remaining open P2/P3 follow-ons.
+    **Still deferred (`0A000`):** a float `PASSING` value.
     **Not supported, by decision (`0A000`, §3.1):** the datetime methods, and with them the `_tz`
     functions' time zone use and `PASSING` a date/time value (a datetime item).
+  - **Predicates** ✅ — `exists (…)`, `like_regex` with its flags (§4.3, onto the Pike VM's
+    newline-sensitive / dot-all / quote modes, regex.md §8d), `starts with`, and `(…) is unknown`
+    (§4.4 rules 5–7), in filters and as top-level predicates. Capability `expr.jsonpath_predicates`.
+    **Unsupported (`0A000`, §4.3):** the `m` flag (and `x`, as in PostgreSQL).
+  - **Any-level accessor** ✅ — `.**` with `{n}` / `{n to m}` / `last` bounds (§3.3), suppressing
+    navigation errors below it in either mode. Capability `expr.jsonpath_any`.
 - **P3** — the `_tz` variants (§5.1): ✅ as STABLE twins. They have no datetime comparisons to
   route through the clock/tz seam, since jed has no datetime items (§3.1).
 

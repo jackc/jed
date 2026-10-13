@@ -1556,6 +1556,12 @@ file = "json/jsonpath_arith.test"
 sql = "SELECT '$ ? (($.a + 1).type() == \"number\")'::jsonpath, '$ ? ((-@.a).abs() > 1)'::jsonpath, '$[(last - 1).abs()]'::jsonpath"
 reason = "jed renders an arithmetic operator followed by accessors parenthesized wherever it appears: `$?(($.\"a\" + 1).type() == \"number\")`. PostgreSQL's printJsonPathItem brackets an operand only by operator priority, ignoring the accessors that follow it, so it prints `$?($.\"a\" + 1.type() == \"number\")` (which does not even parse) and `$?(-@.\"a\".abs() > 1)` (which parses as a different path, -(abs(a))). jed stores and evaluates a jsonpath as its canonical text (jsonpath.md §1), so that text must read back as the same path (jsonpath.md §2.3)."
 
+# --- jsonpath render: a predicate that prints without brackets keeps them before accessors.
+[[override]]
+file = "json/jsonpath_predicates.test"
+sql = "SELECT '(exists ($[*])).type()'::jsonpath, '(($ > 1) is unknown).type()'::jsonpath, '(!($ > 1)).type()'::jsonpath"
+reason = "jed keeps the parentheses that make `exists (…)`, `(…) is unknown`, and `!(…)` the operand of the accessors after them: `(exists ($[*])).type()`. PostgreSQL's printJsonPathItem prints these predicates without outer brackets, so it renders `exists ($[*]).type()`, `($ > 1) is unknown.type()`, and `!($ > 1).type()`, none of which parse. jed evaluates a jsonpath from its canonical text (jsonpath.md §1), so the text must read back as the same path (jsonpath.md §2.3)."
+
 # --- jsonpath datetime item methods: not supported by decision (jsonpath.md §3.1).
 [[override]]
 file = "json/json_datetime_extract.test"

@@ -1,0 +1,462 @@
+# jsonpath predicate forms beyond comparison (spec/design/jsonpath.md §4.3/§4.4): exists (…),
+# like_regex with its flags, starts with, and (…) is unknown — in filters and as top-level
+# predicates. Output matches the postgres:18 oracle; the regex-subset divergences are per-core tests.
+# Format: ../../../design/conformance.md.
+# requires: query.select, query.set_returning, types.jsonb, types.jsonpath, types.text, func.jsonb_path, expr.jsonpath_filter, expr.jsonpath_match, expr.jsonpath_methods, expr.jsonpath_arith, expr.jsonpath_vars, expr.jsonpath_predicates
+
+# --- The canonical render ---------------------------------------------------------------------
+
+# exists prints `exists (…)` and is never wrapped further, even at the top level; `!` applies to it.
+query TTTT nosort
+SELECT 'exists($.a)'::jsonpath, '$ ? (exists (@.a) && @.b == 1)'::jsonpath, '$ ? (!exists(@.a))'::jsonpath, 'exists($.a) || exists($.b)'::jsonpath
+----
+exists ($."a")
+$?(exists (@."a") && @."b" == 1)
+$?(!(exists (@."a")))
+(exists ($."a") || exists ($."b"))
+
+query TT nosort
+SELECT 'exists(1 + 1)'::jsonpath, 'exists(($ ? (@ > 1)))'::jsonpath
+----
+exists (1 + 1)
+exists ($?(@ > 1))
+
+# is unknown prints `(…) is unknown`, unwrapped at the top level; it nests.
+query TTT nosort
+SELECT '(1 > "a") is unknown'::jsonpath, '$ ? ((@ > 1) is unknown)'::jsonpath, '$ ? (((@ > 1) is unknown) is unknown)'::jsonpath
+----
+(1 > "a") is unknown
+$?((@ > 1) is unknown)
+$?(((@ > 1) is unknown) is unknown)
+
+# starts with is a comparison: wrapped at the top level, its left operand bracketed by priority.
+query TTTTT nosort
+SELECT '$ ? (@ starts with "a")'::jsonpath, '$ starts with "a"'::jsonpath, '$ ? (@ starts with $"x y")'::jsonpath, '($ + 1) starts with "a"'::jsonpath, '$ + 1 starts with "a"'::jsonpath
+----
+$?(@ starts with "a")
+($ starts with "a")
+$?(@ starts with $"x y")
+($ + 1 starts with "a")
+($ + 1 starts with "a")
+
+# like_regex wraps an operator operand; its flags print as a set in `ismxq` order.
+query TTTT nosort
+SELECT '$ ? ($.a + 1 like_regex "a")'::jsonpath, '$.a like_regex "a"'::jsonpath, '$ ? (@.a like_regex "a" && @ starts with "x")'::jsonpath, '$ ? (@ like_regex "a\\.b")'::jsonpath
+----
+$?(($."a" + 1) like_regex "a")
+($."a" like_regex "a")
+$?(@."a" like_regex "a" && @ starts with "x")
+$?(@ like_regex "a\\.b")
+
+query TTTT nosort
+SELECT '$ ? (@ like_regex "a" flag "qiqi")'::jsonpath, '$ ? (@ like_regex "a" flag "")'::jsonpath, '$ ? (@ like_regex "a" flag "sqi")'::jsonpath, '$ ? (@ like_regex "(" flag "q")'::jsonpath
+----
+$?(@ like_regex "a" flag "iq")
+$?(@ like_regex "a")
+$?(@ like_regex "a" flag "isq")
+$?(@ like_regex "(" flag "q")
+
+# The keywords are case-insensitive and may be spaced.
+query TTTTT nosort
+SELECT '$ ? (@ starts   with "a")'::jsonpath, '$ ? (@ STARTS WITH "a")'::jsonpath, '$ ? (@ LIKE_REGEX "a" FLAG "i")'::jsonpath, '$ ? (EXISTS(@))'::jsonpath, '$ ? ((@ > 1) IS UNKNOWN)'::jsonpath
+----
+$?(@ starts with "a")
+$?(@ starts with "a")
+$?(@ like_regex "a" flag "i")
+$?(exists (@))
+$?((@ > 1) is unknown)
+
+# A predicate followed by accessors is its truth value as an item.
+query TTT nosort
+SELECT '($ like_regex "a").type()'::jsonpath, '($ starts with "a").type()'::jsonpath, jsonb_path_query_first('[1,2]', '(exists ($[*])).type()')
+----
+($ like_regex "a").type()
+($ starts with "a").type()
+"boolean"
+
+# A predicate that prints without its own brackets keeps them before accessors, so the text reads
+# back as the same path (an oracle override: PostgreSQL prints `exists ($[*]).type()`).
+query TTT nosort
+SELECT '(exists ($[*])).type()'::jsonpath, '(($ > 1) is unknown).type()'::jsonpath, '(!($ > 1)).type()'::jsonpath
+----
+(exists ($[*])).type()
+(($ > 1) is unknown).type()
+(!($ > 1)).type()
+
+# The keywords are member names after `.`.
+query TT nosort
+SELECT jsonb_path_query_first('{"exists": 2}', '$.exists'), '$.like_regex.starts.with.is.unknown.flag'::jsonpath
+----
+2
+$."like_regex"."starts"."with"."is"."unknown"."flag"
+
+# --- Malformed predicates (42601) -------------------------------------------------------------
+
+statement error 42601
+SELECT 'exists($ == 1)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (exists(@.a) == true)'::jsonpath
+
+statement error 42601
+SELECT 'exists'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ > 1 is unknown)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (!(@ > 1) is unknown)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (exists(@) is unknown)'::jsonpath
+
+statement error 42601
+SELECT '$ is unknown'::jsonpath
+
+statement error 42601
+SELECT 'exists ($[*]).type()'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ starts with @.a)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ starts with 1)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ starts with ("a"))'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ like_regex $x)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ like_regex "a" flag $x)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ like_regex "a" flag "i" flag "q")'::jsonpath
+
+# An unrecognized flag character is a syntax error; x (expanded) is not implemented unless q is set.
+statement error 42601
+SELECT '$ ? (@ like_regex "a" flag "z")'::jsonpath
+
+statement error 0A000
+SELECT '$ ? (@ like_regex "a" flag "x")'::jsonpath
+
+query T nosort
+SELECT '$ ? (@ like_regex "a" flag "xq")'::jsonpath
+----
+$?(@ like_regex "a" flag "xq")
+
+# A malformed pattern is 2201B when the path is compiled; under q it is a literal.
+statement error 2201B
+SELECT '$ ? (@ like_regex "(")'::jsonpath
+
+# --- exists -------------------------------------------------------------------------------------
+
+query BBB nosort
+SELECT jsonb_path_match('{"a":1}', 'exists($.a)'), jsonb_path_match('{"a":1}', 'exists($.b)'), jsonb_path_match('{"a":1}', 'strict exists($.b)')
+----
+true
+false
+NULL
+
+query TT nosort
+SELECT jsonb_path_query_first('{"a":1}', 'exists($.a)'), jsonb_path_query_first('{"a":1}', 'strict exists($.b)')
+----
+true
+null
+
+query BB nosort
+SELECT jsonb_path_query_first('[1,2]', 'exists(1)')::text::boolean, jsonb_path_query_first('[1,2]', 'exists(1 + 1)')::text::boolean
+----
+true
+true
+
+# Strict: a missing member is an error, so the test is unknown; lax: an empty sequence, false.
+query T nosort
+SELECT * FROM jsonb_path_query('[{"x":1},{"y":2}]', 'strict $[*] ? (exists(@.x))')
+----
+{"x": 1}
+
+query T nosort
+SELECT * FROM jsonb_path_query('[{"x":1},{"y":2}]', 'strict $[*] ? ((exists(@.x)) is unknown)')
+----
+{"y": 2}
+
+query T nosort
+SELECT * FROM jsonb_path_query('[{"x":1},{"y":2}]', 'lax $[*] ? (exists(@.x))')
+----
+{"x": 1}
+
+query T nosort
+SELECT * FROM jsonb_path_query('[{"x":1},{"y":2}]', '$[*] ? (!exists(@.x))')
+----
+{"y": 2}
+
+# Lax stops at the first item, so a later item's error is never reached; strict evaluates them all.
+query T nosort
+SELECT * FROM jsonb_path_query('[1, "a", [2]]', 'lax $ ? (exists(@[*].double()))')
+----
+1
+[2]
+
+query T nosort
+SELECT * FROM jsonb_path_query('["a", 1]', 'lax $ ? (exists(@[*].double()))')
+----
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1, "a"]', 'lax $ ? (exists(@[*].double()))')
+----
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1, "a"]', 'strict $ ? (exists(@[*].double()))')
+----
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1, "a"]', 'strict $ ? ((exists(@[*].double())) is unknown)')
+----
+[1, "a"]
+
+# exists inside a filter over an object's members, and against the root.
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[{"b":1},{"c":2},{"b":3}]}', '$.a[*] ? (exists(@.b) && @.b > 1)')
+----
+{"b": 3}
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[{"b":1},{"c":2}],"flag":true}', '$.a[*] ? (exists($.flag))')
+----
+{"b": 1}
+{"c": 2}
+
+# --- is unknown ---------------------------------------------------------------------------------
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1,"a",null,3]', '$[*] ? ((@ > 1) is unknown)')
+----
+"a"
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1,"a",null,3]', 'strict $[*] ? ((@ > 1) is unknown)')
+----
+"a"
+
+query TT nosort
+SELECT jsonb_path_query_first('1', '(($ > 1) is unknown).type()'), jsonb_path_query_first('1', '(1 > "a") is unknown')
+----
+"boolean"
+true
+
+query BB nosort
+SELECT jsonb_path_match('1', '(1 > "a") is unknown'), jsonb_path_match('1', '((1 > "a") is unknown) is unknown')
+----
+true
+false
+
+# --- starts with --------------------------------------------------------------------------------
+
+# Left operand lax-unwrapped; a non-string item is unknown.
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","ab",1,["abx"],"xab"]', '$[*] ? (@ starts with "ab")')
+----
+"abc"
+"ab"
+"abx"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","ab",1,["abx"]]', 'lax $ ? (@ starts with "ab")')
+----
+"abc"
+"ab"
+["abx"]
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","ab",1,["abx"]]', 'strict $[*] ? ((@ starts with "ab") is unknown)')
+----
+1
+["abx"]
+
+query T nosort
+SELECT * FROM jsonb_path_query('["","a"]', '$[*] ? (@ starts with "")')
+----
+""
+"a"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["é","éa","e"]', '$[*] ? (@ starts with "é")')
+----
+"é"
+"éa"
+
+# A variable prefix: a string works, anything else (not unwrapped) is unknown; a missing one 42704.
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","ab"]', '$[*] ? (@ starts with $p)', '{"p":"abc"}')
+----
+"abc"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","ab"]', '$[*] ? (@ starts with $p)', '{"p":["ab"]}')
+----
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","ab"]', '$[*] ? ((@ starts with $p) is unknown)', '{"p":["ab"]}')
+----
+"abc"
+"ab"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","ab"]', '$[*] ? (@ starts with $p)', '{"p":1}')
+----
+
+statement error 42704
+SELECT * FROM jsonb_path_query('["abc","ab"]', '$[*] ? (@ starts with $p)', '{}')
+
+query BBB nosort
+SELECT jsonb_path_match('"abc"', '$ starts with "ab"'), jsonb_path_match('"abc"', '$ starts with "b"'), jsonb_path_match('1', '$ starts with "b"')
+----
+true
+false
+NULL
+
+# Existential over a sequence: lax true if any item starts with it; strict unknown on any non-string.
+query BB nosort
+SELECT jsonb_path_match('["x", 1, "ab"]', '$[*] starts with "a"'), jsonb_path_match('["x", 1, "ab"]', 'strict $[*] starts with "a"')
+----
+true
+NULL
+
+query BB nosort
+SELECT jsonb_path_exists('{"a":"abc"}', '$ ? (@.a starts with "ab")'), jsonb_path_exists('{"a":"abc"}', '$ ? (@.b starts with "ab")')
+----
+true
+false
+
+# --- like_regex ---------------------------------------------------------------------------------
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","xabc","ABC",1,null,["abd"]]', '$[*] ? (@ like_regex "^ab")')
+----
+"abc"
+"abd"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","xabc","ABC",1,null,["abd"]]', '$[*] ? (@ like_regex "^ab" flag "i")')
+----
+"abc"
+"ABC"
+"abd"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","xabc","ABC",1,null,["abd"]]', 'strict $[*] ? ((@ like_regex "^ab") is unknown)')
+----
+1
+null
+["abd"]
+
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","xabc","ABC",1,null,["abd"]]', 'lax $[*] ? ((@ like_regex "^ab") is unknown)')
+----
+1
+null
+
+# Unanchored: a match anywhere.
+query T nosort
+SELECT * FROM jsonb_path_query('["abc","xbz","cab",""]', '$[*] ? (@ like_regex "b")')
+----
+"abc"
+"xbz"
+"cab"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["2024-01-15","15/01/2024","2024-1-5"]', '$[*] ? (@ like_regex "^\\d{4}-\\d{2}-\\d{2}$")')
+----
+"2024-01-15"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["cat","dog","bird","cow"]', '$[*] ? (@ like_regex "^(c|d)o")')
+----
+"dog"
+"cow"
+
+# q: the pattern is a literal; qi folds it too.
+query T nosort
+SELECT * FROM jsonb_path_query('["a.c","abc"]', '$[*] ? (@ like_regex "a.c" flag "q")')
+----
+"a.c"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["A.C","abc"]', '$[*] ? (@ like_regex "a.c" flag "qi")')
+----
+"A.C"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["a(b","ab"]', '$[*] ? (@ like_regex "(" flag "q")')
+----
+"a(b"
+
+query T nosort
+SELECT * FROM jsonb_path_query('["a\\b","ab"]', '$[*] ? (@ like_regex "\\" flag "q")')
+----
+"a\\b"
+
+# Newlines: without s, `.` and a negated bracket class stop at a newline; \D, \s, \W match it.
+query BBBBBB nosort
+SELECT jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a.b")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a[^x]b")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a\\Db")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a\\sb")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a\\Wb")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a\\Sb")')
+----
+false
+false
+true
+true
+true
+false
+
+query BBBB nosort
+SELECT jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a.b" flag "s")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a[^x]b" flag "s")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a\\Wb" flag "s")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a[\\n]b")')
+----
+true
+true
+true
+true
+
+# ^ and $ anchor the whole string.
+query BB nosort
+SELECT jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "^b")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a$")')
+----
+false
+false
+
+query BBB nosort
+SELECT jsonb_path_match('"abc"', '$ like_regex "b"'), jsonb_path_match('1', '$ like_regex "b"'), jsonb_path_match('["x", "abc"]', '$[*] like_regex "b"')
+----
+true
+NULL
+true
+
+query B nosort
+SELECT jsonb_path_match('["x", 1, "abc"]', 'strict $[*] like_regex "b"')
+----
+NULL
+
+# A regex operand may be any expression; lax unwraps an array operand.
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[{"n":"xy"},{"n":"zz"}]}', '$.a[*] ? (@.n like_regex "^x")')
+----
+{"n": "xy"}
+
+query B nosort
+SELECT jsonb_path_exists('{"tags":["red","blue"]}', '$ ? (@.tags like_regex "^bl")')
+----
+true
+
+# The operators @? and @@ and the vars argument.
+query BB nosort
+SELECT '{"a":"hello"}'::jsonb @? '$.a ? (@ like_regex "^h")', '{"a":"hello"}'::jsonb @@ '$.a starts with "he"'
+----
+true
+true
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"xs":["apple","banana","avocado"]}', '$.xs[*] ? (@ starts with $p && @ like_regex "o")', '{"p":"a"}')
+----
+"avocado"

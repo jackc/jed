@@ -133,6 +133,14 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
   jsonb_path_query_array('[1, "x", 2]', '$[*].double()', silent => true)   AS before_error,
   JSON_VALUE('{"price": 2.50}', '$.price * $qty' PASSING 4 AS qty)         AS total;`;
 
+	const jsonpathPredicateDemo = `SELECT
+  jsonb_path_query_array('["apple", "Avocado", "banana", 7]',
+                         '$[*] ? (@ like_regex "^a" flag "i")')              AS a_words,
+  jsonb_path_query_array('["v1.2", "v2.0", "beta"]', '$[*] ? (@ starts with "v")') AS versions,
+  jsonb_path_query_array('[{"id": 1, "tag": "x"}, {"id": 2}]',
+                         '$[*] ? (exists (@.tag)).id')                        AS tagged,
+  jsonb_path_query_array('{"a": {"price": 3}, "b": [{"price": 5}]}', 'strict $.**.price') AS prices;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -457,6 +465,20 @@ forms of the functions (`jsonb_path_exists_tz`, …) behave the same; as in Post
 `STABLE`, so an index expression cannot use them:
 
 <LiveSql demo="jsonpathVarsDemo" query={jsonpathVarsDemo} rows={1} />
+
+Besides comparisons, a `jsonpath` filter or top-level predicate may use PostgreSQL's other
+predicates: `exists (path)`, `starts with "prefix"` (or a variable), `like_regex "pattern"` with an
+optional `flag` string, and `(predicate) is unknown`. `like_regex` uses jed's regular expressions (see
+[pattern matching](/docs/sql/pattern-matching)), with the flags `i` (ignore case), `s` (`.` matches a
+newline), and `q` (the pattern is literal text). Without `s`, `.` and `[^…]` do not match a newline.
+The `m` flag is not supported (`0A000`), and `x` is not supported in PostgreSQL either. The `.**`
+accessor reaches every level below an item: `$.**` is the item and all its descendants,
+`$.**{2}` only level 2, and `$.**{1 to last}` everything below the item. As in PostgreSQL, a path
+continuing after `.**` skips the items it does not apply to, even in `strict` mode. In `lax` mode it
+also unwraps arrays as usual, so `lax $.**.price` finds a price inside an array twice, once through the
+array and once through the object:
+
+<LiveSql demo="jsonpathPredicateDemo" query={jsonpathPredicateDemo} rows={1} />
 
 An unquoted member name in a `jsonpath` follows PostgreSQL's lexing. It runs until whitespace, `"`,
 or one of the path's operator and punctuation characters (`. [ ] ( ) $ @ ? , * + - / % ! = < > & |

@@ -145,6 +145,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // jsonpath variables: the jsonb_path_* `vars`/`silent` arguments, the `_tz` functions, and the
   // SQL/JSON `PASSING` clause (jsonpath.md §5, json-sql-functions.md §5.4).
   "expr.jsonpath_vars",
+  // jsonpath predicates — `exists`, `like_regex` (+ flags), `starts with`, `is unknown` (jsonpath.md
+  // §4.3–§4.4).
+  "expr.jsonpath_predicates",
+  // The jsonpath any-level accessor `.**` with its level bounds (jsonpath.md §3.3).
+  "expr.jsonpath_any",
   // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
   "func.jsonb_access",
   // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).
