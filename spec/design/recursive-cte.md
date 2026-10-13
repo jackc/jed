@@ -198,10 +198,10 @@ bump).
   The substrate they desugar to has landed: a recursive CTE's working table carries `record` and
   `record[]` columns, so the hand-written equivalents — a `path || ROW(id)` column ordered for
   depth-first, `ROW(depth, id)` for breadth-first, and `ROW(id) = ANY(path)` for cycle detection —
-  run today ([composite.md](composite.md) §13, `suites/types/record_column.test`). The desugaring
-  must build each `ROW(…)` from values already coerced to the anchor's column types: `||` takes an
-  element of exactly the array's element type, so an `i64` anchor path does not accept an `i32`
-  recursive-term element.
+  run today ([composite.md](composite.md) §13, `suites/types/record_column.test`). `||` widens a
+  record element's integer fields ([array-functions.md](array-functions.md) §2.1), so an `i64`
+  anchor path accepts an `i32` recursive-term element; the path column's type is still fixed by the
+  anchor (§2).
 - **Recursive reference inside a `FROM` derived table** or **a set-operation recursive term**
   (`0A000` today; PostgreSQL allows both).
 - **Mutual recursion** between WITH items (`0A000` in PostgreSQL; `42P01` in jed today).

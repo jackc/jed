@@ -3398,6 +3398,14 @@ volatility     = "immutable"
 # arg_families/result as an allowlist. No grammar change (the function_call production already
 # parses them). All rules are oracle-pinned (postgres:18).
 #
+# `anycompatiblearray` / `anycompatible` are PostgreSQL's WIDENING spellings of the same two slots,
+# used exactly where PG declares them (the builders, the search/edit functions, and `||`): ELEM
+# binds to the COMMON type of those arguments by the set-operation rule (grammar.md §25 — integer
+# widths, integer with decimal, f32 with f64, anonymous-record integer fields) instead of requiring
+# equal types, and the result code `anycompatiblearray` is ELEM[] (array-functions.md §2.1). An
+# argument whose values must change to reach ELEM (int → decimal, f32 → f64) is cast. The
+# containment operators and the introspectors keep the strict `anyarray`, as in PostgreSQL.
+#
 # Introspection (array_ndims/length/lower/upper/cardinality/dims): pure readers of the value's
 # ndim/dims/lbounds header. They `propagate` NULL (a NULL array OR a NULL dimension arg → NULL)
 # and beyond that return NULL for an out-of-shape request — array_length/lower/upper are NULL for
@@ -3511,9 +3519,9 @@ volatility     = "immutable"
 name           = "array_append"
 kind           = "function"
 arity          = 2
-arg_families   = ["anyarray", "anyelement"]
+arg_families   = ["anycompatiblearray", "anycompatible"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 errors         = ["22000"]
 
@@ -3522,9 +3530,9 @@ volatility     = "immutable"
 name           = "array_prepend"
 kind           = "function"
 arity          = 2
-arg_families   = ["anyelement", "anyarray"]
+arg_families   = ["anycompatible", "anycompatiblearray"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 errors         = ["22000"]
 
@@ -3533,9 +3541,9 @@ volatility     = "immutable"
 name           = "array_cat"
 kind           = "function"
 arity          = 2
-arg_families   = ["anyarray", "anyarray"]
+arg_families   = ["anycompatiblearray", "anycompatiblearray"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 errors         = ["2202E"]
 
@@ -3560,9 +3568,9 @@ volatility     = "immutable"
 name           = "array_remove"
 kind           = "function"
 arity          = 2
-arg_families   = ["anyarray", "anyelement"]
+arg_families   = ["anycompatiblearray", "anycompatible"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 errors         = ["0A000"]
 
@@ -3571,9 +3579,9 @@ volatility     = "immutable"
 name           = "array_replace"
 kind           = "function"
 arity          = 3
-arg_families   = ["anyarray", "anyelement", "anyelement"]
+arg_families   = ["anycompatiblearray", "anycompatible", "anycompatible"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 errors         = []
 
@@ -3582,7 +3590,7 @@ volatility     = "immutable"
 name           = "array_position"
 kind           = "function"
 arity          = 2
-arg_families   = ["anyarray", "anyelement"]
+arg_families   = ["anycompatiblearray", "anycompatible"]
 arg_resolution = "none"
 result         = "i32"
 null           = "none"
@@ -3593,7 +3601,7 @@ volatility     = "immutable"
 name           = "array_position"
 kind           = "function"
 arity          = 3
-arg_families   = ["anyarray", "anyelement", "integer"]
+arg_families   = ["anycompatiblearray", "anycompatible", "integer"]
 arg_resolution = "none"
 result         = "i32"
 null           = "none"
@@ -3604,7 +3612,7 @@ volatility     = "immutable"
 name           = "array_positions"
 kind           = "function"
 arity          = 2
-arg_families   = ["anyarray", "anyelement"]
+arg_families   = ["anycompatiblearray", "anycompatible"]
 arg_resolution = "none"
 result         = "i32[]"
 null           = "none"
@@ -3629,9 +3637,9 @@ name           = "concat"
 symbol         = "||"
 kind           = "concat"
 arity          = 2
-arg_families   = ["anyarray", "anyarray"]
+arg_families   = ["anycompatiblearray", "anycompatiblearray"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 precedence     = 37
 errors         = ["2202E"]
@@ -3642,9 +3650,9 @@ name           = "concat"
 symbol         = "||"
 kind           = "concat"
 arity          = 2
-arg_families   = ["anyarray", "anyelement"]
+arg_families   = ["anycompatiblearray", "anycompatible"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 precedence     = 37
 errors         = ["22000"]
@@ -3655,9 +3663,9 @@ name           = "concat"
 symbol         = "||"
 kind           = "concat"
 arity          = 2
-arg_families   = ["anyelement", "anyarray"]
+arg_families   = ["anycompatible", "anycompatiblearray"]
 arg_resolution = "none"
-result         = "anyarray"
+result         = "anycompatiblearray"
 null           = "none"
 precedence     = 37
 errors         = ["22000"]

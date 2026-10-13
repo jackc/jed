@@ -519,7 +519,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			if base, ok := strings.CutSuffix(o.Result, "[]"); ok {
 				_, concreteArray = scalarTypeFromName(base)
 			}
-			if _, ok := scalarTypeFromName(o.Result); o.Result != "anyarray" && o.Result != "anyelement" && !concreteArray && !ok {
+			if _, ok := scalarTypeFromName(o.Result); o.Result != "anyarray" && o.Result != "anycompatiblearray" && o.Result != "anyelement" && !concreteArray && !ok {
 				t.Fatalf("array function %s has unhandled result code %s", o.Name, o.Result)
 			}
 			continue

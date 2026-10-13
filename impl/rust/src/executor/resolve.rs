@@ -1634,18 +1634,26 @@ pub(crate) fn resolve_concat(
     // bytea row (routed above) must not take part.
     let overload = OPERATORS
         .iter()
-        .filter(|o| o.kind == "concat" && o.result == "anyarray")
+        .filter(|o| o.kind == "concat" && o.result == "anycompatiblearray")
         .find_map(|o| match_poly(o.arg_families, &tys).map(|elem| (o, elem)));
     let (desc, elem) = overload.ok_or_else(no_overload)?;
     let result = poly_result_type(desc.result, &elem)?;
     // The matched overload's slot pattern selects the kernel; the operands stay in source order
     // (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
     let func = match desc.arg_families {
-        ["anyarray", "anyarray"] => ArrayFunc::ArrayCat,
-        ["anyarray", "anyelement"] => ArrayFunc::ArrayAppend,
-        ["anyelement", "anyarray"] => ArrayFunc::ArrayPrepend,
+        ["anycompatiblearray", "anycompatiblearray"] => ArrayFunc::ArrayCat,
+        ["anycompatiblearray", "anycompatible"] => ArrayFunc::ArrayAppend,
+        ["anycompatible", "anycompatiblearray"] => ArrayFunc::ArrayPrepend,
         _ => unreachable!("concat overload has an unexpected slot pattern"),
     };
+    // An operand whose values must change to reach the common element type is cast (§2.1).
+    if let Some(e) = &elem {
+        let [lslot, rslot] = desc.arg_families else {
+            unreachable!("a concat overload is binary")
+        };
+        rl = coerce_compatible_arg(rl, &tys[0], lslot, e);
+        rr = coerce_compatible_arg(rr, &tys[1], rslot, e);
+    }
     Ok((
         RExpr::ArrayFunc {
             func,

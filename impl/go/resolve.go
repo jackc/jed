@@ -3308,7 +3308,8 @@ func rejectIndeterminateTarget(d deriv) error {
 func functionResultCollatable(name string) bool {
 	for i := range operators {
 		o := &operators[i]
-		if o.Kind == "function" && (o.Result == "text" || o.Result == "text[]" || o.Result == "anyarray") &&
+		if o.Kind == "function" && (o.Result == "text" || o.Result == "text[]" || o.Result == "anyarray" ||
+			o.Result == "anycompatiblearray") &&
 			o.Name == name {
 			return true
 		}

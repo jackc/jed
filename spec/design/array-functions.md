@@ -34,7 +34,10 @@
 > compare. Capability `func.array_composite`, oracle-checked
 > (`suites/query/unnest_composite.test`, `suites/expr/array_composite_functions.test`). §14 — the
 > **`width_bucket(operand, thresholds)`** array-threshold variant, a binary search over a sorted
-> thresholds array (`suites/expr/width_bucket_array.test`, oracle-checked).
+> thresholds array (`suites/expr/width_bucket_array.test`, oracle-checked). §2.1 — the
+> **`anycompatible` widening** of the builders, the search/edit functions, and `||`: their element
+> type is the common type of the arguments, not one exact type (`suites/expr/array_compatible.test`,
+> capability `func.array_compatible`, oracle-checked).
 
 ## 1. Why a new layer
 
@@ -119,6 +122,44 @@ down to its elements — previously every caller passed `None`, so 1-D inference
 bound `elem`**; `scalar_result_type` gains the two reserved codes and consults `elem`. This is the
 one structural change to the resolution path; everything downstream (the per-row evaluator, the
 `# types:` contract, cost) is unchanged.
+
+### 2.1 `anycompatiblearray` / `anycompatible` — the widening slots
+
+PostgreSQL (13+) declares most of this surface not over `anyarray`/`anyelement` but over their
+widening spellings `anycompatiblearray`/`anycompatible`: `array_append`, `array_prepend`,
+`array_cat`, `array_remove`, `array_replace`, `array_position` (both arities), `array_positions`,
+and the three array `||` operators. (The introspectors, `unnest`, and the containment operators
+`@>`/`<@`/`&&` stay strict `anyarray`; `width_bucket` is `anycompatible` too, resolved by its own
+comparability rule, §14.2.) Their element type is the **common type** of the arguments, so
+`i32[] || i64` is an `i64[]` and `i32[] || 2.5` a `numeric[]`, where strict unification finds no
+match.
+
+jed mirrors the declarations as data: those catalog rows use the two tokens (and the result code
+`anycompatiblearray` = `ELEM[]`), exactly where PostgreSQL does. Resolution is §2 with one change in
+step 5: for a compatible slot, `unify(elem, X)` widens `elem` to the **common type** of `elem` and
+`X` instead of requiring equality. The common type is jed's one set-operation rule
+([grammar.md](grammar.md) §25), the same function `UNION`, `VALUES`, and `CASE` fold:
+
+- integer widths widen to the widest (`i32[] || i64` → `i64[]`);
+- an integer meets `decimal` as `decimal` (`i32[] || 2.5` → `decimal[]`);
+- `f32` meets `f64` as `f64`;
+- two anonymous records of the same arity widen their integer fields
+  ([composite.md](composite.md) §13) — `record(i64)[] || ROW(i32_col)`, the shape a recursive
+  CTE's path column takes;
+- anything else must be identical, so `i32[] || text` stays `42883`.
+
+**Applying the widening.** An argument whose *values* must change to reach the common element type
+is cast: an integer element to `decimal` or an `f32` element to `f64` through the scalar `Cast`
+node, an integer or `f32` array through the element-wise `ArrayCast` node (array.md §7). Each
+charges the cast's usual cost. The other widenings — integer widths and a record's integer fields —
+leave every value unchanged (every integer is one `i64`), so no cast is inserted and the cost of a
+call whose arguments already agreed is unchanged. The literal-adaptation pass still runs first, so
+`i32[] || 40` adapts `40` to `i32` (and `i32[] || 5000000000` is still its `22003`).
+
+**Deliberate divergence — the float island.** PostgreSQL's `anycompatible` widens an integer or
+`numeric` with a float to `float8`; jed's common-type rule never lets float meet an integer or
+`decimal` implicitly ([float.md](float.md) §6), so `i32[] || f64` and `array_append(decimal[], f64)`
+stay `42883` — ledgered in [../conformance/oracle_overrides.toml](../conformance/oracle_overrides.toml).
 
 ## 3. AF1 functions — the scalar-function-shaped surface
 
@@ -215,11 +256,11 @@ all*.)
 Default is "match PostgreSQL" (CLAUDE.md §1); each divergence is recorded here and, when its
 corpus lands, in [../conformance/oracle_overrides.toml](../conformance/oracle_overrides.toml).
 
-1. **Polymorphic resolution by unification, not a coercion lattice** — jed binds one type
-   variable `ELEM` by structural equality and rejects conflicts as `42883`; it does **not**
-   reproduce PG's `select_common_type` coercion search (which would, e.g., unify `int[]` with
-   `bigint` element). This is the same strictness jed already applies to every overload
-   (CLAUDE.md §4) and observably matches PG on the in-corpus cases.
+1. **Polymorphic resolution by unification** — jed binds one type variable `ELEM` by structural
+   equality for the strict `anyarray`/`anyelement` slots, as PostgreSQL does, and rejects conflicts
+   as `42883`. For PostgreSQL's widening `anycompatible*` slots it binds the common type by jed's
+   set-operation rule rather than reproducing PG's full `select_common_type` lattice (§2.1); the one
+   observable difference is the float island.
 2. **`anyarray`/`anyelement` are catalog tokens, not scalars** — absent from scalars.toml; the
    resolver interprets them. (Contrast a real family, which the generic `family_matches` handles.)
 3. **The dimension argument is the `integer` family, not strict `int4`** — `array_length(xs,
@@ -240,11 +281,12 @@ corpus lands, in [../conformance/oracle_overrides.toml](../conformance/oracle_ov
    types the bare `NULL` as `int4`), inherited from jed's untyped-NULL posture, not new to AF1.
 8. **Element unification adapts literals to the *first* `anyarray` argument** — the literal-adaptation
    hint (above) comes from the first array argument. The realistic shapes (`array_append(col, lit)`,
-   `array_cat(col, ARRAY[…])`, `array_cat(col, col)`, `array_cat(ARRAY[…], ARRAY[…])`) all resolve;
-   the one shape that does not is an untyped `ARRAY[…]` *first* with a typed array of a different
-   (narrower) element type second (`array_cat(ARRAY[1,2], i32[]_col)` → `42883`), where PG would
-   find a common type. jed is strict here (the same posture as its array comparison, which requires
-   element-family compatibility); put the typed/column array first.
+   `array_cat(col, ARRAY[…])`, `array_cat(col, col)`, `array_cat(ARRAY[…], ARRAY[…])`) all resolve,
+   and since the builders widen (§2.1) so does an untyped `ARRAY[…]` *first* with a narrower typed
+   array second (`array_cat(ARRAY[1,2], i32[]_col)` → `i64[]`, where PG, typing the literals `int4`,
+   returns `int4[]` — the values agree). The literal adaptation itself still range-checks against
+   the first array: `array_append(i32[], 5000000000)` is `22003` where PG, typing the literal `int8`,
+   widens to `bigint[]`.
 9. **`||` takes the array overloads only with a typed array operand** (AF2, §8). Text `||` has since
    landed ([string-functions.md](string-functions.md) §5): with no array operand, `'a' || 'b'` is
    `'ab'` and a bare NULL with an element (`NULL || 1`) is a NULL `text`, as in PG. `1 || 2` is

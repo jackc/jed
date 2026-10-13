@@ -381,6 +381,12 @@ The element cast follows the scalar matrix exactly — so widening (`i32[] → i
 cast is a type error (`42804`). Like every cast to `text`, `array → text` is explicit-only: an array
 never silently lands in a `text` column.
 
+Concatenation and the array builders and search functions (`||`, `array_append`, `array_prepend`,
+`array_cat`, `array_remove`, `array_replace`, `array_position`, `array_positions`) widen on their
+own, as in PostgreSQL: the result's element type is the common type of the arguments. So
+`ARRAY[1::i32] || 9000000000::i64` is an `i64[]` and `ARRAY[1, 2] || 2.5` a `numeric[]`. A float
+never meets an integer or `numeric` implicitly, so mixing those is still an error (`42883`).
+
 ## JSON assignment
 
 `json` preserves its input spelling; `jsonb` stores a canonical document. Both can be updated from

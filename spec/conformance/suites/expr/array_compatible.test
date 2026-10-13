@@ -1,0 +1,177 @@
+# Array builders, search/edit functions, and `||` widen their element type the way PostgreSQL's
+# anycompatible pseudo-types do (spec/design/array-functions.md §2.1). PostgreSQL declares
+# array_append / array_prepend / array_cat / array_remove / array_replace / array_position /
+# array_positions and the three array `||` operators over anycompatiblearray / anycompatible, so the
+# element type is the COMMON type of the arguments rather than requiring them to be equal. jed binds
+# it by its set-operation rule (grammar.md §25): integer widths widen, an integer meets decimal as
+# decimal, f32 meets f64 as f64, and anonymous records widen their integer fields. An argument whose
+# values must change (an integer array meeting a decimal) is cast element by element. The
+# containment operators keep the strict anyarray, as in PostgreSQL, and float never meets an
+# integer or decimal (jed's float island; PostgreSQL would choose float8 — ledgered). Every other
+# row is PostgreSQL-oracle-verified (postgres:18).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.array, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, types.composite, types.array_composite, types.record_column, func.array, func.array_compatible, cast.explicit, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s i16, i i32, b i64, d decimal, r f32, f f64, xs i32[], bs i64[], ds decimal[], rs f32[])
+
+statement ok
+INSERT INTO t VALUES (1, 7, 8, 9000000000, 2.5, 1.5, 2.25, ARRAY[1, 2], ARRAY[5000000000], ARRAY[1.5], ARRAY[0.5::real])
+
+# --- `||` across integer widths ------------------------------------------------------------------
+
+query T nosort
+SELECT xs || b FROM t
+----
+{1,2,9000000000}
+
+query T nosort
+SELECT bs || i FROM t
+----
+{5000000000,8}
+
+query T nosort
+SELECT s || xs FROM t
+----
+{7,1,2}
+
+query T nosort
+SELECT xs || bs FROM t
+----
+{1,2,5000000000}
+
+query T nosort
+SELECT bs || xs FROM t
+----
+{5000000000,1,2}
+
+# --- integer meets decimal: decimal, the integer side cast -----------------------------------------
+
+query T nosort
+SELECT ds || i FROM t
+----
+{1.5,8}
+
+query T nosort
+SELECT xs || d FROM t
+----
+{1,2,2.5}
+
+query T nosort
+SELECT xs || ds FROM t
+----
+{1,2,1.5}
+
+query T nosort
+SELECT d || xs FROM t
+----
+{2.5,1,2}
+
+query T nosort
+SELECT ARRAY[1::int] || 2.5
+----
+{1,2.5}
+
+# --- f32 meets f64 -------------------------------------------------------------------------------
+
+query R nosort
+SELECT (rs || f)[2] FROM t
+----
+2.25
+
+query R nosort
+SELECT (r || ARRAY[2.25::float8])[1] FROM t
+----
+1.5
+
+# --- anonymous records widen their integer fields ------------------------------------------------
+
+query T nosort
+SELECT ARRAY[ROW(1::bigint, 'a'::text)] || ROW(2::int, 'b'::text)
+----
+{"(1,a)","(2,b)"}
+
+query T nosort
+SELECT ARRAY[ROW(1::int)] || ARRAY[ROW(2::bigint)]
+----
+{(1),(2)}
+
+# --- the builder functions -----------------------------------------------------------------------
+
+query T nosort
+SELECT array_append(xs, b) FROM t
+----
+{1,2,9000000000}
+
+query T nosort
+SELECT array_prepend(b, xs) FROM t
+----
+{9000000000,1,2}
+
+query T nosort
+SELECT array_cat(xs, ds) FROM t
+----
+{1,2,1.5}
+
+query T nosort
+SELECT array_append(ds, s) FROM t
+----
+{1.5,7}
+
+# --- the search/edit functions -------------------------------------------------------------------
+
+query I nosort
+SELECT array_position(xs, 2::bigint) FROM t
+----
+2
+
+query I nosort
+SELECT array_position(ARRAY[1.5, 2.0], 2::int)
+----
+2
+
+query T nosort
+SELECT array_positions(bs, 5000000000::bigint) FROM t
+----
+{1}
+
+query T nosort
+SELECT array_remove(xs, 2.0) FROM t
+----
+{1}
+
+query T nosort
+SELECT array_replace(xs, 2::bigint, b) FROM t
+----
+{1,9000000000}
+
+query T nosort
+SELECT array_replace(xs, 2::smallint, d) FROM t
+----
+{1,2.5}
+
+# --- a typed NULL element widens like any other ------------------------------------------------
+
+query T nosort
+SELECT xs || NULL::bigint FROM t
+----
+{1,2,NULL}
+
+# --- still no common type ------------------------------------------------------------------------
+
+statement error 42883
+SELECT xs || 'x'::text FROM t
+
+statement error 42883
+SELECT array_cat(xs, ARRAY['a'::text]) FROM t
+
+# The containment operators stay strict anyarray, as in PostgreSQL.
+statement error 42883
+SELECT xs @> bs FROM t
+
+# Float never meets an integer or decimal (jed's float island; PostgreSQL widens to float8).
+statement error 42883
+SELECT xs || f FROM t
+
+statement error 42883
+SELECT array_append(ds, f) FROM t

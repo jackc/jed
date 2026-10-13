@@ -10,9 +10,11 @@
 #   2. each operator has the fields required for its kind; arity == arg_families
 #      length; null_test => arity 1; comparison => arity 2
 #   3. every arg_families entry is "any", a real `family` in scalars.toml, or a
-#      polymorphic pseudo-family (anyarray | anyelement — array-functions.md §2)
+#      polymorphic pseudo-family (anyarray | anyelement | anycompatiblearray | anycompatible —
+#      array-functions.md §2)
 #   4. result is a scalar id in scalars.toml ("boolean"), a reserved id (promoted |
-#      anyarray | anyelement), or a concrete array result `<scalar>[]` (array_positions → i32[])
+#      anyarray | anyelement | anycompatiblearray), or a concrete array result `<scalar>[]`
+#      (array_positions → i32[])
 #   5. arg_resolution is "promote" | "none"; "promote" requires the operand pair
 #      to be comparable and the family to have a promotion rule (compare.toml)
 #   6. null is "propagates" | "detects" | "kleene" | "null_safe" | "none" (null_safe = the
@@ -70,11 +72,14 @@ SPEC_DIR = File.expand_path("..", FUNC_DIR)
 # any range arg (binds ELEM := its element type — range-functions.md §1); `anyelement` matches any
 # arg (binds/checks ELEM). Admitted in arg_families AND, for the array builders' / range constructors'
 # result, as reserved result codes (anyarray = ELEM[], anyrange = ELEM-range, anyelement = ELEM).
-POLYMORPHIC_FAMILIES = %w[anyarray anyrange anyelement].to_set
+# `anycompatiblearray` / `anycompatible` are PostgreSQL's widening spellings of the same two slots
+# (array-functions.md §2.1): ELEM binds to the COMMON type of their arguments (grammar.md §25)
+# rather than requiring equal types, and the result code `anycompatiblearray` = ELEM[].
+POLYMORPHIC_FAMILIES = %w[anyarray anyrange anyelement anycompatiblearray anycompatible].to_set
 
 # `none` is the non-strict discipline (array_append/prepend/cat): the resolver does NOT
 # short-circuit a NULL argument — the kernel handles NULL itself (array-functions.md §4).
-RESERVED_RESULTS = %w[promoted anyarray anyrange anyelement].to_set
+RESERVED_RESULTS = %w[promoted anyarray anyrange anyelement anycompatiblearray].to_set
 # "concat" is the `||` array concatenation operator's kind (array-functions.md §8): a binary infix
 # operator with its own precedence, polymorphic over anyarray/anyelement like the array functions.
 # "containment" is the kind of the array containment/overlap operators `@>`/`<@`/`&&`

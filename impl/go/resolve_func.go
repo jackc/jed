@@ -516,7 +516,7 @@ func isArrayFuncName(name string) bool {
 		o := &operators[i]
 		if o.Kind == "function" && o.Name == name {
 			for _, f := range o.ArgFamilies {
-				if f == "anyarray" || f == "anyelement" {
+				if isArraySlot(f) || isElementSlot(f) {
 					return true
 				}
 			}
@@ -649,15 +649,65 @@ func scalarPairCastable(from, to scalarType) bool {
 	}
 }
 
+// isArraySlot reports whether a catalog slot is an array pseudo-family — strict anyarray or
+// PostgreSQL's widening anycompatiblearray (array-functions.md §2.1).
+func isArraySlot(slot string) bool { return slot == "anyarray" || slot == "anycompatiblearray" }
+
+// isElementSlot reports whether a catalog slot is an element pseudo-family — strict anyelement or
+// the widening anycompatible (array-functions.md §2.1).
+func isElementSlot(slot string) bool { return slot == "anyelement" || slot == "anycompatible" }
+
 // unifyElem binds/checks the type variable ELEM against a concrete type x: binds if unbound (*set),
-// else requires structural equality. false ⇒ a conflict (array_cat(i32[], text[])) — no match.
-func unifyElem(elem **resolvedType, x resolvedType) bool {
+// else requires structural equality — or, for an anycompatible* slot (compatible), widens ELEM to
+// the common type of the two by the set-operation rule (array-functions.md §2.1, grammar.md §25).
+// false ⇒ a conflict (array_cat(i32[], text[])) — no match.
+func unifyElem(elem **resolvedType, x resolvedType, compatible bool) bool {
 	if *elem == nil {
 		cp := x
 		*elem = &cp
 		return true
 	}
+	if compatible {
+		c, ok := commonType(**elem, x)
+		if !ok {
+			return false
+		}
+		*elem = &c
+		return true
+	}
 	return resolvedTypeEqual(**elem, x)
+}
+
+// coerceCompatibleArg casts one argument of an anycompatible* slot to the bound common element type
+// elem when its values must change to get there (array-functions.md §2.1): an integer to decimal, or
+// an f32 to f64 — the element itself (an anycompatible slot) or every element of the array (an
+// anycompatiblearray slot, through the element-wise array cast). Every other difference the common
+// type admits (integer widths, an anonymous record's integer fields) leaves the values unchanged, so
+// the argument is returned as is, as is an untyped NULL.
+func coerceCompatibleArg(r *rExpr, t resolvedType, slot string, elem resolvedType) *rExpr {
+	var from resolvedType
+	switch {
+	case slot == "anycompatible":
+		from = t
+	case slot == "anycompatiblearray" && t.kind == rtArray:
+		from = *t.elem
+	default:
+		return r
+	}
+	var target scalarType
+	switch {
+	case from.kind == rtInt && elem.kind == rtDecimal:
+		target = scalarDecimal
+	case from.kind == rtFloat32 && elem.kind == rtFloat64:
+		target = scalarFloat64
+	default:
+		return r
+	}
+	if slot == "anycompatible" {
+		return &rExpr{kind: reCast, operand: r, result: target}
+	}
+	ec := colType{Scalar: target}
+	return &rExpr{kind: reArrayCast, operand: r, castElem: &ec}
 }
 
 // matchPoly matches an overload's slots (which may contain anyarray/anyelement) against the resolved
@@ -666,10 +716,10 @@ func unifyElem(elem **resolvedType, x resolvedType) bool {
 // anyelement (may precede its binding array — array_prepend), then concrete family slots.
 func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched bool) {
 	for j, slot := range slots {
-		if slot == "anyarray" {
+		if isArraySlot(slot) {
 			switch tys[j].kind {
 			case rtArray:
-				if !unifyElem(&elem, *tys[j].elem) {
+				if !unifyElem(&elem, *tys[j].elem, slot == "anycompatiblearray") {
 					return nil, false
 				}
 			case rtNull:
@@ -685,7 +735,7 @@ func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched 
 		if slot == "anyrange" {
 			switch tys[j].kind {
 			case rtRange:
-				if !unifyElem(&elem, *tys[j].elem) {
+				if !unifyElem(&elem, *tys[j].elem, false) {
 					return nil, false
 				}
 			case rtNull:
@@ -696,16 +746,16 @@ func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched 
 		}
 	}
 	for j, slot := range slots {
-		if slot == "anyelement" {
+		if isElementSlot(slot) {
 			if tys[j].kind != rtNull { // untyped NULL — defer
-				if !unifyElem(&elem, tys[j]) {
+				if !unifyElem(&elem, tys[j], slot == "anycompatible") {
 					return nil, false
 				}
 			}
 		}
 	}
 	for j, slot := range slots {
-		if slot != "anyarray" && slot != "anyrange" && slot != "anyelement" && !familyMatches(slot, tys[j]) {
+		if !isArraySlot(slot) && slot != "anyrange" && !isElementSlot(slot) && !familyMatches(slot, tys[j]) {
 			return nil, false
 		}
 	}
@@ -717,7 +767,7 @@ func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched 
 // other code is a concrete scalar id (i32, text).
 func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
 	switch code {
-	case "anyarray":
+	case "anyarray", "anycompatiblearray":
 		if elem == nil {
 			return resolvedType{}, indeterminatePoly()
 		}
@@ -841,7 +891,7 @@ func resolveArrayFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	// is the element type of the first anyarray argument.
 	var hint *scalarType
 	for j, slot := range slots {
-		if slot == "anyarray" && tys[j].kind == rtArray {
+		if isArraySlot(slot) && tys[j].kind == rtArray {
 			if s, ok := elemScalarHint(*tys[j].elem); ok {
 				hint = &s
 			}
@@ -850,7 +900,7 @@ func resolveArrayFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	}
 	if hint != nil {
 		for j, slot := range slots {
-			if slot == "anyarray" || slot == "anyelement" {
+			if isArraySlot(slot) || isElementSlot(slot) {
 				r, t, err := resolve(s, *fc.Args[j], hint, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
@@ -867,6 +917,11 @@ func resolveArrayFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	result, err := polyResultType(desc.Result, elem)
 	if err != nil {
 		return nil, resolvedType{}, err
+	}
+	if elem != nil {
+		for j, slot := range slots {
+			rargs[j] = coerceCompatibleArg(rargs[j], tys[j], slot, *elem)
+		}
 	}
 	return &rExpr{kind: reArrayFunc, afunc: arrayFuncID(name), sargs: rargs}, result, nil
 }
@@ -1391,7 +1446,7 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	var elem *resolvedType
 	for i := range operators {
 		o := &operators[i]
-		if o.Kind != "concat" || o.Result != "anyarray" {
+		if o.Kind != "concat" || o.Result != "anycompatiblearray" {
 			continue
 		}
 		if e, matched := matchPoly(o.ArgFamilies, tys); matched {
@@ -1411,12 +1466,17 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	// (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
 	var fn arrayFunc
 	switch {
-	case desc.ArgFamilies[0] == "anyarray" && desc.ArgFamilies[1] == "anyarray":
+	case desc.ArgFamilies[0] == "anycompatiblearray" && desc.ArgFamilies[1] == "anycompatiblearray":
 		fn = afCat
-	case desc.ArgFamilies[0] == "anyarray" && desc.ArgFamilies[1] == "anyelement":
+	case desc.ArgFamilies[0] == "anycompatiblearray" && desc.ArgFamilies[1] == "anycompatible":
 		fn = afAppend
-	default: // anyelement, anyarray
+	default: // anycompatible, anycompatiblearray
 		fn = afPrepend
+	}
+	// An operand whose values must change to reach the common element type is cast (§2.1).
+	if elem != nil {
+		rl = coerceCompatibleArg(rl, lt, desc.ArgFamilies[0], *elem)
+		rr = coerceCompatibleArg(rr, rt, desc.ArgFamilies[1], *elem)
 	}
 	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, result, nil
 }

@@ -790,8 +790,20 @@ pub(crate) fn is_array_func_name(name: &str) -> bool {
             && o.name == name
             && o.arg_families
                 .iter()
-                .any(|f| *f == "anyarray" || *f == "anyelement")
+                .any(|f| is_array_slot(f) || is_element_slot(f))
     })
+}
+
+/// Whether a catalog slot is an array pseudo-family — strict `anyarray` or PostgreSQL's widening
+/// `anycompatiblearray` (array-functions.md §2.1).
+pub(crate) fn is_array_slot(slot: &str) -> bool {
+    slot == "anyarray" || slot == "anycompatiblearray"
+}
+
+/// Whether a catalog slot is an element pseudo-family — strict `anyelement` or the widening
+/// `anycompatible` (array-functions.md §2.1).
+pub(crate) fn is_element_slot(slot: &str) -> bool {
+    slot == "anyelement" || slot == "anycompatible"
 }
 
 /// The kernel id for array function `name` (each name is single-arity, so the name alone selects
@@ -816,14 +828,27 @@ pub(crate) fn array_func_id(name: &str) -> ArrayFunc {
 }
 
 /// Bind/check the type variable ELEM against a concrete type `x`: bind if unbound, else require
-/// structural equality. `false` ⇒ a conflict (e.g. `array_cat(i32[], text[])`) — the overload
-/// does not match. An untyped `NULL` operand never reaches here (the caller defers it).
-pub(crate) fn unify_elem(elem: &mut Option<ResolvedType>, x: &ResolvedType) -> bool {
+/// structural equality — or, for an `anycompatible*` slot (`compatible`), widen ELEM to the common
+/// type of the two by the set-operation rule (array-functions.md §2.1, grammar.md §25). `false` ⇒ a
+/// conflict (e.g. `array_cat(i32[], text[])`) — the overload does not match. An untyped `NULL`
+/// operand never reaches here (the caller defers it).
+pub(crate) fn unify_elem(
+    elem: &mut Option<ResolvedType>,
+    x: &ResolvedType,
+    compatible: bool,
+) -> bool {
     match elem {
         None => {
             *elem = Some(x.clone());
             true
         }
+        Some(e) if compatible => match common_type(e, x) {
+            Some(c) => {
+                *e = c;
+                true
+            }
+            None => false,
+        },
         Some(e) => e == x,
     }
 }
@@ -836,10 +861,10 @@ pub(crate) fn unify_elem(elem: &mut Option<ResolvedType>, x: &ResolvedType) -> b
 pub(crate) fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<ResolvedType>> {
     let mut elem: Option<ResolvedType> = None;
     for (slot, t) in std::iter::zip(slots, tys) {
-        if *slot == "anyarray" {
+        if is_array_slot(slot) {
             match t {
                 ResolvedType::Array(e) => {
-                    if !unify_elem(&mut elem, e) {
+                    if !unify_elem(&mut elem, e, *slot == "anycompatiblearray") {
                         return None;
                     }
                 }
@@ -854,7 +879,7 @@ pub(crate) fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<
         if *slot == "anyrange" {
             match t {
                 ResolvedType::Range(e) => {
-                    if !unify_elem(&mut elem, e) {
+                    if !unify_elem(&mut elem, e, false) {
                         return None;
                     }
                 }
@@ -864,11 +889,11 @@ pub(crate) fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<
         }
     }
     for (slot, t) in std::iter::zip(slots, tys) {
-        if *slot == "anyelement" {
+        if is_element_slot(slot) {
             match t {
                 ResolvedType::Null => {} // untyped NULL — defer
                 _ => {
-                    if !unify_elem(&mut elem, t) {
+                    if !unify_elem(&mut elem, t, *slot == "anycompatible") {
                         return None;
                     }
                 }
@@ -876,9 +901,9 @@ pub(crate) fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<
         }
     }
     for (slot, t) in std::iter::zip(slots, tys) {
-        if *slot != "anyarray"
+        if !is_array_slot(slot)
             && *slot != "anyrange"
-            && *slot != "anyelement"
+            && !is_element_slot(slot)
             && !family_matches(slot, t)
         {
             return None;
@@ -892,7 +917,7 @@ pub(crate) fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<
 /// polymorphic arg was an untyped NULL); any other code is a concrete scalar id (`i32`, `text`).
 pub(crate) fn poly_result_type(code: &str, elem: &Option<ResolvedType>) -> Result<ResolvedType> {
     match code {
-        "anyarray" => match elem {
+        "anyarray" | "anycompatiblearray" => match elem {
             Some(e) => Ok(ResolvedType::Array(Box::new(e.clone()))),
             None => Err(indeterminate_poly()),
         },
@@ -916,6 +941,45 @@ pub(crate) fn poly_result_type(code: &str, elem: &Option<ResolvedType>) -> Resul
             ScalarType::from_name(code)
                 .unwrap_or_else(|| unreachable!("poly_result_type: unknown result code {code}")),
         )),
+    }
+}
+
+/// Cast one argument of an `anycompatible*` slot to the bound common element type `elem` when its
+/// values must change to get there (array-functions.md §2.1): an integer to `decimal`, or an `f32`
+/// to `f64` — the element itself (an `anycompatible` slot) or every element of the array (an
+/// `anycompatiblearray` slot, through the element-wise array cast). Every other difference the
+/// common type admits (integer widths, an anonymous record's integer fields) leaves the values
+/// unchanged, so the argument is returned as is, as is an untyped `NULL`.
+pub(crate) fn coerce_compatible_arg(
+    r: RExpr,
+    t: &ResolvedType,
+    slot: &str,
+    elem: &ResolvedType,
+) -> RExpr {
+    let from = match (slot, t) {
+        ("anycompatible", t) => t,
+        ("anycompatiblearray", ResolvedType::Array(e)) => &**e,
+        _ => return r,
+    };
+    let target = match (from, elem) {
+        (ResolvedType::Int(_), ResolvedType::Decimal) => ScalarType::Decimal,
+        (ResolvedType::Float(ScalarType::Float32), ResolvedType::Float(ScalarType::Float64)) => {
+            ScalarType::Float64
+        }
+        _ => return r,
+    };
+    if slot == "anycompatible" {
+        RExpr::Cast {
+            inner: Box::new(r),
+            target,
+            typmod: None,
+            varchar_len: None,
+        }
+    } else {
+        RExpr::ArrayCast {
+            inner: Box::new(r),
+            to_elem: Some(ColType::Scalar(target)),
+        }
     }
 }
 
@@ -988,16 +1052,13 @@ pub(crate) fn resolve_array_func(
         tys.push(t);
     }
     // Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar.
-    let hint = slots
-        .iter()
-        .zip(tys.iter())
-        .find_map(|(slot, t)| match (*slot, t) {
-            ("anyarray", ResolvedType::Array(e)) => elem_scalar_hint(e),
-            _ => None,
-        });
+    let hint = slots.iter().zip(tys.iter()).find_map(|(slot, t)| match t {
+        ResolvedType::Array(e) if is_array_slot(slot) => elem_scalar_hint(e),
+        _ => None,
+    });
     if let Some(s) = hint {
         for (i, slot) in slots.iter().enumerate() {
-            if *slot == "anyarray" || *slot == "anyelement" {
+            if is_array_slot(slot) || is_element_slot(slot) {
                 let (r, t) = resolve(scope, &args[i], Some(s), agg, params)?;
                 rargs[i] = r;
                 tys[i] = t;
@@ -1006,6 +1067,11 @@ pub(crate) fn resolve_array_func(
     }
     let elem = match_poly(slots, &tys).ok_or_else(|| no_func_overload(name))?;
     let result = poly_result_type(desc.result, &elem)?;
+    if let Some(e) = &elem {
+        rargs = std::iter::zip(rargs, std::iter::zip(slots, &tys))
+            .map(|(r, (slot, t))| coerce_compatible_arg(r, t, slot, e))
+            .collect();
+    }
     Ok((
         RExpr::ArrayFunc {
             func: array_func_id(name),

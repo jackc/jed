@@ -1429,6 +1429,7 @@ mod registry_tests {
                     .is_some_and(|base| ScalarType::from_name(base).is_some());
                 assert!(
                     o.result == "anyarray"
+                        || o.result == "anycompatiblearray"
                         || o.result == "anyelement"
                         || concrete_array
                         || ScalarType::from_name(o.result).is_some(),

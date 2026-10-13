@@ -478,6 +478,7 @@ import {
   assignableTo,
   astDeepEqual,
   coerceSetopRows,
+  commonType,
   combineSetop,
   exprEqual,
   exprLocation,
@@ -34705,8 +34706,47 @@ export function isArrayFuncName(name: string): boolean {
     (o) =>
       o.kind === "function" &&
       o.name === name &&
-      o.argFamilies.some((f) => f === "anyarray" || f === "anyelement"),
+      o.argFamilies.some((f) => isArraySlot(f) || isElementSlot(f)),
   );
+}
+
+// isArraySlot reports whether a catalog slot is an array pseudo-family — strict anyarray or
+// PostgreSQL's widening anycompatiblearray (array-functions.md §2.1).
+export function isArraySlot(slot: string): boolean {
+  return slot === "anyarray" || slot === "anycompatiblearray";
+}
+
+// isElementSlot reports whether a catalog slot is an element pseudo-family — strict anyelement or
+// the widening anycompatible (array-functions.md §2.1).
+export function isElementSlot(slot: string): boolean {
+  return slot === "anyelement" || slot === "anycompatible";
+}
+
+// coerceCompatibleArg casts one argument of an anycompatible* slot to the bound common element type
+// elem when its values must change to get there (array-functions.md §2.1): an integer to decimal, or
+// an f32 to f64 — the element itself (an anycompatible slot) or every element of the array (an
+// anycompatiblearray slot, through the element-wise array cast). Every other difference the common
+// type admits (integer widths, an anonymous record's integer fields) leaves the values unchanged, so
+// the argument is returned as is, as is an untyped NULL.
+export function coerceCompatibleArg(
+  r: RExpr,
+  t: ResolvedType,
+  slot: string,
+  elem: ResolvedType,
+): RExpr {
+  let from: ResolvedType;
+  if (slot === "anycompatible") from = t;
+  else if (slot === "anycompatiblearray" && t.kind === "array") from = t.elem;
+  else return r;
+  let target: ScalarType;
+  if (from.kind === "int" && elem.kind === "decimal") target = "decimal";
+  else if (from.kind === "float" && from.ty === "f32" && elem.kind === "float" && elem.ty === "f64")
+    target = "f64";
+  else return r;
+  if (slot === "anycompatible") {
+    return { kind: "cast", target, typmod: null, varcharLen: null, operand: r };
+  }
+  return { kind: "arrayCast", toElem: { kind: "scalar", scalar: target }, operand: r };
 }
 
 // resolvedTypeEqual reports structural equality of two resolved types (the unification check):
@@ -34802,18 +34842,29 @@ export function matchPoly(
   tys: ResolvedType[],
 ): { elem: ResolvedType | null; matched: boolean } {
   let elem: ResolvedType | null = null;
-  const unify = (x: ResolvedType): boolean => {
+  // Bind/check ELEM: bind if unbound, else require structural equality — or, for an anycompatible*
+  // slot (compatible), widen ELEM to the common type by the set-operation rule (array-functions.md
+  // §2.1, grammar.md §25).
+  const unify = (x: ResolvedType, compatible = false): boolean => {
     if (elem === null) {
       elem = x;
+      return true;
+    }
+    if (compatible) {
+      const c = commonType(elem, x);
+      if (c === null) return false;
+      elem = c;
       return true;
     }
     return resolvedTypeEqual(elem, x);
   };
   for (let j = 0; j < slots.length; j++) {
-    if (slots[j] === "anyarray") {
+    if (isArraySlot(slots[j]!)) {
       const t = tys[j]!;
       if (t.kind === "array") {
-        if (!unify(t.elem)) return { elem: null, matched: false };
+        if (!unify(t.elem, slots[j] === "anycompatiblearray")) {
+          return { elem: null, matched: false };
+        }
       } else if (t.kind !== "null") {
         return { elem: null, matched: false }; // a non-array where anyarray is required
       }
@@ -34832,15 +34883,15 @@ export function matchPoly(
     }
   }
   for (let j = 0; j < slots.length; j++) {
-    if (slots[j] === "anyelement" && tys[j]!.kind !== "null") {
-      if (!unify(tys[j]!)) return { elem: null, matched: false };
+    if (isElementSlot(slots[j]!) && tys[j]!.kind !== "null") {
+      if (!unify(tys[j]!, slots[j] === "anycompatible")) return { elem: null, matched: false };
     }
   }
   for (let j = 0; j < slots.length; j++) {
     if (
-      slots[j] !== "anyarray" &&
+      !isArraySlot(slots[j]!) &&
       slots[j] !== "anyrange" &&
-      slots[j] !== "anyelement" &&
+      !isElementSlot(slots[j]!) &&
       !familyMatches(slots[j]!, tys[j]!)
     ) {
       return { elem: null, matched: false };
@@ -34853,7 +34904,7 @@ export function matchPoly(
 // bound ELEM: anyarray → ELEM[], anyelement → ELEM (both 42P18 if ELEM is undeterminable); any other
 // code is a concrete scalar id (i32, text).
 export function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
-  if (code === "anyarray") {
+  if (code === "anyarray" || code === "anycompatiblearray") {
     if (elem === null) throw indeterminatePoly();
     return { kind: "array", elem };
   }
@@ -34959,14 +35010,14 @@ export function resolveArrayFunc(
   // element type of the first anyarray argument.
   let hint: ScalarType | null = null;
   for (let j = 0; j < slots.length; j++) {
-    if (slots[j] === "anyarray" && tys[j]!.kind === "array") {
+    if (isArraySlot(slots[j]!) && tys[j]!.kind === "array") {
       hint = elemScalarHint((tys[j] as { elem: ResolvedType }).elem);
       break;
     }
   }
   if (hint !== null) {
     for (let j = 0; j < slots.length; j++) {
-      if (slots[j] === "anyarray" || slots[j] === "anyelement") {
+      if (isArraySlot(slots[j]!) || isElementSlot(slots[j]!)) {
         const r = resolve(scope, e.args[j]!, hint, ag, params);
         rargs[j] = r.node;
         tys[j] = r.type;
@@ -34976,6 +35027,11 @@ export function resolveArrayFunc(
   const { elem, matched } = matchPoly(slots, tys);
   if (!matched) throw noFuncOverload(name);
   const type = polyResultType(desc.result, elem);
+  if (elem !== null) {
+    for (let j = 0; j < slots.length; j++) {
+      rargs[j] = coerceCompatibleArg(rargs[j]!, tys[j]!, slots[j]!, elem);
+    }
+  }
   return { node: { kind: "arrayFunc", func: name, args: rargs }, type };
 }
 

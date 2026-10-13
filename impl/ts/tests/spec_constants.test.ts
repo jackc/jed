@@ -309,6 +309,7 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
     const ok =
       o.result === "promoted" ||
       o.result === "anyarray" ||
+      o.result === "anycompatiblearray" ||
       o.result === "anyelement" ||
       concreteArray ||
       scalarTypeFromName(o.result) !== undefined;

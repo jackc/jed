@@ -15,6 +15,7 @@ import {
   isOrderedSetAggregateName,
   isWindowOnlyName,
   matchGroupExpr,
+  coerceCompatibleArg,
   matchPoly,
   noAggOverload,
   noFuncOverload,
@@ -2473,7 +2474,10 @@ function functionResultCollatable(name: string): boolean {
       OPERATORS.filter(
         (o) =>
           o.kind === "function" &&
-          (o.result === "text" || o.result === "text[]" || o.result === "anyarray"),
+          (o.result === "text" ||
+            o.result === "text[]" ||
+            o.result === "anyarray" ||
+            o.result === "anycompatiblearray"),
       ).map((o) => o.name),
     );
   }
@@ -2949,7 +2953,7 @@ export function resolveConcat(
   for (const o of OPERATORS) {
     // Only the polymorphic (anyarray-result) rows: matchPoly ignores a concrete slot, so the bytea
     // row (routed above) must not take part.
-    if (o.kind !== "concat" || o.result !== "anyarray") continue;
+    if (o.kind !== "concat" || o.result !== "anycompatiblearray") continue;
     const m = matchPoly(o.argFamilies, tys);
     if (m.matched) {
       chosen = o;
@@ -2962,12 +2966,18 @@ export function resolveConcat(
   // The matched overload's slot pattern selects the kernel; the operands stay in source order
   // (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
   let func: ArrayFuncName;
-  if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyarray")
-    func = "array_cat";
-  else if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyelement")
-    func = "array_append";
+  const [lslot, rslot] = chosen.argFamilies as [string, string];
+  if (lslot === "anycompatiblearray" && rslot === "anycompatiblearray") func = "array_cat";
+  else if (lslot === "anycompatiblearray" && rslot === "anycompatible") func = "array_append";
   else func = "array_prepend";
-  return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type };
+  // An operand whose values must change to reach the common element type is cast (§2.1).
+  let lnode = rl.node;
+  let rnode = rr.node;
+  if (elem !== null) {
+    lnode = coerceCompatibleArg(lnode, rl.type, lslot, elem);
+    rnode = coerceCompatibleArg(rnode, rr.type, rslot, elem);
+  }
+  return { node: { kind: "arrayFunc", func, args: [lnode, rnode] }, type };
 }
 
 // noSetOpOverload is the "operator does not exist" error (42883) for a containment/positional

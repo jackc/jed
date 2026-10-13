@@ -5968,13 +5968,17 @@ pub(crate) fn reject_indeterminate_target(d: &Deriv) -> Result<()> {
 
 /// Whether a scalar function's result carries its arguments' collation (spec/design/collation.md §1
 /// "Function results"): read from the shared function catalog — any `kind = "function"` overload
-/// whose `result` is `text`, `text[]`, or `anyarray`. A non-collatable argument derives no
+/// whose `result` is `text`, `text[]`, `anyarray`, or `anycompatiblearray`. A non-collatable
+/// argument derives no
 /// collation, so an overload taking only non-text arguments (the range `lower`/`upper`,
 /// `array_append` over `i32[]`) contributes nothing.
 fn function_result_collatable(name: &str) -> bool {
     crate::operators::OPERATORS.iter().any(|o| {
         o.kind == "function"
-            && (o.result == "text" || o.result == "text[]" || o.result == "anyarray")
+            && matches!(
+                o.result,
+                "text" | "text[]" | "anyarray" | "anycompatiblearray"
+            )
             && o.name == name
     })
 }

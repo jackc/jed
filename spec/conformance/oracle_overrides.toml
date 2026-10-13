@@ -383,6 +383,19 @@ file = "subquery/row_valued.test"
 sql = "SELECT ROW(1, 2) IN (SELECT true, 2)"
 reason = "jed: a row-valued IN subquery compares each body row as an anonymous composite, so an incomparable field pair (i64 vs boolean) is 42804 (datatype_mismatch — the same gate a single-column IN subquery uses, composite.md §5). PostgreSQL raises 42883 (no `integer = boolean` operator). A code-only divergence; both reject."
 
+# --- the anycompatible array surface (array-functions.md §2.1): jed binds the common element type
+# by its set-operation rule, where float never meets an integer or decimal (the float island,
+# float.md §6). PostgreSQL's anycompatible resolution widens both to float8.
+[[override]]
+file = "expr/array_compatible.test"
+sql = "SELECT xs || f FROM t"
+reason = "jed: an i32[] meeting an f64 has no common element type — float never meets an integer or decimal implicitly (the float island, float.md §6; grammar.md §25), so no `||` overload matches: 42883. PostgreSQL's anycompatible resolution widens the pair to float8 and returns {1,2,2.25}. The same strictness jed applies to `int UNION float` (42804) and mixed int/float arithmetic."
+
+[[override]]
+file = "expr/array_compatible.test"
+sql = "SELECT array_append(ds, f) FROM t"
+reason = "jed: a decimal[] meeting an f64 has no common element type (the float island, float.md §6; grammar.md §25): 42883. PostgreSQL's anycompatible resolution widens numeric with float8 to float8 and returns {1.5,2.25}."
+
 # --- anonymous record columns (composite.md §1): jed's record type is static — a derived relation's
 # record column carries its field list — so field access always resolves. PostgreSQL's `record` is
 # dynamic: it keeps the field list only where the planner still sees the ROW(…) expression (a plain

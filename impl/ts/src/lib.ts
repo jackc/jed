@@ -226,6 +226,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
   // (array_append/prepend/cat).
   "func.array",
+  // The anycompatible widening of the array builders, search/edit functions, and `||`
+  // (array-functions.md §2.1): ELEM binds to the common type of the arguments.
+  "func.array_compatible",
   // Regex scalar functions (regex.md §8): regexp_replace → text and regexp_match → text[], over the
   // same Pike VM as the operators; the first text- and text[]-returning scalar functions.
   "func.regexp_replace",
