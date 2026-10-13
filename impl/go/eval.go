@@ -2260,22 +2260,14 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return TextValue(out), nil
 		case rxMatch:
-			groups, ok, err := prog.regexpMatch(matchRunes, origRunes, m)
+			arrays, err := regexpCaptureArrays(prog, matchRunes, origRunes, false, m)
 			if err != nil {
 				return Value{}, err
 			}
-			if !ok {
+			if len(arrays) == 0 {
 				return NullValue(), nil
 			}
-			elems := make([]Value, len(groups))
-			for i, g := range groups {
-				if g == nil {
-					elems[i] = NullValue()
-				} else {
-					elems[i] = TextValue(*g)
-				}
-			}
-			return ArrayValue(elems), nil
+			return arrays[0], nil
 		case rxLike:
 			matched, err := prog.isMatch(matchRunes, m)
 			if err != nil {
@@ -2294,23 +2286,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return ArrayValue(elems), nil
 		case rxMatches:
 			// The SRF transport: one text[] capture array per match.
-			found, err := prog.allMatches(matchRunes, origRunes, global, m)
+			arrays, err := regexpCaptureArrays(prog, matchRunes, origRunes, global, m)
 			if err != nil {
 				return Value{}, err
 			}
-			rows := make([]Value, len(found))
-			for i, groups := range found {
-				elems := make([]Value, len(groups))
-				for j, g := range groups {
-					if g == nil {
-						elems[j] = NullValue()
-					} else {
-						elems[j] = TextValue(*g)
-					}
-				}
-				rows[i] = ArrayValue(elems)
-			}
-			return ArrayValue(rows), nil
+			return ArrayValue(arrays), nil
 		case rxCount:
 			cnt, err := prog.regexpCount(matchRunes, int(start0), m)
 			if err != nil {

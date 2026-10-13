@@ -1,0 +1,184 @@
+# The regexp family under the output-constructing kernel rule (spec/design/cost.md §8.1,
+# memory.md §1). regexp_match and regexp_matches are amplifiers: nested groups capture the same text
+# once each, so the pattern multiplies the subject by its group count. Each runs its whole search,
+# then sizes its text[] capture arrays exactly from the capture spans (16 per dimension, plus 32 and
+# the UTF-8 bytes of each element; an unset group is a bare 32), charges scalar_byte for that size,
+# and reserves it against the scalar allowance before building anything, even over constants.
+# The splits and regexp_substr return pieces of the subject and are not covered.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.set_returning, func.array, func.regexp_match, func.regexp_matches, func.regexp_split_to_array, func.regexp_split_to_table, func.regexp_substr, types.array, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+
+# === regexp_match ===
+
+# Exact sizing: {an,a} is 16 + (32 + 2) + (32 + 1) = 83.
+# max_scalar_bytes: 83
+query T nosort
+SELECT regexp_match('banana', '(an)(a)')
+----
+{an,a}
+
+# max_scalar_bytes: 82
+statement error 54P04
+SELECT regexp_match('banana', '(an)(a)')
+
+# A pattern with no group reports the whole match: {nan} is 16 + 35 = 51.
+# max_scalar_bytes: 51
+query T nosort
+SELECT regexp_match('banana', 'nan')
+----
+{nan}
+
+# max_scalar_bytes: 50
+statement error 54P04
+SELECT regexp_match('banana', 'nan')
+
+# An unset group is a NULL element, a bare 32: {NULL,b} is 16 + 32 + 33 = 81.
+# max_scalar_bytes: 81
+query T nosort
+SELECT regexp_match('abc', '(x)?(b)')
+----
+{NULL,b}
+
+# max_scalar_bytes: 80
+statement error 54P04
+SELECT regexp_match('abc', '(x)?(b)')
+
+# Elements count UTF-8 bytes: {é} is 16 + 32 + 2 = 50.
+# max_scalar_bytes: 50
+query T nosort
+SELECT regexp_match('héllo', 'h(é)l')
+----
+{é}
+
+# max_scalar_bytes: 49
+statement error 54P04
+SELECT regexp_match('héllo', 'h(é)l')
+
+# No match is NULL, which builds and reserves nothing.
+# max_scalar_bytes: 1
+query T nosort
+SELECT regexp_match('banana', 'x')
+----
+NULL
+
+# The regex search cost is unchanged; the output adds its bytes ({an}, 16 + 34 = 50) to the 39 the
+# call charged before.
+# cost: 89
+query T nosort
+SELECT regexp_match('banana', '(an)')
+----
+{an}
+
+# A no-match result charges only its search (which here runs from every start position).
+# cost: 52
+query T nosort
+SELECT regexp_match('banana', '(x)')
+----
+NULL
+
+# The amplification: eight nested groups each capture all 1000 characters, so the result is
+# 16 + 8 × (32 + 1000) = 8272 bytes, reserved after repeat's 1000.
+# max_scalar_bytes: 9272
+query I nosort
+SELECT cardinality(regexp_match(repeat('a', 1000), '((((((((a*))))))))'))
+----
+8
+
+# max_scalar_bytes: 9271
+statement error 54P04
+SELECT cardinality(regexp_match(repeat('a', 1000), '((((((((a*))))))))'))
+
+# The output's 8272 scalar_byte is charged to cost as well, on top of the 14053 before it...
+# cost: 22325
+query I nosort
+SELECT cardinality(regexp_match(repeat('a', 1000), '((((((((a*))))))))'))
+----
+8
+
+# ...so a ceiling that covers the search but not the output stops the call before it builds.
+# max_cost: 20000
+statement error 54P01
+SELECT cardinality(regexp_match(repeat('a', 1000), '((((((((a*))))))))'))
+
+# Cost wins: the output charge reaches the ceiling (the call charged 39 before it) before the
+# allowance is consulted.
+# max_cost: 40
+# max_scalar_bytes: 1
+statement error 54P01
+SELECT regexp_match('banana', '(an)')
+
+# The allowance is cumulative over the statement: two rows of {an} reserve 50 each.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 'banana'), (2, 'band')
+
+# max_scalar_bytes: 100
+query IT rowsort
+SELECT id, regexp_match(s, '(an)') FROM t
+----
+1
+{an}
+2
+{an}
+
+# max_scalar_bytes: 99
+statement error 54P04
+SELECT id, regexp_match(s, '(an)') FROM t
+
+# === regexp_matches ===
+
+# Every match's array is sized and reserved before any row is produced: {a,1} and {b,2} are
+# 16 + 33 + 33 = 82 each, 164 in all.
+# max_scalar_bytes: 164
+query T nosort
+SELECT * FROM regexp_matches('a1b2', '([a-z])([0-9])', 'g')
+----
+{a,1}
+{b,2}
+
+# max_scalar_bytes: 163
+statement error 54P04
+SELECT * FROM regexp_matches('a1b2', '([a-z])([0-9])', 'g')
+
+# Without `g` only the first match is built: 82.
+# max_scalar_bytes: 82
+query T nosort
+SELECT * FROM regexp_matches('a1b2', '([a-z])([0-9])')
+----
+{a,1}
+
+# max_scalar_bytes: 81
+statement error 54P04
+SELECT * FROM regexp_matches('a1b2', '([a-z])([0-9])')
+
+# No match produces no row and reserves nothing.
+# max_scalar_bytes: 1
+query T nosort
+SELECT * FROM regexp_matches('abc', 'x', 'g')
+----
+
+# === not covered: pieces of the subject ===
+
+# The split pieces partition the subject, so a split never reserves.
+# max_scalar_bytes: 1
+query T nosort
+SELECT regexp_split_to_array('a,b,c', ',')
+----
+{a,b,c}
+
+# max_scalar_bytes: 1
+query T rowsort
+SELECT * FROM regexp_split_to_table('a,b,c', ',')
+----
+a
+b
+c
+
+# regexp_substr returns a substring of the subject.
+# max_scalar_bytes: 1
+query T nosort
+SELECT regexp_substr('banana', '(an)+')
+----
+anan

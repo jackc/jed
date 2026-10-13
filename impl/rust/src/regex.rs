@@ -948,36 +948,13 @@ impl Program {
         Ok(())
     }
 
-    /// `regexp_match(source, …)` capture extraction (regex.md §8). Searches once; on a match returns
-    /// the capture group strings (groups 1..n, or a 1-element whole-match list when the pattern has
-    /// no group — the PG rule), an unset group being `None`. Returns `None` (the whole result) on no
-    /// match. `match_input` is the (possibly case-folded) subject the VM matches; `orig_input` is the
-    /// ORIGINAL-case subject the returned substrings are sliced from (same length, regex.md §8).
-    pub fn regexp_match(
-        &self,
-        match_input: &[char],
-        orig_input: &[char],
-        m: &mut Meter,
-    ) -> Result<Option<Vec<Option<String>>>> {
-        let Some(saves) = self.search(match_input, 0, m)? else {
-            return Ok(None);
-        };
-        let groups = if self.ngroups == 0 {
-            // No capturing group: PG returns a 1-element array of the whole match.
-            vec![slice_group(orig_input, saves[0], saves[1])]
-        } else {
-            (1..=self.ngroups)
-                .map(|g| slice_group(orig_input, saves[2 * g], saves[2 * g + 1]))
-                .collect()
-        };
-        Ok(Some(groups))
-    }
-
     /// The matches `regexp_replace(source, pattern, replacement, …)` (regex.md §8) replaces: the first
     /// match, or every non-overlapping match when `global`. Each entry is a match's capture slots. The
     /// VM matches over `match_input` (possibly case-folded); this is the kernel's whole search, so it
     /// charges every `regex_step` the replacement costs. [`replace_size`] and [`replace_build`] then
-    /// size and splice from these slots without searching again (cost.md §8.1).
+    /// size and splice from these slots without searching again (cost.md §8.1). `regexp_match` (never
+    /// global) and `regexp_matches` run the same search, then size and slice their capture arrays from
+    /// the slots ([`Program::capture_array_size`], [`Program::capture_array`]).
     pub fn replace_matches(
         &self,
         match_input: &[char],
@@ -1026,30 +1003,38 @@ impl Program {
         Ok(count)
     }
 
-    /// The capture arrays of `regexp_matches` (regex.md §8c): the first match only, or every
-    /// non-overlapping match when `global` (the same advance as [`replace_matches`](Self::replace_matches)
-    /// — an empty match continues one character on). Each entry is shaped like [`regexp_match`](Self::regexp_match)'s
-    /// result: groups 1..n (an unset group `None`), or the whole match when the pattern has no group.
-    pub fn all_matches(
-        &self,
-        match_input: &[char],
-        orig_input: &[char],
-        global: bool,
-        m: &mut Meter,
-    ) -> Result<Vec<Vec<Option<String>>>> {
-        let found = self.replace_matches(match_input, global, m)?;
-        Ok(found
-            .iter()
-            .map(|saves| {
-                if self.ngroups == 0 {
-                    vec![slice_group(orig_input, saves[0], saves[1])]
-                } else {
-                    (1..=self.ngroups)
-                        .map(|g| slice_group(orig_input, saves[2 * g], saves[2 * g + 1]))
-                        .collect()
-                }
-            })
-            .collect())
+    /// The capture groups `regexp_match` / `regexp_matches` report for a match (regex.md §8):
+    /// groups 1..n, or group 0 (the whole match) when the pattern has no group — the PG rule.
+    fn reported_groups(&self) -> std::ops::RangeInclusive<usize> {
+        if self.ngroups == 0 {
+            0..=0
+        } else {
+            1..=self.ngroups
+        }
+    }
+
+    /// The exact `payload` (memory.md §3) of the one-dimensional `text[]` capture array for a
+    /// match's slots, computed from the spans without building it (cost.md §8.1): `ARRAY_DIM`, plus
+    /// `VALUE` and the span's UTF-8 bytes per reported group (an unset group is a bare `VALUE`).
+    /// `utf8_at` is [`utf8_offsets`] of the subject, so each span is measured in O(1).
+    pub fn capture_array_size(&self, saves: &[i64], utf8_at: &[i64]) -> i64 {
+        let mut size = crate::costs::MEMORY_ARRAY_DIM;
+        for g in self.reported_groups() {
+            let (s, e) = (saves[2 * g], saves[2 * g + 1]);
+            size += crate::costs::MEMORY_VALUE;
+            if s >= 0 && e >= 0 {
+                size += utf8_at[e as usize] - utf8_at[s as usize];
+            }
+        }
+        size
+    }
+
+    /// The capture array for a match's slots, sliced from the ORIGINAL-case subject: the reported
+    /// groups' substrings, an unset group `None`.
+    pub fn capture_array(&self, saves: &[i64], orig: &[char]) -> Vec<Option<String>> {
+        self.reported_groups()
+            .map(|g| slice_group(orig, saves[2 * g], saves[2 * g + 1]))
+            .collect()
     }
 
     /// The pieces of `regexp_split_to_array` / `regexp_split_to_table` (regex.md §8c): the text
@@ -1112,6 +1097,19 @@ impl Program {
         }
         Ok(None)
     }
+}
+
+/// The UTF-8 byte offset of every code point of `orig`, plus the total at `orig.len()`: the
+/// span `[s, e)` is `offsets[e] - offsets[s]` bytes.
+pub fn utf8_offsets(orig: &[char]) -> Vec<i64> {
+    let mut offsets = Vec::with_capacity(orig.len() + 1);
+    let mut at = 0i64;
+    offsets.push(at);
+    for c in orig {
+        at += c.len_utf8() as i64;
+        offsets.push(at);
+    }
+    offsets
 }
 
 /// Slice `orig[start..end]` to an owned `String`, or `None` for an unset (`-1`) group.

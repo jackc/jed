@@ -200,6 +200,52 @@ pub(crate) fn regexp_replace_text(
     Ok(crate::regex::replace_build(orig_chars, repl, &found, size))
 }
 
+/// `regexp_match` / `regexp_matches` (regex.md §8/§8c): one `text[]` capture array for the first
+/// match, or for every non-overlapping match when `global`; no match gives none. An amplifier
+/// (cost.md §8.1): nested groups capture the same text once each, so the pattern multiplies the
+/// subject. The search's `regex_step`s are its input charge; the arrays' exact payload is then
+/// computed from the capture spans, charged, and reserved before any is built.
+pub(crate) fn regexp_capture_arrays(
+    prog: &crate::regex::Program,
+    match_chars: &[char],
+    orig_chars: &[char],
+    global: bool,
+    meter: &mut Meter,
+) -> Result<Vec<Value>> {
+    let found = prog.replace_matches(match_chars, global, meter)?;
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+    let utf8_at = crate::regex::utf8_offsets(orig_chars);
+    let size: i64 = found
+        .iter()
+        .map(|saves| prog.capture_array_size(saves, &utf8_at))
+        .sum();
+    meter.charge(COSTS.scalar_byte * size);
+    meter.guard()?;
+    meter.reserve_scalar(size)?;
+    let arrays: Vec<Value> = found
+        .iter()
+        .map(|saves| {
+            let elems = prog
+                .capture_array(saves, orig_chars)
+                .into_iter()
+                .map(|g| g.map_or(Value::Null, Value::Text))
+                .collect();
+            Value::Array(ArrayVal::one_dim(elems))
+        })
+        .collect();
+    debug_assert_eq!(
+        arrays
+            .iter()
+            .map(crate::memsize::payload_bytes)
+            .sum::<i64>(),
+        size,
+        "capture_array_size disagrees with the built arrays"
+    );
+    Ok(arrays)
+}
+
 /// `jsonb_pretty(j)` (json-sql-functions.md §2): an amplifier, because indentation grows with depth
 /// times node count (cost.md §8.1). The input payload is charged, then the exact rendering size is
 /// computed, capped at `MAX_RESULT_CHARS` (`54000`), charged, and reserved before rendering.

@@ -407,11 +407,14 @@ import {
   gistSearch,
 } from "./gist.ts";
 import {
+  captureArray,
+  captureArraySize,
   compileRegex,
   replaceBuild,
   replaceMatches,
   replaceSize,
   type RegexProgram,
+  utf8Offsets,
 } from "./regex.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
@@ -1011,6 +1014,36 @@ export function regexpReplaceText(
   meter.guard();
   meter.reserveScalar(size);
   return replaceBuild(origCps, repl, found);
+}
+
+// regexpCaptureArrays is regexp_match / regexp_matches (regex.md §8/§8c): one text[] capture array
+// for the first match, or for every non-overlapping match when global; no match gives none. An
+// amplifier (cost.md §8.1): nested groups capture the same text once each, so the pattern multiplies
+// the subject. The search's regex_steps are its input charge; the arrays' exact payload is then
+// computed from the capture spans, charged, and reserved before any is built.
+export function regexpCaptureArrays(
+  prog: RegexProgram,
+  matchCps: number[],
+  origCps: number[],
+  global: boolean,
+  meter: Meter,
+): Value[] {
+  const found = replaceMatches(prog, matchCps, global, meter);
+  if (found.length === 0) return [];
+  const utf8At = utf8Offsets(origCps);
+  let total = 0;
+  for (const saves of found) total += captureArraySize(prog, saves, utf8At);
+  const size = BigInt(total);
+  meter.charge(COSTS.scalarByte * size);
+  meter.guard();
+  meter.reserveScalar(size);
+  return found.map((saves) =>
+    arrayValue(
+      captureArray(prog, saves, origCps).map((g) =>
+        g === null ? nullValue() : { kind: "text", text: g },
+      ),
+    ),
+  );
 }
 
 // splitPart is split_part(s, delim, n) (string-functions.md §3): split s on the substring delim and

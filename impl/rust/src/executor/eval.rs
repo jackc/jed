@@ -1403,16 +1403,11 @@ impl RExpr {
                             m,
                         )?))
                     }
-                    RegexFunc::Match => match prog.regexp_match(&match_chars, &orig_chars, m)? {
-                        None => Ok(Value::Null),
-                        Some(groups) => {
-                            let elems: Vec<Value> = groups
-                                .into_iter()
-                                .map(|g| g.map_or(Value::Null, Value::Text))
-                                .collect();
-                            Ok(Value::Array(ArrayVal::one_dim(elems)))
-                        }
-                    },
+                    RegexFunc::Match => {
+                        let mut arrays =
+                            regexp_capture_arrays(prog, &match_chars, &orig_chars, false, m)?;
+                        Ok(arrays.pop().unwrap_or(Value::Null))
+                    }
                     RegexFunc::Like => Ok(Value::Bool(prog.is_match(&match_chars, m)?)),
                     RegexFunc::SplitToArray | RegexFunc::SplitToTable => {
                         let pieces = prog.split_pieces(&match_chars, &orig_chars, m)?;
@@ -1421,21 +1416,9 @@ impl RExpr {
                         )))
                     }
                     // The SRF transport (RegexFunc::Matches): one text[] capture array per match.
-                    RegexFunc::Matches => {
-                        let found = prog.all_matches(&match_chars, &orig_chars, global, m)?;
-                        let rows: Vec<Value> = found
-                            .into_iter()
-                            .map(|groups| {
-                                Value::Array(ArrayVal::one_dim(
-                                    groups
-                                        .into_iter()
-                                        .map(|g| g.map_or(Value::Null, Value::Text))
-                                        .collect(),
-                                ))
-                            })
-                            .collect();
-                        Ok(Value::Array(ArrayVal::one_dim(rows)))
-                    }
+                    RegexFunc::Matches => Ok(Value::Array(ArrayVal::one_dim(
+                        regexp_capture_arrays(prog, &match_chars, &orig_chars, global, m)?,
+                    ))),
                     RegexFunc::Count => {
                         Ok(Value::Int(prog.regexp_count(&match_chars, start0, m)?))
                     }

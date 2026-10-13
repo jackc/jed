@@ -94,6 +94,7 @@ import {
   quoteIdentText,
   likeEscapeText,
   quoteLiteralText,
+  regexpCaptureArrays,
   regexpReplaceText,
   repeatText,
   replaceText,
@@ -187,9 +188,7 @@ import {
   compileRegex,
   regexIsMatch,
   regexNinst,
-  regexpAllMatches,
   regexpCount,
-  regexpMatch,
   regexpNthMatch,
   regexpSplitPieces,
 } from "./regex.ts";
@@ -1000,13 +999,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
             text: regexpReplaceText(prog, matchCps, origCps, repl, global, m),
           };
         }
-        case "match": {
-          const groups = regexpMatch(prog, matchCps, origCps, m);
-          if (groups === null) return nullValue();
-          return arrayValue(
-            groups.map((g) => (g === null ? nullValue() : { kind: "text", text: g })),
-          );
-        }
+        case "match":
+          return regexpCaptureArrays(prog, matchCps, origCps, false, m)[0] ?? nullValue();
         case "like":
           return boolValue(regexIsMatch(prog, matchCps, m));
         case "split_to_array":
@@ -1018,11 +1012,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           );
         case "matches":
           // The SRF transport: one text[] capture array per match.
-          return arrayValue(
-            regexpAllMatches(prog, matchCps, origCps, global, m).map((groups) =>
-              arrayValue(groups.map((g) => (g === null ? nullValue() : { kind: "text", text: g }))),
-            ),
-          );
+          return arrayValue(regexpCaptureArrays(prog, matchCps, origCps, global, m));
         case "count":
           return intValue(BigInt(regexpCount(prog, matchCps, start0, m)));
         default: {

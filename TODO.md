@@ -391,6 +391,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ when jsonpath `.**` lands, keep its recursive descent bounded by document
     depth; when a storable `jsonpath` column lands, its decoder must re-run the compiler's
     nesting gate (`XX001` on a crafted body).
+- [ ] **Regex capture-slot copies are unmetered.** Each Pike-VM `Save` copies the thread's whole
+  capture-slot vector (O(groups) work) but charges one `regex_step` (regex.md §6), so a pattern with
+  thousands of nested groups does about groups× more work per cost unit: a 4000-group pattern spends
+  about 8 s of Go time on 1M units. Either charge the slots a `Save` copies, or make a `Save` O(1)
+  (a shared/persistent slot representation); the first changes cost in every core. (The output side,
+  `regexp_match`/`regexp_matches` capture arrays, is charged and reserved: cost.md §8.1.)
 - [x] **Q2 — operator state.** Hash-join, group, DISTINCT, set-operation and recursive-CTE
   tables (`ENTRY` 32 + key), retained aggregate inputs, window partitions, sort state,
   columnar lanes, and spill structures' resident elements; spill residency is measured on

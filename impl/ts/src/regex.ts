@@ -9,7 +9,7 @@
 // (spec/regex/match_vectors.toml). The lowering follows regex.md §3 exactly. Iteration is by Unicode
 // CODE POINT (Array.from / codePointAt — never charCodeAt), a §8 determinism surface.
 
-import { COSTS } from "./costs.ts";
+import { COSTS, MEMORY_ARRAY_DIM, MEMORY_VALUE } from "./costs.ts";
 import type { Meter } from "./cost.ts";
 import { engineError } from "./errors.ts";
 
@@ -788,32 +788,13 @@ function addThread(
   }
 }
 
-// regexpMatch is regexp_match(source, …) capture extraction (regex.md §8). Searches once; on a match
-// returns the capture group strings (groups 1..n, or a 1-element whole-match list when the pattern
-// has no group — the PG rule), an unset group being null. Returns null (the whole result) on no
-// match. matchInput is the (possibly case-folded) subject the VM matches; origInput is the
-// ORIGINAL-case subject the returned substrings are sliced from (same length).
-export function regexpMatch(
-  p: RegexProgram,
-  matchInput: number[],
-  origInput: number[],
-  m: Meter,
-): (string | null)[] | null {
-  const saves = regexSearch(p, matchInput, 0, m);
-  if (saves === null) return null;
-  if (p.ngroups === 0) return [sliceGroup(origInput, saves[0], saves[1])];
-  const groups: (string | null)[] = [];
-  for (let g = 1; g <= p.ngroups; g++) {
-    groups.push(sliceGroup(origInput, saves[2 * g], saves[2 * g + 1]));
-  }
-  return groups;
-}
-
 // replaceMatches finds the matches regexp_replace(source, pattern, replacement, …) (regex.md §8)
 // replaces: the first match, or every non-overlapping match when global. Each entry is a match's
 // capture slots. The VM matches over matchInput (possibly case-folded); this is the kernel's whole
 // search, so it charges every regex_step the replacement costs. replaceSize and replaceBuild then size
 // and splice from these slots without searching again (cost.md §8.1).
+// regexp_match (never global) and regexp_matches run the same search, then size and slice their
+// capture arrays from the slots (captureArraySize, captureArray).
 export function replaceMatches(
   p: RegexProgram,
   matchInput: number[],
@@ -837,25 +818,49 @@ export function replaceMatches(
   return found;
 }
 
-// regexpAllMatches returns the capture arrays of regexp_matches (regex.md §8c): the first match only,
-// or every non-overlapping match when global (the same advance as replaceMatches — an empty match
-// continues one character on). Each entry is shaped like regexpMatch's result: groups 1..n (an unset
-// group null), or the whole match when the pattern has no group.
-export function regexpAllMatches(
-  p: RegexProgram,
-  matchInput: number[],
-  origInput: number[],
-  global: boolean,
-  m: Meter,
-): (string | null)[][] {
-  return replaceMatches(p, matchInput, global, m).map((saves) => {
-    if (p.ngroups === 0) return [sliceGroup(origInput, saves[0], saves[1])];
-    const groups: (string | null)[] = [];
-    for (let g = 1; g <= p.ngroups; g++) {
-      groups.push(sliceGroup(origInput, saves[2 * g], saves[2 * g + 1]));
-    }
-    return groups;
-  });
+// reportedGroups returns the capture groups regexp_match / regexp_matches report for a match (regex.md
+// §8): groups 1..n, or group 0 (the whole match) when the pattern has no group — the PG rule — as the
+// inclusive range [lo, hi].
+function reportedGroups(p: RegexProgram): [number, number] {
+  return p.ngroups === 0 ? [0, 0] : [1, p.ngroups];
+}
+
+// captureArraySize is the exact payload (memory.md §3) of the one-dimensional text[] capture array for
+// a match's slots, computed from the spans without building it (cost.md §8.1): ARRAY_DIM, plus VALUE
+// and the span's UTF-8 bytes per reported group (an unset group is a bare VALUE). utf8At is
+// utf8Offsets of the subject, so each span is measured in O(1).
+export function captureArraySize(p: RegexProgram, saves: number[], utf8At: number[]): number {
+  let size = MEMORY_ARRAY_DIM;
+  const [lo, hi] = reportedGroups(p);
+  for (let g = lo; g <= hi; g++) {
+    const s = saves[2 * g];
+    const e = saves[2 * g + 1];
+    size += MEMORY_VALUE;
+    if (s >= 0 && e >= 0) size += utf8At[e] - utf8At[s];
+  }
+  return size;
+}
+
+// captureArray returns the capture array for a match's slots, sliced from the ORIGINAL-case subject:
+// the reported groups' substrings, an unset group null.
+export function captureArray(p: RegexProgram, saves: number[], orig: number[]): (string | null)[] {
+  const [lo, hi] = reportedGroups(p);
+  const groups: (string | null)[] = [];
+  for (let g = lo; g <= hi; g++) groups.push(sliceGroup(orig, saves[2 * g], saves[2 * g + 1]));
+  return groups;
+}
+
+// utf8Offsets returns the UTF-8 byte offset of every code point of orig, plus the total at
+// orig.length: the span [s, e) is offsets[e] - offsets[s] bytes.
+export function utf8Offsets(orig: number[]): number[] {
+  const offsets = new Array<number>(orig.length + 1);
+  let at = 0;
+  offsets[0] = 0;
+  for (let i = 0; i < orig.length; i++) {
+    at += cpUtf8Len(orig[i]);
+    offsets[i + 1] = at;
+  }
+  return offsets;
 }
 
 // regexpSplitPieces returns the pieces of regexp_split_to_array / regexp_split_to_table (regex.md

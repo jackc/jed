@@ -51,8 +51,9 @@ SELECT * FROM regexp_matches('abc', '(x)?b')
 # Empty matches with `g`: one before each character and one at the end; a non-empty match is
 # followed by an empty one right at its end (PostgreSQL's advance rule).
 # Cost (regex.md §8c): the call node's operator_eval (1) + regex_compile ('b*' = 9 instructions,
-# once) + regex_step (33, four searches) + 4 generated_row + 4 row_produced = 51.
-# cost: 51
+# once) + regex_step (33, four searches) + the capture arrays' scalar_byte (cost.md §8.1: three
+# {""} at 16 + 32 = 48 and {b} at 49, 193) + 4 generated_row + 4 row_produced = 244.
+# cost: 244
 query T nosort
 SELECT * FROM regexp_matches('abc', 'b*', 'g')
 ----
@@ -265,8 +266,9 @@ INSERT INTO kv VALUES (1, 'a=1;b=2'), (2, 'c=3'), (3, ''), (4, NULL)
 
 # Each row's pairs: row 1 twice, row 2 once, row 3 (no match) and row 4 (NULL) never.
 # Cost — the constant pattern compiles ONCE for the statement although the lateral call runs per kv
-# row; each call charges its own operator_eval + regex_step, each produced match a generated_row.
-# cost: 145
+# row; each call charges its own operator_eval + regex_step, its capture arrays' scalar_byte (each
+# two-letter pair 16 + 2 × 33 = 82), and each produced match a generated_row.
+# cost: 391
 query IT rowsort
 SELECT kv.id, m FROM kv CROSS JOIN regexp_matches(kv.s, '(\w)=(\d)', 'g') AS m
 ----
@@ -329,7 +331,8 @@ b
 c
 
 # Cost — the flags are per-row, so the (constant) pattern compiles on every call — 3 × regex_compile.
-# cost: 232
+# The capture arrays add 82 + 82 + 85 scalar_byte ('😀' is 4 UTF-8 bytes).
+# cost: 481
 query IT rowsort
 SELECT pats.id, m FROM pats CROSS JOIN regexp_matches(pats.s, '(.)(.)$', pats.f) AS m
 ----

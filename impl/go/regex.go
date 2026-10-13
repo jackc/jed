@@ -941,51 +941,54 @@ func (p *regexProgram) addThread(list *[]regexThread, seen []uint32, generation 
 	return nil
 }
 
-// regexpMatch is regexp_match(source, …) capture extraction (regex.md §8). Searches once; on a match
-// returns the capture group strings (groups 1..n, or a 1-element whole-match list when the pattern
-// has no group — the PG rule), an unset group being a nil pointer. Returns ok=false on no match.
-// matchInput is the (possibly case-folded) subject the VM matches; origInput is the ORIGINAL-case
-// subject the returned substrings are sliced from (same length).
-func (p *regexProgram) regexpMatch(matchInput, origInput []rune, m *costMeter) (groups []*string, ok bool, err error) {
-	saves, err := p.search(matchInput, 0, m)
-	if err != nil {
-		return nil, false, err
-	}
-	if saves == nil {
-		return nil, false, nil
-	}
+// reportedGroups returns the capture groups regexp_match / regexp_matches report for a match (regex.md
+// §8): groups 1..n, or group 0 (the whole match) when the pattern has no group — the PG rule — as
+// the inclusive range [lo, hi].
+func (p *regexProgram) reportedGroups() (lo, hi int) {
 	if p.ngroups == 0 {
-		return []*string{sliceGroup(origInput, saves[0], saves[1])}, true, nil
+		return 0, 0
 	}
-	groups = make([]*string, p.ngroups)
-	for g := 1; g <= p.ngroups; g++ {
-		groups[g-1] = sliceGroup(origInput, saves[2*g], saves[2*g+1])
-	}
-	return groups, true, nil
+	return 1, p.ngroups
 }
 
-// allMatches returns the capture arrays of regexp_matches (regex.md §8c): the first match only, or
-// every non-overlapping match when global (the same advance as replaceMatches — an empty match
-// continues one character on). Each entry is shaped like regexpMatch's result: groups 1..n (an unset
-// group nil), or the whole match when the pattern has no group.
-func (p *regexProgram) allMatches(matchInput, origInput []rune, global bool, m *costMeter) ([][]*string, error) {
-	found, err := p.replaceMatches(matchInput, global, m)
-	if err != nil {
-		return nil, err
-	}
-	out := make([][]*string, len(found))
-	for i, saves := range found {
-		if p.ngroups == 0 {
-			out[i] = []*string{sliceGroup(origInput, saves[0], saves[1])}
-			continue
+// captureArraySize is the exact payload (memory.md §3) of the one-dimensional text[] capture array for
+// a match's slots, computed from the spans without building it (cost.md §8.1): ARRAY_DIM, plus VALUE
+// and the span's UTF-8 bytes per reported group (an unset group is a bare VALUE). utf8At is
+// utf8Offsets of the subject, so each span is measured in O(1).
+func (p *regexProgram) captureArraySize(saves, utf8At []int64) int64 {
+	size := memoryArrayDim
+	lo, hi := p.reportedGroups()
+	for g := lo; g <= hi; g++ {
+		s, e := saves[2*g], saves[2*g+1]
+		size += memoryValue
+		if s >= 0 && e >= 0 {
+			size += utf8At[e] - utf8At[s]
 		}
-		groups := make([]*string, p.ngroups)
-		for g := 1; g <= p.ngroups; g++ {
-			groups[g-1] = sliceGroup(origInput, saves[2*g], saves[2*g+1])
-		}
-		out[i] = groups
 	}
-	return out, nil
+	return size
+}
+
+// captureArray returns the capture array for a match's slots, sliced from the ORIGINAL-case subject:
+// the reported groups' substrings, an unset group nil.
+func (p *regexProgram) captureArray(saves []int64, orig []rune) []*string {
+	lo, hi := p.reportedGroups()
+	groups := make([]*string, 0, hi-lo+1)
+	for g := lo; g <= hi; g++ {
+		groups = append(groups, sliceGroup(orig, saves[2*g], saves[2*g+1]))
+	}
+	return groups
+}
+
+// utf8Offsets returns the UTF-8 byte offset of every rune of orig, plus the total at len(orig): the
+// span [s, e) is offsets[e] - offsets[s] bytes.
+func utf8Offsets(orig []rune) []int64 {
+	offsets := make([]int64, len(orig)+1)
+	var at int64
+	for i, c := range orig {
+		at += int64(utf8.RuneLen(c))
+		offsets[i+1] = at
+	}
+	return offsets
 }
 
 // splitPieces returns the pieces of regexp_split_to_array / regexp_split_to_table (regex.md §8c):
@@ -1029,6 +1032,8 @@ func (p *regexProgram) splitPieces(matchInput, origInput []rune, m *costMeter) (
 // capture slots. The VM matches over matchInput (possibly case-folded); this is the kernel's whole
 // search, so it charges every regex_step the replacement costs. replaceSize and replaceBuild then size
 // and splice from these slots without searching again (cost.md §8.1).
+// regexp_match (never global) and regexp_matches run the same search, then size and slice their
+// capture arrays from the slots (captureArraySize, captureArray).
 func (p *regexProgram) replaceMatches(matchInput []rune, global bool, m *costMeter) ([][]int64, error) {
 	var found [][]int64
 	pos := 0

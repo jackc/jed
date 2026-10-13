@@ -40,9 +40,10 @@ heap counter or a process RSS ceiling. The covered allocations are:
   kernel step, with D defined in cost.md §8. This conservative reservation is
   representation-independent, not a measurement of the runtime allocator.
 - The exact output size of the other **amplifiers** ([cost.md](cost.md) §8.1):
-  `replace`, `regexp_replace`, and `array_replace` (slice S1), and `jsonb_pretty`
-  (S2). Each is sized before it builds anything: UTF-8 bytes for text, and the §3
-  `payload` for an array.
+  `replace`, `regexp_replace`, and `array_replace` (slice S1), `jsonb_pretty`
+  (S2), and the capture arrays of `regexp_match` and `regexp_matches` (S4). Each is
+  sized before it builds anything: UTF-8 bytes for text, and the §3 `payload` for an
+  array.
 
 A reservation succeeds if `used + bytes <= limit`, implemented by comparing
 `bytes <= limit - used` to avoid overflow. Successful reservations accumulate;
@@ -74,7 +75,8 @@ large but legitimate work. They charge their output bytes to **cost** instead
 ([cost.md](cost.md) §8.1), which closes the geometric-growth hole under
 `max_cost`. The values they leave in buffered rows are counted by the
 query-memory account (§2). The kernel list, the slices (S1 arrays and replacement,
-S2 JSON, S3 renders), and what stays uncovered are in cost.md §8.1.
+S2 JSON, S3 renders, S4 regexp capture arrays), and what stays uncovered are in
+cost.md §8.1.
 
 ## 2. Query memory account
 

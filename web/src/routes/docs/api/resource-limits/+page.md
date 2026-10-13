@@ -53,8 +53,9 @@ calls, rows, subqueries and CTEs. A cursor keeps its original budget until it cl
 
 This budget covers the functions where one call can multiply its input by an amount an argument
 controls: the exact output bytes of **`repeat`, `lpad`, `rpad`, `replace`, `regexp_replace`,
-`jsonb_pretty`** (UTF-8) and **`array_replace`**, and logical scratch reservations in **decimal `sqrt`, `exp`,
-`ln`, `log`, `log10`, `power`, `pow`**. These functions also charge their input and output bytes
+`jsonb_pretty`** (UTF-8), **`array_replace`**, and the capture arrays of **`regexp_match` and
+`regexp_matches`** (a pattern of nested groups repeats the matched text once per group), and logical
+scratch reservations in **decimal `sqrt`, `exp`, `ln`, `log`, `log10`, `power`, `pow`**. These functions also charge their input and output bytes
 as cost before they build anything; decimals charge inside their algorithms. A cost ceiling can
 reject the work before its allocation budget is used.
 

@@ -395,7 +395,10 @@ functions; they resolve through a dedicated `RExpr::RegexFunc` node carrying the
 surrounding `ResolvedType` (the array/range-function precedent), not the scalar-`result` `ScalarFunc`
 path. Cost: `operator_eval` (the call node) + `regex_compile` (once, constant pattern) + `regex_step`
 (the match), plus, for a global replace, the match is re-run from the end of each match (each run
-metered).
+metered). Both are amplifiers ([cost.md](cost.md) §8.1): `regexp_replace`'s template can repeat
+the captures, and nested groups make `regexp_match`'s array repeat the subject once per group. Each
+sizes its exact output from the recorded capture slots, then charges `scalar_byte` for it and
+reserves it against the scalar allowance ([memory.md](memory.md) §1) before building it.
 
 ---
 
@@ -500,10 +503,12 @@ compiles once per statement. The SELECT-list position stays deferred for every S
 
 **Cost.** The call node charges what `regexp_match` charges: one `operator_eval`, `regex_compile`
 (once per statement for a constant pattern with constant flags, else per call), and `regex_step`
-for every search. Each produced row then charges one `generated_row`
-([cost.md](cost.md) §3 "`generated_row`"). `regexp_split_to_array` is a scalar, so it charges no
-`generated_row`. Like `regexp_match`, none of these charge `scalar_byte` for their output. The
-split pieces partition the subject, so their text never exceeds it.
+for every search, and, like `regexp_match`, `regexp_matches` is an amplifier ([cost.md](cost.md)
+§8.1): after the search it sizes every match's capture array from the recorded slots, charges
+`scalar_byte` for the total, and reserves it against the scalar allowance before building any row.
+Each produced row then charges one `generated_row` ([cost.md](cost.md) §3 "`generated_row`").
+`regexp_split_to_array` is a scalar, so it charges no `generated_row`. The split functions charge
+no `scalar_byte`: their pieces partition the subject, so their text never exceeds it.
 
 ---
 

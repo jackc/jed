@@ -1228,8 +1228,8 @@ but charges no `row_produced`. Worked examples (all asserted in the corpus):
 - `SELECT * FROM generate_series(1, 5) ORDER BY generate_series DESC LIMIT 2` — 5 `generated_row`
   + 2 `row_produced` = **7** (the SRF takes the eager path; the sort/limit are unmetered).
 - `SELECT * FROM regexp_matches('abc', 'b*', 'g')` — the call node's `operator_eval` +
-  `regex_compile` + `regex_step` (what `regexp_match` charges, [regex.md](regex.md) §8c) + 4
-  `generated_row` + 4 `row_produced` = **51**.
+  `regex_compile` + `regex_step` + the capture arrays' `scalar_byte` (what `regexp_match` charges,
+  [regex.md](regex.md) §8c, §8.1 below) + 4 `generated_row` + 4 `row_produced` = **244**.
 - `SELECT * FROM t CROSS JOIN generate_series(1, 3)` over a 3-row `t` — `t`'s scan block
   (`page_read` + 3 `storage_row_read`) **+ 3 `generated_row`** (the series is materialized once,
   like any join operand) + 9 `row_produced` for the product.
@@ -1951,8 +1951,9 @@ The exact charge sites are specified alongside the kernels in decimal.md.
 
 ### 8.1 Output-constructing kernels
 
-> **Status: S1–S3 implemented** in all three cores (`resource/scalar_output.test`,
-> `resource/scalar_output_json.test`, `resource/scalar_output_render.test`).
+> **Status: S1–S4 implemented** in all three cores (`resource/scalar_output.test`,
+> `resource/scalar_output_json.test`, `resource/scalar_output_render.test`,
+> `resource/scalar_output_regexp.test`).
 
 The `repeat`/pad rule generalizes. A kernel that **builds** a variable-width value
 can produce bytes that no earlier charge paid for. It can combine operands
@@ -1987,7 +1988,9 @@ input scan, guards, computes the exact output size without building the output,
 applies any structural cap, charges `scalar_byte × size`, guards, reserves `size`
 against the scalar allowance ([memory.md](memory.md) §1), and only then builds.
 `repeat`, `lpad`, `rpad` (above) and the decimal transcendental kernels are the
-existing members.
+existing members. The amplifiers below include `regexp_match` and `regexp_matches`: nested
+groups capture the same text once each, so the pattern multiplies the subject by its group
+count (up to about 16k groups under `MAX_REGEX_PROGRAM`, [regex.md](regex.md) §6).
 
 | Kernel | Class | Slice | Input charge | Output size |
 |---|---|---|---|---|
@@ -1999,6 +2002,7 @@ existing members.
 | `replace(s, from, to)` | amplifier | S1 | UTF-8 bytes of `s` | UTF-8 bytes of the result |
 | `regexp_replace` | amplifier | S1 | none beyond `regex_step` | UTF-8 bytes of the result |
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
+| `regexp_match`, `regexp_matches` | amplifier | S4 | none beyond `regex_step` | Σ `payload` of the capture arrays |
 | jsonb `\|\|`, `jsonb_set`, `jsonb_insert`, `json[b]_build_array`/`_object` (spread or `VARIADIC`), `json[b]_object(text[] [, text[]])`, `to_json`, `to_jsonb`, `array_to_json`, `JSON_SCALAR`, `JSON_SERIALIZE`, `jsonb_path_query_array`, `JSON_QUERY` when a wrapper builds an array | growth | S2 | — | `payload(result)` |
 | `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
 | `encode`, `quote_literal`, `quote_ident`, `quote_nullable`, `like_escape`; casts from an array, `bytea`, or `jsonb` to `text`, and from `jsonb` to `json` | growth | S3 | — | UTF-8 bytes of the result |
@@ -2017,6 +2021,14 @@ The amplifiers' exact sizes:
   match's expanded replacement (literal characters, `\1`–`\9`, `\&`, `\\`). The
   build then splices from the recorded matches without searching again, so
   regex cost is unchanged.
+- `regexp_match`, `regexp_matches`: the kernel first runs its whole search (`regexp_match`'s
+  first match, or every non-overlapping match for `regexp_matches` with `g`), recording each
+  match's capture slots, exactly as `regexp_replace` does. Each match's one-dimensional `text[]`
+  is `ARRAY_DIM + Σ (VALUE + UTF-8 bytes of the group's span)` over the reported groups (groups
+  1..n, or the whole match when the pattern has no group); an unset group is a NULL element, a
+  bare `VALUE`. A core measures each span in O(1) from a prefix of UTF-8 offsets over the subject,
+  so sizing never walks the output. `regexp_matches` charges and reserves the sum over its matches
+  once, before any row is built or produced. No match charges nothing.
 - `array_replace`: `payload(a) + Σ (value_bytes(new) − value_bytes(e))` over the
   matched elements `e`. Elements that compare equal can still differ in payload, for
   example decimals of different scale.
@@ -2030,7 +2042,9 @@ The amplifiers' exact sizes:
   [json.md](json.md) §6.4), which is why this kernel is an amplifier.
 
 `replace`, `regexp_replace`, and `jsonb_pretty` also reject a size above
-`MAX_RESULT_CHARS` with `54000`, before the output charge, like `repeat`.
+`MAX_RESULT_CHARS` with `54000`, before the output charge, like `repeat`. The array
+amplifiers (`array_replace`, `regexp_match`, `regexp_matches`) have no structural cap; the
+cost ceiling and the scalar allowance bound them.
 
 Rules for both classes:
 
@@ -2067,7 +2081,7 @@ Rules for both classes:
   every evaluation, and charging them would tax keyset predicates such as
   `(a, b) > (1, 'x')` for no protection.
 - Results that are an operand or part of one, or an operand-sized copy:
-  substrings, trims, `split_part`, `set_byte` / `set_bit`,
+  substrings (including `regexp_substr`), trims, `split_part`, `set_byte` / `set_bit`,
   subscripts and slices, jsonb extraction (`->`, `->>`, `#>`, `#>>`),
   `jsonb_strip_nulls`, `array_remove`, jsonb `-`, `CASE`, `COALESCE`,
   `GREATEST`/`LEAST`.
@@ -2086,10 +2100,13 @@ Rules for both classes:
   input, so each can grow it.
 - Parsing text into an array, `json`, `jsonb`, composite, or range: the result is
   bounded by the input text, and getting back to text for another round needs a
-  covered renderer.
+  covered renderer. `regexp_split_to_array` and `regexp_split_to_table` are the same
+  case: their pieces partition the subject, so their text never exceeds it, and the
+  array adds at most one element header per character.
 - Aggregates (`json_agg`, `jsonb_object_agg`, …): each input came from a charged
   row, and the retained inputs are Q2 operator state ([memory.md](memory.md) §6).
-- Set-returning functions: each row they produce charges `generated_row`.
+- Set-returning functions: each row they produce charges `generated_row`. The
+  exception is `regexp_matches`, whose rows are capture arrays (above).
 - Host functions: outside the engine's guarantees (CLAUDE.md §13).
 
 **Follow-ons.** New constructing kernels (`concat`, `format`,

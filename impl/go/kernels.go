@@ -287,6 +287,44 @@ func regexpReplaceText(prog *regexProgram, matchRunes, origRunes, repl []rune, g
 	return replaceBuild(origRunes, repl, found, size), nil
 }
 
+// regexpCaptureArrays is regexp_match / regexp_matches (regex.md §8/§8c): one text[] capture array
+// for the first match, or for every non-overlapping match when global; no match gives none. An
+// amplifier (cost.md §8.1): nested groups capture the same text once each, so the pattern multiplies
+// the subject. The search's regex_steps are its input charge; the arrays' exact payload is then
+// computed from the capture spans, charged, and reserved before any is built.
+func regexpCaptureArrays(prog *regexProgram, matchRunes, origRunes []rune, global bool, m *costMeter) ([]Value, error) {
+	found, err := prog.replaceMatches(matchRunes, global, m)
+	if err != nil || len(found) == 0 {
+		return nil, err
+	}
+	utf8At := utf8Offsets(origRunes)
+	var size int64
+	for _, saves := range found {
+		size += prog.captureArraySize(saves, utf8At)
+	}
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return nil, err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return nil, err
+	}
+	arrays := make([]Value, len(found))
+	for i, saves := range found {
+		groups := prog.captureArray(saves, origRunes)
+		elems := make([]Value, len(groups))
+		for j, g := range groups {
+			if g == nil {
+				elems[j] = NullValue()
+			} else {
+				elems[j] = TextValue(*g)
+			}
+		}
+		arrays[i] = ArrayValue(elems)
+	}
+	return arrays, nil
+}
+
 // splitPart is split_part(s, delim, n) (string-functions.md §3): split s on the substring delim and
 // return the n-th field (1-based; a negative n counts from the end). An out-of-range field is empty;
 // n = 0 traps 22023. An EMPTY delim treats the whole string as one field (strings.Split would
