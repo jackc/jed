@@ -191,7 +191,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `jsonb` GIN terms, pricing GIN predicates and candidates). The canonical contracts are
   [estimator.md](spec/design/estimator.md), [statistics.md](spec/design/statistics.md),
   [planner.md](spec/design/planner.md), and [explain.md](spec/design/explain.md).
-  - [ ] _follow-on:_ parameter-sensitive/custom prepared plans; planning remains pre-bind today.
+  - [ ] _follow-on:_ parameter-sensitive/custom prepared plans — designed in
+    [estimator.md §6.1](spec/design/estimator.md): a statement whose `$N` reaches a statistics, GIN
+    term, skeleton-overlap, or LIMIT site is planned with its bound values at every execution
+    (optionally memoized by exact values); every other statement keeps its single cached plan. No
+    PostgreSQL-style switch to a generic plan after five executions (history-dependent). Today
+    planning is pre-bind, so MCV/histogram/GIN term facts never reach parameterized queries.
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
     composite/array/json/jsonb, GIN term statistics for parameter operands and `<@`, and an element-count

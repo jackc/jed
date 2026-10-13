@@ -169,7 +169,7 @@ The pipeline remains `resolve → optimize → bind`. A literal is available to 
 a structural class or a histogram bucket. `$N` is not bound at physical-selection time and always
 receives a generic estimate: statistics-aware NDV average density for eligible equality, otherwise
 the generic structural selectivity. It never receives an MCV/histogram bucket. Initial Path B has no
-custom parameter-sensitive plans.
+custom parameter-sensitive plans; §6.1 designs them.
 
 A prepared-plan cache entry is reusable only when an exact, collision-free, relation-scoped input
 signature still matches. For every referenced persistent relation, in source ordinal order, the
@@ -196,6 +196,70 @@ prepared point lookup. A relevant revision change forces re-planning even if row
 return to its prior value, because structure or future distribution statistics may differ. Cache
 hits must be plan-, estimate-, result-, and actual-cost-identical to fresh planning over the same
 snapshot.
+
+### 6.1 Parameter-sensitive plans (designed; not landed)
+
+Because `$N` always takes the generic estimate, statistics reach a parameterized query only through
+NDV averages: an MCV, a histogram bucket, or a GIN term fact ([statistics.md §6.1](statistics.md))
+never applies. Embedded hosts bind parameters almost everywhere, and the one-shot `query(sql,
+params)` is prepare-then-run ([api.md](api.md) *Plan cache*), so today even a single ad-hoc
+parameterized query is planned blind to its values.
+
+**PostgreSQL's rule, and why jed does not copy it.** A PostgreSQL named prepared statement is
+custom-planned with its bound values for its first five executions. On the sixth it also builds a
+generic plan, and if that plan's *estimated* cost is no higher than the average estimated cost of
+the custom plans (each charged a fixed planning-overhead constant), it switches to the generic plan
+and stops custom planning until the plan is invalidated. `plan_cache_mode` (`auto` /
+`force_custom_plan` / `force_generic_plan`) overrides the choice. The plan of an execution therefore
+depends on which values the first five executions happened to bind and on per-backend cache
+history: a statement can turn slow on its sixth run, two connections can run one statement with
+different plans, and the switch compares a default-selectivity estimate against custom estimates,
+never against observed behaviour. jed's plan and cost must be a pure function of the statement and
+the database state (§1, CLAUDE.md §8/§13), and a cache hit must equal fresh planning (above), so a
+history-dependent switch is excluded.
+
+**Rule.** The plan of every execution is the plan physical selection produces when each bound value
+is available to the estimator as a plan-time constant of its parameter's resolved type, at exactly
+the sites where a literal of that type would be read (§7, §8.1, [statistics.md §6](statistics.md)).
+Call it the *custom plan*. Resolution (parse, name binding, parameter types) is unchanged and still
+happens once at prepare time; only physical selection and estimation see the values. Results never
+depend on the plan; the cost of an execution may, deterministically, through the values, exactly as
+the cost of the equivalent literal query does.
+
+**Sensitivity.** A statement is *parameter-sensitive* when some `$N` reaches an estimator input that
+can vary with its value. The sites are:
+
+- a comparison, `IN`, or `BETWEEN` leaf to which column statistics apply under
+  [statistics.md §6](statistics.md);
+- a GIN-served operand on a column with GIN term facts ([statistics.md §6.1](statistics.md));
+- an ordered-index or primary-key bound whose literal form would use the skeleton overlap count
+  (§8.1) — a range bound, or an equality on a non-unique key prefix;
+- `LIMIT` / `OFFSET`, and the bounds of a `generate_series` whose literal form has an exact
+  cardinality (§7.2).
+
+Full primary-key or unique-key equality is not a site: it estimates `min(N, 1)` whatever the value,
+so `SELECT … WHERE id = $1` stays insensitive. Sensitivity is a function of the resolved statement
+and the snapshot's catalog, statistics, and structure facts, so it is recomputed exactly when the
+cache signature changes. A core may classify conservatively (report sensitive when unsure) but never
+the reverse: an insensitive classification asserts that the generic plan *is* the custom plan for
+every value.
+
+**Caching.** An insensitive statement keeps today's single cached plan, which by the rule above is
+the custom plan for every value, so a point lookup pays no extra planning. A sensitive statement is
+planned with its values at each execution. A core may memoize custom plans by the exact canonical
+bytes of the bound values alongside the §6 signature, with any bounded eviction policy: a hit equals
+fresh planning by construction, so the memo is invisible to results, plans, estimates, and cost.
+Planning stays unmetered ([cost.md](cost.md)).
+
+**EXPLAIN** of a prepared statement shows the custom plan for the bound values. **Divergence:**
+PostgreSQL may switch a sensitive statement to a generic plan after five executions; jed never
+does, and offers no `plan_cache_mode` (CLAUDE.md §1: determinism is the overriding reason).
+
+**Conformance.** The shared corpus binds no parameters ([conformance.md §1.2](conformance.md)), and
+its literal EXPLAIN records already pin every custom plan. Each core adds host-API tests that a
+prepared statement's EXPLAIN and actual cost with bound values equal the literal query's; that an
+insensitive statement is planned once across executions; that a sensitive one re-plans when its value
+moves between an MCV / histogram bucket / GIN term class; and that a memo hit equals fresh planning.
 
 ## 7. Base cardinality
 
@@ -781,7 +845,7 @@ selectivities are recorded data, not a promise to reproduce PostgreSQL plans.
 
 ## 14. Deliberate boundaries and deferred work
 
-- No parameter-sensitive/custom plans in the current planner.
+- No parameter-sensitive/custom plans in the current planner (designed in §6.1, not landed).
 - No cost-based choice for the source query of `INSERT ... SELECT` beyond the ordinary SELECT rules,
   and no conflict-frequency model for `ON CONFLICT`.
 - No extended/multi-column statistics, automatic analyze, configurable targets, MCV-aware join
