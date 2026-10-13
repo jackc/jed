@@ -191,6 +191,8 @@ per row, after the proposed row's own default draws). The value takes the same s
 `NOT NULL`, `CHECK`, and end-state validation as any assignment. A constant/no default is free; an
 expression default is metered like INSERT's application of it (`operator_eval` per node, §7).
 Privilege preflight walks the selected default expression's named functions (session.md §5.3).
+As in PostgreSQL, a `DO UPDATE` statement needs `UPDATE` on the target besides `INSERT`, and any
+conflict target (`DO NOTHING` too) or column-reading `RETURNING` needs `SELECT` (session.md §5.3).
 
 **Narrowings on `SET` (each relaxable, §9):** assigning a **primary-key column** is
 **`0A000`** — a deferred follow-on (the standalone `UPDATE` re-keying has landed, CLAUDE.md §11

@@ -429,16 +429,34 @@ default-off + per-function `grant`"; a *deny-list* is "default-on + per-function
 
 - **`SELECT`** on every table whose **columns it reads** — `FROM`/`JOIN` tables, subquery and
   scalar-subquery tables, an `INSERT … SELECT` source, and the columns an `UPDATE`/`DELETE` reads
-  in its `WHERE` / assignment RHS / `RETURNING`.
+  in its `WHERE` / assignment RHS / `RETURNING`. An `INSERT` reads its target when it has an `ON
+  CONFLICT` conflict target (the arbiter columns — a column list or `ON CONSTRAINT`) or a
+  `RETURNING` that references a column (`*` included); a target-less `ON CONFLICT DO NOTHING` and a
+  column-free `RETURNING 1` read nothing. These are PostgreSQL's rules, at table granularity.
 - **`INSERT` / `UPDATE` / `DELETE`** on the statement's **write target**. A statement that both
   reads and writes a table needs both privileges: `UPDATE t SET … WHERE …` requires `UPDATE` *and*
-  `SELECT` on `t`; a bare `INSERT INTO t VALUES …` (no read) requires only `INSERT`.
+  `SELECT` on `t`; a bare `INSERT INTO t VALUES …` (no read) requires only `INSERT`. `INSERT … ON
+  CONFLICT … DO UPDATE` also requires `UPDATE` (and, through its conflict target, `SELECT`).
 - **`EXECUTE`** on every **named function** the statement calls. Built-in *operators* are **not**
   gated — they are pure and unavoidable (CLAUDE.md §13); the function privilege is most useful for
-  pinning determinism (revoke `uuidv4`/`now()`) or disabling set-returning functions. This includes
-  functions reached indirectly through a catalog expression selected by the statement, such as the
-  column default applied by `UPDATE t SET x = DEFAULT` (standalone or as an `ON CONFLICT DO UPDATE`
-  action); privilege preflight walks that selected expression before any row is evaluated.
+  pinning determinism (revoke `uuidv4`/`now()`) or disabling set-returning functions. Every
+  expression position counts, not only a call's argument list: select items, `WHERE`, `JOIN … ON`,
+  `GROUP BY`, `HAVING`, `ORDER BY` (of a query or set operation), an aggregate's `FILTER`, its
+  `WITHIN GROUP` and in-aggregate `ORDER BY` keys, a window's `PARTITION BY`, `ORDER BY`, and frame
+  offsets (inline or through a named `WINDOW`), `FROM`-clause function arguments, `VALUES` rows,
+  `JSON_TABLE`'s context item and path, subqueries at any depth, CTE bodies (writable ones
+  included), `RETURNING`, and `ON CONFLICT DO UPDATE`'s `SET` and `WHERE`. The same walk also finds
+  the tables those positions read, and the `nextval`/`setval` calls that make a read a write (§5.1).
+  It also includes functions reached indirectly through a **catalog expression** the statement makes
+  the engine evaluate, as PostgreSQL checks them against the current user: the column default an
+  `INSERT` fills (an omitted column, a `DEFAULT` slot, `DEFAULT VALUES`) or `SET x = DEFAULT`
+  assigns (in `UPDATE` or an `ON CONFLICT DO UPDATE` action), and the `CHECK` constraints of an
+  `INSERT`/`UPDATE`/upsert target. Through an updatable view these are the base table's
+  ([views.md](views.md) §15.4). Privilege preflight walks those selected expressions before any row
+  is evaluated, so the check is static: a write that touches no row still needs them. Index
+  expressions and partial-index predicates are not checked (nor are they in PostgreSQL, whose index
+  maintenance runs no permission check), and foreign-key actions check nothing against the writer
+  (PostgreSQL runs them as the table's owner).
 
 **DDL** (CREATE / DROP / ALTER of tables, indexes, types, sequences) is **not** a per-table
 privilege — jed has no schema/owner model (§3) — so a session capability **`allow_ddl`**

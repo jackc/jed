@@ -3361,10 +3361,11 @@ export class Engine {
     collectStmtPrivs(stmt, req);
     // The functions a read view's body calls need the reader's EXECUTE (views.md §9).
     this.collectViewFunctionPrivs(req);
-    // UPDATE's DEFAULT marker has no expression subtree. Add the selected catalog default's named
-    // functions during preflight so a revoked function cannot be invoked through
-    // `SET column = DEFAULT` (session.md §5.3).
-    this.collectUpdateDefaultPrivs(stmt, req);
+    // The catalog expressions a write evaluates — applied column defaults and the target's CHECK
+    // constraints — carry no expression tree in the statement. Preflight walks them explicitly,
+    // before execution resolves/evaluates them, so a revoked function cannot be invoked through them
+    // (session.md §5.3).
+    this.collectCatalogExprPrivs(stmt, req);
     if (req.isDdl) {
       // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
       // table by allowTempDdl, everything else (persistent) by allowDdl. A CREATE TABLE is classified
@@ -3416,53 +3417,81 @@ export class Engine {
     }
   }
 
-  // Add named functions reached through SET column = DEFAULT — standalone UPDATE and INSERT … ON
-  // CONFLICT DO UPDATE. Ordinary assignment expressions are covered by collectStmtPrivs; this
-  // catalog-dependent walk includes top-level, writable-CTE, and EXPLAIN-contained statements.
-  // Missing targets are skipped so execution retains its existing 42P01/42703 error precedence.
-  private collectUpdateDefaultPrivs(stmt: Statement, req: PrivReq): void {
-    if (stmt.kind === "update") this.collectOneUpdateDefaultPrivs(stmt, req);
-    else if (stmt.kind === "insert") this.collectOneUpsertDefaultPrivs(stmt, req);
+  // collectCatalogExprPrivs adds the named functions of the catalog expressions a write evaluates
+  // (session.md §5.3): the column defaults an INSERT fills (an omitted column, a DEFAULT slot) or an
+  // UPDATE / ON CONFLICT DO UPDATE assigns with SET c = DEFAULT, and the target table's CHECK
+  // constraints. These carry no expression in the statement itself, so preflight walks the selected
+  // catalog expressions before execution resolves or evaluates them. A write through an updatable
+  // view is retargeted first, as execution does (views.md §15.2), so the base table's defaults and
+  // CHECKs apply. Covers top-level, writable-CTE, and EXPLAIN-contained statements. An unresolved
+  // target or column is left to execution, so its error precedence is unchanged.
+  private collectCatalogExprPrivs(stmt: Statement, req: PrivReq): void {
+    if (stmt.kind === "update") this.collectUpdateCatalogPrivs(stmt, req);
+    else if (stmt.kind === "insert") this.collectInsertCatalogPrivs(stmt, req);
     else if (stmt.kind === "with") {
-      for (const cte of stmt.ctes) this.collectCteDefaultPrivs(cte.body, req);
-      this.collectCteDefaultPrivs(stmt.body, req);
-    } else if (stmt.kind === "explain") this.collectUpdateDefaultPrivs(stmt.inner, req);
+      for (const cte of stmt.ctes) this.collectCteCatalogPrivs(cte.body, req);
+      this.collectCteCatalogPrivs(stmt.body, req);
+    } else if (stmt.kind === "explain") this.collectCatalogExprPrivs(stmt.inner, req);
   }
 
-  private collectCteDefaultPrivs(body: CteBody, req: PrivReq): void {
-    if (body.kind === "update") this.collectOneUpdateDefaultPrivs(body, req);
-    else if (body.kind === "insert") this.collectOneUpsertDefaultPrivs(body, req);
+  private collectCteCatalogPrivs(body: CteBody, req: PrivReq): void {
+    if (body.kind === "update") this.collectUpdateCatalogPrivs(body, req);
+    else if (body.kind === "insert") this.collectInsertCatalogPrivs(body, req);
   }
 
-  private collectOneUpdateDefaultPrivs(upd: Update, req: PrivReq): void {
-    this.collectAssignmentDefaultPrivs(upd.db, upd.table, upd.assignments, req);
-  }
-
-  private collectOneUpsertDefaultPrivs(ins: Insert, req: PrivReq): void {
-    if (ins.onConflict !== null && ins.onConflict.doUpdate) {
-      this.collectAssignmentDefaultPrivs(ins.db, ins.table, ins.onConflict.assignments, req);
+  private collectUpdateCatalogPrivs(written: Update, req: PrivReq): void {
+    let upd: Update;
+    try {
+      upd = this.rewriteUpdateTarget(written).upd;
+    } catch {
+      return;
     }
+    const table = this.lkpTableScoped(upd.db, upd.table);
+    if (table === undefined) return;
+    collectAssignmentDefaultPrivs(table, upd.assignments, req);
+    collectCheckPrivs(table, req);
   }
 
-  private collectAssignmentDefaultPrivs(
-    db: string | undefined,
-    tableName: string,
-    assignments: Assignment[],
-    req: PrivReq,
-  ): void {
-    if (!assignments.some((a) => a.isDefault)) return;
-    const table = this.lkpTableScoped(db, tableName);
+  private collectInsertCatalogPrivs(written: Insert, req: PrivReq): void {
+    let ins: Insert;
+    try {
+      ins = this.rewriteInsertTarget(written).ins;
+    } catch {
+      return;
+    }
+    const table = this.lkpTableScoped(ins.db, ins.table);
     if (table === undefined) return;
-    const locals = new Set<string>();
-    for (const assignment of assignments) {
-      if (!assignment.isDefault) continue;
-      const col = table.columns.find(
-        (candidate) => candidate.name === assignment.column,
-      );
-      if (col !== undefined && col.defaultExpr !== null) {
-        collectExprPrivs(col.defaultExpr.expr, req, locals);
+    // The columns this INSERT defaults, exactly as execution selects them: every column the list
+    // omits (all of them for DEFAULT VALUES), every OVERRIDING USER VALUE identity column, and every
+    // column a VALUES row fills with DEFAULT. An unknown or repeated list column is skipped —
+    // execution reports it.
+    const n = table.columns.length;
+    const provided: number[] = [];
+    for (let i = 0; i < n; i++) provided.push(ins.columns === null ? i : -1);
+    if (ins.columns !== null) {
+      ins.columns.forEach((name, p) => {
+        const idx = columnIndex(table, name);
+        if (idx >= 0 && provided[idx]! < 0) provided[idx] = p;
+      });
+    }
+    if (ins.overriding === "user") {
+      for (let i = 0; i < n; i++) {
+        if (table.columns[i]!.identity !== null) provided[i] = -1;
       }
     }
+    const needs = insertDefaultNeeds(
+      provided,
+      ins.source.kind === "values" ? ins.source.rows : null,
+    );
+    const locals = new Set<string>();
+    needs.forEach((need, i) => {
+      const def = table.columns[i]!.defaultExpr;
+      if (need && def !== null) collectExprPrivs(def.expr, req, locals);
+    });
+    if (ins.onConflict !== null && ins.onConflict.doUpdate) {
+      collectAssignmentDefaultPrivs(table, ins.onConflict.assignments, req);
+    }
+    collectCheckPrivs(table, req);
   }
 
   // gateReadLanes runs the admission gates the lazy read lanes (tryScanQuery / tryDeferredQuery) would
@@ -34738,6 +34767,26 @@ function finalizeBlockingCollection(
 // identity columns) and every column a VALUES row fills with a top-level DEFAULT. rows is null for a
 // SELECT source, whose projection never yields DEFAULT. A row of the wrong arity is skipped here; the
 // caller reports it.
+// collectAssignmentDefaultPrivs adds the named functions of the column defaults an assignment list
+// selects with SET c = DEFAULT.
+function collectAssignmentDefaultPrivs(table: Table, assignments: Assignment[], req: PrivReq): void {
+  const locals = new Set<string>();
+  for (const assignment of assignments) {
+    if (!assignment.isDefault) continue;
+    const col = table.columns.find((candidate) => candidate.name === assignment.column);
+    if (col !== undefined && col.defaultExpr !== null) {
+      collectExprPrivs(col.defaultExpr.expr, req, locals);
+    }
+  }
+}
+
+// collectCheckPrivs adds the named functions of a write target's CHECK constraints, which the write
+// evaluates on each new row.
+function collectCheckPrivs(table: Table, req: PrivReq): void {
+  const locals = new Set<string>();
+  for (const check of table.checks) collectExprPrivs(check.expr, req, locals);
+}
+
 function insertDefaultNeeds(
   provided: readonly number[],
   rows: readonly InsertValue[][] | null,

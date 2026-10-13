@@ -38,18 +38,23 @@ A separate **`allow_ddl`** flag (default on) gates all `CREATE` / `DROP` / `ALTE
 
 ## What each statement needs
 
-- **`SELECT`** on every table a statement reads — its `FROM`/`JOIN` tables, subqueries, an
-  `INSERT … SELECT` source, and the columns an `UPDATE`/`DELETE` reads in `WHERE` / `RETURNING` /
-  an assignment.
+- **`SELECT`** on every table a statement reads — its `FROM`/`JOIN` tables, subqueries anywhere in
+  it, an `INSERT … SELECT` source, and the columns an `UPDATE`/`DELETE` reads in `WHERE` /
+  `RETURNING` / an assignment. An `INSERT` reads its target when it names an `ON CONFLICT` target or
+  has a `RETURNING` that references a column.
 - **`INSERT` / `UPDATE` / `DELETE`** on the write target. A statement that both reads and writes
   needs both: `UPDATE t … WHERE …` needs `UPDATE` *and* `SELECT`; a bare `INSERT INTO t VALUES …`
-  needs only `INSERT`.
+  needs only `INSERT`; `INSERT … ON CONFLICT (id) DO UPDATE …` needs `INSERT`, `UPDATE`, and
+  `SELECT`.
 - **Views** are granted like tables. Reading a [view](../../sql/views/) needs `SELECT` on the view
   only, not on the tables its query reads. `CREATE VIEW` needs `allow_ddl` plus `SELECT` on every
   table and view its query reads, so a session cannot create a view over data it could not read.
-- **`EXECUTE`** on every named function it calls. Built-in operators (`+`, `=`, …) are never gated —
-  they are pure and unavoidable. Revoking `EXECUTE` on `uuidv4()` or `now()` is the easy way to pin a
-  session's determinism.
+- **`EXECUTE`** on every named function it calls, wherever the call appears — including an
+  aggregate's `FILTER`, a `WITHIN GROUP` or window `OVER (…)` clause, and `ORDER BY` — and on the
+  functions in the column defaults an `INSERT` fills or `SET col = DEFAULT` assigns and in the
+  target's `CHECK` constraints. Built-in operators (`+`, `=`, …) are never gated — they are pure and
+  unavoidable. Revoking `EXECUTE` on `uuidv4()` or `now()` is the easy way to pin a session's
+  determinism.
 - **`ANALYZE table [(columns)]`** needs `SELECT` on its target plus `allow_ddl`. Collection reads the
   table and transactionally replaces planner facts; this slice has no separate `MAINTAIN` privilege.
 

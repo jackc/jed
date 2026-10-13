@@ -51,9 +51,15 @@ DELETE FROM v WHERE id = 4 RETURNING id
 statement error 42501
 INSERT INTO t VALUES (9, 9, 'q')
 
-# ON CONFLICT through the view is checked on the view too, as for a table (§15.7)
+# ON CONFLICT through the view is checked on the view too, as for a table (§15.7): the conflict
+# target and the RETURNING read the view's columns, so SELECT on the view is needed as well
 # default_privileges: NONE
 # grant: INSERT ON v
+statement error 42501
+INSERT INTO v (id, a) VALUES (5, 50), (1, 0) ON CONFLICT (id) DO NOTHING
+
+# default_privileges: NONE
+# grant: INSERT, SELECT ON v
 query II nosort
 INSERT INTO v (id, a) VALUES (5, 50), (1, 0) ON CONFLICT (id) DO NOTHING RETURNING id, a2
 ----

@@ -4230,7 +4230,10 @@ impl Engine {
 /// columns) and every column a VALUES row fills with a top-level `DEFAULT`. `rows` is empty for a
 /// SELECT source, whose projection never yields `DEFAULT`. A row of the wrong arity is skipped here;
 /// the caller reports it.
-fn insert_default_needs(provided: &[Option<usize>], rows: &[Vec<InsertValue>]) -> Vec<bool> {
+pub(crate) fn insert_default_needs(
+    provided: &[Option<usize>],
+    rows: &[Vec<InsertValue>],
+) -> Vec<bool> {
     provided
         .iter()
         .map(|p| match p {

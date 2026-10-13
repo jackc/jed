@@ -2,7 +2,6 @@ package jed
 
 import (
 	"fmt"
-	"slices"
 )
 
 // Per-statement admission checks: privilege enforcement, budgets, and lane gating (session.md,
@@ -96,7 +95,7 @@ func queryCallsSeqMutator(qe *queryExpr) bool {
 }
 
 func setopCallsSeqMutator(so *setOp) bool {
-	return queryCallsSeqMutator(&so.Lhs) || queryCallsSeqMutator(&so.Rhs)
+	return queryCallsSeqMutator(&so.Lhs) || queryCallsSeqMutator(&so.Rhs) || orderKeysCallSeqMutator(so.OrderBy)
 }
 
 func selectCallsSeqMutator(s *selectStmt) bool {
@@ -133,6 +132,45 @@ func selectCallsSeqMutator(s *selectStmt) bool {
 	if s.Having != nil && exprCallsSeqMutator(s.Having) {
 		return true
 	}
+	for i := range s.Windows {
+		if windowDefCallsSeqMutator(&s.Windows[i].Def) {
+			return true
+		}
+	}
+	return orderKeysCallSeqMutator(s.OrderBy)
+}
+
+// orderKeysCallSeqMutator reports whether an ORDER BY / WITHIN GROUP / in-aggregate ORDER BY key
+// list calls a sequence-mutating function.
+func orderKeysCallSeqMutator(keys []orderKey) bool {
+	for i := range keys {
+		if k := keys[i].Expr; k != nil && exprCallsSeqMutator(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// windowDefCallsSeqMutator reports whether a window definition's PARTITION BY, ORDER BY, or frame
+// offsets call a sequence-mutating function.
+func windowDefCallsSeqMutator(w *windowDef) bool {
+	for i := range w.Partition {
+		if exprCallsSeqMutator(&w.Partition[i]) {
+			return true
+		}
+	}
+	for i := range w.Order {
+		if exprCallsSeqMutator(&w.Order[i].Expr) {
+			return true
+		}
+	}
+	if f := w.Frame; f != nil {
+		for _, b := range []*frameBound{&f.Start, &f.End} {
+			if (b.Kind == framePreceding || b.Kind == frameFollowing) && exprCallsSeqMutator(&b.Offset) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -143,6 +181,9 @@ func tableRefCallsSeqMutator(t *tableRef) bool {
 		}
 	}
 	if t.Subquery != nil && queryCallsSeqMutator(t.Subquery) {
+		return true
+	}
+	if jt := t.JsonTable; jt != nil && (exprCallsSeqMutator(jt.Ctx) || exprCallsSeqMutator(jt.Path)) {
 		return true
 	}
 	for _, row := range t.Values {
@@ -167,12 +208,13 @@ func exprCallsSeqMutator(e *exprNode) bool {
 				return true
 			}
 		}
-		for i := range e.FuncCall.AggOrder {
-			if k := e.FuncCall.AggOrder[i].Expr; k != nil && exprCallsSeqMutator(k) {
-				return true
-			}
+		if e.FuncCall.Filter != nil && exprCallsSeqMutator(e.FuncCall.Filter) {
+			return true
 		}
-		return false
+		if e.FuncCall.Over != nil && windowDefCallsSeqMutator(e.FuncCall.Over) {
+			return true
+		}
+		return orderKeysCallSeqMutator(e.FuncCall.WithinGroup) || orderKeysCallSeqMutator(e.FuncCall.AggOrder)
 	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprParam:
 		return false
 	case exprRow, exprArray:
@@ -420,10 +462,11 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	collectStmtPrivs(stmt, &req)
 	// The functions a read view's body calls need the reader's EXECUTE (views.md §9).
 	db.collectViewFunctionPrivs(&req)
-	// UPDATE's DEFAULT marker carries no expression tree of its own. Preflight must therefore walk
-	// the selected catalog default explicitly, before execution resolves/evaluates it, so a revoked
-	// function cannot be invoked through `SET column = DEFAULT` (session.md §5.3).
-	db.collectUpdateDefaultPrivs(stmt, &req)
+	// The catalog expressions a write evaluates — applied column defaults and the target's CHECK
+	// constraints — carry no expression tree in the statement. Preflight walks them explicitly,
+	// before execution resolves/evaluates them, so a revoked function cannot be invoked through them
+	// (session.md §5.3).
+	db.collectCatalogExprPrivs(stmt, &req)
 	if req.isDDL {
 		// DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
 		// table by allowTempDDL, everything else (persistent) by allowDDL. A CREATE TABLE is classified
@@ -472,56 +515,111 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	return nil
 }
 
-// collectUpdateDefaultPrivs adds named functions reached through SET column = DEFAULT — standalone
-// UPDATE and INSERT … ON CONFLICT DO UPDATE. Ordinary assignment expressions are handled by
-// collectStmtPrivs; this catalog-dependent second walk covers top-level, writable-CTE, and
-// EXPLAIN-contained statements without changing missing-table or missing-column error precedence
-// (an unresolved target is left to execution).
-func (db *engine) collectUpdateDefaultPrivs(stmt statement, req *privReq) {
+// collectCatalogExprPrivs adds the named functions of the catalog expressions a write evaluates
+// (session.md §5.3): the column defaults an INSERT fills (an omitted column, a DEFAULT slot) or an
+// UPDATE / ON CONFLICT DO UPDATE assigns with SET c = DEFAULT, and the target table's CHECK
+// constraints. These carry no expression in the statement itself, so preflight walks the selected
+// catalog expressions before execution resolves or evaluates them. A write through an updatable view
+// is retargeted first, as execution does (views.md §15.2), so the base table's defaults and CHECKs
+// apply. Covers top-level, writable-CTE, and EXPLAIN-contained statements. An unresolved target or
+// column is left to execution, so its error precedence is unchanged.
+func (db *engine) collectCatalogExprPrivs(stmt statement, req *privReq) {
 	if stmt.Update != nil {
-		db.collectOneUpdateDefaultPrivs(stmt.Update, req)
+		db.collectUpdateCatalogPrivs(stmt.Update, req)
 	}
 	if stmt.Insert != nil {
-		db.collectOneUpsertDefaultPrivs(stmt.Insert, req)
+		db.collectInsertCatalogPrivs(stmt.Insert, req)
 	}
 	if stmt.With != nil {
 		for i := range stmt.With.Ctes {
-			db.collectCteDefaultPrivs(&stmt.With.Ctes[i].Body, req)
+			db.collectCteCatalogPrivs(&stmt.With.Ctes[i].Body, req)
 		}
-		db.collectCteDefaultPrivs(&stmt.With.Body, req)
+		db.collectCteCatalogPrivs(&stmt.With.Body, req)
 	}
 	if stmt.Explain != nil {
-		db.collectUpdateDefaultPrivs(*stmt.Explain.Inner, req)
+		db.collectCatalogExprPrivs(*stmt.Explain.Inner, req)
 	}
 }
 
-func (db *engine) collectCteDefaultPrivs(body *cteBody, req *privReq) {
+func (db *engine) collectCteCatalogPrivs(body *cteBody, req *privReq) {
 	if body.Update != nil {
-		db.collectOneUpdateDefaultPrivs(body.Update, req)
+		db.collectUpdateCatalogPrivs(body.Update, req)
 	}
 	if body.Insert != nil {
-		db.collectOneUpsertDefaultPrivs(body.Insert, req)
+		db.collectInsertCatalogPrivs(body.Insert, req)
 	}
 }
 
-func (db *engine) collectOneUpdateDefaultPrivs(upd *update, req *privReq) {
-	db.collectAssignmentDefaultPrivs(upd.DB, upd.Table, upd.Assignments, req)
-}
-
-func (db *engine) collectOneUpsertDefaultPrivs(ins *insert, req *privReq) {
-	if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
-		db.collectAssignmentDefaultPrivs(ins.DB, ins.Table, ins.OnConflict.Assignments, req)
-	}
-}
-
-func (db *engine) collectAssignmentDefaultPrivs(dbName *string, tableName string, assignments []assignment, req *privReq) {
-	if !slices.ContainsFunc(assignments, func(a assignment) bool { return a.IsDefault }) {
+func (db *engine) collectUpdateCatalogPrivs(upd *update, req *privReq) {
+	upd, _, err := db.rewriteUpdateTarget(upd)
+	if err != nil {
 		return
 	}
-	table, ok := db.lkpTableScoped(dbName, tableName)
+	table, ok := db.lkpTableScoped(upd.DB, upd.Table)
 	if !ok {
 		return
 	}
+	db.collectAssignmentDefaultPrivs(table, upd.Assignments, req)
+	collectCheckPrivs(table, req)
+}
+
+func (db *engine) collectInsertCatalogPrivs(ins *insert, req *privReq) {
+	ins, _, err := db.rewriteInsertTarget(ins)
+	if err != nil {
+		return
+	}
+	table, ok := db.lkpTableScoped(ins.DB, ins.Table)
+	if !ok {
+		return
+	}
+	// The columns this INSERT defaults, exactly as execution selects them (dml.go): every column the
+	// list omits (all of them for DEFAULT VALUES), every OVERRIDING USER VALUE identity column, and
+	// every column a VALUES row fills with DEFAULT. An unknown or repeated list column is skipped —
+	// execution reports it.
+	n := len(table.Columns)
+	provided := make([]int, n)
+	for i := range provided {
+		provided[i] = i
+	}
+	if ins.Columns != nil {
+		for i := range provided {
+			provided[i] = -1
+		}
+		for p, name := range ins.Columns {
+			if idx := table.ColumnIndex(name); idx >= 0 && provided[idx] < 0 {
+				provided[idx] = p
+			}
+		}
+	}
+	if ins.Overriding != nil && *ins.Overriding == overridingUser {
+		for i := range table.Columns {
+			if table.Columns[i].Identity != nil {
+				provided[i] = -1
+			}
+		}
+	}
+	locals := map[string]bool{}
+	for i, need := range insertDefaultNeeds(provided, ins.Rows) {
+		if col := &table.Columns[i]; need && col.DefaultExpr != nil {
+			collectExprPrivs(&col.DefaultExpr.Expr, req, locals)
+		}
+	}
+	if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
+		db.collectAssignmentDefaultPrivs(table, ins.OnConflict.Assignments, req)
+	}
+	collectCheckPrivs(table, req)
+}
+
+// collectCheckPrivs adds the named functions of a write target's CHECK constraints, which the write
+// evaluates on each new row.
+func collectCheckPrivs(table *catTable, req *privReq) {
+	locals := map[string]bool{}
+	for i := range table.Checks {
+		collectExprPrivs(&table.Checks[i].Expr, req, locals)
+	}
+}
+
+func (db *engine) collectAssignmentDefaultPrivs(table *catTable, assignments []assignment, req *privReq) {
 	locals := map[string]bool{}
 	for i := range assignments {
 		a := &assignments[i]
@@ -646,6 +744,20 @@ func collectInsertPrivs(ins *insert, req *privReq, locals map[string]bool) {
 	// The write target needs INSERT. A VALUES expression slot needs what its sublinks read and the
 	// functions it calls (grammar.md §16); an INSERT … SELECT source needs SELECT on its tables.
 	req.needTable(ins.Table, PrivInsert)
+	// PostgreSQL's ON CONFLICT and RETURNING rules (session.md §5.3): a conflict target reads the
+	// arbiter columns (SELECT), DO UPDATE also updates (UPDATE), and a RETURNING that reads a column
+	// reads the target (SELECT). A target-less DO NOTHING and a column-free RETURNING read nothing.
+	if ins.OnConflict != nil {
+		if ins.OnConflict.Target != nil {
+			req.needTable(ins.Table, PrivSelect)
+		}
+		if ins.OnConflict.DoUpdate {
+			req.needTable(ins.Table, PrivUpdate)
+		}
+	}
+	if returningReadsColumns(ins.Returning) {
+		req.needTable(ins.Table, PrivSelect)
+	}
 	if ins.Query != nil {
 		collectQueryPrivs(ins.Query, req, locals)
 	}
@@ -727,6 +839,7 @@ func collectQueryPrivs(qe *queryExpr, req *privReq, locals map[string]bool) {
 func collectSetopPrivs(so *setOp, req *privReq, locals map[string]bool) {
 	collectQueryPrivs(&so.Lhs, req, locals)
 	collectQueryPrivs(&so.Rhs, req, locals)
+	collectOrderKeyPrivs(so.OrderBy, req, locals)
 }
 
 func collectWithPrivs(wq *withQuery, req *privReq, locals map[string]bool) {
@@ -789,6 +902,38 @@ func collectSelectPrivs(s *selectStmt, req *privReq, locals map[string]bool) {
 	if s.Having != nil {
 		collectExprPrivs(s.Having, req, locals)
 	}
+	for i := range s.Windows {
+		collectWindowDefPrivs(&s.Windows[i].Def, req, locals)
+	}
+	collectOrderKeyPrivs(s.OrderBy, req, locals)
+}
+
+// collectOrderKeyPrivs walks an ORDER BY / WITHIN GROUP / in-aggregate ORDER BY key list (a bare
+// column or ordinal key has no expression).
+func collectOrderKeyPrivs(keys []orderKey, req *privReq, locals map[string]bool) {
+	for i := range keys {
+		if k := keys[i].Expr; k != nil {
+			collectExprPrivs(k, req, locals)
+		}
+	}
+}
+
+// collectWindowDefPrivs walks a window definition's PARTITION BY and ORDER BY expressions and its
+// frame offsets (window.md).
+func collectWindowDefPrivs(w *windowDef, req *privReq, locals map[string]bool) {
+	for i := range w.Partition {
+		collectExprPrivs(&w.Partition[i], req, locals)
+	}
+	for i := range w.Order {
+		collectExprPrivs(&w.Order[i].Expr, req, locals)
+	}
+	if f := w.Frame; f != nil {
+		for _, b := range []*frameBound{&f.Start, &f.End} {
+			if b.Kind == framePreceding || b.Kind == frameFollowing {
+				collectExprPrivs(&b.Offset, req, locals)
+			}
+		}
+	}
 }
 
 func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
@@ -807,6 +952,11 @@ func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 				collectExprPrivs(e, req, locals)
 			}
 		}
+	case t.JsonTable != nil:
+		// JSON_TABLE is syntax, not a named function or a table: its name is only the row source's
+		// label. The context item and path are expressions (json-table.md).
+		collectExprPrivs(t.JsonTable.Ctx, req, locals)
+		collectExprPrivs(t.JsonTable.Path, req, locals)
 	default:
 		// A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified name
 		// never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
@@ -815,6 +965,23 @@ func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 			req.relations = append(req.relations, relationRef{db: t.DB, name: t.Name})
 		}
 	}
+}
+
+// returningReadsColumns reports whether a RETURNING list reads the target's columns: `*` does, and
+// so does any item that references a column or holds a subquery.
+func returningReadsColumns(returning *returningClause) bool {
+	if returning == nil {
+		return false
+	}
+	if returning.Items.All {
+		return true
+	}
+	for i := range returning.Items.Items {
+		if exprReadsColumns(&returning.Items.Items[i].Expr) {
+			return true
+		}
+	}
+	return false
 }
 
 func collectReturningPrivs(returning *returningClause, req *privReq, locals map[string]bool) {
@@ -835,11 +1002,16 @@ func collectExprPrivs(e *exprNode, req *privReq, locals map[string]bool) {
 		for _, a := range e.FuncCall.Args {
 			collectExprPrivs(a, req, locals)
 		}
-		// An in-aggregate ORDER BY key may call functions / hold a subquery (aggregates.md §22).
-		for i := range e.FuncCall.AggOrder {
-			if k := e.FuncCall.AggOrder[i].Expr; k != nil {
-				collectExprPrivs(k, req, locals)
-			}
+		// The positions outside the argument list run expressions too: the FILTER condition, the
+		// WITHIN GROUP and in-aggregate ORDER BY keys (aggregates.md §11/§13/§22), and an inline
+		// OVER definition (a named one is walked with its WINDOW clause).
+		if e.FuncCall.Filter != nil {
+			collectExprPrivs(e.FuncCall.Filter, req, locals)
+		}
+		collectOrderKeyPrivs(e.FuncCall.WithinGroup, req, locals)
+		collectOrderKeyPrivs(e.FuncCall.AggOrder, req, locals)
+		if e.FuncCall.Over != nil {
+			collectWindowDefPrivs(e.FuncCall.Over, req, locals)
 		}
 	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprParam:
 		// leaf — nothing to collect

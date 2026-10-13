@@ -836,7 +836,9 @@ and `SELECT` when the statement reads the view's columns (in a `WHERE`, a `SET` 
 `RETURNING`): the table rule of [session.md](session.md) §5.3 applied to the view. Nothing else is
 checked against the writer. Neither the base relation nor, in a chain, the views below the target
 are checked, just as reading a view needs `SELECT` on that view only (§9). A function a select item
-or the view's `WHERE` calls needs the writer's `EXECUTE`, as when the view is read.
+or the view's `WHERE` calls needs the writer's `EXECUTE`, as when the view is read, and so does one
+in a base-table column default the write fills or a base-table `CHECK` it evaluates (session.md
+§5.3).
 
 A host can therefore let a session write a subset of a table without any grant on the table: grant
 `INSERT`, `UPDATE`, or `DELETE` on an updatable view over it.

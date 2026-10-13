@@ -1,0 +1,224 @@
+# Session authorization — every expression position the privilege preflight must walk
+# (spec/design/session.md §5.3). A named function anywhere in a statement needs EXECUTE and a table
+# read anywhere in it needs SELECT, including positions outside a call's argument list: an
+# aggregate's FILTER, a WITHIN GROUP key, a window's PARTITION BY / ORDER BY (inline or through a named
+# WINDOW), a query's ORDER BY, a JSON_TABLE context item, a view body, and the
+# catalog expressions a write applies (the column defaults an INSERT fills, the target's CHECK
+# constraints). INSERT ... ON CONFLICT and INSERT ... RETURNING follow PostgreSQL's table privileges.
+# jed-specific (the envelope is host-configured), so CROSS-CORE-checked, NOT oracle-checked; the
+# directive grammar is privileges.test's.
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default_expr, ddl.check, ddl.view, dml.view_write, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.returning, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.order_by_expr, query.aggregates, query.aggregate_filter, query.window_aggregate_filter, query.ordered_set_aggregate, query.within_group_expr, query.window, query.window_aggregate, query.window_expr_keys, query.window_named, query.subquery_scalar, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns, func.json_table, func.json_builders, func.abs, types.i32, session.privileges
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, -20), (3, 30)
+
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO s VALUES (1, 5)
+
+# --- aggregate FILTER ----------------------------------------------------------------------------
+
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT count(*) FILTER (WHERE abs(v) > 0) FROM t
+
+# revoke: SELECT ON s
+statement error 42501
+SELECT count(*) FILTER (WHERE v > (SELECT min(v) FROM s)) FROM t
+
+# the FILTER of a window aggregate
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT count(*) FILTER (WHERE abs(v) > 0) OVER () FROM t
+
+# --- WITHIN GROUP keys ---------------------------------------------------------------------------
+
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY abs(v)) FROM t
+
+# --- window definitions --------------------------------------------------------------------------
+
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT sum(v) OVER (PARTITION BY abs(v)) FROM t
+
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT sum(v) OVER (ORDER BY abs(v)) FROM t
+
+# a named WINDOW clause's definition
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT sum(v) OVER w FROM t WINDOW w AS (PARTITION BY abs(v))
+
+# --- the query's ORDER BY ------------------------------------------------------------------------
+
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT v FROM t ORDER BY abs(v)
+
+# revoke: SELECT ON s
+statement error 42501
+SELECT v FROM t ORDER BY v + (SELECT min(v) FROM s)
+
+# --- JSON_TABLE ----------------------------------------------------------------------------------
+
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT x FROM JSON_TABLE(jsonb_build_array(abs(-1)), '$[*]' COLUMNS (x i32 PATH '$')) AS jt
+
+# revoke: SELECT ON s
+statement error 42501
+SELECT x FROM JSON_TABLE((SELECT jsonb_build_array(min(v)) FROM s), '$[*]' COLUMNS (x i32 PATH '$')) AS jt
+
+# a JSON_TABLE label is not a table reference: a table of the same name needs no privilege
+statement ok
+CREATE TABLE jt (id i32 PRIMARY KEY)
+
+# revoke: SELECT ON jt
+query I nosort
+SELECT x FROM JSON_TABLE('[7]'::jsonb, '$[*]' COLUMNS (x i32 PATH '$')) AS jt
+----
+7
+
+# --- view bodies ---------------------------------------------------------------------------------
+
+statement ok
+CREATE VIEW vf AS SELECT count(*) FILTER (WHERE abs(v) > 0) AS c FROM t
+
+# a function in a view body's FILTER needs the reader's EXECUTE (views.md §9)
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT c FROM vf
+
+# creating a view needs SELECT on every relation its body reads, here only inside a FILTER
+# revoke: SELECT ON s
+statement error 42501
+CREATE VIEW vs AS SELECT count(*) FILTER (WHERE v > (SELECT min(v) FROM s)) AS c FROM t
+
+# --- column defaults an INSERT applies -----------------------------------------------------------
+
+statement ok
+CREATE TABLE dp (id i32 PRIMARY KEY, v i32 DEFAULT abs(-7))
+
+# an omitted column takes its default, which calls abs
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO dp (id) VALUES (1)
+
+# so does a DEFAULT slot
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO dp VALUES (1, DEFAULT)
+
+# and an omitted column of an INSERT ... SELECT
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO dp (id) SELECT 1
+
+# a column the INSERT supplies does not evaluate its default
+# revoke: EXECUTE ON abs
+statement ok
+INSERT INTO dp VALUES (1, 1)
+
+# a write through a view fills the base columns it does not target with their defaults
+statement ok
+CREATE VIEW dpv AS SELECT id FROM dp
+
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO dpv VALUES (2)
+
+query II nosort
+SELECT id, v FROM dp
+----
+1
+1
+
+# --- CHECK constraints of the write target -------------------------------------------------------
+
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, v i32 CHECK (abs(v) < 100))
+
+statement ok
+INSERT INTO ck VALUES (1, 1)
+
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO ck VALUES (2, 2)
+
+# revoke: EXECUTE ON abs
+statement error 42501
+UPDATE ck SET v = 3 WHERE id = 1
+
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO ck VALUES (1, 4) ON CONFLICT (id) DO UPDATE SET v = 4
+
+# through an updatable view, the base table's CHECK still applies
+statement ok
+CREATE VIEW ckv AS SELECT id, v FROM ck
+
+# revoke: EXECUTE ON abs
+statement error 42501
+UPDATE ckv SET v = 5 WHERE id = 1
+
+# a DELETE evaluates no CHECK
+# revoke: EXECUTE ON abs
+statement ok
+DELETE FROM ck WHERE id = 1
+
+# --- INSERT ... ON CONFLICT and RETURNING table privileges (PostgreSQL's) ------------------------
+
+# ON CONFLICT DO NOTHING without a conflict target reads nothing: INSERT suffices
+# default_privileges: INSERT
+statement ok
+INSERT INTO t VALUES (1, 0) ON CONFLICT DO NOTHING
+
+# a conflict target reads the arbiter columns, so it needs SELECT
+# default_privileges: INSERT
+statement error 42501
+INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO NOTHING
+
+# default_privileges: INSERT, SELECT
+statement ok
+INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO NOTHING
+
+# DO UPDATE also needs UPDATE
+# default_privileges: INSERT, SELECT
+statement error 42501
+INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET v = t.v
+
+# default_privileges: INSERT, SELECT, UPDATE
+statement ok
+INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET v = t.v
+
+# RETURNING that reads the inserted row's columns needs SELECT ...
+# default_privileges: INSERT
+statement error 42501
+INSERT INTO t VALUES (4, 40) RETURNING v
+
+# ... a RETURNING that reads no column does not
+# default_privileges: INSERT
+query I nosort
+INSERT INTO t VALUES (4, 40) RETURNING 1
+----
+1
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+2
+-20
+3
+30
+4
+40

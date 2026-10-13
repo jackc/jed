@@ -1,0 +1,43 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# A read-shaped statement that calls nextval is a write (spec/design/sequences.md §4), so a READ ONLY
+# block refuses it with 25006 — wherever the call sits, including positions outside a call's argument
+# list: an aggregate's FILTER, a query's ORDER BY, and a named WINDOW definition (the same walk as the
+# privilege preflight, session.md §5.3). PostgreSQL refuses each with 25006 too; as for read_only.test,
+# the oracle harness cannot replay a block that spans records, so only the first probe is automatic.
+# requires: txn.read_only, txn.explicit, ddl.create_table, ddl.primary_key, ddl.sequence, func.sequence, dml.insert, query.select, query.order_by, query.order_by_expr, query.aggregates, query.aggregate_filter, query.window, query.window_aggregate, query.window_expr_keys, query.window_named, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE SEQUENCE sq
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+SELECT count(*) FILTER (WHERE nextval('sq') > 0) FROM t
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+SELECT v FROM t ORDER BY nextval('sq')
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+SELECT sum(v) OVER w FROM t WINDOW w AS (ORDER BY nextval('sq'))
+
+statement ok
+ROLLBACK

@@ -4,6 +4,7 @@
 //! check_lifetime_admission) — as Engine methods.
 
 use super::*;
+use crate::executor::dml::insert_default_needs;
 
 impl Engine {
     /// `nextval('name')` (spec/design/sequences.md §4): advance the named sequence and return the
@@ -1153,10 +1154,11 @@ impl Engine {
         collect_stmt_privs(stmt, &mut req);
         // The functions a read view's body calls need the reader's EXECUTE (views.md §9).
         self.collect_view_function_privs(&mut req);
-        // The UPDATE DEFAULT marker has no expression subtree. Add the selected catalog default's
-        // named functions during preflight so a revoked function cannot be invoked through
-        // `SET column = DEFAULT` (session.md §5.3).
-        self.collect_update_default_privs(stmt, &mut req);
+        // The catalog expressions a write evaluates — applied column defaults and the target's CHECK
+        // constraints — carry no expression tree in the statement. Preflight walks them explicitly,
+        // before execution resolves/evaluates them, so a revoked function cannot be invoked through
+        // them (session.md §5.3).
+        self.collect_catalog_expr_privs(stmt, &mut req);
         if req.is_ddl {
             // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
             // table by `allow_temp_ddl`, everything else (persistent) by `allow_ddl`. The split lets a
@@ -1218,77 +1220,102 @@ impl Engine {
         Ok(())
     }
 
-    /// Add named functions reached through `SET column = DEFAULT` — standalone UPDATE and
-    /// `INSERT … ON CONFLICT DO UPDATE`. Ordinary assignment expressions are covered by
-    /// `collect_stmt_privs`; this catalog-dependent walk includes top-level, writable-CTE, and
-    /// EXPLAIN-contained statements. Missing targets are deliberately skipped so execution retains
-    /// its existing 42P01/42703 error precedence.
-    fn collect_update_default_privs(&self, stmt: &Statement, req: &mut PrivReq) {
+    /// Add the named functions of the catalog expressions a write evaluates (session.md §5.3): the
+    /// column defaults an INSERT fills (an omitted column, a `DEFAULT` slot) or an UPDATE / `ON
+    /// CONFLICT DO UPDATE` assigns with `SET c = DEFAULT`, and the target table's CHECK constraints.
+    /// These carry no expression in the statement itself, so preflight walks the selected catalog
+    /// expressions before execution resolves or evaluates them. A write through an updatable view is
+    /// retargeted first, as execution does (views.md §15.2), so the base table's defaults and CHECKs
+    /// apply. Covers top-level, writable-CTE, and EXPLAIN-contained statements. An unresolved target
+    /// or column is left to execution, so its error precedence is unchanged.
+    fn collect_catalog_expr_privs(&self, stmt: &Statement, req: &mut PrivReq) {
         match stmt {
-            Statement::Update(upd) => self.collect_one_update_default_privs(upd, req),
-            Statement::Insert(ins) => self.collect_one_upsert_default_privs(ins, req),
+            Statement::Update(upd) => self.collect_update_catalog_privs(upd, req),
+            Statement::Insert(ins) => self.collect_insert_catalog_privs(ins, req),
             Statement::With(wq) => {
                 for cte in &wq.ctes {
-                    self.collect_cte_default_privs(&cte.body, req);
+                    self.collect_cte_catalog_privs(&cte.body, req);
                 }
-                self.collect_cte_default_privs(&wq.body, req);
+                self.collect_cte_catalog_privs(&wq.body, req);
             }
-            Statement::Explain { inner, .. } => self.collect_update_default_privs(inner, req),
+            Statement::Explain { inner, .. } => self.collect_catalog_expr_privs(inner, req),
             _ => {}
         }
     }
 
-    fn collect_cte_default_privs(&self, body: &CteBody, req: &mut PrivReq) {
+    fn collect_cte_catalog_privs(&self, body: &CteBody, req: &mut PrivReq) {
         match body {
-            CteBody::Update(upd) => self.collect_one_update_default_privs(upd, req),
-            CteBody::Insert(ins) => self.collect_one_upsert_default_privs(ins, req),
+            CteBody::Update(upd) => self.collect_update_catalog_privs(upd, req),
+            CteBody::Insert(ins) => self.collect_insert_catalog_privs(ins, req),
             _ => {}
         }
     }
 
-    fn collect_one_update_default_privs(&self, upd: &Update, req: &mut PrivReq) {
-        self.collect_assignment_default_privs(upd.db.as_deref(), &upd.table, &upd.assignments, req);
+    fn collect_update_catalog_privs(&self, upd: &Update, req: &mut PrivReq) {
+        let mut upd = upd.clone();
+        if self.rewrite_update_target(&mut upd).is_err() {
+            return;
+        }
+        let Some(table) = self.table_scoped(upd.db.as_deref(), &upd.table) else {
+            return;
+        };
+        collect_assignment_default_privs(table, &upd.assignments, req);
+        collect_check_privs(table, req);
     }
 
-    fn collect_one_upsert_default_privs(&self, ins: &Insert, req: &mut PrivReq) {
+    fn collect_insert_catalog_privs(&self, ins: &Insert, req: &mut PrivReq) {
+        let mut ins = ins.clone();
+        if self.rewrite_insert_target(&mut ins).is_err() {
+            return;
+        }
+        let Some(table) = self.table_scoped(ins.db.as_deref(), &ins.table) else {
+            return;
+        };
+        // The columns this INSERT defaults, exactly as execution selects them (dml.rs): every column
+        // the list omits (all of them for DEFAULT VALUES), every OVERRIDING USER VALUE identity
+        // column, and every column a VALUES row fills with DEFAULT. An unknown or repeated list
+        // column is skipped — execution reports it.
+        let mut provided: Vec<Option<usize>> = match &ins.columns {
+            None => (0..table.columns.len()).map(Some).collect(),
+            Some(names) => {
+                let mut provided = vec![None; table.columns.len()];
+                for (p, name) in names.iter().enumerate() {
+                    if let Some(idx) = table.columns.iter().position(|c| c.name == *name) {
+                        provided[idx].get_or_insert(p);
+                    }
+                }
+                provided
+            }
+        };
+        if ins.overriding == Some(Overriding::User) {
+            for (i, col) in table.columns.iter().enumerate() {
+                if col.identity.is_some() {
+                    provided[i] = None;
+                }
+            }
+        }
+        let rows = match &ins.source {
+            InsertSource::Values(rows) => rows.as_slice(),
+            InsertSource::Query(_) => &[],
+        };
+        let locals = HashSet::new();
+        for (col, need) in table
+            .columns
+            .iter()
+            .zip(insert_default_needs(&provided, rows))
+        {
+            if let (true, Some(default)) = (need, &col.default_expr) {
+                collect_expr_privs(&default.expr, req, &locals);
+            }
+        }
         if let Some(OnConflict {
             action: ConflictAction::DoUpdate { assignments, .. },
             ..
         }) = &ins.on_conflict
         {
-            self.collect_assignment_default_privs(ins.db.as_deref(), &ins.table, assignments, req);
+            collect_assignment_default_privs(table, assignments, req);
         }
-    }
-
-    fn collect_assignment_default_privs(
-        &self,
-        db: Option<&str>,
-        table: &str,
-        assignments: &[crate::ast::Assignment],
-        req: &mut PrivReq,
-    ) {
-        if !assignments.iter().any(|a| a.is_default) {
-            return;
-        }
-        let Some(table) = self.table_scoped(db, table) else {
-            return;
-        };
-        let locals = HashSet::new();
-        for assignment in assignments {
-            if !assignment.is_default {
-                continue;
-            }
-            let Some(col) = table
-                .columns
-                .iter()
-                .find(|col| col.name == assignment.column)
-            else {
-                continue;
-            };
-            if let Some(default) = &col.default_expr {
-                collect_expr_privs(&default.expr, req, &locals);
-            }
-        }
+        collect_check_privs(table, req);
     }
 
     /// Enforce the read-path admission gates a lazy read lane bypasses (the safe-total-`query`
@@ -1345,5 +1372,33 @@ impl Engine {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }));
         }
+    }
+}
+
+/// Add the named functions of the column defaults an assignment list selects with `SET c = DEFAULT`.
+fn collect_assignment_default_privs(
+    table: &Table,
+    assignments: &[crate::ast::Assignment],
+    req: &mut PrivReq,
+) {
+    let locals = HashSet::new();
+    for assignment in assignments.iter().filter(|a| a.is_default) {
+        let default = table
+            .columns
+            .iter()
+            .find(|col| col.name == assignment.column)
+            .and_then(|col| col.default_expr.as_ref());
+        if let Some(default) = default {
+            collect_expr_privs(&default.expr, req, &locals);
+        }
+    }
+}
+
+/// Add the named functions of a write target's CHECK constraints, which the write evaluates on each
+/// new row.
+fn collect_check_privs(table: &Table, req: &mut PrivReq) {
+    let locals = HashSet::new();
+    for check in &table.checks {
+        collect_expr_privs(&check.expr, req, &locals);
     }
 }

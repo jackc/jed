@@ -67,6 +67,7 @@ import type {
   Insert,
   JsonOnBehavior,
   JsonWrapper,
+  OrderKey,
   QueryExpr,
   ReturningClause,
   Select,
@@ -77,6 +78,7 @@ import type {
   Statement,
   TableRef,
   Update,
+  WindowDef,
   WithQuery,
 } from "./ast.ts";
 import { cteBodyAsQuery, cteBodyIsDataModifying, forEachGroupExpr } from "./ast.ts";
@@ -1655,7 +1657,37 @@ export function queryCallsSeqMutator(qe: QueryExpr): boolean {
 }
 
 export function setOpCallsSeqMutator(so: SetOp): boolean {
-  return queryCallsSeqMutator(so.lhs) || queryCallsSeqMutator(so.rhs);
+  return (
+    queryCallsSeqMutator(so.lhs) ||
+    queryCallsSeqMutator(so.rhs) ||
+    orderKeysCallSeqMutator(so.orderBy)
+  );
+}
+
+// orderKeysCallSeqMutator reports whether an ORDER BY / WITHIN GROUP / in-aggregate ORDER BY key
+// list calls a sequence-mutating function.
+export function orderKeysCallSeqMutator(keys: readonly OrderKey[] | null | undefined): boolean {
+  return (keys ?? []).some((k) => k.expr !== null && exprCallsSeqMutator(k.expr));
+}
+
+// windowDefCallsSeqMutator reports whether a window definition's PARTITION BY, ORDER BY, or frame
+// offsets call a sequence-mutating function.
+export function windowDefCallsSeqMutator(w: WindowDef): boolean {
+  return (
+    w.partition.some(exprCallsSeqMutator) ||
+    w.order.some((k) => exprCallsSeqMutator(k.expr)) ||
+    frameOffsets(w).some(exprCallsSeqMutator)
+  );
+}
+
+// frameOffsets is the offset expressions of a window frame's `n PRECEDING` / `n FOLLOWING` bounds.
+export function frameOffsets(w: WindowDef): Expr[] {
+  const out: Expr[] = [];
+  if (w.frame == null) return out;
+  for (const b of [w.frame.start, w.frame.end]) {
+    if (b.kind === "preceding" || b.kind === "following") out.push(b.offset);
+  }
+  return out;
 }
 
 export function selectCallsSeqMutator(s: Select): boolean {
@@ -1675,7 +1707,9 @@ export function selectCallsSeqMutator(s: Select): boolean {
       });
       return found;
     }) ||
-    (s.having !== null && exprCallsSeqMutator(s.having))
+    (s.having !== null && exprCallsSeqMutator(s.having)) ||
+    s.windows.some(([, w]) => windowDefCallsSeqMutator(w)) ||
+    orderKeysCallSeqMutator(s.orderBy)
   );
 }
 
@@ -1683,7 +1717,9 @@ export function tableRefCallsSeqMutator(t: TableRef): boolean {
   return (
     t.args?.some(exprCallsSeqMutator) ||
     (t.subquery !== undefined && queryCallsSeqMutator(t.subquery)) ||
-    (t.values?.some((row) => row.some(exprCallsSeqMutator)) ?? false)
+    (t.values?.some((row) => row.some(exprCallsSeqMutator)) ?? false) ||
+    (t.jsonTable !== undefined &&
+      (exprCallsSeqMutator(t.jsonTable.ctx) || exprCallsSeqMutator(t.jsonTable.path)))
   );
 }
 
@@ -1697,7 +1733,10 @@ export function exprCallsSeqMutator(e: Expr): boolean {
         n === "nextval" ||
         n === "setval" ||
         e.args.some(exprCallsSeqMutator) ||
-        (e.aggOrder ?? []).some((k) => k.expr != null && exprCallsSeqMutator(k.expr))
+        (e.filter != null && exprCallsSeqMutator(e.filter)) ||
+        (e.over != null && windowDefCallsSeqMutator(e.over)) ||
+        orderKeysCallSeqMutator(e.withinGroup) ||
+        orderKeysCallSeqMutator(e.aggOrder)
       );
     }
     case "column":
@@ -1848,6 +1887,14 @@ export function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string
   // The write target needs INSERT. A VALUES expression slot needs what its sublinks read and the
   // functions it calls (grammar.md §16); an INSERT … SELECT source needs SELECT on its tables.
   req.tables.push({ name: ins.table, priv: "insert" });
+  // PostgreSQL's ON CONFLICT and RETURNING rules (session.md §5.3): a conflict target reads the
+  // arbiter columns (SELECT), DO UPDATE also updates (UPDATE), and a RETURNING that reads a column
+  // reads the target (SELECT). A target-less DO NOTHING and a column-free RETURNING read nothing.
+  if (ins.onConflict !== null) {
+    if (ins.onConflict.target !== null) req.tables.push({ name: ins.table, priv: "select" });
+    if (ins.onConflict.doUpdate) req.tables.push({ name: ins.table, priv: "update" });
+  }
+  if (returningReadsColumns(ins.returning)) req.tables.push({ name: ins.table, priv: "select" });
   if (ins.source.kind === "query") {
     collectQueryPrivs(ins.source.query, req, locals);
   } else {
@@ -1904,6 +1951,7 @@ export function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<strin
 export function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>): void {
   collectQueryPrivs(so.lhs, req, locals);
   collectQueryPrivs(so.rhs, req, locals);
+  collectOrderKeyPrivs(so.orderBy, req, locals);
 }
 
 export function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): void {
@@ -1942,6 +1990,26 @@ export function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>)
   if (s.filter !== null) collectExprPrivs(s.filter, req, locals);
   for (const g of s.groupBy) forEachGroupExpr(g, (e) => collectExprPrivs(e, req, locals));
   if (s.having !== null) collectExprPrivs(s.having, req, locals);
+  for (const [, w] of s.windows) collectWindowDefPrivs(w, req, locals);
+  collectOrderKeyPrivs(s.orderBy, req, locals);
+}
+
+// collectOrderKeyPrivs walks an ORDER BY / WITHIN GROUP / in-aggregate ORDER BY key list (a bare
+// column or ordinal key has no expression).
+export function collectOrderKeyPrivs(
+  keys: readonly OrderKey[] | null | undefined,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
+  for (const k of keys ?? []) if (k.expr !== null) collectExprPrivs(k.expr, req, locals);
+}
+
+// collectWindowDefPrivs walks a window definition's PARTITION BY and ORDER BY expressions and its
+// frame offsets (window.md).
+export function collectWindowDefPrivs(w: WindowDef, req: PrivReq, locals: Set<string>): void {
+  for (const e of w.partition) collectExprPrivs(e, req, locals);
+  for (const k of w.order) collectExprPrivs(k.expr, req, locals);
+  for (const e of frameOffsets(w)) collectExprPrivs(e, req, locals);
 }
 
 export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): void {
@@ -1953,12 +2021,25 @@ export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<stri
     collectQueryPrivs(t.subquery, req, locals);
   } else if (t.values !== undefined) {
     for (const row of t.values) for (const e of row) collectExprPrivs(e, req, locals);
+  } else if (t.jsonTable !== undefined) {
+    // JSON_TABLE is syntax, not a named function or a table: its name is only the row source's
+    // label. The context item and path are expressions (json-table.md).
+    collectExprPrivs(t.jsonTable.ctx, req, locals);
+    collectExprPrivs(t.jsonTable.path, req, locals);
   } else if (t.db !== undefined || !locals.has(t.name)) {
     // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified name
     // never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
     req.tables.push({ name: t.name, priv: "select" });
     req.relations.push({ db: t.db, name: t.name });
   }
+}
+
+// returningReadsColumns reports whether a RETURNING list reads the target's columns: `*` does, and
+// so does any item that references a column or holds a subquery.
+export function returningReadsColumns(returning: ReturningClause | null): boolean {
+  if (returning === null) return false;
+  if (returning.items.kind !== "list") return true;
+  return returning.items.items.some((it) => exprReadsColumns(it.expr));
 }
 
 export function collectReturningPrivs(
@@ -1978,8 +2059,13 @@ export function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): vo
     case "funcCall":
       req.functions.push(e.name);
       for (const a of e.args) collectExprPrivs(a, req, locals);
-      // An in-aggregate ORDER BY key may call functions / hold a subquery (aggregates.md §22).
-      for (const k of e.aggOrder ?? []) if (k.expr != null) collectExprPrivs(k.expr, req, locals);
+      // The positions outside the argument list run expressions too: the FILTER condition, the
+      // WITHIN GROUP and in-aggregate ORDER BY keys (aggregates.md §11/§13/§22), and an inline OVER
+      // definition (a named one is walked with its WINDOW clause).
+      if (e.filter != null) collectExprPrivs(e.filter, req, locals);
+      collectOrderKeyPrivs(e.withinGroup, req, locals);
+      collectOrderKeyPrivs(e.aggOrder, req, locals);
+      if (e.over != null) collectWindowDefPrivs(e.over, req, locals);
       break;
     case "column":
     case "qualifiedColumn":

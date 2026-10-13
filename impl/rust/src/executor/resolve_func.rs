@@ -3,6 +3,7 @@
 //! ParamTypes/PrivReq helpers that fall in this range.
 
 use super::*;
+use crate::ast::{FrameBound, WindowFrame};
 
 /// Resolve a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar function
 /// (abs/round/…, spec/design/functions.md §9), the named/defaulted `make_interval` (§11), or
@@ -2640,7 +2641,34 @@ pub(crate) fn query_calls_seq_mutator(qe: &QueryExpr) -> bool {
 }
 
 pub(crate) fn setop_calls_seq_mutator(so: &SetOp) -> bool {
-    query_calls_seq_mutator(&so.lhs) || query_calls_seq_mutator(&so.rhs)
+    query_calls_seq_mutator(&so.lhs)
+        || query_calls_seq_mutator(&so.rhs)
+        || order_keys_call_seq_mutator(&so.order_by)
+}
+
+/// Whether an ORDER BY / WITHIN GROUP / in-aggregate ORDER BY key list calls a sequence-mutating
+/// function.
+pub(crate) fn order_keys_call_seq_mutator(keys: &[OrderKey]) -> bool {
+    keys.iter()
+        .any(|k| k.expr.as_ref().is_some_and(expr_calls_seq_mutator))
+}
+
+/// Whether a window definition's PARTITION BY, ORDER BY, or frame offsets call a sequence-mutating
+/// function.
+pub(crate) fn window_def_calls_seq_mutator(w: &WindowDef) -> bool {
+    w.partition.iter().any(expr_calls_seq_mutator)
+        || w.order.iter().any(|k| expr_calls_seq_mutator(&k.expr))
+        || w.frame
+            .as_ref()
+            .is_some_and(|f| frame_offsets(f).any(expr_calls_seq_mutator))
+}
+
+/// The offset expressions of a window frame's `n PRECEDING` / `n FOLLOWING` bounds.
+pub(crate) fn frame_offsets(f: &WindowFrame) -> impl Iterator<Item = &Expr> {
+    [&f.start, &f.end].into_iter().filter_map(|b| match b {
+        FrameBound::Preceding(e) | FrameBound::Following(e) => Some(e.as_ref()),
+        _ => None,
+    })
 }
 
 pub(crate) fn select_calls_seq_mutator(s: &Select) -> bool {
@@ -2660,6 +2688,10 @@ pub(crate) fn select_calls_seq_mutator(s: &Select) -> bool {
             found
         })
         || s.having.as_ref().is_some_and(expr_calls_seq_mutator)
+        || s.windows
+            .iter()
+            .any(|(_, w)| window_def_calls_seq_mutator(w))
+        || order_keys_call_seq_mutator(&s.order_by)
 }
 
 pub(crate) fn table_ref_calls(t: &TableRef) -> bool {
@@ -2672,6 +2704,9 @@ pub(crate) fn table_ref_calls(t: &TableRef) -> bool {
         || t.values
             .as_ref()
             .is_some_and(|rows| rows.iter().flatten().any(expr_calls_seq_mutator))
+        || t.json_table
+            .as_ref()
+            .is_some_and(|jt| expr_calls_seq_mutator(&jt.ctx) || expr_calls_seq_mutator(&jt.path))
 }
 
 /// Exhaustive over `Expr` (the compiler enforces it): true iff the tree contains a sequence-
@@ -2681,16 +2716,23 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
         Expr::FuncCall {
             name,
             args,
+            filter,
+            over,
+            within_group,
             agg_order,
             ..
         } => {
             name == "nextval"
                 || name == "setval"
                 || args.iter().any(expr_calls_seq_mutator)
-                || agg_order.as_deref().is_some_and(|keys| {
-                    keys.iter()
-                        .any(|k| k.expr.as_ref().is_some_and(expr_calls_seq_mutator))
-                })
+                || filter.as_deref().is_some_and(expr_calls_seq_mutator)
+                || over.as_deref().is_some_and(window_def_calls_seq_mutator)
+                || within_group
+                    .as_deref()
+                    .is_some_and(|keys| order_keys_call_seq_mutator(keys))
+                || agg_order
+                    .as_deref()
+                    .is_some_and(|keys| order_keys_call_seq_mutator(keys))
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
@@ -2833,6 +2875,20 @@ pub(crate) fn collect_insert_privs(ins: &Insert, req: &mut PrivReq, locals: &Has
     // The write target needs INSERT. A `VALUES` expression slot needs what its sublinks read and
     // the functions it calls (grammar.md §16); an `INSERT … SELECT` source needs SELECT on its tables.
     req.need_table(&ins.table, Privilege::Insert);
+    // PostgreSQL's ON CONFLICT and RETURNING rules (session.md §5.3): a conflict target reads the
+    // arbiter columns (SELECT), DO UPDATE also updates (UPDATE), and a RETURNING that reads a column
+    // reads the target (SELECT). A target-less DO NOTHING and a column-free RETURNING read nothing.
+    if let Some(oc) = &ins.on_conflict {
+        if oc.target.is_some() {
+            req.need_table(&ins.table, Privilege::Select);
+        }
+        if matches!(oc.action, ConflictAction::DoUpdate { .. }) {
+            req.need_table(&ins.table, Privilege::Update);
+        }
+    }
+    if returning_reads_columns(&ins.returning) {
+        req.need_table(&ins.table, Privilege::Select);
+    }
     match &ins.source {
         InsertSource::Query(q) => collect_query_privs(q, req, locals),
         InsertSource::Values(rows) => {
@@ -2914,6 +2970,7 @@ pub(crate) fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &Ha
 pub(crate) fn collect_setop_privs(so: &SetOp, req: &mut PrivReq, locals: &HashSet<String>) {
     collect_query_privs(&so.lhs, req, locals);
     collect_query_privs(&so.rhs, req, locals);
+    collect_order_key_privs(&so.order_by, req, locals);
 }
 
 pub(crate) fn collect_with_privs(wq: &WithQuery, req: &mut PrivReq, locals: &HashSet<String>) {
@@ -2968,6 +3025,38 @@ pub(crate) fn collect_select_privs(s: &Select, req: &mut PrivReq, locals: &HashS
     if let Some(h) = &s.having {
         collect_expr_privs(h, req, locals);
     }
+    for (_, w) in &s.windows {
+        collect_window_def_privs(w, req, locals);
+    }
+    collect_order_key_privs(&s.order_by, req, locals);
+}
+
+/// Walk an ORDER BY / WITHIN GROUP / in-aggregate ORDER BY key list (a bare column or ordinal key
+/// has no expression).
+pub(crate) fn collect_order_key_privs(
+    keys: &[OrderKey],
+    req: &mut PrivReq,
+    locals: &HashSet<String>,
+) {
+    for e in keys.iter().filter_map(|k| k.expr.as_ref()) {
+        collect_expr_privs(e, req, locals);
+    }
+}
+
+/// Walk a window definition's PARTITION BY and ORDER BY expressions and its frame offsets
+/// (window.md).
+pub(crate) fn collect_window_def_privs(w: &WindowDef, req: &mut PrivReq, locals: &HashSet<String>) {
+    for e in &w.partition {
+        collect_expr_privs(e, req, locals);
+    }
+    for k in &w.order {
+        collect_expr_privs(&k.expr, req, locals);
+    }
+    if let Some(f) = &w.frame {
+        for e in frame_offsets(f) {
+            collect_expr_privs(e, req, locals);
+        }
+    }
 }
 
 pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &HashSet<String>) {
@@ -2983,11 +3072,32 @@ pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &
         for e in rows.iter().flatten() {
             collect_expr_privs(e, req, locals);
         }
+    } else if let Some(jt) = &t.json_table {
+        // JSON_TABLE is syntax, not a named function or a table: its name is only the row source's
+        // label. The context item and path are expressions (json-table.md).
+        collect_expr_privs(&jt.ctx, req, locals);
+        collect_expr_privs(&jt.path, req, locals);
     } else if t.db.is_some() || !locals.contains(&t.name.to_string()) {
         // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified
         // name never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
         req.need_table(&t.name, Privilege::Select);
         req.relations.push((t.db.clone(), t.name.clone()));
+    }
+}
+
+/// Whether a RETURNING list reads the target's columns: `*` does, and so does any item that
+/// references a column or holds a subquery.
+pub(crate) fn returning_reads_columns(returning: &Option<ReturningClause>) -> bool {
+    match returning {
+        None => false,
+        Some(ReturningClause {
+            items: SelectItems::All(_),
+            ..
+        }) => true,
+        Some(ReturningClause {
+            items: SelectItems::Items(list),
+            ..
+        }) => list.iter().any(|it| expr_reads_columns(&it.expr)),
     }
 }
 
@@ -3014,6 +3124,9 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
         Expr::FuncCall {
             name,
             args,
+            filter,
+            over,
+            within_group,
             agg_order,
             ..
         } => {
@@ -3021,11 +3134,20 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
             for a in args {
                 collect_expr_privs(a, req, locals);
             }
-            // An in-aggregate ORDER BY key may call functions / hold a subquery (aggregates.md §22).
-            for k in agg_order.iter().flat_map(|keys| keys.iter()) {
-                if let Some(e) = &k.expr {
-                    collect_expr_privs(e, req, locals);
-                }
+            // The positions outside the argument list run expressions too: the FILTER condition,
+            // the WITHIN GROUP and in-aggregate ORDER BY keys (aggregates.md §11/§13/§22), and an
+            // inline OVER definition (a named one is walked with its WINDOW clause).
+            if let Some(f) = filter {
+                collect_expr_privs(f, req, locals);
+            }
+            if let Some(keys) = within_group {
+                collect_order_key_privs(keys, req, locals);
+            }
+            if let Some(keys) = agg_order {
+                collect_order_key_privs(keys, req, locals);
+            }
+            if let Some(w) = over {
+                collect_window_def_privs(w, req, locals);
             }
         }
         Expr::Column(_, _)
