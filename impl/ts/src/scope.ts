@@ -287,12 +287,24 @@ export class Scope {
   // `excluded` as a QUALIFIER-ONLY relation at offset n over the combined row [existing | proposed]
   // (excluded.col reads the proposed row). A target labeled `excluded` (a table so named, or AS
   // excluded) keeps BOTH relations under the one label, so excluded.col is 42P09 (PostgreSQL's rule
-  // — resolveQualified).
-  static onConflictExcluded(catalog: Engine, t: Table, alias?: string): Scope {
+  // — resolveQualified). For an INSERT through a view (vw, views.md §15.7) both relations expose the
+  // view's columns over their halves of the combined row.
+  static onConflictExcluded(
+    catalog: Engine,
+    t: Table,
+    vw: ViewWrite | null,
+    alias?: string,
+  ): Scope {
     const n = t.columns.length;
     const rels: ScopeRel[] = [
-      Scope.targetRel(t, null, alias),
-      { label: "excluded", table: t, offset: n, qualifierOnly: true },
+      Scope.targetRel(t, vw, alias),
+      {
+        label: "excluded",
+        table: t,
+        offset: n,
+        qualifierOnly: true,
+        ...(vw === null ? {} : { layer: vw.top }),
+      },
     ];
     return new Scope(rels, catalog, null, true);
   }

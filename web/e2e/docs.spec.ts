@@ -608,6 +608,23 @@ test('the views page writes through an updatable view', async ({ page }) => {
   await expect(panel.getByTestId('error-code')).toHaveText('0A000');
 });
 
+test('the views page upserts through an updatable view', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // INSERT … ON CONFLICT through open_tasks (views.md §15.7): the done task 2, which the view hides,
+  // is updated anyway, and task 5 is inserted.
+  const panel = livePanel(page, 'upsertQuery');
+  await expect(panel.getByTestId('result-rows')).toContainText('ship it again');
+  await expect(panel.getByTestId('result-rows')).toContainText('triage');
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+
+  // A computed view column matches no unique constraint (42P10).
+  await panel
+    .getByTestId('sql-input')
+    .fill("INSERT INTO open_tasks (id, title) VALUES (1, 'x') ON CONFLICT (owner_tag) DO NOTHING");
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('42P10');
+});
+
 test('the views page enforces WITH CHECK OPTION', async ({ page }) => {
   await page.goto('/docs/sql/views/');
   // INSERT through ada_tasks of a row the view shows succeeds (views.md §15.6).

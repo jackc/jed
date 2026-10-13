@@ -1,10 +1,10 @@
 # skip: disk — temp tables and transactions spanning records cannot survive the disk-mode per-record
 # reopen (spec/design/conformance.md §3); views persist and reload in the other views files' disk pass.
 # Views — the jed-specific behavior of spec/design/views.md that PostgreSQL cannot oracle-check:
-# the IF NOT EXISTS extension, the jed_ reservation, 0A000 for ON CONFLICT on a view and the
-# deferred forms, temp scope, untracked dependencies, a rolled-back CASCADE,
-# re-validation after ALTER TABLE, CREATE OR REPLACE VIEW, and ALTER VIEW (§8), the cycle check and
-# typmod rule of OR REPLACE (§1.2), the session privilege envelope (§9), and transactions.
+# the IF NOT EXISTS extension, the jed_ reservation, 0A000 for the deferred forms, temp scope,
+# untracked dependencies, a rolled-back CASCADE, re-validation after ALTER TABLE, CREATE OR REPLACE
+# VIEW, and ALTER VIEW (§8), the cycle check and typmod rule of OR REPLACE (§1.2), the session
+# privilege envelope (§9), and transactions.
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # requires: ddl.view, ddl.view_cascade, dml.view_write, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, types.decimal, types.varchar_length, types.composite, cast.operator, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
 
@@ -77,20 +77,6 @@ WITH d AS (DELETE FROM tabs RETURNING name) SELECT count(*) FROM d
 
 statement ok
 DROP VIEW tabs
-
-# --- ON CONFLICT on an updatable view is a follow-on (views.md §15.2); writes through updatable
-# views are covered by dml/view_write.test and dml/view_write_jed.test ---------------------------
-
-statement error 0A000
-INSERT INTO v VALUES (1, 'x') ON CONFLICT DO NOTHING
-
-query IT nosort
-SELECT * FROM v ORDER BY a
-----
-1
-x
-2
-y
 
 # --- deferred forms are recognized and refused with 0A000 -------------------------------------------
 

@@ -417,9 +417,13 @@ impl Engine {
                 // Resolve the ON CONFLICT clause (its DO UPDATE SET/WHERE share this statement's
                 // ptypes so a `$N` unifies) before binding (spec/design/upsert.md §2/§5).
                 let mut conflict_plan = match &on_conflict {
-                    Some(oc) => {
-                        Some(self.resolve_on_conflict(&table, oc, alias.as_deref(), &mut ptypes)?)
-                    }
+                    Some(oc) => Some(self.resolve_on_conflict(
+                        &table,
+                        oc,
+                        alias.as_deref(),
+                        vw.as_ref(),
+                        &mut ptypes,
+                    )?),
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
@@ -626,9 +630,13 @@ impl Engine {
                     None => None,
                 };
                 let mut conflict_plan = match &on_conflict {
-                    Some(oc) => {
-                        Some(self.resolve_on_conflict(&table, oc, alias.as_deref(), &mut ptypes)?)
-                    }
+                    Some(oc) => Some(self.resolve_on_conflict(
+                        &table,
+                        oc,
+                        alias.as_deref(),
+                        vw.as_ref(),
+                        &mut ptypes,
+                    )?),
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
@@ -1792,11 +1800,15 @@ impl Engine {
     /// arbiter constraint, plus — for `DO UPDATE` — the resolved `SET` assignment plans and the
     /// optional `WHERE` filter, both resolved against the `[existing | excluded]` scope. Threads
     /// the statement `ptypes` so a `$N` in a `SET`/`WHERE` unifies with the rest of the INSERT.
+    /// For an INSERT through an updatable view (`vw`, views.md §15.7) the target maps through the
+    /// view and the scope exposes the view's columns, on the existing row and on `excluded`; the
+    /// `SET` columns were already retargeted at the base table.
     pub(crate) fn resolve_on_conflict(
         &self,
         table: &str,
         oc: &OnConflict,
         alias: Option<&str>,
+        vw: Option<&ViewWrite>,
         ptypes: &mut ParamTypes,
     ) -> Result<ConflictPlan> {
         let tdef = self.table(table).ok_or_else(|| {
@@ -1805,7 +1817,12 @@ impl Engine {
                 format!("table does not exist: {table}"),
             )
         })?;
-        let arbiter = resolve_arbiter(tdef, oc.target.as_ref())?;
+        let arbiter = match vw {
+            Some(vw) => {
+                resolve_arbiter(tdef, vw.conflict_target(tdef, oc.target.as_ref())?.as_ref())?
+            }
+            None => resolve_arbiter(tdef, oc.target.as_ref())?,
+        };
         let action = match &oc.action {
             ConflictAction::DoNothing => ConflictActionPlan::DoNothing,
             ConflictAction::DoUpdate {
@@ -1819,7 +1836,7 @@ impl Engine {
                         "ON CONFLICT DO UPDATE requires inference specification or constraint name",
                     ));
                 }
-                let scope = Scope::on_conflict_excluded(self, tdef, alias);
+                let scope = Scope::on_conflict_excluded(self, tdef, vw, alias);
                 let pk_members = tdef.pk_indices();
                 // SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once,
                 // exactly as standalone UPDATE does (constraints.md §2): a constant/no default
@@ -1969,6 +1986,8 @@ impl Engine {
     /// inserts + updates are then validated against the statement END STATE (PK / unique / CHECK
     /// / FK) before phase 2 writes anything (all-or-nothing). `returning` projects the AFFECTED
     /// rows (inserts with an all-NULL old side, updates with their pre-update existing row).
+    /// `view_checks` are the check-option checks of an INSERT through a view (views.md §15.6/§15.7),
+    /// evaluated on each row inserted or updated, as phase 1 decides it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_rows_on_conflict(
         &mut self,
@@ -1977,6 +1996,7 @@ impl Engine {
         columns: &[Column],
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
+        view_checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
         provided: &[Option<usize>],
@@ -2019,6 +2039,21 @@ impl Engine {
         // duplicate is skipped (the arbiter path uses `proposed_arbiter` instead).
         let mut ins_pk: HashSet<Vec<u8>> = HashSet::new();
         let mut ins_prefixes: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); uniq_idx.len()];
+        // The check option of an INSERT through a view (views.md §15.7): each row phase 1 decides to
+        // insert, and each updated row, right after its CHECK constraints and the conflict decision.
+        // A row DO NOTHING skips, or that a DO UPDATE WHERE leaves alone, is not checked. (A view's
+        // WHERE reads no parameter or statement CTE, as in `insert_rows`.)
+        let view_check = |row: &Row, meter: &mut Meter| -> Result<()> {
+            let env = EvalEnv {
+                exec: self,
+                params: &[],
+                outer: &[],
+                rng,
+                ctes: CteCtx::empty(),
+                host_batch: None,
+            };
+            eval_view_checks(view_checks, row, &env, meter)
+        };
 
         for values in &rows {
             // Build + coerce the candidate row, then CHECK — the INSERT per-row order
@@ -2066,6 +2101,7 @@ impl Engine {
                             ins_prefixes[u].insert(p);
                         }
                     }
+                    view_check(&row, meter)?;
                     inserts.push(row);
                 }
                 // Arbiter present (DO UPDATE always; DO NOTHING with a target).
@@ -2074,6 +2110,7 @@ impl Engine {
                         self.arbiter_probe_key(arb, pk, &col_types, &colls, &rindexes, &row)?
                     else {
                         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
+                        view_check(&row, meter)?;
                         inserts.push(row);
                         continue;
                     };
@@ -2093,7 +2130,10 @@ impl Engine {
                     match self.arbiter_existing(arb, table, &indexes, &ak)? {
                         // No committed conflict on the arbiter → insert (a non-arbiter conflict is
                         // caught by the end-state validation below).
-                        None => inserts.push(row),
+                        None => {
+                            view_check(&row, meter)?;
+                            inserts.push(row);
+                        }
                         Some((ekey, erow)) => match &plan.action {
                             ConflictActionPlan::DoNothing => continue, // skip
                             ConflictActionPlan::DoUpdate {
@@ -2140,6 +2180,7 @@ impl Engine {
                                     );
                                 }
                                 self.eval_checks(checks, &new_row, rng, &relation, meter)?;
+                                view_check(&new_row, meter)?;
                                 updates.push((ekey, new_row, erow));
                             }
                         },
@@ -2639,6 +2680,7 @@ impl Engine {
                 columns,
                 pk,
                 checks,
+                view_checks,
                 default_exprs,
                 rng,
                 provided,

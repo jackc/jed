@@ -1,0 +1,394 @@
+# INSERT … ON CONFLICT through an automatically updatable view (spec/design/views.md §15.7). The
+# clause is rewritten onto the base table: the conflict target's columns are view columns, each
+# mapped to its base column (a read-only column matches no unique index: 42P10; ON CONSTRAINT names
+# no constraint of the view: 42704). DO UPDATE SET assigns view columns (a read-only one is 0A000,
+# `= DEFAULT` the view column's default, NULL); its SET and WHERE read the existing row through the
+# view's columns, and `excluded` exposes the view's columns over the proposed row. The view's WHERE
+# does not limit which existing row the conflict path updates, but a check option applies to every
+# row inserted or updated. RETURNING projects the view's columns. Every record here is
+# PostgreSQL-oracle-checked; jed-only behavior (privileges, cost, divergences) lives in
+# view_write_jed.test.
+# requires: ddl.view, dml.view_write, dml.view_on_conflict, dml.view_check_option, ddl.create_table, ddl.primary_key, ddl.unique, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.insert_on_conflict, dml.insert_on_conflict_default, dml.insert_alias, dml.returning, dml.returning_old_new, query.select, query.select_star, query.where_eq, query.order_by, query.table_alias, query.table_column_alias, query.subquery_scalar, query.subquery_correlated, query.cte, query.cte_data_modifying, query.aggregates, expr.arithmetic, null.three_valued, types.i32, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b i32 DEFAULT 7, c i32 DEFAULT 9, u i32 UNIQUE, note text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 5, 100, 'one'), (2, 20, -1, 200, 'two')
+
+# bb renames b, cc is read-only, uu renames u; the view hides `note` and rows with c <= 0.
+statement ok
+CREATE VIEW v AS SELECT id, b AS bb, c + 1 AS cc, u AS uu FROM t WHERE c > 0
+
+# --- DO UPDATE -------------------------------------------------------------------------------------
+
+# The arbiter is the view column id (the primary key). SET assigns bb; its RHS reads the existing
+# row's read-only cc (c + 1 = 6) and the proposed row's bb.
+query IIII nosort
+INSERT INTO v (id, bb) VALUES (1, 100) ON CONFLICT (id) DO UPDATE SET bb = excluded.bb + v.cc RETURNING *
+----
+1
+106
+6
+100
+
+# excluded.cc is the read-only column over the proposed row, whose c takes its default (9 + 1).
+query IIII nosort
+INSERT INTO v (id, bb) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET bb = excluded.cc RETURNING id, bb, old.bb, new.cc
+----
+1
+10
+106
+6
+
+# The view's WHERE does not limit the conflict path: row 2 (c = -1) is hidden yet updated.
+query IIII nosort
+INSERT INTO v (id, bb) VALUES (2, 21) ON CONFLICT (id) DO UPDATE SET bb = excluded.bb RETURNING *
+----
+2
+21
+0
+200
+
+# A DO UPDATE WHERE reads view columns: false on the existing row skips the update.
+query IIII nosort
+INSERT INTO v (id, bb) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET bb = 6 WHERE v.cc > 100 RETURNING *
+----
+
+query IIII nosort
+INSERT INTO v (id, bb) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET bb = 6 WHERE excluded.cc = 10 AND v.uu = 100 RETURNING *
+----
+1
+6
+6
+100
+
+# The arbiter may be a renamed column (uu → u's UNIQUE constraint), in any order of a column set.
+query IIII rowsort
+INSERT INTO v (id, bb, uu) VALUES (5, 50, 100), (6, 60, 600) ON CONFLICT (uu) DO UPDATE SET bb = excluded.bb RETURNING *
+----
+1
+50
+6
+100
+6
+60
+10
+600
+
+# SET bb = DEFAULT assigns the view column's default, which is NULL (the base default 7 is not used).
+query IIII nosort
+INSERT INTO v (id) VALUES (6) ON CONFLICT (id) DO UPDATE SET bb = DEFAULT RETURNING *
+----
+6
+NULL
+10
+600
+
+# A correlated subquery in SET reads the existing row's view columns.
+query II nosort
+INSERT INTO v (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET bb = (SELECT count(*) FROM t AS s WHERE s.u < v.uu) + v.cc RETURNING id, bb
+----
+1
+6
+
+# INSERT … SELECT as the source.
+query IIII rowsort
+INSERT INTO v (id, bb) SELECT id, b + 1000 FROM t WHERE id IN (1, 2) ON CONFLICT (id) DO UPDATE SET bb = excluded.bb RETURNING *
+----
+1
+1006
+6
+100
+2
+1021
+0
+200
+
+# The target alias labels the view's columns.
+query II nosort
+INSERT INTO v AS x (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET bb = x.bb + excluded.bb RETURNING x.id, x.bb
+----
+1
+1007
+
+# Hidden base columns are untouched; omitted ones of an inserted row take their defaults.
+query IIIIT rowsort
+SELECT * FROM t
+----
+1
+1007
+5
+100
+one
+2
+1021
+-1
+200
+two
+6
+NULL
+9
+600
+NULL
+
+# --- DO NOTHING ------------------------------------------------------------------------------------
+
+query IIII rowsort
+INSERT INTO v (id, bb, uu) VALUES (1, 0, 0), (7, 70, 700) ON CONFLICT (id) DO NOTHING RETURNING *
+----
+7
+70
+10
+700
+
+query IIII rowsort
+INSERT INTO v (id, bb, uu) VALUES (8, 0, 700), (9, 90, 900) ON CONFLICT (uu) DO NOTHING RETURNING *
+----
+9
+90
+10
+900
+
+query IIII rowsort
+INSERT INTO v (id, bb, uu) VALUES (9, 0, 0), (10, 0, 100), (11, 110, 1100) ON CONFLICT DO NOTHING RETURNING *
+----
+11
+110
+10
+1100
+
+# --- errors ----------------------------------------------------------------------------------------
+
+# A second proposed row with the same arbiter key.
+statement error 21000
+INSERT INTO v (id, bb) VALUES (1, 1), (1, 2) ON CONFLICT (id) DO UPDATE SET bb = excluded.bb
+
+# A view has no constraints.
+statement error 42704
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING
+
+statement error 42704
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT ON CONSTRAINT t_u_key DO UPDATE SET bb = 1
+
+# An arbiter column the view does not have, by any name.
+statement error 42703
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (zz) DO NOTHING
+
+statement error 42703
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (u) DO NOTHING
+
+# A read-only arbiter column is an expression, which no unique constraint matches.
+statement error 42P10
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (cc) DO NOTHING
+
+statement error 42P10
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id, cc) DO UPDATE SET bb = 1
+
+# SET names view columns: an unknown or hidden one is 42703, a read-only one 0A000.
+statement error 42703
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET zz = 1
+
+statement error 42703
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET note = 'x'
+
+statement error 0A000
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET cc = 1
+
+statement error 0A000
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET cc = DEFAULT
+
+# excluded and the target expose only the view's columns; the base table is not in scope.
+statement error 42703
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET bb = excluded.c
+
+statement error 42703
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET bb = v.note
+
+statement error 42P01
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET bb = t.b
+
+# DO UPDATE without a target.
+statement error 42601
+INSERT INTO v (id, bb) VALUES (1, 1) ON CONFLICT DO UPDATE SET bb = 1
+
+# A view that is not updatable.
+statement ok
+CREATE VIEW vg AS SELECT b, count(*) AS n FROM t GROUP BY b
+
+statement error 55000
+INSERT INTO vg (b) VALUES (1) ON CONFLICT DO NOTHING
+
+# Nothing was written by the failed statements.
+query IIII rowsort
+SELECT id, b, c, u FROM t
+----
+1
+1007
+5
+100
+11
+110
+9
+1100
+2
+1021
+-1
+200
+6
+NULL
+9
+600
+7
+70
+9
+700
+9
+90
+9
+900
+
+# --- chains of views -------------------------------------------------------------------------------
+
+# w renames v's columns through a column alias list and outputs only some of them.
+statement ok
+CREATE VIEW w AS SELECT k, x + 1 AS x1, x FROM v AS q (k, x) WHERE x < 5000
+
+query III nosort
+INSERT INTO w (k, x) VALUES (2, 3) ON CONFLICT (k) DO UPDATE SET x = excluded.x1 + w.x1 RETURNING *
+----
+2
+1027
+1026
+
+statement error 0A000
+INSERT INTO w (k, x) VALUES (2, 3) ON CONFLICT (k) DO UPDATE SET x1 = 1
+
+statement error 42703
+INSERT INTO w (k, x) VALUES (2, 3) ON CONFLICT (bb) DO NOTHING
+
+statement error 42P10
+INSERT INTO w (k, x) VALUES (2, 3) ON CONFLICT (x1) DO NOTHING
+
+# --- writable CTE ----------------------------------------------------------------------------------
+
+query II nosort
+WITH up AS (INSERT INTO v (id, bb) VALUES (7, 77) ON CONFLICT (id) DO UPDATE SET bb = v.bb + excluded.bb RETURNING id, bb) SELECT * FROM up
+----
+7
+147
+
+# --- WITH CHECK OPTION -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE k (id i32 PRIMARY KEY, a i32, c i32 DEFAULT 1)
+
+statement ok
+INSERT INTO k VALUES (1, 10, 1), (2, -20, 2), (3, 30, -3)
+
+statement ok
+CREATE VIEW kv AS SELECT id, a, c FROM k WHERE a > 0 WITH CHECK OPTION
+
+# The updated row must pass: a = -1 fails.
+statement error 44000
+INSERT INTO kv VALUES (1, 1, 1) ON CONFLICT (id) DO UPDATE SET a = -1
+
+# A hidden existing row (a = -20) is updated to a row the view shows.
+query III nosort
+INSERT INTO kv VALUES (2, 1, 1) ON CONFLICT (id) DO UPDATE SET a = 5 RETURNING *
+----
+2
+5
+2
+
+# The proposed row would fail, but it conflicts: the updated row is what is checked.
+query III nosort
+INSERT INTO kv VALUES (1, -1, 1) ON CONFLICT (id) DO UPDATE SET a = 11 RETURNING *
+----
+1
+11
+1
+
+# A skipped proposed row is not checked.
+query III nosort
+INSERT INTO kv VALUES (1, -1, 1) ON CONFLICT (id) DO NOTHING RETURNING *
+----
+
+query III nosort
+INSERT INTO kv VALUES (1, -1, 1) ON CONFLICT DO NOTHING RETURNING *
+----
+
+query III nosort
+INSERT INTO kv VALUES (1, -1, 1) ON CONFLICT (id) DO UPDATE SET a = -5 WHERE false RETURNING *
+----
+
+# A proposed row that is inserted is checked.
+statement error 44000
+INSERT INTO kv VALUES (4, -4, 4) ON CONFLICT (id) DO NOTHING
+
+statement error 44000
+INSERT INTO kv VALUES (4, -4, 4) ON CONFLICT DO NOTHING
+
+statement error 44000
+INSERT INTO kv VALUES (4, NULL, 4) ON CONFLICT (id) DO UPDATE SET a = 1
+
+# One statement inserting and updating: every affected row passes.
+query III rowsort
+INSERT INTO kv VALUES (1, 12, 0), (4, 4, 4) ON CONFLICT (id) DO UPDATE SET a = excluded.a + kv.a RETURNING *
+----
+1
+23
+1
+4
+4
+4
+
+# The failure of a later row undoes the whole statement.
+statement error 44000
+INSERT INTO kv VALUES (5, 5, 5), (1, 1, 1) ON CONFLICT (id) DO UPDATE SET a = 0
+
+# LOCAL checks only its own WHERE and those of checked views below; CASCADED checks every view below.
+statement ok
+CREATE VIEW kc AS SELECT id, a, c FROM k WHERE c > 0
+
+statement ok
+CREATE VIEW kl AS SELECT id, a, c FROM kc WHERE a < 100 WITH LOCAL CHECK OPTION
+
+statement ok
+CREATE VIEW kcc AS SELECT id, a, c FROM kc WHERE a < 100 WITH CASCADED CHECK OPTION
+
+query III nosort
+INSERT INTO kl VALUES (3, 0, 0) ON CONFLICT (id) DO UPDATE SET c = -30 RETURNING *
+----
+3
+30
+-30
+
+statement error 44000
+INSERT INTO kl VALUES (3, 0, 0) ON CONFLICT (id) DO UPDATE SET a = 300
+
+statement error 44000
+INSERT INTO kcc VALUES (3, 0, 0) ON CONFLICT (id) DO UPDATE SET c = -31
+
+query III nosort
+INSERT INTO kcc VALUES (3, 0, 0) ON CONFLICT (id) DO UPDATE SET c = 3 RETURNING *
+----
+3
+30
+3
+
+query III rowsort
+SELECT * FROM k
+----
+1
+23
+1
+2
+5
+2
+3
+30
+3
+4
+4
+4

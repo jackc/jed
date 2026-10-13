@@ -42,6 +42,9 @@ conflict_action ::= DO NOTHING
 - An optional **`AS alias`** on the target renames it: the alias replaces the table's name as
   the qualifier for the existing row (and in `RETURNING`), and the table's own name is then no
   longer visible (§5).
+- The target may be an automatically updatable **view**: the clause is then the base table's, with
+  the conflict target, `SET` columns, the existing row, and `excluded` all written in the view's
+  columns ([views.md](views.md) §15.7).
 
 ## 2. The arbiter (conflict target) and which conflicts it covers
 

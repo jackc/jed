@@ -898,6 +898,7 @@ var SupportedCapabilities = []string{
 	"ddl.view_alter",
 	"dml.view_write",
 	"dml.view_check_option",
+	"dml.view_on_conflict",
 	"ddl.view_cascade",
 }
 

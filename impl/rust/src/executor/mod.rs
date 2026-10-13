@@ -2079,15 +2079,17 @@ impl<'a> Scope<'a> {
     /// QUALIFIER-ONLY relation at offset `n` over the combined row `[existing | proposed]`
     /// (`excluded.col` reads the proposed row). A target labeled `excluded` (a table so named, or
     /// `AS excluded`) keeps BOTH relations under the one label, so `excluded.col` is `42P09`
-    /// (PostgreSQL's rule — `resolve_qualified`).
+    /// (PostgreSQL's rule — `resolve_qualified`). For an INSERT through a view (`vw`, views.md
+    /// §15.7) both relations expose the view's columns over their halves of the combined row.
     fn on_conflict_excluded(
         catalog: &'a Engine,
         table: &'a Table,
+        vw: Option<&'a ViewWrite>,
         alias: Option<&str>,
     ) -> Scope<'a> {
         let n = table.columns.len();
         let rels = vec![
-            Scope::target_rel(table, None, alias),
+            Scope::target_rel(table, vw, alias),
             ScopeRel {
                 label: "excluded".to_string(),
                 table,
@@ -2097,7 +2099,7 @@ impl<'a> Scope<'a> {
                 base: false,
                 cte: None,
                 db: None,
-                layer: None,
+                layer: vw.map(|vw| &vw.top),
             },
         ];
         Scope {

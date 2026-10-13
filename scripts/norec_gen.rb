@@ -125,9 +125,10 @@
 #              table, an aggregate body, and a column alias list over the reference. Expected rows
 #              by construction; view_plan.test pins the matching cost and EXPLAIN.
 #   view_write — a write through an updatable view IS a write to its base table (spec/design/
-#              views.md §15): UPDATE / DELETE / INSERT through a view (and a view over it) and the
-#              same writes on an identically seeded table, with the views' conditions and read-only
-#              columns inlined, must return the same RETURNING rows and leave the same contents.
+#              views.md §15): UPDATE / DELETE / INSERT / INSERT … ON CONFLICT through a view (and a
+#              view over it) and the same writes on an identically seeded table, with the views'
+#              conditions and read-only columns inlined, must return the same RETURNING rows and
+#              leave the same contents.
 #              Expected rows by construction; view_write_jed.test pins cost and EXPLAIN.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
@@ -407,8 +408,9 @@ VIEW_REQ = %w[ddl.view ddl.create_table ddl.primary_key dml.insert dml.insert_mu
               query.group_by query.is_null query.is_distinct_from query.derived_table
               query.derived_pushdown query.table_alias expr.arithmetic expr.between
               expr.comparison_value null.three_valued types.i32].freeze
-VIEW_WRITE_REQ = %w[ddl.view dml.view_write ddl.create_table ddl.primary_key dml.insert
-                    dml.insert_multi_row dml.insert_column_list dml.update dml.delete dml.returning
+VIEW_WRITE_REQ = %w[ddl.view dml.view_write dml.view_on_conflict ddl.create_table ddl.primary_key
+                    dml.insert dml.insert_multi_row dml.insert_column_list dml.insert_on_conflict
+                    dml.update dml.delete dml.returning
                     query.select query.where_eq query.comparison_order query.logical_connectives
                     query.order_by query.is_null query.is_distinct_from expr.arithmetic expr.between
                     expr.comparison_value null.three_valued types.i32].freeze
@@ -3275,6 +3277,37 @@ def gen_view_write(seed)
   pair.call(out, "II", "INSERT INTO wv (id, k, v) VALUES #{values} RETURNING id, s",
             "INSERT INTO bt (id, k, v) VALUES #{values} RETURNING id, v + k",
             fresh.map { |id, k, v| [id, plus.call(v, k)] })
+
+  # INSERT … ON CONFLICT through a view (views.md §15.7): the arbiter, SET, and WHERE name view
+  # columns, `excluded.s` is the read-only column over the proposed row, and the view's WHERE does
+  # not limit which existing row is updated. Proposed ids mix existing and new ones.
+  bound = rng.rand(0..12)
+  proposed = (1..45).to_a.sample(5, random: rng).sort.map { |id| [id, rng.rand(1..5), val.call] }
+  values = proposed.map { |id, k, v| "(#{id}, #{k}, #{lit.call(v)})" }.join(", ")
+  affected = []
+  proposed.each do |id, k, v|
+    at = rows.index { |r| r[0] == id }
+    if at.nil?
+      rows << [id, k, v]
+      affected << [id, plus.call(v, k)]
+      next
+    end
+    _, ek, ev = rows[at]
+    es = plus.call(ev, ek)
+    next unless !es.nil? && es > bound
+
+    nv = plus.call(plus.call(v, k), ev)
+    rows[at] = [id, ek, nv]
+    affected << [id, plus.call(nv, ek)]
+  end
+  rows = rows.sort_by(&:first)
+  out << "# INSERT … ON CONFLICT through a view"
+  pair.call(out, "II",
+            "INSERT INTO wv (id, k, v) VALUES #{values} ON CONFLICT (id) DO UPDATE SET v = excluded.s + wv.v " \
+            "WHERE wv.s > #{bound} RETURNING id, s",
+            "INSERT INTO bt (id, k, v) VALUES #{values} ON CONFLICT (id) DO UPDATE SET v = (excluded.v + excluded.k) + bt.v " \
+            "WHERE (bt.v + bt.k) > #{bound} RETURNING id, v + k",
+            affected)
 
   out << "# both tables reach the same contents"
   %w[vt bt].each do |name|

@@ -159,7 +159,7 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 | `INSERT INTO v` | writes the base relation if `v` is updatable (§15), else `55000` *cannot insert into view "v"* | same |
 | `UPDATE v` | writes the base relation if `v` is updatable, else `55000` *cannot update view "v"* | same |
 | `DELETE FROM v` | writes the base relation if `v` is updatable, else `55000` *cannot delete from view "v"* | same |
-| `INSERT INTO v … ON CONFLICT` | `55000` if `v` is not updatable, else `0A000` (§15.2) | PG supports it on an updatable view |
+| `INSERT INTO v … ON CONFLICT` | the base table's `ON CONFLICT` if `v` is updatable (§15.7), else `55000` | same |
 | A writable CTE targeting `v` | as the statement it holds | same |
 | `CREATE INDEX … ON v` | `42809` *cannot create index on relation "v"* | same |
 | `REFERENCES v` (a foreign-key parent) | `42809` *referenced relation "v" is not a table* | same |
@@ -615,7 +615,8 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | A write to a view that is not updatable is `55000` before any column or expression error; PG reports its parse-analysis errors (`42703`, `42601`, a bad literal) first | updatability is checked when the target resolves (§15.3) |
 | Assigning a read-only view column is `0A000` before the statement's expressions are resolved; PG reports it after them | the check belongs to the target columns (§15.3) |
 | Two view columns that reach the same base column, assigned together, are `42701`; PG says `42601` | jed's duplicate-assignment code for tables (`UPDATE t SET a = 1, a = 2`) |
-| `INSERT … ON CONFLICT` on an updatable view is `0A000`; PG supports it | a follow-on (§15.2) |
+| `ON CONFLICT (c)` naming a read-only view column is `42P10` even when a unique expression index matches its select item; PG infers that index | a conflict target's column list matches column-list unique indexes only ([upsert.md](upsert.md) §2), on a table too |
+| In an `INSERT … ON CONFLICT` through a view with a check option, a row that fails the check option, or one that follows it, reports `44000` where PG reports a `23505` for a non-arbiter `UNIQUE` or primary-key conflict of the same or an earlier row | the conflict path checks non-arbiter uniqueness over the statement's end state ([upsert.md](upsert.md) §3), so its check option runs as each row is decided (§15.7) |
 | A row that violates both an `EXCLUDE` constraint and a check option is `44000`; PG reports `23P01` | jed checks `EXCLUDE` over the statement's end state, after the check option (§15.6) |
 | An `UPDATE` in which one row fails a check option and a later row fails a `CHECK`, primary-key, or `UNIQUE` check reports the later failure; PG reports `44000` for the earlier row | jed's `UPDATE` checks keys over its end state, so its check option is a pass over the new rows after those checks (§15.6) |
 | A write through a view checks only the writer's privilege on the view; PG also checks the view owner's privilege on the base relation | jed has no persistent owners, and the session that creates a view already holds `allow_ddl`, which is trusted schema authority (§15.4) |
@@ -643,7 +644,6 @@ Deferred follow-ons, none foreclosed:
   them, §15.2), `SET` / `RESET` view options;
 - `WITH (options)`, including `WITH (check_option = …)` and `ALTER VIEW … SET (check_option = …)`
   (`0A000`; the `WITH … CHECK OPTION` clause is the supported spelling, §15.6);
-- `INSERT … ON CONFLICT` on an updatable view (`0A000`, §15.2);
 - `INSTEAD OF` behavior for views that are not automatically updatable (jed has no triggers or
   rules);
 - an updatability column in `jed_views` (PostgreSQL's `information_schema.views.is_updatable`);
@@ -697,10 +697,13 @@ Deferred follow-ons, none foreclosed:
 9. **V9 — `WITH [CASCADED | LOCAL] CHECK OPTION`** (§15.6): the clause, its `0A000` on a view that
    is not updatable, the `format_version` 39 view entry, `jed_views.check_option`, the dump, and
    the `44000` check on `INSERT` and `UPDATE` through a view.
+10. **V10 — `INSERT … ON CONFLICT` through an updatable view** (§15.7): the conflict target mapped
+    through the view, `DO UPDATE` in the view's columns on the existing row and on `excluded`, and
+    the check option on every inserted and updated row.
 
 Capabilities: `ddl.view` (V1), `ddl.view_rename` (V2 + V4), `query.table_column_alias` (V3),
 `introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6), `dml.view_write` (V7),
-`ddl.view_cascade` (V8), `dml.view_check_option` (V9).
+`ddl.view_cascade` (V8), `dml.view_check_option` (V9), `dml.view_on_conflict` (V10).
 
 ## 15. Writing through a view
 
@@ -795,9 +798,8 @@ view nearest the table first, then the statement's `p`: `(w₁ AND w₂) AND p`.
 transaction and access-mode checks (`25006`), and error messages, which name `b` and its columns. A
 writable CTE may target an updatable view, with the same meaning.
 
-**`ON CONFLICT`.** `INSERT INTO v … ON CONFLICT` is `0A000` (*ON CONFLICT on a view is not supported
-yet*) when `v` is updatable, and `55000` when it is not. PostgreSQL supports it; it is a follow-on
-(§12).
+**`ON CONFLICT`.** `INSERT INTO v … ON CONFLICT` is the base statement's `ON CONFLICT`, written in
+`v`'s columns (§15.7).
 
 ### 15.3 Validation order
 
@@ -806,24 +808,25 @@ yet*) when `v` is updatable, and `55000` when it is not. PostgreSQL supports it;
    database qualifier.
 2. The target view is updatable for the statement's kind (§15.1), else **`55000`** (*cannot insert
    into view "v"*, *cannot update view "v"*, *cannot delete from view "v"*).
-3. `ON CONFLICT` is `0A000` (§15.2).
-4. The view is planned as a read of it at the statement's top level would plan it (§4, §4.1): an
+3. The view is planned as a read of it at the statement's top level would plan it (§4, §4.1): an
    error in its body or in a view it reads, or the nesting and expansion limits (`54001`).
-5. The statement's target columns resolve against `v`'s output columns, with the rules and codes of
+4. The statement's target columns resolve against `v`'s output columns, with the rules and codes of
    a table target: an unknown column is `42703`, and a column listed twice in `INSERT` or assigned
    twice in `UPDATE` is `42701`. (An `INSERT` source whose arity differs from its targets is `42601`
-   where the table path checks it, which is later.)
-6. For each view from `v` down the chain:
+   where the table path checks it, which is later.) An `ON CONFLICT DO UPDATE`'s `SET` columns are
+   targets too, resolved after the `INSERT`'s own the same way (§15.7).
+5. For each view from `v` down the chain:
    1. a view after the first must be updatable for the statement's kind (`55000`, naming it);
    2. for `INSERT` and `UPDATE`, every target column of the view must be updatable, else **`0A000`**
       (*cannot insert into column "c" of view "v"*, *cannot update column "c" of view "v"*), naming
       the first read-only target in the view's column order. A `DEFAULT` slot or `SET c = DEFAULT`
-      still targets `c`.
+      still targets `c`. An `INSERT`'s `ON CONFLICT DO UPDATE` `SET` targets are checked together
+      with its own targets, under the `insert into` message (PostgreSQL's).
 
    The targets then map to the base relation's columns.
-7. Two targets that reach the same column of the table are `42701` (*column "a" assigned more than
-   once*).
-8. The equivalent base statement's own validation follows in its existing order: identity
+6. Two targets that reach the same column of the table are `42701` (*column "a" assigned more than
+   once*): two of the statement's targets, or two `ON CONFLICT DO UPDATE` `SET` targets.
+7. The equivalent base statement's own validation follows in its existing order: identity
    (`428C9`), the `SET`, `VALUES`, `WHERE`, and `RETURNING` expressions, types, and then execution.
 
 ### 15.4 Privileges
@@ -910,4 +913,54 @@ estimate does not include it ([estimator.md](estimator.md) §8.4: check expressi
 fallback). A write through a view with a check option therefore costs its equivalent base statement
 (§15.5) plus the checks.
 
-**`ON CONFLICT`** on a view stays `0A000` (§15.2), so no conflict path is checked.
+**`ON CONFLICT`.** An `INSERT … ON CONFLICT` checks every row it inserts and every row its `DO
+UPDATE` changes, and no row it skips (§15.7).
+
+### 15.7 `INSERT … ON CONFLICT`
+
+`INSERT INTO v … ON CONFLICT` through an updatable view is the equivalent base statement's `ON
+CONFLICT` ([upsert.md](upsert.md)), with every part of the clause written in `v`'s columns, as
+PostgreSQL's rewriter does it. Behavior below was pinned against the PostgreSQL 18 oracle; the
+divergences are in §12.
+
+**The conflict target.** A column list names view columns. Each must be an output column of `v`
+(`42703` otherwise, also for a base column `v` does not output), and maps to its base column through
+the chain. The mapped list then selects the arbiter on the table exactly as on a direct `INSERT`
+([upsert.md](upsert.md) §2). A read-only column maps to its select item, an expression, which no
+column-list unique index matches, so a target naming one is `42P10`. `ON CONSTRAINT name` is always
+`42704` (*constraint name for table v does not exist*): a view has no constraints, and the table's
+are not visible through it. The target resolves where a table's does, after `RETURNING`; every name
+is checked for `42703` before any `42P10`.
+
+**`DO UPDATE SET`** assigns view columns. They are targets of the statement (§15.3 steps 4–6): an
+unknown one is `42703`, a read-only one `0A000` (*cannot insert into column "c" of view "v"*, the
+first read-only target, `INSERT` or `SET`, in the view's column order), the same column twice or two
+columns over one base column `42701`. Each assigns its base column. `SET c = DEFAULT` assigns the view
+column's default, NULL, as `UPDATE` does (§15.2); the base column's default is not used.
+
+**Names in `SET`, `WHERE`, and `RETURNING`.** The existing row is visible under `v`'s name (or the
+`AS` alias) with `v`'s columns, and `excluded` is the proposed row with `v`'s columns. A read-only
+column denotes its select item evaluated on that row (§15.2): `excluded.c` evaluates `c`'s item on the
+proposed row, after its defaults are filled in. Base columns `v` does not output are not visible on
+either (`42703`), nor is the base table's name (`42P01`). `RETURNING` projects `v`'s columns over each
+inserted or updated row, with `old` and `new` as in [upsert.md](upsert.md) §6.
+
+**The view's `WHERE`** is not part of the conflict path, as in PostgreSQL. It does not limit which
+existing row conflicts or is updated: a proposed row that conflicts with a row `v` does not show
+updates that row (or skips it, under `DO NOTHING`). `DO UPDATE WHERE` is the statement's own
+condition only.
+
+**Check option.** With a check option in the chain (§15.6), every row the statement inserts and
+every row its `DO UPDATE` produces is checked, nearest the table first. A proposed row that conflicts
+is not itself checked — under `DO UPDATE` the updated row is checked instead, and a row `DO NOTHING` or
+a false `DO UPDATE WHERE` skips is not checked at all. Phase 1 of the conflict model
+([upsert.md](upsert.md) §3) checks each row as it decides it: an inserted row after its `NOT NULL`
+and `CHECK` checks and the arbiter probe, an updated row after its `NOT NULL` and `CHECK` checks. The
+end-state primary-key, `UNIQUE`, and `FOREIGN KEY` checks follow phase 1, so a check-option failure
+is reported before them (§12).
+
+**Everything else** is the base statement's: the arbiter only arbitrates its own constraint, the
+second-affect rule (`21000`), the `DO UPDATE` narrowings (a primary-key or container column is
+`0A000`), two-phase validation, privileges checked on `v` exactly as on a table (§15.4), and cost: no charge for the view, so a statement without a
+check option costs its equivalent base statement, and a check option adds its `WHERE` evaluations
+(§15.6). `EXPLAIN` renders the base statement (`Insert t`). A writable CTE may hold the statement.

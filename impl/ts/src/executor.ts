@@ -507,6 +507,7 @@ import {
   checkOptionViolation,
   columnRefPosition,
   renamedNames,
+  viewConflictTarget,
   viewsBottomUp,
   writeVerb,
 } from "./view_write.ts";
@@ -10372,7 +10373,7 @@ export class Engine {
           ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw, ins.alias)
           : null;
       const cplan =
-        ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, ptypes) : null;
+        ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes) : null;
       const bound = bindParams(params, ptypes.finalize(), this.inputZone());
       const meter = this.session.newMeter();
       const foldCost = { value: 0n };
@@ -10512,7 +10513,7 @@ export class Engine {
         ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw, ins.alias)
         : null;
     const cplan =
-      ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, ptypes) : null;
+      ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
 
     // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
@@ -11080,14 +11081,18 @@ export class Engine {
   // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
   // ConflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
   // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
-  // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
+  // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT. For an INSERT
+  // through an updatable view (vw, views.md §15.7) the target maps through the view and the scope
+  // exposes the view's columns, on the existing row and on `excluded`; the SET columns were already
+  // retargeted at the base table.
   private resolveOnConflict(
     table: Table,
     oc: OnConflict,
     alias: string | undefined,
+    vw: ViewWrite | null,
     ptypes: ParamTypes,
   ): ConflictPlan {
-    const arb = resolveArbiter(table, oc.target);
+    const arb = resolveArbiter(table, vw === null ? oc.target : viewConflictTarget(vw, table, oc.target));
     if (!oc.doUpdate) {
       return { arb, doUpdate: false, assignments: [], filter: null };
     }
@@ -11098,7 +11103,7 @@ export class Engine {
         "ON CONFLICT DO UPDATE requires inference specification or constraint name",
       );
     }
-    const scope = Scope.onConflictExcluded(this, table, alias);
+    const scope = Scope.onConflictExcluded(this, table, vw, alias);
     const pkMembers = pkIndices(table);
     // SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once, exactly as
     // standalone UPDATE does (constraints.md §2): a constant/no default becomes a constant node
@@ -11289,6 +11294,7 @@ export class Engine {
         dbScope,
         pk,
         checks,
+        viewChecks,
         defaultExprs,
         rng,
         provided,
@@ -11337,6 +11343,7 @@ export class Engine {
     dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
+    viewChecks: ViewCheck[],
     defaultExprs: (RExpr | null)[],
     rng: StmtRng,
     provided: number[],
@@ -11382,6 +11389,13 @@ export class Engine {
       ctes: EMPTY_CTE_CTX,
       exec: this,
     });
+    // The check option of an INSERT through a view (views.md §15.7): each row phase 1 decides to
+    // insert, and each updated row, right after its CHECK constraints and the conflict decision. A
+    // row DO NOTHING skips, or that a DO UPDATE WHERE leaves alone, is not checked. (A view's WHERE
+    // reads no parameter or statement CTE, as in insertRows.)
+    const viewCheck = (row: Row): void => {
+      if (viewChecks.length > 0) evalViewChecks(viewChecks, row, checkEnv(), meter);
+    };
 
     for (const values of rows) {
       // Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL before
@@ -11413,6 +11427,7 @@ export class Engine {
           const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[uniqIdx[u]!]!, row);
           if (prefix !== null) insPrefixes[u]!.add(prefix.join(","));
         }
+        viewCheck(row);
         inserts.push(row);
         continue;
       }
@@ -11421,6 +11436,7 @@ export class Engine {
       const ak = this.arbiterProbeKey(plan.arb, store.columnTypes(), pk, colls, rindexes, row);
       if (ak === null) {
         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
+        viewCheck(row);
         inserts.push(row);
         continue;
       }
@@ -11440,6 +11456,7 @@ export class Engine {
       if (existing === null) {
         // No committed conflict on the arbiter → insert (a non-arbiter conflict is caught by the
         // end-state validation below).
+        viewCheck(row);
         inserts.push(row);
         continue;
       }
@@ -11476,6 +11493,7 @@ export class Engine {
       }
       if (nullCol !== null) throw this.notNullRowViolation(relation, nullCol, newRow);
       if (checks.length > 0) evalChecks(checks, relation, newRow, checkEnv(), meter);
+      viewCheck(newRow);
       updates.push({ key: existing.key, newRow, oldRow: existing.row });
     }
 
@@ -13713,14 +13731,17 @@ export class Engine {
   // 2–6), or returns null when the target is not a view. targets are the statement's target view
   // columns: the INSERT column list (null = every view column) or the UPDATE SET columns, in order;
   // DELETE has none. targetLocs holds each target's source character position, index-aligned
-  // (undefined when unknown), for a 42703 (spec/design/error-fields.md §10.2).
+  // (undefined when unknown), for a 42703 (spec/design/error-fields.md §10.2). conflictSet and
+  // conflictLocs are the same for an INSERT's ON CONFLICT DO UPDATE SET columns (§15.7), empty
+  // otherwise.
   private prepareViewWrite(
     db: string | undefined,
     name: string,
     kind: WriteKind,
-    onConflict: boolean,
     targets: string[] | null,
     targetLocs: (number | undefined)[] = [],
+    conflictSet: string[] = [],
+    conflictLocs: (number | undefined)[] = [],
   ): ViewWrite | null {
     const view = this.dmlTargetView(db, name);
     if (view === undefined) return null;
@@ -13729,14 +13750,10 @@ export class Engine {
       engineError("object_not_in_prerequisite_state", `cannot ${writeVerb(kind)} view "${v}"`);
     // 2. The target view is updatable for the statement's kind (55000).
     if (this.updatableShape(view.body, checkCols) === null) throw notUpdatable(view.name);
-    // 3. ON CONFLICT on a view is a follow-on.
-    if (onConflict) {
-      throw engineError("feature_not_supported", "ON CONFLICT on a view is not supported yet");
-    }
-    // 4. The view is planned as a read of it would be (§4): its body's errors and the nesting and
+    // 3. The view is planned as a read of it would be (§4): its body's errors and the nesting and
     // expansion limits. The plan yields every chain view's output types and collations.
     const metas = this.planWriteTarget(view);
-    // 5. The statement's targets against the view's output columns.
+    // 4. The statement's targets against the view's output columns.
     let cur: number[] = [];
     if (checkCols) {
       if (targets === null) {
@@ -13763,7 +13780,23 @@ export class Engine {
         }
       }
     }
-    // 6. Each view from the target down: updatable, then its target columns.
+    // An ON CONFLICT DO UPDATE's SET columns, after the INSERT's own targets (§15.7).
+    let setCur: number[] = [];
+    for (let i = 0; i < conflictSet.length; i++) {
+      const t = conflictSet[i]!;
+      const idx = view.columns.indexOf(t);
+      if (idx < 0) {
+        throw engineError(
+          "undefined_column",
+          `column ${t} of relation ${view.name} does not exist`,
+        ).withPosition(conflictLocs[i]);
+      }
+      if (setCur.includes(idx)) {
+        throw engineError("duplicate_column", `column ${t} assigned more than once`);
+      }
+      setCur.push(idx);
+    }
+    // 5. Each view from the target down: updatable, then its target columns.
     type Level = { view: ViewDef; rename: string[] | undefined; label: string; cols: LayerCol[]; filter: Expr | null };
     const levels: Level[] = [];
     let levelView = view;
@@ -13787,7 +13820,7 @@ export class Engine {
         return j >= 0 ? { kind: "ref", ref: j } : { kind: "expr", expr: it.expr };
       });
       if (checkCols) {
-        const readOnly = cur.filter((c) => cols[c]!.kind === "expr");
+        const readOnly = cur.concat(setCur).filter((c) => cols[c]!.kind === "expr");
         if (readOnly.length > 0) {
           const first = Math.min(...readOnly);
           const verb = kind === "insert" ? "insert into" : "update";
@@ -13796,7 +13829,9 @@ export class Engine {
             `cannot ${verb} column "${levelView.columns[first]}" of view "${levelView.name}"`,
           );
         }
-        cur = cur.map((c) => (cols[c] as { kind: "ref"; ref: number }).ref);
+        const down = (c: number) => (cols[c] as { kind: "ref"; ref: number }).ref;
+        cur = cur.map(down);
+        setCur = setCur.map(down);
       }
       levels.push({ view: levelView, rename, label, cols, filter: sel.filter });
       if (base !== undefined) {
@@ -13807,12 +13842,15 @@ export class Engine {
       levelView = snap.view(tref.name)!;
       rename = tref.columnAliases;
     }
-    // 7. Two targets that reach the same table column (42701).
-    cur.forEach((c, i) => {
-      if (cur.slice(0, i).includes(c)) {
-        throw engineError("duplicate_column", `column ${table.columns[c]!.name} assigned more than once`);
-      }
-    });
+    // 6. Two targets that reach the same table column (42701): among the statement's targets, then
+    // among the ON CONFLICT SET targets.
+    for (const list of [cur, setCur]) {
+      list.forEach((c, i) => {
+        if (list.slice(0, i).includes(c)) {
+          throw engineError("duplicate_column", `column ${table.columns[c]!.name} assigned more than once`);
+        }
+      });
+    }
     // Build the layers bottom-up: the table, then each view.
     const tableCols = table.columns.map((c, i) =>
       tableRename !== undefined && i < tableRename.length ? { ...c, name: tableRename[i]! } : c,
@@ -13846,6 +13884,7 @@ export class Engine {
       table: table.name,
       top: layer,
       targets: cur.map((c) => table.columns[c]!.name),
+      conflictSet: setCur.map((c) => table.columns[c]!.name),
     };
   }
 
@@ -13914,21 +13953,34 @@ export class Engine {
   }
 
   // rewriteInsertTarget retargets an INSERT through an updatable view at its base table (views.md
-  // §15.2): the column list becomes the base columns the view's targets map to. It returns a copy of
-  // the statement (the written one is left intact) and the write, or the statement unchanged and null
-  // when the target is not a view.
+  // §15.2): the column list becomes the base columns the view's targets map to. An ON CONFLICT DO
+  // UPDATE's SET columns map the same way, and `SET c = DEFAULT` assigns the view column's default,
+  // which is NULL, as in UPDATE (§15.7). The conflict target maps when the clause is resolved
+  // (viewConflictTarget). It returns a copy of the statement (the written one is left intact) and
+  // the write, or the statement unchanged and null when the target is not a view.
   rewriteInsertTarget(ins: Insert): { ins: Insert; vw: ViewWrite | null } {
+    const set = ins.onConflict !== null && ins.onConflict.doUpdate ? ins.onConflict.assignments : [];
     const vw = this.prepareViewWrite(
       ins.db,
       ins.table,
       "insert",
-      ins.onConflict !== null,
       ins.columns,
       ins.columnLocs,
+      set.map((a) => a.column),
+      set.map((a) => a.loc),
     );
     if (vw === null) return { ins, vw };
     const { db: _db, ...rest } = ins;
-    return { ins: { ...rest, table: vw.table, columns: vw.targets.slice() }, vw };
+    let onConflict = ins.onConflict;
+    if (onConflict !== null && onConflict.doUpdate) {
+      const assignments = onConflict.assignments.map((a, i) =>
+        a.isDefault
+          ? { column: vw.conflictSet[i]!, isDefault: false, value: { kind: "literal", literal: { kind: "null" } } as Expr }
+          : { ...a, column: vw.conflictSet[i]! },
+      );
+      onConflict = { ...onConflict, assignments };
+    }
+    return { ins: { ...rest, table: vw.table, columns: vw.targets.slice(), onConflict }, vw };
   }
 
   // rewriteUpdateTarget retargets an UPDATE through an updatable view at its base table (views.md
@@ -13939,7 +13991,6 @@ export class Engine {
       upd.db,
       upd.table,
       "update",
-      false,
       upd.assignments.map((a) => a.column),
       upd.assignments.map((a) => a.loc),
     );
@@ -13956,7 +14007,7 @@ export class Engine {
   // rewriteDeleteTarget retargets a DELETE through an updatable view at its base table (views.md
   // §15.2).
   rewriteDeleteTarget(del: Delete): { del: Delete; vw: ViewWrite | null } {
-    const vw = this.prepareViewWrite(del.db, del.table, "delete", false, null);
+    const vw = this.prepareViewWrite(del.db, del.table, "delete", null);
     if (vw === null) return { del, vw };
     const { db: _db, ...rest } = del;
     return { del: { ...rest, table: vw.table }, vw };

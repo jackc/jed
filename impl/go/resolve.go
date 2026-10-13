@@ -258,13 +258,15 @@ func targetRel(t *catTable, vw *viewWrite, alias *string) scopeRel {
 // `excluded` as a QUALIFIER-ONLY relation at offset n over the combined row [existing | proposed]
 // (excluded.col reads the proposed row). A target labeled `excluded` (a table so named, or AS
 // excluded) keeps BOTH relations under the one label, so excluded.col is 42P09 (PostgreSQL's rule
-// — resolveQualified).
-func onConflictExcludedScope(catalog *engine, t *catTable, alias *string) *scope {
+// — resolveQualified). For an INSERT through a view (vw, views.md §15.7) both relations expose the
+// view's columns over their halves of the combined row.
+func onConflictExcludedScope(catalog *engine, t *catTable, vw *viewWrite, alias *string) *scope {
 	n := len(t.Columns)
-	rels := []scopeRel{
-		targetRel(t, nil, alias),
-		{label: "excluded", table: t, offset: n, qualifierOnly: true},
+	excluded := scopeRel{label: "excluded", table: t, offset: n, qualifierOnly: true}
+	if vw != nil {
+		excluded.layer = vw.top
 	}
+	rels := []scopeRel{targetRel(t, vw, alias), excluded}
 	return &scope{rels: rels, catalog: catalog, allowSubquery: true}
 }
 

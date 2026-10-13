@@ -14,7 +14,10 @@ package jed
 // statement's own (resolveWriteFilter); the checked views' WHERE clauses become the statement's
 // check-option checks (resolveViewChecks, §15.6).
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // writeKind is the statement kind a write through a view performs.
 type writeKind int
@@ -87,12 +90,51 @@ func (l *writeLayer) viewsBottomUp() []*writeLayer {
 }
 
 // viewWrite is a validated write through a view: the target view, the base table, the top layer,
-// and the base column each statement target maps to (in the statement's target order).
+// and the base column each statement target maps to (in the statement's target order). conflictSet
+// holds the same for an INSERT … ON CONFLICT DO UPDATE's SET targets (views.md §15.7).
 type viewWrite struct {
-	view    string
-	table   string
-	top     *writeLayer
-	targets []string
+	view        string
+	table       string
+	top         *writeLayer
+	targets     []string
+	conflictSet []string
+}
+
+// conflictTarget maps an ON CONFLICT target through the view to the base table (views.md §15.7): a
+// column list names view columns, each of which must exist (42703) and lead to a base column — a
+// read-only column leads to an expression, which no unique index's column list matches (42P10). A
+// view has no constraints, so ON CONSTRAINT is always 42704.
+func (vw *viewWrite) conflictTarget(table *catTable, target *conflictTarget) (*conflictTarget, error) {
+	if target == nil {
+		return nil, nil
+	}
+	if target.IsConstraint {
+		return nil, newError(UndefinedObject, fmt.Sprintf(
+			"constraint %s for table %s does not exist", target.Constraint, vw.view))
+	}
+	positions := make([]int, len(target.Columns))
+	for i, c := range target.Columns {
+		positions[i] = -1
+		for k, col := range vw.top.columns {
+			if col.Name == c {
+				positions[i] = k
+				break
+			}
+		}
+		if positions[i] < 0 {
+			return nil, newError(UndefinedColumn, "column does not exist: "+c)
+		}
+	}
+	mapped := &conflictTarget{Columns: make([]string, len(positions))}
+	for i, k := range positions {
+		base, owner, _ := vw.top.follow(k)
+		if owner != nil {
+			return nil, newError(InvalidColumnReference,
+				"there is no unique or exclusion constraint matching the ON CONFLICT specification")
+		}
+		mapped.Columns[i] = table.Columns[base].Name
+	}
+	return mapped, nil
 }
 
 // chainLevel is one level of the chain while it is validated top-down.
@@ -267,8 +309,9 @@ func (db *engine) updatableShape(body *queryExpr, checkCols bool) (*selectStmt, 
 // 2–6), or returns nil when the target is not a view. targets are the statement's target view
 // columns: the INSERT column list (nil = every view column) or the UPDATE SET columns, in order;
 // DELETE has none. targetPos holds each target's character position, index-aligned (nil when
-// unknown), for a 42703 (spec/design/error-fields.md §10.2).
-func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onConflict bool, targets []string, targetPos []srcPos) (*viewWrite, error) {
+// unknown), for a 42703 (spec/design/error-fields.md §10.2). conflictSet and conflictPos are the
+// same for an INSERT's ON CONFLICT DO UPDATE SET columns (§15.7), empty otherwise.
+func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targets []string, targetPos []srcPos, conflictSet []string, conflictPos []srcPos) (*viewWrite, error) {
 	view, err := db.dmlTargetView(q, name)
 	if err != nil || view == nil {
 		return nil, err
@@ -278,17 +321,13 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 	if sel, _ := db.updatableShape(view.Body, checkCols); sel == nil {
 		return nil, notUpdatable(kind, view.Name)
 	}
-	// 3. ON CONFLICT on a view is a follow-on.
-	if onConflict {
-		return nil, newError(FeatureNotSupported, "ON CONFLICT on a view is not supported yet")
-	}
-	// 4. The view is planned as a read of it would be (§4): its body's errors and the nesting and
+	// 3. The view is planned as a read of it would be (§4): its body's errors and the nesting and
 	// expansion limits. The plan yields every chain view's output types and collations.
 	metas, err := db.planWriteTarget(view)
 	if err != nil {
 		return nil, err
 	}
-	// 5. The statement's targets against the view's output columns.
+	// 4. The statement's targets against the view's output columns.
 	var cur []int
 	if checkCols {
 		if targets == nil {
@@ -320,7 +359,20 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 			}
 		}
 	}
-	// 6. Each view from the target down: updatable, then its target columns.
+	// An ON CONFLICT DO UPDATE's SET columns, after the INSERT's own targets (§15.7).
+	var setCur []int
+	for ti, t := range conflictSet {
+		idx := slices.Index(view.Columns, t)
+		if idx < 0 {
+			return nil, newError(UndefinedColumn, fmt.Sprintf("column %s of relation %s does not exist", t, view.Name)).
+				withPosition(srcPosOf(conflictPos, ti))
+		}
+		if slices.Contains(setCur, idx) {
+			return nil, newError(DuplicateColumn, fmt.Sprintf("column %s assigned more than once", t))
+		}
+		setCur = append(setCur, idx)
+	}
+	// 5. Each view from the target down: updatable, then its target columns.
 	var levels []chainLevel
 	levelView := view
 	var rename []string
@@ -357,7 +409,7 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 		}
 		if checkCols {
 			first := -1
-			for _, c := range cur {
+			for _, c := range slices.Concat(cur, setCur) {
 				if cols[c].expr != nil && (first < 0 || c < first) {
 					first = c
 				}
@@ -370,11 +422,14 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 				return nil, newError(FeatureNotSupported, fmt.Sprintf(
 					"cannot %s column \"%s\" of view \"%s\"", verb, levelView.Columns[first], levelView.Name))
 			}
-			next := make([]int, len(cur))
-			for i, c := range cur {
-				next[i] = cols[c].ref
+			down := func(list []int) []int {
+				next := make([]int, len(list))
+				for i, c := range list {
+					next[i] = cols[c].ref
+				}
+				return next
 			}
-			cur = next
+			cur, setCur = down(cur), down(setCur)
 		}
 		levels = append(levels, chainLevel{view: levelView, rename: rename, label: label, cols: cols, filter: sel.Filter})
 		if isTable {
@@ -384,10 +439,11 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 		levelView = snap.view(tref.Name)
 		rename = tref.ColumnAliases
 	}
-	// 7. Two targets that reach the same table column (42701).
-	for i, c := range cur {
-		for _, d := range cur[:i] {
-			if c == d {
+	// 6. Two targets that reach the same table column (42701): among the statement's targets, then
+	// among the ON CONFLICT SET targets.
+	for _, list := range [][]int{cur, setCur} {
+		for i, c := range list {
+			if slices.Contains(list[:i], c) {
 				return nil, newError(DuplicateColumn, fmt.Sprintf("column %s assigned more than once", table.Columns[c].Name))
 			}
 		}
@@ -417,6 +473,9 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, onCon
 	vw := &viewWrite{view: layer.view, table: table.Name, top: layer}
 	for _, c := range cur {
 		vw.targets = append(vw.targets, table.Columns[c].Name)
+	}
+	for _, c := range setCur {
+		vw.conflictSet = append(vw.conflictSet, table.Columns[c].Name)
 	}
 	return vw, nil
 }
@@ -558,17 +617,40 @@ func resolveLayerRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, res
 }
 
 // rewriteInsertTarget retargets an INSERT through an updatable view at its base table (views.md
-// §15.2): the column list becomes the base columns the view's targets map to. It returns a copy of
-// the statement (the written one is left intact) and the write, or the statement unchanged and nil
-// when the target is not a view.
+// §15.2): the column list becomes the base columns the view's targets map to. An ON CONFLICT DO
+// UPDATE's SET columns map the same way, and `SET c = DEFAULT` assigns the view column's default,
+// which is NULL, as in UPDATE (§15.7). The conflict target maps when the clause is resolved
+// (viewWrite.conflictTarget). It returns a copy of the statement (the written one is left intact)
+// and the write, or the statement unchanged and nil when the target is not a view.
 func (db *engine) rewriteInsertTarget(ins *insert) (*insert, *viewWrite, error) {
-	vw, err := db.prepareViewWrite(ins.DB, ins.Table, writeInsert, ins.OnConflict != nil, ins.Columns, ins.ColumnPos)
+	var setTargets []string
+	var setPos []srcPos
+	if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
+		for _, a := range ins.OnConflict.Assignments {
+			setTargets = append(setTargets, a.Column)
+			setPos = append(setPos, a.Pos)
+		}
+	}
+	vw, err := db.prepareViewWrite(ins.DB, ins.Table, writeInsert, ins.Columns, ins.ColumnPos, setTargets, setPos)
 	if err != nil || vw == nil {
 		return ins, nil, err
 	}
 	c := *ins
 	c.Table, c.DB = vw.table, nil
 	c.Columns = append(make([]string, 0, len(vw.targets)), vw.targets...)
+	if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
+		oc := *ins.OnConflict
+		oc.Assignments = make([]assignment, len(ins.OnConflict.Assignments))
+		for i, a := range ins.OnConflict.Assignments {
+			a.Column = vw.conflictSet[i]
+			if a.IsDefault {
+				a.IsDefault = false
+				a.Value = exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}
+			}
+			oc.Assignments[i] = a
+		}
+		c.OnConflict = &oc
+	}
 	return &c, vw, nil
 }
 
@@ -582,7 +664,7 @@ func (db *engine) rewriteUpdateTarget(upd *update) (*update, *viewWrite, error) 
 		targets[i] = a.Column
 		targetPos[i] = a.Pos
 	}
-	vw, err := db.prepareViewWrite(upd.DB, upd.Table, writeUpdate, false, targets, targetPos)
+	vw, err := db.prepareViewWrite(upd.DB, upd.Table, writeUpdate, targets, targetPos, nil, nil)
 	if err != nil || vw == nil {
 		return upd, nil, err
 	}
@@ -603,7 +685,7 @@ func (db *engine) rewriteUpdateTarget(upd *update) (*update, *viewWrite, error) 
 // rewriteDeleteTarget retargets a DELETE through an updatable view at its base table (views.md
 // §15.2).
 func (db *engine) rewriteDeleteTarget(del *deleteStmt) (*deleteStmt, *viewWrite, error) {
-	vw, err := db.prepareViewWrite(del.DB, del.Table, writeDelete, false, nil, nil)
+	vw, err := db.prepareViewWrite(del.DB, del.Table, writeDelete, nil, nil, nil, nil)
 	if err != nil || vw == nil {
 		return del, nil, err
 	}

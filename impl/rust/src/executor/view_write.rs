@@ -93,12 +93,59 @@ impl WriteLayer {
 }
 
 /// A validated write through a view: the target view, the base table, the top layer, and the
-/// base column each statement target maps to (in the statement's target order).
+/// base column each statement target maps to (in the statement's target order). `conflict_set`
+/// holds the same for an `INSERT … ON CONFLICT DO UPDATE`'s `SET` targets (views.md §15.7).
 pub(crate) struct ViewWrite {
     pub(crate) view: String,
     pub(crate) table: String,
     pub(crate) top: WriteLayer,
     pub(crate) targets: Vec<String>,
+    pub(crate) conflict_set: Vec<String>,
+}
+
+impl ViewWrite {
+    /// Map an `ON CONFLICT` target through the view to the base table (views.md §15.7): a column
+    /// list names view columns, each of which must exist (`42703`) and lead to a base column — a
+    /// read-only column leads to an expression, which no unique index's column list matches
+    /// (`42P10`). A view has no constraints, so `ON CONSTRAINT` is always `42704`.
+    pub(crate) fn conflict_target(
+        &self,
+        table: &Table,
+        target: Option<&ConflictTarget>,
+    ) -> Result<Option<ConflictTarget>> {
+        match target {
+            None => Ok(None),
+            Some(ConflictTarget::Constraint(name)) => Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("constraint {name} for table {} does not exist", self.view),
+            )),
+            Some(ConflictTarget::Columns(cols)) => {
+                let mut positions = Vec::with_capacity(cols.len());
+                for c in cols {
+                    let k = self
+                        .top
+                        .columns
+                        .iter()
+                        .position(|col| col.name == *c)
+                        .ok_or_else(|| undefined_column(c))?;
+                    positions.push(k);
+                }
+                let mut base = Vec::with_capacity(positions.len());
+                for k in positions {
+                    match self.top.follow(k) {
+                        Follow::Base(i) => base.push(table.columns[i].name.clone()),
+                        Follow::Expr(..) => {
+                            return Err(EngineError::new(
+                                SqlState::InvalidColumnReference,
+                                "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                            ));
+                        }
+                    }
+                }
+                Ok(Some(ConflictTarget::Columns(base)))
+            }
+        }
+    }
 }
 
 /// One level of the chain while it is validated top-down.
@@ -258,19 +305,23 @@ impl Engine {
         Some((sel, tref))
     }
 
-    /// Validate a write through `name` and build its layer chain (views.md §15.3 steps 2–7), or
+    /// Validate a write through `name` and build its layer chain (views.md §15.3 steps 2–6), or
     /// `Ok(None)` when the target is not a view. `targets` are the statement's target view columns:
     /// the INSERT column list (`None` = every view column) or the UPDATE `SET` columns, in order;
     /// DELETE has none. `target_pos` holds each target's character position, index-aligned (empty
-    /// when unknown), for a `42703` (spec/design/error-fields.md §10.2).
+    /// when unknown), for a `42703` (spec/design/error-fields.md §10.2). `conflict_set` and
+    /// `conflict_pos` are the same for an INSERT's `ON CONFLICT DO UPDATE` `SET` columns (§15.7),
+    /// empty otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_view_write(
         &self,
         db: Option<&str>,
         name: &str,
         kind: WriteKind,
-        on_conflict: bool,
         targets: Option<&[String]>,
         target_pos: &[SrcPos],
+        conflict_set: &[String],
+        conflict_pos: &[SrcPos],
     ) -> Result<Option<ViewWrite>> {
         let Some(view) = self.dml_target_view(db, name)? else {
             return Ok(None);
@@ -282,17 +333,10 @@ impl Engine {
         {
             return Err(not_updatable(kind, &view.name));
         }
-        // 3. ON CONFLICT on a view is a follow-on.
-        if on_conflict {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "ON CONFLICT on a view is not supported yet",
-            ));
-        }
-        // 4. The view is planned as a read of it would be (§4): its body's errors and the nesting and
+        // 3. The view is planned as a read of it would be (§4): its body's errors and the nesting and
         // expansion limits. The plan yields every chain view's output types and collations.
         let metas = self.plan_write_target(&view)?;
-        // 5. The statement's targets against the view's output columns.
+        // 4. The statement's targets against the view's output columns.
         let mut cur: Vec<usize> = Vec::new();
         if kind != WriteKind::Delete {
             match targets {
@@ -318,7 +362,25 @@ impl Engine {
                 }
             }
         }
-        // 6. Each view from the target down: updatable, then its target columns.
+        // An ON CONFLICT DO UPDATE's SET columns, after the INSERT's own targets (§15.7).
+        let mut set_cur: Vec<usize> = Vec::with_capacity(conflict_set.len());
+        for (i, t) in conflict_set.iter().enumerate() {
+            let idx = view.columns.iter().position(|c| c == t).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedColumn,
+                    format!("column {t} of relation {} does not exist", view.name),
+                )
+                .with_position(conflict_pos.get(i).map_or(0, |p| p.0))
+            })?;
+            if set_cur.contains(&idx) {
+                return Err(EngineError::new(
+                    SqlState::DuplicateColumn,
+                    format!("column {t} assigned more than once"),
+                ));
+            }
+            set_cur.push(idx);
+        }
+        // 5. Each view from the target down: updatable, then its target columns.
         let mut levels: Vec<ChainLevel> = Vec::new();
         let mut level_view = view;
         let mut rename: Option<Vec<String>> = None;
@@ -351,6 +413,7 @@ impl Engine {
                 .collect();
             if kind != WriteKind::Delete {
                 let mut ordered = cur.clone();
+                ordered.extend_from_slice(&set_cur);
                 ordered.sort_unstable();
                 if let Some(&c) = ordered
                     .iter()
@@ -369,13 +432,12 @@ impl Engine {
                         ),
                     ));
                 }
-                cur = cur
-                    .iter()
-                    .map(|&c| match cols[c] {
-                        LayerCol::Ref(j) => j,
-                        LayerCol::Expr(_) => unreachable!("checked above"),
-                    })
-                    .collect();
+                let down = |c: &usize| match cols[*c] {
+                    LayerCol::Ref(j) => j,
+                    LayerCol::Expr(_) => unreachable!("checked above"),
+                };
+                cur = cur.iter().map(down).collect();
+                set_cur = set_cur.iter().map(down).collect();
             }
             let next = snap.view(&tref.name).cloned();
             let base = snap.table(&tref.name).cloned();
@@ -396,16 +458,19 @@ impl Engine {
                 }
             }
         };
-        // 7. Two targets that reach the same table column (42701).
-        let mut seen: Vec<usize> = Vec::with_capacity(cur.len());
-        for &c in &cur {
-            if seen.contains(&c) {
-                return Err(EngineError::new(
-                    SqlState::DuplicateColumn,
-                    format!("column {} assigned more than once", table.columns[c].name),
-                ));
+        // 6. Two targets that reach the same table column (42701): among the statement's targets,
+        // then among the ON CONFLICT SET targets.
+        for list in [&cur, &set_cur] {
+            let mut seen: Vec<usize> = Vec::with_capacity(list.len());
+            for &c in list.iter() {
+                if seen.contains(&c) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateColumn,
+                        format!("column {} assigned more than once", table.columns[c].name),
+                    ));
+                }
+                seen.push(c);
             }
-            seen.push(c);
         }
         // Build the layers bottom-up: the table, then each view.
         let mut table_cols = table.columns.clone();
@@ -446,6 +511,10 @@ impl Engine {
         Ok(Some(ViewWrite {
             view: top_name,
             targets: cur.iter().map(|&c| table.columns[c].name.clone()).collect(),
+            conflict_set: set_cur
+                .iter()
+                .map(|&c| table.columns[c].name.clone())
+                .collect(),
             table: table.name.clone(),
             top: layer,
         }))
@@ -609,16 +678,29 @@ fn resolve_at_depth(top: &Scope, level: usize, e: &Expr) -> Result<(RExpr, Resol
 
 impl Engine {
     /// Retarget an INSERT through an updatable view at its base table (views.md §15.2): the column
-    /// list becomes the base columns the view's targets map to. `Ok(None)` when the target is not a
-    /// view.
+    /// list becomes the base columns the view's targets map to. An `ON CONFLICT DO UPDATE`'s `SET`
+    /// columns map the same way, and `SET c = DEFAULT` assigns the view column's default, which is
+    /// NULL, as in UPDATE (§15.7). The conflict target maps when the clause is resolved
+    /// ([`ViewWrite::conflict_target`]). `Ok(None)` when the target is not a view.
     pub(crate) fn rewrite_insert_target(&self, ins: &mut Insert) -> Result<Option<ViewWrite>> {
+        let (set_targets, set_pos): (Vec<String>, Vec<SrcPos>) = match &ins.on_conflict {
+            Some(OnConflict {
+                action: ConflictAction::DoUpdate { assignments, .. },
+                ..
+            }) => assignments
+                .iter()
+                .map(|a| (a.column.clone(), a.pos))
+                .unzip(),
+            _ => (Vec::new(), Vec::new()),
+        };
         let Some(vw) = self.prepare_view_write(
             ins.db.as_deref(),
             &ins.table,
             WriteKind::Insert,
-            ins.on_conflict.is_some(),
             ins.columns.as_deref(),
             &ins.column_pos,
+            &set_targets,
+            &set_pos,
         )?
         else {
             return Ok(None);
@@ -626,6 +708,19 @@ impl Engine {
         ins.table = vw.table.clone();
         ins.db = None;
         ins.columns = Some(vw.targets.clone());
+        if let Some(OnConflict {
+            action: ConflictAction::DoUpdate { assignments, .. },
+            ..
+        }) = &mut ins.on_conflict
+        {
+            for (a, base) in assignments.iter_mut().zip(&vw.conflict_set) {
+                a.column = base.clone();
+                if a.is_default {
+                    a.is_default = false;
+                    a.value = Expr::Literal(Literal::Null);
+                }
+            }
+        }
         Ok(Some(vw))
     }
 
@@ -639,9 +734,10 @@ impl Engine {
             upd.db.as_deref(),
             &upd.table,
             WriteKind::Update,
-            false,
             Some(&targets),
             &target_pos,
+            &[],
+            &[],
         )?
         else {
             return Ok(None);
@@ -664,8 +760,9 @@ impl Engine {
             del.db.as_deref(),
             &del.table,
             WriteKind::Delete,
-            false,
             None,
+            &[],
+            &[],
             &[],
         )?
         else {

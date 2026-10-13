@@ -708,9 +708,19 @@ func arbiterKey(arb *arbiter, colTypes []colType, pk []int, colls []*Collation, 
 // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
 // conflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
 // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
-// statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
-func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *string, ptypes *paramTypes) (*conflictPlan, error) {
-	arb, err := resolveArbiter(table, oc.Target)
+// statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT. For an INSERT
+// through an updatable view (vw, views.md §15.7) the target maps through the view and the scope
+// exposes the view's columns, on the existing row and on `excluded`; the SET columns were already
+// retargeted at the base table.
+func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *string, vw *viewWrite, ptypes *paramTypes) (*conflictPlan, error) {
+	target := oc.Target
+	if vw != nil {
+		var err error
+		if target, err = vw.conflictTarget(table, target); err != nil {
+			return nil, err
+		}
+	}
+	arb, err := resolveArbiter(table, target)
 	if err != nil {
 		return nil, err
 	}
@@ -722,7 +732,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 		return nil, newError(SyntaxError,
 			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
 	}
-	s := onConflictExcludedScope(db, table, alias)
+	s := onConflictExcludedScope(db, table, vw, alias)
 	pkMembers := table.PKIndices()
 	// SET col = DEFAULT resolves the assigned-DEFAULT columns' expression defaults once, exactly as
 	// standalone UPDATE does (constraints.md §2): a constant/no default becomes a constant node
@@ -1050,7 +1060,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		}
 		var cplan *conflictPlan
 		if ins.OnConflict != nil {
-			if cplan, err = db.resolveOnConflict(table, ins.OnConflict, ins.Alias, ptypes); err != nil {
+			if cplan, err = db.resolveOnConflict(table, ins.OnConflict, ins.Alias, vw, ptypes); err != nil {
 				return outcome{}, err
 			}
 		}
@@ -1213,7 +1223,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	var cplan *conflictPlan
 	if ins.OnConflict != nil {
 		var cerr error
-		if cplan, cerr = db.resolveOnConflict(table, ins.OnConflict, ins.Alias, ptypes); cerr != nil {
+		if cplan, cerr = db.resolveOnConflict(table, ins.OnConflict, ins.Alias, vw, ptypes); cerr != nil {
 			return outcome{}, cerr
 		}
 	}
@@ -2301,7 +2311,7 @@ func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *str
 	if conflict != nil {
 		// ON CONFLICT is reached only for a reserved scope (an attachment target is 0A000 in
 		// executeInsert). Keep dbScope so generated parent-side FK actions retain main versus temp.
-		return db.insertRowsOnConflict(table, store, dbScope, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
+		return db.insertRowsOnConflict(table, store, dbScope, pk, checks, viewChecks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
 	}
 	rindexes, err := db.resolveTableIndexes(table)
 	if err != nil {
@@ -2320,8 +2330,10 @@ func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *str
 // classifying each as a planned INSERT, a planned UPDATE of an existing row, or a SKIP; the planned
 // inserts + updates are then validated against the statement END STATE (PK / unique / CHECK / FK)
 // before phase 2 writes anything (all-or-nothing). returning projects the AFFECTED rows (inserts
-// with an all-NULL old side, updates with their pre-update existing row).
-func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
+// with an all-NULL old side, updates with their pre-update existing row). viewChecks are the
+// check-option checks of an INSERT through a view (views.md §15.6/§15.7), evaluated on each row
+// inserted or updated, as phase 1 decides it.
+func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
 	n := len(table.Columns)
 	relation := table.Name
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
@@ -2357,6 +2369,13 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	insPrefixes := make([]map[string]struct{}, len(uniqIdx))
 	for i := range insPrefixes {
 		insPrefixes[i] = make(map[string]struct{})
+	}
+	// The check option of an INSERT through a view (views.md §15.7): each row phase 1 decides to
+	// insert, and each updated row, right after its CHECK constraints and the conflict decision. A
+	// row DO NOTHING skips, or that a DO UPDATE WHERE leaves alone, is not checked. (A view's WHERE
+	// reads no parameter or statement CTE, as in insertRows.)
+	viewCheck := func(row storedRow) error {
+		return evalViewChecks(viewChecks, row, &evalEnv{exec: db, rng: rng}, meter)
 	}
 
 	for _, values := range rows {
@@ -2426,6 +2445,9 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 					insPrefixes[u][string(prefix)] = struct{}{}
 				}
 			}
+			if err := viewCheck(row); err != nil {
+				return 0, nil, err
+			}
 			inserts = append(inserts, row)
 			continue
 		}
@@ -2437,6 +2459,9 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 		if !ok {
 			// A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
+			if err := viewCheck(row); err != nil {
+				return 0, nil, err
+			}
 			inserts = append(inserts, row)
 			continue
 		}
@@ -2456,6 +2481,9 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		if !found {
 			// No committed conflict on the arbiter → insert (a non-arbiter conflict is caught
 			// by the end-state validation below).
+			if err := viewCheck(row); err != nil {
+				return 0, nil, err
+			}
 			inserts = append(inserts, row)
 			continue
 		}
@@ -2508,6 +2536,9 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			if err := evalChecks(checks, relation, newRow, cenv, meter); err != nil {
 				return 0, nil, err
 			}
+		}
+		if err := viewCheck(newRow); err != nil {
+			return 0, nil, err
 		}
 		updates = append(updates, pendingUpdate{key: existKey, newRow: newRow, oldRow: existRow})
 	}

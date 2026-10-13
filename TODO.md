@@ -145,9 +145,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `view_write` NoREC relation) landed in every core too, as did V8 (`DROP TABLE` / `DROP VIEW` /
   `ALTER TABLE … DROP COLUMN` `CASCADE` dropping the closure of dependent views) and V9
   (`WITH [CASCADED | LOCAL] CHECK OPTION`: `44000` on an `INSERT`/`UPDATE` whose new row a checked
-  view would not show, `format_version` 39, `jed_views.check_option`).
+  view would not show, `format_version` 39, `jed_views.check_option`), and V10 (`INSERT … ON
+  CONFLICT` through an updatable view, written in the view's columns).
   → [views.md](spec/design/views.md)
-  - [ ] _follow-on:_ `ON CONFLICT` on an updatable view, view column defaults,
+  - [ ] _follow-on:_ view column defaults,
     view options and the other `ALTER VIEW` actions, materialized and recursive views, temporary views, views in or over attached
     databases, dependency tracking for
     sequences/types/collations/host functions, definitions longer than one catalog page. (View

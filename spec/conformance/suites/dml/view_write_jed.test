@@ -1,10 +1,11 @@
 # Writing through an updatable view — the jed-specific behavior of spec/design/views.md §15 that
 # PostgreSQL cannot oracle-check: the session privilege envelope, which checks the written view like a
 # table (§15.4), the recorded divergences (§12: 55000 before column errors, 0A000 before
-# expression errors, 42701 for two view columns over one base column, ON CONFLICT 0A000, the
-# list-less INSERT arity rule), and the plan/cost equivalence with the base statement (§15.5).
+# expression errors, 42701 for two view columns over one base column, the ON CONFLICT DO UPDATE
+# primary-key narrowing, the list-less INSERT arity rule), and the plan/cost equivalence with the base
+# statement (§15.5, §15.7).
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.view, dml.view_write, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.order_by, query.group_by, query.aggregates, query.explain, dml.explain, func.abs, expr.arithmetic, resource.cost_metering, types.i32, types.text, session.privileges
+# requires: ddl.view, dml.view_write, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.view_on_conflict, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.order_by, query.group_by, query.aggregates, query.explain, dml.explain, func.abs, expr.arithmetic, resource.cost_metering, types.i32, types.text, session.privileges
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text)
@@ -49,6 +50,23 @@ DELETE FROM v WHERE id = 4 RETURNING id
 # grant: INSERT ON v
 statement error 42501
 INSERT INTO t VALUES (9, 9, 'q')
+
+# ON CONFLICT through the view is checked on the view too, as for a table (§15.7)
+# default_privileges: NONE
+# grant: INSERT ON v
+query II nosort
+INSERT INTO v (id, a) VALUES (5, 50), (1, 0) ON CONFLICT (id) DO NOTHING RETURNING id, a2
+----
+5
+100
+
+# default_privileges: NONE
+# grant: INSERT ON v
+statement error 42501
+INSERT INTO t VALUES (5, 50, 'q') ON CONFLICT (id) DO NOTHING
+
+statement ok
+DELETE FROM t WHERE id = 5
 
 # default_privileges: NONE
 # grant: SELECT ON v
@@ -127,15 +145,21 @@ UPDATE vdup SET a = 1, aa = 2
 statement error 42701
 INSERT INTO vdup (id, a, aa) VALUES (9, 1, 2)
 
-# ON CONFLICT is 0A000 on an updatable view (PG supports it), 55000 on one that is not
-statement error 0A000
-INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a = excluded.a
+# the same for an ON CONFLICT DO UPDATE's SET targets (§15.7)
+statement error 42701
+INSERT INTO vdup (id, a) VALUES (9, 1) ON CONFLICT (id) DO UPDATE SET a = 1, aa = 2
 
+# a read-only SET target is 0A000 before the SET expressions resolve (PG reports 42883 first)
 statement error 0A000
-INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT DO NOTHING
+INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a2 = nosuch_fn()
 
+# ON CONFLICT on a view that is not updatable is 55000 before a conflict-target error (PG: 42703)
 statement error 55000
-INSERT INTO vg VALUES (1, 1) ON CONFLICT DO NOTHING
+INSERT INTO vg VALUES (1, 1) ON CONFLICT (nosuch) DO NOTHING
+
+# DO UPDATE cannot assign a primary-key column (upsert.md §9), through a view too (PG allows it)
+statement error 0A000
+INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET id = 2
 
 # a list-less INSERT supplies every view column, as for a table (PG accepts fewer)
 statement ok
@@ -230,6 +254,43 @@ query I nosort
 DELETE FROM m WHERE y > 0 AND x * 2 > 50 RETURNING id
 ----
 3
+
+statement ok
+INSERT INTO m VALUES (3, 31, 1)
+
+# An ON CONFLICT through the view renders its base statement (§15.7).
+# names: depth, node, detail, est_rows, est_cost
+# types: i32, text, text, i64, i64
+query ITTII nosort
+EXPLAIN INSERT INTO mv (id, x) VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET x = excluded.s
+----
+0
+Insert m
+on conflict do update
+1
+0
+1
+Values
+rows=1
+1
+0
+
+# An ON CONFLICT through the view costs its base statement too (§15.7): `INSERT INTO m … ON CONFLICT
+# (id) DO UPDATE SET x = excluded.x + (m.x + m.y) RETURNING id, x + y` — the SET's two `+` + `x + y`
+# for `s` + 1 produced = 4. The view's WHERE is not part of the conflict path.
+# cost: 4
+query II nosort
+INSERT INTO mv (id, x) VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET x = excluded.x + mv.s RETURNING id, s
+----
+2
+27
+
+# cost: 4
+query II nosort
+INSERT INTO m (id, x) VALUES (2, 7) ON CONFLICT (id) DO UPDATE SET x = excluded.x + m.x + m.y RETURNING id, x + y
+----
+2
+34
 
 query III nosort
 SELECT * FROM v ORDER BY id

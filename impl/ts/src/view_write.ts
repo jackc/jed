@@ -13,8 +13,8 @@
 // WHERE clauses resolve the same way and are AND-ed ahead of the statement's own; the checked views'
 // WHERE clauses become the statement's check-option checks (resolveViewChecks, §15.6).
 
-import type { CheckOption, Expr } from "./ast.ts";
-import type { Column } from "./catalog.ts";
+import type { CheckOption, ConflictTarget, Expr } from "./ast.ts";
+import type { Column, Table } from "./catalog.ts";
 import type { EngineError } from "./errors.ts";
 import { engineError } from "./errors.ts";
 import type { RExpr } from "./executor.ts";
@@ -73,8 +73,49 @@ export function viewsBottomUp(layer: WriteLayer): WriteLayer[] {
 }
 
 // ViewWrite is a validated write through a view: the target view, the base table, the top layer,
-// and the base column each statement target maps to (in the statement's target order).
-export type ViewWrite = { view: string; table: string; top: WriteLayer; targets: string[] };
+// and the base column each statement target maps to (in the statement's target order). conflictSet
+// holds the same for an INSERT … ON CONFLICT DO UPDATE's SET targets (views.md §15.7).
+export type ViewWrite = {
+  view: string;
+  table: string;
+  top: WriteLayer;
+  targets: string[];
+  conflictSet: string[];
+};
+
+// viewConflictTarget maps an ON CONFLICT target through the view to the base table (views.md
+// §15.7): a column list names view columns, each of which must exist (42703) and lead to a base
+// column — a read-only column leads to an expression, which no unique index's column list matches
+// (42P10). A view has no constraints, so ON CONSTRAINT is always 42704.
+export function viewConflictTarget(
+  vw: ViewWrite,
+  table: Table,
+  target: ConflictTarget | null,
+): ConflictTarget | null {
+  if (target === null) return null;
+  if (target.kind === "constraint") {
+    throw engineError(
+      "undefined_object",
+      `constraint ${target.name} for table ${vw.view} does not exist`,
+    );
+  }
+  const positions = target.columns.map((c) => {
+    const k = vw.top.columns.findIndex((col) => col.name === c);
+    if (k < 0) throw engineError("undefined_column", "column does not exist: " + c);
+    return k;
+  });
+  const columns = positions.map((k) => {
+    const f = followLayer(vw.top, k);
+    if (f.kind === "expr") {
+      throw engineError(
+        "invalid_column_reference",
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+      );
+    }
+    return table.columns[f.index]!.name;
+  });
+  return { kind: "columns", columns };
+}
 
 // ViewCheck is one check-option check of a write through a view (views.md §15.6): the checked view's
 // name and its WHERE, resolved over the base row.

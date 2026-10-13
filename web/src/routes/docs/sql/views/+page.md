@@ -67,6 +67,11 @@ INSERT INTO open_tasks (id, title) VALUES (4, 'plan');
 DELETE FROM open_tasks WHERE owner_tag = 'KEN';
 SELECT * FROM task ORDER BY id;`;
 
+	const upsertQuery = `INSERT INTO open_tasks (id, title)
+  VALUES (2, 'ship it again'), (5, 'triage')
+  ON CONFLICT (id) DO UPDATE SET title = excluded.title
+  RETURNING id, title, owner_tag;`;
+
 	const checkSeed = `CREATE TABLE task (
   id    i32 PRIMARY KEY,
   title text NOT NULL,
@@ -304,7 +309,24 @@ A write through a view is planned like the same write on the table: `UPDATE open
 1` is a primary-key lookup on `task`, and `EXPLAIN` shows `Update task`.
 
 Writing to any other view, such as `dept_payroll` (which groups its rows), is `55000` (*cannot
-delete from view …*). `INSERT … ON CONFLICT` on a view is not supported yet (`0A000`).
+delete from view …*).
+
+### `INSERT … ON CONFLICT` through a view
+
+`ON CONFLICT` works through an updatable view as it does on the table underneath, as in PostgreSQL.
+Everything in the clause is written in the view's columns:
+
+<LiveSql demo="upsertQuery" seed={writeSeed} query={upsertQuery} rows={2} />
+
+- The conflict target `(id)` names view columns, each mapped to its table column, and must match the
+  table's primary key or a `UNIQUE` constraint. A computed column such as `owner_tag` matches none
+  (`42P10`), and `ON CONSTRAINT` is `42704`, because a view has no constraints.
+- `DO UPDATE SET` assigns view columns (a computed one is `0A000`, and `= DEFAULT` sets `NULL`).
+  `excluded.col` and the view's name (or the `AS` alias) read the proposed and the existing row
+  through the view's columns, computed ones included.
+- The view's `WHERE` does not limit which existing row is updated: task 2 is done, so the view does
+  not show it, yet the conflict updates it. `WITH CHECK OPTION` ([below](#with-check-option)) checks
+  every row the statement inserts or updates; a row `DO NOTHING` skips is not checked.
 
 `CREATE INDEX … ON` a view and a foreign key that references a view are `42809`. `ANALYZE` on a view
 succeeds and does nothing.
@@ -382,7 +404,6 @@ Each of these is `0A000` today:
 - `ALTER VIEW` forms other than `RENAME`.
 - View options written as `WITH (…)`, including `WITH (check_option = local)`. Write the clause
   form, `WITH LOCAL CHECK OPTION`, instead.
-- `INSERT … ON CONFLICT` on a view.
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW`.
 - Temporary views, and a view that reads a temporary table.
 - Views in an attached database, and views whose query reads an attached database.
