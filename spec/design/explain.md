@@ -120,8 +120,8 @@ Attributes are separated by `; `. A node with no attributes is `-`.
 
 - Scans render `Full scan`, `PK bound: ...`, `Index bound: using <index>`, `GIN bound: ...`,
   `GiST bound: ...`, or an interval-set form. Bound operators are `= <> < > <= >=`; sources are
-  `$N`, `outer`, or canonical literals. Float bounds use the core's native shortest round-trip
-  formatter rather than the old `<float>` placeholder.
+  `$N`, `outer`, or canonical literals. A float bound is its PostgreSQL `float8out` text
+  ([float.md](float.md) §9) rather than the old `<float>` placeholder.
 - `touched=K` is the exact number of statically referenced stored columns. It is emitted for SELECT
   scans and UPDATE/DELETE target scans, including assignment sources and the storage-reading side of
   `RETURNING`; it is omitted when zero.
@@ -174,14 +174,12 @@ rules.
 ## 7. Determinism ledger
 
 Plan traversal, names, counts, integer literals, and non-float constant rendering remain exact
-cross-core contracts. Two newly exposed presentation surfaces are separately audited in
+cross-core contracts, and so does a float constant, which renders as PostgreSQL's `float8out`
+text ([float.md](float.md) §9). One newly exposed presentation surface is separately audited in
 [determinism_exceptions.toml](../conformance/determinism_exceptions.toml):
 
 - `explain-expression-spelling` records the hand-written resolved-expression spelling contract. It
   drops no guarantee; exact corpus cells are the differential check.
-- `explain-float-literal-layout` bounds the already-ratified native shortest-float layout exception
-  to float text embedded in EXPLAIN details. The float value and selected bound remain identical;
-  only equivalent exponent/layout spelling may vary at formatter-specific thresholds.
 
 No hashmap iteration, locale, clock, entropy, allocation, or wall time may reach plan text,
 estimates, actual costs, or lane tags.

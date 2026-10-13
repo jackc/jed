@@ -269,9 +269,8 @@ and each renders without new state:
   `'2024-01-01'`). The canonical render is the zone-free one, so a `timestamptz` renders
   in UTC (`+00`) whatever the session time zone — the relation stays a pure function of the
   snapshot. The text re-parses to the same value when assigned to the column. Because the stored
-  value is the coerced one, `DEFAULT 1.5` on `decimal(6,2)` shows `1.50`. A float value renders by
-  its core's native shortest round-trip formatter, quoted (`'1.5'`), under the existing
-  `float-render-layout` determinism-ledger entry.
+  value is the coerced one, `DEFAULT 1.5` on `decimal(6,2)` shows `1.50`. A float value renders as
+  its PostgreSQL text, quoted (`'1.5'`, `'1e+21'`; [float.md](float.md) §9).
 - **`DEFAULT NULL` renders NULL**, the same as no default. The two behave identically, and
   PostgreSQL stores no default at all for `DEFAULT NULL` (`heap.c`, `AddRelationNewConstraints`),
   so its `column_default` is also NULL.

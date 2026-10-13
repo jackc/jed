@@ -5,9 +5,9 @@
 # `postgres` styles, json verbatim, jsonb and jsonpath canonical. A timestamptz renders in the
 # SESSION zone (timezones.md §9.5) with PostgreSQL's offset spelling (+HH, +HH:MM, +HH:MM:SS), so the
 # cast is STABLE and an index expression containing it is 42P17, as in PostgreSQL. Element-wise
-# T[] -> text[] casts each element the same way (array.md §7). Float renders are limited here to
-# values whose shortest round-trip layout every core and PostgreSQL agree on (the float-render-layout
-# determinism exception).
+# T[] -> text[] casts each element the same way (array.md §7). A float renders as PostgreSQL's
+# float8out / float4out text (float.md §9): Ryu's shortest digits, in exponent form outside
+# [1e-4, 1e15) (f32: [1e-4, 1e6)), so the text is the same in every core and can key an index.
 #
 # OUT of this corpus (cannot live in the PG-clean oracle): the casts stay EXPLICIT — an implicit or
 # assignment use (INSERT INTO text_col VALUES (1), text_col = 1) is 42804 where PostgreSQL accepts
@@ -57,6 +57,52 @@ SELECT 1.5::float8::text, (-0.25::float8)::text, 0.1::real::text, 'NaN'::float8:
 NaN
 Infinity
 -Infinity
+
+# the layout: fixed-point for a decimal exponent in [-4, 15) (f32: [-4, 6)), else d.ddde±XX
+query TTTTTTT nosort
+SELECT 1e21::float8::text, 1e-7::float8::text, 1e15::float8::text, 1e14::float8::text, 123456789012345678::float8::text, 1e6::real::text, 16777215::real::text
+----
+1e+21
+1e-07
+1e+15
+100000000000000
+1.2345678901234568e+17
+1e+06
+1.6777215e+07
+
+# the digits are Ryu's: the shortest decimal strictly inside the rounding interval (1e23 is on the
+# bound of its nearest double), a tie to the even last digit
+query TTTT nosort
+SELECT '1e23'::float8::text, '3454183008863.90625'::float8::text, '131744.125'::real::text, '125073824'::real::text
+----
+9.999999999999999e+22
+3454183008863.9062
+131744.12
+1.25073824e+08
+
+# element-wise to text[]
+query T nosort
+SELECT '{1e21,0.1,-0,NaN}'::float8[]::text[]
+----
+{1e+21,0.1,-0,NaN}
+
+# the text is a stable index key: the same float, however written, collides
+statement ok
+CREATE TABLE float_text (id i32 PRIMARY KEY, f float8)
+
+statement ok
+CREATE UNIQUE INDEX float_text_f ON float_text ((f::text))
+
+statement ok
+INSERT INTO float_text VALUES (1, '1e23'::float8), (2, 1e-7::float8)
+
+query I nosort
+SELECT id FROM float_text WHERE f::text = '9.999999999999999e+22'
+----
+1
+
+statement error 23505
+INSERT INTO float_text VALUES (3, '99999999999999991611392'::float8)
 
 # bytea renders as \x lowercase hex; the empty value is the bare prefix
 query TT nosort

@@ -2547,8 +2547,8 @@ errors         = []
 
 # pi() — the constant π as f64 (float.md §8). A ZERO-arg function (like now()), so no operand and
 # no NULL path. Unlike the libm transcendentals it is IN-CONTRACT: the same f64 literal
-# (3.141592653589793) in every core, byte-identical — NOT in the determinism ledger (only its
-# render layout is exempt, the standing `float-render-layout` entry). volatility immutable.
+# (3.141592653589793) in every core, byte-identical — NOT in the determinism ledger. volatility
+# immutable.
 [[operator]]
 name           = "pi"
 kind           = "function"

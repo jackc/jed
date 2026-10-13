@@ -2764,11 +2764,12 @@ func writeRangeBoundKey(b *strings.Builder, bound *Value, inc bool) {
 }
 
 // floatCanonicalKey is a collision-free string of a float's total-order equivalence class
-// (spec/design/float.md §3): every NaN → "nan", -0 → +0, otherwise the shortest round-trip
-// decimal. So -0/+0 and any two NaNs key identically (they dedup to one DISTINCT/GROUP BY bucket).
+// (spec/design/float.md §3): every NaN → "nan", -0 → +0, otherwise the native shortest round
+// trip, which is never displayed and only has to be distinct per value. So -0/+0 and any two NaNs
+// key identically (they dedup to one DISTINCT/GROUP BY bucket).
 func floatCanonicalKey(f float64) string {
 	if math.IsNaN(f) {
 		return "nan"
 	}
-	return renderFloat64(canonicalizeFloat64(f))
+	return strconv.FormatFloat(canonicalizeFloat64(f), 'g', -1, 64)
 }

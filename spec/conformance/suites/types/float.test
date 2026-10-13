@@ -1,8 +1,8 @@
 # f64 / f32 — IEEE 754 binary floating point (spec/design/float.md). The FIRST types
-# deliberately EXEMPTED from cross-core byte-identity for COMPUTED/RENDERED values: float result
-# columns use the `R` render tag, compared by PARSED VALUE at tolerance (conformance.md §1), so a
-# core's native render layout and a transcendental's last ULP don't fail a test. The IN-CONTRACT
-# surface stays exact & cross-core: storage, the TOTAL ORDER (-0=+0, NaN=NaN, NaN is the LARGEST
+# deliberately EXEMPTED from cross-core byte-identity for COMPUTED values: float result columns
+# use the `R` render tag, compared by PARSED VALUE at tolerance (conformance.md §1), so a
+# transcendental's last ULP doesn't fail a test. The IN-CONTRACT surface stays exact & cross-core:
+# the text (PostgreSQL's float8out, float.md §9), storage, the TOTAL ORDER (-0=+0, NaN=NaN, NaN is the LARGEST
 # value), the trapping +-*/ kernel, casts (float->decimal yields an exact `D` value), and the
 # order-independent canonical-fold SUM/AVG. The two widths form a promotion tower (f32 widens
 # to f64, lossless). float IS keyable (the float-order-preserving key, §2.8 — the full PK/index/

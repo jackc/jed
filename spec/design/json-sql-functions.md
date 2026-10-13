@@ -239,11 +239,9 @@ recorded in the override ledger.
 
 **Floats take PostgreSQL's exact text.** A float source, element, field, key, or aggregate input is
 written as PostgreSQL's `float8out` (`float4out` for an `f32`) text at `extra_float_digits = 1`:
-Ryu's shortest digits and its layout, pinned in every core ([float.md](float.md) §9.1). This is not
-the native rendering a float result cell or `CAST(float AS text)` uses (the `float-render-layout`
-ledger entry): a float inside a JSON document is part of a value that is stored, compared, and keyed,
-so its text is byte-identical across cores and matches PostgreSQL's, digit for digit. A key is the
-text (`json_build_object(1.5e20::f64, 1)` is `{"1.5e+20" : 1}`).
+Ryu's shortest digits and its layout, the text every float rendering uses ([float.md](float.md) §9),
+byte-identical across cores and with PostgreSQL. A key is the text (`json_build_object(1.5e20::f64,
+1)` is `{"1.5e+20" : 1}`).
 
 **Session zone.** A `timestamptz` anywhere in an argument's type (the value itself, an array element,
 a field, a range bound, at any depth) is rendered in the session zone. Such a call to `to_json`,

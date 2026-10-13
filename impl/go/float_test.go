@@ -335,8 +335,8 @@ func TestFloatRenderSpellings(t *testing.T) {
 		1.5:                  "1.5",
 	}
 	for f, want := range cases {
-		if got := renderFloat64(f); got != want {
-			t.Errorf("renderFloat64(%v) = %q, want %q", f, got, want)
+		if got := renderFloatPG(f, 64); got != want {
+			t.Errorf("renderFloatPG(%v, 64) = %q, want %q", f, got, want)
 		}
 	}
 }

@@ -246,7 +246,7 @@ SELECT count(*) FROM jed_columns
 # SQL literal of that value: integer / decimal / boolean bare, everything else quoted with ' doubled.
 # DEFAULT NULL is NULL, the same as no default (PostgreSQL stores no default for it). The relation is
 # zone-free: a timestamptz constant renders in UTC whatever the session time zone. A float constant
-# renders quoted by the native shortest formatter (float-render-layout; 1.5 is layout-identical). A
+# renders quoted as its PostgreSQL text (float.md §9). A
 # parenthesized literal is still a constant, so `(2)` shows `2`.
 statement ok
 CREATE TABLE defaults (

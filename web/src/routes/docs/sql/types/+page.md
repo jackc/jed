@@ -283,8 +283,9 @@ an index expression containing `timestamptz::text` is rejected (`42P17`), as in 
 other cast to text is fine in an index. An `array → text[]` cast renders each element the same way,
 and so does `array → text` for a `timestamptz` anywhere inside the array — an element, a composite
 field, or a range bound (see [Time zones](#time-zones)).
-A `float` uses each engine's shortest round-trip form, so very large or small values may differ in
-exponent spelling between the Rust, Go, and TypeScript engines.
+A `float` renders exactly as PostgreSQL renders it, in every engine: the shortest digits that read
+back to the same float, in exponent form when the number is very large or very small (`1e+21`,
+`1e-07`). So `f::text` is a stable value, and an index on it works.
 
 Unlike PostgreSQL, the cast is **explicit only**: `INSERT INTO t (name) VALUES (42)` and
 `name = 42` stay type errors (`42804`). A composite or range value does not cast to `text` yet.

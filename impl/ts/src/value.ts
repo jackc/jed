@@ -561,16 +561,11 @@ export function render(v: Value): string {
       // Decimal renders as its canonical base-10 string, preserving display scale
       // (the D tag — spec/design/decimal.md §6).
       return v.dec.render();
+    // PostgreSQL's float4out / float8out text (spec/design/float.md §9).
     case "f32":
-      // The binary32 shortest round trip (renderFloat32) — what Rust/Go print for an f32.
-      return renderFloat32(v.value);
+      return renderFloatPg(v.value, true);
     case "f64":
-      // Native shortest-round-trip (JS Number#toString), the R tag (spec/design/float.md §9).
-      // Specials render PG-style. NOTE the JS quirk: (-0).toString()
-      // is "0" (and (+0).toString() is "0"), so -0 is special-cased to "-0"; Infinity.toString()
-      // is already "Infinity"/"−" handled, and NaN.toString() is "NaN". Layout (exponent
-      // threshold) may differ cross-core — absorbed by the R tag's parse-to-value compare.
-      return renderFloat(v.value);
+      return renderFloatPg(v.value, false);
     case "bytea":
       return renderByteaHex(v.bytes);
     case "uuid":
@@ -1117,35 +1112,10 @@ export function parseRecordTokens(input: string): (string | null)[] | null {
   return fields;
 }
 
-// renderFloat formats a float value's JS number to its conformance text (spec/design/float.md §9):
-// the native shortest-round-trip (Number#toString) for finite values, PG-style spellings for the
-// specials. The R tag compares by parsed value, so the only requirement here is that the digits be
-// shortest-round-trip (mathematically unique cross-core) and the specials match PG's words. The two
-// JS quirks handled: (-0).toString() is "0" (force "-0"), and NaN/Infinity already toString to
-// "NaN"/"Infinity"/"-Infinity".
-export function renderFloat(n: number): string {
-  if (Object.is(n, -0)) return "-0";
-  return n.toString();
-}
-
-// renderFloat32 renders a binary32 value (held widened in a Number) with the fewest significant
-// digits that read back to the same binary32 — the shortest round trip Rust's f32 Display and Go's
-// FormatFloat(…, 32) print. Number#toString alone gives the binary64 shortest form of the widened
-// value (0.1f32 → "0.10000000149011612"), which differs in digits, not just layout. Specials and
-// -0 go through renderFloat.
-export function renderFloat32(n: number): string {
-  if (!Number.isFinite(n) || n === 0) return renderFloat(n);
-  for (let p = 1; p < 9; p++) {
-    const shortest = Number(n.toPrecision(p));
-    if (Math.fround(shortest) === n) return renderFloat(shortest);
-  }
-  return renderFloat(Number(n.toPrecision(9))); // 9 significant digits always round-trip binary32
-}
-
-// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9.1) -------------------
+// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9) -------------------
 //
-// The canonical text of a float wherever it becomes part of a value — today, a JSON document. Its
-// digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
+// The text of a float wherever it is rendered: a result cell, CAST(float AS text), an array or
+// composite's text, a JSON document, EXPLAIN. Its digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
 // the fewest significant digits of a decimal STRICTLY inside the float's rounding interval, the
 // one nearest the exact value, a tie to the even last digit. Its layout is Ryu's to_chars:
 // fixed-point when the decimal exponent is in [-4, 15) for an f64 or [-4, 6) for an f32, otherwise

@@ -1820,8 +1820,8 @@ pub(crate) fn bound_op_text(op: CmpOp) -> &'static str {
 }
 
 /// Render a bound's const-source operand: a bind parameter as `$N` (1-based), a correlated
-/// outer-column reference as `outer`, or a literal. Floats use the native shortest-round-trip
-/// spelling under `explain-float-literal-layout`; the other variants use their canonical spelling.
+/// outer-column reference as `outer`, or a literal, in its canonical spelling (a float's is its
+/// PostgreSQL text, float.md §9).
 pub(crate) fn render_bound_src(src: &BoundSrc) -> String {
     match src {
         BoundSrc::Param(idx) => format!("${}", idx + 1),

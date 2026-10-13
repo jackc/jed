@@ -1320,8 +1320,8 @@ fn render_drained(drained: &Drained, cols: usize, sortmode: &str) -> Vec<String>
 /// Compare an expected vs actual flat row-major result list, applying the per-column conformance
 /// render tag (spec/design/conformance.md §1). For most coltype letters the compare is EXACT
 /// string equality, but the **`R` (real / float)** tag compares BY VALUE within a tolerance
-/// (spec/design/float.md §9): each core's native shortest-round-trip layout may differ and a
-/// transcendental may differ by an ULP, so a column tagged `R` parses both sides to f64 and
+/// (spec/design/float.md §9): a transcendental may differ by an ULP, and an expected value may be
+/// written in another layout, so a column tagged `R` parses both sides to f64 and
 /// considers them equal iff both NaN, or `==` (covers ±Inf and -0==+0), or both finite within a
 /// small relative tolerance. Column association comes from the row-major position (`i % cols`),
 /// valid for `nosort`/`rowsort`; `valuesort` loses it, so there we fall back to exact compare

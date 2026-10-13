@@ -2,8 +2,8 @@
 // the value-level semantics (total order, render, the -0/NaN canonicalization, the codec bytes) and
 // end-to-end tests through execute (literals, arithmetic + traps, casts, the canonical-fold SUM/AVG,
 // MIN/MAX, GROUP BY, the scalar functions, the strict-island 42804s, and the f32 Math.fround
-// discipline). The R-tag exemption (float.md §9) means cross-core text layout differs; these
-// assertions pin THIS core's deterministic surface (storage, total order, kernel, exact-sum fold).
+// discipline). The cross-core contract is the corpus; these assertions pin THIS core's
+// deterministic surface (storage, total order, kernel, exact-sum fold, the text's specials).
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -17,7 +17,7 @@ import {
   float32Value,
   float64Value,
   floatTotalCmp,
-  renderFloat,
+  renderFloatPg,
 } from "../src/value.ts";
 import { dbWith, errCode, query } from "./util.ts";
 import { memDb } from "./mem_db.ts";
@@ -26,14 +26,14 @@ const GOLDEN_PAGE_SIZE = 256;
 
 // --- value-level: render, canonicalization, total order ---------------------
 
-test("renderFloat: specials and -0", () => {
-  assert.equal(renderFloat(1.5), "1.5");
-  assert.equal(renderFloat(0), "0");
-  assert.equal(renderFloat(-0), "-0"); // JS (-0).toString() is "0"; we special-case it
-  assert.equal(renderFloat(Infinity), "Infinity");
-  assert.equal(renderFloat(-Infinity), "-Infinity");
-  assert.equal(renderFloat(NaN), "NaN");
-  assert.equal(renderFloat(-1.25), "-1.25");
+test("renderFloatPg: specials and -0", () => {
+  assert.equal(renderFloatPg(1.5, false), "1.5");
+  assert.equal(renderFloatPg(0, false), "0");
+  assert.equal(renderFloatPg(-0, false), "-0"); // JS (-0).toString() is "0"; we special-case it
+  assert.equal(renderFloatPg(Infinity, false), "Infinity");
+  assert.equal(renderFloatPg(-Infinity, false), "-Infinity");
+  assert.equal(renderFloatPg(NaN, false), "NaN");
+  assert.equal(renderFloatPg(-1.25, false), "-1.25");
 });
 
 test("canonFloat maps -0 to +0 only", () => {
@@ -62,7 +62,7 @@ test("floatTotalCmp is the PG total order: -Inf < finite < +Inf < NaN, -0==+0, N
   const xs = [NaN, 3, -Infinity, -0, 0, Infinity, -2.5, 100];
   xs.sort(floatTotalCmp);
   assert.deepEqual(
-    xs.map((x) => (Number.isNaN(x) ? "NaN" : renderFloat(canonFloat(x)))),
+    xs.map((x) => (Number.isNaN(x) ? "NaN" : renderFloatPg(canonFloat(x), false))),
     ["-Infinity", "-2.5", "0", "0", "3", "100", "Infinity", "NaN"],
   );
 });

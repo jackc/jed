@@ -98,8 +98,8 @@ EXPLAIN (ANALYZE TRUE, COSTS FALSE) SELECT name FROM city WHERE id = 3;
 `VERBOSE` replaces compact predicate counts with canonical resolved expressions and appends the
 projection list as `output=[...]`. `COSTS` controls the two estimate columns (on by default), `ANALYZE`
 adds `actual_cost`, and `LANE` adds `streaming`, `buffered`, or `deferred`. Boolean options accept
-`TRUE`/`FALSE` or `ON`/`OFF`; a missing value means true. Exact float bounds are shown with their
-shortest round-trip value rather than a placeholder. SQL/JSON expressions include their resolved
+`TRUE`/`FALSE` or `ON`/`OFF`; a missing value means true. Exact float bounds are shown as their
+PostgreSQL text rather than a placeholder. SQL/JSON expressions include their resolved
 `RETURNING`, wrapper/quotes, and `ON EMPTY`/`ON ERROR` behavior. Lanes describe the public dispatcher:
 sequence-mutating SELECTs and WITH statements containing DML are buffered writes regardless of shape.
 

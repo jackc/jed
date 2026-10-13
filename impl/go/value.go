@@ -596,9 +596,10 @@ func (v Value) Render() string {
 	case ValInterval:
 		return renderInterval(v.interval())
 	case ValFloat32:
-		return renderFloat32(v.F32())
+		// PostgreSQL's float4out / float8out text (spec/design/float.md §9).
+		return renderFloatPG(float64(v.F32()), 32)
 	case ValFloat64:
-		return renderFloat64(v.F64())
+		return renderFloatPG(v.F64(), 64)
 	case ValComposite:
 		// A composite renders as PG record_out: `(f1,f2,…)` with per-field quoting
 		// (spec/design/composite.md §8). The renderer recurses (a composite field's text is itself

@@ -77,9 +77,10 @@ Conventions, fixed here so every implementation renders identically:
   a tolerance, not by string**: both sides are parsed to f64 and considered equal iff bit-equal
   or within a small ULP/relative tolerance, with `NaN == NaN`, `±Inf` exact, and `-0 == +0`
   ([float.md](float.md) §9, [determinism.md](determinism.md) §6). This single rule absorbs the
-  cross-core rendering-layout difference and the exempted transcendental last-ULP divergence
-  (`f64` is the first type exempted from cross-core byte-identity for *computed/rendered
-  values*; its *storage*, *ordering*, *kernel*, *exact-sum aggregates*, and *cost* stay exact).
+  exempted transcendental last-ULP divergence and float `SUM`/`AVG` fold order, and lets an
+  expected value be written in any layout (`f64` is the first type exempted from cross-core
+  byte-identity for *computed values*; its *storage*, *ordering*, *kernel*, *exact-sum
+  aggregates*, *text*, and *cost* stay exact).
   The letter is a **rendering** tag (how a value
   is printed), *not* a type assertion — asserting the precise resolved type (`i16` vs
   `i32`) is the separate **`# types:`** directive (below; the decimal `numeric(p,s)` typmod

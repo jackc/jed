@@ -28,17 +28,6 @@ test         = "the `R` render tag's tolerant compare (parse to f64, equal withi
 status       = "ratified"
 reason       = "IEEE 754 does NOT mandate correctly-rounded transcendentals (the table-maker's dilemma), so every libm differs by an ULP across Rust/Go/TS and PG. Not injectable away; bit-pinned reimplementations would cost decimal-limb-level effort on an approximate type (the over-investment determinism.md §6 declines). The arithmetic kernel (+ - * / sqrt) IS correctly-rounded and stays in-contract (float.md §5)."
 
-# --- f64: text rendering layout ------------------------------------------
-[[exception]]
-id           = "float-render-layout"
-surface      = "f32/f64 value -> text (each core's native shortest-round-trip formatter), as a result cell, through the explicit CAST(float AS text), inside an error's structured Detail field (../design/error-fields.md §9.6), and as a constant float column DEFAULT in jed_columns.column_default (../design/introspection.md §5)"
-class        = "A"
-drops        = ["G2", "G3"]
-blast_radius = "the rendered STRING: its layout (exponent threshold/spelling) and, rarely, its last digit. The shortest-round-trip digits are unique except where a shorter decimal lies exactly on the rounding interval's bound (Go accepts it for an even mantissa: the double nearest 1e23 renders `1e+23`) or the value lies exactly halfway between two shortest candidates (Rust's Display and the TS f32 path round the other way); every rendering still parses back to the same float (per width — an f32 renders its binary32 shortest form in every core), and the `R` tag compares by parsed value, so these differences never affect a test result. A result cell is terminal. The one promotion path is the explicit CAST(float AS text) (../design/types.md §5): its text value carries the layout into whatever consumes it (a text comparison, length(), ORDER BY, a stored text column or key), so a query that branches on a float's rendered text can differ cross-core for values whose layouts differ (typically large or small magnitudes in exponent form). The value-level comparison, arithmetic, and key encoding of the float itself are unaffected. A float converted to JSON does NOT use this rendering: it takes the pinned PostgreSQL float8out text (../design/float.md §9.1), in-contract."
-test         = "the `R` render tag's tolerant compare (conformance.md §1) — parsed to f64, so layout is irrelevant. The result cell and the cast keep each core's native formatter (the exemption's payoff); the hand-rolled PostgreSQL text exists for JSON only. The CAST(float AS text) corpus entries (suites/cast/scalar_to_text.test) pin only values whose rendering every core and PostgreSQL share (ordinary decimals and the special values)."
-status       = "ratified"
-reason       = "Each language's shortest-round-trip formatter chooses different presentation (Rust {} vs Go FormatFloat(-1) vs JS toString) even when the digits agree. Pinning one shared formatter is decimal-limb-level effort for zero observable benefit given the `R` tolerant compare."
-
 # --- EXPLAIN: canonical resolved-expression spelling ----------------------
 [[exception]]
 id           = "explain-expression-spelling"
@@ -49,17 +38,6 @@ blast_radius = "presentation inside the EXPLAIN detail text only. The printer co
 test         = "exact `T` cells in suites/query/explain_followon.test pin fully-parenthesized column slots, constants, operators, CASE, and function/projection spelling across Rust/Go/TypeScript; ordinary query conformance independently pins the expression's semantics and cost."
 status       = "ratified"
 reason       = "The surface is deliberately hand-written in each independent core rather than generated. No determinism guarantee is surrendered, but the explicit ledger audit records the presentation boundary and its non-contamination rule, as required for promoting resolved-expression structure into observable plan text."
-
-# --- EXPLAIN: native shortest float text in details -----------------------
-[[exception]]
-id           = "explain-float-literal-layout"
-surface      = "f32/f64 literals embedded in EXPLAIN bound and VERBOSE expression detail text (../design/explain.md §5)"
-class        = "A"
-drops        = ["G2", "G3"]
-blast_radius = "the float token's STRING layout inside one EXPLAIN detail cell (exponent threshold/spelling) only. The parsed IEEE value, encoded bound, selected access path, result rows, estimates, actual cost, and every non-float detail token remain exact. Plan text is terminal and never reparsed for execution."
-test         = "suites/query/explain_followon.test pins an exactly shared ordinary-layout value in both the verbose expression and compact PK bound. Float-key/query suites independently pin the encoded bound and results; formatter-threshold spellings join the existing float-render-layout exemption rather than gaining a second semantic tolerance path."
-status       = "ratified"
-reason       = "The bound must expose the exact value rather than the former `<float>` placeholder, but jed intentionally retains each language's native shortest-round-trip formatter. As with float-render-layout, equivalent exponent/layout choices can differ even though the value and plan are identical."
 
 # --- uuidv4: random generation on the entropy seam ---------------------------
 [[exception]]

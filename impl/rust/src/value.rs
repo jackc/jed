@@ -613,13 +613,9 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Bool(true) => "true".to_string(),
             Value::Bool(false) => "false".to_string(),
-            // Floats render with the native SHORTEST round-trip formatter (spec/design/float.md §9):
-            // Rust's `{}` (= `to_string()`) is shortest-round-trip. Special values render PG-style
-            // (`Infinity` / `-Infinity` / `NaN`), and `-0` renders `-0` (Rust's default already
-            // prints `-0`). Layout may differ across cores; the conformance `R` tag compares by
-            // value within a tolerance (float.md §9), so this divergence is absorbed.
-            Value::Float32(f) => render_f32(*f),
-            Value::Float64(f) => render_f64(*f),
+            // PostgreSQL's float4out / float8out text (spec/design/float.md §9).
+            Value::Float32(f) => render_float_pg(f64::from(*f), true),
+            Value::Float64(f) => render_float_pg(*f, false),
             Value::Text(s) => s.clone(),
             // Decimal renders as its canonical base-10 string, preserving display scale
             // (the `D` tag — spec/design/decimal.md §6).
@@ -1575,44 +1571,10 @@ fn bool3(b: bool) -> ThreeValued {
     }
 }
 
-/// Render a `f64` as its native shortest-round-trip decimal, with PG-style special-value
-/// spellings (spec/design/float.md §9). Rust's `{}` is already shortest-round-trip and prints
-/// `-0` for negative zero, but spells infinity `inf`/`-inf` and NaN `NaN`; PG (and the corpus)
-/// want `Infinity` / `-Infinity` / `NaN`, so those three are spelled here. The layout of finite
-/// values is core-specific and absorbed by the `R` tag's tolerant compare (§9).
-fn render_f64(f: f64) -> String {
-    if f.is_nan() {
-        "NaN".to_string()
-    } else if f.is_infinite() {
-        if f < 0.0 {
-            "-Infinity".to_string()
-        } else {
-            "Infinity".to_string()
-        }
-    } else {
-        f.to_string()
-    }
-}
-
-/// As [`render_f64`], for `f32` — `f32::to_string()` is the binary32 shortest round trip.
-fn render_f32(f: f32) -> String {
-    if f.is_nan() {
-        "NaN".to_string()
-    } else if f.is_infinite() {
-        if f < 0.0 {
-            "-Infinity".to_string()
-        } else {
-            "Infinity".to_string()
-        }
-    } else {
-        f.to_string()
-    }
-}
-
-// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9.1) -------------------
+// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9) -------------------
 //
-// The canonical text of a float wherever it becomes part of a value — today, a JSON document. Its
-// digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
+// The text of a float wherever it is rendered: a result cell, CAST(float AS text), an array or
+// composite's text, a JSON document, EXPLAIN. Its digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
 // the fewest significant digits of a decimal STRICTLY inside the float's rounding interval, the
 // one nearest the exact value, a tie to the even last digit. Its layout is Ryu's `to_chars`:
 // fixed-point when the decimal exponent is in [-4, 15) for an f64 or [-4, 6) for an f32, otherwise

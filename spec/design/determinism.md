@@ -109,8 +109,7 @@ deliberately keeps **inside** the deterministic contract by paying for it elsewh
   [json.md §2.3](json.md)) so the bytes and every key-enumerating render are a pure function
   of the value, never of hashmap order — and JSON numbers are exact **`decimal`**, never
   binary float ([json.md §8](json.md)); a float converted to JSON takes PostgreSQL's pinned
-  `float8out` text ([float.md](float.md) §9.1), not the native rendering, so JSON introduces
-  **no new** sanctioned relaxation
+  `float8out` text ([float.md](float.md) §9), so JSON introduces **no new** sanctioned relaxation
   (its only seam-reads are the existing clock/entropy ones, the `.datetime()`/`_tz` path
   surface — [jsonpath.md §5.1](jsonpath.md), class **B** below).
 - **Plan choice and estimates.** Independently implemented optimizers are not permission to pick
@@ -216,9 +215,9 @@ the design doc, type-system data, and exception ledger are authored and the type
 across all three cores). They are the *defining* members of class **A**: the one case where a value that **has** a right answer is
 computed *differently per core* (G2) and per platform (G3) and cannot be injected away — but the
 exemption is **narrow** (storage, total order, the `+ − * / sqrt` kernel, `MIN`/`MAX`/`COUNT`,
-int/decimal `SUM`/`AVG`, and cost all stay in-contract; transcendental *values*, text-rendering
-*layout*, and the float `SUM`/`AVG` *fold order* are exempt, all absorbed by the `R` tag's
-tolerant compare). The ledger entries are in [../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml).
+int/decimal `SUM`/`AVG`, text rendering, and cost all stay in-contract; transcendental *values*
+and the float `SUM`/`AVG` *fold order* are exempt, both absorbed by the `R` tag's tolerant
+compare). The ledger entries are in [../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml).
 
 The hard surface and the resolutions taken (full detail in [float.md](float.md)):
 
@@ -245,10 +244,9 @@ The hard surface and the resolutions taken (full detail in [float.md](float.md))
   differs by an ULP → defer or exclude (or ship bit-pinned implementations later, at
   decimal-limb cost).
 - **Text formatting** — the native shortest round trips differ in *layout* and, at exact ties
-  and interval bounds, in the last *digit*. A result cell and `CAST(float AS text)` keep the
-  native rendering (`float-render-layout`, absorbed by the `R` tag); a float inside JSON takes
-  the hand-rolled PostgreSQL `float8out` text, pinned by oracle-checked corpus entries
-  ([float.md](float.md) §9.1).
+  and interval bounds, in the last *digit*. Every rendering instead takes the hand-rolled
+  PostgreSQL `float8out` text, pinned by oracle-checked corpus entries ([float.md](float.md) §9),
+  so it is in-contract.
 - **Ordering / keys** — adopt PG's total order (`-0 = +0`, `NaN = NaN`, `NaN` largest);
   order-preserving key encoding via the u64-bit trick with `-0`/`NaN` canonicalization.
 

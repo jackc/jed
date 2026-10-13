@@ -1225,9 +1225,9 @@ func renderBoundSrc(e *rExpr) string {
 	}
 }
 
-// renderBoundLit renders a constant bound operand as a single-line token. Floats use the native
-// shortest-round-trip spelling under explain-float-literal-layout; other values use their canonical
-// renderer, quoting textual forms so the token stays structurally unambiguous.
+// renderBoundLit renders a constant bound operand as a single-line token. A float is its
+// PostgreSQL text (float.md §9); other values use their canonical renderer, quoting textual forms
+// so the token stays structurally unambiguous.
 func renderBoundLit(e *rExpr) string {
 	switch e.kind {
 	case reConstInt:
@@ -1241,8 +1241,10 @@ func renderBoundLit(e *rExpr) string {
 		return e.cDec.Render()
 	case reConstText:
 		return quoteExplainText(e.cText)
-	case reConstFloat32, reConstFloat64:
-		return strconv.FormatFloat(e.cFloat, 'g', -1, map[bool]int{true: 32, false: 64}[e.kind == reConstFloat32])
+	case reConstFloat32:
+		return renderFloatPG(e.cFloat, 32)
+	case reConstFloat64:
+		return renderFloatPG(e.cFloat, 64)
 	default:
 		return "<value>"
 	}

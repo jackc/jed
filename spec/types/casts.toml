@@ -535,8 +535,8 @@ overflow_error = "22P02"
 # --- any scalar -> text (../design/types.md §5) -------------------------------------------------
 # CAST(x AS text) / x::text / x::varchar(n) from every built-in scalar renders the type's OWN OUTPUT
 # FORM — the text a result cell of that type shows: base-10 integers and decimals (decimal keeps its
-# display scale), true/false (PostgreSQL's bool -> text cast, not boolout's t/f), each core's shortest
-# round-trip float (layout core-specific under the float-render-layout determinism exception), bytea
+# display scale), true/false (PostgreSQL's bool -> text cast, not boolout's t/f), a float as
+# PostgreSQL's float8out / float4out text (the same in every core, float.md §9), bytea
 # \x hex, uuid canonical lowercase, timestamp/date/interval in the ISO / `postgres` styles, json
 # verbatim, jsonb/jsonpath canonical. timestamptz renders in the SESSION zone with PostgreSQL's offset
 # spelling (+HH, +HH:MM, +HH:MM:SS) — a hand-written, zone-dependent transform (like the datetime

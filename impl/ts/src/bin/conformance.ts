@@ -287,8 +287,8 @@ function parseFloatCell(s: string): number {
 // floatCellsEqual is the R (real) render-tag's tolerant comparison (spec/design/float.md §9,
 // conformance.md §1): parse both cells to f64 and consider them equal iff both NaN, OR bit-equal /
 // Object.is (covers ±Inf and -0===+0 via the a===b arm), OR — for two finite values — within a
-// small relative tolerance. Layout differences and a transcendental's last-ULP divergence never
-// fail. This is the ONE tag compared by value, not by string.
+// small relative tolerance. A transcendental's last-ULP divergence and an expected value written in
+// another layout never fail. This is the ONE tag compared by value, not by string.
 function floatCellsEqual(expected: string, actual: string): boolean {
   const a = parseFloatCell(expected);
   const b = parseFloatCell(actual);

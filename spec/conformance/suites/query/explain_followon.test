@@ -328,8 +328,8 @@ Scan t
 PK bound: id = 1; touched=2
 2
 
-# Float constants use each core's exact shortest round-trip rendering in both the expression and
-# the compact bound. The float-layout ledger entry bounds the presentation exception.
+# Float constants render as PostgreSQL's float8out text (float.md §9) in both the expression and
+# the compact bound, the same in every core.
 statement ok
 CREATE TABLE f (x f64 PRIMARY KEY)
 
@@ -346,6 +346,18 @@ filter=(#0 = 1.25); output=[#0]
 1
 Scan f
 PK bound: x = 1.25; touched=1
+
+# 1e23 is not a double: its nearest renders with Ryu's digits, in exponent form.
+# names: depth, node, detail
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT x FROM f WHERE x = f64 '1e23'
+----
+0
+Filter
+filter=(#0 = 9.999999999999999e+22); output=[#0]
+1
+Scan f
+PK bound: x = 9.999999999999999e+22; touched=1
 
 # UPDATE/DELETE scan details include the exact resolved DML touched-set width.
 query ITT nosort

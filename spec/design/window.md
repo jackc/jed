@@ -566,8 +566,8 @@ a row.
   (the corpus compares `rowsort` or adds an `ORDER BY`); the *values* are deterministic.
 - **The `f64` ratios** (`percent_rank`/`cume_dist`) are one IEEE correctly-rounded division of
   small exactly-representable integer counts ([float.md](float.md) §5), so the value is
-  bit-identical across cores and to PostgreSQL — in-contract, no exemption; the `R` render tag
-  ([conformance.md](conformance.md) §1) absorbs any cross-core layout difference.
+  bit-identical across cores and to PostgreSQL — in-contract, no exemption, and so is its text
+  ([float.md](float.md) §9).
 - **Aggregate-window reuse** inherits the aggregate determinism contract unchanged (the
   order-independent float fold, the widening overflow boundaries).
 

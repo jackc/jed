@@ -411,11 +411,11 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   binary floats **out of the comparison and text-output paths entirely**; lean on exact
   `decimal`. This aligns with "a real type system" and kills the worst offender. ✅ `decimal`
   has landed (`spec/design/decimal.md`) as that exact path. Binary `f32`/`f64` has since landed
-  too (`spec/design/float.md`) as the **first type narrowly exempted from byte-identity**: each
-  core renders a result cell with its native shortest round-trip formatter, and the corpus `R`
-  tag compares within a tolerance (the `float-render-layout` entry in the determinism ledger).
-  A float that becomes part of a JSON value instead takes PostgreSQL's exact `float8out` text,
-  hand-rolled in every core and byte-identical (`spec/design/float.md` §9.1).
+  too (`spec/design/float.md`) as the **first type narrowly exempted from byte-identity** — but
+  only its transcendental function values and float `SUM`/`AVG` fold order, which the corpus `R`
+  tag compares within a tolerance. Its text is in-contract: every rendering (result cell, cast,
+  JSON, EXPLAIN) is PostgreSQL's exact `float8out` text, hand-rolled in every core
+  (`spec/design/float.md` §9).
 - **Decimal rounding** — ✅ **decided: round half away from zero** (PostgreSQL `numeric`;
   `0.125 → 0.13`, `2.5 → 3`), one mode engine-wide, applied to scale coercion / casts /
   division (`spec/design/decimal.md` §3). Result **scale** follows PG's per-operator rules
@@ -764,8 +764,9 @@ The design is optimized for AI agents even more than for humans. In practice:
   everything *else* stays bit-reproducible, which is what the agent loop and cross-impl sync
   depend on. Determinism is **default-deny with a ledger** (`spec/design/determinism.md`): the
   few sanctioned relaxations are enumerated in `spec/conformance/determinism_exceptions.toml` —
-  `f64` value/render (class A), and the **`uuidv4`/`uuidv7` generators** plus the **clock
-  functions `now()`/`current_timestamp`/`clock_timestamp()`**, which read entropy + the clock through
+  `f64` transcendental values and `SUM`/`AVG` fold order (class A), and the **`uuidv4`/`uuidv7`
+  generators** plus the **clock functions `now()`/`current_timestamp`/`clock_timestamp()`**, which
+  read entropy + the clock through
   a **host-injected seam** (`spec/design/entropy.md`) and so stay *deterministic given the seam
   inputs* (tests inject a fixed seed + a fixed/advancing clock → byte-identical cross-core; production
   reads OS entropy + wall clock). The seam joins the storage and cost seams as the engine's third

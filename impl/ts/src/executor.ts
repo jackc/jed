@@ -378,7 +378,6 @@ import {
   nullValue,
   decodeHexPairs,
   renderByteaHex,
-  renderFloat,
   renderUuid,
   textValue,
   intervalValue,
@@ -28228,10 +28227,10 @@ export function distinctValueKey(v: Value): string {
       // tags 'f'/'g' per width so a f32 never collides with a f64 of the same number
       // (they are different typed columns; the tag keeps the key total). The number's toString
       // is the shortest round-trip — unique per binary value, so distinct values get distinct
-      // keys after the -0/NaN normalization.
+      // keys after the -0/NaN normalization. It is never displayed.
       return (
         (v.kind === "f32" ? "f" : "g") +
-        (Number.isNaN(v.value) ? "NaN" : renderFloat(canonFloat(v.value)))
+        (Number.isNaN(v.value) ? "NaN" : canonFloat(v.value).toString())
       );
     default:
       // unfetched never reaches a projected dedup row (the scan layer resolves touched columns).

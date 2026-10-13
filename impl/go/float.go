@@ -5,9 +5,9 @@ package jed
 // NaN/±Infinity. It is the FIRST type partially exempted from cross-core byte-identity
 // (determinism.md §6), but the exemption is NARROW — storage, the total order, the
 // +-*/ /sqrt kernel, MIN/MAX/COUNT and int/decimal SUM/AVG, and cost all stay fully
-// deterministic and cross-core. TRANSCENDENTAL function values, text-render LAYOUT, and the
-// float SUM/AVG fold ORDER (streaming scan-order — §7) are exempt (absorbed by the conformance
-// `R` tag). This file holds the float-specific value logic: the total order, the kernel, the
+// deterministic and cross-core, and so does the text (PostgreSQL's float8out — §9).
+// TRANSCENDENTAL function values and the float SUM/AVG fold ORDER (streaming scan-order — §7) are
+// exempt (absorbed by the conformance `R` tag). This file holds the float-specific value logic: the total order, the kernel, the
 // casts, and the streaming scan-order fold.
 
 import (
@@ -118,52 +118,10 @@ func encodeFloat32Key(bits uint32) []byte {
 	return []byte{byte(bits >> 24), byte(bits >> 16), byte(bits >> 8), byte(bits)}
 }
 
-// --- rendering (spec/design/float.md §9) --------------------------------------------------
+// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9) -------------------
 //
-// Each core uses its NATIVE shortest-round-trip formatter; the `R` tag absorbs layout
-// differences. Go: strconv.FormatFloat('g', -1, width). Special values render PG-style —
-// `Infinity` / `-Infinity` / `NaN` (Go prints `+Inf`/`-Inf`/`NaN`), and -0 renders `-0`.
-
-// renderFloat64 formats a f64 as its shortest round-trip decimal, mapping Go's special-value
-// spellings to the spec's PG spellings (spec/design/float.md §9).
-func renderFloat64(f float64) string {
-	if math.IsNaN(f) {
-		return "NaN"
-	}
-	if math.IsInf(f, 1) {
-		return "Infinity"
-	}
-	if math.IsInf(f, -1) {
-		return "-Infinity"
-	}
-	if f == 0 && math.Signbit(f) {
-		return "-0" // negative zero renders with its sign (PG)
-	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
-}
-
-// renderFloat32 is renderFloat64 at binary32 width (shortest round-trip for the 32-bit value).
-func renderFloat32(f float32) string {
-	d := float64(f)
-	if math.IsNaN(d) {
-		return "NaN"
-	}
-	if math.IsInf(d, 1) {
-		return "Infinity"
-	}
-	if math.IsInf(d, -1) {
-		return "-Infinity"
-	}
-	if d == 0 && math.Signbit(d) {
-		return "-0"
-	}
-	return strconv.FormatFloat(d, 'g', -1, 32)
-}
-
-// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9.1) -------------------
-//
-// The canonical text of a float wherever it becomes part of a value — today, a JSON document. Its
-// digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
+// The text of a float wherever it is rendered: a result cell, CAST(float AS text), an array or
+// composite's text, a JSON document, EXPLAIN. Its digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
 // the fewest significant digits of a decimal STRICTLY inside the float's rounding interval, the
 // one nearest the exact value, a tie to the even last digit. Its layout is Ryu's to_chars:
 // fixed-point when the decimal exponent is in [-4, 15) for an f64 or [-4, 6) for an f32, otherwise

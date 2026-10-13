@@ -48,14 +48,13 @@ So the stance (determinism.md §6, class **A**):
 - **Cost** — structural (one `operator_eval` per node, one `aggregate_accumulate` per row);
   it depends on the *count* of operations, never the float *value*, so it stays fully
   deterministic and cross-core, and float queries still carry `# cost:` assertions.
+- **Text** — every rendering of a float is PostgreSQL's `float8out` / `float4out` text, computed
+  the same way in every core (§9).
 
 **Exempted from cross-core identity (G2/G3) — ledgered (`determinism_exceptions.toml`):**
 
 - **Transcendental function *values*** (`exp`, `ln`, `log10`, `pow`/`^`, `sin`, `cos`, `tan`,
   `atan2`, …) — not IEEE-correctly-rounded; every libm differs by an ULP (§8).
-- **Text rendering layout** — each core uses its native shortest-round-trip formatter (§9);
-  the corpus's **`R`** render tag compares by *parsing back to f64 within a tolerance*, so
-  layout differences and a transcendental's last-ULP divergence never fail a test.
 - **Float `SUM`/`AVG` fold order** — folded as a **streaming running total in scan order**
   (§7), not order-independently. Because IEEE `+` is non-associative, the low bits depend on
   the fold order, so the value is exempted (class **A ∩ P** — determinism.md §7): it is
@@ -73,7 +72,7 @@ So the stance (determinism.md §6, class **A**):
 Net: a float query that does not call a transcendental is, in practice, cross-core identical
 today (float `SUM`/`AVG` included — every core folds the same scan order); the exemption
 withholds the *promise* only at transcendentals, float `SUM`/`AVG` fold order (against a future
-parallel plan), the PG oracle, and the rendering layout the `R` tag already absorbs.
+parallel plan), and the PG oracle.
 
 ## 2. Scope — two widths forming a promotion tower
 
@@ -236,7 +235,7 @@ one is lossy or representation-changing:
 | `decimal → f64` | explicit | nearest binary64 to the exact decimal value, round-ties-to-even. Never traps (a huge decimal → ±Inf? **traps `22003`** rather than yielding Inf, matching the finite-overflow rule §3). |
 | `f64 → int{16,32,64}` | explicit | round **half away from zero** to an integer (jed's one rounding mode — decimal.md §3), then range-check (`22003`). NaN/±Inf → `22003`. **Documented divergence from PG**, which rounds half-to-even (`rint`); jed keeps one engine-wide mode. |
 | `f64 → decimal` | explicit | the exact decimal of the binary64 value, then the target typmod's scale coercion (decimal.md §3). NaN/±Inf → `22003` (decimal is finite). |
-| `text ⇄ f64` | explicit | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS f64)` parses per row (the runtime-text-cast slice), and `CAST(float_expr AS text)` renders the value with the §9 shortest round-trip formatter (types.md §5) — so a float's text *layout* reaches a text value, under the `float-render-layout` exception. |
+| `text ⇄ f64` | explicit | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS f64)` parses per row (the runtime-text-cast slice), and `CAST(float_expr AS text)` renders PostgreSQL's `float8out` / `float4out` text (§9, types.md §5), the same in every core, so it can be compared, stored, and keyed. |
 
 `int`/`decimal` → `f64` is explicit (not implicit like `int → decimal`) precisely because
 it is **lossy** — the whole point of the strict matrix.
@@ -301,7 +300,7 @@ the `abs`/`round` precedent) with `f64` overloads. **Also in-contract** — thou
 are irrational — are **`pi()`** (a shared f64 literal, no operand) and **`radians`/`degrees`**
 (a SINGLE correctly-rounded IEEE multiply/divide by PG's exact `RADIANS_PER_DEGREE` literal):
 one IEEE op with one shared constant is byte-identical cross-core, so these carry **no** ledger
-entry, only the standing `float-render-layout` exemption (§9).
+entry.
 
 **Transcendental — exempted (G2/G3 dropped, ledgered):** `exp`, `ln`, `log10`, `pow(x, y)` /
 the `^` operator, `power` (the PG-name alias for `pow`), `sin`, `cos`, `tan`, `cbrt`, `asin`,
@@ -334,49 +333,33 @@ trio `scale`/`min_scale`/`trim_scale` have **landed** (in-contract, no ledger �
 
 ## 9. Rendering and the `R` conformance tag
 
-**Rendering.** A `f64` renders with each core's **native shortest round-trip** formatter
-(Rust `{}`, Go `strconv.FormatFloat(f, 'g', -1, 64)`, JS `Number.prototype.toString`),
-producing the shortest decimal string that parses back to the same binary64. Special values
-render PG-style: `Infinity`, `-Infinity`, `NaN` (and `-0` renders `-0`). The *layout*
-(exponent threshold/spelling) differs between the formatters, and so, rarely, does the last
-*digit*: shortest round trip is unique except where a shorter decimal lies exactly on the
-rounding interval's bound (Go accepts it when the mantissa is even; `1e23` is the classic case,
-the double nearest it being `99999999999999991611392`) or the value lies exactly halfway between
-two shortest candidates (Go and JavaScript's `toString` take the even digit, Rust's `Display`
-and JavaScript's `toPrecision` the other). The `R` tag absorbs both, so a result cell keeps its
-native formatter (the exemption's payoff, determinism.md §6). A float that becomes part of a
-*value* other than `text` uses the pinned PostgreSQL text instead (§9.1).
-
-An `f32` renders the **binary32** shortest round trip — the fewest digits that read back to the same
-binary32 (Rust's `f32` `Display`, Go's `FormatFloat(f, 'g', -1, 32)`; TypeScript, which holds an
-`f32` widened in a `Number`, searches the precisions 1–9 for the shortest that `Math.fround`s back),
-so `real '0.1'` renders `0.1` in every core, not the widened binary64's `0.10000000149011612`.
-
-The explicit `CAST(x AS text)` of a float ([types.md](types.md) §5) produces exactly this rendering
-as a `text` value. That is the one path by which the native rendering leaves the terminal render
-and reaches a value that can be compared, measured, or stored; it is covered by the same
-`float-render-layout` exception. The corpus pins such casts only for values whose rendering every
-core and PostgreSQL agree on.
-
-### 9.1 The PostgreSQL text: floats in JSON
-
-A float converted to JSON (`to_json[b]`, `array_to_json`, `row_to_json`, `JSON_SCALAR`, the
-builders and aggregates, a `FORMAT JSON` `PASSING` value — [json-sql-functions.md](json-sql-functions.md)
-§2.2) becomes part of a value that is stored, compared, and keyed, so its text is **pinned**:
-exactly PostgreSQL's `float8out` (an `f32`: `float4out`) at the oracle's `extra_float_digits = 1`.
-It is in-contract, byte-identical across cores and with PostgreSQL, with no ledger entry.
+**Rendering.** Every rendering of a float is PostgreSQL's `float8out` (an `f32`: `float4out`)
+text at the oracle's `extra_float_digits = 1`: a result cell, `CAST(float AS text)` and what is
+built on it (an array's or composite's text, a `text[]` element), a JSON document (§9.1), an
+error's Detail field, a `column_default`, an EXPLAIN literal. It is in-contract, byte-identical
+across cores and with PostgreSQL, with no ledger entry; the text can be compared, stored, and
+keyed (a `UNIQUE` index on `f::text` holds in every core).
 
 - **Digits** — PostgreSQL's Ryu (`src/common/d2s.c` / `f2s.c`), built with `STRICTLY_SHORTEST 0`:
   the fewest significant digits of a decimal **strictly inside** the value's rounding interval
   (both bounds excluded, whatever the mantissa's parity); among those, the one nearest the exact
   value; a tie to the even last digit. The interval is `x ± ½ ulp`, except that its lower half is
-  `¼ ulp` when the mantissa is a power of two above the lowest binade.
+  `¼ ulp` when the mantissa is a power of two above the lowest binade. An `f32` takes the
+  binary32 interval, so `real '0.1'` is `0.1`, not the widened binary64's `0.10000000149011612`.
 - **Layout** — Ryu's `to_chars`: fixed-point when the decimal exponent of the first digit is in
   `[-4, 15)` for an `f64` or `[-4, 6)` for an `f32` (`0.0001`, `100000000000000`, `123456`),
   otherwise `d[.ddd]e±XX` with at least two exponent digits (`1e-05`, `1e+15`, `1.6777215e+07`,
   `5e-324`). `NaN`, `Infinity`, `-Infinity`, `0`, `-0` are spelled out.
 
-Each core computes the digits the same way, from the exact value with its own decimal limb
+The native shortest round trips (Rust `{}`, Go `strconv.FormatFloat(f, 'g', -1, 64)`,
+JavaScript `Number.prototype.toString`) are not enough. Their layouts differ, and so, rarely, do
+their digits: a shorter decimal can lie exactly on the rounding interval's bound (Go accepts it
+when the mantissa is even; the double nearest `1e23`, `99999999999999991611392`, is `1e+23` in Go
+and `9.999999999999999e+22` in PostgreSQL), or the value can lie exactly halfway between two
+shortest candidates (`3454183008863.90625`: Go and `toString` take the even digit, Rust's `Display`
+and JavaScript's `toPrecision` the other).
+
+So each core computes the digits the same way, from the exact value with its own decimal limb
 arithmetic (`floatShortestExact`): for each length n, the n-digit decimals just below and just
 above the exact value, kept if strictly inside the interval; the first length with one wins. The
 search starts at the native shortest length, a valid lower bound because a native formatter
@@ -389,24 +372,29 @@ significant digits (a negative exponent of at least `-25`, or an integer bound b
 with a factor 5 in its odd part). A fuzz of fifty thousand values against the oracle (random bit
 patterns, every power of two, the neighbours of every power of ten, short dyadics, large
 integers), on both paths, agreed exactly. The guarded values cost a few times the native
-formatter (`json_float_render` benchmark).
+formatter (`json_float_render` benchmark). Only internal keys that are never displayed (the
+DISTINCT/GROUP BY dedup key) keep a native formatter.
 
-JSON's use of the text: in `json` it is a number, or for NaN/±Infinity a JSON string; in `jsonb`
+**The `R` (real) render tag** (conformance.md §1 — long reserved, now in use). A column tagged
+`R` is compared **by value, not by string**: both expected and actual are parsed to f64 and
+considered equal iff bit-equal **or** within a small relative/ULP tolerance, with `NaN` ==
+`NaN`, `±Inf` exact, and `-0` == `+0`. This single rule covers (a) a transcendental's last-ULP
+cross-core divergence, (b) the float `SUM`/`AVG` fold order, and (c) the larger jed-vs-PG
+divergence in the oracle import (PG libm). The in-contract surface
+(kernel, exact functions, exact-sum aggregates) is bit-identical and would pass an exact
+compare; the tolerance exists for the exempted surface and the oracle. `# cost:`/`# names:`/
+`# types:` are unaffected — they are structural and stay exact (§1).
+
+### 9.1 Floats in JSON
+
+A float converted to JSON (`to_json[b]`, `array_to_json`, `row_to_json`, `JSON_SCALAR`, the
+builders and aggregates, a `FORMAT JSON` `PASSING` value — [json-sql-functions.md](json-sql-functions.md)
+§2.2) takes the §9 text: in `json` it is a number, or for NaN/±Infinity a JSON string; in `jsonb`
 it is the `numeric` that `numeric_in` reads from it (`1e+21` is `1000000000000000000000`, `-0` is
 `0`), or the string; an object key is the text. A float `PASSING` value without `FORMAT JSON`
 does not use the text: it is a jsonpath number by `float8_numeric` / `float4_numeric` (`%.15g` /
 `%.6g` of the exact value), and NaN/±Infinity, numeric NaN/Infinity items in PostgreSQL, are a
 deferred `0A000` because jed's `decimal` is finite.
-
-**The `R` (real) render tag** (conformance.md §1 — long reserved, now in use). A column tagged
-`R` is compared **by value, not by string**: both expected and actual are parsed to f64 and
-considered equal iff bit-equal **or** within a small relative/ULP tolerance, with `NaN` ==
-`NaN`, `±Inf` exact, and `-0` == `+0`. This single rule covers (a) cross-core layout
-differences, (b) a transcendental's last-ULP cross-core divergence, and (c) the larger
-jed-vs-PG divergence in the oracle import (PG formatting + PG libm). The in-contract surface
-(kernel, exact functions, exact-sum aggregates) is bit-identical and would pass an exact
-compare; the tolerance exists for the exempted surface and the oracle. `# cost:`/`# names:`/
-`# types:` are unaffected — they are structural and stay exact (§1).
 
 ## 10. On-disk, keys, and cost
 
@@ -463,9 +451,10 @@ compare; the tolerance exists for the exempted surface and the oracle. `# cost:`
 5. **Exact accumulator** — `SUM`/`AVG` round once over an order-independent exact sum; special
    values resolved before the finite sum. Hand-rolled identically per core (no library drift).
 6. **In-contract vs exempted** — storage, ordering, the kernel, exact functions (incl `sqrt`),
-   exact-sum aggregates, and **cost/names/types** are bit-identical (G1–G3). Only transcendental
-   *values* and rendering *layout* are exempted, both absorbed by the `R` tag's tolerant
-   compare + the ledger; float-gated control flow is the one promotion path (§1, §4).
+   exact-sum aggregates, text rendering (§9), and **cost/names/types** are bit-identical (G1–G3).
+   Only transcendental *values* and the float `SUM`/`AVG` fold order are exempted, absorbed by the
+   `R` tag's tolerant compare + the ledger; float-gated control flow is the one promotion path
+   (§1, §4).
 7. **`R` tag compares by value** (parse to f64 + tolerance), never by string; NaN==NaN, ±Inf
    exact, -0==+0.
 8. **Strict coercion** — no implicit `int`/`decimal` ⊕ `f64` (`42804`); only literals adapt

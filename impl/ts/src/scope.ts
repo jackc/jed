@@ -100,7 +100,7 @@ import type {
 import { cteBodyAsQuery, cteBodyIsDataModifying, forEachGroupExpr } from "./ast.ts";
 import { requireSetopEquality, unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
-import { render, renderFloat } from "./value.ts";
+import { render, renderFloatPg } from "./value.ts";
 import { storeValue } from "./store.ts";
 import { quoteIdentifier } from "./parser.ts";
 import type { Privilege } from "./privileges.ts";
@@ -2800,9 +2800,9 @@ export function renderBoundSrc(e: RExpr | null): string {
   }
 }
 
-// renderBoundLit renders a constant bound operand as a single-line token. Floats use the native
-// shortest-round-trip spelling under explain-float-literal-layout; other values use their canonical
-// renderer, quoting textual forms so the token stays structurally unambiguous.
+// renderBoundLit renders a constant bound operand as a single-line token. A float is its
+// PostgreSQL text (float.md §9); other values use their canonical renderer, quoting textual forms
+// so the token stays structurally unambiguous.
 export function renderBoundLit(e: RExpr): string {
   switch (e.kind) {
     case "constInt":
@@ -2814,7 +2814,7 @@ export function renderBoundLit(e: RExpr): string {
     case "constText":
       return quoteExplainText(e.value);
     case "constFloat":
-      return renderFloat(e.value);
+      return renderFloatPg(e.value, e.ty === "f32");
     default:
       return "<value>";
   }
@@ -2921,7 +2921,7 @@ export function renderRExpr(e: RExpr): string {
     case "constInt":
       return e.value.toString();
     case "constFloat":
-      return renderFloat(e.value);
+      return renderFloatPg(e.value, e.ty === "f32");
     case "constBool":
       return e.value ? "true" : "false";
     case "constText":
@@ -3161,7 +3161,7 @@ function renderExplainValue(value: Value): string {
       return value.dec.render();
     case "f32":
     case "f64":
-      return renderFloat(value.value);
+      return renderFloatPg(value.value, value.kind === "f32");
     default:
       return quoteExplainText(render(value));
   }

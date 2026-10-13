@@ -328,11 +328,8 @@ statement.
 
 `Detail` is built **after** the error is decided, from values the statement already holds. It is
 **unmetered** and cannot change the error code, the reported cost, or the abort point. Its text is
-cross-core byte-identical, with two input-determined exceptions:
-
-- a `timestamptz` renders in the session zone (deterministic given the session);
-- a float value's *layout* follows the existing `float-render-layout` determinism exception, whose
-  surface now names `Detail`.
+cross-core byte-identical. A `timestamptz` renders in the session zone (deterministic given the
+session), and a float as its PostgreSQL text ([float.md](float.md) §9).
 
 There is no format bump and no cost-schedule change.
 

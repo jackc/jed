@@ -1968,7 +1968,7 @@ impl Decimal {
     }
 }
 
-/// PostgreSQL's shortest decimal of the finite, nonzero float `m·2^e` (spec/design/float.md §9.1)
+/// PostgreSQL's shortest decimal of the finite, nonzero float `m·2^e` (spec/design/float.md §9)
 /// by exact decimal arithmetic over its rounding interval: for each length n from `min_len`, the
 /// n-digit decimals just below and just above the value, kept if strictly inside the interval; the
 /// first length with one wins, the nearer of two, a tie to the even last digit. `lower_tight` says

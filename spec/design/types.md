@@ -258,9 +258,9 @@ listed).
   `timestamptz_out` is). Every other render is immutable and indexable. A `varchar(n)` target
   truncates the rendered text (§15); `$1::text` types the parameter as text. All pairs are
   **explicit only** — stricter than PostgreSQL, which assignment-casts any type to text — so
-  `INSERT INTO text_col VALUES (1)` and `text_col = 1` stay `42804`. A float render's *layout*
-  (exponent threshold) is core-specific under the `float-render-layout` determinism exception;
-  its shortest round-trip *digits* agree. Rendering `bytea` and `jsonb` can expand the value, so
+  `INSERT INTO text_col VALUES (1)` and `text_col = 1` stay `42804`. A float renders as
+  PostgreSQL's `float8out` / `float4out` text, the same in every core ([float.md](float.md) §9),
+  so `f::text` is an indexable key. Rendering `bytea` and `jsonb` can expand the value, so
   those two casts are growth kernels charged for their output ([cost.md](cost.md) §8.1).
   Composite and range sources stay `0A000`.
 - **Strictness is preserved.** The string→number/bool coercion fires only when the type is
