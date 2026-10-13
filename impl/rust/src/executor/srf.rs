@@ -814,8 +814,10 @@ impl Engine {
     /// → `42P18` (jed's polymorphic posture, exactly like `array_append(NULL, NULL)`); a *typed*
     /// NULL array (`NULL::i32[]`) resolves and yields zero rows at exec. `ELEM` may be a **scalar
     /// or a composite** (AF7 — `unnest(composite[])`): the synthetic column is typed at the bound
-    /// element type directly (`type_from_resolved`), so a composite array produces composite rows
-    /// (an anonymous-composite element has no catalog name → `0A000`, not reachable from a typed array).
+    /// element type directly (`type_from_resolved`), so a composite array produces composite rows.
+    /// An anonymous-record element (`unnest(ARRAY[ROW(…)])`) makes `unnest` a function returning
+    /// `record`, which in `FROM` needs a column-definition list — `42601`, as in PostgreSQL
+    /// (composite.md §1; the list itself is not supported for `unnest` yet).
     pub(crate) fn resolve_unnest(
         &self,
         args: &[Expr],
@@ -828,6 +830,13 @@ impl Engine {
         }
         let (rarg, t) = resolve(arg_scope, &args[0], None, &mut AggCtx::Forbidden, ptypes)?;
         let elem_ty = match &t {
+            ResolvedType::Array(elem) if matches!(&**elem, ResolvedType::Composite(c) if c.name.is_none()) =>
+            {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "a column definition list is required for functions returning \"record\"",
+                ));
+            }
             ResolvedType::Array(elem) => type_from_resolved(elem)?,
             ResolvedType::Null => return Err(indeterminate_poly()),
             _ => return Err(no_func_overload("unnest")),

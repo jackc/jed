@@ -512,6 +512,11 @@ impl Engine {
         let body_types = plan.column_types().to_vec();
         let body_derivs = plan.column_derivs().to_vec();
         let columns = view_output_names(&body_names, cv.columns.as_deref())?;
+        // A view column cannot be an anonymous record (or an array of one) — 42P16, as for a
+        // CREATE TABLE … AS column (composite.md §1).
+        for (name, rt) in columns.iter().zip(body_types.iter()) {
+            super::create_table_as::reject_pseudo_type(name, rt)?;
+        }
         // 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
         let (definition, body, depth, trace) = if trace.stars.is_empty() {
             // The stored body carries no positions: they point into this statement, not into the

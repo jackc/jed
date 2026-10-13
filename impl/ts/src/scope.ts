@@ -56,6 +56,7 @@ import {
   rangeT,
   canonicalName,
   compositeT,
+  recordT,
   isBool,
   isBytea,
   isDate,
@@ -911,6 +912,14 @@ export function resolvedTypeOfCol(ty: Type, db: Engine): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
   if (ty.kind === "array") return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
   if (ty.kind === "range") return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
+  if (ty.kind === "record") {
+    // An anonymous record round-trips to the nameless composite a ROW(…) resolves to.
+    return {
+      kind: "composite",
+      name: null,
+      fields: ty.fields.map((f) => ({ name: f.name, type: resolvedTypeOfCol(f.ty, db) })),
+    };
+  }
   const def = db.compositeType(ty.name);
   if (def === undefined) throw new Error("composite type reference resolved at load / CREATE TYPE");
   return {
@@ -1564,8 +1573,8 @@ export function setSyntheticCollation(col: Column, d: Deriv): void {
 // typeFromResolved is the catalog Type that round-trips a column's ResolvedType — used to give a
 // CTE's synthetic columns a Type (spec/design/cte.md). An untyped NULL column maps to text
 // (PostgreSQL's unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only
-// CTE column (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite has
-// no catalog type to name — deferred (0A000), a corner not reached by the corpus.
+// CTE column (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite
+// becomes a record Type carrying its field list (spec/design/composite.md §1).
 export function typeFromResolved(rt: ResolvedType): Type {
   switch (rt.kind) {
     case "int":
@@ -1598,10 +1607,7 @@ export function typeFromResolved(rt: ResolvedType): Type {
       return scalarT("jsonpath");
     case "composite":
       if (rt.name !== null) return compositeT(rt.name);
-      throw engineError(
-        "feature_not_supported",
-        "an anonymous composite column in a CTE is not supported yet",
-      );
+      return recordT(rt.fields.map((f) => ({ name: f.name, ty: typeFromResolved(f.type) })));
     case "array":
       return arrayT(typeFromResolved(rt.elem));
     case "range":

@@ -3522,6 +3522,14 @@ pub(crate) fn resolved_type_of_col(ty: &Type, db: &Engine) -> ResolvedType {
         }
         Type::Array(elem) => ResolvedType::Array(Box::new(resolved_type_of_col(elem, db))),
         Type::Range(elem) => ResolvedType::Range(Box::new(resolved_type_of_col(elem, db))),
+        // An anonymous record round-trips to the nameless composite a `ROW(…)` resolves to.
+        Type::Record(fields) => ResolvedType::Composite(Box::new(CompositeRType {
+            name: None,
+            fields: fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), resolved_type_of_col(ty, db)))
+                .collect(),
+        })),
     }
 }
 

@@ -73,7 +73,7 @@ pub(crate) fn distribution_eligible(ty: &Type) -> bool {
     match ty {
         Type::Scalar(ScalarType::Json | ScalarType::Jsonb | ScalarType::JsonPath) => false,
         Type::Scalar(_) | Type::Range(_) => true,
-        Type::Composite(_) | Type::Array(_) => false,
+        Type::Composite(_) | Type::Array(_) | Type::Record(_) => false,
     }
 }
 

@@ -442,8 +442,10 @@ func (db *engine) resolveGenerateSeries(args []*exprNode, alias *string, argScop
 // 42P18 (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array
 // (NULL::i32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
 // unnest(composite[])): the synthetic column is typed at the bound element type directly
-// (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
-// has no catalog name → 0A000, not reachable from a typed array).
+// (typeFromResolved), so a composite array produces composite rows. An anonymous-record element
+// (unnest(ARRAY[ROW(…)])) makes unnest a function returning record, which in FROM needs a
+// column-definition list — 42601, as in PostgreSQL (composite.md §1; the list itself is not supported
+// for unnest yet).
 func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	if len(args) != 1 {
 		return nil, nil, noFuncOverload("unnest")
@@ -455,6 +457,10 @@ func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope
 	}
 	switch t.kind {
 	case rtArray:
+		if t.elem.kind == rtComposite && !t.elem.comp.named {
+			return nil, nil, newError(SyntaxError,
+				`a column definition list is required for functions returning "record"`)
+		}
 		elemTy, err := typeFromResolved(*t.elem)
 		if err != nil {
 			return nil, nil, err

@@ -116,7 +116,7 @@ func (db *engine) ctasColumns(ct *createTable, plan *queryPlan, targetTemp bool)
 			return nil, err
 		}
 		var tm typmod
-		if ty.Comp == nil && ty.Array == nil && ty.Range == nil {
+		if _, ok := ty.AsScalar(); ok {
 			tm = typmods[i]
 		}
 		collation := ""
@@ -143,12 +143,10 @@ func (db *engine) ctasColumns(ct *createTable, plan *queryPlan, targetTemp bool)
 	return columns, nil
 }
 
-// ctasColumnType is the table-column type of a query output column of resolved type rt
-// (create-table-as.md §2): an untyped NULL is text, as in PostgreSQL. An anonymous ROW(…) (or an array
-// of one) has no storable type — PostgreSQL's pseudo-type record, 42P16. The types a declared column
-// cannot have in jed either are the same 0A000: a jsonpath column, and an array whose element is
-// itself an array or a range.
-func ctasColumnType(name string, rt resolvedType) (dataType, error) {
+// rejectPseudoType rejects a persisted relation column (a CREATE TABLE … AS table's or a view's)
+// whose type is an anonymous ROW(…) or an array of one: PostgreSQL's pseudo-type record / record[],
+// which only a query's own output may carry (spec/design/composite.md §1) — 42P16.
+func rejectPseudoType(name string, rt resolvedType) error {
 	anonymous := func(t resolvedType) bool { return t.kind == rtComposite && !t.comp.named }
 	pseudo := ""
 	switch {
@@ -156,9 +154,20 @@ func ctasColumnType(name string, rt resolvedType) (dataType, error) {
 		pseudo = "record"
 	case rt.kind == rtArray && anonymous(*rt.elem):
 		pseudo = "record[]"
+	default:
+		return nil
 	}
-	if pseudo != "" {
-		return dataType{}, newError(InvalidTableDefinition, fmt.Sprintf("column \"%s\" has pseudo-type %s", name, pseudo))
+	return newError(InvalidTableDefinition, fmt.Sprintf("column \"%s\" has pseudo-type %s", name, pseudo))
+}
+
+// ctasColumnType is the table-column type of a query output column of resolved type rt
+// (create-table-as.md §2): an untyped NULL is text, as in PostgreSQL. An anonymous ROW(…) (or an array
+// of one) has no storable type — PostgreSQL's pseudo-type record, 42P16. The types a declared column
+// cannot have in jed either are the same 0A000: a jsonpath column, and an array whose element is
+// itself an array or a range.
+func ctasColumnType(name string, rt resolvedType) (dataType, error) {
+	if err := rejectPseudoType(name, rt); err != nil {
+		return dataType{}, err
 	}
 	ty, err := typeFromResolved(rt)
 	if err != nil {
@@ -167,7 +176,10 @@ func ctasColumnType(name string, rt resolvedType) (dataType, error) {
 	supported := true
 	switch {
 	case ty.Array != nil:
-		supported = ty.Array.Array == nil && ty.Array.Range == nil
+		supported = ty.Array.Array == nil && ty.Array.Range == nil && ty.Array.Record == nil
+	case ty.Record != nil:
+		// Unreachable: rejectPseudoType rejects a record (and a record[]) first.
+		supported = false
 	case ty.Comp == nil && ty.Range == nil:
 		supported = ty.Scalar != scalarJsonPath
 	}

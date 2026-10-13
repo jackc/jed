@@ -433,6 +433,12 @@ pub enum Type {
     /// have a range (i32/i64/decimal/timestamp/timestamptz/date — `ranges.toml`), never a composite,
     /// array, or another range. The canonical name comes from `ranges.toml` (`i32` → `i32range`).
     Range(Box<Type>),
+    /// An **anonymous** composite — PostgreSQL's `record`, the type of a `ROW(…)` result — carrying
+    /// its `(field name, field type)` list inline (spec/design/composite.md §1). Structural like
+    /// `Array`: two records are the same type iff their field lists are equal. Only a derived
+    /// relation's synthetic column (a CTE, derived table, `VALUES` list, or view output) has this
+    /// type; it is never stored — no table, composite field, or file carries it.
+    Record(Vec<(String, Type)>),
 }
 
 /// A by-name reference to a composite type in the database's type catalog. The display name is
@@ -462,6 +468,10 @@ impl Type {
                 "range type used where a scalar was expected; the range path must branch before \
                  this point (spec/design/ranges.md)"
             ),
+            Type::Record(_) => unreachable!(
+                "record type used where a scalar was expected; the composite path must branch \
+                 before this point (spec/design/composite.md)"
+            ),
         }
     }
 
@@ -469,7 +479,7 @@ impl Type {
     pub fn as_scalar(&self) -> Option<ScalarType> {
         match self {
             Type::Scalar(s) => Some(*s),
-            Type::Composite(_) | Type::Array(_) | Type::Range(_) => None,
+            Type::Composite(_) | Type::Array(_) | Type::Range(_) | Type::Record(_) => None,
         }
     }
 
@@ -504,6 +514,9 @@ impl Type {
             // A range's element is always a scalar subtype (never a composite), so a range never
             // carries a composite reference (spec/design/ranges.md §2).
             Type::Scalar(_) | Type::Range(_) => None,
+            // A record's fields come from a query, never from the catalog's dependency graph, so
+            // a record never pins a composite against `DROP TYPE` (it is never stored).
+            Type::Record(_) => None,
         }
     }
 
@@ -527,6 +540,7 @@ impl Type {
         match self {
             Type::Scalar(s) => s.canonical_name().to_string(),
             Type::Composite(r) => r.name.clone(),
+            Type::Record(_) => "record".to_string(),
             Type::Array(elem) => format!("{}[]", elem.canonical_name()),
             // A range's canonical name comes from ranges.toml keyed by the element (i32 → i32range).
             Type::Range(elem) => crate::range::range_name_for_element(elem.scalar())

@@ -470,7 +470,21 @@ export type Type =
   | { kind: "scalar"; scalar: ScalarType }
   | { kind: "composite"; name: string }
   | { kind: "array"; elem: Type }
-  | { kind: "range"; elem: Type };
+  | { kind: "range"; elem: Type }
+  // An ANONYMOUS composite — PostgreSQL's `record`, the type of a ROW(…) result — carrying its
+  // (field name, field type) list inline (spec/design/composite.md §1). Structural like array: two
+  // records are the same type iff their field lists are equal. Only a derived relation's synthetic
+  // column (a CTE, derived table, VALUES list, or view output) has this type; it is never stored —
+  // no table, composite field, or file carries it.
+  | { kind: "record"; fields: RecordField[] };
+
+// RecordField is one field of an anonymous record Type.
+export type RecordField = { name: string; ty: Type };
+
+// recordT builds an anonymous record Type over the given fields (spec/design/composite.md §1).
+export function recordT(fields: RecordField[]): Type {
+  return { kind: "record", fields };
+}
 
 // scalarT wraps a ScalarType as a Type.
 export function scalarT(s: ScalarType): Type {
@@ -528,6 +542,9 @@ export function typeScalar(t: Type): ScalarType {
   if (t.kind === "range") {
     throw new Error("range type used where a scalar was expected (spec/design/ranges.md)");
   }
+  if (t.kind === "record") {
+    throw new Error("record type used where a scalar was expected (spec/design/composite.md)");
+  }
   throw new Error(
     `composite type ${t.name} used where a scalar was expected; the composite path must branch before this point (spec/design/composite.md)`,
   );
@@ -558,6 +575,7 @@ export function typeCanonicalName(t: Type): string {
     }
     return `range<${typeCanonicalName(t.elem)}>`;
   }
+  if (t.kind === "record") return "record";
   return t.name;
 }
 

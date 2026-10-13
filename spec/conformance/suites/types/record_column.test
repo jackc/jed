@@ -1,0 +1,294 @@
+# Anonymous record columns of derived relations (spec/design/composite.md §1). An anonymous ROW(…)
+# — PostgreSQL's pseudo-type `record` — and an array of them (`record[]`) may be a column of a
+# query's own output: a derived table, a CTE (inline, MATERIALIZED, or recursive), or a VALUES list.
+# The column keeps the row's structural field list (f1…fN over the field types), so it compares,
+# orders, groups, deduplicates, renders, and takes field access like the expression it came from.
+# This is what recursive-CTE SEARCH / CYCLE desugar to (a record[] path accumulated per step, tested
+# with ROW(…) = ANY(path)). It is never STORED: a CREATE TABLE … AS column or a view column of type
+# record / record[] is 42P16 (pseudo-type), and unnest(record[]) in FROM needs a column-definition
+# list (42601), as in PostgreSQL. String fields are cast to text: PostgreSQL leaves a bare literal
+# inside ROW(…) `unknown`, which it cannot compare or render through a derived relation.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.create_table_as, ddl.view, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.select_no_from, query.where_eq, query.order_by, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, query.union, query.join_using, query.derived_table, query.values, query.cte, query.cte_recursive, query.table_alias, query.qualified_column, func.unnest, func.array, func.array_quantified, types.record_column, types.composite, types.array, types.array_composite, expr.array_subscript, types.i32, types.text, resource.cost_metering
+
+# --- A derived table ---------------------------------------------------------------------------
+
+query T nosort
+SELECT * FROM (SELECT ROW(1, 'a'::text) AS r) s
+----
+(1,a)
+
+query IT nosort
+SELECT (r).f1, (r).f2 FROM (SELECT ROW(1, 'a'::text) AS r) s
+----
+1
+a
+
+query IIT nosort
+SELECT (s.r).* , s.n FROM (SELECT ROW(1, 2) AS r, 'x'::text AS n) s
+----
+1
+2
+x
+
+# A record column built from table columns keeps their types.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 10, 'x')
+
+query IT rowsort
+SELECT id, r FROM (SELECT id, ROW(a, b) AS r FROM t) s WHERE r = ROW(10, 'x'::text)
+----
+1
+(10,x)
+3
+(10,x)
+
+query IT nosort
+SELECT count(*), r FROM (SELECT ROW(a, b) AS r FROM t) s GROUP BY r ORDER BY r
+----
+2
+(10,x)
+1
+(20,y)
+
+query T rowsort
+SELECT DISTINCT r FROM (SELECT ROW(a, b) AS r FROM t) s
+----
+(10,x)
+(20,y)
+
+# --- CTEs --------------------------------------------------------------------------------------
+
+query I nosort
+WITH c AS (SELECT ROW(1, 2) AS r) SELECT (r).f2 FROM c
+----
+2
+
+query TT nosort
+WITH c AS MATERIALIZED (SELECT ROW(1, 'x'::text) AS r) SELECT a.r, b.r FROM c a, c b WHERE a.r = b.r
+----
+(1,x)
+(1,x)
+
+query T nosort
+SELECT r FROM (SELECT ROW(1) AS r) a JOIN (SELECT ROW(1) AS r) b USING (r)
+----
+(1)
+
+# --- VALUES and set operations -----------------------------------------------------------------
+
+query T nosort
+SELECT r FROM (VALUES (ROW(2, 'b'::text)), (ROW(1, 'z'::text)), (ROW(1, 'a'::text))) v(r) ORDER BY r
+----
+(1,a)
+(1,z)
+(2,b)
+
+query T nosort
+SELECT r FROM (VALUES (ROW(2, 'b'::text)), (ROW(1, 'z'::text))) v(r) WHERE r > ROW(1, 'y'::text) ORDER BY r
+----
+(1,z)
+(2,b)
+
+query T nosort
+SELECT r FROM (SELECT ROW(3, 4) AS r UNION ALL SELECT ROW(1, 2)) s ORDER BY r
+----
+(1,2)
+(3,4)
+
+# Anonymous records unify field-wise across integer widths, as arrays do (a value no-op). (PostgreSQL
+# accepts the union too, but keeps the per-row widths and then cannot compare them: an ORDER BY here
+# is its 42804, where jed's widened column orders.)
+query T rowsort
+SELECT r FROM (SELECT ROW(2::int, 'b'::text) AS r UNION ALL SELECT ROW(1::bigint, 'a'::text)) s
+----
+(1,a)
+(2,b)
+
+query T rowsort
+SELECT r FROM (VALUES (ROW(1::smallint)), (ROW(2::int)), (ROW(3::bigint))) v(r)
+----
+(1)
+(2)
+(3)
+
+# An i64-literal anchor record takes the recursive term's i32 record (widened to the anchor).
+query IT nosort
+WITH RECURSIVE t(n, r) AS (SELECT 1::int, ROW(1) UNION ALL SELECT n + 1, ROW(n + 1) FROM t WHERE n < 3)
+SELECT n, r FROM t ORDER BY n
+----
+1
+(1)
+2
+(2)
+3
+(3)
+
+# A NULL record, and a record whose fields are all NULL: IS NULL is the all-fields rule.
+query BT rowsort
+SELECT r IS NULL, r FROM (VALUES (ROW(1, 2)), (ROW(NULL::bigint, NULL::bigint)), (NULL)) v(r)
+----
+false
+(1,2)
+true
+(,)
+true
+NULL
+
+# --- record[] columns --------------------------------------------------------------------------
+
+query T nosort
+SELECT p FROM (VALUES (ARRAY[ROW(2)]), (ARRAY[ROW(1), ROW(3)]), (ARRAY[ROW(1)])) v(p) ORDER BY p
+----
+{(1)}
+{(1),(3)}
+{(2)}
+
+query T rowsort
+SELECT DISTINCT p FROM (VALUES (ARRAY[ROW(1, 2)]), (ARRAY[ROW(1, 2)]), (ARRAY[ROW(2, 1)])) v(p)
+----
+{"(1,2)"}
+{"(2,1)"}
+
+query T nosort
+SELECT p FROM (SELECT ARRAY[ROW(1, 2), ROW(3, 4)] AS p) s WHERE ROW(3, 4) = ANY (p)
+----
+{"(1,2)","(3,4)"}
+
+query T nosort
+WITH c AS (SELECT ARRAY[ROW(1)] AS p) SELECT p || ROW(2) FROM c
+----
+{(1),(2)}
+
+# --- Recursive CTEs: the shapes SEARCH / CYCLE desugar to --------------------------------------
+
+statement ok
+CREATE TABLE tree (id i32 PRIMARY KEY, parent i32)
+
+statement ok
+INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 3), (6, 2)
+
+# Depth-first: each row carries the record[] path from the root; ordering by it is depth-first.
+query IT nosort
+WITH RECURSIVE r(id, path) AS (
+  SELECT id, ARRAY[ROW(id)] FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT tree.id, r.path || ROW(tree.id) FROM tree JOIN r ON tree.parent = r.id
+)
+SELECT id, path FROM r ORDER BY path
+----
+1
+{(1)}
+2
+{(1),(2)}
+4
+{(1),(2),(4)}
+6
+{(1),(2),(6)}
+3
+{(1),(3)}
+5
+{(1),(3),(5)}
+
+# Breadth-first: a ROW(depth, id) ordering record.
+query IT nosort
+WITH RECURSIVE r(id, d, ord) AS (
+  SELECT id, 0, ROW(0, id) FROM tree WHERE parent IS NULL
+  UNION ALL
+  SELECT tree.id, r.d + 1, ROW(r.d + 1, tree.id) FROM tree JOIN r ON tree.parent = r.id
+)
+SELECT id, ord FROM r ORDER BY ord
+----
+1
+(0,1)
+2
+(1,2)
+3
+(1,3)
+4
+(2,4)
+5
+(2,5)
+6
+(2,6)
+
+# Cycle detection: the visited path, a ROW(…) = ANY(path) test, and no expansion past a cycle.
+statement ok
+CREATE TABLE edge (src i32, dst i32, PRIMARY KEY (src, dst))
+
+statement ok
+INSERT INTO edge VALUES (1, 2), (2, 3), (3, 1), (3, 4)
+
+query IBT nosort
+WITH RECURSIVE g(node, is_cycle, path) AS (
+  SELECT 1::int, false, ARRAY[ROW(1::int)]
+  UNION ALL
+  SELECT edge.dst, ROW(edge.dst) = ANY (g.path), g.path || ROW(edge.dst)
+  FROM edge JOIN g ON edge.src = g.node
+  WHERE NOT g.is_cycle
+)
+SELECT node, is_cycle, path FROM g ORDER BY path
+----
+1
+false
+{(1)}
+2
+false
+{(1),(2)}
+3
+false
+{(1),(2),(3)}
+1
+true
+{(1),(2),(3),(1)}
+4
+false
+{(1),(2),(3),(4)}
+
+# --- Never stored ------------------------------------------------------------------------------
+
+statement error 42P16
+CREATE TABLE bad AS WITH c AS (SELECT ARRAY[ROW(1)] AS p) SELECT p FROM c
+
+statement error 42P16
+CREATE VIEW bad AS SELECT 1 AS a, ROW(1, 2) AS r
+
+statement error 42P16
+CREATE VIEW bad AS SELECT ARRAY[ROW(1)] AS p
+
+statement error 42P16
+CREATE VIEW bad AS SELECT * FROM (SELECT ROW(1) AS r) s
+
+# unnest over a record[] returns record, which in FROM needs a column-definition list.
+statement error 42601
+SELECT * FROM unnest(ARRAY[ROW(1, 'a'::text)])
+
+# --- Field access PostgreSQL loses (jed keeps the static field list; ledgered) ------------------
+
+query I nosort
+SELECT (r).f1 FROM (VALUES (ROW(1, 2))) v(r)
+----
+1
+
+query I nosort
+SELECT (p[1]).f2 FROM (SELECT ARRAY[ROW(5, 6)] AS p) s
+----
+6
+
+query IT nosort
+WITH RECURSIVE r(n, ord) AS (
+  SELECT 1, ROW(0, 1)
+  UNION ALL
+  SELECT n + 1, ROW((ord).f1 + 1, n + 1) FROM r WHERE n < 3
+)
+SELECT n, ord FROM r ORDER BY ord
+----
+1
+(0,1)
+2
+(1,2)
+3
+(2,3)

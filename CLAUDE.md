@@ -245,9 +245,11 @@ everything else tests against, not a detail discovered during implementation.
     Composite(catalog-ref) }`, the **open** wrapper threaded through parser/resolver/evaluator/
     codec/comparator/catalog in every core (the closed `ScalarType` enum is kept *intact inside*
     `Type::Scalar` — it never gains user variants). Composite is the first **container** axis and
-    the shared open-`Type` foundation the future `array` axis reuses; **named composites only this
-    slice** (no anonymous `record`), and no implicit per-table row types (a documented PG
-    divergence). **Composite-as-key has since landed** (encoding.md §2.15, the recursive
+    the shared open-`Type` foundation the future `array` axis reuses. **Only named composites are
+    stored**: an anonymous `record` (a `ROW(…)` result) and `record[]` are query values and may be a
+    derived relation's column (CTE, recursive CTE, derived table, `VALUES`) through an inline-field
+    `Record` type arm, but never a table, view, or composite field (`42P16`, as PostgreSQL —
+    composite.md §13). There are no implicit per-table row types (a documented PG divergence). **Composite-as-key has since landed** (encoding.md §2.15, the recursive
     `composite-field-slots` rule — the **third container key** after `range` §2.11 and `array` §2.14):
     a composite-typed `PRIMARY KEY` / ordered index / `UNIQUE` column of an all-keyable-field type,
     the key a concatenation of per-field §2.2 nullable slots recursing into each field's own key. With

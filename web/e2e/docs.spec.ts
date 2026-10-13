@@ -430,6 +430,15 @@ test('the select page runs the WITH RECURSIVE series demo live', async ({ page }
   await expect(panel.getByTestId('result-rows')).toContainText('5');
 });
 
+test('the select page runs the recursive path-and-cycle demo live', async ({ page }) => {
+  await page.goto('/docs/sql/select/');
+  // A record[] path column (spec/design/composite.md §13): the walk 1 → 2 → 3 revisits 1, which is
+  // flagged as a cycle and not expanded; 3 → 4 is the other branch.
+  const panel = livePanel(page, 'recursivePath');
+  await expect(panel.getByTestId('result-rows')).toContainText('{(1),(2),(3),(1)}');
+  await expect(panel.getByTestId('result-rows')).toContainText('{(1),(2),(3),(4)}');
+});
+
 test('the select page runs the nested WITH demo live', async ({ page }) => {
   await page.goto('/docs/sql/select/');
   // The nested-WITH demo (spec/design/cte.md §7): a derived table whose body

@@ -658,6 +658,9 @@ export function coerceStringToComposite(
       const { node, type } = coerceStringToRangeExpr(tok, desc, iz);
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
+    } else if (f.type.kind === "record") {
+      // A record is never a catalog composite's field type (composite.md §1).
+      throw new Error("a composite field is never an anonymous record");
     } else {
       const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal, f.varcharLen, iz);
       nodes.push(node);

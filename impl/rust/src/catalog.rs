@@ -641,6 +641,22 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
         // inline. The element is always one of the six scalar subtypes, so the recursion bottoms
         // out at `ColType::Scalar` immediately.
         Type::Range(elem) => ColType::Range(Box::new(resolve_col_type(elem, types))),
+        // An anonymous record (a derived relation's synthetic column, composite.md §1) resolves to
+        // the composite shape it carries inline — the same codec, comparison, and rendering as a
+        // named composite, under PostgreSQL's display name `record`.
+        Type::Record(fields) => ColType::Composite {
+            name: "record".to_string(),
+            fields: fields
+                .iter()
+                .map(|(name, ty)| ColField {
+                    name: name.clone(),
+                    ty: resolve_col_type(ty, types),
+                    typmod: None,
+                    varchar_len: None,
+                    not_null: false,
+                })
+                .collect(),
+        },
     }
 }
 

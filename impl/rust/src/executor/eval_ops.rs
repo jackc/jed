@@ -705,6 +705,8 @@ pub(crate) fn array_get_slice(a: &ArrayVal, bounds: &[(Option<i64>, Option<i64>)
 /// - float widths promote to the widest (`f32` with `f64` → `f64`; float never meets int/decimal);
 /// - two arrays unify element-wise when the elements differ only in integer width (a value no-op —
 ///   every integer is one `i64`); any other element difference is `None`;
+/// - two anonymous records (`ROW(…)` results) of the same arity unify field-wise by the same
+///   integer-width rule (spec/design/composite.md §13);
 /// - otherwise the two types must be IDENTICAL (structural equality: same element for an array or
 ///   range, same named composite or same anonymous shape) — identical types ALWAYS unify, whatever
 ///   the family (`json`, `jsonb`, `jsonpath`, `date`, `interval`, ranges, composites, …).
@@ -725,6 +727,9 @@ pub(crate) fn common_type(a: &ResolvedType, b: &ResolvedType) -> Option<Resolved
             },
         )),
         (Array(x), Array(y)) => common_array_element(x, y).map(|e| Array(Box::new(e))),
+        (Composite(x), Composite(y)) if x.name.is_none() && y.name.is_none() => {
+            common_record(x, y).map(Composite)
+        }
         _ if a == b => Some(a.clone()),
         _ => None,
     }
@@ -738,9 +743,33 @@ fn common_array_element(x: &ResolvedType, y: &ResolvedType) -> Option<ResolvedTy
     match (x, y) {
         (Int(_), Int(_)) => Some(Int(promote(x, y))),
         (Array(a), Array(b)) => common_array_element(a, b).map(|e| Array(Box::new(e))),
+        (Composite(a), Composite(b)) if a.name.is_none() && b.name.is_none() => {
+            common_record(a, b).map(Composite)
+        }
         _ if x == y => Some(x.clone()),
         _ => None,
     }
+}
+
+/// The common type of two anonymous records (spec/design/composite.md §13): the same arity and field
+/// names, each field pair unified by the array-element rule — integer widths promote (a value no-op),
+/// anything else must be identical.
+fn common_record(x: &CompositeRType, y: &CompositeRType) -> Option<Box<CompositeRType>> {
+    if x.fields.len() != y.fields.len() {
+        return None;
+    }
+    let fields = x
+        .fields
+        .iter()
+        .zip(&y.fields)
+        .map(|((xn, xt), (yn, yt))| {
+            (xn == yn)
+                .then(|| common_array_element(xt, yt))
+                .flatten()
+                .map(|t| (xn.clone(), t))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Box::new(CompositeRType { name: None, fields }))
 }
 
 /// Unify a CASE's result-arm types — or a COALESCE's (grammar.md §51) or GREATEST/LEAST's (§52)
@@ -1377,6 +1406,10 @@ pub(crate) fn coerce_string_to_composite(
                             .expect("a range field's element always has a range type");
                         coerce_string_to_range_expr(&s, desc, iz)?
                     }
+                    // A record is never a catalog composite's field type (composite.md §1).
+                    Type::Record(_) => {
+                        unreachable!("a composite field is never an anonymous record")
+                    }
                 };
                 nodes.push(node);
                 field_types.push((f.name.clone(), ty));
@@ -1441,6 +1474,14 @@ pub(crate) fn resolve_container_assign(
                     .map_err(|e| e.with_position(pos.0))?;
                 params.note_input_zone(&iz);
                 return Ok(node);
+            }
+            // PostgreSQL's record_in: "input of anonymous composite types is not implemented".
+            Type::Record(_) => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "input of anonymous composite types is not implemented",
+                )
+                .with_position(pos.0));
             }
             Type::Scalar(_) => {
                 unreachable!("resolve_container_assign is only called for containers")

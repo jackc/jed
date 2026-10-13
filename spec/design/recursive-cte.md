@@ -195,6 +195,13 @@ bump).
 **Deferred (each its own slice):**
 
 - **`SEARCH` / `CYCLE` clauses** — PostgreSQL's breadth/depth ordering and cycle-detection sugar.
+  The substrate they desugar to has landed: a recursive CTE's working table carries `record` and
+  `record[]` columns, so the hand-written equivalents — a `path || ROW(id)` column ordered for
+  depth-first, `ROW(depth, id)` for breadth-first, and `ROW(id) = ANY(path)` for cycle detection —
+  run today ([composite.md](composite.md) §13, `suites/types/record_column.test`). The desugaring
+  must build each `ROW(…)` from values already coerced to the anchor's column types: `||` takes an
+  element of exactly the array's element type, so an `i64` anchor path does not accept an `i32`
+  recursive-term element.
 - **Recursive reference inside a `FROM` derived table** or **a set-operation recursive term**
   (`0A000` today; PostgreSQL allows both).
 - **Mutual recursion** between WITH items (`0A000` in PostgreSQL; `42P01` in jed today).

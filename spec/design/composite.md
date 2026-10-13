@@ -35,11 +35,14 @@ SELECT id, (home).zip, home FROM person ORDER BY home
 SELECT * FROM person WHERE home = ROW('Main', 90210)
 ```
 
-- **Named composites only.** A composite type has a name in the database's type namespace and a
-  fixed, ordered list of named fields. Anonymous `record` (the untyped row, e.g. a `record`-typed
-  column) is **not** supported this slice (`0A000`). A `ROW(…)` *result* still has a structural
-  (anonymous) type for typing purposes (§5); it just cannot be stored except into a named
-  composite column.
+- **Named composites are the stored kind; anonymous records are query-only.** A composite type you
+  can *store* has a name in the database's type namespace and a fixed, ordered list of named fields.
+  An anonymous `ROW(…)` *result* — PostgreSQL's pseudo-type `record` — has a structural type (fields
+  `f1…fN` over the field types, §5). It is a value and may be a column of a query's own output (a
+  derived table, CTE, recursive CTE, or `VALUES` list), alone or as the element of a `record[]`
+  (§13). It is **never stored**: no table, view, composite field, or file carries a `record` type,
+  so a `CREATE TABLE … AS` or view column of that type is `42P16`, and it is assigned to a stored
+  composite column only as a named composite.
 - **Field types** are any *existing* type — a built-in scalar or a previously-defined composite.
   **Nested composites are supported** (`CREATE TYPE line AS (a addr, b addr)`): every derived
   method recurses. An unknown field type is `42704`. Nesting is bounded to `MAX_COMPOSITE_DEPTH`
@@ -92,6 +95,13 @@ it**, threaded wherever a column/value type was a `ScalarType`:
 
 A `CompositeType` is `{ name, fields: [(name, Type)] }`, recursive, resident in the snapshot
 catalog (§3). The integer-only `ScalarType` accessors never receive a composite.
+
+The anonymous record (§13) is a further arm, `Record([(name, Type)])`, that carries its field list
+**inline** — structural like `Array`, so two records are the same type iff their field lists are
+equal, and no catalog lookup is ever made for one. Only a derived relation's synthetic column has
+this type; every storage path (the catalog encoders, the column-type resolver of `CREATE TABLE`) is
+unreachable for it. (Rust `Type::Record`; Go a `Record *[]recordField` discriminant beside
+`Comp`/`Array`/`Range`; TS a `{kind:"record", fields}` union arm.)
 
 ## 3. Catalog & on-disk format (`format_version` 9)
 
@@ -277,8 +287,10 @@ sound bound; [../cost/schedule.toml](../cost/schedule.toml) is unchanged.
 Default is "match PostgreSQL" (CLAUDE.md §1); the divergences below each have an overriding reason
 and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_overrides.toml).
 
-1. **Named composites only** — no anonymous `record`-typed columns (`0A000`). The closed→open
-   transition is already XL; a `ROW(…)` result still types structurally.
+1. **Named composites are the only stored kind** — an anonymous `record` (and `record[]`) is a
+   query-output type only (§13): a derived relation's column, never a table, view, or composite
+   field. The same line PostgreSQL draws (its `record` is a pseudo-type, `42P16` in a table or
+   view). Where PostgreSQL loses a derived record's field list, jed keeps it (§13, ledgered).
 2. **PG all-fields `IS NULL` / `IS NOT NULL` rule** — adopted as-is (§5).
 3. **Composite-as-key** — ✅ landed as the third container key (§6, [encoding.md §2.15](encoding.md));
    an **array-of-composite** key and a composite **FK** pairing remain deferred `0A000` follow-ons.
@@ -305,7 +317,9 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 | `DROP TYPE` of a missing type (no `IF EXISTS`) | `42704` undefined_object |
 | `CREATE TYPE` nesting deeper than `MAX_COMPOSITE_DEPTH` (32) | `54001` statement_too_complex |
 | Corrupt type catalog (dangling/cyclic/over-deep field ref) | `XX001` data_corrupted |
-| A composite `PRIMARY KEY`/index/`UNIQUE` whose type transitively contains an **array-of-composite** field; a composite **FK** pairing; bare `(a,b)`; anonymous `record`; `ALTER TYPE`; `DROP TYPE … CASCADE` | `0A000` feature_not_supported |
+| A `CREATE TABLE … AS` or view column of type `record` / `record[]` (§13) | `42P16` invalid_table_definition |
+| `unnest(record[])` in `FROM` without a column-definition list (§13) | `42601` syntax_error |
+| A composite `PRIMARY KEY`/index/`UNIQUE` whose type transitively contains an **array-of-composite** field; a composite **FK** pairing; bare `(a,b)`; `ALTER TYPE`; `DROP TYPE … CASCADE` | `0A000` feature_not_supported |
 
 ## 12. Delivery (sub-slices)
 
@@ -394,3 +408,52 @@ cast, the `composite::text` cast, the anonymous `ROW(…)::type` structural cast
 `ROW(ROW(…),…)`-into-column constructor (a jed extension PG rejects — covered by unit tests, not the
 PG-oracle corpus) are each `0A000` / jed-only. Composite **value** comparison (`WHERE c = ROW(…)`),
 ORDER BY, DISTINCT, and GROUP BY all landed in S5.
+
+## 13. Anonymous record columns (✅ landed)
+
+An anonymous `ROW(…)` — PostgreSQL's pseudo-type `record` — and an array of them (`record[]`) are
+first-class **query values**: every expression form already worked on them (comparison, `ORDER BY`,
+`DISTINCT`, `GROUP BY`, field access, `ARRAY[ROW(…)]`, `||`, `= ANY`, subscripts, `record_out` /
+`array_out`). This slice lets them be a **column of a derived relation** — a derived table, an
+inline or `MATERIALIZED` CTE, a recursive CTE's working table, or a `VALUES` list — which used to be
+`0A000`. It is the substrate recursive-CTE `SEARCH` / `CYCLE` desugar to: a `record[]` path
+accumulated per step (`path || ROW(id)`), ordered for depth-first order or tested with
+`ROW(id) = ANY(path)` for cycle detection ([recursive-cte.md](recursive-cte.md) §8). Corpus:
+`suites/types/record_column.test`.
+
+- **The type.** A derived relation's synthetic column takes the `Record` type arm (§2), carrying
+  the row's resolved field list inline; a reference to the column resolves back to the same nameless
+  composite the `ROW(…)` expression had. So the column behaves exactly like the expression: the row
+  3VL for `=`/`<`, the composite total order for `ORDER BY` / `GROUP BY` / `DISTINCT`, the all-fields
+  `IS NULL` rule, and field access `(r).f1` / `(r).*` / `(p[1]).f2`. A field whose expression was an
+  untyped `NULL` is `text` (PostgreSQL's unknown → text rule for an output column), so comparing it
+  with a non-text field is `42804`, as in PostgreSQL.
+- **Unification widens integer fields.** A `VALUES` / set-operation / `CASE` column, and a recursive
+  CTE's column, unifies two anonymous records of the same arity whose fields differ at most in
+  integer width — the array rule ([grammar.md](grammar.md) §25), a value no-op since every integer
+  is one `i64`. It matters because jed's unconstrained integer literal is `i64`: an anchor
+  `ROW(1)` meets a recursive term's `ROW(n + 1)` over an `i32` column. Any other field difference is
+  `42804`. PostgreSQL accepts any mix of anonymous records (its `record` is dynamic) but then cannot
+  compare rows whose field types differ; jed's is the narrower, statically comparable rule. A
+  recursive term still may not *widen* an anchor's record (anchor `ROW(1::i32)`, recursive
+  `ROW(x::i64)` is `42804`, as for an array — [recursive-cte.md](recursive-cte.md) §2).
+- **Never stored.** A `CREATE TABLE … AS` column ([create-table-as.md](create-table-as.md) §2) or a
+  view column ([views.md](views.md) §1.1) of type `record` / `record[]` is **`42P16`** *column "r"
+  has pseudo-type record* (`record[]`), as in PostgreSQL — a view column is a catalog column, even
+  though jed persists only its name. The catalog encoders treat a `Record` type as unreachable.
+- **`unnest(record[])`.** `unnest` over a `record[]` is a function returning `record`, which in
+  `FROM` needs a column-definition list: **`42601`** *a column definition list is required for
+  functions returning "record"*, as in PostgreSQL. Supplying the list (`unnest(…) AS u(a i32, b
+  text)`) is a deferred follow-on (`42601` today — the list is accepted only on the json record
+  functions, [json-table.md](json-table.md) §2).
+- **Deliberate divergence — jed keeps the field list.** PostgreSQL's `record` is *dynamic*: it keeps
+  a derived record's fields only where the planner still sees the `ROW(…)` expression (a plain
+  derived table or CTE — jed agrees there). Through a `VALUES` list, a `record[]` element, or a
+  recursive CTE's working table it loses them, and field access is `42809` *record type has not been
+  registered* / `42703`. jed's record type is static (CLAUDE.md §4), so the field always resolves.
+  A lenient divergence — jed accepts a superset — ledgered in
+  [../conformance/oracle_overrides.toml](../conformance/oracle_overrides.toml).
+- **No format change.** A derived relation is a query-plan construct; nothing new reaches the file.
+  Spill and materialized-CTE buffers hold self-describing `Value` rows, so a record column needs no
+  codec of its own there.
+

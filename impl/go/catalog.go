@@ -612,6 +612,16 @@ func resolveColType(ty dataType, types map[string]*compositeType) colType {
 		elem := resolveColType(*ty.Range, types)
 		return colType{RangeElem: &elem}
 	}
+	if ty.Record != nil {
+		// An anonymous record (a derived relation's synthetic column, composite.md §1) resolves to
+		// the composite shape it carries inline — the same codec, comparison, and rendering as a named
+		// composite, under PostgreSQL's display name `record`.
+		fields := make([]colField, len(*ty.Record))
+		for i, f := range *ty.Record {
+			fields[i] = colField{Name: f.Name, Type: resolveColType(f.Type, types)}
+		}
+		return colType{Composite: true, Name: "record", Fields: fields}
+	}
 	if ty.Comp == nil {
 		return colType{Scalar: ty.Scalar}
 	}

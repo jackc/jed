@@ -976,6 +976,14 @@ func resolvedTypeOfCol(ty dataType, snap *snapshot) resolvedType {
 		elem := resolvedTypeOfCol(*ty.Range, snap)
 		return resolvedType{kind: rtRange, elem: &elem}
 	}
+	if ty.Record != nil {
+		// An anonymous record round-trips to the nameless composite a ROW(…) resolves to.
+		fields := make([]compositeRField, len(*ty.Record))
+		for i, f := range *ty.Record {
+			fields[i] = compositeRField{name: f.Name, ty: resolvedTypeOfCol(f.Type, snap)}
+		}
+		return resolvedType{kind: rtComposite, comp: &compositeRType{fields: fields}}
+	}
 	if ty.Comp == nil {
 		return resolvedTypeOf(ty.Scalar)
 	}

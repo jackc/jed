@@ -246,6 +246,7 @@ fn push_array_element_type(out: &mut Vec<u8>, elem: &Type) {
         Type::Range(_) => {
             unreachable!("array-of-range is not storable yet (range columns land in R2)")
         }
+        Type::Record(_) => unreachable!("an anonymous record is never stored (composite.md §1)"),
     }
 }
 
@@ -3521,6 +3522,9 @@ fn table_entry_bytes(
                 out.push(flags);
                 push_range_element_type(&mut out, elem);
             }
+            Type::Record(_) => {
+                unreachable!("an anonymous record is never stored (composite.md §1)")
+            }
             Type::Scalar(s) => {
                 out.push(type_code_for_scalar(*s));
                 let mut flags = 0u8;
@@ -4352,6 +4356,9 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
             Type::Range(elem) => {
                 out.push(17);
                 push_range_element_type(&mut out, elem);
+            }
+            Type::Record(_) => {
+                unreachable!("an anonymous record is never stored (composite.md §1)")
             }
         }
         out.push(if f.not_null { 0b1 } else { 0 });

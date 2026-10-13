@@ -267,6 +267,9 @@ function pushArrayElementType(w: ByteWriter, elem: Type): void {
   if (elem.kind === "range") {
     throw new Error("array-of-range is not storable yet (range columns land in R2)");
   }
+  if (elem.kind === "record") {
+    throw new Error("an anonymous record is never stored (composite.md §1)");
+  }
   w.u8(typeCodeForScalar(elem.scalar));
 }
 
@@ -1366,7 +1369,7 @@ function writeOverflowChain(
 }
 
 function statisticsDistributionEligible(type: Type): boolean {
-  if (type.kind === "composite" || type.kind === "array") return false;
+  if (type.kind === "composite" || type.kind === "record" || type.kind === "array") return false;
   return (
     type.kind === "range" ||
     (type.scalar !== "json" && type.scalar !== "jsonb" && type.scalar !== "jsonpath")
@@ -2033,6 +2036,8 @@ function compositeTypeEntryBytes(ct: CompositeType): Uint8Array {
       // column uses (spec/design/ranges.md §3), before the flags byte.
       w.u8(17);
       pushRangeElementType(w, f.type.elem);
+    } else if (f.type.kind === "record") {
+      throw new Error("an anonymous record is never stored (composite.md §1)");
     } else {
       w.u8(typeCodeForScalar(f.type.scalar));
     }

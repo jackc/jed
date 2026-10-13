@@ -150,10 +150,10 @@ func hashJoinColumnType(rels []scopeRel, index int) (dataType, bool) {
 
 func hashJoinTypesEqual(a, b dataType) bool {
 	if (a.Comp != nil) != (b.Comp != nil) || (a.Array != nil) != (b.Array != nil) ||
-		(a.Range != nil) != (b.Range != nil) {
+		(a.Range != nil) != (b.Range != nil) || (a.Record != nil) != (b.Record != nil) {
 		return false
 	}
-	if a.Comp != nil {
+	if a.Comp != nil || a.Record != nil {
 		return false
 	}
 	if a.Array != nil {
@@ -166,16 +166,14 @@ func hashJoinTypesEqual(a, b dataType) bool {
 }
 
 func hashJoinKeyableType(ty dataType) bool {
-	if ty.Comp != nil {
+	if ty.Comp != nil || ty.Record != nil {
 		return false
 	}
 	if ty.Array != nil {
-		return ty.Array.Comp == nil && ty.Array.Array == nil && ty.Array.Range == nil &&
-			hashJoinKeyableScalar(ty.Array.Scalar)
+		return ty.Array.isScalar() && hashJoinKeyableScalar(ty.Array.Scalar)
 	}
 	if ty.Range != nil {
-		return ty.Range.Comp == nil && ty.Range.Array == nil && ty.Range.Range == nil &&
-			hashJoinKeyableScalar(ty.Range.Scalar)
+		return ty.Range.isScalar() && hashJoinKeyableScalar(ty.Range.Scalar)
 	}
 	return hashJoinKeyableScalar(ty.Scalar)
 }

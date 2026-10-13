@@ -504,6 +504,13 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
+	// A view column cannot be an anonymous record (or an array of one) — 42P16, as for a CREATE
+	// TABLE … AS column (composite.md §1).
+	for i, name := range columns {
+		if err := rejectPseudoType(name, bodyTypes[i]); err != nil {
+			return outcome{}, err
+		}
+	}
 	// 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
 	definition := cv.Body
 	if len(trace.stars) > 0 {

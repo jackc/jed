@@ -209,7 +209,7 @@ func statisticsKeyValue(value Value, ty dataType) (Value, bool) {
 	if ty.Range != nil {
 		return value, value.Kind == ValRange
 	}
-	if ty.Comp != nil || ty.Array != nil {
+	if ty.Comp != nil || ty.Array != nil || ty.Record != nil {
 		return Value{}, false
 	}
 	if ty.Scalar == scalarDecimal && value.Kind == ValInt {
@@ -787,7 +787,7 @@ func statisticsFNV1a64(b []byte) uint64 {
 }
 
 func statisticsDistributionEligible(ty dataType) bool {
-	if ty.IsComposite() || ty.IsArray() || ty.IsJson() || ty.IsJsonb() || ty.IsJsonPath() {
+	if ty.IsComposite() || ty.IsRecord() || ty.IsArray() || ty.IsJson() || ty.IsJsonb() || ty.IsJsonPath() {
 		return false
 	}
 	return true // every remaining scalar plus range has a canonical comparison key

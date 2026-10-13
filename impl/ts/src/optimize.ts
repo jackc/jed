@@ -184,7 +184,7 @@ function hashJoinColumnType(rels: ScopeRel[], index: number): Type | null {
 }
 
 function hashJoinKeyableType(type: Type): boolean {
-  if (type.kind === "composite") return false;
+  if (type.kind === "composite" || type.kind === "record") return false;
   if (type.kind === "array" || type.kind === "range") {
     return type.elem.kind === "scalar" && hashJoinKeyableScalar(type.elem.scalar);
   }

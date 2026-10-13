@@ -93,7 +93,9 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
    checked: its base relation may be a view that is not updatable, as in PostgreSQL, and a write
    then fails with that view's `55000` (§15.3).
 5. Column-list arity (`42601`), then duplicate final output names (`42701`), computed from the
-   body as planned in step 4.
+   body as planned in step 4, then a column of type `record` / `record[]` — an anonymous `ROW(…)`
+   or an array of one — **`42P16`** (*column "r" has pseudo-type record*, PostgreSQL;
+   [composite.md](composite.md) §13).
 6. `*` is expanded and the expanded text is verified (§5).
 7. The creating session's `SELECT` privilege on every relation the body reads (`42501`, §9).
 8. A taken name is **`42P07`** (*relation "v" already exists*). PostgreSQL also reports body errors

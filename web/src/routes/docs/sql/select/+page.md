@@ -40,6 +40,18 @@ SELECT name, price FROM kitchen ORDER BY price DESC;`;
 )
 SELECT n FROM series ORDER BY n;`;
 
+	const graphSeed = `CREATE TABLE edge (src i32, dst i32, PRIMARY KEY (src, dst));
+INSERT INTO edge VALUES (1, 2), (2, 3), (3, 1), (3, 4);`;
+
+	const recursivePath = `WITH RECURSIVE walk(node, is_cycle, path) AS (
+  SELECT 1::i32, false, ARRAY[ROW(1::i32)]
+  UNION ALL
+  SELECT edge.dst, ROW(edge.dst) = ANY (walk.path), walk.path || ROW(edge.dst)
+  FROM edge JOIN walk ON edge.src = walk.node
+  WHERE NOT walk.is_cycle
+)
+SELECT node, is_cycle, path FROM walk ORDER BY path;`;
+
 	const nestedWith = `WITH prices AS (
   SELECT category, price FROM product
 )
@@ -326,6 +338,15 @@ makes a cyclic graph walk terminate). The column types are fixed by the non-recu
 recursion with no stopping condition runs until it hits the statement's
 [cost ceiling](../../api/resource-limits/) — set one when running untrusted queries. `SEARCH` /
 `CYCLE` clauses and mutual recursion are not yet supported.
+
+What those clauses do can be written by hand: a CTE column may hold an anonymous `ROW(…)` or an
+array of them, so each step can carry the path it took. Ordering by the path gives depth-first
+order, and `ROW(…) = ANY (path)` stops a walk that revisits a node:
+
+<LiveSql demo="recursivePath" seed={graphSeed} query={recursivePath} rows={5} />
+
+Such a `record` or `record[]` column lives only in the query: a `CREATE TABLE … AS` or view column
+of that type is an error (`42P16`), as in PostgreSQL.
 
 ### Nested `WITH`
 

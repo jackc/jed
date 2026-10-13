@@ -52,7 +52,7 @@ function fnv1a64(bytes: Uint8Array): bigint {
 }
 
 function distributionEligible(type: Type): boolean {
-  if (type.kind === "composite" || type.kind === "array") return false;
+  if (type.kind === "composite" || type.kind === "record" || type.kind === "array") return false;
   return (
     type.kind === "range" ||
     (type.scalar !== "json" && type.scalar !== "jsonb" && type.scalar !== "jsonpath")

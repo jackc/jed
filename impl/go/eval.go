@@ -819,6 +819,8 @@ func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
 //   - float widths promote to the widest (f32 with f64 → f64; float never meets int/decimal);
 //   - two arrays unify element-wise when the elements differ only in integer width (a value no-op —
 //     every integer is one i64); any other element difference fails;
+//   - two anonymous records (ROW(…) results) of the same arity unify field-wise by the same
+//     integer-width rule (spec/design/composite.md §13);
 //   - otherwise the two types must be IDENTICAL (structural equality: same element for an array or
 //     range, same named composite or same anonymous shape) — identical types ALWAYS unify, whatever
 //     the family (json, jsonb, jsonpath, date, interval, ranges, composites, …).
@@ -846,6 +848,8 @@ func commonType(a, b resolvedType) (resolvedType, bool) {
 			return resolvedType{}, false
 		}
 		return resolvedType{kind: rtArray, elem: &elem}, true
+	case isAnonymousRecord(a) && isAnonymousRecord(b):
+		return commonRecord(a, b)
 	case resolvedTypeEqual(a, b):
 		return a, true
 	default:
@@ -867,11 +871,40 @@ func commonArrayElement(x, y resolvedType) (resolvedType, bool) {
 			return resolvedType{}, false
 		}
 		return resolvedType{kind: rtArray, elem: &elem}, true
+	case isAnonymousRecord(x) && isAnonymousRecord(y):
+		return commonRecord(x, y)
 	case resolvedTypeEqual(x, y):
 		return x, true
 	default:
 		return resolvedType{}, false
 	}
+}
+
+// isAnonymousRecord reports whether t is an anonymous record (a ROW(…) result's type).
+func isAnonymousRecord(t resolvedType) bool {
+	return t.kind == rtComposite && t.comp != nil && !t.comp.named
+}
+
+// commonRecord is the common type of two anonymous records (spec/design/composite.md §13): the same
+// arity and field names, each field pair unified by the array-element rule — integer widths promote
+// (a value no-op), anything else must be identical.
+func commonRecord(x, y resolvedType) (resolvedType, bool) {
+	if len(x.comp.fields) != len(y.comp.fields) {
+		return resolvedType{}, false
+	}
+	fields := make([]compositeRField, len(x.comp.fields))
+	for i, xf := range x.comp.fields {
+		yf := y.comp.fields[i]
+		if xf.name != yf.name {
+			return resolvedType{}, false
+		}
+		ft, ok := commonArrayElement(xf.ty, yf.ty)
+		if !ok {
+			return resolvedType{}, false
+		}
+		fields[i] = compositeRField{name: xf.name, ty: ft}
+	}
+	return resolvedType{kind: rtComposite, comp: &compositeRType{fields: fields}}, true
 }
 
 // mismatchLocation is the location of the expression a failed type unification names

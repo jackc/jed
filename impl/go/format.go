@@ -111,6 +111,9 @@ func pushArrayElementType(out []byte, elem dataType) []byte {
 	if elem.Range != nil {
 		panic("array-of-range is not a storable type (ranges.md §2)")
 	}
+	if elem.Record != nil {
+		panic("an anonymous record is never stored (composite.md §1)")
+	}
 	if elem.Comp != nil {
 		out = append(out, 14)
 		out = appendU16(out, uint16(len(elem.Comp.Name)))
@@ -2918,6 +2921,9 @@ func compositeTypeEntryBytes(ct *compositeType) []byte {
 	for _, f := range ct.Fields {
 		out = appendU16(out, uint16(len(f.Name)))
 		out = append(out, f.Name...)
+		if f.Type.Record != nil {
+			panic("an anonymous record is never stored (composite.md §1)")
+		}
 		if f.Type.Comp != nil {
 			out = append(out, 14)
 			out = appendU16(out, uint16(len(f.Type.Comp.Name)))
@@ -3682,6 +3688,9 @@ func tableEntryBytes(table *catTable, rootDataPage uint32, indexRoots []uint32, 
 	for _, col := range table.Columns {
 		out = appendU16(out, uint16(len(col.Name)))
 		out = append(out, col.Name...)
+		if col.Type.Record != nil {
+			panic("an anonymous record is never stored (composite.md §1)")
+		}
 		if col.Type.Comp != nil {
 			// A composite column (v9): type_code 14, then flags, then the type name in the typmod
 			// slot (spec/fileformat/format.md). Composite columns carry no default this slice, so

@@ -383,6 +383,26 @@ file = "subquery/row_valued.test"
 sql = "SELECT ROW(1, 2) IN (SELECT true, 2)"
 reason = "jed: a row-valued IN subquery compares each body row as an anonymous composite, so an incomparable field pair (i64 vs boolean) is 42804 (datatype_mismatch — the same gate a single-column IN subquery uses, composite.md §5). PostgreSQL raises 42883 (no `integer = boolean` operator). A code-only divergence; both reject."
 
+# --- anonymous record columns (composite.md §1): jed's record type is static — a derived relation's
+# record column carries its field list — so field access always resolves. PostgreSQL's `record` is
+# dynamic: it keeps the field list only where the planner still sees the ROW(…) expression (a plain
+# derived table or CTE — those agree), and loses it through a VALUES list, an array element, or a
+# recursive CTE's working table. jed accepts a superset; the rows it returns are the field values.
+[[override]]
+file = "types/record_column.test"
+sql = "SELECT (r).f1 FROM (VALUES (ROW(1, 2))) v(r)"
+reason = "jed: a VALUES column of anonymous records keeps its static field list (f1, f2 over i64), so (r).f1 resolves to 1 (the strict static type system, CLAUDE.md §4; composite.md §1). PostgreSQL types the column as the dynamic pseudo-type record with no registered row descriptor and raises 42809 (\"record type has not been registered\"). A lenient divergence; jed returns what PG would for the same ROW(…) in a plain derived table."
+
+[[override]]
+file = "types/record_column.test"
+sql = "SELECT (p[1]).f2 FROM (SELECT ARRAY[ROW(5, 6)] AS p) s"
+reason = "jed: a record[] column keeps its element's static field list, so (p[1]).f2 resolves to 6 (CLAUDE.md §4; composite.md §1). PostgreSQL's record[] element is the dynamic pseudo-type record and the field cannot be resolved at parse time: 42703 (\"could not identify column f2 in record data type\"). A lenient divergence."
+
+[[override]]
+file = "types/record_column.test"
+sql = "WITH RECURSIVE r(n, ord) AS ( SELECT 1, ROW(0, 1) UNION ALL SELECT n + 1, ROW((ord).f1 + 1, n + 1) FROM r WHERE n < 3 ) SELECT n, ord FROM r ORDER BY ord"
+reason = "jed: a recursive CTE's record column keeps the anchor's static field list, so (ord).f1 in the recursive term resolves (CLAUDE.md §4; composite.md §1). PostgreSQL's working-table column is the dynamic pseudo-type record and raises 42809 (\"record type has not been registered\"). A lenient divergence."
+
 # (Nested WITH has since landed — spec/design/cte.md §7 — so jed now accepts it like PostgreSQL; the
 # former cte/errors.test + subquery/derived.test override entries were removed with the feature.)
 

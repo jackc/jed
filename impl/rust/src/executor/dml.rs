@@ -699,7 +699,10 @@ impl Engine {
                             // untyped NULL — the container assignment rule UPDATE and an INSERT VALUES
                             // expression share (array.md §4, ranges.md §4, composite.md §12). An
                             // anonymous ROW(…) column has no composite type to match (0A000).
-                            Type::Composite(_) | Type::Array(_) | Type::Range(_) => {
+                            Type::Composite(_)
+                            | Type::Array(_)
+                            | Type::Range(_)
+                            | Type::Record(_) => {
                                 let src = &q.column_types[p];
                                 if matches!(src, ResolvedType::Composite(c) if c.name.is_none()) {
                                     return Err(EngineError::new(
@@ -818,7 +821,7 @@ impl Engine {
                 Type::Range(_) | Type::Array(_) => {
                     resolve_container_assign(&scope, col, e, &mut AggCtx::Forbidden, ptypes)?
                 }
-                Type::Composite(_) => {
+                Type::Composite(_) | Type::Record(_) => {
                     let (node, ty) = resolve(&scope, e, None, &mut AggCtx::Forbidden, ptypes)?;
                     match &ty {
                         ResolvedType::Null => {}
@@ -1890,7 +1893,7 @@ impl Engine {
                     // assignability gate.
                     let (target, col_type) = match &col.ty {
                         Type::Scalar(target_scalar) => (*target_scalar, None),
-                        Type::Composite(_) | Type::Range(_) | Type::Array(_) => (
+                        Type::Composite(_) | Type::Range(_) | Type::Array(_) | Type::Record(_) => (
                             ScalarType::Int32, // unused (col_type drives the check)
                             Some(resolve_col_type(&col.ty, &self.read_snap().types)),
                         ),
@@ -3614,7 +3617,7 @@ impl Engine {
                 });
                 let (target, col_type) = match &col.ty {
                     Type::Scalar(target) => (*target, None),
-                    Type::Composite(_) | Type::Range(_) | Type::Array(_) => (
+                    Type::Composite(_) | Type::Range(_) | Type::Array(_) | Type::Record(_) => (
                         ScalarType::Int32,
                         Some(resolve_col_type(&col.ty, &scope.catalog.read_snap().types)),
                     ),
@@ -3656,7 +3659,7 @@ impl Engine {
                         col_type: None,
                     });
                 }
-                Type::Composite(_) | Type::Range(_) | Type::Array(_) => {
+                Type::Composite(_) | Type::Range(_) | Type::Array(_) | Type::Record(_) => {
                     // A composite, range, or array column: the RHS adapts (a bare string literal
                     // via record_in/range_in/array_in, a bare NULL to the typed NULL) or must
                     // resolve to the SAME container type; an anonymous ROW(…) expression is 0A000

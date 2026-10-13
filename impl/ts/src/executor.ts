@@ -113,7 +113,7 @@ import {
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { optimizeSelect } from "./optimize.ts";
-import { ctasColumns } from "./create_table_as.ts";
+import { ctasColumns, rejectPseudoType } from "./create_table_as.ts";
 import {
   type WherePushdown,
   accessPredicate,
@@ -6129,7 +6129,7 @@ export class Engine {
           );
         }
       } else if (def.default !== null) {
-        const sty = colType.scalar;
+        const sty = typeScalar(colType);
         // A clock-relative date string DEFAULT ('today'/'now'/…) must NOT fold at CREATE TABLE:
         // it routes to the EXPRESSION path below, re-resolved to the STABLE dateClock node and
         // evaluated per INSERT — where PostgreSQL folds the literal to the table-creation day,
@@ -14369,6 +14369,9 @@ export class Engine {
     const bodyTypes = first.plan.columnTypes;
     const bodyDerivs = queryPlanColumnDerivs(first.plan);
     const columns = viewOutputNames(bodyNames, cv.columns);
+    // A view column cannot be an anonymous record (or an array of one) — 42P16, as for a CREATE
+    // TABLE … AS column (composite.md §1).
+    for (let i = 0; i < columns.length; i++) rejectPseudoType(columns[i]!, bodyTypes[i]!);
     // 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
     let definition = cv.body;
     let trace = first.trace;
@@ -17244,8 +17247,10 @@ export class Engine {
   // 42P18 (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array
   // (NULL::i32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
   // unnest(composite[])): the synthetic column is typed at the bound element type directly
-  // (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
-  // has no catalog name → 0A000, not reachable from a typed array).
+  // (typeFromResolved), so a composite array produces composite rows. An anonymous-record element
+  // (unnest(ARRAY[ROW(…)])) makes unnest a function returning record, which in FROM needs a
+  // column-definition list — 42601, as in PostgreSQL (composite.md §1; the list itself is not
+  // supported for unnest yet).
   private resolveUnnest(
     args: Expr[],
     alias: string | null,
@@ -17256,6 +17261,12 @@ export class Engine {
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const { node, type } = resolve(argScope, args[0]!, null, forbidden, ptypes);
     if (type.kind === "array") {
+      if (type.elem.kind === "composite" && type.elem.name === null) {
+        throw engineError(
+          "syntax_error",
+          'a column definition list is required for functions returning "record"',
+        );
+      }
       const elemTy = typeFromResolved(type.elem);
       const table = srfTable("unnest", alias, elemTy);
       // The column carries the array's collation as an implicit one, like a derived-table column

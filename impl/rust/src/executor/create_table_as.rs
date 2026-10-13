@@ -163,29 +163,36 @@ impl Engine {
     }
 }
 
+/// Reject a persisted relation column (a `CREATE TABLE … AS` table's or a view's) whose type is an
+/// anonymous `ROW(…)` or an array of one: PostgreSQL's pseudo-type `record` / `record[]`, which
+/// only a query's own output may carry (spec/design/composite.md §1) — `42P16`.
+pub(crate) fn reject_pseudo_type(name: &str, rt: &ResolvedType) -> Result<()> {
+    let anonymous = |t: &ResolvedType| matches!(t, ResolvedType::Composite(c) if c.name.is_none());
+    let pseudo = match rt {
+        t if anonymous(t) => "record",
+        ResolvedType::Array(e) if anonymous(e) => "record[]",
+        _ => return Ok(()),
+    };
+    Err(EngineError::new(
+        SqlState::InvalidTableDefinition,
+        format!("column \"{name}\" has pseudo-type {pseudo}"),
+    ))
+}
+
 /// The table-column type of a query output column of resolved type `rt` (create-table-as.md §2): an
 /// untyped NULL is `text`, as in PostgreSQL. An anonymous `ROW(…)` (or an array of one) has no
 /// storable type — PostgreSQL's pseudo-type `record`, 42P16. The types a declared column cannot have
 /// in jed either are the same 0A000: a `jsonpath` column, and an array whose element is itself an
 /// array or a range.
 fn ctas_column_type(name: &str, rt: &ResolvedType) -> Result<Type> {
-    let anonymous = |t: &ResolvedType| matches!(t, ResolvedType::Composite(c) if c.name.is_none());
-    let pseudo = match rt {
-        t if anonymous(t) => Some("record"),
-        ResolvedType::Array(e) if anonymous(e) => Some("record[]"),
-        _ => None,
-    };
-    if let Some(p) = pseudo {
-        return Err(EngineError::new(
-            SqlState::InvalidTableDefinition,
-            format!("column \"{name}\" has pseudo-type {p}"),
-        ));
-    }
+    reject_pseudo_type(name, rt)?;
     let ty = type_from_resolved(rt)?;
     let supported = match &ty {
         Type::Scalar(s) => *s != ScalarType::JsonPath,
         Type::Array(e) => matches!(**e, Type::Scalar(_) | Type::Composite(_)),
         Type::Range(_) | Type::Composite(_) => true,
+        // Unreachable: the pseudo-type check above rejects a record (and a record[]) first.
+        Type::Record(_) => false,
     };
     if !supported {
         return Err(EngineError::new(

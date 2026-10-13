@@ -1429,7 +1429,7 @@ fn hash_join_keyable_type(ty: &Type) -> bool {
         Type::Array(elem) | Type::Range(elem) => {
             matches!(&**elem, Type::Scalar(s) if hash_join_keyable_scalar(*s))
         }
-        Type::Composite(_) => false,
+        Type::Composite(_) | Type::Record(_) => false,
     }
 }
 

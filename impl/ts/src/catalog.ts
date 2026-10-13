@@ -520,6 +520,22 @@ export function resolveColType(ty: Type, types: Map<string, CompositeType>): Col
     // scalar ColType immediately.
     return { kind: "range", elem: resolveColType(ty.elem, types) };
   }
+  if (ty.kind === "record") {
+    // An anonymous record (a derived relation's synthetic column, composite.md §1) resolves to the
+    // composite shape it carries inline — the same codec, comparison, and rendering as a named
+    // composite, under PostgreSQL's display name `record`.
+    return {
+      kind: "composite",
+      name: "record",
+      fields: ty.fields.map((f) => ({
+        name: f.name,
+        type: resolveColType(f.ty, types),
+        typmod: null,
+        varcharLen: null,
+        notNull: false,
+      })),
+    };
+  }
   const def = types.get(ty.name);
   if (def === undefined) {
     throw new Error("composite type reference resolved by validateCompositeTypes");

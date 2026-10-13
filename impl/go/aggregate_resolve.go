@@ -424,9 +424,10 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 		// The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
 		// key's scalar type via the hint. Its type must match the key's family (else 42883).
 		var hint *scalarType
-		if t, err := typeFromResolved(ktype); err == nil && t.Comp == nil && t.Array == nil && t.Range == nil {
-			st := t.Scalar
-			hint = &st
+		if t, err := typeFromResolved(ktype); err == nil {
+			if st, ok := t.AsScalar(); ok {
+				hint = &st
+			}
 		}
 		anode, atype, err := resolve(s, *arg, hint, ag, params)
 		if err != nil {

@@ -365,9 +365,21 @@ type dataType struct {
 	// is one of the six scalar subtypes that have a range, never a composite/array/range. The
 	// pointer also breaks == like Comp/Array.
 	Range *dataType
-	// Scalar is the inner scalar type when Comp == nil && Array == nil && Range == nil. Meaningless
+	// Record is the inline (field name, field type) list when this is an *anonymous* composite —
+	// PostgreSQL's `record`, the type of a ROW(…) result — else nil (spec/design/composite.md §1).
+	// Structural like Array: two records are the same type iff their field lists are equal. Only a
+	// derived relation's synthetic column (a CTE, derived table, VALUES list, or view output) has this
+	// type; it is never stored — no table, composite field, or file carries it.
+	Record *[]recordField
+	// Scalar is the inner scalar type when Comp, Array, Range, and Record are all nil. Meaningless
 	// otherwise.
 	Scalar scalarType
+}
+
+// recordField is one field of an anonymous record type (dataType.Record).
+type recordField struct {
+	Name string
+	Type dataType
 }
 
 // CompositeRef is a by-name reference to a composite type in the database's type catalog. The
@@ -389,6 +401,9 @@ func arrayT(elem dataType) dataType { return dataType{Array: &elem} }
 // RangeT builds a structural range Type over the given scalar element (spec/design/ranges.md §2).
 func rangeT(elem dataType) dataType { return dataType{Range: &elem} }
 
+// RecordT builds an anonymous record Type over the given fields (spec/design/composite.md §1).
+func recordT(fields []recordField) dataType { return dataType{Record: &fields} }
+
 // ScalarTy returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
 // codec, the scalar resolver) call this; a composite/array column reaches those paths only after
 // the caller has branched on IsComposite/IsArray, so a non-scalar here is an engine-invariant
@@ -404,12 +419,15 @@ func (t dataType) ScalarTy() scalarType {
 	if t.Range != nil {
 		panic("BUG: range type used where a scalar was expected (spec/design/ranges.md)")
 	}
+	if t.Record != nil {
+		panic("BUG: record type used where a scalar was expected (spec/design/composite.md)")
+	}
 	return t.Scalar
 }
 
 // AsScalar returns the inner scalar type and true, or (0, false) for a composite/array/range.
 func (t dataType) AsScalar() (scalarType, bool) {
-	if t.Comp != nil || t.Array != nil || t.Range != nil {
+	if !t.isScalar() {
 		return 0, false
 	}
 	return t.Scalar, true
@@ -423,6 +441,9 @@ func (t dataType) IsArray() bool { return t.Array != nil }
 
 // IsRange reports whether this is a range type.
 func (t dataType) IsRange() bool { return t.Range != nil }
+
+// IsRecord reports whether this is an anonymous record type.
+func (t dataType) IsRecord() bool { return t.Record != nil }
 
 // RangeElement returns the element (subtype) of a range type, or (zero, false) if not a range.
 func (t dataType) RangeElement() (dataType, bool) {
@@ -453,6 +474,9 @@ func (t dataType) CanonicalName() string {
 	if t.Comp != nil {
 		return t.Comp.Name
 	}
+	if t.Record != nil {
+		return "record"
+	}
 	if t.Array != nil {
 		return t.Array.CanonicalName() + "[]"
 	}
@@ -470,7 +494,9 @@ func (t dataType) CanonicalName() string {
 // none of these families — so keyability checks (IsInteger || IsUuid || …) correctly reject them
 // (0A000), and family branches fall through to their composite/array handling.
 
-func (t dataType) isScalar() bool { return t.Comp == nil && t.Array == nil && t.Range == nil }
+func (t dataType) isScalar() bool {
+	return t.Comp == nil && t.Array == nil && t.Range == nil && t.Record == nil
+}
 
 // IsInteger reports whether this is a scalar integer type (false for a composite/array).
 func (t dataType) IsInteger() bool { return t.isScalar() && t.Scalar.IsInteger() }

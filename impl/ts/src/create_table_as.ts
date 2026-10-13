@@ -91,12 +91,10 @@ export function ctasColumns(
   });
 }
 
-// ctasColumnType is the table-column type of a query output column of resolved type rt
-// (create-table-as.md §2): an untyped NULL is text, as in PostgreSQL. An anonymous ROW(…) (or an array
-// of one) has no storable type — PostgreSQL's pseudo-type record, 42P16. The types a declared column
-// cannot have in jed either are the same 0A000: a jsonpath column, and an array whose element is
-// itself an array or a range.
-function ctasColumnType(name: string, rt: ResolvedType): Type {
+// rejectPseudoType rejects a persisted relation column (a CREATE TABLE … AS table's or a view's)
+// whose type is an anonymous ROW(…) or an array of one: PostgreSQL's pseudo-type record / record[],
+// which only a query's own output may carry (spec/design/composite.md §1) — 42P16.
+export function rejectPseudoType(name: string, rt: ResolvedType): void {
   const anonymous = (t: ResolvedType): boolean => t.kind === "composite" && t.name === null;
   let pseudo: string | null = null;
   if (anonymous(rt)) pseudo = "record";
@@ -104,6 +102,15 @@ function ctasColumnType(name: string, rt: ResolvedType): Type {
   if (pseudo !== null) {
     throw engineError("invalid_table_definition", `column "${name}" has pseudo-type ${pseudo}`);
   }
+}
+
+// ctasColumnType is the table-column type of a query output column of resolved type rt
+// (create-table-as.md §2): an untyped NULL is text, as in PostgreSQL. An anonymous ROW(…) (or an array
+// of one) has no storable type — PostgreSQL's pseudo-type record, 42P16. The types a declared column
+// cannot have in jed either are the same 0A000: a jsonpath column, and an array whose element is
+// itself an array or a range.
+function ctasColumnType(name: string, rt: ResolvedType): Type {
+  rejectPseudoType(name, rt);
   const ty = typeFromResolved(rt);
   let supported: boolean;
   switch (ty.kind) {
@@ -112,6 +119,10 @@ function ctasColumnType(name: string, rt: ResolvedType): Type {
       break;
     case "array":
       supported = ty.elem.kind === "scalar" || ty.elem.kind === "composite";
+      break;
+    case "record":
+      // Unreachable: rejectPseudoType rejects a record (and a record[]) first.
+      supported = false;
       break;
     default:
       supported = true;

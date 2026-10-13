@@ -100,7 +100,9 @@ Composite opened the type system; arrays add the **third arm**, and a **structur
   multidimensionality is a value property (§4), not array-of-array. `i32[][]` parses to
   `Array(Scalar(i32))` with a *value* `ndim` of 2, never `Array(Array(i32))`. (A future
   array-of-array, if ever wanted, would be a deliberate divergence from PG and is **not** this
-  axis.)
+  axis.) The composite may be an anonymous record — `ARRAY[ROW(…)]`, PostgreSQL's `record[]` — which
+  is a query value and a derived relation's column but never a stored type
+  ([composite.md](composite.md) §13).
 - An array **value** is `Value::Array { ndim, dims, lbounds, elements }` (Rust) / a `ValArray`
   kind holding a pointer so the flat Go `Value` struct stays `==`-comparable — array equality and
   hashing forced through the structural path, never raw `==` (the rule `Decimal`/`Composite`

@@ -680,6 +680,8 @@ export function unifyCaseTypes(arms: ResolvedType[], mismatch: string): Resolved
 //   - float widths promote to the widest (f32 with f64 → f64; float never meets int/decimal);
 //   - two arrays unify element-wise when the elements differ only in integer width (a value no-op —
 //     every integer is one bigint); any other element difference fails;
+//   - two anonymous records (ROW(…) results) of the same arity unify field-wise by the same
+//     integer-width rule (spec/design/composite.md §13);
 //   - otherwise the two types must be IDENTICAL (structural equality: same element for an array or
 //     range, same named composite or same anonymous shape) — identical types ALWAYS unify, whatever
 //     the family (json, jsonb, jsonpath, date, interval, ranges, composites, …).
@@ -700,6 +702,7 @@ export function commonType(a: ResolvedType, b: ResolvedType): ResolvedType | nul
     const elem = commonArrayElement(a.elem, b.elem);
     return elem === null ? null : { kind: "array", elem };
   }
+  if (isAnonymousRecord(a) && isAnonymousRecord(b)) return commonRecord(a, b);
   return resolvedTypeEqual(a, b) ? a : null;
 }
 
@@ -713,7 +716,31 @@ function commonArrayElement(x: ResolvedType, y: ResolvedType): ResolvedType | nu
     const elem = commonArrayElement(x.elem, y.elem);
     return elem === null ? null : { kind: "array", elem };
   }
+  if (isAnonymousRecord(x) && isAnonymousRecord(y)) return commonRecord(x, y);
   return resolvedTypeEqual(x, y) ? x : null;
+}
+
+// isAnonymousRecord reports whether t is an anonymous record (a ROW(…) result's type).
+function isAnonymousRecord(t: ResolvedType): boolean {
+  return t.kind === "composite" && t.name === null;
+}
+
+// commonRecord is the common type of two anonymous records (spec/design/composite.md §13): the same
+// arity and field names, each field pair unified by the array-element rule — integer widths promote
+// (a value no-op), anything else must be identical.
+function commonRecord(x: ResolvedType, y: ResolvedType): ResolvedType | null {
+  if (x.kind !== "composite" || y.kind !== "composite") return null;
+  if (x.fields.length !== y.fields.length) return null;
+  const fields: { name: string; type: ResolvedType }[] = [];
+  for (let i = 0; i < x.fields.length; i++) {
+    const xf = x.fields[i]!;
+    const yf = y.fields[i]!;
+    if (xf.name !== yf.name) return null;
+    const type = commonArrayElement(xf.type, yf.type);
+    if (type === null) return null;
+    fields.push({ name: xf.name, type });
+  }
+  return { kind: "composite", name: null, fields };
 }
 
 // coerceCaseValue coerces a CASE arm's value to the unified result type. The only runtime

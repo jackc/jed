@@ -4978,7 +4978,7 @@ fn set_synthetic_collation(col: &mut Column, d: &Deriv) {
 /// synthetic columns a `Type` (spec/design/cte.md). An untyped NULL column maps to `text`
 /// (PostgreSQL's unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only
 /// CTE column (values flow through unchanged), so it is dropped. An anonymous `ROW(...)` composite
-/// has no catalog type to name — deferred (0A000), a corner not reached by the corpus.
+/// becomes a `Type::Record` carrying its field list (spec/design/composite.md §1).
 fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
     Ok(match rt {
         ResolvedType::Int(s) | ResolvedType::Float(s) => Type::Scalar(*s),
@@ -4996,12 +4996,13 @@ fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
         ResolvedType::Interval => Type::Scalar(ScalarType::Interval),
         ResolvedType::Composite(r) => match &r.name {
             Some(n) => Type::Composite(crate::types::CompositeRef { name: n.clone() }),
-            None => {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "an anonymous composite column in a CTE is not supported yet",
-                ));
-            }
+            // An anonymous `ROW(…)` column carries its shape inline (composite.md §1).
+            None => Type::Record(
+                r.fields
+                    .iter()
+                    .map(|(name, ty)| Ok((name.clone(), type_from_resolved(ty)?)))
+                    .collect::<Result<_>>()?,
+            ),
         },
         ResolvedType::Array(elem) => Type::Array(Box::new(type_from_resolved(elem)?)),
         ResolvedType::Range(elem) => Type::Range(Box::new(type_from_resolved(elem)?)),

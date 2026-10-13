@@ -616,13 +616,15 @@ impl Engine {
                     )?
                     .0
                 }
-                Type::Composite(_) | Type::Range(_) | Type::Array(_) => resolve_container_assign(
-                    &scope,
-                    col,
-                    &assignment.value,
-                    &mut AggCtx::Forbidden,
-                    &mut ptypes,
-                )?,
+                Type::Composite(_) | Type::Range(_) | Type::Array(_) | Type::Record(_) => {
+                    resolve_container_assign(
+                        &scope,
+                        col,
+                        &assignment.value,
+                        &mut AggCtx::Forbidden,
+                        &mut ptypes,
+                    )?
+                }
             };
             collect_touched(&source, 0, &mut mask);
         }

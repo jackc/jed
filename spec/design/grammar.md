@@ -1837,6 +1837,9 @@ cannot drift apart. The pair `(X, Y)` unifies to:
   island ([float.md](float.md) §6; PostgreSQL would promote to `double precision`);
 - two **arrays** element-wise, when their elements differ **only in integer width** (`i32[] ∪
   i64[]` → `i64[]`, a value no-op);
+- two **anonymous records** (`ROW(…)` results) of the same arity field-wise, by the same
+  integer-width rule (`ROW(1::i32) ∪ ROW(2::i64)` → a record of `i64`, a value no-op —
+  [composite.md](composite.md) §13);
 - otherwise **the type itself, when `X` and `Y` are identical** — structurally equal: the same
   scalar, the same element for an array/range, the same named composite (or the same anonymous
   shape). **Identical types always unify, whatever the family**: `json`, `jsonb`, `jsonpath`,
@@ -1858,7 +1861,10 @@ float8[]` → `float8[]`). jed unifies array elements only across integer widths
 that leaves every element value untouched; a pair whose unification would convert each element
 (int → `decimal`, `f32` → `f64`, inside an array or a composite field) is `42804` — deferred, not
 foreclosed (recorded in the override ledger). Likewise an anonymous `ROW(…)` unifies only with an
-identically-shaped anonymous `ROW(…)` (PostgreSQL types every anonymous record as `record`).
+anonymous `ROW(…)` of the same arity whose fields differ at most in integer width. PostgreSQL types
+every anonymous record as `record` and accepts any mix, keeping each row's own field types — so it
+then cannot compare two rows whose field types differ (`42804` *cannot compare dissimilar column
+types*), where jed's widened column compares.
 
 **Matching needs equality.** Unifying is not matching: every set operation except `UNION ALL` —
 `UNION`, `INTERSECT`, `EXCEPT`, `INTERSECT ALL`, `EXCEPT ALL`, and a `UNION` recursive CTE

@@ -1402,8 +1402,8 @@ func setSyntheticCollation(col *catColumn, d deriv) {
 // typeFromResolved is the catalog Type for a resolved expression type — used to give a CTE's
 // synthetic columns a Type (spec/design/cte.md). An untyped NULL column maps to text (PostgreSQL's
 // unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only CTE column
-// (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite has no catalog
-// type to name — deferred (0A000), a corner not reached by the corpus.
+// (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite becomes a record
+// Type carrying its field list (spec/design/composite.md §1).
 func typeFromResolved(rt resolvedType) (dataType, error) {
 	switch rt.kind {
 	case rtInt:
@@ -1440,8 +1440,15 @@ func typeFromResolved(rt resolvedType) (dataType, error) {
 		if rt.comp != nil && rt.comp.named {
 			return compositeT(rt.comp.name), nil
 		}
-		return dataType{}, newError(FeatureNotSupported,
-			"an anonymous composite column in a CTE is not supported yet")
+		fields := make([]recordField, len(rt.comp.fields))
+		for i, f := range rt.comp.fields {
+			ft, err := typeFromResolved(f.ty)
+			if err != nil {
+				return dataType{}, err
+			}
+			fields[i] = recordField{Name: f.name, Type: ft}
+		}
+		return recordT(fields), nil
 	case rtArray:
 		elem, err := typeFromResolved(*rt.elem)
 		if err != nil {
