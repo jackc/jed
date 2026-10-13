@@ -292,6 +292,9 @@ var SupportedCapabilities = []string{
 	// GIN over non-integer fixed-width key-encodable element types (uuid/date/timestamp/
 	// timestamptz/boolean) — the gate lift + the shared key-value term encoder (gin.md §3/§4).
 	"query.gin_element_types",
+	// GIN over f32[]/f64[] — the canonicalizing float key as the term + cross-width query-value
+	// conversion (gin.md §3/§4/§6).
+	"query.gin_float_elements",
 	"query.is_null",
 	"query.order_by",
 	// Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

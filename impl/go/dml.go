@@ -445,21 +445,24 @@ func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b s
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
-// the integers, boolean, uuid, date, timestamp, timestamptz (spec/design/gin.md §3): a GIN term IS
-// the element's order-preserving key encoding (§4) and a term carries no length/terminator framing,
-// so only the FIXED-WIDTH keyables qualify. The variable-width keyables (text, bytea, decimal) —
-// valid ordered-index / PK keys — are 0A000 here, as is float. interval is fixed-width keyable (its
-// 16-byte span key landed, encoding.md §2.10) but its GIN element support is a separate follow-on
-// slice (gin.md §3/§10), so it is not yet admitted here.
+// the integers, boolean, uuid, date, timestamp, timestamptz, f32, f64 (spec/design/gin.md §3): a GIN
+// term IS the element's order-preserving key encoding (§4) and a term carries no length/terminator
+// framing, so only the FIXED-WIDTH keyables qualify. A float term is the canonicalizing
+// float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN), so term equality is
+// exactly SQL float =. The variable-width keyables (text, bytea, decimal) — valid ordered-index / PK
+// keys — are 0A000 here. interval is fixed-width keyable (its 16-byte span key, encoding.md §2.10)
+// but its GIN element support is a separate follow-on slice (gin.md §3/§10), so it is not yet
+// admitted here.
 func isGinElementType(elem scalarType) bool {
 	return elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
-		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate()
+		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate() || elem.IsFloat()
 }
 
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
-// Exactly isGinElementType's set, kept a separate predicate so the two surfaces evolve independently.
+// isGinElementType's set minus the floats, kept a separate predicate so the two surfaces evolve
+// independently.
 func isGistScalarType(ty dataType) bool {
 	return ty.IsInteger() || ty.IsBool() || ty.IsUuid() ||
 		ty.IsTimestamp() || ty.IsTimestamptz() || ty.IsDate()

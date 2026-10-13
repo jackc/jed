@@ -4410,8 +4410,9 @@ impl Engine {
                     // GIN needs an operator class for the column type: only an array has one (else
                     // 42704, no default opclass), and only a FIXED-WIDTH KEY-ENCODABLE element type
                     // (else 0A000) — the GIN term IS that element's key encoding (gin.md §3/§4), so
-                    // the admitted set is the integers, boolean, uuid, date, timestamp, timestamptz
-                    // (interval's GIN-element support is a separate follow-on — gin.md §3/§10).
+                    // the admitted set is the integers, boolean, uuid, date, timestamp, timestamptz,
+                    // f32, f64 (interval's GIN-element support is a separate follow-on — gin.md
+                    // §3/§10).
                     match ty.array_element() {
                         None => {
                             return Err(EngineError::new(

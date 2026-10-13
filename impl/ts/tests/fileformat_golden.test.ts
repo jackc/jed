@@ -425,6 +425,27 @@ function ginUuidTableDB(): Engine {
   return db;
 }
 
+// ginFloatTableDB has gIN indexes over f64[] and f32[] columns (kind 1) — the float GIN element golden
+// (spec/design/gin.md §2/§4): each GIN term is the element's canonicalizing float-order-preserving
+// key (encoding.md §2.8), so -0 and +0 share a term (row 1's tags) and every NaN is ONE term (row
+// 2), while the stored values keep -0's sign bit. Rows 3/4 hold an empty and a NULL whole-value
+// array (no entries) and row 5 NULL elements + a duplicate. An ordered index i_n sits beside them.
+function ginFloatTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, tags f64[], r f32[], n i32)");
+  run(
+    db,
+    "INSERT INTO t VALUES " +
+      "(1, '{1.5,-0,0}', '{-0,0.5}', 1), (2, '{NaN,Infinity,NaN}', '{NaN}', 2), " +
+      "(3, '{}', NULL, 3), (4, NULL, '{}', 4), " +
+      "(5, '{-Infinity,NULL,-2.5}', '{100.25,NULL,100.25}', 5)",
+  );
+  run(db, "CREATE INDEX i_n ON t (n)");
+  run(db, "CREATE INDEX i_tags_gin ON t USING gin (tags)");
+  run(db, "CREATE INDEX i_r_gin ON t USING gin (r)");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 function nopkTableDB(): Engine {
   const db = goldenDb();
@@ -1080,6 +1101,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "hostfunc_check_table.jed", build: hostfuncCheckTableDB },
     { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
+    { name: "gin_float_table.jed", build: ginFloatTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "composite_key_table.jed", build: compositeKeyTableDB },
@@ -1158,6 +1180,7 @@ test("read goldens reproduces rows", () => {
     { name: "hostfunc_check_table.jed", build: hostfuncCheckTableDB, table: "t" },
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
+    { name: "gin_float_table.jed", build: ginFloatTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "composite_key_table.jed", build: compositeKeyTableDB, table: "t" },

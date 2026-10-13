@@ -1,0 +1,231 @@
+# GIN over binary-float element arrays — a `USING gin` index, and every GIN-bounded scan it
+# accelerates (`@>`, `&&`, `= ANY`, array `=`, and the GIN-bounded UPDATE/DELETE), admit an `f64[]` /
+# `f32[]` column (spec/design/gin.md §3). A GIN term IS the element's `float-order-preserving` key
+# (encoding.md §2.8), which canonicalizes `-0 → +0` and every NaN to one NaN — so term equality is
+# exactly SQL float `=` under PostgreSQL's total float order (`-0 = +0`, `NaN = NaN`; float.md §3): a
+# `{-0}` row is found by `0 = ANY(col)`, a `{NaN}` row by `'NaN' = ANY(col)`, and `{0,-0}` yields ONE
+# entry. A query value of the OTHER float width compares by promoting the f32 side (float.md §2), so
+# the gather converts it to the element width first: an f32 widens exactly, an f64 narrows only when it
+# is exactly an f32 (`0.1::f64` is not, so it equals no f32 element — gin.md §6).
+#
+# The rows and end state match PostgreSQL's float4[]/float8[] array_ops GIN (index presence never
+# changes results). The `# cost:` assertions pin that the GIN bound — not a full scan — is taken,
+# cross-core identical (CLAUDE.md §8); query/gin_float_elements_explain.test pins the plan itself.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_element_types, query.gin_float_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, cast.operator, types.f64, types.f32, types.i32, types.array, resource.cost_metering
+
+# ============================================================================
+# f64[] — the index is created BEFORE the rows (every entry arrives through INSERT maintenance).
+# ============================================================================
+
+statement ok
+CREATE TABLE f (id i32 PRIMARY KEY, v f64[])
+
+statement ok
+CREATE INDEX f_v_gin ON f USING gin (v)
+
+statement ok
+INSERT INTO f VALUES
+  (1, '{-0,1.5}'),
+  (2, '{0,0}'),
+  (3, '{NaN,Infinity}'),
+  (4, '{-Infinity,NULL}'),
+  (5, '{}'),
+  (6, NULL),
+  (7, '{0.1,-2.5}'),
+  (8, '{NaN,-0,0,NaN}')
+
+# = ANY: +0 and -0 are one term, so rows holding either zero → ids 1, 2, 8
+# cost: 20
+query I nosort
+SELECT id FROM f WHERE '0'::f64 = ANY(v) ORDER BY id
+----
+1
+2
+8
+
+# cost: 20
+query I nosort
+SELECT id FROM f WHERE '-0'::f64 = ANY(v) ORDER BY id
+----
+1
+2
+8
+
+# = ANY: every NaN is one term (NaN = NaN in the total order) → ids 3, 8
+# cost: 13
+query I nosort
+SELECT id FROM f WHERE 'NaN'::f64 = ANY(v) ORDER BY id
+----
+3
+8
+
+# = ANY over an inexact decimal fraction stored verbatim → id 7
+# cost: 7
+query I nosort
+SELECT id FROM f WHERE '0.1'::f64 = ANY(v) ORDER BY id
+----
+7
+
+# @> (contains): a NaN and a zero together → id 8 (the two-posting-list intersection)
+# cost: 11
+query I nosort
+SELECT id FROM f WHERE v @> '{0,NaN}'::f64[] ORDER BY id
+----
+8
+
+# @> with a -0 query element finds +0 rows too → ids 1, 2, 8
+# cost: 16
+query I nosort
+SELECT id FROM f WHERE v @> '{-0}'::f64[] ORDER BY id
+----
+1
+2
+8
+
+# @> miss: no row holds 2.5 → an empty posting list
+# cost: 1
+query I nosort
+SELECT id FROM f WHERE v @> '{2.5}'::f64[] ORDER BY id
+----
+
+# && (overlaps): either infinity → ids 3, 4 (the posting-list union)
+# cost: 12
+query I nosort
+SELECT id FROM f WHERE v && '{Infinity,-Infinity}'::f64[] ORDER BY id
+----
+3
+4
+
+# = (exact array equality): element-wise float =, so {-0,-0} equals the stored {0,0} → id 2
+# cost: 14
+query I nosort
+SELECT id FROM f WHERE v = '{-0,-0}'::f64[] ORDER BY id
+----
+2
+
+# = ANY with an f32 query value against the f64[] index: the f32 widens exactly. 1.5 is exact in both
+# widths → id 1; 0.1::f32 widens to a different double than the stored 0.1 → no row.
+# cost: 8
+query I nosort
+SELECT id FROM f WHERE '1.5'::f32 = ANY(v) ORDER BY id
+----
+1
+
+# cost: 1
+query I nosort
+SELECT id FROM f WHERE '0.1'::f32 = ANY(v) ORDER BY id
+----
+
+# GIN-bounded DELETE: remove the NaN rows → ids 3, 8; the index is maintained (a probe after the
+# delete finds NaN in no surviving row)
+# cost: 11
+statement ok
+DELETE FROM f WHERE 'NaN'::f64 = ANY(v)
+
+# cost: 1
+query I nosort
+SELECT id FROM f WHERE 'NaN'::f64 = ANY(v) ORDER BY id
+----
+
+# cost: 13
+query I nosort
+SELECT id FROM f WHERE '0'::f64 = ANY(v) ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM f ORDER BY id
+----
+1
+2
+4
+5
+6
+7
+
+# ============================================================================
+# f32[] — the index is created AFTER the rows (the CREATE INDEX build path).
+# ============================================================================
+
+statement ok
+CREATE TABLE g (id i32 PRIMARY KEY, w f32[])
+
+statement ok
+INSERT INTO g VALUES
+  (1, '{-0,1.5}'),
+  (2, '{0.1}'),
+  (3, '{NaN}'),
+  (4, '{3.4028235e38,-Infinity}'),
+  (5, '{}'),
+  (6, NULL)
+
+statement ok
+CREATE INDEX g_w_gin ON g USING gin (w)
+
+# = ANY: the f32 zero term → id 1
+# cost: 7
+query I nosort
+SELECT id FROM g WHERE '0'::f32 = ANY(w) ORDER BY id
+----
+1
+
+# = ANY: the f32 NaN term → id 3
+# cost: 7
+query I nosort
+SELECT id FROM g WHERE 'NaN'::f32 = ANY(w) ORDER BY id
+----
+3
+
+# @> (contains) → id 2
+# cost: 6
+query I nosort
+SELECT id FROM g WHERE w @> '{0.1}'::f32[] ORDER BY id
+----
+2
+
+# && (overlaps): the largest finite f32 or 0.1 → ids 2, 4
+# cost: 12
+query I nosort
+SELECT id FROM g WHERE w && '{3.4028235e38,0.1}'::f32[] ORDER BY id
+----
+2
+4
+
+# = ANY with an f64 query value against the f32[] index: the f32 elements are promoted, so an f64
+# that is exactly an f32 narrows to that term (1.5 → id 1; NaN → id 3) ...
+# cost: 8
+query I nosort
+SELECT id FROM g WHERE '1.5'::f64 = ANY(w) ORDER BY id
+----
+1
+
+# cost: 7
+query I nosort
+SELECT id FROM g WHERE 'NaN'::f64 = ANY(w) ORDER BY id
+----
+3
+
+# ... while an f64 that no f32 represents equals no element (0.1::f64 is not the f32 0.1 widened):
+# a provably-empty bound
+# cost: 0
+query I nosort
+SELECT id FROM g WHERE '0.1'::f64 = ANY(w) ORDER BY id
+----
+
+# GIN-bounded UPDATE: rewrite the rows holding a zero; the entry set moves with the new value
+# cost: 5
+statement ok
+UPDATE g SET w = '{2.5}' WHERE w @> '{-0}'::f32[]
+
+# cost: 1
+query I nosort
+SELECT id FROM g WHERE '0'::f32 = ANY(w) ORDER BY id
+----
+
+# cost: 7
+query I nosort
+SELECT id FROM g WHERE '2.5'::f32 = ANY(w) ORDER BY id
+----
+1

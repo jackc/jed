@@ -401,6 +401,24 @@ func ginUuidTableDB(t *testing.T) *Session {
 	return db
 }
 
+// ginFloatTableDB has gIN indexes over f64[] and f32[] columns (kind 1) — the float GIN element golden
+// (spec/design/gin.md §2/§4): each GIN term is the element's canonicalizing float-order-preserving
+// key (encoding.md §2.8), so -0 and +0 share a term (row 1's tags) and every NaN is ONE term (row
+// 2), while the stored values keep -0's sign bit. Rows 3/4 hold an empty and a NULL whole-value
+// array (no entries) and row 5 NULL elements + a duplicate. An ordered index i_n sits beside them.
+func ginFloatTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, tags f64[], r f32[], n i32)")
+	run(t, db, "INSERT INTO t VALUES "+
+		"(1, '{1.5,-0,0}', '{-0,0.5}', 1), (2, '{NaN,Infinity,NaN}', '{NaN}', 2), "+
+		"(3, '{}', NULL, 3), (4, NULL, '{}', 4), "+
+		"(5, '{-Infinity,NULL,-2.5}', '{100.25,NULL,100.25}', 5)")
+	run(t, db, "CREATE INDEX i_n ON t (n)")
+	run(t, db, "CREATE INDEX i_tags_gin ON t USING gin (tags)")
+	run(t, db, "CREATE INDEX i_r_gin ON t USING gin (r)")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 func nopkTableDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
@@ -1048,6 +1066,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"hostfunc_check_table.jed", hostfuncCheckTableDB},
 		{"gin_array_table.jed", ginArrayTableDB},
 		{"gin_uuid_table.jed", ginUuidTableDB},
+		{"gin_float_table.jed", ginFloatTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"composite_key_table.jed", compositeKeyTableDB},
@@ -1128,6 +1147,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"timezone_index_table.jed", timezoneIndexTableDB, "t"},
 		{"gin_array_table.jed", ginArrayTableDB, "t"},
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
+		{"gin_float_table.jed", ginFloatTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"composite_key_table.jed", compositeKeyTableDB, "t"},

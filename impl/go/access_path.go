@@ -1731,25 +1731,29 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		if qv.Kind == ValInt && !gb.elemType.InRange(qv.Int) {
 			return nil, 0, 0, nil // out-of-range guard
 		}
-		// a GIN element is fixed-width (isGinElementType excludes text), so the term never collates / fails
-		t, err := encodeKeyValue(gb.elemType, qv, nil)
-		if err != nil {
-			panic("a GIN element key is infallible (fixed-width, no collation)")
+		t, ok := ginQueryTerm(gb.elemType, qv)
+		if !ok {
+			return nil, 0, 0, nil // c equals no element of the indexed type
 		}
 		terms = append(terms, t)
 	} else {
 		if qv.Kind != ValArray {
 			return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
 		}
+		// unmatchable: a query element no stored element can equal (an f64 not exactly an f32 against
+		// an f32[] index — ginQueryTerm). It reaches no posting list, so @> and array = (which need
+		// EVERY query element present) are provably empty; && skips it.
+		unmatchable := false
 		seen := make(map[string]bool)
 		for _, el := range qv.arrayVal().Elements {
 			if el.Kind == ValNull {
 				hasNull = true // a NULL element carries no term
 				continue
 			}
-			t, err := encodeKeyValue(gb.elemType, el, nil)
-			if err != nil {
-				panic("a GIN element key is infallible (fixed-width, no collation)")
+			t, ok := ginQueryTerm(gb.elemType, el)
+			if !ok {
+				unmatchable = true
+				continue
 			}
 			if !seen[string(t)] {
 				seen[string(t)] = true
@@ -1757,6 +1761,9 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 			}
 		}
 		isEmpty = len(qv.arrayVal().Elements) == 0
+		if unmatchable && gb.strategy != ginOverlaps {
+			return nil, 0, 0, nil
+		}
 		slices.SortFunc(terms, bytes.Compare)
 	}
 
@@ -1845,6 +1852,33 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		out = append(out, entry{Key: key, Row: row})
 	}
 	return out, pages, slabs, nil
+}
+
+// ginQueryTerm is the GIN term for one non-NULL query value against an index whose elements are
+// elem — the element's order-preserving key encoding (gin.md §4), the same bytes the entries carry —
+// or ok=false when the value can equal NO stored element. A float query value may be the OTHER float
+// width (f64 = ANY(f32[]) compares by promoting the f32 elements, float.md §2), so it is first
+// converted to the element width: an f32 value widens exactly; an f64 value narrows only when it is
+// exactly an f32 (or NaN — every NaN is one value, float.md §3), else no f32 element can equal it.
+// The float key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so term equality is exactly
+// SQL float =. A GIN element is fixed-width (no text), so the encoding never collates / fails.
+func ginQueryTerm(elem scalarType, v Value) ([]byte, bool) {
+	switch {
+	case elem == scalarFloat32 && v.Kind == ValFloat64:
+		x := v.F64()
+		narrowed := float32(x)
+		if !math.IsNaN(x) && float64(narrowed) != x {
+			return nil, false
+		}
+		return encodeFloat32Key(math.Float32bits(narrowed)), true
+	case elem == scalarFloat64 && v.Kind == ValFloat32:
+		return encodeFloat64Key(math.Float64bits(float64(v.F32()))), true
+	}
+	t, err := encodeKeyValue(elem, v, nil)
+	if err != nil {
+		panic("a GIN element key is infallible (fixed-width, no collation)")
+	}
+	return t, true
 }
 
 // gistBoundRows gathers a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the

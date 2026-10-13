@@ -283,30 +283,27 @@ impl Engine {
         let mut terms: Vec<Vec<u8>> = Vec::new();
         let mut has_null = false;
         let mut is_empty = false;
+        // A query element no stored element can equal (an `f64` constant not exactly representable
+        // as `f32` against an `f32[]` index — gin_query_term). It reaches no posting list, so `@>`
+        // and array `=` (which need EVERY query element present) are provably empty; `&&` skips it.
+        let mut unmatchable = false;
         if gb.strategy == GinStrategy::Member {
             // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL `c` can equal no
             // element, so the bound is provably empty (gin.md §6). `c` is in the element type's
             // domain by resolution (jed coerces `c` to the element type, rejecting an out-of-range
             // integer constant 22003 before exec); the integer range check is a defensive guard
             // against silently truncating an out-of-range value into a wrong term.
-            // A GIN element is fixed-width (no text), so the term encoding never collates / fails.
-            let gin_term = |ty: ScalarType, v: &Value| -> Vec<u8> {
-                encode_key_value(ty, v, None)
-                    .expect("a GIN element key is infallible (fixed-width, no collation)")
-            };
             match &qv {
                 Value::Null => return Ok((Vec::new(), (0, 0))),
-                Value::Int(n) if *n >= gb.elem_type.min() && *n <= gb.elem_type.max() => {
-                    terms.push(gin_term(gb.elem_type, &qv))
+                Value::Int(n) if *n < gb.elem_type.min() || *n > gb.elem_type.max() => {
+                    return Ok((Vec::new(), (0, 0))); // out-of-range guard
                 }
-                Value::Int(_) => return Ok((Vec::new(), (0, 0))), // out-of-range guard
-                v => terms.push(gin_term(gb.elem_type, v)),
+                v => match gin_query_term(gb.elem_type, v) {
+                    Some(term) => terms.push(term),
+                    None => return Ok((Vec::new(), (0, 0))),
+                },
             }
         } else {
-            let gin_term = |ty: ScalarType, v: &Value| -> Vec<u8> {
-                encode_key_value(ty, v, None)
-                    .expect("a GIN element key is infallible (fixed-width, no collation)")
-            };
             let arr = match &qv {
                 // A NULL whole-array query is 3VL-NULL for every row → never TRUE (both @> and &&).
                 Value::Null => return Ok((Vec::new(), (0, 0))),
@@ -316,10 +313,16 @@ impl Engine {
             for el in &arr.elements {
                 match el {
                     Value::Null => has_null = true, // a NULL element carries no term
-                    v => terms.push(gin_term(gb.elem_type, v)),
+                    v => match gin_query_term(gb.elem_type, v) {
+                        Some(term) => terms.push(term),
+                        None => unmatchable = true,
+                    },
                 }
             }
             is_empty = arr.elements.is_empty();
+            if unmatchable && gb.strategy != GinStrategy::Overlaps {
+                return Ok((Vec::new(), (0, 0)));
+            }
         }
         terms.sort_unstable();
         terms.dedup();
@@ -546,4 +549,27 @@ pub(crate) fn index_store_bound_entries(
         ));
     }
     Ok((rows, (pages, slabs)))
+}
+
+/// The GIN term for one non-NULL query value against an index whose elements are `elem` — the
+/// element's order-preserving key encoding (gin.md §4), the same bytes the entries carry — or
+/// `None` when the value can equal NO stored element. A float query value may be the OTHER float
+/// width (`f64 = ANY(f32[])` compares by promoting the `f32` elements, float.md §2), so it is first
+/// converted to the element width: an `f32` value widens exactly; an `f64` value narrows only when
+/// it is exactly an `f32` (or NaN — every NaN is one value, float.md §3), else no `f32` element can
+/// equal it. The float key canonicalizes `-0 → +0` and every NaN (encoding.md §2.8), so term
+/// equality is exactly SQL float `=`. A GIN element is fixed-width (no text), so the encoding never
+/// collates / fails.
+fn gin_query_term(elem: ScalarType, v: &Value) -> Option<Vec<u8>> {
+    match (elem, v) {
+        (ScalarType::Float32, Value::Float64(x)) => {
+            let narrowed = *x as f32;
+            (x.is_nan() || f64::from(narrowed) == *x).then(|| encode_f32_key(narrowed))
+        }
+        (ScalarType::Float64, Value::Float32(x)) => Some(encode_f64_key(f64::from(*x))),
+        _ => Some(
+            encode_key_value(elem, v, None)
+                .expect("a GIN element key is infallible (fixed-width, no collation)"),
+        ),
+    }
 }

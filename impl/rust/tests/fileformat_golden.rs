@@ -653,6 +653,35 @@ fn gist_exclude_table_db() -> Session {
     db
 }
 
+/// `i_tags_gin` / `i_r_gin` — gIN indexes over f64[] and f32[] columns (kind 1) — the float GIN element golden
+/// (spec/design/gin.md §2/§4): each GIN term is the element's canonicalizing float-order-preserving
+/// key (encoding.md §2.8), so -0 and +0 share a term (row 1's tags) and every NaN is ONE term (row
+/// 2), while the stored values keep -0's sign bit. Rows 3/4 hold an empty and a NULL whole-value
+/// array (no entries) and row 5 NULL elements + a duplicate. An ordered index i_n sits beside them.
+fn gin_float_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, tags f64[], r f32[], n i32)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES \
+         (1, '{1.5,-0,0}', '{-0,0.5}', 1), (2, '{NaN,Infinity,NaN}', '{NaN}', 2), \
+         (3, '{}', NULL, 3), (4, NULL, '{}', 4), \
+         (5, '{-Infinity,NULL,-2.5}', '{100.25,NULL,100.25}', 5)",
+    );
+    run(&mut db, "CREATE INDEX i_n ON t (n)");
+    run(&mut db, "CREATE INDEX i_tags_gin ON t USING gin (tags)");
+    run(&mut db, "CREATE INDEX i_r_gin ON t USING gin (r)");
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
@@ -1725,6 +1754,7 @@ fn write_matches_goldens() {
         ("hostfunc_check_table.jed", hostfunc_check_table_db),
         ("gin_array_table.jed", gin_array_table_db),
         ("gin_uuid_table.jed", gin_uuid_table_db),
+        ("gin_float_table.jed", gin_float_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("composite_key_table.jed", composite_key_table_db),
@@ -1823,6 +1853,7 @@ fn read_goldens_reproduces_rows() {
         ("timezone_index_table.jed", timezone_index_table_db, "t"),
         ("gin_array_table.jed", gin_array_table_db, "t"),
         ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
+        ("gin_float_table.jed", gin_float_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("composite_key_table.jed", composite_key_table_db, "t"),

@@ -1071,6 +1071,27 @@ GIST_EXCLUDE_TABLE = {
          [7, 105, rng(1, 5)], [8, nil, rng(10, 20)]]
 }.freeze
 
+# GIN indexes over f64[] and f32[] columns (the float GIN element golden, spec/design/gin.md §2/§4):
+# each GIN term is the element's canonicalizing float-order-preserving key (encoding.md §2.8), so
+# -0 and +0 share a term (row 1's tags), every NaN is ONE term (row 2's two NaNs; row 2's r), and
+# the 8-byte (f64) / 4-byte (f32) terms self-delimit before the storage key. The stored VALUES keep
+# -0's sign bit (row 1) — only the index terms canonicalize. Rows 3/4 hold an empty and a NULL
+# whole-value array (no entries) and row 5 NULL elements + a duplicate. In-contract literals only.
+GIN_FLOAT_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("tags", "f64[]"), col("r", "f32[]"), col("n", "i32")],
+  indexes: [
+    { name: "i_n", cols: [3] },
+    { name: "i_r_gin", cols: [2], kind: "gin" },
+    { name: "i_tags_gin", cols: [1], kind: "gin" }
+  ],
+  rows: [[1, [1.5, -0.0, 0.0], [-0.0, 0.5], 1],
+         [2, [Float::NAN, Float::INFINITY, Float::NAN], [Float::NAN], 2],
+         [3, [], nil, 3],
+         [4, nil, [], 4],
+         [5, [-Float::INFINITY, nil, -2.5], [100.25, nil, 100.25], 5]]
+}.freeze
+
 # A composite type used as an ARRAY ELEMENT type (v10 — array-of-composite, spec/design/array.md §12
 # AC1): pins the catalog array-column entry with a COMPOSITE element descriptor (type_code 15, then
 # the element descriptor element_type_code 14 + name "addr", §3) AND the recursive value body — an
@@ -1406,6 +1427,7 @@ FIXTURES = ([
   { file: "hostfunc_check_table.jed", page_size: 256, tables: [HOSTFUNC_CHECK_TABLE] },
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
+  { file: "gin_float_table.jed", page_size: 256, tables: [GIN_FLOAT_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
@@ -2389,7 +2411,9 @@ end
 # A GIN index's (entry_key, record-plan) pairs in entry-key order (spec/design/gin.md §4): one
 # entry per DISTINCT non-NULL array element — encode(element) ‖ storage_key, with NO presence tag
 # (a term is never NULL) and an EMPTY payload. A NULL whole-value array and an empty array yield no
-# entries (they appear in no posting list). This slice: a single integer-element array column.
+# entries (they appear in no posting list). Terms dedup by their ENCODED bytes, not Ruby value
+# equality: a float term's key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so {-0,0} and
+# {NaN,NaN} are one term each (Ruby's uniq would keep two distinct NaN objects).
 def gin_index_entries(table, ix)
   elem_type = array_elem(table[:columns][ix[:cols][0]][:type])
   raise "a GIN index column must be an array" unless elem_type
@@ -2398,8 +2422,8 @@ def gin_index_entries(table, ix)
     av = row[ix[:cols][0]]
     next if av.nil? # a NULL array yields no terms
     elems = av.is_a?(Hash) ? av[:elements] : av
-    elems.compact.uniq.each do |e|
-      key = (key_body(elem_type, e) + storage_key).b
+    elems.compact.map { |e| key_body(elem_type, e) }.uniq.each do |term|
+      key = (term + storage_key).b
       pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
     end
   end

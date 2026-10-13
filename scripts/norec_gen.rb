@@ -145,6 +145,11 @@
 #   gin_eq   — `tags = Q` over a GIN-indexed array column gathers candidates via the @>-superset
 #              bound + residual = (gin.md §6); the equivalent `NOT (tags <> Q)` is NOT GIN-accelerated
 #              (full scan). Both must return identical rows (exact-equality gather oracle).
+#   gin_float — GIN over f64[]/f32[] (gin.md §3/§6): `k = ANY(col)` / `col @> Q` / `col = Q`, incl.
+#              the cross-width `f64 = ANY(f32[])` / `f32 = ANY(f64[])` memberships, gather through the
+#              canonicalizing float key (-0 = +0, NaN = NaN); the equivalent `NOT (k <> ALL(col))` /
+#              `Q <@ col` / `NOT (col <> Q)` are NOT GIN-accelerated (full scan). Both must return the
+#              by-construction rows under PostgreSQL's total float equality.
 #   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
 #              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
@@ -349,6 +354,11 @@ GIN_ANY_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_any_eq
 GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_eq dml.insert
                 dml.insert_multi_row query.select query.order_by query.where_eq types.i32
                 types.array].freeze
+GIN_FLOAT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_any_eq
+                   query.gin_array_eq query.gin_float_elements dml.insert dml.insert_multi_row
+                   query.select query.order_by query.logical_connectives types.i32 types.f64
+                   types.f32 types.array func.array_containment func.array_quantified
+                   cast.operator].freeze
 GIN_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_mutation query.gin_any_eq
                  dml.insert dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                  query.order_by types.i32 types.array func.array_containment func.array_quantified].freeze
@@ -2151,6 +2161,99 @@ def gen_gin_eq(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN over float element arrays (bounded vs full-scan spellings) --------------------
+# A GIN term over `f64[]`/`f32[]` is the canonicalizing `float-order-preserving` key (encoding.md
+# §2.8), so `-0`/`+0` share a term and every NaN is one term — term equality must be exactly SQL
+# float `=` under the total order (-0 = +0, NaN = NaN; float.md §3). A cross-width query value
+# (`f64 = ANY(f32[])` promotes the f32 elements) is converted to the element width before the gather
+# (gin.md §6). Each pair is a GIN-accelerated spelling vs a semantically identical one the GIN matcher
+# never takes: `k = ANY(col)` vs `NOT (k <> ALL(col))` (no NULL elements are generated, so both are
+# exactly "col holds an element equal to k"), `col @> Q` vs `Q <@ col`, and `col = Q` vs
+# `NOT (col <> Q)`. Expected rows come from a Ruby model of the float total-order equality (f32
+# values rounded through `pack('g')`), so this catches a canonicalization / width-conversion bug all
+# three cores might share, which differential testing alone cannot.
+def gen_gin_float(seed)
+  rng = Random.new(seed)
+  domain = %w[-0 0 1.5 -2.5 0.1 NaN Infinity -Infinity]
+  parse = lambda do |s|
+    case s
+    when "NaN" then Float::NAN
+    when "Infinity" then Float::INFINITY
+    when "-Infinity" then -Float::INFINITY
+    else Float(s)
+    end
+  end
+  f32 = ->(x) { [x].pack("g").unpack1("g") }
+  feq = ->(a, b) { a.nan? ? b.nan? : (!b.nan? && a == b) }
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, v, w): the same small float-literal arrays in an f64[] and an f32[] column; one row is NULL
+  # in both and some are empty {}. No NULL ELEMENTS (keeps the <> ALL / <> spellings exact).
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { domain.sample(random: rng) }]
+  end
+  vals = ->(t, width) { t.map { |s| width == :f32 ? f32.call(parse.call(s)) : parse.call(s) } }
+  member = lambda do |width, k|
+    rows.select { |_id, t| !t.nil? && vals.call(t, width).any? { |e| feq.call(e, k) } }.map { |id, _| id.to_s }
+  end
+  contains = lambda do |width, ks|
+    rows.select do |_id, t|
+      !t.nil? && ks.all? { |k| vals.call(t, width).any? { |e| feq.call(e, k) } }
+    end.map { |id, _| id.to_s }
+  end
+  equal = lambda do |width, qs|
+    rows.select do |_id, t|
+      next false if t.nil? || t.size != qs.size
+
+      vals.call(t, width).zip(qs).all? { |e, k| feq.call(e, k) }
+    end.map { |id, _| id.to_s }
+  end
+
+  lit = ->(t) { t.nil? ? "NULL" : "'{#{t.join(',')}}'" }
+  arr = ->(ks, ty) { "'{#{ks.join(',')}}'::#{ty}[]" }
+  # Query values always include a signed zero and NaN (the canonicalization edges) plus random picks.
+  zero = %w[-0 0].sample(random: rng)
+  pick = domain.sample(random: rng)
+  pair = [zero, domain.sample(random: rng)]
+  # An existing non-empty row with every zero sign-flipped (still equal under float =).
+  eq_src = rows.filter_map { |_id, t| t }.reject(&:empty?).sample(random: rng) || ["1.5"]
+  eq_q = eq_src.map { |s| { "-0" => "0", "0" => "-0" }.fetch(s, s) }
+
+  out = header(seed, GIN_FLOAT_REQ, "GIN over float element arrays (bounded vs full-scan spellings)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v f64[], w f32[])")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{lit.call(t)}, #{lit.call(t)})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_v_gin ON t USING gin (v)")
+  stmt(out, "CREATE INDEX t_w_gin ON t USING gin (w)")
+
+  mpair = lambda do |col, col_w, k, k_ty|
+    kv = k_ty == "f32" ? f32.call(parse.call(k)) : parse.call(k)
+    exp = member.call(col_w, kv)
+    out << "# '#{k}'::#{k_ty} = ANY(#{col}) — GIN bound vs NOT (<> ALL) full scan"
+    q(out, "I", "SELECT id FROM t WHERE '#{k}'::#{k_ty} = ANY(#{col}) ORDER BY id", exp)
+    q(out, "I", "SELECT id FROM t WHERE NOT ('#{k}'::#{k_ty} <> ALL(#{col})) ORDER BY id", exp)
+  end
+
+  [zero, "NaN", pick].each { |k| mpair.call("v", :f64, k, "f64") }
+  # cross-width: an f64 against the f32[] index narrows (or matches nothing); an f32 against f64[] widens
+  [pick, "0.1", "NaN"].each { |k| mpair.call("w", :f32, k, "f64") }
+  [zero, pick].each { |k| mpair.call("v", :f64, k, "f32") }
+
+  ks = pair.map { |s| parse.call(s) }
+  exp = contains.call(:f64, ks)
+  out << "# v @> {#{pair.join(',')}} — GIN bound vs <@ full scan"
+  q(out, "I", "SELECT id FROM t WHERE v @> #{arr.call(pair, 'f64')} ORDER BY id", exp)
+  q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair, 'f64')} <@ v ORDER BY id", exp)
+
+  exp = equal.call(:f32, eq_q.map { |s| f32.call(parse.call(s)) })
+  out << "# w = {#{eq_q.join(',')}} — GIN bound + residual = vs NOT (<>) full scan"
+  q(out, "I", "SELECT id FROM t WHERE w = #{arr.call(eq_q, 'f32')} ORDER BY id", exp)
+  q(out, "I", "SELECT id FROM t WHERE NOT (w <> #{arr.call(eq_q, 'f32')}) ORDER BY id", exp)
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: GIN-bounded UPDATE/DELETE (index-bound mutation vs <@ full-scan mutation) ---------
 # A GIN-bounded UPDATE/DELETE bounds its TARGET-ROW scan through the index (spec/design/gin.md §6;
 # query.gin_mutation): `UPDATE … WHERE tags @> Q` takes the @> bound, `DELETE … WHERE c = ANY(tags)`
@@ -3672,6 +3775,7 @@ SCENARIOS = {
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),
+  "gin_float" => method(:gen_gin_float),
   "gin_mut" => method(:gen_gin_mutation),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),

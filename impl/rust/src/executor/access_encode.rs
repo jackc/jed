@@ -3113,13 +3113,14 @@ pub(crate) fn exclusion_pair_conflicts(
 }
 
 /// Is `elem` an element type a GIN (`array_ops`) index admits? The integers, `boolean`, `uuid`,
-/// `date`, `timestamp`, `timestamptz` (spec/design/gin.md §3): the GIN term IS the element's
-/// order-preserving key encoding (§4) and a term carries no length/terminator framing, so only the
-/// FIXED-WIDTH keyables qualify. The VARIABLE-width keyables (`text`, `bytea`, `decimal`) — though
-/// valid ordered-index / PK keys — are 0A000 here, as is `float`. `interval` is fixed-width keyable
-/// (its 16-byte span key landed this slice, encoding.md §2.10) but its GIN *element* support is a
-/// separate follow-on slice (gin.md §3/§10 — like each element type before it), so it is not yet
-/// admitted here.
+/// `date`, `timestamp`, `timestamptz`, `f32`, `f64` (spec/design/gin.md §3): the GIN term IS the
+/// element's order-preserving key encoding (§4) and a term carries no length/terminator framing, so
+/// only the FIXED-WIDTH keyables qualify. A float term is the canonicalizing `float-order-preserving`
+/// key (encoding.md §2.8: `-0 → +0`, every NaN → one NaN), so term equality is exactly SQL float `=`.
+/// The VARIABLE-width keyables (`text`, `bytea`, `decimal`) — though valid ordered-index / PK keys —
+/// are 0A000 here. `interval` is fixed-width keyable (its 16-byte span key, encoding.md §2.10) but
+/// its GIN *element* support is a separate follow-on slice (gin.md §3/§10 — like each element type
+/// before it), so it is not yet admitted here.
 pub(crate) fn is_gin_element_type(elem: &Type) -> bool {
     elem.is_integer()
         || elem.is_bool()
@@ -3127,13 +3128,14 @@ pub(crate) fn is_gin_element_type(elem: &Type) -> bool {
         || elem.is_timestamp()
         || elem.is_timestamptz()
         || elem.is_date()
+        || elem.is_float()
 }
 
 /// Does the scalar `=` GiST opclass admit this column type (spec/design/gist.md §6)? The FIXED-WIDTH
 /// keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is `[min, max]`
-/// over the order-preserving key encoding, compared as raw bytes (no decode, no collation). Exactly
-/// `is_gin_element_type`'s set (both stage on the fixed-width key-encodable scalars), kept a separate
-/// predicate so the two surfaces evolve independently.
+/// over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
+/// `is_gin_element_type`'s set minus the floats (both stage on the fixed-width key-encodable
+/// scalars), kept a separate predicate so the two surfaces evolve independently.
 pub(crate) fn is_gist_scalar_type(ty: &Type) -> bool {
     ty.is_integer()
         || ty.is_bool()

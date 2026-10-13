@@ -8890,8 +8890,8 @@ export class Engine {
         // GIN needs an operator class for the column type: only an array has one (else 42704),
         // and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
         // element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean, uuid,
-        // date, timestamp, timestamptz (interval's GIN-element support is a separate follow-on — its
-        // key landed but the GIN slice has not; gin.md §3/§10).
+        // date, timestamp, timestamptz, f32, f64 (interval's GIN-element support is a separate
+        // follow-on — its key landed but the GIN slice has not; gin.md §3/§10).
         if (ty.kind !== "array") {
           throw engineError(
             "undefined_object",
@@ -9710,17 +9710,26 @@ export class Engine {
       if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
       if (qv.kind === "int" && !inRange(gb.elemType, qv.int))
         return { entries: [], pages: 0, slabs: 0 };
-      // a GIN element is fixed-width (no text), so the term never collates.
-      terms.push(encodeKeyValue(gb.elemType, qv, null));
+      const t = ginQueryTerm(gb.elemType, qv);
+      if (t === null) return { entries: [], pages: 0, slabs: 0 }; // c equals no element of the type
+      terms.push(t);
     } else {
       if (qv.kind !== "array") return { entries: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
+      // unmatchable: a query element no stored element can equal (an f64 not exactly an f32 against
+      // an f32[] index — ginQueryTerm). It reaches no posting list, so @> and array = (which need
+      // EVERY query element present) are provably empty; && skips it.
+      let unmatchable = false;
       const seen = new Set<string>();
       for (const el of qv.elements) {
         if (el.kind === "null") {
           hasNull = true; // a NULL element carries no term
           continue;
         }
-        const t = encodeKeyValue(gb.elemType, el, null);
+        const t = ginQueryTerm(gb.elemType, el);
+        if (t === null) {
+          unmatchable = true;
+          continue;
+        }
         const k = byteKey(t);
         if (!seen.has(k)) {
           seen.add(k);
@@ -9728,6 +9737,7 @@ export class Engine {
         }
       }
       isEmpty = qv.elements.length === 0;
+      if (unmatchable && gb.strategy !== "overlaps") return { entries: [], pages: 0, slabs: 0 };
       terms.sort(cmpBytes);
     }
 
@@ -24599,15 +24609,18 @@ export function exclusionPairConflicts(
 // ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
 // DISTINCT non-NULL array element — encode(element) ‖ storage_key, NO presence tag (a term is never
 // NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
-// they appear in no posting list). Returned sorted by term (= encoded-byte order for the integer
-// element types). This slice: a single integer-element array column.
+// they appear in no posting list). Returned sorted by term (= encoded-byte order, order-preserving
+// for every admitted element type); terms dedup by their canonical encoded bytes (so a float -0/+0
+// or two NaNs are one term).
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits — the
-// integers, boolean, uuid, date, timestamp, timestamptz (spec/design/gin.md §3): a GIN term IS the
-// element's order-preserving key encoding (§4) and a term carries no length/terminator framing, so
-// only the FIXED-WIDTH keyables qualify. The variable-width keyables (text, bytea, decimal) — valid
-// ordered-index / PK keys — are 0A000 here, as is float. interval is fixed-width keyable (its 16-byte
-// span key landed, encoding.md §2.10) but its GIN element support is a separate follow-on slice
-// (gin.md §3/§10), so it is not yet admitted here.
+// integers, boolean, uuid, date, timestamp, timestamptz, f32, f64 (spec/design/gin.md §3): a GIN term
+// IS the element's order-preserving key encoding (§4) and a term carries no length/terminator
+// framing, so only the FIXED-WIDTH keyables qualify. A float term is the canonicalizing
+// float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN), so term equality is
+// exactly SQL float =. The variable-width keyables (text, bytea, decimal) — valid ordered-index / PK
+// keys — are 0A000 here. interval is fixed-width keyable (its 16-byte span key, encoding.md §2.10)
+// but its GIN element support is a separate follow-on slice (gin.md §3/§10), so it is not yet
+// admitted here.
 export function isGinElementType(elem: Type): boolean {
   return (
     typeIsInteger(elem) ||
@@ -24615,8 +24628,27 @@ export function isGinElementType(elem: Type): boolean {
     typeIsUuid(elem) ||
     typeIsTimestamp(elem) ||
     typeIsTimestamptz(elem) ||
-    typeIsDate(elem)
+    typeIsDate(elem) ||
+    typeIsFloat(elem)
   );
+}
+
+// ginQueryTerm is the GIN term for one non-NULL query value against an index whose elements are
+// elem — the element's order-preserving key encoding (gin.md §4), the same bytes the entries carry —
+// or null when the value can equal NO stored element. A float query value may be the OTHER float
+// width (f64 = ANY(f32[]) compares by promoting the f32 elements, float.md §2), so it is first
+// converted to the element width: an f32 value widens exactly; an f64 value narrows only when it is
+// exactly an f32 (or NaN — every NaN is one value, float.md §3), else no f32 element can equal it.
+// The float key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so term equality is exactly
+// SQL float =. A GIN element is fixed-width (no text), so the encoding never collates.
+function ginQueryTerm(elem: ScalarType, v: Value): Uint8Array | null {
+  if (elem === "f32" && v.kind === "f64") {
+    const narrowed = Math.fround(v.value);
+    if (!Number.isNaN(v.value) && narrowed !== v.value) return null;
+    return encodeFloat32Key(narrowed);
+  }
+  if (elem === "f64" && v.kind === "f32") return encodeFloat64Key(v.value);
+  return encodeKeyValue(elem, v, null);
 }
 
 // Resolve the EXCLUDE access method, element columns, duplicate-column rule, and operator/opclass
@@ -24676,7 +24708,8 @@ function resolveExclusionDefinition(
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
-// Exactly isGinElementType's set, kept a separate predicate so the two surfaces evolve independently.
+// isGinElementType's set minus the floats, kept a separate predicate so the two surfaces evolve
+// independently.
 export function isGistScalarType(ty: Type): boolean {
   return (
     typeIsInteger(ty) ||
