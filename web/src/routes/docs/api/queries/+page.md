@@ -213,3 +213,21 @@ The cache is transparent and always correct: a schema change (`CREATE`/`DROP`/`A
 it and the next execute re-plans; reusing a cached plan is by construction result- and
 cost-identical to planning fresh, so a prepared statement never changes what a query returns — only
 how fast it gets there.
+
+### Plans see your values
+
+Every execution is planned **as if its bound values were literals** — its *custom plan*. After
+[`ANALYZE`](/docs/sql/statistics), `WHERE status = $1` uses the most-common-value list and histogram
+for the value you bind, exactly as `WHERE status = 'shipped'` would: a value in nearly every row can
+choose a full scan while a rare one takes the index, from one prepared statement. The first planning
+works out whether any estimate actually depends on a value:
+
+- **Value-blind** statements — a primary-key or unique lookup like `WHERE id = $1`, or parameters
+  that reach no statistics — keep one cached plan, so a hot point lookup still skips planning.
+- **Parameter-sensitive** statements plan once per execution with their values, and remember the
+  plans of up to 8 recent bindings, so a value you bind repeatedly is not planned again.
+
+Unlike PostgreSQL, a statement never switches to a "generic" plan after some number of executions,
+and there is no `plan_cache_mode`: the plan of an execution depends only on the statement, its
+values, and the database — never on which values earlier runs happened to bind. `EXPLAIN` accepts
+bound values and shows the plan they get.

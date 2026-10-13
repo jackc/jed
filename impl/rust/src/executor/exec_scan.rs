@@ -871,77 +871,168 @@ impl Engine {
         };
         // Cache HIT: the statement still belongs to the same shared database and every ordered base
         // relation has the same exact identity/generation/name/revision tuple. Resolving those tuples
-        // also rejects a temp shadow or a missing/replaced attachment. Reuse the resolved plan +
-        // finalized param types — no `plan_query`, no
-        // fold, no param-type walk. A cached plan carries no subquery to fold (`plan_cacheable`
-        // rejected any), so the shared `Rc` plan is never mutated; params are still bound per execute.
+        // also rejects a temp shadow or a missing/replaced attachment. Reuse the finalized param
+        // types — no param-type walk — and, for a value-blind statement, the resolved plan: no
+        // `plan_query`, no fold. A cached plan carries no subquery to fold (`plan_cacheable`
+        // rejected any), so the shared `Rc` plan is never mutated; params are still bound per
+        // execute. A parameter-sensitive statement (estimator.md §6.1) takes its custom plan: from
+        // the memo for a binding planned before, else planned once with the values.
         if let (Some(cell), Some(core)) = (cache, &self.core) {
             let hit = {
                 let cached = cell.borrow();
-                cached
-                    .as_ref()
-                    .filter(|cp| {
-                        std::sync::Weak::ptr_eq(&cp.core, &std::sync::Arc::downgrade(core))
-                            && self.estimator_inputs_match(&cp.plan, &cp.inputs)
-                    })
-                    .map(|cp| {
-                        Ok((
-                            std::rc::Rc::clone(&cp.plan),
-                            bind_params_with_labels(
-                                params,
-                                &cp.param_types,
-                                &cp.param_labels,
-                                &self.input_zone(),
-                            )?,
-                            cp.metadata.clone(),
-                        ))
-                    })
-                    .transpose()?
+                match cached.as_ref().filter(|cp| {
+                    std::sync::Weak::ptr_eq(&cp.core, &std::sync::Arc::downgrade(core))
+                        && self.estimator_inputs_match(&cp.plan, &cp.inputs)
+                }) {
+                    None => None,
+                    Some(cp) => {
+                        let bound = bind_params_with_labels(
+                            params,
+                            &cp.param_types,
+                            &cp.param_labels,
+                            &self.input_zone(),
+                        )?;
+                        let has_null = bound.iter().any(|v| matches!(v, Value::Null));
+                        let plan = if !cp.sensitive && !(cp.null_read && has_null) {
+                            Some(std::rc::Rc::clone(&cp.plan))
+                        } else if cp.sensitive {
+                            let key = plan_params::memo_key(&bound);
+                            cp.memo
+                                .borrow()
+                                .iter()
+                                .find(|(k, _)| *k == key)
+                                .map(|(_, plan)| std::rc::Rc::clone(plan))
+                        } else {
+                            None
+                        };
+                        Some((plan, bound, cp.metadata.clone(), cp.sensitive))
+                    }
+                }
             };
-            if let Some((plan, bound_params, metadata)) = hit {
-                if let Some(rows) = self.build_scan_rows(plan, bound_params, 0, metadata)? {
+            if let Some((plan, bound_params, metadata, sensitive)) = hit {
+                let (plan, subquery_cost) = match plan {
+                    Some(plan) => (plan, 0),
+                    None => {
+                        let qe = QueryExpr::Select(Box::new(sel.clone()));
+                        let mut ptypes = ParamTypes::default();
+                        let QueryPlan::Select(mut sp) =
+                            plan_params::with_values(&bound_params, || {
+                                self.plan_query(&qe, None, &[], &mut ptypes)
+                            })?
+                        else {
+                            return Ok(None);
+                        };
+                        let reusable = from_committed
+                            && sensitive
+                            && !ptypes.uncacheable
+                            && self.plan_cacheable(&sp);
+                        let mut subquery_cost: i64 = 0;
+                        self.fold_uncorrelated_in_select(
+                            &mut sp,
+                            &bound_params,
+                            CteCtx::empty(),
+                            &mut subquery_cost,
+                        )?;
+                        let plan = std::rc::Rc::new(sp);
+                        if reusable && let Some(cp) = cell.borrow().as_ref() {
+                            let mut memo = cp.memo.borrow_mut();
+                            if memo.len() == plan_params::MEMO_CAPACITY {
+                                memo.remove(0);
+                            }
+                            memo.push((
+                                plan_params::memo_key(&bound_params),
+                                std::rc::Rc::clone(&plan),
+                            ));
+                        }
+                        (plan, subquery_cost)
+                    }
+                };
+                if let Some(rows) =
+                    self.build_scan_rows(plan, bound_params, subquery_cost, metadata)?
+                {
                     return Ok(Some(rows));
                 }
             }
         }
-        // MISS: plan once.
+        // MISS: plan in a probe frame, bind, and plan again with the values when the probe read one
+        // (estimator.md §6.1).
         let qe = QueryExpr::Select(Box::new(sel.clone()));
+        let mut planning = plan_params::begin();
         let mut ptypes = ParamTypes::default();
-        let QueryPlan::Select(mut sp) = self.plan_query(&qe, None, &[], &mut ptypes)? else {
+        let QueryPlan::Select(probe) = self.plan_query(&qe, None, &[], &mut ptypes)? else {
             return Ok(None); // set-op / VALUES / WITH — a scan lane does not cover it
         };
         let uncacheable = ptypes.uncacheable;
         let ptys = ptypes.finalize()?;
         let labels = param_labels(ptys.len());
         let bound_params = bind_params_with_labels(params, &ptys, &labels, &self.input_zone())?;
-        // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
-        // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
-        // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
-        // added to the cursor's reported cost below. A cacheable plan has no subquery, so this is a
-        // no-op (and is skipped on a hit) — cost stays identical.
-        let mut subquery_cost: i64 = 0;
-        self.fold_uncorrelated_in_select(
-            &mut sp,
-            &bound_params,
-            CteCtx::empty(),
-            &mut subquery_cost,
-        )?;
+        let (sensitive, null_read) = planning.probe_facts();
+        let custom = if planning.bind(&bound_params) {
+            let mut ptypes = ParamTypes::default();
+            let QueryPlan::Select(sp) = self.plan_query(&qe, None, &[], &mut ptypes)? else {
+                return Ok(None);
+            };
+            Some((sp, ptypes.uncacheable))
+        } else {
+            None
+        };
+        drop(planning);
         // Fill only from committed state, so a working transaction can consume an entry whose exact
         // signature matches but can never publish its working revision into the committed cache slot.
         // Also require a reusable plan and a core identity (a bare/transient engine never fills).
-        let inputs = self.estimator_inputs(&sp);
+        let inputs = self.estimator_inputs(&probe);
         let cacheable =
-            from_committed && !uncacheable && self.plan_cacheable(&sp) && inputs.is_some();
-        let plan = std::rc::Rc::new(sp);
+            from_committed && !uncacheable && self.plan_cacheable(&probe) && inputs.is_some();
+        // Fold globally-uncorrelated subqueries (in the executed plan) to constants (at top level
+        // every surviving subquery is uncorrelated) so the per-row eval re-enters nothing — keeping
+        // the cursor self-contained. The fold's own cost was already charged to the shared lifetime
+        // gauge by its sub-executions; it is added to the cursor's reported cost below. A cacheable
+        // plan has no subquery, so this is a no-op (and is skipped on a hit) — cost stays identical.
+        let mut subquery_cost: i64 = 0;
+        let (probe, plan, memo) = match custom {
+            None => {
+                let mut probe = probe;
+                self.fold_uncorrelated_in_select(
+                    &mut probe,
+                    &bound_params,
+                    CteCtx::empty(),
+                    &mut subquery_cost,
+                )?;
+                let probe = std::rc::Rc::new(probe);
+                (std::rc::Rc::clone(&probe), probe, Vec::new())
+            }
+            Some((mut sp, custom_uncacheable)) => {
+                let reusable = sensitive && !custom_uncacheable && self.plan_cacheable(&sp);
+                self.fold_uncorrelated_in_select(
+                    &mut sp,
+                    &bound_params,
+                    CteCtx::empty(),
+                    &mut subquery_cost,
+                )?;
+                let plan = std::rc::Rc::new(sp);
+                let memo = if reusable {
+                    vec![(
+                        plan_params::memo_key(&bound_params),
+                        std::rc::Rc::clone(&plan),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                (std::rc::Rc::new(probe), plan, memo)
+            }
+        };
         let metadata = ResultMetadata::from_plan(&plan);
         if let (Some(cell), true, Some(core)) = (cache, cacheable, &self.core) {
             *cell.borrow_mut() = Some(CachedPlan {
                 core: std::sync::Arc::downgrade(core),
                 inputs: inputs.expect("cacheable plans have estimator inputs"),
-                plan: std::rc::Rc::clone(&plan),
+                plan: probe,
                 param_types: ptys,
                 param_labels: labels,
                 metadata: metadata.clone(),
+                sensitive,
+                null_read,
+                memo: std::cell::RefCell::new(memo),
             });
         }
         self.build_scan_rows(plan, bound_params, subquery_cost, metadata)

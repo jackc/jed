@@ -280,14 +280,16 @@ fn finish_distribution(
 /// One analyzed column scaled to the table's exact current row count. The owned key vectors keep
 /// planner consumers independent of snapshot borrow lifetimes and make every fold use persisted
 /// order, not map order.
-pub(crate) struct CurrentColumnStatistics {
+pub(crate) struct CurrentColumnStatistics<'a> {
     pub(crate) rows: i64,
     pub(crate) null_rows: i64,
     pub(crate) nonnull_rows: i64,
     pub(crate) ndv: Option<i64>,
     pub(crate) average_width: Option<i64>,
-    mcv: Vec<(Vec<u8>, i64)>,
-    histogram: Vec<Vec<u8>>,
+    // The keys borrow the snapshot's immutable fact: planning reads them on every estimate, so a
+    // copy per call dominated the planning of a statement over analyzed columns.
+    mcv: Vec<(&'a [u8], i64)>,
+    histogram: Vec<&'a [u8]>,
     complete_mcv: bool,
 }
 
@@ -319,11 +321,11 @@ pub(crate) fn statistics_scale(n: i64, numerator: i64, denominator: i64) -> i64 
     }
 }
 
-pub(crate) fn current_column_statistics(
+pub(crate) fn current_column_statistics<'a>(
     rel: &ScopeRel<'_>,
     column: usize,
-    catalog: &Engine,
-) -> Option<CurrentColumnStatistics> {
+    catalog: &'a Engine,
+) -> Option<CurrentColumnStatistics<'a>> {
     let fact = catalog.column_statistics_scoped(rel.db.as_deref(), &rel.table.name, column)?;
     let rows = catalog
         .store_scoped(rel.db.as_deref(), &rel.table.name)
@@ -363,7 +365,7 @@ pub(crate) fn current_column_statistics(
         )
         .min(remaining);
         remaining -= scaled;
-        mcv.push((entry.value.key.clone(), scaled));
+        mcv.push((entry.value.key.as_slice(), scaled));
     }
     let sampled_mcv_rows: u64 = fact
         .mcv
@@ -383,7 +385,7 @@ pub(crate) fn current_column_statistics(
         histogram: fact
             .histogram
             .iter()
-            .map(|bound| bound.key.clone())
+            .map(|bound| bound.key.as_slice())
             .collect(),
         complete_mcv,
     })
@@ -472,16 +474,21 @@ pub(crate) fn statistics_gin_estimate(
 /// a one-dimensional `ARRAY[...]` of literals.
 fn statistics_gin_operand_value(operand: &RExpr) -> Option<Value> {
     match operand {
-        RExpr::ConstArray(array) => Some(Value::Array((**array).clone())),
         RExpr::Array {
             elems,
             nested: false,
         } => elems
             .iter()
-            .map(|elem| rexpr_const_to_value(elem).ok())
+            .map(|elem| estimator_value(elem).and_then(|c| rexpr_const_to_value(&c).ok()))
             .collect::<Option<Vec<_>>>()
             .map(|values| Value::Array(ArrayVal::one_dim(values))),
-        other => rexpr_const_to_value(other).ok(),
+        other => {
+            let value = estimator_value(other)?;
+            match value.as_ref() {
+                RExpr::ConstArray(array) => Some(Value::Array((**array).clone())),
+                constant => rexpr_const_to_value(constant).ok(),
+            }
+        }
     }
 }
 
@@ -565,8 +572,9 @@ fn statistics_literal_key(
     column: usize,
     catalog: &Engine,
 ) -> Option<Vec<u8>> {
+    let literal = estimator_value(literal)?;
     let value = statistics_key_value(
-        rexpr_const_to_value(literal).ok()?,
+        rexpr_const_to_value(&literal).ok()?,
         &rel.table.columns[column].ty,
     )?;
     if matches!(value, Value::Null) {
@@ -636,7 +644,7 @@ fn statistics_key_value(value: Value, ty: &Type) -> Option<Value> {
 }
 
 fn statistics_equality_rows(current: &CurrentColumnStatistics, key: &[u8]) -> i64 {
-    if let Some((_, rows)) = current.mcv.iter().find(|(candidate, _)| candidate == key) {
+    if let Some((_, rows)) = current.mcv.iter().find(|(candidate, _)| *candidate == key) {
         return *rows;
     }
     if current.complete_mcv {
@@ -671,7 +679,7 @@ fn statistics_key_satisfies(order: std::cmp::Ordering, op: CmpOp) -> bool {
 fn statistics_less_rows(current: &CurrentColumnStatistics, key: &[u8], inclusive: bool) -> i64 {
     let op = if inclusive { CmpOp::Le } else { CmpOp::Lt };
     let mcv_rows = current.mcv.iter().fold(0i64, |sum, (candidate, rows)| {
-        if statistics_key_satisfies(candidate.as_slice().cmp(key), op) {
+        if statistics_key_satisfies((*candidate).cmp(key), op) {
             sum.saturating_add(*rows)
         } else {
             sum
@@ -684,9 +692,9 @@ fn statistics_less_rows(current: &CurrentColumnStatistics, key: &[u8], inclusive
         .min(current.nonnull_rows);
     let residual = current.nonnull_rows - all_mcv_rows;
     let histogram_rows = if current.histogram.len() >= 2 {
-        let ordinal = current.histogram.partition_point(|bound| {
-            bound.as_slice() < key || (inclusive && bound.as_slice() == key)
-        });
+        let ordinal = current
+            .histogram
+            .partition_point(|bound| (*bound) < key || (inclusive && (*bound) == key));
         statistics_scale(residual, ordinal as i64, current.histogram.len() as i64 - 1).min(residual)
     } else {
         statistics_scale(
@@ -744,13 +752,17 @@ pub(crate) fn statistics_bound_source_selectivity(
     catalog: &Engine,
 ) -> Option<crate::estimator::Selectivity> {
     let current = current_column_statistics(rel, column, catalog)?;
-    if matches!(source, BoundSrc::Null) {
+    if estimator_bound_is_null(source) {
         return Some(crate::estimator::Selectivity::Zero);
     }
-    if matches!(
-        source,
-        BoundSrc::Param(_) | BoundSrc::Outer { .. } | BoundSrc::Sibling(_)
-    ) {
+    let key_type = rel.table.columns[column].ty.scalar();
+    if matches!(source, BoundSrc::Param(_))
+        && let Some(rows) = statistics_value_blind_rows(&current, op, rel, column)
+    {
+        return Some(statistics_fraction(rows, current.rows));
+    }
+    let Some(source) = estimator_bound_value(source, key_type) else {
+        // An unbound parameter or a runtime outer/sibling column: the generic estimate.
         if op != CmpOp::Eq {
             return None;
         }
@@ -758,8 +770,8 @@ pub(crate) fn statistics_bound_source_selectivity(
             statistics_scale(current.nonnull_rows, 1, current.ndv?.max(1)),
             current.rows,
         ));
-    }
-    let value = statistics_bound_value(source, rel.table.columns[column].ty.scalar())?;
+    };
+    let value = statistics_bound_value(&source, key_type)?;
     let key = statistics_value_key(&value, rel, column, catalog)?;
     Some(statistics_fraction(
         statistics_comparison_rows(&current, op, &key),
@@ -787,15 +799,16 @@ pub(crate) fn statistics_bound_terms_selectivity(
         .find(|term| matches!(term.op, CmpOp::Lt | CmpOp::Le));
     if let (Some(lower), Some(upper)) = (lower, upper) {
         let current = current_column_statistics(rel, column, catalog)?;
+        let key_type = rel.table.columns[column].ty.scalar();
         let lower_value =
-            statistics_bound_value(&lower.src, rel.table.columns[column].ty.scalar())?;
+            statistics_bound_value(&*estimator_bound_value(&lower.src, key_type)?, key_type)?;
         let upper_value =
-            statistics_bound_value(&upper.src, rel.table.columns[column].ty.scalar())?;
+            statistics_bound_value(&*estimator_bound_value(&upper.src, key_type)?, key_type)?;
         let lower_key = statistics_value_key(&lower_value, rel, column, catalog)?;
         let upper_key = statistics_value_key(&upper_value, rel, column, catalog)?;
         let mcv_rows = current.mcv.iter().fold(0i64, |sum, (key, rows)| {
-            if statistics_key_satisfies(key.as_slice().cmp(&lower_key), lower.op)
-                && statistics_key_satisfies(key.as_slice().cmp(&upper_key), upper.op)
+            if statistics_key_satisfies((*key).cmp(&lower_key), lower.op)
+                && statistics_key_satisfies((*key).cmp(&upper_key), upper.op)
             {
                 sum.saturating_add(*rows)
             } else {
@@ -810,12 +823,12 @@ pub(crate) fn statistics_bound_terms_selectivity(
         let residual = current.nonnull_rows - all_mcv_rows;
         let histogram_rows = if current.histogram.len() >= 2 {
             let lower_ordinal = current.histogram.partition_point(|bound| {
-                bound.as_slice() < lower_key.as_slice()
-                    || (lower.op == CmpOp::Gt && bound.as_slice() == lower_key.as_slice())
+                (*bound) < lower_key.as_slice()
+                    || (lower.op == CmpOp::Gt && (*bound) == lower_key.as_slice())
             });
             let upper_ordinal = current.histogram.partition_point(|bound| {
-                bound.as_slice() < upper_key.as_slice()
-                    || (upper.op == CmpOp::Le && bound.as_slice() == upper_key.as_slice())
+                (*bound) < upper_key.as_slice()
+                    || (upper.op == CmpOp::Le && (*bound) == upper_key.as_slice())
             });
             statistics_scale(
                 residual,
@@ -893,26 +906,66 @@ pub(crate) fn statistics_leaf_selectivity(
     }
     let (column, op, literal) = statistics_comparison(expr, rel)?;
     let current = current_column_statistics(rel, column, catalog)?;
-    if matches!(literal, RExpr::ConstNull) {
+    if estimator_is_null(literal) {
         return Some(crate::estimator::Selectivity::Zero);
     }
-    if matches!(literal, RExpr::Param(_)) {
-        if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
-            return None;
-        }
-        let equality = statistics_scale(current.nonnull_rows, 1, current.ndv?.max(1));
-        let rows = if op == CmpOp::Eq {
-            equality
-        } else {
-            current.nonnull_rows.saturating_sub(equality)
-        };
-        return Some(statistics_fraction(rows, current.rows));
+    let rows = statistics_literal_rows(&current, op, literal, rel, column, catalog)?;
+    Some(statistics_fraction(rows, current.rows))
+}
+
+/// The rows a column comparison with a non-NULL plan-time literal admits (statistics.md §6). A
+/// parameter whose value is unavailable takes the generic equality estimate, never an MCV or
+/// histogram bucket (estimator.md §6.1).
+fn statistics_literal_rows(
+    current: &CurrentColumnStatistics,
+    op: CmpOp,
+    literal: &RExpr,
+    rel: &ScopeRel<'_>,
+    column: usize,
+    catalog: &Engine,
+) -> Option<i64> {
+    let param = matches!(literal, RExpr::Param(_));
+    if param && let Some(rows) = statistics_value_blind_rows(current, op, rel, column) {
+        return Some(rows);
     }
-    let key = statistics_literal_key(literal, rel, column, catalog)?;
-    Some(statistics_fraction(
-        statistics_comparison_rows(&current, op, &key),
-        current.rows,
-    ))
+    if let Some(key) = statistics_literal_key(literal, rel, column, catalog) {
+        return Some(statistics_comparison_rows(current, op, &key));
+    }
+    if !param || !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+        return None;
+    }
+    let equality = statistics_scale(current.nonnull_rows, 1, current.ndv?.max(1));
+    Some(if op == CmpOp::Eq {
+        equality
+    } else {
+        current.nonnull_rows.saturating_sub(equality)
+    })
+}
+
+/// An equality (or `<>`) estimate that no non-NULL value can change (estimator.md §6.1): the facts
+/// hold no MCV and do not prove absence, so every value falls in the residual population and takes
+/// the NDV average — exactly the literal estimate, read without the value. This keeps a key lookup
+/// on an analyzed table parameter-insensitive. A collated text column is excluded because its sort
+/// key can fail for a value, which the literal path turns into the structural fallback.
+fn statistics_value_blind_rows(
+    current: &CurrentColumnStatistics,
+    op: CmpOp,
+    rel: &ScopeRel<'_>,
+    column: usize,
+) -> Option<i64> {
+    if !matches!(op, CmpOp::Eq | CmpOp::Ne)
+        || !current.mcv.is_empty()
+        || current.complete_mcv
+        || rel.table.columns[column].collation.is_some()
+    {
+        return None;
+    }
+    let equality = statistics_scale(current.nonnull_rows, 1, current.ndv?.max(1));
+    Some(if op == CmpOp::Eq {
+        equality
+    } else {
+        current.nonnull_rows.saturating_sub(equality)
+    })
 }
 
 fn statistics_collect_equality_disjunction<'a>(
@@ -955,8 +1008,14 @@ pub(crate) fn statistics_equality_disjunction_selectivity(
     let mut matched = 0i64;
     let mut has_null = false;
     for literal in literals {
-        if matches!(literal, RExpr::ConstNull) {
+        if estimator_is_null(literal) {
             has_null = true;
+        } else if let Some(key) = statistics_literal_key(literal, rel, column, catalog) {
+            if seen.insert(key.clone()) {
+                matched = matched
+                    .saturating_add(statistics_equality_rows(&current, &key))
+                    .min(current.nonnull_rows);
+            }
         } else if matches!(literal, RExpr::Param(_)) {
             matched = matched
                 .saturating_add(statistics_scale(
@@ -964,12 +1023,6 @@ pub(crate) fn statistics_equality_disjunction_selectivity(
                     1,
                     current.ndv?.max(1),
                 ))
-                .min(current.nonnull_rows);
-        } else if let Some(key) = statistics_literal_key(literal, rel, column, catalog)
-            && seen.insert(key.clone())
-        {
-            matched = matched
-                .saturating_add(statistics_equality_rows(&current, &key))
                 .min(current.nonnull_rows);
         }
     }
@@ -1005,8 +1058,8 @@ fn statistics_negated_paired_range_selectivity(
     if !matches!(lower_op, CmpOp::Gt | CmpOp::Ge) || !matches!(upper_op, CmpOp::Lt | CmpOp::Le) {
         return None;
     }
-    let lower_null = matches!(lower_literal, RExpr::ConstNull);
-    let upper_null = matches!(upper_literal, RExpr::ConstNull);
+    let lower_null = estimator_is_null(lower_literal);
+    let upper_null = estimator_is_null(upper_literal);
     if lower_null || upper_null {
         let current = current_column_statistics(rel, a_column, catalog)?;
         return match (lower_null, upper_null) {
@@ -1064,23 +1117,10 @@ pub(crate) fn statistics_negated_leaf_selectivity(
     }
     if let Some((column, op, literal)) = statistics_comparison(expr, rel) {
         let current = current_column_statistics(rel, column, catalog)?;
-        if matches!(literal, RExpr::ConstNull) {
+        if estimator_is_null(literal) {
             return Some(crate::estimator::Selectivity::Zero);
         }
-        let rows = if matches!(literal, RExpr::Param(_)) {
-            if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
-                return None;
-            }
-            let equality = statistics_scale(current.nonnull_rows, 1, current.ndv?.max(1));
-            if op == CmpOp::Eq {
-                equality
-            } else {
-                current.nonnull_rows.saturating_sub(equality)
-            }
-        } else {
-            let key = statistics_literal_key(literal, rel, column, catalog)?;
-            statistics_comparison_rows(&current, op, &key)
-        };
+        let rows = statistics_literal_rows(&current, op, literal, rel, column, catalog)?;
         return Some(statistics_fraction(
             current.nonnull_rows.saturating_sub(rows),
             current.rows,
@@ -1112,10 +1152,7 @@ pub(crate) fn statistics_paired_range_selectivity(
 ) -> Option<crate::estimator::Selectivity> {
     let (a_column, a_op, a_literal) = statistics_comparison(lhs, rel)?;
     let (b_column, b_op, b_literal) = statistics_comparison(rhs, rel)?;
-    if a_column != b_column
-        || matches!(a_literal, RExpr::Param(_))
-        || matches!(b_literal, RExpr::Param(_))
-    {
+    if a_column != b_column {
         return None;
     }
     let ((lower_op, lower_literal), (upper_op, upper_literal)) =
@@ -1131,8 +1168,8 @@ pub(crate) fn statistics_paired_range_selectivity(
     let upper = statistics_literal_key(upper_literal, rel, a_column, catalog)?;
     let current = current_column_statistics(rel, a_column, catalog)?;
     let mcv_rows = current.mcv.iter().fold(0i64, |sum, (key, rows)| {
-        if statistics_key_satisfies(key.as_slice().cmp(&lower), lower_op)
-            && statistics_key_satisfies(key.as_slice().cmp(&upper), upper_op)
+        if statistics_key_satisfies((*key).cmp(&lower), lower_op)
+            && statistics_key_satisfies((*key).cmp(&upper), upper_op)
         {
             sum.saturating_add(*rows)
         } else {
@@ -1147,12 +1184,10 @@ pub(crate) fn statistics_paired_range_selectivity(
     let residual = current.nonnull_rows - all_mcv_rows;
     let histogram_rows = if current.histogram.len() >= 2 {
         let lower_ordinal = current.histogram.partition_point(|bound| {
-            bound.as_slice() < lower.as_slice()
-                || (lower_op == CmpOp::Gt && bound.as_slice() == lower.as_slice())
+            (*bound) < lower.as_slice() || (lower_op == CmpOp::Gt && (*bound) == lower.as_slice())
         });
         let upper_ordinal = current.histogram.partition_point(|bound| {
-            bound.as_slice() < upper.as_slice()
-                || (upper_op == CmpOp::Le && bound.as_slice() == upper.as_slice())
+            (*bound) < upper.as_slice() || (upper_op == CmpOp::Le && (*bound) == upper.as_slice())
         });
         statistics_scale(
             residual,

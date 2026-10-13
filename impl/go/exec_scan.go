@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"sync"
 	"sync/atomic"
 )
 
@@ -84,6 +85,65 @@ type scanCache struct {
 	ptys        []scalarType
 	plabels     []string
 	resultTypes []string
+	// sensitive: the probe plan read a parameter's value (estimator.md §6.1), so sp is not reused —
+	// each execution takes its custom plan, from memo when this exact binding was planned before.
+	sensitive bool
+	// nullRead: the probe plan assumed a parameter non-NULL; a binding with a NULL takes its custom
+	// plan.
+	nullRead bool
+	memo     *planMemo
+}
+
+// planMemo holds a parameter-sensitive entry's custom plans by exact binding (planMemoKey), oldest
+// first, at most planMemoCapacity. Shared by every goroutine executing the statement.
+type planMemo struct {
+	mu      sync.Mutex
+	entries []planMemoEntry
+}
+
+type planMemoEntry struct {
+	key string
+	sp  *selectPlan
+}
+
+func (m *planMemo) get(key string) *selectPlan {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.entries {
+		if e.key == key {
+			return e.sp
+		}
+	}
+	return nil
+}
+
+func (m *planMemo) put(key string, sp *selectPlan) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.entries {
+		if e.key == key {
+			return
+		}
+	}
+	if len(m.entries) == planMemoCapacity {
+		m.entries = append(m.entries[:0:0], m.entries[1:]...)
+	}
+	m.entries = append(m.entries, planMemoEntry{key: key, sp: sp})
+}
+
+func (m *planMemo) len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.entries)
+}
+
+func hasNullValue(values []Value) bool {
+	for _, v := range values {
+		if v.Kind == ValNull {
+			return true
+		}
+	}
+	return false
 }
 
 // estimatorInputSignature is collision-free by construction: identity and revision are opaque
@@ -259,17 +319,50 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 	}
 	// Cache HIT: the statement still belongs to the same shared Database and every ordered base
 	// relation has the same exact identity/generation/name/revision tuple. Resolving those tuples also
-	// rejects a session-local temp shadow or a missing/replaced attachment. Reuse the
-	// resolved plan + finalized param types — no planQuery, no fold, no param-type walk. A cached plan
-	// carries no subquery to fold (planCacheable rejected any), so the shared plan is never mutated;
-	// params are still bound per execute inside buildScanRows.
+	// rejects a session-local temp shadow or a missing/replaced attachment. Reuse the finalized param
+	// types — no param-type walk — and, for a value-blind statement, the resolved plan: no planQuery,
+	// no fold. A cached plan carries no subquery to fold (planCacheable rejected any), so the shared
+	// plan is never mutated; params are still bound per execute. A parameter-sensitive statement
+	// (estimator.md §6.1) takes its custom plan: from the memo for a binding planned before, else
+	// planned once with the values.
 	rsnap := db.readSnap()
 	if sc != nil {
 		if c := sc.p.Load(); c != nil && c.core == db.core && db.estimatorInputsMatch(c.sp, c.inputs) {
-			return db.buildScanRows(c.sp, c.ptys, c.plabels, c.resultTypes, params, false)
+			bound, err := bindParamsWithLabels(params, c.ptys, c.plabels, db.inputZone())
+			if err != nil {
+				return nil, false, err
+			}
+			if !c.sensitive && !(c.nullRead && hasNullValue(bound)) {
+				return db.buildScanRows(c.sp, c.resultTypes, bound, false)
+			}
+			key := planMemoKey(bound)
+			if c.sensitive {
+				if sp := c.memo.get(key); sp != nil {
+					return db.buildScanRows(sp, c.resultTypes, bound, false)
+				}
+			}
+			ptypes := &paramTypes{}
+			var plan queryPlan
+			if err := db.withPlanValues(bound, func() (err error) {
+				plan, err = db.planQuery(queryExpr{Select: stmt.Select}, nil, nil, ptypes)
+				return err
+			}); err != nil {
+				return nil, false, err
+			}
+			if plan.sel == nil {
+				return nil, false, nil
+			}
+			if c.sensitive && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(plan.sel) {
+				c.memo.put(key, plan.sel)
+				return db.buildScanRows(plan.sel, c.resultTypes, bound, false)
+			}
+			return db.buildScanRows(plan.sel, c.resultTypes, bound, true)
 		}
 	}
-	// MISS: plan once.
+	// MISS: plan in a probe frame, bind, and plan again with the values when the probe read one
+	// (estimator.md §6.1).
+	planning := db.beginPlanning()
+	defer planning.end()
 	ptypes := &paramTypes{}
 	plan, err := db.planQuery(queryExpr{Select: stmt.Select}, nil, nil, ptypes)
 	if err != nil {
@@ -278,34 +371,54 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 	if plan.sel == nil {
 		return nil, false, nil // set-op / VALUES / WITH — a scan lane does not cover it
 	}
-	sp := plan.sel
+	probe := plan.sel
 	ptys, err := ptypes.finalize()
 	if err != nil {
 		return nil, false, err
 	}
 	plabels := paramLabels(len(ptys))
-	resultTypes := typeNames(sp.columnTypes)
+	resultTypes := typeNames(probe.columnTypes)
+	bound, err := bindParamsWithLabels(params, ptys, plabels, db.inputZone())
+	if err != nil {
+		return nil, false, err
+	}
+	sensitive, nullRead := planning.probeFacts()
+	sp, customReusable := probe, false
+	if planning.bind(bound) {
+		cp := &paramTypes{}
+		custom, err := db.planQuery(queryExpr{Select: stmt.Select}, nil, nil, cp)
+		if err != nil {
+			return nil, false, err
+		}
+		sp = custom.sel
+		customReusable = sensitive && !cp.uncacheable && db.planCacheable(sp)
+	}
+	// The frame stops answering before a plan is shared.
+	planning.end()
 	// Fill only from committed state, so a working transaction can consume an entry whose exact
 	// signature matches but can never publish its working revision into the committed cache slot.
 	// Also require a reusable plan and a core identity (a core-less engine never fills).
-	inputs, inputsOK := db.estimatorInputs(sp)
-	if sc != nil && db.core != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(sp) && inputsOK {
-		sc.p.Store(&scanCache{core: db.core, inputs: inputs, sp: sp, ptys: ptys, plabels: plabels, resultTypes: resultTypes})
+	inputs, inputsOK := db.estimatorInputs(probe)
+	if sc != nil && db.core != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(probe) && inputsOK {
+		memo := &planMemo{}
+		if customReusable {
+			memo.put(planMemoKey(bound), sp)
+		}
+		sc.p.Store(&scanCache{
+			core: db.core, inputs: inputs, sp: probe, ptys: ptys, plabels: plabels,
+			resultTypes: resultTypes, sensitive: sensitive, nullRead: nullRead, memo: memo,
+		})
 	}
-	return db.buildScanRows(sp, ptys, plabels, resultTypes, params, true)
+	return db.buildScanRows(sp, resultTypes, bound, true)
 }
 
-// buildScanRows binds params, optionally folds uncorrelated subqueries to constants (doFold — done on
+// buildScanRows takes the bound params, optionally folds uncorrelated subqueries to constants (doFold — done on
 // a freshly-planned plan, skipped for a cached one which has no subquery), classifies the plan as
 // direct-pull or buffered via pullStreamingScanEligible, and returns the matching lazy cursor. When
 // doFold is false, sp is a shared cached plan and stays strictly read-only. The direct branch handles
 // full/contiguous-PK scans; generalized bounded streams run through the buffered cursor on first pull.
 // Under full drain the rows + total cost are byte-identical to the eager path.
-func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resultTypes []string, params []Value, doFold bool) (*Rows, bool, error) {
-	bound, err := bindParamsWithLabels(params, ptys, plabels, db.inputZone())
-	if err != nil {
-		return nil, false, err
-	}
+func (db *engine) buildScanRows(sp *selectPlan, resultTypes []string, bound []Value, doFold bool) (*Rows, bool, error) {
 	// Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
 	// uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
 	// fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
@@ -352,6 +465,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resu
 		} else if isPoint {
 			pointScan = store.pointScanPrefetched(nil)
 		} else if !empty {
+			var err error
 			if overlap, slabs, err = store.OverlapScanUnits(b, sp.relMasks[0]); err != nil {
 				return nil, false, err
 			}

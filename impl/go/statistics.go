@@ -220,12 +220,14 @@ func (db *engine) currentColumnStatistics(rel scopeRel, column int) *currentColu
 			scaled = remaining
 		}
 		remaining -= scaled
-		mcv = append(mcv, currentStatisticsMCV{key: append([]byte(nil), entry.Value.Key...), rows: scaled})
+		// The keys share the snapshot's immutable fact: planning reads them on every estimate, so a
+		// copy per call dominated the planning of a statement over analyzed columns.
+		mcv = append(mcv, currentStatisticsMCV{key: entry.Value.Key, rows: scaled})
 		sampledMCVRows += uint64(entry.Frequency)
 	}
 	histogram := make([][]byte, len(fact.Histogram))
 	for i := range fact.Histogram {
-		histogram[i] = append([]byte(nil), fact.Histogram[i].Key...)
+		histogram[i] = fact.Histogram[i].Key
 	}
 	return &currentColumnStatistics{
 		rows: rows, nullRows: nullRows, nonnullRows: nonnullRows, ndv: ndv,
@@ -317,13 +319,14 @@ func (db *engine) statisticsGinEstimate(rel scopeRel, column int, opclass ginOpc
 // statisticsGinOperandValue is a GIN query operand's plan-time value (statistics.md §6.1): a
 // literal, a folded array literal, or a one-dimensional ARRAY[...] of literals.
 func statisticsGinOperandValue(operand *rExpr) (Value, bool) {
-	switch {
-	case operand.kind == reConstArray:
-		return arrayValueOf(operand.cArray), true
-	case operand.kind == reArray && !operand.nested:
+	if operand.kind == reArray && !operand.nested {
 		values := make([]Value, len(operand.sargs))
 		for i, elem := range operand.sargs {
-			value, err := rExprConstToValue(elem)
+			c := estimatorValue(elem)
+			if c == nil {
+				return Value{}, false
+			}
+			value, err := rExprConstToValue(c)
 			if err != nil {
 				return Value{}, false
 			}
@@ -331,7 +334,14 @@ func statisticsGinOperandValue(operand *rExpr) (Value, bool) {
 		}
 		return ArrayValue(values), true
 	}
-	value, err := rExprConstToValue(operand)
+	c := estimatorValue(operand)
+	if c == nil {
+		return Value{}, false
+	}
+	if c.kind == reConstArray {
+		return arrayValueOf(c.cArray), true
+	}
+	value, err := rExprConstToValue(c)
 	return value, err == nil
 }
 
@@ -423,11 +433,56 @@ func (db *engine) statisticsValueKey(value Value, rel scopeRel, column int) ([]b
 }
 
 func (db *engine) statisticsLiteralKey(literal *rExpr, rel scopeRel, column int) ([]byte, bool) {
-	value, err := rExprConstToValue(literal)
+	c := estimatorValue(literal)
+	if c == nil {
+		return nil, false
+	}
+	value, err := rExprConstToValue(c)
 	if err != nil {
 		return nil, false
 	}
 	return db.statisticsValueKey(value, rel, column)
+}
+
+// statisticsLiteralRows is the rows a column comparison with a non-NULL plan-time literal admits
+// (statistics.md §6). A parameter whose value is unavailable takes the generic equality estimate,
+// never an MCV or histogram bucket (estimator.md §6.1).
+func (db *engine) statisticsLiteralRows(current *currentColumnStatistics, op binaryOp, literal *rExpr, rel scopeRel, column int) (int64, bool) {
+	param := literal.kind == reParam
+	if param {
+		if rows, ok := statisticsValueBlindRows(current, op, rel, column); ok {
+			return rows, true
+		}
+	}
+	if key, ok := db.statisticsLiteralKey(literal, rel, column); ok {
+		return statisticsComparisonRows(current, op, key), true
+	}
+	if !param || op != opEq && op != opNe || current.ndv == nil {
+		return 0, false
+	}
+	equality := statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv))
+	if op == opNe {
+		equality = current.nonnullRows - equality
+	}
+	return equality, true
+}
+
+// statisticsValueBlindRows is an equality (or <>) estimate no non-NULL value can change
+// (estimator.md §6.1): the facts hold no MCV and do not prove absence, so every value falls in the
+// residual population and takes the NDV average — exactly the literal estimate, read without the
+// value. This keeps a key lookup on an analyzed table parameter-insensitive. A collated text column
+// is excluded because its sort key can fail for a value, which the literal path turns into the
+// structural fallback.
+func statisticsValueBlindRows(current *currentColumnStatistics, op binaryOp, rel scopeRel, column int) (int64, bool) {
+	if op != opEq && op != opNe || len(current.mcv) != 0 || current.completeMCV ||
+		rel.table.Columns[column].Collation != "" || current.ndv == nil {
+		return 0, false
+	}
+	equality := statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv))
+	if op == opNe {
+		equality = current.nonnullRows - equality
+	}
+	return equality, true
 }
 
 // statisticsKeyValue adapts a comparison literal to the column's stored-key family. Resolved
@@ -565,18 +620,22 @@ func (db *engine) statisticsBoundSourceSelectivity(rel scopeRel, column int, op 
 	if current == nil {
 		return selectivityExpr{}, false
 	}
-	if source.kind == reConstNull {
+	if estimatorIsNull(source) {
 		return selectivityExpr{kind: selectivityZero}, true
 	}
-	if source.kind == reParam || source.kind == reColumn || source.kind == reOuterColumn {
-		if op != opEq || current.ndv == nil {
-			return selectivityExpr{}, false
+	if source.kind == reParam {
+		if rows, ok := statisticsValueBlindRows(current, op, rel, column); ok {
+			return statisticsSelectivity(rows, current.rows), true
 		}
-		return statisticsSelectivity(statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv)), current.rows), true
 	}
 	key, ok := db.statisticsLiteralKey(source, rel, column)
 	if !ok {
-		return selectivityExpr{}, false
+		// An unbound parameter or a runtime outer/sibling column: the generic estimate.
+		if source.kind != reParam && source.kind != reColumn && source.kind != reOuterColumn ||
+			op != opEq || current.ndv == nil {
+			return selectivityExpr{}, false
+		}
+		return statisticsSelectivity(statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv)), current.rows), true
 	}
 	return statisticsSelectivity(statisticsComparisonRows(current, op, key), current.rows), true
 }
@@ -725,24 +784,14 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 	if current == nil {
 		return selectivityExpr{}, false
 	}
-	if literal.kind == reConstNull {
+	if estimatorIsNull(literal) {
 		return selectivityExpr{kind: selectivityZero}, true
 	}
-	if literal.kind == reParam {
-		if op != opEq && op != opNe || current.ndv == nil {
-			return selectivityExpr{}, false
-		}
-		equality := statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv))
-		if op == opNe {
-			equality = current.nonnullRows - equality
-		}
-		return statisticsSelectivity(equality, current.rows), true
-	}
-	key, keyOK := db.statisticsLiteralKey(literal, rel, column)
-	if !keyOK {
+	rows, ok := db.statisticsLiteralRows(current, op, literal, rel, column)
+	if !ok {
 		return selectivityExpr{}, false
 	}
-	return statisticsSelectivity(statisticsComparisonRows(current, op, key), current.rows), true
+	return statisticsSelectivity(rows, current.rows), true
 }
 
 func collectStatisticsEqualityDisjunction(expr *rExpr, rel scopeRel, column *int, set *bool, literals *[]*rExpr) bool {
@@ -771,17 +820,19 @@ func (db *engine) statisticsEqualityDisjunctionSelectivity(expr *rExpr, rel scop
 	}
 	seen, matched := make(map[string]bool), int64(0)
 	for _, literal := range literals {
-		if literal.kind == reConstNull {
+		if estimatorIsNull(literal) {
 			continue
 		}
-		if literal.kind == reParam {
+		if key, ok := db.statisticsLiteralKey(literal, rel, column); ok {
+			if !seen[string(key)] {
+				seen[string(key)] = true
+				matched = satEstimateAdd(matched, statisticsEqualityRows(current, key))
+			}
+		} else if literal.kind == reParam {
 			if current.ndv == nil {
 				return selectivityExpr{}, false
 			}
 			matched = satEstimateAdd(matched, statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv)))
-		} else if key, ok := db.statisticsLiteralKey(literal, rel, column); ok && !seen[string(key)] {
-			seen[string(key)] = true
-			matched = satEstimateAdd(matched, statisticsEqualityRows(current, key))
 		}
 		if matched > current.nonnullRows {
 			matched = current.nonnullRows
@@ -803,7 +854,7 @@ func (db *engine) statisticsNegatedPairedRangeSelectivity(lhs, rhs *rExpr, rel s
 	if lowerOp != opGt && lowerOp != opGe || upperOp != opLt && upperOp != opLe {
 		return selectivityExpr{}, false
 	}
-	lowerNull, upperNull := lowerLiteral.kind == reConstNull, upperLiteral.kind == reConstNull
+	lowerNull, upperNull := estimatorIsNull(lowerLiteral), estimatorIsNull(upperLiteral)
 	if lowerNull || upperNull {
 		if lowerNull && upperNull {
 			return selectivityExpr{kind: selectivityZero}, true
@@ -839,19 +890,18 @@ func (db *engine) statisticsNegatedLeafSelectivity(expr *rExpr, rel scopeRel) (s
 		}
 		seen, matched, hasNull := make(map[string]bool), int64(0), false
 		for _, literal := range literals {
-			switch literal.kind {
-			case reConstNull:
+			if estimatorIsNull(literal) {
 				hasNull = true
-			case reParam:
+			} else if key, ok := db.statisticsLiteralKey(literal, rel, column); ok {
+				if !seen[string(key)] {
+					seen[string(key)] = true
+					matched = satEstimateAdd(matched, statisticsEqualityRows(current, key))
+				}
+			} else if literal.kind == reParam {
 				if current.ndv == nil {
 					return selectivityExpr{}, false
 				}
 				matched = satEstimateAdd(matched, statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv)))
-			default:
-				if key, ok := db.statisticsLiteralKey(literal, rel, column); ok && !seen[string(key)] {
-					seen[string(key)] = true
-					matched = satEstimateAdd(matched, statisticsEqualityRows(current, key))
-				}
 			}
 			if matched > current.nonnullRows {
 				matched = current.nonnullRows
@@ -873,24 +923,12 @@ func (db *engine) statisticsNegatedLeafSelectivity(expr *rExpr, rel scopeRel) (s
 		if current == nil {
 			return selectivityExpr{}, false
 		}
-		if literal.kind == reConstNull {
+		if estimatorIsNull(literal) {
 			return selectivityExpr{kind: selectivityZero}, true
 		}
-		var rows int64
-		if literal.kind == reParam {
-			if op != opEq && op != opNe || current.ndv == nil {
-				return selectivityExpr{}, false
-			}
-			rows = statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv))
-			if op == opNe {
-				rows = current.nonnullRows - rows
-			}
-		} else {
-			key, keyOK := db.statisticsLiteralKey(literal, rel, column)
-			if !keyOK {
-				return selectivityExpr{}, false
-			}
-			rows = statisticsComparisonRows(current, op, key)
+		rows, ok := db.statisticsLiteralRows(current, op, literal, rel, column)
+		if !ok {
+			return selectivityExpr{}, false
 		}
 		return statisticsSelectivity(current.nonnullRows-rows, current.rows), true
 	}
@@ -912,7 +950,7 @@ func (db *engine) statisticsNegatedLeafSelectivity(expr *rExpr, rel scopeRel) (s
 func (db *engine) statisticsPairedRangeSelectivity(lhs, rhs *rExpr, rel scopeRel) (selectivityExpr, bool) {
 	aColumn, aOp, aLiteral, aOK := statisticsComparison(lhs, rel)
 	bColumn, bOp, bLiteral, bOK := statisticsComparison(rhs, rel)
-	if !aOK || !bOK || aColumn != bColumn || aLiteral.kind == reParam || bLiteral.kind == reParam {
+	if !aOK || !bOK || aColumn != bColumn {
 		return selectivityExpr{}, false
 	}
 	lowerOp, lowerLiteral, upperOp, upperLiteral := aOp, aLiteral, bOp, bLiteral

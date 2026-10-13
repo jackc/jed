@@ -384,6 +384,13 @@ func whereConjunctsContradict(conjuncts []*rExpr) bool {
 			if !c.cBool {
 				return true
 			}
+		case reParam:
+			if estimatorIsNull(c) {
+				return true
+			}
+			if v := estimatorValue(c); v != nil && v.kind == reConstBool && !v.cBool {
+				return true
+			}
 		case reCompare:
 			if literalComparisonFalse(c) {
 				return true
@@ -405,13 +412,17 @@ func literalComparisonFalse(c *rExpr) bool {
 	if !estimatorLiteral(c.lhs) || !estimatorLiteral(c.rhs) {
 		return false
 	}
-	if c.lhs.kind == reConstNull || c.rhs.kind == reConstNull {
+	if estimatorIsNull(c.lhs) || estimatorIsNull(c.rhs) {
 		return true
 	}
-	if (c.lhs.kind == reConstText || c.rhs.kind == reConstText) && c.op != opEq {
+	lhs, rhs := estimatorValue(c.lhs), estimatorValue(c.rhs)
+	if lhs == nil || rhs == nil {
 		return false
 	}
-	order, ok := estimatorLiteralCmp(c.lhs, c.rhs)
+	if (lhs.kind == reConstText || rhs.kind == reConstText) && c.op != opEq {
+		return false
+	}
+	order, ok := estimatorLiteralCmp(lhs, rhs)
 	return ok && !estimatorComparisonSatisfied(order, c.op)
 }
 

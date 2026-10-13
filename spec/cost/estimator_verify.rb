@@ -57,7 +57,7 @@ def main
   expect_equal(data, "max_estimate", 9_223_372_036_854_775_807)
   expect_equal(data, "max_selectivity_denominator", 1_000_000)
   expect_equal(data, "row_rounding", "ceiling")
-  expect_equal(data, "parameter_strategy", "generic_before_bind")
+  expect_equal(data, "parameter_strategy", "custom_per_execution")
   expect_equal(data, "join_dp_limit", 8)
   expect_equal(data, "large_join_strategy", "greedy_cheapest_next")
   expect_equal(data, "default_distinct_values", 200)

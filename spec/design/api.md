@@ -333,6 +333,17 @@ commit. `close` is idempotent.
   different database or detach/reattach cannot falsely hit. Catalog generation is still scoped to its
   database, so unrelated DDL in that database is a safe conservative invalidation.
 
+  Every execution runs its **custom plan** — the plan the estimator makes with the bound values
+  ([estimator.md](estimator.md) §6.1). The first planning of a statement is a probe that records
+  whether any estimator read touched a parameter's value. A **value-blind** statement (a primary-key
+  or unique-key lookup, a statement whose parameters reach no statistics) caches that one plan and
+  reuses it, as above; a binding with a NULL the probe assumed non-NULL is planned with its values
+  without replacing it. A **parameter-sensitive** statement (an MCV-skewed column, a histogram range,
+  a GIN tag after `ANALYZE`) caches its parameter types and signature and plans once per execution
+  with the values, memoizing up to 8 custom plans by the exact bound values; a memo hit equals fresh
+  planning, and the memo is discarded with its entry. Unlike PostgreSQL, a sensitive statement never
+  switches to a generic plan after some number of executions, and there is no `plan_cache_mode`.
+
   Because a statement may be filled on one session and run on another, a hit also **re-checks the
   plan's relations against the executing session's temp domain** (`plan_touches_temp`): a plan cached
   where a bare name was persistent is never served on a session whose session-local temp table shadows
@@ -653,6 +664,12 @@ into a NOT NULL target → `23502`, bad `bytea`/`uuid` text → `22P02`) **befor
 touched**, so a bad binding fails deterministically with no partial work. Supplying the
 wrong number of values is `42601` (a malformed invocation — PG's `08P01` is wire-protocol
 only and the engine has no wire protocol).
+
+**Plans see the values.** Types never depend on values, but the plan does: each execution is planned
+as if its bound values were literals of their parameters' types ([estimator.md](estimator.md) §6.1),
+so statistics reach a parameterized query exactly as they reach the literal one. `EXPLAIN` given
+values shows that plan (a `$N` still renders symbolically); without values it shows the plan with
+the values unknown.
 
 ## 6. Idiomatic mapping
 

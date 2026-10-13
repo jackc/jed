@@ -95,7 +95,7 @@ because intermediate ceiling and saturation are observable.
 
 [../cost/estimator.toml](../cost/estimator.toml) schema version 1 owns:
 
-- `MAX_ESTIMATE`, ceiling rounding, and the generic-before-bind parameter strategy;
+- `MAX_ESTIMATE`, ceiling rounding, and the custom-per-execution parameter strategy (§6.1);
 - PostgreSQL-derived no-statistics selectivities expressed as exact rationals;
 - deterministic fallbacks for boolean and opaque predicates;
 - the default distinct count, SRF cardinality, and variable-width hash-key work;
@@ -165,11 +165,11 @@ they are never estimator arithmetic inputs, serialized bytes, EXPLAIN values, or
 
 ## 6. Parameters, literals, and prepared-plan caching
 
-The pipeline remains `resolve → optimize → bind`. A literal is available to planning and may select
-a structural class or a histogram bucket. `$N` is not bound at physical-selection time and always
-receives a generic estimate: statistics-aware NDV average density for eligible equality, otherwise
-the generic structural selectivity. It never receives an MCV/histogram bucket. Initial Path B has no
-custom parameter-sensitive plans; §6.1 designs them.
+A literal is available to planning and may select a structural class or a histogram bucket. So is a
+bound parameter: every execution is planned with its values, the *custom plan* of §6.1. A `$N` whose
+value is unavailable — the probe pass of §6.1, or a plain EXPLAIN given no values — receives the
+generic estimate: statistics-aware NDV average density for eligible equality, otherwise the generic
+structural selectivity. It never receives an MCV/histogram bucket.
 
 A prepared-plan cache entry is reusable only when an exact, collision-free, relation-scoped input
 signature still matches. For every referenced persistent relation, in source ordinal order, the
@@ -197,13 +197,12 @@ return to its prior value, because structure or future distribution statistics m
 hits must be plan-, estimate-, result-, and actual-cost-identical to fresh planning over the same
 snapshot.
 
-### 6.1 Parameter-sensitive plans (designed; not landed)
+### 6.1 Parameter-sensitive plans
 
-Because `$N` always takes the generic estimate, statistics reach a parameterized query only through
-NDV averages: an MCV, a histogram bucket, or a GIN term fact ([statistics.md §6.1](statistics.md))
-never applies. Embedded hosts bind parameters almost everywhere, and the one-shot `query(sql,
-params)` is prepare-then-run ([api.md](api.md) *Plan cache*), so today even a single ad-hoc
-parameterized query is planned blind to its values.
+Embedded hosts bind parameters almost everywhere, and the one-shot `query(sql, params)` is
+prepare-then-run ([api.md](api.md) *Plan cache*). If `$N` always took the generic estimate,
+statistics would reach a parameterized query only through NDV averages: an MCV, a histogram bucket,
+or a GIN term fact ([statistics.md §6.1](statistics.md)) would never apply.
 
 **PostgreSQL's rule, and why jed does not copy it.** A PostgreSQL named prepared statement is
 custom-planned with its bound values for its first five executions. On the sixth it also builds a
@@ -219,47 +218,80 @@ the database state (§1, CLAUDE.md §8/§13), and a cache hit must equal fresh p
 history-dependent switch is excluded.
 
 **Rule.** The plan of every execution is the plan physical selection produces when each bound value
-is available to the estimator as a plan-time constant of its parameter's resolved type, at exactly
-the sites where a literal of that type would be read (§7, §8.1, [statistics.md §6](statistics.md)).
-Call it the *custom plan*. Resolution (parse, name binding, parameter types) is unchanged and still
-happens once at prepare time; only physical selection and estimation see the values. Results never
-depend on the plan; the cost of an execution may, deterministically, through the values, exactly as
-the cost of the equivalent literal query does.
+is available as a plan-time constant of its parameter's resolved type, at exactly the sites where a
+literal of that type would be read: the estimator (§7, §7.2, [statistics.md §6](statistics.md)) and
+the stage-2 contradiction proof ([planner.md](planner.md) §3.1). Call it the *custom plan*.
+Resolution (parse, name binding, parameter types, errors) does not depend on values; only physical
+selection and estimation see them. Results never depend on the plan; the cost of an execution may,
+deterministically, through the values, exactly as the cost of the equivalent literal query does. A
+`$N` still renders symbolically in EXPLAIN and still binds at execution, so a custom plan executes
+the same expressions as the generic one.
 
-**Sensitivity.** A statement is *parameter-sensitive* when some `$N` reaches an estimator input that
-can vary with its value. The sites are:
+**Probe, then custom.** Each plan→bind boundary (a query, an INSERT/UPDATE/DELETE, a writable
+`WITH`, an EXPLAIN given values) first plans in a *probe* frame, where a parameter is a plan-time
+literal of unknown value. The estimator follows a literal's path; the first read of a parameter's
+*value* answers "unknown" — the generic estimate above — and marks the statement
+*parameter-sensitive*. A NULL test of a parameter answers "not NULL" and is recorded separately.
+After binding, the boundary plans again in a *custom* frame, where each parameter reads as the
+constant a literal of its resolved type would be — but only when the probe read a value, or assumed
+a parameter non-NULL that the binding makes NULL. Otherwise the probe plan already is the custom
+plan: nothing in it depended on a value. An INSERT/UPDATE/DELETE plans its target scan after binding,
+with the values; one whose resolution planned a value-reading subquery (or an `INSERT ... SELECT`
+source) restarts from resolution in a custom frame. A plain `INSERT ... VALUES` that is not written
+through a view plans nothing at the boundary, so a subquery in one of its value slots keeps the
+generic estimate, in every core.
 
-- a comparison, `IN`, or `BETWEEN` leaf to which column statistics apply under
-  [statistics.md §6](statistics.md);
-- a GIN-served operand on a column with GIN term facts ([statistics.md §6.1](statistics.md));
-- an ordered-index or primary-key bound whose literal form would use the skeleton overlap count
-  (§8.1) — a range bound, or an equality on a non-unique key prefix;
-- `LIMIT` / `OFFSET`, and the bounds of a `generate_series` whose literal form has an exact
-  cardinality (§7.2).
+**Sensitivity** is therefore exact with respect to the estimator: a statement is parameter-sensitive
+when its probe read a value. The reads are:
 
-Full primary-key or unique-key equality is not a site: it estimates `min(N, 1)` whatever the value,
-so `SELECT … WHERE id = $1` stays insensitive. Sensitivity is a function of the resolved statement
-and the snapshot's catalog, statistics, and structure facts, so it is recomputed exactly when the
-cache signature changes. A core may classify conservatively (report sensitive when unsure) but never
-the reverse: an insensitive classification asserts that the generic plan *is* the custom plan for
-every value.
+- a column statistics estimate for a comparison, `IN` (equality disjunction), or paired range /
+  `BETWEEN` with a parameter operand ([statistics.md §6](statistics.md)) — except an equality or
+  `<>` over facts that hold no MCV list and no complete-MCV absence proof, on a column without a
+  collation, whose NDV average is the literal estimate for every value;
+- a GIN-served operand on a column with GIN term facts ([statistics.md §6.1](statistics.md)),
+  including an `ARRAY[...]` of parameters;
+- a contradiction proof that compares two literals: two comparisons on one operand, a comparison
+  between two literals, or two scan-bound sources of one key (§7, [planner.md](planner.md) §3.1);
+  and a bare boolean parameter conjunct;
+- the bounds of `generate_series` (§7.2).
 
-**Caching.** An insensitive statement keeps today's single cached plan, which by the rule above is
-the custom plan for every value, so a point lookup pays no extra planning. A sensitive statement is
-planned with its values at each execution. A core may memoize custom plans by the exact canonical
-bytes of the bound values alongside the §6 signature, with any bounded eviction policy: a hit equals
-fresh planning by construction, so the memo is invisible to results, plans, estimates, and cost.
+Full primary-key or unique-key equality is not a read: it estimates `min(N, 1)` whatever the value,
+so `SELECT … WHERE id = $1` stays value-blind — also on an analyzed table, by the MCV-free equality
+exception, unless the whole table fits a complete MCV list (at most 100 distinct values), where a
+literal can be proven absent. Neither is a single comparison without statistics (its structural
+fraction ignores the value), `LIMIT`/`OFFSET` (literal-only in the grammar), nor an ordered-index
+bound's page estimate (§8.1's skeleton overlap count is permitted for a literal but not implemented;
+implementing it would make it a read). Structural `IN`/`OR` de-duplication (§7) compares parameters
+by position, never by value, and an integer parameter is not range-checked against a narrower key —
+a custom plan, like the probe, assumes the bound value fits. Sensitivity is a function of the
+resolved statement and the snapshot's catalog, statistics, and structure facts, so a prepared
+statement re-derives it exactly when its cache signature changes.
+
+**Caching.** A prepared statement's cache entry keeps its probe's two observations. A value-blind
+statement keeps today's single cached plan, which is the custom plan for every value, so a point
+lookup pays no extra planning; a binding with a NULL that the probe assumed non-NULL takes its
+custom plan without disturbing the entry. A sensitive statement keeps its parameter types and
+signature and plans once with its values at each execution (no probe), memoizing up to 8 custom
+plans by the exact bytes of their bound values, oldest evicted first. A memo hit equals fresh
+planning by construction, so the memo is invisible to results, plans, estimates, and cost; it is
+discarded with its entry. The one-shot `query(sql, params)` has no entry and plans probe-then-custom.
 Planning stays unmetered ([cost.md](cost.md)).
 
-**EXPLAIN** of a prepared statement shows the custom plan for the bound values. **Divergence:**
-PostgreSQL may switch a sensitive statement to a generic plan after five executions; jed never
-does, and offers no `plan_cache_mode` (CLAUDE.md §1: determinism is the overriding reason).
+**EXPLAIN** with bound values (plain or ANALYZE) types the parameters with a probe pass and then
+estimates and renders the custom plan; ANALYZE executes it. Without values a `$N` is planned
+unbound. **Divergence:** PostgreSQL may switch a sensitive statement to a generic plan after five
+executions; jed never does, and offers no `plan_cache_mode` (CLAUDE.md §1: determinism is the
+overriding reason).
 
 **Conformance.** The shared corpus binds no parameters ([conformance.md §1.2](conformance.md)), and
-its literal EXPLAIN records already pin every custom plan. Each core adds host-API tests that a
-prepared statement's EXPLAIN and actual cost with bound values equal the literal query's; that an
-insensitive statement is planned once across executions; that a sensitive one re-plans when its value
-moves between an MCV / histogram bucket / GIN term class; and that a memo hit equals fresh planning.
+its literal EXPLAIN records already pin every custom plan. Each core's host-API tests assert that a
+prepared statement's EXPLAIN and actual cost with bound values equal the literal query's (an MCV
+versus a rare value, a histogram range, a GIN tag, `generate_series` bounds, a NULL key, DML target
+scans, an `INSERT ... SELECT` source, a subquery inside DELETE); that a key lookup is planned once;
+that a sensitive statement re-plans as its value moves between classes and that a memo hit equals
+fresh planning; and that every statement a core classifies value-blind has an unbound EXPLAIN equal
+to its bound EXPLAIN. Two sound classifications cannot differ observably, so a core may be more
+conservative than another without breaking the cross-core contract.
 
 ## 7. Base cardinality
 
@@ -271,7 +303,7 @@ Let `N` be a base relation's exact row count.
 - Other equality: `scale_ceil(N, equality)`.
 - `IN (v1, …, vk)`: apply §7.1's OR rule to equality entries in authored order. A literal NULL
   contributes zero true rows. Canonically equal resolved literals are de-duplicated with the first
-  occurrence retained; parameters are never assumed equal to each other or a literal. `NOT IN`
+  occurrence retained; parameters are compared by position, never by value (§6.1). `NOT IN`
   uses the NOT rule, except that a known literal NULL anywhere in the list proves zero true rows.
 - `<>`: `N - equality_rows`.
 - One-sided `<`, `<=`, `>`, or `>=`: `scale_ceil(N, inequality)`.
@@ -304,7 +336,7 @@ predicate's output cardinality depend on its physical path. This separation is d
 
 The initial access-method classifications are canonical data in `estimator.toml`: scalar GiST `=`
 uses `equality`; range GiST and every GIN strategy use `matching` — unless the column has GIN term
-facts and a literal query operand, when [statistics.md §6.1](statistics.md) supplies the GIN
+facts and a literal query operand (or a bound one, §6.1), when [statistics.md §6.1](statistics.md) supplies the GIN
 candidate's rows, `gin_entry`, and pages. Ordered/PK bounds derive their
 program from their equality prefix, optional trailing range, and interval disjunction. Unsupported
 access predicates use `opaque`.
@@ -369,10 +401,11 @@ weight; the owning base unit still counts the operation. Runtime metering remain
 ### 8.1 Scans and access paths
 
 - Full table/index scan `page_read` is the exact resident-skeleton node count.
-- A literal contiguous bound may use the exact skeleton overlap count without leaf I/O.
-- A generic/parameter bound applies the access predicate's same ordered selectivity program to
-  `node_count`, then clamps a non-empty result to `[height, node_count]`; an empty row estimate is
-  zero. This avoids a second rounded `estimated_rows / table_rows` division.
+- A literal contiguous bound may use the exact skeleton overlap count without leaf I/O (not
+  implemented; a bound parameter would then read its value here, §6.1).
+- Every other bound (today, every bound) applies the access predicate's same ordered selectivity
+  program to `node_count`, then clamps a non-empty result to `[height, node_count]`; an empty row
+  estimate is zero. This avoids a second rounded `estimated_rows / table_rows` division.
 - A table point fetch after a secondary-index hit estimates `table_height` pages per fetched row.
 - `storage_row_read` equals the candidate rows fetched from table storage, before residual filter.
 - Overflow-chain `page_read` and `value_decompress` are zero until persisted size statistics exist;
@@ -664,8 +697,8 @@ to every candidate and could not change the winner.
 
 Execution plans after folding globally-uncorrelated WHERE subqueries, so a folded value is a
 literal to the estimator, while DML EXPLAIN plans its resolved, unfolded filter, where the subquery
-is opaque. The two can therefore select differently for such a filter; a parameter is generic in
-both. This is the existing folding boundary, not a mutation-specific relaxation.
+is opaque. The two can therefore select differently for such a filter; a bound parameter is a
+literal in both (§6.1). This is the existing folding boundary, not a mutation-specific relaxation.
 
 **Visitation and error order.** The selected path's natural emission order is the phase-one
 visitation order: table storage-key order for full, PK, PK interval, GIN, and GiST paths, and the
@@ -794,8 +827,8 @@ complete formulas. The estimator-facing summary is:
 - current NULL/MCV/histogram populations rescale from `analyzed_rows` to exact current table rows;
 - low analyzed NDV (at most 10% of analyzed non-NULL rows) stays fixed, while higher NDV scales
   proportionally and clamps to current non-NULL rows;
-- a known literal may match MCV or the step histogram; a generic parameter may use average NDV
-  density but never a value bucket;
+- a known literal — including a bound parameter in its custom plan (§6.1) — may match MCV or the
+  step histogram; an unbound parameter may use average NDV density but never a value bucket;
 - eligible equality joins use both inputs' non-NULL rows and maximum NDV; simple-column GROUP BY /
   DISTINCT uses the product of per-column NDVs plus a NULL group; and
 - average canonical key width replaces the variable-width hash fallback where present.
@@ -845,7 +878,8 @@ selectivities are recorded data, not a promise to reproduce PostgreSQL plans.
 
 ## 14. Deliberate boundaries and deferred work
 
-- No parameter-sensitive/custom plans in the current planner (designed in §6.1, not landed).
+- No cross-core corpus pinning of the binding path itself (a `# params:` directive); custom plans
+  are pinned through their literal equivalents (§6.1).
 - No cost-based choice for the source query of `INSERT ... SELECT` beyond the ordinary SELECT rules,
   and no conflict-frequency model for `ON CONFLICT`.
 - No extended/multi-column statistics, automatic analyze, configurable targets, MCV-aware join

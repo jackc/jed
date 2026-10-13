@@ -18,6 +18,8 @@ import (
 // commit swaps committed := working (rollback drops working, since committed was never touched).
 // Every write — autocommit included — runs as a transaction, which unifies the two paths.
 type engine struct {
+	// planFrames is the parameter-planning frame stack (plan_params.go, estimator.md §6.1).
+	planFrames []*planFrame
 	// commitChanges reports the changed domains of the last commit (or host catalog op) to the shared
 	// session, whose publish consumes and clears it so it persists only changed domains.
 	commitChanges struct{ main, attached bool }

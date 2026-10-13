@@ -1553,6 +1553,7 @@ impl ParamTypes {
         if idx0 >= self.types.len() {
             self.types.resize(idx0 + 1, None);
         }
+        plan_params::note_type(idx0, ty);
         if let Some(new) = ty {
             self.types[idx0] = Some(match self.types[idx0] {
                 None => new,

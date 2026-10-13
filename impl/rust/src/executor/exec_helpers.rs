@@ -160,6 +160,14 @@ pub(crate) struct CachedPlan {
     pub(crate) param_types: Vec<ScalarType>,
     pub(crate) param_labels: Vec<String>,
     pub(crate) metadata: ResultMetadata,
+    /// The probe plan read a parameter's value (estimator.md §6.1): `plan` is then not reused —
+    /// each execution takes its custom plan, from `memo` when this exact binding was planned.
+    pub(crate) sensitive: bool,
+    /// The probe plan assumed a parameter non-NULL: a binding with a NULL takes its custom plan.
+    pub(crate) null_read: bool,
+    /// Custom plans by exact binding ([`plan_params::memo_key`]), oldest first, at most
+    /// [`plan_params::MEMO_CAPACITY`].
+    pub(crate) memo: std::cell::RefCell<Vec<(String, std::rc::Rc<SelectPlan>)>>,
 }
 
 #[derive(Clone)]

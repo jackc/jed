@@ -404,15 +404,21 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 // in list order (a later body sees the earlier buffers); (5) fold + EXECUTE the main body with the
 // CTE context. Cost composes like set operations — a sum of the parts.
 func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
-	ptypes := &paramTypes{}
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes, ctePrimary{body: &wq.Body})
-	if err != nil {
-		return selectResult{}, err
-	}
-	// (2) Plan the main body with all bindings visible (the pure-query path always has a query primary
-	//     — a data-modifying primary routes to executeWithDml).
 	bodyQ := wq.Body.AsQuery()
-	plan, err := db.planQuery(*bodyQ, nil, bindings, ptypes)
+	planAll := func(ptypes *paramTypes) ([]*cteBinding, queryPlan, error) {
+		bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes, ctePrimary{body: &wq.Body})
+		if err != nil {
+			return nil, queryPlan{}, err
+		}
+		// (2) Plan the main body with all bindings visible (the pure-query path always has a query
+		//     primary — a data-modifying primary routes to executeWithDml).
+		plan, err := db.planQuery(*bodyQ, nil, bindings, ptypes)
+		return bindings, plan, err
+	}
+	planning := db.beginPlanning()
+	defer planning.end()
+	ptypes := &paramTypes{}
+	bindings, plan, err := planAll(ptypes)
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -423,6 +429,11 @@ func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return selectResult{}, err
+	}
+	if planning.bind(bound) {
+		if bindings, plan, err = planAll(&paramTypes{}); err != nil {
+			return selectResult{}, err
+		}
 	}
 	modes := cteModes(bindings)
 	buffers, totalCost, err := db.materializeCtes(bindings, modes, bound, cteCtx{}, nil)
@@ -677,6 +688,10 @@ func (db *engine) executeWithDml(wq *withQuery, params []Value) (outcome, error)
 // query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
 // primary — every read against the pin, every write into the transaction's working.
 func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
+	// Every part is planned before the values are bound; a probe that read one restarts the
+	// statement with the values visible (estimator.md §6.1).
+	planning := db.beginPlanning()
+	defer planning.end()
 	ptypes := &paramTypes{}
 	// (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
 	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes, ctePrimary{body: &wq.Body})
@@ -718,6 +733,14 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
+	}
+	if planning.bind(bound) {
+		var out outcome
+		err := db.restartPlanning(bound, func() (err error) {
+			out, err = db.runWithDml(wq, params)
+			return err
+		})
+		return out, err
 	}
 	modes := cteModes(bindings)
 
@@ -1579,6 +1602,8 @@ func typeFromResolved(rt resolvedType) (dataType, error) {
 // and finally EXECUTE against an empty outer-row environment. Correlated subqueries that survive
 // the fold are re-executed per outer row by the evaluator.
 func (db *engine) runQueryExpr(qe queryExpr, params []Value) (selectResult, error) {
+	planning := db.beginPlanning()
+	defer planning.end()
 	ptypes := &paramTypes{}
 	plan, err := db.planQuery(qe, nil, nil, ptypes)
 	if err != nil {
@@ -1591,6 +1616,13 @@ func (db *engine) runQueryExpr(qe queryExpr, params []Value) (selectResult, erro
 	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return selectResult{}, err
+	}
+	// A plan that read a parameter's value is planned again with the bound values: the custom plan
+	// (estimator.md §6.1).
+	if planning.bind(bound) {
+		if plan, err = db.planQuery(qe, nil, nil, &paramTypes{}); err != nil {
+			return selectResult{}, err
+		}
 	}
 	var subqueryCost int64
 	if err := db.foldUncorrelatedInPlan(&plan, bound, cteCtx{}, &subqueryCost); err != nil {

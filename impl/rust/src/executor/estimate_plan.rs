@@ -238,7 +238,7 @@ impl Engine {
         &self,
         sp: &SelectPlan,
         global: usize,
-    ) -> Option<(usize, CurrentColumnStatistics)> {
+    ) -> Option<(usize, CurrentColumnStatistics<'_>)> {
         for (ordinal, rel) in sp.rels.iter().enumerate() {
             if global < rel.offset || global >= rel.offset + rel.col_count {
                 continue;
@@ -383,16 +383,25 @@ impl Engine {
     }
 
     fn estimate_generate_series_rows(srf: &SrfPlan) -> i64 {
-        let [RExpr::ConstInt(start), RExpr::ConstInt(stop), rest @ ..] = srf.args.as_slice() else {
-            return DEFAULT_SRF_ROWS;
+        // A bound parameter is a plan-time literal (estimator.md §6.1); an unbound one keeps the
+        // default.
+        let int = |arg: &RExpr| match estimator_value(arg).as_deref() {
+            Some(RExpr::ConstInt(n)) => Some(*n),
+            _ => None,
         };
-        if srf.kind != SrfKind::GenerateSeries || rest.len() > 1 {
+        if srf.kind != SrfKind::GenerateSeries || !(2..=3).contains(&srf.args.len()) {
             return DEFAULT_SRF_ROWS;
         }
-        let step = match rest {
-            [] => 1,
-            [RExpr::ConstInt(step)] => *step,
-            _ => return DEFAULT_SRF_ROWS,
+        let (Some(start), Some(stop)) = (int(&srf.args[0]), int(&srf.args[1])) else {
+            return DEFAULT_SRF_ROWS;
+        };
+        let (start, stop) = (&start, &stop);
+        let step = match srf.args.get(2) {
+            None => 1,
+            Some(arg) => match int(arg) {
+                Some(step) => step,
+                None => return DEFAULT_SRF_ROWS,
+            },
         };
         if step == 0 || (step > 0 && start > stop) || (step < 0 && start < stop) {
             return 0;

@@ -983,6 +983,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 }
 
 func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, ic *insertStmtCache, allowCacheFill bool) (outcome, error) {
+	original := ins
 	// A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
 	// checked by NAME before qualifier validation (the built-in resolves in every database).
 	if err := checkCatalogRelWrite(ins.Table); err != nil {
@@ -1014,6 +1015,18 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	// method without a cache slot; SELECT and ON CONFLICT retain the existing general path.
 	if ins.Query == nil && ins.OnConflict == nil {
 		return db.executeInsertValuesCached(ins, params, ctx, ic, allowCacheFill, vw)
+	}
+	// A SELECT source or ON CONFLICT clause is planned before the values are bound; a probe that read
+	// one restarts the statement with the values visible (estimator.md §6.1).
+	planning := db.beginPlanning()
+	defer planning.end()
+	restart := func(bound []Value) (outcome, error) {
+		var out outcome
+		err := db.restartPlanning(bound, func() (err error) {
+			out, err = db.executeInsertCached(original, params, ctx, nil, false)
+			return err
+		})
+		return out, err
 	}
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
@@ -1149,6 +1162,9 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		bound, err := bindParams(params, ptys, db.inputZone())
 		if err != nil {
 			return outcome{}, err
+		}
+		if planning.bind(bound) {
+			return restart(bound)
 		}
 		meter := db.session.newMeter()
 		if err := db.foldUncorrelatedInPlan(&plan, bound, ctx, &meter.Accrued); err != nil {
@@ -1310,6 +1326,9 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
+	}
+	if planning.bind(bound) {
+		return restart(bound)
 	}
 
 	// INSERT ... VALUES reads no rows; with only literal values and constant defaults it
@@ -3375,6 +3394,11 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
 func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (outcome, error) {
+	// The statement resolves before its values are bound; a subquery plan that read one restarts the
+	// statement with the values visible (estimator.md §6.1).
+	planning := db.beginPlanning()
+	defer planning.end()
+	original := del
 	// A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
 	// checked by NAME before qualifier validation (the built-in resolves in every database).
 	if err := checkCatalogRelWrite(del.Table); err != nil {
@@ -3433,6 +3457,15 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
+	}
+	// From here the target scan is planned with the bound values (the custom plan).
+	if planning.bind(bound) {
+		var out outcome
+		err := db.restartPlanning(bound, func() (err error) {
+			out, err = db.executeDelete(original, params, ctx)
+			return err
+		})
+		return out, err
 	}
 
 	// Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
@@ -3632,6 +3665,10 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
 func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcome, error) {
+	// As DELETE: resolve probing, then plan the target scan with the bound values.
+	planning := db.beginPlanning()
+	defer planning.end()
+	original := upd
 	// A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
 	// checked by NAME before qualifier validation (the built-in resolves in every database).
 	if err := checkCatalogRelWrite(upd.Table); err != nil {
@@ -3807,6 +3844,14 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
+	}
+	if planning.bind(bound) {
+		var out outcome
+		err := db.restartPlanning(bound, func() (err error) {
+			out, err = db.executeUpdate(original, params, ctx)
+			return err
+		})
+		return out, err
 	}
 
 	// Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their

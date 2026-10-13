@@ -539,6 +539,13 @@ fn where_conjuncts_contradict(conjuncts: &[&RExpr]) -> bool {
     for &c in conjuncts {
         match c {
             RExpr::ConstNull | RExpr::ConstBool(false) => return true,
+            RExpr::Param(_) => {
+                if estimator_is_null(c)
+                    || estimator_value(c).is_some_and(|v| matches!(*v, RExpr::ConstBool(false)))
+                {
+                    return true;
+                }
+            }
             RExpr::Compare { .. } => {
                 if literal_comparison_false(c) {
                     return true;
@@ -570,15 +577,19 @@ fn literal_comparison_false(c: &RExpr) -> bool {
     if !estimator_literal(lhs) || !estimator_literal(rhs) {
         return false;
     }
-    if matches!(lhs.as_ref(), RExpr::ConstNull) || matches!(rhs.as_ref(), RExpr::ConstNull) {
+    if estimator_is_null(lhs) || estimator_is_null(rhs) {
         return true;
     }
+    let (Some(lhs), Some(rhs)) = (estimator_value(lhs), estimator_value(rhs)) else {
+        return false;
+    };
     if (matches!(lhs.as_ref(), RExpr::ConstText(_)) || matches!(rhs.as_ref(), RExpr::ConstText(_)))
         && *op != CmpOp::Eq
     {
         return false;
     }
-    estimator_literal_cmp(lhs, rhs).is_some_and(|order| !estimator_comparison_satisfied(order, *op))
+    estimator_literal_cmp(&lhs, &rhs)
+        .is_some_and(|order| !estimator_comparison_satisfied(order, *op))
 }
 
 /// The one relation whose columns `c` references; `None` when it references none or several. Only

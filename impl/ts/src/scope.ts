@@ -1,6 +1,7 @@
 import type { TimeZoneDeps } from "./catalog.ts";
 import type { InputZone } from "./timezone.ts";
 import { noteIndexZone } from "./index_dependencies.ts";
+import { noteParamType } from "./plan_params.ts";
 import type {
   BoundTerm,
   CteBinding,
@@ -1673,9 +1674,11 @@ export class ParamTypes {
   // incompatible concrete pair is 42804.
   note(idx0: number, ty: ScalarType | null): void {
     while (idx0 >= this.types.length) this.types.push(null);
-    if (ty === null) return;
-    const prev = this.types[idx0]!;
-    this.types[idx0] = prev === null ? ty : unifyParamType(prev, ty, idx0);
+    if (ty !== null) {
+      const prev = this.types[idx0]!;
+      this.types[idx0] = prev === null ? ty : unifyParamType(prev, ty, idx0);
+    }
+    noteParamType(idx0, this.types[idx0]!);
   }
 
   // finalize returns the ordered parameter types. A slot referenced but never typed — including a

@@ -182,6 +182,21 @@ impl Engine {
         insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
         allow_cache_fill: bool,
     ) -> Result<Outcome> {
+        // The general path (a SELECT source, ON CONFLICT, or a write through a view) is planned
+        // before the values are bound; a probe that read one restarts the statement with the values
+        // visible (estimator.md §6.1). The plain-VALUES fast path opens no boundary, as in Go/TS.
+        let general = matches!(&ins.source, InsertSource::Query(_))
+            || ins.on_conflict.is_some()
+            || self
+                .dml_target_view(ins.db.as_deref(), &ins.table)
+                .ok()
+                .flatten()
+                .is_some();
+        let mut planning = general.then(plan_params::begin);
+        let retry = planning
+            .as_ref()
+            .is_some_and(plan_params::Planning::probing)
+            .then(|| ins.clone());
         // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
         // checked by NAME before qualifier validation (the built-in resolves in every database).
         check_catalog_rel_write(&ins.table)?;
@@ -432,6 +447,12 @@ impl Engine {
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+                if planning.as_mut().is_some_and(|p| p.bind(&bound)) {
+                    let retry = retry.expect("a probing boundary keeps its statement");
+                    return plan_params::restart(&bound, || {
+                        self.execute_insert_cached(retry, params, ctx, None, false)
+                    });
+                }
 
                 // INSERT ... VALUES reads no rows; with only literal values and constant
                 // defaults it evaluates no expression tree (leaves), so a plain fully-inline
@@ -646,6 +667,12 @@ impl Engine {
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+                if planning.as_mut().is_some_and(|p| p.bind(&bound)) {
+                    let retry = retry.expect("a probing boundary keeps its statement");
+                    return plan_params::restart(&bound, || {
+                        self.execute_insert_cached(retry, params, ctx, None, false)
+                    });
+                }
                 let mut meter = self.session.new_meter();
                 self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut meter.accrued)?;
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
@@ -3223,6 +3250,10 @@ impl Engine {
         params: &[Value],
         ctx: CteCtx,
     ) -> Result<Outcome> {
+        // The statement resolves before its values are bound; a subquery plan that read one
+        // restarts the statement with the values visible (estimator.md §6.1).
+        let mut planning = plan_params::begin();
+        let retry = planning.probing().then(|| del.clone());
         // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
         // checked by NAME before qualifier validation (the built-in resolves in every database).
         check_catalog_rel_write(&del.table)?;
@@ -3299,6 +3330,11 @@ impl Engine {
             None => None,
         };
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        // From here the target scan is planned with the bound values (the custom plan).
+        if planning.bind(&bound) {
+            let retry = retry.expect("a probing boundary keeps its statement");
+            return plan_params::restart(&bound, || self.execute_delete(retry, params, ctx));
+        }
 
         // Fold globally-uncorrelated subqueries (in the WHERE or the RETURNING list) once
         // (their cost is added a single time — spec/design/grammar.md §26, cost.md §3); a
@@ -3509,6 +3545,9 @@ impl Engine {
         params: &[Value],
         ctx: CteCtx,
     ) -> Result<Outcome> {
+        // As DELETE: resolve probing, then plan the target scan with the bound values.
+        let mut planning = plan_params::begin();
+        let retry = planning.probing().then(|| upd.clone());
         // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
         // checked by NAME before qualifier validation (the built-in resolves in every database).
         check_catalog_rel_write(&upd.table)?;
@@ -3726,6 +3765,10 @@ impl Engine {
         // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind
         // before any scan.
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        if planning.bind(&bound) {
+            let retry = retry.expect("a probing boundary keeps its statement");
+            return plan_params::restart(&bound, || self.execute_update(retry, params, ctx));
+        }
 
         // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
         // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and

@@ -27,8 +27,10 @@ import {
   estimatorComparisonSatisfied,
   estimatorConjunctionContradictory,
   estimatorFlattenBoolean,
+  estimatorIsNull,
   estimatorLiteral,
   estimatorLiteralCmp,
+  estimatorValue,
   resolvedTypeEqual,
 } from "./executor.ts";
 
@@ -455,6 +457,12 @@ function whereConjunctsContradict(conjuncts: RExpr[]): boolean {
       case "constBool":
         if (!c.value) return true;
         break;
+      case "param": {
+        if (estimatorIsNull(c)) return true;
+        const v = estimatorValue(c);
+        if (v !== null && v.kind === "constBool" && !v.value) return true;
+        break;
+      }
       case "compare": {
         if (literalComparisonFalse(c)) return true;
         const comparison = estimatorComparisonParts(c);
@@ -472,9 +480,12 @@ function literalComparisonFalse(c: RExpr & { kind: "compare" }): boolean {
   const op = c.op;
   if (op !== "eq" && op !== "lt" && op !== "le" && op !== "gt" && op !== "ge") return false;
   if (!estimatorLiteral(c.lhs) || !estimatorLiteral(c.rhs)) return false;
-  if (c.lhs.kind === "constNull" || c.rhs.kind === "constNull") return true;
-  if ((c.lhs.kind === "constText" || c.rhs.kind === "constText") && op !== "eq") return false;
-  const order = estimatorLiteralCmp(c.lhs, c.rhs);
+  if (estimatorIsNull(c.lhs) || estimatorIsNull(c.rhs)) return true;
+  const lhs = estimatorValue(c.lhs);
+  const rhs = estimatorValue(c.rhs);
+  if (lhs === null || rhs === null) return false;
+  if ((lhs.kind === "constText" || rhs.kind === "constText") && op !== "eq") return false;
+  const order = estimatorLiteralCmp(lhs, rhs);
   return order !== null && !estimatorComparisonSatisfied(order, op);
 }
 

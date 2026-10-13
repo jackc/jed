@@ -69,6 +69,15 @@ import type {
   WithExpr,
   WithQuery,
 } from "./ast.ts";
+import {
+  paramIsNull,
+  paramValue,
+  PLAN_MEMO_CAPACITY,
+  Planning,
+  planMemoKey,
+  restartPlanning,
+  withPlanValues,
+} from "./plan_params.ts";
 import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions } from "./ast.ts";
 import { chooseObjectName, indexColumnNames, nameAddition } from "./autoname.ts";
 import {
@@ -4246,13 +4255,19 @@ export class Engine {
   }
 
   private estimateSrfRows(srf: SrfPlan): bigint {
-    if (srf.kind !== "generate_series" || srf.args.length < 2 || srf.args.length > 3 ||
-      srf.args[0]!.kind !== "constInt" || srf.args[1]!.kind !== "constInt" ||
-      (srf.args.length === 3 && srf.args[2]!.kind !== "constInt")) return DEFAULT_SRF_ROWS;
-    const start = srf.args[0].value;
-    const stop = srf.args[1].value;
-    const stepExpr = srf.args[2];
-    const step = stepExpr !== undefined && stepExpr.kind === "constInt" ? stepExpr.value : 1n;
+    if (srf.kind !== "generate_series" || srf.args.length < 2 || srf.args.length > 3) {
+      return DEFAULT_SRF_ROWS;
+    }
+    // A bound parameter is a plan-time literal (estimator.md §6.1); an unbound one keeps the default.
+    const ints: bigint[] = [];
+    for (const arg of srf.args) {
+      const c = estimatorValue(arg);
+      if (c === null || c.kind !== "constInt") return DEFAULT_SRF_ROWS;
+      ints.push(c.value);
+    }
+    const start = ints[0]!;
+    const stop = ints[1]!;
+    const step = ints[2] ?? 1n;
     if (step === 0n || (step > 0n && start > stop) || (step < 0n && start < stop)) return 0n;
     const distance = start <= stop ? stop - start : start - stop;
     const rows = distance / (step < 0n ? -step : step) + 1n;
@@ -5007,13 +5022,26 @@ export class Engine {
   // per emitted plan row. EXPLAIN ANALYZE (analyze true) delegates to executeExplainAnalyze, which also
   // runs the inner statement.
   private executeExplain(ex: Explain, params: Value[]): Outcome {
+    // Bound values make EXPLAIN show the custom plan (estimator.md §6.1): a probe pass types each $N,
+    // then every planning pass below — and an ANALYZE's execution — sees the values. A $N still
+    // renders symbolically. Without values a $N is planned unbound.
+    const planning = Planning.begin();
+    try {
+      if (params.length > 0) {
+        this.estimateExplain(ex.inner);
+        const types = new ParamTypes();
+        types.types = planning.probeTypes();
+        planning.bind(bindParams(params, types.finalize(), this.inputZone()));
+      }
+      return this.executeExplainPlanned(ex, params);
+    } finally {
+      planning.end();
+    }
+  }
+
+  private executeExplainPlanned(ex: Explain, params: Value[]): Outcome {
     if (ex.analyze) {
       return this.executeExplainAnalyze(ex, params);
-    }
-    if (params.length > 0) {
-      // Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its bound
-      // value), so supplied parameters are neither needed nor bound.
-      throw engineError("syntax_error", "bind parameters are not allowed in EXPLAIN");
     }
     const estimates = this.estimateExplain(ex.inner).map((estimate) => ({
       rows: estimate.rows,
@@ -10522,6 +10550,22 @@ export class Engine {
   }
 
   private executeInsert(written: Insert, params: Value[], ctx: CteCtx): Outcome {
+    // A SELECT source or ON CONFLICT clause is planned before the values are bound; a probe that
+    // read one restarts the statement with the values visible (estimator.md §6.1).
+    const planning = Planning.begin();
+    try {
+      return this.executeInsertPlanned(written, params, ctx, planning);
+    } finally {
+      planning.end();
+    }
+  }
+
+  private executeInsertPlanned(
+    written: Insert,
+    params: Value[],
+    ctx: CteCtx,
+    planning: Planning,
+  ): Outcome {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
     checkCatalogRelWrite(written.table);
@@ -10648,6 +10692,7 @@ export class Engine {
       const cplan =
         ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes) : null;
       const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+      if (planning.bind(bound)) return restartPlanning(bound, () => this.executeInsert(written, params, ctx));
       const meter = this.session.newMeter();
       const foldCost = { value: 0n };
       this.foldUncorrelatedInPlan(plan, bound, ctx, foldCost);
@@ -10788,6 +10833,7 @@ export class Engine {
     const cplan =
       ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, vw, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    if (planning.bind(bound)) return restartPlanning(bound, () => this.executeInsert(written, params, ctx));
 
     // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
     // evaluates no expression tree (leaves), so a plain fully-inline insert still costs zero. An
@@ -12311,6 +12357,23 @@ export class Engine {
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
   private executeDelete(written: Delete, params: Value[], ctx: CteCtx): Outcome {
+    // The statement resolves before its values are bound; a subquery plan that read one restarts
+    // the statement with the values visible (estimator.md §6.1). After binding, the target scan is
+    // planned with the values (the custom plan).
+    const planning = Planning.begin();
+    try {
+      return this.executeDeletePlanned(written, params, ctx, planning);
+    } finally {
+      planning.end();
+    }
+  }
+
+  private executeDeletePlanned(
+    written: Delete,
+    params: Value[],
+    ctx: CteCtx,
+    planning: Planning,
+  ): Outcome {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
     checkCatalogRelWrite(written.table);
@@ -12344,6 +12407,7 @@ export class Engine {
         ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes, vw)
         : null;
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    if (planning.bind(bound)) return restartPlanning(bound, () => this.executeDelete(written, params, ctx));
 
     // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
     // spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via the
@@ -12513,6 +12577,21 @@ export class Engine {
   // a collision with another row's key traps 23505 (<table>_pkey). A duplicate target
   // column traps 42701. No WHERE updates every row.
   private executeUpdate(written: Update, params: Value[], ctx: CteCtx): Outcome {
+    // As DELETE: resolve probing, then plan the target scan with the bound values.
+    const planning = Planning.begin();
+    try {
+      return this.executeUpdatePlanned(written, params, ctx, planning);
+    } finally {
+      planning.end();
+    }
+  }
+
+  private executeUpdatePlanned(
+    written: Update,
+    params: Value[],
+    ctx: CteCtx,
+    planning: Planning,
+  ): Outcome {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
     checkCatalogRelWrite(written.table);
@@ -12669,6 +12748,7 @@ export class Engine {
     // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
     // any scan.
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    if (planning.bind(bound)) return restartPlanning(bound, () => this.executeUpdate(written, params, ctx));
 
     // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
     // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and re-runs
@@ -13104,13 +13184,21 @@ export class Engine {
   // and finally EXECUTE against an empty outer-row environment. Correlated subqueries that survive
   // the fold are re-executed per outer row by the evaluator.
   private runQueryExpr(qe: QueryExpr, params: Value[]): SelectResult {
-    const ptypes = new ParamTypes();
-    const plan = this.planQuery(qe, null, [], ptypes);
-    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
-    const subqueryCost = { value: 0n };
-    this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, subqueryCost);
-    const r = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
-    return { ...r, cost: r.cost + subqueryCost.value };
+    const planning = Planning.begin();
+    try {
+      const ptypes = new ParamTypes();
+      let plan = this.planQuery(qe, null, [], ptypes);
+      const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+      // A plan that read a parameter's value is planned again with the bound values: the custom
+      // plan (estimator.md §6.1).
+      if (planning.bind(bound)) plan = this.planQuery(qe, null, [], new ParamTypes());
+      const subqueryCost = { value: 0n };
+      this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, subqueryCost);
+      const r = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
+      return { ...r, cost: r.cost + subqueryCost.value };
+    } finally {
+      planning.end();
+    }
   }
 
   // runSelect runs a lone SELECT — the entry point executeSelect and INSERT ... SELECT use.
@@ -13370,16 +13458,29 @@ export class Engine {
   // earlier buffers); (5) fold + EXECUTE the main body with the CTE context. Cost composes like set
   // operations — a sum of the parts.
   private runWith(wq: WithQuery, params: Value[]): SelectResult {
-    const ptypes = new ParamTypes();
-    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes, wq.body);
-    // (2) Plan the main body with all bindings visible (the pure-query path always has a query
-    //     primary — a data-modifying primary routes to executeWithDml).
+    const planning = Planning.begin();
+    try {
+      return this.runWithPlanned(wq, params, planning);
+    } finally {
+      planning.end();
+    }
+  }
+
+  private runWithPlanned(wq: WithQuery, params: Value[], planning: Planning): SelectResult {
     const bodyQuery = cteBodyAsQuery(wq.body);
     if (bodyQuery === null) {
       throw new Error("runWith is the pure-query path");
     }
-    const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
+    const planAll = (ptypes: ParamTypes) => {
+      const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes, wq.body);
+      // (2) Plan the main body with all bindings visible (the pure-query path always has a query
+      //     primary — a data-modifying primary routes to executeWithDml).
+      return { bindings, plan: this.planQuery(bodyQuery, null, bindings, ptypes) };
+    };
+    const ptypes = new ParamTypes();
+    let { bindings, plan } = planAll(ptypes);
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    if (planning.bind(bound)) ({ bindings, plan } = planAll(new ParamTypes()));
     const modes = cteModes(bindings);
     const { buffers, totalCost } = this.materializeCtes(bindings, modes, bound, EMPTY_CTE_CTX, []);
 
@@ -13627,6 +13728,17 @@ export class Engine {
   // query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
   // primary — every read against the pin, every write into the transaction's working.
   private runWithDml(wq: WithQuery, params: Value[]): Outcome {
+    // Every part is planned before the values are bound; a probe that read one restarts the
+    // statement with the values visible (estimator.md §6.1).
+    const planning = Planning.begin();
+    try {
+      return this.runWithDmlPlanned(wq, params, planning);
+    } finally {
+      planning.end();
+    }
+  }
+
+  private runWithDmlPlanned(wq: WithQuery, params: Value[], planning: Planning): Outcome {
     const { ctes, body, recursive } = wq;
     const ptypes = new ParamTypes();
     // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
@@ -13655,6 +13767,7 @@ export class Engine {
       }
     }
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    if (planning.bind(bound)) return restartPlanning(bound, () => this.runWithDml(wq, params));
     const modes = cteModes(bindings);
 
     // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its
@@ -18051,10 +18164,12 @@ export class Engine {
     const ident = this.core ?? this;
     // Cache HIT: the statement still belongs to the same database identity and every ordered base
     // relation has the same exact identity/generation/name/revision tuple. Resolving those tuples also
-    // rejects a temp shadow or a missing/replaced attachment. Reuse the
-    // resolved plan + finalized param types — no planQuery, no fold, no param-type walk. A cached plan
-    // carries no subquery to fold (planCacheable rejected any), so the shared plan is never mutated;
-    // params are still bound per execute.
+    // rejects a temp shadow or a missing/replaced attachment. Reuse the finalized param types — no
+    // param-type walk — and, for a value-blind statement, the resolved plan: no planQuery, no fold. A
+    // cached plan carries no subquery to fold (planCacheable rejected any), so the shared plan is
+    // never mutated; params are still bound per execute. A parameter-sensitive statement
+    // (estimator.md §6.1) takes its custom plan: from the memo for a binding planned before, else
+    // planned once with the values.
     if (
       holder !== null &&
       holder.cache !== null &&
@@ -18062,22 +18177,58 @@ export class Engine {
       this.estimatorInputsMatch(holder.cache.sp, holder.cache.inputs)
     ) {
       const c = holder.cache;
-      return this.buildScanRows(
-        c.sp,
-        bindParams(params, c.ptys, this.inputZone(), c.plabels),
-        0n,
-        c.resultTypes,
-      );
+      const bound = bindParams(params, c.ptys, this.inputZone(), c.plabels);
+      if (!c.sensitive && !(c.nullRead && bound.some((v) => v.kind === "null"))) {
+        return this.buildScanRows(c.sp, bound, 0n, c.resultTypes);
+      }
+      const key = planMemoKey(bound);
+      if (c.sensitive) {
+        const hit = c.memo.find((m) => m.key === key);
+        if (hit !== undefined) return this.buildScanRows(hit.sp, bound, 0n, c.resultTypes);
+      }
+      const ptypes = new ParamTypes();
+      const plan = withPlanValues(bound, () => this.planQuery(stmt, null, [], ptypes));
+      if (plan.kind !== "select") return null;
+      const subqueryCost = { value: 0n };
+      this.foldUncorrelatedInSelect(plan, bound, EMPTY_CTE_CTX, subqueryCost);
+      if (c.sensitive && snap === this.committed && !ptypes.uncacheable && this.planCacheable(plan)) {
+        if (c.memo.length === PLAN_MEMO_CAPACITY) c.memo.shift();
+        c.memo.push({ key, sp: plan });
+      }
+      return this.buildScanRows(plan, bound, subqueryCost.value, c.resultTypes);
     }
-    // MISS: plan once.
-    const ptypes = new ParamTypes();
-    const plan = this.planQuery(stmt, null, [], ptypes);
-    if (plan.kind !== "select") return null; // set-op / VALUES / WITH — a scan lane does not cover it
-    const sp = plan;
-    const ptys = ptypes.finalize();
-    const plabels = paramLabels(ptys.length);
-    const bound = bindParams(params, ptys, this.inputZone(), plabels);
-    const resultTypes = typeNames(sp.columnTypes);
+    // MISS: plan in a probe frame, bind, and plan again with the values when the probe read one
+    // (estimator.md §6.1).
+    const planning = Planning.begin();
+    let probe: SelectPlan;
+    let sp: SelectPlan;
+    let ptypes: ParamTypes;
+    let ptys: ScalarType[];
+    let plabels: string[];
+    let bound: Value[];
+    let facts: { sensitive: boolean; nullRead: boolean };
+    let customReusable = false;
+    try {
+      ptypes = new ParamTypes();
+      const plan = this.planQuery(stmt, null, [], ptypes);
+      if (plan.kind !== "select") return null; // set-op / VALUES / WITH — a scan lane does not cover it
+      probe = plan;
+      ptys = ptypes.finalize();
+      plabels = paramLabels(ptys.length);
+      bound = bindParams(params, ptys, this.inputZone(), plabels);
+      facts = planning.probeFacts();
+      sp = probe;
+      if (planning.bind(bound)) {
+        const cp = new ParamTypes();
+        const custom = this.planQuery(stmt, null, [], cp);
+        if (custom.kind !== "select") return null;
+        sp = custom;
+        customReusable = facts.sensitive && !cp.uncacheable && this.planCacheable(sp);
+      }
+    } finally {
+      planning.end();
+    }
+    const resultTypes = typeNames(probe.columnTypes);
     // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
     // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
     // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
@@ -18088,15 +18239,25 @@ export class Engine {
     // Fill only from committed state, so a working transaction can consume an entry whose exact
     // signature matches but can never publish its working revision into the committed cache slot.
     // Also require a reusable plan.
-    const inputs = this.estimatorInputs(sp);
+    const inputs = this.estimatorInputs(probe);
     if (
       holder !== null &&
       snap === this.committed &&
       !ptypes.uncacheable &&
-      this.planCacheable(sp) &&
+      this.planCacheable(probe) &&
       inputs !== null
     ) {
-      holder.cache = { core: ident, inputs, sp, ptys, plabels, resultTypes };
+      holder.cache = {
+        core: ident,
+        inputs,
+        sp: probe,
+        ptys,
+        plabels,
+        resultTypes,
+        sensitive: facts.sensitive,
+        nullRead: facts.nullRead,
+        memo: customReusable ? [{ key: planMemoKey(bound), sp }] : [],
+      };
     }
     return this.buildScanRows(sp, bound, subqueryCost.value, resultTypes);
   }
@@ -22559,7 +22720,9 @@ function currentColumnStatistics(
     if (scaled > remaining) scaled = remaining;
     remaining -= scaled;
     sampledMcvRows += entry.frequency;
-    return { key: entry.value.key.slice(), rows: scaled };
+    // The keys share the snapshot's immutable fact: planning reads them on every estimate, so a
+    // copy per call dominated the planning of a statement over analyzed columns.
+    return { key: entry.value.key, rows: scaled };
   });
   return {
     rows,
@@ -22568,7 +22731,7 @@ function currentColumnStatistics(
     ndv,
     averageWidth,
     mcv,
-    histogram: fact.histogram.map((bound) => bound.key.slice()),
+    histogram: fact.histogram.map((bound) => bound.key),
     completeMcv:
       !fact.stale &&
       BigInt(fact.sampleRows) === fact.analyzedRows &&
@@ -22664,8 +22827,56 @@ function statisticsLiteralKey(
   column: number,
   engine: Engine,
 ): Uint8Array | null {
-  const value = statisticsConstantValue(literal);
+  const constant = estimatorValue(literal);
+  const value = constant === null ? null : statisticsConstantValue(constant);
   return value === null ? null : statisticsValueKey(value, rel, column, engine);
+}
+
+// statisticsLiteralRows is the rows a column comparison with a non-NULL plan-time literal admits
+// (statistics.md §6). A parameter whose value is unavailable takes the generic equality estimate,
+// never an MCV or histogram bucket (estimator.md §6.1).
+function statisticsLiteralRows(
+  current: CurrentColumnStatistics,
+  op: BinaryOp,
+  literal: RExpr,
+  rel: ScopeRel,
+  column: number,
+  engine: Engine,
+): bigint | null {
+  const param = literal.kind === "param";
+  if (param) {
+    const blind = statisticsValueBlindRows(current, op, rel, column);
+    if (blind !== null) return blind;
+  }
+  const key = statisticsLiteralKey(literal, rel, column, engine);
+  if (key !== null) return statisticsComparisonRows(current, op, key);
+  if (!param || (op !== "eq" && op !== "ne") || current.ndv === null) return null;
+  const equality = statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv);
+  return op === "ne" ? current.nonnullRows - equality : equality;
+}
+
+// statisticsValueBlindRows is an equality (or <>) estimate no non-NULL value can change
+// (estimator.md §6.1): the facts hold no MCV and do not prove absence, so every value falls in the
+// residual population and takes the NDV average — exactly the literal estimate, read without the
+// value. This keeps a key lookup on an analyzed table parameter-insensitive. A collated text column
+// is excluded because its sort key can fail for a value, which the literal path turns into the
+// structural fallback.
+function statisticsValueBlindRows(
+  current: CurrentColumnStatistics,
+  op: BinaryOp,
+  rel: ScopeRel,
+  column: number,
+): bigint | null {
+  if (
+    (op !== "eq" && op !== "ne") ||
+    current.mcv.length !== 0 ||
+    current.completeMcv ||
+    rel.table.columns[column]!.collation !== null ||
+    current.ndv === null
+  )
+    return null;
+  const equality = statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv);
+  return op === "ne" ? current.nonnullRows - equality : equality;
 }
 
 // Adapt a comparison literal to the column's stored-key family. Integer/decimal comparisons
@@ -22791,7 +23002,14 @@ function statisticsBoundSourceSelectivity(
 ): Selectivity | null {
   const current = currentColumnStatistics(engine, rel, column);
   if (current === null) return null;
-  if (source.kind === "constNull") return { kind: "zero" };
+  if (estimatorIsNull(source)) return { kind: "zero" };
+  if (source.kind === "param") {
+    const blind = statisticsValueBlindRows(current, op, rel, column);
+    if (blind !== null) return statisticsSelectivity(blind, current.rows);
+  }
+  const key = statisticsLiteralKey(source, rel, column, engine);
+  if (key !== null) return statisticsSelectivity(statisticsComparisonRows(current, op, key), current.rows);
+  // An unbound parameter or a runtime outer/sibling column: the generic estimate.
   if (source.kind === "param" || source.kind === "column" || source.kind === "outerColumn") {
     if (op !== "eq" || current.ndv === null) return null;
     return statisticsSelectivity(
@@ -22799,10 +23017,7 @@ function statisticsBoundSourceSelectivity(
       current.rows,
     );
   }
-  const key = statisticsLiteralKey(source, rel, column, engine);
-  return key === null
-    ? null
-    : statisticsSelectivity(statisticsComparisonRows(current, op, key), current.rows);
+  return null;
 }
 
 function statisticsBoundTermsSelectivity(
@@ -22937,15 +23152,16 @@ function statisticsGinEstimate(
 // statisticsGinOperandValue is a GIN query operand's plan-time value (statistics.md §6.1): a literal,
 // a folded array literal, or a one-dimensional ARRAY[...] of literals.
 function statisticsGinOperandValue(operand: RExpr): Value | null {
-  const constant = (e: RExpr): Value | null => {
-    if (e.kind === "constRange") return e.value;
+  const constant = (expr: RExpr): Value | null => {
+    const e = estimatorValue(expr);
+    if (e === null) return null;
+    if (e.kind === "constRange" || e.kind === "constArray") return e.value;
     try {
       return rexprConstToValue(e);
     } catch {
       return null;
     }
   };
-  if (operand.kind === "constArray") return operand.value;
   if (operand.kind === "array" && !operand.nested) {
     const values: Value[] = [];
     for (const elem of operand.elements) {
@@ -23072,19 +23288,16 @@ function statisticsLeafSelectivity(
   if (comparison === null) return null;
   const current = currentColumnStatistics(engine, rel, comparison.column);
   if (current === null) return null;
-  if (comparison.literal.kind === "constNull") return { kind: "zero" };
-  if (comparison.literal.kind === "param") {
-    if ((comparison.op !== "eq" && comparison.op !== "ne") || current.ndv === null) return null;
-    let rows = statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv);
-    if (comparison.op === "ne") rows = current.nonnullRows - rows;
-    return statisticsSelectivity(rows, current.rows);
-  }
-  const key = statisticsLiteralKey(comparison.literal, rel, comparison.column, engine);
-  if (key === null) return null;
-  return statisticsSelectivity(
-    statisticsComparisonRows(current, comparison.op, key),
-    current.rows,
+  if (estimatorIsNull(comparison.literal)) return { kind: "zero" };
+  const rows = statisticsLiteralRows(
+    current,
+    comparison.op,
+    comparison.literal,
+    rel,
+    comparison.column,
+    engine,
   );
+  return rows === null ? null : statisticsSelectivity(rows, current.rows);
 }
 
 function collectStatisticsEqualityDisjunction(
@@ -23122,20 +23335,20 @@ function statisticsEqualityDisjunctionSelectivity(
   const seen = new Set<string>();
   let matched = 0n;
   for (const literal of disjunction.literals) {
-    if (literal.kind === "constNull") continue;
-    if (literal.kind === "param") {
+    if (estimatorIsNull(literal)) continue;
+    const key = statisticsLiteralKey(literal, rel, disjunction.column, engine);
+    if (key !== null) {
+      const id = encodeBytea(key, "hex");
+      if (!seen.has(id)) {
+        seen.add(id);
+        matched = saturatingEstimateAdd(matched, statisticsEqualityRows(current, key));
+      }
+    } else if (literal.kind === "param") {
       if (current.ndv === null) return null;
       matched = saturatingEstimateAdd(
         matched,
         statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv),
       );
-    } else {
-      const key = statisticsLiteralKey(literal, rel, disjunction.column, engine);
-      const id = key === null ? null : encodeBytea(key, "hex");
-      if (key !== null && id !== null && !seen.has(id)) {
-        seen.add(id);
-        matched = saturatingEstimateAdd(matched, statisticsEqualityRows(current, key));
-      }
     }
     if (matched > current.nonnullRows) matched = current.nonnullRows;
   }
@@ -23158,8 +23371,8 @@ function statisticsNegatedPairedRangeSelectivity(
     (upper.op !== "lt" && upper.op !== "le")
   )
     return null;
-  const lowerNull = lower.literal.kind === "constNull";
-  const upperNull = upper.literal.kind === "constNull";
+  const lowerNull = estimatorIsNull(lower.literal);
+  const upperNull = estimatorIsNull(upper.literal);
   if (lowerNull || upperNull) {
     if (lowerNull && upperNull) return { kind: "zero" };
     if (lowerNull)
@@ -23200,20 +23413,23 @@ function statisticsNegatedLeafSelectivity(
     let matched = 0n;
     let hasNull = false;
     for (const literal of disjunction.literals) {
-      if (literal.kind === "constNull") hasNull = true;
-      else if (literal.kind === "param") {
+      if (estimatorIsNull(literal)) {
+        hasNull = true;
+        continue;
+      }
+      const key = statisticsLiteralKey(literal, rel, disjunction.column, engine);
+      if (key !== null) {
+        const id = encodeBytea(key, "hex");
+        if (!seen.has(id)) {
+          seen.add(id);
+          matched = saturatingEstimateAdd(matched, statisticsEqualityRows(current, key));
+        }
+      } else if (literal.kind === "param") {
         if (current.ndv === null) return null;
         matched = saturatingEstimateAdd(
           matched,
           statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv),
         );
-      } else {
-        const key = statisticsLiteralKey(literal, rel, disjunction.column, engine);
-        const id = key === null ? null : encodeBytea(key, "hex");
-        if (key !== null && id !== null && !seen.has(id)) {
-          seen.add(id);
-          matched = saturatingEstimateAdd(matched, statisticsEqualityRows(current, key));
-        }
       }
       if (matched > current.nonnullRows) matched = current.nonnullRows;
     }
@@ -23227,22 +23443,16 @@ function statisticsNegatedLeafSelectivity(
   if (comparison !== null) {
     const current = currentColumnStatistics(engine, rel, comparison.column);
     if (current === null) return null;
-    if (comparison.literal.kind === "constNull") return { kind: "zero" };
-    let rows: bigint;
-    if (comparison.literal.kind === "param") {
-      if ((comparison.op !== "eq" && comparison.op !== "ne") || current.ndv === null)
-        return null;
-      rows = statisticsScale(
-        current.nonnullRows,
-        1n,
-        current.ndv < 1n ? 1n : current.ndv,
-      );
-      if (comparison.op === "ne") rows = current.nonnullRows - rows;
-    } else {
-      const key = statisticsLiteralKey(comparison.literal, rel, comparison.column, engine);
-      if (key === null) return null;
-      rows = statisticsComparisonRows(current, comparison.op, key);
-    }
+    if (estimatorIsNull(comparison.literal)) return { kind: "zero" };
+    const rows = statisticsLiteralRows(
+      current,
+      comparison.op,
+      comparison.literal,
+      rel,
+      comparison.column,
+      engine,
+    );
+    if (rows === null) return null;
     return statisticsSelectivity(current.nonnullRows - rows, current.rows);
   }
   if (expr.kind === "column") {
@@ -23272,14 +23482,7 @@ function statisticsPairedRangeSelectivity(
 ): Selectivity | null {
   const a = statisticsComparison(lhs, rel);
   const b = statisticsComparison(rhs, rel);
-  if (
-    a === null ||
-    b === null ||
-    a.column !== b.column ||
-    a.literal.kind === "param" ||
-    b.literal.kind === "param"
-  )
-    return null;
+  if (a === null || b === null || a.column !== b.column) return null;
   const lower = a.op === "gt" || a.op === "ge" ? a : b;
   const upper = lower === a ? b : a;
   if (
@@ -23395,7 +23598,7 @@ function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
     case "not":
       return notSelectivity(estimatorPredicateSelectivity(expr.operand));
     case "compare":
-      if (expr.lhs.kind === "constNull" || expr.rhs.kind === "constNull") return { kind: "zero" };
+      if (estimatorIsNull(expr.lhs) || estimatorIsNull(expr.rhs)) return { kind: "zero" };
       if (expr.op === "eq") return fractionSelectivity(SELECTIVITY_EQUALITY);
       if (expr.op === "ne") return notSelectivity(fractionSelectivity(SELECTIVITY_EQUALITY));
       return fractionSelectivity(SELECTIVITY_INEQUALITY);
@@ -23503,7 +23706,28 @@ export function estimatorFlattenBoolean(expr: RExpr, kind: "and" | "or", out: RE
 }
 
 export function estimatorLiteral(expr: RExpr): boolean {
-  return expr.kind.startsWith("const"); // parameters are a separate non-literal node kind
+  return expr.kind.startsWith("const") || expr.kind === "param";
+}
+
+// estimatorValue is a plan-time literal's constant for the estimator (estimator.md §6.1): the
+// literal itself, or a parameter's bound value in a custom planning frame. null for any other
+// expression and for a parameter whose value is unavailable — a probe frame records that read, so
+// the statement is planned again with its values. Every read of a literal's VALUE goes through here.
+export function estimatorValue(expr: RExpr): RExpr | null {
+  if (expr.kind === "param") {
+    const value = paramValue(expr.index);
+    if (value === null) return null;
+    const c = valueToRExpr(value);
+    return c.kind.startsWith("const") ? c : null;
+  }
+  return estimatorLiteral(expr) ? expr : null;
+}
+
+// estimatorIsNull reports whether a plan-time literal is NULL. An unbound parameter is assumed
+// non-NULL (estimator.md §6.1).
+export function estimatorIsNull(expr: RExpr): boolean {
+  if (expr.kind === "param") return paramIsNull(expr.index);
+  return expr.kind === "constNull";
 }
 
 function estimatorEqualityParts(expr: RExpr): { operand: RExpr; literal: RExpr } | null {
@@ -23549,8 +23773,11 @@ export function estimatorComparisonParts(expr: RExpr): EstimatorComparison | nul
 
 // Compare resolved, same-kind plan-time literals by their SQL total order. Open/unsupported
 // literal kinds return null: missing a proof is safe, inventing one is not.
-export function estimatorLiteralCmp(a: RExpr, b: RExpr): number | null {
-  if (a.kind !== b.kind) return null;
+export function estimatorLiteralCmp(lhs: RExpr, rhs: RExpr): number | null {
+  const a = estimatorValue(lhs);
+  if (a === null) return null;
+  const b = estimatorValue(rhs);
+  if (b === null || a.kind !== b.kind) return null;
   switch (a.kind) {
     case "constInt": {
       if (b.kind !== "constInt") return null;
@@ -23630,10 +23857,13 @@ function estimatorComparisonsContradict(a: EstimatorComparison, b: EstimatorComp
 
 function estimatorBoundsContradict(
   aOp: EstimatorComparison["op"],
-  aLiteral: RExpr,
+  aLiteralExpr: RExpr,
   bOp: EstimatorComparison["op"],
-  bLiteral: RExpr,
+  bLiteralExpr: RExpr,
 ): boolean {
+  const aLiteral = estimatorValue(aLiteralExpr);
+  const bLiteral = estimatorValue(bLiteralExpr);
+  if (aLiteral === null || bLiteral === null) return false;
   // Text equality is byte identity, but range order may use a derived collation unavailable here.
   if (
     (aLiteral.kind === "constText" || bLiteral.kind === "constText") &&
@@ -23665,7 +23895,7 @@ export function estimatorConjunctionContradictory(conjuncts: RExpr[]): boolean {
     const comparison = estimatorComparisonParts(conjunct);
     if (comparison === null) continue;
     if (
-      comparison.literal.kind === "constNull" ||
+      estimatorIsNull(comparison.literal) ||
       comparisons.some((prior) => estimatorComparisonsContradict(prior, comparison))
     ) {
       return true;
@@ -23678,7 +23908,7 @@ export function estimatorConjunctionContradictory(conjuncts: RExpr[]): boolean {
 function estimatorEqualitySourcesImpossible(sources: RExpr[], keyType: ScalarType): boolean {
   return sources.some(
     (source, i) =>
-      source.kind === "constNull" ||
+      estimatorIsNull(source) ||
       (source.kind === "constInt" && isInteger(keyType) && !inRange(keyType, source.value)) ||
       sources
         .slice(0, i)
@@ -23688,7 +23918,7 @@ function estimatorEqualitySourcesImpossible(sources: RExpr[], keyType: ScalarTyp
 
 function estimatorRangeTerms(terms: BoundTerm[], keyType: ScalarType): Selectivity {
   if (terms.length === 0) return { kind: "all" };
-  if (terms.some((term) => term.src.kind === "constNull")) return { kind: "zero" };
+  if (terms.some((term) => estimatorIsNull(term.src))) return { kind: "zero" };
   if (
     terms.some(
       (term, i) =>
@@ -30871,6 +31101,14 @@ export type ScanCache = {
   ptys: ScalarType[];
   plabels: string[];
   resultTypes: string[];
+  // sensitive: the probe plan read a parameter's value (estimator.md §6.1), so sp is not reused —
+  // each execution takes its custom plan, from memo when this exact binding was planned before.
+  sensitive: boolean;
+  // nullRead: the probe plan assumed a parameter non-NULL; a binding with a NULL takes its custom
+  // plan.
+  nullRead: boolean;
+  // memo: custom plans by exact binding (planMemoKey), oldest first, at most PLAN_MEMO_CAPACITY.
+  memo: { key: string; sp: SelectPlan }[];
 };
 export type EstimatorInputSignature = {
   database: object;

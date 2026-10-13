@@ -95,16 +95,22 @@ impl Engine {
         inner: Statement,
         params: &[Value],
     ) -> Result<Outcome> {
+        // Bound values make EXPLAIN show the custom plan (estimator.md §6.1): a probe pass types
+        // each `$N`, then every planning pass below — and an ANALYZE's execution — sees the values.
+        // A `$N` still renders symbolically. Without values a `$N` is planned unbound.
+        let mut planning = plan_params::begin();
+        if !params.is_empty() {
+            self.estimate_explain(&inner)?;
+            let types = ParamTypes {
+                types: planning.probe_types(),
+                ..ParamTypes::default()
+            }
+            .finalize()?;
+            let bound = bind_params(params, &types, &self.input_zone())?;
+            planning.bind(&bound);
+        }
         if analyze {
             return self.execute_explain_analyze(verbose, costs, lane, inner, params);
-        }
-        if !params.is_empty() {
-            // Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its
-            // bound value), so supplied parameters are neither needed nor bound.
-            return Err(EngineError::new(
-                SqlState::SyntaxError,
-                "bind parameters are not allowed in EXPLAIN",
-            ));
         }
         let estimates = self
             .estimate_explain(&inner)?

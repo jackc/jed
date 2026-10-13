@@ -65,13 +65,27 @@ func (r *explainRender) actualCost(i int) int64 {
 // EXPLAIN never executes the inner statement — planExplainInner produces the plan structs, which
 // renderQueryPlan walks. The EXPLAIN statement's own cost is one row_produced per emitted plan row.
 func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
+	// Bound values make EXPLAIN show the custom plan (estimator.md §6.1): a probe pass types each $N,
+	// then every planning pass below — and an ANALYZE's execution — sees the values. A $N still
+	// renders symbolically. Without values a $N is planned unbound.
+	planning := db.beginPlanning()
+	defer planning.end()
+	if len(params) > 0 {
+		if _, err := db.estimateExplain(ex.Inner); err != nil {
+			return outcome{}, err
+		}
+		ptys, err := (&paramTypes{types: planning.frame.types}).finalize()
+		if err != nil {
+			return outcome{}, err
+		}
+		bound, err := bindParams(params, ptys, db.inputZone())
+		if err != nil {
+			return outcome{}, err
+		}
+		planning.bind(bound)
+	}
 	if ex.Analyze {
 		return db.executeExplainAnalyze(ex, params)
-	}
-	if len(params) > 0 {
-		// Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its
-		// bound value), so supplied parameters are neither needed nor bound.
-		return outcome{}, newError(SyntaxError, "bind parameters are not allowed in EXPLAIN")
 	}
 	estimates, err := db.estimateExplain(ex.Inner)
 	if err != nil {
@@ -396,7 +410,7 @@ type explainWithPlan struct {
 }
 
 func (db *engine) planExplainWithDml(wq *withQuery) (*explainWithPlan, error) {
-	ptypes := &paramTypes{}
+	ptypes := db.newParamTypes()
 	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes, ctePrimary{body: &wq.Body})
 	if err != nil {
 		return nil, err
@@ -465,7 +479,7 @@ func (db *engine) explainInsert(r *explainRender, ins *insert, depth int, bindin
 	}
 	r.emit(depth, "Insert "+ins.Table, insertDetail(ins))
 	if ins.Query != nil {
-		ptypes := &paramTypes{}
+		ptypes := db.newParamTypes()
 		plan, err := db.planQuery(*ins.Query, nil, bindings, ptypes)
 		if err != nil {
 			return err
@@ -544,7 +558,7 @@ func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int, bi
 func (db *engine) explainDmlFilter(table *catTable, where *exprNode, bindings []*cteBinding, vw *viewWrite) (*rExpr, error) {
 	s := writeTargetScope(db, table, vw)
 	s.ctes = bindings
-	filter, err := db.resolveWriteFilter(s, table, vw, where, &paramTypes{})
+	filter, err := db.resolveWriteFilter(s, table, vw, where, db.newParamTypes())
 	return filter, err
 }
 
@@ -574,7 +588,7 @@ func (db *engine) explainDeleteTouched(table *catTable, del *deleteStmt, filter 
 	if del.Returning == nil {
 		return mask, nil
 	}
-	nodes, _, _, err := db.resolveReturning(table, *del.Returning, true, bindings, &paramTypes{}, vw, nil)
+	nodes, _, _, err := db.resolveReturning(table, *del.Returning, true, bindings, db.newParamTypes(), vw, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -593,7 +607,7 @@ func (db *engine) explainUpdateTouched(table *catTable, upd *update, filter *rEx
 	collectTouched(filter, 0, mask)
 	s := writeTargetScope(db, table, vw)
 	s.ctes = bindings
-	ptypes := &paramTypes{}
+	ptypes := db.newParamTypes()
 	assigned := make([]bool, len(mask))
 	for _, a := range upd.Assignments {
 		idx := table.ColumnIndex(a.Column)
@@ -645,7 +659,7 @@ func (db *engine) dmlScanBound(table *catTable, filter *rExpr) *scanBound {
 // WITH is planned as a nested WITH expression (there are no enclosing CTEs to
 // inherit at the top level), which produces the same withPlan structure to render.
 func (db *engine) planExplainInner(inner *statement) (queryPlan, error) {
-	ptypes := &paramTypes{}
+	ptypes := db.newParamTypes()
 	switch {
 	case inner.Select != nil:
 		return db.planQuery(queryExpr{Select: inner.Select}, nil, nil, ptypes)

@@ -262,6 +262,21 @@ pair retained checksum `52e015d7a68673bd` and improved after ANALYZE by **18.7×
 before/after records above; they verify that the final integrated branch retains their plan shapes,
 answers, and performance direction.
 
+**Parameter-sensitive (custom) plans (2026-10-13).** `custom_plan_gin_common_tag`,
+`custom_plan_gin_rare_tag`, `custom_plan_mcv_common`, and `custom_plan_mcv_rare` bind the value a
+plan depends on as `$1` ([estimator.md](estimator.md) §6.1). Alternating base/after/base/after runs on
+the native harnesses (mean ns/op, base → after): the MCV common value **63.8 → 3.2 ms Go, 46.9 → 5.5
+ms Rust, 73.8 → 13.9 ms TypeScript** (the index walk over 90,000 rows becomes a full scan); the
+common GIN tag **98.7 → 80.1 ms Go, 77.0 → 71.5 ms Rust, 315 → 297 ms TypeScript**. The rare lanes
+keep their plans and measure planning each execution with its value: `custom_plan_mcv_rare`
+**2.3 → 14.9 µs Go, 2.2 → 7.7 µs Rust, 7.2 → 29.1 µs TypeScript** (PostgreSQL 13.2 µs), and the rare
+GIN tag +7% Go, +23% Rust, +36% TypeScript. Sharing the statistics fact's MCV/histogram keys instead
+of copying them per estimate cut that planning roughly in half (Go 20.3 → 12.1 µs per execution).
+Value-blind lanes are unchanged within noise: `point_lookup_pk` / `_miss` / `_ramp` moved −7% to +12%
+across rounds with no consistent sign, and `secondary_update` −0.1% to +2% (one +12.7% TypeScript
+round from a single outlier run). Every lane's checksum agreed across Go, Rust, TypeScript, and
+PostgreSQL.
+
 **Point-lookup ramp/hot split baseline (2026-07-14).** The former `point_lookup_pk` number mixed
 steady prepared execution with the first fault of roughly 5,000 packed leaves: 2,000 random warmup
 probes could not populate a roughly 6,900-leaf working set. It is now the explicitly named

@@ -76,6 +76,15 @@ EXPLAIN SELECT id FROM post WHERE tags @> '{rare-tag}'::text[];
 A term missing from a fresh list that holds every term in the table is estimated at zero rows; after
 later writes, or when the list was truncated, a missing term gets a small positive estimate.
 
+## Parameters get the same estimates
+
+A bound parameter is estimated like the literal it carries: `WHERE category = $1` and
+`tags @> ARRAY[$1]` use the MCV list, histogram, and GIN terms for each execution's value, because
+every execution is planned with its values (its *custom plan* —
+[prepared statements](/docs/api/queries)). `EXPLAIN` given bound values shows that plan; without
+values it shows the estimate for an unknown value — the distinct-value average, never an MCV
+bucket.
+
 ## Transactional and deliberately stale
 
 `ANALYZE` is a write: it commits atomically in autocommit mode, joins an explicit transaction, rolls

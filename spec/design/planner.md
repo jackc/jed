@@ -22,6 +22,7 @@ rewrite rules            → logical plan         (stage 2 — rewriteWhere, §3
 physical selection       → physical decisions   (stage 3 — optimizeSelect, §4)
 —— the planner ends here ——
 bind params              → values for $N
+  (custom plan)          → stages 1–3 again with the values, when the plan read one (estimator.md §6.1)
 fold uncorrelated        → subquery results as constants
 execute                  → rows                 (exec-time lane selection, §6)
 ```
@@ -40,7 +41,8 @@ Two stages that look planner-shaped deliberately are **not** in the planner:
 - **`foldUncorrelatedInPlan` is not a rewrite rule.** It *executes* uncorrelated subqueries
   once and folds their results in as constants — execution needs bound parameters, so it
   runs **after** bind, between the planner and the executor. A stage-2 rewrite rule is a
-  pure plan→plan transform that runs before binding.
+  pure plan→plan transform; it sees a parameter's value only as a custom plan's literal
+  ([estimator.md](estimator.md) §6.1), never by executing anything.
 - **Exec-time lane selection is not physical selection** (§6). The executor's dispatch
   (`execSelectEmit`) picks *how* to run the chosen plan — streaming vs. buffered vs.
   vectorized — from facts that are not plan properties: whether the meter is unmetered,
@@ -85,8 +87,10 @@ planned again as if the conjuncts had been written there.
 
 The contract every rewrite rule meets:
 
-- **Plan→plan and pure** — it transforms the logical plan before parameters are bound; it
-  never executes anything and never reads a parameter value.
+- **Plan→plan and pure** — it transforms the logical plan; it never executes anything. It reads a
+  parameter's value only as the estimator does — through the custom-plan frame
+  ([estimator.md](estimator.md) §6.1), where a bound parameter is a literal and an unbound one is a
+  literal of unknown value.
 - **Results-identical, and never a new error.** The same rows on every core. A rewrite may
   evaluate an expression on rows the unrewritten plan would not reach only when that expression is
   structurally unable to trap; it may skip evaluations the unrewritten plan performs — exactly as a
@@ -124,10 +128,13 @@ opaque conjunct). The WHERE is a **contradiction** when any of these plan-time p
    same literal comparison and text-equality restriction as rule 2.
 
 Rule 3 deliberately admits only bare columns: a column has one value per row, while a structurally
-equal expression may not (`random() > 0.9 AND random() < 0.1` can be TRUE). Parameters are never
-proven (planning is pre-bind), nor are disjunctions or non-column operands; a missed proof only
-forgoes the optimization. Contradictions over a scan key's parameters remain the runtime empty-bound
-rule of cost.md §3.
+equal expression may not (`random() > 0.9 AND random() < 0.1` can be TRUE). A bound parameter is a
+literal here, so a custom plan ([estimator.md](estimator.md) §6.1) proves `x > $1 AND x < $2` with
+contradicting values exactly as the literal query does, and a bare boolean parameter bound to
+FALSE or NULL is a FALSE/NULL conjunct; an unbound parameter is never proven. Disjunctions and
+non-column operands are never proven; a missed proof only forgoes the optimization. Contradictions
+over a scan key's parameters that a plan does not prove remain the runtime empty-bound rule of
+cost.md §3.
 
 **Cost decision.** A contradictory SELECT reads **no relation**: no base table page or row, no SRF
 generated row, no `cte_scan_row`, no derived or inlined-CTE body, and no FROM-less virtual row. Nothing

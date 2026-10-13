@@ -17,9 +17,11 @@ max_selectivity_denominator = 1000000
 # a non-empty input therefore estimates at least one row unless a structural proof yields zero.
 row_rounding = "ceiling"
 
-# Initial Path B retains the current plan-before-bind pipeline. A $N placeholder uses the same
-# generic selectivity as an unknown value of the predicate's structural class.
-parameter_strategy = "generic_before_bind"
+# Every execution takes its custom plan (estimator.md §6.1): a bound $N is a plan-time literal of
+# its resolved type at every estimator read. A placeholder with no value (a probe pass, or EXPLAIN
+# without values) uses the same generic selectivity as an unknown value of the predicate's
+# structural class. There is no switch to a generic plan after N executions.
+parameter_strategy = "custom_per_execution"
 
 # Left-deep dynamic programming is exhaustive through this many relations. Larger reorderable
 # islands use the deterministic cheapest-next fallback rather than PostgreSQL's randomized GEQO.

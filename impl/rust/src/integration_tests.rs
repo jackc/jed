@@ -73,6 +73,8 @@ mod cost_limit;
 mod create_table;
 #[path = "../tests/cte.rs"]
 mod cte;
+#[path = "../tests/custom_plans.rs"]
+mod custom_plans;
 #[path = "../tests/date.rs"]
 mod date;
 #[path = "../tests/date_clock.rs"]

@@ -82,6 +82,7 @@ mod execute;
 mod explain_exec;
 mod kernels;
 mod optimize;
+mod plan_params;
 mod plan_query;
 mod planner;
 mod srf;
@@ -6602,6 +6603,7 @@ pub(crate) struct HashJoinKey {
 /// instead of full-scanning for every outer row (index-nested-loop join, cost.md §3 "JOIN"). The
 /// `Sibling` source is the join analog of `Outer`: the same per-outer-row bound, resolved from the
 /// sibling row rather than an enclosing query's row.
+#[derive(Clone)]
 pub(crate) enum BoundSrc {
     Int(i64),
     Bool(bool),

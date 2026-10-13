@@ -191,15 +191,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `jsonb` GIN terms, pricing GIN predicates and candidates). The canonical contracts are
   [estimator.md](spec/design/estimator.md), [statistics.md](spec/design/statistics.md),
   [planner.md](spec/design/planner.md), and [explain.md](spec/design/explain.md).
-  - [ ] _follow-on:_ parameter-sensitive/custom prepared plans — designed in
-    [estimator.md §6.1](spec/design/estimator.md): a statement whose `$N` reaches a statistics, GIN
-    term, skeleton-overlap, or LIMIT site is planned with its bound values at every execution
-    (optionally memoized by exact values); every other statement keeps its single cached plan. No
-    PostgreSQL-style switch to a generic plan after five executions (history-dependent). Today
-    planning is pre-bind, so MCV/histogram/GIN term facts never reach parameterized queries.
+  - [x] **Parameter-sensitive (custom) plans** — landed in all three cores
+    ([estimator.md §6.1](spec/design/estimator.md)): every execution is planned with its bound
+    values as plan-time literals (probe, then custom only when the probe read a value), so MCV,
+    histogram, GIN term, contradiction, and `generate_series` facts reach parameterized queries.
+    A value-blind statement (key lookups) keeps its single cached plan; a sensitive one plans per
+    execution with a bounded memo of custom plans by exact binding. EXPLAIN accepts bound values. No
+    PostgreSQL-style switch to a generic plan after five executions.
+    - [ ] _follow-on:_ a `# params:` corpus directive, so the binding path itself (not only its
+      literal equivalent) is pinned cross-core — today per-core host-API tests compare each custom
+      plan with its literal query, which the corpus pins.
+    - [ ] _follow-on:_ subqueries in a top-level plain `INSERT ... VALUES` slot still plan unbound
+      (the fast path opens no boundary); custom-plan them if a workload needs it.
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
-    composite/array/json/jsonb, GIN term statistics for parameter operands and `<@`, and an element-count
+    composite/array/json/jsonb, GIN term statistics for `<@`, and an element-count
     histogram (PostgreSQL's `elem_count_histogram`) for array `=`.
   - [ ] _follow-on:_ broader physical search — costed outer/barrier shapes, bushy trees, parallel
     plan search, or adaptive runtime re-planning; each requires a bounded deterministic contract.

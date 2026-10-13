@@ -807,6 +807,8 @@ type paramTypes struct {
 	nonimmutable bool
 	indexContext bool
 	timezoneDeps timeZoneDeps
+	// frame, when set, also receives every type noted here (the EXPLAIN typing pass, plan_params.go).
+	frame *planFrame
 }
 
 // note records that $(idx0+1) appears with context type ty (nil = no context here). It unifies
@@ -816,6 +818,7 @@ func (p *paramTypes) note(idx0 int, ty *scalarType) error {
 	for idx0 >= len(p.types) {
 		p.types = append(p.types, nil)
 	}
+	p.frame.noteType(idx0, ty)
 	if ty == nil {
 		return nil
 	}
@@ -1573,7 +1576,11 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		} else {
 			rty = resolvedType{kind: rtNull}
 		}
-		return &rExpr{kind: reParam, index: idx0}, rty, nil
+		var frame *planFrame
+		if s != nil {
+			frame = s.catalog.currentPlanFrame()
+		}
+		return &rExpr{kind: reParam, index: idx0, plan: frame}, rty, nil
 	case exprColumn:
 		// Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
 		// (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).

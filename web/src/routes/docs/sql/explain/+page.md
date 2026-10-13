@@ -228,6 +228,11 @@ none of its `SET` or `RETURNING` expressions, and changes nothing.
 
 <LiveSql demo="contradiction" seed={seed} query={contradiction} rows={4} />
 
+A **bound parameter** counts as a literal here and in every estimate: each execution is planned with
+its values (its *custom plan* — see [prepared statements](/docs/api/queries)), so `zone > $1 AND zone
+< $2` bound to 5 and 3 reads no table either. Run `EXPLAIN` from your host with the values to see the
+plan they get; a `$N` still prints as `$N`. Without values, `EXPLAIN` plans the parameters as unknown.
+
 A condition on a subquery in `FROM` moves **into** the subquery when it only compares the subquery's
 plain output columns and the subquery has no `LIMIT` or `OFFSET`. The subquery is then planned as if
 you had written the condition inside it — here it becomes a primary-key lookup on `city` rather than a

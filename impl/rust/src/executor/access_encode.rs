@@ -559,10 +559,7 @@ pub(crate) fn estimator_predicate_selectivity(
             result.unwrap_or(Selectivity::Zero)
         }
         RExpr::Not(child) => estimator_predicate_selectivity(Some(child)).not(),
-        RExpr::Compare { lhs, rhs, .. }
-            if matches!(lhs.as_ref(), RExpr::ConstNull)
-                || matches!(rhs.as_ref(), RExpr::ConstNull) =>
-        {
+        RExpr::Compare { lhs, rhs, .. } if estimator_is_null(lhs) || estimator_is_null(rhs) => {
             Selectivity::Zero
         }
         RExpr::Compare { op: CmpOp::Eq, .. } => Selectivity::fraction(SELECTIVITY_EQUALITY),
@@ -714,7 +711,76 @@ pub(crate) fn estimator_literal(expr: &RExpr) -> bool {
             | RExpr::ConstArray(_)
             | RExpr::ConstRange(_)
             | RExpr::ConstNull
+            | RExpr::Param(_)
     )
+}
+
+/// A plan-time literal's constant for the estimator (estimator.md §6.1): the literal itself, or a
+/// parameter's bound value in a custom planning frame. `None` for any other expression and for a
+/// parameter whose value is unavailable — a probe frame records that read, so the statement is
+/// planned again with its values. Every read of a literal's *value* goes through here.
+pub(crate) fn estimator_value(expr: &RExpr) -> Option<EstimatorValue<'_>> {
+    match expr {
+        RExpr::Param(i) => plan_params::param_value(*i).map(EstimatorValue::Bound),
+        e if estimator_literal(e) => Some(EstimatorValue::Literal(e)),
+        _ => None,
+    }
+}
+
+/// A literal's constant as [`estimator_value`] reads it: the literal node, or a bound parameter's
+/// value as the constant a literal of its type resolves to.
+pub(crate) enum EstimatorValue<'a> {
+    Literal(&'a RExpr),
+    Bound(RExpr),
+}
+
+impl std::ops::Deref for EstimatorValue<'_> {
+    type Target = RExpr;
+    fn deref(&self) -> &RExpr {
+        match self {
+            EstimatorValue::Literal(e) => e,
+            EstimatorValue::Bound(e) => e,
+        }
+    }
+}
+
+impl AsRef<RExpr> for EstimatorValue<'_> {
+    fn as_ref(&self) -> &RExpr {
+        self
+    }
+}
+
+/// Whether a plan-time literal is NULL. An unbound parameter is assumed non-NULL (estimator.md §6.1).
+pub(crate) fn estimator_is_null(expr: &RExpr) -> bool {
+    match expr {
+        RExpr::ConstNull => true,
+        RExpr::Param(i) => plan_params::param_is_null(*i),
+        _ => false,
+    }
+}
+
+/// [`estimator_value`] for a scan-bound source of a `key_type` key: a parameter's bound value as
+/// the source a literal would have produced. Runtime sources (outer/sibling columns) have none.
+pub(crate) fn estimator_bound_value(
+    src: &BoundSrc,
+    key_type: ScalarType,
+) -> Option<Cow<'_, BoundSrc>> {
+    match src {
+        BoundSrc::Param(i) => plan_params::param_value(*i)
+            .and_then(|c| const_source(&c, key_type, None))
+            .map(Cow::Owned),
+        BoundSrc::Outer { .. } | BoundSrc::Sibling(_) => None,
+        _ => Some(Cow::Borrowed(src)),
+    }
+}
+
+/// Whether a scan-bound source is a known NULL (an unbound parameter is assumed non-NULL).
+pub(crate) fn estimator_bound_is_null(src: &BoundSrc) -> bool {
+    match src {
+        BoundSrc::Null => true,
+        BoundSrc::Param(i) => plan_params::param_is_null(*i),
+        _ => false,
+    }
 }
 
 fn estimator_equality_parts(expr: &RExpr) -> Option<(&RExpr, &RExpr)> {
@@ -772,6 +838,12 @@ pub(crate) fn estimator_comparison_parts(expr: &RExpr) -> Option<EstimatorCompar
 // Compare resolved, same-kind plan-time literals by their SQL total order. Open/unsupported
 // literal kinds return None: missing a proof is safe, inventing one is not.
 pub(crate) fn estimator_literal_cmp(a: &RExpr, b: &RExpr) -> Option<std::cmp::Ordering> {
+    let a = estimator_value(a)?;
+    let b = estimator_value(b)?;
+    estimator_const_cmp(&a, &b)
+}
+
+fn estimator_const_cmp(a: &RExpr, b: &RExpr) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (RExpr::ConstInt(x), RExpr::ConstInt(y)) => Some(x.cmp(y)),
         (RExpr::ConstBool(x), RExpr::ConstBool(y)) => Some(x.cmp(y)),
@@ -813,19 +885,24 @@ fn estimator_comparisons_contradict(
     if !rexpr_eq_shifted(a.operand, b.operand, 0) {
         return false;
     }
+    let (Some(a_value), Some(b_value)) = (estimator_value(a.literal), estimator_value(b.literal))
+    else {
+        return false;
+    };
     // Text equality is byte identity, but range order may use a derived collation unavailable to
     // this structural fold. Decline that proof rather than applying raw UTF-8 order.
-    if (matches!(a.literal, RExpr::ConstText(_)) || matches!(b.literal, RExpr::ConstText(_)))
+    if (matches!(a_value.as_ref(), RExpr::ConstText(_))
+        || matches!(b_value.as_ref(), RExpr::ConstText(_)))
         && (a.op != CmpOp::Eq || b.op != CmpOp::Eq)
     {
         return false;
     }
     if a.op == CmpOp::Eq {
-        return estimator_literal_cmp(a.literal, b.literal)
+        return estimator_const_cmp(&a_value, &b_value)
             .is_some_and(|order| !estimator_comparison_satisfied(order, b.op));
     }
     if b.op == CmpOp::Eq {
-        return estimator_literal_cmp(b.literal, a.literal)
+        return estimator_const_cmp(&b_value, &a_value)
             .is_some_and(|order| !estimator_comparison_satisfied(order, a.op));
     }
     let a_lower = matches!(a.op, CmpOp::Gt | CmpOp::Ge);
@@ -833,8 +910,12 @@ fn estimator_comparisons_contradict(
     if a_lower == b_lower {
         return false;
     }
-    let (lower, upper) = if a_lower { (a, b) } else { (b, a) };
-    estimator_literal_cmp(lower.literal, upper.literal).is_some_and(|order| {
+    let (lower, upper, lower_value, upper_value) = if a_lower {
+        (a, b, &a_value, &b_value)
+    } else {
+        (b, a, &b_value, &a_value)
+    };
+    estimator_const_cmp(lower_value, upper_value).is_some_and(|order| {
         order == Ordering::Greater
             || (order == Ordering::Equal && (lower.op == CmpOp::Gt || upper.op == CmpOp::Lt))
     })
@@ -846,7 +927,7 @@ pub(crate) fn estimator_conjunction_contradictory(conjuncts: &[&RExpr]) -> bool 
         let Some(comparison) = estimator_comparison_parts(conjunct) else {
             continue;
         };
-        if matches!(comparison.literal, RExpr::ConstNull)
+        if estimator_is_null(comparison.literal)
             || comparisons
                 .iter()
                 .any(|prior| estimator_comparisons_contradict(prior, &comparison))
@@ -875,8 +956,14 @@ fn estimator_paired_range(lhs: &RExpr, rhs: &RExpr) -> bool {
     a_lower != b_lower && rexpr_eq_shifted(a, b, 0)
 }
 
-fn estimator_bound_src_cmp(a: &BoundSrc, b: &BoundSrc) -> Option<std::cmp::Ordering> {
-    match (a, b) {
+fn estimator_bound_src_cmp(
+    a: &BoundSrc,
+    b: &BoundSrc,
+    key_type: ScalarType,
+) -> Option<std::cmp::Ordering> {
+    let a = estimator_bound_value(a, key_type)?;
+    let b = estimator_bound_value(b, key_type)?;
+    match (a.as_ref(), b.as_ref()) {
         (BoundSrc::Int(x), BoundSrc::Int(y)) => Some(x.cmp(y)),
         (BoundSrc::Bool(x), BoundSrc::Bool(y)) => Some(x.cmp(y)),
         (BoundSrc::Uuid(x), BoundSrc::Uuid(y)) => Some(x.cmp(y)),
@@ -890,20 +977,18 @@ fn estimator_bound_src_cmp(a: &BoundSrc, b: &BoundSrc) -> Option<std::cmp::Order
     }
 }
 
-fn estimator_bound_terms_contradict(a: &BoundTerm, b: &BoundTerm) -> bool {
+fn estimator_bound_terms_contradict(a: &BoundTerm, b: &BoundTerm, key_type: ScalarType) -> bool {
     use std::cmp::Ordering;
     // Text range order may be collated; equality remains byte identity.
-    if (matches!(a.src, BoundSrc::Text(_)) || matches!(b.src, BoundSrc::Text(_)))
-        && (a.op != CmpOp::Eq || b.op != CmpOp::Eq)
-    {
+    if key_type.is_text() && (a.op != CmpOp::Eq || b.op != CmpOp::Eq) {
         return false;
     }
     if a.op == CmpOp::Eq {
-        return estimator_bound_src_cmp(&a.src, &b.src)
+        return estimator_bound_src_cmp(&a.src, &b.src, key_type)
             .is_some_and(|order| !estimator_comparison_satisfied(order, b.op));
     }
     if b.op == CmpOp::Eq {
-        return estimator_bound_src_cmp(&b.src, &a.src)
+        return estimator_bound_src_cmp(&b.src, &a.src, key_type)
             .is_some_and(|order| !estimator_comparison_satisfied(order, a.op));
     }
     let a_lower = matches!(a.op, CmpOp::Gt | CmpOp::Ge);
@@ -912,7 +997,7 @@ fn estimator_bound_terms_contradict(a: &BoundTerm, b: &BoundTerm) -> bool {
         return false;
     }
     let (lower, upper) = if a_lower { (a, b) } else { (b, a) };
-    estimator_bound_src_cmp(&lower.src, &upper.src).is_some_and(|order| {
+    estimator_bound_src_cmp(&lower.src, &upper.src, key_type).is_some_and(|order| {
         order == Ordering::Greater
             || (order == Ordering::Equal && (lower.op == CmpOp::Gt || upper.op == CmpOp::Lt))
     })
@@ -920,10 +1005,10 @@ fn estimator_bound_terms_contradict(a: &BoundTerm, b: &BoundTerm) -> bool {
 
 fn estimator_equality_sources_impossible(sources: &[BoundSrc], key_type: ScalarType) -> bool {
     sources.iter().enumerate().any(|(i, source)| {
-        matches!(source, BoundSrc::Null)
+        estimator_bound_is_null(source)
             || matches!(source, BoundSrc::Int(value) if key_type.is_integer() && !key_type.in_range(*value))
             || sources[..i].iter().any(|prior| {
-                estimator_bound_src_cmp(prior, source)
+                estimator_bound_src_cmp(prior, source, key_type)
                     .is_some_and(|order| order != std::cmp::Ordering::Equal)
             })
     })
@@ -938,14 +1023,14 @@ fn estimator_range_terms(
     if terms.is_empty() {
         return Selectivity::All;
     }
-    if terms.iter().any(|term| matches!(&term.src, BoundSrc::Null)) {
+    if terms.iter().any(|term| estimator_bound_is_null(&term.src)) {
         return Selectivity::Zero;
     }
     if terms.iter().enumerate().any(|(i, term)| {
         matches!(&term.src, BoundSrc::Int(value) if term.op == CmpOp::Eq && key_type.is_integer() && !key_type.in_range(*value))
             || terms[..i]
                 .iter()
-                .any(|prior| estimator_bound_terms_contradict(prior, term))
+                .any(|prior| estimator_bound_terms_contradict(prior, term, key_type))
     }) {
         return Selectivity::Zero;
     }

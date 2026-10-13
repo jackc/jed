@@ -299,13 +299,14 @@ unlisted term one row, like the MCV rule above.
 ## 6. Selectivity rules
 
 Facts apply only when the resolved operand is a bare column of the owning base relation and the
-literal is plan-time known/coercible to that exact column type. Otherwise §7's structural fallback
-remains authoritative.
+literal is plan-time known/coercible to that exact column type. A bound parameter is plan-time known
+in its execution's custom plan ([estimator.md §6.1](estimator.md)). Otherwise §7's structural
+fallback remains authoritative.
 
 - `IS NULL` / `IS NOT NULL`: `current_null` and its complement.
 - Literal equality: a matching MCV's scaled rows; otherwise divide non-MCV non-NULL rows by
   `max(1, current_ndv - mcv_count)`. A fresh complete MCV may prove zero; stale/sample facts do not.
-- Generic parameter equality: `ceil(current_nonnull / max(1, current_ndv))`; it is statistics-aware
+- Unbound parameter equality: `ceil(current_nonnull / max(1, current_ndv))`; it is statistics-aware
   but never bucket/value-aware.
 - `<>`, NOT, and NOT IN complements subtract from `current_nonnull`, not `N`, preserving SQL 3VL.
 - `IN`: de-duplicate known literals canonically, fold equality estimates in authored order, and cap
@@ -351,8 +352,9 @@ only its GIN candidate uses the terms (below). Then:
 The predicate's logical selectivity is `rows / N`. A GIN candidate over the same column uses `rows`
 as its scan rows, `entries` as its `gin_entry` estimate, and
 `clamp(scale_ceil(index_nodes, entries / total_entries), index_height, index_nodes)` index pages
-(zero when `entries` is zero), in place of the access-method default. A parameter or sibling-column
-operand keeps the structural `matching` default.
+(zero when `entries` is zero), in place of the access-method default. An unbound parameter or a sibling-column
+operand keeps the structural `matching` default; a bound parameter is a literal in its custom plan
+([estimator.md §6.1](estimator.md)).
 
 An equality join between two bare distribution-eligible columns with facts on both sides uses:
 

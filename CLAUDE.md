@@ -1145,7 +1145,12 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   heuristics, never safety gates; the actual runtime counter remains authoritative for ceilings.
   P2's prepared-plan cache now validates an exact relation-scoped signature over the owning
   database/attachment identity, catalog generation, table name, and transactional estimator revision,
-  so a hit cannot preserve a plan selected from stale estimator inputs.
+  so a hit cannot preserve a plan selected from stale estimator inputs. Every execution takes its
+  custom plan (`spec/design/estimator.md` §6.1): bound `$N` values are plan-time literals at every
+  estimator and contradiction read, so statistics reach parameterized queries exactly as literal ones.
+  A probe pass classifies a statement value-blind (one cached plan — key lookups) or
+  parameter-sensitive (planned per execution, memoized by exact binding); there is no
+  PostgreSQL-style switch to a generic plan after N executions (a history-dependent plan).
   P3 now inventories every legal base-relation access path in the canonical kind/name order, with
   explicit scan-order and residual-filter facts, then applies a separate legacy selector at the
   staged boundaries that have not yet moved to cost selection.

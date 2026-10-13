@@ -66,9 +66,15 @@ impl Engine {
     /// (4) EXECUTE the plan against an empty outer-row environment. Correlated subqueries that
     /// survive the fold are re-executed per outer row by the evaluator (grammar.md §26).
     pub(crate) fn run_query_expr(&self, qe: QueryExpr, params: &[Value]) -> Result<SelectResult> {
+        let mut planning = plan_params::begin();
         let mut ptypes = ParamTypes::default();
         let mut plan = self.plan_query(&qe, None, &[], &mut ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        // A plan that read a parameter's value is planned again with the bound values: the custom
+        // plan (estimator.md §6.1).
+        if planning.bind(&bound) {
+            plan = self.plan_query(&qe, None, &[], &mut ParamTypes::default())?;
+        }
         let mut subquery_cost: i64 = 0;
         self.fold_uncorrelated_in_plan(&mut plan, &bound, CteCtx::empty(), &mut subquery_cost)?;
         let mut r = self.exec_query_plan(&plan, &[], &bound, CteCtx::empty())?;
@@ -416,21 +422,29 @@ impl Engine {
     /// EXECUTE the main body with the CTE context. Cost composes like set operations — a sum of the
     /// parts.
     pub(crate) fn run_with(&self, wq: WithQuery, params: &[Value]) -> Result<SelectResult> {
-        let mut ptypes = ParamTypes::default();
-        let bindings = self.plan_cte_bindings(
-            &wq.ctes,
-            wq.recursive,
-            &[],
-            None,
-            &mut ptypes,
-            CtePrimary::Body(&wq.body),
-        )?;
-        // (2) Plan the main body with all bindings visible (the pure-query path always has a query
-        //     primary — a data-modifying primary routes to execute_with_dml).
         let body_q = wq.body.as_query().expect("run_with is the pure-query path");
-        let visible: Vec<&CteBinding> = bindings.iter().collect();
-        let mut plan = self.plan_query(body_q, None, &visible, &mut ptypes)?;
+        let plan_all = |ptypes: &mut ParamTypes| -> Result<(Vec<CteBinding>, QueryPlan)> {
+            let bindings = self.plan_cte_bindings(
+                &wq.ctes,
+                wq.recursive,
+                &[],
+                None,
+                ptypes,
+                CtePrimary::Body(&wq.body),
+            )?;
+            // (2) Plan the main body with all bindings visible (the pure-query path always has a
+            //     query primary — a data-modifying primary routes to execute_with_dml).
+            let visible: Vec<&CteBinding> = bindings.iter().collect();
+            let plan = self.plan_query(body_q, None, &visible, ptypes)?;
+            Ok((bindings, plan))
+        };
+        let mut planning = plan_params::begin();
+        let mut ptypes = ParamTypes::default();
+        let (mut bindings, mut plan) = plan_all(&mut ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        if planning.bind(&bound) {
+            (bindings, plan) = plan_all(&mut ParamTypes::default())?;
+        }
         let modes = cte_modes(&bindings);
         let (buffers, total_cost) =
             self.materialize_ctes(&bindings, &modes, &bound, CteCtx::empty(), &[])?;
@@ -686,6 +700,10 @@ impl Engine {
     /// primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
     /// primary — every read against the pin, every write into the transaction's `working`.
     pub(crate) fn run_with_dml(&mut self, wq: WithQuery, params: &[Value]) -> Result<Outcome> {
+        // Every part is planned before the values are bound; a probe that read one restarts the
+        // statement with the values visible (estimator.md §6.1).
+        let mut planning = plan_params::begin();
+        let retry = planning.probing().then(|| wq.clone());
         let WithQuery {
             ctes,
             body,
@@ -731,6 +749,11 @@ impl Engine {
             }
         }
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
+        if planning.bind(&bound) {
+            let retry = retry.expect("a probing boundary keeps its statement");
+            drop(bindings);
+            return plan_params::restart(&bound, || self.run_with_dml(retry, params));
+        }
         let modes = cte_modes(&bindings);
 
         // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its

@@ -1784,6 +1784,118 @@ setup_sql = [
   "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
 ]
 
+# Parameter-sensitive ("custom") plans (spec/design/estimator.md §6.1): the gin_stats pair above with
+# the tag bound as a parameter, over an integer-array copy of the table ('0' in every row's tags,
+# '1 + g % 1000' in 100 rows each). Before custom plans a bound tag took the generic GIN default
+# (1/100), so the common tag read every posting entry plus a point fetch per row; with its value
+# visible it full-scans, as the literal query does. The rare tag gathers its posting list either way
+# on this table, so it measures what planning each execution with its value costs.
+[[bench]]
+name = "custom_plan_gin_common_tag"
+description = "Custom plan: count rows whose tags contain the bound tag 0 (every row) — a full scan once the value reaches the GIN term facts"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM tstats_int WHERE tags @> ARRAY[$1]"
+warmup = 5
+iterations = 50
+seed = 4298
+setup_sql = [
+  "DROP TABLE IF EXISTS tstats_int",
+  "CREATE TABLE tstats_int (id bigint PRIMARY KEY, tags bigint[], n bigint)",
+  "INSERT INTO tstats_int SELECT g, ARRAY[0, 1 + g % 1000], g % 10 FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tstats_int_tags_gin ON tstats_int USING gin (tags)",
+  "CREATE INDEX tstats_int_n ON tstats_int (n)",
+  "ANALYZE tstats_int"
+]
+
+[bench.sql_override]
+postgres = "SELECT count(*) FROM tstats_int WHERE tags @> ARRAY[$1::bigint]"
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 0
+
+[[bench]]
+name = "custom_plan_gin_rare_tag"
+description = "Custom plan: rows whose tags contain a bound rare tag (100 rows) and n = 7 (10,000 rows) — the GIN bound, planned with each execution's value"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM tstats_int WHERE tags @> ARRAY[$1] AND n = 7 ORDER BY id"
+warmup = 20
+iterations = 200
+seed = 4299
+setup_sql = [
+  "DROP TABLE IF EXISTS tstats_int",
+  "CREATE TABLE tstats_int (id bigint PRIMARY KEY, tags bigint[], n bigint)",
+  "INSERT INTO tstats_int SELECT g, ARRAY[0, 1 + g % 1000], g % 10 FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tstats_int_tags_gin ON tstats_int USING gin (tags)",
+  "CREATE INDEX tstats_int_n ON tstats_int (n)",
+  "ANALYZE tstats_int"
+]
+
+[bench.sql_override]
+postgres = "SELECT id FROM tstats_int WHERE tags @> ARRAY[$1::bigint] AND n = 7 ORDER BY id"
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000
+
+# The B-tree analogue (estimator.md §6.1, statistics.md §6): k is 0 in nine rows of ten (an MCV) and
+# unique otherwise, behind an ordered index. The common value is a full scan by its MCV; before custom
+# plans the bound value took the NDV average (~10 rows) and walked the index for all 90,000. The rare
+# values keep the index plan either way, so that benchmark measures what planning each execution with
+# its value costs a parameter-sensitive statement whose bindings rarely repeat.
+[[bench]]
+name = "custom_plan_mcv_common"
+description = "Custom plan: count rows whose k is the bound MCV 0 (90% of rows) — a full scan once the value reaches the MCV list"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM tskew WHERE k = $1"
+warmup = 5
+iterations = 50
+seed = 4300
+setup_sql = [
+  "DROP TABLE IF EXISTS tskew",
+  "CREATE TABLE tskew (id bigint PRIMARY KEY, k bigint, pad bigint)",
+  "INSERT INTO tskew SELECT g, CASE WHEN g % 10 = 0 THEN g / 10 ELSE 0 END, g * 7 FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tskew_k ON tskew (k)",
+  "ANALYZE tskew"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 0
+
+[[bench]]
+name = "custom_plan_mcv_rare"
+description = "Custom plan: the row whose k is a bound rare value (1 row) — the index plan, planned with each execution's value"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id, pad FROM tskew WHERE k = $1"
+warmup = 500
+iterations = 5000
+seed = 4301
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS tskew",
+  "CREATE TABLE tskew (id bigint PRIMARY KEY, k bigint, pad bigint)",
+  "INSERT INTO tskew SELECT g, CASE WHEN g % 10 = 0 THEN g / 10 ELSE 0 END, g * 7 FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX tskew_k ON tskew (k)",
+  "ANALYZE tskew"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 10000
+
 # GIN jsonb_ops (spec/design/gin.md §2.1; query.gin_jsonb_ops). A 100k-row scratch table of small
 # documents behind a jsonb GIN index: `n` takes 1000 values (100 rows each) and the `tag<g % 97>`
 # key 97 values (~1031 rows each). `doc @> {"n": $1}` gathers the posting list of one number term

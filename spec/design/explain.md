@@ -32,7 +32,10 @@ query (`SELECT`, `VALUES`, a set operation, or `WITH`, including a data-modifyin
   is DML, but checks the inner statement's privileges.
 - `ANALYZE` executes the inner statement. It is a write when the inner statement is a write, and a
   successful autocommit invocation commits that mutation.
-- Bind values are not accepted by plain EXPLAIN; unresolved `$N` sources render symbolically.
+- Bind values are accepted by plain EXPLAIN and EXPLAIN ANALYZE alike: the inner statement is then
+  planned with them — its custom plan ([estimator.md](estimator.md) §6.1), so estimates and the
+  selected access path reflect the values. A `$N` source always renders symbolically. Without
+  values a `$N` is planned unbound (its generic estimate), and ANALYZE then fails to bind.
 
 ## 2. Output shape
 

@@ -364,7 +364,7 @@ func predicateSelectivity(expr *rExpr) selectivityExpr {
 	case reNot:
 		return predicateSelectivity(expr.operand).Not()
 	case reCompare:
-		if expr.lhs.kind == reConstNull || expr.rhs.kind == reConstNull {
+		if estimatorIsNull(expr.lhs) || estimatorIsNull(expr.rhs) {
 			return selectivityExpr{kind: selectivityZero}
 		}
 		switch expr.op {
@@ -496,11 +496,40 @@ func estimatorLiteral(expr *rExpr) bool {
 	case reConstInt, reConstBool, reConstText, reConstDecimal, reConstBytea, reConstUuid,
 		reConstTimestamp, reConstTimestamptz, reConstDate, reConstInterval, reConstFloat32,
 		reConstFloat64, reConstJson, reConstJsonb, reConstJsonPath, reConstNull, reConstArray,
-		reConstRange:
+		reConstRange, reParam:
 		return true
 	default:
 		return false
 	}
+}
+
+// estimatorValue is a plan-time literal's constant for the estimator (estimator.md §6.1): the
+// literal itself, or a parameter's bound value in a custom planning frame. nil for any other
+// expression and for a parameter whose value is unavailable — a probe frame records that read, so
+// the statement is planned again with its values. Every read of a literal's VALUE goes through here.
+func estimatorValue(expr *rExpr) *rExpr {
+	if expr == nil {
+		return nil
+	}
+	if expr.kind == reParam {
+		return expr.plan.value(expr.index)
+	}
+	if estimatorLiteral(expr) {
+		return expr
+	}
+	return nil
+}
+
+// estimatorIsNull reports whether a plan-time literal is NULL. An unbound parameter is assumed
+// non-NULL (estimator.md §6.1).
+func estimatorIsNull(expr *rExpr) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.kind == reParam {
+		return expr.plan.isNull(expr.index)
+	}
+	return expr.kind == reConstNull
 }
 
 func estimatorEqualityParts(expr *rExpr) (*rExpr, *rExpr, bool) {
@@ -538,7 +567,13 @@ func estimatorComparisonParts(expr *rExpr) (estimatorComparison, bool) {
 // estimatorLiteralCmp compares resolved, same-kind plan-time literals by the SQL comparison order.
 // Unsupported/open literal kinds return false: a missed proof is a safe estimate, a false proof is not.
 func estimatorLiteralCmp(a, b *rExpr) (int, bool) {
-	if a == nil || b == nil || a.kind != b.kind {
+	if a = estimatorValue(a); a == nil {
+		return 0, false
+	}
+	if b = estimatorValue(b); b == nil {
+		return 0, false
+	}
+	if a.kind != b.kind {
 		return 0, false
 	}
 	cmpInt := func(x, y int64) int {
@@ -601,6 +636,10 @@ func estimatorComparisonsContradict(a, b estimatorComparison) bool {
 }
 
 func estimatorBoundsContradict(aOp binaryOp, aLiteral *rExpr, bOp binaryOp, bLiteral *rExpr) bool {
+	aLiteral, bLiteral = estimatorValue(aLiteral), estimatorValue(bLiteral)
+	if aLiteral == nil || bLiteral == nil {
+		return false
+	}
 	// Text equality is byte identity, but range order may use a derived collation unavailable here.
 	if (aLiteral.kind == reConstText || bLiteral.kind == reConstText) && (aOp != opEq || bOp != opEq) {
 		return false
@@ -634,7 +673,7 @@ func estimatorConjunctionContradictory(conjuncts []*rExpr) bool {
 	comparisons := make([]estimatorComparison, 0, len(conjuncts))
 	for _, conjunct := range conjuncts {
 		if comparison, ok := estimatorComparisonParts(conjunct); ok {
-			if comparison.literal.kind == reConstNull {
+			if estimatorIsNull(comparison.literal) {
 				return true
 			}
 			for _, prior := range comparisons {
@@ -664,7 +703,7 @@ func pairedRangeConjunction(lhs, rhs *rExpr) bool {
 
 func estimatorEqualitySourcesImpossible(sources []*rExpr, keyType scalarType) bool {
 	for i, source := range sources {
-		if source.kind == reConstNull || (source.kind == reConstInt && keyType.IsInteger() && !keyType.InRange(source.cInt)) {
+		if estimatorIsNull(source) || (source.kind == reConstInt && keyType.IsInteger() && !keyType.InRange(source.cInt)) {
 			return true
 		}
 		for _, prior := range sources[:i] {
@@ -682,7 +721,7 @@ func rangeTermsSelectivity(terms []boundTerm, keyType scalarType) selectivityExp
 	}
 	hasLower, hasUpper := false, false
 	for i, term := range terms {
-		if term.src.kind == reConstNull {
+		if estimatorIsNull(term.src) {
 			return selectivityExpr{kind: selectivityZero}
 		}
 		if term.op == opEq && term.src.kind == reConstInt && keyType.IsInteger() && !keyType.InRange(term.src.cInt) {
@@ -1438,14 +1477,19 @@ func (db *engine) estimateHashWidth(sp *selectPlan, global int, ty dataType) int
 }
 
 func estimateGenerateSeriesRows(srf *srfPlan) int64 {
-	if srf.kind != srfGenerateSeries || len(srf.args) < 2 || len(srf.args) > 3 ||
-		srf.args[0].kind != reConstInt || srf.args[1].kind != reConstInt ||
-		(len(srf.args) == 3 && srf.args[2].kind != reConstInt) {
+	if srf.kind != srfGenerateSeries || len(srf.args) < 2 || len(srf.args) > 3 {
 		return defaultSRFRows
 	}
-	start, stop, step := srf.args[0].cInt, srf.args[1].cInt, int64(1)
-	if len(srf.args) == 3 {
-		step = srf.args[2].cInt
+	// A bound parameter is a plan-time literal (estimator.md §6.1); an unbound one keeps the default.
+	args := make([]*rExpr, len(srf.args))
+	for i, arg := range srf.args {
+		if args[i] = estimatorValue(arg); args[i] == nil || args[i].kind != reConstInt {
+			return defaultSRFRows
+		}
+	}
+	start, stop, step := args[0].cInt, args[1].cInt, int64(1)
+	if len(args) == 3 {
+		step = args[2].cInt
 	}
 	if step == 0 || (step > 0 && start > stop) || (step < 0 && start < stop) {
 		return 0
@@ -2219,7 +2263,7 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 		}
 		var source estimatedPlan
 		if ins.Query != nil {
-			plan, err := db.planQuery(*ins.Query, nil, bindings, &paramTypes{})
+			plan, err := db.planQuery(*ins.Query, nil, bindings, db.newParamTypes())
 			if err != nil {
 				return nil, err
 			}

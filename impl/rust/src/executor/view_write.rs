@@ -220,7 +220,7 @@ impl Engine {
     /// The view a DML target names, if any: a table (temp first for a bare name) shadows nothing,
     /// because tables and views share one namespace; only bare and `main.` names reach a view. A
     /// view behind an attachment qualifier is 0A000 (views.md §10).
-    fn dml_target_view(&self, db: Option<&str>, name: &str) -> Result<Option<ViewDef>> {
+    pub(crate) fn dml_target_view(&self, db: Option<&str>, name: &str) -> Result<Option<ViewDef>> {
         self.reject_attached_view(db, name)?;
         let snap = match db {
             None => {
