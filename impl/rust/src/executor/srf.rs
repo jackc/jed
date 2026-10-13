@@ -1162,6 +1162,10 @@ impl Engine {
                 average_width,
                 Value::Int(statistics.mcv.len() as i64),
                 Value::Int(statistics.histogram.len() as i64),
+                statistics
+                    .terms
+                    .as_ref()
+                    .map_or(Value::Null, |terms| Value::Int(terms.entries.len() as i64)),
             ]);
         }
         Ok(out)

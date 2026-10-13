@@ -5,6 +5,7 @@ use crate::estimator_constants::{
     SELECTIVITY_INEQUALITY, SELECTIVITY_PAIRED_RANGE, STATISTICS_HISTOGRAM_BOUNDS,
     STATISTICS_KMV_HASHES, STATISTICS_MAX_VALUE_BYTES, STATISTICS_MCV_ENTRIES,
     STATISTICS_NDV_SCALE_DENOMINATOR, STATISTICS_NDV_SCALE_NUMERATOR, STATISTICS_SAMPLE_ROWS,
+    STATISTICS_TERM_BUCKET_WIDTH, STATISTICS_TERM_ENTRIES,
 };
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -32,6 +33,87 @@ pub(crate) struct ColumnStatistics {
     pub(crate) sample_nonnull_rows: u32,
     pub(crate) mcv: Vec<StatisticsMcv>,
     pub(crate) histogram: Vec<StatisticsValue>,
+    /// GIN term facts, present exactly for a term-eligible column (statistics.md §4.5).
+    pub(crate) terms: Option<TermStatistics>,
+}
+
+/// A term-eligible column's GIN term facts (statistics.md §4.5): the saturated count of term
+/// occurrences, the row-count estimate for an unlisted term (0 = the list is complete), and the
+/// most common terms with their row counts, in descending count then ascending byte order.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TermStatistics {
+    pub(crate) occurrences: i64,
+    pub(crate) untracked_rows: i64,
+    pub(crate) entries: Vec<(Vec<u8>, i64)>,
+}
+
+/// Does this column type have a GIN operator class (statistics.md §4.5)? `jsonb`, or an array whose
+/// element type a GIN index admits.
+pub(crate) fn term_eligible(ty: &Type) -> bool {
+    ty.is_jsonb()
+        || ty
+            .array_element()
+            .is_some_and(|elem| is_gin_element_type(&elem))
+}
+
+/// PostgreSQL's lossy counting over GIN term occurrences (statistics.md §4.5), bucket width
+/// `STATISTICS_TERM_BUCKET_WIDTH`. Removal is a per-entry predicate, so the map's iteration order
+/// never reaches the result.
+#[derive(Default)]
+struct TermCounter {
+    occurrences: i64,
+    entries: HashMap<Vec<u8>, (i64, i64)>,
+    pruned: bool,
+    oversized: bool,
+}
+
+impl TermCounter {
+    fn add(&mut self, term: &[u8]) {
+        self.occurrences = self.occurrences.saturating_add(1);
+        let bucket =
+            (self.occurrences + STATISTICS_TERM_BUCKET_WIDTH - 1) / STATISTICS_TERM_BUCKET_WIDTH;
+        if term.len() > STATISTICS_MAX_VALUE_BYTES {
+            self.oversized = true;
+        } else if let Some(entry) = self.entries.get_mut(term) {
+            entry.0 += 1;
+        } else {
+            self.entries.insert(term.to_vec(), (1, bucket - 1));
+        }
+        if self.occurrences % STATISTICS_TERM_BUCKET_WIDTH == 0 {
+            let before = self.entries.len();
+            self.entries
+                .retain(|_, (count, delta)| *count + *delta > bucket);
+            self.pruned |= self.entries.len() != before;
+        }
+    }
+
+    fn finish(self) -> TermStatistics {
+        let mut ranked: Vec<(Vec<u8>, i64)> = self
+            .entries
+            .into_iter()
+            .map(|(term, (count, _))| (term, count))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut untracked = 0i64;
+        if let Some((_, count)) = ranked.get(STATISTICS_TERM_ENTRIES) {
+            untracked = untracked.max(*count);
+        }
+        if self.pruned {
+            untracked = untracked.max(
+                self.occurrences / STATISTICS_TERM_BUCKET_WIDTH
+                    + i64::from(self.occurrences % STATISTICS_TERM_BUCKET_WIDTH != 0),
+            );
+        }
+        if self.oversized {
+            untracked = untracked.max(1);
+        }
+        ranked.truncate(STATISTICS_TERM_ENTRIES);
+        TermStatistics {
+            occurrences: self.occurrences,
+            untracked_rows: untracked,
+            entries: ranked,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -223,7 +305,7 @@ fn statistics_fraction(rows: i64, population: i64) -> crate::estimator::Selectiv
     }
 }
 
-fn statistics_scale(n: i64, numerator: i64, denominator: i64) -> i64 {
+pub(crate) fn statistics_scale(n: i64, numerator: i64, denominator: i64) -> i64 {
     if n <= 0 || numerator <= 0 || denominator <= 0 {
         0
     } else {
@@ -305,6 +387,136 @@ pub(crate) fn current_column_statistics(
             .collect(),
         complete_mcv,
     })
+}
+
+/// A GIN-served predicate's estimate from term statistics (statistics.md §6.1): the rows it admits,
+/// the posting-list entries a GIN gather reads, and the estimated total entries in the index.
+pub(crate) struct GinTermEstimate {
+    pub(crate) rows: i64,
+    pub(crate) entries: i64,
+    pub(crate) total_entries: i64,
+}
+
+/// Price a GIN predicate over the local `column` with a literal `operand` from the column's term
+/// facts (statistics.md §6.1). `None` — the structural default applies — when the column has no
+/// term facts, the operand is not a plan-time literal, or the query falls back to a full scan.
+pub(crate) fn statistics_gin_estimate(
+    rel: &ScopeRel<'_>,
+    column: usize,
+    opclass: GinOpclass,
+    strategy: GinStrategy,
+    operand: &RExpr,
+    catalog: &Engine,
+) -> Option<GinTermEstimate> {
+    let fact = catalog.column_statistics_scoped(rel.db.as_deref(), &rel.table.name, column)?;
+    let term_facts = fact.terms.as_ref()?;
+    let value = statistics_gin_operand_value(operand)?;
+    let current = current_column_statistics(rel, column, catalog)?;
+    let n = current.rows;
+    let total_entries = statistics_scale(n, term_facts.occurrences, fact.analyzed_rows);
+    let terms = match gin_query_terms(opclass, strategy, &value) {
+        GinQuery::Empty => {
+            return Some(GinTermEstimate {
+                rows: 0,
+                entries: 0,
+                total_entries,
+            });
+        }
+        GinQuery::FullScan => return None,
+        GinQuery::Terms(terms) => terms,
+    };
+    let term_rows = |term: &[u8]| -> i64 {
+        if current.nonnull_rows == 0 {
+            return 0;
+        }
+        if let Some((_, count)) = term_facts.entries.iter().find(|(t, _)| t == term) {
+            return statistics_scale(n, *count, fact.analyzed_rows).min(current.nonnull_rows);
+        }
+        if term_facts.untracked_rows == 0 && !fact.stale {
+            return 0;
+        }
+        let half = term_facts.untracked_rows / 2 + term_facts.untracked_rows % 2;
+        statistics_scale(n, half, fact.analyzed_rows)
+            .min(current.nonnull_rows)
+            .max(1)
+    };
+    let mut priced: Vec<(i64, Vec<u8>)> = terms
+        .into_iter()
+        .map(|term| (term_rows(term.as_slice()), term))
+        .collect();
+    priced.sort();
+    let (rows, entries) = if strategy.is_any() {
+        let sum = priced
+            .iter()
+            .fold(0i64, |acc, (rows, _)| acc.saturating_add(*rows));
+        (sum.min(current.nonnull_rows), sum)
+    } else {
+        let mut iter = priced.iter();
+        let first = iter.next().map_or(0, |(rows, _)| *rows);
+        let mut rows = first;
+        let mut entries = first;
+        for (term_rows, _) in iter {
+            entries = entries.saturating_add(rows);
+            rows = statistics_scale(rows, *term_rows, n);
+        }
+        (rows, entries)
+    };
+    Some(GinTermEstimate {
+        rows,
+        entries,
+        total_entries,
+    })
+}
+
+/// A GIN query operand's plan-time value (statistics.md §6.1): a literal, a folded array literal, or
+/// a one-dimensional `ARRAY[...]` of literals.
+fn statistics_gin_operand_value(operand: &RExpr) -> Option<Value> {
+    match operand {
+        RExpr::ConstArray(array) => Some(Value::Array((**array).clone())),
+        RExpr::Array {
+            elems,
+            nested: false,
+        } => elems
+            .iter()
+            .map(|elem| rexpr_const_to_value(elem).ok())
+            .collect::<Option<Vec<_>>>()
+            .map(|values| Value::Array(ArrayVal::one_dim(values))),
+        other => rexpr_const_to_value(other).ok(),
+    }
+}
+
+/// The logical selectivity of a GIN-served leaf from term statistics (statistics.md §6.1). Array
+/// `=` keeps its structural equality estimate as a logical leaf.
+fn statistics_gin_leaf_selectivity(
+    expr: &RExpr,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> Option<crate::estimator::Selectivity> {
+    if !matches!(
+        expr,
+        RExpr::ArrayFunc { .. }
+            | RExpr::Quantified { .. }
+            | RExpr::JsonContains { .. }
+            | RExpr::JsonHasKey { .. }
+    ) {
+        return None;
+    }
+    for (column, declared) in rel.table.columns.iter().enumerate() {
+        if !term_eligible(&declared.ty) {
+            continue;
+        }
+        let opclass = GinOpclass::for_type(&declared.ty)?;
+        let Some((strategy, operand)) = gin_match(expr, rel.offset + column, opclass) else {
+            continue;
+        };
+        if strategy == GinStrategy::Equal {
+            return None;
+        }
+        let estimate = statistics_gin_estimate(rel, column, opclass, strategy, operand, catalog)?;
+        let current = current_column_statistics(rel, column, catalog)?;
+        return Some(statistics_fraction(estimate.rows, current.rows));
+    }
+    None
 }
 
 fn statistics_column(expr: &RExpr, rel: &ScopeRel<'_>) -> Option<usize> {
@@ -635,6 +847,9 @@ pub(crate) fn statistics_leaf_selectivity(
     rel: &ScopeRel<'_>,
     catalog: &Engine,
 ) -> Option<crate::estimator::Selectivity> {
+    if let Some(selectivity) = statistics_gin_leaf_selectivity(expr, rel, catalog) {
+        return Some(selectivity);
+    }
     if let RExpr::IsNull { operand, negated } = expr {
         let column = statistics_column(operand, rel)?;
         let current = current_column_statistics(rel, column, catalog)?;
@@ -1023,6 +1238,10 @@ impl Engine {
         for &column in &columns {
             meter.charge(COSTS.page_read * store.node_count() as i64);
             let eligible = distribution_eligible(&table.columns[column].ty);
+            let term_opclass = term_eligible(&table.columns[column].ty)
+                .then(|| GinOpclass::for_type(&table.columns[column].ty))
+                .flatten();
+            let mut term_counter = TermCounter::default();
             let mut scan = store.store_scan(KeyBound::unbounded(), false);
             let mut sample = BinaryHeap::new();
             let mut kmv = BinaryHeap::new();
@@ -1079,6 +1298,15 @@ impl Engine {
                 if let Some(key) = &key {
                     retain_kmv(&mut kmv, &mut kmv_seen, fnv1a64(key));
                 }
+                if let Some(opclass) = term_opclass {
+                    for term in gin_value_terms(opclass, value) {
+                        meter.charge(
+                            COSTS.statistics_value
+                                * i64::try_from(term.len().max(1)).unwrap_or(i64::MAX),
+                        );
+                        term_counter.add(&term);
+                    }
+                }
                 let oversized = body_len > STATISTICS_MAX_VALUE_BYTES
                     || key
                         .as_ref()
@@ -1126,6 +1354,7 @@ impl Engine {
                     sample_nonnull_rows,
                     mcv,
                     histogram,
+                    terms: term_opclass.map(|_| term_counter.finish()),
                 },
             ));
         }

@@ -1066,6 +1066,9 @@ func (db *engine) estimateScanCandidates(candidates []scanCandidate, rel scopeRe
 		} else if candidate.identity.kind == scanCandidateGist {
 			accessWork = accessPages
 		}
+		if estimate, ok := db.ginCandidateTermEstimate(candidate.bound, candidate.residual, rel); ok {
+			scanRows, accessWork, accessPages = estimate.rows, estimate.entries, estimate.pages
+		}
 		out = append(out, estimateCandidate(candidateEstimateInputs{
 			kind: kind, indexName: candidate.identity.indexName, scanRows: scanRows,
 			outputRows: outputRows, accessPages: accessPages, tableHeight: tableHeight,
@@ -1073,6 +1076,36 @@ func (db *engine) estimateScanCandidates(candidates []scanCandidate, rel scopeRe
 		}))
 	}
 	return out
+}
+
+// ginCandidateTermOverride is a GIN candidate's scan rows, gin_entry work, and index pages from its
+// column's term statistics (statistics.md §6.1).
+type ginCandidateTermOverride struct {
+	rows, entries, pages int64
+}
+
+// ginCandidateTermEstimate prices a GIN candidate from its column's term statistics, or ok=false when
+// the access-method default applies.
+func (db *engine) ginCandidateTermEstimate(bound *scanBound, residual *rExpr, rel scopeRel) (ginCandidateTermOverride, bool) {
+	if bound == nil || bound.gin == nil || residual == nil {
+		return ginCandidateTermOverride{}, false
+	}
+	gb := bound.gin
+	strategy, operand, ok := ginMatch(residual, gb.colGlobal, gb.jsonb)
+	if !ok || strategy != gb.strategy || gb.colGlobal < rel.offset {
+		return ginCandidateTermOverride{}, false
+	}
+	estimate := db.statisticsGinEstimate(rel, gb.colGlobal-rel.offset, gb.opclass(), strategy, operand)
+	if estimate == nil {
+		return ginCandidateTermOverride{}, false
+	}
+	index := db.lkpIndexStoreScoped(rel.db, gb.nameKey)
+	if index == nil {
+		return ginCandidateTermOverride{}, false
+	}
+	nodes, height := int64(index.NodeCount()), int64(index.Height())
+	pages := clampEstimatedPages(statisticsScale(nodes, estimate.entries, max64(1, estimate.totalEntries)), nodes, height)
+	return ginCandidateTermOverride{rows: estimate.rows, entries: estimate.entries, pages: pages}, true
 }
 
 // --- P5 whole-plan propagation ---------------------------------------------------------------
@@ -1319,6 +1352,17 @@ func estimateExpressionOwner(sp *selectPlan, expr *rExpr) (int, int) {
 		return estimateExpressionOwner(sp, expr.operand)
 	case reInValues:
 		return estimateExpressionOwner(sp, expr.lhs)
+	// The GIN-served shapes, which GIN term statistics price (statistics.md §6.1).
+	case reArrayFunc:
+		if len(expr.sargs) == 2 {
+			a, as := estimateExpressionOwner(sp, expr.sargs[0])
+			b, bs := estimateExpressionOwner(sp, expr.sargs[1])
+			return merge(a, as, b, bs)
+		}
+	case reQuantified, reJsonContains, reJsonHasKey:
+		a, as := estimateExpressionOwner(sp, expr.lhs)
+		b, bs := estimateExpressionOwner(sp, expr.rhs)
+		return merge(a, as, b, bs)
 	}
 	return 0, 0
 }

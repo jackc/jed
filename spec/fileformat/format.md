@@ -17,7 +17,14 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 41)
+## Version scope (`format_version` 42)
+
+`format_version` **42** — **GIN term statistics** ([../design/statistics.md §4.5/§7](../design/statistics.md)).
+A column-statistics summary gains flag bit2 `term_eligible`; a term-eligible summary appends
+`term_occurrences`, `untracked_term_rows`, and `term_count`, and is followed by `stats_kind = 3` term
+entries (*Column-statistics entries* below). A file whose statistics cover no array or `jsonb` column
+changes only by its version byte + meta CRC; the new `statistics_terms_table` golden pins the term
+records. Readers accept only the exact current version.
 
 `format_version` **41** — **range-typed composite fields** ([../design/composite.md §3](../design/composite.md)).
 A composite-type entry's field may now carry `field_type_code = 17` (a range), followed by the
@@ -582,7 +589,7 @@ Two slots for torn-write-safe publication, with dirty-page validation since v33
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`35`** |
+| 4  | 2 | `format_version` (u16) — current = **`42`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -870,7 +877,7 @@ stats_kind, item_ordinal)`. Every entry begins:
 | field | encoding |
 |---|---|
 | `entry_kind` | u8 = `4` |
-| `stats_kind` | u8: `0` summary, `1` MCV, `2` histogram; other values `XX001` |
+| `stats_kind` | u8: `0` summary, `1` MCV, `2` histogram, `3` GIN term (v42); other values `XX001` |
 | `table_name_len` | u16 |
 | `table_name` | UTF-8 table name; must name a table entry exactly |
 | `column_ordinal` | u16; must be `< col_count` |
@@ -879,7 +886,7 @@ A **summary** (`stats_kind = 0`) continues:
 
 | field | encoding |
 |---|---|
-| `stats_flags` | u8: bit0 `stale`, bit1 `distribution_eligible`; bits 2–7 zero |
+| `stats_flags` | u8: bit0 `stale`, bit1 `distribution_eligible`, bit2 `term_eligible` (v42: the column has a GIN operator class — `jsonb` or a GIN-admitted array); bits 3–7 zero |
 | `analyzed_rows` | non-negative i64 |
 | `null_count` | non-negative i64, `<= analyzed_rows` |
 | `width_sum` | non-negative i64 (saturated collection sum) |
@@ -888,6 +895,9 @@ A **summary** (`stats_kind = 0`) continues:
 | `sample_nonnull_rows` | u32, `<= sample_rows` |
 | `mcv_count` | u16, `<= 100` |
 | `histogram_count` | u16, `<= 101`; zero or `>= 2` |
+| `term_occurrences` | **only when bit2 is set** (v42): non-negative i64, the saturated sum of the analyzed rows' GIN term-set sizes |
+| `untracked_term_rows` | **only when bit2 is set**: non-negative i64, `<= analyzed_rows - null_count`; zero means the term list is complete |
+| `term_count` | **only when bit2 is set**: u16, `<= 100` |
 
 An **MCV item** (`stats_kind = 1`) continues:
 
@@ -906,12 +916,23 @@ A **histogram item** (`stats_kind = 2`) continues:
 | `value_len` | u16 in `1..128` |
 | `value` | the same ordinary non-NULL single-value codec form as MCV |
 
+A **GIN term item** (`stats_kind = 3`, v42; only under a summary with bit2 set) continues:
+
+| field | encoding |
+|---|---|
+| `item_ordinal` | u16, contiguous `0...term_count-1` |
+| `row_count` | i64 in `1..=analyzed_rows - null_count` |
+| `term_len` | u16 in `1..128` |
+| `term` | the term's exact GIN bytes ([../design/gin.md §4](../design/gin.md)), `term_len` bytes |
+
 The loader first registers ordinary tables/types, then resolves statistics. A summary is unique per
 column and its declared item counts must exactly match following entries. Every value must decode
 fully under the resolved column type, remain non-NULL, re-encode to the same bytes, and regenerate a
 comparison key no longer than 128 bytes. Distribution-ineligible summaries have no MCV/histogram
 items. MCV values are distinct and ordered by descending frequency then comparison key; histogram
-bounds are nondecreasing. Bad flags/counts/order/references/types/bytes are `XX001`.
+bounds are nondecreasing. Terms are distinct and ordered by descending `row_count` then ascending
+bytes; a summary's bit2 must equal the column's term eligibility, and a term-ineligible summary has
+no term items. Bad flags/counts/order/references/types/bytes are `XX001`.
 
 ### View entry (`entry_kind = 5`, v38; `check_option` v39)
 
@@ -1687,6 +1708,7 @@ the interior-node format and the split contract.
 | `gin_jsonb_table.jed` | **GIN over a `jsonb` column** (no version bump — the opclass follows from the column type) — a `USING gin` index taking `jsonb_ops` ([../design/gin.md §2.1/§4.1](../design/gin.md)): a flag-byte + terminated-body term per object key and string array element (KEY, `0x01`) and per other scalar (`0x02` null, `0x03` boolean, `0x04` number by value — `1.5` and `1.50` one entry, `0x05` member string value), deduplicated per row; `{}` and a SQL NULL have no entry. The over-128-byte cut form cannot fit this page size and is pinned by [../encoding/gin_jsonb_terms.toml](../encoding/gin_jsonb_terms.toml) |
 | `gin_text_table.jed` | **GIN over text elements** (no version bump — the text key is already on disk) — a `USING gin` index over a `text[]` column: each term is the element's `C` text key (`text-terminated-escape` over its UTF-8, [../design/encoding.md §2.4](../design/encoding.md); [../design/gin.md §4.2](../design/gin.md)), never a collation sort key; a duplicate element is one entry, the empty string is a term, NULL elements and empty/NULL arrays have none. The over-128-byte cut form cannot fit this page size and is pinned cross-core by `query/gin_text_elements.test` costs |
 | `gin_decimal_bytea_table.jed` | **GIN over decimal and bytea elements** (no version bump — both keys are already on disk) — `USING gin` indexes over a `decimal[]` and a `bytea[]` column: a decimal term is the element's value-based `decimal-order-preserving` key ([../design/encoding.md §2.5](../design/encoding.md)), so `1.5` and `1.50` of one row are ONE entry while the stored values keep their scales, and `0.00` is the zero term `04`; a bytea term is its `bytea-terminated-escape` key ([../design/encoding.md §2.6](../design/encoding.md)) — an embedded `0x00` escaped, the empty value a term, a duplicate one entry ([../design/gin.md §4.3](../design/gin.md)). NULL elements and empty/NULL arrays have none. The over-128-byte cut forms cannot fit this page size and are pinned cross-core by the `query/gin_decimal_elements.test` and `query/gin_bytea_elements.test` costs |
+| `statistics_terms_table.jed` | **GIN term statistics** (v42) — a table with an `i32[]` column and a `jsonb` column analyzed after small inserts: each summary carries bit2 and its term facts; the array's complete list (`untracked_term_rows = 0`) holds a term shared by two rows ahead of single-row terms, and the `jsonb` list holds key and value terms ([../design/statistics.md §4.5](../design/statistics.md)). An `i32` column beside them has no term facts |
 | `view_table.jed` | **views** (v38) — a table `t(a, b)` with two rows and three views: `v` = `SELECT * FROM t WHERE a > 0` (its stored text shows the frozen `"t" . "a" , "t" . "b"` expansion; dependency on `t` columns `a`, `b`), `w (x) AS SELECT a FROM v` (a column-list rename, a view dependency with no column list), and `n AS SELECT count(*) AS c FROM t` (a table dependency with zero columns); entries emitted after the table entry in name order `n`, `v`, `w` ([../design/views.md](../design/views.md)) |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
 | `hostfunc_check_table.jed` | **host-function check dependencies** (v35) — `t_a_check` with `check_flags` 0 beside `t_a_check1`, which calls the host function `geo_hash(i64) -> i64` (component `com.example/geo_hash`, semantic version 1) and so carries flags 1 + the dependency list (empty table) |

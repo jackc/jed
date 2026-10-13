@@ -239,7 +239,9 @@ access-method false-positive statistics, and inventing a second reduction would 
 predicate's output cardinality depend on its physical path. This separation is deliberate.
 
 The initial access-method classifications are canonical data in `estimator.toml`: scalar GiST `=`
-uses `equality`; range GiST and every GIN strategy use `matching`. Ordered/PK bounds derive their
+uses `equality`; range GiST and every GIN strategy use `matching` — unless the column has GIN term
+facts and a literal query operand, when [statistics.md §6.1](statistics.md) supplies the GIN
+candidate's rows, `gin_entry`, and pages. Ordered/PK bounds derive their
 program from their equality prefix, optional trailing range, and interval disjunction. Unsupported
 access predicates use `opaque`.
 
@@ -311,7 +313,8 @@ weight; the owning base unit still counts the operation. Runtime metering remain
 - `storage_row_read` equals the candidate rows fetched from table storage, before residual filter.
 - Overflow-chain `page_read` and `value_decompress` are zero until persisted size statistics exist;
   planning never scans leaves to discover them.
-- GIN `gin_entry` defaults to the estimated candidate/posting rows; GiST `gist_descent` uses the
+- GIN `gin_entry` defaults to the estimated candidate/posting rows (term facts refine it to the
+  skip-scan's expected entry reads, [statistics.md §6.1](statistics.md)); GiST `gist_descent` uses the
   admitted resident structural descent count where available, otherwise the estimated non-leaf
   pages of its bound. Both retain their ordinary table-fetch and residual costs.
 - Interval sets sum disjoint interval page estimates in canonical interval order with saturation.

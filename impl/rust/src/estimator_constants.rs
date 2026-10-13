@@ -20,6 +20,8 @@ pub const STATISTICS_HISTOGRAM_BOUNDS: usize = 101;
 pub const STATISTICS_MAX_VALUE_BYTES: usize = 128;
 pub const STATISTICS_NDV_SCALE_NUMERATOR: i64 = 1;
 pub const STATISTICS_NDV_SCALE_DENOMINATOR: i64 = 10;
+pub const STATISTICS_TERM_ENTRIES: usize = 100;
+pub const STATISTICS_TERM_BUCKET_WIDTH: i64 = 10000;
 
 pub const SELECTIVITY_EQUALITY: EstimatorFraction = EstimatorFraction {
     numerator: 1,

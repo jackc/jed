@@ -277,11 +277,7 @@ impl Engine {
             Some(q) => q.eval(query_row, env, &mut env.exec.session.scratch_meter())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
-        let terms = match gb.opclass {
-            GinOpclass::Array(elem) => array_query_terms(gb.strategy, elem, &qv),
-            GinOpclass::Jsonb => jsonb_query_terms(gb.strategy, &qv),
-        };
-        let terms = match terms {
+        let terms = match gin_query_terms(gb.opclass, gb.strategy, &qv) {
             GinQuery::Empty => return Ok((Vec::new(), (0, 0))),
             // Rows the index cannot enumerate (they carry no terms) may match: scan them all and let
             // the residual filter keep the right ones (gin.md §6 / §2.1).
@@ -574,10 +570,19 @@ impl GinGather {
 /// The outcome of a GIN opclass's `extract_query_terms` (gin.md §2/§6): the distinct query terms to
 /// gather (sorted), a provably-empty bound, or the full-scan fallback for a query whose matches the
 /// index cannot enumerate.
-enum GinQuery {
+pub(crate) enum GinQuery {
     Terms(Vec<Vec<u8>>),
     Empty,
     FullScan,
+}
+
+/// A GIN query value's terms under its operator class and strategy — what the gather reads, and
+/// what the planner prices from GIN term statistics (statistics.md §6.1).
+pub(crate) fn gin_query_terms(opclass: GinOpclass, strategy: GinStrategy, qv: &Value) -> GinQuery {
+    match opclass {
+        GinOpclass::Array(elem) => array_query_terms(strategy, elem, qv),
+        GinOpclass::Jsonb => jsonb_query_terms(strategy, qv),
+    }
 }
 
 /// `array_ops` query terms (gin.md §2/§6). Each term is the element's order-preserving key encoding

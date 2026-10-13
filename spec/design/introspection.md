@@ -414,11 +414,13 @@ jed_statistics(
   sample_rows      i64 NOT NULL,
   average_width    i64,
   mcv_count        i32 NOT NULL,
-  histogram_count  i32 NOT NULL
+  histogram_count  i32 NOT NULL,
+  term_count       i32
 )
 ```
 
-`distinct_count` is NULL for a distribution-ineligible type; `average_width` is NULL when the
+`distinct_count` is NULL for a distribution-ineligible type; `term_count` (the GIN term-list
+length, [statistics.md §4.5](statistics.md)) is NULL for a column with no GIN operator class; `average_width` is NULL when the
 analyzed population had no non-NULL value. Counts describe the stored analyzed fact, not a
 row-count-rescaled current estimate. `is_stale` becomes true after later DML and remains visible
 until explicit ANALYZE replaces the column fact ([statistics.md](statistics.md)). Rows generate by

@@ -3,7 +3,7 @@
 > Deterministic, transactional, persisted column-distribution facts collected through SQL and
 > consumed by the cross-core physical-plan contract in [estimator.md](estimator.md). Mechanical
 > limits live in [../cost/estimator.toml](../cost/estimator.toml); runtime collection cost lives in
-> [../cost/schedule.toml](../cost/schedule.toml); the v29 bytes live in
+> [../cost/schedule.toml](../cost/schedule.toml); the v29 bytes (and the v42 GIN term facts) live in
 > [../fileformat/format.md](../fileformat/format.md).
 
 ## 1. Surface and PostgreSQL relationship
@@ -52,6 +52,10 @@ ColumnStatistics {
     sample_nonnull_rows non-negative u32, <= sample_rows
     mcv                 <= 100 (value, sample_frequency) entries
     histogram           <= 101 non-NULL bound values
+    terms               present only for a term-eligible column (§4.5):
+        term_occurrences    saturated non-negative i64
+        untracked_term_rows non-negative i64
+        entries             <= 100 (term bytes, row_count) entries
 }
 ```
 
@@ -98,10 +102,15 @@ The canonical constants are:
 | histogram bounds | 101 |
 | maximum retained value body and comparison key | 128 bytes each |
 | proportional-NDV threshold | strictly greater than `1/10` of analyzed non-NULL rows |
+| most-common GIN terms | 100 |
+| term lossy-counting bucket width | 10,000 term occurrences |
+| maximum retained term | 128 bytes (the retained-value limit) |
 
 These are spec data, not handle settings. In particular `work_mem` cannot change persisted facts or
 selected plans. Collection processes columns sequentially, so resident collection memory is bounded
-by one column's fixed sample/KMV limits independent of table width.
+by one column's fixed sample/KMV limits independent of table width, plus the term counter of §4.5,
+whose size the lossy-counting bound limits to `O(w · log(L / w))` entries for `L` term occurrences
+and bucket width `w`.
 
 ## 4. Deterministic collection
 
@@ -125,6 +134,9 @@ For each row:
    `(priority, storage_ordinal)` pairs. `storage_ordinal` is the zero-based position in this scan and
    breaks hash collisions. A retained non-NULL value carries its ordinary value bytes and comparison
    key only when both are at most 128 bytes; otherwise it is an `oversized` sample marker.
+
+4. if the column is term-eligible (§4.5), extract the row's GIN term set and feed it to the term
+   counter, charging `statistics_value × max(1, term_bytes)` per term. A NULL row has no terms.
 
 The bounded sample is therefore a pure function of the table's storage-key/value set, not scan
 timing, host randomness, map order, or the entropy seam. If the table has at most 30,000 rows, it is
@@ -193,6 +205,50 @@ bound(i) = remaining[rank(i)]
 Duplicate adjacent bounds are retained: they carry sampled mass and make step-CDF estimates reflect
 minor duplicates that were not MCVs. All arithmetic is integer.
 
+### 4.5 GIN term frequencies
+
+A column is **term-eligible** when it has a GIN operator class ([gin.md §3](gin.md)): a `jsonb`
+column (`jsonb_ops`), or an array whose element type a GIN index admits (`array_ops`). Eligibility
+follows the column type alone; an index need not exist, because the facts also refine the logical
+estimate of the predicates the operator class serves (§6). This is PostgreSQL's
+`most_common_elems` (collected for every array column by `array_typanalyze.c`) generalized to every
+GIN term, including `jsonb_ops`' key and value terms, which PostgreSQL does not collect.
+
+A row's **term set** is exactly the set its GIN entries carry ([gin.md §4](gin.md)): the distinct
+element terms of an array, or the distinct `jsonb_ops` terms of a document, as byte strings in
+ascending order. An empty array, `{}`, `[]`, and a NULL value have none. Term bytes never depend
+on a collation, so a collation change never affects these facts. Let `L` be the total number of
+term occurrences — the sum of the rows' term-set sizes over the whole table, saturated at i64.
+`term_occurrences` stores `L`; it estimates the GIN index's entry count.
+
+Counting is PostgreSQL's lossy counting (Manku–Motwani) over the **full population** in the scan
+order of §4 — rows in ascending storage-key order, each row's terms in ascending byte order —
+with bucket width `w = 10,000`. Number the occurrences `1, 2, …`; occurrence `p` lies in bucket
+`b = ceil(p / w)`. Keep a table `term → (count, delta)`:
+
+1. A term longer than 128 bytes is **oversized**: it advances `p` but is not tracked.
+2. Otherwise, if the term is present, `count += 1`; else insert it with `(1, b - 1)`.
+3. After occurrence `p` with `p mod w = 0`, remove every entry with `count + delta <= p / w`. If
+   any entry was ever removed, the counter is **pruned**.
+
+Removal is a per-entry predicate, so the result is independent of the table's iteration order.
+At the end, order the entries by descending `count`, then ascending term bytes; the first 100 are
+the persisted **term list**, each with `row_count = count` (a lower bound on the rows containing
+the term, short by at most `delta`). Then
+
+```text
+untracked_term_rows = max(
+    count of the 101st entry, if there is one,
+    ceil(L / w), if the counter was pruned,
+    1, if any term was oversized
+)   (0 when none applies)
+```
+
+estimates the row count of any term not on the list: a term removed from the table had a count of
+at most `ceil(L / w)` when it was last removed, and a term past the 100th is counted no higher than
+the 101st entry. `untracked_term_rows = 0` means the list is **complete**: every term in the table
+is on it with its exact row count.
+
 ## 5. Applying fresh or stale facts
 
 Let `N` be the current exact table row count. If `analyzed_rows == 0`, distribution fractions are
@@ -226,6 +282,20 @@ stale or sampled list uses at least one row for a positive residual population.
 Average width is `ceil(width_sum / analyzed_nonnull_rows)` and does not row-count-scale. It replaces
 `default_variable_key_bytes` where the estimator prices variable-width hash keys.
 
+GIN term facts scale the same way, against `analyzed_rows` (a NULL row contains no term):
+
+```text
+term_rows(t)  = min(scale_ceil(N, row_count(t) / analyzed_rows), current_nonnull)  for a listed t
+term_rows(t)  = 0                                       for an unlisted t, complete fresh list
+term_rows(t)  = max(1, min(scale_ceil(N, ceil(untracked_term_rows / 2) / analyzed_rows),
+                           current_nonnull))            for any other unlisted t
+total_entries = scale_ceil(N, term_occurrences / analyzed_rows)
+```
+
+Half the untracked bound is PostgreSQL's `minfreq / 2` default for an element missing from
+`most_common_elems`. Only a fresh complete list proves a term absent; a stale complete list gives an
+unlisted term one row, like the MCV rule above.
+
 ## 6. Selectivity rules
 
 Facts apply only when the resolved operand is a bare column of the owning base relation and the
@@ -253,6 +323,37 @@ AND still folds source order; OR remains the deterministic disjoint-union upper 
 replace individual leaf estimates and exact NULL complements but do not introduce multi-column
 correlation or OR-overlap models.
 
+### 6.1 GIN predicates
+
+A GIN-served predicate over a bare term-eligible column with facts — the conjunct shapes a GIN
+index accelerates ([gin.md §1/§2.1](gin.md): `col @> Q`, `col && Q`, `c = ANY(col)`, `col ? k`,
+`col ?| K`, `col ?& K`, and `jsonb` `col @> Q` / `Q <@ col`) — whose query operand is a plan-time
+literal extracts the query's terms exactly as the gather would ([gin.md §6](gin.md)), including the
+element-type conversion of `c`. Array `=` keeps the structural equality estimate as a logical leaf;
+only its GIN candidate uses the terms (below). Then:
+
+- **Provably empty** (a NULL operand, an unmatchable element, `?|` with no non-NULL key): zero rows.
+- **Full-scan fallback** (`@> '{}'`, `?&` with no non-NULL key): no term estimate; §7 of
+  [estimator.md](estimator.md) applies.
+- **ALL** (`@>`, `= ANY`, `?`, `?&`, and array `=`'s candidate): order the distinct terms by
+  ascending `term_rows`, then ascending bytes. With `r1` the first, fold the rest under independence:
+
+  ```text
+  rows = r1;  entries = r1
+  for each later term t:  entries += rows;  rows = scale_ceil(rows, term_rows(t) / N)
+  ```
+
+  `entries` models the skip-scan ([gin.md §6.2](gin.md)): the rarest posting list is read whole,
+  and each later term is probed at no more than the surviving candidates.
+- **ANY** (`&&`, `?|`): `rows = min(current_nonnull, Σ term_rows)` and `entries = Σ term_rows`, both
+  saturating — the disjoint-union upper bound of §7.1 of [estimator.md](estimator.md).
+
+The predicate's logical selectivity is `rows / N`. A GIN candidate over the same column uses `rows`
+as its scan rows, `entries` as its `gin_entry` estimate, and
+`clamp(scale_ceil(index_nodes, entries / total_entries), index_height, index_nodes)` index pages
+(zero when `entries` is zero), in place of the access-method default. A parameter or sibling-column
+operand keeps the structural `matching` default.
+
 An equality join between two bare distribution-eligible columns with facts on both sides uses:
 
 ```text
@@ -263,7 +364,7 @@ with saturation. MCV-to-MCV join skew is deferred. GROUP BY/DISTINCT over bare c
 product of each column's `current_ndv + (current_null > 0 ? 1 : 0)`, capped by input rows; any other
 expression keeps `default_distinct_values`. Multi-column dependency statistics are deferred.
 
-## 7. Persistence — format version 29
+## 7. Persistence — format version 29 (GIN terms: v42)
 
 Persistent statistics are ordinary kind-tagged catalog entries after the table-entry group. A
 single catalog entry must still fit one page. `entry_kind = 4` has a `stats_kind` subtag:
@@ -271,14 +372,21 @@ single catalog entry must still fit one page. `entry_kind = 4` has a `stats_kind
 - `0` summary: table name, column ordinal, flags (`stale`, distribution eligibility), analyzed/null/
   width/NDV counts, sample counts, and declared MCV/histogram entry counts;
 - `1` MCV: table name, column ordinal, MCV ordinal, sample frequency, and one typed non-NULL value;
-- `2` histogram: table name, column ordinal, bound ordinal, and one typed non-NULL value.
+- `2` histogram: table name, column ordinal, bound ordinal, and one typed non-NULL value;
+- `3` term (v42): table name, column ordinal, term ordinal, row count, and the term's bytes.
+
+Since v42 a summary's flags carry a `term_eligible` bit, and a term-eligible summary also records
+`term_occurrences`, `untracked_term_rows`, and its declared term count. Term bytes are at most 128,
+so a term entry fits the minimum page as an MCV entry does.
 
 The 128-byte retained-value limit plus 63-byte identifier limit guarantees each value entry fits the
 minimum 256-byte page payload. Entries sort by `(table name bytes, column ordinal, stats_kind,
 ordinal)`. On load, summaries must be unique; referenced tables/ordinals must exist; counts and
 ordinals must be exact/contiguous; MCV values must be distinct and in canonical frequency/key order;
 histogram bounds must be nondecreasing; every value must decode under the column type and satisfy
-the size/type gates. Any violation is `XX001`.
+the size/type gates; terms must be distinct, nonempty, at most 128 bytes, and in descending
+row-count / ascending byte order, with each row count in `1..=analyzed_rows - null_count`; the
+`term_eligible` bit must equal the column's eligibility. Any violation is `XX001`.
 
 Files without statistics still move to v29 by the exact-version clean break (version bytes/meta
 CRC). No new page type, meta root, value codec, table B+tree, or planning-time leaf read is added.
@@ -298,9 +406,13 @@ jed_statistics(
     sample_rows      i64 NOT NULL,
     average_width    i64,
     mcv_count        i32 NOT NULL,
-    histogram_count  i32 NOT NULL
+    histogram_count  i32 NOT NULL,
+    term_count       i32
 )
 ```
+
+`term_count` is the persisted term-list length for a term-eligible column (§4.5) and NULL
+otherwise.
 
 One row exists per collected column, ordered internally by table name (byte order) then column ordinal.
 It charges one `generated_row` at the source, no page/storage row units, is independently SELECT-
@@ -315,7 +427,8 @@ relations. Typed MCV/histogram arrays stay internal in the current surface.
 - Per-core tests: exact collection/KMV/MCV/histogram vectors, prepared-cache fresh-vs-hit parity,
   corruption rejection, host privilege/read-only classification, and statement rollback under a
   cost ceiling.
-- File format: v29 golden isolating fresh and stale stats plus cross-core/Ruby byte identity.
+- File format: v29 golden isolating fresh and stale stats plus cross-core/Ruby byte identity; a v42
+  golden pinning array and `jsonb` term facts, including a truncated list.
 - Benchmarks: uniform and skewed distributions before/after ANALYZE with identical checksums.
 
 PostgreSQL is the SQL-result/surface oracle for the supported command form. The deterministic sample,

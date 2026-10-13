@@ -96,6 +96,23 @@ fn estimate_expression_owner(
             estimate_expression_owner(sp, child)
         }
         RExpr::InValues { lhs, .. } => estimate_expression_owner(sp, lhs),
+        // The GIN-served shapes, which GIN term statistics price (statistics.md §6.1).
+        RExpr::ArrayFunc { args, .. } if args.len() == 2 => merge_expression_owner(
+            estimate_expression_owner(sp, &args[0]),
+            estimate_expression_owner(sp, &args[1]),
+        ),
+        RExpr::Quantified { lhs, array, .. } => merge_expression_owner(
+            estimate_expression_owner(sp, lhs),
+            estimate_expression_owner(sp, array),
+        ),
+        RExpr::JsonContains { a, b } => merge_expression_owner(
+            estimate_expression_owner(sp, a),
+            estimate_expression_owner(sp, b),
+        ),
+        RExpr::JsonHasKey { base, arg, .. } => merge_expression_owner(
+            estimate_expression_owner(sp, base),
+            estimate_expression_owner(sp, arg),
+        ),
         _ => Ok(None),
     }
 }

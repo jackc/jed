@@ -1281,6 +1281,11 @@ work and guard, so a ceiling aborts at the same value/byte boundary in every cor
 rollback discards partially collected facts. Sampling/sorting is fixed at at most 30,000 rows, so it
 is absolutely bounded and adds no second variable unit.
 
+A term-eligible column — an array with a GIN element type, or `jsonb` ([statistics.md §4.5](statistics.md))
+— then charges `statistics_value × max(1, term_bytes)` for each term of the row's GIN term set, in
+ascending term order, before counting it. Term extraction is proportional to the value, so this
+bounds the counting work the same way.
+
 For an inline `i32` one-column table with `N` rows and `P` B+tree nodes, `ANALYZE t` costs
 `P page_read + N storage_row_read + 4N statistics_value`; it emits no result rows and therefore no
 `row_produced`. An ineligible NULL value still costs one `statistics_value`.

@@ -495,16 +495,50 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 	if err != nil {
 		return nil, err
 	}
-	if columns[ci].Type.IsJsonb() {
+	opclass, ok := ginOpclassFor(columns[ci].Type)
+	if !ok {
+		panic("a GIN index column has an operator class (CREATE INDEX / ALTER gate)")
+	}
+	return ginEntriesFromTerms(ginValueTerms(opclass, v), storageKey), nil
+}
+
+// ginOpclass is a GIN column's operator class (gin.md §2/§2.1): jsonb_ops for a jsonb column, else
+// array_ops over the array's element type elem.
+type ginOpclass struct {
+	jsonb bool
+	elem  scalarType
+}
+
+// ginOpclassFor is the GIN operator class of a column type, or ok=false when it has none: jsonb, or
+// an array whose element type a GIN index admits.
+func ginOpclassFor(ty dataType) (ginOpclass, bool) {
+	if ty.IsJsonb() {
+		return ginOpclass{jsonb: true}, true
+	}
+	if ty.Array == nil {
+		return ginOpclass{}, false
+	}
+	elem, ok := ty.Array.AsScalar()
+	if !ok || !isGinElementType(elem) {
+		return ginOpclass{}, false
+	}
+	return ginOpclass{elem: elem}, true
+}
+
+// ginValueTerms is one resident value's GIN term set (gin.md §4): its distinct terms in ascending
+// byte order — an array's non-NULL element terms, or a jsonb document's jsonb_ops terms. A NULL value
+// has none. The entries of a GIN index and ANALYZE's term counts (statistics.md §4.5) share this one
+// extraction.
+func ginValueTerms(opclass ginOpclass, v Value) [][]byte {
+	if opclass.jsonb {
 		if v.Kind != ValJsonb {
-			return nil, nil
+			return nil
 		}
-		return ginEntriesFromTerms(ginJsonbIndexTerms(v.jsonb()), storageKey), nil
+		return ginJsonbIndexTerms(v.jsonb())
 	}
 	if v.Kind != ValArray {
-		return nil, nil
+		return nil
 	}
-	elemTy := columns[ci].Type.Array.ScalarTy()
 	// Dedup by the encoded term (the key is canonical under SQL =: a float -0/+0 or two NaNs, or
 	// span-equal intervals like 1 mon/30 days, share one key — so byte-dedup == =-dedup, and
 	// byte-sort == value-sort) generically over every admitted element type.
@@ -514,14 +548,14 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 		if el.Kind == ValNull {
 			continue // a NULL element carries no term; a non-keyable element is impossible under the gate
 		}
-		t := ginElementTerm(elemTy, el)
+		t := ginElementTerm(opclass.elem, el)
 		if !seen[string(t)] {
 			seen[string(t)] = true
 			terms = append(terms, t)
 		}
 	}
 	slices.SortFunc(terms, bytes.Compare)
-	return ginEntriesFromTerms(terms, storageKey), nil
+	return terms
 }
 
 // ginElementTerm is the array_ops term of one non-NULL element (gin.md §4): the element type's

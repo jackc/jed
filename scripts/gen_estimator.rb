@@ -64,6 +64,8 @@ def rust_file(data, units)
     pub const STATISTICS_MAX_VALUE_BYTES: usize = #{data.fetch('statistics_max_value_bytes')};
     pub const STATISTICS_NDV_SCALE_NUMERATOR: i64 = #{data.fetch('statistics_ndv_scale_numerator')};
     pub const STATISTICS_NDV_SCALE_DENOMINATOR: i64 = #{data.fetch('statistics_ndv_scale_denominator')};
+    pub const STATISTICS_TERM_ENTRIES: usize = #{data.fetch('statistics_term_entries')};
+    pub const STATISTICS_TERM_BUCKET_WIDTH: i64 = #{data.fetch('statistics_term_bucket_width')};
 
     #{fractions}
 
@@ -123,6 +125,8 @@ def go_file(data, units)
     \tstatisticsMaxValueBytes       = #{data.fetch('statistics_max_value_bytes')}
     \tstatisticsNDVScaleNumerator   = #{data.fetch('statistics_ndv_scale_numerator')}
     \tstatisticsNDVScaleDenominator = #{data.fetch('statistics_ndv_scale_denominator')}
+    \tstatisticsTermEntries         = #{data.fetch('statistics_term_entries')}
+    \tstatisticsTermBucketWidth     = #{data.fetch('statistics_term_bucket_width')}
     )
 
     #{fractions}
@@ -181,6 +185,8 @@ def ts_file(data, units)
     export const STATISTICS_MAX_VALUE_BYTES = #{data.fetch('statistics_max_value_bytes')};
     export const STATISTICS_NDV_SCALE_NUMERATOR = #{data.fetch('statistics_ndv_scale_numerator')}n;
     export const STATISTICS_NDV_SCALE_DENOMINATOR = #{data.fetch('statistics_ndv_scale_denominator')}n;
+    export const STATISTICS_TERM_ENTRIES = #{data.fetch('statistics_term_entries')};
+    export const STATISTICS_TERM_BUCKET_WIDTH = #{data.fetch('statistics_term_bucket_width')};
 
     #{fractions}
 

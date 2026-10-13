@@ -393,6 +393,10 @@ id = "maintenance.analyze"
 description = "Explicit deterministic column-statistics collection through `ANALYZE table [(columns)]` (spec/design/statistics.md): a transactional write that scans each requested column in storage-key order, replaces only those snapshot facts, retains facts as stale after later DML, and feeds the shared integer estimator. It requires target SELECT plus the appropriate DDL capability; database-wide/multi-target/automatic analyze and configurable targets are deferred."
 
 [[capability]]
+id = "maintenance.analyze_gin_terms"
+description = "GIN term statistics (spec/design/statistics.md §4.5/§6.1): ANALYZE of an array column with a GIN-admitted element type or a jsonb column counts each row's GIN terms by deterministic lossy counting over the full population (bucket width 10,000) and persists the 100 most common with their row counts, the total term occurrences, and an untracked-term bound (format v42, stats_kind 3; jed_statistics.term_count). A GIN-served predicate with a plan-time literal operand (@>, &&, = ANY, ?, ?|, ?&, jsonb @>) then takes its logical rows, and a GIN candidate its scan rows, gin_entry reads, and index pages, from those facts: ALL folds terms rarest-first under independence, ANY sums them, and an unlisted term gets half the untracked bound (zero for a fresh complete list). Builds on maintenance.analyze, ddl.gin_index, and query.gin_jsonb_ops"
+
+[[capability]]
 id = "introspect.statistics"
 description = "The read-only qualified `jed_statistics` computed relation (spec/design/statistics.md §8): one generated row per collected table column exposing analyzed population, stale state, NULL/NDV/sample/width summaries, and MCV/histogram counts without exposing typed bucket values."
 

@@ -1172,7 +1172,10 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   stale, with fixed low-cardinality or proportional high-cardinality NDV scaling against current
   exact row counts. Planning remains leaf-I/O-free. The facts refine literal/parameter selectivity,
   equality joins, simple GROUP BY/DISTINCT, and variable-width hash work, are cache-safe and
-  cross-core identical, and are summarized by `jed_statistics`. See
+  cross-core identical, and are summarized by `jed_statistics`. An array column with a GIN element
+  type and a `jsonb` column also get GIN term facts (format v42): deterministic lossy counting of every
+  row's GIN terms keeps the 100 most common with row counts, which price GIN-served predicates with
+  literal operands and the GIN candidate's scan rows, entry reads, and pages. See
   `spec/design/statistics.md`; automatic analyze and extended/correlation statistics remain deferred.
   Stage-2 rewrites now precede physical selection (`spec/design/planner.md` §3): a SELECT, UPDATE, or
   DELETE WHERE whose literals contradict on a bare column (or a literal FALSE/NULL conjunct) reads no

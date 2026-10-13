@@ -56,6 +56,26 @@ produce the same facts, estimates, plan, and execution cost in Rust, Go, and Typ
 Distribution statistics cover canonically ordered scalar and range columns. Composite, array,
 `json`, and `jsonb` columns still receive NULL and width facts, but no distinct/MCV/histogram facts.
 
+## GIN term statistics
+
+An array column whose elements a GIN index accepts, and a `jsonb` column, get a different kind of
+fact: the 100 most common GIN terms (array elements, or `jsonb` keys and values) with the number of
+rows holding each, counted over the whole table. `jed_statistics.term_count` shows the list length.
+With them the planner prices `@>`, `&&`, `= ANY`, `?`, `?|`, and `?&` against a literal: a rare tag
+picks the GIN index, a tag in nearly every row picks a full scan, and an `@>` of several tags combines
+their frequencies rarest first.
+
+```sql
+CREATE TABLE post (id i32 PRIMARY KEY, tags text[]);
+CREATE INDEX post_tags ON post USING gin (tags);
+-- ... load rows ...
+ANALYZE post;
+EXPLAIN SELECT id FROM post WHERE tags @> '{rare-tag}'::text[];
+```
+
+A term missing from a fresh list that holds every term in the table is estimated at zero rows; after
+later writes, or when the list was truncated, a missing term gets a small positive estimate.
+
 ## Transactional and deliberately stale
 
 `ANALYZE` is a write: it commits atomically in autocommit mode, joins an explicit transaction, rolls

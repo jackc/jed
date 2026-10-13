@@ -187,13 +187,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Cost as a plan input (Path B)** — landed end-to-end: exact transactional row counts,
   relation-scoped prepared-plan validity, complete candidate inventory, whole-plan estimates and
   EXPLAIN columns, costed access/order pipelines, bounded deterministic N-way join search, and
-  transactional v29 `ANALYZE` statistics. The canonical contracts are
+  transactional v29 `ANALYZE` statistics, plus v42 GIN term statistics (the most common array /
+  `jsonb` GIN terms, pricing GIN predicates and candidates). The canonical contracts are
   [estimator.md](spec/design/estimator.md), [statistics.md](spec/design/statistics.md),
   [planner.md](spec/design/planner.md), and [explain.md](spec/design/explain.md).
   - [ ] _follow-on:_ parameter-sensitive/custom prepared plans; planning remains pre-bind today.
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
-    configurable targets, MCV-aware join skew, automatic analyze, and distribution facts for
-    composite/array/json/jsonb.
+    configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
+    composite/array/json/jsonb, GIN term statistics for parameter operands and `<@`, and an element-count
+    histogram (PostgreSQL's `elem_count_histogram`) for array `=`.
   - [ ] _follow-on:_ broader physical search — costed outer/barrier shapes, bushy trees, parallel
     plan search, or adaptive runtime re-planning; each requires a bounded deterministic contract.
 

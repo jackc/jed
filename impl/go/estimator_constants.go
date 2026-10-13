@@ -22,6 +22,8 @@ const (
 	statisticsMaxValueBytes             = 128
 	statisticsNDVScaleNumerator         = 1
 	statisticsNDVScaleDenominator       = 10
+	statisticsTermEntries               = 100
+	statisticsTermBucketWidth           = 10000
 )
 
 var (

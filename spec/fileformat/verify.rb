@@ -27,7 +27,10 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 41 # v41: a composite-type entry admits a range-typed field — field_type_code 17 + the
+VERSION = 42 # v42: GIN term statistics — a statistics summary's flags gain bit2 term_eligible, a
+# term-eligible summary appends term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16, and
+# stats_kind 3 term items follow (statistics.md §4.5/§7). No other byte layout change.
+# v41: a composite-type entry admits a range-typed field — field_type_code 17 + the
 # one-byte range element descriptor, before the field flags byte (composite.md §3). No other byte
 # layout change.
 # v40: bit 6 of a foreign key's actions byte is match_full (MATCH FULL; 0 = MATCH SIMPLE —
@@ -366,6 +369,27 @@ STATISTICS_TABLES = [
         mcv: [["x", 2]], histogram: [] }
     ] }
 ].freeze
+
+# v42 GIN term statistics fixture (statistics.md §4.5): `ANALYZE t (tags, doc)` over 105 rows. Every
+# row's tags hold its own id and a shared 0, so 106 distinct terms truncate to the 100-term list (0 in
+# 105 rows, then ids 1..99 by key bytes) with untracked_term_rows 1 (the 101st term's count). Four rows
+# carry a document — nested keys, an array string element (a KEY term), a top-level string — and the
+# rest are NULL. The cores build it via
+#   CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], doc jsonb)
+#   INSERT INTO t SELECT g::i32, ARRAY[g::i32, 0::i32], CASE g WHEN 1 THEN '{"a": 1, "b": [true, "x"]}'
+#     WHEN 2 THEN '{"a": 2}' WHEN 3 THEN '[1, "a"]' WHEN 4 THEN '"s"' END  -- each ::jsonb
+#     FROM generate_series(1, 105) AS g
+#   ANALYZE t (tags, doc)
+STATISTICS_TERMS_TABLE = begin
+  docs = { 1 => [:obj, [["a", [:num, "1"]], ["b", [:arr, [[:bool, true], [:str, "x"]]]]]],
+           2 => [:obj, [["a", [:num, "2"]]]],
+           3 => [:arr, [[:num, "1"], [:str, "a"]]],
+           4 => [:str, "s"] }
+  { name: "t",
+    columns: [col("id", "i32", pk: true), col("tags", "i32[]"), col("doc", "jsonb")],
+    rows: (1..105).map { |g| [g, [g, 0], docs[g]] },
+    term_statistics_columns: [1, 2] }.freeze
+end
 
 # A table whose rows force a HEIGHT-2 tree (an interior node whose children are themselves
 # interior nodes) at page_size 256. A wide text padding column makes each record ~66 bytes, so a
@@ -1516,6 +1540,7 @@ FIXTURES = ([
     tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("v", "i16")], rows: [] }] },
   { file: "row_count_table.jed", page_size: 256, tables: [ROW_COUNT_TABLE] },
   { file: "statistics_table.jed", page_size: 256, tables: STATISTICS_TABLES },
+  { file: "statistics_terms_table.jed", page_size: 256, tables: [STATISTICS_TERMS_TABLE] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "varchar_table.jed",   page_size: 256, tables: [VARCHAR_TABLE] },
@@ -2311,15 +2336,17 @@ end
 # Serialize one table's v29 kind-4 column-statistics groups. The caller already emits tables in name
 # order; columns are sorted here, and each group is summary, MCV ordinals, then histogram ordinals.
 def statistics_entries(table)
-  (table[:statistics] || []).sort_by { |s| s[:column] }.flat_map do |s|
+  table_statistics(table).sort_by { |s| s[:column] }.flat_map do |s|
     col = table[:columns].fetch(s[:column])
     distribution = !s[:distinct_count].nil?
     summary = +"\x04\x00".b
     summary << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
-    summary << [(s[:stale] ? 1 : 0) | (distribution ? 2 : 0)].pack("C")
+    terms = s[:terms]
+    summary << [(s[:stale] ? 1 : 0) | (distribution ? 2 : 0) | (terms ? 4 : 0)].pack("C")
     summary << [s[:analyzed_rows], s[:null_count], s[:width_sum], s[:distinct_count] || 0].pack("q>q>q>q>")
     summary << u32(s[:sample_rows]) << u32(s[:sample_nonnull_rows])
     summary << u16(s[:mcv].size) << u16(s[:histogram].size)
+    summary << [terms[:occurrences], terms[:untracked_rows]].pack("q>q>") << u16(terms[:entries].size) if terms
     out = [summary]
     s[:mcv].each_with_index do |(value, frequency), ordinal|
       encoded = encode_value(col[:type], value)
@@ -2335,8 +2362,84 @@ def statistics_entries(table)
       item << u16(ordinal) << u16(encoded.bytesize) << encoded
       out << item
     end
+    (terms ? terms[:entries] : []).each_with_index do |(term, rows), ordinal|
+      item = +"\x04\x03".b
+      item << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
+      item << u16(ordinal) << [rows].pack("q>") << u16(term.bytesize) << term.b
+      out << item
+    end
     out
   end
+end
+
+# A table's statistics facts: written out, or (term_statistics_columns) derived from its rows.
+def table_statistics(table)
+  table[:statistics] || (table[:term_statistics_columns] || []).map { |c| term_column_statistics(table, c) }
+end
+
+# The GIN-admitted array element types (gin.md §3); with jsonb, the term-eligible column types.
+GIN_ELEMENT_TYPES = %w[i16 i32 i64 boolean uuid date timestamp timestamptz f32 f64 interval text bytea
+                       decimal].freeze
+def term_eligible?(type) = type == "jsonb" || GIN_ELEMENT_TYPES.include?(array_elem(type))
+
+# One value's GIN term set (gin.md §4): distinct terms in ascending byte order; NULL has none.
+def gin_value_terms(type, value)
+  return [] if value.nil?
+  return gin_jsonb_terms(value).map(&:b).uniq.sort if type == "jsonb"
+
+  elems = value.is_a?(Hash) ? value[:elements] : value
+  elems.compact.map { |e| gin_element_term(array_elem(type), e).b }.uniq.sort
+end
+
+TERM_BUCKET_WIDTH = 10_000
+TERM_ENTRIES = 100
+
+# A column's GIN term facts (statistics.md §4.5), computed independently of the cores: lossy counting
+# over every row's term set, rows in storage-key order, bucket width 10,000; the 100 most common
+# terms by descending count then ascending bytes; the untracked-row bound.
+def term_statistics(table, column)
+  type = table[:columns][column][:type]
+  occurrences = 0
+  entries = {}
+  pruned = false
+  oversized = false
+  table_entries(table).each do |_key, row|
+    gin_value_terms(type, row[column]).each do |term|
+      occurrences += 1
+      bucket = (occurrences + TERM_BUCKET_WIDTH - 1) / TERM_BUCKET_WIDTH
+      if term.bytesize > 128
+        oversized = true
+      elsif entries.key?(term)
+        entries[term][0] += 1
+      else
+        entries[term] = [1, bucket - 1]
+      end
+      next unless (occurrences % TERM_BUCKET_WIDTH).zero?
+
+      before = entries.size
+      entries.reject! { |_, (count, delta)| count + delta <= bucket }
+      pruned ||= entries.size != before
+    end
+  end
+  ranked = entries.map { |term, (count, _)| [term, count] }.sort_by { |term, count| [-count, term] }
+  untracked = 0
+  untracked = [untracked, ranked[TERM_ENTRIES][1]].max if ranked.size > TERM_ENTRIES
+  untracked = [untracked, (occurrences + TERM_BUCKET_WIDTH - 1) / TERM_BUCKET_WIDTH].max if pruned
+  untracked = [untracked, 1].max if oversized
+  { occurrences: occurrences, untracked_rows: untracked, entries: ranked.first(TERM_ENTRIES) }
+end
+
+# A term-eligible column's complete v42 statistics fact, derived from the rows (statistics.md §4):
+# every row is sampled (the fixture is under 30,000 rows), the width is the value-body length, and
+# array / jsonb columns are distribution-ineligible (no NDV, MCV, or histogram).
+def term_column_statistics(table, column)
+  type = table[:columns][column][:type]
+  values = table_entries(table).map { |_key, row| row[column] }
+  nonnull = values.compact
+  { column: column, stale: false, analyzed_rows: values.size, null_count: values.size - nonnull.size,
+    width_sum: nonnull.sum { |v| encode_value(type, v).bytesize - 1 }, distinct_count: nil,
+    sample_rows: values.size, sample_nonnull_rows: nonnull.size, mcv: [], histogram: [],
+    terms: term_statistics(table, column) }
 end
 
 # Serialize a composite-type catalog entry's BODY (after the entry_kind=1 byte), v9: name, field
@@ -4410,7 +4513,7 @@ def decode_statistics_entry(buf, pos, tables, statistics, expected)
     raise "duplicate statistics summary" if expected.key?(key)
     fb, pos = take(buf, pos, 1)
     flags = fb.getbyte(0)
-    raise "reserved statistics flag" unless (flags & ~3).zero?
+    raise "reserved statistics flag" unless (flags & ~7).zero?
     raw, pos = take(buf, pos, 32)
     analyzed, null_count, width_sum, distinct = raw.unpack("q>q>q>q>")
     sb, pos = take(buf, pos, 8)
@@ -4418,6 +4521,17 @@ def decode_statistics_entry(buf, pos, tables, statistics, expected)
     counts, pos = take(buf, pos, 4)
     mcv_count, histogram_count = counts.unpack("nn")
     distribution = (flags & 2) != 0
+    terms = nil
+    term_count = 0
+    if (flags & 4) != 0
+      tb, pos = take(buf, pos, 18)
+      occurrences, untracked = tb.unpack("q>q>")
+      term_count = tb.byteslice(16, 2).unpack1("n")
+      raise "invalid statistics term summary" if occurrences.negative? || untracked.negative? ||
+                                                 untracked > analyzed - null_count || term_count > 100
+      terms = { occurrences: occurrences, untracked_rows: untracked, entries: [] }
+    end
+    raise "statistics term eligibility mismatch" if terms.nil? == term_eligible?(table[:columns][column][:type])
     raise "invalid statistics summary" if analyzed.negative? || null_count.negative? || null_count > analyzed ||
                                           width_sum.negative? || sample_rows > [analyzed, 30_000].min ||
                                           sample_nonnull > sample_rows || mcv_count > 100 || histogram_count > 101 ||
@@ -4427,8 +4541,9 @@ def decode_statistics_entry(buf, pos, tables, statistics, expected)
              null_count: null_count, width_sum: width_sum,
              distinct_count: distribution ? distinct : nil, sample_rows: sample_rows,
              sample_nonnull_rows: sample_nonnull, mcv: [], histogram: [] }
+    item[:terms] = terms if terms
     statistics << item
-    expected[key] = [mcv_count, histogram_count]
+    expected[key] = [mcv_count, histogram_count, term_count]
     return pos
   end
 
@@ -4437,6 +4552,26 @@ def decode_statistics_entry(buf, pos, tables, statistics, expected)
   counts = expected.fetch(key)
   ob, pos = take(buf, pos, 2)
   ordinal = ob.unpack1("n")
+  if kind == 3
+    raise "statistics term under a term-ineligible summary" unless item[:terms]
+
+    rb, pos = take(buf, pos, 2 + 8)
+    rows = rb.unpack1("q>")
+    length = rb.byteslice(8, 2).unpack1("n")
+    raise "invalid statistics term length" unless length.between?(1, 128)
+
+    term, pos = take(buf, pos, length)
+    entries = item[:terms][:entries]
+    raise "invalid statistics term ordinal/rows" unless ordinal == entries.size && ordinal < counts[2] &&
+                                                        rows.between?(1, item[:analyzed_rows] - item[:null_count])
+    raise "duplicate statistics term" if entries.any? { |t, _| t == term }
+    if (last = entries.last) && (rows > last[1] || (rows == last[1] && term < last[0]))
+      raise "statistics terms are out of order"
+    end
+
+    entries << [term.b, rows]
+    return pos
+  end
   if kind == 1
     fb, pos = take(buf, pos, 4)
     frequency = fb.unpack1("N")
@@ -4529,10 +4664,11 @@ def decode_image(image)
     end
     cat = pg[:next_page]
   end
-  statistics_expected.each do |(table, column), (mcv_count, histogram_count)|
+  statistics_expected.each do |(table, column), (mcv_count, histogram_count, term_count)|
     item = statistics.find { |s| s[:table] == table && s[:column] == column }
     raise "incomplete statistics group" unless item && item[:mcv].size == mcv_count &&
-                                               item[:histogram].size == histogram_count
+                                               item[:histogram].size == histogram_count &&
+                                               (item[:terms] ? item[:terms][:entries].size : 0) == term_count
   end
   reached = $reached.size
   $reached = nil
@@ -4582,7 +4718,7 @@ end
 
 def expected_statistics(fx)
   fx[:tables].sort_by { |t| t[:name] }.flat_map do |t|
-    (t[:statistics] || []).sort_by { |s| s[:column] }.map { |s| { table: t[:name], **s } }
+    table_statistics(t).sort_by { |s| s[:column] }.map { |s| { table: t[:name], **s } }
   end
 end
 

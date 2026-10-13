@@ -916,6 +916,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Explicit deterministic per-column statistics and their read-only computed catalog relation
   // (P9, spec/design/statistics.md).
   "maintenance.analyze",
+  // GIN term statistics: ANALYZE counts array / jsonb GIN terms and the planner prices GIN
+  // predicates from them (statistics.md §4.5/§6.1).
+  "maintenance.analyze_gin_terms",
   "introspect.statistics",
   // The jed_columns catalog relation (I1): one row per column of every user table — ordinal,
   // canonical type text, not_null, pk_ordinal, column_default (introspection.md §5).

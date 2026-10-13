@@ -125,6 +125,31 @@ fn statistics_table_db() -> Session {
     db
 }
 
+/// v42 GIN term statistics (statistics.md §4.5): `ANALYZE t (tags, doc)` over 105 rows whose tags
+/// truncate to the 100-term list and whose four documents give key and value terms. Must match
+/// verify.rb's STATISTICS_TERMS_TABLE.
+fn statistics_terms_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], doc jsonb)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t SELECT g::i32, ARRAY[g::i32, 0::i32], CASE g \
+         WHEN 1 THEN '{\"a\": 1, \"b\": [true, \"x\"]}'::jsonb WHEN 2 THEN '{\"a\": 2}'::jsonb \
+         WHEN 3 THEN '[1, \"a\"]'::jsonb WHEN 4 THEN '\"s\"'::jsonb END \
+         FROM generate_series(1, 105) AS g",
+    );
+    run(&mut db, "ANALYZE t (tags, doc)");
+    db
+}
+
 /// A table with a COMPOSITE primary key (constraints.md §3) — the stored key is the
 /// concatenation of the members' encodings (4-byte i32 ‖ 2-byte i16, encoding.md §2.3).
 /// Rows insert in ascending tuple order (the tree shape is order-sensitive), with a negative
@@ -1851,6 +1876,7 @@ fn write_matches_goldens() {
         ("one_table_empty.jed", one_table_empty_db),
         ("row_count_table.jed", row_count_table_db),
         ("statistics_table.jed", statistics_table_db),
+        ("statistics_terms_table.jed", statistics_terms_table_db),
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
         ("varchar_table.jed", varchar_table_db),

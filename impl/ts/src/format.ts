@@ -118,15 +118,16 @@ import {
   jsonbValue,
 } from "./value.ts";
 import { type JsonNode, MAX_JSON_DEPTH } from "./json.ts";
-import type { ColumnStatistics, StatisticsValue } from "./statistics.ts";
+import { type ColumnStatistics, type StatisticsValue, termEligible } from "./statistics.ts";
 import {
   STATISTICS_HISTOGRAM_BOUNDS,
   STATISTICS_MAX_VALUE_BYTES,
   STATISTICS_MCV_ENTRIES,
   STATISTICS_SAMPLE_ROWS,
+  STATISTICS_TERM_ENTRIES,
 } from "./estimator_constants.ts";
 
-const FORMAT_VERSION = 41; // 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED — spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit descriptors; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1, delivery step 4): the per-index index_flags byte gains bit2 has_host_deps, and — only when set — after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order. An index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 42; // 42 = GIN term statistics: a statistics summary's flags byte gains bit2 term_eligible (set exactly for a jsonb column or an array of a GIN element type), followed — only when set — after histogram_count by term_occurrences i64 ‖ untracked_term_rows i64 ‖ term_count u16, and stats_kind 3 term items (ordinal u16 ‖ rows i64 ‖ term_len u16 ‖ term bytes) follow the histogram items (spec/design/statistics.md §4.5/§7); no other byte layout change; 41 = a composite-type entry admits a range-typed field — field_type_code 17 + the one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3); no other byte layout change; 40 = a foreign key's actions byte gains bit 6 match_full (MATCH FULL; 0 = MATCH SIMPLE — spec/design/constraints.md §6.3/§6.9); bit 7 stays reserved 0; no other byte layout change; 39 = every view entry gains a trailing u8 check_option (0 none, 1 LOCAL, 2 CASCADED — spec/design/views.md §15.6); no other byte layout change; 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit descriptors; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1, delivery step 4): the per-index index_flags byte gains bit2 has_host_deps, and — only when set — after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order. An index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 export const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const RECORD_MAX_RESERVE = 12; // bytes reserved inside RECORD_MAX beyond the per-column term — independent of PAGE_HEADER (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K=0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C).
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -1533,7 +1534,11 @@ function statisticsCatalogEntries(snap: Snapshot): Uint8Array[] {
       summary.u8(0);
       wstr(summary, table.name);
       summary.u16(column);
-      summary.u8((statistics.stale ? 1 : 0) | (statistics.distinctCount !== null ? 2 : 0));
+      summary.u8(
+        (statistics.stale ? 1 : 0) |
+          (statistics.distinctCount !== null ? 2 : 0) |
+          (statistics.terms !== null ? 4 : 0),
+      );
       summary.i64(statistics.analyzedRows);
       summary.i64(statistics.nullCount);
       summary.i64(statistics.widthSum);
@@ -1542,6 +1547,11 @@ function statisticsCatalogEntries(snap: Snapshot): Uint8Array[] {
       summary.u32(statistics.sampleNonNullRows);
       summary.u16(statistics.mcv.length);
       summary.u16(statistics.histogram.length);
+      if (statistics.terms !== null) {
+        summary.i64(statistics.terms.occurrences);
+        summary.i64(statistics.terms.untrackedRows);
+        summary.u16(statistics.terms.entries.length);
+      }
       entries.push(summary.toBytes());
 
       const colType = snap.stores.get(tableKey)!.columnTypes()[column]!;
@@ -1570,6 +1580,21 @@ function statisticsCatalogEntries(snap: Snapshot): Uint8Array[] {
         const encoded = encodeValue(colType, bound.value);
         entry.u16(encoded.length);
         entry.bytes(encoded);
+        entries.push(entry.toBytes());
+      }
+      // v42 GIN term items (statistics.md §4.5/§7).
+      const termEntries = statistics.terms?.entries ?? [];
+      for (let ordinal = 0; ordinal < termEntries.length; ordinal++) {
+        const [term, rows] = termEntries[ordinal]!;
+        const entry = new ByteWriter();
+        entry.u8(4);
+        entry.u8(3);
+        wstr(entry, table.name);
+        entry.u16(column);
+        entry.u16(ordinal);
+        entry.i64(rows);
+        entry.u16(term.length);
+        entry.bytes(term);
         entries.push(entry.toBytes());
       }
     }
@@ -1634,7 +1659,7 @@ function decodeStatisticsEntry(
   buf: Uint8Array,
   cur: Cursor,
   snap: Snapshot,
-  expected: Map<string, readonly [number, number]>,
+  expected: Map<string, readonly [number, number, number]>,
 ): void {
   const subkind = readU8(buf, cur);
   const tableKey = readString(buf, cur);
@@ -1661,8 +1686,12 @@ function decodeStatisticsEntry(
     const mcvCount = readU16(buf, cur);
     const histogramCount = readU16(buf, cur);
     const distribution = (flags & 2) !== 0;
+    const termFlag = (flags & 4) !== 0;
+    const termOccurrences = termFlag ? readI64(buf, cur) : 0n;
+    const untrackedRows = termFlag ? readI64(buf, cur) : 0n;
+    const termCount = termFlag ? readU16(buf, cur) : 0;
     if (
-      (flags & ~3) !== 0 ||
+      (flags & ~7) !== 0 ||
       analyzedRows < 0n ||
       nullCount < 0n ||
       nullCount > analyzedRows ||
@@ -1676,7 +1705,12 @@ function decodeStatisticsEntry(
       (!distribution && distinctRaw !== 0n) ||
       (distribution && distinctRaw > analyzedRows - nullCount) ||
       (histogramCount !== 0 && histogramCount < 2) ||
-      distribution !== statisticsDistributionEligible(table.columns[column]!.type)
+      distribution !== statisticsDistributionEligible(table.columns[column]!.type) ||
+      termFlag !== termEligible(table.columns[column]!.type) ||
+      termOccurrences < 0n ||
+      untrackedRows < 0n ||
+      untrackedRows > analyzedRows - nullCount ||
+      termCount > STATISTICS_TERM_ENTRIES
     ) {
       throw engineError("data_corrupted", "invalid statistics summary");
     }
@@ -1690,9 +1724,10 @@ function decodeStatisticsEntry(
       sampleNonNullRows,
       mcv: [],
       histogram: [],
+      terms: termFlag ? { occurrences: termOccurrences, untrackedRows, entries: [] } : null,
     };
     snap.putColumnStatistics(tableKey, column, statistics);
-    expected.set(groupKey, [mcvCount, histogramCount]);
+    expected.set(groupKey, [mcvCount, histogramCount, termCount]);
     return;
   }
 
@@ -1702,7 +1737,9 @@ function decodeStatisticsEntry(
       "data_corrupted",
       subkind === 1
         ? "statistics MCV precedes its summary"
-        : "statistics histogram precedes its summary",
+        : subkind === 3
+          ? "statistics term precedes its summary"
+          : "statistics histogram precedes its summary",
     );
   }
   const statistics = snap.columnStatistics(tableKey, column)!;
@@ -1747,6 +1784,39 @@ function decodeStatisticsEntry(
       throw engineError("data_corrupted", "statistics histogram is out of order");
     }
     statistics.histogram.push(value);
+    return;
+  }
+  if (subkind === 3) {
+    const ordinal = readU16(buf, cur);
+    const rows = readI64(buf, cur);
+    const termLength = readU16(buf, cur);
+    if (
+      termLength === 0 ||
+      termLength > STATISTICS_MAX_VALUE_BYTES ||
+      cur.pos + termLength > buf.length
+    ) {
+      throw engineError("data_corrupted", "invalid statistics term length");
+    }
+    const term = take(buf, cur, termLength).slice();
+    const nonnull = statistics.analyzedRows - statistics.nullCount;
+    const terms = statistics.terms;
+    if (terms === null) {
+      throw engineError("data_corrupted", "statistics term under a term-ineligible summary");
+    }
+    if (ordinal !== terms.entries.length || ordinal >= counts[2] || rows < 1n || rows > nonnull) {
+      throw engineError("data_corrupted", "invalid statistics term ordinal or row count");
+    }
+    if (terms.entries.some(([existing]) => compareBytes(existing, term) === 0)) {
+      throw engineError("data_corrupted", "duplicate statistics term");
+    }
+    const previous = terms.entries.at(-1);
+    if (
+      previous !== undefined &&
+      (rows > previous[1] || (rows === previous[1] && compareBytes(term, previous[0]) < 0))
+    ) {
+      throw engineError("data_corrupted", "statistics terms are out of order");
+    }
+    terms.entries.push([term, rows]);
     return;
   }
   throw engineError("data_corrupted", "unknown statistics entry subkind");
@@ -3333,7 +3403,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   const mt = selected.meta;
 
   const snap = new Snapshot(mt.txid);
-  const statisticsExpected = new Map<string, readonly [number, number]>();
+  const statisticsExpected = new Map<string, readonly [number, number, number]>();
   const loadedViews: ViewDef[] = [];
   // v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
   // walk — so the catalog + skeleton load no longer tracks a reached set. The live-page count comes
@@ -3436,7 +3506,8 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
     if (
       statistics === undefined ||
       statistics.mcv.length !== counts[0] ||
-      statistics.histogram.length !== counts[1]
+      statistics.histogram.length !== counts[1] ||
+      (statistics.terms?.entries.length ?? 0) !== counts[2]
     ) {
       throw engineError("data_corrupted", "incomplete statistics entry group");
     }

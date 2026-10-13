@@ -154,7 +154,7 @@ import {
   utf8Length,
   valueBytes,
 } from "./memsize.ts";
-import { collectColumnStatistics, type ColumnStatistics } from "./statistics.ts";
+import { collectColumnStatistics, type ColumnStatistics, termEligible } from "./statistics.ts";
 import {
   andSelectivity,
   addPlanEstimates,
@@ -484,6 +484,7 @@ import {
   literalToValue,
   materializeInsertValue,
   overflow,
+  rexprConstToValue,
   storeValue,
   typeError,
   withAssignmentHint,
@@ -4117,6 +4118,28 @@ export class Engine {
         return this.estimateExpressionOwner(sp, expr.operand);
       case "inValues":
         return this.estimateExpressionOwner(sp, expr.lhs);
+      // The GIN-served shapes, which GIN term statistics price (statistics.md §6.1).
+      case "arrayFunc":
+        if (expr.args.length !== 2) return { kind: "none" };
+        return merge(
+          this.estimateExpressionOwner(sp, expr.args[0]!),
+          this.estimateExpressionOwner(sp, expr.args[1]!),
+        );
+      case "quantified":
+        return merge(
+          this.estimateExpressionOwner(sp, expr.lhs),
+          this.estimateExpressionOwner(sp, expr.array),
+        );
+      case "jsonContains":
+        return merge(
+          this.estimateExpressionOwner(sp, expr.a),
+          this.estimateExpressionOwner(sp, expr.b),
+        );
+      case "jsonHasKey":
+        return merge(
+          this.estimateExpressionOwner(sp, expr.base),
+          this.estimateExpressionOwner(sp, expr.arg),
+        );
       default:
         return { kind: "none" };
     }
@@ -9897,110 +9920,16 @@ export class Engine {
     // §3): evaluate Q on a scratch meter. queryRow is empty for a constant bound and the combined
     // left row for a sibling INL.
     const qv = evalExpr(query, queryRow, env, env.exec.session.scratchMeter());
-    // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
-    // entries carry, so a term doubles as its posting-list prefix below. Encoding now lets us dedup
-    // distinct terms by bytes (a bijection: byte-dedup == value-dedup, byte-sort == value-sort)
-    // generically over every admitted element type.
-    const terms: Uint8Array[] = [];
-    let hasNull = false;
-    let isEmpty = false;
-    let anyMode = gb.strategy === "overlaps";
-    if (ginStrategyOpclass(gb.strategy) === "jsonb") {
-      // jsonb_ops (gin.md §2.1). Every strategy is strict, so a NULL operand is provably empty.
-      if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
-      if (gb.strategy === "jsonContains") {
-        // `col @> Q`: Q's own index terms, mode ALL. A term-less Q ({}, [], [[]], …) is contained by
-        // rows the index cannot enumerate (term-less ones) — fall back to the full scan.
-        if (qv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb @> operand");
-        terms.push(...ginJsonbIndexTerms(qv.node));
-      } else if (gb.strategy === "jsonHasKey") {
-        if (qv.kind !== "text") throw new Error("resolver guarantees a text ? operand");
-        terms.push(ginJsonbKeyTerm(qv.text));
-      } else {
-        // `?|` / `?&`: the key terms of K's NON-NULL elements (NULL elements are skipped).
-        if (qv.kind !== "array") throw new Error("resolver guarantees a text[] ?| / ?& operand");
-        const seen = new Set<string>();
-        for (const el of qv.elements) {
-          if (el.kind === "null") continue;
-          if (el.kind !== "text") throw new Error("a text[] operand has text/NULL elements");
-          const t = ginJsonbKeyTerm(el.text);
-          const k = byteKey(t);
-          if (!seen.has(k)) {
-            seen.add(k);
-            terms.push(t);
-          }
-        }
-        terms.sort(cmpBytes);
-        if (gb.strategy === "jsonHasAnyKey") {
-          anyMode = true;
-          // ?| with no non-NULL key matches nothing.
-          if (terms.length === 0) return { entries: [], pages: 0, slabs: 0 };
-        }
-      }
-      if (terms.length === 0) {
-        // @> a term-less Q, or ?& with no non-NULL key (TRUE for every non-NULL document): the index
-        // cannot enumerate the matching rows — fall back to the full scan (the residual decides).
-        const u = store.scanWithUnits(mask);
-        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
-      }
-    } else if (gb.strategy === "member") {
-      // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
-      // so the bound is provably empty (gin.md §6). c may be a different numeric type than the
-      // elements (an integer against decimal[], a decimal against i32[]); ginQueryTerm converts it to
-      // the element type or reports that no element can equal it.
-      if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
-      const t = ginQueryTerm(gb.elemType, qv);
-      if (t === null) return { entries: [], pages: 0, slabs: 0 }; // c equals no element of the type
-      terms.push(t);
-    } else {
-      if (qv.kind !== "array") return { entries: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
-      // unmatchable: a query element no stored element can equal (an f64 not exactly an f32 against
-      // an f32[] index — ginQueryTerm). It reaches no posting list, so @> and array = (which need
-      // EVERY query element present) are provably empty; && skips it.
-      let unmatchable = false;
-      const seen = new Set<string>();
-      for (const el of qv.elements) {
-        if (el.kind === "null") {
-          hasNull = true; // a NULL element carries no term
-          continue;
-        }
-        const t = ginQueryTerm(gb.elemType, el);
-        if (t === null) {
-          unmatchable = true;
-          continue;
-        }
-        const k = byteKey(t);
-        if (!seen.has(k)) {
-          seen.add(k);
-          terms.push(t);
-        }
-      }
-      isEmpty = qv.elements.length === 0;
-      if (unmatchable && gb.strategy !== "overlaps") return { entries: [], pages: 0, slabs: 0 };
-      terms.sort(cmpBytes);
+    const extracted = ginQueryTerms(gb.strategy, gb.elemType, qv);
+    if (extracted.kind === "empty") return { entries: [], pages: 0, slabs: 0 };
+    if (extracted.kind === "fullScan") {
+      // Rows the index cannot enumerate (they carry no terms) may match: scan them all and let the
+      // residual filter keep the right ones (gin.md §6 / §2.1).
+      const u = store.scanWithUnits(mask);
+      return { entries: u.entries, pages: u.pages, slabs: u.slabs };
     }
-
-    if (gb.strategy === "contains") {
-      if (isEmpty) {
-        // @> '{}': every non-NULL array contains the empty array — not derivable from the index;
-        // fall back to the full scan (the residual filter keeps the right rows — gin.md §6).
-        const u = store.scanWithUnits(mask);
-        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
-      }
-      if (hasNull) return { entries: [], pages: 0, slabs: 0 }; // @> a query with a NULL element is never TRUE
-    } else if (gb.strategy === "equal") {
-      if (terms.length === 0) {
-        // col = Q with NO non-NULL term — '{}' (isEmpty) or an all-NULL Q (hasNull, no non-NULL
-        // element). The rows it matches ({}, {NULL}, …) carry NO index terms, so the index cannot
-        // enumerate them: fall back to the full scan and let the residual = keep them (gin.md §6).
-        // NOT a provably-empty bound — and a Q with ≥1 non-NULL element is NOT caught here (it
-        // gathers, even when it also has a NULL element).
-        const u = store.scanWithUnits(mask);
-        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
-      }
-    } else if (gb.strategy === "overlaps") {
-      if (terms.length === 0) return { entries: [], pages: 0, slabs: 0 }; // && with no non-NULL term
-    }
+    const terms = extracted.terms;
+    const anyMode = gb.strategy === "overlaps" || gb.strategy === "jsonHasAnyKey";
 
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
     // (gin.md §4). The entry is encode(term) ‖ storage_key and every term self-delimits — an
@@ -17695,6 +17624,9 @@ export class Engine {
           averageWidth,
           intValue(BigInt(statistics.mcv.length)),
           intValue(BigInt(statistics.histogram.length)),
+          statistics.terms === null
+            ? nullValue()
+            : intValue(BigInt(statistics.terms.entries.length)),
         ]);
       }
     }
@@ -22916,11 +22848,158 @@ function statisticsBoundTermsSelectivity(
   return statisticsSelectivity(rows > current.nonnullRows ? current.nonnullRows : rows, current.rows);
 }
 
+// GinTermEstimate is a GIN-served predicate's estimate from term statistics (statistics.md §6.1):
+// the rows it admits, the posting-list entries a GIN gather reads, and the estimated total entries in
+// the index.
+type GinTermEstimate = { rows: bigint; entries: bigint; totalEntries: bigint };
+
+// statisticsGinEstimate prices a GIN predicate over the local column with a literal operand from the
+// column's term facts (statistics.md §6.1). null — the structural default applies — when the column
+// has no term facts, the operand is not a plan-time literal, or the query falls back to a full scan.
+function statisticsGinEstimate(
+  rel: ScopeRel,
+  column: number,
+  strategy: GinStrategy,
+  operand: RExpr,
+  engine: Engine,
+): GinTermEstimate | null {
+  const fact = engine.estimatorColumnStatistics(rel.db, rel.table.name, column);
+  if (fact === undefined || fact.terms === null) return null;
+  const termFacts = fact.terms;
+  const value = statisticsGinOperandValue(operand);
+  if (value === null) return null;
+  const current = currentColumnStatistics(engine, rel, column);
+  if (current === null) return null;
+  const n = current.rows;
+  const totalEntries = statisticsScale(n, termFacts.occurrences, fact.analyzedRows);
+  const colType = rel.table.columns[column]!.type;
+  const elemType = colType.kind === "array" ? typeScalar(colType.elem) : typeScalar(colType);
+  const query = ginQueryTerms(strategy, elemType, value);
+  if (query.kind === "empty") return { rows: 0n, entries: 0n, totalEntries };
+  if (query.kind === "fullScan") return null;
+  const termRows = (term: Uint8Array): bigint => {
+    if (current.nonnullRows === 0n) return 0n;
+    const listed = termFacts.entries.find(([t]) => compareBytes(t, term) === 0);
+    if (listed !== undefined) {
+      const rows = statisticsScale(n, listed[1], fact.analyzedRows);
+      return rows < current.nonnullRows ? rows : current.nonnullRows;
+    }
+    if (termFacts.untrackedRows === 0n && !fact.stale) return 0n;
+    const half = termFacts.untrackedRows / 2n + (termFacts.untrackedRows % 2n);
+    let rows = statisticsScale(n, half, fact.analyzedRows);
+    if (rows > current.nonnullRows) rows = current.nonnullRows;
+    return rows < 1n ? 1n : rows;
+  };
+  const priced: [bigint, Uint8Array][] = query.terms.map((term) => [termRows(term), term]);
+  priced.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : compareBytes(a[1], b[1])));
+  if (strategy === "overlaps" || strategy === "jsonHasAnyKey") {
+    const sum = priced.reduce((acc, [rows]) => saturatingEstimateAdd(acc, rows), 0n);
+    return {
+      rows: sum < current.nonnullRows ? sum : current.nonnullRows,
+      entries: sum,
+      totalEntries,
+    };
+  }
+  const first = priced[0]?.[0] ?? 0n;
+  let rows = first;
+  let entries = first;
+  for (let i = 1; i < priced.length; i++) {
+    entries = saturatingEstimateAdd(entries, rows);
+    rows = statisticsScale(rows, priced[i]![0], n);
+  }
+  return { rows, entries, totalEntries };
+}
+
+// statisticsGinOperandValue is a GIN query operand's plan-time value (statistics.md §6.1): a literal,
+// a folded array literal, or a one-dimensional ARRAY[...] of literals.
+function statisticsGinOperandValue(operand: RExpr): Value | null {
+  const constant = (e: RExpr): Value | null => {
+    if (e.kind === "constRange") return e.value;
+    try {
+      return rexprConstToValue(e);
+    } catch {
+      return null;
+    }
+  };
+  if (operand.kind === "constArray") return operand.value;
+  if (operand.kind === "array" && !operand.nested) {
+    const values: Value[] = [];
+    for (const elem of operand.elements) {
+      const v = constant(elem);
+      if (v === null) return null;
+      values.push(v);
+    }
+    return arrayValue(values);
+  }
+  return constant(operand);
+}
+
+// statisticsGinLeafSelectivity is the logical selectivity of a GIN-served leaf from term statistics
+// (statistics.md §6.1). Array = keeps its structural equality estimate as a logical leaf.
+function statisticsGinLeafSelectivity(
+  expr: RExpr,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity | null {
+  if (
+    expr.kind !== "arrayFunc" &&
+    expr.kind !== "quantified" &&
+    expr.kind !== "jsonContains" &&
+    expr.kind !== "jsonHasKey"
+  )
+    return null;
+  for (let column = 0; column < rel.table.columns.length; column++) {
+    const declared = rel.table.columns[column]!;
+    if (!termEligible(declared.type)) continue;
+    const opclass = ginOpclassOf(declared.type);
+    if (opclass === null) return null;
+    const m = ginMatch(expr, rel.offset + column, opclass);
+    if (m === null) continue;
+    if (m.strategy === "equal") return null;
+    const estimate = statisticsGinEstimate(rel, column, m.strategy, m.query, engine);
+    if (estimate === null) return null;
+    const current = currentColumnStatistics(engine, rel, column);
+    if (current === null) return null;
+    return statisticsSelectivity(estimate.rows, current.rows);
+  }
+  return null;
+}
+
+// ginCandidateTermEstimate is a GIN candidate's (scan rows, gin_entry, index pages) from its column's
+// term statistics (statistics.md §6.1), or null when the access-method default applies.
+function ginCandidateTermEstimate(
+  bound: ScanBound | null,
+  residual: RExpr | null,
+  rel: ScopeRel,
+  engine: Engine,
+): { rows: bigint; entries: bigint; pages: bigint } | null {
+  if (bound === null || bound.kind !== "gin" || residual === null) return null;
+  const gb = bound.gin;
+  const m = ginMatch(residual, gb.colGlobal, ginStrategyOpclass(gb.strategy));
+  if (m === null || m.strategy !== gb.strategy) return null;
+  if (gb.colGlobal < rel.offset) return null;
+  const column = gb.colGlobal - rel.offset;
+  const estimate = statisticsGinEstimate(rel, column, m.strategy, m.query, engine);
+  if (estimate === null) return null;
+  const index = engine.estimatorIndexStore(rel.db, gb.nameKey);
+  const nodes = BigInt(index.nodeCount());
+  const height = BigInt(index.height());
+  const totalEntries = estimate.totalEntries < 1n ? 1n : estimate.totalEntries;
+  const pages = estimatorClampPages(
+    statisticsScale(nodes, estimate.entries, totalEntries),
+    nodes,
+    height,
+  );
+  return { rows: estimate.rows, entries: estimate.entries, pages };
+}
+
 function statisticsLeafSelectivity(
   expr: RExpr,
   rel: ScopeRel,
   engine: Engine,
 ): Selectivity | null {
+  const gin = statisticsGinLeafSelectivity(expr, rel, engine);
+  if (gin !== null) return gin;
   if (expr.kind === "isNull") {
     const column = statisticsColumn(expr.operand, rel);
     if (column === null) return null;
@@ -23994,7 +24073,7 @@ export function estimateScanCandidates(
   const filterNodes = estimatorOperatorNodes(residual);
   return candidates.map((candidate, i) => {
     const selectivity = selectivities[i]!;
-    const scanRows = estimateSelectivity(selectivity, rowCount);
+    let scanRows = estimateSelectivity(selectivity, rowCount);
     let accessNodes = BigInt(store.nodeCount());
     let accessHeight = tableHeight;
     if (
@@ -24006,7 +24085,7 @@ export function estimateScanCandidates(
       accessNodes = BigInt(index.nodeCount());
       accessHeight = BigInt(index.height());
     }
-    const accessPages =
+    let accessPages =
       candidate.identity.kind === "full"
         ? accessNodes
         : estimatorClampPages(
@@ -24014,12 +24093,18 @@ export function estimateScanCandidates(
             accessNodes,
             accessHeight,
           );
-    const accessWork =
+    let accessWork =
       candidate.identity.kind === "gin"
         ? scanRows
         : candidate.identity.kind === "gist"
           ? accessPages
           : 0n;
+    const term = ginCandidateTermEstimate(candidate.bound, candidate.residual, rel, engine);
+    if (term !== null) {
+      scanRows = term.rows;
+      accessWork = term.entries;
+      accessPages = term.pages;
+    }
     return estimateCandidate({
       kind: candidate.identity.kind,
       indexName: candidate.identity.indexName,
@@ -25253,6 +25338,119 @@ export function isGinElementType(elem: Type): boolean {
   );
 }
 
+// GinQuery is the outcome of a GIN opclass's extract_query_terms (gin.md §2/§6): the distinct query
+// terms to gather (byte-sorted), a provably-empty bound, or the full-scan fallback for a query whose
+// matches the index cannot enumerate.
+export type GinQuery =
+  | { kind: "terms"; terms: Uint8Array[] }
+  | { kind: "empty" }
+  | { kind: "fullScan" };
+
+// ginQueryTerms is a GIN query value's terms under its strategy (which implies the opclass) — what
+// the gather reads, and what the planner prices from GIN term statistics (statistics.md §6.1).
+// elemType is the indexed array's element type (unused for jsonb_ops).
+export function ginQueryTerms(strategy: GinStrategy, elemType: ScalarType, qv: Value): GinQuery {
+  return ginStrategyOpclass(strategy) === "jsonb"
+    ? jsonbQueryTerms(strategy, qv)
+    : arrayQueryTerms(strategy, elemType, qv);
+}
+
+// arrayQueryTerms is the array_ops query terms (gin.md §2/§6). Each term is the element's
+// order-preserving key encoding (§4) — the SAME bytes the entries carry, so a term doubles as its
+// posting-list prefix. Encoding now lets us dedup distinct terms by bytes (a bijection: byte-dedup ==
+// value-dedup, byte-sort == value-sort) generically over every admitted element type.
+function arrayQueryTerms(strategy: GinStrategy, elemType: ScalarType, qv: Value): GinQuery {
+  const terms: Uint8Array[] = [];
+  let hasNull = false;
+  let isEmpty = false;
+  const seen = new Set<string>();
+  const push = (t: Uint8Array): void => {
+    const k = byteKey(t);
+    if (!seen.has(k)) {
+      seen.add(k);
+      terms.push(t);
+    }
+  };
+  if (strategy === "member") {
+    // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
+    // so the bound is provably empty (gin.md §6). c may be a different numeric type than the
+    // elements (an integer against decimal[], a decimal against i32[]); ginQueryTerm converts it to
+    // the element type or reports that no element can equal it.
+    if (qv.kind === "null") return { kind: "empty" };
+    const t = ginQueryTerm(elemType, qv);
+    if (t === null) return { kind: "empty" }; // c equals no element of the type
+    push(t);
+  } else {
+    // A NULL whole-array query is 3VL-NULL for every row → never TRUE (NULL/non-array → empty).
+    if (qv.kind !== "array") return { kind: "empty" };
+    // unmatchable: a query element no stored element can equal (an f64 not exactly an f32 against
+    // an f32[] index — ginQueryTerm). It reaches no posting list, so @> and array = (which need
+    // EVERY query element present) are provably empty; && skips it.
+    let unmatchable = false;
+    for (const el of qv.elements) {
+      if (el.kind === "null") {
+        hasNull = true; // a NULL element carries no term
+        continue;
+      }
+      const t = ginQueryTerm(elemType, el);
+      if (t === null) unmatchable = true;
+      else push(t);
+    }
+    isEmpty = qv.elements.length === 0;
+    if (unmatchable && strategy !== "overlaps") return { kind: "empty" };
+  }
+  terms.sort(cmpBytes);
+  // @> '{}': every non-NULL array contains the empty array — not derivable from the index (which
+  // knows only rows that HAVE terms), so fall back to the full scan.
+  if (strategy === "contains" && isEmpty) return { kind: "fullScan" };
+  // @> a query containing a NULL element is never TRUE (strict element equality).
+  if (strategy === "contains" && hasNull) return { kind: "empty" };
+  // col = Q with NO non-NULL term — '{}' or an all-NULL Q. The rows it matches ({}, {NULL}, …) carry
+  // NO index terms, so the index cannot enumerate them: fall back to the full scan (gin.md §6). NOT a
+  // provably-empty bound — and a Q with ≥1 non-NULL element is NOT caught here (it gathers, even when
+  // it also has a NULL element).
+  if (strategy === "equal" && terms.length === 0) return { kind: "fullScan" };
+  // && with no non-NULL term (empty or all-NULL Q) overlaps nothing.
+  if (strategy === "overlaps" && terms.length === 0) return { kind: "empty" };
+  return { kind: "terms", terms };
+}
+
+// jsonbQueryTerms is the jsonb_ops query terms (gin.md §2.1). @> gathers the query document's own
+// index terms (ALL); ? the one key term; ?| / ?& the key terms of the array's non-NULL elements (ANY /
+// ALL). A NULL operand is provably empty (every strategy is strict); a term-less @> query and a
+// key-less ?& fall back to the full scan ({} is contained by every object, ?& '{}' holds for every
+// document); a key-less ?| matches nothing.
+function jsonbQueryTerms(strategy: GinStrategy, qv: Value): GinQuery {
+  if (qv.kind === "null") return { kind: "empty" };
+  if (strategy === "jsonContains") {
+    if (qv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb @> operand");
+    const terms = ginJsonbIndexTerms(qv.node);
+    return terms.length === 0 ? { kind: "fullScan" } : { kind: "terms", terms };
+  }
+  if (strategy === "jsonHasKey") {
+    if (qv.kind !== "text") throw new Error("resolver guarantees a text ? operand");
+    return { kind: "terms", terms: [ginJsonbKeyTerm(qv.text)] };
+  }
+  // `?|` / `?&`: the key terms of K's NON-NULL elements (NULL elements are skipped).
+  if (qv.kind !== "array") throw new Error("resolver guarantees a text[] ?| / ?& operand");
+  const seen = new Set<string>();
+  const terms: Uint8Array[] = [];
+  for (const el of qv.elements) {
+    if (el.kind === "null") continue;
+    if (el.kind !== "text") throw new Error("a text[] operand has text/NULL elements");
+    const t = ginJsonbKeyTerm(el.text);
+    const k = byteKey(t);
+    if (!seen.has(k)) {
+      seen.add(k);
+      terms.push(t);
+    }
+  }
+  terms.sort(cmpBytes);
+  if (terms.length === 0)
+    return strategy === "jsonHasAllKeys" ? { kind: "fullScan" } : { kind: "empty" };
+  return { kind: "terms", terms };
+}
+
 // ginQueryTerm is the GIN term for one non-NULL query value against an index whose elements are
 // elem — the element's order-preserving key encoding (gin.md §4), the same bytes the entries carry —
 // or null when the value can equal NO stored element. A float query value may be the OTHER float
@@ -25396,31 +25594,33 @@ export function ginEntries(
 ): Uint8Array[] {
   const ci = cols[0]!;
   const colType = columns[ci]!.type;
-  if (typeIsJsonb(colType)) {
-    // jsonb_ops (gin.md §2.1/§4.1): the document's term set, already deduplicated and byte-sorted.
-    // A large document spills like any variable-width value, so it must be resolved first. A SQL
-    // NULL document yields no entry.
-    const doc = residentValue(row[ci]!);
-    if (doc.kind !== "jsonb") return [];
-    return ginJsonbIndexTerms(doc.node).map((term) => {
-      const out = new Uint8Array(term.length + storageKey.length);
-      out.set(term, 0);
-      out.set(storageKey, term.length);
-      return out;
-    });
-  }
-  if (colType.kind !== "array")
+  if (!typeIsJsonb(colType) && colType.kind !== "array")
     throw new Error("a GIN index column is an array or jsonb (CREATE INDEX gate)");
+  // A large array or document spills like any variable-width value, so a stored row's value may be
+  // deferred; it must be resolved — skipping it would silently drop (or fail to remove) its posting
+  // entries.
+  return ginValueTerms(colType, residentValue(row[ci]!)).map((term) => {
+    const out = new Uint8Array(term.length + storageKey.length);
+    out.set(term, 0);
+    out.set(storageKey, term.length);
+    return out;
+  });
+}
+
+// ginValueTerms is one value's GIN term set (gin.md §4): its distinct terms in ascending byte order —
+// an array's non-NULL element terms, or a jsonb document's jsonb_ops terms (gin.md §2.1/§4.1). A NULL
+// value has none. The entries of a GIN index and ANALYZE's term counts (statistics.md §4.5) share
+// this one extraction.
+export function ginValueTerms(colType: Type, value: Value): Uint8Array[] {
+  // jsonb_ops: the document's term set, already deduplicated and byte-sorted.
+  if (typeIsJsonb(colType)) return value.kind === "jsonb" ? ginJsonbIndexTerms(value.node) : [];
+  if (colType.kind !== "array" || value.kind !== "array") return [];
   const elemTy = typeScalar(colType.elem);
-  // A large array spills like any variable-width value, so a stored row's array may be deferred; it
-  // must be resolved — skipping it would silently drop (or fail to remove) its posting entries.
-  const v = residentValue(row[ci]!);
-  if (v.kind !== "array") return [];
   // Dedup by the encoded term (the key is canonical under SQL =, so byte-dedup == =-dedup, and
   // byte-sort == value-sort) generically over every admitted element type.
   const seen = new Set<string>();
   const terms: Uint8Array[] = [];
-  for (const el of v.elements) {
+  for (const el of value.elements) {
     if (el.kind === "null") continue; // a NULL element carries no term; a non-keyable element is impossible
     // the shared element term — a text element is its C key (gin.md §4.2), so it never collates.
     const term = ginElementTerm(elemTy, el);
@@ -25431,12 +25631,7 @@ export function ginEntries(
     }
   }
   terms.sort(cmpBytes);
-  return terms.map((term) => {
-    const out = new Uint8Array(term.length + storageKey.length);
-    out.set(term, 0);
-    out.set(storageKey, term.length);
-    return out;
-  });
+  return terms;
 }
 
 // cmpBytes compares two byte strings lexicographically (-1/0/1), the on-disk storage-key order.
@@ -29741,6 +29936,8 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("average_width", "i64", false),
         col("mcv_count", "i32", true),
         col("histogram_count", "i32", true),
+        // GIN term-list length; NULL for a term-ineligible column (statistics.md §8).
+        col("term_count", "i32", false),
       ]);
   }
 }

@@ -174,6 +174,10 @@
 #   gin_bytea — GIN over bytea[] (gin.md §4.3): the same pair over each element's bytea key cut at 128
 #              bytes (embedded 0x00 bytes, the empty value, long values sharing a prefix). Both must
 #              return the by-construction rows of byte-exact equality.
+#   gin_stats — GIN term statistics (statistics.md §4.5/§6.1): the same `tags @> Q AND n = k` and
+#              `c = ANY(tags)` queries before and after ANALYZE, which flips their plans between the GIN
+#              index, the ordered index on n, and a full scan, plus the `<@` full-scan spellings. All
+#              must return the by-construction rows.
 #   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
 #              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
@@ -414,6 +418,11 @@ GIN_BYTEA_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan
                    query.gin_element_types query.gin_bytea_elements dml.insert dml.insert_multi_row
                    query.select query.order_by types.i32 types.bytea types.array func.array
                    func.array_containment func.array_quantified cast.operator].freeze
+GIN_STATS_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.gin_index query.gin_scan
+                   query.gin_any_eq maintenance.analyze maintenance.analyze_gin_terms dml.insert
+                   dml.insert_select query.select query.set_returning query.order_by query.where_eq
+                   types.i32 types.i64 types.array func.array func.array_containment
+                   func.array_quantified expr.arithmetic cast.operator].freeze
 GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
               dml.insert_multi_row query.select query.order_by types.i32 types.range
               func.range_constructors func.range_operators].freeze
@@ -2153,6 +2162,50 @@ def gen_gin_bytea(seed)
   q(out, "I", "SELECT id FROM t WHERE b @> #{arr.call(pair)} ORDER BY id", contains.call(pair))
   out << "# full scan — MUST match"
   q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair)} <@ b ORDER BY id", contains.call(pair))
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GIN term statistics (plans flip under ANALYZE; rows never change) ----------------
+# A skewed tag column: 0 in every row, `g % a` in a fraction, and a per-row unique tag `1000 + g`,
+# beside an ordered index on `n = g % m`. Before ANALYZE every GIN strategy takes the default
+# selectivity; after it, rare tags pick the GIN index, the every-row tag a full scan, and the
+# conjunctions trade the GIN bound against the ordered one. `Q <@ tags` is the same predicate and
+# never GIN-accelerated. Expected rows: modular arithmetic, known by construction.
+def gen_gin_stats(seed)
+  rng = Random.new(seed)
+  n = rng.rand(300..900)
+  a = rng.rand(3..12)
+  m = rng.rand(5..15)
+  tags = ->(g) { [0, g % a, 1000 + g] }
+  out = header(seed, GIN_STATS_REQ, "GIN term statistics (plans flip under ANALYZE; rows never change)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], n i32)")
+  stmt(out, "INSERT INTO t SELECT g::i32, ARRAY[0::i32, (g % #{a})::i32, (1000 + g)::i32], (g % #{m})::i32 " \
+            "FROM generate_series(1, #{n}) AS g")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+  stmt(out, "CREATE INDEX t_n ON t (n)")
+  rare = 1000 + rng.rand(1..n)
+  common = rng.rand(0...a)
+  k = rng.rand(0...m)
+  ids = ->(pred) { (1..n).select { |g| pred.call(g) }.map(&:to_s) }
+  queries = [
+    ["tags @> '{#{rare}}'::i32[] AND n = #{k}", "'{#{rare}}'::i32[] <@ tags AND n = #{k}",
+     ->(g) { tags.call(g).include?(rare) && g % m == k }],
+    ["tags @> '{0}'::i32[] AND n = #{k}", "'{0}'::i32[] <@ tags AND n = #{k}", ->(g) { g % m == k }],
+    ["tags @> '{0,#{common}}'::i32[]", "'{0,#{common}}'::i32[] <@ tags", ->(g) { tags.call(g).include?(common) }],
+    ["#{common} = ANY(tags) AND n = #{k}", "'{#{common}}'::i32[] <@ tags AND n = #{k}",
+     ->(g) { tags.call(g).include?(common) && g % m == k }],
+    ["tags && '{#{rare},#{common}}'::i32[]", "('{#{rare}}'::i32[] <@ tags OR '{#{common}}'::i32[] <@ tags)",
+     ->(g) { tags.call(g).include?(rare) || tags.call(g).include?(common) }]
+  ]
+  [false, true].each do |analyzed|
+    stmt(out, "ANALYZE t") if analyzed
+    queries.each do |gin_pred, scan_pred, pred|
+      out << "# #{analyzed ? 'after' : 'before'} ANALYZE: #{gin_pred}"
+      q(out, "I", "SELECT id FROM t WHERE #{gin_pred} ORDER BY id", ids.call(pred))
+      out << "# full scan (<@ is not GIN-accelerated) — MUST match"
+      q(out, "I", "SELECT id FROM t WHERE #{scan_pred} ORDER BY id", ids.call(pred))
+    end
+  end
   out.join("\n") + "\n"
 end
 
@@ -4262,6 +4315,7 @@ SCENARIOS = {
   "gin_jsonb" => method(:gen_gin_jsonb),
   "gin_skip" => method(:gen_gin_skip),
   "gin_text" => method(:gen_gin_text),
+  "gin_stats" => method(:gen_gin_stats),
   "gin_dec" => method(:gen_gin_decimal),
   "gin_bytea" => method(:gen_gin_bytea),
   "gist" => method(:gen_gist),

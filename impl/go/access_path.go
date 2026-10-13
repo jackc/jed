@@ -1754,31 +1754,82 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		return nil, 0, 0, err
 	}
 	if gb.jsonb {
-		return db.ginJsonbBoundRows(store, gb, qv, meter, mask, keysOnly)
+		if qv, err = residentValue(qv); err != nil {
+			return nil, 0, 0, err
+		}
 	}
-	// Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
-	// entries carry, so a term doubles as its posting-list prefix below. Encoding now lets us dedup
-	// distinct terms by bytes (a bijection: byte-dedup == value-dedup, byte-sort == value-sort)
-	// generically over every admitted element type.
+	q := ginQueryTerms(gb.opclass(), gb.strategy, qv)
+	switch q.kind {
+	case ginQueryEmpty:
+		return nil, 0, 0, nil
+	case ginQueryFullScan:
+		// Rows the index cannot enumerate (they carry no terms) may match: scan them all and let the
+		// residual filter keep the right ones (gin.md §6 / §2.1).
+		return store.ScanWithUnits(mask)
+	}
+	return db.ginGather(store, gb, q.terms, gb.strategy.isAny(), meter, mask, keysOnly)
+}
+
+// isAny reports whether the strategy's posting lists combine by union (mode ANY: `&&`, `?|`) rather
+// than intersection (mode ALL).
+func (s ginStrategy) isAny() bool {
+	return s == ginOverlaps || s == ginJsonbExistsAny
+}
+
+// opclass is the bound column's GIN operator class.
+func (gb *ginBoundPlan) opclass() ginOpclass {
+	return ginOpclass{jsonb: gb.jsonb, elem: gb.elemType}
+}
+
+// ginQueryKind is the outcome of a GIN opclass's extract_query_terms (gin.md §2/§6): distinct query
+// terms to gather (sorted), a provably-empty bound, or the full-scan fallback for a query whose
+// matches the index cannot enumerate.
+type ginQueryKind int
+
+const (
+	ginQueryGather ginQueryKind = iota
+	ginQueryEmpty
+	ginQueryFullScan
+)
+
+type ginQuery struct {
+	kind  ginQueryKind
+	terms [][]byte
+}
+
+// ginQueryTerms is a resident GIN query value's terms under its operator class and strategy — what
+// the gather reads, and what the planner prices from GIN term statistics (statistics.md §6.1).
+func ginQueryTerms(opclass ginOpclass, strategy ginStrategy, qv Value) ginQuery {
+	if opclass.jsonb {
+		return jsonbQueryTerms(strategy, qv)
+	}
+	return arrayQueryTerms(strategy, opclass.elem, qv)
+}
+
+// arrayQueryTerms is the array_ops query terms (gin.md §2/§6). Each term is the element's
+// order-preserving key encoding (gin.md §4) — the SAME bytes the entries carry, so a term doubles as
+// its posting-list prefix. Encoding now lets us dedup distinct terms by bytes (a bijection:
+// byte-dedup == value-dedup, byte-sort == value-sort) generically over every admitted element type.
+func arrayQueryTerms(strategy ginStrategy, elem scalarType, qv Value) ginQuery {
 	var terms [][]byte
 	hasNull := false
 	isEmpty := false
-	if gb.strategy == ginMember {
+	if strategy == ginMember {
 		// `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
 		// so the bound is provably empty (gin.md §6). c may be a different numeric type than the
 		// elements (an integer against decimal[], a decimal against i32[]); ginQueryTerm converts it to
 		// the element type or reports that no element can equal it.
 		if qv.Kind == ValNull {
-			return nil, 0, 0, nil
+			return ginQuery{kind: ginQueryEmpty}
 		}
-		t, ok := ginQueryTerm(gb.elemType, qv)
+		t, ok := ginQueryTerm(elem, qv)
 		if !ok {
-			return nil, 0, 0, nil // c equals no element of the indexed type
+			return ginQuery{kind: ginQueryEmpty} // c equals no element of the indexed type
 		}
 		terms = append(terms, t)
 	} else {
 		if qv.Kind != ValArray {
-			return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
+			return ginQuery{kind: ginQueryEmpty} // a NULL whole-array (or non-array) query → provably empty
 		}
 		// unmatchable: a query element no stored element can equal (an f64 not exactly an f32 against
 		// an f32[] index — ginQueryTerm). It reaches no posting list, so @> and array = (which need
@@ -1790,7 +1841,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 				hasNull = true // a NULL element carries no term
 				continue
 			}
-			t, ok := ginQueryTerm(gb.elemType, el)
+			t, ok := ginQueryTerm(elem, el)
 			if !ok {
 				unmatchable = true
 				continue
@@ -1801,25 +1852,21 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 			}
 		}
 		isEmpty = len(qv.arrayVal().Elements) == 0
-		if unmatchable && gb.strategy != ginOverlaps {
-			return nil, 0, 0, nil
+		if unmatchable && strategy != ginOverlaps {
+			return ginQuery{kind: ginQueryEmpty}
 		}
 		slices.SortFunc(terms, bytes.Compare)
 	}
 
-	switch gb.strategy {
+	switch strategy {
 	case ginContains:
 		if isEmpty {
 			// @> '{}': every non-NULL array contains the empty array — not derivable from the index;
 			// fall back to the full scan (the residual filter keeps the right rows — gin.md §6).
-			entries, p, sl, e := store.ScanWithUnits(mask)
-			if e != nil {
-				return nil, 0, 0, e
-			}
-			return entries, p, sl, nil
+			return ginQuery{kind: ginQueryFullScan}
 		}
 		if hasNull {
-			return nil, 0, 0, nil // @> a query with a NULL element is never TRUE
+			return ginQuery{kind: ginQueryEmpty} // @> a query with a NULL element is never TRUE
 		}
 	case ginEqual:
 		if len(terms) == 0 {
@@ -1828,19 +1875,14 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 			// enumerate them: fall back to the full scan and let the residual = keep them (gin.md §6).
 			// NOT a provably-empty bound — and a Q with ≥1 non-NULL element is NOT caught here (it
 			// gathers, even when it also has a NULL element).
-			entries, p, sl, e := store.ScanWithUnits(mask)
-			if e != nil {
-				return nil, 0, 0, e
-			}
-			return entries, p, sl, nil
+			return ginQuery{kind: ginQueryFullScan}
 		}
 	case ginOverlaps:
 		if len(terms) == 0 {
-			return nil, 0, 0, nil // && with no non-NULL term overlaps nothing
+			return ginQuery{kind: ginQueryEmpty} // && with no non-NULL term overlaps nothing
 		}
 	}
-
-	return db.ginGather(store, gb, terms, gb.strategy == ginOverlaps, meter, mask, keysOnly)
+	return ginQuery{kind: ginQueryGather, terms: terms}
 }
 
 // ginGather is the shared inverted gather (gin.md §6 steps 2–4) over a non-empty, deduplicated,
@@ -1898,38 +1940,34 @@ func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, terms [][]byte,
 	return out, pages, slabs, nil
 }
 
-// ginJsonbBoundRows is the jsonb_ops gather (gin.md §2.1): the query terms + mode of the evaluated
-// query operand qv, with the degenerate shapes — `@>`: a NULL Q is provably empty, a term-less Q
-// (`{}`, `[]`, …) falls back to the full scan, else its index terms ALL; `?`: a NULL k is empty, else
-// its one key term; `?|`: a NULL K or no non-NULL key is empty, else the keys' terms ANY; `?&`: a NULL
-// K is empty, no non-NULL key falls back to the full scan, else the keys' terms ALL. The gather is
-// lossy; the residual operator rechecks every candidate.
-func (db *engine) ginJsonbBoundRows(store *tableStore, gb *ginBoundPlan, qv Value, meter *costMeter, mask []bool, keysOnly bool) ([]entry, int, int, error) {
-	qv, err := residentValue(qv)
-	if err != nil {
-		return nil, 0, 0, err
-	}
+// jsonbQueryTerms is the jsonb_ops query terms (gin.md §2.1) of a resident query operand qv, with the
+// degenerate shapes — `@>`: a NULL Q is provably empty, a term-less Q (`{}`, `[]`, …) falls back to
+// the full scan, else its index terms ALL; `?`: a NULL k is empty, else its one key term; `?|`: a NULL
+// K or no non-NULL key is empty, else the keys' terms ANY; `?&`: a NULL K is empty, no non-NULL key
+// falls back to the full scan, else the keys' terms ALL. The gather is lossy; the residual operator
+// rechecks every candidate.
+func jsonbQueryTerms(strategy ginStrategy, qv Value) ginQuery {
 	if qv.Kind == ValNull {
-		return nil, 0, 0, nil // every strategy is strict: a NULL query operand matches nothing
+		return ginQuery{kind: ginQueryEmpty} // every strategy is strict: a NULL query operand matches nothing
 	}
 	var terms [][]byte
-	switch gb.strategy {
+	switch strategy {
 	case ginJsonbContains:
 		if qv.Kind != ValJsonb {
-			return nil, 0, 0, nil
+			return ginQuery{kind: ginQueryEmpty}
 		}
 		terms = ginJsonbIndexTerms(qv.jsonb())
 		if len(terms) == 0 {
-			return store.ScanWithUnits(mask) // a term-less Q is contained by rows the index cannot enumerate
+			return ginQuery{kind: ginQueryFullScan} // a term-less Q is contained by rows the index cannot enumerate
 		}
 	case ginJsonbExists:
 		if qv.Kind != ValText {
-			return nil, 0, 0, nil
+			return ginQuery{kind: ginQueryEmpty}
 		}
 		terms = [][]byte{ginJsonbKeyTerm(qv.str())}
 	default: // ginJsonbExistsAny / ginJsonbExistsAll — a text[] of keys
 		if qv.Kind != ValArray {
-			return nil, 0, 0, nil
+			return ginQuery{kind: ginQueryEmpty}
 		}
 		for _, el := range qv.arrayVal().Elements {
 			if el.Kind == ValNull {
@@ -1938,15 +1976,15 @@ func (db *engine) ginJsonbBoundRows(store *tableStore, gb *ginBoundPlan, qv Valu
 			terms = append(terms, ginJsonbKeyTerm(el.str()))
 		}
 		if len(terms) == 0 {
-			if gb.strategy == ginJsonbExistsAny {
-				return nil, 0, 0, nil // ?| with no non-NULL key matches nothing
+			if strategy == ginJsonbExistsAny {
+				return ginQuery{kind: ginQueryEmpty} // ?| with no non-NULL key matches nothing
 			}
-			return store.ScanWithUnits(mask) // ?& with no non-NULL key is TRUE for every non-NULL document
+			return ginQuery{kind: ginQueryFullScan} // ?& with no non-NULL key is TRUE for every non-NULL document
 		}
 		slices.SortFunc(terms, bytes.Compare)
 		terms = slices.CompactFunc(terms, bytes.Equal)
 	}
-	return db.ginGather(store, gb, terms, gb.strategy == ginJsonbExistsAny, meter, mask, keysOnly)
+	return ginQuery{kind: ginQueryGather, terms: terms}
 }
 
 // ginQueryTerm is the GIN term for one non-NULL query value against an index whose elements are

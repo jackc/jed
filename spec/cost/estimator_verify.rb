@@ -71,6 +71,8 @@ def main
   expect_equal(data, "statistics_max_value_bytes", 128)
   expect_equal(data, "statistics_ndv_scale_numerator", 1)
   expect_equal(data, "statistics_ndv_scale_denominator", 10)
+  expect_equal(data, "statistics_term_entries", 100)
+  expect_equal(data, "statistics_term_bucket_width", 10_000)
 
   entries = data["selectivity"] || []
   selectivity_count = entries.length

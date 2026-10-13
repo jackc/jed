@@ -41,6 +41,10 @@ statistics_histogram_bounds = 101
 statistics_max_value_bytes = 128
 statistics_ndv_scale_numerator = 1
 statistics_ndv_scale_denominator = 10
+# GIN term frequencies (statistics.md §4.5): the persisted most-common-term list length and the
+# lossy-counting bucket width, in term occurrences.
+statistics_term_entries = 100
+statistics_term_bucket_width = 10000
 
 # PostgreSQL's no-statistics selectivity defaults, expressed as exact reduced rationals rather
 # than binary floats. `matching` is PG's broader "other matching operator" default; `boolean` and

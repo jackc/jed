@@ -80,6 +80,23 @@ function statisticsTableDB(): Engine {
   return db;
 }
 
+// statisticsTermsTableDB is the v42 GIN term statistics golden (statistics.md §4.5): ANALYZE t (tags,
+// doc) over 105 rows whose tags truncate to the 100-term list and whose four documents give key and
+// value terms. Must match verify.rb's STATISTICS_TERMS_TABLE.
+function statisticsTermsTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], doc jsonb)");
+  run(
+    db,
+    "INSERT INTO t SELECT g::i32, ARRAY[g::i32, 0::i32], CASE g " +
+      `WHEN 1 THEN '{"a": 1, "b": [true, "x"]}'::jsonb WHEN 2 THEN '{"a": 2}'::jsonb ` +
+      `WHEN 3 THEN '[1, "a"]'::jsonb WHEN 4 THEN '"s"'::jsonb END ` +
+      "FROM generate_series(1, 105) AS g",
+  );
+  run(db, "ANALYZE t (tags, doc)");
+  return db;
+}
+
 // compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
 // the concatenation of the members' encodings (4-byte i32 then 2-byte i16,
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
@@ -1156,6 +1173,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "row_count_table.jed", build: rowCountTableDB },
     { name: "statistics_table.jed", build: statisticsTableDB },
+    { name: "statistics_terms_table.jed", build: statisticsTermsTableDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
     { name: "varchar_table.jed", build: varcharTableDB },

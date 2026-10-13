@@ -16,6 +16,8 @@ export const STATISTICS_HISTOGRAM_BOUNDS = 101;
 export const STATISTICS_MAX_VALUE_BYTES = 128;
 export const STATISTICS_NDV_SCALE_NUMERATOR = 1n;
 export const STATISTICS_NDV_SCALE_DENOMINATOR = 10n;
+export const STATISTICS_TERM_ENTRIES = 100;
+export const STATISTICS_TERM_BUCKET_WIDTH = 10000;
 
 export const SELECTIVITY_EQUALITY: EstimatorFraction = { numerator: 1n, denominator: 200n };
 export const SELECTIVITY_INEQUALITY: EstimatorFraction = { numerator: 1n, denominator: 3n };

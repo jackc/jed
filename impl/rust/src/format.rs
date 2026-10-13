@@ -126,7 +126,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v41: a composite-type entry admits a range-typed field — `field_type_code 17` followed by the
 // one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3);
 // no other byte layout change.
-const FORMAT_VERSION: u16 = 41;
+const FORMAT_VERSION: u16 = 42;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -2334,8 +2334,10 @@ impl Engine {
         // v25: the free-list is read from the persisted chain (below), not reconstructed by a
         // reachability walk — so the catalog + skeleton load no longer tracks a `reached` set.
         let mut cat_page = meta.root_page;
-        let mut statistics_expected: std::collections::HashMap<(String, usize), (usize, usize)> =
-            std::collections::HashMap::new();
+        let mut statistics_expected: std::collections::HashMap<
+            (String, usize),
+            (usize, usize, usize),
+        > = std::collections::HashMap::new();
         let mut loaded_views: Vec<crate::catalog::ViewDef> = Vec::new();
         let mut live = LiveCount {
             live: meta.live_pages,
@@ -2462,11 +2464,14 @@ impl Engine {
             cat_page = page.next_page;
         }
 
-        for ((table, column), (mcv_count, histogram_count)) in statistics_expected {
+        for ((table, column), (mcv_count, histogram_count, term_count)) in statistics_expected {
             let statistics = snap
                 .column_statistics(&table, column)
                 .ok_or_else(|| corrupt("missing statistics summary"))?;
-            if statistics.mcv.len() != mcv_count || statistics.histogram.len() != histogram_count {
+            if statistics.mcv.len() != mcv_count
+                || statistics.histogram.len() != histogram_count
+                || statistics.terms.as_ref().map_or(0, |t| t.entries.len()) != term_count
+            {
                 return Err(corrupt("incomplete statistics entry group"));
             }
         }
@@ -3225,6 +3230,9 @@ fn statistics_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
         if statistics.distinct_count.is_some() {
             flags |= 0b10;
         }
+        if statistics.terms.is_some() {
+            flags |= 0b100;
+        }
         summary.push(flags);
         summary.extend_from_slice(&statistics.analyzed_rows.to_be_bytes());
         summary.extend_from_slice(&statistics.null_count.to_be_bytes());
@@ -3234,6 +3242,11 @@ fn statistics_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
         summary.extend_from_slice(&statistics.sample_nonnull_rows.to_be_bytes());
         summary.extend_from_slice(&(statistics.mcv.len() as u16).to_be_bytes());
         summary.extend_from_slice(&(statistics.histogram.len() as u16).to_be_bytes());
+        if let Some(terms) = &statistics.terms {
+            summary.extend_from_slice(&terms.occurrences.to_be_bytes());
+            summary.extend_from_slice(&terms.untracked_rows.to_be_bytes());
+            summary.extend_from_slice(&(terms.entries.len() as u16).to_be_bytes());
+        }
         entries.push(summary);
 
         let col_type = snapshot.store(table_key).column_type(column);
@@ -3256,6 +3269,18 @@ fn statistics_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
             let encoded = encode_value(col_type, &bound.value);
             entry.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
             entry.extend_from_slice(&encoded);
+            entries.push(entry);
+        }
+        // v42 GIN term items (statistics.md §4.5/§7).
+        for (ordinal, (term, rows)) in statistics.terms.iter().flat_map(|t| &t.entries).enumerate()
+        {
+            let mut entry = vec![4u8, 3u8];
+            push_string(&mut entry, &table.name);
+            entry.extend_from_slice(&(column as u16).to_be_bytes());
+            entry.extend_from_slice(&(ordinal as u16).to_be_bytes());
+            entry.extend_from_slice(&rows.to_be_bytes());
+            entry.extend_from_slice(&(term.len() as u16).to_be_bytes());
+            entry.extend_from_slice(term);
             entries.push(entry);
         }
     }
@@ -3326,7 +3351,7 @@ fn decode_statistics_entry(
     buf: &[u8],
     pos: &mut usize,
     snapshot: &mut Snapshot,
-    expected: &mut std::collections::HashMap<(String, usize), (usize, usize)>,
+    expected: &mut std::collections::HashMap<(String, usize), (usize, usize, usize)>,
 ) -> Result<()> {
     let subkind = read_u8(buf, pos)?;
     let table_name = read_string(buf, pos)?;
@@ -3349,7 +3374,7 @@ fn decode_statistics_entry(
                 return Err(corrupt("duplicate statistics summary"));
             }
             let flags = read_u8(buf, pos)?;
-            if flags & !0b11 != 0 {
+            if flags & !0b111 != 0 {
                 return Err(corrupt("reserved statistics flag set"));
             }
             let analyzed_rows = read_i64(buf, pos)?;
@@ -3361,6 +3386,16 @@ fn decode_statistics_entry(
             let mcv_count = read_u16(buf, pos)? as usize;
             let histogram_count = read_u16(buf, pos)? as usize;
             let distribution = flags & 0b10 != 0;
+            let term_flag = flags & 0b100 != 0;
+            let (term_occurrences, untracked_rows, term_count) = if term_flag {
+                (
+                    read_i64(buf, pos)?,
+                    read_i64(buf, pos)?,
+                    read_u16(buf, pos)? as usize,
+                )
+            } else {
+                (0, 0, 0)
+            };
             if analyzed_rows < 0
                 || null_count < 0
                 || null_count > analyzed_rows
@@ -3375,10 +3410,15 @@ fn decode_statistics_entry(
                 || (distribution && distinct_raw > analyzed_rows - null_count)
                 || (histogram_count != 0 && histogram_count < 2)
                 || distribution != crate::executor::distribution_eligible(&table.columns[column].ty)
+                || term_flag != crate::executor::term_eligible(&table.columns[column].ty)
+                || term_occurrences < 0
+                || untracked_rows < 0
+                || untracked_rows > analyzed_rows - null_count
+                || term_count > crate::estimator_constants::STATISTICS_TERM_ENTRIES
             {
                 return Err(corrupt("invalid statistics summary"));
             }
-            expected.insert(group_key, (mcv_count, histogram_count));
+            expected.insert(group_key, (mcv_count, histogram_count, term_count));
             snapshot.put_column_statistics(
                 &table_key,
                 column,
@@ -3392,11 +3432,16 @@ fn decode_statistics_entry(
                     sample_nonnull_rows,
                     mcv: Vec::new(),
                     histogram: Vec::new(),
+                    terms: term_flag.then(|| crate::executor::TermStatistics {
+                        occurrences: term_occurrences,
+                        untracked_rows,
+                        entries: Vec::new(),
+                    }),
                 },
             );
         }
         1 => {
-            let (mcv_count, _) = *expected
+            let (mcv_count, _, _) = *expected
                 .get(&group_key)
                 .ok_or_else(|| corrupt("statistics MCV precedes its summary"))?;
             let ordinal = read_u16(buf, pos)? as usize;
@@ -3432,7 +3477,7 @@ fn decode_statistics_entry(
                 .push(crate::executor::StatisticsMcv { value, frequency });
         }
         2 => {
-            let (_, histogram_count) = *expected
+            let (_, histogram_count, _) = *expected
                 .get(&group_key)
                 .ok_or_else(|| corrupt("statistics histogram precedes its summary"))?;
             let ordinal = read_u16(buf, pos)? as usize;
@@ -3452,6 +3497,42 @@ fn decode_statistics_entry(
                 return Err(corrupt("statistics histogram is out of order"));
             }
             statistics.histogram.push(value);
+        }
+        3 => {
+            let (_, _, term_count) = *expected
+                .get(&group_key)
+                .ok_or_else(|| corrupt("statistics term precedes its summary"))?;
+            let ordinal = read_u16(buf, pos)? as usize;
+            let rows = read_i64(buf, pos)?;
+            let term_len = read_u16(buf, pos)? as usize;
+            if term_len == 0
+                || term_len > crate::estimator_constants::STATISTICS_MAX_VALUE_BYTES
+                || *pos + term_len > buf.len()
+            {
+                return Err(corrupt("invalid statistics term length"));
+            }
+            let term = buf[*pos..*pos + term_len].to_vec();
+            *pos += term_len;
+            let statistics = snapshot
+                .column_statistics_mut(&table_key, column)
+                .expect("summary was installed");
+            let nonnull = statistics.analyzed_rows - statistics.null_count;
+            let Some(terms) = statistics.terms.as_mut() else {
+                return Err(corrupt("statistics term under a term-ineligible summary"));
+            };
+            if ordinal != terms.entries.len() || ordinal >= term_count || rows < 1 || rows > nonnull
+            {
+                return Err(corrupt("invalid statistics term ordinal or row count"));
+            }
+            if terms.entries.iter().any(|(existing, _)| *existing == term) {
+                return Err(corrupt("duplicate statistics term"));
+            }
+            if let Some((previous, previous_rows)) = terms.entries.last()
+                && (rows > *previous_rows || (rows == *previous_rows && term < *previous))
+            {
+                return Err(corrupt("statistics terms are out of order"));
+            }
+            terms.entries.push((term, rows));
         }
         _ => return Err(corrupt("unknown statistics entry subkind")),
     }

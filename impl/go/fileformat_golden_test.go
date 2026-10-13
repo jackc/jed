@@ -86,6 +86,20 @@ func statisticsTableDB(t *testing.T) *Session {
 	return db
 }
 
+// statisticsTermsTableDB is v42 GIN term statistics (statistics.md §4.5): `ANALYZE t (tags, doc)`
+// over 105 rows whose tags truncate to the 100-term list and whose four documents give key and value
+// terms. Must match verify.rb's STATISTICS_TERMS_TABLE.
+func statisticsTermsTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], doc jsonb)")
+	run(t, db, "INSERT INTO t SELECT g::i32, ARRAY[g::i32, 0::i32], CASE g "+
+		`WHEN 1 THEN '{"a": 1, "b": [true, "x"]}'::jsonb WHEN 2 THEN '{"a": 2}'::jsonb `+
+		`WHEN 3 THEN '[1, "a"]'::jsonb WHEN 4 THEN '"s"'::jsonb END `+
+		"FROM generate_series(1, 105) AS g")
+	run(t, db, "ANALYZE t (tags, doc)")
+	return db
+}
+
 // compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
 // the concatenation of the members' encodings (4-byte i32 then 2-byte i16,
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
@@ -1108,6 +1122,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"one_table_empty.jed", oneTableEmptyDB},
 		{"row_count_table.jed", rowCountTableDB},
 		{"statistics_table.jed", statisticsTableDB},
+		{"statistics_terms_table.jed", statisticsTermsTableDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
 		{"varchar_table.jed", varcharTableDB},

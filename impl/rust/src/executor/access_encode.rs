@@ -1493,6 +1493,33 @@ pub(crate) fn estimator_clamp_pages(rows: i64, nodes: i64, height: i64) -> i64 {
     }
 }
 
+/// A GIN candidate's `(scan rows, gin_entry, index pages)` from its column's term statistics
+/// (statistics.md §6.1), or `None` when the access-method default applies.
+fn gin_candidate_term_estimate(
+    bound: Option<&ScanBound>,
+    residual: Option<&RExpr>,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> Option<(i64, i64, i64)> {
+    let Some(ScanBound::Gin(bound)) = bound else {
+        return None;
+    };
+    let (strategy, operand) = gin_match(residual?, bound.col_global, bound.opclass)?;
+    if strategy != bound.strategy {
+        return None;
+    }
+    let column = bound.col_global.checked_sub(rel.offset)?;
+    let estimate = statistics_gin_estimate(rel, column, bound.opclass, strategy, operand, catalog)?;
+    let index = catalog.index_store_scoped(rel.db.as_deref(), &bound.name_key);
+    let (nodes, height) = (index.node_count() as i64, index.height() as i64);
+    let pages = estimator_clamp_pages(
+        statistics_scale(nodes, estimate.entries, estimate.total_entries.max(1)),
+        nodes,
+        height,
+    );
+    Some((estimate.rows, estimate.entries, pages))
+}
+
 pub(crate) fn estimate_scan_candidates(
     candidates: &[ScanCandidate<'_>],
     rel: &ScopeRel<'_>,
@@ -1559,6 +1586,13 @@ pub(crate) fn estimate_scan_candidates(
                 ScanCandidateKind::Gist => access_pages,
                 _ => 0,
             };
+            let (scan_rows, access_work, access_pages) = gin_candidate_term_estimate(
+                candidate.bound.as_ref(),
+                candidate.residual,
+                rel,
+                catalog,
+            )
+            .unwrap_or((scan_rows, access_work, access_pages));
             estimate_candidate(CandidateInputs {
                 kind,
                 index_name: &candidate.identity.index_name,
@@ -1705,6 +1739,10 @@ pub(crate) fn estimate_selected_scan(
         ScanCandidateKind::Gist => access_pages,
         _ => 0,
     };
+    let (scan_rows, access_work, access_pages) = gin_candidate_term_estimate(
+        bound, residual, rel, catalog,
+    )
+    .unwrap_or((scan_rows, access_work, access_pages));
     let mut candidate = estimate_candidate(CandidateInputs {
         kind: crate::estimator_constants::ACCESS_PATH_ORDER[kind as usize],
         index_name,
@@ -3291,31 +3329,33 @@ pub(crate) fn gin_entries(
     // posting entries.
     let opclass = GinOpclass::for_type(&columns[ci].ty)
         .expect("a GIN index column has an operator class (CREATE INDEX / ALTER gate)");
-    let elem_ty = match opclass {
-        GinOpclass::Array(elem) => elem,
-        GinOpclass::Jsonb => {
-            let terms = match &*resident(&row[ci])? {
-                Value::Jsonb(doc) => crate::json::gin_jsonb_index_terms(doc),
-                _ => Vec::new(), // a SQL NULL document has no terms
-            };
-            return Ok(gin_entry_keys(terms, storage_key));
-        }
-    };
-    let mut terms: Vec<Vec<u8>> = Vec::new();
-    if let Value::Array(arr) = &*resident(&row[ci])? {
-        for el in &arr.elements {
-            // a NULL element contributes no term; a non-keyable element is impossible under the gate
-            if !matches!(el, Value::Null) {
-                terms.push(gin_element_term(elem_ty, el));
-            }
-        }
-    }
-    // Dedup by the encoded term: the key is canonical under SQL `=` (a float -0/+0 or two NaNs, or
-    // span-equal intervals like `1 mon`/`30 days`, share one key), so byte-dedup == `=`-dedup, and
-    // byte-sort == value-sort (order-preserving). Each distinct term yields one entry.
-    terms.sort_unstable();
-    terms.dedup();
+    let terms = gin_value_terms(opclass, &*resident(&row[ci])?);
     Ok(gin_entry_keys(terms, storage_key))
+}
+
+/// One value's GIN term set (gin.md §4): its distinct terms in ascending byte order — an array's
+/// non-NULL element terms, or a `jsonb` document's `jsonb_ops` terms. A NULL value has none. The
+/// entries of a GIN index and ANALYZE's term counts (statistics.md §4.5) share this one extraction.
+pub(crate) fn gin_value_terms(opclass: GinOpclass, value: &Value) -> Vec<Vec<u8>> {
+    match (opclass, value) {
+        (GinOpclass::Jsonb, Value::Jsonb(doc)) => crate::json::gin_jsonb_index_terms(doc),
+        (GinOpclass::Array(elem_ty), Value::Array(arr)) => {
+            // a NULL element contributes no term; a non-keyable element is impossible under the gate
+            let mut terms: Vec<Vec<u8>> = arr
+                .elements
+                .iter()
+                .filter(|el| !matches!(el, Value::Null))
+                .map(|el| gin_element_term(elem_ty, el))
+                .collect();
+            // Dedup by the encoded term: the key is canonical under SQL `=` (a float -0/+0 or two
+            // NaNs, or span-equal intervals like `1 mon`/`30 days`, share one key), so byte-dedup ==
+            // `=`-dedup. Each distinct term yields one entry.
+            terms.sort_unstable();
+            terms.dedup();
+            terms
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The `array_ops` term of one non-NULL element (gin.md §4): the element type's order-preserving key

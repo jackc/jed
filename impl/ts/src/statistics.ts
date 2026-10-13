@@ -10,13 +10,15 @@ import {
   STATISTICS_MAX_VALUE_BYTES,
   STATISTICS_MCV_ENTRIES,
   STATISTICS_SAMPLE_ROWS,
+  STATISTICS_TERM_BUCKET_WIDTH,
+  STATISTICS_TERM_ENTRIES,
 } from "./estimator_constants.ts";
 import { encodeValue } from "./format.ts";
 import { compareBytes, unboundedBound } from "./pmap.ts";
 import type { TableStore } from "./storage.ts";
-import type { Type } from "./types.ts";
+import { type Type, typeIsJsonb } from "./types.ts";
 import type { Value } from "./value.ts";
-import { encodeTypedKey } from "./executor.ts";
+import { encodeTypedKey, ginValueTerms, isGinElementType } from "./executor.ts";
 
 export type StatisticsValue = { value: Value; key: Uint8Array };
 export type StatisticsMcv = { value: StatisticsValue; frequency: number };
@@ -30,7 +32,24 @@ export type ColumnStatistics = {
   sampleNonNullRows: number;
   mcv: StatisticsMcv[];
   histogram: StatisticsValue[];
+  // GIN term facts, present exactly for a term-eligible column (statistics.md §4.5).
+  terms: TermStatistics | null;
 };
+
+// A term-eligible column's GIN term facts (statistics.md §4.5): the saturated count of term
+// occurrences, the row-count estimate for an unlisted term (0 = the list is complete), and the most
+// common terms with their row counts, in descending count then ascending byte order.
+export type TermStatistics = {
+  occurrences: bigint;
+  untrackedRows: bigint;
+  entries: [Uint8Array, bigint][];
+};
+
+// termEligible reports whether a column type has a GIN operator class (statistics.md §4.5): jsonb,
+// or an array whose element type a GIN index admits.
+export function termEligible(type: Type): boolean {
+  return typeIsJsonb(type) || (type.kind === "array" && isGinElementType(type.elem));
+}
 
 type SampleRow = {
   priority: bigint;
@@ -139,6 +158,59 @@ function kmvCount(heap: bigint[], nonnullRows: bigint): bigint {
   return estimate > nonnullRows ? nonnullRows : estimate;
 }
 
+// TermCounter is PostgreSQL's lossy counting over GIN term occurrences (statistics.md §4.5), bucket
+// width STATISTICS_TERM_BUCKET_WIDTH. Entries are keyed by the term's byte-exact latin1 string;
+// removal is a per-entry predicate and finish sorts by (count, bytes), so the Map's iteration order
+// never reaches the result.
+class TermCounter {
+  occurrences = 0n;
+  entries = new Map<string, { term: Uint8Array; count: bigint; delta: bigint }>();
+  pruned = false;
+  oversized = false;
+
+  add(term: Uint8Array): void {
+    if (this.occurrences < I64_MAX) this.occurrences++;
+    const width = BigInt(STATISTICS_TERM_BUCKET_WIDTH);
+    const bucket = (this.occurrences + width - 1n) / width;
+    if (term.length > STATISTICS_MAX_VALUE_BYTES) {
+      this.oversized = true;
+    } else {
+      const key = byteKey(term);
+      const entry = this.entries.get(key);
+      if (entry !== undefined) entry.count++;
+      else this.entries.set(key, { term: term.slice(), count: 1n, delta: bucket - 1n });
+    }
+    if (this.occurrences % width === 0n) {
+      for (const [key, entry] of this.entries) {
+        if (entry.count + entry.delta <= bucket) {
+          this.entries.delete(key);
+          this.pruned = true;
+        }
+      }
+    }
+  }
+
+  finish(): TermStatistics {
+    const ranked: [Uint8Array, bigint][] = [...this.entries.values()]
+      .map((entry): [Uint8Array, bigint] => [entry.term, entry.count])
+      .sort((a, b) => (a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : compareBytes(a[0], b[0])));
+    let untracked = 0n;
+    const next = ranked[STATISTICS_TERM_ENTRIES];
+    if (next !== undefined && next[1] > untracked) untracked = next[1];
+    if (this.pruned) {
+      const width = BigInt(STATISTICS_TERM_BUCKET_WIDTH);
+      const buckets = this.occurrences / width + (this.occurrences % width !== 0n ? 1n : 0n);
+      if (buckets > untracked) untracked = buckets;
+    }
+    if (this.oversized && untracked < 1n) untracked = 1n;
+    return {
+      occurrences: this.occurrences,
+      untrackedRows: untracked,
+      entries: ranked.slice(0, STATISTICS_TERM_ENTRIES),
+    };
+  }
+}
+
 type Group = { value: StatisticsValue; frequency: number };
 
 function finishDistribution(
@@ -202,7 +274,9 @@ export function collectColumnStatistics(
   meter: Meter,
 ): ColumnStatistics {
   meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
-  const eligible = distributionEligible(table.columns[column]!.type);
+  const columnType = table.columns[column]!.type;
+  const eligible = distributionEligible(columnType);
+  const termCounter = termEligible(columnType) ? new TermCounter() : null;
   const sample: SampleRow[] = [];
   const kmv: bigint[] = [];
   const kmvSeen = new Set<bigint>();
@@ -244,6 +318,12 @@ export function collectColumnStatistics(
     if (widthSum > I64_MAX) widthSum = I64_MAX;
     meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, width)));
     if (key !== null) retainKmv(kmv, kmvSeen, fnv1a64(key));
+    if (termCounter !== null) {
+      for (const term of ginValueTerms(columnType, value)) {
+        meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, term.length)));
+        termCounter.add(term);
+      }
+    }
     const oversized =
       bodyLength > STATISTICS_MAX_VALUE_BYTES ||
       (key !== null && key.length > STATISTICS_MAX_VALUE_BYTES);
@@ -274,5 +354,6 @@ export function collectColumnStatistics(
     distinctCount,
     sampleRows: sample.length,
     ...distribution,
+    terms: termCounter === null ? null : termCounter.finish(),
   };
 }

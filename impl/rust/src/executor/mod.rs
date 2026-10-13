@@ -53,7 +53,7 @@ pub(crate) use std::sync::LazyLock;
 mod window;
 pub(crate) use window::*;
 mod access_path;
-pub(crate) use access_path::index_store_bound_entries;
+pub(crate) use access_path::{GinQuery, gin_query_terms, index_store_bound_entries};
 mod aggregate;
 pub(crate) use aggregate::{
     agg_order_tuple, jsonb_image_node, push_json_agg_elem, push_json_object_agg_pair,
@@ -5543,6 +5543,8 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("average_width", ScalarType::Int64, false),
                 col("mcv_count", ScalarType::Int32, true),
                 col("histogram_count", ScalarType::Int32, true),
+                // GIN term-list length; NULL for a term-ineligible column (statistics.md §8).
+                col("term_count", ScalarType::Int32, false),
             ],
         ),
         SrfKind::JedSequences => table(

@@ -30,6 +30,105 @@ type columnStatistics struct {
 	SampleNonNullRows uint32
 	MCV               []statisticsMCV
 	Histogram         []statisticsValue
+	// Terms holds the GIN term facts, present exactly for a term-eligible column
+	// (statistics.md §4.5).
+	Terms *termStatistics
+}
+
+// termStatistics is a term-eligible column's GIN term facts (statistics.md §4.5): the saturated
+// count of term occurrences, the row-count estimate for an unlisted term (0 = the list is
+// complete), and the most common terms with their row counts, in descending count then ascending
+// byte order.
+type termStatistics struct {
+	Occurrences   int64
+	UntrackedRows int64
+	Entries       []termStatisticsEntry
+}
+
+type termStatisticsEntry struct {
+	Term []byte
+	Rows int64
+}
+
+// termEligible reports whether this column type has a GIN operator class (statistics.md §4.5):
+// jsonb, or an array whose element type a GIN index admits.
+func termEligible(ty dataType) bool {
+	_, ok := ginOpclassFor(ty)
+	return ok
+}
+
+// termCounter is PostgreSQL's lossy counting over GIN term occurrences (statistics.md §4.5), bucket
+// width statisticsTermBucketWidth. Removal is a per-entry predicate, so the map's iteration order
+// never reaches the result.
+type termCounter struct {
+	occurrences int64
+	entries     map[string]*termCount
+	pruned      bool
+	oversized   bool
+}
+
+type termCount struct {
+	count, delta int64
+}
+
+func (c *termCounter) add(term []byte) {
+	if c.occurrences < math.MaxInt64 {
+		c.occurrences++
+	}
+	bucket := c.occurrences/statisticsTermBucketWidth + boolInt64(c.occurrences%statisticsTermBucketWidth != 0)
+	if len(term) > statisticsMaxValueBytes {
+		c.oversized = true
+	} else if entry, ok := c.entries[string(term)]; ok {
+		entry.count++
+	} else {
+		if c.entries == nil {
+			c.entries = make(map[string]*termCount)
+		}
+		c.entries[string(term)] = &termCount{count: 1, delta: bucket - 1}
+	}
+	if c.occurrences%statisticsTermBucketWidth == 0 {
+		for term, entry := range c.entries {
+			if entry.count+entry.delta <= bucket {
+				delete(c.entries, term)
+				c.pruned = true
+			}
+		}
+	}
+}
+
+func (c *termCounter) finish() *termStatistics {
+	ranked := make([]termStatisticsEntry, 0, len(c.entries))
+	for term, entry := range c.entries {
+		ranked = append(ranked, termStatisticsEntry{Term: []byte(term), Rows: entry.count})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].Rows != ranked[j].Rows {
+			return ranked[i].Rows > ranked[j].Rows
+		}
+		return bytes.Compare(ranked[i].Term, ranked[j].Term) < 0
+	})
+	untracked := int64(0)
+	if len(ranked) > statisticsTermEntries {
+		untracked = max64(untracked, ranked[statisticsTermEntries].Rows)
+	}
+	if c.pruned {
+		untracked = max64(untracked, c.occurrences/statisticsTermBucketWidth+
+			boolInt64(c.occurrences%statisticsTermBucketWidth != 0))
+	}
+	if c.oversized {
+		untracked = max64(untracked, 1)
+	}
+	if len(ranked) > statisticsTermEntries {
+		ranked = ranked[:statisticsTermEntries]
+	}
+	return &termStatistics{Occurrences: c.occurrences, UntrackedRows: untracked, Entries: ranked}
+}
+
+func boolInt64(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // currentColumnStatistics is one persisted fact scaled to the owning table's exact current row
@@ -134,6 +233,139 @@ func (db *engine) currentColumnStatistics(rel scopeRel, column int) *currentColu
 		completeMCV: !fact.Stale && int64(fact.SampleRows) == fact.AnalyzedRows &&
 			sampledMCVRows == uint64(fact.SampleNonNullRows),
 	}
+}
+
+// ginTermEstimate is a GIN-served predicate's estimate from term statistics (statistics.md §6.1):
+// the rows it admits, the posting-list entries a GIN gather reads, and the estimated total entries
+// in the index.
+type ginTermEstimate struct {
+	rows, entries, totalEntries int64
+}
+
+// statisticsGinEstimate prices a GIN predicate over the local column with a literal operand from the
+// column's term facts (statistics.md §6.1). nil — the structural default applies — when the column
+// has no term facts, the operand is not a plan-time literal, or the query falls back to a full scan.
+func (db *engine) statisticsGinEstimate(rel scopeRel, column int, opclass ginOpclass, strategy ginStrategy, operand *rExpr) *ginTermEstimate {
+	fact := db.columnStatisticsScoped(rel.db, rel.table.Name, column)
+	if fact == nil || fact.Terms == nil {
+		return nil
+	}
+	termFacts := fact.Terms
+	value, ok := statisticsGinOperandValue(operand)
+	if !ok {
+		return nil
+	}
+	current := db.currentColumnStatistics(rel, column)
+	if current == nil {
+		return nil
+	}
+	n := current.rows
+	totalEntries := statisticsScale(n, termFacts.Occurrences, fact.AnalyzedRows)
+	query := ginQueryTerms(opclass, strategy, value)
+	switch query.kind {
+	case ginQueryEmpty:
+		return &ginTermEstimate{totalEntries: totalEntries}
+	case ginQueryFullScan:
+		return nil
+	}
+	termRows := func(term []byte) int64 {
+		if current.nonnullRows == 0 {
+			return 0
+		}
+		for _, entry := range termFacts.Entries {
+			if bytes.Equal(entry.Term, term) {
+				return min64(statisticsScale(n, entry.Rows, fact.AnalyzedRows), current.nonnullRows)
+			}
+		}
+		if termFacts.UntrackedRows == 0 && !fact.Stale {
+			return 0
+		}
+		half := termFacts.UntrackedRows/2 + termFacts.UntrackedRows%2
+		return max64(min64(statisticsScale(n, half, fact.AnalyzedRows), current.nonnullRows), 1)
+	}
+	type pricedTerm struct {
+		rows int64
+		term []byte
+	}
+	priced := make([]pricedTerm, len(query.terms))
+	for i, term := range query.terms {
+		priced[i] = pricedTerm{rows: termRows(term), term: term}
+	}
+	sort.Slice(priced, func(i, j int) bool {
+		if priced[i].rows != priced[j].rows {
+			return priced[i].rows < priced[j].rows
+		}
+		return bytes.Compare(priced[i].term, priced[j].term) < 0
+	})
+	var rows, entries int64
+	if strategy.isAny() {
+		sum := int64(0)
+		for _, p := range priced {
+			sum = satEstimateAdd(sum, p.rows)
+		}
+		rows, entries = min64(sum, current.nonnullRows), sum
+	} else if len(priced) > 0 {
+		rows, entries = priced[0].rows, priced[0].rows
+		for _, p := range priced[1:] {
+			entries = satEstimateAdd(entries, rows)
+			rows = statisticsScale(rows, p.rows, n)
+		}
+	}
+	return &ginTermEstimate{rows: rows, entries: entries, totalEntries: totalEntries}
+}
+
+// statisticsGinOperandValue is a GIN query operand's plan-time value (statistics.md §6.1): a
+// literal, a folded array literal, or a one-dimensional ARRAY[...] of literals.
+func statisticsGinOperandValue(operand *rExpr) (Value, bool) {
+	switch {
+	case operand.kind == reConstArray:
+		return arrayValueOf(operand.cArray), true
+	case operand.kind == reArray && !operand.nested:
+		values := make([]Value, len(operand.sargs))
+		for i, elem := range operand.sargs {
+			value, err := rExprConstToValue(elem)
+			if err != nil {
+				return Value{}, false
+			}
+			values[i] = value
+		}
+		return ArrayValue(values), true
+	}
+	value, err := rExprConstToValue(operand)
+	return value, err == nil
+}
+
+// statisticsGinLeafSelectivity is the logical selectivity of a GIN-served leaf from term statistics
+// (statistics.md §6.1). Array = keeps its structural equality estimate as a logical leaf.
+func (db *engine) statisticsGinLeafSelectivity(expr *rExpr, rel scopeRel) (selectivityExpr, bool) {
+	switch expr.kind {
+	case reArrayFunc, reQuantified, reJsonContains, reJsonHasKey:
+	default:
+		return selectivityExpr{}, false
+	}
+	for column, declared := range rel.table.Columns {
+		opclass, ok := ginOpclassFor(declared.Type)
+		if !ok {
+			continue
+		}
+		strategy, operand, ok := ginMatch(expr, rel.offset+column, opclass.jsonb)
+		if !ok {
+			continue
+		}
+		if strategy == ginEqual {
+			return selectivityExpr{}, false
+		}
+		estimate := db.statisticsGinEstimate(rel, column, opclass, strategy, operand)
+		if estimate == nil {
+			return selectivityExpr{}, false
+		}
+		current := db.currentColumnStatistics(rel, column)
+		if current == nil {
+			return selectivityExpr{}, false
+		}
+		return statisticsSelectivity(estimate.rows, current.rows), true
+	}
+	return selectivityExpr{}, false
 }
 
 func statisticsColumn(expr *rExpr, rel scopeRel) (int, bool) {
@@ -422,6 +654,9 @@ func (db *engine) statisticsBoundTermsSelectivity(rel scopeRel, column int, term
 func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectivityExpr, bool) {
 	if expr == nil {
 		return selectivityExpr{}, false
+	}
+	if selectivity, ok := db.statisticsGinLeafSelectivity(expr, rel); ok {
+		return selectivity, true
 	}
 	if expr.kind == reIsNull {
 		column, ok := statisticsColumn(expr.operand, rel)
@@ -975,6 +1210,8 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 	for _, column := range columns {
 		meter.Charge(costs.PageRead * int64(store.NodeCount()))
 		eligible := statisticsDistributionEligible(table.Columns[column].Type)
+		termOpclass, termsEligible := ginOpclassFor(table.Columns[column].Type)
+		var terms termCounter
 		scan := store.storeScan(unboundedBound(), false)
 		sample := &sampleHeap{}
 		kmv := &uint64MaxHeap{}
@@ -1034,6 +1271,16 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			if eligible {
 				retainStatisticsKMV(kmv, kmvSeen, statisticsFNV1a64(key))
 			}
+			if termsEligible {
+				resident, err := residentValue(value)
+				if err != nil {
+					return outcome{}, err
+				}
+				for _, term := range ginValueTerms(termOpclass, resident) {
+					meter.Charge(costs.StatisticsValue * int64(max(1, len(term))))
+					terms.add(term)
+				}
+			}
 			oversized := bodyLen > statisticsMaxValueBytes || (eligible && len(key) > statisticsMaxValueBytes)
 			var retained *statisticsValue
 			if eligible && !oversized {
@@ -1065,6 +1312,9 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			DistinctCount: distinct, SampleRows: uint32(len(*sample)), SampleNonNullRows: sampleNonNull,
 			MCV: mcv, Histogram: histogram,
 		}})
+		if termsEligible {
+			facts[len(facts)-1].statistics.Terms = terms.finish()
+		}
 	}
 	database := "main"
 	if analyze.DB == nil {

@@ -620,6 +620,12 @@ entry into the index, exactly as it does into a float `PRIMARY KEY`. The gather'
 intersection/union is over storage-key **sets**, so its result is order-insensitive and the
 final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
 
+**Estimates.** Without statistics a GIN candidate takes the `matching` default selectivity
+([estimator.md §7](estimator.md)). `ANALYZE` collects each term-eligible column's most common GIN
+terms ([statistics.md §4.5](statistics.md)), after which a literal query's terms give the candidate's
+rows, `gin_entry` reads, and index pages, and the predicate's logical selectivity
+([statistics.md §6.1](statistics.md)).
+
 ## 9. Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
 - **No system-catalog surface** — PG exposes GIN indexes via `pg_indexes` / `pg_am`; jed has

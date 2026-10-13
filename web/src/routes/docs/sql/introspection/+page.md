@@ -62,7 +62,8 @@ Nine relations ship today:
   *is* its backing unique index,
   so it appears in both `jed_indexes` and `jed_constraints` under the same name.
 - **`jed_statistics`** — one summary per analyzed column: table/column name, analyzed row and NULL
-  counts, stale flag, optional distinct count, sample rows, average width, and MCV/histogram counts.
+  counts, stale flag, optional distinct count, sample rows, average width, MCV/histogram counts, and
+  the GIN term-list length (`term_count`, `NULL` for a column without a GIN operator class).
   Typed distribution values stay internal; run [`ANALYZE`](../statistics/) to create or refresh a
   fact. A successful table write retains its facts and marks them stale.
 - **`jed_sequences`** — one row per sequence: `name`, `start_value`, `min_value`, `max_value`,

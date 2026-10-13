@@ -760,6 +760,8 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "average_width", Type: scalarT(scalarInt64)},
 			{Name: "mcv_count", Type: scalarT(scalarInt32), NotNull: true},
 			{Name: "histogram_count", Type: scalarT(scalarInt32), NotNull: true},
+			// GIN term-list length; NULL for a term-ineligible column (statistics.md §8).
+			{Name: "term_count", Type: scalarT(scalarInt32)},
 		}}
 	}
 }
@@ -972,12 +974,16 @@ func (db *engine) jedStatisticsRows(sp *srfPlan, m *costMeter) ([]storedRow, err
 		if nonnull > 0 {
 			averageWidth = IntValue((statistics.WidthSum + nonnull - 1) / nonnull)
 		}
+		termCount := NullValue()
+		if statistics.Terms != nil {
+			termCount = IntValue(int64(len(statistics.Terms.Entries)))
+		}
 		out = append(out, storedRow{
 			TextValue(table.Name), TextValue(table.Columns[item.column].Name),
 			IntValue(statistics.AnalyzedRows), BoolValue(statistics.Stale),
 			IntValue(statistics.NullCount), distinct, IntValue(int64(statistics.SampleRows)),
 			averageWidth, IntValue(int64(len(statistics.MCV))),
-			IntValue(int64(len(statistics.Histogram))),
+			IntValue(int64(len(statistics.Histogram))), termCount,
 		})
 	}
 	return out, nil

@@ -165,6 +165,10 @@ export class Snapshot {
               ...statistics,
               mcv: statistics.mcv.slice(),
               histogram: statistics.histogram.slice(),
+              terms:
+                statistics.terms === null
+                  ? null
+                  : { ...statistics.terms, entries: statistics.terms.entries.slice() },
             },
           ]),
         ),

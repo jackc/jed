@@ -175,6 +175,11 @@ func (s *snapshot) clone() *snapshot {
 			copyStatistics := *statistics
 			copyStatistics.MCV = append([]statisticsMCV(nil), statistics.MCV...)
 			copyStatistics.Histogram = append([]statisticsValue(nil), statistics.Histogram...)
+			if statistics.Terms != nil {
+				terms := *statistics.Terms
+				terms.Entries = append([]termStatisticsEntry(nil), statistics.Terms.Entries...)
+				copyStatistics.Terms = &terms
+			}
 			copyColumns[column] = &copyStatistics
 		}
 		statistics[table] = copyColumns
