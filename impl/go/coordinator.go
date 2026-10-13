@@ -30,10 +30,11 @@ const (
 )
 
 type lockFiles struct {
-	presence, arrival, transition, writer, commit *os.File
+	presence, arrival, transition, writer, commit lockHandle
 }
 
 type fileCoordinator struct {
+	host    lockHost
 	path    string
 	files   lockFiles
 	state   atomic.Uint32
@@ -43,11 +44,6 @@ type fileCoordinator struct {
 	started atomic.Bool
 	once    sync.Once
 }
-
-var processOpenPaths = struct {
-	sync.Mutex
-	paths map[string]bool
-}{paths: make(map[string]bool)}
 
 func prepareOpenCoordinator(path string, mode Locking, timeout *uint64) (*fileCoordinator, string, error) {
 	mode, err := resolvedLocking(mode)
@@ -75,7 +71,7 @@ func prepareOpenCoordinator(path string, mode Locking, timeout *uint64) (*fileCo
 	if multiple {
 		return nil, "", newError(ObjectInUse, "hard-linked database paths cannot use jed locking: "+real)
 	}
-	c, err := acquireCoordinator(real, mode, timeout)
+	c, err := acquireCoordinator(osLocks, real, mode, timeout)
 	return c, real, err
 }
 
@@ -96,87 +92,81 @@ func prepareCreateCoordinator(path string, mode Locking, timeout *uint64) (*file
 		return nil, "", newError(IoError, "resolve database parent: "+err.Error())
 	}
 	real := filepath.Join(parent, filepath.Base(path))
-	c, err := acquireCoordinator(real, mode, timeout)
+	c, err := acquireCoordinator(osLocks, real, mode, timeout)
 	return c, real, err
 }
 
-func acquireCoordinator(path string, mode Locking, timeoutOpt *uint64) (*fileCoordinator, error) {
-	processOpenPaths.Lock()
-	if processOpenPaths.paths[path] {
-		processOpenPaths.Unlock()
+func acquireCoordinator(host lockHost, path string, mode Locking, timeoutOpt *uint64) (*fileCoordinator, error) {
+	if !host.claimPath(path) {
 		return nil, newError(ObjectInUse, "database is already open in this process: "+path+" (share one Database handle)")
 	}
-	processOpenPaths.paths[path] = true
-	processOpenPaths.Unlock()
 
 	fail := func(err error) (*fileCoordinator, error) {
-		processOpenPaths.Lock()
-		delete(processOpenPaths.paths, path)
-		processOpenPaths.Unlock()
+		host.releasePath(path)
 		return nil, err
 	}
-	files, err := openLockBundle(path)
+	files, err := host.openBundle(path)
 	if err != nil {
 		return fail(err)
 	}
 	closeFiles := true
 	defer func() {
 		if closeFiles {
-			files.close()
+			host.closeFiles(files)
 		}
 	}()
-	deadline := fileLockDeadline(timeoutOpt)
-	if err := lockUntil(files.arrival, false, deadline, path, false); err != nil {
+	deadline := fileLockDeadline(host, timeoutOpt)
+	if err := lockUntil(host, files.arrival, false, deadline, path, false); err != nil {
 		return fail(err)
 	}
-	if err := validateProtocolMarker(path); err != nil {
-		_ = osUnlock(files.arrival)
+	if err := host.validateMarker(path); err != nil {
+		_ = host.unlock(files.arrival)
 		return fail(err)
 	}
 
 	state := leaseShared
 	if mode == LockingExclusive {
 		for {
-			if err := lockUntil(files.transition, true, deadline, path, false); err != nil {
-				_ = osUnlock(files.arrival)
+			if err := lockUntil(host, files.transition, true, deadline, path, false); err != nil {
+				_ = host.unlock(files.arrival)
 				return fail(err)
 			}
-			ok, lockErr := osTryLock(files.presence, true)
-			_ = osUnlock(files.transition)
+			ok, lockErr := host.tryLock(files.presence, true)
+			_ = host.unlock(files.transition)
 			if lockErr != nil {
-				_ = osUnlock(files.arrival)
+				_ = host.unlock(files.arrival)
 				return fail(classifyLockError(lockErr))
 			}
 			if ok {
 				state = leaseExclusive
 				break
 			}
-			if err := checkLockDeadline(deadline, path, false); err != nil {
-				_ = osUnlock(files.arrival)
+			if err := checkLockDeadline(host, deadline, path, false); err != nil {
+				_ = host.unlock(files.arrival)
 				return fail(err)
 			}
-			time.Sleep(2 * time.Millisecond)
+			host.pause()
 		}
 	} else {
-		if err := lockUntil(files.transition, true, deadline, path, false); err != nil {
-			_ = osUnlock(files.arrival)
+		if err := lockUntil(host, files.transition, true, deadline, path, false); err != nil {
+			_ = host.unlock(files.arrival)
 			return fail(err)
 		}
-		alone, lockErr := osTryLock(files.presence, true)
-		_ = osUnlock(files.transition)
+		alone, lockErr := host.tryLock(files.presence, true)
+		_ = host.unlock(files.transition)
 		if lockErr != nil {
-			_ = osUnlock(files.arrival)
+			_ = host.unlock(files.arrival)
 			return fail(classifyLockError(lockErr))
 		}
 		if alone {
 			state = leaseAlone
-		} else if err := lockUntil(files.presence, false, deadline, path, false); err != nil {
-			_ = osUnlock(files.arrival)
+		} else if err := lockUntil(host, files.presence, false, deadline, path, false); err != nil {
+			_ = host.unlock(files.arrival)
 			return fail(err)
 		}
 	}
-	_ = osUnlock(files.arrival)
-	c := &fileCoordinator{path: path, files: files, pid: os.Getpid(), stop: make(chan struct{}), done: make(chan struct{})}
+	_ = host.unlock(files.arrival)
+	c := &fileCoordinator{host: host, path: path, files: files, pid: host.pid(), stop: make(chan struct{}), done: make(chan struct{})}
 	c.state.Store(uint32(state))
 	closeFiles = false
 	return c, nil
@@ -186,7 +176,7 @@ func (c *fileCoordinator) lease() leaseState     { return leaseState(c.state.Loa
 func (c *fileCoordinator) setLease(s leaseState) { c.state.Store(uint32(s)) }
 
 func (c *fileCoordinator) checkPID() error {
-	if os.Getpid() != c.pid {
+	if c.host.pid() != c.pid {
 		return newError(ObjectInUse, "database handle was inherited across fork; reopen it in the child")
 	}
 	return nil
@@ -198,19 +188,7 @@ func (c *fileCoordinator) startProbe(tick func()) {
 		close(c.done)
 		return
 	}
-	go func() {
-		defer close(c.done)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				tick()
-			case <-c.stop:
-				return
-			}
-		}
-	}()
+	c.host.startProbe(c, tick)
 }
 
 func (c *fileCoordinator) close() {
@@ -219,70 +197,60 @@ func (c *fileCoordinator) close() {
 		if c.started.Load() {
 			<-c.done
 		}
-		c.files.close()
-		processOpenPaths.Lock()
-		delete(processOpenPaths.paths, c.path)
-		processOpenPaths.Unlock()
+		c.host.closeFiles(c.files)
+		c.host.releasePath(c.path)
 	})
 }
 
-func (f lockFiles) close() {
-	for _, file := range []*os.File{f.commit, f.writer, f.transition, f.arrival, f.presence} {
-		if file != nil {
-			_ = file.Close()
-		}
-	}
-}
-
 func (c *fileCoordinator) lockCommitShared() error {
-	return lockBlocking(c.files.commit, false, c.path)
+	return lockBlocking(c.host, c.files.commit, false, c.path)
 }
 
 func (c *fileCoordinator) lockCommitExclusive() error {
-	return lockBlocking(c.files.commit, true, c.path)
+	return lockBlocking(c.host, c.files.commit, true, c.path)
 }
-func (c *fileCoordinator) unlockCommit() { _ = osUnlock(c.files.commit) }
+func (c *fileCoordinator) unlockCommit() { _ = c.host.unlock(c.files.commit) }
 
 func (c *fileCoordinator) lockWriter(timeoutMs uint64) error {
 	var deadline time.Time
 	if timeoutMs != 0 {
-		deadline = time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+		deadline = c.host.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	}
-	return lockUntil(c.files.writer, true, deadline, c.path, true)
+	return lockUntil(c.host, c.files.writer, true, deadline, c.path, true)
 }
 
-func (c *fileCoordinator) unlockWriter() { _ = osUnlock(c.files.writer) }
+func (c *fileCoordinator) unlockWriter() { _ = c.host.unlock(c.files.writer) }
 
 func (c *fileCoordinator) tryArrivalExclusive() (bool, error) {
-	return osTryLock(c.files.arrival, true)
+	return c.host.tryLock(c.files.arrival, true)
 }
 
-func (c *fileCoordinator) unlockArrival() { _ = osUnlock(c.files.arrival) }
+func (c *fileCoordinator) unlockArrival() { _ = c.host.unlock(c.files.arrival) }
 func (c *fileCoordinator) lockTransition() error {
-	return lockBlocking(c.files.transition, true, c.path)
+	return lockBlocking(c.host, c.files.transition, true, c.path)
 }
-func (c *fileCoordinator) unlockTransition() { _ = osUnlock(c.files.transition) }
+func (c *fileCoordinator) unlockTransition() { _ = c.host.unlock(c.files.transition) }
 
 func (c *fileCoordinator) downgradePresence() error {
 	c.setLease(leaseShared)
-	if err := osUnlock(c.files.presence); err != nil {
+	if err := c.host.unlock(c.files.presence); err != nil {
 		return classifyLockError(err)
 	}
-	return lockBlocking(c.files.presence, false, c.path)
+	return lockBlocking(c.host, c.files.presence, false, c.path)
 }
 
 func (c *fileCoordinator) tryUpgradePresence() (bool, error) {
-	if err := osUnlock(c.files.presence); err != nil {
+	if err := c.host.unlock(c.files.presence); err != nil {
 		return false, classifyLockError(err)
 	}
-	ok, err := osTryLock(c.files.presence, true)
+	ok, err := c.host.tryLock(c.files.presence, true)
 	if err != nil {
 		return false, classifyLockError(err)
 	}
 	if ok {
 		return true, nil
 	}
-	if err := lockBlocking(c.files.presence, false, c.path); err != nil {
+	if err := lockBlocking(c.host, c.files.presence, false, c.path); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -313,19 +281,19 @@ func openLockBundle(path string) (lockFiles, error) {
 		return lockFiles{}, newError(IoError, err.Error())
 	}
 	if opened.arrival, err = open("arrival"); err != nil {
-		opened.close()
+		closeOSLockFiles(opened)
 		return lockFiles{}, newError(IoError, err.Error())
 	}
 	if opened.transition, err = open("transition"); err != nil {
-		opened.close()
+		closeOSLockFiles(opened)
 		return lockFiles{}, newError(IoError, err.Error())
 	}
 	if opened.writer, err = open("writer"); err != nil {
-		opened.close()
+		closeOSLockFiles(opened)
 		return lockFiles{}, newError(IoError, err.Error())
 	}
 	if opened.commit, err = open("commit"); err != nil {
-		opened.close()
+		closeOSLockFiles(opened)
 		return lockFiles{}, newError(IoError, err.Error())
 	}
 	return opened, nil
@@ -375,45 +343,45 @@ func resolvedLocking(mode Locking) (Locking, error) {
 	return mode, nil
 }
 
-func fileLockDeadline(value *uint64) time.Time {
+func fileLockDeadline(host lockHost, value *uint64) time.Time {
 	ms := uint64(defaultFileLockTimeoutMs)
 	if value != nil {
 		ms = *value
 	}
-	return time.Now().Add(time.Duration(ms) * time.Millisecond)
+	return host.now().Add(time.Duration(ms) * time.Millisecond)
 }
 
-func lockBlocking(file *os.File, exclusive bool, path string) error {
+func lockBlocking(host lockHost, h lockHandle, exclusive bool, path string) error {
 	for {
-		ok, err := osTryLock(file, exclusive)
+		ok, err := host.tryLock(h, exclusive)
 		if err != nil {
 			return classifyLockError(err)
 		}
 		if ok {
 			return nil
 		}
-		time.Sleep(2 * time.Millisecond)
+		host.pause()
 	}
 }
 
-func lockUntil(file *os.File, exclusive bool, deadline time.Time, path string, writer bool) error {
+func lockUntil(host lockHost, h lockHandle, exclusive bool, deadline time.Time, path string, writer bool) error {
 	for {
-		ok, err := osTryLock(file, exclusive)
+		ok, err := host.tryLock(h, exclusive)
 		if err != nil {
 			return classifyLockError(err)
 		}
 		if ok {
 			return nil
 		}
-		if err := checkLockDeadline(deadline, path, writer); err != nil {
+		if err := checkLockDeadline(host, deadline, path, writer); err != nil {
 			return err
 		}
-		time.Sleep(2 * time.Millisecond)
+		host.pause()
 	}
 }
 
-func checkLockDeadline(deadline time.Time, path string, writer bool) error {
-	if deadline.IsZero() || time.Now().Before(deadline) {
+func checkLockDeadline(host lockHost, deadline time.Time, path string, writer bool) error {
+	if deadline.IsZero() || host.now().Before(deadline) {
 		return nil
 	}
 	if writer {
