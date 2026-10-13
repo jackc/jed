@@ -2816,6 +2816,11 @@ pub(crate) enum ScalarFunc {
     JustifyHours,
     JustifyDays,
     JustifyInterval,
+    /// age(timestamp[tz], timestamp[tz]) → interval, and the one-argument age(x) =
+    /// age(CURRENT_DATE at midnight, x) — PostgreSQL's symbolic field-wise difference with borrow
+    /// (spec/design/interval.md §5.2). A timestamptz decomposes in the session zone; the one-arg
+    /// form reads the statement clock (STABLE). Any ±infinity operand traps 22008.
+    Age,
     /// uuid_extract_version(uuid) → i16 — the version nibble, NULL off-RFC-variant (§12).
     UuidExtractVersion,
     /// uuid_extract_timestamp(uuid) → timestamptz — the embedded instant for v1/v7, else NULL (§12).

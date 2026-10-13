@@ -338,7 +338,9 @@ exactly as PostgreSQL does. Each is oracle-checked against `postgres:18` (CLAUDE
 `clock_timestamp()` (VOLATILE) → `timestamptz`.
 
 **Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): `to_char` /
-`to_timestamp` (a parsing/formatting surface, a different axis from "in a zone") and `age`.
+`to_timestamp` (a parsing/formatting surface, a different axis from "in a zone").
+**`age`** has landed ([interval.md](interval.md) §5.2): `age(timestamptz, timestamptz)` decomposes
+both instants in the session zone, and the one-argument forms read the current day there.
 Session-zone rendering of a `timestamptz` — the `::text` cast, nested in `array → text`, and result
 cells through the host's session render — has landed (§9.5). The runtime `text → date` /
 `timestamp` / `timestamptz` casts ([date.md §6](date.md), §9.3), offset-less `timestamptz` input in

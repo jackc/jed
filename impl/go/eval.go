@@ -2859,6 +2859,65 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return IntervalValue(iv), nil
+		case sfAge:
+			// age (spec/design/interval.md §5.2). The one-argument form is PG's SQL wrapper
+			// age(CURRENT_DATE::timestamp[tz], x): the statement clock's day in the session zone
+			// (dateClockValue charges one timezone unit), widened to midnight — for timestamptz,
+			// midnight read in the session zone (one more timezone unit). A timestamptz pair then
+			// decomposes each finite operand in the session zone (one timezone unit each); any
+			// ±infinity operand traps 22008 before any decomposition. The NULL-input case is
+			// already handled above.
+			var dt1 int64
+			x := vals[0]
+			if len(vals) == 1 {
+				today, err := dateClockValue(env.exec, env.rng, m, 0)
+				if err != nil {
+					return Value{}, err
+				}
+				mid, err := dateMidnightMicros(int32(today.Int))
+				if err != nil {
+					return Value{}, err
+				}
+				dt1 = mid
+				if x.Kind == ValTimestamptz {
+					m.Charge(costs.Timezone)
+					if err := m.Guard(); err != nil {
+						return Value{}, err
+					}
+					instant, ok := localToInstantMicros(env.exec.session.timeZone, mid)
+					if !ok {
+						return Value{}, errZoneShiftOutOfRange()
+					}
+					dt1 = instant
+				}
+			} else {
+				dt1 = vals[0].Int
+				x = vals[1]
+			}
+			dt2 := x.Int
+			if err := ageRejectInfinite(dt1, dt2); err != nil {
+				return Value{}, err
+			}
+			local1, local2 := dt1, dt2
+			if x.Kind == ValTimestamptz {
+				zr := env.exec.session.timeZone
+				for _, p := range []*int64{&local1, &local2} {
+					m.Charge(costs.Timezone)
+					if err := m.Guard(); err != nil {
+						return Value{}, err
+					}
+					local, ok := instantToLocalMicros(zr, *p)
+					if !ok {
+						return Value{}, errZoneShiftOutOfRange()
+					}
+					*p = local
+				}
+			}
+			iv, err := age(dt1, dt2, local1, local2)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(iv), nil
 		case sfUuidExtractVersion:
 			// uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a
 			// non-RFC variant (and, for the timestamp, any version other than 1/7). The

@@ -371,6 +371,106 @@ pub fn justify_interval(iv: &Interval) -> Result<Interval> {
     })
 }
 
+/// `age(dt1, dt2)`'s infinity rule (spec/design/interval.md §5.2). PostgreSQL returns an infinite
+/// interval for one infinite operand and raises `22008` "interval out of range" for the same
+/// infinity twice; jed has no infinite interval, so EVERY infinite operand is that `22008`. Checked
+/// before any zone consultation, like PG's `timestamp_age` / `timestamptz_age`.
+pub fn age_reject_infinite(dt1: i64, dt2: i64) -> Result<()> {
+    let inf = |t: i64| t == timestamp::NEG_INFINITY || t == timestamp::POS_INFINITY;
+    if inf(dt1) || inf(dt2) {
+        return Err(field_overflow("interval out of range"));
+    }
+    Ok(())
+}
+
+/// PostgreSQL `age(dt1, dt2)` (spec/design/interval.md §5.2), ported step for step from
+/// `timestamp_age` / `timestamptz_age`: the field-wise symbolic difference of the two wall clocks
+/// `local1` and `local2` (a timestamp's own value; a timestamptz decomposed in the session zone),
+/// with the sign taken from comparing the values `dt1` and `dt2` themselves. Each field is
+/// subtracted, the result is flipped so the later value comes first, negative fields borrow from
+/// the next higher one (a day borrows the length of the EARLIER value's month), and the sign is
+/// restored. Both operands are finite (`age_reject_infinite` ran first).
+pub fn age(dt1: i64, dt2: i64, local1: i64, local2: i64) -> Result<Interval> {
+    let (y1, mo1, d1, h1, mi1, s1, us1) = timestamp::civil_from_micros(local1);
+    let (y2, mo2, d2, h2, mi2, s2, us2) = timestamp::civil_from_micros(local2);
+    // Form the symbolic difference.
+    let mut usec = us1 as i64 - us2 as i64;
+    let mut sec = s1 as i64 - s2 as i64;
+    let mut min = mi1 as i64 - mi2 as i64;
+    let mut hour = h1 as i64 - h2 as i64;
+    let mut mday = d1 as i64 - d2 as i64;
+    let mut mon = mo1 as i64 - mo2 as i64;
+    let mut year = y1 - y2;
+    let flip = dt1 < dt2;
+    if flip {
+        usec = -usec;
+        sec = -sec;
+        min = -min;
+        hour = -hour;
+        mday = -mday;
+        mon = -mon;
+        year = -year;
+    }
+    // Propagate any negative fields into the next higher field.
+    while usec < 0 {
+        usec += MICROS_PER_SEC;
+        sec -= 1;
+    }
+    while sec < 0 {
+        sec += 60;
+        min -= 1;
+    }
+    while min < 0 {
+        min += 60;
+        hour -= 1;
+    }
+    while hour < 0 {
+        hour += 24;
+        mday -= 1;
+    }
+    while mday < 0 {
+        mday += if flip {
+            timestamp::days_in_month(y1, mo1)
+        } else {
+            timestamp::days_in_month(y2, mo2)
+        } as i64;
+        mon -= 1;
+    }
+    while mon < 0 {
+        mon += MONTHS_PER_YEAR;
+        year -= 1;
+    }
+    // Recover the sign.
+    if flip {
+        usec = -usec;
+        sec = -sec;
+        min = -min;
+        hour = -hour;
+        mday = -mday;
+        mon = -mon;
+        year = -year;
+    }
+    // PG `itm2interval`: the months total must fit i32, the time total i64.
+    let oor = || field_overflow("interval out of range");
+    let months = year
+        .checked_mul(MONTHS_PER_YEAR)
+        .and_then(|m| m.checked_add(mon))
+        .and_then(|m| i32::try_from(m).ok())
+        .ok_or_else(oor)?;
+    let days = i32::try_from(mday).map_err(|_| oor())?;
+    let micros = hour
+        .checked_mul(3600 * MICROS_PER_SEC)
+        .and_then(|t| t.checked_add(min * 60 * MICROS_PER_SEC))
+        .and_then(|t| t.checked_add(sec * MICROS_PER_SEC))
+        .and_then(|t| t.checked_add(usec))
+        .ok_or_else(oor)?;
+    Ok(Interval {
+        months,
+        days,
+        micros,
+    })
+}
+
 // Span-canonical equality/ordering/hash (spec/design/interval.md §2): `'1 mon'` and `'30 days'`
 // must compare equal and land in the same DISTINCT/GROUP BY bucket, while each keeps its own
 // field representation for rendering. Hand-written (not derived) so the canonical span — not the

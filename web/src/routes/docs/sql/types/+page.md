@@ -133,6 +133,11 @@ RETURNING body, raw;`;
   justify_days(interval '45 days')              AS days_to_months,
   justify_interval(interval '1 mon -1 hour')    AS same_sign;`;
 
+	const ageDemo = `SELECT
+  age(timestamp '2001-04-10', timestamp '1957-06-13')  AS years_months_days,
+  age(timestamp '2024-03-01', timestamp '2024-01-31')  AS month_end,
+  timestamp '2024-03-01' - timestamp '2024-01-31'      AS plain_difference;`;
+
 	const dateArithDemo = `SELECT
   date '2024-01-15' + 30                    AS in_30_days,
   date '2024-03-01' - date '2024-01-15'     AS days_between,
@@ -468,6 +473,14 @@ whole 30-day chunks into months, and `justify_interval` does both and gives ever
 sign:
 
 <LiveSql demo="justifyDemo" query={justifyDemo} rows={1} />
+
+`age(a, b)` subtracts two `timestamp`s (or two `timestamptz`s) **field by field**, so the answer
+keeps calendar years and months where `a - b` counts days; a short day field borrows the length of
+the earlier value's month. A `timestamptz` pair is compared in the session time zone, and `age(x)`
+measures from midnight today. As in PostgreSQL; the one difference is an `infinity` argument, which
+raises `22008` because jed has no infinite interval:
+
+<LiveSql demo="ageDemo" query={ageDemo} rows={1} />
 
 ### Date arithmetic
 

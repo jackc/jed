@@ -400,6 +400,89 @@ export function justifyInterval(iv: Interval): Interval {
   return { months, days, micros };
 }
 
+// ageRejectInfinite is age(dt1, dt2)'s infinity rule (spec/design/interval.md §5.2). PostgreSQL
+// returns an infinite interval for one infinite operand and raises 22008 "interval out of range"
+// for the same infinity twice; jed has no infinite interval, so EVERY infinite operand is that
+// 22008. Checked before any zone consultation, like PG's timestamp_age / timestamptz_age.
+export function ageRejectInfinite(dt1: bigint, dt2: bigint): void {
+  const inf = (t: bigint) => t === NEG_INFINITY || t === POS_INFINITY;
+  if (inf(dt1) || inf(dt2)) throw intervalFieldOverflow("interval out of range");
+}
+
+// age is PostgreSQL age(dt1, dt2) (spec/design/interval.md §5.2), ported step for step from
+// timestamp_age / timestamptz_age: the field-wise symbolic difference of the two wall clocks local1
+// and local2 (a timestamp's own value; a timestamptz decomposed in the session zone), with the sign
+// taken from comparing the values dt1 and dt2 themselves. Each field is subtracted, the result is
+// flipped so the later value comes first, negative fields borrow from the next higher one (a day
+// borrows the length of the EARLIER value's month), and the sign is restored. Both operands are
+// finite (ageRejectInfinite ran first).
+export function age(dt1: bigint, dt2: bigint, local1: bigint, local2: bigint): Interval {
+  const [y1, mo1, d1, h1, mi1, s1, us1] = civilFromMicros(local1);
+  const [y2, mo2, d2, h2, mi2, s2, us2] = civilFromMicros(local2);
+  // Form the symbolic difference.
+  let usec = us1 - us2;
+  let sec = s1 - s2;
+  let min = mi1 - mi2;
+  let hour = h1 - h2;
+  let mday = d1 - d2;
+  let mon = mo1 - mo2;
+  let year = y1 - y2;
+  const flip = dt1 < dt2;
+  if (flip) {
+    usec = -usec;
+    sec = -sec;
+    min = -min;
+    hour = -hour;
+    mday = -mday;
+    mon = -mon;
+    year = -year;
+  }
+  // Propagate any negative fields into the next higher field.
+  while (usec < 0n) {
+    usec += MICROS_PER_SEC;
+    sec--;
+  }
+  while (sec < 0n) {
+    sec += 60n;
+    min--;
+  }
+  while (min < 0n) {
+    min += 60n;
+    hour--;
+  }
+  while (hour < 0n) {
+    hour += 24n;
+    mday--;
+  }
+  while (mday < 0n) {
+    mday += flip ? daysInMonth(y1, mo1) : daysInMonth(y2, mo2);
+    mon--;
+  }
+  while (mon < 0n) {
+    mon += MONTHS_PER_YEAR;
+    year--;
+  }
+  // Recover the sign.
+  if (flip) {
+    usec = -usec;
+    sec = -sec;
+    min = -min;
+    hour = -hour;
+    mday = -mday;
+    mon = -mon;
+    year = -year;
+  }
+  // PG itm2interval: the months total must fit i32, the time total i64.
+  const months = year * MONTHS_PER_YEAR + mon;
+  if (months < I32_MIN || months > I32_MAX || mday < I32_MIN || mday > I32_MAX) {
+    throw intervalFieldOverflow("interval out of range");
+  }
+  const micros = checkedI64(
+    hour * 3600n * MICROS_PER_SEC + min * 60n * MICROS_PER_SEC + sec * MICROS_PER_SEC + usec,
+  );
+  return { months: Number(months), days: Number(mday), micros };
+}
+
 // --- parsing -----------------------------------------------------------------
 
 function invalidInterval(detail: string): EngineError {

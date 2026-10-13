@@ -20,7 +20,7 @@ and overloads apply these argument-sensitive rules:
 | timestamp/date conversion crossing the timestamptz boundary | session timezone |
 | timestamptz → text, or array → text whose element type contains timestamptz (timezones.md §9.5) | session timezone |
 | timestamptz interval arithmetic | arguments only under jed's existing UTC arithmetic contract (interval.md) |
-| Two-argument date_trunc on timestamptz; six-argument make_timestamptz | session timezone |
+| Two-argument date_trunc on timestamptz; six-argument make_timestamptz; age(timestamptz, timestamptz) | session timezone |
 | AT TIME ZONE, explicit-zone date_trunc / make_timestamptz | arguments plus the explicit zone |
 | UTC or a fixed numeric zone offset | no timezone-data dependency |
 | Named zone | loaded zone's name, tzdata version, and TZif CRC-32 |

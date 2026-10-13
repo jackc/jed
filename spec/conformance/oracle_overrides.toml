@@ -1382,3 +1382,35 @@ reason = "jed reserves no keywords (grammar.md §3), so `(select)` after the tar
 file = "dml/insert_select_setop.test"
 sql = "INSERT INTO t (a, id) SELECT NULL, 300 UNION SELECT NULL, 301 RETURNING *"
 reason = "jed leaves a set-op column that is NULL-typed in every operand untyped (grammar.md §25, setops/types.test — the same rule as a bare untyped NULL), and an untyped projection is assignable to any INSERT target column (§24), so the NULLs are stored. PostgreSQL resolves the all-unknown UNION column to text first and rejects text for the integer column (42804). A consequence of jed's documented untyped-NULL rule, observable only through an INSERT target or an enclosing type check."
+
+# --- age: jed has no infinite interval, no implicit datetime casts, and a session-zone reader is
+# not indexable (spec/design/interval.md §5.2).
+[[override]]
+file = "expr/age.test"
+sql = "SELECT age(timestamp 'infinity', timestamp '2024-01-01')"
+reason = "jed: a single infinite age operand traps 22008 'interval out of range' — jed's interval type has NO infinity (interval.md §1, the timestamp − timestamp rule). PG 17+ returns an infinite interval. PG itself raises the same 22008 for the same infinity twice, which jed matches."
+
+[[override]]
+file = "expr/age.test"
+sql = "SELECT age(timestamp '2024-01-01', timestamp 'infinity')"
+reason = "jed: a single infinite age operand traps 22008 'interval out of range' — jed's interval type has NO infinity (interval.md §1). PG 17+ returns -infinity."
+
+[[override]]
+file = "expr/age.test"
+sql = "SELECT age(timestamptz 'infinity', timestamptz '-infinity')"
+reason = "jed: opposite infinite age operands trap 22008 'interval out of range' — jed's interval type has NO infinity (interval.md §1). PG 17+ returns an infinite interval."
+
+[[override]]
+file = "expr/age.test"
+sql = "CREATE INDEX ag_agetz_idx ON ag ((age(c, d)))"
+reason = "jed: age(timestamptz, timestamptz) decomposes both instants in the SESSION zone, so it is STABLE and an index expression using it is 42P17 (index-dependencies.md — a session-zone reader is never a persisted key). PostgreSQL labels the function immutable and accepts the index, though its value changes with TimeZone."
+
+[[override]]
+file = "expr/age.test"
+sql = "SELECT age(date '2024-03-01', date '2024-01-31')"
+reason = "jed: no age(date, date) overload — jed has no implicit date → timestamp[tz] cast in function resolution (timezones.md §9.1, the date_trunc rule), so 42883; cast explicitly. PostgreSQL implicitly casts both dates to timestamptz."
+
+[[override]]
+file = "expr/age.test"
+sql = "SELECT age(timestamp '2024-03-01', timestamptz '2024-01-31 00:00:00+00')"
+reason = "jed: no mixed age(timestamp, timestamptz) overload — jed has no implicit timestamp → timestamptz cast in function resolution (timezones.md §9.1), so 42883; cast explicitly. PostgreSQL implicitly casts the timestamp to timestamptz."

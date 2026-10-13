@@ -57,7 +57,7 @@ Each intentional divergence is recorded in the relevant design doc in the
 
 jed implements a broad surface, but notable gaps remain. As representative (not exhaustive) examples:
 
-- Some date/time surface is pending — `to_char` / `to_timestamp`, `date_part`, `age`, and a separate
+- Some date/time surface is pending — `to_char` / `to_timestamp` and a separate
   `time` type.
 - Spill-to-disk covers `ORDER BY`; the spilling hash join, aggregate, and `DISTINCT` are still in
   progress.

@@ -352,6 +352,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfJustifyDays
 	case "justify_interval":
 		return sfJustifyInterval
+	case "age":
+		return sfAge
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
 	// (drawn from the entropy seam at eval); the kernel id is still the name.
 	case "uuid_extract_version":

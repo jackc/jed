@@ -27919,6 +27919,10 @@ export type ScalarFuncName =
   | "justify_hours"
   | "justify_days"
   | "justify_interval"
+  // age(timestamp[tz], timestamp[tz]) → interval, and the one-argument age(x) =
+  // age(CURRENT_DATE at midnight, x) — PostgreSQL's symbolic field-wise difference with borrow
+  // (spec/design/interval.md §5.2); any ±infinity operand traps 22008.
+  | "age"
   // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
   // uuid_extract_version → i16 (NULL off-RFC-variant); uuid_extract_timestamp → timestamptz
   // (the embedded instant for v1/v7, else NULL).

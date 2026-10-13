@@ -721,6 +721,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // jed also resolves the explicit call form current_date(), which PG rejects as a syntax
     // error — a documented jed-lenient divergence (per-core tested).
     "func.current_date",
+    "func.age",
     // date_part(field, source) → f64 (timezones.md §9.2, EXTRACT's float8-returning twin) over
     // date / timestamp / timestamptz / interval: the shared extract kernel, then decimal → f64.
     // The field is a RUNTIME text value validated per row (22023 unrecognized / 0A000

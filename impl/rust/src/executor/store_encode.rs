@@ -1815,6 +1815,7 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         | ScalarFunc::JustifyHours
         | ScalarFunc::JustifyDays
         | ScalarFunc::JustifyInterval
+        | ScalarFunc::Age
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp
         | ScalarFunc::Uuidv4

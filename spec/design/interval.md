@@ -320,6 +320,57 @@ beyond `i32` in `justify_hours`, or a `months` sum beyond `i32` in `justify_days
 `justify_interval`. Each call charges one `operator_eval`, like every scalar function. PostgreSQL
 returns its infinite intervals unchanged; jed has no infinite interval, so every input is finite.
 
+### 5.2 `age` — the symbolic difference
+
+`age(a, b)` over two `timestamp`s or two `timestamptz`s returns an interval that keeps **calendar
+years and months**, where `a - b` counts days: `age(timestamp '2001-04-10', timestamp '1957-06-13')`
+is `43 years 9 mons 27 days`. It is ported step for step from PostgreSQL's `timestamp_age` /
+`timestamptz_age`:
+
+1. Decompose both values into wall-clock fields (year, month, day, hour, minute, second, µs). A
+   `timestamp` is its own wall clock; a `timestamptz` is decomposed **in the session zone**
+   ([timezones.md](timezones.md) §9), whatever offset its literal was written with.
+2. Subtract field by field (`a`'s minus `b`'s). If `a < b` (comparing the values themselves — for
+   `timestamptz` the instants, not the wall clocks), negate every field so the later value comes
+   first.
+3. Borrow upward while a field is negative: µs from seconds, seconds from minutes, minutes from
+   hours, hours from days, then **days from months, adding the length of the earlier value's month**
+   (`b`'s when `a ≥ b`, else `a`'s — leap Februaries included, on the astronomical year so 1 BC is
+   a leap year), then months from years.
+4. Negate every field back if step 2 did, and assemble `months = year·12 + month`, `days`,
+   `micros = time` (PG `itm2interval`).
+
+So `age('2024-03-01', '2024-01-31') = 1 mon 1 day` (January's 31 days absorb the day deficit) and
+the reverse is `-1 mons -1 days`. Because the sign comes from the instants but the fields from the
+session-zone wall clocks, a DST fall-back pair whose later instant has the earlier wall clock borrows
+through the year and comes out as PG prints it (`-1 mons +29 days 23:40:00`) — oracle-pinned.
+
+**One argument.** `age(x)` is PG's SQL wrapper `age(CURRENT_DATE::timestamp[tz], x)`: the statement
+clock's day in the session zone ([date.md](date.md) §6), at midnight — for `timestamptz`, that
+midnight read in the session zone (PostgreSQL's DST gap rule if midnight does not exist). It reads
+the clock seam once per statement ([entropy.md](entropy.md) §5, the `date-clock-literal` ledger
+entry), so it is **STABLE**, never folded, and un-indexable (`42P17`), as in PostgreSQL.
+
+**Errors and divergences.**
+
+- **Infinity.** jed has no infinite interval (§1). PostgreSQL returns `±infinity` when exactly one
+  operand is infinite and raises `22008` "interval out of range" for the same infinity twice; jed
+  raises that `22008` for **every** infinite operand — the `timestamp − timestamp` rule (§5),
+  ledgered in the override file. The check precedes any zone consultation.
+- **Overflow.** A month total beyond `i32` or a time total beyond `i64` is `22008` "interval out of
+  range" (PG `itm2interval`); jed's timestamp range keeps the year difference far inside it.
+- **Volatility.** `age(timestamp, timestamp)` is immutable. `age(timestamptz, timestamptz)` reads
+  the session zone, so it is **stable** and an index expression using it is `42P17`
+  ([index-dependencies.md](index-dependencies.md)); PostgreSQL labels it immutable and accepts the
+  index although its value changes with `TimeZone` — a ledgered divergence.
+- **No implicit casts.** There is no `date` or mixed `timestamp`/`timestamptz` overload (`42883`;
+  PostgreSQL casts implicitly) — jed's standing rule ([timezones.md](timezones.md) §9.1). Cast
+  explicitly.
+
+**Cost.** One `operator_eval` per call, plus one `timezone` unit per zone consultation: one per
+decomposed `timestamptz` operand (none for `±infinity`, which errors first), and for the
+one-argument form one for the current day and, for `timestamptz`, one for its midnight instant.
+
 ## 6. Literals, casts, keys, cost
 
 - **Literals.** A single-quoted string adapts in an interval context (§3); the `INTERVAL '…'`

@@ -45,7 +45,8 @@ call (a fresh read that does *not* touch the statement-clock cache), so it may a
 statement — the draws follow expression-evaluation order, exactly like the random source's. They take
 no entropy. The **clock-relative date literals** (`'today'`/`'now'`/`'tomorrow'`/`'yesterday'` —
 [date.md §6](date.md)) are a further STABLE consumer: the same once-resolved statement clock,
-decomposed into a day in the session zone.
+decomposed into a day in the session zone — as are `CURRENT_DATE` and the one-argument `age(x)`,
+which measures from that day's midnight ([interval.md §5.2](interval.md)).
 
 ## 2. The provided deterministic source — splitmix64, byte-exact shared data
 

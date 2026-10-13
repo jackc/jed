@@ -1,0 +1,339 @@
+# age(a, b) → interval (spec/design/interval.md §5.2) — PostgreSQL's symbolic field-wise
+# difference, ported step for step from timestamp_age / timestamptz_age: subtract the two wall
+# clocks field by field (years, months, days, hours, minutes, seconds, microseconds), the later
+# value first; a negative field borrows from the next higher one — a day borrows the length of the
+# EARLIER value's month — and the sign is restored at the end. So age keeps calendar months where
+# `a - b` counts days. age(timestamptz, timestamptz) decomposes both instants in the SESSION zone
+# (`# timezone:`), so a DST shift or a zone-moved month end changes the fields. Any ±infinity
+# operand is 22008 (PG returns an infinite interval for a single one — jed has no infinite
+# interval, ledgered). Oracle-checked against postgres:18. The clock-reading one-argument forms
+# are pinned by `# clock:` in age_current.test; here only their PG-agreeing equivalence and index
+# rejection.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.date, types.timestamp, types.timestamptz, types.interval, types.boolean, cast.operator, cast.datetime, func.current_date, func.age, expr.at_time_zone, session.timezone, resource.cost_metering
+
+# load-timezone: America/New_York
+# load-timezone: Europe/Paris
+# load-timezone: Australia/Lord_Howe
+# load-timezone: Asia/Kolkata
+
+# --- timestamp: PostgreSQL's documented example, both directions --------------------------------
+# cost: 2
+query T nosort
+SELECT age(timestamp '2001-04-10', timestamp '1957-06-13')
+----
+43 years 9 mons 27 days
+
+query T nosort
+SELECT age(timestamp '1957-06-13', timestamp '2001-04-10')
+----
+-43 years -9 mons -27 days
+
+# equal values are the zero interval
+query T nosort
+SELECT age(timestamp '2024-05-05 10:00:00', timestamp '2024-05-05 10:00:00')
+----
+00:00:00
+
+# --- the day borrow uses the EARLIER value's month length -----------------------------------------
+# Jan 31 → Mar 1: the day field goes 1 - 31 = -30 and borrows January's 31 days
+query T nosort
+SELECT age(timestamp '2024-03-01', timestamp '2024-01-31')
+----
+1 mon 1 day
+
+# the same span backwards borrows the earlier value's month too (January), then negates
+query T nosort
+SELECT age(timestamp '2024-01-31', timestamp '2024-03-01')
+----
+-1 mons -1 days
+
+# leap February borrows 29 days, an ordinary one 28
+query T nosort
+SELECT age(timestamp '2024-03-01', timestamp '2024-02-29')
+----
+1 day
+
+query T nosort
+SELECT age(timestamp '2023-03-01', timestamp '2023-02-28')
+----
+1 day
+
+query T nosort
+SELECT age(timestamp '2024-03-31', timestamp '2024-02-29')
+----
+1 mon 2 days
+
+query T nosort
+SELECT age(timestamp '2024-02-29', timestamp '2023-02-28')
+----
+1 year 1 day
+
+query T nosort
+SELECT age(timestamp '2025-02-28', timestamp '2024-02-29')
+----
+11 mons 28 days
+
+query T nosort
+SELECT age(timestamp '2024-02-28', timestamp '2023-02-28')
+----
+1 year
+
+query T nosort
+SELECT age(timestamp '2025-03-01', timestamp '2024-02-29')
+----
+1 year 1 day
+
+# month and year borrows: Dec 31 → Jan 1 is one day, May 31 → Jun 30 thirty days
+query T nosort
+SELECT age(timestamp '2024-01-01', timestamp '2023-12-31')
+----
+1 day
+
+query T nosort
+SELECT age(timestamp '2024-06-30', timestamp '2024-05-31')
+----
+30 days
+
+query T nosort
+SELECT age(timestamp '2024-07-30', timestamp '2024-05-31')
+----
+1 mon 30 days
+
+query T nosort
+SELECT age(timestamp '2024-05-31', timestamp '2024-07-30')
+----
+-1 mons -30 days
+
+# --- the time fields borrow down to the microsecond ------------------------------------------------
+query T nosort
+SELECT age(timestamp '2024-01-01 00:00:00', timestamp '2023-12-31 23:59:59.999999')
+----
+00:00:00.000001
+
+query T nosort
+SELECT age(timestamp '2023-12-31 23:59:59.999999', timestamp '2024-01-01 00:00:00')
+----
+-00:00:00.000001
+
+query T nosort
+SELECT age(timestamp '2024-05-05 10:00:00.5', timestamp '2024-05-05 10:00:01.25')
+----
+-00:00:00.75
+
+query T nosort
+SELECT age(timestamp '2024-03-01 03:04:05.678', timestamp '2023-01-31 12:34:56.789')
+----
+1 year 1 mon 14:29:08.889
+
+query T nosort
+SELECT age(timestamp '2023-01-31 12:34:56.789', timestamp '2024-03-01 03:04:05.678')
+----
+-1 years -1 mons -14:29:08.889
+
+query T nosort
+SELECT age(timestamp '2024-03-01 00:00:00', timestamp '2024-02-29 23:00:00')
+----
+01:00:00
+
+# --- BC dates: 1 BC is a leap year (astronomical year 0) ------------------------------------------
+query T nosort
+SELECT age(timestamp '0001-03-01 BC', timestamp '0001-02-28 BC')
+----
+2 days
+
+query T nosort
+SELECT age(timestamp '0001-01-01', timestamp '0001-12-31 BC')
+----
+1 day
+
+query T nosort
+SELECT age(timestamp '0044-03-15 BC', timestamp '2024-03-15')
+----
+-2067 years
+
+# a span across most of PostgreSQL's timestamp range still fits the months field
+query T nosort
+SELECT age(timestamp '294000-12-31 23:59:59', timestamp '4713-01-01 BC')
+----
+298712 years 11 mons 30 days 23:59:59
+
+# --- over table columns ----------------------------------------------------------------------------
+statement ok
+CREATE TABLE ag (id i32 PRIMARY KEY, a timestamp, b timestamp, c timestamptz, d timestamptz)
+
+statement ok
+INSERT INTO ag VALUES (1, '2024-03-31 08:00:00', '2023-12-31 20:00:00', '2024-03-31 08:00:00+00', '2023-12-31 20:00:00+00'), (2, '2020-02-29', '2024-02-28', '2020-02-29 00:00:00+00', '2024-02-28 00:00:00+00'), (3, NULL, '2024-01-01', NULL, '2024-01-01 00:00:00+00')
+
+query IT nosort
+SELECT id, age(a, b) FROM ag ORDER BY id
+----
+1
+2 mons 30 days 12:00:00
+2
+-3 years -11 mons -28 days
+3
+NULL
+
+query IT nosort
+SELECT id, age(c, d) FROM ag ORDER BY id
+----
+1
+2 mons 30 days 12:00:00
+2
+-3 years -11 mons -28 days
+3
+NULL
+
+# age is an ordinary interval value: it compares by span and orders
+query I nosort
+SELECT id FROM ag WHERE age(a, b) > interval '1 mon' ORDER BY id
+----
+1
+
+# an immutable age(timestamp, timestamp) key is indexable
+statement ok
+CREATE INDEX ag_age_idx ON ag ((age(a, b)))
+
+# --- NULL propagates -------------------------------------------------------------------------------
+query T nosort
+SELECT age(NULL::timestamp, timestamp '2024-01-01')
+----
+NULL
+
+query T nosort
+SELECT age(timestamptz '2024-01-01 00:00:00+00', NULL::timestamptz)
+----
+NULL
+
+# --- infinity: the same infinity twice is 22008 in PostgreSQL too ----------------------------------
+statement error 22008
+SELECT age(timestamp 'infinity', timestamp 'infinity')
+
+statement error 22008
+SELECT age(timestamptz '-infinity', timestamptz '-infinity')
+
+# one infinite operand: PG returns an infinite interval; jed has none, so 22008 (ledgered)
+statement error 22008
+SELECT age(timestamp 'infinity', timestamp '2024-01-01')
+
+statement error 22008
+SELECT age(timestamp '2024-01-01', timestamp 'infinity')
+
+statement error 22008
+SELECT age(timestamptz 'infinity', timestamptz '-infinity')
+
+# --- timestamptz in the default UTC session ----------------------------------------------------------
+# cost: 4
+query T nosort
+SELECT age(timestamptz '2024-03-01 03:00:00+00', timestamptz '2024-01-31 12:00:00+00')
+----
+1 mon 15:00:00
+
+# the operands' own offsets are irrelevant: both decompose in the session zone
+query T nosort
+SELECT age(timestamptz '2024-03-01 03:00:00+05', timestamptz '2024-01-31 12:00:00-08')
+----
+29 days 02:00:00
+
+# --- timestamptz in a session zone: the same instants, other wall clocks ----------------------------
+# 2024-02-29 22:00 EST vs 2024-01-31 07:00 EST: the month end moved
+# timezone: America/New_York
+query T nosort
+SELECT age(timestamptz '2024-03-01 03:00:00+00', timestamptz '2024-01-31 12:00:00+00')
+----
+29 days 15:00:00
+
+# timezone: Europe/Paris
+query T nosort
+SELECT age(timestamptz '2024-03-01 03:00:00+00', timestamptz '2024-01-31 12:00:00+00')
+----
+1 mon 15:00:00
+
+# spring forward: 01:59 EST → 03:00 EDT is one real minute but 01:01:00 of wall clock
+# timezone: America/New_York
+query T nosort
+SELECT age(timestamptz '2024-03-10 03:00:00-04', timestamptz '2024-03-10 01:59:00-05')
+----
+01:01:00
+
+# fall back: the later instant (01:10 EST) has the EARLIER wall clock than 01:30 EDT, so the
+# symbolic difference borrows up through the year field (-1 year + 11 mons = -1 mons)
+# timezone: America/New_York
+query T nosort
+SELECT age(timestamptz '2024-11-03 06:10:00+00', timestamptz '2024-11-03 05:30:00+00')
+----
+-1 mons +29 days 23:40:00
+
+# timezone: America/New_York
+query T nosort
+SELECT age(timestamptz '2024-11-03 05:30:00+00', timestamptz '2024-11-03 06:10:00+00')
+----
+1 mon -29 days -23:40:00
+
+# Lord Howe's half-hour fall back: 01:50 LHDT then, 20 real minutes later, 01:40 LHST
+# timezone: Australia/Lord_Howe
+query T nosort
+SELECT age(timestamptz '2024-04-06 15:10:00+00', timestamptz '2024-04-06 14:50:00+00')
+----
+-1 mons +29 days 23:50:00
+
+# a year across both DST changes keeps whole calendar units
+# timezone: Europe/Paris
+query T nosort
+SELECT age(timestamptz '2024-07-01 12:00:00+02', timestamptz '2023-12-15 12:00:00+01')
+----
+6 mons 17 days
+
+# timezone: Asia/Kolkata
+query T nosort
+SELECT age(timestamptz '2024-03-01 00:00:00+00', timestamptz '2024-02-01 00:00:00+00')
+----
+1 mon
+
+# timezone: America/New_York
+query IT nosort
+SELECT id, age(c, d) FROM ag ORDER BY id
+----
+1
+2 mons 30 days 13:00:00
+2
+-3 years -11 mons -28 days
+3
+NULL
+
+# --- the one-argument forms are age(CURRENT_DATE at midnight, x) -------------------------------------
+query B nosort
+SELECT age(timestamp '2000-02-29 12:00:00') = age(current_date::timestamp, timestamp '2000-02-29 12:00:00')
+----
+true
+
+# timezone: America/New_York
+query B nosort
+SELECT age(timestamptz '2000-02-29 12:00:00+00') = age(current_date::timestamptz, timestamptz '2000-02-29 12:00:00+00')
+----
+true
+
+query T nosort
+SELECT age(NULL::timestamp)
+----
+NULL
+
+# --- index admission: the clock readers are never indexable --------------------------------------
+statement error 42P17
+CREATE INDEX ag_age1_idx ON ag ((age(a)))
+
+statement error 42P17
+CREATE INDEX ag_age1tz_idx ON ag ((age(c)))
+
+# age(timestamptz, timestamptz) reads the session zone, so jed rejects it in an index (PG labels it
+# immutable and accepts it — ledgered, index-dependencies.md)
+statement error 42P17
+CREATE INDEX ag_agetz_idx ON ag ((age(c, d)))
+
+# --- no implicit datetime casts: a date or a mixed pair has no overload (PG casts — ledgered) ------
+statement error 42883
+SELECT age(date '2024-03-01', date '2024-01-31')
+
+statement error 42883
+SELECT age(timestamp '2024-03-01', timestamptz '2024-01-31 00:00:00+00')

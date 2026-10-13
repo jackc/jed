@@ -352,6 +352,91 @@ func justifyInterval(iv Interval) (Interval, error) {
 	return Interval{Months: months, Days: days, Micros: micros}, nil
 }
 
+// ageRejectInfinite is age(dt1, dt2)'s infinity rule (spec/design/interval.md §5.2). PostgreSQL
+// returns an infinite interval for one infinite operand and raises 22008 "interval out of range"
+// for the same infinity twice; jed has no infinite interval, so EVERY infinite operand is that
+// 22008. Checked before any zone consultation, like PG's timestamp_age / timestamptz_age.
+func ageRejectInfinite(dt1, dt2 int64) error {
+	inf := func(t int64) bool { return t == negInfinity || t == posInfinity }
+	if inf(dt1) || inf(dt2) {
+		return intervalFieldOverflow("interval out of range")
+	}
+	return nil
+}
+
+// age is PostgreSQL age(dt1, dt2) (spec/design/interval.md §5.2), ported step for step from
+// timestamp_age / timestamptz_age: the field-wise symbolic difference of the two wall clocks local1
+// and local2 (a timestamp's own value; a timestamptz decomposed in the session zone), with the sign
+// taken from comparing the values dt1 and dt2 themselves. Each field is subtracted, the result is
+// flipped so the later value comes first, negative fields borrow from the next higher one (a day
+// borrows the length of the EARLIER value's month), and the sign is restored. Both operands are
+// finite (ageRejectInfinite ran first).
+func age(dt1, dt2, local1, local2 int64) (Interval, error) {
+	y1, mo1, d1, h1, mi1, s1, us1 := civilFromMicros(local1)
+	y2, mo2, d2, h2, mi2, s2, us2 := civilFromMicros(local2)
+	// Form the symbolic difference.
+	usec, sec, minute, hour := us1-us2, s1-s2, mi1-mi2, h1-h2
+	mday, mon, year := d1-d2, mo1-mo2, y1-y2
+	flip := dt1 < dt2
+	if flip {
+		usec, sec, minute, hour = -usec, -sec, -minute, -hour
+		mday, mon, year = -mday, -mon, -year
+	}
+	// Propagate any negative fields into the next higher field.
+	for usec < 0 {
+		usec += microsPerSec
+		sec--
+	}
+	for sec < 0 {
+		sec += 60
+		minute--
+	}
+	for minute < 0 {
+		minute += 60
+		hour--
+	}
+	for hour < 0 {
+		hour += 24
+		mday--
+	}
+	for mday < 0 {
+		if flip {
+			mday += daysInMonth(y1, mo1)
+		} else {
+			mday += daysInMonth(y2, mo2)
+		}
+		mon--
+	}
+	for mon < 0 {
+		mon += monthsPerYear
+		year--
+	}
+	// Recover the sign.
+	if flip {
+		usec, sec, minute, hour = -usec, -sec, -minute, -hour
+		mday, mon, year = -mday, -mon, -year
+	}
+	// PG itm2interval: the months total must fit i32, the time total i64.
+	months, ok := mulAdd(year, monthsPerYear, mon)
+	if !ok || months < -2147483648 || months > 2147483647 || mday < -2147483648 || mday > 2147483647 {
+		return Interval{}, intervalFieldOverflow("interval out of range")
+	}
+	micros, ok := mul64(hour, 3600*microsPerSec)
+	if ok {
+		micros, ok = add64(micros, minute*60*microsPerSec)
+	}
+	if ok {
+		micros, ok = add64(micros, sec*microsPerSec)
+	}
+	if ok {
+		micros, ok = add64(micros, usec)
+	}
+	if !ok {
+		return Interval{}, intervalFieldOverflow("interval out of range")
+	}
+	return Interval{Months: int32(months), Days: int32(mday), Micros: micros}, nil
+}
+
 // --- parsing -----------------------------------------------------------------
 
 func invalidInterval(detail string) error       { return newError(InvalidDatetimeFormat, detail) }

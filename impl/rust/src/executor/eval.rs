@@ -2363,6 +2363,62 @@ impl RExpr {
                         })),
                         _ => unreachable!("resolver restricts justify_* to an interval"),
                     },
+                    // age (spec/design/interval.md §5.2). The one-argument form is PG's SQL
+                    // wrapper age(CURRENT_DATE::timestamp[tz], x): the statement clock's day in
+                    // the session zone (date_clock_value charges one timezone unit), widened to
+                    // midnight — for timestamptz, midnight read in the session zone (one more
+                    // timezone unit). A timestamptz pair then decomposes each finite operand in
+                    // the session zone (one timezone unit each); any ±infinity operand traps
+                    // 22008 before any decomposition. The NULL-input case is already handled above.
+                    ScalarFunc::Age => {
+                        let (dt1, x) = if vals.len() == 1 {
+                            let today = match date_clock_value(env.exec, env.rng, m, 0)? {
+                                Value::Date(d) => d,
+                                _ => unreachable!("date_clock_value returns a date"),
+                            };
+                            let mid = date_midnight_micros(today)?;
+                            let anchor = match &vals[0] {
+                                Value::Timestamptz(_) => {
+                                    m.charge(COSTS.timezone);
+                                    m.guard()?;
+                                    crate::timezone::local_to_instant_micros(
+                                        &env.exec.session.time_zone,
+                                        mid,
+                                    )
+                                    .ok_or_else(crate::timestamp::zone_shift_out_of_range)?
+                                }
+                                _ => mid,
+                            };
+                            (anchor, &vals[0])
+                        } else {
+                            let dt1 = match &vals[0] {
+                                Value::Timestamp(t) | Value::Timestamptz(t) => *t,
+                                _ => unreachable!("resolver restricts age to timestamp[tz]"),
+                            };
+                            (dt1, &vals[1])
+                        };
+                        let (dt2, tz) = match x {
+                            Value::Timestamp(t) => (*t, false),
+                            Value::Timestamptz(t) => (*t, true),
+                            _ => unreachable!("resolver restricts age to timestamp[tz]"),
+                        };
+                        crate::interval::age_reject_infinite(dt1, dt2)?;
+                        let (local1, local2) = if tz {
+                            let zr = env.exec.session.time_zone.clone();
+                            let mut local = |t: i64| -> Result<i64> {
+                                m.charge(COSTS.timezone);
+                                m.guard()?;
+                                crate::timezone::instant_to_local_micros(&zr, t)
+                                    .ok_or_else(crate::timestamp::zone_shift_out_of_range)
+                            };
+                            (local(dt1)?, local(dt2)?)
+                        } else {
+                            (dt1, dt2)
+                        };
+                        Ok(Value::Interval(crate::interval::age(
+                            dt1, dt2, local1, local2,
+                        )?))
+                    }
                     // uuid extractors (spec/design/functions.md §12): pure bit inspection. Both
                     // return NULL (Value::Null) for a non-RFC variant; the timestamp also for any
                     // version other than 1/7. The NULL-input case is already handled above.

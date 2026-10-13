@@ -119,6 +119,17 @@ test('the types page autoruns the interval justify demo', async ({ page }) => {
   await expect(rows).toContainText('29 days 23:00:00');
 });
 
+test('the types page autoruns the age demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // age keeps years and months (43 years 9 mons 27 days; Jan 31 → Mar 1 = 1 mon 1 day) where plain
+  // subtraction counts days (30 days).
+  const panel = livePanel(page, 'ageDemo');
+  const rows = panel.getByTestId('result-rows');
+  await expect(rows).toContainText('43 years 9 mons 27 days');
+  await expect(rows).toContainText('1 mon 1 day');
+  await expect(rows).toContainText('30 days');
+});
+
 test('the types page autoruns the bytea position / overlay demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // position = 3, overlay(… PLACING \xaabb FROM 2) = \x01aabb0405, set_byte(…, 0, 255) = \xff0203,

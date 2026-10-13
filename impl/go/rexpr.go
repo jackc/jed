@@ -775,6 +775,11 @@ const (
 	sfJustifyHours
 	sfJustifyDays
 	sfJustifyInterval
+	// age(timestamp[tz], timestamp[tz]) → interval, and the one-argument age(x) =
+	// age(CURRENT_DATE at midnight, x) — PostgreSQL's symbolic field-wise difference with borrow
+	// (spec/design/interval.md §5.2). A timestamptz decomposes in the session zone; the one-arg
+	// form reads the statement clock (STABLE). Any ±infinity operand traps 22008.
+	sfAge
 	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
 	// sfUuidExtractVersion → i16 (NULL off-RFC-variant); sfUuidExtractTimestamp → timestamptz
 	// (the embedded instant for v1/v7, else NULL).

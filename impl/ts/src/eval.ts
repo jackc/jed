@@ -138,6 +138,8 @@ import {
   isUuid,
 } from "./types.ts";
 import {
+  age,
+  ageRejectInfinite,
   intervalAdd,
   intervalNeg,
   intervalSub,
@@ -1390,6 +1392,42 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (e.func === "justify_interval") {
         return intervalValue(justifyInterval((vals[0] as { iv: Interval }).iv));
+      }
+      // age (spec/design/interval.md §5.2). The one-argument form is PG's SQL wrapper
+      // age(CURRENT_DATE::timestamp[tz], x): the statement clock's day in the session zone
+      // (dateClockValue charges one timezone unit), widened to midnight — for timestamptz, midnight
+      // read in the session zone (one more timezone unit). A timestamptz pair then decomposes each
+      // finite operand in the session zone (one timezone unit each); any ±infinity operand traps
+      // 22008 before any decomposition. The NULL-input case is already handled above.
+      if (e.func === "age") {
+        let x = vals[0]! as { kind: string; micros: bigint };
+        let dt1: bigint;
+        if (vals.length === 1) {
+          const today = dateClockValue(env.exec, env.rng, env.seam, m, 0n) as { days: bigint };
+          dt1 = dateMidnightMicros(today.days);
+          if (x.kind === "timestamptz") {
+            m.charge(COSTS.timezone);
+            m.guard();
+            dt1 = localToInstantMicros(env.exec.session.timeZone, dt1);
+          }
+        } else {
+          dt1 = x.micros;
+          x = vals[1]! as { kind: string; micros: bigint };
+        }
+        const dt2 = x.micros;
+        ageRejectInfinite(dt1, dt2);
+        let local1 = dt1;
+        let local2 = dt2;
+        if (x.kind === "timestamptz") {
+          const zr = env.exec.session.timeZone;
+          m.charge(COSTS.timezone);
+          m.guard();
+          local1 = instantToLocalMicros(zr, dt1);
+          m.charge(COSTS.timezone);
+          m.guard();
+          local2 = instantToLocalMicros(zr, dt2);
+        }
+        return intervalValue(age(dt1, dt2, local1, local2));
       }
       // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
       // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is

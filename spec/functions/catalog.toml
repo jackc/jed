@@ -2906,6 +2906,63 @@ null           = "propagates"
 errors         = ["22008"]
 volatility     = "immutable"
 
+# --- age ------------------------------------------------------------------------
+# PostgreSQL's age (../design/interval.md §5.2), ported step for step from timestamp_age /
+# timestamptz_age: the field-wise SYMBOLIC difference of two wall clocks (years, months, days,
+# time), the later value first, negative fields borrowing from the next higher field — a day
+# borrows the length of the EARLIER value's month — then the sign restored. age(timestamptz,
+# timestamptz) decomposes both instants in the SESSION zone (one timezone unit each), so it is
+# STABLE where PG labels it immutable: jed's index-dependency rule rejects a session-zone reader in
+# an index expression (42P17 — ../design/index-dependencies.md), a ledgered divergence. The
+# one-argument forms are PG's SQL wrappers age(CURRENT_DATE::timestamp[tz], x): the statement
+# clock's day in the session zone at midnight (STABLE, the clock seam — ../design/entropy.md §5).
+# Any ±infinity operand is 22008 "interval out of range": PG returns an infinite interval for one,
+# and jed has no infinite interval (the timestamp − timestamp rule). No implicit date / mixed
+# timestamp-timestamptz overloads (42883 — jed has no implicit datetime casts, timezones.md §9.1).
+[[operator]]
+name           = "age"
+kind           = "function"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "age"
+kind           = "function"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "stable"
+
+[[operator]]
+name           = "age"
+kind           = "function"
+arity          = 1
+arg_families   = ["timestamp"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "stable"
+
+[[operator]]
+name           = "age"
+kind           = "function"
+arity          = 1
+arg_families   = ["timestamptz"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "stable"
+
 # --- timestamp constructors (make_timestamp / make_timestamptz) --------------
 # PostgreSQL's timestamp builders, the make_interval siblings (../design/functions.md §11) — every
 # parameter NAMED (year, month, mday, hour, min, sec), but NONE defaulted (all are required, unlike
