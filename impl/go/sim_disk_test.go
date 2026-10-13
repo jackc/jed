@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"hash/fnv"
 	"sort"
+	"testing"
 )
 
 // Decision lanes keep independent choices from correlating (§6.2). The values are part of the
@@ -349,4 +350,22 @@ func (d *simDisk) processDeath() {
 	d.unissued = nil
 	d.fault = nil
 	d.dead = false
+}
+
+// TestSimDecideVectors pins simDecide to the shared vectors in spec/encoding/prng.toml
+// ([[sim_decide]]), which spec/encoding/prng_verify.rb recomputes independently.
+func TestSimDecideVectors(t *testing.T) {
+	for _, v := range []struct {
+		seed, lane, step, offset, version, want uint64
+	}{
+		{0, 1, 0, 0, 0, 0xe28195ddd9ee4956},
+		{1, 1, 7, 8192, 0, 0xa26f2f0c00568058},
+		{81723, 2, 42, 16384, 3, 0x1ec7ed20c6738508},
+		{9223372036854775807, 4, 300, 640, 1, 0x925c4929a8b5d11b},
+		{12345, 8, 9, 0, 0, 0x47a4d3845325ea26},
+	} {
+		if got := simDecide(v.seed, v.lane, v.step, v.offset, v.version); got != v.want {
+			t.Errorf("simDecide(%d, %d, %d, %d, %d) = %016x, want %016x", v.seed, v.lane, v.step, v.offset, v.version, got, v.want)
+		}
+	}
 }

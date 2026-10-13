@@ -77,6 +77,18 @@ def build_v7(rng, clock_micros)
   b
 end
 
+# The simulation's content-keyed decision function (simulation-testing.md §6.2): the splitmix64
+# finalizer folded over (lane, step, offset, version), starting from the seed.
+def sim_mix(z)
+  z = ((z ^ (z >> 30)) * MIX1) & MASK64
+  z = ((z ^ (z >> 27)) * MIX2) & MASK64
+  z ^ (z >> 31)
+end
+
+def sim_decide(seed, lane, step, offset, version)
+  [lane, step, offset, version].reduce(seed & MASK64) { |h, w| sim_mix(((h ^ w) + GAMMA) & MASK64) }
+end
+
 def main
   data = TomlRB.load_file(File.join(__dir__, "prng.toml"))
   fail!("prng.toml: schema_version must be 1") unless data["schema_version"] == 1
@@ -106,7 +118,13 @@ def main
     end
   end
 
-  puts "OK: #{n} PRNG/UUID vectors verified (splitmix64 + v4/v7 byte layout)"
+  (data["sim_decide"] || []).each do |v|
+    got = format("%016x", sim_decide(v["seed"], v["lane"], v["step"], v["offset"], v["version"]))
+    fail!("sim_decide #{v.inspect}: got #{got}") unless got == v["value"]
+    n += 1
+  end
+
+  puts "OK: #{n} PRNG/UUID/simulation vectors verified (splitmix64 + v4/v7 byte layout + sim decide)"
 end
 
 main

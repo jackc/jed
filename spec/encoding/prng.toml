@@ -34,3 +34,48 @@ uuid = "975835de-1c97-46ce-bfc8-46100bfc1e42"
 seed = 1
 clock_micros = 1721056591872000
 uuids = ["0190b6f7-8000-7000-910a-2dec89025cc1", "0190b6f7-8000-7001-beeb-8da1658eec67"]
+
+# --- simulation fault decisions (spec/design/simulation-testing.md §6.2) ---------------------
+# decide(seed, lane, step, offset, version): h = seed; for w in [lane, step, offset, version]:
+# h = mix((h ^ w) + GAMMA), with mix the splitmix64 finalizer above. Every core's simulation runner
+# keys its crash, tear, and I/O-error decisions on this function, so the same trace produces the
+# same crash image in every core. `value` is the 16-hex u64.
+[[sim_decide]]
+seed = 0
+lane = 1
+step = 0
+offset = 0
+version = 0
+value = "e28195ddd9ee4956"
+
+[[sim_decide]]
+seed = 1
+lane = 1
+step = 7
+offset = 8192
+version = 0
+value = "a26f2f0c00568058"
+
+[[sim_decide]]
+seed = 81723
+lane = 2
+step = 42
+offset = 16384
+version = 3
+value = "1ec7ed20c6738508"
+
+[[sim_decide]]
+seed = 9223372036854775807
+lane = 4
+step = 300
+offset = 640
+version = 1
+value = "925c4929a8b5d11b"
+
+[[sim_decide]]
+seed = 12345
+lane = 8
+step = 9
+offset = 0
+version = 0
+value = "47a4d3845325ea26"
