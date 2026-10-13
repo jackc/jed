@@ -1407,6 +1407,12 @@ func computeRelMasks(plan *selectPlan) [][]bool {
 					collectTouched(a, 0, touched)
 				}
 			}
+			// An in-aggregate ORDER BY's keys are evaluated per input row too (aggregates.md §22).
+			if o := plan.aggSpecs[i].order; o != nil {
+				for _, k := range o.keys {
+					collectTouched(k, 0, touched)
+				}
+			}
 		}
 	} else {
 		for _, p := range plan.projections {

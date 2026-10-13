@@ -4457,6 +4457,7 @@ export class Engine {
       for (const agg of sp.aggSpecs) {
         let nodes = saturatingEstimateAdd(estimatorOperatorNodes(agg.operand), estimatorOperatorNodes(agg.filter ?? null));
         if (agg.hypo != null) nodes = saturatingEstimateAdd(nodes, this.estimateSumExprNodes(agg.hypo.keys));
+        if (agg.order != null) nodes = saturatingEstimateAdd(nodes, this.estimateSumExprNodes(agg.order.keys));
         local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(nodes, inputRows));
         local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(estimatorOperatorNodes(agg.osaFrac ?? null), rows));
       }
@@ -4473,6 +4474,7 @@ export class Engine {
         this.addExpressionSubqueries(plan.root, agg.operand, inputRows, ctx);
         this.addExpressionSubqueries(plan.root, agg.filter ?? null, inputRows, ctx);
         if (agg.hypo != null) this.addExpressionListSubqueries(plan.root, agg.hypo.keys, inputRows, ctx);
+        if (agg.order != null) this.addExpressionListSubqueries(plan.root, agg.order.keys, inputRows, ctx);
         this.addExpressionSubqueries(plan.root, agg.osaFrac ?? null, groupRows, ctx);
       }
       this.addExpressionSubqueries(plan.root, sp.having, groupRows, ctx);
@@ -20056,11 +20058,18 @@ export class Engine {
               }
               const value =
                 spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
+              // An in-aggregate ORDER BY's keys follow the argument (aggregates.md §22).
+              const tuple = spec.order != null ? aggOrderTuple(spec.order, value, row, env, meter) : null;
               if (spec.distinct) {
-                if (value.kind === "null") continue;
+                if (value.kind === "null" && !aggDistinctKeepsNull(spec.plan)) continue;
                 // The entry is (group ordinal, aggregate ordinal, value).
                 const dk = `${key.length}:${key}${si}:${distinctRowKey([value])}`;
                 if (!seen.insert(dk, 2 * MEMORY_VALUE + valueBytes(value))) continue;
+              }
+              // An ordered aggregate spools its [keys…, argument] tuple; finalize sorts and folds them.
+              if (tuple !== null) {
+                collections.append(collectionKey, tuple);
+                continue;
               }
               if (
                 !foldBlockingCollection(
@@ -20100,6 +20109,7 @@ export class Engine {
                   budget,
                   sink,
                   acct,
+                  meter,
                 ),
               );
             for (const positions of plan.groupingSpecs)
@@ -20760,12 +20770,19 @@ export class Engine {
               return;
             }
             const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
-            // DISTINCT: skip a NULL (never folded by any aggregate) and any value already folded into
-            // this group — the FIRST occurrence in scan order wins, so the set of folded values (and
-            // the decimalWork fold charges) is order-deterministic and cross-core identical.
+            // An in-aggregate ORDER BY's keys are evaluated per passing row, after the argument and
+            // before the DISTINCT check (aggregates.md §22).
+            const tuple =
+              spec.order !== undefined && spec.order !== null
+                ? aggOrderTuple(spec.order, v, row, env, meter)
+                : null;
+            // DISTINCT: skip any value already folded into this group — the FIRST occurrence in scan
+            // order wins, so the set of folded values (and the decimalWork fold charges) is
+            // order-deterministic and cross-core identical. A NULL is skipped too, except by the JSON
+            // array aggregates, which fold it (aggregates.md §5).
             const dedup = seen[i];
             if (dedup) {
-              if (v.kind === "null") return;
+              if (v.kind === "null" && !aggDistinctKeepsNull(spec.plan)) return;
               const dk = distinctRowKey([v]);
               if (dedup.has(dk)) return;
               dedup.add(dk);
@@ -20774,6 +20791,17 @@ export class Engine {
                 meter.reserveQuery(bytes);
                 group.charge += bytes;
               }
+            }
+            // An ordered aggregate buffers the tuple (its retention charged like the hypothetical-set
+            // tuples); the fold runs in key order at finalize.
+            if (tuple !== null) {
+              if (meter.queryMemoryActive()) {
+                const bytes = rowBytes(tuple);
+                meter.reserveQuery(bytes);
+                group.charge += bytes;
+              }
+              accs[i]!.ordRows!.push(tuple);
+              return;
             }
             group.charge += foldAccCharged(accs[i]!, v, meter);
           });
@@ -20808,6 +20836,19 @@ export class Engine {
             if (hp !== undefined && hp !== null) {
               const hyp = hp.args.map((arg) => evalExpr(arg, srow, env, env.exec.session.scratchMeter()));
               srow.push(finalizeHypothetical(a.plan, a.hypoRows!, hyp, hp.sorts));
+              continue;
+            }
+            // An in-aggregate ORDER BY (aggregates.md §22): fold the buffered arguments in key order
+            // into the plan's own accumulator, charging the fold (its decimalWork / generatedRow and
+            // its retention) as usual.
+            if (a.ordRows !== undefined) {
+              const spec = plan.aggSpecs[si]!;
+              const inner = newAccFromSpecUnordered(spec);
+              for (const v of sortAggOrderRows(a.ordRows, spec.order!)) {
+                meter.guard();
+                g.charge += foldAccCharged(inner, v, meter);
+              }
+              srow.push(finalizeAcc(inner));
               continue;
             }
             srow.push(finalizeAcc(a));
@@ -21023,6 +21064,8 @@ export class Engine {
     for (const s of sp.aggSpecs) {
       if (s.operand !== null)
         s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, ctes, cost);
+      if (s.order != null)
+        s.order.keys = s.order.keys.map((k) => this.foldUncorrelatedInRExpr(k, bound, ctes, cost));
     }
     sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, ctes, cost));
     // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery to
@@ -26101,8 +26144,10 @@ export function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolea
   for (const j of plan.joins) if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
   if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth)) return true;
   if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
-  for (const s of plan.aggSpecs)
+  for (const s of plan.aggSpecs) {
     if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
+    if (s.order != null && s.order.keys.some((k) => rexprReferencesOuter(k, depth))) return true;
+  }
   for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
   // A materialized ORDER BY expression may itself carry a correlated reference (query.order_by_correlated):
   // a subquery whose ONLY outer reference is in its ORDER BY is still correlated and must re-execute per
@@ -26266,6 +26311,8 @@ function computeRelMasks(plan: SelectPlan): boolean[][] {
         for (const k of s.hypo.keys) collectTouched(k, 0, touched);
         for (const a of s.hypo.args) collectTouched(a, 0, touched);
       }
+      // An in-aggregate ORDER BY's keys are evaluated per input row too (aggregates.md §22).
+      if (s.order != null) for (const k of s.order.keys) collectTouched(k, 0, touched);
     }
   } else {
     for (const p of plan.projections) collectTouched(p, 0, touched);
@@ -26821,8 +26868,10 @@ export function collectTouchedPlan(plan: QueryPlan, depth: number, touched: bool
     for (const j of plan.joins) if (j.on !== null) collectTouched(j.on, depth, touched);
     if (plan.filter !== null) collectTouched(plan.filter, depth, touched);
     if (plan.having !== null) collectTouched(plan.having, depth, touched);
-    for (const s of plan.aggSpecs)
+    for (const s of plan.aggSpecs) {
       if (s.operand !== null) collectTouched(s.operand, depth, touched);
+      if (s.order != null) for (const k of s.order.keys) collectTouched(k, depth, touched);
+    }
     for (const p of plan.projections) collectTouched(p, depth, touched);
     // A materialized ORDER BY expression and a set-returning relation's args / a LATERAL derived body
     // can each carry a correlated reference back into the target scope (the same surfaces
@@ -29645,11 +29694,32 @@ export type AggSpec = {
   // ROW during the fold and buffered as a tuple on the Acc), and the per-key sort specs. Null/undefined
   // otherwise. (operand is null here — the keys are buffered as a tuple from hypo.keys.)
   hypo?: HypoParams | null;
+  // Set for an aggregate with an in-aggregate ORDER BY (json_agg(x ORDER BY y) — aggregates.md §22):
+  // the per-row sort keys + their sort specs. The fold loop buffers each passing row's [sort keys…,
+  // argument] tuple and folds the arguments in key order at finalize. Null/undefined otherwise.
+  order?: AggOrder | null;
   // The comparison collation of a text MIN/MAX (spec/design/collation.md §1 "Aggregates and window
   // functions"): the operand's derivation; null/undefined for C, a non-text operand, or any other
   // aggregate.
   collation?: Collation | null;
 };
+
+// AggOrder is an in-aggregate ORDER BY (aggregates.md §22): keys are the sort-key expressions
+// (evaluated per passing input row, after the argument) and sorts their per-key direction / NULL
+// placement / collation. Equal length.
+export type AggOrder = {
+  keys: RExpr[];
+  sorts: KeySort[];
+};
+
+// aggDistinctKeepsNull reports whether a DISTINCT aggregate keeps a NULL argument as one more
+// distinct value instead of skipping it (aggregates.md §5): only the JSON array aggregates, whose
+// non-strict transition folds a NULL (even the _strict variants, which then drop it in the fold but
+// still mark the group non-empty — [], not NULL, as in PostgreSQL). Every other aggregate ignores
+// NULLs.
+export function aggDistinctKeepsNull(plan: AggPlan): boolean {
+  return plan === "jsonAgg";
+}
 
 // KeySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
 // placement, and optional collation (text keys only).
@@ -29840,6 +29910,11 @@ export type Acc = {
   // per-group hypothetical row + the spec's sort specs are available) finalizeHypothetical counts how
   // that hypothetical row would rank. Undefined for every non-hypothetical plan.
   hypoRows?: Value[][];
+  // An in-aggregate ORDER BY's buffer (aggregates.md §22): every passing input row's [sort key…,
+  // argument] tuple (collated text keys already replaced by their UCA sort key), in input order. The
+  // group-emission loop stable-sorts them by the spec's AggOrder and folds the arguments into a fresh
+  // unordered Acc — key order, ties in input order. Undefined for an unordered aggregate.
+  ordRows?: Value[][];
   // A text MIN/MAX's comparison collation (spec/design/collation.md §1); null/undefined is C.
   // Ignored by every other plan.
   collation?: Collation | null;
@@ -29878,6 +29953,19 @@ export function newAcc(
 // ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
 // ordered-set aggregate with OVER is 0A000, rejected at resolve).
 export function newAccFromSpec(s: AggSpec): Acc {
+  // An in-aggregate ORDER BY buffers the passing rows first (aggregates.md §22); the plan's own
+  // accumulator is built at finalize (newAccFromSpecUnordered) and fed in key order.
+  if (s.order !== undefined && s.order !== null) {
+    const a = newAcc(s.plan);
+    a.ordRows = [];
+    return a;
+  }
+  return newAccFromSpecUnordered(s);
+}
+
+// newAccFromSpecUnordered is newAccFromSpec ignoring any in-aggregate ORDER BY — the accumulator an
+// ordered aggregate's sorted arguments are finally folded into.
+export function newAccFromSpecUnordered(s: AggSpec): Acc {
   if (
     s.plan === "mode" ||
     s.plan === "percentileDisc" ||
@@ -30438,6 +30526,46 @@ export function finalizeHypothetical(
     default:
       throw new Error("finalizeHypothetical only for the hypothetical-set plans");
   }
+}
+
+// aggOrderTuple evaluates one passing input row's in-aggregate ORDER BY keys (aggregates.md §22) and
+// returns the buffered tuple [key…, value]. Each key's operator_evals are charged (it is evaluated per
+// row, after the argument). A collated text / text[] key is replaced by its UCA sort key (bytea), so
+// the finalize sort is a plain value sort and an unmapped code point fails here, per row — independent
+// of how many rows the group has.
+export function aggOrderTuple(
+  order: AggOrder,
+  value: Value,
+  row: Row,
+  env: EvalEnv,
+  meter: Meter,
+): Value[] {
+  const tuple: Value[] = [];
+  for (let i = 0; i < order.keys.length; i++) {
+    let kv = evalExpr(order.keys[i]!, row, env, meter);
+    const coll = order.sorts[i]!.collation;
+    if (coll !== null && (kv.kind === "text" || kv.kind === "array")) {
+      kv = byteaValue(collatedSortKey(coll, kv)!);
+    }
+    tuple.push(kv);
+  }
+  tuple.push(value);
+  return tuple;
+}
+
+// sortAggOrderRows stable-sorts an ordered aggregate's buffered [key…, value] tuples by its ORDER BY
+// (each key's direction + NULL placement; ties keep input order) and returns the values in that order
+// (aggregates.md §22). The sort is unmetered, like the query ORDER BY sort.
+export function sortAggOrderRows(rows: Value[][], order: AggOrder): Value[] {
+  const sorted = [...rows].sort((a, b) => {
+    for (let k = 0; k < order.sorts.length; k++) {
+      const ks = order.sorts[k]!;
+      const c = keyCmp(a[k]!, b[k]!, ks.desc, ks.nullsFirst);
+      if (c !== 0) return c;
+    }
+    return 0;
+  });
+  return sorted.map((r) => r[r.length - 1]!);
 }
 
 // hypoCmp compares a buffered key tuple a to the hypothetical row b by the WITHIN GROUP order
@@ -31406,7 +31534,14 @@ export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
 export function resolveAggregate(
   scope: Scope,
-  e: { name: string; args: Expr[]; star: boolean; distinct: boolean; filter?: Expr | null },
+  e: {
+    name: string;
+    args: Expr[];
+    star: boolean;
+    distinct: boolean;
+    filter?: Expr | null;
+    aggOrder?: OrderKey[] | null;
+  },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -31422,12 +31557,27 @@ export function resolveAggregate(
     if (e.star || e.args.length !== 2) throw noAggOverload(name);
     const rk = resolve(scope, e.args[0]!, null, sub, params);
     const rv = resolve(scope, e.args[1]!, null, sub, params);
+    // DISTINCT de-duplicates the (key, value) pair, so both need an equality (json has none).
+    if (e.distinct) {
+      rejectJsonDistinct(rk.type);
+      rejectJsonDistinct(rv.type);
+    }
+    const order =
+      e.aggOrder != null
+        ? resolveAggOrder(scope, e.aggOrder, e.distinct, e.args, [rk.node, rv.node], params)
+        : null;
+    const filter = resolveAggFilter(scope, e.filter ?? null, params);
+    // The key/value pair travels as one Row operand; DISTINCT dedups that pair, FILTER and the
+    // in-aggregate ORDER BY apply as for any aggregate.
     const operandRow: RExpr = { kind: "row", fields: [rk.node, rv.node] };
     const result: ResolvedType = objAgg.asJson ? { kind: "json" } : { kind: "jsonb" };
     const slot = ag.groupKeys.length + ag.specs.length;
     ag.specs.push({
       plan: "jsonObjectAgg",
       operand: operandRow,
+      distinct: e.distinct,
+      filter,
+      order,
       jsonAsJson: objAgg.asJson,
       jsonUnique: objAgg.unique,
     });
@@ -31470,21 +31620,22 @@ export function resolveAggregate(
     const desc = lookupAggregateOverload(name, r.type);
     if (!desc) throw noAggOverload(name);
     [plan, result, floatWidth, jsonFlags] = aggregatePlan(name, desc.result, r.type);
+    if (e.distinct) rejectJsonDistinct(r.type);
   }
+  // The in-aggregate ORDER BY (aggregates.md §22) — resolved after the overload, like PG.
+  const order =
+    e.aggOrder != null
+      ? resolveAggOrder(
+          scope,
+          e.aggOrder,
+          e.distinct,
+          e.args,
+          operand !== null ? [operand] : [],
+          params,
+        )
+      : null;
   const collation = minmaxCollation(scope, plan, e.args, result);
-  // FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
-  // FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A non-boolean
-  // condition (or an untyped NULL, always unknown → folds no row) is 42804. The fold loop evaluates
-  // this per row and folds only the rows for which it is TRUE.
-  let filter: RExpr | null = null;
-  if (e.filter !== undefined && e.filter !== null) {
-    const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-    const rf = resolve(scope, e.filter, null, fsub, params);
-    if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
-      throw typeError("argument of FILTER must be type boolean");
-    }
-    filter = rf.node;
-  }
+  const filter = resolveAggFilter(scope, e.filter ?? null, params);
   // Aggregate results follow the group-key values in the synthetic row.
   const slot = ag.groupKeys.length + ag.specs.length;
   ag.specs.push({
@@ -31493,11 +31644,123 @@ export function resolveAggregate(
     floatWidth,
     distinct: e.distinct,
     filter,
+    order,
     jsonAsJson: jsonFlags?.asJson,
     jsonStrict: jsonFlags?.strict,
     collation,
   });
   return { node: { kind: "column", index: slot }, type: result };
+}
+
+// rejectJsonDistinct: DISTINCT de-duplicates an aggregate's argument by equality, and json has none
+// (PG ships no equality opclass — json.md §5), so a DISTINCT aggregate over a json argument is 42883,
+// the same rule SELECT DISTINCT applies to a json output column.
+function rejectJsonDistinct(t: ResolvedType): void {
+  if (t.kind === "json") {
+    throw engineError("undefined_function", "could not identify an equality operator for type json");
+  }
+}
+
+// resolveAggFilter resolves an aggregate's FILTER (WHERE cond) (aggregates.md §11): a per-row
+// predicate over the input row with aggregates FORBIDDEN (an aggregate inside FILTER is 42803); a
+// non-boolean condition (an untyped NULL is allowed — always unknown, folds no row) is 42804. null
+// when the call has no FILTER.
+function resolveAggFilter(scope: Scope, filter: Expr | null, params: ParamTypes): RExpr | null {
+  if (filter === null) return null;
+  const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  const rf = resolve(scope, filter, null, fsub, params);
+  if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
+    throw typeError("argument of FILTER must be type boolean");
+  }
+  return rf.node;
+}
+
+// aggSortKeyExpr is the expression an aggregate sort key orders by: its general expression, or the
+// (qualified) column reference a column key names.
+function aggSortKeyExpr(key: OrderKey): Expr {
+  if (key.expr !== null && key.expr !== undefined) return key.expr;
+  if (key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== "")
+    return { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column, loc: key.loc };
+  return { kind: "column", name: key.column, loc: key.loc };
+}
+
+// resolveAggSortKey resolves one aggregate sort key — a WITHIN GROUP key of a hypothetical-set
+// aggregate (aggregates.md §19) or an in-aggregate ORDER BY key (§22) — against the input row,
+// aggregates forbidden (a nested aggregate is 42803). It returns the per-row key expression, its type,
+// and its sort spec: direction, NULL placement, and collation (an explicit COLLATE — text only, else
+// 42804 — or the key's derived collation, §13).
+function resolveAggSortKey(
+  scope: Scope,
+  key: OrderKey,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType; sort: KeySort } {
+  const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  const r = resolve(scope, aggSortKeyExpr(key), null, sub, params);
+  const ktype = r.type;
+  let collation: Collation | null = null;
+  if (key.collation !== null && key.collation !== undefined) {
+    if (!rtCollatable(ktype) && ktype.kind !== "null") {
+      throw typeError(`collations are not supported by type ${rtName(ktype)}`);
+    }
+    collation = resolveCollationName(scope.catalog, key.collation);
+  } else if (rtCollatable(ktype)) {
+    collation = sortTargetCollation(scope.catalog, orderKeyDeriv(scope, key));
+  }
+  return {
+    node: r.node,
+    type: ktype,
+    sort: { desc: key.descending, nullsFirst: key.nullsFirst, collation },
+  };
+}
+
+// resolveAggOrder resolves an in-aggregate ORDER BY (json_agg(x ORDER BY y DESC) — aggregates.md
+// §22): each key is evaluated per passing input row and the group's rows are folded in key order. A
+// json key is 42883 (no ordering operator, like the query ORDER BY). With DISTINCT every key must be
+// one of the aggregate's arguments — structurally (the AST, positions ignored) or as the same input
+// column — else 42P10, PostgreSQL's rule (the sort then never splits a de-duplicated value).
+function resolveAggOrder(
+  scope: Scope,
+  keys: OrderKey[],
+  distinct: boolean,
+  args: Expr[],
+  argNodes: RExpr[],
+  params: ParamTypes,
+): AggOrder {
+  const order: AggOrder = { keys: [], sorts: [] };
+  for (const key of keys) {
+    // Like an argument, a key may not contain a window function (PG 42803 — window.md §7).
+    if (key.expr !== null && key.expr !== undefined && exprHasWindow(key.expr)) {
+      throw engineError(
+        "grouping_error",
+        "aggregate function calls cannot contain window function calls",
+      );
+    }
+    const r = resolveAggSortKey(scope, key, params);
+    if (r.type.kind === "json") {
+      throw engineError(
+        "undefined_function",
+        "could not identify an ordering operator for type json",
+      );
+    }
+    if (distinct) {
+      const kexpr = aggSortKeyExpr(key);
+      const knode = r.node;
+      const found =
+        args.some((a) => exprEqual(a, kexpr)) ||
+        argNodes.some(
+          (a) => a.kind === "column" && knode.kind === "column" && a.index === knode.index,
+        );
+      if (!found) {
+        throw engineError(
+          "invalid_column_reference",
+          "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+        );
+      }
+    }
+    order.keys.push(r.node);
+    order.sorts.push(r.sort);
+  }
+  return order;
 }
 
 // minmaxCollation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
@@ -31734,29 +31997,10 @@ export function resolveHypotheticalSetAggregate(
   for (let i = 0; i < keys.length; i++) {
     const key = keys[i]!;
     const arg = e.args[i]!;
-    // The WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN (a nested aggregate is
-    // 42803). A general-expression key carries expr; a bare/qualified column key carries column.
-    const keyExpr: Expr =
-      key.expr !== null && key.expr !== undefined
-        ? key.expr
-        : key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
-          ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column, loc: key.loc }
-          : { kind: "column", name: key.column, loc: key.loc };
-    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-    const r = resolve(scope, keyExpr, null, sub, params);
+    // The WITHIN GROUP order key + its sort spec, resolved per row with aggregates FORBIDDEN (a
+    // nested aggregate is 42803).
+    const r = resolveAggSortKey(scope, key, params);
     const ktype = r.type;
-    // The key's collation (explicit COLLATE — text only — else the key's derived collation, an
-    // indeterminate key 42P21), §13. An unknown name is 42704; a COLLATE on a non-text key is
-    // 42804.
-    let collation: Collation | null = null;
-    if (key.collation !== null && key.collation !== undefined) {
-      if (!rtCollatable(ktype) && ktype.kind !== "null") {
-        throw typeError(`collations are not supported by type ${rtName(ktype)}`);
-      }
-      collation = resolveCollationName(scope.catalog, key.collation);
-    } else if (rtCollatable(ktype)) {
-      collation = sortTargetCollation(scope.catalog, orderKeyDeriv(scope, key));
-    }
     // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
     // key's scalar type via the hint. Its type must match the key's family (else 42883).
     const kt = typeFromResolved(ktype);
@@ -31766,20 +32010,12 @@ export function resolveHypotheticalSetAggregate(
       throw noAggOverload(name);
     }
     keyNodes.push(r.node);
-    sorts.push({ desc: key.descending, nullsFirst: key.nullsFirst, collation });
+    sorts.push(r.sort);
     argNodes.push(ar.node);
   }
 
   // FILTER (WHERE cond): per-input-row predicate (aggregates forbidden); restricts buffered rows.
-  let filter: RExpr | null = null;
-  if (e.filter !== undefined && e.filter !== null) {
-    const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-    const rf = resolve(scope, e.filter, null, fsub, params);
-    if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
-      throw typeError("argument of FILTER must be type boolean");
-    }
-    filter = rf.node;
-  }
+  const filter = resolveAggFilter(scope, e.filter ?? null, params);
 
   let plan: AggPlan;
   let result: ResolvedType;
@@ -32632,6 +32868,7 @@ export function resolveFuncCall(
     star: boolean;
     distinct: boolean;
     filter?: Expr | null;
+    aggOrder?: OrderKey[] | null;
     variadic: boolean;
   },
   ag: AggCtx,
@@ -32645,6 +32882,15 @@ export function resolveFuncCall(
     throw engineError(
       "wrong_object_type",
       `DISTINCT specified, but ${lname} is not an aggregate function`,
+    );
+  }
+  // An in-aggregate ORDER BY is aggregate-only too: `abs(x ORDER BY x)` is 42809 (PG's
+  // wrong_object_type, "ORDER BY specified, but <fn> is not an aggregate function" — aggregates.md
+  // §22). PG checks it between DISTINCT and FILTER.
+  if (e.aggOrder !== undefined && e.aggOrder !== null && !isAggregateName(lname)) {
+    throw engineError(
+      "wrong_object_type",
+      `ORDER BY specified, but ${lname} is not an aggregate function`,
     );
   }
   // FILTER is likewise aggregate-only: `abs(x) FILTER (WHERE …)` is 42809 (PG's wrong_object_type,
@@ -34094,6 +34340,8 @@ function packedStateBytes(accs: Acc[]): number {
   let n = MEMORY_VALUE;
   for (const a of accs) {
     n += MEMORY_VALUE;
+    // An ordered aggregate (aggregates.md §22) keeps its tuples in the collections table too.
+    if (a.ordRows !== undefined) continue;
     switch (a.plan) {
       case "countStar":
       case "count":
@@ -34150,7 +34398,7 @@ function foldBlockingCollection(
   if (a.plan === "jsonAgg" || a.plan === "jsonObjectAgg") {
     // Run the existing one-row fold for its conversion, validation, charge and failure order;
     // move only that row's contribution into scratch, never serialize a growing accumulator.
-    const single = newAccFromSpec(spec);
+    const single = newAccFromSpecUnordered(spec);
     foldAcc(single, value, meter);
     a.seen = single.seen;
     if (a.plan === "jsonAgg") {
@@ -34181,7 +34429,59 @@ function finalizeBlockingCollection(
   budget: number,
   sink: SpillSink,
   acct: QueryAccount,
+  meter: Meter,
 ): Value {
+  // An in-aggregate ORDER BY (aggregates.md §22): stable-sort the spooled [keys…, argument] tuples
+  // by the keys (collated keys were spooled as sort-key bytes), fold the arguments in that order into
+  // the plan's own accumulator — spooling its retained input into a fresh collection exactly as the
+  // unordered fold does — and finalize that.
+  if (a.ordRows !== undefined) {
+    const order = spec.order!;
+    const sorter = new SpoolSorter(
+      (x, y) => {
+        for (let k = 0; k < order.sorts.length; k++) {
+          const ks = order.sorts[k]!;
+          const c = keyCmp(x[k]!, y[k]!, ks.desc, ks.nullsFirst);
+          if (c !== 0) return c;
+        }
+        return 0;
+      },
+      budget,
+      sink,
+      new StateCharge(acct),
+    );
+    let sorted: RowSpool | null = null;
+    const folded = new SpillMultiMap(budget, sink, new StateCharge(acct));
+    const unique = new SpillMap(budget, sink, new StateCharge(acct));
+    try {
+      for (const row of collections.get(key)) sorter.push(row);
+      sorted = sorter.finishSpool();
+      const inner = newAccFromSpecUnordered(spec);
+      for (const row of sorted) {
+        meter.guard();
+        const value = row[row.length - 1]!;
+        if (!foldBlockingCollection(inner, spec, value, "", folded, unique, meter))
+          foldAcc(inner, value, meter);
+      }
+      return finalizeBlockingCollection(
+        inner,
+        spec,
+        "",
+        folded,
+        synthetic,
+        env,
+        budget,
+        sink,
+        acct,
+        meter,
+      );
+    } finally {
+      sorted?.close();
+      sorter.close();
+      unique.close();
+      folded.close();
+    }
+  }
   if (spec.hypo != null) {
     const hp = spec.hypo;
     const hyp = hp.args.map((arg) =>

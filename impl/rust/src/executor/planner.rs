@@ -1806,6 +1806,12 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
                     collect_touched(a, 0, &mut touched);
                 }
             }
+            // An in-aggregate ORDER BY's keys are evaluated per input row too (aggregates.md §22).
+            if let Some(order) = &s.order {
+                for k in &order.keys {
+                    collect_touched(k, 0, &mut touched);
+                }
+            }
         }
     } else {
         for p in &plan.projections {

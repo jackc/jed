@@ -4582,6 +4582,7 @@ impl Parser {
                     over: None,
                     over_name: None,
                     within_group: None,
+                    agg_order: None,
                 };
             }
             return Ok(Expr::Like {
@@ -4770,6 +4771,7 @@ impl Parser {
                 over: None,
                 over_name: None,
                 within_group: None,
+                agg_order: None,
             };
         }
         self.depth = base;
@@ -5370,6 +5372,7 @@ impl Parser {
                     over: None,
                     over_name: None,
                     within_group: None,
+                    agg_order: None,
                 })
             }
             // `current_date` — the SQL-standard bare keyword, desugared to the current_date()
@@ -5392,6 +5395,7 @@ impl Parser {
                     over: None,
                     over_name: None,
                     within_group: None,
+                    agg_order: None,
                 })
             }
             Token::Str(_) => {
@@ -5474,6 +5478,11 @@ impl Parser {
         let mut arg_names: Vec<Option<String>> = Vec::new();
         let mut any_named = false;
         let mut variadic = false;
+        // A trailing in-aggregate `ORDER BY` after the last argument (`json_agg(x ORDER BY y)` —
+        // aggregates.md §22): parsed with `allow_ordinal` OFF, so a bare integer is a constant key
+        // (PostgreSQL), and it ends the argument list. The resolver rejects it on a non-aggregate
+        // (42809) or a window call (0A000).
+        let mut agg_order: Option<Box<Vec<OrderKey>>> = None;
         let star = if matches!(self.peek(), Token::Star) {
             self.advance();
             true
@@ -5491,6 +5500,10 @@ impl Parser {
                     variadic = true;
                     args.push(self.parse_expr()?);
                     arg_names.push(None);
+                    if self.peek_keyword().as_deref() == Some("order") {
+                        agg_order = Some(Box::new(self.parse_order_by(false)?));
+                        break;
+                    }
                     // A VARIADIC argument must be the last (PostgreSQL, 42601).
                     if matches!(self.peek(), Token::Comma) {
                         return Err(syntax("VARIADIC argument must be the last argument"));
@@ -5539,6 +5552,10 @@ impl Parser {
                     let source = args.pop().expect("one argument parsed");
                     return self.parse_overlay_tail(name, source);
                 }
+                if self.peek_keyword().as_deref() == Some("order") {
+                    agg_order = Some(Box::new(self.parse_order_by(false)?));
+                    break;
+                }
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                 } else {
@@ -5562,6 +5579,13 @@ impl Parser {
         // (not an ordinal), matching PostgreSQL; the resolver enforces exactly one key (42883) and the
         // per-name rules.
         let within_group = if self.peek_keyword().as_deref() == Some("within") {
+            // The in-aggregate ORDER BY and WITHIN GROUP both order the aggregated input; PostgreSQL
+            // rejects the pair in its grammar (42601).
+            if agg_order.is_some() {
+                return Err(syntax(
+                    "cannot use multiple ORDER BY clauses with WITHIN GROUP",
+                ));
+            }
             self.advance();
             self.expect_keyword("group")?;
             self.expect(&Token::LParen)?;
@@ -5615,6 +5639,7 @@ impl Parser {
                     over: None,
                     over_name,
                     within_group,
+                    agg_order,
                 });
             }
             self.expect(&Token::LParen)?;
@@ -5637,6 +5662,7 @@ impl Parser {
             over,
             over_name,
             within_group,
+            agg_order,
         })
     }
 
@@ -5676,6 +5702,7 @@ impl Parser {
             over: None,
             over_name: None,
             within_group: None,
+            agg_order: None,
         })
     }
 
@@ -5704,6 +5731,7 @@ impl Parser {
             over: None,
             over_name: None,
             within_group: None,
+            agg_order: None,
         })
     }
 
@@ -5733,6 +5761,7 @@ impl Parser {
             over: None,
             over_name: None,
             within_group: None,
+            agg_order: None,
         })
     }
 

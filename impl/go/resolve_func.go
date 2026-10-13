@@ -2667,6 +2667,13 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		return nil, resolvedType{}, newError(WrongObjectType,
 			fmt.Sprintf("DISTINCT specified, but %s is not an aggregate function", name))
 	}
+	// An in-aggregate ORDER BY is aggregate-only too: `abs(x ORDER BY x)` is 42809 (PG's
+	// wrong_object_type, "ORDER BY specified, but <fn> is not an aggregate function" — aggregates.md
+	// §22). PG checks it between DISTINCT and FILTER.
+	if fc.AggOrder != nil && !isAggregateName(name) {
+		return nil, resolvedType{}, newError(WrongObjectType,
+			fmt.Sprintf("ORDER BY specified, but %s is not an aggregate function", name))
+	}
 	// FILTER is likewise aggregate-only: `abs(x) FILTER (WHERE …)` is 42809 (PG's wrong_object_type,
 	// "FILTER specified, but <fn> is not an aggregate function" — aggregates.md §11). Same placement
 	// as DISTINCT, so it covers every non-aggregate path before the per-kind dispatch.

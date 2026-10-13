@@ -32,21 +32,42 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		if fc.Star || len(fc.Args) != 2 {
 			return nil, resolvedType{}, noAggOverload(name)
 		}
-		rk, _, err := resolve(s, *fc.Args[0], nil, sub, params)
+		rk, kt, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		rv, _, err := resolve(s, *fc.Args[1], nil, sub, params)
+		rv, vt, err := resolve(s, *fc.Args[1], nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// DISTINCT de-duplicates the (key, value) pair, so both need an equality (json has none).
+		if fc.Distinct {
+			if err := rejectJSONDistinct(kt); err != nil {
+				return nil, resolvedType{}, err
+			}
+			if err := rejectJSONDistinct(vt); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+		var order *aggOrder
+		if fc.AggOrder != nil {
+			if order, err = resolveAggOrder(s, fc.AggOrder, fc.Distinct, fc.Args, []*rExpr{rk, rv}, params); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+		filter, err := resolveAggFilter(s, fc.Filter, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		// The key/value pair travels as one Row operand; DISTINCT dedups that pair, FILTER and the
+		// in-aggregate ORDER BY apply as for any aggregate.
 		operand := &rExpr{kind: reRow, sargs: []*rExpr{rk, rv}}
 		result := resolvedType{kind: rtJsonb}
 		if objPlan == planJsonObjectAgg || objPlan == planJsonObjectAggUnique {
 			result = resolvedType{kind: rtJson}
 		}
 		slot := len(ag.groupKeys) + len(ag.specs)
-		ag.specs = append(ag.specs, aggSpec{plan: objPlan, operand: operand})
+		ag.specs = append(ag.specs, aggSpec{plan: objPlan, operand: operand, distinct: fc.Distinct, filter: filter, order: order})
 		return &rExpr{kind: reColumn, index: slot}, result, nil
 	}
 	if fc.Star {
@@ -78,31 +99,151 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		}
 		plan, result = aggregatePlan(name, desc.Result, t)
 		operand = r
+		if fc.Distinct {
+			if err := rejectJSONDistinct(t); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+	}
+	// The in-aggregate ORDER BY (aggregates.md §22) — resolved after the overload, like PG.
+	var order *aggOrder
+	if fc.AggOrder != nil {
+		var argNodes []*rExpr
+		if operand != nil {
+			argNodes = []*rExpr{operand}
+		}
+		var err error
+		if order, err = resolveAggOrder(s, fc.AggOrder, fc.Distinct, fc.Args, argNodes, params); err != nil {
+			return nil, resolvedType{}, err
+		}
 	}
 	collation, err := minmaxCollation(s, plan, fc.Args, result)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	// FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
-	// FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A non-boolean
-	// condition (or an untyped NULL, always unknown → folds no row) is 42804. The fold loop evaluates
-	// this per row and folds only the rows for which it is TRUE.
-	var filter *rExpr
-	if fc.Filter != nil {
-		fsub := &aggCtx{collecting: false}
-		rf, ft, err := resolve(s, *fc.Filter, nil, fsub, params)
-		if err != nil {
-			return nil, resolvedType{}, err
-		}
-		if ft.kind != rtBool && ft.kind != rtNull {
-			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
-		}
-		filter = rf
+	filter, err := resolveAggFilter(s, fc.Filter, params)
+	if err != nil {
+		return nil, resolvedType{}, err
 	}
 	// Aggregate results follow the group-key values in the synthetic row.
 	slot := len(ag.groupKeys) + len(ag.specs)
-	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter, collation: collation})
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter, order: order, collation: collation})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// rejectJSONDistinct: DISTINCT de-duplicates an aggregate's argument by equality, and json has none
+// (PG ships no equality opclass — json.md §5), so a DISTINCT aggregate over a json argument is 42883,
+// the same rule SELECT DISTINCT applies to a json output column.
+func rejectJSONDistinct(t resolvedType) error {
+	if t.kind == rtJson {
+		return newError(UndefinedFunction, "could not identify an equality operator for type json")
+	}
+	return nil
+}
+
+// resolveAggFilter resolves an aggregate's FILTER (WHERE cond) (aggregates.md §11): a per-row
+// predicate over the input row with aggregates FORBIDDEN (an aggregate inside FILTER is 42803); a
+// non-boolean condition (an untyped NULL is allowed — always unknown, folds no row) is 42804. nil
+// when the call has no FILTER.
+func resolveAggFilter(s *scope, filter *exprNode, params *paramTypes) (*rExpr, error) {
+	if filter == nil {
+		return nil, nil
+	}
+	fsub := &aggCtx{collecting: false}
+	rf, ft, err := resolve(s, *filter, nil, fsub, params)
+	if err != nil {
+		return nil, err
+	}
+	if ft.kind != rtBool && ft.kind != rtNull {
+		return nil, typeError("argument of FILTER must be type boolean")
+	}
+	return rf, nil
+}
+
+// aggSortKeyExpr is the expression an aggregate sort key orders by: its general expression, or the
+// (qualified) column reference a column key names.
+func aggSortKeyExpr(key *orderKey) exprNode {
+	if key.Expr != nil {
+		return *key.Expr
+	}
+	if key.Qualifier != "" {
+		return exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column, Pos: key.Pos}
+	}
+	return exprNode{Kind: exprColumn, Column: key.Column, Pos: key.Pos}
+}
+
+// resolveAggSortKey resolves one aggregate sort key — a WITHIN GROUP key of a hypothetical-set
+// aggregate (aggregates.md §19) or an in-aggregate ORDER BY key (§22) — against the input row,
+// aggregates forbidden (a nested aggregate is 42803). It returns the per-row key expression, its type,
+// and its sort spec: direction, NULL placement, and collation (an explicit COLLATE — text only, else
+// 42804 — or the key's derived collation, §13).
+func resolveAggSortKey(s *scope, key *orderKey, params *paramTypes) (*rExpr, resolvedType, keySort, error) {
+	sub := &aggCtx{collecting: false}
+	knode, ktype, err := resolve(s, aggSortKeyExpr(key), nil, sub, params)
+	if err != nil {
+		return nil, resolvedType{}, keySort{}, err
+	}
+	var collation *Collation
+	if key.Collation != "" {
+		if !ktype.collatable() && ktype.kind != rtNull {
+			return nil, resolvedType{}, keySort{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ktype)))
+		}
+		if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+			return nil, resolvedType{}, keySort{}, err
+		}
+	} else if ktype.collatable() {
+		kd, err := orderKeyDeriv(s, key)
+		if err != nil {
+			return nil, resolvedType{}, keySort{}, err
+		}
+		if collation, err = sortTargetCollation(s.catalog, kd); err != nil {
+			return nil, resolvedType{}, keySort{}, err
+		}
+	}
+	return knode, ktype, keySort{desc: key.Descending, nullsFirst: key.NullsFirst, collation: collation}, nil
+}
+
+// resolveAggOrder resolves an in-aggregate ORDER BY (json_agg(x ORDER BY y DESC) — aggregates.md
+// §22): each key is evaluated per passing input row and the group's rows are folded in key order. A
+// json key is 42883 (no ordering operator, like the query ORDER BY). With DISTINCT every key must be
+// one of the aggregate's arguments — structurally (the AST, positions ignored) or as the same input
+// column — else 42P10, PostgreSQL's rule (the sort then never splits a de-duplicated value).
+func resolveAggOrder(s *scope, keys []orderKey, distinct bool, args []*exprNode, argNodes []*rExpr, params *paramTypes) (*aggOrder, error) {
+	order := &aggOrder{}
+	for i := range keys {
+		key := &keys[i]
+		// Like an argument, a key may not contain a window function (PG 42803 — window.md §7).
+		if key.Expr != nil && exprHasWindow(*key.Expr) {
+			return nil, newError(GroupingError, "aggregate function calls cannot contain window function calls")
+		}
+		knode, ktype, ks, err := resolveAggSortKey(s, key, params)
+		if err != nil {
+			return nil, err
+		}
+		if ktype.kind == rtJson {
+			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json")
+		}
+		if distinct {
+			kexpr := aggSortKeyExpr(key)
+			found := false
+			for _, a := range args {
+				if exprEqual(*a, kexpr) {
+					found = true
+				}
+			}
+			for _, a := range argNodes {
+				if a.kind == reColumn && knode.kind == reColumn && a.index == knode.index {
+					found = true
+				}
+			}
+			if !found {
+				return nil, newError(InvalidColumnReference, "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list")
+			}
+		}
+		order.keys = append(order.keys, knode)
+		order.sorts = append(order.sorts, ks)
+	}
+	return order, nil
 }
 
 // minmaxCollation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
@@ -268,39 +409,11 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 	for i := range fc.WithinGroup {
 		key := fc.WithinGroup[i]
 		arg := fc.Args[i]
-		// The WITHIN GROUP order key, resolved per row with aggregates FORBIDDEN (a nested aggregate is
-		// 42803). A general-expression key carries Expr; a bare/qualified column key carries Column.
-		var keyExpr exprNode
-		if key.Expr != nil {
-			keyExpr = *key.Expr
-		} else if key.Qualifier != "" {
-			keyExpr = exprNode{Kind: exprQualifiedColumn, Qualifier: key.Qualifier, Column: key.Column, Pos: key.Pos}
-		} else {
-			keyExpr = exprNode{Kind: exprColumn, Column: key.Column, Pos: key.Pos}
-		}
-		sub := &aggCtx{collecting: false}
-		knode, ktype, err := resolve(s, keyExpr, nil, sub, params)
+		// The WITHIN GROUP order key + its sort spec, resolved per row with aggregates FORBIDDEN (a
+		// nested aggregate is 42803).
+		knode, ktype, ks, err := resolveAggSortKey(s, &key, params)
 		if err != nil {
 			return nil, resolvedType{}, err
-		}
-		// The key's collation (explicit COLLATE — text only — or the key's derived collation, an
-		// indeterminate one 42P21), §13. An unknown name is 42704; a COLLATE on a non-text key is 42804.
-		var collation *Collation
-		if key.Collation != "" {
-			if !ktype.collatable() && ktype.kind != rtNull {
-				return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ktype)))
-			}
-			if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
-				return nil, resolvedType{}, err
-			}
-		} else if ktype.collatable() {
-			kd, err := orderKeyDeriv(s, &key)
-			if err != nil {
-				return nil, resolvedType{}, err
-			}
-			if collation, err = sortTargetCollation(s.catalog, kd); err != nil {
-				return nil, resolvedType{}, err
-			}
 		}
 		// The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
 		// key's scalar type via the hint. Its type must match the key's family (else 42883).
@@ -317,22 +430,14 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 			return nil, resolvedType{}, noAggOverload(name)
 		}
 		keyNodes = append(keyNodes, knode)
-		sorts = append(sorts, keySort{desc: key.Descending, nullsFirst: key.NullsFirst, collation: collation})
+		sorts = append(sorts, ks)
 		argNodes = append(argNodes, anode)
 	}
 
 	// FILTER (WHERE cond): per-input-row predicate (aggregates forbidden); restricts buffered rows.
-	var filter *rExpr
-	if fc.Filter != nil {
-		fsub := &aggCtx{collecting: false}
-		rf, ft, err := resolve(s, *fc.Filter, nil, fsub, params)
-		if err != nil {
-			return nil, resolvedType{}, err
-		}
-		if ft.kind != rtBool && ft.kind != rtNull {
-			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
-		}
-		filter = rf
+	filter, err := resolveAggFilter(s, fc.Filter, params)
+	if err != nil {
+		return nil, resolvedType{}, err
 	}
 
 	var (

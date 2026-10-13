@@ -8,7 +8,7 @@
 # thresholds are cross-checked between cores by `mise run conformance:query_memory`, so this file pins
 # the in-memory lanes only.
 # skip: disk — blocking operators take the bounded-spill lane on file-backed databases
-# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, types.text, types.json, types.jsonb, func.json_agg, query.join_inner, query.hash_join, query.aggregates, query.group_by, query.ordered_set_aggregate, query.hypothetical_set_aggregate, query.window, query.window_aggregate, query.intersect, query.except, query.cte, query.cte_recursive, query.order_by, query.limit, query.order_by_topk, query.distinct, query.set_returning, resource.query_memory
+# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, types.text, types.json, types.jsonb, func.json_agg, query.join_inner, query.hash_join, query.aggregates, query.group_by, query.ordered_set_aggregate, query.hypothetical_set_aggregate, query.aggregate_order_by, query.window, query.window_aggregate, query.intersect, query.except, query.cte, query.cte_recursive, query.order_by, query.limit, query.order_by_topk, query.distinct, query.set_returning, resource.query_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v text, pad text)
@@ -105,6 +105,18 @@ SELECT rank(3) WITHIN GROUP (ORDER BY id) FROM n
 # max_query_memory_bytes: 991
 statement error 54P05
 SELECT rank(3) WITHIN GROUP (ORDER BY id) FROM n
+
+# An in-aggregate ORDER BY retains each passing row's [key…, argument] tuple (row_bytes) until
+# finalize, then the fold's own retention (here json_agg's inputs) on top (aggregates.md §22).
+# max_query_memory_bytes: 1568
+query T nosort
+SELECT jsonb_agg(id ORDER BY g DESC, id) FROM n
+----
+[1, 3, 5, 2, 4, 6]
+
+# max_query_memory_bytes: 1567
+statement error 54P05
+SELECT jsonb_agg(id ORDER BY g DESC, id) FROM n
 
 # A window aggregate's running accumulator retains its inputs until the partition's pass ends.
 # max_query_memory_bytes: 548

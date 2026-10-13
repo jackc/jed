@@ -156,7 +156,7 @@ func TestBlockingVariableAggregatesSpill(t *testing.T) {
 				fraction := Float64Value(.5)
 				v, err = db.blockingOrderedSet(a, &fraction, collections, 0)
 			} else {
-				v, err = db.finalizeSpilledAcc(a, spec, nil, collections, 0, &evalEnv{exec: db})
+				v, err = db.finalizeSpilledAcc(a, spec, nil, collections, 0, &evalEnv{exec: db}, &costMeter{})
 			}
 			if err != nil {
 				t.Fatal(err)

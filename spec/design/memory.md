@@ -377,7 +377,8 @@ it is folded:
 | `json_object_agg`, `jsonb_object_agg` (and `_unique`, `_strict`) | `value_bytes(key) + value_bytes(value)` |
 | `mode`, `percentile_disc`, `percentile_cont` (non-NULL inputs) | `value_bytes(argument)` |
 | `rank`, `dense_rank`, `percent_rank`, `cume_dist` (hypothetical-set) | `row_bytes(WITHIN GROUP key tuple)` |
-| any `DISTINCT` aggregate's value set | `entry_bytes([argument])` per newly seen non-NULL value |
+| any aggregate with an in-aggregate `ORDER BY` ([aggregates.md](aggregates.md) §22) | `row_bytes([sort key…, argument])` per passing row (a collated text key as its sort-key `bytea`), then — at finalize, folding in key order — the plan's own per-input charge above |
+| any `DISTINCT` aggregate's value set | `entry_bytes([argument])` per newly seen value (non-NULL, except for the JSON array aggregates, which keep one NULL) |
 
 A grouped accumulator's charge belongs to its group and is released with it
 (§6.2). A **window** aggregate's accumulator is released when the accumulator is
@@ -447,10 +448,10 @@ Because the measures depend on what each element holds, the bounded-spill lane's
 | Structure | Element |
 |---|---|
 | Stage spools | relation rows (untouched slots NULL), physically placed driver and combined join rows, NULL-extended rows, post-WHERE rows (the WHERE pass always copies into a new spool, filter or not), group rows, and `ORDER BY` rows decorated with every order-expression value and then every order key (a collated key as `bytea` of its sort key) |
-| Group state map | key: the group-key values; value: `[int ordinal, composite(packed) per aggregate]`, packed as `count` → `[int]`, integer `sum` → `[int, bool seen]`, decimal `sum` → `[decimal, bool]`, `avg` → `[decimal, int count]`, float `sum`/`avg` → `[f64, int, bool, bool, bool]`, `min`/`max` → `[value or NULL]`, JSON aggregates → `[bool seen]`, ordered-set and hypothetical → `[]` |
+| Group state map | key: the group-key values; value: `[int ordinal, composite(packed) per aggregate]`, packed as `count` → `[int]`, integer `sum` → `[int, bool seen]`, decimal `sum` → `[decimal, bool]`, `avg` → `[decimal, int count]`, float `sum`/`avg` → `[f64, int, bool, bool, bool]`, `min`/`max` → `[value or NULL]`, JSON aggregates → `[bool seen]`, ordered-set, hypothetical, and any in-aggregate `ORDER BY` → `[]` |
 | Group key spool | the group-key values, one row per group in creation order |
 | `DISTINCT`-aggregate set / object-agg unique set | `[int ordinal, int aggregate index, value]` / `[int ordinal, int aggregate index, text key]` |
-| Retained aggregate inputs (hash rows, keyed by `ordinal × aggregates + index`) | `json_agg` → `[jsonb node]`; `json_object_agg` → `[text key, value]`; ordered-set → `[value]` (`percentile_cont`: `[f64]`); hypothetical → the key tuple |
+| Retained aggregate inputs (hash rows, keyed by `ordinal × aggregates + index`) | `json_agg` → `[jsonb node]`; `json_object_agg` → `[text key, value]`; ordered-set → `[value]` (`percentile_cont`: `[f64]`); hypothetical → the key tuple; in-aggregate `ORDER BY` → `[sort key…, argument]`, sorted at finalize and folded into a fresh collection of the plan's own shape |
 | Spilled hash-join build | `[bytea encoded key, composite(build row)]` (the key encoding is the §8 byte contract) |
 | Probe matches / right-match set | a per-left-row spool of matched build rows / `[int match ordinal]` |
 | Finalization | ordered-set sorter rows `[value]` or `[value, bytea collation key]`; percentile spool of sorted rows; `json_object_agg` sorter rows `[int UTF-8 length, text key, jsonb]`; dense-rank distinct set of key tuples |

@@ -18,6 +18,7 @@ pub(crate) fn resolve_func_call(
     star: bool,
     distinct: bool,
     filter: Option<&Expr>,
+    agg_order: Option<&[OrderKey]>,
     variadic: bool,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -30,6 +31,15 @@ pub(crate) fn resolve_func_call(
         return Err(EngineError::new(
             SqlState::WrongObjectType,
             format!("DISTINCT specified, but {lname} is not an aggregate function"),
+        ));
+    }
+    // An in-aggregate ORDER BY is aggregate-only too: `abs(x ORDER BY x)` is 42809 (PG's
+    // wrong_object_type, "ORDER BY specified, but <fn> is not an aggregate function" — aggregates.md
+    // §22). PG checks it between DISTINCT and FILTER.
+    if agg_order.is_some() && !is_aggregate_name(&lname) {
+        return Err(EngineError::new(
+            SqlState::WrongObjectType,
+            format!("ORDER BY specified, but {lname} is not an aggregate function"),
         ));
     }
     // FILTER is likewise aggregate-only: `abs(x) FILTER (WHERE …)` is 42809 (PG's wrong_object_type,
@@ -165,7 +175,9 @@ pub(crate) fn resolve_func_call(
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
     if is_aggregate_name(&lname) {
         reject_named(&lname, arg_names)?;
-        return resolve_aggregate(scope, &lname, args, star, distinct, filter, agg, params);
+        return resolve_aggregate(
+            scope, &lname, args, star, distinct, filter, agg_order, agg, params,
+        );
     }
     // The polymorphic array functions (array-functions.md §2) are also kind="function", so they
     // must be intercepted BEFORE the generic scalar path — their `anyarray`/`anyelement` slots need
@@ -2666,8 +2678,19 @@ pub(crate) fn table_ref_calls(t: &TableRef) -> bool {
 /// mutating call (`nextval` or `setval`).
 pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
     match e {
-        Expr::FuncCall { name, args, .. } => {
-            name == "nextval" || name == "setval" || args.iter().any(expr_calls_seq_mutator)
+        Expr::FuncCall {
+            name,
+            args,
+            agg_order,
+            ..
+        } => {
+            name == "nextval"
+                || name == "setval"
+                || args.iter().any(expr_calls_seq_mutator)
+                || agg_order.as_deref().is_some_and(|keys| {
+                    keys.iter()
+                        .any(|k| k.expr.as_ref().is_some_and(expr_calls_seq_mutator))
+                })
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
@@ -2988,10 +3011,21 @@ pub(crate) fn collect_returning_privs(
 /// named function call (`EXECUTE`) and walk every subquery (its tables need `SELECT`).
 pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
     match e {
-        Expr::FuncCall { name, args, .. } => {
+        Expr::FuncCall {
+            name,
+            args,
+            agg_order,
+            ..
+        } => {
             req.need_function(name);
             for a in args {
                 collect_expr_privs(a, req, locals);
+            }
+            // An in-aggregate ORDER BY key may call functions / hold a subquery (aggregates.md §22).
+            for k in agg_order.iter().flat_map(|keys| keys.iter()) {
+                if let Some(e) = &k.expr {
+                    collect_expr_privs(e, req, locals);
+                }
             }
         }
         Expr::Column(_, _)
@@ -3625,6 +3659,7 @@ pub(crate) fn resolve(
             over,
             over_name: _, // desugared to `over` before resolution (window.md §5)
             within_group,
+            agg_order,
         } => {
             // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md
             // §19) is one of these window-function names used WITH a WITHIN GROUP clause; that clause
@@ -3700,6 +3735,14 @@ pub(crate) fn resolve(
                         "DISTINCT is not implemented for window functions",
                     ));
                 }
+                // Nor is an in-aggregate ORDER BY (PG 0A000 — aggregates.md §22): the window frame,
+                // not an input sort, orders a window aggregate's fold.
+                if agg_order.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "aggregate ORDER BY is not implemented for window functions",
+                    ));
+                }
                 // FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the
                 // frame rows for which the filter is TRUE; a pure (non-aggregate) window function with
                 // FILTER is PG's own 0A000 ("FILTER is not implemented for non-aggregate window
@@ -3739,6 +3782,7 @@ pub(crate) fn resolve(
                 *star,
                 *distinct,
                 filter.as_deref(),
+                agg_order.as_deref().map(Vec::as_slice),
                 *variadic,
                 agg,
                 params,
@@ -5169,6 +5213,7 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             over: None,
             over_name: None,
             within_group: None,
+            agg_order: None,
             ..
         } if !scope.storage_collation && function_result_collatable(name) => {
             combine_derivs(scope, args)?

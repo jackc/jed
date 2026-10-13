@@ -1913,6 +1913,9 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 			if agg.hypo != nil {
 				nodes = satEstimateAdd(nodes, sumExprNodes(agg.hypo.keys))
 			}
+			if agg.order != nil {
+				nodes = satEstimateAdd(nodes, sumExprNodes(agg.order.keys))
+			}
 			local[estimatorUnitOperatorEval] = satEstimateAdd(local[estimatorUnitOperatorEval], satEstimateMul(nodes, inputRows))
 			local[estimatorUnitOperatorEval] = satEstimateAdd(local[estimatorUnitOperatorEval], satEstimateMul(estimatorOperatorNodes(agg.osaFrac), rows))
 		}
@@ -1929,6 +1932,9 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 			db.addExpressionSubqueries(&plan.root, agg.filter, inputRows, ctx)
 			if agg.hypo != nil {
 				db.addExpressionListSubqueries(&plan.root, agg.hypo.keys, inputRows, ctx)
+			}
+			if agg.order != nil {
+				db.addExpressionListSubqueries(&plan.root, agg.order.keys, inputRows, ctx)
 			}
 			db.addExpressionSubqueries(&plan.root, agg.osaFrac, groupRows, ctx)
 		}

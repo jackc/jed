@@ -290,6 +290,12 @@ export type Expr =
       // Column-only, like the query ORDER BY (the parser keeps the whole list so the resolver can
       // reject a second key, 42883).
       withinGroup?: OrderKey[] | null;
+      // Set to the in-aggregate ORDER BY keys when the argument list ends in one (json_agg(x ORDER BY
+      // y DESC) — spec/design/aggregates.md §22, grammar.md §17): the order the aggregate's input
+      // rows are folded in. General-expression keys with the ordinary ASC/DESC / NULLS FIRST|LAST /
+      // COLLATE suffix; a bare integer is a constant, not an ordinal (PostgreSQL). Absent for every
+      // other call (the key is only written when present, so an ordinary call's shape is unchanged).
+      aggOrder?: OrderKey[] | null;
     }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a

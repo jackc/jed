@@ -242,6 +242,10 @@ type aggSpec struct {
 	// WITHIN GROUP — aggregates.md §19), set only for the planHypo* plans, nil otherwise. (operand
 	// is nil here — the keys are buffered as a tuple per row from hypo.keys.)
 	hypo *hypoParams
+	// order is the in-aggregate ORDER BY (json_agg(x ORDER BY y) — aggregates.md §22): the per-row
+	// sort keys + their sort specs; nil for an unordered aggregate. The fold loop buffers each passing
+	// row's [sort keys…, argument] tuple and folds the arguments in key order at finalize.
+	order *aggOrder
 	// collation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
 	// "Aggregates and window functions"): the operand's derivation; nil for C, a non-text operand, or
 	// any other aggregate.
@@ -254,6 +258,26 @@ type keySort struct {
 	desc       bool
 	nullsFirst bool
 	collation  *Collation
+}
+
+// aggOrder is an in-aggregate ORDER BY (aggregates.md §22): keys are the sort-key expressions
+// (evaluated per passing input row, after the argument) and sorts their per-key direction / NULL
+// placement / collation. Equal length.
+type aggOrder struct {
+	keys  []*rExpr
+	sorts []keySort
+}
+
+// distinctKeepsNull reports whether a DISTINCT aggregate keeps a NULL argument as one more distinct
+// value instead of skipping it (aggregates.md §5): only the JSON array aggregates, whose non-strict
+// transition folds a NULL (even the _strict variants, which then drop it in the fold but still mark
+// the group non-empty — [], not NULL, as in PostgreSQL). Every other aggregate ignores NULLs.
+func (p aggPlan) distinctKeepsNull() bool {
+	switch p {
+	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
+		return true
+	}
+	return false
 }
 
 // hypoParams are the resolve-time parameters of a hypothetical-set aggregate (aggregates.md §19).
@@ -313,6 +337,12 @@ type acc struct {
 	// hypothetical row + the spec's sort specs are available) finalizeHypothetical counts how that
 	// hypothetical row would rank. plan selects the result formula.
 	hypoRows [][]Value
+	// ordered marks an aggregate with an in-aggregate ORDER BY (aggregates.md §22); ordRows buffers
+	// every passing input row's [sort key…, argument] tuple (collated text keys already replaced by
+	// their UCA sort key), in input order. The group-emission loop stable-sorts them by the spec's
+	// aggOrder and folds the arguments into a fresh unordered acc — key order, ties in input order.
+	ordered bool
+	ordRows [][]Value
 }
 
 // objAggPair is one (key, value) pair accumulated by json[b]_object_agg (the key already coerced to
@@ -357,6 +387,17 @@ func newAcc(plan aggPlan) *acc {
 // ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
 // ordered-set aggregate with OVER is 0A000, rejected at resolve).
 func newAccFromSpec(s aggSpec) *acc {
+	// An in-aggregate ORDER BY buffers the passing rows first (aggregates.md §22); the plan's own
+	// accumulator is built at finalize (newAccFromSpecUnordered) and fed in key order.
+	if s.order != nil {
+		return &acc{plan: s.plan, ordered: true}
+	}
+	return newAccFromSpecUnordered(s)
+}
+
+// newAccFromSpecUnordered is newAccFromSpec ignoring any in-aggregate ORDER BY — the accumulator an
+// ordered aggregate's sorted arguments are finally folded into.
+func newAccFromSpecUnordered(s aggSpec) *acc {
 	switch s.plan {
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		// The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
@@ -1147,6 +1188,49 @@ func finalizeHypothetical(plan aggPlan, rows [][]Value, hyp []Value, sorts []key
 // hypoCmp compares a buffered key tuple a to the hypothetical row b by the WITHIN GROUP order
 // (aggregates.md §19): the first key whose comparison is non-equal decides. Each key honors its NULL
 // placement, direction, and collation (a collated text key can fail 0A000).
+// aggOrderTuple evaluates one passing input row's in-aggregate ORDER BY keys (aggregates.md §22)
+// and returns the buffered tuple [key…, value]. Each key's operator_evals are charged (it is
+// evaluated per row, after the argument). A collated text / text[] key is replaced by its UCA sort
+// key (bytea), so the finalize sort is a plain value sort and an unmapped code point fails here,
+// per row — independent of how many rows the group has.
+func aggOrderTuple(order *aggOrder, v Value, row storedRow, env *evalEnv, m *costMeter) ([]Value, error) {
+	tuple := make([]Value, 0, len(order.keys)+1)
+	for i, k := range order.keys {
+		kv, err := k.eval(row, env, m)
+		if err != nil {
+			return nil, err
+		}
+		if c := order.sorts[i].collation; c != nil && (kv.Kind == ValText || kv.Kind == ValArray) {
+			b, err := collationSortKey(c, kv)
+			if err != nil {
+				return nil, err
+			}
+			kv = ByteaValue(b)
+		}
+		tuple = append(tuple, kv)
+	}
+	return append(tuple, v), nil
+}
+
+// sortAggOrderRows stable-sorts an ordered aggregate's buffered [key…, value] tuples by its ORDER BY
+// (each key's direction + NULL placement; ties keep input order) and returns the values in that
+// order (aggregates.md §22). The sort is unmetered, like the query ORDER BY sort.
+func sortAggOrderRows(rows [][]Value, order *aggOrder) []Value {
+	slices.SortStableFunc(rows, func(a, b []Value) int {
+		for k, ks := range order.sorts {
+			if c := keyCmp(a[k], b[k], ks.desc, ks.nullsFirst); c != 0 {
+				return c
+			}
+		}
+		return 0
+	})
+	out := make([]Value, len(rows))
+	for i, r := range rows {
+		out[i] = r[len(r)-1]
+	}
+	return out
+}
+
 func hypoCmp(a, b []Value, sorts []keySort) (int, error) {
 	for i, ks := range sorts {
 		ord, err := compareHypoKey(a[i], b[i], ks)

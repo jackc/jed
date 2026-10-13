@@ -1007,6 +1007,9 @@ impl Engine {
                 if let Some(hypo) = &agg.hypo {
                     nodes = sat_add(nodes, sum_expr_nodes(&hypo.keys));
                 }
+                if let Some(order) = &agg.order {
+                    nodes = sat_add(nodes, sum_expr_nodes(&order.keys));
+                }
                 local[UNIT_OPERATOR_EVAL] =
                     sat_add(local[UNIT_OPERATOR_EVAL], sat_mul(nodes, input_rows));
                 let fraction = agg.osa.as_ref().and_then(|osa| osa.frac.as_ref());
@@ -1043,6 +1046,14 @@ impl Engine {
                     self.add_expression_list_subqueries(
                         &mut plan.root,
                         &hypo.keys,
+                        input_rows,
+                        ctx,
+                    );
+                }
+                if let Some(order) = &agg.order {
+                    self.add_expression_list_subqueries(
+                        &mut plan.root,
+                        &order.keys,
                         input_rows,
                         ctx,
                     );

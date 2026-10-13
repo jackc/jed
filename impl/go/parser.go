@@ -4618,6 +4618,34 @@ func (p *parser) parseOrderBy(sel *selectStmt) error {
 	return nil
 }
 
+// parseAggOrderBy parses an in-aggregate `ORDER BY key [, …]` (aggregates.md §22), the cursor on
+// ORDER. Keys are general expressions classified with allowOrdinal OFF, so a bare integer is a
+// constant key (PostgreSQL), as in WITHIN GROUP.
+func (p *parser) parseAggOrderBy() ([]orderKey, error) {
+	p.advance()
+	if err := p.expectKeyword("by"); err != nil {
+		return nil, err
+	}
+	keys := []orderKey{}
+	for {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		collation, descending, nullsFirst, err := p.parseSortSuffix()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, classifyOrderKey(expr, collation, descending, nullsFirst, false))
+		if p.peek().Kind == tokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	return keys, nil
+}
+
 // classifyOrderKey classifies a parsed ORDER BY key expression into one of the three OrderKey modes
 // (grammar.md §10). allowOrdinal matches PostgreSQL's rule that only a bare integer constant is an
 // ordinal — and only in a query/set-operation ORDER BY: when set, an integer literal (positive, or
@@ -6174,6 +6202,14 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 				}
 				fc.Args = append(fc.Args, &arg)
 				names = append(names, nil)
+				if p.peekKeyword() == "order" {
+					keys, err := p.parseAggOrderBy()
+					if err != nil {
+						return exprNode{}, err
+					}
+					fc.AggOrder = keys
+					break
+				}
 				// A VARIADIC argument must be the last (PostgreSQL, 42601).
 				if p.peek().Kind == tokComma {
 					return exprNode{}, newError(SyntaxError, "VARIADIC argument must be the last argument")
@@ -6217,6 +6253,16 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 			if overlayForm && argName == nil && !fc.Distinct && len(fc.Args) == 1 && p.peekKeyword() == "placing" {
 				return p.parseOverlayTail(name, arg)
 			}
+			// A trailing in-aggregate ORDER BY (`json_agg(x ORDER BY y)` — aggregates.md §22) ends the
+			// argument list. The resolver rejects it on a non-aggregate (42809) or a window call (0A000).
+			if p.peekKeyword() == "order" {
+				keys, err := p.parseAggOrderBy()
+				if err != nil {
+					return exprNode{}, err
+				}
+				fc.AggOrder = keys
+				break
+			}
 			if p.peek().Kind != tokComma {
 				break
 			}
@@ -6237,6 +6283,11 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 	// allowOrdinal OFF, so a bare integer is a constant (not an ordinal), matching PostgreSQL; the
 	// resolver enforces exactly one key (42883) and the per-name rules.
 	if p.peekKeyword() == "within" {
+		// The in-aggregate ORDER BY and WITHIN GROUP both order the aggregated input; PostgreSQL
+		// rejects the pair in its grammar (42601).
+		if fc.AggOrder != nil {
+			return exprNode{}, newError(SyntaxError, "cannot use multiple ORDER BY clauses with WITHIN GROUP")
+		}
 		p.advance()
 		if err := p.expectKeyword("group"); err != nil {
 			return exprNode{}, err

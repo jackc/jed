@@ -991,6 +991,9 @@ pub(crate) fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> boo
             s.operand
                 .as_ref()
                 .is_some_and(|op| rexpr_references_outer(op, depth))
+                || s.order.as_ref().is_some_and(|o| {
+                    o.keys.iter().any(|k| rexpr_references_outer(k, depth))
+                })
         })
         || sp
             .projections

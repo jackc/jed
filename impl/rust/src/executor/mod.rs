@@ -53,6 +53,7 @@ pub(crate) use window::*;
 mod access_path;
 pub(crate) use access_path::index_store_bound_entries;
 mod aggregate;
+pub(crate) use aggregate::{agg_order_tuple, sort_agg_order_rows};
 mod ddl;
 mod index_dependencies;
 pub(crate) use index_dependencies::*;

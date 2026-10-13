@@ -12,6 +12,10 @@ import (
 // Rust core's pack_acc field for field: it preserves the running decimal scale and the float special
 // flags, never finalizing/recombining partials.
 func blockingAccRow(a *acc) storedRow {
+	// An ordered aggregate (aggregates.md §22) spools its tuples in the collection rows too.
+	if a.ordered {
+		return storedRow{}
+	}
 	switch a.plan {
 	case planCountStar, planCount:
 		return storedRow{IntValue(a.count)}
@@ -39,6 +43,9 @@ func blockingAccRow(a *acc) storedRow {
 
 func blockingAccFromRow(spec aggSpec, r storedRow) *acc {
 	a := newAccFromSpec(spec)
+	if a.ordered {
+		return a
+	}
 	switch a.plan {
 	case planCountStar, planCount:
 		a.count = r[0].Int
@@ -180,8 +187,15 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 							return err
 						}
 					}
+					// An in-aggregate ORDER BY's keys follow the argument (aggregates.md §22).
+					var tuple []Value
+					if spec.order != nil {
+						if tuple, err = aggOrderTuple(spec.order, v, row, env, m); err != nil {
+							return err
+						}
+					}
 					if spec.distinct {
-						if v.IsNull() {
+						if v.IsNull() && !spec.plan.distinctKeepsNull() {
 							continue
 						}
 						inserted, err := seen.insert([]Value{state[0], IntValue(int64(si)), v})
@@ -192,20 +206,16 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 							continue
 						}
 					}
-					a := blockingAccFromRow(spec, *state[si+1].composite())
-					if err := a.fold(v, m); err != nil {
-						return err
-					}
-					if a.objAgg && a.objUnique && len(a.objPairs) > 0 {
-						inserted, err := unique.insert([]Value{state[0], IntValue(int64(si)), TextValue(a.objPairs[0].key)})
-						if err != nil {
+					// An ordered aggregate spools its [keys…, argument] tuple; finalize sorts and folds
+					// them.
+					if tuple != nil {
+						if err := collections.push(owner, tuple); err != nil {
 							return err
 						}
-						if !inserted {
-							return newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
-						}
+						continue
 					}
-					if err := blockingRetain(a, owner, collections); err != nil {
+					a := blockingAccFromRow(spec, *state[si+1].composite())
+					if err := blockingFold(a, v, m, unique, []Value{state[0], IntValue(int64(si))}, collections, owner); err != nil {
 						return err
 					}
 					state[si+1] = CompositeValue(blockingAccRow(a))
@@ -230,7 +240,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 				}
 				for si, spec := range p.aggSpecs {
 					a := blockingAccFromRow(spec, *state[si+1].composite())
-					v, err := db.finalizeSpilledAcc(a, spec, out, collections, group*nspecs+uint64(si), env)
+					v, err := db.finalizeSpilledAcc(a, spec, out, collections, group*nspecs+uint64(si), env, m)
 					if err != nil {
 						return err
 					}
@@ -248,6 +258,33 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 	}
 	rows.close()
 	return output, nil
+}
+
+// blockingFold folds one argument into a spilled aggregate's accumulator, then moves whatever the
+// fold retained into the collection rows under owner, so the in-memory accumulator stays O(1). A
+// _unique object aggregate's key is checked against unique (keyed by prefix + the key) — 22030 on a
+// repeat.
+func blockingFold(a *acc, v Value, m *costMeter, unique *stateMap, prefix []Value, collections *hashRows, owner uint64) error {
+	if err := a.fold(v, m); err != nil {
+		return err
+	}
+	if a.objAgg && a.objUnique && len(a.objPairs) > 0 {
+		entry := append(append([]Value(nil), prefix...), TextValue(a.objPairs[0].key))
+		inserted, err := unique.insert(entry)
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			return newError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+		}
+	}
+	if err := blockingRetain(a, owner, collections); err != nil {
+		return err
+	}
+	// The retained input now lives in the collection rows; drop it from the accumulator so a
+	// long-lived one (an ordered aggregate's finalize fold) never re-retains it.
+	a.jsonNodes, a.objPairs, a.osaVals, a.osaFloats = nil, nil, nil, nil
+	return nil
 }
 
 // blockingRetain moves what a fold retained (JSON elements, object pairs, ordered-set values) out of
@@ -279,7 +316,50 @@ func blockingRetain(a *acc, owner uint64, collections *hashRows) error {
 // finalizeSpilledAcc finalizes one group's accumulator, reading what it retained from its collection
 // rows (owner). Ordered-set and object aggregates sort through the external sorter; a hypothetical
 // DENSE_RANK dedups through a bounded map. Each is discarded once the value is computed.
-func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, collections *hashRows, owner uint64, env *evalEnv) (Value, error) {
+func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, collections *hashRows, owner uint64, env *evalEnv, m *costMeter) (Value, error) {
+	// An in-aggregate ORDER BY (aggregates.md §22): stable-sort the spooled [keys…, argument] tuples
+	// by the keys (collated keys were spooled as sort-key bytes), fold the arguments in that order into
+	// the plan's own accumulator — spooling its retained input into a fresh collection exactly as the
+	// unordered fold does — and finalize that.
+	if a.ordered {
+		slots := make([]orderSlot, len(spec.order.sorts))
+		for i, ks := range spec.order.sorts {
+			slots[i] = orderSlot{idx: i, descending: ks.desc, nullsFirst: ks.nullsFirst}
+		}
+		s := db.newSorterFor(slots)
+		defer s.close()
+		if err := collections.each(owner, func(row storedRow) error { return s.push(row) }); err != nil {
+			return NullValue(), err
+		}
+		sorted, err := s.finish()
+		if err != nil {
+			return NullValue(), err
+		}
+		defer sorted.close()
+		inner := newAccFromSpecUnordered(spec)
+		unique := newStateMap(db)
+		defer unique.close()
+		folded := newHashRows(db)
+		defer folded.close()
+		for {
+			row, ok, err := sorted.next()
+			if err != nil {
+				return NullValue(), err
+			}
+			if !ok {
+				break
+			}
+			if err := m.Guard(); err != nil {
+				return NullValue(), err
+			}
+			// A _unique key entry keeps the per-group map's (group, aggregate, key) shape, so its
+			// measured bytes match every core's (memory.md §6.6).
+			if err := blockingFold(inner, row[len(row)-1], m, unique, []Value{IntValue(0), IntValue(0)}, folded, 0); err != nil {
+				return NullValue(), err
+			}
+		}
+		return db.finalizeSpilledAcc(inner, spec, srow, folded, 0, env, m)
+	}
 	if spec.hypo != nil {
 		hyp := make(storedRow, len(spec.hypo.args))
 		for i, e := range spec.hypo.args {

@@ -284,6 +284,19 @@ test('the select page names a column with a bare label (no AS)', async ({ page }
   await expect(panel.getByTestId('result-rows')).toContainText('kitchen');
 });
 
+test('the select page orders an aggregate input live', async ({ page }) => {
+  await page.goto('/docs/sql/select/');
+  // An in-aggregate ORDER BY (spec/design/aggregates.md §22): each category's names, priciest first.
+  const panel = livePanel(page, 'aggOrder');
+  await expect(panel.getByTestId('result-rows')).toContainText('["Mug", "Coffee"]');
+  await expect(panel.getByTestId('result-rows')).toContainText('["Notebook", "Pen"]');
+  await panel.getByTestId('sql-input').fill('SELECT jsonb_agg(name ORDER BY price) FROM product');
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText(
+    '["Pen", "Notebook", "Coffee", "Mug"]'
+  );
+});
+
 test('the select page inserts the rows of a set operation live', async ({ page }) => {
   await page.goto('/docs/sql/select/');
   // A set operation as an INSERT source (spec/design/grammar.md §24): the two office products are

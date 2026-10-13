@@ -4985,6 +4985,16 @@ pub(crate) enum AggPlan {
     HypoCumeDist,
 }
 
+impl AggPlan {
+    /// Whether a DISTINCT aggregate keeps a NULL argument as one more distinct value instead of
+    /// skipping it (aggregates.md §5): only the JSON array aggregates, whose non-strict transition
+    /// folds a NULL (even the `_strict` variants, which then drop it in the fold but still mark the
+    /// group non-empty — `[]`, not NULL, as in PostgreSQL). Every other aggregate ignores NULLs.
+    pub(crate) fn distinct_keeps_null(self) -> bool {
+        matches!(self, AggPlan::JsonAgg { .. })
+    }
+}
+
 /// The resolve-time parameters of an ordered-set aggregate (spec/design/aggregates.md §13), kept
 /// off `AggPlan` (which is `Copy`/`Eq`). `desc` is the `WITHIN GROUP` sort direction; `frac` is the
 /// resolved **direct argument** (the percentile fraction) — resolved in the grouped context so it
@@ -5021,6 +5031,10 @@ pub(crate) struct AggSpec {
     /// key operands + per-key sort specs. `None` otherwise. (`operand` is `None` here — the keys
     /// are buffered as a tuple per row from `hypo.keys`.)
     pub(crate) hypo: Option<HypoParams>,
+    /// `Some` for an aggregate with an in-aggregate `ORDER BY` (`json_agg(x ORDER BY y)` —
+    /// aggregates.md §22): the per-row sort keys + their sort specs. The fold loop buffers each
+    /// passing row's `[sort keys…, argument]` and folds the arguments in key order at finalize.
+    pub(crate) order: Option<AggOrder>,
     /// The comparison collation of a text `MIN`/`MAX` (spec/design/collation.md §1 "Aggregates and
     /// window functions"): the operand's derivation; `None` for `C`, a non-text operand, or any
     /// other aggregate.
@@ -5042,6 +5056,14 @@ pub(crate) struct KeySort {
 /// vectors have equal length (the arity check at resolve).
 pub(crate) struct HypoParams {
     pub(crate) args: Vec<RExpr>,
+    pub(crate) keys: Vec<RExpr>,
+    pub(crate) sorts: Vec<KeySort>,
+}
+
+/// An in-aggregate `ORDER BY` (aggregates.md §22): `keys` are the sort-key expressions (evaluated
+/// per passing input row, after the argument) and `sorts` their per-key direction / NULL placement /
+/// collation. Equal length.
+pub(crate) struct AggOrder {
     pub(crate) keys: Vec<RExpr>,
     pub(crate) sorts: Vec<KeySort>,
 }
@@ -5129,6 +5151,13 @@ pub(crate) enum Acc {
     /// hypothetical row would rank. `kind` selects the result formula.
     Hypothetical {
         kind: AggPlan,
+        rows: Vec<Vec<Value>>,
+    },
+    /// An aggregate with an in-aggregate `ORDER BY` (aggregates.md §22): every passing input row's
+    /// `[sort key…, argument]` tuple (collated text keys already replaced by their UCA sort key), in
+    /// input order. Finalize stable-sorts the tuples by the spec's `AggOrder` and folds the arguments
+    /// into a fresh unordered accumulator — the fold runs in key order, ties in input order.
+    Ordered {
         rows: Vec<Vec<Value>>,
     },
 }
@@ -6621,7 +6650,12 @@ pub(crate) fn filter_columnar(
 /// shared [`Acc::fold`] keeps the fold byte-identical to the scalar path (the scalar grouped path folds
 /// through the same `Acc::fold`), so only the group/scan machinery differs.
 pub(crate) fn vectorized_spec_eligible(spec: &AggSpec) -> bool {
-    if spec.distinct || spec.filter.is_some() || spec.osa.is_some() || spec.hypo.is_some() {
+    if spec.distinct
+        || spec.filter.is_some()
+        || spec.osa.is_some()
+        || spec.hypo.is_some()
+        || spec.order.is_some()
+    {
         return false;
     }
     match spec.plan {

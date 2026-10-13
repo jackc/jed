@@ -786,8 +786,13 @@ impl Engine {
                         Some(op) => op.eval(&row, env, meter)?,
                         None => Value::Null,
                     };
+                    // An in-aggregate ORDER BY's keys follow the argument (aggregates.md §22).
+                    let tuple = match &spec.order {
+                        Some(order) => Some(agg_order_tuple(order, v.clone(), &row, env, meter)?),
+                        None => None,
+                    };
                     if spec.distinct
-                        && (matches!(v, Value::Null)
+                        && ((matches!(v, Value::Null) && !spec.plan.distinct_keeps_null())
                             || !seen.insert(vec![
                                 state[0].clone(),
                                 Value::Int(si as i64),
@@ -796,52 +801,26 @@ impl Engine {
                     {
                         continue;
                     }
+                    // An ordered aggregate spools its `[keys…, argument]` tuple; finalize sorts and
+                    // folds them.
+                    if let Some(tuple) = tuple {
+                        collections.push(owner, tuple)?;
+                        continue;
+                    }
                     let packed = std::mem::replace(&mut state[si + 1], Value::Null);
                     let Value::Composite(packed) = packed else {
                         unreachable!()
                     };
                     let mut acc = unpack_acc(spec, packed);
-                    acc.fold(v, meter)?;
-                    if let Acc::JsonObjectAgg {
-                        pairs,
-                        unique: true,
-                        ..
-                    } = &acc
-                    {
-                        if let Some((key, _)) = pairs.first() {
-                            if !unique.insert(vec![
-                                state[0].clone(),
-                                Value::Int(si as i64),
-                                Value::Text(key.clone()),
-                            ])? {
-                                return Err(EngineError::new(
-                                    SqlState::DuplicateJsonObjectKeyValue,
-                                    "duplicate JSON object key value",
-                                ));
-                            }
-                        }
-                    }
-                    match &mut acc {
-                        Acc::JsonAgg { nodes, .. } => {
-                            for node in nodes.drain(..) {
-                                collections.push(owner, vec![Value::Jsonb(node)])?;
-                            }
-                        }
-                        Acc::JsonObjectAgg { pairs, .. } => {
-                            for (key, value) in pairs.drain(..) {
-                                collections.push(owner, vec![Value::Text(key), value])?;
-                            }
-                        }
-                        Acc::OrderedSet { vals, floats, .. } => {
-                            for value in vals.drain(..) {
-                                collections.push(owner, vec![value])?;
-                            }
-                            for value in floats.drain(..) {
-                                collections.push(owner, vec![Value::Float64(value)])?;
-                            }
-                        }
-                        _ => {}
-                    }
+                    fold_spilled_value(
+                        &mut acc,
+                        v,
+                        meter,
+                        &mut unique,
+                        &[state[0].clone(), Value::Int(si as i64)],
+                        &mut collections,
+                        owner,
+                    )?;
                     state[si + 1] = Value::Composite(pack_acc(acc));
                 }
                 groups.put(key, state)?;
@@ -875,6 +854,7 @@ impl Engine {
                         &collections,
                         group as u64 * plan.agg_specs.len() as u64 + si as u64,
                         env,
+                        meter,
                     )?);
                 }
                 for positions in &plan.grouping_specs {
@@ -885,6 +865,7 @@ impl Engine {
         }
         Ok(output)
     }
+    #[allow(clippy::too_many_arguments)]
     fn finalize_spilled_acc(
         &self,
         acc: Acc,
@@ -893,9 +874,42 @@ impl Engine {
         collections: &HashRows,
         owner: u64,
         env: &EvalEnv,
+        meter: &mut Meter,
     ) -> Result<Value> {
         let mut values = collections.reader(owner)?;
         match acc {
+            // An in-aggregate ORDER BY (aggregates.md §22): stable-sort the spooled `[keys…,
+            // argument]` tuples by the keys (collated keys were spooled as sort-key bytes), fold the
+            // arguments in that order into the plan's own accumulator — spooling its retained input
+            // into a fresh collection exactly as the unordered fold does — and finalize that.
+            Acc::Ordered { .. } => {
+                let order = spec.order.as_ref().expect("an ordered acc has its order");
+                let keys: Vec<crate::spill::SortKey> = order
+                    .sorts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s.desc, s.nulls_first, None))
+                    .collect();
+                let mut sorter = self.new_sorter(&keys);
+                while let Some(row) = values.next()? {
+                    sorter.push(row)?;
+                }
+                let mut sorted = sorter.finish()?;
+                let mut inner = Acc::from_spec_unordered(spec);
+                let mut unique = self.blocking_map();
+                let mut folded = self.blocking_hash_rows();
+                // A _unique key entry keeps the per-group map's (group, aggregate, key) shape, so its
+                // measured bytes match every core's (memory.md §6.6).
+                let prefix = [Value::Int(0), Value::Int(0)];
+                while let Some(mut row) = sorted.next()? {
+                    meter.guard()?;
+                    let v = row.pop().expect("an ordered tuple ends with its value");
+                    fold_spilled_value(&mut inner, v, meter, &mut unique, &prefix, &mut folded, 0)?;
+                }
+                // The sorted run, the key map, and the refolded collection all stay resident until the
+                // plan's own finalize below completes (memory.md §6.6).
+                self.finalize_spilled_acc(inner, spec, srow, &folded, 0, env, meter)
+            }
             Acc::OrderedSet {
                 kind,
                 desc,
@@ -1129,6 +1143,61 @@ impl Engine {
     }
 }
 
+/// Fold one argument into a spilled aggregate's accumulator, then move whatever the fold retained
+/// (JSON elements / pairs, ordered-set values) into `collections` under `owner`, so the in-memory
+/// accumulator stays O(1). A `_unique` object aggregate's key is checked against `unique` (keyed by
+/// `prefix` + the key) — 22030 on a repeat.
+fn fold_spilled_value(
+    acc: &mut Acc,
+    v: Value,
+    meter: &mut Meter,
+    unique: &mut StateMap,
+    prefix: &[Value],
+    collections: &mut HashRows,
+    owner: u64,
+) -> Result<()> {
+    acc.fold(v, meter)?;
+    if let Acc::JsonObjectAgg {
+        pairs,
+        unique: true,
+        ..
+    } = &acc
+    {
+        if let Some((key, _)) = pairs.first() {
+            let mut entry = prefix.to_vec();
+            entry.push(Value::Text(key.clone()));
+            if !unique.insert(entry)? {
+                return Err(EngineError::new(
+                    SqlState::DuplicateJsonObjectKeyValue,
+                    "duplicate JSON object key value",
+                ));
+            }
+        }
+    }
+    match acc {
+        Acc::JsonAgg { nodes, .. } => {
+            for node in nodes.drain(..) {
+                collections.push(owner, vec![Value::Jsonb(node)])?;
+            }
+        }
+        Acc::JsonObjectAgg { pairs, .. } => {
+            for (key, value) in pairs.drain(..) {
+                collections.push(owner, vec![Value::Text(key), value])?;
+            }
+        }
+        Acc::OrderedSet { vals, floats, .. } => {
+            for value in vals.drain(..) {
+                collections.push(owner, vec![value])?;
+            }
+            for value in floats.drain(..) {
+                collections.push(owner, vec![Value::Float64(value)])?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn pack_acc(acc: Acc) -> Row {
     match acc {
         Acc::CountStar(n) | Acc::Count(n) => vec![Value::Int(n)],
@@ -1151,7 +1220,7 @@ fn pack_acc(acc: Acc) -> Row {
         ],
         Acc::MinMax { cur, .. } => vec![cur.unwrap_or(Value::Null)],
         Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => vec![Value::Bool(seen)],
-        Acc::OrderedSet { .. } | Acc::Hypothetical { .. } => Vec::new(),
+        Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => Vec::new(),
     }
 }
 fn unpack_acc(spec: &AggSpec, state: Row) -> Acc {
@@ -1204,7 +1273,7 @@ fn unpack_acc(spec: &AggSpec, state: Row) -> Acc {
             }
         }
         Acc::JsonAgg { seen, .. } | Acc::JsonObjectAgg { seen, .. } => *seen = flag(0),
-        Acc::OrderedSet { .. } | Acc::Hypothetical { .. } => {}
+        Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => {}
     }
     acc
 }

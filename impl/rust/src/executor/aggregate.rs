@@ -11,6 +11,17 @@ impl Acc {
     /// ordered-set accumulators — the window stage (which calls [`Acc::new`] directly) never sees
     /// one (an ordered-set aggregate with `OVER` is 0A000, rejected at resolve).
     pub(crate) fn from_spec(s: &AggSpec) -> Acc {
+        // An in-aggregate ORDER BY buffers the passing rows first (aggregates.md §22); the plan's own
+        // accumulator is built at finalize ([`Acc::from_spec_unordered`]) and fed in key order.
+        if s.order.is_some() {
+            return Acc::Ordered { rows: Vec::new() };
+        }
+        Acc::from_spec_unordered(s)
+    }
+
+    /// [`Acc::from_spec`] ignoring any in-aggregate `ORDER BY` — the accumulator an ordered
+    /// aggregate's sorted arguments are finally folded into.
+    pub(crate) fn from_spec_unordered(s: &AggSpec) -> Acc {
         match s.plan {
             AggPlan::OrderedSetMode
             | AggPlan::OrderedSetDisc
@@ -300,6 +311,10 @@ impl Acc {
             Acc::Hypothetical { .. } => {
                 unreachable!("a hypothetical-set accumulator buffers tuples in the fold loop")
             }
+            // Likewise an ordered aggregate's `[keys…, argument]` tuples (aggregates.md §22).
+            Acc::Ordered { .. } => {
+                unreachable!("an ordered aggregate buffers tuples in the fold loop")
+            }
         }
         Ok(())
     }
@@ -490,6 +505,57 @@ impl Acc {
                     "a hypothetical-set accumulator is finalized in the group-emission loop"
                 )
             }
+            // An ordered aggregate is sorted + folded in the group-emission loop (it needs the
+            // spec's `AggOrder`), never through `Acc::finalize` (aggregates.md §22).
+            Acc::Ordered { .. } => {
+                unreachable!("an ordered aggregate is finalized in the group-emission loop")
+            }
         })
     }
+}
+
+/// Evaluate one passing input row's in-aggregate `ORDER BY` keys (aggregates.md §22) and return the
+/// buffered tuple `[key…, value]`. Each key's `operator_eval`s are charged (it is evaluated per row,
+/// after the argument). A collated text / text[] key is replaced by its UCA sort key (`bytea`), so the
+/// finalize sort is a plain value sort and an unmapped code point fails here, per row — independent
+/// of how many rows the group has.
+pub(crate) fn agg_order_tuple(
+    order: &AggOrder,
+    value: Value,
+    row: &[Value],
+    env: &EvalEnv,
+    m: &mut Meter,
+) -> Result<Vec<Value>> {
+    let mut tuple = Vec::with_capacity(order.keys.len() + 1);
+    for (k, sort) in order.keys.iter().zip(&order.sorts) {
+        let kv = k.eval(row, env, m)?;
+        let kv = match &sort.collation {
+            Some(c) => match collation_sort_key(c, &kv)? {
+                Some(bytes) => Value::Bytea(bytes),
+                None => kv,
+            },
+            None => kv,
+        };
+        tuple.push(kv);
+    }
+    tuple.push(value);
+    Ok(tuple)
+}
+
+/// Stable-sort an ordered aggregate's buffered `[key…, value]` tuples by its `ORDER BY` (each key's
+/// direction + NULL placement; ties keep input order) and return the values in that order
+/// (aggregates.md §22). The sort is unmetered, like the query ORDER BY sort.
+pub(crate) fn sort_agg_order_rows(mut rows: Vec<Vec<Value>>, order: &AggOrder) -> Vec<Value> {
+    rows.sort_by(|a, b| {
+        for (i, sort) in order.sorts.iter().enumerate() {
+            let ord = key_cmp(&a[i], &b[i], sort.desc, sort.nulls_first);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    rows.into_iter()
+        .map(|mut r| r.pop().expect("an ordered tuple ends with its value"))
+        .collect()
 }

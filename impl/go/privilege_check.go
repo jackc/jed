@@ -167,6 +167,11 @@ func exprCallsSeqMutator(e *exprNode) bool {
 				return true
 			}
 		}
+		for i := range e.FuncCall.AggOrder {
+			if k := e.FuncCall.AggOrder[i].Expr; k != nil && exprCallsSeqMutator(k) {
+				return true
+			}
+		}
 		return false
 	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprParam:
 		return false
@@ -829,6 +834,12 @@ func collectExprPrivs(e *exprNode, req *privReq, locals map[string]bool) {
 		req.needFunction(e.FuncCall.Name)
 		for _, a := range e.FuncCall.Args {
 			collectExprPrivs(a, req, locals)
+		}
+		// An in-aggregate ORDER BY key may call functions / hold a subquery (aggregates.md §22).
+		for i := range e.FuncCall.AggOrder {
+			if k := e.FuncCall.AggOrder[i].Expr; k != nil {
+				collectExprPrivs(k, req, locals)
+			}
 		}
 	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprParam:
 		// leaf — nothing to collect

@@ -521,6 +521,7 @@ export function filterColumnar(
 export function vectorizedSpecEligible(spec: AggSpec): boolean {
   if (spec.distinct === true) return false;
   if (spec.filter !== undefined && spec.filter !== null) return false;
+  if (spec.order !== undefined && spec.order !== null) return false;
   switch (spec.plan) {
     case "countStar":
       return spec.operand === null;

@@ -1246,6 +1246,25 @@ argument (the value sorted over). Parser rules, byte-identical across the three 
    aggregate inside the `WITHIN GROUP` order key is **`42803`** — see [aggregates.md](aggregates.md)
    §13.
 
+**The in-aggregate `ORDER BY`.** The argument list of an aggregate call may end in `ORDER BY key [,
+…]` (`agg_order_clause`, `json_agg(x ORDER BY y DESC)`, `jsonb_object_agg(k, v ORDER BY ts)`) — the
+order the aggregate folds its input rows in ([aggregates.md](aggregates.md) §22). Parser rules,
+byte-identical across the three cores:
+
+1. **After the last regular argument.** `ORDER` (reserved) right after an argument — instead of the
+   `,` or `)` — starts the clause; it ends the argument list (the next token must be `)`). It needs a
+   regular argument first: `f(ORDER BY x)` and `count(* ORDER BY x)` are `42601`. It may follow a
+   `VARIADIC` or named argument and combine with a leading `DISTINCT`.
+2. **Keys.** Each key is an `order_term` — a general expression with the `COLLATE` / `ASC`|`DESC` /
+   `NULLS FIRST|LAST` suffix — parsed with ordinals OFF: a bare integer is a constant key (PostgreSQL),
+   as in `WITHIN GROUP`. The keys ride on the call node (`agg_order`); an ordinary call carries none and
+   parses byte-identically to before.
+3. **Not with `WITHIN GROUP`.** A call carrying both is `42601` (*"cannot use multiple ORDER BY
+   clauses with WITHIN GROUP"*), raised by the parser as PostgreSQL's grammar does.
+4. **Resolve-time meaning.** On a non-aggregate `42809`, on a window call `0A000`, a `json` key `42883`,
+   an aggregate or window function in a key `42803`, under `DISTINCT` a key that is not an argument
+   `42P10` — see [aggregates.md](aggregates.md) §22.
+
 ## 18. `GROUP BY`
 
 `group_by ::= "GROUP" "BY" group_item ("," group_item)*` slots between `WHERE` and

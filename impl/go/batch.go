@@ -177,7 +177,7 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 // reference. SUM(i64|decimal) → planSumDecimal and AVG(decimal) → planAvg are deferred (their fold
 // charges running-sum-dependent decimal_work); MIN/MAX fold ANY type through valueCmp.
 func vectorizedSpecEligible(spec *aggSpec) bool {
-	if spec.distinct || spec.filter != nil || spec.osaFrac != nil || spec.hypo != nil {
+	if spec.distinct || spec.filter != nil || spec.osaFrac != nil || spec.hypo != nil || spec.order != nil {
 		return false
 	}
 	switch spec.plan {

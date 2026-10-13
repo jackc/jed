@@ -342,6 +342,9 @@ var SupportedCapabilities = []string{
 	// FILTER (WHERE cond) on an aggregate — agg(x) FILTER (WHERE cond): fold only the input rows for
 	// which cond is TRUE (spec/design/aggregates.md §11). 42809 on a non-aggregate, 0A000 on a window.
 	"query.aggregate_filter",
+	// In-aggregate ORDER BY — agg(x ORDER BY y DESC): fold the passing input rows in key order
+	// (spec/design/aggregates.md §22). 42809 on a non-aggregate, 0A000 on a window, 42P10 under DISTINCT.
+	"query.aggregate_order_by",
 	// FILTER (WHERE cond) on a WINDOW aggregate — agg(x) FILTER (WHERE cond) OVER (...): fold only the
 	// frame rows for which cond is TRUE (spec/design/aggregates.md §20). 0A000 on a non-aggregate window fn.
 	"query.window_aggregate_filter",

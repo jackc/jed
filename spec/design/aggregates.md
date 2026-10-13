@@ -124,7 +124,13 @@ extremes, but the form is accepted for symmetry with PostgreSQL). De-duplication
 fold, **value-canonically** — the same `Eq`/`Hash` the group-key bucketing uses, so `1.5` and `1.50`
 are one value and `-0.0` and `+0.0` are one value — keeping the **first occurrence in scan order**.
 NULL arguments are skipped exactly as without `DISTINCT` (so an all-NULL / empty distinct group is
-`COUNT` `0` and `SUM`/`AVG` `NULL`). It composes with `GROUP BY` (de-duplication is per group).
+`COUNT` `0` and `SUM`/`AVG` `NULL`) — except by the JSON array aggregates `json[b]_agg[_strict]`,
+whose transition function is not strict in PostgreSQL: there one NULL is kept as a distinct value
+(`jsonb_agg(DISTINCT x)` folds it as JSON `null`; the `_strict` variant then drops it in the fold but
+the group is still non-empty, `[]` not NULL). The object aggregates de-duplicate the `(key, value)`
+pair. It composes with `GROUP BY` (de-duplication is per group). De-duplication needs an equality,
+so `DISTINCT` over a `json` argument is **`42883`** (*"could not identify an equality operator for
+type json"*, PG — `jsonb` has one).
 
 The deliberate restrictions, all matching PostgreSQL (oracle-verified):
 
@@ -246,6 +252,8 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   `WITHIN GROUP` (§19).
 - **`GROUPING SETS` combined with window functions** (landed) — the window stage runs over the
   unioned grouping-set rows; `GROUPING()` and window functions coexist in one query (§21).
+- **The in-aggregate `ORDER BY`** (landed) — `json_agg(x ORDER BY y DESC)` folds the input rows in
+  key order (§22).
 
 ## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
 
@@ -661,3 +669,55 @@ already runs over the full set of grouped rows (the same code a single-set `GROU
 only the slot layout / rebase change. The post-`WHERE` scan, the per-`(set × row × aggregate)`
 accumulate (§12), and the window stage's `window_frame_step` (§20) are charged unchanged.
 Deterministic and cross-core identical. New capability `query.grouping_sets_window`.
+
+## 22. The in-aggregate `ORDER BY` — `agg(args ORDER BY keys)`
+
+`agg(args ORDER BY key [ASC|DESC] [NULLS FIRST|LAST] [, …])` folds the aggregate's input rows **in
+the key order** (PostgreSQL / SQL-standard; [grammar.md](grammar.md) §17 for the syntax). It is what
+makes an order-sensitive aggregate deterministic without ordering its source: `json[b]_agg[_strict]`
+and `json[b]_object_agg[_unique]` concatenate in fold order, so the clause *is* their result order
+(and `jsonb_object_agg`'s last-wins duplicate key is the **last in key order**). PostgreSQL accepts the
+clause on every ordinary aggregate, and so does jed: an order-insensitive one (`count`, `sum` over an
+exact type, `min`/`max`, …) returns the same value, the fold order aside.
+
+**Keys.** Each key is a general expression over the **input** row (the scope an argument resolves in,
+aggregates forbidden — a nested aggregate is **`42803`**, as is a window function, PG's *"aggregate
+function calls cannot contain window function calls"*), with the ordinary direction / NULL placement
+(`ASC` default; `NULLS LAST` for `ASC`, `NULLS FIRST` for `DESC` by default) and an optional `COLLATE`
+— or a text key's derived collation, exactly like a `WITHIN GROUP` key (§13/§19). A bare integer is a
+**constant** key (every row ties), never an ordinal — PostgreSQL's reading here, as in `WITHIN GROUP`.
+A `json` key is **`42883`** (*"could not identify an ordering operator for type json"*); `jsonb` sorts by
+its btree order. Keys are evaluated per **passing** input row (after `FILTER`), after the argument.
+
+**Order and ties.** The passing rows are stable-sorted by the keys: rows that tie on every key keep
+their input order (PostgreSQL leaves a tie's order unspecified; jed's input order is itself
+deterministic, so the fold — and any error it raises, such as `_unique`'s `22030` — is cross-core
+identical). The fold then runs in that order at **finalize**, as PostgreSQL's ordered transition does.
+
+**With `DISTINCT`.** Every key must be one of the aggregate's arguments — structurally (the same AST,
+positions ignored) or as the same input column — else **`42P10`** (*"in an aggregate with DISTINCT,
+ORDER BY expressions must appear in argument list"*, PG); so equal arguments never sort apart, and the
+first occurrence of each distinct value (input order) is the one folded, in key order. The §5 NULL rule
+applies (the JSON array aggregates keep one NULL, which then sorts by the key's NULL placement).
+
+**Not here.** On a scalar function the clause is **`42809`** (*"ORDER BY specified, but f is not an
+aggregate function"*); on a window call (`agg(x ORDER BY y) OVER (…)`) **`0A000`** (*"aggregate ORDER BY
+is not implemented for window functions"* — the frame orders a window aggregate); together with a
+`WITHIN GROUP` clause **`42601`** (*"cannot use multiple ORDER BY clauses with WITHIN GROUP"*). `count(*
+ORDER BY x)` and `f(ORDER BY x)` are syntax errors (the clause follows a regular argument).
+
+**Execution.** Each group holds one buffer per ordered aggregate: the passing rows' `[key…, argument]`
+tuples (a collated text key replaced by its UCA sort key, so the sort is a plain value sort and an
+unmapped code point fails per row, independent of the group's size). At finalize the buffer is
+stable-sorted and the arguments are folded into the plan's ordinary accumulator, which then finalizes
+as usual. On the bounded-spill lane the tuples are the group's retained collection rows, sorted by the
+external sorter and refolded into a fresh collection of the plan's own shape ([spill.md](spill.md)).
+The buffer is retained operator state — `row_bytes` per tuple ([memory.md](memory.md) §6.3) — and the
+plan's own retention is charged on top as it refolds.
+
+**Cost** (the cross-core contract, §8). Unchanged from the unordered aggregate except the keys: the
+argument and each key's `operator_eval`s per passing row, `aggregate_accumulate` per passing row
+(DISTINCT duplicates included, §5), and the fold's own charges (`decimal_work`, the JSON aggregates'
+`generated_row`) when the sorted arguments are folded at finalize. The buffering and the sort are
+**unmetered**, like the query `ORDER BY` sort. Deterministic and cross-core identical. New capability
+`query.aggregate_order_by`.

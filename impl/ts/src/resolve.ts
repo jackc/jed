@@ -781,6 +781,14 @@ export function resolve(
             "DISTINCT is not implemented for window functions",
           );
         }
+        // Nor is an in-aggregate ORDER BY (PG 0A000 — aggregates.md §22): the window frame, not an
+        // input sort, orders a window aggregate's fold.
+        if (e.aggOrder !== undefined && e.aggOrder !== null) {
+          throw engineError(
+            "feature_not_supported",
+            "aggregate ORDER BY is not implemented for window functions",
+          );
+        }
         // FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the frame
         // rows for which the filter is TRUE; a pure (non-aggregate) window function with FILTER is
         // PG's own 0A000 ("FILTER is not implemented for non-aggregate window functions"). The filter

@@ -1,0 +1,274 @@
+# The in-aggregate ORDER BY — agg(args ORDER BY key [ASC|DESC] [NULLS FIRST|LAST], ...)
+# (spec/design/aggregates.md §22, grammar.md §17). The aggregate folds its passing input rows in
+# the key order, so an order-sensitive aggregate (json[b]_agg, json[b]_object_agg — the
+# concatenation order is the result) becomes deterministic without ordering the source. Keys are
+# general expressions evaluated per row; a bare integer is a constant, not an ordinal. DISTINCT
+# composes (every key must then be an argument, else 42P10) and keeps a NULL for the JSON array
+# aggregates; FILTER composes; an order-insensitive aggregate accepts the clause too. Errors: on
+# a scalar function 42809, on a window call 0A000, with WITHIN GROUP 42601, a json key 42883
+# (no ordering operator), an aggregate in a key 42803, a window function in a key 42803.
+# Output matches the postgres:18 oracle.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.aggregate_distinct, query.aggregate_filter, query.aggregate_order_by, query.window, query.window_ranking, query.window_grouped, ddl.view, types.i32, types.text, types.jsonb, types.json, func.json_agg, func.json_object_agg, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, grp i32, x i32, y i32, k text)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 30, 4, 'b'), (2, 1, 10, 2, 'a'), (3, 1, NULL, 3, 'c'), (4, 2, 20, 1, 'a'), (5, 2, 40, 5, 'b'), (6, 2, 10, 6, 'a')
+
+# The array follows the ORDER BY key, not the scan (PK) order. A bare-column key evaluates for
+# free, so the cost is the unordered aggregate's: 1 page_read + 6 storage_row_read + 6
+# aggregate_accumulate + 6 generated_row (the fold, now at finalize) + 1 row_produced; the buffer
+# and the sort are unmetered.
+# cost: 20
+query T nosort
+SELECT jsonb_agg(x ORDER BY y) FROM t
+----
+[20, 10, null, 30, 40, 10]
+
+query T nosort
+SELECT json_agg(x ORDER BY y DESC) FROM t
+----
+[10, 40, 30, null, 10, 20]
+
+# Ordering by the aggregated value itself, with each NULL placement. ASC defaults to NULLS LAST,
+# DESC to NULLS FIRST (PostgreSQL).
+query TTTT nosort
+SELECT jsonb_agg(x ORDER BY x), jsonb_agg(x ORDER BY x NULLS FIRST), jsonb_agg(x ORDER BY x DESC), jsonb_agg(x ORDER BY x DESC NULLS LAST) FROM t
+----
+[10, 10, 20, 30, 40, null]
+[null, 10, 10, 20, 30, 40]
+[null, 40, 30, 20, 10, 10]
+[40, 30, 20, 10, 10, null]
+
+# Several keys: the first orders, the next breaks its ties.
+query T nosort
+SELECT jsonb_agg(id ORDER BY k, x DESC, id) FROM t
+----
+[4, 2, 6, 5, 1, 3]
+
+# A general-expression key, evaluated per row: its operator_eval adds 6 to the cost above.
+# cost: 26
+query T nosort
+SELECT jsonb_agg(id ORDER BY x % 20, id DESC) FROM t
+----
+[5, 4, 6, 2, 1, 3]
+
+# A bare integer key is a constant (every row ties), not an ordinal: the order is unchanged, so
+# compare an order-independent property.
+query I nosort
+SELECT jsonb_array_length(jsonb_agg(x ORDER BY 1)) FROM t
+----
+6
+
+# Grouped: each group's array is in its own key order.
+query IT nosort
+SELECT grp, jsonb_agg(k ORDER BY y DESC) FROM t GROUP BY grp ORDER BY grp
+----
+1
+["b", "c", "a"]
+2
+["a", "b", "a"]
+
+# The strict variants drop the NULL after ordering; the rest keep their order.
+query TT nosort
+SELECT jsonb_agg_strict(x ORDER BY y), json_agg_strict(x ORDER BY y DESC) FROM t
+----
+[20, 10, 30, 40, 10]
+[10, 40, 30, 10, 20]
+
+# An empty group is still SQL NULL.
+query T nosort
+SELECT jsonb_agg(x ORDER BY y) FROM t WHERE id > 100
+----
+NULL
+
+# DISTINCT + ORDER BY: the distinct values in key order. The JSON array aggregates keep one NULL
+# as a distinct value (their transition function is not strict).
+query TT nosort
+SELECT jsonb_agg(DISTINCT x ORDER BY x), json_agg(DISTINCT x ORDER BY x DESC) FROM t
+----
+[10, 20, 30, 40, null]
+[null, 40, 30, 20, 10]
+
+query T nosort
+SELECT jsonb_agg(DISTINCT k ORDER BY k DESC) FROM t
+----
+["c", "b", "a"]
+
+# The strict variant drops that NULL, but a group whose only value is NULL is still [] (not NULL).
+query TT nosort
+SELECT jsonb_agg_strict(DISTINCT x ORDER BY x DESC), jsonb_agg_strict(DISTINCT x ORDER BY x) FILTER (WHERE id = 3) FROM t
+----
+[40, 30, 20, 10]
+[]
+
+query T nosort
+SELECT jsonb_agg(DISTINCT x) FILTER (WHERE id = 3) FROM t
+----
+[null]
+
+# FILTER composes: only the passing rows are ordered and folded.
+query T nosort
+SELECT jsonb_agg(x ORDER BY y DESC) FILTER (WHERE x > 15) FROM t
+----
+[40, 30, 20]
+
+# jsonb_object_agg: under ORDER BY a duplicate key's LAST value in key order wins.
+query TT nosort
+SELECT jsonb_object_agg(k, x ORDER BY y), jsonb_object_agg(k, x ORDER BY y DESC) FROM t
+----
+{"a": 10, "b": 40, "c": null}
+{"a": 20, "b": 30, "c": null}
+
+# json_object_agg keeps every pair, in key order.
+query T nosort
+SELECT json_object_agg(k, x ORDER BY y) FROM t WHERE grp = 2
+----
+{ "a" : 20, "b" : 40, "a" : 10 }
+
+query T nosort
+SELECT json_object_agg(k, id ORDER BY k, id DESC) FROM t
+----
+{ "a" : 6, "a" : 4, "a" : 2, "b" : 5, "b" : 1, "c" : 3 }
+
+# Grouped object aggregate.
+query IT nosort
+SELECT grp, json_object_agg(id, x ORDER BY x DESC NULLS LAST) FROM t GROUP BY grp ORDER BY grp
+----
+1
+{ "1" : 30, "2" : 10, "3" : null }
+2
+{ "5" : 40, "4" : 20, "6" : 10 }
+
+# DISTINCT de-duplicates the (key, value) pair: the repeated ('a', 10) folds once, so the _unique
+# variant sees no duplicate key once each key has a single value.
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, k text, v i32)
+
+statement ok
+INSERT INTO p VALUES (1, 'b', 2), (2, 'a', 1), (3, 'a', 1), (4, 'c', 3)
+
+query TT nosort
+SELECT json_object_agg(DISTINCT k, v ORDER BY k DESC), jsonb_object_agg_unique(DISTINCT k, v ORDER BY v) FROM p
+----
+{ "c" : 3, "b" : 2, "a" : 1 }
+{"a": 1, "b": 2, "c": 3}
+
+# Without DISTINCT the repeated key is a duplicate for _unique.
+statement error 22030
+SELECT jsonb_object_agg_unique(k, v ORDER BY v) FROM p
+
+# FILTER on an object aggregate.
+query T nosort
+SELECT json_object_agg(k, v ORDER BY id DESC) FILTER (WHERE v > 1) FROM p
+----
+{ "c" : 3, "b" : 2 }
+
+# Order-insensitive aggregates accept the clause; the result is unchanged.
+query IIIT nosort
+SELECT count(x ORDER BY y), sum(x ORDER BY y DESC), max(x ORDER BY k), min(k ORDER BY x) FROM t
+----
+5
+110
+40
+a
+
+# An ordered aggregate composes with HAVING.
+query IT nosort
+SELECT grp, jsonb_agg(id ORDER BY id DESC) FROM t GROUP BY grp HAVING jsonb_agg(x ORDER BY y) -> 0 = '20' ORDER BY grp
+----
+2
+[6, 5, 4]
+
+# An explicit COLLATE on a text key ("C" — code-point order, so 'B' < 'a').
+statement ok
+INSERT INTO p VALUES (5, 'B', 4)
+
+query T nosort
+SELECT jsonb_agg(k ORDER BY k COLLATE "C" DESC, id) FROM p
+----
+["c", "b", "a", "a", "B"]
+
+statement ok
+DELETE FROM p WHERE id = 5
+
+# A grouped query that also windows: the ordered aggregate is computed per group before the window.
+query ITI nosort
+SELECT grp, jsonb_agg(x ORDER BY y), rank() OVER (ORDER BY grp DESC) FROM t GROUP BY grp ORDER BY grp
+----
+1
+[10, null, 30]
+2
+2
+[20, 40, 10]
+1
+
+# A view keeps the ordered aggregate; a key column is a dependency of the view.
+statement ok
+CREATE VIEW v AS SELECT grp, jsonb_agg(x ORDER BY y DESC NULLS LAST, id) AS a FROM t GROUP BY grp
+
+query IT nosort
+SELECT grp, a FROM v ORDER BY grp
+----
+1
+[30, null, 10]
+2
+[10, 40, 20]
+
+statement error 2BP01
+ALTER TABLE t DROP COLUMN y
+
+statement ok
+DROP VIEW v
+
+# A correlated subquery as the key.
+query T nosort
+SELECT jsonb_agg(p.k ORDER BY (SELECT count(*) FROM t WHERE t.k = p.k), p.id) FROM p
+----
+["c", "b", "a", "a"]
+
+# ORDER BY on a scalar function is 42809.
+statement error 42809
+SELECT abs(x ORDER BY y) FROM t
+
+# An in-aggregate ORDER BY on a window call is 0A000 (PostgreSQL does not implement it).
+statement error 0A000
+SELECT jsonb_agg(x ORDER BY y) OVER () FROM t
+
+# An ORDER BY inside the parentheses AND a WITHIN GROUP is 42601.
+statement error 42601
+SELECT percentile_disc(0.5 ORDER BY x) WITHIN GROUP (ORDER BY x) FROM t
+
+# With DISTINCT every ORDER BY key must be an argument.
+statement error 42P10
+SELECT jsonb_agg(DISTINCT x ORDER BY y) FROM t
+
+statement error 42P10
+SELECT jsonb_agg(DISTINCT x ORDER BY x + 0) FROM t
+
+# json has no ordering operator (and no equality for DISTINCT); jsonb has both.
+statement error 42883
+SELECT jsonb_agg(x ORDER BY to_json(y)) FROM t
+
+statement error 42883
+SELECT count(DISTINCT to_json(x)) FROM t
+
+query T nosort
+SELECT jsonb_agg(DISTINCT to_jsonb(x) ORDER BY to_jsonb(x)) FROM t
+----
+[10, 20, 30, 40, null]
+
+# An aggregate or a window function inside a key is 42803.
+statement error 42803
+SELECT jsonb_agg(x ORDER BY sum(y)) FROM t
+
+statement error 42803
+SELECT jsonb_agg(x ORDER BY row_number() OVER ()) FROM t
+
+# ORDER BY needs an argument before it, and count(*) takes none.
+statement error 42601
+SELECT jsonb_agg(ORDER BY x) FROM t
+
+statement error 42601
+SELECT count(* ORDER BY x) FROM t

@@ -969,12 +969,23 @@ impl Engine {
                             Some(op) => op.eval(row, &env, meter)?,
                             None => Value::Null, // COUNT(*) ignores the value
                         };
-                        // DISTINCT: skip a NULL (never folded by any aggregate) and any value already
-                        // folded into this group — the FIRST occurrence in scan order wins, so the set
-                        // of folded values (and the decimal_work fold charges) is order-deterministic
-                        // and cross-core identical. `insert` returns false when the value is a repeat.
+                        // An in-aggregate ORDER BY's keys are evaluated per passing row, after the
+                        // argument and before the DISTINCT check (aggregates.md §22).
+                        let tuple = match &spec.order {
+                            Some(order) => {
+                                Some(agg_order_tuple(order, v.clone(), row, &env, meter)?)
+                            }
+                            None => None,
+                        };
+                        // DISTINCT: skip any value already folded into this group — the FIRST
+                        // occurrence in scan order wins, so the set of folded values (and the
+                        // decimal_work fold charges) is order-deterministic and cross-core identical.
+                        // `insert` returns false when the value is a repeat. A NULL is skipped too,
+                        // except by the JSON array aggregates, which fold it (aggregates.md §5).
                         if let Some(seen) = &mut groups[gi].2[si] {
-                            if matches!(v, Value::Null) || !seen.insert(v.clone()) {
+                            if (matches!(v, Value::Null) && !spec.plan.distinct_keeps_null())
+                                || !seen.insert(v.clone())
+                            {
                                 continue;
                             }
                             if meter.query_memory_active() {
@@ -983,6 +994,19 @@ impl Engine {
                                 groups[gi].3 += bytes;
                             }
                         }
+                        // An ordered aggregate buffers the tuple (its retention charged like the
+                        // hypothetical-set tuples); the fold runs in key order at finalize.
+                        if let Some(tuple) = tuple {
+                            if meter.query_memory_active() {
+                                let bytes = crate::memsize::row_bytes(&tuple);
+                                meter.reserve_query(bytes)?;
+                                groups[gi].3 += bytes;
+                            }
+                            if let Acc::Ordered { rows } = &mut groups[gi].1[si] {
+                                rows.push(tuple);
+                            }
+                            continue;
+                        }
                         let group = &mut groups[gi];
                         group.1[si].fold_charged(v, meter, &mut group.3)?;
                     }
@@ -990,7 +1014,7 @@ impl Engine {
                 // Build one synthetic row per group of this set: each master grouping column's value
                 // (NULL where this set doesn't group it), then the aggregate results, then each
                 // GROUPING() value (computed from this set's mask — spec/design/aggregates.md §12).
-                for (key, accs, _seen, charge) in groups {
+                for (key, accs, _seen, mut charge) in groups {
                     let mut srow: Vec<Value> = Vec::with_capacity(
                         plan.group_keys.len() + plan.agg_specs.len() + plan.grouping_specs.len(),
                     );
@@ -1030,6 +1054,18 @@ impl Engine {
                                 .map(|a| a.eval(&srow, &env, &mut env.exec.session.scratch_meter()))
                                 .collect::<Result<Vec<Value>>>()?;
                             finalize_hypothetical(*kind, rows, &hyp, &hp.sorts)?
+                        } else if let Acc::Ordered { rows } = acc {
+                            // An in-aggregate ORDER BY (aggregates.md §22): fold the buffered
+                            // arguments in key order into the plan's own accumulator, charging the
+                            // fold (its decimal_work / generated_row and its retention) as usual.
+                            let spec = &plan.agg_specs[si];
+                            let order = spec.order.as_ref().expect("an ordered acc has its order");
+                            let mut inner = Acc::from_spec_unordered(spec);
+                            for v in sort_agg_order_rows(rows, order) {
+                                meter.guard()?;
+                                inner.fold_charged(v, meter, &mut charge)?;
+                            }
+                            inner.finalize()?
                         } else {
                             acc.finalize()?
                         };
@@ -1308,6 +1344,11 @@ impl Engine {
         for s in &mut sp.agg_specs {
             if let Some(op) = &mut s.operand {
                 self.fold_uncorrelated_in_rexpr(op, bound, ctes, cost)?;
+            }
+            if let Some(order) = &mut s.order {
+                for k in &mut order.keys {
+                    self.fold_uncorrelated_in_rexpr(k, bound, ctes, cost)?;
+                }
             }
         }
         for p in &mut sp.projections {

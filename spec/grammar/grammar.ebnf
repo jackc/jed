@@ -1315,8 +1315,15 @@ overlay_expr   ::= "OVERLAY" "(" expr "PLACING" expr "FROM" expr ( "FOR" expr )?
  * the input rows for which cond is TRUE; it binds to the aggregate and precedes any OVER. FILTER is
  * not reserved but is always the modifier right after the call's ")". FILTER on a non-aggregate is
  * 42809, on a window function 0A000, an aggregate inside cond is 42803, a non-boolean cond 42804
- * (the resolver rejects). */
-function_call  ::= identifier "(" "DISTINCT"? ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" within_group_clause? filter_clause? over_clause?
+ * (the resolver rejects).
+ * An in-aggregate ORDER BY (agg_order_clause, ../design/aggregates.md §22) may follow the LAST
+ * argument inside the parens (json_agg(x ORDER BY y DESC)): the order the aggregate folds its input
+ * rows in. It needs at least one regular argument (f(ORDER BY x) and count(* ORDER BY x) are 42601),
+ * and with a within_group_clause it is 42601. Its keys are order_terms, but a bare integer is a
+ * constant key, never an ordinal (PostgreSQL). On a non-aggregate it is 42809, on a window call 0A000,
+ * a json key 42883, under DISTINCT a key that is not an argument 42P10 (the resolver rejects). */
+function_call  ::= identifier "(" "DISTINCT"? ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? agg_order_clause? | variadic_arg agg_order_clause? )? ")" within_group_clause? filter_clause? over_clause?
+agg_order_clause ::= "ORDER" "BY" order_term ( "," order_term )*
 function_arg   ::= ( identifier "=>" )? expr
 variadic_arg   ::= "VARIADIC" expr
 filter_clause  ::= "FILTER" "(" "WHERE" expr ")"

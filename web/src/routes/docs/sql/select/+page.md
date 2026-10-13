@@ -18,6 +18,11 @@ FROM product
 GROUP BY category
 ORDER BY category;`;
 
+	const aggOrder = `SELECT category, jsonb_agg(name ORDER BY price DESC) AS by_price
+FROM product
+GROUP BY category
+ORDER BY category;`;
+
 	const filtered = `SELECT name, price
 FROM product
 WHERE price > 4
@@ -205,6 +210,9 @@ the first select-list item), each with optional `ASC` / `DESC` and `NULLS FIRST`
 Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
 (`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).
+An aggregate's argument list may end in its own `ORDER BY` — the order it folds its input in — which
+is what fixes the element order of `jsonb_agg` / `json_agg` and the last-wins key of
+`jsonb_object_agg` (`jsonb_agg(name ORDER BY price DESC)`, `jsonb_object_agg(k, v ORDER BY ts)`).
 `GROUP BY` also takes `GROUPING SETS`, `ROLLUP`, and `CUBE` to compute several groupings at once,
 with the `GROUPING(col)` function to tell subtotal rows apart, and groups by an output column,
 a select-list position (`GROUP BY 1`), or any expression (`GROUP BY a + b`), not just a column.
@@ -224,6 +232,10 @@ quotes (`1 AS year`, `1 "year"`); the full list is in
 Grouping and aggregation:
 
 <LiveSql demo="grouped" {seed} query={grouped} rows={6} />
+
+An aggregate that collects its group in a chosen order — each category's products, priciest first:
+
+<LiveSql demo="aggOrder" {seed} query={aggOrder} rows={3} />
 
 `AND` and `OR` evaluate their operands **left to right and stop early**: a `FALSE` left operand
 decides `AND` and a `TRUE` one decides `OR`, so the right operand is never evaluated. A guard

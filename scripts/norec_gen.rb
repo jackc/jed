@@ -107,6 +107,11 @@
 #              aggregates, a never-pushed non-partition column, a grouped window body, single-reference
 #              CTEs (joined, chained, grouped, windowed, NULL-extended) and a two-reference
 #              (materialized) CTE must match by-construction rows.
+#   agg_order — an in-aggregate ORDER BY (aggregates.md §22) folds its input in key order; the same
+#              aggregate WITHOUT the clause over a derived table ordered by the same keys folds in that
+#              (input) order. Whole-table and grouped jsonb_agg, every direction / NULL placement, a
+#              FILTER, a DISTINCT, and jsonb_object_agg's last-wins duplicate key must all match
+#              by-construction rows (the buffered sort, its spill, and the plain fold agree).
 #   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
 #              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
 #              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
@@ -290,6 +295,11 @@ HASH_JOIN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_
                    query.join_inner query.join_left query.qualified_column query.order_by
                    query.order_by_keys query.hash_join expr.arithmetic types.i32
                    null.three_valued].freeze
+AGG_ORDER_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                   query.order_by query.order_by_keys query.group_by query.derived_table
+                   query.aggregates query.aggregate_distinct query.aggregate_filter
+                   query.aggregate_order_by expr.comparison_value types.i32 types.jsonb
+                   func.json_agg func.json_object_agg].freeze
 DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                         dml.insert_multi_row query.select query.distinct query.order_by
                         query.order_by_keys query.limit query.offset query.order_by_pk_scan
@@ -1749,6 +1759,86 @@ def gen_distinct_order(seed)
     out << "# SELECT DISTINCT a ORDER BY a #{clause.empty? ? '(full)' : clause}"
     q(out, "I", "SELECT DISTINCT a FROM t ORDER BY a #{clause}".strip, flat.call(exp))
   end
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: in-aggregate ORDER BY vs an ordered derived-table input --------------------------
+def gen_agg_order(seed)
+  rng = Random.new(seed)
+  ids = (1..60).to_a.sample(rng.rand(10..16), random: rng).sort
+  # k repeats and is sometimes NULL (ties break on id); v is sometimes NULL; g is a small group key.
+  rows = ids.map do |id|
+    [id, rng.rand(1..3), rng.rand(5).zero? ? nil : rng.rand(1..6), rng.rand(6).zero? ? nil : rng.rand(-20..20)]
+  end
+  render = ->(x) { x.nil? ? "null" : x.to_s }
+  arr = ->(xs) { xs.empty? ? "NULL" : "[#{xs.map(&render).join(', ')}]" }
+  # One sort key: [value, descending, nulls_first] — PostgreSQL's default NULL placement (last for ASC,
+  # first for DESC) unless overridden.
+  key_cmp = lambda do |a, b, desc, nulls_first|
+    return 0 if a.nil? && b.nil?
+    return nulls_first ? -1 : 1 if a.nil?
+    return nulls_first ? 1 : -1 if b.nil?
+
+    desc ? b <=> a : a <=> b
+  end
+  # sort rows by [(column index, desc, nulls_first)...] then id ASC (a total order)
+  sorted = lambda do |rs, keys|
+    rs.sort do |x, y|
+      c = 0
+      keys.each do |col, desc, nf|
+        c = key_cmp.call(x[col], y[col], desc, nf.nil? ? desc : nf)
+        break if c != 0
+      end
+      c.zero? ? x[0] <=> y[0] : c
+    end
+  end
+  spell = ->(keys) { keys.map { |col, desc, nf| "#{%w[id g k v][col]}#{desc ? ' DESC' : ''}#{nf.nil? ? '' : (nf ? ' NULLS FIRST' : ' NULLS LAST')}" }.join(', ') + ', id' }
+  pair = lambda do |out, coltypes, ordered, derived, exp|
+    q(out, coltypes, ordered, exp)
+    q(out, coltypes, derived, exp)
+  end
+
+  out = header(seed, AGG_ORDER_REQ, "in-aggregate ORDER BY vs an ordered derived-table input")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, g i32, k i32, v i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |r| "(#{r.map { |x| x.nil? ? 'NULL' : x }.join(', ')})" }.join(', ')}")
+
+  orders = [[[2, false, nil]], [[2, true, nil]], [[2, false, true]], [[2, true, false]], [[3, true, nil], [2, false, nil]]]
+  orders.each do |keys|
+    o = spell.call(keys)
+    exp = [arr.call(sorted.call(rows, keys).map { |r| r[3] })]
+    out << "# whole-table jsonb_agg ORDER BY #{o}"
+    pair.call(out, "T", "SELECT jsonb_agg(v ORDER BY #{o}) FROM t",
+              "SELECT jsonb_agg(v) FROM (SELECT v FROM t ORDER BY #{o}) s", exp)
+  end
+
+  keys = orders.sample(random: rng)
+  o = spell.call(keys)
+  gexp = rows.map { |r| r[1] }.uniq.sort.flat_map do |g|
+    [g.to_s, arr.call(sorted.call(rows.select { |r| r[1] == g }, keys).map { |r| r[3] })]
+  end
+  out << "# grouped jsonb_agg ORDER BY #{o}"
+  pair.call(out, "IT", "SELECT g, jsonb_agg(v ORDER BY #{o}) FROM t GROUP BY g ORDER BY g",
+            "SELECT g, jsonb_agg(v) FROM (SELECT g, v FROM t ORDER BY #{o}) s GROUP BY g ORDER BY g", gexp)
+
+  cut = rng.rand(-10..10)
+  fexp = [arr.call(sorted.call(rows.select { |r| !r[3].nil? && r[3] > cut }, keys).map { |r| r[3] })]
+  out << "# FILTER composes with the ordering"
+  pair.call(out, "T", "SELECT jsonb_agg(v ORDER BY #{o}) FILTER (WHERE v > #{cut}) FROM t",
+            "SELECT jsonb_agg(v) FILTER (WHERE v > #{cut}) FROM (SELECT v, k, id FROM t ORDER BY #{o}) s", fexp)
+
+  ks = rows.map { |r| r[2] }.uniq
+  dexp = [arr.call(ks.compact.sort.reverse.then { |xs| ks.include?(nil) ? [nil] + xs : xs })]
+  out << "# DISTINCT keeps one NULL and folds the distinct values in key order"
+  pair.call(out, "T", "SELECT jsonb_agg(DISTINCT k ORDER BY k DESC) FROM t",
+            "SELECT jsonb_agg(k) FROM (SELECT DISTINCT k FROM t ORDER BY k DESC) s", dexp)
+
+  last = {}
+  sorted.call(rows, keys).each { |r| last[r[1]] = r[3] }
+  oexp = ["{#{last.keys.sort.map { |g| "\"#{g}\": #{render.call(last[g])}" }.join(', ')}}"]
+  out << "# jsonb_object_agg: a repeated key keeps the value LAST in key order"
+  pair.call(out, "T", "SELECT jsonb_object_agg(g, v ORDER BY #{o}) FROM t",
+            "SELECT jsonb_object_agg(g, v) FROM (SELECT g, v FROM t ORDER BY #{o}) s", oexp)
 
   out.join("\n") + "\n"
 end
@@ -3471,6 +3561,7 @@ SCENARIOS = {
   "hash_join" => method(:gen_hash_join),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
+  "agg_order" => method(:gen_agg_order),
   "join_order" => method(:gen_join_order),
   "join_inl_topn" => method(:gen_join_inl_topn),
   "gin_inl" => method(:gen_gin_inl),

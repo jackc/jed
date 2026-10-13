@@ -177,8 +177,12 @@ share **one duplicate-key kernel** (§6.2).
 | `json_object_agg_unique` / `jsonb_object_agg_unique` | k, v | `json`/`jsonb` | `22030` on duplicate key (shared kernel §6.2) |
 | `json_object_agg_unique_strict` / `jsonb_object_agg_unique_strict` | k, v | | both unique + strict |
 
-`json_object_agg` with a NULL key → `22030`/`23502`-class per PG; ordering inside the
-aggregate follows any `ORDER BY` in the aggregate call (the existing ordered-aggregate path).
+`json_object_agg` with a NULL key → `22023` (*"field name must not be null"*, PG); ordering inside the
+aggregate follows any `ORDER BY` in the aggregate call (`jsonb_agg(x ORDER BY y)`,
+`jsonb_object_agg(k, v ORDER BY ts)` — the generic in-aggregate `ORDER BY`, [aggregates.md](aggregates.md)
+§22), so `jsonb_object_agg`'s last-wins duplicate key is the last in key order. `DISTINCT` and `FILTER`
+apply as for any aggregate (the object aggregates de-duplicate the `(key, value)` pair; a `json`
+argument under `DISTINCT` is `42883`).
 
 ---
 

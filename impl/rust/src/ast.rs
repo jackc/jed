@@ -1470,6 +1470,13 @@ pub enum Expr {
         /// the whole list so the resolver can reject a second key, 42883). `None` for every ordinary
         /// call. Boxed so a plain call does not grow `Expr`.
         within_group: Option<Box<Vec<OrderKey>>>,
+        /// `Some(order_keys)` when the argument list ends in an **in-aggregate `ORDER BY`**
+        /// (`json_agg(x ORDER BY y DESC)` — spec/design/aggregates.md §22, grammar.md §17): the
+        /// order the aggregate's input rows are folded in. General-expression keys with the ordinary
+        /// `ASC`/`DESC` / `NULLS FIRST|LAST` / `COLLATE` suffix; a bare integer is a constant, not an
+        /// ordinal (PostgreSQL). `None` for every other call. Boxed so a plain call does not grow
+        /// `Expr`.
+        agg_order: Option<Box<Vec<OrderKey>>>,
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`
     /// plans it once against the scope chain; an uncorrelated one is then folded to a constant,

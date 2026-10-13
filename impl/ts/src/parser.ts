@@ -4779,6 +4779,11 @@ class Parser {
     let star = false;
     let anyNamed = false;
     let variadic = false;
+    // A trailing in-aggregate ORDER BY after the last argument (`json_agg(x ORDER BY y)` —
+    // aggregates.md §22): parsed with allowOrdinal OFF, so a bare integer is a constant key
+    // (PostgreSQL), and it ends the argument list. The resolver rejects it on a non-aggregate (42809)
+    // or a window call (0A000).
+    let aggOrder: OrderKey[] | null = null;
     if (this.peek().kind === "star") {
       this.advance();
       star = true;
@@ -4794,6 +4799,10 @@ class Parser {
           variadic = true;
           args.push(this.parseExpr());
           names.push(null);
+          if (this.peekKeyword() === "order") {
+            aggOrder = this.parseOrderBy(false);
+            break;
+          }
           // A VARIADIC argument must be the last (PostgreSQL, 42601).
           if (this.peek().kind === "comma") {
             throw engineError("syntax_error", "VARIADIC argument must be the last argument");
@@ -4837,6 +4846,10 @@ class Parser {
         ) {
           return this.parseOverlayTail(name, args[0]!);
         }
+        if (this.peekKeyword() === "order") {
+          aggOrder = this.parseOrderBy(false);
+          break;
+        }
         if (this.peek().kind !== "comma") break;
         this.advance();
       }
@@ -4852,6 +4865,11 @@ class Parser {
     // PostgreSQL; the resolver enforces exactly one key (42883) and the per-name rules.
     let withinGroup: OrderKey[] | null = null;
     if (this.peekKeyword() === "within") {
+      // The in-aggregate ORDER BY and WITHIN GROUP both order the aggregated input; PostgreSQL
+      // rejects the pair in its grammar (42601).
+      if (aggOrder !== null) {
+        throw engineError("syntax_error", "cannot use multiple ORDER BY clauses with WITHIN GROUP");
+      }
       this.advance();
       this.expectKeyword("group");
       this.expect("lparen");
@@ -4902,6 +4920,8 @@ class Parser {
           over: null,
           overName,
           withinGroup,
+          // Present only when written, so an ordinary call's AST shape is unchanged.
+          ...(aggOrder !== null ? { aggOrder } : {}),
         };
       }
       this.expect("lparen");
@@ -4922,6 +4942,7 @@ class Parser {
       over,
       overName,
       withinGroup,
+      ...(aggOrder !== null ? { aggOrder } : {}),
     };
   }
 

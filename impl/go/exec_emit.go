@@ -1166,12 +1166,21 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							return emitter{}, verr
 						}
 					}
-					// DISTINCT: skip a NULL (never folded by any aggregate) and any value already
-					// folded into this group — the FIRST occurrence in scan order wins, so the set of
-					// folded values (and the decimal_work fold charges) is order-deterministic and
-					// cross-core identical.
+					// An in-aggregate ORDER BY's keys are evaluated per passing row, after the argument
+					// and before the DISTINCT check (aggregates.md §22).
+					var tuple []Value
+					if spec.order != nil {
+						var terr error
+						if tuple, terr = aggOrderTuple(spec.order, v, row, env, meter); terr != nil {
+							return emitter{}, terr
+						}
+					}
+					// DISTINCT: skip any value already folded into this group — the FIRST occurrence in
+					// scan order wins, so the set of folded values (and the decimal_work fold charges) is
+					// order-deterministic and cross-core identical. A NULL is skipped too, except by the
+					// JSON array aggregates, which fold it (aggregates.md §5).
 					if seen := groups[gi].seen[i]; seen != nil {
-						if v.IsNull() {
+						if v.IsNull() && !spec.plan.distinctKeepsNull() {
 							continue
 						}
 						dk := distinctRowKey([]Value{v})
@@ -1187,6 +1196,20 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							groups[gi].charge += bytes
 						}
 					}
+					// An ordered aggregate buffers the tuple (its retention charged like the
+					// hypothetical-set tuples); the fold runs in key order at finalize.
+					if tuple != nil {
+						if meter.queryMemoryActive() {
+							bytes := memRowBytes(tuple)
+							if err := meter.reserveQuery(bytes); err != nil {
+								return emitter{}, err
+							}
+							groups[gi].charge += bytes
+						}
+						a := groups[gi].accs[i]
+						a.ordRows = append(a.ordRows, tuple)
+						continue
+					}
 					if ferr := groups[gi].accs[i].foldCharged(v, meter, &groups[gi].charge); ferr != nil {
 						return emitter{}, ferr
 					}
@@ -1195,7 +1218,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// Build one synthetic row per group of this set: each master grouping column's value (NULL
 			// where this set doesn't group it), then the aggregate results, then each GROUPING() value
 			// (computed from this set's mask — spec/design/aggregates.md §12).
-			for _, g := range groups {
+			for gi := range groups {
+				g := &groups[gi]
 				srow := make([]Value, 0, len(plan.groupKeys)+len(plan.aggSpecs)+len(plan.groupingSpecs))
 				for _, src := range gset.slotSrc {
 					if src < 0 {
@@ -1235,6 +1259,22 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						}
 						srow = append(srow, v)
 						continue
+					}
+					// An in-aggregate ORDER BY (aggregates.md §22): fold the buffered arguments in key
+					// order into the plan's own accumulator, charging the fold (its decimal_work /
+					// generated_row and its retention) as usual.
+					if a.ordered {
+						spec := plan.aggSpecs[si]
+						inner := newAccFromSpecUnordered(spec)
+						for _, v := range sortAggOrderRows(a.ordRows, spec.order) {
+							if err := meter.Guard(); err != nil {
+								return emitter{}, err
+							}
+							if ferr := inner.foldCharged(v, meter, &g.charge); ferr != nil {
+								return emitter{}, ferr
+							}
+						}
+						a = inner
 					}
 					v, ferr := a.finalize()
 					if ferr != nil {
@@ -1485,6 +1525,13 @@ func (db *engine) foldUncorrelatedInSelectAt(sp *selectPlan, bound []Value, ctes
 				return err
 			}
 		}
+		if o := sp.aggSpecs[i].order; o != nil {
+			for _, k := range o.keys {
+				if err := db.foldUncorrelatedInRExpr(k, bound, ctes, cost); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	for _, p := range sp.projections {
 		if err := db.foldUncorrelatedInRExpr(p, bound, ctes, cost); err != nil {
@@ -1656,6 +1703,13 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 	for i := range sp.aggSpecs {
 		if sp.aggSpecs[i].operand != nil && rexprReferencesOuter(sp.aggSpecs[i].operand, depth) {
 			return true
+		}
+		if o := sp.aggSpecs[i].order; o != nil {
+			for _, k := range o.keys {
+				if rexprReferencesOuter(k, depth) {
+					return true
+				}
+			}
 		}
 	}
 	for _, p := range sp.projections {
@@ -2152,6 +2206,11 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 		collectTouched(sp.having, depth, touched)
 		for i := range sp.aggSpecs {
 			collectTouched(sp.aggSpecs[i].operand, depth, touched)
+			if o := sp.aggSpecs[i].order; o != nil {
+				for _, k := range o.keys {
+					collectTouched(k, depth, touched)
+				}
+			}
 		}
 		for _, p := range sp.projections {
 			collectTouched(p, depth, touched)

@@ -266,7 +266,8 @@ Sequenced so the canonical operator lands first on a frozen budget seam:
   bounded input/intermediate/output spools, external ordering and finite descriptor
   counts. Hash probes retain full-key collision checks and original candidate order.
   Group state preserves global fold order; aggregate DISTINCT membership spills too.
-  Ordered-set and hypothetical collections use scratch and bounded replay/sorting;
+  Ordered-set, hypothetical, and in-aggregate `ORDER BY` collections use scratch and bounded
+  replay/sorting (an ordered aggregate's sorted arguments refold into a fresh collection);
   JSON aggregates assemble their final scalar after replay. Direct scans and their
   cost prepasses stream. The shared forced-spill corpus joins `mise run test`/`mise run ci`;
   `mise run bench:spill` measures wide inputs larger than `work_mem`.

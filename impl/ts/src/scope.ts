@@ -1681,7 +1681,12 @@ export function exprCallsSeqMutator(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall": {
       const n = e.name;
-      return n === "nextval" || n === "setval" || e.args.some(exprCallsSeqMutator);
+      return (
+        n === "nextval" ||
+        n === "setval" ||
+        e.args.some(exprCallsSeqMutator) ||
+        (e.aggOrder ?? []).some((k) => k.expr != null && exprCallsSeqMutator(k.expr))
+      );
     }
     case "column":
     case "qualifiedColumn":
@@ -1961,6 +1966,8 @@ export function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): vo
     case "funcCall":
       req.functions.push(e.name);
       for (const a of e.args) collectExprPrivs(a, req, locals);
+      // An in-aggregate ORDER BY key may call functions / hold a subquery (aggregates.md §22).
+      for (const k of e.aggOrder ?? []) if (k.expr != null) collectExprPrivs(k.expr, req, locals);
       break;
     case "column":
     case "qualifiedColumn":

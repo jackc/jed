@@ -1643,6 +1643,12 @@ type funcCallExpr struct {
 	// Column-only, like the query ORDER BY (the parser keeps the whole list so the resolver can
 	// reject a second key, 42883).
 	WithinGroup []orderKey
+	// AggOrder is the in-aggregate ORDER BY keys when the argument list ends in one
+	// (json_agg(x ORDER BY y DESC) — spec/design/aggregates.md §22, grammar.md §17): the order the
+	// aggregate's input rows are folded in. General-expression keys with the ordinary ASC/DESC /
+	// NULLS FIRST|LAST / COLLATE suffix; a bare integer is a constant, not an ordinal (PostgreSQL).
+	// nil for every other call.
+	AggOrder []orderKey
 }
 
 // InExpr is `Lhs IN (List)` / `Lhs NOT IN (List)` — membership over a non-empty value list

@@ -312,6 +312,11 @@ pub(crate) fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut
                 if let Some(op) = &s.operand {
                     collect_touched(op, depth, touched);
                 }
+                if let Some(order) = &s.order {
+                    for k in &order.keys {
+                        collect_touched(k, depth, touched);
+                    }
+                }
             }
             for p in &sp.projections {
                 collect_touched(p, depth, touched);
@@ -1386,6 +1391,7 @@ pub(crate) fn resolve_aggregate(
     star: bool,
     distinct: bool,
     filter: Option<&Expr>,
+    agg_order: Option<&[OrderKey]>,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
@@ -1404,8 +1410,25 @@ pub(crate) fn resolve_aggregate(
         if star || args.len() != 2 {
             return Err(no_agg_overload(name));
         }
-        let (rk, _kt) = resolve(scope, &args[0], None, &mut sub, params)?;
-        let (rv, _vt) = resolve(scope, &args[1], None, &mut sub, params)?;
+        let (rk, kt) = resolve(scope, &args[0], None, &mut sub, params)?;
+        let (rv, vt) = resolve(scope, &args[1], None, &mut sub, params)?;
+        // DISTINCT de-duplicates the (key, value) pair, so both need an equality (json has none).
+        if distinct {
+            reject_json_distinct(&kt)?;
+            reject_json_distinct(&vt)?;
+        }
+        let order = match agg_order {
+            Some(keys) => Some(resolve_agg_order(
+                scope,
+                keys,
+                distinct,
+                args,
+                &[&rk, &rv],
+                params,
+            )?),
+            None => None,
+        };
+        let filter = resolve_agg_filter(scope, filter, params)?;
         let operand = RExpr::Row(vec![rk, rv]);
         let plan = AggPlan::JsonObjectAgg { json, unique };
         let result = if json {
@@ -1413,10 +1436,10 @@ pub(crate) fn resolve_aggregate(
         } else {
             ResolvedType::Jsonb
         };
-        // object_agg never carries DISTINCT/FILTER (the 2-arg key/value shape predates them and the
-        // surface does not wire them — B4); both default off, matching Go's zero-valued aggSpec. It
-        // collects into `Collect` or `GroupedWindow` (a grouped query that also windows), exactly like
-        // any aggregate (spec/design/window.md §5.1).
+        // The key/value pair travels as one Row operand; DISTINCT dedups that pair, FILTER and the
+        // in-aggregate ORDER BY apply as for any aggregate. It collects into `Collect` or
+        // `GroupedWindow` (a grouped query that also windows), exactly like any aggregate
+        // (spec/design/window.md §5.1).
         return match agg {
             AggCtx::Collect {
                 group_keys, specs, ..
@@ -1425,10 +1448,11 @@ pub(crate) fn resolve_aggregate(
                 specs.push(AggSpec {
                     plan,
                     operand: Some(operand),
-                    distinct: false,
-                    filter: None,
+                    distinct,
+                    filter,
                     osa: None,
                     hypo: None,
+                    order,
                     collation: None,
                 });
                 Ok((RExpr::Column(slot), result))
@@ -1442,10 +1466,11 @@ pub(crate) fn resolve_aggregate(
                 agg_specs.push(AggSpec {
                     plan,
                     operand: Some(operand),
-                    distinct: false,
-                    filter: None,
+                    distinct,
+                    filter,
                     osa: None,
                     hypo: None,
+                    order,
                     collation: None,
                 });
                 Ok((RExpr::Column(slot), result))
@@ -1482,29 +1507,27 @@ pub(crate) fn resolve_aggregate(
         let (r, t) = resolve(scope, arg, None, &mut sub, params)?;
         let desc = lookup_aggregate_overload(name, &t).ok_or_else(|| no_agg_overload(name))?;
         let (plan, result) = aggregate_plan(name, desc.result, &t);
+        if distinct {
+            reject_json_distinct(&t)?;
+        }
         (plan, Some(r), result)
+    };
+    // The in-aggregate ORDER BY (aggregates.md §22) — resolved after the overload, like PG.
+    let order = match agg_order {
+        Some(keys) => {
+            let arg_nodes: Vec<&RExpr> = operand.iter().collect();
+            Some(resolve_agg_order(
+                scope, keys, distinct, args, &arg_nodes, params,
+            )?)
+        }
+        None => None,
     };
     let collation = minmax_collation(scope, plan, args, &result)?;
     // FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
     // FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A
     // non-boolean condition (or an untyped NULL, always unknown → folds no row) is 42804. The
     // fold loop evaluates this per row and folds only the rows for which it is TRUE.
-    let rfilter = match filter {
-        Some(f) => {
-            let mut fsub = AggCtx::Forbidden;
-            let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
-            match ft {
-                ResolvedType::Bool | ResolvedType::Null => Some(rf),
-                _ => {
-                    return Err(EngineError::new(
-                        SqlState::DatatypeMismatch,
-                        "argument of FILTER must be type boolean",
-                    ));
-                }
-            }
-        }
-        None => None,
-    };
+    let rfilter = resolve_agg_filter(scope, filter, params)?;
     // Aggregate results follow the group-key values in the synthetic row. A grouped+window query
     // (`GroupedWindow`) collects into the SAME `agg_specs` (its window results are slotted after
     // every aggregate — spec/design/window.md §5.1).
@@ -1520,6 +1543,7 @@ pub(crate) fn resolve_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: None,
+                order,
                 collation: collation.clone(),
             });
             Ok((RExpr::Column(slot), result))
@@ -1537,12 +1561,146 @@ pub(crate) fn resolve_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: None,
+                order,
                 collation: collation.clone(),
             });
             Ok((RExpr::Column(slot), result))
         }
         _ => unreachable!("an aggregate in a non-collecting context is handled above"),
     }
+}
+
+/// DISTINCT de-duplicates an aggregate's argument by equality, and `json` has none (PG ships no
+/// equality opclass — json.md §5): a DISTINCT aggregate over a json argument is 42883, the same
+/// rule `SELECT DISTINCT` applies to a json output column.
+pub(crate) fn reject_json_distinct(t: &ResolvedType) -> Result<()> {
+    if matches!(t, ResolvedType::Json) {
+        return Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            "could not identify an equality operator for type json",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve an aggregate's `FILTER (WHERE cond)` (aggregates.md §11): a per-row predicate over the
+/// input row with aggregates FORBIDDEN (an aggregate inside FILTER is 42803); a non-boolean
+/// condition (an untyped NULL is allowed — always unknown, folds no row) is 42804.
+pub(crate) fn resolve_agg_filter(
+    scope: &Scope,
+    filter: Option<&Expr>,
+    params: &mut ParamTypes,
+) -> Result<Option<RExpr>> {
+    let Some(f) = filter else { return Ok(None) };
+    let mut fsub = AggCtx::Forbidden;
+    let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
+    match ft {
+        ResolvedType::Bool | ResolvedType::Null => Ok(Some(rf)),
+        _ => Err(EngineError::new(
+            SqlState::DatatypeMismatch,
+            "argument of FILTER must be type boolean",
+        )),
+    }
+}
+
+/// The expression an aggregate sort key orders by: its general expression, or the (qualified)
+/// column reference a column key names.
+pub(crate) fn agg_sort_key_expr(key: &OrderKey) -> Expr {
+    match &key.expr {
+        Some(e) => e.clone(),
+        None => match &key.qualifier {
+            Some(q) => Expr::QualifiedColumn {
+                qualifier: q.clone(),
+                name: key.column.clone(),
+                pos: key.pos,
+            },
+            None => Expr::Column(key.column.clone(), key.pos),
+        },
+    }
+}
+
+/// Resolve one aggregate sort key — a `WITHIN GROUP` key of a hypothetical-set aggregate
+/// (aggregates.md §19) or an in-aggregate `ORDER BY` key (§22) — against the input row, aggregates
+/// forbidden (a nested aggregate is 42803). Returns the per-row key expression, its type, and its
+/// sort spec: direction, NULL placement, and collation (an explicit COLLATE — text only, else 42804
+/// — or the key's derived collation, §13).
+pub(crate) fn resolve_agg_sort_key(
+    scope: &Scope,
+    key: &OrderKey,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType, KeySort)> {
+    let mut sub = AggCtx::Forbidden;
+    let (knode, ktype) = resolve(scope, &agg_sort_key_expr(key), None, &mut sub, params)?;
+    let collation: Option<std::sync::Arc<Collation>> = match &key.collation {
+        Some(cn) => {
+            if !ktype.collatable() {
+                return Err(type_error(format!(
+                    "collations are not supported by type {}",
+                    ktype.type_name()
+                )));
+            }
+            resolve_collation_name(scope.catalog, cn)?
+        }
+        None if ktype.collatable() => {
+            sort_target_collation(scope.catalog, order_key_deriv(scope, key)?)?
+        }
+        None => None,
+    };
+    let sort = KeySort {
+        desc: key.descending,
+        nulls_first: key.nulls_first,
+        collation,
+    };
+    Ok((knode, ktype, sort))
+}
+
+/// Resolve an in-aggregate `ORDER BY` (`json_agg(x ORDER BY y DESC)` — aggregates.md §22): each key
+/// is evaluated per passing input row and the group's rows are folded in key order. A `json` key is
+/// 42883 (no ordering operator, like the query ORDER BY). With DISTINCT every key must be one of the
+/// aggregate's arguments — structurally (the AST, positions ignored) or as the same input column —
+/// else 42P10, PostgreSQL's rule (the sort then never splits a de-duplicated value).
+pub(crate) fn resolve_agg_order(
+    scope: &Scope,
+    keys: &[OrderKey],
+    distinct: bool,
+    args: &[Expr],
+    arg_nodes: &[&RExpr],
+    params: &mut ParamTypes,
+) -> Result<AggOrder> {
+    let mut rkeys = Vec::with_capacity(keys.len());
+    let mut sorts = Vec::with_capacity(keys.len());
+    for key in keys {
+        // Like an argument, a key may not contain a window function (PG 42803 — window.md §7).
+        if key.expr.as_ref().is_some_and(expr_has_window) {
+            return Err(EngineError::new(
+                SqlState::GroupingError,
+                "aggregate function calls cannot contain window function calls",
+            ));
+        }
+        let (knode, ktype, sort) = resolve_agg_sort_key(scope, key, params)?;
+        if matches!(ktype, ResolvedType::Json) {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                "could not identify an ordering operator for type json",
+            ));
+        }
+        if distinct {
+            let kexpr = agg_sort_key_expr(key);
+            let same_column = |a: &&RExpr| match (a, &knode) {
+                (RExpr::Column(i), RExpr::Column(j)) => i == j,
+                _ => false,
+            };
+            if !args.iter().any(|a| *a == kexpr) && !arg_nodes.iter().any(same_column) {
+                return Err(EngineError::new(
+                    SqlState::InvalidColumnReference,
+                    "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+                ));
+            }
+        }
+        rkeys.push(knode);
+        sorts.push(sort);
+    }
+    Ok(AggOrder { keys: rkeys, sorts })
 }
 
 /// The comparison collation of a text / text[] `MIN`/`MAX` (spec/design/collation.md §1 "Aggregates and
@@ -1715,6 +1873,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
                 filter: rfilter,
                 osa: Some(osa),
                 hypo: None,
+                order: None,
                 collation: None,
             });
             Ok((RExpr::Column(slot), result))
@@ -1732,6 +1891,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
                 filter: rfilter,
                 osa: Some(osa),
                 hypo: None,
+                order: None,
                 collation: None,
             });
             Ok((RExpr::Column(slot), result))
@@ -1792,38 +1952,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
     let mut sorts: Vec<KeySort> = Vec::with_capacity(keys.len());
     let mut arg_nodes: Vec<RExpr> = Vec::with_capacity(args.len());
     for (key, arg) in keys.iter().zip(args.iter()) {
-        // A nested aggregate in the key is 42803.
-        let mut sub = AggCtx::Forbidden;
-        let (knode, ktype) = match &key.expr {
-            Some(e) => resolve(scope, e, None, &mut sub, params)?,
-            None => {
-                let key_expr = match &key.qualifier {
-                    Some(q) => Expr::QualifiedColumn {
-                        qualifier: q.clone(),
-                        name: key.column.clone(),
-                        pos: key.pos,
-                    },
-                    None => Expr::Column(key.column.clone(), key.pos),
-                };
-                resolve(scope, &key_expr, None, &mut sub, params)?
-            }
-        };
-        // The key's collation (explicit COLLATE — text only — or a column's frozen collation), §13.
-        let collation: Option<std::sync::Arc<Collation>> = match &key.collation {
-            Some(cn) => {
-                if !ktype.collatable() {
-                    return Err(type_error(format!(
-                        "collations are not supported by type {}",
-                        ktype.type_name()
-                    )));
-                }
-                resolve_collation_name(scope.catalog, cn)?
-            }
-            None if ktype.collatable() => {
-                sort_target_collation(scope.catalog, order_key_deriv(scope, key)?)?
-            }
-            None => None,
-        };
+        let (knode, ktype, sort) = resolve_agg_sort_key(scope, key, params)?;
         // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
         // key's scalar type via the hint. Its type must match the key's family (else 42883).
         let hint = match type_from_resolved(&ktype) {
@@ -1835,26 +1964,12 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
             return Err(no_agg_overload(&lname));
         }
         key_nodes.push(knode);
-        sorts.push(KeySort {
-            desc: key.descending,
-            nulls_first: key.nulls_first,
-            collation,
-        });
+        sorts.push(sort);
         arg_nodes.push(anode);
     }
 
     // FILTER (WHERE cond): per-input-row predicate (aggregates forbidden); restricts buffered rows.
-    let rfilter = match filter {
-        Some(f) => {
-            let mut fsub = AggCtx::Forbidden;
-            let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
-            match ft {
-                ResolvedType::Bool | ResolvedType::Null => Some(rf),
-                _ => return Err(type_error("argument of FILTER must be type boolean")),
-            }
-        }
-        None => None,
-    };
+    let rfilter = resolve_agg_filter(scope, filter, params)?;
 
     let (plan, result) = match lname.as_str() {
         "rank" => (AggPlan::HypoRank, ResolvedType::Int(ScalarType::Int64)),
@@ -1886,6 +2001,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: Some(hypo),
+                order: None,
                 collation: None,
             });
             Ok((RExpr::Column(slot), result))
@@ -1903,6 +2019,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: Some(hypo),
+                order: None,
                 collation: None,
             });
             Ok((RExpr::Column(slot), result))
