@@ -450,6 +450,42 @@ ext4 file-growth metadata journaling — `insert_commit_durable` fell ~9 ms → 
 three cores. This changes only fsync *timing/flavor*, never the commit-visibility boundary, and is
 byte- and cost-neutral (the slack is trailing zeros past the high-water).
 
+**What "durable" means per platform — and why jed is slower than SQLite/PostgreSQL on macOS.** A
+committed write passes three layers: the OS page cache, the drive's volatile write cache, and stable
+media. `synchronous=on` promises the commit is on **stable media** before it returns, so it survives
+a sudden **power loss**, not just a process or OS crash. Each platform's flush meets that differently:
+
+- **Linux** (ext4/xfs, default barriers): `fsync`/`fdatasync` write the OS cache *and* issue a
+  drive cache flush. Ordinary `fsync` is the full guarantee, so jed, SQLite (`synchronous=FULL`),
+  and PostgreSQL (default `wal_sync_method = fdatasync`) are equally durable there.
+- **macOS / Apple platforms:** ordinary `fsync`/`fdatasync` only hand the data to the drive. It may
+  sit in the drive's volatile cache and reach media **in a different order** from how it was written.
+  Only `fcntl(F_FULLFSYNC)` drains that cache. Every jed core's durable flush on Apple targets
+  is `F_FULLFSYNC` (Go `File.Sync`, Rust `sync_data`/`sync_all`, libuv `fdatasync`). SQLite's default
+  (`PRAGMA fullfsync = OFF`) and PostgreSQL's default `wal_sync_method` use the ordinary calls.
+  Measured on an Apple M3 Max: ~4 ms per `F_FULLFSYNC` versus 20–60 μs for `fsync`/`fdatasync`
+  ([durable-commit-experiments.md](durable-commit-experiments.md#macos-measurements-2026-10-13)).
+
+The weaker flush matters only if the drive itself loses power before its cache drains. An app crash
+or kernel panic is safe, because the drive stays powered and empties its cache. Under a sudden power
+cut, it can fail in two ways: (1) **lost commits**: transactions reported committed are gone; and
+(2) **corruption**: crash safety depends on write *ordering* (SQLite's journal before its database
+file, jed's body pages before its meta page), and a drive that persists out of order can leave a state
+that was never valid.
+
+Those defaults are reasonable for those projects. SQLite leaves `fullfsync` opt-in, accepting the
+power-loss window on hardware where it is rare (battery-backed laptops and phones). PostgreSQL treats macOS as a
+development platform: production runs on Linux, where its default is fully durable, and its
+reliability docs point macOS users at `wal_sync_method = fsync_writethrough`. **jed does not
+follow them here** (a deliberate divergence from the PG-default rule, CLAUDE.md §1). The overriding
+reason: durability at commit is a core promise of `synchronous=on` (CLAUDE.md §9), and an embedded
+library also runs on battery-less desktop Macs, where the failure is real. A platform-dependent
+weakening would make the same setting mean different things on different hosts. Speed on macOS
+comes from fewer flushes per acknowledged transaction (explicit `BEGIN … COMMIT` batching, or the
+relaxed mode above), never from a weaker flush under `synchronous=on`. Consequently, durable-write
+benchmarks against default SQLite/PostgreSQL on macOS compare different guarantees
+([benchmarks.md](benchmarks.md) §8, *Durability caveats*).
+
 **`skip_fsync` — the built dev/testing knob (distinct from `synchronous=off`).** `synchronous=off`
 above is a *durability-preserving* relaxation (batched/deferred fsync, **never corrupts** — a valid
 older snapshot always remains). Realizing it on a copy-on-write engine is subtle: because the durable

@@ -239,9 +239,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   process/reuse byte parity, and real durable Go benchmarks (1.60–1.65× in the measured Linux cases).
   → [validated COW](spec/design/validated-cow.md),
   [experiment report](spec/design/durable-commit-experiments.md). _(size: L)_
-  - [ ] **macOS measurements** — run the existing pure-Go `F_BARRIERFSYNC`/`F_FULLFSYNC` probe
-    and the production validated-COW benchmarks on Mac hardware; Linux cannot establish Apple
-    hardware durability or latency. Retain the existing full durable-completion guarantee.
+  - [x] **macOS measurements** — Apple M3 Max/APFS: v33 cuts the production durable commit
+    1.72–1.76× (9.0 → 5.2 ms); `F_FULLFSYNC` is ~4 ms and the whole cost. The
+    `F_BARRIERFSYNC` → full variant (4.8 ms) is slower than v33's single drain (4.2 ms), so it
+    is not adopted; the full durable-completion guarantee is unchanged.
+    → [macOS measurements](spec/design/durable-commit-experiments.md#macos-measurements-2026-10-13)
 
 - [x] **Shared multi-process file access** — ✅ **landed** ([locking.md](spec/design/locking.md)). The stable `protocol-v1` bundle, alone fast path, global writer, commit/meta gate, append-only shared commits, foreign-plan invalidation, independently coordinated file attachments, and Rust↔Go↔Node real-process matrix are implemented. The independent TypeScript engine uses the narrow first-party `impl/ts/native-lock` Node-API adapter; the full Rust wrapper remains a workload-dependent reach experiment. `locking = auto` is shared on capable local hosts. Pre-protocol binaries still require a one-time drain. → [locking.md](spec/design/locking.md), [benchmarks.md §7.3](spec/design/benchmarks.md)
   - [ ] **Node prebuilt distribution matrix** — ship no-install-script Node-API-8 artifacts for Linux glibc/musl x64+arm64, macOS x64+arm64, and Windows x64 with SHA-256/provenance and packaging tests. Source/dev builds already use `mise run ts:lock_build`; missing production artifacts fail closed `0A000`.

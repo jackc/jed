@@ -66,8 +66,8 @@ adjacent raw measurements. There is no synthetic-delay result in that dataset.
 
 For macOS, the separate [pure-Go syscall probe](macos_sync_probe/README.md)
 implements the no-format-change barrier/full-sync proposal and the fdatasync
-side investigation. It cross-compiles on Linux; execute it on a Mac for actual
-timings.
+side investigation. Its [Apple M3 Max results](results/macos-probe-apfs-2026-10-13.jsonl)
+are summarized in the [research record](../../spec/design/durable-commit-experiments.md#macos-measurements-2026-10-13).
 
 ## Production validated COW benchmark
 
@@ -115,5 +115,17 @@ Both revisions wrote identical application byte counts in these workloads:
 meta page. Including one growth event per 256-commit sample, flushes fell from
 2.00390625 to 1.00390625 per commit. Larger dirty sets spill manifest records to
 additional pages, so this is not a universal zero-byte-overhead claim. Timings
-are workstation observations, not a macOS measurement or a hardware-independent
-performance guarantee. See the [production design](../../spec/design/validated-cow.md).
+are workstation observations, not a hardware-independent performance guarantee.
+See the [production design](../../spec/design/validated-cow.md).
+
+The same paired comparison on an Apple M3 Max (macOS 27.0.1, internal SSD, APFS,
+Go 1.27.1 darwin/arm64), master `4f1a3b27` against v33 `9c195da1`, six
+order-alternating pairs, is in [production-go-macos-v33.csv](results/production-go-macos-v33.csv):
+
+| Rows updated | Master, two flushes | Validated COW | Speedup |
+| --- | ---: | ---: | ---: |
+| 1 | 8.998 ms | 5.228 ms | 1.72× |
+| 64 | 9.109 ms | 5.185 ms | 1.76× |
+
+Byte and flush counts match the Linux run. Each Darwin flush is `F_FULLFSYNC`
+(~4 ms on this device), so the removed flush is most of the saving.

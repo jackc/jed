@@ -159,7 +159,10 @@ Six paired Linux/ext4 samples against master `4f1a3b27` reduced median end-to-en
 commit latency from 3.677 to 2.292 ms for one-row updates and from 3.880 to 2.349 ms
 for 64-row batches. These inline-manifest workloads wrote identical application
 byte counts; including allocation flushes, barriers fell from 2.004 to 1.004 per
-commit. The checked-in CSV retains every sample. macOS measurement remains pending.
+commit. The checked-in CSV retains every sample. On an Apple M3 Max with APFS, the same
+paired benchmark measured 8.998 → 5.228 ms (1.72×) and 9.109 → 5.185 ms (1.76×); there
+each commit's one remaining `F_FULLFSYNC` costs ~4 ms
+([macOS measurements](durable-commit-experiments.md#macos-measurements-2026-10-13)).
 
 Open-time work is proportional to the selected commit's dirty set, so reopening
 after a large transaction reads more pages than the previous spine-only loader.

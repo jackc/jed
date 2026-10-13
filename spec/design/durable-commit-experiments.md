@@ -39,6 +39,9 @@ First measure **body `F_BARRIERFSYNC` → meta `F_FULLFSYNC` on a Mac**. It is t
 smallest plausible fix: one full drive-cache drain, no redo copies, no format
 change. Apple's ordering contract supports its safety argument, but the Linux
 work here cannot establish its macOS performance or hardware behavior.
+_(Resolved: v33 landed first and already needs only one full drain; the
+[macOS measurements](#macos-measurements-2026-10-13) show the barrier variant is
+slower than v33, so it is not pursued.)_
 
 For a portable one-sync design, **validated COW merits a production design
 slice before adopting a WAL**. It was competitive with these WAL prototypes
@@ -230,15 +233,68 @@ Implemented a standalone pure-Go probe comparing the two full flushes, the
 barrier/full-flush proposal, and explicit unsafe fsync/fdatasync timing controls.
 It preallocates real bytes, checks syscall errors, reports fallback counts and
 latency distributions, and checks final content. Five protocol tests and vet pass
-on Linux; `CGO_ENABLED=0` builds for Darwin arm64 and amd64. **It has not run on
-macOS**, and content readback is not a power-cut test. Instructions and primary
-source details are in the [probe README](../../bench/durability/macos_sync_probe/README.md).
+on Linux; `CGO_ENABLED=0` builds for Darwin arm64 and amd64. It has since run on
+macOS (results below); content readback is still not a power-cut test. Instructions
+and primary source details are in the
+[probe README](../../bench/durability/macos_sync_probe/README.md).
 
 Production would need a distinct ordering operation in the block-host seam:
 silently weakening the existing `sync()` violates its durability contract. The
 Go probe needs no dependency, cgo, or unsafe code. Rust std has no separate barrier
 operation; a production Rust host adapter must resolve that API boundary under
 the repository's dependency/memory-safety policy.
+
+## macOS measurements, 2026-10-13
+
+Machine: Apple M3 Max (16 cores, 48 GiB), macOS 27.0.1 (Darwin 27.0.0), internal
+`APPLE SSD AP1024Z`, APFS on the Data volume (87% full), Go 1.27.1 darwin/arm64,
+`CGO_ENABLED=0`. A desktop workstation with a running VM and light background I/O,
+not an isolated storage lab. Raw data:
+[probe JSONL](../../bench/durability/results/macos-probe-apfs-2026-10-13.jsonl),
+[production CSV](../../bench/durability/results/production-go-macos-v33.csv).
+
+**Probe.** Six repetitions of 500 commits (50 warmup) per mode, rotating mode order,
+seeds varied; the table is the median of the per-run means and p99s. 16 body pages
+gave the same figures within noise. No barrier fell back to a full flush.
+
+| Mode | Mean | p99 | Mean per call |
+| --- | ---: | ---: | --- |
+| `fullsync-fullsync` (pre-v33 recipe) | 8.43 ms | 11.1 ms | full 4.2 ms |
+| `barrier-fullsync` (proposal) | 4.81 ms | 6.9 ms | barrier 0.55 ms, full 4.0 ms |
+| `fullsync` (one drain — v33's shape) | 4.23 ms | 6.0 ms | full 4.2 ms |
+| `fsync` (unsafe control) | 0.02–0.06 ms | — | — |
+| `fdatasync` (unsafe control) | 0.03–0.04 ms | — | — |
+
+`F_FULLFSYNC` costs a near-constant ~4 ms regardless of 4 KiB versus 64 KiB of body;
+it is the commit's entire cost. Ordinary `fsync`/`fdatasync` are ~100–150× cheaper
+because they do not drain the drive cache — the gap is the price of the durability
+contract, not an inefficiency to remove. `F_BARRIERFSYNC` is real and cheap
+(~0.55 ms), but adds to rather than replaces the one remaining drain.
+
+**Production.** `BenchmarkProductionDurableCommit`, 256 commits per sample, six
+order-alternating pairs of v33 (`9c195da1`) against the pre-v33 master `4f1a3b27`.
+Medians per commit:
+
+| Rows updated | Master, two full flushes | v33 validated COW | Speedup |
+| --- | ---: | ---: | ---: |
+| 1 | 8.998 ms | 5.228 ms | 1.72× |
+| 64 | 9.109 ms | 5.185 ms | 1.76× |
+
+Byte and flush counts match the Linux run exactly (41,248 / 42,368 bytes;
+2.004 → 1.004 flushes per commit). The win exceeds Linux's 1.60–1.65× because the
+removed flush is a larger share of the commit on Apple hardware; the remaining
+~1 ms above the probe's single drain is SQL execution, page writes, and checksums.
+
+**Decision.** v33 already has the single-drain shape the barrier proposal aimed
+for, and is ~0.6 ms per commit faster than it, so **`F_BARRIERFSYNC` is not adopted**
+and no ordering operation is added to the block seam. The full durable-completion
+guarantee is unchanged: every acknowledged macOS commit has passed `F_FULLFSYNC`
+(Go `File.Sync`, Rust `sync_data`/`sync_all`, libuv `fdatasync` on Apple targets).
+Further macOS commit-latency gains need fewer drains per acknowledged transaction —
+explicit batching today, group commit or a relaxed `synchronous` setting
+([transactions.md §9](transactions.md)) — not a cheaper primitive. That section also
+records why jed keeps `F_FULLFSYNC` where SQLite's and PostgreSQL's macOS defaults use the
+ordinary calls.
 
 ## Other options and verification boundaries
 

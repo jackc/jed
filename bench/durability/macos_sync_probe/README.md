@@ -2,8 +2,12 @@
 
 This standalone, standard-library-only Go experiment measures the macOS flush
 choices without changing any engine or database format. The implementation and
-protocol tests were built on Linux; **no macOS performance or power-loss result
-has been measured here**. Cross-compilation establishes buildability only.
+protocol tests were built on Linux and first run on an Apple M3 Max on 2026-10-13:
+`F_FULLFSYNC` costs ~4 ms per call, `F_BARRIERFSYNC` ~0.55 ms, and the
+barrier/full proposal (4.8 ms) is slower than the single full flush production v33
+already uses (4.2 ms), so it was not adopted. See the
+[measurements](../../../spec/design/durable-commit-experiments.md#macos-measurements-2026-10-13).
+No power-loss result has been measured.
 
 ## Findings
 

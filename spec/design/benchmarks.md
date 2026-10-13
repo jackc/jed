@@ -1256,7 +1256,14 @@ scratch.
 **Durability caveats.** On devcontainer filesystems (overlayfs / virtio volumes) fsync
 can be artificially cheap or unevenly costly, and PostgreSQL's fsync happens server-side
 on the PG service's own volume while jed/SQLite fsync the local one — durable-commit
-numbers are indicative, compare with care. There is also a standing client/server
+numbers are indicative, compare with care. **On macOS the lane is not like-for-like:**
+every jed durable flush is `F_FULLFSYNC` (Go `File.Sync`, Rust `sync_data`, libuv), which
+drains the drive cache at ~4 ms per call on an M3 Max, while SQLite's documented default
+(`PRAGMA fullfsync=OFF`) and PostgreSQL's default `wal_sync_method` issue ordinary flushes
+measured at 20–60 μs there. These calls leave the drive's volatile cache, so a power loss can lose
+or reorder acknowledged commits. The gap reflects a stronger durability guarantee, not engine
+cost ([transactions.md](transactions.md) §9).
+There is also a standing client/server
 asymmetry: every PG number includes IPC over the Unix socket, which is PG's deployment
 model but not jed's or SQLite's.
 
