@@ -650,9 +650,14 @@ export function coerceStringToComposite(
       nodes.push(valueToRExpr(val));
       fieldTypes.push({ name: f.name, type: resolvedTypeOfCol(f.type, db) });
     } else if (f.type.kind === "range") {
-      // A range field cannot occur: CREATE TYPE rejects a range field (range columns are not
-      // storable yet — R2).
-      throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
+      // A range-typed field: the token is a range text literal, coerced through range_in — the same
+      // path a bare `'[1,5)'::i32range` cast uses.
+      if (f.type.elem.kind !== "scalar") throw new Error("a range element is always a scalar");
+      const desc = rangeForElement(f.type.elem.scalar);
+      if (desc === undefined) throw new Error("a range field's element always has a range type");
+      const { node, type } = coerceStringToRangeExpr(tok, desc, iz);
+      nodes.push(node);
+      fieldTypes.push({ name: f.name, type });
     } else {
       const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal, f.varcharLen, iz);
       nodes.push(node);

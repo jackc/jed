@@ -669,7 +669,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   expression (`uuidv7()`, `1 + 1`) evaluated per row at INSERT through the per-statement seam,
   rather than a constant folded at `CREATE TABLE`, `spec/design/constraints.md` §2),
   **composite (row) types** (`format_version` 9 — kind-tagged catalog entries + a composite-type
-  section + two-pass acyclic load, `spec/design/composite.md`), **array (`T[]`) columns**
+  section + two-pass acyclic load, `spec/design/composite.md`; since v41 a composite field may be
+  range-typed, carrying the one-byte range element descriptor), **array (`T[]`) columns**
   (`format_version` 10 — `type_code 15` + an inline element-type descriptor + the compact array
   value body, `spec/design/array.md`), **`FOREIGN KEY` constraints** (`format_version` 11 — the
   table catalog entry gains a per-table foreign-key list after the index list, referencing the

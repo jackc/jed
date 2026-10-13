@@ -930,6 +930,20 @@ function compositeArrayFieldTableDB(): Engine {
   return db;
 }
 
+// compositeRangeFieldTableDB: a composite type with RANGE-typed fields (v41 — composite.md §3): the
+// catalog composite-type entry carries code-17 range fields (element_type_code 2 = i32, 6 = decimal)
+// and the value body recurses. Row 2 has the empty range and a NULL numrange field; row 3 a NULL
+// i32range field and an unbounded-lower numrange.
+function compositeRangeFieldTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TYPE booking AS (room text, span i32range, amt numrange)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, b booking)");
+  run(db, "INSERT INTO t VALUES (1, ROW('a', '[1,5)', '[1.5,2.25]'))");
+  run(db, "INSERT INTO t VALUES (2, ROW('b', 'empty', NULL))");
+  run(db, "INSERT INTO t VALUES (3, ROW('c', NULL, '(,10)'))");
+  return db;
+}
+
 // nestedCompositeTableDB: nested composite types (a field whose type is another composite, by name)
 // used by a column with a stored nested value (S3). `point` is created first (a referenced type must
 // exist), but the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
@@ -1143,6 +1157,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "gist_exclude_table.jed", build: gistExcludeTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
+    { name: "composite_range_field_table.jed", build: compositeRangeFieldTableDB },
     { name: "json_table.jed", build: jsonTableDB },
     { name: "jsonb_table.jed", build: jsonbTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
@@ -1223,6 +1238,7 @@ test("read goldens reproduces rows", () => {
     { name: "gist_exclude_table.jed", build: gistExcludeTableDB, table: "booking" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
+    { name: "composite_range_field_table.jed", build: compositeRangeFieldTableDB, table: "t" },
     { name: "json_table.jed", build: jsonTableDB, table: "t" },
     { name: "jsonb_table.jed", build: jsonbTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },

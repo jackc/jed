@@ -109,10 +109,16 @@ layout in [../fileformat/format.md](../fileformat/format.md)):
   field — `field_name_len u16` + name, `field_type_code u8`, then (only when the field's code is
   `14`) `field_type_name_len u16` + the referenced composite type's name **or** (only when the
   field's code is `15` — an **array-typed field**, [array.md §12](array.md)) the inline array
-  element-type descriptor (the same descriptor an array column uses, array.md §3), `field_flags u8`
-  (bit 0 = NOT NULL), and (only when the field's code is `6`) the decimal typmod (`precision u16`,
-  `scale u16`). Reuses the existing stable scalar type codes. The array field descriptor sits
-  **before** the flags byte, exactly where a nested-composite name does.
+  element-type descriptor (the same descriptor an array column uses, array.md §3) **or** (only
+  when the field's code is `17` — a **range-typed field**, `format_version` 41) the one-byte range
+  element code (the same descriptor a range column uses, [ranges.md §3](ranges.md)), `field_flags
+  u8` (bit 0 = NOT NULL), and (only when the field's code is `6`) the decimal typmod (`precision
+  u16`, `scale u16`). Reuses the existing stable scalar type codes. The array and range field
+  descriptors sit **before** the flags byte, exactly where a nested-composite name does. A range
+  field takes no typmod — `numrange`'s element is the unconstrained `decimal`, so a type modifier on
+  a range field is `0A000`, as on a range column (PostgreSQL raises `42601`; a per-core test pins
+  it). A range element is always a scalar, so a range field references no other type and adds no
+  edge to the two-pass load's reference graph.
 - **Composite columns reference their type by NAME** — a composite column in a table entry stores
   `type_code = 14` followed by `type_name_len u16` + the composite type's name, occupying the slot
   a decimal column uses for its typmod. By-name (not a numeric id) is the boring, explicit choice
@@ -336,6 +342,18 @@ down). The element may itself be a composite (the doubly-nested `addr[]` field, 
 14` + name). `DROP TYPE` dependency tracking and the two-pass-load existence/acyclicity validation
 look through one array level, so an `addr[]` field (or column) is a `2BP01` dependent of `addr`.
 
+**A composite type with a range-typed field** (`CREATE TYPE booking AS (room text, span int4range)`)
+**landed** (capability `types.composite_range_field`, `suites/types/composite_range_field.test`): the
+composite-type catalog entry gains a `field_type_code = 17` range field carrying the one-byte range
+element code (§3, `format_version` 41 — unlike the array field, which fit an existing v10 shape, a
+range field had no descriptor slot, so its bytes needed the bump). The value codec, comparison,
+`record_out` / `record_in`, and the composite key (§6, recursing into the range-bounds key) recurse
+through the range field: its `record_in` token is a range text literal coerced through `range_in`
+(a discrete subtype canonicalizes to `[)`), and `record_out` quotes `range_out`'s text, nesting a
+`tsrange` bound's own quoting. Any of the six range types may be a field; a range element is
+always a scalar, so `DROP TYPE` dependency tracking and the two-pass load gain nothing to look
+through.
+
 **The array function/operator surface over composite elements** (`array_append`/`array_cat`/`||`,
 `@>`/`<@`/`&&`, `ANY`/`ALL`, the introspectors, the search/edit functions, `num_nulls` VARIADIC) and
 **`unnest(composite[])`** landed (AF7, [array-functions.md §13](array-functions.md), capability
@@ -371,9 +389,7 @@ catalog bytes) and `jed_columns.column_default` is NULL.
 `UPDATE`/`DO UPDATE` (or as a non-literal-field `INSERT … VALUES` slot) is `0A000` — the
 anonymous-record → named-composite assignment coercion; a `$N` parameter as an `UPDATE`/`DO UPDATE`
 composite RHS is `0A000` (the container rule); a non-NULL `DEFAULT` on a composite column is `0A000`;
-a **range-typed field** (`CREATE TYPE r AS (span i32range)`) is `0A000` — the composite-type catalog
-entry has no field descriptor for `field_type_code 17` (format.md *Composite-type entry*), so it needs
-a catalog-format extension; the runtime (non-literal) text→composite
+the runtime (non-literal) text→composite
 cast, the `composite::text` cast, the anonymous `ROW(…)::type` structural cast, and the nested
 `ROW(ROW(…),…)`-into-column constructor (a jed extension PG rejects — covered by unit tests, not the
 PG-oracle corpus) are each `0A000` / jed-only. Composite **value** comparison (`WHERE c = ROW(…)`),

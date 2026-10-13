@@ -1413,6 +1413,19 @@ func coerceStringToComposite(text string, ct *compositeType, catalog *engine, iz
 			}
 			nodes[i] = valueToRExpr(val)
 			fields[i] = compositeRField{name: f.Name, ty: resolvedTypeOfCol(f.Type, snap)}
+		case f.Type.Range != nil:
+			// A range-typed field: the token is a range text literal, coerced through range_in — the
+			// same path a bare `'[1,5)'::i32range` cast uses.
+			desc, ok := rangeForElement(f.Type.Range.Scalar)
+			if !ok {
+				panic("a range field's element always has a range type")
+			}
+			node, ty, err := coerceStringToRangeExpr(*tokens[i], desc, iz)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+			fields[i] = compositeRField{name: f.Name, ty: ty}
 		default:
 			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal, f.VarcharLen, iz)
 			if err != nil {

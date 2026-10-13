@@ -17,7 +17,14 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 40)
+## Version scope (`format_version` 41)
+
+`format_version` **41** — **range-typed composite fields** ([../design/composite.md §3](../design/composite.md)).
+A composite-type entry's field may now carry `field_type_code = 17` (a range), followed by the
+one-byte range element descriptor — the same descriptor a range column uses — before the field
+flags byte (*Composite-type entry* below). A file with no range-typed field changes only by its
+version byte + meta CRC; the new `composite_range_field_table` golden pins the field descriptor and
+the recursive value body. Readers accept only the exact current version.
 
 `format_version` **40** — **foreign-key match type** ([../design/constraints.md §6.3](../design/constraints.md)).
 Bit 6 of each foreign key's `fk_actions` byte is now `match_full` (`1` = `MATCH FULL`, `0` = `MATCH
@@ -955,10 +962,11 @@ A composite-type entry records a `CREATE TYPE name AS (field type, …)` definit
 | per field (×`field_count`): | |
 | &nbsp;&nbsp;`field_name_len` | u16 |
 | &nbsp;&nbsp;`field_name` | UTF-8 (original case) |
-| &nbsp;&nbsp;`field_type_code` | u8 (the *Stable type codes* table; `14` = a nested composite, `15` = an array-typed field) |
+| &nbsp;&nbsp;`field_type_code` | u8 (the *Stable type codes* table; `14` = a nested composite, `15` = an array-typed field, `17` = a range-typed field — **v41**) |
 | &nbsp;&nbsp;`field_type_name_len` | u16 — **only when `field_type_code == 14`** |
 | &nbsp;&nbsp;`field_type_name` | UTF-8 — **only when `field_type_code == 14`**: the referenced composite type's name |
 | &nbsp;&nbsp;`field_element_descriptor` | **only when `field_type_code == 15`**: the array element-type descriptor (a `u8 element_type_code`, then `14` + `u16 name_len` + name for a composite element) — the same descriptor an array *column* uses (the *Each catalog entry* table), one level down |
+| &nbsp;&nbsp;`field_range_element_code` | u8 — **only when `field_type_code == 17`** (**v41**): the range element-type descriptor, one of the six range element codes (`2`, `3`, `6`, `9`, `10`, `16`; any other code is `XX001`) — the same descriptor a range *column* uses. No typmod follows (a `numrange` element is the unconstrained `decimal`) |
 | &nbsp;&nbsp;`field_flags` | u8 — bit0 `not_null` (declared `NOT NULL`); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`precision` | u16 — **only when `field_type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only when `field_type_code == 6` (decimal)** |
@@ -971,7 +979,11 @@ the mirror of an array-of-composite element), carrying the inline element descri
 flags byte (where a nested-composite name sits) so the element type is self-describing. The
 loader's two-pass validation rejects a dangling reference or a definition cycle — including a
 composite reached **through an array field** — as `XX001` (a v10 additive extension; no
-`format_version` bump, since an array element descriptor is already a v10 shape).
+`format_version` bump, since an array element descriptor is already a v10 shape). A field type code
+of `17` (**v41**) is a **range-typed field** (`span i32range`, [../design/composite.md
+§3](../design/composite.md)), carrying the one-byte range element code in the same position; a range
+element is always a scalar, so a range field references no other type and adds no load-order
+dependency.
 
 ### Sequence entry (`entry_kind = 2`, v12; owner added v13)
 

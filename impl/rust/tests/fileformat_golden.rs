@@ -1425,6 +1425,31 @@ fn composite_array_field_table_db() -> Session {
     db
 }
 
+/// A composite type with RANGE-typed fields (v41 — spec/design/composite.md §3): the catalog
+/// composite-type entry carries code-17 range fields (`element_type_code` 2 = i32, 6 = decimal) and
+/// the value body recurses (a composite body whose range fields are range bodies). Row 2 has the
+/// empty range and a NULL numrange field; row 3 a NULL i32range field and an unbounded-lower numrange.
+fn composite_range_field_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TYPE booking AS (room text, span i32range, amt numrange)",
+    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, b booking)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, ROW('a', '[1,5)', '[1.5,2.25]'))",
+    );
+    run(&mut db, "INSERT INTO t VALUES (2, ROW('b', 'empty', NULL))");
+    run(&mut db, "INSERT INTO t VALUES (3, ROW('c', NULL, '(,10)'))");
+    db
+}
+
 /// Nested composite types (a field whose type is another composite, by name) used by a column
 /// with a stored nested value (S3). `point` is created first (a referenced type must exist), but
 /// the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
@@ -1804,6 +1829,10 @@ fn write_matches_goldens() {
             "composite_array_field_table.jed",
             composite_array_field_table_db,
         ),
+        (
+            "composite_range_field_table.jed",
+            composite_range_field_table_db,
+        ),
         ("collation_table.jed", collation_table_db),
         ("collation_pk_table.jed", collation_pk_table_db),
         ("collation_array_table.jed", collation_array_table_db),
@@ -1899,6 +1928,11 @@ fn read_goldens_reproduces_rows() {
         (
             "composite_array_field_table.jed",
             composite_array_field_table_db,
+            "t",
+        ),
+        (
+            "composite_range_field_table.jed",
+            composite_range_field_table_db,
             "t",
         ),
         ("collation_table.jed", collation_table_db, "t"),

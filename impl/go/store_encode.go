@@ -691,8 +691,16 @@ func coerceRecordTextToValue(text string, ct colType, iz *inputZone) (Value, err
 		case f.Type.Elem != nil:
 			v, err = coerceStringToArray(*tokens[i], *f.Type.Elem, iz)
 		case f.Type.RangeElem != nil:
-			// A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
-			panic("a composite range field is rejected at CREATE TYPE (R2)")
+			// A range-typed field: the token is a range text literal (range_in).
+			desc, ok := rangeForElement(f.Type.RangeElem.Scalar)
+			if !ok {
+				panic("a range field's element always has a range type")
+			}
+			var rv *RangeVal
+			rv, err = coerceStringToRange(*tokens[i], desc, iz)
+			if err == nil {
+				v = RangeValue(rv)
+			}
 		default:
 			var node *rExpr
 			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod, f.VarcharLen, iz)

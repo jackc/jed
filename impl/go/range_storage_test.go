@@ -184,14 +184,17 @@ func TestRangeCrossElementComparisonIs42804(t *testing.T) {
 	}
 }
 
-// TestRangeCompositeFieldIs0A000: a range-typed composite field is deferred (0A000) — only range
-// *columns* are storable this slice. The type name IS known, so it is 0A000, not the 42704 an unknown
-// type would give.
-func TestRangeCompositeFieldIs0A000(t *testing.T) {
+// TestRangeCompositeFieldTypmodIs0A000: a type modifier on a range-typed composite field is 0A000,
+// like one on a range column — a deliberate divergence (PostgreSQL raises 42601), so it cannot live
+// in the oracle corpus. The agreeing range-field behavior is types/composite_range_field.test.
+func TestRangeCompositeFieldTypmodIs0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
-	if got := errRange(t, db, "CREATE TYPE rec AS (lo i32, span i32range)"); got != "0A000" {
-		t.Errorf("range composite field: got %s, want 0A000", got)
+	if got := errRange(t, db, "CREATE TYPE rec AS (lo i32, span numrange(10,2))"); got != "0A000" {
+		t.Errorf("range composite field typmod: got %s, want 0A000", got)
+	}
+	if got := errRange(t, db, "CREATE TABLE t (span numrange(10,2))"); got != "0A000" {
+		t.Errorf("range column typmod: got %s, want 0A000", got)
 	}
 }
 

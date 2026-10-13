@@ -876,9 +876,14 @@ pub(crate) fn coerce_record_text(
                     fields: f2,
                 } => coerce_record_text(&s, n2, f2, iz)?,
                 ColType::Array(inner) => coerce_string_to_array(&s, inner, iz)?,
-                // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
-                ColType::Range(_) => {
-                    unreachable!("a composite range field is rejected at CREATE TYPE (R2)")
+                // A range-typed field: the token is a range text literal (`range_in`).
+                ColType::Range(elem) => {
+                    let ColType::Scalar(es) = elem.as_ref() else {
+                        unreachable!("a range element is always a scalar (ranges.md §2)")
+                    };
+                    let desc = crate::range::range_for_element(*es)
+                        .expect("a range field's element always has a range type");
+                    Value::Range(coerce_string_to_range(&s, desc, iz)?)
                 }
             }),
         }

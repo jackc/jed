@@ -194,16 +194,21 @@ fn cross_element_comparison_is_42804() {
     assert_eq!(err(&mut db, "SELECT '[1,5)'::i32range = 5"), "42804");
 }
 
-/// A range-typed composite field is deferred (`0A000`) — only range *columns* are storable this
-/// slice. The type name IS known, so it is `0A000`, not the `42704` an unknown type would give.
+/// A type modifier on a range-typed composite field is `0A000`, like one on a range column — a
+/// deliberate divergence (PostgreSQL raises `42601`), so it cannot live in the oracle corpus. The
+/// agreeing range-field behavior is types/composite_range_field.test.
 #[test]
-fn composite_range_field_is_0a000() {
+fn composite_range_field_typmod_is_0a000() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
-        err(&mut db, "CREATE TYPE rec AS (lo i32, span i32range)"),
+        err(&mut db, "CREATE TYPE rec AS (lo i32, span numrange(10,2))"),
         "0A000",
+    );
+    assert_eq!(
+        err(&mut db, "CREATE TABLE t (span numrange(10,2))"),
+        "0A000"
     );
 }
 

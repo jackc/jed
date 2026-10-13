@@ -559,9 +559,13 @@ export function coerceRecordTextToValue(
     const f = ct.fields[i]!;
     if (f.type.kind === "composite") return coerceRecordTextToValue(tok, f.type, iz);
     if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem, iz);
-    // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
-    if (f.type.kind === "range")
-      throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
+    // A range-typed field: the token is a range text literal (range_in).
+    if (f.type.kind === "range") {
+      if (f.type.elem.kind !== "scalar") throw new Error("a range element is always a scalar");
+      const desc = rangeForElement(f.type.elem.scalar);
+      if (desc === undefined) throw new Error("a range field's element always has a range type");
+      return coerceStringToRange(tok, desc, iz);
+    }
     const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod, f.varcharLen, iz);
     return rexprConstToValue(node);
   });

@@ -3785,12 +3785,14 @@ func (db *engine) executeCreateType(ct *createType) (outcome, error) {
 				return outcome{}, err
 			}
 			fty, fdecimal, fvarchar = scalarT(s), d, vl
-		} else if _, ok := rangeByName(f.TypeName); ok {
-			// A range-typed composite field (a range inside CREATE TYPE) is deferred this slice (only
-			// range *columns* are storable — spec/design/ranges.md §3); the type name IS known, so this
-			// is 0A000, not the 42704 below.
-			return outcome{}, newError(FeatureNotSupported,
-				"a range-typed composite field ("+f.TypeName+") is not supported yet")
+		} else if rdesc, ok := rangeByName(f.TypeName); ok {
+			// A range-typed field (spec/design/composite.md §3, format_version 41): the element is
+			// carried inline like a range column's, and a range takes no typmod.
+			if f.TypeMod != nil {
+				return outcome{}, newError(FeatureNotSupported,
+					"a type modifier on a range type is not supported")
+			}
+			fty = rangeT(scalarT(elementScalar(rdesc)))
 		} else if db.readSnap().compositeType(f.TypeName) != nil {
 			if f.TypeMod != nil {
 				return outcome{}, newError(FeatureNotSupported,

@@ -27,7 +27,10 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 40 # v40: bit 6 of a foreign key's actions byte is match_full (MATCH FULL; 0 = MATCH SIMPLE —
+VERSION = 41 # v41: a composite-type entry admits a range-typed field — field_type_code 17 + the
+# one-byte range element descriptor, before the field flags byte (composite.md §3). No other byte
+# layout change.
+# v40: bit 6 of a foreign key's actions byte is match_full (MATCH FULL; 0 = MATCH SIMPLE —
 # constraints.md §6.3/§6.9); bit 7 stays reserved 0. No other byte layout change.
 # v39: a trailing u8 check_option on every view entry (0 none, 1 LOCAL, 2 CASCADED —
 # views.md §15.6); no other byte layout change.
@@ -1153,6 +1156,26 @@ COMPOSITE_ARRAY_FIELD_TABLE = {
                     [3, ["c", nil]]] }]
 }.freeze
 
+# A composite type with RANGE-typed fields (v41 — spec/design/composite.md §3): pins the catalog
+# composite-type entry with code-17 range fields (field_type_code 17 + the one-byte range element
+# descriptor — element_type_code 2 = i32 for `span`, 6 = decimal for `amt`, format.md *Composite-type
+# entry*) AND the recursive value body — a composite body (null-bitmap + present fields, §4) whose
+# range fields are range bodies (flags byte + present bound bodies). Row 1: every field present (a
+# discrete [) range + a continuous [] numrange). Row 2: the EMPTY range (the lone 0x01 flags byte)
+# and a NULL numrange field (the composite null-bitmap marks field 2). Row 3: a NULL i32range field
+# and an unbounded-lower numrange (LB_INF, no lower body). The cores build this via
+#   CREATE TYPE booking AS (room text, span i32range, amt numrange)
+#   CREATE TABLE t (id i32 PRIMARY KEY, b booking)
+#   INSERT (1, ROW('a', '[1,5)', '[1.5,2.25]')); (2, ROW('b', 'empty', NULL)); (3, ROW('c', NULL, '(,10)'))
+COMPOSITE_RANGE_FIELD_TABLE = {
+  types: [ctype("booking", [field("room", "text"), field("span", "i32range"), field("amt", "numrange")])],
+  tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("b", "booking")],
+             rows: [[1, ["a", { lower: 1, upper: 5, lower_inc: true, upper_inc: false },
+                         { lower: "1.5", upper: "2.25", lower_inc: true, upper_inc: true }]],
+                    [2, ["b", :empty, nil]],
+                    [3, ["c", nil, { lower: nil, upper: "10", lower_inc: false, upper_inc: false }]]] }]
+}.freeze
+
 # FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog foreign-key list
 # (fk_count + per FK: name, local ordinals, ref table, ref ordinals, actions byte). Two tables —
 # parent `p` (a PK + two UNIQUE constraints, the FK targets) and child `c` carrying four FKs that
@@ -1467,6 +1490,8 @@ FIXTURES = ([
     types: ARRAY_COMPOSITE_TABLE[:types], tables: ARRAY_COMPOSITE_TABLE[:tables] },
   { file: "composite_array_field_table.jed", page_size: 256,
     types: COMPOSITE_ARRAY_FIELD_TABLE[:types], tables: COMPOSITE_ARRAY_FIELD_TABLE[:tables] },
+  { file: "composite_range_field_table.jed", page_size: 256,
+    types: COMPOSITE_RANGE_FIELD_TABLE[:types], tables: COMPOSITE_RANGE_FIELD_TABLE[:tables] },
   { file: "nested_composite_table.jed", page_size: 256,
     types: NESTED_COMPOSITE_TABLE[:types], tables: NESTED_COMPOSITE_TABLE[:tables] },
   { file: "sequence_table.jed", page_size: 256,
@@ -2230,7 +2255,8 @@ def statistics_entries(table)
 end
 
 # Serialize a composite-type catalog entry's BODY (after the entry_kind=1 byte), v9: name, field
-# count, then per field — name, type code, [type name when code 14 (nested composite)], flags
+# count, then per field — name, type code, [type name when code 14 (nested composite), the element
+# descriptor when code 15 (array, v10) or 17 (range, v41)], flags
 # (bit0 not_null), [decimal typmod when code 6] (format.md *Composite-type entry*).
 def composite_type_entry_bytes(ct)
   out = +"".b
@@ -2243,6 +2269,10 @@ def composite_type_entry_bytes(ct)
       # descriptor (§3), before the flags byte — mirroring where a nested-composite name sits.
       out << [15].pack("C")
       push_array_element_type(out, elem)
+    elsif (relem = range_elem(f[:type]))
+      # A range-typed field (v41, composite.md §3): type_code 17 + the one-byte range element
+      # descriptor (ranges.md §3), before the flags byte. A range takes no typmod.
+      out << [17].pack("C") << [TYPECODE.fetch(relem)].pack("C")
     elsif TYPECODE.key?(f[:type])
       out << [TYPECODE.fetch(f[:type])].pack("C")
     else
@@ -3516,6 +3546,11 @@ def decode_composite_type_entry(buf, pos)
       # the code-15 branch above), then (below) the flags byte. The type string carries the "[]".
       elem, pos = read_array_element_type(buf, pos)
       type = "#{elem}[]"
+    elsif code == 17
+      # A range-typed field (v41): the one-byte range element descriptor (inverse of the code-17
+      # branch above), then (below) the flags byte. The type string is the range's canonical name.
+      ecb, pos = take(buf, pos, 1)
+      type = RANGE_ELEM.key(CODETYPE.fetch(ecb.getbyte(0))) or raise "type code is not a valid range element subtype"
     else
       type = CODETYPE.fetch(code)
     end

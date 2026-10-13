@@ -4907,17 +4907,17 @@ impl Engine {
                 } else if ScalarType::from_name(&f.type_name).is_some() {
                     let (s, d, vlen) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
                     (Type::Scalar(s), d, vlen)
-                } else if crate::range::range_by_name(&f.type_name).is_some() {
-                    // A range-typed composite field (a `range` inside `CREATE TYPE`) is deferred
-                    // this slice (only range *columns* are storable — spec/design/ranges.md §3); the
-                    // type name IS known, so this is 0A000, not the 42704 below.
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        format!(
-                            "a range-typed composite field ({}) is not supported yet",
-                            f.type_name
-                        ),
-                    ));
+                } else if let Some(rdesc) = crate::range::range_by_name(&f.type_name) {
+                    // A range-typed field (spec/design/composite.md §3, format_version 41): the
+                    // element is carried inline like a range column's, and a range takes no typmod.
+                    if f.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "a type modifier on a range type is not supported".to_string(),
+                        ));
+                    }
+                    let elem = crate::range::element_scalar(rdesc);
+                    (Type::Range(Box::new(Type::Scalar(elem))), None, None)
                 } else if self.read_snap().composite_type(&f.type_name).is_some() {
                     if f.type_mod.is_some() {
                         return Err(EngineError::new(

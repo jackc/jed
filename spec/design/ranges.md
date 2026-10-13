@@ -116,6 +116,11 @@ layout in [../fileformat/format.md](../fileformat/format.md), landed R2):
 - **`format_version` 16** is a clean break (the v16 reader rejects v15 and earlier, as
   v9/v10/v13 did). All existing `.jed` goldens regenerate at the bump (the version byte);
   range columns appear only in new goldens.
+- **A range-typed composite field** (`CREATE TYPE booking AS (room text, span int4range)`,
+  **`format_version` 41**) carries the same one-byte element descriptor in the composite-type
+  catalog entry: `field_type_code = 17 ‖ element_type_code`, before the field flags byte
+  ([composite.md §3](composite.md)). The value body inside a composite is the range body below
+  (§4), recursed into exactly as a range column's is.
 
 ## 4. Value model — bounds, flags, canonicalization, empty
 

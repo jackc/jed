@@ -123,7 +123,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // spec/design/views.md §15.6); no other byte layout change.
 // v40: a foreign key's actions byte gains bit 6 `match_full` (MATCH FULL; 0 = MATCH SIMPLE — spec/
 // design/constraints.md §6.3/§6.9); bit 7 stays reserved 0. No other byte layout change.
-const FORMAT_VERSION: u16 = 40;
+// v41: a composite-type entry admits a range-typed field — `field_type_code 17` followed by the
+// one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3);
+// no other byte layout change.
+const FORMAT_VERSION: u16 = 41;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -4315,8 +4318,9 @@ pub(crate) fn decode_leaf_node(
 /// included), its `root_data_page`, and each index's root page (parallel to
 /// `Table::indexes`).
 /// Serialize a composite-type catalog entry's BODY (after its `entry_kind = 1` byte): name,
-/// field count, then per field — name, type code, [type name when code 14 (nested composite)],
-/// flags (bit0 `not_null`), [decimal typmod when code 6] (spec/fileformat/format.md
+/// field count, then per field — name, type code, [type name when code 14 (nested composite), the
+/// element descriptor when code 15 (array) or 17 (range)], flags (bit0 `not_null`), [decimal
+/// typmod when code 6] (spec/fileformat/format.md
 /// *Composite-type entry*).
 fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
     let mut out = Vec::new();
@@ -4343,10 +4347,11 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
                 out.push(15);
                 push_array_element_type(&mut out, elem);
             }
-            // A range field cannot occur: CREATE TYPE rejects a range field (range columns are not
-            // storable yet — R2).
-            Type::Range(_) => {
-                unreachable!("a composite range field is rejected at CREATE TYPE (R2)")
+            // A range-typed field (v41): type_code 17, then the same one-byte element descriptor
+            // a range column uses (spec/design/ranges.md §3), before the flags byte.
+            Type::Range(elem) => {
+                out.push(17);
+                push_range_element_type(&mut out, elem);
             }
         }
         out.push(if f.not_null { 0b1 } else { 0 });
@@ -4389,6 +4394,11 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
             // (below) the flags byte — the inverse of the `Type::Array` arm above.
             let elem = read_array_element_type(buf, pos)?;
             (Type::Array(Box::new(elem)), None)
+        } else if tc == 17 {
+            // A range-typed field (v41): the one-byte range element descriptor — the inverse of
+            // the `Type::Range` arm above.
+            let elem = read_range_element_type(buf, pos)?;
+            (Type::Range(Box::new(elem)), None)
         } else {
             let s = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown field type code"))?;
             (Type::Scalar(s), None)

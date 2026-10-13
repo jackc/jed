@@ -96,6 +96,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // A composite type with an array-typed field (array.md §12 — the mirror nesting) — the catalog
   // composite-type entry gains a code-15 array field; the codec/comparison/text-I/O recurse.
   "types.composite_array_field",
+  "types.composite_range_field",
   // Range types (ranges.md) — the six built-in PG range types as a structural type over a scalar
   // element (R0–R2): the '[1,5)' literal/cast, the value codec (type_code 17, format_version 15),
   // range_out, discrete canonicalization, empty normalization, IS NULL. Comparison + the

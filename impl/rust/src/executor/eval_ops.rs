@@ -1348,10 +1348,12 @@ pub(crate) fn coerce_string_to_composite(
                         let rt = resolved_type_of_col(&f.ty, catalog);
                         (value_to_rexpr(&val), rt)
                     }
-                    // A range field cannot occur: CREATE TYPE rejects a range field (range columns
-                    // are not storable yet — R2), so a composite field type is never a range.
-                    Type::Range(_) => {
-                        unreachable!("a composite range field is rejected at CREATE TYPE (R2)")
+                    // A range-typed field: the token is a range text literal, coerced through
+                    // `range_in` — the same path a bare `'[1,5)'::i32range` cast uses.
+                    Type::Range(elem_ty) => {
+                        let desc = crate::range::range_for_element(elem_ty.scalar())
+                            .expect("a range field's element always has a range type");
+                        coerce_string_to_range_expr(&s, desc, iz)?
                     }
                 };
                 nodes.push(node);
