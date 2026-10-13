@@ -805,6 +805,7 @@ export class Snapshot {
     this.tables.delete(key);
     this.stores.delete(key);
     this.estimatorRevisions.delete(key);
+    this.statistics.delete(key);
   }
 
   // applyOnCommitActions runs the temporary tables' ON COMMIT actions on a committing transaction's

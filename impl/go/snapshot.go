@@ -1037,6 +1037,7 @@ func (s *snapshot) removeTable(key string) {
 	delete(s.tables, key)
 	delete(s.stores, key)
 	delete(s.estimatorRevisions, key)
+	delete(s.statistics, key)
 }
 
 // applyOnCommitActions runs the temporary tables' ON COMMIT actions on a committing transaction's

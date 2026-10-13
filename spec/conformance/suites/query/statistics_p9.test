@@ -237,6 +237,26 @@ SELECT count(*) FROM jed_statistics WHERE table_name = 'p9_lifecycle_renamed'
 ----
 0
 
+# DROP TABLE drops the table's facts with it, so the next catalog write has none to persist and a
+# recreated table of the same name starts with no facts. (Found by deterministic simulation: a
+# commit after ANALYZE + DROP TABLE crashed serializing the orphaned facts.)
+statement ok
+ANALYZE p9_lifecycle_renamed
+
+statement ok
+DROP TABLE p9_lifecycle_renamed
+
+statement ok
+CREATE TABLE p9_lifecycle_renamed (id i32 PRIMARY KEY)
+
+query I nosort
+SELECT count(*) FROM jed_statistics WHERE table_name = 'p9_lifecycle_renamed'
+----
+0
+
+statement ok
+DROP TABLE p9_lifecycle_renamed
+
 # Distribution-ineligible open/JSON types still collect NULL and average-width facts but expose no
 # NDV, MCV, or histogram.
 statement ok
