@@ -561,26 +561,115 @@ fn apply_unit(
     Ok(())
 }
 
-/// The cascade weights (`months_per`, `days_per`, `micros_per`) for a unit word (case-insensitive),
-/// or None for an unrecognized unit. Exactly one weight is nonzero. The "unit + time" subset
-/// (spec/design/interval.md §3); ambiguous bare `m` is intentionally not accepted.
-fn unit_weights(unit: &str) -> Option<(i128, i128, i128)> {
+// The per-field masks of PostgreSQL's `DecodeInterval` (spec/design/interval.md §3): each unit
+// sets its own bit, so an input that names the same field twice is rejected (22007). `week` and
+// `day` are DIFFERENT fields (`'1 week 1 day'` is valid), as are `year`/`decade`/`century`/
+// `millennium` and `second`/`millisecond`/`microsecond`. A bare `HH:MM[:SS]` time claims the whole
+// time-of-day group, and a seconds value with a nonzero fraction claims all three seconds bits.
+const FIELD_MONTH: u32 = 1 << 1;
+const FIELD_YEAR: u32 = 1 << 2;
+const FIELD_DAY: u32 = 1 << 3;
+const FIELD_HOUR: u32 = 1 << 10;
+const FIELD_MINUTE: u32 = 1 << 11;
+const FIELD_SECOND: u32 = 1 << 12;
+const FIELD_MILLISECOND: u32 = 1 << 13;
+const FIELD_MICROSECOND: u32 = 1 << 14;
+const FIELD_WEEK: u32 = 1 << 24;
+const FIELD_DECADE: u32 = 1 << 25;
+const FIELD_CENTURY: u32 = 1 << 26;
+const FIELD_MILLENNIUM: u32 = 1 << 27;
+/// Seconds with a fractional part (PG `DTK_ALL_SECS_M`).
+const FIELD_ALL_SECS: u32 = FIELD_SECOND | FIELD_MILLISECOND | FIELD_MICROSECOND;
+/// A bare `HH:MM[:SS[.ffffff]]` time (PG `DTK_TIME_M`).
+const FIELD_TIME: u32 = FIELD_HOUR | FIELD_MINUTE | FIELD_ALL_SECS;
+
+/// The field mask a seconds value claims: a nonzero fraction also claims the millisecond and
+/// microsecond fields (PG: `'1.5 sec 1 ms'` is a duplicate, `'1 sec 1 ms'` / `'1.0 sec 1 ms'` are not).
+fn seconds_mask(frac_num: i128) -> u32 {
+    if frac_num == 0 {
+        FIELD_SECOND
+    } else {
+        FIELD_ALL_SECS
+    }
+}
+
+/// The cascade weights (`months_per`, `days_per`, `micros_per`) and the field mask for a unit word
+/// (case-insensitive), or None for an unrecognized unit. Exactly one weight is nonzero. The "unit +
+/// time" subset (spec/design/interval.md §3); ambiguous bare `m` is intentionally not accepted.
+fn unit_weights(unit: &str) -> Option<((i128, i128, i128), u32)> {
     let u = unit.to_ascii_lowercase();
     Some(match u.as_str() {
-        "millennium" | "millennia" | "mil" | "mils" => (12000 * MONTHS_PER_YEAR as i128 / 12, 0, 0),
-        "century" | "centuries" | "cent" | "c" => (1200, 0, 0),
-        "decade" | "decades" | "dec" | "decs" => (120, 0, 0),
-        "year" | "years" | "yr" | "yrs" | "y" => (MONTHS_PER_YEAR as i128, 0, 0),
-        "month" | "months" | "mon" | "mons" => (1, 0, 0),
-        "week" | "weeks" | "w" => (0, 7, 0),
-        "day" | "days" | "d" => (0, 1, 0),
-        "hour" | "hours" | "hr" | "hrs" | "h" => (0, 0, 3600 * MICROS_PER_SEC as i128),
-        "minute" | "minutes" | "min" | "mins" => (0, 0, 60 * MICROS_PER_SEC as i128),
-        "second" | "seconds" | "sec" | "secs" | "s" => (0, 0, MICROS_PER_SEC as i128),
-        "millisecond" | "milliseconds" | "msec" | "msecs" | "ms" => (0, 0, 1000),
-        "microsecond" | "microseconds" | "usec" | "usecs" | "us" => (0, 0, 1),
+        "millennium" | "millennia" | "mil" | "mils" => (
+            (12000 * MONTHS_PER_YEAR as i128 / 12, 0, 0),
+            FIELD_MILLENNIUM,
+        ),
+        "century" | "centuries" | "cent" | "c" => ((1200, 0, 0), FIELD_CENTURY),
+        "decade" | "decades" | "dec" | "decs" => ((120, 0, 0), FIELD_DECADE),
+        "year" | "years" | "yr" | "yrs" | "y" => ((MONTHS_PER_YEAR as i128, 0, 0), FIELD_YEAR),
+        "month" | "months" | "mon" | "mons" => ((1, 0, 0), FIELD_MONTH),
+        "week" | "weeks" | "w" => ((0, 7, 0), FIELD_WEEK),
+        "day" | "days" | "d" => ((0, 1, 0), FIELD_DAY),
+        "hour" | "hours" | "hr" | "hrs" | "h" => {
+            ((0, 0, 3600 * MICROS_PER_SEC as i128), FIELD_HOUR)
+        }
+        "minute" | "minutes" | "min" | "mins" => {
+            ((0, 0, 60 * MICROS_PER_SEC as i128), FIELD_MINUTE)
+        }
+        "second" | "seconds" | "sec" | "secs" | "s" => {
+            ((0, 0, MICROS_PER_SEC as i128), FIELD_SECOND)
+        }
+        "millisecond" | "milliseconds" | "msec" | "msecs" | "ms" => {
+            ((0, 0, 1000), FIELD_MILLISECOND)
+        }
+        "microsecond" | "microseconds" | "usec" | "usecs" | "us" => ((0, 0, 1), FIELD_MICROSECOND),
         _ => return None,
     })
+}
+
+/// One parsed field: its mask and the exact amount it added to each of the three accumulators.
+struct FieldPart {
+    mask: u32,
+    months: i64,
+    days: i64,
+    micros: i64,
+}
+
+/// PostgreSQL's duplicate-field rule (spec/design/interval.md §3). PG's `DecodeInterval` reads the
+/// fields right to left, adding each into its running fields (an `i32` month/day or `i64` µs
+/// overflow is an out-of-range error) and THEN rejecting it as a duplicate if its mask overlaps the
+/// fields already read. jed parses left to right, so it replays that order here over the recorded
+/// fields: a duplicate traps 22007, unless the running total from the right end through the
+/// duplicate already overflowed, in which case PG would have stopped there first (22008).
+fn check_duplicate_fields(input: &str, fields: &[FieldPart]) -> Result<()> {
+    let mut seen: u32 = 0;
+    let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
+    let mut overflowed = false;
+    for f in fields.iter().rev() {
+        if !overflowed {
+            match (
+                months.checked_add(f.months),
+                days.checked_add(f.days),
+                micros.checked_add(f.micros),
+            ) {
+                (Some(m), Some(d), Some(u))
+                    if i32::try_from(m).is_ok() && i32::try_from(d).is_ok() =>
+                {
+                    (months, days, micros) = (m, d, u);
+                }
+                _ => overflowed = true,
+            }
+        }
+        if f.mask & seen != 0 {
+            if overflowed {
+                return Err(field_overflow("interval out of range"));
+            }
+            return Err(invalid_format(format!(
+                "invalid input syntax for type interval: \"{input}\""
+            )));
+        }
+        seen |= f.mask;
+    }
+    Ok(())
 }
 
 struct Cursor<'a> {
@@ -702,7 +791,9 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
     }
 
     let mut ago = false;
-    let mut saw_field = false;
+    // Every field read, in input order — for PG's duplicate-field rule, checked once the input is
+    // fully read (check_duplicate_fields).
+    let mut fields: Vec<FieldPart> = Vec::new();
     // Whether whitespace followed the previous field. Fields must be whitespace-separated, so
     // run-together input such as the SQL-standard `'1-2'` (deferred, §3) fails closed rather than
     // being read as two adjacent fields.
@@ -737,10 +828,12 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
         }
         let int_part = read_digits(&mut c)?.ok_or_else(|| invalid_format("expected a number"))?;
 
+        let (before_months, before_days, before_micros) = (acc.months, acc.days, acc.micros);
+        let mask;
         if c.peek() == Some(b':') {
             // A bare time: this integer is the hour. (No fractional hour before `:`.)
             parse_time(&mut acc, &mut c, neg, int_part)?;
-            saw_field = true;
+            mask = FIELD_TIME;
         } else {
             // An optional fractional part on a unit (or bare-seconds) value.
             let (frac_num, frac_den) = if c.peek() == Some(b'.') {
@@ -754,7 +847,7 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
             // number with no unit means SECONDS (PG `interval '5'` = 5 seconds), but only as the
             // LAST field: elsewhere PG reads it positionally as a SQL-standard field (`'1 1:00'`
             // is 1 day), which jed defers (§3), so it fails closed instead of misreading.
-            let per = match peek_word(&c) {
+            let (per, unit_mask) = match peek_word(&c) {
                 Some(u) if !u.eq_ignore_ascii_case("ago") => {
                     c.i += u.len();
                     unit_weights(&u)
@@ -765,11 +858,22 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
                         "a number without a unit must be the last interval field",
                     ));
                 }
-                _ => (0, 0, MICROS_PER_SEC as i128),
+                _ => ((0, 0, MICROS_PER_SEC as i128), FIELD_SECOND),
             };
             apply_unit(&mut acc, neg, int_part, frac_num, frac_den, per)?;
-            saw_field = true;
+            mask = if unit_mask == FIELD_SECOND {
+                seconds_mask(frac_num)
+            } else {
+                unit_mask
+            };
         }
+        // Each accumulator add was checked, so the difference is exactly the field's i64 amount.
+        fields.push(FieldPart {
+            mask,
+            months: acc.months.wrapping_sub(before_months),
+            days: acc.days.wrapping_sub(before_days),
+            micros: acc.micros.wrapping_sub(before_micros),
+        });
         let before = c.i;
         c.skip_ws();
         separated = c.i > before;
@@ -778,9 +882,10 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
     if !c.done() {
         return Err(invalid_format("trailing characters in interval"));
     }
-    if !saw_field {
+    if fields.is_empty() {
         return Err(invalid_format("empty interval"));
     }
+    check_duplicate_fields(input, &fields)?;
 
     if ago {
         acc.months = acc

@@ -491,73 +491,145 @@ function applyUnit(
   if (microsNum !== 0n) acc.micros = addChecked(acc.micros, roundDivBig(microsNum, d));
 }
 
-// unitWeights returns the cascade weights [monthsPer, daysPer, microsPer] for a unit word
-// (case-insensitive), or undefined for an unrecognized unit. Exactly one weight is nonzero.
-function unitWeights(unit: string): [bigint, bigint, bigint] | undefined {
+// The per-field masks of PostgreSQL's DecodeInterval (spec/design/interval.md §3): each unit sets
+// its own bit, so an input that names the same field twice is rejected (22007). `week` and `day`
+// are DIFFERENT fields ('1 week 1 day' is valid), as are year/decade/century/millennium and
+// second/millisecond/microsecond. A bare HH:MM[:SS] time claims the whole time-of-day group, and
+// a seconds value with a nonzero fraction claims all three seconds bits.
+const FIELD_MONTH = 1 << 1;
+const FIELD_YEAR = 1 << 2;
+const FIELD_DAY = 1 << 3;
+const FIELD_HOUR = 1 << 10;
+const FIELD_MINUTE = 1 << 11;
+const FIELD_SECOND = 1 << 12;
+const FIELD_MILLISECOND = 1 << 13;
+const FIELD_MICROSECOND = 1 << 14;
+const FIELD_WEEK = 1 << 24;
+const FIELD_DECADE = 1 << 25;
+const FIELD_CENTURY = 1 << 26;
+const FIELD_MILLENNIUM = 1 << 27;
+// Seconds with a fractional part (PG DTK_ALL_SECS_M).
+const FIELD_ALL_SECS = FIELD_SECOND | FIELD_MILLISECOND | FIELD_MICROSECOND;
+// A bare HH:MM[:SS[.ffffff]] time (PG DTK_TIME_M).
+const FIELD_TIME = FIELD_HOUR | FIELD_MINUTE | FIELD_ALL_SECS;
+
+// The field mask a seconds value claims: a nonzero fraction also claims the millisecond and
+// microsecond fields (PG: '1.5 sec 1 ms' is a duplicate, '1 sec 1 ms' / '1.0 sec 1 ms' are not).
+function secondsMask(fracNum: bigint): number {
+  return fracNum === 0n ? FIELD_SECOND : FIELD_ALL_SECS;
+}
+
+// One parsed field: its mask and the exact amount it added to each of the three accumulators.
+interface FieldPart {
+  mask: number;
+  months: bigint;
+  days: bigint;
+  micros: bigint;
+}
+
+// checkDuplicateFields applies PostgreSQL's duplicate-field rule (spec/design/interval.md §3). PG's
+// DecodeInterval reads the fields right to left, adding each into its running fields (an i32
+// month/day or i64 µs overflow is an out-of-range error) and THEN rejecting it as a duplicate if
+// its mask overlaps the fields already read. jed parses left to right, so it replays that order
+// here over the recorded fields: a duplicate traps 22007, unless the running total from the right
+// end through the duplicate already overflowed, in which case PG would have stopped there first
+// (22008).
+function checkDuplicateFields(input: string, fields: FieldPart[]): void {
+  let seen = 0;
+  let months = 0n;
+  let days = 0n;
+  let micros = 0n;
+  let overflowed = false;
+  for (let i = fields.length - 1; i >= 0; i--) {
+    const f = fields[i];
+    if (!overflowed) {
+      months += f.months;
+      days += f.days;
+      micros += f.micros;
+      overflowed =
+        months < I32_MIN ||
+        months > I32_MAX ||
+        days < I32_MIN ||
+        days > I32_MAX ||
+        micros < I64_MIN ||
+        micros > I64_MAX;
+    }
+    if ((f.mask & seen) !== 0) {
+      if (overflowed) throw intervalFieldOverflow("interval out of range");
+      throw invalidInterval(`invalid input syntax for type interval: "${input}"`);
+    }
+    seen |= f.mask;
+  }
+}
+
+// unitWeights returns the cascade weights [monthsPer, daysPer, microsPer] and the field mask for a
+// unit word (case-insensitive), or undefined for an unrecognized unit. Exactly one weight is
+// nonzero.
+function unitWeights(unit: string): [bigint, bigint, bigint, number] | undefined {
   switch (unit.toLowerCase()) {
     case "millennium":
     case "millennia":
     case "mil":
     case "mils":
-      return [12000n, 0n, 0n];
+      return [12000n, 0n, 0n, FIELD_MILLENNIUM];
     case "century":
     case "centuries":
     case "cent":
     case "c":
-      return [1200n, 0n, 0n];
+      return [1200n, 0n, 0n, FIELD_CENTURY];
     case "decade":
     case "decades":
     case "dec":
     case "decs":
-      return [120n, 0n, 0n];
+      return [120n, 0n, 0n, FIELD_DECADE];
     case "year":
     case "years":
     case "yr":
     case "yrs":
     case "y":
-      return [MONTHS_PER_YEAR, 0n, 0n];
+      return [MONTHS_PER_YEAR, 0n, 0n, FIELD_YEAR];
     case "month":
     case "months":
     case "mon":
     case "mons":
-      return [1n, 0n, 0n];
+      return [1n, 0n, 0n, FIELD_MONTH];
     case "week":
     case "weeks":
     case "w":
-      return [0n, 7n, 0n];
+      return [0n, 7n, 0n, FIELD_WEEK];
     case "day":
     case "days":
     case "d":
-      return [0n, 1n, 0n];
+      return [0n, 1n, 0n, FIELD_DAY];
     case "hour":
     case "hours":
     case "hr":
     case "hrs":
     case "h":
-      return [0n, 0n, 3600n * MICROS_PER_SEC];
+      return [0n, 0n, 3600n * MICROS_PER_SEC, FIELD_HOUR];
     case "minute":
     case "minutes":
     case "min":
     case "mins":
-      return [0n, 0n, 60n * MICROS_PER_SEC];
+      return [0n, 0n, 60n * MICROS_PER_SEC, FIELD_MINUTE];
     case "second":
     case "seconds":
     case "sec":
     case "secs":
     case "s":
-      return [0n, 0n, MICROS_PER_SEC];
+      return [0n, 0n, MICROS_PER_SEC, FIELD_SECOND];
     case "millisecond":
     case "milliseconds":
     case "msec":
     case "msecs":
     case "ms":
-      return [0n, 0n, 1000n];
+      return [0n, 0n, 1000n, FIELD_MILLISECOND];
     case "microsecond":
     case "microseconds":
     case "usec":
     case "usecs":
     case "us":
-      return [0n, 0n, 1n];
+      return [0n, 0n, 1n, FIELD_MICROSECOND];
     default:
       return undefined;
   }
@@ -676,7 +748,9 @@ export function parseInterval(input: string): Interval {
   if (c.done()) throw invalidInterval("empty interval");
 
   let ago = false;
-  let sawField = false;
+  // Every field read, in input order — for PG's duplicate-field rule, checked once the input is
+  // fully read (checkDuplicateFields).
+  const fields: FieldPart[] = [];
   // Whether whitespace followed the previous field. Fields must be whitespace-separated, so
   // run-together input such as the SQL-standard '1-2' (deferred, §3) fails closed rather than
   // being read as two adjacent fields.
@@ -702,9 +776,13 @@ export function parseInterval(input: string): Interval {
     const intPart = c.readDigits();
     if (intPart === undefined) throw invalidInterval("expected a number");
 
+    const beforeMonths = acc.months;
+    const beforeDays = acc.days;
+    const beforeMicros = acc.micros;
+    let mask: number;
     if (c.peek() === 0x3a) {
       parseTime(acc, c, neg, intPart);
-      sawField = true;
+      mask = FIELD_TIME;
     } else {
       let fracNum = 0n;
       let fracDen = 1n;
@@ -716,7 +794,7 @@ export function parseInterval(input: string): Interval {
       // A recognized unit applies its weights; else 22007. A number with no unit means SECONDS
       // (PG), but only as the LAST field: elsewhere PG reads it positionally as a SQL-standard
       // field ('1 1:00' is 1 day), which jed defers (§3), so it fails closed.
-      let weights: [bigint, bigint, bigint];
+      let weights: [bigint, bigint, bigint, number];
       const word = c.peekWord();
       if (word !== undefined && word.toLowerCase() !== "ago") {
         c.i += word.length;
@@ -726,18 +804,25 @@ export function parseInterval(input: string): Interval {
       } else if (!c.done()) {
         throw invalidInterval("a number without a unit must be the last interval field");
       } else {
-        weights = [0n, 0n, MICROS_PER_SEC];
+        weights = [0n, 0n, MICROS_PER_SEC, FIELD_SECOND];
       }
       applyUnit(acc, neg, intPart, fracNum, fracDen, weights[0], weights[1], weights[2]);
-      sawField = true;
+      mask = weights[3] === FIELD_SECOND ? secondsMask(fracNum) : weights[3];
     }
+    fields.push({
+      mask,
+      months: acc.months - beforeMonths,
+      days: acc.days - beforeDays,
+      micros: acc.micros - beforeMicros,
+    });
     const before = c.i;
     c.skipWs();
     separated = c.i > before;
   }
 
   if (!c.done()) throw invalidInterval("trailing characters in interval");
-  if (!sawField) throw invalidInterval("empty interval");
+  if (fields.length === 0) throw invalidInterval("empty interval");
+  checkDuplicateFields(input, fields);
 
   if (ago) {
     acc.months = -acc.months;

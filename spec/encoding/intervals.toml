@@ -67,6 +67,13 @@ cases = [
   # zero
   { input = "00:00:00",         months = 0, days = 0, micros = 0 },
   { input = "0 seconds",        months = 0, days = 0, micros = 0 },
+  # distinct fields under PG's duplicate-field rule (interval.md §3) — each unit is its own field
+  { input = "1 week 1 day",     months = 0, days = 8, micros = 0 },
+  { input = "1 millennium 1 century 1 decade 1 year 1 mon", months = 13333, days = 0, micros = 0 },
+  { input = "1 day 01:00",      months = 0, days = 1, micros = 3600000000 },
+  { input = "1 hour 1 min 1 sec 1 ms 1 us", months = 0, days = 0, micros = 3661001001 },
+  { input = "1.0 sec 1 ms",     months = 0, days = 0, micros = 1001000 },  # a zero fraction is plain seconds
+  { input = "1 ms 5",           months = 0, days = 0, micros = 5001000 },  # bare seconds vs ms
 ]
 
 # --- parse_error: input string -> SQLSTATE -----------------------------------
@@ -96,6 +103,25 @@ cases = [
   { input = "1 day-1:00",  error = "22007" },
   { input = "1hour2min",   error = "22007" },
   { input = "1:00-2",      error = "22007" },
+  # PG's duplicate-field rule (interval.md §3): a field named twice is rejected, not summed
+  { input = "1 day 1 day",       error = "22007" },
+  { input = "-1 day +1 day",     error = "22007" },
+  { input = "1 day 1d",          error = "22007" },  # same field, different spelling
+  { input = "1 week 1 week",     error = "22007" },
+  { input = "1 mon 1 year 1 month", error = "22007" },
+  { input = "1 hour 2 hours",    error = "22007" },
+  { input = "1 hour 1:00",       error = "22007" },  # a bare time claims hour..microsecond
+  { input = "1:00 1 us",         error = "22007" },
+  { input = "1:00 5",            error = "22007" },  # a trailing bare number is seconds
+  { input = "1 sec 5",           error = "22007" },
+  { input = "1.5 sec 1 ms",      error = "22007" },  # fractional seconds claim ms + us too
+  { input = "1 ms 5.5",          error = "22007" },
+  { input = "1 day 1 day ago",   error = "22007" },
+  # error precedence: PG reads fields right to left, so an out-of-range running total met at or
+  # before the duplicate is reported instead (22008); one left of the duplicate is not reached
+  { input = "2000000000 days 2000000000 days", error = "22008" },
+  { input = "1 day 1 day 99999999999 years",   error = "22008" },
+  { input = "99999999999 years 1 day 1 day",   error = "22007" },
 ]
 
 # --- render: (months, days, micros) -> text (PG IntervalStyle = postgres) ----

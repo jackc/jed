@@ -486,36 +486,113 @@ func (a *intervalAcc) applyUnit(neg bool, intPart, fracNum, fracDen *big.Int, mo
 	return nil
 }
 
-// unitWeights returns the cascade weights (monthsPer, daysPer, microsPer) for a unit word
-// (case-insensitive), or ok=false for an unrecognized unit. Exactly one weight is nonzero.
-func unitWeights(unit string) (int64, int64, int64, bool) {
+// The per-field masks of PostgreSQL's DecodeInterval (spec/design/interval.md §3): each unit sets
+// its own bit, so an input that names the same field twice is rejected (22007). `week` and `day`
+// are DIFFERENT fields ('1 week 1 day' is valid), as are year/decade/century/millennium and
+// second/millisecond/microsecond. A bare HH:MM[:SS] time claims the whole time-of-day group, and
+// a seconds value with a nonzero fraction claims all three seconds bits.
+const (
+	fieldMonth       uint32 = 1 << 1
+	fieldYear        uint32 = 1 << 2
+	fieldDay         uint32 = 1 << 3
+	fieldHour        uint32 = 1 << 10
+	fieldMinute      uint32 = 1 << 11
+	fieldSecond      uint32 = 1 << 12
+	fieldMillisecond uint32 = 1 << 13
+	fieldMicrosecond uint32 = 1 << 14
+	fieldWeek        uint32 = 1 << 24
+	fieldDecade      uint32 = 1 << 25
+	fieldCentury     uint32 = 1 << 26
+	fieldMillennium  uint32 = 1 << 27
+	// fieldAllSecs is seconds with a fractional part (PG DTK_ALL_SECS_M).
+	fieldAllSecs = fieldSecond | fieldMillisecond | fieldMicrosecond
+	// fieldTime is a bare HH:MM[:SS[.ffffff]] time (PG DTK_TIME_M).
+	fieldTime = fieldHour | fieldMinute | fieldAllSecs
+)
+
+// secondsMask is the field mask a seconds value claims: a nonzero fraction also claims the
+// millisecond and microsecond fields (PG: '1.5 sec 1 ms' is a duplicate, '1 sec 1 ms' /
+// '1.0 sec 1 ms' are not).
+func secondsMask(fracNum *big.Int) uint32 {
+	if fracNum.Sign() == 0 {
+		return fieldSecond
+	}
+	return fieldAllSecs
+}
+
+// unitWeights returns the cascade weights (monthsPer, daysPer, microsPer) and the field mask for a
+// unit word (case-insensitive), or ok=false for an unrecognized unit. Exactly one weight is nonzero.
+func unitWeights(unit string) (int64, int64, int64, uint32, bool) {
 	switch strings.ToLower(unit) {
 	case "millennium", "millennia", "mil", "mils":
-		return 12000, 0, 0, true
+		return 12000, 0, 0, fieldMillennium, true
 	case "century", "centuries", "cent", "c":
-		return 1200, 0, 0, true
+		return 1200, 0, 0, fieldCentury, true
 	case "decade", "decades", "dec", "decs":
-		return 120, 0, 0, true
+		return 120, 0, 0, fieldDecade, true
 	case "year", "years", "yr", "yrs", "y":
-		return monthsPerYear, 0, 0, true
+		return monthsPerYear, 0, 0, fieldYear, true
 	case "month", "months", "mon", "mons":
-		return 1, 0, 0, true
+		return 1, 0, 0, fieldMonth, true
 	case "week", "weeks", "w":
-		return 0, 7, 0, true
+		return 0, 7, 0, fieldWeek, true
 	case "day", "days", "d":
-		return 0, 1, 0, true
+		return 0, 1, 0, fieldDay, true
 	case "hour", "hours", "hr", "hrs", "h":
-		return 0, 0, 3600 * microsPerSec, true
+		return 0, 0, 3600 * microsPerSec, fieldHour, true
 	case "minute", "minutes", "min", "mins":
-		return 0, 0, 60 * microsPerSec, true
+		return 0, 0, 60 * microsPerSec, fieldMinute, true
 	case "second", "seconds", "sec", "secs", "s":
-		return 0, 0, microsPerSec, true
+		return 0, 0, microsPerSec, fieldSecond, true
 	case "millisecond", "milliseconds", "msec", "msecs", "ms":
-		return 0, 0, 1000, true
+		return 0, 0, 1000, fieldMillisecond, true
 	case "microsecond", "microseconds", "usec", "usecs", "us":
-		return 0, 0, 1, true
+		return 0, 0, 1, fieldMicrosecond, true
 	}
-	return 0, 0, 0, false
+	return 0, 0, 0, 0, false
+}
+
+// intervalFieldPart is one parsed field: its mask and the exact amount it added to each of the
+// three accumulators.
+type intervalFieldPart struct {
+	mask   uint32
+	months int64
+	days   int64
+	micros int64
+}
+
+// checkDuplicateIntervalFields applies PostgreSQL's duplicate-field rule (spec/design/interval.md
+// §3). PG's DecodeInterval reads the fields right to left, adding each into its running fields (an
+// i32 month/day or i64 µs overflow is an out-of-range error) and THEN rejecting it as a duplicate
+// if its mask overlaps the fields already read. jed parses left to right, so it replays that order
+// here over the recorded fields: a duplicate traps 22007, unless the running total from the right
+// end through the duplicate already overflowed, in which case PG would have stopped there first
+// (22008).
+func checkDuplicateIntervalFields(input string, fields []intervalFieldPart) error {
+	var seen uint32
+	var months, days, micros int64
+	overflowed := false
+	for i := len(fields) - 1; i >= 0; i-- {
+		f := fields[i]
+		if !overflowed {
+			m, okM := add64(months, f.months)
+			d, okD := add64(days, f.days)
+			u, okU := add64(micros, f.micros)
+			if okM && okD && okU && m >= -2147483648 && m <= 2147483647 && d >= -2147483648 && d <= 2147483647 {
+				months, days, micros = m, d, u
+			} else {
+				overflowed = true
+			}
+		}
+		if f.mask&seen != 0 {
+			if overflowed {
+				return intervalFieldOverflow("interval out of range")
+			}
+			return invalidInterval(fmt.Sprintf("invalid input syntax for type interval: \"%s\"", input))
+		}
+		seen |= f.mask
+	}
+	return nil
 }
 
 type intervalCursor struct {
@@ -679,7 +756,9 @@ func parseInterval(input string) (Interval, error) {
 	}
 
 	ago := false
-	sawField := false
+	// Every field read, in input order — for PG's duplicate-field rule, checked once the input is
+	// fully read (checkDuplicateIntervalFields).
+	var fields []intervalFieldPart
 	// Whether whitespace followed the previous field. Fields must be whitespace-separated, so
 	// run-together input such as the SQL-standard '1-2' (deferred, §3) fails closed rather than
 	// being read as two adjacent fields.
@@ -713,11 +792,13 @@ func parseInterval(input string) (Interval, error) {
 			return Interval{}, invalidInterval("expected a number")
 		}
 
+		beforeMonths, beforeDays, beforeMicros := a.months, a.days, a.micros
+		var mask uint32
 		if b, has := c.peek(); has && b == ':' {
 			if err := a.parseTime(c, neg, intPart); err != nil {
 				return Interval{}, err
 			}
-			sawField = true
+			mask = fieldTime
 		} else {
 			fracNum, fracDen := big.NewInt(0), one
 			if b2, has2 := c.peek(); has2 && b2 == '.' {
@@ -732,23 +813,35 @@ func parseInterval(input string) (Interval, error) {
 			// SECONDS (PG), but only as the LAST field: elsewhere PG reads it positionally as a
 			// SQL-standard field ('1 1:00' is 1 day), which jed defers (§3), so it fails closed.
 			var mper, dper, uper int64
+			var unitMask uint32
 			if word, has := c.peekWord(); has && !strings.EqualFold(word, "ago") {
 				c.i += len(word)
 				var known bool
-				mper, dper, uper, known = unitWeights(word)
+				mper, dper, uper, unitMask, known = unitWeights(word)
 				if !known {
 					return Interval{}, invalidInterval(fmt.Sprintf("unknown interval unit %q", word))
 				}
 			} else if !c.done() {
 				return Interval{}, invalidInterval("a number without a unit must be the last interval field")
 			} else {
-				mper, dper, uper = 0, 0, microsPerSec
+				mper, dper, uper, unitMask = 0, 0, microsPerSec, fieldSecond
 			}
 			if err := a.applyUnit(neg, intPart, fracNum, fracDen, mper, dper, uper); err != nil {
 				return Interval{}, err
 			}
-			sawField = true
+			mask = unitMask
+			if unitMask == fieldSecond {
+				mask = secondsMask(fracNum)
+			}
 		}
+		// Each accumulator add was checked, so the (wrapping) difference is exactly the field's
+		// int64 amount.
+		fields = append(fields, intervalFieldPart{
+			mask:   mask,
+			months: a.months - beforeMonths,
+			days:   a.days - beforeDays,
+			micros: a.micros - beforeMicros,
+		})
 		before := c.i
 		c.skipWS()
 		separated = c.i > before
@@ -757,8 +850,11 @@ func parseInterval(input string) (Interval, error) {
 	if !c.done() {
 		return Interval{}, invalidInterval("trailing characters in interval")
 	}
-	if !sawField {
+	if len(fields) == 0 {
 		return Interval{}, invalidInterval("empty interval")
+	}
+	if err := checkDuplicateIntervalFields(input, fields); err != nil {
+		return Interval{}, err
 	}
 
 	if ago {

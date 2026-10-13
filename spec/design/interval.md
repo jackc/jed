@@ -119,10 +119,39 @@ these SQL-standard forms, and must never *misread* them (an earlier parser read 
    vectors in [../encoding/intervals.toml](../encoding/intervals.toml) rather than the corpus.
 
 PG also accepts `'.5'` and `'5.'` (no digits on one side of the point); jed traps both — fail
-closed, not a misread. **Known remaining leniency:** PG rejects any input that sets the same field
-twice (`'1 day 1 day'`, `'1 sec 5'`, `'1:00 5'`, `'1 hour 1:00'`), via its per-field mask; jed
-instead *sums* repeated fields (`'1 day 1 day'` = `2 days`, `'1:00 5'` = `01:00:05`). That is jed
-accepting input PG rejects, never a different answer to input PG accepts.
+closed, not a misread.
+
+**Each field at most once (PG's `DecodeInterval` field mask).** An input that names the same field
+twice is malformed — `22007`, `invalid input syntax for type interval: "<input>"` — never summed.
+Each segment claims a set of field bits, and a segment whose bits overlap an earlier one's is the
+duplicate:
+
+| segment | claims |
+|---|---|
+| `millennium`, `century`, `decade`, `year`, `month`, `week`, `day`, `hour`, `minute`, `millisecond`, `microsecond` | that unit's own bit (spellings and signs do not matter: `'1 day 1d'`, `'-1 day +1 day'` are duplicates) |
+| `second` with no fraction, or a fraction of zero (`'1.0 sec'`) | second |
+| `second` with a nonzero fraction | second + millisecond + microsecond |
+| a trailing unitless number | as `second` (`'1 sec 5'`, `'1:00 5'` are duplicates; `'1 ms 5'` is not) |
+| a bare time `HH:MM[:SS[.ffffff]]` | hour + minute + second + millisecond + microsecond |
+
+So `week` and `day` are **different** fields (`'1 week 1 day'` = `8 days`), as are the year-based
+units (`'1 decade 1 year'` = `11 years`) and `second`/`millisecond`/`microsecond`
+(`'1 sec 1 ms'` = `00:00:01.001`), while `'1 hour 1:00'`, `'1.5 sec 1 ms'`, and `'1 day 1 day ago'`
+are rejected. The rule lives in the one parser, so it binds every text→interval path (the literal,
+an adapting string, `::interval`/CAST, the runtime text cast, a bound parameter, container element
+text).
+
+*Error precedence.* PG reads the fields right to left, adding each into its running fields (out of
+range → its overflow error) **before** testing it for a duplicate. jed parses left to right, then
+replays that order over the parsed fields: a duplicate traps `22007` unless the running total from
+the right end through the duplicate is already outside the `i32` month/day or `i64` µs range, in
+which case it traps `22008` as PG would (`'2000000000 days 2000000000 days'`,
+`'1 day 1 day 99999999999 years'` → `22008` — PG's code is `22015`, the ledgered code divergence;
+`'99999999999 years 1 day 1 day'` → `22007`). Two residual differences, both on input PG also
+rejects: jed's running months fold years into months where PG keeps them apart until the end, and an
+error found while *reading* a segment (unknown unit, too many digits, a non-final unitless number)
+is reported left to right as before, so input that is both malformed and duplicated or out of range
+can report the other code.
 
 **Fractional-unit cascade.** A unit value may carry a fractional part, which cascades down using
 1 month = 30 days and 1 day = 24 h, **per token, independently** (PG semantics; jed computes it with

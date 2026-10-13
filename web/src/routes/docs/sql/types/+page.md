@@ -205,7 +205,9 @@ column cast agree.
 jed's input grammars are stricter than PostgreSQL's, the same as for literals: the `'now'`, `'today'`,
 and `'epoch'` timestamp words, ISO-8601 (`P1D`) and SQL-standard interval input (`'1-2'`,
 `'1 1:00'`) are rejected. A unit-less interval number is read as seconds only when it is the last
-field (`'5'`, `'1 day 2'`).
+field (`'5'`, `'1 day 2'`). As in PostgreSQL, an interval may name each field only once:
+`'1 day 1 day'` and `'1 hour 1:00'` raise `22007`, while `'1 week 1 day'` (week and day are
+different fields) is `8 days`.
 
 ## Casting to text
 
