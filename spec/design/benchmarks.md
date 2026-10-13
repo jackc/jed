@@ -1469,7 +1469,9 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
   engine;
 - ✅ UPDATE / DELETE throughput — `secondary_update`, `costed_update`, `secondary_pointset_delete`,
   and the `fk_*delete*` lanes;
-- miss-heavy point lookups;
+- ✅ **miss-heavy point lookups** — `point_lookup_pk_miss`: a scratch table holding every tenth key
+  of 1..1,000,000, so ~90% of the uniform probes miss and each miss descends to a different leaf
+  (probing past the end of the dense `large` keys would land on the one rightmost leaf every time);
 - text-heavy / large-value rows (exercise the overflow + LZ4 path);
 - ✅ **`Database` concurrent-reader throughput** — landed as the `concurrent_read` kind
   (§8.1): `concurrent_read_pk_r{1,4}` over the resident `small` dataset plus

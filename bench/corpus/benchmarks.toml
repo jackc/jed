@@ -37,6 +37,37 @@ gen = "int_uniform"
 min = 1
 max = 1000000
 
+# Miss-heavy PK point lookup (benchmarks.md §11). The scratch table holds every tenth key of
+# 1..1,000,000, so ~90% of the uniformly drawn probes find no row — and, unlike probing past the end
+# of the dense `large` keys, each miss descends to a different leaf. A recursive CTE builds the rows
+# so the one setup text runs on every engine (SQLite has no generate_series).
+[[bench]]
+name = "point_lookup_pk_miss"
+description = "PK point lookup on 100k sparse keys where ~90% of the probes are absent"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM sparse_orders WHERE id = $1"
+warmup = 5000
+iterations = 50000
+seed = 4289
+setup_sql = [
+  "DROP TABLE IF EXISTS sparse_orders",
+  "CREATE TABLE sparse_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO sparse_orders WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 100000) SELECT x * 10, x * 7 FROM g"
+]
+
+[bench.setup_sql_override]
+sqlite = [
+  "DROP TABLE IF EXISTS sparse_orders",
+  "CREATE TABLE sparse_orders (id INTEGER PRIMARY KEY, v INTEGER)",
+  "INSERT INTO sparse_orders WITH RECURSIVE g(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM g WHERE x < 100000) SELECT x * 10, x * 7 FROM g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
 # Composite-PK complete tuple lookup (query.composite_pk_pushdown). The scratch setup builds 100
 # contiguous 1000-row bucket prefixes; fixing bucket=42 and probing id exercises direct tuple-key
 # encoding. Before the tuple-bound slice jed full-scanned all 100k rows per iteration.
