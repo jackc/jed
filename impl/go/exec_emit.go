@@ -2297,6 +2297,73 @@ func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, er
 	return inVal, nil
 }
 
+// widthBucketArray is width_bucket(operand, thresholds) (array-functions.md §14) — PostgreSQL's
+// width_bucket_array ported step for step. Both arguments are non-NULL here (the node is strict). A
+// multidimensional array is 2202E and a NULL element 22004 (checked in that order, before any search,
+// as PG does). Then the binary search over the thresholds (ASSUMED sorted ascending — not checked, so
+// an unsorted array yields whatever the search lands on, exactly as in PG): mid = (left+right)/2;
+// operand < thresholds[mid] moves right to mid, else left to mid+1; the result is the final left —
+// the number of thresholds <= operand. A NaN float operand sorts at or above every threshold, so it
+// returns the element count without searching (PG's float8 shortcut). Each search step charges one
+// operator_eval plus the size-scaled work of the comparison, guarded — collate per code point of a
+// collated text pair, else decimal_work / varlen_compare — metered like an explicit `<` (the
+// GREATEST/LEAST rule, cost.md §3).
+func widthBucketArray(operand, thresholds Value, collation *Collation, m *costMeter) (Value, error) {
+	arr := thresholds.arrayVal()
+	if len(arr.Dims) > 1 {
+		return Value{}, newError(ArraySubscriptError, "thresholds must be one-dimensional array")
+	}
+	for _, e := range arr.Elements {
+		if e.Kind == ValNull {
+			return Value{}, newError(NullValueNotAllowed, "thresholds array must not contain NULLs")
+		}
+	}
+	left, right := 0, len(arr.Elements)
+	if (operand.Kind == ValFloat32 && math.IsNaN(float64(operand.F32()))) ||
+		(operand.Kind == ValFloat64 && math.IsNaN(operand.F64())) {
+		return IntValue(int64(right)), nil
+	}
+	for left < right {
+		mid := (left + right) / 2
+		t := arr.Elements[mid]
+		m.Charge(costs.OperatorEval)
+		collated := collation != nil && operand.Kind == ValText && t.Kind == ValText
+		if collated {
+			m.Charge(costs.Collate * int64(utf8.RuneCountInString(operand.str())+utf8.RuneCountInString(t.str())))
+		} else {
+			m.Charge(costs.DecimalWork * (decimalCmpWork(operand, t) - 1))
+			m.Charge(costs.VarlenCompare * (varlenCompareWork(operand, t) - 1))
+		}
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		var c int
+		switch {
+		case collated:
+			var err error
+			if c, err = collatedCmp(collation, operand.str(), t.str()); err != nil {
+				return Value{}, err
+			}
+		case operand.Kind == ValInt && t.Kind == ValDecimal:
+			c = decimalFromInt64(operand.Int).CmpValue(*t.decimal())
+		case operand.Kind == ValDecimal && t.Kind == ValInt:
+			c = operand.decimal().CmpValue(decimalFromInt64(t.Int))
+		case operand.Kind == ValFloat32 && t.Kind == ValFloat64:
+			c = floatTotalCmp(float64(operand.F32()), t.F64())
+		case operand.Kind == ValFloat64 && t.Kind == ValFloat32:
+			c = floatTotalCmp(operand.F64(), float64(t.F32()))
+		default:
+			c = valueCmp(operand, t)
+		}
+		if c < 0 {
+			right = mid
+		} else {
+			left = mid + 1
+		}
+	}
+	return IntValue(int64(left)), nil
+}
+
 // quantifiedMembership is the three-valued membership fold for `lhs op ANY/ALL(array)`
 // (array-functions.md §11), the generalization of inMembership to all five comparison operators and
 // both quantifiers. A NULL array → NULL; otherwise, over the flattened elements, ANY/SOME (all=false)

@@ -1245,6 +1245,83 @@ pub(crate) fn quantified_membership(
     })
 }
 
+/// `width_bucket(operand, thresholds)` (array-functions.md §14) — PostgreSQL's `width_bucket_array`
+/// ported step for step. Both arguments are non-NULL here (the node is strict). A multidimensional
+/// array is 2202E and a NULL element 22004 (checked in that order, before any search, as PG does).
+/// Then the binary search over the thresholds (ASSUMED sorted ascending — not checked, so an
+/// unsorted array yields whatever the search lands on, exactly as in PG): `mid = (left + right) /
+/// 2`; `operand < thresholds[mid]` moves `right` to `mid`, else `left` to `mid + 1`; the result is
+/// the final `left` — the number of thresholds `<=` operand, i.e. the rightmost of equal ones. A
+/// NaN float operand sorts at or above every threshold, so it returns the element count without
+/// searching (PG's float8 shortcut). Each search step charges one `operator_eval` plus the
+/// size-scaled work of the comparison, guarded — `collate` per code point of a collated text pair,
+/// else `decimal_work` / `varlen_compare` — metered like an explicit `<` (the GREATEST/LEAST rule,
+/// cost.md §3), over at most `⌈log₂(n+1)⌉` steps.
+pub(crate) fn width_bucket_array(
+    operand: &Value,
+    thresholds: &Value,
+    collation: Option<&Collation>,
+    m: &mut Meter,
+) -> Result<Value> {
+    let arr = match thresholds {
+        Value::Array(a) => a,
+        _ => unreachable!("the resolver requires an array thresholds argument"),
+    };
+    if arr.dims.len() > 1 {
+        return Err(EngineError::new(
+            SqlState::ArraySubscriptError,
+            "thresholds must be one-dimensional array",
+        ));
+    }
+    if arr.elements.iter().any(|e| matches!(e, Value::Null)) {
+        return Err(EngineError::new(
+            SqlState::NullValueNotAllowed,
+            "thresholds array must not contain NULLs",
+        ));
+    }
+    let mut left = 0usize;
+    let mut right = arr.elements.len();
+    let is_nan = match operand {
+        Value::Float32(f) => f.is_nan(),
+        Value::Float64(f) => f.is_nan(),
+        _ => false,
+    };
+    if is_nan {
+        return Ok(Value::Int(right as i64));
+    }
+    while left < right {
+        let mid = (left + right) / 2;
+        let t = &arr.elements[mid];
+        m.charge(COSTS.operator_eval);
+        let ord = if let (Some(c), Value::Text(x), Value::Text(y)) = (collation, operand, t) {
+            m.charge(COSTS.collate * (x.chars().count() as i64 + y.chars().count() as i64));
+            m.guard()?;
+            collated_cmp(c, x, y)?
+        } else {
+            m.charge(COSTS.decimal_work * ((decimal_cmp_work(operand, t) - 1) as i64));
+            m.charge(COSTS.varlen_compare * (varlen_compare_work(operand, t) - 1));
+            m.guard()?;
+            match (operand, t) {
+                (Value::Int(x), Value::Decimal(y)) => Decimal::from_i64(*x).cmp_value(y),
+                (Value::Decimal(x), Value::Int(y)) => x.cmp_value(&Decimal::from_i64(*y)),
+                (Value::Float32(x), Value::Float64(y)) => {
+                    crate::value::total_cmp_f64(*x as f64, *y)
+                }
+                (Value::Float64(x), Value::Float32(y)) => {
+                    crate::value::total_cmp_f64(*x, *y as f64)
+                }
+                _ => value_cmp(operand, t),
+            }
+        };
+        if ord == std::cmp::Ordering::Less {
+            right = mid;
+        } else {
+            left = mid + 1;
+        }
+    }
+    Ok(Value::Int(left as i64))
+}
+
 /// The row-constructor three-valued comparison `lhs op e` (composite.md §5): the same
 /// `eq3`/`lt3`/`gt3` decomposition `RExpr::Compare` evaluates, so a NULL field at the deciding
 /// position is UNKNOWN (PostgreSQL's row comparison against a subquery row).

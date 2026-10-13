@@ -1583,7 +1583,12 @@ impl Engine {
                 Ok(())
             }
             RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, ctes, cost),
-            RExpr::Quantified { lhs, array, .. } => {
+            RExpr::Quantified { lhs, array, .. }
+            | RExpr::WidthBucketArray {
+                operand: lhs,
+                thresholds: array,
+                ..
+            } => {
                 self.fold_uncorrelated_in_rexpr(lhs, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(array, bound, ctes, cost)
             }

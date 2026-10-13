@@ -508,6 +508,7 @@ import {
   resolveJsonpathFn,
   resolveColumnRef,
   resolveProjections,
+  resolveWidthBucketArray,
   sortTargetCollation,
   typmodOfColumn,
   valueToNode,
@@ -3800,6 +3801,7 @@ export class Engine {
       }
       case "inValues": add(expr.lhs); return;
       case "quantified": add(expr.lhs); add(expr.array); return;
+      case "widthBucketArray": add(expr.operand); add(expr.thresholds); return;
       case "cast": case "arrayCast": case "neg": case "not": case "isNull":
       case "isJson": case "jsonCtor": add(expr.operand); return;
       case "arith": case "compare": case "and": case "or": case "distinct":
@@ -21666,6 +21668,10 @@ export class Engine {
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
         e.array = this.foldUncorrelatedInRExpr(e.array, bound, ctes, cost);
         return e;
+      case "widthBucketArray":
+        e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost);
+        e.thresholds = this.foldUncorrelatedInRExpr(e.thresholds, bound, ctes, cost);
+        return e;
       default:
         return e; // leaves: column, outerColumn, param, const*
     }
@@ -23473,6 +23479,9 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
     case "quantified":
       children = sum(expr.lhs, expr.array);
       break;
+    case "widthBucketArray":
+      children = sum(expr.operand, expr.thresholds);
+      break;
     case "cast":
     case "arrayCast":
     case "neg":
@@ -24482,6 +24491,8 @@ export function rexprIsConstant(e: RExpr): boolean {
       return rexprIsConstant(e.lhs);
     case "quantified":
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.array);
+    case "widthBucketArray":
+      return rexprIsConstant(e.operand) && rexprIsConstant(e.thresholds);
     default:
       // Every leaf constant (constInt/constArray/param/…) is constant; a subscript / any other node
       // is treated conservatively as non-constant (no GIN accel; the residual filter still applies).
@@ -26629,6 +26640,8 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       return rexprReferencesOuter(e.lhs, depth);
     case "quantified":
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.array, depth);
+    case "widthBucketArray":
+      return rexprReferencesOuter(e.operand, depth) || rexprReferencesOuter(e.thresholds, depth);
     case "cast":
     case "arrayCast":
     case "neg":
@@ -26965,6 +26978,10 @@ function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
       collectHostFuncNodes(e.lhs, out);
       collectHostFuncNodes(e.array, out);
       return;
+    case "widthBucketArray":
+      collectHostFuncNodes(e.operand, out);
+      collectHostFuncNodes(e.thresholds, out);
+      return;
     case "cast":
     case "arrayCast":
     case "neg":
@@ -27240,6 +27257,10 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
     case "quantified":
       collectTouched(e.lhs, depth, touched);
       collectTouched(e.array, depth, touched);
+      return;
+    case "widthBucketArray":
+      collectTouched(e.operand, depth, touched);
+      collectTouched(e.thresholds, depth, touched);
       return;
     case "cast":
     case "arrayCast":
@@ -27655,6 +27676,10 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
     case "quantified":
       rebasePlaceholderCols(e.lhs, from, target);
       rebasePlaceholderCols(e.array, from, target);
+      return;
+    case "widthBucketArray":
+      rebasePlaceholderCols(e.operand, from, target);
+      rebasePlaceholderCols(e.thresholds, from, target);
       return;
     case "cast":
     case "arrayCast":
@@ -28333,7 +28358,14 @@ export type RExpr =
       // sorts by it. The left operand's derivation for the array form (an array carries none), the
       // subquery form's combined one when folded from it; null for C / a non-text pair.
       collation: Collation | null;
-    };
+    }
+  // `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14),
+  // PostgreSQL's width_bucket_array: a binary search over a thresholds array ASSUMED sorted ascending
+  // (not checked), yielding the count of thresholds <= operand as i32. STRICT like a scalar function:
+  // a NULL operand → NULL without evaluating `thresholds`. A multidimensional array is 2202E, a NULL
+  // element 22004. Charges one operator_eval for the node plus one per search step (plus
+  // decimal_work / collate). `collation` is the text comparison collation (null for C / non-text).
+  | { kind: "widthBucketArray"; operand: RExpr; thresholds: RExpr; collation: Collation | null };
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
 export type SubqueryKind = "scalar" | "exists" | "in" | "quantified";
@@ -33608,6 +33640,14 @@ export function resolveFuncCall(
         : t.kind === "int" || t.kind === "decimal" || t.kind === "null";
     if (!ok(tys[0]!) || !ok(tys[1]!) || !ok(tys[2]!)) throw noFuncOverload("width_bucket");
     return scalarFuncNode("width_bucket", rargs, "i32", undefined);
+  }
+  // `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14): a
+  // binary search over a sorted thresholds array, its operand paired with the array's element type
+  // like a quantified comparison.
+  if (lname === "width_bucket" && e.args.length === 2) {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    return resolveWidthBucketArray(scope, e.args[0]!, e.args[1]!, ag, params);
   }
   // A built-in scalar function OR a host-registered one (extensibility.md §4.2 — a host-only name
   // routes here too; resolveScalarFunc tries the built-in catalog first, then the host registry).

@@ -562,6 +562,14 @@ const (
 	// over the array's flattened elements reuses the IN-list membership semantics, charging per
 	// element like reInValues.
 	reQuantified
+	// reWidthBucketArray is width_bucket(operand, thresholds) — the array-threshold variant
+	// (array-functions.md §14), PostgreSQL's width_bucket_array: a binary search over a thresholds
+	// array ASSUMED sorted ascending (not checked), yielding the count of thresholds <= operand as
+	// i32. `lhs` is the operand, `rhs` the thresholds array, `collation` the text comparison
+	// collation (nil = C / non-text). STRICT like a scalar function: a NULL operand → NULL without
+	// evaluating `rhs`. A multidimensional array is 2202E, a NULL element 22004. Charges one
+	// operator_eval for the node plus one per search step (plus decimal_work / collate).
+	reWidthBucketArray
 	// reRow is a ROW(...) composite constructor (spec/design/composite.md §1): its field nodes are
 	// held in sargs (so the existing fold / references-outer / touched-set walks recurse into them
 	// for free). Evaluates to a ValComposite; one operator_eval per node (cost.md §9).

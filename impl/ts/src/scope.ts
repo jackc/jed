@@ -2867,6 +2867,8 @@ export function renderRExpr(e: RExpr): string {
     }
     case "quantified":
       return `${renderRExpr(e.lhs)} ${explainOp(e.op)} ${e.all ? "all" : "any"}(${renderRExpr(e.array)})`;
+    case "widthBucketArray":
+      return `width_bucket(${renderRExpr(e.operand)}, ${renderRExpr(e.thresholds)})`;
     case "inValues":
       return `${renderRExpr(e.lhs)} ${e.negated ? "not " : ""}in (${e.list.map(renderExplainValue).join(", ")})`;
     case "subquery": {

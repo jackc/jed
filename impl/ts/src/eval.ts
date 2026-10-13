@@ -17,6 +17,7 @@ import {
   decimalValue,
   eq3,
   float32Value,
+  floatTotalCmp,
   float64Value,
   from3,
   gt3,
@@ -2392,7 +2393,87 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const av = evalExpr(e.array, row, env, m);
       return quantifiedMembership(e.op, e.all, e.rowWise, lv, av, e.collation, m);
     }
+    case "widthBucketArray": {
+      // width_bucket(operand, thresholds) (array-functions.md §14): strict like a scalar function —
+      // a NULL operand short-circuits before the thresholds are evaluated.
+      m.charge(COSTS.operatorEval);
+      const ov = evalExpr(e.operand, row, env, m);
+      if (ov.kind === "null") return nullValue();
+      const tv = evalExpr(e.thresholds, row, env, m);
+      if (tv.kind === "null") return nullValue();
+      return widthBucketArray(ov, tv, e.collation, m);
+    }
   }
+}
+
+// widthBucketArray is width_bucket(operand, thresholds) (array-functions.md §14) — PostgreSQL's
+// width_bucket_array ported step for step. Both arguments are non-NULL here (the node is strict). A
+// multidimensional array is 2202E and a NULL element 22004 (checked in that order, before any search,
+// as PG does). Then the binary search over the thresholds (ASSUMED sorted ascending — not checked, so
+// an unsorted array yields whatever the search lands on, exactly as in PG): mid = (left+right)/2;
+// operand < thresholds[mid] moves right to mid, else left to mid+1; the result is the final left —
+// the number of thresholds <= operand. A NaN float operand sorts at or above every threshold, so it
+// returns the element count without searching (PG's float8 shortcut). Each search step charges one
+// operator_eval plus the size-scaled work of the comparison, guarded — collate per code point of a
+// collated text pair, else decimal_work / varlen_compare — metered like an explicit `<` (the
+// GREATEST/LEAST rule, cost.md §3).
+export function widthBucketArray(
+  operand: Value,
+  thresholds: Value,
+  collation: Collation | null,
+  m: Meter,
+): Value {
+  if (thresholds.kind !== "array") {
+    throw new Error("BUG: the resolver requires an array thresholds argument");
+  }
+  if (thresholds.dims.length > 1) {
+    throw engineError("array_subscript_error", "thresholds must be one-dimensional array");
+  }
+  if (thresholds.elements.some((t) => t.kind === "null")) {
+    throw engineError("null_value_not_allowed", "thresholds array must not contain NULLs");
+  }
+  let left = 0;
+  let right = thresholds.elements.length;
+  if ((operand.kind === "f32" || operand.kind === "f64") && Number.isNaN(operand.value)) {
+    return intValue(BigInt(right));
+  }
+  while (left < right) {
+    const mid = Math.floor((left + right) / 2);
+    const t = thresholds.elements[mid]!;
+    m.charge(COSTS.operatorEval);
+    let c: number;
+    if (collation !== null && operand.kind === "text" && t.kind === "text") {
+      m.charge(COSTS.collate * BigInt([...operand.text].length + [...t.text].length));
+      m.guard();
+      c = collatedCmp(collation, operand.text, t.text);
+    } else {
+      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(operand, t) - 1));
+      m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(operand, t) - 1));
+      m.guard();
+      c = widthBucketCmp(operand, t);
+    }
+    if (c < 0) right = mid;
+    else left = mid + 1;
+  }
+  return intValue(BigInt(left));
+}
+
+// widthBucketCmp is the total order of width_bucket's operand against one threshold: an integer and
+// a decimal compare by value, an f32 and an f64 by the float total order, anything else by valueCmp.
+function widthBucketCmp(operand: Value, t: Value): number {
+  if (operand.kind === "int" && t.kind === "decimal") {
+    return Decimal.fromBigInt(operand.int).cmpValue(t.dec);
+  }
+  if (operand.kind === "decimal" && t.kind === "int") {
+    return operand.dec.cmpValue(Decimal.fromBigInt(t.int));
+  }
+  if (
+    (operand.kind === "f32" || operand.kind === "f64") &&
+    (t.kind === "f32" || t.kind === "f64")
+  ) {
+    return floatTotalCmp(operand.value, t.value);
+  }
+  return valueCmp(operand, t);
 }
 
 // subqueryRowValue is the value one subquery body row contributes (§26): its single column, or —

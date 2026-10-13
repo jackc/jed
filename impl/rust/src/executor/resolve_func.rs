@@ -345,6 +345,19 @@ pub(crate) fn resolve_func_call(
             resolved_type_of(ScalarType::Int32),
         ));
     }
+    // `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14):
+    // a binary search over a sorted thresholds array, its operand paired with the array's element
+    // type like a quantified comparison.
+    if lname == "width_bucket" && args.len() == 2 {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_width_bucket_array(scope, &args[0], &args[1], agg, params);
+    }
     // `mod(a, b)` is the function spelling of the `%` (mod) operator (catalog name "mod") — route it
     // to the SAME arithmetic machinery so mod() and % are observably identical (promotion, the
     // integer/decimal/float kernels, 22012/22003). PG's mod() is integer/numeric only; jed
@@ -2236,6 +2249,15 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
                 (true, true) => "!~*",
             },
             rhs,
+        ),
+        RExpr::WidthBucketArray {
+            operand,
+            thresholds,
+            ..
+        } => format!(
+            "width_bucket({}, {})",
+            render_rexpr(operand),
+            render_rexpr(thresholds)
         ),
         RExpr::Casing { upper, arg } => explain_call(
             if *upper { "upper" } else { "lower" },

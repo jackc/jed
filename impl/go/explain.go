@@ -1532,6 +1532,8 @@ func renderRExpr(e *rExpr) string {
 		return fmt.Sprintf("%s %sin (%s)", renderRExpr(e.lhs), map[bool]string{true: "not ", false: ""}[e.negated], strings.Join(vals, ", "))
 	case reQuantified:
 		return fmt.Sprintf("%s %s %s(%s)", renderRExpr(e.lhs), explainBinaryOp(e.op), map[bool]string{true: "all", false: "any"}[e.quantAll], renderRExpr(e.rhs))
+	case reWidthBucketArray:
+		return fmt.Sprintf("width_bucket(%s, %s)", renderRExpr(e.lhs), renderRExpr(e.rhs))
 	}
 	panic("unhandled resolved expression in EXPLAIN")
 }

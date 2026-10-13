@@ -32,7 +32,9 @@
 > composite element, and the comparison kernels route through the composite *total order*); the two
 > pieces that needed code are `unnest`'s composite output column and the `ANY`/`ALL` per-element
 > compare. Capability `func.array_composite`, oracle-checked
-> (`suites/query/unnest_composite.test`, `suites/expr/array_composite_functions.test`).
+> (`suites/query/unnest_composite.test`, `suites/expr/array_composite_functions.test`). §14 — the
+> **`width_bucket(operand, thresholds)`** array-threshold variant, a binary search over a sorted
+> thresholds array (`suites/expr/width_bucket_array.test`, oracle-checked).
 
 ## 1. Why a new layer
 
@@ -899,3 +901,78 @@ Two pieces, one per core (Rust/Go/TS), each tiny:
     quirk. Both are *rows* (the element count / `count(*)` agree, and the NULL sorts last under `ORDER
     BY` in both), so the oracle corpus pins the count and the non-NULL renders; the NULL-element render
     is a per-core unit-test assertion.
+
+## 14. `width_bucket(operand, thresholds)` — the array-threshold variant
+
+PostgreSQL's `width_bucket(anycompatible, anycompatiblearray) → integer` (`width_bucket_array` in
+`arrayfuncs.c`), the array sibling of the equi-width `width_bucket(op, low, high, count)`
+([../functions/catalog.toml](../functions/catalog.toml)). It returns the **bucket number** of
+`operand` in a list of bucket lower bounds: the number of thresholds `<=` operand — `0` below the
+first, the element count at or above the last. Like the four-argument form it is **resolver-routed**
+(no catalog row): `width_bucket` with two arguments is intercepted before the generic scalar path and
+resolves to a dedicated `WidthBucketArray` node carrying the comparison collation.
+
+### 14.1 Semantics — ported from `width_bucket_array`
+
+1. **Strict.** A NULL operand or a NULL array yields NULL. Like every jed scalar function, the
+   operand is evaluated first and a NULL short-circuits before the thresholds are evaluated (so a NULL
+   operand never reaches the element checks below).
+2. **Shape and NULL checks, in PG's order, before any search.** A multidimensional thresholds array is
+   **`2202E`** (*"thresholds must be one-dimensional array"*); then a NULL element is **`22004`**
+   (*"thresholds array must not contain NULLs"*). The empty array (`ndim 0`) is fine and yields `0`.
+   The array's lower bound is irrelevant — the result counts elements, not subscripts.
+3. **The binary search, step for step.** `left = 0`, `right = n`; while `left < right`: `mid =
+   (left + right) / 2`; if `operand < thresholds[mid]` then `right = mid`, else `left = mid + 1`; the
+   result is `left`. The thresholds are **assumed sorted ascending and never checked** — an unsorted
+   array yields whatever the search lands on, exactly PG's answer (`width_bucket(2, ARRAY[10, 1, 5,
+   3, 8])` is `2`). Among equal thresholds the search finds the rightmost.
+4. **Ordering.** The comparison is the element type's total order — the order `ORDER BY` uses:
+   integers/decimals by value (an integer and a decimal compare by value, the `promote-to-decimal`
+   rule), floats by PG's total `float8` order (`NaN` above every number and equal to `NaN`, `-0 = +0`,
+   [float.md §3](float.md)), text by the derived collation (`C` byte order unless a column, `COLLATE`,
+   or the array carries another — the operand's and the array's derivations combine, a conflict is
+   `42P22`, [collation.md §1](collation.md)), and every other orderable type (date, timestamp(tz),
+   interval, uuid, bytea, boolean, range, jsonb, composite) by its btree order. A **NaN float
+   operand** returns `n` without searching — PG's `float8` shortcut; the search would land there
+   anyway.
+5. **Result** `i32` (PG `integer`); an array cannot exceed `i32` elements, so it never overflows.
+
+### 14.2 Resolution — jed's spelling of `anycompatible`
+
+The two arguments resolve exactly as a quantified comparison's operands do (§11.3, the shared
+`resolve_scalar_array_operands`): a bare literal operand adapts to the array's element type
+(`width_bucket(5, ARRAY[1.5, 2.5]::f64[])` lands `5` on `f64`), and a bare `ARRAY[…]` thresholds
+argument adapts its elements to a concrete operand's type (`width_bucket(i32_col, ARRAY[1, 2])`
+builds an `i32[]`). Then:
+
+- the second argument must be an array, else **`42883`** (PG: `function width_bucket(integer,
+  integer) does not exist`); a bare untyped `NULL` array takes its element type from the operand and
+  yields NULL;
+- the operand must be **comparable** with the element type under jed's comparison matrix
+  (`classify_comparable`), else **`42883`** — PG's anycompatible unification finding no common type.
+  An array operand is `42883` too;
+- two bare untyped `NULL`s are **`42P18`** (jed's polymorphic posture, §5 #6; PG defaults them to
+  `text` and returns NULL — a degenerate case, never oracle-checked).
+
+### 14.3 Cost
+
+One `operator_eval` for the node, then each **search step** charges one `operator_eval` plus the
+comparison's size-scaled work — `collate` per code point of both strings for a collated text pair,
+else `decimal_work` and `varlen_compare` — guarded before the comparison runs: the same metering an
+explicit `<` charges, as GREATEST/LEAST does ([cost.md §3](cost.md)). A search makes at most
+`⌈log₂(n + 1)⌉` steps, so the per-row charge is logarithmic in the array, unlike `= ANY`'s
+per-element walk (§11.4). The arguments charge their own evaluation. Deterministic and
+cross-core-identical, asserted with `# cost:` in the corpus.
+
+### 14.4 Ratified divergences
+
+25. **The operand/element pairing is jed's comparison matrix, not PG's coercion lattice.** Where PG
+    finds a common type by implicit casts, jed requires the two to be comparable: an integer and a
+    decimal pair (by value, as PG's numeric cast would), but float and date stay strict islands
+    ([float.md §6](float.md), [date.md §4](date.md)), so a **typed** integer operand against `f64[]`
+    thresholds (`width_bucket(5::i64, ARRAY[1.5]::f64[])`) is `42883` where PG returns a bucket
+    (ledgered in `oracle_overrides.toml`); a bare literal adapts and agrees with PG. Likewise a
+    `date` operand against `timestamp[]` thresholds is `42883`.
+26. **`json` thresholds are a resolve-time `42883`.** PG raises the same code at execution (*"could
+    not identify a comparison function for type json"*), so jed differs only when the operand is NULL
+    (PG then returns NULL without looking for a comparator).

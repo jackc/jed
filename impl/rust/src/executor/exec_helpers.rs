@@ -1036,7 +1036,12 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 || query_plan_references_outer(plan, depth + 1)
         }
         RExpr::InValues { lhs, .. } => rexpr_references_outer(lhs, depth),
-        RExpr::Quantified { lhs, array, .. } => {
+        RExpr::Quantified { lhs, array, .. }
+        | RExpr::WidthBucketArray {
+            operand: lhs,
+            thresholds: array,
+            ..
+        } => {
             rexpr_references_outer(lhs, depth) || rexpr_references_outer(array, depth)
         }
         RExpr::Cast { inner, .. } | RExpr::ArrayCast { inner, .. } => {
@@ -1185,7 +1190,12 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched_plan(plan, depth + 1, touched);
         }
         RExpr::InValues { lhs, .. } => collect_touched(lhs, depth, touched),
-        RExpr::Quantified { lhs, array, .. } => {
+        RExpr::Quantified { lhs, array, .. }
+        | RExpr::WidthBucketArray {
+            operand: lhs,
+            thresholds: array,
+            ..
+        } => {
             collect_touched(lhs, depth, touched);
             collect_touched(array, depth, touched);
         }

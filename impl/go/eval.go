@@ -4139,6 +4139,25 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		return quantifiedMembership(e.op, e.quantAll, e.rowWise, lv, av, e.collation, m)
+	case reWidthBucketArray:
+		// width_bucket(operand, thresholds) (array-functions.md §14): strict like a scalar function —
+		// a NULL operand short-circuits before the thresholds are evaluated.
+		m.Charge(costs.OperatorEval)
+		ov, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if ov.Kind == ValNull {
+			return NullValue(), nil
+		}
+		tv, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if tv.Kind == ValNull {
+			return NullValue(), nil
+		}
+		return widthBucketArray(ov, tv, e.collation, m)
 	default: // reDistinct
 		m.Charge(costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)

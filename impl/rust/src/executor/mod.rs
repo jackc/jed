@@ -3856,6 +3856,20 @@ pub(crate) enum RExpr {
         /// subquery form's combined one when folded from it; `None` for `C` / a non-text pair.
         collation: Option<std::sync::Arc<Collation>>,
     },
+    /// `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14),
+    /// PostgreSQL's `width_bucket_array`: a binary search over a thresholds array ASSUMED sorted
+    /// ascending (not checked), yielding the count of thresholds `<=` operand (the 1-based bucket,
+    /// 0 below the first) as `i32`. STRICT like a scalar function: a NULL operand → NULL without
+    /// evaluating `thresholds`, a NULL array → NULL. A multidimensional array is 2202E, a NULL
+    /// element 22004. Charges one `operator_eval` for the node plus one per comparison step the
+    /// search makes (plus `decimal_work` / `collate` like the quantified walk).
+    WidthBucketArray {
+        operand: Box<RExpr>,
+        thresholds: Box<RExpr>,
+        /// The comparison collation for a text operand/thresholds pair (collation.md §1): the
+        /// combined derivation of both arguments, `None` for `C` / a non-text pair.
+        collation: Option<std::sync::Arc<Collation>>,
+    },
 }
 
 /// Which subquery form an `RExpr::Subquery` is (spec/design/grammar.md §26).

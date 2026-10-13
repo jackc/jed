@@ -1342,23 +1342,18 @@ pub(crate) fn resolve_range_set_op(
     ))
 }
 
-/// Resolve a quantified array comparison `x op ANY/SOME/ALL(arr)` (array-functions.md §11): the
-/// array spelling of `IN`. `x` (`lhs`) and the array operand resolve with the SAME literal
-/// adaptation the comparison operators use — a bare-literal `x` adapts to the array's element type,
-/// a bare `ARRAY[…]` operand adapts its elements to `x`'s type. The right operand must be an array
-/// (a non-array side is `42809`; a bare untyped `NULL` is `42P18`); `x` and the element type must
-/// be comparable (else `42883`, PG's operator-not-found). The result is always `boolean`; the 3VL
-/// fold over the flattened elements reuses the `eq3`/`lt3`/`gt3` kernels at eval (the `IN`-list
-/// membership machinery, generalized to all five operators and both quantifiers).
-pub(crate) fn resolve_quantified(
+/// Resolve a scalar operand `x` against an array operand with the comparison operators' literal
+/// adaptation (array-functions.md §11.3) — shared by the quantified comparisons and the
+/// `width_bucket(operand, thresholds)` array variant (§14). Both resolve with no hint first; then a
+/// bare `ARRAY[…]` constructor adapts its elements to a CONCRETE `x`'s type, or a bare-literal `x`
+/// adapts (with a range check) to the array's element type.
+pub(crate) fn resolve_scalar_array_operands(
     scope: &Scope,
-    op: BinaryOp,
-    all: bool,
     lhs: &Expr,
     array: &Expr,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<(RExpr, ResolvedType)> {
+) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
     // Pass 1: resolve both operands with no hint.
     let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
     let (mut ra, mut at) = resolve(scope, array, None, agg, params)?;
@@ -1380,6 +1375,27 @@ pub(crate) fn resolve_quantified(
             }
         }
     }
+    Ok((rl, lt, ra, at))
+}
+
+/// Resolve a quantified array comparison `x op ANY/SOME/ALL(arr)` (array-functions.md §11): the
+/// array spelling of `IN`. `x` (`lhs`) and the array operand resolve with the SAME literal
+/// adaptation the comparison operators use — a bare-literal `x` adapts to the array's element type,
+/// a bare `ARRAY[…]` operand adapts its elements to `x`'s type. The right operand must be an array
+/// (a non-array side is `42809`; a bare untyped `NULL` is `42P18`); `x` and the element type must
+/// be comparable (else `42883`, PG's operator-not-found). The result is always `boolean`; the 3VL
+/// fold over the flattened elements reuses the `eq3`/`lt3`/`gt3` kernels at eval (the `IN`-list
+/// membership machinery, generalized to all five operators and both quantifiers).
+pub(crate) fn resolve_quantified(
+    scope: &Scope,
+    op: BinaryOp,
+    all: bool,
+    lhs: &Expr,
+    array: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (rl, lt, ra, at) = resolve_scalar_array_operands(scope, lhs, array, agg, params)?;
     // The right operand must be an array.
     let elem = match &at {
         ResolvedType::Array(e) => (**e).clone(),
@@ -1441,6 +1457,59 @@ pub(crate) fn resolve_quantified(
             collation,
         },
         ResolvedType::Bool,
+    ))
+}
+
+/// Resolve `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md
+/// §14), PostgreSQL's `width_bucket(anycompatible, anycompatiblearray)`. The two arguments pair with
+/// the quantified comparisons' literal adaptation (`resolve_scalar_array_operands`), and the operand
+/// must be COMPARABLE with the element type under jed's comparison matrix — jed's spelling of PG's
+/// anycompatible unification (int × decimal promote; float and date are strict islands, the
+/// documented float.md §6 / date.md §4 divergences). A non-array second argument or an incomparable
+/// pair is 42883 (PG's function-does-not-exist); two bare untyped NULLs are 42P18 (jed's
+/// polymorphic posture). A text pair compares under the combined collation (collation.md §1).
+pub(crate) fn resolve_width_bucket_array(
+    scope: &Scope,
+    operand: &Expr,
+    thresholds: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (ro, ot, rt, tt) = resolve_scalar_array_operands(scope, operand, thresholds, agg, params)?;
+    let elem = match &tt {
+        ResolvedType::Array(e) => (**e).clone(),
+        // A bare untyped NULL array takes its type from the operand (ELEM := the operand's type);
+        // with a bare NULL operand too, ELEM is undeterminable.
+        ResolvedType::Null => {
+            if ot == ResolvedType::Null {
+                return Err(EngineError::new(
+                    SqlState::IndeterminateDatatype,
+                    "could not determine the polymorphic type of width_bucket's arguments",
+                ));
+            }
+            ot.clone()
+        }
+        _ => return Err(no_func_overload("width_bucket")),
+    };
+    if matches!(ot, ResolvedType::Array(_)) || classify_comparable(&ot, &elem).is_err() {
+        return Err(no_func_overload("width_bucket"));
+    }
+    let collation = if ot == ResolvedType::Text && elem == ResolvedType::Text {
+        let d = combine_deriv(
+            derive_collation(scope, operand)?,
+            derive_collation(scope, thresholds)?,
+        )?;
+        resolve_deriv(scope.catalog, d)?
+    } else {
+        None
+    };
+    Ok((
+        RExpr::WidthBucketArray {
+            operand: Box::new(ro),
+            thresholds: Box::new(rt),
+            collation,
+        },
+        resolved_type_of(ScalarType::Int32),
     ))
 }
 

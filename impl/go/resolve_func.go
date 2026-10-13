@@ -1662,6 +1662,96 @@ func resolveRangeSetOp(op binaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt re
 		resolvedType{kind: rtRange, elem: &elemRT}, nil
 }
 
+// resolveScalarArrayOperands resolves a scalar operand `x` against an array operand with the
+// comparison operators' literal adaptation (array-functions.md §11.3) — shared by the quantified
+// comparisons and the width_bucket(operand, thresholds) array variant (§14). Both resolve with no
+// hint first; then a bare ARRAY[…] constructor adapts its elements to a CONCRETE `x`'s type, or a
+// bare-literal `x` adapts (with a range check) to the array's element type.
+func resolveScalarArrayOperands(s *scope, lhs, array exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+	// Pass 1: resolve both operands with no hint.
+	rl, lt, err := resolve(s, lhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	ra, at, err := resolve(s, array, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	// If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
+	// bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
+	// constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
+	// column / cast operand (it ignores the hint).
+	if !isAdaptableOperand(lhs) {
+		if h := ctxOf(lt); h != nil {
+			if ra, at, err = resolve(s, array, h, ag, params); err != nil {
+				return nil, resolvedType{}, nil, resolvedType{}, err
+			}
+		}
+	}
+	// If the array resolved to E[] and `x` is an adaptable bare literal, adapt `x` to E (with a
+	// range check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
+	if at.kind == rtArray && isAdaptableOperand(lhs) {
+		if h, ok := elemScalarHint(*at.elem); ok {
+			if rl, lt, err = resolve(s, lhs, &h, ag, params); err != nil {
+				return nil, resolvedType{}, nil, resolvedType{}, err
+			}
+		}
+	}
+	return rl, lt, ra, at, nil
+}
+
+// resolveWidthBucketArray resolves width_bucket(operand, thresholds) — the array-threshold variant
+// (array-functions.md §14), PostgreSQL's width_bucket(anycompatible, anycompatiblearray). The two
+// arguments pair with the quantified comparisons' literal adaptation (resolveScalarArrayOperands),
+// and the operand must be COMPARABLE with the element type under jed's comparison matrix — jed's
+// spelling of PG's anycompatible unification (int × decimal promote; float and date are strict
+// islands, the documented float.md §6 / date.md §4 divergences). A non-array second argument or an
+// incomparable pair is 42883 (PG's function-does-not-exist); two bare untyped NULLs are 42P18 (jed's
+// polymorphic posture). A text pair compares under the combined collation (collation.md §1).
+func resolveWidthBucketArray(s *scope, operand, thresholds exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	ro, ot, rt, tt, err := resolveScalarArrayOperands(s, operand, thresholds, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	var elem resolvedType
+	switch tt.kind {
+	case rtArray:
+		elem = *tt.elem
+	case rtNull:
+		// A bare untyped NULL array takes its type from the operand (ELEM := the operand's type);
+		// with a bare NULL operand too, ELEM is undeterminable.
+		if ot.kind == rtNull {
+			return nil, resolvedType{}, newError(IndeterminateDatatype,
+				"could not determine the polymorphic type of width_bucket's arguments")
+		}
+		elem = ot
+	default:
+		return nil, resolvedType{}, noFuncOverload("width_bucket")
+	}
+	if ot.kind == rtArray || classifyComparable(ot, elem) != nil {
+		return nil, resolvedType{}, noFuncOverload("width_bucket")
+	}
+	var coll *Collation
+	if ot.kind == rtText && elem.kind == rtText {
+		od, err := deriveCollation(s, operand)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		td, err := deriveCollation(s, thresholds)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		d, err := combineDeriv(od, td)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if coll, err = resolveDeriv(s.catalog, d); err != nil {
+			return nil, resolvedType{}, err
+		}
+	}
+	return &rExpr{kind: reWidthBucketArray, lhs: ro, rhs: rt, collation: coll}, resolvedTypeOf(scalarInt32), nil
+}
+
 // resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
 // (array-functions.md §11): the array spelling of IN. `x` (Lhs) and the array operand resolve with
 // the SAME literal adaptation the comparison operators use — a bare-literal `x` adapts to the array's
@@ -1669,34 +1759,9 @@ func resolveRangeSetOp(op binaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt re
 // an array (a non-array side is 42809; a bare untyped NULL is 42P18); `x` and the element type must
 // be comparable (else 42883, PG's operator-not-found). The result is always boolean.
 func resolveQuantified(s *scope, q *quantifiedExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	// Pass 1: resolve both operands with no hint.
-	rl, lt, err := resolve(s, q.Lhs, nil, ag, params)
+	rl, lt, ra, at, err := resolveScalarArrayOperands(s, q.Lhs, q.Array, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
-	}
-	ra, at, err := resolve(s, q.Array, nil, ag, params)
-	if err != nil {
-		return nil, resolvedType{}, err
-	}
-	// If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
-	// bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
-	// constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
-	// column / cast operand (it ignores the hint).
-	if !isAdaptableOperand(q.Lhs) {
-		if h := ctxOf(lt); h != nil {
-			if ra, at, err = resolve(s, q.Array, h, ag, params); err != nil {
-				return nil, resolvedType{}, err
-			}
-		}
-	}
-	// If the array resolved to E[] and `x` is an adaptable bare literal, adapt `x` to E (with a
-	// range check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
-	if at.kind == rtArray && isAdaptableOperand(q.Lhs) {
-		if h, ok := elemScalarHint(*at.elem); ok {
-			if rl, lt, err = resolve(s, q.Lhs, &h, ag, params); err != nil {
-				return nil, resolvedType{}, err
-			}
-		}
 	}
 	// The right operand must be an array.
 	switch {
@@ -2914,6 +2979,18 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, noFuncOverload("width_bucket")
 		}
 		return &rExpr{kind: reScalarFunc, sfunc: sfWidthBucket, sargs: rargs, result: scalarInt32}, resolvedTypeOf(scalarInt32), nil
+	}
+	// `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14): a
+	// binary search over a sorted thresholds array, its operand paired with the array's element type
+	// like a quantified comparison.
+	if name == "width_bucket" && len(fc.Args) == 2 {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		return resolveWidthBucketArray(s, *fc.Args[0], *fc.Args[1], ag, params)
 	}
 	// `mod(a, b)` is the function spelling of the `%` (mod) operator — route it to the SAME
 	// arithmetic machinery so mod() and % are observably identical (promotion, the integer/decimal/

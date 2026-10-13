@@ -1222,6 +1222,11 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
         RExpr::Subquery { lhs, .. } => estimator_operator_nodes(lhs.as_deref()),
         RExpr::InValues { lhs, .. } => estimator_operator_nodes(Some(lhs)),
         RExpr::Quantified { lhs, array, .. }
+        | RExpr::WidthBucketArray {
+            operand: lhs,
+            thresholds: array,
+            ..
+        }
         | RExpr::Arith {
             lhs, rhs: array, ..
         }
@@ -1333,6 +1338,11 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
         RExpr::Subquery { lhs, .. } => lhs.iter().map(Box::as_ref).collect(),
         RExpr::InValues { lhs, .. } => vec![lhs],
         RExpr::Quantified { lhs, array, .. }
+        | RExpr::WidthBucketArray {
+            operand: lhs,
+            thresholds: array,
+            ..
+        }
         | RExpr::Arith {
             lhs, rhs: array, ..
         }
@@ -2753,7 +2763,12 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::JsonPathFn { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::JsonSqlFn { ctx, path, .. } => rexpr_is_constant(ctx) && rexpr_is_constant(path),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
-        RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
+        RExpr::Quantified { lhs, array, .. }
+        | RExpr::WidthBucketArray {
+            operand: lhs,
+            thresholds: array,
+            ..
+        } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
     }
 }
 

@@ -2838,8 +2838,15 @@ errors         = []
 #   float   — the same in f64 (a single correctly-rounded chain, so cross-core identical), but an
 #             operand/bound NaN → 2201G, an infinite bound → 2201G (the operand may be ±Inf).
 # `count ≤ 0` → 2201G, `low == high` → 2201G; a result past int4 (count+1 with count = int4 max) →
-# 22003. Result int4. The array-threshold variant width_bucket(value, thresholds[]) is a deferred
-# follow-on. (No catalog row — see resolve_func_call.)
+# 22003. Result int4. (No catalog row — see resolve_func_call.)
+#
+# width_bucket(operand, thresholds) — the ARRAY-THRESHOLD variant, PG's width_bucket(anycompatible,
+# anycompatiblearray) → int4 (../design/array-functions.md §14): PG's width_bucket_array binary search
+# over a thresholds array assumed sorted ascending (not checked) → the count of thresholds <= operand.
+# Strict; a multidimensional array → 2202E, a NULL element → 22004. The operand pairs with the element
+# type like a quantified comparison (literal adaptation, then jed's comparison matrix — else 42883);
+# text compares under the combined collation. Each search step charges one operator_eval plus the
+# comparison's size-scaled work. Also resolver-routed (two args), with no catalog row.
 
 # --- interval constructor (make_interval) ------------------------------------
 # PostgreSQL's interval builder, and the engine's FIRST named + defaulted function

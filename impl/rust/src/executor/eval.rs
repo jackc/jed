@@ -3247,6 +3247,24 @@ impl RExpr {
                 let av = array.eval(row, env, m)?;
                 quantified_membership(*op, *all, *row_wise, &lv, &av, collation.as_deref(), m)
             }
+            // `width_bucket(operand, thresholds)` (array-functions.md §14): strict like a scalar
+            // function — a NULL operand short-circuits before `thresholds` is evaluated.
+            RExpr::WidthBucketArray {
+                operand,
+                thresholds,
+                collation,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let ov = operand.eval(row, env, m)?;
+                if matches!(ov, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let tv = thresholds.eval(row, env, m)?;
+                if matches!(tv, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                width_bucket_array(&ov, &tv, collation.as_deref(), m)
+            }
         }
     }
 }

@@ -320,6 +320,52 @@ SELECT id FROM at WHERE a < ANY (SELECT c FROM at)
 statement error 42P22
 SELECT id FROM at WHERE s < ANY (c)
 
+# width_bucket(operand, thresholds) (array-functions.md §14) searches under the combined collation of
+# its operand and thresholds: "unicode" puts A between a and b; C puts it before both.
+query II nosort
+SELECT width_bucket('A', ARRAY['a', 'b'] COLLATE "unicode"), width_bucket('A', ARRAY['a', 'b'])
+----
+1
+0
+
+query II nosort
+SELECT id, width_bucket(s, ARRAY['a', 'b']) FROM at ORDER BY id
+----
+1
+2
+2
+1
+3
+1
+4
+2
+5
+1
+
+query II nosort
+SELECT id, width_bucket(t, ARRAY['a', 'b']) FROM at ORDER BY id
+----
+1
+2
+2
+0
+3
+1
+4
+0
+5
+1
+
+statement error 42P22
+SELECT width_bucket(s, c) FROM at
+
+# Each search step charges collate per code point of both strings (two steps × 2 code points).
+# cost: 9
+query I nosort
+SELECT width_bucket('A', ARRAY['a', 'b'] COLLATE "unicode")
+----
+1
+
 statement error 42P22
 SELECT id FROM at WHERE s = ANY (c)
 

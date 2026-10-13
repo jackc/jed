@@ -3889,21 +3889,18 @@ export function resolveRangeSetOp(
   };
 }
 
-// resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
-// (array-functions.md §11): the array spelling of IN. `x` (lhs) and the array operand resolve with
-// the SAME literal adaptation the comparison operators use — a bare-literal `x` adapts to the array's
-// element type, a bare ARRAY[…] operand adapts its elements to `x`'s type. The right operand must be
-// an array (a non-array side is 42809; a bare untyped NULL is 42P18); `x` and the element type must
-// be comparable (else 42883, PG's operator-not-found). The result is always boolean.
-export function resolveQuantified(
+// resolveScalarArrayOperands resolves a scalar operand `x` against an array operand with the
+// comparison operators' literal adaptation (array-functions.md §11.3) — shared by the quantified
+// comparisons and the width_bucket(operand, thresholds) array variant (§14). Both resolve with no hint
+// first; then a bare ARRAY[…] constructor adapts its elements to a CONCRETE `x`'s type, or a
+// bare-literal `x` adapts (with a range check) to the array's element type.
+export function resolveScalarArrayOperands(
   scope: Scope,
-  op: BinaryOp,
-  all: boolean,
   lhs: Expr,
   array: Expr,
   ag: AggCtx,
   params: ParamTypes,
-): { node: RExpr; type: ResolvedType } {
+): [{ node: RExpr; type: ResolvedType }, { node: RExpr; type: ResolvedType }] {
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
   let ra = resolve(scope, array, null, ag, params);
@@ -3921,6 +3918,76 @@ export function resolveQuantified(
     const h = elemScalarHint(ra.type.elem);
     if (h !== null) rl = resolve(scope, lhs, h, ag, params);
   }
+  return [rl, ra];
+}
+
+// resolveWidthBucketArray resolves width_bucket(operand, thresholds) — the array-threshold variant
+// (array-functions.md §14), PostgreSQL's width_bucket(anycompatible, anycompatiblearray). The two
+// arguments pair with the quantified comparisons' literal adaptation (resolveScalarArrayOperands), and
+// the operand must be COMPARABLE with the element type under jed's comparison matrix — jed's spelling
+// of PG's anycompatible unification (int × decimal promote; float and date are strict islands, the
+// documented float.md §6 / date.md §4 divergences). A non-array second argument or an incomparable
+// pair is 42883 (PG's function-does-not-exist); two bare untyped NULLs are 42P18 (jed's polymorphic
+// posture). A text pair compares under the combined collation (collation.md §1).
+export function resolveWidthBucketArray(
+  scope: Scope,
+  operand: Expr,
+  thresholds: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const [ro, rt] = resolveScalarArrayOperands(scope, operand, thresholds, ag, params);
+  let elem: ResolvedType;
+  if (rt.type.kind === "array") {
+    elem = rt.type.elem;
+  } else if (rt.type.kind === "null") {
+    // A bare untyped NULL array takes its type from the operand (ELEM := the operand's type); with a
+    // bare NULL operand too, ELEM is undeterminable.
+    if (ro.type.kind === "null") {
+      throw engineError(
+        "indeterminate_datatype",
+        "could not determine the polymorphic type of width_bucket's arguments",
+      );
+    }
+    elem = ro.type;
+  } else {
+    throw noFuncOverload("width_bucket");
+  }
+  if (ro.type.kind === "array") throw noFuncOverload("width_bucket");
+  try {
+    classifyComparable(ro.type, elem);
+  } catch {
+    throw noFuncOverload("width_bucket");
+  }
+  const collation =
+    ro.type.kind === "text" && elem.kind === "text"
+      ? resolveDeriv(
+          scope.catalog,
+          combineDeriv(deriveCollation(scope, operand), deriveCollation(scope, thresholds)),
+        )
+      : null;
+  return {
+    node: { kind: "widthBucketArray", operand: ro.node, thresholds: rt.node, collation },
+    type: resolvedTypeOf("i32"),
+  };
+}
+
+// resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
+// (array-functions.md §11): the array spelling of IN. `x` (lhs) and the array operand resolve with
+// the SAME literal adaptation the comparison operators use — a bare-literal `x` adapts to the array's
+// element type, a bare ARRAY[…] operand adapts its elements to `x`'s type. The right operand must be
+// an array (a non-array side is 42809; a bare untyped NULL is 42P18); `x` and the element type must
+// be comparable (else 42883, PG's operator-not-found). The result is always boolean.
+export function resolveQuantified(
+  scope: Scope,
+  op: BinaryOp,
+  all: boolean,
+  lhs: Expr,
+  array: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const [rl, ra] = resolveScalarArrayOperands(scope, lhs, array, ag, params);
   // The right operand must be an array.
   if (ra.type.kind === "null") {
     // A bare untyped NULL leaves the array type undeterminable — jed's polymorphic posture (§11; the

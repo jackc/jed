@@ -182,7 +182,10 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   be compared — so `GREATEST(1, 1/0)` traps. Their internal min/max comparisons are **metered like
   an explicit `<` chain**: each comparison after the first non-NULL argument charges the same
   size-scaled `decimal_work` / `varlen_compare` / `collate` a binary comparison would, so a fold
-  over many large values cannot do unbounded comparison work under the ceiling — §6/§13.)
+  over many large values cannot do unbounded comparison work under the ceiling — §6/§13.
+  `width_bucket(operand, thresholds)` meters each step of its binary search the same way: one
+  `operator_eval` plus the comparison's size-scaled work per step, at most `⌈log₂(n + 1)⌉` steps —
+  [array-functions.md](array-functions.md) §14.)
 - **Pre-order, LHS-before-RHS.** A node charges itself, then evaluates its left operand,
   then its right. For an eager node the order does not change the **total** (a sum is
   order-independent), but it fixes the deterministic **abort point** for the cost ceiling (§6)

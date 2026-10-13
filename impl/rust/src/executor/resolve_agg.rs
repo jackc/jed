@@ -163,7 +163,12 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
             }
         }
         RExpr::InValues { lhs, .. } => rebase_placeholder_cols(lhs, from, target),
-        RExpr::Quantified { lhs, array, .. } => {
+        RExpr::Quantified { lhs, array, .. }
+        | RExpr::WidthBucketArray {
+            operand: lhs,
+            thresholds: array,
+            ..
+        } => {
             rebase_placeholder_cols(lhs, from, target);
             rebase_placeholder_cols(array, from, target);
         }
