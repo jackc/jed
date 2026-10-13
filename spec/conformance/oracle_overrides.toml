@@ -1604,3 +1604,18 @@ reason = "jed: the same deferred 0A000 as a NaN PASSING value, for an f32 -Infin
 file = "json/jsonpath_vars.test"
 sql = "SELECT JSON_QUERY('{}', '$x' PASSING '\\x7b7d'::bytea FORMAT JSON AS x)"
 reason = "jed: FORMAT JSON on a bytea PASSING value is a deferred 0A000 (json-sql-functions.md §5.4). PostgreSQL decodes the bytes as JSON text in the server encoding (an ENCODING clause may name UTF8/UTF16/UTF32) and parses it, returning {}."
+
+# --- ALTER COLUMN TYPE re-applies the CREATE INDEX column gate (alter.md §3.3). Both divergences
+# are the CREATE INDEX narrowings, reached through a retype.
+[[override]]
+file = "ddl/alter_column_type_index_gate.test"
+sql = "ALTER TABLE t ALTER COLUMN a TYPE text[]"
+reason = "jed: a GIN index over a variable-width array element type (text[]) is deferred 0A000 (gin.md §3/§10), so a retype that would need one is rejected as CREATE INDEX would be. PostgreSQL's array_ops GIN covers text[] and rebuilds the index."
+[[override]]
+file = "ddl/alter_column_type_index_gate.test"
+sql = "ALTER TABLE t ALTER COLUMN n TYPE json USING NULL"
+reason = "jed: an ordered index over a non-key-encodable type reports 0A000 (a json index column is not supported yet), as at CREATE INDEX (indexes.md §1). PostgreSQL reports 42704 (no default btree operator class for json). Same rejection, different code — the existing CREATE INDEX divergence reached through a retype."
+[[override]]
+file = "ddl/create_gin_jsonb_index.test"
+sql = "CREATE INDEX i ON t USING gin (doc, tags)"
+reason = "jed: a multi-column GIN index is deferred 0A000 (gin.md §3/§10). PostgreSQL builds a multicolumn GIN over a jsonb and an int[] column."

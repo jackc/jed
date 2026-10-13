@@ -710,6 +710,33 @@ fn gin_interval_table_db() -> Session {
     db
 }
 
+/// A GIN index over a jsonb column (the jsonb_ops golden, spec/design/gin.md §2.1/§4.1): keys at two
+/// levels, an array string element (KEY term) beside a member string value (STRING term), a boolean
+/// and a JSON null; a top-level array whose 1.5 and 1.50 are ONE number term; a top-level string; `{}`
+/// and a SQL NULL (no entries); a negative number. An ordered index i_n sits beside it.
+fn gin_jsonb_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb, n i32)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES \
+         (1, '{\"a\": 1, \"b\": [true, null, \"x\"], \"c\": {\"d\": \"e\"}}', 1), \
+         (2, '[\"x\", 1.5, 1.50, false, {\"a\": 2}]', 2), (3, '\"x\"', 3), (4, '{}', 4), \
+         (5, NULL, 5), (6, '-0.001', 6)",
+    );
+    run(&mut db, "CREATE INDEX i_n ON t (n)");
+    run(&mut db, "CREATE INDEX i_doc_gin ON t USING gin (doc)");
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
@@ -1809,6 +1836,7 @@ fn write_matches_goldens() {
         ("gin_uuid_table.jed", gin_uuid_table_db),
         ("gin_float_table.jed", gin_float_table_db),
         ("gin_interval_table.jed", gin_interval_table_db),
+        ("gin_jsonb_table.jed", gin_jsonb_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("composite_key_table.jed", composite_key_table_db),
@@ -1913,6 +1941,7 @@ fn read_goldens_reproduces_rows() {
         ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
         ("gin_float_table.jed", gin_float_table_db, "t"),
         ("gin_interval_table.jed", gin_interval_table_db, "t"),
+        ("gin_jsonb_table.jed", gin_jsonb_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("composite_key_table.jed", composite_key_table_db, "t"),

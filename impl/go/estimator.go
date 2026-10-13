@@ -810,6 +810,14 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 			return estimatorSelectivityClass(accessGinOverlaps)
 		case ginMember:
 			return estimatorSelectivityClass(accessGinMember)
+		case ginJsonbContains:
+			return estimatorSelectivityClass(accessGinJsonbContains)
+		case ginJsonbExists:
+			return estimatorSelectivityClass(accessGinJsonbExists)
+		case ginJsonbExistsAny:
+			return estimatorSelectivityClass(accessGinJsonbExistsAny)
+		case ginJsonbExistsAll:
+			return estimatorSelectivityClass(accessGinJsonbExistsAll)
 		default:
 			return estimatorSelectivityClass(accessGinEqual)
 		}

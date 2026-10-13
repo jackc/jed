@@ -97,6 +97,10 @@ gin_contains = "matching"
 gin_overlaps = "matching"
 gin_member = "matching"
 gin_equal = "matching"
+gin_jsonb_contains = "matching"
+gin_jsonb_exists = "matching"
+gin_jsonb_exists_any = "matching"
+gin_jsonb_exists_all = "matching"
 unsupported = "opaque"
 
 # Equal estimated cost falls back to today's structural preferences. Names compare after

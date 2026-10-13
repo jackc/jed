@@ -12,6 +12,7 @@
 
 require "bundler/setup"
 require "toml-rb"
+require "json"
 
 WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "boolean" => 1, "uuid" => 16 }.freeze
 
@@ -464,6 +465,189 @@ def check_order(label, rows)
   end
 end
 
+# --- GIN jsonb_ops terms (spec/design/gin.md §2.1/§4.1) -----------------------------------------
+# term = flag ‖ body: 0x01 key / 0x02 null / 0x03 boolean / 0x04 number / 0x05 string value, with
+# 0x10 set when a key/number/string body source exceeded 128 bytes and was cut to its first 128. A
+# key/string body is text-terminated-escape over the (cut) UTF-8; a number body the same over the
+# (cut) decimal-order-preserving key; boolean 0x00/0x01; null empty.
+GIN_JSONB_MAX = 128
+
+def gin_jsonb_framed(flag, content)
+  content = content.b
+  if content.bytesize > GIN_JSONB_MAX
+    flag |= 0x10
+    content = content.byteslice(0, GIN_JSONB_MAX)
+  end
+  [flag].pack("C") + enc_terminated(content)
+end
+
+def gin_jsonb_key_term(key) = gin_jsonb_framed(0x01, key)
+
+# A scalar's term; `as_key` marks a string that is an array element (or the top-level scalar).
+def gin_jsonb_scalar_term(v, as_key)
+  case v
+  when nil then "\x02".b
+  when true then "\x03\x01".b
+  when false then "\x03\x00".b
+  when String then gin_jsonb_framed(as_key ? 0x01 : 0x05, v)
+  when GinJsonbNumber then gin_jsonb_framed(0x04, enc_decimal(v.plain))
+  else raise "bad jsonb scalar #{v.inspect}"
+  end
+end
+
+def gin_jsonb_walk(node, out)
+  case node
+  when Hash
+    node.each do |k, v|
+      out << gin_jsonb_key_term(k)
+      v.is_a?(Hash) || v.is_a?(Array) ? gin_jsonb_walk(v, out) : out << gin_jsonb_scalar_term(v, false)
+    end
+  when Array
+    node.each do |e|
+      e.is_a?(Hash) || e.is_a?(Array) ? gin_jsonb_walk(e, out) : out << gin_jsonb_scalar_term(e, e.is_a?(String))
+    end
+  end
+end
+
+# A JSON number kept EXACT (jsonb numbers are decimals): `plain` is its "[-]int[.frac]" spelling.
+GinJsonbNumber = Struct.new(:plain)
+
+# A minimal exact JSON reader for the vectors (Ruby's JSON would round numbers through Float): objects
+# keep their LAST duplicate key (jsonb's rule), strings decode JSON escapes via JSON.parse.
+class GinJsonbParser
+  def initialize(text)
+    @s = text
+    @i = 0
+  end
+
+  def parse
+    v = value
+    ws
+    raise "trailing JSON text" unless @i == @s.length
+
+    v
+  end
+
+  private
+
+  def ws = (@i += 1 while @i < @s.length && " \t\n\r".include?(@s[@i]))
+
+  def value
+    ws
+    case @s[@i]
+    when "{" then object
+    when "[" then array
+    when '"' then string
+    when "t" then lit("true", true)
+    when "f" then lit("false", false)
+    when "n" then lit("null", nil)
+    else number
+    end
+  end
+
+  def lit(word, v)
+    raise "bad JSON literal" unless @s[@i, word.length] == word
+
+    @i += word.length
+    v
+  end
+
+  def object
+    @i += 1
+    h = {}
+    ws
+    if @s[@i] == "}"
+      @i += 1
+      return h
+    end
+    loop do
+      ws
+      k = string
+      ws
+      raise "expected :" unless @s[@i] == ":"
+
+      @i += 1
+      h.delete(k)
+      h[k] = value
+      ws
+      c = @s[@i]
+      @i += 1
+      return h if c == "}"
+      raise "expected , or }" unless c == ","
+    end
+  end
+
+  def array
+    @i += 1
+    a = []
+    ws
+    if @s[@i] == "]"
+      @i += 1
+      return a
+    end
+    loop do
+      a << value
+      ws
+      c = @s[@i]
+      @i += 1
+      return a if c == "]"
+      raise "expected , or ]" unless c == ","
+    end
+  end
+
+  def string
+    m = /\G"(?:[^"\\]|\\.)*"/.match(@s, @i) or raise "bad JSON string"
+    @i += m[0].length
+    JSON.parse(m[0])
+  end
+
+  # Normalize "[-]int[.frac][e[+-]exp]" to a plain "[-]int[.frac]" decimal string, exactly.
+  def number
+    m = /\G(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?/.match(@s, @i) or raise "bad JSON number"
+    @i += m[0].length
+    sign, int, frac, exp = m[1], m[2], m[3] || "", m[4].to_i
+    digits = int + frac
+    point = int.length + exp # position of the decimal point within `digits`
+    digits = ("0" * -point) + digits if point.negative?
+    point = [point, 0].max
+    digits += "0" * (point - digits.length) if point > digits.length
+    whole = digits[0, point]
+    whole = "0" if whole.empty?
+    fr = digits[point..]
+    GinJsonbNumber.new(fr.empty? ? "#{sign}#{whole}" : "#{sign}#{whole}.#{fr}")
+  end
+end
+
+# The index term SET of a document (JSON text), deduplicated, in ascending byte order.
+def gin_jsonb_index_terms(doc_text)
+  node = GinJsonbParser.new(doc_text).parse
+  out = []
+  if node.is_a?(Hash) || node.is_a?(Array)
+    gin_jsonb_walk(node, out)
+  else
+    out << gin_jsonb_scalar_term(node, node.is_a?(String)) # a raw scalar is a one-element array
+  end
+  out.uniq.sort
+end
+
+# Verify spec/encoding/gin_jsonb_terms.toml: each document's term set and each query key's term are
+# byte-exact against this independent reference.
+def check_gin_jsonb_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+  (data["index"] || []).each do |c|
+    got = gin_jsonb_index_terms(c["doc"]).map { |t| hex(t) }
+    fail!("gin jsonb index #{c['doc'][0, 60].inspect}: terms=#{got} want=#{c['terms']}") unless got == c["terms"]
+    checked += 1
+  end
+  (data["key"] || []).each do |c|
+    got = hex(gin_jsonb_key_term(c["key"]))
+    fail!("gin jsonb key #{c['key'][0, 60].inspect}: term=#{got} want=#{c['term']}") unless got == c["term"]
+    checked += 1
+  end
+  checked
+end
+
 def label_of(c) = c["null"] ? "NULL" : c["value"]
 
 def main
@@ -541,6 +725,10 @@ def main
   # into each field's key via the §2.2 nullable slot (fixed arity, no terminator). Its own file: a
   # heterogeneous field-value list per case, not a scalar.
   checked += check_composite_file("composite.toml")
+
+  # GIN jsonb_ops terms (gin.md §4.1): not a key encoding of a value, but the inverted index's term
+  # bytes, built from the text/decimal key rules above — a flag byte + a cut, terminated body.
+  checked += check_gin_jsonb_file("gin_jsonb_terms.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

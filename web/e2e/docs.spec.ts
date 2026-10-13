@@ -619,6 +619,19 @@ test('the indexes page runs the GIN = array-equality scan live', async ({ page }
   await expect(panel.getByTestId('result-rows')).not.toContainText('intro');
 });
 
+test('the indexes page runs the jsonb GIN @> and ? scans live', async ({ page }) => {
+  await page.goto('/docs/sql/indexes/');
+  // jsonb_ops containment: only event 3 is a login from ios (event 4's device is android).
+  const contains = livePanel(page, 'jsonbContainsQuery');
+  await expect(contains.getByTestId('result-rows')).toContainText('3');
+  await expect(contains.getByTestId('result-rows')).not.toContainText('4');
+  // jsonb_ops key existence: events 1 and 4 carry a top-level "tags" key.
+  const key = livePanel(page, 'jsonbKeyQuery');
+  await expect(key.getByTestId('result-rows')).toContainText('1');
+  await expect(key.getByTestId('result-rows')).toContainText('4');
+  await expect(key.getByTestId('result-rows')).not.toContainText('2');
+});
+
 test('the views page reads views live and rejects bad writes and breaking drops', async ({
   page
 }) => {

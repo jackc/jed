@@ -3,10 +3,12 @@
 > `CREATE INDEX … USING gin (col)`: a **generalized inverted index** — a second index
 > *kind* beside the ordered B-tree ([indexes.md](indexes.md)) — that maps the **terms**
 > extracted from a value to the rows containing them, so a predicate over a multi-valued
-> column narrows its scan to matching rows instead of reading the whole table. This slice
-> ships the **`array_ops`** operator class only, accelerating the array **containment
-> `@>`** and **overlap `&&`** operators ([array-functions.md §10](array-functions.md)) over
-> an array column of a **fixed-width key-encodable element** type (§1). This doc is the
+> column narrows its scan to matching rows instead of reading the whole table. Two operator
+> classes ship: **`array_ops`**, accelerating the array **containment `@>`**, **overlap `&&`**,
+> membership, and equality operators ([array-functions.md §10](array-functions.md)) over an array
+> column of a **fixed-width key-encodable element** type (§1), and **`jsonb_ops`** (§2.1),
+> accelerating the `jsonb` containment `@>` and key-existence `?` / `?|` / `?&` operators
+> ([json-sql-functions.md §1](json-sql-functions.md)) over a `jsonb` column. This doc is the
 > contract all three cores implement in lockstep (CLAUDE.md §2); the grammar is in
 > [../grammar/grammar.ebnf](../grammar/grammar.ebnf) + [grammar.md §30](grammar.md), the
 > byte layout in [../fileformat/format.md](../fileformat/format.md) (`format_version` 13),
@@ -26,7 +28,9 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   ([indexes.md §2/§6](indexes.md)); only **how entries are derived from a row** and **how a
   query uses it** differ. The default kind (no `USING`, or `USING btree`) is the ordered
   B-tree; `USING gin` selects this one.
-- **One column, a fixed-width-key-encodable-element array.** A single column whose element
+- **One column: a `jsonb` column (`jsonb_ops`, §2.1) or a fixed-width-key-encodable-element
+  array (`array_ops`).** The operator class is implied by the column type — there is no explicit
+  opclass syntax and none is persisted. For an array, a single column whose element
   type is one of the engine's fixed-width keyable scalars — the integers (`i16[]` / `i32[]` /
   `i64[]`), `boolean[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, the binary floats
   `f32[]` / `f64[]`, and `interval[]` — i.e. element types whose fixed-width order-preserving key
@@ -34,14 +38,16 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   [§2.10](encoding.md) for interval), the keys an ordered-index / `PRIMARY KEY` column accepts. A
   multi-column GIN, and an array of a variable-width element type (`text[]`, `decimal[]`,
   `bytea[]`), are `0A000` this slice (§3, §10) — the same "lift it when its key encoding lands"
-  narrowing the ordered index makes for text/decimal keys.
+  narrowing the ordered index makes for text/decimal keys. A `json` column has no GIN operator
+  class (`42704`, as in PostgreSQL).
 - **Accelerates `@>`, `&&`, `const = ANY(col)` membership, and array `=`.** A `WHERE`
   conjunct `col @> const` (contains), `col && const` (overlaps), `const = ANY(col)` (the
   array spelling of membership — semantically `col @> ARRAY[const]`), or `col = const`
   (exact array equality — a `col @> distinct(const)` bound + the residual `=` filter, §6)
   against a GIN-indexed column bounds the scan to candidate rows (§6). `<@` (contained-by)
   and `IN` membership over a scalar list are **not** GIN-accelerated this slice (they still
-  run, by full scan — §10).
+  run, by full scan — §10). On a `jsonb` column the accelerated conjuncts are `col @> const`
+  (equivalently `const <@ col`), `col ? const`, `col ?| const`, and `col ?& const` (§2.1).
 - **`UNIQUE` is meaningless for GIN and rejected.** An inverted index has many entries per
   row, so uniqueness is undefined; `CREATE UNIQUE INDEX … USING gin` is `0A000` (§3). A GIN
   index never backs a `UNIQUE` constraint.
@@ -65,11 +71,12 @@ opclass(T):
 A `Term` is a canonical, order-preserving byte string (it lives in the entry B-tree, §4);
 `mode` is `ALL` (every query term must be present) or `ANY` (≥ 1). This mirrors
 PostgreSQL's `extractValue` / `extractQuery` / `consistent` GIN support functions — a
-battle-tested decomposition — and it is the seam a future `jsonb_ops` (jsonb keys + scalar
-values as terms) or an object-type opclass slots into with **no change to the inverted
-core**. This slice defines exactly one opclass:
+battle-tested decomposition — and it is the seam `jsonb_ops` (§2.1) slots into with **no change
+to the inverted core**: the entry tree, the posting-list gather, the ALL/ANY combine, the
+storage-key-order candidate fetch, the residual recheck, maintenance, persistence, and the cost
+contract are shared. Only term extraction and the accelerated operator shapes differ.
 
-**`array_ops`** (the only opclass this slice):
+**`array_ops`** (an array column):
 
 - `extract_index_terms(arr)` = the **distinct, non-NULL elements** of `arr`, flattened
   across any dimensionality, each encoded by the element type's key encoding
@@ -131,9 +138,53 @@ core**. This slice defines exactly one opclass:
   (the standard bounded-scan contract — [indexes.md §5](indexes.md)), rather than trusting
   the gather to be exact. For `array_ops` the gather *is* exact, so the residual filter
   only ever confirms; keeping it (a) costs one `operator_eval` per candidate, already in
-  the cost model, and (b) seats the **lossy** opclasses a future slice needs (a `jsonb_ops`
-  `@>` gather over key/value tokens is a superset and *must* recheck). "Recheck always" is
-  the v1 posture (§9).
+  the cost model, and (b) seats the **lossy** opclasses — the `jsonb_ops` gather (§2.1) is a
+  superset and *must* recheck. "Recheck always" is the v1 posture (§9).
+
+### 2.1 `jsonb_ops` (a `jsonb` column)
+
+PostgreSQL's default `jsonb` GIN operator class, term-for-term (`gin_extract_jsonb` /
+`gin_extract_jsonb_query` in `jsonb_gin.c`), with jed's own byte form for each term (§4.1).
+
+- `extract_index_terms(doc)` walks the **whole document** (every nesting level) and emits:
+  - a **key** term for every object member's **key**;
+  - a **key** term for every **string** that is an **array element** — including a top-level
+    scalar string, which PostgreSQL stores as a one-element raw-scalar array (this is why `?`
+    matches a string array element and an equal top-level string, and why the index finds them);
+  - a **value** term for every other **scalar** — an object member's scalar value (a `null`,
+    boolean, number, or **string** value term), and a non-string array element or top-level
+    scalar (a `null`, boolean, or number value term).
+
+  Containers (objects, arrays) produce no term of their own; only their keys and scalars do. The
+  term set is deduplicated by its bytes (§4). A SQL NULL column value, `{}`, `[]`, and a document of
+  only empty containers yield **zero** terms.
+- `extract_query_terms(Q, strategy)`:
+  - `@>` (`json_contains`, `col @> Q` or `Q <@ col`): `extract_index_terms(Q)`, mode **ALL**. A NULL
+    `Q` is provably empty; a `Q` with **no** terms (`{}`, `[]`, `[[]]`, …) **falls back to the full
+    scan** (PostgreSQL's `GIN_SEARCH_MODE_ALL`): `{}` is contained by every object, and the index
+    cannot enumerate term-less rows.
+  - `?` (`json_has_key`, `col ? k`): the single key term of `k`, mode **ALL**. A NULL `k` is
+    provably empty.
+  - `?|` (`json_has_any_key`, `col ?| K`): the key terms of `K`'s **non-NULL** elements, mode
+    **ANY**. A NULL `K`, or a `K` with no non-NULL element, is provably empty.
+  - `?&` (`json_has_all_keys`, `col ?& K`): the key terms of `K`'s **non-NULL** elements, mode
+    **ALL**. A NULL `K` is provably empty; a `K` with no non-NULL element (`'{}'`, `'{NULL}'`)
+    falls back to the full scan (`?& '{}'` is TRUE for every non-NULL document).
+- **Soundness.** For every row where the operator is TRUE, every query term is among the row's
+  terms, so the ALL/ANY gather is a **superset** of the matching rows and the residual recheck makes
+  it exact. For `@>` this rests on PostgreSQL's containment rule ([json-sql-functions.md
+  §1.2](json-sql-functions.md)): each contained key must appear in the containing object, each
+  contained scalar must *equal* a scalar at the corresponding position — a member value of the same
+  kind, or a direct array element — and only the **top level** admits an array containing a bare
+  scalar. Every one of those matches lands on an identical term. For `?`/`?|`/`?&`, a top-level key,
+  string array element, or equal top-level string is a key term by construction.
+- **Lossy, always rechecked.** The gather ignores structure (a key found at another nesting level, a
+  value under a different key) and string terms may be truncated (§4.1), so candidates include false
+  positives; the residual operator removes them. PostgreSQL marks every `jsonb_ops` strategy
+  `recheck = true` as well.
+- **Not accelerated:** the jsonpath operators `@?` / `@@` (PostgreSQL's `jsonb_ops` serves them
+  through a path-to-terms extraction — a follow-on, §10), `=`, and every other `jsonb` operator.
+  `jsonb_path_ops` (hashed paths, `@>` only) is not offered.
 
 ## 3. DDL semantics (PG-matched where the surface overlaps; oracle-probed)
 
@@ -150,9 +201,10 @@ like a type name.
    (`undefined_object`, "access method does not exist: {name}"). PG's code for an unknown
    access method.
 3. The key column must exist — **42703** — and satisfy the opclass:
-   - a **non-array** column has no GIN operator class — **42704** (PG's "data type … has no
-     default operator class for access method gin"; jed matches the code, house-style
-     message);
+   - a **`jsonb`** column takes `jsonb_ops` (§2.1);
+   - any other **non-array** column (including `json`) has no GIN operator class — **42704**
+     (PG's "data type … has no default operator class for access method gin"; jed matches the
+     code, house-style message);
    - an array whose element type is **not an admitted fixed-width key-encodable scalar** is
      **0A000** this slice. The admitted element types are the integers (`i16`/`i32`/`i64`),
      `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval` — fixed-width
@@ -166,6 +218,13 @@ like a type name.
    multicolumn GIN — divergence, override).
 6. The explicit name, if any, is checked against the relation namespace — **42P07** (§
    [indexes.md §2](indexes.md), unchanged).
+
+**`ALTER COLUMN … TYPE`** re-applies step 3 to every surviving index that keys the column
+([alter.md §3.3](alter.md)): retyping a GIN-indexed column to a type with no GIN operator class is
+**42704**, to a deferred array element type **0A000** — PostgreSQL likewise rebuilds the index under
+the new type and fails the same way. (The same gate applies per index kind: an ordered index's
+column must stay key-encodable, `0A000`; a GiST column must keep a GiST operator class, `42704`/
+`0A000`.)
 
 **Auto-naming** is unchanged from the ordered index — `<table>_<col>_idx` with the smallest
 free suffix (the access method does not change the name; PG agrees). **`DROP INDEX`** /
@@ -183,7 +242,7 @@ opclass extracts. An entry key is:
 entry_key = encode_element(term) ‖ row_storage_key
 ```
 
-- `encode_element(term)` is the element type's order-preserving key encoding
+- For `array_ops`, `encode_element(term)` is the element type's order-preserving key encoding
   ([encoding.md §2.1](encoding.md)) — fixed-width for every element type this slice admits
   (the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval` —
   §3), so the term
@@ -204,6 +263,41 @@ entry_key = encode_element(term) ‖ row_storage_key
   scan. No separate posting-tree structure exists; the inverted index *is* the ordered
   entry B-tree.
 
+### 4.1 `jsonb_ops` term bytes
+
+A `jsonb_ops` term is a flag byte then a body:
+
+```
+term  = flag (u8) ‖ body
+flag  = 0x01 key │ 0x02 null │ 0x03 boolean │ 0x04 number │ 0x05 string value
+        (│ 0x10 on a key / number / string whose body was truncated)
+body  = null:    (empty)
+        boolean: 0x00 false │ 0x01 true
+        key, string value: text-terminated-escape (encoding.md §2.4) of the first
+                           min(n, 128) bytes of the string's UTF-8 encoding
+        number:  text-terminated-escape of the first min(n, 128) bytes of the value's
+                 decimal-order-preserving key (encoding.md §2.5)
+```
+
+The flag values are PostgreSQL's `JGINFLAG_KEY`/`NULL`/`BOOL`/`NUM`/`STR` and its `JGINFLAG_HASHED`
+bit. A **number** term encodes the *value*, not the display scale, so `1.5` and `1.50` share a term
+(numeric `=`), as PostgreSQL's normalized numeric text does. A string body is the exact UTF-8 (the
+`C` collation, json.md's string equality).
+
+**Truncation (128 bytes).** A body source longer than 128 bytes keeps only its first 128 bytes and
+sets `0x10` in the flag. Equal values truncate identically, so the term stays sound (a superset;
+the recheck removes the collisions), and every term is at most `1 + 2·128 + 2` bytes, so a GIN entry
+always fits a node: a huge string or number in a document never makes its row unindexable.
+PostgreSQL hashes over-long strings (`JGIN_MAXLENGTH`); jed truncates because a prefix needs no
+cross-core hash function and is byte-identical by construction. The cut is at a byte, not a
+character boundary — a term is bytes, never decoded.
+
+**Self-delimiting.** A `null` term is one byte, a `boolean` term two, and every other body ends in
+the `0x00 0x01` terminator that never occurs inside an escaped body, so no term is a proper prefix of
+another. The posting list of a term `t` is therefore the entry range `[t, byte-successor(t))`, and
+the storage key is the entry's suffix after `t` — exactly the `array_ops` gather (§6), now with
+variable-width terms.
+
 **Term extraction is a SET (dedup is mandatory, not an optimization).** A row
 `{1, 1, 2}` yields the terms `{1, 2}` — one entry each. Two `1` entries for one row would
 be the identical key `encode(1) ‖ storage_key` and collide on insert (the index's
@@ -211,7 +305,8 @@ uniqueness invariant — [indexes.md §3](indexes.md)); deduping the elements is
 each `(term, row)` pair unique. A whole-NULL array, an empty array `{}`, and a NULL array
 **column value** all yield **zero** entries — so they are absent from every posting list,
 which is exactly correct for `@>`/`&&` (a row with no indexed term can neither contain a
-non-empty query nor overlap anything).
+non-empty query nor overlap anything). The same holds for `jsonb_ops`: a document's terms are
+deduplicated by bytes, and a NULL, `{}`, or `[]` document has no entry.
 
 ## 5. Maintenance (every write path, phase 2)
 
@@ -244,8 +339,10 @@ The per-relation pushdown seam ([indexes.md §5](indexes.md), [cost.md §3](cost
 **third bound kind**, after the PK bound and the ordered-index equality bound. For a base
 relation scanned by a **`SELECT`, `UPDATE`, or `DELETE`**, if the `WHERE` AND-chain has a conjunct
 `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)` (membership), or `col = Q`
-(exact array equality) where `col` is a GIN-indexed column and **the query operand is a
-constant** (`Q` a literal/`$N`-param array, `c` a literal/`$N`-param scalar), the plan bounds the scan through the GIN
+(exact array equality) where `col` is a GIN-indexed array column — or `col @> Q` / `Q <@ col` /
+`col ? k` / `col ?| K` / `col ?& K` where `col` is a GIN-indexed `jsonb` column (§2.1) — and **the
+query operand is a constant** (`Q` a literal/`$N`-param array or `jsonb`, `c`/`k` a literal/`$N`-param
+scalar or key, `K` a literal/`$N`-param `text[]`), the plan bounds the scan through the GIN
 index. **`UPDATE`/`DELETE` apply the identical bound to their target-row scan** (the gather +
 residual filter that finds the rows to rewrite/remove), so the same conjunct that bounds a
 `SELECT` bounds the mutation, chosen against the other candidates by the same estimate and
@@ -265,7 +362,8 @@ PK/ordered/full choice stands.
 
 **Execution** — the classic inverted gather + residual filter:
 
-1. The opclass extracts the query terms and mode (§2). Several **provably-empty** shapes
+1. The opclass extracts the query terms and mode (§2; `jsonb_ops`' own provably-empty and
+   full-scan-fallback shapes are listed in §2.1). Several `array_ops` **provably-empty** shapes
    read nothing (like an ordered equality against NULL): `Q` is the NULL array (`@>`/`&&`/`=`
    all → NULL for every row); `Q` contains a NULL element under `@>` (a NULL is found in no
    row → never TRUE — but **not** under `=`, see below); `&&` whose `Q` has no non-NULL element;
@@ -307,7 +405,8 @@ and fully charged, then storage-key-ordered table point-lookups and residual wor
 
 ### 6.1 Join sibling query operands
 
-For an INNER/CROSS/LEFT join's right base relation, the same four GIN strategies may take their query
+For an INNER/CROSS/LEFT join's right base relation, the same GIN strategies (the four `array_ops` and
+four `jsonb_ops` shapes) may take their query
 operand from a **bare column of an earlier sibling relation**. This is the opclass form of the
 index-nested-loop rule: evaluate the sibling value once for the current combined left row, perform
 the ordinary posting gather, fetch candidates in storage-key order, and reapply the complete ON and
@@ -372,6 +471,15 @@ exactly as a table tree — is unchanged ([indexes.md §6](indexes.md)); a GIN e
 bytes* differ (term ‖ storage-key, §4), but the page/record framing does not. Each version
 is a clean break (CLAUDE.md §1); a reader accepts only version 13.
 
+`jsonb_ops` needs no format change: the operator class follows from the indexed column's catalog
+type (`jsonb` → `jsonb_ops`, an array → `array_ops`), so a reader recovers it without a new byte.
+`fixtures/gin_jsonb_table.jed` pins its entry bytes: a GIN index over a `jsonb` column whose rows
+hold nested keys, string array elements (key terms), a boolean, a JSON null, `1.5`/`1.50` (one
+number term), a top-level string, a negative number, a term shared by two rows, `{}`, and a SQL NULL.
+A cut (over-128-byte) term's entry exceeds the 256-byte fixture page's record limit, so the cut form
+is pinned by [../encoding/gin_jsonb_terms.toml](../encoding/gin_jsonb_terms.toml) instead, which every
+core checks.
+
 **Golden fixture.** `fixtures/gin_array_table.jed` ([../fileformat/format.md](../fileformat/format.md)
 *Fixtures*): a table with an `i32[]` column and a `USING gin` index over it, rows holding
 multi-element / duplicate-element / empty / NULL arrays (exercising term dedup and the
@@ -392,7 +500,8 @@ the **entry B-tree** inherits the ordered index's content-deterministic split co
 the same mutation sequence produces the same entries and the same tree. The build's
 sort-before-insert (§5) fixes the from-scratch shape. No new determinism-ledger entry is
 needed ([determinism.md](determinism.md)): every input to a GIN index (array elements, their
-key bytes, storage keys) is already in-contract. That includes a float element: a float **at
+key bytes, storage keys) is already in-contract — including every `jsonb_ops` term, which is a
+pure function of the canonical document (exact decimal numbers, canonical key order). That includes a float element: a float **at
 rest** — its stored bits, total order, and canonicalizing key bytes — is cross-core byte-identical
 ([encoding.md §2.8](encoding.md) "Why lifting the narrowing is sound"); only a *tainted* float (a
 transcendental result) stored into the column carries the existing `float-transcendental` ledger
@@ -428,17 +537,21 @@ final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
   the future lossy opclasses. (PG marks `array_ops` `@>`/`&&` as non-lossy and can skip the
   recheck.) Unobservable in results; it only adds the (already-metered) residual
   `operator_eval`.
-- **Error code on a non-indexable column** matches PG's code (42704 non-array, 0A000 for the
-  deferred element types), house-style messages.
+- **Error code on a non-indexable column** matches PG's code (42704 for a type with no GIN
+  operator class, 0A000 for the deferred element types), house-style messages.
+- **`jsonb_ops` over-long terms** — PostgreSQL hashes a key/string longer than 125 bytes into its
+  term; jed keeps the first 128 bytes (§4.1). Both are lossy and rechecked; unobservable in results.
+- **`jsonb_ops` does not accelerate `@?` / `@@`** (PostgreSQL does — §10). Same rows, by full scan.
 
 ## 10. Narrowings this slice (deferred follow-ons)
 
 Each is `0A000`-free (simply not built) or `0A000` (rejected at DDL), relaxable as its own
 vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
 
-- **More opclasses** — `jsonb_ops` (jsonb keys + scalar values as terms; the lossy-recheck
-  path §2 already seats) and a future object/document type, each a new opclass behind the §2
-  seam; `jsonb_path_ops` (path hashes) later still.
+- **More opclasses** — `jsonb_ops` has **landed** (§2.1); a future object/document type would be a
+  new opclass behind the §2 seam; `jsonb_path_ops` (path hashes) later still.
+- **`jsonb_ops` jsonpath strategies** — `col @? path` / `col @@ path`, extracting the key/value
+  terms a path's equality chain requires (PostgreSQL's `jsonb_ops` strategies 15/16).
 - **More array element types** — the **fixed-width key-encodable** elements (`uuid`, `date`,
   `timestamp`, `timestamptz`, `boolean`, alongside the integers) have **landed** (§3): the GIN
   term is their existing key encoding, so the inverted core was unchanged — only the DDL gate
@@ -459,3 +572,9 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   posting-tree TID compression is a later storage optimization, byte-contract-pinned when it lands.
 - **Recheck elision** — proving the `array_ops` gather exact and dropping the residual
   `operator_eval` for non-lossy opclasses.
+- **ALL-mode skip-scan** — the gather reads every query term's posting list whole and charges
+  `gin_entry` for each entry, so an intersection with one very common term costs that term's whole
+  list. That is typical of `jsonb_ops`, where `doc @> '{"n": 7}'` reads the `"n"` key term of every
+  document carrying `n`. PostgreSQL's GIN fast-scan advances the long lists by the short one's keys.
+  The equivalent here is a byte-contract change to the gather and its cost (cost.md §3), so it is its
+  own slice.

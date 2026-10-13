@@ -155,6 +155,10 @@
 #              `720:00:00`) are one term; the equivalent `NOT (k <> ALL(col))` / `Q <@ col` /
 #              `NOT (col <> Q)` are NOT GIN-accelerated (full scan). Both must return the
 #              by-construction rows under PG's span equality (interval_cmp_value).
+#   gin_jsonb — GIN over a jsonb column (jsonb_ops, gin.md §2.1): `doc @> Q`, `doc ? k`, `doc ?| K`,
+#              and `doc ?& K` gather candidates from key/value terms; the same predicates over
+#              `doc::text::jsonb` (an identity round trip, not the bare column) are NOT GIN-accelerated.
+#              Both must return the by-construction rows of PostgreSQL's containment rule.
 #   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
 #              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
@@ -202,6 +206,7 @@
 #   ruby scripts/norec_gen.rb --sweep 20        # seeds 1..20 × all scenarios, all three cores
 #   ruby scripts/norec_gen.rb 7 --keep          # generate seed 7 and LEAVE the files for inspection
 
+require "json"
 require "open3"
 require "fileutils"
 
@@ -376,6 +381,9 @@ GIN_INTERVAL_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_s
 GIN_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_mutation query.gin_any_eq
                  dml.insert dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                  query.order_by types.i32 types.array func.array_containment func.array_quantified].freeze
+GIN_JSONB_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_jsonb_ops
+                   dml.insert dml.insert_multi_row query.select query.order_by types.i32 types.text
+                   types.jsonb types.json_casts func.jsonb_contains cast.operator].freeze
 GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
               dml.insert_multi_row query.select query.order_by types.i32 types.range
               func.range_constructors func.range_operators].freeze
@@ -1984,6 +1992,118 @@ def gen_gin(seed)
   gpair.call("@> {#{present}} (present)", [present], matches.call([present]))
   gpair.call("@> {#{absent}} (absent -> empty)", [absent], matches.call([absent]))
   gpair.call("@> {#{present},#{k2}} (intersection)", [present, k2], matches.call([present, k2]))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GIN jsonb_ops (@> / ? / ?| / ?& via the GIN index vs doc::text::jsonb full scan) ---
+# A jsonb GIN index gathers candidates from key/value terms (spec/design/gin.md §2.1); the gather is
+# lossy, so the residual operator decides. The SAME predicates over `doc::text::jsonb` (a value-exact
+# round trip that is not the bare column) are NOT GIN-accelerated and full scan. Expected rows come
+# from a by-construction model of PostgreSQL's JsonbDeepContains and key existence
+# (json-sql-functions.md §1.2), so no oracle is consulted — this catches a term-extraction or
+# gather bug ALL cores might share. Documents mix objects, arrays, nested containers, scalars, and
+# strings that also appear as keys (a key term vs a string-value term).
+JSONB_KEYS = %w[a b c d].freeze
+
+def jsonb_container?(v) = v.is_a?(Hash) || v.is_a?(Array)
+
+# PostgreSQL's containment: an array contains a bare scalar only at the top level; below it a
+# contained value must be the same kind.
+def jsonb_contains?(a, b, top: true)
+  return a.any? { |x| !jsonb_container?(x) && x == b } if top && a.is_a?(Array) && !jsonb_container?(b)
+
+  if a.is_a?(Hash) && b.is_a?(Hash)
+    b.all? { |k, v| a.key?(k) && jsonb_contains?(a[k], v, top: false) }
+  elsif a.is_a?(Array) && b.is_a?(Array)
+    b.all? do |e|
+      if jsonb_container?(e)
+        a.any? { |x| x.instance_of?(e.class) && jsonb_contains?(x, e, top: false) }
+      else
+        a.any? { |x| !jsonb_container?(x) && x == e }
+      end
+    end
+  elsif !jsonb_container?(a) && !jsonb_container?(b)
+    a == b
+  else
+    false
+  end
+end
+
+def jsonb_has_key?(doc, k)
+  case doc
+  when Hash then doc.key?(k)
+  when Array then doc.any? { |e| e == k }
+  when String then doc == k
+  else false
+  end
+end
+
+def gen_gin_jsonb(seed)
+  rng = Random.new(seed)
+  scalar = lambda do
+    [rng.rand(0..2), "x", "a", true, false, nil].sample(random: rng)
+  end
+  value = lambda do |depth|
+    case rng.rand(0..5)
+    when 0 then Array.new(rng.rand(0..2)) { scalar.call }
+    when 1 then depth.zero? ? scalar.call : JSONB_KEYS.sample(rng.rand(1..2), random: rng).to_h { |k| [k, value.call(depth - 1)] }
+    else scalar.call
+    end
+  end
+  docs = (1..16).map do |id|
+    doc = case rng.rand(0..9)
+          when 0..5 then JSONB_KEYS.sample(rng.rand(0..3), random: rng).to_h { |k| [k, value.call(1)] }
+          when 6..7 then Array.new(rng.rand(0..3)) { rng.rand(0..3).zero? ? { JSONB_KEYS.sample(random: rng) => scalar.call } : scalar.call }
+          when 8 then ["a", "x", rng.rand(0..2)].sample(random: rng)
+          end
+    [id, doc]
+  end
+  docs[rng.rand(0...docs.size)][1] = nil # one SQL NULL document (rand 9 above also yields NULL)
+  lit = ->(d) { d.nil? ? "NULL" : "'#{JSON.generate(d)}'" }
+  ids_where = ->(pred) { docs.select { |_id, d| !d.nil? && pred.call(d) }.map { |id, _| id.to_s } }
+
+  objects = docs.filter_map { |_id, d| d if d.is_a?(Hash) && !d.empty? }
+  arrays = docs.filter_map { |_id, d| d if d.is_a?(Array) && !d.empty? }
+  queries = []
+  if (o = objects.sample(random: rng))
+    queries << o.to_a.sample(rng.rand(1..o.size), random: rng).to_h # present (a sub-object)
+  end
+  queries << (arrays.sample(random: rng) || [0]).sample(1, random: rng) # an element of some array
+  # a nested member of some object: {k: {k2: v}} narrowed to one inner member, or {k: [e]}
+  nested = objects.flat_map { |o| o.select { |_k, v| (v.is_a?(Hash) || v.is_a?(Array)) && !v.empty? }.to_a }
+  if (k, v = nested.sample(random: rng))
+    queries << { k => (v.is_a?(Hash) ? v.to_a.sample(1, random: rng).to_h : v.sample(1, random: rng)) }
+  end
+  queries << { JSONB_KEYS.sample(random: rng) => scalar.call }         # random member
+  queries << { JSONB_KEYS.sample(random: rng) => [scalar.call] }       # random member array
+  queries << scalar.call                                              # a bare scalar
+  queries << { "zz" => 1 }                                            # absent key
+  queries << {}                                                       # term-less: full-scan fallback
+  key = (objects.sample(random: rng)&.keys || JSONB_KEYS).sample(random: rng) # usually present
+  keys = [JSONB_KEYS.sample(random: rng), ["x", "zz", JSONB_KEYS.sample(random: rng)].sample(random: rng)]
+
+  out = header(seed, GIN_JSONB_REQ, "GIN jsonb_ops (@> / ? / ?| / ?& via the GIN index vs doc::text::jsonb full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb)")
+  stmt(out, "CREATE INDEX t_doc_gin ON t USING gin (doc)")
+  stmt(out, "INSERT INTO t VALUES #{docs.map { |id, d| "(#{id}, #{lit.call(d)})" }.join(', ')}")
+
+  pair = lambda do |title, pred_sql, exp|
+    out << "# #{title}"
+    out << "# GIN bound (jsonb_ops term gather + residual recheck)"
+    q(out, "I", "SELECT id FROM t WHERE doc #{pred_sql} ORDER BY id", exp)
+    out << "# full scan (doc::text::jsonb is not the bare column) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE doc::text::jsonb #{pred_sql} ORDER BY id", exp)
+  end
+  queries.each do |qd|
+    json = JSON.generate(qd)
+    pair.call("@> #{json}", "@> '#{json}'", ids_where.call(->(d) { jsonb_contains?(d, qd) }))
+  end
+  pair.call("? #{key}", "? '#{key}'", ids_where.call(->(d) { jsonb_has_key?(d, key) }))
+  pair.call("? x (a string value is not a key)", "? 'x'", ids_where.call(->(d) { jsonb_has_key?(d, "x") }))
+  arr = "'{#{keys.join(',')}}'"
+  pair.call("?| #{keys.join(',')}", "?| #{arr}", ids_where.call(->(d) { keys.any? { |k| jsonb_has_key?(d, k) } }))
+  pair.call("?& #{keys.join(',')}", "?& #{arr}", ids_where.call(->(d) { keys.all? { |k| jsonb_has_key?(d, k) } }))
 
   out.join("\n") + "\n"
 end
@@ -3939,6 +4059,7 @@ SCENARIOS = {
   "gin_float" => method(:gen_gin_float),
   "gin_interval" => method(:gen_gin_interval),
   "gin_mut" => method(:gen_gin_mutation),
+  "gin_jsonb" => method(:gen_gin_jsonb),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),
   "tlp" => method(:gen_tlp),

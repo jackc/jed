@@ -466,6 +466,25 @@ function ginIntervalTableDB(): Engine {
   return db;
 }
 
+// ginJsonbTableDB has a GIN index over a jsonb column (kind 1, the jsonb_ops opclass — spec/design/
+// gin.md §2.1/§4.1): keys at two levels, an array string element (a KEY term) beside a member string
+// value (a STRING term), 1.5/1.50 as ONE number term, a top-level string, `{}` and a SQL NULL (no
+// entries), and a negative number. An ordered index i_n sits beside it.
+function ginJsonbTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb, n i32)");
+  run(db, "CREATE INDEX i_n ON t (n)");
+  run(db, "CREATE INDEX i_doc_gin ON t USING gin (doc)");
+  run(
+    db,
+    "INSERT INTO t VALUES " +
+      `(1, '{"a": 1, "b": [true, null, "x"], "c": {"d": "e"}}', 1), ` +
+      `(2, '["x", 1.5, 1.50, false, {"a": 2}]', 2), (3, '"x"', 3), (4, '{}', 4), (5, NULL, 5), ` +
+      "(6, '-0.001', 6)",
+  );
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 function nopkTableDB(): Engine {
   const db = goldenDb();
@@ -1137,6 +1156,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "gin_float_table.jed", build: ginFloatTableDB },
     { name: "gin_interval_table.jed", build: ginIntervalTableDB },
+    { name: "gin_jsonb_table.jed", build: ginJsonbTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "composite_key_table.jed", build: compositeKeyTableDB },
@@ -1218,6 +1238,7 @@ test("read goldens reproduces rows", () => {
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "gin_float_table.jed", build: ginFloatTableDB, table: "t" },
     { name: "gin_interval_table.jed", build: ginIntervalTableDB, table: "t" },
+    { name: "gin_jsonb_table.jed", build: ginJsonbTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "composite_key_table.jed", build: compositeKeyTableDB, table: "t" },

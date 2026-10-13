@@ -1,0 +1,200 @@
+# GIN `jsonb_ops` term vectors (../design/gin.md §2.1/§4.1). Not a key encoding of a value but the
+# inverted index's TERM bytes, built from the text (encoding.md §2.4) and decimal (§2.5) key rules:
+#
+#   term = flag ‖ body
+#   flag = 0x01 key │ 0x02 null │ 0x03 boolean │ 0x04 number │ 0x05 string value
+#          (│ 0x10 when a key / number / string body source was cut to its first 128 bytes)
+#   body = null: empty; boolean: 0x00 / 0x01;
+#          key / string: text-terminated-escape over the (cut) UTF-8 bytes;
+#          number: text-terminated-escape over the (cut) decimal-order-preserving key.
+#
+# `[[index]]`: a document (JSON text, as `jsonb` input) and its index term SET — deduplicated, in
+# ascending byte order. Every object key and every string array element (incl. a top-level string)
+# is a KEY term; every other scalar a value term. `[[key]]`: the query term of a `?` / `?|` / `?&`
+# key. Verified by verify.rb against an independent Ruby reference; each core checks its own term
+# extraction against this file.
+
+schema_version = 1
+
+# keys at every level; an array string element is a KEY term, a member string value a STRING term
+[[index]]
+doc = '{"a": 1, "b": [true, null, "x"], "c": {"d": "e"}}'
+terms = [
+  "01610001",
+  "01620001",
+  "01630001",
+  "01640001",
+  "01780001",
+  "02",
+  "0301",
+  "04058000ff00ff010200ff0001",
+  "05650001",
+]
+
+# a top-level array: 1.5 and 1.50 are one number term; nested containers recurse
+[[index]]
+doc = '["x", 1.5, 1.50, false, {"a": 2}, ["y"]]'
+terms = [
+  "01610001",
+  "01780001",
+  "01790001",
+  "0300",
+  "04058000ff00ff01023300ff0001",
+  "04058000ff00ff010300ff0001",
+]
+
+# a top-level string is a one-element raw-scalar array: a KEY term
+[[index]]
+doc = '"x"'
+terms = [
+  "01780001",
+]
+
+# a top-level number
+[[index]]
+doc = '42'
+terms = [
+  "04058000ff00ff012b00ff0001",
+]
+
+# a top-level JSON null: the null value term
+[[index]]
+doc = 'null'
+terms = [
+  "02",
+]
+
+# a top-level boolean
+[[index]]
+doc = 'true'
+terms = [
+  "0301",
+]
+
+# an empty object: no terms
+[[index]]
+doc = '{}'
+terms = [
+]
+
+# an empty array: no terms
+[[index]]
+doc = '[]'
+terms = [
+]
+
+# only empty containers: no terms
+[[index]]
+doc = '[[], {}, [[]]]'
+terms = [
+]
+
+# the same text as a key and as a string value: two distinct terms
+[[index]]
+doc = '{"a": "a"}'
+terms = [
+  "01610001",
+  "05610001",
+]
+
+# duplicates collapse: one key term a, one number term 1
+[[index]]
+doc = '{"a": {"a": {"a": 1}}, "b": [1, 1.0, 1.00]}'
+terms = [
+  "01610001",
+  "01620001",
+  "04058000ff00ff010200ff0001",
+]
+
+# every scalar kind as a member value; 1e2 and 100 are one number term
+[[index]]
+doc = '{"n": null, "f": false, "t": true, "z": 0, "m": -0.001, "e": 1e2, "h": 100}'
+terms = [
+  "01650001",
+  "01660001",
+  "01680001",
+  "016d0001",
+  "016e0001",
+  "01740001",
+  "017a0001",
+  "02",
+  "0300",
+  "0301",
+  "04038000ff00ff00fff4ff0001",
+  "04040001",
+  "04058000ff00ff020200ff0001",
+]
+
+# UTF-8 and the empty string
+[[index]]
+doc = '{"é": "😀", "": ""}'
+terms = [
+  "010001",
+  "01c3a90001",
+  "050001",
+  "05f09f98800001",
+]
+
+# exactly 128 bytes: not cut
+[[index]]
+doc = '{"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"}'
+terms = [
+  "016b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b0001",
+  "0576767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676760001",
+]
+
+# over 128 bytes: cut to 128, flag | 0x10
+[[index]]
+doc = '{"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"}'
+terms = [
+  "116b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b0001",
+  "1576767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676767676760001",
+]
+
+# a cut array string element (0x11) and its uncut 128-byte prefix (0x01) are distinct terms
+[[index]]
+doc = '["sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss", "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"]'
+terms = [
+  "0173737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373730001",
+  "1173737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373730001",
+]
+
+# two 301-digit numbers whose keys share the first 128 bytes: one cut number term
+[[index]]
+doc = '[9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999991, 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999992]'
+terms = [
+  "14058000ff00ff970a64646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464640001",
+]
+
+# a cut that splits a UTF-8 character: the term is bytes
+[[index]]
+doc = '{"ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé": 1}'
+terms = [
+  "04058000ff00ff010200ff0001",
+  "11c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a90001",
+]
+
+[[key]]
+key = "a"
+term = "01610001"
+
+[[key]]
+key = ""
+term = "010001"
+
+[[key]]
+key = "é"
+term = "01c3a90001"
+
+[[key]]
+key = "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+term = "016b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b0001"
+
+[[key]]
+key = "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+term = "116b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b0001"
+
+[[key]]
+key = "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+term = "11c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a90001"
+

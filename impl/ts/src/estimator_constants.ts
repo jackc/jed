@@ -32,6 +32,10 @@ export const ACCESS_GIN_CONTAINS = "matching";
 export const ACCESS_GIN_OVERLAPS = "matching";
 export const ACCESS_GIN_MEMBER = "matching";
 export const ACCESS_GIN_EQUAL = "matching";
+export const ACCESS_GIN_JSONB_CONTAINS = "matching";
+export const ACCESS_GIN_JSONB_EXISTS = "matching";
+export const ACCESS_GIN_JSONB_EXISTS_ANY = "matching";
+export const ACCESS_GIN_JSONB_EXISTS_ALL = "matching";
 export const ACCESS_UNSUPPORTED = "opaque";
 
 export const ESTIMATOR_ACCESS_PATH_ORDER = [

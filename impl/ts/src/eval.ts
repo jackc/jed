@@ -763,16 +763,13 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         if (av.kind !== "text") throw new Error("resolver guarantees a text arg for ?");
         result = jsonHasKeyKernel(node, av.text);
       } else {
-        // `?|` / `?&` — a text[] arg. A NULL element never matches (PG): `?&` over an array with a
-        // NULL is false; `?|` simply skips it.
+        // `?|` / `?&` — a text[] arg. A NULL element is SKIPPED by both (PG,
+        // json-sql-functions.md §1.2): `'{"a":1}' ?& '{a,NULL}'` is true, `?& '{}'` is true for
+        // every document, `?| '{}'` false.
         if (av.kind !== "array") throw new Error("resolver guarantees a text[] arg for ?| / ?&");
         const keys: string[] = [];
-        let hasNull = false;
         for (const el of av.elements) {
-          if (el.kind === "null") {
-            hasNull = true;
-            continue;
-          }
+          if (el.kind === "null") continue;
           if (el.kind !== "text") throw new Error("a text[] arg has text/NULL elements");
           keys.push(el.text);
         }
@@ -780,7 +777,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           result = keys.some((k) => jsonHasKeyKernel(node, k));
         } else {
           // "all"
-          result = !hasNull && keys.every((k) => jsonHasKeyKernel(node, k));
+          result = keys.every((k) => jsonHasKeyKernel(node, k));
         }
       }
       return { kind: "bool", value: result };

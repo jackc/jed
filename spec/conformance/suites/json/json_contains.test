@@ -45,6 +45,46 @@ false
 true
 true
 
+# Below the top level a contained value must be the SAME kind: the bare-scalar-in-array rule is
+# top-level only (json-sql-functions.md §1.2), so a nested array never contains a nested scalar, and
+# an object member never matches a member of another container kind.
+query BBBB nosort
+SELECT '{"x":["a"]}'::jsonb @> '{"x":"a"}', '{"x":[1]}'::jsonb @> '{"x":1}',
+       '{"x":{"a":1}}'::jsonb @> '{"x":[]}', '{"x":[]}'::jsonb @> '{"x":{}}'
+----
+false
+false
+false
+false
+
+query BBBB nosort
+SELECT '[{"x":[1]}]'::jsonb @> '[{"x":1}]', '{"x":{"y":["a"]}}'::jsonb @> '{"x":{"y":"a"}}',
+       '{"x":["a"]}'::jsonb @> '{"x":["a"]}', '{"a":1.0}'::jsonb @> '{"a":1}'
+----
+false
+false
+true
+true
+
+# A top-level scalar contains only an equal scalar; a top-level array contains a bare scalar element.
+query BBBB nosort
+SELECT '"a"'::jsonb @> '[]', '"a"'::jsonb @> '"a"', '["a"]'::jsonb @> '"a"', '[["a"]]'::jsonb @> '"a"'
+----
+false
+true
+true
+false
+
+# ?& skips NULL keys (an all-NULL or empty list is vacuously true); ?| ignores them.
+query BBBB nosort
+SELECT '{"a":1}'::jsonb ?& '{a,NULL}', '{"a":1}'::jsonb ?& '{NULL}', '{"a":1}'::jsonb ?& '{}',
+       '{"a":1}'::jsonb ?| '{NULL,a}'
+----
+true
+true
+true
+true
+
 # <@ is the reverse of @>.
 query BB nosort
 SELECT '{"a":1}'::jsonb <@ '{"a":1,"b":2}', '{"a":1,"b":2}'::jsonb <@ '{"a":1}'

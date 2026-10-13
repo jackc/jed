@@ -78,11 +78,31 @@ ORDER BY id;`;
 	const equalQuery = `SELECT title FROM post
 WHERE tags = ARRAY[10, 20]
 ORDER BY id;`;
+
+	const jsonbSeed = `CREATE TABLE event (
+  id   i32 PRIMARY KEY,
+  body jsonb
+);
+CREATE INDEX event_body_gin ON event USING gin (body);
+INSERT INTO event VALUES
+  (1, '{"kind": "signup", "plan": "pro", "tags": ["beta"]}'),
+  (2, '{"kind": "signup", "plan": "free"}'),
+  (3, '{"kind": "login", "device": {"os": "ios"}}'),
+  (4, '{"kind": "login", "device": {"os": "android"}, "tags": ["beta"]}'),
+  (5, '{"kind": "refund"}');`;
+
+	const jsonbContainsQuery = `SELECT id FROM event
+WHERE body @> '{"kind": "login", "device": {"os": "ios"}}'
+ORDER BY id;`;
+
+	const jsonbKeyQuery = `SELECT id FROM event
+WHERE body ? 'tags'
+ORDER BY id;`;
 </script>
 
 <svelte:head>
 	<title>Indexes — jed</title>
-	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, expression and partial (WHERE) indexes, and GIN inverted indexes that accelerate array containment, overlap, membership, and exact equality, run live." />
+	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, expression and partial (WHERE) indexes, and GIN inverted indexes that accelerate array containment, overlap, membership, and exact equality, and jsonb containment and key existence, run live." />
 </svelte:head>
 
 # Indexes
@@ -275,11 +295,45 @@ Equality is stricter than containment — `tags = ARRAY[10, 20]` keeps only `gin
 
 <LiveSql demo="equalQuery" seed={ginSeed} query={equalQuery} rows={6} />
 
+## GIN indexes for `jsonb`
+
+A GIN index on a `jsonb` column indexes every **key** and every **scalar value** of each
+document, at every nesting level — PostgreSQL's default `jsonb_ops` operator class. It accelerates
+containment and key existence:
+
+- **`body @> '{"kind": "login"}'`** (contains; `'…' <@ body` is the same) — documents that contain
+  the query document. jed gathers the rows carrying *all* of the query's keys and values.
+- **`body ? 'tags'`** — documents with that top-level key (or, for an array, that string element).
+- **`body ?| '{a,b}'`** / **`body ?& '{a,b}'`** — any / all of the keys.
+
+```sql
+CREATE INDEX event_body_gin ON event USING gin (body)
+```
+
+The index ignores where in the document a key or value sits, so the rows it gathers are candidates
+that the original operator always rechecks — the answer is exactly the full-scan answer.
+Containment follows PostgreSQL: a nested value must match in kind, so `{"tags": ["beta"]}` does not
+contain `{"tags": "beta"}`, and only a top-level array contains a bare scalar element. `UPDATE` and
+`DELETE` use the index for their target rows, as they do for arrays. A `json` column has no GIN
+operator class (`42704`).
+
+<LiveSql demo="jsonbContainsQuery" seed={jsonbSeed} query={jsonbContainsQuery} rows={6} />
+
+Key existence (`1` and `4` have a top-level `tags` key):
+
+<LiveSql demo="jsonbKeyQuery" seed={jsonbSeed} query={jsonbKeyQuery} rows={6} />
+
+A key or string longer than 128 bytes is indexed by its first 128 bytes, so very long values that
+share a prefix also share an index entry; the recheck tells them apart. The jsonpath operators
+`@?` and `@@` are not accelerated yet, and run by full scan.
+
 ### Current scope
 
 GIN this release covers a focused surface (it grows from here):
 
-- **One column, an array of a fixed-width key-encodable element type** — the integers (`i16[]`,
+- **A `jsonb` column** — the `jsonb_ops` operator class above, for `@>`, `<@`, `?`, `?|`, and `?&`.
+
+- **Or one column, an array of a fixed-width key-encodable element type** — the integers (`i16[]`,
   `i32[]`, `i64[]`), plus `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`,
   `interval[]`, and the binary floats (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding
   and carries no length/terminator framing, so only the fixed-width keyables qualify: the
@@ -294,7 +348,7 @@ GIN this release covers a focused surface (it grows from here):
   counts as 30 days, a day as 24 hours), so `1 mon`, `30 days`, and `720:00:00` are one term:
   `'1 mon'::interval = ANY(col)` finds a stored `{30 days}`, exactly as the full scan would. The
   stored values keep their own spelling.
-- **`@>`, `&&`, `= ANY`, and array `=` only** — `<@` (contained-by) and `IN` over a scalar list
+- **For arrays, `@>`, `&&`, `= ANY`, and array `=` only** — `<@` (contained-by) and `IN` over a scalar list
   still run, by full scan; they are not GIN-accelerated yet.
 - **No `UNIQUE`** — an inverted index has many entries per row, so `CREATE UNIQUE INDEX … USING gin`
   is rejected (`0A000`), matching PostgreSQL.

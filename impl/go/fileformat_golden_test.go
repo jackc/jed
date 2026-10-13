@@ -436,6 +436,22 @@ func ginIntervalTableDB(t *testing.T) *Session {
 	return db
 }
 
+// ginJsonbTableDB is the jsonb_ops GIN golden (gin.md §2.1/§4.1): keys at two levels, an array
+// string element (a KEY term) beside a member string value, every scalar kind, 1.5/1.50 as one number
+// term, a duplicate term, a top-level string, {}, a SQL NULL, and a negative number. Must match
+// verify.rb's GIN_JSONB_TABLE.
+func ginJsonbTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb, n i32)")
+	run(t, db, "CREATE INDEX i_n ON t (n)")
+	run(t, db, "CREATE INDEX i_doc_gin ON t USING gin (doc)")
+	run(t, db, "INSERT INTO t VALUES "+
+		`(1, '{"a": 1, "b": [true, null, "x"], "c": {"d": "e"}}', 1), `+
+		`(2, '["x", 1.5, 1.50, false, {"a": 2}]', 2), (3, '"x"', 3), (4, '{}', 4), (5, NULL, 5), `+
+		`(6, '-0.001', 6)`)
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 func nopkTableDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
@@ -1099,6 +1115,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"gin_float_table.jed", ginFloatTableDB},
 		{"gin_interval_table.jed", ginIntervalTableDB},
+		{"gin_jsonb_table.jed", ginJsonbTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"composite_key_table.jed", compositeKeyTableDB},
@@ -1182,6 +1199,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
 		{"gin_float_table.jed", ginFloatTableDB, "t"},
 		{"gin_interval_table.jed", ginIntervalTableDB, "t"},
+		{"gin_jsonb_table.jed", ginJsonbTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"composite_key_table.jed", compositeKeyTableDB, "t"},
@@ -1217,7 +1235,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		}
 		got := loaded.RowsInKeyOrder(c.table)
 		want := c.build(t).RowsInKeyOrder(c.table)
-		if !reflect.DeepEqual(got, want) {
+		if !reflect.DeepEqual(goldenComparableRows(got), goldenComparableRows(want)) {
 			t.Errorf("%s: rows differ\n  got:  %v\n  want: %v", c.name, got, want)
 		}
 	}
@@ -1670,4 +1688,22 @@ func TestCorruptImageIsRejected(t *testing.T) {
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
 		t.Errorf("expected XX001, got %v", err)
 	}
+}
+
+// goldenComparableRows replaces each jsonb value with its canonical text (jsonbOut) so the read-back
+// comparison is over the document, not the Go slice representation: a decoded `{}` holds an empty
+// member slice where a parsed one holds nil — the same document.
+func goldenComparableRows(rows []storedRow) [][]any {
+	out := make([][]any, len(rows))
+	for i, row := range rows {
+		out[i] = make([]any, len(row))
+		for j, v := range row {
+			if v.Kind == ValJsonb {
+				out[i][j] = "jsonb:" + jsonbOut(v.jsonb())
+			} else {
+				out[i][j] = v
+			}
+		}
+	}
+	return out
 }

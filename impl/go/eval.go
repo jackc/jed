@@ -1883,13 +1883,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case hkOne:
 			result = jsonHasKey(node, av.str()) // resolver guarantees a text arg for ?
 		default: // hkAny / hkAll — a text[] arg
-			// A NULL element never matches (PG): `?&` over an array with a NULL is false; `?|`
-			// simply skips it.
+			// A NULL element is skipped (PG, json-sql-functions.md §1.2): `?|` ignores it, and `?&`
+			// requires only every NON-NULL key (an all-NULL / empty list is vacuously true).
 			keys := make([]string, 0, len(av.arrayVal().Elements))
-			hasNull := false
 			for _, el := range av.arrayVal().Elements {
 				if el.Kind == ValNull {
-					hasNull = true
 					continue
 				}
 				keys = append(keys, el.str()) // a text[] arg has text/NULL elements
@@ -1902,7 +1900,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					}
 				}
 			} else { // hkAll
-				result = !hasNull
+				result = true
 				for _, k := range keys {
 					if !jsonHasKey(node, k) {
 						result = false

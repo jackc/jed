@@ -1415,21 +1415,37 @@ func verbatimObjectMembers(text string) ([]verbatimMember, error) {
 // Containment / existence operators (`@> <@ ? ?| ?&`, spec/design/json-sql-functions.md §1, J5).
 // ---------------------------------------------------------------------------------------------
 
-// jsonContains is `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains`)?
-// The rules, pinned against the postgres:18 oracle:
-//   - object @> object: every member of `b` has a matching key in `a` whose value contains it.
-//   - array @> array: every element of `b` is "contained in" `a` — a SCALAR element must EQUAL a
-//     direct element of `a` (no recursion into `a`'s sub-containers); an OBJECT/ARRAY element must
-//     be contained in some same-kind direct element of `a`.
-//   - array @> scalar: the scalar is a direct element of the array (by value equality).
-//   - scalar @> scalar: value equality.
-//   - any other top-level pairing (object vs array, scalar vs array/object, …) is false.
+// jsonContains is `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains` /
+// `JsonbDeepContains`, spec/design/json-sql-functions.md §1.2)? The rules, pinned against the
+// postgres:18 oracle:
+//   - top level: object @> object; array @> array; array @> a bare SCALAR that equals one of its
+//     direct elements (PostgreSQL's raw-scalar pseudo-array); scalar @> an equal scalar. Every other
+//     pairing (object vs non-object, scalar vs array) is false.
+//   - below the top level a contained value must be the SAME kind (jsonContainsSameKind): the
+//     bare-scalar-in-array rule is top-level only, so `{"x":["a"]} @> {"x":"a"}` is false.
 func jsonContains(a, b *JsonNode) bool {
+	if a.Kind == JArray && !jsonIsContainer(b) {
+		// array @> a bare scalar (top level only): the scalar is a direct element of the array.
+		for i := range a.Arr {
+			if jsonbValueEqual(&a.Arr[i], b) {
+				return true
+			}
+		}
+		return false
+	}
+	return jsonContainsSameKind(a, b)
+}
+
+// jsonContainsSameKind is containment of two values of the same kind (PG `JsonbDeepContains` below the
+// top level): object ⊇ object (every member of `b` has a member of `a` with the same key whose value
+// contains it, same kind), array ⊇ array (every element of `b` is matched by an element of `a`), or two
+// equal scalars. Any kind mismatch is false.
+func jsonContainsSameKind(a, b *JsonNode) bool {
 	switch {
 	case a.Kind == JObject && b.Kind == JObject:
 		for i := range b.Obj {
 			va := jsonGetField(a, b.Obj[i].Key)
-			if va == nil || !jsonContains(va, &b.Obj[i].Val) {
+			if va == nil || !jsonContainsSameKind(va, &b.Obj[i].Val) {
 				return false
 			}
 		}
@@ -1441,17 +1457,8 @@ func jsonContains(a, b *JsonNode) bool {
 			}
 		}
 		return true
-	case a.Kind == JArray && !jsonIsContainer(b):
-		// array @> a scalar: the scalar is a direct element of the array.
-		for i := range a.Arr {
-			if jsonbValueEqual(&a.Arr[i], b) {
-				return true
-			}
-		}
-		return false
 	case !jsonIsContainer(a) && !jsonIsContainer(b):
-		// scalar @> scalar: value equality (a container `a` against a scalar `b` already fell
-		// through; two scalars compare by the structural equality).
+		// scalar = scalar: value equality (numbers by value, strings by bytes).
 		return jsonbValueEqual(a, b)
 	default:
 		return false
@@ -1465,14 +1472,14 @@ func jsonElementInArray(arr []JsonNode, e *JsonNode) bool {
 	switch e.Kind {
 	case JObject:
 		for i := range arr {
-			if arr[i].Kind == JObject && jsonContains(&arr[i], e) {
+			if arr[i].Kind == JObject && jsonContainsSameKind(&arr[i], e) {
 				return true
 			}
 		}
 		return false
 	case JArray:
 		for i := range arr {
-			if arr[i].Kind == JArray && jsonContains(&arr[i], e) {
+			if arr[i].Kind == JArray && jsonContainsSameKind(&arr[i], e) {
 				return true
 			}
 		}

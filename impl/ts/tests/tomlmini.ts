@@ -278,3 +278,51 @@ function parseEncCaseLine(line: string, kind: EncCase["kind"] | "", typ: string)
   if (bytes === "") return null;
   return { kind, typ, value, strValue, boolValue, isNull, bytes };
 }
+
+// GinJsonbVectors is spec/encoding/gin_jsonb_terms.toml: `[[index]]` documents with their expected
+// term SET (hex, ascending), and `[[key]]` query keys with their expected key term (hex).
+export type GinJsonbVectors = {
+  index: { doc: string; terms: string[] }[];
+  key: { key: string; term: string }[];
+};
+
+// readGinJsonbVectors reads the GIN jsonb_ops term vectors. The file's shape is fixed: a document is
+// a single-line TOML literal string (`doc = '…'`, no escapes), `terms` a multi-line array of hex
+// basic strings, and a key a basic string with no escapes (raw UTF-8).
+export function readGinJsonbVectors(file: string): GinJsonbVectors {
+  const out: GinJsonbVectors = { index: [], key: [] };
+  let section = "";
+  let inTerms = false;
+  let doc = "";
+  let terms: string[] = [];
+  let key = "";
+  for (const raw of readFileSync(file, "utf8").split("\n")) {
+    const line = raw.trim();
+    if (inTerms) {
+      if (line === "]") {
+        out.index.push({ doc, terms });
+        inTerms = false;
+      } else if (line.startsWith('"')) terms.push(unquote(line.replace(/,$/, "")));
+      continue;
+    }
+    if (line === "" || line.startsWith("#")) continue;
+    if (line === "[[index]]" || line === "[[key]]") {
+      section = line;
+      continue;
+    }
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const k = line.slice(0, eq).trim();
+    const v = line.slice(eq + 1).trim();
+    if (section === "[[index]]" && k === "doc") {
+      if (!(v.startsWith("'") && v.endsWith("'"))) throw new Error(`bad doc line: ${line}`);
+      doc = v.slice(1, -1);
+    } else if (section === "[[index]]" && k === "terms") {
+      terms = [];
+      if (v === "[") inTerms = true;
+      else throw new Error(`bad terms line: ${line}`);
+    } else if (section === "[[key]]" && k === "key") key = unquote(v);
+    else if (section === "[[key]]" && k === "term") out.key.push({ key, term: unquote(v) });
+  }
+  return out;
+}

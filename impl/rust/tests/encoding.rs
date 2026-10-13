@@ -150,3 +150,37 @@ fn descending_is_inverted_nullable() {
         }
     }
 }
+
+/// The GIN `jsonb_ops` term vectors (spec/encoding/gin_jsonb_terms.toml, gin.md §4.1): each
+/// document's deduplicated, byte-sorted index term set, and each `?` / `?|` / `?&` key's query term.
+#[test]
+fn gin_jsonb_terms_match_vectors() {
+    let v: toml::Value = toml::from_str(&spec("encoding/gin_jsonb_terms.toml")).unwrap();
+    let mut checked = 0;
+    for case in v["index"].as_array().unwrap() {
+        let doc = case["doc"].as_str().unwrap();
+        let node = jed::json::jsonb_in(doc).unwrap();
+        let got: Vec<String> = jed::json::gin_jsonb_index_terms(&node)
+            .iter()
+            .map(|t| hex(t))
+            .collect();
+        let want: Vec<&str> = case["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
+        assert_eq!(got, want, "index terms of {doc}");
+        checked += 1;
+    }
+    for case in v["key"].as_array().unwrap() {
+        let key = case["key"].as_str().unwrap();
+        assert_eq!(
+            hex(&jed::json::gin_jsonb_key_term(key)),
+            case["term"].as_str().unwrap(),
+            "key term of {key:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 20);
+}

@@ -269,6 +269,13 @@ index/constraint that touches it. The hardest form: a failed cast is the cast's 
 expression over the row's columns. If the column is a key member, its key encoding changes, so
 the table (and dependent indexes) re-key — a full rebuild with final-key uniqueness validation.
 The target type must be key-encodable before PRIMARY KEY metadata is retained (`0A000` otherwise).
+Every surviving index that keys the column re-applies its `CREATE INDEX` column gate under the new
+type: an ordered index needs a key-encodable type (`0A000`), a GIN index a GIN operator class
+([gin.md §3](gin.md) — `42704` for none, `0A000` for a deferred array element), a GiST index a GiST
+operator class ([gist.md §6](gist.md)). The gate runs once every action of the statement has passed
+its own validation and before any row is rewritten, so a later action's error (an unknown column,
+`42703`) is reported first and a row-level `USING` error never is. PostgreSQL re-creates the index
+under the new type at that point and fails the same way.
 
 A column a **view** references cannot change type: `0A000` (*cannot alter type of a column used by
 a view*), as in PostgreSQL ([views.md](views.md) §6).

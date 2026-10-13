@@ -33,6 +33,10 @@ EXPECTED_ACCESS_METHOD = {
   "gin_overlaps" => "matching",
   "gin_member" => "matching",
   "gin_equal" => "matching",
+  "gin_jsonb_contains" => "matching",
+  "gin_jsonb_exists" => "matching",
+  "gin_jsonb_exists_any" => "matching",
+  "gin_jsonb_exists_all" => "matching",
   "unsupported" => "opaque",
 }.freeze
 

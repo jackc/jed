@@ -42,9 +42,8 @@ recorded as data, not branchy code — except where PG observably differs, §3).
 | `@?` | `jsonb @? jsonpath` | `boolean` | P2 | path exists — [jsonpath.md §6](jsonpath.md) |
 | `@@` | `jsonb @@ jsonpath` | `boolean` | P2 | path match — [jsonpath.md §6](jsonpath.md) |
 
-`@>` / `<@` / `?` / `?|` / `?&` are exactly the predicates a future GIN `jsonb_ops` opclass
-accelerates ([gin.md](gin.md) — the seam already seats it); J5 ships them as sequential
-predicates, GIN pushdown a deferred follow-on.
+`@>` / `<@` / `?` / `?|` / `?&` are exactly the predicates the GIN `jsonb_ops` opclass
+accelerates ([gin.md §2.1](gin.md)); without a GIN index they run as sequential predicates.
 
 ### 1.1 The `json` accessor overloads (verbatim)
 
@@ -73,6 +72,28 @@ escapes kept, surrounding whitespace dropped. Each core walks the text with a sm
   `i32` — so `'1 '` or an out-of-range step never matches.
 
 Cost is the jsonb accessors' (one `operator_eval`); the scan is bounded by the input text.
+
+### 1.2 Containment and key existence (PostgreSQL's `JsonbDeepContains`)
+
+`a @> b` (and `b <@ a`) — every rule oracle-pinned, and the rule the GIN `jsonb_ops` gather's
+soundness rests on ([gin.md §2.1](gin.md)):
+
+- **Top level.** An object contains an object; an array contains an array; an array also contains a
+  **bare scalar** that equals one of its direct elements (`'["a",1]' @> '"a"'`); a scalar contains an
+  equal scalar. Every other pairing — an object against a non-object, a scalar against an array
+  (`'1' @> '[1]'`, `'"a"' @> '[]'`) — is false.
+- **Objects.** Every member of `b` must have a member of `a` with the same key whose value has the
+  **same kind** — scalars equal (numbers by value, `1.0 = 1`; strings by UTF-8 bytes), objects
+  contained recursively, arrays contained recursively. The bare-scalar-in-array rule does **not**
+  apply below the top level: `'{"x":["a"]}' @> '{"x":"a"}'` is false.
+- **Arrays.** Every element of `b` must be matched by some element of `a`: a scalar by an equal
+  scalar element, an object by an object element that contains it, an array by an array element that
+  contains it. Duplicates and order are irrelevant (`'[1,1]' @> '[1]'`, `'[1]' @> '[1,1]'`).
+
+`a ? k` is true when `k` is a key of a top-level object, a string element of a top-level array, or
+equal to a top-level string. `?|` is true when any non-NULL element of the `text[]` is such a key,
+`?&` when every **non-NULL** element is — NULL elements are skipped, so `'{"a":1}' ?& '{a,NULL}'` is
+true and `?& '{}'` is true for every non-NULL document, while `?| '{}'` is false.
 
 ---
 

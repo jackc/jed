@@ -1095,6 +1095,35 @@ GIN_FLOAT_TABLE = {
          [5, [-Float::INFINITY, nil, -2.5], [100.25, nil, 100.25], 5]]
 }.freeze
 
+# A GIN index over a jsonb column (the jsonb_ops golden, spec/design/gin.md §2.1/§4.1): row 1 holds
+# keys at two levels, an array string element (a KEY term) beside a member string value (a STRING
+# term), a boolean and a JSON null; row 2 a top-level array whose 1.5 and 1.50 are ONE number term
+# and whose "x" duplicates row 1's key term "x" (one entry per row); row 3 a top-level string (a KEY
+# term); rows 4/5 `{}` and a SQL NULL (no entries); row 6 a negative number. The truncated-term form
+# (over 128 bytes) cannot fit this 256-byte page's record limit; spec/encoding/gin_jsonb_terms.toml
+# pins it. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb, n i32)
+#   CREATE INDEX i_n ON t (n);  CREATE INDEX i_doc_gin ON t USING gin (doc)
+#   INSERT (1, '{"a": 1, "b": [true, null, "x"], "c": {"d": "e"}}', 1),
+#          (2, '["x", 1.5, 1.50, false, {"a": 2}]', 2), (3, '"x"', 3), (4, '{}', 4), (5, NULL, 5),
+#          (6, '-0.001', 6)
+GIN_JSONB_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("doc", "jsonb"), col("n", "i32")],
+  indexes: [
+    { name: "i_doc_gin", cols: [1], kind: "gin" },
+    { name: "i_n", cols: [2] }
+  ],
+  rows: [[1, [:obj, [["a", [:num, "1"]], ["b", [:arr, [[:bool, true], [:null], [:str, "x"]]]],
+                     ["c", [:obj, [["d", [:str, "e"]]]]]]], 1],
+         [2, [:arr, [[:str, "x"], [:num, "1.5"], [:num, "1.50"], [:bool, false],
+                     [:obj, [["a", [:num, "2"]]]]]], 2],
+         [3, [:str, "x"], 3],
+         [4, [:obj, []], 4],
+         [5, nil, 5],
+         [6, [:num, "-0.001"], 6]]
+}.freeze
+
 # A GIN index over an interval[] column (the interval GIN element golden, spec/design/gin.md §2/§4):
 # each GIN term is the element's 16-byte interval-span-i128 key (encoding.md §2.10), so the
 # span-equal `1 mon` / `30 days` / `720:00:00` of row 1 are ONE term and row 2's duplicate `-1 day`
@@ -1472,6 +1501,7 @@ FIXTURES = ([
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
   { file: "gin_float_table.jed", page_size: 256, tables: [GIN_FLOAT_TABLE] },
   { file: "gin_interval_table.jed", page_size: 256, tables: [GIN_INTERVAL_TABLE] },
+  { file: "gin_jsonb_table.jed", page_size: 256, tables: [GIN_JSONB_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
@@ -2466,19 +2496,78 @@ end
 # equality: a float term's key canonicalizes -0 → +0 and every NaN (encoding.md §2.8), so {-0,0} and
 # {NaN,NaN} are one term each (Ruby's uniq would keep two distinct NaN objects).
 def gin_index_entries(table, ix)
-  elem_type = array_elem(table[:columns][ix[:cols][0]][:type])
-  raise "a GIN index column must be an array" unless elem_type
+  col_type = table[:columns][ix[:cols][0]][:type]
+  elem_type = array_elem(col_type)
+  raise "a GIN index column must be an array or jsonb" unless elem_type || col_type == "jsonb"
   pairs = []
   table_entries(table).each do |storage_key, row|
     av = row[ix[:cols][0]]
-    next if av.nil? # a NULL array yields no terms
-    elems = av.is_a?(Hash) ? av[:elements] : av
-    elems.compact.map { |e| key_body(elem_type, e) }.uniq.each do |term|
+    next if av.nil? # a NULL array / document yields no terms
+    terms = if col_type == "jsonb"
+              gin_jsonb_terms(av)
+            else
+              elems = av.is_a?(Hash) ? av[:elements] : av
+              elems.compact.map { |e| key_body(elem_type, e) }
+            end
+    terms.uniq.each do |term|
       key = (term + storage_key).b
       pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
     end
   end
   pairs.sort_by { |key, _| key }
+end
+
+# GIN `jsonb_ops` index terms of a tagged jsonb node (spec/design/gin.md §2.1/§4.1): a KEY term
+# (flag 0x01) per object key and per string array element (a top-level string included), a value
+# term per other scalar — 0x02 null, 0x03 boolean (+ 0x00/0x01), 0x04 number, 0x05 string member
+# value. A key/string body is text-terminated-escape over the UTF-8, a number body the same over its
+# decimal-order-preserving key; a source over 128 bytes is cut to 128 and sets flag bit 0x10.
+GIN_JSONB_MAX_TERM_BYTES = 128
+
+def gin_jsonb_framed(flag, content)
+  content = content.b
+  if content.bytesize > GIN_JSONB_MAX_TERM_BYTES
+    flag |= 0x10
+    content = content.byteslice(0, GIN_JSONB_MAX_TERM_BYTES)
+  end
+  [flag].pack("C") + enc_terminated(content)
+end
+
+def gin_jsonb_scalar_term(node, as_key)
+  case node[0]
+  when :null then "\x02".b
+  when :bool then node[1] ? "\x03\x01".b : "\x03\x00".b
+  when :num then gin_jsonb_framed(0x04, encode_decimal_key(node[1]))
+  when :str then gin_jsonb_framed(as_key ? 0x01 : 0x05, node[1])
+  else raise "not a jsonb scalar #{node.inspect}"
+  end
+end
+
+def gin_jsonb_container?(node) = %i[obj arr].include?(node[0])
+
+def gin_jsonb_walk(node, out)
+  case node[0]
+  when :obj
+    node[1].each do |k, v|
+      out << gin_jsonb_framed(0x01, k)
+      gin_jsonb_container?(v) ? gin_jsonb_walk(v, out) : out << gin_jsonb_scalar_term(v, false)
+    end
+  when :arr
+    node[1].each do |e|
+      gin_jsonb_container?(e) ? gin_jsonb_walk(e, out) : out << gin_jsonb_scalar_term(e, e[0] == :str)
+    end
+  end
+end
+
+# The document's deduplicated term set, in ascending byte order.
+def gin_jsonb_terms(node)
+  out = []
+  if gin_jsonb_container?(node)
+    gin_jsonb_walk(node, out)
+  else
+    out << gin_jsonb_scalar_term(node, node[0] == :str) # a raw scalar is a one-element array
+  end
+  out.uniq.sort
 end
 
 # --- GiST R-tree (spec/design/gist.md §3/§4.1) -------------------------------

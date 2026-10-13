@@ -577,9 +577,8 @@ kernels in [json-sql-functions.md](json-sql-functions.md)):
 | `#-` | delete at path (`text[]`) | `jsonb` | J6 |
 | `@?` / `@@` | jsonpath exists / match | `boolean` | P2 ([jsonpath.md](jsonpath.md)) |
 
-`@>`/`<@`/`?`/`?|`/`?&` are exactly the predicates a future GIN `jsonb_ops` opclass
-accelerates (the [gin.md](gin.md) seam already seats it — TODO.md line 388); J5 ships them as
-sequential predicates, GIN pushdown a deferred follow-on (§12), the range-GiST precedent.
+`@>`/`<@`/`?`/`?|`/`?&` are exactly the predicates the GIN `jsonb_ops` opclass accelerates
+([gin.md §2.1](gin.md)); without a GIN index they run as sequential predicates.
 
 ---
 
@@ -620,4 +619,5 @@ across all four JSON docs is in [TODO.md]. Critical path:
 
 **Explicitly deferred `0A000` follow-ons:** the key/string **dictionary builder** (opens the
 §3 door — its own slice, its own goldens); **`jsonb` as PK/index** (exercise
-[encoding.md §2.13](encoding.md)); the **GIN `jsonb_ops`** opclass for `@>`/`?` ([gin.md](gin.md)).
+[encoding.md §2.13](encoding.md)). (The **GIN `jsonb_ops`** opclass for `@>`/`?`/`?|`/`?&` has
+since landed — [gin.md §2.1](gin.md).)

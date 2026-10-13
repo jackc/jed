@@ -197,6 +197,10 @@ import {
   STATISTICS_NDV_SCALE_NUMERATOR,
   ACCESS_GIN_CONTAINS,
   ACCESS_GIN_EQUAL,
+  ACCESS_GIN_JSONB_CONTAINS,
+  ACCESS_GIN_JSONB_EXISTS,
+  ACCESS_GIN_JSONB_EXISTS_ALL,
+  ACCESS_GIN_JSONB_EXISTS_ANY,
   ACCESS_GIN_MEMBER,
   ACCESS_GIN_OVERLAPS,
   ACCESS_GIST_EQUAL,
@@ -351,6 +355,7 @@ import {
   typeIsDate,
   typeIsInterval,
   typeIsRange,
+  typeIsJsonb,
   typeIsUuid,
   typeAsScalar,
   typeScalar,
@@ -358,6 +363,7 @@ import {
   isFixedWidth,
 } from "./types.ts";
 import { type ClockFunc, type RandomFill, type Seam, StmtRng } from "./seam.ts";
+import { ginJsonbIndexTerms, ginJsonbKeyTerm } from "./gin_jsonb.ts";
 import { type Interval, intervalEncodeKey, intervalLerp, intervalSpan } from "./interval.ts";
 import {
   AGGREGATES,
@@ -2833,6 +2839,59 @@ export class Engine {
     if (ty.kind === "array") return typeIsArrayKeyable(ty);
     if (ty.kind === "range") return true;
     return typeIsKeyableScalar(ty);
+  }
+
+  // checkIndexColumnType is the CREATE INDEX per-kind column-type gate (indexes.md §1, gin.md §3,
+  // gist.md §6), shared with ALTER COLUMN … TYPE, which re-applies it to every surviving index that
+  // keys a retyped column (alter.md §3.3):
+  //   - gin: a `jsonb` column takes jsonb_ops; an array of a FIXED-WIDTH KEY-ENCODABLE element takes
+  //     array_ops (the GIN term IS that element's key encoding — the integers, boolean, uuid, date,
+  //     timestamp, timestamptz, f32, f64, interval); any other array is 0A000; any other type
+  //     (including `json`) has no GIN operator class — 42704.
+  //   - gist: range_ops over a range column, or the in-core btree_gist-equivalent scalar `=` opclass
+  //     over a fixed-width keyable scalar; a keyable-but-deferred scalar (text / bytea / decimal /
+  //     interval) is 0A000; any other type has no GiST opclass — 42704 (PG's wording).
+  //   - btree: the column must be key-encodable — 0A000 otherwise.
+  checkIndexColumnType(kind: "btree" | "gin" | "gist", ty: Type): void {
+    if (kind === "gin") {
+      if (typeIsJsonb(ty)) return;
+      if (ty.kind !== "array") {
+        throw engineError(
+          "undefined_object",
+          "data type " +
+            typeCanonicalName(ty) +
+            " has no default operator class for access method gin",
+        );
+      }
+      if (!isGinElementType(ty.elem)) {
+        throw engineError(
+          "feature_not_supported",
+          "a gin index on " + typeCanonicalName(ty) + " is not supported yet",
+        );
+      }
+      return;
+    }
+    if (kind === "gist") {
+      if (typeIsRange(ty) || isGistScalarType(ty)) return;
+      if (isGistDeferredScalarType(ty)) {
+        throw engineError(
+          "feature_not_supported",
+          "a gist index on " + typeCanonicalName(ty) + " is not supported yet",
+        );
+      }
+      throw engineError(
+        "undefined_object",
+        "data type " +
+          typeCanonicalName(ty) +
+          " has no default operator class for access method gist",
+      );
+    }
+    if (!this.typeIsKeyable(ty)) {
+      throw engineError(
+        "feature_not_supported",
+        "a " + typeCanonicalName(ty) + " index column is not supported yet",
+      );
+    }
   }
 
   // tableNames is the canonical name of every table in the visible snapshot, sorted ascending
@@ -8131,6 +8190,15 @@ export class Engine {
     }
 
     if (typeChanged) {
+      // Every surviving index keying a retyped column re-applies its CREATE INDEX column gate under
+      // the end-state type (alter.md §3.3, gin.md §3) — once every action has passed its own
+      // validation (so a later action's 42703 wins) and before any row is rewritten (so a row-level
+      // USING error never does): a GIN index needs a GIN operator class, a GiST index a GiST one, an
+      // ordered index a key-encodable type. Plain-column keys only.
+      for (const index of table.indexes)
+        for (const k of index.keys)
+          if (k.kind === "column" && typeChangedColumns[k.column])
+            this.checkIndexColumnType(index.kind, table.columns[k.column]!.type);
       for (const fk of table.fks) {
         const parent =
           fk.refTable === table.name ? table : snap.table(fk.refTable)!;
@@ -9069,58 +9137,7 @@ export class Engine {
       if (idx < 0) {
         throw engineError("undefined_column", "column does not exist: " + name);
       }
-      const ty = columns[idx]!.type;
-      if (kind === "gin") {
-        // GIN needs an operator class for the column type: only an array has one (else 42704),
-        // and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
-        // element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean, uuid,
-        // date, timestamp, timestamptz, f32, f64, interval.
-        if (ty.kind !== "array") {
-          throw engineError(
-            "undefined_object",
-            "data type " +
-              typeCanonicalName(ty) +
-              " has no default operator class for access method gin",
-          );
-        }
-        if (!isGinElementType(ty.elem)) {
-          throw engineError(
-            "feature_not_supported",
-            "a gin index on " + typeCanonicalName(ty) + " is not supported yet",
-          );
-        }
-      } else if (kind === "gist") {
-        // GiST opclasses (gist.md §5/§6): range_ops over a range column, or the in-core
-        // btree_gist-equivalent scalar `=` opclass over a FIXED-WIDTH keyable scalar (integers /
-        // boolean / uuid / date / timestamp / timestamptz — its bound is [min,max] over that type's
-        // order-preserving key encoding, all pure byte comparison). A keyable-but-deferred scalar
-        // (text / bytea / decimal / interval) is 0A000 — we will support it (the GIN element-staging
-        // precedent, §11); any other type has no GiST opclass at all — 42704 (PG's wording).
-        if (!typeIsRange(ty)) {
-          if (isGistScalarType(ty)) {
-            // supported scalar `=` opclass — ok
-          } else if (isGistDeferredScalarType(ty)) {
-            throw engineError(
-              "feature_not_supported",
-              "a gist index on " + typeCanonicalName(ty) + " is not supported yet",
-            );
-          } else {
-            throw engineError(
-              "undefined_object",
-              "data type " +
-                typeCanonicalName(ty) +
-                " has no default operator class for access method gist",
-            );
-          }
-        }
-      } else if (
-        !this.typeIsKeyable(ty)
-      ) {
-        throw engineError(
-          "feature_not_supported",
-          "a " + typeCanonicalName(ty) + " index column is not supported yet",
-        );
-      }
+      this.checkIndexColumnType(kind, columns[idx]!.type);
       // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
       ciKeys.push({ kind: "column", column: idx });
     }
@@ -9823,8 +9840,8 @@ export class Engine {
         return { ...r, empty: false };
       }
       case "gin": {
-        const m = filter !== null ? ginMatch(filter, b.gin.colGlobal) : null;
-        const r = this.ginBoundRows(tableName, b.gin, m?.query ?? null, [], env, meter, mask);
+        const q = filter !== null ? ginQueryOperand(filter, b.gin) : null;
+        const r = this.ginBoundRows(tableName, b.gin, q, [], env, meter, mask);
         return { ...r, empty: false };
       }
       case "gist": {
@@ -9886,7 +9903,46 @@ export class Engine {
     const terms: Uint8Array[] = [];
     let hasNull = false;
     let isEmpty = false;
-    if (gb.strategy === "member") {
+    let anyMode = gb.strategy === "overlaps";
+    if (ginStrategyOpclass(gb.strategy) === "jsonb") {
+      // jsonb_ops (gin.md §2.1). Every strategy is strict, so a NULL operand is provably empty.
+      if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
+      if (gb.strategy === "jsonContains") {
+        // `col @> Q`: Q's own index terms, mode ALL. A term-less Q ({}, [], [[]], …) is contained by
+        // rows the index cannot enumerate (term-less ones) — fall back to the full scan.
+        if (qv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb @> operand");
+        terms.push(...ginJsonbIndexTerms(qv.node));
+      } else if (gb.strategy === "jsonHasKey") {
+        if (qv.kind !== "text") throw new Error("resolver guarantees a text ? operand");
+        terms.push(ginJsonbKeyTerm(qv.text));
+      } else {
+        // `?|` / `?&`: the key terms of K's NON-NULL elements (NULL elements are skipped).
+        if (qv.kind !== "array") throw new Error("resolver guarantees a text[] ?| / ?& operand");
+        const seen = new Set<string>();
+        for (const el of qv.elements) {
+          if (el.kind === "null") continue;
+          if (el.kind !== "text") throw new Error("a text[] operand has text/NULL elements");
+          const t = ginJsonbKeyTerm(el.text);
+          const k = byteKey(t);
+          if (!seen.has(k)) {
+            seen.add(k);
+            terms.push(t);
+          }
+        }
+        terms.sort(cmpBytes);
+        if (gb.strategy === "jsonHasAnyKey") {
+          anyMode = true;
+          // ?| with no non-NULL key matches nothing.
+          if (terms.length === 0) return { entries: [], pages: 0, slabs: 0 };
+        }
+      }
+      if (terms.length === 0) {
+        // @> a term-less Q, or ?& with no non-NULL key (TRUE for every non-NULL document): the index
+        // cannot enumerate the matching rows — fall back to the full scan (the residual decides).
+        const u = store.scanWithUnits(mask);
+        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
+      }
+    } else if (gb.strategy === "member") {
       // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
       // so the bound is provably empty (gin.md §6). c is in the element type's domain by resolution
       // (jed coerces c to the element type, rejecting an out-of-range integer constant 22003 before
@@ -9976,7 +10032,7 @@ export class Engine {
     // intersection; = ANY (member) is a single term, so its intersection is that lone posting list;
     // array = (equal) gathers the same superset as @> over Q's distinct non-NULL terms (the residual
     // = makes it exact downstream); && ANY → union.
-    const cand = gb.strategy === "overlaps" ? unionPostings(postings) : intersectPostings(postings);
+    const cand = anyMode ? unionPostings(postings) : intersectPostings(postings);
 
     let slabs = 0;
     const entries: Entry[] = [];
@@ -18597,7 +18653,7 @@ export class Engine {
           ? this.ginBoundRows(
               plan.rels[0]!.tableName,
               sb.gin,
-              plan.filter === null ? null : (ginMatch(plan.filter, sb.gin.colGlobal)?.query ?? null),
+              plan.filter === null ? null : ginQueryOperand(plan.filter, sb.gin),
               [],
               env,
               meter,
@@ -19553,12 +19609,18 @@ export class Engine {
       if (inl) {
         for (const filter of [...inlFilters, plan.filter]) {
           if (filter === null) continue;
-          m = ginSiblingMatch(filter, relBound.gin.colGlobal, siblingRange);
+          m = ginSiblingMatch(
+            filter,
+            relBound.gin.colGlobal,
+            ginStrategyOpclass(relBound.gin.strategy),
+            siblingRange,
+          );
           if (m !== null) break;
         }
       } else {
         const access = accessPredicate(plan);
-        if (access !== null) m = ginMatch(access, relBound.gin.colGlobal);
+        if (access !== null)
+          m = ginMatch(access, relBound.gin.colGlobal, ginStrategyOpclass(relBound.gin.strategy));
       }
       const r = this.ginBoundRows(
         rel.tableName,
@@ -22167,11 +22229,69 @@ export type GistBound = {
 // query operand recovered by ginMatch is the scalar c, not an array; for "equal" it is the array Q
 // whose distinct non-NULL elements gather the same superset as `@> Q` (equal arrays have identical
 // element multisets, so col = Q ⟹ col @> Q), made exact by the residual = filter.
-export type GinStrategy = "contains" | "overlaps" | "member" | "equal";
+//
+// The four jsonb_ops strategies (gin.md §2.1) apply only to a jsonb GIN column, the four above only
+// to an array GIN column: "jsonContains" (`col @> Q` / `Q <@ col`, mode ALL over Q's index terms),
+// "jsonHasKey" (`col ? k`, one key term), "jsonHasAnyKey" (`col ?| K`, mode ANY over K's non-NULL
+// key terms), "jsonHasAllKeys" (`col ?& K`, mode ALL over K's non-NULL key terms).
+export type GinStrategy =
+  | "contains"
+  | "overlaps"
+  | "member"
+  | "equal"
+  | "jsonContains"
+  | "jsonHasKey"
+  | "jsonHasAnyKey"
+  | "jsonHasAllKeys";
+
+// GinOpclass is a GIN index's operator class, implied by its column type (gin.md §1): array_ops over
+// an array column, jsonb_ops over a jsonb column. It decides which strategies the matcher accepts.
+export type GinOpclass = "array" | "jsonb";
+
+// ginOpclassOf is the operator class a GIN index over a column of type ty uses, or null when the type
+// has none (CREATE INDEX enforces one; null is the defensive answer for a stale catalog).
+export function ginOpclassOf(ty: Type): GinOpclass | null {
+  if (typeIsJsonb(ty)) return "jsonb";
+  if (ty.kind === "array") return "array";
+  return null;
+}
+
+// ginStrategyOpclass is the operator class a strategy belongs to.
+export function ginStrategyOpclass(s: GinStrategy): GinOpclass {
+  return s === "jsonContains" ||
+    s === "jsonHasKey" ||
+    s === "jsonHasAnyKey" ||
+    s === "jsonHasAllKeys"
+    ? "jsonb"
+    : "array";
+}
+
+// ginAccessClass is a GIN strategy's estimator selectivity class (spec/cost/estimator.toml).
+function ginAccessClass(s: GinStrategy): string {
+  switch (s) {
+    case "contains":
+      return ACCESS_GIN_CONTAINS;
+    case "overlaps":
+      return ACCESS_GIN_OVERLAPS;
+    case "member":
+      return ACCESS_GIN_MEMBER;
+    case "equal":
+      return ACCESS_GIN_EQUAL;
+    case "jsonContains":
+      return ACCESS_GIN_JSONB_CONTAINS;
+    case "jsonHasKey":
+      return ACCESS_GIN_JSONB_EXISTS;
+    case "jsonHasAnyKey":
+      return ACCESS_GIN_JSONB_EXISTS_ANY;
+    case "jsonHasAllKeys":
+      return ACCESS_GIN_JSONB_EXISTS_ALL;
+  }
+}
 
 // GinBound is the plan-time result for one eligible GIN index (spec/design/gin.md §6): its array
-// ELEMENT type (for encode(term) — the term bytes), operator strategy, and column's global scope
-// index. The inventory owns one plan per eligible index; the selector chooses among them. The
+// ELEMENT type (for encode(term) — the term bytes; the column's own scalar type, unused, for a jsonb
+// column), operator strategy (which implies the opclass), and column's global scope index. The
+// inventory owns one plan per eligible index; the selector chooses among them. The
 // constant query Q is NOT stored; it is re-found in plan.filter at exec time by ginMatch and
 // evaluated there.
 export type GinBound = {
@@ -23585,13 +23705,7 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       return selectivityClass(bound.gist.strategy === "equal" ? ACCESS_GIST_EQUAL : ACCESS_GIST_RANGE);
     case "gin":
       return selectivityClass(
-        bound.gin.strategy === "contains"
-          ? ACCESS_GIN_CONTAINS
-          : bound.gin.strategy === "overlaps"
-            ? ACCESS_GIN_OVERLAPS
-            : bound.gin.strategy === "member"
-              ? ACCESS_GIN_MEMBER
-              : ACCESS_GIN_EQUAL,
+        ginAccessClass(bound.gin.strategy),
       );
     case "pkSet":
       return estimatorIntervalSelectivity(
@@ -24281,23 +24395,16 @@ export function inventoryINLCandidates(
     const ci = indexFirstColumn(idx);
     const colGlobal = rel.offset + ci;
     const colType = rel.table.columns[ci]!.type;
-    if (colType.kind !== "array") continue;
+    const opclass = ginOpclassOf(colType);
+    if (opclass === null) continue;
     for (const filter of filters) {
-      const m = ginSiblingMatch(filter, colGlobal, siblingRange);
+      const m = ginSiblingMatch(filter, colGlobal, opclass, siblingRange);
       if (m !== null)
         candidates.push(
           storageOrderCandidate(
             "gin",
             idx.name,
-            {
-              kind: "gin",
-              gin: {
-                nameKey: idx.name,
-                elemType: typeScalar(colType.elem),
-                strategy: m.strategy,
-                colGlobal,
-              },
-            },
+            { kind: "gin", gin: ginBoundOf(idx.name, colType, m.strategy, colGlobal) },
             whereFilter,
           ),
         );
@@ -24478,17 +24585,26 @@ export function buildGinBoundForIndex(
   const ci = indexFirstColumn(idx);
   const colGlobal = offset + ci;
   const colType = columns[ci]!.type;
-  if (colType.kind !== "array") return null; // defensive: CREATE INDEX enforces array
-  const m = ginMatch(filter, colGlobal);
-  if (m !== null) {
-    return {
-      nameKey: idx.name,
-      elemType: typeScalar(colType.elem),
-      strategy: m.strategy,
-      colGlobal,
-    };
-  }
+  const opclass = ginOpclassOf(colType);
+  if (opclass === null) return null; // defensive: CREATE INDEX enforces an operator class
+  const m = ginMatch(filter, colGlobal, opclass);
+  if (m !== null) return ginBoundOf(idx.name, colType, m.strategy, colGlobal);
   return null;
+}
+
+// ginBoundOf builds a GinBound for a GIN index over a column of type colType.
+export function ginBoundOf(
+  nameKey: string,
+  colType: Type,
+  strategy: GinStrategy,
+  colGlobal: number,
+): GinBound {
+  return {
+    nameKey,
+    elemType: colType.kind === "array" ? typeScalar(colType.elem) : typeScalar(colType),
+    strategy,
+    colGlobal,
+  };
 }
 
 // ginMatch finds the first WHERE AND-chain conjunct a GIN index on colGlobal accelerates
@@ -24499,35 +24615,69 @@ export function buildGinBoundForIndex(
 // column be ANY's array operand and c the scalar. Returns the strategy and the constant query
 // operand (the scalar c for "member", the array Q otherwise). Used at plan time (strategy) and exec
 // time (recover the operand from plan.filter), so the two agree on the same conjunct by construction.
+//
+// The match is opclass-aware: an array GIN column matches only the four array strategies, a jsonb GIN
+// column only the four jsonb_ops ones (gin.md §2.1) — `col @> Q` / `Q <@ col` (one resolved
+// jsonContains node with the column as the CONTAINING operand), `col ? k`, `col ?| K`, `col ?& K`.
+// So `jsonbcol = Q` is never an array "equal" bound.
 export function ginMatch(
   filter: RExpr,
   colGlobal: number,
+  opclass: GinOpclass,
 ): { strategy: GinStrategy; query: RExpr } | null {
-  return ginMatchOperand(filter, colGlobal, rexprIsConstant);
+  return ginMatchOperand(filter, colGlobal, opclass, rexprIsConstant);
 }
 
 export function ginSiblingMatch(
   filter: RExpr,
   colGlobal: number,
+  opclass: GinOpclass,
   siblingRange: ColumnRange,
 ): { strategy: GinStrategy; query: RExpr } | null {
   return ginMatchOperand(
     filter,
     colGlobal,
+    opclass,
     (q) => q.kind === "column" && columnRangeContains(siblingRange, q.index),
   );
+}
+
+// ginQueryOperand recovers a GIN bound's query operand from the live filter at exec time, under the
+// bound's own opclass (so it re-finds the conjunct the planner matched).
+export function ginQueryOperand(filter: RExpr, gb: GinBound): RExpr | null {
+  return ginMatch(filter, gb.colGlobal, ginStrategyOpclass(gb.strategy))?.query ?? null;
 }
 
 function ginMatchOperand(
   filter: RExpr,
   colGlobal: number,
+  opclass: GinOpclass,
   queryOK: (query: RExpr) => boolean,
 ): { strategy: GinStrategy; query: RExpr } | null {
   if (filter.kind === "and") {
     return (
-      ginMatchOperand(filter.lhs, colGlobal, queryOK) ??
-      ginMatchOperand(filter.rhs, colGlobal, queryOK)
+      ginMatchOperand(filter.lhs, colGlobal, opclass, queryOK) ??
+      ginMatchOperand(filter.rhs, colGlobal, opclass, queryOK)
     );
+  }
+  if (opclass === "jsonb") {
+    // jsonb_ops (gin.md §2.1): `<@` resolved to the same jsonContains node with the operands swapped,
+    // so the column must be its containing operand `a`.
+    if (filter.kind === "jsonContains") {
+      if (isColumnRef(filter.a, colGlobal) && queryOK(filter.b))
+        return { strategy: "jsonContains", query: filter.b };
+    } else if (filter.kind === "jsonHasKey") {
+      if (isColumnRef(filter.base, colGlobal) && queryOK(filter.arg)) {
+        const strategy: GinStrategy =
+          filter.hasKeyKind === "one"
+            ? "jsonHasKey"
+            : filter.hasKeyKind === "any"
+              ? "jsonHasAnyKey"
+              : "jsonHasAllKeys";
+        return { strategy, query: filter.arg };
+      }
+    }
+    return null;
   }
   if (filter.kind === "arrayFunc" && filter.args.length === 2) {
     const a = filter.args[0]!;
@@ -25220,8 +25370,21 @@ export function ginEntries(
 ): Uint8Array[] {
   const ci = cols[0]!;
   const colType = columns[ci]!.type;
+  if (typeIsJsonb(colType)) {
+    // jsonb_ops (gin.md §2.1/§4.1): the document's term set, already deduplicated and byte-sorted.
+    // A large document spills like any variable-width value, so it must be resolved first. A SQL
+    // NULL document yields no entry.
+    const doc = residentValue(row[ci]!);
+    if (doc.kind !== "jsonb") return [];
+    return ginJsonbIndexTerms(doc.node).map((term) => {
+      const out = new Uint8Array(term.length + storageKey.length);
+      out.set(term, 0);
+      out.set(storageKey, term.length);
+      return out;
+    });
+  }
   if (colType.kind !== "array")
-    throw new Error("a GIN index column is an array (CREATE INDEX gate)");
+    throw new Error("a GIN index column is an array or jsonb (CREATE INDEX gate)");
   const elemTy = typeScalar(colType.elem);
   // A large array spills like any variable-width value, so a stored row's array may be deferred; it
   // must be resolved — skipping it would silently drop (or fail to remove) its posting entries.

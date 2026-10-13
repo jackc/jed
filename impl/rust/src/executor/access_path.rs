@@ -212,7 +212,8 @@ impl Engine {
                 self.index_bound_entries(table_name, ib, params, &[], mask, &[])?
             }
             Some(ScanBound::Gin(gb)) => {
-                let query = filter.and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
+                let query =
+                    filter.and_then(|f| gin_match(f, gb.col_global, gb.opclass).map(|(_, q)| q));
                 self.gin_bound_rows(table_name, gb, query, &[], env, meter, mask, false)?
             }
             Some(ScanBound::Gist(gb)) => {
@@ -276,87 +277,26 @@ impl Engine {
             Some(q) => q.eval(query_row, env, &mut env.exec.session.scratch_meter())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
-        // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
-        // entries carry, so a term doubles as its posting-list prefix below. Encoding now (vs. later)
-        // lets us dedup distinct terms by bytes (the encoding is a bijection: byte-dedup ==
-        // value-dedup, byte-sort == value-sort) generically over every admitted element type.
-        let mut terms: Vec<Vec<u8>> = Vec::new();
-        let mut has_null = false;
-        let mut is_empty = false;
-        // A query element no stored element can equal (an `f64` constant not exactly representable
-        // as `f32` against an `f32[]` index — gin_query_term). It reaches no posting list, so `@>`
-        // and array `=` (which need EVERY query element present) are provably empty; `&&` skips it.
-        let mut unmatchable = false;
-        if gb.strategy == GinStrategy::Member {
-            // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL `c` can equal no
-            // element, so the bound is provably empty (gin.md §6). `c` is in the element type's
-            // domain by resolution (jed coerces `c` to the element type, rejecting an out-of-range
-            // integer constant 22003 before exec); the integer range check is a defensive guard
-            // against silently truncating an out-of-range value into a wrong term.
-            match &qv {
-                Value::Null => return Ok((Vec::new(), (0, 0))),
-                Value::Int(n) if *n < gb.elem_type.min() || *n > gb.elem_type.max() => {
-                    return Ok((Vec::new(), (0, 0))); // out-of-range guard
-                }
-                v => match gin_query_term(gb.elem_type, v) {
-                    Some(term) => terms.push(term),
-                    None => return Ok((Vec::new(), (0, 0))),
-                },
-            }
-        } else {
-            let arr = match &qv {
-                // A NULL whole-array query is 3VL-NULL for every row → never TRUE (both @> and &&).
-                Value::Null => return Ok((Vec::new(), (0, 0))),
-                Value::Array(a) => a,
-                _ => return Ok((Vec::new(), (0, 0))), // not an array (impossible post-resolve)
-            };
-            for el in &arr.elements {
-                match el {
-                    Value::Null => has_null = true, // a NULL element carries no term
-                    v => match gin_query_term(gb.elem_type, v) {
-                        Some(term) => terms.push(term),
-                        None => unmatchable = true,
-                    },
-                }
-            }
-            is_empty = arr.elements.is_empty();
-            if unmatchable && gb.strategy != GinStrategy::Overlaps {
-                return Ok((Vec::new(), (0, 0)));
-            }
-        }
-        terms.sort_unstable();
-        terms.dedup();
-
-        match gb.strategy {
-            // `@> '{}'`: every non-NULL array contains the empty array — not derivable from the
-            // index (which knows only rows that HAVE terms), so fall back to the full scan. The
-            // residual filter then keeps the right rows (gin.md §6).
-            GinStrategy::Contains if is_empty => {
+        let terms = match gb.opclass {
+            GinOpclass::Array(elem) => array_query_terms(gb.strategy, elem, &qv),
+            GinOpclass::Jsonb => jsonb_query_terms(gb.strategy, &qv),
+        };
+        let terms = match terms {
+            GinQuery::Empty => return Ok((Vec::new(), (0, 0))),
+            // Rows the index cannot enumerate (they carry no terms) may match: scan them all and let
+            // the residual filter keep the right ones (gin.md §6 / §2.1).
+            GinQuery::FullScan => {
                 let (entries, pages, slabs) = store.scan_with_units(mask)?;
                 return Ok((entries, (pages, slabs)));
             }
-            // `@>` a query containing a NULL element is never TRUE (strict element equality).
-            GinStrategy::Contains if has_null => return Ok((Vec::new(), (0, 0))),
-            // `col = Q` with NO non-NULL term — `'{}'` (`is_empty`) or an all-NULL `Q` (`has_null`,
-            // no non-NULL element). The rows it matches (`{}`, `{NULL}`, …) carry NO index terms,
-            // so the index cannot enumerate them: fall back to the full scan and let the residual
-            // `=` keep them (gin.md §6). NOT a provably-empty bound — and a `Q` with ≥1 non-NULL
-            // element is NOT caught here (it gathers, even when it also has a NULL element).
-            GinStrategy::Equal if terms.is_empty() => {
-                let (entries, pages, slabs) = store.scan_with_units(mask)?;
-                return Ok((entries, (pages, slabs)));
-            }
-            // `&&` with no non-NULL term (empty or all-NULL `Q`) overlaps nothing.
-            GinStrategy::Overlaps if terms.is_empty() => return Ok((Vec::new(), (0, 0))),
-            _ => {}
-        }
+            GinQuery::Terms(terms) => terms,
+        };
 
-        // Gather each term's posting list: the entry range [encode(term), successor) of the GIN
-        // tree (gin.md §4). The entry is `encode_element(term) ‖ storage_key`; the element's KEY
-        // encoding is fixed-width, so the storage key is the suffix after the term's own length
-        // (the query term and every stored term of one element type share that width;
-        // `width_bytes()` is 0 for interval, whose 16-byte span key is not its value encoding —
-        // encoding.md §2.10).
+        // Gather each term's posting list: the entry range [term, successor) of the GIN tree
+        // (gin.md §4). The entry is `term ‖ storage_key` and every term self-delimits — an
+        // `array_ops` element key is fixed-width per element type, a `jsonb_ops` term is a flag byte
+        // plus a fixed or terminated body (§4.1) — so the range holds exactly this term's entries
+        // and the storage key is the suffix after the term's own length.
         let istore = self.index_store(&gb.name_key);
         let mut pages = 0usize;
         let mut entries_visited = 0usize;
@@ -382,21 +322,21 @@ impl Engine {
         // Combine the posting sets by mode into the candidate storage keys, in ascending byte
         // (= storage-key) order, so the point lookups and the emitted rows follow storage order
         // exactly as a full scan would (gin.md §6/§8).
-        let candidates: BTreeSet<Vec<u8>> = match gb.strategy {
-            // `@>` ALL → intersection; `= ANY` (Member) is a single term, so its intersection is
-            // that lone posting list; array `=` (Equal) gathers the same superset as `@>` over `Q`'s
-            // distinct non-NULL terms (the residual `=` makes it exact downstream) — gin.md §6.
-            GinStrategy::Contains | GinStrategy::Member | GinStrategy::Equal => {
-                let mut it = postings.into_iter();
-                let mut acc: BTreeSet<Vec<u8>> =
-                    it.next().unwrap_or_default().into_iter().collect();
-                for list in it {
-                    let s: BTreeSet<Vec<u8>> = list.into_iter().collect();
-                    acc.retain(|k| s.contains(k));
-                }
-                acc
+        let candidates: BTreeSet<Vec<u8>> = if gb.strategy.is_any() {
+            // mode ANY (`&&`, `?|`) → union
+            postings.into_iter().flatten().collect()
+        } else {
+            // mode ALL → intersection. `= ANY` (Member) and `?` are a single term, so the
+            // intersection is that lone posting list; array `=` (Equal) gathers the same superset as
+            // `@>` over `Q`'s distinct non-NULL terms (the residual `=` makes it exact downstream) —
+            // gin.md §6; the `jsonb_ops` gathers are supersets the residual rechecks (§2.1).
+            let mut it = postings.into_iter();
+            let mut acc: BTreeSet<Vec<u8>> = it.next().unwrap_or_default().into_iter().collect();
+            for list in it {
+                let s: BTreeSet<Vec<u8>> = list.into_iter().collect();
+                acc.retain(|k| s.contains(k));
             }
-            GinStrategy::Overlaps => postings.into_iter().flatten().collect(),
+            acc
         };
 
         let mut slabs = 0usize;
@@ -551,6 +491,121 @@ pub(crate) fn index_store_bound_entries(
         ));
     }
     Ok((rows, (pages, slabs)))
+}
+
+/// The outcome of a GIN opclass's `extract_query_terms` (gin.md §2/§6): the distinct query terms to
+/// gather (sorted), a provably-empty bound, or the full-scan fallback for a query whose matches the
+/// index cannot enumerate.
+enum GinQuery {
+    Terms(Vec<Vec<u8>>),
+    Empty,
+    FullScan,
+}
+
+/// `array_ops` query terms (gin.md §2/§6). Each term is the element's order-preserving key encoding
+/// (§4) — the SAME bytes the entries carry, so a term doubles as its posting-list prefix. Encoding
+/// now (vs. later) lets us dedup distinct terms by bytes (the encoding is a bijection: byte-dedup ==
+/// value-dedup, byte-sort == value-sort) generically over every admitted element type.
+fn array_query_terms(strategy: GinStrategy, elem: ScalarType, qv: &Value) -> GinQuery {
+    let mut terms: Vec<Vec<u8>> = Vec::new();
+    let mut has_null = false;
+    let mut is_empty = false;
+    if strategy == GinStrategy::Member {
+        // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL `c` can equal no
+        // element, so the bound is provably empty (gin.md §6). `c` is in the element type's
+        // domain by resolution (jed coerces `c` to the element type, rejecting an out-of-range
+        // integer constant 22003 before exec); the integer range check is a defensive guard
+        // against silently truncating an out-of-range value into a wrong term.
+        match qv {
+            Value::Null => return GinQuery::Empty,
+            Value::Int(n) if *n < elem.min() || *n > elem.max() => return GinQuery::Empty,
+            v => match gin_query_term(elem, v) {
+                Some(term) => terms.push(term),
+                None => return GinQuery::Empty,
+            },
+        }
+    } else {
+        let arr = match qv {
+            // A NULL whole-array query is 3VL-NULL for every row → never TRUE (both @> and &&).
+            Value::Array(a) => a,
+            _ => return GinQuery::Empty, // NULL (or not an array — impossible post-resolve)
+        };
+        // A query element no stored element can equal (an `f64` constant not exactly representable
+        // as `f32` against an `f32[]` index — gin_query_term). It reaches no posting list, so `@>`
+        // and array `=` (which need EVERY query element present) are provably empty; `&&` skips it.
+        let mut unmatchable = false;
+        for el in &arr.elements {
+            match el {
+                Value::Null => has_null = true, // a NULL element carries no term
+                v => match gin_query_term(elem, v) {
+                    Some(term) => terms.push(term),
+                    None => unmatchable = true,
+                },
+            }
+        }
+        is_empty = arr.elements.is_empty();
+        if unmatchable && strategy != GinStrategy::Overlaps {
+            return GinQuery::Empty;
+        }
+    }
+    terms.sort_unstable();
+    terms.dedup();
+    match strategy {
+        // `@> '{}'`: every non-NULL array contains the empty array — not derivable from the
+        // index (which knows only rows that HAVE terms), so fall back to the full scan.
+        GinStrategy::Contains if is_empty => GinQuery::FullScan,
+        // `@>` a query containing a NULL element is never TRUE (strict element equality).
+        GinStrategy::Contains if has_null => GinQuery::Empty,
+        // `col = Q` with NO non-NULL term — `'{}'` or an all-NULL `Q`. The rows it matches (`{}`,
+        // `{NULL}`, …) carry NO index terms, so the index cannot enumerate them: fall back to the
+        // full scan (gin.md §6). NOT a provably-empty bound — and a `Q` with ≥1 non-NULL element is
+        // NOT caught here (it gathers, even when it also has a NULL element).
+        GinStrategy::Equal if terms.is_empty() => GinQuery::FullScan,
+        // `&&` with no non-NULL term (empty or all-NULL `Q`) overlaps nothing.
+        GinStrategy::Overlaps if terms.is_empty() => GinQuery::Empty,
+        _ => GinQuery::Terms(terms),
+    }
+}
+
+/// `jsonb_ops` query terms (gin.md §2.1). `@>` gathers the query document's own index terms (ALL);
+/// `?` the one key term; `?|` / `?&` the key terms of the array's non-NULL elements (ANY / ALL). A
+/// NULL operand is provably empty; a term-less `@>` query and a key-less `?&` fall back to the full
+/// scan (`{}` is contained by every object, `?& '{}'` holds for every document); a key-less `?|`
+/// matches nothing.
+fn jsonb_query_terms(strategy: GinStrategy, qv: &Value) -> GinQuery {
+    let terms = match (strategy, qv) {
+        (_, Value::Null) => return GinQuery::Empty,
+        (GinStrategy::JsonContains, Value::Jsonb(doc)) => {
+            let terms = crate::json::gin_jsonb_index_terms(doc);
+            if terms.is_empty() {
+                return GinQuery::FullScan;
+            }
+            terms
+        }
+        (GinStrategy::JsonHasKey, Value::Text(k)) => vec![crate::json::gin_jsonb_key_term(k)],
+        (GinStrategy::JsonHasAnyKey | GinStrategy::JsonHasAllKeys, Value::Array(arr)) => {
+            let mut terms: Vec<Vec<u8>> = arr
+                .elements
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Text(k) => Some(crate::json::gin_jsonb_key_term(k)),
+                    _ => None, // a NULL key is skipped (json-sql-functions.md §1.2)
+                })
+                .collect();
+            terms.sort_unstable();
+            terms.dedup();
+            if terms.is_empty() {
+                return if strategy == GinStrategy::JsonHasAllKeys {
+                    GinQuery::FullScan
+                } else {
+                    GinQuery::Empty
+                };
+            }
+            terms
+        }
+        _ => unreachable!("a jsonb_ops strategy's operand type is fixed by resolution"),
+    };
+    GinQuery::Terms(terms)
 }
 
 /// The GIN term for one non-NULL query value against an index whose elements are `elem` — the

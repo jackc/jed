@@ -60,18 +60,69 @@ pub(crate) enum GinStrategy {
     /// Unlike `Contains`, a NULL ELEMENT of `Q` does not empty the bound; and a `Q` with no non-NULL
     /// element (`'{}'`/all-NULL) falls back to the full scan, not a provably-empty bound (gin.md §6).
     Equal,
+    /// `jsonb_ops` `col @> Q` (or `Q <@ col`): `Q`'s index terms, mode ALL; a term-less `Q` falls
+    /// back to the full scan (gin.md §2.1).
+    JsonContains,
+    /// `jsonb_ops` `col ? k`: the single key term of `k`.
+    JsonHasKey,
+    /// `jsonb_ops` `col ?| K`: the key terms of `K`'s non-NULL elements, mode ANY.
+    JsonHasAnyKey,
+    /// `jsonb_ops` `col ?& K`: the key terms of `K`'s non-NULL elements, mode ALL; none falls back
+    /// to the full scan.
+    JsonHasAllKeys,
 }
 
-/// The plan-time result for one eligible GIN index (spec/design/gin.md §6): its array **element**
-/// type (for `encode_element` — the term bytes), operator strategy, and column's global scope index.
+impl GinStrategy {
+    /// Whether the posting lists combine by union (mode ANY) rather than intersection (mode ALL).
+    pub(crate) fn is_any(self) -> bool {
+        matches!(self, GinStrategy::Overlaps | GinStrategy::JsonHasAnyKey)
+    }
+
+    /// The estimator's access-method class for this strategy (spec/cost/estimator.toml).
+    pub(crate) fn access_method(self) -> &'static str {
+        use crate::estimator_constants::*;
+        match self {
+            GinStrategy::Contains => ACCESS_GIN_CONTAINS,
+            GinStrategy::Overlaps => ACCESS_GIN_OVERLAPS,
+            GinStrategy::Member => ACCESS_GIN_MEMBER,
+            GinStrategy::Equal => ACCESS_GIN_EQUAL,
+            GinStrategy::JsonContains => ACCESS_GIN_JSONB_CONTAINS,
+            GinStrategy::JsonHasKey => ACCESS_GIN_JSONB_EXISTS,
+            GinStrategy::JsonHasAnyKey => ACCESS_GIN_JSONB_EXISTS_ANY,
+            GinStrategy::JsonHasAllKeys => ACCESS_GIN_JSONB_EXISTS_ALL,
+        }
+    }
+}
+
+/// A GIN index's operator class, implied by its column's type (gin.md §2): `array_ops` over an array
+/// of a fixed-width key-encodable element (carrying the element type, whose key encoding is each
+/// term), or `jsonb_ops` over a `jsonb` column (§2.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GinOpclass {
+    Array(ScalarType),
+    Jsonb,
+}
+
+impl GinOpclass {
+    /// The operator class for a GIN-indexed column of type `ty`, or `None` when it has none.
+    pub(crate) fn for_type(ty: &Type) -> Option<GinOpclass> {
+        if ty.is_jsonb() {
+            return Some(GinOpclass::Jsonb);
+        }
+        ty.array_element().map(|e| GinOpclass::Array(e.scalar()))
+    }
+}
+
+/// The plan-time result for one eligible GIN index (spec/design/gin.md §6): its operator class (for
+/// the term bytes), operator strategy, and column's global scope index.
 /// The inventory owns one plan per eligible index; the selector chooses among them. The constant
 /// query `Q` is NOT stored (`RExpr` is not `Clone`); it is re-found in `plan.filter` at exec time by
 /// `gin_match` and evaluated there.
 pub(crate) struct GinBound {
     /// The index store's key — the exact index name.
     pub(crate) name_key: String,
-    /// The array element type, whose key encoding produces each term's bytes.
-    pub(crate) elem_type: ScalarType,
+    /// The operator class, which produces each term's bytes.
+    pub(crate) opclass: GinOpclass,
     pub(crate) strategy: GinStrategy,
     /// The GIN-indexed column's global scope index (`rel.offset + ci`).
     pub(crate) col_global: usize,
@@ -1012,12 +1063,7 @@ fn estimator_candidate_selectivity(
                 selectivity_class(ACCESS_GIST_RANGE)
             }
         }
-        Some(ScanBound::Gin(bound)) => selectivity_class(match bound.strategy {
-            GinStrategy::Contains => ACCESS_GIN_CONTAINS,
-            GinStrategy::Overlaps => ACCESS_GIN_OVERLAPS,
-            GinStrategy::Member => ACCESS_GIN_MEMBER,
-            GinStrategy::Equal => ACCESS_GIN_EQUAL,
-        }),
+        Some(ScanBound::Gin(bound)) => selectivity_class(bound.strategy.access_method()),
         Some(ScanBound::PkSet(bound)) => {
             estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
         }
@@ -1600,12 +1646,7 @@ pub(crate) fn estimate_selected_scan(
                 },
             ),
             Some(ScanBound::Gin(bound)) => {
-                crate::estimator::selectivity_class(match bound.strategy {
-                    GinStrategy::Contains => crate::estimator_constants::ACCESS_GIN_CONTAINS,
-                    GinStrategy::Overlaps => crate::estimator_constants::ACCESS_GIN_OVERLAPS,
-                    GinStrategy::Member => crate::estimator_constants::ACCESS_GIN_MEMBER,
-                    GinStrategy::Equal => crate::estimator_constants::ACCESS_GIN_EQUAL,
-                })
+                crate::estimator::selectivity_class(bound.strategy.access_method())
             }
             Some(ScanBound::PkSet(bound)) => {
                 estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
@@ -2132,18 +2173,20 @@ pub(crate) fn inventory_inl_candidates<'a>(
         }
         let ci = idx.first_column();
         let col_global = rel.offset + ci;
-        let Some(elem_type) = rel.table.columns[ci].ty.array_element().map(|t| t.scalar()) else {
+        let Some(opclass) = GinOpclass::for_type(&rel.table.columns[ci].ty) else {
             continue;
         };
         for filter in &filters {
-            if let Some((strategy, _)) = gin_sibling_match(filter, col_global, sibling_columns) {
+            if let Some((strategy, _)) =
+                gin_sibling_match(filter, col_global, opclass, sibling_columns)
+            {
                 let name_key = idx.name.to_string();
                 candidates.push(storage_order_candidate(
                     ScanCandidateKind::Gin,
                     name_key.clone(),
                     Some(ScanBound::Gin(GinBound {
                         name_key,
-                        elem_type,
+                        opclass,
                         strategy,
                         col_global,
                     })),
@@ -2396,8 +2439,9 @@ pub(crate) fn order_satisfied_by_index(
         .next()
 }
 
-/// Inventory one GIN index when its array column has an accelerable conjunct (`col @> const`,
-/// `col && const`, `const = ANY(col)`, or `col = const`). Legacy selection later picks a winner.
+/// Inventory one GIN index when its column has an accelerable conjunct — `col @> const`,
+/// `col && const`, `const = ANY(col)`, or `col = const` on an array; `col @> const`, `col ? const`,
+/// `col ?| const`, or `col ?& const` on a jsonb column. Legacy selection later picks a winner.
 pub(crate) fn build_gin_bound_for_index(
     filter: &RExpr,
     idx: &IndexDef,
@@ -2409,11 +2453,11 @@ pub(crate) fn build_gin_bound_for_index(
     }
     let ci = idx.first_column();
     let col_global = offset + ci;
-    let elem_ty = columns[ci].ty.array_element()?.scalar();
-    if let Some((strategy, _)) = gin_match(filter, col_global) {
+    let opclass = GinOpclass::for_type(&columns[ci].ty)?;
+    if let Some((strategy, _)) = gin_match(filter, col_global, opclass) {
         return Some(GinBound {
             name_key: idx.name.to_string(),
-            elem_type: elem_ty,
+            opclass,
             strategy,
             col_global,
         });
@@ -2587,28 +2631,65 @@ pub(crate) fn gist_query_operand<'a>(filter: &'a RExpr, gb: &GistBound) -> Optio
 }
 
 /// Find the first WHERE AND-chain conjunct that a GIN index on `col_global` accelerates
-/// (spec/design/gin.md §6): `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)`
-/// (membership), or `col = Q` (exact array equality) where the query operand is a **constant**
+/// (spec/design/gin.md §6): for `array_ops`, `col @> Q` (contains), `col && Q` (overlaps),
+/// `c = ANY(col)` (membership), or `col = Q` (exact array equality); for `jsonb_ops` (§2.1),
+/// `col @> Q` / `Q <@ col`, `col ? k`, `col ?| K`, or `col ?& K` — where the query operand is a **constant**
 /// (references no column / outer / subquery — re-evaluable per scan, not per row). `@>` is
 /// asymmetric (the indexed column must be the LEFT operand — `Q @> col` is the non-accelerated
 /// `<@`); `&&` and array `=` are symmetric (the column may be either operand). Returns the
 /// strategy and a reference to the constant query operand. Used both at plan time (for the
 /// strategy) and exec time (to recover the operand from `plan.filter`), so the two agree on the
 /// same conjunct by construction.
-pub(crate) fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrategy, &RExpr)> {
-    gin_match_operand(filter, col_global, rexpr_is_constant)
+pub(crate) fn gin_match(
+    filter: &RExpr,
+    col_global: usize,
+    opclass: GinOpclass,
+) -> Option<(GinStrategy, &RExpr)> {
+    match opclass {
+        GinOpclass::Array(_) => gin_match_operand(filter, col_global, rexpr_is_constant),
+        GinOpclass::Jsonb => gin_jsonb_match_operand(filter, col_global, rexpr_is_constant),
+    }
 }
 
 pub(crate) fn gin_sibling_match<'a>(
     filter: &'a RExpr,
     col_global: usize,
+    opclass: GinOpclass,
     sibling_columns: &[(usize, usize)],
 ) -> Option<(GinStrategy, &'a RExpr)> {
-    gin_match_operand(
-        filter,
-        col_global,
-        |q| matches!(q, RExpr::Column(i) if sibling_columns.iter().any(|(start, end)| *i >= *start && *i < *end)),
-    )
+    let sibling = |q: &RExpr| matches!(q, RExpr::Column(i) if sibling_columns.iter().any(|(start, end)| *i >= *start && *i < *end));
+    match opclass {
+        GinOpclass::Array(_) => gin_match_operand(filter, col_global, sibling),
+        GinOpclass::Jsonb => gin_jsonb_match_operand(filter, col_global, sibling),
+    }
+}
+
+/// The `jsonb_ops` conjunct shapes (gin.md §2.1): the containment node with the indexed column as
+/// the CONTAINING operand (`col @> Q`, and `Q <@ col`, which resolves to the same node), and the
+/// key-existence operators with the column as the base. The recovered operand is `Q` / `k` / `K`.
+fn gin_jsonb_match_operand<'a, F>(
+    filter: &'a RExpr,
+    col_global: usize,
+    query_ok: F,
+) -> Option<(GinStrategy, &'a RExpr)>
+where
+    F: Fn(&RExpr) -> bool + Copy,
+{
+    match filter {
+        RExpr::And(l, r) => gin_jsonb_match_operand(l, col_global, query_ok)
+            .or_else(|| gin_jsonb_match_operand(r, col_global, query_ok)),
+        RExpr::JsonContains { a, b } => (is_column(a, col_global) && query_ok(b))
+            .then_some((GinStrategy::JsonContains, b.as_ref())),
+        RExpr::JsonHasKey { kind, base, arg } if is_column(base, col_global) && query_ok(arg) => {
+            let strategy = match kind {
+                HasKeyKind::One => GinStrategy::JsonHasKey,
+                HasKeyKind::Any => GinStrategy::JsonHasAnyKey,
+                HasKeyKind::All => GinStrategy::JsonHasAllKeys,
+            };
+            Some((strategy, arg.as_ref()))
+        }
+        _ => None,
+    }
 }
 
 fn gin_match_operand<'a, F>(
@@ -3202,14 +3283,22 @@ pub(crate) fn gin_entries(
     row: &Row,
 ) -> Result<Vec<Vec<u8>>> {
     let ci = cols[0];
-    let elem_ty = columns[ci]
-        .ty
-        .array_element()
-        .expect("a GIN index column is an array (CREATE INDEX gate)")
-        .scalar();
+    // A large value spills like any variable-width value, so a stored row's array/document may be
+    // deferred; it must be resolved — skipping it would silently drop (or fail to remove) its
+    // posting entries.
+    let opclass = GinOpclass::for_type(&columns[ci].ty)
+        .expect("a GIN index column has an operator class (CREATE INDEX / ALTER gate)");
+    let elem_ty = match opclass {
+        GinOpclass::Array(elem) => elem,
+        GinOpclass::Jsonb => {
+            let terms = match &*resident(&row[ci])? {
+                Value::Jsonb(doc) => crate::json::gin_jsonb_index_terms(doc),
+                _ => Vec::new(), // a SQL NULL document has no terms
+            };
+            return Ok(gin_entry_keys(terms, storage_key));
+        }
+    };
     let mut terms: Vec<Vec<u8>> = Vec::new();
-    // A large array spills like any variable-width value, so a stored row's array may be deferred;
-    // it must be resolved — skipping it would silently drop (or fail to remove) its posting entries.
     if let Value::Array(arr) = &*resident(&row[ci])? {
         for el in &arr.elements {
             // a NULL element contributes no term; a non-keyable element is impossible under the gate
@@ -3228,13 +3317,18 @@ pub(crate) fn gin_entries(
     // byte-sort == value-sort (order-preserving). Each distinct term yields one entry.
     terms.sort_unstable();
     terms.dedup();
-    Ok(terms
+    Ok(gin_entry_keys(terms, storage_key))
+}
+
+/// `term ‖ storage_key` for each (sorted, distinct) term — a GIN index's entry keys for one row.
+fn gin_entry_keys(terms: Vec<Vec<u8>>, storage_key: &[u8]) -> Vec<Vec<u8>> {
+    terms
         .into_iter()
         .map(|mut entry| {
             entry.extend_from_slice(storage_key);
             entry
         })
-        .collect())
+        .collect()
 }
 
 /// A row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the concatenation of the

@@ -1205,7 +1205,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		if sb.gin != nil {
 			var query *rExpr
 			if plan.filter != nil {
-				if _, q, ok := ginMatch(plan.filter, sb.gin.colGlobal); ok {
+				if _, q, ok := ginMatch(plan.filter, sb.gin.colGlobal, sb.gin.jsonb); ok {
 					query = q
 				}
 			}
@@ -2269,13 +2269,13 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 		var query *rExpr
 		if inl {
 			for _, filter := range inlFilters {
-				if _, q, ok := ginSiblingMatch(filter, sb.gin.colGlobal, siblingColumns); ok {
+				if _, q, ok := ginSiblingMatch(filter, sb.gin.colGlobal, sb.gin.jsonb, siblingColumns); ok {
 					query = q
 					break
 				}
 			}
 		} else if access := plan.accessPredicate(); access != nil {
-			if _, q, ok := ginMatch(access, sb.gin.colGlobal); ok {
+			if _, q, ok := ginMatch(access, sb.gin.colGlobal, sb.gin.jsonb); ok {
 				query = q
 			}
 		}

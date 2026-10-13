@@ -322,6 +322,14 @@ const (
 	// exact. Unlike ginContains, a NULL ELEMENT of Q does not empty the bound; and a Q with no
 	// non-NULL element ('{}'/all-NULL) falls back to the full scan, not a provably-empty bound.
 	ginEqual
+	// The jsonb_ops strategies (gin.md §2.1), matched only on a jsonb GIN column: `col @> Q` (Q <@ col
+	// resolves to the same node — the column is the CONTAINING operand; Q's index terms, mode ALL),
+	// `col ? k` (one key term), `col ?| K` (the non-NULL keys' terms, mode ANY), `col ?& K` (the
+	// non-NULL keys' terms, mode ALL). The recovered query operand is Q / k / K.
+	ginJsonbContains
+	ginJsonbExists
+	ginJsonbExistsAny
+	ginJsonbExistsAll
 )
 
 // ginBoundPlan is the plan-time result for one eligible GIN index (spec/design/gin.md §6): its array
@@ -334,6 +342,9 @@ type ginBoundPlan struct {
 	elemType  scalarType
 	strategy  ginStrategy
 	colGlobal int
+	// jsonb is true for a jsonb column (the jsonb_ops opclass, gin.md §2.1; elemType unused), false
+	// for an array column (array_ops). It selects which strategies ginMatch admits.
+	jsonb bool
 }
 
 // indexEqCol is one column of an index access predicate's equality prefix (indexes.md §5.1):
@@ -947,14 +958,13 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		ci := idx.firstColumn()
 		colGlobal := rel.offset + ci
 		at := rel.table.Columns[ci].Type
-		if at.Array == nil {
+		jsonb := at.IsJsonb()
+		if at.Array == nil && !jsonb {
 			continue
 		}
 		for _, filter := range filters {
-			if s, _, ok := ginSiblingMatch(filter, colGlobal, siblingColumns); ok {
-				bound := &scanBound{gin: &ginBoundPlan{
-					nameKey: idx.Name, elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
-				}}
+			if s, _, ok := ginSiblingMatch(filter, colGlobal, jsonb, siblingColumns); ok {
+				bound := &scanBound{gin: newGinBoundPlan(idx.Name, at, s, colGlobal)}
 				candidates = append(candidates, storageOrderCandidate(scanCandidateGin, bound.gin.nameKey, bound, whereFilter))
 				break
 			}
@@ -1006,15 +1016,24 @@ func buildGinBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, off
 	ci := idx.firstColumn()
 	colGlobal := offset + ci
 	at := columns[ci].Type
-	if at.Array == nil {
-		return nil // a GIN column is always an array (the CREATE INDEX gate); defensive
+	jsonb := at.IsJsonb()
+	if at.Array == nil && !jsonb {
+		return nil // a GIN column is always an array or jsonb (the CREATE INDEX gate); defensive
 	}
-	if s, _, ok := ginMatch(filter, colGlobal); ok {
-		return &ginBoundPlan{
-			nameKey: idx.Name, elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
-		}
+	if s, _, ok := ginMatch(filter, colGlobal, jsonb); ok {
+		return newGinBoundPlan(idx.Name, at, s, colGlobal)
 	}
 	return nil
+}
+
+// newGinBoundPlan builds the plan for one GIN index over a column of type colTy (an array — array_ops
+// — or jsonb — jsonb_ops).
+func newGinBoundPlan(name string, colTy dataType, s ginStrategy, colGlobal int) *ginBoundPlan {
+	gb := &ginBoundPlan{nameKey: name, strategy: s, colGlobal: colGlobal, jsonb: colTy.IsJsonb()}
+	if colTy.Array != nil {
+		gb.elemType = colTy.Array.ScalarTy()
+	}
+	return gb
 }
 
 // ginMatch finds the first WHERE AND-chain conjunct a GIN index on colGlobal accelerates
@@ -1025,27 +1044,49 @@ func buildGinBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, off
 // column be ANY's array operand and c the scalar. Returns the strategy and the constant query
 // operand (the scalar c for ginMember, the array Q otherwise). Used at plan time (strategy) and exec
 // time (recover the operand from plan.filter), so the two agree on the same conjunct by construction.
-func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
-	return ginMatchOperand(filter, colGlobal, rexprIsConstant)
+//
+// jsonb selects the opclass: on a jsonb column only the jsonb_ops shapes match (gin.md §2.1 —
+// `col @> Q` / `Q <@ col`, `col ? k`, `col ?| K`, `col ?& K`), on an array column only the array_ops
+// shapes (so `jsonbcol = Q` never becomes an array-equality bound).
+func ginMatch(filter *rExpr, colGlobal int, jsonb bool) (ginStrategy, *rExpr, bool) {
+	return ginMatchOperand(filter, colGlobal, jsonb, rexprIsConstant)
 }
 
 // ginSiblingMatch is the join counterpart of ginMatch: Q must be a bare column from an earlier
 // sibling relation. Expressions, the indexed inner column, and later-sibling columns are rejected.
-func ginSiblingMatch(filter *rExpr, colGlobal int, siblingColumns columnRanges) (ginStrategy, *rExpr, bool) {
-	return ginMatchOperand(filter, colGlobal, func(e *rExpr) bool {
+func ginSiblingMatch(filter *rExpr, colGlobal int, jsonb bool, siblingColumns columnRanges) (ginStrategy, *rExpr, bool) {
+	return ginMatchOperand(filter, colGlobal, jsonb, func(e *rExpr) bool {
 		return e != nil && e.kind == reColumn && siblingColumns.contains(e.index)
 	})
 }
 
-func ginMatchOperand(filter *rExpr, colGlobal int, queryOK func(*rExpr) bool) (ginStrategy, *rExpr, bool) {
+func ginMatchOperand(filter *rExpr, colGlobal int, jsonb bool, queryOK func(*rExpr) bool) (ginStrategy, *rExpr, bool) {
 	if filter == nil {
 		return 0, nil, false
 	}
 	if filter.kind == reAnd {
-		if s, q, ok := ginMatchOperand(filter.lhs, colGlobal, queryOK); ok {
+		if s, q, ok := ginMatchOperand(filter.lhs, colGlobal, jsonb, queryOK); ok {
 			return s, q, true
 		}
-		return ginMatchOperand(filter.rhs, colGlobal, queryOK)
+		return ginMatchOperand(filter.rhs, colGlobal, jsonb, queryOK)
+	}
+	if jsonb {
+		// jsonb_ops (gin.md §2.1): the indexed column is the containing operand of @> (`Q <@ col`
+		// resolves to the same reJsonContains node) and the base of ? / ?| / ?&.
+		switch {
+		case filter.kind == reJsonContains && isColumn(filter.lhs, colGlobal) && queryOK(filter.rhs):
+			return ginJsonbContains, filter.rhs, true
+		case filter.kind == reJsonHasKey && isColumn(filter.lhs, colGlobal) && queryOK(filter.rhs):
+			switch filter.hasKey {
+			case hkOne:
+				return ginJsonbExists, filter.rhs, true
+			case hkAny:
+				return ginJsonbExistsAny, filter.rhs, true
+			default:
+				return ginJsonbExistsAll, filter.rhs, true
+			}
+		}
+		return 0, nil, false
 	}
 	if filter.kind == reArrayFunc && len(filter.sargs) == 2 {
 		a, b := filter.sargs[0], filter.sargs[1]
@@ -1644,7 +1685,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 	}
 	if b.gin != nil {
 		var query *rExpr
-		if _, q, ok := ginMatch(plan.filter, b.gin.colGlobal); ok {
+		if _, q, ok := ginMatch(plan.filter, b.gin.colGlobal, b.gin.jsonb); ok {
 			query = q
 		}
 		entries, pages, slabs, err := db.ginBoundRows(tableName, b.gin, query, nil, env, meter, mask, false)
@@ -1711,6 +1752,9 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 	qv, err := query.eval(queryRow, env, env.exec.session.scratchMeter())
 	if err != nil {
 		return nil, 0, 0, err
+	}
+	if gb.jsonb {
+		return db.ginJsonbBoundRows(store, gb, qv, meter, mask, keysOnly)
 	}
 	// Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
 	// entries carry, so a term doubles as its posting-list prefix below. Encoding now lets us dedup
@@ -1800,11 +1844,18 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		}
 	}
 
-	// Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
-	// (gin.md §4). The entry is encode(term) ‖ storage_key; the element's KEY encoding is
-	// fixed-width, so the storage key is the suffix after the term's own length (the query term and
-	// every stored term of one element type share that width; WidthBytes is 0 for interval, whose
-	// 16-byte span key is not its value encoding — encoding.md §2.10).
+	return db.ginGather(store, gb, terms, gb.strategy == ginOverlaps, meter, mask, keysOnly)
+}
+
+// ginGather is the shared inverted gather (gin.md §6 steps 2–4) over a non-empty, deduplicated,
+// byte-sorted query term set: each term's posting list is the entry range [term, successor(term)) of
+// the GIN tree — a term self-delimits (fixed-width array_ops keys; jsonb_ops terms end in a
+// terminator or are a fixed 1–2 bytes, gin.md §4.1), so the storage key is the entry's suffix after
+// the term's own length. The posting sets combine by mode (any → union, else intersection) into the
+// candidate storage keys, ascending byte (= storage-key) order, each point-looked-up so lookups and
+// emitted rows follow storage order exactly as a full scan (gin.md §6/§8). gin_entry (per posting
+// entry visited) is charged on meter; the (pages, slabs) block is returned for the caller.
+func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, terms [][]byte, any bool, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	istore := db.lkpIndexStore(gb.nameKey)
 	entriesVisited := 0
 	postings := make([][][]byte, 0, len(terms))
@@ -1824,13 +1875,8 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 	}
 	meter.Charge(costs.GinEntry * int64(entriesVisited))
 
-	// Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
-	// lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8).
-	// @> ALL → intersection; = ANY (ginMember) is a single term, so its intersection is that lone
-	// posting list; array = (ginEqual) gathers the same superset as @> over Q's distinct non-NULL
-	// terms (the residual = makes it exact downstream). && ANY → union.
 	var cand [][]byte
-	if gb.strategy == ginOverlaps {
+	if any {
 		cand = unionPostings(postings)
 	} else {
 		cand = intersectPostings(postings)
@@ -1853,6 +1899,57 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		out = append(out, entry{Key: key, Row: row})
 	}
 	return out, pages, slabs, nil
+}
+
+// ginJsonbBoundRows is the jsonb_ops gather (gin.md §2.1): the query terms + mode of the evaluated
+// query operand qv, with the degenerate shapes — `@>`: a NULL Q is provably empty, a term-less Q
+// (`{}`, `[]`, …) falls back to the full scan, else its index terms ALL; `?`: a NULL k is empty, else
+// its one key term; `?|`: a NULL K or no non-NULL key is empty, else the keys' terms ANY; `?&`: a NULL
+// K is empty, no non-NULL key falls back to the full scan, else the keys' terms ALL. The gather is
+// lossy; the residual operator rechecks every candidate.
+func (db *engine) ginJsonbBoundRows(store *tableStore, gb *ginBoundPlan, qv Value, meter *costMeter, mask []bool, keysOnly bool) ([]entry, int, int, error) {
+	qv, err := residentValue(qv)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if qv.Kind == ValNull {
+		return nil, 0, 0, nil // every strategy is strict: a NULL query operand matches nothing
+	}
+	var terms [][]byte
+	switch gb.strategy {
+	case ginJsonbContains:
+		if qv.Kind != ValJsonb {
+			return nil, 0, 0, nil
+		}
+		terms = ginJsonbIndexTerms(qv.jsonb())
+		if len(terms) == 0 {
+			return store.ScanWithUnits(mask) // a term-less Q is contained by rows the index cannot enumerate
+		}
+	case ginJsonbExists:
+		if qv.Kind != ValText {
+			return nil, 0, 0, nil
+		}
+		terms = [][]byte{ginJsonbKeyTerm(qv.str())}
+	default: // ginJsonbExistsAny / ginJsonbExistsAll — a text[] of keys
+		if qv.Kind != ValArray {
+			return nil, 0, 0, nil
+		}
+		for _, el := range qv.arrayVal().Elements {
+			if el.Kind == ValNull {
+				continue // a NULL key is skipped (json-sql-functions.md §1.2)
+			}
+			terms = append(terms, ginJsonbKeyTerm(el.str()))
+		}
+		if len(terms) == 0 {
+			if gb.strategy == ginJsonbExistsAny {
+				return nil, 0, 0, nil // ?| with no non-NULL key matches nothing
+			}
+			return store.ScanWithUnits(mask) // ?& with no non-NULL key is TRUE for every non-NULL document
+		}
+		slices.SortFunc(terms, bytes.Compare)
+		terms = slices.CompactFunc(terms, bytes.Equal)
+	}
+	return db.ginGather(store, gb, terms, gb.strategy == ginJsonbExistsAny, meter, mask, keysOnly)
 }
 
 // ginQueryTerm is the GIN term for one non-NULL query value against an index whose elements are

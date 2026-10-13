@@ -1,0 +1,74 @@
+# ALTER COLUMN ... TYPE re-applies each surviving index's CREATE INDEX column gate under the new type
+# (spec/design/alter.md §3.3): a GIN index needs a GIN operator class (gin.md §3), a GiST index a GiST
+# operator class (gist.md §6), an ordered index a key-encodable type. PostgreSQL rebuilds the index
+# under the new type and fails the same way (42704 "has no default operator class"). A rejected ALTER
+# changes nothing: the index still serves its queries afterwards.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, ddl.alter_table, query.gin_jsonb_ops, dml.insert, query.select, query.order_by, expr.arithmetic, types.i32, types.text, types.json, types.jsonb, types.i64, types.array, types.range, func.jsonb_contains, func.array_containment, cast.operator
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32[], d jsonb, r int4range, n i32)
+
+statement ok
+CREATE INDEX t_a_gin ON t USING gin (a)
+
+statement ok
+CREATE INDEX t_d_gin ON t USING gin (d)
+
+statement ok
+CREATE INDEX t_r_gist ON t USING gist (r)
+
+statement ok
+INSERT INTO t VALUES (1, '{1,2}', '{"k": 1}', '[1,5)', 1), (2, '{3}', '["k"]', '[7,9)', 2)
+
+statement error 42704
+ALTER TABLE t ALTER COLUMN a TYPE text
+
+statement error 42704
+ALTER TABLE t ALTER COLUMN d TYPE text
+
+statement error 42704
+ALTER TABLE t ALTER COLUMN d TYPE json
+
+statement error 42704
+ALTER TABLE t ALTER COLUMN r TYPE json USING NULL
+
+# The gate runs after every action's own validation and before any row is rewritten: a later
+# action's unknown column (42703) is reported first, and a row-level USING error never is.
+statement error 42703
+ALTER TABLE t ALTER COLUMN a TYPE text, ALTER COLUMN nosuch TYPE i32
+
+statement error 42704
+ALTER TABLE t ALTER COLUMN n TYPE i32 USING n / (n - n), ALTER COLUMN a TYPE text
+
+statement error 42704
+ALTER TABLE t ALTER COLUMN a TYPE text, ALTER COLUMN n TYPE i32 USING n / (n - n)
+
+# a retype that keeps an operator class rebuilds the index under the new type
+statement ok
+ALTER TABLE t ALTER COLUMN a TYPE i64[]
+
+query I nosort
+SELECT id FROM t WHERE a @> '{3}'::i64[] ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE d ? 'k' ORDER BY id
+----
+1
+2
+
+# --- jed narrowings, kept LAST (PG accepts both: a text[] GIN and a json-free btree retype) ----
+
+# a deferred GIN element type is 0A000, as at CREATE INDEX
+statement error 0A000
+ALTER TABLE t ALTER COLUMN a TYPE text[]
+
+statement ok
+CREATE INDEX t_n ON t (n)
+
+# PG has no btree opclass for json (42704); jed's ordered-index gate reports a non-key-encodable
+# type as 0A000, as at CREATE INDEX
+statement error 0A000
+ALTER TABLE t ALTER COLUMN n TYPE json USING NULL

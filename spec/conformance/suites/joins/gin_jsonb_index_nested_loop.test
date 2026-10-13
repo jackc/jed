@@ -1,0 +1,127 @@
+# jsonb_ops sibling-bound index-nested-loop (gin.md §2.1/§6.1). The inner jsonb GIN query — the
+# `@>` document, the `?` key, or the `?|`/`?&` key array — may be a bare column of an earlier
+# sibling, evaluated once per outer row; each outer row takes the same provably-empty or
+# full-scan-fallback path a constant would (a NULL query matches nothing, `{}` and `?& '{}'` scan
+# the inner), and the complete ON/WHERE stays residual. Rows match PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.qualified_column, query.table_alias, query.order_by, query.index_nested_loop, query.gin_scan, query.gin_index_nested_loop, query.gin_jsonb_ops, types.i32, types.text, types.array, types.jsonb, func.jsonb_contains, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE probe (id i32 PRIMARY KEY, q jsonb, k text, ks text[])
+
+statement ok
+CREATE TABLE doc (id i32 PRIMARY KEY, body jsonb)
+
+statement ok
+CREATE INDEX doc_body_gin ON doc USING gin (body)
+
+statement ok
+INSERT INTO probe VALUES
+  (1, '{"a": 1}', 'a', '{a,b}'),
+  (2, '{}', 'red', '{}'),
+  (3, NULL, NULL, NULL),
+  (4, '["red"]', 'zz', '{zz,NULL}'),
+  (5, '{"tags": ["red"]}', 'tags', '{NULL}')
+
+statement ok
+INSERT INTO doc VALUES
+  (10, '{"a": 1, "b": 2, "tags": ["red"]}'),
+  (11, '{"a": 2}'),
+  (12, '["red", "a"]'),
+  (13, '"red"'),
+  (14, '{}'),
+  (15, NULL)
+
+# cost: 56
+query II nosort
+SELECT p.id, d.id FROM probe p JOIN doc d ON d.body @> p.q ORDER BY p.id, d.id
+----
+1
+10
+2
+10
+2
+11
+2
+14
+4
+12
+5
+10
+
+# cost: 57
+query II nosort
+SELECT p.id, d.id FROM probe p LEFT JOIN doc d ON d.body @> p.q ORDER BY p.id, d.id
+----
+1
+10
+2
+10
+2
+11
+2
+14
+3
+NULL
+4
+12
+5
+10
+
+# cost: 44
+query II nosort
+SELECT p.id, d.id FROM probe p JOIN doc d ON d.body ? p.k ORDER BY p.id, d.id
+----
+1
+10
+1
+11
+1
+12
+2
+12
+2
+13
+5
+10
+
+# cost: 25
+query II nosort
+SELECT p.id, d.id FROM probe p JOIN doc d ON d.body ?| p.ks ORDER BY p.id, d.id
+----
+1
+10
+1
+11
+1
+12
+
+# cost: 55
+query II nosort
+SELECT p.id, d.id FROM probe p LEFT JOIN doc d ON d.body ?& p.ks ORDER BY p.id, d.id
+----
+1
+10
+2
+10
+2
+11
+2
+12
+2
+13
+2
+14
+3
+NULL
+4
+NULL
+5
+10
+5
+11
+5
+12
+5
+13
+5
+14

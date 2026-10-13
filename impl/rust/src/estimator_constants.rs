@@ -60,6 +60,10 @@ pub const ACCESS_GIN_CONTAINS: &str = "matching";
 pub const ACCESS_GIN_OVERLAPS: &str = "matching";
 pub const ACCESS_GIN_MEMBER: &str = "matching";
 pub const ACCESS_GIN_EQUAL: &str = "matching";
+pub const ACCESS_GIN_JSONB_CONTAINS: &str = "matching";
+pub const ACCESS_GIN_JSONB_EXISTS: &str = "matching";
+pub const ACCESS_GIN_JSONB_EXISTS_ANY: &str = "matching";
+pub const ACCESS_GIN_JSONB_EXISTS_ALL: &str = "matching";
 pub const ACCESS_UNSUPPORTED: &str = "opaque";
 
 pub const ACCESS_PATH_ORDER: [&str; 7] = [

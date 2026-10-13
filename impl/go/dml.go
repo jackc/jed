@@ -481,18 +481,28 @@ func isGistDeferredScalarType(ty dataType) bool {
 // they appear in no posting list). Returned sorted by encoded term (= key-encoding byte order, which
 // is order-preserving for every admitted element type). array_ops over any fixed-width key-encodable
 // element type.
+//
+// A jsonb column (jsonb_ops, gin.md §2.1/§4.1) contributes one entry per DISTINCT term of its
+// document (ginJsonbIndexTerms) instead; a NULL document yields none.
 func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRow) ([][]byte, error) {
 	ci := cols[0]
-	elemTy := columns[ci].Type.Array.ScalarTy()
-	// A large array spills like any variable-width value, so a stored row's array may be deferred;
-	// it must be resolved — skipping it would silently drop (or fail to remove) its posting entries.
+	// A large array / document spills like any variable-width value, so a stored row's value may be
+	// deferred; it must be resolved — skipping it would silently drop (or fail to remove) its posting
+	// entries.
 	v, err := residentValue(row[ci])
 	if err != nil {
 		return nil, err
 	}
+	if columns[ci].Type.IsJsonb() {
+		if v.Kind != ValJsonb {
+			return nil, nil
+		}
+		return ginEntriesFromTerms(ginJsonbIndexTerms(v.jsonb()), storageKey), nil
+	}
 	if v.Kind != ValArray {
 		return nil, nil
 	}
+	elemTy := columns[ci].Type.Array.ScalarTy()
 	// Dedup by the encoded term (the key is canonical under SQL =: a float -0/+0 or two NaNs, or
 	// span-equal intervals like 1 mon/30 days, share one key — so byte-dedup == =-dedup, and
 	// byte-sort == value-sort) generically over every admitted element type.
@@ -514,12 +524,18 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 		}
 	}
 	slices.SortFunc(terms, bytes.Compare)
+	return ginEntriesFromTerms(terms, storageKey), nil
+}
+
+// ginEntriesFromTerms appends the row's storage key to each term of a deduplicated, byte-sorted term
+// set — the GIN entry keys term ‖ storage_key (gin.md §4), in ascending entry order.
+func ginEntriesFromTerms(terms [][]byte, storageKey []byte) [][]byte {
 	entries := make([][]byte, 0, len(terms))
 	for _, t := range terms {
 		entry := append(append([]byte{}, t...), storageKey...)
 		entries = append(entries, entry)
 	}
-	return entries, nil
+	return entries
 }
 
 // bytesDiff returns the entries in a that are not in b (set difference over byte slices),

@@ -1516,6 +1516,56 @@ gen = "int_uniform"
 min = 1
 max = 500
 
+# GIN jsonb_ops (spec/design/gin.md §2.1; query.gin_jsonb_ops). A 100k-row scratch table of small
+# documents behind a jsonb GIN index: `n` takes 1000 values (100 rows each) and the `tag<g % 97>`
+# key 97 values (~1031 rows each). `doc @> {"n": $1}` gathers the posting list of one number term
+# (both docs share the "n" key term, so the ALL intersection is the number's 100 rows); `doc ? key`
+# gathers one key term. Before jsonb_ops jed full-scanned all 100k documents per query. PostgreSQL
+# builds the same jsonb_ops GIN; the answer is index-independent, so the checksum holds.
+[[bench]]
+name = "gin_jsonb_contains"
+description = "GIN jsonb_ops @>: documents containing {\"n\": $1} — a key + number term intersection over a 100k-row jsonb column (100 rows per query)"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM jdocs WHERE doc @> jsonb_build_object('n', $1::bigint) ORDER BY id"
+warmup = 200
+iterations = 2000
+seed = 4290
+setup_sql = [
+  "DROP TABLE IF EXISTS jdocs",
+  "CREATE TABLE jdocs (id bigint PRIMARY KEY, doc jsonb)",
+  "INSERT INTO jdocs SELECT g, jsonb_build_object('kind', 'k' || (g % 50)::text, 'tag' || (g % 97)::text, true, 'n', g % 1000) FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX jdocs_doc_gin ON jdocs USING gin (doc)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 999
+
+[[bench]]
+name = "gin_jsonb_exists"
+description = "GIN jsonb_ops ?: documents with the top-level key tag<$1> — a single key-term posting list over a 100k-row jsonb column (~1031 rows per query)"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM jdocs WHERE doc ? ('tag' || ($1::bigint)::text) ORDER BY id"
+warmup = 100
+iterations = 1000
+seed = 4291
+setup_sql = [
+  "DROP TABLE IF EXISTS jdocs",
+  "CREATE TABLE jdocs (id bigint PRIMARY KEY, doc jsonb)",
+  "INSERT INTO jdocs SELECT g, jsonb_build_object('kind', 'k' || (g % 50)::text, 'tag' || (g % 97)::text, true, 'n', g % 1000) FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX jdocs_doc_gin ON jdocs USING gin (doc)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 96
+
 # GIN-bounded array equality: `tags = ARRAY[$1,$2]` is exact array equality, which jed accelerates as
 # the SAME two-term `@>` candidate gather as gin_contains (col = Q ⟹ col @> Q) plus a residual `=`
 # that re-checks order/cardinality (spec/design/gin.md §6; query.gin_array_eq). Over the length-0..6

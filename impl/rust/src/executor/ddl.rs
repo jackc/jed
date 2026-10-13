@@ -355,6 +355,89 @@ impl Engine {
             || (ty.is_composite() && self.read_snap().resolve_col_type(ty).keyable())
     }
 
+    /// The `CREATE INDEX` column-type gate for one index kind (indexes.md §1, gin.md §3, gist.md §6):
+    /// an ordered index needs a key-encodable type (`0A000`), GIN and GiST an operator class for the
+    /// type (`42704` for none, `0A000` for a deferred one). `ALTER COLUMN … TYPE` re-applies it to
+    /// every surviving index on a retyped column (alter.md §3.3).
+    pub(crate) fn check_index_column_type(&self, kind: IndexKind, ty: &Type) -> Result<()> {
+        match kind {
+            IndexKind::Btree => {
+                if !self.type_is_keyable(ty) {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "a {} index column is not supported yet",
+                            ty.canonical_name()
+                        ),
+                    ));
+                }
+            }
+            IndexKind::Gin => {
+                // GIN needs an operator class for the column type (gin.md §3): `jsonb_ops` for a
+                // jsonb column (§2.1); `array_ops` for an array, whose element must be FIXED-WIDTH
+                // KEY-ENCODABLE (else 0A000) — the term IS that element's key encoding (§4), so the
+                // admitted set is the integers, boolean, uuid, date, timestamp, timestamptz, f32,
+                // f64, interval. Any other type has no GIN operator class (42704).
+                if ty.is_jsonb() {
+                    return Ok(());
+                }
+                match ty.array_element() {
+                    None => {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedObject,
+                            format!(
+                                "data type {} has no default operator class for access method gin",
+                                ty.canonical_name()
+                            ),
+                        ));
+                    }
+                    Some(elem) if !is_gin_element_type(&elem) => {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "a gin index on {} is not supported yet",
+                                ty.canonical_name()
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            IndexKind::Gist => {
+                // GiST opclasses (spec/design/gist.md §5/§6): `range_ops` over a range column,
+                // or the in-core `btree_gist`-equivalent scalar `=` opclass over a FIXED-WIDTH
+                // keyable scalar (integers / boolean / uuid / date / timestamp / timestamptz —
+                // its bound is `[min, max]` over that type's order-preserving key encoding, all
+                // pure byte comparison). A keyable-but-deferred scalar (text / bytea / decimal /
+                // interval) is 0A000 — we will support it (the GIN element-staging precedent,
+                // §11); any other type (float / json / array / composite / jsonpath) has no GiST
+                // opclass at all — 42704 (PG's wording, the GIN-no-opclass precedent).
+                if !ty.is_range() {
+                    if is_gist_scalar_type(ty) {
+                        // supported scalar `=` opclass — ok
+                    } else if is_gist_deferred_scalar_type(ty) {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "a gist index on {} is not supported yet",
+                                ty.canonical_name()
+                            ),
+                        ));
+                    } else {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedObject,
+                            format!(
+                                "data type {} has no default operator class for access method gist",
+                                ty.canonical_name()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
     pub(crate) fn dispatch_stmt(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
@@ -3082,6 +3165,18 @@ impl Engine {
             }
         }
 
+        // Every surviving index on a retyped column must still admit the new type — the CREATE INDEX
+        // column gate, checked before any row is rewritten, as PostgreSQL re-creates the index under
+        // the new type before its table rewrite (alter.md §3.3).
+        for index in &table.indexes {
+            for key in &index.keys {
+                if let IndexKey::Column(ci) = key
+                    && type_changed_columns[*ci]
+                {
+                    self.check_index_column_type(index.kind, &table.columns[*ci].ty)?;
+                }
+            }
+        }
         let page_size = at
             .db
             .as_deref()
@@ -4455,79 +4550,7 @@ impl Engine {
                     format!("column does not exist: {name}"),
                 )
             })?;
-            let ty = &columns[idx].ty;
-            match kind {
-                IndexKind::Btree => {
-                    if !self.type_is_keyable(ty) {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            format!(
-                                "a {} index column is not supported yet",
-                                ty.canonical_name()
-                            ),
-                        ));
-                    }
-                }
-                IndexKind::Gin => {
-                    // GIN needs an operator class for the column type: only an array has one (else
-                    // 42704, no default opclass), and only a FIXED-WIDTH KEY-ENCODABLE element type
-                    // (else 0A000) — the GIN term IS that element's key encoding (gin.md §3/§4), so
-                    // the admitted set is the integers, boolean, uuid, date, timestamp, timestamptz,
-                    // f32, f64, interval.
-                    match ty.array_element() {
-                        None => {
-                            return Err(EngineError::new(
-                                SqlState::UndefinedObject,
-                                format!(
-                                    "data type {} has no default operator class for access method gin",
-                                    ty.canonical_name()
-                                ),
-                            ));
-                        }
-                        Some(elem) if !is_gin_element_type(&elem) => {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                format!(
-                                    "a gin index on {} is not supported yet",
-                                    ty.canonical_name()
-                                ),
-                            ));
-                        }
-                        Some(_) => {}
-                    }
-                }
-                IndexKind::Gist => {
-                    // GiST opclasses (spec/design/gist.md §5/§6): `range_ops` over a range column,
-                    // or the in-core `btree_gist`-equivalent scalar `=` opclass over a FIXED-WIDTH
-                    // keyable scalar (integers / boolean / uuid / date / timestamp / timestamptz —
-                    // its bound is `[min, max]` over that type's order-preserving key encoding, all
-                    // pure byte comparison). A keyable-but-deferred scalar (text / bytea / decimal /
-                    // interval) is 0A000 — we will support it (the GIN element-staging precedent,
-                    // §11); any other type (float / json / array / composite / jsonpath) has no GiST
-                    // opclass at all — 42704 (PG's wording, the GIN-no-opclass precedent).
-                    if !ty.is_range() {
-                        if is_gist_scalar_type(ty) {
-                            // supported scalar `=` opclass — ok
-                        } else if is_gist_deferred_scalar_type(ty) {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                format!(
-                                    "a gist index on {} is not supported yet",
-                                    ty.canonical_name()
-                                ),
-                            ));
-                        } else {
-                            return Err(EngineError::new(
-                                SqlState::UndefinedObject,
-                                format!(
-                                    "data type {} has no default operator class for access method gist",
-                                    ty.canonical_name()
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
+            self.check_index_column_type(kind, &columns[idx].ty)?;
             // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
             ci_keys.push(IndexKey::Column(idx));
         }

@@ -703,22 +703,20 @@ impl RExpr {
                     },
                     HasKeyKind::Any | HasKeyKind::All => match &av {
                         Value::Array(arr) => {
-                            // A NULL element never matches (PG): `?&` over an array with a NULL is
-                            // false; `?|` simply skips it.
+                            // A NULL element is skipped (PG `jsonb_exists_any`/`_all`): `?|` never
+                            // matches it, and `?&` over only NULLs (or nothing) is vacuously true
+                            // (json-sql-functions.md §1.2).
                             let mut keys: Vec<&str> = Vec::with_capacity(arr.elements.len());
-                            let mut has_null = false;
                             for e in &arr.elements {
                                 match e {
                                     Value::Text(s) => keys.push(s),
-                                    Value::Null => has_null = true,
+                                    Value::Null => {}
                                     _ => unreachable!("a text[] arg has text/NULL elements"),
                                 }
                             }
                             match kind {
                                 HasKeyKind::Any => keys.iter().any(|k| json::has_key(node, k)),
-                                HasKeyKind::All => {
-                                    !has_null && keys.iter().all(|k| json::has_key(node, k))
-                                }
+                                HasKeyKind::All => keys.iter().all(|k| json::has_key(node, k)),
                                 HasKeyKind::One => unreachable!(),
                             }
                         }

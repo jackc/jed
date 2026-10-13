@@ -1195,27 +1195,34 @@ pub fn verbatim_object_members(text: &str) -> Result<Vec<(String, &str)>> {
 // Containment / existence operators (`@> <@ ? ?| ?&`, spec/design/json-sql-functions.md §1, J5).
 // ---------------------------------------------------------------------------------------------
 
-/// `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains`)? The rules,
-/// pinned against the postgres:18 oracle:
-///   - object @> object: every member of `b` has a matching key in `a` whose value contains it.
+/// `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains` /
+/// `JsonbDeepContains`, spec/design/json-sql-functions.md §1.2)? The rules, pinned against the
+/// postgres:18 oracle:
+///   - object @> object: every member of `b` has a matching key in `a` whose value has the SAME kind
+///     and contains it (scalars equal, containers recursively).
 ///   - array @> array: every element of `b` is "contained in" `a` — a SCALAR element must EQUAL a
 ///     direct element of `a` (no recursion into `a`'s sub-containers); an OBJECT/ARRAY element must
 ///     be contained in some same-kind direct element of `a`.
-///   - array @> scalar: the scalar is a direct element of the array (by value equality).
+///   - array @> scalar: the scalar is a direct element of the array — at the TOP LEVEL only (PG's
+///     raw-scalar pseudo-array); below it a nested array never contains a bare scalar.
 ///   - scalar @> scalar: value equality.
-///   - any other top-level pairing (object vs array, scalar vs array/object, …) is false.
+///   - any other pairing (object vs array, scalar vs array/object, …) is false.
 pub fn contains(a: &JsonNode, b: &JsonNode) -> bool {
+    match (a, b) {
+        (JsonNode::Array(ea), b) if !is_container(b) => ea.iter().any(|x| x == b),
+        _ => contains_same_kind(a, b),
+    }
+}
+
+/// Containment between two nodes that must be the same kind (every level below the top).
+fn contains_same_kind(a: &JsonNode, b: &JsonNode) -> bool {
     match (a, b) {
         (JsonNode::Object(ma), JsonNode::Object(mb)) => mb.iter().all(|(k, vb)| {
             ma.iter()
                 .find(|(ka, _)| ka == k)
-                .is_some_and(|(_, va)| contains(va, vb))
+                .is_some_and(|(_, va)| contains_same_kind(va, vb))
         }),
         (JsonNode::Array(ea), JsonNode::Array(eb)) => eb.iter().all(|e| element_in_array(ea, e)),
-        // array @> a scalar: the scalar is a direct element of the array.
-        (JsonNode::Array(ea), b) if !is_container(b) => ea.iter().any(|x| x == b),
-        // scalar @> scalar: value equality (a container `a` against a scalar `b` already fell
-        // through; two scalars compare by the structural `==`).
         (a, b) if !is_container(a) && !is_container(b) => a == b,
         _ => false,
     }
@@ -1228,10 +1235,10 @@ fn element_in_array(arr: &[JsonNode], e: &JsonNode) -> bool {
     match e {
         JsonNode::Object(_) => arr
             .iter()
-            .any(|x| matches!(x, JsonNode::Object(_)) && contains(x, e)),
+            .any(|x| matches!(x, JsonNode::Object(_)) && contains_same_kind(x, e)),
         JsonNode::Array(_) => arr
             .iter()
-            .any(|x| matches!(x, JsonNode::Array(_)) && contains(x, e)),
+            .any(|x| matches!(x, JsonNode::Array(_)) && contains_same_kind(x, e)),
         scalar => arr.iter().any(|x| x == scalar),
     }
 }
@@ -1253,6 +1260,98 @@ pub fn has_key(node: &JsonNode, key: &str) -> bool {
         JsonNode::String(s) => s == key,
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GIN `jsonb_ops` terms (spec/design/gin.md §2.1/§4.1).
+// ---------------------------------------------------------------------------------------------
+
+/// The longest body source (string UTF-8 / number key bytes) a `jsonb_ops` term keeps; a longer one
+/// is cut to this many bytes and its flag gains [`GIN_JSONB_TRUNCATED`] (gin.md §4.1).
+pub const GIN_JSONB_MAX_TERM_BYTES: usize = 128;
+const GIN_JSONB_KEY: u8 = 0x01;
+const GIN_JSONB_NULL: u8 = 0x02;
+const GIN_JSONB_BOOL: u8 = 0x03;
+const GIN_JSONB_NUM: u8 = 0x04;
+const GIN_JSONB_STR: u8 = 0x05;
+const GIN_JSONB_TRUNCATED: u8 = 0x10;
+
+/// `flag ‖ text-terminated-escape(source cut to 128 bytes)`, the cut setting the truncated bit.
+fn gin_jsonb_framed(flag: u8, source: &[u8]) -> Vec<u8> {
+    let (flag, body) = if source.len() > GIN_JSONB_MAX_TERM_BYTES {
+        (
+            flag | GIN_JSONB_TRUNCATED,
+            &source[..GIN_JSONB_MAX_TERM_BYTES],
+        )
+    } else {
+        (flag, source)
+    };
+    let mut term = vec![flag];
+    term.extend_from_slice(&crate::encoding::encode_terminated(body));
+    term
+}
+
+/// The query term of a `?` / `?|` / `?&` key — the same KEY term an object key indexes.
+pub fn gin_jsonb_key_term(key: &str) -> Vec<u8> {
+    gin_jsonb_framed(GIN_JSONB_KEY, key.as_bytes())
+}
+
+/// A scalar's term. `as_key` marks a string that is an array element (or the top-level scalar,
+/// PG's one-element raw-scalar array): it indexes as a KEY, which is what `?` finds.
+fn gin_jsonb_scalar_term(node: &JsonNode, as_key: bool) -> Vec<u8> {
+    match node {
+        JsonNode::Null => vec![GIN_JSONB_NULL],
+        JsonNode::Bool(b) => vec![GIN_JSONB_BOOL, u8::from(*b)],
+        // The decimal key encodes the value, not the scale: 1.5 and 1.50 share a term.
+        JsonNode::Number(d) => gin_jsonb_framed(GIN_JSONB_NUM, &d.encode_key()),
+        JsonNode::String(s) => gin_jsonb_framed(
+            if as_key { GIN_JSONB_KEY } else { GIN_JSONB_STR },
+            s.as_bytes(),
+        ),
+        JsonNode::Array(_) | JsonNode::Object(_) => unreachable!("a container has no term"),
+    }
+}
+
+fn gin_jsonb_walk(node: &JsonNode, out: &mut Vec<Vec<u8>>) {
+    match node {
+        JsonNode::Object(members) => {
+            for (k, v) in members {
+                out.push(gin_jsonb_key_term(k));
+                if is_container(v) {
+                    gin_jsonb_walk(v, out);
+                } else {
+                    out.push(gin_jsonb_scalar_term(v, false));
+                }
+            }
+        }
+        JsonNode::Array(elems) => {
+            for e in elems {
+                if is_container(e) {
+                    gin_jsonb_walk(e, out);
+                } else {
+                    out.push(gin_jsonb_scalar_term(e, matches!(e, JsonNode::String(_))));
+                }
+            }
+        }
+        _ => unreachable!("only a container is walked"),
+    }
+}
+
+/// The `jsonb_ops` index term SET of a document (PG `gin_extract_jsonb`): a KEY term per object key
+/// and per string array element (a top-level string included), a value term per other scalar, at
+/// every nesting level; deduplicated by bytes, in ascending byte order. `{}` / `[]` yield none.
+pub fn gin_jsonb_index_terms(doc: &JsonNode) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    match doc {
+        JsonNode::Object(_) | JsonNode::Array(_) => gin_jsonb_walk(doc, &mut out),
+        scalar => out.push(gin_jsonb_scalar_term(
+            scalar,
+            matches!(scalar, JsonNode::String(_)),
+        )),
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 // ---------------------------------------------------------------------------------------------

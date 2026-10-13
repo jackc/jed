@@ -487,6 +487,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // GIN over interval[] — the 16-byte span key as the term, so span-equal intervals (1 mon /
     // 30 days) share one entry (gin.md §3/§4).
     "query.gin_interval_elements",
+    // GIN over a jsonb column — the jsonb_ops opclass: key/value terms accelerating @> / ? / ?| / ?&
+    // (gin.md §2.1/§4.1).
+    "query.gin_jsonb_ops",
     "query.is_null",
     "query.order_by",
     // Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

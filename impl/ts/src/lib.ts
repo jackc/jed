@@ -414,6 +414,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // GIN over interval[] — the 16-byte span key as the term, so span-equal intervals (1 mon /
   // 30 days) share one entry (gin.md §3/§4).
   "query.gin_interval_elements",
+  "query.gin_jsonb_ops",
   "query.is_null",
   "query.order_by",
   // Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

@@ -1172,48 +1172,44 @@ function isContainer(n: JsonNode): boolean {
   return n.kind === "object" || n.kind === "array";
 }
 
-// contains is `a @> b` — does the jsonb document `a` deeply contain `b` (PG `jsonb_contains`)? The
-// rules, pinned against the postgres:18 oracle:
-//   - object @> object: every member of `b` has a matching key in `a` whose value contains it.
-//   - array @> array: every element of `b` is "contained in" `a` — a SCALAR element must EQUAL a
-//     direct element of `a` (no recursion into `a`'s sub-containers); an OBJECT/ARRAY element must
-//     be contained in some same-kind direct element of `a`.
-//   - array @> scalar: the scalar is a direct element of the array (by value equality).
-//   - scalar @> scalar: value equality.
-//   - any other top-level pairing (object vs array, scalar vs array/object, …) is false.
+// contains is `a @> b` — does the jsonb document `a` deeply contain `b` (PostgreSQL's
+// `JsonbDeepContains`, spec/design/json-sql-functions.md §1.2)? The top level admits one extra
+// pairing — an array contains a bare scalar equal to one of its direct elements (`'["a",1]' @> '"a"'`)
+// — and otherwise defers to deepContains, which demands the same kind at every level. Every other
+// top-level pairing (object vs non-object, a scalar against an array) is false.
 export function contains(a: JsonNode, b: JsonNode): boolean {
-  if (a.kind === "object" && b.kind === "object") {
-    return b.members.every((mb) => {
-      const va = getField(a, mb.key);
-      return va !== null && contains(va, mb.value);
-    });
-  }
-  if (a.kind === "array" && b.kind === "array") {
-    return b.elements.every((e) => elementInArray(a.elements, e));
-  }
-  // array @> a scalar: the scalar is a direct element of the array.
   if (a.kind === "array" && !isContainer(b)) {
     return a.elements.some((x) => nodesEqual(x, b));
   }
-  // scalar @> scalar: value equality (a container `a` against a scalar `b` already fell through;
-  // two scalars compare by structural equality).
-  if (!isContainer(a) && !isContainer(b)) {
-    return nodesEqual(a, b);
-  }
-  return false;
+  return deepContains(a, b);
 }
 
-// elementInArray reports whether `e` (an element of the right array) is "contained in" the left
-// array `arr`: a scalar element must EQUAL a direct element of `arr`; an object/array element must
-// be contained in some same-kind direct element of `arr`.
+// deepContains is containment below the top level: the two nodes must be the SAME kind —
+//   - object ⊇ object: every member of `b` has a member of `a` with the same key whose value
+//     deep-contains it (so `'{"x":["a"]}' @> '{"x":"a"}'` is false — no bare-scalar-in-array here);
+//   - array ⊇ array: every element of `b` is matched by some element of `a` (elementInArray);
+//   - scalar = scalar: value equality.
+function deepContains(a: JsonNode, b: JsonNode): boolean {
+  if (a.kind === "object") {
+    if (b.kind !== "object") return false;
+    return b.members.every((mb) => {
+      const va = getField(a, mb.key);
+      return va !== null && deepContains(va, mb.value);
+    });
+  }
+  if (a.kind === "array") {
+    if (b.kind !== "array") return false;
+    return b.elements.every((e) => elementInArray(a.elements, e));
+  }
+  if (isContainer(b)) return false;
+  return nodesEqual(a, b);
+}
+
+// elementInArray reports whether `e` (an element of the right array) is matched by some element of
+// the left array `arr`: a scalar element by an EQUAL direct element; an object/array element by a
+// same-kind direct element that deep-contains it.
 function elementInArray(arr: JsonNode[], e: JsonNode): boolean {
-  if (e.kind === "object") {
-    return arr.some((x) => x.kind === "object" && contains(x, e));
-  }
-  if (e.kind === "array") {
-    return arr.some((x) => x.kind === "array" && contains(x, e));
-  }
-  // scalar
+  if (isContainer(e)) return arr.some((x) => x.kind === e.kind && deepContains(x, e));
   return arr.some((x) => nodesEqual(x, e));
 }
 

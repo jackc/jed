@@ -36,13 +36,17 @@ var (
 )
 
 const (
-	accessGistEqual   = "equality"
-	accessGistRange   = "matching"
-	accessGinContains = "matching"
-	accessGinOverlaps = "matching"
-	accessGinMember   = "matching"
-	accessGinEqual    = "matching"
-	accessUnsupported = "opaque"
+	accessGistEqual         = "equality"
+	accessGistRange         = "matching"
+	accessGinContains       = "matching"
+	accessGinOverlaps       = "matching"
+	accessGinMember         = "matching"
+	accessGinEqual          = "matching"
+	accessGinJsonbContains  = "matching"
+	accessGinJsonbExists    = "matching"
+	accessGinJsonbExistsAny = "matching"
+	accessGinJsonbExistsAll = "matching"
+	accessUnsupported       = "opaque"
 )
 
 var estimatorAccessPathOrder = [...]string{

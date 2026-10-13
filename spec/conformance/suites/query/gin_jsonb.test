@@ -1,0 +1,416 @@
+# GIN over a jsonb column — the jsonb_ops operator class (spec/design/gin.md §2.1/§4.1). A
+# `USING gin` index on a jsonb column indexes a KEY term per object key and per string array element
+# (a top-level string included) and a VALUE term per other scalar, at every nesting level, and
+# accelerates `@>` / `<@`, `?`, `?|`, and `?&` for SELECT and for the GIN-bounded UPDATE/DELETE.
+# The gather is lossy (it ignores structure, and a term longer than 128 bytes is truncated), so the
+# residual operator always rechecks every candidate.
+#
+# The rows and end state match PostgreSQL's jsonb_ops GIN (index presence never changes results);
+# they also pin PostgreSQL's containment rule the gather's soundness rests on — below the top level a
+# value must match in KIND (`{"tags":["red"]} @> {"tags":"red"}` is false), and `?&` skips NULL keys
+# (json-sql-functions.md §1.2). The `# cost:` assertions pin that the GIN bound — not a full scan — is
+# taken, cross-core identical (CLAUDE.md §8); query/gin_jsonb_explain.test pins the plan itself.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, ddl.secondary_index, query.gin_scan, query.gin_mutation, query.gin_jsonb_ops, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, types.i32, types.text, types.decimal, types.jsonb, func.jsonb_contains, func.jsonb_mutate, func.json_builders, expr.text_concat, cast.operator, resource.cost_metering
+
+# ============================================================================
+# The index is created BEFORE the rows (every entry arrives through INSERT maintenance).
+# ============================================================================
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, doc jsonb)
+
+statement ok
+CREATE INDEX d_doc_gin ON d USING gin (doc)
+
+statement ok
+INSERT INTO d VALUES
+  (1, '{"a": 1, "b": "x", "tags": ["red", "blue"]}'),
+  (2, '{"a": 2, "b": "y", "tags": ["red"], "n": null}'),
+  (3, '{"a": 1.50, "c": {"d": "x", "e": [1, 2]}}'),
+  (4, '{"a": 1.5, "b": true}'),
+  (5, '["red", "x", 1, false, null, {"a": 1}]'),
+  (6, '"red"'),
+  (7, '42'),
+  (8, '{}'),
+  (9, '[]'),
+  (10, NULL),
+  (11, '{"x": ["a"], "y": {"z": "a"}}'),
+  (12, '{"tags": "red"}'),
+  (13, '[["red"], [1, 2]]')
+
+# Terms longer than 128 bytes are truncated (flag | 0x10): rows 14 and 15 have keys sharing their
+# first 128 bytes, rows 16 and 17 string values sharing them, rows 18 and 19 301-digit numbers whose
+# keys share them. Each pair shares one term; the recheck tells them apart.
+statement ok
+INSERT INTO d VALUES
+  (14, jsonb_build_object(repeat('k', 128) || 'aa', 1)),
+  (15, jsonb_build_object(repeat('k', 128) || 'bb', 1)),
+  (16, jsonb_build_object('s', repeat('v', 130) || 'aa')),
+  (17, jsonb_build_object('s', repeat('v', 130) || 'bb')),
+  (18, jsonb_build_object('big', (repeat('9', 300) || '1')::decimal)),
+  (19, jsonb_build_object('big', (repeat('9', 300) || '2')::decimal))
+
+# ---- @> -------------------------------------------------------------------------------------
+
+# a top-level member value: only row 1 has a = 1 (row 3's 1.50 is a different number)
+# cost: 24
+query I nosort
+SELECT id FROM d WHERE doc @> '{"a": 1}' ORDER BY id
+----
+1
+
+# numbers compare by value: 1.50 = 1.5, one term
+query I nosort
+SELECT id FROM d WHERE doc @> '{"a": 1.5}' ORDER BY id
+----
+3
+4
+
+# a nested array contains a string element (a KEY term in both)
+query I nosort
+SELECT id FROM d WHERE doc @> '{"tags": ["red"]}' ORDER BY id
+----
+1
+2
+
+# below the top level a value matches only a value of the same kind: rows 1 and 2 hold an ARRAY
+# under "tags", so only row 12's string matches (an array's "red" is a KEY term, a member value's
+# "red" a STRING term, so the gather already separates them)
+# cost: 10
+query I nosort
+SELECT id FROM d WHERE doc @> '{"tags": "red"}' ORDER BY id
+----
+12
+
+# an array contains an array of its string element; a top-level string or a nested ["red"] does not
+query I nosort
+SELECT id FROM d WHERE doc @> '["red"]' ORDER BY id
+----
+5
+
+# a top-level array contains a bare scalar element; a top-level scalar contains itself
+query I nosort
+SELECT id FROM d WHERE doc @> '"red"' ORDER BY id
+----
+5
+6
+
+query I nosort
+SELECT id FROM d WHERE doc @> '[["red"]]' ORDER BY id
+----
+13
+
+query I nosort
+SELECT id FROM d WHERE doc @> '[{"a": 1}]' ORDER BY id
+----
+5
+
+query I nosort
+SELECT id FROM d WHERE doc @> '{"c": {"e": [2]}}' ORDER BY id
+----
+3
+
+# row 11 holds ["a"] under "x", not "a": a different kind, not contained
+query I nosort
+SELECT id FROM d WHERE doc @> '{"x": "a"}' ORDER BY id
+----
+
+query I nosort
+SELECT id FROM d WHERE doc @> '{"y": {"z": "a"}}' ORDER BY id
+----
+11
+
+# a JSON null value term: row 5's null element (row 2's "n": null is under an object, and an object
+# never contains a top-level scalar)
+query I nosort
+SELECT id FROM d WHERE doc @> 'null' ORDER BY id
+----
+5
+
+query I nosort
+SELECT id FROM d WHERE doc @> '42' ORDER BY id
+----
+7
+
+query I nosort
+SELECT id FROM d WHERE doc @> '[false, 1]' ORDER BY id
+----
+5
+
+# the commuted spelling Q <@ doc is the same predicate and the same bound
+query I nosort
+SELECT id FROM d WHERE '{"b": "x"}' <@ doc ORDER BY id
+----
+1
+
+# a term-less Q falls back to the full scan: {} is contained by every object, [] by every array
+# cost: 52
+query I nosort
+SELECT id FROM d WHERE doc @> '{}' ORDER BY id
+----
+1
+2
+3
+4
+8
+11
+12
+14
+15
+16
+17
+18
+19
+
+query I nosort
+SELECT id FROM d WHERE doc @> '[]' ORDER BY id
+----
+5
+9
+13
+
+# a NULL query matches nothing
+# cost: 0
+query I nosort
+SELECT id FROM d WHERE doc @> NULL::jsonb ORDER BY id
+----
+
+# truncated terms: each pair shares a term, the recheck keeps the exact match
+query I nosort
+SELECT id FROM d WHERE doc @> jsonb_build_object('s', repeat('v', 130) || 'bb') ORDER BY id
+----
+17
+
+query I nosort
+SELECT id FROM d WHERE doc @> jsonb_build_object('big', (repeat('9', 300) || '1')::decimal) ORDER BY id
+----
+18
+
+# ---- ? / ?| / ?& ----------------------------------------------------------------------------
+
+# a top-level object key (row 5's nested {"a": 1} is not top-level)
+# cost: 29
+query I nosort
+SELECT id FROM d WHERE doc ? 'a' ORDER BY id
+----
+1
+2
+3
+4
+
+# a string element of a top-level array, or an equal top-level string
+query I nosort
+SELECT id FROM d WHERE doc ? 'red' ORDER BY id
+----
+5
+6
+
+# row 1's "x" is a value and row 3's is nested — neither is a key
+query I nosort
+SELECT id FROM d WHERE doc ? 'x' ORDER BY id
+----
+5
+11
+
+query I nosort
+SELECT id FROM d WHERE doc ? 'n' ORDER BY id
+----
+2
+
+# cost: 1
+query I nosort
+SELECT id FROM d WHERE doc ? 'missing' ORDER BY id
+----
+
+query I nosort
+SELECT id FROM d WHERE doc ? NULL::text ORDER BY id
+----
+
+query I nosort
+SELECT id FROM d WHERE doc ? (repeat('k', 128) || 'aa') ORDER BY id
+----
+14
+
+# cost: 43
+query I nosort
+SELECT id FROM d WHERE doc ?| '{a,red}' ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT id FROM d WHERE doc ?| '{missing,n}' ORDER BY id
+----
+2
+
+# no non-NULL key: matches nothing
+# cost: 0
+query I nosort
+SELECT id FROM d WHERE doc ?| '{}' ORDER BY id
+----
+
+query I nosort
+SELECT id FROM d WHERE doc ?| '{NULL}' ORDER BY id
+----
+
+# cost: 23
+query I nosort
+SELECT id FROM d WHERE doc ?& '{a,b}' ORDER BY id
+----
+1
+2
+4
+
+# a NULL key is skipped
+query I nosort
+SELECT id FROM d WHERE doc ?& '{a,NULL}' ORDER BY id
+----
+1
+2
+3
+4
+
+query I nosort
+SELECT id FROM d WHERE doc ?& '{a,missing}' ORDER BY id
+----
+
+# no non-NULL key: every non-NULL document (the full-scan fallback)
+# cost: 57
+query I nosort
+SELECT id FROM d WHERE doc ?& '{}' ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+11
+12
+13
+14
+15
+16
+17
+18
+19
+
+query I nosort
+SELECT id FROM d WHERE doc ?| NULL::text[] ORDER BY id
+----
+
+# a GIN conjunct composes with an ordinary residual conjunct
+query I nosort
+SELECT id FROM d WHERE doc ? 'a' AND id > 2 ORDER BY id
+----
+3
+4
+
+# ============================================================================
+# Maintenance and GIN-bounded UPDATE / DELETE.
+# ============================================================================
+
+# adds a key to rows 1-4; the new key's term must be indexed
+statement ok
+UPDATE d SET doc = doc || '{"k": "v"}' WHERE doc ? 'a'
+
+query I nosort
+SELECT id FROM d WHERE doc @> '{"k": "v"}' ORDER BY id
+----
+1
+2
+3
+4
+
+# replaces row 2's document: its old terms must leave the index
+statement ok
+UPDATE d SET doc = '{"moved": true}' WHERE doc @> '{"a": 2}'
+
+query I nosort
+SELECT id FROM d WHERE doc ? 'b' ORDER BY id
+----
+1
+4
+
+query I nosort
+SELECT id FROM d WHERE doc @> '{"moved": true}' ORDER BY id
+----
+2
+
+# re-keys row 12: every entry's storage-key suffix moves
+statement ok
+UPDATE d SET id = id + 100 WHERE doc @> '{"tags": "red"}'
+
+query I nosort
+SELECT id FROM d WHERE doc ? 'tags' ORDER BY id
+----
+1
+112
+
+# cost: 23
+statement ok
+DELETE FROM d WHERE doc ?| '{red,x}'
+
+query I nosort
+SELECT id FROM d WHERE doc @> '"red"' OR id IN (5, 6, 11) ORDER BY id
+----
+
+statement ok
+DELETE FROM d WHERE doc ?& '{s}'
+
+query I nosort
+SELECT id FROM d WHERE doc @> '{}' ORDER BY id
+----
+1
+2
+3
+4
+8
+14
+15
+18
+19
+112
+
+# ============================================================================
+# The index built over existing rows (CREATE INDEX's build scan extracts every row's terms).
+# ============================================================================
+
+statement ok
+DROP INDEX d_doc_gin
+
+# cost: 15
+statement ok
+CREATE INDEX d_doc_gin ON d USING gin (doc)
+
+query I nosort
+SELECT id FROM d WHERE doc ? 'k' ORDER BY id
+----
+1
+3
+4
+
+query I nosort
+SELECT id FROM d WHERE doc @> '{"tags": ["blue"]}' ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM d WHERE doc ?| '{big,moved}' ORDER BY id
+----
+2
+18
+19
+
+query I nosort
+SELECT id FROM d WHERE doc @> '[[1]]' ORDER BY id
+----
+13

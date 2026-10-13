@@ -400,6 +400,48 @@ func rejectParamsForDDL(params []Value) error {
 // a second primary key traps 42P16 before its members resolve; members resolve
 // left to right (unknown 42703, repeated 42701); then the jed narrowings — the
 // declaration-order rule and the per-member key-type gate — trap 0A000.
+// indexColumnTypeGate is the CREATE INDEX per-kind column-type check (spec/design/gin.md §3,
+// gist.md §5/§6, indexes.md §1), shared with ALTER COLUMN … TYPE, which re-applies it to every
+// surviving index keying a retyped column (alter.md §3.3):
+//   - an ordered B-tree needs a key-encodable type (0A000);
+//   - GIN needs an operator class: a jsonb column takes jsonb_ops (gin.md §2.1); any other non-array
+//     type has none (42704); an array takes array_ops only over a FIXED-WIDTH KEY-ENCODABLE element
+//     type (else 0A000) — the integers, boolean, uuid, date, timestamp, timestamptz, f32, f64,
+//     interval (the GIN term IS that element's key encoding, gin.md §4);
+//   - GiST: range_ops over a range column, or the in-core btree_gist-equivalent scalar `=` opclass
+//     over a FIXED-WIDTH keyable scalar (integers / boolean / uuid / date / timestamp / timestamptz);
+//     a keyable-but-deferred scalar (text / bytea / decimal / interval) is 0A000, any other type
+//     (float / json / array / composite / jsonpath) has no GiST opclass — 42704 (PG's wording).
+func (db *engine) indexColumnTypeGate(kind indexKind, ty dataType) error {
+	switch kind {
+	case indexBtree:
+		if !db.typeIsKeyable(ty) {
+			return newError(FeatureNotSupported, "a "+ty.CanonicalName()+" index column is not supported yet")
+		}
+	case indexGin:
+		if ty.IsJsonb() {
+			return nil
+		}
+		if ty.Array == nil {
+			return newError(UndefinedObject,
+				"data type "+ty.CanonicalName()+" has no default operator class for access method gin")
+		}
+		if elem, ok := ty.Array.AsScalar(); !ok || !isGinElementType(elem) {
+			return newError(FeatureNotSupported, "a gin index on "+ty.CanonicalName()+" is not supported yet")
+		}
+	case indexGist:
+		if ty.IsRange() || isGistScalarType(ty) {
+			return nil
+		}
+		if isGistDeferredScalarType(ty) {
+			return newError(FeatureNotSupported, "a gist index on "+ty.CanonicalName()+" is not supported yet")
+		}
+		return newError(UndefinedObject,
+			"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
+	}
+	return nil
+}
+
 // typeIsKeyable reports whether a resolved column dataType is key-encodable — usable as a PRIMARY KEY
 // / ordered secondary index / UNIQUE member (spec/design/encoding.md §2). The keyable scalars, the
 // range container, a scalar-element array (isArrayKeyable), or a composite whose fields are ALL
@@ -2400,6 +2442,18 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 	}
 	if typeChanged {
+		// Every surviving index keying a retyped column re-applies its CREATE INDEX column gate under
+		// the new type before anything is rebuilt (alter.md §3.3, gin.md §3).
+		for _, ix := range table.Indexes {
+			for _, k := range ix.Keys {
+				if k.Expr != nil || k.Col < 0 || k.Col >= len(columnSources) || !columnSources[k.Col].typeChanged {
+					continue
+				}
+				if err := db.indexColumnTypeGate(ix.Kind, table.Columns[k.Col].Type); err != nil {
+					return outcome{}, err
+				}
+			}
+		}
 		for _, fk := range table.ForeignKeys {
 			parent := &table
 			if fk.RefTable != table.Name {
@@ -3438,46 +3492,8 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		if idx < 0 {
 			return outcome{}, newError(UndefinedColumn, "column does not exist: "+name)
 		}
-		ty := columns[idx].Type
-		switch kind {
-		case indexBtree:
-			if !db.typeIsKeyable(ty) {
-				return outcome{}, newError(FeatureNotSupported,
-					"a "+ty.CanonicalName()+" index column is not supported yet")
-			}
-		case indexGin:
-			// GIN needs an operator class for the column type: only an array has one (else 42704),
-			// and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
-			// element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean,
-			// uuid, date, timestamp, timestamptz, f32, f64, interval.
-			if ty.Array == nil {
-				return outcome{}, newError(UndefinedObject,
-					"data type "+ty.CanonicalName()+" has no default operator class for access method gin")
-			}
-			if elem, ok := ty.Array.AsScalar(); !ok || !isGinElementType(elem) {
-				return outcome{}, newError(FeatureNotSupported,
-					"a gin index on "+ty.CanonicalName()+" is not supported yet")
-			}
-		case indexGist:
-			// GiST opclasses (gist.md §5/§6): range_ops over a range column, or the in-core
-			// btree_gist-equivalent scalar `=` opclass over a FIXED-WIDTH keyable scalar (integers /
-			// boolean / uuid / date / timestamp / timestamptz — its bound is [min,max] over that type's
-			// order-preserving key encoding, all pure byte comparison). A keyable-but-deferred scalar
-			// (text / bytea / decimal / interval) is 0A000 — we will support it (the GIN element-staging
-			// precedent, §11); any other type (float / json / array / composite / jsonpath) has no GiST
-			// opclass at all — 42704 (PG's wording).
-			if !ty.IsRange() {
-				switch {
-				case isGistScalarType(ty):
-					// supported scalar `=` opclass — ok
-				case isGistDeferredScalarType(ty):
-					return outcome{}, newError(FeatureNotSupported,
-						"a gist index on "+ty.CanonicalName()+" is not supported yet")
-				default:
-					return outcome{}, newError(UndefinedObject,
-						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
-				}
-			}
+		if err := db.indexColumnTypeGate(kind, columns[idx].Type); err != nil {
+			return outcome{}, err
 		}
 		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
 		ciKeys = append(ciKeys, indexKey{Col: idx})
