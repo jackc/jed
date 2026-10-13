@@ -850,49 +850,7 @@ pub(crate) fn resolve_scalar_func(
     // matches (a host-only name, or a host overload over a signature the built-in name does not
     // accept).
     if let Some(desc) = select_scalar_overload(name, &tys)? {
-        // An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare `$N` is
-        // re-resolved with that family's type, recording it; a bare NULL stays a NULL node of
-        // that type.
-        for (i, t) in tys.iter_mut().enumerate() {
-            if !matches!(t, ResolvedType::Null) {
-                continue;
-            }
-            let Some(st) = family_param_type(desc.arg_families[i]) else {
-                continue;
-            };
-            if matches!(args[i], Expr::Param(_)) {
-                let (r, rt) = resolve(scope, &args[i], Some(st), agg, params)?;
-                rargs[i] = r;
-                *t = rt;
-            } else {
-                *t = resolved_type_of(st);
-            }
-        }
-        // Catalog volatility is executable admission data. date_part's epoch overload
-        // is refined by its constant field, without erasing dependencies of either child.
-        let epoch = name == "date_part"
-            && matches!(rargs.first(), Some(RExpr::ConstText(f)) if f.eq_ignore_ascii_case("epoch"));
-        params.nonimmutable |= desc.volatility != "immutable" && !epoch;
-        let result = scalar_result_type(desc.result, &tys);
-        let func = scalar_func_id(name);
-        // Promote float arguments to f64 when the function computes at f64 (every float
-        // overload except `abs(f32)`, which keeps its width). The eval then sees one width.
-        let widen_args = !matches!(func, ScalarFunc::Abs);
-        if widen_args && result == ScalarType::Float64 {
-            rargs = rargs
-                .into_iter()
-                .zip(tys.iter())
-                .map(|(r, t)| widen_float_to_f64(r, t))
-                .collect();
-        }
-        return Ok((
-            RExpr::ScalarFunc {
-                func,
-                args: rargs,
-                result,
-            },
-            resolved_type_of(result),
-        ));
+        return adopt_scalar_overload(scope, name, args, desc, rargs, tys, None, agg, params);
     }
     // Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
     // promotion. `id` indexes the frozen registry; the kernel is reached by id at eval.
@@ -907,7 +865,93 @@ pub(crate) fn resolve_scalar_func(
             resolved_type_of(result),
         ));
     }
+    // No overload takes the bare string literals as text, so retry with them unknown-typed, as
+    // PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
+    if let Some(literals) = bare_string_literals(args)
+        && let Some(desc) = select_unknown_overload(name, &tys, Some(&literals))?
+    {
+        return adopt_scalar_overload(
+            scope,
+            name,
+            args,
+            desc,
+            rargs,
+            tys,
+            Some(&literals),
+            agg,
+            params,
+        );
+    }
     Err(no_func_overload(name))
+}
+
+/// Which arguments are bare string literals (`'…'`, not a typed literal or a cast), or `None` when
+/// there are none.
+fn bare_string_literals(args: &[Expr]) -> Option<Vec<bool>> {
+    let marks: Vec<bool> = args
+        .iter()
+        .map(|a| matches!(a, Expr::Literal(Literal::Text(_), _)))
+        .collect();
+    marks.contains(&true).then_some(marks)
+}
+
+/// Build the call node for a selected built-in overload. An unknown-typed argument first adopts its
+/// slot's family (functions.md §9.1): a bare `$N`, or a bare string literal marked in `literals`, is
+/// re-resolved with that family's type (recording a `$N`'s type, input-converting a literal); a bare
+/// NULL stays a NULL node of that type.
+#[allow(clippy::too_many_arguments)]
+fn adopt_scalar_overload(
+    scope: &Scope,
+    name: &str,
+    args: &[Expr],
+    desc: &'static OperatorDesc,
+    mut rargs: Vec<RExpr>,
+    mut tys: Vec<ResolvedType>,
+    literals: Option<&[bool]>,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    for (i, t) in tys.iter_mut().enumerate() {
+        let literal = literals.is_some_and(|l| l[i]);
+        if !matches!(t, ResolvedType::Null) && !literal {
+            continue;
+        }
+        let Some(st) = family_param_type(desc.arg_families[i]) else {
+            continue;
+        };
+        if literal || matches!(args[i], Expr::Param(_)) {
+            let (r, rt) = resolve(scope, &args[i], Some(st), agg, params)?;
+            rargs[i] = r;
+            *t = rt;
+        } else {
+            *t = resolved_type_of(st);
+        }
+    }
+    // Catalog volatility is executable admission data. date_part's epoch overload
+    // is refined by its constant field, without erasing dependencies of either child.
+    let epoch = name == "date_part"
+        && matches!(rargs.first(), Some(RExpr::ConstText(f)) if f.eq_ignore_ascii_case("epoch"));
+    params.nonimmutable |= desc.volatility != "immutable" && !epoch;
+    let result = scalar_result_type(desc.result, &tys);
+    let func = scalar_func_id(name);
+    // Promote float arguments to f64 when the function computes at f64 (every float
+    // overload except `abs(f32)`, which keeps its width). The eval then sees one width.
+    let widen_args = !matches!(func, ScalarFunc::Abs);
+    if widen_args && result == ScalarType::Float64 {
+        rargs = rargs
+            .into_iter()
+            .zip(tys.iter())
+            .map(|(r, t)| widen_float_to_f64(r, t))
+            .collect();
+    }
+    Ok((
+        RExpr::ScalarFunc {
+            func,
+            args: rargs,
+            result,
+        },
+        resolved_type_of(result),
+    ))
 }
 
 /// Resolve `(name, arg types)` against the session's frozen host-function registry

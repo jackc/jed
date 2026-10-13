@@ -142,6 +142,25 @@ func selectScalarOverload(name string, tys []resolvedType) (*operatorDesc, error
 	if !anyUnknown {
 		return lookupScalarOverload(name, tys), nil
 	}
+	return selectUnknownOverload(name, tys, nil)
+}
+
+// literalAdapts reports whether a bare string literal can be read as a value of a slot's family:
+// the families whose input the literal resolver converts (resolveNode's literalText case), plus
+// text itself and the unconstrained any. The numeric and boolean families are not among them.
+func literalAdapts(slot string) bool {
+	switch slot {
+	case "any", "text", "bytea", "uuid", "date", "timestamp", "timestamptz", "interval", "json", "jsonb", "jsonpath":
+		return true
+	}
+	return false
+}
+
+// selectUnknownOverload is the unknown-argument rule of functions.md §9.1. An argument of the
+// untyped NULL type is unknown and matches any slot; so is a position marked in literals (a bare
+// string literal), which matches only the slots literalAdapts admits.
+func selectUnknownOverload(name string, tys []resolvedType, literals []bool) (*operatorDesc, error) {
+	unknown := func(i int) bool { return tys[i].kind == rtNull || (literals != nil && literals[i]) }
 	var candidates []*operatorDesc
 	for i := range operators {
 		o := &operators[i]
@@ -150,8 +169,14 @@ func selectScalarOverload(name string, tys []resolvedType) (*operatorDesc, error
 		}
 		match := true
 		for j, slot := range o.ArgFamilies {
-			if tys[j].kind != rtNull && !familyMatches(slot, tys[j]) {
-				match = false
+			switch {
+			case literals != nil && literals[j]:
+				match = literalAdapts(slot)
+			case tys[j].kind == rtNull:
+			default:
+				match = familyMatches(slot, tys[j])
+			}
+			if !match {
 				break
 			}
 		}
@@ -168,8 +193,8 @@ func selectScalarOverload(name string, tys []resolvedType) (*operatorDesc, error
 	// At each unknown position pick text if any candidate accepts it, else the one family every
 	// candidate agrees on; a disagreement without text is ambiguous.
 	picked := make([]string, len(tys))
-	for i, t := range tys {
-		if t.kind != rtNull {
+	for i := range tys {
+		if !unknown(i) {
 			continue
 		}
 		first := candidates[0].ArgFamilies[i]
@@ -3564,39 +3589,72 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 		return nil, resolvedType{}, err
 	}
 	if desc != nil {
-		// An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare $N is
-		// re-resolved with that family's type, recording it; a bare NULL stays a NULL node of
-		// that type.
-		for i := range tys {
-			if tys[i].kind != rtNull {
-				continue
-			}
-			st, ok := familyParamType(desc.ArgFamilies[i])
-			if !ok {
-				continue
-			}
-			if fc.Args[i].Kind == exprParam {
-				r, t, err := resolve(s, *fc.Args[i], &st, ag, params)
-				if err != nil {
-					return nil, resolvedType{}, err
-				}
-				rargs[i], tys[i] = r, t
-			} else {
-				tys[i] = resolvedTypeOf(st)
-			}
-		}
-		epoch := name == "date_part" && len(rargs) > 0 && rargs[0].kind == reConstText && strings.EqualFold(rargs[0].cText, "epoch")
-		params.nonimmutable = params.nonimmutable || (desc.Volatility != "immutable" && !epoch)
-		fn := scalarFuncID(name, tys)
-		result := scalarResultType(desc.Result, tys)
-		return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, resolvedTypeOf(result), nil
+		return adoptScalarOverload(s, fc, desc, rargs, tys, nil, ag, params)
 	}
 	// Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
 	// promotion. index holds the frozen-registry id; cText carries the name for EXPLAIN.
 	if id, result, ok := resolveHostScalar(s, name, tys); ok {
 		return &rExpr{kind: reHostFunc, index: id, cText: name, sargs: rargs, result: result}, resolvedTypeOf(result), nil
 	}
+	// No overload takes the bare string literals as text, so retry with them unknown-typed, as
+	// PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
+	if literals := bareStringLiterals(fc.Args); literals != nil {
+		desc, err := selectUnknownOverload(name, tys, literals)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if desc != nil {
+			return adoptScalarOverload(s, fc, desc, rargs, tys, literals, ag, params)
+		}
+	}
 	return nil, resolvedType{}, noFuncOverload(name)
+}
+
+// bareStringLiterals marks the arguments that are bare string literals ('…', not a typed literal or
+// a cast), or returns nil when there are none.
+func bareStringLiterals(args []*exprNode) []bool {
+	var out []bool
+	for i, a := range args {
+		if a.Kind == exprLiteral && a.Literal.Kind == literalText {
+			if out == nil {
+				out = make([]bool, len(args))
+			}
+			out[i] = true
+		}
+	}
+	return out
+}
+
+// adoptScalarOverload builds the call node for a selected built-in overload. An unknown-typed
+// argument first adopts its slot's family (functions.md §9.1): a bare $N, or a bare string literal
+// marked in literals, is re-resolved with that family's type (recording a $N's type, input-
+// converting a literal); a bare NULL stays a NULL node of that type.
+func adoptScalarOverload(s *scope, fc *funcCallExpr, desc *operatorDesc, rargs []*rExpr, tys []resolvedType, literals []bool, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	name := fc.Name
+	for i := range tys {
+		literal := literals != nil && literals[i]
+		if tys[i].kind != rtNull && !literal {
+			continue
+		}
+		st, ok := familyParamType(desc.ArgFamilies[i])
+		if !ok {
+			continue
+		}
+		if fc.Args[i].Kind == exprParam || literal {
+			r, t, err := resolve(s, *fc.Args[i], &st, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			rargs[i], tys[i] = r, t
+		} else {
+			tys[i] = resolvedTypeOf(st)
+		}
+	}
+	epoch := name == "date_part" && len(rargs) > 0 && rargs[0].kind == reConstText && strings.EqualFold(rargs[0].cText, "epoch")
+	params.nonimmutable = params.nonimmutable || (desc.Volatility != "immutable" && !epoch)
+	fn := scalarFuncID(name, tys)
+	result := scalarResultType(desc.Result, tys)
+	return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, resolvedTypeOf(result), nil
 }
 
 // resolveHostScalar resolves (name, arg types) against the session's frozen host-function registry

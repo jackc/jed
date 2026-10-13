@@ -33792,19 +33792,51 @@ export function lookupScalarOverload(name: string, tys: ResolvedType[]): Operato
 // matches (the caller tries the host registry, then 42883); 42725 when the overloads cannot decide.
 export function selectScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc | undefined {
   if (!tys.some((t) => t.kind === "null")) return lookupScalarOverload(name, tys);
+  return selectUnknownOverload(name, tys, null);
+}
+
+// LITERAL_FAMILIES are the slot families a bare string literal can be read as: those whose input
+// the literal resolver converts (resolveNode's text-literal case), plus text itself and the
+// unconstrained any. The numeric and boolean families are not among them.
+const LITERAL_FAMILIES = new Set([
+  "any",
+  "text",
+  "bytea",
+  "uuid",
+  "date",
+  "timestamp",
+  "timestamptz",
+  "interval",
+  "json",
+  "jsonb",
+  "jsonpath",
+]);
+
+// selectUnknownOverload is the unknown-argument rule of functions.md §9.1. An argument of the
+// untyped NULL type is unknown and matches any slot; so is a position marked in literals (a bare
+// string literal), which matches only the LITERAL_FAMILIES slots.
+export function selectUnknownOverload(
+  name: string,
+  tys: ResolvedType[],
+  literals: boolean[] | null,
+): OperatorDesc | undefined {
+  const literal = (i: number): boolean => literals !== null && literals[i]!;
+  const unknown = (i: number): boolean => tys[i]!.kind === "null" || literal(i);
   const candidates = OPERATORS.filter(
     (o) =>
       o.kind === "function" &&
       o.name === name &&
       o.argFamilies.length === tys.length &&
-      o.argFamilies.every((slot, i) => tys[i]!.kind === "null" || familyMatches(slot, tys[i]!)),
+      o.argFamilies.every((slot, i) =>
+        literal(i) ? LITERAL_FAMILIES.has(slot) : unknown(i) || familyMatches(slot, tys[i]!)
+      ),
   );
   if (candidates.length <= 1) return candidates[0];
   // At each unknown position pick text if any candidate accepts it, else the one family every
   // candidate agrees on; a disagreement without text is ambiguous.
   const picked: (string | null)[] = tys.map(() => null);
   for (let i = 0; i < tys.length; i++) {
-    if (tys[i]!.kind !== "null") continue;
+    if (!unknown(i)) continue;
     const first = candidates[0]!.argFamilies[i]!;
     if (candidates.some((o) => o.argFamilies[i] === "text")) picked[i] = "text";
     else if (candidates.every((o) => o.argFamilies[i] === first)) picked[i] = first;
@@ -34585,7 +34617,8 @@ export function resolveScalarFunc(
   // Pick the overload by argument families and its result type by the catalog `result` code
   // (extensibility.md §5) — by the SPELLED name, so `power(numeric,numeric)` and `power(float,float)`
   // both resolve (the decimal `power` row has no `pow` alias, matching Rust/Go).
-  const desc = selectScalarOverload(name, tys);
+  let desc = selectScalarOverload(name, tys);
+  let literals: boolean[] | null = null;
   if (!desc) {
     // Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
     // promotion. A built-in overload (above) always wins; a host function is reached only when no
@@ -34593,15 +34626,21 @@ export function resolveScalarFunc(
     // `id` indexes the frozen registry; the kernel is reached by id at eval.
     const host = resolveHostScalar(scope, e.name, rargs, tys);
     if (host) return host;
-    throw noFuncOverload(name);
+    // No overload takes the bare string literals as text, so retry with them unknown-typed, as
+    // PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
+    literals = bareStringLiterals(e.args);
+    if (literals) desc = selectUnknownOverload(name, tys, literals);
+    if (!desc) throw noFuncOverload(name);
   }
-  // An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare $N is re-resolved
-  // with that family's type, recording it; a bare NULL stays a NULL node of that type.
+  // An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare $N, or a bare
+  // string literal marked in literals, is re-resolved with that family's type (recording a $N's
+  // type, input-converting a literal); a bare NULL stays a NULL node of that type.
   for (let i = 0; i < tys.length; i++) {
-    if (tys[i]!.kind !== "null") continue;
+    const literal = literals !== null && literals[i]!;
+    if (tys[i]!.kind !== "null" && !literal) continue;
     const st = familyParamType(desc.argFamilies[i]!);
     if (st === null) continue;
-    if (e.args[i]!.kind === "param") {
+    if (literal || e.args[i]!.kind === "param") {
       const r = resolve(scope, e.args[i]!, st, ag, params);
       rargs[i] = r.node;
       tys[i] = r.type;
@@ -34637,6 +34676,13 @@ export function resolveScalarFunc(
   params.nonimmutable ||= desc.volatility !== "immutable" && !epoch;
   const result = scalarResultType(desc.result, tys);
   return scalarFuncNode(func, rargs, result, argWidth);
+}
+
+// bareStringLiterals marks the arguments that are bare string literals ('…', not a typed literal or
+// a cast), or returns null when there are none.
+function bareStringLiterals(args: Expr[]): boolean[] | null {
+  const marks = args.map((a) => a.kind === "literal" && a.literal.kind === "text");
+  return marks.includes(true) ? marks : null;
 }
 
 // scalarFuncNode builds a resolved scalar-function node + its public type.

@@ -460,8 +460,9 @@ are STRICT and ride the scalar-function mold (§1), except `||`, which has its o
   unknown-literal rule picks the string category. The result carries the argument's collation like
   any text-result function.
 - **`sha224(bytea)`, `sha256(bytea)`, `sha384(bytea)`, `sha512(bytea)` → bytea** — the FIPS 180-4
-  digest as raw bytes: 28, 32, 48, or 64 bytes. There is no text overload (`42883`, as in
-  PostgreSQL); render the digest with `encode(…, 'hex')`.
+  digest as raw bytes: 28, 32, 48, or 64 bytes. There is no text overload: a bare literal is read
+  as bytea input (`sha256('abc')`), and a `text` value is `42883`, as in PostgreSQL. Render the
+  digest with `encode(…, 'hex')`.
 
   The digests come from a vetted library in each core, never a hand-rolled algorithm (CLAUDE.md §14
   clause 3): Go's standard library (`crypto/md5`, `crypto/sha256`, `crypto/sha512`), RustCrypto's
@@ -475,9 +476,13 @@ are STRICT and ride the scalar-function mold (§1), except `||`, which has its o
 are not growth kernels and charge only their `operator_eval` ([cost.md](cost.md) §8.1 *Not
 covered*): applying them again cannot grow a value.
 
-The argument must already be `bytea`: as with `encode`, a bare string literal argument resolves as
-`text`, so `get_byte('\x01', 0)` is `42883` (write `bytea '\x01'` or `'\x01'::bytea`), and likewise
-`position('\x02' IN b)` and `sha256('abc')`. Only `||` adapts a literal, through its operand hint.
+A bare string literal fills a `bytea` slot when no overload takes it as `text` (functions.md
+§9.1): `get_byte('\x0102', 1) = 2`, `encode('\x01', 'hex') = '01'`, `sha256('abc')` hashes the three
+bytes `abc`, and `position('\x02' IN b)` matches a bytea `b`. A literal is read as bytea input, so
+`'\x…'` is hex and anything else the escape format. Where a `text` overload exists the literal stays
+text: `md5('\x01')` hashes the four characters `\x01`, and `length('\x01') = 4`. A `text`-typed value
+is never converted: `sha256('abc'::text)` is `42883`, as in PostgreSQL. `||` resolves by hand
+(above) and adapts a literal through its operand hint.
 
 ## 5. Text concatenation (`||`)
 

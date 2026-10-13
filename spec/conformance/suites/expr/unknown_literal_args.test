@@ -1,0 +1,72 @@
+# A bare string literal as a scalar-function argument (spec/design/functions.md §9.1). A literal is
+# text when an overload takes it as text. Otherwise it is unknown-typed, as PostgreSQL types it,
+# and adopts the family of the one slot it can fill, being read as that type's input: sha256('abc')
+# hashes the bytea 'abc'. Among several candidates text wins, and an undecidable set is 42725. A
+# literal fills only the families it can be read as (bytea, uuid, the date/time types, interval,
+# and the JSON types), never a numeric or boolean slot. PostgreSQL-oracle-verified (postgres:18).
+# requires: query.select_no_from, types.i32, types.text, types.bytea, types.uuid, types.interval, types.json, types.jsonb, func.unknown_args
+
+# === one candidate: the literal is read as the slot's type ================================
+
+query T nosort
+SELECT sha256('abc')
+----
+\xba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+
+query IT nosort
+SELECT get_byte('\x0102ff', 2), encode('\x0102', 'hex')
+----
+255
+0102
+
+query I nosort
+SELECT uuid_extract_version('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')
+----
+4
+
+query TTI nosort
+SELECT json_typeof('[1, 2]'), jsonb_typeof('{"a": 1}'), jsonb_array_length('[1, 2, 3]')
+----
+array
+object
+3
+
+query T nosort
+SELECT justify_days('35 days')
+----
+1 mon 5 days
+
+# A typed argument narrows the candidates first: bytea '…' picks position's and btrim's bytea rows.
+query IT nosort
+SELECT position('\x03' IN bytea '\x010203'), btrim(bytea '\x0001020100', '\x0001')
+----
+3
+\x02
+
+# A literal that is not valid input for the slot's type is that type's input error.
+statement error 22P02
+SELECT sha256('a\9')
+
+statement error 22P02
+SELECT uuid_extract_version('not-a-uuid')
+
+# === several candidates: text wins ========================================================
+
+# md5 and length take text or bytea: the literal is text, so length counts its 4 characters.
+query TI nosort
+SELECT md5('\x01'), length('\x01')
+----
+7dc2e06a7d279321a584a73cd5fa51ef
+4
+
+# === several candidates, no text: ambiguous ===============================================
+
+# date_part's value slot is date, timestamp, timestamptz, or interval.
+statement error 42725
+SELECT date_part('year', '2024-03-15')
+
+# === no candidate stays 42883 =============================================================
+
+# The SHA-2 functions take bytea only, and a text value is not a literal.
+statement error 42883
+SELECT sha256('abc'::text)

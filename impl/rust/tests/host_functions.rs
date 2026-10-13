@@ -163,6 +163,33 @@ fn builtin_wins_over_host_same_signature() {
 }
 
 #[test]
+fn host_text_overload_wins_over_literal_adaptation() {
+    // The built-in sha256 takes only bytea, so sha256('abc') reads the literal as bytea input — but
+    // only after the call failed to resolve with the literal as text. A host sha256(text) matches
+    // that first pass, so it is reached instead (functions.md §9.1).
+    let host_sha = HostFunction::new(
+        "sha256",
+        vec![ScalarType::Text],
+        ScalarType::Text,
+        Box::new(|args: &[Value]| -> jed::Result<Value> {
+            let Value::Text(a) = &args[0] else {
+                unreachable!("text argument")
+            };
+            Ok(Value::Text(format!("host:{a}")))
+        }),
+    );
+    let mut db = db_with_ext(registry(vec![host_sha]), &[]);
+    assert_eq!(
+        one(&mut db, "SELECT sha256('abc')"),
+        Value::Text("host:abc".into())
+    );
+    assert_eq!(
+        one(&mut db, "SELECT length(sha256(bytea 'abc'))"),
+        Value::Int(32)
+    );
+}
+
+#[test]
 fn duplicate_signature_rejected() {
     let mut reg = ExtensionRegistry::new();
     reg.register_function(add_i64()).unwrap();

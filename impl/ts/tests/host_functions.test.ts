@@ -141,6 +141,22 @@ test("built-in wins over host on the same signature", () => {
   assert.equal(asInt(oneVal(s, "SELECT abs(-5)")), 5n);
 });
 
+test("a host text overload wins over literal adaptation", () => {
+  // The built-in sha256 takes only bytea, so sha256('abc') reads the literal as bytea input — but
+  // only after the call failed to resolve with the literal as text. A host sha256(text) matches
+  // that first pass, so it is reached instead (functions.md §9.1).
+  const s = dbExt(
+    regWith({
+      name: "sha256",
+      argTypes: ["text"],
+      result: "text",
+      kernel: (args) => textValue(`host:${asText(args[0]!)}`),
+    }),
+  );
+  assert.equal(asText(oneVal(s, "SELECT sha256('abc')")), "host:abc");
+  assert.equal(asInt(oneVal(s, "SELECT length(sha256(bytea 'abc'))")), 32n);
+});
+
 test("duplicate signature is rejected", () => {
   const r = new ExtensionRegistry();
   r.registerFunction(hostAdd);

@@ -80,8 +80,8 @@
 	const byteaHashDemo = `SELECT
   md5('abc')                                  AS md5_text,
   md5('\\x616263'::bytea)                     AS md5_bytea,
-  encode(sha256('\\x616263'::bytea), 'hex')   AS sha256_hex,
-  length(sha512('\\x'::bytea))                AS sha512_bytes;`;
+  encode(sha256('abc'), 'hex')                AS sha256_hex,
+  length(sha512(''))                          AS sha512_bytes;`;
 
 	const arrayCastDemo = `SELECT
   (ARRAY[1, 2, 3])::text                     AS array_to_text,
@@ -384,8 +384,10 @@ changed (bits count from the least-significant bit of each byte, so bit 9 is bit
 The digest functions hash a value. `md5` takes `text` or `bytea` and returns 32 lowercase hex
 digits as `text`, hashing a `text` argument as its UTF-8 bytes. `sha224`, `sha256`, `sha384`, and
 `sha512` take `bytea` and return the raw digest as `bytea` (28, 32, 48, or 64 bytes); wrap them in
-`encode(…, 'hex')` for hex text. As with the other `bytea` functions, a bare string literal is
-`text`, so write `sha256('abc'::bytea)`, not `sha256('abc')`:
+`encode(…, 'hex')` for hex text. A bare string literal in a `bytea`-only argument is read as
+`bytea` input, as in PostgreSQL: `sha256('abc')` hashes the three bytes `abc`, and `get_byte('\x0102',
+1)` is `2`. Where a `text` version exists the literal stays `text`, so `md5('abc')` hashes the
+string:
 
 <LiveSql demo="byteaHashDemo" query={byteaHashDemo} rows={1} />
 

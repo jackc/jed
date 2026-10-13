@@ -141,6 +141,22 @@ func TestBuiltinWinsOverHostSameSignature(t *testing.T) {
 	}
 }
 
+func TestHostTextOverloadWinsOverLiteralAdaptation(t *testing.T) {
+	t.Parallel()
+	// The built-in sha256 takes only bytea, so sha256('abc') reads the literal as bytea input — but
+	// only after the call failed to resolve with the literal as text. A host sha256(text) matches
+	// that first pass, so it is reached instead (functions.md §9.1).
+	hostSha := NewHostFunction("sha256", []string{"text"}, "text",
+		func(args []Value) (Value, error) { return TextValue("host:" + args[0].str()), nil })
+	s := dbExt(t, regWith(t, hostSha))
+	if v := oneVal(t, s, "SELECT sha256('abc')"); v.str() != "host:abc" {
+		t.Fatalf("sha256('abc') = %q, want host:abc (host text overload wins)", v.str())
+	}
+	if v := oneVal(t, s, "SELECT length(sha256(bytea 'abc'))"); v.Int != 32 {
+		t.Fatalf("length(sha256(bytea 'abc')) = %v, want 32 (built-in)", v.Int)
+	}
+}
+
 func TestDuplicateSignatureRejected(t *testing.T) {
 	t.Parallel()
 	r := NewExtensionRegistry()

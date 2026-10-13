@@ -1303,7 +1303,7 @@ description = "round(x[, n]) scalar function — numeric/integer → numeric, ha
 
 [[capability]]
 id = "func.unknown_args"
-description = "A bare NULL scalar-function argument adopts its slot's declared family (spec/design/functions.md §9.1): one candidate decides, text wins among several, an undecidable overload set is 42725 (no preferred-type step); a strict function returns NULL. The same rule types a bind parameter (api.md §5)"
+description = "A bare NULL scalar-function argument adopts its slot's declared family (spec/design/functions.md §9.1): one candidate decides, text wins among several, an undecidable overload set is 42725 (no preferred-type step); a strict function returns NULL. The same rule types a bind parameter (api.md §5). A bare string literal that no overload takes as text is retried as unknown-typed, filling only the families a literal can be read as (bytea, uuid, the date/time types, interval, the JSON types) and input-converted to the selected slot's type: sha256('abc') hashes bytea input"
 
 [[capability]]
 id = "func.casing"

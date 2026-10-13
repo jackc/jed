@@ -4710,8 +4710,8 @@ null           = "propagates"
 errors         = []
 
 # sha224/sha256/sha384/sha512(bytea) → bytea — the SHA-2 digest (FIPS 180-4) as raw bytes: 28, 32,
-# 48, or 64 bytes. bytea only, as in PG: there is no text overload. Library-backed like md5. NULL
-# propagates. (string-functions.md §4)
+# 48, or 64 bytes. bytea only, as in PG: there is no text overload, and a bare literal is read as
+# bytea input (functions.md §9.1). Library-backed like md5. NULL propagates. (string-functions.md §4)
 [[operator]]
 volatility     = "immutable"
 name           = "sha224"

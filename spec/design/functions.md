@@ -360,6 +360,32 @@ writes the cast: `abs(NULL)`, `abs($1)`, `sqrt(NULL)`, `round($1, 2)` and `pow(N
 differ the other way: `to_hex($1)` types `$1` as `i64` because jed has one `to_hex(integer)` row,
 where PostgreSQL's `int4`/`int8` pair is `42725`.
 
+**A bare string literal is unknown-typed too, as a fallback.** PostgreSQL types `'abc'` as
+`unknown`, so `sha256('abc')` reads it as bytea input. jed types a string literal `text`, and keeps
+doing so whenever that resolves the call. When it does not, a bare string literal (`'…'`, not
+`text '…'` or `'…'::text`) becomes unknown-typed and resolution runs again in this order:
+
+1. The call resolves as before, each literal typed `text`: against the built-in overloads, then
+   the host-registered functions. A call that resolved before this rule existed resolves the same
+   way now.
+2. If that finds nothing, the built-in overloads are matched again with every bare string literal
+   unknown. The rule above applies, with one difference: a literal fits only a slot whose family
+   it can be read as. Those families are the ones a literal already adapts to beside a column or
+   operand: `bytea`, `uuid`, `date`, `timestamp`, `timestamptz`, `interval`, `json`, `jsonb`,
+   `jsonpath`, plus `text` and `any`. The numeric and boolean families are not among them. If
+   nothing matches, the call is still `42883`.
+3. **Adoption.** A literal in the selected overload is resolved again with its slot's type, and so
+   becomes that type's input. A malformed literal raises that type's input error, as a cast
+   would: `sha256('a\9')` is `22P02`.
+
+So `sha256('abc')`, `get_byte('\x0102', 1)`, `uuid_extract_version('a0ee…')`, and
+`json_typeof('[1]')` resolve. `md5('abc')` and `length('\x01')` still take their `text` overloads,
+and `date_part('year', '2024-03-15')` is `42725`, all as in PostgreSQL. jed reads a literal only
+as the families above, so `chr('65')` stays `42883` where PostgreSQL reads `'65'` as `int4`.
+PostgreSQL also has `bit` overloads of `get_bit`/`set_bit`/`length`/`overlay`/`position`, which
+jed lacks: there `set_bit('\x00', 0, 1)` reads the literal as a `bit` string and fails, while jed
+reads it as bytea.
+
 **Scope.** The rule covers the generic path only. The functions with their own resolvers
 (`make_interval`/`make_timestamp`/`make_date`, `lower`/`upper`, the regex, range, array, json-set
 and VARIADIC functions, aggregates) keep their own argument typing. An unknown argument never

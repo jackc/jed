@@ -523,18 +523,55 @@ pub(crate) fn select_scalar_overload(
     name: &str,
     arg_tys: &[ResolvedType],
 ) -> Result<Option<&'static OperatorDesc>> {
-    let unknown = |t: &ResolvedType| matches!(t, ResolvedType::Null);
-    if !arg_tys.iter().any(unknown) {
+    if !arg_tys.iter().any(|t| matches!(t, ResolvedType::Null)) {
         return Ok(lookup_scalar_overload(name, arg_tys));
     }
+    select_unknown_overload(name, arg_tys, None)
+}
+
+/// Whether a bare string literal can be read as a value of a slot's family: the families whose input
+/// the literal resolver converts (`resolve_node`'s `Literal::Text` arm), plus `text` itself and the
+/// unconstrained `any`. The numeric and boolean families are not among them.
+fn literal_adapts(slot: &str) -> bool {
+    matches!(
+        slot,
+        "any"
+            | "text"
+            | "bytea"
+            | "uuid"
+            | "date"
+            | "timestamp"
+            | "timestamptz"
+            | "interval"
+            | "json"
+            | "jsonb"
+            | "jsonpath"
+    )
+}
+
+/// The unknown-argument rule of functions.md §9.1. An argument of the untyped NULL type is unknown
+/// and matches any slot; so is a position marked in `literals` (a bare string literal), which
+/// matches only the slots `literal_adapts` admits.
+pub(crate) fn select_unknown_overload(
+    name: &str,
+    arg_tys: &[ResolvedType],
+    literals: Option<&[bool]>,
+) -> Result<Option<&'static OperatorDesc>> {
+    let literal = |i: usize| literals.is_some_and(|l| l[i]);
+    let unknown = |i: usize| matches!(arg_tys[i], ResolvedType::Null) || literal(i);
     let candidates: Vec<&'static OperatorDesc> = OPERATORS
         .iter()
         .filter(|o| {
             o.kind == "function"
                 && o.name == name
                 && o.arg_families.len() == arg_tys.len()
-                && std::iter::zip(o.arg_families, arg_tys)
-                    .all(|(slot, t)| unknown(t) || family_matches(slot, t))
+                && o.arg_families.iter().enumerate().all(|(i, slot)| {
+                    if literal(i) {
+                        literal_adapts(slot)
+                    } else {
+                        unknown(i) || family_matches(slot, &arg_tys[i])
+                    }
+                })
         })
         .collect();
     if candidates.len() <= 1 {
@@ -543,8 +580,8 @@ pub(crate) fn select_scalar_overload(
     // At each unknown position pick `text` if any candidate accepts it, else the one family every
     // candidate agrees on; a disagreement without `text` is ambiguous.
     let mut picked: Vec<Option<&str>> = vec![None; arg_tys.len()];
-    for (i, t) in arg_tys.iter().enumerate() {
-        if !unknown(t) {
+    for i in 0..arg_tys.len() {
+        if !unknown(i) {
             continue;
         }
         let first = candidates[0].arg_families[i];
