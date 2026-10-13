@@ -127,3 +127,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [mutation-testing.md](mutation-testing.md) — mutation-testing the Go core (`mise run mutation`,
   `impl/go/cmd/mutate`): inject deliberate bugs and check the conformance corpus catches each;
   a surviving mutant is untested logic, located to a line (an analysis tool, outside `mise run ci`).
+- [simulation-testing.md](simulation-testing.md) — deterministic simulation testing (**proposed,
+  not built**): seeded multi-session histories over a fault-injecting simulated disk, checked by a
+  generation-history oracle, a durability floor, structural invariants, and cross-core agreement on
+  byte-identical crash images; targets the storage/commit/recovery state machine.
