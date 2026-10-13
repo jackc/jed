@@ -334,6 +334,25 @@ impl Engine {
         // commit thus reclaims this commit's fresh orphans (`plan_free_list`); a short open→commit→close
         // session no longer leaks them (open no longer reconstructs the free-list). Preallocate ahead of
         // the high-water so the body `fdatasync` carries no file-growth journaling (pager.md §7).
+        // A crashed compaction or create may have left the file's directory entry unsynced: the first
+        // durable commit after open syncs the directory once (validated-cow.md §3).
+        if !self.dir_synced {
+            self.dir_synced = true;
+            let skips_sync = self
+                .paging
+                .as_ref()
+                .expect("paging present")
+                .pager()
+                .skips_sync();
+            if let (false, Some(path)) = (skips_sync, &self.path) {
+                let files = crate::filehost::OsFileHost;
+                if let Ok(real) = files.real_path(path)
+                    && let Some(dir) = real.parent()
+                {
+                    files.sync_dir(dir);
+                }
+            }
+        }
         {
             let paging = self.paging.as_ref().expect("paging present");
             let mut pager = paging.pager();

@@ -128,6 +128,7 @@ check
 | `fault <kind> <params>` | Arms a fault (§6.3) for the **next** step only. |
 | `crash process` / `crash power survive=‰ tear=‰` | An immediate crash between steps. |
 | `reopen` | Ends every session (rolling back a writer), closes cleanly, and opens again. |
+| `compact` | Host compaction of `main` (api.md §2.6), through the simulated filesystem. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
 
@@ -153,7 +154,14 @@ A crash ends every session of the crashed `Database`. The generator never refere
 
 ### 6.1 State
 
-`SimDisk` implements `BlockStore` over three pieces of state:
+The disk is a small **simulated filesystem** (`simFS`): named files, a directory, and the per-step
+fault state. The directory has a kernel view and a durable view; creates, renames, and removes join
+an ordered list of pending changes until a directory sync makes them durable. The database file is
+`sim.jed`; host compaction (S4) adds its sibling temp file. The filesystem is also the database's
+file host (the seam compaction's temp file, rename, directory sync, and reopen go through in every
+core), so a crash can land between any two of those steps.
+
+Each file implements `BlockStore` over three pieces of state:
 
 - **durable**: the bytes that survive a power loss unconditionally;
 - **pending**: for each page offset, the ordered list of versions written since that offset was last
@@ -194,6 +202,10 @@ keeps independent decisions uncorrelated, and its values are part of the cross-c
 | 7 | `io_error op=sync`: does this pending write land or vanish (`% 2`)? |
 | 8 | a session's entropy-seam seed (`decide(seed, 8, step, 0, 0)` for the session opened at `step`) |
 | 9 | `read_error`: do reads of this offset fail during the step? |
+| 10 | power loss: how many pending directory changes survive (`% (changes + 1)`, an ordered prefix) |
+
+A file other than `sim.jed` adds `(FNV-1a 32(name) + 1) << 40` to every offset it decides on, so two
+files' decisions stay independent while the database file's are unchanged by the others' existence.
 
 This is what makes crash images **comparable across cores** (§8.4). Within a commit, write order is
 not a cross-core contract and may differ by core, but the set of `(offset, bytes)` pairs does not.
@@ -208,8 +220,8 @@ is sound: a failure under it is a real protocol violation, not a modeling artifa
 
 | Kind | Model | Expected outcome | Cross-core tier |
 |---|---|---|---|
-| `power_loss survive=‰ tear=‰` | The process runs until the step's first `sync`, which never completes. Then, for each pending offset, `decide` chooses "nothing lands" (durable stays) or one pending version, **any** version, not only the newest, since an older one may have been written back first. With probability `tear`, the chosen version is mixed sector by sector with the durable bytes. Cache is discarded. | Recovery selects a generation allowed by §8.1–8.2, never `XX001`. | Image + transcript |
-| `process_crash issue=‰` | Each write of the step is independently issued or not (§6.2). The live process sees all of its own writes; at its death, at the step's first `sync`, the never-issued ones vanish from the cache. Issued writes stay **pending**, not durable, so a later power loss can still drop them. | The next opener sees the cache. Before its first write, a writable opener must stabilize an adopted unacknowledged generation (validated-cow §3). A later power loss checks that it did. | Image + transcript |
+| `power_loss survive=‰ tear=‰ [nth=N]` | The process runs until the step's `N`th barrier (default 1; file syncs and directory syncs both count), which never completes. Then, for each pending offset, `decide` chooses "nothing lands" (durable stays) or one pending version, **any** version, not only the newest, since an older one may have been written back first. With probability `tear`, the chosen version is mixed sector by sector with the durable bytes. Cache is discarded. The directory keeps its durable entries plus an ordered prefix of the pending changes (lane 10), as a journaling filesystem would. | Recovery selects a generation allowed by §8.1–8.2, never `XX001`. | Image + transcript |
+| `process_crash issue=‰ [nth=N]` | Each write of the step is independently issued or not (§6.2). The live process sees all of its own writes; at its death, at the step's `N`th barrier, the never-issued ones vanish from the cache. The kernel directory survives. Issued writes stay **pending**, not durable, so a later power loss can still drop them. | The next opener sees the cache. Before its first write, a writable opener must stabilize an adopted unacknowledged generation (validated-cow §3). A later power loss checks that it did. | Image + transcript |
 | `io_error op=write p=‰` | The first write whose `decide` falls under `p` fails and lands nothing. | The commit fails `58030` and the handle is poisoned; recovery yields the prior generation. | Transcript |
 | `io_error op=sync nth=N` | The step's `N`th `sync` fails with Linux "fsyncgate" semantics: each pending write independently became durable or was dropped from the cache, and the error is reported once. | As above, but recovery may yield the in-flight generation if all of it landed. | Transcript |
 | `read_error p=‰` | Every read of an offset whose lane-9 `decide` falls under `p` fails during the step. The runner's own oracle reads (digests, the live checker) are exempt — an early version applied the fault to them too and reported false violations. | The statement fails `58030`, never `XX001` or wrong rows. | Per-core: which reads happen depends on buffer-pool policy |
@@ -219,8 +231,10 @@ is sound: a failure under it is a real protocol violation, not a modeling artifa
 A trace containing a per-core fault runs every oracle on every core but is not compared across
 cores (`scripts/sim.rb`), since one core may read or grow where another does not.
 
-A fault that never reaches a `sync` (an unchanged commit, a statement inside a transaction) fires
-at the end of the step. `set_size` is never a fault point: preallocation is a host-policy detail,
+A fault that never reaches its barrier (an unchanged commit, a statement inside a transaction) fires
+at the end of the step. A directory sync with no pending change is not a fault point and does
+nothing: it cannot lose anything, and counting it would renumber every later barrier. `set_size`
+is never a fault point: preallocation is a host-policy detail,
 and a model that killed the process there would make the fault's reach depend on it. A process
 that died fails every later call it makes.
 
@@ -241,8 +255,10 @@ documented so a reader knows what a green sweep does **not** prove:
 - A torn page is a per-sector mix of old and new bytes at the declared sector size. The default of
   64 bytes keeps tearing possible at the smallest page size (256) and is more adversarial than real
   512-byte or 4 KiB atomic units.
-- A process crash preserves the kernel cache. A power loss preserves only durable bytes plus
-  whatever subset the model chooses.
+- A process crash preserves the kernel cache and directory. A power loss preserves only durable bytes
+  plus whatever subset the model chooses.
+- Syncing a file never makes its directory entry durable; only a directory sync does (POSIX). Pending
+  directory changes survive a power loss as an ordered prefix, as on a journaling filesystem.
 - Reads after an error-free write return that write.
 
 ## 7. Scheduling, clock, and entropy
@@ -288,9 +304,12 @@ belongs to the corpus.
 
 ### 8.2 The durability floor
 
-- The **floor** is the newest version known durable: one whose commit was **acknowledged** under
-  `synchronous = on`, or the version published when a step began if any barrier in that step
-  completed (a stabilization sync, for example, makes an adopted generation durable).
+- The **floor** is the newest version known durable: one whose commit or compaction was
+  **acknowledged** under `synchronous = on`, or the version published when a step began if the
+  database file's own barrier completed in that step with no directory change pending (a
+  stabilization sync, for example, makes an adopted generation durable). A compaction's temp file
+  syncing proves nothing about the database file, and neither does a file sync while the file's
+  directory entry is still pending.
 - The **allowed set** after a crash is every version from the floor through the newest version whose
   commit was **attempted**. Under a relaxed `synchronous` mode, the floor is the last explicit
   durability point.
@@ -400,6 +419,8 @@ defaults, which `mixed.toml` restates):
 | `ddl-churn` | `CREATE`/`DROP`/`ALTER` of tables and indexes, sequences, catalog-chain growth |
 | `crash-storm` | Repeated process and power crashes |
 | `stabilization` | Process crashes that leave complete unsynced generations, then a faulted next commit |
+| `resource` | Tiny caches, spill, storage and query-memory limits, `read_error`, `enospc` |
+| `compaction` | Host compaction with crashes at the temp-file and directory barriers (`nth`) |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
@@ -500,15 +521,43 @@ primitive) gets a simulated implementation.
    storage and query-memory limits fail commits and statements mid-history. `read_error` and
    `enospc` are per-core faults (§6.3). Not done: giving Go and Rust the `SpillSink` seam TypeScript
    has, so a fault could target spill I/O itself, and temp-table spill.
-4. **S4 — Simulated filesystem.** A `SimFs` beneath `SimDisk`: named files, `rename`, `unlink`, and a
-   directory barrier, where a rename becomes durable only after its directory sync. This covers
-   `compact` (`.jedtmp` plus rename), file attachments with the N-root commit, and `create`.
-5. **S5 — Simulated lock host and multiple processes.** A lock-primitive seam beneath the coordinator
-   (today `flock`/`LockFileEx` on concrete files), with a simulated implementation shared by several
-   simulated processes over one `SimFs`. A simulated process crash releases its locks, as the kernel
-   does. The presence probe and lock timeouts run on the simulated clock. This explores alone↔shared
-   transitions, append-only co-resident commits, and foreign-generation adoption randomly.
-   Layer 4 stays the authority for real kernel behavior.
+4. **S4 — Simulated filesystem. Compaction landed; attachments and `create` not yet.** Every core's
+   compaction goes through a file-host seam (`filehost.{go,rs,ts}`); the simulated filesystem
+   implements it, with named files, ordered directory changes, and a directory barrier where a rename
+   becomes durable only after its directory sync. The `compaction` profile crashes at either of
+   compaction's barriers (`nth`).
+
+   **Engine bug found.** A process that died between a compaction's rename and its directory sync
+   left the new file in place with an unsynced entry; the next opener adopted it and committed with
+   file syncs only, and a power loss reverted the rename and lost those acknowledged commits — 8 of
+   80 `compaction` seeds. The first durable commit after each open now syncs the directory
+   (validated-cow.md §3). The same sweep also corrected the floor rule (§8.2), which had trusted a
+   compaction's temp-file sync.
+
+   Not done: file attachments (the generator would need a schema per attachment and the N-root
+   commit's at-most-one-durable-database rule), and `create` (its temp-file recipe is the same as
+   compaction's, so only the open path is new).
+5. **S5 — Simulated lock host and multiple processes.** Every core's coordinator goes through a
+   lock-host seam (bundle files, whole-file locks, the deadline clock, the pause between polls of a
+   contended lock, the presence probe, and the in-process open registry); the OS host keeps today's
+   behavior. The simulated host shares one lock table among simulated processes over one simulated
+   filesystem:
+   - A trace with `# processes: shared` opens every process with shared locking. `spawn <p>` starts
+     process `p` (`p0` starts implicitly), `exit <p>` closes it cleanly, and `kill <p>` crashes it
+     alone: its sessions and locks vanish, as the kernel releases a dead process's locks, while the
+     kernel cache and the other processes survive. `open <sid> <mode> <p>` opens a session in `p`
+     (default `p0`). `tick` runs every live process's presence probe, in process order.
+   - A lock acquisition that would block instead runs the other processes' probes and advances the
+     simulated clock by the poll interval, so deadlines expire in simulated time. A wait that makes no
+     progress for a bounded number of polls is reported as a deadlock.
+   - A `process_crash` fault kills only the process executing the step; a power loss kills them all
+     and `p0` reopens. A session's base version is checked against the history when it opens, so a
+     process that adopts a killed writer's unacknowledged generation must adopt one the history
+     allows.
+
+   This explores alone↔shared transitions, append-only co-resident commits, meta refresh at begin,
+   and foreign-generation adoption under crashes. Layer 4 stays the authority for real kernel
+   behavior.
 6. **S6 — Independent checker. Landed.** `verify.rb --check-image` decodes a crash image as a fourth
    voice: it selects the generation recovery must select and checks the live count and free list.
    The driver compares its decision with every recovery a core reports (`sim:regress` always,

@@ -1,0 +1,20 @@
+# Host compaction under crashes (api.md §2.6; simulation-testing.md §14 S4): the committed snapshot
+# rewritten into a sibling temp file, renamed over the database, and made durable by a directory
+# barrier. Faults land at either barrier, so recovery must find the old file or the new one — never
+# neither — and a leftover temp file must not confuse the next compaction. Readers are rare, since an
+# open session makes compaction fail 55006.
+
+description = "Host compaction with crashes at the temp-file and directory barriers"
+
+page_sizes = [256, 512]
+max_readers = 1
+
+[weights]
+compact = 6
+open_read = 2
+close_read = 6
+read_query = 3
+
+[faults]
+compact_fault = 450
+nth_max = 2

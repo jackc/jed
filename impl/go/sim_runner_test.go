@@ -161,7 +161,7 @@ func simParse(text string) (simTrace, error) {
 				return tr, fmt.Errorf("line %d: clock +<micros>", n+1)
 			}
 			st.params["delta"] = fields[1][1:]
-		case "check", "reopen":
+		case "check", "reopen", "compact":
 		default:
 			return tr, fmt.Errorf("line %d: unknown step %q", n+1, st.kind)
 		}
@@ -182,9 +182,9 @@ func (st simStep) intParam(key string) int {
 func simFaultOf(st simStep) (*simFault, error) {
 	switch st.mode {
 	case "power_loss":
-		return &simFault{kind: simPowerLoss, survive: st.intParam("survive"), tear: st.intParam("tear")}, nil
+		return &simFault{kind: simPowerLoss, survive: st.intParam("survive"), tear: st.intParam("tear"), nth: st.intParam("nth")}, nil
 	case "process_crash":
-		return &simFault{kind: simProcessCrash, issue: st.intParam("issue")}, nil
+		return &simFault{kind: simProcessCrash, issue: st.intParam("issue"), nth: st.intParam("nth")}, nil
 	case "io_error":
 		switch st.params["op"] {
 		case "write":
@@ -248,7 +248,7 @@ func simRunFile(path, out string) simResult {
 	first.run()
 	res.steps = len(tr.steps)
 	res.transcriptHash = simFNV(first.transcript.String())
-	res.opsHash = first.disk.ops
+	res.opsHash = first.fs.ops
 	_ = os.WriteFile(filepath.Join(out, name+".go.jsonl"), []byte(first.transcript.String()), 0o644)
 	if first.violation != "" {
 		res.violation = first.violation
@@ -272,7 +272,7 @@ func simRunFile(path, out string) simResult {
 		res.violationStep = second.violationStep
 	case second.transcript.String() != first.transcript.String():
 		res.violation = "nondeterministic: transcripts differ between two runs" + simFirstDiff(first.transcript.String(), second.transcript.String())
-	case second.disk.ops != first.disk.ops:
+	case second.fs.ops != first.fs.ops:
 		res.violation = "nondeterministic: storage operation logs differ between two runs"
 	}
 	return res
@@ -313,7 +313,7 @@ type simRunner struct {
 	maxStorageBytes int64  // the database's max_storage_bytes
 	spillDir        string // the real scratch directory spill files go to; their bytes are not durable state
 
-	disk     *simDisk
+	fs       *simFS
 	db       *Database
 	sessions map[string]*simSession
 	armed    *simFault
@@ -370,7 +370,7 @@ func newSimRunner(tr simTrace) *simRunner {
 		maxQueryMemory:  maxQueryMemory,
 		maxStorageBytes: maxStorageBytes,
 		spillDir:        spillDir,
-		disk:            newSimDisk(seed, sector, image),
+		fs:              newSimFS(seed, sector, image),
 		sessions:        map[string]*simSession{},
 		history:         map[uint64]map[string]bool{},
 		violationStep:   -1,
@@ -392,7 +392,11 @@ func (r *simRunner) emit(format string, args ...any) {
 // open opens a Database over the simulated disk through the ordinary demand-paged loader — the
 // path a reopening process takes, including validated-COW recovery (validated-cow.md §1).
 func (r *simRunner) open() error {
-	p, err := pagerFromStore(r.disk)
+	main := r.fs.main()
+	if main == nil {
+		return newError(IoError, "the database file is gone")
+	}
+	p, err := pagerFromStore(main)
 	if err != nil {
 		return err
 	}
@@ -407,6 +411,7 @@ func (r *simRunner) open() error {
 	e.path = simDiskPath
 	e.spillDir = r.spillDir
 	r.db = databaseOver(sharedCoreFromEngine(e))
+	r.db.core.storage.files = r.fs // compaction's temp file, rename, and directory barrier
 	if r.maxStorageBytes > 0 {
 		if err := r.db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
 			return err
@@ -434,6 +439,14 @@ func (r *simRunner) run() {
 			return
 		}
 	}
+}
+
+// mainImage copies the database file's cache — what a new process would open — or nil if it is gone.
+func (r *simRunner) mainImage() []byte {
+	if main := r.fs.main(); main != nil {
+		return append([]byte(nil), main.cache...)
+	}
+	return nil
 }
 
 func (r *simRunner) addHistory(v uint64, d string) {
@@ -464,9 +477,9 @@ func (r *simRunner) step(i int) (cont bool) {
 		r.emit(`{"i":%d,"op":"fault","kind":%q}`, i, st.mode)
 		return true
 	case "crash":
-		r.disk.beginStep(uint64(i), nil)
+		r.fs.beginStep(uint64(i), nil)
 		if st.mode == "power" {
-			r.disk.powerLoss(uint64(i), st.intParam("survive"), st.intParam("tear"))
+			r.fs.powerLoss(uint64(i), st.intParam("survive"), st.intParam("tear"))
 		}
 		return r.recover(i, "none")
 	case "clock":
@@ -479,7 +492,7 @@ func (r *simRunner) step(i int) (cont bool) {
 	armed := r.armed
 	r.armed = nil
 	startVersion := r.version
-	r.disk.beginStep(uint64(i), armed)
+	r.fs.beginStep(uint64(i), armed)
 	switch st.kind {
 	case "open":
 		r.stepOpen(i, st)
@@ -491,6 +504,8 @@ func (r *simRunner) step(i int) (cont bool) {
 		r.stepEnd(i, st)
 	case "check":
 		r.stepCheck(i)
+	case "compact":
+		r.stepCompact(i)
 	case "reopen":
 		if !r.stepReopen(i) {
 			return false
@@ -501,19 +516,19 @@ func (r *simRunner) step(i int) (cont bool) {
 	}
 	// A completed barrier made every earlier write durable: the generation published when the step
 	// began can no longer be lost (§8.2).
-	if r.disk.barrierOK && startVersion > r.floor {
+	if r.fs.barrierOK && startVersion > r.floor {
 		r.floor = startVersion
 	}
 	if armed == nil {
 		return true
 	}
 	// Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
-	fired := r.disk.fired
+	fired := r.fs.fired
 	if fired == "" {
 		fired = "end"
 	}
 	if armed.kind == simPowerLoss {
-		r.disk.powerLoss(uint64(i), armed.survive, armed.tear)
+		r.fs.powerLoss(uint64(i), armed.survive, armed.tear)
 	}
 	return r.recover(i, fired)
 }
@@ -619,8 +634,8 @@ var simDigestRelations = []string{"jed_tables", "jed_columns", "jed_indexes", "j
 // rendered and sorted, folded with FNV-1a. ok is false if any query failed (an aborted block).
 func (r *simRunner) digest(s *Session) (string, bool) {
 	// An armed read fault targets the trace's statements, not the oracle checking them.
-	r.disk.oracle = true
-	defer func() { r.disk.oracle = false }()
+	r.fs.oracle = true
+	defer func() { r.fs.oracle = false }()
 	// The oracle's own reads must not trip a trace session's memory limit.
 	if limit := s.MaxQueryMemoryBytes(); limit > 0 {
 		s.SetMaxQueryMemoryBytes(0)
@@ -679,8 +694,8 @@ func (r *simRunner) digest(s *Session) (string, bool) {
 
 // checkLive runs the live integrity checker with read faults suspended, like every oracle read.
 func (r *simRunner) checkLive() error {
-	r.disk.oracle = true
-	defer func() { r.disk.oracle = false }()
+	r.fs.oracle = true
+	defer func() { r.fs.oracle = false }()
 	return simCheckLive(r.db)
 }
 
@@ -718,7 +733,7 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			return
 		}
 		// The commit reached storage, so a crash may still recover its generation (§8.1).
-		if digestOK && r.disk.writes > 0 {
+		if digestOK && r.fs.writes > 0 {
 			r.addHistory(base+1, inflight)
 			r.maxAttempted = max(r.maxAttempted, base+1)
 		}
@@ -779,6 +794,47 @@ func (r *simRunner) stepEnd(i int, st simStep) {
 	r.emit(`{"i":%d,"op":%q,"sid":%q}`, i, st.kind, st.sid)
 }
 
+// stepCompact runs host compaction (api.md §2.6): the committed snapshot rewritten as a fresh image
+// at the next version, through the simulated filesystem's temp file, rename, and directory barrier.
+// Its contents are unchanged, so a crash may recover either version with the same digest.
+func (r *simRunner) stepCompact(i int) {
+	base := r.version
+	r.addHistory(base+1, r.lastDigest)
+	r.maxAttempted = max(r.maxAttempted, base+1)
+	err := r.db.Compact("main")
+	now := r.db.Version()
+	if err != nil {
+		code := simCode(err)
+		if strings.HasPrefix(code, "non-engine") {
+			r.fail(i, "%s", code)
+			return
+		}
+		r.emit(`{"i":%d,"op":"compact","error":%q}`, i, code)
+		switch {
+		case code == "XX001":
+			r.fail(i, "corruption: compaction reported XX001: %v", err)
+		case now != base:
+			r.fail(i, "a failed compaction published version %d (was %d)", now, base)
+		}
+		return
+	}
+	r.emit(`{"i":%d,"op":"compact","version":%d}`, i, now)
+	if now != base+1 {
+		r.fail(i, "compaction moved version %d to %d", base, now)
+		return
+	}
+	if d, ok := r.committedDigest(); !ok || d != r.lastDigest {
+		r.fail(i, "compaction changed the database's contents")
+		return
+	}
+	if err := r.checkLive(); err != nil {
+		r.fail(i, "after compaction: %v", err)
+		return
+	}
+	r.version = now
+	r.floor = now // the rename and the directory barrier completed
+}
+
 func (r *simRunner) stepCheck(i int) {
 	d, ok := r.committedDigest()
 	if !ok || d != r.lastDigest {
@@ -789,7 +845,7 @@ func (r *simRunner) stepCheck(i int) {
 		r.fail(i, "live integrity: %v", err)
 		return
 	}
-	image := append([]byte(nil), r.disk.cache...)
+	image := r.mainImage()
 	live, pages, free, err := simIntegrity(image, r.version)
 	if err != nil {
 		r.fail(i, "integrity: %v", err)
@@ -819,7 +875,7 @@ func (r *simRunner) stepReopen(i int) bool {
 		r.fail(i, "close: %v", err)
 		return false
 	}
-	r.disk.processDeath()
+	r.fs.processDeath()
 	if err := r.open(); err != nil {
 		r.fail(i, "reopen failed: %v", err)
 		return false
@@ -840,8 +896,8 @@ func (r *simRunner) stepReopen(i int) bool {
 func (r *simRunner) recover(i int, fired string) bool {
 	r.sessions = map[string]*simSession{}
 	r.db = nil
-	r.disk.processDeath()
-	image := append([]byte(nil), r.disk.cache...)
+	r.fs.processDeath()
+	image := r.mainImage()
 	if r.imagePrefix != "" {
 		_ = os.WriteFile(fmt.Sprintf("%s.step%d.img", r.imagePrefix, i), image, 0o644)
 	}

@@ -53,6 +53,7 @@ package jed
 
 import (
 	"math"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -546,6 +547,30 @@ type storage struct {
 	// files is the file host a file-backed domain's compaction goes through (filehost.go); nil is the
 	// OS. Only the deterministic simulator sets another.
 	files fileHost
+	// dirSynced is whether this handle has made the file's directory entry durable (syncDirectoryOnce).
+	dirSynced bool
+}
+
+// syncDirectoryOnce makes the database file's directory durable before the first durable commit after
+// open (validated-cow.md §3). A process that crashed between a compaction's or create's rename and its
+// directory sync leaves the new file in place but its directory entry unsynced; a later power loss could
+// revert the rename and bring back the older file, losing every commit made since. Syncing a file never
+// makes its directory entry durable, so the first writer does it once. Best effort, like every
+// directory sync, and skipped under fsync=off.
+func (st *storage) syncDirectoryOnce() {
+	if st.dirSynced || st.path == "" {
+		return
+	}
+	st.dirSynced = true
+	var noSync bool
+	_ = st.paging.withPager(func(p *pager) error { noSync = p.skipsSync(); return nil })
+	if noSync {
+		return
+	}
+	files := st.fileHost()
+	if real, err := files.realPath(st.path); err == nil {
+		files.syncDir(filepath.Dir(real))
+	}
 }
 
 // fileHost is the file host this domain's file operations go through.
@@ -692,6 +717,7 @@ func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator, bu
 	if err != nil {
 		return err
 	}
+	st.syncDirectoryOnce()
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.beginValidatedCommit(); err != nil {
 			return err
@@ -780,6 +806,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 // commit publishes — memory.md §8.7) and syncs once. Caller holds st.mu and has
 // checked writer admission before assigning dirty-node page ids.
 func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveCount, canReclaim, canReuse bool) error {
+	st.syncDirectoryOnce()
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.beginValidatedCommit(); err != nil {
 			return err
@@ -1049,6 +1076,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	st.budget.lastCatRoot = 0
 	st.budget.lastWritten = nil
 	st.budget.lastCatalogPages = 0
+	st.dirSynced = true // compaction's own directory barrier made the new entry durable
 	return loaded.committed, nil
 }
 

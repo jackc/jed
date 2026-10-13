@@ -22,6 +22,9 @@ type engine struct {
 	// session, whose publish consumes and clears it so it persists only changed domains.
 	commitChanges struct{ main, attached bool }
 	committed     *snapshot
+	// dirSynced is whether this single handle has made its file's directory entry durable; the first
+	// durable commit after open does it once (storage.syncDirectoryOnce, validated-cow.md §3).
+	dirSynced bool
 	// explainActual is non-nil only while EXPLAIN ANALYZE executes its inner statement. Execution
 	// records exact operator sub-meter snapshots here; ordinary statements pay only this nil check.
 	explainActual *actualCostProfile

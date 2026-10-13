@@ -213,8 +213,11 @@ func (db *engine) persist(snap *snapshot) error {
 	st := storage{
 		pageSize: db.pageSize, pageCount: db.pageCount, freePages: db.freePages,
 		paging: db.paging, liveAtCompaction: db.liveAtCompaction, freeGenTxid: db.freeGenTxid,
+		path: db.path, dirSynced: db.dirSynced,
 	}
-	if err := st.commitFile(snap, write, live, db.openStreams == 0, true); err != nil {
+	err = st.commitFile(snap, write, live, db.openStreams == 0, true)
+	db.dirSynced = st.dirSynced
+	if err != nil {
 		return err
 	}
 	db.pageCount, db.freePages = st.pageCount, st.freePages

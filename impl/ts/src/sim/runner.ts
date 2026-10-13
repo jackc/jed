@@ -7,8 +7,11 @@ import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { EngineError } from "../errors.ts";
+import { EngineError, engineError } from "../errors.ts";
 import { Snapshot } from "../executor.ts";
+// The Node file host registers the file compactor and the directory barrier the engine reaches
+// through Engine.fileHost (here the simulated filesystem).
+import "../file.ts";
 import { loadEnginePaged, toImage } from "../format.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
@@ -17,7 +20,7 @@ import { seededRandomSource } from "../seam.ts";
 import { Database, type Session } from "../shared.ts";
 import { FileSpillSink } from "../spillfile.ts";
 import { CheckError, checkImage, checkLive as checkLiveDatabase } from "./check.ts";
-import { LANE_SESSION, SimDisk, type SimFault } from "./disk.ts";
+import { LANE_SESSION, MAIN_FILE, SimFS, type SimFault } from "./disk.ts";
 import {
   atoi,
   compareUtf8,
@@ -34,7 +37,6 @@ import {
 } from "./util.ts";
 
 const SECTOR_DEFAULT = 64;
-const DISK_PATH = "sim.jed"; // marks the engine durable; the simulated disk is its only storage
 
 // --- trace parsing ------------------------------------------------------------------------------
 
@@ -103,6 +105,7 @@ export function parseTrace(text: string): SimTrace {
         break;
       case "check":
       case "reopen":
+      case "compact":
         break;
       default:
         throw new Error(`line ${n + 1}: unknown step ${JSON.stringify(st.kind)}`);
@@ -124,9 +127,19 @@ function faultOf(st: SimStep): SimFault {
   const f: SimFault = { kind: "power_loss", survive: 0, tear: 0, issue: 0, p: 0, nth: 0 };
   switch (st.mode) {
     case "power_loss":
-      return { ...f, survive: intParam(st, "survive"), tear: intParam(st, "tear") };
+      return {
+        ...f,
+        survive: intParam(st, "survive"),
+        tear: intParam(st, "tear"),
+        nth: intParam(st, "nth"),
+      };
     case "process_crash":
-      return { ...f, kind: "process_crash", issue: intParam(st, "issue") };
+      return {
+        ...f,
+        kind: "process_crash",
+        issue: intParam(st, "issue"),
+        nth: intParam(st, "nth"),
+      };
     case "io_error":
       if (st.params.get("op") === "write") return { ...f, kind: "io_write", p: intParam(st, "p") };
       if (st.params.get("op") === "sync")
@@ -185,7 +198,7 @@ export function runTrace(name: string, text: string, out: string, writeImages: b
   const transcript = first.transcript.join("");
   res.steps = tr.steps.length;
   res.transcriptHash = fnvStringHex(transcript);
-  res.opsHash = first.disk.opsHex();
+  res.opsHash = first.fs.opsHex();
   writeFileSync(join(out, name + ".ts.jsonl"), transcript);
   if (first.violation !== "") {
     res.violation = first.violation;
@@ -206,7 +219,7 @@ export function runTrace(name: string, text: string, out: string, writeImages: b
   } else if (transcript2 !== transcript) {
     res.violation =
       "nondeterministic: transcripts differ between two runs" + firstDiff(transcript, transcript2);
-  } else if (second.disk.opsHex() !== first.disk.opsHex()) {
+  } else if (second.fs.opsHex() !== first.fs.opsHex()) {
     res.violation = "nondeterministic: storage operation logs differ between two runs";
   }
   return res;
@@ -263,7 +276,7 @@ export class SimRunner {
   private maxStorageBytes: bigint; // the database's max_storage_bytes
   private spillDir: string; // the real scratch directory spill files go to; not durable state
 
-  disk: SimDisk;
+  fs: SimFS;
   private db: Database | null = null;
   private sessions = new Map<string, SimSession>();
   private armed: SimFault | null = null;
@@ -301,7 +314,7 @@ export class SimRunner {
     let sector = atoi(tr.header.get("sector"));
     if (sector <= 0) sector = SECTOR_DEFAULT;
     const image = toImage(new Snapshot(1n), ps, 1n);
-    this.disk = new SimDisk(this.seed, sector, image);
+    this.fs = new SimFS(this.seed, sector, image);
   }
 
   private fail(step: number, msg: string): void {
@@ -322,10 +335,13 @@ export class SimRunner {
   // open opens a Database over the simulated disk through the ordinary demand-paged loader — the
   // path a reopening process takes, including validated-COW recovery (validated-cow.md §1).
   private open(): void {
-    const pager = Pager.fromStore(this.disk);
+    const main = this.fs.main();
+    if (main === undefined) throw engineError("io_error", "the database file is gone");
+    const pager = Pager.fromStore(main);
     const cache = this.cacheBytes > 0 ? this.cacheBytes : DEFAULT_CACHE_BYTES;
     const e = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cache, pager.pageSize)));
-    e.path = DISK_PATH;
+    e.path = MAIN_FILE; // marks the engine durable; the simulated filesystem is its only storage
+    e.fileHost = this.fs; // compaction's temp file, rename, and directory barrier
     e.persistHook = persistImpl;
     e.spillSink = this.spillDir !== "" ? new FileSpillSink(this.spillDir) : null;
     this.db = Database.fromEngine(e, null, null);
@@ -352,6 +368,11 @@ export class SimRunner {
     for (let i = 0; i < this.tr.steps.length; i++) {
       if (!this.step(i) || this.violation !== "") return;
     }
+  }
+
+  // mainImage copies the database file's cache — what a new process would open — or null if gone.
+  private mainImage(): Uint8Array | null {
+    return this.fs.main()?.cache.slice() ?? null;
   }
 
   private addHistory(v: bigint, d: string): void {
@@ -394,9 +415,9 @@ export class SimRunner {
         return true;
       }
       case "crash":
-        this.disk.beginStep(i, null);
+        this.fs.beginStep(i, null);
         if (st.mode === "power") {
-          this.disk.powerLoss(i, intParam(st, "survive"), intParam(st, "tear"));
+          this.fs.powerLoss(i, intParam(st, "survive"), intParam(st, "tear"));
         }
         return this.recover(i, "none");
       case "clock":
@@ -408,7 +429,7 @@ export class SimRunner {
     const armed = this.armed;
     this.armed = null;
     const startVersion = this.version;
-    this.disk.beginStep(i, armed);
+    this.fs.beginStep(i, armed);
     switch (st.kind) {
       case "open":
         this.stepOpen(i, st);
@@ -426,6 +447,9 @@ export class SimRunner {
       case "check":
         this.stepCheck(i);
         break;
+      case "compact":
+        this.stepCompact(i);
+        break;
       case "reopen":
         if (!this.stepReopen(i)) return false;
         break;
@@ -433,11 +457,11 @@ export class SimRunner {
     if (this.violation !== "") return false;
     // A completed barrier made every earlier write durable: the generation published when the step
     // began can no longer be lost (§8.2).
-    if (this.disk.barrierOK && startVersion > this.floor) this.floor = startVersion;
+    if (this.fs.barrierOK && startVersion > this.floor) this.floor = startVersion;
     if (armed === null) return true;
     // Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
-    const fired = this.disk.fired === "" ? "end" : this.disk.fired;
-    if (armed.kind === "power_loss") this.disk.powerLoss(i, armed.survive, armed.tear);
+    const fired = this.fs.fired === "" ? "end" : this.fs.fired;
+    if (armed.kind === "power_loss") this.fs.powerLoss(i, armed.survive, armed.tear);
     return this.recover(i, fired);
   }
 
@@ -498,7 +522,7 @@ export class SimRunner {
   // rendered and sorted, folded with FNV-1a. null if any query failed (an aborted block).
   private digest(s: Session): string | null {
     // An armed read fault targets the trace's statements, not the oracle checking them.
-    this.disk.oracle = true;
+    this.fs.oracle = true;
     // The oracle's own reads must not trip a trace session's memory limit.
     const limit = s.maxQueryMemoryBytes;
     if (limit > 0n) s.setMaxQueryMemoryBytes(0n);
@@ -506,17 +530,17 @@ export class SimRunner {
       return this.digestReads(s);
     } finally {
       if (limit > 0n) s.setMaxQueryMemoryBytes(limit);
-      this.disk.oracle = false;
+      this.fs.oracle = false;
     }
   }
 
   // checkLive runs the live integrity checker with read faults suspended, like every oracle read.
   private checkLive(): void {
-    this.disk.oracle = true;
+    this.fs.oracle = true;
     try {
       checkLiveDatabase(this.database);
     } finally {
-      this.disk.oracle = false;
+      this.fs.oracle = false;
     }
   }
 
@@ -608,7 +632,7 @@ export class SimRunner {
         return;
       }
       // The commit reached storage, so a crash may still recover its generation (§8.1).
-      if (inflight !== null && this.disk.writes > 0) {
+      if (inflight !== null && this.fs.writes > 0) {
         this.addHistory(base + 1n, inflight);
         if (base + 1n > this.maxAttempted) this.maxAttempted = base + 1n;
       }
@@ -679,6 +703,52 @@ export class SimRunner {
     this.emit(`{"i":${i},"op":${goQuote(st.kind)},"sid":${goQuote(st.sid)}}`);
   }
 
+  // stepCompact runs host compaction (api.md §2.6): the committed snapshot rewritten as a fresh image
+  // at the next version, through the simulated filesystem's temp file, rename, and directory barrier.
+  // Its contents are unchanged, so a crash may recover either version with the same digest.
+  private stepCompact(i: number): void {
+    const base = this.version;
+    this.addHistory(base + 1n, this.lastDigest);
+    if (base + 1n > this.maxAttempted) this.maxAttempted = base + 1n;
+    let err: unknown = null;
+    try {
+      this.database.compact("main");
+    } catch (e) {
+      err = e;
+    }
+    const now = this.database.version;
+    if (err !== null) {
+      const code = errCode(err);
+      if (code.startsWith("non-engine")) {
+        this.fail(i, code);
+        return;
+      }
+      this.emit(`{"i":${i},"op":"compact","error":${goQuote(code)}}`);
+      if (code === "XX001") this.fail(i, "corruption: compaction reported XX001: " + errText(err));
+      else if (now !== base)
+        this.fail(i, `a failed compaction published version ${now} (was ${base})`);
+      return;
+    }
+    this.emit(`{"i":${i},"op":"compact","version":${now}}`);
+    if (now !== base + 1n) {
+      this.fail(i, `compaction moved version ${base} to ${now}`);
+      return;
+    }
+    const d = this.committedDigest();
+    if (d === null || d !== this.lastDigest) {
+      this.fail(i, "compaction changed the database's contents");
+      return;
+    }
+    try {
+      this.checkLive();
+    } catch (e) {
+      this.fail(i, "after compaction: " + errText(e));
+      return;
+    }
+    this.version = now;
+    this.floor = now; // the rename and the directory barrier completed
+  }
+
   private stepCheck(i: number): void {
     const d = this.committedDigest();
     if (d === null || d !== this.lastDigest) {
@@ -691,10 +761,10 @@ export class SimRunner {
       this.fail(i, "live integrity: " + errText(e));
       return;
     }
-    const image = this.disk.cache.slice();
+    const image = this.mainImage();
     let counts: [number, number, number];
     try {
-      counts = checkImage(image, this.version);
+      counts = checkImage(image ?? new Uint8Array(), this.version);
     } catch (e) {
       this.fail(i, "integrity: " + errText(e));
       return;
@@ -702,7 +772,7 @@ export class SimRunner {
     const [live, pages, free] = counts;
     this.emit(
       `{"i":${i},"op":"check","version":${this.version},"digest":${goQuote(d)},"live":${live},` +
-        `"pages":${pages},"free":${free},"image":"${imageHash(image, pages, this.pageSize)}"}`,
+        `"pages":${pages},"free":${free},"image":"${imageHash(image!, pages, this.pageSize)}"}`,
     );
   }
 
@@ -727,7 +797,7 @@ export class SimRunner {
       this.fail(i, "close: " + errText(e));
       return false;
     }
-    this.disk.processDeath();
+    this.fs.processDeath();
     try {
       this.open();
     } catch (e) {
@@ -753,9 +823,10 @@ export class SimRunner {
   private recover(i: number, fired: string): boolean {
     this.sessions = new Map();
     this.db = null;
-    this.disk.processDeath();
-    const image = this.disk.cache.slice();
-    if (this.imagePrefix !== "") writeFileSync(`${this.imagePrefix}.step${i}.img`, image);
+    this.fs.processDeath();
+    const image = this.mainImage();
+    if (this.imagePrefix !== "")
+      writeFileSync(`${this.imagePrefix}.step${i}.img`, image ?? new Uint8Array());
     try {
       this.open();
     } catch (e) {
@@ -784,7 +855,7 @@ export class SimRunner {
     if (this.violation !== "") return false;
     let counts: [number, number, number];
     try {
-      counts = checkImage(image, v);
+      counts = checkImage(image ?? new Uint8Array(), v);
     } catch (e) {
       this.crashImage = image;
       this.fail(i, "recovery integrity: " + errText(e));
@@ -795,7 +866,7 @@ export class SimRunner {
     this.lastDigest = d!;
     this.emit(
       `{"i":${i},"op":"crash","fired":${goQuote(fired)},"recovered":${v},"digest":${goQuote(d!)},` +
-        `"live":${live},"pages":${pages},"free":${free},"image":"${imageHash(image, pages, this.pageSize)}"}`,
+        `"live":${live},"pages":${pages},"free":${free},"image":"${imageHash(image!, pages, this.pageSize)}"}`,
     );
     return true;
   }

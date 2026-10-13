@@ -545,6 +545,9 @@ pub struct Engine {
     /// that stages none — pure deletes and drops — may exceed `max_storage_bytes` so a full database
     /// can be repaired. Read by the shared core's publish, which persists main after `commit_tx`.
     pub(crate) commit_stages_rows: bool,
+    /// Whether this handle has made the file's directory entry durable — the first durable commit
+    /// after open does it once (validated-cow.md §3; the shared core's `Storage::sync_directory_once`).
+    pub(crate) dir_synced: bool,
     /// The in-memory attachment commits the last `commit_tx` staged (attached-databases.md §5): their
     /// pages are in each attachment's block store, but its page accounting and post-commit compaction
     /// are adopted only after main persists and the roots publish. Taken by the shared core's publish;

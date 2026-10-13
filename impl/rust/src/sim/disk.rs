@@ -1,12 +1,14 @@
-//! The deterministic-simulation disk (spec/design/simulation-testing.md §6): a `BlockStore` whose
-//! durability, crashes, and I/O errors are decided by a seeded, content-keyed function, so a whole
-//! multi-commit history replays exactly from its seed and a crash image is identical in every core.
-//! A line-for-line port of the Go reference (`impl/go/sim_disk_test.go`).
+//! The deterministic-simulation filesystem (spec/design/simulation-testing.md §6, slice S4): named
+//! files, each a simulated disk, and a directory whose entries become durable only at a directory
+//! barrier. Durability, crashes, and I/O errors are decided by a seeded, content-keyed function, so a
+//! whole multi-commit history replays exactly from its seed and a crash image is identical in every
+//! core. A line-for-line port of the Go reference (`impl/go/sim_disk_test.go`).
 //!
-//! State (§6.1): `durable` bytes survive a power loss unconditionally; `pending` holds, per byte
-//! offset, every version written since that offset was last covered by a barrier; `cache` is what
-//! reads see (durable overlaid with the newest pending version). `sync` and a growing `set_size` are
-//! barriers.
+//! A file's state (§6.1): `durable` bytes survive a power loss unconditionally; `pending` holds, per
+//! byte offset, every version written since that offset was last covered by a barrier; `cache` is
+//! what reads see (durable overlaid with the newest pending version). `sync` and a growing
+//! `set_size` are barriers. The filesystem implements the engine's [`FileHost`], so compaction's
+//! temp file, rename, and directory barrier go through it too.
 //!
 //! Every fault decision is [`decide`]`(seed, lane, step, offset, version)` (§6.2): keyed by WHAT was
 //! written WHERE, never by a write's position in the op log, so cores whose write order differs
@@ -14,7 +16,9 @@
 
 use crate::blockstore::BlockStore;
 use crate::error::{EngineError, Result, SqlState};
-use std::collections::BTreeMap;
+use crate::filehost::{FileHost, WriteAt};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // Decision lanes keep independent choices from correlating (§6.2). The values are part of the
@@ -28,6 +32,7 @@ const LANE_ISSUE: u64 = 6; // process_crash: was this write issued before the pr
 const LANE_LAND: u64 = 7; // io_error op=sync: does this pending write land or vanish (fsyncgate)?
 pub(crate) const LANE_SESSION: u64 = 8; // a session's entropy-seam seed
 const LANE_READ: u64 = 9; // read_error: do reads of this offset fail during the step?
+const LANE_DIR: u64 = 10; // power loss: how many pending directory changes survive (% changes+1)
 
 const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -84,7 +89,8 @@ pub(crate) struct Fault {
     pub(crate) tear: i64,    // power_loss
     pub(crate) issue: i64,   // process_crash
     pub(crate) p: i64,       // io_error op=write, read_error
-    pub(crate) nth: i64,     // io_error op=sync
+    /// power_loss/process_crash: the barrier it fires at (default 1); io_error op=sync: the sync
+    pub(crate) nth: i64,
 }
 
 impl Fault {
@@ -106,14 +112,74 @@ fn permille(p: i64) -> u64 {
     p as u64
 }
 
-/// The simulated device. It outlives every Database opened over it: a crash discards the process
-/// (the Database) but keeps the disk, as a real file would.
-pub(crate) struct SimDisk {
+/// The database file's name in the simulated filesystem — the path the engine is given.
+pub(crate) const MAIN_FILE: &str = "sim.jed";
+
+/// Keeps two files' fault decisions independent (§6.2): the database file's key is 0, so its
+/// decisions are unchanged by the existence of other files; another file's is its name's FNV-1a 32
+/// plus one, shifted above any offset (wrapping, as the Go reference's `uint64` arithmetic does).
+fn file_key(name: &str) -> u64 {
+    if name == MAIN_FILE {
+        return 0;
+    }
+    let mut h: u32 = 2166136261;
+    for b in name.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    (h as u64).wrapping_add(1) << 40
+}
+
+/// One simulated file. Files live in the filesystem's arena and are named by their index there, so
+/// a file keeps its identity across renames and stays reachable from a pending directory change.
+struct SimFile {
+    /// Folded into fault decisions' offsets; 0 for the database file.
+    key: u64,
+    durable: Vec<u8>,
+    cache: Vec<u8>,
+    pending: BTreeMap<u64, Vec<Vec<u8>>>,
+    /// The writes an armed process_crash decided never reached the kernel; process death removes them.
+    unissued: Vec<(u64, usize)>,
+}
+
+/// One directory change: create a file, rename one over another, or remove one.
+#[derive(Clone)]
+struct DirOp {
+    kind: u8, // b'c' create, b'r' rename, b'd' remove
+    from: String,
+    to: String,
+    file: usize,
+}
+
+fn apply_dir_op(dir: &mut BTreeMap<String, usize>, op: &DirOp) {
+    match op.kind {
+        b'c' => {
+            dir.insert(op.to.clone(), op.file);
+        }
+        b'r' => {
+            dir.insert(op.to.clone(), op.file);
+            dir.remove(&op.from);
+        }
+        _ => {
+            dir.remove(&op.from);
+        }
+    }
+}
+
+/// The simulated filesystem. It outlives every Database opened over it: a crash discards the
+/// process but keeps the disk, as a real filesystem would. The per-step fault state lives here,
+/// because a fault arms a step, not a file.
+pub(crate) struct SimFs {
     seed: u64,
     sector: usize,
-    durable: Vec<u8>,
-    pub(crate) cache: Vec<u8>,
-    pending: BTreeMap<u64, Vec<Vec<u8>>>,
+
+    arena: Vec<SimFile>,
+    /// The kernel's view of the directory.
+    files: BTreeMap<String, usize>,
+    /// The directory as of the last directory barrier.
+    durable: BTreeMap<String, usize>,
+    /// Directory changes since that barrier, in order.
+    dir_ops: Vec<DirOp>,
 
     // Per-step state, reset by begin_step.
     step: u64,
@@ -122,43 +188,73 @@ pub(crate) struct SimDisk {
     pub(crate) fired: &'static str,
     /// The process died mid-step; every later call fails.
     dead: bool,
+    /// File syncs this step (io_error op=sync nth).
     syncs: i64,
+    /// File and directory barriers this step (power_loss/process_crash nth).
+    barriers: i64,
     pub(crate) writes: usize,
-    /// A barrier completed this step.
+    /// The database file's barrier completed this step, its directory entry durable.
     pub(crate) barrier_ok: bool,
     /// The runner's own oracle reads are in progress: read faults do not apply.
     pub(crate) oracle: bool,
 
     /// FNV-1a fold of every mutating call, for the self-determinism check (§8.5).
     pub(crate) ops: u64,
-
-    /// The writes an armed process_crash decided never reached the kernel; process_death removes them.
-    unissued: Vec<(u64, usize)>,
 }
 
 fn injected(what: &str) -> EngineError {
     EngineError::new(SqlState::IoError, format!("I/O error: simulated {what}"))
 }
 
-impl SimDisk {
-    pub(crate) fn new(seed: u64, sector: usize, image: &[u8]) -> SimDisk {
-        SimDisk {
+impl SimFs {
+    pub(crate) fn new(seed: u64, sector: usize, image: &[u8]) -> SimFs {
+        let mut fs = SimFs {
             seed,
             sector,
-            durable: image.to_vec(),
-            cache: image.to_vec(),
-            pending: BTreeMap::new(),
+            arena: Vec::new(),
+            files: BTreeMap::new(),
+            durable: BTreeMap::new(),
+            dir_ops: Vec::new(),
             step: 0,
             fault: None,
             fired: "",
             dead: false,
             syncs: 0,
+            barriers: 0,
             writes: 0,
             barrier_ok: false,
             oracle: false,
             ops: FNV_OFFSET,
+        };
+        let main = fs.new_file(MAIN_FILE);
+        fs.arena[main].durable = image.to_vec();
+        fs.arena[main].cache = image.to_vec();
+        fs.files.insert(MAIN_FILE.to_string(), main);
+        fs.durable.insert(MAIN_FILE.to_string(), main);
+        fs
+    }
+
+    fn new_file(&mut self, name: &str) -> usize {
+        self.arena.push(SimFile {
+            key: file_key(name),
+            durable: Vec::new(),
+            cache: Vec::new(),
+            pending: BTreeMap::new(),
             unissued: Vec::new(),
-        }
+        });
+        self.arena.len() - 1
+    }
+
+    /// The database file, or `None` if a crash lost it.
+    pub(crate) fn main(&self) -> Option<usize> {
+        self.files.get(MAIN_FILE).copied()
+    }
+
+    /// A copy of the database file's cache — what a new process would open — or empty if it is gone.
+    pub(crate) fn main_image(&self) -> Vec<u8> {
+        self.main()
+            .map(|id| self.arena[id].cache.clone())
+            .unwrap_or_default()
     }
 
     /// Reset the per-step state and arm `f` (`None` for an unfaulted step).
@@ -168,34 +264,88 @@ impl SimDisk {
         self.fired = "";
         self.dead = false;
         self.syncs = 0;
+        self.barriers = 0;
         self.writes = 0;
         self.barrier_ok = false;
-        self.unissued.clear();
+        for id in self.all_files() {
+            self.arena[id].unissued.clear();
+        }
     }
 
-    fn fold(&mut self, kind: u8, off: u64, p: &[u8]) {
-        let mut buf = [0u8; 17];
+    /// Every file the directory, its durable state, or a pending change refers to, each once, in a
+    /// deterministic order: the directory by name, then its durable state by name, then the changes.
+    fn all_files(&self) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let ids = self
+            .files
+            .values()
+            .chain(self.durable.values())
+            .copied()
+            .chain(self.dir_ops.iter().map(|op| op.file));
+        for id in ids {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    fn fold(&mut self, kind: u8, key: u64, off: u64, p: &[u8]) {
+        let mut buf = [0u8; 25];
         buf[0..8].copy_from_slice(&self.ops.to_be_bytes());
         buf[8] = kind;
-        buf[9..17].copy_from_slice(&off.to_be_bytes());
+        buf[9..17].copy_from_slice(&key.to_be_bytes());
+        buf[17..25].copy_from_slice(&off.to_be_bytes());
         let h = fnv_fold(FNV_OFFSET, &buf);
         self.ops = fnv_fold(h, p);
     }
 
-    fn read_at(&mut self, off: u64, len: usize) -> Result<Vec<u8>> {
+    /// Count one file or directory barrier and report whether an armed power loss or process crash
+    /// fires at it: the barrier never completes, because the machine or process is gone.
+    fn barrier(&mut self) -> bool {
+        self.barriers += 1;
+        let Some(f) = self.fault else {
+            return false;
+        };
+        if !self.fired.is_empty()
+            || (f.kind != FaultKind::PowerLoss && f.kind != FaultKind::ProcessCrash)
+        {
+            return false;
+        }
+        let nth = if f.nth <= 0 { 1 } else { f.nth };
+        if self.barriers != nth {
+            return false;
+        }
+        self.fired = "barrier";
+        self.dead = true;
+        true
+    }
+
+    fn decide_at(&self, id: usize, lane: u64, step: u64, off: u64, version: u64) -> u64 {
+        decide(
+            self.seed,
+            lane,
+            step,
+            off.wrapping_add(self.arena[id].key),
+            version,
+        )
+    }
+
+    fn read_at(&mut self, id: usize, off: u64, len: usize) -> Result<Vec<u8>> {
         if let Some(f) = self.fault
             && f.kind == FaultKind::ReadError
             && !self.dead
             && !self.oracle
-            && decide(self.seed, LANE_READ, self.step, off, 0) % 1000 < permille(f.p)
+            && self.decide_at(id, LANE_READ, self.step, off, 0) % 1000 < permille(f.p)
         {
             self.fired = "read";
             return Err(injected("read error"));
         }
-        let end = off.checked_add(len as u64);
-        match end {
-            Some(end) if end <= self.cache.len() as u64 => {
-                Ok(self.cache[off as usize..end as usize].to_vec())
+        let cache = &self.arena[id].cache;
+        match off.checked_add(len as u64) {
+            Some(end) if end <= cache.len() as u64 => {
+                Ok(cache[off as usize..end as usize].to_vec())
             }
             _ => Err(EngineError::new(
                 SqlState::IoError,
@@ -204,26 +354,27 @@ impl SimDisk {
         }
     }
 
-    fn write_at(&mut self, off: u64, p: &[u8]) -> Result<()> {
-        self.fold(b'w', off, p);
+    fn write_at(&mut self, id: usize, off: u64, p: &[u8]) -> Result<()> {
+        let key = self.arena[id].key;
+        self.fold(b'w', key, off, p);
         if self.dead {
             return Err(injected("write after process death"));
         }
-        let version = self.pending.get(&off).map_or(0, |vs| vs.len()) as u64;
+        let version = self.arena[id].pending.get(&off).map_or(0, |vs| vs.len()) as u64;
         if let Some(f) = self.fault {
             match f.kind {
                 FaultKind::ProcessCrash => {
                     // The live process sees all its own writes; only at its death does a write that
                     // was never issued to the kernel disappear (process_death).
-                    if decide(self.seed, LANE_ISSUE, self.step, off, version) % 1000
+                    if self.decide_at(id, LANE_ISSUE, self.step, off, version) % 1000
                         >= permille(f.issue)
                     {
-                        self.unissued.push((off, version as usize));
+                        self.arena[id].unissued.push((off, version as usize));
                     }
                 }
                 FaultKind::IoWrite => {
                     if self.fired.is_empty()
-                        && decide(self.seed, LANE_IO_WRITE, self.step, off, version) % 1000
+                        && self.decide_at(id, LANE_IO_WRITE, self.step, off, version) % 1000
                             < permille(f.p)
                     {
                         self.fired = "write";
@@ -234,82 +385,81 @@ impl SimDisk {
             }
         }
         self.writes += 1;
-        let off_u = off as usize;
-        let end = off_u + p.len();
-        if end > self.cache.len() {
-            self.cache.resize(end, 0);
+        let file = &mut self.arena[id];
+        let start = off as usize;
+        let end = start + p.len();
+        if end > file.cache.len() {
+            file.cache.resize(end, 0);
         }
-        self.cache[off_u..end].copy_from_slice(p);
-        self.pending.entry(off).or_default().push(p.to_vec());
+        file.cache[start..end].copy_from_slice(p);
+        file.pending.entry(off).or_default().push(p.to_vec());
         Ok(())
     }
 
-    fn put_durable(&mut self, off: u64, p: &[u8]) {
-        let off = off as usize;
-        let end = off + p.len();
-        if end > self.durable.len() {
-            self.durable.resize(end, 0);
-        }
-        self.durable[off..end].copy_from_slice(p);
-    }
-
-    /// Make every pending write durable: a successful barrier.
-    fn flush(&mut self) {
-        let pending = std::mem::take(&mut self.pending);
+    /// Make every pending write of file `id` durable: a successful barrier.
+    fn flush(&mut self, id: usize) {
+        let file = &mut self.arena[id];
+        let pending = std::mem::take(&mut file.pending);
         for (off, vs) in &pending {
-            self.put_durable(*off, vs.last().expect("a pending offset holds a version"));
+            put_durable(
+                &mut file.durable,
+                *off,
+                vs.last().expect("a pending offset holds a version"),
+            );
         }
-        if self.durable.len() < self.cache.len() {
-            self.durable.resize(self.cache.len(), 0);
+        if file.durable.len() < file.cache.len() {
+            let n = file.cache.len();
+            file.durable.resize(n, 0);
         }
-        self.barrier_ok = true;
-        self.unissued.clear(); // reaching a barrier means every earlier write was issued
+        file.unissued.clear(); // reaching a barrier means every earlier write was issued
+        // Only the database file's own barrier, with its directory entry durable, makes the
+        // generation it holds durable (the floor, §8.2); a compaction's temp file syncing proves
+        // nothing about it.
+        if self.main() == Some(id) && self.dir_ops.is_empty() {
+            self.barrier_ok = true;
+        }
     }
 
-    fn sync(&mut self) -> Result<()> {
-        self.fold(b's', 0, &[]);
+    fn sync(&mut self, id: usize) -> Result<()> {
+        let key = self.arena[id].key;
+        self.fold(b's', key, 0, &[]);
         if self.dead {
             return Err(injected("sync after process death"));
         }
         self.syncs += 1;
-        if let Some(f) = self.fault
-            && self.fired.is_empty()
-        {
-            match f.kind {
-                FaultKind::PowerLoss | FaultKind::ProcessCrash => {
-                    // The barrier never completes: the machine or process is gone.
-                    self.fired = "barrier";
-                    self.dead = true;
-                    return Err(injected("crash at a durability barrier"));
-                }
-                FaultKind::IoSync => {
-                    if self.syncs == f.nth {
-                        self.fired = "sync";
-                        self.fsyncgate();
-                        return Err(injected("sync error"));
-                    }
-                }
-                _ => {}
-            }
+        if self.barrier() {
+            return Err(injected("crash at a durability barrier"));
         }
-        self.flush();
+        if let Some(f) = self.fault
+            && f.kind == FaultKind::IoSync
+            && self.fired.is_empty()
+            && self.syncs == f.nth
+        {
+            self.fired = "sync";
+            self.fsyncgate(id);
+            return Err(injected("sync error"));
+        }
+        self.flush(id);
         Ok(())
     }
 
     /// A failed fsync on Linux: each pending write independently became durable or was dropped from
     /// the cache, and the error is reported once (§6.3).
-    fn fsyncgate(&mut self) {
-        let pending = std::mem::take(&mut self.pending);
+    fn fsyncgate(&mut self, id: usize) {
+        let pending = std::mem::take(&mut self.arena[id].pending);
         for (off, vs) in &pending {
             let newest = vs.last().expect("a pending offset holds a version");
-            if decide(self.seed, LANE_LAND, self.step, *off, (vs.len() - 1) as u64) % 2 == 0 {
-                self.put_durable(*off, newest);
+            let land =
+                self.decide_at(id, LANE_LAND, self.step, *off, (vs.len() - 1) as u64) % 2 == 0;
+            let file = &mut self.arena[id];
+            if land {
+                put_durable(&mut file.durable, *off, newest);
                 continue;
             }
             let start = *off as usize;
             for i in start..start + newest.len() {
-                self.cache[i] = if i < self.durable.len() {
-                    self.durable[i]
+                file.cache[i] = if i < file.durable.len() {
+                    file.durable[i]
                 } else {
                     0
                 };
@@ -317,18 +467,19 @@ impl SimDisk {
         }
     }
 
-    fn size(&self) -> u64 {
-        self.cache.len() as u64
+    fn size(&self, id: usize) -> u64 {
+        self.arena[id].cache.len() as u64
     }
 
     /// Grow durably (zero blocks + a full fsync, which also flushes every pending write — hosts.md
-    /// §2.1) or truncate. It is never a fault point (simulation-testing.md §6.3).
-    fn set_size(&mut self, n: u64) -> Result<()> {
-        self.fold(b'z', n, &[]);
+    /// §2.1) or truncate. It is never a fault point for a crash (simulation-testing.md §6.3).
+    fn set_size(&mut self, id: usize, n: u64) -> Result<()> {
+        let key = self.arena[id].key;
+        self.fold(b'z', key, n, &[]);
         if self.dead {
             return Err(injected("set_size after process death"));
         }
-        let cur = self.cache.len() as u64;
+        let cur = self.arena[id].cache.len() as u64;
         if let Some(f) = self.fault
             && f.kind == FaultKind::Enospc
             && n > cur
@@ -338,64 +489,92 @@ impl SimDisk {
             return Err(injected("no space left on device"));
         }
         if n > cur {
-            self.cache.resize(n as usize, 0);
-            self.flush();
+            self.arena[id].cache.resize(n as usize, 0);
+            self.flush(id);
         } else if n < cur {
-            self.cache.truncate(n as usize);
-            if self.durable.len() as u64 > n {
-                self.durable.truncate(n as usize);
+            let file = &mut self.arena[id];
+            file.cache.truncate(n as usize);
+            if file.durable.len() as u64 > n {
+                file.durable.truncate(n as usize);
             }
-            self.pending.retain(|off, _| *off < n);
+            file.pending.retain(|off, _| *off < n);
         }
         Ok(())
     }
 
-    /// Replace the device contents with what survives a power cut during `step` (§6.3): for each
+    /// Replace file `id`'s contents with what survives a power cut during `step` (§6.3): for each
     /// pending offset, nothing lands or one pending version (any, not only the newest) lands,
     /// possibly torn sector by sector against the durable bytes. The cache is discarded.
-    pub(crate) fn power_loss(&mut self, step: u64, survive: i64, tear: i64) {
-        let pending = std::mem::take(&mut self.pending);
+    fn file_power_loss(&mut self, id: usize, step: u64, survive: i64, tear: i64) {
+        let sector = self.sector;
+        let pending = std::mem::take(&mut self.arena[id].pending);
         for (off, vs) in &pending {
             let off = *off;
-            if decide(self.seed, LANE_SURVIVE, step, off, 0) % 1000 >= permille(survive) {
+            if self.decide_at(id, LANE_SURVIVE, step, off, 0) % 1000 >= permille(survive) {
                 continue;
             }
-            let idx = decide(self.seed, LANE_VERSION, step, off, 0) % vs.len() as u64;
+            let idx = self.decide_at(id, LANE_VERSION, step, off, 0) % vs.len() as u64;
             let mut data = vs[idx as usize].clone();
-            if decide(self.seed, LANE_TEAR, step, off, idx) % 1000 < permille(tear) {
+            if self.decide_at(id, LANE_TEAR, step, off, idx) % 1000 < permille(tear) {
                 let mut s = 0usize;
                 while s < data.len() {
-                    if decide(self.seed, LANE_SECTOR, step, off + s as u64, idx) & 1 == 1 {
-                        s += self.sector;
-                        continue; // this sector took the new bytes
+                    let new_bytes =
+                        self.decide_at(id, LANE_SECTOR, step, off.wrapping_add(s as u64), idx) & 1
+                            == 1;
+                    if !new_bytes {
+                        let durable = &self.arena[id].durable;
+                        let mut i = s;
+                        while i < s + sector && i < data.len() {
+                            let at = off as usize + i;
+                            data[i] = if at < durable.len() { durable[at] } else { 0 };
+                            i += 1;
+                        }
                     }
-                    let mut i = s;
-                    while i < s + self.sector && i < data.len() {
-                        let at = off as usize + i;
-                        data[i] = if at < self.durable.len() {
-                            self.durable[at]
-                        } else {
-                            0
-                        };
-                        i += 1;
-                    }
-                    s += self.sector;
+                    s += sector;
                 }
             }
-            self.put_durable(off, &data);
+            put_durable(&mut self.arena[id].durable, off, &data);
         }
-        self.cache = self.durable.clone();
+        let file = &mut self.arena[id];
+        file.cache = file.durable.clone();
     }
 
-    /// End the process: the kernel cache survives with every issued write still pending (not
-    /// durable), so a later power loss can still drop it (§6.3).
+    /// A power cut to the whole filesystem: every file loses what its own decisions say, and the
+    /// directory keeps its durable entries plus an ordered prefix of the pending changes — a
+    /// journaling filesystem applies metadata changes in order (§6.3).
+    pub(crate) fn power_loss(&mut self, step: u64, survive: i64, tear: i64) {
+        for id in self.all_files() {
+            self.file_power_loss(id, step, survive, tear);
+        }
+        let keep =
+            (decide(self.seed, LANE_DIR, step, 0, 0) % (self.dir_ops.len() as u64 + 1)) as usize;
+        let mut dir = self.durable.clone();
+        for op in &self.dir_ops[..keep] {
+            apply_dir_op(&mut dir, op);
+        }
+        self.durable = dir.clone();
+        self.files = dir;
+        self.dir_ops.clear();
+    }
+
+    /// End the process: the kernel cache and directory survive, every issued write still pending
+    /// (not durable), so a later power loss can still drop it (§6.3).
     pub(crate) fn process_death(&mut self) {
+        for id in self.all_files() {
+            self.file_process_death(id);
+        }
+        self.fault = None;
+        self.dead = false;
+    }
+
+    fn file_process_death(&mut self, id: usize) {
         // Undo the never-issued writes, newest first so each version index stays valid. A barrier that
         // completed after such a write already made it durable — the process could not have reached
         // that barrier without issuing it — so only still-pending versions are removed.
-        let unissued = std::mem::take(&mut self.unissued);
+        let file = &mut self.arena[id];
+        let unissued = std::mem::take(&mut file.unissued);
         for &(off, version) in unissued.iter().rev() {
-            let Some(vs) = self.pending.get_mut(&off) else {
+            let Some(vs) = file.pending.get_mut(&off) else {
                 continue;
             };
             if version >= vs.len() {
@@ -405,47 +584,190 @@ impl SimDisk {
             vs.remove(version);
             let newest = vs.last().cloned();
             if vs.is_empty() {
-                self.pending.remove(&off);
+                file.pending.remove(&off);
             }
             for j in 0..size {
                 let at = off as usize + j;
-                self.cache[at] = match &newest {
+                file.cache[at] = match &newest {
                     Some(v) => v[j],
-                    None if at < self.durable.len() => self.durable[at],
+                    None if at < file.durable.len() => file.durable[at],
                     None => 0,
                 };
             }
         }
-        self.fault = None;
-        self.dead = false;
+    }
+
+    // --- the file host operations (crate::filehost), under the filesystem lock ---
+
+    /// Create `name` as a new, empty file (replacing any entry of that name): a pending directory
+    /// change until the next directory barrier.
+    fn create(&mut self, name: &str) -> Result<usize> {
+        if self.dead {
+            return Err(injected("create after process death"));
+        }
+        let id = self.new_file(name);
+        self.files.insert(name.to_string(), id);
+        self.dir_ops.push(DirOp {
+            kind: b'c',
+            from: String::new(),
+            to: name.to_string(),
+            file: id,
+        });
+        let key = self.arena[id].key;
+        self.fold(b'c', key, 0, &[]);
+        Ok(id)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        if self.dead {
+            return Err(injected("rename after process death"));
+        }
+        let Some(id) = self.files.get(from).copied() else {
+            return Err(EngineError::new(
+                SqlState::IoError,
+                format!("I/O error: rename of a missing file {from}"),
+            ));
+        };
+        self.files.insert(to.to_string(), id);
+        self.files.remove(from);
+        self.dir_ops.push(DirOp {
+            kind: b'r',
+            from: from.to_string(),
+            to: to.to_string(),
+            file: id,
+        });
+        let key = self.arena[id].key;
+        self.fold(b'r', key, 0, &[]);
+        Ok(())
+    }
+
+    fn remove(&mut self, name: &str) {
+        if self.dead {
+            return;
+        }
+        if let Some(id) = self.files.remove(name) {
+            self.dir_ops.push(DirOp {
+                kind: b'd',
+                from: name.to_string(),
+                to: String::new(),
+                file: id,
+            });
+            let key = self.arena[id].key;
+            self.fold(b'd', key, 0, &[]);
+        }
+    }
+
+    /// A directory barrier. It is a fault point only when it has something to make durable: one
+    /// with no pending change cannot lose anything, and counting it would shift every later
+    /// barrier's number.
+    fn sync_dir(&mut self) {
+        self.fold(b'D', 0, 0, &[]);
+        if self.dead || self.dir_ops.is_empty() || self.barrier() {
+            return;
+        }
+        self.durable = self.files.clone();
+        self.dir_ops.clear();
+    }
+
+    fn open(&self, name: &str) -> Result<usize> {
+        if self.dead {
+            return Err(injected("open after process death"));
+        }
+        self.files.get(name).copied().ok_or_else(|| {
+            EngineError::new(SqlState::IoError, format!("I/O error: no such file {name}"))
+        })
     }
 }
 
-/// The `BlockStore` handed to the pager: a shared reference to the runner's disk, so the disk
-/// outlives every pager (process) opened over it.
-pub(crate) struct SimStore(pub(crate) Arc<Mutex<SimDisk>>);
-
-impl SimStore {
-    fn disk(&self) -> std::sync::MutexGuard<'_, SimDisk> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+fn put_durable(durable: &mut Vec<u8>, off: u64, p: &[u8]) {
+    let off = off as usize;
+    let end = off + p.len();
+    if end > durable.len() {
+        durable.resize(end, 0);
     }
+    durable[off..end].copy_from_slice(p);
+}
+
+/// The runner's shared handle to the filesystem.
+pub(crate) type SharedFs = Arc<Mutex<SimFs>>;
+
+fn lock(fs: &SharedFs) -> std::sync::MutexGuard<'_, SimFs> {
+    fs.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The `BlockStore` handed to a pager: one file of the shared filesystem, so the filesystem outlives
+/// every pager (process) opened over it.
+pub(crate) struct SimStore {
+    pub(crate) fs: SharedFs,
+    pub(crate) file: usize,
 }
 
 impl BlockStore for SimStore {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        self.disk().read_at(offset, len)
+        lock(&self.fs).read_at(self.file, offset, len)
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        self.disk().write_at(offset, bytes)
+        lock(&self.fs).write_at(self.file, offset, bytes)
     }
     fn sync(&mut self) -> Result<()> {
-        self.disk().sync()
+        lock(&self.fs).sync(self.file)
     }
     fn size(&mut self) -> Result<u64> {
-        Ok(self.disk().size())
+        Ok(lock(&self.fs).size(self.file))
     }
     fn set_size(&mut self, bytes: u64) -> Result<()> {
-        self.disk().set_size(bytes)
+        lock(&self.fs).set_size(self.file, bytes)
+    }
+}
+
+/// The file host the simulated database's compaction (and first-commit directory barrier) goes
+/// through. Paths are names in the one simulated directory; `real_path` is the identity.
+pub(crate) struct SimHost(pub(crate) SharedFs);
+
+fn name_of(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+impl FileHost for SimHost {
+    fn real_path(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path.to_path_buf())
+    }
+
+    fn write_file(
+        &self,
+        path: &Path,
+        _mode_from: &Path,
+        no_sync: bool,
+        fill: &mut dyn FnMut(&mut WriteAt<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let id = lock(&self.0).create(&name_of(path))?;
+        // The lock is not held across `fill`: it reads the source pages through the database's own
+        // store, which locks the filesystem per call.
+        fill(&mut |offset, bytes| lock(&self.0).write_at(id, offset, bytes))?;
+        if !no_sync {
+            return lock(&self.0).sync(id);
+        }
+        Ok(())
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        lock(&self.0).rename(&name_of(from), &name_of(to))
+    }
+
+    fn remove(&self, path: &Path) {
+        lock(&self.0).remove(&name_of(path));
+    }
+
+    fn sync_dir(&self, _dir: &Path) {
+        lock(&self.0).sync_dir();
+    }
+
+    fn open_store(&self, path: &Path, _no_sync: bool) -> Result<Box<dyn BlockStore>> {
+        let file = lock(&self.0).open(&name_of(path))?;
+        Ok(Box::new(SimStore {
+            fs: self.0.clone(),
+            file,
+        }))
     }
 }
 

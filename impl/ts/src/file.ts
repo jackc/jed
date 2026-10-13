@@ -32,7 +32,7 @@ import type { FileHost, WriteAt } from "./filehost.ts";
 import { loadEnginePaged, ROOT_PAGE, toImage, writeImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
-import { persistImpl } from "./persist.ts";
+import { persistImpl, registerDirectorySync } from "./persist.ts";
 import {
   buildInMemory,
   Database,
@@ -372,6 +372,13 @@ export const osFiles: FileHost = {
 // Register the Node file host as the file compactor (spec/design/api.md §2.6), the same injection as the
 // attach opener above: shared.ts stays browser-clean and reaches compactFile only through this hook.
 registerFileCompactor(compactFile);
+
+// The directory barrier the first durable commit after open runs (persist.ts syncDirectoryOnce): the
+// file's real directory, through the database's file host (null is the OS).
+registerDirectorySync((host, path) => {
+  const files = host ?? osFiles;
+  files.syncDir(dirname(files.realPath(path)));
+});
 
 function removeQuietly(path: string): void {
   try {

@@ -1713,6 +1713,9 @@ export class Engine {
   // fileHost is the file host a file database's compaction goes through (filehost.ts); null is the
   // OS. Only the deterministic simulator sets another.
   fileHost: FileHost | null;
+  // dirSynced is whether this handle has made the file's directory entry durable (persist.ts
+  // syncDirectoryOnce): false on open, set by the first durable file commit or a compaction.
+  dirSynced: boolean;
   // reclaimWithinSession turns on within-session free-list compaction (persist.ts maybeCompact): the
   // never-reopened in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their
   // copy-on-write orphans are reclaimed rather than leaked. The main file/in-memory domain ALSO sets it
@@ -1820,6 +1823,7 @@ export class Engine {
     this.readOnly = false;
     this.spillSink = null;
     this.fileHost = null;
+    this.dirSynced = false;
     this.reclaimWithinSession = false;
     this.liveAtCompaction = 0;
     this.freeGenTxid = 0n;

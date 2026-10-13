@@ -16,6 +16,7 @@ import {
 } from "./commit_manifest.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import { engineError } from "./errors.ts";
+import type { FileHost } from "./filehost.ts";
 import { cacheLeaves } from "./paging.ts";
 import type { SpillSink } from "./spill.ts";
 import {
@@ -294,6 +295,7 @@ export function persistSharedBody(
     throw engineError("program_limit_exceeded", "database page limit exceeded");
   const ids = Array.from({ length: overflowCount }, (_, i) => write.pageCount + i);
   const manifest = buildCommitManifest(db.pageSize, snap.txid, write.pages, ids);
+  syncDirectoryOnce(db);
   paging.beginDurableCommit();
   paging.refreshAllocatedPages();
   paging.reserve(pageCount);
@@ -325,6 +327,34 @@ export function persistSharedBody(
   };
 }
 
+// DirectorySync makes the directory holding the database file at path durable, through files (null is
+// the OS). Registered by the Node host (file.ts), so this module stays browser-clean.
+type DirectorySync = (files: FileHost | null, path: string) => void;
+let directorySync: DirectorySync | null = null;
+
+// registerDirectorySync installs the host's directory barrier for syncDirectoryOnce (called once, at
+// file.ts module load).
+export function registerDirectorySync(fn: DirectorySync): void {
+  directorySync = fn;
+}
+
+// syncDirectoryOnce makes the database file's directory durable before the first durable commit after
+// open (validated-cow.md §3). A process that crashed between a compaction's or create's rename and its
+// directory sync leaves the new file in place but its directory entry unsynced; a later power loss could
+// revert the rename and bring back the older file, losing every commit made since. Syncing a file never
+// makes its directory entry durable, so the first writer does it once. Best effort, like every
+// directory sync, and skipped under fsync=off. A store without a path (OPFS, in memory) has no directory.
+function syncDirectoryOnce(db: Engine): void {
+  if (db.dirSynced || db.path === null) return;
+  db.dirSynced = true;
+  if (db.paging === null || db.paging.skipsSync() || directorySync === null) return;
+  try {
+    directorySync(db.fileHost, db.path);
+  } catch {
+    // Best effort: an unresolvable path skips the directory barrier, as every directory sync may.
+  }
+}
+
 // Write tree/catalog first so reclamation can read the new catalog. Joint allocation then reserves
 // descriptor and free-list pages from the prior safe free set, protecting every new write from reuse.
 // The inline/overflow descriptor hashes those body pages and the single final sync publishes them.
@@ -337,6 +367,7 @@ function commitFile(
   canReclaim: boolean,
   canReuse: boolean,
 ): void {
+  syncDirectoryOnce(db);
   const paging = db.paging!;
   paging.beginDurableCommit();
   // Preallocate ahead of the high-water so the body sync carries no file-growth journaling (pager.md §7).

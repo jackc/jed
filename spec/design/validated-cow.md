@@ -117,6 +117,17 @@ again. A read-only adoption does not require a sync; adopting it cannot silently
 safe for a future writer. A locally acknowledged generation is already durable and does
 not need a stabilization flush on every transaction.
 
+The same reasoning covers the file's **directory entry**. Compaction and `create` replace the
+file by renaming a synced temp file over it and then syncing the directory
+([api.md](api.md) §2.6). A process that dies between the rename and the directory sync leaves
+the new file readable but its entry not durable: the next opener adopts it, and a later power
+failure can revert the rename and bring back the older file, losing every commit made since —
+syncing the file itself never makes its directory entry durable. So the first durable commit
+after each open syncs the database's directory, once, before any write (best effort, like
+every directory sync; skipped under `fsync=off`). This applies to the alone, shared, and
+attachment commit paths. The deterministic simulator found this gap
+([simulation-testing.md](simulation-testing.md) §14).
+
 Any write/sync failure poisons the storage handle: no later commit may continue from an
 assumed prior root. Close and reopen through recovery. Shared-file failure retains the
 coordinator gates until close, as [locking.md](locking.md) requires. This applies to the

@@ -46,7 +46,7 @@ module SimGen
       "create_table" => 2, "drop_table" => 1, "create_index" => 2, "drop_index" => 1,
       "add_column" => 1, "analyze" => 1, "sequence" => 1, "invalid" => 1,
       "commit" => 9, "rollback" => 2, "check" => 2, "reopen" => 1, "clock" => 1,
-      "crash_power" => 1, "crash_process" => 1
+      "crash_power" => 1, "crash_process" => 1, "compact" => 0
     },
     "values" => {
       "short" => 10, "long_compressible" => 3, "long_incompressible" => 3, "null" => 2, "uuid" => 1
@@ -54,6 +54,7 @@ module SimGen
     "faults" => {
       "commit_fault" => 150, "chain" => 150, "power_loss" => 5, "process_crash" => 3,
       "io_error_write" => 1, "io_error_sync" => 1, "read_error" => 0, "enospc" => 0,
+      "compact_fault" => 300, "nth_max" => 1,
       "survive" => [100, 900], "tear" => [0, 400], "issue" => [200, 900], "io_p" => [50, 500]
     }
   }.freeze
@@ -206,6 +207,7 @@ module SimGen
       when "clock" then emit("clock +#{@rng.range(1, 5_000_000)}")
       when "crash_power" then crash_power
       when "crash_process" then crash_process
+      when "compact" then compact
       else
         writer_statement(action)
       end
@@ -272,6 +274,18 @@ module SimGen
       emit("reopen")
     end
 
+    # Host compaction (api.md §2.6). An open session makes it fail 55006, which is worth seeing too. A
+    # fault may land at any of its barriers: the temp file's sync, then the directory's.
+    def compact
+      faulted = @rng.chance(@p.dig("faults", "compact_fault"))
+      if faulted
+        kind = @rng.chance(500) ? "power_loss survive=#{draw('survive')} tear=#{draw('tear')}" : "process_crash issue=#{draw('issue')}"
+        emit("fault #{kind} nth=#{@rng.range(1, 3)}")
+      end
+      emit("compact")
+      kill_sessions if faulted
+    end
+
     def crash_power
       emit("crash power survive=#{draw('survive')} tear=#{draw('tear')}")
       kill_sessions
@@ -301,11 +315,18 @@ module SimGen
       @rng.range(lo, hi)
     end
 
+    # ` nth=K` for a commit's crash fault, so it can land at a later barrier than the first (after a
+    # stabilization sync, say). Drawn only when the profile asks, so other traces are unchanged.
+    def nth
+      max = @p.dig("faults", "nth_max")
+      max > 1 ? " nth=#{@rng.range(1, max)}" : ""
+    end
+
     def fault_line
       kinds = %w[power_loss process_crash io_error_write io_error_sync read_error enospc]
       case @rng.weighted(@p["faults"].slice(*kinds))
-      when "power_loss" then "fault power_loss survive=#{draw('survive')} tear=#{draw('tear')}"
-      when "process_crash" then "fault process_crash issue=#{draw('issue')}"
+      when "power_loss" then "fault power_loss survive=#{draw('survive')} tear=#{draw('tear')}#{nth}"
+      when "process_crash" then "fault process_crash issue=#{draw('issue')}#{nth}"
       when "io_error_write" then "fault io_error op=write p=#{draw('io_p')}"
       when "read_error" then "fault read_error p=#{draw('io_p')}"
       when "enospc" then "fault enospc"

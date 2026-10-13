@@ -666,6 +666,7 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
   st.storageBudget.lastCatRoot = 0;
   st.storageBudget.lastWritten = [];
   st.storageBudget.lastCatalogPages = 0;
+  st.dirSynced = true; // compaction's own directory barrier made the new entry durable
   return loaded.committed;
 }
 

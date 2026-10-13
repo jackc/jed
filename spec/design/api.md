@@ -514,8 +514,12 @@ it is not metered and no session's cost or memory account is charged.
 
 **Crash safety.** Until the rename, the old file is intact and is what a crash leaves; a crash may
 also leave a stale `<path>.jedtmp`, which `open` ignores and the next compaction overwrites. After
-the rename the new file is complete and durable (with `skip_fsync`, only across a process crash —
-§2.1). If the rename itself fails, the old file is reopened and the handle carries on unchanged. If
+the rename the new file is complete, and once the directory sync completes its entry is durable too
+(with `skip_fsync`, only across a process crash — §2.1). A process that dies between the rename and
+the directory sync leaves the new file in place but its entry unsynced, so the first durable commit
+of the next opener syncs the directory before writing anything ([validated-cow.md](validated-cow.md)
+§3); otherwise a power failure could revert the rename and lose that opener's commits. If the rename
+itself fails, the old file is reopened and the handle carries on unchanged. If
 reopening the new file fails, the handle is poisoned — later statements fail and the host must close
 and reopen it, exactly as after a commit I/O failure (§3).
 

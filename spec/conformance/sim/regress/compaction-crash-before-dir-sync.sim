@@ -1,0 +1,33 @@
+# A process that died between a compaction's rename and its directory sync left the new file with an
+# unsynced entry; the next writer committed to it with file syncs only, and a power loss reverted the
+# rename and lost those acknowledged commits. The first durable commit after open now syncs the
+# directory (validated-cow.md §3). Shrunk from compaction seed 77.
+# format: simulation
+# profile: compaction
+# seed: 77
+# page_size: 512
+# clock: 1700000000000000
+compact
+compact
+compact
+fault process_crash issue=866 nth=2
+compact
+open w13 write
+on w13 CREATE TABLE IF NOT EXISTS t1 (id i64 PRIMARY KEY, c1 i32)
+on w13 INSERT INTO t1 (id, c1) SELECT g, (g * 87 + 27) % 1000 FROM generate_series(100, 104) g
+commit w13
+open w14 write
+on w14 CREATE INDEX ix2 ON t1 (c1)
+compact
+on w14 CREATE TABLE t4 (id i64 PRIMARY KEY, c1 text, c2 text)
+on w14 INSERT INTO t1 (id) VALUES (NULL)
+rollback w14
+on w24 CREATE TABLE t5 (id i64 PRIMARY KEY, c1 i64, c2 text)
+on w24 UPDATE t1 SET c1 = (c1 + 1) % 1000 WHERE id % 5 = 1
+commit w24
+check
+open w25 write
+on w25 INSERT INTO t5 (id, c1, c2) SELECT g, g * 7, md5(g::text || '218.1') || md5(g::text || '218.2') || md5(g::text || '218.3') || md5(g::text || '218.4') || md5(g::text || '218.5') || md5(g::text || '218.6') || md5(g::text || '218.7') || md5(g::text || '218.8') || md5(g::text || '218.9') || md5(g::text || '218.10') || md5(g::text || '218.11') FROM generate_series(1, 5) g
+check
+on w25 SELECT id % 6 AS k, count(*), max(id) FROM t1 GROUP BY 1
+crash power survive=248 tear=391

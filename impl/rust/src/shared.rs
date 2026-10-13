@@ -290,6 +290,8 @@ pub(crate) struct Storage {
     /// The file host a file-backed domain's compaction goes through ([`crate::filehost`]); `None`
     /// is the OS. Only the deterministic simulator sets another.
     files: Option<Arc<dyn crate::filehost::FileHost>>,
+    /// Whether this handle has made the file's directory entry durable ([`Storage::sync_directory_once`]).
+    dir_synced: bool,
 }
 
 /// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
@@ -385,6 +387,7 @@ impl Storage {
             budget: StorageBudget::default(),
             live: crate::format::LiveCount::default(),
             files: None,
+            dir_synced: false,
         }
     }
 
@@ -652,6 +655,35 @@ impl Storage {
         i64::from(pages) * i64::from(self.page_size)
     }
 
+    /// Make the database file's directory durable before the first durable commit after open
+    /// (validated-cow.md §3). A process that crashed between a compaction's or create's rename and its
+    /// directory sync leaves the new file in place but its directory entry unsynced; a later power
+    /// loss could revert the rename and bring back the older file, losing every commit made since.
+    /// Syncing a file never makes its directory entry durable, so the first writer does it once. Best
+    /// effort, like every directory sync, and skipped under `fsync=off`.
+    fn sync_directory_once(&mut self) {
+        if self.dir_synced {
+            return;
+        }
+        let Some(path) = &self.path else {
+            return;
+        };
+        self.dir_synced = true;
+        if self.paging.pager().skips_sync() {
+            return;
+        }
+        let os = crate::filehost::OsFileHost;
+        let files: &dyn crate::filehost::FileHost = match &self.files {
+            Some(files) => files.as_ref(),
+            None => &os,
+        };
+        if let Ok(real) = files.real_path(path)
+            && let Some(dir) = real.parent()
+        {
+            files.sync_dir(dir);
+        }
+    }
+
     /// Durably publish `snap` into this storage via an **incremental** copy-on-write commit
     /// (spec/fileformat/format.md; transactions.md §9) — the same recipe [`Shared::persist`] uses for
     /// the MAIN domain, factored out so a host-attached FILE database (attached-databases.md §5, Slice 2)
@@ -694,6 +726,7 @@ impl Storage {
         can_reclaim: bool,
         can_reuse: bool,
     ) -> Result<()> {
+        self.sync_directory_once();
         let ps = self.page_size as usize;
         let cap = ps - crate::format::PAGE_HEADER;
         // Write the dirty tree + catalog first (unsynced) so the reachability walk can read the new
@@ -757,6 +790,7 @@ impl Storage {
         coordinator: &FileCoordinator,
     ) -> Result<()> {
         let plan = crate::format::plan_shared_commit(self.page_size, snap.txid, &write, live.live)?;
+        self.sync_directory_once();
         {
             let mut pager = self.paging.pager();
             pager.begin_commit()?;
@@ -908,6 +942,7 @@ impl Storage {
         self.budget.last_cat_root = 0;
         self.budget.last_written.clear();
         self.budget.last_catalog_pages = 0;
+        self.dir_synced = true; // compaction's own directory barrier made the new entry durable
         Ok(engine.committed)
     }
 }
@@ -2043,6 +2078,7 @@ impl Database {
             budget: StorageBudget::default(),
             live: engine.live,
             files: None,
+            dir_synced: false,
         };
         let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -2412,6 +2448,7 @@ impl Database {
                 },
                 live: engine.live,
                 files: None,
+                dir_synced: false,
             };
             Some((storage, engine.committed, coordinator))
         } else {
@@ -3601,6 +3638,16 @@ impl Database {
             free_pages: st.free_pages.clone(),
             paging: st.paging.clone(),
         }
+    }
+
+    /// Route MAIN's file operations (compaction, the first commit's directory barrier) through the
+    /// simulator's filesystem instead of the OS.
+    pub(crate) fn sim_set_files(&self, files: Arc<dyn crate::filehost::FileHost>) {
+        self.0
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .files = Some(files);
     }
 }
 

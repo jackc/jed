@@ -24,7 +24,7 @@ use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, cache_leaves};
 use crate::seam::seeded_random_source;
 use crate::shared::{Database, Session};
-use disk::{Fault, FaultKind, LANE_SESSION, SimDisk, SimStore, decide, fnv};
+use disk::{Fault, FaultKind, LANE_SESSION, MAIN_FILE, SimFs, SimHost, SimStore, decide, fnv};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -34,8 +34,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SECTOR_DEFAULT: usize = 64;
-/// Marks the engine durable; the simulated disk is its only storage.
-const DISK_PATH: &str = "sim.jed";
 
 /// The message and backtrace of the most recent panic, captured by the hook [`main`] installs so a
 /// panicking step becomes a violation with its stack (the Go runner's `recover` + `debug.Stack`).
@@ -217,7 +215,7 @@ fn parse(text: &str) -> Result<Trace, String> {
                 st.params
                     .insert("delta".to_string(), fields[1][1..].to_string());
             }
-            "check" | "reopen" => {}
+            "check" | "reopen" | "compact" => {}
             other => return Err(format!("line {}: unknown step {}", n + 1, go_quote(other))),
         }
         tr.steps.push(st);
@@ -235,11 +233,13 @@ fn fault_of(st: &Step) -> Result<Fault, String> {
             let mut f = Fault::new(FaultKind::PowerLoss);
             f.survive = st.int_param("survive");
             f.tear = st.int_param("tear");
+            f.nth = st.int_param("nth");
             return Ok(f);
         }
         "process_crash" => {
             let mut f = Fault::new(FaultKind::ProcessCrash);
             f.issue = st.int_param("issue");
+            f.nth = st.int_param("nth");
             return Ok(f);
         }
         "io_error" => match st.params.get("op").map(String::as_str) {
@@ -455,7 +455,7 @@ struct Runner<'a> {
 
     sessions: HashMap<String, SimSession>,
     db: Option<Database>,
-    disk: Arc<Mutex<SimDisk>>,
+    fs: Arc<Mutex<SimFs>>,
     armed: Option<Fault>,
 
     transcript: String,
@@ -633,7 +633,7 @@ impl<'a> Runner<'a> {
             spill_dir,
             sessions: HashMap::new(),
             db: None,
-            disk: Arc::new(Mutex::new(SimDisk::new(seed, sector as usize, &image))),
+            fs: Arc::new(Mutex::new(SimFs::new(seed, sector as usize, &image))),
             armed: None,
             transcript: String::new(),
             history: HashMap::new(),
@@ -651,8 +651,8 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn disk(&self) -> std::sync::MutexGuard<'_, SimDisk> {
-        self.disk.lock().unwrap_or_else(|e| e.into_inner())
+    fn disk(&self) -> std::sync::MutexGuard<'_, SimFs> {
+        self.fs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Run one of the runner's own oracle reads with read faults suspended: an armed read fault
@@ -687,7 +687,16 @@ impl<'a> Runner<'a> {
     /// Open a Database over the simulated disk through the ordinary demand-paged loader — the path a
     /// reopening process takes, including validated-COW recovery (validated-cow.md §1).
     fn open(&mut self) -> Result<(), EngineError> {
-        let pager = Pager::from_store(Box::new(SimStore(self.disk.clone())))?;
+        let Some(main) = self.disk().main() else {
+            return Err(EngineError::new(
+                crate::error::SqlState::IoError,
+                "the database file is gone",
+            ));
+        };
+        let pager = Pager::from_store(Box::new(SimStore {
+            fs: self.fs.clone(),
+            file: main,
+        }))?;
         let cache = if self.cache_bytes <= 0 {
             DEFAULT_CACHE_BYTES
         } else {
@@ -695,9 +704,12 @@ impl<'a> Runner<'a> {
         };
         let page_size = pager.page_size();
         let mut engine = Engine::open_paged(pager, cache_leaves(cache, page_size))?;
-        engine.path = Some(PathBuf::from(DISK_PATH));
+        // The path marks the engine durable; the simulated filesystem is its only storage.
+        engine.path = Some(PathBuf::from(MAIN_FILE));
         engine.spill_dir = self.spill_dir.clone();
         let db = Database::from_engine(engine);
+        // Compaction's temp file, rename, and directory barrier go through the simulated filesystem.
+        db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
         if self.max_storage_bytes > 0 {
             db.set_max_storage_bytes("main", self.max_storage_bytes)?;
         }
@@ -806,6 +818,7 @@ impl<'a> Runner<'a> {
             "commit" => self.step_commit(i, st),
             "rollback" | "close" => self.step_end(i, st),
             "check" => self.step_check(i),
+            "compact" => self.step_compact(i),
             "reopen" => {
                 if !self.step_reopen(i) {
                     return false;
@@ -1061,6 +1074,51 @@ impl<'a> Runner<'a> {
         self.emit(format!("{{\"i\":{i},\"op\":{op},\"sid\":{sid}}}"));
     }
 
+    /// Host compaction (api.md §2.6): the committed snapshot rewritten as a fresh image at the next
+    /// version, through the simulated filesystem's temp file, rename, and directory barrier. Its
+    /// contents are unchanged, so a crash may recover either version with the same digest.
+    fn step_compact(&mut self, i: usize) {
+        let base = self.version;
+        self.add_history(base + 1, self.last_digest.clone());
+        self.max_attempted = self.max_attempted.max(base + 1);
+        let result = self.db().compact("main");
+        let now = self.db().version();
+        if let Err(e) = result {
+            let code = engine_code(&e);
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"compact\",\"error\":{}}}",
+                go_quote(&code)
+            ));
+            if code == "XX001" {
+                self.fail(i, format!("corruption: compaction reported XX001: {e}"));
+            } else if now != base {
+                self.fail(
+                    i,
+                    format!("a failed compaction published version {now} (was {base})"),
+                );
+            }
+            return;
+        }
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"compact\",\"version\":{now}}}"
+        ));
+        if now != base + 1 {
+            self.fail(i, format!("compaction moved version {base} to {now}"));
+            return;
+        }
+        let d = self.committed_digest();
+        if d.as_deref() != Some(self.last_digest.as_str()) {
+            self.fail(i, "compaction changed the database's contents".to_string());
+            return;
+        }
+        if let Err(e) = self.oracle(|| check::check_live(self.db())) {
+            self.fail(i, format!("after compaction: {e}"));
+            return;
+        }
+        self.version = now;
+        self.floor = now; // the rename and the directory barrier completed
+    }
+
     fn step_check(&mut self, i: usize) {
         let d = self.committed_digest();
         let Some(d) = d.filter(|d| *d == self.last_digest) else {
@@ -1074,7 +1132,7 @@ impl<'a> Runner<'a> {
             self.fail(i, format!("live integrity: {e}"));
             return;
         }
-        let image = self.disk().cache.clone();
+        let image = self.disk().main_image();
         let (live, pages, free) = match check::integrity(&image, self.version) {
             Ok(r) => r,
             Err(e) => {
@@ -1141,7 +1199,7 @@ impl<'a> Runner<'a> {
         let image = {
             let mut disk = self.disk();
             disk.process_death();
-            disk.cache.clone()
+            disk.main_image()
         };
         if let Some(prefix) = &self.image_prefix {
             let _ = std::fs::write(format!("{}.step{i}.img", prefix.display()), &image);
