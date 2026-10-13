@@ -1540,7 +1540,7 @@ pub(crate) fn resolve_concat(
 /// Resolve the two operands of a binary operator, giving each adaptable literal the other
 /// operand's type as context: a bare *integer* literal adopts the sibling's integer type (so
 /// `small + 1` types `1` as i16, and `small + 100000` traps 22003 at resolve), and a
-/// *string* literal adapts to a bytea sibling (decoding the hex input — types.md §6/§13),
+/// *string* literal adapts to a bytea sibling (decoding its hex or escape input — types.md §6/§13),
 /// otherwise staying text. When the sibling offers no usable context, the literal defaults to
 /// its own family and the caller's family check reports the mismatch. This does NOT enforce a
 /// family — `resolve_int_pair`/arithmetic and `classify_comparable` (comparison) layer that on top.

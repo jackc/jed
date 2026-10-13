@@ -4280,7 +4280,7 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 			return UuidValue(b), nil
 		}
 		// text → interval / bytea (types.md §5): the literal's own input per row — parseInterval
-		// (22007/22008) and the `\x` hex bytea input (22P02).
+		// (22007/22008) and the bytea input — `\x` hex or escape format (22P02).
 		if target.IsInterval() {
 			iv, err := parseInterval(v.str())
 			if err != nil {

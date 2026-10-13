@@ -242,7 +242,7 @@ listed).
   The three datetime casts are STABLE, like PostgreSQL's `timestamp_in` / `timestamptz_in` /
   `interval_in` (`42P17` in an index expression); `text → bytea` is immutable (`byteain`) and
   indexable. The jed-stricter grammars (`'now'`/`'epoch'` for timestamps, ISO-8601 and SQL-standard
-  interval input, the bytea escape format) are identical to the literal path. `CAST(interval AS
+  interval input) are identical to the literal path. `CAST(interval AS
   interval)` is the identity, and every other source to these four targets is a forbidden pair
   (`42804`). The `text → text` identity is implicit, like any identity cast.
 - **Casting *to* text** (`CAST(x AS text)`, `x::text`, `x::varchar(n)`) is admitted from **every
@@ -497,8 +497,8 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   order-preserving, scale-independent `decimal-order-preserving` encoding ([encoding.md](encoding.md)
   §2.5; `1.5` and `1.50` index as one). Deferred sub-feature: negative/over-precision scale typmods.
 - **`bytea`** — ✅ landed as the fourth storable non-integer scalar — variable-width raw bytes,
-  unsigned byte-order comparison (§13). Its deferred sub-features (the traditional escape input
-  format, bytea⇄other casts, binary functions, and bytea in keys) are enumerated in §13.
+  unsigned byte-order comparison, hex and escape input (§13). Its deferred sub-features are
+  enumerated in §13.
 - **`uuid`** — ✅ landed as the fifth storable non-integer scalar (§14) — a fixed 16-byte value,
   unsigned byte-order comparison, PostgreSQL-flexible input + canonical `8-4-4-4-12` lowercase
   output, and the **first non-integer type usable as a `PRIMARY KEY`** (its `uuid-raw16` key
@@ -650,17 +650,33 @@ bytes in every core (Rust `Vec<u8>`, Go `[]byte`, TS `Uint8Array`), and a byte-w
 `memcmp` is natively identical across all three. There are no code points and no encoding to get
 wrong.
 
-**Literals: a string in a bytea context, hex input only.** There is no distinct bytea literal
+**Literals: a string in a bytea context, hex or escape input.** There is no distinct bytea literal
 token; a bytea value is written as a single-quoted string literal that **adapts to a bytea
 context** (§6) — `INSERT INTO t VALUES (1, '\xdeadbeef')`, `UPDATE t SET b = '\xff'`, and
-`WHERE b = '\xab'`. The string is decoded via the **hex input form**: a literal `\x` followed
-by an **even** count of hexadecimal digits (case-insensitive), each pair one byte; `'\x'` alone
-is the empty byte string. This matches PostgreSQL's hex input and, by being the same form as the
-render output (below), round-trips exactly. An ill-formed hex literal in a bytea context (no
-`\x` prefix, an odd digit count, or a non-hex character) traps **`22P02`**
-(`invalid_text_representation`) deterministically at resolve time, before any row is scanned
-(§6). An integer or boolean literal in a bytea context, and a string literal into a non-bytea
-column, are `42804` type errors, as for text.
+`WHERE b = '\xab'`. The string is decoded exactly as PostgreSQL's `byteain` decodes it, in one of
+two formats chosen by its first two characters:
+
+- **Hex** — a string beginning with `\x` (lowercase `x`): an **even** count of hexadecimal digits
+  (case-insensitive) follows, each pair one byte; `'\x'` alone is the empty byte string. This is
+  the same form as the render output (below), so it round-trips exactly. An odd digit count or a
+  non-hex character traps **`22P02`** (`invalid_text_representation`) — PostgreSQL reports
+  `22023` for these two, a ledgered code divergence. PostgreSQL also skips whitespace between
+  hex digit pairs; jed does not yet (a `22P02`, a deferred sub-feature below).
+- **Escape** — any other string, PostgreSQL's traditional escape format: `\\` is one backslash
+  byte, `\nnn` (exactly three octal digits, the first `0`–`3`, so `\000`–`\377`) is the one byte
+  of that value, and every other character stands for its own UTF-8 bytes (`'abc'` is
+  `\x616263`, `'é'` is `\xc3a9`, `''` is the empty byte string). Any other backslash — followed
+  by fewer than three octal digits, a digit above `3` first, a non-octal character, or nothing —
+  traps **`22P02`** with PostgreSQL's message `invalid input syntax for type bytea`. The decoder
+  is the one `decode(s, 'escape')` uses (string-functions.md §4), which PostgreSQL defines
+  identically. (With standard conforming strings, the SQL literal `'\101'` is the four characters
+  `\`, `1`, `0`, `1` — one escape, the byte `0x41`.)
+
+The trap is deterministic and fires at resolve time, before any row is scanned (§6). The same
+decoding applies everywhere bytea text input is read: a typed literal (`bytea '…'`), a literal
+cast (`'…'::bytea`), the per-row `text → bytea` cast (§5), and each element of an array's text
+form (`'{abc,"\\101"}'::bytea[]`). An integer or boolean literal in a bytea context, and a
+string literal into a non-bytea column, are `42804` type errors, as for text.
 
 **Rendering: lowercase hex.** A bytea value renders in the conformance corpus as `\x` followed
 by the **lowercase** hex of its bytes (the empty value renders as exactly `\x`) — PostgreSQL's
@@ -683,10 +699,8 @@ over-`RECORD_MAX` bytea key is rejected `0A000` (the same node-fit limit as text
 
 **Deferred bytea sub-features** (relaxable narrowings, each its own follow-up):
 
-- **The traditional escape input format** (`\047`, `\\`, literal printable bytes) — not accepted;
-  the hex form `\x…` is the only input this slice. A deliberate, documented divergence from PG
-  (which also accepts the escape format on input), justified by determinism and a smaller surface;
-  the hex form is the modern canonical spelling and matches the render output.
+- **Whitespace inside hex input** (`'\x de ad'`) — PostgreSQL's `hex_decode` skips whitespace
+  between digit pairs; jed's hex input does not (`22P02`).
 - **The hash functions** (`md5`, `sha256`, …). The rest of PostgreSQL's binary-string surface has
   landed: `length` / `octet_length` / `bit_length`, `||`, `substr` / `substring`, `get_byte` /
   `set_byte`, `get_bit` / `set_bit`, `overlay`, `position`, and `btrim` / `ltrim` / `rtrim`

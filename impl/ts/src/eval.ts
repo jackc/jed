@@ -2810,7 +2810,7 @@ export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | n
     // malformed string traps 22P02.
     if (isUuid(target)) return uuidValue(decodeUuidLiteral(v.text));
     // text → interval / bytea (types.md §5): the literal's own input per row — parseInterval
-    // (22007/22008) and the `\x` hex bytea input (22P02).
+    // (22007/22008) and the bytea input — `\x` hex or escape format (22P02).
     if (isInterval(target)) return intervalValue(parseInterval(v.text));
     if (isBytea(target)) return byteaValue(decodeByteaLiteral(v.text));
     // text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same per-row

@@ -497,14 +497,13 @@ overflow_error = "22008"
 # transform like the datetime casts above, charging one timezone unit (DST gap/overlap as the
 # timestamp -> timestamptz cast; the string-LITERAL path reads it in the session zone too, folded at
 # resolve — ../design/timezones.md §9.3);
-# parse_interval (the "unit + time" subset); and the `\x` hex bytea input. 22007 malformed / 22008
-# out of range per row (bytea: 22P02). The three datetime casts are STABLE, like PostgreSQL's
+# parse_interval (the "unit + time" subset); and the bytea input (byteain: `\x` hex, otherwise the
+# traditional escape format). 22007 malformed / 22008 out of range per row (bytea: 22P02). The three datetime casts are STABLE, like PostgreSQL's
 # timestamp_in / timestamptz_in / interval_in, so an index expression containing one is 42P17;
 # text -> bytea is immutable (byteain) and indexable. All EXPLICIT (PG's text -> T I/O casts are
 # explicit too). The accepted grammars AGREE with PostgreSQL and are oracle-checked
 # (suites/cast/text_to_string_native.test, postgres:18); the jed-stricter grammars (timestamp
-# 'now'/'today'/'epoch', ISO-8601 / SQL-standard interval input, the bytea escape format) and the
-# differing SQLSTATE subcodes are per-core tested, identical to the literal path. NULL -> NULL.
+# 'now'/'today'/'epoch', ISO-8601 / SQL-standard interval input) and the differing SQLSTATE subcodes are per-core tested, identical to the literal path. NULL -> NULL.
 [[cast]]
 from = "text"
 to = "timestamp"

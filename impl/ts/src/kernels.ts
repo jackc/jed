@@ -7,6 +7,8 @@ import {
   type Engine,
   type ParamTypes,
   type Scope,
+  SQL_BYTE_ENCODER,
+  decodeEscape,
   resolve,
   resolvedTypeEqual,
   resolvedTypeOf,
@@ -313,11 +315,15 @@ export function intTypeOf(t: ResolvedType): ScalarType | null {
   return t.kind === "int" ? t.ty : null;
 }
 
-// decodeByteaLiteral decodes a single-quoted literal's content as a bytea value via the hex
-// input form (parseByteaHex), mapping malformed hex to a 22P02 (invalid_text_representation).
-// Used when a string literal adapts to a bytea context (types.md §6/§13); the trap is
-// deterministic and fires at resolve time, before any scan.
+// decodeByteaLiteral decodes a text value as a bytea value — PostgreSQL's byteain (types.md §13).
+// A string that begins with `\x` is the hex input form (parseByteaHex; malformed hex is a 22P02
+// carrying the reason); any other string is the traditional escape form, decoded exactly as
+// decode(s, 'escape') over its UTF-8 bytes (decodeEscape: `\\` is one backslash, `\nnn` with three
+// octal digits ≤ `\377` is one byte, every other byte is itself, and any other backslash is 22P02).
+// Used by a string literal adapting to a bytea context (types.md §6), where the trap is
+// deterministic and fires at resolve time before any scan, and by the per-row text → bytea cast.
 export function decodeByteaLiteral(str: string): Uint8Array {
+  if (!str.startsWith("\\x")) return decodeEscape(SQL_BYTE_ENCODER.encode(str));
   const r = parseByteaHex(str);
   if ("error" in r) {
     throw engineError(

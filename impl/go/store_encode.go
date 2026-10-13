@@ -121,8 +121,8 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 			return TextValue(s), nil
 		}
 		if colTy.IsBytea() {
-			// A string literal adapts to a bytea column, decoding the hex input form
-			// (types.md §6/§13); malformed hex traps 22P02.
+			// A string literal adapts to a bytea column, decoding its hex or escape
+			// input form (types.md §6/§13); malformed input traps 22P02.
 			b, err := decodeByteaLiteral(v.str())
 			if err != nil {
 				return Value{}, err

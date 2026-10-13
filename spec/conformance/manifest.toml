@@ -782,7 +782,7 @@ description = "Exact-numeric transcendentals over decimal/numeric — sqrt, ln, 
 
 [[capability]]
 id = "types.bytea"
-description = "bytea scalar type (variable-width raw bytes): storage, hex-input literals, and unsigned-byte comparison/ordering. bytea is ALSO a KEY type — a bytea PRIMARY KEY / composite-key member / secondary index / UNIQUE uses the variable-width bytea-terminated-escape key encoding (encoding.md §2.6; the embedded-0x00 escape is routinely exercised), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key; an oversized bytea key is 0A000 (spec/design/types.md §13)"
+description = "bytea scalar type (variable-width raw bytes): storage, hex- and escape-input literals, and unsigned-byte comparison/ordering. bytea is ALSO a KEY type — a bytea PRIMARY KEY / composite-key member / secondary index / UNIQUE uses the variable-width bytea-terminated-escape key encoding (encoding.md §2.6; the embedded-0x00 escape is routinely exercised), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key; an oversized bytea key is 0A000 (spec/design/types.md §13)"
 
 [[capability]]
 id = "types.uuid"

@@ -843,10 +843,11 @@ export function resolve(
           };
         case "text": {
           // A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
-          // context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
-          // input (uuid) — 22P02 on malformed; any other context — including none — keeps it text.
+          // context (types.md §6/§13/§14): decode the bytea input (hex or escape) or the PG-flexible
+          // uuid input (uuid) — 22P02 on malformed; any other context — including none — keeps it
+          // text.
           // A string literal is text by default (collation C). It adapts to a BYTEA context
-          // (decode the hex input, 22P02 on bad hex) or a TIMESTAMP/TIMESTAMPTZ context (parse
+          // (decode the bytea input, 22P02 on bad input) or a TIMESTAMP/TIMESTAMPTZ context (parse
           // the datetime, 22007/22008 — spec/design/timestamp.md). Any other context keeps it text.
           if (ctx !== null && isBytea(ctx)) {
             return {

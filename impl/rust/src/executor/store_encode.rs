@@ -91,8 +91,8 @@ pub(crate) fn store_value(
                 // over-length traps 22001, unless the excess is all spaces (truncate) — §15.
                 Ok(Value::Text(coerce_varchar_store(s, varchar_len, col_name)?))
             } else if col_ty.is_bytea() {
-                // A string literal adapts to a bytea column, decoding the hex input form
-                // (types.md §6/§13); malformed hex traps 22P02.
+                // A string literal adapts to a bytea column, decoding its hex or escape
+                // input form (types.md §6/§13); malformed input traps 22P02.
                 Ok(Value::Bytea(decode_bytea_literal(&s)?))
             } else if col_ty.is_uuid() {
                 // A string literal adapts to a uuid column via the PG-flexible input

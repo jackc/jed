@@ -53,6 +53,11 @@
   '550e8400-e29b-41d4-a716-446655440000'::uuid::bytea   AS uuid_to_bytea,
   '\\x550e8400e29b41d4a716446655440000'::bytea::uuid    AS bytea_to_uuid;`;
 
+	const byteaInputDemo = `SELECT
+  '\\xdeadbeef'::bytea   AS hex,
+  'abc'::bytea          AS plain,
+  'a\\\\b\\101'::bytea    AS escaped;`;
+
 	const byteaDemo = `SELECT
   length('\\x0102ff'::bytea)                      AS len,
   '\\x0102'::bytea || '\\xff'                     AS concatenated,
@@ -182,8 +187,8 @@ rejected (`22P02`) where PostgreSQL accepts them.
 
 A runtime `text` value also casts to **`date`**, **`timestamp`**, **`timestamptz`**, **`interval`**,
 and **`bytea`**, using the same input rules as that type's literal. A malformed date or time raises
-`22007` and an out-of-range field `22008`; a malformed `bytea` (only the `\x` hex form is accepted)
-raises `22P02`:
+`22007` and an out-of-range field `22008`; a malformed `bytea` (hex or escape format, see
+[Binary strings](#binary-strings-bytea)) raises `22P02`:
 
 <LiveSql demo="textTemporalCastDemo" query={textTemporalCastDemo} rows={1} />
 
@@ -199,8 +204,8 @@ column cast agree.
 
 jed's input grammars are stricter than PostgreSQL's, the same as for literals: the `'now'`, `'today'`,
 and `'epoch'` timestamp words, ISO-8601 (`P1D`) and SQL-standard interval input (`'1-2'`,
-`'1 1:00'`), and the `bytea` escape format are rejected. A unit-less interval number is read as
-seconds only when it is the last field (`'5'`, `'1 day 2'`).
+`'1 1:00'`) are rejected. A unit-less interval number is read as seconds only when it is the last
+field (`'5'`, `'1 day 2'`).
 
 ## Casting to text
 
@@ -266,7 +271,17 @@ bytes and raises `22P02` otherwise:
 `uuid → text` explicit-only (PostgreSQL assignment-casts any type to `text`), and the `bytea` ↔ `uuid`
 casts are a jed convenience PostgreSQL does not offer at all.
 
+<a id="binary-strings-bytea"></a>
+
 ## Binary strings (bytea)
+
+A `bytea` value is written as a string, read the way PostgreSQL reads it. A string that starts with
+`\x` is **hex**: two hex digits per byte, either case. Any other string is the traditional **escape
+format**: each character is its own UTF-8 bytes, `\\` is one backslash, and `\nnn` (three octal
+digits, `\000` to `\377`) is one byte. Any other backslash raises `22P02`. Output is always hex, as
+in PostgreSQL by default:
+
+<LiveSql demo="byteaInputDemo" query={byteaInputDemo} rows={1} />
 
 `bytea` has PostgreSQL's binary-string functions, all counting and indexing **bytes** (the `text`
 versions count characters). `length` and `octet_length` return the byte count and `bit_length` eight

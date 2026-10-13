@@ -375,9 +375,10 @@ export function renderByteaHex(bytes: Uint8Array): string {
 // parseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
 // a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
 // pair one byte; `\x` alone is the empty byte string. The inverse of renderByteaHex, so a
-// value round-trips. The traditional escape input format is not accepted (a documented
-// narrowing). Returns the bytes on success, or { error } describing malformed input (the
-// caller raises it as a 22P02).
+// value round-trips. Returns the bytes on success, or { error } describing malformed input (the
+// caller raises it as a 22P02). decodeByteaLiteral routes here only a string that begins with
+// `\x`; any other string is the traditional escape input form, decoded by decode(s, 'escape')'s
+// kernel instead.
 export function parseByteaHex(s: string): { bytes: Uint8Array } | { error: string } {
   if (s.length < 2 || s[0] !== "\\" || s[1] !== "x") {
     return { error: "bytea hex input must begin with \\x" };

@@ -57,7 +57,6 @@ fn grammar_and_sqlstate_divergences() {
         ("2024-01-01 12:00:00+16", "s :: timestamptz", "22008"), // PG: 22009 displacement
         ("P1D", "s :: interval", "22007"), // PG: ISO-8601 1 day; jed: unit + time only
         ("2147483648 days", "s :: interval", "22008"), // PG: 22015 interval field overflow
-        ("abc", "s :: bytea", "22P02"),    // PG: escape format \x616263; jed: hex only
         (r"\x0", "s :: bytea", "22P02"),   // PG: 22023 odd number of hex digits
         (r"\xzz", "s :: bytea", "22P02"),  // PG: 22023 invalid hexadecimal digit
     ];

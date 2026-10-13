@@ -77,6 +77,16 @@ test('the types page autoruns the text concatenation demo', async ({ page }) => 
   await expect(rows).toContainText('1.50 USD');
 });
 
+test('the types page autoruns the bytea input demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // hex input \xdeadbeef, escape-format 'abc' = \x616263, 'a\\b\101' = \x615c6241.
+  const panel = livePanel(page, 'byteaInputDemo');
+  const rows = panel.getByTestId('result-rows');
+  await expect(rows).toContainText('\\xdeadbeef');
+  await expect(rows).toContainText('\\x616263');
+  await expect(rows).toContainText('\\x615c6241');
+});
+
 test('the types page autoruns the bytea functions demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The bytea demo: length 3, \x0102 || \xff = \x0102ff, SUBSTRING(… FROM 2 FOR 3) = \x020304,

@@ -210,10 +210,10 @@ max_scale = 16383
 # bytea comparison). The empty byte string is a distinct, non-NULL value. There is
 # NO collation (bytea is bytes, not text) and NO alias (PostgreSQL spells it only
 # `bytea`). A bytea literal is written as a single-quoted string in a bytea context
-# (../design/types.md §6): the HEX input form `\x` + an even count of hex digits,
-# decoded to the raw bytes; rendered back as `\x` + lowercase hex (PG bytea_output =
-# hex). Invalid hex input traps 22P02. The traditional escape input format, text⇄
-# bytea casts, and binary functions are deferred. The bytea KEY encoding rule
+# (../design/types.md §6), decoded as PostgreSQL's byteain does: the HEX input form
+# `\x` + an even count of hex digits, otherwise the traditional ESCAPE format (`\\`,
+# `\nnn` octal, any other byte itself); rendered back as `\x` + lowercase hex (PG
+# bytea_output = hex). Malformed input traps 22P02. The bytea KEY encoding rule
 # (bytea-terminated-escape, encoding.md §2.6) is EXERCISED: bytea IS a valid PRIMARY KEY /
 # ordered index / UNIQUE key (like text — the embedded-0x00 escape is routinely hit; an
 # oversized bytea key is 0A000). No bits/min/max/overflow/rank (integer-family fields);

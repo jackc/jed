@@ -632,7 +632,7 @@ file = "expr/like.test"
 sql = "SELECT 5 LIKE '5' FROM one"
 reason = "jed: a non-text LIKE operand is 42804 (strict typing). PostgreSQL finds no ~~(integer,text) operator and reports 42883. jed owns its operator surface; a standing divergence."
 
-# --- bytea: cross-type compare, string-into-int, malformed/escape-format input, bytea PK.
+# --- bytea: cross-type compare, string-into-int, malformed hex input, bytea PK.
 [[override]]
 file = "types/bytea.test"
 sql = "SELECT id FROM t WHERE b = 1"
@@ -652,11 +652,6 @@ reason = "jed: malformed bytea hex input (odd length) is 22P02. PostgreSQL repor
 file = "types/bytea.test"
 sql = '''INSERT INTO t VALUES (8, '\xzz')'''
 reason = "jed: malformed bytea hex input (non-hex digit) is 22P02. PostgreSQL reports 22023 invalid_parameter_value. jed owns its bytea-input error surface; a code divergence."
-
-[[override]]
-file = "types/bytea.test"
-sql = "INSERT INTO t VALUES (9, 'deadbeef')"
-reason = "jed: bytea input requires the \\x prefix (the traditional escape format is not accepted this slice), so a bare 'deadbeef' is 22P02. PostgreSQL accepts the escape-format string. A documented input-surface narrowing."
 
 [[override]]
 file = "types/bytea.test"

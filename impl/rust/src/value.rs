@@ -1625,10 +1625,10 @@ fn render_bytea_hex(bytes: &[u8]) -> String {
 /// Decode a bytea literal from its hex input form (spec/design/types.md §13): a `\x`
 /// prefix followed by an even count of hexadecimal digits (case-insensitive), each pair
 /// one byte; `\x` alone is the empty byte string. This is the inverse of
-/// `render_bytea_hex`, so a value round-trips. The traditional escape input format is not
-/// accepted (a documented narrowing). On malformed input returns the reason string; the
-/// caller raises it as a `22P02` (invalid_text_representation). Used when a single-quoted
-/// literal adapts to a bytea context (the executor), never at parse time.
+/// `render_bytea_hex`, so a value round-trips. On malformed input returns the reason string;
+/// the caller raises it as a `22P02` (invalid_text_representation). The executor's
+/// `decode_bytea_literal` routes here only a string that begins with `\x`; any other string is
+/// the traditional escape input form, decoded by `decode(s, 'escape')`'s kernel instead.
 pub fn parse_bytea_hex(s: &str) -> Result<Vec<u8>, &'static str> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'\\' || bytes[1] != b'x' {

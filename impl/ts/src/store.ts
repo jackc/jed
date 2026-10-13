@@ -129,8 +129,8 @@ export function storeValue(
         // traps 22001, unless the excess is all spaces (truncate) — spec/design/types.md §15.
         return textValue(coerceVarcharStore(v.text, varcharLen, colName));
       }
-      // A string literal adapts to a bytea column, decoding the hex input (types.md §6/§13);
-      // malformed hex traps 22P02.
+      // A string literal adapts to a bytea column, decoding its hex or escape input
+      // (types.md §6/§13); malformed input traps 22P02.
       if (isBytea(colTy)) return byteaValue(decodeByteaLiteral(v.text));
       // ... and to a uuid column via the PG-flexible uuid input (types.md §6/§14); 22P02 on bad input.
       if (isUuid(colTy)) return uuidValue(decodeUuidLiteral(v.text));

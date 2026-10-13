@@ -1374,10 +1374,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			return &rExpr{kind: reConstBool, cBool: e.Literal.Bool}, resolvedType{kind: rtBool}, nil
 		case literalText:
 			// A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
-			// context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
-			// input (uuid) — 22P02 on malformed; any other context — including none — keeps it text.
-			// A string literal is text by default (collation C). It adapts to a BYTEA context (hex
-			// input, 22P02), a UUID context (PG-flexible input, 22P02 — types.md §6/§13/§14), or a
+			// context (types.md §6/§13/§14): decode the bytea input (hex or escape) or the
+			// PG-flexible uuid input (uuid) — 22P02 on malformed; any other context — including none —
+			// keeps it text.
+			// A string literal is text by default (collation C). It adapts to a BYTEA context (hex or
+			// escape input, 22P02), a UUID context (PG-flexible input, 22P02 — types.md §6/§13/§14), or a
 			// TIMESTAMP/TIMESTAMPTZ context (parse the datetime, 22007/22008 — spec/design/timestamp.md).
 			switch {
 			case ctx != nil && ctx.IsBytea():

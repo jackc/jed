@@ -1289,11 +1289,17 @@ func isAdaptableOperand(e exprNode) bool {
 	return e.Kind == exprLiteral && (e.Literal.Kind == literalInt || e.Literal.Kind == literalText)
 }
 
-// decodeByteaLiteral decodes a single-quoted literal's content as a bytea value via the hex
-// input form (ParseByteaHex), mapping malformed hex to a 22P02 (invalid_text_representation).
-// Used when a string literal adapts to a bytea context (types.md §6/§13); the trap is
-// deterministic and fires at resolve time, before any scan.
+// decodeByteaLiteral decodes a text value as a bytea value — PostgreSQL's byteain (types.md §13).
+// A string that begins with `\x` is the hex input form (parseByteaHex; malformed hex is a 22P02
+// carrying the reason); any other string is the traditional escape form, decoded exactly as
+// decode(s, 'escape') (decodeEscape: `\\` is one backslash, `\nnn` with three octal digits ≤ `\377`
+// is one byte, every other byte is itself, and any other backslash is 22P02). Used by a string
+// literal adapting to a bytea context (types.md §6), where the trap is deterministic and fires at
+// resolve time before any scan, and by the per-row text → bytea cast.
 func decodeByteaLiteral(s string) ([]byte, error) {
+	if !strings.HasPrefix(s, `\x`) {
+		return decodeEscape([]byte(s))
+	}
 	b, reason := parseByteaHex(s)
 	if reason != "" {
 		return nil, newError(InvalidTextRepresentation, "invalid input syntax for type bytea: "+reason)

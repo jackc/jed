@@ -1,11 +1,12 @@
-# Bytea scalar type (spec/design/types.md §12): storage, hex-input literals (\x...), equality,
+# Bytea scalar type (spec/design/types.md §13): storage, hex- and escape-input literals, equality,
 # ordering (UNSIGNED byte order = memcmp), and NULL. The empty byte string '\x' is a distinct,
 # non-NULL value. bytea IS a valid PRIMARY KEY / index / UNIQUE key — its variable-width
 # bytea-terminated-escape key encoding (encoding.md §2.6) is self-delimiting and order-preserving
 # (exercised below, incl. the embedded-0x00 escape). A single-quoted literal adapts to a bytea
-# context (§6); malformed hex traps 22P02. A literal in a NON-bytea context is never decoded (it
+# context (§6) and decodes as PostgreSQL's byteain does: \x hex input, otherwise the traditional
+# escape format; malformed input traps 22P02. A literal in a NON-bytea context is never decoded (it
 # stays text). Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.bytea, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.bytea, types.array, cast.explicit, cast.operator, cast.string_literal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, b bytea)
@@ -98,18 +99,106 @@ INSERT INTO t VALUES (7, '\xabc')
 statement error 22P02
 INSERT INTO t VALUES (8, '\xzz')
 
-# ... missing the \x prefix (the traditional escape format is not accepted this slice) ...
-statement error 22P02
-INSERT INTO t VALUES (9, 'deadbeef')
-
-# ... and a prefix with the required backslash but the wrong format marker. This isolates the second
-# prefix byte from the wholly-missing-prefix case above.
+# ... and a backslash followed by anything but another backslash or three octal digits. A string
+# that does not begin with \x is read in the traditional escape format (below), where \y is no
+# valid escape.
 statement error 22P02
 INSERT INTO t VALUES (9, '\y00')
 
 # ... and a comparison literal traps the same way (pre-scan)
 statement error 22P02
 SELECT id FROM t WHERE b = '\xgg'
+
+# --- the traditional escape input format (PostgreSQL byteain) ------------------------------
+# A string that does NOT begin with \x is read in escape format: \\ is one backslash, \nnn (three
+# octal digits, the first 0-3) is one byte, and any other byte stands for itself. (Backslashes in
+# a standard string literal are ordinary characters, so '\101' is the four characters \ 1 0 1.)
+statement ok
+CREATE TABLE esc (id i32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO esc VALUES (1, 'deadbeef'), (2, '\101\102C'), (3, 'a\\b'), (4, ''), (5, '\000\377'), (6, '\\x41'), (7, 'é')
+
+query IT nosort
+SELECT id, b FROM esc ORDER BY id
+----
+1
+\x6465616462656566
+2
+\x414243
+3
+\x615c62
+4
+\x
+5
+\x00ff
+6
+\x5c783431
+7
+\xc3a9
+
+# escape-format and hex-format spellings of the same bytes are the same value
+query I nosort
+SELECT id FROM esc WHERE b = '\x414243'
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE b = '\336\255\276\357'
+----
+1
+
+# the empty string is the empty byte string in either format
+query I nosort
+SELECT id FROM esc WHERE b = '\x'
+----
+4
+
+# the same decoding applies to an explicit cast of a literal
+query T nosort
+SELECT CAST('\001\\z' AS bytea)
+----
+\x015c7a
+
+query T nosort
+SELECT 'abc' :: bytea
+----
+\x616263
+
+query T nosort
+SELECT bytea '\\'
+----
+\x5c
+
+# ... and to each element of an array literal (inside a quoted element, \\ is one backslash, so
+# "\\101" is the escape \101)
+query T nosort
+SELECT '{abc,"\\101",NULL,"\\x00ff"}' :: bytea[]
+----
+{"\\x616263","\\x41",NULL,"\\x00ff"}
+
+statement error 22P02
+SELECT '{"\\400"}' :: bytea[]
+
+# a malformed escape traps 22P02: an octal value whose first digit is above 3 ...
+statement error 22P02
+INSERT INTO esc VALUES (10, '\400')
+
+# ... a non-octal digit ...
+statement error 22P02
+INSERT INTO esc VALUES (10, '\8')
+
+# ... too few octal digits ...
+statement error 22P02
+INSERT INTO esc VALUES (10, '\10')
+
+# ... a trailing lone backslash ...
+statement error 22P02
+INSERT INTO esc VALUES (10, 'a\')
+
+# ... and an uppercase X, which is not the hex marker
+statement error 22P02
+SELECT id FROM esc WHERE b = '\X01'
 
 # a string literal with NO bytea context stays text and is never decoded: '\xzz' compared with
 # a text column is the ordinary 4-character text value \xzz, NOT a 22P02 (and here it matches).

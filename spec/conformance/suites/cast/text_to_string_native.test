@@ -4,16 +4,16 @@
 # evaluator: parse_timestamp (an offset validated then ignored), the timestamptz parse (an explicit
 # offset fixes the instant; an offset-LESS wall clock is read in the SESSION zone, as PostgreSQL's
 # timestamptz_in does, charging one timezone unit), parse_interval (the "unit + time" subset), and the
-# `\x` hex bytea input. Malformed input traps 22007 and an out-of-range field 22008, PER ROW during the
-# scan. The three datetime casts are STABLE, like PostgreSQL's timestamp_in / timestamptz_in /
-# interval_in, so an index expression containing one is 42P17; text → bytea is immutable (byteain)
-# and indexable. CAST(interval_expr AS interval) is the identity.
+# bytea input (PostgreSQL's byteain: `\x` hex, otherwise the traditional escape format). Malformed
+# input traps 22007 (bytea: 22P02) and an out-of-range field 22008, PER ROW during the scan. The
+# three datetime casts are STABLE, like PostgreSQL's timestamp_in / timestamptz_in / interval_in, so
+# an index expression containing one is 42P17; text → bytea is immutable (byteain) and indexable.
+# CAST(interval_expr AS interval) is the identity.
 #
 # OUT of this corpus (cannot live in the PG-clean oracle), covered by the per-core unit tests
 # (cast_text_string_native): the jed-stricter input grammars, identical to the literal path —
 # 'now'/'today'/'epoch' and DateStyle spellings for timestamp, ISO-8601 `P…` and SQL-standard
-# interval input, the traditional bytea escape format (all accepted by PG, rejected by jed); the
-# SQLSTATE subcode differences (an out-of-range offset 22008 vs PG 22009, interval overflow 22008 vs
+# interval input (all accepted by PG, rejected by jed); the SQLSTATE subcode differences (an out-of-range offset 22008 vs PG 22009, interval overflow 22008 vs
 # PG 22015, malformed hex 22P02 vs PG 22023); and a forbidden source (1::interval, 42804 vs PG 42846).
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.text, types.timestamp, types.timestamptz, types.interval, types.bytea, cast.explicit, cast.operator, cast.string_literal, cast.text_string_native, expr.timestamp_arithmetic, session.timezone, expr.at_time_zone, expr.interval_arithmetic, query.aggregates, expr.in_list, resource.cost_metering
@@ -293,8 +293,10 @@ statement ok
 CREATE TABLE b (id integer PRIMARY KEY, s text)
 
 statement ok
-INSERT INTO b VALUES (1, '\x'), (2, '\x00ff'), (3, '\xDEADbeef'), (4, NULL)
+INSERT INTO b VALUES (1, '\x'), (2, '\x00ff'), (3, '\xDEADbeef'), (4, NULL), (5, 'ab\\c'), (6, '\336\255')
 
+# a string not beginning with \x is the traditional escape format: \\ is one backslash, \nnn
+# (three octal digits) one byte, any other byte itself
 query IT nosort
 SELECT id, s :: bytea FROM b ORDER BY id
 ----
@@ -306,6 +308,10 @@ SELECT id, s :: bytea FROM b ORDER BY id
 \xdeadbeef
 4
 NULL
+5
+\x61625c63
+6
+\xdead
 
 query T nosort
 SELECT CAST(s AS bytea) FROM b WHERE id = 3
@@ -317,6 +323,26 @@ query I nosort
 SELECT id FROM b WHERE s :: bytea = '\xdeadbeef' :: bytea ORDER BY id
 ----
 3
+
+query I nosort
+SELECT id FROM b WHERE s :: bytea = '\xdead' :: bytea ORDER BY id
+----
+6
+
+# a malformed escape traps 22P02 per row, during the scan
+statement ok
+CREATE TABLE b_bad (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO b_bad VALUES (1, 'ok'), (2, '\400')
+
+query T nosort
+SELECT s :: bytea FROM b_bad WHERE id = 1
+----
+\x6f6b
+
+statement error 22P02
+SELECT s :: bytea FROM b_bad
 
 # ============================================================================================
 # Indexability: the datetime casts are STABLE (42P17), text → bytea is immutable

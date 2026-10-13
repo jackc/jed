@@ -354,9 +354,10 @@ func (v Value) IsFloat() bool { return v.Kind == ValFloat32 || v.Kind == ValFloa
 // ParseByteaHex decodes a bytea literal from its hex input form (spec/design/types.md §13):
 // a `\x` prefix followed by an even count of hexadecimal digits (case-insensitive), each
 // pair one byte; `\x` alone is the empty byte string. The inverse of the bytea render form,
-// so a value round-trips. The traditional escape input format is not accepted (a documented
-// narrowing). On success the reason is ""; on malformed input the bytes are nil and the
-// reason explains why (the caller raises it as a 22P02).
+// so a value round-trips. On success the reason is ""; on malformed input the bytes are nil and
+// the reason explains why (the caller raises it as a 22P02). decodeByteaLiteral routes here only
+// a string that begins with `\x`; any other string is the traditional escape input form, decoded
+// by decode(s, 'escape')'s kernel instead.
 func parseByteaHex(s string) (b []byte, reason string) {
 	if len(s) < 2 || s[0] != '\\' || s[1] != 'x' {
 		return nil, "bytea hex input must begin with \\x"

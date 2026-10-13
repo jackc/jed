@@ -3728,8 +3728,8 @@ pub(crate) fn resolve(
         }
         Expr::Literal(Literal::Text(s)) => {
             // A string literal is text by default (collation `C`). It adapts to a BYTEA context
-            // (decode the hex input, 22P02), a UUID context (PG-flexible uuid input, 22P02 —
-            // types.md §6/§13/§14), or a TIMESTAMP/TIMESTAMPTZ context (parse the datetime,
+            // (decode the hex or escape input, 22P02), a UUID context (PG-flexible uuid input,
+            // 22P02 — types.md §6/§13/§14), or a TIMESTAMP/TIMESTAMPTZ context (parse the datetime,
             // 22007/22008 — spec/design/timestamp.md). Any other context keeps it text.
             match ctx {
                 Some(t) if t.is_bytea() => Ok((

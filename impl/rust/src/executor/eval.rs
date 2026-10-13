@@ -216,7 +216,7 @@ impl RExpr {
                     // uuid_in parser; a malformed string traps 22P02.
                     Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
                     // text → interval / bytea (types.md §5): the literal's own input per row —
-                    // parse_interval (22007/22008) and the `\x` hex bytea input (22P02).
+                    // parse_interval (22007/22008) and the bytea input — `\x` hex or escape format (22P02).
                     Value::Text(s) if target.is_interval() => {
                         Ok(Value::Interval(crate::interval::parse_interval(&s)?))
                     }
