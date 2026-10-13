@@ -96,6 +96,7 @@ import {
   floatFromDecimalLiteral,
   intervalScaleResult,
   isAdaptableOperand,
+  parseBoolLiteral,
   promote,
   requireBool,
   requireNumericOperand,
@@ -3654,6 +3655,48 @@ export function resolveJsonObject(
   return {
     node: { kind: "jsonObjectFromArrays", json, args: rargs },
     type: { kind: json ? "json" : "jsonb" },
+  };
+}
+
+// resolveRowToJson resolves `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) →
+// json. The record is any composite (named or an anonymous ROW(…)) or an untyped NULL; a bare string
+// literal is PG's anonymous `record`, which has no input function (0A000); any other type is 42883.
+// The optional flag is a boolean (a bare string literal adapts). A timestamptz anywhere in the
+// record's type renders in the session zone, which makes the call nonimmutable (42P17 in an index
+// expression).
+export function resolveRowToJson(
+  scope: Scope,
+  args: Expr[],
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (args.length === 0 || args.length > 2) throw noFuncOverload("row_to_json");
+  if (isStringLiteral(args[0])) {
+    throw engineError(
+      "feature_not_supported",
+      "input of anonymous composite types is not implemented",
+    );
+  }
+  const record = resolve(scope, args[0], null, ag, params);
+  if (record.type.kind !== "composite" && record.type.kind !== "null") {
+    throw noFuncOverload("row_to_json");
+  }
+  const rargs: RExpr[] = [record.node];
+  if (args.length === 2) {
+    const flag = args[1];
+    if (flag.kind === "literal" && flag.literal.kind === "text") {
+      // A bare string literal adapts to the boolean through PG's boolin (22P02 if malformed).
+      rargs.push({ kind: "constBool", value: parseBoolLiteral(flag.literal.text) });
+    } else {
+      const f = resolve(scope, flag, "boolean", ag, params);
+      if (f.type.kind !== "bool" && f.type.kind !== "null") throw noFuncOverload("row_to_json");
+      rargs.push(f.node);
+    }
+  }
+  params.nonimmutable ||= containsTimestamptz(record.type);
+  return {
+    node: { kind: "rowToJson", args: rargs, recordType: record.type },
+    type: { kind: "json" },
   };
 }
 

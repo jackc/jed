@@ -537,9 +537,11 @@ computation (§9.4), input (§9.3), and output alike. Oracle-checked in
   `42P17` in an index expression or predicate; an array whose element type holds no `timestamptz`
   renders zone-free and stays admissible. (PostgreSQL marks `array_out` STABLE for every element type;
   jed's per-operation dependency rule, [index-dependencies.md](index-dependencies.md), admits the
-  zone-free ones.) The composite → text and range → text casts remain `0A000`, and `to_json[b]` of a
-  `timestamptz` remains a `0A000` follow-on; when it lands it renders the session zone in
-  PostgreSQL's ISO form (`"2024-01-15T17:30:00+05:30"`).
+  zone-free ones.) The composite → text and range → text casts remain `0A000`. `row_to_json` renders a
+  `timestamptz` at any depth in the session zone in PostgreSQL's ISO form
+  (`"2024-01-15T17:30:00+05:30"`), with the same per-instant `timezone` charge and the same
+  STABLE-iff-it-holds-`timestamptz` rule ([json-sql-functions.md](json-sql-functions.md) §2.2).
+  `to_json[b]` of a `timestamptz` remains a `0A000` follow-on.
 - **Result cells.** A result cell is a zone-free value; turning it into text is a host act. The host
   API therefore has two renders:
   - the **canonical render** — Rust `Value::render`, Go `Value.Render`, TS `render(value)` — is

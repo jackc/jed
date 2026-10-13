@@ -95,7 +95,7 @@ already built.
 | `jsonb_set_lax(jsonb, text[], jsonb [, create_if_missing bool [, null_value_treatment text]])` | | `jsonb` | `jsonb_set` that is not strict in the value; a SQL NULL value follows `null_value_treatment` (below) |
 | `jsonb_insert(jsonb, text[], jsonb [, insert_after bool])` | | `jsonb` | insert at path |
 | `jsonb_pretty(jsonb)` | any | `text` | indented render |
-| `row_to_json(record [, pretty bool])` | composite | `json` | composite value → object |
+| `row_to_json(record [, pretty bool])` | composite | `json` | composite value → object (§2.2) |
 | `array_to_json(anyarray [, pretty bool])` | array | `json` | array value → JSON array |
 
 **The path mutators' signatures.** `jsonb_set`, `jsonb_set_lax`, and `jsonb_insert` are resolved by
@@ -162,6 +162,75 @@ check (jsonb_set_lax: the order above), the checks run in PostgreSQL's order:
 `- text[]` (PostgreSQL's `jsonb_delete_array`) shares steps 1–4 with the message `cannot delete from
 scalar`, and then **skips** a NULL key. The extractors differ: `#>`, `#>>` (jsonb and the verbatim
 json overloads, §1.1) return SQL NULL when the path holds any NULL element.
+
+### 2.2 `row_to_json(record [, pretty boolean])`
+
+`row_to_json` renders a composite value as a `json` object. It is a port of PostgreSQL's
+`composite_to_json` and `datum_to_json` (json.c). The function is hand-resolved: the catalog has no
+`record` family.
+
+**The argument.** A named composite takes its member names from the type's fields. An anonymous
+`ROW(…)` names its fields `f1`, `f2`, …, as PostgreSQL does. The argument must be a composite.
+An untyped `NULL` is accepted and yields `NULL`. A bare string literal is `0A000` `input of anonymous
+composite types is not implemented`, because PostgreSQL reads it as an anonymous `record`. Any
+other type is `42883`. The optional flag must be a boolean; a bare string literal adapts to it.
+Any other flag type, and any other argument count, is `42883`. The function is STRICT: a `NULL`
+record or flag yields `NULL`.
+
+**Whole-row references are not expressible.** PostgreSQL's common `row_to_json(t)` passes a table
+alias as its row. jed has no implicit per-table row type ([composite.md](composite.md) §10.4) and
+no row-valued table reference ([grammar.md](grammar.md) §15). There, `t` resolves as a missing
+column (`42703`). Use a composite column or `ROW(t.a, t.b, …)` instead. This divergence is
+recorded in the override ledger.
+
+**The object.** The output is `{`, then one `"name":value` member per field in declaration order,
+then `}`. The name is escaped as a JSON string. Members are separated by `,` with no spaces. With
+`pretty = true`, the separator between **top-level** members is `,\n ` (a comma, a newline, and
+one space). Nested composites and arrays never break lines. `ROW()` renders as `{}`.
+
+**Each field's value** follows PostgreSQL's `datum_to_json`:
+
+| Field | JSON |
+|---|---|
+| `NULL` | `null` |
+| `boolean` | `true` / `false` |
+| integer, `decimal` | the number's text, exact (`1.50` keeps its scale) |
+| `text` | an escaped JSON string (`\"`, `\\`, `\n`, `\t`, …, other controls as `\u00XX`) |
+| `json` | the value's text, verbatim |
+| `jsonb` | the canonical, spaced text (`{"a": 1}`) |
+| array | `[`…`]` with `,` separators, elements by these rules. A multidimensional array nests one level per dimension; the lower bounds are dropped; an empty array is `[]` |
+| composite | a nested object, rendered the same way |
+| `date` | `"2024-01-15"` (a BC date keeps its ` BC` suffix) |
+| `timestamp` | ISO 8601 with a `T` separator: `"2024-01-15T10:30:00.5"`, fraction trimmed, ` BC` suffix |
+| `timestamptz` | in the session zone, with an offset of at least hours and minutes: `"2024-01-15T17:30:00+05:30"`, `"…+00:00"`, an LMT `"…-04:56:02"` |
+| `interval`, `uuid`, `bytea`, range, `jsonpath` | the JSON string of the type's text output (`"1 day 02:00:00"`, `"\\x0102"`, `"[1,5)"`). A `timestamptz` range bound renders in the session zone |
+| `f32` / `f64` | `0A000` (below) |
+
+The datetime forms are PostgreSQL's `JsonEncodeDateTime` (the `XSD` date style). They differ from
+the text output in two places: the `T` separator, and a `timestamptz` offset that always shows
+minutes. `±infinity` renders as the words `"infinity"` and `"-infinity"`.
+
+**Float fields are a deferred `0A000`.** `to_json` and `to_jsonb` defer a float source too.
+PostgreSQL writes the `float8out` text as a JSON number. jed keeps binary floats out of its
+byte-identical text outputs, because each core's shortest round-trip layout differs
+([determinism.md](determinism.md), `float-render-layout`). This divergence is recorded in the
+override ledger.
+
+**Session zone.** A `timestamptz` anywhere in the argument's type (a field, an array element, a
+range bound, at any depth) is rendered in the session zone. Such a call is nonimmutable: it is
+`42P17` in an index expression or predicate. Other calls are admitted, under the per-operation
+dependency rule of [index-dependencies.md](index-dependencies.md). PostgreSQL marks `row_to_json`
+STABLE for every argument.
+
+**Cost.** One `operator_eval` for the call. Then one `timezone` unit per finite `timestamptz`
+rendered, charged and guarded before rendering, as for the array → text cast
+([timezones.md](timezones.md) §9.5). The function is a growth kernel ([cost.md](cost.md) §8.1): it
+charges `scalar_byte` × the result's UTF-8 bytes, and nothing when every argument is constant. The
+result passes the textual depth check ([json.md](json.md) §6.4), since a `jsonb` field can nest deep.
+
+`row_to_json(x)` is `to_json(x)` for a composite in PostgreSQL. jed's `to_json` and `to_jsonb` still
+defer composite, datetime, `uuid`, `bytea`, `interval`, and range sources (`0A000`). `row_to_json`
+does not share their kernel.
 
 ---
 

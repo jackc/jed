@@ -2579,6 +2579,54 @@ func resolveJSONObject(s *scope, name string, jsonResult bool, fc *funcCallExpr,
 	return &rExpr{kind: reJsonObject, jbJson: jsonResult, sargs: rargs}, resolvedType{kind: result}, nil
 }
 
+// resolveRowToJSON resolves `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) →
+// json. The record is any composite (named or an anonymous ROW(…)) or an untyped NULL; a bare string
+// literal is PG's anonymous `record`, which has no input function (0A000); any other type is 42883.
+// The optional flag is a boolean (a bare string literal adapts). A timestamptz anywhere in the
+// record's type renders in the session zone, which makes the call nonimmutable (42P17 in an index
+// expression).
+func resolveRowToJSON(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if len(fc.Args) == 0 || len(fc.Args) > 2 {
+		return nil, resolvedType{}, noFuncOverload("row_to_json")
+	}
+	if isStringLiteral(*fc.Args[0]) {
+		return nil, resolvedType{}, newError(FeatureNotSupported, "input of anonymous composite types is not implemented")
+	}
+	record, ty, err := resolve(s, *fc.Args[0], nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if ty.kind != rtComposite && ty.kind != rtNull {
+		return nil, resolvedType{}, noFuncOverload("row_to_json")
+	}
+	sargs := []*rExpr{record}
+	if len(fc.Args) == 2 {
+		flag := *fc.Args[1]
+		var f *rExpr
+		if isStringLiteral(flag) {
+			// A bare string literal adapts to the boolean through PG's boolin (22P02 if malformed).
+			b, err := parseBoolLiteral(flag.Literal.Str)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			f = valueToRExpr(BoolValue(b))
+		} else {
+			boolHint := scalarBool
+			r, tf, err := resolve(s, flag, &boolHint, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if tf.kind != rtBool && tf.kind != rtNull {
+				return nil, resolvedType{}, noFuncOverload("row_to_json")
+			}
+			f = r
+		}
+		sargs = append(sargs, f)
+	}
+	params.nonimmutable = params.nonimmutable || ty.containsTimestamptz()
+	return &rExpr{kind: reRowToJson, sargs: sargs, recordType: &ty}, resolvedType{kind: rtJson}, nil
+}
+
 // valueToOptTextArray extracts a `text[]` value into a []*string, preserving NULL elements (a nil
 // pointer) — nil if the value is not an array. Used by json_object (a NULL value → JSON null; a NULL
 // key → 22004).
@@ -2846,6 +2894,17 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 			mode = psInsert
 		}
 		return resolveJSONSetInsert(s, name, mode, fc, ag, params)
+	}
+	// row_to_json(record [, pretty boolean]) (json-sql-functions.md §2.2) takes any composite — the
+	// catalog has no `record` family — so it is hand-resolved too.
+	if name == "row_to_json" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		return resolveRowToJSON(s, fc, ag, params)
 	}
 	// json_object / jsonb_object (json-sql-functions.md §2) build an object from one text[] of
 	// alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting

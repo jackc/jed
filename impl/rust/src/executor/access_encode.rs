@@ -1306,6 +1306,7 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::RowToJson { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().fold(0, |total, arg| {
             sat_add(total, estimator_operator_nodes(Some(arg)))
         }),
@@ -1403,6 +1404,7 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::RowToJson { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().collect(),
         RExpr::JsonSqlFn { ctx, path, .. } => vec![ctx, path],
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => fields.iter().collect(),
@@ -2760,6 +2762,7 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::RowToJson { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::JsonSqlFn { ctx, path, .. } => rexpr_is_constant(ctx) && rexpr_is_constant(path),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),

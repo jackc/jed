@@ -574,6 +574,14 @@ func makeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, er
 // +HH, +HH:MM when the minutes are nonzero, +HH:MM:SS when the seconds are (an LMT offset), placed
 // before any " BC" era.
 func renderDatetime(micros int64, offset *int32) string {
+	return renderDatetimeStyled(micros, offset, false)
+}
+
+// renderDatetimeStyled is the shared body of renderDatetime (xsd false, PostgreSQL's ISO date style)
+// and the JSON renders (xsd true, the XSD style JsonEncodeDateTime forces — json-sql-functions.md
+// §2.2): XSD separates the date and time with T instead of a space, and always spells an offset's
+// minutes (+00:00, not +00).
+func renderDatetimeStyled(micros int64, offset *int32, xsd bool) string {
 	if micros == negInfinity {
 		return "-infinity"
 	}
@@ -588,7 +596,11 @@ func renderDatetime(micros int64, offset *int32) string {
 		era = " BC"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%04d-%02d-%02d %02d:%02d:%02d", displayed, mo, d, h, mi, s)
+	sep := byte(' ')
+	if xsd {
+		sep = 'T'
+	}
+	fmt.Fprintf(&b, "%04d-%02d-%02d%c%02d:%02d:%02d", displayed, mo, d, sep, h, mi, s)
 	if us != 0 {
 		frac := fmt.Sprintf("%06d", us)
 		frac = strings.TrimRight(frac, "0")
@@ -607,7 +619,7 @@ func renderDatetime(micros int64, offset *int32) string {
 		fmt.Fprintf(&b, "%02d", h)
 		if sec != 0 {
 			fmt.Fprintf(&b, ":%02d:%02d", mi, sec)
-		} else if mi != 0 {
+		} else if mi != 0 || xsd {
 			fmt.Fprintf(&b, ":%02d", mi)
 		}
 	}
@@ -638,4 +650,24 @@ func renderTimestamptzIn(micros int64, zone ZoneRef) (string, error) {
 		return "", errZoneShiftOutOfRange()
 	}
 	return renderDatetime(local, &off.Utoff), nil
+}
+
+// renderTimestampXSD renders a timestamp value as its JSON string body (JsonEncodeDateTime, the XSD
+// style — json-sql-functions.md §2.2): 2024-01-15T10:30:00.5, ±infinity bare, a " BC" suffix.
+func renderTimestampXSD(micros int64) string { return renderDatetimeStyled(micros, nil, true) }
+
+// renderTimestamptzXSDIn renders a timestamptz instant as its JSON string body in zone (the XSD
+// style): the local wall clock with a T separator and an offset that always shows its minutes
+// (+05:30, +00:00). ±infinity render bare; a local reading out of range traps 22008, as the text
+// render does.
+func renderTimestamptzXSDIn(micros int64, zone ZoneRef) (string, error) {
+	if micros == negInfinity || micros == posInfinity {
+		return renderDatetime(micros, nil), nil
+	}
+	off := offsetAtRef(zone, floorDiv(micros, 1_000_000))
+	local, ok := instantToLocalMicros(zone, micros)
+	if !ok {
+		return "", errZoneShiftOutOfRange()
+	}
+	return renderDatetimeStyled(local, &off.Utoff, true), nil
 }

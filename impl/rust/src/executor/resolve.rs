@@ -1081,6 +1081,48 @@ pub(crate) fn resolve_json_object(
     Ok((RExpr::JsonObjectFromArrays { json, args: rargs }, result))
 }
 
+/// Resolve `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) → json. The record
+/// is any composite (named or an anonymous `ROW(…)`) or an untyped NULL; a bare string literal is PG's
+/// anonymous `record`, which has no input function (0A000); any other type is 42883. The optional
+/// flag is a boolean (a bare string literal adapts). A `timestamptz` anywhere in the record's type
+/// renders in the session zone, which makes the call nonimmutable (42P17 in an index expression).
+pub(crate) fn resolve_row_to_json(
+    scope: &Scope,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(no_func_overload("row_to_json"));
+    }
+    if is_string_literal(&args[0]) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "input of anonymous composite types is not implemented",
+        ));
+    }
+    let (record, ty) = resolve(scope, &args[0], None, agg, params)?;
+    if !matches!(ty, ResolvedType::Composite(_) | ResolvedType::Null) {
+        return Err(no_func_overload("row_to_json"));
+    }
+    let mut rargs = vec![record];
+    if let Some(flag) = args.get(1) {
+        // A bare string literal adapts to the boolean through PG's boolin (22P02 if malformed).
+        let f = if let Expr::Literal(Literal::Text(s), _) = flag {
+            RExpr::ConstBool(parse_bool_literal(s)?)
+        } else {
+            let (f, tf) = resolve(scope, flag, Some(ScalarType::Bool), agg, params)?;
+            if !matches!(tf, ResolvedType::Bool | ResolvedType::Null) {
+                return Err(no_func_overload("row_to_json"));
+            }
+            f
+        };
+        rargs.push(f);
+    }
+    params.nonimmutable |= ty.contains_timestamptz();
+    Ok((RExpr::RowToJson { args: rargs, ty }, ResolvedType::Json))
+}
+
 /// Resolve a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. A
 /// bare string literal adapts (the context to jsonb, the path to a compiled jsonpath). STRICT.
 pub(crate) fn resolve_jsonpath_fn(

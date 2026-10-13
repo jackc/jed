@@ -477,6 +477,14 @@ pub fn make_timestamp(
 /// `+HH`, `+HH:MM` when the minutes are nonzero, `+HH:MM:SS` when the seconds are (an LMT offset),
 /// placed before any ` BC` era.
 fn render(micros: i64, offset: Option<i32>) -> String {
+    render_styled(micros, offset, false)
+}
+
+/// The shared body of [`render`] (`xsd = false`, PostgreSQL's `ISO` date style) and the JSON
+/// renders (`xsd = true`, the `XSD` style `JsonEncodeDateTime` forces — json-sql-functions.md
+/// §2.2): XSD separates the date and time with `T` instead of a space, and always spells an
+/// offset's minutes (`+00:00`, not `+00`).
+fn render_styled(micros: i64, offset: Option<i32>, xsd: bool) -> String {
     if micros == NEG_INFINITY {
         return "-infinity".to_string();
     }
@@ -485,7 +493,8 @@ fn render(micros: i64, offset: Option<i32>) -> String {
     }
     let (y, mo, d, h, mi, s, us) = civil_from_micros(micros);
     let (displayed, era) = if y <= 0 { (1 - y, " BC") } else { (y, "") };
-    let mut out = format!("{displayed:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+    let sep = if xsd { 'T' } else { ' ' };
+    let mut out = format!("{displayed:04}-{mo:02}-{d:02}{sep}{h:02}:{mi:02}:{s:02}");
     if us != 0 {
         let frac = format!("{us:06}");
         out.push('.');
@@ -498,12 +507,31 @@ fn render(micros: i64, offset: Option<i32>) -> String {
         out.push_str(&format!("{sign}{h:02}"));
         if s != 0 {
             out.push_str(&format!(":{mi:02}:{s:02}"));
-        } else if mi != 0 {
+        } else if mi != 0 || xsd {
             out.push_str(&format!(":{mi:02}"));
         }
     }
     out.push_str(era);
     out
+}
+
+/// Render a `timestamp` value as its JSON string body (`JsonEncodeDateTime`, the XSD style —
+/// json-sql-functions.md §2.2): `2024-01-15T10:30:00.5`, ±infinity bare, a ` BC` suffix.
+pub fn render_timestamp_xsd(micros: i64) -> String {
+    render_styled(micros, None, true)
+}
+
+/// Render a `timestamptz` instant as its JSON string body in `zone` (the XSD style): the local wall
+/// clock with a `T` separator and an offset that always shows its minutes (`+05:30`, `+00:00`).
+/// ±infinity render bare; a local reading out of range traps `22008`, as the text render does.
+pub fn render_timestamptz_xsd_in(micros: i64, zone: &crate::timezone::ZoneRef) -> Result<String> {
+    if micros == NEG_INFINITY || micros == POS_INFINITY {
+        return Ok(render(micros, None));
+    }
+    let off = crate::timezone::offset_at_ref(zone, micros.div_euclid(MICROS_PER_SEC));
+    let local = crate::timezone::instant_to_local_micros(zone, micros)
+        .ok_or_else(zone_shift_out_of_range)?;
+    Ok(render_styled(local, Some(off.utoff), true))
 }
 
 /// Render a `timestamp` value to its canonical text.

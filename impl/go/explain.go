@@ -1508,6 +1508,8 @@ func renderRExpr(e *rExpr) string {
 			name = "json_object"
 		}
 		return explainExprCall(name, e.sargs)
+	case reRowToJson:
+		return explainExprCall("row_to_json", e.sargs)
 	case reJsonPathFn:
 		return explainExprCall(explainJSONPathFunc(e.jpFnKind), e.sargs)
 	case reJsonSqlFn:

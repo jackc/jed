@@ -1543,6 +1543,7 @@ impl Engine {
             | RExpr::JsonBuild { args, .. }
             | RExpr::JsonSetInsert { args, .. }
             | RExpr::JsonObjectFromArrays { args, .. }
+            | RExpr::RowToJson { args, .. }
             | RExpr::JsonPathFn { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;

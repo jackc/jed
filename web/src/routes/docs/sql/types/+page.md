@@ -102,6 +102,12 @@ RETURNING body, raw;`;
   '{"a" : [1,  2], "a": {"b" :  1.50}}'::jsonb -> 'a'      AS jsonb_member,
   '{"a" : [1,  2], "a": {"b" :  1.50}}'::json #>> '{a,b}'  AS b_text;`;
 
+	const rowToJsonDemo = `CREATE TYPE addr AS (street text, zip i32);
+SELECT
+  row_to_json('(Main,90210)'::addr)                     AS named,
+  row_to_json(ROW(1, NULL, ARRAY[1, 2], '{"b":2}'::jsonb)) AS anonymous,
+  row_to_json(ROW(timestamp '2024-01-15 10:30:00'))     AS stamp;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -385,6 +391,19 @@ A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper d
 building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with
 `54001`. PostgreSQL's limit depends on its stack size and is much higher (about 10 000 levels by
 default). jed's fixed limit is the same in every core.
+
+## Rows as JSON
+
+`row_to_json(record [, pretty])` renders a composite value as a `json` object, as in PostgreSQL. A
+named composite type keys the members by its field names, and an anonymous `ROW(…)` names them
+`f1`, `f2`, …. Each field takes its JSON form: numbers stay exact, a `jsonb` field embeds its
+canonical text, arrays and nested composites nest, and dates and timestamps become ISO 8601 strings
+(a `timestamptz` in the session time zone). With `pretty` set to `true`, each top-level member goes
+on its own line. jed has no implicit row type per table, so PostgreSQL's `row_to_json(t)` over a
+table alias is not available: build the row with `ROW(t.a, t.b)` or use a composite column. A
+float (`f32`/`f64`) field is not supported yet (`0A000`):
+
+<LiveSql demo="rowToJsonDemo" query={rowToJsonDemo} rows={1} />
 
 ## Three-valued NULL logic
 

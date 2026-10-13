@@ -1102,6 +1102,7 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::RowToJson { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::JsonSqlFn { ctx, path, .. } => {
             rexpr_references_outer(ctx, depth) || rexpr_references_outer(path, depth)
@@ -1264,6 +1265,7 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::RowToJson { args, .. }
         | RExpr::JsonPathFn { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);

@@ -109,6 +109,8 @@ mod views;
 pub(crate) use views::*;
 mod view_write;
 pub(crate) use view_write::*;
+mod row_json;
+pub(crate) use row_json::*;
 // __SUBMODULES__
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -3938,6 +3940,13 @@ pub(crate) enum RExpr {
         json: bool,
         args: Vec<RExpr>,
         array_form: bool,
+    },
+    /// `row_to_json(record [, pretty])` (json-sql-functions.md §2.2): `args` are the record and the
+    /// optional boolean flag; `ty` is the record's static type — a composite, whose field names key
+    /// the members, or `Null` for an untyped NULL argument. STRICT (a NULL operand → NULL).
+    RowToJson {
+        args: Vec<RExpr>,
+        ty: ResolvedType,
     },
     /// A correlated column reference (spec/design/grammar.md §26): the column `index` of the
     /// enclosing-query row `level` hops out (1 = immediate parent). A **leaf** — charges no

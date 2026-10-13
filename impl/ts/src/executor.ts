@@ -510,6 +510,7 @@ import {
   resolveDeriv,
   resolveIntOrDecimalPair,
   resolveJsonObject,
+  resolveRowToJson,
   resolveJsonbSetInsert,
   resolveJsonpathArgs,
   resolveJsonpathFn,
@@ -3831,7 +3832,8 @@ export class Engine {
       case "greatestLeast": case "coalesce": case "scalarFunc": case "hostFunc": case "arrayFunc":
       case "regexFunc": case "rangeFunc": case "rangeCtor": case "rangeOp":
       case "rangeSetOp": case "variadic": case "jsonBuild": case "jsonSetInsert":
-      case "jsonObjectFromArrays": case "jsonPathFn": case "jsonSqlFn": addMany(expr.args); return;
+      case "jsonObjectFromArrays": case "rowToJson": case "jsonPathFn": case "jsonSqlFn":
+        addMany(expr.args); return;
       case "row": addMany(expr.fields); return;
       case "array": addMany(expr.elements); return;
       case "field": add(expr.base); return;
@@ -21692,6 +21694,7 @@ export class Engine {
       case "jsonBuild":
       case "jsonSetInsert":
       case "jsonObjectFromArrays":
+      case "rowToJson":
       case "jsonPathFn":
       case "jsonSqlFn":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
@@ -23607,6 +23610,7 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "rowToJson":
     case "jsonPathFn":
     case "jsonSqlFn":
       children = expr.args.reduce<bigint>(
@@ -24549,6 +24553,7 @@ export function rexprIsConstant(e: RExpr): boolean {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "rowToJson":
     case "jsonPathFn":
     case "jsonSqlFn":
       return e.args.every(rexprIsConstant);
@@ -26764,6 +26769,7 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "rowToJson":
     case "jsonPathFn":
     case "jsonSqlFn":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
@@ -27220,6 +27226,7 @@ function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "rowToJson":
     case "jsonPathFn":
     case "jsonSqlFn":
       for (const a of e.args) collectHostFuncNodes(a, out);
@@ -27501,6 +27508,7 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "rowToJson":
     case "jsonPathFn":
     case "jsonSqlFn":
       for (const a of e.args) collectTouched(a, depth, touched);
@@ -27909,6 +27917,7 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
+    case "rowToJson":
     case "jsonPathFn":
     case "jsonSqlFn":
       for (const a of e.args) rebasePlaceholderCols(a, from, target);
@@ -28459,6 +28468,15 @@ export type RExpr =
       kind: "jsonObjectFromArrays";
       json: boolean;
       args: RExpr[];
+    }
+  // `row_to_json(record [, pretty])` (json-sql-functions.md §2.2): the composite record rendered as
+  // a json object. `args` is [record] or [record, pretty boolean]; STRICT (any NULL → SQL NULL).
+  // `recordType` is the record's static type — a composite, whose field names key the members, or
+  // null for an untyped NULL argument.
+  | {
+      kind: "rowToJson";
+      args: RExpr[];
+      recordType: ResolvedType;
     }
   // A scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists / jsonb_path_query_first
   // / jsonb_path_query_array. `args` = `[ctx jsonb, path jsonpath]`; STRICT (any NULL → SQL NULL).
@@ -33707,6 +33725,13 @@ export function resolveFuncCall(
       ag,
       params,
     );
+  }
+  // `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) takes any composite — the
+  // catalog has no `record` family — so it is hand-resolved too.
+  if (lname === "row_to_json") {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    return resolveRowToJson(scope, e.args, ag, params);
   }
   // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
   // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting

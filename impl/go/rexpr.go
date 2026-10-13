@@ -536,6 +536,11 @@ const (
 	// NULL array → SQL NULL). `jbJson` true ⇒ the json result (insertion order + dups + " : "
 	// spacing); false ⇒ the jsonb result (canonical: last-wins dedup + sorted keys).
 	reJsonObject
+	// reRowToJson is `row_to_json(record [, pretty])` (json-sql-functions.md §2.2): the composite
+	// record rendered as a json object. `sargs` = [record] or [record, pretty boolean]; STRICT (any
+	// NULL → SQL NULL). `recordType` is the record's static type — a composite, whose field names key
+	// the members, or rtNull for an untyped NULL argument.
+	reRowToJson
 	// reJsonPathFn is a scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists /
 	// jsonb_path_query_first / jsonb_path_query_array. `sargs` = [ctx jsonb, path jsonpath]; STRICT
 	// (any NULL → SQL NULL). `jpFnKind` selects which function. The path is recompiled from its
@@ -1174,6 +1179,9 @@ type rExpr struct {
 	// (json-sql-functions.md §2).
 	psMode pathSetMode
 	psLax  bool
+
+	// reRowToJson: the record argument's static type (its field names key the object's members).
+	recordType *resolvedType
 
 	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
 	// arrays, stacked into one higher dimension — spec/design/array.md §4).

@@ -3923,6 +3923,41 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			members = append(members, JsonMember{Key: *p.key, Val: node})
 		}
 		return growthResult(m, e.sargs, JsonbValue(makeObject(members)))
+	case reRowToJson:
+		// row_to_json(record [, pretty]) (json-sql-functions.md §2.2): the composite rendered as a json
+		// object. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
+		// guarded before rendering (the array → text cast's rule, timezones.md §9.5).
+		m.Charge(costs.OperatorEval)
+		vals := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
+		}
+		for _, v := range vals {
+			if v.IsNull() {
+				return NullValue(), nil
+			}
+		}
+		pretty := len(vals) == 2 && vals[1].Kind == ValBool && vals[1].boolVal()
+		if zoned := vals[0].zoneRenderCount(); zoned > 0 {
+			m.Charge(costs.Timezone * zoned)
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+		}
+		var b strings.Builder
+		if err := compositeToJSON(*vals[0].composite(), e.recordType.comp, pretty, env.exec.session.timeZone, &b); err != nil {
+			return Value{}, err
+		}
+		// A jsonb field can nest a deep document (json.md §6.4).
+		text := b.String()
+		if err := checkJSONTextDepth(text); err != nil {
+			return Value{}, err
+		}
+		return growthResult(m, e.sargs, JsonValue(text))
 	case reJsonSetInsert:
 		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
 		// → SQL NULL (a NULL path element is the kernel's 22004). One operator_eval; the args charge their own.

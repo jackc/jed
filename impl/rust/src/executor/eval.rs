@@ -3085,6 +3085,38 @@ impl RExpr {
                 };
                 Ok(Value::Int(count as i64))
             }
+            // row_to_json(record [, pretty]) (json-sql-functions.md §2.2): the composite rendered as a
+            // json object. STRICT. A finite timestamptz at any depth charges one `timezone` unit,
+            // charged and guarded before rendering (the array → text cast's rule, timezones.md §9.5).
+            RExpr::RowToJson { args, ty } => {
+                m.charge(COSTS.operator_eval);
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(a.eval(row, env, m)?);
+                }
+                if vals.iter().any(|v| matches!(v, Value::Null)) {
+                    return Ok(Value::Null);
+                }
+                let (Value::Composite(fields), ResolvedType::Composite(c)) = (&vals[0], ty) else {
+                    unreachable!("resolver restricts row_to_json to a composite record")
+                };
+                let pretty = matches!(vals.get(1), Some(Value::Bool(true)));
+                let zoned = vals[0].zone_render_count();
+                if zoned > 0 {
+                    m.charge(COSTS.timezone * zoned as i64);
+                    m.guard()?;
+                }
+                let mut text = String::new();
+                composite_to_json(fields, c, pretty, &env.exec.session.time_zone, &mut text)?;
+                // A jsonb field can nest a deep document (json.md §6.4).
+                json::check_text_depth(&text)?;
+                let out = Value::Json(text);
+                // A growth kernel (cost.md §8.1), free over constant operands.
+                if !args.iter().all(rexpr_is_constant) {
+                    charge_output(m, &out)?;
+                }
+                Ok(out)
+            }
             // A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values
             // (the spread form directly; the VARIADIC-array form spreads the lone array — a NULL
             // array → NULL), then build an array / object node.

@@ -18,6 +18,7 @@ import {
   fieldOverflow,
   parseTimestamptzInput,
   renderTimestamptzAt,
+  renderTimestamptzXsdAt,
 } from "./timestamp.ts";
 
 const SECS_PER_DAY = 86_400n;
@@ -643,6 +644,16 @@ export function renderTimestamptzIn(zr: ZoneRef, micros: bigint): string {
   if (micros === NEG_INFINITY || micros === POS_INFINITY) return renderTimestamptzAt(micros, 0);
   const local = instantToLocalMicros(zr, micros);
   return renderTimestamptzAt(micros, Number((local - micros) / 1_000_000n));
+}
+
+// renderTimestamptzXsdIn renders a timestamptz instant as its JSON string body in zone zr (the XSD
+// style row_to_json uses — json-sql-functions.md §2.2): renderTimestamptzIn with a T separator and an
+// offset that always shows its minutes. ±infinity render bare; an out-of-range local reading traps
+// 22008. Meters nothing — the caller charges the timezone unit.
+export function renderTimestamptzXsdIn(zr: ZoneRef, micros: bigint): string {
+  if (micros === NEG_INFINITY || micros === POS_INFINITY) return renderTimestamptzXsdAt(micros, 0);
+  const local = instantToLocalMicros(zr, micros);
+  return renderTimestamptzXsdAt(micros, Number((local - micros) / 1_000_000n));
 }
 
 // localToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. The offset is

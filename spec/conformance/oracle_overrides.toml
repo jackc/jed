@@ -1465,3 +1465,15 @@ reason = "jed: a data-modifying WITH in CREATE TABLE … AS is 0A000 — the que
 file = "expr/width_bucket_array.test"
 sql = "SELECT width_bucket(5::i64, ARRAY[1.5, 2.5]::f64[])"
 reason = "jed: a typed integer operand and f64 thresholds are not comparable (no implicit int→float promotion — the float strict island, float.md §6), so width_bucket(anycompatible, anycompatiblearray) finds no common type and is 42883. PostgreSQL unifies bigint with double precision and returns 2. A bare integer literal adapts to the element type and resolves in both engines."
+
+# --- row_to_json(record): jed has no whole-row table reference, and a float field keeps to_json's
+# float deferral (json-sql-functions.md §2.2).
+[[override]]
+file = "json/row_to_json.test"
+sql = "SELECT row_to_json(p) FROM person p"
+reason = "jed: no implicit per-table row type (composite.md §10.4) and no row-valued table reference (grammar.md §15), so the alias `p` is not a value and resolves as a missing column, 42703. PostgreSQL reads `p` as a whole-row reference of the table's row type and returns one object per row. A composite column, a named composite value, or ROW(col, …) is the jed spelling."
+
+[[override]]
+file = "json/row_to_json.test"
+sql = "SELECT row_to_json(ROW(1.5::f64))"
+reason = "jed: a float field is a deferred 0A000, the same deferral to_json/to_jsonb carry for a float source (json-sql-functions.md §2.2): binary floats stay out of jed's byte-identical text outputs (CLAUDE.md §8, float.md), and each core's shortest round-trip layout differs (determinism_exceptions.toml float-render-layout). PostgreSQL renders the float8out text as a JSON number (1.5)."

@@ -817,6 +817,8 @@ var SupportedCapabilities = []string{
 	// json/jsonb construction builders (B1) — to_json / json[b]_build_array / json[b]_build_object
 	// (json-sql-functions.md §2).
 	"func.json_builders",
+	// row_to_json(record [, pretty]) — a composite as a json object (json-sql-functions.md §2.2).
+	"func.row_to_json",
 	// jsonb_set / jsonb_insert (B1) — the jsonb path-mutation builders (json-sql-functions.md §2).
 	"func.json_set",
 	// jsonb_set_lax — jsonb_set with a null_value_treatment for a SQL NULL value (§2).

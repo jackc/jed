@@ -178,6 +178,15 @@ test('the types page autoruns the verbatim json accessor demo', async ({ page })
   await expect(rows).toContainText('{"b": 1.50}');
 });
 
+test('the types page autoruns the row_to_json demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // A named composite keys by field name; an anonymous ROW by f1, f2, …; a timestamp is ISO 8601.
+  const rows = livePanel(page, 'rowToJsonDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('{"street":"Main","zip":90210}');
+  await expect(rows).toContainText('{"f1":1,"f2":null,"f3":[1,2],"f4":{"b": 2}}');
+  await expect(rows).toContainText('{"f1":"2024-01-15T10:30:00"}');
+});
+
 test('the tables page decodes Unicode-escape literals and names live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   // U&'caf\00e9' is café in a column named näme; the UESCAPE '!' form decodes to data.

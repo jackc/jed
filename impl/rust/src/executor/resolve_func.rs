@@ -144,6 +144,18 @@ pub(crate) fn resolve_func_call(
     // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
     // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
     // literal are outside the catalog family mold), like jsonb_set.
+    // `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) takes any composite — the
+    // catalog has no `record` family — so it is hand-resolved too.
+    if lname == "row_to_json" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_row_to_json(scope, args, agg, params);
+    }
     if lname == "json_object" || lname == "jsonb_object" {
         reject_named(&lname, arg_names)?;
         if star {
@@ -2160,6 +2172,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
         RExpr::JsonObjectFromArrays { json, args } => {
             explain_call(if *json { "json_object" } else { "jsonb_object" }, args)
         }
+        RExpr::RowToJson { args, .. } => explain_call("row_to_json", args),
         RExpr::JsonPathFn { kind, args } => explain_call(explain_jsonpath_func(*kind), args),
         RExpr::JsonSqlFn {
             kind,

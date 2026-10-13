@@ -231,6 +231,7 @@ import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import type { BinaryOp } from "./ast.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import { OPERATORS } from "./operators.ts";
+import { compositeToJson } from "./row_json.ts";
 // evalFilter evaluates a predicate in a filter context — WHERE, ON, HAVING, a partial index's WHERE,
 // ON CONFLICT … WHERE — and reports whether it keeps the row (it is TRUE). The top-level AND chain
 // stops at the first conjunct that is not TRUE (FALSE or NULL: the predicate can no longer be TRUE),
@@ -2234,6 +2235,30 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // Inserting a document inside another can deepen the result (json.md §6.4).
       jsonCheckDepth(out);
       return growthResult(m, e.args, jsonbValue(out));
+    }
+    case "rowToJson": {
+      // row_to_json(record [, pretty]) (json-sql-functions.md §2.2): the composite rendered as a json
+      // object. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
+      // guarded before rendering (the array → text cast's rule, timezones.md §9.5).
+      m.charge(COSTS.operatorEval);
+      const vals = e.args.map((a) => evalExpr(a, row, env, m));
+      if (vals.some((v) => v.kind === "null")) return nullValue();
+      const record = vals[0];
+      if (record.kind !== "composite" || e.recordType.kind !== "composite") {
+        throw new Error("resolver restricts row_to_json to a composite record");
+      }
+      const pretty = vals.length === 2 && vals[1].kind === "bool" && vals[1].value;
+      const zoned = zoneRenderCount(record);
+      if (zoned > 0) {
+        m.charge(COSTS.timezone * BigInt(zoned));
+        m.guard();
+      }
+      const out: string[] = [];
+      compositeToJson(record.fields, e.recordType, pretty, env.exec.session.timeZone, out);
+      const text = out.join("");
+      // A jsonb field can nest a deep document (json.md §6.4).
+      jsonCheckTextDepth(text);
+      return growthResult(m, e.args, jsonValue(text));
     }
     case "jsonObjectFromArrays": {
       // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).

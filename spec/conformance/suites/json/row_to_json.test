@@ -1,0 +1,237 @@
+# row_to_json(record [, pretty boolean]) → json (spec/design/json-sql-functions.md §2.2): a composite
+# value — a named composite type or an anonymous ROW(…), whose fields are f1, f2, … — rendered as a
+# JSON object, one member per field in declaration order, keyed by the field name. A port of
+# PostgreSQL's composite_to_json: each field takes its datum_to_json image (a NULL field → null, a
+# number stays exact, text → an escaped string, a json field verbatim, a jsonb field its canonical
+# text, an array → a JSON array of any dimensionality, a nested composite → a nested object, a datetime
+# → its ISO 8601 string, every other type → the string of its text output). pretty = true puts each
+# TOP-LEVEL member after the first on its own line (",\n "); nested values never break. STRICT. jed has
+# no whole-row table reference, so PostgreSQL's common row_to_json(t) is not expressible (ledgered).
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.composite, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.i64, types.text, types.boolean, types.decimal, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.uuid, types.bytea, types.range, func.range_constructors, cast.explicit, cast.operator, session.timezone, func.row_to_json
+
+# load-timezone: Asia/Kolkata
+# load-timezone: America/New_York
+
+# An anonymous ROW(…): fields f1, f2, …; a NULL field → null; numbers stay exact.
+query T nosort
+SELECT row_to_json(ROW(1, 'a', NULL, true, 1.50, -0.5))
+----
+{"f1":1,"f2":"a","f3":null,"f4":true,"f5":1.50,"f6":-0.5}
+
+# The zero-field row is the empty object; a one-field row.
+query TT nosort
+SELECT row_to_json(ROW()), row_to_json(ROW(7))
+----
+{}
+{"f1":7}
+
+# STRICT: a NULL argument → SQL NULL.
+query T nosort
+SELECT row_to_json(NULL)
+----
+NULL
+
+# A named composite: the members are keyed by the type's field names.
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TABLE person (id i32 PRIMARY KEY, home addr)
+
+statement ok
+INSERT INTO person VALUES (1, ROW('Main', 90210))
+
+statement ok
+INSERT INTO person VALUES (2, ROW(NULL, NULL))
+
+statement ok
+INSERT INTO person (id) VALUES (3)
+
+query IT nosort
+SELECT id, row_to_json(home) FROM person ORDER BY id
+----
+1
+{"street":"Main","zip":90210}
+2
+{"street":null,"zip":null}
+3
+NULL
+
+# A field name is escaped as a JSON string.
+statement ok
+CREATE TYPE odd AS ("A b" i32, "q""x" text)
+
+query T nosort
+SELECT row_to_json('(1,z)'::odd)
+----
+{"A b":1,"q\"x":"z"}
+
+# Text is escaped as a JSON string (quote, backslash, control characters).
+query T nosort
+SELECT row_to_json(ROW('a"b\c', 'x' || chr(10) || 'y' || chr(9), chr(1)))
+----
+{"f1":"a\"b\\c","f2":"x\ny\t","f3":"\u0001"}
+
+# A nested composite renders as a nested object — an anonymous ROW inside a ROW, and a named type.
+query T nosort
+SELECT row_to_json(ROW(1, ROW(2, ROW(3, 'x'))))
+----
+{"f1":1,"f2":{"f1":2,"f2":{"f1":3,"f2":"x"}}}
+
+statement ok
+CREATE TYPE seg AS (a addr, b addr)
+
+query T nosort
+SELECT row_to_json('("(Main,1)","(Elm,)")'::seg)
+----
+{"a":{"street":"Main","zip":1},"b":{"street":"Elm","zip":null}}
+
+# Arrays: 1-D, NULL elements, empty, a non-default lower bound (dropped), multidimensional, and an
+# array of a composite.
+query T nosort
+SELECT row_to_json(ROW(ARRAY[1, 2], ARRAY['a', NULL], '{}'::i32[], '[2:3]={5,6}'::i32[], '{{1,2},{3,4}}'::i32[]))
+----
+{"f1":[1,2],"f2":["a",null],"f3":[],"f4":[5,6],"f5":[[1,2],[3,4]]}
+
+query T nosort
+SELECT row_to_json(ROW('{"(Main,1)",NULL}'::addr[]))
+----
+{"f1":[{"street":"Main","zip":1},null]}
+
+# A json field embeds VERBATIM; a jsonb field its canonical (spaced) text; nested in an array too.
+query T nosort
+SELECT row_to_json(ROW('{"b" :  2, "b": 3}'::json, '{"b":2, "a":[1,{"c":null}]}'::jsonb, ARRAY['{"x":1}'::jsonb]))
+----
+{"f1":{"b" :  2, "b": 3},"f2":{"a": [1, {"c": null}], "b": 2},"f3":[{"x": 1}]}
+
+# Datetimes render as ISO 8601 strings: date as is, timestamp with a T separator and trimmed fraction,
+# ±infinity as words, a BC year with its suffix.
+query T nosort
+SELECT row_to_json(ROW(date '2024-01-15', timestamp '2024-01-15 10:30:00.5', timestamp '2024-01-15 10:30:00', date 'infinity', timestamp '-infinity', date '0044-03-15 BC', timestamp '0044-03-15 10:00:00 BC'))
+----
+{"f1":"2024-01-15","f2":"2024-01-15T10:30:00.5","f3":"2024-01-15T10:30:00","f4":"infinity","f5":"-infinity","f6":"0044-03-15 BC","f7":"0044-03-15T10:00:00 BC"}
+
+# A timestamptz renders in the SESSION zone with an hh:mm offset (always minutes, unlike the text
+# output's bare +hh).
+query T nosort
+SELECT row_to_json(ROW(timestamptz '2024-01-15 12:00:00+00', timestamptz 'infinity'))
+----
+{"f1":"2024-01-15T12:00:00+00:00","f2":"infinity"}
+
+# timezone: Asia/Kolkata
+query T nosort
+SELECT row_to_json(ROW(timestamptz '2024-01-15 12:00:00.25+00'))
+----
+{"f1":"2024-01-15T17:30:00.25+05:30"}
+
+# timezone: America/New_York
+query T nosort
+SELECT row_to_json(ROW(timestamptz '1883-11-18 12:00:00+00', timestamptz '0044-03-15 10:00:00+00 BC'))
+----
+{"f1":"1883-11-18T07:03:58-04:56:02","f2":"0044-03-15T05:03:58-04:56:02 BC"}
+
+# Every other type renders as the JSON string of its text output: interval, uuid, bytea (hex, its
+# backslash escaped), a range, a jsonpath.
+query T nosort
+SELECT row_to_json(ROW(interval '1 day 02:00:00', uuid 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '\x0102'::bytea, int4range(1, 5), '[1.5,2.5]'::numrange, 'empty'::int4range, '$.a[*] ? (@ > 1)'::jsonpath))
+----
+{"f1":"1 day 02:00:00","f2":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","f3":"\\x0102","f4":"[1,5)","f5":"[1.5,2.5]","f6":"empty","f7":"$.\"a\"[*]?(@ > 1)"}
+
+# A timestamptz range bound renders in the session zone (the range's text output).
+# timezone: Asia/Kolkata
+query T nosort
+SELECT row_to_json(ROW(tstzrange('2024-01-01 00:00:00+00', '2024-02-01 00:00:00+00')))
+----
+{"f1":"[\"2024-01-01 05:30:00+05:30\",\"2024-02-01 05:30:00+05:30\")"}
+
+# Stored composite columns of every kind.
+statement ok
+CREATE TYPE ev AS (id i64, at timestamp, tags text[], body jsonb, u uuid)
+
+statement ok
+CREATE TABLE evs (k i32 PRIMARY KEY, e ev)
+
+statement ok
+INSERT INTO evs VALUES (1, '(10,"2024-05-01 08:00:00","{a,b}","{""z"": 1, ""a"": [true]}",a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11)'::ev)
+
+statement ok
+INSERT INTO evs VALUES (2, '(,,,,)'::ev)
+
+query IT nosort
+SELECT k, row_to_json(e) FROM evs ORDER BY k
+----
+1
+{"id":10,"at":"2024-05-01T08:00:00","tags":["a","b"],"body":{"a": [true], "z": 1},"u":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
+2
+{"id":null,"at":null,"tags":null,"body":null,"u":null}
+
+# pretty = true: each top-level member after the first starts a new line (shown with the newline
+# replaced by ~); nested composites and arrays stay on one line. pretty = false is the compact form.
+query T nosort
+SELECT replace(row_to_json(ROW(1, ROW(2, 3), ARRAY[ARRAY[1, 2], ARRAY[3, 4]]), true)::text, chr(10), '~')
+----
+{"f1":1,~ "f2":{"f1":2,"f2":3},~ "f3":[[1,2],[3,4]]}
+
+query TTT nosort
+SELECT row_to_json(ROW(1, 2), false), replace(row_to_json(ROW(7), true)::text, chr(10), '~'), row_to_json(ROW(), true)
+----
+{"f1":1,"f2":2}
+{"f1":7}
+{}
+
+query T nosort
+SELECT replace(row_to_json(home, true)::text, chr(10), '~') FROM person WHERE id = 1
+----
+{"street":"Main",~ "zip":90210}
+
+# A bare string literal adapts to the boolean; a NULL pretty flag → SQL NULL (STRICT).
+query TT nosort
+SELECT row_to_json(ROW(1, 2), 'false'), row_to_json(ROW(1, 2), NULL)
+----
+{"f1":1,"f2":2}
+NULL
+
+statement error 22P02
+SELECT row_to_json(ROW(1, 2), 'maybe')
+
+# The argument must be a composite; the flag a boolean. Any other signature is 42883.
+statement error 42883
+SELECT row_to_json(1)
+
+# A bare string literal would be an anonymous record, which has no input function (PostgreSQL's
+# "input of anonymous composite types is not implemented").
+statement error 0A000
+SELECT row_to_json('(1,2)')
+
+statement error 42883
+SELECT row_to_json(ROW(1, 2), 1)
+
+statement error 42883
+SELECT row_to_json()
+
+statement error 42883
+SELECT row_to_json(ROW(1), true, true)
+
+# row_to_json follows the session zone when its argument holds a timestamptz, so it cannot be an
+# index expression then (PostgreSQL marks it STABLE).
+statement ok
+CREATE TYPE stamp AS (at timestamptz)
+
+statement ok
+CREATE TABLE stamps (id i32 PRIMARY KEY, s stamp)
+
+statement error 42P17
+CREATE INDEX stamps_json ON stamps ((row_to_json(s)::text))
+
+# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
+
+# jed has no implicit per-table row type and no whole-row table reference (composite.md §10.4,
+# grammar.md §15), so a table alias is not a value: 42703. PostgreSQL passes the whole row.
+statement error 42703
+SELECT row_to_json(p) FROM person p
+
+# A float field is a deferred 0A000, as for to_json (float.md: binary floats stay out of jed's text
+# output paths). PostgreSQL renders the float8out text as a JSON number.
+statement error 0A000
+SELECT row_to_json(ROW(1.5::f64))

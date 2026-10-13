@@ -224,6 +224,7 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
         | RExpr::Variadic { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::RowToJson { args, .. }
         | RExpr::JsonPathFn { args, .. }
         | RExpr::JsonBuild { args, .. } => {
             for a in args {

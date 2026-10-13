@@ -5,7 +5,7 @@
 # before rendering. payload(jsonb) = 32 per node beyond the root, plus key and string UTF-8 bytes and
 # 4 per decimal digit group; payload(json/text) = UTF-8 bytes.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.jsonb_mutate, func.json_processing, func.json_ctor, func.jsonb_path, func.json_object, func.json_set, func.json_set_lax, func.json_builders, expr.json_query_fns, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.jsonb_mutate, func.json_processing, func.json_ctor, func.jsonb_path, func.json_object, func.json_set, func.json_set_lax, func.json_builders, func.row_to_json, types.composite, types.timestamptz, expr.json_query_fns, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, j jsonb, s text, a i32[])
@@ -60,6 +60,27 @@ SELECT to_json(s), to_jsonb(a), array_to_json(a), JSON_SCALAR(s), JSON_SERIALIZE
 [1,2]
 "q\"x"
 {"a": 1}
+
+# row_to_json charges its rendered bytes: {"f1":"q\"x","f2":1} is 20, on top of the scan's 3 and
+# one operator_eval each for ROW and row_to_json. Constant operands are free. A finite timestamptz
+# field adds one timezone unit, charged before rendering: 3 + 2 + 1 + 41 bytes.
+# cost: 25
+query T nosort
+SELECT row_to_json(ROW(s, id)) FROM t
+----
+{"f1":"q\"x","f2":1}
+
+# cost: 3
+query T nosort
+SELECT row_to_json(ROW('q', 1), false)
+----
+{"f1":"q","f2":1}
+
+# cost: 47
+query T nosort
+SELECT row_to_json(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
+----
+{"f1":"2024-01-15T12:00:00+00:00","f2":1}
 
 # jsonb_set and jsonb_object(text[]).
 # cost: 234

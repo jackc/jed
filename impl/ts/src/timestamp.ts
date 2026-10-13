@@ -365,14 +365,17 @@ function pad(n: bigint, width: number): string {
 // renderDatetime renders micros (a wall-clock reading) as ISO text. offset is the UT offset in seconds
 // to suffix for a timestamptz (null for a timestamp): PostgreSQL's EncodeTimezone spelling — +HH,
 // +HH:MM when the minutes are nonzero, +HH:MM:SS when the seconds are (an LMT offset), placed before
-// any " BC" era.
-function renderDatetime(micros: bigint, offset: number | null): string {
+// any " BC" era. xsd selects the XSD style JsonEncodeDateTime forces (json-sql-functions.md §2.2): a
+// T between the date and time instead of a space, and an offset that always spells its minutes
+// (+00:00, not +00).
+function renderDatetime(micros: bigint, offset: number | null, xsd = false): string {
   if (micros === NEG_INFINITY) return "-infinity";
   if (micros === POS_INFINITY) return "infinity";
   const [y, mo, d, h, mi, s, us] = civilFromMicros(micros);
   const displayed = y <= 0n ? 1n - y : y;
   const era = y <= 0n ? " BC" : "";
-  let out = `${pad(displayed, 4)}-${pad(mo, 2)}-${pad(d, 2)} ${pad(h, 2)}:${pad(mi, 2)}:${pad(s, 2)}`;
+  const sep = xsd ? "T" : " ";
+  let out = `${pad(displayed, 4)}-${pad(mo, 2)}-${pad(d, 2)}${sep}${pad(h, 2)}:${pad(mi, 2)}:${pad(s, 2)}`;
   if (us !== 0n) {
     const frac = pad(us, 6).replace(/0+$/, "");
     out += `.${frac}`;
@@ -383,7 +386,7 @@ function renderDatetime(micros: bigint, offset: number | null): string {
     const two = (n: number) => String(n).padStart(2, "0");
     out += `${offset < 0 ? "-" : "+"}${two(h)}`;
     if (sec !== 0) out += `:${two(mi)}:${two(sec)}`;
-    else if (mi !== 0) out += `:${two(mi)}`;
+    else if (mi !== 0 || xsd) out += `:${two(mi)}`;
   }
   out += era;
   return out;
@@ -405,4 +408,18 @@ export function renderTimestamptz(micros: bigint): string {
 export function renderTimestamptzAt(micros: bigint, utoff: number): string {
   if (micros === NEG_INFINITY || micros === POS_INFINITY) return renderDatetime(micros, null);
   return renderDatetime(micros + BigInt(utoff) * 1_000_000n, utoff);
+}
+
+// renderTimestampXsd renders a timestamp value as its JSON string body (JsonEncodeDateTime, the XSD
+// style — json-sql-functions.md §2.2): 2024-01-15T10:30:00.5, ±infinity bare, a " BC" suffix.
+export function renderTimestampXsd(micros: bigint): string {
+  return renderDatetime(micros, null, true);
+}
+
+// renderTimestamptzXsdAt renders a timestamptz instant as its JSON string body at UT offset utoff
+// (seconds; the caller supplies the session zone's offset): the local wall clock with a T separator
+// and an offset that always shows its minutes (+05:30, +00:00). ±infinity render bare.
+export function renderTimestamptzXsdAt(micros: bigint, utoff: number): string {
+  if (micros === NEG_INFINITY || micros === POS_INFINITY) return renderDatetime(micros, null);
+  return renderDatetime(micros + BigInt(utoff) * 1_000_000n, utoff, true);
 }
