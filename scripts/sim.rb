@@ -58,7 +58,7 @@ module Sim
 
   # Run every trace in `list` (a file of paths) on `core`, split across `jobs` processes. Returns
   # { trace name => result hash }.
-  def run_core(core, paths, out, jobs: 1)
+  def run_core(core, paths, out, jobs: 1, images: false)
     cmd, dir = RUNNERS.fetch(core)[:run]
     chunks = paths.each_slice([(paths.size.to_f / jobs).ceil, 1].max).to_a
     threads = chunks.each_with_index.map do |chunk, i|
@@ -67,6 +67,7 @@ module Sim
         File.write(list, chunk.join("\n") + "\n")
         env = { "JED_SIM_IN" => list, "JED_SIM_OUT" => out,
                 "JED_SIM_RESULTS" => File.join(out, "#{core}.results.#{i}.jsonl") }
+        env["JED_SIM_IMAGES"] = "1" if images
         _o, e, _st = Open3.capture3(env, *cmd, chdir: dir)
         [i, e]
       end
@@ -87,9 +88,10 @@ module Sim
     File.exist?(path) ? File.read(path) : nil
   end
 
-  # Run `paths` on `cores` and report. Returns the list of failure strings.
-  def run_and_compare(paths, cores, out, jobs:)
-    results = cores.to_h { |core| [core, run_core(core, paths, out, jobs: jobs)] }
+  # Run `paths` on `cores` and report. Returns the list of failure strings. With `images`, every
+  # recovery's image is also decoded by the independent checker (check_images).
+  def run_and_compare(paths, cores, out, jobs:, images: false)
+    results = cores.to_h { |core| [core, run_core(core, paths, out, jobs: jobs, images: images)] }
     failures = []
     paths.each do |path|
       name = File.basename(path, ".sim")
@@ -109,6 +111,49 @@ module Sim
       at = diff ? "first difference at transcript line #{diff[1] + 1}:\n      #{a[0]}: #{diff[0].strip}\n      #{b[0]}: #{b[1][diff[1]]&.strip}" : "lengths differ"
       failures << "#{name}: CROSS-CORE TRANSCRIPT DISAGREEMENT (#{transcripts.keys.join(', ')}) — #{at}"
     end
+    failures.concat(check_images(paths, cores.first, out)) if images
+    failures
+  end
+
+  # The independent fourth voice (simulation-testing.md §12, S6): spec/fileformat/verify.rb decodes
+  # every image a recovery opened and must select the same generation — version, live pages, page
+  # count, and free-list size — that the core's transcript reports. Equal transcripts mean equal
+  # images across cores, so one core's images suffice.
+  def check_images(paths, core, out)
+    expected = {}
+    paths.each do |path|
+      name = File.basename(path, ".sim")
+      text = transcript(out, name, core) or next
+      text.each_line do |line|
+        j = JSON.parse(line)
+        next unless j["op"] == "crash"
+
+        img = File.join(out, "#{name}.#{core}.step#{j['i']}.img")
+        expected[img] = j if File.exist?(img)
+      end
+    end
+    return [] if expected.empty?
+
+    failures = []
+    expected.keys.each_slice(200) do |batch|
+      stdout, _err, _st = Open3.capture3("ruby", File.join(REPO, "spec/fileformat/verify.rb"), "--check-image", *batch)
+      stdout.each_line do |line|
+        r = JSON.parse(line)
+        want = expected[r["file"]]
+        label = "#{File.basename(r['file'], '.img')}"
+        if r["error"]
+          failures << "#{label}: the independent checker rejects the image #{core} recovered: #{r['error']}"
+          next
+        end
+        got = [r["version"], r["live"], r["pages"], r["free"]]
+        have = [want["recovered"], want["live"], want["pages"], want["free"]]
+        next if got == have
+
+        failures << "#{label}: the independent checker selects version/live/pages/free #{got.join('/')}, " \
+                    "#{core} recovered #{have.join('/')}"
+      end
+    end
+    puts "sim: the independent checker decoded #{expected.size} crash image(s)"
     failures
   end
 
@@ -137,7 +182,7 @@ module Sim
       end
     end
     puts "sim: #{paths.size} traces (#{profiles.join(', ')}) on #{cores.join(', ')} → #{out}"
-    failures = run_and_compare(paths, cores, out, jobs: opts[:jobs])
+    failures = run_and_compare(paths, cores, out, jobs: opts[:jobs], images: opts[:images])
     report(failures, paths.size, out)
   end
 
@@ -150,7 +195,7 @@ module Sim
     build(opts[:cores])
     out = opts[:out] || stamp_dir("regress")
     puts "sim: #{paths.size} regression traces on #{opts[:cores].join(', ')}"
-    report(run_and_compare(paths, opts[:cores], out, jobs: opts[:jobs]), paths.size, out)
+    report(run_and_compare(paths, opts[:cores], out, jobs: opts[:jobs], images: true), paths.size, out)
   end
 
   def replay(opts, trace)
@@ -259,6 +304,7 @@ if $PROGRAM_NAME == __FILE__
     o.on("--jobs N", Integer, "runner processes per core") { |v| opts[:jobs] = v }
     o.on("--out DIR", "results directory") { |v| opts[:out] = v }
     o.on("-o FILE", "shrink: write the minimal trace here") { |v| opts[:output] = v }
+    o.on("--check-images", "sweep: decode every crash image with spec/fileformat/verify.rb too") { opts[:images] = true }
   end
   parser.parse!
   bad = opts[:cores] - Sim::ALL_CORES

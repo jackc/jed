@@ -10,7 +10,9 @@ package jed
 //	JED_SIM_IN=trace.sim JED_SIM_OUT=out/ go test -run '^TestSimRunner$' -count=1 .
 //
 // JED_SIM_IN is one .sim file, a directory of them, or a file listing trace paths one per line.
-// Results append to JED_SIM_RESULTS (default JED_SIM_OUT/go.results.jsonl).
+// Results append to JED_SIM_RESULTS (default JED_SIM_OUT/go.results.jsonl). With JED_SIM_IMAGES
+// set, every image a recovery opens is written to JED_SIM_OUT/<trace>.go.step<N>.img for the
+// independent checker (spec/fileformat/verify.rb --check-image).
 // Without JED_SIM_IN the test skips, so `go test ./...` is unaffected.
 
 import (
@@ -229,6 +231,9 @@ func simRunFile(path, out string) simResult {
 		return res
 	}
 	first := newSimRunner(tr)
+	if os.Getenv("JED_SIM_IMAGES") != "" {
+		first.imagePrefix = filepath.Join(out, name+".go")
+	}
 	first.run()
 	res.steps = len(tr.steps)
 	res.transcriptHash = simFNV(first.transcript.String())
@@ -312,6 +317,7 @@ type simRunner struct {
 
 	lastDigestText string            // the text the most recent digest folded
 	diagnostics    map[string]string // artifact name → contents, written on a violation
+	imagePrefix    string            // when set, each recovery's image is written to <prefix>.step<N>.img
 }
 
 func newSimRunner(tr simTrace) *simRunner {
@@ -782,6 +788,9 @@ func (r *simRunner) recover(i int, fired string) bool {
 	r.db = nil
 	r.disk.processDeath()
 	image := append([]byte(nil), r.disk.cache...)
+	if r.imagePrefix != "" {
+		_ = os.WriteFile(fmt.Sprintf("%s.step%d.img", r.imagePrefix, i), image, 0o644)
+	}
 	if err := r.open(); err != nil {
 		r.crashImage = image
 		r.fail(i, "recovery: open failed: %v", err)

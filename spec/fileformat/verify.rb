@@ -3757,6 +3757,7 @@ def validate_free_list!(image, ps, meta)
          (free_pages & (meta[:protected] + seen)).empty?
     raise "invalid free-list entry"
   end
+  free_pages
 end
 
 def select_meta(image, ps)
@@ -4598,7 +4599,7 @@ end
 def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
-  validate_free_list!(image, ps, meta)
+  free_pages = validate_free_list!(image, ps, meta)
   # Every page the decode reads from the catalog root is live (v34): the catalog chain, each tree
   # and GiST node, and each overflow page. The meta's count must equal that reachable set.
   $reached = Set.new
@@ -4670,11 +4671,34 @@ def decode_image(image)
                                                item[:histogram].size == histogram_count &&
                                                (item[:terms] ? item[:terms][:entries].size : 0) == term_count
   end
-  reached = $reached.size
+  reached = $reached
   $reached = nil
-  raise "live page count #{meta[:live]} does not match #{reached} reachable pages" unless meta[:live] == reached
+  raise "live page count #{meta[:live]} does not match #{reached.size} reachable pages" unless meta[:live] == reached.size
+  raise "a free-list page is reachable" unless (free_pages & reached.to_a).empty?
   { types: types, sequences: sequences, collations: collations, tables: tables,
-    statistics: statistics, views: views }
+    statistics: statistics, views: views, meta: meta, free_pages: free_pages }
+end
+
+# --check-image FILE… (spec/design/simulation-testing.md §12, slice S6): decode arbitrary database
+# images — the crash images the simulation runners dump — as an independent fourth voice. Selects
+# the generation recovery must select (meta validation + the full commit manifest), validates the
+# free list, decodes every table, index, and overflow chain, and checks the live page count against
+# the reachable set and the free list against both. Prints one JSON line per image, the fields the
+# runners' transcripts also report, or the error that made the image undecodable.
+def check_images(paths)
+  require "json"
+  failed = false
+  paths.each do |path|
+    image = File.binread(path)
+    decoded = decode_image(image)
+    meta = decoded[:meta]
+    puts JSON.generate({ file: path, version: meta[:txid], live: meta[:live], pages: meta[:page_count],
+                         free: decoded[:free_pages].size })
+  rescue StandardError => e
+    failed = true
+    puts JSON.generate({ file: path, error: e.message })
+  end
+  exit(failed ? 1 : 0)
 end
 
 # Decode a sequence catalog entry's body (inverse of sequence_entry_bytes); the caller has consumed
@@ -4929,6 +4953,8 @@ end
 
 if ARGV.include?("--generate")
   generate
+elsif ARGV.first == "--check-image"
+  check_images(ARGV.drop(1))
 else
   verify
 end
