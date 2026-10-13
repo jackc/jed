@@ -391,9 +391,13 @@ import {
   zoneRenderCount,
 } from "./value.ts";
 import {
+  type EvalOpts as JsonPathEvalOpts,
+  type Vars as JsonPathVars,
+  checkVarsObject,
   compile as jsonPathCompile,
   compileMetered as jsonPathCompileMetered,
   evalPath as jsonPathEval,
+  evalPathSilent as jsonPathEvalSilent,
   render as jsonPathRender,
 } from "./jsonpath.ts";
 import {
@@ -449,7 +453,14 @@ import {
 // column. The resolved SCALAR type — for decimal the unconstrained "decimal", not the
 // numeric(p,s) typmod (spec/design/conformance.md §7).
 import type { AssignPlan } from "./window.ts";
-import { evalExpr, evalFilter, floatToIntHalfAway, subqueryRowValue, toDecimal } from "./eval.ts";
+import {
+  evalExpr,
+  evalFilter,
+  floatToIntHalfAway,
+  passingBindings,
+  subqueryRowValue,
+  toDecimal,
+} from "./eval.ts";
 import {
   assignmentError,
   assignmentHint,
@@ -516,6 +527,7 @@ import {
   resolveJsonObject,
   resolveJsonImage,
   resolveJsonbSetInsert,
+  resolveJsonPassing,
   resolveJsonpathArgs,
   resolveJsonpathFn,
   resolveColumnRef,
@@ -15445,6 +15457,7 @@ export class Engine {
           r = this.resolveSRF(
             tref.name,
             tref.args,
+            tref.argNames ?? [],
             tref.alias,
             tref.columnDefs ?? null,
             srfParent,
@@ -15463,6 +15476,7 @@ export class Engine {
               this.resolveSRF(
                 tref.name,
                 args,
+                tref.argNames ?? [],
                 tref.alias,
                 tref.columnDefs ?? null,
                 lateralParentScope,
@@ -16611,6 +16625,7 @@ export class Engine {
   private resolveSRF(
     name: string,
     args: Expr[],
+    argNames: (string | null)[],
     alias: string | null,
     columnDefs: TypeFieldDef[] | null,
     parent: Scope | null,
@@ -16624,6 +16639,11 @@ export class Engine {
     // from here (error-fields.md §11.8).
     argScope.hints = { unseen: [], onClause: false, lateralActive: true };
     const lname = name;
+    // Named notation (`name => value`) is accepted only by `jsonb_path_query[_tz]`, whose parameters
+    // PostgreSQL names; it is the only table function here with optional arguments.
+    if (lname !== "jsonb_path_query" && lname !== "jsonb_path_query_tz") {
+      rejectNamed(lname, argNames);
+    }
     // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
     // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
     // `AS t(col type, …)`. Dispatched FIRST, before the col-def-list guard below.
@@ -16710,13 +16730,16 @@ export class Engine {
           ptypes,
         );
     }
-    // jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): the SRF form — one `jsonb` row per
-    // item of the path's evaluation sequence over the context document. A bare string literal adapts.
-    if (lname === "jsonb_path_query") {
+    // jsonb_path_query(target, path [, vars [, silent]]) (P2, jsonpath.md §5.2): the SRF form — one
+    // `jsonb` row per item of the path's evaluation sequence over the context document. A bare string
+    // literal adapts. `jsonb_path_query_tz` is PostgreSQL's STABLE twin (jsonpath.md §5.1); it reads
+    // no time zone until the datetime item methods land.
+    if (lname === "jsonb_path_query" || lname === "jsonb_path_query_tz") {
       const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-      const [ctx, path] = resolveJsonpathArgs(argScope, lname, args, forbidden, ptypes);
+      const rargs = resolveJsonpathArgs(argScope, lname, args, argNames, forbidden, ptypes);
+      if (lname.endsWith("_tz")) ptypes.nonimmutable = true;
       const table = srfTable(lname, alias, scalarT("jsonb"));
-      return { table, srf: { kind: "jsonb_path_query", args: [ctx, path] } };
+      return { table, srf: { kind: "jsonb_path_query", args: rargs } };
     }
     // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
     // variants return each element's verbatim sub-text (json.md §4).
@@ -17020,6 +17043,8 @@ export class Engine {
       throw engineError("feature_not_supported", "a non-constant JSON_TABLE path is not supported");
     }
     const rootPath = rpath.node.value;
+    // The PASSING values (json-sql-functions.md §5.4) follow the context in the SRF's args.
+    const passing = resolveJsonPassing(argScope, jt.passing, forbidden, ptypes);
     const outColumns: Column[] = [];
     const columns = this.resolveJtColumns(jt.columns, outColumns);
     const width = outColumns.length;
@@ -17034,7 +17059,11 @@ export class Engine {
     };
     return {
       table,
-      srf: { kind: "json_table", args: [rctx.node], jtPlan: { rootPath, width, columns } },
+      srf: {
+        kind: "json_table",
+        args: [rctx.node, ...passing.exprs],
+        jtPlan: { rootPath, passingNames: passing.names, width, columns },
+      },
     };
   }
 
@@ -17119,22 +17148,31 @@ export class Engine {
   private jsonTableRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
     const plan = srf.jtPlan;
     if (plan === undefined) throw new Error("a json_table SRF carries its plan");
+    // The PASSING values are evaluated first, as PostgreSQL's JSON_TABLE does (even for a NULL
+    // context).
+    const bindings = passingBindings(srf.args.slice(1), plan.passingNames, [], env, meter);
+    const vars: JsonPathVars = {
+      kind: "passing",
+      vars: bindings,
+      count: plan.passingNames.length,
+    };
     const ctx = evalExpr(srf.args[0]!, [], env, meter);
     if (ctx.kind === "null") return [];
     // A json context is converted to jsonb, as PostgreSQL casts it (jsonpath.md §5).
     const node = jsonpathContextNode(ctx);
     // The root path → the sequence of row items (a structural error here yields no rows).
     const root = jsonPathCompileMetered(plan.rootPath, meter);
-    // A navigation error yields no rows; a cost abort propagates (jsonpath.md §7).
+    // A navigation error yields no rows; a cost abort or a missing variable propagates
+    // (jsonpath.md §7).
     let items: JsonNode[];
     try {
-      items = jsonPathEval(root, node, JT_EVAL, meter);
+      items = jsonPathEval(root, node, jtEval(vars), meter);
     } catch (e) {
       if (!isSqljsonError(e)) throw e;
       items = [];
     }
     // Expand the column tree over the root sequence → sparse rows, then materialize.
-    const sparse = expandJtLevel(plan.columns, items, env, meter);
+    const sparse = expandJtLevel(plan.columns, items, vars, env, meter);
     const out: Row[] = [];
     for (const assignment of sparse) {
       meter.guard();
@@ -17784,15 +17822,25 @@ export class Engine {
       }
       // jsonb_path_query (P2): one jsonb row per path-evaluation-sequence item. The context node
       // (`node`) is already parsed above; evaluate the path (a NULL path → zero rows).
+      // STRICT: a NULL path, vars, or silent → zero rows. The vars object is checked before
+      // evaluation; silent mode returns the items found before a SQL/JSON error (jsonpath.md §5).
       case "jsonb_path_query": {
         const path = evalExpr(srf.args[1]!, [], env, meter);
-        if (path.kind === "null") return out;
-        if (path.kind !== "jsonpath") {
-          throw new Error("resolver restricts the path argument to jsonpath");
+        const varsVal = evalExpr(srf.args[2]!, [], env, meter);
+        const silentVal = evalExpr(srf.args[3]!, [], env, meter);
+        if (path.kind !== "jsonpath" || varsVal.kind !== "jsonb" || silentVal.kind !== "bool") {
+          return out;
         }
+        checkVarsObject(varsVal.node);
         const compiled = jsonPathCompileMetered(path.text, meter);
-        // PostgreSQL's default vars object is one base object (jsonpath.md §3.1).
-        for (const item of jsonPathEval(compiled, node, { exists: false, vars: 1 }, meter)) {
+        const opts: JsonPathEvalOpts = {
+          exists: false,
+          vars: { kind: "object", node: varsVal.node },
+        };
+        const items = silentVal.value
+          ? jsonPathEvalSilent(compiled, node, opts, meter).seq
+          : jsonPathEval(compiled, node, opts, meter);
+        for (const item of items) {
           meter.guard();
           meter.charge(COSTS.generatedRow);
           out.push([jsonbValue(item)]);
@@ -28556,21 +28604,26 @@ export type RExpr =
       valueType: ResolvedType;
     }
   // A scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists / jsonb_path_query_first
-  // / jsonb_path_query_array. `args` = `[ctx jsonb, path jsonpath]`; STRICT (any NULL → SQL NULL).
-  // The path is recompiled from its canonical text at eval.
+  // / jsonb_path_query_array / jsonb_path_match (`args` = `[target jsonb, path jsonpath, vars jsonb,
+  // silent boolean]`, `tz` for the `_tz` form) or the `@?` / `@@` operator (`args` = `[target,
+  // path]`). STRICT (any NULL → SQL NULL). The path is recompiled from its canonical text at eval.
   | {
       kind: "jsonPathFn";
       pathFnKind: JsonPathFnKind;
+      tz: boolean;
       args: RExpr[];
     }
   // A SQL/JSON query function `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md §5,
-  // S2). `args` = `[ctx, path]` (the SRF-style arg list, so the generic RExpr walks recurse for
-  // free): `ctx` produces the context jsonb (or json/text, coerced), `path` the jsonpath; the
-  // behaviors / wrapper / quotes drive the result. The result type is fixed at resolve.
+  // S2). `args` = `[ctx, path, ...passing]` (the SRF-style arg list, so the generic RExpr walks
+  // recurse for free): `ctx` produces the context jsonb (or json/text, coerced), `path` the jsonpath,
+  // and the rest the `PASSING` values (each already a JSON-item-shaped value, see
+  // resolveJsonPassing), binding the variables `passingNames` in clause order; the behaviors /
+  // wrapper / quotes drive the result. The result type is fixed at resolve.
   | {
       kind: "jsonSqlFn";
       sqlKind: JsonSqlKind;
       args: RExpr[];
+      passingNames: string[];
       // The RETURNING scalar type ("boolean" for JSON_EXISTS; the JSON_VALUE scalar target;
       // "jsonb"/"json" for JSON_QUERY) — drives the result coercion.
       returning: ScalarType;
@@ -29337,6 +29390,8 @@ export function catalogTypeText(ty: Type, dec: DecimalTypmod | null, vlen: numbe
 export type JtPlan = {
   // The compiled root jsonpath (its evaluation over `ctx` yields the row items).
   rootPath: string;
+  // The PASSING variable names; their values are the SRF's arguments after the context.
+  passingNames: string[];
   // The total number of flattened output columns.
   width: number;
   // The top-level column tree.
@@ -29714,16 +29769,19 @@ export function jtCompilePath(path: string | null, name: string): string {
   return jsonPathRender(jsonPathCompile(src));
 }
 
-// JT_EVAL is how JSON_TABLE evaluates its row, NESTED, and value-column paths: the full sequence,
-// with no PASSING variables (jsonpath.md §3.1).
-const JT_EVAL = { exists: false, vars: 0 };
+// jtEval is how JSON_TABLE evaluates its row, NESTED, and value-column paths: the full sequence,
+// with its PASSING variables (jsonpath.md §3.1, §5).
+function jtEval(vars: JsonPathVars): JsonPathEvalOpts {
+  return { exists: false, vars };
+}
 
 // expandJtLevel expands a `JSON_TABLE` COLUMNS level over a sequence of row items → the sparse rows
-// (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Port
-// of impl/rust/src/executor.rs `expand_jt_level`.
+// (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Every
+// path reads the PASSING variables `vars`. Port of impl/rust/src/executor.rs `expand_jt_level`.
 export function expandJtLevel(
   cols: JtCol[],
   items: JsonNode[],
+  vars: JsonPathVars,
   env: EvalEnv,
   meter: Meter,
 ): JtAssign[] {
@@ -29743,6 +29801,7 @@ export function expandJtLevel(
           const v = evalJtRegular(
             item,
             col.path,
+            vars,
             col.query,
             col.returning,
             col.decimal,
@@ -29756,7 +29815,7 @@ export function expandJtLevel(
           break;
         }
         case "exists": {
-          const v = evalJtExists(item, col.path, col.returning, col.onError, meter);
+          const v = evalJtExists(item, col.path, vars, col.returning, col.onError, meter);
           local.push([col.idx, v]);
           break;
         }
@@ -29766,7 +29825,7 @@ export function expandJtLevel(
     }
     // The NESTED siblings, expanded over this item (UNIONed + LEFT OUTER fill).
     const nested = cols.filter((c): c is JtCol & { kind: "nested" } => c.kind === "nested");
-    const nestedRows = expandJtNested(nested, item, env, meter);
+    const nestedRows = expandJtNested(nested, item, vars, env, meter);
     for (const nr of nestedRows) {
       rows.push([...local, ...nr]);
     }
@@ -29781,6 +29840,7 @@ export function expandJtLevel(
 export function expandJtNested(
   children: (JtCol & { kind: "nested" })[],
   item: JsonNode,
+  vars: JsonPathVars,
   env: EvalEnv,
   meter: Meter,
 ): JtAssign[] {
@@ -29791,12 +29851,12 @@ export function expandJtNested(
     // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
     let childSeq: JsonNode[];
     try {
-      childSeq = jsonPathEval(p, item, JT_EVAL, meter);
+      childSeq = jsonPathEval(p, item, jtEval(vars), meter);
     } catch (e) {
       if (!isSqljsonError(e)) throw e;
       childSeq = [];
     }
-    union.push(...expandJtLevel(child.columns, childSeq, env, meter));
+    union.push(...expandJtLevel(child.columns, childSeq, vars, env, meter));
   }
   if (union.length === 0) union.push([]);
   return union;
@@ -29808,6 +29868,7 @@ export function expandJtNested(
 export function evalJtRegular(
   item: JsonNode,
   path: string,
+  vars: JsonPathVars,
   query: boolean,
   returning: ScalarType,
   decimal: DecimalTypmod | null,
@@ -29820,7 +29881,7 @@ export function evalJtRegular(
   const p = jsonPathCompileMetered(path, meter);
   let seq: JsonNode[];
   try {
-    seq = jsonPathEval(p, item, JT_EVAL, meter);
+    seq = jsonPathEval(p, item, jtEval(vars), meter);
   } catch (e) {
     if (isSqljsonError(e)) {
       return applyJsonBehavior(onError, e, returning, env, meter);
@@ -29838,6 +29899,7 @@ export function evalJtRegular(
 export function evalJtExists(
   item: JsonNode,
   path: string,
+  vars: JsonPathVars,
   returning: ScalarType,
   onError: JsonOnBehavior,
   meter: Meter,
@@ -29845,7 +29907,7 @@ export function evalJtExists(
   const p = jsonPathCompileMetered(path, meter);
   let exists: boolean;
   try {
-    exists = jsonPathEval(p, item, { exists: true, vars: 0 }, meter).length > 0;
+    exists = jsonPathEval(p, item, { exists: true, vars }, meter).length > 0;
   } catch (e) {
     if (isSqljsonError(e)) {
       switch (onError) {
@@ -31570,7 +31632,11 @@ export function exprHasAggregate(e: Expr): boolean {
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
-      return exprHasAggregate(e.ctx) || exprHasAggregate(e.path);
+      return (
+        exprHasAggregate(e.ctx) ||
+        exprHasAggregate(e.path) ||
+        e.passing.some((p) => exprHasAggregate(p.expr))
+      );
     case "binary":
     case "isDistinct":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.rhs);
@@ -31646,7 +31712,11 @@ export function exprHasWindow(e: Expr): boolean {
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
-      return exprHasWindow(e.ctx) || exprHasWindow(e.path);
+      return (
+        exprHasWindow(e.ctx) ||
+        exprHasWindow(e.path) ||
+        e.passing.some((p) => exprHasWindow(p.expr))
+      );
     case "binary":
     case "isDistinct":
       return exprHasWindow(e.lhs) || exprHasWindow(e.rhs);
@@ -31809,6 +31879,7 @@ export function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): vo
     case "jsonQuery":
       desugarNamedWindows(e.ctx, windows);
       desugarNamedWindows(e.path, windows);
+      for (const p of e.passing) desugarNamedWindows(p.expr, windows);
       return;
     case "binary":
     case "isDistinct":
@@ -31937,6 +32008,7 @@ export function rejectCheckStructure(e: Expr): void {
     case "jsonQuery":
       rejectCheckStructure(e.ctx);
       rejectCheckStructure(e.path);
+      for (const p of e.passing) rejectCheckStructure(p.expr);
       return;
     case "binary":
     case "isDistinct":
@@ -32033,6 +32105,7 @@ export function rejectDefaultStructure(e: Expr): void {
     case "jsonQuery":
       rejectDefaultStructure(e.ctx);
       rejectDefaultStructure(e.path);
+      for (const p of e.passing) rejectDefaultStructure(p.expr);
       return;
     case "binary":
     case "isDistinct":
@@ -32126,7 +32199,11 @@ export function indexExprHasSubquery(e: Expr): boolean {
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
-      return indexExprHasSubquery(e.ctx) || indexExprHasSubquery(e.path);
+      return (
+        indexExprHasSubquery(e.ctx) ||
+        indexExprHasSubquery(e.path) ||
+        e.passing.some((p) => indexExprHasSubquery(p.expr))
+      );
     case "binary":
     case "isDistinct":
     case "like":
@@ -32203,7 +32280,11 @@ export function indexExprFirstParam(e: Expr): number | null {
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
-      return indexExprFirstParam(e.ctx) ?? indexExprFirstParam(e.path);
+      return (
+        indexExprFirstParam(e.ctx) ??
+        indexExprFirstParam(e.path) ??
+        e.passing.reduce<number | null>((found, p) => found ?? indexExprFirstParam(p.expr), null)
+      );
     case "binary":
     case "isDistinct":
     case "like":
@@ -32311,6 +32392,7 @@ export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
       case "jsonQuery":
         walk(e.ctx);
         walk(e.path);
+        for (const p of e.passing) walk(p.expr);
         return;
       case "binary":
       case "isDistinct":
@@ -33868,23 +33950,25 @@ export function resolveFuncCall(
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     return resolveJsonObject(scope, lname, lname === "json_object", e.args, ag, params);
   }
-  // The scalar jsonpath query functions (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. Hand-
-  // resolved (the jsonpath arg + adapting-literal are outside the catalog family mold).
+  // The scalar jsonpath query functions (P2, jsonpath.md §5): `(target jsonb, path jsonpath
+  // [, vars jsonb [, silent boolean]])` and their `_tz` forms. Hand-resolved (the jsonpath arg +
+  // adapting-literal are outside the catalog family mold).
   {
+    const tz = lname.endsWith("_tz");
+    const base = tz ? lname.slice(0, -3) : lname;
     const pathFnKind: JsonPathFnKind | null =
-      lname === "jsonb_path_exists"
+      base === "jsonb_path_exists"
         ? "exists"
-        : lname === "jsonb_path_query_first"
+        : base === "jsonb_path_query_first"
           ? "queryFirst"
-          : lname === "jsonb_path_query_array"
+          : base === "jsonb_path_query_array"
             ? "queryArray"
-            : lname === "jsonb_path_match"
+            : base === "jsonb_path_match"
               ? "match"
               : null;
     if (pathFnKind !== null) {
-      rejectNamed(lname, e.argNames);
       if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-      return resolveJsonpathFn(scope, lname, pathFnKind, e.args, ag, params);
+      return resolveJsonpathFn(scope, lname, pathFnKind, tz, e.args, e.argNames, ag, params);
     }
   }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an

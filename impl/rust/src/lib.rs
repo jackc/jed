@@ -1036,6 +1036,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.jsonpath_methods",
     // jsonpath arithmetic (`+ - * / %`, unary `+ -`) and parenthesized expressions (jsonpath.md §3.2).
     "expr.jsonpath_arith",
+    // jsonpath variables: the jsonb_path_* `vars`/`silent` arguments, the `_tz` functions, and the
+    // SQL/JSON `PASSING` clause (jsonpath.md §5, json-sql-functions.md §5.4).
+    "expr.jsonpath_vars",
     // the SQL/JSON query functions JSON_EXISTS / JSON_VALUE / JSON_QUERY (S2, json-sql-functions.md §5).
     "expr.json_query_fns",
     // JSON_TABLE with the default plan (T1, json-table.md §3): COLUMNS, FOR ORDINALITY, EXISTS, NESTED.

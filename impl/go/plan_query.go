@@ -922,11 +922,23 @@ func countSelfRefsExpr(e exprNode, name string) int {
 	case exprJsonCtor:
 		return countSelfRefsExpr(e.JsonCtorOf.Operand, name)
 	case exprJsonExists:
-		return countSelfRefsExpr(e.JsonExists.Ctx, name) + countSelfRefsExpr(e.JsonExists.Path, name)
+		n := countSelfRefsExpr(e.JsonExists.Ctx, name) + countSelfRefsExpr(e.JsonExists.Path, name)
+		for _, p := range e.JsonExists.Passing {
+			n += countSelfRefsExpr(p.Expr, name)
+		}
+		return n
 	case exprJsonValue:
-		return countSelfRefsExpr(e.JsonValue.Ctx, name) + countSelfRefsExpr(e.JsonValue.Path, name)
+		n := countSelfRefsExpr(e.JsonValue.Ctx, name) + countSelfRefsExpr(e.JsonValue.Path, name)
+		for _, p := range e.JsonValue.Passing {
+			n += countSelfRefsExpr(p.Expr, name)
+		}
+		return n
 	case exprJsonQuery:
-		return countSelfRefsExpr(e.JsonQuery.Ctx, name) + countSelfRefsExpr(e.JsonQuery.Path, name)
+		n := countSelfRefsExpr(e.JsonQuery.Ctx, name) + countSelfRefsExpr(e.JsonQuery.Path, name)
+		for _, p := range e.JsonQuery.Passing {
+			n += countSelfRefsExpr(p.Expr, name)
+		}
+		return n
 	case exprBinary:
 		return countSelfRefsExpr(e.Binary.Lhs, name) + countSelfRefsExpr(e.Binary.Rhs, name)
 	case exprIsDistinct:

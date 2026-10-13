@@ -107,6 +107,9 @@ new alternative beside `table_function`.
 but **reuses** the synthetic-`Table` + implicit-lateral prefix-scope machinery that the SRF
 and derived-table paths already share:
 
+- `PASSING value AS name, …` binds path variables for every path in it (the root path, the column
+  and `EXISTS` paths, and `NESTED` paths), evaluated once before the context
+  ([json-sql-functions.md §5.4](json-sql-functions.md)).
 - It is **implicitly lateral** — its `ctx` and `PASSING` args may reference earlier FROM
   siblings (`JSON_TABLE(t.doc, …)` works) via the existing prefix-scope builder. No LATERAL
   slice needed.

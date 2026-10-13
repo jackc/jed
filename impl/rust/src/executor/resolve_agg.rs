@@ -265,9 +265,14 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
             rebase_placeholder_cols(a, from, target);
             rebase_placeholder_cols(b, from, target);
         }
-        RExpr::JsonSqlFn { ctx, path, .. } => {
+        RExpr::JsonSqlFn {
+            ctx, path, passing, ..
+        } => {
             rebase_placeholder_cols(ctx, from, target);
             rebase_placeholder_cols(path, from, target);
+            for p in passing {
+                rebase_placeholder_cols(p, from, target);
+            }
         }
         RExpr::IsJson { operand, .. } | RExpr::JsonCtor { operand, .. } => {
             rebase_placeholder_cols(operand, from, target)

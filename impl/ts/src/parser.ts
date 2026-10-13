@@ -30,6 +30,7 @@ import type {
   JoinKind,
   JsonOnBehavior,
   JsonPredicateKind,
+  JsonPassing,
   JsonTable,
   JsonWrapper,
   JtColumn,
@@ -3272,19 +3273,36 @@ class Parser {
       namePos = this.pos;
       name = this.expectIdentifier();
     }
-    // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
+    // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`). An argument
+    // may be named (`name => value`, grammar.md §17); `argNames` stays undefined when every argument
+    // is positional.
     let args: Expr[] | null = null;
+    let argNames: (string | null)[] | undefined;
     if (this.peek().kind === "lparen") {
       if (db !== undefined) {
         throw engineError("syntax_error", "a database-qualified name cannot be a function call");
       }
       this.advance();
-      args = [this.parseExpr()];
-      while (this.peek().kind === "comma") {
-        this.advance();
+      args = [];
+      const names: (string | null)[] = [];
+      let anyNamed = false;
+      for (;;) {
+        let argName: string | null = null;
+        if (isIdentKind(this.peek().kind) && this.peekKindAt(1) === "fatArrow") {
+          argName = this.expectIdentifier();
+          this.expect("fatArrow");
+          anyNamed = true;
+        } else if (anyNamed) {
+          // A positional argument may not follow a named one (PostgreSQL, 42601).
+          throw engineError("syntax_error", "positional argument cannot follow named argument");
+        }
         args.push(this.parseExpr());
+        names.push(argName);
+        if (this.peek().kind !== "comma") break;
+        this.advance();
       }
       this.expect("rparen");
+      if (anyNamed) argNames = names;
     }
     let alias: string | null = null;
     let aliasPos: number | null = null;
@@ -3339,7 +3357,9 @@ class Parser {
     }
     // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
     const pos: TableRefPos = { name: namePos, alias: aliasPos, list: listPos, depth: this.depth };
-    return { name, db, alias, args, columnAliases, columnDefs, lateral, pos, loc };
+    const tref: TableRef = { name, db, alias, args, columnAliases, columnDefs, lateral, pos, loc };
+    if (argNames !== undefined) tref.argNames = argNames;
+    return tref;
   }
 
   // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42)
@@ -3494,9 +3514,7 @@ class Parser {
       this.advance();
       this.expectIdentifier();
     }
-    if (this.peekKeyword() === "passing") {
-      throw engineError("feature_not_supported", "JSON_TABLE PASSING clause is not supported yet");
-    }
+    const passing = this.parseJsonPassing();
     this.expectKeyword("columns");
     const columns = this.parseJtColumns();
     // An explicit PLAN clause is the deferred T2 slice.
@@ -3521,7 +3539,7 @@ class Parser {
         this.advance();
       }
     }
-    const jsonTable: JsonTable = { ctx, path, columns };
+    const jsonTable: JsonTable = { ctx, path, passing, columns };
     return { name: alias ?? "json_table", alias, args: null, jsonTable, lateral: false };
   }
 
@@ -4649,26 +4667,30 @@ class Parser {
         this.skipFormatJson();
         this.expect("comma");
         const path = this.parseExpr();
-        // `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
-        if (this.peekKeyword() === "passing") {
-          throw engineError(
-            "feature_not_supported",
-            "JSON query function PASSING clause is not supported yet",
-          );
-        }
+        const passing = this.parseJsonPassing();
         let expr: Expr;
         if (kw === "json_exists") {
           const onError = this.parseJsonOnErrorOnly();
-          expr = { kind: "jsonExists", ctx, path, onError };
+          expr = { kind: "jsonExists", ctx, path, passing, onError };
         } else if (kw === "json_value") {
           const returning = this.parseJsonReturning();
           const [onEmpty, onError] = this.parseJsonOnClauses();
-          expr = { kind: "jsonValue", ctx, path, returning, onEmpty, onError };
+          expr = { kind: "jsonValue", ctx, path, passing, returning, onEmpty, onError };
         } else {
           const returning = this.parseJsonReturning();
           const [wrapper, keepQuotes] = this.parseJsonWrapperQuotes();
           const [onEmpty, onError] = this.parseJsonOnClauses();
-          expr = { kind: "jsonQuery", ctx, path, returning, wrapper, keepQuotes, onEmpty, onError };
+          expr = {
+            kind: "jsonQuery",
+            ctx,
+            path,
+            passing,
+            returning,
+            wrapper,
+            keepQuotes,
+            onEmpty,
+            onError,
+          };
         }
         this.expect("rparen");
         return expr;
@@ -5303,12 +5325,32 @@ class Parser {
   // --- cursor helpers ---
 
   // skipFormatJson skips an optional `FORMAT JSON [ENCODING …]` clause after a SQL/JSON context item
-  // (json-sql-functions.md §5). The clause is accepted and ignored — a text/json/jsonb context is
-  // coerced to jsonb regardless.
-  private skipFormatJson(): void {
+  // (json-sql-functions.md §5) and reports whether one was there. After a context item the clause is
+  // accepted and ignored — a text/json/jsonb context is coerced to jsonb regardless.
+  private skipFormatJson(): boolean {
     if (this.peekKeyword() === "format" && this.peekKeywordAt(1) === "json") {
       this.advance(); // FORMAT
       this.advance(); // JSON
+      return true;
+    }
+    return false;
+  }
+
+  // parseJsonPassing parses an optional `PASSING value [FORMAT JSON] AS name [, …]` clause of a
+  // SQL/JSON query function or `JSON_TABLE` (json-sql-functions.md §5.4) → its arguments (empty when
+  // absent). The name is any identifier, folded like one (`AS X` binds `$x`; `AS "X"` binds `$X`).
+  private parseJsonPassing(): JsonPassing[] {
+    const passing: JsonPassing[] = [];
+    if (this.peekKeyword() !== "passing") return passing;
+    this.advance(); // PASSING
+    for (;;) {
+      const expr = this.parseExpr();
+      const formatJson = this.skipFormatJson();
+      this.expectKeyword("as");
+      const name = this.expectIdentifier();
+      passing.push({ expr, formatJson, name });
+      if (this.peek().kind !== "comma") return passing;
+      this.advance();
     }
   }
 

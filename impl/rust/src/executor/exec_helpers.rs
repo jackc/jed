@@ -1112,8 +1112,12 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::JsonObjectFromArrays { args, .. }
         | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
-        RExpr::JsonSqlFn { ctx, path, .. } => {
-            rexpr_references_outer(ctx, depth) || rexpr_references_outer(path, depth)
+        RExpr::JsonSqlFn {
+            ctx, path, passing, ..
+        } => {
+            rexpr_references_outer(ctx, depth)
+                || rexpr_references_outer(path, depth)
+                || passing.iter().any(|p| rexpr_references_outer(p, depth))
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
@@ -1279,9 +1283,14 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
                 collect_touched(a, depth, touched);
             }
         }
-        RExpr::JsonSqlFn { ctx, path, .. } => {
+        RExpr::JsonSqlFn {
+            ctx, path, passing, ..
+        } => {
             collect_touched(ctx, depth, touched);
             collect_touched(path, depth, touched);
+            for p in passing {
+                collect_touched(p, depth, touched);
+            }
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             for f in fields {

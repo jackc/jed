@@ -868,6 +868,9 @@ var SupportedCapabilities = []string{
 	"expr.jsonpath_methods",
 	// jsonpath arithmetic (`+ - * / %`, unary `+ -`) and parenthesized expressions (jsonpath.md §3.2).
 	"expr.jsonpath_arith",
+	// jsonpath variables: the jsonb_path_* vars/silent arguments, the _tz functions, and the SQL/JSON
+	// PASSING clause (jsonpath.md §5, json-sql-functions.md §5.4).
+	"expr.jsonpath_vars",
 	// The SQL/JSON query functions (S2) — JSON_EXISTS / JSON_VALUE / JSON_QUERY: compile a jsonpath,
 	// evaluate it over a context item, and apply per-function semantics (RETURNING / wrapper / quotes
 	// / ON EMPTY / ON ERROR). PASSING vars, DEFAULT-expr behaviors, JSON_QUERY OMIT QUOTES, and a

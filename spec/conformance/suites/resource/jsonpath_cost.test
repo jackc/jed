@@ -4,7 +4,7 @@
 # each object member a `.key` lookup examines, and each comparison pair tested, plus a SQL
 # comparison's size extra. The query function still charges one operator_eval per result item.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, query.aggregates, func.json_agg, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.json_query_fns, func.json_table, types.i32, resource.cost_metering, resource.cost_limit
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, query.aggregates, func.json_agg, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.json_query_fns, func.json_table, types.i32, resource.cost_metering, resource.cost_limit, expr.jsonpath_arith, expr.jsonpath_vars
 
 statement ok
 CREATE TABLE d (id i32 PRIMARY KEY, j jsonb)
@@ -163,3 +163,19 @@ query T nosort
 SELECT jsonb_path_query_first(j, '1e40 * 1e40') FROM d
 ----
 100000000000000000000000000000000000000000000000000000000000000000000000000000000
+
+# A variable, like `$`, seeds its item for free; its comparisons charge as any other operand's.
+# `$."a"[*]?(@ > $"v")` is 19 bytes, 3 more than the literal filter's above.
+# cost: 112
+query T nosort
+SELECT jsonb_path_query_array(j, '$.a[*] ? (@ > $v)', '{"v": 1}') FROM d
+----
+[2, 3]
+
+# A PASSING value is evaluated like any expression and costs nothing more to bind: against
+# `$.a[0] + 1` above, only the 3 more bytes of `$"n"`.
+# cost: 29
+query T nosort
+SELECT JSON_VALUE(j, '$.a[0] + $n' PASSING id AS n) FROM d
+----
+2

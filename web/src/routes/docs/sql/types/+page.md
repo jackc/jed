@@ -126,6 +126,12 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
   jsonb_path_query_first('[10, 20, 30]', '$[last - 1]')                    AS second_last,
   jsonb_path_query_first('{"a": 1, "b": 2}', '($.a + $.b).type()')         AS sum_type;`;
 
+	const jsonpathVarsDemo = `SELECT
+  jsonb_path_query_array('[3, 8, 12, 20]', '$[*] ? (@ >= $min && @ < $max)',
+                         vars => '{"min": 5, "max": 15}')                     AS in_range,
+  jsonb_path_query_array('[1, "x", 2]', '$[*].double()', silent => true)   AS before_error,
+  JSON_VALUE('{"price": 2.50}', '$.price * $qty' PASSING 4 AS qty)         AS total;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -423,6 +429,18 @@ negates every number of its operand and fails with `2203B` on anything else. Div
 with `22012`, but inside a filter it only makes that comparison unknown:
 
 <LiveSql demo="jsonpathArithDemo" query={jsonpathArithDemo} rows={1} />
+
+A `jsonpath` may name variables, `$name` or `$"any name"`. The `jsonb_path_*` functions bind them
+from their third argument, `vars`, a `jsonb` object, and their fourth, `silent`, stops at the first
+JSON error instead of raising it: the functions then return what they found before it, and
+`jsonb_path_exists` returns `NULL`. Both may be passed by name (`vars => …`, `silent => …`).
+`JSON_EXISTS`, `JSON_VALUE`, `JSON_QUERY`, and `JSON_TABLE` bind variables with
+`PASSING value AS name`. A variable with no value fails with `42704`, and `vars` must be an object
+(`22023`). Passing a date, timestamp, or float value is not supported yet (`0A000`). The `_tz`
+forms of the functions (`jsonb_path_exists_tz`, …) behave the same; as in PostgreSQL they are
+`STABLE`, so an index expression cannot use them:
+
+<LiveSql demo="jsonpathVarsDemo" query={jsonpathVarsDemo} rows={1} />
 
 An unquoted member name in a `jsonpath` follows PostgreSQL's lexing. It runs until whitespace, `"`,
 or one of the path's operator and punctuation characters (`. [ ] ( ) $ @ ? , * + - / % ! = < > & |

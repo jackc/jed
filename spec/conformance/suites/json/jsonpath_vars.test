@@ -1,0 +1,481 @@
+# jsonpath variables (spec/design/jsonpath.md §5): `$name` / `$"name"` in a path, bound by the
+# `vars` object of the jsonb_path_* functions (positionally or by name, with PostgreSQL's DEFAULTs)
+# or by the SQL/JSON `PASSING value AS name` clause of JSON_EXISTS / JSON_VALUE / JSON_QUERY /
+# JSON_TABLE; the `silent` argument; and the `_tz` functions. A missing variable is 42704 and a
+# non-object `vars` 22023, neither suppressed by lax mode, silent mode, ON ERROR, or a filter.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: query.select, query.set_returning, ddl.create_table, ddl.secondary_index, dml.insert, types.jsonb, types.json, types.jsonpath, types.i32, types.text, types.bytea, types.uuid, types.interval, types.array, func.jsonb_path, expr.jsonpath_filter, expr.jsonpath_match, expr.jsonpath_methods, expr.jsonpath_arith, expr.json_query_fns, func.json_table, expr.jsonpath_vars
+
+# --- The canonical render ---------------------------------------------------------------------
+
+# A variable renders quoted, like a member key; an unquoted name is a run of non-special characters.
+query TTTTTT nosort
+SELECT '$x'::jsonpath, '$"x y"'::jsonpath, '$x.a ? (@ > $y)'::jsonpath, 'strict $X'::jsonpath, '$x + $y'::jsonpath, '$[$i to last]'::jsonpath
+----
+$"x"
+$"x y"
+$"x"."a"?(@ > $"y")
+strict $"X"
+($"x" + $"y")
+$[$"i" to last]
+
+query TTTT nosort
+SELECT '$1abc'::jsonpath, '$é'::jsonpath, '$"a\"b\\c"'::jsonpath, '$"\u0041"'::jsonpath
+----
+$"1abc"
+$"é"
+$"a\"b\\c"
+$"A"
+
+# A special character ends an unquoted variable name; a space after `$` makes it the root.
+query TT nosort
+SELECT '$a.b'::jsonpath, '$a-1'::jsonpath
+----
+$"a"."b"
+($"a" - 1)
+
+statement error 42601
+SELECT '$a$b'::jsonpath
+
+statement error 42601
+SELECT '$ "x"'::jsonpath
+
+# --- vars --------------------------------------------------------------------------------------
+
+query T rowsort
+SELECT * FROM jsonb_path_query('{"a": 1}', '$x', '{"x": [1, 2]}')
+----
+[1, 2]
+
+query T rowsort
+SELECT * FROM jsonb_path_query('{}', '$x[*] ? (@ > $y)', '{"x": [1, 2, 3], "y": 1}')
+----
+2
+3
+
+query T rowsort
+SELECT * FROM jsonb_path_query('[1, 5, 10]', '$[*] ? (@ >= $min && @ <= $max)', vars => '{"min": 2, "max": 9}')
+----
+5
+
+# Variables in arithmetic, subscripts, and comparisons; a JSON null value is a null item.
+query TTTT nosort
+SELECT jsonb_path_query_first('1', '$x + $y', '{"x": 2, "y": 3}'), jsonb_path_query_first('[10, 20, 30]', '$[$i]', '{"i": 1}'), jsonb_path_query_first('1', '$x', '{"x": null}'), jsonb_path_query_array('[1, 2]', '$[*] ? (@ != $"a b")', '{"a b": 1}')
+----
+5
+20
+null
+[2]
+
+# Lax unwraps a variable's array value like the context item's.
+query TT nosort
+SELECT jsonb_path_query_array('{}', '$x.a', '{"x": [{"a": 1}, {"a": 2}]}'), jsonb_path_query_array('{}', '$x.size()', '{"x": [1, 2, 3]}')
+----
+[1, 2]
+[3]
+
+query BBB nosort
+SELECT jsonb_path_exists('{"a": 1}', '$.a ? (@ == $v)', '{"v": 1}'), jsonb_path_exists('{"a": 1}', '$.a ? (@ == $v)', '{"v": 2}'), jsonb_path_match('{"a": 1}', '$.a == $v', '{"v": 1}')
+----
+true
+false
+true
+
+# Variable names are case-sensitive.
+statement error 42704
+SELECT jsonb_path_query_first('1', '$X', '{"x": 1}')
+
+# A missing variable is 42704: raised with the default (empty) vars, in silent mode, and from a
+# filter operand, where SQL/JSON errors only make the comparison unknown.
+statement error 42704
+SELECT jsonb_path_exists('{}', '$x')
+
+statement error 42704
+SELECT jsonb_path_query_first('{}', '$x', '{}', true)
+
+statement error 42704
+SELECT jsonb_path_query_array('[1]', '$[*] ? ($z == 1)', '{"x": 1}')
+
+statement error 42704
+SELECT '{}'::jsonb @? '$x'
+
+statement error 42704
+SELECT '{}'::jsonb @@ '$x == 1'
+
+# A non-object vars is 22023, even when the path uses no variable and in silent mode.
+statement error 22023
+SELECT jsonb_path_exists('{}', '$', '1')
+
+statement error 22023
+SELECT jsonb_path_exists('{}', '$', 'null')
+
+statement error 22023
+SELECT jsonb_path_query_first('{}', '$', '[]', true)
+
+statement error 22023
+SELECT * FROM jsonb_path_query('{}', '$', '[1]')
+
+# STRICT: a NULL vars or silent is a NULL result (zero rows from the set-returning form).
+query BTT nosort
+SELECT jsonb_path_exists('{"a": 1}', '$.a', '{}', NULL), jsonb_path_query_first('{"a": 1}', '$.a', NULL), jsonb_path_query_array('{"a": 1}', '$.a', NULL, false)
+----
+NULL
+NULL
+NULL
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('{"a": 1}', '$.a', NULL)
+----
+0
+
+# --- silent ------------------------------------------------------------------------------------
+
+# Silent mode ends the evaluation at the first SQL/JSON error: the items found before it are the
+# result, and an existence test is NULL.
+query T rowsort
+SELECT * FROM jsonb_path_query('[1, "a", 2]', '$[*].double()', silent => true)
+----
+1
+
+query TTB nosort
+SELECT jsonb_path_query_array('[1, "a", 2]', '$[*].double()', silent => true), jsonb_path_query_first('["a", 2]', '$[*].double()', silent => true), jsonb_path_exists('["a", 2]', 'strict $[*].double()', silent => true)
+----
+[1]
+NULL
+NULL
+
+statement error 22036
+SELECT jsonb_path_exists('["a", 2]', 'strict $[*].double()', '{}', false)
+
+query TBB nosort
+SELECT jsonb_path_query_first('[1]', 'strict $[5]', '{}', true), jsonb_path_exists('[1]', 'strict $[5]', silent => true), jsonb_path_exists('[1, "a"]', '$[*].double()', silent => true)
+----
+NULL
+NULL
+true
+
+# jsonb_path_match: silent turns a result that is not one boolean into NULL, and decides on the
+# items found before an error.
+query BBBB nosort
+SELECT jsonb_path_match('[true, "x"]', '$[*].boolean()', silent => true), jsonb_path_match('1', '$', silent => true), jsonb_path_match('[true, true]', '$[*]', silent => true), jsonb_path_match('{}', '$ == 1', silent => true)
+----
+true
+NULL
+NULL
+NULL
+
+statement error 22038
+SELECT jsonb_path_match('1', '$', silent => false)
+
+statement error 22036
+SELECT jsonb_path_match('[true, "x"]', '$[*].boolean()')
+
+# --- named notation ----------------------------------------------------------------------------
+
+query TTB nosort
+SELECT jsonb_path_query_first(target => '{"a": 1}', path => '$.a'), jsonb_path_query_array(path => '$[*] ? (@ > $n)', target => '[1, 2, 3]', vars => '{"n": 1}'), jsonb_path_exists('[1]', '$[2]', silent => true)
+----
+1
+[2, 3]
+false
+
+query T rowsort
+SELECT * FROM jsonb_path_query('[1, 2, 3]', '$[*] ? (@ > $n)', vars => '{"n": 1}')
+----
+2
+3
+
+statement error 42883
+SELECT jsonb_path_exists('{}', '$', nope => true)
+
+statement error 42601
+SELECT jsonb_path_exists(target => '{}', '$')
+
+statement error 42883
+SELECT jsonb_path_exists('{}')
+
+statement error 42883
+SELECT jsonb_path_exists('{}', '$', '{}', true, 1)
+
+# --- .keyvalue() ids ---------------------------------------------------------------------------
+
+# The vars object is base object 1: a variable's .keyvalue() id is 10^10 plus the value's offset in
+# the vars object's binary layout. Generated objects are numbered from 2.
+query TTT nosort
+SELECT jsonb_path_query_first('{}', '$x.keyvalue()', '{"x": {"b": 1}, "a": 5}'), jsonb_path_query_first('{}', '$x.c.keyvalue()', '{"x": {"b": 1, "c": {"z": 1}}, "a": 5}'), jsonb_path_query_first('{"a": {"b": 1}}', '$.a.keyvalue()', '{"x": 1}')
+----
+{"id": 10000000032, "key": "b", "value": 1}
+{"id": 10000000064, "key": "z", "value": 1}
+{"id": 16, "key": "b", "value": 1}
+
+query T nosort
+SELECT jsonb_path_query_array('{"q": {"r": 1}}', '$.keyvalue().value.keyvalue()', '{"x": {"y": 1}}')
+----
+[{"id": 20000000048, "key": "r", "value": 1}]
+
+# A pair taken from a variable's object is a generated base object like any other (numbered 2).
+query T nosort
+SELECT jsonb_path_query_array('{}', '$x.keyvalue().value.keyvalue()', '{"x": {"q": {"r": 1}}}')
+----
+[{"id": 20000000056, "key": "r", "value": 1}]
+
+# The context and a variable may hold the same document parts; each is laid out in its own base.
+query TT nosort
+SELECT jsonb_path_query_array(v->'x', '$.keyvalue()', v), jsonb_path_query_array(v->'x', '$x.keyvalue()', v) FROM (SELECT '{"x": {"b": 1}, "a": 5}'::jsonb) c(v)
+----
+[{"id": 0, "key": "b", "value": 1}]
+[{"id": 10000000032, "key": "b", "value": 1}]
+
+# --- the _tz functions -------------------------------------------------------------------------
+
+query BBTT nosort
+SELECT jsonb_path_exists_tz('{"a": 1}', '$.a ? (@ == $v)', '{"v": 1}'), jsonb_path_match_tz('{"a": 1}', '$.a == 1'), jsonb_path_query_first_tz('[1, 2]', '$[1]'), jsonb_path_query_array_tz('[1, 2]', '$[*] ? (@ > $n)', vars => '{"n": 1}')
+----
+true
+true
+2
+[2]
+
+query T rowsort
+SELECT * FROM jsonb_path_query_tz('{"a": [1, 2]}', '$.a[*]')
+----
+1
+2
+
+query T rowsort
+SELECT * FROM jsonb_path_query_tz('[1, "a"]', '$[*].double()', silent => true)
+----
+1
+
+statement error 42704
+SELECT jsonb_path_exists_tz('{}', '$x')
+
+statement error 22023
+SELECT jsonb_path_exists_tz('{}', '$', '[]')
+
+# The _tz functions are STABLE, so an index expression cannot use them; the others are IMMUTABLE.
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, j jsonb)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"a": 1}'), (2, '{"a": 2}'), (3, '{"b": 1}')
+
+statement ok
+CREATE INDEX docs_has_a ON docs ((jsonb_path_exists(j, '$.a')))
+
+statement error 42P17
+CREATE INDEX docs_has_a_tz ON docs ((jsonb_path_exists_tz(j, '$.a')))
+
+statement error 42P17
+CREATE INDEX docs_first_tz ON docs ((jsonb_path_query_first_tz(j, '$.a')))
+
+query I rowsort
+SELECT id FROM docs WHERE jsonb_path_exists(j, '$.a ? (@ >= $min)', '{"min": 2}')
+----
+2
+
+# --- PASSING -----------------------------------------------------------------------------------
+
+query BB nosort
+SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x)' PASSING 1 AS x), JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x && @ < $y)' PASSING 0 AS x, 1 AS y)
+----
+true
+false
+
+query TTT nosort
+SELECT JSON_VALUE('{"a": 5}', '$.a + $n' PASSING 10 AS n), JSON_VALUE('{}', '$x' PASSING 1.50 AS x), JSON_QUERY('[1, 2, 3]', '$[$i]' PASSING 2 AS i)
+----
+15
+1.50
+3
+
+# A text value (a bare string literal is text) is a string item, even when it reads as JSON; a
+# boolean, integer, or decimal is the item itself; SQL NULL is a JSON null.
+query TTTTTT nosort
+SELECT JSON_QUERY('{}', '$x' PASSING 'abc' AS x), JSON_QUERY('{}', '$x' PASSING '{"a":1}' AS x), JSON_QUERY('{}', '$x' PASSING true AS x), JSON_QUERY('{}', '$x' PASSING '12345678901234567890'::decimal AS x), JSON_QUERY('{}', '$x' PASSING NULL AS x), JSON_VALUE('{}', '$x' PASSING NULL AS x)
+----
+"abc"
+"{\"a\":1}"
+true
+12345678901234567890
+null
+NULL
+
+query TT nosort
+SELECT JSON_QUERY('{}', '$x' PASSING NULL::i32 AS x), JSON_QUERY('{}', '$x.type()' PASSING 'abc'::text AS x)
+----
+null
+"string"
+
+# A jsonb value is itself; a json value is converted (canonical, the last duplicate key wins).
+query TTT nosort
+SELECT JSON_QUERY('{}', '$x' PASSING '{"a":1}'::jsonb AS x), JSON_QUERY('{}', '$x' PASSING '{"a":1, "a":2}'::json AS x), JSON_QUERY('{}', '$x.a[1]' PASSING '{"a": [5, 6]}'::jsonb AS x)
+----
+{"a": 1}
+{"a": 2}
+6
+
+# Any other type is converted by to_jsonb.
+query TTTTT nosort
+SELECT JSON_QUERY('{}', '$x' PASSING interval '1 day' AS x), JSON_QUERY('{}', '$x' PASSING ARRAY[1, 2] AS x), JSON_QUERY('{}', '$x' PASSING uuid 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' AS x), JSON_VALUE('{}', '$x' PASSING '\x616263'::bytea AS x), JSON_QUERY('{}', '$x' PASSING '[1,5)'::int4range AS x)
+----
+"1 day"
+[1, 2]
+"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+\x616263
+"[1,5)"
+
+# FORMAT JSON parses a text value as JSON; a json or jsonb value is unchanged.
+query TTTT nosort
+SELECT JSON_QUERY('{}', '$x' PASSING '{"a":1}' FORMAT JSON AS x), JSON_QUERY('{}', '$x' PASSING 1 FORMAT JSON AS x), JSON_QUERY('{}', '$x' PASSING '{"a":1}'::jsonb FORMAT JSON AS x), JSON_QUERY('{}', '$x.type()' PASSING date '2020-01-01' FORMAT JSON AS x)
+----
+{"a": 1}
+1
+{"a": 1}
+"string"
+
+statement error 22P02
+SELECT JSON_QUERY('{}', '$x' PASSING 'nope' FORMAT JSON AS x)
+
+# The first of two bindings with one name wins; an unquoted name folds to lower case.
+query TTT nosort
+SELECT JSON_VALUE('{}', '$x' PASSING 1 AS x, 2 AS x), JSON_VALUE('{}', '$x' PASSING 1 AS X), JSON_VALUE('{}', '$X' PASSING 1 AS "X")
+----
+1
+1
+1
+
+query B nosort
+SELECT JSON_EXISTS(jsonb '{"a": 1}', '$.a ? (@ == $"b c")' PASSING 1 AS "b c")
+----
+true
+
+# A missing variable is 42704, which ON ERROR does not catch.
+statement error 42704
+SELECT JSON_EXISTS('{}', '$y' PASSING 1 AS x)
+
+statement error 42704
+SELECT JSON_EXISTS('{}', '$y' PASSING 1 AS x TRUE ON ERROR)
+
+statement error 42704
+SELECT JSON_VALUE('{}', '$y' PASSING 1 AS x NULL ON ERROR)
+
+statement error 42704
+SELECT JSON_QUERY('{}', '$y')
+
+# Each PASSING value is a base object numbered by its position; generated objects follow them.
+query TT nosort
+SELECT JSON_QUERY('{}', '$x.keyvalue()' PASSING '{"a":1}'::jsonb AS y, '{"b":{"c":1}}'::jsonb AS x), JSON_QUERY('{}', '$x.b.keyvalue()' PASSING '{"a":1}'::jsonb AS y, '{"b":{"c":1}}'::jsonb AS x)
+----
+{"id": 20000000000, "key": "b", "value": {"c": 1}}
+{"id": 20000000016, "key": "c", "value": 1}
+
+query TT nosort
+SELECT JSON_QUERY('{"q":{"r":1}}', '$.keyvalue().value.keyvalue()' PASSING 1 AS y, 2 AS x WITH WRAPPER), JSON_QUERY('{"q":{"r":1}}', '$.keyvalue().value.keyvalue()' WITH WRAPPER)
+----
+[{"id": 30000000048, "key": "r", "value": 1}]
+[{"id": 10000000048, "key": "r", "value": 1}]
+
+# PASSING values may come from columns.
+query IT rowsort
+SELECT id, JSON_VALUE(j, '$.a * $k' PASSING id AS k) FROM docs
+----
+1
+1
+2
+4
+3
+NULL
+
+# A PASSING value may be any expression: an aggregate, a scalar subquery, a row.
+query TTT nosort
+SELECT JSON_VALUE('{}', '$x' PASSING count(*) AS x), JSON_VALUE('{}', '$x' PASSING (SELECT max(id) FROM docs) AS x), max(JSON_VALUE(j, '$.a + $x' PASSING id AS x)) FROM docs
+----
+3
+3
+4
+
+query T nosort
+SELECT JSON_QUERY('{}', '$x' PASSING ROW(1, 'a') AS x)
+----
+{"f1": 1, "f2": "a"}
+
+# --- JSON_TABLE PASSING ------------------------------------------------------------------------
+
+# The variables reach the row path, the column paths, EXISTS columns, and NESTED paths.
+query II rowsort
+SELECT * FROM JSON_TABLE('[1, 2, 3]', '$[*] ? (@ > $x)' PASSING 1 AS x COLUMNS (a i32 PATH '$', b i32 PATH '$ + $x'))
+----
+2
+3
+3
+4
+
+query IIB rowsort
+SELECT * FROM JSON_TABLE('[1, 2, 3]', '$[*] ? (@ > $x)' PASSING 1 AS x, 10 AS y COLUMNS (a i32 PATH '$', b i32 PATH '$ + $y', c boolean EXISTS PATH '$ ? (@ > $x)'))
+----
+2
+12
+true
+3
+13
+true
+
+query I rowsort
+SELECT * FROM JSON_TABLE('[[1], [2], [9]]', '$[*]' PASSING 5 AS k COLUMNS (NESTED PATH '$[*] ? (@ < $k)' COLUMNS (a i32 PATH '$ + $k')))
+----
+6
+7
+NULL
+
+query I rowsort
+SELECT * FROM JSON_TABLE('[1, 2, 3]', '$[*]' AS p PASSING 1 AS p COLUMNS (a i32 PATH '$ + $p'))
+----
+2
+3
+4
+
+statement error 42704
+SELECT * FROM JSON_TABLE('[1]', '$[*]' PASSING 1 AS x COLUMNS (a i32 PATH '$z'))
+
+statement error 42704
+SELECT * FROM JSON_TABLE('[1]', '$[*]' PASSING 1 AS x COLUMNS (a i32 PATH '$z' NULL ON ERROR))
+
+statement error 42704
+SELECT * FROM JSON_TABLE('[1]', '$z' PASSING 1 AS x COLUMNS (a i32 PATH '$'))
+
+# A column path's context item is the row item: its .keyvalue() ids count from the row item.
+query T nosort
+SELECT * FROM JSON_TABLE('[{"a": 1}]', '$[*]' PASSING 1 AS x COLUMNS (a jsonb PATH '$.keyvalue()'))
+----
+{"id": 0, "key": "a", "value": 1}
+
+# Correlated PASSING values (JSON_TABLE is implicitly lateral).
+query II rowsort
+SELECT d.id, t.v FROM docs d, JSON_TABLE(d.j, '$.a' PASSING d.id AS k COLUMNS (v i32 PATH '$ + $k')) t
+----
+1
+2
+2
+4
+
+# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
+
+# A date/time value is a jsonpath datetime item in PostgreSQL, and the datetime item methods are a
+# deferred 0A000 (jsonpath.md §3.1). A float is converted by float8_numeric, or is NaN/±Infinity,
+# which decimal cannot hold; it is a deferred 0A000 too.
+statement error 0A000
+SELECT JSON_VALUE('{}', '$x' PASSING date '2020-01-01' AS x)
+
+statement error 0A000
+SELECT JSON_VALUE('{}', '$x' PASSING timestamptz '2020-01-01 00:00:00+00' AS x)
+
+statement error 0A000
+SELECT JSON_VALUE('{}', '$x' PASSING 1.5::f64 AS x)
+
+statement error 0A000
+SELECT JSON_QUERY('{}', '$x' PASSING ARRAY[1.5::f64] AS x)
+
+# FORMAT JSON on a bytea value reads it as encoded JSON text in PostgreSQL; jed defers it.
+statement error 0A000
+SELECT JSON_QUERY('{}', '$x' PASSING '\x7b7d'::bytea FORMAT JSON AS x)

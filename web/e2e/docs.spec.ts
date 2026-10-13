@@ -215,6 +215,15 @@ test('the types page autoruns the jsonpath arithmetic demo', async ({ page }) =>
   await expect(rows).toContainText('"number"');
 });
 
+test('the types page autoruns the jsonpath variables demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // vars bound $min/$max; silent stopped at "x" keeping [1]; PASSING bound $qty (2.50 * 4).
+  const rows = livePanel(page, 'jsonpathVarsDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('[8, 12]');
+  await expect(rows).toContainText('[1]');
+  await expect(rows).toContainText('10.00');
+});
+
 test('the tables page decodes Unicode-escape literals and names live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   // U&'caf\00e9' is café in a column named näme; the UESCAPE '!' form decodes to data.

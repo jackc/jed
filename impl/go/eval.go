@@ -4033,25 +4033,36 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		return growthResult(m, e.sargs, JsonbValue(out))
 	case reJsonPathFn:
-		// A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
+		// A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL argument → NULL.
 		m.Charge(costs.OperatorEval)
-		ctx, err := e.sargs[0].eval(row, env, m)
-		if err != nil {
-			return Value{}, err
+		vals := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
 		}
-		path, err := e.sargs[1].eval(row, env, m)
-		if err != nil {
-			return Value{}, err
+		for _, v := range vals {
+			if v.Kind == ValNull {
+				return NullValue(), nil
+			}
 		}
-		// The operators are PostgreSQL's silent forms. The jsonb_path_* functions pass the default
-		// vars object, one base object for .keyvalue() ids; the operators pass none (jsonpath.md
-		// §3.1).
-		silent := e.jpFnKind == jpfExistsSilent || e.jpFnKind == jpfMatchSilent
-		opts := jpEvalOpts{exists: e.jpFnKind == jpfExists || e.jpFnKind == jpfExistsSilent, vars: 1}
-		if silent {
-			opts.vars = 0
+		// The jsonb_path_* functions take a vars object (one base object for .keyvalue() ids, checked
+		// before evaluation even in silent mode) and a silent flag; the operators are PostgreSQL's
+		// silent forms with no variables (jsonpath.md §3.1, §5).
+		vars := jpVars{}
+		silent := true
+		if len(vals) == 4 {
+			varsNode := vals[2].jsonb()
+			if err := checkVarsObject(varsNode); err != nil {
+				return Value{}, err
+			}
+			vars = jpObjectVars(varsNode)
+			silent = vals[3].boolVal()
 		}
-		seq, ok, errored, err := evalJsonpath(ctx, path, opts, silent, m)
+		opts := jpEvalOpts{exists: e.jpFnKind == jpfExists || e.jpFnKind == jpfExistsSilent, vars: vars}
+		seq, ok, errored, err := evalJsonpath(vals[0], vals[1], opts, silent, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -4064,10 +4075,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		switch e.jpFnKind {
-		case jpfExists:
-			return BoolValue(len(seq) > 0), nil
-		case jpfExistsSilent:
-			// @?: a SQL/JSON error → SQL NULL.
+		case jpfExists, jpfExistsSilent:
+			// Silent: a SQL/JSON error → SQL NULL.
 			if errored {
 				return NullValue(), nil
 			}
@@ -4077,23 +4086,21 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return NullValue(), nil
 			}
 			return JsonbValue(seq[0]), nil
-		case jpfMatch:
+		case jpfMatch, jpfMatchSilent:
 			// jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON null — an
-			// unknown predicate — which is SQL NULL).
+			// unknown predicate — which is SQL NULL). Silent (@@, or silent => true) suppresses
+			// anything else to SQL NULL; an error ends the evaluation, and the items found before it
+			// still decide.
 			if len(seq) == 1 && seq[0].Kind == JBool {
 				return BoolValue(seq[0].B), nil
 			}
 			if len(seq) == 1 && seq[0].Kind == JNull {
 				return NullValue(), nil
 			}
-			return Value{}, newError(SingletonSqlJsonItemRequired, "single boolean result is expected")
-		case jpfMatchSilent:
-			// @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean result to NULL.
-			// An error ends the evaluation; the items found before it still decide.
-			if len(seq) == 1 && seq[0].Kind == JBool {
-				return BoolValue(seq[0].B), nil
+			if silent {
+				return NullValue(), nil
 			}
-			return NullValue(), nil
+			return Value{}, newError(SingletonSqlJsonItemRequired, "single boolean result is expected")
 		default: // jpfQueryArray
 			// Wrapping the items in an array can deepen the result (json.md §6.4).
 			out := JsonNode{Kind: JArray, Arr: seq}
@@ -4124,10 +4131,22 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		seq, _, err := evalJsonpathOn(node, pv, jpEvalOpts{exists: e.jsKind == jsExists}, false, m)
+		compiled, err := compileMetered(pv.str(), m)
+		if err != nil {
+			return Value{}, err
+		}
+		// The PASSING values, evaluated after the context and path (as in PostgreSQL) and outside ON
+		// ERROR: each is a base object for .keyvalue() ids (jsonpath.md §3.1).
+		passing := e.sargs[2:]
+		bindings, err := passingBindings(passing, e.jsPassingNames, row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		opts := jpEvalOpts{exists: e.jsKind == jsExists, vars: jpPassingVarsOf(bindings, int64(len(passing)))}
+		seq, err := compiled.Eval(node, opts, m)
 		if err != nil {
 			// A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
-			// else (a cost abort, etc.) propagates.
+			// else (a cost abort, a missing variable, etc.) propagates.
 			if isSQLJSONError(err) {
 				return applyJSONBehavior(e.jsOnError, err, e.result, env, m)
 			}
@@ -4138,7 +4157,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		constant := rexprIsConstant(e.sargs[0]) && rexprIsConstant(e.sargs[1])
+		constant := true
+		for _, a := range e.sargs {
+			constant = constant && rexprIsConstant(a)
+		}
 		return evalJSONSqlResult(e.jsKind, seq, e.result, e.jsWrapper, e.jsOnEmpty, e.jsOnError, constant, env, m)
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.

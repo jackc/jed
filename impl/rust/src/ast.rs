@@ -818,6 +818,10 @@ pub struct TableRef {
     pub db: Option<String>,
     pub alias: Option<String>,
     pub args: Option<Vec<Expr>>,
+    /// The parameter names of a table function's arguments in PostgreSQL named notation (`name =>
+    /// value`, grammar.md §17), one per argument (`None` for a positional one); `None` when every
+    /// argument is positional.
+    pub arg_names: Option<Vec<Option<String>>>,
     pub subquery: Option<Box<QueryExpr>>,
     pub values: Option<Vec<Vec<Expr>>>,
     pub column_aliases: Option<Vec<String>>,
@@ -906,7 +910,18 @@ impl Eq for SrcPos {}
 pub struct JsonTable {
     pub ctx: Box<Expr>,
     pub path: Box<Expr>,
+    pub passing: Vec<JsonPassing>,
     pub columns: Vec<JtColumn>,
+}
+
+/// One `PASSING value [FORMAT JSON] AS name` argument of a SQL/JSON query function or `JSON_TABLE`
+/// (json-sql-functions.md §5.4): binds the path variable `$name` to the value.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JsonPassing {
+    pub expr: Expr,
+    /// `FORMAT JSON` was written: a character-string value is parsed as JSON text.
+    pub format_json: bool,
+    pub name: String,
 }
 
 /// One `JSON_TABLE` `COLUMNS` entry (json-table.md §3.3).
@@ -1356,10 +1371,12 @@ pub enum Expr {
     },
     /// `JSON_EXISTS(ctx, path [behavior ON ERROR])` — the SQL/JSON existence predicate
     /// (json-sql-functions.md §5, S2). The path is evaluated over the context item; a non-empty
-    /// sequence → true. The default `ON ERROR` behavior is `FALSE`. `PASSING` (vars) is deferred.
+    /// sequence → true. The default `ON ERROR` behavior is `FALSE`. `passing` binds the path's
+    /// `$name` variables.
     JsonExists {
         ctx: Box<Expr>,
         path: Box<Expr>,
+        passing: Vec<JsonPassing>,
         on_error: Option<JsonOnBehavior>,
     },
     /// `JSON_VALUE(ctx, path [RETURNING type] [ON EMPTY] [ON ERROR])` — extract a single SCALAR
@@ -1368,6 +1385,7 @@ pub enum Expr {
     JsonValue {
         ctx: Box<Expr>,
         path: Box<Expr>,
+        passing: Vec<JsonPassing>,
         returning: Option<String>,
         on_empty: Option<JsonOnBehavior>,
         on_error: Option<JsonOnBehavior>,
@@ -1378,6 +1396,7 @@ pub enum Expr {
     JsonQuery {
         ctx: Box<Expr>,
         path: Box<Expr>,
+        passing: Vec<JsonPassing>,
         returning: Option<String>,
         wrapper: JsonWrapper,
         /// `KEEP QUOTES` (true, default) / `OMIT QUOTES` (false).

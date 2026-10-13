@@ -1,7 +1,7 @@
 # EXPLAIN follow-on surface: parenthesized boolean options, canonical verbose expressions, exact
 # float literal text, lane classification, per-node ANALYZE costs, DML touched sets, and writable
 # WITH plans. This is jed-owned deterministic output (spec/design/explain.md).
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.returning, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.limit, query.order_by, query.order_by_pk_scan, query.order_by_index_scan, query.order_by_join_inl, query.order_by_topk, query.window, query.window_ranking, query.cte, query.cte_data_modifying, query.union, query.explain, query.explain_analyze, query.aggregates, query.subquery_scalar, query.derived_table, query.join_inner, query.qualified_column, query.hash_join, dml.explain, expr.arithmetic, expr.json_query_fns, func.sequence, func.array, func.jsonb_path, types.i32, types.i64, types.f64, types.bytea, types.jsonb, types.jsonpath, expr.text_concat, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.returning, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.limit, query.order_by, query.order_by_pk_scan, query.order_by_index_scan, query.order_by_join_inl, query.order_by_topk, query.window, query.window_ranking, query.cte, query.cte_data_modifying, query.union, query.explain, query.explain_analyze, query.aggregates, query.subquery_scalar, query.derived_table, query.join_inner, query.qualified_column, query.hash_join, dml.explain, expr.arithmetic, expr.json_query_fns, func.sequence, func.array, func.jsonb_path, types.i32, types.i64, types.f64, types.bytea, types.jsonb, types.json, types.jsonpath, expr.jsonpath_match, expr.jsonpath_arith, expr.jsonpath_vars, expr.text_concat, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -266,6 +266,23 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT JSON_QUERY('{"a":1}', '$' RETURNING json W
 0
 Result
 output=[json_query('{"a": 1}', '$' returning json with conditional array wrapper keep quotes on scalar string empty object on empty error on error)]
+
+# A PASSING clause renders each value as resolved (a json value converted to jsonb) and its name as
+# an identifier.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT JSON_VALUE('{"a":1}', '$.a + $x' PASSING 1 AS x, 'q' AS "B c", '{"a":1}'::json AS j)
+----
+0
+Result
+output=[json_value('{"a": 1}', '($."a" + $"x")' passing 1 as x, 'q' as "B c", cast('{"a":1}' as jsonb) as j returning text null on empty null on error)]
+
+# The jsonb_path_* functions render their DEFAULT vars and silent arguments; a _tz form keeps its name.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT jsonb_path_exists('{}', '$'), jsonb_path_match_tz('{}', '$ == $v', silent => true)
+----
+0
+Result
+output=[jsonb_path_exists('{}', '$', '{}', false), jsonb_path_match_tz('{}', '($ == $"v")', '{}', true)]
 
 # Parenthesized ANALYZE adds actual_cost independently of the estimate columns.
 # names: depth, node, detail, actual_cost

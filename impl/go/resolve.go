@@ -2537,13 +2537,13 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			},
 			resolvedType{kind: rtJson}, nil
 	case exprJsonExists:
-		return resolveJSONSqlFn(s, jsExists, e.JsonExists.Ctx, e.JsonExists.Path, nil,
+		return resolveJSONSqlFn(s, jsExists, e.JsonExists.Ctx, e.JsonExists.Path, e.JsonExists.Passing, nil,
 			jWWithout, true, nil, e.JsonExists.OnError, ag, params)
 	case exprJsonValue:
-		return resolveJSONSqlFn(s, jsValue, e.JsonValue.Ctx, e.JsonValue.Path, e.JsonValue.Returning,
+		return resolveJSONSqlFn(s, jsValue, e.JsonValue.Ctx, e.JsonValue.Path, e.JsonValue.Passing, e.JsonValue.Returning,
 			jWWithout, true, e.JsonValue.OnEmpty, e.JsonValue.OnError, ag, params)
 	case exprJsonQuery:
-		return resolveJSONSqlFn(s, jsQuery, e.JsonQuery.Ctx, e.JsonQuery.Path, e.JsonQuery.Returning,
+		return resolveJSONSqlFn(s, jsQuery, e.JsonQuery.Ctx, e.JsonQuery.Path, e.JsonQuery.Passing, e.JsonQuery.Returning,
 			e.JsonQuery.Wrapper, e.JsonQuery.KeepQuotes, e.JsonQuery.OnEmpty, e.JsonQuery.OnError, ag, params)
 	case exprIsDistinct:
 		// NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a

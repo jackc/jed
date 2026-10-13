@@ -919,24 +919,33 @@ impl RExpr {
                 }
                 Ok(out)
             }
-            // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
-            RExpr::JsonPathFn { kind, args } => {
+            // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL argument → NULL.
+            RExpr::JsonPathFn { kind, args, .. } => {
                 m.charge(COSTS.operator_eval);
-                let ctx = args[0].eval(row, env, m)?;
-                let path = args[1].eval(row, env, m)?;
-                let Some((node, compiled)) = jsonpath_operands(&ctx, &path, m)? else {
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(a.eval(row, env, m)?);
+                }
+                if vals.iter().any(|v| matches!(v, Value::Null)) {
+                    return Ok(Value::Null);
+                }
+                // The `jsonb_path_*` functions take a `vars` object (one base object for
+                // `.keyvalue()` ids, checked before evaluation even in silent mode) and a `silent`
+                // flag; the operators are PostgreSQL's silent forms with no variables
+                // (jsonpath.md §3.1, §5).
+                let (vars, silent) = match &vals[2..] {
+                    [Value::Jsonb(v), Value::Bool(s)] => {
+                        crate::jsonpath::check_vars_object(v)?;
+                        (crate::jsonpath::Vars::Object(v), *s)
+                    }
+                    _ => (crate::jsonpath::Vars::None, true),
+                };
+                let Some((node, compiled)) = jsonpath_operands(&vals[0], &vals[1], m)? else {
                     return Ok(Value::Null);
                 };
-                // The operators are PostgreSQL's silent forms. The `jsonb_path_*` functions pass
-                // the default `vars` object, one base object for `.keyvalue()` ids; the operators
-                // pass none (jsonpath.md §3.1).
-                let silent = matches!(
-                    kind,
-                    JsonPathFnKind::ExistsSilent | JsonPathFnKind::MatchSilent
-                );
                 let opts = crate::jsonpath::EvalOpts {
                     exists: matches!(kind, JsonPathFnKind::Exists | JsonPathFnKind::ExistsSilent),
-                    vars: if silent { 0 } else { 1 },
+                    vars,
                 };
                 let (seq, errored) = if silent {
                     crate::jsonpath::eval_silent(&compiled, &node, opts, m)?
@@ -947,10 +956,13 @@ impl RExpr {
                 m.charge(COSTS.operator_eval * seq.len() as i64);
                 m.guard()?;
                 match kind {
-                    JsonPathFnKind::Exists => Ok(Value::Bool(!seq.is_empty())),
-                    // `@?`: a SQL/JSON error → SQL NULL.
-                    JsonPathFnKind::ExistsSilent if errored => Ok(Value::Null),
-                    JsonPathFnKind::ExistsSilent => Ok(Value::Bool(!seq.is_empty())),
+                    // Silent: a SQL/JSON error → SQL NULL.
+                    JsonPathFnKind::Exists | JsonPathFnKind::ExistsSilent if errored => {
+                        Ok(Value::Null)
+                    }
+                    JsonPathFnKind::Exists | JsonPathFnKind::ExistsSilent => {
+                        Ok(Value::Bool(!seq.is_empty()))
+                    }
                     JsonPathFnKind::QueryFirst => Ok(seq
                         .into_iter()
                         .next()
@@ -967,24 +979,18 @@ impl RExpr {
                         Ok(out)
                     }
                     // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON
-                    // null — an unknown predicate — which is SQL NULL).
-                    JsonPathFnKind::Match => {
+                    // null — an unknown predicate — which is SQL NULL). Silent (`@@`, or
+                    // `silent => true`) suppresses anything else to SQL NULL; an error ends the
+                    // evaluation, and the items found before it still decide.
+                    JsonPathFnKind::Match | JsonPathFnKind::MatchSilent => {
                         match seq.iter().map(|n| n.as_ref()).collect::<Vec<_>>()[..] {
                             [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
                             [JsonNode::Null] => Ok(Value::Null),
+                            _ if silent => Ok(Value::Null),
                             _ => Err(EngineError::new(
                                 SqlState::SingletonSqlJsonItemRequired,
                                 "single boolean result is expected",
                             )),
-                        }
-                    }
-                    // @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean
-                    // result to SQL NULL. An error ends the evaluation; the items found before it
-                    // still decide.
-                    JsonPathFnKind::MatchSilent => {
-                        match seq.iter().map(|n| n.as_ref()).collect::<Vec<_>>()[..] {
-                            [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
-                            _ => Ok(Value::Null),
                         }
                     }
                 }
@@ -995,6 +1001,8 @@ impl RExpr {
                 kind,
                 ctx,
                 path,
+                passing,
+                passing_names,
                 returning,
                 decimal,
                 wrapper,
@@ -1013,11 +1021,17 @@ impl RExpr {
                 let Some((node, compiled)) = jsonpath_operands(&cv, &pv, m)? else {
                     return Ok(Value::Null);
                 };
+                // The PASSING values, evaluated after the context and path (as in PostgreSQL) and
+                // outside ON ERROR: each is a base object for `.keyvalue()` ids (jsonpath.md §3.1).
+                let vars = passing_bindings(passing, passing_names, row, env, m)?;
                 // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR;
-                // anything else (a cost abort, etc.) propagates.
+                // anything else (a cost abort, a missing variable, etc.) propagates.
                 let opts = crate::jsonpath::EvalOpts {
                     exists: matches!(kind, JsonSqlKind::Exists),
-                    vars: 0,
+                    vars: crate::jsonpath::Vars::Passing {
+                        vars: &vars,
+                        count: passing.len() as i64,
+                    },
                 };
                 let seq = match crate::jsonpath::eval(&compiled, &node, opts, m) {
                     Ok(s) => s,
@@ -1028,7 +1042,9 @@ impl RExpr {
                 };
                 m.charge(COSTS.operator_eval * seq.len() as i64);
                 m.guard()?;
-                let constant = rexpr_is_constant(ctx) && rexpr_is_constant(path);
+                let constant = rexpr_is_constant(ctx)
+                    && rexpr_is_constant(path)
+                    && passing.iter().all(rexpr_is_constant);
                 eval_json_sql_result(
                     *kind, seq, *returning, *decimal, *wrapper, *on_empty, *on_error, constant,
                     env, m,

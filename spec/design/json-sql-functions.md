@@ -345,7 +345,7 @@ json_exists_func::= "JSON_EXISTS" "(" ctx "," path json_passing?
 ctx             ::= expr ( "FORMAT" "JSON" )?           (* json/jsonb/text coerced to jsonb *)
 path            ::= string_literal                      (* compiled to jsonpath *)
 json_passing    ::= "PASSING" passing_arg ( "," passing_arg )*
-passing_arg     ::= expr "AS" identifier                (* binds $identifier in the path *)
+passing_arg     ::= expr ( "FORMAT" "JSON" )? "AS" identifier   (* binds $identifier in the path, §5.4 *)
 json_returning  ::= "RETURNING" type ( "FORMAT" "JSON" )?
 wrapper_clause  ::= "WITH" ("CONDITIONAL"|"UNCONDITIONAL")? "ARRAY"? "WRAPPER"
                   | "WITHOUT" "ARRAY"? "WRAPPER"
@@ -415,13 +415,53 @@ Still **deferred** (each `0A000`, a documented divergence):
   a **guarded sub-evaluation** (try the kernel; on a SQL/JSON error substitute the default
   expression without unwinding the statement) — a genuinely new evaluator capability. **It is
   deferred to slice S3**.
-- **`PASSING … AS name`** reuses the `vars` substitution from [jsonpath.md §5](jsonpath.md)
-  (the path-variable surface, itself a jsonpath follow-on).
 - **`JSON_QUERY OMIT QUOTES`** — PG returns the de-quoted scalar string still typed `jsonb`
   (an invalid-`jsonb` quirk that fits jed's strict static typing poorly); deferred.
 - **`JSON_QUERY RETURNING` a non-json type** — the wrapper/quotes result is a JSON value;
   coercing it to an arbitrary scalar is a follow-on.
 - **`IS JSON … WITH UNIQUE KEYS`** (S1) uses the shared duplicate-key kernel (§6.2).
+
+### 5.4 `PASSING`
+
+**Status: landed** (capability `expr.jsonpath_vars`). `PASSING value [FORMAT JSON] AS name, …`
+after the path of `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`, and after the root path (and its
+optional `AS name`) of `JSON_TABLE` ([json-table.md](json-table.md) §3.1), binds the path variable
+`$name` ([jsonpath.md §5](jsonpath.md)). The name is an identifier, folded like one (`AS X` binds
+`$x`, `AS "X"` binds `$X`). When two bindings share a name the first wins, as PostgreSQL's lookup
+finds it. A path variable with no binding is `42704`, which `ON ERROR` does not catch.
+
+Each value becomes a jsonpath item the way PostgreSQL's `transformJsonPassingArgs` and
+`JsonItemFromDatum` make it:
+
+- a `boolean`, an integer, or a `decimal` value is that item; a `text` value is a string item, even
+  when its text reads as JSON (a bare string literal is `text`); SQL NULL is JSON `null`;
+- a `jsonb` value is itself, and a `json` value is converted to `jsonb` (keys canonical, the last
+  duplicate key winning);
+- any other type is converted by `to_jsonb` (§2.2): an array is a JSON array, a composite an object,
+  an `interval`/`uuid`/`bytea`/range/`jsonpath` the string of its text output. A `timestamptz` inside
+  one renders in the session zone, which makes the expression nonimmutable, as for `to_jsonb`;
+- `FORMAT JSON` parses a `text` value as JSON text (`22P02` when malformed) and leaves `json`/`jsonb`
+  alone; any other type is converted by `to_jsonb`, so a `date` becomes a string.
+
+**Deferred (`0A000`), ledgered.** A `date`, `timestamp`, or `timestamptz` value without `FORMAT JSON`
+is a jsonpath *datetime item* in PostgreSQL, with its own `.type()` and comparison rules, which waits
+for the datetime item methods ([jsonpath.md §3.1](jsonpath.md)). A float value is converted by
+PostgreSQL's `float8_numeric` (or `float4_numeric`), and NaN/±Infinity become `numeric` NaN/Infinity
+items, which jed's finite `decimal` cannot hold; it waits with the other float-to-JSON conversions
+(§2.2). `FORMAT JSON` on a `bytea` value (encoded JSON text, with an optional `ENCODING`) is deferred
+too.
+
+Evaluation order follows PostgreSQL's. For the query functions the context and path come first (a
+NULL either way is SQL NULL without evaluating the `PASSING` values), then the `PASSING` values in
+order, then the path; the values are evaluated outside `ON ERROR`. `JSON_TABLE` evaluates its
+`PASSING` values before its context, and every path in it — the root path, the column paths, `EXISTS`
+columns, and `NESTED` paths — reads them. Each value is a `.keyvalue()` base object numbered by its
+position in the clause ([jsonpath.md §3.1](jsonpath.md)). A value costs what its expression costs
+(a converted one what `to_jsonb` or the cast costs); binding and reading it charge nothing more.
+
+EXPLAIN VERBOSE renders the clause after the path: `json_value(ctx, path passing value as name, …
+returning …)`, each value as resolved (a converted value shows its `to_jsonb(…)` or `cast(… as
+jsonb)`).
 
 ---
 

@@ -2219,25 +2219,30 @@ func resolveTextArrayArg(s *scope, rhs exprNode, sym string, ag *aggCtx, params 
 	}
 }
 
-// resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb,
-// path jsonpath)`. A bare string literal adapts (the context to jsonb, the path to a compiled
-// jsonpath). STRICT (any NULL → SQL NULL).
-func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	ctx, path, err := resolveJsonpathArgs(s, name, fc.Args, ag, params)
+// resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(target jsonb,
+// path jsonpath [, vars jsonb [, silent boolean]])`, positionally or in named notation, the omitted
+// trailing arguments filled with PostgreSQL's DEFAULTs ('{}', false). A bare string literal adapts.
+// STRICT (any NULL → SQL NULL). A _tz form (tz) is PostgreSQL's STABLE twin, so it is nonimmutable
+// (42P17 in an index expression).
+func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, tz bool, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	args, err := resolveJsonpathArgs(s, name, fc.Args, fc.ArgNames, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
+	}
+	if tz {
+		params.nonimmutable = true
 	}
 	result := resolvedType{kind: rtJsonb}
 	if kind == jpfExists || kind == jpfExistsSilent || kind == jpfMatch || kind == jpfMatchSilent {
 		result = resolvedType{kind: rtBool}
 	}
-	return &rExpr{kind: reJsonPathFn, jpFnKind: kind, sargs: []*rExpr{ctx, path}}, result, nil
+	return &rExpr{kind: reJsonPathFn, jpFnKind: kind, jpTz: tz, sargs: args}, result, nil
 }
 
 // resolveJSONSqlFn resolves a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY
 // (json-sql-functions.md §5, S2) → an reJsonSqlFn node + its fixed result type. ctx is json/jsonb/
 // text (coerced to a jsonb document at eval); path is a jsonpath (a bare string literal compiles).
-func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, returning *string, wrapper jsonWrapper, keepQuotes bool, onEmpty, onError *jsonOnBehavior, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, passing []jsonPassing, returning *string, wrapper jsonWrapper, keepQuotes bool, onEmpty, onError *jsonOnBehavior, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// The context item — json / jsonb / text, coerced to a jsonb document at eval; a bare string
 	// literal adapts to jsonb.
 	jsonbHint := scalarJsonb
@@ -2296,43 +2301,168 @@ func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, returning 
 	} else if kind == jsExists {
 		onErrorB = jOBFalse
 	}
+	passingExprs, passingNames, err := resolveJSONPassing(s, passing, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
 	return &rExpr{
-		kind:         reJsonSqlFn,
-		jsKind:       kind,
-		sargs:        []*rExpr{rctx, rpath},
-		result:       returningST,
-		jsWrapper:    wrapper,
-		jsKeepQuotes: keepQuotes,
-		jsOnEmpty:    onEmptyB,
-		jsOnError:    onErrorB,
+		kind:           reJsonSqlFn,
+		jsKind:         kind,
+		sargs:          append([]*rExpr{rctx, rpath}, passingExprs...),
+		jsPassingNames: passingNames,
+		result:         returningST,
+		jsWrapper:      wrapper,
+		jsKeepQuotes:   keepQuotes,
+		jsOnEmpty:      onEmptyB,
+		jsOnError:      onErrorB,
 	}, resolvedTypeOf(returningST), nil
 }
 
-// resolveJsonpathArgs resolves the `(context jsonb, path jsonpath)` argument pair shared by the
-// jsonpath query functions (the SRF and the scalar forms). A bare string literal adapts: the context
-// to jsonb, the path to a compiled `jsonpath`. Exactly two args this slice (the optional vars /
-// silent are a follow-on).
-func resolveJsonpathArgs(s *scope, name string, args []*exprNode, ag *aggCtx, params *paramTypes) (*rExpr, *rExpr, error) {
-	if len(args) != 2 {
-		return nil, nil, noFuncOverload(name)
+// resolveJSONPassing resolves a `PASSING value [FORMAT JSON] AS name, …` clause (json-sql-functions.md
+// §5.4) → the value expressions, each yielding a value passingBindings reads as a jsonpath item, and
+// the names. PostgreSQL's transformJsonPassingArgs + JsonItemFromDatum: a boolean, integer, decimal,
+// or text value (a bare string literal is text) is the item directly, a jsonb value is itself, and
+// every other type is converted to jsonb — a json value parsed (last duplicate key wins), anything
+// else by to_jsonb. FORMAT JSON parses a text value as JSON instead (22P02 on malformed text) and
+// converts every other type by to_jsonb. Deferred (0A000): a date/timestamp/timestamptz value, which
+// PostgreSQL passes as a jsonpath datetime item (the datetime item methods are deferred, jsonpath.md
+// §3.1); a float, which PostgreSQL converts with float8_numeric (finite values) or passes as
+// NaN/±Infinity, which jed's decimal cannot hold; and FORMAT JSON on a bytea value (an encoded JSON
+// text).
+func resolveJSONPassing(s *scope, passing []jsonPassing, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, error) {
+	exprs := make([]*rExpr, 0, len(passing))
+	names := make([]string, 0, len(passing))
+	unsupported := func(what string) error {
+		return newError(FeatureNotSupported, "a "+what+" PASSING value is not supported yet")
+	}
+	for _, p := range passing {
+		var hint *scalarType
+		if isStringLiteral(p.Expr) || p.Expr.Kind == exprParam {
+			textHint := scalarText
+			hint = &textHint
+		}
+		r, ty, err := resolve(s, p.Expr, hint, ag, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		toJsonb := func() *rExpr {
+			params.nonimmutable = params.nonimmutable || ty.containsTimestamptz()
+			t := ty
+			return &rExpr{kind: reJsonImage, jiFunc: jiToJsonb, sargs: []*rExpr{r}, jiType: &t}
+		}
+		var value *rExpr
+		switch {
+		case ty.kind == rtFloat32 || ty.kind == rtFloat64:
+			return nil, nil, unsupported("float")
+		case ty.kind == rtBytea && p.FormatJSON:
+			return nil, nil, unsupported("FORMAT JSON bytea")
+		case ty.kind == rtNull || ty.kind == rtJsonb:
+			value = r
+		case ty.kind == rtJson || (ty.kind == rtText && p.FormatJSON):
+			value = &rExpr{kind: reCast, operand: r, result: scalarJsonb}
+		case p.FormatJSON:
+			value = toJsonb()
+		case ty.kind == rtBool || ty.kind == rtInt || ty.kind == rtDecimal || ty.kind == rtText:
+			value = r
+		case ty.kind == rtDate || ty.kind == rtTimestamp || ty.kind == rtTimestamptz:
+			return nil, nil, unsupported("date/time")
+		default:
+			value = toJsonb()
+		}
+		exprs = append(exprs, value)
+		names = append(names, p.Name)
+	}
+	return exprs, names, nil
+}
+
+// passingBindings evaluates a resolved PASSING clause into its jsonpath variables (json-sql-functions.md
+// §5.4): each value as a jsonb item (SQL NULL is JSON null), ordered for lookup by passingVars.
+func passingBindings(exprs []*rExpr, names []string, row storedRow, env *evalEnv, m *costMeter) ([]jpPassingVar, error) {
+	bindings := make([]jpBinding, 0, len(exprs))
+	for i, e := range exprs {
+		v, err := e.eval(row, env, m)
+		if err != nil {
+			return nil, err
+		}
+		var node JsonNode
+		switch v.Kind {
+		case ValNull:
+			node = JsonNode{Kind: JNull}
+		case ValBool:
+			node = JsonNode{Kind: JBool, B: v.boolVal()}
+		case ValInt:
+			node = JsonNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}
+		case ValDecimal:
+			node = JsonNode{Kind: JNumber, Num: *v.decimal()}
+		case ValText:
+			node = JsonNode{Kind: JString, S: v.str()}
+		case ValJsonb:
+			node = *v.jsonb()
+		default:
+			panic("resolveJSONPassing converts every other type to jsonb")
+		}
+		bindings = append(bindings, jpBinding{name: names[i], value: node})
+	}
+	return passingVars(bindings), nil
+}
+
+// resolveJsonpathArgs resolves the `(target jsonb, path jsonpath [, vars jsonb [, silent boolean]])`
+// arguments shared by the jsonpath query functions (the SRF and the scalar forms) → the four argument
+// expressions, an omitted vars the empty object and an omitted silent false (PostgreSQL's DEFAULTs).
+// Named notation uses PostgreSQL's parameter names. A bare string literal adapts: the target and vars
+// to jsonb, the path to a compiled `jsonpath`, silent to a boolean.
+func resolveJsonpathArgs(s *scope, name string, args []*exprNode, argNames []*string, ag *aggCtx, params *paramTypes) ([]*rExpr, error) {
+	slots, err := placeNamedArgs(name, []string{"target", "path", "vars", "silent"}, args, argNames)
+	if err != nil {
+		return nil, err
+	}
+	if slots[0] == nil || slots[1] == nil {
+		return nil, noFuncOverload(name)
 	}
 	jsonbHint := scalarJsonb
-	ctx, ct, err := resolve(s, *args[0], &jsonbHint, ag, params)
+	ctx, ct, err := resolve(s, *slots[0], &jsonbHint, ag, params)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if ct.kind != rtJsonb && ct.kind != rtNull {
-		return nil, nil, noFuncOverload(name)
+		return nil, noFuncOverload(name)
 	}
 	pathHint := scalarJsonPath
-	path, pt, err := resolve(s, *args[1], &pathHint, ag, params)
+	path, pt, err := resolve(s, *slots[1], &pathHint, ag, params)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if pt.kind != rtJsonPath && pt.kind != rtNull {
-		return nil, nil, noFuncOverload(name)
+		return nil, noFuncOverload(name)
 	}
-	return ctx, path, nil
+	var vars *rExpr
+	if slots[2] != nil {
+		v, vt, err := resolve(s, *slots[2], &jsonbHint, ag, params)
+		if err != nil {
+			return nil, err
+		}
+		if vt.kind != rtJsonb && vt.kind != rtNull {
+			return nil, noFuncOverload(name)
+		}
+		vars = v
+	} else {
+		vars = valueToRExpr(JsonbValue(JsonNode{Kind: JObject}))
+	}
+	var silent *rExpr
+	if slots[3] != nil {
+		boolHint := scalarBool
+		v, vt, err := resolve(s, *slots[3], &boolHint, ag, params)
+		if err != nil {
+			return nil, err
+		}
+		if vt.kind != rtBool && vt.kind != rtNull {
+			return nil, noFuncOverload(name)
+		}
+		silent = v
+	} else {
+		silent = valueToRExpr(BoolValue(false))
+	}
+	return []*rExpr{ctx, path, vars, silent}, nil
 }
 
 // jsonpathContextNode is a jsonpath query's context item: a jsonb value as is, a json value converted
@@ -2868,17 +2998,15 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveJSONObject(s, name, name == "json_object", fc, ag, params)
 	}
-	// The scalar jsonpath query functions (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. Hand-
-	// resolved (the jsonpath arg + adapting-literal are outside the catalog family mold).
-	if name == "jsonb_path_exists" || name == "jsonb_path_query_first" || name == "jsonb_path_query_array" || name == "jsonb_path_match" {
-		if err := rejectNamed(name, fc.ArgNames); err != nil {
-			return nil, resolvedType{}, err
-		}
+	// The scalar jsonpath query functions (P2, jsonpath.md §5): `(target jsonb, path jsonpath
+	// [, vars jsonb [, silent boolean]])` and their _tz forms. Hand-resolved (the jsonpath arg +
+	// adapting-literal are outside the catalog family mold).
+	if base := strings.TrimSuffix(name, "_tz"); base == "jsonb_path_exists" || base == "jsonb_path_query_first" || base == "jsonb_path_query_array" || base == "jsonb_path_match" {
 		if fc.Star {
 			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		var kind jsonPathFnKind
-		switch name {
+		switch base {
 		case "jsonb_path_exists":
 			kind = jpfExists
 		case "jsonb_path_query_first":
@@ -2888,7 +3016,7 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		default: // jsonb_path_query_array
 			kind = jpfQueryArray
 		}
-		return resolveJsonpathFn(s, name, kind, fc, ag, params)
+		return resolveJsonpathFn(s, name, kind, base != name, fc, ag, params)
 	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).

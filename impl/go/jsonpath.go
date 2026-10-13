@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -13,7 +14,8 @@ import (
 // .*, [subscripts] of any expression, [*], to slices, ?(filter), and the item methods of §3.1);
 // arithmetic (+ - * / %, unary + -, §3.2); a top-level comparison predicate. Still deferred (a
 // valid-PG path using one → 0A000 at compile): like_regex / starts with / is unknown / exists
-// predicates, $name variables, .**, and the datetime methods. A malformed path is 42601. The
+// predicates, .**, and the datetime methods. Path variables ($name, $"name") are bound by the caller's
+// jpVars. A malformed path is 42601. The
 // compiled program is a pure function of the source — kept byte-identical cross-core by the
 // conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned). Mirrors
 // impl/rust/src/jsonpath.rs.
@@ -41,6 +43,8 @@ const (
 	// jpLast is `last` — the index of the innermost subscripted array's last element (subscript
 	// expressions only).
 	jpLast
+	// jpVar is `$name` / `$"name"` — a path variable, bound by the caller's jpVars (§5).
+	jpVar
 	// jpUnary is `+e` / `-e` — unary arithmetic over each item of e (§3.2).
 	jpUnary
 	// jpBinary is `l op r` — binary arithmetic over two singleton numbers (§3.2).
@@ -56,6 +60,8 @@ type jpPathExpr struct {
 	primary jpPrimaryKind
 	// lit holds the literal when primary == jpLiteral.
 	lit JsonNode
+	// name holds the variable name when primary == jpVar.
+	name string
 	// unaryOp / arithOp hold the operator when primary == jpUnary / jpBinary; left is the unary
 	// operand or the binary left operand, right the binary right operand.
 	unaryOp     jpUnaryOp
@@ -350,6 +356,9 @@ func writeExpr(e *jpPathExpr, brackets bool, out *strings.Builder) {
 		out.WriteByte('@')
 	case jpLast:
 		out.WriteString("last")
+	case jpVar:
+		out.WriteByte('$')
+		writeQuoted(e.name, out)
 	case jpUnary:
 		open()
 		out.WriteString(e.unaryOp.symbol())
@@ -485,10 +494,100 @@ type jpEvalOpts struct {
 	// exists is an existence test (jsonb_path_exists, @?, JSON_EXISTS): a lax path stops at its first
 	// item, so a later item's error is never reached. A strict path evaluates fully (§4.2).
 	exists bool
-	// vars is how many variable base objects the caller supplies (PostgreSQL counts one for the
-	// jsonb_path_* functions' vars argument, none for the operators and the SQL/JSON query
-	// functions). The first .keyvalue() object is numbered one past them (§3.1).
-	vars int64
+	// vars is the variables the path's $name references read (§5).
+	vars jpVars
+}
+
+// jpVarsKind tags where a path's variables come from.
+type jpVarsKind int
+
+const (
+	// jpVarsNone is no variables: the @? / @@ operators. Counts no base object.
+	jpVarsNone jpVarsKind = iota
+	// jpVarsObject is the jsonb_path_* functions' vars object (already checked to be an object by
+	// checkVarsObject). It is one base object, number 1.
+	jpVarsObject
+	// jpVarsPassing is the SQL/JSON functions' PASSING values, as passingVars orders them. Each is a
+	// base object numbered by its position in the clause; count is the clause's length.
+	jpVarsPassing
+)
+
+// jpVars is the variables a path's $name references are bound to (jsonpath.md §5), and the variable
+// base objects they count for .keyvalue() ids (§3.1).
+type jpVars struct {
+	kind jpVarsKind
+	// object is the vars object (jpVarsObject).
+	object *JsonNode
+	// passing is the ordered PASSING bindings and count the clause's length (jpVarsPassing).
+	passing []jpPassingVar
+	count   int64
+}
+
+// jpObjectVars is the jsonb_path_* functions' vars object as a path's variables.
+func jpObjectVars(object *JsonNode) jpVars { return jpVars{kind: jpVarsObject, object: object} }
+
+// jpPassingVarsOf is a PASSING clause's ordered bindings (count = the clause's length) as a path's
+// variables.
+func jpPassingVarsOf(passing []jpPassingVar, count int64) jpVars {
+	return jpVars{kind: jpVarsPassing, passing: passing, count: count}
+}
+
+// baseCount is how many variable base objects the caller supplies (PostgreSQL's countVars): the
+// first .keyvalue() object is numbered one past them.
+func (v jpVars) baseCount() int64 {
+	switch v.kind {
+	case jpVarsObject:
+		return 1
+	case jpVarsPassing:
+		return v.count
+	default:
+		return 0
+	}
+}
+
+// jpPassingVar is one `PASSING value AS name` binding (jsonpath.md §5): the value as a jsonb item and
+// its base object number (its 1-based position in the clause).
+type jpPassingVar struct {
+	name  string
+	value JsonNode
+	id    int64
+}
+
+// jpBinding is one evaluated PASSING value with the name it binds, in clause order.
+type jpBinding struct {
+	name  string
+	value JsonNode
+}
+
+// passingVars orders a PASSING clause's bindings for lookup: sorted by name, and of two bindings with
+// the same name only the first kept, as PostgreSQL's lookup finds the first. Each keeps its clause
+// position as its base object number.
+func passingVars(bindings []jpBinding) []jpPassingVar {
+	vars := make([]jpPassingVar, len(bindings))
+	for i, b := range bindings {
+		vars[i] = jpPassingVar{name: b.name, value: b.value, id: int64(i) + 1}
+	}
+	// A stable sort keeps the first of equal names first.
+	sort.SliceStable(vars, func(i, j int) bool { return vars[i].name < vars[j].name })
+	out := vars[:0]
+	for i := range vars {
+		if len(out) > 0 && out[len(out)-1].name == vars[i].name {
+			continue
+		}
+		out = append(out, vars[i])
+	}
+	return out
+}
+
+// checkVarsObject checks a jsonb_path_* function's vars argument (PostgreSQL's
+// countVariablesFromJsonb): it must be an object, else 22023. Checked before evaluation, so it is
+// raised even when the path uses no variable and even in silent mode.
+func checkVarsObject(vars *JsonNode) error {
+	if vars.Kind == JObject {
+		return nil
+	}
+	return newError(InvalidParameterValue, `"vars" argument is not an object`).
+		withDetail(`Jsonpath parameters should be encoded as key-value pairs of "vars" object.`)
 }
 
 // compileMetered compiles a path for evaluation, charging jsonpath_compile for each byte of the text
@@ -536,7 +635,7 @@ func jpMaterializeAll(items []jpItem) []JsonNode {
 }
 
 func (jp jsonPath) evalItems(ctx *JsonNode, opts jpEvalOpts, m *costMeter, out *[]jpItem) error {
-	cx := &jpCtx{root: ctx, strict: jp.Strict, m: m, nextGen: 1 + opts.vars}
+	cx := &jpCtx{root: ctx, vars: opts.vars, strict: jp.Strict, m: m, nextGen: 1 + opts.vars.baseCount()}
 	if jp.Pred != nil {
 		// A top-level predicate → a single item: its truth value as a boolean, or JSON null when
 		// unknown (§4.4).
@@ -584,6 +683,9 @@ type jpKvPair struct {
 	// generated is this object's own base-object number — the id prefix of a .keyvalue() applied
 	// within it.
 	generated int64
+	// tree is the base object (the document or a variable's) that holds a document value, for the
+	// value's layout offsets.
+	tree *JsonNode
 }
 
 func jpDocItem(n *JsonNode) jpItem { return jpItem{kind: jpItemDoc, node: n} }
@@ -630,21 +732,27 @@ func (it jpItem) materialize() JsonNode {
 }
 
 // jpBase is the base object a .keyvalue() id is measured against (jsonpath.md §3.1): the context
-// item (kv == nil) while a $ path runs, or the .keyvalue() object whose continuation is running.
+// item (kv == nil, varTree == nil) while a $ path runs, a variable's base object (varTree, numbered
+// varID: the vars object, number 1, or a PASSING value, its position) while a $name path runs, or
+// the .keyvalue() object (kv) whose continuation is running.
 type jpBase struct {
-	kv *jpKvPair
+	kv      *jpKvPair
+	varTree *JsonNode
+	varID   int64
 }
 
 // jpCtx is the evaluation context shared by a path and the filter operands nested in it.
 type jpCtx struct {
 	root   *JsonNode
+	vars   jpVars
 	strict bool
 	m      *costMeter
 	// nextGen is the next .keyvalue() object number, assigned in evaluation order.
 	nextGen int64
-	// rootOffsets is each document container's byte offset in PostgreSQL's binary jsonb layout,
-	// computed on the first .keyvalue() that needs one.
-	rootOffsets map[*JsonNode]int64
+	// offsets is, per base object laid out so far (the document or a variable's), each container's
+	// byte offset in PostgreSQL's binary jsonb layout of that base object, computed for a base object
+	// on the first .keyvalue() that needs one.
+	offsets map[*JsonNode]map[*JsonNode]int64
 }
 
 // charge charges n units of jsonpath_step and guards (jsonpath.md §7).
@@ -800,6 +908,12 @@ func (cx *jpCtx) headNext(e *jpPathExpr, head *jpHead, current jpItem, base jpBa
 	switch e.primary {
 	case jpRoot:
 		return jpDocItem(cx.root), jpBase{}, true, nil
+	case jpVar:
+		item, varBase, err := cx.variable(e.name)
+		if err != nil {
+			return jpItem{}, jpBase{}, false, err
+		}
+		return item, varBase, true, nil
 	case jpCurrent:
 		return current, base, true, nil
 	case jpLast:
@@ -1128,7 +1242,7 @@ func (cx *jpCtx) nextKeyValue(f *jpFrame) (jpOutKind, jpItem, jpBase, *jpFrame, 
 		}
 		key, value = jpKvKeys[i], v
 	}
-	kv := &jpKvPair{key: key, value: value, id: f.kvID, generated: cx.nextGen}
+	kv := &jpKvPair{key: key, value: value, id: f.kvID, generated: cx.nextGen, tree: cx.baseTree(f.base)}
 	cx.nextGen++
 	if err := cx.charge(1); err != nil {
 		return jpOutDone, jpItem{}, jpBase{}, nil, err
@@ -1709,16 +1823,24 @@ func jpParseBool(s string) (bool, bool) {
 // ---------------------------------------------------------------------------------------------
 
 // keyvalueID is the id of a .keyvalue() object: 10^10 × base number + the object's byte offset inside
-// the base object, where the base is the context item (number 0) or the .keyvalue() object whose
-// continuation is running. PostgreSQL measures the offset in its binary jsonb layout, which is a pure
-// function of the value, so jed computes the same layout arithmetically.
+// the base object, where the base is the context item (number 0), a variable's base object (§5), or
+// the .keyvalue() object whose continuation is running. PostgreSQL measures the offset in its binary
+// jsonb layout, which is a pure function of the value, so jed computes the same layout
+// arithmetically.
 func (cx *jpCtx) keyvalueID(item jpItem, base jpBase) int64 {
 	const baseStride = int64(10_000_000_000)
-	if base.kv == nil {
+	if base.kv == nil && base.varTree == nil {
 		if d := item.doc(); d != nil {
-			return cx.rootOffset(d)
+			return cx.treeOffset(cx.root, d)
 		}
 		return 0
+	}
+	if base.kv == nil {
+		var offset int64
+		if d := item.doc(); d != nil {
+			offset = cx.treeOffset(base.varTree, d)
+		}
+		return base.varID*baseStride + offset
 	}
 	kv := base.kv
 	var offset int64
@@ -1728,20 +1850,64 @@ func (cx *jpCtx) keyvalueID(item jpItem, base jpBase) int64 {
 	case item.kind == jpItemDoc && kv.value.kind == jpItemDoc:
 		// A container inside the pair's value: the value's offset in the pair object plus the
 		// container's offset inside the value (both are 4-byte aligned, so the value's internal
-		// layout does not depend on where it sits).
+		// layout does not depend on where it sits). Both lie in the base object kv.tree.
 		valueAt := jpAlign4(40 + pgNumericSize(decimalFromInt64(kv.id)) + int64(len(kv.key)))
-		offset = valueAt + cx.rootOffset(item.node) - cx.rootOffset(kv.value.node)
+		offset = valueAt + cx.treeOffset(kv.tree, item.node) - cx.treeOffset(kv.tree, kv.value.node)
 	}
 	return kv.generated*baseStride + offset
 }
 
-// rootOffset is a document container's offset in the context item's binary layout.
-func (cx *jpCtx) rootOffset(n *JsonNode) int64 {
-	if cx.rootOffsets == nil {
-		cx.rootOffsets = map[*JsonNode]int64{}
-		pgLayout(cx.root, 0, cx.rootOffsets)
+// baseTree is the base object (the document or a variable's) whose document items a continuation
+// under base reaches.
+func (cx *jpCtx) baseTree(base jpBase) *JsonNode {
+	switch {
+	case base.kv != nil:
+		return base.kv.tree
+	case base.varTree != nil:
+		return base.varTree
+	default:
+		return cx.root
 	}
-	return cx.rootOffsets[n]
+}
+
+// treeOffset is a container's offset in the binary layout of the base object tree that holds it,
+// laying the base object out first if no .keyvalue() has yet. Each base object keeps its own offsets:
+// two base objects may share nodes (Go jsonb values share their backing arrays), at different offsets.
+func (cx *jpCtx) treeOffset(tree, n *JsonNode) int64 {
+	if cx.offsets == nil {
+		cx.offsets = map[*JsonNode]map[*JsonNode]int64{}
+	}
+	offsets, ok := cx.offsets[tree]
+	if !ok {
+		offsets = map[*JsonNode]int64{}
+		pgLayout(tree, 0, offsets)
+		cx.offsets[tree] = offsets
+	}
+	return offsets[n]
+}
+
+// variable is the value of the path variable $name with the base object its continuation runs under
+// (PostgreSQL's getJsonPathVariable): a member of the vars object, found by a binary search of its
+// canonical key order, or the first PASSING binding of that name. A name with no binding is 42704,
+// which neither lax mode, silent mode, nor a comparison operand suppresses.
+func (cx *jpCtx) variable(name string) (jpItem, jpBase, error) {
+	switch cx.vars.kind {
+	case jpVarsObject:
+		tree := cx.vars.object
+		members := tree.Obj
+		i := sort.Search(len(members), func(i int) bool { return jsonKeyCmp(members[i].Key, name) >= 0 })
+		if tree.Kind == JObject && i < len(members) && members[i].Key == name {
+			return jpDocItem(&members[i].Val), jpBase{varTree: tree, varID: 1}, nil
+		}
+	case jpVarsPassing:
+		vars := cx.vars.passing
+		i := sort.Search(len(vars), func(i int) bool { return vars[i].name >= name })
+		if i < len(vars) && vars[i].name == name {
+			v := &vars[i]
+			return jpDocItem(&v.value), jpBase{varTree: &v.value, varID: v.id}, nil
+		}
+	}
+	return jpItem{}, jpBase{}, newError(UndefinedObject, `could not find jsonpath variable "`+name+`"`)
 }
 
 func jpAlign4(off int64) int64 { return (off + 3) &^ 3 }
@@ -2396,17 +2562,24 @@ func (p *jpParser) parsePostfix() (jpParsed, error) {
 		return jpParsed{}, jpMalformed("unexpected end of input")
 	case c == '$':
 		p.i++
-		// $name / $"name" — a path variable — is a deferred follow-on (the vars surface).
-		// PostgreSQL's unquoted variable name is a run of `other` bytes (no escapes).
+		// $"name" / $name — a path variable. PostgreSQL's unquoted variable name is a run of `other`
+		// bytes (no escapes); a quoted one takes the string escapes (§2.1).
 		if nc, ok := p.peek(); ok && nc == '"' {
-			if _, err := p.parseQuoted(); err != nil {
+			name, err := p.parseQuoted()
+			if err != nil {
 				return jpParsed{}, err
 			}
-			return jpParsed{}, jpUnsupported("path variables `$name`")
+			e.primary, e.name = jpVar, name
 		} else if ok && jpIsOther(nc) {
-			return jpParsed{}, jpUnsupported("path variables `$name`")
+			start := p.i
+			for c, ok := p.peek(); ok && jpIsOther(c); c, ok = p.peek() {
+				p.i++
+			}
+			// A run of `other` bytes never splits a UTF-8 sequence (every non-ASCII byte is one).
+			e.primary, e.name = jpVar, string(p.s[start:p.i])
+		} else {
+			e.primary = jpRoot
 		}
-		e.primary = jpRoot
 	case c == '@':
 		if p.inFilter == 0 {
 			return jpParsed{}, jpMalformed("@ is not allowed in root expressions")

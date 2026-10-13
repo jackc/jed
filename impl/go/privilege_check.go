@@ -183,7 +183,8 @@ func tableRefCallsSeqMutator(t *tableRef) bool {
 	if t.Subquery != nil && queryCallsSeqMutator(t.Subquery) {
 		return true
 	}
-	if jt := t.JsonTable; jt != nil && (exprCallsSeqMutator(jt.Ctx) || exprCallsSeqMutator(jt.Path)) {
+	if jt := t.JsonTable; jt != nil && (exprCallsSeqMutator(jt.Ctx) || exprCallsSeqMutator(jt.Path) ||
+		passingAny(jt.Passing, exprCallsSeqMutator)) {
 		return true
 	}
 	for _, row := range t.Values {
@@ -261,11 +262,14 @@ func exprCallsSeqMutator(e *exprNode) bool {
 	case exprJsonCtor:
 		return exprCallsSeqMutator(&e.JsonCtorOf.Operand)
 	case exprJsonExists:
-		return exprCallsSeqMutator(&e.JsonExists.Ctx) || exprCallsSeqMutator(&e.JsonExists.Path)
+		return exprCallsSeqMutator(&e.JsonExists.Ctx) || exprCallsSeqMutator(&e.JsonExists.Path) ||
+			passingAny(e.JsonExists.Passing, exprCallsSeqMutator)
 	case exprJsonValue:
-		return exprCallsSeqMutator(&e.JsonValue.Ctx) || exprCallsSeqMutator(&e.JsonValue.Path)
+		return exprCallsSeqMutator(&e.JsonValue.Ctx) || exprCallsSeqMutator(&e.JsonValue.Path) ||
+			passingAny(e.JsonValue.Passing, exprCallsSeqMutator)
 	case exprJsonQuery:
-		return exprCallsSeqMutator(&e.JsonQuery.Ctx) || exprCallsSeqMutator(&e.JsonQuery.Path)
+		return exprCallsSeqMutator(&e.JsonQuery.Ctx) || exprCallsSeqMutator(&e.JsonQuery.Path) ||
+			passingAny(e.JsonQuery.Passing, exprCallsSeqMutator)
 	case exprBinary:
 		return exprCallsSeqMutator(&e.Binary.Lhs) || exprCallsSeqMutator(&e.Binary.Rhs)
 	case exprIsDistinct:
@@ -963,6 +967,9 @@ func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 		// label. The context item and path are expressions (json-table.md).
 		collectExprPrivs(t.JsonTable.Ctx, req, locals)
 		collectExprPrivs(t.JsonTable.Path, req, locals)
+		for i := range t.JsonTable.Passing {
+			collectExprPrivs(&t.JsonTable.Passing[i].Expr, req, locals)
+		}
 	default:
 		// A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified name
 		// never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
@@ -1061,12 +1068,21 @@ func collectExprPrivs(e *exprNode, req *privReq, locals map[string]bool) {
 	case exprJsonExists:
 		collectExprPrivs(&e.JsonExists.Ctx, req, locals)
 		collectExprPrivs(&e.JsonExists.Path, req, locals)
+		for i := range e.JsonExists.Passing {
+			collectExprPrivs(&e.JsonExists.Passing[i].Expr, req, locals)
+		}
 	case exprJsonValue:
 		collectExprPrivs(&e.JsonValue.Ctx, req, locals)
 		collectExprPrivs(&e.JsonValue.Path, req, locals)
+		for i := range e.JsonValue.Passing {
+			collectExprPrivs(&e.JsonValue.Passing[i].Expr, req, locals)
+		}
 	case exprJsonQuery:
 		collectExprPrivs(&e.JsonQuery.Ctx, req, locals)
 		collectExprPrivs(&e.JsonQuery.Path, req, locals)
+		for i := range e.JsonQuery.Passing {
+			collectExprPrivs(&e.JsonQuery.Passing[i].Expr, req, locals)
+		}
 	case exprBinary:
 		collectExprPrivs(&e.Binary.Lhs, req, locals)
 		collectExprPrivs(&e.Binary.Rhs, req, locals)
@@ -1176,11 +1192,14 @@ func exprReadsColumns(e *exprNode) bool {
 	case exprJsonCtor:
 		return exprReadsColumns(&e.JsonCtorOf.Operand)
 	case exprJsonExists:
-		return exprReadsColumns(&e.JsonExists.Ctx) || exprReadsColumns(&e.JsonExists.Path)
+		return exprReadsColumns(&e.JsonExists.Ctx) || exprReadsColumns(&e.JsonExists.Path) ||
+			passingAny(e.JsonExists.Passing, exprReadsColumns)
 	case exprJsonValue:
-		return exprReadsColumns(&e.JsonValue.Ctx) || exprReadsColumns(&e.JsonValue.Path)
+		return exprReadsColumns(&e.JsonValue.Ctx) || exprReadsColumns(&e.JsonValue.Path) ||
+			passingAny(e.JsonValue.Passing, exprReadsColumns)
 	case exprJsonQuery:
-		return exprReadsColumns(&e.JsonQuery.Ctx) || exprReadsColumns(&e.JsonQuery.Path)
+		return exprReadsColumns(&e.JsonQuery.Ctx) || exprReadsColumns(&e.JsonQuery.Path) ||
+			passingAny(e.JsonQuery.Passing, exprReadsColumns)
 	case exprFuncCall:
 		for _, a := range e.FuncCall.Args {
 			if exprReadsColumns(a) {

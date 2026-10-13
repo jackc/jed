@@ -19,7 +19,7 @@ func jpErr(t *testing.T, db dbHandle, sql string) string {
 }
 
 // The still-deferred path-expression constructs — the datetime item methods, like_regex / starts with
-// / is unknown / exists predicates, $name variables, .** — are a deferred 0A000 at compile.
+// / is unknown / exists predicates, .** — are a deferred 0A000 at compile.
 // PostgreSQL compiles them, so each is a documented divergence; the supported subset is oracle-clean
 // in suites/json/jsonpath_literal.test, jsonpath_query.test, and jsonpath_methods.test.
 func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
@@ -37,8 +37,6 @@ func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
 		`$.a starts with "x"`,   // a starts-with top-level predicate
 		"($.a == 1) is unknown", // an is-unknown predicate
 		"$ ? (exists (@.a))",    // an exists predicate
-		"$[$x]",                 // a path variable in a subscript expression
-		"$x + 1",                // a path variable
 		"$.**",                  // the any-level accessor
 	} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "0A000" {

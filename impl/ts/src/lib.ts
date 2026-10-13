@@ -138,6 +138,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "expr.jsonpath_methods",
   // jsonpath arithmetic (`+ - * / %`, unary `+ -`) and parenthesized expressions (jsonpath.md §3.2).
   "expr.jsonpath_arith",
+  // jsonpath variables: the jsonb_path_* `vars`/`silent` arguments, the `_tz` functions, and the
+  // SQL/JSON `PASSING` clause (jsonpath.md §5, json-sql-functions.md §5.4).
+  "expr.jsonpath_vars",
   // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
   "func.jsonb_access",
   // jsonb containment / key-existence (J5) — `@>` `<@` `?` `?|` `?&` (json-sql-functions.md §1).

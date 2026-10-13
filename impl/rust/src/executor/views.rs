@@ -304,6 +304,7 @@ impl Engine {
             db: None,
             alias: Some(label),
             args: None,
+            arg_names: None,
             subquery: Some(Box::new((*view.body).clone())),
             values: None,
             column_aliases: Some(column_aliases),

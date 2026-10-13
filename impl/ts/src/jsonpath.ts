@@ -4,9 +4,9 @@
 // `last` inside a subscript, or a parenthesized expression or predicate) followed by accessor steps
 // (`.key`, `.*`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the item
 // methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
-// Still deferred (a valid-PG path using one → `0A000` at compile): `like_regex` / `starts with` /
-// `is unknown` / `exists` predicates, `$name` variables, `.**`, and the datetime methods. A
-// malformed path is `42601`. The compiled program is a pure function of the source — kept
+// Path variables (`$name`, `$"name"`) are bound by the caller's Vars. Still deferred (a valid-PG
+// path using one → `0A000` at compile): `like_regex` / `starts with` / `is unknown` / `exists`
+// predicates, `.**`, and the datetime methods. A malformed path is `42601`. The compiled program is a pure function of the source — kept
 // byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
 // codegenned).
 //
@@ -28,6 +28,7 @@ import { EngineError, engineError } from "./errors.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { utf8Length } from "./memsize.ts";
+import { compareTextC } from "./value.ts";
 import {
   HIGH_SURROGATE_DETAIL,
   LOW_SURROGATE_DETAIL,
@@ -36,6 +37,7 @@ import {
   jsonCompactOut,
   jsonNodeCmp,
   type JsonNode,
+  keyCmp,
   typeofName,
   unicodeZeroError,
 } from "./json.ts";
@@ -103,6 +105,7 @@ export type Primary =
   | { kind: "current" }
   | { kind: "lit"; node: JsonNode }
   | { kind: "last" }
+  | { kind: "var"; name: string } // `$name` / `$"name"` — a path variable, bound by the caller's Vars (§5).
   | { kind: "unary"; op: UnaryOp; arg: PathExpr }
   | { kind: "binary"; op: ArithOp; l: PathExpr; r: PathExpr }
   | { kind: "pred"; pred: Pred };
@@ -436,15 +439,18 @@ class Parser {
       throw malformed("unexpected end of input");
     } else if (c === "$") {
       this.i += 1;
-      // `$name` / `$"name"` — a path variable — is a deferred follow-on (the `vars` surface).
-      // PostgreSQL's unquoted variable name is a run of `other` characters (no escapes).
+      // `$"name"` / `$name` — a path variable. PostgreSQL's unquoted variable name is a run of
+      // `other` characters (no escapes); a quoted one takes the string escapes (§2.1).
       const after = this.peek();
       if (after === '"') {
-        this.parseQuoted();
-        throw unsupported("path variables `$name`");
+        primary = { kind: "var", name: this.parseQuoted() };
+      } else if (isOther(after)) {
+        const start = this.i;
+        while (isOther(this.peek())) this.i += 1;
+        primary = { kind: "var", name: this.s.slice(start, this.i) };
+      } else {
+        primary = { kind: "root" };
       }
-      if (isOther(after)) throw unsupported("path variables `$name`");
-      primary = { kind: "root" };
     } else if (c === "@") {
       if (this.inFilter === 0) {
         throw malformed("@ is not allowed in root expressions");
@@ -1076,6 +1082,9 @@ function writeExpr(e: PathExpr, brackets: boolean): string {
     case "last":
       out = "last";
       break;
+    case "var":
+      out = "$" + writeQuoted(p.name);
+      break;
     case "lit":
       out = jsonCompactOut(p.node);
       if (p.node.kind === "number" && e.steps.length > 0) out = "(" + out + ")";
@@ -1246,10 +1255,73 @@ export interface EvalOpts {
   // An existence test (jsonb_path_exists, @?, JSON_EXISTS): a lax path stops at its first item, so a
   // later item's error is never reached. A strict path evaluates fully (§4.2).
   exists: boolean;
-  // How many variable base objects the caller supplies (PostgreSQL counts one for the jsonb_path_*
-  // functions' vars argument, none for the operators and the SQL/JSON query functions). The first
-  // .keyvalue() object is numbered one past them (§3.1).
-  vars: number;
+  // The variables the path's `$name` references read (§5).
+  vars: Vars;
+}
+
+// Vars is what a path's `$name` references are bound to (jsonpath.md §5), and the variable base
+// objects they count for .keyvalue() ids (§3.1):
+//   - none: no variables — the @? / @@ operators. Counts no base object.
+//   - object: the jsonb_path_* functions' vars object (already checked to be an object by
+//     checkVarsObject). It is one base object, number 1.
+//   - passing: the SQL/JSON functions' PASSING values, as passingVars orders them. Each is a base
+//     object numbered by its position in the clause; count is the clause's length.
+export type Vars =
+  | { kind: "none" }
+  | { kind: "object"; node: JsonNode }
+  | { kind: "passing"; vars: PassingVar[]; count: number };
+
+// NO_VARS binds no variables (the @? / @@ operators).
+export const NO_VARS: Vars = { kind: "none" };
+
+// varsCount is how many variable base objects the caller supplies (PostgreSQL's countVars): the
+// first .keyvalue() object is numbered one past them.
+function varsCount(v: Vars): number {
+  switch (v.kind) {
+    case "none":
+      return 0;
+    case "object":
+      return 1;
+    case "passing":
+      return v.count;
+  }
+}
+
+// PassingVar is one `PASSING value AS name` binding (jsonpath.md §5): the value as a jsonb item and
+// its base object number (its 1-based position in the clause).
+export interface PassingVar {
+  name: string;
+  value: JsonNode;
+  id: bigint;
+}
+
+// passingVars orders a PASSING clause's bindings for lookup: sorted by name (UTF-8 bytes), and of
+// two bindings with the same name only the first kept, as PostgreSQL's lookup finds the first. Each
+// keeps its clause position as its base object number.
+export function passingVars(bindings: { name: string; value: JsonNode }[]): PassingVar[] {
+  const vars: PassingVar[] = bindings.map((b, i) => ({
+    name: b.name,
+    value: b.value,
+    id: BigInt(i + 1),
+  }));
+  // Array.prototype.sort is stable, so the first of equal names stays first.
+  vars.sort((a, b) => compareTextC(a.name, b.name));
+  const out: PassingVar[] = [];
+  for (const v of vars) {
+    if (out.length > 0 && out[out.length - 1]!.name === v.name) continue;
+    out.push(v);
+  }
+  return out;
+}
+
+// checkVarsObject checks a jsonb_path_* function's vars argument (PostgreSQL's
+// countVariablesFromJsonb): it must be an object, else 22023. Checked before evaluation, so it is
+// raised even when the path uses no variable and even in silent mode.
+export function checkVarsObject(vars: JsonNode): void {
+  if (vars.kind === "object") return;
+  throw engineError("invalid_parameter_value", '"vars" argument is not an object').withDetail(
+    'Jsonpath parameters should be encoded as key-value pairs of "vars" object.',
+  );
 }
 
 // compileMetered compiles a path for evaluation, charging jsonpath_compile for each UTF-8 byte of
@@ -1300,10 +1372,11 @@ function isSoft(e: unknown): boolean {
 function evalItems(path: JsonPath, ctx: JsonNode, opts: EvalOpts, m: Meter, out: Item[]): void {
   const cx: Ctx = {
     root: ctx,
+    vars: opts.vars,
     strict: path.strict,
     m,
-    nextGen: 1n + BigInt(opts.vars),
-    rootOffsets: null,
+    nextGen: 1n + BigInt(varsCount(opts.vars)),
+    offsets: new Map(),
   };
   if (path.body.kind === "predicate") {
     // A top-level predicate → a single item: its truth value as a boolean, or JSON null when unknown
@@ -1330,32 +1403,39 @@ type Item =
 
 // One .keyvalue() pair object (jsonpath.md §3.1). `id` is the "id" member (the source object's id);
 // `generated` is this object's own base-object number — the id prefix of a .keyvalue() applied
-// within it.
+// within it. `tree` is the base object (the document or a variable's) whose binary layout the
+// value's containers are measured in.
 interface KvPair {
   key: string;
   value: Item;
   id: bigint;
   generated: bigint;
+  tree: JsonNode;
 }
 
-// The base object a .keyvalue() id is measured against (jsonpath.md §3.1): the context item (kv
-// null) while a $ path runs, or the .keyvalue() object whose continuation is running.
+// The base object a .keyvalue() id is measured against (jsonpath.md §3.1): the context item (kv and
+// varTree null) while a $ path runs, a variable's base object (varTree, numbered varId — the vars
+// object, number 1, or a PASSING value, its position) while a $name path runs, or the .keyvalue()
+// object whose continuation is running.
 interface Base {
   kv: KvPair | null;
+  varTree: JsonNode | null;
+  varId: bigint;
 }
 
-const ROOT_BASE: Base = { kv: null };
+const ROOT_BASE: Base = { kv: null, varTree: null, varId: 0n };
 
 // The evaluation context shared by a path and the filter operands nested in it.
 interface Ctx {
   root: JsonNode;
+  vars: Vars;
   strict: boolean;
   m: Meter;
   // The next .keyvalue() object number, assigned in evaluation order.
   nextGen: bigint;
-  // Each document container's byte offset in PostgreSQL's binary jsonb layout, computed on the first
-  // .keyvalue() that needs one.
-  rootOffsets: Map<JsonNode, number> | null;
+  // Per base object (the document or a variable's), each container's byte offset in PostgreSQL's
+  // binary jsonb layout of it, computed for a base object on the first .keyvalue() that needs one.
+  offsets: Map<JsonNode, Map<JsonNode, number>>;
 }
 
 // charge charges n units of jsonpath_step and guards (jsonpath.md §7).
@@ -1547,6 +1627,8 @@ function headNext(
   switch (p.kind) {
     case "root":
       return { item: { kind: "doc", node: cx.root }, base: ROOT_BASE };
+    case "var":
+      return variable(cx, p.name);
     case "current":
       return { item: current, base };
     case "lit":
@@ -1839,10 +1921,10 @@ function nextKeyValue(cx: Ctx, f: Frame): Out {
   } else {
     return DONE;
   }
-  const kv: KvPair = { key, value, id: f.kvId, generated: cx.nextGen };
+  const kv: KvPair = { key, value, id: f.kvId, generated: cx.nextGen, tree: baseTree(cx, f.base) };
   cx.nextGen += 1n;
   charge(cx, 1);
-  return { kind: "item", item: { kind: "kv", kv }, base: { kv } };
+  return { kind: "item", item: { kind: "kv", kv }, base: { kv, varTree: null, varId: 0n } };
 }
 
 // KV_KEYS is the member names of a .keyvalue() object, in canonical key order.
@@ -2357,13 +2439,16 @@ function parseBool(s: string): boolean | null {
 const BASE_STRIDE = 10_000_000_000n;
 
 // keyvalueId is the id of a .keyvalue() object: 10^10 × base number + the object's byte offset
-// inside the base object, where the base is the context item (number 0) or the .keyvalue() object
-// whose continuation is running. PostgreSQL measures the offset in its binary jsonb layout, which is
-// a pure function of the value, so jed computes the same layout arithmetically.
+// inside the base object, where the base is the context item (number 0), a variable's base object
+// (§5), or the .keyvalue() object whose continuation is running. PostgreSQL measures the offset in
+// its binary jsonb layout, which is a pure function of the value, so jed computes the same layout
+// arithmetically.
 function keyvalueId(cx: Ctx, item: Item, base: Base): bigint {
   const kv = base.kv;
   if (kv === null) {
-    return item.kind === "doc" ? BigInt(rootOffset(cx, item.node)) : 0n;
+    const tree = base.varTree ?? cx.root;
+    const offset = item.kind === "doc" ? BigInt(treeOffset(cx, tree, item.node)) : 0n;
+    return base.varId * BASE_STRIDE + offset;
   }
   let offset = 0;
   if (item.kind === "doc" && kv.value.kind === "doc") {
@@ -2371,18 +2456,70 @@ function keyvalueId(cx: Ctx, item: Item, base: Base): bigint {
     // container's offset inside the value (both are 4-byte aligned, so the value's internal layout
     // does not depend on where it sits).
     const valueAt = align4(40 + pgNumericSize(Decimal.fromBigInt(kv.id)) + utf8Length(kv.key));
-    offset = valueAt + rootOffset(cx, item.node) - rootOffset(cx, kv.value.node);
+    offset = valueAt + treeOffset(cx, kv.tree, item.node) - treeOffset(cx, kv.tree, kv.value.node);
   }
   return kv.generated * BASE_STRIDE + BigInt(offset);
 }
 
-// rootOffset is a document container's offset in the context item's binary layout.
-function rootOffset(cx: Ctx, n: JsonNode): number {
-  if (cx.rootOffsets === null) {
-    cx.rootOffsets = new Map();
-    pgLayout(cx.root, 0, cx.rootOffsets);
+// baseTree is the base object whose binary layout a container under `base` is measured in: the
+// document, a variable's base object, or the tree of the .keyvalue() pair's value.
+function baseTree(cx: Ctx, base: Base): JsonNode {
+  if (base.kv !== null) return base.kv.tree;
+  return base.varTree ?? cx.root;
+}
+
+// treeOffset is a container's offset in the binary layout of the base object `tree` that holds it,
+// laying the base object out first if no .keyvalue() has yet.
+function treeOffset(cx: Ctx, tree: JsonNode, n: JsonNode): number {
+  let offsets = cx.offsets.get(tree);
+  if (offsets === undefined) {
+    offsets = new Map();
+    pgLayout(tree, 0, offsets);
+    cx.offsets.set(tree, offsets);
   }
-  return cx.rootOffsets.get(n) ?? 0;
+  return offsets.get(n) ?? 0;
+}
+
+// variable is the value of the path variable `$name` with the base object its continuation runs
+// under (PostgreSQL's getJsonPathVariable): a member of the vars object, found by a binary search of
+// its canonical key order, or the first PASSING binding of that name. A name with no binding is
+// 42704, which neither lax mode, silent mode, nor a comparison operand suppresses.
+function variable(cx: Ctx, name: string): { item: Item; base: Base } {
+  const vars = cx.vars;
+  if (vars.kind === "object" && vars.node.kind === "object") {
+    const members = vars.node.members;
+    let lo = 0;
+    let hi = members.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const c = keyCmp(members[mid]!.key, name);
+      if (c === 0) {
+        return {
+          item: { kind: "doc", node: members[mid]!.value },
+          base: { kv: null, varTree: vars.node, varId: 1n },
+        };
+      }
+      if (c < 0) lo = mid + 1;
+      else hi = mid;
+    }
+  } else if (vars.kind === "passing") {
+    let lo = 0;
+    let hi = vars.vars.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const v = vars.vars[mid]!;
+      const c = compareTextC(v.name, name);
+      if (c === 0) {
+        return {
+          item: { kind: "doc", node: v.value },
+          base: { kv: null, varTree: v.value, varId: v.id },
+        };
+      }
+      if (c < 0) lo = mid + 1;
+      else hi = mid;
+    }
+  }
+  throw engineError("undefined_object", `could not find jsonpath variable "${name}"`);
 }
 
 function align4(off: number): number {

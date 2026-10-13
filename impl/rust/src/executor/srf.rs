@@ -19,6 +19,7 @@ impl Engine {
         &'a self,
         name: &str,
         args: &[Expr],
+        arg_names: Option<&[Option<String>]>,
         alias: Option<&str>,
         column_defs: Option<&[TypeFieldDef]>,
         parent: Option<&Scope<'a>>,
@@ -50,6 +51,12 @@ impl Engine {
                 ..Default::default()
             },
         };
+        // Named notation (`name => value`) is accepted only by `jsonb_path_query[_tz]`, whose
+        // parameters PostgreSQL names; it is the only table function here with optional arguments.
+        let path_query = matches!(name, "jsonb_path_query" | "jsonb_path_query_tz");
+        if !path_query {
+            reject_named(name, arg_names)?;
+        }
         // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
         // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
         // `AS t(col type, …)`. Dispatched first, before the col-def-list guard below.
@@ -142,16 +149,22 @@ impl Engine {
                     ptypes,
                 );
             }
-            "jsonb_path_query" => {
-                let (ctx, path) = resolve_jsonpath_args(
+            // `jsonb_path_query_tz` is PostgreSQL's STABLE twin (jsonpath.md §5.1); it reads no
+            // time zone until the datetime item methods land.
+            "jsonb_path_query" | "jsonb_path_query_tz" => {
+                let rargs = resolve_jsonpath_args(
                     &arg_scope,
                     &lname,
                     args,
+                    arg_names,
                     &mut AggCtx::Forbidden,
                     ptypes,
                 )?;
+                if lname.ends_with("_tz") {
+                    ptypes.nonimmutable = true;
+                }
                 let table = srf_table(&lname, alias, Type::Scalar(ScalarType::Jsonb));
-                return Ok((table, vec![ctx, path], SrfKind::JsonbPathQuery));
+                return Ok((table, rargs, SrfKind::JsonbPathQuery));
             }
             // json[b]_populate_record(set) (R2, json-table.md §2): like json[b]_to_record(set) but the
             // column shape comes from the COMPOSITE TYPE of the (typically NULL) first argument.
@@ -582,6 +595,9 @@ impl Engine {
                 ));
             }
         };
+        // The PASSING values (json-sql-functions.md §5.4) follow the context in the SRF's args.
+        let (passing, passing_names) =
+            resolve_json_passing(&arg_scope, &jt.passing, &mut AggCtx::Forbidden, ptypes)?;
         let mut out_columns: Vec<Column> = Vec::new();
         let columns = self.resolve_jt_columns(&jt.columns, &mut out_columns)?;
         let width = out_columns.len();
@@ -596,11 +612,14 @@ impl Engine {
             on_commit: crate::catalog::OnCommit::PreserveRows,
             scalar_func: false,
         });
+        let mut args = vec![rctx];
+        args.extend(passing);
         Ok((
             table,
-            vec![rctx],
+            args,
             JtPlan {
                 root_path,
+                passing_names,
                 width,
                 columns,
             },
@@ -708,6 +727,13 @@ impl Engine {
             .json_table
             .as_ref()
             .expect("a JsonTable SRF carries its plan");
+        // The PASSING values are evaluated first, as PostgreSQL's JSON_TABLE does (even for a NULL
+        // context).
+        let bindings = passing_bindings(&srf.args[1..], &plan.passing_names, &[], env, meter)?;
+        let vars = crate::jsonpath::Vars::Passing {
+            vars: &bindings,
+            count: plan.passing_names.len() as i64,
+        };
         let ctx = srf.args[0].eval(&[], env, meter)?;
         if matches!(ctx, Value::Null) {
             return Ok(Vec::new());
@@ -719,14 +745,15 @@ impl Engine {
         };
         // The root path → the sequence of row items (a structural error here yields no rows).
         let root = crate::jsonpath::compile_metered(&plan.root_path, meter)?;
-        // A navigation error yields no rows; a cost abort propagates (jsonpath.md §7).
-        let items = match crate::jsonpath::eval(&root, &node, JT_EVAL, meter) {
+        // A navigation error yields no rows; a cost abort or a missing variable propagates
+        // (jsonpath.md §7).
+        let items = match crate::jsonpath::eval(&root, &node, jt_eval(vars), meter) {
             Ok(items) => items,
             Err(e) if e.code().starts_with("22") => Vec::new(),
             Err(e) => return Err(e),
         };
         // Expand the column tree over the root sequence → sparse rows, then materialize.
-        let sparse = expand_jt_level(&plan.columns, &items, env, meter)?;
+        let sparse = expand_jt_level(&plan.columns, &items, vars, env, meter)?;
         let mut out = Vec::with_capacity(sparse.len());
         for assignment in sparse {
             meter.guard()?;
@@ -1433,21 +1460,29 @@ impl Engine {
                 }
             }
             // jsonb_path_query (P2): one jsonb row per path-evaluation-sequence item. The context node
-            // is already parsed above (`node`); evaluate the path (a NULL path → zero rows).
+            // is already parsed above (`node`). STRICT: a NULL path, vars, or silent → zero rows. The
+            // vars object is checked before evaluation; silent mode returns the items found before a
+            // SQL/JSON error (jsonpath.md §5).
             SrfKind::JsonbPathQuery => {
                 let path = srf.args[1].eval(&[], env, meter)?;
-                let text = match &path {
-                    Value::Null => return Ok(out),
-                    Value::JsonPath(s) => s,
-                    _ => unreachable!("resolver restricts the path argument to jsonpath"),
+                let vars = srf.args[2].eval(&[], env, meter)?;
+                let silent = srf.args[3].eval(&[], env, meter)?;
+                let (text, vars, silent) = match (&path, &vars, &silent) {
+                    (Value::JsonPath(t), Value::Jsonb(v), Value::Bool(s)) => (t, v, *s),
+                    _ => return Ok(out),
                 };
+                crate::jsonpath::check_vars_object(vars)?;
                 let compiled = crate::jsonpath::compile_metered(text, meter)?;
-                // PostgreSQL's default `vars` object is one base object (jsonpath.md §3.1).
                 let opts = crate::jsonpath::EvalOpts {
                     exists: false,
-                    vars: 1,
+                    vars: crate::jsonpath::Vars::Object(vars),
                 };
-                for item in crate::jsonpath::eval(&compiled, &node, opts, meter)? {
+                let items = if silent {
+                    crate::jsonpath::eval_silent(&compiled, &node, opts, meter)?.0
+                } else {
+                    crate::jsonpath::eval(&compiled, &node, opts, meter)?
+                };
+                for item in items {
                     meter.guard()?;
                     meter.charge(COSTS.generated_row);
                     out.push(vec![Value::Jsonb(item.into_owned())]);

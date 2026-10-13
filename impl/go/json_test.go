@@ -259,15 +259,14 @@ func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
 }
 
 // TestJSONQueryFnDeferredClausesAre0A000: the SQL/JSON query functions' deferred sub-clauses (S2,
-// json-sql-functions.md §5) each resolve to 0A000 — PASSING path vars, a DEFAULT-expr behavior,
-// JSON_QUERY OMIT QUOTES, and a JSON_QUERY non-json RETURNING. A per-core test (the oracle corpus is
+// json-sql-functions.md §5) each resolve to 0A000 — a DEFAULT-expr behavior, JSON_QUERY OMIT QUOTES,
+// and a JSON_QUERY non-json RETURNING. A per-core test (the oracle corpus is
 // PG-clean, so a jed-defers case cannot live there). Mirrors impl/rust/tests/json.rs
 // json_query_fn_deferred_clauses_are_0a000.
 func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
-		`SELECT JSON_VALUE('{"a":1}', '$.a' PASSING 1 AS x)`,
 		`SELECT JSON_VALUE('{"a":1}', '$.b' DEFAULT 'z' ON EMPTY)`,
 		`SELECT JSON_QUERY('{"a":1}', '$.a' OMIT QUOTES)`,
 		`SELECT JSON_QUERY('{"a":1}', '$.a' RETURNING int)`,
@@ -279,7 +278,7 @@ func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
 }
 
 // TestJSONTableDeferredFeaturesAre0A000: the deferred T1 sub-features of JSON_TABLE are 0A000 — an
-// explicit PLAN, PASSING, an array column, a WRAPPER on a scalar column, OMIT QUOTES; an unknown
+// explicit PLAN, an array column, a WRAPPER on a scalar column, OMIT QUOTES; an unknown
 // column type is 42704. PostgreSQL supports the first set, so each is a documented divergence; the
 // supported subset is oracle-clean in suites/json/json_table.test. Mirrors impl/rust/tests/json.rs
 // json_table_deferred_features_are_0a000.
@@ -288,7 +287,6 @@ func TestJSONTableDeferredFeaturesAre0A000(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
 		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))`,
-		`SELECT * FROM JSON_TABLE('{}', '$' PASSING 1 AS y COLUMNS (x i32 PATH '$.x'))`,
 		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32[] PATH '$.x'))`,
 		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' WITH WRAPPER))`,
 		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' OMIT QUOTES))`,

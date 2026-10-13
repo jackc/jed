@@ -309,6 +309,7 @@ pub(crate) fn resolve_binary(
             Ok((
                 RExpr::JsonPathFn {
                     kind,
+                    tz: false,
                     args: vec![ctx, path],
                 },
                 ResolvedType::Bool,
@@ -1049,17 +1050,26 @@ pub(crate) fn resolve_json_image(
     ))
 }
 
-/// Resolve a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. A
-/// bare string literal adapts (the context to jsonb, the path to a compiled jsonpath). STRICT.
+/// Resolve a scalar jsonpath query function (P2, jsonpath.md §5): `(target jsonb, path jsonpath
+/// [, vars jsonb [, silent boolean]])`, positionally or in named notation, the omitted trailing
+/// arguments filled with PostgreSQL's DEFAULTs (`'{}'`, `false`). A bare string literal adapts.
+/// STRICT. A `_tz` form (`tz`) is PostgreSQL's STABLE twin, so it is nonimmutable (42P17 in an
+/// index expression).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_jsonpath_fn(
     scope: &Scope,
     name: &str,
     kind: JsonPathFnKind,
+    tz: bool,
     args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    let (ctx, path) = resolve_jsonpath_args(scope, name, args, agg, params)?;
+    let args = resolve_jsonpath_args(scope, name, args, arg_names, agg, params)?;
+    if tz {
+        params.nonimmutable = true;
+    }
     let result = match kind {
         JsonPathFnKind::Exists
         | JsonPathFnKind::ExistsSilent
@@ -1067,37 +1077,53 @@ pub(crate) fn resolve_jsonpath_fn(
         | JsonPathFnKind::MatchSilent => ResolvedType::Bool,
         JsonPathFnKind::QueryFirst | JsonPathFnKind::QueryArray => ResolvedType::Jsonb,
     };
-    Ok((
-        RExpr::JsonPathFn {
-            kind,
-            args: vec![ctx, path],
-        },
-        result,
-    ))
+    Ok((RExpr::JsonPathFn { kind, tz, args }, result))
 }
 
-/// Resolve the `(context jsonb, path jsonpath)` argument pair shared by the jsonpath query functions
-/// (the SRF and the scalar forms). A bare string literal adapts: the context to jsonb, the path to a
-/// compiled `jsonpath`. Exactly two args this slice (the optional `vars` / `silent` are a follow-on).
+/// Resolve the `(target jsonb, path jsonpath [, vars jsonb [, silent boolean]])` arguments shared by
+/// the jsonpath query functions (the SRF and the scalar forms) → the four argument expressions, an
+/// omitted `vars` the empty object and an omitted `silent` false (PostgreSQL's DEFAULTs). Named
+/// notation uses PostgreSQL's parameter names. A bare string literal adapts: the target and vars to
+/// jsonb, the path to a compiled `jsonpath`, silent to a boolean.
 pub(crate) fn resolve_jsonpath_args(
     scope: &Scope,
     name: &str,
     args: &[Expr],
+    arg_names: Option<&[Option<String>]>,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<(RExpr, RExpr)> {
-    if args.len() != 2 {
-        return Err(no_func_overload(name));
-    }
-    let (ctx, ct) = resolve(scope, &args[0], Some(ScalarType::Jsonb), agg, params)?;
+) -> Result<Vec<RExpr>> {
+    let slots = place_named_args(name, &["target", "path", "vars", "silent"], args, arg_names)?;
+    let required = |i: usize| slots[i].as_ref().ok_or_else(|| no_func_overload(name));
+    let (ctx, ct) = resolve(scope, required(0)?, Some(ScalarType::Jsonb), agg, params)?;
     if !matches!(ct, ResolvedType::Jsonb | ResolvedType::Null) {
         return Err(no_func_overload(name));
     }
-    let (path, pt) = resolve(scope, &args[1], Some(ScalarType::JsonPath), agg, params)?;
+    let (path, pt) = resolve(scope, required(1)?, Some(ScalarType::JsonPath), agg, params)?;
     if !matches!(pt, ResolvedType::JsonPath | ResolvedType::Null) {
         return Err(no_func_overload(name));
     }
-    Ok((ctx, path))
+    let vars = match &slots[2] {
+        Some(e) => {
+            let (v, vt) = resolve(scope, e, Some(ScalarType::Jsonb), agg, params)?;
+            if !matches!(vt, ResolvedType::Jsonb | ResolvedType::Null) {
+                return Err(no_func_overload(name));
+            }
+            v
+        }
+        None => value_to_rexpr(&Value::Jsonb(JsonNode::Object(Vec::new()))),
+    };
+    let silent = match &slots[3] {
+        Some(e) => {
+            let (v, vt) = resolve(scope, e, Some(ScalarType::Bool), agg, params)?;
+            if !matches!(vt, ResolvedType::Bool | ResolvedType::Null) {
+                return Err(no_func_overload(name));
+            }
+            v
+        }
+        None => RExpr::ConstBool(false),
+    };
+    Ok(vec![ctx, path, vars, silent])
 }
 
 /// The context node and compiled path of a jsonpath call (the shared front of the jsonpath query

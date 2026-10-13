@@ -52,17 +52,41 @@ func rejectCheckStructure(e exprNode) error {
 		if err := rejectCheckStructure(e.JsonExists.Ctx); err != nil {
 			return err
 		}
-		return rejectCheckStructure(e.JsonExists.Path)
+		if err := rejectCheckStructure(e.JsonExists.Path); err != nil {
+			return err
+		}
+		for _, p := range e.JsonExists.Passing {
+			if err := rejectCheckStructure(p.Expr); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprJsonValue:
 		if err := rejectCheckStructure(e.JsonValue.Ctx); err != nil {
 			return err
 		}
-		return rejectCheckStructure(e.JsonValue.Path)
+		if err := rejectCheckStructure(e.JsonValue.Path); err != nil {
+			return err
+		}
+		for _, p := range e.JsonValue.Passing {
+			if err := rejectCheckStructure(p.Expr); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprJsonQuery:
 		if err := rejectCheckStructure(e.JsonQuery.Ctx); err != nil {
 			return err
 		}
-		return rejectCheckStructure(e.JsonQuery.Path)
+		if err := rejectCheckStructure(e.JsonQuery.Path); err != nil {
+			return err
+		}
+		for _, p := range e.JsonQuery.Passing {
+			if err := rejectCheckStructure(p.Expr); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprBinary:
 		if err := rejectCheckStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -205,17 +229,41 @@ func rejectDefaultStructure(e exprNode) error {
 		if err := rejectDefaultStructure(e.JsonExists.Ctx); err != nil {
 			return err
 		}
-		return rejectDefaultStructure(e.JsonExists.Path)
+		if err := rejectDefaultStructure(e.JsonExists.Path); err != nil {
+			return err
+		}
+		for _, p := range e.JsonExists.Passing {
+			if err := rejectDefaultStructure(p.Expr); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprJsonValue:
 		if err := rejectDefaultStructure(e.JsonValue.Ctx); err != nil {
 			return err
 		}
-		return rejectDefaultStructure(e.JsonValue.Path)
+		if err := rejectDefaultStructure(e.JsonValue.Path); err != nil {
+			return err
+		}
+		for _, p := range e.JsonValue.Passing {
+			if err := rejectDefaultStructure(p.Expr); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprJsonQuery:
 		if err := rejectDefaultStructure(e.JsonQuery.Ctx); err != nil {
 			return err
 		}
-		return rejectDefaultStructure(e.JsonQuery.Path)
+		if err := rejectDefaultStructure(e.JsonQuery.Path); err != nil {
+			return err
+		}
+		for _, p := range e.JsonQuery.Passing {
+			if err := rejectDefaultStructure(p.Expr); err != nil {
+				return err
+			}
+		}
+		return nil
 	case exprBinary:
 		if err := rejectDefaultStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -353,12 +401,21 @@ func checkReferencedColumns(e exprNode, columns []catColumn) []int {
 		case exprJsonExists:
 			walk(e.JsonExists.Ctx)
 			walk(e.JsonExists.Path)
+			for _, p := range e.JsonExists.Passing {
+				walk(p.Expr)
+			}
 		case exprJsonValue:
 			walk(e.JsonValue.Ctx)
 			walk(e.JsonValue.Path)
+			for _, p := range e.JsonValue.Passing {
+				walk(p.Expr)
+			}
 		case exprJsonQuery:
 			walk(e.JsonQuery.Ctx)
 			walk(e.JsonQuery.Path)
+			for _, p := range e.JsonQuery.Passing {
+				walk(p.Expr)
+			}
 		case exprBinary:
 			walk(e.Binary.Lhs)
 			walk(e.Binary.Rhs)
@@ -451,11 +508,14 @@ func indexExprHasSubquery(e exprNode) bool {
 		case exprJsonCtor:
 			return walk(e.JsonCtorOf.Operand)
 		case exprJsonExists:
-			return walk(e.JsonExists.Ctx) || walk(e.JsonExists.Path)
+			return walk(e.JsonExists.Ctx) || walk(e.JsonExists.Path) ||
+				passingAny(e.JsonExists.Passing, func(p *exprNode) bool { return walk(*p) })
 		case exprJsonValue:
-			return walk(e.JsonValue.Ctx) || walk(e.JsonValue.Path)
+			return walk(e.JsonValue.Ctx) || walk(e.JsonValue.Path) ||
+				passingAny(e.JsonValue.Passing, func(p *exprNode) bool { return walk(*p) })
 		case exprJsonQuery:
-			return walk(e.JsonQuery.Ctx) || walk(e.JsonQuery.Path)
+			return walk(e.JsonQuery.Ctx) || walk(e.JsonQuery.Path) ||
+				passingAny(e.JsonQuery.Passing, func(p *exprNode) bool { return walk(*p) })
 		case exprBinary:
 			return walk(e.Binary.Lhs) || walk(e.Binary.Rhs)
 		case exprIsDistinct:
@@ -582,17 +642,41 @@ func indexExprFirstParam(e exprNode) (uint64, bool) {
 			if n, ok := walk(e.JsonExists.Ctx); ok {
 				return n, true
 			}
-			return walk(e.JsonExists.Path)
+			if n, ok := walk(e.JsonExists.Path); ok {
+				return n, true
+			}
+			for _, p := range e.JsonExists.Passing {
+				if n, ok := walk(p.Expr); ok {
+					return n, true
+				}
+			}
+			return 0, false
 		case exprJsonValue:
 			if n, ok := walk(e.JsonValue.Ctx); ok {
 				return n, true
 			}
-			return walk(e.JsonValue.Path)
+			if n, ok := walk(e.JsonValue.Path); ok {
+				return n, true
+			}
+			for _, p := range e.JsonValue.Passing {
+				if n, ok := walk(p.Expr); ok {
+					return n, true
+				}
+			}
+			return 0, false
 		case exprJsonQuery:
 			if n, ok := walk(e.JsonQuery.Ctx); ok {
 				return n, true
 			}
-			return walk(e.JsonQuery.Path)
+			if n, ok := walk(e.JsonQuery.Path); ok {
+				return n, true
+			}
+			for _, p := range e.JsonQuery.Passing {
+				if n, ok := walk(p.Expr); ok {
+					return n, true
+				}
+			}
+			return 0, false
 		case exprBinary:
 			if n, ok := walk(e.Binary.Lhs); ok {
 				return n, true

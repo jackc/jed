@@ -6141,7 +6141,9 @@ errors         = ["22023"]
 # the path's evaluation sequence over the context document. A NULL argument yields zero rows; each
 # produced row charges one generated_row on top of the path evaluation. PG declares no OUT parameter
 # (its parameters are target/path/vars/silent, all IN), so the column is named after the function.
-# The 4-arg vars/silent forms are deferred. The errors are the strict-mode evaluation errors.
+# The optional vars (DEFAULT '{}') / silent (DEFAULT false) arguments, named notation, and the STABLE
+# jsonb_path_query_tz twin are hand-resolved (jsonpath.md §5, §5.2), so this row records the
+# required arguments only. The errors are the strict-mode evaluation errors.
 [[set_returning]]
 name           = "jsonb_path_query"
 kind           = "set_returning"

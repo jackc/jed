@@ -356,6 +356,7 @@ impl Engine {
                         .resolve_srf(
                             &tref.name,
                             args,
+                            tref.arg_names.as_deref(),
                             tref.alias.as_deref(),
                             tref.column_defs.as_deref(),
                             Some(&prefix),
@@ -370,6 +371,7 @@ impl Engine {
                             self.resolve_srf(
                                 &tref.name,
                                 args,
+                                tref.arg_names.as_deref(),
                                 tref.alias.as_deref(),
                                 tref.column_defs.as_deref(),
                                 lateral_parent,
@@ -385,6 +387,7 @@ impl Engine {
                     self.resolve_srf(
                         &tref.name,
                         args,
+                        tref.arg_names.as_deref(),
                         tref.alias.as_deref(),
                         tref.column_defs.as_deref(),
                         lateral_parent,

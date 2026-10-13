@@ -21,13 +21,21 @@ import (
 // type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows PostgreSQL's
 // single-column function-alias rule (srfColumnName): a named OUT parameter, else the table alias
 // when one is given (generate_series(1,5) AS g ⇒ column g), else the function name.
-func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, columnDefs []typeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*catTable, *srfPlan, error) {
+func (db *engine) resolveSRF(name string, args []*exprNode, argNames []*string, alias *string, columnDefs []typeFieldDef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*catTable, *srfPlan, error) {
 	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
 	// inherited so an arg subquery can reference a CTE (cte.md §2). Arguments are resolved with
 	// PostgreSQL's p_lateral_active set, so a hint never suggests LATERAL from here (error-fields.md
 	// §11.8).
 	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, hints: scopeHints{lateralActive: true}}
 	lname := name
+	// Named notation (`name => value`) is accepted only by jsonb_path_query[_tz], whose parameters
+	// PostgreSQL names; it is the only table function here with optional arguments.
+	pathQuery := lname == "jsonb_path_query" || lname == "jsonb_path_query_tz"
+	if !pathQuery {
+		if err := rejectNamed(name, argNames); err != nil {
+			return nil, nil, err
+		}
+	}
 	// Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
 	// json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
 	// `AS t(col type, …)`. Dispatched first, before the col-def-list guard below.
@@ -85,16 +93,21 @@ func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, colum
 	case "json_array_elements_text":
 		return db.resolveJSONSrf(lname, srfJsonArrayElementsText, scalarT(scalarText), false, args, alias, argScope, ptypes)
 	}
-	// jsonb_path_query(jsonb, jsonpath) (P2, jsonpath.md §5.2): one `jsonb` row per item of the path's
-	// evaluation sequence over the context document. A bare string literal adapts (the ctx to jsonb,
-	// the path to a compiled jsonpath). STRICT in the args; a NULL ctx/path → zero rows at exec.
-	if lname == "jsonb_path_query" {
+	// jsonb_path_query(target jsonb, path jsonpath [, vars jsonb [, silent boolean]]) (P2, jsonpath.md
+	// §5.2): one `jsonb` row per item of the path's evaluation sequence over the context document. A
+	// bare string literal adapts (the ctx to jsonb, the path to a compiled jsonpath). STRICT in the
+	// args; a NULL argument → zero rows at exec. jsonb_path_query_tz is PostgreSQL's STABLE twin
+	// (jsonpath.md §5.1); it reads no time zone until the datetime item methods land.
+	if pathQuery {
 		forbidden := &aggCtx{}
-		ctx, path, err := resolveJsonpathArgs(argScope, lname, args, forbidden, ptypes)
+		rargs, err := resolveJsonpathArgs(argScope, lname, args, argNames, forbidden, ptypes)
 		if err != nil {
 			return nil, nil, err
 		}
-		return srfTable(lname, alias, scalarT(scalarJsonb)), &srfPlan{kind: srfJsonbPathQuery, args: []*rExpr{ctx, path}}, nil
+		if lname == "jsonb_path_query_tz" {
+			ptypes.nonimmutable = true
+		}
+		return srfTable(lname, alias, scalarT(scalarJsonb)), &srfPlan{kind: srfJsonbPathQuery, args: rargs}, nil
 	}
 	return nil, nil, newError(UndefinedFunction, "function does not exist: "+name).hinted(hintFunctionNoMatch)
 }
@@ -289,6 +302,11 @@ func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, 
 		return nil, nil, newError(FeatureNotSupported, "a non-constant JSON_TABLE path is not supported")
 	}
 	rootPath := rpath.cText
+	// The PASSING values (json-sql-functions.md §5.4) follow the context in the SRF's args.
+	passing, passingNames, err := resolveJSONPassing(argScope, jt.Passing, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
 	var outColumns []catColumn
 	columns, err := db.resolveJtColumns(jt.Columns, &outColumns)
 	if err != nil {
@@ -301,8 +319,8 @@ func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, 
 	table := &catTable{Name: tname, Columns: outColumns}
 	return table, &srfPlan{
 		kind:      srfJsonTable,
-		args:      []*rExpr{rctx},
-		jsonTable: &jtPlan{rootPath: rootPath, width: len(outColumns), columns: columns},
+		args:      append([]*rExpr{rctx}, passing...),
+		jsonTable: &jtPlan{rootPath: rootPath, passingNames: passingNames, width: len(outColumns), columns: columns},
 	}, nil
 }
 
@@ -1417,21 +1435,40 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		}
 	case srfJsonbPathQuery:
 		// jsonb_path_query (P2, jsonpath.md §5.2): one jsonb row per path-evaluation-sequence item.
-		// The context node is already parsed above (`node`); evaluate the path (a NULL path → zero
-		// rows). The resolver restricts the path argument to jsonpath (its canonical text in Str).
+		// The context node is already parsed above (`node`). STRICT: a NULL path, vars, or silent →
+		// zero rows. The vars object is checked before evaluation; silent mode returns the items found
+		// before a SQL/JSON error (jsonpath.md §5). The resolver restricts the path argument to
+		// jsonpath (its canonical text in Str).
 		path, err := sp.args[1].eval(nil, env, m)
 		if err != nil {
 			return nil, err
 		}
-		if path.Kind == ValNull {
+		varsV, err := sp.args[2].eval(nil, env, m)
+		if err != nil {
+			return nil, err
+		}
+		silentV, err := sp.args[3].eval(nil, env, m)
+		if err != nil {
+			return nil, err
+		}
+		if path.Kind == ValNull || varsV.Kind == ValNull || silentV.Kind == ValNull {
 			return nil, nil
+		}
+		varsNode := varsV.jsonb()
+		if err := checkVarsObject(varsNode); err != nil {
+			return nil, err
 		}
 		compiled, err := compileMetered(path.str(), m)
 		if err != nil {
 			return nil, err
 		}
-		// PostgreSQL's default vars object is one base object (jsonpath.md §3.1).
-		seq, err := compiled.Eval(node, jpEvalOpts{vars: 1}, m)
+		opts := jpEvalOpts{vars: jpObjectVars(varsNode)}
+		var seq []JsonNode
+		if silentV.boolVal() {
+			seq, _, err = compiled.EvalSilent(node, opts, m)
+		} else {
+			seq, err = compiled.Eval(node, opts, m)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1637,6 +1674,13 @@ type jtAssign struct {
 // rows; a structural error evaluating the root path → zero rows.
 func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
 	plan := sp.jsonTable
+	// The PASSING values are evaluated first, as PostgreSQL's JSON_TABLE does (even for a NULL
+	// context).
+	bindings, err := passingBindings(sp.args[1:], plan.passingNames, nil, env, m)
+	if err != nil {
+		return nil, err
+	}
+	vars := jpPassingVarsOf(bindings, int64(len(plan.passingNames)))
 	ctx, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
 		return nil, err
@@ -1654,7 +1698,9 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 	if err != nil {
 		return nil, err
 	}
-	items, err := root.Eval(node, jpEvalOpts{}, m)
+	// A navigation error yields no rows; a cost abort or a missing variable propagates (jsonpath.md
+	// §7).
+	items, err := root.Eval(node, jtEvalOpts(vars), m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			return nil, nil
@@ -1662,7 +1708,7 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 		return nil, err
 	}
 	// Expand the column tree over the root sequence → sparse rows, then materialize.
-	sparse, err := expandJtLevel(plan.columns, items, env, m)
+	sparse, err := expandJtLevel(plan.columns, items, vars, env, m)
 	if err != nil {
 		return nil, err
 	}
@@ -1723,9 +1769,14 @@ func jtCompilePath(path *string, name string) (string, error) {
 	return compiled.Render(), nil
 }
 
+// jtEvalOpts is how JSON_TABLE evaluates its row, NESTED, and value-column paths: the full sequence,
+// with its PASSING variables (jsonpath.md §3.1, §5).
+func jtEvalOpts(vars jpVars) jpEvalOpts { return jpEvalOpts{vars: vars} }
+
 // expandJtLevel expands a JSON_TABLE COLUMNS level over a sequence of row items → the sparse rows
-// (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3).
-func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
+// (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Every
+// path reads the PASSING variables vars.
+func expandJtLevel(cols []jtCol, items []JsonNode, vars jpVars, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
 	var rows [][]jtAssign
 	for i := range items {
 		if err := m.Guard(); err != nil {
@@ -1740,13 +1791,13 @@ func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *costMeter) (
 			case *jtColOrdinality:
 				local = append(local, jtAssign{idx: c.idx, v: IntValue(ord)})
 			case *jtColRegular:
-				v, err := evalJtRegular(item, c, env, m)
+				v, err := evalJtRegular(item, c, vars, env, m)
 				if err != nil {
 					return nil, err
 				}
 				local = append(local, jtAssign{idx: c.idx, v: v})
 			case *jtColExists:
-				v, err := evalJtExists(item, c, m)
+				v, err := evalJtExists(item, c, vars, m)
 				if err != nil {
 					return nil, err
 				}
@@ -1762,7 +1813,7 @@ func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *costMeter) (
 				nested = append(nested, n)
 			}
 		}
-		nestedRows, err := expandJtNested(nested, item, env, m)
+		nestedRows, err := expandJtNested(nested, item, vars, env, m)
 		if err != nil {
 			return nil, err
 		}
@@ -1779,7 +1830,7 @@ func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *costMeter) (
 // expandJtNested expands the NESTED siblings of a level over one parent item — the default-plan
 // UNION of the siblings (each row fills only its own subtree), with the parent→child LEFT OUTER fill
 // (no child rows at all → one all-NULL nested row).
-func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
+func expandJtNested(children []*jtColNested, item *JsonNode, vars jpVars, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
 	if len(children) == 0 {
 		return [][]jtAssign{nil}, nil
 	}
@@ -1789,7 +1840,7 @@ func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *co
 		if err != nil {
 			return nil, err
 		}
-		childSeq, err := p.Eval(*item, jpEvalOpts{}, m)
+		childSeq, err := p.Eval(*item, jtEvalOpts(vars), m)
 		if err != nil {
 			if isSQLJSONError(err) {
 				childSeq = nil
@@ -1797,7 +1848,7 @@ func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *co
 				return nil, err
 			}
 		}
-		rows, err := expandJtLevel(child.columns, childSeq, env, m)
+		rows, err := expandJtLevel(child.columns, childSeq, vars, env, m)
 		if err != nil {
 			return nil, err
 		}
@@ -1811,12 +1862,12 @@ func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *co
 
 // evalJtRegular evaluates a regular JSON_TABLE column over a row item — JSON_VALUE (scalar) /
 // JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
-func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *costMeter) (Value, error) {
+func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m *costMeter) (Value, error) {
 	p, err := compileMetered(c.path, m)
 	if err != nil {
 		return Value{}, err
 	}
-	seq, err := p.Eval(*item, jpEvalOpts{}, m)
+	seq, err := p.Eval(*item, jtEvalOpts(vars), m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			return applyJSONBehavior(c.onError, err, c.returning, env, m)
@@ -1833,13 +1884,13 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *costMeter) 
 
 // evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the
 // column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
-func evalJtExists(item *JsonNode, c *jtColExists, m *costMeter) (Value, error) {
+func evalJtExists(item *JsonNode, c *jtColExists, vars jpVars, m *costMeter) (Value, error) {
 	p, err := compileMetered(c.path, m)
 	if err != nil {
 		return Value{}, err
 	}
 	var exists bool
-	seq, err := p.Eval(*item, jpEvalOpts{exists: true}, m)
+	seq, err := p.Eval(*item, jpEvalOpts{exists: true, vars: vars}, m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			switch c.onError {

@@ -43,6 +43,7 @@ import type {
   BinaryOp,
   Expr,
   JsonOnBehavior,
+  JsonPassing,
   JsonPredicateKind,
   JsonWrapper,
   OrderKey,
@@ -1801,6 +1802,7 @@ function resolveNode(
         "exists",
         e.ctx,
         e.path,
+        e.passing,
         null,
         "without",
         true,
@@ -1815,6 +1817,7 @@ function resolveNode(
         "value",
         e.ctx,
         e.path,
+        e.passing,
         e.returning,
         "without",
         true,
@@ -1829,6 +1832,7 @@ function resolveNode(
         "query",
         e.ctx,
         e.path,
+        e.passing,
         e.returning,
         e.wrapper,
         e.keepQuotes,
@@ -2857,7 +2861,7 @@ export function resolveBinary(
         );
       }
       return {
-        node: { kind: "jsonPathFn", pathFnKind: kind, args: [ctx.node, path.node] },
+        node: { kind: "jsonPathFn", pathFnKind: kind, tz: false, args: [ctx.node, path.node] },
         type: { kind: "bool" },
       };
     }
@@ -3634,42 +3638,75 @@ export function resolveJsonImage(
   };
 }
 
-// resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb, path
-// jsonpath)`. A bare string literal adapts (the context to jsonb, the path to a compiled jsonpath).
-// STRICT.
+// resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(target jsonb,
+// path jsonpath [, vars jsonb [, silent boolean]])`, positionally or in named notation, the omitted
+// trailing arguments filled with PostgreSQL's DEFAULTs (`'{}'`, `false`). A bare string literal
+// adapts. STRICT. A `_tz` form (`tz`) is PostgreSQL's STABLE twin, so it is nonimmutable (42P17 in an
+// index expression).
 export function resolveJsonpathFn(
   scope: Scope,
   name: string,
   kind: JsonPathFnKind,
+  tz: boolean,
   args: Expr[],
+  argNames: (string | null)[],
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  const [ctx, path] = resolveJsonpathArgs(scope, name, args, ag, params);
+  const rargs = resolveJsonpathArgs(scope, name, args, argNames, ag, params);
+  if (tz) params.nonimmutable = true;
   const type: ResolvedType =
     kind === "exists" || kind === "existsSilent" || kind === "match" || kind === "matchSilent"
       ? { kind: "bool" }
       : { kind: "jsonb" };
-  return { node: { kind: "jsonPathFn", pathFnKind: kind, args: [ctx, path] }, type };
+  return { node: { kind: "jsonPathFn", pathFnKind: kind, tz, args: rargs }, type };
 }
 
-// resolveJsonpathArgs resolves the `(context jsonb, path jsonpath)` argument pair shared by the
-// jsonpath query functions (the SRF and the scalar forms). A bare string literal adapts: the context
-// to jsonb, the path to a compiled `jsonpath`. Exactly two args this slice (the optional `vars` /
-// `silent` are a follow-on).
+// JSONPATH_PARAMS is PostgreSQL's parameter names of the jsonpath query functions.
+const JSONPATH_PARAMS = ["target", "path", "vars", "silent"] as const;
+
+// resolveJsonpathArgs resolves the `(target jsonb, path jsonpath [, vars jsonb [, silent boolean]])`
+// arguments shared by the jsonpath query functions (the SRF and the scalar forms) → the four argument
+// expressions, an omitted `vars` the empty object and an omitted `silent` false (PostgreSQL's
+// DEFAULTs). Named notation uses PostgreSQL's parameter names. A bare string literal adapts: the
+// target and vars to jsonb, the path to a compiled `jsonpath`, silent to a boolean.
 export function resolveJsonpathArgs(
   scope: Scope,
   name: string,
   args: Expr[],
+  argNames: (string | null)[],
   ag: AggCtx,
   params: ParamTypes,
-): [RExpr, RExpr] {
-  if (args.length !== 2) throw noFuncOverload(name);
-  const ctx = resolve(scope, args[0]!, "jsonb", ag, params);
+): RExpr[] {
+  const slots = placeNamedArgs(name, JSONPATH_PARAMS, args, argNames);
+  const required = (i: number): Expr => {
+    const a = slots[i];
+    if (a === null || a === undefined) throw noFuncOverload(name);
+    return a;
+  };
+  const ctx = resolve(scope, required(0), "jsonb", ag, params);
   if (ctx.type.kind !== "jsonb" && ctx.type.kind !== "null") throw noFuncOverload(name);
-  const path = resolve(scope, args[1]!, "jsonpath", ag, params);
+  const path = resolve(scope, required(1), "jsonpath", ag, params);
   if (path.type.kind !== "jsonpath" && path.type.kind !== "null") throw noFuncOverload(name);
-  return [ctx.node, path.node];
+  let vars: RExpr;
+  const varsArg = slots[2];
+  if (varsArg !== null && varsArg !== undefined) {
+    const v = resolve(scope, varsArg, "jsonb", ag, params);
+    if (v.type.kind !== "jsonb" && v.type.kind !== "null") throw noFuncOverload(name);
+    vars = v.node;
+  } else {
+    vars = { kind: "constJsonb", value: { kind: "object", members: [] } };
+  }
+  let silent: RExpr;
+  const silentArg = slots[3];
+  if (silentArg !== null && silentArg !== undefined) {
+    const v = resolve(scope, silentArg, "boolean", ag, params);
+    if (v.type.kind !== "bool" && v.type.kind !== "null") throw noFuncOverload(name);
+    silent = v.node;
+  } else {
+    silent = { kind: "constBool", value: false };
+  }
+  return [ctx.node, path.node, vars, silent];
 }
 
 // resolveJsonSqlFn resolves a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY
@@ -3680,6 +3717,7 @@ export function resolveJsonSqlFn(
   kind: JsonSqlKind,
   ctx: Expr,
   path: Expr,
+  passing: JsonPassing[],
   returning: string | null,
   wrapper: JsonWrapper,
   keepQuotes: boolean,
@@ -3739,11 +3777,13 @@ export function resolveJsonSqlFn(
   }
   const onEmptyB: JsonOnBehavior = onEmpty ?? "null";
   const onErrorB: JsonOnBehavior = onError ?? (kind === "exists" ? "false" : "null");
+  const rpassing = resolveJsonPassing(scope, passing, ag, params);
   return {
     node: {
       kind: "jsonSqlFn",
       sqlKind: kind,
-      args: [rctx.node, rpath.node],
+      args: [rctx.node, rpath.node, ...rpassing.exprs],
+      passingNames: rpassing.names,
       returning: returningSt,
       decimal: null,
       wrapper,
@@ -3753,6 +3793,74 @@ export function resolveJsonSqlFn(
     },
     type: resolvedTypeOf(returningSt),
   };
+}
+
+// resolveJsonPassing resolves a `PASSING value [FORMAT JSON] AS name, …` clause
+// (json-sql-functions.md §5.4) → the value expressions, each yielding a value passingBindings reads
+// as a jsonpath item, and the names. PostgreSQL's transformJsonPassingArgs + JsonItemFromDatum: a
+// boolean, integer, decimal, or text value (a bare string literal is text) is the item directly, a
+// jsonb value is itself, and every other type is converted to jsonb — a json value parsed (last
+// duplicate key wins), anything else by to_jsonb. FORMAT JSON parses a text value as JSON instead
+// (22P02 on malformed text) and converts every other type by to_jsonb. Deferred (0A000): a
+// date/timestamp/timestamptz value, which PostgreSQL passes as a jsonpath datetime item (the
+// datetime item methods are deferred, jsonpath.md §3.1); a float, which PostgreSQL converts with
+// float8_numeric (finite values) or passes as NaN/±Infinity, which jed's decimal cannot hold; and
+// FORMAT JSON on a bytea value (an encoded JSON text). Port of impl/rust `resolve_json_passing`.
+export function resolveJsonPassing(
+  scope: Scope,
+  passing: JsonPassing[],
+  ag: AggCtx,
+  params: ParamTypes,
+): { exprs: RExpr[]; names: string[] } {
+  const exprs: RExpr[] = [];
+  const names: string[] = [];
+  const unsupported = (what: string): EngineError =>
+    engineError("feature_not_supported", `a ${what} PASSING value is not supported yet`);
+  for (const p of passing) {
+    const hint =
+      (p.expr.kind === "literal" && p.expr.literal.kind === "text") || p.expr.kind === "param"
+        ? "text"
+        : null;
+    const r = resolve(scope, p.expr, hint, ag, params);
+    const ty = r.type;
+    const toJsonb = (): RExpr => {
+      params.nonimmutable ||= containsTimestamptz(ty);
+      return { kind: "jsonImage", func: "to_jsonb", args: [r.node], valueType: ty };
+    };
+    const castJsonb = (): RExpr => ({
+      kind: "cast",
+      target: "jsonb",
+      typmod: null,
+      varcharLen: null,
+      operand: r.node,
+    });
+    let value: RExpr;
+    if (ty.kind === "float") {
+      throw unsupported("float");
+    } else if (ty.kind === "bytea" && p.formatJson) {
+      throw unsupported("FORMAT JSON bytea");
+    } else if (ty.kind === "null" || ty.kind === "jsonb") {
+      value = r.node;
+    } else if (ty.kind === "json" || (ty.kind === "text" && p.formatJson)) {
+      value = castJsonb();
+    } else if (p.formatJson) {
+      value = toJsonb();
+    } else if (
+      ty.kind === "bool" ||
+      ty.kind === "int" ||
+      ty.kind === "decimal" ||
+      ty.kind === "text"
+    ) {
+      value = r.node;
+    } else if (ty.kind === "date" || ty.kind === "timestamp" || ty.kind === "timestamptz") {
+      throw unsupported("date/time");
+    } else {
+      value = toJsonb();
+    }
+    exprs.push(value);
+    names.push(p.name);
+  }
+  return { exprs, names };
 }
 
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).

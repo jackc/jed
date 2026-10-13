@@ -857,7 +857,10 @@ values_row     ::= "(" expr ("," expr)* ")"
 
 derived_alias  ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
 
-table_function ::= identifier "(" expr ("," expr)* ")"
+/* A table_function argument may be named (function_arg, ../design/grammar.md §35); of the SRFs
+ * only jsonb_path_query[_tz] declares parameter names (target, path, vars, silent), so a named
+ * argument to any other is 42883. */
+table_function ::= identifier "(" function_arg ("," function_arg)* ")"
 
 table_function_alias ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
 

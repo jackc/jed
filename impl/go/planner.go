@@ -298,13 +298,13 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			if lateralEligible {
 				srfParent = lateralParent
 			}
-			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, tref.ColumnDefs, srfParent, ctes, ptypes)
+			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.ArgNames, tref.Alias, tref.ColumnDefs, srfParent, ctes, ptypes)
 			if serr == nil && rightSide && lateralEligible && slices.ContainsFunc(sp.args, func(a *rExpr) bool { return rexprReferencesOuter(a, 0) }) {
 				// Correlated only outside this FROM (the left side refused above).
 				detached = true
 				serr = db.planAgain(ctes, func() error {
 					var rerr error
-					tbl, sp, rerr = db.resolveSRF(tref.Name, tref.Args, tref.Alias, tref.ColumnDefs, lateralParentScope, ctes, ptypes)
+					tbl, sp, rerr = db.resolveSRF(tref.Name, tref.Args, tref.ArgNames, tref.Alias, tref.ColumnDefs, lateralParentScope, ctes, ptypes)
 					return rerr
 				})
 			}

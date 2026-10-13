@@ -266,8 +266,8 @@ fn json_record_composite_array_column_is_0a000() {
 
 /// A `jsonb` column round-trips every node kind (object/array/number/string/bool/null) through a
 /// serialize + reload, confirming the tagged-node value codec decodes back to the canonical render.
-/// The deferred S2 sub-clauses of the SQL/JSON query functions are `0A000` — PASSING (path vars),
-/// ON ERROR/EMPTY DEFAULT expr, JSON_QUERY OMIT QUOTES, and JSON_QUERY RETURNING a non-json type.
+/// The deferred S2 sub-clauses of the SQL/JSON query functions are `0A000` — ON ERROR/EMPTY
+/// DEFAULT expr, JSON_QUERY OMIT QUOTES, and JSON_QUERY RETURNING a non-json type.
 /// PostgreSQL supports all of these, so each is a documented divergence; the supported subset is
 /// oracle-clean in suites/json/json_query_fns.test.
 #[test]
@@ -276,7 +276,6 @@ fn json_query_fn_deferred_clauses_are_0a000() {
         .unwrap()
         .session(SessionOptions::default());
     for sql in [
-        "SELECT JSON_VALUE('{\"a\":1}', '$.a' PASSING 1 AS x)",
         "SELECT JSON_VALUE('{\"a\":1}', '$.b' DEFAULT 'z' ON EMPTY)",
         "SELECT JSON_QUERY('{\"a\":1}', '$.a' OMIT QUOTES)",
         "SELECT JSON_QUERY('{\"a\":1}', '$.a' RETURNING int)",
@@ -285,7 +284,7 @@ fn json_query_fn_deferred_clauses_are_0a000() {
     }
 }
 
-/// The deferred T1 sub-features of JSON_TABLE are `0A000` — an explicit PLAN, PASSING, an array
+/// The deferred T1 sub-features of JSON_TABLE are `0A000` — an explicit PLAN, an array
 /// column, a WRAPPER on a scalar column, OMIT QUOTES; an unknown column type is `42704`. PostgreSQL
 /// supports the first set, so each is a documented divergence; the supported subset is oracle-clean
 /// in suites/json/json_table.test.
@@ -296,7 +295,6 @@ fn json_table_deferred_features_are_0a000() {
         .session(SessionOptions::default());
     for sql in [
         "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))",
-        "SELECT * FROM JSON_TABLE('{}', '$' PASSING 1 AS y COLUMNS (x i32 PATH '$.x'))",
         "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32[] PATH '$.x'))",
         "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' WITH WRAPPER))",
         "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x' OMIT QUOTES))",

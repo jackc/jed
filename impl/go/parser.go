@@ -1820,10 +1820,42 @@ func (p *parser) parseCreateType() (*createType, error) {
 }
 
 // skipFormatJSON skips an optional `FORMAT JSON [ENCODING …]` clause after a SQL/JSON context item.
-func (p *parser) skipFormatJSON() {
+func (p *parser) skipFormatJSON() bool {
 	if p.peekKeyword() == "format" && p.peekKeywordAt(1) == "json" {
 		p.advance() // FORMAT
 		p.advance() // JSON
+		return true
+	}
+	return false
+}
+
+// parseJSONPassing parses an optional `PASSING value [FORMAT JSON] AS name [, …]` clause of a SQL/JSON
+// query function or JSON_TABLE (json-sql-functions.md §5.4) → its arguments (nil when absent). The
+// name is any identifier, folded like one (`AS X` binds $x; `AS "X"` binds $X).
+func (p *parser) parseJSONPassing() ([]jsonPassing, error) {
+	if p.peekKeyword() != "passing" {
+		return nil, nil
+	}
+	p.advance() // PASSING
+	var passing []jsonPassing
+	for {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		formatJSON := p.skipFormatJSON()
+		if err := p.expectKeyword("as"); err != nil {
+			return nil, err
+		}
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		passing = append(passing, jsonPassing{Expr: expr, FormatJSON: formatJSON, Name: name})
+		if p.peek().Kind != tokComma {
+			return passing, nil
+		}
+		p.advance()
 	}
 }
 
@@ -3930,8 +3962,10 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		dbQualifier = &q
 		name = tbl
 	}
-	// A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
+	// A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`). An argument may
+	// be named (`name => value`, grammar.md §17); argNames is nil when every argument is positional.
 	var args []*exprNode
+	var argNames []*string
 	isFunc := false
 	if p.peek().Kind == tokLParen {
 		if dbQualifier != nil {
@@ -3939,12 +3973,30 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		}
 		isFunc = true
 		p.advance()
+		var names []*string
+		anyNamed := false
 		for {
+			var argName *string
+			if isIdentKind(p.peek().Kind) && p.peekKindAt(1) == tokFatArrow {
+				nm, err := p.expectIdentifier()
+				if err != nil {
+					return tableRef{}, err
+				}
+				if err := p.expect(tokFatArrow); err != nil {
+					return tableRef{}, err
+				}
+				anyNamed = true
+				argName = &nm
+			} else if anyNamed {
+				// A positional argument may not follow a named one (PostgreSQL, 42601).
+				return tableRef{}, newError(SyntaxError, "positional argument cannot follow named argument")
+			}
 			arg, err := p.parseExpr()
 			if err != nil {
 				return tableRef{}, err
 			}
 			args = append(args, &arg)
+			names = append(names, argName)
 			if p.peek().Kind != tokComma {
 				break
 			}
@@ -3952,6 +4004,9 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		}
 		if err := p.expect(tokRParen); err != nil {
 			return tableRef{}, err
+		}
+		if anyNamed {
+			argNames = names
 		}
 	}
 	var alias *string
@@ -4026,7 +4081,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	}
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
 	return tableRef{
-		Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnAliases: columnAliases, ColumnDefs: columnDefs, Lateral: lateral,
+		Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ArgNames: argNames, ColumnAliases: columnAliases, ColumnDefs: columnDefs, Lateral: lateral,
 		NamePos: tokPos(namePos), AliasPos: aliasPos, ListOpen: listOpen, ListClose: listClose, Src: src,
 		Depth: nestDepth(p.depth),
 	}, nil
@@ -4058,8 +4113,9 @@ func (p *parser) parseJsonTable() (tableRef, error) {
 			return tableRef{}, err
 		}
 	}
-	if p.peekKeyword() == "passing" {
-		return tableRef{}, newError(FeatureNotSupported, "JSON_TABLE PASSING clause is not supported yet")
+	passing, err := p.parseJSONPassing()
+	if err != nil {
+		return tableRef{}, err
 	}
 	if err := p.expectKeyword("columns"); err != nil {
 		return tableRef{}, err
@@ -4095,7 +4151,7 @@ func (p *parser) parseJsonTable() (tableRef, error) {
 	return tableRef{
 		Name:      name,
 		Alias:     alias,
-		JsonTable: &jsonTable{Ctx: &ctx, Path: &path, Columns: columns},
+		JsonTable: &jsonTable{Ctx: &ctx, Path: &path, Passing: passing, Columns: columns},
 	}, nil
 }
 
@@ -6059,9 +6115,9 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
-		// `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
-		if p.peekKeyword() == "passing" {
-			return exprNode{}, newError(FeatureNotSupported, "JSON query function PASSING clause is not supported yet")
+		passing, err := p.parseJSONPassing()
+		if err != nil {
+			return exprNode{}, err
 		}
 		var expr exprNode
 		switch kw {
@@ -6070,7 +6126,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			expr = exprNode{Kind: exprJsonExists, JsonExists: &jsonExistsExpr{Ctx: ctx, Path: path, OnError: onError}}
+			expr = exprNode{Kind: exprJsonExists, JsonExists: &jsonExistsExpr{Ctx: ctx, Path: path, Passing: passing, OnError: onError}}
 		case "json_value":
 			returning, err := p.parseJSONReturning()
 			if err != nil {
@@ -6080,7 +6136,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			expr = exprNode{Kind: exprJsonValue, JsonValue: &jsonValueExpr{Ctx: ctx, Path: path, Returning: returning, OnEmpty: onEmpty, OnError: onError}}
+			expr = exprNode{Kind: exprJsonValue, JsonValue: &jsonValueExpr{Ctx: ctx, Path: path, Passing: passing, Returning: returning, OnEmpty: onEmpty, OnError: onError}}
 		default: // json_query
 			returning, err := p.parseJSONReturning()
 			if err != nil {
@@ -6094,7 +6150,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			expr = exprNode{Kind: exprJsonQuery, JsonQuery: &jsonQueryExpr{Ctx: ctx, Path: path, Returning: returning, Wrapper: wrapper, KeepQuotes: keepQuotes, OnEmpty: onEmpty, OnError: onError}}
+			expr = exprNode{Kind: exprJsonQuery, JsonQuery: &jsonQueryExpr{Ctx: ctx, Path: path, Passing: passing, Returning: returning, Wrapper: wrapper, KeepQuotes: keepQuotes, OnEmpty: onEmpty, OnError: onError}}
 		}
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err

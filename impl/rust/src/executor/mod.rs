@@ -11,10 +11,10 @@ pub(crate) use crate::ast::{
     ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateTableAs,
     CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable,
     DropType, DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue,
-    JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal,
-    OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItems,
-    SeqOptions, SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef, TableRefPos,
-    TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    JoinKind, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
+    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select,
+    SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef,
+    TableRefPos, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -3797,10 +3797,13 @@ pub(crate) enum RExpr {
         args: Vec<RExpr>,
     },
     /// A scalar jsonpath query function (P2, jsonpath.md §5): `jsonb_path_exists` /
-    /// `jsonb_path_query_first` / `jsonb_path_query_array`. `args` = `[ctx jsonb, path jsonpath]`;
-    /// STRICT (any NULL → SQL NULL). The path is recompiled from its canonical text at eval.
+    /// `jsonb_path_query_first` / `jsonb_path_query_array` / `jsonb_path_match` (`args` = `[target
+    /// jsonb, path jsonpath, vars jsonb, silent boolean]`, `tz` for the `_tz` form) or the `@?` /
+    /// `@@` operator (`args` = `[target, path]`). STRICT (any NULL → SQL NULL). The path is
+    /// recompiled from its canonical text at eval.
     JsonPathFn {
         kind: JsonPathFnKind,
+        tz: bool,
         args: Vec<RExpr>,
     },
     /// A SQL/JSON query function `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md
@@ -3810,6 +3813,10 @@ pub(crate) enum RExpr {
         kind: JsonSqlKind,
         ctx: Box<RExpr>,
         path: Box<RExpr>,
+        /// The `PASSING` values, each already a JSON-item-shaped value (see [`resolve_json_passing`]),
+        /// and the variable names they bind, in clause order.
+        passing: Vec<RExpr>,
+        passing_names: Vec<String>,
         /// The RETURNING scalar type (`Bool` for JSON_EXISTS; the JSON_VALUE scalar target;
         /// `Jsonb`/`Json` for JSON_QUERY) — drives the result coercion.
         returning: ScalarType,
@@ -4624,9 +4631,15 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         | Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => sub(operand),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => sub(ctx) + sub(path),
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => sub(ctx) + sub(path) + passing.iter().map(|p| sub(&p.expr)).sum::<usize>(),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -5272,6 +5285,8 @@ impl SrfKind {
 pub(crate) struct JtPlan {
     /// The compiled root jsonpath (its evaluation over `ctx` yields the row items).
     root_path: String,
+    /// The `PASSING` variable names; their values are the SRF's arguments after the context.
+    passing_names: Vec<String>,
     /// The total number of flattened output columns.
     width: usize,
     /// The top-level column tree.
@@ -5673,6 +5688,7 @@ fn resolve_json_sql_fn(
     kind: JsonSqlKind,
     ctx: &Expr,
     path: &Expr,
+    passing: &[JsonPassing],
     returning: &Option<String>,
     wrapper: JsonWrapper,
     keep_quotes: bool,
@@ -5738,11 +5754,14 @@ fn resolve_json_sql_fn(
         JsonSqlKind::Exists => JsonOnBehavior::False,
         _ => JsonOnBehavior::Null,
     });
+    let (passing, passing_names) = resolve_json_passing(scope, passing, agg, params)?;
     Ok((
         RExpr::JsonSqlFn {
             kind,
             ctx: Box::new(rctx),
             path: Box::new(rpath),
+            passing,
+            passing_names,
             returning: returning_st,
             decimal: None,
             wrapper,
@@ -5751,6 +5770,102 @@ fn resolve_json_sql_fn(
         },
         resolved_type_of(returning_st),
     ))
+}
+
+/// Resolve a `PASSING value [FORMAT JSON] AS name, …` clause (json-sql-functions.md §5.4) → the
+/// value expressions, each yielding a value [`passing_bindings`] reads as a jsonpath item, and the
+/// names. PostgreSQL's `transformJsonPassingArgs` + `JsonItemFromDatum`: a boolean, integer,
+/// `decimal`, or text value (a bare string literal is text) is the item directly, a `jsonb` value is
+/// itself, and every other type is converted to `jsonb` — a `json` value parsed (last duplicate key
+/// wins), anything else by `to_jsonb`. `FORMAT JSON` parses a text value as JSON instead (`22P02`
+/// on malformed text) and converts every other type by `to_jsonb`. Deferred (`0A000`): a
+/// `date`/`timestamp`/`timestamptz` value, which PostgreSQL passes as a jsonpath datetime item
+/// (the datetime item methods are deferred, jsonpath.md §3.1); a float, which PostgreSQL converts
+/// with `float8_numeric` (finite values) or passes as NaN/±Infinity, which jed's `decimal` cannot
+/// hold; and `FORMAT JSON` on a `bytea` value (an encoded JSON text).
+pub(crate) fn resolve_json_passing(
+    scope: &Scope,
+    passing: &[JsonPassing],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(Vec<RExpr>, Vec<String>)> {
+    let mut exprs = Vec::with_capacity(passing.len());
+    let mut names = Vec::with_capacity(passing.len());
+    for p in passing {
+        let hint = if matches!(p.expr, Expr::Literal(Literal::Text(_), _) | Expr::Param(_)) {
+            Some(ScalarType::Text)
+        } else {
+            None
+        };
+        let (r, ty) = resolve(scope, &p.expr, hint, agg, params)?;
+        let unsupported = |what: &str| {
+            Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                format!("a {what} PASSING value is not supported yet"),
+            ))
+        };
+        let to_jsonb = |r: RExpr, ty: ResolvedType, params: &mut ParamTypes| {
+            params.nonimmutable |= ty.contains_timestamptz();
+            RExpr::JsonImage {
+                func: JsonImageFunc::ToJsonb,
+                args: vec![r],
+                ty,
+            }
+        };
+        let cast_jsonb = |r: RExpr| RExpr::Cast {
+            inner: Box::new(r),
+            target: ScalarType::Jsonb,
+            typmod: None,
+            varchar_len: None,
+        };
+        let value = match (&ty, p.format_json) {
+            (ResolvedType::Float(_), _) => return unsupported("float"),
+            (ResolvedType::Bytea, true) => return unsupported("FORMAT JSON bytea"),
+            (ResolvedType::Null | ResolvedType::Jsonb, _) => r,
+            (ResolvedType::Json, _) | (ResolvedType::Text, true) => cast_jsonb(r),
+            (_, true) => to_jsonb(r, ty, params),
+            (
+                ResolvedType::Bool
+                | ResolvedType::Int(_)
+                | ResolvedType::Decimal
+                | ResolvedType::Text,
+                false,
+            ) => r,
+            (ResolvedType::Date | ResolvedType::Timestamp | ResolvedType::Timestamptz, false) => {
+                return unsupported("date/time");
+            }
+            (_, false) => to_jsonb(r, ty, params),
+        };
+        exprs.push(value);
+        names.push(p.name.clone());
+    }
+    Ok((exprs, names))
+}
+
+/// Evaluate a resolved `PASSING` clause into its jsonpath variables (json-sql-functions.md §5.4):
+/// each value as a `jsonb` item (SQL NULL is JSON `null`), ordered for lookup by
+/// [`crate::jsonpath::passing_vars`].
+pub(crate) fn passing_bindings(
+    exprs: &[RExpr],
+    names: &[String],
+    row: &[Value],
+    env: &EvalEnv,
+    m: &mut Meter,
+) -> Result<Vec<crate::jsonpath::PassingVar>> {
+    let mut bindings = Vec::with_capacity(exprs.len());
+    for (e, name) in exprs.iter().zip(names) {
+        let node = match e.eval(row, env, m)? {
+            Value::Null => JsonNode::Null,
+            Value::Bool(b) => JsonNode::Bool(b),
+            Value::Int(n) => JsonNode::Number(Decimal::from_i64(n)),
+            Value::Decimal(d) => JsonNode::Number(d),
+            Value::Text(s) => JsonNode::String(s),
+            Value::Jsonb(n) => n,
+            _ => unreachable!("resolve_json_passing converts every other type to jsonb"),
+        };
+        bindings.push((name.clone(), node));
+    }
+    Ok(crate::jsonpath::passing_vars(bindings))
 }
 
 /// A SQL/JSON error that the query functions' `ON ERROR` clause catches: a data exception (class
@@ -5992,18 +6107,22 @@ fn jt_compile_path(path: Option<&str>, name: &str) -> Result<String> {
     Ok(crate::jsonpath::JsonPath::compile(&src)?.render())
 }
 
-/// How `JSON_TABLE` evaluates its row, NESTED, and value-column paths: the full sequence, with no
-/// `PASSING` variables (jsonpath.md §3.1).
-pub(crate) const JT_EVAL: crate::jsonpath::EvalOpts = crate::jsonpath::EvalOpts {
-    exists: false,
-    vars: 0,
-};
+/// How `JSON_TABLE` evaluates its row, NESTED, and value-column paths: the full sequence, with its
+/// `PASSING` variables (jsonpath.md §3.1, §5).
+pub(crate) fn jt_eval(vars: crate::jsonpath::Vars<'_>) -> crate::jsonpath::EvalOpts<'_> {
+    crate::jsonpath::EvalOpts {
+        exists: false,
+        vars,
+    }
+}
 
 /// Expand a `JSON_TABLE` COLUMNS level over a sequence of row items → the sparse rows (the
-/// parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3).
+/// parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Every
+/// path reads the `PASSING` variables `vars`.
 fn expand_jt_level(
     cols: &[JtCol],
     items: &[Cow<'_, JsonNode>],
+    vars: crate::jsonpath::Vars<'_>,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<JtAssign>> {
@@ -6027,8 +6146,8 @@ fn expand_jt_level(
                     on_error,
                 } => {
                     let v = eval_jt_regular(
-                        item, path, *query, *returning, *decimal, *wrapper, *on_empty, *on_error,
-                        env, meter,
+                        item, path, vars, *query, *returning, *decimal, *wrapper, *on_empty,
+                        *on_error, env, meter,
                     )?;
                     local.push((*idx, v));
                 }
@@ -6038,7 +6157,7 @@ fn expand_jt_level(
                     path,
                     on_error,
                 } => {
-                    let v = eval_jt_exists(item, path, *returning, *on_error, meter)?;
+                    let v = eval_jt_exists(item, path, vars, *returning, *on_error, meter)?;
                     local.push((*idx, v));
                 }
                 JtCol::Nested { .. } => {}
@@ -6049,7 +6168,7 @@ fn expand_jt_level(
             .iter()
             .filter(|c| matches!(c, JtCol::Nested { .. }))
             .collect();
-        let nested_rows = expand_jt_nested(&nested, item, env, meter)?;
+        let nested_rows = expand_jt_nested(&nested, item, vars, env, meter)?;
         for nr in nested_rows {
             let mut row = local.clone();
             row.extend(nr);
@@ -6065,6 +6184,7 @@ fn expand_jt_level(
 fn expand_jt_nested(
     children: &[&JtCol],
     item: &JsonNode,
+    vars: crate::jsonpath::Vars<'_>,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<JtAssign>> {
@@ -6076,12 +6196,12 @@ fn expand_jt_nested(
         if let JtCol::Nested { path, columns } = child {
             let p = crate::jsonpath::compile_metered(path, meter)?;
             // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
-            let child_seq = match crate::jsonpath::eval(&p, item, JT_EVAL, meter) {
+            let child_seq = match crate::jsonpath::eval(&p, item, jt_eval(vars), meter) {
                 Ok(seq) => seq,
                 Err(e) if is_sqljson_error(&e) => Vec::new(),
                 Err(e) => return Err(e),
             };
-            union.extend(expand_jt_level(columns, &child_seq, env, meter)?);
+            union.extend(expand_jt_level(columns, &child_seq, vars, env, meter)?);
         }
     }
     if union.is_empty() {
@@ -6096,6 +6216,7 @@ fn expand_jt_nested(
 fn eval_jt_regular(
     item: &JsonNode,
     path: &str,
+    vars: crate::jsonpath::Vars<'_>,
     query: bool,
     returning: ScalarType,
     decimal: Option<DecimalTypmod>,
@@ -6106,7 +6227,7 @@ fn eval_jt_regular(
     meter: &mut Meter,
 ) -> Result<Value> {
     let p = crate::jsonpath::compile_metered(path, meter)?;
-    let seq = match crate::jsonpath::eval(&p, item, JT_EVAL, meter) {
+    let seq = match crate::jsonpath::eval(&p, item, jt_eval(vars), meter) {
         Ok(s) => s,
         Err(e) if is_sqljson_error(&e) => {
             return apply_json_behavior(on_error, e, returning, env, meter);
@@ -6129,15 +6250,13 @@ fn eval_jt_regular(
 fn eval_jt_exists(
     item: &JsonNode,
     path: &str,
+    vars: crate::jsonpath::Vars<'_>,
     returning: ScalarType,
     on_error: JsonOnBehavior,
     meter: &mut Meter,
 ) -> Result<Value> {
     let p = crate::jsonpath::compile_metered(path, meter)?;
-    let opts = crate::jsonpath::EvalOpts {
-        exists: true,
-        vars: 0,
-    };
+    let opts = crate::jsonpath::EvalOpts { exists: true, vars };
     let exists = match crate::jsonpath::eval(&p, item, opts, meter) {
         Ok(seq) => !seq.is_empty(),
         Err(e) if is_sqljson_error(&e) => match on_error {

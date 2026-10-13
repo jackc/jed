@@ -1310,9 +1310,14 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
         | RExpr::JsonPathFn { args, .. } => args.iter().fold(0, |total, arg| {
             sat_add(total, estimator_operator_nodes(Some(arg)))
         }),
-        RExpr::JsonSqlFn { ctx, path, .. } => sat_add(
-            estimator_operator_nodes(Some(ctx)),
-            estimator_operator_nodes(Some(path)),
+        RExpr::JsonSqlFn {
+            ctx, path, passing, ..
+        } => passing.iter().fold(
+            sat_add(
+                estimator_operator_nodes(Some(ctx)),
+                estimator_operator_nodes(Some(path)),
+            ),
+            |total, p| sat_add(total, estimator_operator_nodes(Some(p))),
         ),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().fold(0, |total, field| {
@@ -1406,7 +1411,13 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
         | RExpr::JsonObjectFromArrays { args, .. }
         | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().collect(),
-        RExpr::JsonSqlFn { ctx, path, .. } => vec![ctx, path],
+        RExpr::JsonSqlFn {
+            ctx, path, passing, ..
+        } => {
+            let mut children = vec![ctx.as_ref(), path.as_ref()];
+            children.extend(passing);
+            children
+        }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => fields.iter().collect(),
         RExpr::Field { base, .. } => vec![base],
         RExpr::Subscript {
@@ -2764,7 +2775,13 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::JsonObjectFromArrays { args, .. }
         | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().all(rexpr_is_constant),
-        RExpr::JsonSqlFn { ctx, path, .. } => rexpr_is_constant(ctx) && rexpr_is_constant(path),
+        RExpr::JsonSqlFn {
+            ctx, path, passing, ..
+        } => {
+            rexpr_is_constant(ctx)
+                && rexpr_is_constant(path)
+                && passing.iter().all(rexpr_is_constant)
+        }
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. }
         | RExpr::WidthBucketArray {
@@ -5692,9 +5709,19 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_has_aggregate(operand),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => expr_has_aggregate(ctx) || expr_has_aggregate(path),
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
+            expr_has_aggregate(ctx)
+                || expr_has_aggregate(path)
+                || passing.iter().any(|p| expr_has_aggregate(&p.expr))
+        }
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_aggregate(lhs) || expr_has_aggregate(rhs)
         }
@@ -5781,9 +5808,19 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_has_window(operand),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => expr_has_window(ctx) || expr_has_window(path),
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
+            expr_has_window(ctx)
+                || expr_has_window(path)
+                || passing.iter().any(|p| expr_has_window(&p.expr))
+        }
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_window(lhs) || expr_has_window(rhs)
         }
@@ -5956,11 +5993,20 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
         | Expr::JsonCtor { operand, .. } => {
             desugar_named_windows(operand, windows)?;
         }
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => {
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
             desugar_named_windows(ctx, windows)?;
             desugar_named_windows(path, windows)?;
+            for p in passing {
+                desugar_named_windows(&mut p.expr, windows)?;
+            }
         }
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             desugar_named_windows(lhs, windows)?;
@@ -6064,11 +6110,21 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
         | Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => reject_check_structure(operand),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => {
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
             reject_check_structure(ctx)?;
-            reject_check_structure(path)
+            reject_check_structure(path)?;
+            for p in passing {
+                reject_check_structure(&p.expr)?;
+            }
+            Ok(())
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -6176,11 +6232,21 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
         | Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => reject_default_structure(operand),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => {
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
             reject_default_structure(ctx)?;
-            reject_default_structure(path)
+            reject_default_structure(path)?;
+            for p in passing {
+                reject_default_structure(&p.expr)?;
+            }
+            Ok(())
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -6272,11 +6338,20 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
             | Expr::IsNull { operand, .. }
             | Expr::IsJson { operand, .. }
             | Expr::JsonCtor { operand, .. } => walk(operand, columns, out),
-            Expr::JsonExists { ctx, path, .. }
-            | Expr::JsonValue { ctx, path, .. }
-            | Expr::JsonQuery { ctx, path, .. } => {
+            Expr::JsonExists {
+                ctx, path, passing, ..
+            }
+            | Expr::JsonValue {
+                ctx, path, passing, ..
+            }
+            | Expr::JsonQuery {
+                ctx, path, passing, ..
+            } => {
                 walk(ctx, columns, out);
                 walk(path, columns, out);
+                for p in passing {
+                    walk(&p.expr, columns, out);
+                }
             }
             Expr::Binary { lhs, rhs, .. }
             | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -6404,11 +6479,17 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
         | Expr::JsonCtor { operand: inner, .. }
         | Expr::FieldAccess { base: inner, .. }
         | Expr::FieldStar { base: inner } => index_expr_first_param(inner),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => {
-            index_expr_first_param(ctx).or_else(|| index_expr_first_param(path))
+        Expr::JsonExists {
+            ctx, path, passing, ..
         }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => index_expr_first_param(ctx)
+            .or_else(|| index_expr_first_param(path))
+            .or_else(|| passing.iter().find_map(|p| index_expr_first_param(&p.expr))),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -6477,10 +6558,18 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
         | Expr::JsonCtor { operand: inner, .. }
         | Expr::FieldAccess { base: inner, .. }
         | Expr::FieldStar { base: inner } => index_expr_has_subquery(inner),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => {
-            index_expr_has_subquery(ctx) || index_expr_has_subquery(path)
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
+            index_expr_has_subquery(ctx)
+                || index_expr_has_subquery(path)
+                || passing.iter().any(|p| index_expr_has_subquery(&p.expr))
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }

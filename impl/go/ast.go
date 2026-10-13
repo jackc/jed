@@ -804,10 +804,14 @@ type tableRef struct {
 	// implicit-scope name. Only the reserved implicit qualifiers `main` (the file database) and `temp`
 	// (the session-local domain) resolve this slice; any other is 42P01 (Slice 1b adds host-attached
 	// databases). Never set on the function / derived-table alternatives.
-	DB            *string
-	Alias         *string
-	IsFunc        bool
-	Args          []*exprNode
+	DB     *string
+	Alias  *string
+	IsFunc bool
+	Args   []*exprNode
+	// ArgNames carries a table function's arguments in PostgreSQL named notation (name => value,
+	// grammar.md §17): nil ⇒ every argument positional; otherwise parallel to Args, a non-nil *string
+	// for a named slot and nil for a positional one.
+	ArgNames      []*string
 	Subquery      *queryExpr
 	Values        [][]*exprNode
 	ColumnAliases []string
@@ -842,6 +846,7 @@ type tableRef struct {
 type jsonTable struct {
 	Ctx     *exprNode
 	Path    *exprNode
+	Passing []jsonPassing
 	Columns []jtColumn
 }
 
@@ -1589,10 +1594,50 @@ const (
 
 // JsonExistsExpr is `JSON_EXISTS(Ctx, Path [behavior ON ERROR])` — the SQL/JSON existence predicate
 // (json-sql-functions.md §5, S2). OnError is nil when no `ON ERROR` clause is present (default FALSE).
+// Passing binds the path's $name variables.
 type jsonExistsExpr struct {
 	Ctx     exprNode
 	Path    exprNode
+	Passing []jsonPassing
 	OnError *jsonOnBehavior
+}
+
+// JsonPassing is one `PASSING value [FORMAT JSON] AS name` argument of a SQL/JSON query function or
+// JSON_TABLE (json-sql-functions.md §5.4): binds the path variable $name to the value. FormatJSON is
+// true when `FORMAT JSON` was written (a character-string value is parsed as JSON text).
+type jsonPassing struct {
+	Expr       exprNode
+	FormatJSON bool
+	Name       string
+}
+
+// passingAny reports whether f holds for any PASSING value expression of ps — the shared walk of the
+// SQL/JSON PASSING clause by the tree walkers.
+func passingAny(ps []jsonPassing, f func(*exprNode) bool) bool {
+	for i := range ps {
+		if f(&ps[i].Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// desugarPassing applies a rewrite f to every PASSING value expression of ps → a fresh slice (nil
+// when ps is empty), leaving ps untouched.
+func desugarPassing(ps []jsonPassing, f func(exprNode) (exprNode, error)) ([]jsonPassing, error) {
+	if len(ps) == 0 {
+		return ps, nil
+	}
+	out := make([]jsonPassing, len(ps))
+	for i, p := range ps {
+		e, err := f(p.Expr)
+		if err != nil {
+			return nil, err
+		}
+		p.Expr = e
+		out[i] = p
+	}
+	return out, nil
 }
 
 // JsonValueExpr is `JSON_VALUE(Ctx, Path [RETURNING type] [ON EMPTY] [ON ERROR])` (json-sql-functions.md
@@ -1600,6 +1645,7 @@ type jsonExistsExpr struct {
 type jsonValueExpr struct {
 	Ctx       exprNode
 	Path      exprNode
+	Passing   []jsonPassing
 	Returning *string
 	OnEmpty   *jsonOnBehavior
 	OnError   *jsonOnBehavior
@@ -1611,6 +1657,7 @@ type jsonValueExpr struct {
 type jsonQueryExpr struct {
 	Ctx        exprNode
 	Path       exprNode
+	Passing    []jsonPassing
 	Returning  *string
 	Wrapper    jsonWrapper
 	KeepQuotes bool

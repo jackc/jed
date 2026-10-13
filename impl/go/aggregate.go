@@ -1502,11 +1502,14 @@ func exprHasAggregate(e exprNode) bool {
 	case exprJsonCtor:
 		return exprHasAggregate(e.JsonCtorOf.Operand)
 	case exprJsonExists:
-		return exprHasAggregate(e.JsonExists.Ctx) || exprHasAggregate(e.JsonExists.Path)
+		return exprHasAggregate(e.JsonExists.Ctx) || exprHasAggregate(e.JsonExists.Path) ||
+			passingAny(e.JsonExists.Passing, func(p *exprNode) bool { return exprHasAggregate(*p) })
 	case exprJsonValue:
-		return exprHasAggregate(e.JsonValue.Ctx) || exprHasAggregate(e.JsonValue.Path)
+		return exprHasAggregate(e.JsonValue.Ctx) || exprHasAggregate(e.JsonValue.Path) ||
+			passingAny(e.JsonValue.Passing, func(p *exprNode) bool { return exprHasAggregate(*p) })
 	case exprJsonQuery:
-		return exprHasAggregate(e.JsonQuery.Ctx) || exprHasAggregate(e.JsonQuery.Path)
+		return exprHasAggregate(e.JsonQuery.Ctx) || exprHasAggregate(e.JsonQuery.Path) ||
+			passingAny(e.JsonQuery.Passing, func(p *exprNode) bool { return exprHasAggregate(*p) })
 	case exprBinary:
 		return exprHasAggregate(e.Binary.Lhs) || exprHasAggregate(e.Binary.Rhs)
 	case exprIsDistinct:
@@ -1643,11 +1646,14 @@ func exprHasWindow(e exprNode) bool {
 	case exprJsonCtor:
 		return exprHasWindow(e.JsonCtorOf.Operand)
 	case exprJsonExists:
-		return exprHasWindow(e.JsonExists.Ctx) || exprHasWindow(e.JsonExists.Path)
+		return exprHasWindow(e.JsonExists.Ctx) || exprHasWindow(e.JsonExists.Path) ||
+			passingAny(e.JsonExists.Passing, func(p *exprNode) bool { return exprHasWindow(*p) })
 	case exprJsonValue:
-		return exprHasWindow(e.JsonValue.Ctx) || exprHasWindow(e.JsonValue.Path)
+		return exprHasWindow(e.JsonValue.Ctx) || exprHasWindow(e.JsonValue.Path) ||
+			passingAny(e.JsonValue.Passing, func(p *exprNode) bool { return exprHasWindow(*p) })
 	case exprJsonQuery:
-		return exprHasWindow(e.JsonQuery.Ctx) || exprHasWindow(e.JsonQuery.Path)
+		return exprHasWindow(e.JsonQuery.Ctx) || exprHasWindow(e.JsonQuery.Path) ||
+			passingAny(e.JsonQuery.Passing, func(p *exprNode) bool { return exprHasWindow(*p) })
 	case exprBinary:
 		return exprHasWindow(e.Binary.Lhs) || exprHasWindow(e.Binary.Rhs)
 	case exprIsDistinct:
@@ -1928,9 +1934,14 @@ func desugarNamedWindows(e exprNode, windows []namedWindow) (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
+		passing, err := desugarPassing(e.JsonExists.Passing, func(p exprNode) (exprNode, error) { return desugarNamedWindows(p, windows) })
+		if err != nil {
+			return exprNode{}, err
+		}
 		nj := *e.JsonExists
 		nj.Ctx = ctx
 		nj.Path = path
+		nj.Passing = passing
 		ne := e
 		ne.JsonExists = &nj
 		return ne, nil
@@ -1943,9 +1954,14 @@ func desugarNamedWindows(e exprNode, windows []namedWindow) (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
+		passing, err := desugarPassing(e.JsonValue.Passing, func(p exprNode) (exprNode, error) { return desugarNamedWindows(p, windows) })
+		if err != nil {
+			return exprNode{}, err
+		}
 		nj := *e.JsonValue
 		nj.Ctx = ctx
 		nj.Path = path
+		nj.Passing = passing
 		ne := e
 		ne.JsonValue = &nj
 		return ne, nil
@@ -1958,9 +1974,14 @@ func desugarNamedWindows(e exprNode, windows []namedWindow) (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
+		passing, err := desugarPassing(e.JsonQuery.Passing, func(p exprNode) (exprNode, error) { return desugarNamedWindows(p, windows) })
+		if err != nil {
+			return exprNode{}, err
+		}
 		nj := *e.JsonQuery
 		nj.Ctx = ctx
 		nj.Path = path
+		nj.Passing = passing
 		ne := e
 		ne.JsonQuery = &nj
 		return ne, nil

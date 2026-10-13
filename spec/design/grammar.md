@@ -2582,11 +2582,15 @@ catalog data ([catalog.toml](../functions/catalog.toml) `[[set_returning]]`). Th
 identical for both: a single `table_function` production keyed on a `(` after the leading
 identifier — the resolver dispatches by name.
 
-**Syntax.** `table_function ::= identifier "(" expr ("," expr)* ")"` — a `(` immediately
-after the leading identifier in `table_ref` position marks the function form (a **one-token
-lookahead**, a §8 cross-core determinism surface; a bare table name has no `(` there). The
-arguments are general expressions parsed exactly like a `function_call`'s, minus the `*` /
-`DISTINCT` forms (those are the aggregate/star spellings, not an SRF argument list). The optional
+**Syntax.** `table_function ::= identifier "(" function_arg ("," function_arg)* ")"` — a `(`
+immediately after the leading identifier in `table_ref` position marks the function form (a
+**one-token lookahead**, a §8 cross-core determinism surface; a bare table name has no `(` there).
+The arguments are general expressions parsed exactly like a `function_call`'s, minus the `*` /
+`DISTINCT` forms (those are the aggregate/star spellings, not an SRF argument list). An argument may
+be named (`name => value`, §17; a positional argument after a named one is `42601`). Only
+`jsonb_path_query` / `jsonb_path_query_tz` declare parameter names (PostgreSQL's `target`, `path`,
+`vars`, `silent`, with `vars` and `silent` defaulted — [jsonpath.md](jsonpath.md) §5); a named
+argument to any other SRF is `42883`. The optional
 alias is `table_function_alias ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?`:
 `AS` remains optional, while a parenthesized column-alias list requires the relation alias before it.
 

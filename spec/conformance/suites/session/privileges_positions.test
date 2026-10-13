@@ -2,12 +2,12 @@
 # (spec/design/session.md §5.3). A named function anywhere in a statement needs EXECUTE and a table
 # read anywhere in it needs SELECT, including positions outside a call's argument list: an
 # aggregate's FILTER, a WITHIN GROUP key, a window's PARTITION BY / ORDER BY (inline or through a named
-# WINDOW), a query's ORDER BY, a JSON_TABLE context item, a view body, and the
+# WINDOW), a query's ORDER BY, a JSON_TABLE context item, a PASSING value, a view body, and the
 # catalog expressions a write applies (the column defaults an INSERT fills, the target's CHECK
 # constraints). INSERT ... ON CONFLICT and INSERT ... RETURNING follow PostgreSQL's table privileges.
 # jed-specific (the envelope is host-configured), so CROSS-CORE-checked, NOT oracle-checked; the
 # directive grammar is privileges.test's.
-# requires: ddl.create_table, ddl.primary_key, ddl.column_default_expr, ddl.check, ddl.view, dml.view_write, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.returning, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.order_by_expr, query.aggregates, query.aggregate_filter, query.window_aggregate_filter, query.ordered_set_aggregate, query.within_group_expr, query.window, query.window_aggregate, query.window_expr_keys, query.window_named, query.subquery_scalar, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns, func.json_table, func.json_builders, func.abs, types.i32, session.privileges
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default_expr, ddl.check, ddl.view, dml.view_write, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.returning, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.order_by_expr, query.aggregates, query.aggregate_filter, query.window_aggregate_filter, query.ordered_set_aggregate, query.within_group_expr, query.window, query.window_aggregate, query.window_expr_keys, query.window_named, query.subquery_scalar, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns, func.json_table, expr.jsonpath_vars, func.json_builders, func.abs, types.i32, session.privileges
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -76,6 +76,14 @@ SELECT x FROM JSON_TABLE(jsonb_build_array(abs(-1)), '$[*]' COLUMNS (x i32 PATH 
 # revoke: SELECT ON s
 statement error 42501
 SELECT x FROM JSON_TABLE((SELECT jsonb_build_array(min(v)) FROM s), '$[*]' COLUMNS (x i32 PATH '$')) AS jt
+
+# revoke: SELECT ON s
+statement error 42501
+SELECT x FROM JSON_TABLE('[1]'::jsonb, '$[*] ? (@ <= $m)' PASSING (SELECT min(v) FROM s) AS m COLUMNS (x i32 PATH '$')) AS jt
+
+# revoke: SELECT ON s
+statement error 42501
+SELECT JSON_VALUE('{}', '$m' PASSING (SELECT min(v) FROM s) AS m)
 
 # a JSON_TABLE label is not a table reference: a table of the same name needs no privilege
 statement ok

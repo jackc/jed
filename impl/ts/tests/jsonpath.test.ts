@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { dbWith, errCode } from "./util.ts";
 
 // The still-deferred path-expression constructs — the datetime item methods, like_regex / starts
-// with / is unknown / exists predicates, $name variables, .** — are a 0A000 at compile. PostgreSQL
+// with / is unknown / exists predicates, .** — are a 0A000 at compile. PostgreSQL
 // compiles them, so each is a documented divergence; the supported subset is oracle-clean in
 // suites/json/jsonpath_literal.test, jsonpath_query.test, and jsonpath_methods.test.
 test("jsonpath P1b constructs are 0A000", () => {
@@ -27,8 +27,6 @@ test("jsonpath P1b constructs are 0A000", () => {
     '$.a starts with "x"', // a starts-with top-level predicate
     "($.a == 1) is unknown", // an is-unknown predicate
     "$ ? (exists (@.a))", // an exists predicate
-    "$[$x]", // a path variable in a subscript expression
-    "$x + 1", // a path variable
     "$.**", // the any-level accessor
   ]) {
     assert.equal(

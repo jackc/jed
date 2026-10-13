@@ -542,13 +542,15 @@ const (
 	// (a composite's field names key its members), or rtNull for an untyped NULL argument.
 	reJsonImage
 	// reJsonPathFn is a scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists /
-	// jsonb_path_query_first / jsonb_path_query_array. `sargs` = [ctx jsonb, path jsonpath]; STRICT
-	// (any NULL → SQL NULL). `jpFnKind` selects which function. The path is recompiled from its
-	// canonical text at eval.
+	// jsonb_path_query_first / jsonb_path_query_array / jsonb_path_match (`sargs` = [target jsonb, path
+	// jsonpath, vars jsonb, silent boolean], `jpTz` for the _tz form) or the @? / @@ operator (`sargs`
+	// = [target, path]); STRICT (any NULL → SQL NULL). `jpFnKind` selects which function. The path is
+	// recompiled from its canonical text at eval.
 	reJsonPathFn
 	// reJsonSqlFn is a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md
-	// §5, S2). `sargs` = [ctx, path]: ctx produces the context jsonb (or json/text, coerced), path the
-	// jsonpath; a NULL ctx/path → SQL NULL. `jsKind` selects which function; `result`/`typmod` the
+	// §5, S2). `sargs` = [ctx, path, PASSING values…]: ctx produces the context jsonb (or json/text,
+	// coerced), path the jsonpath, and each PASSING value a jsonpath variable named by
+	// `jsPassingNames`; a NULL ctx/path → SQL NULL. `jsKind` selects which function; `result`/`typmod` the
 	// RETURNING type; `jsWrapper`/`jsKeepQuotes`/`jsOnEmpty`/`jsOnError` drive the result. A SQL/JSON
 	// (class-22) error honors ON ERROR; anything else propagates.
 	reJsonSqlFn
@@ -1167,17 +1169,22 @@ type rExpr struct {
 	jbJson bool
 
 	// reJsonPathFn: which scalar jsonpath query function (jsonb_path_exists / _query_first /
-	// _query_array). Argument nodes are in `sargs` = [ctx jsonb, path jsonpath] (jsonpath.md §5).
+	// _query_array / _match, or the @? / @@ operator). Argument nodes are in `sargs` (jsonpath.md §5).
+	// jpTz marks a _tz form (rendered with its name).
 	jpFnKind jsonPathFnKind
+	jpTz     bool
 
 	// reJsonSqlFn: a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md
-	// §5, S2). `sargs` = [ctx, path]; `result`/`typmod` hold the RETURNING scalar type + decimal typmod.
-	// jsKind selects the function; jsWrapper/jsKeepQuotes/jsOnEmpty/jsOnError drive the result.
-	jsKind       jsonSqlKind
-	jsWrapper    jsonWrapper
-	jsKeepQuotes bool
-	jsOnEmpty    jsonOnBehavior
-	jsOnError    jsonOnBehavior
+	// §5, S2). `sargs` = [ctx, path, PASSING values…]; `result`/`typmod` hold the RETURNING scalar type
+	// + decimal typmod. jsKind selects the function; jsWrapper/jsKeepQuotes/jsOnEmpty/jsOnError drive
+	// the result; jsPassingNames are the PASSING variable names, in clause order (parallel to
+	// sargs[2:]).
+	jsPassingNames []string
+	jsKind         jsonSqlKind
+	jsWrapper      jsonWrapper
+	jsKeepQuotes   bool
+	jsOnEmpty      jsonOnBehavior
+	jsOnError      jsonOnBehavior
 
 	// reJsonSetInsert: which path mutation (jsonb_set vs jsonb_insert), and whether it is
 	// jsonb_set_lax. Argument nodes are in `sargs` = [target, path, value, flag (, treatment)]
@@ -1667,6 +1674,8 @@ type srfPlan struct {
 type jtPlan struct {
 	// rootPath is the compiled root jsonpath (its evaluation over `ctx` yields the row items).
 	rootPath string
+	// passingNames are the PASSING variable names; their values are the SRF's args after the context.
+	passingNames []string
 	// width is the total number of flattened output columns.
 	width int
 	// columns is the top-level column tree.

@@ -176,8 +176,15 @@ export type Expr =
   | { kind: "jsonCtor"; operand: Expr; uniqueKeys: boolean }
   // `JSON_EXISTS(ctx, path [behavior ON ERROR])` — the SQL/JSON existence predicate
   // (json-sql-functions.md §5, S2). The path is evaluated over the context item; a non-empty
-  // sequence → true. The default `ON ERROR` behavior is `FALSE`. `PASSING` (vars) is deferred.
-  | { kind: "jsonExists"; ctx: Expr; path: Expr; onError: JsonOnBehavior | null }
+  // sequence → true. The default `ON ERROR` behavior is `FALSE`. `passing` binds the path's `$name`
+  // variables (as do JSON_VALUE's and JSON_QUERY's).
+  | {
+      kind: "jsonExists";
+      ctx: Expr;
+      path: Expr;
+      passing: JsonPassing[];
+      onError: JsonOnBehavior | null;
+    }
   // `JSON_VALUE(ctx, path [RETURNING type] [ON EMPTY] [ON ERROR])` — extract a single SCALAR item,
   // coerced to the RETURNING type (default `text`). Empty → ON EMPTY (default NULL); a non-scalar /
   // >1 item / coercion failure → ON ERROR (default NULL). (json-sql-functions.md §5.)
@@ -185,6 +192,7 @@ export type Expr =
       kind: "jsonValue";
       ctx: Expr;
       path: Expr;
+      passing: JsonPassing[];
       returning: string | null;
       onEmpty: JsonOnBehavior | null;
       onError: JsonOnBehavior | null;
@@ -196,6 +204,7 @@ export type Expr =
       kind: "jsonQuery";
       ctx: Expr;
       path: Expr;
+      passing: JsonPassing[];
       returning: string | null;
       wrapper: JsonWrapper;
       keepQuotes: boolean;
@@ -988,6 +997,10 @@ export type TableRef = {
   db?: string;
   alias: string | null;
   args: Expr[] | null;
+  // The parameter names of a table function's arguments in PostgreSQL named notation (`name =>
+  // value`, grammar.md §17), one per argument (null for a positional one); undefined when every
+  // argument is positional.
+  argNames?: (string | null)[];
   subquery?: QueryExpr;
   values?: Expr[][];
   columnAliases?: string[];
@@ -1030,8 +1043,15 @@ export type TableRefPos = {
 export type JsonTable = {
   ctx: Expr;
   path: Expr;
+  passing: JsonPassing[];
   columns: JtColumn[];
 };
+
+// JsonPassing is one `PASSING value [FORMAT JSON] AS name` argument of a SQL/JSON query function or
+// `JSON_TABLE` (json-sql-functions.md §5.4): binds the path variable `$name` to the value.
+// `formatJson` records that `FORMAT JSON` was written (a character-string value is parsed as JSON
+// text).
+export type JsonPassing = { expr: Expr; formatJson: boolean; name: string };
 
 // JtColumn is one `JSON_TABLE` COLUMNS entry (json-table.md §3.3), a discriminated union over the
 // four column kinds.

@@ -11,9 +11,9 @@ use crate::ast::{
     CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete,
     DropIndex, DropSequence, DropTable, DropType, DropView, ExcludeDef, Expr, ForeignKeyDef,
     GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
-    JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
-    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select,
-    SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement,
+    JoinClause, JoinKind, JsonOnBehavior, JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper,
+    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause,
+    Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement,
     SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
     WindowDef, WithExpr, WithQuery,
 };
@@ -778,19 +778,14 @@ impl Parser {
         self.skip_format_json();
         self.expect(&Token::Comma)?;
         let path = self.parse_expr()?;
-        // `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
-        if self.peek_keyword().as_deref() == Some("passing") {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "JSON query function PASSING clause is not supported yet",
-            ));
-        }
+        let passing = self.parse_json_passing()?;
         let expr = match kw {
             "json_exists" => {
                 let on_error = self.parse_json_on_error_only()?;
                 Expr::JsonExists {
                     ctx: Box::new(ctx),
                     path: Box::new(path),
+                    passing,
                     on_error,
                 }
             }
@@ -800,6 +795,7 @@ impl Parser {
                 Expr::JsonValue {
                     ctx: Box::new(ctx),
                     path: Box::new(path),
+                    passing,
                     returning,
                     on_empty,
                     on_error,
@@ -812,6 +808,7 @@ impl Parser {
                 Expr::JsonQuery {
                     ctx: Box::new(ctx),
                     path: Box::new(path),
+                    passing,
                     returning,
                     wrapper,
                     keep_quotes,
@@ -1630,12 +1627,40 @@ impl Parser {
     /// `AS t(col type, …)` (C0, json-table.md §1). The caller has consumed the opening `(`; this
     /// consumes through the matching `)`. Each field is `name type [numeric(p,s)] [[]] [NOT NULL]`.
     /// Skip an optional `FORMAT JSON [ENCODING …]` clause after a SQL/JSON context item.
-    fn skip_format_json(&mut self) {
+    fn skip_format_json(&mut self) -> bool {
         if self.peek_keyword().as_deref() == Some("format")
             && self.peek_keyword_at(1).as_deref() == Some("json")
         {
             self.advance(); // FORMAT
             self.advance(); // JSON
+            return true;
+        }
+        false
+    }
+
+    /// Parse an optional `PASSING value [FORMAT JSON] AS name [, …]` clause of a SQL/JSON query
+    /// function or `JSON_TABLE` (json-sql-functions.md §5.4) → its arguments (empty when absent).
+    /// The name is any identifier, folded like one (`AS X` binds `$x`; `AS "X"` binds `$X`).
+    fn parse_json_passing(&mut self) -> Result<Vec<JsonPassing>> {
+        let mut passing = Vec::new();
+        if self.peek_keyword().as_deref() != Some("passing") {
+            return Ok(passing);
+        }
+        self.advance(); // PASSING
+        loop {
+            let expr = self.parse_expr()?;
+            let format_json = self.skip_format_json();
+            self.expect_keyword("as")?;
+            let name = self.expect_identifier()?;
+            passing.push(JsonPassing {
+                expr,
+                format_json,
+                name,
+            });
+            if !matches!(self.peek(), Token::Comma) {
+                return Ok(passing);
+            }
+            self.advance();
         }
     }
 
@@ -3559,6 +3584,9 @@ impl Parser {
         };
         // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT` — those
         // are aggregate/star forms, not an SRF argument list).
+        // An argument may be named (`name => value`, grammar.md §17); `arg_names` is `None` when
+        // every argument is positional.
+        let mut arg_names = None;
         let args = if matches!(self.peek(), Token::LParen) {
             if db.is_some() {
                 return Err(syntax(
@@ -3566,12 +3594,31 @@ impl Parser {
                 ));
             }
             self.advance();
-            let mut a = vec![self.parse_expr()?];
-            while matches!(self.peek(), Token::Comma) {
-                self.advance();
+            let mut a = Vec::new();
+            let mut names: Vec<Option<String>> = Vec::new();
+            loop {
+                let argname = if is_ident(self.peek()) && matches!(self.peek_at(1), Token::FatArrow)
+                {
+                    let nm = self.expect_identifier()?;
+                    self.expect(&Token::FatArrow)?;
+                    Some(nm)
+                } else if names.iter().any(Option::is_some) {
+                    // A positional argument may not follow a named one (PostgreSQL, 42601).
+                    return Err(syntax("positional argument cannot follow named argument"));
+                } else {
+                    None
+                };
                 a.push(self.parse_expr()?);
+                names.push(argname);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.advance();
             }
             self.expect(&Token::RParen)?;
+            if names.iter().any(Option::is_some) {
+                arg_names = Some(names);
+            }
             Some(a)
         } else {
             None
@@ -3640,6 +3687,7 @@ impl Parser {
             db,
             alias,
             args,
+            arg_names,
             subquery: None,
             values: None,
             column_aliases,
@@ -3765,6 +3813,7 @@ impl Parser {
             db: None,
             alias,
             args: None,
+            arg_names: None,
             subquery,
             values,
             column_aliases,
@@ -3791,12 +3840,7 @@ impl Parser {
             self.advance();
             self.expect_identifier()?;
         }
-        if self.peek_keyword().as_deref() == Some("passing") {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "JSON_TABLE PASSING clause is not supported yet",
-            ));
-        }
+        let passing = self.parse_json_passing()?;
         self.expect_keyword("columns")?;
         let columns = self.parse_jt_columns()?;
         // An explicit PLAN clause is the deferred T2 slice.
@@ -3831,6 +3875,7 @@ impl Parser {
             db: None,
             alias,
             args: None,
+            arg_names: None,
             subquery: None,
             values: None,
             column_aliases: None,
@@ -3838,6 +3883,7 @@ impl Parser {
             json_table: Some(Box::new(JsonTable {
                 ctx: Box::new(ctx),
                 path: Box::new(path),
+                passing,
                 columns,
             })),
             lateral: false,
@@ -6504,6 +6550,7 @@ fn group_outer_join_item(joins: &mut Vec<JoinClause>, seg: usize) {
             db: None,
             alias: None,
             args: None,
+            arg_names: None,
             subquery: Some(Box::new(body)),
             values: None,
             column_aliases: None,
@@ -6536,6 +6583,7 @@ fn values_query(
         db: None,
         alias: Some(VALUES_LABEL.to_string()),
         args: None,
+        arg_names: None,
         subquery: None,
         values: Some(rows),
         column_aliases: None,

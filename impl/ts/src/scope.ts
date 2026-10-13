@@ -102,6 +102,7 @@ import { requireSetopEquality, unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
 import { render, renderFloat } from "./value.ts";
 import { storeValue } from "./store.ts";
+import { quoteIdentifier } from "./parser.ts";
 import type { Privilege } from "./privileges.ts";
 import type { TableStore } from "./storage.ts";
 import type { ViewWrite, WriteLayer } from "./view_write.ts";
@@ -1264,7 +1265,11 @@ export function countSelfRefsExpr(e: Expr, name: string): number {
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
-      return countSelfRefsExpr(e.ctx, name) + countSelfRefsExpr(e.path, name);
+      return (
+        countSelfRefsExpr(e.ctx, name) +
+        countSelfRefsExpr(e.path, name) +
+        e.passing.reduce((n, p) => n + countSelfRefsExpr(p.expr, name), 0)
+      );
     case "binary":
     case "isDistinct":
     case "like":
@@ -2044,7 +2049,9 @@ export function tableRefCallsSeqMutator(t: TableRef): boolean {
     (t.subquery !== undefined && queryCallsSeqMutator(t.subquery)) ||
     (t.values?.some((row) => row.some(exprCallsSeqMutator)) ?? false) ||
     (t.jsonTable !== undefined &&
-      (exprCallsSeqMutator(t.jsonTable.ctx) || exprCallsSeqMutator(t.jsonTable.path)))
+      (exprCallsSeqMutator(t.jsonTable.ctx) ||
+        exprCallsSeqMutator(t.jsonTable.path) ||
+        t.jsonTable.passing.some((p) => exprCallsSeqMutator(p.expr))))
   );
 }
 
@@ -2103,7 +2110,11 @@ export function exprCallsSeqMutator(e: Expr): boolean {
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
-      return exprCallsSeqMutator(e.ctx) || exprCallsSeqMutator(e.path);
+      return (
+        exprCallsSeqMutator(e.ctx) ||
+        exprCallsSeqMutator(e.path) ||
+        e.passing.some((p) => exprCallsSeqMutator(p.expr))
+      );
     case "binary":
     case "isDistinct":
     case "like":
@@ -2354,9 +2365,10 @@ export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<stri
     for (const row of t.values) for (const e of row) collectExprPrivs(e, req, locals);
   } else if (t.jsonTable !== undefined) {
     // JSON_TABLE is syntax, not a named function or a table: its name is only the row source's
-    // label. The context item and path are expressions (json-table.md).
+    // label. The context item, path, and PASSING values are expressions (json-table.md).
     collectExprPrivs(t.jsonTable.ctx, req, locals);
     collectExprPrivs(t.jsonTable.path, req, locals);
+    for (const p of t.jsonTable.passing) collectExprPrivs(p.expr, req, locals);
   } else if (t.db !== undefined || !locals.has(t.name)) {
     // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified name
     // never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
@@ -2447,6 +2459,7 @@ export function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): vo
     case "jsonQuery":
       collectExprPrivs(e.ctx, req, locals);
       collectExprPrivs(e.path, req, locals);
+      for (const p of e.passing) collectExprPrivs(p.expr, req, locals);
       break;
     case "binary":
     case "isDistinct":
@@ -2541,7 +2554,11 @@ export function exprReadsColumns(e: Expr): boolean {
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
-      return exprReadsColumns(e.ctx) || exprReadsColumns(e.path);
+      return (
+        exprReadsColumns(e.ctx) ||
+        exprReadsColumns(e.path) ||
+        e.passing.some((p) => exprReadsColumns(p.expr))
+      );
     case "funcCall":
       return e.args.some(exprReadsColumns);
     case "binary":
@@ -3043,8 +3060,8 @@ export function renderRExpr(e: RExpr): string {
       return explainCall(`range_${camelToSnake(e.op)}`, e.args);
     case "variadic":
       return explainCall(e.func, e.args);
-    case "jsonPathFn":
-      return explainCall(
+    case "jsonPathFn": {
+      const name =
         e.pathFnKind === "exists"
           ? "jsonb_path_exists"
           : e.pathFnKind === "existsSilent"
@@ -3055,9 +3072,9 @@ export function renderRExpr(e: RExpr): string {
                 ? "jsonb_path_query_array"
                 : e.pathFnKind === "match"
                   ? "jsonb_path_match"
-                  : "jsonb_path_match_silent",
-        e.args,
-      );
+                  : "jsonb_path_match_silent";
+      return explainCall(e.tz ? name + "_tz" : name, e.args);
+    }
     case "jsonSqlFn":
       return renderExplainJsonSql(e);
     case "jsonObjectFromArrays":
@@ -3092,6 +3109,10 @@ export function renderRExpr(e: RExpr): string {
 
 function renderExplainJsonSql(e: Extract<RExpr, { kind: "jsonSqlFn" }>): string {
   let out = `json_${e.sqlKind}(${renderRExpr(e.args[0]!)}, ${renderRExpr(e.args[1]!)}`;
+  for (let i = 0; i < e.passingNames.length; i++) {
+    out += i === 0 ? " passing " : ", ";
+    out += `${renderRExpr(e.args[2 + i]!)} as ${quoteIdentifier(e.passingNames[i]!)}`;
+  }
   if (e.sqlKind === "exists") {
     out += ` ${explainJsonBehavior(e.onError)} on error`;
   } else if (e.sqlKind === "value") {

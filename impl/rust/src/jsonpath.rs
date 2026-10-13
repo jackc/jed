@@ -4,8 +4,9 @@
 //! `last` inside a subscript, or a parenthesized expression or predicate) followed by accessor steps
 //! (`.key`, `.*`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the item
 //! methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
-//! Still deferred (a valid-PG path using one → `0A000` at compile): `like_regex` / `starts with` /
-//! `is unknown` / `exists` predicates, `$name` variables, `.**`, and the datetime methods. A
+//! Path variables (`$name`, `$"name"`) are bound by the caller's [`Vars`]. Still deferred (a valid-PG
+//! path using one → `0A000` at compile): `like_regex` / `starts with` / `is unknown` / `exists`
+//! predicates, `.**`, and the datetime methods. A
 //! malformed path is `42601`. The compiled program is a pure function of the source — kept
 //! byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
 //! codegenned).
@@ -58,6 +59,8 @@ pub enum Primary {
     /// `last` — the index of the innermost subscripted array's last element (subscript expressions
     /// only).
     Last,
+    /// `$name` / `$"name"` — a path variable, bound by the caller's [`Vars`] (§5).
+    Var(String),
     /// `+e` / `-e` — unary arithmetic over each item of `e` (§3.2).
     Unary(UnaryOp, Box<PathExpr>),
     /// `l op r` — binary arithmetic over two singleton numbers (§3.2).
@@ -304,6 +307,10 @@ fn write_expr(e: &PathExpr, brackets: bool, out: &mut String) {
         Primary::Root => out.push('$'),
         Primary::Current => out.push('@'),
         Primary::Last => out.push_str("last"),
+        Primary::Var(name) => {
+            out.push('$');
+            write_quoted(name, out);
+        }
         Primary::Lit(n @ JsonNode::Number(_)) if !e.steps.is_empty() => {
             out.push('(');
             out.push_str(&crate::json::json_compact_out(n));
@@ -442,14 +449,82 @@ fn write_pred(pred: &Pred, brackets: bool, out: &mut String) {
 
 /// How a caller consumes the sequence (jsonpath.md §5).
 #[derive(Clone, Copy, Debug)]
-pub struct EvalOpts {
+pub struct EvalOpts<'d> {
     /// An existence test (`jsonb_path_exists`, `@?`, `JSON_EXISTS`): a lax path stops at its first
     /// item, so a later item's error is never reached. A strict path evaluates fully (§4.2).
     pub exists: bool,
-    /// How many variable base objects the caller supplies (PostgreSQL counts one for the
-    /// `jsonb_path_*` functions' `vars` argument, none for the operators and the SQL/JSON query
-    /// functions). The first `.keyvalue()` object is numbered one past them (§3.1).
-    pub vars: i64,
+    /// The variables the path's `$name` references read (§5).
+    pub vars: Vars<'d>,
+}
+
+/// The variables a path's `$name` references are bound to (jsonpath.md §5), and the variable base
+/// objects they count for `.keyvalue()` ids (§3.1).
+#[derive(Clone, Copy, Debug)]
+pub enum Vars<'d> {
+    /// No variables: the `@?` / `@@` operators. Counts no base object.
+    None,
+    /// The `jsonb_path_*` functions' `vars` object (already checked to be an object by
+    /// [`check_vars_object`]). It is one base object, number 1.
+    Object(&'d JsonNode),
+    /// The SQL/JSON functions' `PASSING` values, as [`passing_vars`] orders them. Each is a base
+    /// object numbered by its position in the clause; `count` is the clause's length.
+    Passing { vars: &'d [PassingVar], count: i64 },
+}
+
+impl Vars<'_> {
+    /// How many variable base objects the caller supplies (PostgreSQL's `countVars`): the first
+    /// `.keyvalue()` object is numbered one past them.
+    fn count(&self) -> i64 {
+        match self {
+            Vars::None => 0,
+            Vars::Object(_) => 1,
+            Vars::Passing { count, .. } => *count,
+        }
+    }
+}
+
+/// One `PASSING value AS name` binding (jsonpath.md §5): the value as a `jsonb` item and its base
+/// object number (its 1-based position in the clause).
+#[derive(Clone, Debug)]
+pub struct PassingVar {
+    pub name: String,
+    pub value: JsonNode,
+    pub id: i64,
+}
+
+/// Order a `PASSING` clause's bindings for lookup: sorted by name, and of two bindings with the same
+/// name only the first kept, as PostgreSQL's lookup finds the first. Each keeps its clause position
+/// as its base object number.
+pub fn passing_vars(bindings: Vec<(String, JsonNode)>) -> Vec<PassingVar> {
+    let mut vars: Vec<PassingVar> = bindings
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, value))| PassingVar {
+            name,
+            value,
+            id: i as i64 + 1,
+        })
+        .collect();
+    // A stable sort keeps the first of equal names first.
+    vars.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    vars.dedup_by(|later, first| later.name == first.name);
+    vars
+}
+
+/// Check a `jsonb_path_*` function's `vars` argument (PostgreSQL's `countVariablesFromJsonb`): it
+/// must be an object, else `22023`. Checked before evaluation, so it is raised even when the path
+/// uses no variable and even in silent mode.
+pub fn check_vars_object(vars: &JsonNode) -> Result<()> {
+    if matches!(vars, JsonNode::Object(_)) {
+        return Ok(());
+    }
+    Err(EngineError::new(
+        SqlState::InvalidParameterValue,
+        "\"vars\" argument is not an object",
+    )
+    .with_detail(Some(
+        "Jsonpath parameters should be encoded as key-value pairs of \"vars\" object.".to_string(),
+    )))
 }
 
 /// Compile a path for evaluation, charging `jsonpath_compile` for each source byte first
@@ -468,7 +543,7 @@ pub fn compile_metered(src: &str, m: &mut Meter) -> Result<JsonPath> {
 pub fn eval<'d>(
     path: &JsonPath,
     ctx: &'d JsonNode,
-    opts: EvalOpts,
+    opts: EvalOpts<'d>,
     m: &mut Meter,
 ) -> Result<Vec<Cow<'d, JsonNode>>> {
     let mut items = Vec::new();
@@ -481,7 +556,7 @@ pub fn eval<'d>(
 pub fn eval_silent<'d>(
     path: &JsonPath,
     ctx: &'d JsonNode,
-    opts: EvalOpts,
+    opts: EvalOpts<'d>,
     m: &mut Meter,
 ) -> Result<(Vec<Cow<'d, JsonNode>>, bool)> {
     let mut items = Vec::new();
@@ -502,16 +577,18 @@ fn is_soft(e: &EngineError) -> bool {
 fn eval_items<'d>(
     path: &JsonPath,
     ctx: &'d JsonNode,
-    opts: EvalOpts,
+    opts: EvalOpts<'d>,
     m: &mut Meter,
     out: &mut Vec<Item<'d>>,
 ) -> Result<()> {
     let mut cx = Ctx {
         root: ctx,
+        vars: opts.vars,
         strict: path.strict,
         m,
-        next_gen: 1 + opts.vars,
-        root_offsets: None,
+        next_gen: 1 + opts.vars.count(),
+        offsets: HashMap::new(),
+        laid_out: Vec::new(),
     };
     match &path.body {
         // `@` is not allowed outside a filter, so the root expression's current item is unused.
@@ -599,23 +676,33 @@ impl<'d> Item<'d> {
 }
 
 /// The base object a `.keyvalue()` id is measured against (jsonpath.md §3.1): the context item
-/// while a `$` path runs, or the `.keyvalue()` object whose continuation is running.
+/// while a `$` path runs, the variable base object while a `$name` path runs, or the `.keyvalue()`
+/// object whose continuation is running.
 #[derive(Clone, Debug)]
 enum Base<'d> {
     Root,
+    /// A variable's base object: the `vars` object (number 1) or a `PASSING` value (its position).
+    Var {
+        tree: &'d JsonNode,
+        id: i64,
+    },
     Kv(Rc<KvPair<'d>>),
 }
 
 /// The evaluation context shared by a path and the filter operands nested in it.
 struct Ctx<'d, 'm> {
     root: &'d JsonNode,
+    vars: Vars<'d>,
     strict: bool,
     m: &'m mut Meter,
     /// The next `.keyvalue()` object number, assigned in evaluation order.
     next_gen: i64,
-    /// Each document container's byte offset in PostgreSQL's binary jsonb layout, computed on the
-    /// first `.keyvalue()` that needs one.
-    root_offsets: Option<HashMap<*const JsonNode, i64>>,
+    /// Each container's byte offset in PostgreSQL's binary jsonb layout of its base object (the
+    /// document or a variable's), computed for a base object on the first `.keyvalue()` that needs
+    /// one.
+    offsets: HashMap<*const JsonNode, i64>,
+    /// The base objects laid out into `offsets` so far.
+    laid_out: Vec<*const JsonNode>,
 }
 
 impl Ctx<'_, '_> {
@@ -818,6 +905,7 @@ fn head_next<'d>(
         Primary::Root => (Item::Doc(cx.root), Base::Root),
         Primary::Current => (current.clone(), base.clone()),
         Primary::Lit(n) => (Item::Val(n.clone()), base.clone()),
+        Primary::Var(name) => variable(cx, name)?,
         Primary::Last => (
             Item::Val(JsonNode::Number(Decimal::from_i64(last.unwrap_or(0) - 1))),
             base.clone(),
@@ -1637,27 +1725,36 @@ fn parse_bool(s: &str) -> Option<bool> {
 // ---------------------------------------------------------------------------------------------
 
 /// The id of a `.keyvalue()` object: `10^10 × base number + the object's byte offset inside the base
-/// object`, where the base is the context item (number 0) or the `.keyvalue()` object whose
-/// continuation is running. PostgreSQL measures the offset in its binary jsonb layout, which is a
-/// pure function of the value, so jed computes the same layout arithmetically.
+/// object`, where the base is the context item (number 0), a variable's base object (§5), or the
+/// `.keyvalue()` object whose continuation is running. PostgreSQL measures the offset in its binary
+/// jsonb layout, which is a pure function of the value, so jed computes the same layout
+/// arithmetically.
 fn keyvalue_id<'d>(cx: &mut Ctx<'d, '_>, item: &Item<'d>, base: &Base<'d>) -> i64 {
     const BASE_STRIDE: i64 = 10_000_000_000;
     match base {
         Base::Root => match item {
-            Item::Doc(n) => root_offset(cx, n),
+            Item::Doc(n) => tree_offset(cx, cx.root, n),
             _ => 0,
         },
+        Base::Var { tree, id } => {
+            let offset = match item {
+                Item::Doc(n) => tree_offset(cx, tree, n),
+                _ => 0,
+            };
+            id * BASE_STRIDE + offset
+        }
         Base::Kv(kv) => {
             let offset = match (item, &kv.value) {
                 (Item::Kv(k), _) if Rc::ptr_eq(k, kv) => 0,
                 // A container inside the pair's value: the value's offset in the pair object plus
                 // the container's offset inside the value (both are 4-byte aligned, so the value's
-                // internal layout does not depend on where it sits).
+                // internal layout does not depend on where it sits). The value's base object was
+                // laid out when the `.keyvalue()` that made the pair numbered it.
                 (Item::Doc(n), Item::Doc(v)) => {
                     let value_at = align4(
                         40 + pg_numeric_size(&Decimal::from_i64(kv.id)) + kv.key.len() as i64,
                     );
-                    value_at + root_offset(cx, n) - root_offset(cx, v)
+                    value_at + laid_out_offset(cx, n) - laid_out_offset(cx, v)
                 }
                 _ => 0,
             };
@@ -1666,15 +1763,60 @@ fn keyvalue_id<'d>(cx: &mut Ctx<'d, '_>, item: &Item<'d>, base: &Base<'d>) -> i6
     }
 }
 
-/// A document container's offset in the context item's binary layout.
-fn root_offset(cx: &mut Ctx<'_, '_>, n: &JsonNode) -> i64 {
-    let root = cx.root;
-    let map = cx.root_offsets.get_or_insert_with(|| {
-        let mut map = HashMap::new();
-        pg_layout(root, 0, &mut map);
-        map
-    });
-    map.get(&(n as *const JsonNode)).copied().unwrap_or(0)
+/// A container's offset in the binary layout of the base object `tree` that holds it, laying the
+/// base object out first if no `.keyvalue()` has yet.
+fn tree_offset(cx: &mut Ctx<'_, '_>, tree: &JsonNode, n: &JsonNode) -> i64 {
+    let key = tree as *const JsonNode;
+    if !cx.laid_out.contains(&key) {
+        cx.laid_out.push(key);
+        pg_layout(tree, 0, &mut cx.offsets);
+    }
+    laid_out_offset(cx, n)
+}
+
+/// A container's offset in its already laid-out base object.
+fn laid_out_offset(cx: &Ctx<'_, '_>, n: &JsonNode) -> i64 {
+    cx.offsets
+        .get(&(n as *const JsonNode))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The value of the path variable `$name` with the base object its continuation runs under
+/// (PostgreSQL's `getJsonPathVariable`): a member of the `vars` object, found by a binary search of
+/// its canonical key order, or the first `PASSING` binding of that name. A name with no binding is
+/// `42704`, which neither lax mode, silent mode, nor a comparison operand suppresses.
+fn variable<'d>(cx: &Ctx<'d, '_>, name: &str) -> Result<(Item<'d>, Base<'d>)> {
+    let found = match cx.vars {
+        Vars::None => None,
+        Vars::Object(tree) => match tree {
+            JsonNode::Object(members) => members
+                .binary_search_by(|(k, _)| crate::json::key_cmp(k, name))
+                .ok()
+                .map(|i| (&members[i].1, Base::Var { tree, id: 1 })),
+            _ => None,
+        },
+        Vars::Passing { vars, .. } => vars
+            .binary_search_by(|v| v.name.as_bytes().cmp(name.as_bytes()))
+            .ok()
+            .map(|i| {
+                let v = &vars[i];
+                (
+                    &v.value,
+                    Base::Var {
+                        tree: &v.value,
+                        id: v.id,
+                    },
+                )
+            }),
+    };
+    match found {
+        Some((node, base)) => Ok((Item::Doc(node), base)),
+        None => Err(EngineError::new(
+            SqlState::UndefinedObject,
+            format!("could not find jsonpath variable \"{name}\""),
+        )),
+    }
 }
 
 fn align4(off: i64) -> i64 {
@@ -2209,17 +2351,24 @@ impl Parser<'_> {
         let primary = match self.peek() {
             Some(b'$') => {
                 self.i += 1;
-                // `$name` / `$"name"` — a path variable — is a deferred follow-on (the `vars`
-                // surface). PostgreSQL's unquoted variable name is a run of `other` bytes (no escapes).
+                // `$"name"` / `$name` — a path variable. PostgreSQL's unquoted variable name is a run
+                // of `other` bytes (no escapes); a quoted one takes the string escapes (§2.1).
                 match self.peek() {
-                    Some(b'"') => {
-                        self.parse_quoted()?;
-                        return Err(unsupported("path variables `$name`"));
+                    Some(b'"') => Primary::Var(self.parse_quoted()?),
+                    Some(c) if is_other(c) => {
+                        let start = self.i;
+                        while self.peek().is_some_and(is_other) {
+                            self.i += 1;
+                        }
+                        // A run of `other` bytes never splits a UTF-8 sequence (every non-ASCII
+                        // byte is one), so the slice is valid UTF-8.
+                        Primary::Var(
+                            String::from_utf8(self.s[start..self.i].to_vec())
+                                .expect("a run of other bytes is whole UTF-8 characters"),
+                        )
                     }
-                    Some(c) if is_other(c) => return Err(unsupported("path variables `$name`")),
-                    _ => {}
+                    _ => Primary::Root,
                 }
-                Primary::Root
             }
             Some(b'@') => {
                 if self.in_filter == 0 {

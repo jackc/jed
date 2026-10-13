@@ -177,23 +177,25 @@ pub(crate) fn resolve_func_call(
         }
         return resolve_json_object(scope, &lname, lname == "json_object", args, agg, params);
     }
-    // The scalar jsonpath query functions (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. Hand-
-    // resolved (the jsonpath arg + adapting-literal are outside the catalog family mold).
-    if let Some(kind) = match lname.as_str() {
+    // The scalar jsonpath query functions (P2, jsonpath.md §5): `(target jsonb, path jsonpath
+    // [, vars jsonb [, silent boolean]])` and their `_tz` forms. Hand-resolved (the jsonpath arg +
+    // adapting-literal are outside the catalog family mold).
+    let base = lname.strip_suffix("_tz").unwrap_or(&lname);
+    if let Some(kind) = match base {
         "jsonb_path_exists" => Some(JsonPathFnKind::Exists),
         "jsonb_path_query_first" => Some(JsonPathFnKind::QueryFirst),
         "jsonb_path_query_array" => Some(JsonPathFnKind::QueryArray),
         "jsonb_path_match" => Some(JsonPathFnKind::Match),
         _ => None,
     } {
-        reject_named(&lname, arg_names)?;
         if star {
             return Err(EngineError::new(
                 SqlState::SyntaxError,
                 "* is only valid as the argument of COUNT",
             ));
         }
-        return resolve_jsonpath_fn(scope, &lname, kind, args, agg, params);
+        let tz = base.len() != lname.len();
+        return resolve_jsonpath_fn(scope, &lname, kind, tz, args, arg_names, agg, params);
     }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -1970,14 +1972,19 @@ fn explain_json_has_key(kind: HasKeyKind) -> &'static str {
     }
 }
 
-fn explain_jsonpath_func(kind: JsonPathFnKind) -> &'static str {
-    match kind {
+fn explain_jsonpath_func(kind: JsonPathFnKind, tz: bool) -> String {
+    let name = match kind {
         JsonPathFnKind::Exists => "jsonb_path_exists",
         JsonPathFnKind::ExistsSilent => "jsonb_path_exists_silent",
         JsonPathFnKind::QueryFirst => "jsonb_path_query_first",
         JsonPathFnKind::QueryArray => "jsonb_path_query_array",
         JsonPathFnKind::Match => "jsonb_path_match",
         JsonPathFnKind::MatchSilent => "jsonb_path_match_silent",
+    };
+    if tz {
+        format!("{name}_tz")
+    } else {
+        name.to_string()
     }
 }
 
@@ -1994,6 +2001,8 @@ fn render_explain_json_sql(
     kind: JsonSqlKind,
     ctx: &RExpr,
     path: &RExpr,
+    passing: &[RExpr],
+    passing_names: &[String],
     returning: ScalarType,
     decimal: Option<&DecimalTypmod>,
     wrapper: JsonWrapper,
@@ -2006,6 +2015,12 @@ fn render_explain_json_sql(
         render_rexpr(ctx),
         render_rexpr(path)
     );
+    for (i, (value, name)) in passing.iter().zip(passing_names).enumerate() {
+        out.push_str(if i == 0 { " passing " } else { ", " });
+        out.push_str(&render_rexpr(value));
+        out.push_str(" as ");
+        out.push_str(&crate::parser::quote_identifier(name));
+    }
     match kind {
         JsonSqlKind::Exists => {
             out.push_str(&format!(" {} on error", explain_json_behavior(on_error)));
@@ -2199,11 +2214,15 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             },
             args,
         ),
-        RExpr::JsonPathFn { kind, args } => explain_call(explain_jsonpath_func(*kind), args),
+        RExpr::JsonPathFn { kind, tz, args } => {
+            explain_call(&explain_jsonpath_func(*kind, *tz), args)
+        }
         RExpr::JsonSqlFn {
             kind,
             ctx,
             path,
+            passing,
+            passing_names,
             returning,
             decimal,
             wrapper,
@@ -2213,6 +2232,8 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             *kind,
             ctx,
             path,
+            passing,
+            passing_names,
             *returning,
             decimal.as_ref(),
             *wrapper,
@@ -2798,9 +2819,11 @@ pub(crate) fn table_ref_calls(t: &TableRef) -> bool {
         || t.values
             .as_ref()
             .is_some_and(|rows| rows.iter().flatten().any(expr_calls_seq_mutator))
-        || t.json_table
-            .as_ref()
-            .is_some_and(|jt| expr_calls_seq_mutator(&jt.ctx) || expr_calls_seq_mutator(&jt.path))
+        || t.json_table.as_ref().is_some_and(|jt| {
+            expr_calls_seq_mutator(&jt.ctx)
+                || expr_calls_seq_mutator(&jt.path)
+                || jt.passing.iter().any(|p| expr_calls_seq_mutator(&p.expr))
+        })
 }
 
 /// Exhaustive over `Expr` (the compiler enforces it): true iff the tree contains a sequence-
@@ -2853,10 +2876,18 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_calls_seq_mutator(operand),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => {
-            expr_calls_seq_mutator(ctx) || expr_calls_seq_mutator(path)
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
+            expr_calls_seq_mutator(ctx)
+                || expr_calls_seq_mutator(path)
+                || passing.iter().any(|p| expr_calls_seq_mutator(&p.expr))
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -3177,9 +3208,12 @@ pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &
         }
     } else if let Some(jt) = &t.json_table {
         // JSON_TABLE is syntax, not a named function or a table: its name is only the row source's
-        // label. The context item and path are expressions (json-table.md).
+        // label. The context item, path, and PASSING values are expressions (json-table.md).
         collect_expr_privs(&jt.ctx, req, locals);
         collect_expr_privs(&jt.path, req, locals);
+        for p in &jt.passing {
+            collect_expr_privs(&p.expr, req, locals);
+        }
     } else if t.db.is_some() || !locals.contains(&t.name.to_string()) {
         // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified
         // name never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
@@ -3292,11 +3326,20 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => collect_expr_privs(operand, req, locals),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => {
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
             collect_expr_privs(ctx, req, locals);
             collect_expr_privs(path, req, locals);
+            for p in passing {
+                collect_expr_privs(&p.expr, req, locals);
+            }
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -3385,9 +3428,19 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
         Expr::IsNull { operand, .. }
         | Expr::IsJson { operand, .. }
         | Expr::JsonCtor { operand, .. } => expr_reads_columns(operand),
-        Expr::JsonExists { ctx, path, .. }
-        | Expr::JsonValue { ctx, path, .. }
-        | Expr::JsonQuery { ctx, path, .. } => expr_reads_columns(ctx) || expr_reads_columns(path),
+        Expr::JsonExists {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonValue {
+            ctx, path, passing, ..
+        }
+        | Expr::JsonQuery {
+            ctx, path, passing, ..
+        } => {
+            expr_reads_columns(ctx)
+                || expr_reads_columns(path)
+                || passing.iter().any(|p| expr_reads_columns(&p.expr))
+        }
         Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -5077,12 +5130,14 @@ fn resolve_node(
         Expr::JsonExists {
             ctx,
             path,
+            passing,
             on_error,
         } => resolve_json_sql_fn(
             scope,
             JsonSqlKind::Exists,
             ctx,
             path,
+            passing,
             &None,
             JsonWrapper::Without,
             true,
@@ -5094,6 +5149,7 @@ fn resolve_node(
         Expr::JsonValue {
             ctx,
             path,
+            passing,
             returning,
             on_empty,
             on_error,
@@ -5102,6 +5158,7 @@ fn resolve_node(
             JsonSqlKind::Value,
             ctx,
             path,
+            passing,
             returning,
             JsonWrapper::Without,
             true,
@@ -5113,6 +5170,7 @@ fn resolve_node(
         Expr::JsonQuery {
             ctx,
             path,
+            passing,
             returning,
             wrapper,
             keep_quotes,
@@ -5123,6 +5181,7 @@ fn resolve_node(
             JsonSqlKind::Query,
             ctx,
             path,
+            passing,
             returning,
             *wrapper,
             *keep_quotes,

@@ -15,9 +15,9 @@
 > live `postgres:18` oracle; the lax/strict edge cases (§4) are subtle and oracle-pinned.
 
 > **Status: landed in part.** The type, the structural accessors, filters, top-level predicates,
-> the query functions and operators, the item methods (except the datetime family), and arithmetic
-> with parenthesized expressions are implemented in all three cores; §9 lists what remains deferred
-> (`0A000`).
+> the query functions (with their `vars` / `silent` arguments and `_tz` forms) and operators, the
+> item methods (except the datetime family), arithmetic with parenthesized expressions, and path
+> variables are implemented in all three cores; §9 lists what remains deferred (`0A000`).
 
 ---
 
@@ -171,7 +171,10 @@ ASCII-case-insensitively except `null`, `true`, and `false`, which are lowercase
 (PostgreSQL's `key_name`), and a method keyword followed by `(` is an item method (§2). Elsewhere a
 name is valid only as a keyword the grammar expects there; any other (`abc`, `$ ? (@ == abc)`,
 `$.a is unknown`) is a syntax error (`42601`). An unquoted variable name (`$name`) is a run of the same
-characters without escapes; variables themselves are deferred (§5).
+characters without escapes, so a special character ends it (`$a.b` is `$a` then `.b`, `$a$b` a syntax
+error) while a digit or non-ASCII character does not (`$1abc`, `$é`); a quoted one (`$"a b"`) takes the
+§2.1 escapes. A `$` followed by anything else is the root. A variable renders as `$` and its name
+quoted like a member key (`$x` is `$"x"`).
 
 PostgreSQL's scanner also skips C-style `/* … */` comments between tokens. jed does not lex them
 yet, a follow-on.
@@ -269,11 +272,14 @@ integers (`"0x10".bigint()` is `16`), and its `float8in` accepts glibc's hex flo
 
 **`.keyvalue()` ids.** `"id"` identifies the object a pair came from: PostgreSQL computes
 `10^10 × base + offset`, where `offset` is the object's byte offset inside its *base object* in
-PostgreSQL's binary jsonb layout. The base is the context item (number 0) while a `$` path runs,
-and the `.keyvalue()` object whose continuation is running for anything reached through one.
-`.keyvalue()` objects are numbered in evaluation order (depth-first, §3), starting one past the
-variable base objects the caller supplies: 2 for the `jsonb_path_*` functions (their default
-`vars` object counts as one), 1 for `@?`/`@@` and the SQL/JSON functions. The layout is a pure
+PostgreSQL's binary jsonb layout. The base is the context item (number 0) while a `$` path runs, a
+variable's base object while a `$name` path runs (§5: the whole `vars` object, number 1, or the
+`PASSING` value itself, numbered by its position in the clause), and the `.keyvalue()` object whose
+continuation is running for anything reached through one. `.keyvalue()` objects are numbered in
+evaluation order (depth-first, §3), starting one past the variable base objects the caller
+supplies: 2 for the `jsonb_path_*` functions (their `vars` object counts as one, given or
+defaulted), 1 for `@?`/`@@`, and one past the number of `PASSING` values for the SQL/JSON functions
+and `JSON_TABLE`. The layout is a pure
 function of the value, so jed computes it arithmetically: a container starts 4-byte aligned with a
 4-byte header and one 4-byte entry per array element (two per object member), then the members'
 key bytes, then the element/value data; a string takes its UTF-8 bytes, `null`/`true`/`false` take
@@ -370,8 +376,9 @@ as-is).
 **Silent mode** is **orthogonal**: it suppresses the SQL/JSON (class `22`) errors that remain,
 ending the evaluation at the first one. `@?` then returns SQL NULL; `@@` decides on the items found
 before the error (`'[true, "x"]'::jsonb @@ '$[*].boolean()'` is true). Filter operands are always
-evaluated silently (§4.4 rule 1). A cost, budget, or cancellation error is never suppressed. The
-`silent` argument of the query functions (§5) is still deferred.
+evaluated silently (§4.4 rule 1). A cost, budget, or cancellation error is never suppressed, nor is
+a missing variable (`42704`) or a non-object `vars` argument (`22023`, §5), which are not SQL/JSON
+errors. The query functions' `silent => true` argument (§5) selects the same mode.
 
 ### 4.3 `like_regex` onto the Pike VM
 
@@ -425,24 +432,38 @@ path's items, unwrapped one level in lax — §4.1 rule 4 — or a single litera
 
 ## 5. Path query functions
 
-The catalog plan ([../functions/catalog.toml](../functions/catalog.toml)): five functions
-(one set-returning) + their `_tz` variants, plus two operators (§6). All take a `jsonb`
-context, a `jsonpath`, and optional `vars jsonb` + `silent boolean` trailing arguments
-(the existing `arg_defaults` / named-notation facility; `silent` defaults `false`).
+Five functions (one set-returning) + their `_tz` variants (§5.1), plus two operators (§6). Each
+takes PostgreSQL's parameters `(target jsonb, path jsonpath, vars jsonb DEFAULT '{}', silent boolean
+DEFAULT false)`, positionally or in named notation (`vars => …`, `silent => …`, grammar.md §17; in
+`FROM` too for the set-returning form, grammar.md §35). They are hand-resolved, like `jsonb_set_lax`,
+rather than catalog rows, so the defaults are filled at resolve. All are STRICT: a NULL argument
+(including `vars` or `silent`) is SQL NULL, or no rows.
 
 | function | kind | result | semantics |
 |---|---|---|---|
-| `jsonb_path_exists(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence non-empty |
-| `jsonb_path_match(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence must be a single boolean, or a single JSON `null` → SQL NULL (`22038` otherwise unless silent) |
-| `jsonb_path_query(jsonb, jsonpath [, vars, silent])` | **SRF** | setof `jsonb` | one row per sequence item |
-| `jsonb_path_query_array(jsonb, jsonpath [, vars, silent])` | scalar | `jsonb` | wrap the sequence in a JSON array |
-| `jsonb_path_query_first(jsonb, jsonpath [, vars, silent])` | scalar | `jsonb` | first item, or NULL if empty |
+| `jsonb_path_exists(target, path [, vars [, silent]])` | scalar | `boolean` | sequence non-empty |
+| `jsonb_path_match(target, path [, vars [, silent]])` | scalar | `boolean` | sequence must be a single boolean, or a single JSON `null` → SQL NULL (`22038` otherwise unless silent) |
+| `jsonb_path_query(target, path [, vars [, silent]])` | **SRF** | setof `jsonb` | one row per sequence item |
+| `jsonb_path_query_array(target, path [, vars [, silent]])` | scalar | `jsonb` | wrap the sequence in a JSON array |
+| `jsonb_path_query_first(target, path [, vars [, silent]])` | scalar | `jsonb` | first item, or NULL if empty |
 
-- **`vars`** — a `jsonb` object whose members bind the path's `$name` variables (substituted
-  as literal items during evaluation). Deferred; the default `{}` object still counts as one base
-  object for `.keyvalue()` numbering (§3.1).
-- **`silent`** — suppress the errors that strict mode / singleton checks would raise,
-  returning NULL/false/empty (§4.2). Deferred; the `@?`/`@@` operators are the silent forms.
+- **`vars`** — a `jsonb` object whose members bind the path's `$name` variables: `$x` reads member
+  `x` (names are case-sensitive; `$"a b"` reads `a b`). A variable's value is an item like the
+  context item — lax unwraps an array value, `.keyvalue()` numbers it against the `vars` object
+  (§3.1). It must be an object: anything else is **`22023`** `"vars" argument is not an object`
+  (Detail `Jsonpath parameters should be encoded as key-value pairs of "vars" object.`), raised before
+  evaluation, so even when the path uses no variable and in silent mode. A variable with no member is
+  **`42704`** `could not find jsonpath variable "x"` when evaluation reaches it; it is not a SQL/JSON
+  error, so neither lax mode, silent mode, nor a filter operand (§4.4) suppresses it. The operators
+  have no `vars`: any variable is `42704`.
+- **`silent`** — `true` evaluates in silent mode (§4.2): the evaluation ends at the first SQL/JSON
+  error, `jsonb_path_exists` returns SQL NULL, `jsonb_path_match` decides on the items found before
+  it (anything but one boolean or JSON `null` is SQL NULL, not `22038`), and the query functions
+  return those items. `false` (the default) raises the error. The operators are the silent forms.
+
+Variables are read by name: a `vars` member by a binary search of the object's canonical key order,
+a `PASSING` binding (json-sql-functions.md §5.4) by a binary search of the bindings sorted by name
+once per evaluation. Both are flat work (§7).
 
 **Existence tests stop early.** `jsonb_path_exists`, `@?`, `JSON_EXISTS`, and a `JSON_TABLE`
 `EXISTS` column only ask whether the sequence is non-empty. In lax mode the evaluation stops at the
@@ -456,32 +477,34 @@ duplicate key keeps its last value (`JSON_VALUE('{"a":1,"a":2}'::json, '$.a')` i
 
 ### 5.1 `_tz` variants
 
-`jsonb_path_exists_tz` / `_match_tz` / `_query_tz` / `_query_array_tz` / `_query_first_tz`
-behave identically except that `.datetime()` comparisons and zone-aware coercions resolve
-through the host clock/tz seam ([entropy.md](entropy.md), the `now()`/`clock_timestamp()`
-seam). The non-`_tz` functions are **`immutable`**; the `_tz` ones are **`stable`** (the
-catalog `volatility` field), so they stay deterministic-given-the-seam.
+`jsonb_path_exists_tz` / `_match_tz` / `_query_tz` / `_query_array_tz` / `_query_first_tz` take the
+same arguments. In PostgreSQL they differ from the plain functions only in allowing datetime
+comparisons and conversions that depend on the session time zone (the plain ones raise `0A000`
+`cannot convert value from … without time zone usage` instead), which makes them **STABLE** where the
+plain ones are **IMMUTABLE**. jed's datetime item methods are still deferred (§3.1), so no path can
+reach a datetime item and the `_tz` functions behave exactly like the plain ones. They keep
+PostgreSQL's volatility: an expression using one is nonimmutable, so it is `42P17` in an index
+expression or partial-index predicate ([index-dependencies.md](index-dependencies.md)). The time zone
+difference matters only once the datetime methods land, when the `_tz` forms will read the session
+zone through the host clock/tz seam ([entropy.md](entropy.md), [timezones.md](timezones.md)).
 
 ### 5.2 The `jsonb_path_query` SRF fit
 
-`jsonb_path_query` slots into jed's existing set-returning-function machinery with one
-extension. Today `SrfKind` is `{GenerateSeries, Unnest}`, resolved into a synthetic
-single-column `Table` and driven by per-kind row generators (the executor's `resolve_srf` /
-`srf_table` path). Plan:
+`jsonb_path_query` and `jsonb_path_query_tz` slot into jed's existing set-returning-function
+machinery as one generator, `SrfKind::JsonbPathQuery`:
 
-- Add `SrfKind::JsonbPathQuery` (and `JsonbPathQueryTz`).
-- The resolver type-checks the args (`jsonb`, `jsonpath`, optional `vars jsonb` / `silent
-  boolean`), builds a synthetic one-column table typed `jsonb` (column name
-  `jsonb_path_query`), and stores the compiled path + arg expressions in the plan.
-- A new row generator runs the path over the context item and yields one row per sequence
-  item, charging one `generated_row` each (so a runaway `[*]` fan-out stays cost-proportional
-  and a `max_cost` ceiling aborts).
+- The resolver places and type-checks the arguments as §5 does (named notation is accepted in
+  `FROM`, grammar.md §35), builds a synthetic one-column table typed `jsonb` named after the
+  function (`jsonb_path_query` / `jsonb_path_query_tz`), and keeps the four argument expressions.
+- The row generator checks `vars` (§5), runs the path over the context item (silently when `silent`
+  is true), and yields one row per sequence item, charging one `generated_row` each (so a runaway
+  `[*]` fan-out stays cost-proportional and a `max_cost` ceiling aborts). A NULL argument yields no
+  rows.
 - **SRFs are already implicitly lateral** in jed, so a correlated
-  `jsonb_path_query(t.doc, '$.a[*]')` over a table column works with no LATERAL slice. (The
-  generic `WITH ORDINALITY` form stays deferred — it is not needed here.)
-- Add a `[[set_returning]]` catalog entry mirroring `unnest`, with
-  `arg_families = ["jsonb", "jsonpath", "jsonb", "boolean"]`, `result = "set_of_jsonb"`,
-  `null = "empty_on_null"`.
+  `jsonb_path_query(t.doc, '$.a[*]')` over a table column works with no LATERAL slice. A select-list
+  SRF is not yet supported (functions.md §10).
+- The catalog keeps a `[[set_returning]]` row for `jsonb_path_query` (its result column); the
+  argument list is hand-resolved.
 
 ---
 
@@ -546,8 +569,9 @@ it compiles it again and charges.
    without evaluating the right, as in PostgreSQL); each charges its own steps. A literal operand
    charges nothing, and neither does the lax unwrapping of an array-valued operand item (§4.1): it
    only changes which pairs exist.
-5. **Connectives and roots.** `&&`, `||`, `!`, seeding `$`, `@`, or `last`, and producing a
-   top-level or parenthesized predicate's single item charge nothing. Both operands of `&&` and
+5. **Connectives and roots.** `&&`, `||`, `!`, seeding `$`, `@`, `last`, or a variable (§5: its
+   lookup is a binary search, flat work), and producing a top-level or parenthesized predicate's
+   single item charge nothing. A `PASSING` value costs what its expression costs to evaluate. Both operands of `&&` and
    `||` are always evaluated; there is no short-circuit.
 6. **Arithmetic (§3.2).** A binary operator charges its operands' own steps (a literal operand
    nothing, the lax unwrapping of an array operand nothing), then 1 for the application, the SQL
@@ -596,6 +620,10 @@ Register the SQL/JSON class-22 subcodes in [../errors/registry.toml](../errors/r
 | `22037` | `non_unique_keys_in_a_json_object` | object construction unique-keys |
 | `22038` | `singleton_sql_json_item_required` | `JSON_VALUE` requires a scalar; `jsonb_path_match` requires one boolean; a binary arithmetic operand is not a single number (§3.2) |
 
+A path variable with no binding is **`42704`** (`undefined_object`, `could not find jsonpath variable
+"x"`) and a `jsonb_path_*` `vars` argument that is not an object **`22023`**; neither is a SQL/JSON
+error, so silent mode and `ON ERROR` do not suppress them (§5).
+
 Reuse existing codes where PG does: **`42601`** for a malformed path *literal* (syntax-error
 class, at resolve), **`22023`** for a `.decimal()` precision or scale outside PostgreSQL's
 `numeric` typmod ranges, **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
@@ -627,7 +655,8 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
   `like_regex` → Pike VM (§4.3) + the `2203x` error registration (§8). **Highest novelty
   after `JSON_TABLE`** — a whole sub-language and evaluator. Capability `types.jsonpath`.
 - **P2** — the path query functions + `@?`/`@@` + the `jsonb_path_query` SRF + `vars`/
-  `silent` (§5–§6). Depends on P1. Capability `func.jsonb_path`.
+  `silent` (§5–§6). Depends on P1. Capability `func.jsonb_path`; `vars`/`silent` with the variables
+  themselves are `expr.jsonpath_vars` (below).
   - **P1b/P2-filters** ✅ — filter expressions `?(predicate)` (§4) + the `@?` exists operator
     (§6) have landed. The predicate subset is the comparison core: `==` `!=`/`<>` `<` `<=`
     `>` `>=` over `@`/`$`-rooted accessor paths and scalar literals, combined with `&&` /
@@ -653,13 +682,17 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     and parenthesized expressions followed by accessors (§2), in comparisons, filters, top-level
     predicates, and subscript expressions (`$[last - 1]`); PostgreSQL's operator parenthesization
     in the render (§2.3), with `&&`/`||` grouping now kept. Capability `expr.jsonpath_arith`.
+  - **Variables** ✅ — `$name` / `$"name"` (§2.2), the `jsonb_path_*` `vars` / `silent` arguments
+    positionally or in named notation with PostgreSQL's defaults (§5), the `_tz` functions as STABLE
+    twins (§5.1), and the SQL/JSON `PASSING` clause of `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` /
+    `JSON_TABLE` (json-sql-functions.md §5.4); `.keyvalue()` ids count the variable base objects
+    (§3.1). Capability `expr.jsonpath_vars`.
     **Still deferred (`0A000`):** the datetime methods (they need PostgreSQL's `to_timestamp`
-    engine, §3.1), the §4.3
-    Pike-VM `like_regex` / `starts with` / `is unknown` / `exists` predicates, `$name` variables
-    and the `vars`/`silent` arguments, `.**`, and the `_tz` functions — the remaining open P2/P3
-    follow-ons.
-- **P3** — the `_tz` variants (§5.1): route `.datetime()` through the clock/tz seam,
-  `stable` volatility. Small follow-on to P2.
+    engine, §3.1), and with them the `_tz` functions' time zone use and `PASSING` a date/time value
+    (a datetime item); the §4.3 Pike-VM `like_regex` / `starts with` / `is unknown` / `exists`
+    predicates; `.**`; a float `PASSING` value — the remaining open P2/P3 follow-ons.
+- **P3** — the `_tz` variants (§5.1): ✅ as STABLE twins; routing their datetime comparisons through
+  the clock/tz seam waits on the datetime methods.
 
 **Riskiest, least-precedented:** the lax-mode auto-unwrapping + the navigation-vs-coercion
 error distinction (§4.2 rule 6) — the cross-core determinism contract makes any subtle

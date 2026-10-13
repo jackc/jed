@@ -16,7 +16,7 @@ fn err(db: &mut Session, sql: &str) -> String {
 }
 
 /// The still-deferred path-expression constructs — the datetime item methods, `like_regex` /
-/// `starts with` / `is unknown` / `exists`, `$name` variables, `.**` — are a `0A000` at compile.
+/// `starts with` / `is unknown` / `exists`, `.**` — are a `0A000` at compile.
 /// PostgreSQL compiles them, so each is a documented divergence; the supported subset is
 /// oracle-clean in suites/json/jsonpath_literal.test, jsonpath_query.test, and
 /// jsonpath_methods.test.
@@ -37,8 +37,6 @@ fn jsonpath_p1b_constructs_are_0a000() {
         "$.a starts with \"x\"", // a starts-with top-level predicate
         "($.a == 1) is unknown", // an is-unknown predicate
         "$ ? (exists (@.a))",    // an exists predicate
-        "$[$x]",                 // a path variable in a subscript expression
-        "$x + 1",                // a path variable
         "$.**",                  // the any-level accessor
     ] {
         assert_eq!(

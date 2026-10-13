@@ -1555,9 +1555,14 @@ impl Engine {
                 }
                 Ok(())
             }
-            RExpr::JsonSqlFn { ctx, path, .. } => {
+            RExpr::JsonSqlFn {
+                ctx, path, passing, ..
+            } => {
                 self.fold_uncorrelated_in_rexpr(ctx, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(path, bound, ctes, cost)?;
+                for p in passing {
+                    self.fold_uncorrelated_in_rexpr(p, bound, ctes, cost)?;
+                }
                 Ok(())
             }
             RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {

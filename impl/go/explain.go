@@ -1511,7 +1511,11 @@ func renderRExpr(e *rExpr) string {
 	case reJsonImage:
 		return explainExprCall(explainJSONImageFunc(e.jiFunc), e.sargs)
 	case reJsonPathFn:
-		return explainExprCall(explainJSONPathFunc(e.jpFnKind), e.sargs)
+		name := explainJSONPathFunc(e.jpFnKind)
+		if e.jpTz {
+			name += "_tz"
+		}
+		return explainExprCall(name, e.sargs)
 	case reJsonSqlFn:
 		return renderExplainJSONSQL(e)
 	case reJsonGet:
@@ -1805,6 +1809,16 @@ func renderExplainJSONSQL(e *rExpr) string {
 	b.WriteString(renderRExpr(e.sargs[0]))
 	b.WriteString(", ")
 	b.WriteString(renderRExpr(e.sargs[1]))
+	for i, value := range e.sargs[2:] {
+		if i == 0 {
+			b.WriteString(" passing ")
+		} else {
+			b.WriteString(", ")
+		}
+		b.WriteString(renderRExpr(value))
+		b.WriteString(" as ")
+		b.WriteString(quoteIdentifier(e.jsPassingNames[i]))
+	}
 	switch e.jsKind {
 	case jsExists:
 		b.WriteByte(' ')

@@ -65,7 +65,6 @@ import {
   evalDateConvert,
   evalJsonSqlResult,
   evalJsonpath,
-  evalJsonpathOn,
   evalRangeCtor,
   evalRangeFunc,
   evalRangeOp,
@@ -158,6 +157,15 @@ import { Decimal, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
 import type { Interval } from "./interval.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import { valueMatchesResult } from "./extension.ts";
+import {
+  NO_VARS,
+  type PassingVar,
+  type Vars as JsonPathVars,
+  checkVarsObject,
+  compileMetered as jsonPathCompileMetered,
+  evalPath as jsonPathEval,
+  passingVars,
+} from "./jsonpath.ts";
 import { not3, or3, valueCmp } from "./window.ts";
 import type { JsonMember, JsonNode } from "./json.ts";
 import {
@@ -237,6 +245,47 @@ import {
   datumToJsonb,
   jsonKeyText,
 } from "./row_json.ts";
+// passingBindings evaluates a resolved PASSING clause into its jsonpath variables
+// (json-sql-functions.md §5.4): each value as a jsonb item (SQL NULL is JSON null), ordered for lookup
+// by passingVars. resolveJsonPassing converts every other type to jsonb.
+export function passingBindings(
+  exprs: RExpr[],
+  names: string[],
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): PassingVar[] {
+  const bindings: { name: string; value: JsonNode }[] = [];
+  for (let i = 0; i < exprs.length; i++) {
+    const v = evalExpr(exprs[i]!, row, env, m);
+    let node: JsonNode;
+    switch (v.kind) {
+      case "null":
+        node = { kind: "null" };
+        break;
+      case "bool":
+        node = { kind: "bool", value: v.value };
+        break;
+      case "int":
+        node = { kind: "number", dec: Decimal.fromBigInt(v.int) };
+        break;
+      case "decimal":
+        node = { kind: "number", dec: v.dec };
+        break;
+      case "text":
+        node = { kind: "string", value: v.text };
+        break;
+      case "jsonb":
+        node = v.node;
+        break;
+      default:
+        throw new Error("resolveJsonPassing converts every other type to jsonb");
+    }
+    bindings.push({ name: names[i]!, value: node });
+  }
+  return passingVars(bindings);
+}
+
 // evalFilter evaluates a predicate in a filter context — WHERE, ON, HAVING, a partial index's WHERE,
 // ON CONFLICT … WHERE — and reports whether it keeps the row (it is TRUE). The top-level AND chain
 // stops at the first conjunct that is not TRUE (FALSE or NULL: the predicate can no longer be TRUE),
@@ -2306,19 +2355,27 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return growthResult(m, e.args, jsonbValue(jsonMakeObject(members)));
     }
     case "jsonPathFn": {
-      // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
+      // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL argument → NULL.
       m.charge(COSTS.operatorEval);
-      const ctx = evalExpr(e.args[0]!, row, env, m);
-      const path = evalExpr(e.args[1]!, row, env, m);
-      // The operators are PostgreSQL's silent forms. The jsonb_path_* functions pass the default
-      // vars object, one base object for .keyvalue() ids; the operators pass none (jsonpath.md
-      // §3.1).
-      const silent = e.pathFnKind === "existsSilent" || e.pathFnKind === "matchSilent";
+      const vals = e.args.map((a) => evalExpr(a, row, env, m));
+      if (vals.some((v) => v.kind === "null")) return nullValue();
+      // The jsonb_path_* functions take a vars object (one base object for .keyvalue() ids, checked
+      // before evaluation even in silent mode) and a silent flag; the operators are PostgreSQL's
+      // silent forms with no variables (jsonpath.md §3.1, §5).
+      let vars: JsonPathVars = NO_VARS;
+      let silent = true;
+      const varsVal = vals[2];
+      const silentVal = vals[3];
+      if (varsVal?.kind === "jsonb" && silentVal?.kind === "bool") {
+        checkVarsObject(varsVal.node);
+        vars = { kind: "object", node: varsVal.node };
+        silent = silentVal.value;
+      }
       const opts = {
         exists: e.pathFnKind === "exists" || e.pathFnKind === "existsSilent",
-        vars: silent ? 0 : 1,
+        vars,
       };
-      const res = evalJsonpath(ctx, path, opts, silent, m);
+      const res = evalJsonpath(vals[0]!, vals[1]!, opts, silent, m);
       if (res === null) return nullValue();
       const seq = res.seq;
       // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
@@ -2326,9 +2383,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.guard();
       switch (e.pathFnKind) {
         case "exists":
-          return boolValue(seq.length > 0);
         case "existsSilent":
-          // `@?`: a SQL/JSON error → SQL NULL.
+          // Silent: a SQL/JSON error → SQL NULL.
           return res.errored ? nullValue() : boolValue(seq.length > 0);
         case "queryFirst":
           return seq.length > 0 ? jsonbValue(seq[0]!) : nullValue();
@@ -2338,26 +2394,24 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           jsonCheckDepth(out);
           return growthResult(m, e.args, jsonbValue(out));
         }
-        case "match": {
+        case "match":
+        case "matchSilent": {
           // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON null —
-          // an unknown predicate — which is SQL NULL).
+          // an unknown predicate — which is SQL NULL). Silent (`@@`, or `silent => true`)
+          // suppresses anything else to SQL NULL; an error ends the evaluation, and the items
+          // found before it still decide.
           if (seq.length === 1 && seq[0]!.kind === "bool") {
             return boolValue(seq[0]!.value);
           }
           if (seq.length === 1 && seq[0]!.kind === "null") {
             return nullValue();
           }
+          if (silent) return nullValue();
           throw engineError(
             "singleton_sql_json_item_required",
             "single boolean result is expected",
           );
         }
-        case "matchSilent":
-          // @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean result to
-          // SQL NULL. An error ends the evaluation; the items found before it still decide.
-          return seq.length === 1 && seq[0]!.kind === "bool"
-            ? boolValue(seq[0]!.value)
-            : nullValue();
       }
       break;
     }
@@ -2372,12 +2426,21 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // conversion, not path evaluation, so ON ERROR does not catch it — as in PostgreSQL
       // (json.md §4.2). The conversion canonicalizes it, as PostgreSQL casts it (jsonpath.md §5).
       const node = jsonpathContextNode(cv);
+      if (pv.kind !== "jsonpath") {
+        throw new Error("resolver restricts a jsonpath argument to jsonpath");
+      }
+      const compiled = jsonPathCompileMetered(pv.text, m);
+      // The PASSING values, evaluated after the context and path (as in PostgreSQL) and outside ON
+      // ERROR: each is a base object for .keyvalue() ids (jsonpath.md §3.1).
+      const passing = e.args.slice(2);
+      const bindings = passingBindings(passing, e.passingNames, row, env, m);
+      const vars: JsonPathVars = { kind: "passing", vars: bindings, count: passing.length };
       let seq: JsonNode[];
       try {
-        seq = evalJsonpathOn(node, pv, { exists: e.sqlKind === "exists", vars: 0 }, false, m).seq;
+        seq = jsonPathEval(compiled, node, { exists: e.sqlKind === "exists", vars }, m);
       } catch (err) {
         // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
-        // else (a cost abort, etc.) propagates.
+        // else (a cost abort, a missing variable, etc.) propagates.
         if (isSqljsonError(err)) {
           return applyJsonBehavior(e.onError, err, e.returning, env, m);
         }
@@ -2393,7 +2456,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         e.wrapper,
         e.onEmpty,
         e.onError,
-        rexprIsConstant(e.args[0]!) && rexprIsConstant(e.args[1]!),
+        e.args.every(rexprIsConstant),
         env,
         m,
       );

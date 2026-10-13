@@ -1562,3 +1562,30 @@ reason = "jed: a float array element is the same deferred 0A000 as a float sourc
 file = "json/jsonpath_arith.test"
 sql = "SELECT '$ ? (($.a + 1).type() == \"number\")'::jsonpath, '$ ? ((-@.a).abs() > 1)'::jsonpath, '$[(last - 1).abs()]'::jsonpath"
 reason = "jed renders an arithmetic operator followed by accessors parenthesized wherever it appears: `$?(($.\"a\" + 1).type() == \"number\")`. PostgreSQL's printJsonPathItem brackets an operand only by operator priority, ignoring the accessors that follow it, so it prints `$?($.\"a\" + 1.type() == \"number\")` (which does not even parse) and `$?(-@.\"a\".abs() > 1)` (which parses as a different path, -(abs(a))). jed stores and evaluates a jsonpath as its canonical text (jsonpath.md §1), so that text must read back as the same path (jsonpath.md §2.3)."
+
+# --- jsonpath PASSING values PostgreSQL passes as items jed cannot hold yet (json-sql-functions.md
+# §5.4).
+[[override]]
+file = "json/jsonpath_vars.test"
+sql = "SELECT JSON_VALUE('{}', '$x' PASSING date '2020-01-01' AS x)"
+reason = "jed: a date/time PASSING value is a deferred 0A000 (json-sql-functions.md §5.4). PostgreSQL's JsonItemFromDatum passes a date, time, timetz, timestamp, or timestamptz value as a jsonpath datetime item, which jed's evaluator does not have until the datetime item methods land (jsonpath.md §3.1): such an item reports its own .type() (\"date\") and compares only with other datetime items, so passing it as a string would give different answers. PostgreSQL returns 2020-01-01."
+
+[[override]]
+file = "json/jsonpath_vars.test"
+sql = "SELECT JSON_VALUE('{}', '$x' PASSING timestamptz '2020-01-01 00:00:00+00' AS x)"
+reason = "jed: a timestamptz PASSING value is the same deferred 0A000 as a date (a jsonpath datetime item in PostgreSQL, json-sql-functions.md §5.4). PostgreSQL returns the instant rendered in the session zone."
+
+[[override]]
+file = "json/jsonpath_vars.test"
+sql = "SELECT JSON_VALUE('{}', '$x' PASSING 1.5::f64 AS x)"
+reason = "jed: a float PASSING value is a deferred 0A000 (json-sql-functions.md §5.4). PostgreSQL converts a finite float with float8_numeric/float4_numeric (15 or 6 significant digits) and passes NaN and ±Infinity as numeric NaN/Infinity items, which jed's always-finite decimal cannot hold (decimal.md §2). PostgreSQL returns 1.5."
+
+[[override]]
+file = "json/jsonpath_vars.test"
+sql = "SELECT JSON_QUERY('{}', '$x' PASSING ARRAY[1.5::f64] AS x)"
+reason = "jed: a float array PASSING value is converted by to_jsonb, whose float source is the deferred 0A000 of every JSON conversion (json-sql-functions.md §2.2, the float-render-layout ledger entry not covering JSON text). PostgreSQL returns [1.5]."
+
+[[override]]
+file = "json/jsonpath_vars.test"
+sql = "SELECT JSON_QUERY('{}', '$x' PASSING '\\x7b7d'::bytea FORMAT JSON AS x)"
+reason = "jed: FORMAT JSON on a bytea PASSING value is a deferred 0A000 (json-sql-functions.md §5.4). PostgreSQL decodes the bytes as JSON text in the server encoding (an ENCODING clause may name UTF8/UTF16/UTF32) and parses it, returning {}."
