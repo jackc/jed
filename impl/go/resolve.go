@@ -2650,7 +2650,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if rr.kind == reConstText {
 			pat := rr.cText
 			if e.Regex.Insensitive {
-				pat = foldLowerSimple(pat, loadedProperty())
+				pat = foldRegexPattern(pat, loadedProperty())
 			}
 			prog, err = compileRegex(pat)
 			if err != nil {

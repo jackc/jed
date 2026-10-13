@@ -152,8 +152,8 @@ import type { ExtractSrc } from "./datetime_fn.ts";
 import { extractField } from "./datetime_fn.ts";
 import type { ColType, Column, CompositeType, Table } from "./catalog.ts";
 import type { RegexProgram } from "./regex.ts";
-import { foldLowerSimple, loadedProperty, sortKey as collationSortKey } from "./collation.ts";
-import { compileRegex } from "./regex.ts";
+import { loadedProperty, sortKey as collationSortKey } from "./collation.ts";
+import { compileRegex, foldRegexPattern } from "./regex.ts";
 import type { Collation } from "./collation.ts";
 import { AGGREGATES, OPERATORS, WINDOWS } from "./operators.ts";
 import type { ArrayShape, Value } from "./value.ts";
@@ -1939,7 +1939,7 @@ function resolveNode(
       // pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
       let program: RegexProgram | null = null;
       if (p.rr.kind === "constText") {
-        const pat = e.insensitive ? foldLowerSimple(p.rr.value, loadedProperty()) : p.rr.value;
+        const pat = e.insensitive ? foldRegexPattern(p.rr.value, loadedProperty()) : p.rr.value;
         program = compileRegex(pat);
       }
       // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so

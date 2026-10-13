@@ -1238,7 +1238,7 @@ impl RExpr {
                         // Non-constant pattern: compile now (charging regex_compile) and run.
                         let pat_folded;
                         let pat_ref = if *insensitive {
-                            pat_folded = crate::collation::fold_lower_simple(p, prop.as_deref());
+                            pat_folded = crate::regex::fold_pattern(p, prop.as_deref());
                             pat_folded.as_str()
                         } else {
                             p
@@ -1442,7 +1442,7 @@ impl RExpr {
                     }
                     None => {
                         let pat = if insensitive {
-                            crate::collation::fold_lower_simple(&pattern, prop.as_deref())
+                            crate::regex::fold_pattern(&pattern, prop.as_deref())
                         } else {
                             pattern.clone()
                         };

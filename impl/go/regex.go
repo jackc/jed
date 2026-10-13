@@ -806,10 +806,36 @@ func (c *regexCompiler) emitRepeat(n *regexNode) error {
 	return nil
 }
 
+// foldRegexPattern is the case-insensitive pattern fold (regex.md §1): foldLowerSimple over the
+// pattern's literal characters and class members, with the code point after each backslash kept as
+// written. Every escape is a backslash plus one code point (§2), so this leaves escape letters
+// intact — `\D \W \S` stay negated classes rather than becoming `\d \w \s`, and `\A` stays an anchor.
+func foldRegexPattern(pat string, p *propertyTable) string {
+	var b strings.Builder
+	b.Grow(len(pat))
+	start := 0
+	for i := 0; i < len(pat); i++ {
+		if pat[i] != '\\' {
+			continue
+		}
+		b.WriteString(foldLowerSimple(pat[start:i], p))
+		end := i + 1
+		if end < len(pat) {
+			_, size := utf8.DecodeRuneInString(pat[end:])
+			end += size
+		}
+		b.WriteString(pat[i:end])
+		start = end
+		i = end - 1
+	}
+	b.WriteString(foldLowerSimple(pat[start:], p))
+	return b.String()
+}
+
 // compileRegex compiles a pattern to a program (regex.md §3). Raises 2201B on a malformed pattern
 // and 54001 on a well-formed-but-too-large one. Does NOT meter — the caller charges
 // regex_compile × program.ninst() (the precompilation contract, regex.md §5). For ~* the pattern
-// must already be case-folded by the caller.
+// must already be case-folded by the caller (foldRegexPattern).
 func compileRegex(pattern string) (*regexProgram, error) {
 	return compileRegexMode(pattern, regexMode{})
 }

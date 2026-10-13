@@ -208,6 +208,7 @@ import {
 import { type Collation, foldCase, foldLowerSimple, loadedProperty } from "./collation.ts";
 import {
   compileRegex,
+  foldRegexPattern,
   regexIsMatch,
   regexNinst,
   regexpCount,
@@ -956,7 +957,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         matched = regexIsMatch(e.program, subjCps, m);
       } else {
         // Non-constant pattern: compile now (charging regex_compile) and run.
-        const pat = e.insensitive ? foldLowerSimple(pattern.text, prop) : pattern.text;
+        const pat = e.insensitive ? foldRegexPattern(pattern.text, prop) : pattern.text;
         const prog = compileRegex(pat);
         m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
         m.guard();
@@ -1072,7 +1073,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
         prog = e.program;
       } else {
-        const pat = insensitive ? foldLowerSimple(pattern, prop) : pattern;
+        const pat = insensitive ? foldRegexPattern(pattern, prop) : pattern;
         prog = compileRegex(pat);
         m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
         m.guard();

@@ -781,10 +781,34 @@ fn clone_node(n: &Node) -> Node {
     }
 }
 
+/// The case-insensitive pattern fold (regex.md §1): `fold_lower_simple` over the pattern's literal
+/// characters and class members, with the code point after each backslash kept as written. Every
+/// escape is a backslash plus one code point (§2), so this leaves escape letters intact — `\D \W \S`
+/// stay negated classes rather than becoming `\d \w \s`, and `\A` stays an anchor.
+pub fn fold_pattern(pat: &str, prop: Option<&crate::collation::PropertyTable>) -> String {
+    let mut out = String::with_capacity(pat.len());
+    let mut start = 0;
+    let mut chars = pat.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        out.push_str(&crate::collation::fold_lower_simple(&pat[start..i], prop));
+        let end = match chars.next() {
+            Some((j, e)) => j + e.len_utf8(),
+            None => i + 1,
+        };
+        out.push_str(&pat[i..end]);
+        start = end;
+    }
+    out.push_str(&crate::collation::fold_lower_simple(&pat[start..], prop));
+    out
+}
+
 /// Compile a pattern to a program (regex.md §3). Raises `2201B` on a malformed pattern and `54001`
 /// on a well-formed-but-too-large one. Does NOT meter — the caller charges `regex_compile ×
 /// program.ninst()` (the precompilation contract, regex.md §5). For `~*` the pattern must already be
-/// case-folded by the caller.
+/// case-folded by the caller ([`fold_pattern`]).
 pub fn compile(pattern: &str) -> Result<Program> {
     compile_mode(pattern, Mode::default())
 }

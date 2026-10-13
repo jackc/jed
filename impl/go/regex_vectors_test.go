@@ -125,7 +125,7 @@ func TestRegexProgramVectors(t *testing.T) {
 		pattern := tomlUnquote(c["pattern"])
 		pat := pattern
 		if strings.Contains(tomlUnquote(c["flags"]), "i") {
-			pat = foldLowerSimple(pat, loadedProperty())
+			pat = foldRegexPattern(pat, loadedProperty())
 		}
 		prog, err := compileRegex(pat)
 		if err != nil {
@@ -161,7 +161,7 @@ func TestRegexMatchVectors(t *testing.T) {
 		input := tomlUnquote(c["input"])
 		pat, subj := pattern, input
 		if strings.Contains(tomlUnquote(c["flags"]), "i") {
-			pat = foldLowerSimple(pat, loadedProperty())
+			pat = foldRegexPattern(pat, loadedProperty())
 			subj = foldLowerSimple(subj, loadedProperty())
 		}
 		prog, err := compileRegex(pat)

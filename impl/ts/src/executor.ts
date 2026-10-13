@@ -137,7 +137,6 @@ import {
 } from "./rewrite.ts";
 import {
   type Collation,
-  foldLowerSimple,
   loadedCollationTables,
   loadedProperty,
   loadUnicodeData as loadUnicodeDataGlobal,
@@ -443,6 +442,7 @@ import {
   captureArraySize,
   compileRegex,
   cpsUtf8Length,
+  foldRegexPattern,
   replaceBuild,
   replaceMatches,
   replaceSize,
@@ -34314,7 +34314,7 @@ export function resolveRegexFunc(
   }
   let program: RegexProgram | null = null;
   if (rargs[1].kind === "constText" && insensitive !== null) {
-    const pat = insensitive ? foldLowerSimple(rargs[1].value, loadedProperty()) : rargs[1].value;
+    const pat = insensitive ? foldRegexPattern(rargs[1].value, loadedProperty()) : rargs[1].value;
     program = compileRegex(pat);
   }
   // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so a

@@ -52,8 +52,14 @@ beside `LIKE`/`ILIKE` — [grammar.md](grammar.md) §22b):
 - **Negation** (`!~`, `!~*`) is carried on the AST node (a `negated` flag), not a separate
   operator — the `NOT LIKE` precedent. There is no `NOT ~` keyword spelling (PG has none either).
 - **Case-insensitive `~*`** simple-lowercases (1:1) *both* operands before compiling/matching —
-  exactly the `ILIKE` mechanism ([collation.md](collation.md) §16): ASCII baseline when no Unicode
+  the `ILIKE` mechanism ([collation.md](collation.md) §16): ASCII baseline when no Unicode
   property bundle is loaded, full simple Unicode mappings when one is. So `'FOO' ~* 'f.o'` is TRUE.
+  The subject is folded whole. The pattern folds only its **literal characters and class members**:
+  the code point after each backslash is kept as written. Every escape is a backslash plus one code
+  point (§2), and no escape denotes a letter, so this folds exactly what can match a letter while
+  leaving the escape letters intact. Folding the raw pattern text would turn `\D \W \S` into
+  `\d \w \s` (inverting them), `\A` into the invalid `\a`, and the invalid `\Z` into the valid
+  `\z`. So `'a' ~* '\D'` is TRUE and `' ' ~* '\S'` is FALSE, as in PostgreSQL.
 - **Match unit = Unicode code point** (not byte, not UTF-16 unit) — a §8 determinism surface, the
   `LIKE` precedent. Cores iterate Rust `chars()`, Go `[]rune`, TS `Array.from`.
 
@@ -360,8 +366,10 @@ compiles per row at eval. (Precedent: jed already mutates a resolved node at pla
 - **Non-constant:** charge `regex_compile × |program|` **each time** the pattern is compiled (each
   row whose pattern value is evaluated) — genuinely repeated work, correctly metered.
 
-For `~*` the pattern is `fold_lower_simple`-folded *before* compilation, so the precompiled program
-is that of the folded pattern, and each subject is folded before matching (the ILIKE precedent).
+For `~*` the pattern is folded *before* compilation — `fold_lower_simple` over its literal
+characters and class members, never the letter after a backslash (§1) — so the precompiled program
+is that of the folded pattern, and each subject is folded whole before matching (the ILIKE
+precedent). A non-constant pattern gets the same fold before its per-row compile.
 
 ---
 
@@ -432,7 +440,8 @@ them):
   match). An unset (`⊥`) group element is **NULL**. **No match → NULL** (the whole result, not an
   empty array).
 
-`flags` is a short text: `'i'` (case-insensitive, = the `~*` fold), `'g'` (global, `regexp_replace`
+`flags` is a short text: `'i'` (case-insensitive, = the `~*` fold of §1: the subject whole, the
+pattern's literals only), `'g'` (global, `regexp_replace`
 and the set-returning `regexp_matches` only). Unknown flag → `2201B`; `'g'` on `regexp_match` is
 PostgreSQL's `22023` (§8c). These are jed's first **text-returning** and **text[]-returning**
 functions; they resolve through a dedicated `RExpr::RegexFunc` node carrying the result in the
@@ -627,7 +636,8 @@ backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups. And
 - Corpus: `suites/expr/regex.test` (operators, NULL/42804/2201B, code-point/astral, `# cost:` pins),
   `suites/resource/regex_program_limit.test` (`54001` boundary, jed-specific — not oracle-checked),
   `suites/expr/regexp_functions.test` (Slice 2), `suites/expr/regexp_oracle_functions.test` (Slice 3),
-  `suites/query/regexp_srf.test` (Slice 4).
+  `suites/query/regexp_srf.test` (Slice 4), `suites/expr/regex_case_insensitive_escapes.test` (the
+  §1 pattern fold keeps escape letters: `\D \W \S \A` under `~*` and `'i'`).
 - **Oracle divergence** (§7 conformance): jed's flavor is the RE2 subset, so only the **PG-agreeing
   subset** is oracle-checkable (`mise run corpus:check`); flavor-divergent cases (a pattern PG accepts
   via a backref, greedy-edge differences) get **hand-authored expected output + an

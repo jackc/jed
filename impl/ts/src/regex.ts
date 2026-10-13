@@ -11,6 +11,7 @@
 
 import { COSTS, MEMORY_ARRAY_DIM, MEMORY_VALUE } from "./costs.ts";
 import type { Meter } from "./cost.ts";
+import { foldLowerSimple, type PropertyTable } from "./collation.ts";
 import { engineError } from "./errors.ts";
 
 // The maximum compiled-program size, in instructions (regex.md §6, cost.md §7c). A fixed cross-core
@@ -669,10 +670,29 @@ class RegexCompiler {
   }
 }
 
+// foldRegexPattern is the case-insensitive pattern fold (regex.md §1): foldLowerSimple over the
+// pattern's literal characters and class members, with the code point after each backslash kept as
+// written. Every escape is a backslash plus one code point (§2), so this leaves escape letters intact —
+// `\D \W \S` stay negated classes rather than becoming `\d \w \s`, and `\A` stays an anchor.
+export function foldRegexPattern(pat: string, prop: PropertyTable | undefined): string {
+  let out = "";
+  let start = 0;
+  for (let i = 0; i < pat.length; i++) {
+    if (pat.charCodeAt(i) !== 0x5c) continue;
+    out += foldLowerSimple(pat.slice(start, i), prop);
+    let end = i + 1;
+    if (end < pat.length) end += (pat.codePointAt(end) as number) > 0xffff ? 2 : 1;
+    out += pat.slice(i, end);
+    start = end;
+    i = end - 1;
+  }
+  return out + foldLowerSimple(pat.slice(start), prop);
+}
+
 // compileRegex compiles a pattern to a program (regex.md §3). Throws 2201B on a malformed pattern
 // and 54001 on a well-formed-but-too-large one. Does NOT meter — the caller charges
 // regex_compile × regexNinst() (the precompilation contract, regex.md §5). For ~* the pattern must
-// already be case-folded by the caller.
+// already be case-folded by the caller (foldRegexPattern).
 export function compileRegex(pattern: string): RegexProgram {
   return compileRegexMode(pattern, NO_MODE);
 }

@@ -94,9 +94,10 @@ fn program_vectors_match() {
         cases.len()
     );
     for c in &cases {
-        // `flags = "i"` folds the pattern with simple lowercasing before compiling (the ~* path).
+        // `flags = "i"` folds the pattern's literals with simple lowercasing before compiling (the ~*
+        // path, regex.md §1).
         let pat = if c.flags.contains('i') {
-            jed::collation::fold_lower_simple(&c.pattern, None)
+            jed::regex::fold_pattern(&c.pattern, None)
         } else {
             c.pattern.clone()
         };
@@ -208,7 +209,7 @@ fn match_vectors_match() {
     for c in &cases {
         let (pat, subj) = if c.flags.contains('i') {
             (
-                jed::collation::fold_lower_simple(&c.pattern, None),
+                jed::regex::fold_pattern(&c.pattern, None),
                 jed::collation::fold_lower_simple(&c.input, None),
             )
         } else {

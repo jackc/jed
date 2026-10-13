@@ -481,7 +481,7 @@ pub(crate) fn resolve_regex_func(
         (RExpr::ConstText(pat), Some(insensitive)) => {
             let pat = if insensitive {
                 let prop = crate::collation::loaded_property();
-                crate::collation::fold_lower_simple(pat, prop.as_deref())
+                crate::regex::fold_pattern(pat, prop.as_deref())
             } else {
                 pat.clone()
             };
@@ -5386,7 +5386,7 @@ fn resolve_node(
                 let folded;
                 let pat_ref = if *insensitive {
                     let prop = crate::collation::loaded_property();
-                    folded = crate::collation::fold_lower_simple(pat, prop.as_deref());
+                    folded = crate::regex::fold_pattern(pat, prop.as_deref());
                     folded.as_str()
                 } else {
                     pat.as_str()

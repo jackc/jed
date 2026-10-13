@@ -34,7 +34,9 @@ pairs (decimal) joined by `,`, prefixed with `^` when negated. E.g. `97-99` is `
 `[^0-9]`. Ranges are sorted by `lo` and merged (regex.md §3.4).
 
 `flags = "i"` folds the pattern with simple lowercasing *before* compiling (the `~*` / ILIKE
-mechanism), so `(pattern="A", flags="i")` compiles identically to `(pattern="a")`.
+mechanism), so `(pattern="A", flags="i")` compiles identically to `(pattern="a")`. The fold skips the
+code point after each backslash (regex.md §1), so `(pattern="\\AX\\D", flags="i")` keeps its anchor
+and negated class.
 
 ## `match_vectors.toml` — the execution + step-cost contract
 

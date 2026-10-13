@@ -12,6 +12,7 @@ import { foldLowerSimple, loadedProperty } from "../src/collation.ts";
 import { Meter } from "../src/cost.ts";
 import {
   compileRegex,
+  foldRegexPattern,
   regexClassListing,
   regexListing,
   regexNinst,
@@ -96,7 +97,7 @@ test("regex program vectors match spec/regex/program_vectors.toml", () => {
   for (const c of blocks) {
     const pattern = tomlUnquote(c.get("pattern"));
     const pat = tomlUnquote(c.get("flags")).includes("i")
-      ? foldLowerSimple(pattern, loadedProperty())
+      ? foldRegexPattern(pattern, loadedProperty())
       : pattern;
     const prog = compileRegex(pat);
     assert.deepEqual(regexListing(prog), parseStrArray(c.get("prog")), `program for ${pattern}`);
@@ -116,7 +117,7 @@ test("regex match vectors match spec/regex/match_vectors.toml", () => {
     const pattern = tomlUnquote(c.get("pattern"));
     const input = tomlUnquote(c.get("input"));
     const insensitive = tomlUnquote(c.get("flags")).includes("i");
-    const pat = insensitive ? foldLowerSimple(pattern, loadedProperty()) : pattern;
+    const pat = insensitive ? foldRegexPattern(pattern, loadedProperty()) : pattern;
     const subj = insensitive ? foldLowerSimple(input, loadedProperty()) : input;
     const prog = compileRegex(pat);
     const cps = Array.from(subj, (ch) => ch.codePointAt(0) as number);

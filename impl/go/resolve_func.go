@@ -1042,7 +1042,7 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	if rargs[1].kind == reConstText && insensitiveKnown {
 		pat := rargs[1].cText
 		if insensitive {
-			pat = foldLowerSimple(pat, loadedProperty())
+			pat = foldRegexPattern(pat, loadedProperty())
 		}
 		var err error
 		prog, err = compileRegex(pat)

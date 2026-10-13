@@ -2154,7 +2154,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// Non-constant pattern: compile now (charging regex_compile) and run.
 			pat := pattern.str()
 			if e.insensitive {
-				pat = foldLowerSimple(pat, prop)
+				pat = foldRegexPattern(pat, prop)
 			}
 			prog, err := compileRegex(pat)
 			if err != nil {
@@ -2308,7 +2308,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		} else {
 			pat := pattern
 			if insensitive {
-				pat = foldLowerSimple(pattern, prop)
+				pat = foldRegexPattern(pattern, prop)
 			}
 			var err error
 			prog, err = compileRegex(pat)

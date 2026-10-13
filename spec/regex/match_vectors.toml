@@ -5,7 +5,8 @@
 # and audited against the VM spec; like the on-disk goldens it is then the pinned contract.
 #
 # `caps` is empty `[]` when `matched = false`. `flags = "i"` folds BOTH pattern and input with simple
-# lowercasing (the ~* / ILIKE mechanism) before running, so offsets are into the folded subject.
+# lowercasing (the ~* / ILIKE mechanism) before running, so offsets are into the folded subject. The
+# pattern fold skips the code point after each backslash (../design/regex.md §1).
 
 schema_version = 1
 
@@ -240,6 +241,15 @@ input = "ABC"
 matched = true
 caps = [[0, 3]]
 steps = 20
+
+# `\W` keeps its escape letter under the fold, so it matches only the space, not the letters.
+[[case]]
+pattern = "\\W"
+flags = "i"
+input = "Ab "
+matched = true
+caps = [[2, 3]]
+steps = 21
 
 # Code-point offsets — the astral 😀 is ONE code point, so the spans count code points, not UTF-16
 # units (a core iterating UTF-16 would get [2,4] and diverge).
