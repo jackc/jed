@@ -1,0 +1,17 @@
+# Overflow chains and LZ4-compressed records: UPDATEs that grow and shrink values
+# (simulation-testing.md §9).
+
+description = "Overflow chains, LZ4-compressed records, values that grow and shrink"
+
+page_sizes = [256, 512]
+batch = [1, 12]
+
+[weights]
+update = 14
+insert = 10
+
+[values]
+short = 4
+long_compressible = 6
+long_incompressible = 6
+null = 2

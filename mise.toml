@@ -252,6 +252,45 @@ run = [
   "cd impl/rust && cargo test --bin conformance",
 ]
 
+# Deterministic simulation testing (spec/design/simulation-testing.md): seeded multi-session
+# histories over a fault-injecting simulated disk, checked by recovery, durability, isolation, and
+# integrity oracles. A sweep is bench-family and stays outside `ci`; the committed regression traces
+# (spec/conformance/sim/regress) are the part a gate runs.
+[tasks."sim:sweep"]
+description = "Simulation sweep: generate traces, run them on the cores; fails on any oracle violation or disagreement"
+usage = '''
+arg "[seeds]" default="1..50" help="Seed range, e.g. 1..200"
+arg "[profile]" default="all" help="A profile under spec/conformance/sim/profiles, or all"
+arg "[cores]" default="go" help="Comma-separated subset of go,rust,ts"
+'''
+run = 'ruby scripts/sim.rb sweep --seeds "${usage_seeds}" --profile "${usage_profile}" --cores "${usage_cores}"'
+
+[tasks."sim:regress"]
+description = "Run the committed simulation regression traces on the cores"
+usage = 'arg "[cores]" default="go" help="Comma-separated subset of go,rust,ts"'
+run = 'ruby scripts/sim.rb regress --cores "${usage_cores}"'
+
+[tasks."sim:replay"]
+description = "Rerun one simulation trace and keep its transcripts"
+usage = '''
+arg "<trace>" help="The .sim file"
+arg "[cores]" default="go" help="Comma-separated subset of go,rust,ts"
+'''
+run = 'ruby scripts/sim.rb replay "${usage_trace}" --cores "${usage_cores}"'
+
+[tasks."sim:shrink"]
+description = "Shrink a failing simulation trace to a minimal one (ddmin over steps)"
+usage = '''
+arg "<trace>" help="The failing .sim file"
+arg "[core]" default="go" help="The core it fails on"
+'''
+run = 'ruby scripts/sim.rb shrink "${usage_trace}" --core "${usage_core}"'
+
+[tasks."sim:plant"]
+description = "Check the simulator still catches each deliberately planted Go-core storage bug"
+usage = 'arg "[seeds]" default="1..60" help="Seed range per planted bug"'
+run = 'ruby scripts/sim_plant.rb "${usage_seeds}"'
+
 # --- Unit suites --------------------------------------------------------------------------------
 # Each core's per-language unit + integration suite: the checks the corpus CANNOT express
 # (CLAUDE.md §10). Rust runs RELEASE for the same depth_limit native-stack reason as conformance.

@@ -1,6 +1,6 @@
 # Deterministic simulation testing — design
 
-> **Status: proposed — design only, nothing built.** A seeded simulator that runs long, randomized
+> **Status: S1 landed (Go runner); S2–S6 not yet built** (§14). A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -105,10 +105,11 @@ is a header plus one step per line:
 
 ```
 # format: simulation
+# profile: mixed
 # seed: 81723
 # page_size: 256
 # cache_bytes: 4096
-# work_mem: 8192
+# clock: 1700000000000000
 open w write
 on w CREATE TABLE t (id i32 PRIMARY KEY, v text)
 on w INSERT INTO t SELECT g, repeat('x', g * 37) FROM generate_series(1, 200) g
@@ -118,23 +119,26 @@ open w2 write
 on w2 UPDATE t SET v = v || 'y' WHERE id % 3 = 0
 fault power_loss survive=500 tear=100
 commit w2
-recover
 check
-close r
 ```
 
 | Step | Meaning |
 |---|---|
-| `open <sid> read\|write`, `on <sid> <sql>`, `commit`, `rollback`, `close` | As in the concurrency format. The SQL's outcome is recorded, not asserted. |
+| `open <sid> read\|write`, `on <sid> <sql>`, `commit`, `rollback`, `close` | As in the concurrency format. The SQL's outcome is recorded, not asserted. A step naming a session that no longer exists is recorded as skipped. |
 | `fault <kind> <params>` | Arms a fault (§6.3) for the **next** step only. |
-| `crash process` / `crash power <params>` | An immediate crash between steps. |
-| `recover` | Opens a new `Database` over the surviving disk image, the recovery path. |
-| `reopen` | Clean `close` then open. |
-| `check` | Runs the integrity checker (§8.3). |
+| `crash process` / `crash power survive=‰ tear=‰` | An immediate crash between steps. |
+| `reopen` | Ends every session (rolling back a writer), closes cleanly, and opens again. |
+| `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
-| `set <setting> <value>` | A handle setting (`cache_bytes`, `work_mem`, `max_storage_bytes`, …). |
 
-**Header knobs** select the starting configuration. The most important is a **small page size**
+**Every faulted step and every crash ends the process.** After the step, the runner abandons the
+`Database` and its sessions and opens the disk as a new process would; that recovery and its oracle
+checks are part of the step. There is no separate `recover` step.
+
+**Header knobs** are `seed`, `page_size`, `cache_bytes` (0 or absent: the engine default), `clock`
+(the simulated clock's start, in microseconds), `sector` (the tear granularity, default 64 bytes),
+and the informational `profile`. Further handle settings (`work_mem`, `max_storage_bytes`) arrive
+with slice S3. The most important is a **small page size**
 (256 or 512). It produces deep trees, multi-page overflow chains, and manifest overflow with very
 little data. At 256-byte pages the inline manifest holds `floor((256 − 64) / 12) = 16` entries, so
 any commit dirtying more than 16 pages exercises the overflow chain. A small database also keeps the
@@ -154,9 +158,9 @@ A crash ends every session of the crashed `Database`. The generator never refere
 - **cache**: what reads return, meaning durable overlaid with the newest pending version (the OS
   page cache's read-your-writes).
 
-`write_at` appends a pending version and updates the cache. `sync` and `set_size` succeed by moving
-every pending write to durable. `set_size` is a full `fsync` by contract, so it is a barrier too
-(hosts.md §2.1). `read_at` serves the cache.
+`write_at` appends a pending version and updates the cache. A successful `sync` makes every pending
+write durable. A growing `set_size` does too: it is a full `fsync` by contract (hosts.md §2.1).
+`read_at` serves the cache.
 
 ### 6.2 Content-keyed fault decisions
 
@@ -164,13 +168,28 @@ Fault outcomes are decided by **what** was written and **where**, never by the p
 in the operation log:
 
 ```
-decide(seed, lane, step, offset, version) = splitmix64_mix(seed, lane, step, offset, version)
+mix(z)  = z ^= z >> 30; z *= 0xBF58476D1CE4E5B9; z ^= z >> 27; z *= 0x94D049BB133111EB; z ^ z >> 31
+decide(seed, lane, step, offset, version):
+  h = seed
+  for w in [lane, step, offset, version]: h = mix((h ^ w) + 0x9E3779B97F4A7C15)
+  return h                                          (all arithmetic mod 2^64)
 ```
 
-Here `lane` separates independent decisions (survival, version choice, per-sector tear), `step` is
-the trace step index, `offset` is the byte offset, and `version` is the version's index in that
-offset's pending list. The exact mixing function is pinned by new vectors in
-`spec/encoding/prng.toml` and checked by `prng_verify.rb`.
+`mix` is splitmix64's finalizer, the mixer `spec/encoding/prng.toml` already pins. `step` is the
+trace step index (0-based, counting only step lines), `offset` the byte offset, and `version` the
+write's index in that offset's pending list. A permille test is `decide(…) % 1000 < p`. The `lane`
+keeps independent decisions uncorrelated, and its values are part of the cross-core contract:
+
+| Lane | Decision |
+|---|---|
+| 1 | power loss: does anything land at this offset? |
+| 2 | power loss: which pending version lands (`% versions`) |
+| 3 | power loss: is the landing version torn? |
+| 4 | power loss: the sector's bytes, new or old (`& 1`), keyed by the sector's own offset |
+| 5 | `io_error op=write`: does this write fail? |
+| 6 | `process_crash`: was this write issued before the process died? |
+| 7 | `io_error op=sync`: does this pending write land or vanish (`% 2`)? |
+| 8 | a session's entropy-seam seed (`decide(seed, 8, step, 0, 0)` for the session opened at `step`) |
 
 This is what makes crash images **comparable across cores** (§8.4). Within a commit, write order is
 not a cross-core contract and may differ by core, but the set of `(offset, bytes)` pairs does not.
@@ -185,14 +204,22 @@ is sound: a failure under it is a real protocol violation, not a modeling artifa
 
 | Kind | Model | Expected outcome | Cross-core tier |
 |---|---|---|---|
-| `power_loss survive=‰ tear=‰ sector=512` | For each pending offset, `decide` chooses "nothing lands" (durable stays) or one pending version, **any** version, not only the newest, since an older one may have been written back first. With probability `tear`, the chosen version is mixed sector by sector with the durable bytes. Cache is discarded. | Recovery selects a generation allowed by §8.1–8.2, never `XX001`. | Image + transcript |
-| `process_crash` | Armed on a step: each write of that step is independently issued or not (§6.2). The `Database` is dropped without `close`. Issued writes stay in cache and remain **pending**, not durable, so a later power loss can still drop them. | The next opener sees the cache. Before its first write, a writable opener must stabilize an adopted unacknowledged generation (validated-cow §3). A later `crash power` checks that it did. | Image + transcript |
-| `io_error op=write\|sync\|set_size p=‰` | The first matching call whose `decide` falls under `p` returns a host error. A failed `sync` follows Linux "fsyncgate" semantics: each pending write independently lands or vanishes, then the error is reported. | The statement fails `58030`. The handle is poisoned: no later commit continues from an assumed root. `recover` yields the prior or in-flight generation. | Transcript only |
-| `enospc` | `set_size` growth fails. | As `io_error`. | Transcript only |
-| `read_error p=‰` | `read_at` fails. | The statement fails `58030` or returns rows matching the history. Recovery never silently selects an older commit because a read failed (validated-cow §1). | Per-core only: which pages are read depends on buffer-pool policy, which is per-core |
-| `corrupt flips=n` | Opt-in mode: flip bits in durable, non-pending pages. | `XX001` on access, or inert if the page is dead. **Never wrong rows.** | Per-core only, intrinsic oracle |
+| `power_loss survive=‰ tear=‰` | The process runs until the step's first `sync`, which never completes. Then, for each pending offset, `decide` chooses "nothing lands" (durable stays) or one pending version, **any** version, not only the newest, since an older one may have been written back first. With probability `tear`, the chosen version is mixed sector by sector with the durable bytes. Cache is discarded. | Recovery selects a generation allowed by §8.1–8.2, never `XX001`. | Image + transcript |
+| `process_crash issue=‰` | Each write of the step is independently issued or not (§6.2). The live process sees all of its own writes; at its death, at the step's first `sync`, the never-issued ones vanish from the cache. Issued writes stay **pending**, not durable, so a later power loss can still drop them. | The next opener sees the cache. Before its first write, a writable opener must stabilize an adopted unacknowledged generation (validated-cow §3). A later power loss checks that it did. | Image + transcript |
+| `io_error op=write p=‰` | The first write whose `decide` falls under `p` fails and lands nothing. | The commit fails `58030` and the handle is poisoned; recovery yields the prior generation. | Transcript |
+| `io_error op=sync nth=N` | The step's `N`th `sync` fails with Linux "fsyncgate" semantics: each pending write independently became durable or was dropped from the cache, and the error is reported once. | As above, but recovery may yield the in-flight generation if all of it landed. | Transcript |
+| `enospc`, `read_error p=‰` | Slice S3. `set_size` growth fails; `read_at` fails. A read error must surface `58030` or correct rows, and must never make recovery select an older commit (validated-cow §1). | Per-core only: which reads happen depends on buffer-pool policy, which is per-core. | Per-core |
+| `corrupt flips=n` | Slice S3. Opt-in: flip bits in durable, non-pending pages. | `XX001` on access, or inert if the page is dead. **Never wrong rows.** | Per-core only, intrinsic oracle |
 
-Writes issued after a fault fires never reach the disk.
+A fault that never reaches a `sync` (an unchanged commit, a statement inside a transaction) fires
+at the end of the step. `set_size` is never a fault point: preallocation is a host-policy detail,
+and a model that killed the process there would make the fault's reach depend on it. A process
+that died fails every later call it makes.
+
+**A process crash must not drop writes while the process still runs.** The first version of this
+model decided "never issued" at write time, so the live process read its own unwritten pages back
+as stale and reported `XX001`: a modeling artifact, not an engine bug. Unissued writes now vanish
+only at death.
 
 ### 6.4 What the model assumes
 
@@ -204,7 +231,8 @@ documented so a reader knows what a green sweep does **not** prove:
 - Writes to distinct offsets are independent. There are no misdirected writes (a page landing at
   the wrong offset).
 - A torn page is a per-sector mix of old and new bytes at the declared sector size. The default of
-  512 is more adversarial than 4 KiB atomic units.
+  64 bytes keeps tearing possible at the smallest page size (256) and is more adversarial than real
+  512-byte or 4 KiB atomic units.
 - A process crash preserves the kernel cache. A power loss preserves only durable bytes plus
   whatever subset the model chooses.
 - Reads after an error-free write return that write.
@@ -219,28 +247,32 @@ watermark exists to protect, and the profiles weight it heavily (§9). The runne
 order on one thread. That is sound by §2: every real interleaving consistent with the trace's order
 produces the same observations.
 
-The runner installs a `SeededRandomSource` derived from the trace seed and a clock that starts at a
-header-given instant and advances only on `clock` steps. Nothing in a run reads wall time or OS
-entropy.
+Each session gets a `SeededRandomSource` seeded with lane 8 of the decision function (§6.2) and a
+clock that starts at the `clock` header and advances only on `clock` steps. Nothing in a run reads
+wall time or OS entropy.
 
 ## 8. Oracles
 
 ### 8.1 The generation history
 
-The runner keeps a history of **logical digests** keyed by version:
+The runner keeps a history of **logical digests**: for each version, the digests of every
+generation attempted at it. (A version can have several: after recovery to version 5, a new commit
+produces a different version 6.)
 
-- After each acknowledged commit, it opens a read session with faults paused and computes the digest
-  of the newly committed version.
 - Immediately before each commit, it computes the digest of the in-flight version **inside the write
   session**, which sees its own writes.
+- After an acknowledged commit, a fresh read session's digest of the new version must equal that
+  in-flight digest: the commit published exactly what its transaction saw. The digest is recorded.
+- After a failed commit that wrote at least one page, the in-flight digest is recorded as attempted
+  at the next version, since a crash may still recover it.
 
-A digest is computed through SQL so every core can produce it identically. It covers the catalog
-(the `jed_tables`, `jed_columns`, `jed_indexes`, `jed_constraints`, and `jed_sequences` relations,
-[introspection.md](introspection.md)), every table's rows in primary-key order (all columns for a keyless
-table), and every sequence's state. The digest folds these with FNV-1a 64, the bench answer checksum.
+A digest is computed through SQL so every core can produce it identically:
+`SELECT * FROM` each of `jed_tables`, `jed_columns`, `jed_indexes`, `jed_constraints`, and
+`jed_sequences` ([introspection.md](introspection.md)), then `SELECT * FROM` every table in name
+order. Each result's rendered rows are sorted and folded, with the query text, into FNV-1a 64.
 
-**After every `recover`, the recovered version must be in the allowed set (§8.2) and its digest must
-equal the recorded digest for that version.** This catches torn or mixed snapshots, lost index
+**After every recovery, the recovered version must be in the allowed set (§8.2) and its digest must
+be one recorded for that version.** This catches torn or mixed snapshots, lost index
 updates, wrong row counts, and recovery of a generation that never existed, without a hand-written
 model of SQL semantics. The engine's own fault-free behavior is the reference. That is acceptable
 here because the target is durability: a semantics bug shared by the faulted and unfaulted paths
@@ -248,9 +280,9 @@ belongs to the corpus.
 
 ### 8.2 The durability floor
 
-- The **floor** is the newest version whose commit was **acknowledged** under `synchronous = on`.
-  The commit returned success, so its barrier completed. A completed stabilization sync also raises
-  the floor to the adopted version.
+- The **floor** is the newest version known durable: one whose commit was **acknowledged** under
+  `synchronous = on`, or the version published when a step began if any barrier in that step
+  completed (a stabilization sync, for example, makes an adopted generation durable).
 - The **allowed set** after a crash is every version from the floor through the newest version whose
   commit was **attempted**. Under a relaxed `synchronous` mode, the floor is the last explicit
   durability point.
@@ -259,33 +291,63 @@ belongs to the corpus.
 
 ### 8.3 Structural invariants
 
-`check` steps, and every `recover`, run a per-core, test-only integrity checker. It walks the image
-the engine actually selected and asserts:
+Two per-core, test-only checkers run at every `check`; the image checker also runs after every
+recovery, and the live checker after every commit.
 
-- the selected meta slot validates: its checksum, manifest, and every listed dependency digest;
-- every reachable page has a valid CRC and the page type its referrer expects;
-- the B+tree shape invariants ([bplus-reshape.md](bplus-reshape.md)): ordered keys within and across
-  leaves, separators bounding their children, and uniform leaf depth;
-- each table's catalog `row_count` equals its leaf total, and `root == 0` exactly when it is zero;
-- every secondary, unique, GIN, and GiST index holds exactly the entries derived from its table's
-  rows, and a unique index has no duplicates;
-- overflow chains decode, including LZ4, to their recorded lengths, and no page belongs to two chains;
-- the live page count at meta offset 56 equals the number of pages reachable from the catalog root;
+The **image checker** opens a copy of the disk the way a new process would, so meta selection and
+manifest validation (validated-cow.md §1) run first, and then walks the selected generation:
+
+- the image holds the version the runner expects;
+- the live page count at meta offset 56 equals the pages reachable from the catalog root, and every
+  reachable page lies in `[2, page_count)`;
 - the free list has no duplicates and is disjoint from the reachable set and from the selected
-  generation's manifest dependencies, and every referenced page lies below the high-water;
-- **bounded growth**: in exclusive mode over a long run, the high-water stays within a per-profile
-  bound of the live page count, which catches leaked orphans. This is the process corpus's
-  `max_page_count` idea applied continuously.
+  generation's manifest dependencies;
+- each table's storage keys ascend strictly and equal the primary-key encoding of their rows;
+- each table's persisted row count equals its leaf total;
+- each column B-tree index holds exactly the entries derived from its table's rows.
 
-A violation reports the invariant, the version, and the page.
+The **live checker** checks the running process instead: every page its committed in-memory trees
+reference (tree nodes, and the overflow chains reached through resident rows as well as faulted
+leaves) lies below the high-water and off the in-memory free list the next commit allocates from.
+It exists because the image checker asks the engine's own reachability walk what is live and
+re-derives everything from disk, so it cannot see a resident node whose references went stale. The
+stale-root bug in §14 passed the image checker and was caught only when its corruption surfaced; the
+live checker flags it at the commit that creates it.
+
+Two invariants from the original plan are not checked yet. Separator bounds and chain decoding are
+implied by the digest, which reads every row, but are not checked structurally. **Bounded growth**
+needs a reader-aware form: the engine reclaims only when no reader is pinned behind the new version
+(transactions.md §8), so a workload that always holds a reader legitimately grows without bound
+until the readers close.
+
+**Two more violations** need no checker: any statement or commit that reports `XX001` (corruption
+must never surface outside corruption mode), and **snapshot isolation** — when a reader closes, its
+digest must be one recorded for the version it pinned, however many commits, reclamations, and page
+reuses happened in between.
 
 ### 8.4 Cross-core agreement
 
-When a trace runs on several cores, the driver requires identical transcripts. Per step, the
-transcript records the outcome (`ok`, a row digest, or a SQLSTATE), the metered cost, the version
-after commit, whether an armed fault fired, and the version `recover` selected. For faults marked
-"image" in §6.3, the driver also requires a **byte-identical logical post-crash image**: pages below
-the high-water, ignoring preallocated tails.
+When a trace runs on several cores, the driver requires identical transcripts. A transcript is one
+JSON object per line, keys in exactly this order, no whitespace, hashes as 16 lowercase hex digits:
+
+```
+{"i":N,"op":"open","sid":S,"version":V}                      V: the session's base version
+{"i":N,"op":"on","sid":S,"rows":R,"affected":A,"hash":H,"cost":C}   A: -1 when not a DML count
+{"i":N,"op":"on","sid":S,"error":"23505"}
+{"i":N,"op":"commit","sid":S,"version":V}   or   …,"error":CODE}
+{"i":N,"op":"rollback","sid":S}   {"i":N,"op":"close","sid":S}
+{"i":N,"op":OP,"sid":S,"skip":true}                          the session no longer exists
+{"i":N,"op":"fault","kind":K}   {"i":N,"op":"clock"}
+{"i":N,"op":"check","version":V,"digest":D,"live":L,"pages":P,"free":F}
+{"i":N,"op":"reopen","version":V,"digest":D}
+{"i":N,"op":"crash","fired":X,"recovered":V,"digest":D,"live":L,"pages":P,"free":F}
+```
+
+`hash` folds the statement's rendered rows, sorted (row order is not what this harness tests), with
+FNV-1a 64; `fired` is `barrier`, `write`, `sync`, `end`, or `none` (a standalone `crash` step). The
+`live`/`pages`/`free` counts come from the meta page and persisted free list, which are byte-exact
+across cores. For faults marked "image" in §6.3, the driver also requires a **byte-identical
+logical post-crash image**: pages below the high-water, ignoring preallocated tails.
 
 This tier carries the CLAUDE.md §2 cross-core comparison into histories nobody wrote by hand. Three
 independently written recovery paths look at the same torn bytes and must make the same decision.
@@ -302,32 +364,42 @@ looks right.
 
 ## 9. The generator and workload profiles
 
-`scripts/sim_gen.rb` keeps a model of the schema, open sessions, gate holder, pinned readers, and
-armed faults. With that model it emits mostly valid statements, plus a configurable small fraction
-of invalid ones, so error paths (`23505`, `42P01`, `54P06`, serialization-time errors) run without
-poisoning anything they should not. After a fault the model knows the consequences: it emits
-`recover` after a crash, and after a poisoning I/O error it drops the dead handle's sessions.
+`scripts/sim_gen.rb` keeps a model of the schema, open sessions, gate holder, and pinned readers.
+With that model it emits mostly valid statements, plus a configurable small fraction of invalid ones
+(`42P01`, `22012`, `23502`), which abort the write block so commit-of-an-aborted-block runs too.
+Inserts take fresh ids and unique indexes cover only id-derived columns, so constraint errors occur
+only when intended. After a faulted commit the model cannot know whether the commit landed, so every
+table the transaction changed becomes *maybe*: its next use re-establishes it idempotently
+(`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`).
 
-Weights live in profiles (`spec/conformance/sim/profiles/*.toml`). The first set:
+Fault parameters are drawn from per-profile permille ranges, except that a quarter of the draws take
+the extreme (every write lands or is issued; nothing torn), because a complete in-flight generation
+is what a random subset rarely produces. `chain` is the fault chance for the first commit after a
+crash, whose barrier stabilizes the recovered generation.
+
+Weights live in profiles (`spec/conformance/sim/profiles/*.toml`, merged over the generator's
+defaults, which `mixed.toml` restates):
 
 | Profile | Emphasis |
 |---|---|
-| `reuse-under-pins` | Long-pinned readers, many small commits, free-list churn, crashes during reuse |
+| `mixed` | The baseline: every action, value shape, and fault kind |
+| `reuse-under-pins` | Readers held across many small commits, so reclamation and reuse run around pinned snapshots |
 | `large-values` | Overflow chains, LZ4-compressed records, `UPDATE`s that grow and shrink values |
 | `big-commits` | Transactions dirtying hundreds of pages: manifest overflow, free-list/manifest planning retries |
 | `ddl-churn` | `CREATE`/`DROP`/`ALTER` of tables and indexes, sequences, catalog-chain growth |
-| `crash-storm` | Repeated process and power crashes, including crashes during recovery stabilization |
-| `resource` | Tiny `cache_bytes`, `work_mem`, `temp_buffers`, and `max_storage_bytes` (added in slice S3) |
+| `crash-storm` | Repeated process and power crashes |
+| `stabilization` | Process crashes that leave complete unsynced generations, then a faulted next commit |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
 ## 10. Shrinking and the regression corpus
 
-A failing trace shrinks with the ddmin approach of `scripts/reduce.rb`, applied to **steps**.
-Dropping an `open` drops that session's later steps, and the failure predicate is "the same oracle
-fails on the same core". Fault parameters shrink too, for example by lowering the survival rate
-toward the minimal failing subset. The minimized trace is committed under
-`spec/conformance/sim/regress/` with a one-line comment naming the bug.
+A failing trace shrinks with ddmin applied to **steps** (`scripts/sim.rb shrink`). Removing an
+`open` leaves that session's later steps skipped, which the runner tolerates. The failure predicate
+is "the same core fails with the same violation class": the message with its step location, numbers,
+and hashes masked. The 307-step trace that found the stale-root bug shrank to 11 steps in 198 runs
+and about a second. The minimized trace is committed under `spec/conformance/sim/regress/` with a
+comment naming the bug.
 
 Regression traces carry **no pinned transcript**. They must pass every oracle on every core and agree
 across cores. A pinned transcript would break on unrelated changes, such as a new SQLSTATE, and the
@@ -338,17 +410,20 @@ oracles are what the test means.
 - **Generator and driver:** `scripts/sim_gen.rb` and `scripts/sim.rb`, Ruby per CLAUDE.md §10.
 - **Runners:** one per core, test-only, reading many traces per process so startup cost is
   amortized. A runner needs to open an engine over a caller-supplied `BlockStore`. Go runs it as an
-  internal test (`go test -run TestSim -args …`), as the existing crash tests do. Rust exposes the
-  hook behind a non-default `sim` cargo feature. TypeScript already exports the interface.
+  internal test compiled once (`go test -c`), as the existing crash tests do:
+  `impl/go/sim_{disk,runner,check}_test.go`. Rust exposes the hook behind a non-default `sim` cargo
+  feature. TypeScript already exports the interface. A runner reads `JED_SIM_IN` (a trace, a
+  directory, or a list file) and writes transcripts under `JED_SIM_OUT`.
 - **Tasks:**
-  - `mise run sim:regress` runs the regression corpus on all cores. It is in `mise run ci`, gated by a
-    `sim.trace` capability.
-  - `mise run sim:sweep [--profile P] [--seeds N] [--cores go,rust,ts]` runs a long seed sweep
-    **outside** `mise run ci`, like `stress`, and emits JSONL.
-  - `mise run sim:replay <trace|seed>` reruns one case with verbose step logging.
-- **Failure artifacts:** for each failure the driver writes the seed, profile, trace, per-core
-  transcripts, and the pre- and post-recovery images to a scratch directory. These are everything
-  needed to debug without rerunning the sweep.
+  - `mise run sim:sweep [seeds] [profile] [cores]` runs a seed sweep **outside** `mise run ci`, like
+    `stress`. 1,050 traces across all profiles take about 90 seconds on Go.
+  - `mise run sim:regress [cores]` runs the regression corpus; it joins the gate in S2.
+  - `mise run sim:replay <trace> [cores]` and `mise run sim:shrink <trace> [core]`.
+  - `mise run sim:plant [seeds]` re-runs the planted-bug check (§14), an analysis tool like mutation
+    testing.
+- **Failure artifacts:** results land in `bench/results/sim/<stamp>/`: every trace, each core's
+  transcript, the crash image a failed recovery opened, a panic's stack, and, for a commit-contents
+  violation, the digest text before and after.
 
 ## 12. Relationship to existing harnesses
 
@@ -370,15 +445,36 @@ primitive) gets a simulated implementation.
 
 ## 14. Slices
 
-1. **S1 — Foundation, Go runner.** The trace format, `sim_gen.rb` with sessions, DML/DDL, large
-   values, and small pages, the `SimDisk` with `power_loss`, `process_crash`, and `io_error`, the
-   clock and entropy injection, the history and floor oracles (§8.1–8.2), the Go integrity checker,
-   self-determinism (§8.5), and `sim:sweep --cores go`.
-   **Exit criterion: the simulator must catch bugs planted on purpose.** On a scratch branch, plant
-   each of these, as the mutation harness does: skip recovered-generation stabilization; let the free
-   list include a manifest dependency; skip one dependency digest check; return pages freed under a
-   pinned reader. Each must be caught within a fixed seed budget. A simulator that has not caught a
-   planted bug has not shown it can catch a real one.
+1. **S1 — Foundation, Go runner. Landed.** The trace format, `sim_gen.rb` with sessions, DML/DDL,
+   large values, and small pages, the `SimDisk` with `power_loss`, `process_crash`, and `io_error`,
+   the clock and entropy injection, the history, floor, isolation, and corruption oracles, the image
+   and live integrity checkers, self-determinism (§8.5), shrinking, and the mise tasks.
+   **Exit criterion: the simulator must catch bugs planted on purpose. Met.** `scripts/sim_plant.rb`
+   removes one protection at a time from the Go core and sweeps the profile built to reach it
+   (60 seeds each; the digest plant sweeps all profiles):
+
+   | Planted bug | Profile | Traces that caught it |
+   |---|---|---|
+   | skip recovered-generation stabilization | `stabilization` | 36 / 60 |
+   | let the free list include the commit's own manifest pages | `big-commits` | 26 / 60 |
+   | skip the dependency digest check | all | 10 / 420 |
+   | ignore pinned readers when reclaiming and reusing pages | `reuse-under-pins` | 60 / 60 |
+
+   Two lessons came from making this pass. The reclaim and reuse gates are **redundant defenses**:
+   disabling either alone is masked by the other (a free list that cannot be reused just grows), so
+   the plant removes both. And a plant no trace catches usually means a workload gap, not an oracle
+   gap: stabilization was caught in 4 of 600 general traces until the `stabilization` profile and
+   the `chain` knob targeted it.
+
+   **Engine bugs found.** The first sweeps found two real bugs, both now fixed with corpus entries
+   and regression traces:
+   - *DROP TABLE kept the table's ANALYZE facts* (Go and TS; Rust was correct), so the next catalog
+     write crashed on the missing table. Found on the first sweep.
+   - *A resident root leaf kept references to overflow chains its own commit had freed*, in **all
+     three cores**, so the cross-core comparison could not see it. After a reopen, or after a
+     multi-leaf table shrank back to one leaf, a commit rewrote the leaf's spilled values into fresh
+     chains; the next commit that reused the freed pages corrupted the table. No fault was needed —
+     the simulator's reopen and long histories reached it.
 2. **S2 — Rust and TS runners, cross-core tier.** The content-keyed decision vectors in `prng.toml`,
    transcript and image comparison (§8.4), the regression corpus, and `sim:regress` in CI.
 3. **S3 — Resource knobs.** Buffer-pool eviction under tiny `cache_bytes`, spill under tiny
@@ -398,9 +494,8 @@ primitive) gets a simulated implementation.
 
 ## 15. Open questions
 
-- **Generator throughput.** A Ruby generator keeps the trace language-neutral and authored once.
-  If sweeps become generator-bound, an accelerated single-core generator is an option. It must emit
-  the same trace format so its finds still replay everywhere. Decide after S1 measurements.
+- **Generator throughput.** A Ruby generator keeps the trace language-neutral and authored once. In
+  S1 the runners, not the generator, dominate sweep time, so no accelerated generator is needed.
 - **The Rust hook's shape.** Is a `sim` feature flag the right boundary, or should "open over a
   host-supplied `BlockStore`" become a real host-API capability? hosts.md already treats hosts as
   pluggable. That decision belongs to the API, not this harness.

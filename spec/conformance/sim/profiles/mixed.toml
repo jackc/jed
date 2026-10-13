@@ -1,0 +1,62 @@
+# The baseline workload profile (spec/design/simulation-testing.md §9). Every other profile states
+# only what it changes; scripts/sim_gen.rb fills the rest from its built-in defaults, which equal
+# this file. A profile changes what is EMITTED, never what is checked.
+
+description = "Balanced mix of sessions, DML, DDL, large values, and faults"
+
+page_sizes = [256, 512, 1024]   # one is drawn per trace; small pages give deep trees cheaply
+cache_bytes = [0, 2048, 8192]    # 0 = the engine default; small values force buffer-pool eviction
+steps = 300                      # approximate trace length in steps
+max_tables = 3
+max_rows = 300                   # a table stops growing past this many ids
+batch = [1, 40]                  # rows per INSERT / upsert
+max_readers = 3
+
+# Relative weights of generator actions (scripts/sim_gen.rb). An action that is impossible in the
+# current state (e.g. a statement with no write session open) is skipped for that draw.
+[weights]
+open_write = 10
+open_read = 6
+close_read = 5
+read_query = 8
+insert = 14
+update = 9
+delete = 5
+upsert = 4
+create_table = 2
+drop_table = 1
+create_index = 2
+drop_index = 1
+add_column = 1
+analyze = 1
+sequence = 1
+invalid = 1
+commit = 9
+rollback = 2
+check = 2
+reopen = 1
+clock = 1
+crash_power = 1
+crash_process = 1
+
+# Value shapes for text/bytea columns (relative weights).
+[values]
+short = 10
+long_compressible = 3
+long_incompressible = 3
+null = 2
+uuid = 1
+
+# Fault injection (simulation-testing.md §6.3). commit_fault is the permille chance a commit step
+# is armed with a fault; the kind is then drawn by weight. Ranges are permille, drawn per fault.
+[faults]
+commit_fault = 150
+chain = 150                     # the fault chance for the first commit after a crash
+power_loss = 5
+process_crash = 3
+io_error_write = 1
+io_error_sync = 1
+survive = [100, 900]
+tear = [0, 400]
+issue = [200, 900]
+io_p = [50, 500]

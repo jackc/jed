@@ -1,0 +1,16 @@
+# Repeated process and power crashes, including crashes during recovery stabilization: a commit
+# right after a recovery is the one whose first barrier stabilizes the adopted generation
+# (simulation-testing.md §9; validated-cow.md §3).
+
+description = "Repeated process and power crashes, including during recovery stabilization"
+
+[weights]
+crash_power = 5
+crash_process = 6
+commit = 12
+
+[faults]
+commit_fault = 450
+chain = 800
+power_loss = 4
+process_crash = 5

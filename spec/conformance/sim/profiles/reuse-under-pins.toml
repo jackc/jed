@@ -1,0 +1,41 @@
+# Long-pinned readers across many small commits: free-list reuse gated by the reader watermark
+# (simulation-testing.md §9). A reader must stay pinned while a commit compacts the free list and a
+# later commit reuses it, so readers here outlive many commits and crashes are rare (a crash ends
+# every reader). The planted watermark bug (§14 S1) is the yardstick for this profile.
+
+description = "Long-pinned readers, many small commits, free-list churn, crashes during reuse"
+
+page_sizes = [256, 512]
+cache_bytes = [2048]
+steps = 500
+max_tables = 2
+max_rows = 120
+max_readers = 4
+batch = [1, 6]
+
+[weights]
+open_write = 14
+open_read = 6
+close_read = 1
+read_query = 4
+insert = 6
+update = 14
+delete = 6
+upsert = 2
+commit = 16
+rollback = 1
+create_table = 1
+drop_table = 0
+create_index = 1
+drop_index = 1
+add_column = 0
+analyze = 0
+sequence = 0
+invalid = 0
+check = 1
+reopen = 0
+crash_power = 0
+crash_process = 0
+
+[faults]
+commit_fault = 15
