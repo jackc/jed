@@ -8909,8 +8909,7 @@ export class Engine {
         // GIN needs an operator class for the column type: only an array has one (else 42704),
         // and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
         // element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean, uuid,
-        // date, timestamp, timestamptz, f32, f64 (interval's GIN-element support is a separate
-        // follow-on — its key landed but the GIN slice has not; gin.md §3/§10).
+        // date, timestamp, timestamptz, f32, f64, interval.
         if (ty.kind !== "array") {
           throw engineError(
             "undefined_object",
@@ -9783,10 +9782,11 @@ export class Engine {
     }
 
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
-    // (gin.md §4). The entry is encode(term) ‖ storage_key; the fixed-width term self-delimits, so
-    // the storage key is the suffix after termWidth bytes.
+    // (gin.md §4). The entry is encode(term) ‖ storage_key; the element's KEY encoding is
+    // fixed-width, so the storage key is the suffix after the term's own length (the query term and
+    // every stored term of one element type share that width; widthBytes is 0 for interval, whose
+    // 16-byte span key is not its value encoding — encoding.md §2.10).
     const istore = this.lkpIndexStore(gb.nameKey);
-    const termWidth = widthBytes(gb.elemType);
     let pages = 0;
     let entriesVisited = 0;
     const postings: Uint8Array[][] = [];
@@ -9800,7 +9800,7 @@ export class Engine {
       const scan = istore.rangeScanWithUnits(b, []);
       pages += scan.pages;
       entriesVisited += scan.entries.length;
-      postings.push(scan.entries.map((e) => e.key.slice(termWidth)));
+      postings.push(scan.entries.map((e) => e.key.slice(prefix.length)));
     }
     meter.charge(COSTS.ginEntry * BigInt(entriesVisited));
 
@@ -24653,21 +24653,14 @@ export function exclusionPairConflicts(
   return true;
 }
 
-// ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
-// DISTINCT non-NULL array element — encode(element) ‖ storage_key, NO presence tag (a term is never
-// NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
-// they appear in no posting list). Returned sorted by term (= encoded-byte order, order-preserving
-// for every admitted element type); terms dedup by their canonical encoded bytes (so a float -0/+0
-// or two NaNs are one term).
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits — the
-// integers, boolean, uuid, date, timestamp, timestamptz, f32, f64 (spec/design/gin.md §3): a GIN term
-// IS the element's order-preserving key encoding (§4) and a term carries no length/terminator
-// framing, so only the FIXED-WIDTH keyables qualify. A float term is the canonicalizing
-// float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN), so term equality is
-// exactly SQL float =. The variable-width keyables (text, bytea, decimal) — valid ordered-index / PK
-// keys — are 0A000 here. interval is fixed-width keyable (its 16-byte span key, encoding.md §2.10)
-// but its GIN element support is a separate follow-on slice (gin.md §3/§10), so it is not yet
-// admitted here.
+// integers, boolean, uuid, date, timestamp, timestamptz, f32, f64, interval (spec/design/gin.md
+// §3): a GIN term IS the element's order-preserving key encoding (§4) and a term carries no
+// length/terminator framing, so only the FIXED-WIDTH keyables qualify. A float term is the
+// canonicalizing float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN),
+// and an interval term the 16-byte interval-span-i128 span key (encoding.md §2.10: 1 mon,
+// 30 days, 720:00:00 share one key), so term equality is exactly SQL = for both. The
+// variable-width keyables (text, bytea, decimal) — valid ordered-index / PK keys — are 0A000 here.
 export function isGinElementType(elem: Type): boolean {
   return (
     typeIsInteger(elem) ||
@@ -24676,7 +24669,8 @@ export function isGinElementType(elem: Type): boolean {
     typeIsTimestamp(elem) ||
     typeIsTimestamptz(elem) ||
     typeIsDate(elem) ||
-    typeIsFloat(elem)
+    typeIsFloat(elem) ||
+    typeIsInterval(elem)
   );
 }
 
@@ -24755,8 +24749,8 @@ function resolveExclusionDefinition(
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
-// isGinElementType's set minus the floats, kept a separate predicate so the two surfaces evolve
-// independently.
+// isGinElementType's set minus the floats and interval, kept a separate predicate so the two
+// surfaces evolve independently.
 export function isGistScalarType(ty: Type): boolean {
   return (
     typeIsInteger(ty) ||
@@ -24775,6 +24769,12 @@ export function isGistDeferredScalarType(ty: Type): boolean {
   return typeIsText(ty) || typeIsBytea(ty) || typeIsDecimal(ty) || typeIsInterval(ty);
 }
 
+// ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
+// DISTINCT non-NULL array element — encode(element) ‖ storage_key, NO presence tag (a term is never
+// NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
+// they appear in no posting list). Returned sorted by term (= encoded-byte order, order-preserving
+// for every admitted element type); terms dedup by their canonical encoded bytes (so a float -0/+0,
+// two NaNs, or span-equal intervals like 1 mon/30 days are one term).
 export function ginEntries(
   columns: Column[],
   cols: number[],
@@ -24790,8 +24790,8 @@ export function ginEntries(
   // must be resolved — skipping it would silently drop (or fail to remove) its posting entries.
   const v = residentValue(row[ci]!);
   if (v.kind !== "array") return [];
-  // Dedup by the encoded term (the encoding is a bijection: byte-dedup == value-dedup, byte-sort ==
-  // value-sort) generically over every admitted element type.
+  // Dedup by the encoded term (the key is canonical under SQL =, so byte-dedup == =-dedup, and
+  // byte-sort == value-sort) generically over every admitted element type.
   const seen = new Set<string>();
   const terms: Uint8Array[] = [];
   for (const el of v.elements) {

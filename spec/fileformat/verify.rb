@@ -1092,6 +1092,26 @@ GIN_FLOAT_TABLE = {
          [5, [-Float::INFINITY, nil, -2.5], [100.25, nil, 100.25], 5]]
 }.freeze
 
+# A GIN index over an interval[] column (the interval GIN element golden, spec/design/gin.md §2/§4):
+# each GIN term is the element's 16-byte interval-span-i128 key (encoding.md §2.10), so the
+# span-equal `1 mon` / `30 days` / `720:00:00` of row 1 are ONE term and row 2's duplicate `-1 day`
+# one more, while the stored VALUES keep each interval's own [months, days, micros] fields. Rows 3/4
+# hold an empty and a NULL whole-value array (no entries) and row 5 a NULL element. Each element is
+# the [months, days, micros] triple.
+GIN_INTERVAL_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("v", "interval[]"), col("n", "i32")],
+  indexes: [
+    { name: "i_n", cols: [2] },
+    { name: "i_v_gin", cols: [1], kind: "gin" }
+  ],
+  rows: [[1, [[1, 0, 0], [0, 30, 0], [0, 0, 2_592_000_000_000]], 1],
+         [2, [[0, -1, 0], [0, 0, 1_000_000], [0, -1, 0]], 2],
+         [3, [], 3],
+         [4, nil, 4],
+         [5, [[1200, 0, 0], nil, [-1, 0, 0]], 5]]
+}.freeze
+
 # A composite type used as an ARRAY ELEMENT type (v10 — array-of-composite, spec/design/array.md §12
 # AC1): pins the catalog array-column entry with a COMPOSITE element descriptor (type_code 15, then
 # the element descriptor element_type_code 14 + name "addr", §3) AND the recursive value body — an
@@ -1428,6 +1448,7 @@ FIXTURES = ([
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
   { file: "gin_float_table.jed", page_size: 256, tables: [GIN_FLOAT_TABLE] },
+  { file: "gin_interval_table.jed", page_size: 256, tables: [GIN_INTERVAL_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },

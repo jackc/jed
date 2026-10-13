@@ -28,12 +28,12 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   B-tree; `USING gin` selects this one.
 - **One column, a fixed-width-key-encodable-element array.** A single column whose element
   type is one of the engine's fixed-width keyable scalars — the integers (`i16[]` / `i32[]` /
-  `i64[]`), `boolean[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, and the binary floats
-  `f32[]` / `f64[]` — i.e. element types whose fixed-width order-preserving key encoding has landed
-  ([encoding.md §2.1](encoding.md), [§2.8](encoding.md) for floats), the keys an ordered-index /
-  `PRIMARY KEY` column accepts. A multi-column GIN, and an array of a variable-width element type
-  (`text[]`, `decimal[]`, `bytea[]`) or of `interval[]` (fixed-width keyable, its GIN slice not yet
-  landed), are `0A000` this slice (§3, §10) — the same "lift it when its key encoding lands"
+  `i64[]`), `boolean[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, the binary floats
+  `f32[]` / `f64[]`, and `interval[]` — i.e. element types whose fixed-width order-preserving key
+  encoding has landed ([encoding.md §2.1](encoding.md), [§2.8](encoding.md) for floats,
+  [§2.10](encoding.md) for interval), the keys an ordered-index / `PRIMARY KEY` column accepts. A
+  multi-column GIN, and an array of a variable-width element type (`text[]`, `decimal[]`,
+  `bytea[]`), are `0A000` this slice (§3, §10) — the same "lift it when its key encoding lands"
   narrowing the ordered index makes for text/decimal keys.
 - **Accelerates `@>`, `&&`, `const = ANY(col)` membership, and array `=`.** A `WHERE`
   conjunct `col @> const` (contains), `col && const` (overlaps), `const = ANY(col)` (the
@@ -115,6 +115,17 @@ core**. This slice defines exactly one opclass:
   `f32` element can equal it, so it has no term: `= ANY`, `@>`, and `=` are then provably empty
   (every query element must be present), and `&&` simply drops it. Cross-width `@>`/`&&` do not
   resolve (`42883`), so only `= ANY` and `=` reach this.
+- **Interval terms.** An interval element's term is its 16-byte `interval-span-i128` key
+  ([encoding.md §2.10](encoding.md)) — the signed 128-bit span `(months·30 + days)·86_400_000_000 +
+  micros`, PG's `interval_cmp_value` — so term equality is exactly SQL interval `=`, and PG's
+  `array_ops` (whose `interval` element comparison is that span) agrees: `1 mon`, `30 days`, and
+  `720:00:00` are ONE term. A row storing `{30 days}` is in the posting list a query `'1 mon' =
+  ANY(col)` gathers, and `{1 mon,30 days}` extracts ONE term (the dedup of §4 is over canonical
+  bytes). Only the term canonicalizes: the stored value keeps each interval's own three fields, and
+  the residual recheck (§6) compares by span too, so the rows are PG's. Interval compares only with
+  interval, so there is no cross-type query value to convert. The interval key width (16) is not
+  its value-codec width — the gather recovers each storage key by skipping the *term's* own length
+  (§4), never a per-type value width.
 - `consistent` is **the residual operator itself** — see §6: this slice always re-applies
   the original `@>`/`&&` predicate to each candidate row as the residual `WHERE` filter
   (the standard bounded-scan contract — [indexes.md §5](indexes.md)), rather than trusting
@@ -144,12 +155,11 @@ like a type name.
      message);
    - an array whose element type is **not an admitted fixed-width key-encodable scalar** is
      **0A000** this slice. The admitted element types are the integers (`i16`/`i32`/`i64`),
-     `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64` — fixed-width keys a
-     `PRIMARY KEY` / ordered-index key column accepts ([indexes.md §1](indexes.md)), because a
-     GIN term is exactly that key encoding (§4). A **variable-width** element type — `text[]`,
-     `decimal[]`, `bytea[]` — and `interval[]` (fixed-width keyable, its GIN slice not yet landed)
-     stay **0A000** (the lift-when-encoded narrowing — §1, §10; PG *would* build it, a documented
-     divergence recorded in the oracle override ledger).
+     `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval` — fixed-width
+     keys a `PRIMARY KEY` / ordered-index key column accepts ([indexes.md §1](indexes.md)), because
+     a GIN term is exactly that key encoding (§4). A **variable-width** element type — `text[]`,
+     `decimal[]`, `bytea[]` — stays **0A000** (the lift-when-encoded narrowing — §1, §10; PG
+     *would* build it, a documented divergence recorded in the oracle override ledger).
 4. **`UNIQUE` with `USING gin`** is **0A000** (uniqueness is undefined for an inverted
    index — §1; PG raises `0A000` too: "access method gin does not support unique indexes").
 5. **More than one key column** with `USING gin` is **0A000** this slice (PG *would* build a
@@ -175,12 +185,14 @@ entry_key = encode_element(term) ‖ row_storage_key
 
 - `encode_element(term)` is the element type's order-preserving key encoding
   ([encoding.md §2.1](encoding.md)) — fixed-width for every element type this slice admits
-  (the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64` — §3), so the term
+  (the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`, `f32`, `f64`, `interval` —
+  §3), so the term
   needs **no presence tag and no terminator** (a GIN term is never NULL — §2 — and a
   fixed-width term self-delimits). It is the *same* per-type key encoder a `PRIMARY KEY` /
   ordered-index key column uses, so a `uuid[]` term is the 16 raw bytes, a `date[]` term the
   i32 sign-flipped day count, a `timestamp[]` term the i64 sign-flipped microseconds, an
-  `f64[]`/`f32[]` term the canonicalized `float-order-preserving` bits (§2 *Float terms*) — each
+  `f64[]`/`f32[]` term the canonicalized `float-order-preserving` bits (§2 *Float terms*), an
+  `interval[]` term the 16-byte `interval-span-i128` span (§2 *Interval terms*) — each
   already byte-pinned by that type's key-encoding vectors and PK goldens. The future
   variable-width element types reuse the terminated/escaped encodings
   ([encoding.md §2.4–§2.6](encoding.md)) when they lift.
@@ -365,9 +377,11 @@ is a clean break (CLAUDE.md §1); a reader accepts only version 13.
 multi-element / duplicate-element / empty / NULL arrays (exercising term dedup and the
 zero-entry cases), beside one ordinary ordered index (`index_kind = 0`) in the same catalog
 (the per-index kind byte). Byte-identical across Rust, Go, TS, and the Ruby reference (the §8
-cross-core round-trip). `fixtures/gin_uuid_table.jed` and `fixtures/gin_float_table.jed` pin
-the non-integer element terms the same way — the latter the canonicalizing float key (§2 *Float
-terms*): `{1.5,-0,0}` stores three values but two entries, `{NaN,Infinity,NaN}` two.
+cross-core round-trip). `fixtures/gin_uuid_table.jed`, `fixtures/gin_float_table.jed`, and
+`fixtures/gin_interval_table.jed` pin the non-integer element terms the same way — the float one
+the canonicalizing float key (§2 *Float terms*): `{1.5,-0,0}` stores three values but two entries,
+`{NaN,Infinity,NaN}` two; the interval one the span key (§2 *Interval terms*): `{1 mon,30
+days,720:00:00}` stores three distinct values but ONE entry.
 
 ## 8. Determinism (the byte contract)
 
@@ -393,7 +407,7 @@ final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
   per-core tests), as for the ordered index ([indexes.md §7](indexes.md)).
 - **Element-type subset** — PG's `array_ops` GIN indexes an array of any element type; jed
   covers the **fixed-width key-encodable** elements (the integers, `boolean`, `uuid`, `date`,
-  `timestamp`, `timestamptz`, `f32`, `f64` — §3), the variable-width rest and `interval` `0A000`
+  `timestamp`, `timestamptz`, `f32`, `f64`, `interval` — §3), the variable-width rest `0A000`
   until their GIN slices land. A divergence on `text[]`/`decimal[]`/etc. (PG builds, jed
   `0A000`), oracle-override-ledgered.
 - **Single-column only** — PG supports multicolumn GIN; jed is `0A000` this slice (§3).
@@ -429,8 +443,8 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   `timestamp`, `timestamptz`, `boolean`, alongside the integers) have **landed** (§3): the GIN
   term is their existing key encoding, so the inverted core was unchanged — only the DDL gate
   and the per-element encoder generalized. The binary floats `f32[]`/`f64[]` have landed the same
-  way, plus the cross-width query-value conversion (§2 *Float terms*). `interval[]` (fixed-width keyable,
-  [encoding.md §2.10](encoding.md)) is its own pending slice; the **variable-width** elements —
+  way, plus the cross-width query-value conversion (§2 *Float terms*), and `interval[]` over its
+  span key (§2 *Interval terms*). The **variable-width** elements —
   `text[]`, `decimal[]`, `bytea[]` — remain `0A000` until GIN term framing for their
   terminated/escaped key encodings lands ([encoding.md §2.4–§2.6](encoding.md)); composite-element
   arrays too.

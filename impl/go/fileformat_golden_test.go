@@ -419,6 +419,23 @@ func ginFloatTableDB(t *testing.T) *Session {
 	return db
 }
 
+// ginIntervalTableDB has a GIN index over an interval[] column (kind 1) — the interval GIN element
+// golden (spec/design/gin.md §2/§4): each GIN term is the element's 16-byte interval-span-i128 key
+// (encoding.md §2.10), so row 1's span-equal 1 mon / 30 days / 720:00:00 are ONE term and row 2's
+// duplicate -1 day one more, while the stored values keep their own fields. Rows 3/4 hold an empty
+// and a NULL whole-value array (no entries) and row 5 a NULL element. An ordered index i_n sits
+// beside it.
+func ginIntervalTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v interval[], n i32)")
+	run(t, db, "INSERT INTO t VALUES "+
+		"(1, '{1 mon,30 days,720:00:00}', 1), (2, '{-1 day,1 sec,-1 day}', 2), (3, '{}', 3), "+
+		"(4, NULL, 4), (5, '{100 years,NULL,-1 mon}', 5)")
+	run(t, db, "CREATE INDEX i_n ON t (n)")
+	run(t, db, "CREATE INDEX i_v_gin ON t USING gin (v)")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 func nopkTableDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
@@ -1067,6 +1084,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gin_array_table.jed", ginArrayTableDB},
 		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"gin_float_table.jed", ginFloatTableDB},
+		{"gin_interval_table.jed", ginIntervalTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"composite_key_table.jed", compositeKeyTableDB},
@@ -1148,6 +1166,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gin_array_table.jed", ginArrayTableDB, "t"},
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
 		{"gin_float_table.jed", ginFloatTableDB, "t"},
+		{"gin_interval_table.jed", ginIntervalTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"composite_key_table.jed", compositeKeyTableDB, "t"},

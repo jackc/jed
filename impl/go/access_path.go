@@ -1801,10 +1801,11 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 	}
 
 	// Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
-	// (gin.md §4). The entry is encode(term) ‖ storage_key; the fixed-width term self-delimits, so
-	// the storage key is the suffix after termWidth bytes.
+	// (gin.md §4). The entry is encode(term) ‖ storage_key; the element's KEY encoding is
+	// fixed-width, so the storage key is the suffix after the term's own length (the query term and
+	// every stored term of one element type share that width; WidthBytes is 0 for interval, whose
+	// 16-byte span key is not its value encoding — encoding.md §2.10).
 	istore := db.lkpIndexStore(gb.nameKey)
-	termWidth := gb.elemType.WidthBytes()
 	entriesVisited := 0
 	postings := make([][][]byte, 0, len(terms))
 	for _, prefix := range terms {
@@ -1817,7 +1818,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 		entriesVisited += len(es)
 		keys := make([][]byte, len(es))
 		for i := range es {
-			keys[i] = es[i].Key[termWidth:]
+			keys[i] = es[i].Key[len(prefix):]
 		}
 		postings = append(postings, keys)
 	}

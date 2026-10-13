@@ -445,24 +445,24 @@ func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b s
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
-// the integers, boolean, uuid, date, timestamp, timestamptz, f32, f64 (spec/design/gin.md §3): a GIN
-// term IS the element's order-preserving key encoding (§4) and a term carries no length/terminator
-// framing, so only the FIXED-WIDTH keyables qualify. A float term is the canonicalizing
-// float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN), so term equality is
-// exactly SQL float =. The variable-width keyables (text, bytea, decimal) — valid ordered-index / PK
-// keys — are 0A000 here. interval is fixed-width keyable (its 16-byte span key, encoding.md §2.10)
-// but its GIN element support is a separate follow-on slice (gin.md §3/§10), so it is not yet
-// admitted here.
+// the integers, boolean, uuid, date, timestamp, timestamptz, f32, f64, interval (spec/design/gin.md
+// §3): a GIN term IS the element's order-preserving key encoding (§4) and a term carries no
+// length/terminator framing, so only the FIXED-WIDTH keyables qualify. A float term is the
+// canonicalizing float-order-preserving key (encoding.md §2.8: -0 → +0, every NaN → one NaN),
+// and an interval term the 16-byte interval-span-i128 span key (encoding.md §2.10: 1 mon,
+// 30 days, 720:00:00 share one key), so term equality is exactly SQL = for both. The
+// variable-width keyables (text, bytea, decimal) — valid ordered-index / PK keys — are 0A000 here.
 func isGinElementType(elem scalarType) bool {
 	return elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
-		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate() || elem.IsFloat()
+		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate() || elem.IsFloat() ||
+		elem.IsInterval()
 }
 
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
-// isGinElementType's set minus the floats, kept a separate predicate so the two surfaces evolve
-// independently.
+// isGinElementType's set minus the floats and interval, kept a separate predicate so the two
+// surfaces evolve independently.
 func isGistScalarType(ty dataType) bool {
 	return ty.IsInteger() || ty.IsBool() || ty.IsUuid() ||
 		ty.IsTimestamp() || ty.IsTimestamptz() || ty.IsDate()
@@ -493,8 +493,9 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 	if v.Kind != ValArray {
 		return nil, nil
 	}
-	// Dedup by the encoded term (the encoding is a bijection: byte-dedup == value-dedup, byte-sort
-	// == value-sort) generically over every admitted element type.
+	// Dedup by the encoded term (the key is canonical under SQL =: a float -0/+0 or two NaNs, or
+	// span-equal intervals like 1 mon/30 days, share one key — so byte-dedup == =-dedup, and
+	// byte-sort == value-sort) generically over every admitted element type.
 	seen := make(map[string]bool)
 	var terms [][]byte
 	for _, el := range v.arrayVal().Elements {

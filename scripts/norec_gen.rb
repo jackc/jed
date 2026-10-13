@@ -150,6 +150,11 @@
 #              canonicalizing float key (-0 = +0, NaN = NaN); the equivalent `NOT (k <> ALL(col))` /
 #              `Q <@ col` / `NOT (col <> Q)` are NOT GIN-accelerated (full scan). Both must return the
 #              by-construction rows under PostgreSQL's total float equality.
+#   gin_interval — GIN over interval[] (gin.md §3/§6): `k = ANY(col)` / `col @> Q` / `col = Q`
+#              gather through the 16-byte span key, so span-equal spellings (`1 mon` / `30 days` /
+#              `720:00:00`) are one term; the equivalent `NOT (k <> ALL(col))` / `Q <@ col` /
+#              `NOT (col <> Q)` are NOT GIN-accelerated (full scan). Both must return the
+#              by-construction rows under PG's span equality (interval_cmp_value).
 #   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
 #              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
@@ -359,6 +364,10 @@ GIN_FLOAT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan
                    query.select query.order_by query.logical_connectives types.i32 types.f64
                    types.f32 types.array func.array_containment func.array_quantified
                    cast.operator].freeze
+GIN_INTERVAL_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_any_eq
+                      query.gin_array_eq query.gin_interval_elements dml.insert dml.insert_multi_row
+                      query.select query.order_by query.logical_connectives types.i32 types.interval
+                      types.array func.array_containment func.array_quantified cast.operator].freeze
 GIN_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_mutation query.gin_any_eq
                  dml.insert dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                  query.order_by types.i32 types.array func.array_containment func.array_quantified].freeze
@@ -2254,6 +2263,81 @@ def gen_gin_float(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN over interval element arrays (bounded vs full-scan spellings) -----------------
+# A GIN term over `interval[]` is the 16-byte `interval-span-i128` key (encoding.md §2.10): the
+# span `(months·30 + days)·86_400_000_000 + micros`, PG's interval_cmp_value — so span-equal
+# spellings share one term, and term equality must be exactly SQL interval `=` (gin.md §3). Each
+# pair is a GIN-accelerated spelling vs a semantically identical one the GIN matcher never takes:
+# `k = ANY(col)` vs `NOT (k <> ALL(col))` (no NULL elements are generated, so both are exactly
+# "col holds an element equal to k"), `col @> Q` vs `Q <@ col`, and `col = Q` vs `NOT (col <> Q)`.
+# Query values are spelled independently of the stored values. Expected rows come from a Ruby
+# model of the span equality, so this catches a span/term bug all three cores might share, which
+# differential testing alone cannot.
+def gen_gin_interval(seed)
+  rng = Random.new(seed)
+  day = 86_400_000_000
+  # Each span class lists several spellings of the SAME span (PG interval_cmp_value).
+  spellings = {
+    30 * day => ["1 mon", "30 days", "720:00:00", "43200 minutes"],
+    day => ["1 day", "24:00:00", "86400 seconds"],
+    -day => ["-1 day", "-24:00:00", "1 mon -31 days"],
+    0 => ["00:00:00", "1 mon -30 days", "0 seconds"],
+    360 * day => ["1 year", "360 days", "12 mons"],
+    1_000_000 => ["1 sec", "00:00:01", "1000 milliseconds"],
+    2 * day => ["2 days", "48:00:00"]
+  }
+  spans = spellings.keys
+  spell = ->(span) { spellings.fetch(span).sample(random: rng) }
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, spans): 0..3 span classes per row, each element spelled independently; one row is NULL and
+  # some are empty {}. No NULL ELEMENTS (keeps the <> ALL / <> spellings exact).
+  rows = ids.map do |id|
+    next [id, nil, nil] if id == null_id
+
+    ss = Array.new(rng.rand(0..3)) { spans.sample(random: rng) }
+    [id, ss, ss.map { |sp| spell.call(sp) }]
+  end
+  matching = lambda do |&pred|
+    rows.select { |_id, ss, _| !ss.nil? && pred.call(ss) }.map { |id, _, _| id.to_s }
+  end
+  member = ->(k) { matching.call { |ss| ss.include?(k) } }
+  contains = ->(ks) { matching.call { |ss| ks.all? { |k| ss.include?(k) } } }
+  equal = ->(qs) { matching.call { |ss| ss == qs } }
+
+  lit = ->(t) { t.nil? ? "NULL" : "'{#{t.map { |e| "\"#{e}\"" }.join(',')}}'" }
+  arr = ->(ss) { "'{#{ss.map { |sp| "\"#{spell.call(sp)}\"" }.join(',')}}'::interval[]" }
+
+  out = header(seed, GIN_INTERVAL_REQ,
+               "GIN over interval element arrays (bounded vs full-scan spellings)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v interval[])")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, _, t| "(#{id}, #{lit.call(t)})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_v_gin ON t USING gin (v)")
+
+  spans.sample(3, random: rng).each do |k|
+    ks = spell.call(k)
+    exp = member.call(k)
+    out << "# '#{ks}'::interval = ANY(v) — GIN bound vs NOT (<> ALL) full scan"
+    q(out, "I", "SELECT id FROM t WHERE '#{ks}'::interval = ANY(v) ORDER BY id", exp)
+    q(out, "I", "SELECT id FROM t WHERE NOT ('#{ks}'::interval <> ALL(v)) ORDER BY id", exp)
+  end
+
+  pair = spans.sample(2, random: rng)
+  exp = contains.call(pair)
+  out << "# v @> a two-span query — GIN bound vs <@ full scan"
+  q(out, "I", "SELECT id FROM t WHERE v @> #{arr.call(pair)} ORDER BY id", exp)
+  q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair)} <@ v ORDER BY id", exp)
+
+  # An existing non-empty row, every element re-spelled (still equal under span =).
+  eq_src = rows.filter_map { |_id, ss, _| ss }.reject(&:empty?).sample(random: rng) || [day]
+  exp = equal.call(eq_src)
+  out << "# v = a re-spelled stored array — GIN bound + residual = vs NOT (<>) full scan"
+  q(out, "I", "SELECT id FROM t WHERE v = #{arr.call(eq_src)} ORDER BY id", exp)
+  q(out, "I", "SELECT id FROM t WHERE NOT (v <> #{arr.call(eq_src)}) ORDER BY id", exp)
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: GIN-bounded UPDATE/DELETE (index-bound mutation vs <@ full-scan mutation) ---------
 # A GIN-bounded UPDATE/DELETE bounds its TARGET-ROW scan through the index (spec/design/gin.md §6;
 # query.gin_mutation): `UPDATE … WHERE tags @> Q` takes the @> bound, `DELETE … WHERE c = ANY(tags)`
@@ -3776,6 +3860,7 @@ SCENARIOS = {
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),
   "gin_float" => method(:gen_gin_float),
+  "gin_interval" => method(:gen_gin_interval),
   "gin_mut" => method(:gen_gin_mutation),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),

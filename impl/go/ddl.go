@@ -3415,8 +3415,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			// GIN needs an operator class for the column type: only an array has one (else 42704),
 			// and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
 			// element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean,
-			// uuid, date, timestamp, timestamptz, f32, f64 (interval's GIN-element support is a separate
-			// follow-on — its key landed but the GIN slice has not; gin.md §3/§10).
+			// uuid, date, timestamp, timestamptz, f32, f64, interval.
 			if ty.Array == nil {
 				return outcome{}, newError(UndefinedObject,
 					"data type "+ty.CanonicalName()+" has no default operator class for access method gin")

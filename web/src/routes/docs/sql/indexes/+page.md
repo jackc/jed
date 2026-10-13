@@ -280,16 +280,20 @@ Equality is stricter than containment — `tags = ARRAY[10, 20]` keeps only `gin
 GIN this release covers a focused surface (it grows from here):
 
 - **One column, an array of a fixed-width key-encodable element type** — the integers (`i16[]`,
-  `i32[]`, `i64[]`), plus `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`, and the
-  binary floats (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding and carries no
-  length/terminator framing, so only the fixed-width keyables qualify: the *variable-width* keyables
-  (`text[]`, `numeric[]`, `bytea[]`) — though their elements are valid ordered-index / `PRIMARY KEY`
-  keys — are rejected `0A000` here, as are `interval[]` and a multi-column GIN.
+  `i32[]`, `i64[]`), plus `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]`,
+  `interval[]`, and the binary floats (`f32[]`, `f64[]`). A GIN term *is* the element's key encoding
+  and carries no length/terminator framing, so only the fixed-width keyables qualify: the
+  *variable-width* keyables (`text[]`, `numeric[]`, `bytea[]`) — though their elements are valid
+  ordered-index / `PRIMARY KEY` keys — are rejected `0A000` here, as is a multi-column GIN.
 - **Float elements match like float `=`** — `-0` and `0` are one term and every `NaN` is one term
   (PostgreSQL's float order: `-0 = 0`, `NaN = NaN`), so `0 = ANY(col)` finds a stored `{-0}` and
   `'NaN'::f64 = ANY(col)` finds a stored `{NaN}`. A query value of the other float width works too:
   `'1.5'::f64 = ANY(f32_col)` uses the index, while an `f64` no `f32` can represent (such as
   `0.1`) matches nothing, exactly as the full scan would.
+- **Interval elements match like interval `=`** — intervals compare by their total span (a month
+  counts as 30 days, a day as 24 hours), so `1 mon`, `30 days`, and `720:00:00` are one term:
+  `'1 mon'::interval = ANY(col)` finds a stored `{30 days}`, exactly as the full scan would. The
+  stored values keep their own spelling.
 - **`@>`, `&&`, `= ANY`, and array `=` only** — `<@` (contained-by) and `IN` over a scalar list
   still run, by full scan; they are not GIN-accelerated yet.
 - **No `UNIQUE`** — an inverted index has many entries per row, so `CREATE UNIQUE INDEX … USING gin`

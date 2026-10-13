@@ -682,6 +682,34 @@ fn gin_float_table_db() -> Session {
     db
 }
 
+/// `i_v_gin` — a GIN index over an interval[] column (kind 1) — the interval GIN element golden
+/// (spec/design/gin.md §2/§4): each GIN term is the element's 16-byte `interval-span-i128` key
+/// (encoding.md §2.10), so row 1's span-equal `1 mon` / `30 days` / `720:00:00` are ONE term and
+/// row 2's duplicate `-1 day` one more, while the stored values keep their own fields. Rows 3/4
+/// hold an empty and a NULL whole-value array (no entries) and row 5 a NULL element. An ordered
+/// index i_n sits beside it.
+fn gin_interval_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, v interval[], n i32)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES \
+         (1, '{1 mon,30 days,720:00:00}', 1), (2, '{-1 day,1 sec,-1 day}', 2), (3, '{}', 3), \
+         (4, NULL, 4), (5, '{100 years,NULL,-1 mon}', 5)",
+    );
+    run(&mut db, "CREATE INDEX i_n ON t (n)");
+    run(&mut db, "CREATE INDEX i_v_gin ON t USING gin (v)");
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
@@ -1755,6 +1783,7 @@ fn write_matches_goldens() {
         ("gin_array_table.jed", gin_array_table_db),
         ("gin_uuid_table.jed", gin_uuid_table_db),
         ("gin_float_table.jed", gin_float_table_db),
+        ("gin_interval_table.jed", gin_interval_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("composite_key_table.jed", composite_key_table_db),
@@ -1854,6 +1883,7 @@ fn read_goldens_reproduces_rows() {
         ("gin_array_table.jed", gin_array_table_db, "t"),
         ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
         ("gin_float_table.jed", gin_float_table_db, "t"),
+        ("gin_interval_table.jed", gin_interval_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("composite_key_table.jed", composite_key_table_db, "t"),

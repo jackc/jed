@@ -352,10 +352,12 @@ impl Engine {
         }
 
         // Gather each term's posting list: the entry range [encode(term), successor) of the GIN
-        // tree (gin.md §4). The entry is `encode_element(term) ‖ storage_key`; the element type is
-        // fixed-width, so the storage key is the suffix after `term_width` bytes.
+        // tree (gin.md §4). The entry is `encode_element(term) ‖ storage_key`; the element's KEY
+        // encoding is fixed-width, so the storage key is the suffix after the term's own length
+        // (the query term and every stored term of one element type share that width;
+        // `width_bytes()` is 0 for interval, whose 16-byte span key is not its value encoding —
+        // encoding.md §2.10).
         let istore = self.index_store(&gb.name_key);
-        let term_width = gb.elem_type.width_bytes();
         let mut pages = 0usize;
         let mut entries_visited = 0usize;
         let mut postings: Vec<Vec<Vec<u8>>> = Vec::with_capacity(terms.len());
@@ -371,7 +373,7 @@ impl Engine {
             entries_visited += es.len();
             postings.push(
                 es.into_iter()
-                    .map(|(ekey, _)| ekey[term_width..].to_vec())
+                    .map(|(ekey, _)| ekey[prefix.len()..].to_vec())
                     .collect(),
             );
         }

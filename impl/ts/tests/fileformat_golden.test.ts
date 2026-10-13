@@ -446,6 +446,26 @@ function ginFloatTableDB(): Engine {
   return db;
 }
 
+// ginIntervalTableDB has a GIN index over an interval[] column (kind 1) — the interval GIN element
+// golden (spec/design/gin.md §2/§4): each GIN term is the element's 16-byte interval-span-i128 key
+// (encoding.md §2.10), so row 1's span-equal 1 mon / 30 days / 720:00:00 are ONE term and row 2's
+// duplicate -1 day one more, while the stored values keep their own fields. Rows 3/4 hold an empty
+// and a NULL whole-value array (no entries) and row 5 a NULL element. An ordered index i_n sits
+// beside it.
+function ginIntervalTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v interval[], n i32)");
+  run(
+    db,
+    "INSERT INTO t VALUES " +
+      "(1, '{1 mon,30 days,720:00:00}', 1), (2, '{-1 day,1 sec,-1 day}', 2), (3, '{}', 3), " +
+      "(4, NULL, 4), (5, '{100 years,NULL,-1 mon}', 5)",
+  );
+  run(db, "CREATE INDEX i_n ON t (n)");
+  run(db, "CREATE INDEX i_v_gin ON t USING gin (v)");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 function nopkTableDB(): Engine {
   const db = goldenDb();
@@ -1102,6 +1122,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "gin_float_table.jed", build: ginFloatTableDB },
+    { name: "gin_interval_table.jed", build: ginIntervalTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "composite_key_table.jed", build: compositeKeyTableDB },
@@ -1181,6 +1202,7 @@ test("read goldens reproduces rows", () => {
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "gin_float_table.jed", build: ginFloatTableDB, table: "t" },
+    { name: "gin_interval_table.jed", build: ginIntervalTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "composite_key_table.jed", build: compositeKeyTableDB, table: "t" },

@@ -1,0 +1,241 @@
+# GIN over interval element arrays — a `USING gin` index, and every GIN-bounded scan it accelerates
+# (`@>`, `&&`, `= ANY`, array `=`, and the GIN-bounded UPDATE/DELETE), admit an `interval[]` column
+# (spec/design/gin.md §3). A GIN term IS the element's 16-byte `interval-span-i128` key (encoding.md
+# §2.10): the span `(months·30 + days)·86_400_000_000 + micros` (PG `interval_cmp_value`), so term
+# equality is exactly SQL interval `=` — `1 mon`, `30 days`, and `720:00:00` are one term, a row
+# storing any of them is found by a query spelling any other, and `{1 mon,30 days}` yields ONE entry.
+# The stored values keep their own fields (and render distinctly); only the index terms collapse.
+#
+# The rows and end state match PostgreSQL's interval[] array_ops GIN (index presence never changes
+# results). The `# cost:` assertions pin that the GIN bound — not a full scan — is taken, cross-core
+# identical (CLAUDE.md §8); query/gin_interval_elements_explain.test pins the plan itself.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_element_types, query.gin_interval_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, cast.operator, types.interval, types.i32, types.array, resource.cost_metering
+
+# ============================================================================
+# The index is created BEFORE the rows (every entry arrives through INSERT maintenance).
+# ============================================================================
+
+statement ok
+CREATE TABLE iv (id i32 PRIMARY KEY, v interval[])
+
+statement ok
+CREATE INDEX iv_v_gin ON iv USING gin (v)
+
+statement ok
+INSERT INTO iv VALUES
+  (1, '{1 mon,2 days}'),
+  (2, '{30 days}'),
+  (3, '{720:00:00}'),
+  (4, '{-1 day,NULL}'),
+  (5, '{}'),
+  (6, NULL),
+  (7, '{1 mon,30 days}'),
+  (8, '{1 year,00:00:00.000001}'),
+  (9, '{1 day,24:00:00}'),
+  (10, '{-1 mon +30 days}')
+
+# = ANY: 1 mon, 30 days and 720:00:00 share one span term, so each spelling finds all three
+# spellings → ids 1, 2, 3, 7
+# cost: 25
+query I nosort
+SELECT id FROM iv WHERE '1 mon'::interval = ANY(v) ORDER BY id
+----
+1
+2
+3
+7
+
+# cost: 25
+query I nosort
+SELECT id FROM iv WHERE '30 days'::interval = ANY(v) ORDER BY id
+----
+1
+2
+3
+7
+
+# cost: 25
+query I nosort
+SELECT id FROM iv WHERE '720 hours'::interval = ANY(v) ORDER BY id
+----
+1
+2
+3
+7
+
+# the stored values keep their own spellings — only the index term is the span
+query IT nosort
+SELECT id, v FROM iv WHERE '43200 minutes'::interval = ANY(v) ORDER BY id
+----
+1
+{"1 mon","2 days"}
+2
+{"30 days"}
+3
+{720:00:00}
+7
+{"1 mon","30 days"}
+
+# = ANY: -1 mon +30 days has span 0, so it is the zero interval's term → id 10
+# cost: 7
+query I nosort
+SELECT id FROM iv WHERE '00:00:00'::interval = ANY(v) ORDER BY id
+----
+10
+
+# = ANY: a one-microsecond span is its own term → id 8
+# cost: 8
+query I nosort
+SELECT id FROM iv WHERE '0.000001 seconds'::interval = ANY(v) ORDER BY id
+----
+8
+
+# = ANY with a typed NULL: provably empty
+# cost: 0
+query I nosort
+SELECT id FROM iv WHERE NULL::interval = ANY(v) ORDER BY id
+----
+
+# @> (contains): a span-equal spelling of each query element → ids 1, 2, 3, 7
+# cost: 21
+query I nosort
+SELECT id FROM iv WHERE v @> '{30 days}'::interval[] ORDER BY id
+----
+1
+2
+3
+7
+
+# @> with two elements (the two-posting-list intersection): 720 hours and 48 hours → id 1
+# cost: 11
+query I nosort
+SELECT id FROM iv WHERE v @> '{720 hours,48 hours}'::interval[] ORDER BY id
+----
+1
+
+# @> with 1 day spelled as 24 hours: row 9's {1 day,24:00:00} (one term) → id 9
+# cost: 6
+query I nosort
+SELECT id FROM iv WHERE v @> '{24 hours}'::interval[] ORDER BY id
+----
+9
+
+# @> miss: no row holds 2 mon → an empty posting list
+# cost: 1
+query I nosort
+SELECT id FROM iv WHERE v @> '{2 mon}'::interval[] ORDER BY id
+----
+
+# && (overlaps): 360 days is 1 year's span, -24 hours is -1 day's → ids 4, 8 (the posting-list union)
+# cost: 12
+query I nosort
+SELECT id FROM iv WHERE v && '{360 days,-24 hours}'::interval[] ORDER BY id
+----
+4
+8
+
+# = (exact array equality): element-wise interval =, so {30 days} equals the stored {30 days} and
+# {720:00:00} but not the two-element {1 mon,30 days} → ids 2, 3
+# cost: 19
+query I nosort
+SELECT id FROM iv WHERE v = '{30 days}'::interval[] ORDER BY id
+----
+2
+3
+
+# = in another spelling of row 7, element by element → id 7
+# cost: 18
+query I nosort
+SELECT id FROM iv WHERE v = '{720:00:00,1 mon}'::interval[] ORDER BY id
+----
+7
+
+# GIN-bounded DELETE: remove every row holding a span-equal 1 mon → ids 1, 2, 3, 7; the index is
+# maintained (a probe after the delete finds that span in no surviving row)
+# cost: 21
+statement ok
+DELETE FROM iv WHERE '30 days'::interval = ANY(v)
+
+# cost: 1
+query I nosort
+SELECT id FROM iv WHERE '1 mon'::interval = ANY(v) ORDER BY id
+----
+
+query I nosort
+SELECT id FROM iv ORDER BY id
+----
+4
+5
+6
+8
+9
+10
+
+# ============================================================================
+# The index is created AFTER the rows (the CREATE INDEX build path).
+# ============================================================================
+
+statement ok
+CREATE TABLE jv (id i32 PRIMARY KEY, w interval[])
+
+statement ok
+INSERT INTO jv VALUES
+  (1, '{1 day,1 mon}'),
+  (2, '{24:00:00}'),
+  (3, '{-2 years}'),
+  (4, '{-720 days,1 mon -30 days}'),
+  (5, '{}'),
+  (6, NULL)
+
+statement ok
+CREATE INDEX jv_w_gin ON jv USING gin (w)
+
+# = ANY: 1 day spelled in hours → ids 1, 2
+# cost: 13
+query I nosort
+SELECT id FROM jv WHERE '24 hours'::interval = ANY(w) ORDER BY id
+----
+1
+2
+
+# = ANY: -2 years is -720 days' span → ids 3, 4
+# cost: 13
+query I nosort
+SELECT id FROM jv WHERE '-720 days'::interval = ANY(w) ORDER BY id
+----
+3
+4
+
+# @> across spellings: {30 days, 86400 seconds} → id 1
+# cost: 9
+query I nosort
+SELECT id FROM jv WHERE w @> '{30 days,86400 seconds}'::interval[] ORDER BY id
+----
+1
+
+# && (overlaps): 1 day (ids 1, 2) or the zero span (row 4's 1 mon -30 days) → ids 1, 2, 4
+# cost: 17
+query I nosort
+SELECT id FROM jv WHERE w && '{1 day,0 seconds}'::interval[] ORDER BY id
+----
+1
+2
+4
+
+# GIN-bounded UPDATE: rewrite the rows holding a 1-day span; the entry set moves with the new value
+# cost: 9
+statement ok
+UPDATE jv SET w = '{3 days}' WHERE w @> '{1440 minutes}'::interval[]
+
+# cost: 1
+query I nosort
+SELECT id FROM jv WHERE '1 day'::interval = ANY(w) ORDER BY id
+----
+
+# cost: 13
+query I nosort
+SELECT id FROM jv WHERE '72 hours'::interval = ANY(w) ORDER BY id
+----
+1
+2
