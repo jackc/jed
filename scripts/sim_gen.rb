@@ -40,13 +40,16 @@ module SimGen
     "max_rows" => 300,
     "batch" => [1, 40],
     "max_readers" => 3,
+    "processes" => "single",
+    "max_procs" => 3,
     "weights" => {
       "open_write" => 10, "open_read" => 6, "close_read" => 5, "read_query" => 8,
       "insert" => 14, "update" => 9, "delete" => 5, "upsert" => 4,
       "create_table" => 2, "drop_table" => 1, "create_index" => 2, "drop_index" => 1,
       "add_column" => 1, "analyze" => 1, "sequence" => 1, "invalid" => 1,
       "commit" => 9, "rollback" => 2, "check" => 2, "reopen" => 1, "clock" => 1,
-      "crash_power" => 1, "crash_process" => 1, "compact" => 0
+      "crash_power" => 1, "crash_process" => 1, "compact" => 0,
+      "spawn" => 0, "exit" => 0, "kill" => 0, "tick" => 0
     },
     "values" => {
       "short" => 10, "long_compressible" => 3, "long_incompressible" => 3, "null" => 2, "uuid" => 1
@@ -142,6 +145,9 @@ module SimGen
       @readers = {}         # reader session id => table names visible at its open
       @sequences = []       # sequence names ever created
       @next = Hash.new(0)   # name counters
+      @shared = @p["processes"] == "shared" # several processes over one file (slice S5)
+      @procs = [0]          # the running processes
+      @pid_of = {}          # session id => its process
     end
 
     def generate
@@ -159,6 +165,7 @@ module SimGen
         # (54P06, or a 54P05 that aborted the block), so every commit is as uncertain as a faulted one.
         @limited ||= value.positive? && knob != "work_mem"
       end
+      header << "# processes: shared" if @shared
       header << "# clock: 1700000000000000"
       bootstrap
       step_once while @lines.length < @steps
@@ -208,6 +215,10 @@ module SimGen
       when "crash_power" then crash_power
       when "crash_process" then crash_process
       when "compact" then compact
+      when "spawn" then spawn if @shared
+      when "exit" then exit_process if @shared
+      when "kill" then kill_process_step if @shared
+      when "tick" then emit("tick") if @shared
       else
         writer_statement(action)
       end
@@ -219,7 +230,7 @@ module SimGen
       @writer = fresh("w")
       @working = @committed.transform_values(&:deep_dup)
       @aborted = false
-      emit("open #{@writer} write")
+      emit("open #{@writer} write#{in_process(@writer)}")
     end
 
     def open_read
@@ -227,7 +238,69 @@ module SimGen
 
       sid = fresh("r")
       @readers[sid] = @committed.keys.sort
-      emit("open #{sid} read")
+      emit("open #{sid} read#{in_process(sid)}")
+    end
+
+    # In a shared trace a session opens in a random running process (` p<N>`); otherwise in p0, with
+    # no suffix and no draw.
+    def in_process(sid)
+      return "" unless @shared
+
+      pid = @rng.pick(@procs)
+      @pid_of[sid] = pid
+      " p#{pid}"
+    end
+
+    # --- processes (slice S5) ---------------------------------------------------------------------
+
+    # Joining needs the running processes' probes to make room, and a process holding an open write
+    # session cannot until that writer ends — which no single simulated step can wait for — so a
+    # process spawns only while no writer is open.
+    def spawn
+      free = (0...@p["max_procs"]).reject { |pid| @procs.include?(pid) }
+      return if free.empty? || @writer
+
+      pid = @rng.pick(free)
+      @procs = (@procs + [pid]).sort
+      emit("spawn p#{pid}")
+    end
+
+    # A clean exit rolls back the process's writer and closes its readers. The last process stays.
+    def exit_process
+      return if @procs.length < 2
+
+      pid = @rng.pick(@procs)
+      emit("exit p#{pid}")
+      end_process(pid)
+    end
+
+    def kill_process_step
+      pid = @rng.pick(@procs)
+      emit("kill p#{pid}")
+      @after_crash = true
+      end_process(pid)
+    end
+
+    # end_process forgets pid's sessions. When no process is left, the runner reopens p0.
+    def end_process(pid)
+      @readers.delete_if { |sid, _| @pid_of[sid] == pid }
+      if @writer && @pid_of[@writer] == pid
+        @writer = nil
+        @working = nil
+      end
+      @procs.delete(pid)
+      @procs = [0] if @procs.empty?
+    end
+
+    # A fault on a step kills the process running it; a power loss kills them all (S5). In a single-
+    # process trace every fault ends every session.
+    def fault_kills(line, pid)
+      if !@shared || line.start_with?("fault power_loss") || @procs.length < 2
+        kill_sessions
+      else
+        @after_crash = true
+        end_process(pid)
+      end
     end
 
     def close_read
@@ -244,11 +317,12 @@ module SimGen
       rate = @after_crash ? @p.dig("faults", "chain") : @p.dig("faults", "commit_fault")
       faulted = fault && @rng.chance(rate)
       @after_crash = faulted
-      emit(fault_line) if faulted
+      line = fault_line if faulted
+      emit(line) if faulted
       emit("commit #{@writer}")
       if faulted
         merge_uncertain
-        kill_sessions
+        fault_kills(line, @pid_of[@writer])
       elsif @limited
         merge_uncertain
         @writer = nil
@@ -271,6 +345,7 @@ module SimGen
       @writer = nil
       @working = nil
       @readers.clear
+      @procs = [0]
       emit("reopen")
     end
 
@@ -280,10 +355,11 @@ module SimGen
       faulted = @rng.chance(@p.dig("faults", "compact_fault"))
       if faulted
         kind = @rng.chance(500) ? "power_loss survive=#{draw('survive')} tear=#{draw('tear')}" : "process_crash issue=#{draw('issue')}"
-        emit("fault #{kind} nth=#{@rng.range(1, 3)}")
+        line = "fault #{kind} nth=#{@rng.range(1, 3)}"
+        emit(line)
       end
       emit("compact")
-      kill_sessions if faulted
+      fault_kills(line, @procs.min) if faulted
     end
 
     def crash_power
@@ -302,6 +378,7 @@ module SimGen
       @writer = nil
       @working = nil
       @readers.clear
+      @procs = [0]
     end
 
     # A permille fault parameter. A quarter of the draws take the range's extreme — every write lands

@@ -1,0 +1,28 @@
+# Several processes over one file under the shared locking protocol (locking.md; simulation-testing.md
+# §14 S5): processes join and leave, so the presence lease moves between alone and shared; co-resident
+# commits are append-only; every transaction begin refreshes meta; and a process killed mid-commit
+# leaves a generation the others may adopt and must stabilize before writing.
+
+description = "Processes joining, leaving, and dying around a shared file"
+
+processes = "shared"
+max_procs = 3
+page_sizes = [256, 512]
+max_readers = 4
+
+[weights]
+spawn = 4
+exit = 2
+kill = 2
+tick = 5
+open_read = 7
+close_read = 4
+crash_power = 1
+crash_process = 1
+
+[faults]
+commit_fault = 250
+nth_max = 2
+power_loss = 2
+process_crash = 7
+issue = [800, 1000]

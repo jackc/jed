@@ -19,7 +19,9 @@ import { persistImpl } from "../persist.ts";
 import { seededRandomSource } from "../seam.ts";
 import { Database, type Session } from "../shared.ts";
 import { FileSpillSink } from "../spillfile.ts";
+import { FileCoordinator } from "../coordinator.ts";
 import { CheckError, checkImage, checkLive as checkLiveDatabase } from "./check.ts";
+import { SimDeadlock, SimLockHost, SimLockTable } from "./locks.ts";
 import { LANE_SESSION, MAIN_FILE, SimFS, type SimFault } from "./disk.ts";
 import {
   atoi,
@@ -43,6 +45,7 @@ const SECTOR_DEFAULT = 64;
 export type SimStep = {
   line: number;
   kind: string;
+  pid: number; // open (the session's process), spawn, exit, kill
   sid: string;
   mode: string;
   sql: string;
@@ -67,12 +70,29 @@ export function parseTrace(text: string): SimTrace {
       continue;
     }
     const f = fields(line);
-    const st: SimStep = { line: n + 1, kind: f[0]!, sid: "", mode: "", sql: "", params: new Map() };
+    const st: SimStep = {
+      line: n + 1,
+      kind: f[0]!,
+      pid: 0,
+      sid: "",
+      mode: "",
+      sql: "",
+      params: new Map(),
+    };
     switch (st.kind) {
       case "open":
-        if (f.length !== 3) throw new Error(`line ${n + 1}: open <sid> read|write`);
+        if (f.length !== 3 && f.length !== 4) {
+          throw new Error(`line ${n + 1}: open <sid> read|write [p<N>]`);
+        }
         st.sid = f[1]!;
         st.mode = f[2]!;
+        if (f.length === 4) st.pid = parsePid(f[3]!, n + 1);
+        break;
+      case "spawn":
+      case "exit":
+      case "kill":
+        if (f.length !== 2) throw new Error(`line ${n + 1}: ${st.kind} p<N>`);
+        st.pid = parsePid(f[1]!, n + 1);
         break;
       case "on": {
         if (f.length < 3) throw new Error(`line ${n + 1}: on <sid> <sql>`);
@@ -106,6 +126,7 @@ export function parseTrace(text: string): SimTrace {
       case "check":
       case "reopen":
       case "compact":
+      case "tick":
         break;
       default:
         throw new Error(`line ${n + 1}: unknown step ${JSON.stringify(st.kind)}`);
@@ -116,6 +137,15 @@ export function parseTrace(text: string): SimTrace {
     throw new Error("missing `# format: simulation` header");
   }
   return tr;
+}
+
+// parsePid parses a process name, p<N>.
+function parsePid(name: string, line: number): number {
+  if (!/^p[+-]?[0-9]+$/.test(name))
+    throw new Error(`line ${line}: bad process "${name}" (want p<N>)`);
+  const pid = atoi(name.slice(1));
+  if (pid < 0) throw new Error(`line ${line}: bad process "${name}" (want p<N>)`);
+  return pid;
 }
 
 function intParam(st: SimStep, key: string): number {
@@ -253,7 +283,18 @@ type SimSession = {
   s: Session;
   write: boolean;
   pin: bigint; // the version a read session pinned (§8.1: what it must keep seeing)
+  pid: number; // the process the session lives in
 };
+
+// SimProc is one simulated process: a Database over the shared simulated filesystem, and in a shared
+// trace its own lock host (S5).
+type SimProc = { pid: number; db: Database; host: SimLockHost | null };
+
+// versionOf is the version db has published, without refreshing from another process (Go's
+// Database.Version; the TS getter also adopts a newer shared generation).
+function versionOf(db: Database): bigint {
+  return (db as unknown as { core: { committed: { txid: bigint } } }).core.committed.txid;
+}
 
 const DIGEST_RELATIONS = [
   "jed_tables",
@@ -277,8 +318,15 @@ export class SimRunner {
   private spillDir: string; // the real scratch directory spill files go to; not durable state
 
   fs: SimFS;
-  private db: Database | null = null;
+  private db: Database | null = null; // the database of the process running the current step
   private sessions = new Map<string, SimSession>();
+
+  // Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
+  // coordination; a `# processes: shared` trace opens every process with shared locking.
+  private shared: boolean;
+  private procs = new Map<number, SimProc>();
+  private cur = 0; // the process running the current step
+  private locks: SimLockTable | null = null;
   private armed: SimFault | null = null;
 
   transcript: string[] = [];
@@ -315,6 +363,7 @@ export class SimRunner {
     if (sector <= 0) sector = SECTOR_DEFAULT;
     const image = toImage(new Snapshot(1n), ps, 1n);
     this.fs = new SimFS(this.seed, sector, image);
+    this.shared = tr.header.get("processes") === "shared";
   }
 
   private fail(step: number, msg: string): void {
@@ -335,6 +384,66 @@ export class SimRunner {
   // open opens a Database over the simulated disk through the ordinary demand-paged loader — the
   // path a reopening process takes, including validated-COW recovery (validated-cow.md §1).
   private open(): void {
+    this.openProc(0);
+  }
+
+  // openProc starts process pid. A shared trace acquires the file coordinator through the simulated
+  // lock host first, exactly as openDatabase does through the OS host.
+  private openProc(pid: number): void {
+    let coord: FileCoordinator | null = null;
+    let host: SimLockHost | null = null;
+    if (this.shared) {
+      if (this.locks === null) {
+        this.locks = new SimLockTable(
+          {
+            get: () => this.clock,
+            advance: (micros) => {
+              this.clock += micros;
+            },
+          },
+          (p) => this.procBusy(p),
+        );
+      }
+      const locks = this.locks;
+      host = new SimLockHost(locks, pid);
+      try {
+        coord = FileCoordinator.acquire(host, MAIN_FILE, "shared");
+      } catch (e) {
+        locks.release(pid);
+        throw e;
+      }
+      try {
+        coord.lockCommitShared();
+      } catch (e) {
+        coord.close();
+        locks.release(pid);
+        throw e;
+      }
+    }
+    let db: Database;
+    try {
+      db = this.openDatabase(coord);
+    } catch (e) {
+      if (coord !== null) {
+        coord.unlockCommit();
+        coord.close();
+        this.locks!.release(pid);
+      }
+      throw e;
+    }
+    this.procs.set(pid, { pid, db, host });
+    this.cur = pid;
+    this.db = db;
+  }
+
+  // procBusy reports whether pid's presence probe would block: it takes the process's own writer
+  // gate, which an open write session holds.
+  private procBusy(pid: number): boolean {
+    for (const ss of this.sessions.values()) if (ss.pid === pid && ss.write) return true;
+    return false;
+  }
+
+  private openDatabase(coord: FileCoordinator | null): Database {
     const main = this.fs.main();
     if (main === undefined) throw engineError("io_error", "the database file is gone");
     const pager = Pager.fromStore(main);
@@ -344,8 +453,10 @@ export class SimRunner {
     e.fileHost = this.fs; // compaction's temp file, rename, and directory barrier
     e.persistHook = persistImpl;
     e.spillSink = this.spillDir !== "" ? new FileSpillSink(this.spillDir) : null;
-    this.db = Database.fromEngine(e, null, null);
-    if (this.maxStorageBytes > 0n) this.db.setMaxStorageBytes("main", this.maxStorageBytes);
+    coord?.unlockCommit();
+    const db = Database.fromEngine(e, coord, null);
+    if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
+    return db;
   }
 
   run(): void {
@@ -355,7 +466,7 @@ export class SimRunner {
       this.violation = "initial open: " + errText(e);
       return;
     }
-    this.version = this.database.version;
+    this.version = versionOf(this.database);
     this.floor = this.version;
     this.maxAttempted = this.version;
     const d = this.committedDigest();
@@ -424,13 +535,67 @@ export class SimRunner {
         this.clock += parseInt64(st.params.get("delta"));
         this.emit(`{"i":${i},"op":"clock"}`);
         return true;
+      case "tick":
+        this.locks?.runProbes(-1);
+        this.emit(`{"i":${i},"op":"tick"}`);
+        return true;
+      case "exit": {
+        if (!this.procs.has(st.pid)) {
+          this.emit(`{"i":${i},"op":"exit","pid":${st.pid},"skip":true}`);
+          return true;
+        }
+        try {
+          this.closeProc(st.pid);
+        } catch (e) {
+          if (!isEngineError(e)) throw e;
+          this.fail(i, `exit p${st.pid}: ${errText(e)}`);
+          return false;
+        }
+        this.emit(`{"i":${i},"op":"exit","pid":${st.pid}}`);
+        return true;
+      }
+      case "kill":
+        if (!this.procs.has(st.pid)) {
+          this.emit(`{"i":${i},"op":"kill","pid":${st.pid},"skip":true}`);
+          return true;
+        }
+        this.dropProc(st.pid);
+        if (this.procs.size === 0) {
+          this.fs.beginStep(i, null);
+          return this.recover(i, "none");
+        }
+        this.emit(`{"i":${i},"op":"kill","pid":${st.pid}}`);
+        return true;
     }
 
+    // A step that needs a process when none is running (the last one exited) restarts p0 first.
+    if (this.procs.size === 0 && st.kind !== "spawn") {
+      this.fs.beginStep(i, null);
+      this.stepSpawn(i, 0);
+      if (this.violation !== "" || this.procs.size === 0) {
+        if (this.violation === "") this.fail(i, "p0 could not restart");
+        return false;
+      }
+    }
     const armed = this.armed;
     this.armed = null;
     const startVersion = this.version;
+    const pid = this.stepPid(st);
+    if (pid !== null && st.kind !== "spawn" && !this.selectProc(pid)) {
+      if (st.kind === "open") {
+        this.emit(`{"i":${i},"op":"open","sid":${goQuote(st.sid)},"skip":true}`);
+        return true;
+      }
+      if (this.procs.size === 0) {
+        this.fail(i, "no process is running");
+        return false;
+      }
+    }
     this.fs.beginStep(i, armed);
     switch (st.kind) {
+      case "spawn":
+        this.stepSpawn(i, st.pid);
+        break;
       case "open":
         this.stepOpen(i, st);
         break;
@@ -461,7 +626,19 @@ export class SimRunner {
     if (armed === null) return true;
     // Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
     const fired = this.fs.fired === "" ? "end" : this.fs.fired;
-    if (armed.kind === "power_loss") this.fs.powerLoss(i, armed.survive, armed.tear);
+    if (armed.kind === "power_loss") {
+      this.fs.powerLoss(i, armed.survive, armed.tear);
+      return this.recover(i, fired);
+    }
+    // In a shared trace any other fault kills only the process running the step; the others keep
+    // running over the same kernel state.
+    if (this.shared && this.procs.size > 1) {
+      const dead = this.cur;
+      this.dropProc(dead);
+      this.fs.processDeath();
+      this.emit(`{"i":${i},"op":"killed","pid":${dead},"fired":${goQuote(fired)}}`);
+      return true;
+    }
     return this.recover(i, fired);
   }
 
@@ -489,7 +666,11 @@ export class SimRunner {
     s.setClockSource(() => this.clock);
     if (this.workMem > 0) s.setWorkMem(this.workMem);
     if (this.maxQueryMemory > 0n) s.setMaxQueryMemoryBytes(this.maxQueryMemory);
-    this.sessions.set(st.sid, { s, write: st.mode === "write", pin: s.version });
+    if (this.shared) {
+      const d = this.digest(s);
+      if (!this.observe(i, "session " + st.sid, s.version, d)) return;
+    }
+    this.sessions.set(st.sid, { s, write: st.mode === "write", pin: s.version, pid: this.cur });
     this.emit(`{"i":${i},"op":"open","sid":${goQuote(st.sid)},"version":${s.version}}`);
   }
 
@@ -590,6 +771,17 @@ export class SimRunner {
     return fnvStringHex(b);
   }
 
+  // committedView is the version and digest a fresh read session sees.
+  private committedView(): { v: bigint; d: string | null } {
+    const rs = this.database.readSession();
+    try {
+      const d = this.digest(rs);
+      return { v: rs.version, d };
+    } finally {
+      rs.close();
+    }
+  }
+
   private committedDigest(): string | null {
     const rs = this.database.readSession();
     try {
@@ -615,7 +807,7 @@ export class SimRunner {
     } catch (e) {
       err = e;
     }
-    const now = this.database.version;
+    const now = versionOf(this.database);
     if (err !== null) {
       const code = errCode(err);
       if (code.startsWith("non-engine")) {
@@ -716,7 +908,7 @@ export class SimRunner {
     } catch (e) {
       err = e;
     }
-    const now = this.database.version;
+    const now = versionOf(this.database);
     if (err !== null) {
       const code = errCode(err);
       if (code.startsWith("non-engine")) {
@@ -750,11 +942,15 @@ export class SimRunner {
   }
 
   private stepCheck(i: number): void {
-    const d = this.committedDigest();
-    if (d === null || d !== this.lastDigest) {
+    const view = this.committedView();
+    if (this.shared) {
+      // Another process may have died leaving a newer complete generation this one now adopts.
+      if (!this.observe(i, "check", view.v, view.d)) return;
+    } else if (view.d === null || view.v !== this.version || view.d !== this.lastDigest) {
       this.fail(i, "a read session does not see the last committed version's contents");
       return;
     }
+    const d = view.d!;
     try {
       this.checkLive();
     } catch (e) {
@@ -779,23 +975,14 @@ export class SimRunner {
   // stepReopen ends every session cleanly, closes the Database, and reopens it: the result must be
   // exactly the last committed version.
   private stepReopen(i: number): boolean {
-    for (const sid of [...this.sessions.keys()].sort(compareUtf8)) {
-      const ss = this.sessions.get(sid)!;
-      if (ss.write) {
-        try {
-          ss.s.rollback();
-        } catch (e) {
-          if (!isEngineError(e)) throw e;
-        }
-      } else closeQuietly(ss.s);
-    }
-    this.sessions = new Map();
-    try {
-      this.database.close();
-    } catch (e) {
-      if (!isEngineError(e)) throw e;
-      this.fail(i, "close: " + errText(e));
-      return false;
+    for (const pid of this.livePids()) {
+      try {
+        this.closeProc(pid);
+      } catch (e) {
+        if (!isEngineError(e)) throw e;
+        this.fail(i, "close: " + errText(e));
+        return false;
+      }
     }
     this.fs.processDeath();
     try {
@@ -804,16 +991,19 @@ export class SimRunner {
       this.fail(i, "reopen failed: " + errText(e));
       return false;
     }
-    const v = this.database.version;
+    const v = versionOf(this.database);
     const d = this.committedDigest();
-    if (v !== this.version || d === null || d !== this.lastDigest) {
+    if (this.shared) {
+      // A process killed mid-commit may have left a complete generation no survivor began on yet.
+      if (!this.observe(i, "reopened p0", v, d)) return false;
+    } else if (v !== this.version || d === null || d !== this.lastDigest) {
       this.fail(
         i,
         `a clean reopen returned version ${v} (digest ${d ?? ""}), want version ${this.version} (digest ${this.lastDigest})`,
       );
       return false;
     }
-    this.emit(`{"i":${i},"op":"reopen","version":${v},"digest":${goQuote(d)}}`);
+    this.emit(`{"i":${i},"op":"reopen","version":${v},"digest":${goQuote(d!)}}`);
     return true;
   }
 
@@ -821,8 +1011,7 @@ export class SimRunner {
   // process would, then checks the recovered generation against the history and the durability
   // floor (§8.1–8.2) and the image against the integrity checker (§8.3).
   private recover(i: number, fired: string): boolean {
-    this.sessions = new Map();
-    this.db = null;
+    for (const pid of this.livePids()) this.dropProc(pid);
     this.fs.processDeath();
     const image = this.mainImage();
     if (this.imagePrefix !== "")
@@ -834,7 +1023,7 @@ export class SimRunner {
       this.fail(i, "recovery: open failed: " + errText(e));
       return false;
     }
-    const v = this.database.version;
+    const v = versionOf(this.database);
     const d = this.committedDigest();
     if (d === null) {
       this.crashImage = image;
@@ -869,6 +1058,122 @@ export class SimRunner {
         `"live":${live},"pages":${pages},"free":${free},"image":"${imageHash(image!, pages, this.pageSize)}"}`,
     );
     return true;
+  }
+
+  // livePids lists the running processes in order.
+  private livePids(): number[] {
+    return [...this.procs.keys()].sort((a, b) => a - b);
+  }
+
+  // sessionsOf lists pid's open sessions in name order.
+  private sessionsOf(pid: number): string[] {
+    const sids: string[] = [];
+    for (const [sid, ss] of this.sessions) if (ss.pid === pid) sids.push(sid);
+    return sids.sort(compareUtf8);
+  }
+
+  // closeProc ends process pid cleanly: its sessions end (a writer rolls back) and its Database
+  // closes, releasing its locks.
+  private closeProc(pid: number): void {
+    for (const sid of this.sessionsOf(pid)) {
+      const ss = this.sessions.get(sid)!;
+      if (ss.write) {
+        try {
+          ss.s.rollback();
+        } catch (e) {
+          if (!isEngineError(e)) throw e;
+        }
+      } else closeQuietly(ss.s);
+      this.sessions.delete(sid);
+    }
+    try {
+      this.procs.get(pid)!.db.close();
+    } finally {
+      this.locks?.release(pid);
+      this.procs.delete(pid);
+    }
+  }
+
+  // dropProc abandons process pid as a crash does: its sessions and Database vanish without closing,
+  // and the kernel releases its locks.
+  private dropProc(pid: number): void {
+    for (const sid of this.sessionsOf(pid)) this.sessions.delete(sid);
+    this.locks?.release(pid);
+    this.procs.delete(pid);
+    if (this.cur === pid) this.db = null;
+  }
+
+  // observe checks the version and contents a process sees when it begins (S5): in a shared trace
+  // another process may have committed — or died mid-commit, leaving a complete generation another
+  // process adopts — so the version may be newer than the last this runner saw, but never older, and
+  // its contents must be a generation the history records.
+  private observe(i: number, who: string, v: bigint, d: string | null): boolean {
+    if (d === null) this.fail(i, `${who}: version ${v} is unreadable`);
+    else if (v < this.version) {
+      this.fail(i, `${who} sees version ${v} after version ${this.version} was published`);
+    } else if (v > this.maxAttempted) {
+      this.fail(
+        i,
+        `${who} sees version ${v}, which was never attempted (latest attempted ${this.maxAttempted})`,
+      );
+    } else if (!this.inHistory(v, d)) {
+      this.fail(i, `${who} sees version ${v} with contents (digest ${d}) no transaction produced`);
+    }
+    if (this.violation !== "") return false;
+    this.version = v;
+    this.lastDigest = d!;
+    return true;
+  }
+
+  // selectProc makes pid the process running the step.
+  private selectProc(pid: number): boolean {
+    const p = this.procs.get(pid);
+    if (p === undefined) return false;
+    this.cur = pid;
+    this.db = p.db;
+    return true;
+  }
+
+  // stepPid is the process a step runs in: a session's own, an explicit one, or the lowest running.
+  private stepPid(st: SimStep): number | null {
+    switch (st.kind) {
+      case "open":
+      case "spawn":
+      case "exit":
+      case "kill":
+        return st.pid;
+      case "on":
+      case "commit":
+      case "rollback":
+      case "close":
+        return this.sessions.get(st.sid)?.pid ?? null;
+    }
+    const pids = this.livePids();
+    return pids.length > 0 ? pids[0]! : null;
+  }
+
+  // stepSpawn starts a process (S5) and checks what it sees.
+  private stepSpawn(i: number, pid: number): void {
+    if (this.procs.has(pid)) {
+      this.fail(i, `spawn p${pid}: already running`);
+      return;
+    }
+    try {
+      this.openProc(pid);
+    } catch (e) {
+      if (e instanceof SimDeadlock) throw e;
+      const code = errCode(e);
+      if (code.startsWith("non-engine") || code === "XX001") {
+        this.fail(i, `spawn p${pid}: ${errText(e)}`);
+        return;
+      }
+      this.emit(`{"i":${i},"op":"spawn","pid":${pid},"error":${goQuote(code)}}`);
+      return;
+    }
+    const v = versionOf(this.database);
+    const d = this.committedDigest();
+    if (!this.observe(i, `spawned p${pid}`, v, d)) return;
+    this.emit(`{"i":${i},"op":"spawn","pid":${pid},"version":${v}}`);
   }
 }
 

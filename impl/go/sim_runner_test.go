@@ -100,6 +100,7 @@ func simTracePaths(in string) ([]string, error) {
 type simStep struct {
 	line   int
 	kind   string
+	pid    int // open (the session's process), spawn, exit, kill
 	sid    string
 	mode   string
 	sql    string
@@ -128,10 +129,26 @@ func simParse(text string) (simTrace, error) {
 		st := simStep{line: n + 1, kind: fields[0], params: map[string]string{}}
 		switch st.kind {
 		case "open":
-			if len(fields) != 3 {
-				return tr, fmt.Errorf("line %d: open <sid> read|write", n+1)
+			if len(fields) != 3 && len(fields) != 4 {
+				return tr, fmt.Errorf("line %d: open <sid> read|write [p<N>]", n+1)
 			}
 			st.sid, st.mode = fields[1], fields[2]
+			if len(fields) == 4 {
+				pid, err := simPid(fields[3])
+				if err != nil {
+					return tr, fmt.Errorf("line %d: %v", n+1, err)
+				}
+				st.pid = pid
+			}
+		case "spawn", "exit", "kill":
+			if len(fields) != 2 {
+				return tr, fmt.Errorf("line %d: %s p<N>", n+1, st.kind)
+			}
+			pid, err := simPid(fields[1])
+			if err != nil {
+				return tr, fmt.Errorf("line %d: %v", n+1, err)
+			}
+			st.pid = pid
 		case "on":
 			if len(fields) < 3 {
 				return tr, fmt.Errorf("line %d: on <sid> <sql>", n+1)
@@ -161,7 +178,7 @@ func simParse(text string) (simTrace, error) {
 				return tr, fmt.Errorf("line %d: clock +<micros>", n+1)
 			}
 			st.params["delta"] = fields[1][1:]
-		case "check", "reopen", "compact":
+		case "check", "reopen", "compact", "tick":
 		default:
 			return tr, fmt.Errorf("line %d: unknown step %q", n+1, st.kind)
 		}
@@ -171,6 +188,15 @@ func simParse(text string) (simTrace, error) {
 		return tr, errors.New("missing `# format: simulation` header")
 	}
 	return tr, nil
+}
+
+// simPid parses a process name, p<N>.
+func simPid(name string) (int, error) {
+	pid, err := strconv.Atoi(strings.TrimPrefix(name, "p"))
+	if !strings.HasPrefix(name, "p") || err != nil || pid < 0 {
+		return 0, fmt.Errorf("bad process %q (want p<N>)", name)
+	}
+	return pid, nil
 }
 
 func (st simStep) intParam(key string) int {
@@ -298,6 +324,15 @@ type simSession struct {
 	s     *Session
 	write bool
 	pin   uint64 // the version a read session pinned (§8.1: what it must keep seeing)
+	pid   int    // the process the session lives in
+}
+
+// simProc is one simulated process: a Database over the shared simulated filesystem, and in a
+// shared trace its own lock host (S5).
+type simProc struct {
+	pid  int
+	db   *Database
+	host *simLockHost
 }
 
 type simRunner struct {
@@ -314,9 +349,16 @@ type simRunner struct {
 	spillDir        string // the real scratch directory spill files go to; their bytes are not durable state
 
 	fs       *simFS
-	db       *Database
+	db       *Database // the database of the process running the current step
 	sessions map[string]*simSession
-	armed    *simFault
+
+	// Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
+	// coordination; a `# processes: shared` trace opens every process with shared locking.
+	shared bool
+	procs  map[int]*simProc
+	cur    int // the process running the current step
+	locks  *simLockTable
+	armed  *simFault
 
 	transcript strings.Builder
 
@@ -372,6 +414,8 @@ func newSimRunner(tr simTrace) *simRunner {
 		spillDir:        spillDir,
 		fs:              newSimFS(seed, sector, image),
 		sessions:        map[string]*simSession{},
+		shared:          tr.header["processes"] == "shared",
+		procs:           map[int]*simProc{},
 		history:         map[uint64]map[string]bool{},
 		violationStep:   -1,
 	}
@@ -391,14 +435,66 @@ func (r *simRunner) emit(format string, args ...any) {
 
 // open opens a Database over the simulated disk through the ordinary demand-paged loader — the
 // path a reopening process takes, including validated-COW recovery (validated-cow.md §1).
-func (r *simRunner) open() error {
+func (r *simRunner) open() error { return r.openProc(0) }
+
+// openProc starts process pid. A shared trace acquires the file coordinator through the simulated
+// lock host first, exactly as OpenDatabaseWithOptions does through the OS host.
+func (r *simRunner) openProc(pid int) error {
+	var coord *fileCoordinator
+	var host *simLockHost
+	if r.shared {
+		if r.locks == nil {
+			r.locks = newSimLockTable(&r.clock, r.procBusy)
+		}
+		host = &simLockHost{table: r.locks, pidNum: pid, claimed: map[string]bool{}}
+		c, err := acquireCoordinator(host, simDiskPath, LockingShared, nil)
+		if err != nil {
+			r.locks.release(pid)
+			return err
+		}
+		if err := c.lockCommitShared(); err != nil {
+			c.close()
+			r.locks.release(pid)
+			return err
+		}
+		coord = c
+	}
+	db, err := r.openDatabase(coord)
+	if coord != nil {
+		if err != nil {
+			coord.unlockCommit()
+			coord.close()
+			r.locks.release(pid)
+			return err
+		}
+	}
+	if err != nil {
+		return err
+	}
+	r.procs[pid] = &simProc{pid: pid, db: db, host: host}
+	r.cur, r.db = pid, db
+	return nil
+}
+
+// procBusy reports whether pid's presence probe would block: it takes the process's own writer gate,
+// which an open write session holds (a real probe would wait for that writer to finish).
+func (r *simRunner) procBusy(pid int) bool {
+	for _, ss := range r.sessions {
+		if ss.pid == pid && ss.write {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 	main := r.fs.main()
 	if main == nil {
-		return newError(IoError, "the database file is gone")
+		return nil, newError(IoError, "the database file is gone")
 	}
 	p, err := pagerFromStore(main)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cache := r.cacheBytes
 	if cache <= 0 {
@@ -406,18 +502,21 @@ func (r *simRunner) open() error {
 	}
 	e, err := loadEnginePaged(p, cacheLeaves(cache, p.pageSize))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	e.path = simDiskPath
 	e.spillDir = r.spillDir
-	r.db = databaseOver(sharedCoreFromEngine(e))
-	r.db.core.storage.files = r.fs // compaction's temp file, rename, and directory barrier
+	if coord != nil {
+		coord.unlockCommit()
+	}
+	db := databaseOver(sharedCoreFromEngineCoordinated(e, coord))
+	db.core.storage.files = r.fs // compaction's temp file, rename, and directory barrier
 	if r.maxStorageBytes > 0 {
-		if err := r.db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
-			return err
+		if err := db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
+			return nil, err
 		}
 	}
-	return nil
+	return db, nil
 }
 
 func (r *simRunner) run() {
@@ -487,13 +586,67 @@ func (r *simRunner) step(i int) (cont bool) {
 		r.clock += delta
 		r.emit(`{"i":%d,"op":"clock"}`, i)
 		return true
+	case "tick":
+		if r.locks != nil {
+			r.locks.runProbes(-1)
+		}
+		r.emit(`{"i":%d,"op":"tick"}`, i)
+		return true
+	case "exit":
+		if r.procs[st.pid] == nil {
+			r.emit(`{"i":%d,"op":"exit","pid":%d,"skip":true}`, i, st.pid)
+			return true
+		}
+		if err := r.closeProc(st.pid); err != nil {
+			r.fail(i, "exit p%d: %v", st.pid, err)
+			return false
+		}
+		r.emit(`{"i":%d,"op":"exit","pid":%d}`, i, st.pid)
+		return true
+	case "kill":
+		if r.procs[st.pid] == nil {
+			r.emit(`{"i":%d,"op":"kill","pid":%d,"skip":true}`, i, st.pid)
+			return true
+		}
+		r.dropProc(st.pid)
+		if len(r.procs) == 0 {
+			r.fs.beginStep(uint64(i), nil)
+			return r.recover(i, "none")
+		}
+		r.emit(`{"i":%d,"op":"kill","pid":%d}`, i, st.pid)
+		return true
 	}
 
+	// A step that needs a process when none is running (the last one exited) restarts p0 first.
+	if len(r.procs) == 0 && st.kind != "spawn" {
+		r.fs.beginStep(uint64(i), nil)
+		r.stepSpawn(i, 0)
+		if r.violation != "" || len(r.procs) == 0 {
+			if r.violation == "" {
+				r.fail(i, "p0 could not restart")
+			}
+			return false
+		}
+	}
 	armed := r.armed
 	r.armed = nil
 	startVersion := r.version
+	if pid, ok := r.stepPid(st); ok {
+		if st.kind != "spawn" && !r.selectProc(pid) {
+			if st.kind == "open" {
+				r.emit(`{"i":%d,"op":"open","sid":%q,"skip":true}`, i, st.sid)
+				return true
+			}
+			if len(r.procs) == 0 {
+				r.fail(i, "no process is running")
+				return false
+			}
+		}
+	}
 	r.fs.beginStep(uint64(i), armed)
 	switch st.kind {
+	case "spawn":
+		r.stepSpawn(i, st.pid)
 	case "open":
 		r.stepOpen(i, st)
 	case "on":
@@ -529,6 +682,16 @@ func (r *simRunner) step(i int) (cont bool) {
 	}
 	if armed.kind == simPowerLoss {
 		r.fs.powerLoss(uint64(i), armed.survive, armed.tear)
+		return r.recover(i, fired)
+	}
+	// In a shared trace any other fault kills only the process running the step; the others keep
+	// running over the same kernel state.
+	if r.shared && len(r.procs) > 1 {
+		pid := r.cur
+		r.dropProc(pid)
+		r.fs.processDeath()
+		r.emit(`{"i":%d,"op":"killed","pid":%d,"fired":%q}`, i, pid, fired)
+		return true
 	}
 	return r.recover(i, fired)
 }
@@ -562,7 +725,13 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 	if r.maxQueryMemory > 0 {
 		s.SetMaxQueryMemoryBytes(r.maxQueryMemory)
 	}
-	r.sessions[st.sid] = &simSession{s: s, write: st.mode == "write", pin: s.Version()}
+	if r.shared {
+		d, ok := r.digest(s)
+		if !r.observe(i, "session "+st.sid, s.Version(), d, ok) {
+			return
+		}
+	}
+	r.sessions[st.sid] = &simSession{s: s, write: st.mode == "write", pin: s.Version(), pid: r.cur}
 	r.emit(`{"i":%d,"op":"open","sid":%q,"version":%d}`, i, st.sid, s.Version())
 }
 
@@ -697,6 +866,14 @@ func (r *simRunner) checkLive() error {
 	r.fs.oracle = true
 	defer func() { r.fs.oracle = false }()
 	return simCheckLive(r.db)
+}
+
+// committedView is the version and digest a fresh read session sees.
+func (r *simRunner) committedView() (uint64, string, bool) {
+	rs := r.db.ReadSession()
+	defer rs.Close()
+	d, ok := r.digest(rs)
+	return rs.Version(), d, ok
 }
 
 func (r *simRunner) committedDigest() (string, bool) {
@@ -836,8 +1013,14 @@ func (r *simRunner) stepCompact(i int) {
 }
 
 func (r *simRunner) stepCheck(i int) {
-	d, ok := r.committedDigest()
-	if !ok || d != r.lastDigest {
+	v, d, ok := r.committedView()
+	switch {
+	case r.shared:
+		// Another process may have died leaving a newer complete generation this one now adopts.
+		if !r.observe(i, "check", v, d, ok) {
+			return
+		}
+	case !ok || v != r.version || d != r.lastDigest:
 		r.fail(i, "a read session does not see the last committed version's contents")
 		return
 	}
@@ -858,22 +1041,11 @@ func (r *simRunner) stepCheck(i int) {
 // stepReopen ends every session cleanly, closes the Database, and reopens it: the result must be
 // exactly the last committed version.
 func (r *simRunner) stepReopen(i int) bool {
-	sids := make([]string, 0, len(r.sessions))
-	for sid := range r.sessions {
-		sids = append(sids, sid)
-	}
-	sort.Strings(sids)
-	for _, sid := range sids {
-		if ss := r.sessions[sid]; ss.write {
-			_ = ss.s.Rollback()
-		} else {
-			ss.s.Close()
+	for _, pid := range r.livePids() {
+		if err := r.closeProc(pid); err != nil {
+			r.fail(i, "close: %v", err)
+			return false
 		}
-	}
-	r.sessions = map[string]*simSession{}
-	if err := r.db.Close(); err != nil {
-		r.fail(i, "close: %v", err)
-		return false
 	}
 	r.fs.processDeath()
 	if err := r.open(); err != nil {
@@ -882,7 +1054,12 @@ func (r *simRunner) stepReopen(i int) bool {
 	}
 	v := r.db.Version()
 	d, ok := r.committedDigest()
-	if v != r.version || !ok || d != r.lastDigest {
+	if r.shared {
+		// A process killed mid-commit may have left a complete generation no survivor began on yet.
+		if !r.observe(i, "reopened p0", v, d, ok) {
+			return false
+		}
+	} else if v != r.version || !ok || d != r.lastDigest {
 		r.fail(i, "a clean reopen returned version %d (digest %s), want version %d (digest %s)", v, d, r.version, r.lastDigest)
 		return false
 	}
@@ -894,8 +1071,9 @@ func (r *simRunner) stepReopen(i int) bool {
 // process would, then checks the recovered generation against the history and the durability
 // floor (§8.1–8.2) and the image against the integrity checker (§8.3).
 func (r *simRunner) recover(i int, fired string) bool {
-	r.sessions = map[string]*simSession{}
-	r.db = nil
+	for _, pid := range r.livePids() {
+		r.dropProc(pid)
+	}
 	r.fs.processDeath()
 	image := r.mainImage()
 	if r.imagePrefix != "" {
@@ -935,6 +1113,134 @@ func (r *simRunner) recover(i int, fired string) bool {
 	r.emit(`{"i":%d,"op":"crash","fired":%q,"recovered":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"}`,
 		i, fired, v, d, live, pages, free, simImageHash(image, pages, r.pageSize))
 	return true
+}
+
+// livePids lists the running processes in order.
+func (r *simRunner) livePids() []int {
+	pids := make([]int, 0, len(r.procs))
+	for pid := range r.procs {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids
+}
+
+// sessionsOf lists pid's open sessions in name order.
+func (r *simRunner) sessionsOf(pid int) []string {
+	var sids []string
+	for sid, ss := range r.sessions {
+		if ss.pid == pid {
+			sids = append(sids, sid)
+		}
+	}
+	sort.Strings(sids)
+	return sids
+}
+
+// closeProc ends process pid cleanly: its sessions end (a writer rolls back) and its Database closes,
+// releasing its locks.
+func (r *simRunner) closeProc(pid int) error {
+	for _, sid := range r.sessionsOf(pid) {
+		if ss := r.sessions[sid]; ss.write {
+			_ = ss.s.Rollback()
+		} else {
+			ss.s.Close()
+		}
+		delete(r.sessions, sid)
+	}
+	err := r.procs[pid].db.Close()
+	if r.locks != nil {
+		r.locks.release(pid)
+	}
+	delete(r.procs, pid)
+	return err
+}
+
+// dropProc abandons process pid as a crash does: its sessions and Database vanish without closing,
+// and the kernel releases its locks.
+func (r *simRunner) dropProc(pid int) {
+	for _, sid := range r.sessionsOf(pid) {
+		delete(r.sessions, sid)
+	}
+	if r.locks != nil {
+		r.locks.release(pid)
+	}
+	delete(r.procs, pid)
+	if r.cur == pid {
+		r.db = nil
+	}
+}
+
+// observe checks the version and contents a process sees when it begins (S5): in a shared trace
+// another process may have committed — or died mid-commit, leaving a complete generation another
+// process adopts — so the version may be newer than the last this runner saw, but never older, and
+// its contents must be a generation the history records.
+func (r *simRunner) observe(i int, who string, v uint64, d string, ok bool) bool {
+	switch {
+	case !ok:
+		r.fail(i, "%s: version %d is unreadable", who, v)
+	case v < r.version:
+		r.fail(i, "%s sees version %d after version %d was published", who, v, r.version)
+	case v > r.maxAttempted:
+		r.fail(i, "%s sees version %d, which was never attempted (latest attempted %d)", who, v, r.maxAttempted)
+	case !r.history[v][d]:
+		r.fail(i, "%s sees version %d with contents (digest %s) no transaction produced", who, v, d)
+	}
+	if r.violation != "" {
+		return false
+	}
+	r.version, r.lastDigest = v, d
+	return true
+}
+
+// selectProc makes pid the process running the step.
+func (r *simRunner) selectProc(pid int) bool {
+	p := r.procs[pid]
+	if p == nil {
+		return false
+	}
+	r.cur, r.db = pid, p.db
+	return true
+}
+
+// stepPid is the process a step runs in: a session's own, an explicit one, or the lowest running.
+func (r *simRunner) stepPid(st simStep) (int, bool) {
+	switch st.kind {
+	case "open", "spawn", "exit", "kill":
+		return st.pid, true
+	case "on", "commit", "rollback", "close":
+		if ss := r.sessions[st.sid]; ss != nil {
+			return ss.pid, true
+		}
+		return 0, false
+	}
+	if pids := r.livePids(); len(pids) > 0 {
+		return pids[0], true
+	}
+	return 0, false
+}
+
+// stepSpawn starts a process (S5) and checks what it sees.
+func (r *simRunner) stepSpawn(i int, pid int) {
+	if r.procs[pid] != nil {
+		r.fail(i, "spawn p%d: already running", pid)
+		return
+	}
+	if err := r.openProc(pid); err != nil {
+		code := simCode(err)
+		if strings.HasPrefix(code, "non-engine") || code == "XX001" {
+			r.fail(i, "spawn p%d: %v", pid, err)
+			return
+		}
+		r.emit(`{"i":%d,"op":"spawn","pid":%d,"error":%q}`, i, pid, code)
+		return
+	}
+	v := r.db.Version()
+	d, ok := r.committedDigest()
+	if !r.observe(i, fmt.Sprintf("spawned p%d", pid), v, d, ok) {
+		return
+	}
+	r.emit(`{"i":%d,"op":"spawn","pid":%d,"version":%d}`, i, pid, v)
 }
 
 // simImageHash folds the logical image — the pages below the high-water — into FNV-1a 64 (§8.4).

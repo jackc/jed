@@ -3640,6 +3640,19 @@ impl Database {
         }
     }
 
+    /// A shared core over `engine` coordinated by `coordinator` (the simulator's processes, which
+    /// acquire the coordinator through a simulated lock host).
+    pub(crate) fn sim_from_engine_coordinated(
+        engine: Engine,
+        coordinator: FileCoordinator,
+    ) -> Database {
+        Self::from_engine_coordinated(
+            engine,
+            Some(coordinator),
+            Arc::new(crate::extension::ExtensionRegistry::default()),
+        )
+    }
+
     /// Route MAIN's file operations (compaction, the first commit's directory barrier) through the
     /// simulator's filesystem instead of the OS.
     pub(crate) fn sim_set_files(&self, files: Arc<dyn crate::filehost::FileHost>) {

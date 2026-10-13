@@ -67,6 +67,16 @@ module SimPlant
       edits: [["impl/go/shared.go",
                "canReclaim := !shared && oldest == snap.txid\n\tcanReuse := !shared && oldest >= c.storage.freeGenTxid",
                "canReclaim := !shared && oldest <= snap.txid\n\tcanReuse := !shared && oldest >= 0"]]
+    ),
+    # Shared-file coordination (locking.md §5.3): co-resident processes must commit append-only and
+    # refresh meta at begin. The plant makes every process act as if it were alone.
+    Plant.new(
+      name: "ignore-co-residents",
+      protection: "a process sharing the file commits append-only and never reclaims under another process (locking.md §5.3)",
+      profile: "shared",
+      edits: [["impl/go/shared.go",
+               "shared := c.coordinator != nil && c.coordinator.lease() == leaseShared",
+               "shared := false && c.coordinator != nil && c.coordinator.lease() == leaseShared"]]
     )
   ].freeze
 

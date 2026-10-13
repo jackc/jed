@@ -16,6 +16,7 @@ import process from "node:process";
 
 import { engineError } from "./errors.ts";
 import type { Locking } from "./file.ts";
+import type { LockFiles, LockHandle, LockHost } from "./lockhost.ts";
 import type { FileCoordinatorHost, LeaseState } from "./session.ts";
 
 const PROTOCOL_MARKER = "protocol-v1";
@@ -56,8 +57,6 @@ function native(): NativeBinding {
   }
   return nativeBinding;
 }
-
-type LockFiles = Record<(typeof LOCK_NAMES)[number], NativeLockHandle>;
 
 const openPaths = new Set<string>();
 
@@ -134,7 +133,7 @@ function openBundle(path: string): LockFiles {
   validateProtocol(path);
   for (const name of LOCK_NAMES) ensureRegular(join(bundle, name));
 
-  const opened: Partial<LockFiles> = {};
+  const opened: Partial<Record<(typeof LOCK_NAMES)[number], NativeLockHandle>> = {};
   try {
     for (const name of LOCK_NAMES) {
       opened[name] = native().NativeLockFile.open(join(bundle, name));
@@ -164,38 +163,72 @@ function timeoutValue(value: number | undefined): number {
   return timeout;
 }
 
-function tryLock(file: NativeLockHandle, exclusive: boolean): boolean {
-  try {
-    return exclusive ? file.tryLockExclusive() : file.tryLockShared();
-  } catch (error) {
-    ioError("file lock", error);
-  }
-}
+// osLocks is the production coordination host: the native whole-file locks, the monotonic clock, a
+// RETRY_MS sleep between polls, and a one-second unref'd probe timer.
+export const osLocks: LockHost = {
+  claimPath(path: string): boolean {
+    if (openPaths.has(path)) return false;
+    openPaths.add(path);
+    return true;
+  },
+  releasePath(path: string): void {
+    openPaths.delete(path);
+  },
+  openBundle,
+  validateMarker: validateProtocol,
+  closeFiles(files: LockFiles): void {
+    for (const file of Object.values(files)) (file as NativeLockHandle).close();
+  },
+  tryLock(handle: LockHandle, exclusive: boolean): boolean {
+    const file = handle as NativeLockHandle;
+    try {
+      return exclusive ? file.tryLockExclusive() : file.tryLockShared();
+    } catch (error) {
+      ioError("file lock", error);
+    }
+  },
+  unlock(handle: LockHandle): void {
+    try {
+      (handle as NativeLockHandle).unlock();
+    } catch (error) {
+      ioError("file unlock", error);
+    }
+  },
+  nowMicros(): number {
+    return performance.now() * 1000;
+  },
+  pause(): void {
+    sleep(RETRY_MS);
+  },
+  startProbe(tick: () => void): () => void {
+    const probe = setInterval(tick, 1000);
+    probe.unref();
+    return () => clearInterval(probe);
+  },
+  pid(): number {
+    return process.pid;
+  },
+};
 
-function unlock(file: NativeLockHandle): void {
-  try {
-    file.unlock();
-  } catch (error) {
-    ioError("file unlock", error);
-  }
-}
-
+// lockUntil polls handle until it is locked or the deadline (microseconds on host's clock; null is
+// none) passes.
 function lockUntil(
-  file: NativeLockHandle,
+  host: LockHost,
+  handle: LockHandle,
   exclusive: boolean,
   deadline: number | null,
   path: string,
   writer: boolean,
 ): void {
   for (;;) {
-    if (tryLock(file, exclusive)) return;
-    if (deadline !== null && performance.now() >= deadline) {
+    if (host.tryLock(handle, exclusive)) return;
+    if (deadline !== null && host.nowMicros() >= deadline) {
       if (writer) {
         throw engineError("lock_not_available", "could not obtain the database writer lock");
       }
       throw engineError("object_in_use", `database file is in use: ${path}`);
     }
-    sleep(RETRY_MS);
+    host.pause();
   }
 }
 
@@ -234,79 +267,88 @@ function canonicalCreatePath(path: string): string {
 export class FileCoordinator implements FileCoordinatorHost {
   readonly path: string;
   state: LeaseState;
+  private readonly host: LockHost;
   private readonly files: LockFiles;
-  private readonly openerPid = process.pid;
-  private probe: NodeJS.Timeout | null = null;
+  private readonly openerPid: number;
+  private stopProbe: (() => void) | null = null;
   private closed = false;
 
-  private constructor(path: string, files: LockFiles, state: LeaseState) {
+  private constructor(host: LockHost, path: string, files: LockFiles, state: LeaseState) {
+    this.host = host;
     this.path = path;
     this.files = files;
     this.state = state;
+    this.openerPid = host.pid();
   }
 
   static open(path: string, mode?: Locking, fileLockTimeoutMs?: number): FileCoordinator | null {
     const locking = resolvedLocking(mode);
     if (locking === "none") return null;
-    return FileCoordinator.acquire(canonicalOpenPath(path), locking, fileLockTimeoutMs);
+    return FileCoordinator.acquire(osLocks, canonicalOpenPath(path), locking, fileLockTimeoutMs);
   }
 
   static create(path: string, mode?: Locking, fileLockTimeoutMs?: number): FileCoordinator | null {
     const locking = resolvedLocking(mode);
     if (locking === "none") return null;
-    return FileCoordinator.acquire(canonicalCreatePath(path), locking, fileLockTimeoutMs);
+    return FileCoordinator.acquire(osLocks, canonicalCreatePath(path), locking, fileLockTimeoutMs);
   }
 
-  private static acquire(path: string, mode: Locking, timeoutOption?: number): FileCoordinator {
-    if (openPaths.has(path)) {
+  // acquire joins the coordination protocol for the (already canonical) path through host: arrival
+  // SH, then presence EX (alone or exclusive) or SH (shared) under transition EX (locking.md §4).
+  static acquire(
+    host: LockHost,
+    path: string,
+    mode: Locking,
+    timeoutOption?: number,
+  ): FileCoordinator {
+    if (!host.claimPath(path)) {
       throw engineError(
         "object_in_use",
         `database is already open in this process: ${path} (share one Database handle)`,
       );
     }
-    openPaths.add(path);
     let files: LockFiles | null = null;
     try {
-      files = openBundle(path);
-      const deadline = performance.now() + timeoutValue(timeoutOption);
-      lockUntil(files.arrival, false, deadline, path, false);
-      validateProtocol(path);
+      files = host.openBundle(path);
+      const deadline = host.nowMicros() + timeoutValue(timeoutOption) * 1000;
+      lockUntil(host, files.arrival, false, deadline, path, false);
+      host.validateMarker(path);
       let state: LeaseState;
       if (mode === "exclusive") {
         for (;;) {
-          lockUntil(files.transition, true, deadline, path, false);
-          const alone = tryLock(files.presence, true);
-          unlock(files.transition);
+          lockUntil(host, files.transition, true, deadline, path, false);
+          const alone = host.tryLock(files.presence, true);
+          host.unlock(files.transition);
           if (alone) {
             state = "exclusive";
             break;
           }
-          if (performance.now() >= deadline) {
+          if (host.nowMicros() >= deadline) {
             throw engineError("object_in_use", `database file is in use: ${path}`);
           }
-          sleep(RETRY_MS);
+          host.pause();
         }
       } else {
-        lockUntil(files.transition, true, deadline, path, false);
-        const alone = tryLock(files.presence, true);
-        unlock(files.transition);
+        lockUntil(host, files.transition, true, deadline, path, false);
+        const alone = host.tryLock(files.presence, true);
+        host.unlock(files.transition);
         if (alone) state = "alone";
         else {
-          lockUntil(files.presence, false, deadline, path, false);
+          lockUntil(host, files.presence, false, deadline, path, false);
           state = "shared";
         }
       }
-      unlock(files.arrival);
-      return new FileCoordinator(path, files, state);
+      host.unlock(files.arrival);
+      return new FileCoordinator(host, path, files, state);
     } catch (error) {
-      if (files !== null) for (const file of Object.values(files)) file.close();
-      openPaths.delete(path);
+      if (files !== null) host.closeFiles(files);
+      host.releasePath(path);
       throw error;
     }
   }
 
   checkPid(): void {
-    if (process.pid !== this.openerPid) {
+    if (this.host.pid() !== this.openerPid) {
       throw engineError(
         "object_in_use",
         "database handle was inherited across fork; reopen it in the child",
@@ -315,67 +357,66 @@ export class FileCoordinator implements FileCoordinatorHost {
   }
 
   startProbe(tick: () => void): void {
-    if (this.state === "exclusive" || this.probe !== null) return;
-    this.probe = setInterval(tick, 1000);
-    this.probe.unref();
+    if (this.state === "exclusive" || this.stopProbe !== null) return;
+    this.stopProbe = this.host.startProbe(tick);
   }
 
   lockCommitShared(): void {
-    lockUntil(this.files.commit, false, null, this.path, false);
+    lockUntil(this.host, this.files.commit, false, null, this.path, false);
   }
 
   lockCommitExclusive(): void {
-    lockUntil(this.files.commit, true, null, this.path, false);
+    lockUntil(this.host, this.files.commit, true, null, this.path, false);
   }
 
   unlockCommit(): void {
-    unlock(this.files.commit);
+    this.host.unlock(this.files.commit);
   }
 
   lockWriter(timeoutMs: number): void {
-    const deadline = timeoutMs === 0 ? null : performance.now() + timeoutMs;
-    lockUntil(this.files.writer, true, deadline, this.path, true);
+    const deadline = timeoutMs === 0 ? null : this.host.nowMicros() + timeoutMs * 1000;
+    lockUntil(this.host, this.files.writer, true, deadline, this.path, true);
   }
 
   unlockWriter(): void {
-    unlock(this.files.writer);
+    this.host.unlock(this.files.writer);
   }
 
   tryArrivalExclusive(): boolean {
-    return tryLock(this.files.arrival, true);
+    return this.host.tryLock(this.files.arrival, true);
   }
 
   unlockArrival(): void {
-    unlock(this.files.arrival);
+    this.host.unlock(this.files.arrival);
   }
 
   lockTransition(): void {
-    lockUntil(this.files.transition, true, null, this.path, false);
+    lockUntil(this.host, this.files.transition, true, null, this.path, false);
   }
 
   unlockTransition(): void {
-    unlock(this.files.transition);
+    this.host.unlock(this.files.transition);
   }
 
   downgradePresence(): void {
     this.state = "shared";
-    unlock(this.files.presence);
-    lockUntil(this.files.presence, false, null, this.path, false);
+    this.host.unlock(this.files.presence);
+    lockUntil(this.host, this.files.presence, false, null, this.path, false);
   }
 
   tryUpgradePresence(): boolean {
-    unlock(this.files.presence);
-    if (tryLock(this.files.presence, true)) return true;
-    lockUntil(this.files.presence, false, null, this.path, false);
+    this.host.unlock(this.files.presence);
+    if (this.host.tryLock(this.files.presence, true)) return true;
+    lockUntil(this.host, this.files.presence, false, null, this.path, false);
     return false;
   }
 
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.probe !== null) clearInterval(this.probe);
-    this.probe = null;
-    for (const file of Object.values(this.files)) file.close();
-    openPaths.delete(this.path);
+    if (this.stopProbe !== null) this.stopProbe();
+    this.stopProbe = null;
+    this.host.closeFiles(this.files);
+    this.host.releasePath(this.path);
   }
 }

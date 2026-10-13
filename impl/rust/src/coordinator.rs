@@ -2,6 +2,12 @@
 //!
 //! The database file is never itself the lock identity. Five empty files in the persistent
 //! `<database>.lock/` bundle carry whole-file OS locks; the database remains one copyable data file.
+//!
+//! Every lock operation goes through a [`LockHost`]: the lock bundle, whole-file locks on it, the
+//! clock deadlines read, the pause between polls of a contended lock, the background presence probe,
+//! and the process-local duplicate-open registry. Production uses the OS ([`OsLockHost`]). The
+//! deterministic simulator (spec/design/simulation-testing.md §14 S5) substitutes simulated
+//! processes sharing one lock table, so the protocol runs, crashes, and interleaves deterministically.
 
 use std::collections::HashSet;
 use std::fs::{self, File, TryLockError};
@@ -40,38 +46,179 @@ impl LeaseState {
     }
 }
 
-struct LockFiles {
-    presence: File,
-    arrival: File,
-    transition: File,
-    writer: File,
-    commit: File,
+/// One bundle file's lock, opaque to the coordinator: a [`File`] for the OS host.
+pub(crate) type LockHandle = Box<dyn std::any::Any + Send + Sync>;
+
+/// The five bundle locks of one participant.
+pub(crate) struct LockFiles {
+    pub(crate) presence: LockHandle,
+    pub(crate) arrival: LockHandle,
+    pub(crate) transition: LockHandle,
+    pub(crate) writer: LockHandle,
+    pub(crate) commit: LockHandle,
 }
 
-struct Inner {
-    files: LockFiles,
-    state: AtomicU8,
+/// The stop signal of an OS presence-probe thread.
+pub(crate) struct ProbeSignal {
     stop: AtomicBool,
     wake_mu: Mutex<()>,
     wake: Condvar,
 }
 
+/// Everything the coordinator needs from its environment (see the module docs).
+pub(crate) trait LockHost: Send + Sync {
+    /// Register `path` as open in this process; false if it already is.
+    fn claim_path(&self, path: &Path) -> bool;
+    fn release_path(&self, path: &Path);
+    /// Create or open the lock bundle beside `path` and open its five lock handles.
+    fn open_bundle(&self, path: &Path) -> Result<LockFiles>;
+    /// Re-validate the protocol marker (held under arrival SH, the migration barrier).
+    fn validate_marker(&self, path: &Path) -> Result<()>;
+    /// Release this participant's hold on its bundle (the OS closes the files when they drop).
+    fn close_files(&self, files: &LockFiles);
+    /// Take or convert the lock without waiting: `Ok(false)` when another holder conflicts.
+    fn try_lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<bool>;
+    /// Take or convert the lock, waiting as long as it takes.
+    fn lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<()>;
+    fn unlock(&self, handle: &LockHandle) -> std::io::Result<()>;
+    /// The clock lock deadlines read.
+    fn now(&self) -> Instant;
+    /// Wait between polls of a contended lock.
+    fn pause(&self);
+    /// Run `callback` periodically until `signal` stops; the OS returns the probe thread to join.
+    fn start_probe(
+        &self,
+        signal: Arc<ProbeSignal>,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<JoinHandle<()>>;
+    /// The process id the fork check compares.
+    fn pid(&self) -> u32;
+}
+
+/// The production coordination host: `flock` / `LockFileEx` on the bundle files.
+pub(crate) struct OsLockHost;
+
+fn os_file(handle: &LockHandle) -> &File {
+    handle
+        .downcast_ref::<File>()
+        .expect("the OS lock host's handles are files")
+}
+
+impl LockHost for OsLockHost {
+    fn claim_path(&self, path: &Path) -> bool {
+        OPEN_PATHS
+            .lock()
+            .expect("open-path registry poisoned")
+            .insert(path.to_path_buf())
+    }
+
+    fn release_path(&self, path: &Path) {
+        OPEN_PATHS
+            .lock()
+            .expect("open-path registry poisoned")
+            .remove(path);
+    }
+
+    fn open_bundle(&self, path: &Path) -> Result<LockFiles> {
+        open_bundle(path)
+    }
+
+    fn validate_marker(&self, path: &Path) -> Result<()> {
+        validate_protocol_marker(path)
+    }
+
+    fn close_files(&self, _files: &LockFiles) {}
+
+    fn try_lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<bool> {
+        let file = os_file(handle);
+        let result = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    fn lock(&self, handle: &LockHandle, exclusive: bool) -> std::io::Result<()> {
+        let file = os_file(handle);
+        if exclusive {
+            file.lock()
+        } else {
+            file.lock_shared()
+        }
+    }
+
+    fn unlock(&self, handle: &LockHandle) -> std::io::Result<()> {
+        os_file(handle).unlock()
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn pause(&self) {
+        thread::sleep(RETRY_INTERVAL);
+    }
+
+    fn start_probe(
+        &self,
+        signal: Arc<ProbeSignal>,
+        callback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<JoinHandle<()>> {
+        Some(thread::spawn(move || {
+            loop {
+                // Release the wait mutex before the callback: Drop takes it to publish `stop`, and
+                // may run on this thread when the callback releases the last handle.
+                let timed_out = {
+                    let guard = signal.wake_mu.lock().expect("probe wake lock poisoned");
+                    let (_guard, wait) = signal
+                        .wake
+                        .wait_timeout_while(guard, POLL_INTERVAL, |_| {
+                            !signal.stop.load(Ordering::Acquire)
+                        })
+                        .expect("probe wake lock poisoned");
+                    wait.timed_out()
+                };
+                if signal.stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if timed_out {
+                    callback();
+                }
+            }
+        }))
+    }
+
+    fn pid(&self) -> u32 {
+        std::process::id()
+    }
+}
+
 /// One registered participant in a file's stable lock domain.
 pub(crate) struct FileCoordinator {
+    host: Arc<dyn LockHost>,
     path: PathBuf,
-    inner: Arc<Inner>,
+    files: LockFiles,
+    state: AtomicU8,
+    signal: Arc<ProbeSignal>,
     probe: Mutex<Option<JoinHandle<()>>>,
+    probe_started: AtomicBool,
     opener_pid: u32,
 }
 
 /// An RAII whole-file lock used for the short commit/meta adoption gates.
 pub(crate) struct FileLockGuard<'a> {
-    file: &'a File,
+    host: &'a dyn LockHost,
+    handle: &'a LockHandle,
 }
 
 impl Drop for FileLockGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = self.host.unlock(self.handle);
     }
 }
 
@@ -94,7 +241,7 @@ impl FileCoordinator {
         })?;
         #[cfg(any(unix, windows))]
         reject_hard_link(&path)?;
-        Self::acquire(path, mode, timeout_ms)
+        Self::acquire(Arc::new(OsLockHost), path, mode, timeout_ms).map(Some)
     }
 
     /// Prepare coordination for an absent database path before the initial image is published.
@@ -109,41 +256,53 @@ impl FileCoordinator {
         let name = path.file_name().ok_or_else(|| {
             EngineError::new(SqlState::IoError, "database path has no final component")
         })?;
-        Self::acquire(parent.join(name), mode, timeout_ms)
+        Self::acquire(Arc::new(OsLockHost), parent.join(name), mode, timeout_ms).map(Some)
     }
 
-    fn acquire(path: PathBuf, mode: Locking, timeout_ms: u64) -> Result<Option<Self>> {
-        register_path(&path)?;
+    /// Register as a participant in `path`'s lock domain through `host` (`mode` is Shared or
+    /// Exclusive; the caller has resolved Auto and handled None).
+    pub(crate) fn acquire(
+        host: Arc<dyn LockHost>,
+        path: PathBuf,
+        mode: Locking,
+        timeout_ms: u64,
+    ) -> Result<Self> {
+        if !host.claim_path(&path) {
+            return Err(EngineError::new(
+                SqlState::ObjectInUse,
+                format!(
+                    "database is already open in this process: {} (share one Database handle)",
+                    path.display()
+                ),
+            ));
+        }
+        let files = match host.open_bundle(&path) {
+            Ok(files) => files,
+            Err(e) => {
+                host.release_path(&path);
+                return Err(e);
+            }
+        };
+        let h = host.as_ref();
         let result = (|| {
-            let files = open_bundle(&path)?;
-            let deadline = deadline(timeout_ms);
-            lock_until(&files.arrival, LockKind::Shared, deadline, &path, false)?;
-            validate_protocol_marker(&path)?;
+            let deadline = deadline(h, timeout_ms);
+            lock_until(h, &files.arrival, false, deadline, &path, false)?;
+            h.validate_marker(&path)?;
 
             let state = if mode == Locking::Exclusive {
                 loop {
-                    lock_until(
-                        &files.transition,
-                        LockKind::Exclusive,
-                        deadline,
-                        &path,
-                        false,
-                    )?;
-                    match try_lock(&files.presence, LockKind::Exclusive)? {
+                    lock_until(h, &files.transition, true, deadline, &path, false)?;
+                    match try_lock(h, &files.presence, true)? {
                         true => {
-                            files
-                                .transition
-                                .unlock()
+                            h.unlock(&files.transition)
                                 .map_err(|e| lock_error(e, &path))?;
                             break LeaseState::Exclusive;
                         }
                         false => {
-                            files
-                                .transition
-                                .unlock()
+                            h.unlock(&files.transition)
                                 .map_err(|e| lock_error(e, &path))?;
-                            check_deadline(deadline, &path, false)?;
-                            thread::sleep(RETRY_INTERVAL);
+                            check_deadline(h, deadline, &path, false)?;
+                            h.pause();
                         }
                     }
                 }
@@ -151,43 +310,42 @@ impl FileCoordinator {
                 // A first opener takes presence EX and immediately gets the fast path. A participant
                 // already present makes the EX attempt fail; its arrival lock then drives the holder's
                 // downgrade and this opener joins with presence SH.
-                lock_until(
-                    &files.transition,
-                    LockKind::Exclusive,
-                    deadline,
-                    &path,
-                    false,
-                )?;
-                let alone = try_lock(&files.presence, LockKind::Exclusive)?;
-                files
-                    .transition
-                    .unlock()
+                lock_until(h, &files.transition, true, deadline, &path, false)?;
+                let alone = try_lock(h, &files.presence, true)?;
+                h.unlock(&files.transition)
                     .map_err(|e| lock_error(e, &path))?;
                 if alone {
                     LeaseState::Alone
                 } else {
-                    lock_until(&files.presence, LockKind::Shared, deadline, &path, false)?;
+                    lock_until(h, &files.presence, false, deadline, &path, false)?;
                     LeaseState::Shared
                 }
             };
-            files.arrival.unlock().map_err(|e| lock_error(e, &path))?;
-            Ok(FileCoordinator {
-                path: path.clone(),
-                inner: Arc::new(Inner {
-                    files,
-                    state: AtomicU8::new(state as u8),
-                    stop: AtomicBool::new(false),
-                    wake_mu: Mutex::new(()),
-                    wake: Condvar::new(),
-                }),
-                probe: Mutex::new(None),
-                opener_pid: std::process::id(),
-            })
+            h.unlock(&files.arrival).map_err(|e| lock_error(e, &path))?;
+            Ok(state)
         })();
         match result {
-            Ok(coordinator) => Ok(Some(coordinator)),
+            Ok(state) => {
+                let opener_pid = host.pid();
+                Ok(FileCoordinator {
+                    host,
+                    path,
+                    files,
+                    state: AtomicU8::new(state as u8),
+                    signal: Arc::new(ProbeSignal {
+                        stop: AtomicBool::new(false),
+                        wake_mu: Mutex::new(()),
+                        wake: Condvar::new(),
+                    }),
+                    probe: Mutex::new(None),
+                    probe_started: AtomicBool::new(false),
+                    opener_pid,
+                })
+            }
             Err(e) => {
-                unregister_path(&path);
+                host.close_files(&files);
+                drop(files);
+                host.release_path(&path);
                 Err(e)
             }
         }
@@ -198,15 +356,15 @@ impl FileCoordinator {
     }
 
     pub(crate) fn state(&self) -> LeaseState {
-        LeaseState::from_u8(self.inner.state.load(Ordering::Acquire))
+        LeaseState::from_u8(self.state.load(Ordering::Acquire))
     }
 
     pub(crate) fn set_state(&self, state: LeaseState) {
-        self.inner.state.store(state as u8, Ordering::Release);
+        self.state.store(state as u8, Ordering::Release);
     }
 
     pub(crate) fn check_pid(&self) -> Result<()> {
-        if std::process::id() == self.opener_pid {
+        if self.host.pid() == self.opener_pid {
             Ok(())
         } else {
             Err(EngineError::new(
@@ -216,36 +374,37 @@ impl FileCoordinator {
         }
     }
 
+    fn guard<'a>(&'a self, handle: &'a LockHandle) -> FileLockGuard<'a> {
+        FileLockGuard {
+            host: self.host.as_ref(),
+            handle,
+        }
+    }
+
     pub(crate) fn lock_commit_shared(&self) -> Result<FileLockGuard<'_>> {
-        self.inner
-            .files
-            .commit
-            .lock_shared()
+        self.host
+            .lock(&self.files.commit, false)
             .map_err(|e| lock_error(e, &self.path))?;
-        Ok(FileLockGuard {
-            file: &self.inner.files.commit,
-        })
+        Ok(self.guard(&self.files.commit))
     }
 
     pub(crate) fn lock_commit_exclusive(&self) -> Result<FileLockGuard<'_>> {
-        self.inner
-            .files
-            .commit
-            .lock()
+        self.host
+            .lock(&self.files.commit, true)
             .map_err(|e| lock_error(e, &self.path))?;
-        Ok(FileLockGuard {
-            file: &self.inner.files.commit,
-        })
+        Ok(self.guard(&self.files.commit))
     }
 
     pub(crate) fn lock_writer(&self, timeout_ms: u64) -> Result<()> {
+        let h = self.host.as_ref();
         lock_until(
-            &self.inner.files.writer,
-            LockKind::Exclusive,
+            h,
+            &self.files.writer,
+            true,
             if timeout_ms == 0 {
                 None
             } else {
-                deadline(timeout_ms)
+                deadline(h, timeout_ms)
             },
             &self.path,
             true,
@@ -253,25 +412,19 @@ impl FileCoordinator {
     }
 
     pub(crate) fn unlock_writer(&self) {
-        let _ = self.inner.files.writer.unlock();
+        let _ = self.host.unlock(&self.files.writer);
     }
 
     pub(crate) fn lock_transition(&self) -> Result<FileLockGuard<'_>> {
-        self.inner
-            .files
-            .transition
-            .lock()
+        self.host
+            .lock(&self.files.transition, true)
             .map_err(|e| lock_error(e, &self.path))?;
-        Ok(FileLockGuard {
-            file: &self.inner.files.transition,
-        })
+        Ok(self.guard(&self.files.transition))
     }
 
     pub(crate) fn try_arrival_exclusive(&self) -> Result<Option<FileLockGuard<'_>>> {
-        if try_lock(&self.inner.files.arrival, LockKind::Exclusive)? {
-            Ok(Some(FileLockGuard {
-                file: &self.inner.files.arrival,
-            }))
+        if try_lock(self.host.as_ref(), &self.files.arrival, true)? {
+            Ok(Some(self.guard(&self.files.arrival)))
         } else {
             Ok(None)
         }
@@ -280,32 +433,24 @@ impl FileCoordinator {
     /// Convert the held presence EX lease to SH. The caller holds transition EX and the local barrier.
     pub(crate) fn downgrade_presence(&self) -> Result<()> {
         self.set_state(LeaseState::Shared);
-        self.inner
-            .files
-            .presence
-            .unlock()
+        self.host
+            .unlock(&self.files.presence)
             .map_err(|e| lock_error(e, &self.path))?;
-        self.inner
-            .files
-            .presence
-            .lock_shared()
+        self.host
+            .lock(&self.files.presence, false)
             .map_err(|e| lock_error(e, &self.path))
     }
 
     /// Try SH→EX while arrival EX and transition EX make the temporary unlock invisible.
     pub(crate) fn try_upgrade_presence(&self) -> Result<bool> {
-        self.inner
-            .files
-            .presence
-            .unlock()
+        self.host
+            .unlock(&self.files.presence)
             .map_err(|e| lock_error(e, &self.path))?;
-        if try_lock(&self.inner.files.presence, LockKind::Exclusive)? {
+        if try_lock(self.host.as_ref(), &self.files.presence, true)? {
             Ok(true)
         } else {
-            self.inner
-                .files
-                .presence
-                .lock_shared()
+            self.host
+                .lock(&self.files.presence, false)
                 .map_err(|e| lock_error(e, &self.path))?;
             Ok(false)
         }
@@ -318,32 +463,10 @@ impl FileCoordinator {
             return;
         }
         let mut slot = self.probe.lock().expect("probe lock poisoned");
-        if slot.is_some() {
+        if self.probe_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let inner = Arc::clone(&self.inner);
-        *slot = Some(thread::spawn(move || {
-            loop {
-                // Release the wait mutex before the callback: Drop takes it to publish `stop`, and
-                // may run on this thread when the callback releases the last handle.
-                let timed_out = {
-                    let guard = inner.wake_mu.lock().expect("probe wake lock poisoned");
-                    let (_guard, wait) = inner
-                        .wake
-                        .wait_timeout_while(guard, POLL_INTERVAL, |_| {
-                            !inner.stop.load(Ordering::Acquire)
-                        })
-                        .expect("probe wake lock poisoned");
-                    wait.timed_out()
-                };
-                if inner.stop.load(Ordering::Acquire) {
-                    break;
-                }
-                if timed_out {
-                    callback();
-                }
-            }
-        }));
+        *slot = self.host.start_probe(Arc::clone(&self.signal), callback);
     }
 }
 
@@ -353,59 +476,57 @@ impl Drop for FileCoordinator {
         // between the probe's predicate check and its park, losing the wakeup and stalling this
         // join for a full POLL_INTERVAL.
         {
-            let _guard = self.inner.wake_mu.lock().expect("probe wake lock poisoned");
-            self.inner.stop.store(true, Ordering::Release);
+            let _guard = self
+                .signal
+                .wake_mu
+                .lock()
+                .expect("probe wake lock poisoned");
+            self.signal.stop.store(true, Ordering::Release);
         }
-        self.inner.wake.notify_all();
+        self.signal.wake.notify_all();
         if let Some(handle) = self.probe.lock().expect("probe lock poisoned").take() {
             if handle.thread().id() != thread::current().id() {
                 let _ = handle.join();
             }
         }
-        unregister_path(&self.path);
+        self.host.close_files(&self.files);
+        self.host.release_path(&self.path);
     }
 }
 
-#[derive(Clone, Copy)]
-enum LockKind {
-    Shared,
-    Exclusive,
-}
-
-fn try_lock(file: &File, kind: LockKind) -> Result<bool> {
-    let result = match kind {
-        LockKind::Shared => file.try_lock_shared(),
-        LockKind::Exclusive => file.try_lock(),
-    };
-    match result {
-        Ok(()) => Ok(true),
-        Err(TryLockError::WouldBlock) => Ok(false),
-        Err(TryLockError::Error(e)) => Err(classify_lock_error(e)),
-    }
+fn try_lock(host: &dyn LockHost, handle: &LockHandle, exclusive: bool) -> Result<bool> {
+    host.try_lock(handle, exclusive)
+        .map_err(classify_lock_error)
 }
 
 fn lock_until(
-    file: &File,
-    kind: LockKind,
+    host: &dyn LockHost,
+    handle: &LockHandle,
+    exclusive: bool,
     deadline: Option<Instant>,
     path: &Path,
     writer: bool,
 ) -> Result<()> {
     loop {
-        if try_lock(file, kind)? {
+        if try_lock(host, handle, exclusive)? {
             return Ok(());
         }
-        check_deadline(deadline, path, writer)?;
-        thread::sleep(RETRY_INTERVAL);
+        check_deadline(host, deadline, path, writer)?;
+        host.pause();
     }
 }
 
-fn deadline(timeout_ms: u64) -> Option<Instant> {
-    Some(Instant::now() + Duration::from_millis(timeout_ms))
+fn deadline(host: &dyn LockHost, timeout_ms: u64) -> Option<Instant> {
+    Some(host.now() + Duration::from_millis(timeout_ms))
 }
 
-fn check_deadline(deadline: Option<Instant>, path: &Path, writer: bool) -> Result<()> {
-    if deadline.is_some_and(|d| Instant::now() >= d) {
+fn check_deadline(
+    host: &dyn LockHost,
+    deadline: Option<Instant>,
+    path: &Path,
+    writer: bool,
+) -> Result<()> {
+    if deadline.is_some_and(|d| host.now() >= d) {
         let state = if writer {
             SqlState::LockNotAvailable
         } else {
@@ -444,27 +565,6 @@ fn resolve_mode(mode: Locking) -> Result<Locking> {
     }
 }
 
-fn register_path(path: &Path) -> Result<()> {
-    let mut paths = OPEN_PATHS.lock().expect("open-path registry poisoned");
-    if !paths.insert(path.to_path_buf()) {
-        return Err(EngineError::new(
-            SqlState::ObjectInUse,
-            format!(
-                "database is already open in this process: {} (share one Database handle)",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn unregister_path(path: &Path) {
-    OPEN_PATHS
-        .lock()
-        .expect("open-path registry poisoned")
-        .remove(path);
-}
-
 fn open_bundle(path: &Path) -> Result<LockFiles> {
     let bundle = PathBuf::from(format!("{}.lock", path.display()));
     match fs::create_dir(&bundle) {
@@ -490,11 +590,11 @@ fn open_bundle(path: &Path) -> Result<LockFiles> {
     // protocol-marker check against a cooperating future migration.
     ensure_regular_file(&bundle.join(PROTOCOL_MARKER))?;
     Ok(LockFiles {
-        presence: open_regular(&bundle.join("presence"))?,
-        arrival: open_regular(&bundle.join("arrival"))?,
-        transition: open_regular(&bundle.join("transition"))?,
-        writer: open_regular(&bundle.join("writer"))?,
-        commit: open_regular(&bundle.join("commit"))?,
+        presence: Box::new(open_regular(&bundle.join("presence"))?),
+        arrival: Box::new(open_regular(&bundle.join("arrival"))?),
+        transition: Box::new(open_regular(&bundle.join("transition"))?),
+        writer: Box::new(open_regular(&bundle.join("writer"))?),
+        commit: Box::new(open_regular(&bundle.join("commit"))?),
     })
 }
 

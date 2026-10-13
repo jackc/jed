@@ -382,7 +382,9 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   A seeded generator (`scripts/sim_gen.rb`) writes multi-session histories; each core's runner executes
   them over a simulated disk whose power losses, process crashes, torn sectors, and I/O errors are
   decided by a content-keyed function, so a run replays exactly from its seed and the three cores must
-  produce **byte-identical transcripts and crash images**. Oracles: recovery lands between the durability
+  produce **byte-identical transcripts and crash images**. The simulated filesystem covers compaction's
+  rename and directory barrier, and simulated processes share one file under the real locking protocol
+  through a lock-host seam. Oracles: recovery lands between the durability
   floor and the newest attempted commit and matches a recorded generation; a reader sees its pinned
   version; no `XX001`; image and live integrity checks; and `spec/fileformat/verify.rb --check-image`
   re-decides every recovery independently. `mise run ci` runs the regression traces and a fixed sweep;

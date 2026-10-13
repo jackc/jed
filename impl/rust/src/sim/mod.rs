@@ -17,15 +17,18 @@
 
 mod check;
 mod disk;
+mod locks;
 
+use crate::coordinator::FileCoordinator;
 use crate::error::EngineError;
 use crate::executor::{Engine, Snapshot};
+use crate::file::Locking;
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, cache_leaves};
 use crate::seam::seeded_random_source;
 use crate::shared::{Database, Session};
 use disk::{Fault, FaultKind, LANE_SESSION, MAIN_FILE, SimFs, SimHost, SimStore, decide, fnv};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -123,6 +126,8 @@ fn trace_paths(input: &str) -> std::io::Result<Vec<PathBuf>> {
 struct Step {
     line: usize,
     kind: String,
+    /// open (the session's process), spawn, exit, kill
+    pid: u32,
     sid: String,
     mode: String,
     sql: String,
@@ -169,6 +174,7 @@ fn parse(text: &str) -> Result<Trace, String> {
         let mut st = Step {
             line: n + 1,
             kind: fields[0].to_string(),
+            pid: 0,
             sid: String::new(),
             mode: String::new(),
             sql: String::new(),
@@ -176,11 +182,20 @@ fn parse(text: &str) -> Result<Trace, String> {
         };
         match fields[0] {
             "open" => {
-                if fields.len() != 3 {
-                    return Err(format!("line {}: open <sid> read|write", n + 1));
+                if fields.len() != 3 && fields.len() != 4 {
+                    return Err(format!("line {}: open <sid> read|write [p<N>]", n + 1));
                 }
                 st.sid = fields[1].to_string();
                 st.mode = fields[2].to_string();
+                if fields.len() == 4 {
+                    st.pid = parse_pid(fields[3]).map_err(|e| format!("line {}: {e}", n + 1))?;
+                }
+            }
+            "spawn" | "exit" | "kill" => {
+                if fields.len() != 2 {
+                    return Err(format!("line {}: {} p<N>", n + 1, st.kind));
+                }
+                st.pid = parse_pid(fields[1]).map_err(|e| format!("line {}: {e}", n + 1))?;
             }
             "on" => {
                 if fields.len() < 3 {
@@ -215,7 +230,7 @@ fn parse(text: &str) -> Result<Trace, String> {
                 st.params
                     .insert("delta".to_string(), fields[1][1..].to_string());
             }
-            "check" | "reopen" | "compact" => {}
+            "check" | "reopen" | "compact" | "tick" => {}
             other => return Err(format!("line {}: unknown step {}", n + 1, go_quote(other))),
         }
         tr.steps.push(st);
@@ -224,6 +239,13 @@ fn parse(text: &str) -> Result<Trace, String> {
         return Err("missing `# format: simulation` header".to_string());
     }
     Ok(tr)
+}
+
+/// Parse a process name, `p<N>`.
+fn parse_pid(name: &str) -> Result<u32, String> {
+    name.strip_prefix('p')
+        .and_then(|n| n.parse::<u32>().ok())
+        .ok_or_else(|| format!("bad process {} (want p<N>)", go_quote(name)))
 }
 
 /// The fault a `fault` step arms (simulation-testing.md §6.3).
@@ -433,6 +455,14 @@ struct SimSession {
     write: bool,
     /// The version a read session pinned (§8.1: what it must keep seeing).
     pin: u64,
+    /// The process the session lives in.
+    pid: u32,
+}
+
+/// One simulated process: a Database over the shared simulated filesystem (in a shared trace, with
+/// its own coordinator over the simulated lock table — S5).
+struct Proc {
+    db: Database,
 }
 
 struct Runner<'a> {
@@ -454,8 +484,17 @@ struct Runner<'a> {
     spill_dir: Option<PathBuf>,
 
     sessions: HashMap<String, SimSession>,
+    /// The database of the process running the current step.
     db: Option<Database>,
     fs: Arc<Mutex<SimFs>>,
+
+    // Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
+    // coordination; a `# processes: shared` trace opens every process with shared locking.
+    shared: bool,
+    procs: BTreeMap<u32, Proc>,
+    /// The process running the current step.
+    cur: u32,
+    locks: Option<locks::SharedTable>,
     armed: Option<Fault>,
 
     transcript: String,
@@ -633,6 +672,10 @@ impl<'a> Runner<'a> {
             spill_dir,
             sessions: HashMap::new(),
             db: None,
+            shared: tr.header("processes") == "shared",
+            procs: BTreeMap::new(),
+            cur: 0,
+            locks: None,
             fs: Arc::new(Mutex::new(SimFs::new(seed, sector as usize, &image))),
             armed: None,
             transcript: String::new(),
@@ -684,9 +727,66 @@ impl<'a> Runner<'a> {
         self.transcript.push('\n');
     }
 
-    /// Open a Database over the simulated disk through the ordinary demand-paged loader — the path a
+    /// Open p0 over the simulated disk through the ordinary demand-paged loader — the path a
     /// reopening process takes, including validated-COW recovery (validated-cow.md §1).
     fn open(&mut self) -> Result<(), EngineError> {
+        self.open_proc(0)
+    }
+
+    /// Start process `pid`. A shared trace acquires the file coordinator through the simulated lock
+    /// host first, exactly as `Database::open_with_options` does through the OS host.
+    fn open_proc(&mut self, pid: u32) -> Result<(), EngineError> {
+        let db = if self.shared {
+            let table = self
+                .locks
+                .get_or_insert_with(|| locks::new_table(self.clock.clone()))
+                .clone();
+            let host = Arc::new(locks::SimLockHost::new(table.clone(), pid));
+            let coordinator = match FileCoordinator::acquire(
+                host,
+                PathBuf::from(MAIN_FILE),
+                Locking::Shared,
+                crate::file::DEFAULT_FILE_LOCK_TIMEOUT_MS,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    locks::release(&table, pid);
+                    return Err(e);
+                }
+            };
+            let engine = match coordinator.lock_commit_shared() {
+                Ok(commit) => {
+                    let engine = self.open_engine();
+                    drop(commit);
+                    engine
+                }
+                Err(e) => Err(e),
+            };
+            let engine = match engine {
+                Ok(engine) => engine,
+                Err(e) => {
+                    drop(coordinator);
+                    locks::release(&table, pid);
+                    return Err(e);
+                }
+            };
+            Database::sim_from_engine_coordinated(engine, coordinator)
+        } else {
+            Database::from_engine(self.open_engine()?)
+        };
+        // Compaction's temp file, rename, and directory barrier go through the simulated filesystem.
+        db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
+        if self.max_storage_bytes > 0 {
+            db.set_max_storage_bytes("main", self.max_storage_bytes)?;
+        }
+        self.procs.insert(pid, Proc { db: db.clone() });
+        self.cur = pid;
+        self.db = Some(db);
+        Ok(())
+    }
+
+    /// Load the engine over the simulated main file.
+    fn open_engine(&self) -> Result<Engine, EngineError> {
         let Some(main) = self.disk().main() else {
             return Err(EngineError::new(
                 crate::error::SqlState::IoError,
@@ -707,14 +807,163 @@ impl<'a> Runner<'a> {
         // The path marks the engine durable; the simulated filesystem is its only storage.
         engine.path = Some(PathBuf::from(MAIN_FILE));
         engine.spill_dir = self.spill_dir.clone();
-        let db = Database::from_engine(engine);
-        // Compaction's temp file, rename, and directory barrier go through the simulated filesystem.
-        db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
-        if self.max_storage_bytes > 0 {
-            db.set_max_storage_bytes("main", self.max_storage_bytes)?;
+        Ok(engine)
+    }
+
+    /// Tell the lock table which processes hold an open write session: a real probe would wait for
+    /// that writer to finish, so the simulation does not run it.
+    fn sessions_changed(&self) {
+        if let Some(table) = &self.locks {
+            let busy: BTreeSet<u32> = self
+                .sessions
+                .values()
+                .filter(|ss| ss.write)
+                .map(|ss| ss.pid)
+                .collect();
+            locks::set_busy(table, busy);
         }
-        self.db = Some(db);
-        Ok(())
+    }
+
+    /// The running processes, in order.
+    fn live_pids(&self) -> Vec<u32> {
+        self.procs.keys().copied().collect()
+    }
+
+    /// `pid`'s open sessions, in name order.
+    fn sessions_of(&self, pid: u32) -> Vec<String> {
+        let mut sids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, ss)| ss.pid == pid)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        sids.sort();
+        sids
+    }
+
+    /// End process `pid` cleanly: its sessions end (a writer rolls back) and its Database closes,
+    /// releasing its locks.
+    fn close_proc(&mut self, pid: u32) -> Result<(), EngineError> {
+        for sid in self.sessions_of(pid) {
+            let mut ss = self.sessions.remove(&sid).expect("a listed session exists");
+            if ss.write {
+                let _ = ss.s.rollback();
+            } else {
+                ss.s.close();
+            }
+        }
+        self.sessions_changed();
+        let proc = self.procs.remove(&pid).expect("a running process");
+        if self.cur == pid {
+            self.db = None;
+        }
+        let result = proc.db.close();
+        if let Some(table) = &self.locks {
+            locks::release(table, pid);
+        }
+        result
+    }
+
+    /// Abandon process `pid` as a crash does: its sessions and Database vanish without closing, and
+    /// the kernel releases its locks.
+    fn drop_proc(&mut self, pid: u32) {
+        for sid in self.sessions_of(pid) {
+            self.sessions.remove(&sid);
+        }
+        self.sessions_changed();
+        if let Some(table) = &self.locks {
+            locks::release(table, pid);
+        }
+        self.procs.remove(&pid);
+        if self.cur == pid {
+            self.db = None;
+        }
+    }
+
+    /// Check the version and contents a process sees when it begins (S5): in a shared trace another
+    /// process may have committed — or died mid-commit, leaving a complete generation another
+    /// process adopts — so the version may be newer than the last this runner saw, but never older,
+    /// and its contents must be a generation the history records.
+    fn observe(&mut self, i: usize, who: &str, v: u64, d: Option<String>) -> bool {
+        let msg = match &d {
+            None => Some(format!("{who}: version {v} is unreadable")),
+            Some(_) if v < self.version => Some(format!(
+                "{who} sees version {v} after version {} was published",
+                self.version
+            )),
+            Some(_) if v > self.max_attempted => Some(format!(
+                "{who} sees version {v}, which was never attempted (latest attempted {})",
+                self.max_attempted
+            )),
+            Some(d) if !self.in_history(v, d) => Some(format!(
+                "{who} sees version {v} with contents (digest {d}) no transaction produced"
+            )),
+            Some(_) => None,
+        };
+        if let Some(msg) = msg {
+            self.fail(i, msg);
+            return false;
+        }
+        self.version = v;
+        self.last_digest = d.expect("checked above");
+        true
+    }
+
+    /// Make `pid` the process running the step.
+    fn select_proc(&mut self, pid: u32) -> bool {
+        let Some(p) = self.procs.get(&pid) else {
+            return false;
+        };
+        self.db = Some(p.db.clone());
+        self.cur = pid;
+        true
+    }
+
+    /// The process a step runs in: a session's own, an explicit one, or the lowest running.
+    fn step_pid(&self, st: &Step) -> Option<u32> {
+        match st.kind.as_str() {
+            "open" | "spawn" | "exit" | "kill" => Some(st.pid),
+            "on" | "commit" | "rollback" | "close" => self.sessions.get(&st.sid).map(|ss| ss.pid),
+            _ => self.procs.keys().next().copied(),
+        }
+    }
+
+    /// Start a process (S5) and check what it sees.
+    fn step_spawn(&mut self, i: usize, pid: u32) {
+        if self.procs.contains_key(&pid) {
+            self.fail(i, format!("spawn p{pid}: already running"));
+            return;
+        }
+        if let Err(e) = self.open_proc(pid) {
+            let code = engine_code(&e);
+            if code == "XX001" {
+                self.fail(i, format!("spawn p{pid}: {e}"));
+                return;
+            }
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"spawn\",\"pid\":{pid},\"error\":{}}}",
+                go_quote(&code)
+            ));
+            return;
+        }
+        let v = self.db().version();
+        let d = self.committed_digest();
+        if !self.observe(i, &format!("spawned p{pid}"), v, d) {
+            return;
+        }
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"spawn\",\"pid\":{pid},\"version\":{v}}}"
+        ));
+    }
+
+    /// The version and digest a fresh read session sees.
+    fn committed_view(&mut self) -> (u64, Option<String>) {
+        let mut rs = self.db().read_session();
+        let (d, text) = self.oracle(|| digest(&mut rs));
+        self.last_digest_text = text;
+        let v = rs.version();
+        rs.close();
+        (v, d)
     }
 
     fn run(&mut self) {
@@ -806,13 +1055,79 @@ impl<'a> Runner<'a> {
                 self.emit(format!("{{\"i\":{i},\"op\":\"clock\"}}"));
                 return true;
             }
+            "tick" => {
+                if let Some(table) = &self.locks {
+                    locks::run_probes(table, None);
+                }
+                self.emit(format!("{{\"i\":{i},\"op\":\"tick\"}}"));
+                return true;
+            }
+            "exit" => {
+                let pid = st.pid;
+                if !self.procs.contains_key(&pid) {
+                    self.emit(format!(
+                        "{{\"i\":{i},\"op\":\"exit\",\"pid\":{pid},\"skip\":true}}"
+                    ));
+                    return true;
+                }
+                if let Err(e) = self.close_proc(pid) {
+                    self.fail(i, format!("exit p{pid}: {e}"));
+                    return false;
+                }
+                self.emit(format!("{{\"i\":{i},\"op\":\"exit\",\"pid\":{pid}}}"));
+                return true;
+            }
+            "kill" => {
+                let pid = st.pid;
+                if !self.procs.contains_key(&pid) {
+                    self.emit(format!(
+                        "{{\"i\":{i},\"op\":\"kill\",\"pid\":{pid},\"skip\":true}}"
+                    ));
+                    return true;
+                }
+                self.drop_proc(pid);
+                if self.procs.is_empty() {
+                    self.disk().begin_step(i as u64, None);
+                    return self.recover(i, "none");
+                }
+                self.emit(format!("{{\"i\":{i},\"op\":\"kill\",\"pid\":{pid}}}"));
+                return true;
+            }
             _ => {}
         }
 
+        // A step that needs a process when none is running (the last one exited) restarts p0 first.
+        if self.procs.is_empty() && st.kind != "spawn" {
+            self.disk().begin_step(i as u64, None);
+            self.step_spawn(i, 0);
+            if !self.violation.is_empty() || self.procs.is_empty() {
+                if self.violation.is_empty() {
+                    self.fail(i, "p0 could not restart".to_string());
+                }
+                return false;
+            }
+        }
         let armed = self.armed.take();
         let start_version = self.version;
+        if let Some(pid) = self.step_pid(st)
+            && st.kind != "spawn"
+            && !self.select_proc(pid)
+        {
+            if st.kind == "open" {
+                self.emit(format!(
+                    "{{\"i\":{i},\"op\":\"open\",\"sid\":{},\"skip\":true}}",
+                    go_quote(&st.sid)
+                ));
+                return true;
+            }
+            if self.procs.is_empty() {
+                self.fail(i, "no process is running".to_string());
+                return false;
+            }
+        }
         self.disk().begin_step(i as u64, armed);
         match st.kind.as_str() {
+            "spawn" => self.step_spawn(i, st.pid),
             "open" => self.step_open(i, st),
             "on" => self.step_on(i, st),
             "commit" => self.step_commit(i, st),
@@ -839,17 +1154,30 @@ impl<'a> Runner<'a> {
         };
         // Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
         let fired = {
-            let mut disk = self.disk();
+            let disk = self.disk();
             let fired = if disk.fired.is_empty() {
                 "end"
             } else {
                 disk.fired
             };
-            if armed.kind == FaultKind::PowerLoss {
-                disk.power_loss(i as u64, armed.survive, armed.tear);
-            }
             fired
         };
+        if armed.kind == FaultKind::PowerLoss {
+            self.disk().power_loss(i as u64, armed.survive, armed.tear);
+            return self.recover(i, fired);
+        }
+        // In a shared trace any other fault kills only the process running the step; the others keep
+        // running over the same kernel state.
+        if self.shared && self.procs.len() > 1 {
+            let pid = self.cur;
+            self.drop_proc(pid);
+            self.disk().process_death();
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"killed\",\"pid\":{pid},\"fired\":{}}}",
+                go_quote(fired)
+            ));
+            return true;
+        }
         self.recover(i, fired)
     }
 
@@ -895,6 +1223,14 @@ impl<'a> Runner<'a> {
         if self.max_query_memory > 0 {
             s.set_max_query_memory_bytes(self.max_query_memory);
         }
+        if self.shared {
+            let (d, text) = self.oracle(|| digest(&mut s));
+            self.last_digest_text = text;
+            let v = s.version();
+            if !self.observe(i, &format!("session {}", st.sid), v, d) {
+                return;
+            }
+        }
         let version = s.version();
         self.sessions.insert(
             st.sid.clone(),
@@ -902,8 +1238,10 @@ impl<'a> Runner<'a> {
                 s,
                 write: st.mode == "write",
                 pin: version,
+                pid: self.cur,
             },
         );
+        self.sessions_changed();
         self.emit(format!(
             "{{\"i\":{i},\"op\":\"open\",\"sid\":{},\"version\":{version}}}",
             go_quote(&st.sid)
@@ -953,6 +1291,7 @@ impl<'a> Runner<'a> {
             ));
             return;
         };
+        self.sessions_changed();
         let base = self.version;
         let (inflight, inflight_text) = self.oracle(|| digest(&mut ss.s));
         self.last_digest_text = inflight_text.clone();
@@ -1044,6 +1383,7 @@ impl<'a> Runner<'a> {
             ));
             return;
         };
+        self.sessions_changed();
         if st.kind == "rollback" {
             if let Err(e) = ss.s.rollback() {
                 self.emit(format!(
@@ -1120,13 +1460,25 @@ impl<'a> Runner<'a> {
     }
 
     fn step_check(&mut self, i: usize) {
-        let d = self.committed_digest();
-        let Some(d) = d.filter(|d| *d == self.last_digest) else {
-            self.fail(
-                i,
-                "a read session does not see the last committed version's contents".to_string(),
-            );
-            return;
+        let (v, d) = self.committed_view();
+        let d = if self.shared {
+            // Another process may have died leaving a newer complete generation this one now adopts.
+            if !self.observe(i, "check", v, d) {
+                return;
+            }
+            self.last_digest.clone()
+        } else {
+            match d.filter(|d| v == self.version && *d == self.last_digest) {
+                Some(d) => d,
+                None => {
+                    self.fail(
+                        i,
+                        "a read session does not see the last committed version's contents"
+                            .to_string(),
+                    );
+                    return;
+                }
+            }
         };
         if let Err(e) = self.oracle(|| check::check_live(self.db())) {
             self.fail(i, format!("live integrity: {e}"));
@@ -1151,21 +1503,11 @@ impl<'a> Runner<'a> {
     /// End every session cleanly, close the Database, and reopen it: the result must be exactly the
     /// last committed version.
     fn step_reopen(&mut self, i: usize) -> bool {
-        let mut sids: Vec<String> = self.sessions.keys().cloned().collect();
-        sids.sort();
-        for sid in sids {
-            let mut ss = self.sessions.remove(&sid).expect("a listed session exists");
-            if ss.write {
-                let _ = ss.s.rollback();
-            } else {
-                ss.s.close();
+        for pid in self.live_pids() {
+            if let Err(e) = self.close_proc(pid) {
+                self.fail(i, format!("close: {e}"));
+                return false;
             }
-        }
-        if let Some(db) = self.db.take()
-            && let Err(e) = db.close()
-        {
-            self.fail(i, format!("close: {e}"));
-            return false;
         }
         self.disk().process_death();
         if let Err(e) = self.open() {
@@ -1175,7 +1517,12 @@ impl<'a> Runner<'a> {
         let v = self.db().version();
         let d = self.committed_digest();
         let shown = d.clone().unwrap_or_default();
-        if v != self.version || d.as_deref() != Some(self.last_digest.as_str()) {
+        if self.shared {
+            // A process killed mid-commit may have left a complete generation no survivor began on yet.
+            if !self.observe(i, "reopened p0", v, d) {
+                return false;
+            }
+        } else if v != self.version || d.as_deref() != Some(self.last_digest.as_str()) {
             let msg = format!(
                 "a clean reopen returned version {v} (digest {shown}), want version {} (digest {})",
                 self.version, self.last_digest
@@ -1194,8 +1541,9 @@ impl<'a> Runner<'a> {
     /// would, then check the recovered generation against the history and the durability floor
     /// (§8.1–8.2) and the image against the integrity checker (§8.3).
     fn recover(&mut self, i: usize, fired: &str) -> bool {
-        self.sessions.clear();
-        self.db = None;
+        for pid in self.live_pids() {
+            self.drop_proc(pid);
+        }
         let image = {
             let mut disk = self.disk();
             disk.process_death();
