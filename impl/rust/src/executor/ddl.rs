@@ -891,8 +891,14 @@ impl Engine {
                 (None, Some(DefaultExpr { expr_text, expr }), identity_kind)
             } else if ty.is_composite() || ty.is_array() || ty.is_range() {
                 // A DEFAULT on a composite-, array-, or range-typed column is not supported this
-                // slice (composite.md §12 / array.md §12 / ranges.md §8).
-                if def.default.is_some() {
+                // slice (composite.md §12 / array.md §12 / ranges.md §8), except a bare `DEFAULT
+                // NULL`: it is the same as no default (PostgreSQL stores none for it), so it records
+                // nothing.
+                if def
+                    .default
+                    .as_ref()
+                    .is_some_and(|d| !is_bare_null_default(d))
+                {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         "a DEFAULT on a composite-, array-, or range-typed column is not supported yet"
@@ -3584,6 +3590,11 @@ impl Engine {
         def: &DefaultDef,
     ) -> Result<(Option<Value>, Option<DefaultExpr>)> {
         let Type::Scalar(sty) = &col.ty else {
+            // A bare `DEFAULT NULL` on a container column is the same as no default (PostgreSQL
+            // stores none for it); any other container DEFAULT is not supported yet.
+            if is_bare_null_default(def) {
+                return Ok((None, None));
+            }
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "a DEFAULT on this container type is not supported yet".to_string(),
@@ -3873,7 +3884,12 @@ impl Engine {
                 }
             });
         } else if col.ty.is_composite() || col.ty.is_array() || col.ty.is_range() {
-            if def.default.is_some() {
+            // A bare `DEFAULT NULL` is the same as no default (see `create_table`).
+            if def
+                .default
+                .as_ref()
+                .is_some_and(|d| !is_bare_null_default(d))
+            {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
@@ -5449,4 +5465,11 @@ pub(crate) fn nextval_default_text(seqname: &str) -> String {
         "nextval ( '{}' )",
         crate::parser::quote_identifier(seqname).replace('\'', "''")
     )
+}
+
+/// Whether a column DEFAULT is the bare `NULL` literal — the one DEFAULT a composite-, array-, or
+/// range-typed column admits: it is the same as no default (PostgreSQL's `AddRelationNewConstraints`
+/// stores no default for a NULL constant), so it records nothing (composite.md §12).
+fn is_bare_null_default(def: &DefaultDef) -> bool {
+    matches!(def.expr, Expr::Literal(Literal::Null, _))
 }

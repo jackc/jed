@@ -1436,12 +1436,14 @@ func coerceStringToComposite(text string, ct *compositeType, catalog *engine, iz
 // ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
 // canonicalize (spec/design/ranges.md §4/§5). Folds to a reConstRange. Malformed → 22P02;
 // lower>upper → 22000; a canonicalize overflow → 22003.
-// resolveContainerAssign resolves an UPDATE assignment RHS against a RANGE or ARRAY column (the
-// caller has already rejected composite — 0A000). It mirrors INSERT's value adaptation
-// (ranges.md §5 / array.md §7): a bare string literal adapts to the container via range_in /
-// array_in, a bare NULL is the typed NULL, and any other expression must resolve to the SAME
-// container type (matching element) else 42804. A top-level $N parameter is deferred (0A000) —
-// INSERT's param-to-container handling is special and not generalized to the assignment RHS yet.
+// resolveContainerAssign resolves an UPDATE (or ON CONFLICT DO UPDATE) assignment RHS against a
+// RANGE, ARRAY, or COMPOSITE column. It mirrors INSERT's value adaptation (ranges.md §5 / array.md
+// §7 / composite.md §8): a bare string literal adapts to the container via range_in / array_in /
+// record_in, a bare NULL is the typed NULL, and any other expression must resolve to the SAME
+// container type (matching element / the same named composite) else 42804. An anonymous ROW(…)
+// expression has no composite type to match (0A000, the INSERT … VALUES expression rule —
+// composite.md §12). A top-level $N parameter is deferred (0A000) — INSERT's param-to-container
+// handling is special and not generalized to the assignment RHS yet.
 func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, params *paramTypes) (*rExpr, error) {
 	snap := s.catalog.readSnap()
 	colRT := resolvedTypeOfCol(col.Type, snap)
@@ -1459,6 +1461,19 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 			params.noteInputZone(iz)
 			return node, positionError(err, e.Pos)
 		}
+		if col.Type.IsComposite() {
+			ct := snap.compositeType(col.Type.Comp.Name)
+			if ct == nil {
+				panic("a composite column's type exists in the catalog")
+			}
+			iz := s.catalog.inputZone()
+			node, _, err := coerceStringToComposite(e.Literal.Str, ct, s.catalog, iz)
+			if err != nil {
+				return nil, positionError(err, e.Pos)
+			}
+			params.noteInputZone(iz)
+			return node, nil
+		}
 		// array
 		iz := s.catalog.inputZone()
 		val, err := coerceStringToArray(e.Literal.Str, resolveColType(*col.Type.Array, snap.types), iz)
@@ -1475,6 +1490,8 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 		kind := "range"
 		if col.Type.IsArray() {
 			kind = "array"
+		} else if col.Type.IsComposite() {
+			kind = "composite"
 		}
 		return nil, newError(FeatureNotSupported,
 			"updating "+kind+" column "+col.Name+" from a parameter is not supported yet")
@@ -1497,6 +1514,10 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 	if ty.kind == rtNull {
 		return node, nil // a NULL-typed expression (e.g. a CASE that may be NULL)
 	}
+	if ty.kind == rtComposite && !ty.comp.named {
+		return nil, newError(FeatureNotSupported,
+			"assigning a ROW expression to composite column "+col.Name+" is not supported yet")
+	}
 	if !containerAssignable(ty, colRT) {
 		return nil, positionError(assignmentError("column "+col.Name+" is of type "+col.Type.CanonicalName()+
 			" but expression is of type "+rtName(ty)), exprLocation(e))
@@ -1504,10 +1525,11 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 	return node, nil
 }
 
-// containerAssignable reports whether a resolved RHS type is assignable to a range/array column
-// type. Ranges require the SAME element scalar (i32range ⇍ i64range — no implicit cross-element
-// range conversion, matching the comparison rule, ranges.md §6); arrays require structurally equal
-// element types (array.md §5). A NULL RHS is handled by the caller.
+// containerAssignable reports whether a resolved RHS type is assignable to a range/array/composite
+// column type. Ranges require the SAME element scalar (i32range ⇍ i64range — no implicit
+// cross-element range conversion, matching the comparison rule, ranges.md §6); arrays require
+// structurally equal element types (array.md §5); a composite requires the same named composite
+// (composite.md §12). A NULL RHS is handled by the caller.
 func containerAssignable(rhs, col resolvedType) bool {
 	if rhs.kind != col.kind {
 		return false
@@ -1517,7 +1539,7 @@ func containerAssignable(rhs, col resolvedType) bool {
 		re, rok := resolvedRangeElementScalar(rhs.elem)
 		ce, cok := resolvedRangeElementScalar(col.elem)
 		return rok && cok && re == ce
-	case rtArray:
+	case rtArray, rtComposite:
 		return resolvedTypeEqual(rhs, col)
 	default:
 		return false

@@ -616,22 +616,13 @@ impl Engine {
                     )?
                     .0
                 }
-                Type::Range(_) | Type::Array(_) => resolve_container_assign(
+                Type::Composite(_) | Type::Range(_) | Type::Array(_) => resolve_container_assign(
                     &scope,
                     col,
                     &assignment.value,
                     &mut AggCtx::Forbidden,
                     &mut ptypes,
                 )?,
-                Type::Composite(_) => {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        format!(
-                            "updating composite column {} is not supported yet",
-                            assignment.column
-                        ),
-                    ));
-                }
             };
             collect_touched(&source, 0, &mut mask);
         }

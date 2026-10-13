@@ -1372,12 +1372,14 @@ pub(crate) fn coerce_string_to_composite(
 /// `i32range '[1,5)'`). Parses the literal, coerces each bound to the element type via the
 /// string-literal coercion, then canonicalizes (spec/design/ranges.md §4/§5). Folds to a
 /// `ConstRange`. Malformed → `22P02`; `lower>upper` → `22000`; a canonicalize overflow → `22003`.
-/// Resolve an UPDATE assignment RHS against a RANGE or ARRAY column (the caller has already
-/// rejected composite — 0A000). Mirrors INSERT's value adaptation (ranges.md §5 / array.md §7): a
-/// bare string literal adapts to the container via range_in / array_in, a bare NULL is the typed
-/// NULL, and any other expression must resolve to the SAME container type (matching element) else
-/// 42804. A top-level `$N` parameter is deferred (0A000) — INSERT's param-to-container handling is
-/// special and not generalized to the assignment RHS yet.
+/// Resolve an UPDATE (or ON CONFLICT DO UPDATE) assignment RHS against a RANGE, ARRAY, or
+/// COMPOSITE column. Mirrors INSERT's value adaptation (ranges.md §5 / array.md §7 / composite.md
+/// §8): a bare string literal adapts to the container via range_in / array_in / record_in, a bare
+/// NULL is the typed NULL, and any other expression must resolve to the SAME container type
+/// (matching element / the same named composite) else 42804. An anonymous `ROW(…)` expression has
+/// no composite type to match (0A000, the INSERT … VALUES expression rule — composite.md §12). A
+/// top-level `$N` parameter is deferred (0A000) — INSERT's param-to-container handling is special
+/// and not generalized to the assignment RHS yet.
 pub(crate) fn resolve_container_assign(
     scope: &Scope,
     col: &Column,
@@ -1406,14 +1408,30 @@ pub(crate) fn resolve_container_assign(
                 params.note_input_zone(&iz);
                 return Ok(value_to_rexpr(&val));
             }
-            _ => unreachable!("resolve_container_assign is only called for range/array columns"),
+            Type::Composite(r) => {
+                let ct = scope
+                    .catalog
+                    .composite_type(&r.name)
+                    .expect("a composite column's type exists in the catalog");
+                let (node, _) = coerce_string_to_composite(s, ct, scope.catalog, &iz)
+                    .map_err(|e| e.with_position(pos.0))?;
+                params.note_input_zone(&iz);
+                return Ok(node);
+            }
+            Type::Scalar(_) => {
+                unreachable!("resolve_container_assign is only called for containers")
+            }
         }
     }
     if let Expr::Literal(Literal::Null, _) = e {
         return Ok(RExpr::ConstNull);
     }
     if let Expr::Param(_) = e {
-        let kind = if col.ty.is_array() { "array" } else { "range" };
+        let kind = match &col.ty {
+            Type::Array(_) => "array",
+            Type::Range(_) => "range",
+            _ => "composite",
+        };
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
             format!(
@@ -1431,6 +1449,15 @@ pub(crate) fn resolve_container_assign(
     let (node, ty) = resolve(scope, e, hint, agg, params)?;
     if matches!(ty, ResolvedType::Null) {
         return Ok(node); // a NULL-typed expression (e.g. a CASE that may be NULL)
+    }
+    if matches!(&ty, ResolvedType::Composite(c) if c.name.is_none()) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!(
+                "assigning a ROW expression to composite column {} is not supported yet",
+                col.name
+            ),
+        ));
     }
     // Ranges/arrays compare equal only over equal element types (ResolvedType's derived Eq compares
     // the boxed element), matching the comparison rule (ranges.md §6 / array.md §5).

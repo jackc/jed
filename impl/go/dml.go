@@ -781,28 +781,32 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 			}
 		}
 		col := table.Columns[idx]
-		// Updating a non-scalar column (composite / range / array) on the ON CONFLICT DO UPDATE path
-		// is deferred (0A000): standalone UPDATE of a range/array column has landed, but extending the
-		// conflict-action path to non-scalar columns is a separate follow-on (upsert.md §9).
-		if _, ok := col.Type.AsScalar(); !ok {
-			noun := "composite"
-			switch {
-			case col.Type.IsRange():
-				noun = "range"
-			case col.Type.IsArray():
-				noun = "array"
-			}
-			return nil, newError(FeatureNotSupported,
-				"updating "+noun+" column "+a.Column+" is not supported yet")
+		// A container (composite / range / array) column takes the standalone UPDATE container rule
+		// (resolveContainerAssign) and is stored through coerceForStore (carried as colType); a
+		// scalar column takes the scalar assignability gate.
+		plan := assignPlan{
+			idx: idx, name: col.Name, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull,
 		}
-		colScalar := col.Type.ScalarTy()
-		var src *rExpr
-		if a.IsDefault {
-			src = defaultExprs[idx]
-			if src == nil {
-				src = valueToRExpr(defaultOrNull(col))
-			}
+		colScalar, isScalar := col.Type.AsScalar()
+		if isScalar {
+			plan.target = colScalar
 		} else {
+			ct := resolveColType(col.Type, db.readSnap().types)
+			plan.colType = &ct
+		}
+		switch {
+		case a.IsDefault:
+			plan.source = defaultExprs[idx]
+			if plan.source == nil {
+				plan.source = valueToRExpr(defaultOrNull(col))
+			}
+		case !isScalar:
+			resolved, err := resolveContainerAssign(s, col, a.Value, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			plan.source = resolved
+		default:
 			resolved, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
 			if err != nil {
 				return nil, err
@@ -810,11 +814,9 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
 				return nil, positionError(err, exprLocation(a.Value))
 			}
-			src = resolved
+			plan.source = resolved
 		}
-		plans = append(plans, assignPlan{
-			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,
-		})
+		plans = append(plans, plan)
 	}
 	var filter *rExpr
 	if oc.Filter != nil {
@@ -3663,13 +3665,6 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			plans = append(plans, plan)
 			continue
 		}
-		// Updating a composite-typed column lands in a later slice (anonymous-record → named-composite
-		// assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
-		// ARE updatable (ranges.md §4 / array.md §4) through the container path below.
-		if col.Type.IsComposite() {
-			return outcome{}, newError(FeatureNotSupported,
-				"updating composite column "+a.Column+" is not supported yet")
-		}
 		if scalar, ok := col.Type.AsScalar(); ok {
 			// The RHS is a general expression evaluated against the *old* row; a literal operand
 			// adapts to the target column's type. The result must be assignable to the column's
@@ -3686,8 +3681,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,
 			})
 		} else {
-			// A range or array column: the RHS adapts (a bare string literal via range_in/array_in,
-			// a bare NULL to the typed NULL) or must resolve to the SAME container type. Stored
+			// A composite, range, or array column: the RHS adapts (a bare string literal via
+			// record_in/range_in/array_in, a bare NULL to the typed NULL) or must resolve to the SAME
+			// container type; an anonymous ROW(…) expression is 0A000 (composite.md §12). Stored
 			// through coerceForStore (carried on the plan as colType).
 			src, err := resolveContainerAssign(s, col, a.Value, &aggCtx{collecting: false}, ptypes)
 			if err != nil {

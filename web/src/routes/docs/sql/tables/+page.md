@@ -348,6 +348,9 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
 - **`RETURNING`** — append `RETURNING id, balance` to see the affected (inserted or updated) rows.
 - **Resetting to a default** — `DO UPDATE SET col = DEFAULT` assigns the column's declared default
   (or `NULL`), exactly like `UPDATE … SET col = DEFAULT` (see Applying defaults above).
+- **Array, range, and composite columns** — `DO UPDATE` assigns them as `UPDATE` does: `NULL`, a
+  text literal (`'{1,2}'`, `'[1,5)'`, `'(Main,1)'`), or a value of the column's own type such as
+  `excluded.col`.
 - **A target alias** — `INSERT INTO account AS a VALUES (1, 'Ada', 5.00) ON CONFLICT (id) DO UPDATE
   SET balance = a.balance + excluded.balance RETURNING a.balance;` names the existing row `a`. Once
   aliased, the table is referred to only by its alias (`account.balance` would be `42P01`), in the

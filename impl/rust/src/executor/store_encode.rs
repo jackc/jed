@@ -560,6 +560,11 @@ pub(crate) fn materialize_insert_value(
                 Ok(Value::Composite(vals))
             }
             InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
+            // A bare NULL adapts to the composite as its whole-value NULL, and a bare string
+            // literal adapts via record_in — the same unknown-literal-adapts-to-context rule the
+            // array/range arms and the scalar slots follow (spec/design/composite.md §8).
+            InsertValue::Lit(Literal::Null) => Ok(Value::Null),
+            InsertValue::Lit(Literal::Text(s)) => coerce_record_text(s, name, fields, iz),
             InsertValue::Lit(_) => Err(type_error(format!(
                 "cannot assign a scalar value to composite column (type {name})"
             ))),

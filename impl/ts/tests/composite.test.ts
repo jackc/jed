@@ -37,14 +37,20 @@ test("DROP TYPE removes it", () => {
   assert.equal(db.compositeType("addr"), undefined);
 });
 
-// A nested composite value round-trips and renders with the inner record quoted.
+// A nested composite value round-trips and renders with the inner record quoted. The nested
+// ROW(ROW(…),…) constructor is a jed extension PG rejects, so this lives here, not in the corpus.
 test("nested composite value round-trip", () => {
   const db = memDb().session();
   run(db, "CREATE TYPE point AS (x i32, y i32)");
   run(db, "CREATE TYPE seg AS (a point, b point)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, s seg)");
   run(db, "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))");
-  assert.deepStrictEqual(query(db, "SELECT s FROM t"), [['("(1,2)","(3,4)")']]);
+  // A bare NULL in a nested composite field adapts to that field's type (composite.md §12).
+  run(db, "INSERT INTO t VALUES (2, ROW(NULL, ROW(5, 6)))");
+  assert.deepStrictEqual(query(db, "SELECT s FROM t ORDER BY id"), [
+    ['("(1,2)","(3,4)")'],
+    ['(,"(5,6)")'],
+  ]);
 });
 
 // Composite values survive a serialize → load round-trip (the v9 recursive value codec).

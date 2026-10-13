@@ -604,6 +604,13 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value, iz *input
 		return Value{}, typeError("cannot assign an array value to composite column (type " + ty.Name + ")")
 	case iv.IsDefault:
 		return Value{}, newError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
+	case iv.Lit.Kind == literalNull:
+		// A bare NULL adapts to the composite as its whole-value NULL, and a bare string literal
+		// adapts via record_in — the same unknown-literal-adapts-to-context rule the array/range
+		// arms and the scalar slots follow (spec/design/composite.md §8).
+		return NullValue(), nil
+	case iv.Lit.Kind == literalText:
+		return coerceRecordTextToValue(iv.Lit.Str, ty, iz)
 	default:
 		return Value{}, typeError("cannot assign a scalar value to composite column (type " + ty.Name + ")")
 	}

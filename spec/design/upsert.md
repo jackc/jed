@@ -177,9 +177,13 @@ here: every FROM rejects a duplicate label up front with `42712`.)
 
 Each `SET col = expr` is resolved, type-checked assignable to `col` (`42804` otherwise),
 evaluated against `[E | R]`, and coerced through the same `store_value` chokepoint `UPDATE`
-uses (range `22003`, `NOT NULL` `23502`, decimal typmod). The post-assignment row `E'` is
-then validated like any `UPDATE` row: every `CHECK` (`23514`), end-state uniqueness over the
-non-arbiter unique indexes (`23505`), and the FK child-side (`23503`).
+uses (range `22003`, `NOT NULL` `23502`, decimal typmod). A **composite / range / array** column
+takes the standalone `UPDATE` container rule: a bare string literal adapts through
+`record_in`/`range_in`/`array_in`, a bare `NULL` is the typed NULL, and any other expression must be
+of the column's own type (`excluded.col`, a scalar subquery, …) — composite.md §12. The
+post-assignment row `E'` is then validated like any `UPDATE` row: every `CHECK` (`23514`),
+end-state uniqueness over the non-arbiter unique indexes (`23505`), and the FK child-side
+(`23503`).
 
 **`SET col = DEFAULT`** (PostgreSQL semantics, probed) resets `col` of the existing row to its
 declared default, or NULL when it has none — the standalone `UPDATE … SET col = DEFAULT` rule
@@ -199,9 +203,9 @@ conflict target (`DO NOTHING` too) or column-reading `RETURNING` needs `SELECT` 
 step 6, but extending it to the conflict path is separate); assigning a
 **`GENERATED ALWAYS AS IDENTITY`** column anything but `DEFAULT` is **`428C9`** (the standing
 `UPDATE` rule, sequences.md §13.4 — `SET id = DEFAULT` is accepted and advances the owned
-sequence); assigning a **composite / range / array** column is **`0A000`** on this path, in either
-form (the standalone `UPDATE` container assignment has not been extended here). Both narrowings
-apply to the `DEFAULT` form too. An unknown `col` is `42703`.
+sequence). The standalone `UPDATE` container narrowings carry over: a `$N` parameter into a
+container column, and an anonymous `ROW(…)` expression into a composite column, are `0A000`. The
+primary-key narrowing applies to the `DEFAULT` form too. An unknown `col` is `42703`.
 
 ## 6. `RETURNING`
 
@@ -263,7 +267,7 @@ except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes
 
 ## 10. Deferred (each its own later slice)
 
-Assigning a primary-key or container column on the conflict-action path (§5);
+Assigning a primary-key column on the conflict-action path (§5);
 the partial-index `WHERE index_predicate` in a conflict target (jed has no partial indexes)
 and `COLLATE`/opclass inference decorations; multi-column `SET (a,b) = (...)`; and the GIN /
 ordered-index acceleration of the arbiter probe (the probe reuses the unique-index point/range

@@ -732,8 +732,9 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			}
 		} else if isComposite || isArray || isRange {
 			// A DEFAULT on a composite-, array-, or range-typed column is not supported this slice
-			// (composite.md §12 / array.md §12 / ranges.md §8).
-			if def.Default != nil {
+			// (composite.md §12 / array.md §12 / ranges.md §8), except a bare DEFAULT NULL: it is the
+			// same as no default (PostgreSQL stores none for it), so it records nothing.
+			if def.Default != nil && !isBareNullDefault(def.Default) {
 				return outcome{}, newError(FeatureNotSupported,
 					"a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
 			}
@@ -2802,6 +2803,11 @@ func retypeIdentitySequence(existing *sequenceDef, oldType, newType seqDataType)
 
 func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *defaultExprDef, error) {
 	if !col.Type.isScalar() {
+		// A bare DEFAULT NULL on a container column is the same as no default (PostgreSQL stores
+		// none for it); any other container DEFAULT is not supported yet.
+		if isBareNullDefault(def) {
+			return nil, nil, nil
+		}
 		return nil, nil, newError(FeatureNotSupported, "a DEFAULT on this container type is not supported yet")
 	}
 	ty := col.Type.Scalar
@@ -2949,7 +2955,8 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 			col.Identity = &k
 		}
 	} else if ty.IsComposite() || ty.IsArray() || ty.IsRange() {
-		if def.Default != nil {
+		// A bare DEFAULT NULL is the same as no default (see createTable).
+		if def.Default != nil && !isBareNullDefault(def.Default) {
 			return catColumn{}, newError(FeatureNotSupported, "a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
 		}
 	} else if def.Default != nil {
@@ -3975,4 +3982,12 @@ func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) err
 // exactly that name (sequences.md §12).
 func nextvalDefaultText(seqName string) string {
 	return "nextval ( '" + strings.ReplaceAll(quoteIdentifier(seqName), "'", "''") + "' )"
+}
+
+// isBareNullDefault reports whether a column DEFAULT is the bare NULL literal — the one DEFAULT a
+// composite-, array-, or range-typed column admits: it is the same as no default (PostgreSQL's
+// AddRelationNewConstraints stores no default for a NULL constant), so it records nothing
+// (composite.md §12).
+func isBareNullDefault(def *defaultDef) bool {
+	return def.Expr.Kind == exprLiteral && def.Expr.Literal != nil && def.Expr.Literal.Kind == literalNull
 }

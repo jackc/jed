@@ -481,6 +481,11 @@ export function materializeInsertValue(
     case "param":
       return bound[iv.index - 1]!;
     case "lit":
+      // A bare NULL adapts to the composite as its whole-value NULL, and a bare string literal
+      // adapts via record_in — the same unknown-literal-adapts-to-context rule the array/range arms
+      // and the scalar slots follow (spec/design/composite.md §8).
+      if (iv.lit.kind === "null") return nullValue();
+      if (iv.lit.kind === "text") return coerceRecordTextToValue(iv.lit.text, ty, iz);
       throw typeError("cannot assign a scalar value to composite column (type " + ty.name + ")");
     case "array":
       throw typeError("cannot assign an array value to composite column (type " + ty.name + ")");

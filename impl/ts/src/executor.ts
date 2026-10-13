@@ -6071,13 +6071,13 @@ export class Engine {
         colType.kind === "array" ||
         colType.kind === "range"
       ) {
-        // A DEFAULT on a composite-/array-typed column is not supported this slice (composite.md §12
-        // / array.md §12); a range column is not storable at all yet (ranges.md §8 — unreachable,
-        // CREATE TABLE rejects it).
-        if (def.default !== null) {
+        // A DEFAULT on a composite-, array-, or range-typed column is not supported this slice
+        // (composite.md §12 / array.md §12 / ranges.md §8), except a bare DEFAULT NULL: it is the
+        // same as no default (PostgreSQL stores none for it), so it records nothing.
+        if (def.default !== null && !isBareNullDefault(def.default)) {
           throw engineError(
             "feature_not_supported",
-            "a DEFAULT on a composite- or array-typed column is not supported yet",
+            "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
           );
         }
       } else if (def.default !== null) {
@@ -8452,6 +8452,10 @@ export class Engine {
 
   private buildAlterDefault(col: Column, def: DefaultDef): Column {
     const sty = typeAsScalar(col.type);
+    // A bare DEFAULT NULL on a container column is the same as no default (PostgreSQL stores none
+    // for it); any other container DEFAULT is not supported yet.
+    if (sty === undefined && isBareNullDefault(def))
+      return { ...col, default: null, defaultExpr: null };
     if (sty === undefined)
       throw engineError(
         "feature_not_supported",
@@ -8637,7 +8641,8 @@ export class Engine {
           def.identity === null ? null : def.identity.always ? "always" : "byDefault",
       };
     } else if (type.kind === "composite" || type.kind === "array" || type.kind === "range") {
-      if (def.default !== null)
+      // A bare DEFAULT NULL is the same as no default (see executeCreateTable).
+      if (def.default !== null && !isBareNullDefault(def.default))
         throw engineError(
           "feature_not_supported",
           "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
@@ -11374,23 +11379,30 @@ export class Engine {
         }
       }
       const col = table.columns[idx]!;
-      if (col.type.kind === "composite") {
-        throw engineError(
-          "feature_not_supported",
-          "updating composite column " + a.column + " is not supported yet",
-        );
-      }
-      if (col.type.kind === "array") {
-        throw engineError(
-          "feature_not_supported",
-          "updating array column " + a.column + " is not supported yet",
-        );
-      }
-      if (col.type.kind === "range") {
-        throw engineError(
-          "feature_not_supported",
-          "updating range column " + a.column + " is not supported yet",
-        );
+      // A container (composite / range / array) column takes the standalone UPDATE container rule
+      // (resolveContainerAssign) and is stored through coerceForStore (carried as colType); a scalar
+      // column takes the scalar assignability gate.
+      if (col.type.kind !== "scalar") {
+        const source = a.isDefault
+          ? (defaultExprs[idx] ?? valueToRExpr(col.default ?? nullValue()))
+          : resolveContainerAssign(
+              scope,
+              col,
+              a.value,
+              { collecting: false, groupKeys: [], specs: [] },
+              ptypes,
+            );
+        plans.push({
+          idx,
+          name: col.name,
+          target: "i32",
+          decimal: col.decimal,
+          varcharLen: col.varcharLen,
+          notNull: col.notNull,
+          source,
+          colType: scope.catalog.colTypeOf(col.type),
+        });
+        continue;
       }
       const targetScalar = col.type.scalar;
       let source: RExpr;
@@ -12559,15 +12571,6 @@ export class Engine {
         }
         continue;
       }
-      // Updating a composite-typed column lands in a later slice (anonymous-record → named-composite
-      // assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
-      // ARE updatable (ranges.md §4 / array.md §4), via the container path below.
-      if (col.type.kind === "composite") {
-        throw engineError(
-          "feature_not_supported",
-          "updating composite column " + a.column + " is not supported yet",
-        );
-      }
       if (col.type.kind === "scalar") {
         const targetScalar = col.type.scalar;
         // The RHS is a general expression evaluated against the OLD row; a literal operand
@@ -12591,9 +12594,10 @@ export class Engine {
           source: node,
         });
       } else {
-        // A range or array column: the RHS adapts (a bare string literal via range_in/array_in, a
-        // bare NULL to the typed NULL) or must resolve to the SAME container type. Stored through
-        // coerceForStore (carried on the plan as colType).
+        // A composite, range, or array column: the RHS adapts (a bare string literal via
+        // record_in/range_in/array_in, a bare NULL to the typed NULL) or must resolve to the SAME
+        // container type; an anonymous ROW(…) expression is 0A000 (composite.md §12). Stored
+        // through coerceForStore (carried on the plan as colType).
         const node = resolveContainerAssign(
           scope,
           col,
@@ -35703,4 +35707,12 @@ function pushJsonObjectAggPair(out: string[], i: number, key: string, v: Value):
   writeJsonString(key, out);
   out.push(" : ");
   out.push(v.kind === "json" ? v.text : "null");
+}
+
+// isBareNullDefault reports whether a column DEFAULT is the bare NULL literal — the one DEFAULT a
+// composite-, array-, or range-typed column admits: it is the same as no default (PostgreSQL's
+// AddRelationNewConstraints stores no default for a NULL constant), so it records nothing
+// (composite.md §12).
+function isBareNullDefault(def: DefaultDef): boolean {
+  return def.expr.kind === "literal" && def.expr.literal.kind === "null";
 }

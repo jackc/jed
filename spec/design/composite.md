@@ -355,7 +355,25 @@ untyped `NULL` (an anonymous `ROW(…)` column is `0A000`, any other type `42804
 VALUES` expression already follows, [grammar.md](grammar.md) §24; `CREATE TABLE … AS` fills its
 composite columns through it, [create-table-as.md](create-table-as.md) §3).
 
-**Still narrowed (relaxed in a later slice):** `UPDATE` of a composite column remains `0A000`; `DEFAULT` on a composite column is `0A000`; the runtime (non-literal) text→composite
+**Assigning a composite column.** A bare `NULL` adapts to a composite column as its whole-value
+NULL, and a bare string literal adapts through `record_in` (§8) — the unknown-literal-adapts-to-context
+rule scalar, array, and range columns follow — in every write position: a one-row or multi-row
+`INSERT … VALUES` (beside `ROW(…)`, a cast literal, or an expression slot; inside a jed-extension
+nested `ROW(…)` / `ARRAY[ROW(…), …]` constructor too), `INSERT … SELECT`, `UPDATE … SET`, and
+`ON CONFLICT DO UPDATE SET` (oracle-checked, `suites/dml/composite_assign.test`). `UPDATE` and
+`DO UPDATE` take the INSERT … VALUES expression rule otherwise: a value of the column's own composite
+type (another composite column, a scalar subquery, `excluded.col`, `DEFAULT`) is assigned; any other
+type is `42804`. A bare **`DEFAULT NULL`** on a composite (or array/range) column is accepted as the
+same as no default — PostgreSQL stores no default for a NULL constant — so it records nothing (no
+catalog bytes) and `jed_columns.column_default` is NULL.
+
+**Still narrowed (relaxed in a later slice):** an anonymous `ROW(…)` *expression* assigned by
+`UPDATE`/`DO UPDATE` (or as a non-literal-field `INSERT … VALUES` slot) is `0A000` — the
+anonymous-record → named-composite assignment coercion; a `$N` parameter as an `UPDATE`/`DO UPDATE`
+composite RHS is `0A000` (the container rule); a non-NULL `DEFAULT` on a composite column is `0A000`;
+a **range-typed field** (`CREATE TYPE r AS (span i32range)`) is `0A000` — the composite-type catalog
+entry has no field descriptor for `field_type_code 17` (format.md *Composite-type entry*), so it needs
+a catalog-format extension; the runtime (non-literal) text→composite
 cast, the `composite::text` cast, the anonymous `ROW(…)::type` structural cast, and the nested
 `ROW(ROW(…),…)`-into-column constructor (a jed extension PG rejects — covered by unit tests, not the
 PG-oracle corpus) are each `0A000` / jed-only. Composite **value** comparison (`WHERE c = ROW(…)`),

@@ -255,7 +255,8 @@ A range **is** a valid `PRIMARY KEY` / ordered (btree) secondary index / `UNIQUE
 target via its order-preserving `range-bounds` key ([encoding.md §2.11](encoding.md)) — the
 first *container* key, recursing into the element codec with empty/±∞/inclusivity framing that
 mirrors the §6 total order. Two narrowings remain (the array narrowings verbatim, CLAUDE.md §4;
-array.md §1/§8): a range-typed column `DEFAULT` is still **`0A000`**, and a **GIN** index over a
+array.md §1/§8): a range-typed column `DEFAULT` is still **`0A000`** (bar a bare `DEFAULT NULL`, the
+same as no default — composite.md §12), and a **GIN** index over a
 range column is **`0A000`** (a range is not a GIN element — that is a GiST job, §10). Two
 deliberate scopings on the *key*, both relaxable: **point-lookup pushdown is deferred** (a range
 PK/index `WHERE k = …` is correct via full-scan + residual filter, just unindexed — the

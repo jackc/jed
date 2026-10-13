@@ -84,7 +84,8 @@ func queryRendered(t *testing.T, db dbHandle, sql string) [][]string {
 }
 
 // TestNestedCompositeValueRoundtrip: a nested composite value round-trips and renders with the inner
-// record quoted.
+// record quoted. The nested ROW(ROW(…),…) constructor is a jed extension PG rejects, so this lives
+// here, not in the corpus.
 func TestNestedCompositeValueRoundtrip(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
@@ -92,8 +93,10 @@ func TestNestedCompositeValueRoundtrip(t *testing.T) {
 	runComposite(t, db, "CREATE TYPE seg AS (a point, b point)")
 	runComposite(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, s seg)")
 	runComposite(t, db, "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))")
-	got := queryRendered(t, db, "SELECT s FROM t")
-	want := [][]string{{`("(1,2)","(3,4)")`}}
+	// A bare NULL in a nested composite field adapts to that field's type (composite.md §12).
+	runComposite(t, db, "INSERT INTO t VALUES (2, ROW(NULL, ROW(5, 6)))")
+	got := queryRendered(t, db, "SELECT s FROM t ORDER BY id")
+	want := [][]string{{`("(1,2)","(3,4)")`}, {`(,"(5,6)")`}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rows = %v, want %v", got, want)
 	}

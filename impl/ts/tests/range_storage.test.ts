@@ -95,12 +95,13 @@ test("range narrowings are 0A000", () => {
   // dml/insert_select_container.test).
 });
 
-// Updating a range COLUMN works (ranges.md §4, oracle-clean in types/range.test) but three sub-cases
-// stay 0A000 — PG supports them, so they are jed-stricter and cannot live in the oracle corpus: a $N
-// parameter into a range column, the ON CONFLICT DO UPDATE conflict-action path, and a composite
-// column (a separate slice). The happy-path forms (literal / cast / constructor / set-op / NULL /
-// re-key) and the 42804 type errors live in types/range.test.
-test("range update deferrals are 0A000", () => {
+// Updating a range or composite COLUMN works — standalone UPDATE and the ON CONFLICT DO UPDATE
+// conflict-action path (ranges.md §4 / composite.md §12, oracle-clean in types/range.test and
+// dml/composite_assign.test) — but two sub-cases stay 0A000. PG supports them, so they are
+// jed-stricter and cannot live in the oracle corpus: a $N parameter into a container column, and an
+// anonymous ROW(…) expression assigned to a composite column (the anonymous-record → named-composite
+// coercion, composite.md §12).
+test("container update deferrals are 0A000", () => {
   const db = dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
     "INSERT INTO t VALUES (1, '[1,5)')",
@@ -111,7 +112,7 @@ test("range update deferrals are 0A000", () => {
   );
   assert.equal(
     errCode(() =>
-      db.execute("INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'"),
+      db.execute("INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = $1"),
     ),
     "0A000",
   );
@@ -120,6 +121,16 @@ test("range update deferrals are 0A000", () => {
   db.execute("INSERT INTO p VALUES (1, ROW('x', 5))");
   assert.equal(
     errCode(() => db.execute("UPDATE p SET a = ROW('y', 9) WHERE id = 1")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() =>
+      db.execute("INSERT INTO p VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET a = ROW('y', 9)"),
+    ),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => db.execute("UPDATE p SET a = $1 WHERE id = 1")),
     "0A000",
   );
 });

@@ -67,7 +67,8 @@ fn drop_type_removes_it() {
     assert!(db.composite_type("addr").is_none());
 }
 
-/// A nested composite value round-trips and renders with the inner record quoted.
+/// A nested composite value round-trips and renders with the inner record quoted. The nested
+/// `ROW(ROW(…),…)` constructor is a jed extension PG rejects, so this lives here, not in the corpus.
 #[test]
 fn nested_composite_value_roundtrip() {
     let mut db = Database::create(CreateOptions::default())
@@ -80,9 +81,14 @@ fn nested_composite_value_roundtrip() {
         &mut db,
         "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))",
     );
+    // A bare NULL in a nested composite field adapts to that field's type (composite.md §12).
+    run(&mut db, "INSERT INTO t VALUES (2, ROW(NULL, ROW(5, 6)))");
     assert_eq!(
-        query(&mut db, "SELECT s FROM t"),
-        vec![vec![r#"("(1,2)","(3,4)")"#.to_string()]]
+        query(&mut db, "SELECT s FROM t ORDER BY id"),
+        vec![
+            vec![r#"("(1,2)","(3,4)")"#.to_string()],
+            vec![r#"(,"(5,6)")"#.to_string()],
+        ]
     );
 }
 

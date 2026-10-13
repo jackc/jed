@@ -1203,7 +1203,8 @@ A `VALUES` slot may hold any expression: `INSERT INTO t VALUES (1 + 1, upper('x'
   (including the folded `-5`), a `parameter`, `DEFAULT`, or a `ROW(…)` / `ARRAY[…]` whose fields are
   themselves only those forms — i.e. the token after it closes the slot (`,` or `)`) — is parsed and
   materialized as before: a string literal adapts to the column type (`'2024-01-01'` into a `date`,
-  `'{1,2}'` into an array, `'[1,5)'` into a range, `'today'` per date.md §6), a `ROW(…)` materializes
+  `'{1,2}'` into an array, `'[1,5)'` into a range, `'(Main,1)'` into a composite via `record_in`,
+  `'today'` per date.md §6), a bare `NULL` is the column type's NULL (a composite's too), a `ROW(…)` materializes
   field by field against a composite column, and a bare `$N` takes its target column's type. Any
   other slot re-parses from its start as a general `expr`. A constructor with an expression field
   (`ARRAY[1 + 1, 3]`) is therefore one general expression, not a literal constructor. A non-syntax
@@ -1216,9 +1217,9 @@ A `VALUES` slot may hold any expression: `INSERT INTO t VALUES (1 + 1, upper('x'
   column types as `i16`. The result must be **assignable** to the column — the scalar gate
   `INSERT ... SELECT` and `UPDATE` use (`42804`); a range/array column follows `UPDATE`'s container
   rule (a NULL, or the same container type — array.md §4 / ranges.md §4); a composite column takes
-  NULL or a value of its own composite type (e.g. a scalar subquery over a composite column). An
-  anonymous `ROW(…)` *expression* into a composite column is `0A000`, the same deferred
-  anonymous-record → named-composite assignment `UPDATE` carries (composite.md §12) — a documented
+  NULL or a value of its own composite type (e.g. a scalar subquery over a composite column), as
+  `UPDATE` does. An anonymous `ROW(…)` *expression* into a composite column is `0A000`, the same
+  deferred anonymous-record → named-composite assignment `UPDATE` carries (composite.md §12) — a documented
   narrowing (PostgreSQL accepts it); a literal-field `ROW(…)` is unaffected. A `$N` inside an
   expression is typed by its operator context (api.md §5), not by the column. Slots are resolved
   row by row, left to right, before `RETURNING` and `ON CONFLICT` (PostgreSQL's analysis order), so

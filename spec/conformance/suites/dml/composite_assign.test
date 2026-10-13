@@ -1,0 +1,334 @@
+# Assigning a composite column (spec/design/composite.md §12): a bare NULL adapts to the column's
+# composite type as its whole-value NULL, and a bare string literal adapts through record_in — the
+# same unknown-literal-adapts-to-context rule a scalar, array, or range column follows — in every
+# write position: a one-row and a multi-row INSERT ... VALUES (mixed with ROW(...), a cast literal,
+# or a scalar subquery), INSERT ... SELECT, UPDATE SET, ON CONFLICT DO UPDATE SET, and a `DEFAULT
+# NULL` (the same as no default — PostgreSQL stores none for it). UPDATE and DO UPDATE take a value
+# of the column's own composite type too; DO UPDATE assigns range and array columns by the same
+# container rule. A NULL element in an array of composites stores as such. Oracle-checked against
+# PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.unique, ddl.composite_key, ddl.column_default, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_values_expr, dml.insert_select, dml.insert_select_container, dml.insert_on_conflict, dml.update, dml.update_container, dml.update_default, dml.returning, query.select, query.where_eq, query.order_by, query.is_null, query.subquery_scalar, expr.array_subscript, types.i32, types.text, types.composite, types.array, types.array_composite, types.range, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a addr)
+
+# --- INSERT ... VALUES: a bare NULL in a one-row and a multi-row VALUES ----------------------------
+
+statement ok
+INSERT INTO t VALUES (1, NULL)
+
+statement ok
+INSERT INTO t VALUES (2, ROW('Main', 2)), (3, NULL)
+
+statement ok
+INSERT INTO t VALUES (4, NULL), (5, '(Oak,5)'::addr), (6, NULL)
+
+# A bare string literal adapts through record_in, beside a NULL.
+statement ok
+INSERT INTO t VALUES (7, '("Elm St",7)'), (8, NULL)
+
+# A scalar subquery of the column's type in one row, a NULL in the next.
+statement ok
+INSERT INTO t VALUES (9, (SELECT a FROM t WHERE id = 2)), (10, NULL)
+
+statement ok
+INSERT INTO t (a, id) VALUES (NULL, 11)
+
+statement ok
+INSERT INTO t SELECT 12, NULL
+
+query ITB nosort
+SELECT id, a, a IS NULL FROM t ORDER BY id
+----
+1
+NULL
+true
+2
+(Main,2)
+false
+3
+NULL
+true
+4
+NULL
+true
+5
+(Oak,5)
+false
+6
+NULL
+true
+7
+("Elm St",7)
+false
+8
+NULL
+true
+9
+(Main,2)
+false
+10
+NULL
+true
+11
+NULL
+true
+12
+NULL
+true
+
+# A malformed string literal is 22P02 (record_in), a bad field value its field's own error.
+statement error 22P02
+INSERT INTO t VALUES (13, 'Main')
+
+statement error 22P02
+INSERT INTO t VALUES (13, '(Main,x)')
+
+# A non-string, non-NULL scalar is not a composite.
+statement error 42804
+INSERT INTO t VALUES (13, 5)
+
+# --- UPDATE SET: NULL, a string literal, a value of the column's own type --------------------------
+
+statement ok
+UPDATE t SET a = NULL WHERE id = 2
+
+statement ok
+UPDATE t SET a = '(Pine,1)' WHERE id = 1
+
+statement ok
+UPDATE t SET a = (SELECT a FROM t WHERE id = 5) WHERE id = 3
+
+query IT nosort
+UPDATE t SET a = DEFAULT WHERE id = 5 RETURNING id, a
+----
+5
+NULL
+
+query IT nosort
+SELECT id, a FROM t WHERE id <= 5 ORDER BY id
+----
+1
+(Pine,1)
+2
+NULL
+3
+(Oak,5)
+4
+NULL
+5
+NULL
+
+statement error 42804
+UPDATE t SET a = 5 WHERE id = 1
+
+statement error 22P02
+UPDATE t SET a = '(Pine,x)' WHERE id = 1
+
+# A NOT NULL composite column rejects the NULL at every write site.
+statement ok
+CREATE TABLE tn (id i32 PRIMARY KEY, a addr NOT NULL)
+
+statement error 23502
+INSERT INTO tn VALUES (1, NULL)
+
+statement ok
+INSERT INTO tn VALUES (1, '(a,1)'), (2, ROW('b', 2))
+
+statement error 23502
+UPDATE tn SET a = NULL WHERE id = 1
+
+statement error 23502
+INSERT INTO tn VALUES (2, '(c,3)') ON CONFLICT (id) DO UPDATE SET a = NULL
+
+# --- ON CONFLICT DO UPDATE SET a composite (and a range / an array) column -------------------------
+
+statement ok
+INSERT INTO t VALUES (2, '(Ash,9)') ON CONFLICT (id) DO UPDATE SET a = excluded.a
+
+statement ok
+INSERT INTO t VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET a = NULL
+
+statement ok
+INSERT INTO t VALUES (4, NULL) ON CONFLICT (id) DO UPDATE SET a = '(Fir,4)'
+
+query IT nosort
+SELECT id, a FROM t WHERE id <= 4 ORDER BY id
+----
+1
+NULL
+2
+(Ash,9)
+3
+(Oak,5)
+4
+(Fir,4)
+
+statement ok
+CREATE TABLE tc (id i32 PRIMARY KEY, xs i32[], r int4range)
+
+statement ok
+INSERT INTO tc VALUES (1, ARRAY[1, 2], '[1,5)'), (2, NULL, NULL)
+
+statement ok
+INSERT INTO tc VALUES (1, ARRAY[7], '[2,3]') ON CONFLICT (id) DO UPDATE SET xs = excluded.xs, r = NULL
+
+statement ok
+INSERT INTO tc VALUES (2, NULL, NULL) ON CONFLICT (id) DO UPDATE SET xs = '{4,NULL}', r = '[3,8)'
+
+query ITT nosort
+SELECT id, xs, r FROM tc ORDER BY id
+----
+1
+{7}
+NULL
+2
+{4,NULL}
+[3,8)
+
+statement error 42804
+INSERT INTO tc VALUES (1, NULL, NULL) ON CONFLICT (id) DO UPDATE SET xs = 5
+
+# --- a composite UNIQUE column: assignment re-probes the index -------------------------------------
+
+statement ok
+CREATE TABLE tu (id i32 PRIMARY KEY, a addr UNIQUE)
+
+statement ok
+INSERT INTO tu VALUES (1, '(a,1)'), (2, '(b,2)'), (3, NULL)
+
+statement error 23505
+UPDATE tu SET a = '(a,1)' WHERE id = 2
+
+statement error 23505
+INSERT INTO tu VALUES (2, NULL) ON CONFLICT (id) DO UPDATE SET a = '(a,1)'
+
+# NULLs are distinct under UNIQUE.
+statement ok
+UPDATE tu SET a = NULL WHERE id = 1
+
+query IT nosort
+SELECT id, a FROM tu ORDER BY id
+----
+1
+NULL
+2
+(b,2)
+3
+NULL
+
+# A composite PRIMARY KEY column assigned a string literal re-keys the row.
+statement ok
+CREATE TABLE tk (a addr PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO tk VALUES ('(a,1)', 1), ('(b,2)', 2)
+
+statement ok
+UPDATE tk SET a = '(c,3)' WHERE n = 1
+
+statement error 23505
+UPDATE tk SET a = '(b,2)' WHERE n = 1
+
+query TI nosort
+SELECT a, n FROM tk ORDER BY a
+----
+(b,2)
+2
+(c,3)
+1
+
+# --- DEFAULT NULL on a composite / array / range column is the same as no default ------------------
+
+statement ok
+CREATE TABLE td (id i32 PRIMARY KEY, a addr DEFAULT NULL, xs i32[] DEFAULT NULL, r int4range DEFAULT NULL)
+
+statement ok
+INSERT INTO td (id) VALUES (1)
+
+statement ok
+INSERT INTO td VALUES (2, DEFAULT, DEFAULT, DEFAULT)
+
+statement ok
+ALTER TABLE td ADD COLUMN b addr DEFAULT NULL
+
+statement ok
+ALTER TABLE td ALTER COLUMN a SET DEFAULT NULL
+
+statement ok
+INSERT INTO td (id) VALUES (3)
+
+query ITTTT nosort
+SELECT id, a, xs, r, b FROM td ORDER BY id
+----
+1
+NULL
+NULL
+NULL
+NULL
+2
+NULL
+NULL
+NULL
+NULL
+3
+NULL
+NULL
+NULL
+NULL
+
+# --- a nested composite column: NULL and a nested string literal -----------------------------------
+
+statement ok
+CREATE TYPE seg AS (p addr, q addr)
+
+statement ok
+CREATE TABLE ts (id i32 PRIMARY KEY, s seg)
+
+statement ok
+INSERT INTO ts VALUES (1, NULL), (2, '("(a,1)",)')
+
+statement ok
+UPDATE ts SET s = '(,"(b,2)")' WHERE id = 1
+
+query ITTT nosort
+SELECT id, s, (s).p, (s).q FROM ts ORDER BY id
+----
+1
+(,"(b,2)")
+NULL
+(b,2)
+2
+("(a,1)",)
+(a,1)
+NULL
+
+# --- an array of composites holding NULL elements --------------------------------------------------
+
+statement ok
+CREATE TABLE ta (id i32 PRIMARY KEY, items addr[])
+
+statement ok
+INSERT INTO ta VALUES (1, ARRAY[NULL, '(a,1)'::addr]), (2, '{NULL,"(b,2)"}'), (3, NULL)
+
+statement ok
+UPDATE ta SET items = ARRAY['(c,3)'::addr, NULL] WHERE id = 3
+
+query ITBB nosort
+SELECT id, items, items[1] IS NULL, items[2] IS NULL FROM ta ORDER BY id
+----
+1
+{NULL,"(a,1)"}
+true
+false
+2
+{NULL,"(b,2)"}
+true
+false
+3
+{"(c,3)",NULL}
+false
+true

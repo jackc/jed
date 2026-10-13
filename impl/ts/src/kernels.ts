@@ -389,11 +389,13 @@ export function floatFromDecimalLiteral(
 // ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
 // canonicalize (spec/design/ranges.md §4/§5). Folds to a constRange. 22P02 malformed / 22000
 // lower>upper / 22003 canonicalize overflow.
-// resolveContainerAssign resolves an UPDATE assignment RHS against a RANGE or ARRAY column (the
-// caller has already rejected composite — 0A000). Mirrors INSERT's value adaptation (ranges.md §5 /
-// array.md §7): a bare string literal adapts to the container via range_in / array_in, a bare NULL
-// is the typed NULL, and any other expression must resolve to the SAME container type (matching
-// element) else 42804. A top-level $N parameter is deferred (0A000) — INSERT's param-to-container
+// resolveContainerAssign resolves an UPDATE (or ON CONFLICT DO UPDATE) assignment RHS against a
+// RANGE, ARRAY, or COMPOSITE column. Mirrors INSERT's value adaptation (ranges.md §5 / array.md §7 /
+// composite.md §8): a bare string literal adapts to the container via range_in / array_in /
+// record_in, a bare NULL is the typed NULL, and any other expression must resolve to the SAME
+// container type (matching element / the same named composite) else 42804. An anonymous ROW(…)
+// expression has no composite type to match (0A000, the INSERT … VALUES expression rule —
+// composite.md §12). A top-level $N parameter is deferred (0A000) — INSERT's param-to-container
 // handling is special and not generalized to the assignment RHS yet.
 export function resolveContainerAssign(
   scope: Scope,
@@ -417,6 +419,15 @@ export function resolveContainerAssign(
       params.noteInputZone(iz);
       return node;
     }
+    if (col.type.kind === "composite") {
+      const ct = scope.catalog.compositeType(col.type.name);
+      if (ct === undefined) throw new Error("a composite column's type exists in the catalog");
+      const node = atPosition(e.loc, () =>
+        coerceStringToComposite(text, ct, scope.catalog, iz),
+      ).node;
+      params.noteInputZone(iz);
+      return node;
+    }
     // array
     const elem = (col.type as { kind: "array"; elem: Type }).elem;
     const val = atPosition(e.loc, () =>
@@ -429,7 +440,7 @@ export function resolveContainerAssign(
     return { kind: "constNull" };
   }
   if (e.kind === "param") {
-    const kind = col.type.kind === "array" ? "array" : "range";
+    const kind = col.type.kind;
     throw engineError(
       "feature_not_supported",
       `updating ${kind} column ${col.name} from a parameter is not supported yet`,
@@ -444,6 +455,12 @@ export function resolveContainerAssign(
   if (col.type.kind === "array" && col.type.elem.kind === "scalar") hint = col.type.elem.scalar;
   const { node, type } = resolve(scope, e, hint, ag, params);
   if (type.kind === "null") return node; // a NULL-typed expression (e.g. a CASE that may be NULL)
+  if (type.kind === "composite" && type.name === null) {
+    throw engineError(
+      "feature_not_supported",
+      `assigning a ROW expression to composite column ${col.name} is not supported yet`,
+    );
+  }
   // Ranges/arrays are assignable only over equal element types (resolvedTypeEqual compares the
   // element recursively), matching the comparison rule (ranges.md §6 / array.md §5).
   if (!resolvedTypeEqual(type, colRT)) {

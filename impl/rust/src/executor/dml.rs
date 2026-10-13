@@ -1884,47 +1884,50 @@ impl Engine {
                         ));
                     }
                     let col = &tdef.columns[idx];
-                    // Updating a non-scalar column (composite / range / array) on the ON CONFLICT DO
-                    // UPDATE path is deferred (0A000): standalone UPDATE of a range/array column has
-                    // landed, but extending the conflict-action path to non-scalar columns is a
-                    // separate follow-on (upsert.md §9).
-                    let Type::Scalar(target_scalar) = &col.ty else {
-                        let noun = match &col.ty {
-                            Type::Range(_) => "range",
-                            Type::Array(_) => "array",
-                            _ => "composite",
-                        };
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            format!("updating {noun} column {} is not supported yet", a.column),
-                        ));
+                    // A container (composite / range / array) column takes the standalone UPDATE
+                    // container rule (resolve_container_assign) and is stored through
+                    // coerce_for_store (carried as col_type); a scalar column takes the scalar
+                    // assignability gate.
+                    let (target, col_type) = match &col.ty {
+                        Type::Scalar(target_scalar) => (*target_scalar, None),
+                        Type::Composite(_) | Type::Range(_) | Type::Array(_) => (
+                            ScalarType::Int32, // unused (col_type drives the check)
+                            Some(resolve_col_type(&col.ty, &self.read_snap().types)),
+                        ),
                     };
-                    let target_scalar = *target_scalar;
                     let source = if a.is_default {
                         default_exprs[idx].take().unwrap_or_else(|| {
                             value_to_rexpr(col.default.as_ref().unwrap_or(&Value::Null))
                         })
+                    } else if col_type.is_some() {
+                        resolve_container_assign(
+                            &scope,
+                            col,
+                            &a.value,
+                            &mut AggCtx::Forbidden,
+                            ptypes,
+                        )?
                     } else {
                         let (source, ty) = resolve(
                             &scope,
                             &a.value,
-                            Some(target_scalar),
+                            Some(target),
                             &mut AggCtx::Forbidden,
                             ptypes,
                         )?;
-                        require_assignable(&ty, target_scalar, &a.column)
+                        require_assignable(&ty, target, &a.column)
                             .map_err(|e| e.with_position(a.value.location().0))?;
                         source
                     };
                     plans.push(AssignPlan {
                         idx,
                         name: col.name.clone(),
-                        target: target_scalar,
+                        target,
                         decimal: col.decimal,
                         varchar_len: col.varchar_len,
                         not_null: col.not_null,
                         source,
-                        col_type: None,
+                        col_type,
                     });
                 }
                 let filter = match filter {
@@ -3638,19 +3641,6 @@ impl Engine {
                 continue;
             }
             match &col.ty {
-                // Updating a composite-typed column lands in a later slice (anonymous-record →
-                // named-composite assignment coercion — composite.md §12); reject it (0A000). Range
-                // and array columns ARE updatable (ranges.md §4 / array.md §4), via the container
-                // path below.
-                Type::Composite(_) => {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        format!(
-                            "updating composite column {} is not supported yet",
-                            a.column
-                        ),
-                    ));
-                }
                 Type::Scalar(target_scalar) => {
                     let target_scalar = *target_scalar;
                     // The RHS is a general expression evaluated against the *old* row; a literal
@@ -3677,10 +3667,11 @@ impl Engine {
                         col_type: None,
                     });
                 }
-                Type::Range(_) | Type::Array(_) => {
-                    // A range or array column: the RHS adapts (a bare string literal via
-                    // range_in/array_in, a bare NULL to the typed NULL) or must resolve to the SAME
-                    // container type. Stored through coerce_for_store (carried as col_type).
+                Type::Composite(_) | Type::Range(_) | Type::Array(_) => {
+                    // A composite, range, or array column: the RHS adapts (a bare string literal
+                    // via record_in/range_in/array_in, a bare NULL to the typed NULL) or must
+                    // resolve to the SAME container type; an anonymous ROW(…) expression is 0A000
+                    // (composite.md §12). Stored through coerce_for_store (carried as col_type).
                     let source = resolve_container_assign(
                         &scope,
                         col,

@@ -130,12 +130,13 @@ func TestRangeNarrowingsAre0A000(t *testing.T) {
 	// dml/insert_select_container.test).
 }
 
-// TestRangeUpdateDeferrals: updating a range COLUMN works (ranges.md §4, oracle-clean in
-// types/range.test) but three sub-cases stay 0A000 — PG supports them, so they are jed-stricter and
-// cannot live in the oracle corpus: a $N parameter into a range column, the ON CONFLICT DO UPDATE
-// conflict-action path, and a composite column (a separate slice). The happy-path forms (literal /
-// cast / constructor / set-op / NULL / re-key) and the 42804 type errors live in types/range.test.
-func TestRangeUpdateDeferrals(t *testing.T) {
+// TestContainerUpdateDeferrals: updating a range or composite COLUMN works — standalone UPDATE and
+// the ON CONFLICT DO UPDATE conflict-action path (ranges.md §4 / composite.md §12, oracle-clean in
+// types/range.test and dml/composite_assign.test) — but two sub-cases stay 0A000. PG supports them,
+// so they are jed-stricter and cannot live in the oracle corpus: a $N parameter into a container
+// column, and an anonymous ROW(…) expression assigned to a composite column (the anonymous-record →
+// named-composite coercion, composite.md §12).
+func TestContainerUpdateDeferrals(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)")
@@ -144,16 +145,20 @@ func TestRangeUpdateDeferrals(t *testing.T) {
 	if got := errRange(t, db, "UPDATE t SET r = $1 WHERE id = 1"); got != "0A000" {
 		t.Errorf("$N into range column: got %s, want 0A000", got)
 	}
-	// The ON CONFLICT DO UPDATE conflict-action path does not yet update a container column.
-	if got := errRange(t, db, "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'"); got != "0A000" {
-		t.Errorf("ON CONFLICT DO UPDATE range: got %s, want 0A000", got)
+	if got := errRange(t, db, "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = $1"); got != "0A000" {
+		t.Errorf("ON CONFLICT DO UPDATE $N into range column: got %s, want 0A000", got)
 	}
-	// A composite column UPDATE is a separate slice (anonymous-record → named-composite coercion).
 	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	run(t, db, "CREATE TABLE p (id i32 PRIMARY KEY, a addr)")
 	run(t, db, "INSERT INTO p VALUES (1, ROW('x', 5))")
 	if got := errRange(t, db, "UPDATE p SET a = ROW('y', 9) WHERE id = 1"); got != "0A000" {
-		t.Errorf("composite column UPDATE: got %s, want 0A000", got)
+		t.Errorf("anonymous ROW into composite column: got %s, want 0A000", got)
+	}
+	if got := errRange(t, db, "INSERT INTO p VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET a = ROW('y', 9)"); got != "0A000" {
+		t.Errorf("ON CONFLICT DO UPDATE anonymous ROW into composite column: got %s, want 0A000", got)
+	}
+	if got := errRange(t, db, "UPDATE p SET a = $1 WHERE id = 1"); got != "0A000" {
+		t.Errorf("$N into composite column: got %s, want 0A000", got)
 	}
 }
 

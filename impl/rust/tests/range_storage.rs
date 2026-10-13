@@ -133,13 +133,14 @@ fn range_narrowings_are_0a000() {
     // dml/insert_select_container.test).
 }
 
-/// Updating a range COLUMN works (ranges.md §4, oracle-clean in types/range.test) but three sub-cases
-/// stay `0A000` — PG supports them, so they are jed-stricter and cannot live in the oracle corpus: a
-/// `$N` parameter into a range column, the ON CONFLICT DO UPDATE conflict-action path, and a composite
-/// column (a separate slice). The happy-path forms (literal / cast / constructor / set-op / NULL /
-/// re-key) and the 42804 type errors live in types/range.test.
+/// Updating a range or composite COLUMN works — standalone UPDATE and the ON CONFLICT DO UPDATE
+/// conflict-action path (ranges.md §4 / composite.md §12, oracle-clean in types/range.test and
+/// dml/composite_assign.test) — but two sub-cases stay `0A000`. PG supports them, so they are
+/// jed-stricter and cannot live in the oracle corpus: a `$N` parameter into a container column, and
+/// an anonymous `ROW(…)` expression assigned to a composite column (the anonymous-record →
+/// named-composite coercion, composite.md §12).
 #[test]
-fn range_update_deferrals_are_0a000() {
+fn container_update_deferrals_are_0a000() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
@@ -149,7 +150,7 @@ fn range_update_deferrals_are_0a000() {
     assert_eq!(
         err(
             &mut db,
-            "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = '[9,10)'",
+            "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = $1",
         ),
         "0A000",
     );
@@ -160,6 +161,14 @@ fn range_update_deferrals_are_0a000() {
         err(&mut db, "UPDATE p SET a = ROW('y', 9) WHERE id = 1"),
         "0A000"
     );
+    assert_eq!(
+        err(
+            &mut db,
+            "INSERT INTO p VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET a = ROW('y', 9)",
+        ),
+        "0A000"
+    );
+    assert_eq!(err(&mut db, "UPDATE p SET a = $1 WHERE id = 1"), "0A000");
 }
 
 /// Range comparison (R3) is restricted to the SAME element type (spec/design/ranges.md §6): a range
