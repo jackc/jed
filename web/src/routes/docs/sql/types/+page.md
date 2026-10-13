@@ -357,8 +357,10 @@ order, and duplicate keys. In a multi-column `UPDATE`, every right-hand side rea
 by default. Like PostgreSQL's, it returns SQL `NULL` when `value` is `NULL`. `jsonb_set_lax` instead
 applies its `null_value_treatment`: `'use_json_null'` (the default) stores a JSON `null`,
 `'delete_key'` removes the path, `'return_target'` returns the document unchanged, and
-`'raise_exception'` fails with `22004`. `jsonb_set`, `jsonb_set_lax`, and `jsonb_insert` accept
-PostgreSQL's named arguments:
+`'raise_exception'` fails with `22004`. A `NULL` element inside the path is an error (`22004`, "path
+element at position N is null") for `jsonb_set`, `jsonb_set_lax`, `jsonb_insert`, and `#-` when
+the walk reaches it, while `#>` and `#>>` just return `NULL`. `jsonb_set`, `jsonb_set_lax`, and
+`jsonb_insert` accept PostgreSQL's named arguments:
 
 <LiveSql demo="jsonSetLaxDemo" query={jsonSetLaxDemo} rows={1} />
 

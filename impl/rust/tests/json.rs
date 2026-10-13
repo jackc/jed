@@ -214,31 +214,6 @@ fn large_json_spills_verbatim() {
     assert_eq!(rows[0][0], verbatim); // verbatim bytes, whitespace preserved
 }
 
-/// A NULL element inside the `jsonb_set` / `jsonb_insert` path array propagates a SQL NULL result —
-/// a documented divergence from PostgreSQL, which raises `22004` ("path element at position N is
-/// null"). jed treats the path strictly, like the `#-` delete-path operator's text[] handling. The
-/// agreeing behavior (set/insert/no-op/22023/22P02) is oracle-clean in suites/json/json_set.test.
-#[test]
-fn jsonb_set_null_path_element_propagates_null() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT jsonb_set('{\"a\":1}', ARRAY['a', NULL], '99')"
-        )[0][0],
-        "NULL"
-    );
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT jsonb_insert('{\"a\":1}', ARRAY[NULL], '99')"
-        )[0][0],
-        "NULL"
-    );
-}
-
 /// The json/jsonb construction builders (to_json / json[b]_build_array / _object) reuse the
 /// `to_jsonb` element kernel, so a deferred-source element (float, like to_jsonb) is `0A000`. PG
 /// supports these sources, so this is a documented divergence; the supported set is oracle-clean in

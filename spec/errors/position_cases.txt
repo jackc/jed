@@ -1262,3 +1262,11 @@ run: SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'raise_exception')
 code: 22004
 no-position
 hint: To avoid, either change the null_value_treatment argument or ensure that an SQL NULL is not passed.
+
+# --- jsonb_insert's existing-key hint (error-fields.md §11.6) ---------------------------------------
+
+case: jsonb_insert existing key hint
+run: SELECT jsonb_insert('{"a": 1}', '{a}', '2')
+code: 22023
+no-position
+hint: Try using the function jsonb_set to replace key value.

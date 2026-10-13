@@ -1224,10 +1224,23 @@ export function deleteIndex(node: JsonNode, idx: bigint): JsonNode {
   }
 }
 
-// deleteKeys is `jsonb - text[]` — delete each key in turn (the `- text` rule applied per element).
-export function deleteKeys(node: JsonNode, keys: string[]): JsonNode {
+// rootCount is the element count of a container root (`JB_ROOT_COUNT`); a scalar counts as one.
+function rootCount(node: JsonNode): number {
+  if (node.kind === "object") return node.members.length;
+  if (node.kind === "array") return node.elements.length;
+  return 1;
+}
+
+// deleteKeys is `jsonb - text[]` (PG `jsonb_delete_array`) — delete every key (object) / matching
+// string element (array) named by a non-NULL element of `keys`; a NULL element is skipped. A scalar
+// root is `22023` ("cannot delete from scalar") even for empty `keys`; an empty container is returned
+// unchanged.
+export function deleteKeys(node: JsonNode, keys: (string | null)[]): JsonNode {
+  if (!isContainer(node)) throw cannotDelete("cannot delete from scalar");
   let cur = node;
-  for (const k of keys) cur = deleteKey(cur, k);
+  for (const k of keys) {
+    if (k !== null) cur = deleteKey(cur, k);
+  }
   return cur;
 }
 
@@ -1250,48 +1263,26 @@ export function nullValueRaised(): EngineError {
     );
 }
 
-// deletePath is `jsonb #- text[]` — delete the element at a path. An empty path is a no-op (even on a
-// scalar); otherwise navigate to the parent and delete the last step (a key from an object, an index
-// from an array, negative from the end, out of range a no-op; a missing intermediate step a no-op). A
-// non-empty path that reaches a scalar is `22023` ("cannot delete path in scalar").
-export function deletePath(node: JsonNode, path: string[]): JsonNode {
-  if (path.length === 0) return node;
-  const step = path[0]!;
-  const rest = path.slice(1);
-  switch (node.kind) {
-    case "object": {
-      const out: JsonMember[] = node.members.map((m) => ({ key: m.key, value: m.value }));
-      const pos = out.findIndex((m) => m.key === step);
-      if (pos >= 0) {
-        if (rest.length === 0) {
-          out.splice(pos, 1);
-        } else {
-          out[pos]!.value = deletePath(out[pos]!.value, rest);
-        }
-      }
-      return { kind: "object", members: out };
-    }
-    case "array": {
-      // A non-integer (or out-of-i64-range) step misses (no-op), matching Rust/Go ParseInt<i64>.
-      // Parse the trimmed step as a base-10 integer bounded to the signed-64-bit range.
-      const trimmed = step.trim();
-      if (!/^[+-]?\d+$/.test(trimmed)) return node;
-      const idx = BigInt(trimmed);
-      if (idx < -(2n ** 63n) || idx > 2n ** 63n - 1n) return node;
-      const len = BigInt(node.elements.length);
-      const i = idx < 0n ? len + idx : idx;
-      if (i < 0n || i >= len) return node; // out of range, no-op
-      const out = node.elements.slice();
-      if (rest.length === 0) {
-        out.splice(Number(i), 1);
-      } else {
-        out[Number(i)] = deletePath(out[Number(i)]!, rest);
-      }
-      return { kind: "array", elements: out };
-    }
-    default:
-      throw cannotDelete("cannot delete path in scalar");
-  }
+// PathOp is the walk a path mutation performs — PostgreSQL's setPath op_type bits, restricted to the
+// SQL functions (the subscript-assignment FILL_GAPS / CONSISTENT_POSITION bits never arise here):
+// replace = jsonb_set without create_if_missing, create = with it, insertBefore / insertAfter =
+// jsonb_insert, delete = `#-` / jsonb_set_lax 'delete_key'.
+type PathOp = "replace" | "create" | "insertBefore" | "insertAfter" | "delete";
+
+// addsMissing is JB_PATH_CREATE_OR_INSERT: whether a missing final key / index is added.
+function addsMissing(op: PathOp): boolean {
+  return op === "create" || op === "insertBefore" || op === "insertAfter";
+}
+
+// deletePath is `jsonb #- text[]` (PG `jsonb_delete_path`) — delete the element at a path. A scalar
+// root is `22023` ("cannot delete path in scalar"), even for an empty path; an empty container or an
+// empty path returns the target unchanged; otherwise the setPathWalk rules apply (a NULL path element
+// reached → `22004`, a non-integer step into an array → `22P02`, a missing / out-of-range / scalar
+// step → no-op).
+export function deletePath(node: JsonNode, path: (string | null)[]): JsonNode {
+  if (!isContainer(node)) throw cannotDelete("cannot delete path in scalar");
+  if (rootCount(node) === 0 || path.length === 0) return node;
+  return setPathWalk(node, path, 0, { kind: "null" }, "delete");
 }
 
 // PathSetMode selects whether a path mutation REPLACES at the final step (`jsonb_set`) or INSERTS a
@@ -1300,109 +1291,150 @@ export function deletePath(node: JsonNode, path: string[]): JsonNode {
 // index).
 export type PathSetMode = "set" | "insert";
 
-// setPath is `jsonb_set(target, path, value[, create_if_missing])` (json-sql-functions.md §2): set
-// the value at `path` (a text[] of object keys / array indices). A non-final missing key/index is a
-// no-op (the target is returned unchanged); at the final step an existing element is REPLACED, a
-// missing one is added only when `create`. A scalar at any step → `22023`; a non-integer step into an
-// array → `22P02`. Negative array indices count from the end; an out-of-range create appends (≥len)
-// or prepends (<0).
+// setPath is `jsonb_set(target, path, value[, create_if_missing])` (json-sql-functions.md §2, PG
+// `jsonb_set`): set the value at `path` (a text[] of object keys / array indices). A scalar root is
+// `22023` ("cannot set path in scalar"), even for an empty path; an empty container without `create`,
+// or an empty path, returns the target unchanged. At the final step an existing element is REPLACED
+// and a missing one is added only when `create` (an out-of-range index appends; one before the start
+// prepends). See setPathWalk for the per-step rules.
 export function setPath(
   node: JsonNode,
-  path: string[],
+  path: (string | null)[],
   value: JsonNode,
   create: boolean,
 ): JsonNode {
-  return setInsertPath(node, path, value, create, "set", 0);
+  if (!isContainer(node)) throw cannotDelete("cannot set path in scalar");
+  if ((rootCount(node) === 0 && !create) || path.length === 0) return node;
+  return setPathWalk(node, path, 0, value, create ? "create" : "replace");
 }
 
-// insertPath is `jsonb_insert(target, path, value[, insert_after])` (json-sql-functions.md §2): like
-// setPath but the final step INSERTS rather than replaces — an existing object key → `22023` ("cannot
-// replace existing key"); an array index inserts before the index (or after, when `insert_after`).
+// insertPath is `jsonb_insert(target, path, value[, insert_after])` (json-sql-functions.md §2, PG
+// `jsonb_insert`): like setPath but the final step INSERTS — an existing object key is `22023`
+// ("cannot replace existing key"); an array index inserts before it (or after, when `insert_after`).
+// A scalar root is `22023` ("cannot set path in scalar"); an empty path returns the target unchanged
+// (an empty container does NOT short-circuit).
 export function insertPath(
   node: JsonNode,
-  path: string[],
+  path: (string | null)[],
   value: JsonNode,
   insertAfter: boolean,
 ): JsonNode {
-  return setInsertPath(node, path, value, insertAfter, "insert", 0);
+  if (!isContainer(node)) throw cannotDelete("cannot set path in scalar");
+  if (path.length === 0) return node;
+  return setPathWalk(node, path, 0, value, insertAfter ? "insertAfter" : "insertBefore");
 }
 
-// setInsertPath is the shared recursion for setPath/insertPath (mirrors deletePath's structure).
-// `flag` is create_if_missing (Set) | insert_after (Insert); `pos` is the 0-based path position, for
-// the 22P02 message.
-function setInsertPath(
+// pathStepInt32 is PostgreSQL's `strtoint(step, &end, 10)` acceptance for an array path step:
+// optional leading C whitespace, an optional sign, then one or more ASCII digits to the end, within
+// int32. null for anything else (no digits, trailing characters, or out of int32 range).
+function pathStepInt32(step: string): number | null {
+  const m = /^[ \t\n\v\f\r]*([+-]?)([0-9]+)$/.exec(step);
+  if (m === null) return null;
+  let mag = 0;
+  for (const c of m[2]!) {
+    mag = mag * 10 + (c.charCodeAt(0) - 48);
+    if (mag > 2 ** 31) return null; // beyond every int32 magnitude
+  }
+  const v = m[1] === "-" ? -mag : mag;
+  if (v < -(2 ** 31) || v > 2 ** 31 - 1) return null;
+  return v === 0 ? 0 : v; // normalize -0
+}
+
+// setPathWalk is the recursive step of a path mutation (PG setPath / setPathObject / setPathArray), at
+// path position `level` (< path.length). A NULL step reached is `22004` ("path element at position N
+// is null", 1-based) — checked before the node is inspected, so a NULL step under a scalar still
+// raises, while one past a missing key / out-of-range index is never reached. A scalar node below the
+// root is returned unchanged. Object: the key matching the step is replaced / deleted at the final
+// step (an insert op on an existing key is `22023` "cannot replace existing key") or descended into; a
+// missing final key is added by the adding ops. Array: the step must be an int32 (else `22P02` "path
+// element at position N is not an integer"); a negative index counts from the end, one before the
+// start becomes a prepend for the adding ops, one past the end clamps to the length (an append); a
+// non-final missing index is a no-op.
+function setPathWalk(
   node: JsonNode,
-  path: string[],
+  path: (string | null)[],
+  level: number,
   value: JsonNode,
-  flag: boolean,
-  mode: PathSetMode,
-  pos: number,
+  op: PathOp,
 ): JsonNode {
-  if (path.length === 0) return node; // an empty path returns the target unchanged (PG)
-  const step = path[0]!;
-  const rest = path.slice(1);
-  const isFinal = rest.length === 0;
+  const step = path[level]!;
+  if (step === null) {
+    throw engineError("null_value_not_allowed", `path element at position ${level + 1} is null`);
+  }
+  const isFinal = level + 1 === path.length;
   switch (node.kind) {
     case "object": {
-      const out: JsonMember[] = node.members.map((m) => ({ key: m.key, value: m.value }));
-      const found = out.findIndex((m) => m.key === step);
-      if (isFinal) {
-        if (found >= 0) {
-          if (mode === "insert") throw cannotDelete("cannot replace existing key");
-          out[found]!.value = value;
-        } else if (mode === "insert" || flag) {
-          // A missing final key: Set adds it only with create; Insert always adds it.
-          out.push({ key: step, value });
+      let out: JsonMember[] = [];
+      let done = false;
+      for (const mem of node.members) {
+        if (!done && mem.key === step) {
+          done = true;
+          if (isFinal) {
+            if (op === "insertBefore" || op === "insertAfter") {
+              throw cannotDelete("cannot replace existing key").withHint(
+                "Try using the function jsonb_set to replace key value.",
+              );
+            }
+            if (op !== "delete") out.push({ key: mem.key, value });
+          } else {
+            out.push({ key: mem.key, value: setPathWalk(mem.value, path, level + 1, value, op) });
+          }
+        } else {
+          out.push(mem);
         }
-      } else if (found >= 0) {
-        out[found]!.value = setInsertPath(out[found]!.value, rest, value, flag, mode, pos + 1);
       }
-      // (a missing non-final key is a no-op). Re-canonicalize: a replaced value keeps the canonical
-      // order; an added key is sorted into place.
-      return { kind: "object", members: canonicalizeObject(out) };
+      if (!done && isFinal && addsMissing(op)) {
+        // A missing final key is added, sorted into canonical place.
+        out.push({ key: step, value });
+        out = canonicalizeObject(out);
+      }
+      return { kind: "object", members: out };
     }
     case "array": {
-      // The step must parse as a base-10 i64 (trimmed); a non-integer OR an out-of-i64-range value →
-      // 22P02 (1-based position), matching Rust `step.trim().parse::<i64>()` (which errors on both).
-      const trimmed = step.trim();
-      const bad = (): never => {
-        throw malformed(`path element at position ${pos + 1} is not an integer: "${step}"`);
-      };
-      if (!/^[+-]?\d+$/.test(trimmed)) bad();
-      const idx64 = BigInt(trimmed);
-      if (idx64 < -(2n ** 63n) || idx64 > 2n ** 63n - 1n) bad();
-      const idx = Number(idx64);
-      const len = node.elements.length;
-      const out = node.elements.slice();
-      if (isFinal) {
-        if (mode === "insert") {
-          // Insertion index: normalize a negative index from the end, clamp to [0,len], then
-          // `insert_after` shifts one past.
-          let i = idx < 0 ? len + idx : idx;
-          if (i < 0) i = 0;
-          if (flag) i += 1;
-          if (i > len) i = len;
-          out.splice(i, 0, value);
-        } else {
-          const i = idx < 0 ? len + idx : idx;
-          if (i >= 0 && i < len) {
-            out[i] = value;
-          } else if (flag) {
-            // out of range + create: append (≥len) or prepend (<0).
-            if (idx < 0) out.unshift(value);
-            else out.push(value);
+      const parsed = pathStepInt32(step);
+      if (parsed === null) {
+        throw engineError(
+          "invalid_text_representation",
+          `path element at position ${level + 1} is not an integer: "${step}"`,
+        );
+      }
+      const nelems = node.elements.length;
+      // before is PG's INT_MIN sentinel: a negative index before the start (matches nothing; an
+      // adding op prepends).
+      let idx = parsed;
+      let before = false;
+      if (parsed < 0) {
+        if (-parsed > nelems) before = true;
+        else idx = nelems + parsed;
+      }
+      if (!before && idx > nelems) idx = nelems;
+      const out: JsonNode[] = [];
+      let done = false;
+      if ((before || nelems === 0) && isFinal && addsMissing(op)) {
+        out.push(value);
+        done = true;
+      }
+      for (let i = 0; i < nelems; i++) {
+        const el = node.elements[i]!;
+        if (!before && idx === i) {
+          done = true;
+          if (isFinal) {
+            if (op === "insertBefore" || op === "create") out.push(value);
+            if (op === "insertBefore" || op === "insertAfter") out.push(el);
+            if (op === "insertAfter" || op === "replace") out.push(value);
+          } else {
+            out.push(setPathWalk(el, path, level + 1, value, op));
           }
-        }
-      } else {
-        const i = idx < 0 ? len + idx : idx;
-        if (i >= 0 && i < len) {
-          out[i] = setInsertPath(out[i]!, rest, value, flag, mode, pos + 1);
+        } else {
+          out.push(el);
         }
       }
+      if (!done && isFinal && addsMissing(op)) out.push(value);
       return { kind: "array", elements: out };
     }
     default:
-      throw cannotDelete("cannot set path in scalar");
+      // A scalar below the root: the path cannot continue, so the value stays (PG).
+      return node;
   }
 }
 

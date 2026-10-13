@@ -3260,6 +3260,18 @@ export function valueToOptTextArray(v: Value): (string | null)[] {
   return v.elements.map((e) => (e.kind === "text" ? e.text : null));
 }
 
+// jsonTextPathArg extracts a jsonb mutator's `text[]` path / key-list argument, keeping NULL elements
+// as null (each kernel decides what one means: jsonb_set / jsonb_insert / `#-` raise 22004 when the
+// walk reaches it, `- text[]` skips it). A multidimensional array is 2202E ("wrong number of array
+// subscripts"), checked before anything else about the target (PG).
+export function jsonTextPathArg(v: Value): (string | null)[] {
+  if (v.kind !== "array") throw new Error("resolver guarantees a text[] path argument");
+  if (v.dims.length > 1) {
+    throw engineError("array_subscript_error", "wrong number of array subscripts");
+  }
+  return v.elements.map((e) => (e.kind === "text" ? e.text : null));
+}
+
 // resolveJsonbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to a "jsonContains" node with the operands swapped

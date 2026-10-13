@@ -1,8 +1,9 @@
 # jsonb_set / jsonb_insert — the jsonb path-mutation builders (B1, spec/design/json-sql-functions.md
 # §2). jsonb_set replaces (or creates, default) the value at a text[] path; jsonb_insert inserts a new
-# element. A non-final missing key/index → no-op; an empty path → unchanged; a scalar at a step →
-# 22023; a non-integer array step → 22P02; negative indices count from the end. STRICT. Output matches
-# the postgres:18 oracle. Format: ../../../design/conformance.md.
+# element. A non-final missing key/index → no-op; an empty path → unchanged; a scalar root → 22023; a
+# non-integer array step → 22P02; negative indices count from the end. STRICT. The walk's edges (NULL
+# path elements, scalars below the root, step parsing) are in json_path_walk.test. Output matches the
+# postgres:18 oracle. Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, func.json_set
 
 # jsonb_set replaces an existing object member, descends a nested path, and (default) creates a
@@ -55,7 +56,7 @@ NULL
 statement error 22023
 SELECT jsonb_insert('{"a": 1}', '{a}', '99')
 
-# A scalar target at a path step → 22023.
+# A scalar target → 22023.
 statement error 22023
 SELECT jsonb_set('5'::jsonb, '{a}', '1')
 

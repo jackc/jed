@@ -173,8 +173,8 @@ error surface.
 
 - **`Detail`** — no longer deferred; specified in §9.
 - **`Position`** — no longer deferred; specified in §10.
-- **`Hint`** — no longer deferred; specified in §11 for the two suggestion families and two fixed
-  sentences (§11.4, §11.5). Other PostgreSQL hints (`42883`'s "You might need to add explicit type casts.", the LATERAL hints) remain open.
+- **`Hint`** — no longer deferred; specified in §11 for the two suggestion families and three fixed
+  sentences (§11.4–§11.6). Other PostgreSQL hints (`42883`'s "You might need to add explicit type casts.", the LATERAL hints) remain open.
 - **`DatabaseName` (the `SchemaName` analog).** jed qualifies by database, not schema. If
   attachment-qualified errors ever need to name the database, this is the additive field to add;
   not motivated yet.
@@ -468,8 +468,8 @@ the same token; a case where jed's token surface differs is marked `# jed:`.
 PostgreSQL attaches a HINT to an unknown column when a column of a similar name is in scope:
 `SELECT nme FROM t` → `Perhaps you meant to reference the column "t.name".`. It is the most useful hint
 for an ad-hoc query tool, and it is deterministic (an edit distance over the catalog names in scope).
-jed adds `Hint` as a seventh structured field and populates it for two families, plus two fixed
-sentences (§11.4, §11.5). Like `Detail`, it is
+jed adds `Hint` as a seventh structured field and populates it for two families, plus three fixed
+sentences (§11.4–§11.6). Like `Detail`, it is
 never appended to the rendered message (§9.1); the CLI prints it as psql's `HINT:  …` line.
 
 ### 11.1 Misspelled column (`42703` on a column reference)
@@ -529,7 +529,7 @@ Recorded divergences from PostgreSQL:
 - PostgreSQL visits an unaliased join's inner relations at their place in the range table; jed visits
   them after the level's FROM relations. This can change which of two equally close candidates is
   named first.
-- Every other PostgreSQL hint is absent (§7), except §11.4's and §11.5's.
+- Every other PostgreSQL hint is absent (§7), except §11.4's, §11.5's, and §11.6's.
 
 ### 11.4 `jsonb_set_lax`'s `raise_exception` (`22004`)
 
@@ -549,4 +549,12 @@ A malformed escape in a `U&'…'` string or `U&"…"` identifier ([grammar.md](g
 `Unicode escapes must be \XXXX or \+XXXXXX.` — naming the backslash even under a `UESCAPE`
 character, as PostgreSQL does. The other Unicode-escape errors (escape value, surrogate pair,
 `UESCAPE`) carry no hint. Constant text, so cross-core identical; the shared position fixture pins it
+([../errors/position_cases.txt](../errors/position_cases.txt)).
+
+### 11.6 `jsonb_insert` on an existing key (`22023`)
+
+`jsonb_insert` whose path ends at an existing object key ([json-sql-functions.md](json-sql-functions.md)
+§2.1) raises `22023` `cannot replace existing key` with PostgreSQL's fixed Hint, byte-for-byte:
+`Try using the function jsonb_set to replace key value.` Constant text, so cross-core identical; the
+error carries no Position (raised at evaluation), and the shared position fixture pins it
 ([../errors/position_cases.txt](../errors/position_cases.txt)).

@@ -1909,20 +1909,6 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		node := bv.jsonb() // resolver guarantees a jsonb base for - / #-
-		// Extract a text[] argument's keys (a NULL element propagates to a NULL result, PG).
-		textArray := func(v Value) ([]string, bool) {
-			if v.Kind != ValArray {
-				return nil, false
-			}
-			keys := make([]string, 0, len(v.arrayVal().Elements))
-			for _, el := range v.arrayVal().Elements {
-				if el.Kind != ValText {
-					return nil, false // a NULL element → NULL result
-				}
-				keys = append(keys, el.str())
-			}
-			return keys, true
-		}
 		var result JsonNode
 		switch e.delKind {
 		case dkKey:
@@ -1930,17 +1916,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case dkIndex:
 			result, err = jsonDeleteIndex(node, av.Int) // resolver guarantees an int arg for - index
 		case dkKeys:
-			keys, ok := textArray(av)
-			if !ok {
-				return NullValue(), nil
+			// A NULL key is skipped (PG).
+			var keys []*string
+			if keys, err = jsonTextPathArg(av); err == nil {
+				result, err = jsonDeleteKeys(node, keys)
 			}
-			result, err = jsonDeleteKeys(node, keys)
 		default: // dkPath
-			path, ok := textArray(av)
-			if !ok {
-				return NullValue(), nil
+			// A NULL path element reached raises 22004 (PG).
+			var path []*string
+			if path, err = jsonTextPathArg(av); err == nil {
+				result, err = jsonDeletePath(node, path)
 			}
-			result, err = jsonDeletePath(node, path)
 		}
 		if err != nil {
 			return Value{}, err
@@ -3907,7 +3893,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		return growthResult(m, e.sargs, JsonbValue(makeObject(members)))
 	case reJsonSetInsert:
 		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
-		// (or a NULL path element) → SQL NULL. One operator_eval; the args charge their own.
+		// → SQL NULL (a NULL path element is the kernel's 22004). One operator_eval; the args charge their own.
 		// jsonb_set_lax is jsonb_set that is not strict in the value: a SQL NULL value is handled by
 		// its null_value_treatment.
 		m.Charge(costs.OperatorEval)
@@ -3923,20 +3909,6 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		target, pathV, valueV, flagV := args[0], args[1], args[2], args[3]
-		// Extract the text[] path (a NULL element propagates a SQL NULL, like the `#-` path).
-		textPath := func() ([]string, bool) {
-			if pathV.Kind != ValArray {
-				return nil, false
-			}
-			path := make([]string, 0, len(pathV.arrayVal().Elements))
-			for _, el := range pathV.arrayVal().Elements {
-				if el.Kind != ValText {
-					return nil, false // a NULL path element propagates
-				}
-				path = append(path, el.str())
-			}
-			return path, true
-		}
 		var valueNode JsonNode
 		if e.psLax {
 			if target.Kind == ValNull || pathV.Kind == ValNull || flagV.Kind == ValNull {
@@ -3955,9 +3927,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				case "delete_key":
 					// `#-` (jsonb_delete_path): removing a member never grows the document, so no
 					// output charge and no depth check.
-					path, ok := textPath()
-					if !ok {
-						return NullValue(), nil
+					path, err := jsonTextPathArg(pathV)
+					if err != nil {
+						return Value{}, err
 					}
 					out, err := jsonDeletePath(target.jsonb(), path)
 					if err != nil {
@@ -3979,14 +3951,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			valueNode = *valueV.jsonb()
 		}
-		path, ok := textPath()
-		if !ok {
-			return NullValue(), nil
+		path, err := jsonTextPathArg(pathV)
+		if err != nil {
+			return Value{}, err
 		}
 		node := *target.jsonb() // resolver guarantees a jsonb target
 		flag := flagV.Kind == ValBool && flagV.boolVal()
 		var out JsonNode
-		var err error
 		if e.psMode == psSet {
 			out, err = setPath(&node, path, &valueNode, flag)
 		} else {

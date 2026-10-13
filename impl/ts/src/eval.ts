@@ -118,6 +118,7 @@ import {
   utf8ByteLength,
   valueToNode,
   valueToOptTextArray,
+  jsonTextPathArg,
   widthBucketErr,
   widthBucketFloat,
   widthBucketNumeric,
@@ -729,16 +730,6 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (bv.kind === "null" || av.kind === "null") return nullValue();
       if (bv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb base for - / #-");
       const node = bv.node;
-      // Extract a text[] argument's keys (a NULL element propagates to a NULL result, PG).
-      const textArray = (v: Value): string[] | null => {
-        if (v.kind !== "array") return null;
-        const keys: string[] = [];
-        for (const el of v.elements) {
-          if (el.kind !== "text") return null; // a NULL element → NULL result
-          keys.push(el.text);
-        }
-        return keys;
-      };
       let result: JsonNode;
       switch (e.deleteKind) {
         case "key":
@@ -749,19 +740,14 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           if (av.kind !== "int") throw new Error("resolver guarantees an int arg for - index");
           result = jsonDeleteIndex(node, av.int);
           break;
-        case "keys": {
-          const keys = textArray(av);
-          if (keys === null) return nullValue();
-          result = jsonDeleteKeys(node, keys);
+        case "keys":
+          // A NULL key is skipped (PG).
+          result = jsonDeleteKeys(node, jsonTextPathArg(av));
           break;
-        }
-        default: {
-          // "path"
-          const path = textArray(av);
-          if (path === null) return nullValue();
-          result = jsonDeletePathKernel(node, path);
+        default:
+          // "path" — a NULL path element reached raises 22004 (PG).
+          result = jsonDeletePathKernel(node, jsonTextPathArg(av));
           break;
-        }
       }
       return jsonbValue(result);
     }
@@ -2163,22 +2149,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     }
     case "jsonSetInsert": {
       // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
-      // (or a NULL path element) → SQL NULL. jsonb_set_lax is jsonb_set that is not strict in the
-      // value: a SQL NULL value is handled by its null_value_treatment.
+      // → SQL NULL (a NULL path element is the kernel's 22004). jsonb_set_lax is jsonb_set that is
+      // not strict in the value: a SQL NULL value is handled by its null_value_treatment.
       m.charge(COSTS.operatorEval);
       const vals = e.args.map((a) => evalExpr(a, row, env, m));
       m.guard();
       const [target, pathV, valueV, flagV] = vals as [Value, Value, Value, Value];
-      // Extract the text[] path (a NULL element propagates a SQL NULL result, like the `#-` path).
-      const textPath = (): string[] | null => {
-        if (pathV.kind !== "array") throw new Error("resolver guarantees a text[] path");
-        const path: string[] = [];
-        for (const el of pathV.elements) {
-          if (el.kind !== "text") return null; // a NULL path element propagates
-          path.push(el.text);
-        }
-        return path;
-      };
       let valueNode: JsonNode;
       if (e.lax) {
         if (target.kind === "null" || pathV.kind === "null" || flagV.kind === "null") {
@@ -2197,8 +2173,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
             case "delete_key": {
               // `#-` (jsonb_delete_path): removing a member never grows the document, so no
               // output charge and no depth check.
-              const path = textPath();
-              if (path === null) return nullValue();
+              const path = jsonTextPathArg(pathV);
               return jsonbValue(jsonDeletePathKernel(jsonArgNode(target), path));
             }
             case "return_target":
@@ -2221,8 +2196,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
         valueNode = jsonArgNode(valueV);
       }
-      const path = textPath();
-      if (path === null) return nullValue();
+      const path = jsonTextPathArg(pathV);
       const node = jsonArgNode(target);
       const flag = flagV.kind === "bool" && flagV.value;
       const out =

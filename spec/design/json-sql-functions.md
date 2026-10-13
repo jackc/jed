@@ -121,8 +121,8 @@ exactly:
    PostgreSQL's Detail and Hint ([error-fields.md](error-fields.md) §9.2, §11.4); anything else → the
    step-2 `22023`.
 
-Each branch inherits its kernel's behavior: the scalar-target `22023`s, the `22P02` non-integer array
-step, and the NULL path element (SQL NULL, as for `jsonb_set` and `#-`). Cost follows the branch:
+Each branch inherits its kernel's behavior (§2.1): the scalar-target `22023`s, the `22P02`
+non-integer array step, and the `22004` NULL path element. Cost follows the branch:
 the set branches are a growth kernel like `jsonb_set` ([cost.md](cost.md) §8.1) and check the result's
 depth ([json.md](json.md) §6.4); `delete_key` and `return_target` only remove from or return the target,
 so like `#-` they charge one `operator_eval` and no output bytes.
@@ -130,6 +130,38 @@ so like `#-` they charge one `operator_eval` and no output bytes.
 The json-vs-jsonb observable differences (where they exist) are recorded as catalog data:
 `json_typeof`/`json_array_length` parse the textual form; the json builders preserve insertion
 order and duplicate keys, the jsonb builders canonicalize ([json.md §2.3](json.md)).
+
+### 2.1 The path walk (`jsonb_set`, `jsonb_set_lax`, `jsonb_insert`, `#-`)
+
+The path mutators share one walk, ported from PostgreSQL's `setPath` (jsonfuncs.c); `jsonb_set_lax`
+reaches it through `jsonb_set` or, for `'delete_key'`, through `#-`. After the STRICT NULL-argument
+check (jsonb_set_lax: the order above), the checks run in PostgreSQL's order:
+
+1. A multidimensional path → `2202E` `wrong number of array subscripts`.
+2. A scalar root → `22023` `cannot set path in scalar` (`#-`: `cannot delete path in scalar`), even
+   for an empty path.
+3. An empty object or array returns the target unchanged for `jsonb_set` without
+   `create_if_missing` and for `#-` (not for `jsonb_insert`, which walks an empty container).
+4. An empty path returns the target unchanged.
+5. The walk, one path element per level, each element checked **when the walk reaches it**:
+   - A NULL element → `22004` `path element at position N is null` (N 1-based). The check precedes
+     looking at the node, so a NULL under a scalar member still raises (`jsonb_set('{"a":1}',
+     '{a,NULL}', …)`), while a NULL past a missing key or an out-of-range index is never reached and
+     the target comes back unchanged.
+   - A scalar below the root ends the walk; the target comes back unchanged (no error).
+   - An object step matches its key. At the last step the member is replaced, deleted (`#-`), or —
+     for `jsonb_insert` — refused with `22023` `cannot replace existing key` (hint `Try using the
+     function jsonb_set to replace key value.`); a missing last key is added by `jsonb_set` with
+     `create_if_missing` and by `jsonb_insert`. A missing earlier key is a no-op.
+   - An array step must parse as PostgreSQL's `strtoint`: optional leading whitespace, an optional
+     sign, digits to the end, within `i32` — else `22P02` `path element at position N is not an
+     integer: "<step>"` (for `#-` too). A negative index counts from the end; one before the start
+     makes the adding forms prepend (`jsonb_insert` with `insert_after` included); one past the end
+     clamps to the length, so the adding forms append.
+
+`- text[]` (PostgreSQL's `jsonb_delete_array`) shares steps 1–4 with the message `cannot delete from
+scalar`, and then **skips** a NULL key. The extractors differ: `#>`, `#>>` (jsonb and the verbatim
+json overloads, §1.1) return SQL NULL when the path holds any NULL element.
 
 ---
 

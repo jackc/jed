@@ -761,22 +761,6 @@ impl RExpr {
                 if matches!(av, Value::Null) {
                     return Ok(Value::Null);
                 }
-                // Extract a text[] argument's keys (a NULL element propagates to a NULL result, PG).
-                let text_array = |v: &Value| -> Option<Vec<String>> {
-                    match v {
-                        Value::Array(arr) => {
-                            let mut keys = Vec::with_capacity(arr.elements.len());
-                            for e in &arr.elements {
-                                match e {
-                                    Value::Text(s) => keys.push(s.clone()),
-                                    _ => return None, // a NULL element → NULL result
-                                }
-                            }
-                            Some(keys)
-                        }
-                        _ => None,
-                    }
-                };
                 let result = match kind {
                     DeleteKind::Key => match &av {
                         Value::Text(k) => json::delete_key(node, k)?,
@@ -786,19 +770,14 @@ impl RExpr {
                         Value::Int(i) => json::delete_index(node, *i)?,
                         _ => unreachable!("resolver guarantees an int arg for - index"),
                     },
-                    DeleteKind::Keys => match text_array(&av) {
-                        Some(keys) => json::delete_keys(node, &keys)?,
-                        None => return Ok(Value::Null),
-                    },
-                    DeleteKind::Path => match text_array(&av) {
-                        Some(path) => json::delete_path(node, &path)?,
-                        None => return Ok(Value::Null),
-                    },
+                    // A NULL key is skipped; a NULL path element reached raises 22004 (PG).
+                    DeleteKind::Keys => json::delete_keys(node, &json_text_path_arg(&av)?)?,
+                    DeleteKind::Path => json::delete_path(node, &json_text_path_arg(&av)?)?,
                 };
                 Ok(Value::Jsonb(result))
             }
             // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL
-            // argument (or a NULL path element) → SQL NULL. jsonb_set_lax is jsonb_set that is not
+            // argument → SQL NULL (a NULL path element is the kernel's 22004). jsonb_set_lax is jsonb_set that is not
             // strict in the value: a SQL NULL value is handled by its null_value_treatment.
             RExpr::JsonSetInsert { mode, lax, args } => {
                 m.charge(COSTS.operator_eval);
@@ -827,10 +806,7 @@ impl RExpr {
                             "delete_key" => {
                                 // `#-` (jsonb_delete_path): removing a member never grows the
                                 // document, so no output charge and no depth check.
-                                let path = match value_to_text_path(&path_v) {
-                                    Some(p) => p,
-                                    None => return Ok(Value::Null), // a NULL path element
-                                };
+                                let path = json_text_path_arg(&path_v)?;
                                 let node = json_arg_node(&target)?;
                                 return Ok(Value::Jsonb(json::delete_path(&node, &path)?));
                             }
@@ -846,10 +822,7 @@ impl RExpr {
                 {
                     return Ok(Value::Null);
                 }
-                let path = match value_to_text_path(&path_v) {
-                    Some(p) => p,
-                    None => return Ok(Value::Null), // a NULL path element propagates
-                };
+                let path = json_text_path_arg(&path_v)?;
                 let node = json_arg_node(&target)?;
                 let value_node = match value_node {
                     Some(n) => n,

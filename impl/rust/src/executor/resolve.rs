@@ -1160,21 +1160,29 @@ pub(crate) fn value_to_opt_text_array(v: &Value) -> Option<Vec<Option<String>>> 
     }
 }
 
-/// Extract a `text[]` value into a path of strings — `None` if it is not an array or has a NULL
-/// element (which propagates a SQL NULL through `jsonb_set`/`jsonb_insert`, like the `#-` path).
-pub(crate) fn value_to_text_path(v: &Value) -> Option<Vec<String>> {
+/// Extract a jsonb mutator's `text[]` path / key-list argument into `Vec<Option<String>>`, keeping
+/// NULL elements (each kernel decides what one means: `jsonb_set` / `jsonb_insert` / `#-` raise
+/// `22004` when the walk reaches it, `- text[]` skips it). A multidimensional array is `2202E`
+/// ("wrong number of array subscripts"), checked before anything else about the target (PG).
+pub(crate) fn json_text_path_arg(v: &Value) -> Result<Vec<Option<String>>> {
     match v {
         Value::Array(arr) => {
-            let mut path = Vec::with_capacity(arr.elements.len());
-            for e in &arr.elements {
-                match e {
-                    Value::Text(s) => path.push(s.clone()),
-                    _ => return None,
-                }
+            if arr.dims.len() > 1 {
+                return Err(EngineError::new(
+                    SqlState::ArraySubscriptError,
+                    "wrong number of array subscripts",
+                ));
             }
-            Some(path)
+            Ok(arr
+                .elements
+                .iter()
+                .map(|e| match e {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect())
         }
-        _ => None,
+        _ => unreachable!("resolver guarantees a text[] path argument"),
     }
 }
 
