@@ -4043,7 +4043,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		seq, ok, err := evalJsonpath(ctx, path, m)
+		// The operators are PostgreSQL's silent forms. The jsonb_path_* functions pass the default
+		// vars object, one base object for .keyvalue() ids; the operators pass none (jsonpath.md
+		// §3.1).
+		silent := e.jpFnKind == jpfExistsSilent || e.jpFnKind == jpfMatchSilent
+		opts := jpEvalOpts{exists: e.jpFnKind == jpfExists || e.jpFnKind == jpfExistsSilent, vars: 1}
+		if silent {
+			opts.vars = 0
+		}
+		seq, ok, errored, err := evalJsonpath(ctx, path, opts, silent, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -4057,6 +4065,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		switch e.jpFnKind {
 		case jpfExists:
+			return BoolValue(len(seq) > 0), nil
+		case jpfExistsSilent:
+			// @?: a SQL/JSON error → SQL NULL.
+			if errored {
+				return NullValue(), nil
+			}
 			return BoolValue(len(seq) > 0), nil
 		case jpfQueryFirst:
 			if len(seq) == 0 {
@@ -4075,6 +4089,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, newError(SingletonSqlJsonItemRequired, "single boolean result is expected")
 		case jpfMatchSilent:
 			// @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean result to NULL.
+			// An error ends the evaluation; the items found before it still decide.
 			if len(seq) == 1 && seq[0].Kind == JBool {
 				return BoolValue(seq[0].B), nil
 			}
@@ -4104,12 +4119,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		// Reading a json context as jsonb (a `\u0000` / unpaired surrogate raises) is the context's
 		// conversion, not path evaluation, so ON ERROR does not catch it — as in PostgreSQL
-		// (json.md §4.2).
-		node, err := jsonArgNode(cv)
+		// (json.md §4.2). The conversion canonicalizes it, as PostgreSQL casts it (jsonpath.md §5).
+		node, err := jsonpathContextNode(cv)
 		if err != nil {
 			return Value{}, err
 		}
-		seq, err := evalJsonpathOn(node, pv, m)
+		seq, _, err := evalJsonpathOn(node, pv, jpEvalOpts{exists: e.jsKind == jsExists}, false, m)
 		if err != nil {
 			// A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
 			// else (a cost abort, etc.) propagates.

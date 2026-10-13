@@ -197,6 +197,15 @@ test('the types page autoruns the to_json demo', async ({ page }) => {
   await expect(rows).toContainText('["2024-01-15", "2024-02-15"]');
 });
 
+test('the types page autoruns the jsonpath item method demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // .type() per element; .integer() unwraps the array and rounds 3.7 → 4; .keyvalue().key lists keys.
+  const rows = livePanel(page, 'jsonpathMethodDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('["number", "string", "number"]');
+  await expect(rows).toContainText('[12, 4, -4]');
+  await expect(rows).toContainText('["x", "y"]');
+});
+
 test('the tables page decodes Unicode-escape literals and names live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   // U&'caf\00e9' is café in a column named näme; the UESCAPE '!' form decodes to data.

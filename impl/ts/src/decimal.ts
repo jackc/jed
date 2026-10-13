@@ -151,6 +151,40 @@ export class Decimal {
     return exactFromBits(bits, 8, 23, 150, -149);
   }
 
+  // fromFloat64DblDig is PostgreSQL's float8_numeric: the binary64 value printed with %.15g
+  // (DBL_DIG significant digits) and read back as a numeric. The digits come from the EXACT decimal
+  // expansion (exactFromFloat64), rounded to 15 significant digits half-to-even (glibc's printf
+  // rounds the exact value to nearest, ties to even), with trailing fractional zeros trimmed — %g
+  // drops them, and an exponent form reads back at display scale max(0, digits − exponent). Pure
+  // integer arithmetic, so every core agrees bit-for-bit. Used by the jsonpath .double() method
+  // (spec/design/jsonpath.md §3.1); the caller has already rejected NaN and ±Infinity.
+  static fromFloat64DblDig(f: number): Decimal {
+    const DBL_DIG = 15;
+    const exact = Decimal.exactFromFloat64(f);
+    const digits = exact.precision();
+    if (digits <= DBL_DIG) return exact;
+    const drop = digits - DBL_DIG;
+    const pow = magPow10(drop);
+    const [quotient, r] = magDivMod(exact.limbs, pow);
+    let q = quotient;
+    const c = magCmp(magAdd(r, r), pow);
+    if (c > 0 || (c === 0 && q.length > 0 && q[0]! % 2 === 1)) {
+      q = magAdd(q, [1]);
+    }
+    const rounded =
+      exact.scale >= drop
+        ? Decimal.fromParts(exact.neg, exact.scale - drop, q)
+        : Decimal.fromParts(exact.neg, 0, magMulPow10(q, drop - exact.scale));
+    // Trim trailing fractional zeros (the value is unchanged).
+    let coeff = magToDecimalStr(rounded.limbs);
+    let scale = rounded.scale;
+    while (scale > 0 && coeff.endsWith("0")) {
+      coeff = coeff.slice(0, -1);
+      scale--;
+    }
+    return Decimal.fromDigitsScale(rounded.neg, coeff, scale);
+  }
+
   isZero(): boolean {
     return this.limbs.length === 0;
   }

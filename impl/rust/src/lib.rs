@@ -1032,6 +1032,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.jsonpath_filter",
     // jsonpath top-level predicates + jsonb_path_match + the `@@` operator (P1b/P2, jsonpath.md §6).
     "expr.jsonpath_match",
+    // jsonpath item methods (.type()/.size()/.double()/…/.keyvalue(), jsonpath.md §3.1).
+    "expr.jsonpath_methods",
     // the SQL/JSON query functions JSON_EXISTS / JSON_VALUE / JSON_QUERY (S2, json-sql-functions.md §5).
     "expr.json_query_fns",
     // JSON_TABLE with the default plan (T1, json-table.md §3): COLUMNS, FOR ORDINALITY, EXISTS, NESTED.

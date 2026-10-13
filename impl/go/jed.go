@@ -852,18 +852,20 @@ var SupportedCapabilities = []string{
 	"func.json_populate",
 	// The jsonpath scalar type (P1a) — the '…'::jsonpath / jsonpath '…' literal cast compiled at
 	// resolve + the canonical render ($.a → $."a", lax omitted, strict kept); structural-accessor
-	// subset only (filters/methods/arithmetic → 0A000); non-comparable (42883); literal-only (a
+	// arithmetic / $name / datetime methods → 0A000; non-comparable (42883); literal-only (a
 	// jsonpath column → 0A000); malformed → 42601 (spec/design/jsonpath.md).
 	"types.jsonpath",
 	// The jsonpath query functions (P1b/P2) over the structural-accessor evaluator: jsonb_path_exists
 	// / jsonb_path_query (SRF) / jsonb_path_query_first / jsonb_path_query_array, each `(jsonb,
 	// jsonpath)`; lax auto-unwraps arrays + suppresses navigation failures, strict raises (2203A
-	// missing member / 22033 subscript); a filter / item-method path is still 0A000 (jsonpath.md §5).
+	// missing member / 22033 subscript) (jsonpath.md §5).
 	"func.jsonb_path",
 	// jsonpath filter expressions `?(predicate)` + the `@?` exists operator (P1b, jsonpath.md §4/§6).
 	"expr.jsonpath_filter",
 	// Top-level jsonpath predicates (`$.a == 1`) + jsonb_path_match + the `@@` operator (jsonpath.md §6).
 	"expr.jsonpath_match",
+	// jsonpath item methods (.type()/.size()/.double()/…/.keyvalue(), jsonpath.md §3.1).
+	"expr.jsonpath_methods",
 	// The SQL/JSON query functions (S2) — JSON_EXISTS / JSON_VALUE / JSON_QUERY: compile a jsonpath,
 	// evaluate it over a context item, and apply per-function semantics (RETURNING / wrapper / quotes
 	// / ON EMPTY / ON ERROR). PASSING vars, DEFAULT-expr behaviors, JSON_QUERY OMIT QUOTES, and a

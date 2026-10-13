@@ -1,0 +1,706 @@
+# jsonpath item-method edge cases (spec/design/jsonpath.md §2-§5), oracle-imported: .keyvalue() ids
+# through filters, wildcards and nested pairs; lax/strict unwrapping of methods; methods in filter
+# operands (an operand error is unknown); existence tests stopping at the first item; the silent
+# @? / @@ operators; the SQL/JSON functions over method results; strict subscripts; literal
+# primaries and number-literal parsing; the method render. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.jsonpath_match, expr.jsonpath_methods, expr.json_query_fns
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"b": {"c": 1}}}', '$.a.keyvalue().value.keyvalue()')
+----
+[{"id": 20000000052, "key": "c", "value": 1}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"b": {"c": 1}}}', '$.*.keyvalue()')
+----
+[{"id": 16, "key": "b", "value": {"c": 1}}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"b": {"c": 1}}}', '$.a ? (@.b.c == 1).keyvalue()')
+----
+[{"id": 16, "key": "b", "value": {"c": 1}}]
+
+statement error 2203C
+SELECT jsonb_path_query_array('{"a": [{"x": 1}, {"y": [2, {"z": 3}]}]}', '$.a[*].keyvalue().value[*].keyvalue()')
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": [{"x": 1}, {"y": [2, {"z": 3}]}]}', '$.a[1].y[1].keyvalue()')
+----
+[{"id": 88, "key": "z", "value": 3}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"aaaa": "bbbbbbb", "a": [1, 2.5, -3e5, true, null, "str"], "zz": {"q": {}}}', '$.zz.keyvalue()')
+----
+[{"id": 96, "key": "q", "value": {}}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"aaaa": "bbbbbbb", "a": [1, 2.5, -3e5, true, null, "str"], "zz": {"q": {}}}', '$.zz.q.keyvalue()')
+----
+[]
+
+query T nosort
+SELECT jsonb_path_query_array('{"aaaa": "bbbbbbb", "a": [1, 2.5, -3e5, true, null, "str"], "zz": {"q": {"r": 1}}}', '$.zz.q.keyvalue()')
+----
+[{"id": 112, "key": "r", "value": 1}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"k": {"x": 1}}', '$.keyvalue().keyvalue().keyvalue()')
+----
+[{"id": 30000000000, "key": "id", "value": 20000000000}, {"id": 30000000000, "key": "key", "value": "id"}, {"id": 30000000000, "key": "value", "value": 0}, {"id": 70000000000, "key": "id", "value": 20000000000}, {"id": 70000000000, "key": "key", "value": "key"}, {"id": 70000000000, "key": "value", "value": "k"}, {"id": 110000000000, "key": "id", "value": 20000000000}, {"id": 110000000000, "key": "key", "value": "value"}, {"id": 110000000000, "key": "value", "value": {"x": 1}}]
+
+statement error 2203C
+SELECT jsonb_path_query_array('{"k": {"x": 1}, "longerkey": {"y": {"z": 2}}}', '$.keyvalue().value.keyvalue().value.keyvalue()')
+
+query T nosort
+SELECT jsonb_path_query_array('[1, 2, 3]', '$.type().size()')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('[1, 2, 3]', 'strict $.type()')
+----
+["array"]
+
+query T nosort
+SELECT jsonb_path_query_array('[[1, 2], 3]', '$.size()')
+----
+[2]
+
+query T nosort
+SELECT jsonb_path_query_array('"abc"', '"abc".size()')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('null', '"x"')
+----
+["x"]
+
+query T nosort
+SELECT jsonb_path_query_array('null', '1')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('null', 'true.type()')
+----
+["boolean"]
+
+query T nosort
+SELECT jsonb_path_query_array('null', '(1).type()')
+----
+["number"]
+
+query T nosort
+SELECT jsonb_path_query_array('[1,2,3]', '$ ? (@.size() == 3)')
+----
+[]
+
+query T nosort
+SELECT jsonb_path_query_array('[1,2,3]', 'strict $ ? (@.size() == 3)')
+----
+[[1, 2, 3]]
+
+statement error 22036
+SELECT jsonb_path_query_array('{"a": ["1", "x"]}', '$.a.integer()')
+
+statement error 22036
+SELECT jsonb_path_query_array('{"a": ["1", "2"]}', 'strict $.a.integer()')
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": ["1", "2"]}', 'strict $.a[*].integer()')
+----
+[1, 2]
+
+query T nosort
+SELECT jsonb_path_query_array('[1, 2]', '$ ? (@ == 1.)')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('[0.5, 2]', '$ ? (@ == .5)')
+----
+[0.5]
+
+query T nosort
+SELECT jsonb_path_query_array('["a", "b"]', '$[*].string().type()')
+----
+["string", "string"]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": 1, "b": 2}', '$.* ? (@.double() > 1.5)')
+----
+[2]
+
+query T nosort
+SELECT jsonb_path_query_array('[1.123456789012345678901234567890]', '$[0].double()')
+----
+[1.123456789012345678901234567890]
+
+query T nosort
+SELECT jsonb_path_query_array('["1.123456789012345678901234567890", "-1e-5", "123456789012345678"]', '$[*].double()')
+----
+[1.12345678901235, -0.00001, 123456789012346000]
+
+query T nosort
+SELECT jsonb_path_query_array('["0.1e1", "1E2", "-.5e-1"]', '$[*].double()')
+----
+[1, 100, -0.05]
+
+query T nosort
+SELECT jsonb_path_query_array('["1.50", "1e-3", "-12.30e1"]', '$[*].number()')
+----
+[1.50, 0.001, -123.0]
+
+statement error 22036
+SELECT jsonb_path_query_array('["1.50", "1e-3", "-12.30e1"]', '$[*].decimal(5,3)')
+
+query T nosort
+SELECT jsonb_path_query_array('[1.555, 1.545, -1.555]', '$[*].decimal(3,2)')
+----
+[1.56, 1.55, -1.56]
+
+query T nosort
+SELECT jsonb_path_query_array('[12345, 0.5]', '$[*].decimal(1,-4)')
+----
+[10000, 0]
+
+query T nosort
+SELECT jsonb_path_query_array('[5000, 15000]', '$[*].decimal(1,-4)')
+----
+[10000, 20000]
+
+query T nosort
+SELECT jsonb_path_query_array('["Yes", "NO", "On", "OFF"]', '$[*].boolean()')
+----
+[true, false, true, false]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', '$.keyvalue().value.x')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', '$.keyvalue().value.*')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', '$.keyvalue() ? (@.value.x == 1)')
+----
+[{"id": 0, "key": "a", "value": {"x": 1}}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', '$.keyvalue() ? (@ == null)')
+----
+[]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', '$.keyvalue() ? (@ != null)')
+----
+[{"id": 0, "key": "a", "value": {"x": 1}}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', '$.keyvalue() ? (@ == 1)')
+----
+[]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', 'strict $.keyvalue() ? (@.zzz == 1)')
+----
+[]
+
+statement error 2203A
+SELECT jsonb_path_query_array('{"a": {"x": 1}}', 'strict $.keyvalue().zzz')
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": 1}', '$.keyvalue().id.type()')
+----
+["number"]
+
+query T nosort
+SELECT jsonb_path_query_array('[]', '$.keyvalue()')
+----
+[]
+
+statement error 2203C
+SELECT jsonb_path_query_array('[[]]', '$.keyvalue()')
+
+statement error 2203C
+SELECT jsonb_path_query_array('{"a": 1}', '$.a.keyvalue()')
+
+query T nosort
+SELECT jsonb_path_query_array('[1, "a", null]', '$[*] ? (@.type() != "null").string()')
+----
+["1", "a"]
+
+query T nosort
+SELECT jsonb_path_query_array('["12", "x"]', '$ ? (@.integer() == 12)')
+----
+["12"]
+
+query T nosort
+SELECT jsonb_path_query_array('["12", "x"]', 'strict $ ? (@[*].integer() == 12)')
+----
+[]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": [{"b": 1}, {"b": 2}]}', '$.a ? (@.b > 1).keyvalue()')
+----
+[{"id": 52, "key": "b", "value": 2}]
+
+query T nosort
+SELECT jsonb_path_query_array('[{"a":1},{"b":2}]', '$.keyvalue()[*].key')
+----
+["a", "b"]
+
+query T nosort
+SELECT jsonb_path_query_array('[{"a":1},{"b":2}]', '$[last].keyvalue()')
+----
+[{"id": 36, "key": "b", "value": 2}]
+
+query T nosort
+SELECT jsonb_path_query_array('[1,2,3]', '$[1 to last].abs()')
+----
+[2, 3]
+
+query T nosort
+SELECT jsonb_path_query_array('[1,2,3]', '$[0, 2].size()')
+----
+[1, 1]
+
+query T nosort
+SELECT jsonb_path_query_array('[[1,2,3]]', '$[0].size()')
+----
+[3]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": {"b": [1, {"c": 2}]}}', '$.a.b[1].keyvalue().value.type()')
+----
+["number"]
+
+statement error 22036
+SELECT jsonb_path_query_first('[1,"x"]', '$[*].double()')
+
+query B nosort
+SELECT jsonb_path_exists('[1, "a"]', '$[*].double()')
+----
+true
+
+query B nosort
+SELECT '[1, "a"]'::jsonb @? 'strict $[*].double()'
+----
+NULL
+
+query B nosort
+SELECT jsonb_path_match('[1]', '$[*].double() == 1')
+----
+true
+
+query B nosort
+SELECT jsonb_path_match('[1, "x"]', 'strict $[*].double() == 1')
+----
+NULL
+
+query B nosort
+SELECT jsonb_path_match('[1, "x"]', '$[*].double() == 1')
+----
+NULL
+
+query T nosort
+SELECT jsonb_path_query_array('[1, "x"]', '$ ? (@.double() > 0)')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('[1, "x"]', 'strict $ ? (@[*].double() > 0)')
+----
+[]
+
+statement error 22036
+SELECT jsonb_path_query_array('{"a": "x"}', '$.a.decimal(0)')
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": "x"}', '$ ? (@.a.decimal(0) == 1)')
+----
+[]
+
+statement error 2203C
+SELECT jsonb_path_query_array('[1,2,3]', '$.keyvalue()')
+
+query B nosort
+SELECT '[1,2,3]'::jsonb @? '$.keyvalue()'
+----
+NULL
+
+query B nosort
+SELECT '[{},{"a":1}]'::jsonb @? '$.keyvalue()'
+----
+true
+
+query B nosort
+SELECT '[{"a":1}, 1]'::jsonb @? '$.keyvalue()'
+----
+true
+
+query B nosort
+SELECT '[{"a":1}, 1]'::jsonb @? 'strict $[*].keyvalue()'
+----
+NULL
+
+query B nosort
+SELECT '[{"a":1}, 1]'::jsonb @@ '$[*].keyvalue().value == 1'
+----
+NULL
+
+query B nosort
+SELECT '{"a": 1}'::jsonb @@ '$.a.type() == "number"'
+----
+true
+
+statement error 22036
+SELECT jsonb_path_query_first('[1.5, "2.5"]', '$.ceiling()')
+
+query B nosort
+SELECT JSON_EXISTS('[1, "a"]', '$[*].double()')
+----
+true
+
+query B nosort
+SELECT JSON_EXISTS('["a", 1]', '$[*].double()')
+----
+false
+
+statement error 22036
+SELECT JSON_EXISTS('["a", 1]', '$[*].double()' ERROR ON ERROR)
+
+query T nosort
+SELECT JSON_VALUE('["a", 1]', '$[1].double()')
+----
+1
+
+statement error 22036
+SELECT JSON_VALUE('["a", 1]', '$[0].double()' ERROR ON ERROR)
+
+query T nosort
+SELECT JSON_QUERY('{"a": [1, 2]}', '$.a.size()')
+----
+2
+
+query T nosort
+SELECT JSON_QUERY('{"a": {"b": 1}}', '$.a.keyvalue()')
+----
+{"id": 16, "key": "b", "value": 1}
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": 1, "b": 2}', 'strict $.keyvalue()')
+----
+[{"id": 0, "key": "a", "value": 1}, {"id": 0, "key": "b", "value": 2}]
+
+query T nosort
+SELECT jsonb_path_query_array('[{"a": 1}, {"b": 2}]', 'strict $[*].keyvalue().value.double()')
+----
+[1, 2]
+
+query T nosort
+SELECT jsonb_path_query_array('1', '$[0 to 0].abs()')
+----
+[1]
+
+statement error 22039
+SELECT jsonb_path_query_array('1', 'strict $[0].abs()')
+
+statement error 22033
+SELECT jsonb_path_query_array('[1, 2]', 'strict $[3].abs()')
+
+statement error 22033
+SELECT jsonb_path_query_array('[1, 2]', '$[99999999999]')
+
+statement error 22033
+SELECT jsonb_path_query_array('[1, 2]', 'strict $[-1]')
+
+query T nosort
+SELECT jsonb_path_query_array('[1, 2]', '$[-1 to 0]')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": 1}', '$.a ? (@ == 1).type()')
+----
+["number"]
+
+query T nosort
+SELECT jsonb_path_query_array('"x"', '$.string().size()')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_array('[{"a": "1"}, {"a": "x"}]', '$[*] ? (@.a.number() == 1)')
+----
+[{"a": "1"}]
+
+query T nosort
+SELECT jsonb_path_query_array('[{"a": "1"}, {"a": "x"}]', 'strict $[*] ? (@.a.number() == 1)')
+----
+[{"a": "1"}]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": [1, "x", 3]}', '$ ? (@.a[*].double() > 2)')
+----
+[]
+
+query T nosort
+SELECT jsonb_path_query_array('{"a": [1, "x", 3]}', 'strict $ ? (@.a[*].double() > 2)')
+----
+[]
+
+query T nosort
+SELECT jsonb_path_query_first('{"a": [1, "x", 3]}', '$.a == 3')
+----
+true
+
+query T nosort
+SELECT jsonb_path_query_first('{"a": [1, "x", 3]}', '$.a.double() == 3')
+----
+null
+
+query T nosort
+SELECT jsonb_path_query_first('{"a": [1, "x", 3]}', 'strict $.a[*].double() == 1')
+----
+null
+
+query T nosort
+SELECT '$ ? (@ == "a".type())'::jsonpath
+----
+$?(@ == "a".type())
+
+query T nosort
+SELECT '$ ? ("a".size() == @.size())'::jsonpath
+----
+$?("a".size() == @.size())
+
+query T nosort
+SELECT '$ ? (1.5.type() == @)'::jsonpath
+----
+$?((1.5).type() == @)
+
+query T nosort
+SELECT '$ ? ((1.5).type() == @)'::jsonpath
+----
+$?((1.5).type() == @)
+
+query T nosort
+SELECT '$ ? (true.type() == @ && null.type() != @)'::jsonpath
+----
+$?(true.type() == @ && null.type() != @)
+
+query T nosort
+SELECT '"abc"'::jsonpath
+----
+"abc"
+
+query T nosort
+SELECT '1.50'::jsonpath
+----
+1.50
+
+query T nosort
+SELECT '-1.5'::jsonpath
+----
+-1.5
+
+query T nosort
+SELECT '1e-2'::jsonpath
+----
+0.01
+
+query T nosort
+SELECT '.5'::jsonpath
+----
+0.5
+
+query T nosort
+SELECT '1.'::jsonpath
+----
+1
+
+query T nosort
+SELECT '1. '::jsonpath
+----
+1
+
+query T nosort
+SELECT 'true'::jsonpath
+----
+true
+
+query T nosort
+SELECT 'null.type()'::jsonpath
+----
+null.type()
+
+query T nosort
+SELECT '(null).type()'::jsonpath
+----
+null.type()
+
+query T nosort
+SELECT '("a").type()'::jsonpath
+----
+"a".type()
+
+query T nosort
+SELECT '(1).type() == 1'::jsonpath
+----
+((1).type() == 1)
+
+query T nosort
+SELECT '(1) == 1'::jsonpath
+----
+(1 == 1)
+
+query T nosort
+SELECT '1 == 1'::jsonpath
+----
+(1 == 1)
+
+statement error 42601
+SELECT 'strict 1.type()'::jsonpath
+
+query T nosort
+SELECT '$.a.decimal()'::jsonpath
+----
+$."a".decimal()
+
+query T nosort
+SELECT '$.decimal(-0)'::jsonpath
+----
+$.decimal(0)
+
+statement error 42601
+SELECT '$.decimal(00)'::jsonpath
+
+statement error 42601
+SELECT '$.decimal(1,)'::jsonpath
+
+statement error 42601
+SELECT '$.decimal(,1)'::jsonpath
+
+query T nosort
+SELECT '$.decimal(- 2)'::jsonpath
+----
+$.decimal(-2)
+
+statement error 42601
+SELECT '$.decimal(1e2)'::jsonpath
+
+query T nosort
+SELECT '$.double( )'::jsonpath
+----
+$.double()
+
+query T nosort
+SELECT '$.Double()'::jsonpath
+----
+$.double()
+
+query T nosort
+SELECT '$.KeyValue()'::jsonpath
+----
+$.keyvalue()
+
+query T nosort
+SELECT '$.keyvalue ()'::jsonpath
+----
+$.keyvalue()
+
+query T nosort
+SELECT '$.keyvalue.a'::jsonpath
+----
+$."keyvalue"."a"
+
+query T nosort
+SELECT '$.a.b.c.size().type()'::jsonpath
+----
+$."a"."b"."c".size().type()
+
+query T nosort
+SELECT '$[*].string()'::jsonpath
+----
+$[*].string()
+
+statement error 42601
+SELECT '@'::jsonpath
+
+statement error 42601
+SELECT '$ == @'::jsonpath
+
+statement error 42601
+SELECT 'last'::jsonpath
+
+statement error 42601
+SELECT '$ ? (last == 1)'::jsonpath
+
+statement error 42601
+SELECT '1a'::jsonpath
+
+statement error 42601
+SELECT '01'::jsonpath
+
+statement error 42601
+SELECT '1e'::jsonpath
+
+statement error 42601
+SELECT '1e+'::jsonpath
+
+statement error 42601
+SELECT '$.a ? (@ == 1e)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == 01)'::jsonpath
+
+query T nosort
+SELECT jsonb_path_query_array('[1, 2]', '$ ? (@ == 1.)')
+----
+[1]
+
+query T nosort
+SELECT jsonb_path_query_first('null', '1.')
+----
+1
+
+query T nosort
+SELECT jsonb_path_query_first('null', '.5e1')
+----
+5
+
+query T nosort
+SELECT jsonb_path_query_first('null', '"x".type()')
+----
+"string"
+
+statement error 22036
+SELECT jsonb_path_query_first('null', '"x".double()')
+
+query T nosort
+SELECT jsonb_path_query_first('null', '"12.5".double().type()')
+----
+"number"
+
+query T nosort
+SELECT jsonb_path_query_first('[1]', '"a" == "a"')
+----
+true
+
+query T nosort
+SELECT jsonb_path_query_first('[1]', '1 == $[0]')
+----
+true
+
+statement error 2203C
+SELECT jsonb_path_query_first('[1]', 'strict (1).keyvalue()')
+
+statement error 2203C
+SELECT jsonb_path_query_first('{"a":1}', '$.a.keyvalue()')
+

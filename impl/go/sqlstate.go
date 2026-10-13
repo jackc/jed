@@ -61,12 +61,14 @@ const (
 	ArraySubscriptError
 	// DuplicateJsonObjectKeyValue is 22030 — duplicate JSON object key value.
 	DuplicateJsonObjectKeyValue
-	// SqlJsonItemCannotBeCastToTargetType is 2203A — {detail}.
-	SqlJsonItemCannotBeCastToTargetType
+	// SqlJsonArrayNotFound is 22039 — {detail}.
+	SqlJsonArrayNotFound
+	// SqlJsonMemberNotFound is 2203A — {detail}.
+	SqlJsonMemberNotFound
 	// SqlJsonObjectNotFound is 2203C — {detail}.
 	SqlJsonObjectNotFound
-	// SqlJsonMemberNotFound is 2203F — {detail}.
-	SqlJsonMemberNotFound
+	// SqlJsonScalarRequired is 2203F — {detail}.
+	SqlJsonScalarRequired
 	// InvalidArgumentForSqlJsonDatetimeFunction is 22031 — {detail}.
 	InvalidArgumentForSqlJsonDatetimeFunction
 	// InvalidSqlJsonSubscript is 22033 — {detail}.
@@ -254,11 +256,13 @@ func (s SqlState) Code() string {
 		return "2202E"
 	case DuplicateJsonObjectKeyValue:
 		return "22030"
-	case SqlJsonItemCannotBeCastToTargetType:
+	case SqlJsonArrayNotFound:
+		return "22039"
+	case SqlJsonMemberNotFound:
 		return "2203A"
 	case SqlJsonObjectNotFound:
 		return "2203C"
-	case SqlJsonMemberNotFound:
+	case SqlJsonScalarRequired:
 		return "2203F"
 	case InvalidArgumentForSqlJsonDatetimeFunction:
 		return "22031"
@@ -435,9 +439,10 @@ var errorDescs = []errorDesc{
 	{Code: "2201B", Name: "invalid_regular_expression", Class: "data exception"},
 	{Code: "2202E", Name: "array_subscript_error", Class: "data exception"},
 	{Code: "22030", Name: "duplicate_json_object_key_value", Class: "data exception"},
-	{Code: "2203A", Name: "sql_json_item_cannot_be_cast_to_target_type", Class: "data exception"},
+	{Code: "22039", Name: "sql_json_array_not_found", Class: "data exception"},
+	{Code: "2203A", Name: "sql_json_member_not_found", Class: "data exception"},
 	{Code: "2203C", Name: "sql_json_object_not_found", Class: "data exception"},
-	{Code: "2203F", Name: "sql_json_member_not_found", Class: "data exception"},
+	{Code: "2203F", Name: "sql_json_scalar_required", Class: "data exception"},
 	{Code: "22031", Name: "invalid_argument_for_sql_json_datetime_function", Class: "data exception"},
 	{Code: "22033", Name: "invalid_sql_json_subscript", Class: "data exception"},
 	{Code: "22034", Name: "more_than_one_sql_json_item", Class: "data exception"},

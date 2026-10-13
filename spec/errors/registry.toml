@@ -193,8 +193,14 @@ template = "duplicate JSON object key value"
 
 # --- SQL/JSON path + standard-function errors (class 22, ../design/jsonpath.md §8) -----------
 [[error]]
+code = "22039"
+name = "sql_json_array_not_found"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
 code = "2203A"
-name = "sql_json_item_cannot_be_cast_to_target_type"
+name = "sql_json_member_not_found"
 class = "data exception"
 template = "{detail}"
 
@@ -206,7 +212,7 @@ template = "{detail}"
 
 [[error]]
 code = "2203F"
-name = "sql_json_member_not_found"
+name = "sql_json_scalar_required"
 class = "data exception"
 template = "{detail}"
 

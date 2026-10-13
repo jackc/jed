@@ -3522,6 +3522,9 @@ pub(crate) enum VariadicFunc {
 pub(crate) enum JsonPathFnKind {
     /// `jsonb_path_exists` → boolean (the sequence is non-empty).
     Exists,
+    /// The PostgreSQL `@?` operator: the same existence test in silent mode — a SQL/JSON error
+    /// yields SQL NULL.
+    ExistsSilent,
     /// `jsonb_path_query_first` → the first sequence item, or NULL if empty.
     QueryFirst,
     /// `jsonb_path_query_array` → the sequence wrapped in a JSON array.
@@ -5836,7 +5839,7 @@ fn eval_json_sql_result(
                 return apply_json_behavior(
                     on_error,
                     EngineError::new(
-                        SqlState::SqlJsonMemberNotFound,
+                        SqlState::SqlJsonScalarRequired,
                         "JSON path expression in JSON_VALUE should return singleton scalar item",
                     ),
                     returning,
@@ -5989,6 +5992,13 @@ fn jt_compile_path(path: Option<&str>, name: &str) -> Result<String> {
     Ok(crate::jsonpath::JsonPath::compile(&src)?.render())
 }
 
+/// How `JSON_TABLE` evaluates its row, NESTED, and value-column paths: the full sequence, with no
+/// `PASSING` variables (jsonpath.md §3.1).
+pub(crate) const JT_EVAL: crate::jsonpath::EvalOpts = crate::jsonpath::EvalOpts {
+    exists: false,
+    vars: 0,
+};
+
 /// Expand a `JSON_TABLE` COLUMNS level over a sequence of row items → the sparse rows (the
 /// parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3).
 fn expand_jt_level(
@@ -6066,7 +6076,7 @@ fn expand_jt_nested(
         if let JtCol::Nested { path, columns } = child {
             let p = crate::jsonpath::compile_metered(path, meter)?;
             // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
-            let child_seq = match crate::jsonpath::eval(&p, item, meter) {
+            let child_seq = match crate::jsonpath::eval(&p, item, JT_EVAL, meter) {
                 Ok(seq) => seq,
                 Err(e) if is_sqljson_error(&e) => Vec::new(),
                 Err(e) => return Err(e),
@@ -6096,7 +6106,7 @@ fn eval_jt_regular(
     meter: &mut Meter,
 ) -> Result<Value> {
     let p = crate::jsonpath::compile_metered(path, meter)?;
-    let seq = match crate::jsonpath::eval(&p, item, meter) {
+    let seq = match crate::jsonpath::eval(&p, item, JT_EVAL, meter) {
         Ok(s) => s,
         Err(e) if is_sqljson_error(&e) => {
             return apply_json_behavior(on_error, e, returning, env, meter);
@@ -6124,7 +6134,11 @@ fn eval_jt_exists(
     meter: &mut Meter,
 ) -> Result<Value> {
     let p = crate::jsonpath::compile_metered(path, meter)?;
-    let exists = match crate::jsonpath::eval(&p, item, meter) {
+    let opts = crate::jsonpath::EvalOpts {
+        exists: true,
+        vars: 0,
+    };
+    let exists = match crate::jsonpath::eval(&p, item, opts, meter) {
         Ok(seq) => !seq.is_empty(),
         Err(e) if is_sqljson_error(&e) => match on_error {
             JsonOnBehavior::Error => return Err(e),

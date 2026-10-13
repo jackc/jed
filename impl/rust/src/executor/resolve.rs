@@ -288,7 +288,7 @@ pub(crate) fn resolve_binary(
         // (jsonpath.md §6). Both reuse the jsonpath kernels.
         BinaryOp::JsonPathExists | BinaryOp::JsonPathMatch => {
             let (sym, kind) = if matches!(op, BinaryOp::JsonPathExists) {
-                ("@?", JsonPathFnKind::Exists)
+                ("@?", JsonPathFnKind::ExistsSilent)
             } else {
                 ("@@", JsonPathFnKind::MatchSilent)
             };
@@ -1061,9 +1061,10 @@ pub(crate) fn resolve_jsonpath_fn(
 ) -> Result<(RExpr, ResolvedType)> {
     let (ctx, path) = resolve_jsonpath_args(scope, name, args, agg, params)?;
     let result = match kind {
-        JsonPathFnKind::Exists | JsonPathFnKind::Match | JsonPathFnKind::MatchSilent => {
-            ResolvedType::Bool
-        }
+        JsonPathFnKind::Exists
+        | JsonPathFnKind::ExistsSilent
+        | JsonPathFnKind::Match
+        | JsonPathFnKind::MatchSilent => ResolvedType::Bool,
         JsonPathFnKind::QueryFirst | JsonPathFnKind::QueryArray => ResolvedType::Jsonb,
     };
     Ok((
@@ -1101,7 +1102,8 @@ pub(crate) fn resolve_jsonpath_args(
 
 /// The context node and compiled path of a jsonpath call (the shared front of the jsonpath query
 /// functions). A NULL context or path yields `None` (→ SQL NULL). A `jsonb` context is borrowed and
-/// a `json` one parsed; recompiling the path's canonical text charges `jsonpath_compile`
+/// a `json` one converted to `jsonb` (PostgreSQL casts it: keys canonical, duplicates last-wins —
+/// jsonpath.md §5); recompiling the path's canonical text charges `jsonpath_compile`
 /// (jsonpath.md §7). The caller evaluates with [`crate::jsonpath::eval`].
 pub(crate) fn jsonpath_operands<'v>(
     ctx: &'v Value,
@@ -1111,7 +1113,7 @@ pub(crate) fn jsonpath_operands<'v>(
     let node = match ctx {
         Value::Null => return Ok(None),
         Value::Jsonb(n) => Cow::Borrowed(n),
-        Value::Json(s) => Cow::Owned(json::parse_preserving(s)?),
+        Value::Json(s) => Cow::Owned(json::jsonb_in(s)?),
         _ => unreachable!("resolver restricts a json/jsonb function argument to json/jsonb"),
     };
     let text = match path {

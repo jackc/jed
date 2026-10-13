@@ -14,8 +14,9 @@
 > [json.md](json.md). PostgreSQL semantics are the default (CLAUDE.md §1), pinned against the
 > live `postgres:18` oracle; the lax/strict edge cases (§4) are subtle and oracle-pinned.
 
-> **Status: SPEC-FIRST (design ratified, implementation pending).** Implemented by the
-> P-series slices (§9), after the `jsonb` type foundation ([json.md §12](json.md), J0–J2).
+> **Status: landed in part.** The type, the structural accessors, filters, top-level predicates,
+> the query functions and operators, and the item methods (except the datetime family) are
+> implemented in all three cores; §9 lists what remains deferred (`0A000`).
 
 ---
 
@@ -64,8 +65,12 @@ accessor     ::= "." member                       (* .key  or  ."key with spaces
                | ".*"                             (* wildcard member *)
                | "[" subscript ( "," subscript )* "]"
                | "[" "*" "]"                      (* wildcard element *)
-               | "." method "(" arg? ")"          (* item method, §3 *)
+               | "." method "(" ")"               (* item method, §3.1 *)
+               | "." "decimal" "(" ( int ( "," int )? )? ")"
+               | "." "datetime" "(" string? ")"
+               | "." ( "time" | "time_tz" | "timestamp" | "timestamp_tz" ) "(" uint? ")"
                | "?" "(" predicate ")"            (* filter, §4 *)
+int          ::= ( "+" | "-" )? uint              (* an integer literal: 0, or no leading zero *)
 subscript    ::= path_expr ( "to" path_expr )?    (* index, or idx TO idx slice; "last" allowed *)
 arith_op     ::= "+" | "-" | "*" | "/" | "%"
 predicate    ::= predicate "||" predicate
@@ -78,9 +83,23 @@ predicate    ::= predicate "||" predicate
                | path_expr "starts" "with" ( string | "$" varname )
                | path_expr "is" "unknown"
 comparison   ::= "==" | "!=" | "<>" | "<" | "<=" | ">" | ">="
-method       ::= "type" | "size" | "double" | "ceiling" | "floor" | "abs"
-               | "keyvalue" | "datetime" | "bigint" | "number" | "boolean" | "string"
+method       ::= "type" | "size" | "double" | "ceiling" | "floor" | "abs" | "keyvalue"
+               | "bigint" | "boolean" | "integer" | "number" | "string" | "date"
 ```
+
+Method names are keywords matched case-insensitively (`$.TYPE()` is `.type()`); whitespace may
+separate the `.`, the name, and the `(`. Without the parentheses the same word is a member key
+(`$.type` is `$."type"`). An unknown method name, arguments where a method takes none, or more
+than two `.decimal()` arguments is `42601`.
+
+A literal primary takes accessors too (`"12".number()`, `null.type()`). A number literal followed
+by an accessor renders parenthesized (`1.5.type()` → `(1.5).type()`), and `(` *literal* `)` is
+accepted back, so the render round-trips; a parenthesized expression or predicate followed by an
+accessor is otherwise deferred (`0A000`). Number literals follow PostgreSQL's jsonpath scanner
+(`1`, `1.5`, `1.`, `.5`, `1e3`); a number running into a letter or digit (`1.type()`, `01`, `1e`)
+is trailing junk (`42601`). `-1.5.abs()` is unary minus applied to the path — arithmetic, deferred.
+Like jed's SQL literals (grammar.md §36), jsonpath numbers take no `_` digit separators and no
+hex/octal/binary prefixes, which PostgreSQL 16+ accepts.
 
 Faithful inclusions: `last` (array-length-minus-1 sentinel inside a subscript), `to` slices,
 named variables `$name` (bound by the `vars` argument, §5), `.datetime(template?)`,
@@ -135,6 +154,11 @@ items. This single abstraction unifies accessors, methods, filters, and the quer
 - **Result.** The query functions (§5) interpret the final sequence: exists = non-empty;
   query = one row per item; query_first = first or NULL; match = the sequence must be a
   single boolean.
+- **Depth-first order.** Like PostgreSQL's executor, each item a step emits runs through the rest of
+  the path before the step emits its next item. The sequence is the same as applying the steps one
+  after another, but the order fixes which error is raised first, lets an existence test stop early
+  (§5), and numbers `.keyvalue()` objects (§3.1). Each core runs the steps on an explicit stack of
+  step applications, so a long path does not deepen the native stack.
 
 Determinism is automatic: `jsonb` object members are stored in canonical key order
 ([json.md §2.3](json.md)) and array order is preserved, so `.*` and `.keyvalue()` emit in a
@@ -142,21 +166,70 @@ deterministic order across cores.
 
 ### 3.1 Item methods
 
-| method | on | result | error (non-applicable) |
-|---|---|---|---|
-| `.type()` | any | string (`"null"`/`"boolean"`/`"number"`/`"string"`/`"array"`/`"object"`) | — |
-| `.size()` | array (lax: any → 1) | number (element count) | — |
-| `.double()` | number / numeric-string | number | `2203A` cast failure / `22036` non-numeric |
-| `.ceiling()` / `.floor()` / `.abs()` | number | number | `22036` non-numeric |
-| `.bigint()` / `.number()` | number / string | number (`decimal`) | `2203A` / `22036` |
-| `.boolean()` | boolean / `"true"`/`"false"` / number | boolean | `2203A` |
-| `.string()` | scalar | string | `2203A` |
-| `.keyvalue()` | object | sequence of `{"key":k,"value":v,"id":n}` objects | `2203C` on non-object |
-| `.datetime(template?)` | string | a date/time `jsonb` scalar (zone via the `_tz` seam, §5.1) | `22031` bad arg |
+PostgreSQL's item methods, ported from `executeItemOptUnwrapTarget`. In lax mode every method
+except `.type()` and `.size()` applies to each element of an array item (one level — an element
+that is itself an array is not unwrapped again, so it fails the method's kind check). A method's
+result feeds the next step; a method follows `$`, `@`, or a literal.
 
-**Crucial:** item-method *coercion* failures (`.double()` on a non-number, etc.) are **not**
-suppressed by lax mode — only structural *navigation* failures are (§4.2). This is the
-classic PG-compat trap; both modes raise `2203A`/`22036` on a bad method coercion.
+| method | applies to | result | failure (code, message) |
+|---|---|---|---|
+| `.type()` | any | its JSON type name: `"null"` `"boolean"` `"number"` `"string"` `"array"` `"object"` | — |
+| `.size()` | any | an array's element count; lax: `1` for a non-array | strict non-array: `22039` |
+| `.abs()` `.floor()` `.ceiling()` | number | `numeric` `abs`/`floor`/`ceil` (floor/ceiling at scale 0) | `22036` "can only be applied to a numeric value" |
+| `.double()` | number, string | a number: the item itself, once its text reads as a finite double; a string: read as a double, then `float8_numeric` | `22036`: out of range (either way, `1e400`, `"1e-400"`) or unreadable "argument … is invalid for type double precision"; NaN/±Infinity; other kinds |
+| `.bigint()` `.integer()` | number, string | a number rounds half away from zero; a string is read with jed's integer grammar; must fit i64 / i32 | `22036` "argument … is invalid for type bigint/integer"; other kinds |
+| `.boolean()` | boolean, number, string | a number's text must read as an i32 (`1.0` fails), nonzero is true; a string by PostgreSQL's `parse_bool` (any prefix of `true`/`false`/`yes`/`no`, `on`, `off`/`of`, `1`, `0`, case-insensitive, no surrounding space) | `22036` "argument … is invalid for type boolean"; null/array/object |
+| `.number()` `.decimal()` | number, string | a number: the item itself; a string: read with jed's decimal grammar (keeping its written scale) | `22036`: unreadable, NaN/Infinity, other kinds |
+| `.decimal(p [, s])` | number, string | rounded half away from zero to scale `s` (default 0; negative rounds left of the point), then fewer than `p − s` digits before the point | `22036` overflow; precision/scale outside the integer range `22036`; precision outside 1..1000 or scale outside −1000..1000 `22023` |
+| `.string()` | boolean, number, string | `"true"`/`"false"`, the number's text, the string | `22036` null/array/object |
+| `.keyvalue()` | object | one `{"id", "key", "value"}` object per member, in key order | `2203C` non-object (both modes) |
+
+The failures are coercion failures: lax mode does **not** suppress them (§4.2). `22036` messages
+follow PostgreSQL's ("argument "x" of jsonpath item method .double() is invalid for type double
+precision", "jsonpath item method .abs() can only be applied to a numeric value", "NaN or Infinity
+is not allowed for jsonpath item method .number()").
+
+**`.double()` on a string** reads the text with `float8in` (surrounding whitespace, sign, digits,
+point, exponent; a nonzero mantissa that underflows to zero is out of range, a subnormal is kept)
+and converts the double back with PostgreSQL's `float8_numeric`: `%.15g`, the double's *exact*
+decimal expansion rounded to 15 significant digits with ties to even (glibc), trailing fractional
+zeros dropped, read back at scale `max(0, digits − exponent)`. `"0.1"` → `0.1`, `"1e20"` →
+`100000000000000000000`, `"1234567890123455"` → `1234567890123460`. Exact integer arithmetic on
+the binary64 value, so every core agrees; no float-render ledger entry is needed. A number item is
+returned as written — PostgreSQL validates it and keeps the `numeric`.
+
+**Number grammars.** `.bigint()`/`.integer()`/`.boolean()`/`.number()`/`.decimal()` read strings
+with jed's own integer and decimal grammars (grammar.md §36) and `.double()` with jed's float
+grammar (float.md §4). PostgreSQL 16+ also accepts `_` digit separators and hex/octal/binary
+integers (`"0x10".bigint()` is `16`), and its `float8in` accepts glibc's hex floats; jed reports
+`22036` for those, the same documented divergence as its SQL literals (a per-core test).
+
+**`.keyvalue()` ids.** `"id"` identifies the object a pair came from: PostgreSQL computes
+`10^10 × base + offset`, where `offset` is the object's byte offset inside its *base object* in
+PostgreSQL's binary jsonb layout. The base is the context item (number 0) while a `$` path runs,
+and the `.keyvalue()` object whose continuation is running for anything reached through one.
+`.keyvalue()` objects are numbered in evaluation order (depth-first, §3), starting one past the
+variable base objects the caller supplies: 2 for the `jsonb_path_*` functions (their default
+`vars` object counts as one), 1 for `@?`/`@@` and the SQL/JSON functions. The layout is a pure
+function of the value, so jed computes it arithmetically: a container starts 4-byte aligned with a
+4-byte header and one 4-byte entry per array element (two per object member), then the members'
+key bytes, then the element/value data; a string takes its UTF-8 bytes, `null`/`true`/`false` take
+none, and a number takes its aligned `numeric` datum — a 4-byte varlena header, a 2-byte (short)
+or 4-byte (long) header, and 2 bytes per base-10000 digit group from the most to the least
+significant nonzero group (short when the display scale ≤ 63 and the leading group's weight is in
+−64..63). A `.keyvalue()` object `{"id": i, "key": k, "value": v}` lays out its value at
+`align4(40 + size(i) + len(k))`. So `$[*].keyvalue()` over `[{"a": 1, "b": [1, 2]}, {"c": …}]`
+gives ids 12 and 72, and `$.keyvalue().value.keyvalue()` under `jsonb_path_query` gives
+`20000000048` for the first pair's value. A `.keyvalue()` object is an ordinary object to every
+other step (`.key`, `.*`, `.type()`, filters, comparisons); it is built as `jsonb` only when it is
+returned.
+
+**Deferred (`0A000`).** The datetime methods `.datetime([template])`, `.date()`, `.time([p])`,
+`.time_tz([p])`, `.timestamp([p])`, and `.timestamp_tz([p])`. Even without a template PostgreSQL
+runs its `to_timestamp` engine over a fixed list of ISO templates, with that engine's field-reading
+rules (`"20-01-05"` is year 20, `"10:00:00.+05"` reads microseconds) and its time zone abbreviation
+table (`"10:00:00PST"`), which jed has not decided to load (timezones.md §15); the methods also
+produce date/time items that PostgreSQL compares across types. They need that engine first.
 
 ---
 
@@ -194,13 +267,19 @@ as-is).
 
 5. A **navigation** failure — a missing object member, an out-of-range subscript, a type
    mismatch on a structural step — contributes **no item** in lax (the sequence is just
-   shorter), where strict raises `2203F` (member not found), `22033` (subscript), etc.
+   shorter), where strict raises: `2203A` for a missing member or a member accessor on a
+   non-object, `2203C` for `.*` on a non-object, `22039` for `[…]`/`[*]`/`.size()` on a
+   non-array, and `22033` for a subscript out of bounds — including a strict slice that runs past
+   either end or is reversed (`strict $[1 to 10]` over three elements). A subscript outside the
+   integer range is `22033` in both modes.
 6. **Item-method coercion failures are NOT suppressed** even in lax (§3.1). Lax suppresses
    *navigation* failures, not *coercion* failures.
 
-The `silent` argument of the query functions (§5) is **orthogonal**: when true it suppresses
-the remaining errors that even strict mode (and the singleton checks of `_match`/`_query_first`)
-would otherwise raise, returning NULL/false/empty instead.
+**Silent mode** is **orthogonal**: it suppresses the SQL/JSON (class `22`) errors that remain,
+ending the evaluation at the first one. `@?` then returns SQL NULL; `@@` decides on the items found
+before the error (`'[true, "x"]'::jsonb @@ '$[*].boolean()'` is true). Filter operands are always
+evaluated silently (§4.4 rule 1). A cost, budget, or cancellation error is never suppressed. The
+`silent` argument of the query functions (§5) is still deferred.
 
 ### 4.3 `like_regex` onto the Pike VM
 
@@ -226,14 +305,16 @@ truth value.
 ### 4.4 Predicate truth values
 
 A predicate is three-valued: **true**, **false**, or **unknown**. A comparison `l op r` is
-existential over every pair `(a, b)` of items from the two operand sequences (each a `@`/`$` path's
-items, unwrapped one level in lax — §4.1 rule 4 — or a single literal):
+existential over every pair `(a, b)` of items from the two operand sequences (each a `@`/`$`/literal
+path's items, unwrapped one level in lax — §4.1 rule 4 — or a single literal):
 
-1. **Operand errors.** A navigation error while evaluating an operand (possible only in strict: a
-   missing member, an out-of-range subscript, an accessor on the wrong type) makes the comparison
-   **unknown**; it never propagates (§4.2). In lax the same navigation produces an **empty**
-   sequence instead, and an empty operand makes the comparison **false** — so
-   `lax $ ? (!(@.a == 1))` keeps an item that has no `a`, and `strict` does not.
+1. **Operand errors.** A SQL/JSON error while evaluating an operand — a strict navigation error
+   (a missing member, an out-of-range subscript, an accessor on the wrong type) or, in either
+   mode, an item-method failure (`@.double()` on `"x"`) — makes the comparison **unknown**; it
+   never propagates (§4.2). The left operand is evaluated first; when it fails the right one is
+   not evaluated. In lax a navigation produces an **empty** sequence instead, and an empty operand
+   makes the comparison **false** — so `lax $ ? (!(@.a == 1))` keeps an item that has no `a`, and
+   `strict` does not.
 2. **Pairs.** Two scalars of the same type compare by that type's order — numbers numerically,
    strings by code point, `false < true`, and `null` equal to `null` — under every operator
    (`true > false` and `null <= null` are true). `null` against any other item, including an array
@@ -266,9 +347,20 @@ context, a `jsonpath`, and optional `vars jsonb` + `silent boolean` trailing arg
 | `jsonb_path_query_first(jsonb, jsonpath [, vars, silent])` | scalar | `jsonb` | first item, or NULL if empty |
 
 - **`vars`** — a `jsonb` object whose members bind the path's `$name` variables (substituted
-  as literal items during evaluation).
+  as literal items during evaluation). Deferred; the default `{}` object still counts as one base
+  object for `.keyvalue()` numbering (§3.1).
 - **`silent`** — suppress the errors that strict mode / singleton checks would raise,
-  returning NULL/false/empty (§4.2).
+  returning NULL/false/empty (§4.2). Deferred; the `@?`/`@@` operators are the silent forms.
+
+**Existence tests stop early.** `jsonb_path_exists`, `@?`, `JSON_EXISTS`, and a `JSON_TABLE`
+`EXISTS` column only ask whether the sequence is non-empty. In lax mode the evaluation stops at the
+first item, so an error a later item would raise is never reached
+(`jsonb_path_exists('[1, "a"]', '$[*].double()')` is true, while `'["a", 1]'` raises `22036`). A
+strict path is evaluated in full, as PostgreSQL requires the absence of errors.
+
+**A `json` context is converted to `jsonb`.** The SQL/JSON query functions and `JSON_TABLE` also
+accept a `json` context; PostgreSQL casts it to `jsonb` first, so keys are in canonical order and a
+duplicate key keeps its last value (`JSON_VALUE('{"a":1,"a":2}'::json, '$.a')` is `2`).
 
 ### 5.1 `_tz` variants
 
@@ -305,15 +397,16 @@ single-column `Table` and driven by per-kind row generators (the executor's `res
 
 | operator | meaning | result |
 |---|---|---|
-| `jsonb @? jsonpath` | `jsonb_path_exists` | `boolean` |
+| `jsonb @? jsonpath` | silent `jsonb_path_exists` | `boolean` |
 | `jsonb @@ jsonpath` | silent `jsonb_path_match` | `boolean` |
 
 New `[[operator]]` rows (kind `"json_path"`). The lexer's `@` arm (today only `@>`) gains
 `@?` and `@@` — the exact precedent set by `@>`/`<@`. The parser binds them at the
 containment-operator precedence level (the `@>` level); the resolver routes a `jsonb @?
 jsonpath` to the path-exists kernel — hand-written dispatch, like the `@>` containment
-dispatch. PostgreSQL's operator is the match function's `silent = true` form: when the path does
-not produce exactly one boolean item, `jsonb_path_match` raises `22038` but `@@` returns SQL NULL.
+dispatch. PostgreSQL's operators are the functions' `silent = true` forms with no `vars`: when the
+path does not produce exactly one boolean item, `jsonb_path_match` raises `22038` but `@@` returns
+SQL NULL, and a SQL/JSON error during evaluation makes `@?` SQL NULL (§4.2).
 
 ---
 
@@ -338,23 +431,29 @@ it compiles it again and charges.
 **`jsonpath_step`: path-evaluation work,** each charge guarded as it accrues:
 
 1. **Applying a step.** Applying a step to an item charges 1. Under lax unwrapping (§4.1), an
-   accessor or filter applied to an array is applied to each element instead, and each element
-   charges 1; the array itself does not. A lax subscript on a non-array (the singleton rule)
-   is one application.
-2. **Emitting items.** Each item a step emits charges 1, so `[*]` over N elements charges N.
+   accessor, filter, or item method applied to an array is applied to each element instead, and
+   each element charges 1; the array itself does not. A lax subscript on a non-array (the
+   singleton rule) is one application. An item method's own work (a conversion, a rounding, a
+   render) is a flat single pass over the item and charges nothing more (cost.md §3, "linear
+   single-pass work stays flat"), and so is the layout arithmetic behind a `.keyvalue()` id, done
+   at most once per evaluation over the context item.
+2. **Emitting items.** Each item a step emits charges 1, so `[*]` over N elements charges N, an
+   item method's result charges 1, and `.keyvalue()` charges 1 per pair object.
 3. **Member lookup.** `.key` charges 1 for each member it examines: members in stored order
    up to and including the first match, or all of them when the key is absent. Stored order is
-   canonical for `jsonb` and input order for a `json` context (§5), so the count is the same in
-   every core. `.*` emits every member and pays through rule 2.
+   canonical (a `json` context is converted to `jsonb`, §5), so the count is the same in every
+   core; a `.keyvalue()` object's members are `id`, `key`, `value` in that order. `.*` emits every
+   member and pays through rule 2.
 4. **Comparisons.** Each `(a, b)` pair an existential comparison (§4.4) tests charges 1, plus
    the extra a SQL comparison of the same values would charge: two strings
    `varlen_compare × (W − 1)`, with W the shorter length in code points, and two numbers
    `decimal_work × (work_linear(a, b) − 1)` ([cost.md](cost.md) §3). Pairs are tested
    left operand outer, right operand inner. Lax stops at the first true pair and strict at the
-   first unknown pair, so untested pairs charge nothing. Both operands are always evaluated,
-   left then right, and charge their own steps. A literal operand charges nothing, and
-   neither does the lax unwrapping of an array-valued operand item (§4.1): it only changes
-   which pairs exist.
+   first unknown pair, so untested pairs charge nothing. The left operand is evaluated first and
+   the right one only if the left succeeds (an error in the left makes the comparison unknown
+   without evaluating the right, as in PostgreSQL); each charges its own steps. A literal operand
+   charges nothing, and neither does the lax unwrapping of an array-valued operand item (§4.1): it
+   only changes which pairs exist.
 5. **Connectives and roots.** `&&`, `||`, `!`, seeding `$` or `@`, and producing a top-level
    predicate's single item charge nothing. Both operands of `&&` and `||` are always evaluated;
    there is no short-circuit.
@@ -362,10 +461,15 @@ it compiles it again and charges.
 A cost-ceiling, lifetime-budget, or cancellation error raised inside a filter operand
 propagates. Only SQL/JSON navigation errors make a comparison unknown (§4.2).
 
+An existence test in lax mode stops at the first item (§5), so the steps it never runs charge
+nothing.
+
 Results are not charged here. The query functions copy their result items out of the
 document: `jsonb_path_query` rows charge `generated_row` (§5.2), `jsonb_path_query_array` and a
 wrapped `JSON_QUERY` charge their built array as growth kernels (cost.md §8.1), and the other
-results are single sub-values of the document. Existence tests and matches copy nothing.
+results are single sub-values of the document or small method results. A `.keyvalue()` object
+refers to its member value instead of copying it until it is returned. Existence tests and
+matches copy nothing.
 
 ---
 
@@ -377,21 +481,23 @@ Register the SQL/JSON class-22 subcodes in [../errors/registry.toml](../errors/r
 
 | code | name | use |
 |---|---|---|
-| `2203A` | `sql_json_item_cannot_be_cast_to_target_type` | `.double()` / cast failure |
-| `2203C` | `sql_json_object_not_found` | object expected (`.keyvalue()` / strict member) |
-| `2203F` | `sql_json_member_not_found` | strict-mode missing member |
+| `22039` | `sql_json_array_not_found` | strict `[…]` / `[*]` / `.size()` on a non-array |
+| `2203A` | `sql_json_member_not_found` | strict missing member, or a member accessor on a non-object |
+| `2203C` | `sql_json_object_not_found` | `.keyvalue()` (both modes) / strict `.*` on a non-object |
+| `2203F` | `sql_json_scalar_required` | `JSON_VALUE` of an array or object |
 | `22030` | `duplicate_json_object_key_value` | `WITH UNIQUE KEYS` / `*_unique` agg |
 | `22031` | `invalid_argument_for_sql_json_datetime_function` | `.datetime()` bad arg |
 | `22032` | `invalid_json_text` | malformed JSON (path-surface parse) |
 | `22033` | `invalid_sql_json_subscript` | bad array subscript (strict) |
 | `22034` | `more_than_one_sql_json_item` | singleton required, >1 item |
 | `22035` | `no_sql_json_item` | `JSON_VALUE`/`JSON_QUERY` empty, no `ON EMPTY` default |
-| `22036` | `non_numeric_sql_json_item` | arithmetic / numeric method on a non-number |
+| `22036` | `non_numeric_sql_json_item` | every item-method coercion failure (§3.1) |
 | `22037` | `non_unique_keys_in_a_json_object` | object construction unique-keys |
 | `22038` | `singleton_sql_json_item_required` | `JSON_VALUE` requires a scalar; `jsonb_path_match` requires one boolean |
 
 Reuse existing codes where PG does: **`42601`** for a malformed path *literal* (syntax-error
-class, at resolve), **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
+class, at resolve), **`22023`** for a `.decimal()` precision or scale outside PostgreSQL's
+`numeric` typmod ranges, **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
 unsupported `s`/`m`/`x` regex flags (§4.3), and **`22P02`** for malformed JSON in the
 `json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)). A string escape that decodes
 to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1).
@@ -431,9 +537,16 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     error. A top-level predicate produces one item — `true`, `false`, or JSON `null` when unknown
     (§4.4), which `jsonb_path_match` and `@@` return as SQL NULL. A top-level predicate, queried, yields the boolean as a single item;
     it renders parenthesized (`($."a" == 1)`), which round-trips through compile. Capability
-    `expr.jsonpath_match`. **Still deferred (`0A000`):** item methods, arithmetic, the §4.3
-    Pike-VM `like_regex` / `starts with` / `is unknown` predicates, and `$name` variables —
-    the remaining open P2 follow-ons.
+    `expr.jsonpath_match`.
+  - **Item methods** ✅ — every PostgreSQL 18 item method except the datetime family (§3.1),
+    after `$`, `@`, or a literal; the depth-first evaluator (§3) with PostgreSQL's early stop for
+    existence tests (§5) and silent `@?`/`@@` (§4.2); `.keyvalue()` ids from PostgreSQL's binary
+    layout; a `json` context converted to `jsonb` (§5); PostgreSQL's strict subscript and
+    non-array codes (§4.2). Capability `expr.jsonpath_methods`. **Still deferred (`0A000`):** the
+    datetime methods (they need PostgreSQL's `to_timestamp` engine, §3.1), arithmetic, the §4.3
+    Pike-VM `like_regex` / `starts with` / `is unknown` / `exists` predicates, `$name` variables
+    and the `vars`/`silent` arguments, `.**`, and the `_tz` functions — the remaining open P2/P3
+    follow-ons.
 - **P3** — the `_tz` variants (§5.1): route `.datetime()` through the clock/tz seam,
   `stable` volatility. Small follow-on to P2.
 

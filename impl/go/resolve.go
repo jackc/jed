@@ -3703,7 +3703,7 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 	// `jsonb @? jsonpath` = jsonb_path_exists, `jsonb @@ jsonpath` = jsonb_path_match
 	// (jsonpath.md §6). Both reuse the jsonpath kernels.
 	case opJsonPathExists, opJsonPathMatch:
-		sym, fnKind := "@?", jpfExists
+		sym, fnKind := "@?", jpfExistsSilent
 		if b.Op == opJsonPathMatch {
 			sym, fnKind = "@@", jpfMatchSilent
 		}

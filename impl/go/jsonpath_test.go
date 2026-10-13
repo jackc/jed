@@ -1,10 +1,11 @@
 package jed
 
-// The jsonpath type (spec/design/jsonpath.md, slice P1a) — the per-core checks the conformance
-// corpus cannot express (CLAUDE.md §10): the deliberate PG divergences (the deferred P1b constructs
-// are 0A000, where PG compiles them; a jsonpath is non-comparable / a jsonpath column is 0A000).
-// The agreeing behavior (the canonical render, malformed → 42601) is oracle-clean in
-// suites/json/jsonpath_literal.test. Mirrors impl/rust/tests/jsonpath.rs.
+// The jsonpath type (spec/design/jsonpath.md) — the per-core checks the conformance corpus cannot
+// express (CLAUDE.md §10): the deliberate PG divergences (the deferred constructs are 0A000, where PG
+// compiles them; a jsonpath is non-comparable / a jsonpath column is 0A000; an item method reads a
+// string with jed's own number grammar). The agreeing behavior (the canonical render, malformed →
+// 42601, the item methods) is oracle-clean in suites/json/jsonpath_literal.test and
+// jsonpath_methods.test. Mirrors impl/rust/tests/jsonpath.rs.
 
 import "testing"
 
@@ -17,16 +18,21 @@ func jpErr(t *testing.T, db dbHandle, sql string) string {
 	return err.(*EngineError).Code()
 }
 
-// The still-deferred path-expression constructs — item methods .m(), arithmetic, like_regex /
+// The still-deferred path-expression constructs — the datetime item methods, arithmetic, like_regex /
 // starts-with top-level predicates, $name variables, non-literal subscripts — are a deferred 0A000
-// at compile (P1b added filters ?(comparison) and top-level comparison predicates, but not these).
-// PostgreSQL compiles them, so each is a documented divergence; the supported subset is oracle-clean
-// in suites/json/jsonpath_literal.test and jsonpath_query.test.
+// at compile. PostgreSQL compiles them, so each is a documented divergence; the supported subset is
+// oracle-clean in suites/json/jsonpath_literal.test, jsonpath_query.test, and jsonpath_methods.test.
 func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, path := range []string{
-		"$.a.size()",          // item method
+		"$.a.datetime()", // a datetime item method
+		`$.a.datetime("HH24")`,
+		"$.a.date()",
+		"$.a.time(3)",
+		"$.a.time_tz()",
+		"$.a.timestamp()",
+		"$.a.timestamp_tz(2)",
 		"$.a + 2",             // arithmetic
 		`$.a like_regex "x"`,  // a like_regex top-level predicate
 		`$.a starts with "x"`, // a starts-with top-level predicate
@@ -62,17 +68,16 @@ func TestJsonpathColumnIsUnsupported(t *testing.T) {
 	}
 }
 
-// A jsonpath using a STILL-deferred construct (an item method, like_regex in a filter, like_regex as
-// a top-level predicate) is 0A000 — it fails to compile. Filters ?(comparison) and top-level
-// comparison predicates ($.a == 1, for jsonb_path_match / @@) now compile (P1b), but item methods /
-// like_regex are a follow-on. PostgreSQL evaluates all of these, so each is a documented divergence;
-// the supported filter + query + match behavior is oracle-clean in suites/json/jsonpath_query.test.
+// A jsonpath using a STILL-deferred construct (a datetime method, like_regex in a filter, like_regex
+// as a top-level predicate) is 0A000 — it fails to compile. PostgreSQL evaluates these, so each is a
+// documented divergence; the supported filter + query + match + method behavior is oracle-clean in
+// suites/json/jsonpath_query.test and jsonpath_methods.test.
 func TestJsonpathDeferredConstructsAre0A000(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
-	// An item method.
-	if got := jpErr(t, db, "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')"); got != "0A000" {
-		t.Errorf("jsonb_path_query_array with an item method should be 0A000, got %s", got)
+	// A datetime item method.
+	if got := jpErr(t, db, `SELECT jsonb_path_query_array('["2020-01-01"]', '$[*].datetime()')`); got != "0A000" {
+		t.Errorf("jsonb_path_query_array with a datetime method should be 0A000, got %s", got)
 	}
 	// like_regex inside a filter (a non-comparison predicate).
 	if got := jpErr(t, db, "SELECT jsonb_path_exists('[\"x\"]', '$[*] ? (@ like_regex \"x\")')"); got != "0A000" {
@@ -93,6 +98,27 @@ func TestMalformedJsonpathIs42601(t *testing.T) {
 	for _, path := range []string{"$.", "$[", "$[1 to"} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "42601" {
 			t.Errorf("malformed path %q should be 42601, got %s", path, got)
+		}
+	}
+}
+
+// An item method reads a string with jed's OWN number grammars (grammar.md §36): decimal digits only,
+// no hex/octal/binary prefixes and no digit underscores, so those strings are 22036 where PostgreSQL
+// 16+ (int8in / numeric_in, and glibc strtod behind float8in) accepts them.
+func TestJsonpathMethodNumberGrammarDivergence(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	for _, c := range []struct{ doc, path string }{
+		{`"0x10"`, "$.bigint()"},
+		{`"1_000"`, "$.bigint()"},
+		{`"0o17"`, "$.integer()"},
+		{`"0x1A"`, "$.number()"},
+		{`"1_0"`, "$.decimal()"},
+		{`"0x10"`, "$.double()"},
+	} {
+		sql := "SELECT jsonb_path_query_first('" + c.doc + "', '" + c.path + "')"
+		if got := jpErr(t, db, sql); got != "22036" {
+			t.Errorf("%s %s should be 22036, got %s", c.doc, c.path, got)
 		}
 	}
 }

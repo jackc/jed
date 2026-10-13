@@ -6,25 +6,46 @@ import (
 	"unicode/utf8"
 )
 
-// The jsonpath type's compiler + canonical renderer (spec/design/jsonpath.md, slice P1a).
+// The jsonpath type's compiler, canonical renderer, and evaluator (spec/design/jsonpath.md).
 //
-// P1a is the LITERAL-ONLY surface (like J0 for json): the jsonpath scalar type, the
-// '…'::jsonpath / jsonpath '…' literal cast (compiled at resolve), and the canonical render
-// ($.a → $."a", lax omitted, strict kept). The structural-accessor subset is parsed here
-// ($, .key, .*, [subscripts], [*], numeric / last indices, to slices, lax/strict mode);
-// the eval engine, filters, item methods, arithmetic, like_regex, and $name variables are a
-// deferred P1b follow-on (a valid-PG path using one → 0A000 at compile). A malformed path is
-// 42601. The compiled program is a pure function of the source — kept byte-identical cross-core
-// by the conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
+// The compiled surface: lax/strict mode; a path primary ($, @ inside a filter, or a scalar literal)
+// followed by accessor steps (.key, .*, [subscripts], [*], numeric / last indices, to slices,
+// ?(filter), and the item methods of §3.1); a top-level comparison predicate. Still deferred (a
+// valid-PG path using one → 0A000 at compile): arithmetic, like_regex / starts with / is unknown /
+// exists predicates, $name variables, non-literal subscripts, .**, and the datetime methods. A
+// malformed path is 42601. The compiled program is a pure function of the source — kept
+// byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
+// codegenned). Mirrors impl/rust/src/jsonpath.rs.
 
-// JsonPath is a compiled jsonpath. The body is EITHER an accessor path (produces a sequence) or a
+// jsonPath is a compiled jsonpath. The body is EITHER an accessor path (produces a sequence) or a
 // top-level boolean predicate (`$.a == 1`, for jsonb_path_match / @@; jsonpath.md §6).
 type jsonPath struct {
 	Strict bool
-	// Path holds the accessor steps when Pred == nil; Pred holds a top-level predicate otherwise.
-	// Exactly one is meaningful (Go has no sum types): Pred == nil ⇒ an accessor-path body.
-	Path []jpStep
+	// Path holds the accessor path when Pred == nil; Pred holds a top-level predicate otherwise.
+	// Exactly one is meaningful (Go has no sum types).
+	Path jpPathExpr
 	Pred *jpPred
+}
+
+// jpPrimaryKind tags where a path starts.
+type jpPrimaryKind int
+
+const (
+	// jpRoot is `$` — the context item.
+	jpRoot jpPrimaryKind = iota
+	// jpCurrent is `@` — the item a filter is testing (filter context only).
+	jpCurrent
+	// jpLiteral is a scalar literal — a JSON number / string / boolean / null.
+	jpLiteral
+)
+
+// jpPathExpr is a path primary followed by accessor steps — the top-level path body and every
+// comparison operand. A literal primary with no steps is a plain literal operand.
+type jpPathExpr struct {
+	primary jpPrimaryKind
+	// lit holds the literal when primary == jpLiteral.
+	lit   JsonNode
+	steps []jpStep
 }
 
 // jpStepKind tags an accessor step.
@@ -41,6 +62,8 @@ const (
 	jpWildcardElement
 	// jpFilter is `?(predicate)` — keep only items for which the predicate is TRUE (§4).
 	jpFilter
+	// jpMethodStep is `.name(…)` — an item method (§3.1).
+	jpMethodStep
 )
 
 // jpStep is one accessor step.
@@ -52,11 +75,48 @@ type jpStep struct {
 	subs []jpSubscript
 	// pred holds the filter predicate when kind == jpFilter.
 	pred *jpPred
+	// method holds the item method when kind == jpMethodStep.
+	method jpMethod
 }
 
-// jpPredKind tags a filter predicate (jsonpath.md §4, the P1b comparison subset). 3-valued —
-// Not/And/Or follow SQL/JSON's Kleene logic, but a filter keeps an item only when the predicate is
-// definitely TRUE.
+// jpMethodKind tags an item method (jsonpath.md §3.1). The datetime family is still deferred (0A000).
+type jpMethodKind int
+
+const (
+	jmType jpMethodKind = iota
+	jmSize
+	jmDouble
+	jmCeiling
+	jmFloor
+	jmAbs
+	jmKeyValue
+	jmBigint
+	jmBoolean
+	jmInteger
+	jmNumber
+	jmString
+	jmDecimal
+)
+
+// jpMethodNames is each method's name as PostgreSQL spells it in an error message (jspOperationName),
+// indexed by jpMethodKind.
+var jpMethodNames = [...]string{
+	"type", "size", "double", "ceiling", "floor", "abs", "keyvalue",
+	"bigint", "boolean", "integer", "number", "string", "decimal",
+}
+
+// jpMethod is an item method. precision/scale hold `.decimal(p [, s])`'s optional integer arguments,
+// as written.
+type jpMethod struct {
+	kind             jpMethodKind
+	precision, scale *Decimal
+}
+
+func (m jpMethod) name() string { return jpMethodNames[m.kind] }
+
+// jpPredKind tags a filter predicate (jsonpath.md §4, the comparison subset). 3-valued — Not/And/Or
+// follow SQL/JSON's Kleene logic, but a filter keeps an item only when the predicate is definitely
+// TRUE.
 type jpPredKind int
 
 const (
@@ -76,29 +136,8 @@ type jpPred struct {
 	// left/right hold operand predicates for Or/And; left holds the inner predicate for Not.
 	left, right *jpPred
 	// cmpLeft/cmpRight/cmpOp hold the comparison operands and operator when kind == jpPredCompare.
-	cmpLeft, cmpRight jpFiltExpr
+	cmpLeft, cmpRight jpPathExpr
 	cmpOp             jpCmpOp
-}
-
-// jpFiltExprKind tags a comparison operand inside a filter: a `@`/`$`-rooted accessor path, or a
-// scalar literal.
-type jpFiltExprKind int
-
-const (
-	// jpFiltPath is a `@`-rooted (fromRoot == false) or `$`-rooted (true) accessor path.
-	jpFiltPath jpFiltExprKind = iota
-	// jpFiltLit is a scalar literal — a JSON number / string / boolean / null.
-	jpFiltLit
-)
-
-// jpFiltExpr is a comparison operand inside a filter.
-type jpFiltExpr struct {
-	kind jpFiltExprKind
-	// fromRoot/steps hold the accessor path when kind == jpFiltPath.
-	fromRoot bool
-	steps    []jpStep
-	// lit holds the literal node when kind == jpFiltLit.
-	lit JsonNode
 }
 
 // jpCmpOp is a jsonpath comparison operator (`==`, `!=`/`<>`, `<`, `<=`, `>`, `>=`).
@@ -120,15 +159,16 @@ type jpSubscript struct {
 	slice bool
 }
 
-// jpIndex is a subscript index: a non-negative integer literal or the `last` sentinel.
+// jpIndex is a subscript index: an integer literal (as written — evaluation rejects one outside the
+// integer range) or the `last` sentinel.
 type jpIndex struct {
 	// last is true for the `last` sentinel; otherwise number is the integer value.
 	last   bool
-	number int64
+	number Decimal
 }
 
 // jpUnsupported is a jsonpath construct that is valid in PostgreSQL but not yet supported by jed (a
-// deferred P1b follow-on): 0A000, a documented divergence.
+// deferred follow-on): 0A000, a documented divergence.
 func jpUnsupported(what string) *EngineError {
 	return newError(FeatureNotSupported, "jsonpath "+what+" is not supported yet")
 }
@@ -139,8 +179,8 @@ func jpMalformed(detail string) *EngineError {
 	return newError(SyntaxError, "invalid jsonpath: "+detail)
 }
 
-// Compile compiles a jsonpath source string (P1a structural subset). Malformed → 42601; a valid-PG
-// but unsupported construct → 0A000.
+// compile compiles a jsonpath source string. Malformed → 42601; a valid-PG but unsupported construct
+// → 0A000.
 func compile(src string) (jsonPath, error) {
 	p := &jpParser{s: []byte(src)}
 	p.skipWs()
@@ -153,8 +193,9 @@ func compile(src string) (jsonPath, error) {
 	}
 	p.skipWs()
 	// A parenthesized top-level predicate — `($.a == 1)`, which is also the canonical render of a
-	// top-level predicate, so this round-trips render → compile.
-	if c, ok := p.peek(); ok && c == '(' {
+	// top-level predicate, so this round-trips render → compile. A parenthesized literal (`(1.5)`,
+	// the render of a number literal followed by a step) starts a path instead.
+	if c, ok := p.peek(); ok && c == '(' && !p.parenLiteralAhead() {
 		pred, err := p.parsePred()
 		if err != nil {
 			return jsonPath{}, err
@@ -165,30 +206,19 @@ func compile(src string) (jsonPath, error) {
 		}
 		return jsonPath{Strict: strict, Pred: pred}, nil
 	}
-	// Remember the body start: if the accessor path turns out to be the LHS of a TOP-LEVEL
-	// predicate (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
+	// Remember the body start: if the path turns out to be the LHS of a TOP-LEVEL predicate
+	// (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
 	bodyStart := p.i
-	if !p.eat('$') {
-		// @, a variable, or a bare literal as a top-level path expression — the filter / scalar
-		// path-expression surface (a P1b follow-on).
-		return jsonPath{}, jpUnsupported("expressions other than a `$`-rooted accessor path")
-	}
-	// $name — a path variable (the $ immediately followed by a name char / quote) is a P1b
-	// follow-on (the bound-variable vars surface).
-	if c, ok := p.peek(); ok && (isMemberStart(c) || c == '"') {
-		return jsonPath{}, jpUnsupported("path variables `$name`")
-	}
-	steps, err := p.parseSteps()
+	expr, err := p.parsePathExpr(true)
 	if err != nil {
 		return jsonPath{}, err
 	}
 	p.skipWs()
-	// After the accessor path: a comparison / logical operator makes the whole thing a top-level
-	// predicate (re-parse from the body start as a predicate); arithmetic is a P1b follow-on.
+	// After the path: a comparison / logical operator makes the whole thing a top-level predicate
+	// (re-parse from the body start as a predicate); arithmetic is a deferred follow-on.
 	c, ok := p.peek()
 	if !ok {
-		// `$` alone is valid (the root document) — steps is empty in that case.
-		return jsonPath{Strict: strict, Path: steps}, nil
+		return jsonPath{Strict: strict, Path: expr}, nil
 	}
 	switch c {
 	case '=', '<', '>', '!', '&', '|':
@@ -219,7 +249,7 @@ func compile(src string) (jsonPath, error) {
 }
 
 // Render is the canonical render (spec/design/jsonpath.md §2): strict kept / lax omitted; member
-// keys quoted; [*], [i], [i to j] subscripts; matches PostgreSQL's jsonpath_out.
+// keys quoted; [*], [i], [i to j] subscripts; methods lowercase; matches PostgreSQL's jsonpath_out.
 func (jp jsonPath) Render() string {
 	var out strings.Builder
 	if jp.Strict {
@@ -232,13 +262,31 @@ func (jp jsonPath) Render() string {
 		out.WriteByte(')')
 		return out.String()
 	}
-	out.WriteByte('$')
-	writeSteps(jp.Path, &out)
+	writePathExpr(&jp.Path, &out)
 	return out.String()
 }
 
-// writeSteps renders an accessor-step sequence (shared by the path render and a filter's `@`/`$`
-// operand).
+// writePathExpr renders a path primary and its steps. A number literal followed by a step is
+// parenthesized (`(1.5).type()`), as PostgreSQL prints it.
+func writePathExpr(e *jpPathExpr, out *strings.Builder) {
+	switch e.primary {
+	case jpRoot:
+		out.WriteByte('$')
+	case jpCurrent:
+		out.WriteByte('@')
+	default:
+		if e.lit.Kind == JNumber && len(e.steps) > 0 {
+			out.WriteByte('(')
+			out.WriteString(jsonCompactOut(&e.lit))
+			out.WriteByte(')')
+		} else {
+			out.WriteString(jsonCompactOut(&e.lit))
+		}
+	}
+	writeSteps(e.steps, out)
+}
+
+// writeSteps renders an accessor-step sequence.
 func writeSteps(steps []jpStep, out *strings.Builder) {
 	for _, step := range steps {
 		switch step.kind {
@@ -268,6 +316,18 @@ func writeSteps(steps []jpStep, out *strings.Builder) {
 			out.WriteString("?(")
 			writePred(step.pred, out)
 			out.WriteByte(')')
+		case jpMethodStep:
+			out.WriteByte('.')
+			out.WriteString(step.method.name())
+			out.WriteByte('(')
+			if step.method.precision != nil {
+				out.WriteString(step.method.precision.Render())
+			}
+			if step.method.scale != nil {
+				out.WriteByte(',')
+				out.WriteString(step.method.scale.Render())
+			}
+			out.WriteByte(')')
 		}
 	}
 }
@@ -288,7 +348,7 @@ func writePred(pred *jpPred, out *strings.Builder) {
 		writePred(pred.left, out)
 		out.WriteByte(')')
 	default: // jpPredCompare
-		writeFiltExpr(&pred.cmpLeft, out)
+		writePathExpr(&pred.cmpLeft, out)
 		out.WriteByte(' ')
 		switch pred.cmpOp {
 		case jpCmpEq:
@@ -305,26 +365,24 @@ func writePred(pred *jpPred, out *strings.Builder) {
 			out.WriteString(">=")
 		}
 		out.WriteByte(' ')
-		writeFiltExpr(&pred.cmpRight, out)
+		writePathExpr(&pred.cmpRight, out)
 	}
 }
 
-func writeFiltExpr(e *jpFiltExpr, out *strings.Builder) {
-	if e.kind == jpFiltPath {
-		if e.fromRoot {
-			out.WriteByte('$')
-		} else {
-			out.WriteByte('@')
-		}
-		writeSteps(e.steps, out)
-		return
-	}
-	out.WriteString(jsonCompactOut(&e.lit))
-}
+// ---------------------------------------------------------------------------------------------
+// Evaluation (jsonpath.md §3-4) — the lax/strict ordered SQL/JSON item sequence.
+// ---------------------------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------------------------
-// Evaluation (jsonpath.md §3-4) — the lax/strict ordered jsonb-item sequence (P1b structural subset).
-// ---------------------------------------------------------------------------------------------
+// jpEvalOpts is how a caller consumes the sequence (jsonpath.md §5).
+type jpEvalOpts struct {
+	// exists is an existence test (jsonb_path_exists, @?, JSON_EXISTS): a lax path stops at its first
+	// item, so a later item's error is never reached. A strict path evaluates fully (§4.2).
+	exists bool
+	// vars is how many variable base objects the caller supplies (PostgreSQL counts one for the
+	// jsonb_path_* functions' vars argument, none for the operators and the SQL/JSON query
+	// functions). The first .keyvalue() object is numbered one past them (§3.1).
+	vars int64
+}
 
 // compileMetered compiles a path for evaluation, charging jsonpath_compile for each byte of the text
 // first (jsonpath.md §7). Every evaluation compiles its path; there is no cache.
@@ -336,256 +394,622 @@ func compileMetered(src string, m *costMeter) (jsonPath, error) {
 	return compile(src)
 }
 
-// chargeSteps charges n units of jsonpath_step and guards (jsonpath.md §7).
-func chargeSteps(m *costMeter, n int64) error {
-	m.Charge(costs.JsonpathStep * n)
-	return m.Guard()
-}
-
-// emit appends item to a step's output sequence, charging its one unit first (§7 rule 2).
-func emit(out []JsonNode, item *JsonNode, m *costMeter) ([]JsonNode, error) {
-	if err := chargeSteps(m, 1); err != nil {
+// Eval evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
+// (jsonpath.md §3). Generated items (method results, .keyvalue() objects, literals) are built; any
+// error propagates. Metered by jsonpath_step (§7).
+func (jp jsonPath) Eval(ctx JsonNode, opts jpEvalOpts, m *costMeter) ([]JsonNode, error) {
+	var items []jpItem
+	if err := jp.evalItems(&ctx, opts, m, &items); err != nil {
 		return nil, err
 	}
-	return append(out, *item), nil
+	return jpMaterializeAll(items), nil
 }
 
-// Eval evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
-// (jsonpath.md §3). Each accessor is a `seq → seq` map applied left to right. lax (the default)
-// auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); strict raises.
-// Metered by jsonpath_step (§7).
-func (jp jsonPath) Eval(ctx JsonNode, m *costMeter) ([]JsonNode, error) {
+// EvalSilent is Eval in PostgreSQL's silent mode (@?, @@): a SQL/JSON (class 22) error ends the
+// evaluation, returning the items found before it and errored = true. Any other error propagates.
+func (jp jsonPath) EvalSilent(ctx JsonNode, opts jpEvalOpts, m *costMeter) (seq []JsonNode, errored bool, err error) {
+	var items []jpItem
+	if err := jp.evalItems(&ctx, opts, m, &items); err != nil {
+		if !isSQLJSONError(err) {
+			return nil, false, err
+		}
+		errored = true
+	}
+	return jpMaterializeAll(items), errored, nil
+}
+
+func jpMaterializeAll(items []jpItem) []JsonNode {
+	out := make([]JsonNode, len(items))
+	for i := range items {
+		out[i] = items[i].materialize()
+	}
+	return out
+}
+
+func (jp jsonPath) evalItems(ctx *JsonNode, opts jpEvalOpts, m *costMeter, out *[]jpItem) error {
+	cx := &jpCtx{root: ctx, strict: jp.Strict, m: m, nextGen: 1 + opts.vars}
 	if jp.Pred != nil {
 		// A top-level predicate → a single item: its truth value as a boolean, or JSON null when
 		// unknown (§4.4).
-		v, err := evalPred(jp.Pred, &ctx, &ctx, jp.Strict, m)
+		truth, err := cx.evalPred(jp.Pred, jpDocItem(ctx), jpBase{})
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if v == nil {
-			return []JsonNode{{Kind: JNull}}, nil
+		if truth == nil {
+			*out = append(*out, jpValItem(JsonNode{Kind: JNull}))
+		} else {
+			*out = append(*out, jpValItem(JsonNode{Kind: JBool, B: *truth}))
 		}
-		return []JsonNode{{Kind: JBool, B: *v}}, nil
+		return nil
 	}
-	return evalSteps(jp.Path, &ctx, &ctx, jp.Strict, m)
+	seed := jpDocItem(ctx)
+	if jp.Path.primary == jpLiteral {
+		seed = jpValItem(jp.Path.lit)
+	}
+	return cx.runPath(jp.Path.steps, seed, jpBase{}, opts.exists && !jp.Strict, out)
 }
 
-// evalSteps evaluates an accessor-step sequence over a seed item, with root as the document `$` (for
-// a filter's `$`-rooted operand).
-func evalSteps(steps []jpStep, seed, root *JsonNode, strict bool, m *costMeter) ([]JsonNode, error) {
-	seq := []JsonNode{*seed}
-	for i := range steps {
-		var next []JsonNode
-		for j := range seq {
-			var err error
-			next, err = applyStep(&steps[i], &seq[j], strict, root, next, m)
-			if err != nil {
-				return nil, err
+// jpItemKind tags an item of the SQL/JSON sequence.
+type jpItemKind int
+
+const (
+	// jpItemDoc is a node of the context document.
+	jpItemDoc jpItemKind = iota
+	// jpItemVal is a scalar the evaluation produced: a path literal or an item-method result.
+	jpItemVal
+	// jpItemKv is a .keyvalue() object {"id": …, "key": …, "value": …}, materialized only on output.
+	jpItemKv
+)
+
+// jpItem is one item of the SQL/JSON sequence. node is the document node (jpItemDoc) or the owned
+// generated node (jpItemVal); kv the pair (jpItemKv).
+type jpItem struct {
+	kind jpItemKind
+	node *JsonNode
+	kv   *jpKvPair
+}
+
+// jpKvPair is one .keyvalue() pair object (jsonpath.md §3.1).
+type jpKvPair struct {
+	key   string
+	value jpItem
+	// id is the "id" member: the source object's id.
+	id int64
+	// generated is this object's own base-object number — the id prefix of a .keyvalue() applied
+	// within it.
+	generated int64
+}
+
+func jpDocItem(n *JsonNode) jpItem { return jpItem{kind: jpItemDoc, node: n} }
+
+func jpValItem(n JsonNode) jpItem { return jpItem{kind: jpItemVal, node: &n} }
+
+// scalarNode is the node of a document or generated item (nil for a .keyvalue() object).
+func (it jpItem) scalarNode() *JsonNode {
+	if it.kind == jpItemKv {
+		return nil
+	}
+	return it.node
+}
+
+// doc is the document node (nil for a generated item).
+func (it jpItem) doc() *JsonNode {
+	if it.kind == jpItemDoc {
+		return it.node
+	}
+	return nil
+}
+
+func (it jpItem) isDocKind(k JsonNodeKind) bool {
+	return it.kind == jpItemDoc && it.node.Kind == k
+}
+
+func (it jpItem) typeName() string {
+	if it.kind == jpItemKv {
+		return "object"
+	}
+	return jsonTypeofName(it.node)
+}
+
+// materialize is the item as a jsonb value; a .keyvalue() object is built.
+func (it jpItem) materialize() JsonNode {
+	if it.kind != jpItemKv {
+		return *it.node
+	}
+	return JsonNode{Kind: JObject, Obj: []JsonMember{
+		{Key: "id", Val: JsonNode{Kind: JNumber, Num: decimalFromInt64(it.kv.id)}},
+		{Key: "key", Val: JsonNode{Kind: JString, S: it.kv.key}},
+		{Key: "value", Val: it.kv.value.materialize()},
+	}}
+}
+
+// jpBase is the base object a .keyvalue() id is measured against (jsonpath.md §3.1): the context
+// item (kv == nil) while a $ path runs, or the .keyvalue() object whose continuation is running.
+type jpBase struct {
+	kv *jpKvPair
+}
+
+// jpCtx is the evaluation context shared by a path and the filter operands nested in it.
+type jpCtx struct {
+	root   *JsonNode
+	strict bool
+	m      *costMeter
+	// nextGen is the next .keyvalue() object number, assigned in evaluation order.
+	nextGen int64
+	// rootOffsets is each document container's byte offset in PostgreSQL's binary jsonb layout,
+	// computed on the first .keyvalue() that needs one.
+	rootOffsets map[*JsonNode]int64
+}
+
+// charge charges n units of jsonpath_step and guards (jsonpath.md §7).
+func (cx *jpCtx) charge(n int64) error {
+	cx.m.Charge(costs.JsonpathStep * n)
+	return cx.m.Guard()
+}
+
+// jpFrame is a step application in progress: step `step` applied to `item`, producing its outputs
+// lazily so each output's continuation runs before the next output is produced (PostgreSQL's
+// depth-first order, which fixes the error raised first, the early stop of an existence test, and
+// the .keyvalue() numbering).
+type jpFrame struct {
+	step int
+	item jpItem
+	base jpBase
+	// unwrap is whether lax auto-unwrapping applies to this item (§4.1); false for the elements of
+	// an unwrapped array, which are not unwrapped again.
+	unwrap  bool
+	started bool
+	// a, b are output cursors.
+	a, b int
+	// hasRange/from/to are the current subscript's resolved element range.
+	hasRange bool
+	to       int64
+	// kvID is the .keyvalue() id of this frame's object.
+	kvID int64
+}
+
+// jpOutKind is what a frame produces next.
+type jpOutKind int
+
+const (
+	// jpOutItem is an item for the following step (or the result), with its continuation's base.
+	jpOutItem jpOutKind = iota
+	// jpOutSub is one element of a lax-unwrapped array, to which the frame's step applies in turn.
+	jpOutSub
+	jpOutDone
+)
+
+// runPath runs steps over seed depth-first with an explicit stack (no native recursion per step),
+// appending each final item to out. stopAtFirst ends the run at the first final item.
+func (cx *jpCtx) runPath(steps []jpStep, seed jpItem, base jpBase, stopAtFirst bool, out *[]jpItem) error {
+	if len(steps) == 0 {
+		*out = append(*out, seed)
+		return nil
+	}
+	unwrap := !cx.strict
+	stack := []*jpFrame{{step: 0, item: seed, base: base, unwrap: unwrap}}
+	for len(stack) > 0 {
+		top := stack[len(stack)-1]
+		kind, item, itemBase, sub, err := cx.nextOut(steps, top)
+		if err != nil {
+			return err
+		}
+		switch kind {
+		case jpOutItem:
+			next := top.step + 1
+			if next == len(steps) {
+				*out = append(*out, item)
+				if stopAtFirst {
+					return nil
+				}
+			} else {
+				stack = append(stack, &jpFrame{step: next, item: item, base: itemBase, unwrap: unwrap})
 			}
+		case jpOutSub:
+			stack = append(stack, sub)
+		default:
+			stack = stack[:len(stack)-1]
 		}
-		seq = next
 	}
-	return seq, nil
+	return nil
 }
 
-func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []JsonNode, m *costMeter) ([]JsonNode, error) {
+// jpUnwraps is whether lax mode unwraps an array before applying this step (§4.1 rule 1). The
+// subscripts handle arrays themselves, and .type() / .size() describe the array.
+func jpUnwraps(step *jpStep) bool {
+	switch step.kind {
+	case jpMember, jpWildcardMember, jpFilter:
+		return true
+	case jpMethodStep:
+		return step.method.kind != jmType && step.method.kind != jmSize
+	default:
+		return false
+	}
+}
+
+// nextOut produces a frame's next output, charging its step application and each emitted item (§7).
+func (cx *jpCtx) nextOut(steps []jpStep, f *jpFrame) (jpOutKind, jpItem, jpBase, *jpFrame, error) {
+	step := &steps[f.step]
+	done := func() (jpOutKind, jpItem, jpBase, *jpFrame, error) {
+		return jpOutDone, jpItem{}, jpBase{}, nil, nil
+	}
+	fail := func(err error) (jpOutKind, jpItem, jpBase, *jpFrame, error) {
+		return jpOutDone, jpItem{}, jpBase{}, nil, err
+	}
+	if f.unwrap && jpUnwraps(step) && f.item.isDocKind(JArray) {
+		// lax: apply the step to each element instead (one level — an element array is not
+		// unwrapped again).
+		elems := f.item.node.Arr
+		if f.a < len(elems) {
+			e := &elems[f.a]
+			f.a++
+			return jpOutSub, jpItem{}, jpBase{}, &jpFrame{step: f.step, item: jpDocItem(e), base: f.base}, nil
+		}
+		return done()
+	}
+	strict := cx.strict
+	var child jpItem
+	found := false
 	switch step.kind {
 	case jpMember:
-		// lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
-		if !strict && item.Kind == JArray {
-			for k := range item.Arr {
-				var err error
-				out, err = memberAccess(&item.Arr[k], step.key, strict, out, m)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return out, nil
+		if f.started {
+			return done()
 		}
-		return memberAccess(item, step.key, strict, out, m)
+		f.started = true
+		if err := cx.charge(1); err != nil {
+			return fail(err)
+		}
+		c, ok, err := cx.memberOf(f.item, step.key)
+		if err != nil {
+			return fail(err)
+		}
+		child, found = c, ok
 	case jpWildcardMember:
-		if !strict && item.Kind == JArray {
-			for k := range item.Arr {
-				var err error
-				out, err = wildcardMember(&item.Arr[k], strict, out, m)
-				if err != nil {
-					return nil, err
-				}
+		if !f.started {
+			f.started = true
+			if err := cx.charge(1); err != nil {
+				return fail(err)
 			}
-			return out, nil
+			if f.item.typeName() != "object" {
+				if strict {
+					return fail(newError(SqlJsonObjectNotFound,
+						"jsonpath wildcard member accessor can only be applied to an object"))
+				}
+				return done()
+			}
 		}
-		return wildcardMember(item, strict, out, m)
+		i := f.a
+		f.a++
+		if d := f.item.doc(); d != nil {
+			if i < len(d.Obj) {
+				child, found = jpDocItem(&d.Obj[i].Val), true
+			}
+		} else if f.item.kind == jpItemKv {
+			child, found = jpKvMember(f.item.kv, i)
+		}
 	case jpSubscripts:
-		if err := chargeSteps(m, 1); err != nil {
-			return nil, err
-		}
-		// [i] on a non-array: lax treats the item as a singleton array (§4.1.2); strict raises.
-		var elems []JsonNode
-		if item.Kind == JArray {
-			elems = item.Arr
-		} else if !strict {
-			elems = []JsonNode{*item}
-		} else {
-			return nil, newError(InvalidSqlJsonSubscript,
-				"jsonpath array accessor can only be applied to an array")
-		}
-		for i := range step.subs {
-			var err error
-			out, err = subscript(elems, &step.subs[i], strict, out, m)
-			if err != nil {
-				return nil, err
+		if !f.started {
+			f.started = true
+			if err := cx.charge(1); err != nil {
+				return fail(err)
+			}
+			if strict && !f.item.isDocKind(JArray) {
+				return fail(newError(SqlJsonArrayNotFound, "jsonpath array accessor can only be applied to an array"))
 			}
 		}
-		return out, nil
-	case jpWildcardElement:
-		if err := chargeSteps(m, 1); err != nil {
-			return nil, err
+		// A non-array is a singleton array in lax (§4.1 rule 2).
+		isArray := f.item.isDocKind(JArray)
+		size := int64(1)
+		if isArray {
+			size = int64(len(f.item.node.Arr))
 		}
-		// [*] on a non-array: lax → the singleton item; strict raises.
-		if item.Kind == JArray {
-			for k := range item.Arr {
-				var err error
-				if out, err = emit(out, &item.Arr[k], m); err != nil {
-					return nil, err
+		for !found {
+			if !f.hasRange {
+				if f.a >= len(step.subs) {
+					return done()
 				}
-			}
-			return out, nil
-		}
-		if !strict {
-			return emit(out, item, m)
-		}
-		return nil, newError(InvalidSqlJsonSubscript,
-			"jsonpath wildcard array accessor can only be applied to an array")
-	default: // jpFilter
-		// `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
-		// predicate's `@` is the item, `$` is the document root. lax: a filter on an array unwraps
-		// it ONE level first, testing each element (§4.1.1); a nested array element is tested as-is.
-		if !strict && item.Kind == JArray {
-			for k := range item.Arr {
-				var err error
-				out, err = filterItem(step.pred, &item.Arr[k], root, strict, out, m)
+				from, to, err := jpSubscriptRange(&step.subs[f.a], size, strict)
 				if err != nil {
-					return nil, err
+					return fail(err)
 				}
+				f.hasRange, f.to, f.b = true, to, int(from)
 			}
-			return out, nil
+			if int64(f.b) <= f.to {
+				i := f.b
+				f.b++
+				if isArray {
+					child = jpDocItem(&f.item.node.Arr[i])
+				} else {
+					child = f.item
+				}
+				found = true
+			} else {
+				f.hasRange = false
+				f.a++
+			}
 		}
-		return filterItem(step.pred, item, root, strict, out, m)
+	case jpWildcardElement:
+		if !f.started {
+			f.started = true
+			if err := cx.charge(1); err != nil {
+				return fail(err)
+			}
+			if !f.item.isDocKind(JArray) {
+				if strict {
+					return fail(newError(SqlJsonArrayNotFound,
+						"jsonpath wildcard array accessor can only be applied to an array"))
+				}
+				// lax: the item is a singleton array.
+				if err := cx.charge(1); err != nil {
+					return fail(err)
+				}
+				return jpOutItem, f.item, f.base, nil, nil
+			}
+		}
+		if f.item.isDocKind(JArray) && f.a < len(f.item.node.Arr) {
+			child, found = jpDocItem(&f.item.node.Arr[f.a]), true
+			f.a++
+		}
+	case jpFilter:
+		// ?(predicate) — keep the item when the predicate is definitely TRUE (§4). The predicate's @
+		// is the item; $ is the context item.
+		if f.started {
+			return done()
+		}
+		f.started = true
+		if err := cx.charge(1); err != nil {
+			return fail(err)
+		}
+		truth, err := cx.evalPred(step.pred, f.item, f.base)
+		if err != nil {
+			return fail(err)
+		}
+		if isTrue(truth) {
+			child, found = f.item, true
+		}
+	default: // jpMethodStep
+		if step.method.kind == jmKeyValue {
+			return cx.nextKeyValue(f)
+		}
+		if f.started {
+			return done()
+		}
+		f.started = true
+		if err := cx.charge(1); err != nil {
+			return fail(err)
+		}
+		c, err := jpApplyMethod(step.method, f.item, strict)
+		if err != nil {
+			return fail(err)
+		}
+		child, found = c, true
+	}
+	if !found {
+		return done()
+	}
+	if err := cx.charge(1); err != nil {
+		return fail(err)
+	}
+	return jpOutItem, child, f.base, nil, nil
+}
+
+// nextKeyValue produces a .keyvalue() frame's next pair object: one per member, each the base of its
+// own continuation.
+func (cx *jpCtx) nextKeyValue(f *jpFrame) (jpOutKind, jpItem, jpBase, *jpFrame, error) {
+	if !f.started {
+		f.started = true
+		if err := cx.charge(1); err != nil {
+			return jpOutDone, jpItem{}, jpBase{}, nil, err
+		}
+		if f.item.typeName() != "object" {
+			return jpOutDone, jpItem{}, jpBase{}, nil, newError(SqlJsonObjectNotFound,
+				"jsonpath item method .keyvalue() can only be applied to an object")
+		}
+		f.kvID = cx.keyvalueID(f.item, f.base)
+	}
+	i := f.a
+	f.a++
+	var key string
+	var value jpItem
+	if d := f.item.doc(); d != nil {
+		if i >= len(d.Obj) {
+			return jpOutDone, jpItem{}, jpBase{}, nil, nil
+		}
+		key, value = d.Obj[i].Key, jpDocItem(&d.Obj[i].Val)
+	} else {
+		v, ok := jpKvMember(f.item.kv, i)
+		if !ok {
+			return jpOutDone, jpItem{}, jpBase{}, nil, nil
+		}
+		key, value = jpKvKeys[i], v
+	}
+	kv := &jpKvPair{key: key, value: value, id: f.kvID, generated: cx.nextGen}
+	cx.nextGen++
+	if err := cx.charge(1); err != nil {
+		return jpOutDone, jpItem{}, jpBase{}, nil, err
+	}
+	return jpOutItem, jpItem{kind: jpItemKv, kv: kv}, jpBase{kv: kv}, nil, nil
+}
+
+// jpKvKeys is the member names of a .keyvalue() object, in canonical key order.
+var jpKvKeys = [3]string{"id", "key", "value"}
+
+// jpKvMember is the i-th member value of a .keyvalue() object.
+func jpKvMember(kv *jpKvPair, i int) (jpItem, bool) {
+	switch i {
+	case 0:
+		return jpValItem(JsonNode{Kind: JNumber, Num: decimalFromInt64(kv.id)}), true
+	case 1:
+		return jpValItem(JsonNode{Kind: JString, S: kv.key}), true
+	case 2:
+		return kv.value, true
+	default:
+		return jpItem{}, false
 	}
 }
 
-func filterItem(pred *jpPred, item, root *JsonNode, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
-	if err := chargeSteps(m, 1); err != nil {
-		return nil, err
+// memberOf is `.key` on one item (§7 rule 3): one unit per member examined (stored order, up to and
+// including the first match). A missing member or a non-object raises in strict and yields nothing
+// in lax.
+func (cx *jpCtx) memberOf(item jpItem, key string) (jpItem, bool, error) {
+	var child jpItem
+	found := false
+	switch {
+	case item.isDocKind(JObject):
+		members := item.node.Obj
+		at := -1
+		for i := range members {
+			if members[i].Key == key {
+				at = i
+				break
+			}
+		}
+		examined := len(members)
+		if at >= 0 {
+			examined = at + 1
+			child, found = jpDocItem(&members[at].Val), true
+		}
+		if err := cx.charge(int64(examined)); err != nil {
+			return jpItem{}, false, err
+		}
+	case item.kind == jpItemKv:
+		at := -1
+		for i, k := range jpKvKeys {
+			if k == key {
+				at = i
+				break
+			}
+		}
+		examined := len(jpKvKeys)
+		if at >= 0 {
+			examined = at + 1
+			child, found = jpKvMember(item.kv, at)
+		}
+		if err := cx.charge(int64(examined)); err != nil {
+			return jpItem{}, false, err
+		}
+	case cx.strict:
+		return jpItem{}, false, newError(SqlJsonMemberNotFound, "jsonpath member accessor can only be applied to an object")
+	default:
+		return jpItem{}, false, nil
 	}
-	ok, err := evalPred(pred, item, root, strict, m)
+	if !found && cx.strict {
+		return jpItem{}, false, newError(SqlJsonMemberNotFound, "JSON object does not contain key \""+key+"\"")
+	}
+	return child, found, nil
+}
+
+// jpSubscriptRange resolves one subscript against an array of size elements → its inclusive
+// (from, to) range, clamped. An index outside the integer range raises in both modes; strict raises
+// on an out-of-bounds or reversed range, which lax just leaves (partly) empty.
+func jpSubscriptRange(sub *jpSubscript, size int64, strict bool) (int64, int64, error) {
+	resolve := func(i jpIndex) (int64, error) {
+		if i.last {
+			return size - 1, nil
+		}
+		v, ok := i.number.ToInt64Round()
+		if !ok || v < -2147483648 || v > 2147483647 {
+			return 0, newError(InvalidSqlJsonSubscript, "jsonpath array subscript is out of integer range")
+		}
+		return v, nil
+	}
+	from, err := resolve(sub.a)
 	if err != nil {
-		return nil, err
+		return 0, 0, err
 	}
-	if isTrue(ok) {
-		return emit(out, item, m)
+	to := from
+	if sub.slice {
+		if to, err = resolve(sub.b); err != nil {
+			return 0, 0, err
+		}
 	}
-	return out, nil
+	if strict && (from < 0 || from > to || to >= size) {
+		return 0, 0, newError(InvalidSqlJsonSubscript, "jsonpath array subscript is out of bounds")
+	}
+	return max(from, 0), min(to, size-1), nil
 }
 
-// evalPred evaluates a filter predicate to a Kleene truth value (a *bool: &true / &false / nil =
-// unknown — mirroring the Rust Option<bool>). Both operands of &&/|| are always evaluated (no
-// short-circuit), so their cost is fixed (§7).
-func evalPred(pred *jpPred, current, root *JsonNode, strict bool, m *costMeter) (*bool, error) {
-	switch pred.kind {
-	case jpPredOr:
-		x, err := evalPred(pred.left, current, root, strict, m)
-		if err != nil {
-			return nil, err
-		}
-		y, err := evalPred(pred.right, current, root, strict, m)
-		if err != nil {
-			return nil, err
-		}
-		switch {
-		case isTrue(x) || isTrue(y):
-			return boolPtr(true), nil
-		case isFalse(x) && isFalse(y):
-			return boolPtr(false), nil
-		default:
-			return nil, nil
-		}
-	case jpPredAnd:
-		x, err := evalPred(pred.left, current, root, strict, m)
-		if err != nil {
-			return nil, err
-		}
-		y, err := evalPred(pred.right, current, root, strict, m)
-		if err != nil {
-			return nil, err
-		}
-		switch {
-		case isFalse(x) || isFalse(y):
-			return boolPtr(false), nil
-		case isTrue(x) && isTrue(y):
-			return boolPtr(true), nil
-		default:
-			return nil, nil
-		}
-	case jpPredNot:
-		v, err := evalPred(pred.left, current, root, strict, m)
-		if err != nil {
-			return nil, err
-		}
-		if v == nil {
-			return nil, nil
-		}
-		return boolPtr(!*v), nil
-	default: // jpPredCompare
-		return evalCompare(&pred.cmpLeft, pred.cmpOp, &pred.cmpRight, current, root, strict, m)
-	}
-}
-
-func isTrue(b *bool) bool  { return b != nil && *b }
-func isFalse(b *bool) bool { return b != nil && !*b }
+func isTrue(b *bool) bool { return b != nil && *b }
 
 func boolPtr(b bool) *bool { return &b }
 
-// evalCompare is the existential comparison (§4.4) over every pair (a in lhs-seq, b in rhs-seq), left
-// outer. An operand navigation error → nil (unknown). lax: any true pair → true, else any incomparable
-// pair → unknown, else false (so an empty operand is false). strict: any incomparable pair → unknown,
-// even beside a true pair. Each tested pair charges its unit plus a SQL comparison's size extra (§7
-// rule 4).
-func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNode, strict bool, m *costMeter) (*bool, error) {
-	// Both operands are evaluated, left then right, even when the left one fails to navigate.
-	ls, lok, err := evalFiltExpr(l, current, root, strict, m)
-	if err != nil {
-		return nil, err
-	}
-	rs, rok, err := evalFiltExpr(r, current, root, strict, m)
-	if err != nil {
-		return nil, err
-	}
-	if !lok || !rok {
+// evalPred evaluates a filter predicate to a Kleene truth value (&true / &false / nil = unknown).
+// Both operands of &&/|| are always evaluated (no short-circuit), so their cost is fixed (§7).
+func (cx *jpCtx) evalPred(pred *jpPred, current jpItem, base jpBase) (*bool, error) {
+	switch pred.kind {
+	case jpPredOr, jpPredAnd:
+		x, err := cx.evalPred(pred.left, current, base)
+		if err != nil {
+			return nil, err
+		}
+		y, err := cx.evalPred(pred.right, current, base)
+		if err != nil {
+			return nil, err
+		}
+		if pred.kind == jpPredOr {
+			switch {
+			case isTrue(x) || isTrue(y):
+				return boolPtr(true), nil
+			case x != nil && y != nil:
+				return boolPtr(false), nil
+			}
+			return nil, nil
+		}
+		switch {
+		case (x != nil && !*x) || (y != nil && !*y):
+			return boolPtr(false), nil
+		case isTrue(x) && isTrue(y):
+			return boolPtr(true), nil
+		}
 		return nil, nil
+	case jpPredNot:
+		v, err := cx.evalPred(pred.left, current, base)
+		if err != nil || v == nil {
+			return nil, err
+		}
+		return boolPtr(!*v), nil
+	default:
+		return cx.evalCompare(&pred.cmpLeft, pred.cmpOp, &pred.cmpRight, current, base)
 	}
+}
+
+// evalCompare is an existential comparison (§4.4) over every pair (a in lhs-seq, b in rhs-seq), left
+// outer. An operand error → nil (unknown); the right operand is not evaluated when the left one
+// fails. lax: any true pair → true, else any incomparable pair → unknown, else false (so an empty
+// operand is false). strict: any incomparable pair → unknown, even beside a true pair. Each tested
+// pair charges its unit plus a SQL comparison's size extra (§7 rule 4).
+func (cx *jpCtx) evalCompare(l *jpPathExpr, op jpCmpOp, r *jpPathExpr, current jpItem, base jpBase) (*bool, error) {
+	ls, ok, err := cx.evalOperand(l, current, base)
+	if err != nil || !ok {
+		return nil, err
+	}
+	rs, ok, err := cx.evalOperand(r, current, base)
+	if err != nil || !ok {
+		return nil, err
+	}
+	strict := cx.strict
 	found := false
 	anyUnknown := false
 	for i := range ls {
 		for j := range rs {
-			if err := chargeSteps(m, 1); err != nil {
+			if err := cx.charge(1); err != nil {
 				return nil, err
 			}
-			a, b := &ls[i], &rs[j]
+			a, b := ls[i].scalarNode(), rs[j].scalarNode()
 			switch {
-			case a.Kind == JString && b.Kind == JString:
+			case a != nil && b != nil && a.Kind == JString && b.Kind == JString:
 				w := min(utf8.RuneCountInString(a.S), utf8.RuneCountInString(b.S))
-				m.Charge(costs.VarlenCompare * int64(max(w, 1)-1))
-				if err := m.Guard(); err != nil {
+				cx.m.Charge(costs.VarlenCompare * int64(max(w, 1)-1))
+				if err := cx.m.Guard(); err != nil {
 					return nil, err
 				}
-			case a.Kind == JNumber && b.Kind == JNumber:
-				m.Charge(costs.DecimalWork * (workLinear(a.Num, b.Num) - 1))
-				if err := m.Guard(); err != nil {
+			case a != nil && b != nil && a.Kind == JNumber && b.Kind == JNumber:
+				cx.m.Charge(costs.DecimalWork * (workLinear(a.Num, b.Num) - 1))
+				if err := cx.m.Guard(); err != nil {
 					return nil, err
 				}
 			}
-			c := compareNodes(a, op, b)
+			c := jpCompareItems(ls[i], op, rs[j])
 			switch {
 			case c == nil && strict:
 				return nil, nil
@@ -608,46 +1032,56 @@ func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNo
 	}
 }
 
-// evalFiltExpr evaluates a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton
-// literal. ok=false is a navigation error, which makes the comparison unknown rather than
-// propagating (§4.2: filter operands never raise, even in strict). A cost, budget, or cancellation
-// error still propagates (§7): only SQL/JSON (class 22) errors are navigation errors.
-func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool, m *costMeter) (seq []JsonNode, ok bool, err error) {
-	if e.kind == jpFiltLit {
-		return []JsonNode{e.lit}, true, nil
+// evalOperand evaluates a comparison operand to its item sequence (a path, or a singleton literal).
+// ok=false is a SQL/JSON error, which makes the comparison unknown rather than propagating (§4.2:
+// filter operands never raise). A cost, budget, or cancellation error still propagates (§7).
+func (cx *jpCtx) evalOperand(e *jpPathExpr, current jpItem, base jpBase) ([]jpItem, bool, error) {
+	seed, seedBase := current, base
+	switch e.primary {
+	case jpRoot:
+		seed, seedBase = jpDocItem(cx.root), jpBase{}
+	case jpLiteral:
+		seed = jpValItem(e.lit)
 	}
-	seed := current
-	if e.fromRoot {
-		seed = root
-	}
-	seq, err = evalSteps(e.steps, seed, root, strict, m)
-	if err != nil {
+	var seq []jpItem
+	if err := cx.runPath(e.steps, seed, seedBase, false, &seq); err != nil {
 		if isSQLJSONError(err) {
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
-	if strict {
+	if cx.strict {
 		return seq, true, nil
 	}
-	// lax: an array-valued operand item is unwrapped ONE level, so the existential comparison
-	// ranges over its elements (§4.1.4).
-	out := make([]JsonNode, 0, len(seq))
-	for i := range seq {
-		if seq[i].Kind == JArray {
-			out = append(out, seq[i].Arr...)
+	// lax: an array-valued operand item is unwrapped ONE level, so the existential comparison ranges
+	// over its elements (§4.1 rule 4).
+	out := make([]jpItem, 0, len(seq))
+	for _, item := range seq {
+		if item.isDocKind(JArray) {
+			for k := range item.node.Arr {
+				out = append(out, jpDocItem(&item.node.Arr[k]))
+			}
 		} else {
-			out = append(out, seq[i])
+			out = append(out, item)
 		}
 	}
 	return out, true, nil
 }
 
-// compareNodes compares two jsonb items under a jsonpath operator (§4.4; a *bool: &v / nil =
-// unknown). Same-type scalars compare by their order (numbers numerically, strings by code point,
+// jpCompareItems compares two items under a jsonpath operator (§4.4; a *bool: &v / nil = unknown).
+// Same-type scalars compare by their order (numbers numerically, strings by code point,
 // false < true, null = null) under every operator. null against any other item is `!=` and nothing
-// else. Any other pair (mixed non-null types, or two arrays/objects) is nil (unknown).
-func compareNodes(a *JsonNode, op jpCmpOp, b *JsonNode) *bool {
+// else. Any other pair (mixed non-null types, or two arrays/objects) is nil (unknown). A .keyvalue()
+// object is an object.
+func jpCompareItems(x jpItem, op jpCmpOp, y jpItem) *bool {
+	a, b := x.scalarNode(), y.scalarNode()
+	if a == nil || b == nil {
+		// An object against null is `!=`; against anything else it is not comparable.
+		if (a != nil && a.Kind == JNull) || (b != nil && b.Kind == JNull) {
+			return boolPtr(op == jpCmpNe)
+		}
+		return nil
+	}
 	var ord int
 	switch {
 	case a.Kind == JNumber && b.Kind == JNumber:
@@ -679,101 +1113,405 @@ func compareNodes(a *JsonNode, op jpCmpOp, b *JsonNode) *bool {
 	}
 }
 
-// memberAccess is `.key` on one item (§7 rules 1–3): one unit for the application, one per member
-// examined (stored order, up to and including the first match), and one for the emitted value.
-func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
-	if err := chargeSteps(m, 1); err != nil {
-		return nil, err
-	}
-	if item.Kind == JObject {
-		for i := range item.Obj {
-			if item.Obj[i].Key == key {
-				if err := chargeSteps(m, int64(i+1)); err != nil {
-					return nil, err
-				}
-				return emit(out, &item.Obj[i].Val, m)
-			}
-		}
-		if err := chargeSteps(m, int64(len(item.Obj))); err != nil {
-			return nil, err
-		}
-		if strict {
-			return nil, newError(SqlJsonItemCannotBeCastToTargetType,
-				"JSON object does not contain key \""+key+"\"")
-		}
-		// lax: a missing member contributes no item (§4.2 rule 5).
-		return out, nil
-	}
-	if strict {
-		return nil, newError(SqlJsonObjectNotFound,
-			"jsonpath member accessor can only be applied to an object")
-	}
-	// lax: a member accessor on a non-object/non-array contributes no item.
-	return out, nil
+// ---------------------------------------------------------------------------------------------
+// Item methods (jsonpath.md §3.1) — PostgreSQL's executeItemOptUnwrapTarget method arms.
+// ---------------------------------------------------------------------------------------------
+
+// jpNonNumeric is 22036 non_numeric_sql_json_item — the class every method coercion failure raises.
+func jpNonNumeric(msg string) error { return newError(NonNumericSqlJsonItem, msg) }
+
+// jpWrongKind is the "can only be applied to …" error of a method applied to the wrong kind of item.
+func jpWrongKind(m jpMethod, what string) error {
+	return jpNonNumeric("jsonpath item method ." + m.name() + "() can only be applied to " + what)
 }
 
-func wildcardMember(item *JsonNode, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
-	if err := chargeSteps(m, 1); err != nil {
-		return nil, err
-	}
-	if item.Kind == JObject {
-		for i := range item.Obj {
-			var err error
-			if out, err = emit(out, &item.Obj[i].Val, m); err != nil {
-				return nil, err
-			}
-		}
-		return out, nil
-	}
-	if strict {
-		return nil, newError(SqlJsonObjectNotFound,
-			"jsonpath wildcard member accessor can only be applied to an object")
-	}
-	return out, nil
+// jpBadArgument is the "argument … is invalid for type …" error of a failed conversion.
+func jpBadArgument(m jpMethod, arg, ty string) error {
+	return jpNonNumeric("argument \"" + arg + "\" of jsonpath item method ." + m.name() +
+		"() is invalid for type " + ty)
 }
 
-func subscript(elems []JsonNode, sub *jpSubscript, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
-	length := int64(len(elems))
-	resolve := func(idx jpIndex) int64 {
-		if idx.last {
-			return length - 1
+func jpNaNOrInfinity(m jpMethod) error {
+	return jpNonNumeric("NaN or Infinity is not allowed for jsonpath item method ." + m.name() + "()")
+}
+
+// jpApplyMethod applies a single-result item method (every method except .keyvalue()) to one item.
+func jpApplyMethod(m jpMethod, item jpItem, strict bool) (jpItem, error) {
+	node := item.scalarNode()
+	kindIs := func(k JsonNodeKind) bool { return node != nil && node.Kind == k }
+	switch m.kind {
+	case jmType:
+		return jpValItem(JsonNode{Kind: JString, S: item.typeName()}), nil
+	case jmSize:
+		n := int64(1) // lax: a non-array is a singleton array (§4.1 rule 3)
+		if kindIs(JArray) {
+			n = int64(len(node.Arr))
+		} else if strict {
+			return jpItem{}, newError(SqlJsonArrayNotFound, "jsonpath item method .size() can only be applied to an array")
 		}
-		return idx.number
-	}
-	if sub.slice {
-		from := resolve(sub.a)
-		if from < 0 {
-			from = 0
+		return jpValItem(JsonNode{Kind: JNumber, Num: decimalFromInt64(n)}), nil
+	case jmAbs, jmFloor, jmCeiling:
+		if !kindIs(JNumber) {
+			return jpItem{}, jpWrongKind(m, "a numeric value")
 		}
-		to := resolve(sub.b)
-		if to > length-1 {
-			to = length - 1
+		var v Decimal
+		var err error
+		switch m.kind {
+		case jmAbs:
+			v = node.Num.Abs()
+		case jmFloor:
+			v, err = node.Num.Floor()
+		default:
+			v, err = node.Num.Ceil()
 		}
-		for i := from; i <= to; i++ {
-			var err error
-			if out, err = emit(out, &elems[i], m); err != nil {
-				return nil, err
+		if err != nil {
+			return jpItem{}, err
+		}
+		return jpValItem(JsonNode{Kind: JNumber, Num: v}), nil
+	case jmDouble:
+		// A number is only checked to be a valid double (the item itself is the result); a string is
+		// read as a double and converted back the way PostgreSQL's float8_numeric does.
+		switch {
+		case kindIs(JNumber):
+			if _, err := jpFloat8In(m, node.Num.Render()); err != nil {
+				return jpItem{}, err
 			}
+			return item, nil
+		case kindIs(JString):
+			v, err := jpFloat8In(m, node.S)
+			if err != nil {
+				return jpItem{}, err
+			}
+			return jpValItem(JsonNode{Kind: JNumber, Num: decimalFromFloat64DblDig(v)}), nil
 		}
-		return out, nil
+		return jpItem{}, jpWrongKind(m, "a string or numeric value")
+	case jmBigint, jmInteger:
+		ty, st := "bigint", scalarInt64
+		if m.kind == jmInteger {
+			ty, st = "integer", scalarInt32
+		}
+		var v int64
+		switch {
+		case kindIs(JNumber):
+			// A number rounds half away from zero (numeric → int) and must fit the type.
+			r, ok := node.Num.ToInt64Round()
+			if !ok || !st.InRange(r) {
+				return jpItem{}, jpBadArgument(m, node.Num.Render(), ty)
+			}
+			v = r
+		case kindIs(JString):
+			r, err := parseIntLiteral(node.S, st)
+			if err != nil {
+				return jpItem{}, jpBadArgument(m, node.S, ty)
+			}
+			v = r
+		default:
+			return jpItem{}, jpWrongKind(m, "a string or numeric value")
+		}
+		return jpValItem(JsonNode{Kind: JNumber, Num: decimalFromInt64(v)}), nil
+	case jmBoolean:
+		var b bool
+		switch {
+		case kindIs(JBool):
+			return item, nil
+		case kindIs(JNumber):
+			// A number must read as an integer (its text through int4 input): nonzero is true.
+			text := node.Num.Render()
+			r, err := parseIntLiteral(text, scalarInt32)
+			if err != nil {
+				return jpItem{}, jpBadArgument(m, text, "boolean")
+			}
+			b = r != 0
+		case kindIs(JString):
+			v, ok := jpParseBool(node.S)
+			if !ok {
+				return jpItem{}, jpBadArgument(m, node.S, "boolean")
+			}
+			b = v
+		default:
+			return jpItem{}, jpWrongKind(m, "a boolean, string, or numeric value")
+		}
+		return jpValItem(JsonNode{Kind: JBool, B: b}), nil
+	case jmNumber, jmDecimal:
+		var num Decimal
+		var numstr string
+		switch {
+		case kindIs(JNumber):
+			num, numstr = node.Num, node.Num.Render()
+		case kindIs(JString):
+			d, err := jpNumericIn(m, node.S)
+			if err != nil {
+				return jpItem{}, err
+			}
+			num, numstr = d, node.S
+		default:
+			return jpItem{}, jpWrongKind(m, "a string or numeric value")
+		}
+		if m.kind == jmDecimal && m.precision != nil {
+			d, err := jpApplyTypmod(m, num, numstr)
+			if err != nil {
+				return jpItem{}, err
+			}
+			return jpValItem(JsonNode{Kind: JNumber, Num: d}), nil
+		}
+		if kindIs(JNumber) {
+			return item, nil
+		}
+		return jpValItem(JsonNode{Kind: JNumber, Num: num}), nil
+	default: // jmString
+		var s string
+		switch {
+		case kindIs(JString):
+			return item, nil
+		case kindIs(JNumber):
+			s = node.Num.Render()
+		case kindIs(JBool):
+			s = "false"
+			if node.B {
+				s = "true"
+			}
+		default:
+			return jpItem{}, jpWrongKind(m, "a boolean, string, numeric, or datetime value")
+		}
+		return jpValItem(JsonNode{Kind: JString, S: s}), nil
 	}
-	i := resolve(sub.a)
-	if i >= 0 && i < length {
-		return emit(out, &elems[i], m)
+}
+
+// jpFloat8In is PostgreSQL's float8in over a method argument: surrounding whitespace, a sign, digits
+// with an optional point and exponent, or the special spellings. A result that overflows binary64, or
+// a nonzero mantissa that underflows to zero, is out of range. NaN and ±Infinity are refused.
+func jpFloat8In(m jpMethod, text string) (float64, error) {
+	t := strings.Trim(text, litWhitespace)
+	v, err := parseFloatLiteral(t, scalarFloat64)
+	if err != nil {
+		return 0, jpBadArgument(m, text, "double precision")
 	}
-	if strict {
-		return nil, newError(InvalidSqlJsonSubscript,
-			"jsonpath array subscript is out of bounds")
+	if v != v || v > 1.7976931348623157e308 || v < -1.7976931348623157e308 {
+		return 0, jpNaNOrInfinity(m)
 	}
-	// lax: an out-of-range subscript contributes no item.
-	return out, nil
+	mantissa := t
+	if i := strings.IndexAny(t, "eE"); i >= 0 {
+		mantissa = t[:i]
+	}
+	if v == 0 && strings.ContainsAny(mantissa, "123456789") {
+		return 0, jpBadArgument(m, text, "double precision")
+	}
+	return v, nil
+}
+
+// jpNumericIn is PostgreSQL's numeric_in over a method argument (jed's own decimal grammar,
+// grammar.md §36), refusing NaN and ±Infinity with their own message.
+func jpNumericIn(m jpMethod, text string) (Decimal, error) {
+	if d, err := parseDecimalLiteral(text); err == nil {
+		if d, err = d.CheckCap(); err == nil {
+			return d, nil
+		}
+	}
+	word := toLowerASCII(strings.Trim(text, litWhitespace))
+	body := strings.TrimPrefix(strings.TrimPrefix(word, "+"), "-")
+	if len(word)-len(body) > 1 {
+		body = word
+	}
+	if word == "nan" || body == "infinity" || body == "inf" {
+		return Decimal{}, jpNaNOrInfinity(m)
+	}
+	return Decimal{}, jpBadArgument(m, text, "numeric")
+}
+
+// jpApplyTypmod is `.decimal(p [, s])`: round to numeric(p, s) (PostgreSQL's typmod rules —
+// precision 1..1000, scale −1000..1000, rounding half away from zero) and require fewer than p − s
+// integer digits.
+func jpApplyTypmod(m jpMethod, num Decimal, numstr string) (Decimal, error) {
+	asI32 := func(d Decimal) (int64, bool) {
+		v, ok := d.ToInt64Round()
+		return v, ok && v >= -2147483648 && v <= 2147483647
+	}
+	precision, ok := asI32(*m.precision)
+	if !ok {
+		return Decimal{}, jpNonNumeric("precision of jsonpath item method .decimal() is out of range for type integer")
+	}
+	scale := int64(0)
+	if m.scale != nil {
+		if scale, ok = asI32(*m.scale); !ok {
+			return Decimal{}, jpNonNumeric("scale of jsonpath item method .decimal() is out of range for type integer")
+		}
+	}
+	const maxP = int64(maxPrecision)
+	if precision < 1 || precision > maxP {
+		return Decimal{}, newError(InvalidParameterValue, "NUMERIC precision "+strconv.FormatInt(precision, 10)+
+			" must be between 1 and "+strconv.FormatInt(maxP, 10))
+	}
+	if scale < -maxP || scale > maxP {
+		return Decimal{}, newError(InvalidParameterValue, "NUMERIC scale "+strconv.FormatInt(scale, 10)+
+			" must be between "+strconv.FormatInt(-maxP, 10)+" and "+strconv.FormatInt(maxP, 10))
+	}
+	rounded, err := num.RoundPlaces(scale)
+	if err != nil {
+		return Decimal{}, jpBadArgument(m, numstr, "numeric")
+	}
+	// The digits from the point to the most significant nonzero digit must fit p − s.
+	intDigits := int64(rounded.Precision()) - int64(rounded.Scale)
+	if !rounded.IsZero() && intDigits > precision-scale {
+		return Decimal{}, jpBadArgument(m, numstr, "numeric")
+	}
+	return rounded, nil
+}
+
+// jpParseBool is PostgreSQL's parse_bool: case-insensitive true/false/yes/no and their prefixes, on,
+// off (or of), 1, 0 — with no surrounding whitespace.
+func jpParseBool(s string) (bool, bool) {
+	lower := toLowerASCII(s)
+	prefixOf := func(word string) bool { return lower != "" && strings.HasPrefix(word, lower) }
+	if lower == "" {
+		return false, false
+	}
+	switch lower[0] {
+	case 't':
+		if prefixOf("true") {
+			return true, true
+		}
+	case 'f':
+		if prefixOf("false") {
+			return false, true
+		}
+	case 'y':
+		if prefixOf("yes") {
+			return true, true
+		}
+	case 'n':
+		if prefixOf("no") {
+			return false, true
+		}
+	case 'o':
+		if lower == "on" {
+			return true, true
+		}
+		if len(lower) >= 2 && prefixOf("off") {
+			return false, true
+		}
+	case '1':
+		if len(lower) == 1 {
+			return true, true
+		}
+	case '0':
+		if len(lower) == 1 {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// ---------------------------------------------------------------------------------------------
+// .keyvalue() ids — byte offsets in PostgreSQL's binary jsonb layout (jsonpath.md §3.1).
+// ---------------------------------------------------------------------------------------------
+
+// keyvalueID is the id of a .keyvalue() object: 10^10 × base number + the object's byte offset inside
+// the base object, where the base is the context item (number 0) or the .keyvalue() object whose
+// continuation is running. PostgreSQL measures the offset in its binary jsonb layout, which is a pure
+// function of the value, so jed computes the same layout arithmetically.
+func (cx *jpCtx) keyvalueID(item jpItem, base jpBase) int64 {
+	const baseStride = int64(10_000_000_000)
+	if base.kv == nil {
+		if d := item.doc(); d != nil {
+			return cx.rootOffset(d)
+		}
+		return 0
+	}
+	kv := base.kv
+	var offset int64
+	switch {
+	case item.kind == jpItemKv && item.kv == kv:
+		offset = 0
+	case item.kind == jpItemDoc && kv.value.kind == jpItemDoc:
+		// A container inside the pair's value: the value's offset in the pair object plus the
+		// container's offset inside the value (both are 4-byte aligned, so the value's internal
+		// layout does not depend on where it sits).
+		valueAt := jpAlign4(40 + pgNumericSize(decimalFromInt64(kv.id)) + int64(len(kv.key)))
+		offset = valueAt + cx.rootOffset(item.node) - cx.rootOffset(kv.value.node)
+	}
+	return kv.generated*baseStride + offset
+}
+
+// rootOffset is a document container's offset in the context item's binary layout.
+func (cx *jpCtx) rootOffset(n *JsonNode) int64 {
+	if cx.rootOffsets == nil {
+		cx.rootOffsets = map[*JsonNode]int64{}
+		pgLayout(cx.root, 0, cx.rootOffsets)
+	}
+	return cx.rootOffsets[n]
+}
+
+func jpAlign4(off int64) int64 { return (off + 3) &^ 3 }
+
+// pgLayout lays n out at byte offset off the way PostgreSQL's convertJsonbValue does, recording each
+// container's start, and returns the end offset. A container is 4-byte aligned: a header word, one
+// 4-byte entry per element (two per object member — keys, then values), then the keys' bytes and the
+// element/value data. A string is its UTF-8 bytes, a number its aligned numeric datum, and
+// null/true/false take no data bytes.
+func pgLayout(n *JsonNode, off int64, offsets map[*JsonNode]int64) int64 {
+	switch n.Kind {
+	case JString:
+		return off + int64(len(n.S))
+	case JNumber:
+		return jpAlign4(off) + pgNumericSize(n.Num)
+	case JArray:
+		start := jpAlign4(off)
+		offsets[n] = start
+		p := start + 4 + 4*int64(len(n.Arr))
+		for i := range n.Arr {
+			p = pgLayout(&n.Arr[i], p, offsets)
+		}
+		return p
+	case JObject:
+		start := jpAlign4(off)
+		offsets[n] = start
+		p := start + 4 + 8*int64(len(n.Obj))
+		for i := range n.Obj {
+			p += int64(len(n.Obj[i].Key))
+		}
+		for i := range n.Obj {
+			p = pgLayout(&n.Obj[i].Val, p, offsets)
+		}
+		return p
+	default: // null, boolean
+		return off
+	}
+}
+
+// pgNumericSize is the byte size of PostgreSQL's numeric datum for d: a 4-byte varlena header, a
+// 2-byte header (short form) or 4 bytes (long form), and one 2-byte base-10000 digit per group from
+// the most to the least significant nonzero group. The short form needs a display scale ≤ 63 and a
+// weight (the leading group's power of 10000) in −64..=63. Zero has no digits.
+func pgNumericSize(d Decimal) int64 {
+	text := strings.TrimPrefix(d.Render(), "-")
+	intPart, frac, _ := strings.Cut(text, ".")
+	digits := intPart + frac
+	first := strings.IndexFunc(digits, func(r rune) bool { return r != '0' })
+	if first < 0 {
+		return 6
+	}
+	last := strings.LastIndexFunc(digits, func(r rune) bool { return r != '0' })
+	power := func(i int) int64 { return int64(len(intPart) - 1 - i) }
+	floorDiv4 := func(v int64) int64 {
+		if v < 0 {
+			return -((-v + 3) / 4)
+		}
+		return v / 4
+	}
+	weight := floorDiv4(power(first))
+	ndigits := weight - floorDiv4(power(last)) + 1
+	size := int64(8)
+	if d.Scale <= 63 && weight >= -64 && weight <= 63 {
+		size = 6
+	}
+	return size + 2*ndigits
 }
 
 func writeIndex(i jpIndex, out *strings.Builder) {
 	if i.last {
 		out.WriteString("last")
 	} else {
-		out.WriteString(strconv.FormatInt(i.number, 10))
+		out.WriteString(i.number.Render())
 	}
 }
 
@@ -817,6 +1555,12 @@ func isMemberCont(c byte) bool {
 		c == '_' || c == '$'
 }
 
+func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+func isIdentByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isASCIIDigit(c) || c == '_'
+}
+
 type jpParser struct {
 	s []byte
 	i int
@@ -824,6 +1568,8 @@ type jpParser struct {
 	// parenthesized group, `!`, and `&&`/`||` chain step, bounded by maxJSONDepth → 54001. Bounding
 	// it at the compiler bounds every derived walk (render, evaluate).
 	depth int
+	// inFilter is how many filters enclose the cursor — `@` is valid only inside one.
+	inFilter int
 }
 
 // deepen descends one program nesting level, enforcing maxJSONDepth (json.md §6.4). The caller
@@ -844,6 +1590,13 @@ func (p *jpParser) peek() (byte, bool) {
 	return 0, false
 }
 
+func (p *jpParser) peekAt(k int) (byte, bool) {
+	if p.i+k < len(p.s) {
+		return p.s[p.i+k], true
+	}
+	return 0, false
+}
+
 func (p *jpParser) eat(c byte) bool {
 	if pc, ok := p.peek(); ok && pc == c {
 		p.i++
@@ -852,53 +1605,39 @@ func (p *jpParser) eat(c byte) bool {
 	return false
 }
 
+// skipWs skips jsonpath whitespace (PostgreSQL's [ \t\n\r\f]).
 func (p *jpParser) skipWs() {
-	for p.i < len(p.s) && isAsciiWhitespace(p.s[p.i]) {
-		p.i++
+	for p.i < len(p.s) {
+		switch p.s[p.i] {
+		case ' ', '\t', '\n', '\r', '\f':
+			p.i++
+		default:
+			return
+		}
 	}
-}
-
-func isAsciiWhitespace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
 }
 
 // eatKeyword consumes kw if it appears as a whole WORD at the cursor — i.e. the following byte is
 // not an identifier-continuation character (so `last]`, `to `, `strict $` all match, but `lastfoo`
 // does not).
 func (p *jpParser) eatKeyword(kw string) bool {
-	kb := []byte(kw)
-	if p.i+len(kb) <= len(p.s) && string(p.s[p.i:p.i+len(kb)]) == kw {
-		after := p.i + len(kb)
-		if after >= len(p.s) {
-			p.i += len(kb)
-			return true
-		}
-		c := p.s[after]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
-			p.i += len(kb)
+	if p.i+len(kw) <= len(p.s) && string(p.s[p.i:p.i+len(kw)]) == kw {
+		after := p.i + len(kw)
+		if after >= len(p.s) || !isIdentByte(p.s[after]) {
+			p.i += len(kw)
 			return true
 		}
 	}
 	return false
 }
 
-// parseMember parses a member key after `.`: a bare identifier or a "…" quoted string.
-func (p *jpParser) parseMember() (string, error) {
-	if c, ok := p.peek(); ok && c == '"' {
-		return p.parseQuoted()
-	}
+// parseIdent parses a bare identifier (a member key or method name).
+func (p *jpParser) parseIdent() string {
 	start := p.i
-	for {
-		c, ok := p.peek()
-		if !ok || !isMemberCont(c) {
-			break
-		}
+	for p.i < len(p.s) && isMemberCont(p.s[p.i]) {
 		p.i++
 	}
-	if p.i == start {
-		return "", jpMalformed("empty member name")
-	}
-	return string(p.s[start:p.i]), nil
+	return string(p.s[start:p.i])
 }
 
 // parseQuoted parses a `"…"` jsonpath string — a port of PostgreSQL's jsonpath scanner escapes
@@ -1077,33 +1816,279 @@ func (p *jpParser) parseSubscripts() ([]jpSubscript, error) {
 	}
 }
 
-// parseSteps parses a sequence of accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, `?(filter)`),
-// stopping at the first non-accessor byte (EOF, a comparison/logical operator, `)`, etc).
+func (p *jpParser) parseIndex() (jpIndex, error) {
+	if p.eatKeyword("last") {
+		return jpIndex{last: true}, nil
+	}
+	c, ok := p.peek()
+	switch {
+	case !ok:
+		// A truncated path (no index where one is required) is malformed.
+		return jpIndex{}, jpMalformed("expected a subscript index")
+	case !(isASCIIDigit(c) || c == '-'):
+		// A non-numeric token starts an expression subscript ($.a, arithmetic) — a deferred
+		// follow-on.
+		return jpIndex{}, jpUnsupported("non-literal subscript expressions")
+	}
+	neg := p.eat('-')
+	start := p.i
+	for p.i < len(p.s) && isASCIIDigit(p.s[p.i]) {
+		p.i++
+	}
+	digits := string(p.s[start:p.i])
+	if digits == "" {
+		return jpIndex{}, jpMalformed("expected digits after `-`")
+	}
+	if len(digits) > 1 && digits[0] == '0' {
+		return jpIndex{}, jpMalformed("trailing junk after numeric literal")
+	}
+	return jpIndex{number: decimalFromDigitsScale(neg, digits, 0)}, nil
+}
+
+// parsePathExpr parses a path primary and its accessor steps. top is the root expression, where @ is
+// not allowed (PostgreSQL: "@ is not allowed in root expressions").
+func (p *jpParser) parsePathExpr(top bool) (jpPathExpr, error) {
+	p.skipWs()
+	if lit, ok := p.tryParenLiteral(); ok {
+		steps, err := p.parseSteps()
+		if err != nil {
+			return jpPathExpr{}, err
+		}
+		return jpPathExpr{primary: jpLiteral, lit: lit, steps: steps}, nil
+	}
+	c, _ := p.peek()
+	next, _ := p.peekAt(1)
+	var e jpPathExpr
+	switch {
+	case c == '$' && p.i < len(p.s):
+		p.i++
+		// $name — a path variable — is a deferred follow-on (the vars surface).
+		if nc, ok := p.peek(); ok && (isMemberStart(nc) || nc == '"') {
+			return jpPathExpr{}, jpUnsupported("path variables `$name`")
+		}
+		e.primary = jpRoot
+	case c == '@' && p.i < len(p.s):
+		if p.inFilter == 0 {
+			return jpPathExpr{}, jpMalformed("@ is not allowed in root expressions")
+		}
+		p.i++
+		e.primary = jpCurrent
+	case c == '"' && p.i < len(p.s):
+		s, err := p.parseQuoted()
+		if err != nil {
+			return jpPathExpr{}, err
+		}
+		e.primary, e.lit = jpLiteral, JsonNode{Kind: JString, S: s}
+	case p.i < len(p.s) && (isASCIIDigit(c) || (c == '.' && isASCIIDigit(next))):
+		n, err := p.parseNumber()
+		if err != nil {
+			return jpPathExpr{}, err
+		}
+		e.primary, e.lit = jpLiteral, n
+	case c == '-' && p.i+1 < len(p.s) && (isASCIIDigit(next) || next == '.'):
+		// A negative number. Followed by a step it is PostgreSQL's unary minus applied to the whole
+		// path (-1.5.abs() is -(1.5.abs())) — arithmetic, a deferred follow-on.
+		n, err := p.parseNumber()
+		if err != nil {
+			return jpPathExpr{}, err
+		}
+		steps, err := p.parseSteps()
+		if err != nil {
+			return jpPathExpr{}, err
+		}
+		if len(steps) > 0 {
+			return jpPathExpr{}, jpUnsupported("path arithmetic")
+		}
+		return jpPathExpr{primary: jpLiteral, lit: n}, nil
+	case (c == '-' || c == '+') && p.i < len(p.s):
+		return jpPathExpr{}, jpUnsupported("path arithmetic")
+	case p.eatKeyword("true"):
+		e.primary, e.lit = jpLiteral, JsonNode{Kind: JBool, B: true}
+	case p.eatKeyword("false"):
+		e.primary, e.lit = jpLiteral, JsonNode{Kind: JBool, B: false}
+	case p.eatKeyword("null"):
+		e.primary, e.lit = jpLiteral, JsonNode{Kind: JNull}
+	case p.eatKeyword("last"):
+		return jpPathExpr{}, jpMalformed("LAST is allowed only in array subscripts")
+	case top:
+		// A parenthesized expression, `exists (…)`, or another expression form — a deferred
+		// follow-on.
+		return jpPathExpr{}, jpUnsupported("expressions other than an accessor path")
+	case p.eatKeyword("exists"):
+		return jpPathExpr{}, jpUnsupported("exists predicates")
+	default:
+		return jpPathExpr{}, jpMalformed("expected a comparison operand")
+	}
+	steps, err := p.parseSteps()
+	if err != nil {
+		return jpPathExpr{}, err
+	}
+	e.steps = steps
+	return e, nil
+}
+
+// tryLiteral parses a scalar literal: a string, a number, true, false, or null. ok=false (cursor
+// unmoved) if none starts here.
+func (p *jpParser) tryLiteral() (JsonNode, bool) {
+	start := p.i
+	c, ok := p.peek()
+	switch {
+	case ok && c == '"':
+		if s, err := p.parseQuoted(); err == nil {
+			return JsonNode{Kind: JString, S: s}, true
+		}
+	case ok && (isASCIIDigit(c) || c == '-' || c == '.'):
+		if n, err := p.parseNumber(); err == nil {
+			return n, true
+		}
+	case p.eatKeyword("true"):
+		return JsonNode{Kind: JBool, B: true}, true
+	case p.eatKeyword("false"):
+		return JsonNode{Kind: JBool, B: false}, true
+	case p.eatKeyword("null"):
+		return JsonNode{Kind: JNull}, true
+	}
+	p.i = start
+	return JsonNode{}, false
+}
+
+// tryParenLiteral parses a parenthesized literal — `(1.5)`, PostgreSQL's render of a number literal
+// followed by a step. ok=false (cursor unmoved) if the parentheses hold anything else.
+func (p *jpParser) tryParenLiteral() (JsonNode, bool) {
+	start := p.i
+	if p.eat('(') {
+		p.skipWs()
+		if lit, ok := p.tryLiteral(); ok {
+			p.skipWs()
+			if p.eat(')') {
+				return lit, true
+			}
+		}
+	}
+	p.i = start
+	return JsonNode{}, false
+}
+
+// parenLiteralAhead is whether a parenthesized literal starts at the cursor.
+func (p *jpParser) parenLiteralAhead() bool {
+	start := p.i
+	_, ok := p.tryParenLiteral()
+	p.i = start
+	return ok
+}
+
+// parseNumber parses a number literal (PostgreSQL's jsonpath scanner: an integer, 1.5, 1., .5, an
+// exponent) → a Number node. A number running into a letter or digit is trailing junk.
+func (p *jpParser) parseNumber() (JsonNode, error) {
+	junk := func() (JsonNode, error) { return JsonNode{}, jpMalformed("trailing junk after numeric literal") }
+	neg := p.eat('-')
+	intStart := p.i
+	for p.i < len(p.s) && isASCIIDigit(p.s[p.i]) {
+		p.i++
+	}
+	intPart := string(p.s[intStart:p.i])
+	if len(intPart) > 1 && intPart[0] == '0' {
+		return junk()
+	}
+	frac := ""
+	if c, ok := p.peek(); ok && c == '.' {
+		nc, nok := p.peekAt(1)
+		switch {
+		case nok && isASCIIDigit(nc):
+			p.i++
+			start := p.i
+			for p.i < len(p.s) && isASCIIDigit(p.s[p.i]) {
+				p.i++
+			}
+			frac = string(p.s[start:p.i])
+		case nok && (isAsciiAlpha(nc) || nc == '_'):
+			return junk()
+		case nok && (nc == '*' || nc == '"' || nc == '[' || nc == '.'):
+			// A step follows the point.
+		case intPart != "":
+			// `1.` — a number with an empty fraction.
+			p.i++
+		}
+	}
+	hasExp := false
+	var exp int64
+	if c, ok := p.peek(); ok && (c == 'e' || c == 'E') {
+		p.i++
+		eneg := false
+		if p.eat('-') {
+			eneg = true
+		} else {
+			p.eat('+')
+		}
+		start := p.i
+		for p.i < len(p.s) && isASCIIDigit(p.s[p.i]) {
+			if exp < expLimit {
+				exp = min(exp*10+int64(p.s[p.i]-'0'), expLimit)
+			}
+			p.i++
+		}
+		if p.i == start {
+			return junk()
+		}
+		if eneg {
+			exp = -exp
+		}
+		hasExp = true
+	}
+	if c, ok := p.peek(); ok && isIdentByte(c) {
+		return junk()
+	}
+	if intPart == "" && frac == "" {
+		return JsonNode{}, jpMalformed("invalid number literal")
+	}
+	digits, scale := decimalFromParts(intPart, frac, hasExp, exp)
+	d, err := decimalFromDigitsScale(neg, digits, scale).CheckCap()
+	if err != nil {
+		return JsonNode{}, err
+	}
+	return JsonNode{Kind: JNumber, Num: d}, nil
+}
+
+// parseSteps parses a sequence of accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, `?(filter)`,
+// `.method(…)`), stopping at the first non-accessor byte (EOF, a comparison/logical operator, `)`,
+// etc).
 func (p *jpParser) parseSteps() ([]jpStep, error) {
 	var steps []jpStep
 	for {
 		p.skipWs()
 		c, ok := p.peek()
 		if !ok {
-			break
+			return steps, nil
 		}
 		switch c {
 		case '.':
 			p.i++
-			if p.eat('*') {
+			p.skipWs()
+			nc, ok := p.peek()
+			switch {
+			case p.eat('*'):
 				steps = append(steps, jpStep{kind: jpWildcardMember})
-			} else if nc, ok := p.peek(); ok && (nc == '"' || isMemberStart(nc)) {
-				m, err := p.parseMember()
+			case ok && nc == '"':
+				k, err := p.parseQuoted()
 				if err != nil {
 					return nil, err
 				}
-				// `.identifier(` is an item-method call (a P1b follow-on); a bare identifier
-				// is a member accessor.
+				steps = append(steps, jpStep{kind: jpMember, key: k})
+			case ok && isMemberStart(nc):
+				name := p.parseIdent()
+				save := p.i
+				p.skipWs()
 				if pc, ok := p.peek(); ok && pc == '(' {
-					return nil, jpUnsupported("item methods")
+					m, err := p.parseMethod(name)
+					if err != nil {
+						return nil, err
+					}
+					steps = append(steps, jpStep{kind: jpMethodStep, method: m})
+				} else {
+					p.i = save
+					steps = append(steps, jpStep{kind: jpMember, key: name})
 				}
-				steps = append(steps, jpStep{kind: jpMember, key: m})
-			} else {
+			default:
 				return nil, jpMalformed("expected a member name after `.`")
 			}
 		case '[':
@@ -1131,10 +2116,12 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			if err := p.deepen(); err != nil {
 				return nil, err
 			}
+			p.inFilter++
 			pred, err := p.parsePred()
 			if err != nil {
 				return nil, err
 			}
+			p.inFilter--
 			p.depth--
 			p.skipWs()
 			if !p.eat(')') {
@@ -1145,10 +2132,85 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			return steps, nil
 		}
 	}
-	return steps, nil
 }
 
-// parsePred parses a filter predicate (P1b comparison subset): `||` over `&&` over `!` / `(…)` /
+// parseMethod parses an item method's argument list (the cursor is at its `(`). Method names are
+// matched case-insensitively, like PostgreSQL's keywords.
+func (p *jpParser) parseMethod(name string) (jpMethod, error) {
+	p.i++ // (
+	p.skipWs()
+	lower := toLowerASCII(name)
+	var m jpMethod
+	switch lower {
+	case "datetime", "date", "time", "time_tz", "timestamp", "timestamp_tz":
+		return jpMethod{}, jpUnsupported("item method ." + lower + "()")
+	case "decimal":
+		var args []Decimal
+		if !p.eat(')') {
+			for {
+				d, err := p.parseIntArg()
+				if err != nil {
+					return jpMethod{}, err
+				}
+				args = append(args, d)
+				p.skipWs()
+				if p.eat(')') {
+					break
+				}
+				if !p.eat(',') {
+					return jpMethod{}, jpMalformed("expected `,` or `)` in .decimal() arguments")
+				}
+			}
+		}
+		if len(args) > 2 {
+			return jpMethod{}, jpMalformed(".decimal() can only have an optional precision[,scale]")
+		}
+		m.kind = jmDecimal
+		if len(args) > 0 {
+			m.precision = &args[0]
+		}
+		if len(args) > 1 {
+			m.scale = &args[1]
+		}
+		return m, nil
+	}
+	found := false
+	for k, n := range jpMethodNames {
+		if n == lower && jpMethodKind(k) != jmDecimal {
+			m.kind, found = jpMethodKind(k), true
+		}
+	}
+	if !found {
+		return jpMethod{}, jpMalformed("unknown item method ." + name + "()")
+	}
+	if !p.eat(')') {
+		return jpMethod{}, jpMalformed("item method ." + m.name() + "() takes no arguments")
+	}
+	return m, nil
+}
+
+// parseIntArg parses a .decimal() argument: an optionally signed integer literal.
+func (p *jpParser) parseIntArg() (Decimal, error) {
+	p.skipWs()
+	neg := false
+	if p.eat('-') {
+		neg = true
+	} else {
+		p.eat('+')
+	}
+	p.skipWs()
+	start := p.i
+	for p.i < len(p.s) && isASCIIDigit(p.s[p.i]) {
+		p.i++
+	}
+	digits := string(p.s[start:p.i])
+	if c, ok := p.peek(); digits == "" || (len(digits) > 1 && digits[0] == '0') || (ok && (isIdentByte(c) || c == '.')) {
+		return Decimal{}, jpMalformed("expected an integer .decimal() argument")
+	}
+	return decimalFromDigitsScale(neg, digits, 0), nil
+}
+
+// parsePred parses a filter predicate (the comparison subset): `||` over `&&` over `!` / `(…)` /
 // comparison.
 func (p *jpParser) parsePred() (*jpPred, error) {
 	left, err := p.parseAnd()
@@ -1223,7 +2285,7 @@ func (p *jpParser) parseNot() (*jpPred, error) {
 		}
 		return &jpPred{kind: jpPredNot, left: inner}, nil
 	}
-	if c, ok := p.peek(); ok && c == '(' {
+	if c, ok := p.peek(); ok && c == '(' && !p.parenLiteralAhead() {
 		p.i++
 		if err := p.deepen(); err != nil {
 			return nil, err
@@ -1242,10 +2304,10 @@ func (p *jpParser) parseNot() (*jpPred, error) {
 	return p.parseComparison()
 }
 
-// parseComparison parses `filter_expr cmp filter_expr` — the only leaf predicate this slice (`exists`
-// / `like_regex` / `starts with` / `is unknown` are a follow-on).
+// parseComparison parses `operand cmp operand` — the only leaf predicate this slice (`exists` /
+// `like_regex` / `starts with` / `is unknown` are a follow-on).
 func (p *jpParser) parseComparison() (*jpPred, error) {
-	left, err := p.parseFilterExpr()
+	left, err := p.parsePathExpr(false)
 	if err != nil {
 		return nil, err
 	}
@@ -1269,88 +2331,11 @@ func (p *jpParser) parseComparison() (*jpPred, error) {
 			"filter predicates other than a comparison (exists / like_regex / starts with)",
 		)
 	}
-	right, err := p.parseFilterExpr()
+	right, err := p.parsePathExpr(false)
 	if err != nil {
 		return nil, err
 	}
 	return &jpPred{kind: jpPredCompare, cmpLeft: left, cmpOp: op, cmpRight: right}, nil
-}
-
-// parseFilterExpr parses a comparison operand: a `@`/`$`-rooted accessor path, or a scalar literal.
-func (p *jpParser) parseFilterExpr() (jpFiltExpr, error) {
-	p.skipWs()
-	c, ok := p.peek()
-	if !ok {
-		return jpFiltExpr{}, jpMalformed("expected a comparison operand")
-	}
-	switch {
-	case c == '@':
-		p.i++
-		steps, err := p.parseSteps()
-		if err != nil {
-			return jpFiltExpr{}, err
-		}
-		return jpFiltExpr{kind: jpFiltPath, fromRoot: false, steps: steps}, nil
-	case c == '$':
-		p.i++
-		if nc, ok := p.peek(); ok && (isMemberStart(nc) || nc == '"') {
-			return jpFiltExpr{}, jpUnsupported("path variables `$name`")
-		}
-		steps, err := p.parseSteps()
-		if err != nil {
-			return jpFiltExpr{}, err
-		}
-		return jpFiltExpr{kind: jpFiltPath, fromRoot: true, steps: steps}, nil
-	case c == '"':
-		s, err := p.parseQuoted()
-		if err != nil {
-			return jpFiltExpr{}, err
-		}
-		return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JString, S: s}}, nil
-	case (c >= '0' && c <= '9') || c == '-':
-		n, err := p.parseNumber()
-		if err != nil {
-			return jpFiltExpr{}, err
-		}
-		return jpFiltExpr{kind: jpFiltLit, lit: n}, nil
-	default:
-		switch {
-		case p.eatKeyword("true"):
-			return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JBool, B: true}}, nil
-		case p.eatKeyword("false"):
-			return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JBool, B: false}}, nil
-		case p.eatKeyword("null"):
-			return jpFiltExpr{kind: jpFiltLit, lit: JsonNode{Kind: JNull}}, nil
-		default:
-			return jpFiltExpr{}, jpMalformed("expected a comparison operand")
-		}
-	}
-}
-
-// parseNumber parses a JSON number literal in a filter (integer or decimal) → a Number node. Reuses
-// the json number parser (a bare number is valid JSON).
-func (p *jpParser) parseNumber() (JsonNode, error) {
-	start := p.i
-	if c, ok := p.peek(); ok && c == '-' {
-		p.i++
-	}
-	for {
-		c, ok := p.peek()
-		if !ok {
-			break
-		}
-		if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
-			p.i++
-		} else {
-			break
-		}
-	}
-	text := string(p.s[start:p.i])
-	n, err := jsonbIn(text)
-	if err != nil || n.Kind != JNumber {
-		return JsonNode{}, jpMalformed("invalid number literal")
-	}
-	return n, nil
 }
 
 // eatOp consumes a multi-byte operator token if it appears at the cursor.
@@ -1360,38 +2345,4 @@ func (p *jpParser) eatOp(op string) bool {
 		return true
 	}
 	return false
-}
-
-func (p *jpParser) parseIndex() (jpIndex, error) {
-	if p.eatKeyword("last") {
-		return jpIndex{last: true}, nil
-	}
-	c, ok := p.peek()
-	switch {
-	case !ok:
-		// A truncated path (no index where one is required) is malformed.
-		return jpIndex{}, jpMalformed("expected a subscript index")
-	case !((c >= '0' && c <= '9') || c == '-'):
-		// A non-numeric token starts an expression subscript ($.a, arithmetic) — a P1b follow-on.
-		return jpIndex{}, jpUnsupported("non-literal subscript expressions")
-	}
-	start := p.i
-	if pc, ok := p.peek(); ok && pc == '-' {
-		p.i++
-	}
-	for {
-		dc, ok := p.peek()
-		if !ok || dc < '0' || dc > '9' {
-			break
-		}
-		p.i++
-	}
-	if p.i == start+1 && p.s[start] == '-' {
-		return jpIndex{}, jpMalformed("expected digits after `-`")
-	}
-	n, err := strconv.ParseInt(string(p.s[start:p.i]), 10, 64)
-	if err != nil {
-		return jpIndex{}, jpMalformed("subscript out of range")
-	}
-	return jpIndex{number: n}, nil
 }

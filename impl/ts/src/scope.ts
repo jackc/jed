@@ -3047,13 +3047,15 @@ export function renderRExpr(e: RExpr): string {
       return explainCall(
         e.pathFnKind === "exists"
           ? "jsonb_path_exists"
-          : e.pathFnKind === "queryFirst"
-            ? "jsonb_path_query_first"
-            : e.pathFnKind === "queryArray"
-              ? "jsonb_path_query_array"
-              : e.pathFnKind === "match"
-                ? "jsonb_path_match"
-                : "jsonb_path_match_silent",
+          : e.pathFnKind === "existsSilent"
+            ? "jsonb_path_exists_silent"
+            : e.pathFnKind === "queryFirst"
+              ? "jsonb_path_query_first"
+              : e.pathFnKind === "queryArray"
+                ? "jsonb_path_query_array"
+                : e.pathFnKind === "match"
+                  ? "jsonb_path_match"
+                  : "jsonb_path_match_silent",
         e.args,
       );
     case "jsonSqlFn":

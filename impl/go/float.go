@@ -364,6 +364,43 @@ func exactDecimalFromFloat64(f float64) Decimal {
 	return decimalFromDigitsScale(dneg, digits, scale)
 }
 
+// decimalFromFloat64DblDig is PostgreSQL's float8_numeric: the binary64 value printed with %.15g
+// (DBL_DIG significant digits) and read back as a numeric. The digits come from the EXACT decimal
+// expansion (exactDecimalFromFloat64), rounded to 15 significant digits half-to-even (glibc's printf
+// rounds the exact value to nearest, ties to even), with trailing fractional zeros trimmed — %g drops
+// them, and an exponent form reads back at display scale max(0, digits − exponent). Pure integer
+// arithmetic, so every core agrees bit-for-bit. Used by the jsonpath .double() method
+// (spec/design/jsonpath.md §3.1); the caller has already rejected NaN and ±Infinity.
+func decimalFromFloat64DblDig(f float64) Decimal {
+	const dblDig = 15
+	exact := exactDecimalFromFloat64(f)
+	digits := exact.Precision()
+	if digits <= dblDig {
+		return exact
+	}
+	drop := digits - dblDig
+	pow := magPow10(drop)
+	q, r := magDivMod(exact.Limbs, pow)
+	roundUp := false
+	switch magCmp(magAdd(r, r), pow) {
+	case 1:
+		roundUp = true
+	case 0:
+		roundUp = len(q) > 0 && q[0]%2 == 1
+	}
+	if roundUp {
+		q = magAdd(q, []uint32{1})
+	}
+	var rounded Decimal
+	if exact.Scale >= drop {
+		rounded = newDecimal(exact.Neg, exact.Scale-drop, q)
+	} else {
+		rounded = newDecimal(exact.Neg, 0, magMulPow10(q, drop-exact.Scale))
+	}
+	neg, cdigits, cscale := rounded.canonical()
+	return decimalFromDigitsScale(neg, cdigits, cscale)
+}
+
 // decimalToFloat64 converts a decimal to the nearest binary64, round-ties-to-even via Go's
 // correctly-rounded strconv.ParseFloat over the decimal's canonical string. A finite decimal
 // whose magnitude overflows binary64 traps 22003 (the §3 finite-overflow rule — NOT ±Inf).

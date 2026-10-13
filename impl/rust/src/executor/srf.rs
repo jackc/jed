@@ -712,11 +712,15 @@ impl Engine {
         if matches!(ctx, Value::Null) {
             return Ok(Vec::new());
         }
-        let node = json_arg_node(&ctx)?;
+        // A `json` context is converted to `jsonb`, as PostgreSQL casts it (jsonpath.md §5).
+        let node = match &ctx {
+            Value::Json(s) => json::jsonb_in(s)?,
+            other => json_arg_node(other)?,
+        };
         // The root path → the sequence of row items (a structural error here yields no rows).
         let root = crate::jsonpath::compile_metered(&plan.root_path, meter)?;
         // A navigation error yields no rows; a cost abort propagates (jsonpath.md §7).
-        let items = match crate::jsonpath::eval(&root, &node, meter) {
+        let items = match crate::jsonpath::eval(&root, &node, JT_EVAL, meter) {
             Ok(items) => items,
             Err(e) if e.code().starts_with("22") => Vec::new(),
             Err(e) => return Err(e),
@@ -1438,7 +1442,12 @@ impl Engine {
                     _ => unreachable!("resolver restricts the path argument to jsonpath"),
                 };
                 let compiled = crate::jsonpath::compile_metered(text, meter)?;
-                for item in crate::jsonpath::eval(&compiled, &node, meter)? {
+                // PostgreSQL's default `vars` object is one base object (jsonpath.md §3.1).
+                let opts = crate::jsonpath::EvalOpts {
+                    exists: false,
+                    vars: 1,
+                };
+                for item in crate::jsonpath::eval(&compiled, &node, opts, meter)? {
                     meter.guard()?;
                     meter.charge(COSTS.generated_row);
                     out.push(vec![Value::Jsonb(item.into_owned())]);

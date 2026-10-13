@@ -58,12 +58,14 @@ pub enum SqlState {
     ArraySubscriptError,
     /// 22030 — duplicate JSON object key value
     DuplicateJsonObjectKeyValue,
+    /// 22039 — {detail}
+    SqlJsonArrayNotFound,
     /// 2203A — {detail}
-    SqlJsonItemCannotBeCastToTargetType,
+    SqlJsonMemberNotFound,
     /// 2203C — {detail}
     SqlJsonObjectNotFound,
     /// 2203F — {detail}
-    SqlJsonMemberNotFound,
+    SqlJsonScalarRequired,
     /// 22031 — {detail}
     InvalidArgumentForSqlJsonDatetimeFunction,
     /// 22033 — {detail}
@@ -229,9 +231,10 @@ impl SqlState {
             SqlState::InvalidRegularExpression => "2201B",
             SqlState::ArraySubscriptError => "2202E",
             SqlState::DuplicateJsonObjectKeyValue => "22030",
-            SqlState::SqlJsonItemCannotBeCastToTargetType => "2203A",
+            SqlState::SqlJsonArrayNotFound => "22039",
+            SqlState::SqlJsonMemberNotFound => "2203A",
             SqlState::SqlJsonObjectNotFound => "2203C",
-            SqlState::SqlJsonMemberNotFound => "2203F",
+            SqlState::SqlJsonScalarRequired => "2203F",
             SqlState::InvalidArgumentForSqlJsonDatetimeFunction => "22031",
             SqlState::InvalidSqlJsonSubscript => "22033",
             SqlState::MoreThanOneSqlJsonItem => "22034",
@@ -331,9 +334,10 @@ impl SqlState {
             "2201B" => Some(SqlState::InvalidRegularExpression),
             "2202E" => Some(SqlState::ArraySubscriptError),
             "22030" => Some(SqlState::DuplicateJsonObjectKeyValue),
-            "2203A" => Some(SqlState::SqlJsonItemCannotBeCastToTargetType),
+            "22039" => Some(SqlState::SqlJsonArrayNotFound),
+            "2203A" => Some(SqlState::SqlJsonMemberNotFound),
             "2203C" => Some(SqlState::SqlJsonObjectNotFound),
-            "2203F" => Some(SqlState::SqlJsonMemberNotFound),
+            "2203F" => Some(SqlState::SqlJsonScalarRequired),
             "22031" => Some(SqlState::InvalidArgumentForSqlJsonDatetimeFunction),
             "22033" => Some(SqlState::InvalidSqlJsonSubscript),
             "22034" => Some(SqlState::MoreThanOneSqlJsonItem),
@@ -442,9 +446,10 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
     ErrorDesc { code: "2202E", name: "array_subscript_error", class: "data exception" },
     ErrorDesc { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },
-    ErrorDesc { code: "2203A", name: "sql_json_item_cannot_be_cast_to_target_type", class: "data exception" },
+    ErrorDesc { code: "22039", name: "sql_json_array_not_found", class: "data exception" },
+    ErrorDesc { code: "2203A", name: "sql_json_member_not_found", class: "data exception" },
     ErrorDesc { code: "2203C", name: "sql_json_object_not_found", class: "data exception" },
-    ErrorDesc { code: "2203F", name: "sql_json_member_not_found", class: "data exception" },
+    ErrorDesc { code: "2203F", name: "sql_json_scalar_required", class: "data exception" },
     ErrorDesc { code: "22031", name: "invalid_argument_for_sql_json_datetime_function", class: "data exception" },
     ErrorDesc { code: "22033", name: "invalid_sql_json_subscript", class: "data exception" },
     ErrorDesc { code: "22034", name: "more_than_one_sql_json_item", class: "data exception" },

@@ -159,6 +159,41 @@ impl Decimal {
         Decimal::from_parts(cneg, cscale, cdigits)
     }
 
+    /// PostgreSQL's `float8_numeric`: the binary64 value printed with `%.15g` (`DBL_DIG`
+    /// significant digits) and read back as a numeric. The digits come from the EXACT decimal
+    /// expansion of the binary64 value ([`Decimal::from_float64`]), rounded to 15 significant
+    /// digits half-to-even (glibc's printf rounds the exact value to nearest, ties to even), with
+    /// trailing fractional zeros trimmed — `%g` drops them, and an exponent form reads back at
+    /// display scale `max(0, digits − exponent)`. Pure integer arithmetic, so every core agrees
+    /// bit-for-bit. Used by the jsonpath `.double()` method (spec/design/jsonpath.md §3.1); the
+    /// caller has already rejected NaN and ±Infinity.
+    pub fn from_float64_dbl_dig(f: f64) -> Decimal {
+        const DBL_DIG: u32 = 15;
+        let exact = Decimal::from_float64(f);
+        let digits = exact.precision();
+        if digits <= DBL_DIG {
+            return exact;
+        }
+        let drop = digits - DBL_DIG;
+        let pow = mag_pow10(drop);
+        let (mut q, r) = mag_divmod(&exact.limbs, &pow);
+        let round_up = match mag_cmp(&mag_add(&r, &r), &pow) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => q.first().is_some_and(|l| l % 2 == 1),
+            std::cmp::Ordering::Less => false,
+        };
+        if round_up {
+            q = mag_add(&q, &[1]);
+        }
+        let rounded = if exact.scale >= drop {
+            Decimal::from_parts(exact.neg, exact.scale - drop, q)
+        } else {
+            Decimal::from_parts(exact.neg, 0, mag_mul_pow10(&q, drop - exact.scale))
+        };
+        let (cneg, cdigits, cscale) = rounded.canonical();
+        Decimal::from_parts(cneg, cscale, cdigits)
+    }
+
     pub fn is_zero(&self) -> bool {
         self.limbs.is_empty()
     }

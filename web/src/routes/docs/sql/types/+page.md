@@ -115,6 +115,11 @@ SELECT
   jsonb_agg(d)                                            AS dates
 FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
 
+	const jsonpathMethodDemo = `SELECT
+  jsonb_path_query_array('[-1.5, "2.5", 7]', '$[*].type()')          AS item_types,
+  jsonb_path_query_array('["12", 3.7, "-4"]', '$.integer()')         AS integers,
+  jsonb_path_query_array('{"x": 1, "y": [2, 3]}', '$.keyvalue().key') AS keys;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -393,6 +398,16 @@ the `json` accessors and set-returning functions above, and the SQL/JSON query f
 document, not just the part they return. `json` input only checks syntax, so it stores either escape
 unchanged, and `json_typeof`, `json_array_length`, `json_array_elements`, and `IS JSON` read such a
 value without error. jsonpath string literals reject the same two escapes.
+
+A `jsonpath` (`jsonb_path_query`, `@?`, `JSON_VALUE`, and the rest) can end a step in an item method:
+`.type()`, `.size()`, `.abs()`, `.floor()`, `.ceiling()`, `.double()`, `.bigint()`, `.integer()`,
+`.number()`, `.decimal(p, s)`, `.boolean()`, `.string()`, and `.keyvalue()`, as in PostgreSQL. In
+the default `lax` mode a method other than `.type()` and `.size()` applies to each element of an
+array. A value the method cannot convert fails with `22036` in either mode. `.keyvalue()` turns an
+object into `{"key", "value", "id"}` objects. The datetime methods (`.datetime()`, `.date()`, …) are
+not supported yet (`0A000`):
+
+<LiveSql demo="jsonpathMethodDemo" query={jsonpathMethodDemo} rows={1} />
 
 A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper document, or
 building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with

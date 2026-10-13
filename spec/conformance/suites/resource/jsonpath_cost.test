@@ -70,12 +70,36 @@ SELECT jsonb_path_exists(j, '$.s ? (@ == "abd")') FROM d
 ----
 false
 
-# && and || evaluate both sides.
-# cost: 51
+# && and || evaluate both sides. A lax existence test stops at the first item it finds, so only the
+# first element is tested.
+# cost: 41
 query B nosort
 SELECT jsonb_path_exists(j, '$.a[*] ? (@ == 1 || @ == 2)') FROM d
 ----
 true
+
+# The same filter queried tests every element.
+# cost: 51
+query T nosort
+SELECT jsonb_path_query_first(j, '$.a[*] ? (@ == 1 || @ == 2)') FROM d
+----
+1
+
+# An item method applies once per item and emits its result. lax applies a method other than
+# .type() / .size() to each element of an array (each element charges its own application).
+# cost: 46
+query TT nosort
+SELECT jsonb_path_query_first(j, '$.a.size()'), jsonb_path_query_first(j, '$.a.abs()') FROM d
+----
+3
+1
+
+# .keyvalue() applies once per object and emits one object per member; .key is looked up in it.
+# cost: 140
+query T nosort
+SELECT jsonb_path_query_array(j, '$.keyvalue().key') FROM d
+----
+["a", "b", "s"]
 
 # JSON_TABLE meters its row path and each column path per row item.
 # cost: 29
@@ -94,11 +118,11 @@ SELECT t.v, t.w FROM d, JSON_TABLE(d.j, '$.a[*]' COLUMNS (v i32 PATH '$', w i32 
 # evaluation propagates instead of making the comparison unknown.
 # max_cost: 100000
 statement error 54P01
-SELECT jsonb_path_exists(a, '$[*] ? (@ == $[*])') FROM (SELECT jsonb_agg(g) AS a FROM generate_series(1, 1000) g) s
+SELECT jsonb_path_query_first(a, '$[*] ? (@ == $[*])') FROM (SELECT jsonb_agg(g) AS a FROM generate_series(1, 1000) g) s
 
 # The same filter over 50 elements completes.
 # cost: 4195
-query B nosort
-SELECT jsonb_path_exists(a, '$[*] ? (@ == $[*])') FROM (SELECT jsonb_agg(g) AS a FROM generate_series(1, 50) g) s
+query T nosort
+SELECT jsonb_path_query_first(a, '$[*] ? (@ == $[*])') FROM (SELECT jsonb_agg(g) AS a FROM generate_series(1, 50) g) s
 ----
-true
+1

@@ -81,6 +81,7 @@ import {
   jsonArgNode,
   jsonArgShape,
   jsonPredKindMatches,
+  jsonpathContextNode,
   lcmBigint,
   lcmDecimalValue,
   leftChars,
@@ -2309,14 +2310,26 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const ctx = evalExpr(e.args[0]!, row, env, m);
       const path = evalExpr(e.args[1]!, row, env, m);
-      const seq = evalJsonpath(ctx, path, m);
-      if (seq === null) return nullValue();
+      // The operators are PostgreSQL's silent forms. The jsonb_path_* functions pass the default
+      // vars object, one base object for .keyvalue() ids; the operators pass none (jsonpath.md
+      // §3.1).
+      const silent = e.pathFnKind === "existsSilent" || e.pathFnKind === "matchSilent";
+      const opts = {
+        exists: e.pathFnKind === "exists" || e.pathFnKind === "existsSilent",
+        vars: silent ? 0 : 1,
+      };
+      const res = evalJsonpath(ctx, path, opts, silent, m);
+      if (res === null) return nullValue();
+      const seq = res.seq;
       // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
       m.charge(COSTS.operatorEval * BigInt(seq.length));
       m.guard();
       switch (e.pathFnKind) {
         case "exists":
           return boolValue(seq.length > 0);
+        case "existsSilent":
+          // `@?`: a SQL/JSON error → SQL NULL.
+          return res.errored ? nullValue() : boolValue(seq.length > 0);
         case "queryFirst":
           return seq.length > 0 ? jsonbValue(seq[0]!) : nullValue();
         case "queryArray": {
@@ -2341,7 +2354,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
         case "matchSilent":
           // @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean result to
-          // SQL NULL.
+          // SQL NULL. An error ends the evaluation; the items found before it still decide.
           return seq.length === 1 && seq[0]!.kind === "bool"
             ? boolValue(seq[0]!.value)
             : nullValue();
@@ -2357,11 +2370,11 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (cv.kind === "null" || pv.kind === "null") return nullValue();
       // Reading a json context as jsonb (a `\u0000` / unpaired surrogate raises) is the context's
       // conversion, not path evaluation, so ON ERROR does not catch it — as in PostgreSQL
-      // (json.md §4.2).
-      const node = jsonArgNode(cv);
+      // (json.md §4.2). The conversion canonicalizes it, as PostgreSQL casts it (jsonpath.md §5).
+      const node = jsonpathContextNode(cv);
       let seq: JsonNode[];
       try {
-        seq = evalJsonpathOn(node, pv, m);
+        seq = evalJsonpathOn(node, pv, { exists: e.sqlKind === "exists", vars: 0 }, false, m).seq;
       } catch (err) {
         // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
         // else (a cost abort, etc.) propagates.

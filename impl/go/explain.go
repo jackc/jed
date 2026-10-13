@@ -1791,7 +1791,7 @@ func explainJSONBuildKind(k jsonBuildKind) string {
 }
 
 func explainJSONPathFunc(k jsonPathFnKind) string {
-	return [...]string{"jsonb_path_exists", "jsonb_path_query_first", "jsonb_path_query_array", "jsonb_path_match", "jsonb_path_match_silent"}[k]
+	return [...]string{"jsonb_path_exists", "jsonb_path_query_first", "jsonb_path_query_array", "jsonb_path_match", "jsonb_path_match_silent", "jsonb_path_exists_silent"}[k]
 }
 
 func explainJSONSQLFunc(k jsonSqlKind) string {

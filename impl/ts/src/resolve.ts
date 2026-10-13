@@ -140,7 +140,9 @@ import { jsonbIn, parsePreservingJson, parseShapeJson, validateJson } from "./js
 import {
   compile as jsonPathCompile,
   compileMetered as jsonPathCompileMetered,
+  type EvalOpts as JsonPathEvalOpts,
   evalPath as jsonPathEval,
+  evalPathSilent as jsonPathEvalSilent,
   render as jsonPathRender,
 } from "./jsonpath.ts";
 import type { ExtractSrc } from "./datetime_fn.ts";
@@ -2839,7 +2841,7 @@ export function resolveBinary(
     case "jsonPathExists":
     case "jsonPathMatch": {
       const [sym, kind]: [string, JsonPathFnKind] =
-        op === "jsonPathExists" ? ["@?", "exists"] : ["@@", "matchSilent"];
+        op === "jsonPathExists" ? ["@?", "existsSilent"] : ["@@", "matchSilent"];
       const ctx = resolve(scope, lhs, "jsonb", ag, params);
       if (ctx.type.kind !== "jsonb" && ctx.type.kind !== "null") {
         throw engineError(
@@ -3168,21 +3170,42 @@ export function jsonArgShape(v: Value): JsonNode {
   throw new Error("jsonArgShape: a json/jsonb function argument must be json/jsonb");
 }
 
-// evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb` context
-// value (the shared kernel of the jsonpath query functions). A NULL context or path yields `null`
-// (→ SQL NULL / zero rows). Port of impl/rust/src/executor.rs `eval_jsonpath`.
-export function evalJsonpath(ctx: Value, path: Value, m: Meter): JsonNode[] | null {
+// jsonpathContextNode is a jsonpath query's context item: a jsonb value as is, a json value
+// converted to jsonb (PostgreSQL casts it: keys canonical, duplicates last-wins — jsonpath.md §5).
+export function jsonpathContextNode(v: Value): JsonNode {
+  return v.kind === "json" ? jsonbIn(v.text) : jsonArgNode(v);
+}
+
+// evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a json/jsonb
+// context value (the shared kernel of the jsonpath query functions). A NULL context or path yields
+// `null` (→ SQL NULL / zero rows). Port of impl/rust/src/executor.rs `eval_jsonpath`.
+export function evalJsonpath(
+  ctx: Value,
+  path: Value,
+  opts: JsonPathEvalOpts,
+  silent: boolean,
+  m: Meter,
+): { seq: JsonNode[]; errored: boolean } | null {
   if (ctx.kind === "null" || path.kind === "null") return null;
-  return evalJsonpathOn(jsonArgNode(ctx), path, m);
+  return evalJsonpathOn(jsonpathContextNode(ctx), path, opts, silent, m);
 }
 
 // evalJsonpathOn evaluates a non-NULL jsonpath over an already-read context node: recompiling the
-// path's canonical text charges jsonpath_compile (jsonpath.md §7).
-export function evalJsonpathOn(node: JsonNode, path: Value, m: Meter): JsonNode[] {
+// path's canonical text charges jsonpath_compile (jsonpath.md §7). In silent mode a SQL/JSON error
+// ends the evaluation: the items found before it are returned with `errored: true`.
+export function evalJsonpathOn(
+  node: JsonNode,
+  path: Value,
+  opts: JsonPathEvalOpts,
+  silent: boolean,
+  m: Meter,
+): { seq: JsonNode[]; errored: boolean } {
   if (path.kind !== "jsonpath") {
     throw new Error("resolver restricts a jsonpath argument to jsonpath");
   }
-  return jsonPathEval(jsonPathCompileMetered(path.text, m), node, m);
+  const compiled = jsonPathCompileMetered(path.text, m);
+  if (silent) return jsonPathEvalSilent(compiled, node, opts, m);
+  return { seq: jsonPathEval(compiled, node, opts, m), errored: false };
 }
 
 // jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's kind
@@ -3624,7 +3647,9 @@ export function resolveJsonpathFn(
 ): { node: RExpr; type: ResolvedType } {
   const [ctx, path] = resolveJsonpathArgs(scope, name, args, ag, params);
   const type: ResolvedType =
-    kind === "exists" || kind === "match" ? { kind: "bool" } : { kind: "jsonb" };
+    kind === "exists" || kind === "existsSilent" || kind === "match" || kind === "matchSilent"
+      ? { kind: "bool" }
+      : { kind: "jsonb" };
   return { node: { kind: "jsonPathFn", pathFnKind: kind, args: [ctx, path] }, type };
 }
 

@@ -1973,6 +1973,7 @@ fn explain_json_has_key(kind: HasKeyKind) -> &'static str {
 fn explain_jsonpath_func(kind: JsonPathFnKind) -> &'static str {
     match kind {
         JsonPathFnKind::Exists => "jsonb_path_exists",
+        JsonPathFnKind::ExistsSilent => "jsonb_path_exists_silent",
         JsonPathFnKind::QueryFirst => "jsonb_path_query_first",
         JsonPathFnKind::QueryArray => "jsonb_path_query_array",
         JsonPathFnKind::Match => "jsonb_path_match",

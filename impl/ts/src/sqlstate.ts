@@ -33,9 +33,10 @@ export type SqlState =
   | "invalid_regular_expression" // 2201B — invalid regular expression: {detail}
   | "array_subscript_error" // 2202E — {detail}
   | "duplicate_json_object_key_value" // 22030 — duplicate JSON object key value
-  | "sql_json_item_cannot_be_cast_to_target_type" // 2203A — {detail}
+  | "sql_json_array_not_found" // 22039 — {detail}
+  | "sql_json_member_not_found" // 2203A — {detail}
   | "sql_json_object_not_found" // 2203C — {detail}
-  | "sql_json_member_not_found" // 2203F — {detail}
+  | "sql_json_scalar_required" // 2203F — {detail}
   | "invalid_argument_for_sql_json_datetime_function" // 22031 — {detail}
   | "invalid_sql_json_subscript" // 22033 — {detail}
   | "more_than_one_sql_json_item" // 22034 — {detail}
@@ -129,9 +130,10 @@ const CODES: Record<SqlState, string> = {
   invalid_regular_expression: "2201B",
   array_subscript_error: "2202E",
   duplicate_json_object_key_value: "22030",
-  sql_json_item_cannot_be_cast_to_target_type: "2203A",
+  sql_json_array_not_found: "22039",
+  sql_json_member_not_found: "2203A",
   sql_json_object_not_found: "2203C",
-  sql_json_member_not_found: "2203F",
+  sql_json_scalar_required: "2203F",
   invalid_argument_for_sql_json_datetime_function: "22031",
   invalid_sql_json_subscript: "22033",
   more_than_one_sql_json_item: "22034",
@@ -241,9 +243,10 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
   { code: "2202E", name: "array_subscript_error", class: "data exception" },
   { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },
-  { code: "2203A", name: "sql_json_item_cannot_be_cast_to_target_type", class: "data exception" },
+  { code: "22039", name: "sql_json_array_not_found", class: "data exception" },
+  { code: "2203A", name: "sql_json_member_not_found", class: "data exception" },
   { code: "2203C", name: "sql_json_object_not_found", class: "data exception" },
-  { code: "2203F", name: "sql_json_member_not_found", class: "data exception" },
+  { code: "2203F", name: "sql_json_scalar_required", class: "data exception" },
   { code: "22031", name: "invalid_argument_for_sql_json_datetime_function", class: "data exception" },
   { code: "22033", name: "invalid_sql_json_subscript", class: "data exception" },
   { code: "22034", name: "more_than_one_sql_json_item", class: "data exception" },

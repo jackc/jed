@@ -368,9 +368,11 @@ dispatch** (the same parse site as `IS NULL` / `IS DISTINCT FROM`).
 ### 5.2 Evaluation
 
 All three query functions compile `path` to a `jsonpath` program, evaluate it to a sequence
-over the context item ([jsonpath.md §3](jsonpath.md)), then:
+over the context item ([jsonpath.md §3](jsonpath.md)) — a `json` context is first converted to
+`jsonb`, as PostgreSQL casts it ([jsonpath.md §5](jsonpath.md)) — then:
 
-- **`JSON_EXISTS`** — non-empty → true; errors honor `ON ERROR` (PG default `FALSE`).
+- **`JSON_EXISTS`** — non-empty → true (a lax path stops at its first item, jsonpath.md §5);
+  errors honor `ON ERROR` (PG default `FALSE`).
 - **`JSON_VALUE`** — requires a **single scalar** item, coerced to the `RETURNING` type
   (default `text`); empty → `ON EMPTY` (default `NULL`); error / non-scalar → `ON ERROR`
   (default `NULL`); `>1` item → `22034`; non-scalar → `22038`.

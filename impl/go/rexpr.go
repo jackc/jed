@@ -1072,6 +1072,9 @@ const (
 	// non-singleton/non-boolean result is suppressed to SQL NULL.
 	jpfMatch
 	jpfMatchSilent
+	// jpfExistsSilent is the PostgreSQL @? operator: the same existence test in silent mode — a
+	// SQL/JSON error yields SQL NULL.
+	jpfExistsSilent
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a

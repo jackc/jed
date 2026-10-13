@@ -1430,7 +1430,8 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		if err != nil {
 			return nil, err
 		}
-		seq, err := compiled.Eval(node, m)
+		// PostgreSQL's default vars object is one base object (jsonpath.md §3.1).
+		seq, err := compiled.Eval(node, jpEvalOpts{vars: 1}, m)
 		if err != nil {
 			return nil, err
 		}
@@ -1565,7 +1566,7 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 		// JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
 		if item.Kind == JArray || item.Kind == JObject {
 			return applyJSONBehavior(onError,
-				newError(SqlJsonMemberNotFound, "JSON path expression in JSON_VALUE should return singleton scalar item"),
+				newError(SqlJsonScalarRequired, "JSON path expression in JSON_VALUE should return singleton scalar item"),
 				returning, env, m)
 		}
 		// Coerce the scalar to the RETURNING type (a JSON null → SQL NULL). A coercion failure is a
@@ -1643,7 +1644,8 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 	if ctx.Kind == ValNull {
 		return nil, nil
 	}
-	node, err := jsonArgNode(ctx)
+	// A json context is converted to jsonb, as PostgreSQL casts it (jsonpath.md §5).
+	node, err := jsonpathContextNode(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1652,7 +1654,7 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 	if err != nil {
 		return nil, err
 	}
-	items, err := root.Eval(node, m)
+	items, err := root.Eval(node, jpEvalOpts{}, m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			return nil, nil
@@ -1787,7 +1789,7 @@ func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *co
 		if err != nil {
 			return nil, err
 		}
-		childSeq, err := p.Eval(*item, m)
+		childSeq, err := p.Eval(*item, jpEvalOpts{}, m)
 		if err != nil {
 			if isSQLJSONError(err) {
 				childSeq = nil
@@ -1814,7 +1816,7 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *costMeter) 
 	if err != nil {
 		return Value{}, err
 	}
-	seq, err := p.Eval(*item, m)
+	seq, err := p.Eval(*item, jpEvalOpts{}, m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			return applyJSONBehavior(c.onError, err, c.returning, env, m)
@@ -1837,7 +1839,7 @@ func evalJtExists(item *JsonNode, c *jtColExists, m *costMeter) (Value, error) {
 		return Value{}, err
 	}
 	var exists bool
-	seq, err := p.Eval(*item, m)
+	seq, err := p.Eval(*item, jpEvalOpts{exists: true}, m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			switch c.onError {

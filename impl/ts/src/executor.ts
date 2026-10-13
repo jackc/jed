@@ -502,6 +502,7 @@ import {
   deriveCollation,
   deriveTypmod,
   jsonArgNode,
+  jsonpathContextNode,
   objectKeyNull,
   orderAliasMatch,
   orderKeyDeriv,
@@ -17116,13 +17117,14 @@ export class Engine {
     if (plan === undefined) throw new Error("a json_table SRF carries its plan");
     const ctx = evalExpr(srf.args[0]!, [], env, meter);
     if (ctx.kind === "null") return [];
-    const node = jsonArgNode(ctx);
+    // A json context is converted to jsonb, as PostgreSQL casts it (jsonpath.md §5).
+    const node = jsonpathContextNode(ctx);
     // The root path → the sequence of row items (a structural error here yields no rows).
     const root = jsonPathCompileMetered(plan.rootPath, meter);
     // A navigation error yields no rows; a cost abort propagates (jsonpath.md §7).
     let items: JsonNode[];
     try {
-      items = jsonPathEval(root, node, meter);
+      items = jsonPathEval(root, node, JT_EVAL, meter);
     } catch (e) {
       if (!isSqljsonError(e)) throw e;
       items = [];
@@ -17785,7 +17787,8 @@ export class Engine {
           throw new Error("resolver restricts the path argument to jsonpath");
         }
         const compiled = jsonPathCompileMetered(path.text, meter);
-        for (const item of jsonPathEval(compiled, node, meter)) {
+        // PostgreSQL's default vars object is one base object (jsonpath.md §3.1).
+        for (const item of jsonPathEval(compiled, node, { exists: false, vars: 1 }, meter)) {
           meter.guard();
           meter.charge(COSTS.generatedRow);
           out.push([jsonbValue(item)]);
@@ -28972,10 +28975,12 @@ export type JsonImageFunc =
 // (jsonpath.md §5): "exists" — jsonb_path_exists → boolean (the sequence is non-empty);
 // "queryFirst" — jsonb_path_query_first → the first sequence item, or NULL if empty;
 // "queryArray" — jsonb_path_query_array → the sequence wrapped in a JSON array;
-// "match" — jsonb_path_match (and the `@@` operator) → the single boolean the path/predicate
-// produces (22038 if not exactly one boolean item).
+// "match" — jsonb_path_match → the single boolean the path/predicate produces (22038 if not exactly
+// one boolean item); "existsSilent" / "matchSilent" — the `@?` / `@@` operators, PostgreSQL's
+// silent forms of exists / match (a SQL/JSON error → SQL NULL, or the items found before it).
 export type JsonPathFnKind =
   | "exists"
+  | "existsSilent"
   | "queryFirst"
   | "queryArray"
   | "match"
@@ -29590,7 +29595,7 @@ export function evalJsonSqlResult(
         return applyJsonBehavior(
           onError,
           engineError(
-            "sql_json_member_not_found",
+            "sql_json_scalar_required",
             "JSON path expression in JSON_VALUE should return singleton scalar item",
           ),
           returning,
@@ -29705,6 +29710,10 @@ export function jtCompilePath(path: string | null, name: string): string {
   return jsonPathRender(jsonPathCompile(src));
 }
 
+// JT_EVAL is how JSON_TABLE evaluates its row, NESTED, and value-column paths: the full sequence,
+// with no PASSING variables (jsonpath.md §3.1).
+const JT_EVAL = { exists: false, vars: 0 };
+
 // expandJtLevel expands a `JSON_TABLE` COLUMNS level over a sequence of row items → the sparse rows
 // (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Port
 // of impl/rust/src/executor.rs `expand_jt_level`.
@@ -29778,7 +29787,7 @@ export function expandJtNested(
     // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
     let childSeq: JsonNode[];
     try {
-      childSeq = jsonPathEval(p, item, meter);
+      childSeq = jsonPathEval(p, item, JT_EVAL, meter);
     } catch (e) {
       if (!isSqljsonError(e)) throw e;
       childSeq = [];
@@ -29807,7 +29816,7 @@ export function evalJtRegular(
   const p = jsonPathCompileMetered(path, meter);
   let seq: JsonNode[];
   try {
-    seq = jsonPathEval(p, item, meter);
+    seq = jsonPathEval(p, item, JT_EVAL, meter);
   } catch (e) {
     if (isSqljsonError(e)) {
       return applyJsonBehavior(onError, e, returning, env, meter);
@@ -29832,7 +29841,7 @@ export function evalJtExists(
   const p = jsonPathCompileMetered(path, meter);
   let exists: boolean;
   try {
-    exists = jsonPathEval(p, item, meter).length > 0;
+    exists = jsonPathEval(p, item, { exists: true, vars: 0 }, meter).length > 0;
   } catch (e) {
     if (isSqljsonError(e)) {
       switch (onError) {

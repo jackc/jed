@@ -2228,7 +2228,7 @@ func resolveJsonpathFn(s *scope, name string, kind jsonPathFnKind, fc *funcCallE
 		return nil, resolvedType{}, err
 	}
 	result := resolvedType{kind: rtJsonb}
-	if kind == jpfExists || kind == jpfMatch {
+	if kind == jpfExists || kind == jpfExistsSilent || kind == jpfMatch || kind == jpfMatchSilent {
 		result = resolvedType{kind: rtBool}
 	}
 	return &rExpr{kind: reJsonPathFn, jpFnKind: kind, sargs: []*rExpr{ctx, path}}, result, nil
@@ -2335,33 +2335,49 @@ func resolveJsonpathArgs(s *scope, name string, args []*exprNode, ag *aggCtx, pa
 	return ctx, path, nil
 }
 
-// evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb`
+// jsonpathContextNode is a jsonpath query's context item: a jsonb value as is, a json value converted
+// to jsonb (PostgreSQL casts it: keys canonical, duplicates last-wins — jsonpath.md §5).
+func jsonpathContextNode(v Value) (JsonNode, error) {
+	if v.Kind == ValJson {
+		return jsonbIn(v.str())
+	}
+	return jsonArgNode(v)
+}
+
+// evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a json/jsonb
 // context value (the shared kernel of the jsonpath query functions). A NULL context or path yields
-// ok=false (→ SQL NULL / zero rows). Compiling and evaluating are metered (jsonpath.md §7).
-func evalJsonpath(ctx, path Value, m *costMeter) ([]JsonNode, bool, error) {
+// ok=false (→ SQL NULL / zero rows). Compiling and evaluating are metered (jsonpath.md §7). In silent
+// mode a SQL/JSON error ends the evaluation: the items found before it are returned with
+// errored = true.
+func evalJsonpath(ctx, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JsonNode, ok, errored bool, err error) {
 	if ctx.Kind == ValNull || path.Kind == ValNull {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
-	node, err := jsonArgNode(ctx)
+	node, err := jsonpathContextNode(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	seq, err := evalJsonpathOn(node, path, m)
+	seq, errored, err = evalJsonpathOn(node, path, opts, silent, m)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	return seq, true, nil
+	return seq, true, errored, nil
 }
 
 // evalJsonpathOn evaluates a non-NULL jsonpath over an already-read context node: recompiling the
-// path's canonical text charges jsonpath_compile (jsonpath.md §7).
-func evalJsonpathOn(node JsonNode, path Value, m *costMeter) ([]JsonNode, error) {
+// path's canonical text charges jsonpath_compile (jsonpath.md §7). In silent mode a SQL/JSON error
+// ends the evaluation: the items found before it are returned with errored = true.
+func evalJsonpathOn(node JsonNode, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JsonNode, errored bool, err error) {
 	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
 	compiled, err := compileMetered(path.str(), m)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return compiled.Eval(node, m)
+	if silent {
+		return compiled.EvalSilent(node, opts, m)
+	}
+	seq, err = compiled.Eval(node, opts, m)
+	return seq, false, err
 }
 
 // resolveJSONSetInsert resolves jsonb_set / jsonb_set_lax / jsonb_insert (json-sql-functions.md

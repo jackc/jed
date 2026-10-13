@@ -1,8 +1,9 @@
-//! The `jsonpath` type (spec/design/jsonpath.md, slice P1a) — the per-core checks the conformance
-//! corpus cannot express (CLAUDE.md §10): the deliberate PG divergences (the deferred P1b constructs
-//! are `0A000`, where PG compiles them; a jsonpath is non-comparable / a jsonpath column is `0A000`).
-//! The agreeing behavior (the canonical render, malformed → 42601) is oracle-clean in
-//! suites/json/jsonpath_literal.test.
+//! The `jsonpath` type (spec/design/jsonpath.md) — the per-core checks the conformance corpus cannot
+//! express (CLAUDE.md §10): the deliberate PG divergences (the deferred constructs are `0A000`, where
+//! PG compiles them; a jsonpath is non-comparable / a jsonpath column is `0A000`; an item method reads
+//! a string with jed's own number grammar). The agreeing behavior (the canonical render, malformed →
+//! 42601, the item methods) is oracle-clean in suites/json/jsonpath_literal.test and
+//! jsonpath_methods.test.
 
 use jed::{CreateOptions, Database, Session, SessionOptions};
 
@@ -14,18 +15,23 @@ fn err(db: &mut Session, sql: &str) -> String {
         .to_string()
 }
 
-/// The still-deferred path-expression constructs — item methods `.m()`, arithmetic, `like_regex` /
-/// `starts with`, `$name` variables — are a `0A000` at compile (P1b added filters `?(comparison)`
-/// AND top-level predicates `$.a == 1`, but not these). PostgreSQL compiles them, so each is a
-/// documented divergence; the supported subset is oracle-clean in suites/json/jsonpath_literal.test
-/// and jsonpath_query.test.
+/// The still-deferred path-expression constructs — the datetime item methods, arithmetic,
+/// `like_regex` / `starts with`, `$name` variables — are a `0A000` at compile. PostgreSQL compiles
+/// them, so each is a documented divergence; the supported subset is oracle-clean in
+/// suites/json/jsonpath_literal.test, jsonpath_query.test, and jsonpath_methods.test.
 #[test]
 fn jsonpath_p1b_constructs_are_0a000() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
     for path in [
-        "$.a.size()",            // item method
+        "$.a.datetime()", // a datetime item method
+        "$.a.datetime(\"HH24\")",
+        "$.a.date()",
+        "$.a.time(3)",
+        "$.a.time_tz()",
+        "$.a.timestamp()",
+        "$.a.timestamp_tz(2)",
         "$.a + 2",               // arithmetic
         "$.a like_regex \"x\"",  // a like_regex top-level predicate
         "$.a starts with \"x\"", // a starts-with top-level predicate
@@ -67,21 +73,20 @@ fn jsonpath_column_is_unsupported() {
     assert_eq!(err(&mut db, "CREATE TABLE t (p jsonpath)"), "0A000");
 }
 
-/// A jsonpath using a STILL-deferred construct (an item method, `like_regex`, arithmetic) is
-/// `0A000` — it fails to compile. Filters `?(comparison)` and top-level predicates (`$.a == 1`, for
-/// jsonb_path_match / @@) now compile (P1b), but item methods / like_regex / arithmetic are a
-/// follow-on. PostgreSQL evaluates all of these, so each is a documented divergence; the supported
-/// filter + query + match behavior is oracle-clean in suites/json/jsonpath_query.test.
+/// A jsonpath using a STILL-deferred construct (a datetime method, `like_regex`) is `0A000` — it
+/// fails to compile. PostgreSQL evaluates these, so each is a documented divergence; the supported
+/// filter + query + match + method behavior is oracle-clean in suites/json/jsonpath_query.test and
+/// jsonpath_methods.test.
 #[test]
 fn jsonpath_deferred_constructs_are_0a000() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    // An item method.
+    // A datetime item method.
     assert_eq!(
         err(
             &mut db,
-            "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')"
+            "SELECT jsonb_path_query_array('[\"2020-01-01\"]', '$[*].datetime()')"
         ),
         "0A000"
     );
@@ -114,4 +119,31 @@ fn malformed_jsonpath_is_42601() {
     assert_eq!(err(&mut db, "SELECT '$.'::jsonpath"), "42601");
     assert_eq!(err(&mut db, "SELECT '$['::jsonpath"), "42601");
     assert_eq!(err(&mut db, "SELECT '$[1 to'::jsonpath"), "42601");
+}
+
+/// An item method reads a string with jed's OWN number grammars (grammar.md §36): decimal digits
+/// only, no hex/octal/binary prefixes and no digit underscores, so those strings are `22036` where
+/// PostgreSQL 16+ (`int8in` / `numeric_in`, and glibc `strtod` behind `float8in`) accepts them.
+#[test]
+fn jsonpath_method_number_grammar_divergence() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    for (doc, path) in [
+        ("\"0x10\"", "$.bigint()"),
+        ("\"1_000\"", "$.bigint()"),
+        ("\"0o17\"", "$.integer()"),
+        ("\"0x1A\"", "$.number()"),
+        ("\"1_0\"", "$.decimal()"),
+        ("\"0x10\"", "$.double()"),
+    ] {
+        assert_eq!(
+            err(
+                &mut db,
+                &format!("SELECT jsonb_path_query_first('{doc}', '{path}')")
+            ),
+            "22036",
+            "{doc} {path}"
+        );
+    }
 }
