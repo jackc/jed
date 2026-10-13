@@ -143,8 +143,9 @@ the grammar encodes:
 - A keyword terminal in the grammar (`"SELECT"`, `"FROM"`, …) matches **only a bare word**,
   never a quoted identifier: `SELECT "from" FROM t` selects the column `from`, and `"null"` is a
   column reference, not the null literal. Keyword-like words in fixed vocabularies — `EXPLAIN`
-  options, `EXTRACT` fields, frame bounds, multi-word type names (`double precision`,
-  `timestamp with time zone`) — are keywords in this sense and accept only bare words.
+  options, frame bounds, multi-word type names (`double precision`,
+  `timestamp with time zone`) — are keywords in this sense and accept only bare words. An
+  `EXTRACT` field is not: as in PostgreSQL it is an identifier, bare or quoted, or a string (§50).
   Punctuation terminals (`"("`, `"="`) match literally.
 
 **Output names fold too.** A select item's `AS alias` is an identifier like any other, so
@@ -3277,7 +3278,9 @@ SELECT (tstz)::date                                          -- cross-family cas
 ```
 
 - **Grammar.** `EXTRACT "(" ( identifier | string ) "FROM" expr ")"` ([grammar.ebnf](../grammar/grammar.ebnf)).
-  The **field is syntactic** — a bare identifier or a single-quoted string, case-insensitive, spelled
+  The **field is syntactic** — PostgreSQL's `extract_arg`: an identifier, bare (`hour`) or
+  double-quoted (`"HOURS"`), or a single-quoted string, case-insensitive (the unit lookup folds a
+  quoted or string field; a zero-length `""` is the lexer's `42601`), spelled
   with any of PostgreSQL's unit aliases (`hours`, `msec`, `y`, `jd`, …, [timezones.md §9.6](timezones.md)) — recognized
   only when `EXTRACT` is immediately followed by `(` (a one-token lookahead, §8; `EXTRACT` stays usable as
   a column / function name otherwise). It is validated at **resolve** time.

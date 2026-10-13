@@ -4554,17 +4554,15 @@ class Parser {
     }
     // EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
     // is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
-    // (the one-token lookahead, §8). The field is a bare word or a string literal (lowercased —
-    // a string-valued vocabulary).
+    // (the one-token lookahead, §8). The field is an identifier (bare or quoted) or a string literal
+    // — PostgreSQL's extract_arg — ASCII-lowercased, as the unit lookup folds it (timezones.md §9.6).
     if (this.peekKeyword() === "extract" && this.peekKindAt(1) === "lparen") {
       this.advance(); // EXTRACT
       this.expect("lparen");
       let field: string;
       if (this.peekKindAt(0) === "str") {
         field = this.advance().str!;
-      } else if (this.peekKindAt(0) === "word") {
-        // A bare word only — the field is a fixed vocabulary, so a quoted identifier is not
-        // accepted (grammar.ebnf `extract_expr`).
+      } else if (this.peekKindAt(0) === "word" || this.peekKindAt(0) === "quotedIdent") {
         field = this.expectIdentifier();
       } else {
         throw engineError("syntax_error", "expected an EXTRACT field");
@@ -4572,7 +4570,7 @@ class Parser {
       this.expectKeyword("from");
       const source = this.parseExpr();
       this.expect("rparen");
-      return { kind: "extract", field: field.toLowerCase(), source };
+      return { kind: "extract", field: field.replace(/[A-Z]/g, (c) => c.toLowerCase()), source };
     }
     // `COALESCE(a, b, …)` — the first-non-NULL conditional (grammar.md §51). Recognized only
     // when COALESCE is immediately followed by `(` (the JSON(/EXTRACT( one-token lookahead), so

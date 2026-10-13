@@ -10,7 +10,7 @@
 # Oracle-checked against postgres:18.
 #
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.derived_table, types.i32, types.f64, types.text, types.date, types.timestamp, types.timestamptz, types.interval, expr.extract, expr.date_trunc, func.date_part
+# requires: ddl.create_table, ddl.primary_key, ddl.view, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.derived_table, types.i32, types.f64, types.text, types.date, types.timestamp, types.timestamptz, types.interval, expr.extract, expr.date_trunc, func.date_part
 # load-timezone: America/New_York
 
 # ============================================================================================
@@ -131,6 +131,77 @@ SELECT EXTRACT(HOURS FROM t), EXTRACT('HrS' FROM t), EXTRACT('MiLLiSeCoNdS' FROM
 23456.789
 2460538.57457704616898148148
 1723729643.456789
+
+# ============================================================================================
+# A quoted EXTRACT field: PostgreSQL's extract_arg is an identifier — bare or double-quoted — or
+# a string literal. A quoted identifier keeps its case in the lexer; the unit lookup folds it.
+# ============================================================================================
+
+query DDDDD nosort
+SELECT EXTRACT("HOURS" FROM t), EXTRACT("year" FROM t), EXTRACT("Jd" FROM t), EXTRACT("MiCrOsEcOnDsXYZ" FROM t), EXTRACT("EPOCH" FROM t) FROM (SELECT timestamp '2024-08-15 13:47:23.456789' AS t) s
+----
+13
+2024
+2460538.57457704616898148148
+23456789
+1723729643.456789
+
+query DDD nosort
+SELECT EXTRACT("Mm" FROM t), EXTRACT('YEAR' FROM t), EXTRACT("Timezone_Hours" FROM t) FROM (SELECT timestamptz '2024-08-15 13:47:23.456789+00' AS t) s
+----
+47
+2024
+0
+
+query DD nosort
+SELECT EXTRACT("Dow" FROM date '2024-08-15'), EXTRACT("Mons" FROM interval '1 year 7 months')
+----
+4
+7
+
+# a quoted field inside a view survives the view's stored text
+statement ok
+CREATE VIEW extract_quoted_v AS SELECT EXTRACT("HOURS" FROM t) AS h, EXTRACT('Mins' FROM t) AS m FROM (SELECT timestamp '2024-08-15 13:47:23' AS t) s
+
+query DD nosort
+SELECT h, m FROM extract_quoted_v
+----
+13
+47
+
+statement ok
+DROP VIEW extract_quoted_v
+
+# a zero-length quoted identifier is a syntax error
+statement error 42601
+SELECT EXTRACT("" FROM timestamp '2024-08-15 13:47:23')
+
+# an empty string or an unknown quoted name is an unrecognized unit
+statement error 22023
+SELECT EXTRACT('' FROM timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT EXTRACT("foo" FROM timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT EXTRACT("ho""urs" FROM timestamp '2024-08-15 13:47:23')
+
+statement error 22023
+SELECT EXTRACT("Infinity" FROM interval '1 day')
+
+# a recognized quoted unit the source type does not support is 0A000
+statement error 0A000
+SELECT EXTRACT("Hour" FROM date '2024-08-15')
+
+statement error 0A000
+SELECT EXTRACT("Infinity" FROM timestamp '2024-08-15 13:47:23')
+
+# the field is one identifier: a qualified name or a number is a syntax error
+statement error 42601
+SELECT EXTRACT(s.hour FROM timestamp '2024-08-15 13:47:23')
+
+statement error 42601
+SELECT EXTRACT(1 FROM timestamp '2024-08-15 13:47:23')
 
 # ============================================================================================
 # EXTRACT over a timestamptz (session zone UTC): the timezone* units truncate to timezone_h/_m

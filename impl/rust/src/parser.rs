@@ -5037,8 +5037,9 @@ impl Parser {
         }
         // `EXTRACT(field FROM source)` (grammar.md §50, timezones.md §9.2). Recognized only when
         // `extract` is immediately followed by `(`, so `extract` stays usable as a column / function
-        // name otherwise (the one-token lookahead, §8). The field is a bare word or a string
-        // literal (lowercased — a string-valued vocabulary); the source is any expression.
+        // name otherwise (the one-token lookahead, §8). The field is an identifier (bare or quoted)
+        // or a string literal — PostgreSQL's `extract_arg` — ASCII-lowercased, as the unit lookup
+        // folds it (timezones.md §9.6); the source is any expression.
         if self.peek_keyword().as_deref() == Some("extract")
             && matches!(self.peek_at(1), Token::LParen)
         {
@@ -5052,9 +5053,7 @@ impl Parser {
                         unreachable!()
                     }
                 }
-                // A bare word only — the field is a fixed vocabulary, so a quoted identifier is
-                // not accepted (grammar.ebnf `extract_expr`).
-                Token::Word(_) => self.expect_identifier()?,
+                Token::Word(_) | Token::QuotedIdent(_) => self.expect_identifier()?,
                 other => {
                     return Err(syntax(format!(
                         "expected an EXTRACT field, found {other:?}"

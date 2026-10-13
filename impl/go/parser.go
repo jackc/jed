@@ -5832,8 +5832,8 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	}
 	// EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
 	// is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
-	// (the one-token lookahead, §8). The field is a bare word or a string literal (lowercased — a
-	// string-valued vocabulary); a quoted identifier is not accepted (grammar.ebnf extract_expr).
+	// (the one-token lookahead, §8). The field is an identifier (bare or quoted) or a string literal —
+	// PostgreSQL's extract_arg — ASCII-lowercased, as the unit lookup folds it (timezones.md §9.6).
 	if p.peekKeyword() == "extract" && p.peekKindAt(1) == tokLParen {
 		p.advance() // EXTRACT
 		if err := p.expect(tokLParen); err != nil {
@@ -5842,7 +5842,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		var field string
 		if p.peekKindAt(0) == tokStr {
 			field = p.advance().Word
-		} else if p.peekKindAt(0) != tokWord {
+		} else if !isIdentKind(p.peekKindAt(0)) {
 			return exprNode{}, newError(SyntaxError, "expected an EXTRACT field")
 		} else {
 			id, err := p.expectIdentifier()
@@ -5861,7 +5861,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprExtract, Extract: &extractExpr{Field: strings.ToLower(field), Source: source}}, nil
+		return exprNode{Kind: exprExtract, Extract: &extractExpr{Field: asciiLower(field), Source: source}}, nil
 	}
 	// A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
 	// CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed

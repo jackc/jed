@@ -565,8 +565,8 @@ and then behaves exactly like its canonical unit. The two keyword tables, `delta
 (`datetime_units_gen.{rs,go,ts}`, `scripts/gen_datetime_units.rb`). The lookup is hand-written:
 
 1. **Fold.** The name is ASCII-lowercased (`downcase_truncate_identifier`; a non-ASCII letter keeps
-   its case). The keyword form `EXTRACT(HOURS FROM …)` is already folded by the lexer; a string
-   `'HrS'` is folded here. Error messages print the folded name.
+   its case). The bare-word form `EXTRACT(HOURS FROM …)` is already folded by the lexer; a quoted
+   identifier `"HOURS"` or a string `'HrS'` is folded here. Error messages print the folded name.
 2. **Truncate.** A lookup compares at most 10 bytes (`TOKMAXLEN`): a name matches a token when its
    first 10 bytes equal it. So a token shorter than 10 bytes must match the whole name, and any name
    starting with a 10-byte token is that token: `microseconds` and `microsecondsXYZ` are
@@ -601,10 +601,12 @@ The aliases, by canonical unit:
 
 PostgreSQL's shadowing carries over: `m` is the minute (`deltatktbl`) although `datetktbl` reads it as
 a month, and `mm` exists only in `datetktbl`, so `EXTRACT(mm FROM ts)` is the minute while
-`date_trunc('mm', ts)` is `22023`. `EXTRACT`'s field is a bare word or a string (grammar.md §50). `dec`
-is a keyword in PostgreSQL, so there only the string `EXTRACT('dec' FROM …)` works, where jed's bare
-word also accepts `EXTRACT(dec FROM …)`; PostgreSQL also accepts a quoted identifier
-(`EXTRACT("HOURS" FROM …)`), which jed's grammar rejects (`42601`). Oracle-checked in
+`date_trunc('mm', ts)` is `22023`. `EXTRACT`'s field is PostgreSQL's `extract_arg` (grammar.md §50):
+an identifier, bare or quoted, or a string, so `EXTRACT(hours FROM …)`, `EXTRACT("HOURS" FROM …)`, and
+`EXTRACT('HOURS' FROM …)` agree; a zero-length `EXTRACT("" FROM …)` is `42601`, and `EXTRACT('' FROM
+…)` is an unrecognized unit (`22023`). `dec` is a keyword in PostgreSQL, so there only the string or
+quoted form (`EXTRACT('dec' FROM …)`, `EXTRACT("dec" FROM …)`) works, where jed's bare word also
+accepts `EXTRACT(dec FROM …)` — jed reserves no keywords (grammar.md §3). Oracle-checked in
 `suites/expr/datetime_unit_aliases.test`.
 
 ## 10. Untrusted-query safety, cost, and the determinism ledger

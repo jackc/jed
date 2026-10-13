@@ -1242,9 +1242,10 @@ greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"
 
 /* EXTRACT(field FROM source) (../design/timezones.md §9.2, ../design/grammar.md §50) — the SQL
  * special form for a single datetime field, equal to PostgreSQL's `extract(text, value)` but with
- * the `field FROM source` syntax. The FIELD is SYNTACTIC — a bare identifier (`hour`) or a string
- * literal (`'hour'`), case-insensitive, with PostgreSQL's unit aliases (`hours`, `msec`, `jd`, …,
- * ../design/timezones.md §9.6) — so it is validated at RESOLVE time (not per row): an
+ * the `field FROM source` syntax. The FIELD is SYNTACTIC — PostgreSQL's `extract_arg`: an
+ * identifier, bare (`hour`) or quoted (`"HOURS"`), or a string literal (`'hour'`), case-insensitive
+ * (the unit lookup folds a quoted or string field), with PostgreSQL's unit aliases (`hours`, `msec`,
+ * `jd`, …, ../design/timezones.md §9.6) — so it is validated at RESOLVE time (not per row): an
  * unsupported field FOR THE SOURCE TYPE is 0A000 (e.g. `EXTRACT(hour FROM date)`), an unrecognized
  * field is 22023. The SOURCE is any timestamp / timestamptz / date / interval expression; any other
  * source type is 42883. The result is `numeric` (PG 14+). For a `timestamptz` source the field is
@@ -1252,7 +1253,7 @@ greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"
  * is DEFERRED — it returns `double precision` and jed has no `float` type (timezones.md §9.2).
  * "EXTRACT" is recognized only when immediately followed by "(" (a one-token lookahead, §8), so it
  * stays usable as a column / function name otherwise — like the typed_literal lookahead. */
-extract_expr   ::= "EXTRACT" "(" ( bare_identifier | string ) "FROM" expr ")"
+extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
 
 /* SUBSTRING(x FROM start [FOR count]) / SUBSTRING(x FOR count [FROM start]) (../design/string-
  * functions.md §4, ../design/grammar.md §55) — the SQL special form, desugared by the parser to the

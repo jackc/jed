@@ -475,7 +475,9 @@ datetime casts to `text` — a `timestamptz` in the session time zone.)
 Unit names are case-insensitive and accept PostgreSQL's aliases: `date_trunc('hrs', ts)`,
 `EXTRACT(mons FROM ts)`, and `date_part('msec', ts)` work, as do `y`/`yr`/`years`, `d`/`days`,
 `w`/`weeks`, `qtr`, `us`/`usec`, `c`/`cent`, and the rest. `EXTRACT` and `date_part` also take `jd`/`j`
-for `julian` and `mm` for `minute`.
+for `julian` and `mm` for `minute`. `EXTRACT`'s field may be a bare word, a quoted identifier, or a
+string: `EXTRACT(hours FROM ts)`, `EXTRACT("HOURS" FROM ts)`, and `EXTRACT('Hours' FROM ts)` are the
+same.
 
 An `interval` keeps its months, days, and time as separate fields, so `interval '50 hours'` stays
 `50:00:00`. PostgreSQL's `justify_hours` moves whole 24-hour chunks into days, `justify_days` moves
