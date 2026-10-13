@@ -839,6 +839,29 @@ type capNode struct {
 	kids []*capNode
 }
 
+// The capLeaf and capInner types allocate a node together with the array its slice views, so a
+// level of a Save is one allocation. A one-level tree's leaf holds just the pattern's slots, so its
+// array comes in three sizes.
+type capLeaf4 struct {
+	node capNode
+	buf  [4]int64
+}
+
+type capLeaf8 struct {
+	node capNode
+	buf  [8]int64
+}
+
+type capLeaf struct {
+	node capNode
+	buf  [capFan]int64
+}
+
+type capInner struct {
+	node capNode
+	buf  [capFan]*capNode
+}
+
 // capShape returns the depth of the capture-slot tree for nslots slots and the length of its leaves:
 // a one-level tree is a single leaf of exactly nslots slots, a deeper one has full leaves.
 func capShape(nslots int) (depth, leafLen int) {
@@ -871,7 +894,7 @@ func (p *regexProgram) withSlot(caps *capNode, i int, v int64) *capNode {
 
 func (p *regexProgram) withSlotAt(n *capNode, shift, i int, v int64) *capNode {
 	if shift == 0 {
-		vals := make([]int64, p.capLeafLen)
+		node, vals := p.newLeaf()
 		if n != nil {
 			copy(vals, n.vals)
 		} else {
@@ -880,15 +903,36 @@ func (p *regexProgram) withSlotAt(n *capNode, shift, i int, v int64) *capNode {
 			}
 		}
 		vals[i&(capFan-1)] = v
-		return &capNode{vals: vals}
+		return node
 	}
-	kids := make([]*capNode, capFan)
+	inner := &capInner{}
+	kids := inner.buf[:]
 	if n != nil {
 		copy(kids, n.kids)
 	}
 	k := (i >> shift) & (capFan - 1)
 	kids[k] = p.withSlotAt(kids[k], shift-capFanBits, i, v)
-	return &capNode{kids: kids}
+	inner.node.kids = kids
+	return &inner.node
+}
+
+// newLeaf allocates a leaf and the capLeafLen slots it holds, in one allocation.
+func (p *regexProgram) newLeaf() (*capNode, []int64) {
+	var node *capNode
+	var buf []int64
+	switch {
+	case p.capLeafLen <= 4:
+		leaf := &capLeaf4{}
+		node, buf = &leaf.node, leaf.buf[:]
+	case p.capLeafLen <= 8:
+		leaf := &capLeaf8{}
+		node, buf = &leaf.node, leaf.buf[:]
+	default:
+		leaf := &capLeaf{}
+		node, buf = &leaf.node, leaf.buf[:]
+	}
+	node.vals = buf[:p.capLeafLen]
+	return node, node.vals
 }
 
 // slots returns every capture slot of caps as a flat array.

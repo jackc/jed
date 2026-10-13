@@ -802,12 +802,17 @@ const CAP_FAN: usize = 1 << CAP_FAN_BITS;
 /// level, so its work is bounded however many groups the pattern has; the older version stays intact
 /// for the threads still holding it. A leaf holds slot values (code-point offsets; `-1` = unset), an
 /// interior node its subtrees. A missing node means every slot under it is unset, so a search starts
-/// from no root. A match has set slots 0 and 1, so it always has a root.
-#[derive(Debug)]
+/// from no root. A match has set slots 0 and 1, so it always has a root. Each node is one shared
+/// slice of exactly its entries, so a level of a Save is one allocation.
+#[derive(Clone, Debug)]
 pub enum CapNode {
-    Leaf(Vec<i64>),
-    Inner(Vec<Option<Rc<CapNode>>>),
+    Leaf(Rc<[i64]>),
+    Inner(Rc<[Option<CapNode>]>),
 }
+
+/// The entries of a node no Save has reached: every slot unset, every subtree missing.
+const UNSET_SLOTS: [i64; CAP_FAN] = [-1; CAP_FAN];
+const NO_SUBTREES: [Option<CapNode>; CAP_FAN] = [const { None }; CAP_FAN];
 
 /// The depth of the capture-slot tree for `nslots` slots and the length of its leaves: a one-level
 /// tree is a single leaf of exactly `nslots` slots, a deeper one has full leaves.
@@ -836,7 +841,7 @@ impl Program {
         let mut shift = CAP_FAN_BITS * (self.cap_depth - 1);
         while shift > 0 {
             match node {
-                Some(CapNode::Inner(kids)) => node = kids[(i >> shift) & (CAP_FAN - 1)].as_deref(),
+                Some(CapNode::Inner(kids)) => node = kids[(i >> shift) & (CAP_FAN - 1)].as_ref(),
                 _ => return -1,
             }
             shift -= CAP_FAN_BITS;
@@ -848,27 +853,28 @@ impl Program {
     }
 
     /// The version of `caps` with slot `i` set to `v`, sharing every node off the path to it.
-    fn with_slot(&self, caps: Option<&CapNode>, i: usize, v: i64) -> Rc<CapNode> {
+    fn with_slot(&self, caps: Option<&CapNode>, i: usize, v: i64) -> CapNode {
         self.with_slot_at(caps, CAP_FAN_BITS * (self.cap_depth - 1), i, v)
     }
 
-    fn with_slot_at(&self, node: Option<&CapNode>, shift: usize, i: usize, v: i64) -> Rc<CapNode> {
+    fn with_slot_at(&self, node: Option<&CapNode>, shift: usize, i: usize, v: i64) -> CapNode {
         if shift == 0 {
-            let mut vals = match node {
-                Some(CapNode::Leaf(vals)) => vals.clone(),
-                _ => vec![-1; self.cap_leaf_len],
+            let mut vals: Rc<[i64]> = match node {
+                Some(CapNode::Leaf(vals)) => Rc::from(&vals[..]),
+                _ => Rc::from(&UNSET_SLOTS[..self.cap_leaf_len]),
             };
-            vals[i & (CAP_FAN - 1)] = v;
-            return Rc::new(CapNode::Leaf(vals));
+            Rc::get_mut(&mut vals).expect("a fresh leaf is unshared")[i & (CAP_FAN - 1)] = v;
+            return CapNode::Leaf(vals);
         }
-        let mut kids = match node {
-            Some(CapNode::Inner(kids)) => kids.clone(),
-            _ => vec![None; CAP_FAN],
+        let old = match node {
+            Some(CapNode::Inner(kids)) => &kids[..],
+            _ => &NO_SUBTREES[..],
         };
         let k = (i >> shift) & (CAP_FAN - 1);
-        let child = self.with_slot_at(kids[k].as_deref(), shift - CAP_FAN_BITS, i, v);
-        kids[k] = Some(child);
-        Rc::new(CapNode::Inner(kids))
+        let child = self.with_slot_at(old[k].as_ref(), shift - CAP_FAN_BITS, i, v);
+        let mut kids: Rc<[Option<CapNode>]> = Rc::from(old);
+        Rc::get_mut(&mut kids).expect("a fresh node is unshared")[k] = Some(child);
+        CapNode::Inner(kids)
     }
 
     /// Every capture slot of a match as a flat array.
@@ -885,7 +891,7 @@ impl Program {
 
 struct Thread {
     pc: usize,
-    caps: Option<Rc<CapNode>>,
+    caps: Option<CapNode>,
 }
 
 /// The per-position dedup set (regex.md §4): `marks[pc] == generation` means `pc` was visited at the
@@ -951,7 +957,7 @@ impl Program {
 
     /// Run the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
     /// capture slots on a match, or `None`.
-    pub fn run(&self, input: &[char], m: &mut Meter) -> Result<Option<Rc<CapNode>>> {
+    pub fn run(&self, input: &[char], m: &mut Meter) -> Result<Option<CapNode>> {
         self.with_seen(|seen| self.search(seen, input, 0, m))
     }
 
@@ -968,11 +974,11 @@ impl Program {
         input: &[char],
         start: usize,
         m: &mut Meter,
-    ) -> Result<Option<Rc<CapNode>>> {
+    ) -> Result<Option<CapNode>> {
         let len = input.len();
         let mut clist: Vec<Thread> = Vec::new();
         let mut nlist: Vec<Thread> = Vec::new();
-        let mut matched: Option<Rc<CapNode>> = None;
+        let mut matched: Option<CapNode> = None;
 
         let generation = seen.next();
         self.add_thread(&mut clist, seen, generation, 0, None, start, len, m)?;
@@ -1019,7 +1025,7 @@ impl Program {
         seen: &mut Seen,
         generation: u32,
         pc0: usize,
-        caps0: Option<Rc<CapNode>>,
+        caps0: Option<CapNode>,
         sp: usize,
         len: usize,
         m: &mut Meter,
@@ -1045,7 +1051,7 @@ impl Program {
                     stack.push(Thread { pc: *x, caps });
                 }
                 Inst::Save(n) => {
-                    let caps = self.with_slot(caps.as_deref(), *n, sp as i64);
+                    let caps = self.with_slot(caps.as_ref(), *n, sp as i64);
                     stack.push(Thread {
                         pc: pc + 1,
                         caps: Some(caps),
@@ -1086,7 +1092,7 @@ impl Program {
         match_input: &[char],
         global: bool,
         m: &mut Meter,
-    ) -> Result<Vec<Rc<CapNode>>> {
+    ) -> Result<Vec<CapNode>> {
         self.with_seen(|seen| {
             let mut found = Vec::new();
             let mut pos = 0usize;
@@ -1210,7 +1216,7 @@ impl Program {
         start: usize,
         n: i64,
         m: &mut Meter,
-    ) -> Result<Option<Rc<CapNode>>> {
+    ) -> Result<Option<CapNode>> {
         self.with_seen(|seen| {
             let len = input.len();
             let mut pos = start;
@@ -1272,7 +1278,7 @@ impl Program {
         &self,
         orig: &[char],
         repl: &[char],
-        found: &[Rc<CapNode>],
+        found: &[CapNode],
         mut f: impl FnMut(Piece),
     ) {
         let mut pos = 0usize;
@@ -1296,7 +1302,7 @@ impl Program {
 
     /// The exact UTF-8 byte length of `regexp_replace`'s result for the matches
     /// [`Program::replace_matches`] found, computed without building it (cost.md §8.1).
-    pub fn replace_size(&self, orig: &[char], repl: &[char], found: &[Rc<CapNode>]) -> i64 {
+    pub fn replace_size(&self, orig: &[char], repl: &[char], found: &[CapNode]) -> i64 {
         let mut size = 0i64;
         self.for_each_output(orig, repl, found, |p| match p {
             Piece::Char(c) => size += c.len_utf8() as i64,
@@ -1313,7 +1319,7 @@ impl Program {
         &self,
         orig: &[char],
         repl: &[char],
-        found: &[Rc<CapNode>],
+        found: &[CapNode],
         size: i64,
     ) -> String {
         let mut out = String::with_capacity(size as usize);
