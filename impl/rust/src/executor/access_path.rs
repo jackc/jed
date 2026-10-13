@@ -298,46 +298,25 @@ impl Engine {
         // plus a fixed or terminated body (§4.1) — so the range holds exactly this term's entries
         // and the storage key is the suffix after the term's own length.
         let istore = self.index_store(&gb.name_key);
-        let mut pages = 0usize;
-        let mut entries_visited = 0usize;
-        let mut postings: Vec<Vec<Vec<u8>>> = Vec::with_capacity(terms.len());
-        for prefix in &terms {
-            let bound = KeyBound {
-                lo: Some(prefix.clone()),
-                lo_inc: true,
-                hi: prefix_successor(prefix),
-                hi_inc: false,
-            };
-            let (es, p, _) = istore.range_scan_with_units(&bound, &[])?;
-            pages += p;
-            entries_visited += es.len();
-            postings.push(
-                es.into_iter()
-                    .map(|(ekey, _)| ekey[prefix.len()..].to_vec())
-                    .collect(),
-            );
-        }
-        meter.charge(COSTS.gin_entry * entries_visited as i64);
-
-        // Combine the posting sets by mode into the candidate storage keys, in ascending byte
-        // (= storage-key) order, so the point lookups and the emitted rows follow storage order
-        // exactly as a full scan would (gin.md §6/§8).
-        let candidates: BTreeSet<Vec<u8>> = if gb.strategy.is_any() {
-            // mode ANY (`&&`, `?|`) → union
-            postings.into_iter().flatten().collect()
+        let mut gather = GinGather::default();
+        // The candidate storage keys, in ascending byte (= storage-key) order, so the point lookups
+        // and the emitted rows follow storage order exactly as a full scan would (gin.md §6/§8).
+        let candidates: Vec<Vec<u8>> = if gb.strategy.is_any() {
+            // mode ANY (`&&`, `?|`) → the union of every whole posting list
+            let mut union = BTreeSet::new();
+            for term in &terms {
+                union.extend(gather.posting_list(istore, term)?);
+            }
+            union.into_iter().collect()
         } else {
             // mode ALL → intersection. `= ANY` (Member) and `?` are a single term, so the
             // intersection is that lone posting list; array `=` (Equal) gathers the same superset as
             // `@>` over `Q`'s distinct non-NULL terms (the residual `=` makes it exact downstream) —
             // gin.md §6; the `jsonb_ops` gathers are supersets the residual rechecks (§2.1).
-            let mut it = postings.into_iter();
-            let mut acc: BTreeSet<Vec<u8>> = it.next().unwrap_or_default().into_iter().collect();
-            for list in it {
-                let s: BTreeSet<Vec<u8>> = list.into_iter().collect();
-                acc.retain(|k| s.contains(k));
-            }
-            acc
+            gather.intersect(istore, terms)?
         };
+        meter.charge(COSTS.gin_entry * gather.entries as i64);
+        let mut pages = gather.pages;
 
         let mut slabs = 0usize;
         let mut rows = Vec::with_capacity(candidates.len());
@@ -491,6 +470,105 @@ pub(crate) fn index_store_bound_entries(
         ));
     }
     Ok((rows, (pages, slabs)))
+}
+
+/// The posting reads of one GIN gather and their units: `page_read` nodes and `gin_entry` entries.
+#[derive(Default)]
+struct GinGather {
+    pages: usize,
+    entries: usize,
+}
+
+impl GinGather {
+    /// The posting range of `term`: every entry `term ‖ storage_key` (gin.md §4).
+    fn posting_bound(term: &[u8]) -> KeyBound {
+        KeyBound {
+            lo: Some(term.to_vec()),
+            lo_inc: true,
+            hi: prefix_successor(term),
+            hi_inc: false,
+        }
+    }
+
+    /// Read `bound` of the entry tree, charging its overlap nodes and entries, and return the
+    /// storage keys of its entries (the suffix after the term) in ascending order.
+    fn read(&mut self, istore: &TableStore, bound: &KeyBound, term: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let (es, p, _) = istore.range_scan_with_units(bound, &[])?;
+        self.pages += p;
+        self.entries += es.len();
+        Ok(es
+            .into_iter()
+            .map(|(ekey, _)| ekey[term.len()..].to_vec())
+            .collect())
+    }
+
+    /// A term's whole posting list (a prefix range scan).
+    fn posting_list(&mut self, istore: &TableStore, term: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.read(istore, &Self::posting_bound(term), term)
+    }
+
+    /// The ALL-mode intersection (gin.md §6.2). The terms are ordered by their posting range's
+    /// skeleton overlap count (ties by bytes); the first list is read whole, and each following term
+    /// is probed at the surviving candidates in leaf groups — runs of consecutive candidates whose
+    /// probe keys fall in one leaf — each charging its root-to-leaf path once and one `gin_entry` per
+    /// step of the cheaper leaf-local match (gin.md §6.2). Stops once no candidate survives. The spans and the grouping read only the
+    /// resident skeleton and are unmetered.
+    fn intersect(&mut self, istore: &TableStore, terms: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+        let mut ordered: Vec<(usize, Vec<u8>)> = terms
+            .into_iter()
+            .map(|t| (istore.overlap_node_count(&Self::posting_bound(&t)), t))
+            .collect();
+        ordered.sort();
+        let mut ordered = ordered.into_iter().map(|(_, t)| t);
+        let Some(driver) = ordered.next() else {
+            return Ok(Vec::new());
+        };
+        let mut candidates = self.posting_list(istore, &driver)?;
+        let height = istore.height();
+        let probe = |term: &[u8], key: &[u8]| [term, key].concat();
+        let span = |lo: Vec<u8>, hi: Vec<u8>| KeyBound {
+            lo: Some(lo),
+            lo_inc: true,
+            hi: Some(hi),
+            hi_inc: true,
+        };
+        for term in ordered {
+            if candidates.is_empty() {
+                break;
+            }
+            let mut survivors = Vec::new();
+            let mut i = 0;
+            while i < candidates.len() {
+                let first = probe(&term, &candidates[i]);
+                let mut j = i;
+                while j + 1 < candidates.len()
+                    && istore
+                        .overlap_node_count(&span(first.clone(), probe(&term, &candidates[j + 1])))
+                        == height
+                {
+                    j += 1;
+                }
+                // One leaf: its root-to-leaf path once, then the cheaper leaf-local match — a probe
+                // per candidate, or a merge with the term's entries between the first and last
+                // candidate — one `gin_entry` per step.
+                let (found, path, _) = istore
+                    .range_scan_with_units(&span(first, probe(&term, &candidates[j])), &[])?;
+                self.pages += path;
+                self.entries += (j + 1 - i).min(found.len());
+                // Both lists ascend, so a merge keeps the candidates whose entry was found.
+                let mut f = found.iter().map(|(k, _)| &k[term.len()..]).peekable();
+                for c in &candidates[i..=j] {
+                    while f.next_if(|k| *k < c.as_slice()).is_some() {}
+                    if f.next_if(|k| *k == c.as_slice()).is_some() {
+                        survivors.push(c.clone());
+                    }
+                }
+                i = j + 1;
+            }
+            candidates = survivors;
+        }
+        Ok(candidates)
+    }
 }
 
 /// The outcome of a GIN opclass's `extract_query_terms` (gin.md §2/§6): the distinct query terms to

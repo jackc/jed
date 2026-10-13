@@ -54,7 +54,7 @@ INSERT INTO d VALUES
 # ---- @> -------------------------------------------------------------------------------------
 
 # a top-level member value: only row 1 has a = 1 (row 3's 1.50 is a different number)
-# cost: 24
+# cost: 21
 query I nosort
 SELECT id FROM d WHERE doc @> '{"a": 1}' ORDER BY id
 ----

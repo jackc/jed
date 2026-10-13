@@ -581,13 +581,15 @@ cross-core in `spec/conformance/suites/query/gin_scan.test` (and `gin_any_eq.tes
 
 A GIN-bounded scan accrues, in place of the full-scan block:
 
-- **`page_read` × the entry-tree nodes** overlapping each query term's prefix range — the same
-  overlap-node rule as the ordered index, applied **once per query term** (`@>` and array `=`
-  gather all of `Q`'s distinct non-NULL elements, `&&` its distinct non-NULL elements, `= ANY` the
-  single scalar term — gin.md §2).
-- **`gin_entry` × the posting entries visited** across all term scans — the per-entry combine work
-  (intersection for `@>` / array `=` / `= ANY`, union for `&&`) that the per-node `page_read`
-  under-meters when a posting list is long.
+- **`page_read` × the entry-tree nodes** each posting read overlaps — the same overlap-node rule as
+  the ordered index. A union (`&&`, `?|`) or a single-term gather reads each term's prefix range
+  whole. An intersection of two or more terms (`@>`, array `=`, `?&`) reads only its shortest list
+  whole, then probes each other term at the surviving candidates, charging the root-to-leaf path
+  once per leaf the candidates land in, and stops once none survive (the skip-scan, gin.md §6.2).
+- **`gin_entry` × the posting entries visited** across those reads, plus the skip-scan's leaf-local
+  match steps (per leaf, the fewer of its candidates and the term's entries between them) — the per-entry combine work that the per-node `page_read` under-meters when a
+  posting list is long. The skip-scan's term ordering and leaf grouping read only the resident tree
+  skeleton and are unmetered.
 - **Per candidate row** (post-combine, point-looked-up in storage-key order): `page_read` × the
   table-tree nodes on its descent + its touched-column `value_decompress` slabs +
   **`storage_row_read`** — each candidate fetch costs exactly a PK point lookup of that row.

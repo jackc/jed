@@ -1,0 +1,62 @@
+# The GIN ALL-mode skip-scan intersection (spec/design/gin.md §6.2). Over a multi-leaf entry tree, an
+# intersection reads only its shortest posting list whole (terms ordered by skeleton span, ties by
+# bytes) and probes each other term at the surviving candidates in leaf-sized bounded scans, stopping
+# once none survive. The rows are the plain intersection (oracle-clean); the `# cost:` assertions pin
+# the term order, the leaf grouping, and the early stop cross-core (CLAUDE.md §8), and are far below
+# reading every list whole when one term is common.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_scan, query.gin_jsonb_ops, dml.insert, dml.insert_select, query.select, query.aggregates, query.set_returning, types.i64, types.array, cast.operator, types.jsonb, func.array_containment, func.jsonb_contains, func.json_builders, expr.arithmetic, resource.cost_metering
+
+statement ok
+CREATE TABLE s (id i64 PRIMARY KEY, tags i64[], doc jsonb)
+
+statement ok
+CREATE INDEX s_tags_gin ON s USING gin (tags)
+
+statement ok
+CREATE INDEX s_doc_gin ON s USING gin (doc)
+
+# tags: 0 is in every row, g % 7 in ~1/7, g % 100 + 1000 in 1/100; doc: "all" in every row, n in 1/50
+statement ok
+INSERT INTO s SELECT g, ARRAY[0, g % 7, g % 100 + 1000], jsonb_build_object('n', g % 50, 'all', true) FROM generate_series(1, 3000) AS g
+
+# a rare term (30 rows) drives; the common term 0 is probed at those 30 candidates only
+# cost: 241
+query I nosort
+SELECT count(*) FROM s WHERE tags @> '{0,1050}'::i64[]
+----
+30
+
+# two selective terms: the rarer drives, the other is probed
+# cost: 93
+query I nosort
+SELECT count(*) FROM s WHERE tags @> '{3,1050}'::i64[]
+----
+5
+
+# dense candidates: term 3 drives (~1/7 of the rows) and term 0 is probed leaf by leaf
+# cost: 3036
+query I nosort
+SELECT count(*) FROM s WHERE tags @> '{0,3}'::i64[]
+----
+429
+
+# an absent term has the smallest span and an empty list: nothing else is read
+# cost: 3
+query I nosort
+SELECT count(*) FROM s WHERE tags @> '{0,3,99999}'::i64[]
+----
+0
+
+# jsonb_ops: the number term drives; the "n" and "all" key terms are in every document
+# cost: 615
+query I nosort
+SELECT count(*) FROM s WHERE doc @> '{"n": 7, "all": true}'
+----
+60
+
+# cost: 21040
+query I nosort
+SELECT count(*) FROM s WHERE doc ?& '{n,all}'
+----
+3000

@@ -159,6 +159,10 @@
 #              and `doc ?& K` gather candidates from key/value terms; the same predicates over
 #              `doc::text::jsonb` (an identity round trip, not the bare column) are NOT GIN-accelerated.
 #              Both must return the by-construction rows of PostgreSQL's containment rule.
+#   gin_skip — the GIN ALL-mode skip-scan (gin.md §6.2) over a multi-leaf entry tree: `tags @> Q`
+#              mixing a term in every row, frequent, rare, and absent terms reads only the shortest
+#              posting list whole and probes the rest leaf by leaf; the equivalent `Q <@ tags` is NOT
+#              GIN-accelerated (full scan). Both must return the by-construction count and id sum.
 #   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
 #              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
@@ -384,6 +388,9 @@ GIN_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_mutati
 GIN_JSONB_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan query.gin_jsonb_ops
                    dml.insert dml.insert_multi_row query.select query.order_by types.i32 types.text
                    types.jsonb types.json_casts func.jsonb_contains cast.operator].freeze
+GIN_SKIP_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.insert
+                  dml.insert_select query.select query.aggregates query.set_returning types.i64
+                  types.array func.array_containment expr.arithmetic cast.operator].freeze
 GIST_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index query.gist_scan dml.insert
               dml.insert_multi_row query.select query.order_by types.i32 types.range
               func.range_constructors func.range_operators].freeze
@@ -1993,6 +2000,46 @@ def gen_gin(seed)
   gpair.call("@> {#{absent}} (absent -> empty)", [absent], matches.call([absent]))
   gpair.call("@> {#{present},#{k2}} (intersection)", [present, k2], matches.call([present, k2]))
 
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GIN ALL-mode skip-scan (multi-leaf @> via the GIN index vs <@ full scan) ----------
+# Over a table large enough for a multi-leaf entry tree, an intersection reads only its shortest
+# posting list whole (terms ordered by skeleton span) and probes the others in leaf groups at the
+# surviving candidates (spec/design/gin.md §6.2). `Q <@ tags` is the same predicate and full scans.
+# Each row's tags are modular functions of its id with seeded moduli, so the terms range from one in
+# every row to rare, and the expected count and id sum are known by construction.
+def gen_gin_skip(seed)
+  rng = Random.new(seed)
+  n = rng.rand(1200..2400)
+  a = rng.rand(3..9)    # frequent: g % a
+  b = rng.rand(40..120) # rare: g % b + 1000
+  c = rng.rand(5..15)   # medium, skewed by a multiplier: (g * k) % c + 100
+  k = rng.rand(2..7)
+  tags = ->(g) { [0, g % a, (g * k) % c + 100, g % b + 1000] }
+  out = header(seed, GIN_SKIP_REQ, "GIN ALL-mode skip-scan (multi-leaf @> via the GIN index vs <@ full scan)")
+  stmt(out, "CREATE TABLE t (id i64 PRIMARY KEY, tags i64[])")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+  stmt(out, "INSERT INTO t SELECT g, ARRAY[0, g % #{a}, (g * #{k}) % #{c} + 100, g % #{b} + 1000] " \
+            "FROM generate_series(1, #{n}) AS g")
+  queries = [
+    [0, rng.rand(0...a)],
+    [0, rng.rand(0...b) + 1000],
+    [rng.rand(0...a), rng.rand(0...c) + 100],
+    [0, rng.rand(0...a), rng.rand(0...c) + 100, rng.rand(0...b) + 1000],
+    [rng.rand(0...a), rng.rand(0...b) + 1000],
+    [0, rng.rand(0...a), 99_999] # an absent term
+  ]
+  queries.each do |q|
+    hits = (1..n).select { |g| (q - tags.call(g)).empty? }
+    exp = [hits.size.to_s, hits.empty? ? "NULL" : hits.sum.to_s]
+    arr = "'{#{q.join(',')}}'::i64[]"
+    out << "# @> #{q.inspect}"
+    out << "# GIN bound (skip-scan intersection)"
+    q(out, "II", "SELECT count(*), sum(id) FROM t WHERE tags @> #{arr}", exp)
+    out << "# full scan (Q <@ col is the same predicate, not GIN-accelerated) — MUST match"
+    q(out, "II", "SELECT count(*), sum(id) FROM t WHERE #{arr} <@ tags", exp)
+  end
   out.join("\n") + "\n"
 end
 
@@ -4060,6 +4107,7 @@ SCENARIOS = {
   "gin_interval" => method(:gen_gin_interval),
   "gin_mut" => method(:gen_gin_mutation),
   "gin_jsonb" => method(:gen_gin_jsonb),
+  "gin_skip" => method(:gen_gin_skip),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),
   "tlp" => method(:gen_tlp),

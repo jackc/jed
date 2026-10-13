@@ -10010,29 +10010,18 @@ export class Engine {
     // every stored term of one element type share that width; widthBytes is 0 for interval, whose
     // 16-byte span key is not its value encoding — encoding.md §2.10).
     const istore = this.lkpIndexStore(gb.nameKey);
-    let pages = 0;
-    let entriesVisited = 0;
-    const postings: Uint8Array[][] = [];
-    for (const prefix of terms) {
-      const b: KeyBound = {
-        lo: prefix,
-        loInc: true,
-        hi: prefixSuccessor(prefix),
-        hiInc: false,
-      };
-      const scan = istore.rangeScanWithUnits(b, []);
-      pages += scan.pages;
-      entriesVisited += scan.entries.length;
-      postings.push(scan.entries.map((e) => e.key.slice(prefix.length)));
-    }
-    meter.charge(COSTS.ginEntry * BigInt(entriesVisited));
-
-    // Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
-    // lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8). @> ALL →
-    // intersection; = ANY (member) is a single term, so its intersection is that lone posting list;
-    // array = (equal) gathers the same superset as @> over Q's distinct non-NULL terms (the residual
-    // = makes it exact downstream); && ANY → union.
-    const cand = anyMode ? unionPostings(postings) : intersectPostings(postings);
+    const gather = new GinGather(istore);
+    // The candidate storage keys, ascending byte (= storage-key) order, so the point lookups and
+    // emitted rows follow storage order exactly as a full scan (gin.md §6/§8). && / ?| (mode ANY) →
+    // the union of every whole posting list. Mode ALL → intersection: = ANY (member) and ? are a
+    // single term, so the intersection is that lone posting list; array = (equal) gathers the same
+    // superset as @> over Q's distinct non-NULL terms (the residual = makes it exact downstream); two
+    // or more terms take the skip-scan intersection (gin.md §6.2).
+    const cand = anyMode
+      ? unionPostings(terms.map((t) => gather.postingList(t)))
+      : gather.intersect(terms);
+    meter.charge(COSTS.ginEntry * BigInt(gather.entries));
+    let pages = gather.pages;
 
     let slabs = 0;
     const entries: Entry[] = [];
@@ -25430,25 +25419,99 @@ export function byteKey(a: Uint8Array): string {
   return s;
 }
 
-// intersectPostings returns the storage keys present in EVERY posting list (the @> mode-ALL
-// combine), sorted ascending. Each posting list holds distinct keys (one (term,row) entry per row),
-// so a per-list count == the number of lists means the key is in all of them.
-export function intersectPostings(postings: Uint8Array[][]): Uint8Array[] {
-  if (postings.length === 0) return [];
-  const count = new Map<string, number>();
-  for (const list of postings) {
-    for (const k of list) {
-      const key = byteKey(k);
-      count.set(key, (count.get(key) ?? 0) + 1);
+// GinGather is the posting reads of one GIN gather and their units: page_read nodes and gin_entry
+// entries (gin.md §6, cost.md "GIN-bounded scan").
+class GinGather {
+  pages = 0;
+  entries = 0;
+  private readonly istore: TableStore;
+
+  constructor(istore: TableStore) {
+    this.istore = istore;
+  }
+
+  // postingBound is the posting range of term: every entry term ‖ storage_key (gin.md §4).
+  static postingBound(term: Uint8Array): KeyBound {
+    return { lo: term, loInc: true, hi: prefixSuccessor(term), hiInc: false };
+  }
+
+  // read scans b of the entry tree, charging its overlap nodes and entries, and returns the storage
+  // keys of its entries (the suffix after the term) in ascending order.
+  private read(b: KeyBound, term: Uint8Array): Uint8Array[] {
+    const scan = this.istore.rangeScanWithUnits(b, []);
+    this.pages += scan.pages;
+    this.entries += scan.entries.length;
+    return scan.entries.map((e) => e.key.slice(term.length));
+  }
+
+  // postingList is a term's whole posting list (a prefix range scan).
+  postingList(term: Uint8Array): Uint8Array[] {
+    return this.read(GinGather.postingBound(term), term);
+  }
+
+  // intersect is the ALL-mode intersection (gin.md §6.2). The terms are ordered by their posting
+  // range's skeleton overlap count (ties by bytes); the first list is read whole, and each following
+  // term is probed at the surviving candidates in leaf groups — runs of consecutive candidates whose
+  // probe keys fall in one leaf — each charging its root-to-leaf path once and one gin_entry per step
+  // of the cheaper leaf-local match. Stops once no candidate survives. The spans and the grouping
+  // read only the resident skeleton and are unmetered.
+  intersect(terms: Uint8Array[]): Uint8Array[] {
+    const istore = this.istore;
+    const ordered = terms
+      .map((t) => ({ span: istore.overlapNodeCount(GinGather.postingBound(t)), t }))
+      .sort((a, b) => a.span - b.span || cmpBytes(a.t, b.t))
+      .map((o) => o.t);
+    if (ordered.length === 0) return [];
+    let candidates = this.postingList(ordered[0]!);
+    const height = istore.height();
+    const probe = (term: Uint8Array, key: Uint8Array): Uint8Array => {
+      const out = new Uint8Array(term.length + key.length);
+      out.set(term, 0);
+      out.set(key, term.length);
+      return out;
+    };
+    const span = (lo: Uint8Array, hi: Uint8Array): KeyBound => ({
+      lo,
+      loInc: true,
+      hi,
+      hiInc: true,
+    });
+    for (let ti = 1; ti < ordered.length && candidates.length > 0; ti++) {
+      const term = ordered[ti]!;
+      const survivors: Uint8Array[] = [];
+      let i = 0;
+      while (i < candidates.length) {
+        const first = probe(term, candidates[i]!);
+        let j = i;
+        while (
+          j + 1 < candidates.length &&
+          istore.overlapNodeCount(span(first, probe(term, candidates[j + 1]!))) === height
+        ) {
+          j++;
+        }
+        // One leaf: its root-to-leaf path once, then the cheaper leaf-local match — a probe per
+        // candidate, or a merge with the term's entries between the first and last candidate — one
+        // gin_entry per step.
+        const scan = istore.rangeScanWithUnits(span(first, probe(term, candidates[j]!)), []);
+        this.pages += scan.pages;
+        this.entries += Math.min(j + 1 - i, scan.entries.length);
+        // Both lists ascend, so a merge keeps the candidates whose entry was found.
+        const found = scan.entries.map((e) => e.key.subarray(term.length));
+        let f = 0;
+        for (let c = i; c <= j; c++) {
+          const ck = candidates[c]!;
+          while (f < found.length && cmpBytes(found[f]!, ck) < 0) f++;
+          if (f < found.length && cmpBytes(found[f]!, ck) === 0) {
+            survivors.push(ck);
+            f++;
+          }
+        }
+        i = j + 1;
+      }
+      candidates = survivors;
     }
+    return candidates;
   }
-  const need = postings.length;
-  const out: Uint8Array[] = [];
-  for (const k of postings[0]!) {
-    if (count.get(byteKey(k)) === need) out.push(k);
-  }
-  out.sort(cmpBytes);
-  return out;
 }
 
 // unionPostings returns the storage keys present in ANY posting list (the && mode-ANY combine),

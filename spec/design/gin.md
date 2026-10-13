@@ -383,16 +383,52 @@ PK/ordered/full choice stands.
    empty — it gathers the non-NULL terms and lets the residual `=` confirm (`col = ARRAY[1,NULL]`
    gathers `@> {1}`, finds `{1,NULL}`, confirms). These are degenerate constant queries; the common
    case proceeds.
-2. Each query term's posting list is read by a **prefix range scan** of the entry B-tree
-   (§4) into a set of row storage keys.
-3. The posting sets are combined by mode: **ALL → intersection** (`@>`, and `= ANY`'s single
-   term — an intersection of one list is that list), **ANY → union** (`&&`). The result is the
-   **candidate** storage-key set.
+2. **Mode ANY** (`&&`, `?|`): each query term's posting list is read whole by a **prefix range
+   scan** of the entry B-tree (§4), and the lists are **unioned**. **Mode ALL** with one term (`=
+   ANY`, `?`, a one-term `@>`) reads that term's list whole. **Mode ALL with two or more terms** is
+   the **skip-scan intersection** (§6.2), which reads only the shortest list whole and probes the
+   others at the surviving candidates.
+3. The result is the **candidate** storage-key set, in ascending storage-key order.
 4. Each candidate row is fetched from the table tree by **point lookup**, in storage-key
    order (so downstream order-determinism is unchanged), and the original `@>`/`&&` predicate
    stays the **residual `WHERE` filter**, re-applied to every fetched row — the standard
    bounded-scan contract. The bound only narrows which rows are fetched; the result is always
    correct.
+
+### 6.2 The ALL-mode skip-scan intersection
+
+An intersection needs only the rows every term carries, so it never needs the whole of a long
+posting list — the common jsonb key under `doc @> '{"n": 7}'`, or a frequent array element. The
+gather is, for distinct query terms `t₁ … t_k` (`k ≥ 2`):
+
+1. **Order the terms.** Each term's **span** is the number of entry-tree nodes its posting range
+   `[t, byte-successor(t))` overlaps — the overlap-node count a full read of that list would charge as
+   `page_read`, computed from the resident tree skeleton without reading a leaf (the estimator's
+   count, [estimator.md §8.1](estimator.md)). Terms are ordered by ascending span, ties by ascending
+   term bytes. Computing spans is **unmetered** planning work bounded by `k ×` the tree height.
+2. **Read the driver.** The first term's posting list is read whole, as a prefix range scan, charging
+   its overlap nodes as `page_read` and each entry as `gin_entry`. Its storage keys, ascending, are the
+   candidates `C`.
+3. **Probe each following term in order**, while `C` is non-empty. Walk `C` ascending, cutting it
+   into **leaf groups**: a group starts at the next unprocessed candidate `c_i` and extends to
+   `c_{i+1}, c_{i+2}, …` while the inclusive range `[t ‖ c_i, t ‖ c_j]` still overlaps a single leaf —
+   its overlap-node count equals the entry tree's height (again skeleton-only and unmetered). Each
+   group reads its one leaf: it charges the root-to-leaf path (the tree height) as `page_read` once.
+   It then matches its candidates by the cheaper of two leaf-local walks: probing each candidate for
+   its exact entry `t ‖ c`, or merging with the entries of `t` in `[t ‖ c_first, t ‖ c_last]` (both
+   ends inclusive). It charges one `gin_entry` per step: `min(candidates in the group, entries of t
+   in that range)`. A candidate survives when its entry exists. The survivors become `C`.
+4. **Stop early.** Once `C` is empty the remaining terms are not read and charge nothing.
+
+The result is exactly the intersection of the posting lists, in storage-key order, so rows and
+emission order are unchanged; only `page_read` and `gin_entry` change. Every input — the skeleton,
+the height, the term bytes, the storage keys — is cross-core identical, so the order, the groups, and
+the charges are a byte contract like the rest of the gather (§8). A probed term costs at most one
+`gin_entry` per candidate rather than one per posting entry, and never more than the entries of its
+own list between the candidates, plus one root-to-leaf path per leaf its candidates land in. The
+candidates are a subset of the driver's list, so a common term costs no more than the driver does,
+and over a one-leaf entry tree no intersection costs more than reading every list whole. This is PostgreSQL's GIN "fast scan" idea,
+advancing long lists by the short one's keys, expressed as leaf-local probes of the entry tree.
 
 **Narrowings this slice** (documented, relaxable, each a follow-on with its own NoREC
 obligation — [conformance.md §8](conformance.md)): ordinary single-relation/mutation bounds require
@@ -427,14 +463,17 @@ the join top-N composition.
 
 A GIN-bounded scan accrues, in place of the full-scan block:
 
-- **`page_read` × the entry-tree nodes** overlapping each query term's prefix range — the
-  same overlap-node rule as the ordered index, applied **once per query term** (a logical
-  count, never faulted).
-- **`gin_entry` × the posting entries visited** across all term scans — the per-entry
-  gather/combine work (intersection/union), which `page_read` alone (a per-*node* count)
+- **`page_read` × the entry-tree nodes** each posting read overlaps — the same overlap-node rule
+  as the ordered index, applied to every whole-list read (mode ANY, a single-term gather, the
+  ALL-mode driver), plus the root-to-leaf path once per leaf group of the ALL-mode skip-scan (§6.2)
+  (a logical count, never faulted).
+- **`gin_entry` × the posting entries visited** across those reads, plus one per candidate the
+  skip-scan's leaf-local match steps — the per-entry gather/combine work (intersection/union), which `page_read`
+  alone (a per-*node* count)
   under-bounds when a term's posting list is long. This is the unit that makes a
   many-term or high-posting `@>`/`&&` cost proportional to its real work, so a `max_cost`
-  ceiling bounds it (§13).
+  ceiling bounds it (§13). The skip-scan's ordering spans and leaf grouping are skeleton-only and
+  unmetered.
 - **Per candidate row** (post-combine): `page_read` × the table-tree nodes on its point
   lookup + that row's touched-column `value_decompress` slabs + **`storage_row_read`** —
   i.e. each candidate fetch costs exactly a PK point lookup of that row.
@@ -572,9 +611,3 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   posting-tree TID compression is a later storage optimization, byte-contract-pinned when it lands.
 - **Recheck elision** — proving the `array_ops` gather exact and dropping the residual
   `operator_eval` for non-lossy opclasses.
-- **ALL-mode skip-scan** — the gather reads every query term's posting list whole and charges
-  `gin_entry` for each entry, so an intersection with one very common term costs that term's whole
-  list. That is typical of `jsonb_ops`, where `doc @> '{"n": 7}'` reads the `"n"` key term of every
-  document carrying `n`. PostgreSQL's GIN fast-scan advances the long lists by the short one's keys.
-  The equivalent here is a byte-contract change to the gather and its cost (cost.md §3), so it is its
-  own slice.

@@ -1857,30 +1857,31 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 // entry visited) is charged on meter; the (pages, slabs) block is returned for the caller.
 func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, terms [][]byte, any bool, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	istore := db.lkpIndexStore(gb.nameKey)
-	entriesVisited := 0
-	postings := make([][][]byte, 0, len(terms))
-	for _, prefix := range terms {
-		b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
-		es, p, _, e := istore.RangeScanWithUnits(b, nil)
+	g := ginGatherer{istore: istore}
+	var cand [][]byte
+	if any {
+		// mode ANY (`&&`, `?|`) → the union of every whole posting list
+		postings := make([][][]byte, 0, len(terms))
+		for _, t := range terms {
+			keys, e := g.postingList(t)
+			if e != nil {
+				return nil, 0, 0, e
+			}
+			postings = append(postings, keys)
+		}
+		cand = unionPostings(postings)
+	} else {
+		// mode ALL → the skip-scan intersection (gin.md §6.2). `= ANY` and `?` are a single term, so
+		// the intersection is that lone posting list; array `=` gathers the same superset as `@>`
+		// (the residual makes it exact); the jsonb_ops gathers are supersets the residual rechecks.
+		c, e := g.intersect(terms)
 		if e != nil {
 			return nil, 0, 0, e
 		}
-		pages += p
-		entriesVisited += len(es)
-		keys := make([][]byte, len(es))
-		for i := range es {
-			keys[i] = es[i].Key[len(prefix):]
-		}
-		postings = append(postings, keys)
+		cand = c
 	}
-	meter.Charge(costs.GinEntry * int64(entriesVisited))
-
-	var cand [][]byte
-	if any {
-		cand = unionPostings(postings)
-	} else {
-		cand = intersectPostings(postings)
-	}
+	meter.Charge(costs.GinEntry * int64(g.entries))
+	pages = g.pages
 
 	for _, key := range cand {
 		if keysOnly {
@@ -2060,30 +2061,6 @@ func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 		out = append(out, entry{Key: key, Row: row})
 	}
 	return out, pages, slabs, nil
-}
-
-// intersectPostings returns the storage keys present in EVERY posting list (the @> mode-ALL
-// combine), sorted ascending. Each posting list holds distinct keys (one (term,row) entry per
-// row), so a per-list count == the number of lists means the key is in all of them.
-func intersectPostings(postings [][][]byte) [][]byte {
-	if len(postings) == 0 {
-		return nil
-	}
-	count := make(map[string]int)
-	for _, list := range postings {
-		for _, k := range list {
-			count[string(k)]++
-		}
-	}
-	need := len(postings)
-	var out [][]byte
-	for _, k := range postings[0] {
-		if count[string(k)] == need {
-			out = append(out, k)
-		}
-	}
-	slices.SortFunc(out, bytes.Compare)
-	return out
 }
 
 // unionPostings returns the storage keys present in ANY posting list (the && mode-ANY combine),
@@ -3030,4 +3007,105 @@ func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []ord
 		return nil
 	}
 	return &matches[0]
+}
+
+// ginGatherer accumulates the posting reads of one GIN gather and their units: page_read nodes and
+// gin_entry entries (gin.md §6 Cost).
+type ginGatherer struct {
+	istore  *tableStore
+	pages   int
+	entries int
+}
+
+// ginPostingBound is the posting range of term: every entry term ‖ storage_key (gin.md §4).
+func ginPostingBound(term []byte) keyBound {
+	return keyBound{lo: term, loInc: true, hi: prefixSuccessor(term), hiInc: false}
+}
+
+// postingList reads term's whole posting list (a prefix range scan), charging its overlap nodes and
+// entries, and returns the storage keys (the suffix after the term) in ascending order.
+func (g *ginGatherer) postingList(term []byte) ([][]byte, error) {
+	es, p, _, err := g.istore.RangeScanWithUnits(ginPostingBound(term), nil)
+	if err != nil {
+		return nil, err
+	}
+	g.pages += p
+	g.entries += len(es)
+	keys := make([][]byte, len(es))
+	for i := range es {
+		keys[i] = es[i].Key[len(term):]
+	}
+	return keys, nil
+}
+
+// intersect is the ALL-mode skip-scan intersection (gin.md §6.2). The terms are ordered by their
+// posting range's skeleton overlap count (ties by bytes); the first list is read whole, and each
+// following term is probed at the surviving candidates in leaf groups — runs of consecutive
+// candidates whose probe keys fall in one leaf — each charging its root-to-leaf path once and one
+// gin_entry per step of the cheaper leaf-local match. Stops once no candidate survives. The spans and
+// the grouping read only the resident skeleton and are unmetered.
+func (g *ginGatherer) intersect(terms [][]byte) ([][]byte, error) {
+	if len(terms) == 0 {
+		return nil, nil
+	}
+	type spanned struct {
+		span int
+		term []byte
+	}
+	ordered := make([]spanned, len(terms))
+	for i, t := range terms {
+		ordered[i] = spanned{g.istore.OverlapNodeCount(ginPostingBound(t)), t}
+	}
+	slices.SortFunc(ordered, func(a, b spanned) int {
+		if a.span != b.span {
+			return a.span - b.span
+		}
+		return bytes.Compare(a.term, b.term)
+	})
+	cand, err := g.postingList(ordered[0].term)
+	if err != nil {
+		return nil, err
+	}
+	height := g.istore.Height()
+	probe := func(term, key []byte) []byte {
+		return append(append(make([]byte, 0, len(term)+len(key)), term...), key...)
+	}
+	span := func(lo, hi []byte) keyBound { return keyBound{lo: lo, loInc: true, hi: hi, hiInc: true} }
+	for _, o := range ordered[1:] {
+		if len(cand) == 0 {
+			break
+		}
+		term := o.term
+		var survivors [][]byte
+		for i := 0; i < len(cand); {
+			first := probe(term, cand[i])
+			j := i
+			for j+1 < len(cand) && g.istore.OverlapNodeCount(span(first, probe(term, cand[j+1]))) == height {
+				j++
+			}
+			// One leaf: its root-to-leaf path once, then the cheaper leaf-local match — a probe per
+			// candidate, or a merge with the term's entries between the first and last candidate —
+			// one gin_entry per step.
+			found, path, _, err := g.istore.RangeScanWithUnits(span(first, probe(term, cand[j])), nil)
+			if err != nil {
+				return nil, err
+			}
+			g.pages += path
+			g.entries += min(j+1-i, len(found))
+			// Both lists ascend, so a merge keeps the candidates whose entry was found.
+			f := 0
+			for _, c := range cand[i : j+1] {
+				for f < len(found) && bytes.Compare(found[f].Key[len(term):], c) < 0 {
+					f++
+				}
+				if f < len(found) && bytes.Equal(found[f].Key[len(term):], c) {
+					survivors = append(survivors, c)
+					f++
+				}
+			}
+			i = j + 1
+		}
+		cand = survivors
+	}
+	return cand, nil
 }
