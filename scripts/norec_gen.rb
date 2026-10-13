@@ -158,8 +158,10 @@
 #                 precedence). Independent oracle for the boolean-connective surface (§8 hotspot).
 #   setop_logic — connective ↔ set operation over a unique key: `WHERE p OR q` == `(WHERE p) UNION
 #                 (WHERE q)`, `WHERE p AND q` == `(WHERE p) INTERSECT (WHERE q)`, plus UNION/INTERSECT/
-#                 DISTINCT idempotence + a NULL-group DISTINCT collapse. Exercises the set-op dedup
-#                 path against the same logic — catches a dedup/hash bug all cores share.
+#                 DISTINCT idempotence + a NULL-group DISTINCT collapse, and the same OR/AND pairs as
+#                 INSERT … SELECT sources (a set-op source stores what the connective source stores).
+#                 Exercises the set-op dedup path against the same logic — catches a dedup/hash bug
+#                 all cores share.
 #   join_comm   — INNER JOIN commutes (`a JOIN b` == `b JOIN a`) and equals the CROSS JOIN filtered by
 #                 the same equality. Same projected pairs, different execution shapes (operand order,
 #                 join operator vs Cartesian-product + residual filter). Independent join-semantics oracle.
@@ -342,7 +344,8 @@ GIST_SCALAR_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_scalar_index quer
 PREDICATE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                    query.comparison_order query.order_by query.logical_connectives expr.between
                    expr.in_list expr.comparison_value types.i32 null.three_valued].freeze
-SETOP_LOGIC_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+SETOP_LOGIC_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row
+                     dml.insert_select dml.insert_select_setop query.select
                      query.comparison_order query.order_by query.logical_connectives query.union
                      query.intersect query.distinct expr.comparison_value types.i32
                      null.three_valued].freeze
@@ -2563,6 +2566,23 @@ def gen_setop_logic(seed)
   q(out, "I", "SELECT id FROM t WHERE #{psql} UNION SELECT id FROM t WHERE #{psql} ORDER BY id", ids.call(set_p))
   out << "# INTERSECT idempotence : (WHERE p) INTERSECT (WHERE p) == WHERE p"
   q(out, "I", "SELECT id FROM t WHERE #{psql} INTERSECT SELECT id FROM t WHERE #{psql} ORDER BY id", ids.call(set_p))
+
+  # The same equivalences as INSERT sources (grammar.md §24): a set-op source stores exactly the rows
+  # the connective-filtered source stores.
+  out << "# INSERT sources : (WHERE p) UNION (WHERE q) stores the rows WHERE p OR q stores"
+  stmt(out, "CREATE TABLE ins_or (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE ins_union (id i32 PRIMARY KEY)")
+  stmt(out, "INSERT INTO ins_or SELECT id FROM t WHERE #{psql} OR #{qsql}")
+  stmt(out, "INSERT INTO ins_union SELECT id FROM t WHERE #{psql} UNION SELECT id FROM t WHERE #{qsql}")
+  q(out, "I", "SELECT id FROM ins_or ORDER BY id", ids.call(or_ids))
+  q(out, "I", "SELECT id FROM ins_union ORDER BY id", ids.call(or_ids))
+  out << "# INSERT sources : (WHERE p) INTERSECT (WHERE q) stores the rows WHERE p AND q stores"
+  stmt(out, "CREATE TABLE ins_and (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE ins_intersect (id i32 PRIMARY KEY)")
+  stmt(out, "INSERT INTO ins_and SELECT id FROM t WHERE #{psql} AND #{qsql}")
+  stmt(out, "INSERT INTO ins_intersect SELECT id FROM t WHERE #{psql} INTERSECT SELECT id FROM t WHERE #{qsql}")
+  q(out, "I", "SELECT id FROM ins_and ORDER BY id", ids.call(and_ids))
+  q(out, "I", "SELECT id FROM ins_intersect ORDER BY id", ids.call(and_ids))
 
   # DISTINCT no-op on the unique key (must not drop or alter rows), then a real dedup: DISTINCT over
   # the NON-unique nullable column a — NULL is a single group and ORDER BY a sorts it LAST (PG model).

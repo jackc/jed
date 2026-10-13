@@ -248,6 +248,18 @@ As in PostgreSQL, a parenthesized query is the same query as its contents: `(SEL
 b` sorts the inner query, and writing the same clause inside and after the parentheses
 (`(SELECT … LIMIT 2) LIMIT 1`) is an error (`42601`).
 
+A set operation can also be the source of an `INSERT`, parenthesized or `WITH`-prefixed forms
+included. Each unified column type must be assignable to its target column, and `ON CONFLICT` and
+`RETURNING` work as usual — try it in the panel above:
+
+```sql
+INSERT INTO product
+  SELECT id + 10, name || ' refill', category, price FROM product WHERE category = 'office'
+  UNION ALL
+  SELECT 20, 'Kettle', 'kitchen', 30.00
+RETURNING id, name;
+```
+
 ## Common table expressions (`WITH`)
 
 A `WITH` clause names a query and exposes it to the `FROM` clause like a table. Define one or more —

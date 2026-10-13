@@ -254,6 +254,26 @@ test('the select page names a column with a bare label (no AS)', async ({ page }
   await expect(panel.getByTestId('result-rows')).toContainText('kitchen');
 });
 
+test('the select page inserts the rows of a set operation live', async ({ page }) => {
+  await page.goto('/docs/sql/select/');
+  // A set operation as an INSERT source (spec/design/grammar.md §24): the two office products are
+  // copied as refills and a literal kitchen row is appended, all through one UNION ALL.
+  const panel = livePanel(page, 'setOps');
+  await expect(panel.getByTestId('result-rows')).toContainText('Mug');
+  await panel
+    .getByTestId('sql-input')
+    .fill(
+      "INSERT INTO product SELECT id + 10, name || ' refill', category, price FROM product WHERE category = 'office' UNION ALL SELECT 20, 'Kettle', 'kitchen', 30.00 RETURNING id, name"
+    );
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('Pen refill');
+  await expect(panel.getByTestId('result-rows')).toContainText('Notebook refill');
+  await expect(panel.getByTestId('result-rows')).toContainText('Kettle');
+
+  await panel.getByTestId('reset-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('Mug');
+});
+
 test('the select page runs the data-modifying CTE demo live', async ({ page }) => {
   await page.goto('/docs/sql/select/');
   // The data-modifying CTE demo (spec/design/writable-cte.md): an

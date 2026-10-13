@@ -179,6 +179,7 @@ var SupportedCapabilities = []string{
 	// INSERT ... SELECT — insert the rows a query produces; up-front arity (42601) +
 	// type-assignability (42804) gates, then the same two-phase validation (grammar.md §24).
 	"dml.insert_select",
+	"dml.insert_select_setop",
 	// General expressions (incl. scalar subqueries) in INSERT ... VALUES slots (grammar.md §16).
 	"dml.insert_values_expr",
 	"error.overflow_trap",

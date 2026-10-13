@@ -2590,10 +2590,11 @@ func (p *parser) parseInsert() (*insert, error) {
 	}
 
 	// Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
-	// first expectIdentifier errors 42601 on `)`).
+	// first expectIdentifier errors 42601 on `)`). A `(` that begins a parenthesized query source
+	// (`INSERT INTO t (SELECT …) UNION …` — grammar.md §24) is not a column list.
 	var columns []string
 	var columnPos []srcPos
-	if p.peek().Kind == tokLParen {
+	if p.peek().Kind == tokLParen && !p.atInsertParenQuery() {
 		p.advance() // '('
 		for {
 			columnPos = append(columnPos, p.here())
@@ -2636,7 +2637,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		overriding = &mode
 	}
 
-	// The source is DEFAULT VALUES, a SELECT (§24), or a VALUES list. DEFAULT VALUES is the
+	// The source is DEFAULT VALUES, a query (§24), or a VALUES list. DEFAULT VALUES is the
 	// all-columns-omitted form, represented through the existing column-list machinery as one empty
 	// row mapped by an empty synthetic list. PostgreSQL does not combine it with a column list or
 	// OVERRIDING.
@@ -2658,8 +2659,10 @@ func (p *parser) parseInsert() (*insert, error) {
 		}
 		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: []string{}, Rows: [][]insertValue{{}}, OnConflict: onConflict, Returning: returning}, nil
 	}
-	if p.peekKeyword() == "select" {
-		sel, err := p.parseSelect()
+	// A query source (§24): a SELECT, a set operation, a parenthesized query, or a WITH-prefixed
+	// query. After the column list a `(` can only begin a query.
+	if p.isSelectAtIndex(p.pos) || p.atWithClause() || p.peek().Kind == tokLParen {
+		query, err := p.parseInsertQuery()
 		if err != nil {
 			return nil, err
 		}
@@ -2671,7 +2674,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Query: &query, OnConflict: onConflict, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
@@ -3340,21 +3343,33 @@ func (p *parser) parseSetOpQuantifier() bool {
 	}
 }
 
-// parseSelect parses a complete SELECT with its own trailing ORDER BY/LIMIT/OFFSET — the form an
-// INSERT ... SELECT source takes (spec/design/grammar.md §24). Behaviorally identical to the
-// pre-set-operations select: a select_core plus the trailing clauses.
-func (p *parser) parseSelect() (*selectStmt, error) {
-	sel, err := p.parseSelectCore()
-	if err != nil {
-		return nil, err
+// atInsertParenQuery reports whether the `(` at the current position begins a parenthesized query
+// source rather than an INSERT column list (grammar.md §24). A column list holds only identifiers,
+// so the `(` begins a query when it is followed by another `(`, by a WITH clause, or by a bare
+// SELECT that is not itself a listed column name (`(select)` / `(select, b)` stay column lists —
+// keywords are not reserved, §3). A §8 cross-core surface.
+func (p *parser) atInsertParenQuery() bool {
+	switch {
+	case p.peekKindAt(1) == tokLParen:
+		return true
+	case p.isWithClauseAtOffset(1):
+		return true
+	case p.isSelectAtIndex(p.pos + 1):
+		next := p.peekKindAt(2)
+		return next != tokComma && next != tokRParen
 	}
-	if err := p.parseOrderBy(sel); err != nil {
-		return nil, err
+	return false
+}
+
+// parseInsertQuery parses an INSERT's query source (grammar.md §24): a subquery_expr at the
+// statement top level — a WITH-prefixed query, or a set expression (whose operands may be
+// parenthesized queries) with an optional trailing ORDER BY / LIMIT / OFFSET folded onto it. A lone
+// SELECT folds back to a queryExpr{Select}, exactly the pre-set-operations source.
+func (p *parser) parseInsertQuery() (queryExpr, error) {
+	if p.atWithClause() {
+		return p.parseWithQueryExpr()
 	}
-	if err := p.parseLimitOffset(sel); err != nil {
-		return nil, err
-	}
-	return sel, nil
+	return p.parseQueryExprNode()
 }
 
 // parseSelectCore parses a SELECT without a trailing ORDER BY/LIMIT/OFFSET — the operand form of a

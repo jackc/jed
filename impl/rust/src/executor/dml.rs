@@ -313,7 +313,7 @@ impl Engine {
         // function need not be registered (spec/design/extensibility.md §7.1.1).
         let value_rows = match &source {
             InsertSource::Values(rows) => rows.as_slice(),
-            InsertSource::Select(_) => &[],
+            InsertSource::Query(_) => &[],
         };
         let default_exprs = self.resolve_default_exprs_for(
             tdef,
@@ -585,7 +585,7 @@ impl Engine {
                     },
                 })
             }
-            InsertSource::Select(sel) => {
+            InsertSource::Query(source) => {
                 // GENERATED ALWAYS gate (sequences.md §13.3): a SELECT projection always supplies an
                 // explicit value, so targeting an ALWAYS identity column without `OVERRIDING SYSTEM
                 // VALUE` is `428C9` — raised up front (PG raises it at rewrite), firing even over a
@@ -608,8 +608,10 @@ impl Engine {
                 let mut ptypes = ParamTypes::default();
                 // The source query (and the RETURNING sublinks) see the statement's CTE bindings
                 // (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
-                let mut plan =
-                    self.plan_query(&QueryExpr::Select(sel), None, ctx.bindings, &mut ptypes)?;
+                // A set-operation source is planned by the same set-op planner as a top-level query
+                // (grammar.md §24/§25); its unified column types are what the assignability gate
+                // below sees.
+                let mut plan = self.plan_query(&source, None, ctx.bindings, &mut ptypes)?;
                 let ret = match &returning {
                     Some(items) => Some(self.resolve_returning(
                         db.as_deref(),

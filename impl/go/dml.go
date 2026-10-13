@@ -924,7 +924,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	}
 	// Slice 2 caches only a top-level plain VALUES disposition. Writable CTE children reach this
 	// method without a cache slot; SELECT and ON CONFLICT retain the existing general path.
-	if ins.Select == nil && ins.OnConflict == nil {
+	if ins.Query == nil && ins.OnConflict == nil {
 		return db.executeInsertValuesCached(ins, params, ctx, ic, allowCacheFill, vw)
 	}
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table) // scope-aware temp-first (temp-tables.md §3)
@@ -1017,7 +1017,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		}
 	}
 
-	if ins.Select != nil {
+	if ins.Query != nil {
 		// GENERATED ALWAYS gate (sequences.md §13.3): a SELECT projection always supplies an
 		// explicit value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is
 		// 428C9 — raised up front (PG raises it at rewrite), firing even over a zero-row source.
@@ -1033,8 +1033,10 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		// t) reads the pre-insert snapshot, then writes.
 		// The source query (and the RETURNING sublinks) see the statement's CTE bindings
 		// (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
+		// A set-operation source is planned by the same set-op planner as a top-level query
+		// (grammar.md §24/§25); its unified column types are what the assignability gate below sees.
 		ptypes := &paramTypes{}
-		plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, ctx.bindings, ptypes)
+		plan, err := db.planQuery(*ins.Query, nil, ctx.bindings, ptypes)
 		if err != nil {
 			return outcome{}, err
 		}

@@ -1340,14 +1340,9 @@ impl Engine {
                     ));
                 }
                 let source = match &insert.source {
-                    InsertSource::Select(select) => {
+                    InsertSource::Query(source) => {
                         let mut ptypes = ParamTypes::default();
-                        let query = self.plan_query(
-                            &QueryExpr::Select(select.clone()),
-                            None,
-                            &visible,
-                            &mut ptypes,
-                        )?;
+                        let query = self.plan_query(source, None, &visible, &mut ptypes)?;
                         self.estimate_query_plan(&query, ctx)
                     }
                     InsertSource::Values(rows) => {

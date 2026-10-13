@@ -850,8 +850,8 @@ export function countCteRefsDml(body: CteBody, name: string): number {
   }
   if (body.kind === "insert") {
     let n = 0;
-    if (body.source.kind === "select") {
-      n = countSelfRefsSelect(body.source.select, name);
+    if (body.source.kind === "query") {
+      n = countSelfRefsQuery(body.source.query, name);
     } else {
       // A VALUES expression slot may hold a sublink (grammar.md §16).
       for (const values of body.source.rows) {
@@ -1831,8 +1831,8 @@ export function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string
   // The write target needs INSERT. A VALUES expression slot needs what its sublinks read and the
   // functions it calls (grammar.md §16); an INSERT … SELECT source needs SELECT on its tables.
   req.tables.push({ name: ins.table, priv: "insert" });
-  if (ins.source.kind === "select") {
-    collectSelectPrivs(ins.source.select, req, locals);
+  if (ins.source.kind === "query") {
+    collectQueryPrivs(ins.source.query, req, locals);
   } else {
     for (const values of ins.source.rows) {
       for (const v of values) if (v.kind === "expr") collectExprPrivs(v.expr, req, locals);

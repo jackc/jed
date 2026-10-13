@@ -1547,15 +1547,34 @@ two forms and is the **first deliberately lazy** expression in the engine.
 ## 24. `INSERT ... SELECT`
 
 `INSERT` may take its rows from a **query** instead of a `VALUES` list: the `insert`
-production's source is now `( "VALUES" row ("," row)* | select )`. `INSERT INTO dst SELECT a, b
-FROM src WHERE …` inserts whatever the embedded `SELECT` produces. The whole `SELECT` surface
+production's source is now `( "VALUES" row ("," row)* | subquery_expr )`. `INSERT INTO dst SELECT a, b
+FROM src WHERE …` inserts whatever the embedded query produces. The whole query surface
 is reachable as a source — `WHERE`, `JOIN`, `GROUP BY`/`HAVING`, `DISTINCT`, `ORDER BY`,
-`LIMIT`/`OFFSET`, aggregates, `CASE` — because the source *is* a `select`, parsed and executed
-by the same path as a top-level query. The optional **column list** and **`DEFAULT`-for-omitted
+`LIMIT`/`OFFSET`, aggregates, `CASE` — because the source *is* a query, parsed and executed
+by the same path as a top-level query.
+
+**A set operation, a parenthesized query, or a `WITH` prefix is a source too** (PostgreSQL's
+`SelectStmt`): `INSERT INTO t SELECT … UNION [ALL] SELECT …` (likewise `INTERSECT`/`EXCEPT`, with
+§25's precedence), parenthesized operands with their own `ORDER BY`/`LIMIT`, a trailing `ORDER BY`/
+`LIMIT`/`OFFSET` over the combined result, a parenthesized whole source (`INSERT INTO t (SELECT …)
+…`, `INSERT INTO t (a, b) (SELECT … EXCEPT SELECT …)`), and `INSERT INTO t WITH w AS (…) SELECT …`
+(a **nested** `WITH`, cte.md §7 — so a data-modifying CTE there is `0A000`, PostgreSQL's "must be
+at the top level", while the statement-level `WITH … INSERT` of writable-cte.md stays the place for
+one). The source is planned as the ordinary set-operation plan — no special case — so its output
+column types are §25's per-position unified types, and those are what the assignability gate below
+checks (`SELECT 1 UNION SELECT 3000000000` is `i64`, assignable to an `i32` target, and then traps
+`22003` per row). An all-`NULL` set-op column stays untyped (§25) and so is assignable to any
+target — PostgreSQL resolves it to `text` first and rejects a non-text target (`42804`); jed's
+untyped-NULL rule makes the difference observable here (ledgered). Right after the target, a `(`
+is ambiguous between the column list and a parenthesized source; it **begins the query** when it is
+followed by another `(`, a `WITH` clause, or a bare `SELECT` that is not itself a listed column
+name — keywords are not reserved (§3), so `(select)` and `(select, b)` stay column lists
+(PostgreSQL reserves `SELECT` and rejects both; ledgered). A `VALUES` operand or a parenthesized
+`VALUES` source is not accepted (§25's deferred narrowing). The optional **column list** and **`DEFAULT`-for-omitted
 columns** (§16) apply unchanged; a `DEFAULT` *keyword* value slot is a `VALUES`-only thing and
 does not exist in the SELECT source.
 
-**Arity — the `SELECT`'s output column count must match the target**, exactly as a `VALUES`
+**Arity — the query's output column count must match the target**, exactly as a `VALUES`
 row's arity must (§12): the number of projected columns must equal the column-list length, or
 the table's column count with no list, else `42601`. This is checked **once, before any row is
 produced** — so it fires even when the `SELECT` returns **zero rows**.
@@ -1589,7 +1608,8 @@ new rows back (no Halloween problem). A self-insert whose keys collide with the 
 traps `23505` and stores nothing; a key-shifting self-insert (`INSERT INTO t SELECT id + 100, a
 FROM t`) doubles the table.
 
-**Cost = the embedded `SELECT`'s accrued cost** ([cost.md](cost.md)). The `SELECT` already
+**Cost = the embedded query's accrued cost** ([cost.md](cost.md)) — for a set operation its
+`lhs + rhs` (§25). The `SELECT` already
 charges `storage_row_read` per scanned row and `row_produced` per emitted row (plus expression
 `operator_eval`s); storing the rows is unmetered, like every `INSERT`. So the statement's
 deterministic, cross-core cost is exactly what the source query accrues — unlike the
@@ -1762,8 +1782,6 @@ leaves the `UNION` as a leftover token, `42601`, as in PostgreSQL.
 
 **Deferred narrowings (each relaxable later).**
 
-- **No set operation in an `INSERT … SELECT` source** (§24) — the source stays a single `select`
-  (including a parenthesized one).
 - **No `VALUES` operand** — `VALUES (1) UNION SELECT 2` and a top-level `VALUES` query are not
   accepted; `VALUES` is only a derived-table body (§42).
 

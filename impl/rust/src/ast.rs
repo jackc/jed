@@ -545,9 +545,9 @@ pub struct TypeMod {
     pub scale: Option<u64>,
 }
 
-/// `INSERT INTO <table> [(col, ..)] ( DEFAULT VALUES | VALUES (..)[, (..)]* | <select> )`. The
+/// `INSERT INTO <table> [(col, ..)] ( DEFAULT VALUES | VALUES (..)[, (..)]* | <query> )`. The
 /// rows come from `DEFAULT VALUES`, a `VALUES` list (each value a literal or the `DEFAULT`
-/// keyword), or a `SELECT`
+/// keyword), or a query — a `SELECT`, set operation, or `WITH`-prefixed query
 /// (spec/design/grammar.md §24). An INSERT is two-phase / all-or-nothing — every row is
 /// validated before any is stored (spec/design/grammar.md §12).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -572,7 +572,8 @@ pub struct Insert {
     /// The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
     /// governing IDENTITY columns. `None` is the default (no override).
     pub overriding: Option<Overriding>,
-    /// Where the rows come from: a `VALUES` list or a `SELECT`.
+    /// Where the rows come from: a `VALUES` list or a query (a `SELECT`, set operation, or
+    /// `WITH`-prefixed query).
     /// `DEFAULT VALUES` is represented as one empty VALUES row plus `columns = Some([])`.
     pub source: InsertSource,
     /// The optional `ON CONFLICT` clause (UPSERT — spec/design/upsert.md), between the source
@@ -632,9 +633,10 @@ pub enum InsertSource {
     /// row's values in the order of `columns` (or column order when `columns` is `None`).
     /// Always non-empty.
     Values(Vec<Vec<InsertValue>>),
-    /// `SELECT ...` — the rows the query produces, in its output order. Boxed to keep `Insert`
-    /// (and so `Statement`) small, since the SELECT source is the rarer form.
-    Select(Box<Select>),
+    /// A query — a `SELECT`, a set operation, a parenthesized query, or a `WITH`-prefixed query
+    /// (spec/design/grammar.md §24) — whose rows are inserted in its output order. Boxed to keep
+    /// `Insert` (and so `Statement`) small, since the query source is the rarer form.
+    Query(Box<QueryExpr>),
 }
 
 /// One value slot in an INSERT `VALUES` row: a literal, a bind parameter (`$N`, bound at

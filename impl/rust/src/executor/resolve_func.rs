@@ -2790,7 +2790,7 @@ pub(crate) fn collect_insert_privs(ins: &Insert, req: &mut PrivReq, locals: &Has
     // the functions it calls (grammar.md §16); an `INSERT … SELECT` source needs SELECT on its tables.
     req.need_table(&ins.table, Privilege::Insert);
     match &ins.source {
-        InsertSource::Select(sel) => collect_select_privs(sel, req, locals),
+        InsertSource::Query(q) => collect_query_privs(q, req, locals),
         InsertSource::Values(rows) => {
             for value in rows.iter().flatten() {
                 if let InsertValue::Expr(e) = value {

@@ -580,7 +580,8 @@ type typeMod struct {
 }
 
 // Insert is an INSERT ... [(col, ..)] whose rows come from DEFAULT VALUES, a VALUES list (each
-// value a literal or the DEFAULT keyword), or a SELECT (INSERT ... SELECT — grammar.md §24).
+// value a literal or the DEFAULT keyword), or a query — a SELECT, set operation, or WITH-prefixed
+// query (INSERT ... SELECT — grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
 // (spec/design/grammar.md §12).
 type insert struct {
@@ -604,12 +605,13 @@ type insert struct {
 	// Overriding is the optional `OVERRIDING { SYSTEM | USER } VALUE` clause
 	// (spec/design/sequences.md §13), governing IDENTITY columns. nil is the default (no override).
 	Overriding *overridingKind
-	// EXACTLY ONE of Rows / Select is set (the parser guarantees it). Rows is the VALUES source:
+	// EXACTLY ONE of Rows / Query is set (the parser guarantees it). Rows is the VALUES source:
 	// each inner slice is one row's values in the order of Columns (or column order when Columns
-	// is nil); non-empty when set, nil when Select is set. DEFAULT VALUES is one empty row plus an
-	// empty non-nil Columns slice. Select is the SELECT source: nil when Rows is set.
-	Rows   [][]insertValue
-	Select *selectStmt
+	// is nil); non-empty when set, nil when Query is set. DEFAULT VALUES is one empty row plus an
+	// empty non-nil Columns slice. Query is the query source (a SELECT, set operation, or
+	// WITH-prefixed query): nil when Rows is set.
+	Rows  [][]insertValue
+	Query *queryExpr
 	// OnConflict is the optional ON CONFLICT clause (UPSERT — spec/design/upsert.md), between the
 	// source and RETURNING. Nil = no clause (a conflict traps 23505 as usual).
 	OnConflict *onConflict

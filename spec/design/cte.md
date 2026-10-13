@@ -191,7 +191,8 @@ A nested `WITH` is recognized by a shape-based lookahead — `WITH RECURSIVE …
 `WITH <name> AS …` — so `with` stays a legal identifier elsewhere (`x IN (with)` is still a value
 list). It is reached at every position that already admits a parenthesized subquery: a derived table
 (`FROM ( … )`), a scalar subquery, `IN`/`EXISTS`/`ANY`/`ALL ( … )`, a set-operation operand, and a
-CTE body.
+CTE body — and, unparenthesized, an `INSERT`'s query source (`INSERT INTO t WITH w AS (…) SELECT …`,
+grammar.md §24), which is a nested `WITH` too (so a data-modifying CTE there is `0A000`).
 
 **Inherited scope + inner shadowing.** A nested `WITH` establishes a child CTE scope. It inherits the
 enclosing statement's visible bindings, then adds its own CTEs with the usual forward-only rule.

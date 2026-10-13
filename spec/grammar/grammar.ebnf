@@ -433,8 +433,12 @@ type_word      ::= "character" "varying" | identifier
 
 /* --- DML ----------------------------------------------------------------- */
 
-/* INSERT's source is `DEFAULT VALUES`, a "VALUES" list of one or more parenthesized rows, OR a `select`
- * (INSERT ... SELECT — ../design/grammar.md §24). An optional column list names the target
+/* INSERT's source is `DEFAULT VALUES`, a "VALUES" list of one or more parenthesized rows, OR a
+ * subquery_expr (INSERT ... SELECT — ../design/grammar.md §24): a SELECT, a set operation, a
+ * parenthesized query, or a WITH-prefixed query (a nested WITH — a data-modifying CTE there is 0A000).
+ * Right after the target a "(" begins the parenthesized query source, not a column list, when it is
+ * followed by another "(", a WITH clause, or a bare SELECT that is not itself a listed column name
+ * ("(select)" and "(select, b)" stay column lists — keywords are not reserved, §3). An optional column list names the target
  * columns (`INSERT INTO t (a, c) VALUES ...` / `... SELECT ...`); with no list the values map
  * positionally to every column in declaration order. Each VALUES row's arity — or the SELECT's
  * output column count — must match the list (or the column count); a mismatch is 42601 (for the
@@ -447,9 +451,9 @@ type_word      ::= "character" "varying" | identifier
  * §12): every row is fully validated — arity, type/range (22003), NOT NULL (23502) — and every
  * storage key checked for a duplicate (23505), both against existing rows AND earlier rows in
  * the same statement, BEFORE any row is inserted. If any check fails, no row is inserted. An
- * INSERT ... SELECT additionally validates each projected column's TYPE is assignable to its
- * target up front (42804, even over an empty source — §24), and its cost is the embedded
- * SELECT's accrued cost (not zero).
+ * INSERT ... SELECT additionally validates each projected column's TYPE (a set operation's unified
+ * per-position type) is assignable to its target up front (42804, even over an empty source — §24),
+ * and its cost is the embedded query's accrued cost (not zero).
  *   "DEFAULT" is NOT reserved (§3): a column may be named "default", disambiguated positionally
  * (it is a keyword only in a VALUES slot).
  *   `DEFAULT VALUES` inserts exactly one row with every column omitted; it therefore applies every
@@ -469,7 +473,7 @@ insert         ::= "INSERT" "INTO" qualified_table ("AS" identifier)?
                    ( "DEFAULT" "VALUES"
                    | ("(" identifier ("," identifier)* ")")?
                      ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
-                     ( "VALUES" row ("," row)* | select ) )
+                     ( "VALUES" row ("," row)* | subquery_expr ) )
                    on_conflict?
                    returning_clause?
 
@@ -679,12 +683,6 @@ select_core    ::= "SELECT" "DISTINCT"? select_items ("FROM" from_clause)?
  * inline "OVER ( … )" is the only spelling until then). WINDOW is non-reserved (§3). */
 window_clause  ::= "WINDOW" window_named ("," window_named)*
 window_named   ::= identifier "AS" "(" window_definition ")"
-
-/* A SELECT with its own optional trailing ORDER BY / LIMIT / OFFSET — behaviorally identical to
- * the pre-set-operations `select`. This is the form an INSERT ... SELECT source takes; a set
- * operation is NOT allowed in an INSERT source this slice (a deferred narrowing,
- * ../design/grammar.md §25). */
-select         ::= select_core order_by? limit_offset?
 
 /* HAVING filters GROUPED rows: a general expression that must resolve to boolean (42804
  * otherwise), evaluated AFTER grouping/aggregation and BEFORE ORDER BY. Unlike WHERE (which

@@ -464,9 +464,9 @@ func (db *engine) explainInsert(r *explainRender, ins *insert, depth int, bindin
 		return newError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
 	r.emit(depth, "Insert "+ins.Table, insertDetail(ins))
-	if ins.Select != nil {
+	if ins.Query != nil {
 		ptypes := &paramTypes{}
-		plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, bindings, ptypes)
+		plan, err := db.planQuery(*ins.Query, nil, bindings, ptypes)
 		if err != nil {
 			return err
 		}

@@ -193,6 +193,10 @@ id = "dml.insert_select"
 description = "INSERT ... SELECT — insert the rows a query produces, through the same two-phase / all-or-nothing validation; output arity must match the target (42601) and projected types must be assignable up front (42804, even over an empty source); cost = the embedded SELECT's accrued cost (grammar.md §24)"
 
 [[capability]]
+id = "dml.insert_select_setop"
+description = "A set operation as the INSERT ... SELECT source (grammar.md §24/§25): INSERT INTO t SELECT … UNION [ALL] | INTERSECT [ALL] | EXCEPT [ALL] SELECT …, with parenthesized operands, a parenthesized whole source (INSERT INTO t (SELECT …) … — a `(` followed by `(`, a WITH clause, or a SELECT that is not a listed column name begins the query, not a column list), a trailing ORDER BY / LIMIT / OFFSET over the combined result, and a WITH prefix (a nested WITH: a data-modifying CTE there is 0A000). The source is the ordinary set-op plan; its per-position unified column types are assignment-checked to the target (42804, even over an empty source), its arity checked against the target (42601), and its rows run through the INSERT's two-phase validation, ON CONFLICT, and RETURNING, also as a writable CTE. Cost = the set operation's own cost (lhs + rhs); the INSERT adds nothing"
+
+[[capability]]
 id = "dml.insert_values_expr"
 description = "General expressions in INSERT ... VALUES slots — arithmetic, function calls, CASE, casts, and scalar subqueries (grammar.md §16). A slot that is exactly a literal / $N / DEFAULT / literal-field ROW(…) or ARRAY[…] keeps its contextual adaptation; any other slot resolves against a column-less scope (no columns: 42703; aggregates: 42803) with the target column's type as its literal hint and must be assignable to it (42804, the INSERT ... SELECT gate; a range/array column follows UPDATE's container rule; a composite column takes a value of its own type, an anonymous ROW expression is 0A000). Every slot is evaluated before any row is written; uncorrelated subqueries fold once against the pre-statement snapshot; each expression slot accrues its evaluated tree per row (cost.md §3)"
 

@@ -2211,9 +2211,10 @@ impl Parser {
         };
 
         // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected
-        // (the first `expect_identifier` errors 42601 on `)`).
+        // (the first `expect_identifier` errors 42601 on `)`). A `(` that begins a parenthesized
+        // query source (`INSERT INTO t (SELECT …) UNION …` — grammar.md §24) is not a column list.
         let mut column_pos = Vec::new();
-        let mut columns = if matches!(self.peek(), Token::LParen) {
+        let mut columns = if matches!(self.peek(), Token::LParen) && !self.at_insert_paren_query() {
             self.advance(); // '('
             let mut names = Vec::new();
             loop {
@@ -2251,7 +2252,7 @@ impl Parser {
             None
         };
 
-        // The source is DEFAULT VALUES, a SELECT (§24), or a VALUES list. DEFAULT VALUES is the
+        // The source is DEFAULT VALUES, a query (§24), or a VALUES list. DEFAULT VALUES is the
         // all-columns-omitted form, represented through the existing column-list machinery as one
         // empty row mapped by an empty synthetic list. PostgreSQL does not combine it with an
         // explicit column list or OVERRIDING.
@@ -2265,8 +2266,13 @@ impl Parser {
             self.expect_keyword("values")?;
             columns = Some(Vec::new());
             InsertSource::Values(vec![Vec::new()])
-        } else if self.peek_keyword().as_deref() == Some("select") {
-            InsertSource::Select(Box::new(self.parse_select()?))
+        } else if self.is_select_at(self.pos)
+            || self.at_with_clause()
+            || matches!(self.peek(), Token::LParen)
+        {
+            // A query source (§24): a `SELECT`, a set operation, a parenthesized query, or a
+            // `WITH`-prefixed query. After the column list a `(` can only begin a query.
+            InsertSource::Query(Box::new(self.parse_insert_query()?))
         } else {
             self.expect_keyword("values")?;
             let mut rows = Vec::new();
@@ -2293,6 +2299,36 @@ impl Parser {
             on_conflict,
             returning,
         })
+    }
+
+    /// Whether the `(` at the current position begins a parenthesized query source rather than an
+    /// INSERT column list (grammar.md §24). A column list holds only identifiers, so the `(` begins
+    /// a query when it is followed by another `(`, by a `WITH` clause, or by a bare `SELECT` that is
+    /// not itself a listed column name (`(select)` / `(select, b)` stay column lists — keywords are
+    /// not reserved, §3). A §8 cross-core surface.
+    fn at_insert_paren_query(&self) -> bool {
+        let next = self.pos + 1;
+        match self.tokens.get(next) {
+            Some(Token::LParen) => true,
+            _ if self.is_with_clause_at(next) => true,
+            _ if self.is_select_at(next) => !matches!(
+                self.tokens.get(next + 1),
+                Some(Token::Comma) | Some(Token::RParen)
+            ),
+            _ => false,
+        }
+    }
+
+    /// An INSERT's query source (grammar.md §24): a `subquery_expr` at the statement top level — a
+    /// `WITH`-prefixed query, or a set expression (whose operands may be parenthesized queries)
+    /// with an optional trailing `ORDER BY` / `LIMIT` / `OFFSET` folded onto it. A lone `SELECT`
+    /// folds back to `QueryExpr::Select`, exactly the pre-set-operations source.
+    fn parse_insert_query(&mut self) -> Result<QueryExpr> {
+        if self.at_with_clause() {
+            self.parse_with_query_expr()
+        } else {
+            self.parse_query_expr_node()
+        }
     }
 
     /// Parse the optional `ON CONFLICT [target] action` clause (UPSERT — spec/design/upsert.md),
@@ -2867,18 +2903,6 @@ impl Parser {
             }
             _ => false,
         }
-    }
-
-    /// A complete `SELECT` with its own optional trailing `ORDER BY`/`LIMIT`/`OFFSET` — the form an
-    /// `INSERT ... SELECT` source takes (spec/design/grammar.md §24). Behaviorally identical to the
-    /// pre-set-operations `select`: a `select_core` plus the trailing clauses.
-    fn parse_select(&mut self) -> Result<Select> {
-        let mut sel = self.parse_select_core()?;
-        sel.order_by = self.parse_order_by(true)?;
-        let (limit, offset) = self.parse_limit_offset()?;
-        sel.limit = limit;
-        sel.offset = offset;
-        Ok(sel)
     }
 
     /// `select_core ::= "SELECT" "DISTINCT"? select_items ("FROM" from_clause)? where?

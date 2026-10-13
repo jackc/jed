@@ -1340,3 +1340,20 @@ reason = "jed: an operator word the expression grammar continues with is always 
 file = "expr/bytea_functions.test"
 sql = "SELECT substring('hello' FROM 'l+')"
 reason = "PG's regular-expression substring forms (substring(text FROM pattern), SIMILAR … ESCAPE) are not implemented: the special form desugars to substring(text, text), which has no overload (42883). A deferred-surface divergence (string-functions.md §4)."
+
+# --- a set-op INSERT source: jed's unreserved SELECT keyword and its untyped all-NULL set-op
+# column (grammar.md §3/§24/§25).
+[[override]]
+file = "dml/insert_select_setop.test"
+sql = "INSERT INTO kw (select, a) SELECT 1, 2 UNION SELECT 3, 4 RETURNING *"
+reason = "jed reserves no keywords (grammar.md §3), so a bare `select` is a legal column name and `(select, a)` after the target is a column list: a `(` begins a parenthesized query source only when `(`, a WITH clause, or a SELECT that is not itself a listed name follows (§24). PostgreSQL reserves SELECT and rejects the column list (42601). A standing, documented keyword divergence."
+
+[[override]]
+file = "dml/insert_select_setop.test"
+sql = "INSERT INTO kw (select) VALUES (5) RETURNING *"
+reason = "jed reserves no keywords (grammar.md §3), so `(select)` after the target is a one-column list, not a parenthesized query. PostgreSQL reserves SELECT and rejects it (42601). A standing, documented keyword divergence."
+
+[[override]]
+file = "dml/insert_select_setop.test"
+sql = "INSERT INTO t (a, id) SELECT NULL, 300 UNION SELECT NULL, 301 RETURNING *"
+reason = "jed leaves a set-op column that is NULL-typed in every operand untyped (grammar.md §25, setops/types.test — the same rule as a bare untyped NULL), and an untyped projection is assignable to any INSERT target column (§24), so the NULLs are stored. PostgreSQL resolves the all-unknown UNION column to text first and rejects text for the integer column (42804). A consequence of jed's documented untyped-NULL rule, observable only through an INSERT target or an enclosing type check."

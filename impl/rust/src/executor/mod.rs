@@ -4241,7 +4241,7 @@ fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
         CteBody::Query(q) => count_self_refs_query(q, name),
         CteBody::Insert(ins) => {
             let mut n = match &ins.source {
-                InsertSource::Select(sel) => count_self_refs_select(sel, name),
+                InsertSource::Query(q) => count_self_refs_query(q, name),
                 // A VALUES expression slot may hold a sublink (grammar.md §16).
                 InsertSource::Values(rows) => rows
                     .iter()

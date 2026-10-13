@@ -817,14 +817,15 @@ export type AlterColumnAction = {
 };
 
 // Insert is an INSERT ... [(col, ..)] whose rows come from DEFAULT VALUES, a VALUES list (each
-// value a literal or the DEFAULT keyword), or a SELECT (INSERT ... SELECT — grammar.md §24).
+// value a literal or the DEFAULT keyword), or a query — a SELECT, set operation, or WITH-prefixed
+// query (INSERT ... SELECT — grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
 // (spec/design/grammar.md §12).
 // `columns` is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...` /
 // `... SELECT ...`); null is the positional form (every column, in declaration order). Names
 // resolve at execution time (unknown → 42703, duplicate → 42701); an unlisted column takes its
 // default else NULL.
-// `source` is the VALUES list (rows, non-empty) or the SELECT whose result rows are inserted.
+// `source` is the VALUES list (rows, non-empty) or the query whose result rows are inserted.
 export type Insert = {
   kind: "insert";
   table: string;
@@ -844,7 +845,7 @@ export type Insert = {
   // governing IDENTITY columns. null is the default (no override).
   overriding: Overriding | null;
   // DEFAULT VALUES is represented as one empty values row plus columns=[].
-  source: { kind: "values"; rows: InsertValue[][] } | { kind: "select"; select: Select };
+  source: { kind: "values"; rows: InsertValue[][] } | { kind: "query"; query: QueryExpr };
   // The optional ON CONFLICT clause (UPSERT — spec/design/upsert.md), between the source and
   // RETURNING. Null = no clause (a conflict traps 23505 as usual).
   onConflict: OnConflict | null;

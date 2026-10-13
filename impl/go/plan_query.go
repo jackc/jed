@@ -1038,8 +1038,8 @@ func countCteRefsDml(body *cteBody, name string) int {
 	case body.Insert != nil:
 		ins := body.Insert
 		n := 0
-		if ins.Select != nil {
-			n += countSelfRefsSelect(ins.Select, name)
+		if ins.Query != nil {
+			n += countSelfRefsQuery(*ins.Query, name)
 		}
 		// A VALUES expression slot may hold a sublink (grammar.md §16).
 		for _, values := range ins.Rows {

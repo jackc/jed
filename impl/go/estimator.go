@@ -2160,8 +2160,8 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 			return nil, newError(UndefinedTable, "table does not exist: "+ins.Table)
 		}
 		var source estimatedPlan
-		if ins.Select != nil {
-			plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, bindings, &paramTypes{})
+		if ins.Query != nil {
+			plan, err := db.planQuery(*ins.Query, nil, bindings, &paramTypes{})
 			if err != nil {
 				return nil, err
 			}

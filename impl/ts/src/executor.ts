@@ -4648,9 +4648,9 @@ export class Engine {
       // A write through an updatable view estimates its base-table statement (views.md §15.5).
       const ins = this.rewriteInsertTarget(inner).ins;
       if (this.lkpTableScoped(ins.db, ins.table) === undefined) throw engineError("undefined_table", "table does not exist: " + ins.table);
-      const source = ins.source.kind === "select"
+      const source = ins.source.kind === "query"
         ? this.estimateQueryPlan(
-            this.planQuery(ins.source.select, null, bindings, new ParamTypes()),
+            this.planQuery(ins.source.query, null, bindings, new ParamTypes()),
             ctx,
           )
         : leafEstimatedPlan(emptyPlanEstimate(BigInt(ins.source.rows.length)));
@@ -5013,8 +5013,8 @@ export class Engine {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
     r.emit(depth, "Insert " + ins.table, insertDetail(ins));
-    if (ins.source.kind === "select") {
-      const plan = this.planQuery(ins.source.select, null, bindings, new ParamTypes());
+    if (ins.source.kind === "query") {
+      const plan = this.planQuery(ins.source.query, null, bindings, new ParamTypes());
       this.renderQueryPlan(r, plan, depth + 1);
       return;
     }
@@ -10324,7 +10324,7 @@ export class Engine {
       }
     }
 
-    if (ins.source.kind === "select") {
+    if (ins.source.kind === "query") {
       // GENERATED ALWAYS gate (sequences.md §13.3): a SELECT projection always supplies an explicit
       // value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9 —
       // raised up front (PG raises it at rewrite), firing even over a zero-row source.
@@ -10342,7 +10342,9 @@ export class Engine {
       const ptypes = new ParamTypes();
       // The source query (and the RETURNING sublinks) see the statement's CTE bindings
       // (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
-      const plan = this.planQuery(ins.source.select, null, ctx.bindings, ptypes);
+      // A set-operation source is planned by the same set-op planner as a top-level query
+      // (grammar.md §24/§25); its unified column types are what the assignability gate below sees.
+      const plan = this.planQuery(ins.source.query, null, ctx.bindings, ptypes);
       const ret =
         ins.returning !== null
           ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw, ins.alias)

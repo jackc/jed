@@ -419,10 +419,9 @@ impl Engine {
         }
         r.emit(depth, format!("Insert {}", ins.table), insert_detail(ins));
         match &ins.source {
-            InsertSource::Select(sel) => {
+            InsertSource::Query(source) => {
                 let mut ptypes = ParamTypes::default();
-                let plan =
-                    self.plan_query(&QueryExpr::Select(sel.clone()), None, bindings, &mut ptypes)?;
+                let plan = self.plan_query(source, None, bindings, &mut ptypes)?;
                 self.render_query_plan(r, &plan, depth + 1)
             }
             InsertSource::Values(rows) => {

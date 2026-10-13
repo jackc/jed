@@ -1383,6 +1383,11 @@ drops/duplicates rows is unmetered, so the accrued `row_produced` reflects what 
 produced, not the set operation's final output. This is correct and intended: cost composes from
 the independently-metered subqueries.
 
+As an `INSERT … SELECT` source (grammar.md §24) a set operation composes the same way: the
+statement's cost is the set operation's `cost(a) + cost(b)` and the INSERT adds nothing, so
+`INSERT INTO t SELECT … UNION SELECT …` costs exactly what the same set operation costs as a
+query.
+
 **Worked example.** Tables `a` (3 rows) and `b` (2 rows), each a single leaf page;
 `SELECT x FROM a UNION SELECT x FROM b`. The left operand materializes `a` → 1 `page_read` +
 3 `storage_row_read` and emits 3 rows → 3 `row_produced` (a bare-column projection is a leaf,

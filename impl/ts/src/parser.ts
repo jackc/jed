@@ -2010,10 +2010,11 @@ class Parser {
     }
 
     // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
-    // first expectIdentifier errors 42601 on `)`).
+    // first expectIdentifier errors 42601 on `)`). A `(` that begins a parenthesized query source
+    // (`INSERT INTO t (SELECT …) UNION …` — grammar.md §24) is not a column list.
     let columns: string[] | null = null;
     const columnLocs: SrcLoc[] = [];
-    if (this.peek().kind === "lparen") {
+    if (this.peek().kind === "lparen" && !this.atInsertParenQuery()) {
       this.advance(); // '('
       const names: string[] = [];
       for (;;) {
@@ -2048,7 +2049,7 @@ class Parser {
       this.expectKeyword("value");
     }
 
-    // The source is DEFAULT VALUES, a SELECT (§24), or a VALUES list. DEFAULT VALUES is the
+    // The source is DEFAULT VALUES, a query (§24), or a VALUES list. DEFAULT VALUES is the
     // all-columns-omitted form, represented through the existing column-list machinery as one empty
     // row mapped by an empty synthetic list. PostgreSQL does not combine it with a column list or
     // OVERRIDING.
@@ -2076,9 +2077,10 @@ class Parser {
       };
     }
 
-    // SELECT and VALUES are disjoint leading keywords, so a peek decides without lookahead.
-    if (this.peekKeyword() === "select") {
-      const select = this.parseSelect();
+    // A query source (§24): a SELECT, a set operation, a parenthesized query, or a WITH-prefixed
+    // query. After the column list a `(` can only begin a query.
+    if (this.isSelectAtIndex(this.pos) || this.atWithClause() || this.peek().kind === "lparen") {
+      const query = this.parseInsertQuery();
       const onConflict = this.parseOnConflict();
       const returning = this.parseReturning();
       return {
@@ -2089,7 +2091,7 @@ class Parser {
         columns,
         columnLocs,
         overriding,
-        source: { kind: "select", select },
+        source: { kind: "query", query },
         onConflict,
         returning,
       };
@@ -2658,16 +2660,27 @@ class Parser {
     return { limit, offset };
   }
 
-  // parseSelect parses a complete SELECT with its own trailing ORDER BY/LIMIT/OFFSET — the form an
-  // INSERT ... SELECT source takes (spec/design/grammar.md §24). Behaviorally identical to the
-  // pre-set-operations parseSelect: a select_core plus the trailing clauses.
-  private parseSelect(): Select {
-    const sel = this.parseSelectCore();
-    sel.orderBy = this.parseOrderBy(true);
-    const { limit, offset } = this.parseLimitOffsetClauses();
-    sel.limit = limit;
-    sel.offset = offset;
-    return sel;
+  // atInsertParenQuery reports whether the `(` at the current position begins a parenthesized query
+  // source rather than an INSERT column list (grammar.md §24). A column list holds only identifiers,
+  // so the `(` begins a query when it is followed by another `(`, by a WITH clause, or by a bare
+  // SELECT that is not itself a listed column name (`(select)` / `(select, b)` stay column lists —
+  // keywords are not reserved, §3). A §8 cross-core surface.
+  private atInsertParenQuery(): boolean {
+    if (this.peekKindAt(1) === "lparen") return true;
+    if (this.isWithClauseAtOffset(1)) return true;
+    if (this.isSelectAtIndex(this.pos + 1)) {
+      const next = this.peekKindAt(2);
+      return next !== "comma" && next !== "rparen";
+    }
+    return false;
+  }
+
+  // parseInsertQuery parses an INSERT's query source (grammar.md §24): a subquery_expr at the
+  // statement top level — a WITH-prefixed query, or a set expression (whose operands may be
+  // parenthesized queries) with an optional trailing ORDER BY / LIMIT / OFFSET folded onto it. A lone
+  // SELECT folds back to a Select node, exactly the pre-set-operations source.
+  private parseInsertQuery(): QueryExpr {
+    return this.atWithClause() ? this.parseWithQueryExpr() : this.parseQueryExprNode();
   }
 
   // parseSelectCore parses a SELECT without a trailing ORDER BY/LIMIT/OFFSET — the operand form of
