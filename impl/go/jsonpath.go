@@ -235,14 +235,16 @@ func compile(src string) (jsonPath, error) {
 	case '+', '-', '*', '/', '%':
 		return jsonPath{}, jpUnsupported("path arithmetic")
 	default:
-		// A trailing WORD predicate operator (`like_regex`, `starts with`, `is unknown`) is a
-		// top-level predicate too — deferred 0A000 (not malformed). Any other word is malformed.
-		if isAsciiAlpha(c) {
-			rest := string(p.s[p.i:])
-			if strings.HasPrefix(rest, "like_regex") || strings.HasPrefix(rest, "starts") || strings.HasPrefix(rest, "is") {
+		// A trailing word predicate operator (`like_regex`, `starts with`) makes a top-level
+		// predicate too — deferred 0A000 (not malformed). Any other name is malformed.
+		if p.wordAhead() {
+			word, err := p.scanWord()
+			if err != nil {
+				return jsonPath{}, err
+			}
+			if jpKeywordIs(word, "like_regex") || jpKeywordIs(word, "starts") {
 				return jsonPath{}, jpUnsupported("top-level predicate expressions")
 			}
-			return jsonPath{}, jpMalformed("unexpected trailing input in path")
 		}
 		return jsonPath{}, jpMalformed("unexpected trailing input in path")
 	}
@@ -1515,7 +1517,8 @@ func writeIndex(i jpIndex, out *strings.Builder) {
 	}
 }
 
-// writeQuoted renders a member key as a canonical jsonpath quoted string ("…" with JSON escaping).
+// writeQuoted renders a member key as a canonical jsonpath quoted string — PostgreSQL's escape_json:
+// `\"`, `\\`, `\b \f \n \r \t`, and any other control character as `\u00XX`.
 func writeQuoted(k string, out *strings.Builder) {
 	out.WriteByte('"')
 	for _, c := range k {
@@ -1524,6 +1527,10 @@ func writeQuoted(k string, out *strings.Builder) {
 			out.WriteString("\\\"")
 		case '\\':
 			out.WriteString("\\\\")
+		case '\b':
+			out.WriteString("\\b")
+		case '\f':
+			out.WriteString("\\f")
 		case '\n':
 			out.WriteString("\\n")
 		case '\r':
@@ -1546,13 +1553,144 @@ func writeQuoted(k string, out *strings.Builder) {
 	out.WriteByte('"')
 }
 
-func isMemberStart(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+// jpIsSpecial reports PostgreSQL's jsonpath scanner `special` set (jsonpath_scan.l): each is a token
+// of its own, so it ends an unquoted name.
+func jpIsSpecial(c byte) bool {
+	return strings.IndexByte("?%$.[]{}()|&!=<>@#,*:-+/", c) >= 0
 }
 
-func isMemberCont(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-		c == '_' || c == '$'
+// jpIsBlank reports PostgreSQL's jsonpath `blank` set — whitespace.
+func jpIsBlank(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+}
+
+// jpIsOther reports PostgreSQL's jsonpath `other` class: a byte that may appear unescaped in an
+// unquoted name — not special, blank, `\`, or `"`. Every non-ASCII byte is one.
+func jpIsOther(c byte) bool {
+	return !jpIsSpecial(c) && !jpIsBlank(c) && c != '\\' && c != '"'
+}
+
+func jpIsOctDigit(c byte) bool { return c >= '0' && c <= '7' }
+
+func jpIsBinDigit(c byte) bool { return c == '0' || c == '1' }
+
+// jpNumberLen is the length of the longest PostgreSQL jsonpath number token at the start of s (which
+// starts with a digit), counting the rules a name competes with: an integer (decimal, or a
+// `0x`/`0o`/`0b` prefix), a decimal, a real, an incomplete exponent (`1e+`), and each with one
+// trailing `other` byte (the "trailing junk" rules). `_` digit separators count, as PostgreSQL 16+
+// lexes them.
+func jpNumberLen(s []byte) int {
+	at := func(j int) (byte, bool) {
+		if j < len(s) {
+			return s[j], true
+		}
+		return 0, false
+	}
+	// digitRun is the end of `(_?digit)*` from j (a first digit precedes it).
+	digitRun := func(j int, ok func(byte) bool) int {
+		for {
+			c, has := at(j)
+			switch {
+			case has && ok(c):
+				j++
+			case has && c == '_':
+				if n, hasN := at(j + 1); hasN && ok(n) {
+					j += 2
+				} else {
+					return j
+				}
+			default:
+				return j
+			}
+		}
+	}
+	// junk is a "trailing junk" rule: the token plus one `other` byte.
+	junk := func(end int) int {
+		if c, has := at(end); has && jpIsOther(c) {
+			return end + 1
+		}
+		return end
+	}
+	// decinteger: `0`, or a nonzero digit and (_?digit)*.
+	intEnd := 1
+	if s[0] != '0' {
+		intEnd = digitRun(1, isASCIIDigit)
+	}
+	best := junk(intEnd)
+	// hexinteger / octinteger / bininteger: `0x`, `0o`, `0b` and one or more digits.
+	if s[0] == '0' {
+		var ok func(byte) bool
+		if c, has := at(1); has {
+			switch c {
+			case 'x', 'X':
+				ok = isHexDigit
+			case 'o', 'O':
+				ok = jpIsOctDigit
+			case 'b', 'B':
+				ok = jpIsBinDigit
+			}
+		}
+		if c, has := at(2); ok != nil && has && ok(c) {
+			best = max(best, digitRun(3, ok))
+		}
+	}
+	// decimal: decinteger `.` decdigits?
+	mantissas := []int{intEnd}
+	if c, has := at(intEnd); has && c == '.' {
+		end := intEnd + 1
+		if f, hasF := at(end); hasF && isASCIIDigit(f) {
+			end = digitRun(end+1, isASCIIDigit)
+		}
+		best = max(best, junk(end))
+		mantissas = append(mantissas, end)
+	}
+	// real: (decinteger | decimal) [Ee] [-+]? decdigits; realfail: … [Ee] [-+].
+	for _, m := range mantissas {
+		if c, has := at(m); !has || (c != 'e' && c != 'E') {
+			continue
+		}
+		k := m + 1
+		signed := false
+		if c, has := at(k); has && (c == '-' || c == '+') {
+			signed = true
+			k++
+		}
+		if c, has := at(k); has && isASCIIDigit(c) {
+			best = max(best, junk(digitRun(k+1, isASCIIDigit)))
+		} else if signed {
+			best = max(best, k)
+		}
+	}
+	return best
+}
+
+// jpKeywordIs reports whether PostgreSQL keyword kw matches the decoded word w: exactly for `null` /
+// `true` / `false`, ASCII-case-insensitively for the rest (checkKeyword).
+func jpKeywordIs(w, kw string) bool {
+	if kw == "null" || kw == "true" || kw == "false" {
+		return w == kw
+	}
+	return asciiEqualFold(w, kw)
+}
+
+// asciiEqualFold compares two strings, folding only ASCII letters (PostgreSQL's pg_strncasecmp).
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
 
 func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
@@ -1617,27 +1755,61 @@ func (p *jpParser) skipWs() {
 	}
 }
 
-// eatKeyword consumes kw if it appears as a whole WORD at the cursor — i.e. the following byte is
-// not an identifier-continuation character (so `last]`, `to `, `strict $` all match, but `lastfoo`
-// does not).
-func (p *jpParser) eatKeyword(kw string) bool {
-	if p.i+len(kw) <= len(p.s) && string(p.s[p.i:p.i+len(kw)]) == kw {
-		after := p.i + len(kw)
-		if after >= len(p.s) || !isIdentByte(p.s[after]) {
-			p.i += len(kw)
-			return true
+// wordAhead reports whether PostgreSQL's scanner would lex a name (an identifier or keyword) at the
+// cursor: a backslash escape or an `other` byte. A digit starts a number instead, unless the run of
+// `other` bytes there is longer than every number token (flex's longest match: `1abc` is a name,
+// `12`, `1a`, and `1e3` are not).
+func (p *jpParser) wordAhead() bool {
+	c, ok := p.peek()
+	switch {
+	case !ok:
+		return false
+	case c == '\\':
+		return true
+	case isASCIIDigit(c):
+		rest := p.s[p.i:]
+		run := 0
+		for run < len(rest) && jpIsOther(rest[run]) {
+			run++
 		}
+		return run > jpNumberLen(rest)
+	default:
+		return jpIsOther(c)
 	}
-	return false
 }
 
-// parseIdent parses a bare identifier (a member key or method name).
-func (p *jpParser) parseIdent() string {
-	start := p.i
-	for p.i < len(p.s) && isMemberCont(p.s[p.i]) {
-		p.i++
+// scanWord scans the name at the cursor (wordAhead) — PostgreSQL's non-quoted string state: a run of
+// `other` bytes and backslash escapes (decoded as in a quoted string, jsonpath.md §2.1), ended by a
+// special byte, whitespace, `"`, or the end of input.
+func (p *jpParser) scanWord() (string, error) {
+	var out strings.Builder
+	for {
+		c, ok := p.peek()
+		switch {
+		case ok && c == '\\':
+			if err := p.parseEscape(&out); err != nil {
+				return "", err
+			}
+		case ok && jpIsOther(c):
+			p.copyChar(&out)
+		default:
+			return out.String(), nil
+		}
 	}
-	return string(p.s[start:p.i])
+}
+
+// eatKeyword consumes keyword kw if the name at the cursor is that keyword (jpKeywordIs). A name that
+// is not — or whose escapes fail to decode — is left unconsumed.
+func (p *jpParser) eatKeyword(kw string) bool {
+	if !p.wordAhead() {
+		return false
+	}
+	start := p.i
+	if w, err := p.scanWord(); err == nil && jpKeywordIs(w, kw) {
+		return true
+	}
+	p.i = start
+	return false
 }
 
 // parseQuoted parses a `"…"` jsonpath string — a port of PostgreSQL's jsonpath scanner escapes
@@ -1658,48 +1830,55 @@ func (p *jpParser) parseQuoted() (string, error) {
 			p.i++
 			return out.String(), nil
 		case '\\':
-			if p.i+1 >= len(p.s) {
-				return "", jpMalformed("unexpected end after backslash")
-			}
-			switch ec := p.s[p.i+1]; ec {
-			case 'u':
-				if err := p.parseUnicodeRun(&out); err != nil {
-					return "", err
-				}
-			case 'x':
-				if p.i+4 > len(p.s) || !isHexDigit(p.s[p.i+2]) || !isHexDigit(p.s[p.i+3]) {
-					return "", jpMalformed("invalid hexadecimal character sequence")
-				}
-				ch, _ := strconv.ParseUint(string(p.s[p.i+2:p.i+4]), 16, 32)
-				if err := jpPushCodePoint(rune(ch), &out); err != nil {
-					return "", err
-				}
-				p.i += 4
-			default:
-				p.i++ // the backslash; the escaped character follows
-				switch ec {
-				case 'b':
-					out.WriteByte('\b')
-				case 'f':
-					out.WriteByte('\f')
-				case 'n':
-					out.WriteByte('\n')
-				case 'r':
-					out.WriteByte('\r')
-				case 't':
-					out.WriteByte('\t')
-				case 'v':
-					out.WriteByte('\v')
-				default:
-					p.copyChar(&out)
-					continue
-				}
-				p.i++
+			if err := p.parseEscape(&out); err != nil {
+				return "", err
 			}
 		default:
 			p.copyChar(&out)
 		}
 	}
+}
+
+// parseEscape decodes the backslash escape at the cursor into out — shared by quoted strings and
+// unquoted names (jsonpath.md §2.1).
+func (p *jpParser) parseEscape(out *strings.Builder) error {
+	if p.i+1 >= len(p.s) {
+		return jpMalformed("unexpected end after backslash")
+	}
+	switch ec := p.s[p.i+1]; ec {
+	case 'u':
+		return p.parseUnicodeRun(out)
+	case 'x':
+		if p.i+4 > len(p.s) || !isHexDigit(p.s[p.i+2]) || !isHexDigit(p.s[p.i+3]) {
+			return jpMalformed("invalid hexadecimal character sequence")
+		}
+		ch, _ := strconv.ParseUint(string(p.s[p.i+2:p.i+4]), 16, 32)
+		if err := jpPushCodePoint(rune(ch), out); err != nil {
+			return err
+		}
+		p.i += 4
+	default:
+		p.i++ // the backslash; the escaped character follows
+		switch ec {
+		case 'b':
+			out.WriteByte('\b')
+		case 'f':
+			out.WriteByte('\f')
+		case 'n':
+			out.WriteByte('\n')
+		case 'r':
+			out.WriteByte('\r')
+		case 't':
+			out.WriteByte('\t')
+		case 'v':
+			out.WriteByte('\v')
+		default:
+			p.copyChar(out)
+			return nil
+		}
+		p.i++
+	}
+	return nil
 }
 
 // copyChar copies the one UTF-8 character at the cursor.
@@ -1825,6 +2004,17 @@ func (p *jpParser) parseIndex() (jpIndex, error) {
 	case !ok:
 		// A truncated path (no index where one is required) is malformed.
 		return jpIndex{}, jpMalformed("expected a subscript index")
+	case p.wordAhead():
+		// A name: a true/false/null literal starts an expression subscript (deferred); any other is
+		// not an expression.
+		word, err := p.scanWord()
+		if err != nil {
+			return jpIndex{}, err
+		}
+		if jpKeywordIs(word, "true") || jpKeywordIs(word, "false") || jpKeywordIs(word, "null") {
+			return jpIndex{}, jpUnsupported("non-literal subscript expressions")
+		}
+		return jpIndex{}, jpMalformed("expected a subscript index")
 	case !(isASCIIDigit(c) || c == '-'):
 		// A non-numeric token starts an expression subscript ($.a, arithmetic) — a deferred
 		// follow-on.
@@ -1862,8 +2052,14 @@ func (p *jpParser) parsePathExpr(top bool) (jpPathExpr, error) {
 	switch {
 	case c == '$' && p.i < len(p.s):
 		p.i++
-		// $name — a path variable — is a deferred follow-on (the vars surface).
-		if nc, ok := p.peek(); ok && (isMemberStart(nc) || nc == '"') {
+		// $name / $"name" — a path variable — is a deferred follow-on (the vars surface).
+		// PostgreSQL's unquoted variable name is a run of `other` bytes (no escapes).
+		if nc, ok := p.peek(); ok && nc == '"' {
+			if _, err := p.parseQuoted(); err != nil {
+				return jpPathExpr{}, err
+			}
+			return jpPathExpr{}, jpUnsupported("path variables `$name`")
+		} else if ok && jpIsOther(nc) {
 			return jpPathExpr{}, jpUnsupported("path variables `$name`")
 		}
 		e.primary = jpRoot
@@ -1879,6 +2075,12 @@ func (p *jpParser) parsePathExpr(top bool) (jpPathExpr, error) {
 			return jpPathExpr{}, err
 		}
 		e.primary, e.lit = jpLiteral, JsonNode{Kind: JString, S: s}
+	case p.i < len(p.s) && isASCIIDigit(c) && p.wordAhead():
+		// A digit-led name (`1abc`) is not an operand.
+		if _, err := p.scanWord(); err != nil {
+			return jpPathExpr{}, err
+		}
+		return jpPathExpr{}, jpMalformed("a name is not an operand")
 	case p.i < len(p.s) && (isASCIIDigit(c) || (c == '.' && isASCIIDigit(next))):
 		n, err := p.parseNumber()
 		if err != nil {
@@ -1902,20 +2104,29 @@ func (p *jpParser) parsePathExpr(top bool) (jpPathExpr, error) {
 		return jpPathExpr{primary: jpLiteral, lit: n}, nil
 	case (c == '-' || c == '+') && p.i < len(p.s):
 		return jpPathExpr{}, jpUnsupported("path arithmetic")
-	case p.eatKeyword("true"):
-		e.primary, e.lit = jpLiteral, JsonNode{Kind: JBool, B: true}
-	case p.eatKeyword("false"):
-		e.primary, e.lit = jpLiteral, JsonNode{Kind: JBool, B: false}
-	case p.eatKeyword("null"):
-		e.primary, e.lit = jpLiteral, JsonNode{Kind: JNull}
-	case p.eatKeyword("last"):
-		return jpPathExpr{}, jpMalformed("LAST is allowed only in array subscripts")
+	case p.wordAhead():
+		// A name: one of the keywords that start an operand, or else not an operand at all.
+		word, err := p.scanWord()
+		if err != nil {
+			return jpPathExpr{}, err
+		}
+		switch {
+		case jpKeywordIs(word, "true"):
+			e.primary, e.lit = jpLiteral, JsonNode{Kind: JBool, B: true}
+		case jpKeywordIs(word, "false"):
+			e.primary, e.lit = jpLiteral, JsonNode{Kind: JBool, B: false}
+		case jpKeywordIs(word, "null"):
+			e.primary, e.lit = jpLiteral, JsonNode{Kind: JNull}
+		case jpKeywordIs(word, "last"):
+			return jpPathExpr{}, jpMalformed("LAST is allowed only in array subscripts")
+		case jpKeywordIs(word, "exists"):
+			return jpPathExpr{}, jpUnsupported("exists predicates")
+		default:
+			return jpPathExpr{}, jpMalformed("a name is not an operand")
+		}
 	case top:
-		// A parenthesized expression, `exists (…)`, or another expression form — a deferred
-		// follow-on.
+		// A parenthesized expression or another expression form — a deferred follow-on.
 		return jpPathExpr{}, jpUnsupported("expressions other than an accessor path")
-	case p.eatKeyword("exists"):
-		return jpPathExpr{}, jpUnsupported("exists predicates")
 	default:
 		return jpPathExpr{}, jpMalformed("expected a comparison operand")
 	}
@@ -2063,6 +2274,7 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 		switch c {
 		case '.':
 			p.i++
+			dotEnd := p.i
 			p.skipWs()
 			nc, ok := p.peek()
 			switch {
@@ -2074,8 +2286,15 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 					return nil, err
 				}
 				steps = append(steps, jpStep{kind: jpMember, key: k})
-			case ok && isMemberStart(nc):
-				name := p.parseIdent()
+			case ok && p.i == dotEnd && isASCIIDigit(nc):
+				// PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
+				return nil, jpMalformed("expected a member name after `.`")
+			case p.wordAhead():
+				// An unquoted name (jsonpath.md §2.1); followed by `(`, an item method.
+				name, err := p.scanWord()
+				if err != nil {
+					return nil, err
+				}
 				save := p.i
 				p.skipWs()
 				if pc, ok := p.peek(); ok && pc == '(' {
@@ -2326,10 +2545,21 @@ func (p *jpParser) parseComparison() (*jpPred, error) {
 		op = jpCmpLt
 	case p.eat('>'):
 		op = jpCmpGt
+	case p.wordAhead():
+		// A word predicate operator is a deferred follow-on; any other name is malformed.
+		word, err := p.scanWord()
+		if err != nil {
+			return nil, err
+		}
+		if jpKeywordIs(word, "like_regex") || jpKeywordIs(word, "starts") {
+			return nil, jpUnsupported("like_regex / starts with predicates")
+		}
+		return nil, jpMalformed("expected a comparison operator")
 	default:
-		return nil, jpUnsupported(
-			"filter predicates other than a comparison (exists / like_regex / starts with)",
-		)
+		if c, ok := p.peek(); ok && (c == '+' || c == '-' || c == '*' || c == '/' || c == '%') {
+			return nil, jpUnsupported("path arithmetic")
+		}
+		return nil, jpMalformed("expected a comparison operator")
 	}
 	right, err := p.parsePathExpr(false)
 	if err != nil {

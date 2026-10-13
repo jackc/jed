@@ -131,18 +131,89 @@ function malformed(detail: string): EngineError {
   return engineError("syntax_error", `invalid jsonpath: ${detail}`);
 }
 
-function isMemberStart(c: string): boolean {
-  return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c === "_";
+// isSpecial is PostgreSQL's jsonpath scanner `special` set (jsonpath_scan.l): each is a token of its
+// own, so it ends an unquoted name.
+function isSpecial(c: string): boolean {
+  return "?%$.[]{}()|&!=<>@#,*:-+/".includes(c);
 }
 
-function isMemberCont(c: string): boolean {
-  return (
-    (c >= "a" && c <= "z") ||
-    (c >= "A" && c <= "Z") ||
-    (c >= "0" && c <= "9") ||
-    c === "_" ||
-    c === "$"
-  );
+// isOther is PostgreSQL's jsonpath `other` class: a character that may appear unescaped in an
+// unquoted name — not special, whitespace, `\`, or `"`. Every non-ASCII character is one.
+function isOther(c: string | undefined): boolean {
+  return c !== undefined && !isSpecial(c) && !isJsonpathWhitespace(c) && c !== "\\" && c !== '"';
+}
+
+// pgNumberLen is the length of the longest PostgreSQL jsonpath number token at index `i` of `s`
+// (where a digit starts), counting the rules a name competes with: an integer (decimal, or a
+// `0x`/`0o`/`0b` prefix), a decimal, a real, an incomplete exponent (`1e+`), and each with one
+// trailing `other` character (the "trailing junk" rules). `_` digit separators count, as PostgreSQL
+// 16+ lexes them. A number token is ASCII and its junk rule adds one byte, so the code-unit length
+// returned is PostgreSQL's byte length.
+function pgNumberLen(s: string, i: number): number {
+  const dec = (c: string | undefined): boolean => isAsciiDigit(c);
+  const hex = (c: string | undefined): boolean => c !== undefined && /^[0-9a-fA-F]$/.test(c);
+  const oct = (c: string | undefined): boolean => c !== undefined && c >= "0" && c <= "7";
+  const bin = (c: string | undefined): boolean => c === "0" || c === "1";
+  // The end of `(_?digit)*` from j (a first digit precedes it).
+  const digitRun = (j: number, ok: (c: string | undefined) => boolean): number => {
+    for (;;) {
+      if (ok(s[j])) j += 1;
+      else if (s[j] === "_" && ok(s[j + 1])) j += 2;
+      else return j;
+    }
+  };
+  // A "trailing junk" rule: the token plus one `other` character.
+  const junk = (end: number): number => (isOther(s[end]) ? end + 1 : end);
+  // decinteger: `0`, or a nonzero digit and (_?digit)*.
+  const intEnd = s[i] === "0" ? i + 1 : digitRun(i + 1, dec);
+  let best = junk(intEnd);
+  // hexinteger / octinteger / bininteger: `0x`, `0o`, `0b` and one or more digits.
+  if (s[i] === "0") {
+    const p = s[i + 1];
+    let ok: ((c: string | undefined) => boolean) | null = null;
+    if (p === "x" || p === "X") ok = hex;
+    else if (p === "o" || p === "O") ok = oct;
+    else if (p === "b" || p === "B") ok = bin;
+    if (ok?.(s[i + 2])) best = Math.max(best, digitRun(i + 3, ok));
+  }
+  // decimal: decinteger `.` decdigits?
+  const mantissas = [intEnd];
+  if (s[intEnd] === ".") {
+    const end = dec(s[intEnd + 1]) ? digitRun(intEnd + 2, dec) : intEnd + 1;
+    best = Math.max(best, junk(end));
+    mantissas.push(end);
+  }
+  // real: (decinteger | decimal) [Ee] [-+]? decdigits; realfail: … [Ee] [-+].
+  for (const m of mantissas) {
+    if (s[m] !== "e" && s[m] !== "E") continue;
+    let k = m + 1;
+    const signed = s[k] === "-" || s[k] === "+";
+    if (signed) k += 1;
+    if (dec(s[k])) best = Math.max(best, junk(digitRun(k + 1, dec)));
+    else if (signed) best = Math.max(best, k);
+  }
+  return best - i;
+}
+
+// utf8UnitBytes is the UTF-8 byte count a UTF-16 code unit contributes (each half of a surrogate
+// pair, two of the pair's four bytes).
+function utf8UnitBytes(u: number): number {
+  if (u < 0x80) return 1;
+  if (u < 0x800) return 2;
+  if (u >= 0xd800 && u <= 0xdfff) return 2;
+  return 3;
+}
+
+// asciiLower folds only ASCII letters (PostgreSQL's pg_strncasecmp).
+function asciiLower(w: string): string {
+  return w.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+// keywordIs reports whether PostgreSQL keyword `kw` matches the decoded word `w`: exactly for `null` /
+// `true` / `false`, ASCII-case-insensitively for the rest (checkKeyword).
+function keywordIs(w: string, kw: string): boolean {
+  if (kw === "null" || kw === "true" || kw === "false") return w === kw;
+  return asciiLower(w) === kw;
 }
 
 function isAsciiDigit(c: string | undefined): boolean {
@@ -214,14 +285,52 @@ class Parser {
     }
   }
 
-  // Consume `kw` if it appears as a whole WORD at the cursor — i.e. the following char is not an
-  // identifier-continuation character (so `last]`, `to `, `strict $` all match, but `lastfoo` does
-  // not).
-  eatKeyword(kw: string): boolean {
-    if (this.s.startsWith(kw, this.i) && !isIdentChar(this.s[this.i + kw.length])) {
-      this.i += kw.length;
-      return true;
+  // wordAhead: whether PostgreSQL's scanner would lex a name (an identifier or keyword) at the
+  // cursor — a backslash escape or an `other` character. A digit starts a number instead, unless the
+  // run of `other` characters there is longer than every number token (flex's longest match: `1abc`
+  // is a name, `12`, `1a`, and `1e3` are not). Lengths are PostgreSQL's UTF-8 byte counts (`12é` is
+  // four bytes, longer than the three-byte trailing-junk token `12` + one byte, so a name).
+  private wordAhead(): boolean {
+    const c = this.peek();
+    if (c === undefined) return false;
+    if (c === "\\") return true;
+    if (isAsciiDigit(c)) {
+      let run = 0;
+      for (let j = this.i; isOther(this.s[j]); j += 1) run += utf8UnitBytes(this.s.charCodeAt(j));
+      return run > pgNumberLen(this.s, this.i);
     }
+    return isOther(c);
+  }
+
+  // scanWord scans the name at the cursor (wordAhead) — PostgreSQL's non-quoted string state: a run
+  // of `other` characters and backslash escapes (decoded as in a quoted string, jsonpath.md §2.1),
+  // ended by a special character, whitespace, `"`, or the end of input.
+  private scanWord(): string {
+    let out = "";
+    for (;;) {
+      const c = this.peek();
+      if (c === "\\") {
+        out += this.parseEscape();
+      } else if (isOther(c)) {
+        out += c;
+        this.i += 1;
+      } else {
+        return out;
+      }
+    }
+  }
+
+  // Consume keyword `kw` if the name at the cursor is that keyword (keywordIs). A name that is not —
+  // or whose escapes fail to decode — is left unconsumed.
+  eatKeyword(kw: string): boolean {
+    if (!this.wordAhead()) return false;
+    const start = this.i;
+    try {
+      if (keywordIs(this.scanWord(), kw)) return true;
+    } catch (e) {
+      if (!(e instanceof EngineError)) throw e;
+    }
+    this.i = start;
     return false;
   }
 
@@ -285,14 +394,13 @@ class Parser {
     ) {
       throw unsupported("path arithmetic");
     }
-    // A trailing WORD predicate operator (`like_regex`, `starts with`, `is unknown`) is a top-level
-    // predicate too — deferred `0A000` (not malformed). Any other word is malformed.
-    if (isAsciiAlpha(trailing)) {
-      const rest = this.s.slice(this.i);
-      if (rest.startsWith("like_regex") || rest.startsWith("starts") || rest.startsWith("is")) {
+    // A trailing word predicate operator (`like_regex`, `starts with`) makes a top-level predicate
+    // too — deferred `0A000` (not malformed). Any other name is malformed.
+    if (this.wordAhead()) {
+      const word = this.scanWord();
+      if (keywordIs(word, "like_regex") || keywordIs(word, "starts")) {
         throw unsupported("top-level predicate expressions");
       }
-      throw malformed("unexpected trailing input in path");
     }
     throw malformed("unexpected trailing input in path");
   }
@@ -310,11 +418,14 @@ class Parser {
     let primary: Primary;
     if (c === "$") {
       this.i += 1;
-      // `$name` — a path variable — is a deferred follow-on (the `vars` surface).
+      // `$name` / `$"name"` — a path variable — is a deferred follow-on (the `vars` surface).
+      // PostgreSQL's unquoted variable name is a run of `other` characters (no escapes).
       const after = this.peek();
-      if (after !== undefined && (isMemberStart(after) || after === '"')) {
+      if (after === '"') {
+        this.parseQuoted();
         throw unsupported("path variables `$name`");
       }
+      if (isOther(after)) throw unsupported("path variables `$name`");
       primary = { kind: "root" };
     } else if (c === "@") {
       if (this.inFilter === 0) {
@@ -324,6 +435,10 @@ class Parser {
       primary = { kind: "current" };
     } else if (c === '"') {
       primary = { kind: "lit", node: { kind: "string", value: this.parseQuoted() } };
+    } else if (isAsciiDigit(c) && this.wordAhead()) {
+      // A digit-led name (`1abc`) is not an operand.
+      this.scanWord();
+      throw malformed("a name is not an operand");
     } else if (isAsciiDigit(c) || (c === "." && isAsciiDigit(next))) {
       primary = { kind: "lit", node: this.parseNumber() };
     } else if (c === "-" && (isAsciiDigit(next) || next === ".")) {
@@ -335,20 +450,25 @@ class Parser {
       return { primary: { kind: "lit", node }, steps };
     } else if (c === "-" || c === "+") {
       throw unsupported("path arithmetic");
-    } else if (this.eatKeyword("true")) {
-      primary = { kind: "lit", node: { kind: "bool", value: true } };
-    } else if (this.eatKeyword("false")) {
-      primary = { kind: "lit", node: { kind: "bool", value: false } };
-    } else if (this.eatKeyword("null")) {
-      primary = { kind: "lit", node: { kind: "null" } };
-    } else if (this.eatKeyword("last")) {
-      throw malformed("LAST is allowed only in array subscripts");
+    } else if (this.wordAhead()) {
+      // A name: one of the keywords that start an operand, or else not an operand at all.
+      const word = this.scanWord();
+      if (keywordIs(word, "true")) {
+        primary = { kind: "lit", node: { kind: "bool", value: true } };
+      } else if (keywordIs(word, "false")) {
+        primary = { kind: "lit", node: { kind: "bool", value: false } };
+      } else if (keywordIs(word, "null")) {
+        primary = { kind: "lit", node: { kind: "null" } };
+      } else if (keywordIs(word, "last")) {
+        throw malformed("LAST is allowed only in array subscripts");
+      } else if (keywordIs(word, "exists")) {
+        throw unsupported("exists predicates");
+      } else {
+        throw malformed("a name is not an operand");
+      }
     } else if (top) {
-      // A parenthesized expression, `exists (…)`, or another expression form — a deferred
-      // follow-on.
+      // A parenthesized expression or another expression form — a deferred follow-on.
       throw unsupported("expressions other than an accessor path");
-    } else if (this.eatKeyword("exists")) {
-      throw unsupported("exists predicates");
     } else {
       throw malformed("expected a comparison operand");
     }
@@ -467,14 +587,19 @@ class Parser {
       const c = this.peek();
       if (c === ".") {
         this.i += 1;
+        const dotEnd = this.i;
         this.skipWs();
         const next = this.peek();
         if (this.eat("*")) {
           steps.push({ kind: "wildcardMember" });
         } else if (next === '"') {
           steps.push({ kind: "member", key: this.parseQuoted() });
-        } else if (next !== undefined && isMemberStart(next)) {
-          const name = this.parseIdent();
+        } else if (this.i === dotEnd && isAsciiDigit(next)) {
+          // PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
+          throw malformed("expected a member name after `.`");
+        } else if (this.wordAhead()) {
+          // An unquoted name (jsonpath.md §2.1); followed by `(`, an item method.
+          const name = this.scanWord();
           const save = this.i;
           this.skipWs();
           if (this.peek() === "(") {
@@ -673,10 +798,19 @@ class Parser {
       op = "lt";
     } else if (this.eat(">")) {
       op = "gt";
+    } else if (this.wordAhead()) {
+      // A word predicate operator is a deferred follow-on; any other name is malformed.
+      const word = this.scanWord();
+      if (keywordIs(word, "like_regex") || keywordIs(word, "starts")) {
+        throw unsupported("like_regex / starts with predicates");
+      }
+      throw malformed("expected a comparison operator");
     } else {
-      throw unsupported(
-        "filter predicates other than a comparison (exists / like_regex / starts with)",
-      );
+      const c = this.peek();
+      if (c === "+" || c === "-" || c === "*" || c === "/" || c === "%") {
+        throw unsupported("path arithmetic");
+      }
+      throw malformed("expected a comparison operator");
     }
     const rhs = this.parsePathExpr(false);
     return { kind: "compare", lhs, op, rhs };
@@ -689,15 +823,6 @@ class Parser {
       return true;
     }
     return false;
-  }
-
-  // Parse a bare identifier (a member key or method name).
-  private parseIdent(): string {
-    const start = this.i;
-    while (this.i < this.s.length && isMemberCont(this.s[this.i]!)) {
-      this.i += 1;
-    }
-    return this.s.slice(start, this.i);
   }
 
   // Parse a `"…"` jsonpath string — a port of PostgreSQL's jsonpath scanner escapes
@@ -724,44 +849,38 @@ class Parser {
         this.i += 1;
         continue;
       }
-      const e = this.s[this.i + 1];
-      if (e === undefined) throw malformed("unexpected end after backslash");
-      if (e === "u") {
-        out += this.parseUnicodeRun();
-        continue;
-      }
-      if (e === "x") {
-        const hex = this.s.slice(this.i + 2, this.i + 4);
-        if (!/^[0-9a-fA-F]{2}$/.test(hex))
-          throw malformed("invalid hexadecimal character sequence");
-        out += codePointText(Number.parseInt(hex, 16));
-        this.i += 4;
-        continue;
-      }
-      this.i += 1; // the backslash; the escaped character follows
-      switch (e) {
-        case "b":
-          out += "\b";
-          break;
-        case "f":
-          out += "\f";
-          break;
-        case "n":
-          out += "\n";
-          break;
-        case "r":
-          out += "\r";
-          break;
-        case "t":
-          out += "\t";
-          break;
-        case "v":
-          out += "\v";
-          break;
-        default:
-          out += e; // any other escaped character is itself (a pair's low half copies next)
-      }
-      this.i += 1;
+      out += this.parseEscape();
+    }
+  }
+
+  // parseEscape decodes the backslash escape at the cursor — shared by quoted strings and unquoted
+  // names (jsonpath.md §2.1).
+  private parseEscape(): string {
+    const e = this.s[this.i + 1];
+    if (e === undefined) throw malformed("unexpected end after backslash");
+    if (e === "u") return this.parseUnicodeRun();
+    if (e === "x") {
+      const hex = this.s.slice(this.i + 2, this.i + 4);
+      if (!/^[0-9a-fA-F]{2}$/.test(hex)) throw malformed("invalid hexadecimal character sequence");
+      this.i += 4;
+      return codePointText(Number.parseInt(hex, 16));
+    }
+    this.i += 2; // the backslash and the escaped character
+    switch (e) {
+      case "b":
+        return "\b";
+      case "f":
+        return "\f";
+      case "n":
+        return "\n";
+      case "r":
+        return "\r";
+      case "t":
+        return "\t";
+      case "v":
+        return "\v";
+      default:
+        return e; // any other escaped character is itself (a pair's low half copies next)
     }
   }
 
@@ -841,6 +960,15 @@ class Parser {
     const c = this.peek();
     // A truncated path (no index where one is required) is malformed.
     if (c === undefined) {
+      throw malformed("expected a subscript index");
+    }
+    // A name: a `true`/`false`/`null` literal starts an expression subscript (deferred); any other
+    // is not an expression.
+    if (this.wordAhead()) {
+      const word = this.scanWord();
+      if (keywordIs(word, "true") || keywordIs(word, "false") || keywordIs(word, "null")) {
+        throw unsupported("non-literal subscript expressions");
+      }
       throw malformed("expected a subscript index");
     }
     // A non-numeric token starts an expression subscript (`$.a`, arithmetic) — a deferred follow-on.
@@ -983,8 +1111,8 @@ function writeIndex(i: Index): string {
   return i.kind === "number" ? i.value.render() : "last";
 }
 
-// writeQuoted renders a member key as a canonical jsonpath quoted string (`"…"` with JSON
-// escaping). Matches PostgreSQL's escaping and the Rust write_quoted.
+// writeQuoted renders a member key as a canonical jsonpath quoted string — PostgreSQL's escape_json:
+// `\"`, `\\`, `\b \f \n \r \t`, and any other control character as `\u00XX`.
 function writeQuoted(k: string): string {
   let out = '"';
   for (const c of k) {
@@ -993,6 +1121,10 @@ function writeQuoted(k: string): string {
       out += '\\"';
     } else if (c === "\\") {
       out += "\\\\";
+    } else if (c === "\b") {
+      out += "\\b";
+    } else if (c === "\f") {
+      out += "\\f";
     } else if (c === "\n") {
       out += "\\n";
     } else if (c === "\r") {

@@ -409,6 +409,12 @@ not supported yet (`0A000`):
 
 <LiveSql demo="jsonpathMethodDemo" query={jsonpathMethodDemo} rows={1} />
 
+An unquoted member name in a `jsonpath` follows PostgreSQL's lexing. It runs until whitespace, `"`,
+or one of the path's operator and punctuation characters (`. [ ] ( ) $ @ ? , * + - / % ! = < > & |
+: #` and braces), so it may hold any other character, non-ASCII included (`$.é`, `$.a~b`). It takes
+the same backslash escapes as a string: `$.a\u0041` reads the key `aA`. A keyword is a member key
+too: `$.type` reads the key `type`, and `$.type()` calls the method.
+
 A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper document, or
 building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with
 `54001`. PostgreSQL's limit depends on its stack size and is much higher (about 10 000 levels by

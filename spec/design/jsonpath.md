@@ -89,7 +89,7 @@ method       ::= "type" | "size" | "double" | "ceiling" | "floor" | "abs" | "key
 
 Method names are keywords matched case-insensitively (`$.TYPE()` is `.type()`); whitespace may
 separate the `.`, the name, and the `(`. Without the parentheses the same word is a member key
-(`$.type` is `$."type"`). An unknown method name, arguments where a method takes none, or more
+(`$.type` is `$."type"`), as is every other keyword (`$.last`, `$.strict`, `$.true`; §2.1). An unknown method name, arguments where a method takes none, or more
 than two `.decimal()` arguments is `42601`.
 
 A literal primary takes accessors too (`"12".number()`, `null.type()`). A number literal followed
@@ -109,8 +109,8 @@ deliberate regex subset.
 
 ### 2.1 String escapes
 
-A quoted string (a `."key"` member or a string literal) takes PostgreSQL's jsonpath scanner escapes
-(`jsonpath_scan.l`), which are wider than JSON's:
+A quoted string (a `."key"` member or a string literal) and an unquoted name (§2.2) take PostgreSQL's
+jsonpath scanner escapes (`jsonpath_scan.l`), which are wider than JSON's:
 
 - `\b \f \n \r \t \v` are the control characters.
 - `\uXXXX` (exactly four hex digits) and `\u{X…}` (one to six) are code points. A run of consecutive
@@ -127,9 +127,39 @@ must follow a high surrogate.` or `Unicode high surrogate must not follow a high
 however spelled (`\u0000`, `\u{0}`, `\x00`), is `22P05` `unsupported Unicode escape sequence` with
 the Detail `\u0000 cannot be converted to text.`, as for JSON input ([json.md](json.md) §4.2).
 
-An *unquoted* member name (`$.key`) still takes only ASCII letters, digits, `_`, and `$`, and no
-escapes. PostgreSQL's scanner admits any character outside its special set there (`$.é`, `$.a~b`)
-and the same backslash escapes (`$.a\u0041`); that wider lexing is a follow-on.
+A member key renders quoted, escaped as PostgreSQL's `escape_json` does: `\"`, `\\`, `\b \f \n \r
+\t`, and any other control character as `\u00XX` (`$.a\v` renders `$."a\u000b"`).
+
+### 2.2 Unquoted names and keywords
+
+An unquoted name (`$.key`) is PostgreSQL's non-quoted string token: a run of any characters outside
+the *special* set `? % $ . [ ] { } ( ) | & ! = < > @ # , * : - + /`, whitespace (`[ \t\n\r\f]`),
+and `"`, together with the §2.1 backslash escapes. Non-ASCII characters belong to a name (`$.é`,
+`$.a€`), as does any other punctuation (`$.a~b`, `$.a;b`). A special character, whitespace, or `"`
+ends the name, so `$.a-b` is `$.a - b`, `$.a$b` is `$.a` followed by the variable `$b`, and
+`$.a"b"` is a name followed by a string (both syntax errors). An escaped character never ends the
+name (`$.a\u002eb` is the key `a.b`, `$.a\ b` the key `a b`). The escape errors are §2.1's: a NUL
+is `22P05`, an unpaired surrogate `22P02`, a malformed escape or a backslash ending the input
+`42601`. A name is lexed before the grammar sees it, so its escape error comes first even where a
+name is not allowed (`$.a \u0000` is `22P05`).
+
+The scanner's numbers compete with names by flex's longest match (in bytes). Right after the `.` a
+digit starts a number (`.5`), so `$.5` and `$.1abc` are `42601`. After whitespace, a digit-led run
+is a name only when it is longer than every number token there, counting PostgreSQL's
+trailing-junk tokens (a number plus one byte) and its `0x`/`0o`/`0b` and `_`-separated forms, which
+jed's own number literals do not accept (§2): `$. 1abc`, `$. 0x1Fz`, `$. 12é` are names, `$. 12`,
+`$. 1a`, `$. 1e3` are not.
+
+A keyword is a name whose decoded text spells one of PostgreSQL's jsonpath keywords, compared
+ASCII-case-insensitively except `null`, `true`, and `false`, which are lowercase only (`STRICT $`,
+`$[LAST]`, and `$[l\u0061st]` are keywords; `TRUE` is a name). After `.` every keyword is a member key
+(PostgreSQL's `key_name`), and a method keyword followed by `(` is an item method (§2). Elsewhere a
+name is valid only as a keyword the grammar expects there; any other (`abc`, `$ ? (@ == abc)`,
+`$.a is unknown`) is a syntax error (`42601`). An unquoted variable name (`$name`) is a run of the same
+characters without escapes; variables themselves are deferred (§5).
+
+PostgreSQL's scanner also skips C-style `/* … */` comments between tokens. jed does not lex them
+yet, a follow-on.
 
 ---
 

@@ -222,14 +222,11 @@ impl JsonPath {
                 })
             }
             Some(b'+' | b'-' | b'*' | b'/' | b'%') => Err(unsupported("path arithmetic")),
-            // A trailing WORD predicate operator (`like_regex`, `starts with`, `is unknown`) is a
-            // top-level predicate too — deferred `0A000` (not malformed). Any other word is malformed.
-            Some(c) if c.is_ascii_alphabetic() => {
-                let rest = &p.s[p.i..];
-                if rest.starts_with(b"like_regex")
-                    || rest.starts_with(b"starts")
-                    || rest.starts_with(b"is")
-                {
+            // A trailing word predicate operator (`like_regex`, `starts with`) makes a top-level
+            // predicate too — deferred `0A000` (not malformed). Any other name is malformed.
+            Some(_) if p.word_ahead() => {
+                let word = p.scan_word()?;
+                if keyword_is(&word, "like_regex") || keyword_is(&word, "starts") {
                     Err(unsupported("top-level predicate expressions"))
                 } else {
                     Err(malformed("unexpected trailing input in path"))
@@ -1422,13 +1419,16 @@ fn write_index(i: &Index, out: &mut String) {
     }
 }
 
-/// Render a member key as a canonical jsonpath quoted string (`"…"` with JSON escaping).
+/// Render a member key as a canonical jsonpath quoted string — PostgreSQL's `escape_json`: `\"`,
+/// `\\`, `\b \f \n \r \t`, and any other control character as `\u00XX`.
 fn write_quoted(k: &str, out: &mut String) {
     out.push('"');
     for c in k.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -1439,12 +1439,116 @@ fn write_quoted(k: &str, out: &mut String) {
     out.push('"');
 }
 
-fn is_member_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_'
+/// PostgreSQL's jsonpath scanner `special` set (jsonpath_scan.l): each is a token of its own, so it
+/// ends an unquoted name.
+fn is_special(c: u8) -> bool {
+    b"?%$.[]{}()|&!=<>@#,*:-+/".contains(&c)
 }
 
-fn is_member_cont(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+/// PostgreSQL's jsonpath `blank` set — whitespace.
+fn is_blank(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+}
+
+/// PostgreSQL's jsonpath `other` class: a byte that may appear unescaped in an unquoted name — not
+/// special, blank, `\`, or `"`. Every non-ASCII byte is one.
+fn is_other(c: u8) -> bool {
+    !is_special(c) && !is_blank(c) && c != b'\\' && c != b'"'
+}
+
+/// The length of the longest PostgreSQL jsonpath number token at the start of `s` (which starts with
+/// a digit), counting the rules a name competes with: an integer (decimal, or a `0x`/`0o`/`0b`
+/// prefix), a decimal, a real, an incomplete exponent (`1e+`), and each with one trailing `other`
+/// byte (the "trailing junk" rules). `_` digit separators count, as PostgreSQL 16+ lexes them.
+fn pg_number_len(s: &[u8]) -> usize {
+    fn dec(c: u8) -> bool {
+        c.is_ascii_digit()
+    }
+    fn hex(c: u8) -> bool {
+        c.is_ascii_hexdigit()
+    }
+    fn oct(c: u8) -> bool {
+        (b'0'..=b'7').contains(&c)
+    }
+    fn bin(c: u8) -> bool {
+        c == b'0' || c == b'1'
+    }
+    // The end of `(_?digit)*` from `j` (a first digit precedes it).
+    let digit_run = |mut j: usize, ok: fn(u8) -> bool| -> usize {
+        loop {
+            match s.get(j) {
+                Some(&c) if ok(c) => j += 1,
+                Some(b'_') if s.get(j + 1).is_some_and(|&c| ok(c)) => j += 2,
+                _ => return j,
+            }
+        }
+    };
+    // A "trailing junk" rule: the token plus one `other` byte.
+    let junk = |end: usize| -> usize {
+        if s.get(end).is_some_and(|&c| is_other(c)) {
+            end + 1
+        } else {
+            end
+        }
+    };
+    // decinteger: `0`, or a nonzero digit and (_?digit)*.
+    let int_end = if s.first() == Some(&b'0') {
+        1
+    } else {
+        digit_run(1, dec)
+    };
+    let mut best = junk(int_end);
+    // hexinteger / octinteger / bininteger: `0x`, `0o`, `0b` and one or more digits.
+    if s.first() == Some(&b'0') {
+        let ok: Option<fn(u8) -> bool> = match s.get(1) {
+            Some(b'x' | b'X') => Some(hex),
+            Some(b'o' | b'O') => Some(oct),
+            Some(b'b' | b'B') => Some(bin),
+            _ => None,
+        };
+        if let Some(ok) = ok.filter(|ok| s.get(2).is_some_and(|&c| ok(c))) {
+            best = best.max(digit_run(3, ok));
+        }
+    }
+    // decimal: decinteger `.` decdigits?
+    let mut dec_end = None;
+    if s.get(int_end) == Some(&b'.') {
+        let frac = int_end + 1;
+        let end = if s.get(frac).is_some_and(|&c| dec(c)) {
+            digit_run(frac + 1, dec)
+        } else {
+            frac
+        };
+        best = best.max(junk(end));
+        dec_end = Some(end);
+    }
+    // real: (decinteger | decimal) [Ee] [-+]? decdigits; realfail: … [Ee] [-+].
+    for m in std::iter::once(int_end).chain(dec_end) {
+        if !matches!(s.get(m), Some(b'e' | b'E')) {
+            continue;
+        }
+        let mut k = m + 1;
+        let signed = matches!(s.get(k), Some(b'-' | b'+'));
+        if signed {
+            k += 1;
+        }
+        if s.get(k).is_some_and(|&c| dec(c)) {
+            best = best.max(junk(digit_run(k + 1, dec)));
+        } else if signed {
+            best = best.max(k);
+        }
+    }
+    best
+}
+
+/// Whether PostgreSQL keyword `kw` matches the decoded word `w`: exactly for `null` / `true` /
+/// `false`, ASCII-case-insensitively for the rest (`checkKeyword`).
+fn keyword_is(w: &str, kw: &str) -> bool {
+    if matches!(kw, "null" | "true" | "false") {
+        w == kw
+    } else {
+        w.eq_ignore_ascii_case(kw)
+    }
 }
 
 struct Parser<'a> {
@@ -1499,28 +1603,51 @@ impl Parser<'_> {
         }
     }
 
-    /// Consume `kw` if it appears as a whole WORD at the cursor — i.e. the following byte is not an
-    /// identifier-continuation character (so `last]`, `to `, `strict $` all match, but `lastfoo` does
-    /// not).
-    fn eat_keyword(&mut self, kw: &str) -> bool {
-        let kb = kw.as_bytes();
-        if self.s[self.i..].starts_with(kb) {
-            let after = self.s.get(self.i + kb.len()).copied();
-            if after.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == b'_')) {
-                self.i += kb.len();
-                return true;
+    /// Whether PostgreSQL's scanner would lex a name (an identifier or keyword) at the cursor: a
+    /// backslash escape or an `other` byte. A digit starts a number instead, unless the run of
+    /// `other` bytes there is longer than every number token (flex's longest match: `1abc` is a
+    /// name, `12`, `1a`, and `1e3` are not).
+    fn word_ahead(&self) -> bool {
+        match self.peek() {
+            Some(b'\\') => true,
+            Some(c) if c.is_ascii_digit() => {
+                let rest = &self.s[self.i..];
+                let run = rest.iter().take_while(|&&c| is_other(c)).count();
+                run > pg_number_len(rest)
             }
+            Some(c) => is_other(c),
+            None => false,
         }
-        false
     }
 
-    /// Parse a bare identifier (a member key or method name).
-    fn parse_ident(&mut self) -> String {
-        let start = self.i;
-        while self.peek().is_some_and(is_member_cont) {
-            self.i += 1;
+    /// Scan the name at the cursor ([`Self::word_ahead`]) — PostgreSQL's non-quoted string state: a
+    /// run of `other` bytes and backslash escapes (decoded as in a quoted string, jsonpath.md §2.1),
+    /// ended by a special byte, whitespace, `"`, or the end of input.
+    fn scan_word(&mut self) -> Result<String> {
+        let mut out = String::new();
+        loop {
+            match self.peek() {
+                Some(b'\\') => self.parse_escape(&mut out)?,
+                Some(c) if is_other(c) => self.push_char(&mut out),
+                _ => return Ok(out),
+            }
         }
-        String::from_utf8_lossy(&self.s[start..self.i]).into_owned()
+    }
+
+    /// Consume keyword `kw` if the name at the cursor is that keyword ([`keyword_is`]). A name that
+    /// is not — or whose escapes fail to decode — is left unconsumed.
+    fn eat_keyword(&mut self, kw: &str) -> bool {
+        if !self.word_ahead() {
+            return false;
+        }
+        let start = self.i;
+        match self.scan_word() {
+            Ok(w) if keyword_is(&w, kw) => true,
+            _ => {
+                self.i = start;
+                false
+            }
+        }
     }
 
     /// Parse a `"…"` jsonpath string — a port of PostgreSQL's jsonpath scanner escapes
@@ -1538,39 +1665,46 @@ impl Parser<'_> {
                     self.i += 1;
                     return Ok(out);
                 }
-                Some(b'\\') => match self.s.get(self.i + 1).copied() {
-                    None => return Err(malformed("unexpected end after backslash")),
-                    Some(b'u') => self.parse_unicode_run(&mut out)?,
-                    Some(b'x') => {
-                        let hex = self.s.get(self.i + 2..self.i + 4);
-                        let ch = hex
-                            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                            .and_then(|h| std::str::from_utf8(h).ok())
-                            .and_then(|h| u32::from_str_radix(h, 16).ok())
-                            .ok_or_else(|| malformed("invalid hexadecimal character sequence"))?;
-                        push_code_point(ch, &mut out)?;
-                        self.i += 4;
-                    }
-                    Some(c) => {
-                        self.i += 1; // the backslash; the escaped character follows
-                        match c {
-                            b'b' => out.push('\u{08}'),
-                            b'f' => out.push('\u{0c}'),
-                            b'n' => out.push('\n'),
-                            b'r' => out.push('\r'),
-                            b't' => out.push('\t'),
-                            b'v' => out.push('\u{0b}'),
-                            _ => {
-                                self.push_char(&mut out);
-                                continue;
-                            }
-                        }
-                        self.i += 1;
-                    }
-                },
+                Some(b'\\') => self.parse_escape(&mut out)?,
                 Some(_) => self.push_char(&mut out),
             }
         }
+    }
+
+    /// Decode the backslash escape at the cursor into `out` — shared by quoted strings and unquoted
+    /// names (jsonpath.md §2.1).
+    fn parse_escape(&mut self, out: &mut String) -> Result<()> {
+        match self.s.get(self.i + 1).copied() {
+            None => return Err(malformed("unexpected end after backslash")),
+            Some(b'u') => self.parse_unicode_run(out)?,
+            Some(b'x') => {
+                let hex = self.s.get(self.i + 2..self.i + 4);
+                let ch = hex
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .ok_or_else(|| malformed("invalid hexadecimal character sequence"))?;
+                push_code_point(ch, out)?;
+                self.i += 4;
+            }
+            Some(c) => {
+                self.i += 1; // the backslash; the escaped character follows
+                match c {
+                    b'b' => out.push('\u{08}'),
+                    b'f' => out.push('\u{0c}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'v' => out.push('\u{0b}'),
+                    _ => {
+                        self.push_char(out);
+                        return Ok(());
+                    }
+                }
+                self.i += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Copy the one UTF-8 character at the cursor.
@@ -1676,6 +1810,18 @@ impl Parser<'_> {
         match self.peek() {
             // A truncated path (no index where one is required) is malformed.
             None => return Err(malformed("expected a subscript index")),
+            // A name: a `true`/`false`/`null` literal starts an expression subscript (deferred);
+            // any other is not an expression.
+            Some(_) if self.word_ahead() => {
+                let word = self.scan_word()?;
+                if ["true", "false", "null"]
+                    .iter()
+                    .any(|kw| keyword_is(&word, kw))
+                {
+                    return Err(unsupported("non-literal subscript expressions"));
+                }
+                return Err(malformed("expected a subscript index"));
+            }
             // A non-numeric token starts an expression subscript (`$.a`, arithmetic) — a deferred
             // follow-on.
             Some(c) if !(c.is_ascii_digit() || c == b'-') => {
@@ -1711,9 +1857,15 @@ impl Parser<'_> {
         let primary = match self.peek() {
             Some(b'$') => {
                 self.i += 1;
-                // `$name` — a path variable — is a deferred follow-on (the `vars` surface).
-                if self.peek().is_some_and(|c| is_member_start(c) || c == b'"') {
-                    return Err(unsupported("path variables `$name`"));
+                // `$name` / `$"name"` — a path variable — is a deferred follow-on (the `vars`
+                // surface). PostgreSQL's unquoted variable name is a run of `other` bytes (no escapes).
+                match self.peek() {
+                    Some(b'"') => {
+                        self.parse_quoted()?;
+                        return Err(unsupported("path variables `$name`"));
+                    }
+                    Some(c) if is_other(c) => return Err(unsupported("path variables `$name`")),
+                    _ => {}
                 }
                 Primary::Root
             }
@@ -1725,6 +1877,11 @@ impl Parser<'_> {
                 Primary::Current
             }
             Some(b'"') => Primary::Lit(JsonNode::String(self.parse_quoted()?)),
+            // A digit-led name (`1abc`) is not an operand.
+            Some(c) if c.is_ascii_digit() && self.word_ahead() => {
+                self.scan_word()?;
+                return Err(malformed("a name is not an operand"));
+            }
             Some(c) if c.is_ascii_digit() => Primary::Lit(self.parse_number()?),
             Some(b'.') if self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) => {
                 Primary::Lit(self.parse_number()?)
@@ -1747,25 +1904,26 @@ impl Parser<'_> {
                 });
             }
             Some(b'-' | b'+') => return Err(unsupported("path arithmetic")),
-            _ => {
-                if self.eat_keyword("true") {
+            // A name: one of the keywords that start an operand, or else not an operand at all.
+            _ if self.word_ahead() => {
+                let word = self.scan_word()?;
+                if keyword_is(&word, "true") {
                     Primary::Lit(JsonNode::Bool(true))
-                } else if self.eat_keyword("false") {
+                } else if keyword_is(&word, "false") {
                     Primary::Lit(JsonNode::Bool(false))
-                } else if self.eat_keyword("null") {
+                } else if keyword_is(&word, "null") {
                     Primary::Lit(JsonNode::Null)
-                } else if self.eat_keyword("last") {
+                } else if keyword_is(&word, "last") {
                     return Err(malformed("LAST is allowed only in array subscripts"));
-                } else if top {
-                    // A parenthesized expression, `exists (…)`, or another expression form — a
-                    // deferred follow-on.
-                    return Err(unsupported("expressions other than an accessor path"));
-                } else if self.eat_keyword("exists") {
+                } else if keyword_is(&word, "exists") {
                     return Err(unsupported("exists predicates"));
                 } else {
-                    return Err(malformed("expected a comparison operand"));
+                    return Err(malformed("a name is not an operand"));
                 }
             }
+            // A parenthesized expression or another expression form — a deferred follow-on.
+            _ if top => return Err(unsupported("expressions other than an accessor path")),
+            _ => return Err(malformed("expected a comparison operand")),
         };
         Ok(PathExpr {
             primary,
@@ -1894,13 +2052,18 @@ impl Parser<'_> {
             match self.peek() {
                 Some(b'.') => {
                     self.i += 1;
+                    let dot_end = self.i;
                     self.skip_ws();
                     if self.eat(b'*') {
                         steps.push(Step::WildcardMember);
                     } else if self.peek() == Some(b'"') {
                         steps.push(Step::Member(self.parse_quoted()?));
-                    } else if self.peek().is_some_and(is_member_start) {
-                        let name = self.parse_ident();
+                    } else if self.i == dot_end && self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        // PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
+                        return Err(malformed("expected a member name after `.`"));
+                    } else if self.word_ahead() {
+                        // An unquoted name (jsonpath.md §2.1); followed by `(`, an item method.
+                        let name = self.scan_word()?;
                         let save = self.i;
                         self.skip_ws();
                         if self.peek() == Some(b'(') {
@@ -2116,10 +2279,17 @@ impl Parser<'_> {
             CmpOp::Lt
         } else if self.eat(b'>') {
             CmpOp::Gt
+        } else if self.word_ahead() {
+            // A word predicate operator is a deferred follow-on; any other name is malformed.
+            let word = self.scan_word()?;
+            if keyword_is(&word, "like_regex") || keyword_is(&word, "starts") {
+                return Err(unsupported("like_regex / starts with predicates"));
+            }
+            return Err(malformed("expected a comparison operator"));
+        } else if matches!(self.peek(), Some(b'+' | b'-' | b'*' | b'/' | b'%')) {
+            return Err(unsupported("path arithmetic"));
         } else {
-            return Err(unsupported(
-                "filter predicates other than a comparison (exists / like_regex / starts with)",
-            ));
+            return Err(malformed("expected a comparison operator"));
         };
         let right = self.parse_path_expr(false)?;
         Ok(Pred::Compare(left, op, right))
