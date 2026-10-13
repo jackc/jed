@@ -94,6 +94,8 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
     let bytes = sql.as_bytes();
     let mut i = 0;
     let mut tokens = Vec::new();
+    // Indices of the `U&'…'` / `U&"…"` tokens, decoded after the scan (`apply_unicode_escapes`).
+    let mut unicode_escapes: Vec<usize> = Vec::new();
 
     while i < bytes.len() {
         // The previous iteration's tokens started at its `tok_start`; this one's start at `i`.
@@ -361,25 +363,8 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
                 // valid UTF-8 and `'` is ASCII (never a UTF-8 continuation byte), so
                 // copying raw bytes between quotes preserves UTF-8 validity.
                 i += 1; // consume the opening quote
-                let mut buf: Vec<u8> = Vec::new();
-                loop {
-                    match bytes.get(i) {
-                        None => return Err(syntax("unterminated string literal".to_string())),
-                        Some(&b'\'') => {
-                            if bytes.get(i + 1) == Some(&b'\'') {
-                                buf.push(b'\'');
-                                i += 2;
-                            } else {
-                                i += 1; // consume the closing quote
-                                break;
-                            }
-                        }
-                        Some(&b) => {
-                            buf.push(b);
-                            i += 1;
-                        }
-                    }
-                }
+                let buf = scan_quoted_body(bytes, &mut i, b'\'')
+                    .ok_or_else(|| syntax("unterminated string literal".to_string()))?;
                 let s = String::from_utf8(buf)
                     .map_err(|_| syntax("invalid UTF-8 in string literal".to_string()))?;
                 tokens.push(Token::Str(s));
@@ -390,25 +375,8 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
                 // UTF-8 and `"` is ASCII, so copying raw bytes between quotes preserves UTF-8
                 // validity.
                 i += 1; // consume the opening quote
-                let mut buf: Vec<u8> = Vec::new();
-                loop {
-                    match bytes.get(i) {
-                        None => return Err(syntax("unterminated quoted identifier".to_string())),
-                        Some(&b'"') => {
-                            if bytes.get(i + 1) == Some(&b'"') {
-                                buf.push(b'"');
-                                i += 2;
-                            } else {
-                                i += 1; // consume the closing quote
-                                break;
-                            }
-                        }
-                        Some(&b) => {
-                            buf.push(b);
-                            i += 1;
-                        }
-                    }
-                }
+                let buf = scan_quoted_body(bytes, &mut i, b'"')
+                    .ok_or_else(|| syntax("unterminated quoted identifier".to_string()))?;
                 // A zero-length delimited identifier is a syntax error (PostgreSQL's rule,
                 // spec/design/grammar.md §3).
                 if buf.is_empty() {
@@ -417,17 +385,42 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
                 // The identifier-length gate applies to a quoted name too, measured on its
                 // decoded UTF-8 bytes (spec/design/cost.md §7).
                 if buf.len() > crate::parser::MAX_IDENTIFIER_LENGTH {
-                    return Err(EngineError::new(
-                        SqlState::NameTooLong,
-                        format!(
-                            "identifier exceeds the maximum length of {} bytes",
-                            crate::parser::MAX_IDENTIFIER_LENGTH
-                        ),
-                    ));
+                    return Err(name_too_long());
                 }
                 let s = String::from_utf8(buf)
                     .map_err(|_| syntax("invalid UTF-8 in quoted identifier".to_string()))?;
                 tokens.push(Token::QuotedIdent(s));
+            }
+            b'u' | b'U'
+                if bytes.get(i + 1) == Some(&b'&')
+                    && matches!(bytes.get(i + 2), Some(&b'\'') | Some(&b'"')) =>
+            {
+                // A Unicode-escape string `U&'…'` or identifier `U&"…"` (grammar.md §3). The body
+                // is scanned exactly like its plain form (`''` / `""` doubled) and kept RAW here;
+                // `apply_unicode_escapes` decodes it once the whole input is lexed, because an
+                // optional `UESCAPE '<c>'` after it chooses the escape character.
+                let quote = bytes[i + 2];
+                i += 3; // consume `U&` and the opening quote
+                let buf = scan_quoted_body(bytes, &mut i, quote).ok_or_else(|| {
+                    syntax(if quote == b'\'' {
+                        "unterminated string literal".to_string()
+                    } else {
+                        "unterminated quoted identifier".to_string()
+                    })
+                })?;
+                // The zero-length check precedes decoding (PostgreSQL's order); every escape
+                // decodes to at least one character, so a non-empty body never decodes empty.
+                if quote == b'"' && buf.is_empty() {
+                    return Err(syntax("zero-length delimited identifier".to_string()));
+                }
+                let s = String::from_utf8(buf)
+                    .map_err(|_| syntax("invalid UTF-8 in string literal".to_string()))?;
+                unicode_escapes.push(tokens.len());
+                tokens.push(if quote == b'\'' {
+                    Token::Str(s)
+                } else {
+                    Token::QuotedIdent(s)
+                });
             }
             b'0'..=b'9' => {
                 // A numeric literal. Scan the integer digits; a following `.` and/or scientific
@@ -528,13 +521,7 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
                 // no keyword is this long, so bounding the word length bounds every identifier on
                 // every parse path. Aborts with 42622 before the (possibly huge) name is interned.
                 if i - start > crate::parser::MAX_IDENTIFIER_LENGTH {
-                    return Err(EngineError::new(
-                        SqlState::NameTooLong,
-                        format!(
-                            "identifier exceeds the maximum length of {} bytes",
-                            crate::parser::MAX_IDENTIFIER_LENGTH
-                        ),
-                    ));
+                    return Err(name_too_long());
                 }
                 // A bare word folds to lowercase (ASCII) here, so every later comparison of a
                 // name is byte-exact and keyword matching is case-insensitive by construction
@@ -551,7 +538,202 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
     *tok_start = bytes.len();
     tokens.push(Token::Eof);
     starts.push(bytes.len());
+    if !unicode_escapes.is_empty() {
+        tokens = apply_unicode_escapes(tokens, starts, &unicode_escapes, tok_start)?;
+    }
     Ok(tokens)
+}
+
+/// Scan a quoted body from `bytes[*i..]` (just past the opening `quote`) through its closing quote,
+/// collapsing each doubled quote to one. Returns `None` when the input ends first.
+fn scan_quoted_body(bytes: &[u8], i: &mut usize, quote: u8) -> Option<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let b = *bytes.get(*i)?;
+        if b == quote {
+            if bytes.get(*i + 1) == Some(&quote) {
+                buf.push(quote);
+                *i += 2;
+            } else {
+                *i += 1; // consume the closing quote
+                return Some(buf);
+            }
+        } else {
+            buf.push(b);
+            *i += 1;
+        }
+    }
+}
+
+/// Decode every `U&'…'` / `U&"…"` token (their indices in `uesc`, ascending) — PostgreSQL's
+/// `base_yylex` filter and `str_udeescape` (grammar.md §3). A `UESCAPE '<c>'` right after the token
+/// picks the escape character and is consumed with it; otherwise the escape is `\`. The decoded
+/// token is a plain `Str` / `QuotedIdent`, so nothing downstream (and no stored text, which renders
+/// it with plain quotes) ever sees the Unicode-escape spelling. An error sets `*tok_start` to the
+/// byte PostgreSQL's error cursor names.
+fn apply_unicode_escapes(
+    tokens: Vec<Token>,
+    starts: &mut Vec<usize>,
+    uesc: &[usize],
+    tok_start: &mut usize,
+) -> Result<Vec<Token>> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut out_starts = Vec::with_capacity(starts.len());
+    let mut idx = 0;
+    while idx < tokens.len() {
+        if uesc.binary_search(&idx).is_err() {
+            out.push(tokens[idx].clone());
+            out_starts.push(starts[idx]);
+            idx += 1;
+            continue;
+        }
+        let start = starts[idx];
+        let mut escape = b'\\';
+        let mut next = idx + 1;
+        if matches!(&tokens[idx + 1], Token::Word(w) if w == "uescape") {
+            // The third token must be a simple string literal of exactly one byte that is not a hex
+            // digit, `+`, `'`, `"`, or whitespace. Errors point at that third token. `Eof` always
+            // follows, so `idx + 2` is in range.
+            let third = idx + 2;
+            *tok_start = starts[third];
+            let esc = match &tokens[third] {
+                Token::Str(s) if uesc.binary_search(&third).is_err() => s.as_bytes(),
+                _ => {
+                    return Err(syntax(
+                        "UESCAPE must be followed by a simple string literal".to_string(),
+                    ));
+                }
+            };
+            if esc.len() != 1 || !is_uescape_char(esc[0]) {
+                return Err(syntax("invalid Unicode escape character".to_string()));
+            }
+            escape = esc[0];
+            next = idx + 3;
+        }
+        let (raw, is_ident) = match &tokens[idx] {
+            Token::Str(s) => (s.as_bytes(), false),
+            Token::QuotedIdent(s) => (s.as_bytes(), true),
+            _ => unreachable!("a Unicode-escape token is a Str or QuotedIdent"),
+        };
+        // PostgreSQL's cursor is the token start + 3 (`U&'`) + the offset into the body AFTER `''` /
+        // `""` collapsing, measured in bytes.
+        let decoded = udeescape(raw, escape).map_err(|(e, off)| {
+            *tok_start = start + 3 + off;
+            e
+        })?;
+        if is_ident && decoded.len() > crate::parser::MAX_IDENTIFIER_LENGTH {
+            *tok_start = start;
+            return Err(name_too_long());
+        }
+        // Every escape decodes to a valid scalar value, so the result stays valid UTF-8.
+        let decoded = String::from_utf8(decoded).expect("decoded Unicode escapes are UTF-8");
+        out.push(if is_ident {
+            Token::QuotedIdent(decoded)
+        } else {
+            Token::Str(decoded)
+        });
+        out_starts.push(start);
+        idx = next;
+    }
+    *starts = out_starts;
+    Ok(out)
+}
+
+/// PostgreSQL's `check_uescapechar`: a UESCAPE character may not be a hex digit, `+`, `'`, `"`, or
+/// scanner whitespace.
+fn is_uescape_char(c: u8) -> bool {
+    !(c.is_ascii_hexdigit()
+        || c == b'+'
+        || c == b'\''
+        || c == b'"'
+        || matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C))
+}
+
+/// The value of `n` hex digits at `raw[at..]`, or `None` if any is missing or not a hex digit.
+fn hex_digits(raw: &[u8], at: usize, n: usize) -> Option<u32> {
+    let mut v = 0u32;
+    for k in at..at + n {
+        let d = (*raw.get(k)? as char).to_digit(16)?;
+        v = (v << 4) | d;
+    }
+    Some(v)
+}
+
+/// PostgreSQL's `str_udeescape`: replace `<esc>XXXX` / `<esc>+XXXXXX` with the code point's UTF-8
+/// and `<esc><esc>` with `<esc>`, combining a UTF-16 surrogate pair written as two escapes. An error
+/// carries the byte offset into `raw` that PostgreSQL's cursor names (the escape, or the byte after
+/// a dangling high surrogate).
+fn udeescape(raw: &[u8], esc: u8) -> std::result::Result<Vec<u8>, (EngineError, usize)> {
+    let invalid_pair = |at: usize| (syntax("invalid Unicode surrogate pair".to_string()), at);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut pair_first: u32 = 0;
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != esc {
+            if pair_first != 0 {
+                return Err(invalid_pair(i));
+            }
+            out.push(raw[i]);
+            i += 1;
+            continue;
+        }
+        if raw.get(i + 1) == Some(&esc) {
+            if pair_first != 0 {
+                return Err(invalid_pair(i));
+            }
+            out.push(esc);
+            i += 2;
+            continue;
+        }
+        let (mut cp, len) = if let Some(v) = hex_digits(raw, i + 1, 4) {
+            (v, 5)
+        } else if raw.get(i + 1) == Some(&b'+')
+            && let Some(v) = hex_digits(raw, i + 2, 6)
+        {
+            (v, 8)
+        } else {
+            let e = syntax("invalid Unicode escape".to_string()).with_hint(Some(
+                "Unicode escapes must be \\XXXX or \\+XXXXXX.".to_string(),
+            ));
+            return Err((e, i));
+        };
+        if cp == 0 || cp > 0x10FFFF {
+            return Err((syntax("invalid Unicode escape value".to_string()), i));
+        }
+        let is_high = (0xD800..=0xDBFF).contains(&cp);
+        let is_low = (0xDC00..=0xDFFF).contains(&cp);
+        if pair_first != 0 {
+            if !is_low {
+                return Err(invalid_pair(i));
+            }
+            cp = (((pair_first & 0x3FF) << 10) | (cp & 0x3FF)) + 0x10000;
+            pair_first = 0;
+        } else if is_low {
+            return Err(invalid_pair(i));
+        } else if is_high {
+            pair_first = cp;
+            i += len;
+            continue;
+        }
+        let ch = char::from_u32(cp).expect("a non-surrogate code point <= 0x10FFFF");
+        let mut utf8 = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+        i += len;
+    }
+    if pair_first != 0 {
+        return Err(invalid_pair(raw.len()));
+    }
+    Ok(out)
+}
+
+fn name_too_long() -> EngineError {
+    EngineError::new(
+        SqlState::NameTooLong,
+        format!(
+            "identifier exceeds the maximum length of {} bytes",
+            crate::parser::MAX_IDENTIFIER_LENGTH
+        ),
+    )
 }
 
 fn syntax(msg: String) -> EngineError {

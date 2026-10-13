@@ -558,6 +558,7 @@ var SupportedCapabilities = []string{
 	// every name compares byte-exactly; the sequence functions' text argument parses as one
 	// identifier (42602 when malformed).
 	"query.quoted_identifiers",
+	"query.unicode_escapes",
 	// The AT TIME ZONE operator (and the timezone(zone, value) function it desugars to) +
 	// host-loaded IANA time-zone data (spec/design/timezones.md §6, grammar.md §49): convert
 	// timestamptz↔timestamp through a named zone or fixed offset. A zone is provided by a host-loaded

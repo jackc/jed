@@ -1465,7 +1465,24 @@ colon          ::= ":"
  * by doubling it (`''`) — standard_conforming_strings; there are NO backslash escapes. The
  * content is UTF-8 and compares by the `C` collation (../design/types.md §11). `char` is any
  * character other than a single quote. */
-string         ::= "'" ( char | "''" )* "'"
+string         ::= plain_string | unicode_string
+
+plain_string   ::= "'" ( char | "''" )* "'"
+
+/* A Unicode-escape string constant (../design/grammar.md §3, PostgreSQL's U&'…'). `U&` (either case,
+ * no space before the quote) opens a body scanned exactly like a plain_string and DECODED after
+ * scanning: `<esc>XXXX` (4 hex digits) and `<esc>+XXXXXX` (6) are code points, `<esc><esc>` is a
+ * literal escape character, and a UTF-16 surrogate pair written as two escapes combines into one
+ * code point. The escape character `<esc>` is `\` unless a uescape_clause follows. Any other use of
+ * the escape character, a lone or mismatched surrogate, and the code points 0 and > U+10FFFF are
+ * 42601. The result is an ordinary text literal (stored text renders it as a plain_string). */
+unicode_string ::= ( "U" | "u" ) "&" plain_string uescape_clause?
+
+/* UESCAPE immediately after a Unicode-escape token chooses its escape character: a plain_string of
+ * exactly one byte that is not a hex digit, `+`, `'`, `"`, or whitespace (else 42601 "invalid Unicode
+ * escape character"). Anything but a plain_string after UESCAPE is 42601 — a Unicode-escape string
+ * included. UESCAPE is recognized only in this position; elsewhere it is an ordinary word. */
+uescape_clause ::= "UESCAPE" plain_string
 
 /* A name: bare or double-quoted (../design/grammar.md §3). Every `identifier` position in this
  * grammar accepts either spelling; the resulting name compares byte-exactly everywhere. */
@@ -1479,7 +1496,14 @@ bare_identifier ::= (letter | "_") (letter | digit | "_")*
  * by doubling it (`""`). Never a keyword. Zero-length (`""`) is a 42601 syntax error. Collation
  * names (collate_clause) accept ONLY this form. `qchar` is any character other than a double
  * quote. */
-quoted_identifier ::= "\"" ( qchar | "\"\"" )+ "\""
+quoted_identifier ::= plain_quoted_identifier | unicode_quoted_identifier
+
+plain_quoted_identifier ::= "\"" ( qchar | "\"\"" )+ "\""
+
+/* A Unicode-escape identifier (PostgreSQL's U&"…"), decoded exactly like unicode_string, the
+ * zero-length check applied BEFORE decoding. The decoded name is exact (never folded) and never a
+ * keyword, like any quoted identifier; the 63-byte limit is measured on the decoded name. */
+unicode_quoted_identifier ::= ( "U" | "u" ) "&" plain_quoted_identifier uescape_clause?
 
 letter         ::= [A-Za-z]
 digit          ::= [0-9]

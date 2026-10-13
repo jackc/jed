@@ -3,7 +3,9 @@ package jed
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"unicode/utf8"
 )
 
 // scanExponent: if b[i:] begins a well-formed exponent [eE][+-]?digit+, consume it and return
@@ -110,6 +112,8 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 	b := []byte(sql)
 	i := 0
 	var tokens []token
+	// Indices of the `U&'…'` / `U&"…"` tokens, decoded after the scan (applyUnicodeEscapes).
+	var unicodeEscapes []int
 
 	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
 	isAlpha := func(c byte) bool {
@@ -361,22 +365,7 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 			// UTF-8 and `'` is ASCII (never a UTF-8 continuation byte), so copying raw bytes
 			// between quotes preserves UTF-8 validity.
 			i++ // consume the opening quote
-			var sb []byte
-			closed := false
-			for i < len(b) {
-				if b[i] == '\'' {
-					if i+1 < len(b) && b[i+1] == '\'' {
-						sb = append(sb, '\'')
-						i += 2
-						continue
-					}
-					i++ // consume the closing quote
-					closed = true
-					break
-				}
-				sb = append(sb, b[i])
-				i++
-			}
+			sb, closed := scanQuotedBody(b, &i, '\'')
 			if !closed {
 				return nil, newError(SyntaxError, "unterminated string literal")
 			}
@@ -386,22 +375,7 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 			// any UTF-8), `""` an embedded double quote. `"` is ASCII, so copying raw bytes between
 			// quotes preserves UTF-8 validity.
 			i++ // consume the opening quote
-			var sb []byte
-			closed := false
-			for i < len(b) {
-				if b[i] == '"' {
-					if i+1 < len(b) && b[i+1] == '"' {
-						sb = append(sb, '"')
-						i += 2
-						continue
-					}
-					i++ // consume the closing quote
-					closed = true
-					break
-				}
-				sb = append(sb, b[i])
-				i++
-			}
+			sb, closed := scanQuotedBody(b, &i, '"')
 			if !closed {
 				return nil, newError(SyntaxError, "unterminated quoted identifier")
 			}
@@ -413,9 +387,34 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 			// The identifier-length gate applies to a quoted name too, measured on its decoded
 			// UTF-8 bytes (spec/design/cost.md §7).
 			if len(sb) > maxIdentifierLength {
-				return nil, newError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
+				return nil, nameTooLongError()
 			}
 			tokens = append(tokens, token{Kind: tokQuotedIdent, Word: string(sb)})
+		case (c == 'u' || c == 'U') && i+2 < len(b) && b[i+1] == '&' && (b[i+2] == '\'' || b[i+2] == '"'):
+			// A Unicode-escape string `U&'…'` or identifier `U&"…"` (grammar.md §3). The body is
+			// scanned exactly like its plain form (`''` / `""` doubled) and kept RAW here;
+			// applyUnicodeEscapes decodes it once the whole input is lexed, because an optional
+			// `UESCAPE '<c>'` after it chooses the escape character.
+			quote := b[i+2]
+			i += 3 // consume `U&` and the opening quote
+			sb, closed := scanQuotedBody(b, &i, quote)
+			if !closed {
+				if quote == '\'' {
+					return nil, newError(SyntaxError, "unterminated string literal")
+				}
+				return nil, newError(SyntaxError, "unterminated quoted identifier")
+			}
+			// The zero-length check precedes decoding (PostgreSQL's order); every escape decodes
+			// to at least one character, so a non-empty body never decodes empty.
+			if quote == '"' && len(sb) == 0 {
+				return nil, newError(SyntaxError, "zero-length delimited identifier")
+			}
+			unicodeEscapes = append(unicodeEscapes, len(tokens))
+			if quote == '\'' {
+				tokens = append(tokens, token{Kind: tokStr, Word: string(sb)})
+			} else {
+				tokens = append(tokens, token{Kind: tokQuotedIdent, Word: string(sb)})
+			}
 		case isDigit(c):
 			// A numeric literal. Scan the integer digits; a following '.' and/or scientific
 			// e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an
@@ -514,7 +513,7 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 			// keyword is this long, so bounding the word length bounds every identifier on every
 			// parse path. Aborts with 42622 before the (possibly huge) name is interned.
 			if i-start > maxIdentifierLength {
-				return nil, newError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
+				return nil, nameTooLongError()
 			}
 			// A bare word folds to lowercase (ASCII) here, so every later comparison of a name is
 			// byte-exact and keyword matching is case-insensitive by construction
@@ -531,7 +530,196 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 	*tokStart = len(b)
 	tokens = append(tokens, token{Kind: tokEof})
 	*starts = append(*starts, len(b))
+	if len(unicodeEscapes) > 0 {
+		return applyUnicodeEscapes(tokens, starts, unicodeEscapes, tokStart)
+	}
 	return tokens, nil
+}
+
+// scanQuotedBody scans a quoted body from b[*i:] (just past the opening quote) through its closing
+// quote, collapsing each doubled quote to one. closed is false when the input ends first.
+func scanQuotedBody(b []byte, i *int, quote byte) (body []byte, closed bool) {
+	for *i < len(b) {
+		if b[*i] == quote {
+			if *i+1 < len(b) && b[*i+1] == quote {
+				body = append(body, quote)
+				*i += 2
+				continue
+			}
+			*i++ // consume the closing quote
+			return body, true
+		}
+		body = append(body, b[*i])
+		*i++
+	}
+	return body, false
+}
+
+// applyUnicodeEscapes decodes every `U&'…'` / `U&"…"` token (their indices in uesc, ascending) —
+// PostgreSQL's base_yylex filter and str_udeescape (grammar.md §3). A `UESCAPE '<c>'` right after
+// the token picks the escape character and is consumed with it; otherwise the escape is `\`. The
+// decoded token is a plain tokStr / tokQuotedIdent, so nothing downstream (and no stored text, which
+// renders it with plain quotes) ever sees the Unicode-escape spelling. An error sets *tokStart to
+// the byte PostgreSQL's error cursor names.
+func applyUnicodeEscapes(tokens []token, starts *[]int, uesc []int, tokStart *int) ([]token, error) {
+	isUesc := func(idx int) bool {
+		k := sort.SearchInts(uesc, idx)
+		return k < len(uesc) && uesc[k] == idx
+	}
+	out := make([]token, 0, len(tokens))
+	outStarts := make([]int, 0, len(tokens))
+	for idx := 0; idx < len(tokens); {
+		if !isUesc(idx) {
+			out = append(out, tokens[idx])
+			outStarts = append(outStarts, (*starts)[idx])
+			idx++
+			continue
+		}
+		start := (*starts)[idx]
+		escape := byte('\\')
+		next := idx + 1
+		if tokens[idx+1].Kind == tokWord && tokens[idx+1].Word == "uescape" {
+			// The third token must be a simple string literal of exactly one byte that is not a
+			// hex digit, `+`, `'`, `"`, or whitespace. Errors point at that third token. tokEof
+			// always follows, so idx+2 is in range.
+			third := idx + 2
+			*tokStart = (*starts)[third]
+			if tokens[third].Kind != tokStr || isUesc(third) {
+				return nil, newError(SyntaxError, "UESCAPE must be followed by a simple string literal")
+			}
+			esc := tokens[third].Word
+			if len(esc) != 1 || !isUescapeChar(esc[0]) {
+				return nil, newError(SyntaxError, "invalid Unicode escape character")
+			}
+			escape = esc[0]
+			next = idx + 3
+		}
+		isIdent := tokens[idx].Kind == tokQuotedIdent
+		// PostgreSQL's cursor is the token start + 3 (`U&'`) + the offset into the body AFTER `''`
+		// / `""` collapsing, measured in bytes.
+		decoded, off, err := udeescape(tokens[idx].Word, escape)
+		if err != nil {
+			*tokStart = start + 3 + off
+			return nil, err
+		}
+		if isIdent && len(decoded) > maxIdentifierLength {
+			*tokStart = start
+			return nil, nameTooLongError()
+		}
+		out = append(out, token{Kind: tokens[idx].Kind, Word: decoded})
+		outStarts = append(outStarts, start)
+		idx = next
+	}
+	*starts = outStarts
+	return out, nil
+}
+
+// isUescapeChar is PostgreSQL's check_uescapechar: a UESCAPE character may not be a hex digit, `+`,
+// `'`, `"`, or scanner whitespace.
+func isUescapeChar(c byte) bool {
+	switch {
+	case isHexDigit(c), c == '+', c == '\'', c == '"':
+		return false
+	case c == ' ', c == '\t', c == '\n', c == '\r', c == 0x0B, c == 0x0C:
+		return false
+	}
+	return true
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// hexDigits is the value of n hex digits at raw[at:], or ok=false if any is missing or not a hex
+// digit.
+func hexDigits(raw string, at, n int) (uint32, bool) {
+	if at+n > len(raw) {
+		return 0, false
+	}
+	var v uint32
+	for k := at; k < at+n; k++ {
+		c := raw[k]
+		var d byte
+		switch {
+		case c >= '0' && c <= '9':
+			d = c - '0'
+		case c >= 'a' && c <= 'f':
+			d = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			d = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | uint32(d)
+	}
+	return v, true
+}
+
+// udeescape is PostgreSQL's str_udeescape: replace `<esc>XXXX` / `<esc>+XXXXXX` with the code
+// point's UTF-8 and `<esc><esc>` with `<esc>`, combining a UTF-16 surrogate pair written as two
+// escapes. An error returns the byte offset into raw that PostgreSQL's cursor names (the escape, or
+// the byte after a dangling high surrogate).
+func udeescape(raw string, esc byte) (string, int, error) {
+	invalidPair := func() error { return newError(SyntaxError, "invalid Unicode surrogate pair") }
+	out := make([]byte, 0, len(raw))
+	var pairFirst uint32
+	i := 0
+	for i < len(raw) {
+		if raw[i] != esc {
+			if pairFirst != 0 {
+				return "", i, invalidPair()
+			}
+			out = append(out, raw[i])
+			i++
+			continue
+		}
+		if i+1 < len(raw) && raw[i+1] == esc {
+			if pairFirst != 0 {
+				return "", i, invalidPair()
+			}
+			out = append(out, esc)
+			i += 2
+			continue
+		}
+		var cp uint32
+		var n int
+		if v, ok := hexDigits(raw, i+1, 4); ok {
+			cp, n = v, 5
+		} else if v, ok := hexDigits(raw, i+2, 6); ok && i+1 < len(raw) && raw[i+1] == '+' {
+			cp, n = v, 8
+		} else {
+			return "", i, newError(SyntaxError, "invalid Unicode escape").
+				withHint(`Unicode escapes must be \XXXX or \+XXXXXX.`)
+		}
+		if cp == 0 || cp > 0x10FFFF {
+			return "", i, newError(SyntaxError, "invalid Unicode escape value")
+		}
+		isHigh := cp >= 0xD800 && cp <= 0xDBFF
+		isLow := cp >= 0xDC00 && cp <= 0xDFFF
+		if pairFirst != 0 {
+			if !isLow {
+				return "", i, invalidPair()
+			}
+			cp = ((pairFirst&0x3FF)<<10 | cp&0x3FF) + 0x10000
+			pairFirst = 0
+		} else if isLow {
+			return "", i, invalidPair()
+		} else if isHigh {
+			pairFirst = cp
+			i += n
+			continue
+		}
+		out = utf8.AppendRune(out, rune(cp))
+		i += n
+	}
+	if pairFirst != 0 {
+		return "", len(raw), invalidPair()
+	}
+	return string(out), 0, nil
+}
+
+func nameTooLongError() *EngineError {
+	return newError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
 }
 
 // asciiLower folds ASCII A-Z to a-z and leaves every other byte unchanged — the bare-identifier

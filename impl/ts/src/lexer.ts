@@ -124,6 +124,8 @@ type LexState = { starts: number[]; tokStart: number };
 // lexRaw is the lexer proper.
 function lexRaw(sql: string, st: LexState): Token[] {
   const tokens: Token[] = [];
+  // Indices of the `U&'…'` / `U&"…"` tokens, decoded after the scan (applyUnicodeEscapes).
+  const unicodeEscapes: number[] = [];
   let i = 0;
   const n = sql.length;
 
@@ -367,23 +369,9 @@ function lexRaw(sql: string, st: LexState): Token[] {
       // spec/design/types.md §11). Accumulating code units verbatim preserves the string
       // (a surrogate pair's halves rejoin), so multibyte/astral text round-trips.
       i++; // consume the opening quote
-      let s = "";
-      let closed = false;
-      while (i < n) {
-        if (sql[i] === "'") {
-          if (i + 1 < n && sql[i + 1] === "'") {
-            s += "'";
-            i += 2;
-            continue;
-          }
-          i++; // consume the closing quote
-          closed = true;
-          break;
-        }
-        s += sql[i]!;
-        i++;
-      }
-      if (!closed) {
+      const [s, end] = scanQuotedBody(sql, i, "'");
+      i = end;
+      if (s === null) {
         throw engineError("syntax_error", "unterminated string literal");
       }
       tokens.push({ kind: "str", str: s });
@@ -392,23 +380,9 @@ function lexRaw(sql: string, st: LexState): Token[] {
       // any UTF-8), `""` an embedded double quote. Accumulating code units verbatim keeps a
       // surrogate pair's halves together.
       i++; // consume the opening quote
-      let s = "";
-      let closed = false;
-      while (i < n) {
-        if (sql[i] === '"') {
-          if (i + 1 < n && sql[i + 1] === '"') {
-            s += '"';
-            i += 2;
-            continue;
-          }
-          i++; // consume the closing quote
-          closed = true;
-          break;
-        }
-        s += sql[i]!;
-        i++;
-      }
-      if (!closed) {
+      const [s, end] = scanQuotedBody(sql, i, '"');
+      i = end;
+      if (s === null) {
         throw engineError("syntax_error", "unterminated quoted identifier");
       }
       // A zero-length delimited identifier is a syntax error (PostgreSQL's rule,
@@ -419,12 +393,35 @@ function lexRaw(sql: string, st: LexState): Token[] {
       // The identifier-length gate applies to a quoted name too, measured on its decoded UTF-8
       // bytes (spec/design/cost.md §7) — NOT its UTF-16 .length.
       if (utf8Length(s) > MAX_IDENTIFIER_LENGTH) {
-        throw engineError(
-          "name_too_long",
-          `identifier exceeds the maximum length of ${MAX_IDENTIFIER_LENGTH} bytes`,
-        );
+        throw nameTooLong();
       }
       tokens.push({ kind: "quotedIdent", str: s });
+    } else if (
+      (c === "u" || c === "U") &&
+      sql[i + 1] === "&" &&
+      (sql[i + 2] === "'" || sql[i + 2] === '"')
+    ) {
+      // A Unicode-escape string `U&'…'` or identifier `U&"…"` (grammar.md §3). The body is scanned
+      // exactly like its plain form (`''` / `""` doubled) and kept RAW here; applyUnicodeEscapes
+      // decodes it once the whole input is lexed, because an optional `UESCAPE '<c>'` after it
+      // chooses the escape character.
+      const quote = sql[i + 2]!;
+      i += 3; // consume `U&` and the opening quote
+      const [s, end] = scanQuotedBody(sql, i, quote);
+      i = end;
+      if (s === null) {
+        throw engineError(
+          "syntax_error",
+          quote === "'" ? "unterminated string literal" : "unterminated quoted identifier",
+        );
+      }
+      // The zero-length check precedes decoding (PostgreSQL's order); every escape decodes to at
+      // least one character, so a non-empty body never decodes empty.
+      if (quote === '"' && s === "") {
+        throw engineError("syntax_error", "zero-length delimited identifier");
+      }
+      unicodeEscapes.push(tokens.length);
+      tokens.push(quote === "'" ? { kind: "str", str: s } : { kind: "quotedIdent", str: s });
     } else if (isDigit(c)) {
       // A numeric literal. Scan the integer digits; a following "." and/or scientific
       // e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an
@@ -521,10 +518,7 @@ function lexRaw(sql: string, st: LexState): Token[] {
       // long, so bounding the word length bounds every identifier on every parse path. Throws
       // 42622 before the (possibly huge) name is interned.
       if (i - start > MAX_IDENTIFIER_LENGTH) {
-        throw engineError(
-          "name_too_long",
-          `identifier exceeds the maximum length of ${MAX_IDENTIFIER_LENGTH} bytes`,
-        );
+        throw nameTooLong();
       }
       // A bare word folds to lowercase (ASCII — the word is ASCII-only) here, so every later
       // comparison of a name is byte-exact and keyword matching is case-insensitive by
@@ -539,5 +533,209 @@ function lexRaw(sql: string, st: LexState): Token[] {
   st.tokStart = n;
   tokens.push({ kind: "eof" });
   st.starts.push(n);
+  if (unicodeEscapes.length > 0) return applyUnicodeEscapes(sql, tokens, st, unicodeEscapes);
   return tokens;
+}
+
+// scanQuotedBody scans a quoted body from sql[i..] (just past the opening quote) through its closing
+// quote, collapsing each doubled quote to one. Returns [body, nextIndex]; body is null when the
+// input ends first.
+function scanQuotedBody(sql: string, i: number, quote: string): [string | null, number] {
+  const n = sql.length;
+  let s = "";
+  while (i < n) {
+    if (sql[i] === quote) {
+      if (i + 1 < n && sql[i + 1] === quote) {
+        s += quote;
+        i += 2;
+        continue;
+      }
+      return [s, i + 1]; // consume the closing quote
+    }
+    s += sql[i]!;
+    i++;
+  }
+  return [null, i];
+}
+
+// applyUnicodeEscapes decodes every `U&'…'` / `U&"…"` token (their indices in uesc, ascending) —
+// PostgreSQL's base_yylex filter and str_udeescape (grammar.md §3). A `UESCAPE '<c>'` right after
+// the token picks the escape character and is consumed with it; otherwise the escape is `\`. The
+// decoded token is a plain str / quotedIdent, so nothing downstream (and no stored text, which
+// renders it with plain quotes) ever sees the Unicode-escape spelling. An error sets st.tokStart to
+// the character PostgreSQL's error cursor names.
+function applyUnicodeEscapes(sql: string, tokens: Token[], st: LexState, uesc: number[]): Token[] {
+  const isUesc = new Set(uesc);
+  const out: Token[] = [];
+  const outStarts: number[] = [];
+  let idx = 0;
+  while (idx < tokens.length) {
+    const tok = tokens[idx]!;
+    if (!isUesc.has(idx)) {
+      out.push(tok);
+      outStarts.push(st.starts[idx]!);
+      idx++;
+      continue;
+    }
+    const start = st.starts[idx]!;
+    let escapeChar = "\\";
+    let next = idx + 1;
+    const after = tokens[idx + 1]!;
+    if (after.kind === "word" && after.word === "uescape") {
+      // The third token must be a simple string literal of exactly one byte that is not a hex
+      // digit, `+`, `'`, `"`, or whitespace. Errors point at that third token. The eof token always
+      // follows, so idx + 2 is in range.
+      const third = idx + 2;
+      st.tokStart = st.starts[third]!;
+      const t3 = tokens[third]!;
+      if (t3.kind !== "str" || isUesc.has(third)) {
+        throw engineError("syntax_error", "UESCAPE must be followed by a simple string literal");
+      }
+      const esc = t3.str!;
+      if (esc.length !== 1 || esc.charCodeAt(0) >= 0x80 || !isUescapeChar(esc)) {
+        throw engineError("syntax_error", "invalid Unicode escape character");
+      }
+      escapeChar = esc;
+      next = idx + 3;
+    }
+    const isIdent = tok.kind === "quotedIdent";
+    const raw = tok.str!;
+    let decoded: string;
+    try {
+      decoded = udeescape(raw, escapeChar);
+    } catch (e) {
+      if (e instanceof UnicodeEscapeError) {
+        // PostgreSQL's cursor is the token start + 3 (`U&'`) + the offset into the body AFTER `''`
+        // / `""` collapsing, measured in UTF-8 bytes; name the character holding that byte.
+        st.tokStart = utf16AtUtf8Offset(sql, start + 3, utf8Length(raw.slice(0, e.at)));
+        throw e.error;
+      }
+      throw e;
+    }
+    if (isIdent && utf8Length(decoded) > MAX_IDENTIFIER_LENGTH) {
+      st.tokStart = start;
+      throw nameTooLong();
+    }
+    out.push(isIdent ? { kind: "quotedIdent", str: decoded } : { kind: "str", str: decoded });
+    outStarts.push(start);
+    idx = next;
+  }
+  st.starts = outStarts;
+  return out;
+}
+
+// utf16AtUtf8Offset is the UTF-16 index in sql of the first code point at or after `bytes` UTF-8
+// bytes past `from` — so a byte offset inside a multibyte character names the next character, as
+// PostgreSQL's byte-offset error cursor does.
+function utf16AtUtf8Offset(sql: string, from: number, bytes: number): number {
+  let u = from;
+  let acc = 0;
+  while (u < sql.length && acc < bytes) {
+    const cp = sql.codePointAt(u)!;
+    acc += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    u += cp > 0xffff ? 2 : 1;
+  }
+  return u;
+}
+
+// isUescapeChar is PostgreSQL's check_uescapechar: a UESCAPE character may not be a hex digit, `+`,
+// `'`, `"`, or scanner whitespace.
+function isUescapeChar(c: string): boolean {
+  return !(isHexDigit(c) || "+'\" \t\n\r\v\f".includes(c));
+}
+
+function isHexDigit(c: string | undefined): boolean {
+  return c !== undefined && /^[0-9A-Fa-f]$/.test(c);
+}
+
+// hexDigits is the value of n hex digits at raw[at..], or -1 if any is missing or not a hex digit.
+function hexDigits(raw: string, at: number, n: number): number {
+  let v = 0;
+  for (let k = at; k < at + n; k++) {
+    const c = raw[k];
+    if (!isHexDigit(c)) return -1;
+    v = v * 16 + parseInt(c!, 16);
+  }
+  return v;
+}
+
+// UnicodeEscapeError carries a udeescape failure and the code-unit index into the body PostgreSQL's
+// cursor names (the escape, or the end of the body after a dangling high surrogate).
+class UnicodeEscapeError extends Error {
+  error: EngineError;
+  at: number;
+  constructor(error: EngineError, at: number) {
+    super(error.message);
+    this.error = error;
+    this.at = at;
+  }
+}
+
+// udeescape is PostgreSQL's str_udeescape: replace `<esc>XXXX` / `<esc>+XXXXXX` with the code
+// point and `<esc><esc>` with `<esc>`, combining a UTF-16 surrogate pair written as two escapes.
+function udeescape(raw: string, esc: string): string {
+  const invalidPair = (at: number) =>
+    new UnicodeEscapeError(engineError("syntax_error", "invalid Unicode surrogate pair"), at);
+  let out = "";
+  let pairFirst = 0;
+  let i = 0;
+  while (i < raw.length) {
+    if (raw[i] !== esc) {
+      if (pairFirst !== 0) throw invalidPair(i);
+      out += raw[i];
+      i++;
+      continue;
+    }
+    if (raw[i + 1] === esc) {
+      if (pairFirst !== 0) throw invalidPair(i);
+      out += esc;
+      i += 2;
+      continue;
+    }
+    let cp: number;
+    let len: number;
+    const v4 = hexDigits(raw, i + 1, 4);
+    const v6 = raw[i + 1] === "+" ? hexDigits(raw, i + 2, 6) : -1;
+    if (v4 >= 0) {
+      cp = v4;
+      len = 5;
+    } else if (v6 >= 0) {
+      cp = v6;
+      len = 8;
+    } else {
+      throw new UnicodeEscapeError(
+        engineError("syntax_error", "invalid Unicode escape").withHint(
+          "Unicode escapes must be \\XXXX or \\+XXXXXX.",
+        ),
+        i,
+      );
+    }
+    if (cp === 0 || cp > 0x10ffff) {
+      throw new UnicodeEscapeError(engineError("syntax_error", "invalid Unicode escape value"), i);
+    }
+    const isHigh = cp >= 0xd800 && cp <= 0xdbff;
+    const isLow = cp >= 0xdc00 && cp <= 0xdfff;
+    if (pairFirst !== 0) {
+      if (!isLow) throw invalidPair(i);
+      cp = (pairFirst & 0x3ff) * 0x400 + (cp & 0x3ff) + 0x10000;
+      pairFirst = 0;
+    } else if (isLow) {
+      throw invalidPair(i);
+    } else if (isHigh) {
+      pairFirst = cp;
+      i += len;
+      continue;
+    }
+    out += String.fromCodePoint(cp);
+    i += len;
+  }
+  if (pairFirst !== 0) throw invalidPair(raw.length);
+  return out;
+}
+
+function nameTooLong(): EngineError {
+  return engineError(
+    "name_too_long",
+    `identifier exceeds the maximum length of ${MAX_IDENTIFIER_LENGTH} bytes`,
+  );
 }

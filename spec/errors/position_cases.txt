@@ -42,6 +42,92 @@ run: SELECT ""
 code: 42601
 position: 8
 
+# Unicode-escape literals and identifiers (grammar.md §3). A decoding error points where PostgreSQL's
+# cursor does: the token start + 3 + the BYTE offset of the escape in the body after `''` / `""`
+# collapsing — so a doubled quote before the escape moves the cursor one character left.
+
+case: invalid Unicode escape
+run: SELECT U&'ab\00'
+code: 42601
+position: 13
+hint: Unicode escapes must be \XXXX or \+XXXXXX.
+
+case: invalid Unicode escape after a doubled quote
+run: SELECT U&'a''b\00'
+code: 42601
+position: 14
+hint: Unicode escapes must be \XXXX or \+XXXXXX.
+
+case: invalid Unicode escape after a multibyte character
+run: SELECT U&"é\00"
+code: 42601
+position: 12
+hint: Unicode escapes must be \XXXX or \+XXXXXX.
+
+case: invalid Unicode escape value
+run: SELECT U&'ab\0000'
+code: 42601
+position: 13
+
+case: lone low surrogate
+run: SELECT U&'ab\DC00'
+code: 42601
+position: 13
+
+case: unfinished surrogate pair at end of body
+run: SELECT U&'ab\D800'
+code: 42601
+position: 18
+
+case: surrogate pair broken by a doubled escape
+run: SELECT U&'\D800\\'
+code: 42601
+position: 16
+
+case: surrogate pair broken by an ordinary character under UESCAPE
+run: SELECT U&'x!D83D' UESCAPE '!'
+code: 42601
+position: 17
+
+case: zero-length Unicode-escape identifier
+run: SELECT U&""
+code: 42601
+position: 8
+
+case: unterminated Unicode-escape string
+run: SELECT U&'abc
+code: 42601
+position: 8
+
+case: invalid UESCAPE character
+run: SELECT U&'a' UESCAPE '+'
+code: 42601
+position: 22
+
+case: UESCAPE followed by a non-string
+run: SELECT U&'a' UESCAPE x
+code: 42601
+position: 22
+
+case: UESCAPE at end of input
+run: SELECT U&'a' UESCAPE
+code: 42601
+position: 21
+
+# jed: PostgreSQL truncates an over-long name; jed rejects it at the token (cost.md §7).
+case: over-long decoded Unicode-escape identifier
+run: SELECT 1 AS U&"\0061aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+code: 42622
+position: 13
+
+# jed: the cursor byte falls inside `é`; PostgreSQL then fails to render its cursor (22021). jed
+# reports the 42601 at the next character, by PostgreSQL's own byte-to-character count.
+case: invalid Unicode escape with the cursor inside a multibyte character
+run: SELECT U&'é''é\00'
+code: 42601
+position: 15
+hint: Unicode escapes must be \XXXX or \+XXXXXX.
+
 # --- parser ---------------------------------------------------------------------------------------
 
 case: end of input

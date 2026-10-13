@@ -1,0 +1,211 @@
+# Unicode-escape string constants and identifiers (spec/design/grammar.md §3): `U&'…'` is a string
+# literal and `U&"…"` a quoted identifier whose body is decoded after scanning — `\XXXX` (4 hex
+# digits) and `\+XXXXXX` (6) are code points, `\\` is a literal backslash, and a UTF-16 surrogate
+# pair written as two escapes combines. An optional `UESCAPE '<c>'` right after the token replaces
+# the backslash. The decoded identifier is exact (never folded), like any quoted identifier, and the
+# decoded string is an ordinary text literal. Every malformed escape, a lone or mismatched
+# surrogate, the code point 0, and a bad UESCAPE character are 42601. PostgreSQL's
+# base_yylex/str_udeescape, adopted exactly (oracle-clean).
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.view, dml.insert, query.select, query.where_eq, query.order_by, query.column_alias, query.derived_table, query.quoted_identifiers, query.unicode_escapes, types.i32, types.text, types.date, types.boolean, query.select_no_from, dml.insert_column_list, dml.insert_multi_row, expr.text_concat, ddl.column_default, cast.explicit
+
+# --- string constants ---------------------------------------------------------------------------
+
+query TT nosort
+SELECT U&'d\0061t\+000061', u&'d!0061t!+000061' UESCAPE '!'
+----
+data
+data
+
+# escapes decode to UTF-8 of any length; uppercase and lowercase hex digits are both accepted
+query TTI nosort
+SELECT U&'caf\00e9', U&'\00C9t\00E9', length(U&'\+01F600')
+----
+café
+Été
+1
+
+# a surrogate pair (in either escape form) combines into one code point
+query TTI nosort
+SELECT U&'\D83D\DE00', U&'\+00D83D\+00DE00', length(U&'\D800\+00DC00')
+----
+😀
+😀
+1
+
+# a doubled escape is a literal escape character; a doubled quote is a quote, as in a plain literal
+query TTT nosort
+SELECT U&'a\\b', U&'it''s', U&'x!!y' UESCAPE '!'
+----
+a\b
+it's
+x!y
+
+# with UESCAPE the backslash is ordinary; a non-hex letter is a valid escape character
+query TTT nosort
+SELECT U&'\0041' UESCAPE '!', U&'g0041' UESCAPE 'g', U&'#+000042' UESCAPE '#'
+----
+\0041
+A
+B
+
+# U&, UESCAPE, and the escape string may be separated by whitespace and comments, or by nothing
+query TT nosort
+SELECT U&'*0041' /* c */ uescape -- d
+'*', U&'*0042'UESCAPE'*'
+----
+A
+B
+
+# the decoded string is an ordinary text literal anywhere one is accepted
+query BT nosort
+SELECT U&'\0061' = 'a', DATE U&'2024-01-0\0032'::text
+----
+true
+2024-01-02
+
+# --- identifiers --------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE U&"T\0061b" (U&"\0049d" i32 PRIMARY KEY, U&"n!00e4me" UESCAPE '!' text)
+
+statement ok
+INSERT INTO "Tab" VALUES (1, 'one'), (2, 'two')
+
+# the decoded identifier is exact: the table is `Tab` and the columns `Id` and `näme`
+# names: Id, näme
+query IT nosort
+SELECT "Id", U&"n\00e4me" FROM U&"Tab" ORDER BY U&"\0049d"
+----
+1
+one
+2
+two
+
+statement error 42P01
+SELECT * FROM tab
+
+statement error 42703
+SELECT id FROM "Tab"
+
+# a quoted identifier is never a keyword, so a decoded keyword spelling is a name
+# names: select
+query I nosort
+SELECT 1 AS U&"s\0065lect"
+----
+1
+
+# --- stored text keeps the decoded value ---------------------------------------------------------
+
+statement ok
+CREATE TABLE c (k i32 PRIMARY KEY, s text CHECK (s <> U&'\0078'), d text DEFAULT U&'d\00e9f')
+
+statement ok
+INSERT INTO c (k, s) VALUES (1, 'a')
+
+statement error 23514
+INSERT INTO c (k, s) VALUES (2, 'x')
+
+statement ok
+CREATE VIEW U&"V\0031" AS SELECT U&"\0049d" AS U&"\004B", U&'\00e9' || U&"n\00e4me" AS U&"!00e9" UESCAPE '!' FROM "Tab"
+
+# names: K, é
+query IT nosort
+SELECT * FROM "V1" ORDER BY "K"
+----
+1
+éone
+2
+étwo
+
+query IT nosort
+SELECT k, d FROM c
+----
+1
+déf
+
+# --- errors -------------------------------------------------------------------------------------
+
+# not \XXXX or \+XXXXXX
+statement error 42601
+SELECT U&'ab\00'
+
+statement error 42601
+SELECT U&'ab\+0041'
+
+statement error 42601
+SELECT U&'\'
+
+statement error 42601
+SELECT U&"a\x" FROM "Tab"
+
+# the code point 0 and a code point past U+10FFFF
+statement error 42601
+SELECT U&'\0000'
+
+statement error 42601
+SELECT U&'\+110000'
+
+# a lone high surrogate, a lone low surrogate, and a high surrogate followed by a non-surrogate
+statement error 42601
+SELECT U&'ab\D800'
+
+statement error 42601
+SELECT U&'ab\DC00'
+
+statement error 42601
+SELECT U&'\D800x'
+
+statement error 42601
+SELECT U&'\D800\0041'
+
+statement error 42601
+SELECT U&'\D800\\'
+
+# a zero-length Unicode-escape identifier
+statement error 42601
+SELECT U&""
+
+# the escape character may not be a hex digit, +, a quote, or whitespace, and must be one character
+statement error 42601
+SELECT U&'a' UESCAPE 'a'
+
+statement error 42601
+SELECT U&'a' UESCAPE '+'
+
+statement error 42601
+SELECT U&'a' UESCAPE ''''
+
+statement error 42601
+SELECT U&'a' UESCAPE '"'
+
+statement error 42601
+SELECT U&'a' UESCAPE ' '
+
+statement error 42601
+SELECT U&'a' UESCAPE ''
+
+statement error 42601
+SELECT U&'a' UESCAPE '!!'
+
+statement error 42601
+SELECT U&'a' UESCAPE 'é'
+
+# UESCAPE must be followed by a simple string literal (not a Unicode-escape one)
+statement error 42601
+SELECT U&'a' UESCAPE x
+
+statement error 42601
+SELECT U&'a' UESCAPE U&'!'
+
+statement error 42601
+SELECT U&'a' UESCAPE
+
+statement error 42601
+SELECT 1 AS U&"a" UESCAPE
+
+# an unterminated Unicode-escape literal or identifier
+statement error 42601
+SELECT U&'abc
+
+statement error 42601
+SELECT U&"abc

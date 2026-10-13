@@ -16,6 +16,9 @@ CREATE TABLE txn (
 INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;
 
 	const query = `SELECT id, owner, balance FROM account ORDER BY balance DESC;`;
+
+	const unicodeEscapeDemo = `SELECT U&'caf\\00e9' AS U&"n\\00e4me",
+       U&'d!0061t!+000061' UESCAPE '!' AS decoded;`;
 </script>
 
 <svelte:head>
@@ -33,7 +36,7 @@ Two tables below: `account` (with a `CHECK (balance >= 0)` and a `NOT NULL` owne
 `account_id` is a `FOREIGN KEY` that `REFERENCES account`. Run the query, then try editing it to
 break a constraint:
 
-<LiveSql {seed} {query} rows={6} />
+<LiveSql demo="accountDemo" {seed} {query} rows={6} />
 
 Things to try in the panel above:
 
@@ -101,6 +104,13 @@ Built-in function and type names are lowercase, so `LOWER(x)` works but `"LOWER"
 name passed to `nextval('…')` is read the same way: `nextval('MySeq')` means `myseq`, and
 `nextval('"MySeq"')` means `MySeq`. A name may be at most 63 bytes (error `42622`). Names that start
 with `jed_` are reserved for jed's own catalog relations (error `42939`).
+
+A quoted name or a string literal can also spell characters by code point, as in PostgreSQL. Put
+`U&` before the opening quote, then write `\XXXX` (4 hex digits) or `\+XXXXXX` (6 hex digits) for a
+character and `\\` for a backslash. Add `UESCAPE '!'` after the literal to use another escape
+character. A malformed escape is error `42601`.
+
+<LiveSql demo="unicodeEscapeDemo" query={unicodeEscapeDemo} rows={1} />
 
 ## Applying defaults
 

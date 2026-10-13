@@ -51,7 +51,47 @@ engine ever sees. This is PostgreSQL's rule (CLAUDE.md §1), adopted exactly:
   the name **verbatim** — case kept, any UTF-8 character allowed (spaces, hyphens, `.`, non-ASCII),
   an embedded `"` written by doubling it (`"a""b"` is the name `a"b`). `"userId"`, `"order"`, and
   `"my table"` are names. A **zero-length** quoted identifier `""` is **`42601`** (PostgreSQL's
-  *"zero-length delimited identifier"*). Unicode-escape identifiers (`U&"…"`) are not a jed surface.
+  *"zero-length delimited identifier"*).
+- A **Unicode-escape identifier** (`U&"…"`) is a quoted identifier whose body is decoded after
+  scanning — see *Unicode escapes* below.
+
+**Unicode escapes (`U&'…'`, `U&"…"`).** PostgreSQL's Unicode-escape string constants and
+identifiers, adopted exactly (`scan.l` + `parser.c` `base_yylex` / `str_udeescape`). `U&` (either
+case, immediately followed by the quote) opens a body scanned exactly like the plain form (`''` /
+`""` doubled), then decoded:
+
+- `\XXXX` (4 hex digits) and `\+XXXXXX` (6 hex digits) are the code point's UTF-8; `\\` is a literal
+  backslash. Hex digits are case-insensitive; any other character is copied verbatim.
+- A UTF-16 **surrogate pair** written as two escapes (in either form, `\D83D\DE00`) combines into one
+  code point. A lone low surrogate, a high surrogate not immediately followed by a low-surrogate
+  escape (an ordinary character, a doubled escape, a non-surrogate escape, or the end of the body),
+  are `42601` *"invalid Unicode surrogate pair"*.
+- Any other use of the escape character is `42601` *"invalid Unicode escape"* with PostgreSQL's
+  Hint (*"Unicode escapes must be \XXXX or \+XXXXXX."*, [error-fields.md](error-fields.md) §11.5);
+  the code point 0 or one past U+10FFFF is `42601` *"invalid Unicode escape value"*.
+- **`UESCAPE '<c>'`** immediately after the token replaces the backslash with `<c>`, consumed with
+  the token. `<c>` must be a plain string literal of exactly one byte that is not a hex digit, `+`,
+  `'`, `"`, or whitespace (`42601` *"invalid Unicode escape character"*); anything else after
+  `UESCAPE` — a word, a `U&'…'` string, end of input — is `42601` *"UESCAPE must be followed by a
+  simple string literal"*. `UESCAPE` is recognized only there; anywhere else it is an ordinary word
+  (`SELECT 'x' AS uescape`).
+- The decoded **string** is an ordinary text literal wherever one is accepted (`DATE U&'…'`, a
+  `LIKE` pattern, a function argument). The decoded **identifier** is exact — never folded, never a
+  keyword — like any quoted identifier; `U&""` is the zero-length error (checked before decoding),
+  and the 63-byte limit is measured on the decoded name.
+- jed has no `standard_conforming_strings = off` mode, so PostgreSQL's `0A000` *"unsafe use of
+  string constant with Unicode escapes"* cannot arise.
+- The lexer decodes the token, so nothing downstream sees the escape spelling: stored canonical text
+  (a view definition, a CHECK or DEFAULT expression) renders the value as a plain `'…'` literal or
+  `"…"` identifier, which re-lexes to the same token.
+- **Error positions** ([error-fields.md](error-fields.md) §10) are PostgreSQL's. A `UESCAPE` error
+  points at the token after `UESCAPE` (end of input when there is none). A decoding error points at
+  the token start + 3 + the **byte** offset of the escape in the body *after* `''` / `""`
+  collapsing, converted to characters by PostgreSQL's count — so each doubled quote before the
+  escape moves the cursor one character left, and a dangling high surrogate's error points just
+  past it. When that byte offset falls inside a multibyte character, PostgreSQL fails to render its
+  cursor and reports `22021`; jed reports the `42601` at the next character (the one recorded
+  divergence, unreachable without a doubled quote before a non-ASCII character).
 
 **Names compare by exact bytes, everywhere.** After the fold, every name comparison and every
 catalog key is **byte-exact** — tables (persistent, `TEMP`, attached), columns, indexes,
@@ -189,13 +229,13 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
 - **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression. The two clauses may appear in either
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
   `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
-- **ASCII-only bare identifiers**; a non-ASCII name is written quoted (`"café"`, §3). No
-  `U&"…"` Unicode-escape identifiers. A bare or quoted identifier longer than **63 bytes** (a quoted
+- **ASCII-only bare identifiers**; a non-ASCII name is written quoted (`"café"`, or with Unicode
+  escapes `U&"caf\00e9"`, §3). A bare or quoted identifier longer than **63 bytes** (a quoted
   one measured on its decoded UTF-8 name) is **`42622`** `name_too_long`, where PostgreSQL silently
   truncates to `NAMEDATALEN − 1` ([cost.md](cost.md) §7, the identifier-length limit).
 - **Literal forms.** Integer, **decimal** (`1.50`, `.5`, and scientific `e`-notation
   `1.5e3` / `5e2` / `1e-3` — §14), **single-quoted string** (the `text` type, `'alice'`, with
-  `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`. `boolean` is now a storable column
+  `''` for an embedded quote, or the Unicode-escape form `U&'…'`, §3), `TRUE`/`FALSE`, and `NULL`. `boolean` is now a storable column
   type as well as an expression type (boolean literals, comparison/logical results, and stored
   boolean columns — see [types.md](types.md) §9).
 - **Function calls.** The expression grammar has a `function_call` production with

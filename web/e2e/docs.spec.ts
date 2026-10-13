@@ -177,9 +177,18 @@ test('the types page autoruns the verbatim json accessor demo', async ({ page })
   await expect(rows).toContainText('{"b": 1.50}');
 });
 
+test('the tables page decodes Unicode-escape literals and names live', async ({ page }) => {
+  await page.goto('/docs/sql/tables/');
+  // U&'caf\00e9' is café in a column named näme; the UESCAPE '!' form decodes to data.
+  const panel = livePanel(page, 'unicodeEscapeDemo');
+  await expect(panel.getByTestId('result-rows')).toContainText('café');
+  await expect(panel.getByTestId('result-rows')).toContainText('data');
+  await expect(panel).toContainText('näme');
+});
+
 test('the tables page enforces a CHECK constraint live and resets to seed', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
-  const panel = page.getByTestId('live-sql');
+  const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
   await panel.getByTestId('sql-input').fill("INSERT INTO account VALUES (3, 'Bob', -5)");
@@ -192,7 +201,7 @@ test('the tables page enforces a CHECK constraint live and resets to seed', asyn
 
 test('the tables page enforces a FOREIGN KEY and cascades parent deletes', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
-  const panel = page.getByTestId('live-sql');
+  const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
   // A child row referencing a non-existent account traps 23503.
@@ -214,7 +223,7 @@ test('the tables page enforces a FOREIGN KEY and cascades parent deletes', async
 
 test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
-  const panel = page.getByTestId('live-sql');
+  const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
   // Account 1 already exists, so instead of a 23505 the row is updated: balance 100 + 100 = 200.
@@ -232,7 +241,7 @@ test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async
 
 test('the tables page upserts with DO UPDATE SET col = DEFAULT live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
-  const panel = page.getByTestId('live-sql');
+  const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
   // The conflicting job keeps its key, takes the proposed state, and resets attempts to its
@@ -252,7 +261,7 @@ test('the tables page upserts with DO UPDATE SET col = DEFAULT live', async ({ p
 
 test('the tables page upserts through an INSERT target alias live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
-  const panel = page.getByTestId('live-sql');
+  const panel = livePanel(page, 'accountDemo');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 
   // The alias replaces the table's name (upsert.md §5): balance 100 + 5 = 105 through `a`.
