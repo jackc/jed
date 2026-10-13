@@ -127,6 +127,9 @@ impl Engine {
         // against: `parent`, unless this is a parenthesized join's body planned against a fence — then
         // the fence's view, so they also see the relations to the join's left (§15).
         let lateral_parent = parent.map(|p| p.lateral_view.unwrap_or(p));
+        // Inside a fenced parenthesized join, the fence's view and this FROM's left relations are one
+        // PostgreSQL FROM namespace (§15).
+        let shares_parent_level = parent.is_some_and(|p| p.lateral_view.is_some());
         for (i, tref) in from_items.iter().enumerate() {
             let is_derived = tref.subquery.is_some() || tref.values.is_some();
             // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table /
@@ -137,6 +140,16 @@ impl Engine {
                 && ((is_derived && tref.lateral)
                     || tref.args.is_some()
                     || tref.json_table.is_some());
+            // The right side of a RIGHT/FULL join may not reference the join's left side — every
+            // relation to its left in this FROM, since a later comma item holding such a join is a
+            // parenthesized join of its own (§15) — but may reference the relations outside it: a
+            // reference to those leaves the item uncorrelated to its siblings (§44, PostgreSQL's
+            // `p_lateral_ok`).
+            let right_side =
+                i > 0 && matches!(sel.joins[i - 1].kind, JoinKind::Right | JoinKind::Full);
+            // Set when a RIGHT/FULL item's body correlates only to the relations outside this FROM:
+            // it is planned against them and materialized once, like a non-LATERAL derived table.
+            let mut detached = false;
             let src: RelSrc;
             if is_derived {
                 // Plan the body. LATERAL → `parent` is the prefix scope (earlier siblings chained to
@@ -174,13 +187,22 @@ impl Engine {
                         lateral_parent,
                         self,
                         ctes,
+                        right_side,
+                        shares_parent_level,
                     );
                     match (&tref.subquery, &tref.values) {
                         (Some(body), _) => {
                             let shape = self.plan_body_first(shape_bodies, || {
                                 self.plan_query(body, Some(&prefix), ctes, ptypes)
                             })?;
-                            if shape_bodies && query_plan_references_outer(&shape, 0) {
+                            if right_side && query_plan_references_outer(&shape, 0) {
+                                detached = true;
+                                self.plan_again(ctes, || {
+                                    self.plan_body_first(shape_bodies, || {
+                                        self.plan_query(body, lateral_parent, ctes, ptypes)
+                                    })
+                                })?
+                            } else if shape_bodies && query_plan_references_outer(&shape, 0) {
                                 self.plan_again(ctes, || {
                                     self.plan_query(body, Some(&prefix), ctes, ptypes)
                                 })?
@@ -188,12 +210,22 @@ impl Engine {
                                 shape
                             }
                         }
-                        (None, Some(rows)) => QueryPlan::Values(self.plan_values(
-                            rows,
-                            Some(&prefix),
-                            ctes,
-                            ptypes,
-                        )?),
+                        (None, Some(rows)) => {
+                            let values = self.plan_values(rows, Some(&prefix), ctes, ptypes)?;
+                            let correlated = values
+                                .rows
+                                .iter()
+                                .flatten()
+                                .any(|e| rexpr_references_outer(e, 0));
+                            if right_side && correlated {
+                                detached = true;
+                                QueryPlan::Values(self.plan_again(ctes, || {
+                                    self.plan_values(rows, lateral_parent, ctes, ptypes)
+                                })?)
+                            } else {
+                                QueryPlan::Values(values)
+                            }
+                        }
                         _ => unreachable!(),
                     }
                 } else if i > 0 && paren_join_reaches_left(tref) {
@@ -211,6 +243,8 @@ impl Engine {
                         lateral_parent,
                         self,
                         ctes,
+                        right_side,
+                        shares_parent_level,
                     );
                     let fence = Scope::lateral_fence(parent, &prefix, self, ctes);
                     // The relations to the join's left, for a hint (error-fields.md §11.8).
@@ -276,8 +310,8 @@ impl Engine {
                         _ => unreachable!(),
                     })?
                 };
-                let lateral =
-                    join_lateral || (lateral_eligible && query_plan_references_outer(&plan, 0));
+                let lateral = join_lateral
+                    || (lateral_eligible && !detached && query_plan_references_outer(&plan, 0));
                 shaped[i] = shape_bodies && tref.subquery.is_some() && !lateral;
                 lateral_flags.push(lateral);
                 let label = tref.alias.clone().unwrap_or_default().to_string();
@@ -315,17 +349,38 @@ impl Engine {
                         lateral_parent,
                         self,
                         ctes,
+                        right_side,
+                        shares_parent_level,
                     );
-                    self.resolve_srf(
-                        &tref.name,
-                        args,
-                        tref.alias.as_deref(),
-                        tref.column_defs.as_deref(),
-                        Some(&prefix),
-                        ctes,
-                        ptypes,
-                    )
-                    .map_err(|e| locate_srf_error(e, tref))?
+                    let resolved = self
+                        .resolve_srf(
+                            &tref.name,
+                            args,
+                            tref.alias.as_deref(),
+                            tref.column_defs.as_deref(),
+                            Some(&prefix),
+                            ctes,
+                            ptypes,
+                        )
+                        .map_err(|e| locate_srf_error(e, tref))?;
+                    if right_side && resolved.1.iter().any(|a| rexpr_references_outer(a, 0)) {
+                        // Correlated only outside this FROM (the left side refused above).
+                        detached = true;
+                        self.plan_again(ctes, || {
+                            self.resolve_srf(
+                                &tref.name,
+                                args,
+                                tref.alias.as_deref(),
+                                tref.column_defs.as_deref(),
+                                lateral_parent,
+                                ctes,
+                                ptypes,
+                            )
+                        })
+                        .map_err(|e| locate_srf_error(e, tref))?
+                    } else {
+                        resolved
+                    }
                 } else {
                     self.resolve_srf(
                         &tref.name,
@@ -343,8 +398,11 @@ impl Engine {
                     tref.alias.as_deref().unwrap_or(&tref.name),
                     tref.column_aliases.as_deref(),
                 )?;
-                lateral_flags
-                    .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
+                lateral_flags.push(
+                    lateral_eligible
+                        && !detached
+                        && rargs.iter().any(|a| rexpr_references_outer(a, 0)),
+                );
                 synthetic.push(table);
                 let si = synthetic.len() - 1;
                 srf_meta.push(Some((si, rargs, kind, None, String::new())));
@@ -364,21 +422,43 @@ impl Engine {
                         lateral_parent,
                         self,
                         ctes,
+                        right_side,
+                        shares_parent_level,
                     );
                     Some(&prefix)
                 } else {
                     scope_parent = lateral_parent;
                     scope_parent
                 };
-                let (table, rargs, plan) = self.resolve_json_table(
+                let mut resolved = self.resolve_json_table(
                     jt,
                     tref.alias.as_deref(),
                     resolve_against,
                     ctes,
                     ptypes,
                 )?;
-                lateral_flags
-                    .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
+                if right_side
+                    && lateral_eligible
+                    && resolved.1.iter().any(|a| rexpr_references_outer(a, 0))
+                {
+                    // Correlated only outside this FROM (the left side refused above).
+                    detached = true;
+                    resolved = self.plan_again(ctes, || {
+                        self.resolve_json_table(
+                            jt,
+                            tref.alias.as_deref(),
+                            lateral_parent,
+                            ctes,
+                            ptypes,
+                        )
+                    })?;
+                }
+                let (table, rargs, plan) = resolved;
+                lateral_flags.push(
+                    lateral_eligible
+                        && !detached
+                        && rargs.iter().any(|a| rexpr_references_outer(a, 0)),
+                );
                 synthetic.push(table);
                 let si = synthetic.len() - 1;
                 srf_meta.push(Some((
@@ -546,15 +626,9 @@ impl Engine {
                     },
                 };
             }
-            // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be
-            // both kept whole and evaluated per left row. (i ≥ 1, so the item carries a join kind.)
-            if lateral_flags[i] && matches!(sel.joins[i - 1].kind, JoinKind::Right | JoinKind::Full)
-            {
-                return Err(EngineError::new(
-                    SqlState::InvalidColumnReference,
-                    "invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT",
-                ));
-            }
+            // The right side of a RIGHT/FULL join is never correlated to its left: a reference there
+            // was refused at resolution (`42P10`), and one outside this FROM detached the item.
+            debug_assert!(!(right_side && lateral_flags[i]));
             // The relation's label (alias, else the table/function name; empty for an unaliased derived
             // table, which has no qualifier and never collides). A duplicate explicit label is 42712.
             let table: &Table = match src {
@@ -685,6 +759,8 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    lateral_refused: false,
+                    shares_parent_level: false,
                     hints: Default::default(),
                 };
                 let left_names: Vec<&str> = seg_star
@@ -725,6 +801,8 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    lateral_refused: false,
+                    shares_parent_level: false,
                     hints: Default::default(),
                 };
                 // The synthesized predicate compares the two chosen columns through one-column pseudo
@@ -831,6 +909,8 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    lateral_refused: false,
+                    shares_parent_level: false,
                     hints: Default::default(),
                 };
                 Some(resolve_boolean_filter(
@@ -860,6 +940,8 @@ impl Engine {
                     subquery_derivs: Default::default(),
                     lateral_view: None,
                     lateral_hit: Default::default(),
+                    lateral_refused: false,
+                    shares_parent_level: false,
                     hints: on_hints,
                 };
                 seg_star.extend(rel_star(k + 1));
@@ -886,6 +968,8 @@ impl Engine {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            lateral_refused: false,
+            shares_parent_level: false,
             hints: Default::default(),
         };
 

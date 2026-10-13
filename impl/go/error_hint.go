@@ -177,7 +177,7 @@ func (s *scope) resolveQualifiedAt(qualifier, name string, pos srcPos) (resolved
 	return r, nil
 }
 
-// locateColumnError stamps a column reference's 42703 / 42702 / 42P01 / 42P09 with its position, and adds
+// locateColumnError stamps a column reference's 42703 / 42702 / 42P01 / 42P09 / 42P10 with its position, and adds
 // the misspelled-column (§11.1), table-alias (§11.2), or LATERAL (§11.8) hint. An error already
 // positioned came from an inner site, which wins.
 func (s *scope) locateColumnError(err error, qualifier string, hasQualifier bool, name string, pos srcPos) error {
@@ -193,7 +193,7 @@ func (s *scope) locateColumnError(err error, qualifier string, hasQualifier bool
 		if hasQualifier {
 			e.withHint(s.tableHint(qualifier))
 		}
-	case AmbiguousColumn, AmbiguousAlias:
+	case AmbiguousColumn, AmbiguousAlias, InvalidColumnReference:
 		e.withPosition(int32(pos))
 	}
 	return err

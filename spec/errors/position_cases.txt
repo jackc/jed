@@ -690,6 +690,41 @@ code: 42703
 position: 34
 hint: To reference that column, you must mark this subquery with LATERAL.
 
+# --- LATERAL reference across a RIGHT or FULL join (42P10) ----------------------------------------
+# PostgreSQL's check_lateral_ref_ok: positioned at the reference, with a Detail and no hint
+# (detail_cases.txt).
+
+case: qualified reference to the left side of a RIGHT JOIN
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t RIGHT JOIN LATERAL (SELECT t.a) s ON true
+code: 42P10
+position: 44
+
+case: bare reference to the left side of a FULL JOIN
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t FULL JOIN LATERAL (SELECT a) s ON true
+code: 42P10
+position: 43
+
+case: table function argument on the left side of a RIGHT JOIN
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t RIGHT JOIN generate_series(1, t.a) g ON true
+code: 42P10
+position: 47
+
+case: left side of a RIGHT JOIN in a later comma item
+setup: CREATE TABLE t (a int, b int)
+setup: CREATE TABLE u (c int)
+run: SELECT * FROM t, u RIGHT JOIN LATERAL (SELECT c) s ON true
+code: 42P10
+position: 47
+
+case: missing column of the left side of a RIGHT JOIN
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t RIGHT JOIN LATERAL (SELECT t.nope) s ON true
+code: 42P10
+position: 44
+
 # --- DML targets (42P01) -----------------------------------------------------------------------
 
 case: unknown INSERT target

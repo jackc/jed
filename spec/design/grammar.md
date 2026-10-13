@@ -1043,9 +1043,14 @@ join_clause*`. A comma synthesizes a `CROSS` `JoinClause` (no `ON`) for the next
 `comma: true`; because the engine already executes `CROSS` and the flat-row model concatenates
 relations, this is **resolver-only** beyond the parser loop. Left-deep flattening (`a, b JOIN c …`
 becomes `a CROSS b JOIN c …`) yields the **identical row multiset** as the precedence-correct
-parse, because a cross product crossed with a (possibly outer) join commutes through the preserved
-left rows; only jed's *cost* reflects its own left-deep execution (the rows still match PG — the
-oracle confirms it).
+parse when the later item's joins are inner or `LEFT`, because a cross product commutes through
+their preserved left rows; only jed's *cost* reflects its own left-deep execution (the rows still
+match PG — the oracle confirms it). A `RIGHT` or `FULL` join does not commute: `(e × a) RIGHT JOIN b`
+keeps an unmatched `b` row once, where `e × (a RIGHT JOIN b)` keeps it once per `e` row (and not at
+all when `e` is empty). So the parser makes a **later comma item whose chain holds a `RIGHT` or
+`FULL` join** the unaliased parenthesized join it is — `FROM e, a RIGHT JOIN b ON p` is `FROM e, (a
+RIGHT JOIN b ON p)` (below) — which keeps the item's own `ON` scopes, `*` layout, and visible labels,
+and joins it to the items before it as one relation.
 
 The one place the comma's looser precedence is **observable** is ON-resolution scope: a comma binds
 **looser than `JOIN`**, so each `from_item` is its own segment and a join's `ON` may reference only
@@ -1078,12 +1083,16 @@ table function (§44) anywhere inside the group — including a nested group, an
 them, while the group's `ON` clauses and its non-`LATERAL` items may not. So `FROM a JOIN (b JOIN
 LATERAL (SELECT a.x + b.y) s ON true) ON true` works, re-evaluating the group once per `a` row, and a
 non-`LATERAL` subquery *inside* the `LATERAL` item sees `a` too (the whole lateral item is in its
-scope). The usual join-type rule applies to a group that references a relation on its left: as the
-right side of a `RIGHT`/`FULL` join it is `42P10` (with §44's broader-than-PG narrowing — any
-reference to an earlier FROM relation counts, including one in an earlier comma item, and a `RIGHT`
-join *inside* the group whose lateral item references a relation outside the group is `42P10` too).
-A group whose lateral items reference only an enclosing query level is not correlated to its left and
-joins under any join type.
+scope). §44's join-type rule applies at every level: a group on the right side of a `RIGHT`/`FULL`
+join may not reference that join's left side (`42P10`), while a reference to an earlier comma item
+— outside that join — is allowed (`FROM c, a RIGHT JOIN (b JOIN LATERAL (SELECT c.z) s ON true) ON
+true`), and a `RIGHT JOIN LATERAL` *inside* the group may reference a relation to the group's left
+(`FROM a JOIN (b RIGHT JOIN LATERAL (SELECT a.x) s ON true) ON true`). A group whose lateral items
+reference only an enclosing query level is not correlated to its left and joins under any join type.
+Because the relations to the group's left and those inside it are **one** FROM namespace, a bare
+column that one of each carries is ambiguous (`42702`) from a lateral item inside the group — not
+shadowed by the inner relation, though jed plans the group's body as its own level — and the outer
+relation is checked first, so one refused by a `RIGHT`/`FULL` join is `42P10`.
 
 - **Unaliased**, the group is one join-tree node whose inner relation labels stay visible: `a.x`,
   `b.*`, `WHERE`/`GROUP BY`/`ORDER BY`, a correlated subquery, and a later `LATERAL` item all reach
@@ -1098,7 +1107,9 @@ joins under any join type.
 *Mechanics.* The parser builds the group's body as a `SELECT *` over its chain. A group that
 **begins** a chain — the first FROM item, the item after a comma, or the first item of an enclosing
 group — is the same left-deep chain without its parentheses (the same tree and the same `ON` scopes),
-so an unaliased one is **spliced** into the enclosing chain and the planner sees an ordinary chain.
+so an unaliased one is **spliced** into the enclosing chain and the planner sees an ordinary chain —
+except that a later comma item whose (spliced) chain holds a `RIGHT` or `FULL` join is made a group
+again (comma-`FROM`, above).
 Any other unaliased group is an inline derived body (planned against the enclosing query's scope, like
 §42 — so its `ON` clauses may correlate to an enclosing query level, never to a sibling) marked as a join
 group: after its `*` columns it emits every slot the `*` omitted — the USING/NATURAL copies a merge
@@ -3108,20 +3119,31 @@ prefix, so `t CROSS JOIN LATERAL (…) a CROSS JOIN LATERAL (SELECT a.x + 1) b` 
 earlier lateral relation `a`. The **first** FROM item is never lateral (nothing precedes it); a
 `LATERAL` keyword on it is accepted as a no-op (`FROM LATERAL (SELECT 1) s` — PG).
 
-**Spelled through `JOIN` (no comma-FROM).** jed reaches `LATERAL` via explicit join syntax —
-`CROSS JOIN LATERAL`, `[INNER] JOIN LATERAL … ON …`, `LEFT [OUTER] JOIN LATERAL … ON …`. The
-comma-FROM spelling (`FROM t, LATERAL (…)`) needs comma-`FROM`, still a deferred §15 narrowing; until
-it lands, write `CROSS JOIN LATERAL` for the implicit-cross form.
+**Spelled through `JOIN` or a comma.** `LATERAL` follows any join keyword — `CROSS JOIN LATERAL`,
+`[INNER] JOIN LATERAL … ON …`, `LEFT [OUTER] JOIN LATERAL … ON …`, and (below) `RIGHT`/`FULL` — or a
+comma (`FROM t, LATERAL (…)`, §15), where the lateral item sees every earlier comma item.
 
 **Join kinds.** `INNER` / `CROSS` / `LEFT` work as expected: `LEFT JOIN LATERAL … ON <pred>` keeps every
 left row, NULL-extending it across the lateral columns when the lateral side produces no matching row
 (so `LEFT JOIN LATERAL (…) ON true` keeps a left row even when the lateral body returns **zero** rows —
-the common "optional explode"). A **`RIGHT`/`FULL` JOIN to a lateral item that actually references the
-left side is `42P10`** (`invalid_column_reference` — *"the combining JOIN type must be INNER or LEFT for
-a LATERAL reference"*, matching PG): the right side cannot both be kept whole *and* be evaluated per
-left row. A lateral-eligible item with **no** actual correlation (`RIGHT JOIN generate_series(1, 2) g`,
-`RIGHT JOIN LATERAL (SELECT 1) s`) is *not* dependent, so it is materialized once and **any** join kind
-is allowed — again matching PG.
+the common "optional explode"). On the right side of a **`RIGHT`/`FULL` join**, a reference to **that
+join's left side is `42P10`** (`invalid_column_reference`, matching PG's `check_lateral_ref_ok`): the
+right side cannot both be kept whole *and* be evaluated per left row. PostgreSQL leaves those relations
+visible but refuses them, so the check is made at the reference — positioned there, with the message
+*invalid reference to FROM-clause entry for table t* (an unaliased derived table is `unnamed_subquery`,
+a column of an unaliased join `unnamed_join`) and the Detail *The combining JOIN type must be INNER or
+LEFT for a LATERAL reference.* — and it fires before the reference's column is looked up and before any
+ambiguity with another relation. The left side is every relation to the left of the join in its comma
+item; a comma ends it, so a later comma item may reference those relations again. A reference that
+passes the left side to a relation **outside** the join is allowed: an enclosing query level
+(`SELECT (SELECT … FROM b RIGHT JOIN LATERAL (SELECT a.x) s ON …) FROM a`), an earlier comma item
+(`FROM a, b RIGHT JOIN LATERAL (SELECT a.x) s ON …`, a comma item §15 parenthesizes), or a relation to
+the left of an enclosing parenthesized join (§15). Such an item is not dependent on its siblings: it is
+planned against the relations outside the join and materialized once per evaluation of the FROM it
+belongs to (like a non-`LATERAL` derived table, §42) — once per outer row of a correlated subquery,
+once per left-hand row of a correlated comma item or group. A lateral-eligible item with **no**
+correlation (`RIGHT JOIN generate_series(1, 2) g`, `RIGHT JOIN LATERAL (SELECT 1) s`) is materialized
+once. Either way **any** join kind is allowed — matching PG.
 
 **Execution + cost.** A non-correlated FROM item is materialized **once** (unchanged). A
 **correlated** lateral item is materialized **per combined left-hand row**: the left row is pushed onto
@@ -3138,21 +3160,8 @@ re-executed per outer row (§26). Cost is the sum of those per-row evaluations �
 | `LATERAL` before a bare base-table name | `42601` | The keyword is valid only before a derived table or table function (PG). |
 | Earlier-relation reference inside a **non-`LATERAL`** sub-SELECT / VALUES body | `42P01` / `42703` | The §42 non-correlation rule — mark the body `LATERAL` to correlate it. |
 | **Forward** / self reference (a later sibling) inside a lateral body | `42P01` | Only relations to the **left** are in scope. |
-| `RIGHT` / `FULL JOIN` to a lateral item that references the left side | `42P10` | `invalid_column_reference`; the combining join type must be INNER or LEFT for a LATERAL reference (PG). |
+| A reference from the right side of a `RIGHT` / `FULL JOIN` to that join's left side | `42P10` | `invalid_column_reference`, at the reference, with a Detail: the combining join type must be INNER or LEFT for a LATERAL reference (PG). |
 | A lateral SRF / body whose own argument / clause errors (arity, type, `54001` depth, …) | *(as §35/§42)* | Lateral changes only the *scope* the body resolves against, not its other rules. |
-
-**Deliberate narrowings (relaxable later, [../../TODO.md](../../TODO.md)).**
-
-- **`RIGHT`/`FULL JOIN LATERAL` rejection is slightly broader than PG.** jed raises `42P10` when the
-  lateral item references **any** outer relation (a left sibling *or* an enclosing query); PG rejects
-  only a reference to the **left side of that join**. The practical case — `RIGHT JOIN LATERAL` that
-  correlates to the left — matches PG exactly; the divergences are the exotic `RIGHT JOIN LATERAL (body
-  that references only an *enclosing* query)`, a `RIGHT JOIN` whose lateral side references an earlier
-  *comma* item rather than the join's own left side, and — inside a parenthesized join (§15) — a `RIGHT
-  JOIN LATERAL` whose body references a relation to the left of the enclosing group; the last two are
-  recorded in the override ledger. A `RIGHT`/`FULL JOIN` to a fully **un**correlated lateral item is
-  allowed (matches PG).
-- **comma-`FROM` `LATERAL`** (`FROM t, LATERAL (…)`) waits on comma-`FROM` (§15).
 
 ## 45. `CREATE SEQUENCE` / `DROP SEQUENCE` ([sequences.md](sequences.md))
 

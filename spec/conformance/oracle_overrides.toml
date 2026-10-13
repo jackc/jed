@@ -1286,19 +1286,6 @@ file = "joins/natural.test"
 sql = "SELECT * FROM a NATURAL FULL JOIN b"
 reason = "jed: NATURAL FULL JOIN with a common column is 0A000 — its merged column is COALESCE(left, right), which jed's single-flat-index merge model does not carry (the same deferral as FULL JOIN USING, grammar.md §15). PostgreSQL supports it and returns the coalesced merge. A deliberate, relaxable narrowing."
 
-# --- RIGHT/FULL JOIN LATERAL rejection inside a parenthesized join (grammar.md §15/§44). jed raises
-# 42P10 when a LATERAL item under a RIGHT/FULL join references any outer relation; PostgreSQL rejects
-# only a reference to that join's own left side.
-[[override]]
-file = "joins/parenthesized_lateral.test"
-sql = "SELECT a.id, b.id, s.v FROM a JOIN (b RIGHT JOIN LATERAL (SELECT a.x AS v) s ON true) ON true"
-reason = "jed: a RIGHT/FULL JOIN to a LATERAL item that references ANY outer relation is 42P10 (grammar.md §44 narrowing): the executor cannot keep the right side whole while re-evaluating it per row. Here s references a, which lies to the left of the enclosing group, not on the left side of the RIGHT JOIN, so PostgreSQL allows it (a is a lateral reference of the outer INNER join). A deliberate, relaxable narrowing."
-
-[[override]]
-file = "joins/parenthesized_lateral.test"
-sql = "SELECT count(*) FROM c AS x, a RIGHT JOIN (b JOIN LATERAL (SELECT x.z AS v) s ON true) ON true"
-reason = "jed: a RIGHT/FULL JOIN to a relation that correlates to ANY earlier FROM relation is 42P10 (grammar.md §15/§44 narrowing). Here the group references x, an earlier comma-separated item rather than the RIGHT JOIN's left side, which PostgreSQL allows (comma items stay lateral-referenceable whatever the later join type). The same holds for a top-level RIGHT JOIN LATERAL. A deliberate, relaxable narrowing."
-
 # --- FOREIGN KEY action closure ordering. jed has no deferred constraints and defines NO ACTION
 # and RESTRICT identically at the final generated-action closure boundary (constraints.md §6.6).
 # PostgreSQL's alphabetically earlier immediate NO ACTION trigger fires before the later CASCADE

@@ -104,6 +104,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	if parent != nil && parent.lateralView != nil {
 		lateralParentScope = parent.lateralView
 	}
+	// Inside a fenced parenthesized join, the fence's view and this FROM's left relations are one
+	// PostgreSQL FROM namespace (§15).
+	sharesParentLevel := parent != nil && parent.lateralView != nil
 	for i, tref := range tableRefs {
 		var t *catTable
 		var cteIdx *int
@@ -116,12 +119,20 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// item (i == 0) has no earlier sibling, so it is never lateral; an SRF there resolves against
 		// `parent` (the enclosing query) exactly as before.
 		lateralEligible := i > 0 && ((isDerived && tref.Lateral) || tref.IsFunc || tref.JsonTable != nil)
+		// The right side of a RIGHT/FULL join may not reference the join's left side — every relation
+		// to its left in this FROM, since a later comma item holding such a join is a parenthesized
+		// join of its own (§15) — but may reference the relations outside it: a reference to those
+		// leaves the item uncorrelated to its siblings (§44, PostgreSQL's p_lateral_ok).
+		rightSide := i > 0 && (sel.Joins[i-1].Kind == joinRight || sel.Joins[i-1].Kind == joinFull)
+		// detached is set when a RIGHT/FULL item's body correlates only to the relations outside this
+		// FROM: it is planned against them and materialized once, like a non-LATERAL derived table.
+		detached := false
 		// The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
 		// enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
-		// deeper). nil when not lateral-eligible.
+		// deeper), refused as the left side of a RIGHT/FULL join. nil when not lateral-eligible.
 		var lateralParent *scope
 		if lateralEligible {
-			lateralParent = &scope{rels: rels, parent: lateralParentScope, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels}
+			lateralParent = &scope{rels: rels, parent: lateralParentScope, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels, lateralRefused: rightSide, sharesParentLevel: sharesParentLevel}
 		}
 		if isDerived {
 			// Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
@@ -175,7 +186,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				// learns whether any reference reached them. If so the join is a correlated lateral
 				// relation, planned for real against the fence; otherwise it is planned as any other
 				// derived body.
-				prefix := &scope{rels: rels, parent: lateralParentScope, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels}
+				prefix := &scope{rels: rels, parent: lateralParentScope, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels, lateralRefused: rightSide, sharesParentLevel: sharesParentLevel}
 				fence := lateralFence(parent, prefix, db, ctes)
 				// The relations to the join's left, for a hint (error-fields.md §11.8).
 				err := db.withUnseenFrame(buildUnseenFrame(tableRefs, sel.Joins, rels, subRels, i, fence), func() error {
@@ -220,7 +231,19 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				if err != nil {
 					return nil, err
 				}
-				if shapeBodies && lateralEligible && queryPlanReferencesOuter(&plan, 0) {
+				if rightSide && lateralEligible && queryPlanReferencesOuter(&plan, 0) {
+					detached = true
+					err := db.planAgain(ctes, func() error {
+						return db.planBodyFirst(shapeBodies, func() error {
+							p, perr := db.planQuery(*tref.Subquery, lateralParentScope, ctes, ptypes)
+							plan = p
+							return perr
+						})
+					})
+					if err != nil {
+						return nil, err
+					}
+				} else if shapeBodies && lateralEligible && queryPlanReferencesOuter(&plan, 0) {
 					err := db.planAgain(ctes, func() error {
 						p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
 						plan = p
@@ -239,8 +262,19 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				if err != nil {
 					return nil, err
 				}
+				if rightSide && lateralEligible && queryPlanReferencesOuter(&plan, 0) {
+					detached = true
+					err := db.planAgain(ctes, func() error {
+						vp, verr := db.planValues(tref.Values, lateralParentScope, ctes, ptypes)
+						plan = queryPlan{values: vp}
+						return verr
+					})
+					if err != nil {
+						return nil, err
+					}
+				}
 			}
-			lateralFlags[i] = joinLateral || (lateralEligible && queryPlanReferencesOuter(&plan, 0))
+			lateralFlags[i] = joinLateral || (lateralEligible && !detached && queryPlanReferencesOuter(&plan, 0))
 			shaped[i] = shapeBodies && tref.Subquery != nil && !lateralFlags[i]
 			label := ""
 			if tref.Alias != nil {
@@ -265,6 +299,15 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				srfParent = lateralParent
 			}
 			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, tref.ColumnDefs, srfParent, ctes, ptypes)
+			if serr == nil && rightSide && lateralEligible && slices.ContainsFunc(sp.args, func(a *rExpr) bool { return rexprReferencesOuter(a, 0) }) {
+				// Correlated only outside this FROM (the left side refused above).
+				detached = true
+				serr = db.planAgain(ctes, func() error {
+					var rerr error
+					tbl, sp, rerr = db.resolveSRF(tref.Name, tref.Args, tref.Alias, tref.ColumnDefs, lateralParentScope, ctes, ptypes)
+					return rerr
+				})
+			}
 			if serr != nil {
 				// A table function's own 42883 (no function for these argument types) points at its
 				// name, like a call in an expression (spec/design/error-fields.md §10.2); an argument's
@@ -284,7 +327,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			t = tbl
 			srfPlans[i] = sp
-			if lateralEligible {
+			if lateralEligible && !detached {
 				for _, a := range sp.args {
 					if rexprReferencesOuter(a, 0) {
 						lateralFlags[i] = true
@@ -301,12 +344,21 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				jtParent = lateralParent
 			}
 			tbl, sp, jerr := db.resolveJSONTable(tref.JsonTable, tref.Alias, jtParent, ctes, ptypes)
+			if jerr == nil && rightSide && lateralEligible && slices.ContainsFunc(sp.args, func(a *rExpr) bool { return rexprReferencesOuter(a, 0) }) {
+				// Correlated only outside this FROM (the left side refused above).
+				detached = true
+				jerr = db.planAgain(ctes, func() error {
+					var rerr error
+					tbl, sp, rerr = db.resolveJSONTable(tref.JsonTable, tref.Alias, lateralParentScope, ctes, ptypes)
+					return rerr
+				})
+			}
 			if jerr != nil {
 				return nil, jerr
 			}
 			t = tbl
 			srfPlans[i] = sp
-			if lateralEligible {
+			if lateralEligible && !detached {
 				for _, a := range sp.args {
 					if rexprReferencesOuter(a, 0) {
 						lateralFlags[i] = true
@@ -454,11 +506,10 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				t = tbl
 			}
 		}
-		// RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
-		// kept whole and evaluated per left row. (i ≥ 1 here, so the item carries a join kind.)
-		if lateralFlags[i] && (sel.Joins[i-1].Kind == joinRight || sel.Joins[i-1].Kind == joinFull) {
-			return nil, newError(InvalidColumnReference,
-				"invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT")
+		// The right side of a RIGHT/FULL join is never correlated to its left: a reference there was
+		// refused at resolution (42P10), and one outside this FROM detached the item.
+		if rightSide && lateralFlags[i] {
+			panic("BUG: a RIGHT/FULL join's right side correlated to its left")
 		}
 		label := t.Name
 		if tref.Alias != nil {

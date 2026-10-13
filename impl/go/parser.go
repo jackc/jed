@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -3764,6 +3765,8 @@ func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 	}
 	// A leading unaliased parenthesized join is the same left-deep chain without its parentheses.
 	from, joins := spliceLeadingGroup(from, nil)
+	// segment is where the current comma item's Comma join sits in joins (-1 for the first item).
+	segment := -1
 	for {
 		for {
 			j, ok, err := p.parseJoinClause()
@@ -3774,6 +3777,9 @@ func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 				break
 			}
 			joins = append(joins, j)
+		}
+		if segment >= 0 {
+			joins = groupOuterJoinItem(joins, segment)
 		}
 		// Comma-FROM (grammar.md §15): `FROM a, b` is an implicit CROSS JOIN. The comma separates
 		// top-level FROM items, each its own join sub-chain; it binds LOOSER than JOIN, so the new
@@ -3787,6 +3793,7 @@ func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 			}
 			// An unaliased parenthesized join after a comma starts the new segment the same way.
 			table, groupJoins := spliceLeadingGroup(table, nil)
+			segment = len(joins)
 			joins = append(joins, joinClause{Kind: joinCross, Table: table, Comma: true})
 			joins = append(joins, groupJoins...)
 			continue
@@ -3837,7 +3844,34 @@ func (p *parser) parseJoinGroup() (queryExpr, error) {
 			"a parenthesized FROM item must be a subquery, a VALUES list, or a join")
 	}
 	p.undeepen()
-	return queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &from, Joins: joins, ParenJoin: true}}, nil
+	return joinGroupBody(from, joins), nil
+}
+
+// joinGroupBody is the body of a parenthesized join (grammar.md §15): a `SELECT *` over its chain.
+// Unaliased, the caller marks it JoinGroup.
+func joinGroupBody(from tableRef, joins []joinClause) queryExpr {
+	return queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &from, Joins: joins, ParenJoin: true}}
+}
+
+// groupOuterJoinItem makes a later comma item whose chain holds a RIGHT or FULL join the unaliased
+// parenthesized join it is (grammar.md §15): `FROM t, a RIGHT JOIN b ON p` is
+// `FROM t, (a RIGHT JOIN b ON p)`. Flattened into the left-deep chain, `(t × a) RIGHT JOIN b` would
+// keep an unmatched b row once rather than once per t row. seg indexes the item's Comma join; the
+// joins after it are its chain. An item of only inner and LEFT joins stays flattened — the same rows
+// either way.
+func groupOuterJoinItem(joins []joinClause, seg int) []joinClause {
+	outer := false
+	for _, j := range joins[seg+1:] {
+		outer = outer || j.Kind == joinRight || j.Kind == joinFull
+	}
+	if !outer {
+		return joins
+	}
+	head := joins[seg]
+	body := joinGroupBody(head.Table, slices.Clone(joins[seg+1:]))
+	body.Select.JoinGroup = true
+	head.Table = tableRef{Subquery: &body}
+	return append(joins[:seg], head)
 }
 
 // parseTableRef parses `table_ref ::= derived_table derived_alias? | joined_group derived_alias? |

@@ -1077,6 +1077,8 @@ impl Engine {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            lateral_refused: false,
+            shares_parent_level: false,
             hints: Default::default(),
         };
         let mut resolved_rows: Vec<Vec<RExpr>> = Vec::with_capacity(rows.len());

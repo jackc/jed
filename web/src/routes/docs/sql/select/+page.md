@@ -429,10 +429,16 @@ through a **comma**: `FROM t, LATERAL (…)` is the same as `t CROSS JOIN LATERA
 sub-`SELECT` or `VALUES` body is lateral only with the keyword; a **table function** (`generate_series`,
 `unnest`) is *implicitly* lateral, so `… CROSS JOIN unnest(t.tags)` correlates with or without it.
 
+On the right side of a `RIGHT` or `FULL` join, a lateral item may not reference that join's left side
+(`42P10`, as in PostgreSQL) — those rows must be kept whole, not re-evaluated per left row. It may
+still reference tables **outside** the join: an earlier comma item (`FROM a, b RIGHT JOIN LATERAL
+(SELECT a.x) s ON …`), or an outer query from inside a subquery.
+
 A comma in `FROM` is an implicit `CROSS JOIN` generally — `FROM a, b` is `a CROSS JOIN b`. The comma
 binds looser than `JOIN`, so each comma-separated item is its own join group: a join's `ON` may
 reference only relations inside its own group (`FROM a, b JOIN c ON a.x = c.x` is an error), matching
-PostgreSQL.
+PostgreSQL. A `RIGHT` or `FULL` join therefore applies within its group: in `FROM a, b RIGHT JOIN c ON
+…` every unmatched `c` row is kept once per row of `a`.
 
 To select all columns of **one** relation in a join, use a qualified star `t.*` — the per-table
 counterpart of `*`. Unlike bare `*`, it can be mixed with other items: `SELECT a.*, b.label FROM a
@@ -465,7 +471,8 @@ tables, and it must contain at least one join — `FROM (a)` is an error. A `LAT
 function inside the parentheses also sees the tables to the group's **left**, aliased or not, as in
 PostgreSQL: in `FROM a JOIN (b JOIN LATERAL (SELECT a.x + b.y AS v) s ON true) ON true` the group is
 re-evaluated for each row of `a`. As with any `LATERAL` reference, the group may not be the right side
-of a `RIGHT` or `FULL` join to the table it references (`42P10`).
+of a `RIGHT` or `FULL` join to the table it references (`42P10`); a `RIGHT JOIN LATERAL` *inside* the
+group may reference a table to the group's left.
 
 ## Conditional expressions (`CASE`, `COALESCE`, `GREATEST`/`LEAST`)
 

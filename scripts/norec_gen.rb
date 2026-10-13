@@ -187,6 +187,11 @@
 #                 flat left-deep chain with the LATERAL item after both relations, and from the join with
 #                 the lateral filter folded into its ON. INNER, LEFT (NULL-extended), aliased, and
 #                 table-function forms over NULL-bearing data must match by-construction rows.
+#   right_lateral — a RIGHT/FULL join whose LATERAL item references only relations outside that join
+#                 (grammar.md §44): an earlier comma item, the relation to the left of an enclosing
+#                 group, or an enclosing query. The item is materialized once per evaluation of the
+#                 join; the same rows come from the comma item parenthesized, from the swapped LEFT
+#                 JOIN, and from the join inside a LATERAL derived table, over NULL-bearing data.
 #
 # Determinism (CLAUDE.md §10): generation is SEEDED, so a discovered failure reduces to this exact
 # deterministic .test, which then joins the corpus. The fuzzer is dev-time discovery; the emitted
@@ -390,6 +395,13 @@ PAREN_LATERAL_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_mu
                        query.table_alias query.join_inner query.join_left query.cross_join
                        query.derived_table query.lateral query.set_returning query.join_parenthesized
                        query.select_no_from expr.arithmetic expr.comparison_value null.three_valued types.i32].freeze
+RIGHT_LATERAL_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                       query.comparison_order query.order_by query.order_by_keys query.qualified_column
+                       query.table_alias query.join_inner query.join_left query.join_right query.join_full
+                       query.cross_join query.comma_from query.derived_table query.lateral
+                       query.join_parenthesized query.select_no_from query.aggregates
+                       query.subquery_scalar query.subquery_correlated expr.comparison_value
+                       null.three_valued types.i32].freeze
 JOIN_COMM_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                    query.comparison_order query.order_by query.order_by_keys query.qualified_column
                    query.where_eq query.join_inner query.cross_join expr.comparison_value
@@ -471,6 +483,9 @@ JOIN_COMM_NOTE = ["# Join-shape equivalence: INNER JOIN commutes (a JOIN b == b 
                   "# filtered by the same condition. Same projected pairs, different execution paths.",
                   "# Expected rows known by construction; no oracle."].freeze
 
+RIGHT_LATERAL_NOTE = ["# Join-shape equivalence: a RIGHT/FULL join whose LATERAL item references only relations outside",
+                      "# the join equals its parenthesized, swapped-LEFT, and nested-LATERAL forms. Expected rows known",
+                      "# by construction; no oracle."].freeze
 PAREN_LATERAL_NOTE = ["# Join-shape equivalence: a parenthesized join whose LATERAL item reaches the relation to its left",
                       "# equals the flat chain and the lateral-free join. Expected rows known by construction; no oracle."].freeze
 
@@ -2989,6 +3004,68 @@ def gen_paren_lateral(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: RIGHT/FULL join to a LATERAL item correlated outside the join ------------------
+def gen_right_lateral(seed)
+  rng = Random.new(seed)
+  maybe = ->(range) { rng.rand(5).zero? ? nil : rng.rand(range) }
+  a = (1..12).to_a.sample(5, random: rng).sort.map { |id| [id, maybe.call(0..4), maybe.call(1..5)] }
+  b = (1..12).to_a.sample(5, random: rng).sort.map { |id| [id, maybe.call(1..5)] }
+  floor = rng.rand(0..2)
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  nkey = ->(x) { x.nil? ? [1, 0] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |r| r.first(2).flat_map { |x| nkey.call(x) } }.flat_map { |r| r.map { |x| lit.call(x) } }
+  end
+  # The lateral item l yields one row s = a.v when a.k > floor (UNKNOWN on NULL — no row), and the
+  # join's ON is b.k = l.s.
+  l_of = ->(ak, av) { !ak.nil? && ak > floor ? [av] : [] }
+  matches = ->(s) { s.nil? ? [] : b.select { |_, bk| bk == s } }
+  right = a.flat_map do |aid, ak, av|
+    l_of.call(ak, av).flat_map do |s|
+      (m = matches.call(s)).empty? ? [[aid, nil, s]] : m.map { |bid, _| [aid, bid, s] }
+    end
+  end
+  full = a.flat_map do |aid, ak, av|
+    ls = l_of.call(ak, av)
+    hit = ls.flat_map { |s| matches.call(s).map(&:first) }
+    right.select { |r| r[0] == aid } + b.reject { |bid, _| hit.include?(bid) }.map { |bid, _| [aid, bid, nil] }
+  end
+  counts = a.map { |aid, _, _| [aid, right.count { |r| r[0] == aid }] }
+
+  out = header(seed, RIGHT_LATERAL_REQ, "RIGHT/FULL join to a LATERAL item correlated outside the join",
+               note: RIGHT_LATERAL_NOTE)
+  stmt(out, "CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)")
+  stmt(out, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "INSERT INTO a VALUES #{a.map { |r| "(#{r.map(&lit).join(', ')})" }.join(', ')}")
+  stmt(out, "INSERT INTO b VALUES #{b.map { |r| "(#{r.map(&lit).join(', ')})" }.join(', ')}")
+
+  body = "(SELECT a.v AS s WHERE a.k > #{floor}) l"
+  order = "ORDER BY a.id, b.id"
+  out << "# the RIGHT JOIN's LATERAL item reaches a, an earlier comma item"
+  q(out, "III", "SELECT a.id, b.id, l.s FROM a, b RIGHT JOIN LATERAL #{body} ON b.k = l.s #{order}", flat.call(right))
+  out << "# the comma item parenthesized — MUST match"
+  q(out, "III", "SELECT a.id, b.id, l.s FROM a JOIN (b RIGHT JOIN LATERAL #{body} ON b.k = l.s) ON true #{order}",
+    flat.call(right))
+  out << "# the swapped LEFT JOIN — MUST match"
+  q(out, "III", "SELECT a.id, b.id, l.s FROM a CROSS JOIN LATERAL #{body} LEFT JOIN b ON b.k = l.s #{order}",
+    flat.call(right))
+  out << "# the join inside a LATERAL derived table — MUST match"
+  q(out, "III", "SELECT a.id, g.id, g.s FROM a CROSS JOIN LATERAL (SELECT b.id, l.s FROM b RIGHT JOIN LATERAL " \
+                "#{body} ON b.k = l.s) g ORDER BY a.id, g.id", flat.call(right))
+  out << "# FULL JOIN: every b row is kept once per a row"
+  q(out, "III", "SELECT a.id, b.id, l.s FROM a, b FULL JOIN LATERAL #{body} ON b.k = l.s #{order}", flat.call(full))
+  out << "# the FULL JOIN inside a LATERAL derived table — MUST match"
+  q(out, "III", "SELECT a.id, g.id, g.s FROM a CROSS JOIN LATERAL (SELECT b.id, l.s FROM b FULL JOIN " \
+                "(SELECT a.v AS s WHERE a.k > #{floor}) l ON b.k = l.s) g ORDER BY a.id, g.id", flat.call(full))
+  exp = counts.flat_map { |aid, n| [aid.to_s, n.to_s] }
+  out << "# a correlated subquery: the LATERAL item references only the enclosing query"
+  q(out, "II", "SELECT a.id, (SELECT count(*) FROM b RIGHT JOIN LATERAL #{body} ON b.k = l.s) FROM a ORDER BY a.id", exp)
+  out << "# the swapped LEFT JOIN in the subquery — MUST match"
+  q(out, "II", "SELECT a.id, (SELECT count(*) FROM #{body} LEFT JOIN b ON b.k = l.s) FROM a ORDER BY a.id", exp)
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: WHERE pushdown through joins ---------------------------------------------------
 # One single-relation predicate template: [sql over column expression c, 3VL evaluator]. The
 # evaluator returns true / false / nil (UNKNOWN) for a value x (nil = SQL NULL).
@@ -3871,6 +3948,7 @@ SCENARIOS = {
   "setop_logic" => method(:gen_setop_logic),
   "join_comm" => method(:gen_join_comm),
   "paren_lateral" => method(:gen_paren_lateral),
+  "right_lateral" => method(:gen_right_lateral),
   "where_pushdown" => method(:gen_where_pushdown),
   "contradiction" => method(:gen_contradiction),
   "dml_contradiction" => method(:gen_dml_contradiction),

@@ -3445,9 +3445,14 @@ impl Parser {
         let first = self.parse_table_ref()?;
         // A leading unaliased parenthesized join is the same left-deep chain without its parentheses.
         let (from, mut joins) = splice_leading_group(first, Vec::new());
+        // Where the current comma item's `comma` join sits in `joins` (none for the first item).
+        let mut segment: Option<usize> = None;
         loop {
             while let Some(j) = self.parse_join_clause()? {
                 joins.push(j);
+            }
+            if let Some(seg) = segment {
+                group_outer_join_item(&mut joins, seg);
             }
             // Comma-FROM (grammar.md §15): `FROM a, b` is an implicit `CROSS JOIN`. The comma
             // separates top-level FROM items, each of which is its own join sub-chain; it binds
@@ -3459,6 +3464,7 @@ impl Parser {
                 let item = self.parse_table_ref()?;
                 // An unaliased parenthesized join after a comma starts the new segment the same way.
                 let (table, group_joins) = splice_leading_group(item, Vec::new());
+                segment = Some(joins.len());
                 joins.push(JoinClause {
                     kind: JoinKind::Cross,
                     table,
@@ -3494,21 +3500,7 @@ impl Parser {
             ));
         }
         self.undeepen();
-        Ok(QueryExpr::Select(Box::new(Select {
-            distinct: false,
-            items: SelectItems::All(StarPos(None)),
-            from: Some(from),
-            joins,
-            filter: None,
-            group_by: Vec::new(),
-            having: None,
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            windows: Vec::new(),
-            join_group: false,
-            paren_join: true,
-        })))
+        Ok(join_group_body(from, joins))
     }
 
     /// `table_ref ::= derived_table derived_alias? | joined_group derived_alias? | table_function
@@ -6466,6 +6458,62 @@ fn splice_leading_group(item: TableRef, joins: Vec<JoinClause>) -> (TableRef, Ve
     let mut out = group.joins;
     out.extend(joins);
     (group.from.expect("a join group has a FROM item"), out)
+}
+
+/// The body of a parenthesized join (grammar.md §15): a `SELECT *` over its chain. Unaliased, the
+/// caller marks it `join_group`.
+fn join_group_body(from: TableRef, joins: Vec<JoinClause>) -> QueryExpr {
+    QueryExpr::Select(Box::new(Select {
+        distinct: false,
+        items: SelectItems::All(StarPos(None)),
+        from: Some(from),
+        joins,
+        filter: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        windows: Vec::new(),
+        join_group: false,
+        paren_join: true,
+    }))
+}
+
+/// Make a later comma item whose chain holds a `RIGHT` or `FULL` join the unaliased parenthesized
+/// join it is (grammar.md §15): `FROM t, a RIGHT JOIN b ON p` is `FROM t, (a RIGHT JOIN b ON p)`.
+/// Flattened into the left-deep chain, `(t × a) RIGHT JOIN b` would keep an unmatched `b` row once
+/// rather than once per `t` row. `seg` indexes the item's `comma` join; the joins after it are its
+/// chain. An item of only inner and `LEFT` joins stays flattened — the same rows either way.
+fn group_outer_join_item(joins: &mut Vec<JoinClause>, seg: usize) {
+    let outer = joins[seg + 1..]
+        .iter()
+        .any(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full));
+    if !outer {
+        return;
+    }
+    let chain = joins.split_off(seg + 1);
+    let head = joins.pop().expect("the item's comma join");
+    let mut body = join_group_body(head.table, chain);
+    if let QueryExpr::Select(sel) = &mut body {
+        sel.join_group = true;
+    }
+    joins.push(JoinClause {
+        table: TableRef {
+            name: String::new(),
+            db: None,
+            alias: None,
+            args: None,
+            subquery: Some(Box::new(body)),
+            values: None,
+            column_aliases: None,
+            column_defs: None,
+            json_table: None,
+            lateral: false,
+            pos: TableRefPos::default(),
+        },
+        ..head
+    });
 }
 
 /// The label of a `VALUES` query's relation (PostgreSQL's `"*VALUES*"`).

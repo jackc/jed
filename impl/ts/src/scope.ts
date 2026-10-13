@@ -233,6 +233,14 @@ export class Scope {
   // join's lateral prefix to learn whether the join's body correlates to the relations on its left
   // (grammar.md §15).
   lateralHit = false;
+  // Set on a LATERAL prefix whose relations are the left side of a RIGHT or FULL join (PostgreSQL's
+  // p_lateral_ok = false, spec/design/grammar.md §44): a reference that resolves to one of them is
+  // 42P10. A reference that passes them to an outer level is unaffected.
+  lateralRefused = false;
+  // Set on a LATERAL prefix inside a parenthesized join's body (spec/design/grammar.md §15): its
+  // parent — the fence's view — holds relations PostgreSQL places in the same FROM namespace, so a
+  // bare column matching in both is ambiguous (42702), not shadowed.
+  sharesParentLevel = false;
   // What a name-resolution hint needs beyond the visible relations (error-fields.md §11.8).
   hints: ScopeHints = NO_SCOPE_HINTS;
   constructor(
@@ -436,6 +444,67 @@ export class Scope {
     }
   }
 
+  // hit records a reference resolved to this scope's relation `label` (lateralHit), or refuses it
+  // when this scope is the left side of a RIGHT/FULL join — PostgreSQL's check_lateral_ref_ok, raised
+  // at the first matching relation (grammar.md §44).
+  private hit(label: string): void {
+    this.refuse(label);
+    this.lateralHit = true;
+  }
+
+  // refuse is 42P10 when this scope is the left side of a RIGHT/FULL join (hit).
+  private refuse(label: string): void {
+    if (this.lateralRefused) {
+      throw engineError(
+        "invalid_column_reference",
+        "invalid reference to FROM-clause entry for table " + label,
+      ).withDetail("The combining JOIN type must be INNER or LEFT for a LATERAL reference.");
+    }
+  }
+
+  // parentLevelHasColumn reports whether the fence views PostgreSQL places in this scope's FROM
+  // namespace (sharesParentLevel, grammar.md §15) have a visible column `name`, raising that
+  // namespace's errors in its order — outermost first: a second match is 42702, a refused first
+  // match 42P10.
+  private parentLevelHasColumn(name: string): boolean {
+    if (!this.sharesParentLevel || this.parent === null) return false;
+    return this.parent.levelHasColumn(name);
+  }
+
+  // levelHasColumn is parentLevelHasColumn, then this scope's own columns.
+  private levelHasColumn(name: string): boolean {
+    let seen = this.parentLevelHasColumn(name);
+    const matched = (label: string): void => {
+      if (seen) throw ambiguousColumn(name);
+      this.refuse(label);
+      seen = true;
+    };
+    if (this.merges.some((m) => m.name === name)) matched("unnamed_join");
+    for (const r of this.rels) {
+      if (r.qualifierOnly) continue;
+      if (r.layer !== undefined) {
+        for (const c of r.layer.columns) if (c.name === name) matched(r.label);
+        continue;
+      }
+      for (let local = 0; local < r.table.columns.length; local++) {
+        const idx = r.offset + local;
+        if (r.table.columns[local]!.name === name && !this.hidden.includes(idx)) {
+          matched(this.refusedLabel(r, idx));
+        }
+      }
+    }
+    return seen;
+  }
+
+  // refusedLabel is the label PostgreSQL names a relation by when a bare column idx of this scope is
+  // refused (hit): its label, else unnamed_join for an unaliased parenthesized join's column, else
+  // unnamed_subquery (an unaliased derived table).
+  private refusedLabel(r: ScopeRel, idx: number): string {
+    if (r.label !== "") return r.label;
+    if (this.subRels.some((sr) => sr.slots.includes(idx))) return "unnamed_join";
+    return "unnamed_subquery";
+  }
+
   // resolveScalarFuncRow resolves a bare name that labels a scalar set-returning function's relation
   // as a whole-row reference to it (spec/design/functions.md §10): a scalar function's row IS its
   // one column, so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
@@ -451,13 +520,13 @@ export class Scope {
       ) {
         continue;
       }
-      this.lateralHit = true;
+      this.hit(name);
       return { level: 0, index: r.offset };
     }
     // An unaliased parenthesized join keeps its inner function relation's label visible.
     for (const sr of this.subRels) {
       if (sr.label === name && sr.table.scalarFunc === true) {
-        this.lateralHit = true;
+        this.hit(name);
         return { level: 0, index: sr.slots[0]! };
       }
     }
@@ -479,12 +548,18 @@ export class Scope {
     // the bare name binds the merged column rather than its two (hidden) underlying copies — which is
     // why such a join column is unambiguous. A non-hidden column elsewhere with the same name still
     // makes the reference ambiguous (a third relation sharing the name).
+    // A match in the fence views of the same FROM namespace comes first (§15).
+    const levelSeen = this.parentLevelHasColumn(name);
     let found = -1;
     for (const m of this.merges) {
       if (m.name === lower) {
         found = m.index;
         break;
       }
+    }
+    if (found >= 0) {
+      if (levelSeen) throw ambiguousColumn(name);
+      this.hit("unnamed_join");
     }
     let layered: Resolved | null = null;
     for (let ri = 0; ri < this.rels.length; ri++) {
@@ -494,7 +569,8 @@ export class Scope {
       if (r.layer !== undefined) {
         for (let col = 0; col < r.layer.columns.length; col++) {
           if (r.layer.columns[col]!.name !== lower) continue;
-          if (found >= 0 || layered !== null) throw ambiguousColumn(name);
+          if (levelSeen || found >= 0 || layered !== null) throw ambiguousColumn(name);
+          this.hit(r.label);
           layered = { level: 0, index: -1, layer: { rel: ri, col } };
         }
         continue;
@@ -508,18 +584,15 @@ export class Scope {
         // A merge's underlying copies are superseded by the merge above — skip them.
         if (this.hidden.includes(idx)) continue;
         if (r.table.columns[local]!.name === lower) {
-          if (found >= 0 || layered !== null) throw ambiguousColumn(name);
+          if (levelSeen || found >= 0 || layered !== null) throw ambiguousColumn(name);
+          this.hit(this.refusedLabel(r, idx));
           found = idx;
         }
       }
     }
-    if (layered !== null) {
-      this.lateralHit = true;
-      return layered;
-    }
+    if (layered !== null) return layered;
     if (found >= 0) {
       this.traceFlat(found);
-      this.lateralHit = true;
       return { level: 0, index: found };
     }
     if (this.parent !== null) return outerOf(this.parent.resolveBareColumn(name));
@@ -571,6 +644,7 @@ export class Scope {
     for (let ri = 0; ri < this.rels.length; ri++) {
       const layer = this.rels[ri]!.layer;
       if (this.rels[ri]!.label !== q || layer === undefined) continue;
+      this.hit(qualifier);
       let found = -1;
       for (let col = 0; col < layer.columns.length; col++) {
         if (layer.columns[col]!.name !== name) continue;
@@ -578,11 +652,12 @@ export class Scope {
         found = col;
       }
       if (found < 0) throw undefinedColumn(name);
-      this.lateralHit = true;
       return { level: 0, index: -1, layer: { rel: ri, col: found } };
     }
     for (const r of this.rels) {
       if (r.label === q) {
+        // PostgreSQL refuses the relation itself, before looking up the column.
+        this.hit(qualifier);
         // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
         // columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
         // one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
@@ -603,15 +678,14 @@ export class Scope {
         if (ambiguous) throw ambiguousColumn(name);
         const idx = visible >= 0 ? visible : found;
         this.traceFlat(idx);
-        this.lateralHit = true;
         return { level: 0, index: idx };
       }
     }
     for (const sr of this.subRels) {
       if (sr.label === q) {
+        this.hit(qualifier);
         const local = columnIndex(sr.table, name);
         if (local < 0) throw undefinedColumn(name);
-        this.lateralHit = true;
         return { level: 0, index: sr.slots[local]! };
       }
     }
@@ -638,7 +712,7 @@ export class Scope {
     }
   }
 
-  // locateColumnError stamps a column reference's 42703 / 42702 / 42P01 / 42P09 with its position, and adds
+  // locateColumnError stamps a column reference's 42703 / 42702 / 42P01 / 42P09 / 42P10 with its position, and adds
   // the misspelled-column (§11.1), table-alias (§11.2), or LATERAL (§11.8) hint. An error already
   // positioned came from an inner site, which wins. Returns the (possibly annotated) error for the
   // caller to rethrow.
@@ -650,7 +724,15 @@ export class Scope {
   ): unknown {
     if (!(e instanceof EngineError) || e.position !== undefined) return e;
     const code = e.code();
-    if (code !== "42703" && code !== "42702" && code !== "42P01" && code !== "42P09") return e;
+    if (
+      code !== "42703" &&
+      code !== "42702" &&
+      code !== "42P01" &&
+      code !== "42P09" &&
+      code !== "42P10"
+    ) {
+      return e;
+    }
     let hint: string | undefined;
     if (code === "42703") hint = this.columnHint(qualifier, name);
     else if (code === "42P01" && qualifier !== null) hint = this.tableHint(qualifier);

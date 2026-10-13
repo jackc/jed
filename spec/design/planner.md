@@ -619,6 +619,13 @@ counts through eight movable relations; larger islands use the one-state determi
 cheapest-next fallback. The final selected tree alone feeds ORDER BY/LIMIT recomputation, with only
 its final join step eligible for N-way streaming top-N.
 
+A later comma item holding a `RIGHT`/`FULL` join reaches the planner as an unaliased parenthesized
+join, so it is one derived input — a fence — that the island search orders as a unit (grammar.md
+§15). A `LATERAL` item on the right side of a `RIGHT`/`FULL` join is never correlated to that join's
+left side (`42P10`); one correlated only to relations outside the join is planned as an ordinary
+derived input of its own FROM, materialized once per evaluation of that FROM (grammar.md §44), so it
+adds no per-row dependency for the search to respect.
+
 ### 5.5 UPDATE/DELETE target policy (`dml.costed_access`)
 
 A mutation target is one base relation with no join, ordering, or LIMIT, so its policy is §5.2

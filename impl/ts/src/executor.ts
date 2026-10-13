@@ -15283,6 +15283,9 @@ export class Engine {
     // parent, unless this is a parenthesized join's body planned against a fence — then the fence's
     // view, so they also see the relations to the join's left (§15).
     const lateralParentScope = parent?.lateralView ?? parent;
+    // Inside a fenced parenthesized join, the fence's view and this FROM's left relations are one
+    // PostgreSQL FROM namespace (§15).
+    const sharesParentLevel = parent !== null && parent.lateralView !== null;
     for (let i = 0; i < tableRefs.length; i++) {
       const tref = tableRefs[i]!;
       let t: Table;
@@ -15303,13 +15306,24 @@ export class Engine {
         ((isDerived && tref.lateral === true) ||
           tref.args !== null ||
           tref.jsonTable !== undefined);
+      // The right side of a RIGHT/FULL join may not reference the join's left side — every relation
+      // to its left in this FROM, since a later comma item holding such a join is a parenthesized join
+      // of its own (§15) — but may reference the relations outside it: a reference to those leaves the
+      // item uncorrelated to its siblings (§44, PostgreSQL's p_lateral_ok).
+      const rightSide =
+        i > 0 && (sel.joins[i - 1]!.kind === "right" || sel.joins[i - 1]!.kind === "full");
+      // Set when a RIGHT/FULL item's body correlates only to the relations outside this FROM: it is
+      // planned against them and materialized once, like a non-LATERAL derived table.
+      let detached = false;
       // The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
       // enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
-      // deeper). null when not lateral-eligible.
+      // deeper), refused as the left side of a RIGHT/FULL join. null when not lateral-eligible.
       let lateralParent: Scope | null = null;
       if (lateralEligible) {
         lateralParent = new Scope([...rels], this, lateralParentScope, true, ctes);
         lateralParent.subRels = [...subRels];
+        lateralParent.lateralRefused = rightSide;
+        lateralParent.sharesParentLevel = sharesParentLevel;
       }
       if (isDerived) {
         // Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
@@ -15357,6 +15371,8 @@ export class Engine {
                   ctes,
                   ptypes,
                   shapeBodies,
+                  rightSide,
+                  sharesParentLevel,
                   (hit) => {
                     joinLateral = hit;
                   },
@@ -15377,7 +15393,16 @@ export class Engine {
                         )
                       : this.planValues(tref.values!, bodyParent, ctes, ptypes),
                 );
-        if (
+        if (rightSide && lateralEligible && queryPlanReferencesOuter(plan, 0)) {
+          detached = true;
+          plan = this.planAgain(ctes, () =>
+            tref.subquery !== undefined
+              ? this.planBodyFirst(shapeBodies, () =>
+                  this.planQuery(tref.subquery!, lateralParentScope, ctes, ptypes),
+                )
+              : this.planValues(tref.values!, lateralParentScope, ctes, ptypes),
+          );
+        } else if (
           shapeBodies &&
           lateralEligible &&
           tref.subquery !== undefined &&
@@ -15385,7 +15410,7 @@ export class Engine {
         ) {
           plan = this.planAgain(ctes, () => this.planQuery(tref.subquery!, bodyParent, ctes, ptypes));
         }
-        lateral = joinLateral || (lateralEligible && queryPlanReferencesOuter(plan, 0));
+        lateral = joinLateral || (lateralEligible && !detached && queryPlanReferencesOuter(plan, 0));
         shaped[i] = shapeBodies && tref.subquery !== undefined && !lateral;
         const label = tref.alias === null ? "" : tref.alias;
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
@@ -15419,6 +15444,26 @@ export class Engine {
             ctes,
             ptypes,
           );
+          if (
+            rightSide &&
+            lateralEligible &&
+            r.srf.args.some((a) => rexprReferencesOuter(a, 0))
+          ) {
+            // Correlated only outside this FROM (the left side refused above).
+            detached = true;
+            const args = tref.args;
+            r = this.planAgain(ctes, () =>
+              this.resolveSRF(
+                tref.name,
+                args,
+                tref.alias,
+                tref.columnDefs ?? null,
+                lateralParentScope,
+                ctes,
+                ptypes,
+              ),
+            );
+          }
         } catch (err) {
           // A table function's own 42883 (no function for these argument types) points at its name,
           // like a call in an expression (spec/design/error-fields.md §10.2); an argument's error
@@ -15429,15 +15474,25 @@ export class Engine {
         applySrfColumnAliases(r.table, tref.alias ?? tref.name, tref.columnAliases ?? null);
         t = r.table;
         srf = r.srf;
-        lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
+        lateral =
+          lateralEligible && !detached && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
       } else if (tref.jsonTable !== undefined) {
         // A JSON_TABLE source (T1, json-table.md §3) — implicitly lateral like an SRF; its `ctx`
         // resolves against the prefix scope (so `JSON_TABLE(sibling.doc, …)` works).
         const jtParent = lateralEligible ? lateralParent : lateralParentScope;
-        const r = this.resolveJsonTable(tref.jsonTable, tref.alias, jtParent, ctes, ptypes);
+        const jt = tref.jsonTable;
+        let r = this.resolveJsonTable(jt, tref.alias, jtParent, ctes, ptypes);
+        if (rightSide && lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0))) {
+          // Correlated only outside this FROM (the left side refused above).
+          detached = true;
+          r = this.planAgain(ctes, () =>
+            this.resolveJsonTable(jt, tref.alias, lateralParentScope, ctes, ptypes),
+          );
+        }
         t = r.table;
         srf = r.srf;
-        lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
+        lateral =
+          lateralEligible && !detached && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
       } else if (tref.db !== undefined) {
         // A database-QUALIFIED name reaches an attachment's table directly (attached-databases.md §3):
         // it never resolves to a CTE (a CTE has no database qualifier, so `main.x`/`temp.x` cannot name
@@ -15553,13 +15608,10 @@ export class Engine {
           }
         }
       }
-      // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
-      // kept whole and evaluated per left row. (i ≥ 1 here, so the item carries a join kind.)
-      if (lateral && (sel.joins[i - 1]!.kind === "right" || sel.joins[i - 1]!.kind === "full")) {
-        throw engineError(
-          "invalid_column_reference",
-          "invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT",
-        );
+      // The right side of a RIGHT/FULL join is never correlated to its left: a reference there was
+      // refused at resolution (42P10), and one outside this FROM detached the item.
+      if (rightSide && lateral) {
+        throw new Error("BUG: a RIGHT/FULL join's right side correlated to its left");
       }
       const label = (tref.alias ?? t.name);
       // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no qualifier,
@@ -16437,11 +16489,16 @@ export class Engine {
     ctes: CteBinding[],
     ptypes: ParamTypes,
     shapeBodies: boolean,
+    refused: boolean,
+    sharesParentLevel: boolean,
     setHit: (hit: boolean) => void,
     unseen: (bodyParent: Scope | null) => UnseenFrame,
   ): QueryPlan {
     const prefix = new Scope([...rels], this, lateralParent, true, ctes);
     prefix.subRels = [...subRels];
+    // The left side of a RIGHT/FULL join: the body's LATERAL items may not reference it (§44).
+    prefix.lateralRefused = refused;
+    prefix.sharesParentLevel = sharesParentLevel;
     const fence = Scope.lateralFence(parent, prefix, this, ctes);
     this.withUnseenFrame(unseen(fence), () =>
       this.planBodyFirst(true, () => this.planQuery(body, fence, ctes, ptypes)),

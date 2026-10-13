@@ -1605,7 +1605,9 @@ impl<'a> FinalRel<'a> {
 
 /// Build the temporary `parent` scope a LATERAL item resolves against (spec/design/grammar.md §44):
 /// the relations to its left, chained to the enclosing query's `parent` so a sibling column resolves
-/// as `Outer{level=1}` and an enclosing-query column as a deeper hop. The returned scope borrows
+/// as `Outer{level=1}` and an enclosing-query column as a deeper hop. `lateral_refused` marks them
+/// the left side of a `RIGHT`/`FULL` join, which the item may not reference (`42P10`);
+/// `shares_parent_level` marks `parent` as a fence's view in the same FROM namespace (§15). The returned scope borrows
 /// `synthetic`; it is dropped before the next push, so it never blocks the build's growth.
 fn build_prefix_scope<'s>(
     finalized: &'s [FinalRel<'s>],
@@ -1614,6 +1616,8 @@ fn build_prefix_scope<'s>(
     parent: Option<&'s Scope<'s>>,
     catalog: &'s Engine,
     ctes: &'s [&'s CteBinding],
+    lateral_refused: bool,
+    shares_parent_level: bool,
 ) -> Scope<'s> {
     // The inner labels of the unaliased parenthesized joins to its left (grammar.md §15).
     let sub_rels = sub_rels_within(group_subs, 0, usize::MAX);
@@ -1646,6 +1650,8 @@ fn build_prefix_scope<'s>(
         subquery_derivs: Default::default(),
         lateral_view: None,
         lateral_hit: Default::default(),
+        lateral_refused,
+        shares_parent_level,
         hints: Default::default(),
     }
 }
@@ -1692,6 +1698,8 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            lateral_refused: false,
+            shares_parent_level: false,
             hints: Default::default(),
         }
     }
@@ -1893,6 +1901,14 @@ pub(crate) struct Scope<'a> {
     /// parenthesized join's lateral prefix to learn whether the join's body correlates to the
     /// relations on its left (grammar.md §15).
     lateral_hit: std::cell::Cell<bool>,
+    /// Set on a LATERAL prefix whose relations are the left side of a `RIGHT` or `FULL` join
+    /// (PostgreSQL's `p_lateral_ok = false`, spec/design/grammar.md §44): a reference that resolves
+    /// to one of them is `42P10`. A reference that passes them to an outer level is unaffected.
+    lateral_refused: bool,
+    /// Set on a LATERAL prefix inside a parenthesized join's body (spec/design/grammar.md §15): its
+    /// parent — the fence's view — holds relations PostgreSQL places in the same FROM namespace, so a
+    /// bare column matching in both is ambiguous (`42702`), not shadowed.
+    shares_parent_level: bool,
     /// What a name-resolution hint needs beyond the visible relations (error-fields.md §11.8).
     hints: ScopeHints,
 }
@@ -2030,6 +2046,8 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            lateral_refused: false,
+            shares_parent_level: false,
             hints: Default::default(),
         }
     }
@@ -2113,6 +2131,8 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            lateral_refused: false,
+            shares_parent_level: false,
             hints: Default::default(),
         }
     }
@@ -2198,6 +2218,8 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            lateral_refused: false,
+            shares_parent_level: false,
             hints: Default::default(),
         })
     }
@@ -2272,6 +2294,8 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            lateral_refused: false,
+            shares_parent_level: false,
             hints: Default::default(),
         }
     }
@@ -2286,9 +2310,91 @@ impl<'a> Scope<'a> {
     fn resolve_bare(&self, name: &str) -> Result<Resolved> {
         match self.resolve_bare_column(name) {
             Err(e) if e.state == SqlState::UndefinedColumn => {
-                self.resolve_scalar_func_row(name).ok_or(e)
+                self.resolve_scalar_func_row(name).unwrap_or(Err(e))
             }
             r => r,
+        }
+    }
+
+    /// A reference resolved to this scope's relation `label`: record the hit (`lateral_hit`), or
+    /// refuse it when this scope is the left side of a `RIGHT`/`FULL` join — PostgreSQL's
+    /// `check_lateral_ref_ok`, raised at the first matching relation (grammar.md §44).
+    fn hit(&self, label: &str) -> Result<()> {
+        self.refuse(label)?;
+        self.lateral_hit.set(true);
+        Ok(())
+    }
+
+    /// `42P10` when this scope is the left side of a `RIGHT`/`FULL` join (`hit`).
+    fn refuse(&self, label: &str) -> Result<()> {
+        if self.lateral_refused {
+            return Err(EngineError::new(
+                SqlState::InvalidColumnReference,
+                format!("invalid reference to FROM-clause entry for table {label}"),
+            )
+            .with_detail(Some(
+                "The combining JOIN type must be INNER or LEFT for a LATERAL reference.".into(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the fence views PostgreSQL places in this scope's FROM namespace (`shares_parent_level`,
+    /// grammar.md §15) have a visible column `name`, raising that namespace's errors in its order —
+    /// outermost first: a second match is `42702`, a refused first match `42P10`.
+    fn parent_level_has_column(&self, name: &str) -> Result<bool> {
+        match self.parent {
+            Some(p) if self.shares_parent_level => p.level_has_column(name),
+            _ => Ok(false),
+        }
+    }
+
+    /// [`parent_level_has_column`](Scope::parent_level_has_column), then this scope's own columns.
+    fn level_has_column(&self, name: &str) -> Result<bool> {
+        let mut seen = self.parent_level_has_column(name)?;
+        let mut matched = |label: &str| -> Result<()> {
+            if seen {
+                return Err(ambiguous_column(name));
+            }
+            self.refuse(label)?;
+            seen = true;
+            Ok(())
+        };
+        if self.merges.iter().any(|m| m.name == name) {
+            matched("unnamed_join")?;
+        }
+        for r in &self.rels {
+            if r.qualifier_only {
+                continue;
+            }
+            if let Some(layer) = r.layer {
+                for c in &layer.columns {
+                    if c.name == name {
+                        matched(&r.label)?;
+                    }
+                }
+                continue;
+            }
+            for (local, c) in r.table.columns.iter().enumerate() {
+                let idx = r.offset + local;
+                if c.name == name && !self.hidden.contains(&idx) {
+                    matched(&self.refused_label(r, idx))?;
+                }
+            }
+        }
+        Ok(seen)
+    }
+
+    /// The label PostgreSQL names a relation by when a bare column `idx` of this scope is refused
+    /// (`hit`): its label, else `unnamed_join` for an unaliased parenthesized join's column, else
+    /// `unnamed_subquery` (an unaliased derived table).
+    fn refused_label(&self, rel: &ScopeRel, idx: usize) -> String {
+        if !rel.label.is_empty() {
+            rel.label.clone()
+        } else if self.sub_rels.iter().any(|sr| sr.slots.contains(&idx)) {
+            "unnamed_join".to_string()
+        } else {
+            "unnamed_subquery".to_string()
         }
     }
 
@@ -2297,13 +2403,12 @@ impl<'a> Scope<'a> {
     /// so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
     /// `makeWholeRowVar` for a scalar function). Searched THIS scope, then outward (nearest wins).
     /// No other relation kind has a whole-row value in jed (no implicit per-table row types).
-    fn resolve_scalar_func_row(&self, name: &str) -> Option<Resolved> {
+    fn resolve_scalar_func_row(&self, name: &str) -> Option<Result<Resolved>> {
         for r in &self.rels {
             if r.qualifier_only || r.layer.is_some() || r.label != name || !r.table.scalar_func {
                 continue;
             }
-            self.lateral_hit.set(true);
-            return Some(Resolved::Local(r.offset));
+            return Some(self.hit(name).map(|()| Resolved::Local(r.offset)));
         }
         // An unaliased parenthesized join keeps its inner function relation's label visible.
         if let Some(sr) = self
@@ -2311,12 +2416,11 @@ impl<'a> Scope<'a> {
             .iter()
             .find(|sr| sr.label == name && sr.table.scalar_func)
         {
-            self.lateral_hit.set(true);
-            return Some(Resolved::Local(sr.slots[0]));
+            return Some(self.hit(name).map(|()| Resolved::Local(sr.slots[0])));
         }
         self.parent
             .and_then(|p| p.resolve_scalar_func_row(name))
-            .map(outer_of)
+            .map(|r| r.map(outer_of))
     }
 
     /// Resolve a bare column name against THIS scope, then OUTWARD through the parent chain.
@@ -2331,7 +2435,15 @@ impl<'a> Scope<'a> {
         // so the bare name binds the merged column rather than its two (hidden) underlying copies —
         // which is why such a join column is unambiguous. A *non-hidden* column elsewhere with the
         // same name still makes the reference ambiguous (a third relation sharing the name).
+        // A match in the fence views of the same FROM namespace comes first (§15).
+        let level_seen = self.parent_level_has_column(name)?;
         let mut found: Option<usize> = self.merges.iter().find(|m| m.name == name).map(|m| m.index);
+        if found.is_some() {
+            if level_seen {
+                return Err(ambiguous_column(name));
+            }
+            self.hit("unnamed_join")?;
+        }
         let mut layered: Option<Resolved> = None;
         for (ri, r) in self.rels.iter().enumerate() {
             if r.qualifier_only {
@@ -2341,9 +2453,10 @@ impl<'a> Scope<'a> {
             if let Some(layer) = r.layer {
                 for (col, c) in layer.columns.iter().enumerate() {
                     if c.name == name {
-                        if found.is_some() || layered.is_some() {
+                        if level_seen || found.is_some() || layered.is_some() {
                             return Err(ambiguous_column(name));
                         }
+                        self.hit(&r.label)?;
                         layered = Some(Resolved::Layer {
                             level: 0,
                             rel: ri,
@@ -2365,20 +2478,19 @@ impl<'a> Scope<'a> {
                     continue;
                 }
                 if c.name == name {
-                    if found.is_some() || layered.is_some() {
+                    if level_seen || found.is_some() || layered.is_some() {
                         return Err(ambiguous_column(name));
                     }
+                    self.hit(&self.refused_label(r, idx))?;
                     found = Some(idx);
                 }
             }
         }
         if let Some(r) = layered {
-            self.lateral_hit.set(true);
             return Ok(r);
         }
         if let Some(idx) = found {
             self.trace_flat(idx);
-            self.lateral_hit.set(true);
             return Ok(Resolved::Local(idx));
         }
         match self.parent {
@@ -2448,6 +2560,7 @@ impl<'a> Scope<'a> {
             .position(|r| r.label == q && r.layer.is_some())
         {
             let layer = self.rels[ri].layer.expect("a layered relation");
+            self.hit(qualifier)?;
             let mut hits = layer
                 .columns
                 .iter()
@@ -2456,17 +2569,16 @@ impl<'a> Scope<'a> {
             return match (hits.next(), hits.next()) {
                 (None, _) => Err(undefined_column(name)),
                 (Some(_), Some(_)) => Err(ambiguous_column(name)),
-                (Some((col, _)), None) => {
-                    self.lateral_hit.set(true);
-                    Ok(Resolved::Layer {
-                        level: 0,
-                        rel: ri,
-                        col,
-                    })
-                }
+                (Some((col, _)), None) => Ok(Resolved::Layer {
+                    level: 0,
+                    rel: ri,
+                    col,
+                }),
             };
         }
         if let Some(rel) = self.rels.iter().find(|r| r.label == q) {
+            // PostgreSQL refuses the relation itself, before looking up the column.
+            self.hit(qualifier)?;
             // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
             // columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
             // one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
@@ -2491,17 +2603,16 @@ impl<'a> Scope<'a> {
                 _ if ambiguous => Err(ambiguous_column(name)),
                 (_, Some(idx)) | (Some(idx), None) => {
                     self.trace_flat(idx);
-                    self.lateral_hit.set(true);
                     Ok(Resolved::Local(idx))
                 }
             };
         }
         if let Some(sr) = self.sub_rels.iter().find(|sr| sr.label == q) {
+            self.hit(qualifier)?;
             let local = sr
                 .table
                 .column_index(name)
                 .ok_or_else(|| undefined_column(name))?;
-            self.lateral_hit.set(true);
             return Ok(Resolved::Local(sr.slots[local]));
         }
         match self.parent {
@@ -2529,7 +2640,7 @@ impl<'a> Scope<'a> {
             .map_err(|e| self.locate_column_error(e, Some(qualifier), name, pos))
     }
 
-    /// Stamp a column reference's `42703` / `42702` / `42P01` with its position, and add the
+    /// Stamp a column reference's `42703` / `42702` / `42P01` / `42P10` with its position, and add the
     /// misspelled-column (§11.1), table-alias (§11.2), or LATERAL (§11.8) hint. An error already
     /// positioned came from an inner site, which wins.
     fn locate_column_error(
@@ -2546,6 +2657,7 @@ impl<'a> Scope<'a> {
                     | SqlState::AmbiguousColumn
                     | SqlState::UndefinedTable
                     | SqlState::AmbiguousAlias
+                    | SqlState::InvalidColumnReference
             )
         {
             return e;

@@ -179,6 +179,44 @@ function isTableRefStopKeyword(kw: string): boolean {
   }
 }
 
+// joinGroupBody is the body of a parenthesized join (grammar.md §15): a `SELECT *` over its chain.
+// Unaliased, the caller marks it joinGroup.
+function joinGroupBody(from: TableRef, joins: JoinClause[]): Select {
+  return {
+    kind: "select",
+    distinct: false,
+    items: { kind: "all" },
+    from,
+    joins,
+    filter: null,
+    groupBy: [],
+    having: null,
+    orderBy: [],
+    limit: null,
+    offset: null,
+    windows: [],
+    parenJoin: true,
+  };
+}
+
+// groupOuterJoinItem makes a later comma item whose chain holds a RIGHT or FULL join the unaliased
+// parenthesized join it is (grammar.md §15): `FROM t, a RIGHT JOIN b ON p` is
+// `FROM t, (a RIGHT JOIN b ON p)`. Flattened into the left-deep chain, `(t × a) RIGHT JOIN b` would
+// keep an unmatched b row once rather than once per t row. seg indexes the item's comma join; the
+// joins after it are its chain. An item of only inner and LEFT joins stays flattened — the same rows
+// either way.
+function groupOuterJoinItem(joins: JoinClause[], seg: number): void {
+  const chain = joins.slice(seg + 1);
+  if (!chain.some((j) => j.kind === "right" || j.kind === "full")) return;
+  const head = joins[seg]!;
+  const body = joinGroupBody(head.table, chain);
+  body.joinGroup = true;
+  joins.splice(seg, joins.length - seg, {
+    ...head,
+    table: { name: "", alias: null, args: null, subquery: body },
+  });
+}
+
 // spliceLeadingGroup removes the parentheses from an unaliased parenthesized join that BEGINS a
 // left-deep chain (spec/design/grammar.md §15): `(a JOIN b ON p) JOIN c ON q` is exactly
 // `a JOIN b ON p JOIN c ON q`, the same join tree with the same ON scopes, so the group's chain
@@ -3139,12 +3177,15 @@ class Parser {
   private parseFromClause(): { from: TableRef; joins: JoinClause[] } {
     // A leading unaliased parenthesized join is the same left-deep chain without its parentheses.
     const { from, joins } = spliceLeadingGroup(this.parseTableRef(), []);
+    // Where the current comma item's comma join sits in joins (-1 for the first item).
+    let segment = -1;
     for (;;) {
       for (;;) {
         const j = this.parseJoinClause();
         if (j === null) break;
         joins.push(j);
       }
+      if (segment >= 0) groupOuterJoinItem(joins, segment);
       // Comma-FROM (grammar.md §15): `FROM a, b` is an implicit CROSS JOIN. The comma separates
       // top-level FROM items, each its own join sub-chain; it binds LOOSER than JOIN, so the new
       // item begins a fresh ON-resolution segment (recorded by comma: true). The inner loop then
@@ -3153,6 +3194,7 @@ class Parser {
         this.advance();
         // An unaliased parenthesized join after a comma starts the new segment the same way.
         const { from: table, joins: groupJoins } = spliceLeadingGroup(this.parseTableRef(), []);
+        segment = joins.length;
         joins.push({ kind: "cross", table, on: null, comma: true });
         joins.push(...groupJoins);
         continue;
@@ -3182,21 +3224,7 @@ class Parser {
       );
     }
     this.undeepen();
-    return {
-      kind: "select",
-      distinct: false,
-      items: { kind: "all" },
-      from,
-      joins,
-      filter: null,
-      groupBy: [],
-      having: null,
-      orderBy: [],
-      limit: null,
-      offset: null,
-      windows: [],
-      parenJoin: true,
-    };
+    return joinGroupBody(from, joins);
   }
 
   // parseTableRef parses `table_ref ::= derived_table derived_alias? | joined_group derived_alias? |

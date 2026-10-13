@@ -239,6 +239,7 @@ when `Detail` is set ([cli.md](cli.md) §5).
 | 22P05 | a decoded `\u0000` in JSON input, a de-escaping `json` function, or a jsonpath string ([json.md](json.md) §4.2, [jsonpath.md](jsonpath.md) §2.1) | `\u0000 cannot be converted to text.` |
 | 22P02 | an unpaired surrogate `\u` escape, decoded (same sites) | `Unicode low surrogate must follow a high surrogate.` / `Unicode high surrogate must not follow a high surrogate.` |
 | 22P02 | a JSON `\u` escape without four hex digits ([json.md](json.md) §4.2) | `"\u" must be followed by four hexadecimal digits.` |
+| 42P10 | a reference from the right side of a `RIGHT` / `FULL` join to that join's left side ([grammar.md](grammar.md) §44) | `The combining JOIN type must be INNER or LEFT for a LATERAL reference.` |
 
 `{row}` is every column of the target table in ordinal order, from the candidate (new) row.
 
@@ -386,7 +387,7 @@ query surfaces (CLAUDE.md §13). jed adds it as a sixth structured field.
 |---|---|---|
 | the lexer | every code except class 54 | the first character of the lexeme being scanned (the opening `'` of an unterminated string, the `/*` of an unterminated comment, the bad character); a Unicode-escape decoding or `UESCAPE` error points where PostgreSQL's does ([grammar.md](grammar.md) §3) |
 | the parser | every code except class 54 | the token at which the parse stopped (§10.3) |
-| a column reference in an expression (select list, WHERE, ON, GROUP BY, HAVING, ORDER BY, RETURNING, SET values, …) | `42703`, `42702`, `42P01`, `42P09` | the reference's first character — the qualifier of `t.c` |
+| a column reference in an expression (select list, WHERE, ON, GROUP BY, HAVING, ORDER BY, RETURNING, SET values, …) | `42703`, `42702`, `42P01`, `42P09`, `42P10` | the reference's first character — the qualifier of `t.c` |
 | an `INSERT` column-list name or an `UPDATE … SET` / `ON CONFLICT DO UPDATE SET` target | `42703` | the column name |
 | a FROM-clause table or view name | `42P01` | the name — the database qualifier of `db.t` |
 | an `INSERT` / `UPDATE` / `DELETE` target, also in a writable CTE or under `EXPLAIN` | `42P01` | the name — the database qualifier of `db.t` |
@@ -659,8 +660,8 @@ hint.
 PostgreSQL also gives these errors a DETAIL (`There is a column named "a" in table "t", but it cannot
 be referenced from this part of the query.`) and rewords the `42P01` message; jed keeps its message
 and adds no Detail yet (§7). PostgreSQL's other LATERAL condition, a reference from a `LATERAL` item
-across a `RIGHT` or `FULL` join (`42P10`), carries a DETAIL and no hint, except for an `UPDATE … FROM`
-/ `DELETE … USING` target, which jed does not support.
+across a `RIGHT` or `FULL` join (`42P10`), carries a DETAIL and no hint, as in jed (§9.2), except for an
+`UPDATE … FROM` / `DELETE … USING` target, which jed does not support.
 
 The walk is built only on the error path from names already resolved, so it is unmetered and
 deterministic. The shared fixture ([../errors/position_cases.txt](../errors/position_cases.txt))

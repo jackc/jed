@@ -139,6 +139,14 @@ type scope struct {
 	// parenthesized join's lateral prefix to learn whether the join's body correlates to the
 	// relations on its left (grammar.md §15).
 	lateralHit bool
+	// lateralRefused is set on a LATERAL prefix whose relations are the left side of a RIGHT or FULL
+	// join (PostgreSQL's p_lateral_ok = false, spec/design/grammar.md §44): a reference that resolves
+	// to one of them is 42P10. A reference that passes them to an outer level is unaffected.
+	lateralRefused bool
+	// sharesParentLevel is set on a LATERAL prefix inside a parenthesized join's body
+	// (spec/design/grammar.md §15): its parent — the fence's view — holds relations PostgreSQL places
+	// in the same FROM namespace, so a bare column matching in both is ambiguous (42702), not shadowed.
+	sharesParentLevel bool
 	// hints is what a name-resolution hint needs beyond the visible relations (error-fields.md
 	// §11.8). It never affects resolution.
 	hints scopeHints
@@ -325,10 +333,105 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 	if e, ok := err.(*EngineError); !ok || e.State != UndefinedColumn {
 		return resolved{}, err
 	}
-	if r, ok := s.resolveScalarFuncRow(name); ok {
-		return r, nil
+	if r, ok, ferr := s.resolveScalarFuncRow(name); ferr != nil || ok {
+		return r, ferr
 	}
 	return resolved{}, err
+}
+
+// hit records a reference resolved to this scope's relation label (lateralHit), or refuses it when
+// this scope is the left side of a RIGHT/FULL join — PostgreSQL's check_lateral_ref_ok, raised at the
+// first matching relation (grammar.md §44).
+func (s *scope) hit(label string) error {
+	if err := s.refuse(label); err != nil {
+		return err
+	}
+	s.lateralHit = true
+	return nil
+}
+
+// refuse is 42P10 when this scope is the left side of a RIGHT/FULL join (hit).
+func (s *scope) refuse(label string) error {
+	if s.lateralRefused {
+		return newError(InvalidColumnReference, "invalid reference to FROM-clause entry for table "+label).
+			withDetail("The combining JOIN type must be INNER or LEFT for a LATERAL reference.")
+	}
+	return nil
+}
+
+// parentLevelHasColumn reports whether the fence views PostgreSQL places in this scope's FROM
+// namespace (sharesParentLevel, grammar.md §15) have a visible column name, raising that namespace's
+// errors in its order — outermost first: a second match is 42702, a refused first match 42P10.
+func (s *scope) parentLevelHasColumn(name string) (bool, error) {
+	if !s.sharesParentLevel || s.parent == nil {
+		return false, nil
+	}
+	return s.parent.levelHasColumn(name)
+}
+
+// levelHasColumn is parentLevelHasColumn, then this scope's own columns.
+func (s *scope) levelHasColumn(name string) (bool, error) {
+	seen, err := s.parentLevelHasColumn(name)
+	if err != nil {
+		return false, err
+	}
+	matched := func(label string) error {
+		if seen {
+			return ambiguousColumn(name)
+		}
+		if err := s.refuse(label); err != nil {
+			return err
+		}
+		seen = true
+		return nil
+	}
+	for _, m := range s.merges {
+		if m.name == name {
+			if err := matched("unnamed_join"); err != nil {
+				return false, err
+			}
+			break
+		}
+	}
+	for _, r := range s.rels {
+		if r.qualifierOnly {
+			continue
+		}
+		if r.layer != nil {
+			for _, c := range r.layer.columns {
+				if c.Name == name {
+					if err := matched(r.label); err != nil {
+						return false, err
+					}
+				}
+			}
+			continue
+		}
+		for local, c := range r.table.Columns {
+			idx := r.offset + local
+			if c.Name == name && !slices.Contains(s.hidden, idx) {
+				if err := matched(s.refusedLabel(&r, idx)); err != nil {
+					return false, err
+				}
+			}
+		}
+	}
+	return seen, nil
+}
+
+// refusedLabel is the label PostgreSQL names a relation by when a bare column idx of this scope is
+// refused (hit): its label, else unnamed_join for an unaliased parenthesized join's column, else
+// unnamed_subquery (an unaliased derived table).
+func (s *scope) refusedLabel(r *scopeRel, idx int) string {
+	if r.label != "" {
+		return r.label
+	}
+	for _, sr := range s.subRels {
+		if slices.Contains(sr.slots, idx) {
+			return "unnamed_join"
+		}
+	}
+	return "unnamed_subquery"
 }
 
 // resolveScalarFuncRow resolves a bare name that labels a scalar set-returning function's relation
@@ -336,27 +439,33 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 // column, so `SELECT e FROM jsonb_array_elements(…) AS e` reads the element (PostgreSQL's
 // makeWholeRowVar for a scalar function). Searched THIS scope, then outward (nearest wins). No other
 // relation kind has a whole-row value in jed (no implicit per-table row types).
-func (s *scope) resolveScalarFuncRow(name string) (resolved, bool) {
+func (s *scope) resolveScalarFuncRow(name string) (resolved, bool, error) {
 	for _, r := range s.rels {
 		if r.qualifierOnly || r.layer != nil || r.label != name || !r.table.ScalarFunc {
 			continue
 		}
-		s.lateralHit = true
-		return resolved{level: 0, index: r.offset}, true
+		if err := s.hit(name); err != nil {
+			return resolved{}, false, err
+		}
+		return resolved{level: 0, index: r.offset}, true, nil
 	}
 	// An unaliased parenthesized join keeps its inner function relation's label visible.
 	for _, sr := range s.subRels {
 		if sr.label == name && sr.table.ScalarFunc {
-			s.lateralHit = true
-			return resolved{level: 0, index: sr.slots[0]}, true
+			if err := s.hit(name); err != nil {
+				return resolved{}, false, err
+			}
+			return resolved{level: 0, index: sr.slots[0]}, true, nil
 		}
 	}
 	if s.parent != nil {
-		if r, ok := s.parent.resolveScalarFuncRow(name); ok {
-			return outerOf(r), true
+		r, ok, err := s.parent.resolveScalarFuncRow(name)
+		if err != nil || !ok {
+			return resolved{}, ok, err
 		}
+		return outerOf(r), true, nil
 	}
-	return resolved{}, false
+	return resolved{}, false, nil
 }
 
 // resolveBareColumn resolves a bare column name against THIS scope, then OUTWARD through the parent
@@ -370,11 +479,24 @@ func (s *scope) resolveBareColumn(name string) (resolved, error) {
 	// the bare name binds the merged column rather than its two (hidden) underlying copies — which
 	// is why such a join column is unambiguous. A non-hidden column elsewhere with the same name
 	// still makes the reference ambiguous (a third relation sharing the name).
+	// A match in the fence views of the same FROM namespace comes first (§15).
+	levelSeen, err := s.parentLevelHasColumn(name)
+	if err != nil {
+		return resolved{}, err
+	}
 	found := -1
 	for _, m := range s.merges {
 		if m.name == name {
 			found = m.index
 			break
+		}
+	}
+	if found >= 0 {
+		if levelSeen {
+			return resolved{}, ambiguousColumn(name)
+		}
+		if err := s.hit("unnamed_join"); err != nil {
+			return resolved{}, err
 		}
 	}
 	var layered *resolved
@@ -386,8 +508,11 @@ func (s *scope) resolveBareColumn(name string) (resolved, error) {
 		if r.layer != nil {
 			for col, c := range r.layer.columns {
 				if c.Name == name {
-					if found >= 0 || layered != nil {
+					if levelSeen || found >= 0 || layered != nil {
 						return resolved{}, ambiguousColumn(name)
+					}
+					if err := s.hit(r.label); err != nil {
+						return resolved{}, err
 					}
 					layered = &resolved{layered: true, rel: ri, col: col}
 				}
@@ -406,20 +531,21 @@ func (s *scope) resolveBareColumn(name string) (resolved, error) {
 				continue
 			}
 			if c.Name == name {
-				if found >= 0 || layered != nil {
+				if levelSeen || found >= 0 || layered != nil {
 					return resolved{}, ambiguousColumn(name)
+				}
+				if err := s.hit(s.refusedLabel(&r, idx)); err != nil {
+					return resolved{}, err
 				}
 				found = idx
 			}
 		}
 	}
 	if layered != nil {
-		s.lateralHit = true
 		return *layered, nil
 	}
 	if found >= 0 {
 		s.traceFlat(found)
-		s.lateralHit = true
 		return resolved{level: 0, index: found}, nil
 	}
 	if s.parent != nil {
@@ -492,6 +618,9 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 	}
 	for ri, r := range s.rels {
 		if r.label == q && r.layer != nil {
+			if err := s.hit(qualifier); err != nil {
+				return resolved{}, err
+			}
 			found := -1
 			for col, c := range r.layer.columns {
 				if c.Name == name {
@@ -504,12 +633,15 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 			if found < 0 {
 				return resolved{}, undefinedColumn(name)
 			}
-			s.lateralHit = true
 			return resolved{layered: true, rel: ri, col: found}, nil
 		}
 	}
 	for _, r := range s.rels {
 		if r.label == q {
+			// PostgreSQL refuses the relation itself, before looking up the column.
+			if err := s.hit(qualifier); err != nil {
+				return resolved{}, err
+			}
 			// A synthetic relation (a derived table, an aliased parenthesized join) may carry two
 			// columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
 			// one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
@@ -534,21 +666,21 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 				return resolved{}, ambiguousColumn(name)
 			case visible >= 0:
 				s.traceFlat(visible)
-				s.lateralHit = true
 				return resolved{level: 0, index: visible}, nil
 			}
 			s.traceFlat(found)
-			s.lateralHit = true
 			return resolved{level: 0, index: found}, nil
 		}
 	}
 	for _, sr := range s.subRels {
 		if sr.label == q {
+			if err := s.hit(qualifier); err != nil {
+				return resolved{}, err
+			}
 			local := sr.table.ColumnIndex(name)
 			if local < 0 {
 				return resolved{}, undefinedColumn(name)
 			}
-			s.lateralHit = true
 			return resolved{level: 0, index: sr.slots[local]}, nil
 		}
 	}

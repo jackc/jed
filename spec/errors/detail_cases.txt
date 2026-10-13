@@ -380,3 +380,11 @@ case: jsonpath doubled high surrogate
 run: SELECT '$ ? (@ == "\ud800\ud800")'::jsonpath
 code: 22P02
 detail: Unicode high surrogate must not follow a high surrogate.
+
+# --- 42P10 LATERAL reference across a RIGHT or FULL join ------------------------------------------
+
+case: lateral reference to the left side of a RIGHT JOIN
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t RIGHT JOIN LATERAL (SELECT t.a) s ON true
+code: 42P10
+detail: The combining JOIN type must be INNER or LEFT for a LATERAL reference.

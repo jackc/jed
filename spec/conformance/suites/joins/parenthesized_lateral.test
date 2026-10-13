@@ -435,6 +435,18 @@ SELECT 1 FROM a JOIN (b JOIN (SELECT a.x) s ON true) ON true
 statement error 42P01
 SELECT 1 FROM a JOIN (b JOIN (SELECT * FROM c CROSS JOIN LATERAL (SELECT a.x) l) d ON true) ON true
 
+# The relations to the group's left share one FROM namespace with the group's own: a bare column
+# both have is ambiguous, not shadowed by the group's relation (PostgreSQL).
+statement error 42702
+SELECT 1 FROM a JOIN (b JOIN LATERAL (SELECT id) s ON true) ON true
+
+statement error 42702
+SELECT 1 FROM c, (b JOIN LATERAL (SELECT id AS q) s ON true)
+
+# ... and the outer relation comes first: on the left side of a RIGHT JOIN it is refused.
+statement error 42P10
+SELECT 1 FROM a RIGHT JOIN (b JOIN LATERAL (SELECT id) s ON true) ON true
+
 # A relation to the group's RIGHT is not visible.
 statement error 42P01
 SELECT 1 FROM a JOIN (b JOIN LATERAL (SELECT c.z) s ON true) ON true JOIN c ON true
@@ -452,12 +464,73 @@ SELECT a.id FROM a RIGHT JOIN (b CROSS JOIN generate_series(1, a.id) g) ON true
 statement error 42P10
 SELECT 1 FROM a JOIN (b RIGHT JOIN LATERAL (SELECT b.y AS v) s ON true) ON true
 
-# jed narrowing (grammar.md §44): a RIGHT/FULL JOIN to a LATERAL item that references ANY outer relation
-# is 42P10. Here the RIGHT JOIN is inside the group and its lateral item references a, to the group's
-# left — not the RIGHT JOIN's left side — which PostgreSQL allows.
-statement error 42P10
-SELECT a.id, b.id, s.v FROM a JOIN (b RIGHT JOIN LATERAL (SELECT a.x AS v) s ON true) ON true
+# The right side of a RIGHT or FULL join may reference a relation outside that join. Here the RIGHT
+# JOIN is inside the group and its lateral item references a, to the group's left: s is evaluated once
+# per evaluation of the group, which is re-evaluated once per a row.
+# cost: 34
+query III nosort
+SELECT a.id, b.id, s.v FROM a JOIN (b RIGHT JOIN LATERAL (SELECT a.x AS v) s ON b.y = s.v * 10) ON true ORDER BY 1, 2
+----
+1
+1
+10
+2
+2
+20
+3
+NULL
+30
 
-# ... and here the group references c, an earlier comma item rather than the RIGHT JOIN's left side.
+# cost: 42
+query III nosort
+SELECT a.id, b.id, s.v FROM a JOIN (b FULL JOIN LATERAL (SELECT a.x AS v) s ON b.y = s.v * 10) ON true ORDER BY 1, 2, 3
+----
+1
+1
+10
+1
+2
+NULL
+2
+1
+NULL
+2
+2
+20
+3
+1
+NULL
+3
+2
+NULL
+3
+NULL
+30
+
+# ... and here the group references x, an earlier comma item rather than the RIGHT JOIN's left side:
+# the comma item holding the RIGHT JOIN is re-evaluated once per x row.
+# cost: 45
+query IIII nosort
+SELECT x.id, a.id, b.id, s.v FROM c AS x, a RIGHT JOIN (b JOIN LATERAL (SELECT x.z AS v) s ON true) ON a.id = b.id ORDER BY 1, 3
+----
+1
+1
+1
+5
+1
+2
+2
+5
+3
+1
+1
+6
+3
+2
+2
+6
+
+# A RIGHT JOIN to a lateral item that references the left side of the RIGHT JOIN in an enclosing
+# group is refused, even through an INNER join inside the group.
 statement error 42P10
-SELECT count(*) FROM c AS x, a RIGHT JOIN (b JOIN LATERAL (SELECT x.z AS v) s ON true) ON true
+SELECT 1 FROM a RIGHT JOIN (b JOIN (c JOIN LATERAL (SELECT a.x) s ON true) ON true) ON true
