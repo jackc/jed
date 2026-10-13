@@ -99,7 +99,8 @@ than two `.decimal()` arguments is `42601`.
 
 A literal primary takes accessors too (`"12".number()`, `null.type()`). Number literals follow
 PostgreSQL's jsonpath scanner (`1`, `1.5`, `1.`, `.5`, `1e3`, `1.e3`); a number running into a
-letter or digit (`1.type()`, `01`, `1e`) is trailing junk (`42601`). A sign is an operator, not part
+character that could continue a name (`1.type()`, `01`, `1e`, `1~`, `1.é`) is trailing junk
+(`42601`), PostgreSQL's number-plus-one-`other`-byte rules. A sign is an operator, not part
 of the number: as in PostgreSQL's grammar, unary `+`/`-` applied to a number literal with no
 accessors folds into it (`-1`, `- -1` is `1`, `-(1)` is `-1`), while `-1.5.abs()` is unary minus
 applied to `1.5.abs()`, since accessors bind tighter. Like jed's SQL literals (grammar.md §36), jsonpath numbers take no `_` digit separators and no
@@ -176,8 +177,7 @@ error) while a digit or non-ASCII character does not (`$1abc`, `$é`); a quoted 
 §2.1 escapes. A `$` followed by anything else is the root. A variable renders as `$` and its name
 quoted like a member key (`$x` is `$"x"`).
 
-PostgreSQL's scanner also skips C-style `/* … */` comments between tokens. jed does not lex them
-yet, a follow-on.
+A comment that a name runs straight into discards the name (§2.4).
 
 ### 2.3 Canonical render
 
@@ -196,6 +196,30 @@ brackets by priority alone, so as an operand it prints `($.a + 1).type() == "num
 parses as a different path). jed evaluates a path from its canonical text (§1, §7), so that text
 must read back as the same path; it renders `($."a" + 1).type()` and `(-@."a").abs()` wherever they
 appear (an oracle override).
+
+### 2.4 Comments and empty input
+
+PostgreSQL's scanner skips a C-style `/* … */` comment between tokens as it skips whitespace
+(`$ /* the root */ .a`, `1 /**/ + /**/ 2`, `$.type(/**/)`), and the canonical render (§2.3) drops it.
+A comment may hold anything but `*/` (quotes, newlines, `/*`); comments do not nest, so in
+`$ /* a /* b */ */` the first `*/` ends the comment and the stray `*/` is a syntax error. A comment
+without its `*/` is `42601` (`unexpected end of comment`). Inside a quoted string or quoted variable
+name `/*` is literal text (`$."a/*b*/"`). `/` beside a comment stays the division operator:
+`$.a//**/2` is `$."a" / 2`, and `$.a /**/* 2` is `$."a" * 2`, since the comment ends at its first
+`*/`.
+
+The scanner's non-quoted-string state (§2.2) enters the comment state at `/*` without returning the
+name it was building, so **a name that runs straight into a comment is discarded**: `$.a/*c*/b` is
+`$."b"`, `$.a/*c*/` is `$.` (`42601`), `strict/**/$` is `$` (lax), `$.type/**/()` is `$.()`
+(`42601`), and `$. 1abc/**/x` is `$."x"`. The name is still lexed, so its escape error is raised
+(`$.a\u0000/**/b` is `22P05`). Whitespace before the comment ends the name first, keeping it
+(`$.a /**/`, `strict /**/ $`). A number, variable, or quoted string before a comment is kept
+(`1/**/`, `$x/**/`, `"a"/**/`), and an escaped `/` belongs to the name, so `\/*` does not open a
+comment. jed keeps this quirk as PostgreSQL's behavior.
+
+A path with no tokens at all — empty, or only whitespace, comments, and discarded names (`''`,
+`'/**/'`, `'strict/**/'`) — is PostgreSQL's empty grammar result: `22P02` `invalid input syntax for
+type jsonpath`. A mode keyword with nothing after it (`strict`, `lax /**/`) is `42601`.
 
 ---
 
@@ -629,7 +653,8 @@ class, at resolve), **`22023`** for a `.decimal()` precision or scale outside Po
 `numeric` typmod ranges, **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
 unsupported `s`/`m`/`x` regex flags (§4.3), and **`22P02`** for malformed JSON in the
 `json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)). A string escape that decodes
-to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1). Arithmetic raises the
+to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1), and a path with no tokens
+**`22P02`** (§2.4). Arithmetic raises the
 `decimal` errors: **`22012`** for a zero divisor, **`22003`** past the format cap (§3.2).
 
 **Nesting limit — `54001`.** The compiler counts program nesting (+1 per filter `?(`,

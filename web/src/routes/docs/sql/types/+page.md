@@ -448,6 +448,12 @@ or one of the path's operator and punctuation characters (`. [ ] ( ) $ @ ? , * +
 the same backslash escapes as a string: `$.a\u0041` reads the key `aA`. A keyword is a member key
 too: `$.type` reads the key `type`, and `$.type()` calls the method.
 
+A `jsonpath` may hold `/* … */` comments between its parts, as in PostgreSQL: `'$.a /* key */ + 1'`
+is `$."a" + 1`, and the comment is dropped from the path's text. Comments do not nest. As in
+PostgreSQL, put whitespace between a member name and a comment: a name that runs straight into one
+is dropped with it, so `$.a/*c*/b` reads the key `b`. A path with no parts at all (`''`, `'/**/'`)
+fails with `22P02`.
+
 A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper document, or
 building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with
 `54001`. PostgreSQL's limit depends on its stack size and is much higher (about 10 000 levels by

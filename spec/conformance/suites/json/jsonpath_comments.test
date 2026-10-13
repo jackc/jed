@@ -1,0 +1,312 @@
+# jsonpath comments (spec/design/jsonpath.md §2.4) — PostgreSQL's jsonpath scanner
+# (jsonpath_scan.l): a C-style `/* … */` comment between tokens is skipped like whitespace and
+# vanishes from the canonical render. Comments do not nest, and one without its `*/` is 42601. Inside
+# a quoted string or quoted variable name `/*` is literal text. The scanner's quirk is kept: a name
+# that runs straight into a comment (`$.a/*c*/`) is discarded, so `$.a/*c*/b` is `$."b"`. A path of
+# nothing but whitespace, comments, and discarded names is 22P02, as an empty path is.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: query.select, query.set_returning, types.jsonb, types.jsonpath, types.i32, func.jsonb_path, expr.jsonpath_filter, expr.jsonpath_match, expr.jsonpath_methods, expr.jsonpath_arith, expr.json_query_fns, expr.jsonpath_vars
+
+# --- Comments between tokens ------------------------------------------------------------------
+
+query TTTTT nosort
+SELECT '$ /*c*/ .a'::jsonpath, '$./*c*/a'::jsonpath, '/*c*/$'::jsonpath, '$/*c*/'::jsonpath, '$.a /*c*/'::jsonpath
+----
+$."a"
+$."a"
+$
+$
+$."a"
+
+query TTTTT nosort
+SELECT '$ /**/'::jsonpath, '$ /***/'::jsonpath, '$ /* ** / * */'::jsonpath, '$/**//**/.a'::jsonpath, '$.a /**//**/'::jsonpath
+----
+$
+$
+$
+$."a"
+$."a"
+
+# A comment may hold anything but `*/`: quotes, `/*`, newlines.
+query TTTT nosort
+SELECT '$ /* " */ .a'::jsonpath, '$ /* /* */ .a'::jsonpath, '$ /*
+  two lines */ .a'::jsonpath, '$ ? (@ /*)*/ == 1)'::jsonpath
+----
+$."a"
+$."a"
+$."a"
+$?(@ == 1)
+
+query TTTTT nosort
+SELECT 'strict /**/$'::jsonpath, 'lax/**/ strict $'::jsonpath, '$ [ /**/ 0 /**/ ]'::jsonpath, '$[1 /**/ to /**/ 2]'::jsonpath, '$.size()/**/.type()'::jsonpath
+----
+strict $
+strict $
+$[0]
+$[1 to 2]
+$.size().type()
+
+query TTTT nosort
+SELECT '$ ? (@ /*x*/ == /*y*/ 1)'::jsonpath, '$ ? (@ == 1)/**/'::jsonpath, '$.a /**/ ? (@ > 1)'::jsonpath, '$ ? (@ > 1 /**/&&/**/ @ < 5)'::jsonpath
+----
+$?(@ == 1)
+$?(@ == 1)
+$."a"?(@ > 1)
+$?(@ > 1 && @ < 5)
+
+# Item methods and their arguments.
+query TTTT nosort
+SELECT '$.type /**/()'::jsonpath, '$.type(/**/)'::jsonpath, '$.decimal(/**/1/**/,/**/0/**/)'::jsonpath, '$.abs /**/ ()'::jsonpath
+----
+$.type()
+$.type()
+$.decimal(1,0)
+$.abs()
+
+# --- Arithmetic: `/` beside a comment ---------------------------------------------------------
+
+query TTTTT nosort
+SELECT '1/**/+/**/2'::jsonpath, '$.a//**/2'::jsonpath, '$.a /**/* 2'::jsonpath, '$.*/**/* 2'::jsonpath, '1 /*/ 2*/ + 3'::jsonpath
+----
+(1 + 2)
+($."a" / 2)
+($."a" * 2)
+($.* * 2)
+(1 + 3)
+
+query TTTT nosort
+SELECT '-/**/1'::jsonpath, '- /**/ $.a'::jsonpath, '1./**/'::jsonpath, '1e3/**/'::jsonpath
+----
+-1
+(-$."a")
+1
+1000
+
+query TT nosort
+SELECT '.5/**/'::jsonpath, '$.a / /*c*/ 2'::jsonpath
+----
+0.5
+($."a" / 2)
+
+# --- Variables and quoted strings -------------------------------------------------------------
+
+query TTTT nosort
+SELECT '$x/**/'::jsonpath, '$"x"/**/'::jsonpath, '$x /**/ + 1'::jsonpath, '$"x/**/"'::jsonpath
+----
+$"x"
+$"x"
+($"x" + 1)
+$"x/**/"
+
+# `/*` and `*/` inside a quoted string are literal.
+query TTTT nosort
+SELECT '$."a/*b*/"'::jsonpath, '$ ? (@ == "/*")'::jsonpath, '$ ? (@ == "*/")'::jsonpath, '"a"abc/**/'::jsonpath
+----
+$."a/*b*/"
+$?(@ == "/*")
+$?(@ == "*/")
+"a"
+
+# --- A name that runs straight into a comment is discarded ------------------------------------
+
+query TTTTT nosort
+SELECT '$.a/*c*/b'::jsonpath, '$.a/**/b/**/c'::jsonpath, '$.a/**//**/b'::jsonpath, '$.A/**/b'::jsonpath, '$.a/**/abs()'::jsonpath
+----
+$."b"
+$."c"
+$."b"
+$."b"
+$.abs()
+
+query TTT nosort
+SELECT 'strict/**/$'::jsonpath, '$. 1abc/**/x'::jsonpath, '$.decimal(1é/**/)'::jsonpath
+----
+$
+$."x"
+$.decimal()
+
+# The discarded name is still lexed: its escape error is raised.
+statement error 22P05
+SELECT '$.a\u0000/**/b'::jsonpath
+
+statement error 22P02
+SELECT '$.a\ud800/**/b'::jsonpath
+
+statement error 42601
+SELECT '$.a\u12/**/b'::jsonpath
+
+# What the discarded name leaves behind may not parse.
+statement error 42601
+SELECT '$.a/*c*/'::jsonpath
+
+statement error 42601
+SELECT '$.a/**/.b'::jsonpath
+
+statement error 42601
+SELECT '$.a/**/[0]'::jsonpath
+
+statement error 42601
+SELECT '$.a/**/ ? (@ > 1)'::jsonpath
+
+statement error 42601
+SELECT '$.a/*x*/*2'::jsonpath
+
+statement error 42601
+SELECT '$.type/**/()'::jsonpath
+
+statement error 42601
+SELECT '$.abs/**/ ()'::jsonpath
+
+statement error 42601
+SELECT '$.TYPE/**/()'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@.a/**/ == 1)'::jsonpath
+
+statement error 42601
+SELECT '$[last/**/]'::jsonpath
+
+statement error 42601
+SELECT '$[1 /**/to/**/ 2]'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == null/**/)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (exists/**/(@.a))'::jsonpath
+
+statement error 42601
+SELECT '$x/**/y'::jsonpath
+
+# An escaped `/` belongs to the name, so `\/*` is not a comment.
+statement error 42601
+SELECT '$.a\/*c*/'::jsonpath
+
+statement error 42601
+SELECT '$.a\/**/'::jsonpath
+
+# --- Empty input ------------------------------------------------------------------------------
+
+# Nothing but whitespace, comments, and discarded names is no path at all: 22P02.
+statement error 22P02
+SELECT ''::jsonpath
+
+statement error 22P02
+SELECT '  '::jsonpath
+
+statement error 22P02
+SELECT '/**/'::jsonpath
+
+statement error 22P02
+SELECT ' /* a */ /* b */ '::jsonpath
+
+statement error 22P02
+SELECT 'strict/**/'::jsonpath
+
+statement error 22P02
+SELECT 'abc/**/'::jsonpath
+
+statement error 22P02
+SELECT 'true/**/'::jsonpath
+
+statement error 22P02
+SELECT '1é/**/'::jsonpath
+
+# A mode keyword alone, or before a comment it is not run into, is a syntax error.
+statement error 42601
+SELECT 'strict'::jsonpath
+
+statement error 42601
+SELECT 'lax /**/'::jsonpath
+
+query T nosort
+SELECT 'true /**/'::jsonpath
+----
+true
+
+# --- Unterminated and stray comments ----------------------------------------------------------
+
+statement error 42601
+SELECT '$ /* abc'::jsonpath
+
+statement error 42601
+SELECT '$ /*'::jsonpath
+
+statement error 42601
+SELECT '$ /**'::jsonpath
+
+statement error 42601
+SELECT '$ /*/'::jsonpath
+
+statement error 42601
+SELECT '$.a /*/'::jsonpath
+
+# Comments do not nest: the first `*/` ends one, leaving a stray `*/`.
+statement error 42601
+SELECT '$ /* a /* b */ */'::jsonpath
+
+statement error 42601
+SELECT '$ */'::jsonpath
+
+statement error 42601
+SELECT '$*/'::jsonpath
+
+statement error 42601
+SELECT '$ /'::jsonpath
+
+# --- A number runs into trailing junk before a comment ----------------------------------------
+
+statement error 42601
+SELECT '1~/**/'::jsonpath
+
+statement error 42601
+SELECT '1.~/**/'::jsonpath
+
+statement error 42601
+SELECT '1.é/**/'::jsonpath
+
+statement error 42601
+SELECT '1e3~/**/'::jsonpath
+
+statement error 42601
+SELECT '.5~/**/'::jsonpath
+
+statement error 42601
+SELECT '$[1~/**/]'::jsonpath
+
+statement error 42601
+SELECT '$.decimal(1~/**/)'::jsonpath
+
+statement error 42601
+SELECT '$.1abc/**/x'::jsonpath
+
+statement error 42601
+SELECT '$. 12/**/'::jsonpath
+
+statement error 42601
+SELECT '1e+/**/'::jsonpath
+
+# --- Evaluation -------------------------------------------------------------------------------
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a": [1, 2, 3]}', '$.a[*] /* each */ ? (@ > 1 /* not the first */)')
+----
+2
+3
+
+query T nosort
+SELECT jsonb_path_query_first('{"a": 6}', '$.a / /* half */ 2')
+----
+3.0000000000000000
+
+query BB nosort
+SELECT '{"a": 1}'::jsonb @? '$.a /* present */', '{"a": 1}'::jsonb @@ '$.a /* is one */ == 1'
+----
+true
+true
+
+query TT nosort
+SELECT jsonb_path_query_first('{"a": 5}', '$.a + $n /* bound */', '{"n": 10}'), JSON_VALUE('{"a": 5}', '$.a /* + */ + $x' PASSING 2 AS x)
+----
+15
+7

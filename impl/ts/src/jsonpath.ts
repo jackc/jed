@@ -276,10 +276,6 @@ function isAsciiAlpha(c: string | undefined): boolean {
   return c !== undefined && ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z"));
 }
 
-function isIdentChar(c: string | undefined): boolean {
-  return c !== undefined && (isAsciiAlpha(c) || isAsciiDigit(c) || c === "_");
-}
-
 // isJsonpathWhitespace is PostgreSQL's jsonpath whitespace set: space, tab, LF, CR, FF.
 function isJsonpathWhitespace(c: string): boolean {
   return c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
@@ -335,10 +331,38 @@ class Parser {
     return false;
   }
 
-  skipWs(): void {
-    while (this.i < this.s.length && isJsonpathWhitespace(this.s[this.i]!)) {
-      this.i += 1;
+  // skipWs skips what PostgreSQL's jsonpath scanner discards between tokens (jsonpath.md §2.4):
+  // whitespace ([ \t\n\r\f]), `/* … */` comments, and a name that runs straight into a comment —
+  // the scanner's non-quoted-string state enters the comment state without returning the name, so
+  // `$.a/*c*/b` is `$."b"`. The name is still lexed, so its escape error is raised.
+  private skipWs(): void {
+    for (;;) {
+      while (this.i < this.s.length && isJsonpathWhitespace(this.s[this.i]!)) {
+        this.i += 1;
+      }
+      if (this.s.startsWith("/*", this.i)) {
+        this.skipComment();
+        continue;
+      }
+      if (this.wordAhead()) {
+        const start = this.i;
+        this.scanWord();
+        if (this.s.startsWith("/*", this.i)) {
+          this.skipComment();
+          continue;
+        }
+        this.i = start;
+      }
+      return;
     }
+  }
+
+  // skipComment skips the `/* … */` comment at the cursor. Comments do not nest; one without its
+  // `*/` is `42601`.
+  private skipComment(): void {
+    const end = this.s.indexOf("*/", this.i + 2);
+    if (end < 0) throw malformed("unexpected end of comment");
+    this.i = end + 2;
   }
 
   // wordAhead: whether PostgreSQL's scanner would lex a name (an identifier or keyword) at the
@@ -394,6 +418,13 @@ class Parser {
   // `0A000`.
   compile(): JsonPath {
     this.skipWs();
+    // Nothing but whitespace and comments: PostgreSQL's grammar yields no path, `22P02`.
+    if (this.peek() === undefined) {
+      throw engineError(
+        "invalid_text_representation",
+        `invalid input syntax for type jsonpath: "${this.s}"`,
+      );
+    }
     // Optional mode word: `strict` / `lax` (default lax).
     let strict: boolean;
     if (this.eatKeyword("strict")) {
@@ -537,7 +568,8 @@ class Parser {
       if (this.i === start) throw junk();
       exp = eneg ? -v : v;
     }
-    if (isIdentChar(this.peek())) throw junk();
+    // PostgreSQL's "trailing junk" rules: a number followed by any `other` character (`1a`, `1~`).
+    if (isOther(this.peek())) throw junk();
     if (intPart === "" && frac === "") throw malformed("invalid number literal");
     const [digits, scale] = decimalFromParts(intPart, frac, exp);
     return { kind: "number", dec: Decimal.fromDigitsScale(neg, digits, scale).checkCap() };
@@ -560,7 +592,8 @@ class Parser {
       const c = this.peek();
       if (c === ".") {
         this.i += 1;
-        const dotEnd = this.i;
+        // PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
+        if (isAsciiDigit(this.peek())) throw malformed("expected a member name after `.`");
         this.skipWs();
         const next = this.peek();
         if (this.eat("*")) {
@@ -569,9 +602,6 @@ class Parser {
           steps.push({ kind: "wildcardMember" });
         } else if (next === '"') {
           steps.push({ kind: "member", key: this.parseQuoted() });
-        } else if (this.i === dotEnd && isAsciiDigit(next)) {
-          // PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
-          throw malformed("expected a member name after `.`");
         } else if (this.wordAhead()) {
           // An unquoted name (jsonpath.md §2.1); followed by `(`, an item method.
           const name = this.scanWord();
@@ -680,7 +710,7 @@ class Parser {
     if (
       digits === "" ||
       (digits.length > 1 && digits.startsWith("0")) ||
-      isIdentChar(after) ||
+      isOther(after) ||
       after === "."
     ) {
       throw malformed("expected an integer .decimal() argument");

@@ -237,7 +237,14 @@ impl JsonPath {
             in_filter: 0,
             in_subscript: 0,
         };
-        p.skip_ws();
+        p.skip_ws()?;
+        // Nothing but whitespace and comments: PostgreSQL's grammar yields no path, `22P02`.
+        if p.peek().is_none() {
+            return Err(EngineError::new(
+                SqlState::InvalidTextRepresentation,
+                format!("invalid input syntax for type jsonpath: \"{src}\""),
+            ));
+        }
         // Optional mode word: `strict` / `lax` (default lax).
         let strict = if p.eat_keyword("strict") {
             true
@@ -251,7 +258,7 @@ impl JsonPath {
             Parsed::Expr(e) => PathBody::Path(e),
             Parsed::Pred(pred) => PathBody::Predicate(Box::new(pred)),
         };
-        p.skip_ws();
+        p.skip_ws()?;
         if p.peek().is_some() {
             return Err(malformed("unexpected trailing input"));
         }
@@ -2085,13 +2092,42 @@ impl Parser<'_> {
         }
     }
 
-    /// Skip jsonpath whitespace (PostgreSQL's `[ \t\n\r\f]`).
-    fn skip_ws(&mut self) {
-        while self
-            .peek()
-            .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c'))
-        {
-            self.i += 1;
+    /// Skip what PostgreSQL's jsonpath scanner discards between tokens (jsonpath.md §2.4): whitespace
+    /// (`[ \t\n\r\f]`), `/* … */` comments, and a name that runs straight into a comment — the
+    /// scanner's non-quoted-string state enters the comment state without returning the name, so
+    /// `$.a/*c*/b` is `$."b"`. The name is still lexed, so its escape error is raised.
+    fn skip_ws(&mut self) -> Result<()> {
+        loop {
+            while self.peek().is_some_and(is_blank) {
+                self.i += 1;
+            }
+            if self.s[self.i..].starts_with(b"/*") {
+                self.skip_comment()?;
+                continue;
+            }
+            if self.word_ahead() {
+                let start = self.i;
+                self.scan_word()?;
+                if self.s[self.i..].starts_with(b"/*") {
+                    self.skip_comment()?;
+                    continue;
+                }
+                self.i = start;
+            }
+            return Ok(());
+        }
+    }
+
+    /// Skip the `/* … */` comment at the cursor. Comments do not nest; one without its `*/` is
+    /// `42601`.
+    fn skip_comment(&mut self) -> Result<()> {
+        let body = self.i + 2;
+        match self.s[body..].windows(2).position(|w| w == b"*/") {
+            Some(k) => {
+                self.i = body + k + 2;
+                Ok(())
+            }
+            None => Err(malformed("unexpected end of comment")),
         }
     }
 
@@ -2273,10 +2309,10 @@ impl Parser<'_> {
         self.in_subscript += 1;
         loop {
             let a = self.parse_index()?;
-            self.skip_ws();
+            self.skip_ws()?;
             let sub = if self.eat_keyword("to") {
                 let b = self.parse_index()?;
-                self.skip_ws();
+                self.skip_ws()?;
                 Subscript::Slice(a, b)
             } else {
                 Subscript::Index(a)
@@ -2301,7 +2337,7 @@ impl Parser<'_> {
     /// One subscript index: a number literal or `last` keeps its own form; anything else is an
     /// expression evaluated per array.
     fn parse_index(&mut self) -> Result<Index> {
-        self.skip_ws();
+        self.skip_ws()?;
         if self.peek().is_none() {
             return Err(malformed("expected a subscript index"));
         }
@@ -2324,12 +2360,12 @@ impl Parser<'_> {
     /// parenthesized predicate followed by accessors yields its truth value; without accessors the
     /// parentheses only group.
     fn parse_postfix(&mut self) -> Result<Parsed> {
-        self.skip_ws();
+        self.skip_ws()?;
         if self.eat(b'(') {
             self.deepen()?;
             let inner = self.parse_or()?;
             self.depth -= 1;
-            self.skip_ws();
+            self.skip_ws()?;
             if !self.eat(b')') {
                 return Err(malformed("expected `)`"));
             }
@@ -2479,10 +2515,8 @@ impl Parser<'_> {
             }
             exp = Some(if eneg { -v } else { v });
         }
-        if self
-            .peek()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
-        {
+        // PostgreSQL's "trailing junk" rules: a number followed by any `other` byte (`1a`, `1~`).
+        if self.peek().is_some_and(is_other) {
             return Err(malformed("trailing junk after numeric literal"));
         }
         if int_part.is_empty() && frac.is_empty() {
@@ -2499,12 +2533,15 @@ impl Parser<'_> {
     fn parse_steps(&mut self) -> Result<Vec<Step>> {
         let mut steps = Vec::new();
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             match self.peek() {
                 Some(b'.') => {
                     self.i += 1;
-                    let dot_end = self.i;
-                    self.skip_ws();
+                    // PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
+                    if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        return Err(malformed("expected a member name after `.`"));
+                    }
+                    self.skip_ws()?;
                     if self.eat(b'*') {
                         // `.**` — the any-level accessor — is a deferred follow-on.
                         if self.peek() == Some(b'*') {
@@ -2513,14 +2550,11 @@ impl Parser<'_> {
                         steps.push(Step::WildcardMember);
                     } else if self.peek() == Some(b'"') {
                         steps.push(Step::Member(self.parse_quoted()?));
-                    } else if self.i == dot_end && self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                        // PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
-                        return Err(malformed("expected a member name after `.`"));
                     } else if self.word_ahead() {
                         // An unquoted name (jsonpath.md §2.1); followed by `(`, an item method.
                         let name = self.scan_word()?;
                         let save = self.i;
-                        self.skip_ws();
+                        self.skip_ws()?;
                         if self.peek() == Some(b'(') {
                             steps.push(Step::Method(self.parse_method(&name)?));
                         } else {
@@ -2533,9 +2567,9 @@ impl Parser<'_> {
                 }
                 Some(b'[') => {
                     self.i += 1;
-                    self.skip_ws();
+                    self.skip_ws()?;
                     if self.eat(b'*') {
-                        self.skip_ws();
+                        self.skip_ws()?;
                         if !self.eat(b']') {
                             return Err(malformed("expected `]` after `[*`"));
                         }
@@ -2546,7 +2580,7 @@ impl Parser<'_> {
                 }
                 Some(b'?') => {
                     self.i += 1;
-                    self.skip_ws();
+                    self.skip_ws()?;
                     if !self.eat(b'(') {
                         return Err(malformed("expected `(` after `?`"));
                     }
@@ -2555,7 +2589,7 @@ impl Parser<'_> {
                     let pred = need_pred(self.parse_or()?)?;
                     self.in_filter -= 1;
                     self.depth -= 1;
-                    self.skip_ws();
+                    self.skip_ws()?;
                     if !self.eat(b')') {
                         return Err(malformed("expected `)` after a filter predicate"));
                     }
@@ -2571,7 +2605,7 @@ impl Parser<'_> {
     /// case-insensitively, like PostgreSQL's keywords.
     fn parse_method(&mut self, name: &str) -> Result<Method> {
         self.i += 1; // (
-        self.skip_ws();
+        self.skip_ws()?;
         let method = match name.to_ascii_lowercase().as_str() {
             "type" => Method::Type,
             "size" => Method::Size,
@@ -2590,7 +2624,7 @@ impl Parser<'_> {
                 if !self.eat(b')') {
                     loop {
                         args.push(self.parse_int_arg()?);
-                        self.skip_ws();
+                        self.skip_ws()?;
                         if self.eat(b')') {
                             break;
                         }
@@ -2626,14 +2660,14 @@ impl Parser<'_> {
 
     /// Parse a `.decimal()` argument: an optionally signed integer literal.
     fn parse_int_arg(&mut self) -> Result<Decimal> {
-        self.skip_ws();
+        self.skip_ws()?;
         let neg = if self.eat(b'-') {
             true
         } else {
             self.eat(b'+');
             false
         };
-        self.skip_ws();
+        self.skip_ws()?;
         let start = self.i;
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.i += 1;
@@ -2641,9 +2675,7 @@ impl Parser<'_> {
         let digits = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
         if digits.is_empty()
             || (digits.len() > 1 && digits.starts_with('0'))
-            || self
-                .peek()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.')
+            || self.peek().is_some_and(|c| is_other(c) || c == b'.')
         {
             return Err(malformed("expected an integer .decimal() argument"));
         }
@@ -2658,7 +2690,7 @@ impl Parser<'_> {
         // Each `||` step deepens the left-deep tree by one level (json.md §6.4).
         let mut steps = 0;
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             if !self.eat_op(b"||") {
                 self.depth -= steps;
                 return Ok(left);
@@ -2676,7 +2708,7 @@ impl Parser<'_> {
         // Each `&&` step deepens the left-deep tree by one level (json.md §6.4).
         let mut steps = 0;
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             if !self.eat_op(b"&&") {
                 self.depth -= steps;
                 return Ok(left);
@@ -2691,10 +2723,10 @@ impl Parser<'_> {
 
     /// `!(predicate)` — the operand must be a parenthesized predicate.
     fn parse_not(&mut self) -> Result<Parsed> {
-        self.skip_ws();
+        self.skip_ws()?;
         if self.peek() == Some(b'!') && self.peek_at(1) != Some(b'=') {
             self.i += 1;
-            self.skip_ws();
+            self.skip_ws()?;
             if self.eat_keyword("exists") {
                 return Err(unsupported("exists predicates"));
             }
@@ -2704,7 +2736,7 @@ impl Parser<'_> {
             self.deepen()?;
             let inner = need_pred(self.parse_or()?)?;
             self.depth -= 1;
-            self.skip_ws();
+            self.skip_ws()?;
             if !self.eat(b')') {
                 return Err(malformed("expected `)` after `!(`"));
             }
@@ -2718,7 +2750,7 @@ impl Parser<'_> {
     fn parse_comparison(&mut self) -> Result<Parsed> {
         let left = match self.parse_additive()? {
             Parsed::Pred(pred) => {
-                self.skip_ws();
+                self.skip_ws()?;
                 if self.word_ahead() {
                     let start = self.i;
                     if keyword_is(&self.scan_word()?, "is") {
@@ -2730,7 +2762,7 @@ impl Parser<'_> {
             }
             Parsed::Expr(e) => e,
         };
-        self.skip_ws();
+        self.skip_ws()?;
         let op = if self.eat_op(b"==") {
             CmpOp::Eq
         } else if self.eat_op(b"!=") || self.eat_op(b"<>") {
@@ -2768,7 +2800,7 @@ impl Parser<'_> {
         // Each operator deepens the left-deep tree by one level (json.md §6.4).
         let mut steps = 0;
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             let op = match self.peek() {
                 Some(b'+') => ArithOp::Add,
                 Some(b'-') => ArithOp::Sub,
@@ -2791,7 +2823,7 @@ impl Parser<'_> {
         let mut left = self.parse_unary()?;
         let mut steps = 0;
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             let op = match self.peek() {
                 Some(b'*') => ArithOp::Mul,
                 Some(b'/') => ArithOp::Div,
@@ -2814,7 +2846,7 @@ impl Parser<'_> {
     /// (`-$.a * 2` is `(-($.a)) * 2`). Applied to a number literal they fold into it (`-1`), as
     /// PostgreSQL's grammar does.
     fn parse_unary(&mut self) -> Result<Parsed> {
-        self.skip_ws();
+        self.skip_ws()?;
         let op = match self.peek() {
             Some(b'+') => UnaryOp::Plus,
             Some(b'-') => UnaryOp::Minus,

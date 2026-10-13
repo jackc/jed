@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"bytes"
 	"sort"
 	"strconv"
 	"strings"
@@ -262,7 +263,14 @@ func compile(src string) (jsonPath, error) {
 // parseJsonPath parses a jsonpath source string (see compile).
 func parseJsonPath(src string) (jsonPath, error) {
 	p := &jpParser{s: []byte(src)}
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jsonPath{}, err
+	}
+	// Nothing but whitespace and comments: PostgreSQL's grammar yields no path, 22P02.
+	if _, ok := p.peek(); !ok {
+		return jsonPath{}, newError(InvalidTextRepresentation,
+			"invalid input syntax for type jsonpath: \""+src+"\"")
+	}
 	// Optional mode word: strict / lax (default lax).
 	strict := false
 	if p.eatKeyword("strict") {
@@ -276,7 +284,9 @@ func parseJsonPath(src string) (jsonPath, error) {
 	if err != nil {
 		return jsonPath{}, err
 	}
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jsonPath{}, err
+	}
 	if _, ok := p.peek(); ok {
 		return jsonPath{}, jpMalformed("unexpected trailing input")
 	}
@@ -2165,10 +2175,6 @@ func asciiEqualFold(a, b string) bool {
 
 func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-func isIdentByte(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isASCIIDigit(c) || c == '_'
-}
-
 type jpParser struct {
 	s []byte
 	i int
@@ -2245,16 +2251,48 @@ func (p *jpParser) eat(c byte) bool {
 	return false
 }
 
-// skipWs skips jsonpath whitespace (PostgreSQL's [ \t\n\r\f]).
-func (p *jpParser) skipWs() {
-	for p.i < len(p.s) {
-		switch p.s[p.i] {
-		case ' ', '\t', '\n', '\r', '\f':
+// skipWs skips what PostgreSQL's jsonpath scanner discards between tokens (jsonpath.md §2.4):
+// whitespace ([ \t\n\r\f]), `/* … */` comments, and a name that runs straight into a comment — the
+// scanner's non-quoted-string state enters the comment state without returning the name, so
+// `$.a/*c*/b` is `$."b"`. The name is still lexed, so its escape error is raised.
+func (p *jpParser) skipWs() error {
+	for {
+		for p.i < len(p.s) && jpIsBlank(p.s[p.i]) {
 			p.i++
-		default:
-			return
 		}
+		if bytes.HasPrefix(p.s[p.i:], []byte("/*")) {
+			if err := p.skipComment(); err != nil {
+				return err
+			}
+			continue
+		}
+		if p.wordAhead() {
+			start := p.i
+			if _, err := p.scanWord(); err != nil {
+				return err
+			}
+			if bytes.HasPrefix(p.s[p.i:], []byte("/*")) {
+				if err := p.skipComment(); err != nil {
+					return err
+				}
+				continue
+			}
+			p.i = start
+		}
+		return nil
 	}
+}
+
+// skipComment skips the `/* … */` comment at the cursor. Comments do not nest; one without its `*/`
+// is 42601.
+func (p *jpParser) skipComment() error {
+	body := p.i + 2
+	k := bytes.Index(p.s[body:], []byte("*/"))
+	if k < 0 {
+		return jpMalformed("unexpected end of comment")
+	}
+	p.i = body + k + 2
+	return nil
 }
 
 // wordAhead reports whether PostgreSQL's scanner would lex a name (an identifier or keyword) at the
@@ -2472,14 +2510,18 @@ func (p *jpParser) parseSubscripts() ([]jpSubscript, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return nil, err
+		}
 		var sub jpSubscript
 		if p.eatKeyword("to") {
 			b, err := p.parseIndex()
 			if err != nil {
 				return nil, err
 			}
-			p.skipWs()
+			if err := p.skipWs(); err != nil {
+				return nil, err
+			}
 			sub = jpSubscript{a: a, b: b, slice: true}
 		} else {
 			sub = jpSubscript{a: a}
@@ -2504,7 +2546,9 @@ func (p *jpParser) parseSubscripts() ([]jpSubscript, error) {
 // parseIndex parses one subscript index: a number literal or `last` keeps its own form; anything
 // else is an expression evaluated per array.
 func (p *jpParser) parseIndex() (jpIndex, error) {
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jpIndex{}, err
+	}
 	if _, ok := p.peek(); !ok {
 		return jpIndex{}, jpMalformed("expected a subscript index")
 	}
@@ -2527,7 +2571,9 @@ func (p *jpParser) parseIndex() (jpIndex, error) {
 // parenthesized predicate followed by accessors yields its truth value; without accessors the
 // parentheses only group.
 func (p *jpParser) parsePostfix() (jpParsed, error) {
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
 	if p.eat('(') {
 		if err := p.deepen(); err != nil {
 			return jpParsed{}, err
@@ -2537,7 +2583,9 @@ func (p *jpParser) parsePostfix() (jpParsed, error) {
 			return jpParsed{}, err
 		}
 		p.depth--
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return jpParsed{}, err
+		}
 		if !p.eat(')') {
 			return jpParsed{}, jpMalformed("expected `)`")
 		}
@@ -2699,7 +2747,8 @@ func (p *jpParser) parseNumber() (JsonNode, error) {
 		}
 		hasExp = true
 	}
-	if c, ok := p.peek(); ok && isIdentByte(c) {
+	// PostgreSQL's "trailing junk" rules: a number followed by any `other` byte (`1a`, `1~`).
+	if c, ok := p.peek(); ok && jpIsOther(c) {
 		return junk()
 	}
 	if intPart == "" && frac == "" {
@@ -2728,7 +2777,9 @@ func (p *jpParser) exponentAt(k int) bool {
 func (p *jpParser) parseSteps() ([]jpStep, error) {
 	var steps []jpStep
 	for {
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return nil, err
+		}
 		c, ok := p.peek()
 		if !ok {
 			return steps, nil
@@ -2736,8 +2787,13 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 		switch c {
 		case '.':
 			p.i++
-			dotEnd := p.i
-			p.skipWs()
+			// PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
+			if nc, ok := p.peek(); ok && isASCIIDigit(nc) {
+				return nil, jpMalformed("expected a member name after `.`")
+			}
+			if err := p.skipWs(); err != nil {
+				return nil, err
+			}
 			nc, ok := p.peek()
 			switch {
 			case p.eat('*'):
@@ -2752,9 +2808,6 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 					return nil, err
 				}
 				steps = append(steps, jpStep{kind: jpMember, key: k})
-			case ok && p.i == dotEnd && isASCIIDigit(nc):
-				// PostgreSQL lexes `.5` / `.1abc` as a number token, never `.` and a name.
-				return nil, jpMalformed("expected a member name after `.`")
 			case p.wordAhead():
 				// An unquoted name (jsonpath.md §2.1); followed by `(`, an item method.
 				name, err := p.scanWord()
@@ -2762,7 +2815,9 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 					return nil, err
 				}
 				save := p.i
-				p.skipWs()
+				if err := p.skipWs(); err != nil {
+					return nil, err
+				}
 				if pc, ok := p.peek(); ok && pc == '(' {
 					m, err := p.parseMethod(name)
 					if err != nil {
@@ -2778,9 +2833,13 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			}
 		case '[':
 			p.i++
-			p.skipWs()
+			if err := p.skipWs(); err != nil {
+				return nil, err
+			}
 			if p.eat('*') {
-				p.skipWs()
+				if err := p.skipWs(); err != nil {
+					return nil, err
+				}
 				if !p.eat(']') {
 					return nil, jpMalformed("expected `]` after `[*`")
 				}
@@ -2794,7 +2853,9 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			}
 		case '?':
 			p.i++
-			p.skipWs()
+			if err := p.skipWs(); err != nil {
+				return nil, err
+			}
 			if !p.eat('(') {
 				return nil, jpMalformed("expected `(` after `?`")
 			}
@@ -2808,7 +2869,9 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			}
 			p.inFilter--
 			p.depth--
-			p.skipWs()
+			if err := p.skipWs(); err != nil {
+				return nil, err
+			}
 			if !p.eat(')') {
 				return nil, jpMalformed("expected `)` after a filter predicate")
 			}
@@ -2823,7 +2886,9 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 // matched case-insensitively, like PostgreSQL's keywords.
 func (p *jpParser) parseMethod(name string) (jpMethod, error) {
 	p.i++ // (
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jpMethod{}, err
+	}
 	lower := toLowerASCII(name)
 	var m jpMethod
 	switch lower {
@@ -2838,7 +2903,9 @@ func (p *jpParser) parseMethod(name string) (jpMethod, error) {
 					return jpMethod{}, err
 				}
 				args = append(args, d)
-				p.skipWs()
+				if err := p.skipWs(); err != nil {
+					return jpMethod{}, err
+				}
 				if p.eat(')') {
 					break
 				}
@@ -2876,20 +2943,24 @@ func (p *jpParser) parseMethod(name string) (jpMethod, error) {
 
 // parseIntArg parses a .decimal() argument: an optionally signed integer literal.
 func (p *jpParser) parseIntArg() (Decimal, error) {
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return Decimal{}, err
+	}
 	neg := false
 	if p.eat('-') {
 		neg = true
 	} else {
 		p.eat('+')
 	}
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return Decimal{}, err
+	}
 	start := p.i
 	for p.i < len(p.s) && isASCIIDigit(p.s[p.i]) {
 		p.i++
 	}
 	digits := string(p.s[start:p.i])
-	if c, ok := p.peek(); digits == "" || (len(digits) > 1 && digits[0] == '0') || (ok && (isIdentByte(c) || c == '.')) {
+	if c, ok := p.peek(); digits == "" || (len(digits) > 1 && digits[0] == '0') || (ok && (jpIsOther(c) || c == '.')) {
 		return Decimal{}, jpMalformed("expected an integer .decimal() argument")
 	}
 	return decimalFromDigitsScale(neg, digits, 0), nil
@@ -2906,7 +2977,9 @@ func (p *jpParser) parseOr() (jpParsed, error) {
 	// Each `||` step deepens the left-deep tree by one level (json.md §6.4).
 	steps := 0
 	for {
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return jpParsed{}, err
+		}
 		if !p.eatOp("||") {
 			p.depth -= steps
 			return left, nil
@@ -2935,7 +3008,9 @@ func (p *jpParser) parseAnd() (jpParsed, error) {
 	// Each `&&` step deepens the left-deep tree by one level (json.md §6.4).
 	steps := 0
 	for {
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return jpParsed{}, err
+		}
 		if !p.eatOp("&&") {
 			p.depth -= steps
 			return left, nil
@@ -2958,11 +3033,15 @@ func (p *jpParser) parseAnd() (jpParsed, error) {
 
 // parseNot parses `!(predicate)` — the operand must be a parenthesized predicate.
 func (p *jpParser) parseNot() (jpParsed, error) {
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
 	if c, ok := p.peek(); ok && c == '!' {
 		if nc, ok := p.peekAt(1); !ok || nc != '=' {
 			p.i++
-			p.skipWs()
+			if err := p.skipWs(); err != nil {
+				return jpParsed{}, err
+			}
 			if p.eatKeyword("exists") {
 				return jpParsed{}, jpUnsupported("exists predicates")
 			}
@@ -2977,7 +3056,9 @@ func (p *jpParser) parseNot() (jpParsed, error) {
 				return jpParsed{}, err
 			}
 			p.depth--
-			p.skipWs()
+			if err := p.skipWs(); err != nil {
+				return jpParsed{}, err
+			}
 			if !p.eat(')') {
 				return jpParsed{}, jpMalformed("expected `)` after `!(`")
 			}
@@ -2995,7 +3076,9 @@ func (p *jpParser) parseComparison() (jpParsed, error) {
 		return jpParsed{}, err
 	}
 	if left.pred != nil {
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return jpParsed{}, err
+		}
 		if p.wordAhead() {
 			start := p.i
 			word, err := p.scanWord()
@@ -3009,7 +3092,9 @@ func (p *jpParser) parseComparison() (jpParsed, error) {
 		}
 		return left, nil
 	}
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
 	var op jpCmpOp
 	switch {
 	case p.eatOp("=="):
@@ -3056,7 +3141,9 @@ func (p *jpParser) parseAdditive() (jpParsed, error) {
 	// Each operator deepens the left-deep tree by one level (json.md §6.4).
 	steps := 0
 	for {
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return jpParsed{}, err
+		}
 		c, ok := p.peek()
 		var op jpArithOp
 		switch {
@@ -3093,7 +3180,9 @@ func (p *jpParser) parseMultiplicative() (jpParsed, error) {
 	}
 	steps := 0
 	for {
-		p.skipWs()
+		if err := p.skipWs(); err != nil {
+			return jpParsed{}, err
+		}
 		c, ok := p.peek()
 		var op jpArithOp
 		switch {
@@ -3128,7 +3217,9 @@ func (p *jpParser) parseMultiplicative() (jpParsed, error) {
 // accessors (`-$.a * 2` is `(-($.a)) * 2`). Applied to a number literal they fold into it (`-1`), as
 // PostgreSQL's grammar does.
 func (p *jpParser) parseUnary() (jpParsed, error) {
-	p.skipWs()
+	if err := p.skipWs(); err != nil {
+		return jpParsed{}, err
+	}
 	c, ok := p.peek()
 	var op jpUnaryOp
 	switch {
