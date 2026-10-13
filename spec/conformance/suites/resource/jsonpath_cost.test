@@ -126,3 +126,40 @@ query T nosort
 SELECT jsonb_path_query_first(a, '$[*] ? (@ == $[*])') FROM (SELECT jsonb_agg(g) AS a FROM generate_series(1, 50) g) s
 ----
 1
+
+# A binary operator evaluates both operands, then applies once and emits its result; a literal
+# operand charges nothing. `($."a"[0] + 1)` is 14 bytes; `.a` charges 3 and `[0]` 2.
+# cost: 26
+query T nosort
+SELECT jsonb_path_query_first(j, '$.a[0] + 1') FROM d
+----
+2
+
+# A unary operator applies to each item of its operand and emits one result per number.
+# cost: 139
+query T nosort
+SELECT jsonb_path_query_array(j, '-$.a[*]') FROM d
+----
+[-1, -2, -3]
+
+# A subscript expression is evaluated per array: `last - 1` is one operation.
+# cost: 27
+query T nosort
+SELECT jsonb_path_query_first(j, '$.a[last - 1]') FROM d
+----
+2
+
+# Arithmetic in a filter runs for each item tested.
+# cost: 119
+query T nosort
+SELECT jsonb_path_query_array(j, '$.a[*] ? (@ * 2 > 3)') FROM d
+----
+[2, 3]
+
+# Multiplying two 41-digit numbers charges the SQL operator's decimal_work: 11 × 11 groups, 120
+# beyond the first.
+# cost: 214
+query T nosort
+SELECT jsonb_path_query_first(j, '1e40 * 1e40') FROM d
+----
+100000000000000000000000000000000000000000000000000000000000000000000000000000000

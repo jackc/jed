@@ -444,11 +444,13 @@ over a value therefore recurses at most 256 levels.
    structural use re-parses it through gate 1 (`54001`).
 
 **The `jsonpath` compiler** has its own nesting, separate from document depth. Filters inside
-filters (`@ ? (@ ? (…))`), parenthesized predicate groups, `!(…)`, and long `&&` / `||` chains
-(which build a left-deep tree) all recurse when compiled, rendered, and evaluated. The compiler
-counts nesting the way the SQL parser does ([cost.md §7](cost.md)): **+1** for each filter `?(`,
-each parenthesized group, each `!`, and each `&&` / `||` step. It checks the count against the
-same `MAX_JSON_DEPTH = 256` and raises `54001`. A `jsonpath` is literal-only (no storable column,
+filters (`@ ? (@ ? (…))`), parenthesized groups, `!(…)`, long `&&` / `||` and arithmetic chains
+(which build a left-deep tree), unary operators, and subscripts inside subscripts all recurse when
+compiled, rendered, and evaluated. The compiler counts nesting the way the SQL parser does
+([cost.md §7](cost.md)): **+1** for each filter `?(`, each parenthesized group, each `!`, each
+`&&` / `||` or binary arithmetic step, each unary operator, and each subscript list. It checks the
+count against the same `MAX_JSON_DEPTH = 256` and raises `54001`, for the path's canonical text as
+well as its source ([jsonpath.md](jsonpath.md) §8). A `jsonpath` is literal-only (no storable column,
 §7), so the compiler is its only producer. Evaluating a path walks its steps **iteratively**, not
 recursively by document depth, so a deep document needs no extra guard there.
 

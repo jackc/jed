@@ -1,19 +1,29 @@
 // The `jsonpath` type's compiler, canonical renderer, and evaluator (spec/design/jsonpath.md).
 //
-// The compiled surface: lax/strict mode; a path primary (`$`, `@` inside a filter, or a scalar
-// literal) followed by accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, numeric / `last`
-// indices, `to` slices, `?(filter)`, and the item methods of §3.1); a top-level comparison
-// predicate. Still deferred (a valid-PG path using one → `0A000` at compile): arithmetic,
-// `like_regex` / `starts with` / `is unknown` / `exists` predicates, `$name` variables, non-literal
-// subscripts, `.**`, and the datetime methods. A malformed path is `42601`. The compiled program is a
-// pure function of the source — kept byte-identical cross-core by the conformance suite (CLAUDE.md
-// §5: a hand-written parser, never codegenned).
+// The compiled surface: lax/strict mode; a primary (`$`, `@` inside a filter, a scalar literal,
+// `last` inside a subscript, or a parenthesized expression or predicate) followed by accessor steps
+// (`.key`, `.*`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the item
+// methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
+// Still deferred (a valid-PG path using one → `0A000` at compile): `like_regex` / `starts with` /
+// `is unknown` / `exists` predicates, `$name` variables, `.**`, and the datetime methods. A
+// malformed path is `42601`. The compiled program is a pure function of the source — kept
+// byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
+// codegenned).
 //
 // This is a port of impl/rust/src/jsonpath.rs. The Rust parser walks bytes; this one walks JS string
 // characters, which is equivalent for the ASCII grammar (keywords, digits, punctuation); quoted
 // strings copy their characters verbatim. Byte lengths (the `.keyvalue()` layout) use utf8Length.
 
-import { Decimal, EXP_LIMIT, MAX_PRECISION, decimalFromParts, workLinear } from "./decimal.ts";
+import {
+  Decimal,
+  EXP_LIMIT,
+  MAX_PRECISION,
+  decimalFromParts,
+  workDiv,
+  workLinear,
+  workMod,
+  workMul,
+} from "./decimal.ts";
 import { EngineError, engineError } from "./errors.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
@@ -31,9 +41,12 @@ import {
 } from "./json.ts";
 import { parseDecimalLiteral, parseFloatLiteral, parseIntLiteral, trimLit } from "./kernels.ts";
 
-// A subscript index: an integer literal (as written — evaluation rejects one outside the integer
-// range) or the `last` sentinel.
-export type Index = { kind: "number"; value: Decimal } | { kind: "last" };
+// A subscript index: a number literal (as written — evaluation truncates it and rejects one outside
+// the integer range), the `last` sentinel, or any other expression (§3.2).
+export type Index =
+  | { kind: "number"; value: Decimal }
+  | { kind: "last" }
+  | { kind: "expr"; expr: PathExpr };
 
 // One subscript: a single index or an `i to j` slice.
 export type Subscript = { kind: "index"; index: Index } | { kind: "slice"; from: Index; to: Index };
@@ -81,13 +94,49 @@ export type Step =
   | { kind: "filter"; pred: Pred } // `?(predicate)` — a filter (§4).
   | { kind: "method"; method: Method }; // `.name(…)` — an item method (§3.1).
 
-// Where a path starts: `$` (the context item), `@` (the item a filter is testing), or a scalar
-// literal.
-export type Primary = { kind: "root" } | { kind: "current" } | { kind: "lit"; node: JsonNode };
+// Where a path starts: `$` (the context item), `@` (the item a filter is testing), a scalar literal,
+// `last` (the innermost subscripted array's last index — subscript expressions only), unary
+// arithmetic over each item of an operand, binary arithmetic over two singleton numbers (§3.2), or
+// `(predicate)` followed by accessors (its truth value as an item: true, false, or null when unknown).
+export type Primary =
+  | { kind: "root" }
+  | { kind: "current" }
+  | { kind: "lit"; node: JsonNode }
+  | { kind: "last" }
+  | { kind: "unary"; op: UnaryOp; arg: PathExpr }
+  | { kind: "binary"; op: ArithOp; l: PathExpr; r: PathExpr }
+  | { kind: "pred"; pred: Pred };
 
-// A path primary followed by accessor steps — the top-level path body and every comparison operand.
-// A literal primary with no steps is a plain literal operand.
+// A unary arithmetic operator.
+export type UnaryOp = "+" | "-";
+
+// A binary arithmetic operator, as written and as PostgreSQL names it in an error message.
+export type ArithOp = "+" | "-" | "*" | "/" | "%";
+
+// arithPriority is PostgreSQL's operationPriority: `+ -` bind looser than `* / %`.
+function arithPriority(op: ArithOp): number {
+  return op === "+" || op === "-" ? 3 : 4;
+}
+
+// A primary followed by accessor steps — the top-level path body, every comparison operand, and
+// every arithmetic operand. A literal primary with no steps is a plain literal operand.
 export type PathExpr = { primary: Primary; steps: Step[] };
+
+// A parsed operand: an expression or a predicate — PostgreSQL's expr_or_predicate. A parenthesized
+// predicate is an expression only when accessors follow it.
+type Parsed = { kind: "expr"; expr: PathExpr } | { kind: "pred"; pred: Pred };
+
+// needExpr requires an expression where the grammar takes one (42601 for a bare predicate).
+function needExpr(p: Parsed): PathExpr {
+  if (p.kind !== "expr") throw malformed("expected an expression, not a predicate");
+  return p.expr;
+}
+
+// needPred requires a predicate where the grammar takes one (42601 for an expression).
+function needPred(p: Parsed): Pred {
+  if (p.kind !== "pred") throw malformed("expected a predicate");
+  return p.pred;
+}
 
 // A filter predicate (jsonpath.md §4, the comparison subset). 3-valued — `not`/`and`/`or` follow
 // SQL/JSON's Kleene logic, but a filter keeps an item only when the predicate is definitely TRUE.
@@ -238,17 +287,21 @@ class Parser {
   private readonly s: string;
   private i: number;
   // depth: the program nesting depth (spec/design/json.md §6.4) — +1 per filter `?(`, parenthesized
-  // group, `!`, and `&&`/`||` chain step, bounded by MAX_JSON_DEPTH → 54001. Bounding it at the
-  // compiler bounds every derived walk (render, evaluate).
+  // group, `!`, `&&`/`||` chain step, arithmetic operator, and subscript list, bounded by
+  // MAX_JSON_DEPTH → 54001. Bounding it at the compiler bounds every derived walk (render,
+  // evaluate).
   private depth: number;
   // inFilter: how many filters enclose the cursor — `@` is valid only inside one.
   private inFilter: number;
+  // inSubscript: how many subscripts enclose the cursor — `last` is valid only inside one.
+  private inSubscript: number;
 
   constructor(src: string) {
     this.s = src;
     this.i = 0;
     this.depth = 0;
     this.inFilter = 0;
+    this.inSubscript = 0;
   }
 
   // deepen descends one program nesting level, enforcing MAX_JSON_DEPTH (json.md §6.4). The caller
@@ -346,77 +399,42 @@ class Parser {
       this.eatKeyword("lax");
       strict = false;
     }
+    // The body is an expression (an accessor path, arithmetic) or a top-level predicate
+    // (`$.a == 1`, for jsonb_path_match / @@) — PostgreSQL's expr_or_predicate.
+    const body = this.parseOr();
     this.skipWs();
-    // A parenthesized top-level predicate — `($.a == 1)`, which is also the canonical render of a
-    // top-level predicate, so this round-trips render → compile. A parenthesized literal (`(1.5)`,
-    // the render of a number literal followed by a step) starts a path instead.
-    if (this.peek() === "(" && !this.parenLiteralAhead()) {
-      const pred = this.parsePred();
-      this.skipWs();
-      if (this.peek() !== undefined) {
-        throw malformed("unexpected trailing input in predicate");
-      }
-      return { strict, body: { kind: "predicate", pred } };
-    }
-    // Remember the body start: if the path turns out to be the LHS of a TOP-LEVEL predicate
-    // (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
-    const bodyStart = this.i;
-    const expr = this.parsePathExpr(true);
-    this.skipWs();
-    // After the path: a comparison / logical operator makes the whole thing a top-level predicate
-    // (re-parse from the body start as a predicate); arithmetic is a deferred follow-on.
-    const trailing = this.peek();
-    if (trailing === undefined) {
-      return { strict, body: { kind: "path", expr } };
-    }
-    if (
-      trailing === "=" ||
-      trailing === "<" ||
-      trailing === ">" ||
-      trailing === "!" ||
-      trailing === "&" ||
-      trailing === "|"
-    ) {
-      this.i = bodyStart;
-      const pred = this.parsePred();
-      this.skipWs();
-      if (this.peek() !== undefined) {
-        throw malformed("unexpected trailing input in predicate");
-      }
-      return { strict, body: { kind: "predicate", pred } };
-    }
-    if (
-      trailing === "+" ||
-      trailing === "-" ||
-      trailing === "*" ||
-      trailing === "/" ||
-      trailing === "%"
-    ) {
-      throw unsupported("path arithmetic");
-    }
-    // A trailing word predicate operator (`like_regex`, `starts with`) makes a top-level predicate
-    // too — deferred `0A000` (not malformed). Any other name is malformed.
-    if (this.wordAhead()) {
-      const word = this.scanWord();
-      if (keywordIs(word, "like_regex") || keywordIs(word, "starts")) {
-        throw unsupported("top-level predicate expressions");
-      }
-    }
-    throw malformed("unexpected trailing input in path");
+    if (this.peek() !== undefined) throw malformed("unexpected trailing input");
+    return body.kind === "expr"
+      ? { strict, body: { kind: "path", expr: body.expr } }
+      : { strict, body: { kind: "predicate", pred: body.pred } };
   }
 
-  // Parse a path primary and its accessor steps. `top` is the root expression, where `@` is not
-  // allowed (PostgreSQL: "@ is not allowed in root expressions").
-  private parsePathExpr(top: boolean): PathExpr {
+  // parsePostfix parses a primary and its accessor steps (PostgreSQL's accessor_expr). A
+  // parenthesized expression followed by accessors continues it (`($.a).b` is `$.a.b`,
+  // `(1 + 2).type()`); a parenthesized predicate followed by accessors yields its truth value; without
+  // accessors the parentheses only group.
+  private parsePostfix(): Parsed {
     this.skipWs();
-    const paren = this.tryParenLiteral();
-    if (paren !== null) {
-      return { primary: { kind: "lit", node: paren }, steps: this.parseSteps() };
+    if (this.eat("(")) {
+      this.deepen();
+      const inner = this.parseOr();
+      this.depth -= 1;
+      this.skipWs();
+      if (!this.eat(")")) throw malformed("expected `)`");
+      const steps = this.parseSteps();
+      if (steps.length === 0) return inner;
+      if (inner.kind === "pred") {
+        return { kind: "expr", expr: { primary: { kind: "pred", pred: inner.pred }, steps } };
+      }
+      inner.expr.steps.push(...steps);
+      return inner;
     }
     const c = this.peek();
     const next = this.peekAt(1);
     let primary: Primary;
-    if (c === "$") {
+    if (c === undefined) {
+      throw malformed("unexpected end of input");
+    } else if (c === "$") {
       this.i += 1;
       // `$name` / `$"name"` — a path variable — is a deferred follow-on (the `vars` surface).
       // PostgreSQL's unquoted variable name is a run of `other` characters (no escapes).
@@ -441,15 +459,6 @@ class Parser {
       throw malformed("a name is not an operand");
     } else if (isAsciiDigit(c) || (c === "." && isAsciiDigit(next))) {
       primary = { kind: "lit", node: this.parseNumber() };
-    } else if (c === "-" && (isAsciiDigit(next) || next === ".")) {
-      // A negative number. Followed by a step it is PostgreSQL's unary minus applied to the whole
-      // path (`-1.5.abs()` is `-(1.5.abs())`) — arithmetic, a deferred follow-on.
-      const node = this.parseNumber();
-      const steps = this.parseSteps();
-      if (steps.length > 0) throw unsupported("path arithmetic");
-      return { primary: { kind: "lit", node }, steps };
-    } else if (c === "-" || c === "+") {
-      throw unsupported("path arithmetic");
     } else if (this.wordAhead()) {
       // A name: one of the keywords that start an operand, or else not an operand at all.
       const word = this.scanWord();
@@ -460,69 +469,17 @@ class Parser {
       } else if (keywordIs(word, "null")) {
         primary = { kind: "lit", node: { kind: "null" } };
       } else if (keywordIs(word, "last")) {
-        throw malformed("LAST is allowed only in array subscripts");
+        if (this.inSubscript === 0) throw malformed("LAST is allowed only in array subscripts");
+        primary = { kind: "last" };
       } else if (keywordIs(word, "exists")) {
         throw unsupported("exists predicates");
       } else {
         throw malformed("a name is not an operand");
       }
-    } else if (top) {
-      // A parenthesized expression or another expression form — a deferred follow-on.
-      throw unsupported("expressions other than an accessor path");
     } else {
-      throw malformed("expected a comparison operand");
+      throw malformed("unexpected token");
     }
-    return { primary, steps: this.parseSteps() };
-  }
-
-  // tryLiteral parses a scalar literal: a string, a number, true, false, or null. `null` (cursor
-  // unmoved) if none starts here.
-  private tryLiteral(): JsonNode | null {
-    const start = this.i;
-    const c = this.peek();
-    let lit: JsonNode | null = null;
-    try {
-      if (c === '"') {
-        lit = { kind: "string", value: this.parseQuoted() };
-      } else if (isAsciiDigit(c) || c === "-" || c === ".") {
-        lit = this.parseNumber();
-      } else if (this.eatKeyword("true")) {
-        lit = { kind: "bool", value: true };
-      } else if (this.eatKeyword("false")) {
-        lit = { kind: "bool", value: false };
-      } else if (this.eatKeyword("null")) {
-        lit = { kind: "null" };
-      }
-    } catch (e) {
-      if (!(e instanceof EngineError)) throw e;
-      lit = null;
-    }
-    if (lit === null) this.i = start;
-    return lit;
-  }
-
-  // tryParenLiteral parses a parenthesized literal — `(1.5)`, PostgreSQL's render of a number
-  // literal followed by a step. `null` (cursor unmoved) if the parentheses hold anything else.
-  private tryParenLiteral(): JsonNode | null {
-    const start = this.i;
-    if (this.eat("(")) {
-      this.skipWs();
-      const lit = this.tryLiteral();
-      if (lit !== null) {
-        this.skipWs();
-        if (this.eat(")")) return lit;
-      }
-    }
-    this.i = start;
-    return null;
-  }
-
-  // parenLiteralAhead reports whether a parenthesized literal starts at the cursor.
-  private parenLiteralAhead(): boolean {
-    const start = this.i;
-    const found = this.tryParenLiteral() !== null;
-    this.i = start;
-    return found;
+    return { kind: "expr", expr: { primary, steps: this.parseSteps() } };
   }
 
   // Parse a number literal (PostgreSQL's jsonpath scanner: an integer, `1.5`, `1.`, `.5`, an
@@ -542,6 +499,9 @@ class Parser {
         const start = this.i;
         while (isAsciiDigit(this.peek())) this.i += 1;
         frac = this.s.slice(start, this.i);
+      } else if ((nc === "e" || nc === "E") && intPart !== "" && this.exponentAt(2)) {
+        // `1.e3` — an empty fraction, then an exponent.
+        this.i += 1;
       } else if (isAsciiAlpha(nc) || nc === "_") {
         throw junk();
       } else if (nc === "*" || nc === '"' || nc === "[" || nc === ".") {
@@ -577,6 +537,13 @@ class Parser {
     return { kind: "number", dec: Decimal.fromDigitsScale(neg, digits, scale).checkCap() };
   }
 
+  // exponentAt reports whether exponent digits (optionally signed) start k characters past the cursor.
+  private exponentAt(k: number): boolean {
+    let c = this.peekAt(k);
+    if (c === "+" || c === "-") c = this.peekAt(k + 1);
+    return isAsciiDigit(c);
+  }
+
   // Parse a sequence of accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, `?(filter)`,
   // `.method(…)`), stopping at the first non-accessor character (EOF, a comparison/logical operator,
   // `)`, etc).
@@ -591,6 +558,8 @@ class Parser {
         this.skipWs();
         const next = this.peek();
         if (this.eat("*")) {
+          // `.**` — the any-level accessor — is a deferred follow-on.
+          if (this.peek() === "*") throw unsupported("the .** accessor");
           steps.push({ kind: "wildcardMember" });
         } else if (next === '"') {
           steps.push({ kind: "member", key: this.parseQuoted() });
@@ -631,7 +600,7 @@ class Parser {
         }
         this.deepen();
         this.inFilter += 1;
-        const pred = this.parsePred();
+        const pred = needPred(this.parseOr());
         this.inFilter -= 1;
         this.depth -= 1;
         this.skipWs();
@@ -713,77 +682,80 @@ class Parser {
     return Decimal.fromDigitsScale(neg, digits, 0);
   }
 
-  // Parse a filter predicate (the comparison subset): `||` over `&&` over `!` / `(…)` / comparison.
-  private parsePred(): Pred {
+  // parseOr parses an expression or predicate: `||` over `&&` over `!` / comparison over arithmetic
+  // (PostgreSQL's jsonpath_gram.y precedence: `||`, `&&`, `!`, comparisons, `+ -`, `* / %`, unary
+  // `+ -`, accessors). `||` and `&&` take predicates.
+  private parseOr(): Parsed {
     let left = this.parseAnd();
     // Each `||` step deepens the left-deep tree by one level (json.md §6.4).
     let steps = 0;
     for (;;) {
       this.skipWs();
-      if (this.eatOp("||")) {
-        this.deepen();
-        steps += 1;
-        const right = this.parseAnd();
-        left = { kind: "or", a: left, b: right };
-      } else {
+      if (!this.eatOp("||")) {
         this.depth -= steps;
         return left;
       }
+      this.deepen();
+      steps += 1;
+      const a = needPred(left);
+      const b = needPred(this.parseAnd());
+      left = { kind: "pred", pred: { kind: "or", a, b } };
     }
   }
 
-  private parseAnd(): Pred {
+  private parseAnd(): Parsed {
     let left = this.parseNot();
     // Each `&&` step deepens the left-deep tree by one level (json.md §6.4).
     let steps = 0;
     for (;;) {
       this.skipWs();
-      if (this.eatOp("&&")) {
-        this.deepen();
-        steps += 1;
-        const right = this.parseNot();
-        left = { kind: "and", a: left, b: right };
-      } else {
+      if (!this.eatOp("&&")) {
         this.depth -= steps;
         return left;
       }
+      this.deepen();
+      steps += 1;
+      const a = needPred(left);
+      const b = needPred(this.parseNot());
+      left = { kind: "pred", pred: { kind: "and", a, b } };
     }
   }
 
-  private parseNot(): Pred {
+  // parseNot parses `!(predicate)` — the operand must be a parenthesized predicate.
+  private parseNot(): Parsed {
     this.skipWs();
-    if (this.eat("!")) {
+    if (this.peek() === "!" && this.peekAt(1) !== "=") {
+      this.i += 1;
       this.skipWs();
+      if (this.eatKeyword("exists")) throw unsupported("exists predicates");
       if (!this.eat("(")) {
         throw malformed("expected `(` after `!`");
       }
       this.deepen();
-      const inner = this.parsePred();
+      const inner = needPred(this.parseOr());
       this.depth -= 1;
       this.skipWs();
       if (!this.eat(")")) {
         throw malformed("expected `)` after `!(`");
       }
-      return { kind: "not", p: inner };
-    }
-    if (this.peek() === "(" && !this.parenLiteralAhead()) {
-      this.i += 1;
-      this.deepen();
-      const inner = this.parsePred();
-      this.depth -= 1;
-      this.skipWs();
-      if (!this.eat(")")) {
-        throw malformed("expected `)` in predicate");
-      }
-      return inner;
+      return { kind: "pred", pred: { kind: "not", p: inner } };
     }
     return this.parseComparison();
   }
 
-  // `operand cmp operand` — the only leaf predicate this slice (`exists` / `like_regex` /
-  // `starts with` / `is unknown` are a follow-on).
-  private parseComparison(): Pred {
-    const lhs = this.parsePathExpr(false);
+  // parseComparison parses `expr cmp expr`, or a lone expression or parenthesized predicate. The
+  // word predicates (`like_regex`, `starts with`, `is unknown`) are a deferred follow-on.
+  private parseComparison(): Parsed {
+    const left = this.parseAdditive();
+    if (left.kind === "pred") {
+      this.skipWs();
+      if (this.wordAhead()) {
+        const start = this.i;
+        if (keywordIs(this.scanWord(), "is")) throw unsupported("is unknown predicates");
+        this.i = start;
+      }
+      return left;
+    }
     this.skipWs();
     let op: CmpOp;
     if (this.eatOp("==")) {
@@ -798,22 +770,85 @@ class Parser {
       op = "lt";
     } else if (this.eat(">")) {
       op = "gt";
-    } else if (this.wordAhead()) {
-      // A word predicate operator is a deferred follow-on; any other name is malformed.
-      const word = this.scanWord();
-      if (keywordIs(word, "like_regex") || keywordIs(word, "starts")) {
-        throw unsupported("like_regex / starts with predicates");
-      }
-      throw malformed("expected a comparison operator");
     } else {
-      const c = this.peek();
-      if (c === "+" || c === "-" || c === "*" || c === "/" || c === "%") {
-        throw unsupported("path arithmetic");
+      // A word predicate operator is a deferred follow-on. The name is lexed first, so its escape
+      // error wins; any other name is trailing input.
+      if (this.wordAhead()) {
+        const start = this.i;
+        const word = this.scanWord();
+        if (keywordIs(word, "like_regex") || keywordIs(word, "starts")) {
+          throw unsupported("predicates other than a comparison (like_regex / starts with)");
+        }
+        this.i = start;
       }
-      throw malformed("expected a comparison operator");
+      return left;
     }
-    const rhs = this.parsePathExpr(false);
-    return { kind: "compare", lhs, op, rhs };
+    const rhs = needExpr(this.parseAdditive());
+    return { kind: "pred", pred: { kind: "compare", lhs: left.expr, op, rhs } };
+  }
+
+  // parseAdditive parses `+` and `-`, left-associative.
+  private parseAdditive(): Parsed {
+    let left = this.parseMultiplicative();
+    // Each operator deepens the left-deep tree by one level (json.md §6.4).
+    let steps = 0;
+    for (;;) {
+      this.skipWs();
+      const c = this.peek();
+      if (c !== "+" && c !== "-") {
+        this.depth -= steps;
+        return left;
+      }
+      this.i += 1;
+      this.deepen();
+      steps += 1;
+      const l = needExpr(left);
+      const r = needExpr(this.parseMultiplicative());
+      left = { kind: "expr", expr: { primary: { kind: "binary", op: c, l, r }, steps: [] } };
+    }
+  }
+
+  // parseMultiplicative parses `*`, `/`, and `%`, left-associative.
+  private parseMultiplicative(): Parsed {
+    let left = this.parseUnary();
+    let steps = 0;
+    for (;;) {
+      this.skipWs();
+      const c = this.peek();
+      if (c !== "*" && c !== "/" && c !== "%") {
+        this.depth -= steps;
+        return left;
+      }
+      this.i += 1;
+      this.deepen();
+      steps += 1;
+      const l = needExpr(left);
+      const r = needExpr(this.parseUnary());
+      left = { kind: "expr", expr: { primary: { kind: "binary", op: c, l, r }, steps: [] } };
+    }
+  }
+
+  // parseUnary parses unary `+` / `-`, which bind tighter than the binary operators but looser than
+  // accessors (`-$.a * 2` is `(-($.a)) * 2`). Applied to a number literal they fold into it (`-1`),
+  // as PostgreSQL's grammar does.
+  private parseUnary(): Parsed {
+    this.skipWs();
+    const op = this.peek();
+    if (op !== "+" && op !== "-") return this.parsePostfix();
+    this.i += 1;
+    this.deepen();
+    const arg = needExpr(this.parseUnary());
+    this.depth -= 1;
+    if (
+      arg.primary.kind === "lit" &&
+      arg.primary.node.kind === "number" &&
+      arg.steps.length === 0
+    ) {
+      if (op === "+") return { kind: "expr", expr: arg };
+      const node: JsonNode = { kind: "number", dec: arg.primary.node.dec.negate() };
+      return { kind: "expr", expr: { primary: { kind: "lit", node }, steps: [] } };
+    }
+    return { kind: "expr", expr: { primary: { kind: "unary", op, arg }, steps: [] } };
   }
 
   // Consume a multi-character operator token if it appears at the cursor.
@@ -923,16 +958,17 @@ class Parser {
   }
 
   // Parse a `[…]` subscript list (the opening `[` consumed, not the wildcard form). Each subscript
-  // is `index` or `index to index`; `index` is a number or `last`. Anything else → `0A000`.
+  // is `index` or `index to index`, an index any expression (`1`, `last - 1`, `$.i`), in which
+  // `last` is allowed.
   private parseSubscripts(): Subscript[] {
     const subs: Subscript[] = [];
+    this.deepen();
+    this.inSubscript += 1;
     for (;;) {
-      this.skipWs();
       const a = this.parseIndex();
       this.skipWs();
       let sub: Subscript;
       if (this.eatKeyword("to")) {
-        this.skipWs();
         const b = this.parseIndex();
         this.skipWs();
         sub = { kind: "slice", from: a, to: b };
@@ -947,80 +983,120 @@ class Parser {
       }
       if (c === "]") {
         this.i += 1;
+        this.inSubscript -= 1;
+        this.depth -= 1;
         return subs;
       }
       throw malformed("expected `,` or `]` in subscript");
     }
   }
 
+  // parseIndex parses one subscript index: a number literal or `last` keeps its own form; anything
+  // else is an expression evaluated per array.
   private parseIndex(): Index {
-    if (this.eatKeyword("last")) {
-      return { kind: "last" };
-    }
-    const c = this.peek();
-    // A truncated path (no index where one is required) is malformed.
-    if (c === undefined) {
-      throw malformed("expected a subscript index");
-    }
-    // A name: a `true`/`false`/`null` literal starts an expression subscript (deferred); any other
-    // is not an expression.
-    if (this.wordAhead()) {
-      const word = this.scanWord();
-      if (keywordIs(word, "true") || keywordIs(word, "false") || keywordIs(word, "null")) {
-        throw unsupported("non-literal subscript expressions");
+    this.skipWs();
+    if (this.peek() === undefined) throw malformed("expected a subscript index");
+    const e = needExpr(this.parseAdditive());
+    if (e.steps.length === 0) {
+      if (e.primary.kind === "lit" && e.primary.node.kind === "number") {
+        return { kind: "number", value: e.primary.node.dec };
       }
-      throw malformed("expected a subscript index");
+      if (e.primary.kind === "last") return { kind: "last" };
     }
-    // A non-numeric token starts an expression subscript (`$.a`, arithmetic) — a deferred follow-on.
-    if (!(isAsciiDigit(c) || c === "-")) {
-      throw unsupported("non-literal subscript expressions");
-    }
-    const neg = this.eat("-");
-    const start = this.i;
-    while (isAsciiDigit(this.peek())) this.i += 1;
-    const digits = this.s.slice(start, this.i);
-    if (digits === "") {
-      throw malformed("expected digits after `-`");
-    }
-    if (digits.length > 1 && digits.startsWith("0")) {
-      throw malformed("trailing junk after numeric literal");
-    }
-    return { kind: "number", value: Decimal.fromDigitsScale(neg, digits, 0) };
+    return { kind: "expr", expr: e };
   }
 }
 
 // compile compiles a jsonpath source string. Malformed → `42601`; a valid-PG but unsupported
 // construct → `0A000`.
 export function compile(src: string): JsonPath {
-  return new Parser(src).compile();
+  const path = new Parser(src).compile();
+  // A path is evaluated from its canonical text, whose parenthesization can nest deeper than the
+  // source (`1 + 1 + 1` renders `((1 + 1) + 1)`), so that text must compile too (§8).
+  new Parser(render(path)).compile();
+  return path;
 }
 
-// render is the canonical render (spec/design/jsonpath.md §2): `strict` kept / `lax` omitted; member
-// keys quoted; `[*]`, `[i]`, `[i to j]` subscripts; methods lowercase; matches PostgreSQL's
-// `jsonpath_out`.
+// render is the canonical render (spec/design/jsonpath.md §2.2): `strict` kept / `lax` omitted;
+// member keys quoted; `[*]`, `[i]`, `[i to j]` subscripts; methods lowercase; operators spaced and
+// parenthesized by PostgreSQL's `jsonpath_out` rules. The top level parenthesizes an operator
+// (`($."a" + 1)`, `($."a" == 1)`), as PostgreSQL prints it.
 export function render(jp: JsonPath): string {
   const out = jp.strict ? "strict " : "";
   if (jp.body.kind === "path") {
-    return out + writePathExpr(jp.body.expr);
+    return out + writeExpr(jp.body.expr, true);
   }
-  // A top-level predicate renders parenthesized (PG's `jsonpath_out`): `($."a" == 1)`.
-  return out + "(" + writePred(jp.body.pred) + ")";
+  return out + writePred(jp.body.pred, true);
 }
 
-// writePathExpr renders a path primary and its steps. A number literal followed by a step is
-// parenthesized (`(1.5).type()`), as PostgreSQL prints it.
-function writePathExpr(e: PathExpr): string {
-  let out: string;
+// exprPriority is PostgreSQL's operationPriority of an expression's head: `||` 0, `&&` 1,
+// comparisons 2, `+ -` 3, `* / %` 4, unary `+ -` 5, anything else 6.
+function exprPriority(e: PathExpr): number {
   switch (e.primary.kind) {
+    case "unary":
+      return 5;
+    case "binary":
+      return arithPriority(e.primary.op);
+    case "pred":
+      return predPriority(e.primary.pred);
+    default:
+      return 6;
+  }
+}
+
+function predPriority(pred: Pred): number {
+  switch (pred.kind) {
+    case "or":
+      return 0;
+    case "and":
+      return 1;
+    case "compare":
+      return 2;
+    default:
+      return 6;
+  }
+}
+
+// writeExpr renders an expression — PostgreSQL's printJsonPathItem. An operator is parenthesized
+// when brackets is set: at the top level, and for an operand that binds no tighter than its parent
+// (`((1 + 2) + 3)`, `(1 - (2 - 3))`). jed also parenthesizes an operator followed by accessors,
+// which PostgreSQL prints bare in an operand (`$."a" + 1.type()`), a text that does not read back as
+// the same path (§2.2). A number literal followed by a step is parenthesized (`(1.5).type()`).
+function writeExpr(e: PathExpr, brackets: boolean): string {
+  const wrap = brackets || e.steps.length > 0;
+  const p = e.primary;
+  let out: string;
+  switch (p.kind) {
     case "root":
       out = "$";
       break;
     case "current":
       out = "@";
       break;
+    case "last":
+      out = "last";
+      break;
     case "lit":
-      out = jsonCompactOut(e.primary.node);
-      if (e.primary.node.kind === "number" && e.steps.length > 0) out = "(" + out + ")";
+      out = jsonCompactOut(p.node);
+      if (p.node.kind === "number" && e.steps.length > 0) out = "(" + out + ")";
+      break;
+    case "unary":
+      out = p.op + writeExpr(p.arg, exprPriority(p.arg) <= 5);
+      if (wrap) out = "(" + out + ")";
+      break;
+    case "binary": {
+      const prio = arithPriority(p.op);
+      out =
+        writeExpr(p.l, exprPriority(p.l) <= prio) +
+        " " +
+        p.op +
+        " " +
+        writeExpr(p.r, exprPriority(p.r) <= prio);
+      if (wrap) out = "(" + out + ")";
+      break;
+    }
+    case "pred":
+      out = writePred(p.pred, wrap);
       break;
   }
   return out + writeSteps(e.steps);
@@ -1061,7 +1137,7 @@ function writeSteps(steps: Step[]): string {
       }
       case "filter":
         out += "?(";
-        out += writePred(step.pred);
+        out += writePred(step.pred, false);
         out += ")";
         break;
       case "method":
@@ -1075,19 +1151,32 @@ function writeSteps(steps: Step[]): string {
   return out;
 }
 
-// writePred renders a filter predicate (PG's `?(…)` form: `&&`/`||` spaced, `!(…)`, `a op b`
-// spaced). Port of impl/rust/src/jsonpath.rs `write_pred`.
-function writePred(pred: Pred): string {
+// writePred renders a predicate (PostgreSQL's form: `&&`/`||` and `a op b` spaced, `!(…)`),
+// parenthesized when brackets is set and its operands by priority, like writeExpr.
+function writePred(pred: Pred, brackets: boolean): string {
+  let out: string;
   switch (pred.kind) {
     case "or":
-      return writePred(pred.a) + " || " + writePred(pred.b);
-    case "and":
-      return writePred(pred.a) + " && " + writePred(pred.b);
+    case "and": {
+      const prio = predPriority(pred);
+      out =
+        writePred(pred.a, predPriority(pred.a) <= prio) +
+        (pred.kind === "or" ? " || " : " && ") +
+        writePred(pred.b, predPriority(pred.b) <= prio);
+      break;
+    }
     case "not":
-      return "!(" + writePred(pred.p) + ")";
+      return "!(" + writePred(pred.p, false) + ")";
     case "compare":
-      return writePathExpr(pred.lhs) + " " + cmpOpSymbol(pred.op) + " " + writePathExpr(pred.rhs);
+      out =
+        writeExpr(pred.lhs, exprPriority(pred.lhs) <= 2) +
+        " " +
+        cmpOpSymbol(pred.op) +
+        " " +
+        writeExpr(pred.rhs, exprPriority(pred.rhs) <= 2);
+      break;
   }
+  return brackets ? "(" + out + ")" : out;
 }
 
 function cmpOpSymbol(op: CmpOp): string {
@@ -1108,7 +1197,14 @@ function cmpOpSymbol(op: CmpOp): string {
 }
 
 function writeIndex(i: Index): string {
-  return i.kind === "number" ? i.value.render() : "last";
+  switch (i.kind) {
+    case "number":
+      return i.value.render();
+    case "last":
+      return "last";
+    case "expr":
+      return writeExpr(i.expr, false);
+  }
 }
 
 // writeQuoted renders a member key as a canonical jsonpath quoted string — PostgreSQL's escape_json:
@@ -1161,7 +1257,9 @@ export interface EvalOpts {
 export function compileMetered(src: string, m: Meter): JsonPath {
   m.charge(COSTS.jsonpathCompile * BigInt(utf8Length(src)));
   m.guard();
-  return compile(src);
+  // The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
+  // compile at resolve.
+  return new Parser(src).compile();
 }
 
 // evalPath evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
@@ -1210,17 +1308,16 @@ function evalItems(path: JsonPath, ctx: JsonNode, opts: EvalOpts, m: Meter, out:
   if (path.body.kind === "predicate") {
     // A top-level predicate → a single item: its truth value as a boolean, or JSON null when unknown
     // (§4.4).
-    const truth = evalPred(cx, path.body.pred, { kind: "doc", node: ctx }, ROOT_BASE);
+    const truth = evalPred(cx, path.body.pred, { kind: "doc", node: ctx }, ROOT_BASE, null);
     out.push({
       kind: "val",
       node: truth === null ? { kind: "null" } : { kind: "bool", value: truth },
     });
     return;
   }
-  const e = path.body.expr;
-  const seed: Item =
-    e.primary.kind === "lit" ? { kind: "val", node: e.primary.node } : { kind: "doc", node: ctx };
-  runPath(cx, e.steps, seed, ROOT_BASE, opts.exists && !path.strict, out);
+  // `@` is not allowed outside a filter, so the root expression's current item is unused.
+  const current: Item = { kind: "doc", node: ctx };
+  runExpr(cx, path.body.expr, current, ROOT_BASE, null, opts.exists && !path.strict, out);
 }
 
 // One item of the SQL/JSON sequence: a node of the context document, a scalar the evaluation
@@ -1310,10 +1407,34 @@ interface Frame {
   to: number | null;
   // The .keyvalue() id of this frame's object.
   kvId: bigint;
+  // The size of the innermost array being subscripted, which `last` refers to (in a filter of this
+  // step) — set by an enclosing subscript step, for as long as its outputs' continuations run, as in
+  // PostgreSQL.
+  last: number | null;
+  // A subscript step's array size: its own outputs' `last`.
+  size: number;
 }
 
-function newFrame(step: number, item: Item, base: Base, unwrap: boolean): Frame {
-  return { step, item, base, unwrap, started: false, a: 0, b: 0, to: null, kvId: 0n };
+function newFrame(
+  step: number,
+  item: Item,
+  base: Base,
+  unwrap: boolean,
+  last: number | null,
+): Frame {
+  return {
+    step,
+    item,
+    base,
+    unwrap,
+    started: false,
+    a: 0,
+    b: 0,
+    to: null,
+    kvId: 0n,
+    last,
+    size: 0,
+  };
 }
 
 // What a frame produces next: an item for the following step (or the result) with its
@@ -1325,32 +1446,47 @@ type Out =
 
 const DONE: Out = { kind: "done" };
 
-// runPath runs steps over seed depth-first with an explicit stack (no native recursion per step),
-// appending each final item to out. stopAtFirst ends the run at the first final item.
-function runPath(
+// runExpr runs an expression depth-first (§3): its head produces items one at a time (§3.2), and each
+// runs through the accessor steps on an explicit stack (no native recursion per step) before the head
+// produces the next. `current` is the item `@` names and `last` the size of the innermost array being
+// subscripted. Each final item is appended to out; stopAtFirst ends the run at the first one —
+// PostgreSQL's lax existence test, which also lets a unary operator skip a non-number.
+function runExpr(
   cx: Ctx,
-  steps: Step[],
-  seed: Item,
+  e: PathExpr,
+  current: Item,
   base: Base,
+  last: number | null,
   stopAtFirst: boolean,
   out: Item[],
 ): void {
-  if (steps.length === 0) {
-    out.push(seed);
-    return;
-  }
+  const steps = e.steps;
   const unwrap = !cx.strict;
-  const stack: Frame[] = [newFrame(0, seed, base, unwrap)];
-  while (stack.length > 0) {
-    const top = stack[stack.length - 1]!;
-    const o = nextOut(cx, steps, top);
+  const head: Head = { started: false, items: [], at: 0 };
+  const stack: Frame[] = [];
+  for (;;) {
+    const top = stack[stack.length - 1];
+    if (top === undefined) {
+      const h = headNext(cx, e, head, current, base, last, stopAtFirst);
+      if (h === null) return;
+      if (steps.length === 0) {
+        out.push(h.item);
+        if (stopAtFirst) return;
+      } else {
+        stack.push(newFrame(0, h.item, h.base, unwrap, last));
+      }
+      continue;
+    }
+    const o = nextOut(cx, steps, current, top);
     if (o.kind === "item") {
       const next = top.step + 1;
       if (next === steps.length) {
         out.push(o.item);
         if (stopAtFirst) return;
       } else {
-        stack.push(newFrame(next, o.item, o.base, unwrap));
+        // A subscript step's outputs run their continuations with `last` naming its array.
+        const childLast = steps[top.step]!.kind === "subscripts" ? top.size : top.last;
+        stack.push(newFrame(next, o.item, o.base, unwrap, childLast));
       }
     } else if (o.kind === "sub") {
       stack.push(o.frame);
@@ -1358,6 +1494,172 @@ function runPath(
       stack.pop();
     }
   }
+}
+
+// The state of an expression's head: whether it has started, and a unary operator's operand items
+// with the next one's position.
+interface Head {
+  started: boolean;
+  items: Item[];
+  at: number;
+}
+
+// headNext produces the next item of an expression's head (`$`, `@`, a literal, `last`, an operator,
+// or a parenthesized predicate), with the base its continuation runs under; null when there is none.
+function headNext(
+  cx: Ctx,
+  e: PathExpr,
+  head: Head,
+  current: Item,
+  base: Base,
+  last: number | null,
+  stopAtFirst: boolean,
+): { item: Item; base: Base } | null {
+  const p = e.primary;
+  if (p.kind === "unary") {
+    // Each item of the operand (lax: an array item unwrapped one level) must be a number: one
+    // application each, one emitted item for each number. A lax existence test with nothing after
+    // the operator skips a non-number, as PostgreSQL does.
+    if (!head.started) {
+      head.started = true;
+      head.items = evalSeq(cx, p.arg, current, base, last, true);
+    }
+    while (head.at < head.items.length) {
+      const item = head.items[head.at]!;
+      head.at += 1;
+      charge(cx, 1);
+      const n = scalarNode(item);
+      if (n === null || n.kind !== "number") {
+        if (stopAtFirst && e.steps.length === 0) continue;
+        throw engineError(
+          "sql_json_number_not_found",
+          `operand of unary jsonpath operator ${p.op} is not a numeric value`,
+        );
+      }
+      charge(cx, 1);
+      if (p.op === "+") return { item, base };
+      return { item: numberItem(n.dec.negate()), base };
+    }
+    return null;
+  }
+  if (head.started) return null;
+  head.started = true;
+  switch (p.kind) {
+    case "root":
+      return { item: { kind: "doc", node: cx.root }, base: ROOT_BASE };
+    case "current":
+      return { item: current, base };
+    case "lit":
+      return { item: { kind: "val", node: p.node }, base };
+    case "last":
+      return { item: numberItem(Decimal.fromBigInt(BigInt((last ?? 0) - 1))), base };
+    case "binary":
+      return { item: evalBinary(cx, p.op, p.l, p.r, current, base, last), base };
+    case "pred": {
+      // `(predicate)` followed by accessors: the truth value as an item (JSON null for unknown).
+      const truth = evalPred(cx, p.pred, current, base, last);
+      return {
+        item: {
+          kind: "val",
+          node: truth === null ? { kind: "null" } : { kind: "bool", value: truth },
+        },
+        base,
+      };
+    }
+  }
+}
+
+// evalSeq evaluates an expression to its whole item sequence. With unwrap in lax mode an array item
+// is unwrapped one level (§4.1 rule 4) — free: it only changes which items the caller sees.
+function evalSeq(
+  cx: Ctx,
+  e: PathExpr,
+  current: Item,
+  base: Base,
+  last: number | null,
+  unwrap: boolean,
+): Item[] {
+  const seq: Item[] = [];
+  runExpr(cx, e, current, base, last, false, seq);
+  if (cx.strict || !unwrap) return seq;
+  const out: Item[] = [];
+  for (const item of seq) {
+    const elems = docArray(item);
+    if (elems === null) {
+      out.push(item);
+    } else {
+      for (const node of elems) out.push({ kind: "doc", node });
+    }
+  }
+  return out;
+}
+
+// evalBinary is `l op r` (§3.2): both operands are evaluated (lax unwraps an array item one level),
+// then each must be a single number (22038). One application, the size-scaled decimal_work of the SQL
+// operator, and one emitted item; the arithmetic is decimal's, so `/` takes PostgreSQL's
+// select_div_scale and a zero divisor raises 22012.
+function evalBinary(
+  cx: Ctx,
+  op: ArithOp,
+  l: PathExpr,
+  r: PathExpr,
+  current: Item,
+  base: Base,
+  last: number | null,
+): Item {
+  const ls = evalSeq(cx, l, current, base, last, true);
+  const rs = evalSeq(cx, r, current, base, last, true);
+  charge(cx, 1);
+  const single = (seq: Item[], side: string): Decimal => {
+    const n = seq.length === 1 ? scalarNode(seq[0]!) : null;
+    if (n === null || n.kind !== "number") {
+      throw engineError(
+        "singleton_sql_json_item_required",
+        `${side} operand of jsonpath operator ${op} is not a single numeric value`,
+      );
+    }
+    return n.dec;
+  };
+  const a = single(ls, "left");
+  const b = single(rs, "right");
+  let work: number;
+  switch (op) {
+    case "+":
+    case "-":
+      work = workLinear(a, b);
+      break;
+    case "*":
+      work = workMul(a, b);
+      break;
+    case "/":
+      work = workDiv(a, b);
+      break;
+    case "%":
+      work = workMod(a, b);
+      break;
+  }
+  cx.m.charge(COSTS.decimalWork * BigInt(work - 1));
+  cx.m.guard();
+  let v: Decimal;
+  switch (op) {
+    case "+":
+      v = a.add(b);
+      break;
+    case "-":
+      v = a.sub(b);
+      break;
+    case "*":
+      v = a.mul(b);
+      break;
+    case "/":
+      v = a.div(b);
+      break;
+    case "%":
+      v = a.rem(b);
+      break;
+  }
+  charge(cx, 1);
+  return numberItem(v);
 }
 
 // unwraps reports whether lax mode unwraps an array before applying this step (§4.1 rule 1). The
@@ -1376,7 +1678,7 @@ function unwraps(step: Step): boolean {
 }
 
 // nextOut produces a frame's next output, charging its step application and each emitted item (§7).
-function nextOut(cx: Ctx, steps: Step[], f: Frame): Out {
+function nextOut(cx: Ctx, steps: Step[], current: Item, f: Frame): Out {
   const step = steps[f.step]!;
   const unwrapped = f.unwrap && unwraps(step) ? docArray(f.item) : null;
   if (unwrapped !== null) {
@@ -1385,7 +1687,10 @@ function nextOut(cx: Ctx, steps: Step[], f: Frame): Out {
     if (f.a < unwrapped.length) {
       const e = unwrapped[f.a]!;
       f.a += 1;
-      return { kind: "sub", frame: newFrame(f.step, { kind: "doc", node: e }, f.base, false) };
+      return {
+        kind: "sub",
+        frame: newFrame(f.step, { kind: "doc", node: e }, f.base, false, f.last),
+      };
     }
     return DONE;
   }
@@ -1437,11 +1742,12 @@ function nextOut(cx: Ctx, steps: Step[], f: Frame): Out {
       // A non-array is a singleton array in lax (§4.1 rule 2).
       const array = docArray(f.item);
       const size = array === null ? 1 : array.length;
+      f.size = size;
       while (child === null) {
         if (f.to === null) {
           const sub = step.subs[f.a];
           if (sub === undefined) return DONE;
-          const [from, to] = subscriptRange(sub, size, strict);
+          const [from, to] = subscriptRange(cx, sub, size, current, f.base);
           f.to = to;
           f.b = from;
         }
@@ -1485,7 +1791,7 @@ function nextOut(cx: Ctx, steps: Step[], f: Frame): Out {
       if (f.started) return DONE;
       f.started = true;
       charge(cx, 1);
-      if (evalPred(cx, step.pred, f.item, f.base) === true) child = f.item;
+      if (evalPred(cx, step.pred, f.item, f.base, f.last) === true) child = f.item;
       break;
     }
     case "method": {
@@ -1585,52 +1891,87 @@ function memberOf(cx: Ctx, item: Item, key: string): Item | null {
 }
 
 // subscriptRange resolves one subscript against an array of size elements → its inclusive
-// [from, to] range, clamped. An index outside the integer range raises in both modes; strict raises
-// on an out-of-bounds or reversed range, which lax just leaves (partly) empty.
-function subscriptRange(sub: Subscript, size: number, strict: boolean): [number, number] {
-  const resolve = (i: Index): number => {
-    if (i.kind === "last") return size - 1;
-    const v = i.value.toBigIntRound();
-    if (v === null || v < -2147483648n || v > 2147483647n) {
-      throw engineError(
-        "invalid_sql_json_subscript",
-        "jsonpath array subscript is out of integer range",
-      );
-    }
-    return Number(v);
-  };
-  const from = sub.kind === "index" ? resolve(sub.index) : resolve(sub.from);
-  const to = sub.kind === "index" ? from : resolve(sub.to);
-  if (strict && (from < 0 || from > to || to >= size)) {
+// [from, to] range, clamped. An index is truncated toward zero; one outside the integer range raises
+// in both modes, and strict raises on an out-of-bounds or reversed range, which lax just leaves
+// (partly) empty. A non-literal index (`last - 1`, `$.i`) is evaluated with `last` naming this array
+// and must be a single number (22033).
+function subscriptRange(
+  cx: Ctx,
+  sub: Subscript,
+  size: number,
+  current: Item,
+  base: Base,
+): [number, number] {
+  const from = indexValue(cx, sub.kind === "index" ? sub.index : sub.from, size, current, base);
+  const to = sub.kind === "index" ? from : indexValue(cx, sub.to, size, current, base);
+  if (cx.strict && (from < 0 || from > to || to >= size)) {
     throw engineError("invalid_sql_json_subscript", "jsonpath array subscript is out of bounds");
   }
   return [Math.max(from, 0), Math.min(to, size - 1)];
 }
 
+// indexValue is one subscript index's value (PostgreSQL's getArrayIndex).
+function indexValue(cx: Ctx, i: Index, size: number, current: Item, base: Base): number {
+  let n: Decimal;
+  switch (i.kind) {
+    case "last":
+      return size - 1;
+    case "number":
+      n = i.value;
+      break;
+    case "expr": {
+      const seq = evalSeq(cx, i.expr, current, base, size, false);
+      const node = seq.length === 1 ? scalarNode(seq[0]!) : null;
+      if (node === null || node.kind !== "number") {
+        throw engineError(
+          "invalid_sql_json_subscript",
+          "jsonpath array subscript is not a single numeric value",
+        );
+      }
+      n = node.dec;
+      break;
+    }
+  }
+  const v = n.truncPlaces(0).toBigIntRound();
+  if (v === null || v < -2147483648n || v > 2147483647n) {
+    throw engineError(
+      "invalid_sql_json_subscript",
+      "jsonpath array subscript is out of integer range",
+    );
+  }
+  return Number(v);
+}
+
 // evalPred evaluates a filter predicate to a Kleene truth value (`true`/`false`/`null` = unknown).
 // Both operands of &&/|| are always evaluated (no short-circuit), so their cost is fixed (§7).
-function evalPred(cx: Ctx, pred: Pred, current: Item, base: Base): boolean | null {
+function evalPred(
+  cx: Ctx,
+  pred: Pred,
+  current: Item,
+  base: Base,
+  last: number | null,
+): boolean | null {
   switch (pred.kind) {
     case "or": {
-      const x = evalPred(cx, pred.a, current, base);
-      const y = evalPred(cx, pred.b, current, base);
+      const x = evalPred(cx, pred.a, current, base, last);
+      const y = evalPred(cx, pred.b, current, base, last);
       if (x === true || y === true) return true;
       if (x === false && y === false) return false;
       return null;
     }
     case "and": {
-      const x = evalPred(cx, pred.a, current, base);
-      const y = evalPred(cx, pred.b, current, base);
+      const x = evalPred(cx, pred.a, current, base, last);
+      const y = evalPred(cx, pred.b, current, base, last);
       if (x === false || y === false) return false;
       if (x === true && y === true) return true;
       return null;
     }
     case "not": {
-      const x = evalPred(cx, pred.p, current, base);
+      const x = evalPred(cx, pred.p, current, base, last);
       return x === null ? null : !x;
     }
     case "compare":
-      return evalCompare(cx, pred.lhs, pred.op, pred.rhs, current, base);
+      return evalCompare(cx, pred.lhs, pred.op, pred.rhs, current, base, last);
   }
 }
 
@@ -1652,10 +1993,11 @@ function evalCompare(
   rhs: PathExpr,
   current: Item,
   base: Base,
+  last: number | null,
 ): boolean | null {
-  const ls = evalOperand(cx, lhs, current, base);
+  const ls = evalOperand(cx, lhs, current, base, last);
   if (ls === null) return null;
-  const rs = evalOperand(cx, rhs, current, base);
+  const rs = evalOperand(cx, rhs, current, base, last);
   if (rs === null) return null;
   const strict = cx.strict;
   let found = false;
@@ -1687,38 +2029,23 @@ function evalCompare(
   return anyUnknown ? null : false;
 }
 
-// evalOperand evaluates a comparison operand to its item sequence (a path, or a singleton literal).
-// `null` is a SQL/JSON error, which makes the comparison unknown rather than propagating (§4.2:
-// filter operands never raise). A cost, budget, or cancellation error still propagates (§7).
-function evalOperand(cx: Ctx, e: PathExpr, current: Item, base: Base): Item[] | null {
-  let seed = current;
-  let seedBase = base;
-  if (e.primary.kind === "root") {
-    seed = { kind: "doc", node: cx.root };
-    seedBase = ROOT_BASE;
-  } else if (e.primary.kind === "lit") {
-    seed = { kind: "val", node: e.primary.node };
-  }
-  const seq: Item[] = [];
+// evalOperand evaluates a comparison operand to its item sequence, an array item unwrapped one level
+// in lax (§4.1 rule 4). `null` is a SQL/JSON error, which makes the comparison unknown rather than
+// propagating (§4.2: filter operands never raise). A cost, budget, or cancellation error still
+// propagates (§7).
+function evalOperand(
+  cx: Ctx,
+  e: PathExpr,
+  current: Item,
+  base: Base,
+  last: number | null,
+): Item[] | null {
   try {
-    runPath(cx, e.steps, seed, seedBase, false, seq);
+    return evalSeq(cx, e, current, base, last, true);
   } catch (err) {
     if (isSoft(err)) return null;
     throw err;
   }
-  if (cx.strict) return seq;
-  // lax: an array-valued operand item is unwrapped ONE level, so the existential comparison ranges
-  // over its elements (§4.1 rule 4).
-  const out: Item[] = [];
-  for (const item of seq) {
-    const elems = docArray(item);
-    if (elems === null) {
-      out.push(item);
-    } else {
-      for (const node of elems) out.push({ kind: "doc", node });
-    }
-  }
-  return out;
 }
 
 // compareItems compares two items under a jsonpath operator (§4.4). Same-type scalars compare by

@@ -1,13 +1,14 @@
 //! The `jsonpath` type's compiler, canonical renderer, and evaluator (spec/design/jsonpath.md).
 //!
-//! The compiled surface: lax/strict mode; a path primary (`$`, `@` inside a filter, or a scalar
-//! literal) followed by accessor steps (`.key`, `.*`, `[subscripts]`, `[*]`, numeric / `last`
-//! indices, `to` slices, `?(filter)`, and the item methods of §3.1); a top-level comparison
-//! predicate. Still deferred (a valid-PG path using one → `0A000` at compile): arithmetic,
-//! `like_regex` / `starts with` / `is unknown` / `exists` predicates, `$name` variables,
-//! non-literal subscripts, `.**`, and the datetime methods. A malformed path is `42601`. The compiled
-//! program is a pure function of the source — kept byte-identical cross-core by the conformance suite
-//! (CLAUDE.md §5: a hand-written parser, never codegenned).
+//! The compiled surface: lax/strict mode; a primary (`$`, `@` inside a filter, a scalar literal,
+//! `last` inside a subscript, or a parenthesized expression or predicate) followed by accessor steps
+//! (`.key`, `.*`, `[subscripts]` of any expression, `[*]`, `to` slices, `?(filter)`, and the item
+//! methods of §3.1); arithmetic (`+ - * / %`, unary `+ -`, §3.2); a top-level comparison predicate.
+//! Still deferred (a valid-PG path using one → `0A000` at compile): `like_regex` / `starts with` /
+//! `is unknown` / `exists` predicates, `$name` variables, `.**`, and the datetime methods. A
+//! malformed path is `42601`. The compiled program is a pure function of the source — kept
+//! byte-identical cross-core by the conformance suite (CLAUDE.md §5: a hand-written parser, never
+//! codegenned).
 
 use crate::cost::Meter;
 use crate::costs::COSTS;
@@ -54,6 +55,54 @@ pub enum Primary {
     Current,
     /// A scalar literal — a JSON number / string / boolean / null.
     Lit(JsonNode),
+    /// `last` — the index of the innermost subscripted array's last element (subscript expressions
+    /// only).
+    Last,
+    /// `+e` / `-e` — unary arithmetic over each item of `e` (§3.2).
+    Unary(UnaryOp, Box<PathExpr>),
+    /// `l op r` — binary arithmetic over two singleton numbers (§3.2).
+    Binary(ArithOp, Box<PathExpr>, Box<PathExpr>),
+    /// `(predicate)` followed by accessors — the predicate's truth value as an item (`true`,
+    /// `false`, or `null` when unknown).
+    Pred(Box<Pred>),
+}
+
+/// A unary arithmetic operator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnaryOp {
+    Plus,
+    Minus,
+}
+
+/// A binary arithmetic operator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+impl ArithOp {
+    /// The operator as written and as PostgreSQL names it in an error message.
+    fn symbol(self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+            ArithOp::Mod => "%",
+        }
+    }
+
+    /// PostgreSQL's `operationPriority`: `+ -` bind looser than `* / %`.
+    fn priority(self) -> u8 {
+        match self {
+            ArithOp::Add | ArithOp::Sub => 3,
+            _ => 4,
+        }
+    }
 }
 
 /// One accessor step.
@@ -142,12 +191,13 @@ pub enum Subscript {
     Slice(Index, Index),
 }
 
-/// A subscript index: an integer literal (as written — evaluation rejects one outside the integer
-/// range) or the `last` sentinel.
+/// A subscript index: a number literal (as written — evaluation truncates it and rejects one
+/// outside the integer range), the `last` sentinel, or any other expression (§3.2).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Index {
     Number(Decimal),
     Last,
+    Expr(Box<PathExpr>),
 }
 
 /// A jsonpath construct that is valid in PostgreSQL but not yet supported by jed (a deferred
@@ -168,11 +218,21 @@ impl JsonPath {
     /// Compile a jsonpath source string. Malformed → `42601`; a valid-PG but unsupported construct
     /// → `0A000`.
     pub fn compile(src: &str) -> Result<JsonPath> {
+        let path = JsonPath::parse(src)?;
+        // A path is evaluated from its canonical text, whose parenthesization can nest deeper than
+        // the source (`1 + 1 + 1` renders `((1 + 1) + 1)`), so that text must compile too (§8).
+        JsonPath::parse(&path.render())?;
+        Ok(path)
+    }
+
+    /// Parse a jsonpath source string (see [`JsonPath::compile`]).
+    fn parse(src: &str) -> Result<JsonPath> {
         let mut p = Parser {
             s: src.as_bytes(),
             i: 0,
             depth: 0,
             in_filter: 0,
+            in_subscript: 0,
         };
         p.skip_ws();
         // Optional mode word: `strict` / `lax` (default lax).
@@ -182,93 +242,101 @@ impl JsonPath {
             p.eat_keyword("lax");
             false
         };
+        // The body is an expression (an accessor path, arithmetic) or a top-level predicate
+        // (`$.a == 1`, for jsonb_path_match / @@) — PostgreSQL's `expr_or_predicate`.
+        let body = match p.parse_or()? {
+            Parsed::Expr(e) => PathBody::Path(e),
+            Parsed::Pred(pred) => PathBody::Predicate(Box::new(pred)),
+        };
         p.skip_ws();
-        // A parenthesized top-level predicate — `($.a == 1)`, which is also the canonical render of a
-        // top-level predicate, so this round-trips render → compile. A parenthesized literal (`(1.5)`,
-        // the render of a number literal followed by a step) starts a path instead.
-        if p.peek() == Some(b'(') && !p.paren_literal_ahead() {
-            let pred = p.parse_pred()?;
-            p.skip_ws();
-            if p.peek().is_some() {
-                return Err(malformed("unexpected trailing input in predicate"));
-            }
-            return Ok(JsonPath {
-                strict,
-                body: PathBody::Predicate(Box::new(pred)),
-            });
+        if p.peek().is_some() {
+            return Err(malformed("unexpected trailing input"));
         }
-        // Remember the body start: if the path turns out to be the LHS of a TOP-LEVEL predicate
-        // (`$.a == 1`, for jsonb_path_match / @@), we re-parse from here as a predicate.
-        let body_start = p.i;
-        let expr = p.parse_path_expr(true)?;
-        p.skip_ws();
-        // After the path: a comparison / logical operator makes the whole thing a top-level predicate
-        // (re-parse from the body start as a predicate); arithmetic is a deferred follow-on.
-        match p.peek() {
-            None => Ok(JsonPath {
-                strict,
-                body: PathBody::Path(expr),
-            }),
-            Some(b'=' | b'<' | b'>' | b'!' | b'&' | b'|') => {
-                p.i = body_start;
-                let pred = p.parse_pred()?;
-                p.skip_ws();
-                if p.peek().is_some() {
-                    return Err(malformed("unexpected trailing input in predicate"));
-                }
-                Ok(JsonPath {
-                    strict,
-                    body: PathBody::Predicate(Box::new(pred)),
-                })
-            }
-            Some(b'+' | b'-' | b'*' | b'/' | b'%') => Err(unsupported("path arithmetic")),
-            // A trailing word predicate operator (`like_regex`, `starts with`) makes a top-level
-            // predicate too — deferred `0A000` (not malformed). Any other name is malformed.
-            Some(_) if p.word_ahead() => {
-                let word = p.scan_word()?;
-                if keyword_is(&word, "like_regex") || keyword_is(&word, "starts") {
-                    Err(unsupported("top-level predicate expressions"))
-                } else {
-                    Err(malformed("unexpected trailing input in path"))
-                }
-            }
-            Some(_) => Err(malformed("unexpected trailing input in path")),
-        }
+        Ok(JsonPath { strict, body })
     }
 
-    /// The canonical render (spec/design/jsonpath.md §2): `strict` kept / `lax` omitted; member keys
-    /// quoted; `[*]`, `[i]`, `[i to j]` subscripts; methods lowercase; matches PostgreSQL's
-    /// `jsonpath_out`.
+    /// The canonical render (spec/design/jsonpath.md §2.2): `strict` kept / `lax` omitted; member
+    /// keys quoted; `[*]`, `[i]`, `[i to j]` subscripts; methods lowercase; operators spaced and
+    /// parenthesized by PostgreSQL's `jsonpath_out` rules.
     pub fn render(&self) -> String {
         let mut out = String::new();
         if self.strict {
             out.push_str("strict ");
         }
+        // The top level parenthesizes an operator (`($."a" + 1)`, `($."a" == 1)`), as PostgreSQL
+        // prints it.
         match &self.body {
-            PathBody::Path(e) => write_path_expr(e, &mut out),
-            // A top-level predicate renders parenthesized (PG's `jsonpath_out`): `($."a" == 1)`.
-            PathBody::Predicate(pred) => {
-                out.push('(');
-                write_pred(pred, &mut out);
-                out.push(')');
-            }
+            PathBody::Path(e) => write_expr(e, true, &mut out),
+            PathBody::Predicate(pred) => write_pred(pred, true, &mut out),
         }
         out
     }
 }
 
-/// Render a path primary and its steps. A number literal followed by a step is parenthesized
-/// (`(1.5).type()`), as PostgreSQL prints it.
-fn write_path_expr(e: &PathExpr, out: &mut String) {
+/// PostgreSQL's `operationPriority` of an expression's head: `||` 0, `&&` 1, comparisons 2, `+ -`
+/// 3, `* / %` 4, unary `+ -` 5, anything else 6.
+fn expr_priority(e: &PathExpr) -> u8 {
+    match &e.primary {
+        Primary::Unary(..) => 5,
+        Primary::Binary(op, ..) => op.priority(),
+        Primary::Pred(pred) => pred_priority(pred),
+        _ => 6,
+    }
+}
+
+fn pred_priority(pred: &Pred) -> u8 {
+    match pred {
+        Pred::Or(..) => 0,
+        Pred::And(..) => 1,
+        Pred::Compare(..) => 2,
+        Pred::Not(_) => 6,
+    }
+}
+
+/// Render an expression — PostgreSQL's `printJsonPathItem`. An operator is parenthesized when
+/// `brackets` is set: at the top level, and for an operand that binds no tighter than its parent
+/// (`((1 + 2) + 3)`, `(1 - (2 - 3))`). jed also parenthesizes an operator followed by accessors,
+/// which PostgreSQL prints bare in an operand (`$."a" + 1.type()`), a text that does not read back
+/// as the same path (§2.2). A number literal followed by a step is parenthesized (`(1.5).type()`).
+fn write_expr(e: &PathExpr, brackets: bool, out: &mut String) {
+    let brackets = brackets || !e.steps.is_empty();
     match &e.primary {
         Primary::Root => out.push('$'),
         Primary::Current => out.push('@'),
+        Primary::Last => out.push_str("last"),
         Primary::Lit(n @ JsonNode::Number(_)) if !e.steps.is_empty() => {
             out.push('(');
             out.push_str(&crate::json::json_compact_out(n));
             out.push(')');
         }
         Primary::Lit(n) => out.push_str(&crate::json::json_compact_out(n)),
+        Primary::Unary(op, arg) => {
+            if brackets {
+                out.push('(');
+            }
+            out.push(match op {
+                UnaryOp::Plus => '+',
+                UnaryOp::Minus => '-',
+            });
+            write_expr(arg, expr_priority(arg) <= 5, out);
+            if brackets {
+                out.push(')');
+            }
+        }
+        Primary::Binary(op, l, r) => {
+            if brackets {
+                out.push('(');
+            }
+            write_expr(l, expr_priority(l) <= op.priority(), out);
+            out.push(' ');
+            out.push_str(op.symbol());
+            out.push(' ');
+            write_expr(r, expr_priority(r) <= op.priority(), out);
+            if brackets {
+                out.push(')');
+            }
+        }
+        Primary::Pred(pred) => write_pred(pred, brackets, out),
     }
     write_steps(&e.steps, out);
 }
@@ -302,7 +370,7 @@ fn write_steps(steps: &[Step], out: &mut String) {
             }
             Step::Filter(pred) => {
                 out.push_str("?(");
-                write_pred(pred, out);
+                write_pred(pred, false, out);
                 out.push(')');
             }
             Step::Method(m) => {
@@ -324,26 +392,32 @@ fn write_steps(steps: &[Step], out: &mut String) {
     }
 }
 
-/// Render a filter predicate (PG's `?(…)` form: `&&`/`||` spaced, `!(…)`, `a op b` spaced).
-fn write_pred(pred: &Pred, out: &mut String) {
+/// Render a predicate (PostgreSQL's form: `&&`/`||` and `a op b` spaced, `!(…)`), parenthesized
+/// when `brackets` is set and its operands by priority, like [`write_expr`].
+fn write_pred(pred: &Pred, brackets: bool, out: &mut String) {
     match pred {
-        Pred::Or(a, b) => {
-            write_pred(a, out);
-            out.push_str(" || ");
-            write_pred(b, out);
-        }
-        Pred::And(a, b) => {
-            write_pred(a, out);
-            out.push_str(" && ");
-            write_pred(b, out);
+        Pred::Or(a, b) | Pred::And(a, b) => {
+            let prio = pred_priority(pred);
+            if brackets {
+                out.push('(');
+            }
+            write_pred(a, pred_priority(a) <= prio, out);
+            out.push_str(if prio == 0 { " || " } else { " && " });
+            write_pred(b, pred_priority(b) <= prio, out);
+            if brackets {
+                out.push(')');
+            }
         }
         Pred::Not(p) => {
             out.push_str("!(");
-            write_pred(p, out);
+            write_pred(p, false, out);
             out.push(')');
         }
         Pred::Compare(l, op, r) => {
-            write_path_expr(l, out);
+            if brackets {
+                out.push('(');
+            }
+            write_expr(l, expr_priority(l) <= 2, out);
             out.push(' ');
             out.push_str(match op {
                 CmpOp::Eq => "==",
@@ -354,7 +428,10 @@ fn write_pred(pred: &Pred, out: &mut String) {
                 CmpOp::Ge => ">=",
             });
             out.push(' ');
-            write_path_expr(r, out);
+            write_expr(r, expr_priority(r) <= 2, out);
+            if brackets {
+                out.push(')');
+            }
         }
     }
 }
@@ -380,7 +457,9 @@ pub struct EvalOpts {
 pub fn compile_metered(src: &str, m: &mut Meter) -> Result<JsonPath> {
     m.charge(COSTS.jsonpath_compile * src.len() as i64);
     m.guard()?;
-    JsonPath::compile(src)
+    // The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
+    // `compile` at resolve.
+    JsonPath::parse(src)
 }
 
 /// Evaluate a compiled path over a jsonb context item → the ordered SQL/JSON sequence
@@ -435,18 +514,23 @@ fn eval_items<'d>(
         root_offsets: None,
     };
     match &path.body {
+        // `@` is not allowed outside a filter, so the root expression's current item is unused.
         PathBody::Path(e) => {
-            let seed = match &e.primary {
-                Primary::Lit(n) => Item::Val(n.clone()),
-                _ => Item::Doc(ctx),
-            };
             let stop_at_first = opts.exists && !path.strict;
-            run_path(&mut cx, &e.steps, seed, Base::Root, stop_at_first, out)
+            run_expr(
+                &mut cx,
+                e,
+                &Item::Doc(ctx),
+                &Base::Root,
+                None,
+                stop_at_first,
+                out,
+            )
         }
         // A top-level predicate → a single item: its truth value as a boolean, or JSON null when
         // unknown (§4.4).
         PathBody::Predicate(pred) => {
-            let truth = eval_pred(&mut cx, pred, &Item::Doc(ctx), &Base::Root)?;
+            let truth = eval_pred(&mut cx, pred, &Item::Doc(ctx), &Base::Root, None)?;
             out.push(Item::Val(truth.map_or(JsonNode::Null, JsonNode::Bool)));
             Ok(())
         }
@@ -561,10 +645,22 @@ struct Frame<'d> {
     range: Option<(i64, i64)>,
     /// The `.keyvalue()` id of this frame's object.
     kv_id: i64,
+    /// The size of the innermost array being subscripted, which `last` refers to (in a filter of
+    /// this step) — set by an enclosing subscript step, and for as long as its outputs' continuations
+    /// run, as in PostgreSQL.
+    last: Option<i64>,
+    /// A subscript step's array size: its own outputs' `last`.
+    size: i64,
 }
 
 impl<'d> Frame<'d> {
-    fn new(step: usize, item: Item<'d>, base: Base<'d>, unwrap: bool) -> Frame<'d> {
+    fn new(
+        step: usize,
+        item: Item<'d>,
+        base: Base<'d>,
+        unwrap: bool,
+        last: Option<i64>,
+    ) -> Frame<'d> {
         Frame {
             step,
             item,
@@ -575,6 +671,8 @@ impl<'d> Frame<'d> {
             b: 0,
             range: None,
             kv_id: 0,
+            last,
+            size: 0,
         }
     }
 }
@@ -588,24 +686,46 @@ enum Out<'d> {
     Done,
 }
 
-/// Run `steps` over `seed` depth-first with an explicit stack (no native recursion per step),
-/// appending each final item to `out`. `stop_at_first` ends the run at the first final item.
-fn run_path<'d>(
+/// Run an expression depth-first (§3): its head produces items one at a time (§3.2), and each runs
+/// through the accessor steps on an explicit stack (no native recursion per step) before the head
+/// produces the next. `current` is the item `@` names and `last` the size of the innermost array
+/// being subscripted. Each final item is appended to `out`; `stop_at_first` ends the run at the first
+/// one — PostgreSQL's lax existence test, which also lets a unary operator skip a non-number.
+fn run_expr<'d>(
     cx: &mut Ctx<'d, '_>,
-    steps: &[Step],
-    seed: Item<'d>,
-    base: Base<'d>,
+    e: &PathExpr,
+    current: &Item<'d>,
+    base: &Base<'d>,
+    last: Option<i64>,
     stop_at_first: bool,
     out: &mut Vec<Item<'d>>,
 ) -> Result<()> {
-    if steps.is_empty() {
-        out.push(seed);
-        return Ok(());
-    }
+    let steps = &e.steps;
     let unwrap = !cx.strict;
-    let mut stack = vec![Frame::new(0, seed, base, unwrap)];
-    while let Some(top) = stack.last_mut() {
-        match next_out(cx, steps, top)? {
+    let mut head = Head {
+        started: false,
+        items: Vec::new(),
+        at: 0,
+    };
+    let mut stack: Vec<Frame<'d>> = Vec::new();
+    loop {
+        let Some(top) = stack.last_mut() else {
+            let Some((item, item_base)) =
+                head_next(cx, e, &mut head, current, base, last, stop_at_first)?
+            else {
+                return Ok(());
+            };
+            if steps.is_empty() {
+                out.push(item);
+                if stop_at_first {
+                    return Ok(());
+                }
+            } else {
+                stack.push(Frame::new(0, item, item_base, unwrap, last));
+            }
+            continue;
+        };
+        match next_out(cx, steps, current, top)? {
             Out::Item(item, base) => {
                 let next = top.step + 1;
                 if next == steps.len() {
@@ -614,7 +734,13 @@ fn run_path<'d>(
                         return Ok(());
                     }
                 } else {
-                    stack.push(Frame::new(next, item, base, unwrap));
+                    // A subscript step's outputs run their continuations with `last` naming its
+                    // array.
+                    let last = match &steps[top.step] {
+                        Step::Subscripts(_) => Some(top.size),
+                        _ => top.last,
+                    };
+                    stack.push(Frame::new(next, item, base, unwrap, last));
                 }
             }
             Out::Sub(frame) => stack.push(frame),
@@ -623,7 +749,175 @@ fn run_path<'d>(
             }
         }
     }
-    Ok(())
+}
+
+/// The state of an expression's head: whether it has started, and a unary operator's operand items
+/// with the next one's position.
+struct Head<'d> {
+    started: bool,
+    items: Vec<Item<'d>>,
+    at: usize,
+}
+
+/// Produce the next item of an expression's head (`$`, `@`, a literal, `last`, an operator, or a
+/// parenthesized predicate), with the base its continuation runs under.
+fn head_next<'d>(
+    cx: &mut Ctx<'d, '_>,
+    e: &PathExpr,
+    head: &mut Head<'d>,
+    current: &Item<'d>,
+    base: &Base<'d>,
+    last: Option<i64>,
+    stop_at_first: bool,
+) -> Result<Option<(Item<'d>, Base<'d>)>> {
+    if let Primary::Unary(op, arg) = &e.primary {
+        // Each item of the operand (lax: an array item unwrapped one level) must be a number: one
+        // application each, one emitted item for each number. A lax existence test with nothing
+        // after the operator skips a non-number, as PostgreSQL does.
+        if !head.started {
+            head.started = true;
+            head.items = eval_seq(cx, arg, current, base, last, true)?;
+        }
+        while head.at < head.items.len() {
+            let item = head.items[head.at].clone();
+            head.at += 1;
+            cx.charge(1)?;
+            let negated = match item.node() {
+                Some(JsonNode::Number(d)) => Some(d.neg()),
+                _ => None,
+            };
+            let Some(negated) = negated else {
+                if stop_at_first && e.steps.is_empty() {
+                    continue;
+                }
+                return Err(EngineError::new(
+                    SqlState::SqlJsonNumberNotFound,
+                    format!(
+                        "operand of unary jsonpath operator {} is not a numeric value",
+                        match op {
+                            UnaryOp::Plus => "+",
+                            UnaryOp::Minus => "-",
+                        }
+                    ),
+                ));
+            };
+            cx.charge(1)?;
+            let result = match op {
+                UnaryOp::Plus => item,
+                UnaryOp::Minus => Item::Val(JsonNode::Number(negated)),
+            };
+            return Ok(Some((result, base.clone())));
+        }
+        return Ok(None);
+    }
+    if head.started {
+        return Ok(None);
+    }
+    head.started = true;
+    Ok(Some(match &e.primary {
+        Primary::Root => (Item::Doc(cx.root), Base::Root),
+        Primary::Current => (current.clone(), base.clone()),
+        Primary::Lit(n) => (Item::Val(n.clone()), base.clone()),
+        Primary::Last => (
+            Item::Val(JsonNode::Number(Decimal::from_i64(last.unwrap_or(0) - 1))),
+            base.clone(),
+        ),
+        Primary::Binary(op, l, r) => (
+            eval_binary(cx, *op, l, r, current, base, last)?,
+            base.clone(),
+        ),
+        // `(predicate)` followed by accessors: the truth value as an item (JSON null for unknown).
+        Primary::Pred(pred) => {
+            let truth = eval_pred(cx, pred, current, base, last)?;
+            (
+                Item::Val(truth.map_or(JsonNode::Null, JsonNode::Bool)),
+                base.clone(),
+            )
+        }
+        Primary::Unary(..) => unreachable!("a unary head is handled above"),
+    }))
+}
+
+/// Evaluate an expression to its whole item sequence. With `unwrap` in lax mode an array item is
+/// unwrapped one level (§4.1 rule 4) — free: it only changes which items the caller sees.
+fn eval_seq<'d>(
+    cx: &mut Ctx<'d, '_>,
+    e: &PathExpr,
+    current: &Item<'d>,
+    base: &Base<'d>,
+    last: Option<i64>,
+    unwrap: bool,
+) -> Result<Vec<Item<'d>>> {
+    let mut seq = Vec::new();
+    run_expr(cx, e, current, base, last, false, &mut seq)?;
+    if cx.strict || !unwrap {
+        return Ok(seq);
+    }
+    let mut out = Vec::with_capacity(seq.len());
+    for item in seq {
+        match item.doc() {
+            Some(JsonNode::Array(elems)) => out.extend(elems.iter().map(Item::Doc)),
+            _ => out.push(item),
+        }
+    }
+    Ok(out)
+}
+
+/// `l op r` (§3.2): both operands are evaluated (lax unwraps an array item one level), then each
+/// must be a single number (`22038`). One application, the size-scaled `decimal_work` of the SQL
+/// operator, and one emitted item; the arithmetic is `decimal`'s, so `/` takes PostgreSQL's
+/// `select_div_scale` and a zero divisor raises `22012`.
+fn eval_binary<'d>(
+    cx: &mut Ctx<'d, '_>,
+    op: ArithOp,
+    l: &PathExpr,
+    r: &PathExpr,
+    current: &Item<'d>,
+    base: &Base<'d>,
+    last: Option<i64>,
+) -> Result<Item<'d>> {
+    let ls = eval_seq(cx, l, current, base, last, true)?;
+    let rs = eval_seq(cx, r, current, base, last, true)?;
+    cx.charge(1)?;
+    let single = |seq: &[Item<'d>], side: &str| -> Result<Decimal> {
+        match seq {
+            [item] => match item.node() {
+                Some(JsonNode::Number(d)) => Ok(d.clone()),
+                _ => Err(not_single_numeric(side, op)),
+            },
+            _ => Err(not_single_numeric(side, op)),
+        }
+    };
+    let a = single(&ls, "left")?;
+    let b = single(&rs, "right")?;
+    let work = match op {
+        ArithOp::Add | ArithOp::Sub => decimal::work_linear(&a, &b),
+        ArithOp::Mul => decimal::work_mul(&a, &b),
+        ArithOp::Div => decimal::work_div(&a, &b),
+        ArithOp::Mod => decimal::work_mod(&a, &b),
+    };
+    cx.m.charge(COSTS.decimal_work * (work as i64 - 1));
+    cx.m.guard()?;
+    let v = match op {
+        ArithOp::Add => a.add(&b)?,
+        ArithOp::Sub => a.sub(&b)?,
+        ArithOp::Mul => a.mul(&b)?,
+        ArithOp::Div => a.div(&b)?,
+        ArithOp::Mod => a.rem(&b)?,
+    };
+    cx.charge(1)?;
+    Ok(Item::Val(JsonNode::Number(v)))
+}
+
+/// `22038`: a binary operator's operand is not a single number.
+fn not_single_numeric(side: &str, op: ArithOp) -> EngineError {
+    EngineError::new(
+        SqlState::SingletonSqlJsonItemRequired,
+        format!(
+            "{side} operand of jsonpath operator {} is not a single numeric value",
+            op.symbol()
+        ),
+    )
 }
 
 /// Whether lax mode unwraps an array before applying this step (§4.1 rule 1). The subscripts
@@ -637,7 +931,12 @@ fn unwraps(step: &Step) -> bool {
 }
 
 /// Produce a frame's next output, charging its step application and each emitted item (§7).
-fn next_out<'d>(cx: &mut Ctx<'d, '_>, steps: &[Step], f: &mut Frame<'d>) -> Result<Out<'d>> {
+fn next_out<'d>(
+    cx: &mut Ctx<'d, '_>,
+    steps: &[Step],
+    current: &Item<'d>,
+    f: &mut Frame<'d>,
+) -> Result<Out<'d>> {
     let step = &steps[f.step];
     if f.unwrap
         && unwraps(step)
@@ -653,6 +952,7 @@ fn next_out<'d>(cx: &mut Ctx<'d, '_>, steps: &[Step], f: &mut Frame<'d>) -> Resu
                 Item::Doc(e),
                 f.base.clone(),
                 false,
+                f.last,
             )));
         }
         return Ok(Out::Done);
@@ -706,6 +1006,7 @@ fn next_out<'d>(cx: &mut Ctx<'d, '_>, steps: &[Step], f: &mut Frame<'d>) -> Resu
                 _ => None,
             };
             let size = array.map_or(1, |elems| elems.len() as i64);
+            f.size = size;
             loop {
                 let to = match f.range {
                     Some((_, to)) => to,
@@ -713,7 +1014,7 @@ fn next_out<'d>(cx: &mut Ctx<'d, '_>, steps: &[Step], f: &mut Frame<'d>) -> Resu
                         let Some(sub) = subs.get(f.a) else {
                             return Ok(Out::Done);
                         };
-                        let (from, to) = subscript_range(sub, size, strict)?;
+                        let (from, to) = subscript_range(cx, sub, size, current, &f.base)?;
                         f.range = Some((from, to));
                         f.b = from as usize;
                         to
@@ -764,7 +1065,7 @@ fn next_out<'d>(cx: &mut Ctx<'d, '_>, steps: &[Step], f: &mut Frame<'d>) -> Resu
             }
             f.started = true;
             cx.charge(1)?;
-            if eval_pred(cx, pred, &f.item, &f.base)? == Some(true) {
+            if eval_pred(cx, pred, &f.item, &f.base, f.last)? == Some(true) {
                 Some(f.item.clone())
             } else {
                 None
@@ -868,37 +1169,74 @@ fn member_of<'d>(cx: &mut Ctx<'d, '_>, item: &Item<'d>, key: &str) -> Result<Opt
 }
 
 /// Resolve one subscript against an array of `size` elements → its inclusive `(from, to)` range,
-/// clamped. An index outside the integer range raises in both modes; strict raises on an
-/// out-of-bounds or reversed range, which lax just leaves (partly) empty.
-fn subscript_range(sub: &Subscript, size: i64, strict: bool) -> Result<(i64, i64)> {
-    let resolve = |i: &Index| -> Result<i64> {
-        match i {
-            Index::Number(n) => n
-                .to_i64_round()
-                .filter(|v| i32::try_from(*v).is_ok())
-                .ok_or_else(|| {
-                    EngineError::new(
-                        SqlState::InvalidSqlJsonSubscript,
-                        "jsonpath array subscript is out of integer range",
-                    )
-                }),
-            Index::Last => Ok(size - 1),
-        }
-    };
+/// clamped. An index is truncated toward zero; one outside the integer range raises in both modes,
+/// and strict raises on an out-of-bounds or reversed range, which lax just leaves (partly) empty.
+/// A non-literal index (`last - 1`, `$.i`) is evaluated with `last` naming this array and must be a
+/// single number (`22033`).
+fn subscript_range<'d>(
+    cx: &mut Ctx<'d, '_>,
+    sub: &Subscript,
+    size: i64,
+    current: &Item<'d>,
+    base: &Base<'d>,
+) -> Result<(i64, i64)> {
     let (from, to) = match sub {
         Subscript::Index(i) => {
-            let v = resolve(i)?;
+            let v = index_value(cx, i, size, current, base)?;
             (v, v)
         }
-        Subscript::Slice(a, b) => (resolve(a)?, resolve(b)?),
+        Subscript::Slice(a, b) => (
+            index_value(cx, a, size, current, base)?,
+            index_value(cx, b, size, current, base)?,
+        ),
     };
-    if strict && (from < 0 || from > to || to >= size) {
+    if cx.strict && (from < 0 || from > to || to >= size) {
         return Err(EngineError::new(
             SqlState::InvalidSqlJsonSubscript,
             "jsonpath array subscript is out of bounds",
         ));
     }
     Ok((from.max(0), to.min(size - 1)))
+}
+
+/// One subscript index's value (PostgreSQL's `getArrayIndex`).
+fn index_value<'d>(
+    cx: &mut Ctx<'d, '_>,
+    i: &Index,
+    size: i64,
+    current: &Item<'d>,
+    base: &Base<'d>,
+) -> Result<i64> {
+    let n = match i {
+        Index::Number(n) => Cow::Borrowed(n),
+        Index::Last => return Ok(size - 1),
+        Index::Expr(e) => {
+            let seq = eval_seq(cx, e, current, base, Some(size), false)?;
+            match seq.as_slice() {
+                [item] => match item.node() {
+                    Some(JsonNode::Number(n)) => Cow::Owned(n.clone()),
+                    _ => return Err(not_single_subscript()),
+                },
+                _ => return Err(not_single_subscript()),
+            }
+        }
+    };
+    n.trunc_places(0)
+        .to_i64_round()
+        .filter(|v| i32::try_from(*v).is_ok())
+        .ok_or_else(|| {
+            EngineError::new(
+                SqlState::InvalidSqlJsonSubscript,
+                "jsonpath array subscript is out of integer range",
+            )
+        })
+}
+
+fn not_single_subscript() -> EngineError {
+    EngineError::new(
+        SqlState::InvalidSqlJsonSubscript,
+        "jsonpath array subscript is not a single numeric value",
+    )
 }
 
 /// Evaluate a filter predicate to a Kleene truth value (`Some(true)`/`Some(false)`/`None` = unknown).
@@ -908,11 +1246,12 @@ fn eval_pred<'d>(
     pred: &Pred,
     current: &Item<'d>,
     base: &Base<'d>,
+    last: Option<i64>,
 ) -> Result<Option<bool>> {
     Ok(match pred {
         Pred::Or(a, b) => {
-            let x = eval_pred(cx, a, current, base)?;
-            let y = eval_pred(cx, b, current, base)?;
+            let x = eval_pred(cx, a, current, base, last)?;
+            let y = eval_pred(cx, b, current, base, last)?;
             match (x, y) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -920,16 +1259,16 @@ fn eval_pred<'d>(
             }
         }
         Pred::And(a, b) => {
-            let x = eval_pred(cx, a, current, base)?;
-            let y = eval_pred(cx, b, current, base)?;
+            let x = eval_pred(cx, a, current, base, last)?;
+            let y = eval_pred(cx, b, current, base, last)?;
             match (x, y) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
                 _ => None,
             }
         }
-        Pred::Not(p) => eval_pred(cx, p, current, base)?.map(|b| !b),
-        Pred::Compare(l, op, r) => eval_compare(cx, l, *op, r, current, base)?,
+        Pred::Not(p) => eval_pred(cx, p, current, base, last)?.map(|b| !b),
+        Pred::Compare(l, op, r) => eval_compare(cx, l, *op, r, current, base, last)?,
     })
 }
 
@@ -945,11 +1284,12 @@ fn eval_compare<'d>(
     r: &PathExpr,
     current: &Item<'d>,
     base: &Base<'d>,
+    last: Option<i64>,
 ) -> Result<Option<bool>> {
-    let Some(ls) = eval_operand(cx, l, current, base)? else {
+    let Some(ls) = eval_operand(cx, l, current, base, last)? else {
         return Ok(None);
     };
-    let Some(rs) = eval_operand(cx, r, current, base)? else {
+    let Some(rs) = eval_operand(cx, r, current, base, last)? else {
         return Ok(None);
     };
     let strict = cx.strict;
@@ -988,39 +1328,22 @@ fn eval_compare<'d>(
     })
 }
 
-/// Evaluate a comparison operand to its item sequence (a path, or a singleton literal). `Ok(None)`
-/// is a SQL/JSON error, which makes the comparison unknown rather than propagating (§4.2: filter
-/// operands never raise). A cost, budget, or cancellation error still propagates (§7).
+/// Evaluate a comparison operand to its item sequence, an array item unwrapped one level in lax
+/// (§4.1 rule 4). `Ok(None)` is a SQL/JSON error, which makes the comparison unknown rather than
+/// propagating (§4.2: filter operands never raise). A cost, budget, or cancellation error still
+/// propagates (§7).
 fn eval_operand<'d>(
     cx: &mut Ctx<'d, '_>,
     e: &PathExpr,
     current: &Item<'d>,
     base: &Base<'d>,
+    last: Option<i64>,
 ) -> Result<Option<Vec<Item<'d>>>> {
-    let (seed, seed_base) = match &e.primary {
-        Primary::Root => (Item::Doc(cx.root), Base::Root),
-        Primary::Current => (current.clone(), base.clone()),
-        Primary::Lit(n) => (Item::Val(n.clone()), base.clone()),
-    };
-    let mut seq = Vec::new();
-    match run_path(cx, &e.steps, seed, seed_base, false, &mut seq) {
-        Ok(()) => {}
-        Err(err) if is_soft(&err) => return Ok(None),
-        Err(err) => return Err(err),
+    match eval_seq(cx, e, current, base, last, true) {
+        Ok(seq) => Ok(Some(seq)),
+        Err(err) if is_soft(&err) => Ok(None),
+        Err(err) => Err(err),
     }
-    if cx.strict {
-        return Ok(Some(seq));
-    }
-    // lax: an array-valued operand item is unwrapped ONE level, so the existential comparison ranges
-    // over its elements (§4.1 rule 4).
-    let mut out = Vec::with_capacity(seq.len());
-    for item in seq {
-        match item.doc() {
-            Some(JsonNode::Array(elems)) => out.extend(elems.iter().map(Item::Doc)),
-            _ => out.push(item),
-        }
-    }
-    Ok(Some(out))
 }
 
 /// Compare two items under a jsonpath operator (§4.4). Same-type scalars compare by their order
@@ -1416,6 +1739,7 @@ fn write_index(i: &Index, out: &mut String) {
     match i {
         Index::Number(n) => out.push_str(&n.render()),
         Index::Last => out.push_str("last"),
+        Index::Expr(e) => write_expr(e, false, out),
     }
 }
 
@@ -1555,11 +1879,37 @@ struct Parser<'a> {
     s: &'a [u8],
     i: usize,
     /// The program nesting depth (spec/design/json.md §6.4): +1 per filter `?(`, parenthesized
-    /// group, `!`, and `&&`/`||` chain step, bounded by [`MAX_JSON_DEPTH`] → `54001`. Bounding it at
-    /// the compiler bounds every derived walk (render, evaluate, `Clone`/`Drop`).
+    /// group, `!`, `&&`/`||` chain step, arithmetic operator, and subscript list, bounded by
+    /// [`MAX_JSON_DEPTH`] → `54001`. Bounding it at the compiler bounds every derived walk (render,
+    /// evaluate, `Clone`/`Drop`).
     depth: usize,
     /// How many filters enclose the cursor — `@` is valid only inside one.
     in_filter: usize,
+    /// How many subscripts enclose the cursor — `last` is valid only inside one.
+    in_subscript: usize,
+}
+
+/// A parsed operand: an expression or a predicate — PostgreSQL's `expr_or_predicate`. A
+/// parenthesized predicate is an expression only when accessors follow it.
+enum Parsed {
+    Expr(PathExpr),
+    Pred(Pred),
+}
+
+/// Require an expression where the grammar takes one (`42601` for a bare predicate).
+fn need_expr(p: Parsed) -> Result<PathExpr> {
+    match p {
+        Parsed::Expr(e) => Ok(e),
+        Parsed::Pred(_) => Err(malformed("expected an expression, not a predicate")),
+    }
+}
+
+/// Require a predicate where the grammar takes one (`42601` for an expression).
+fn need_pred(p: Parsed) -> Result<Pred> {
+    match p {
+        Parsed::Pred(pred) => Ok(pred),
+        Parsed::Expr(_) => Err(malformed("expected a predicate")),
+    }
 }
 
 impl Parser<'_> {
@@ -1773,15 +2123,16 @@ impl Parser<'_> {
     }
 
     /// Parse a `[…]` subscript list (the opening `[` consumed, not the wildcard form). Each subscript
-    /// is `index` or `index to index`; `index` is a number or `last`. Anything else → `0A000`.
+    /// is `index` or `index to index`, an index any expression (`1`, `last - 1`, `$.i`), in which
+    /// `last` is allowed.
     fn parse_subscripts(&mut self) -> Result<Vec<Subscript>> {
         let mut subs = Vec::new();
+        self.deepen()?;
+        self.in_subscript += 1;
         loop {
-            self.skip_ws();
             let a = self.parse_index()?;
             self.skip_ws();
             let sub = if self.eat_keyword("to") {
-                self.skip_ws();
                 let b = self.parse_index()?;
                 self.skip_ws();
                 Subscript::Slice(a, b)
@@ -1796,6 +2147,8 @@ impl Parser<'_> {
                 }
                 Some(b']') => {
                     self.i += 1;
+                    self.in_subscript -= 1;
+                    self.depth -= 1;
                     return Ok(subs);
                 }
                 _ => return Err(malformed("expected `,` or `]` in subscript")),
@@ -1803,56 +2156,55 @@ impl Parser<'_> {
         }
     }
 
+    /// One subscript index: a number literal or `last` keeps its own form; anything else is an
+    /// expression evaluated per array.
     fn parse_index(&mut self) -> Result<Index> {
-        if self.eat_keyword("last") {
-            return Ok(Index::Last);
+        self.skip_ws();
+        if self.peek().is_none() {
+            return Err(malformed("expected a subscript index"));
         }
-        match self.peek() {
-            // A truncated path (no index where one is required) is malformed.
-            None => return Err(malformed("expected a subscript index")),
-            // A name: a `true`/`false`/`null` literal starts an expression subscript (deferred);
-            // any other is not an expression.
-            Some(_) if self.word_ahead() => {
-                let word = self.scan_word()?;
-                if ["true", "false", "null"]
-                    .iter()
-                    .any(|kw| keyword_is(&word, kw))
-                {
-                    return Err(unsupported("non-literal subscript expressions"));
-                }
-                return Err(malformed("expected a subscript index"));
-            }
-            // A non-numeric token starts an expression subscript (`$.a`, arithmetic) — a deferred
-            // follow-on.
-            Some(c) if !(c.is_ascii_digit() || c == b'-') => {
-                return Err(unsupported("non-literal subscript expressions"));
-            }
-            _ => {}
-        }
-        let neg = self.eat(b'-');
-        let start = self.i;
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            self.i += 1;
-        }
-        let digits = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
-        if digits.is_empty() {
-            return Err(malformed("expected digits after `-`"));
-        }
-        if digits.len() > 1 && digits.starts_with('0') {
-            return Err(malformed("trailing junk after numeric literal"));
-        }
-        Ok(Index::Number(Decimal::from_digits_scale(neg, digits, 0)))
+        let e = need_expr(self.parse_additive()?)?;
+        Ok(match e {
+            PathExpr {
+                primary: Primary::Lit(JsonNode::Number(n)),
+                steps,
+            } if steps.is_empty() => Index::Number(n),
+            PathExpr {
+                primary: Primary::Last,
+                steps,
+            } if steps.is_empty() => Index::Last,
+            e => Index::Expr(Box::new(e)),
+        })
     }
 
-    /// Parse a path primary and its accessor steps. `top` is the root expression, where `@` is not
-    /// allowed (PostgreSQL: "@ is not allowed in root expressions").
-    fn parse_path_expr(&mut self, top: bool) -> Result<PathExpr> {
+    /// Parse a primary and its accessor steps (PostgreSQL's `accessor_expr`). A parenthesized
+    /// expression followed by accessors continues it (`($.a).b` is `$.a.b`, `(1 + 2).type()`); a
+    /// parenthesized predicate followed by accessors yields its truth value; without accessors the
+    /// parentheses only group.
+    fn parse_postfix(&mut self) -> Result<Parsed> {
         self.skip_ws();
-        if let Some(lit) = self.try_paren_literal() {
-            return Ok(PathExpr {
-                primary: Primary::Lit(lit),
-                steps: self.parse_steps()?,
-            });
+        if self.eat(b'(') {
+            self.deepen()?;
+            let inner = self.parse_or()?;
+            self.depth -= 1;
+            self.skip_ws();
+            if !self.eat(b')') {
+                return Err(malformed("expected `)`"));
+            }
+            let steps = self.parse_steps()?;
+            if steps.is_empty() {
+                return Ok(inner);
+            }
+            return Ok(Parsed::Expr(match inner {
+                Parsed::Expr(mut e) => {
+                    e.steps.extend(steps);
+                    e
+                }
+                Parsed::Pred(pred) => PathExpr {
+                    primary: Primary::Pred(Box::new(pred)),
+                    steps,
+                },
+            }));
         }
         let primary = match self.peek() {
             Some(b'$') => {
@@ -1886,24 +2238,7 @@ impl Parser<'_> {
             Some(b'.') if self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) => {
                 Primary::Lit(self.parse_number()?)
             }
-            // A negative number. Followed by a step it is PostgreSQL's unary minus applied to the
-            // whole path (`-1.5.abs()` is `-(1.5.abs())`) — arithmetic, a deferred follow-on.
-            Some(b'-')
-                if self
-                    .peek_at(1)
-                    .is_some_and(|c| c.is_ascii_digit() || c == b'.') =>
-            {
-                let lit = self.parse_number()?;
-                let steps = self.parse_steps()?;
-                if !steps.is_empty() {
-                    return Err(unsupported("path arithmetic"));
-                }
-                return Ok(PathExpr {
-                    primary: Primary::Lit(lit),
-                    steps,
-                });
-            }
-            Some(b'-' | b'+') => return Err(unsupported("path arithmetic")),
+            None => return Err(malformed("unexpected end of input")),
             // A name: one of the keywords that start an operand, or else not an operand at all.
             _ if self.word_ahead() => {
                 let word = self.scan_word()?;
@@ -1914,64 +2249,22 @@ impl Parser<'_> {
                 } else if keyword_is(&word, "null") {
                     Primary::Lit(JsonNode::Null)
                 } else if keyword_is(&word, "last") {
-                    return Err(malformed("LAST is allowed only in array subscripts"));
+                    if self.in_subscript == 0 {
+                        return Err(malformed("LAST is allowed only in array subscripts"));
+                    }
+                    Primary::Last
                 } else if keyword_is(&word, "exists") {
                     return Err(unsupported("exists predicates"));
                 } else {
                     return Err(malformed("a name is not an operand"));
                 }
             }
-            // A parenthesized expression or another expression form — a deferred follow-on.
-            _ if top => return Err(unsupported("expressions other than an accessor path")),
-            _ => return Err(malformed("expected a comparison operand")),
+            _ => return Err(malformed("unexpected token")),
         };
-        Ok(PathExpr {
+        Ok(Parsed::Expr(PathExpr {
             primary,
             steps: self.parse_steps()?,
-        })
-    }
-
-    /// Parse a scalar literal: a string, a number, `true`, `false`, or `null`. `None` (cursor
-    /// unmoved) if none starts here.
-    fn try_literal(&mut self) -> Option<JsonNode> {
-        let start = self.i;
-        let lit = match self.peek() {
-            Some(b'"') => self.parse_quoted().ok().map(JsonNode::String),
-            Some(c) if c.is_ascii_digit() || c == b'-' || c == b'.' => self.parse_number().ok(),
-            _ if self.eat_keyword("true") => Some(JsonNode::Bool(true)),
-            _ if self.eat_keyword("false") => Some(JsonNode::Bool(false)),
-            _ if self.eat_keyword("null") => Some(JsonNode::Null),
-            _ => None,
-        };
-        if lit.is_none() {
-            self.i = start;
-        }
-        lit
-    }
-
-    /// Parse a parenthesized literal — `(1.5)`, PostgreSQL's render of a number literal followed by
-    /// a step. `None` (cursor unmoved) if the parentheses hold anything else.
-    fn try_paren_literal(&mut self) -> Option<JsonNode> {
-        let start = self.i;
-        if self.eat(b'(') {
-            self.skip_ws();
-            if let Some(lit) = self.try_literal() {
-                self.skip_ws();
-                if self.eat(b')') {
-                    return Some(lit);
-                }
-            }
-        }
-        self.i = start;
-        None
-    }
-
-    /// Whether a parenthesized literal starts at the cursor.
-    fn paren_literal_ahead(&mut self) -> bool {
-        let start = self.i;
-        let found = self.try_paren_literal().is_some();
-        self.i = start;
-        found
+        }))
     }
 
     /// Parse a number literal (PostgreSQL's jsonpath scanner: an integer, `1.5`, `1.`, `.5`, an
@@ -1996,6 +2289,15 @@ impl Parser<'_> {
                         self.i += 1;
                     }
                     frac = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
+                }
+                // `1.e3` — an empty fraction, then an exponent.
+                Some(b'e' | b'E')
+                    if !int_part.is_empty()
+                        && (self.peek_at(2).is_some_and(|c| c.is_ascii_digit())
+                            || (matches!(self.peek_at(2), Some(b'+' | b'-'))
+                                && self.peek_at(3).is_some_and(|c| c.is_ascii_digit()))) =>
+                {
+                    self.i += 1;
                 }
                 Some(c) if c.is_ascii_alphabetic() || c == b'_' => {
                     return Err(malformed("trailing junk after numeric literal"));
@@ -2055,6 +2357,10 @@ impl Parser<'_> {
                     let dot_end = self.i;
                     self.skip_ws();
                     if self.eat(b'*') {
+                        // `.**` — the any-level accessor — is a deferred follow-on.
+                        if self.peek() == Some(b'*') {
+                            return Err(unsupported("the .** accessor"));
+                        }
                         steps.push(Step::WildcardMember);
                     } else if self.peek() == Some(b'"') {
                         steps.push(Step::Member(self.parse_quoted()?));
@@ -2097,7 +2403,7 @@ impl Parser<'_> {
                     }
                     self.deepen()?;
                     self.in_filter += 1;
-                    let pred = self.parse_pred()?;
+                    let pred = need_pred(self.parse_or()?)?;
                     self.in_filter -= 1;
                     self.depth -= 1;
                     self.skip_ws();
@@ -2195,77 +2501,86 @@ impl Parser<'_> {
         Ok(Decimal::from_digits_scale(neg, digits, 0))
     }
 
-    /// Parse a filter predicate (the comparison subset): `||` over `&&` over `!` / `(…)` / comparison.
-    fn parse_pred(&mut self) -> Result<Pred> {
+    /// Parse an expression or predicate: `||` over `&&` over `!` / comparison over arithmetic
+    /// (PostgreSQL's `jsonpath_gram.y` precedence: `||`, `&&`, `!`, comparisons, `+ -`, `* / %`,
+    /// unary `+ -`, accessors). `||` and `&&` take predicates.
+    fn parse_or(&mut self) -> Result<Parsed> {
         let mut left = self.parse_and()?;
         // Each `||` step deepens the left-deep tree by one level (json.md §6.4).
         let mut steps = 0;
         loop {
             self.skip_ws();
-            if self.eat_op(b"||") {
-                self.deepen()?;
-                steps += 1;
-                let right = self.parse_and()?;
-                left = Pred::Or(Box::new(left), Box::new(right));
-            } else {
+            if !self.eat_op(b"||") {
                 self.depth -= steps;
                 return Ok(left);
             }
+            self.deepen()?;
+            steps += 1;
+            let l = need_pred(left)?;
+            let r = need_pred(self.parse_and()?)?;
+            left = Parsed::Pred(Pred::Or(Box::new(l), Box::new(r)));
         }
     }
 
-    fn parse_and(&mut self) -> Result<Pred> {
+    fn parse_and(&mut self) -> Result<Parsed> {
         let mut left = self.parse_not()?;
         // Each `&&` step deepens the left-deep tree by one level (json.md §6.4).
         let mut steps = 0;
         loop {
             self.skip_ws();
-            if self.eat_op(b"&&") {
-                self.deepen()?;
-                steps += 1;
-                let right = self.parse_not()?;
-                left = Pred::And(Box::new(left), Box::new(right));
-            } else {
+            if !self.eat_op(b"&&") {
                 self.depth -= steps;
                 return Ok(left);
             }
+            self.deepen()?;
+            steps += 1;
+            let l = need_pred(left)?;
+            let r = need_pred(self.parse_not()?)?;
+            left = Parsed::Pred(Pred::And(Box::new(l), Box::new(r)));
         }
     }
 
-    fn parse_not(&mut self) -> Result<Pred> {
+    /// `!(predicate)` — the operand must be a parenthesized predicate.
+    fn parse_not(&mut self) -> Result<Parsed> {
         self.skip_ws();
-        if self.eat(b'!') {
+        if self.peek() == Some(b'!') && self.peek_at(1) != Some(b'=') {
+            self.i += 1;
             self.skip_ws();
+            if self.eat_keyword("exists") {
+                return Err(unsupported("exists predicates"));
+            }
             if !self.eat(b'(') {
                 return Err(malformed("expected `(` after `!`"));
             }
             self.deepen()?;
-            let inner = self.parse_pred()?;
+            let inner = need_pred(self.parse_or()?)?;
             self.depth -= 1;
             self.skip_ws();
             if !self.eat(b')') {
                 return Err(malformed("expected `)` after `!(`"));
             }
-            return Ok(Pred::Not(Box::new(inner)));
-        }
-        if self.peek() == Some(b'(') && !self.paren_literal_ahead() {
-            self.i += 1;
-            self.deepen()?;
-            let inner = self.parse_pred()?;
-            self.depth -= 1;
-            self.skip_ws();
-            if !self.eat(b')') {
-                return Err(malformed("expected `)` in predicate"));
-            }
-            return Ok(inner);
+            return Ok(Parsed::Pred(Pred::Not(Box::new(inner))));
         }
         self.parse_comparison()
     }
 
-    /// `operand cmp operand` — the only leaf predicate this slice (`exists` / `like_regex` /
-    /// `starts with` / `is unknown` are a follow-on).
-    fn parse_comparison(&mut self) -> Result<Pred> {
-        let left = self.parse_path_expr(false)?;
+    /// `expr cmp expr`, or a lone expression or parenthesized predicate. The word predicates
+    /// (`like_regex`, `starts with`, `is unknown`) are a deferred follow-on.
+    fn parse_comparison(&mut self) -> Result<Parsed> {
+        let left = match self.parse_additive()? {
+            Parsed::Pred(pred) => {
+                self.skip_ws();
+                if self.word_ahead() {
+                    let start = self.i;
+                    if keyword_is(&self.scan_word()?, "is") {
+                        return Err(unsupported("is unknown predicates"));
+                    }
+                    self.i = start;
+                }
+                return Ok(Parsed::Pred(pred));
+            }
+            Parsed::Expr(e) => e,
+        };
         self.skip_ws();
         let op = if self.eat_op(b"==") {
             CmpOp::Eq
@@ -2279,20 +2594,110 @@ impl Parser<'_> {
             CmpOp::Lt
         } else if self.eat(b'>') {
             CmpOp::Gt
-        } else if self.word_ahead() {
-            // A word predicate operator is a deferred follow-on; any other name is malformed.
-            let word = self.scan_word()?;
-            if keyword_is(&word, "like_regex") || keyword_is(&word, "starts") {
-                return Err(unsupported("like_regex / starts with predicates"));
-            }
-            return Err(malformed("expected a comparison operator"));
-        } else if matches!(self.peek(), Some(b'+' | b'-' | b'*' | b'/' | b'%')) {
-            return Err(unsupported("path arithmetic"));
         } else {
-            return Err(malformed("expected a comparison operator"));
+            // A word predicate operator is a deferred follow-on. The name is lexed first, so its
+            // escape error wins; any other name is trailing input.
+            if self.word_ahead() {
+                let start = self.i;
+                let word = self.scan_word()?;
+                if keyword_is(&word, "like_regex") || keyword_is(&word, "starts") {
+                    return Err(unsupported(
+                        "predicates other than a comparison (like_regex / starts with)",
+                    ));
+                }
+                self.i = start;
+            }
+            return Ok(Parsed::Expr(left));
         };
-        let right = self.parse_path_expr(false)?;
-        Ok(Pred::Compare(left, op, right))
+        let right = need_expr(self.parse_additive()?)?;
+        Ok(Parsed::Pred(Pred::Compare(left, op, right)))
+    }
+
+    /// `+` and `-`, left-associative.
+    fn parse_additive(&mut self) -> Result<Parsed> {
+        let mut left = self.parse_multiplicative()?;
+        // Each operator deepens the left-deep tree by one level (json.md §6.4).
+        let mut steps = 0;
+        loop {
+            self.skip_ws();
+            let op = match self.peek() {
+                Some(b'+') => ArithOp::Add,
+                Some(b'-') => ArithOp::Sub,
+                _ => {
+                    self.depth -= steps;
+                    return Ok(left);
+                }
+            };
+            self.i += 1;
+            self.deepen()?;
+            steps += 1;
+            let l = need_expr(left)?;
+            let r = need_expr(self.parse_multiplicative()?)?;
+            left = Parsed::Expr(binary(op, l, r));
+        }
+    }
+
+    /// `*`, `/`, and `%`, left-associative.
+    fn parse_multiplicative(&mut self) -> Result<Parsed> {
+        let mut left = self.parse_unary()?;
+        let mut steps = 0;
+        loop {
+            self.skip_ws();
+            let op = match self.peek() {
+                Some(b'*') => ArithOp::Mul,
+                Some(b'/') => ArithOp::Div,
+                Some(b'%') => ArithOp::Mod,
+                _ => {
+                    self.depth -= steps;
+                    return Ok(left);
+                }
+            };
+            self.i += 1;
+            self.deepen()?;
+            steps += 1;
+            let l = need_expr(left)?;
+            let r = need_expr(self.parse_unary()?)?;
+            left = Parsed::Expr(binary(op, l, r));
+        }
+    }
+
+    /// Unary `+` / `-`, which bind tighter than the binary operators but looser than accessors
+    /// (`-$.a * 2` is `(-($.a)) * 2`). Applied to a number literal they fold into it (`-1`), as
+    /// PostgreSQL's grammar does.
+    fn parse_unary(&mut self) -> Result<Parsed> {
+        self.skip_ws();
+        let op = match self.peek() {
+            Some(b'+') => UnaryOp::Plus,
+            Some(b'-') => UnaryOp::Minus,
+            _ => return self.parse_postfix(),
+        };
+        self.i += 1;
+        self.deepen()?;
+        let arg = need_expr(self.parse_unary()?)?;
+        self.depth -= 1;
+        Ok(Parsed::Expr(match (op, arg) {
+            (
+                UnaryOp::Plus,
+                arg @ PathExpr {
+                    primary: Primary::Lit(JsonNode::Number(_)),
+                    ..
+                },
+            ) if arg.steps.is_empty() => arg,
+            (
+                UnaryOp::Minus,
+                PathExpr {
+                    primary: Primary::Lit(JsonNode::Number(n)),
+                    steps,
+                },
+            ) if steps.is_empty() => PathExpr {
+                primary: Primary::Lit(JsonNode::Number(n.neg())),
+                steps,
+            },
+            (op, arg) => PathExpr {
+                primary: Primary::Unary(op, Box::new(arg)),
+                steps: Vec::new(),
+            },
+        }))
     }
 
     /// Consume a multi-byte operator token if it appears at the cursor.
@@ -2303,6 +2708,14 @@ impl Parser<'_> {
         } else {
             false
         }
+    }
+}
+
+/// A binary arithmetic expression.
+fn binary(op: ArithOp, l: PathExpr, r: PathExpr) -> PathExpr {
+    PathExpr {
+        primary: Primary::Binary(op, Box::new(l), Box::new(r)),
+        steps: Vec::new(),
     }
 }
 

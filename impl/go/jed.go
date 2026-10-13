@@ -852,7 +852,7 @@ var SupportedCapabilities = []string{
 	"func.json_populate",
 	// The jsonpath scalar type (P1a) — the '…'::jsonpath / jsonpath '…' literal cast compiled at
 	// resolve + the canonical render ($.a → $."a", lax omitted, strict kept); structural-accessor
-	// arithmetic / $name / datetime methods → 0A000; non-comparable (42883); literal-only (a
+	// $name / datetime methods → 0A000; non-comparable (42883); literal-only (a
 	// jsonpath column → 0A000); malformed → 42601 (spec/design/jsonpath.md).
 	"types.jsonpath",
 	// The jsonpath query functions (P1b/P2) over the structural-accessor evaluator: jsonb_path_exists
@@ -866,6 +866,8 @@ var SupportedCapabilities = []string{
 	"expr.jsonpath_match",
 	// jsonpath item methods (.type()/.size()/.double()/…/.keyvalue(), jsonpath.md §3.1).
 	"expr.jsonpath_methods",
+	// jsonpath arithmetic (`+ - * / %`, unary `+ -`) and parenthesized expressions (jsonpath.md §3.2).
+	"expr.jsonpath_arith",
 	// The SQL/JSON query functions (S2) — JSON_EXISTS / JSON_VALUE / JSON_QUERY: compile a jsonpath,
 	// evaluate it over a context item, and apply per-function semantics (RETURNING / wrapper / quotes
 	// / ON EMPTY / ON ERROR). PASSING vars, DEFAULT-expr behaviors, JSON_QUERY OMIT QUOTES, and a

@@ -1556,3 +1556,9 @@ reason = "jed: JSON_SCALAR is to_json's conversion, and a float source is its de
 file = "json/json_scalar_sources.test"
 sql = "SELECT JSON_SCALAR(ARRAY[1.5::f64])"
 reason = "jed: a float array element is the same deferred 0A000 as a float source (json-sql-functions.md §2.2). PostgreSQL renders [1.5]."
+
+# --- jsonpath render: an operator followed by accessors keeps its parentheses as an operand.
+[[override]]
+file = "json/jsonpath_arith.test"
+sql = "SELECT '$ ? (($.a + 1).type() == \"number\")'::jsonpath, '$ ? ((-@.a).abs() > 1)'::jsonpath, '$[(last - 1).abs()]'::jsonpath"
+reason = "jed renders an arithmetic operator followed by accessors parenthesized wherever it appears: `$?(($.\"a\" + 1).type() == \"number\")`. PostgreSQL's printJsonPathItem brackets an operand only by operator priority, ignoring the accessors that follow it, so it prints `$?($.\"a\" + 1.type() == \"number\")` (which does not even parse) and `$?(-@.\"a\".abs() > 1)` (which parses as a different path, -(abs(a))). jed stores and evaluates a jsonpath as its canonical text (jsonpath.md §1), so that text must read back as the same path (jsonpath.md §2.3)."

@@ -65,6 +65,8 @@ const (
 	SqlJsonArrayNotFound
 	// SqlJsonMemberNotFound is 2203A — {detail}.
 	SqlJsonMemberNotFound
+	// SqlJsonNumberNotFound is 2203B — {detail}.
+	SqlJsonNumberNotFound
 	// SqlJsonObjectNotFound is 2203C — {detail}.
 	SqlJsonObjectNotFound
 	// SqlJsonScalarRequired is 2203F — {detail}.
@@ -260,6 +262,8 @@ func (s SqlState) Code() string {
 		return "22039"
 	case SqlJsonMemberNotFound:
 		return "2203A"
+	case SqlJsonNumberNotFound:
+		return "2203B"
 	case SqlJsonObjectNotFound:
 		return "2203C"
 	case SqlJsonScalarRequired:
@@ -441,6 +445,7 @@ var errorDescs = []errorDesc{
 	{Code: "22030", Name: "duplicate_json_object_key_value", Class: "data exception"},
 	{Code: "22039", Name: "sql_json_array_not_found", Class: "data exception"},
 	{Code: "2203A", Name: "sql_json_member_not_found", Class: "data exception"},
+	{Code: "2203B", Name: "sql_json_number_not_found", Class: "data exception"},
 	{Code: "2203C", Name: "sql_json_object_not_found", Class: "data exception"},
 	{Code: "2203F", Name: "sql_json_scalar_required", Class: "data exception"},
 	{Code: "22031", Name: "invalid_argument_for_sql_json_datetime_function", Class: "data exception"},

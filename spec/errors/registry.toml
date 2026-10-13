@@ -205,6 +205,12 @@ class = "data exception"
 template = "{detail}"
 
 [[error]]
+code = "2203B"
+name = "sql_json_number_not_found"
+class = "data exception"
+template = "{detail}"
+
+[[error]]
 code = "2203C"
 name = "sql_json_object_not_found"
 class = "data exception"

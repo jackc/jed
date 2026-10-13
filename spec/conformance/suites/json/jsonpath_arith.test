@@ -1,0 +1,476 @@
+# jsonpath arithmetic and parenthesized expressions (spec/design/jsonpath.md §3.2): binary `+ - * / %`
+# over two singleton numbers (lax unwraps an array operand one level; anything else is 22038), unary
+# `+ -` over each item of their operand (a non-number is 2203B), PostgreSQL's numeric arithmetic
+# (division scale, `%` sign, 22012 on a zero divisor), arithmetic in filters, comparisons, and
+# subscripts (`last - 1`), and parenthesized expressions followed by accessors. Renders with
+# PostgreSQL's parenthesization. Output matches the postgres:18 oracle. Format:
+# ../../../design/conformance.md.
+# requires: query.select, query.set_returning, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.jsonpath_match, expr.jsonpath_methods, expr.jsonpath_arith, expr.json_query_fns, types.i32
+
+# --- The canonical render ---------------------------------------------------------------------
+
+# A top-level operator is parenthesized, and so is an operand that binds no tighter than its parent.
+query TTTTTT nosort
+SELECT '1 + 2 + 3'::jsonpath, '1 - (2 - 3)'::jsonpath, '(1+2)*3'::jsonpath, '1 + 2 * 3'::jsonpath, '1 % 2 / 3 * 4'::jsonpath, '1 + (2 + 3)'::jsonpath
+----
+((1 + 2) + 3)
+(1 - (2 - 3))
+((1 + 2) * 3)
+(1 + 2 * 3)
+(((1 % 2) / 3) * 4)
+(1 + (2 + 3))
+
+# Unary minus folds into a number literal; elsewhere it is an operator binding tighter than `*`.
+query TTTTTTTT nosort
+SELECT '-$.a'::jsonpath, '-(-1)'::jsonpath, '--1'::jsonpath, '+1.5'::jsonpath, '-0.0'::jsonpath, '-1 * 2'::jsonpath, '-$ * 2'::jsonpath, '-($ * 2)'::jsonpath
+----
+(-$."a")
+1
+1
+1.5
+0.0
+(-1 * 2)
+(-$ * 2)
+(-($ * 2))
+
+query TTTTTTT nosort
+SELECT '+$.a'::jsonpath, '- -$'::jsonpath, '1 * -2'::jsonpath, '2*-$'::jsonpath, '-(1+2)'::jsonpath, '1 +-+ 1'::jsonpath, '-"a"'::jsonpath
+----
+(+$."a")
+(-(-$))
+(1 * -2)
+(2 * -$)
+(-(1 + 2))
+(1 + -1)
+(-"a")
+
+# No space is needed around an operator; `-` does not continue a member name.
+query TTTT nosort
+SELECT '1-1'::jsonpath, '$.a-1'::jsonpath, '$-1'::jsonpath, '1.e3+1'::jsonpath
+----
+(1 - 1)
+($."a" - 1)
+($ - 1)
+(1000 + 1)
+
+# An accessor binds tighter than unary minus; a parenthesized expression takes accessors.
+query TTTTT nosort
+SELECT '-1.5.abs()'::jsonpath, '(-1).abs()'::jsonpath, '(-$.a).abs()'::jsonpath, '-(1).a'::jsonpath, '($.a + 1).b[0]'::jsonpath
+----
+(-(1.5).abs())
+(-1).abs()
+(-$."a").abs()
+(-(1)."a")
+($."a" + 1)."b"[0]
+
+# Parentheses around a path, literal, or expression only group; a path continues through them.
+query TTTTTTT nosort
+SELECT '(($))'::jsonpath, '(($.a))'::jsonpath, '((1))'::jsonpath, '((1)).a'::jsonpath, '($.a).b'::jsonpath, '(1 + 2).type().size()'::jsonpath, '((1 + 2).type())'::jsonpath
+----
+$
+$."a"
+1
+(1)."a"
+$."a"."b"
+(1 + 2).type().size()
+(1 + 2).type()
+
+# A parenthesized predicate followed by accessors is its truth value.
+query TTT nosort
+SELECT '($.a == 1).type()'::jsonpath, '(($.a == 1)).type()'::jsonpath, '$ ? (@ == 1).type()'::jsonpath
+----
+($."a" == 1).type()
+($."a" == 1).type()
+$?(@ == 1).type()
+
+# An operator followed by accessors keeps its parentheses as an operand. PostgreSQL prints these bare
+# (`$?($."a" + 1.type() == "number")`, `$?(-@."a".abs() > 1)`), a text that does not read back as
+# the same path; jed evaluates a path from its canonical text, so it keeps them (an override).
+query TTT nosort
+SELECT '$ ? (($.a + 1).type() == "number")'::jsonpath, '$ ? ((-@.a).abs() > 1)'::jsonpath, '$[(last - 1).abs()]'::jsonpath
+----
+$?(($."a" + 1).type() == "number")
+$?((-@."a").abs() > 1)
+$[(last - 1).abs()]
+
+# Arithmetic in comparisons, filters, and top-level predicates.
+query TTTTT nosort
+SELECT '$ ? (@.a + 1 > 2)'::jsonpath, '$.a + 1 == 2'::jsonpath, '-$.a == 2'::jsonpath, '$ ? (@ + 1 == @ * 2)'::jsonpath, '$ ? ((@ + 1) * 2 > 0 && -@ < 0)'::jsonpath
+----
+$?(@."a" + 1 > 2)
+($."a" + 1 == 2)
+(-$."a" == 2)
+$?(@ + 1 == @ * 2)
+$?((@ + 1) * 2 > 0 && -@ < 0)
+
+query T nosort
+SELECT '1 + 2 == 3 && 2 * 2 == 4'::jsonpath
+----
+(1 + 2 == 3 && 2 * 2 == 4)
+
+# `&&` and `||` operands are parenthesized by priority, so grouping survives the render.
+query TTTT nosort
+SELECT '$.a == 1 && $.b == 2 && $.c == 3'::jsonpath, '$ ? ((@.a == 1 || @.b == 2) && @.c == 3)'::jsonpath, '$ ? (@.a == 1 || @.b == 2 && @.c == 3)'::jsonpath, '$ ? (@.a == 1 || (@.b == 2 || @.c == 3))'::jsonpath
+----
+(($."a" == 1 && $."b" == 2) && $."c" == 3)
+$?((@."a" == 1 || @."b" == 2) && @."c" == 3)
+$?(@."a" == 1 || @."b" == 2 && @."c" == 3)
+$?(@."a" == 1 || (@."b" == 2 || @."c" == 3))
+
+# A top-level `!` is not wrapped again.
+query TTT nosort
+SELECT '!($.a == 1)'::jsonpath, '!($.a == 1) && $.b == 1'::jsonpath, '$ ? (!(@.a == 1) || !(@.b == 1))'::jsonpath
+----
+!($."a" == 1)
+(!($."a" == 1) && $."b" == 1)
+$?(!(@."a" == 1) || !(@."b" == 1))
+
+# Subscripts take expressions, and `last` in them.
+query TTTTT nosort
+SELECT '$[last - 1]'::jsonpath, '$[1 + 1 to last]'::jsonpath, '$[1.5, 1e1, -0.5, last-1 to last]'::jsonpath, '$[-last]'::jsonpath, '$[(last)]'::jsonpath
+----
+$[last - 1]
+$[1 + 1 to last]
+$[1.5,10,-0.5,last - 1 to last]
+$[-last]
+$[last]
+
+query TT nosort
+SELECT '$[last.type()]'::jsonpath, '$[$ ? (@ == last)]'::jsonpath
+----
+$[last.type()]
+$[$?(@ == last)]
+
+# --- Malformed expressions (42601) --------------------------------------------------------------
+
+statement error 42601
+SELECT '$ + '::jsonpath
+
+statement error 42601
+SELECT '($.a == 1) + 1'::jsonpath
+
+statement error 42601
+SELECT '-($.a == 1)'::jsonpath
+
+statement error 42601
+SELECT '$.a || $.b'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ + 1)'::jsonpath
+
+statement error 42601
+SELECT '$[$.a == 1]'::jsonpath
+
+statement error 42601
+SELECT '($.a == 1) == true'::jsonpath
+
+statement error 42601
+SELECT '!(1 + 1)'::jsonpath
+
+statement error 42601
+SELECT '(1 + 2'::jsonpath
+
+statement error 42601
+SELECT '1 + 2)'::jsonpath
+
+statement error 42601
+SELECT 'last'::jsonpath
+
+statement error 42601
+SELECT '$[0] ? (@ == last)'::jsonpath
+
+statement error 42601
+SELECT '(@)'::jsonpath
+
+# `-` ends a member name, so `$.a-b` is `$.a - b`, and a bare name is not an operand.
+statement error 42601
+SELECT '$.a-b'::jsonpath
+
+# --- Binary arithmetic -------------------------------------------------------------------------
+
+query TTTTTT nosort
+SELECT jsonb_path_query_first('7', '$ % 3'), jsonb_path_query_first('-7', '$ % 3'), jsonb_path_query_first('7.5', '$ % 2'), jsonb_path_query_first('1', '$ / 3'), jsonb_path_query_first('10', '$ / 4'), jsonb_path_query_first('1.50', '$ * 2.0')
+----
+1
+-1
+1.5
+0.33333333333333333333
+2.5000000000000000
+3.000
+
+query TTTTT nosort
+SELECT jsonb_path_query_first('{"a": 2, "b": 3}', '($.a + $.b) * 2'), jsonb_path_query_first('{"a": 2, "b": 3}', '$.a + $.b * 2'), jsonb_path_query_first('{"a": 2, "b": 3}', '$.a - $.b - 1'), jsonb_path_query_first('{"a": 2, "b": 3}', '$.a - ($.b - 1)'), jsonb_path_query_first('null', '1 - -1')
+----
+10
+8
+-2
+0
+2
+
+# Exact numeric results: scales follow PostgreSQL's numeric operators.
+query TTTTT nosort
+SELECT jsonb_path_query_first('null', '0.1 + 0.2'), jsonb_path_query_first('null', '1.10 * 1.1'), jsonb_path_query_first('null', '2 / 3'), jsonb_path_query_first('null', '1.000 / 7'), jsonb_path_query_first('null', '123456789012345678901234567890 * 987654321098765432109876543210')
+----
+0.3
+1.210
+0.66666666666666666667
+0.14285714285714285714
+121932631137021795226185032733622923332237463801111263526900
+
+query TTTT nosort
+SELECT jsonb_path_query_first('null', '-5.5 % 2'), jsonb_path_query_first('null', '5.5 % -2'), jsonb_path_query_first('null', '1e-20 / 3'), jsonb_path_query_first('null', '0 / 5.00')
+----
+-1.5
+1.5
+0.0000000000000000000033333333333333333333
+0.00000000000000000000
+
+# lax unwraps a one-element array operand; a longer array is not a single numeric value.
+query TT nosort
+SELECT jsonb_path_query_first('{"a": [1]}', '$.a + 1'), jsonb_path_query_first('{"a": [[1]], "b": [1]}', '$.b * $.b')
+----
+2
+1
+
+statement error 22038
+SELECT * FROM jsonb_path_query('{"a": [1, 2]}', '$.a + 1')
+
+statement error 22038
+SELECT * FROM jsonb_path_query('{"a": [1]}', 'strict $.a + 1')
+
+statement error 22038
+SELECT * FROM jsonb_path_query('{"a": [[1]]}', '$.a + 1')
+
+statement error 22038
+SELECT * FROM jsonb_path_query('{"a": "x"}', '$.a + 1')
+
+statement error 22038
+SELECT * FROM jsonb_path_query('1', '$ + "a"')
+
+statement error 22038
+SELECT * FROM jsonb_path_query('1', '$ * true')
+
+statement error 22038
+SELECT * FROM jsonb_path_query('1', '$ - null')
+
+statement error 22038
+SELECT * FROM jsonb_path_query('{}', '$ - 1')
+
+# lax: a missing member is an empty operand, not a single numeric value.
+statement error 22038
+SELECT * FROM jsonb_path_query('{"a": 1}', '1 + $.b')
+
+# strict: the navigation error itself.
+statement error 2203A
+SELECT * FROM jsonb_path_query('{"a": 1}', 'strict 1 + $.b')
+
+# Both operands are evaluated before either is checked.
+statement error 2203A
+SELECT * FROM jsonb_path_query('{"a": "x"}', 'strict $.a + $.b')
+
+statement error 22012
+SELECT * FROM jsonb_path_query('1', '$ / 0')
+
+statement error 22012
+SELECT * FROM jsonb_path_query('1', '$ % 0.0')
+
+statement error 22003
+SELECT * FROM jsonb_path_query('null', '1e131071 * 10')
+
+# Arithmetic on each item of a sequence: `$[*]` emits one item per element.
+query T nosort
+SELECT jsonb_path_query_array('[1, 2, 3]', '$[*] ? (@ * 2 > 3)')
+----
+[2, 3]
+
+query T nosort
+SELECT jsonb_path_query_array('[{"a": 1, "b": 2}, {"a": 3, "b": 4}]', '$[*] ? (@.a + @.b > 4).a')
+----
+[3]
+
+# A filter on the arithmetic result.
+query T nosort
+SELECT jsonb_path_query_array('{"a": 2}', '($.a * 10) ? (@ > 5)')
+----
+[20]
+
+# --- Unary arithmetic --------------------------------------------------------------------------
+
+query TTTT nosort
+SELECT jsonb_path_query_array('[1, -2, 3.5]', '-$[*]'), jsonb_path_query_array('[1, -2, 3.5]', '+$[*]'), jsonb_path_query_array('[1, 2]', '-$'), jsonb_path_query_array('{"a": [1, 2]}', '-$.a')
+----
+[-1, 2, -3.5]
+[1, -2, 3.5]
+[-1, -2]
+[-1, -2]
+
+query TTT nosort
+SELECT jsonb_path_query_array('[1, 2]', '(-$).abs()'), jsonb_path_query_array('[1, 2]', '-$.abs()'), jsonb_path_query_array('{"a": 1}', '- -$.a')
+----
+[1, 2]
+[-1, -2]
+[1]
+
+statement error 2203B
+SELECT * FROM jsonb_path_query('[1, 2, "x"]', '-$[*]')
+
+statement error 2203B
+SELECT * FROM jsonb_path_query('[[1], 2]', '-$')
+
+statement error 2203B
+SELECT * FROM jsonb_path_query('[1, 2]', 'strict -$')
+
+statement error 2203B
+SELECT * FROM jsonb_path_query('"a"', '+$')
+
+statement error 2203B
+SELECT * FROM jsonb_path_query('null', '-null')
+
+# A lax existence test with nothing after the operator skips a non-number; with an accessor after
+# it, the non-number raises, but the test stops at its first item.
+query BBBB nosort
+SELECT jsonb_path_exists('[1, 2, "x"]', '-$[*]'), jsonb_path_exists('["x", 1]', '-$[*]'), jsonb_path_exists('["x"]', '-$[*]'), jsonb_path_exists('[2, "x"]', '(-$[*]).abs()')
+----
+true
+true
+false
+true
+
+statement error 2203B
+SELECT jsonb_path_exists('["x", 2]', '(-$[*]).abs()')
+
+statement error 2203B
+SELECT jsonb_path_exists('["x"]', 'strict -$[*]')
+
+# --- Arithmetic in predicates ------------------------------------------------------------------
+
+query T nosort
+SELECT jsonb_path_query_array('[1, 2, 3, 4]', '$[*] ? (@ % 2 == 0)')
+----
+[2, 4]
+
+query BBB nosort
+SELECT jsonb_path_match('1', '$ + 1 == 2'), jsonb_path_match('{"a": 2, "b": 3}', '$.a * $.b == 6'), jsonb_path_match('{"a": 2}', '-$.a < 0 && $.a / 4 == 0.5')
+----
+true
+true
+true
+
+# An operand error makes the comparison unknown: no item is kept, a top-level predicate is null.
+query TTT nosort
+SELECT jsonb_path_query_array('[1, 0, 2]', '$[*] ? (10 / @ > 4)'), jsonb_path_query_first('{"a": 1}', '$.a / 0 == 1'), jsonb_path_query_first('{"a": 1}', '$.b + 1 == 1')
+----
+[1, 2]
+null
+null
+
+query TT nosort
+SELECT jsonb_path_query_first('{"a": 1}', '-"x" == 1'), jsonb_path_query_array('[1, "x"]', '$[*] ? (-@ == -1)')
+----
+null
+[1]
+
+# lax: array operands unwrap in a comparison too.
+query T nosort
+SELECT jsonb_path_query_array('[1, "x", [2]]', '$ ? (-@ == -1)')
+----
+[1]
+
+# The silent operators: an arithmetic error is NULL from @?, and an unknown @@ is NULL.
+query BBBB nosort
+SELECT '{"a": 1}'::jsonb @? '$.a / 0', '{"a": 1}'::jsonb @@ '$.a / 0 == 1', '[1]'::jsonb @? '$ ? (@ / 0 > 1)', '["x", 2]'::jsonb @? '-$'
+----
+NULL
+NULL
+false
+true
+
+query BBB nosort
+SELECT '[2, "x"]'::jsonb @? '(-$).abs()', '{"a": 1}'::jsonb @? '$.a / 0 + 1', '{"a": 2}'::jsonb @@ '$.a + 1 == 3'
+----
+true
+NULL
+true
+
+# --- Parenthesized expressions with accessors --------------------------------------------------
+
+query TTTT nosort
+SELECT jsonb_path_query_first('{"a": 1}', '($.a + 1).type()'), jsonb_path_query_first('{"a": {"b": 5}}', '($.a).b'), jsonb_path_query_first('{"a": 1}', '($.a == 1).type()'), jsonb_path_query_first('{"a": 1}', '($.a == 1).string()')
+----
+"number"
+5
+"boolean"
+"true"
+
+query TT nosort
+SELECT jsonb_path_query_array('[1, 2, 3]', '$[*] ? ((@ + 1).type() == "number")'), jsonb_path_query_array('[{"x": 1}, {"x": 2}]', '$[*] ? ((@.x) > 1)')
+----
+[1, 2, 3]
+[{"x": 2}]
+
+# A parenthesized predicate's unknown is a JSON null.
+query TT nosort
+SELECT jsonb_path_query_first('{"a": "x"}', '($.a > 1).type()'), jsonb_path_query_first('{"a": "x"}', '(($.a > 1)).type()')
+----
+"null"
+"null"
+
+# --- Subscript expressions ---------------------------------------------------------------------
+
+query TTTT nosort
+SELECT jsonb_path_query_first('[1, 2, 3, 4]', '$[last - 1]'), jsonb_path_query_array('[1, 2, 3, 4]', '$[last - 2 to last]'), jsonb_path_query_first('[1, 2, 3, 4]', '$[$.size() - 4]'), jsonb_path_query_first('{"i": 1, "a": [5, 6]}', '$.a[$.i]')
+----
+3
+[2, 3, 4]
+1
+6
+
+# An index is truncated toward zero.
+query TTTT nosort
+SELECT jsonb_path_query_first('[0, 1, 2]', '$[1.5]'), jsonb_path_query_first('[0, 1, 2]', '$[1.9 + 0]'), jsonb_path_query_first('[0, 1, 2]', '$[-0.5]'), jsonb_path_query_array('[0, 1, 2]', '$[0.5 to 2.5]')
+----
+1
+1
+0
+[0, 1, 2]
+
+# `last` in a filter in a subscript is the subscripted array's last index.
+query T nosort
+SELECT jsonb_path_query_array('[3, 1, 2]', '$[$[*] ? (@ == last)]')
+----
+[2]
+
+# A lax subscript on a non-array: the item is a singleton, so `last` is 0.
+query TT nosort
+SELECT jsonb_path_query_first('5', '$[last - 0]'), jsonb_path_query_array('{"a": 5}', '$.a[last]')
+----
+5
+[5]
+
+statement error 22033
+SELECT * FROM jsonb_path_query('[1, 2, 3]', '$["a"]')
+
+statement error 22033
+SELECT * FROM jsonb_path_query('[1, 2, 3]', '$[$]')
+
+statement error 22033
+SELECT * FROM jsonb_path_query('{"a": 1}', '$[$.b]')
+
+statement error 22033
+SELECT * FROM jsonb_path_query('[1, 2, 3]', '$[1e10]')
+
+statement error 22033
+SELECT * FROM jsonb_path_query('[1, 2, 3]', 'strict $[last + 1]')
+
+# A subscript expression's own error propagates.
+statement error 22012
+SELECT * FROM jsonb_path_query('[1, 2, 3]', '$[1 / 0]')
+
+# --- The SQL/JSON query functions --------------------------------------------------------------
+
+query TTB nosort
+SELECT JSON_VALUE(jsonb '{"a": 2}', '$.a * 1.5'), JSON_QUERY(jsonb '[1, 2]', '-$[*]' WITH WRAPPER), JSON_EXISTS(jsonb '{"a": 2}', '$ ? (@.a - 2 == 0)')
+----
+3.0
+[-1, -2]
+true

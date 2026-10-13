@@ -35,6 +35,7 @@ export type SqlState =
   | "duplicate_json_object_key_value" // 22030 — duplicate JSON object key value
   | "sql_json_array_not_found" // 22039 — {detail}
   | "sql_json_member_not_found" // 2203A — {detail}
+  | "sql_json_number_not_found" // 2203B — {detail}
   | "sql_json_object_not_found" // 2203C — {detail}
   | "sql_json_scalar_required" // 2203F — {detail}
   | "invalid_argument_for_sql_json_datetime_function" // 22031 — {detail}
@@ -132,6 +133,7 @@ const CODES: Record<SqlState, string> = {
   duplicate_json_object_key_value: "22030",
   sql_json_array_not_found: "22039",
   sql_json_member_not_found: "2203A",
+  sql_json_number_not_found: "2203B",
   sql_json_object_not_found: "2203C",
   sql_json_scalar_required: "2203F",
   invalid_argument_for_sql_json_datetime_function: "22031",
@@ -245,6 +247,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },
   { code: "22039", name: "sql_json_array_not_found", class: "data exception" },
   { code: "2203A", name: "sql_json_member_not_found", class: "data exception" },
+  { code: "2203B", name: "sql_json_number_not_found", class: "data exception" },
   { code: "2203C", name: "sql_json_object_not_found", class: "data exception" },
   { code: "2203F", name: "sql_json_scalar_required", class: "data exception" },
   { code: "22031", name: "invalid_argument_for_sql_json_datetime_function", class: "data exception" },

@@ -206,6 +206,15 @@ test('the types page autoruns the jsonpath item method demo', async ({ page }) =
   await expect(rows).toContainText('["x", "y"]');
 });
 
+test('the types page autoruns the jsonpath arithmetic demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // 2.50 * 3 keeps the scale (7.50); the filter keeps even numbers; last - 1 is the second-to-last.
+  const rows = livePanel(page, 'jsonpathArithDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('7.50');
+  await expect(rows).toContainText('[2, 4]');
+  await expect(rows).toContainText('"number"');
+});
+
 test('the tables page decodes Unicode-escape literals and names live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   // U&'caf\00e9' is café in a column named näme; the UESCAPE '!' form decodes to data.

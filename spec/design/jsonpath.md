@@ -15,8 +15,9 @@
 > live `postgres:18` oracle; the lax/strict edge cases (§4) are subtle and oracle-pinned.
 
 > **Status: landed in part.** The type, the structural accessors, filters, top-level predicates,
-> the query functions and operators, and the item methods (except the datetime family) are
-> implemented in all three cores; §9 lists what remains deferred (`0A000`).
+> the query functions and operators, the item methods (except the datetime family), and arithmetic
+> with parenthesized expressions are implemented in all three cores; §9 lists what remains deferred
+> (`0A000`).
 
 ---
 
@@ -52,15 +53,19 @@ EBNF sketch for `JsonPath::compile` (the full grammar lands in
 [../grammar/grammar.ebnf](../grammar/grammar.ebnf) + [grammar.md](grammar.md)):
 
 ```
-jsonpath     ::= mode? path_expr
+jsonpath     ::= mode? ( path_expr | predicate )
 mode         ::= "strict" | "lax"                 (* default: lax *)
-path_expr    ::= accessor_expr ( arith_op accessor_expr )*   (* arithmetic in filter ctx *)
+path_expr    ::= term ( ( "+" | "-" ) term )*     (* left-associative, §3.2 *)
+term         ::= unary ( ( "*" | "/" | "%" ) unary )*
+unary        ::= ( "+" | "-" ) unary | accessor_expr
 accessor_expr::= primary accessor*
+               | "(" path_expr ")" accessor*      (* the accessors continue the inner path *)
+               | "(" predicate ")" accessor+      (* the predicate's truth value as an item *)
 primary      ::= "$"                              (* root document *)
                | "@"                              (* current item (filter context only) *)
                | "$" varname                      (* named variable: $"x" / $x — bound via vars *)
                | literal                          (* number | string | true | false | null *)
-               | "(" path_expr ")"
+               | "last"                           (* inside a subscript only *)
 accessor     ::= "." member                       (* .key  or  ."key with spaces" *)
                | ".*"                             (* wildcard member *)
                | "[" subscript ( "," subscript )* "]"
@@ -92,14 +97,24 @@ separate the `.`, the name, and the `(`. Without the parentheses the same word i
 (`$.type` is `$."type"`), as is every other keyword (`$.last`, `$.strict`, `$.true`; §2.1). An unknown method name, arguments where a method takes none, or more
 than two `.decimal()` arguments is `42601`.
 
-A literal primary takes accessors too (`"12".number()`, `null.type()`). A number literal followed
-by an accessor renders parenthesized (`1.5.type()` → `(1.5).type()`), and `(` *literal* `)` is
-accepted back, so the render round-trips; a parenthesized expression or predicate followed by an
-accessor is otherwise deferred (`0A000`). Number literals follow PostgreSQL's jsonpath scanner
-(`1`, `1.5`, `1.`, `.5`, `1e3`); a number running into a letter or digit (`1.type()`, `01`, `1e`)
-is trailing junk (`42601`). `-1.5.abs()` is unary minus applied to the path — arithmetic, deferred.
-Like jed's SQL literals (grammar.md §36), jsonpath numbers take no `_` digit separators and no
+A literal primary takes accessors too (`"12".number()`, `null.type()`). Number literals follow
+PostgreSQL's jsonpath scanner (`1`, `1.5`, `1.`, `.5`, `1e3`, `1.e3`); a number running into a
+letter or digit (`1.type()`, `01`, `1e`) is trailing junk (`42601`). A sign is an operator, not part
+of the number: as in PostgreSQL's grammar, unary `+`/`-` applied to a number literal with no
+accessors folds into it (`-1`, `- -1` is `1`, `-(1)` is `-1`), while `-1.5.abs()` is unary minus
+applied to `1.5.abs()`, since accessors bind tighter. Like jed's SQL literals (grammar.md §36), jsonpath numbers take no `_` digit separators and no
 hex/octal/binary prefixes, which PostgreSQL 16+ accepts.
+
+The operators follow PostgreSQL's `jsonpath_gram.y` precedence, loosest first: `||`, `&&`, `!`, the
+comparisons, binary `+ -`, `* / %`, unary `+ -`, then accessors. `||` and `&&` take predicates and
+the arithmetic operators and comparisons take expressions, so a misplaced one is `42601`
+(`$.a || $.b`, `($.a == 1) + 1`, `$ ? (@ + 1)`, `($.a == 1) == true`). Parentheses group: around an
+expression they add nothing (`(($.a))` is `$.a`), and accessors after them continue the inner path
+(`($.a).b` is `$.a.b`, `(1 + 2).type()` the type of the sum). A parenthesized predicate is a
+predicate unless accessors follow it, when it is an expression whose one item is its truth value
+(`($.a == 1).type()` is `"boolean"`; unknown is `null`). A subscript is any expression, in which
+`last` names the subscripted array's last index (`$[last - 1]`, `$[$.i to last]`); `last` outside a
+subscript is `42601`.
 
 Faithful inclusions: `last` (array-length-minus-1 sentinel inside a subscript), `to` slices,
 named variables `$name` (bound by the `vars` argument, §5), `.datetime(template?)`,
@@ -160,6 +175,24 @@ characters without escapes; variables themselves are deferred (§5).
 
 PostgreSQL's scanner also skips C-style `/* … */` comments between tokens. jed does not lex them
 yet, a follow-on.
+
+### 2.3 Canonical render
+
+A path renders as PostgreSQL's `jsonpath_out` prints it: `lax` omitted and `strict` kept, member keys
+quoted (§2.1), item methods lowercase, operators spaced (`$."a" + 1`, `@ == 1`, `a && b`), and a
+number literal followed by an accessor parenthesized (`(1.5).type()`). Operators are parenthesized
+by `printJsonPathItem`'s rule: the top-level expression or predicate is wrapped (`($."a" + 1)`,
+`($."a" == 1)`, but not `!(…)` or a plain path), and an operand is wrapped when its operator binds no
+tighter than its parent's, by priority `||` 0, `&&` 1, comparisons 2, `+ -` 3, `* / %` 4, unary 5
+(`((1 + 2) + 3)`, `(1 - (2 - 3))`, `(1 + 2 * 3)`, `(-(1 + 2))`, `((a || b) && c)`). Filter
+predicates and subscripts are not wrapped at their own top level (`$?(@ + 1 > 2)`, `$[last - 1]`).
+
+**Divergence: an operator followed by accessors is always parenthesized.** PostgreSQL decides the
+brackets by priority alone, so as an operand it prints `($.a + 1).type() == "number"` as
+`$."a" + 1.type() == "number"` (which does not parse) and `(-@.a).abs()` as `-@."a".abs()` (which
+parses as a different path). jed evaluates a path from its canonical text (§1, §7), so that text
+must read back as the same path; it renders `($."a" + 1).type()` and `(-@."a").abs()` wherever they
+appear (an oracle override).
 
 ---
 
@@ -260,6 +293,35 @@ runs its `to_timestamp` engine over a fixed list of ISO templates, with that eng
 rules (`"20-01-05"` is year 20, `"10:00:00.+05"` reads microseconds) and its time zone abbreviation
 table (`"10:00:00PST"`), which jed has not decided to load (timezones.md §15); the methods also
 produce date/time items that PostgreSQL compares across types. They need that engine first.
+
+### 3.2 Arithmetic
+
+PostgreSQL's `executeBinaryArithmExpr` and `executeUnaryArithmExpr`, over the current item (`@`) and
+the context item (`$`) of the enclosing expression.
+
+- **Binary `+ - * / %`.** Both operands are evaluated, left then right, to their whole sequences; in
+  lax an array item of either is unwrapped one level (§4.1 rule 4). Then the left and then the right
+  must be exactly one number, else `22038` `left operand of jsonpath operator + is not a single
+  numeric value` (`right …`, the operator as written). So `$.a + 1` is `2` over `{"a": [1]}` in lax,
+  and `22038` in strict or over `{"a": [1, 2]}`; a missing member is an empty operand (`22038` in
+  lax, the navigation error `2203A` in strict). The result is one number, computed as `decimal`
+  arithmetic, which is PostgreSQL's `numeric` ([decimal.md](decimal.md)): the division scale of
+  `select_div_scale` (`1 / 3` is `0.33333333333333333333`), `%` with the dividend's sign
+  (`-7 % 3` is `-1`), `22012` on a zero divisor, `22003` past the format cap.
+- **Unary `+ -`.** The operand is evaluated to its sequence (lax unwraps an array item one level),
+  and the operator applies to each item in turn, its result running through the rest of the path
+  before the next item (§3): `-$[*]` over `[1, -2]` is `-1, 2`. A non-number is `2203B` `operand of
+  unary jsonpath operator - is not a numeric value` when it is reached — except in a lax existence
+  test (§5) with no accessor after the operator, which skips it, as PostgreSQL does
+  (`jsonb_path_exists('["x", 1]', '-$[*]')` is true).
+- **Where errors go.** Arithmetic errors are SQL/JSON errors. Inside a comparison operand they make
+  the comparison unknown (§4.4: `$ ? (10 / @ > 4)` drops a `0`); the silent operators end the
+  evaluation on them (§4.2: `'{"a": 1}' @? '$.a / 0'` is NULL); elsewhere they raise.
+- **Subscripts.** A subscript expression is evaluated (without unwrapping) with `last` naming the
+  subscripted array's last index — for the subscripts and for every continuation of their elements,
+  as PostgreSQL's `innermostArraySize` — and must be one number, else `22033` `jsonpath array
+  subscript is not a single numeric value`. An index, literal or computed, is truncated toward zero
+  (`$[1.9]` is `$[1]`) and must fit the integer range (`22033`).
 
 ---
 
@@ -484,9 +546,17 @@ it compiles it again and charges.
    without evaluating the right, as in PostgreSQL); each charges its own steps. A literal operand
    charges nothing, and neither does the lax unwrapping of an array-valued operand item (§4.1): it
    only changes which pairs exist.
-5. **Connectives and roots.** `&&`, `||`, `!`, seeding `$` or `@`, and producing a top-level
-   predicate's single item charge nothing. Both operands of `&&` and `||` are always evaluated;
-   there is no short-circuit.
+5. **Connectives and roots.** `&&`, `||`, `!`, seeding `$`, `@`, or `last`, and producing a
+   top-level or parenthesized predicate's single item charge nothing. Both operands of `&&` and
+   `||` are always evaluated; there is no short-circuit.
+6. **Arithmetic (§3.2).** A binary operator charges its operands' own steps (a literal operand
+   nothing, the lax unwrapping of an array operand nothing), then 1 for the application, the SQL
+   operator's size-scaled `decimal_work × (W − 1)` ([cost.md](cost.md) §3: `work_linear` for `+ -`,
+   `work_mul`, `work_div`, `work_mod`; a zero divisor charges none), and 1 for the emitted result.
+   The decimal work is charged and guarded before the operation runs. A unary operator charges its
+   operand's steps, then 1 per operand item it is applied to (a skipped non-number too) and 1 per
+   number it emits. A subscript expression charges its own steps each time it is evaluated; a
+   literal or bare `last` index charges nothing.
 
 A cost-ceiling, lifetime-budget, or cancellation error raised inside a filter operand
 propagates. Only SQL/JSON navigation errors make a comparison unknown (§4.2).
@@ -513,30 +583,36 @@ Register the SQL/JSON class-22 subcodes in [../errors/registry.toml](../errors/r
 |---|---|---|
 | `22039` | `sql_json_array_not_found` | strict `[…]` / `[*]` / `.size()` on a non-array |
 | `2203A` | `sql_json_member_not_found` | strict missing member, or a member accessor on a non-object |
+| `2203B` | `sql_json_number_not_found` | a unary `+`/`-` operand item that is not a number (§3.2) |
 | `2203C` | `sql_json_object_not_found` | `.keyvalue()` (both modes) / strict `.*` on a non-object |
 | `2203F` | `sql_json_scalar_required` | `JSON_VALUE` of an array or object |
 | `22030` | `duplicate_json_object_key_value` | `WITH UNIQUE KEYS` / `*_unique` agg |
 | `22031` | `invalid_argument_for_sql_json_datetime_function` | `.datetime()` bad arg |
 | `22032` | `invalid_json_text` | malformed JSON (path-surface parse) |
-| `22033` | `invalid_sql_json_subscript` | bad array subscript (strict) |
+| `22033` | `invalid_sql_json_subscript` | a subscript out of bounds (strict), out of the integer range, or not a single number |
 | `22034` | `more_than_one_sql_json_item` | singleton required, >1 item |
 | `22035` | `no_sql_json_item` | `JSON_VALUE`/`JSON_QUERY` empty, no `ON EMPTY` default |
 | `22036` | `non_numeric_sql_json_item` | every item-method coercion failure (§3.1) |
 | `22037` | `non_unique_keys_in_a_json_object` | object construction unique-keys |
-| `22038` | `singleton_sql_json_item_required` | `JSON_VALUE` requires a scalar; `jsonb_path_match` requires one boolean |
+| `22038` | `singleton_sql_json_item_required` | `JSON_VALUE` requires a scalar; `jsonb_path_match` requires one boolean; a binary arithmetic operand is not a single number (§3.2) |
 
 Reuse existing codes where PG does: **`42601`** for a malformed path *literal* (syntax-error
 class, at resolve), **`22023`** for a `.decimal()` precision or scale outside PostgreSQL's
 `numeric` typmod ranges, **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
 unsupported `s`/`m`/`x` regex flags (§4.3), and **`22P02`** for malformed JSON in the
 `json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)). A string escape that decodes
-to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1).
+to NUL is **`22P05`**, an unpaired surrogate escape **`22P02`** (§2.1). Arithmetic raises the
+`decimal` errors: **`22012`** for a zero divisor, **`22003`** past the format cap (§3.2).
 
 **Nesting limit — `54001`.** The compiler counts program nesting (+1 per filter `?(`,
-parenthesized predicate group, `!`, and `&&`/`||` chain step) and rejects a path past
-`MAX_JSON_DEPTH = 256` with **`54001`** (`statement_too_complex`), the same gate as SQL
-expressions ([cost.md §7](cost.md)), so the compile, render, and evaluation walks are
-stack-safe. PostgreSQL raises `42601` ("memory exhausted") only after about 10 000 nested
+parenthesized group, `!`, `&&`/`||` chain step, binary arithmetic chain step, unary operator, and
+subscript list) and rejects a path past `MAX_JSON_DEPTH = 256` with **`54001`**
+(`statement_too_complex`), the same gate as SQL expressions ([cost.md §7](cost.md)), so the compile,
+render, and evaluation walks are stack-safe. A path is evaluated from its canonical text (§2.3),
+whose parentheses can nest deeper than the source (`$ + 1 + 1` renders `(($ + 1) + 1)`, a unary
+operator `(-…)`), so `JsonPath::compile` checks that text against the limit too: 255 chained binary
+operators fit and 256 do not, and 128 nested unary operators fit. A literal that compiles can
+therefore always be evaluated. PostgreSQL raises `42601` ("memory exhausted") only after about 10 000 nested
 parentheses, when its generated parser runs out of stack. jed's fixed limit is a documented
 divergence ([json.md §6.4](json.md)).
 
@@ -572,8 +648,13 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     after `$`, `@`, or a literal; the depth-first evaluator (§3) with PostgreSQL's early stop for
     existence tests (§5) and silent `@?`/`@@` (§4.2); `.keyvalue()` ids from PostgreSQL's binary
     layout; a `json` context converted to `jsonb` (§5); PostgreSQL's strict subscript and
-    non-array codes (§4.2). Capability `expr.jsonpath_methods`. **Still deferred (`0A000`):** the
-    datetime methods (they need PostgreSQL's `to_timestamp` engine, §3.1), arithmetic, the §4.3
+    non-array codes (§4.2). Capability `expr.jsonpath_methods`.
+  - **Arithmetic** ✅ — binary `+ - * / %` and unary `+ -` (§3.2) with PostgreSQL's precedence
+    and parenthesized expressions followed by accessors (§2), in comparisons, filters, top-level
+    predicates, and subscript expressions (`$[last - 1]`); PostgreSQL's operator parenthesization
+    in the render (§2.3), with `&&`/`||` grouping now kept. Capability `expr.jsonpath_arith`.
+    **Still deferred (`0A000`):** the datetime methods (they need PostgreSQL's `to_timestamp`
+    engine, §3.1), the §4.3
     Pike-VM `like_regex` / `starts with` / `is unknown` / `exists` predicates, `$name` variables
     and the `vars`/`silent` arguments, `.**`, and the `_tz` functions — the remaining open P2/P3
     follow-ons.

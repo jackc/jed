@@ -120,6 +120,12 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
   jsonb_path_query_array('["12", 3.7, "-4"]', '$.integer()')         AS integers,
   jsonb_path_query_array('{"x": 1, "y": [2, 3]}', '$.keyvalue().key') AS keys;`;
 
+	const jsonpathArithDemo = `SELECT
+  jsonb_path_query_first('{"price": 2.50, "qty": 3}', '$.price * $.qty')   AS total,
+  jsonb_path_query_array('[1, 2, 3, 4]', '$[*] ? (@ % 2 == 0)')           AS evens,
+  jsonb_path_query_first('[10, 20, 30]', '$[last - 1]')                    AS second_last,
+  jsonb_path_query_first('{"a": 1, "b": 2}', '($.a + $.b).type()')         AS sum_type;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -408,6 +414,15 @@ object into `{"key", "value", "id"}` objects. The datetime methods (`.datetime()
 not supported yet (`0A000`):
 
 <LiveSql demo="jsonpathMethodDemo" query={jsonpathMethodDemo} rows={1} />
+
+A `jsonpath` also does arithmetic: `+`, `-`, `*`, `/`, and `%`, and unary `+` and `-`, with the usual
+precedence and parentheses, in a path, a filter, a comparison, or a subscript (`$[last - 1]`). The
+math is exact `numeric` arithmetic, as in PostgreSQL. Each operand of a binary operator must be a
+single number (in `lax` mode a one-element array counts), or the path fails with `22038`; unary `-`
+negates every number of its operand and fails with `2203B` on anything else. Dividing by zero fails
+with `22012`, but inside a filter it only makes that comparison unknown:
+
+<LiveSql demo="jsonpathArithDemo" query={jsonpathArithDemo} rows={1} />
 
 An unquoted member name in a `jsonpath` follows PostgreSQL's lexing. It runs until whitespace, `"`,
 or one of the path's operator and punctuation characters (`. [ ] ( ) $ @ ? , * + - / % ! = < > & |
