@@ -180,5 +180,6 @@ func newNotNullViolation(column string) *EngineError {
 }
 
 // pkeyName is the derived <table>_pkey constraint name PostgreSQL auto-assigns a primary
-// key (jed persists no such relation — constraints.md §5.4).
-func pkeyName(table string) string { return table + "_pkey" }
+// key, truncated to fit 63 bytes (grammar.md §3.1). jed persists no such relation
+// (constraints.md §5.4), so it takes no collision suffix.
+func pkeyName(table string) string { return makeObjectName(table, "", false, "pkey") }

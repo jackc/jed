@@ -1398,11 +1398,11 @@ impl Engine {
                     // index, `<table>_pkey` — jed persists/reserves no such relation
                     // (constraints.md §5.4).
                     let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
-                    return Err(EngineError::unique_violation(
-                        &relation,
-                        format!("{}_pkey", relation),
-                    )
-                    .with_detail(self.pk_detail(&relation, columns, &pk_ords, &row, EXISTS)));
+                    return Err(
+                        EngineError::unique_violation(&relation, pkey_name(&relation)).with_detail(
+                            self.pk_detail(&relation, columns, &pk_ords, &row, EXISTS),
+                        ),
+                    );
                 }
                 seen_keys.insert(k.clone());
                 Some(k)
@@ -1587,7 +1587,7 @@ impl Engine {
                 // single statement, phase 1 already caught every duplicate, so this is never reached.
                 return Err(EngineError::unique_violation(
                     &relation,
-                    format!("{}_pkey", relation),
+                    pkey_name(&relation),
                 ));
             }
         }
@@ -1661,7 +1661,7 @@ impl Engine {
             if self.store_scoped(db_scope, table).get(&key)?.is_some() {
                 let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
                 return Err(
-                    EngineError::unique_violation(&relation, format!("{}_pkey", relation))
+                    EngineError::unique_violation(&relation, pkey_name(&relation))
                         .with_detail(self.pk_detail(&relation, columns, &pk_ords, &row, EXISTS)),
                 );
             }
@@ -1782,7 +1782,7 @@ impl Engine {
         if !self.store_mut_scoped(db_scope, table).insert(key, row)? {
             return Err(EngineError::unique_violation(
                 &relation,
-                format!("{}_pkey", relation),
+                pkey_name(&relation),
             ));
         }
         for (def, entries) in indexes.iter().zip(index_entries) {
@@ -2198,11 +2198,10 @@ impl Engine {
                 let k = encode_pk_key(pk, &col_types, &colls, row)?;
                 if self.store(table).get(&k)?.is_some() || !seen.insert(k) {
                     let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
-                    return Err(EngineError::unique_violation(
-                        &relation,
-                        format!("{}_pkey", relation),
-                    )
-                    .with_detail(self.pk_detail(&relation, columns, &pk_ords, row, EXISTS)));
+                    return Err(
+                        EngineError::unique_violation(&relation, pkey_name(&relation))
+                            .with_detail(self.pk_detail(&relation, columns, &pk_ords, row, EXISTS)),
+                    );
                 }
             }
         }
@@ -3922,11 +3921,11 @@ impl Engine {
                 if collides {
                     let pk_ords: Vec<usize> = pk_typed.iter().map(|(o, _)| *o).collect();
                     let columns = self.relation_columns(upd.db.as_deref(), &upd.table);
-                    return Err(EngineError::unique_violation(
-                        &relation,
-                        format!("{}_pkey", relation),
-                    )
-                    .with_detail(self.pk_detail(&relation, &columns, &pk_ords, new_row, EXISTS)));
+                    return Err(
+                        EngineError::unique_violation(&relation, pkey_name(&relation)).with_detail(
+                            self.pk_detail(&relation, &columns, &pk_ords, new_row, EXISTS),
+                        ),
+                    );
                 }
             }
         }
@@ -4162,7 +4161,7 @@ impl Engine {
                     // end-state check already caught every duplicate.
                     return Err(EngineError::unique_violation(
                         &relation,
-                        format!("{relation_lc}_pkey"),
+                        pkey_name(&relation_lc),
                     ));
                 }
             }

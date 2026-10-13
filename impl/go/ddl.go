@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -926,15 +925,10 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 		} else {
 			cols := checkReferencedColumns(def.Expr, columns)
-			var base string
 			if len(cols) == 1 {
-				base = table.Name + "_" + columns[cols[0]].Name + "_check"
+				name = chooseObjectName(table.Name, columns[cols[0]].Name, true, "check", nameTaken)
 			} else {
-				base = table.Name + "_check"
-			}
-			name = base
-			for suffix := 1; nameTaken(name); suffix++ {
-				name = base + strconv.Itoa(suffix)
+				name = chooseObjectName(table.Name, "", false, "check", nameTaken)
 			}
 		}
 		checks = append(checks, checkConstraint{Name: name, ExprText: def.Text, Expr: def.Expr, HostDeps: checkDeps[i]})
@@ -1009,15 +1003,10 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 					"constraint "+name+" for relation "+table.Name+" already exists")
 			}
 		} else {
-			base := table.Name
-			for _, i := range ru.cols {
-				base += "_" + table.Columns[i].Name
-			}
-			base += "_key"
-			name = base
-			for suffix := 1; relationTaken(name) || checkNameTaken(name); suffix++ {
-				name = base + strconv.Itoa(suffix)
-			}
+			addition := nameAddition(columnNames(table.Columns, ru.cols))
+			name = chooseObjectName(table.Name, addition, true, "key", func(n string) bool {
+				return relationTaken(n) || checkNameTaken(n)
+			})
 		}
 		// Insert in catalog (ascending name byte) order — indexes.md §6.
 		def := indexDef{Name: name, Keys: columnKeys(ru.cols), Unique: true, Kind: indexBtree}
@@ -1136,11 +1125,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 			name = fk.Name
 		} else {
-			base := table.Name
-			for _, i := range local {
-				base += "_" + table.Columns[i].Name
-			}
-			base += "_fkey"
+			addition := nameAddition(columnNames(table.Columns, local))
 			fkNameTaken := func(candidate string) bool {
 				for _, c := range table.Checks {
 					if c.Name == candidate {
@@ -1154,10 +1139,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 				}
 				return false
 			}
-			name = base
-			for suffix := 1; fkNameTaken(name); suffix++ {
-				name = base + strconv.Itoa(suffix)
-			}
+			name = chooseObjectName(table.Name, addition, true, "fkey", fkNameTaken)
 		}
 		// 6. Resolve and store the selected referential actions (§6.6).
 		onDelete, err := newFkAction(fk.OnDelete, "DELETE")
@@ -1317,15 +1299,10 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 			name = exc.Name
 		} else {
-			base := table.Name
-			for _, i := range indices {
-				base += "_" + table.Columns[i].Name
-			}
-			base += "_excl"
-			name = base
-			for suffix := 1; relTaken(name) || conTaken(name); suffix++ {
-				name = base + strconv.Itoa(suffix)
-			}
+			addition := nameAddition(columnNames(table.Columns, indices))
+			name = chooseObjectName(table.Name, addition, true, "excl", func(n string) bool {
+				return relTaken(n) || conTaken(n)
+			})
 		}
 		// Insert the backing GiST index in catalog (ascending name byte) order.
 		def := indexDef{Name: name, Keys: columnKeys(indices), Unique: false, Kind: indexGist}
@@ -2999,14 +2976,13 @@ func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename
 }
 
 // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
-// (spec/design/sequences.md §12), matching PostgreSQL: lower(table)_lower(column)_seq, with the
-// smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
-// taken by an existing relation, not equal to the table being created, not already chosen by an
-// earlier serial column of the same statement (pending), and not held by a caller-known pending
-// relation. All-lowercase identifier-derived.
+// (spec/design/sequences.md §12), matching PostgreSQL's ChooseRelationName(table, column, "seq"):
+// <table>_<column>_seq, truncated to fit 63 bytes (grammar.md §3.1), with the smallest integer
+// suffix seq1, seq2, … until the name is free in the relation namespace — not taken by an existing
+// relation, not equal to the table being created, not already chosen by an earlier serial column of
+// the same statement (pending), and not held by a caller-known pending relation.
 func (db *engine) chooseSerialSeqName(table, column string, pending []*sequenceDef, reserved []string) string {
-	base := table + "_" + column + "_seq"
-	taken := func(c string) bool {
+	return chooseObjectName(table, column, true, "seq", func(c string) bool {
 		if db.relationExists(c) || c == table {
 			return true
 		}
@@ -3015,22 +2991,8 @@ func (db *engine) chooseSerialSeqName(table, column string, pending []*sequenceD
 				return true
 			}
 		}
-		for _, name := range reserved {
-			if name == c {
-				return true
-			}
-		}
-		return false
-	}
-	if !taken(base) {
-		return base
-	}
-	for n := 1; ; n++ {
-		cand := fmt.Sprintf("%s%d", base, n)
-		if !taken(cand) {
-			return cand
-		}
-	}
+		return slices.Contains(reserved, c)
+	})
 }
 
 // buildSequenceDef resolves a parsed SeqOptions set into a validated SequenceDef
@@ -3555,18 +3517,15 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 	} else {
 		// PG's ChooseIndexName / ChooseIndexColumnNames (probed): the exact table name + one name part
-		// per key element (list order, duplicates included) + "idx", then the smallest free suffix.
-		// A column key's part is the column name; a bare-function-call expression's is the function
-		// name (lower(email) → lower); any other expression's is the literal expr (indexes.md §2).
-		base := tableKey
-		for _, elem := range ci.Keys {
-			base += "_" + indexNamePart(elem)
+		// per key element (list order; a repeated part becomes part1, …) + "idx", truncated to fit 63
+		// bytes, then the smallest free suffix. A column key's part is the column name; a
+		// bare-function-call expression's is the function name (lower(email) → lower); any other
+		// expression's is the literal expr (indexes.md §2, grammar.md §3.1).
+		parts := make([]string, len(ci.Keys))
+		for i, elem := range ci.Keys {
+			parts[i] = indexNamePart(elem)
 		}
-		base += "_idx"
-		name = base
-		for suffix := 1; relationTaken(name); suffix++ {
-			name = base + strconv.Itoa(suffix)
-		}
+		name = chooseObjectName(tableKey, nameAddition(indexColumnNames(parts)), true, "idx", relationTaken)
 	}
 
 	sortHostDeps(hostDeps)

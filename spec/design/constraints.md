@@ -314,6 +314,10 @@ the expression mentions —
 - if that name is taken (by any earlier-named check, explicit or derived), append the
   smallest positive integer that frees it (`<table>_<column>_check1`, `…2`, …).
 
+A name that would exceed the 63-byte identifier limit is cut to fit, PostgreSQL's way — the
+longer of the table and column parts shortened first, the suffix applied to the label
+(`check1`), never splitting a character ([grammar.md §3.1](grammar.md)).
+
 Derived names are built from the **exact** table/column names (no case change — a quoted
 `"Tab"` gives `Tab_…_check`, as PostgreSQL). Naming is a single pass in textual definition order — an
 explicit name colliding with an *earlier* derived name is `42710` (derived names never
@@ -425,7 +429,8 @@ After the folds, each surviving constraint names its index, in textual order:
   is PG's probed order;
 - an **omitted** name derives PostgreSQL's choice: the exact-name
   `<table>_<col>_<col>…_key` (members in list order), suffix-walked past **both**
-  namespaces (a check named `t_a_key` pushes the derived name to `t_a_key1` — probed).
+  namespaces (a check named `t_a_key` pushes the derived name to `t_a_key1` — probed), cut
+  to fit 63 bytes ([grammar.md §3.1](grammar.md)).
 
 The `_key` suffix (vs `CREATE INDEX`'s `_idx`) is the only naming difference from a plain
 index; the walk rule is otherwise [indexes.md §2](indexes.md)'s.
@@ -441,9 +446,13 @@ duplicate key value violates unique constraint: <name>
 ```
 
 `<name>` is the violated unique index's name. The **primary key's own** `23505` reports
-the derived `<table>_pkey` (from the exact table name — PostgreSQL's auto-name for the PK index). jed
+the derived `<table>_pkey` (from the exact table name, cut to fit 63 bytes — PostgreSQL's
+auto-name for the PK index, [grammar.md §3.1](grammar.md)). jed
 does **not** persist or reserve that name: `CREATE INDEX t_pkey ON t (a)` is legal in jed
-where PG would collide — a documented divergence (the PK has no index object here).
+where PG would collide — a documented divergence (the PK has no index object here). The same
+fact means the derived name never takes PG's collision suffix: where PostgreSQL would name a PK
+`<table>_pkey1` because `<table>_pkey` is already a relation (an index so named, or another
+table's PK whose 63-byte-cut name coincides), jed still reports `<table>_pkey`.
 
 When one row violates several uniqueness constraints, the reported one is: the **primary
 key first**, then the unique indexes in the catalog's **ascending name byte order**
@@ -527,8 +536,9 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
    mutation closure described in §6.6.
 7. **Naming.** An explicit `CONSTRAINT <name>` is used as the name; otherwise the name is derived,
    PostgreSQL's algorithm: exact-name `<table>_<localcol>_<localcol>…_fkey` (every local column in
-   list order, joined by `_`), suffix-walked past the table's **constraint namespace** (its checks
-   and earlier FKs) with the smallest positive integer that frees it (`…_fkey1`, `…_fkey2`, …). An
+   list order, joined by `_`, cut to fit 63 bytes — [grammar.md §3.1](grammar.md)), suffix-walked
+   past the table's **constraint namespace** (its checks and earlier FKs) with the smallest positive
+   integer that frees it (`…_fkey1`, `…_fkey2`, …). An
    explicit name colliding with an existing check or FK name is **`42710`** (`constraint <name> for
    relation <table> already exists`). The FK shares the per-table **constraint** namespace with
    `CHECK` (§4.3); it creates **no** relation object, so — unlike a `UNIQUE` constraint's backing
@@ -753,6 +763,14 @@ and compression work **does** accrue to the originating statement's cost and to 
   CHECK), not the relation namespace — `CREATE TABLE fk_name (…)` does not collide with an FK named
   `fk_name`. PG keeps constraint names per-table too, so this matches PG; the note is only that, like
   the PK's `_pkey`, jed does not reserve FK names in the relation namespace.
+- **Derived-name collisions are per table.** A derived CHECK or FK name (§4.3, §6.2 step 7) is
+  suffix-walked past *this table's* constraint names only; PostgreSQL's `ChooseConstraintName`
+  avoids every constraint name in the schema. The two differ only when another table already holds
+  the same name — rare for short names (table `t_a` with a multi-column check vs. table `t`'s check
+  on `a`, both `t_a_check`), more likely once names are cut to 63 bytes ([grammar.md
+  §3.1](grammar.md)): two tables whose names share their first 29 bytes, each with an unnamed FK on
+  the same 63-byte column, get the same `…_fkey` in jed where PostgreSQL names the second `…_fkey1`.
+  (UNIQUE / EXCLUDE / index / sequence names walk the shared relation namespace and match.)
 - **No PostgreSQL system-catalog surface.** FKs are observable through enforcement, the per-core
   host catalog, and jed's `jed_constraints` surface; there is no `pg_constraint`. `ALTER TABLE …
   ADD/DROP CONSTRAINT` supports FKs, while `DROP TABLE … CASCADE` remains outside the grammar

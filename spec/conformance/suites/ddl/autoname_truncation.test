@@ -1,0 +1,176 @@
+# Engine auto-names truncate to the 63-byte identifier limit (spec/design/grammar.md §3.1): an
+# unnamed constraint, index, or owned sequence is named by PostgreSQL's makeObjectName /
+# ChooseRelationName / ChooseConstraintName / ChooseIndexColumnNames — the longer of the table name
+# and the column-name part is shortened first so `<table>_<cols>_<label>` fits in 63 bytes, never
+# splitting a multibyte character, and a collision suffix (`key1`, `check1`, …) re-truncates the
+# parts to fit. Every derived name is then referenceable from SQL: each block proves one by naming
+# it (DROP CONSTRAINT / DROP INDEX / nextval / ON CONFLICT ON CONSTRAINT), which fails 42704 on any
+# other name. Oracle-checked against PostgreSQL 18 (byte-identical names).
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.secondary_index, ddl.index_expr, ddl.serial, ddl.identity, ddl.alter_table, ddl.drop_table, ddl.sequence, func.sequence, dml.insert, dml.insert_on_conflict, query.select, query.order_by, types.i32, types.i64, types.text, types.range
+
+# --- a 63-byte table name and a 63-byte column name ---------------------------------------
+# (63 and 63 bytes)
+
+statement ok
+CREATE TABLE tab012345678901234567890123456789012345678901234567890123456789 (id i32 PRIMARY KEY, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij i32 UNIQUE, d i32 CHECK (d > 0), CHECK (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij > 0), CHECK (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij < 100), s serial, r int4range, EXCLUDE USING gist (r WITH &&))
+
+# the owned sequence: <table>_s_seq, the table name cut to 58 bytes
+query I nosort
+SELECT nextval('tab012345678901234567890123456789012345678901234567890123_s_seq')
+----
+1
+
+# the primary key: the table name alone, cut to 58 bytes + _pkey
+statement ok
+INSERT INTO tab012345678901234567890123456789012345678901234567890123456789 (id, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij, d) VALUES (1, 5, 5)
+
+statement ok
+INSERT INTO tab012345678901234567890123456789012345678901234567890123456789 (id, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij, d) VALUES (1, 6, 6) ON CONFLICT ON CONSTRAINT tab0123456789012345678901234567890123456789012345678901234_pkey DO NOTHING
+
+query II nosort
+SELECT id, d FROM tab012345678901234567890123456789012345678901234567890123456789
+----
+1
+5
+
+# the UNIQUE member: both names exceed half the budget, so each is cut to 29 bytes
+statement ok
+ALTER TABLE tab012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT tab01234567890123456789012345_colabcdefghijabcdefghijabcdef_key
+
+# a single-column CHECK on a short column keeps the column whole
+statement ok
+ALTER TABLE tab012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT tab0123456789012345678901234567890123456789012345678901_d_check
+
+# two CHECKs on the long column: the second takes the label check1, which re-truncates both parts
+statement ok
+ALTER TABLE tab012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT tab0123456789012345678901234_colabcdefghijabcdefghijabcde_check
+
+statement ok
+ALTER TABLE tab012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT tab0123456789012345678901234_colabcdefghijabcdefghijabcd_check1
+
+statement ok
+ALTER TABLE tab012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT tab01234567890123456789012345678901234567890123456789012_r_excl
+
+# CREATE INDEX: idx, then the colliding idx1, idx2 (a repeated key column becomes <col>1, PG's
+# ChooseIndexColumnNames, but the cut name still collides)
+statement ok
+CREATE INDEX ON tab012345678901234567890123456789012345678901234567890123456789 (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij)
+
+statement ok
+CREATE INDEX ON tab012345678901234567890123456789012345678901234567890123456789 (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij)
+
+statement ok
+CREATE INDEX ON tab012345678901234567890123456789012345678901234567890123456789 (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij)
+
+statement ok
+CREATE INDEX ON tab012345678901234567890123456789012345678901234567890123456789 (d, id)
+
+statement ok
+DROP INDEX tab01234567890123456789012345_colabcdefghijabcdefghijabcdef_idx
+
+statement ok
+DROP INDEX tab01234567890123456789012345_colabcdefghijabcdefghijabcde_idx1
+
+statement ok
+DROP INDEX tab01234567890123456789012345_colabcdefghijabcdefghijabcde_idx2
+
+statement ok
+DROP INDEX tab012345678901234567890123456789012345678901234567890_d_id_idx
+
+# --- ALTER TABLE ADD derives the same names -----------------------------------------------
+
+statement ok
+CREATE TABLE alt012345678901234567890123456789012345678901234567890123456789 (id i32 PRIMARY KEY, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij i32, r int4range)
+
+statement ok
+ALTER TABLE alt012345678901234567890123456789012345678901234567890123456789 ADD CHECK (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij > 0), ADD UNIQUE (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij), ADD EXCLUDE USING gist (r WITH &&), ADD FOREIGN KEY (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij) REFERENCES tab012345678901234567890123456789012345678901234567890123456789 (id)
+
+statement ok
+ALTER TABLE alt012345678901234567890123456789012345678901234567890123456789 ADD CHECK (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij > 1), ADD UNIQUE (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij)
+
+statement ok
+ALTER TABLE alt012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT alt0123456789012345678901234_colabcdefghijabcdefghijabcde_check, DROP CONSTRAINT alt0123456789012345678901234_colabcdefghijabcdefghijabcd_check1
+
+statement ok
+ALTER TABLE alt012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT alt01234567890123456789012345_colabcdefghijabcdefghijabcdef_key, DROP CONSTRAINT alt01234567890123456789012345_colabcdefghijabcdefghijabcde_key1
+
+statement ok
+ALTER TABLE alt012345678901234567890123456789012345678901234567890123456789 DROP CONSTRAINT alt01234567890123456789012345678901234567890123456789012_r_excl, DROP CONSTRAINT alt01234567890123456789012345_colabcdefghijabcdefghijabcde_fkey
+
+statement ok
+ALTER TABLE alt012345678901234567890123456789012345678901234567890123456789 ADD COLUMN g i64 GENERATED ALWAYS AS IDENTITY
+
+query I nosort
+SELECT nextval('alt012345678901234567890123456789012345678901234567890123_g_seq')
+----
+1
+
+# --- a collision across tables: the relation namespace is shared --------------------------
+# Two 58-byte table names sharing their first 54 bytes: each UNIQUE name cuts to the same
+# 29-byte table prefix, so the second walks to key1 (the label grows, so both parts shrink).
+
+statement ok
+CREATE TABLE pre01234567890123456789012345678901234567890123456789_one (k i32 PRIMARY KEY, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij i32 UNIQUE)
+
+statement ok
+CREATE TABLE pre01234567890123456789012345678901234567890123456789_two (k i32 PRIMARY KEY, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij i32 UNIQUE)
+
+statement ok
+ALTER TABLE pre01234567890123456789012345678901234567890123456789_one DROP CONSTRAINT pre01234567890123456789012345_colabcdefghijabcdefghijabcdef_key
+
+statement ok
+ALTER TABLE pre01234567890123456789012345678901234567890123456789_two DROP CONSTRAINT pre01234567890123456789012345_colabcdefghijabcdefghijabcde_key1
+
+# both primary keys fit whole (58 + 5 bytes)
+statement ok
+INSERT INTO pre01234567890123456789012345678901234567890123456789_two VALUES (1, 1) ON CONFLICT ON CONSTRAINT pre01234567890123456789012345678901234567890123456789_two_pkey DO NOTHING
+
+# --- a multibyte cut never splits a character ---------------------------------------------
+# The table name is 'a' + 31 two-byte 'é' (63 bytes): the PK's 58-byte budget would cut an 'é'
+# in half, so the name keeps 57 bytes; the UNIQUE's 29-byte halves keep 'a' + 14 'é' each.
+
+statement ok
+CREATE TABLE "aééééééééééééééééééééééééééééééé" (id i32 PRIMARY KEY, "aééééééééééééééééééééééééééééééé" i32 UNIQUE)
+
+statement ok
+INSERT INTO "aééééééééééééééééééééééééééééééé" VALUES (1, 1) ON CONFLICT ON CONSTRAINT "aéééééééééééééééééééééééééééé_pkey" DO NOTHING
+
+statement ok
+ALTER TABLE "aééééééééééééééééééééééééééééééé" DROP CONSTRAINT "aéééééééééééééé_aéééééééééééééé_key"
+
+# --- a repeated index key part is de-duplicated (PG's ChooseIndexColumnNames) ---------------
+
+statement ok
+CREATE TABLE s (a i32, b i32, x text, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij i32)
+
+statement ok
+CREATE INDEX ON s (a, a)
+
+statement ok
+CREATE INDEX ON s (lower(x), lower(x))
+
+statement ok
+CREATE INDEX ON s ((a + 1), (b + 1))
+
+statement ok
+CREATE INDEX ON s ((a + 1), a)
+
+statement ok
+DROP INDEX s_a_a1_idx
+
+statement ok
+DROP INDEX s_lower_lower1_idx
+
+statement ok
+DROP INDEX s_expr_expr1_idx
+
+statement ok
+DROP INDEX s_expr_a_idx
+
+# a long column used twice: the second part is the column cut to 62 bytes + 1, and the
+# joined parts are then cut to fit beside the short table name
+statement ok
+CREATE INDEX ON s (colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij, colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij)
+
+statement ok
+DROP INDEX s_colabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcd_idx

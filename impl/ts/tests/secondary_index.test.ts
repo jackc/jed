@@ -60,20 +60,20 @@ function db20(): Session {
 
 test("auto-naming matches PostgreSQL", () => {
   // <table>_<cols>_idx from the exact (folded) names + the smallest free suffix (oracle-probed,
-  // indexes.md §2); duplicates in the column list are allowed and named through; an explicit name is
-  // the exact name. The catalog holds indexes in ascending name byte order (uppercase M < t).
+  // indexes.md §2); a duplicate column is allowed and its repeat is named b1 (ChooseIndexColumnNames);
+  // an explicit name is the exact name. The catalog holds indexes in ascending name byte order (uppercase M < t).
   const db = memDb().session();
   run(db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx1
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx2
   run(db, "CREATE INDEX ON T (A, B)"); // t_a_b_idx
-  run(db, "CREATE INDEX ON T (B, B)"); // t_b_b_idx (duplicate column allowed — PG)
+  run(db, "CREATE INDEX ON T (B, B)"); // t_b_b1_idx (duplicate column allowed; the repeat is b1 — PG)
   run(db, 'CREATE INDEX "Mine" ON T (B)'); // explicit quoted name, exact case kept
   const t = db.table("t")!;
   assert.deepEqual(
     t.indexes.map((i) => i.name),
-    ["Mine", "t_a_b_idx", "t_b_b_idx", "t_b_idx", "t_b_idx1", "t_b_idx2"],
+    ["Mine", "t_a_b_idx", "t_b_b1_idx", "t_b_idx", "t_b_idx1", "t_b_idx2"],
   );
   assert.deepEqual(indexColumnOrdinals(t.indexes[1]!), [0, 1]);
   assert.deepEqual(indexColumnOrdinals(t.indexes[2]!), [1, 1]);

@@ -105,11 +105,8 @@ export function stampTable(err: unknown, table: string): unknown {
   return err;
 }
 
-// pkeyName is the derived <table>_pkey constraint name PostgreSQL auto-assigns a primary key
-// (jed persists no such relation — constraints.md §5.4).
-export function pkeyName(table: string): string {
-  return table + "_pkey";
-}
+// pkeyName (the derived <table>_pkey constraint name) lives with the other engine auto-names.
+export { pkeyName } from "./autoname.ts";
 
 // --- typed integrity-violation constructors (spec/design/error-fields.md §5) ----------
 // One source per message template (mirrors spec/errors/registry.toml), so the prose and the

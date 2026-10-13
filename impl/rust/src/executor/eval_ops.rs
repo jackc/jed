@@ -1819,7 +1819,7 @@ pub(crate) fn resolve_arbiter(
             ))
         }
         ConflictTarget::Constraint(name) => {
-            let pkey = format!("{}_pkey", tdef.name);
+            let pkey = pkey_name(&tdef.name);
             if !pk.is_empty() && name == &pkey {
                 return Ok(Some(Arbiter::PrimaryKey));
             }

@@ -135,9 +135,16 @@ element in list order, joined with `_`, where the part is:
 - any **other expression** → the literal `expr` (`(a + b)` → `expr`, `(email || 'x')` →
   `expr`).
 
+A part repeating an earlier one becomes `part1`, `part2`, … (PostgreSQL's
+`ChooseIndexColumnNames`): `(a, a)` → `t_a_a1_idx`, `(lower(x), lower(x))` →
+`t_lower_lower1_idx`, `((a + 1), (b + 1))` → `t_expr_expr1_idx` (probed). A base longer than the
+63-byte identifier limit is cut to fit, the longer of the table name and the joined parts
+shortened first, never splitting a character ([grammar.md §3.1](grammar.md)).
+
 If the base is taken (byte-exact), try `<base>1`, `<base>2`, … and take the smallest
 free suffix — so `CREATE INDEX ON t (lower(email))` then `CREATE UNIQUE INDEX ON t (lower(email))`
-yield `t_lower_idx`, `t_lower_idx1` (probed). An explicit name is stored as the **name** (bare spellings fold to lowercase, quoted
+yield `t_lower_idx`, `t_lower_idx1` (probed). The suffix belongs to the label (`idx1`), so a cut
+name re-shortens its parts to make room. An explicit name is stored as the **name** (bare spellings fold to lowercase, quoted
 spellings are exact; comparisons are byte-exact — [grammar.md §3](grammar.md)) — same rule as
 table and CHECK-constraint names.
 

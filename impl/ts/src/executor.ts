@@ -68,6 +68,7 @@ import type {
   WithQuery,
 } from "./ast.ts";
 import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions } from "./ast.ts";
+import { chooseObjectName, indexColumnNames, nameAddition } from "./autoname.ts";
 import {
   type CheckConstraint,
   type ColField,
@@ -6145,12 +6146,8 @@ export class Engine {
         name = def.name;
       } else {
         const cols = checkReferencedColumns(def.expr, columns);
-        const base =
-          cols.length === 1
-            ? table.name + "_" + columns[cols[0]!]!.name + "_check"
-            : table.name + "_check";
-        name = base;
-        for (let suffix = 1; nameTaken(name); suffix++) name = base + suffix.toString();
+        const column = cols.length === 1 ? columns[cols[0]!]!.name : null;
+        name = chooseObjectName(table.name, column, "check", nameTaken);
       }
       checks.push({ name, exprText: def.text, expr: def.expr, hostDeps: checkDeps[ci] });
     }
@@ -6203,13 +6200,13 @@ export class Engine {
         }
         name = ru.name;
       } else {
-        let base = table.name;
-        for (const i of ru.cols) base += "_" + columns[i]!.name;
-        base += "_key";
-        name = base;
-        for (let suffix = 1; relationTaken(name) || checkNameTaken(name); suffix++) {
-          name = base + suffix.toString();
-        }
+        const addition = nameAddition(ru.cols.map((i) => columns[i]!.name));
+        name = chooseObjectName(
+          table.name,
+          addition,
+          "key",
+          (n) => relationTaken(n) || checkNameTaken(n),
+        );
       }
       // Insert in catalog (ascending name byte) order — indexes.md §6.
       let pos = table.indexes.findIndex((ix) => compareName(ix, { name }) > 0);
@@ -6311,11 +6308,8 @@ export class Engine {
         }
         fkName = fk.name;
       } else {
-        let base = table.name;
-        for (const i of local) base += "_" + table.columns[i]!.name;
-        base += "_fkey";
-        fkName = base;
-        for (let suffix = 1; nameTakenFk(fkName); suffix++) fkName = base + suffix.toString();
+        const addition = nameAddition(local.map((i) => table.columns[i]!.name));
+        fkName = chooseObjectName(table.name, addition, "fkey", nameTakenFk);
       }
       // 6. Resolve and store the selected referential actions (§6.6).
       const onDelete = fkAction(fk.onDelete, "DELETE");
@@ -6405,13 +6399,8 @@ export class Engine {
         }
         name = exc.name;
       } else {
-        let base = table.name;
-        for (const i of indices) base += "_" + table.columns[i]!.name;
-        base += "_excl";
-        name = base;
-        for (let suffix = 1; relTaken(name) || conTaken(name); suffix++) {
-          name = base + suffix.toString();
-        }
+        const addition = nameAddition(indices.map((i) => table.columns[i]!.name));
+        name = chooseObjectName(table.name, addition, "excl", (n) => relTaken(n) || conTaken(n));
       }
       // Insert the backing GiST index in catalog (ascending name byte) order.
       let pos = table.indexes.findIndex((ix) => compareName(ix, { name }) > 0);
@@ -6531,28 +6520,23 @@ export class Engine {
   }
 
   // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
-  // (spec/design/sequences.md §12), matching PostgreSQL: lower(table)_lower(column)_seq, with the
-  // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
-  // taken by an existing relation, not equal to the table being created, not already chosen by an
-  // earlier serial column of the same statement (pending), and not held by a caller-known pending
-  // relation. All-lowercase identifier-derived.
+  // (spec/design/sequences.md §12), matching PostgreSQL's ChooseRelationName(table, column, "seq"):
+  // <table>_<column>_seq, truncated to fit 63 bytes (grammar.md §3.1), with the smallest integer
+  // suffix seq1, seq2, … until the name is free in the relation namespace — not taken by an existing
+  // relation, not equal to the table being created, not already chosen by an earlier serial column
+  // of the same statement (pending), and not held by a caller-known pending relation.
   private chooseSerialSeqName(
     table: string,
     column: string,
     pending: SequenceDef[],
     reserved: string[],
   ): string {
-    const base = `${table}_${column}_seq`;
     const taken = (c: string): boolean =>
       this.relationExists(c) ||
       c === table ||
       pending.some((s) => s.name === c) ||
       reserved.some((name) => name === c);
-    if (!taken(base)) return base;
-    for (let n = 1; ; n++) {
-      const cand = base + n.toString();
-      if (!taken(cand)) return cand;
-    }
+    return chooseObjectName(table, column, "seq", taken);
   }
 
   // resolveChecks resolves a table's CHECK constraints for a write statement: each stored
@@ -7483,17 +7467,17 @@ export class Engine {
               if (rt.kind !== "bool" && rt.kind !== "null")
                 throw typeError("argument of CHECK must be boolean");
               const hostDeps = collectCheckHostDeps(rn, this.session.extensions);
-              let name = d.name ?? `${table.name}_check`;
+              let name: string;
               if (d.name === null) {
                 const rs = checkReferencedColumns(d.expr, table.columns);
-                if (rs.length === 1)
-                  name = `${table.name}_${table.columns[rs[0]!]!.name}_check`;
-                for (let n = 1; taken(name); n++) name = name.replace(/\d+$/, "") + n;
-              } else if (taken(name))
+                const column = rs.length === 1 ? table.columns[rs[0]!]!.name : null;
+                name = chooseObjectName(table.name, column, "check", taken);
+              } else if (taken(d.name)) {
                 throw engineError(
                   "duplicate_object",
-                  `constraint ${name} for relation ${table.name} already exists`,
+                  `constraint ${d.name} for relation ${table.name} already exists`,
                 );
+              } else name = d.name;
               table.checks.push({ name, exprText: d.text, expr: d.expr, hostDeps });
               table.checks.sort(compareName);
               added.add(name);
@@ -7533,10 +7517,13 @@ export class Engine {
                     `constraint ${name} for relation ${table.name} already exists`,
                   );
               } else {
-                const base = `${table.name}_${cols.map((i) => table.columns[i]!.name).join("_")}_key`;
-                name = base;
-                for (let suffix = 1; workingRelationTaken(name) || taken(name); suffix++)
-                  name = base + suffix.toString();
+                const addition = nameAddition(cols.map((i) => table.columns[i]!.name));
+                name = chooseObjectName(
+                  table.name,
+                  addition,
+                  "key",
+                  (n) => workingRelationTaken(n) || taken(n),
+                );
               }
               table.indexes.push({
                 name,
@@ -7617,9 +7604,8 @@ export class Engine {
                     `constraint ${name} for relation ${table.name} already exists`,
                   );
               } else {
-                const base = `${table.name}_${local.map((i) => table.columns[i]!.name).join("_")}_fkey`;
-                name = base;
-                for (let suffix = 1; taken(name); suffix++) name = base + suffix.toString();
+                const addition = nameAddition(local.map((i) => table.columns[i]!.name));
+                name = chooseObjectName(table.name, addition, "fkey", taken);
               }
               for (let p = 0; p < local.length; p++) {
                 const li = local[p]!,
@@ -7656,10 +7642,13 @@ export class Engine {
                     `constraint ${name} for relation ${table.name} already exists`,
                   );
               } else {
-                const base = `${table.name}_${cols.map((i) => table.columns[i]!.name).join("_")}_excl`;
-                name = base;
-                for (let suffix = 1; workingRelationTaken(name) || taken(name); suffix++)
-                  name = base + suffix.toString();
+                const addition = nameAddition(cols.map((i) => table.columns[i]!.name));
+                name = chooseObjectName(
+                  table.name,
+                  addition,
+                  "excl",
+                  (n) => workingRelationTaken(n) || taken(n),
+                );
               }
               table.indexes.push({
                 name,
@@ -8983,14 +8972,12 @@ export class Engine {
       name = ci.name;
     } else {
       // PG's ChooseIndexName / ChooseIndexColumnNames (probed): exact table + one name part per
-      // key element (list order, duplicates included) + "idx", then the smallest free suffix. A
-      // column key's part is the column name; a bare-function-call expression's is the function name
-      // (`lower(email)` → `lower`); any other expression's is the literal `expr` (indexes.md §2).
-      let base = tableKey;
-      for (const elem of ci.keys) base += "_" + indexNamePart(elem);
-      base += "_idx";
-      name = base;
-      for (let suffix = 1; relationTaken(name); suffix++) name = base + suffix.toString();
+      // key element (list order; a repeated part becomes `part1`, …) + "idx", truncated to fit 63
+      // bytes, then the smallest free suffix. A column key's part is the column name; a
+      // bare-function-call expression's is the function name (`lower(email)` → `lower`); any other
+      // expression's is the literal `expr` (indexes.md §2, grammar.md §3.1).
+      const parts = indexColumnNames(ci.keys.map(indexNamePart));
+      name = chooseObjectName(tableKey, nameAddition(parts), "idx", relationTaken);
     }
 
     // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per row. The
@@ -24707,7 +24694,7 @@ export function resolveArbiter(table: Table, target: ConflictTarget | null): Arb
       "there is no unique or exclusion constraint matching the ON CONFLICT specification",
     );
   }
-  const pkey = table.name + "_pkey";
+  const pkey = pkeyName(table.name);
   if (pk.length > 0 && target.name === pkey) return { isPK: true };
   for (let i = 0; i < table.indexes.length; i++) {
     const def = table.indexes[i]!;

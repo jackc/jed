@@ -68,9 +68,9 @@ func siDB20(t *testing.T) *Session {
 }
 
 // Auto-naming matches PostgreSQL (oracle-probed, indexes.md §2): <table>_<cols>_idx from the
-// exact (folded) names + the smallest free suffix; duplicates in the column list are allowed and
-// named through; an explicit name is the exact name. The catalog holds indexes in ascending name
-// byte order.
+// exact (folded) names + the smallest free suffix; a duplicate column is allowed and its
+// repeat is named b1 (ChooseIndexColumnNames); an explicit name is the exact name. The
+// catalog holds indexes in ascending name byte order.
 func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
@@ -79,14 +79,14 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 	siRun(t, db, "CREATE INDEX ON T (B)")        // t_b_idx1
 	siRun(t, db, "CREATE INDEX ON T (B)")        // t_b_idx2
 	siRun(t, db, "CREATE INDEX ON T (A, B)")     // t_a_b_idx
-	siRun(t, db, "CREATE INDEX ON T (B, B)")     // t_b_b_idx (duplicate column allowed — PG)
+	siRun(t, db, "CREATE INDEX ON T (B, B)")     // t_b_b1_idx (duplicate column allowed; the repeat is b1 — PG)
 	siRun(t, db, `CREATE INDEX "Mine" ON T (B)`) // explicit quoted name, exact case kept
 	tab, _ := db.Table("t")
 	names := make([]string, 0, len(tab.Indexes))
 	for _, ix := range tab.Indexes {
 		names = append(names, ix.Name)
 	}
-	want := []string{"Mine", "t_a_b_idx", "t_b_b_idx", "t_b_idx", "t_b_idx1", "t_b_idx2"}
+	want := []string{"Mine", "t_a_b_idx", "t_b_b1_idx", "t_b_idx", "t_b_idx1", "t_b_idx2"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("index names = %v, want %v", names, want)
 	}

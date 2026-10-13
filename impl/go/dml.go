@@ -659,7 +659,7 @@ func resolveArbiter(table *catTable, target *conflictTarget) (*arbiter, error) {
 		return nil, newError(InvalidColumnReference,
 			"there is no unique or exclusion constraint matching the ON CONFLICT specification")
 	}
-	pkey := table.Name + "_pkey"
+	pkey := pkeyName(table.Name)
 	if len(pk) > 0 && target.Constraint == pkey {
 		return &arbiter{isPK: true}, nil
 	}

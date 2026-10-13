@@ -1898,11 +1898,12 @@ impl Engine {
     }
 
     /// Choose the auto-generated name for a `serial` column's OWNED sequence (sequences.md §12),
-    /// matching PostgreSQL: `lower(table)_lower(column)_seq`, with the smallest integer suffix `1`,
-    /// `2`, … appended until the name is free in the relation namespace — not taken by an existing
+    /// matching PostgreSQL's `ChooseRelationName(table, column, "seq")`: `<table>_<column>_seq`,
+    /// truncated to fit 63 bytes (grammar.md §3.1), with the smallest integer suffix `seq1`,
+    /// `seq2`, … until the name is free in the relation namespace — not taken by an existing
     /// relation, not equal to the table being created, not already chosen by an earlier `serial`
     /// column of the same statement (`pending`), and not held by a caller-known pending relation.
-    /// All-lowercase identifier-derived, so deterministic.
+    /// Identifier-derived, so deterministic.
     pub(crate) fn choose_serial_seq_name(
         &self,
         table: &str,
@@ -1910,24 +1911,12 @@ impl Engine {
         pending: &[SequenceDef],
         reserved: &[String],
     ) -> String {
-        let base = format!("{}_{}_seq", table, column);
-        let taken = |c: &str| {
+        choose_object_name(table, Some(column), "seq", |c| {
             self.relation_exists(c)
                 || c == table
                 || pending.iter().any(|s| s.name == c)
                 || reserved.iter().any(|name| name == c)
-        };
-        if !taken(&base) {
-            return base;
-        }
-        let mut n = 1u32;
-        loop {
-            let cand = format!("{base}{n}");
-            if !taken(&cand) {
-                return cand;
-            }
-            n += 1;
-        }
+        })
     }
 }
 

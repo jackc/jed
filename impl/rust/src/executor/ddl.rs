@@ -1132,17 +1132,13 @@ impl Engine {
                 }
                 None => {
                     let cols = check_referenced_columns(&def.expr, &table.columns);
-                    let base = match cols.as_slice() {
-                        [i] => format!("{}_{}_check", table.name, table.columns[*i].name),
-                        _ => format!("{}_check", table.name),
+                    let column = match cols.as_slice() {
+                        [i] => Some(table.columns[*i].name.to_string()),
+                        _ => None,
                     };
-                    let mut candidate = base.clone();
-                    let mut suffix = 0u32;
-                    while checks.iter().any(|c| c.name == candidate) {
-                        suffix += 1;
-                        candidate = format!("{base}{suffix}");
-                    }
-                    candidate
+                    choose_object_name(&table.name, column.as_deref(), "check", |n| {
+                        checks.iter().any(|c| c.name == n)
+                    })
                 }
             };
             checks.push(CheckConstraint {
@@ -1203,21 +1199,11 @@ impl Engine {
                     n
                 }
                 None => {
-                    let mut base = table.name.to_string();
-                    for &i in &cols {
-                        base.push('_');
-                        base.push_str(&table.columns[i].name.to_string());
-                    }
-                    base.push_str("_key");
-                    let mut candidate = base.clone();
-                    let mut suffix = 0u32;
-                    while taken(self, &table, &candidate)
-                        || table.checks.iter().any(|c| c.name == candidate)
-                    {
-                        suffix += 1;
-                        candidate = format!("{base}{suffix}");
-                    }
-                    candidate
+                    let names: Vec<&str> = cols.iter().map(|&i| &*table.columns[i].name).collect();
+                    let addition = name_addition(&names);
+                    choose_object_name(&table.name, Some(&addition), "key", |n| {
+                        taken(self, &table, n) || table.checks.iter().any(|c| c.name == n)
+                    })
                 }
             };
             // Insert in catalog (ascending name byte) order — indexes.md §6.
@@ -1349,21 +1335,12 @@ impl Engine {
                     n.clone()
                 }
                 None => {
-                    let mut base = table.name.to_string();
-                    for &i in &local {
-                        base.push('_');
-                        base.push_str(&table.columns[i].name.to_string());
-                    }
-                    base.push_str("_fkey");
-                    let mut candidate = base.clone();
-                    let mut suffix = 0u32;
-                    while table.checks.iter().any(|c| c.name == candidate)
-                        || resolved_fks.iter().any(|f| f.name == candidate)
-                    {
-                        suffix += 1;
-                        candidate = format!("{base}{suffix}");
-                    }
-                    candidate
+                    let names: Vec<&str> = local.iter().map(|&i| &*table.columns[i].name).collect();
+                    let addition = name_addition(&names);
+                    choose_object_name(&table.name, Some(&addition), "fkey", |n| {
+                        table.checks.iter().any(|c| c.name == n)
+                            || resolved_fks.iter().any(|f| f.name == n)
+                    })
                 }
             };
             // 6. Resolve and store the selected referential actions (§6.6).
@@ -1457,19 +1434,12 @@ impl Engine {
                     n.clone()
                 }
                 None => {
-                    let mut base = table.name.to_string();
-                    for &i in &indices {
-                        base.push('_');
-                        base.push_str(&table.columns[i].name.to_string());
-                    }
-                    base.push_str("_excl");
-                    let mut candidate = base.clone();
-                    let mut suffix = 0u32;
-                    while taken(self, &table, &candidate) || constraint_taken(&table, &candidate) {
-                        suffix += 1;
-                        candidate = format!("{base}{suffix}");
-                    }
-                    candidate
+                    let names: Vec<&str> =
+                        indices.iter().map(|&i| &*table.columns[i].name).collect();
+                    let addition = name_addition(&names);
+                    choose_object_name(&table.name, Some(&addition), "excl", |n| {
+                        taken(self, &table, n) || constraint_taken(&table, n)
+                    })
                 }
             };
             // Insert the backing GiST index in catalog (ascending name byte) order.
@@ -2344,25 +2314,22 @@ impl Engine {
                                 }
                                 let host_deps =
                                     collect_check_host_deps(&node, &self.session.extensions)?;
-                                let mut name = d
-                                    .name
-                                    .clone()
-                                    .unwrap_or_else(|| format!("{}_check", table.name));
-                                if d.name.is_none() {
+                                let name = if let Some(name) = d.name.clone() {
+                                    name
+                                } else {
                                     let rs = check_referenced_columns(&d.expr, &table.columns);
-                                    if rs.len() == 1 {
-                                        name = format!(
-                                            "{}_{}_check",
-                                            table.name, table.columns[rs[0]].name
-                                        );
-                                    }
-                                    let base = name.clone();
-                                    let mut suffix = 0u32;
-                                    while constraint_name_taken(&table, &name) {
-                                        suffix += 1;
-                                        name = format!("{base}{suffix}");
-                                    }
-                                } else if constraint_name_taken(&table, &name) {
+                                    let column = match rs.as_slice() {
+                                        [i] => Some(table.columns[*i].name.to_string()),
+                                        _ => None,
+                                    };
+                                    choose_object_name(
+                                        &table.name,
+                                        column.as_deref(),
+                                        "check",
+                                        |n| constraint_name_taken(&table, n),
+                                    )
+                                };
+                                if d.name.is_some() && constraint_name_taken(&table, &name) {
                                     return Err(EngineError::new(
                                         SqlState::DuplicateObject,
                                         format!(
@@ -2436,27 +2403,17 @@ impl Engine {
                                     }
                                     name
                                 } else {
-                                    let base = format!(
-                                        "{}_{}_key",
-                                        table.name,
-                                        cols.iter()
-                                            .map(|i| table.columns[*i].name.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join("_")
-                                    );
-                                    let mut name = base.clone();
-                                    let mut suffix = 0u32;
-                                    while working_relation_taken(
-                                        &table,
-                                        &pending_serials,
-                                        &dropped_owned_sequences,
-                                        &name,
-                                    ) || constraint_name_taken(&table, &name)
-                                    {
-                                        suffix += 1;
-                                        name = format!("{base}{suffix}");
-                                    }
-                                    name
+                                    let names: Vec<&str> =
+                                        cols.iter().map(|&i| &*table.columns[i].name).collect();
+                                    let addition = name_addition(&names);
+                                    choose_object_name(&table.name, Some(&addition), "key", |n| {
+                                        working_relation_taken(
+                                            &table,
+                                            &pending_serials,
+                                            &dropped_owned_sequences,
+                                            n,
+                                        ) || constraint_name_taken(&table, n)
+                                    })
                                 };
                                 table.indexes.push(IndexDef {
                                     name: name.clone(),
@@ -2565,22 +2522,12 @@ impl Engine {
                                     }
                                     name
                                 } else {
-                                    let base = format!(
-                                        "{}_{}_fkey",
-                                        table.name,
-                                        local
-                                            .iter()
-                                            .map(|i| table.columns[*i].name.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join("_")
-                                    );
-                                    let mut name = base.clone();
-                                    let mut suffix = 0u32;
-                                    while constraint_name_taken(&table, &name) {
-                                        suffix += 1;
-                                        name = format!("{base}{suffix}");
-                                    }
-                                    name
+                                    let names: Vec<&str> =
+                                        local.iter().map(|&i| &*table.columns[i].name).collect();
+                                    let addition = name_addition(&names);
+                                    choose_object_name(&table.name, Some(&addition), "fkey", |n| {
+                                        constraint_name_taken(&table, n)
+                                    })
                                 };
                                 for (&li, &ri) in local.iter().zip(&refs) {
                                     if table.columns[li].ty != parent.columns[ri].ty {
@@ -2638,27 +2585,17 @@ impl Engine {
                                     }
                                     name
                                 } else {
-                                    let base = format!(
-                                        "{}_{}_excl",
-                                        table.name,
-                                        cols.iter()
-                                            .map(|i| table.columns[*i].name.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join("_")
-                                    );
-                                    let mut name = base.clone();
-                                    let mut suffix = 0u32;
-                                    while working_relation_taken(
-                                        &table,
-                                        &pending_serials,
-                                        &dropped_owned_sequences,
-                                        &name,
-                                    ) || constraint_name_taken(&table, &name)
-                                    {
-                                        suffix += 1;
-                                        name = format!("{base}{suffix}");
-                                    }
-                                    name
+                                    let names: Vec<&str> =
+                                        cols.iter().map(|&i| &*table.columns[i].name).collect();
+                                    let addition = name_addition(&names);
+                                    choose_object_name(&table.name, Some(&addition), "excl", |n| {
+                                        working_relation_taken(
+                                            &table,
+                                            &pending_serials,
+                                            &dropped_owned_sequences,
+                                            n,
+                                        ) || constraint_name_taken(&table, n)
+                                    })
                                 };
                                 table.indexes.push(IndexDef {
                                     name: name.clone(),
@@ -3215,7 +3152,7 @@ impl Engine {
                         let pk_ords: Vec<usize> = pk.iter().map(|(o, _)| *o).collect();
                         return Err(EngineError::unique_violation(
                             &table.name,
-                            format!("{}_pkey", table.name),
+                            pkey_name(&table.name),
                         )
                         .with_detail(self.pk_detail(
                             &table.name,
@@ -4639,23 +4576,14 @@ impl Engine {
             }
             None => {
                 // PG's ChooseIndexName / ChooseIndexColumnNames (probed): exact table + one
-                // name part per key element (list order, duplicates included) + "idx", then the
-                // smallest free suffix. A column key's part is the column name; a bare-function-call
-                // expression's is the function name (`lower(email)` → `lower`); any other
-                // expression's is the literal `expr` (indexes.md §2).
-                let mut base = table_key.clone();
-                for elem in &ci.keys {
-                    base.push('_');
-                    base.push_str(&index_name_part(elem));
-                }
-                base.push_str("_idx");
-                let mut candidate = base.clone();
-                let mut suffix = 0u32;
-                while relation_taken(&candidate) {
-                    suffix += 1;
-                    candidate = format!("{base}{suffix}");
-                }
-                candidate
+                // name part per key element (list order; a repeated part becomes `part1`, …) +
+                // "idx", truncated to fit 63 bytes, then the smallest free suffix. A column key's
+                // part is the column name; a bare-function-call expression's is the function name
+                // (`lower(email)` → `lower`); any other expression's is the literal `expr`
+                // (indexes.md §2, grammar.md §3.1).
+                let parts = index_column_names(ci.keys.iter().map(index_name_part).collect());
+                let addition = name_addition(&parts);
+                choose_object_name(&table_key, Some(&addition), "idx", |n| relation_taken(n))
             }
         };
 

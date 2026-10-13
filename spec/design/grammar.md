@@ -168,6 +168,39 @@ reserved a word another did not, the corpus would diverge. Recording the rule in
 grammar keeps all cores honest. (Canonical *output* names — `i16` not `smallint` — are
 a separate determinism rule owned by the type system, see [types.md](types.md) §2.)
 
+### 3.1 Engine auto-names fit the identifier limit
+
+A name the engine derives for an unnamed object — a constraint (`<table>_pkey`,
+`<table>_<cols>_key`, `…_fkey`, `…_check`, `…_excl`), an index (`<table>_<parts>_idx`), or a
+`serial` / identity column's owned sequence (`<table>_<column>_seq`) — always fits the 63-byte
+identifier limit ([cost.md](cost.md) §7a), so it can be written in SQL (`DROP INDEX`, `ALTER TABLE
+… DROP CONSTRAINT`, `nextval('…')`, `ON CONFLICT ON CONSTRAINT`). The algorithm is PostgreSQL's,
+byte for byte (`makeObjectName` / `ChooseRelationName` / `ChooseConstraintName` /
+`ChooseIndexNameAddition` / `ChooseIndexColumnNames`, `indexcmds.c` + `pg_constraint.c`):
+
+- **Parts.** `name1` is the exact table name; `name2` is the column part — one column name (a
+  single-column CHECK, a `serial`), the column names joined by `_` (UNIQUE / FK / EXCLUDE members,
+  index parts; the join stops once it reaches 64 bytes), or absent (`pkey`, a CHECK naming zero or
+  several columns). The `label` is `pkey` / `key` / `fkey` / `check` / `excl` / `idx` / `seq`.
+- **Cut.** With `overhead` = the label's bytes + one `_` per separator, the parts may use
+  `63 − overhead` bytes. While they exceed it, the **longer** of the two loses one byte (`name2`
+  when they are equal). Each part is then clipped back to a UTF-8 character boundary (PostgreSQL's
+  `pg_mbcliplen`), so a cut never splits a character, and the name is
+  `name1[_name2]_label`. The label is never cut.
+- **Collision.** If the name is taken in its namespace (the object kind's existing rules —
+  constraints.md §4.3/§5.3/§6.2, indexes.md §2, sequences.md §12), the label becomes `label1`,
+  `label2`, … and the name is rebuilt from the same parts, so a longer label shortens the parts
+  (`…_abcde_check`, then `…_abcd_check1`). The derived PK name is not persisted and takes no suffix
+  (constraints.md §5.4).
+- **Index parts are de-duplicated first** (`ChooseIndexColumnNames`): a key part equal to an
+  earlier one becomes `part1`, `part2`, … (the part clipped so the suffixed form fits 63 bytes),
+  so `CREATE INDEX ON t (a, a)` is `t_a_a1_idx` and `(lower(x), lower(x))` is
+  `t_lower_lower1_idx`.
+
+A name that fits is unchanged — `t_a_key` stays `t_a_key`. Every auto-name is persisted as chosen,
+so this changes only what newly created objects are called; existing databases keep their stored
+names (no format change).
+
 ## 4. Lexical edges: the minus operator and two-character operators
 
 Two lexer facts are easy to get subtly wrong across cores, so the grammar pins them:

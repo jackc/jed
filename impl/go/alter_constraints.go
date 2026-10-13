@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 )
 
 // alterConstraintState is the statement-local catalog work needed by ALTER TABLE slice 2. The
@@ -262,13 +261,11 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 		} else {
 			refs := checkReferencedColumns(d.Expr, t.Columns)
-			base := t.Name + "_check"
+			taken := func(n string) bool { return constraintNameTaken(t, n) }
 			if len(refs) == 1 {
-				base = t.Name + "_" + t.Columns[refs[0]].Name + "_check"
-			}
-			name = base
-			for n := 1; constraintNameTaken(t, name); n++ {
-				name = base + strconv.Itoa(n)
+				name = chooseObjectName(t.Name, t.Columns[refs[0]].Name, true, "check", taken)
+			} else {
+				name = chooseObjectName(t.Name, "", false, "check", taken)
 			}
 		}
 		t.Checks = append(t.Checks, checkConstraint{Name: name, ExprText: d.Text, Expr: d.Expr, HostDeps: hostDeps})
@@ -305,15 +302,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				return newError(DuplicateObject, "constraint "+name+" for relation "+t.Name+" already exists")
 			}
 		} else {
-			base := t.Name
-			for _, ci := range cols {
-				base += "_" + t.Columns[ci].Name
-			}
-			base += "_key"
-			name = base
-			for n := 1; relationTaken(name) || constraintNameTaken(t, name); n++ {
-				name = base + strconv.Itoa(n)
-			}
+			name = chooseObjectName(t.Name, nameAddition(columnNames(t.Columns, cols)), true, "key", func(n string) bool {
+				return relationTaken(n) || constraintNameTaken(t, n)
+			})
 		}
 		t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Unique: true, Kind: indexBtree})
 		sort.SliceStable(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })
@@ -369,15 +360,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				return newError(DuplicateObject, "constraint "+name+" for relation "+t.Name+" already exists")
 			}
 		} else {
-			base := t.Name
-			for _, ci := range local {
-				base += "_" + t.Columns[ci].Name
-			}
-			base += "_fkey"
-			name = base
-			for n := 1; constraintNameTaken(t, name); n++ {
-				name = base + strconv.Itoa(n)
-			}
+			name = chooseObjectName(t.Name, nameAddition(columnNames(t.Columns, local)), true, "fkey", func(n string) bool {
+				return constraintNameTaken(t, n)
+			})
 		}
 		onDelete, err := newFkAction(d.OnDelete, "DELETE")
 		if err != nil {
@@ -460,15 +445,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			return newError(DuplicateObject, "constraint "+name+" for relation "+t.Name+" already exists")
 		}
 	} else {
-		base := t.Name
-		for _, ci := range cols {
-			base += "_" + t.Columns[ci].Name
-		}
-		base += "_excl"
-		name = base
-		for n := 1; relationTaken(name) || constraintNameTaken(t, name); n++ {
-			name = base + strconv.Itoa(n)
-		}
+		name = chooseObjectName(t.Name, nameAddition(columnNames(t.Columns, cols)), true, "excl", func(n string) bool {
+			return relationTaken(n) || constraintNameTaken(t, n)
+		})
 	}
 	t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Kind: indexGist})
 	sort.SliceStable(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })

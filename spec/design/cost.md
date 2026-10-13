@@ -1823,6 +1823,8 @@ for a quoted one the limit is on the decoded name's UTF-8 bytes (after `""` coll
 the delimiters), so `"café"` counts 5 bytes ([grammar.md](grammar.md) §3); a collation name after
 `COLLATE` is a quoted identifier and is bounded the same way. A name taken from a text argument
 (`nextval('…')`) or the host API is not length-checked — an over-long name simply names nothing.
+A name the engine derives (a constraint, index, or owned-sequence auto-name) is cut to fit the
+same 63 bytes, PostgreSQL's way ([grammar.md](grammar.md) §3.1), so it stays nameable from SQL.
 **63** matches
 PostgreSQL's `NAMEDATALEN − 1` boundary, but jed **errors** where PG silently *truncates* — jed has
 no notices, and a silent truncation could collide two distinct names (a documented PG divergence,

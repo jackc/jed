@@ -498,7 +498,10 @@ For each `serial` column `c` of table `t`, in column declaration order:
    `CREATE TABLE "Tab" (id serial)` gives `Tab_id_seq`, as PostgreSQL). If that name already names a relation
    (table / index / sequence — the shared relation namespace, §2), including a sequence created by an
    *earlier* `serial` column of the **same** statement, the smallest integer suffix `1`, `2`, … is
-   appended until free (`t_id_seq` taken → `t_id_seq1`), matching PG's `ChooseRelationName`.
+   appended until free (`t_id_seq` taken → `t_id_seq1`), matching PG's `ChooseRelationName`. A name
+   past the 63-byte identifier limit is cut to fit, the longer of the table and column names
+   shortened first ([grammar.md §3.1](grammar.md)), so the owned sequence stays nameable in
+   `nextval('…')`.
 6. **The column `DEFAULT`** becomes the expression default `nextval ( '<seqname>' )`, the name written
    bare when it matches `[a-z_][a-z0-9_]*` and otherwise double-quoted inside the literal (so it survives
    §4's identifier parse — `nextval('"Tab_id_seq"')`, as PostgreSQL; [grammar.md §3](grammar.md)) — stored as
