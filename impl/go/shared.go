@@ -543,6 +543,17 @@ type storage struct {
 	// host spill directory (temp-tables.md §6). Once spilled it stays spilled; its pool is then bounded
 	// by tempBuffers instead of pinned. Always false for a main or attached domain.
 	spilled bool
+	// files is the file host a file-backed domain's compaction goes through (filehost.go); nil is the
+	// OS. Only the deterministic simulator sets another.
+	files fileHost
+}
+
+// fileHost is the file host this domain's file operations go through.
+func (st *storage) fileHost() fileHost {
+	if st.files == nil {
+		return osFiles
+	}
+	return st.files
 }
 
 // storageBudget is the max_storage_bytes state of one domain (memory.md §8.1–§8.3, §8.7): the
@@ -1008,7 +1019,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	var paging *sharedPaging
 	if st.path != "" {
 		var err error
-		paging, err = compactFile(st.path, snap, st.pageSize, txid, st.paging, capacity)
+		paging, err = compactFile(st.fileHost(), st.path, snap, st.pageSize, txid, st.paging, capacity)
 		if err != nil {
 			return nil, err
 		}

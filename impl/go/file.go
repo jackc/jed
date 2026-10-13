@@ -319,86 +319,55 @@ func writeAtomic(path string, bytes []byte, noSync bool) error {
 // as they were. If the rename fails, the old file is reopened into old. If reopening the new file
 // fails, old stays closed and poisoned, so the handle must be reopened. Returns the replacement paging
 // context, a pool of capacity leaves over the new file.
-func compactFile(path string, snap *snapshot, pageSize uint32, txid uint64, old *sharedPaging, capacity int) (*sharedPaging, error) {
+func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, txid uint64, old *sharedPaging, capacity int) (*sharedPaging, error) {
 	var noSync bool
 	_ = old.withPager(func(p *pager) error { noSync = p.skipsSync(); return nil })
 	// Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
-	real, err := filepath.EvalSymlinks(path)
+	real, err := files.realPath(path)
 	if err != nil {
-		return nil, ioError(err)
+		return nil, err
 	}
 	tmp := real + ".jedtmp"
-	if err := writeImageFile(tmp, real, snap, pageSize, txid, noSync); err != nil {
-		os.Remove(tmp)
+	if err := files.writeFile(tmp, real, noSync, func(writeAt func(off int64, p []byte) error) error {
+		_, err := snap.writeImage(pageSize, txid, func(index uint32, page []byte) error {
+			return writeAt(int64(index)*int64(pageSize), page)
+		})
+		return err
+	}); err != nil {
+		files.remove(tmp)
 		return nil, err
 	}
 
 	// Close the old file before the rename: Windows cannot replace a file that is still open.
 	_ = old.withPager(func(p *pager) error { return p.swapStore(closedBlockStore{}).close() })
-	if err := os.Rename(tmp, real); err != nil {
-		os.Remove(tmp)
+	if err := files.rename(tmp, real); err != nil {
+		files.remove(tmp)
 		_ = old.withPager(func(p *pager) error {
-			f, oerr := os.OpenFile(real, os.O_RDWR, 0)
+			store, oerr := files.openStore(real, noSync)
 			if oerr != nil {
 				p.poison()
 				return nil
 			}
-			p.swapStore(&fileBlockStore{f: f, noSync: noSync})
+			p.swapStore(store)
 			return nil
 		})
-		return nil, ioError(err)
+		return nil, err
 	}
 	_ = old.withPager(func(p *pager) error { p.poison(); return nil })
 	// Directory fsync makes the rename itself durable (best-effort, as in writeAtomic).
 	if !noSync {
-		if d, derr := os.Open(filepath.Dir(real)); derr == nil {
-			_ = d.Sync()
-			_ = d.Close()
-		}
+		files.syncDir(filepath.Dir(real))
 	}
-	f, err := os.OpenFile(real, os.O_RDWR, 0)
+	store, err := files.openStore(real, noSync)
 	if err != nil {
-		return nil, ioError(err)
+		return nil, err
 	}
-	p, err := pagerFromStore(&fileBlockStore{f: f, noSync: noSync})
+	p, err := pagerFromStore(store)
 	if err != nil {
-		_ = f.Close()
+		_ = store.close()
 		return nil, err
 	}
 	return newSharedPaging(p, capacity), nil
-}
-
-// writeImageFile streams snap's from-scratch image at txid into a fresh file at tmp with positioned
-// writes, gives it the permission bits of the file at real, and syncs it unless noSync. The caller
-// removes tmp on failure.
-func writeImageFile(tmp, real string, snap *snapshot, pageSize uint32, txid uint64, noSync bool) error {
-	f, err := os.Create(tmp)
-	if err != nil {
-		return ioError(err)
-	}
-	_, err = snap.writeImage(pageSize, txid, func(index uint32, page []byte) error {
-		if _, werr := f.WriteAt(page, int64(index)*int64(pageSize)); werr != nil {
-			return ioError(werr)
-		}
-		return nil
-	})
-	if err == nil {
-		var info os.FileInfo
-		if info, err = os.Stat(real); err != nil {
-			err = ioError(err)
-		} else if cerr := f.Chmod(info.Mode().Perm()); cerr != nil {
-			err = ioError(cerr)
-		}
-	}
-	if err == nil && !noSync {
-		if serr := f.Sync(); serr != nil {
-			err = ioError(serr)
-		}
-	}
-	if cerr := f.Close(); err == nil && cerr != nil {
-		err = ioError(cerr)
-	}
-	return err
 }
 
 func ioError(err error) error {
