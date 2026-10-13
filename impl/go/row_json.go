@@ -7,6 +7,7 @@ package jed
 // arguments here (spec/design/json-sql-functions.md §2.2).
 
 import (
+	"math"
 	"strconv"
 	"strings"
 )
@@ -76,7 +77,13 @@ func datumToJSON(v Value, ty resolvedType, zone ZoneRef, out *strings.Builder) e
 		}
 		writeJSONString(text, out)
 	case ValFloat32, ValFloat64:
-		return floatJSONDeferred()
+		// PostgreSQL's float8out/float4out text: a number, or the JSON string of NaN/±Infinity.
+		f, bits := floatOf(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			writeJSONString(renderFloatPG(f, bits), out)
+		} else {
+			out.WriteString(renderFloatPG(f, bits))
+		}
 	case ValInterval, ValUuid, ValBytea, ValRange, ValJsonPath:
 		// Every other type is the JSON string of its text output (a range's timestamptz bounds in
 		// the session zone).
@@ -176,7 +183,12 @@ func datumToJSONB(v Value, ty resolvedType, zone ZoneRef) (JsonNode, error) {
 		}
 		return JsonNode{Kind: JString, S: text}, nil
 	case ValFloat32, ValFloat64:
-		return JsonNode{}, floatJSONDeferred()
+		// The number numeric_in reads from the float8out/float4out text; NaN/±Infinity are strings.
+		f, bits := floatOf(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return JsonNode{Kind: JString, S: renderFloatPG(f, bits)}, nil
+		}
+		return JsonNode{Kind: JNumber, Num: floatJSONNumber(f, bits)}, nil
 	case ValInterval, ValUuid, ValBytea, ValRange, ValJsonPath:
 		text, err := v.renderIn(zone)
 		if err != nil {
@@ -234,7 +246,8 @@ func jsonKeyText(v Value, zone ZoneRef) (string, error) {
 	case ValTimestamptz:
 		return renderTimestamptzXSDIn(v.Int, zone)
 	case ValFloat32, ValFloat64:
-		return "", floatJSONDeferred()
+		f, bits := floatOf(v)
+		return renderFloatPG(f, bits), nil
 	case ValInterval, ValUuid, ValBytea, ValRange, ValJsonPath:
 		return v.renderIn(zone)
 	case ValNull:
@@ -248,11 +261,4 @@ func jsonKeyText(v Value, zone ZoneRef) (string, error) {
 // with an extra "\n " — PostgreSQL does so for the array and composite categories.
 func jsonAggBreaksLine(ty resolvedType) bool {
 	return ty.kind == rtArray || ty.kind == rtComposite
-}
-
-// floatJSONDeferred is the 0A000 for a float anywhere in a JSON conversion: jed keeps binary floats
-// out of its byte-identical text outputs (each core's shortest round-trip layout differs — the
-// float-render-layout determinism-ledger entry), so their JSON image is deferred.
-func floatJSONDeferred() error {
-	return newError(FeatureNotSupported, "converting a float value to JSON is not supported yet")
 }

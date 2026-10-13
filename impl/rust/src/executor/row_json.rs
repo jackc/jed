@@ -70,7 +70,16 @@ pub(crate) fn datum_to_json(
         Value::Timestamptz(m) => {
             json::write_json_string(&crate::timestamp::render_timestamptz_xsd_in(*m, zone)?, out)
         }
-        Value::Float32(_) | Value::Float64(_) => return Err(float_json_deferred()),
+        // PostgreSQL's float8out/float4out text: a number, or the JSON string of NaN/±Infinity.
+        Value::Float32(_) | Value::Float64(_) => {
+            let (f, is32) = crate::value::float_of(v).expect("a float value");
+            let text = crate::value::render_float_pg(f, is32);
+            if f.is_finite() {
+                out.push_str(&text);
+            } else {
+                json::write_json_string(&text, out);
+            }
+        }
         // Every other type is the JSON string of its text output (a range's timestamptz bounds in
         // the session zone).
         Value::Interval(_)
@@ -171,7 +180,15 @@ pub(crate) fn datum_to_jsonb(
         Value::Timestamptz(m) => {
             JsonNode::String(crate::timestamp::render_timestamptz_xsd_in(*m, zone)?)
         }
-        Value::Float32(_) | Value::Float64(_) => return Err(float_json_deferred()),
+        // The number numeric_in reads from the float8out/float4out text; NaN/±Infinity are strings.
+        Value::Float32(_) | Value::Float64(_) => {
+            let (f, is32) = crate::value::float_of(v).expect("a float value");
+            if f.is_finite() {
+                JsonNode::Number(crate::value::float_json_number(f, is32))
+            } else {
+                JsonNode::String(crate::value::render_float_pg(f, is32))
+            }
+        }
         Value::Interval(_)
         | Value::Uuid(_)
         | Value::Bytea(_)
@@ -220,7 +237,10 @@ pub(crate) fn json_key_text(v: &Value, zone: &crate::timezone::ZoneRef) -> Resul
         Value::Date(d) => crate::date::render_date(*d),
         Value::Timestamp(m) => crate::timestamp::render_timestamp_xsd(*m),
         Value::Timestamptz(m) => crate::timestamp::render_timestamptz_xsd_in(*m, zone)?,
-        Value::Float32(_) | Value::Float64(_) => return Err(float_json_deferred()),
+        Value::Float32(_) | Value::Float64(_) => {
+            let (f, is32) = crate::value::float_of(v).expect("a float value");
+            crate::value::render_float_pg(f, is32)
+        }
         Value::Interval(_)
         | Value::Uuid(_)
         | Value::Bytea(_)
@@ -235,14 +255,4 @@ pub(crate) fn json_key_text(v: &Value, zone: &crate::timezone::ZoneRef) -> Resul
 /// `"\n "` — PostgreSQL does so for the array and composite categories.
 pub(crate) fn json_agg_breaks_line(ty: &ResolvedType) -> bool {
     matches!(ty, ResolvedType::Array(_) | ResolvedType::Composite(_))
-}
-
-/// The `0A000` for a float anywhere in a JSON conversion: jed keeps binary floats out of its
-/// byte-identical text outputs (each core's shortest round-trip layout differs — the
-/// `float-render-layout` determinism-ledger entry), so their JSON image is deferred.
-fn float_json_deferred() -> EngineError {
-    EngineError::new(
-        SqlState::FeatureNotSupported,
-        "converting a float value to JSON is not supported yet",
-    )
 }

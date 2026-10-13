@@ -2006,6 +2006,27 @@ base = 0
 off_min = 999
 off_max = 999
 
+# A float converted to JSON takes PostgreSQL's exact float8out text (float.md §9.1). The three columns
+# exercise both of jed's digit paths: a = g/7 takes the native shortest round trip; b, an integer
+# below 2^57, and c, a short dyadic, take the exact interval arithmetic. The answer checksum compares
+# jed's text with PostgreSQL's byte for byte. SQLite renders floats in JSON its own way, so it is out.
+[[bench]]
+name = "json_float_render"
+description = "to_json / to_jsonb of 30k f64 values (10k rows x 3 columns) as PostgreSQL's float8out text"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, to_json(a)::text, to_jsonb(b)::text, to_json(c)::text FROM json_floats ORDER BY id"
+warmup = 1
+iterations = 10
+seed = 4294
+expect_rows_per_iter = 10000
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS json_floats",
+  "CREATE TABLE json_floats (id bigint PRIMARY KEY, a float8, b float8, c float8)",
+  "INSERT INTO json_floats SELECT g, CAST(g AS float8) / 7, CAST(g AS float8) * 1000003, CAST(g AS float8) / 1024 FROM generate_series(1, 10000) AS g"
+]
+
 # Cold open (benchmarks.md §8.3): each iteration opens a fresh handle onto a dataset file, runs one
 # PK point lookup, and closes it — the time to a first answer, close untimed. jed reads the meta page,
 # catalog, persisted free list, and each tree's interior spine, never a leaf it does not need; SQLite

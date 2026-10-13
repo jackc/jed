@@ -152,18 +152,29 @@ export class Decimal {
   }
 
   // fromFloat64DblDig is PostgreSQL's float8_numeric: the binary64 value printed with %.15g
-  // (DBL_DIG significant digits) and read back as a numeric. The digits come from the EXACT decimal
-  // expansion (exactFromFloat64), rounded to 15 significant digits half-to-even (glibc's printf
-  // rounds the exact value to nearest, ties to even), with trailing fractional zeros trimmed — %g
-  // drops them, and an exponent form reads back at display scale max(0, digits − exponent). Pure
-  // integer arithmetic, so every core agrees bit-for-bit. Used by the jsonpath .double() method
-  // (spec/design/jsonpath.md §3.1); the caller has already rejected NaN and ±Infinity.
+  // (DBL_DIG significant digits) and read back as a numeric. Used by the jsonpath .double() method
+  // (spec/design/jsonpath.md §3.1) and a float PASSING value; the caller has already rejected NaN
+  // and ±Infinity.
   static fromFloat64DblDig(f: number): Decimal {
-    const DBL_DIG = 15;
+    return Decimal.fromFloatSigDigits(f, 15);
+  }
+
+  // fromFloat32FltDig is PostgreSQL's float4_numeric: %.6g (FLT_DIG) of the binary32 value (held
+  // widened, exactly, in a Number).
+  static fromFloat32FltDig(f: number): Decimal {
+    return Decimal.fromFloatSigDigits(f, 6);
+  }
+
+  // fromFloatSigDigits is a finite float printed with %.<sig>g and read back as a numeric. The
+  // digits come from the EXACT decimal expansion (exactFromFloat64), rounded to sig significant
+  // digits half-to-even (glibc's printf rounds the exact value to nearest, ties to even), with
+  // trailing fractional zeros trimmed — %g drops them, and an exponent form reads back at display
+  // scale max(0, digits − exponent). Pure integer arithmetic, so every core agrees bit-for-bit.
+  private static fromFloatSigDigits(f: number, sig: number): Decimal {
     const exact = Decimal.exactFromFloat64(f);
     const digits = exact.precision();
-    if (digits <= DBL_DIG) return exact;
-    const drop = digits - DBL_DIG;
+    if (digits <= sig) return exact;
+    const drop = digits - sig;
     const pow = magPow10(drop);
     const [quotient, r] = magDivMod(exact.limbs, pow);
     let q = quotient;
@@ -1194,4 +1205,89 @@ function decimalMathStep(
   m.charge(COSTS.decimalTranscend * work);
   m.guard();
   m.reserveScalar(8n * BigInt(digits));
+}
+
+// floatShortestExact is PostgreSQL's shortest decimal of the finite, nonzero float m·2^e
+// (spec/design/float.md §9.1) by exact decimal arithmetic over its rounding interval: for each
+// length n from minLen, the n-digit decimals just below and just above the value, kept if strictly
+// inside the interval; the first length with one wins, the nearer of two, a tie to the even last
+// digit. lowerTight says the interval's lower half is a quarter ulp (m is a power of two above the
+// lowest binade). minLen is at most the answer's length. Returns the significant digits (no
+// trailing zeros) and the decimal exponent of the first digit. Mirrors Go `floatShortestExact`.
+export function floatShortestExact(
+  m: bigint,
+  e: number,
+  lowerTight: boolean,
+  minLen: number,
+): { digits: string; exp: number } {
+  const lower = lowerTight ? exactDyadic(4n * m - 1n, e - 2) : exactDyadic(2n * m - 1n, e - 1);
+  const upper = exactDyadic(2n * m + 1n, e - 1);
+  let o = m;
+  let k = e;
+  while ((o & 1n) === 0n) {
+    o >>= 1n;
+    k++;
+  }
+  const x = exactDyadic(o, k);
+  let xd = magToDecimalStr(x.limbs);
+  let xs = x.scale;
+  while (xs > 0 && xd.endsWith("0")) {
+    xd = xd.slice(0, -1);
+    xs--;
+  }
+  const top = xd.length - 1 - xs; // the decimal exponent of the value's first digit
+  for (let n = minLen; ; n++) {
+    const q = top - n + 1; // the decimal exponent of an n-digit candidate's last digit
+    const lo = xd.length > n ? xd.slice(0, n) : xd + "0".repeat(n - xd.length);
+    const rest = xd.length > n ? xd.slice(n) : "";
+    const hi = incrementDigits(lo);
+    const loIn = decimalTimesPow10(lo, q).cmpValue(lower) > 0;
+    const hiIn = decimalTimesPow10(hi, q).cmpValue(upper) < 0;
+    let pick: string;
+    if (loIn && hiIn) {
+      // The digits after the n-th against one half of the n-th digit's unit.
+      const r = rest.replace(/0+$/, "");
+      const loEven = Number(lo[n - 1]) % 2 === 0;
+      pick = r === "" || r[0]! < "5" || (r === "5" && loEven) ? lo : hi;
+    } else if (loIn) {
+      pick = lo;
+    } else if (hiIn) {
+      pick = hi;
+    } else {
+      continue;
+    }
+    return { digits: pick.replace(/0+$/, ""), exp: q + pick.length - 1 };
+  }
+}
+
+// exactDyadic is the exact decimal of the nonnegative o·2^k, multiplying by 2^30 or 5^13 a step.
+function exactDyadic(o: bigint, k: number): Decimal {
+  let mag = magFromBigUint(o);
+  let left = Math.abs(k);
+  if (k >= 0) {
+    for (; left >= 30; left -= 30) mag = magMulSmall(mag, 2 ** 30);
+    return Decimal.fromParts(false, 0, magMulSmall(mag, 2 ** left));
+  }
+  for (; left >= 13; left -= 13) mag = magMulSmall(mag, 1220703125); // 5^13
+  return Decimal.fromParts(false, -k, magMulSmall(mag, 5 ** left));
+}
+
+// decimalTimesPow10 is the nonnegative decimal digits·10^q.
+function decimalTimesPow10(digits: string, q: number): Decimal {
+  return q >= 0
+    ? Decimal.fromDigitsScale(false, digits + "0".repeat(q), 0)
+    : Decimal.fromDigitsScale(false, digits, -q);
+}
+
+// incrementDigits adds one to a decimal digit string, growing it by a digit on a carry out.
+function incrementDigits(digits: string): string {
+  const b = digits.split("");
+  for (let i = b.length - 1; i >= 0; i--) {
+    if (b[i]! < "9") {
+      b[i] = String(Number(b[i]) + 1);
+      return b.join("");
+    }
+    b[i] = "0";
+  }
+  return `1${b.join("")}`;
 }

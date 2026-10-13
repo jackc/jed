@@ -412,8 +412,10 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   `decimal`. This aligns with "a real type system" and kills the worst offender. ✅ `decimal`
   has landed (`spec/design/decimal.md`) as that exact path. Binary `f32`/`f64` has since landed
   too (`spec/design/float.md`) as the **first type narrowly exempted from byte-identity**: each
-  core renders with its native shortest round-trip formatter, and the corpus `R` tag compares
-  within a tolerance (the `float-render-layout` entry in the determinism ledger).
+  core renders a result cell with its native shortest round-trip formatter, and the corpus `R`
+  tag compares within a tolerance (the `float-render-layout` entry in the determinism ledger).
+  A float that becomes part of a JSON value instead takes PostgreSQL's exact `float8out` text,
+  hand-rolled in every core and byte-identical (`spec/design/float.md` §9.1).
 - **Decimal rounding** — ✅ **decided: round half away from zero** (PostgreSQL `numeric`;
   `0.125 → 0.13`, `2.5 → 3`), one mode engine-wide, applied to scale coercion / casts /
   division (`spec/design/decimal.md` §3). Result **scale** follows PG's per-operator rules

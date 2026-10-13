@@ -5777,12 +5777,13 @@ fn resolve_json_sql_fn(
 /// names. PostgreSQL's `transformJsonPassingArgs` + `JsonItemFromDatum`: a boolean, integer,
 /// `decimal`, or text value (a bare string literal is text) is the item directly, a `jsonb` value is
 /// itself, and every other type is converted to `jsonb` — a `json` value parsed (last duplicate key
-/// wins), anything else by `to_jsonb`. `FORMAT JSON` parses a text value as JSON instead (`22P02`
-/// on malformed text) and converts every other type by `to_jsonb`. `0A000`: a
-/// `date`/`timestamp`/`timestamptz` value, which PostgreSQL passes as a jsonpath datetime item
-/// (jed has none, by decision, jsonpath.md §3.1); and, deferred, a float, which PostgreSQL converts
-/// with `float8_numeric` (finite values) or passes as NaN/±Infinity, which jed's `decimal` cannot
-/// hold; and `FORMAT JSON` on a `bytea` value (an encoded JSON text).
+/// wins), anything else by `to_jsonb`; a float is the number `float8_numeric`/`float4_numeric`
+/// makes of it. `FORMAT JSON` parses a text value as JSON instead (`22P02` on malformed text) and
+/// converts every other type by `to_jsonb`. `0A000`: a `date`/`timestamp`/`timestamptz` value,
+/// which PostgreSQL passes as a jsonpath datetime item (jed has none, by decision, jsonpath.md
+/// §3.1); and, deferred, a NaN or ±Infinity float (at evaluation), which PostgreSQL passes as a
+/// numeric NaN/±Infinity that jed's `decimal` cannot hold, and `FORMAT JSON` on a `bytea` value (an
+/// encoded JSON text).
 pub(crate) fn resolve_json_passing(
     scope: &Scope,
     passing: &[JsonPassing],
@@ -5819,7 +5820,6 @@ pub(crate) fn resolve_json_passing(
             varchar_len: None,
         };
         let value = match (&ty, p.format_json) {
-            (ResolvedType::Float(_), _) => return unsupported("float"),
             (ResolvedType::Bytea, true) => return unsupported("FORMAT JSON bytea"),
             (ResolvedType::Null | ResolvedType::Jsonb, _) => r,
             (ResolvedType::Json, _) | (ResolvedType::Text, true) => cast_jsonb(r),
@@ -5828,6 +5828,7 @@ pub(crate) fn resolve_json_passing(
                 ResolvedType::Bool
                 | ResolvedType::Int(_)
                 | ResolvedType::Decimal
+                | ResolvedType::Float(_)
                 | ResolvedType::Text,
                 false,
             ) => r,
@@ -5859,6 +5860,18 @@ pub(crate) fn passing_bindings(
             Value::Bool(b) => JsonNode::Bool(b),
             Value::Int(n) => JsonNode::Number(Decimal::from_i64(n)),
             Value::Decimal(d) => JsonNode::Number(d),
+            Value::Float32(f) if f.is_finite() => {
+                JsonNode::Number(Decimal::from_float32_flt_dig(f))
+            }
+            Value::Float64(f) if f.is_finite() => {
+                JsonNode::Number(Decimal::from_float64_dbl_dig(f))
+            }
+            Value::Float32(_) | Value::Float64(_) => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a NaN or infinite float PASSING value is not supported yet",
+                ));
+            }
             Value::Text(s) => JsonNode::String(s),
             Value::Jsonb(n) => n,
             _ => unreachable!("resolve_json_passing converts every other type to jsonb"),

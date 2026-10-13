@@ -3799,13 +3799,14 @@ export function resolveJsonSqlFn(
 // (json-sql-functions.md §5.4) → the value expressions, each yielding a value passingBindings reads
 // as a jsonpath item, and the names. PostgreSQL's transformJsonPassingArgs + JsonItemFromDatum: a
 // boolean, integer, decimal, or text value (a bare string literal is text) is the item directly, a
-// jsonb value is itself, and every other type is converted to jsonb — a json value parsed (last
-// duplicate key wins), anything else by to_jsonb. FORMAT JSON parses a text value as JSON instead
-// (22P02 on malformed text) and converts every other type by to_jsonb. 0A000: a
-// date/timestamp/timestamptz value, which PostgreSQL passes as a jsonpath datetime item (jed has
-// none, by decision, jsonpath.md §3.1); and, deferred, a float, which PostgreSQL converts with
-// float8_numeric (finite values) or passes as NaN/±Infinity, which jed's decimal cannot hold; and
-// FORMAT JSON on a bytea value (an encoded JSON text). Port of impl/rust `resolve_json_passing`.
+// float is the number float8_numeric/float4_numeric makes of it, a jsonb value is itself, and every
+// other type is converted to jsonb — a json value parsed (last duplicate key wins), anything else by
+// to_jsonb. FORMAT JSON parses a text value as JSON instead (22P02 on malformed text) and converts
+// every other type by to_jsonb. 0A000: a date/timestamp/timestamptz value, which PostgreSQL passes
+// as a jsonpath datetime item (jed has none, by decision, jsonpath.md §3.1); and, deferred, a NaN or
+// ±Infinity float (at evaluation), which PostgreSQL passes as a numeric NaN/±Infinity that jed's
+// decimal cannot hold, and FORMAT JSON on a bytea value (an encoded JSON text). Port of impl/rust
+// `resolve_json_passing`.
 export function resolveJsonPassing(
   scope: Scope,
   passing: JsonPassing[],
@@ -3835,9 +3836,7 @@ export function resolveJsonPassing(
       operand: r.node,
     });
     let value: RExpr;
-    if (ty.kind === "float") {
-      throw unsupported("float");
-    } else if (ty.kind === "bytea" && p.formatJson) {
+    if (ty.kind === "bytea" && p.formatJson) {
       throw unsupported("FORMAT JSON bytea");
     } else if (ty.kind === "null" || ty.kind === "jsonb") {
       value = r.node;
@@ -3849,6 +3848,7 @@ export function resolveJsonPassing(
       ty.kind === "bool" ||
       ty.kind === "int" ||
       ty.kind === "decimal" ||
+      ty.kind === "float" ||
       ty.kind === "text"
     ) {
       value = r.node;

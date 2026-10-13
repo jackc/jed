@@ -108,7 +108,9 @@ deliberately keeps **inside** the deterministic contract by paying for it elsewh
   members are stored in a **canonical key order** (length-then-bytewise, dedup last-wins,
   [json.md §2.3](json.md)) so the bytes and every key-enumerating render are a pure function
   of the value, never of hashmap order — and JSON numbers are exact **`decimal`**, never
-  binary float ([json.md §8](json.md)), so JSON introduces **no new** sanctioned relaxation
+  binary float ([json.md §8](json.md)); a float converted to JSON takes PostgreSQL's pinned
+  `float8out` text ([float.md](float.md) §9.1), not the native rendering, so JSON introduces
+  **no new** sanctioned relaxation
   (its only seam-reads are the existing clock/entropy ones, the `.datetime()`/`_tz` path
   surface — [jsonpath.md §5.1](jsonpath.md), class **B** below).
 - **Plan choice and estimates.** Independently implemented optimizers are not permission to pick
@@ -242,8 +244,11 @@ The hard surface and the resolutions taken (full detail in [float.md](float.md))
 - **Transcendentals** (`sin`/`exp`/`log`/`pow`) are not IEEE-correctly-rounded; every libm
   differs by an ULP → defer or exclude (or ship bit-pinned implementations later, at
   decimal-limb cost).
-- **Text formatting** — shortest-round-trip *digits* are unique but *layout* differs per
-  language; needs one hand-rolled formatter pinned with fixtures, or a fixed-precision form.
+- **Text formatting** — the native shortest round trips differ in *layout* and, at exact ties
+  and interval bounds, in the last *digit*. A result cell and `CAST(float AS text)` keep the
+  native rendering (`float-render-layout`, absorbed by the `R` tag); a float inside JSON takes
+  the hand-rolled PostgreSQL `float8out` text, pinned by oracle-checked corpus entries
+  ([float.md](float.md) §9.1).
 - **Ordering / keys** — adopt PG's total order (`-0 = +0`, `NaN = NaN`, `NaN` largest);
   order-preserving key encoding via the u64-bit trick with `-0`/`NaN` canonicalization.
 

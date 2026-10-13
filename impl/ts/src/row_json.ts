@@ -18,7 +18,7 @@ import {
 import { renderDate } from "./date.ts";
 import { renderTimestampXsd } from "./timestamp.ts";
 import { type ZoneRef, renderTimestamptzXsdIn } from "./timezone.ts";
-import { type Value, renderIn } from "./value.ts";
+import { type Value, floatShortest, renderFloatPg, renderIn } from "./value.ts";
 
 type CompositeType = Extract<ResolvedType, { kind: "composite" }>;
 type ArrayValue = Extract<Value, { kind: "array" }>;
@@ -91,9 +91,14 @@ export function datumToJson(v: Value, ty: ResolvedType, zone: ZoneRef, out: stri
     case "timestamptz":
       writeJsonString(renderTimestamptzXsdIn(zone, v.micros), out);
       return;
+    // PostgreSQL's float8out/float4out text: a number, or the JSON string of NaN/±Infinity.
     case "f32":
-    case "f64":
-      throw floatJsonDeferred();
+    case "f64": {
+      const text = renderFloatPg(v.value, v.kind === "f32");
+      if (Number.isFinite(v.value)) out.push(text);
+      else writeJsonString(text, out);
+      return;
+    }
     // Every other type is the JSON string of its text output (a range's timestamptz bounds in the
     // session zone).
     case "interval":
@@ -190,9 +195,13 @@ export function datumToJsonb(v: Value, ty: ResolvedType, zone: ZoneRef): JsonNod
       return { kind: "string", value: renderTimestampXsd(v.micros) };
     case "timestamptz":
       return { kind: "string", value: renderTimestamptzXsdIn(zone, v.micros) };
+    // The number numeric_in reads from the float8out/float4out text; NaN/±Infinity are strings.
     case "f32":
     case "f64":
-      throw floatJsonDeferred();
+      if (Number.isFinite(v.value)) {
+        return { kind: "number", dec: floatJsonNumber(v.value, v.kind === "f32") };
+      }
+      return { kind: "string", value: renderFloatPg(v.value, v.kind === "f32") };
     case "interval":
     case "uuid":
     case "bytea":
@@ -254,7 +263,7 @@ export function jsonKeyText(v: Value, zone: ZoneRef): string {
       return renderTimestamptzXsdIn(zone, v.micros);
     case "f32":
     case "f64":
-      throw floatJsonDeferred();
+      return renderFloatPg(v.value, v.kind === "f32");
     case "interval":
     case "uuid":
     case "bytea":
@@ -274,12 +283,14 @@ export function jsonAggBreaksLine(ty: ResolvedType): boolean {
   return ty.kind === "array" || ty.kind === "composite";
 }
 
-// floatJsonDeferred is the 0A000 for a float anywhere in a JSON conversion: jed keeps binary floats
-// out of its byte-identical text outputs (each core's shortest round-trip layout differs — the
-// float-render-layout determinism-ledger entry), so their JSON image is deferred.
-function floatJsonDeferred(): Error {
-  return engineError(
-    "feature_not_supported",
-    "converting a float value to JSON is not supported yet",
-  );
+// floatJsonNumber is the jsonb number of a finite float: PostgreSQL's numeric_in over the
+// renderFloatPg text, whose display scale is the count of digits after the point in fixed notation.
+// -0 is 0 (a numeric has no negative zero).
+function floatJsonNumber(n: number, is32: boolean): Decimal {
+  if (n === 0) return Decimal.fromDigitsScale(false, "0", 0);
+  const { neg, digits, exp } = floatShortest(n, is32);
+  const shift = exp - digits.length + 1;
+  return shift >= 0
+    ? Decimal.fromDigitsScale(neg, digits + "0".repeat(shift), 0)
+    : Decimal.fromDigitsScale(neg, digits, -shift);
 }

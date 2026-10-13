@@ -272,6 +272,22 @@ export function passingBindings(
       case "decimal":
         node = { kind: "number", dec: v.dec };
         break;
+      case "f32":
+      case "f64":
+        if (!Number.isFinite(v.value)) {
+          throw engineError(
+            "feature_not_supported",
+            "a NaN or infinite float PASSING value is not supported yet",
+          );
+        }
+        node = {
+          kind: "number",
+          dec:
+            v.kind === "f32"
+              ? Decimal.fromFloat32FltDig(v.value)
+              : Decimal.fromFloat64DblDig(v.value),
+        };
+        break;
       case "text":
         node = { kind: "string", value: v.text };
         break;

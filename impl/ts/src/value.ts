@@ -9,7 +9,7 @@
 // three-valued domain, ordered false < true.
 
 import type { ColType } from "./catalog.ts";
-import { Decimal } from "./decimal.ts";
+import { Decimal, floatShortestExact } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { NEG_INFINITY, POS_INFINITY, renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 import { renderDate } from "./date.ts";
@@ -1140,6 +1140,112 @@ export function renderFloat32(n: number): string {
     if (Math.fround(shortest) === n) return renderFloat(shortest);
   }
   return renderFloat(Number(n.toPrecision(9))); // 9 significant digits always round-trip binary32
+}
+
+// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9.1) -------------------
+//
+// The canonical text of a float wherever it becomes part of a value — today, a JSON document. Its
+// digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
+// the fewest significant digits of a decimal STRICTLY inside the float's rounding interval, the
+// one nearest the exact value, a tie to the even last digit. Its layout is Ryu's to_chars:
+// fixed-point when the decimal exponent is in [-4, 15) for an f64 or [-4, 6) for an f32, otherwise
+// d[.ddd]e±XX with at least two exponent digits.
+
+// floatShortest is PostgreSQL's shortest decimal of a finite, nonzero float at its width: its sign,
+// its significant digits (no leading or trailing zeros), and the decimal exponent of the first
+// digit. An f64 takes the native shortest round trip (toExponential with no argument) when
+// floatNativeShortestAgrees proves it equal; otherwise (and for every f32) the digits are computed
+// exactly. The f64 search starts from the native length (a native formatter accepts every decimal
+// Ryu does, so its shortest is never longer); the f32 one from 1, since TS has no native binary32
+// formatter to bound it.
+export function floatShortest(
+  n: number,
+  is32: boolean,
+): { neg: boolean; digits: string; exp: number } {
+  const dv = new DataView(new ArrayBuffer(8));
+  let neg: boolean;
+  let m: bigint;
+  let e: number;
+  let lowerTight: boolean;
+  if (is32) {
+    dv.setFloat32(0, n);
+    const bits = dv.getUint32(0);
+    const be = (bits >>> 23) & 0xff;
+    const frac = BigInt(bits & 0x7fffff);
+    neg = bits >>> 31 !== 0;
+    [m, e] = be === 0 ? [frac, -149] : [frac | (1n << 23n), be - 150];
+    lowerTight = frac === 0n && be > 1;
+  } else {
+    dv.setFloat64(0, n);
+    const bits = dv.getBigUint64(0);
+    const be = Number((bits >> 52n) & 0x7ffn);
+    const frac = bits & ((1n << 52n) - 1n);
+    neg = bits >> 63n !== 0n;
+    [m, e] = be === 0 ? [frac, -1074] : [frac | (1n << 52n), be - 1075];
+    lowerTight = frac === 0n && be > 1;
+    const s = Math.abs(n).toExponential(); // "d.ddde±X"
+    const i = s.indexOf("e");
+    const digits = s.slice(0, i).replace(".", "");
+    if (floatNativeShortestAgrees(m, e, lowerTight)) {
+      return { neg, digits, exp: Number(s.slice(i + 1)) };
+    }
+    return { neg, ...floatShortestExact(m, e, lowerTight, digits.length) };
+  }
+  return { neg, ...floatShortestExact(m, e, lowerTight, 1) };
+}
+
+// floatNativeShortestAgrees reports that the binary64 m·2^e (m > 0) cannot be a case where a native
+// shortest round trip (≤ 17 digits, the nearest of its length) differs from PostgreSQL's: neither
+// an exact tie between two shortest candidates nor a candidate ON a bound of the rounding interval,
+// which a native formatter may accept and Ryu does not. lowerTight says the interval's lower half
+// is a quarter ulp (m is a power of two above the lowest binade).
+//
+// An integer below 2^53 has an interval at most one unit wide, whose bounds have more digits than
+// the integer, so the integer is the only candidate of its length or shorter. Otherwise both
+// failures need a value with few significant digits. A tie needs the exact value to have at most 18,
+// so (with the odd part o and exponent k of the value o·2^k) k is in [-25, -1]: a negative k gives
+// o·5^-k significant digits, at least 5^25's 18 for k ≤ -25, and an integer cannot tie (its
+// shortest candidates lie a whole unit of their last digit apart, wider than the interval). A bound
+// (2m±1)·2^(e-1), or (4m-1)·2^(e-2), is a candidate only if it has at most 17 significant digits:
+// a negative exponent k needs k ≥ -24 by the same count; an integer bound needs to be under 10^17
+// or to end in a zero, which needs a factor 5 in its odd part.
+function floatNativeShortestAgrees(m: bigint, e: number, lowerTight: boolean): boolean {
+  let o = m;
+  let k = e;
+  while ((o & 1n) === 0n) {
+    o >>= 1n;
+    k++;
+  }
+  if (k >= 0 && k < 53 && o < 1n << BigInt(53 - k)) return true;
+  if (k >= -25 && k <= -1) return false;
+  const boundMayBeShort = (o: bigint, k: number): boolean =>
+    k < 0 ? k >= -25 : (k < 57 && o < 1n << BigInt(57 - k)) || o % 5n === 0n;
+  if (boundMayBeShort(2n * m + 1n, e - 1)) return false;
+  return lowerTight ? !boundMayBeShort(4n * m - 1n, e - 2) : !boundMayBeShort(2n * m - 1n, e - 1);
+}
+
+// renderFloatPg is PostgreSQL's float8out (or, for an f32, float4out) text of n, at the oracle's
+// extra_float_digits = 1 (the shortest round trip).
+export function renderFloatPg(n: number, is32: boolean): string {
+  if (Number.isNaN(n)) return "NaN";
+  if (n === Infinity) return "Infinity";
+  if (n === -Infinity) return "-Infinity";
+  if (n === 0) return Object.is(n, -0) ? "-0" : "0";
+  const { neg, digits, exp } = floatShortest(n, is32);
+  const fixedLimit = is32 ? 6 : 15;
+  let body: string;
+  if (exp < -4 || exp >= fixedLimit) {
+    const mantissa = digits.length > 1 ? `${digits[0]}.${digits.slice(1)}` : digits;
+    const abs = Math.abs(exp);
+    body = `${mantissa}e${exp < 0 ? "-" : "+"}${abs < 10 ? "0" : ""}${abs}`;
+  } else if (exp < 0) {
+    body = `0.${"0".repeat(-exp - 1)}${digits}`;
+  } else if (exp >= digits.length - 1) {
+    body = digits + "0".repeat(exp - digits.length + 1);
+  } else {
+    body = `${digits.slice(0, exp + 1)}.${digits.slice(exp + 1)}`;
+  }
+  return neg ? `-${body}` : body;
 }
 
 // eq3 is three-valued equality. NULL compared with anything (including NULL) is

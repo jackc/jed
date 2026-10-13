@@ -1,0 +1,223 @@
+# A float in a JSON conversion (spec/design/json-sql-functions.md §2.2, §5.4; spec/design/float.md
+# §9.1). to_json, to_jsonb, array_to_json, row_to_json, JSON_SCALAR, the json[b] builders, and the
+# json[b] aggregates write a float as PostgreSQL's float8out / float4out text (extra_float_digits = 1):
+# the shortest round-trip digits, fixed-point when the decimal exponent is in [-4, 15) for an f64 or
+# [-4, 6) for an f32, otherwise d.ddde±XX. That layout is pinned in every core, so a float's JSON text
+# is byte-identical cross-core (no determinism-ledger exception). In json the text is a number; in
+# jsonb numeric_in reads it (so the exponent forms expand and -0 is 0); NaN and ±Infinity are JSON
+# strings; an object key is the text. A float PASSING value is a jsonpath number: float8_numeric /
+# float4_numeric (15 / 6 significant digits), or, under FORMAT JSON, to_jsonb's. Output matches the
+# postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.group_by, types.composite, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.f32, types.f64, types.text, cast.explicit, cast.operator, func.to_jsonb, func.json_builders, func.json_agg, func.json_object_agg, func.row_to_json, func.json_ctor, func.jsonb_path, expr.json_query_fns, func.json_table, expr.jsonpath_vars
+
+# --- The f64 layout: fixed-point for a decimal exponent in [-4, 15), else d.ddde±XX ---
+statement ok
+CREATE TABLE f (id i32 PRIMARY KEY, d f64, r f32)
+
+statement ok
+INSERT INTO f VALUES (1, 0, 0), (2, '-0'::f64, '-0'::f32), (3, 1.5, 1.5), (4, 100, 100), (5, 0.1, 0.1), (6, 1e14, 1e5), (7, 1e15, 1e6), (8, 123456789012345678, 123456), (9, 0.0001, 0.0001), (10, 0.00001, 0.00001), (11, -1.5e-7, -1.5e-7), (12, 1e21, 16777215), (13, 5e-324, 1e-45), (14, 1.7976931348623157e308, 3.4028235e38), (15, 1e100, 1e30), (16, 'NaN'::f64, 'NaN'::f32), (17, 'Infinity'::f64, 'Infinity'::f32), (18, '-Infinity'::f64, '-Infinity'::f32)
+
+# to_json writes the text as a JSON number. -0 keeps its sign in json; 123456789012345678 has 17
+# significant digits, so it is the exponent form; 5e-324 is the smallest subnormal. NaN and ±Infinity are
+# not JSON numbers, so they are JSON strings.
+query TT nosort
+SELECT to_json(d), to_json(r) FROM f ORDER BY id
+----
+0
+0
+-0
+-0
+1.5
+1.5
+100
+100
+0.1
+0.1
+100000000000000
+100000
+1e+15
+1e+06
+1.2345678901234568e+17
+123456
+0.0001
+0.0001
+1e-05
+1e-05
+-1.5e-07
+-1.5e-07
+1e+21
+1.6777215e+07
+5e-324
+1e-45
+1.7976931348623157e+308
+3.4028235e+38
+1e+100
+1e+30
+"NaN"
+"NaN"
+"Infinity"
+"Infinity"
+"-Infinity"
+"-Infinity"
+
+# to_jsonb reads the same text as a numeric: the exponent forms expand at their display scale, and -0
+# is 0.
+query TT nosort
+SELECT to_jsonb(d), to_jsonb(r) FROM f WHERE id <> 13 ORDER BY id
+----
+0
+0
+0
+0
+1.5
+1.5
+100
+100
+0.1
+0.1
+100000000000000
+100000
+1000000000000000
+1000000
+123456789012345680
+123456
+0.0001
+0.0001
+0.00001
+0.00001
+-0.00000015
+-0.00000015
+1000000000000000000000
+16777215
+179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+340282350000000000000000000000000000000
+10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+1000000000000000000000000000000
+"NaN"
+"NaN"
+"Infinity"
+"Infinity"
+"-Infinity"
+"-Infinity"
+
+# The subnormal expands to its full 324 fractional digits.
+query B nosort
+SELECT to_jsonb(d) = to_jsonb(5e-324) FROM f WHERE id = 13
+----
+true
+
+# The text is part of the value: its length and its comparison are the same in every core.
+query IIB nosort
+SELECT length(to_json(1e-7::f64)::text), length(to_json(0.1::f32)::text), to_json(1e21::f64)::text = '1e+21'
+----
+5
+3
+true
+
+# --- The digits: PostgreSQL's Ryu, not a native formatter's ---
+#
+# The shortest decimal STRICTLY inside the rounding interval, nearest the exact value, a tie to the
+# even last digit. A native shortest round trip may take a decimal on the interval's bound, or break
+# an exact tie the other way.
+
+# 1e23 is not a double: the nearest is 99999999999999991611392, and 1e23 lies exactly on its upper
+# bound. 6.0656737399483024e16 and the f32 125073824 have a shorter candidate on a bound too.
+query TTTTT nosort
+SELECT to_json('1e23'::f64), to_jsonb('1e23'::f64), to_json('6.0656737399483024e16'::f64), to_json('125073824'::f32), to_jsonb('41320168'::f32)
+----
+9.999999999999999e+22
+99999999999999990000000
+6.0656737399483024e+16
+1.25073824e+08
+41320168
+
+# Each value lies exactly halfway between two shortest candidates: the even last digit wins.
+query TTTT nosort
+SELECT to_json('3454183008863.90625'::f64), to_json('-618195786451728.25'::f64), to_json('131744.125'::f32), to_jsonb('-1822993.25'::f32)
+----
+3454183008863.9062
+-618195786451728.2
+131744.12
+-1822993.2
+
+# An f32 renders its binary32 shortest round trip, not the widened binary64's.
+query TT nosort
+SELECT to_json(0.1::f32), to_json(0.1::f32::f64)
+----
+0.1
+0.10000000149011612
+
+# --- Containers, keys, builders, and aggregates ---
+
+query TTT nosort
+SELECT to_json('{1.5, 1e21, NaN}'::f64[]), to_jsonb('{1.5, 1e21, NaN}'::f64[]), array_to_json('{{0.1, 1e-5}, {-0, 2}}'::f32[])
+----
+[1.5,1e+21,"NaN"]
+[1.5, 1000000000000000000000, "NaN"]
+[[0.1,1e-05],[-0,2]]
+
+query TT nosort
+SELECT row_to_json(ROW(1e100::f64, 0.1::f32, 'Infinity'::f64)), to_jsonb(ROW(1e100::f64, 0.1::f32))
+----
+{"f1":1e+100,"f2":0.1,"f3":"Infinity"}
+{"f1": 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000, "f2": 0.1}
+
+# An object key is the float's text, whatever its layout.
+query TTT nosort
+SELECT json_build_object(1.5e20::f64, 1, 'NaN'::f64, 2), jsonb_build_object('-0'::f64, 1e-7::f64, 0.1::f32, 'Infinity'::f32), json_build_array(1e15::f64, 1e6::f32, 100::f64)
+----
+{"1.5e+20" : 1, "NaN" : 2}
+{"-0": 0.0000001, "0.1": "Infinity"}
+[1e+15, 1e+06, 100]
+
+query TTTT nosort
+SELECT json_agg(d ORDER BY id), jsonb_agg(r ORDER BY id), json_object_agg(d, r ORDER BY id), jsonb_object_agg(r, d ORDER BY id) FROM f WHERE id IN (3, 7, 10, 12, 17)
+----
+[1.5, 1e+15, 1e-05, 1e+21, "Infinity"]
+[1.5, 1000000, 0.00001, 16777215, "Infinity"]
+{ "1.5" : 1.5, "1e+15" : 1e+06, "1e-05" : 1e-05, "1e+21" : 1.6777215e+07, "Infinity" : "Infinity" }
+{"1.5": 1.5, "1e+06": 1000000000000000, "1e-05": 0.00001, "Infinity": "Infinity", "1.6777215e+07": 1000000000000000000000}
+
+# JSON_SCALAR is to_json's conversion.
+query TTTT nosort
+SELECT JSON_SCALAR(1e-7::f64), JSON_SCALAR(1e15::f64), JSON_SCALAR('NaN'::f64), JSON_SCALAR(ARRAY[1.5::f64, 1e-5::f64])
+----
+1e-07
+1e+15
+"NaN"
+[1.5,1e-05]
+
+# A float read back out of its json or jsonb text is the same float, on every row.
+query I nosort
+SELECT count(*) FROM f WHERE (to_json(d) #>> '{}')::f64 = d AND (to_jsonb(r) #>> '{}')::f32 = r
+----
+18
+
+# --- PASSING: a float is the number float8_numeric / float4_numeric makes of it ---
+
+# 15 significant digits for an f64 (1.0000000000000002 is 1), 6 for an f32 (0.1::f32 is 0.1).
+query TTTT nosort
+SELECT JSON_VALUE('0', '$x' PASSING 0.1::f32 AS x), JSON_VALUE('0', '$x' PASSING 1.0000000000000002::f64 AS x), JSON_QUERY('0', '$x' PASSING 1e21::f64 AS x), JSON_VALUE('0', '$x + 1' PASSING 2.5::f32 AS x)
+----
+0.1
+1
+1000000000000000000000
+3.5
+
+# FORMAT JSON converts by to_jsonb, as does a float array.
+query TTT nosort
+SELECT JSON_QUERY('0', '$x' PASSING 1e21::f64 FORMAT JSON AS x), JSON_QUERY('0', '$x' PASSING 'NaN'::f64 FORMAT JSON AS x), JSON_QUERY('0', '$x' PASSING ARRAY[1.5, 1e-7]::f64[] AS x)
+----
+1000000000000000000000
+"NaN"
+[1.5, 0.0000001]
+
+query IT rowsort
+SELECT f.id, t.v FROM f, JSON_TABLE('[1, 2]', '$[*] ? (@ < $lim)' PASSING f.d AS lim COLUMNS (v text PATH '$')) t WHERE f.id IN (3, 4)
+----
+3
+1
+4
+1
+4
+2

@@ -160,21 +160,31 @@ impl Decimal {
     }
 
     /// PostgreSQL's `float8_numeric`: the binary64 value printed with `%.15g` (`DBL_DIG`
-    /// significant digits) and read back as a numeric. The digits come from the EXACT decimal
-    /// expansion of the binary64 value ([`Decimal::from_float64`]), rounded to 15 significant
-    /// digits half-to-even (glibc's printf rounds the exact value to nearest, ties to even), with
-    /// trailing fractional zeros trimmed — `%g` drops them, and an exponent form reads back at
-    /// display scale `max(0, digits − exponent)`. Pure integer arithmetic, so every core agrees
-    /// bit-for-bit. Used by the jsonpath `.double()` method (spec/design/jsonpath.md §3.1); the
-    /// caller has already rejected NaN and ±Infinity.
+    /// significant digits) and read back as a numeric. Used by the jsonpath `.double()` method
+    /// (spec/design/jsonpath.md §3.1) and a float `PASSING` value; the caller has already rejected
+    /// NaN and ±Infinity.
     pub fn from_float64_dbl_dig(f: f64) -> Decimal {
-        const DBL_DIG: u32 = 15;
+        Decimal::from_float_sig_digits(f, 15)
+    }
+
+    /// PostgreSQL's `float4_numeric`: `%.6g` (`FLT_DIG`) of the binary32 value.
+    pub fn from_float32_flt_dig(f: f32) -> Decimal {
+        Decimal::from_float_sig_digits(f64::from(f), 6)
+    }
+
+    /// A finite float printed with `%.<sig>g` and read back as a numeric. The digits come from the
+    /// EXACT decimal expansion ([`Decimal::from_float64`]; an `f32` widens exactly), rounded to
+    /// `sig` significant digits half-to-even (glibc's printf rounds the exact value to nearest,
+    /// ties to even), with trailing fractional zeros trimmed — `%g` drops them, and an exponent
+    /// form reads back at display scale `max(0, digits − exponent)`. Pure integer arithmetic, so
+    /// every core agrees bit-for-bit.
+    fn from_float_sig_digits(f: f64, sig: u32) -> Decimal {
         let exact = Decimal::from_float64(f);
         let digits = exact.precision();
-        if digits <= DBL_DIG {
+        if digits <= sig {
             return exact;
         }
-        let drop = digits - DBL_DIG;
+        let drop = digits - sig;
         let pow = mag_pow10(drop);
         let (mut q, r) = mag_divmod(&exact.limbs, &pow);
         let round_up = match mag_cmp(&mag_add(&r, &r), &pow) {
@@ -192,6 +202,35 @@ impl Decimal {
         };
         let (cneg, cdigits, cscale) = rounded.canonical();
         Decimal::from_parts(cneg, cscale, cdigits)
+    }
+
+    /// The exact decimal of the nonnegative `o·2^k`, multiplying by 2^30 or 5^13 a step
+    /// ([`mag_mul_small`] takes a factor up to about 1.8e10).
+    fn exact_dyadic(o: u64, k: i32) -> Decimal {
+        let mut mag = mag_from_u64(o);
+        let mut left = k.unsigned_abs();
+        if k >= 0 {
+            while left >= 30 {
+                mag = mag_mul_small(&mag, 1 << 30);
+                left -= 30;
+            }
+            return Decimal::from_parts(false, 0, mag_mul_small(&mag, 1 << left));
+        }
+        while left >= 13 {
+            mag = mag_mul_small(&mag, 1_220_703_125); // 5^13
+            left -= 13;
+        }
+        let p = 5u64.pow(left);
+        Decimal::from_parts(false, k.unsigned_abs(), mag_mul_small(&mag, p))
+    }
+
+    /// The nonnegative decimal `digits·10^q`.
+    fn times_pow10(digits: &str, q: i32) -> Decimal {
+        if q >= 0 {
+            Decimal::from_digits_scale(false, &(digits.to_string() + &"0".repeat(q as usize)), 0)
+        } else {
+            Decimal::from_digits_scale(false, digits, q.unsigned_abs())
+        }
     }
 
     pub fn is_zero(&self) -> bool {
@@ -1927,4 +1966,77 @@ impl Decimal {
     pub fn dec_power(base: &Decimal, exp: &Decimal) -> Result<Decimal> {
         Self::dec_power_metered(base, exp, None)
     }
+}
+
+/// PostgreSQL's shortest decimal of the finite, nonzero float `m·2^e` (spec/design/float.md §9.1)
+/// by exact decimal arithmetic over its rounding interval: for each length n from `min_len`, the
+/// n-digit decimals just below and just above the value, kept if strictly inside the interval; the
+/// first length with one wins, the nearer of two, a tie to the even last digit. `lower_tight` says
+/// the interval's lower half is a quarter ulp (m is a power of two above the lowest binade).
+/// `min_len` is at most the answer's length. Returns the significant digits (no trailing zeros) and
+/// the decimal exponent of the first digit.
+pub(crate) fn float_shortest_exact(
+    m: u64,
+    e: i32,
+    lower_tight: bool,
+    min_len: usize,
+) -> (String, i32) {
+    let lower = if lower_tight {
+        Decimal::exact_dyadic(4 * m - 1, e - 2)
+    } else {
+        Decimal::exact_dyadic(2 * m - 1, e - 1)
+    };
+    let upper = Decimal::exact_dyadic(2 * m + 1, e - 1);
+    let tz = m.trailing_zeros();
+    let (_, x_limbs, x_scale) = Decimal::exact_dyadic(m >> tz, e + tz as i32).canonical();
+    let xd = mag_to_decimal_str(&x_limbs);
+    // The decimal exponent of the value's first digit.
+    let top = xd.len() as i32 - 1 - x_scale as i32;
+    let mut n = min_len;
+    loop {
+        // The decimal exponent of an n-digit candidate's last digit.
+        let q = top - n as i32 + 1;
+        let (lo, rest) = if xd.len() > n {
+            (xd[..n].to_string(), &xd[n..])
+        } else {
+            (xd.clone() + &"0".repeat(n - xd.len()), "")
+        };
+        let hi = increment_digits(&lo);
+        let lo_in = Decimal::times_pow10(&lo, q).cmp_value(&lower).is_gt();
+        let hi_in = Decimal::times_pow10(&hi, q).cmp_value(&upper).is_lt();
+        let pick = match (lo_in, hi_in) {
+            (true, true) => {
+                // The digits after the n-th against one half of the n-th digit's unit.
+                let r = rest.trim_end_matches('0');
+                let lo_even = (lo.as_bytes()[n - 1] - b'0') % 2 == 0;
+                if r.is_empty() || r.as_bytes()[0] < b'5' || (r == "5" && lo_even) {
+                    lo
+                } else {
+                    hi
+                }
+            }
+            (true, false) => lo,
+            (false, true) => hi,
+            (false, false) => {
+                n += 1;
+                continue;
+            }
+        };
+        let exp = q + pick.len() as i32 - 1;
+        return (pick.trim_end_matches('0').to_string(), exp);
+    }
+}
+
+/// One added to a decimal digit string, growing it by a digit on a carry out.
+fn increment_digits(digits: &str) -> String {
+    let mut b = digits.as_bytes().to_vec();
+    for i in (0..b.len()).rev() {
+        if b[i] < b'9' {
+            b[i] += 1;
+            return String::from_utf8(b).expect("ASCII digits");
+        }
+        b[i] = b'0';
+    }
+    b.insert(0, b'1');
+    String::from_utf8(b).expect("ASCII digits")
 }

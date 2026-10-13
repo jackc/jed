@@ -1609,6 +1609,169 @@ fn render_f32(f: f32) -> String {
     }
 }
 
+// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9.1) -------------------
+//
+// The canonical text of a float wherever it becomes part of a value — today, a JSON document. Its
+// digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
+// the fewest significant digits of a decimal STRICTLY inside the float's rounding interval, the
+// one nearest the exact value, a tie to the even last digit. Its layout is Ryu's `to_chars`:
+// fixed-point when the decimal exponent is in [-4, 15) for an f64 or [-4, 6) for an f32, otherwise
+// `d[.ddd]e±XX` with at least two exponent digits.
+
+/// A float value as an `f64` (an `f32` widens exactly) and whether it is an `f32`.
+pub(crate) fn float_of(v: &Value) -> Option<(f64, bool)> {
+    match v {
+        Value::Float32(f) => Some((f64::from(*f), true)),
+        Value::Float64(f) => Some((*f, false)),
+        _ => None,
+    }
+}
+
+/// PostgreSQL's shortest decimal of a finite, nonzero float at its width: its sign, its significant
+/// digits (no leading or trailing zeros), and the decimal exponent of the first digit. An f64 takes
+/// the native shortest round trip when [`float_native_shortest_agrees`] proves it equal; otherwise
+/// (and for every f32) the digits are computed exactly, from the native length: a native formatter
+/// accepts every decimal Ryu does, so its shortest is never longer.
+fn float_shortest(f: f64, is32: bool) -> (bool, String, i32) {
+    let (neg, m, e, lower_tight) = if is32 {
+        let bits = (f as f32).to_bits();
+        let (be, frac) = (
+            ((bits >> 23) & 0xff) as i32,
+            u64::from(bits & ((1 << 23) - 1)),
+        );
+        let (m, e) = if be == 0 {
+            (frac, -149)
+        } else {
+            (frac | 1 << 23, be - 150)
+        };
+        (bits >> 31 != 0, m, e, frac == 0 && be > 1)
+    } else {
+        let bits = f.to_bits();
+        let (be, frac) = (((bits >> 52) & 0x7ff) as i32, bits & ((1 << 52) - 1));
+        let (m, e) = if be == 0 {
+            (frac, -1074)
+        } else {
+            (frac | 1 << 52, be - 1075)
+        };
+        (bits >> 63 != 0, m, e, frac == 0 && be > 1)
+    };
+    // `{:e}` is the shortest round trip in scientific form: "d.ddde-X".
+    let s = if is32 {
+        format!("{:e}", (f as f32).abs())
+    } else {
+        format!("{:e}", f.abs())
+    };
+    let (mantissa, exp) = s.split_once('e').expect("{:e} prints an exponent");
+    let digits = mantissa.replacen('.', "", 1);
+    if !is32 && float_native_shortest_agrees(m, e, lower_tight) {
+        let exp = exp.parse().expect("{:e} prints an integer exponent");
+        return (neg, digits, exp);
+    }
+    let (digits, exp) = crate::decimal::float_shortest_exact(m, e, lower_tight, digits.len());
+    (neg, digits, exp)
+}
+
+/// Whether the binary64 `m·2^e` (m > 0) cannot be a case where a native shortest round trip (≤ 17
+/// digits, the nearest of its length) differs from PostgreSQL's: neither an exact tie between two
+/// shortest candidates nor a candidate ON a bound of the rounding interval, which a native
+/// formatter may accept and Ryu does not. `lower_tight` says the interval's lower half is a quarter
+/// ulp (m is a power of two above the lowest binade).
+///
+/// An integer below 2^53 has an interval at most one unit wide, whose bounds have more digits than
+/// the integer, so the integer is the only candidate of its length or shorter. Otherwise both
+/// failures need a value with few significant digits. A tie needs the exact value to have at most 18,
+/// so (with the odd part o and exponent k of the value o·2^k) k is in [-25, -1]: a negative k gives
+/// o·5^-k significant digits, at least 5^25's 18 for k ≤ -25, and an integer cannot tie (its
+/// shortest candidates lie a whole unit of their last digit apart, wider than the interval). A
+/// bound (2m±1)·2^(e-1), or (4m-1)·2^(e-2), is a candidate only if it has at most 17 significant
+/// digits: a negative exponent k needs k ≥ -24 by the same count; an integer bound needs to be under
+/// 10^17 or to end in a zero, which needs a factor 5 in its odd part.
+fn float_native_shortest_agrees(m: u64, e: i32, lower_tight: bool) -> bool {
+    let (o, k) = (m >> m.trailing_zeros(), e + m.trailing_zeros() as i32);
+    if (0..53).contains(&k) && o < 1 << (53 - k) {
+        return true;
+    }
+    if (-25..=-1).contains(&k) {
+        return false;
+    }
+    let bound_may_be_short = |o: u64, k: i32| {
+        if k < 0 {
+            k >= -25
+        } else {
+            (k < 57 && o < 1 << (57 - k)) || o % 5 == 0
+        }
+    };
+    if bound_may_be_short(2 * m + 1, e - 1) {
+        return false;
+    }
+    if lower_tight {
+        !bound_may_be_short(4 * m - 1, e - 2)
+    } else {
+        !bound_may_be_short(2 * m - 1, e - 1)
+    }
+}
+
+/// PostgreSQL's `float8out` (or, for an `f32`, `float4out`) text of `f`, at the oracle's
+/// `extra_float_digits = 1` (the shortest round trip).
+pub(crate) fn render_float_pg(f: f64, is32: bool) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return (if f < 0.0 { "-Infinity" } else { "Infinity" }).to_string();
+    }
+    if f == 0.0 {
+        return (if f.is_sign_negative() { "-0" } else { "0" }).to_string();
+    }
+    let (neg, digits, exp) = float_shortest(f, is32);
+    let fixed_limit = if is32 { 6 } else { 15 };
+    let len = digits.len() as i32;
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if exp < -4 || exp >= fixed_limit {
+        out.push_str(&digits[..1]);
+        if len > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push_str(&format!(
+            "e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        ));
+    } else if exp < 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-exp - 1) as usize));
+        out.push_str(&digits);
+    } else if exp >= len - 1 {
+        out.push_str(&digits);
+        out.push_str(&"0".repeat((exp - len + 1) as usize));
+    } else {
+        out.push_str(&digits[..=exp as usize]);
+        out.push('.');
+        out.push_str(&digits[exp as usize + 1..]);
+    }
+    out
+}
+
+/// The `jsonb` number of a finite float: PostgreSQL's `numeric_in` over the [`render_float_pg`]
+/// text, whose display scale is the count of digits after the point in fixed notation. `-0` is 0
+/// (a numeric has no negative zero).
+pub(crate) fn float_json_number(f: f64, is32: bool) -> Decimal {
+    if f == 0.0 {
+        return Decimal::zero(0);
+    }
+    let (neg, digits, exp) = float_shortest(f, is32);
+    let shift = exp - digits.len() as i32 + 1;
+    if shift >= 0 {
+        Decimal::from_digits_scale(neg, &(digits + &"0".repeat(shift as usize)), 0)
+    } else {
+        Decimal::from_digits_scale(neg, &digits, (-shift) as u32)
+    }
+}
+
 /// Render a bytea value as PostgreSQL's hex output form: a `\x` prefix followed by the
 /// lowercase hex of each byte (two digits per byte). The empty byte string renders as the
 /// bare prefix `\x`. The spelling must be byte-identical across cores (CLAUDE.md §8), so

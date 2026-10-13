@@ -158,12 +158,4 @@ CREATE INDEX stamps_rs ON stamps ((JSON_SCALAR(rs)::text))
 statement ok
 CREATE INDEX stamps_n ON stamps ((JSON_SCALAR(n)::text))
 
-# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
-
-# A float is the deferred 0A000 of every JSON conversion (json-sql-functions.md §2.2). PostgreSQL
-# renders the float8out text as a JSON number.
-statement error 0A000
-SELECT JSON_SCALAR(1.5::f64)
-
-statement error 0A000
-SELECT JSON_SCALAR(ARRAY[1.5::f64])
+# A float source, and every other float conversion to JSON, is in float_sources.test.

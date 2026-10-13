@@ -112,6 +112,7 @@ SELECT
   to_jsonb(ROW('b', 1))                                   AS jsonb_row,
   to_json('{{1,2},{3,4}}'::i32[])                         AS nested,
   json_build_object(date '2024-01-15', interval '1 day') AS date_key,
+  to_json('{0.1,1e21,NaN}'::f64[])                        AS floats,
   jsonb_agg(d)                                            AS dates
 FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
 
@@ -436,7 +437,9 @@ JSON error instead of raising it: the functions then return what they found befo
 `jsonb_path_exists` returns `NULL`. Both may be passed by name (`vars => …`, `silent => …`).
 `JSON_EXISTS`, `JSON_VALUE`, `JSON_QUERY`, and `JSON_TABLE` bind variables with
 `PASSING value AS name`. A variable with no value fails with `42704`, and `vars` must be an object
-(`22023`). Passing a date, timestamp, or float value is not supported yet (`0A000`). The `_tz`
+(`22023`). A float is passed as PostgreSQL passes it, as a number rounded to 15 significant digits
+(6 for `f32`). Passing a date or timestamp value, or a `NaN` or infinite float, is not supported yet
+(`0A000`). The `_tz`
 forms of the functions (`jsonb_path_exists_tz`, …) behave the same; as in PostgreSQL they are
 `STABLE`, so an index expression cannot use them:
 
@@ -476,8 +479,11 @@ pretty])`, `JSON_SCALAR(value)` (the same `json` result as `to_json`), `json_bui
 `json_build_object`, and the `json_agg` and `json_object_agg` aggregates, each with its `jsonb`
 variant. A `jsonb` result keeps an object's keys in canonical order.
 An object key is always a string: a date or timestamp key takes the same ISO 8601 form, and an array,
-composite, or JSON key is an error (`22023`). Converting a float (`f32`/`f64`) value to JSON is not
-supported yet (`0A000`):
+composite, or JSON key is an error (`22023`). A float (`f32`/`f64`) is written exactly as
+PostgreSQL writes it: the shortest digits that read back to the same float, in exponent form when
+the number is very large or very small (`1e+21`, `1e-05`). In `json` it is a number, in `jsonb` the
+exact decimal of that text, and `NaN` and `±Infinity`, which JSON numbers cannot express, become the
+strings `"NaN"`, `"Infinity"`, and `"-Infinity"`:
 
 <LiveSql demo="toJsonDemo" query={toJsonDemo} rows={1} />
 

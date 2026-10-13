@@ -13,6 +13,7 @@ package jed
 import (
 	"math"
 	"strconv"
+	"strings"
 )
 
 // radiansPerDegree is PG's exact RADIANS_PER_DEGREE literal (float.c), shared by radians/degrees
@@ -157,6 +158,268 @@ func renderFloat32(f float32) string {
 		return "-0"
 	}
 	return strconv.FormatFloat(d, 'g', -1, 32)
+}
+
+// --- the PostgreSQL float8out / float4out text (spec/design/float.md §9.1) -------------------
+//
+// The canonical text of a float wherever it becomes part of a value — today, a JSON document. Its
+// digits are those of PostgreSQL's Ryu (src/common/d2s.c / f2s.c, built with STRICTLY_SHORTEST 0):
+// the fewest significant digits of a decimal STRICTLY inside the float's rounding interval, the
+// one nearest the exact value, a tie to the even last digit. Its layout is Ryu's to_chars:
+// fixed-point when the decimal exponent is in [-4, 15) for an f64 or [-4, 6) for an f32, otherwise
+// d[.ddd]e±XX with at least two exponent digits.
+
+// floatShortest is PostgreSQL's shortest decimal of a finite, nonzero float at bitSize width: its
+// sign, its significant digits (no leading or trailing zeros), and the decimal exponent of the
+// first digit. An f64 takes the native shortest round trip when floatNativeShortestAgrees proves
+// it equal; otherwise (and for every f32) the digits are computed exactly, from the native length:
+// a native formatter accepts every decimal Ryu does, so its shortest is never longer.
+func floatShortest(f float64, bitSize int) (neg bool, digits string, exp int) {
+	var m uint64
+	var e int
+	var lowerTight bool
+	if bitSize == 32 {
+		bits := math.Float32bits(float32(f))
+		neg = bits>>31 != 0
+		be, frac := int((bits>>23)&0xff), uint64(bits&(1<<23-1))
+		m, e, lowerTight = frac|1<<23, be-150, frac == 0 && be > 1
+		if be == 0 {
+			m, e = frac, -149
+		}
+	} else {
+		bits := math.Float64bits(f)
+		neg = bits>>63 != 0
+		be, frac := int((bits>>52)&0x7ff), bits&(1<<52-1)
+		m, e, lowerTight = frac|1<<52, be-1075, frac == 0 && be > 1
+		if be == 0 {
+			m, e = frac, -1074
+		}
+	}
+	s := strconv.FormatFloat(math.Abs(f), 'e', -1, bitSize) // "d.ddde±XX"
+	i := strings.IndexByte(s, 'e')
+	exp, _ = strconv.Atoi(s[i+1:])
+	digits = strings.Replace(s[:i], ".", "", 1)
+	if bitSize == 64 && floatNativeShortestAgrees(m, e, lowerTight) {
+		return neg, digits, exp
+	}
+	digits, exp = floatShortestExact(m, e, lowerTight, len(digits))
+	return neg, digits, exp
+}
+
+// floatNativeShortestAgrees reports that the binary64 m·2^e (m > 0) cannot be a case where a native
+// shortest round trip (≤ 17 digits, the nearest of its length) differs from PostgreSQL's: neither
+// an exact tie between two shortest candidates nor a candidate ON a bound of the rounding interval,
+// which a native formatter may accept and Ryu does not. lowerTight says the interval's lower half
+// is a quarter ulp (m is a power of two above the lowest binade).
+//
+// An integer below 2^53 has an interval at most one unit wide, whose bounds have more digits than
+// the integer, so the integer is the only candidate of its length or shorter. Otherwise both
+// failures need a value with few significant digits. A tie needs the exact value to have at most 18,
+// so (with the odd part o and exponent k of the value o·2^k) k is in [-25, -1]: a negative k gives
+// o·5^-k significant digits, at least 5^25's 18 for k ≤ -25, and an integer cannot tie (its
+// shortest candidates lie a whole unit of their last digit apart, wider than the interval). A bound
+// (2m±1)·2^(e-1), or (4m-1)·2^(e-2), is a candidate only if it has at most 17 significant digits:
+// a negative exponent k needs k ≥ -24 by the same count; an integer bound needs to be under 10^17
+// or to end in a zero, which needs a factor 5 in its odd part.
+func floatNativeShortestAgrees(m uint64, e int, lowerTight bool) bool {
+	o, k := m, e
+	for o&1 == 0 {
+		o >>= 1
+		k++
+	}
+	if k >= 0 && k < 53 && o < 1<<(53-k) {
+		return true
+	}
+	if k >= -25 && k <= -1 {
+		return false
+	}
+	boundMayBeShort := func(o uint64, k int) bool {
+		if k < 0 {
+			return k >= -25
+		}
+		return k < 57 && o < 1<<(57-k) || o%5 == 0
+	}
+	if boundMayBeShort(2*m+1, e-1) {
+		return false
+	}
+	if lowerTight {
+		return !boundMayBeShort(4*m-1, e-2)
+	}
+	return !boundMayBeShort(2*m-1, e-1)
+}
+
+// floatShortestExact is floatShortest's digits and exponent by exact decimal arithmetic over the
+// rounding interval of m·2^e: for each length n from minLen, the n-digit decimals just below and
+// just above the value, kept if strictly inside the interval; the first length with one wins, the
+// nearer of two, a tie to the even last digit. minLen is at most the answer's length.
+func floatShortestExact(m uint64, e int, lowerTight bool, minLen int) (string, int) {
+	lower := exactDyadic(2*m-1, e-1)
+	if lowerTight {
+		lower = exactDyadic(4*m-1, e-2)
+	}
+	upper := exactDyadic(2*m+1, e-1)
+	o, k := m, e
+	for o&1 == 0 {
+		o >>= 1
+		k++
+	}
+	_, xd, xs := exactDyadic(o, k).canonical()
+	top := len(xd) - 1 - int(xs) // the decimal exponent of the value's first digit
+	for n := minLen; ; n++ {
+		q := top - n + 1 // the decimal exponent of an n-digit candidate's last digit
+		lo, rest := xd, ""
+		if len(xd) > n {
+			lo, rest = xd[:n], xd[n:]
+		} else {
+			lo += strings.Repeat("0", n-len(xd))
+		}
+		hi := incrementDigits(lo)
+		loIn := decimalTimesPow10(lo, q).CmpValue(lower) > 0
+		hiIn := decimalTimesPow10(hi, q).CmpValue(upper) < 0
+		var pick string
+		switch {
+		case loIn && hiIn:
+			// The digits after the n-th against one half of the n-th digit's unit.
+			r := strings.TrimRight(rest, "0")
+			switch {
+			case r == "" || r[0] < '5':
+				pick = lo
+			case r == "5" && (lo[len(lo)-1]-'0')%2 == 0:
+				pick = lo
+			default:
+				pick = hi
+			}
+		case loIn:
+			pick = lo
+		case hiIn:
+			pick = hi
+		default:
+			continue
+		}
+		return strings.TrimRight(pick, "0"), q + len(pick) - 1
+	}
+}
+
+// exactDyadic is the exact decimal of the nonnegative o·2^k, multiplying by 2^30 or 5^13 a step
+// (magMulSmall takes a factor up to about 1.8e10).
+func exactDyadic(o uint64, k int) Decimal {
+	mag := magFromUint64(o)
+	if k >= 0 {
+		for ; k >= 30; k -= 30 {
+			mag = magMulSmall(mag, 1<<30)
+		}
+		return newDecimal(false, 0, magMulSmall(mag, 1<<k))
+	}
+	scale := uint32(-k)
+	for k = -k; k >= 13; k -= 13 {
+		mag = magMulSmall(mag, 1220703125) // 5^13
+	}
+	p := uint64(1)
+	for ; k > 0; k-- {
+		p *= 5
+	}
+	return newDecimal(false, scale, magMulSmall(mag, p))
+}
+
+// decimalTimesPow10 is the nonnegative decimal digits·10^q.
+func decimalTimesPow10(digits string, q int) Decimal {
+	if q >= 0 {
+		return decimalFromDigitsScale(false, digits+strings.Repeat("0", q), 0)
+	}
+	return decimalFromDigitsScale(false, digits, uint32(-q))
+}
+
+// incrementDigits adds one to a decimal digit string, growing it by a digit on a carry out.
+func incrementDigits(digits string) string {
+	b := []byte(digits)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < '9' {
+			b[i]++
+			return string(b)
+		}
+		b[i] = '0'
+	}
+	return "1" + string(b)
+}
+
+// renderFloatPG is PostgreSQL's float8out (bitSize 64) or float4out (bitSize 32) text of f, at the
+// oracle's extra_float_digits = 1 (the shortest round trip).
+func renderFloatPG(f float64, bitSize int) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	case f == 0 && math.Signbit(f):
+		return "-0"
+	case f == 0:
+		return "0"
+	}
+	neg, digits, exp := floatShortest(f, bitSize)
+	fixedLimit := 15
+	if bitSize == 32 {
+		fixedLimit = 6
+	}
+	var b strings.Builder
+	if neg {
+		b.WriteByte('-')
+	}
+	switch {
+	case exp < -4 || exp >= fixedLimit:
+		b.WriteByte(digits[0])
+		if len(digits) > 1 {
+			b.WriteByte('.')
+			b.WriteString(digits[1:])
+		}
+		b.WriteByte('e')
+		if exp < 0 {
+			b.WriteByte('-')
+			exp = -exp
+		} else {
+			b.WriteByte('+')
+		}
+		if exp < 10 {
+			b.WriteByte('0')
+		}
+		b.WriteString(strconv.Itoa(exp))
+	case exp < 0:
+		b.WriteString("0.")
+		b.WriteString(strings.Repeat("0", -exp-1))
+		b.WriteString(digits)
+	case exp >= len(digits)-1:
+		b.WriteString(digits)
+		b.WriteString(strings.Repeat("0", exp-len(digits)+1))
+	default:
+		b.WriteString(digits[:exp+1])
+		b.WriteByte('.')
+		b.WriteString(digits[exp+1:])
+	}
+	return b.String()
+}
+
+// floatJSONNumber is the jsonb number of a finite float: PostgreSQL's numeric_in over the
+// renderFloatPG text, whose display scale is the count of digits after the point in fixed notation.
+// -0 is 0 (a numeric has no negative zero).
+func floatJSONNumber(f float64, bitSize int) Decimal {
+	if f == 0 {
+		return decimalZero(0)
+	}
+	neg, digits, exp := floatShortest(f, bitSize)
+	shift := exp - len(digits) + 1
+	if shift >= 0 {
+		return decimalFromDigitsScale(neg, digits+strings.Repeat("0", shift), 0)
+	}
+	return decimalFromDigitsScale(neg, digits, uint32(-shift))
+}
+
+// floatOf is a float value as a float64 (an f32 widens exactly) and its width in bits.
+func floatOf(v Value) (float64, int) {
+	if v.Kind == ValFloat32 {
+		return float64(v.F32()), 32
+	}
+	return v.F64(), 64
 }
 
 // --- the arithmetic kernel (spec/design/float.md §5) --------------------------------------
@@ -365,20 +628,27 @@ func exactDecimalFromFloat64(f float64) Decimal {
 }
 
 // decimalFromFloat64DblDig is PostgreSQL's float8_numeric: the binary64 value printed with %.15g
-// (DBL_DIG significant digits) and read back as a numeric. The digits come from the EXACT decimal
-// expansion (exactDecimalFromFloat64), rounded to 15 significant digits half-to-even (glibc's printf
-// rounds the exact value to nearest, ties to even), with trailing fractional zeros trimmed — %g drops
-// them, and an exponent form reads back at display scale max(0, digits − exponent). Pure integer
-// arithmetic, so every core agrees bit-for-bit. Used by the jsonpath .double() method
-// (spec/design/jsonpath.md §3.1); the caller has already rejected NaN and ±Infinity.
-func decimalFromFloat64DblDig(f float64) Decimal {
-	const dblDig = 15
+// (DBL_DIG significant digits) and read back as a numeric. Used by the jsonpath .double() method
+// (spec/design/jsonpath.md §3.1) and a float PASSING value; the caller has already rejected NaN and
+// ±Infinity.
+func decimalFromFloat64DblDig(f float64) Decimal { return decimalFromFloatSigDigits(f, 15) }
+
+// decimalFromFloat32FltDig is PostgreSQL's float4_numeric: %.6g (FLT_DIG) of the binary32 value.
+func decimalFromFloat32FltDig(f float32) Decimal { return decimalFromFloatSigDigits(float64(f), 6) }
+
+// decimalFromFloatSigDigits is a finite float printed with %.<sig>g and read back as a numeric. The
+// digits come from the EXACT decimal expansion (exactDecimalFromFloat64; an f32 widens exactly),
+// rounded to sig significant digits half-to-even (glibc's printf rounds the exact value to nearest,
+// ties to even), with trailing fractional zeros trimmed — %g drops them, and an exponent form reads
+// back at display scale max(0, digits − exponent). Pure integer arithmetic, so every core agrees
+// bit-for-bit.
+func decimalFromFloatSigDigits(f float64, sig uint32) Decimal {
 	exact := exactDecimalFromFloat64(f)
 	digits := exact.Precision()
-	if digits <= dblDig {
+	if digits <= sig {
 		return exact
 	}
-	drop := digits - dblDig
+	drop := digits - sig
 	pow := magPow10(drop)
 	q, r := magDivMod(exact.Limbs, pow)
 	roundUp := false

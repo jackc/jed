@@ -357,18 +357,4 @@ CREATE INDEX stamps_arr ON stamps ((array_to_json(ats)::text))
 statement error 42P17
 CREATE INDEX stamps_build ON stamps ((jsonb_build_object('at', at)))
 
-# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
-
-# A float is a deferred 0A000 wherever it is converted to JSON (float.md: binary floats stay out of
-# jed's text output paths). PostgreSQL renders the float8out text as a JSON number.
-statement error 0A000
-SELECT to_json(1.5::f64)
-
-statement error 0A000
-SELECT to_jsonb(ARRAY[1.5::f64])
-
-statement error 0A000
-SELECT json_build_object(1.5::f64, 1)
-
-statement error 0A000
-SELECT jsonb_agg(x) FROM (VALUES (1.5::f64)) v(x)
+# A float source, element, field, key, or aggregate input is in float_sources.test.

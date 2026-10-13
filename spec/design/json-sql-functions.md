@@ -190,7 +190,7 @@ and aggregates carry their arguments' types to evaluation. The catalog rows of `
 | `timestamp` | ISO 8601 with a `T` separator: `"2024-01-15T10:30:00.5"`, fraction trimmed, ` BC` suffix | the same string |
 | `timestamptz` | in the session zone, with an offset of at least hours and minutes: `"2024-01-15T17:30:00+05:30"`, `"…+00:00"`, an LMT `"…-04:56:02"` | the same string |
 | `interval`, `uuid`, `bytea`, range, `jsonpath` | the JSON string of the type's text output (`"1 day 02:00:00"`, `"\\x0102"`, `"[1,5)"`). A `timestamptz` range bound renders in the session zone | the same string |
-| `f32` / `f64` | `0A000` (below) | `0A000` |
+| `f32` / `f64` | PostgreSQL's `float8out` / `float4out` text as a number (`1.5`, `1e+21`, `-0`, `0.1` for `0.1::f32`); NaN and ±Infinity as the strings `"NaN"`, `"Infinity"`, `"-Infinity"` (below) | the `numeric` that text reads as (`1000000000000000000000`; `-0` is `0`), or the same string |
 
 The datetime forms are PostgreSQL's `JsonEncodeDateTime` (the `XSD` date style). They differ from
 the text output in two places: the `T` separator, and a `timestamptz` offset that always shows
@@ -237,12 +237,13 @@ no row-valued table reference ([grammar.md](grammar.md) §15). There, `t` resolv
 column (`42703`). Use a composite column or `ROW(t.a, t.b, …)` instead. This divergence is
 recorded in the override ledger.
 
-**Floats are a deferred `0A000`.** PostgreSQL writes the `float8out` text as a JSON number (`to_jsonb`
-parses it to a `numeric`) and as a key's text. jed keeps binary floats out of its byte-identical text
-outputs, because each core's shortest round-trip layout differs ([determinism.md](determinism.md),
-`float-render-layout`). That ledger entry covers a float result cell and an explicit `CAST(float AS
-text)`, not a float inside a JSON document, so a float source, element, field, key, or aggregate input
-is `0A000`. This divergence is recorded in the override ledger.
+**Floats take PostgreSQL's exact text.** A float source, element, field, key, or aggregate input is
+written as PostgreSQL's `float8out` (`float4out` for an `f32`) text at `extra_float_digits = 1`:
+Ryu's shortest digits and its layout, pinned in every core ([float.md](float.md) §9.1). This is not
+the native rendering a float result cell or `CAST(float AS text)` uses (the `float-render-layout`
+ledger entry): a float inside a JSON document is part of a value that is stored, compared, and keyed,
+so its text is byte-identical across cores and matches PostgreSQL's, digit for digit. A key is the
+text (`json_build_object(1.5e20::f64, 1)` is `{"1.5e+20" : 1}`).
 
 **Session zone.** A `timestamptz` anywhere in an argument's type (the value itself, an array element,
 a field, a range bound, at any depth) is rendered in the session zone. Such a call to `to_json`,
@@ -386,8 +387,8 @@ over the context item ([jsonpath.md §3](jsonpath.md)) — a `json` context is f
   `date`/`timestamp`/`timestamptz` is an ISO 8601 string (a `timestamptz` in the session zone, which
   makes the call nonimmutable), an `interval`/`uuid`/`bytea`/range/`jsonpath` the string of its text
   output, and PostgreSQL does not restrict it to scalars: an array is a JSON array, a composite an
-  object, a `json` value verbatim. A bare string literal is `text`. A float source is §2.2's deferred
-  `0A000`. It costs as `to_json`. PG 18 has no `RETURNING` clause here, so the result is always `json`.
+  object, a `json` value verbatim. A bare string literal is `text`. A float is its `float8out` text
+  (§2.2). It costs as `to_json`. PG 18 has no `RETURNING` clause here, so the result is always `json`.
   **`JSON_SERIALIZE(expr RETURNING text)`** — a JSON value → its text serialization.
 - **`IS JSON`** — tests well-formedness (and the optional `VALUE`/`SCALAR`/`ARRAY`/`OBJECT`
   kind and `WITH UNIQUE KEYS`); a non-text/json operand → false (PG); never raises.
@@ -435,6 +436,9 @@ Each value becomes a jsonpath item the way PostgreSQL's `transformJsonPassingArg
 
 - a `boolean`, an integer, or a `decimal` value is that item; a `text` value is a string item, even
   when its text reads as JSON (a bare string literal is `text`); SQL NULL is JSON `null`;
+- a float is the number PostgreSQL's `float8_numeric` (`float4_numeric` for an `f32`) makes of it:
+  `%.15g` (`%.6g`) of the exact value read back as a `numeric`, so `1.0000000000000002::f64` is `1`
+  and `0.1::f32` is `0.1`. NaN and ±Infinity are below;
 - a `jsonb` value is itself, and a `json` value is converted to `jsonb` (keys canonical, the last
   duplicate key winning);
 - any other type is converted by `to_jsonb` (§2.2): an array is a JSON array, a composite an object,
@@ -446,11 +450,11 @@ Each value becomes a jsonpath item the way PostgreSQL's `transformJsonPassingArg
 **Not supported (`0A000`), ledgered.** A `date`, `timestamp`, or `timestamptz` value without
 `FORMAT JSON` is a jsonpath *datetime item* in PostgreSQL, with its own `.type()` and comparison
 rules. jed's jsonpath has no datetime items, by decision ([jsonpath.md §3.1](jsonpath.md)); pass
-`d::text` (or use `FORMAT JSON`, which makes it a string) instead. **Deferred (`0A000`), ledgered.** A float value is converted by
-PostgreSQL's `float8_numeric` (or `float4_numeric`), and NaN/±Infinity become `numeric` NaN/Infinity
-items, which jed's finite `decimal` cannot hold; it waits with the other float-to-JSON conversions
-(§2.2). `FORMAT JSON` on a `bytea` value (encoded JSON text, with an optional `ENCODING`) is deferred
-too.
+`d::text` (or use `FORMAT JSON`, which makes it a string) instead. **Deferred (`0A000`),
+ledgered.** A NaN or ±Infinity float without `FORMAT JSON` is a `numeric` NaN/Infinity item in
+PostgreSQL, which jed's finite `decimal` cannot hold; it is raised when the value is evaluated, since
+a float column's other values pass. (Under `FORMAT JSON` it is `to_jsonb`'s string.) `FORMAT JSON`
+on a `bytea` value (encoded JSON text, with an optional `ENCODING`) is deferred too.
 
 Evaluation order follows PostgreSQL's. For the query functions the context and path come first (a
 NULL either way is SQL NULL without evaluating the `PASSING` values), then the `PASSING` values in

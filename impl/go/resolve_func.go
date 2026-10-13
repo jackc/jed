@@ -2321,14 +2321,14 @@ func resolveJSONSqlFn(s *scope, kind jsonSqlKind, ctx, path exprNode, passing []
 // resolveJSONPassing resolves a `PASSING value [FORMAT JSON] AS name, …` clause (json-sql-functions.md
 // §5.4) → the value expressions, each yielding a value passingBindings reads as a jsonpath item, and
 // the names. PostgreSQL's transformJsonPassingArgs + JsonItemFromDatum: a boolean, integer, decimal,
-// or text value (a bare string literal is text) is the item directly, a jsonb value is itself, and
-// every other type is converted to jsonb — a json value parsed (last duplicate key wins), anything
-// else by to_jsonb. FORMAT JSON parses a text value as JSON instead (22P02 on malformed text) and
-// converts every other type by to_jsonb. 0A000: a date/timestamp/timestamptz value, which
-// PostgreSQL passes as a jsonpath datetime item (jed has none, by decision, jsonpath.md §3.1); and,
-// deferred, a float, which PostgreSQL converts with float8_numeric (finite values) or passes as
-// NaN/±Infinity, which jed's decimal cannot hold; and FORMAT JSON on a bytea value (an encoded JSON
-// text).
+// or text value (a bare string literal is text) is the item directly, a float is the number
+// float8_numeric/float4_numeric makes of it, a jsonb value is itself, and every other type is
+// converted to jsonb — a json value parsed (last duplicate key wins), anything else by to_jsonb.
+// FORMAT JSON parses a text value as JSON instead (22P02 on malformed text) and converts every other
+// type by to_jsonb. 0A000: a date/timestamp/timestamptz value, which PostgreSQL passes as a jsonpath
+// datetime item (jed has none, by decision, jsonpath.md §3.1); and, deferred, a NaN or ±Infinity
+// float (at evaluation), which PostgreSQL passes as a numeric NaN/±Infinity that jed's decimal
+// cannot hold, and FORMAT JSON on a bytea value (an encoded JSON text).
 func resolveJSONPassing(s *scope, passing []jsonPassing, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, error) {
 	exprs := make([]*rExpr, 0, len(passing))
 	names := make([]string, 0, len(passing))
@@ -2352,8 +2352,6 @@ func resolveJSONPassing(s *scope, passing []jsonPassing, ag *aggCtx, params *par
 		}
 		var value *rExpr
 		switch {
-		case ty.kind == rtFloat32 || ty.kind == rtFloat64:
-			return nil, nil, unsupported("float")
 		case ty.kind == rtBytea && p.FormatJSON:
 			return nil, nil, unsupported("FORMAT JSON bytea")
 		case ty.kind == rtNull || ty.kind == rtJsonb:
@@ -2362,7 +2360,8 @@ func resolveJSONPassing(s *scope, passing []jsonPassing, ag *aggCtx, params *par
 			value = &rExpr{kind: reCast, operand: r, result: scalarJsonb}
 		case p.FormatJSON:
 			value = toJsonb()
-		case ty.kind == rtBool || ty.kind == rtInt || ty.kind == rtDecimal || ty.kind == rtText:
+		case ty.kind == rtBool || ty.kind == rtInt || ty.kind == rtDecimal || ty.kind == rtText ||
+			ty.kind == rtFloat32 || ty.kind == rtFloat64:
 			value = r
 		case ty.kind == rtDate || ty.kind == rtTimestamp || ty.kind == rtTimestamptz:
 			return nil, nil, unsupported("date/time")
@@ -2394,6 +2393,16 @@ func passingBindings(exprs []*rExpr, names []string, row storedRow, env *evalEnv
 			node = JsonNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}
 		case ValDecimal:
 			node = JsonNode{Kind: JNumber, Num: *v.decimal()}
+		case ValFloat32, ValFloat64:
+			f, bits := floatOf(v)
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil, newError(FeatureNotSupported, "a NaN or infinite float PASSING value is not supported yet")
+			}
+			if bits == 32 {
+				node = JsonNode{Kind: JNumber, Num: decimalFromFloat32FltDig(v.F32())}
+			} else {
+				node = JsonNode{Kind: JNumber, Num: decimalFromFloat64DblDig(f)}
+			}
 		case ValText:
 			node = JsonNode{Kind: JString, S: v.str()}
 		case ValJsonb:

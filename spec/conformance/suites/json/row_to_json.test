@@ -230,8 +230,3 @@ CREATE INDEX stamps_json ON stamps ((row_to_json(s)::text))
 # grammar.md §15), so a table alias is not a value: 42703. PostgreSQL passes the whole row.
 statement error 42703
 SELECT row_to_json(p) FROM person p
-
-# A float field is a deferred 0A000, as for to_json (float.md: binary floats stay out of jed's text
-# output paths). PostgreSQL renders the float8out text as a JSON number.
-statement error 0A000
-SELECT row_to_json(ROW(1.5::f64))

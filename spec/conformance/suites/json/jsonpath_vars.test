@@ -462,8 +462,9 @@ SELECT d.id, t.v FROM docs d, JSON_TABLE(d.j, '$.a' PASSING d.id AS k COLUMNS (v
 # --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
 
 # A date/time value is a jsonpath datetime item in PostgreSQL; jed has no datetime items, since the
-# datetime item methods are not supported (jsonpath.md §3.1). A float is converted by float8_numeric, or is NaN/±Infinity,
-# which decimal cannot hold; it is a deferred 0A000 too.
+# datetime item methods are not supported (jsonpath.md §3.1). A finite float is a number
+# (float_sources.test); NaN and ±Infinity are numeric NaN/±Infinity items, which decimal cannot
+# hold, so they are a deferred 0A000, raised when the value is evaluated.
 statement error 0A000
 SELECT JSON_VALUE('{}', '$x' PASSING date '2020-01-01' AS x)
 
@@ -471,10 +472,10 @@ statement error 0A000
 SELECT JSON_VALUE('{}', '$x' PASSING timestamptz '2020-01-01 00:00:00+00' AS x)
 
 statement error 0A000
-SELECT JSON_VALUE('{}', '$x' PASSING 1.5::f64 AS x)
+SELECT JSON_VALUE('{}', '$x' PASSING 'NaN'::f64 AS x)
 
 statement error 0A000
-SELECT JSON_QUERY('{}', '$x' PASSING ARRAY[1.5::f64] AS x)
+SELECT JSON_VALUE('{}', '$x' PASSING '-Infinity'::f32 AS x)
 
 # FORMAT JSON on a bytea value reads it as encoded JSON text in PostgreSQL; jed defers it.
 statement error 0A000

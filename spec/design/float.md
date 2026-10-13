@@ -337,10 +337,15 @@ trio `scale`/`min_scale`/`trim_scale` have **landed** (in-contract, no ledger �
 **Rendering.** A `f64` renders with each core's **native shortest round-trip** formatter
 (Rust `{}`, Go `strconv.FormatFloat(f, 'g', -1, 64)`, JS `Number.prototype.toString`),
 producing the shortest decimal string that parses back to the same binary64. Special values
-render PG-style: `Infinity`, `-Infinity`, `NaN` (and `-0` renders `-0`). The *digits* of
-shortest-round-trip are mathematically unique, so the cores already agree on them; only the
-*layout* (exponent threshold/spelling) may differ — which the `R` tag absorbs, so jed does
-**not** hand-roll a shared formatter (the exemption's payoff, determinism.md §6).
+render PG-style: `Infinity`, `-Infinity`, `NaN` (and `-0` renders `-0`). The *layout*
+(exponent threshold/spelling) differs between the formatters, and so, rarely, does the last
+*digit*: shortest round trip is unique except where a shorter decimal lies exactly on the
+rounding interval's bound (Go accepts it when the mantissa is even; `1e23` is the classic case,
+the double nearest it being `99999999999999991611392`) or the value lies exactly halfway between
+two shortest candidates (Go and JavaScript's `toString` take the even digit, Rust's `Display`
+and JavaScript's `toPrecision` the other). The `R` tag absorbs both, so a result cell keeps its
+native formatter (the exemption's payoff, determinism.md §6). A float that becomes part of a
+*value* other than `text` uses the pinned PostgreSQL text instead (§9.1).
 
 An `f32` renders the **binary32** shortest round trip — the fewest digits that read back to the same
 binary32 (Rust's `f32` `Display`, Go's `FormatFloat(f, 'g', -1, 32)`; TypeScript, which holds an
@@ -348,10 +353,50 @@ binary32 (Rust's `f32` `Display`, Go's `FormatFloat(f, 'g', -1, 32)`; TypeScript
 so `real '0.1'` renders `0.1` in every core, not the widened binary64's `0.10000000149011612`.
 
 The explicit `CAST(x AS text)` of a float ([types.md](types.md) §5) produces exactly this rendering
-as a `text` value. That is the one path by which a float's layout leaves the terminal render and
-reaches a value that can be compared, measured, or stored; it is covered by the same
-`float-render-layout` exception. The corpus pins such casts only for values whose layout every core
-and PostgreSQL agree on.
+as a `text` value. That is the one path by which the native rendering leaves the terminal render
+and reaches a value that can be compared, measured, or stored; it is covered by the same
+`float-render-layout` exception. The corpus pins such casts only for values whose rendering every
+core and PostgreSQL agree on.
+
+### 9.1 The PostgreSQL text: floats in JSON
+
+A float converted to JSON (`to_json[b]`, `array_to_json`, `row_to_json`, `JSON_SCALAR`, the
+builders and aggregates, a `FORMAT JSON` `PASSING` value — [json-sql-functions.md](json-sql-functions.md)
+§2.2) becomes part of a value that is stored, compared, and keyed, so its text is **pinned**:
+exactly PostgreSQL's `float8out` (an `f32`: `float4out`) at the oracle's `extra_float_digits = 1`.
+It is in-contract, byte-identical across cores and with PostgreSQL, with no ledger entry.
+
+- **Digits** — PostgreSQL's Ryu (`src/common/d2s.c` / `f2s.c`), built with `STRICTLY_SHORTEST 0`:
+  the fewest significant digits of a decimal **strictly inside** the value's rounding interval
+  (both bounds excluded, whatever the mantissa's parity); among those, the one nearest the exact
+  value; a tie to the even last digit. The interval is `x ± ½ ulp`, except that its lower half is
+  `¼ ulp` when the mantissa is a power of two above the lowest binade.
+- **Layout** — Ryu's `to_chars`: fixed-point when the decimal exponent of the first digit is in
+  `[-4, 15)` for an `f64` or `[-4, 6)` for an `f32` (`0.0001`, `100000000000000`, `123456`),
+  otherwise `d[.ddd]e±XX` with at least two exponent digits (`1e-05`, `1e+15`, `1.6777215e+07`,
+  `5e-324`). `NaN`, `Infinity`, `-Infinity`, `0`, `-0` are spelled out.
+
+Each core computes the digits the same way, from the exact value with its own decimal limb
+arithmetic (`floatShortestExact`): for each length n, the n-digit decimals just below and just
+above the exact value, kept if strictly inside the interval; the first length with one wins. The
+search starts at the native shortest length, a valid lower bound because a native formatter
+accepts every decimal Ryu does (TypeScript, which has no native binary32 formatter, starts an
+`f32` at 1). An `f64` skips the search for the native result when a guard proves the two agree:
+an integer below `2^53` always does (its interval is at most one unit wide, and the bounds have
+more digits than it); otherwise a disagreement needs an exact tie (a value with at most 18
+significant digits, so `o·2^k` with odd `o` and `k` in `[-25, -1]`) or a bound with at most 17
+significant digits (a negative exponent of at least `-25`, or an integer bound below `2^57` or
+with a factor 5 in its odd part). A fuzz of fifty thousand values against the oracle (random bit
+patterns, every power of two, the neighbours of every power of ten, short dyadics, large
+integers), on both paths, agreed exactly. The guarded values cost a few times the native
+formatter (`json_float_render` benchmark).
+
+JSON's use of the text: in `json` it is a number, or for NaN/±Infinity a JSON string; in `jsonb`
+it is the `numeric` that `numeric_in` reads from it (`1e+21` is `1000000000000000000000`, `-0` is
+`0`), or the string; an object key is the text. A float `PASSING` value without `FORMAT JSON`
+does not use the text: it is a jsonpath number by `float8_numeric` / `float4_numeric` (`%.15g` /
+`%.6g` of the exact value), and NaN/±Infinity, numeric NaN/Infinity items in PostgreSQL, are a
+deferred `0A000` because jed's `decimal` is finite.
 
 **The `R` (real) render tag** (conformance.md §1 — long reserved, now in use). A column tagged
 `R` is compared **by value, not by string**: both expected and actual are parsed to f64 and
