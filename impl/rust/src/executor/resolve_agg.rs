@@ -17,7 +17,7 @@ pub(crate) fn resolve_group_term(
     // Only a *bare* integer literal is an ordinal — `GROUP BY 1`; `GROUP BY 1 + 1` is a constant
     // expression (PG). The parser folds a unary minus into the value, so a negative is just out of
     // range. The select list fixes the position count: `*` expands to the scope width.
-    if let Expr::Literal(Literal::Int(n)) = term {
+    if let Expr::Literal(Literal::Int(n), _) = term {
         let ncols = match items {
             SelectItems::All(_) => scope.width() as i64,
             SelectItems::Items(its) => its.len() as i64,
@@ -402,12 +402,15 @@ pub(crate) fn in_membership(
     Ok(if negated { not3(&in_val) } else { in_val })
 }
 
-/// Build a binary-operator `Expr` node (used by the IN/BETWEEN desugar in `resolve`).
-pub(crate) fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+/// Build a binary-operator `Expr` node (used by the IN/BETWEEN desugar in `resolve`). `pos` is the
+/// desugared construct's operator position — PostgreSQL reports an IN / BETWEEN comparison's
+/// operator error there (spec/design/error-fields.md §10.2).
+pub(crate) fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr, pos: SrcPos) -> Expr {
     Expr::Binary {
         op,
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
+        pos,
     }
 }
 
@@ -1599,7 +1602,8 @@ pub(crate) fn resolve_agg_filter(
         _ => Err(EngineError::new(
             SqlState::DatatypeMismatch,
             "argument of FILTER must be type boolean",
-        )),
+        )
+        .with_position(f.location().0)),
     }
 }
 
@@ -1849,7 +1853,8 @@ pub(crate) fn resolve_ordered_set_aggregate(
                     return Err(EngineError::new(
                         SqlState::DatatypeMismatch,
                         "argument of FILTER must be type boolean",
-                    ));
+                    )
+                    .with_position(f.location().0));
                 }
             }
         }
@@ -2481,7 +2486,10 @@ pub(crate) fn resolve_window_call(
             let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
             match ft {
                 ResolvedType::Bool | ResolvedType::Null => Some(rf),
-                _ => return Err(type_error("argument of FILTER must be type boolean")),
+                _ => {
+                    return Err(type_error("argument of FILTER must be type boolean")
+                        .with_position(f.location().0));
+                }
             }
         }
         None => None,
@@ -2704,8 +2712,8 @@ pub(crate) fn resolve_int_bound(b: &crate::ast::FrameBound) -> Result<ResolvedBo
     use crate::ast::FrameBound;
     let offset = |e: &Expr| -> Result<Value> {
         match e {
-            Expr::Literal(Literal::Int(n)) if *n >= 0 => Ok(Value::Int(*n)),
-            Expr::Literal(Literal::Int(_)) => Err(EngineError::new(
+            Expr::Literal(Literal::Int(n), _) if *n >= 0 => Ok(Value::Int(*n)),
+            Expr::Literal(Literal::Int(_), _) => Err(EngineError::new(
                 SqlState::InvalidPrecedingOrFollowingSize,
                 "frame starting or ending offset must not be negative",
             )),
@@ -2741,7 +2749,7 @@ pub(crate) fn resolve_range_bound(b: &crate::ast::FrameBound, kt: &Type) -> Resu
     };
     let offset = |e: &Expr| -> Result<Value> {
         match e {
-            Expr::Literal(Literal::Int(n)) => {
+            Expr::Literal(Literal::Int(n), _) => {
                 if *n < 0 {
                     return Err(neg());
                 }
@@ -2753,7 +2761,7 @@ pub(crate) fn resolve_range_bound(b: &crate::ast::FrameBound, kt: &Type) -> Resu
                     Ok(Value::Int(*n))
                 }
             }
-            Expr::Literal(Literal::Decimal(d)) => {
+            Expr::Literal(Literal::Decimal(d), _) => {
                 if d.is_negative() {
                     return Err(neg());
                 }

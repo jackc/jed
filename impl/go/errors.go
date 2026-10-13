@@ -40,6 +40,10 @@ type EngineError struct {
 	// Hint is PostgreSQL's HINT suggestion (`Perhaps you meant to reference the column "t.name".`) —
 	// spec/design/error-fields.md §11. Never part of the rendered message.
 	Hint string
+	// located is set once an expression node's resolution has decided this error's position (stamped
+	// or deliberately left absent), so an enclosing node never claims an error raised inside one of its
+	// operands (spec/design/error-fields.md §10.2). Internal bookkeeping, not a field.
+	located bool
 }
 
 // newError builds an EngineError.
@@ -86,6 +90,38 @@ func (e *EngineError) withHint(hint string) *EngineError {
 		e.Hint = hint
 	}
 	return e
+}
+
+// locateError stamps an error leaving an expression node's resolution with pos unless an inner node
+// already decided its position, then marks it decided (spec/design/error-fields.md §10.2). A no-op for
+// a non-EngineError.
+func locateError(err error, pos srcPos) error {
+	var e *EngineError
+	if errors.As(err, &e) && !e.located {
+		e.withPosition(int32(pos))
+		e.located = true
+	}
+	return err
+}
+
+// positionError sets an error's Position at pos unless one is already set — a raise site that knows
+// the offending expression (spec/design/error-fields.md §10.2). A no-op for a non-EngineError.
+func positionError(err error, pos srcPos) error {
+	var e *EngineError
+	if errors.As(err, &e) {
+		e.withPosition(int32(pos))
+	}
+	return err
+}
+
+// atTarget positions a DML target's 42P01 at the target's name (spec/design/error-fields.md §10.2);
+// any other error passes through.
+func atTarget(err error, pos srcPos) error {
+	var e *EngineError
+	if errors.As(err, &e) && e.State == UndefinedTable {
+		e.withPosition(int32(pos))
+	}
+	return err
 }
 
 // shiftPosition moves a statement error's Position by chars characters — into the coordinates of the

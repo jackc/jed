@@ -205,6 +205,7 @@ impl Engine {
         }
         let Insert {
             table,
+            table_pos,
             db,
             alias,
             columns: col_list,
@@ -216,7 +217,8 @@ impl Engine {
         } = ins;
 
         // Validate an optional database qualifier on the target (attached-databases.md §3).
-        self.check_table_qualifier(db.as_deref(), &table)?;
+        self.check_table_qualifier(db.as_deref(), &table)
+            .map_err(|e| e.at_target(table_pos.0))?;
         // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md
         // §8): the conflict path resolves index stores UNSCOPED. A clean 0A000 before any planning.
         if on_conflict.is_some() && is_attachment_scope(db.as_deref()) {
@@ -231,6 +233,7 @@ impl Engine {
                 SqlState::UndefinedTable,
                 format!("table does not exist: {table}"),
             )
+            .at_target(table_pos.0)
         })?;
 
         // Snapshot the catalog data each row is validated against, ending the `tdef`
@@ -683,7 +686,10 @@ impl Engine {
                                         col.name,
                                         col.ty.canonical_name(),
                                         q.column_types[p].type_name(),
-                                    )));
+                                    ))
+                                    .with_position(
+                                        super::plan_query::output_column_location(&source, p).0,
+                                    ));
                                 }
                             }
                             // A container column takes a source column of exactly its own type, or an
@@ -801,7 +807,8 @@ impl Engine {
                             col.name,
                             col.ty.canonical_name(),
                             ty.type_name(),
-                        )));
+                        ))
+                        .with_position(e.location().0));
                     }
                     node
                 }
@@ -828,7 +835,8 @@ impl Engine {
                                 col.name,
                                 col.ty.canonical_name(),
                                 ty.type_name(),
-                            )));
+                            ))
+                            .with_position(e.location().0));
                         }
                     }
                     node
@@ -889,7 +897,8 @@ impl Engine {
     ) -> Result<Outcome> {
         check_catalog_rel_write(&ins.table)?;
         self.check_attachment_writable(ins.db.as_deref())?;
-        self.check_table_qualifier(ins.db.as_deref(), &ins.table)?;
+        self.check_table_qualifier(ins.db.as_deref(), &ins.table)
+            .map_err(|e| e.at_target(ins.table_pos.0))?;
 
         if let Some(cell) = insert_cache {
             let hit = {
@@ -947,6 +956,7 @@ impl Engine {
                     SqlState::UndefinedTable,
                     format!("table does not exist: {}", ins.table),
                 )
+                .at_target(ins.table_pos.0)
             })?;
         let table = tdef.clone();
         self.ensure_collations_writable(&table.columns)?;
@@ -1903,7 +1913,8 @@ impl Engine {
                             &mut AggCtx::Forbidden,
                             ptypes,
                         )?;
-                        require_assignable(&ty, target_scalar, &a.column)?;
+                        require_assignable(&ty, target_scalar, &a.column)
+                            .map_err(|e| e.with_position(a.value.location().0))?;
                         source
                     };
                     plans.push(AssignPlan {
@@ -2871,6 +2882,7 @@ impl Engine {
             FkAction::Cascade => self.run_fk_action_delete(
                 Delete {
                     table: child.name.clone(),
+                    table_pos: SrcPos::NONE,
                     db: Some("main".to_string()),
                     filter: None,
                     returning: None,
@@ -2887,12 +2899,13 @@ impl Engine {
                         column: child.columns[column].name.clone(),
                         pos: SrcPos::NONE,
                         is_default: fk.on_delete == FkAction::SetDefault,
-                        value: Expr::Literal(Literal::Null),
+                        value: Expr::Literal(Literal::Null, SrcPos::NONE),
                     })
                     .collect();
                 self.run_fk_action_update(
                     Update {
                         table: child.name.clone(),
+                        table_pos: SrcPos::NONE,
                         db: Some("main".to_string()),
                         assignments,
                         filter: None,
@@ -2944,7 +2957,7 @@ impl Engine {
                     column: child.columns[column].name.clone(),
                     pos: SrcPos::NONE,
                     is_default: fk.on_update == FkAction::SetDefault,
-                    value: Expr::Literal(Literal::Null),
+                    value: Expr::Literal(Literal::Null, SrcPos::NONE),
                 })
                 .collect(),
             FkAction::NoAction | FkAction::Restrict => return Ok(()),
@@ -2958,6 +2971,7 @@ impl Engine {
         self.run_fk_action_update(
             Update {
                 table: child.name.clone(),
+                table_pos: SrcPos::NONE,
                 db: Some("main".to_string()),
                 assignments,
                 filter: None,
@@ -3198,7 +3212,8 @@ impl Engine {
         // that is not updatable is 55000.
         let vw = self.rewrite_delete_target(&mut del)?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
-        self.check_table_qualifier(del.db.as_deref(), &del.table)?;
+        self.check_table_qualifier(del.db.as_deref(), &del.table)
+            .map_err(|e| e.at_target(del.table_pos.0))?;
         let table = self
             .table_scoped(del.db.as_deref(), &del.table)
             .ok_or_else(|| {
@@ -3206,6 +3221,7 @@ impl Engine {
                     SqlState::UndefinedTable,
                     format!("table does not exist: {}", del.table),
                 )
+                .at_target(del.table_pos.0)
             })?;
         let fk_parent = table.clone();
         // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
@@ -3482,7 +3498,8 @@ impl Engine {
         // not updatable is 55000.
         let vw = self.rewrite_update_target(&mut upd)?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
-        self.check_table_qualifier(upd.db.as_deref(), &upd.table)?;
+        self.check_table_qualifier(upd.db.as_deref(), &upd.table)
+            .map_err(|e| e.at_target(upd.table_pos.0))?;
         let table = self
             .table_scoped(upd.db.as_deref(), &upd.table)
             .ok_or_else(|| {
@@ -3490,6 +3507,7 @@ impl Engine {
                     SqlState::UndefinedTable,
                     format!("table does not exist: {}", upd.table),
                 )
+                .at_target(upd.table_pos.0)
             })?;
         let fk_parent = table.clone();
         // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
@@ -3623,7 +3641,8 @@ impl Engine {
                         &mut AggCtx::Forbidden,
                         &mut ptypes,
                     )?;
-                    require_assignable(&ty, target_scalar, &a.column)?;
+                    require_assignable(&ty, target_scalar, &a.column)
+                        .map_err(|e| e.with_position(a.value.location().0))?;
                     plans.push(AssignPlan {
                         idx,
                         name: col.name.clone(),

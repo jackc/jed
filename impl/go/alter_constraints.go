@@ -248,7 +248,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			return err
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
-			return typeError("argument of CHECK must be boolean")
+			return positionError(typeError("argument of CHECK must be boolean"), exprLocation(d.Expr))
 		}
 		hostDeps, err := collectCheckHostDeps(node, db.session.extensions)
 		if err != nil {

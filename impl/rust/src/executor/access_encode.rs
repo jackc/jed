@@ -5644,7 +5644,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_) => false,
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_aggregate(inner),
@@ -5683,6 +5683,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
             operand,
             whens,
             els,
+            ..
         } => {
             operand.as_deref().is_some_and(expr_has_aggregate)
                 || whens
@@ -5732,7 +5733,7 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
         } => over.is_some() || over_name.is_some() || args.iter().any(expr_has_window),
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_) => false,
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_window(inner),
@@ -5769,6 +5770,7 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
             operand,
             whens,
             els,
+            ..
         } => {
             operand.as_deref().is_some_and(expr_has_window)
                 || whens
@@ -5956,6 +5958,7 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
             operand,
             whens,
             els,
+            ..
         } => {
             if let Some(o) = operand.as_deref_mut() {
                 desugar_named_windows(o, windows)?;
@@ -6012,7 +6015,7 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. } => Ok(()),
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => {
             reject_check_structure(inner)
@@ -6064,6 +6067,7 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
             operand,
             whens,
             els,
+            ..
         } => {
             if let Some(op) = operand {
                 reject_check_structure(op)?;
@@ -6124,7 +6128,7 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
             }
             args.iter().try_for_each(reject_default_structure)
         }
-        Expr::Literal(_) | Expr::TypedLiteral { .. } => Ok(()),
+        Expr::Literal(_, _) | Expr::TypedLiteral { .. } => Ok(()),
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => {
             reject_default_structure(inner)
         }
@@ -6177,6 +6181,7 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
             operand,
             whens,
             els,
+            ..
         } => {
             if let Some(op) = operand {
                 reject_default_structure(op)?;
@@ -6220,7 +6225,7 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
         };
         match e {
             Expr::Column(name, _) | Expr::QualifiedColumn { name, .. } => note(name),
-            Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => {}
+            Expr::Literal(_, _) | Expr::TypedLiteral { .. } | Expr::Param(_) => {}
             Expr::Cast { inner, .. }
             | Expr::Collate { inner, .. }
             | Expr::Extract { source: inner, .. } => walk(inner, columns, out),
@@ -6260,6 +6265,7 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
                 operand,
                 whens,
                 els,
+                ..
             } => {
                 if let Some(op) = operand {
                     walk(op, columns, out);
@@ -6343,7 +6349,7 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
         Expr::Param(n) => Some(*n),
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::QualifiedStar { .. } => None,
         Expr::ScalarSubquery(_)
@@ -6383,6 +6389,7 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
             operand,
             whens,
             els,
+            ..
         } => operand
             .as_deref()
             .and_then(index_expr_first_param)
@@ -6418,7 +6425,7 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
         | Expr::QuantifiedSubquery { .. } => true,
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_)
         | Expr::QualifiedStar { .. } => false,
@@ -6457,6 +6464,7 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
             operand,
             whens,
             els,
+            ..
         } => {
             operand.as_deref().is_some_and(index_expr_has_subquery)
                 || whens

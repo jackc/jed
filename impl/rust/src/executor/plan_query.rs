@@ -239,8 +239,9 @@ impl Engine {
         rename: Option<&[String]>,
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, DmCte)> {
-        let (table_name, alias, returning, base_is_old, stmt): (
+        let (table_name, table_pos, alias, returning, base_is_old, stmt): (
             &str,
+            SrcPos,
             Option<&str>,
             &Option<ReturningClause>,
             bool,
@@ -248,6 +249,7 @@ impl Engine {
         ) = match body {
             CteBody::Insert(ins) => (
                 &ins.table,
+                ins.table_pos,
                 ins.alias.as_deref(),
                 &ins.returning,
                 false,
@@ -255,6 +257,7 @@ impl Engine {
             ),
             CteBody::Update(upd) => (
                 &upd.table,
+                upd.table_pos,
                 None,
                 &upd.returning,
                 false,
@@ -262,6 +265,7 @@ impl Engine {
             ),
             CteBody::Delete(del) => (
                 &del.table,
+                del.table_pos,
                 None,
                 &del.returning,
                 true,
@@ -284,6 +288,7 @@ impl Engine {
                 SqlState::UndefinedTable,
                 format!("table does not exist: {table_name}"),
             )
+            .at_target(table_pos.0)
         })?;
         match returning {
             None => {
@@ -937,11 +942,16 @@ impl Engine {
 
         // Per-column type unification (42804 on an incompatible pair). Output column NAMES are
         // the LEFT operand's (PostgreSQL).
+        // A mismatch is located at the right operand's column (PostgreSQL's select_common_type).
         let column_types: Vec<ResolvedType> = lhs
             .column_types()
             .iter()
             .zip(rhs.column_types().iter())
-            .map(|(l, r)| unify_setop_column(l, r, so.op))
+            .enumerate()
+            .map(|(i, (l, r))| {
+                unify_setop_column(l, r, so.op)
+                    .map_err(|e| e.with_position(output_column_location(&so.rhs, i).0))
+            })
             .collect::<Result<_>>()?;
         // Every form but UNION ALL matches rows, so each column needs an equality operator (42883
         // for json / jsonpath, as PostgreSQL).
@@ -1081,7 +1091,8 @@ impl Engine {
                 if ri == 0 {
                     col_types.push(ty);
                 } else {
-                    col_types[ci] = unify_values_column(&col_types[ci], &ty)?;
+                    col_types[ci] = unify_values_column(&col_types[ci], &ty)
+                        .map_err(|e| e.with_position(val.location().0))?;
                 }
                 resolved_row.push(node);
             }
@@ -1242,5 +1253,18 @@ impl Engine {
             rows,
             cost,
         })
+    }
+}
+
+/// The location of a query's output column `i` — a set-operation operand, an `INSERT … SELECT`
+/// source (spec/design/error-fields.md §10.2):
+/// the select-list expression of a plain `SELECT`; unknown for a `*` list or any other operand.
+pub(crate) fn output_column_location(q: &QueryExpr, i: usize) -> SrcPos {
+    match q {
+        QueryExpr::Select(s) => match &s.items {
+            SelectItems::Items(items) => items.get(i).map_or(SrcPos::NONE, |it| it.expr.location()),
+            SelectItems::All(_) => SrcPos::NONE,
+        },
+        QueryExpr::SetOp(_) | QueryExpr::With(_) => SrcPos::NONE,
     }
 }

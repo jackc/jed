@@ -244,6 +244,13 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, tref.ColumnDefs, srfParent, ctes, ptypes)
 			if serr != nil {
+				// A table function's own 42883 (no function for these argument types) points at its
+				// name, like a call in an expression (spec/design/error-fields.md §10.2); an argument's
+				// error keeps its own.
+				var ee *EngineError
+				if errors.As(serr, &ee) && ee.State == UndefinedFunction {
+					serr = locateError(serr, tref.Src)
+				}
 				return nil, serr
 			}
 			relationName := tref.Name
@@ -565,11 +572,11 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					scopeRel{label: rq, table: &catTable{Name: rq, Columns: []catColumn{rightRel.table.Columns[rl]}}, offset: ri})
 				eq := newBinaryExpr(opEq,
 					exprNode{Kind: exprQualifiedColumn, Qualifier: lq, Column: name},
-					exprNode{Kind: exprQualifiedColumn, Qualifier: rq, Column: name})
+					exprNode{Kind: exprQualifiedColumn, Qualifier: rq, Column: name}, 0)
 				if predAST == nil {
 					predAST = &eq
 				} else {
-					a := newBinaryExpr(opAnd, *predAST, eq)
+					a := newBinaryExpr(opAnd, *predAST, eq, 0)
 					predAST = &a
 				}
 				mi := li
@@ -840,7 +847,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			return nil, herr
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
-			return nil, typeError("argument of HAVING must be boolean")
+			return nil, positionError(typeError("argument of HAVING must be boolean"), exprLocation(*sel.Having))
 		}
 		having = node
 		aggSpecs = hctx.specs

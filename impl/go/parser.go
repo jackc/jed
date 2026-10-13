@@ -27,9 +27,10 @@ func foldInt(magnitude uint64, negate bool) (int64, bool) {
 	return 0, false
 }
 
-// binaryExpr builds a binary-operator expression node.
-func newBinaryExpr(op binaryOp, lhs, rhs exprNode) exprNode {
-	return exprNode{Kind: exprBinary, Binary: &binaryExpr{Op: op, Lhs: lhs, Rhs: rhs}}
+// binaryExpr builds a binary-operator expression node; pos is the operator's character position
+// (spec/design/error-fields.md §10.2).
+func newBinaryExpr(op binaryOp, lhs, rhs exprNode, pos srcPos) exprNode {
+	return exprNode{Kind: exprBinary, Binary: &binaryExpr{Op: op, Lhs: lhs, Rhs: rhs}, Pos: pos}
 }
 
 // Hand-written recursive-descent parser (CLAUDE.md §5, §10).
@@ -2722,6 +2723,7 @@ func (p *parser) parseInsert() (*insert, error) {
 	if err := p.expectKeyword("into"); err != nil {
 		return nil, err
 	}
+	tablePos := p.here()
 	dbQualifier, table, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
@@ -2806,7 +2808,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: []string{}, Rows: [][]insertValue{{}}, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, TablePos: tablePos, DB: dbQualifier, Alias: alias, Columns: []string{}, Rows: [][]insertValue{{}}, OnConflict: onConflict, Returning: returning}, nil
 	}
 	// A plain VALUES list, possibly parenthesized, is the INSERT VALUES source.
 	rows, plain, err := p.parseInsertValuesSource()
@@ -2829,7 +2831,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Query: &query, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, TablePos: tablePos, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Query: &query, OnConflict: onConflict, Returning: returning}, nil
 	}
 
 	if !plain {
@@ -2848,7 +2850,7 @@ func (p *parser) parseInsert() (*insert, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
+	return &insert{Table: table, TablePos: tablePos, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
 }
 
 // parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —
@@ -4904,6 +4906,7 @@ func (p *parser) parseUpdate() (*update, error) {
 	if err := p.expectKeyword("update"); err != nil {
 		return nil, err
 	}
+	tablePos := p.here()
 	dbQualifier, table, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
@@ -4945,7 +4948,7 @@ func (p *parser) parseUpdate() (*update, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &update{Table: table, DB: dbQualifier, Assignments: assignments, Filter: filter, Returning: returning}, nil
+	return &update{Table: table, TablePos: tablePos, DB: dbQualifier, Assignments: assignments, Filter: filter, Returning: returning}, nil
 }
 
 // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
@@ -4956,6 +4959,7 @@ func (p *parser) parseDelete() (*deleteStmt, error) {
 	if err := p.expectKeyword("from"); err != nil {
 		return nil, err
 	}
+	tablePos := p.here()
 	dbQualifier, table, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
@@ -4968,7 +4972,7 @@ func (p *parser) parseDelete() (*deleteStmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &deleteStmt{Table: table, DB: dbQualifier, Filter: filter, Returning: returning}, nil
+	return &deleteStmt{Table: table, TablePos: tablePos, DB: dbQualifier, Filter: filter, Returning: returning}, nil
 }
 
 // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
@@ -5135,12 +5139,13 @@ func (p *parser) parseOr() (exprNode, error) {
 		if err := p.deepen(); err != nil { // each chained OR is one more AST level
 			return exprNode{}, err
 		}
+		pos := p.here()
 		p.advance()
 		rhs, err := p.parseAnd()
 		if err != nil {
 			return exprNode{}, err
 		}
-		lhs = newBinaryExpr(opOr, lhs, rhs)
+		lhs = newBinaryExpr(opOr, lhs, rhs, pos)
 	}
 	p.depth = base
 	return lhs, nil
@@ -5156,12 +5161,13 @@ func (p *parser) parseAnd() (exprNode, error) {
 		if err := p.deepen(); err != nil { // each chained AND is one more AST level
 			return exprNode{}, err
 		}
+		pos := p.here()
 		p.advance()
 		rhs, err := p.parseNot()
 		if err != nil {
 			return exprNode{}, err
 		}
-		lhs = newBinaryExpr(opAnd, lhs, rhs)
+		lhs = newBinaryExpr(opAnd, lhs, rhs, pos)
 	}
 	p.depth = base
 	return lhs, nil
@@ -5172,6 +5178,7 @@ func (p *parser) parseNot() (exprNode, error) {
 	// starts with the relation label `not`, not the unary operator. The primary parser applies
 	// the same rule before literals / CAST / CASE / current-date spellings.
 	if p.peekKeyword() == "not" && !p.atQualifiedColumnRef() {
+		notPos := p.here()
 		p.advance()
 		// right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so the
 		// depth guard also protects the parser's own stack).
@@ -5183,7 +5190,7 @@ func (p *parser) parseNot() (exprNode, error) {
 			return exprNode{}, err
 		}
 		p.undeepen()
-		return exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: operand}}, nil
+		return exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: operand}, Pos: notPos}, nil
 	}
 	return p.parseComparison()
 }
@@ -5198,6 +5205,7 @@ func (p *parser) parseComparison() (exprNode, error) {
 		return exprNode{}, err
 	}
 	if p.peekKeyword() == "is" {
+		isPos := p.here()
 		p.advance()
 		negated := false
 		if p.peekKeyword() == "not" {
@@ -5214,7 +5222,7 @@ func (p *parser) parseComparison() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			return exprNode{Kind: exprIsDistinct, IsDistinct: &isDistinctExpr{Lhs: lhs, Rhs: rhs, Negated: negated}}, nil
+			return exprNode{Kind: exprIsDistinct, IsDistinct: &isDistinctExpr{Lhs: lhs, Rhs: rhs, Negated: negated}, Pos: isPos}, nil
 		}
 		// IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
 		// well-formedness predicate (json-sql-functions.md §5).
@@ -5260,6 +5268,8 @@ func (p *parser) parseComparison() (exprNode, error) {
 	predNegated := p.peekKeyword() == "not" &&
 		(p.peekKeywordAt(1) == "in" || p.peekKeywordAt(1) == "between" ||
 			p.peekKeywordAt(1) == "like" || p.peekKeywordAt(1) == "ilike")
+	// The operator's position: the `NOT` of a negated form, else the keyword (PostgreSQL's).
+	opPos := p.here()
 	if predNegated {
 		p.advance() // NOT
 	}
@@ -5279,7 +5289,7 @@ func (p *parser) parseComparison() (exprNode, error) {
 			if err := p.expect(tokRParen); err != nil {
 				return exprNode{}, err
 			}
-			return exprNode{Kind: exprInSubquery, InSubquery: &inSubqueryExpr{Lhs: lhs, Query: q, Negated: predNegated}}, nil
+			return exprNode{Kind: exprInSubquery, InSubquery: &inSubqueryExpr{Lhs: lhs, Query: q, Negated: predNegated}, Pos: opPos}, nil
 		}
 		// A non-empty value list (`IN ()` — parseConcat on `)` is a 42601 syntax error).
 		first, err := p.parseConcat()
@@ -5298,7 +5308,7 @@ func (p *parser) parseComparison() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprIn, In: &inExpr{Lhs: lhs, List: list, Negated: predNegated}}, nil
+		return exprNode{Kind: exprIn, In: &inExpr{Lhs: lhs, List: list, Negated: predNegated}, Pos: opPos}, nil
 	}
 	if p.peekKeyword() == "between" {
 		p.advance()
@@ -5317,13 +5327,14 @@ func (p *parser) parseComparison() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprBetween, Between: &betweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
+		return exprNode{Kind: exprBetween, Between: &betweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}, Pos: opPos}, nil
 	}
 	// LIKE / ILIKE (exact name) — grammar.md §22. `ilike` is just another peeked keyword.
 	// An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`; a bare NULL
 	// or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
 	if p.peekKeyword() == "like" || p.peekKeyword() == "ilike" {
 		insensitive := p.peekKeyword() == "ilike"
+		likePos := p.here()
 		p.advance()
 		rhs, err := p.parseConcat()
 		if err != nil {
@@ -5339,9 +5350,9 @@ func (p *parser) parseComparison() (exprNode, error) {
 			rhs = exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{
 				Name: "like_escape",
 				Args: []*exprNode{&pattern, &escape},
-			}}
+			}, Pos: likePos}
 		}
-		return exprNode{Kind: exprLike, Like: &likeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}}, nil
+		return exprNode{Kind: exprLike, Like: &likeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}, Pos: opPos}, nil
 	}
 	// `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
 	// `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
@@ -5365,7 +5376,7 @@ func (p *parser) parseComparison() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprRegex, Regex: &regexExpr{Lhs: lhs, Rhs: rhs, Negated: rxNegated, Insensitive: rxInsensitive}}, nil
+		return exprNode{Kind: exprRegex, Regex: &regexExpr{Lhs: lhs, Rhs: rhs, Negated: rxNegated, Insensitive: rxInsensitive}, Pos: opPos}, nil
 	}
 	var op binaryOp
 	switch p.peek().Kind {
@@ -5404,7 +5415,7 @@ func (p *parser) parseComparison() (exprNode, error) {
 			if err := p.expect(tokRParen); err != nil {
 				return exprNode{}, err
 			}
-			return exprNode{Kind: exprQuantifiedSubquery, QuantifiedSubquery: &quantifiedSubqueryExpr{Op: op, All: all, Lhs: lhs, Query: query}}, nil
+			return exprNode{Kind: exprQuantifiedSubquery, QuantifiedSubquery: &quantifiedSubqueryExpr{Op: op, All: all, Lhs: lhs, Query: query}, Pos: opPos}, nil
 		}
 		array, err := p.parseExpr() // a full expression resolving to an array
 		if err != nil {
@@ -5413,13 +5424,13 @@ func (p *parser) parseComparison() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprQuantified, Quantified: &quantifiedExpr{Op: op, All: all, Lhs: lhs, Array: array}}, nil
+		return exprNode{Kind: exprQuantified, Quantified: &quantifiedExpr{Op: op, All: all, Lhs: lhs, Array: array}, Pos: opPos}, nil
 	}
 	rhs, err := p.parseConcat()
 	if err != nil {
 		return exprNode{}, err
 	}
-	return newBinaryExpr(op, lhs, rhs), nil
+	return newBinaryExpr(op, lhs, rhs, opPos), nil
 }
 
 // parseConcat parses the "any other operator" level (grammar.md §39/§40, array-functions.md §8/§10):
@@ -5483,12 +5494,13 @@ func (p *parser) parseConcat() (exprNode, error) {
 		if err := p.deepen(); err != nil { // each chained operator is one more AST level
 			return exprNode{}, err
 		}
+		pos := p.here()
 		p.advance()
 		rhs, err := p.parseAdditive()
 		if err != nil {
 			return exprNode{}, err
 		}
-		lhs = newBinaryExpr(op, lhs, rhs)
+		lhs = newBinaryExpr(op, lhs, rhs, pos)
 	}
 }
 
@@ -5512,12 +5524,13 @@ func (p *parser) parseAdditive() (exprNode, error) {
 		if err := p.deepen(); err != nil { // each chained +/- is one more AST level (`1+1+…`)
 			return exprNode{}, err
 		}
+		pos := p.here()
 		p.advance()
 		rhs, err := p.parseMultiplicative()
 		if err != nil {
 			return exprNode{}, err
 		}
-		lhs = newBinaryExpr(op, lhs, rhs)
+		lhs = newBinaryExpr(op, lhs, rhs, pos)
 	}
 }
 
@@ -5543,12 +5556,13 @@ func (p *parser) parseMultiplicative() (exprNode, error) {
 		if err := p.deepen(); err != nil { // each chained * / % is one more AST level
 			return exprNode{}, err
 		}
+		pos := p.here()
 		p.advance()
 		rhs, err := p.parseAtTimeZone()
 		if err != nil {
 			return exprNode{}, err
 		}
-		lhs = newBinaryExpr(op, lhs, rhs)
+		lhs = newBinaryExpr(op, lhs, rhs, pos)
 	}
 }
 
@@ -5568,6 +5582,7 @@ func (p *parser) parseAtTimeZone() (exprNode, error) {
 		if err := p.deepen(); err != nil { // each chained AT TIME ZONE is one more AST level
 			return exprNode{}, err
 		}
+		at := p.here()
 		p.advance() // AT
 		p.advance() // TIME
 		p.advance() // ZONE
@@ -5579,7 +5594,7 @@ func (p *parser) parseAtTimeZone() (exprNode, error) {
 		lhs = exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{
 			Name: "timezone",
 			Args: []*exprNode{&zone, &prev},
-		}}
+		}, Pos: at}
 	}
 	p.depth = base
 	return lhs, nil
@@ -5587,6 +5602,7 @@ func (p *parser) parseAtTimeZone() (exprNode, error) {
 
 func (p *parser) parseUnary() (exprNode, error) {
 	if p.peek().Kind == tokMinus {
+		minus := p.here()
 		p.advance()
 		// Fold unary-minus-of-an-integer-literal into one negative literal, so i64's
 		// minimum is representable and the literal range-checks against context. SUPPRESSED
@@ -5599,7 +5615,7 @@ func (p *parser) parseUnary() (exprNode, error) {
 				return exprNode{}, newError(NumericValueOutOfRange,
 					"value out of range: integer literal exceeds the maximum signed 64-bit value")
 			}
-			return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: v}}, nil
+			return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: v}, Pos: minus}, nil
 		}
 		// Fold unary-minus of a decimal literal into one negative decimal literal (decimal
 		// negation never overflows). Same `::` suppression.
@@ -5607,7 +5623,7 @@ func (p *parser) parseUnary() (exprNode, error) {
 			t := p.advance()
 			return exprNode{Kind: exprLiteral, Literal: &literal{
 				Kind: literalDecimal, Dec: decimalFromDigitsScale(true, t.Word, uint32(t.Int)),
-			}}, nil
+			}, Pos: minus}, nil
 		}
 		// each chained unary `-` is one more AST level (recursion here, so the depth guard also
 		// protects the parser's own stack against `- - - … x`).
@@ -5619,7 +5635,7 @@ func (p *parser) parseUnary() (exprNode, error) {
 			return exprNode{}, err
 		}
 		p.undeepen()
-		return exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNeg, Operand: operand}}, nil
+		return exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNeg, Operand: operand}, Pos: minus}, nil
 	}
 	return p.parsePostfix()
 }
@@ -5902,6 +5918,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		return exprNode{Kind: exprArray, RowItems: items}, nil
 	}
 	if p.peekKeyword() == "cast" {
+		castPos := p.here()
 		p.advance()
 		if err := p.expect(tokLParen); err != nil {
 			return exprNode{}, err
@@ -5931,7 +5948,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprCast, Cast: &castExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
+		return exprNode{Kind: exprCast, Cast: &castExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}, Pos: castPos}, nil
 	}
 	// EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
 	// is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
@@ -5974,8 +5991,9 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
 	if t0 := p.peek(); isIdentKind(t0.Kind) && !(t0.Kind == tokWord && (t0.Word == "null" || t0.Word == "true" || t0.Word == "false")) && p.peekKindAt(1) == tokStr {
 		name := p.advance().Word // the named type (folded or quoted; resolved byte-exactly)
+		pos := p.here()
 		t := p.advance()
-		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
+		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, Pos: pos}, nil
 	}
 	// The two-word `character varying '...'` typed literal (types.md §15).
 	if p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying" && p.peekKindAt(2) == tokStr {
@@ -5983,8 +6001,9 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
+		pos := p.here()
 		t := p.advance()
-		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
+		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, Pos: pos}, nil
 	}
 	// The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (json-sql-functions.md
 	// §5, S2) — keyword-led primaries with sub-clauses. Recognized by the function keyword immediately
@@ -6131,6 +6150,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		return exprNode{Kind: exprGreatestLeast, GreatestLeast: args, Greatest: greatest}, nil
 	}
 	if p.peekKeyword() == "case" {
+		casePos := p.here()
 		p.advance()
 		// Simple form has an operand between CASE and the first WHEN; the searched form starts
 		// directly with WHEN (grammar.md §23).
@@ -6173,9 +6193,11 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expectKeyword("end"); err != nil {
 			return exprNode{}, err
 		}
-		return exprNode{Kind: exprCase, Case: &caseExpr{Operand: operand, Whens: whens, Els: els}}, nil
+		return exprNode{Kind: exprCase, Case: &caseExpr{Operand: operand, Whens: whens, Els: els}, Pos: casePos}, nil
 	}
 	t := p.peek()
+	// The primary token's character position (spec/design/error-fields.md §10.2).
+	here := p.here()
 	switch {
 	case t.Kind == tokParam:
 		return exprNode{Kind: exprParam, Param: p.advance().Int}, nil
@@ -6187,24 +6209,24 @@ func (p *parser) parsePrimary() (exprNode, error) {
 			return exprNode{}, newError(NumericValueOutOfRange,
 				"value out of range: integer literal exceeds the maximum signed 64-bit value")
 		}
-		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: v}}, nil
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: v}, Pos: here}, nil
 	case t.Kind == tokDecimal:
 		p.advance()
 		return exprNode{Kind: exprLiteral, Literal: &literal{
 			Kind: literalDecimal, Dec: decimalFromDigitsScale(false, t.Word, uint32(t.Int)),
-		}}, nil
+		}, Pos: here}, nil
 	case t.Kind == tokStr:
 		p.advance()
-		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: t.Word}}, nil
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: t.Word}, Pos: here}, nil
 	case t.Kind == tokWord && t.Word == "null":
 		p.advance()
-		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}, nil
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}, Pos: here}, nil
 	case t.Kind == tokWord && t.Word == "true":
 		p.advance()
-		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: true}}, nil
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: true}, Pos: here}, nil
 	case t.Kind == tokWord && t.Word == "false":
 		p.advance()
-		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: false}}, nil
+		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: false}, Pos: here}, nil
 	case t.Kind == tokWord && t.Word == "current_timestamp" &&
 		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen):
 		// `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the value
@@ -6212,7 +6234,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		// volatility are entirely shared (spec/design/functions.md §12). Not fired when followed by
 		// `(` (a precision typmod, deferred) so that form resolves normally (42883).
 		p.advance()
-		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "now"}}, nil
+		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "now"}, Pos: here}, nil
 	case t.Kind == tokWord && t.Word == "current_date" &&
 		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen):
 		// `current_date` — the SQL-standard bare keyword, desugared to the current_date() catalog
@@ -6220,7 +6242,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		// form; a following `(` is the explicit call spelling, which jed also resolves (PG rejects
 		// it as a syntax error — a documented jed-lenient divergence, catalog.toml).
 		p.advance()
-		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "current_date"}}, nil
+		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "current_date"}, Pos: here}, nil
 	case isIdentKind(t.Kind):
 		// Function call: an identifier IMMEDIATELY followed by "(" is a call (the engine's
 		// first call syntax — grammar.md §17). The one-token lookahead keeps function names
@@ -6260,6 +6282,7 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 	// (below).
 	substringForm := p.peekKeyword() == "substring"
 	overlayForm := p.peekKeyword() == "overlay"
+	pos := p.here()
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return exprNode{}, err
@@ -6347,14 +6370,14 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 			// positional argument selects the special form.
 			if substringForm && argName == nil && !fc.Distinct && len(fc.Args) == 1 {
 				if kw := p.peekKeyword(); kw == "from" || kw == "for" {
-					return p.parseSubstringTail(name, arg)
+					return p.parseSubstringTail(name, arg, pos)
 				}
 			}
 			// `OVERLAY(s PLACING r FROM start [FOR count])` (grammar.ebnf `overlay_expr`,
 			// string-functions.md §3): a PLACING keyword after the first positional argument
 			// selects the special form.
 			if overlayForm && argName == nil && !fc.Distinct && len(fc.Args) == 1 && p.peekKeyword() == "placing" {
-				return p.parseOverlayTail(name, arg)
+				return p.parseOverlayTail(name, arg, pos)
 			}
 			// A trailing in-aggregate ORDER BY (`json_agg(x ORDER BY y)` — aggregates.md §22) ends the
 			// argument list. The resolver rejects it on a non-aggregate (42809) or a window call (0A000).
@@ -6465,7 +6488,7 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 				return exprNode{}, err
 			}
 			fc.OverName = oname
-			return exprNode{Kind: exprFuncCall, FuncCall: fc}, nil
+			return exprNode{Kind: exprFuncCall, FuncCall: fc, Pos: pos}, nil
 		}
 		if err := p.expect(tokLParen); err != nil {
 			return exprNode{}, err
@@ -6481,7 +6504,7 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 		}
 		fc.Over = &def
 	}
-	return exprNode{Kind: exprFuncCall, FuncCall: fc}, nil
+	return exprNode{Kind: exprFuncCall, FuncCall: fc, Pos: pos}, nil
 }
 
 // parseWindowFrame parses an optional window frame clause `{ROWS|RANGE|GROUPS} frame_extent
@@ -6686,7 +6709,7 @@ func (p *parser) parseQualifiedTableName() (*string, string, error) {
 // `SUBSTRING(x FOR l [FROM s])` (grammar.ebnf `substring_expr`), the cursor on FROM or FOR. It
 // desugars to the ordinary call `substring(x, s[, l])` — PostgreSQL's rewrite — with a FOR-only form
 // starting at 1. No FILTER / OVER may follow (the form is not a function application).
-func (p *parser) parseSubstringTail(name string, source exprNode) (exprNode, error) {
+func (p *parser) parseSubstringTail(name string, source exprNode, pos srcPos) (exprNode, error) {
 	var start, count *exprNode
 	if p.peekKeyword() == "from" {
 		p.advance()
@@ -6731,7 +6754,7 @@ func (p *parser) parseSubstringTail(name string, source exprNode) (exprNode, err
 	if count != nil {
 		args = append(args, count)
 	}
-	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: args}}, nil
+	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: args}, Pos: pos}, nil
 }
 
 // parsePositionForm parses the SQL special form `POSITION(substring IN string)` (grammar.ebnf
@@ -6740,6 +6763,7 @@ func (p *parser) parseSubstringTail(name string, source exprNode) (exprNode, err
 // is an "any other operator" (parseConcat) expression, so the operand's own IN is never taken as an
 // IN predicate; anything else after the first operand (a comma) is 42601, as in PostgreSQL.
 func (p *parser) parsePositionForm() (exprNode, error) {
+	pos := p.here()
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return exprNode{}, err
@@ -6765,14 +6789,14 @@ func (p *parser) parsePositionForm() (exprNode, error) {
 	if err := p.expect(tokRParen); err != nil {
 		return exprNode{}, err
 	}
-	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: []*exprNode{&str, &sub}}}, nil
+	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: []*exprNode{&str, &sub}}, Pos: pos}, nil
 }
 
 // parseOverlayTail parses the tail of the SQL special form `OVERLAY(s PLACING r FROM start [FOR
 // count])` (grammar.ebnf `overlay_expr`), the cursor on PLACING. It desugars to the ordinary call
 // `overlay(s, r, start[, count])` — PostgreSQL's rewrite. FROM is required. No FILTER / OVER may
 // follow (the form is not a function application).
-func (p *parser) parseOverlayTail(name string, source exprNode) (exprNode, error) {
+func (p *parser) parseOverlayTail(name string, source exprNode, pos srcPos) (exprNode, error) {
 	if err := p.expectKeyword("placing"); err != nil {
 		return exprNode{}, err
 	}
@@ -6799,7 +6823,7 @@ func (p *parser) parseOverlayTail(name string, source exprNode) (exprNode, error
 	if err := p.expect(tokRParen); err != nil {
 		return exprNode{}, err
 	}
-	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: args}}, nil
+	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: args}, Pos: pos}, nil
 }
 
 // peek returns the current token without consuming it.

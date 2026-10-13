@@ -58,6 +58,7 @@ impl Engine {
         };
         let ins = Insert {
             table,
+            table_pos: SrcPos::NONE,
             db: Some(db),
             alias: None,
             columns: None,

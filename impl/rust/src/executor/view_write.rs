@@ -723,7 +723,7 @@ impl Engine {
                 a.column = base.clone();
                 if a.is_default {
                     a.is_default = false;
-                    a.value = Expr::Literal(Literal::Null);
+                    a.value = Expr::Literal(Literal::Null, SrcPos::NONE);
                 }
             }
         }
@@ -754,7 +754,7 @@ impl Engine {
             a.column = base.clone();
             if a.is_default {
                 a.is_default = false;
-                a.value = Expr::Literal(Literal::Null);
+                a.value = Expr::Literal(Literal::Null, SrcPos::NONE);
             }
         }
         Ok(Some(vw))

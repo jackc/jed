@@ -461,7 +461,7 @@ func (db *engine) explainInsert(r *explainRender, ins *insert, depth int, bindin
 		return err
 	}
 	if _, ok := db.lkpTable(ins.Table); !ok {
-		return newError(UndefinedTable, "table does not exist: "+ins.Table)
+		return newError(UndefinedTable, "table does not exist: "+ins.Table).withPosition(int32(ins.TablePos))
 	}
 	r.emit(depth, "Insert "+ins.Table, insertDetail(ins))
 	if ins.Query != nil {
@@ -498,7 +498,7 @@ func (db *engine) explainUpdate(r *explainRender, upd *update, depth int, bindin
 	}
 	table, ok := db.lkpTable(upd.Table)
 	if !ok {
-		return newError(UndefinedTable, "table does not exist: "+upd.Table)
+		return newError(UndefinedTable, "table does not exist: "+upd.Table).withPosition(int32(upd.TablePos))
 	}
 	filter, err := db.explainDmlFilter(table, upd.Filter, bindings, vw)
 	if err != nil {
@@ -523,7 +523,7 @@ func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int, bi
 	}
 	table, ok := db.lkpTable(del.Table)
 	if !ok {
-		return newError(UndefinedTable, "table does not exist: "+del.Table)
+		return newError(UndefinedTable, "table does not exist: "+del.Table).withPosition(int32(del.TablePos))
 	}
 	filter, err := db.explainDmlFilter(table, del.Filter, bindings, vw)
 	if err != nil {

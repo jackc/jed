@@ -609,6 +609,9 @@ type typeMod struct {
 // (spec/design/grammar.md §12).
 type insert struct {
 	Table string
+	// TablePos is the target name's character position — the database qualifier's for `db.t`
+	// (spec/design/error-fields.md §10.2).
+	TablePos srcPos
 	// DB is the optional database qualifier on the target (`INSERT INTO reports.t …`), like
 	// tableRef.DB (spec/design/attached-databases.md §3). Nil = implicit scope.
 	DB *string
@@ -710,6 +713,9 @@ type insertValue struct {
 // resolve to boolean.
 type update struct {
 	Table string
+	// TablePos is the target name's character position — the database qualifier's for `db.t`
+	// (spec/design/error-fields.md §10.2).
+	TablePos srcPos
 	// DB is the optional database qualifier on the target (`UPDATE reports.t SET …`), like
 	// tableRef.DB (spec/design/attached-databases.md §3). Nil = implicit scope.
 	DB          *string
@@ -739,6 +745,9 @@ type assignment struct {
 // WHERE expression must resolve to boolean.
 type deleteStmt struct {
 	Table string
+	// TablePos is the target name's character position — the database qualifier's for `db.t`
+	// (spec/design/error-fields.md §10.2).
+	TablePos srcPos
 	// DB is the optional database qualifier on the target (`DELETE FROM reports.t …`), like
 	// tableRef.DB (spec/design/attached-databases.md §3). Nil = implicit scope.
 	DB     *string
@@ -1429,8 +1438,11 @@ type exprNode struct {
 	// StarPos is an ExprQualifiedStar's qualifier-token position (views.md §5: `rel . *` is a
 	// three-token span); invisible to equality.
 	StarPos tokPos
-	// Pos is a column reference's character position (spec/design/error-fields.md §10.2) — the
-	// qualifier's for an ExprQualifiedColumn; invisible to equality.
+	// Pos is the node's character position (spec/design/error-fields.md §10.2); invisible to
+	// equality. A column reference's (the qualifier's for an ExprQualifiedColumn), a literal's (the
+	// minus sign of a folded negative number), a typed literal's string token, a function call's name
+	// (a special form's keyword), an operator's token (the NOT of NOT IN / NOT BETWEEN / NOT LIKE, the
+	// IS of IS DISTINCT FROM), a CASE's keyword, a CAST's keyword (0 for a `::` cast). 0 = none.
 	Pos srcPos
 }
 

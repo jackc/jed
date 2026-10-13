@@ -246,6 +246,7 @@ func hasCteBinding(bindings []*cteBinding, name string) bool {
 // be a base table — a CTE name / missing table is 42P01 (§1).
 func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*catTable, *dmCte, error) {
 	var tableName string
+	var tablePos srcPos
 	var returning *returningClause
 	var baseIsOld bool
 	var alias *string
@@ -253,13 +254,16 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	switch {
 	case body.Insert != nil:
 		tableName, returning, baseIsOld = body.Insert.Table, body.Insert.Returning, false
+		tablePos = body.Insert.TablePos
 		alias = body.Insert.Alias
 		dm.insert = body.Insert
 	case body.Update != nil:
 		tableName, returning, baseIsOld = body.Update.Table, body.Update.Returning, false
+		tablePos = body.Update.TablePos
 		dm.update = body.Update
 	default:
 		tableName, returning, baseIsOld = body.Delete.Table, body.Delete.Returning, true
+		tablePos = body.Delete.TablePos
 		dm.delete = body.Delete
 	}
 	// A write through an updatable view targets its base table, and its RETURNING projects the
@@ -284,7 +288,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	}
 	tdef, ok := db.lkpTable(target) // temp-first (temp-tables.md §3)
 	if !ok {
-		return nil, nil, newError(UndefinedTable, "table does not exist: "+tableName)
+		return nil, nil, newError(UndefinedTable, "table does not exist: "+tableName).withPosition(int32(tablePos))
 	}
 	if returning == nil {
 		dm.noReturning = true
@@ -1589,7 +1593,8 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 	for i := range columnTypes {
 		t, err := unifySetopColumn(lhs.columnTypes()[i], rhs.columnTypes()[i], so.Op)
 		if err != nil {
-			return nil, err
+			// A mismatch is located at the right operand's column (PostgreSQL's select_common_type).
+			return nil, positionError(err, outputColumnLocation(so.Rhs, i))
 		}
 		columnTypes[i] = t
 	}
@@ -1773,7 +1778,7 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 			} else {
 				u, err := unifyValuesColumn(colTypes[ci], ty)
 				if err != nil {
-					return nil, err
+					return nil, positionError(err, exprLocation(*val))
 				}
 				colTypes[ci] = u
 			}
@@ -1867,6 +1872,16 @@ func setopName(op setOpKind) string {
 // (spec/design/grammar.md §25, commonType); a pair with no common type is 42804. An all-NULL column
 // stays rtNull (PostgreSQL would call a top-level one text, but the type is never observed in
 // output).
+// outputColumnLocation is the location of a query's output column i — a set-operation operand, an
+// INSERT … SELECT source (spec/design/error-fields.md §10.2): the select-list expression of a plain
+// SELECT; unknown (0) for a `*` list or any other operand.
+func outputColumnLocation(q queryExpr, i int) srcPos {
+	if q.Select == nil || q.Select.Items.All || i >= len(q.Select.Items.Items) {
+		return 0
+	}
+	return exprLocation(q.Select.Items.Items[i].Expr)
+}
+
 func unifySetopColumn(a, b resolvedType, op setOpKind) (resolvedType, error) {
 	if t, ok := commonType(a, b); ok {
 		return t, nil

@@ -34,6 +34,10 @@ export class EngineError extends Error {
   // PostgreSQL's HINT suggestion (`Perhaps you meant to reference the column "t.name".`) —
   // spec/design/error-fields.md §11. Never part of the rendered message.
   hint?: string;
+  // Set once an expression node's resolution has decided this error's position (stamped or
+  // deliberately left absent), so an enclosing node never claims an error raised inside one of its
+  // operands (spec/design/error-fields.md §10.2). Internal bookkeeping, not a field.
+  located?: boolean;
 
   constructor(state: SqlState, message: string) {
     super(`${sqlStateCode(state)}: ${message}`);
@@ -79,6 +83,21 @@ export class EngineError extends Error {
     if (this.position === undefined && pos !== undefined && pos > 0) this.position = pos;
     return this;
   }
+  // locate stamps an error leaving an expression node's resolution with pos unless an inner node
+  // already decided its position, then marks it decided (spec/design/error-fields.md §10.2).
+  locate(pos: number | undefined): this {
+    if (this.located !== true) {
+      this.withPosition(pos);
+      this.located = true;
+    }
+    return this;
+  }
+  // atTarget positions a DML target's 42P01 at the target's name (spec/design/error-fields.md
+  // §10.2); any other error passes through.
+  atTarget(pos: number | undefined): this {
+    if (this.state === "undefined_table") this.withPosition(pos);
+    return this;
+  }
   // shiftPosition moves Position by `chars` characters — a statement's error moved into the
   // coordinates of the script that contains it (spec/design/error-fields.md §10.1).
   shiftPosition(chars: number): this {
@@ -89,6 +108,22 @@ export class EngineError extends Error {
   withHint(hint: string | undefined): this {
     if (this.hint === undefined) this.hint = hint;
     return this;
+  }
+}
+
+// positionedAt sets an EngineError's Position at pos unless one is already set — a raise site that
+// knows the offending expression (spec/design/error-fields.md §10.2). Any other error passes through.
+export function positionedAt<E>(err: E, pos: number | undefined): E {
+  if (err instanceof EngineError) err.withPosition(pos);
+  return err;
+}
+
+// atPosition runs f, positioning an EngineError it throws at pos (positionedAt).
+export function atPosition<T>(pos: number | undefined, f: () => T): T {
+  try {
+    return f();
+  } catch (err) {
+    throw positionedAt(err, pos);
   }
 }
 

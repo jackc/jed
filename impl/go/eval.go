@@ -889,6 +889,31 @@ func commonArrayElement(x, y resolvedType) (resolvedType, bool) {
 	}
 }
 
+// mismatchLocation is the location of the expression a failed type unification names
+// (spec/design/error-fields.md §10.2): PostgreSQL's select_common_type scans the expressions in order
+// and reports the first whose type does not unify with those before it. unifies is the unifier that
+// failed, run over each prefix; exprs is in PostgreSQL's scan order.
+func mismatchLocation(types []resolvedType, exprs []exprNode, unifies func([]resolvedType) bool) srcPos {
+	for i := 1; i < len(types); i++ {
+		if !unifies(types[:i+1]) {
+			return exprLocation(exprs[i])
+		}
+	}
+	return 0
+}
+
+// caseTypesUnify reports whether unifyCaseTypes accepts types.
+func caseTypesUnify(types []resolvedType) bool {
+	_, err := unifyCaseTypes(types, "")
+	return err == nil
+}
+
+// arrayElementTypesUnify reports whether unifyArrayElementTypes accepts types.
+func arrayElementTypesUnify(types []resolvedType) bool {
+	_, err := unifyArrayElementTypes(types)
+	return err == nil
+}
+
 // unifyCaseTypes unifies a CASE's result-arm types — or a COALESCE's (grammar.md §51) or
 // GREATEST/LEAST's (§52) argument types — into one common type by folding commonType; NULL-typed
 // arms are skipped, an all-NULL list is text (PostgreSQL's unknown rule), and a pair with no common

@@ -541,7 +541,7 @@ pub(crate) fn default_expr(lit: &str) -> Expr {
     let n: i64 = lit
         .parse()
         .expect("catalog arg_defaults are integer literals (verify.rb)");
-    Expr::Literal(Literal::Int(n))
+    Expr::Literal(Literal::Int(n), SrcPos::NONE)
 }
 
 /// Place a call's positional + named arguments into a function's parameter slots by PostgreSQL's
@@ -1381,7 +1381,9 @@ pub(crate) fn resolve_boolean_filter(
         | ResolvedType::JsonPath
         | ResolvedType::Composite(_)
         | ResolvedType::Array(_)
-        | ResolvedType::Range(_) => Err(type_error("argument of WHERE must be boolean")),
+        | ResolvedType::Range(_) => {
+            Err(type_error("argument of WHERE must be boolean").with_position(e.location().0))
+        }
     }
 }
 
@@ -2764,7 +2766,7 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_) => false,
         Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_calls_seq_mutator),
@@ -2808,6 +2810,7 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
             operand,
             whens,
             els,
+            ..
         } => {
             operand.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
                 || whens
@@ -3188,7 +3191,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_) => {}
         Expr::Row(es) | Expr::Array(es) => {
@@ -3253,6 +3256,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
             operand,
             whens,
             els,
+            ..
         } => {
             if let Some(x) = operand {
                 collect_expr_privs(x, req, locals);
@@ -3295,7 +3299,7 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
     match e {
         Expr::Column(_, _) | Expr::QualifiedColumn { .. } => true,
         Expr::ScalarSubquery(_) | Expr::Exists(_) => true,
-        Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => false,
+        Expr::Literal(_, _) | Expr::TypedLiteral { .. } | Expr::Param(_) => false,
         Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_reads_columns),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_reads_columns(base),
         // `t.*` reads the relation's columns (e.g. `RETURNING t.*`).
@@ -3335,6 +3339,7 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
             operand,
             whens,
             els,
+            ..
         } => {
             operand.as_ref().is_some_and(|x| expr_reads_columns(x))
                 || whens
@@ -3626,6 +3631,58 @@ pub(crate) fn resolve(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
+    resolve_node(scope, e, ctx, agg, params).map_err(|err| locate_node_error(err, e))
+}
+
+/// Decide the position of an error leaving node `e`'s resolution (spec/design/error-fields.md
+/// §10.2). A function call's `42883` points at its name; an operator's `42883` / `42804` (no operator
+/// for these operand types) points at the operator. AND / OR / NOT name the offending operand
+/// instead, at their raise site. A string literal's input error points at the literal. An error an
+/// operand raised was already decided by that operand's own resolution, so the enclosing node never
+/// claims it.
+fn locate_node_error(err: EngineError, e: &Expr) -> EngineError {
+    let operator_error = matches!(
+        err.state,
+        SqlState::UndefinedFunction | SqlState::DatatypeMismatch
+    );
+    let pos = match e {
+        Expr::FuncCall { pos, .. } if err.state == SqlState::UndefinedFunction => *pos,
+        Expr::Binary { op, pos, .. }
+            if operator_error && !matches!(op, BinaryOp::And | BinaryOp::Or) =>
+        {
+            *pos
+        }
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            pos,
+            ..
+        } if operator_error => *pos,
+        Expr::IsDistinctFrom { pos, .. }
+        | Expr::Like { pos, .. }
+        | Expr::Regex { pos, .. }
+        | Expr::InSubquery { pos, .. }
+        | Expr::Quantified { pos, .. }
+        | Expr::QuantifiedSubquery { pos, .. }
+            if operator_error =>
+        {
+            *pos
+        }
+        // A string literal adapting to its context (a uuid / bytea / date / json … sibling) is
+        // input-converted here, like PostgreSQL's parse-time coercion of an unknown literal: any
+        // input error points at the literal.
+        Expr::Literal(Literal::Text(_), pos) => *pos,
+        _ => SrcPos::NONE,
+    };
+    err.locate(pos.0)
+}
+
+fn resolve_node(
+    scope: &Scope,
+    e: &Expr,
+    ctx: Option<ScalarType>,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
     // GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
     // matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT
     // a+b … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own
@@ -3679,7 +3736,13 @@ pub(crate) fn resolve(
             // Unify the item types. If they are themselves arrays, this is a **nested** (multidim-
             // stacking) constructor and the result type is the SAME array type (dimension-agnostic,
             // spec/design/array.md §2/§4); otherwise it is a flat 1-D array of the unified element.
-            let common = unify_array_element_types(&elem_types)?;
+            let common = unify_array_element_types(&elem_types).map_err(|e| {
+                let exprs: Vec<&Expr> = items.iter().collect();
+                let pos = mismatch_location(&elem_types, &exprs, |ts| {
+                    unify_array_element_types(ts).is_ok()
+                });
+                e.with_position(pos.0)
+            })?;
             let (nested, result_ty) = match common {
                 t @ ResolvedType::Array(_) => (true, t),
                 other => (false, ResolvedType::Array(Box::new(other))),
@@ -3818,6 +3881,7 @@ pub(crate) fn resolve(
             over_name: _, // desugared to `over` before resolution (window.md §5)
             within_group,
             agg_order,
+            ..
         } => {
             // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md
             // §19) is one of these window-function names used WITH a WITHIN GROUP clause; that clause
@@ -3946,9 +4010,9 @@ pub(crate) fn resolve(
                 params,
             )
         }
-        Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
-        Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
-        Expr::Literal(Literal::Int(n)) => {
+        Expr::Literal(Literal::Null, _) => Ok((RExpr::ConstNull, ResolvedType::Null)),
+        Expr::Literal(Literal::Bool(b), _) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
+        Expr::Literal(Literal::Int(n), _) => {
             // An integer literal ADAPTS to a float context — decimal/int literal → float at the
             // context width (nearest, round-ties-to-even — spec/design/float.md §4). This is
             // literal adaptation, not an implicit cross-family cast (a *value* never silently
@@ -3966,7 +4030,7 @@ pub(crate) fn resolve(
             }
             Ok((RExpr::ConstInt(*n), ResolvedType::Int(ty)))
         }
-        Expr::Literal(Literal::Text(s)) => {
+        Expr::Literal(Literal::Text(s), _) => {
             // A string literal is text by default (collation `C`). It adapts to a BYTEA context
             // (decode the hex or escape input, 22P02), a UUID context (PG-flexible uuid input,
             // 22P02 — types.md §6/§13/§14), or a TIMESTAMP/TIMESTAMPTZ context (parse the datetime,
@@ -4028,7 +4092,7 @@ pub(crate) fn resolve(
                 _ => Ok((RExpr::ConstText(s.clone()), ResolvedType::Text)),
             }
         }
-        Expr::Literal(Literal::Decimal(d)) => {
+        Expr::Literal(Literal::Decimal(d), _) => {
             // A decimal literal ADAPTS to a float context — decimal → float at the context width
             // (nearest binary value, round-ties-to-even — spec/design/float.md §4). Otherwise it
             // stays decimal (it does not adapt to other contexts, like text). Cap-check the
@@ -4048,13 +4112,18 @@ pub(crate) fn resolve(
         // `type 'string'`, equal to `CAST('string' AS type)` over a string-literal operand. Resolve
         // the type by name (unknown → 42704) and coerce the string to it at resolve, independent of
         // any context. No typmod rides on the literal (the parser's one-token lookahead admits none).
-        Expr::TypedLiteral { type_name, text } => {
+        Expr::TypedLiteral {
+            type_name,
+            text,
+            pos,
+        } => {
             // A composite type name (`addr '(Main,90210)'`) coerces the string via `record_in`
             // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
             if let Some(ct) = scope.catalog.composite_type(type_name) {
                 return fold_in_session_zone(scope, params, |iz| {
                     coerce_string_to_composite(text, ct, scope.catalog, iz)
-                });
+                })
+                .map_err(|e| e.with_position(pos.0));
             }
             // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via
             // `range_in` against the element type (spec/design/ranges.md §5) — the same primitive
@@ -4062,7 +4131,8 @@ pub(crate) fn resolve(
             if let Some(desc) = crate::range::range_by_name(type_name) {
                 return fold_in_session_zone(scope, params, |iz| {
                     coerce_string_to_range_expr(text, desc, iz)
-                });
+                })
+                .map_err(|e| e.with_position(pos.0));
             }
             let (target, _, _) = resolve_type_and_typmod(type_name, &None)?;
             // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE
@@ -4075,6 +4145,7 @@ pub(crate) fn resolve(
             fold_in_session_zone(scope, params, |iz| {
                 coerce_string_literal(text, target, None, None, iz)
             })
+            .map_err(|e| e.with_position(pos.0))
         }
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
         // scope chain here, so its column-count / type errors fire even over an empty outer.
@@ -4126,6 +4197,7 @@ pub(crate) fn resolve(
             lhs,
             query,
             negated,
+            ..
         } => {
             // The LHS is an OUTER expression (resolved in the current scope / agg context); the
             // subquery yields the single membership column. The test is `lhs = element`, so the
@@ -4218,6 +4290,7 @@ pub(crate) fn resolve(
             inner,
             type_name,
             type_mod,
+            ..
         } => {
             // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
             // string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
@@ -4250,13 +4323,14 @@ pub(crate) fn resolve(
                         }
                     },
                 };
-                if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                if let Expr::Literal(Literal::Text(s), pos) = inner.as_ref() {
                     let val = fold_in_session_zone(scope, params, |iz| {
                         coerce_string_to_array(s, &elem_col, iz)
-                    })?;
+                    })
+                    .map_err(|e| e.with_position(pos.0))?;
                     return Ok((value_to_rexpr(&val), ResolvedType::Array(Box::new(elem_rt))));
                 }
-                if let Expr::Literal(Literal::Null) = inner.as_ref() {
+                if let Expr::Literal(Literal::Null, _) = inner.as_ref() {
                     return Ok((RExpr::ConstNull, ResolvedType::Array(Box::new(elem_rt))));
                 }
                 // A bind parameter into an array stays the documented container-param narrowing
@@ -4334,12 +4408,13 @@ pub(crate) fn resolve(
                     ));
                 }
                 let elem_rt = resolved_type_of(crate::range::element_scalar(desc));
-                if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                if let Expr::Literal(Literal::Text(s), pos) = inner.as_ref() {
                     return fold_in_session_zone(scope, params, |iz| {
                         coerce_string_to_range_expr(s, desc, iz)
-                    });
+                    })
+                    .map_err(|e| e.with_position(pos.0));
                 }
-                if let Expr::Literal(Literal::Null) = inner.as_ref() {
+                if let Expr::Literal(Literal::Null, _) = inner.as_ref() {
                     return Ok((RExpr::ConstNull, ResolvedType::Range(Box::new(elem_rt))));
                 }
                 return Err(EngineError::new(
@@ -4361,10 +4436,11 @@ pub(crate) fn resolve(
                         "a type modifier is not supported on a composite type",
                     ));
                 }
-                if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                if let Expr::Literal(Literal::Text(s), pos) = inner.as_ref() {
                     return fold_in_session_zone(scope, params, |iz| {
                         coerce_string_to_composite(s, ct, scope.catalog, iz)
-                    });
+                    })
+                    .map_err(|e| e.with_position(pos.0));
                 }
                 let ct_name = ct.name.clone();
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
@@ -4392,7 +4468,7 @@ pub(crate) fn resolve(
             // This is the ONLY text→T cast admitted ahead of the general cast slice; a non-literal
             // text operand still falls through to the deferred 0A000 below. A `varchar(n)` target
             // truncates the literal to n code points (types.md §15).
-            if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+            if let Expr::Literal(Literal::Text(s), pos) = inner.as_ref() {
                 // 'today'::date / CAST('now' AS date) — the clock-relative specials become the
                 // STABLE DateClock node, exactly like the ctx-adaptation form (date.md §6).
                 if target.is_date() {
@@ -4400,9 +4476,12 @@ pub(crate) fn resolve(
                         return Ok((node, rt));
                     }
                 }
+                // The literal's input error points at the literal (PostgreSQL coerces it at parse
+                // time — spec/design/error-fields.md §10.2).
                 return fold_in_session_zone(scope, params, |iz| {
                     coerce_string_literal(s, target, typmod, varchar_len, iz)
-                });
+                })
+                .map_err(|e| e.with_position(pos.0));
             }
             // Datetime casts (timezones.md §9.3, types.md §5): a `timestamp`/`timestamptz`/`date`
             // TARGET from another datetime family or from runtime text. A same-family cast is the
@@ -4774,6 +4853,7 @@ pub(crate) fn resolve(
         Expr::Unary {
             op: UnaryOp::Neg,
             operand,
+            ..
         } => {
             let (rop, ty) = resolve(scope, operand, ctx, agg, params)?;
             let result = match ty {
@@ -4820,9 +4900,11 @@ pub(crate) fn resolve(
         Expr::Unary {
             op: UnaryOp::Not,
             operand,
+            ..
         } => {
             let (rop, ty) = resolve(scope, operand, None, agg, params)?;
-            require_bool(&ty, "NOT requires a boolean operand")?;
+            require_bool(&ty, "NOT requires a boolean operand")
+                .map_err(|e| e.with_position(operand.location().0))?;
             Ok((RExpr::Not(Box::new(rop)), ResolvedType::Bool))
         }
         Expr::IsNull { operand, negated } => {
@@ -4950,7 +5032,9 @@ pub(crate) fn resolve(
             agg,
             params,
         ),
-        Expr::IsDistinctFrom { lhs, rhs, negated } => {
+        Expr::IsDistinctFrom {
+            lhs, rhs, negated, ..
+        } => {
             // NULL-safe equality: the SAME operand contract as `=` — resolve the pair
             // (a literal adapts to its sibling; a text literal stays text), then require
             // the operands be comparable (both integer-ish or both text-ish; a mixed pair
@@ -4966,18 +5050,20 @@ pub(crate) fn resolve(
                 ResolvedType::Bool,
             ))
         }
-        Expr::Binary { op, lhs, rhs } => resolve_binary(scope, *op, lhs, rhs, agg, params),
+        Expr::Binary { op, lhs, rhs, .. } => resolve_binary(scope, *op, lhs, rhs, agg, params),
         Expr::Quantified {
             op,
             all,
             lhs,
             array,
+            ..
         } => resolve_quantified(scope, *op, *all, lhs, array, agg, params),
         Expr::QuantifiedSubquery {
             op,
             all,
             lhs,
             query,
+            ..
         } => {
             // The subquery spelling of the quantifier (array-functions.md §11.6) — the IN-subquery
             // pattern, with the comparison + 3VL fold of the array form. Resolve the outer `lhs`,
@@ -5024,7 +5110,12 @@ pub(crate) fn resolve(
                 ResolvedType::Bool,
             ))
         }
-        Expr::In { lhs, list, negated } => {
+        Expr::In {
+            lhs,
+            list,
+            negated,
+            pos,
+        } => {
             // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
             // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant
             // — `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL.
@@ -5043,10 +5134,10 @@ pub(crate) fn resolve(
             // OR-chain model — a documented cost consequence, cost.md §3).
             let mut folded: Option<Expr> = None;
             for elem in list {
-                let eq = binary_expr(BinaryOp::Eq, (**lhs).clone(), elem.clone());
+                let eq = binary_expr(BinaryOp::Eq, (**lhs).clone(), elem.clone(), *pos);
                 folded = Some(match folded {
                     None => eq,
-                    Some(acc) => binary_expr(BinaryOp::Or, acc, eq),
+                    Some(acc) => binary_expr(BinaryOp::Or, acc, eq, *pos),
                 });
             }
             let mut desugared = folded.expect("IN list is non-empty (parser guarantees ≥1)");
@@ -5054,6 +5145,7 @@ pub(crate) fn resolve(
                 desugared = Expr::Unary {
                     op: UnaryOp::Not,
                     operand: Box::new(desugared),
+                    pos: *pos,
                 };
             }
             resolve(scope, &desugared, ctx, agg, params)
@@ -5063,19 +5155,21 @@ pub(crate) fn resolve(
             lo,
             hi,
             negated,
+            pos,
         } => {
             // Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
             // result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a
             // FALSE operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL.
             // `NOT BETWEEN` negates the whole conjunction. The LHS is evaluated twice (the
             // desugar model — a documented cost consequence, cost.md §3).
-            let ge = binary_expr(BinaryOp::Ge, (**lhs).clone(), (**lo).clone());
-            let le = binary_expr(BinaryOp::Le, (**lhs).clone(), (**hi).clone());
-            let mut desugared = binary_expr(BinaryOp::And, ge, le);
+            let ge = binary_expr(BinaryOp::Ge, (**lhs).clone(), (**lo).clone(), *pos);
+            let le = binary_expr(BinaryOp::Le, (**lhs).clone(), (**hi).clone(), *pos);
+            let mut desugared = binary_expr(BinaryOp::And, ge, le, *pos);
             if *negated {
                 desugared = Expr::Unary {
                     op: UnaryOp::Not,
                     operand: Box::new(desugared),
+                    pos: *pos,
                 };
             }
             resolve(scope, &desugared, ctx, agg, params)
@@ -5085,6 +5179,7 @@ pub(crate) fn resolve(
             rhs,
             negated,
             insensitive,
+            ..
         } => {
             // LIKE / ILIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
             // stays text), then require BOTH operands be text (or a bare NULL); a non-text
@@ -5108,6 +5203,7 @@ pub(crate) fn resolve(
             rhs,
             negated,
             insensitive,
+            ..
         } => {
             // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand
             // typing as LIKE: resolve the pair, require both text (or a bare NULL); non-text 42804.
@@ -5152,6 +5248,7 @@ pub(crate) fn resolve(
             operand,
             whens,
             els,
+            ..
         } => {
             // Resolve each branch's condition: searched form requires a boolean WHEN (42804
             // otherwise); simple form desugars to `operand = value` (reusing the `=` operand
@@ -5162,12 +5259,14 @@ pub(crate) fn resolve(
             for (cond, res) in whens {
                 let rcond = match operand {
                     Some(op) => {
-                        let eq = binary_expr(BinaryOp::Eq, (**op).clone(), cond.clone());
+                        let eq =
+                            binary_expr(BinaryOp::Eq, (**op).clone(), cond.clone(), SrcPos::NONE);
                         resolve(scope, &eq, None, agg, params)?.0
                     }
                     None => {
                         let (rc, cty) = resolve(scope, cond, None, agg, params)?;
-                        require_bool(&cty, "CASE WHEN condition must be boolean")?;
+                        require_bool(&cty, "CASE WHEN condition must be boolean")
+                            .map_err(|e| e.with_position(cond.location().0))?;
                         rc
                     }
                 };
@@ -5181,7 +5280,17 @@ pub(crate) fn resolve(
             };
             result_types.push(ety);
             // Unify the THEN/ELSE result types into the CASE's common type (the render type).
-            let unified = unify_case_types(&result_types, "CASE result types must be compatible")?;
+            let unified = unify_case_types(&result_types, "CASE result types must be compatible")
+                .map_err(|e| {
+                // PostgreSQL scans the ELSE result first, then the THEN results in order.
+                let mut types = vec![result_types[result_types.len() - 1].clone()];
+                types.extend_from_slice(&result_types[..result_types.len() - 1]);
+                let null = Expr::Literal(Literal::Null, SrcPos::NONE);
+                let mut exprs: Vec<&Expr> = vec![els.as_deref().unwrap_or(&null)];
+                exprs.extend(whens.iter().map(|(_, res)| res));
+                let pos = mismatch_location(&types, &exprs, |ts| unify_case_types(ts, "").is_ok());
+                e.with_position(pos.0)
+            })?;
             // A mixed-width float CASE is f64: widen the f32 arms (an ordinary cast, like GREATEST).
             if unified == ResolvedType::Float(ScalarType::Float64) {
                 arms = arms
@@ -5225,7 +5334,14 @@ pub(crate) fn resolve(
                 rargs.push(ra);
                 arg_types.push(aty);
             }
-            let unified = unify_case_types(&arg_types, "COALESCE types must be compatible")?;
+            let unified = unify_case_types(&arg_types, "COALESCE types must be compatible")
+                .map_err(|e| {
+                    let exprs: Vec<&Expr> = args.iter().collect();
+                    let pos = mismatch_location(&arg_types, &exprs, |ts| {
+                        unify_case_types(ts, "").is_ok()
+                    });
+                    e.with_position(pos.0)
+                })?;
             // A mixed-width float COALESCE is f64: widen the f32 arguments (as CASE).
             if unified == ResolvedType::Float(ScalarType::Float64) {
                 rargs = rargs
@@ -5267,7 +5383,13 @@ pub(crate) fn resolve(
             let unified = unify_case_types(
                 &arg_types,
                 &format!("{} types must be compatible", name.to_ascii_uppercase()),
-            )?;
+            )
+            .map_err(|e| {
+                let exprs: Vec<&Expr> = args.iter().collect();
+                let pos =
+                    mismatch_location(&arg_types, &exprs, |ts| unify_case_types(ts, "").is_ok());
+                e.with_position(pos.0)
+            })?;
             // The winner is chosen by the unified type's total order, so a non-orderable type
             // (json/jsonpath) or an incomparable pair is `42883`/`42804` HERE — never silently
             // mis-ordered by `value_cmp`'s cross-family totality fallback.
@@ -5367,6 +5489,7 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             op: BinaryOp::Concat,
             lhs,
             rhs,
+            ..
         } => combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?,
         Expr::FuncCall {
             name,
@@ -5389,6 +5512,7 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             inner,
             type_name,
             type_mod,
+            ..
         } if cast_target_collatable(type_name) => {
             let d = derive_collation(scope, inner)?;
             if type_mod.is_some() {

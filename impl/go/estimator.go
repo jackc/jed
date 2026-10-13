@@ -2163,7 +2163,7 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 			return nil, err
 		}
 		if _, ok := db.lkpTableScoped(ins.DB, ins.Table); !ok {
-			return nil, newError(UndefinedTable, "table does not exist: "+ins.Table)
+			return nil, newError(UndefinedTable, "table does not exist: "+ins.Table).withPosition(int32(ins.TablePos))
 		}
 		var source estimatedPlan
 		if ins.Query != nil {
@@ -2185,7 +2185,7 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 		}
 		table, ok := db.lkpTableScoped(upd.DB, upd.Table)
 		if !ok {
-			return nil, newError(UndefinedTable, "table does not exist: "+upd.Table)
+			return nil, newError(UndefinedTable, "table does not exist: "+upd.Table).withPosition(int32(upd.TablePos))
 		}
 		filter, err := db.explainDmlFilter(table, upd.Filter, bindings, vw)
 		if err != nil {
@@ -2201,7 +2201,7 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 		}
 		table, ok := db.lkpTableScoped(del.DB, del.Table)
 		if !ok {
-			return nil, newError(UndefinedTable, "table does not exist: "+del.Table)
+			return nil, newError(UndefinedTable, "table does not exist: "+del.Table).withPosition(int32(del.TablePos))
 		}
 		filter, err := db.explainDmlFilter(table, del.Filter, bindings, vw)
 		if err != nil {

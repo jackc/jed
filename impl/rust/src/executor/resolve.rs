@@ -232,8 +232,11 @@ pub(crate) fn resolve_binary(
         BinaryOp::And | BinaryOp::Or => {
             let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
             let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
-            require_bool(&lt, "AND/OR requires boolean operands")?;
-            require_bool(&rt, "AND/OR requires boolean operands")?;
+            // A non-boolean operand is located at that operand (PostgreSQL's coerce_to_boolean).
+            require_bool(&lt, "AND/OR requires boolean operands")
+                .map_err(|e| e.with_position(lhs.location().0))?;
+            require_bool(&rt, "AND/OR requires boolean operands")
+                .map_err(|e| e.with_position(rhs.location().0))?;
             let node = if matches!(op, BinaryOp::And) {
                 RExpr::And(Box::new(rl), Box::new(rr))
             } else {
@@ -356,7 +359,7 @@ pub(crate) fn resolve_json_access(
     let rarg = if path {
         // `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
         // otherwise the resolved argument must be a text[] (else 42883).
-        if let Expr::Literal(Literal::Text(s)) = rhs {
+        if let Expr::Literal(Literal::Text(s), _) = rhs {
             let val = coerce_string_to_array(
                 s,
                 &ColType::Scalar(ScalarType::Text),
@@ -731,7 +734,7 @@ pub(crate) fn resolve_json_has_key(
         }
         HasKeyKind::Any | HasKeyKind::All => {
             // `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
-            if let Expr::Literal(Literal::Text(s)) = rhs {
+            if let Expr::Literal(Literal::Text(s), _) = rhs {
                 let val = coerce_string_to_array(
                     s,
                     &ColType::Scalar(ScalarType::Text),
@@ -882,7 +885,7 @@ fn resolve_text_concat(
 /// Whether `e` is a bare string literal — PostgreSQL's `unknown`-typed constant, which adapts to its
 /// context rather than being text.
 fn is_string_literal(e: &Expr) -> bool {
-    matches!(e, Expr::Literal(Literal::Text(_)))
+    matches!(e, Expr::Literal(Literal::Text(_), _))
 }
 
 /// Resolve a jsonb delete operator: `-` (key `text` / index `int` / keys `text[]`) or `#-` (path
@@ -906,7 +909,7 @@ pub(crate) fn resolve_jsonb_delete(
             DeleteKind::Path,
             resolve_text_array_arg(scope, rhs, sym, agg, params)?,
         )
-    } else if let Expr::Literal(Literal::Text(_)) = rhs {
+    } else if let Expr::Literal(Literal::Text(_), _) = rhs {
         // A bare string literal is a text key (`jsonb - 'a'`), NOT a text[].
         let (r, _) = resolve(scope, rhs, Some(ScalarType::Text), agg, params)?;
         (DeleteKind::Key, r)
@@ -949,7 +952,7 @@ pub(crate) fn resolve_text_array_arg(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<RExpr> {
-    if let Expr::Literal(Literal::Text(s)) = rhs {
+    if let Expr::Literal(Literal::Text(s), _) = rhs {
         let val = coerce_string_to_array(
             s,
             &ColType::Scalar(ScalarType::Text),
@@ -1826,9 +1829,9 @@ pub(crate) fn resolve_text_operand_pair(
 pub(crate) fn is_adaptable_operand(e: &Expr) -> bool {
     matches!(
         e,
-        Expr::Literal(Literal::Int(_))
-            | Expr::Literal(Literal::Decimal(_))
-            | Expr::Literal(Literal::Text(_))
+        Expr::Literal(Literal::Int(_), _)
+            | Expr::Literal(Literal::Decimal(_), _)
+            | Expr::Literal(Literal::Text(_), _)
             | Expr::Param(_)
     )
 }

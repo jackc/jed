@@ -4300,7 +4300,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_) => 0,
         Expr::Row(items) | Expr::Array(items) => items.iter().map(sub).sum(),
@@ -4336,6 +4336,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
             operand,
             whens,
             els,
+            ..
         } => {
             operand.as_deref().map_or(0, sub)
                 + whens.iter().map(|(c, r)| sub(c) + sub(r)).sum::<usize>()

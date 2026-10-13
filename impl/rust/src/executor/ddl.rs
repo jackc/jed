@@ -898,12 +898,12 @@ impl Engine {
                 // 'epoch' and every ordinary date string stay foldable constants.
                 let clock_default = sty.is_date()
                     && matches!(&def.default, Some(d)
-                        if matches!(&d.expr, Expr::Literal(Literal::Text(s))
+                        if matches!(&d.expr, Expr::Literal(Literal::Text(s), _)
                             if crate::date::date_clock_is_relative(s)));
                 match &def.default {
                     None => (None, None, None),
                     Some(d) => match &d.expr {
-                        Expr::Literal(lit) if !clock_default => (
+                        Expr::Literal(lit, _) if !clock_default => (
                             Some(store_value(
                                 literal_to_value_for(lit, sty)?,
                                 sty,
@@ -1131,7 +1131,8 @@ impl Engine {
                 | ResolvedType::Composite(_)
                 | ResolvedType::Array(_)
                 | ResolvedType::Range(_) => {
-                    return Err(type_error("argument of CHECK must be boolean"));
+                    return Err(type_error("argument of CHECK must be boolean")
+                        .with_position(def.expr.location().0));
                 }
             }
             // Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a
@@ -2337,7 +2338,8 @@ impl Engine {
                                     &mut ParamTypes::default(),
                                 )?;
                                 if !matches!(ty, ResolvedType::Bool | ResolvedType::Null) {
-                                    return Err(type_error("argument of CHECK must be boolean"));
+                                    return Err(type_error("argument of CHECK must be boolean")
+                                        .with_position(d.expr.location().0));
                                 }
                                 let host_deps =
                                     collect_check_host_deps(&node, &self.session.extensions)?;
@@ -2838,6 +2840,7 @@ impl Engine {
                                 inner: Box::new(source),
                                 type_name: type_name.clone(),
                                 type_mod,
+                                pos: SrcPos::NONE,
                             };
                             let (value, ty) = resolve(
                                 &Scope::single(self, &table),
@@ -2874,6 +2877,7 @@ impl Engine {
                                     )),
                                     type_name: type_name.clone(),
                                     type_mod,
+                                    pos: SrcPos::NONE,
                                 };
                                 let (node, _) = resolve(
                                     &Scope::single(self, &default_table),
@@ -2900,6 +2904,7 @@ impl Engine {
                                     inner: Box::new(default.expr),
                                     type_name: type_name.clone(),
                                     type_mod,
+                                    pos: SrcPos::NONE,
                                 };
                                 resolve(
                                     &Scope::empty(self),
@@ -3566,8 +3571,8 @@ impl Engine {
         };
         let sty = *sty;
         let clock_default = sty.is_date()
-            && matches!(&def.expr, Expr::Literal(Literal::Text(s)) if crate::date::date_clock_is_relative(s));
-        if let Expr::Literal(lit) = &def.expr
+            && matches!(&def.expr, Expr::Literal(Literal::Text(s), _) if crate::date::date_clock_is_relative(s));
+        if let Expr::Literal(lit, _) = &def.expr
             && !clock_default
         {
             return Ok((

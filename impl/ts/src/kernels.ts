@@ -26,7 +26,8 @@ import {
 } from "./store.ts";
 import type { BinaryOp, Expr } from "./ast.ts";
 import type { AggCtx, RExpr, ResolvedType } from "./executor.ts";
-import { engineError } from "./errors.ts";
+import { atPosition, engineError, positionedAt } from "./errors.ts";
+import { exprLocation } from "./eval_ops.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import { emptyRangeValue, parseByteaHex, parseRecordTokens, parseUuid } from "./value.ts";
 import { canonicalName, inRange, rank, roundToWidth, typeCanonicalName } from "./types.ts";
@@ -397,19 +398,22 @@ export function resolveContainerAssign(
   // A bare string literal adapts to the container context (the same string-adapts-to-context rule
   // the cast and INSERT VALUES paths use).
   if (e.kind === "literal" && e.literal.kind === "text") {
+    const text = e.literal.text;
     const iz = scope.catalog.inputZone();
     if (col.type.kind === "range") {
       if (col.type.elem.kind !== "scalar")
         throw new Error("a range element is always a scalar (ranges.md §2)");
       const desc = rangeForElement(col.type.elem.scalar);
       if (desc === undefined) throw new Error("a range column's element always has a range type");
-      const node = coerceStringToRangeExpr(e.literal.text, desc, iz).node;
+      const node = atPosition(e.loc, () => coerceStringToRangeExpr(text, desc, iz)).node;
       params.noteInputZone(iz);
       return node;
     }
     // array
     const elem = (col.type as { kind: "array"; elem: Type }).elem;
-    const val = coerceStringToArray(e.literal.text, scope.catalog.colTypeOf(elem), iz);
+    const val = atPosition(e.loc, () =>
+      coerceStringToArray(text, scope.catalog.colTypeOf(elem), iz),
+    );
     params.noteInputZone(iz);
     return valueToRExpr(val);
   }
@@ -435,8 +439,11 @@ export function resolveContainerAssign(
   // Ranges/arrays are assignable only over equal element types (resolvedTypeEqual compares the
   // element recursively), matching the comparison rule (ranges.md §6 / array.md §5).
   if (!resolvedTypeEqual(type, colRT)) {
-    throw typeError(
-      `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+    throw positionedAt(
+      typeError(
+        `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+      ),
+      exprLocation(e),
     );
   }
   return node;

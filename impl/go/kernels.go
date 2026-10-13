@@ -1471,13 +1471,13 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 			iz := s.catalog.inputZone()
 			node, _, err := coerceStringToRangeExpr(e.Literal.Str, desc, iz)
 			params.noteInputZone(iz)
-			return node, err
+			return node, positionError(err, e.Pos)
 		}
 		// array
 		iz := s.catalog.inputZone()
 		val, err := coerceStringToArray(e.Literal.Str, resolveColType(*col.Type.Array, snap.types), iz)
 		if err != nil {
-			return nil, err
+			return nil, positionError(err, e.Pos)
 		}
 		params.noteInputZone(iz)
 		return valueToRExpr(val), nil
@@ -1512,8 +1512,8 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 		return node, nil // a NULL-typed expression (e.g. a CASE that may be NULL)
 	}
 	if !containerAssignable(ty, colRT) {
-		return nil, typeError("column " + col.Name + " is of type " + col.Type.CanonicalName() +
-			" but expression is of type " + rtName(ty))
+		return nil, positionError(typeError("column "+col.Name+" is of type "+col.Type.CanonicalName()+
+			" but expression is of type "+rtName(ty)), exprLocation(e))
 	}
 	return node, nil
 }

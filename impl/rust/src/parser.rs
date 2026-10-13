@@ -2413,6 +2413,7 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Insert> {
         self.expect_keyword("insert")?;
         self.expect_keyword("into")?;
+        let table_pos = self.here();
         let (db, table) = self.parse_qualified_table_name()?;
         // Optional target alias `AS alias` (spec/design/upsert.md §5). PostgreSQL requires the `AS`
         // here (no implicit alias), which also keeps a column list / source keyword unambiguous.
@@ -2499,6 +2500,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Insert {
             table,
+            table_pos,
             db,
             alias,
             columns,
@@ -4136,7 +4138,7 @@ impl Parser {
             nulls_first,
         };
         match expr {
-            Expr::Literal(Literal::Int(n)) if allow_ordinal => {
+            Expr::Literal(Literal::Int(n), _) if allow_ordinal => {
                 mk(Some(n), None, None, String::new(), SrcPos::NONE, collation)
             }
             Expr::Column(name, pos) => mk(None, None, None, name, pos, collation),
@@ -4336,7 +4338,7 @@ impl Parser {
                 );
         if self.peek_keyword().as_deref() == Some("default") && next_is_terminator {
             self.advance();
-            return Ok((true, Expr::Literal(Literal::Null)));
+            return Ok((true, Expr::Literal(Literal::Null, SrcPos::NONE)));
         }
         Ok((false, self.parse_expr()?))
     }
@@ -4344,6 +4346,7 @@ impl Parser {
     /// `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
     fn parse_update(&mut self) -> Result<Update> {
         self.expect_keyword("update")?;
+        let table_pos = self.here();
         let (db, table) = self.parse_qualified_table_name()?;
         self.expect_keyword("set")?;
 
@@ -4373,6 +4376,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Update {
             table,
+            table_pos,
             db,
             assignments,
             filter,
@@ -4385,11 +4389,13 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Delete> {
         self.expect_keyword("delete")?;
         self.expect_keyword("from")?;
+        let table_pos = self.here();
         let (db, table) = self.parse_qualified_table_name()?;
         let filter = self.parse_optional_where()?;
         let returning = self.parse_returning()?;
         Ok(Delete {
             table,
+            table_pos,
             db,
             filter,
             returning,
@@ -4559,9 +4565,10 @@ impl Parser {
         let mut lhs = self.parse_and()?;
         while self.peek_keyword().as_deref() == Some("or") {
             self.deepen()?; // each chained OR is one more AST level
+            let pos = self.here();
             self.advance();
             let rhs = self.parse_and()?;
-            lhs = binary(BinaryOp::Or, lhs, rhs);
+            lhs = binary(BinaryOp::Or, lhs, rhs, pos);
         }
         self.depth = base;
         Ok(lhs)
@@ -4572,9 +4579,10 @@ impl Parser {
         let mut lhs = self.parse_not()?;
         while self.peek_keyword().as_deref() == Some("and") {
             self.deepen()?; // each chained AND is one more AST level
+            let pos = self.here();
             self.advance();
             let rhs = self.parse_not()?;
-            lhs = binary(BinaryOp::And, lhs, rhs);
+            lhs = binary(BinaryOp::And, lhs, rhs, pos);
         }
         self.depth = base;
         Ok(lhs)
@@ -4585,6 +4593,7 @@ impl Parser {
         // starts with the relation label `not`, not the unary operator. The primary parser applies
         // the same rule before literals / CAST / CASE / current-date spellings.
         if self.peek_keyword().as_deref() == Some("not") && !self.at_qualified_column_ref() {
+            let not = self.here();
             self.advance();
             // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so
             // the depth guard also protects the parser's own stack).
@@ -4594,6 +4603,7 @@ impl Parser {
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
+                pos: not,
             });
         }
         self.parse_comparison()
@@ -4606,6 +4616,7 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<Expr> {
         let lhs = self.parse_concat()?;
         if self.peek_keyword().as_deref() == Some("is") {
+            let is_pos = self.here();
             self.advance();
             let negated = if self.peek_keyword().as_deref() == Some("not") {
                 self.advance();
@@ -4622,6 +4633,7 @@ impl Parser {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                     negated,
+                    pos: is_pos,
                 });
             }
             // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
@@ -4685,6 +4697,8 @@ impl Parser {
                 self.peek_keyword_at(1).as_deref(),
                 Some("in") | Some("between") | Some("like") | Some("ilike")
             );
+        // The operator's position: the `NOT` of a negated form, else the keyword (PostgreSQL's).
+        let op_pos = self.here();
         if negated {
             self.advance(); // NOT
         }
@@ -4701,6 +4715,7 @@ impl Parser {
                     lhs: Box::new(lhs),
                     query: Box::new(q),
                     negated,
+                    pos: op_pos,
                 });
             }
             let mut list = vec![self.parse_concat()?];
@@ -4713,6 +4728,7 @@ impl Parser {
                 lhs: Box::new(lhs),
                 list,
                 negated,
+                pos: op_pos,
             });
         }
         if self.peek_keyword().as_deref() == Some("between") {
@@ -4729,6 +4745,7 @@ impl Parser {
                 lo: Box::new(lo),
                 hi: Box::new(hi),
                 negated,
+                pos: op_pos,
             });
         }
         // LIKE / ILIKE (case-insensitive) — grammar.md §22. Both bind at the comparison level; the
@@ -4737,6 +4754,7 @@ impl Parser {
         // NULL or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
         if matches!(self.peek_keyword().as_deref(), Some("like") | Some("ilike")) {
             let insensitive = self.peek_keyword().as_deref() == Some("ilike");
+            let like_pos = self.here();
             self.advance();
             let mut rhs = self.parse_concat()?;
             if self.peek_keyword().as_deref() == Some("escape") {
@@ -4754,6 +4772,7 @@ impl Parser {
                     over_name: None,
                     within_group: None,
                     agg_order: None,
+                    pos: like_pos,
                 };
             }
             return Ok(Expr::Like {
@@ -4761,6 +4780,7 @@ impl Parser {
                 rhs: Box::new(rhs),
                 negated,
                 insensitive,
+                pos: op_pos,
             });
         }
         // `~` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md). These are
@@ -4782,6 +4802,7 @@ impl Parser {
                 rhs: Box::new(rhs),
                 negated: rx_negated,
                 insensitive: rx_insensitive,
+                pos: op_pos,
             });
         }
         let op = match self.peek() {
@@ -4796,6 +4817,7 @@ impl Parser {
         match op {
             Some(op) => {
                 self.advance();
+                let pos = op_pos;
                 // `op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41):
                 // a quantifier may stand in for the ordinary right operand. SOME folds to ANY.
                 let quant = match self.peek_keyword().as_deref() {
@@ -4818,6 +4840,7 @@ impl Parser {
                             all,
                             lhs: Box::new(lhs),
                             query: Box::new(query),
+                            pos,
                         });
                     }
                     let array = self.parse_expr()?; // a full expression resolving to an array
@@ -4827,10 +4850,11 @@ impl Parser {
                         all,
                         lhs: Box::new(lhs),
                         array: Box::new(array),
+                        pos,
                     });
                 }
                 let rhs = self.parse_concat()?;
-                Ok(binary(op, lhs, rhs))
+                Ok(binary(op, lhs, rhs, pos))
             }
             None => Ok(lhs),
         }
@@ -4870,9 +4894,10 @@ impl Parser {
                 _ => break,
             };
             self.deepen()?; // each chained operator is one more AST level
+            let pos = self.here();
             self.advance();
             let rhs = self.parse_additive()?;
-            lhs = binary(op, lhs, rhs);
+            lhs = binary(op, lhs, rhs, pos);
         }
         self.depth = base;
         Ok(lhs)
@@ -4888,9 +4913,10 @@ impl Parser {
                 _ => break,
             };
             self.deepen()?; // each chained +/- is one more AST level (the `1+1+…` vector)
+            let pos = self.here();
             self.advance();
             let rhs = self.parse_multiplicative()?;
-            lhs = binary(op, lhs, rhs);
+            lhs = binary(op, lhs, rhs, pos);
         }
         self.depth = base;
         Ok(lhs)
@@ -4907,9 +4933,10 @@ impl Parser {
                 _ => break,
             };
             self.deepen()?; // each chained * / % is one more AST level
+            let pos = self.here();
             self.advance();
             let rhs = self.parse_at_time_zone()?;
-            lhs = binary(op, lhs, rhs);
+            lhs = binary(op, lhs, rhs, pos);
         }
         self.depth = base;
         Ok(lhs)
@@ -4927,6 +4954,7 @@ impl Parser {
         let mut lhs = self.parse_unary()?;
         while self.peek_at_time_zone() {
             self.deepen()?; // each chained AT TIME ZONE is one more AST level
+            let at = self.here();
             self.advance(); // AT
             self.advance(); // TIME
             self.advance(); // ZONE
@@ -4943,6 +4971,7 @@ impl Parser {
                 over_name: None,
                 within_group: None,
                 agg_order: None,
+                pos: at,
             };
         }
         self.depth = base;
@@ -4958,6 +4987,7 @@ impl Parser {
 
     fn parse_unary(&mut self) -> Result<Expr> {
         if matches!(self.peek(), Token::Minus) {
+            let minus = self.here();
             self.advance();
             // Fold unary-minus-of-an-integer-literal into one negative literal: this
             // makes i64::MIN representable (`-(2^63)`) and lets the negative value
@@ -4972,7 +5002,7 @@ impl Parser {
                 let m = *m;
                 self.advance();
                 let folded = -(m as i128); // m <= 2^63 ⇒ folded ∈ [-2^63, 0] ⊆ i64
-                return Ok(Expr::Literal(Literal::Int(folded as i64)));
+                return Ok(Expr::Literal(Literal::Int(folded as i64), minus));
             }
             // Fold unary-minus of a decimal literal into one negative decimal literal (like
             // the integer fold). Decimal negation never overflows. Same `::` suppression.
@@ -4980,9 +5010,10 @@ impl Parser {
                 && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
             {
                 if let Token::Decimal(digits, scale) = self.advance() {
-                    return Ok(Expr::Literal(Literal::Decimal(Decimal::from_digits_scale(
-                        true, &digits, scale,
-                    ))));
+                    return Ok(Expr::Literal(
+                        Literal::Decimal(Decimal::from_digits_scale(true, &digits, scale)),
+                        minus,
+                    ));
                 }
             }
             // each chained unary `-` is one more AST level (recursion here, so the depth guard
@@ -4993,6 +5024,7 @@ impl Parser {
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
                 operand: Box::new(operand),
+                pos: minus,
             });
         }
         self.parse_postfix()
@@ -5061,6 +5093,7 @@ impl Parser {
                         inner: Box::new(expr),
                         type_name,
                         type_mod,
+                        pos: SrcPos::NONE,
                     };
                     field_accessible = false;
                 }
@@ -5187,6 +5220,7 @@ impl Parser {
             return Ok(Expr::Exists(Box::new(q)));
         }
         if self.peek_keyword().as_deref() == Some("cast") {
+            let cast_pos = self.here();
             self.advance();
             self.expect(&Token::LParen)?;
             let inner = self.parse_expr()?;
@@ -5204,6 +5238,7 @@ impl Parser {
                 inner: Box::new(inner),
                 type_name,
                 type_mod,
+                pos: cast_pos,
             });
         }
         // `EXTRACT(field FROM source)` (grammar.md §50, timezones.md §9.2). Recognized only when
@@ -5301,8 +5336,13 @@ impl Parser {
             && !matches!(self.peek(), Token::Word(w) if matches!(w.as_str(), "null" | "true" | "false"))
         {
             let type_name = self.expect_identifier()?;
+            let pos = self.here();
             if let Token::Str(text) = self.advance() {
-                return Ok(Expr::TypedLiteral { type_name, text });
+                return Ok(Expr::TypedLiteral {
+                    type_name,
+                    text,
+                    pos,
+                });
             }
             unreachable!("peeked a string literal after the type name");
         }
@@ -5312,8 +5352,13 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Str(_)))
         {
             let type_name = self.expect_type_name()?;
+            let pos = self.here();
             if let Token::Str(text) = self.advance() {
-                return Ok(Expr::TypedLiteral { type_name, text });
+                return Ok(Expr::TypedLiteral {
+                    type_name,
+                    text,
+                    pos,
+                });
             }
             unreachable!("peeked a string literal after the type name");
         }
@@ -5407,6 +5452,7 @@ impl Parser {
             return Ok(Expr::GreatestLeast { args, greatest });
         }
         if self.peek_keyword().as_deref() == Some("case") {
+            let case_pos = self.here();
             self.advance();
             // Simple form has an operand between CASE and the first WHEN; the searched form
             // starts directly with WHEN (grammar.md §23).
@@ -5437,8 +5483,11 @@ impl Parser {
                 operand,
                 whens,
                 els,
+                pos: case_pos,
             });
         }
+        // The primary token's character position (spec/design/error-fields.md §10.2).
+        let here = self.here();
         match self.peek() {
             Token::Param(n) => {
                 let n = *n;
@@ -5449,7 +5498,7 @@ impl Parser {
                 let m = *m;
                 self.advance();
                 if m <= i64::MAX as u64 {
-                    Ok(Expr::Literal(Literal::Int(m as i64)))
+                    Ok(Expr::Literal(Literal::Int(m as i64), here))
                 } else {
                     // The only m > i64::MAX the lexer admits is 2^63, which fits no
                     // signed integer type unless negated (handled by the unary fold).
@@ -5461,15 +5510,15 @@ impl Parser {
             }
             Token::Word(w) if w.eq_ignore_ascii_case("null") => {
                 self.advance();
-                Ok(Expr::Literal(Literal::Null))
+                Ok(Expr::Literal(Literal::Null, here))
             }
             Token::Word(w) if w.eq_ignore_ascii_case("true") => {
                 self.advance();
-                Ok(Expr::Literal(Literal::Bool(true)))
+                Ok(Expr::Literal(Literal::Bool(true), here))
             }
             Token::Word(w) if w.eq_ignore_ascii_case("false") => {
                 self.advance();
-                Ok(Expr::Literal(Literal::Bool(false)))
+                Ok(Expr::Literal(Literal::Bool(false), here))
             }
             // `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the
             // value literals above. Pure sugar: desugar to a `now()` call so resolution / execution
@@ -5492,6 +5541,7 @@ impl Parser {
                     over_name: None,
                     within_group: None,
                     agg_order: None,
+                    pos: here,
                 })
             }
             // `current_date` — the SQL-standard bare keyword, desugared to the current_date()
@@ -5515,20 +5565,22 @@ impl Parser {
                     over_name: None,
                     within_group: None,
                     agg_order: None,
+                    pos: here,
                 })
             }
             Token::Str(_) => {
                 if let Token::Str(s) = self.advance() {
-                    Ok(Expr::Literal(Literal::Text(s)))
+                    Ok(Expr::Literal(Literal::Text(s), here))
                 } else {
                     unreachable!("peeked a string literal")
                 }
             }
             Token::Decimal(..) => {
                 if let Token::Decimal(digits, scale) = self.advance() {
-                    Ok(Expr::Literal(Literal::Decimal(Decimal::from_digits_scale(
-                        false, &digits, scale,
-                    ))))
+                    Ok(Expr::Literal(
+                        Literal::Decimal(Decimal::from_digits_scale(false, &digits, scale)),
+                        here,
+                    ))
                 } else {
                     unreachable!("peeked a decimal literal")
                 }
@@ -5574,6 +5626,7 @@ impl Parser {
         // (below).
         let substring_form = matches!(self.peek(), Token::Word(w) if w == "substring");
         let overlay_form = matches!(self.peek(), Token::Word(w) if w == "overlay");
+        let pos = self.here();
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
         // A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct
@@ -5657,7 +5710,7 @@ impl Parser {
                     && matches!(self.peek_keyword().as_deref(), Some("from" | "for"))
                 {
                     let source = args.pop().expect("one argument parsed");
-                    return self.parse_substring_tail(name, source);
+                    return self.parse_substring_tail(name, source, pos);
                 }
                 // `OVERLAY(s PLACING r FROM start [FOR count])` (grammar.ebnf `overlay_expr`,
                 // string-functions.md §3): a PLACING keyword after the first positional argument
@@ -5669,7 +5722,7 @@ impl Parser {
                     && self.peek_keyword().as_deref() == Some("placing")
                 {
                     let source = args.pop().expect("one argument parsed");
-                    return self.parse_overlay_tail(name, source);
+                    return self.parse_overlay_tail(name, source, pos);
                 }
                 if self.peek_keyword().as_deref() == Some("order") {
                     agg_order = Some(Box::new(self.parse_order_by(false)?));
@@ -5759,6 +5812,7 @@ impl Parser {
                     over_name,
                     within_group,
                     agg_order,
+                    pos,
                 });
             }
             self.expect(&Token::LParen)?;
@@ -5782,6 +5836,7 @@ impl Parser {
             over_name,
             within_group,
             agg_order,
+            pos,
         })
     }
 
@@ -5789,7 +5844,7 @@ impl Parser {
     /// (grammar.ebnf `substring_expr`), the cursor on FROM or FOR. Desugars to the ordinary call
     /// `substring(x, s[, l])` — PostgreSQL's rewrite — with a FOR-only form starting at 1. No
     /// FILTER / OVER may follow (the form is not a function application).
-    fn parse_substring_tail(&mut self, name: String, source: Expr) -> Result<Expr> {
+    fn parse_substring_tail(&mut self, name: String, source: Expr, pos: SrcPos) -> Result<Expr> {
         let mut start = None;
         let mut count = None;
         if self.peek_keyword().as_deref() == Some("from") {
@@ -5808,7 +5863,10 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
-        let mut args = vec![source, start.unwrap_or(Expr::Literal(Literal::Int(1)))];
+        let mut args = vec![
+            source,
+            start.unwrap_or(Expr::Literal(Literal::Int(1), SrcPos::NONE)),
+        ];
         args.extend(count);
         Ok(Expr::FuncCall {
             name,
@@ -5822,6 +5880,7 @@ impl Parser {
             over_name: None,
             within_group: None,
             agg_order: None,
+            pos,
         })
     }
 
@@ -5831,6 +5890,7 @@ impl Parser {
     /// "any other operator" (`parse_concat`) expression, so the operand's own `IN` is never taken as
     /// an IN predicate; anything else after the first operand (a comma) is 42601, as in PostgreSQL.
     fn parse_position_form(&mut self) -> Result<Expr> {
+        let pos = self.here();
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
         self.deepen()?;
@@ -5851,6 +5911,7 @@ impl Parser {
             over_name: None,
             within_group: None,
             agg_order: None,
+            pos,
         })
     }
 
@@ -5858,7 +5919,7 @@ impl Parser {
     /// `overlay_expr`), the cursor on PLACING. Desugars to the ordinary call
     /// `overlay(s, r, start[, count])` — PostgreSQL's rewrite. FROM is required. No FILTER / OVER may
     /// follow (the form is not a function application).
-    fn parse_overlay_tail(&mut self, name: String, source: Expr) -> Result<Expr> {
+    fn parse_overlay_tail(&mut self, name: String, source: Expr, pos: SrcPos) -> Result<Expr> {
         self.expect_keyword("placing")?;
         let replacement = self.parse_expr()?;
         self.expect_keyword("from")?;
@@ -5881,6 +5942,7 @@ impl Parser {
             over_name: None,
             within_group: None,
             agg_order: None,
+            pos,
         })
     }
 
@@ -6635,11 +6697,12 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
 }
 
 /// Build a binary-operator expression node.
-fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+fn binary(op: BinaryOp, lhs: Expr, rhs: Expr, pos: SrcPos) -> Expr {
     Expr::Binary {
         op,
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
+        pos,
     }
 }
 

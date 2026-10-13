@@ -131,7 +131,14 @@ For a query tool that shows errors to the person who typed the SQL, two more fie
 explain the mistake. **`position`** (`Position` in Go) is the 1-based **character** offset of the
 offending token, as in PostgreSQL. It is set on syntax errors (`42601` and every other error the
 parser raises, except the `54xxx` limits), on an unknown or ambiguous column reference (`42703`,
-`42702`, `42P01`), on an unknown `INSERT` column or `SET` target, and on an unknown FROM table. It
+`42702`, `42P01`), on an unknown `INSERT` column or `SET` target, on an unknown FROM table or
+`INSERT` / `UPDATE` / `DELETE` target (`42P01`), on an unknown function (`42883`, at its name), on an
+operator with no implementation for its operand types (`42883` / `42804`, at the operator), on a
+non-boolean `WHERE` / `HAVING` / `ON` / `AND` / `OR` / `NOT` / `CASE WHEN` argument and a value of the
+wrong type for its column or for its `CASE` / `COALESCE` / `ARRAY` / `VALUES` / `UNION` siblings
+(`42804`, at that expression), and on a malformed string literal converted at resolve time
+(`'abc'::int`, `22P02` and the other input errors, at the literal). An error raised while running
+the query — a cast of a column's value, say — has none. It
 counts characters, not bytes, and a syntax error at end of input points one past the last
 character. For `execute_script` it counts from the start of the whole script. It is absent
 (`None` / `0` / `undefined`) otherwise. **`hint`** (`Hint`) carries PostgreSQL's suggestion for a
@@ -140,6 +147,8 @@ misspelled column or a table name used in place of its alias:
 | Statement | `code` | `position` | `hint` |
 |---|---|---|---|
 | `SELECT 1 +` | `42601` | `11` | |
+| `SELECT nofunc(1)` | `42883` | `8` | |
+| `SELECT 'abc'::int` | `22P02` | `8` | |
 | `SELECT nme FROM users` | `42703` | `8` | `Perhaps you meant to reference the column "users.name".` |
 | `SELECT users.id FROM users u` | `42P01` | `8` | `Perhaps you meant to reference the table alias "u".` |
 

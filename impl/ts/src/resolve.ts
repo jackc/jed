@@ -66,8 +66,15 @@ import type {
   ResolvedType,
 } from "./executor.ts";
 import type { Meter } from "./cost.ts";
-import { type EngineError, engineError } from "./errors.ts";
-import { exprEqual, resolveTypeAndTypmod, scalarForParamHint, unifyCaseTypes } from "./eval_ops.ts";
+import { EngineError, atPosition, engineError, positionedAt } from "./errors.ts";
+import {
+  exprEqual,
+  exprLocation,
+  mismatchLocation,
+  resolveTypeAndTypmod,
+  scalarForParamHint,
+  unifyCaseTypes,
+} from "./eval_ops.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import { followLayer } from "./view_write.ts";
@@ -384,7 +391,7 @@ export function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes):
     params,
   );
   if (type.kind !== "bool" && type.kind !== "null") {
-    throw typeError("argument of WHERE must be boolean");
+    throw positionedAt(typeError("argument of WHERE must be boolean"), exprLocation(e));
   }
   return node;
 }
@@ -593,6 +600,57 @@ export function resolve(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
+  try {
+    return resolveNode(scope, e, ctx, ag, params);
+  } catch (err) {
+    if (err instanceof EngineError) throw locateNodeError(err, e);
+    throw err;
+  }
+}
+
+// locateNodeError decides the position of an error leaving node e's resolution
+// (spec/design/error-fields.md §10.2). A function call's 42883 points at its name; an operator's
+// 42883 / 42804 (no operator for these operand types) points at the operator. AND / OR / NOT name
+// the offending operand instead, at their raise site. A string literal's input error points at the
+// literal. An error an operand raised was already decided by that operand's own resolution, so the
+// enclosing node never claims it.
+function locateNodeError(err: EngineError, e: Expr): EngineError {
+  const operatorError = err.state === "undefined_function" || err.state === "datatype_mismatch";
+  let pos: number | undefined;
+  switch (e.kind) {
+    case "funcCall":
+      if (err.state === "undefined_function") pos = e.loc;
+      break;
+    case "binary":
+      if (operatorError && e.op !== "and" && e.op !== "or") pos = e.loc;
+      break;
+    case "unary":
+      if (operatorError && e.op === "neg") pos = e.loc;
+      break;
+    case "isDistinct":
+    case "like":
+    case "regex":
+    case "inSubquery":
+    case "quantified":
+    case "quantifiedSubquery":
+      if (operatorError) pos = e.loc;
+      break;
+    case "literal":
+      // A string literal adapting to its context (a uuid / bytea / date / json … sibling) is
+      // input-converted here, like PostgreSQL's parse-time coercion of an unknown literal.
+      if (e.literal.kind === "text") pos = e.loc;
+      break;
+  }
+  return err.locate(pos);
+}
+
+function resolveNode(
+  scope: Scope,
+  e: Expr,
+  ctx: ScalarType | null,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
   // GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
   // matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT a+b
   // … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own path
@@ -641,7 +699,12 @@ export function resolve(
       }
       // If the items are themselves arrays, this is a nested (multidim-stacking) constructor and the
       // result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D array.
-      const common = unifyArrayElementTypes(elemTypes);
+      let common: ResolvedType;
+      try {
+        common = unifyArrayElementTypes(elemTypes);
+      } catch (err) {
+        throw positionedAt(err, mismatchLocation(elemTypes, e.elements, unifyArrayElementTypes));
+      }
       if (common.kind === "array") {
         return {
           node: { kind: "array", elements: nodes, nested: true },
@@ -840,14 +903,18 @@ export function resolve(
       // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
       const ct = scope.catalog.compositeType(e.typeName);
       if (ct !== undefined)
-        return foldInSessionZone(scope, params, (iz) =>
-          coerceStringToComposite(e.text, ct, scope.catalog, iz),
+        return atPosition(e.loc, () =>
+          foldInSessionZone(scope, params, (iz) =>
+            coerceStringToComposite(e.text, ct, scope.catalog, iz),
+          ),
         );
       // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
       // against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
       const rdesc = rangeByName(e.typeName);
       if (rdesc !== undefined)
-        return foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(e.text, rdesc, iz));
+        return atPosition(e.loc, () =>
+          foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(e.text, rdesc, iz)),
+        );
       const [target] = resolveTypeAndTypmod(e.typeName, null);
       // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE dateClock
       // node, exactly like the ctx-adaptation form (date.md §6).
@@ -855,8 +922,10 @@ export function resolve(
         const clock = dateClockLiteral(e.text, params);
         if (clock !== null) return clock;
       }
-      return foldInSessionZone(scope, params, (iz) =>
-        coerceStringLiteral(e.text, target, null, null, iz),
+      return atPosition(e.loc, () =>
+        foldInSessionZone(scope, params, (iz) =>
+          coerceStringLiteral(e.text, target, null, null, iz),
+        ),
       );
     }
     case "literal":
@@ -1176,7 +1245,9 @@ export function resolve(
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
           const text = e.inner.literal.text;
           const col = elemCol;
-          const val = foldInSessionZone(scope, params, (iz) => coerceStringToArray(text, col, iz));
+          const val = atPosition(e.inner.loc, () =>
+            foldInSessionZone(scope, params, (iz) => coerceStringToArray(text, col, iz)),
+          );
           return {
             node: valueToRExpr(val),
             type: { kind: "array", elem: elemRt },
@@ -1263,8 +1334,8 @@ export function resolve(
           const elemRt = resolvedTypeOf(elementScalar(rdesc));
           if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
             const text = e.inner.literal.text;
-            return foldInSessionZone(scope, params, (iz) =>
-              coerceStringToRangeExpr(text, rdesc, iz),
+            return atPosition(e.inner.loc, () =>
+              foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(text, rdesc, iz)),
             );
           }
           if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
@@ -1295,8 +1366,10 @@ export function resolve(
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
           const text = e.inner.literal.text;
-          return foldInSessionZone(scope, params, (iz) =>
-            coerceStringToComposite(text, ct, scope.catalog, iz),
+          return atPosition(e.inner.loc, () =>
+            foldInSessionZone(scope, params, (iz) =>
+              coerceStringToComposite(text, ct, scope.catalog, iz),
+            ),
           );
         }
         const inner = resolve(scope, e.inner, null, ag, params);
@@ -1329,8 +1402,12 @@ export function resolve(
           if (clock !== null) return clock;
         }
         const text = e.inner.literal.text;
-        return foldInSessionZone(scope, params, (iz) =>
-          coerceStringLiteral(text, target, typmod, varcharLen, iz),
+        // The literal's input error points at the literal (PostgreSQL coerces it at parse time —
+        // spec/design/error-fields.md §10.2).
+        return atPosition(e.inner.loc, () =>
+          foldInSessionZone(scope, params, (iz) =>
+            coerceStringLiteral(text, target, typmod, varcharLen, iz),
+          ),
         );
       }
       // Casting TO text (casts.toml, types.md §5): every built-in scalar renders its own output form,
@@ -1621,7 +1698,9 @@ export function resolve(
       }
       {
         const { node, type } = resolve(scope, e.operand, null, ag, params);
-        requireBool(type, "NOT requires a boolean operand");
+        atPosition(exprLocation(e.operand), () =>
+          requireBool(type, "NOT requires a boolean operand"),
+        );
         return { node: { kind: "not", operand: node }, type: { kind: "bool" } };
       }
     case "isNull": {
@@ -1761,13 +1840,15 @@ export function resolve(
       // consequence, cost.md §3).
       let folded: Expr | null = null;
       for (const elem of e.list) {
-        const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem };
-        folded = folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq };
+        // The desugared comparisons carry the IN's operator position (PostgreSQL's).
+        const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem, loc: e.loc };
+        folded =
+          folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq, loc: e.loc };
       }
       // folded is non-null: the parser guarantees a non-empty list.
       let desugared = folded as Expr;
       if (e.negated) {
-        desugared = { kind: "unary", op: "not", operand: desugared };
+        desugared = { kind: "unary", op: "not", operand: desugared, loc: e.loc };
       }
       return resolve(scope, desugared, ctx, ag, params);
     }
@@ -1777,11 +1858,12 @@ export function resolve(
       // operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL. NOT BETWEEN
       // negates the whole conjunction. The LHS is evaluated twice (the desugar model — a
       // documented cost consequence, cost.md §3).
-      const ge: Expr = { kind: "binary", op: "ge", lhs: e.lhs, rhs: e.lo };
-      const le: Expr = { kind: "binary", op: "le", lhs: e.lhs, rhs: e.hi };
-      let desugared: Expr = { kind: "binary", op: "and", lhs: ge, rhs: le };
+      // The desugared comparisons carry the BETWEEN's operator position (PostgreSQL's).
+      const ge: Expr = { kind: "binary", op: "ge", lhs: e.lhs, rhs: e.lo, loc: e.loc };
+      const le: Expr = { kind: "binary", op: "le", lhs: e.lhs, rhs: e.hi, loc: e.loc };
+      let desugared: Expr = { kind: "binary", op: "and", lhs: ge, rhs: le, loc: e.loc };
       if (e.negated) {
-        desugared = { kind: "unary", op: "not", operand: desugared };
+        desugared = { kind: "unary", op: "not", operand: desugared, loc: e.loc };
       }
       return resolve(scope, desugared, ctx, ag, params);
     }
@@ -1852,7 +1934,9 @@ export function resolve(
           cond = resolve(scope, eq, null, ag, params).node;
         } else {
           const rc = resolve(scope, w.cond, null, ag, params);
-          requireBool(rc.type, "CASE WHEN condition must be boolean");
+          atPosition(exprLocation(w.cond), () =>
+            requireBool(rc.type, "CASE WHEN condition must be boolean"),
+          );
           cond = rc.node;
         }
         const rres = resolve(scope, w.result, null, ag, params);
@@ -1868,7 +1952,21 @@ export function resolve(
         els = { kind: "constNull" };
         resultTypes.push({ kind: "null" });
       }
-      const unified = unifyCaseTypes(resultTypes, "CASE result types must be compatible");
+      let unified: ResolvedType;
+      try {
+        unified = unifyCaseTypes(resultTypes, "CASE result types must be compatible");
+      } catch (err) {
+        // PostgreSQL scans the ELSE result first, then the THEN results in order.
+        const types = [resultTypes[resultTypes.length - 1]!, ...resultTypes.slice(0, -1)];
+        const exprs: Expr[] = [
+          e.els ?? { kind: "literal", literal: { kind: "null" } },
+          ...e.whens.map((w) => w.result),
+        ];
+        throw positionedAt(
+          err,
+          mismatchLocation(types, exprs, (ts) => unifyCaseTypes(ts, "")),
+        );
+      }
       // A mixed-width float CASE is f64: widen the f32 arms (an ordinary cast, like GREATEST).
       if (unified.kind === "float") {
         arms.forEach((arm, i) => {
@@ -1905,7 +2003,15 @@ export function resolve(
         args.push(ra.node);
         argTypes.push(ra.type);
       }
-      const unified = unifyCaseTypes(argTypes, "COALESCE types must be compatible");
+      let unified: ResolvedType;
+      try {
+        unified = unifyCaseTypes(argTypes, "COALESCE types must be compatible");
+      } catch (err) {
+        throw positionedAt(
+          err,
+          mismatchLocation(argTypes, e.args, (ts) => unifyCaseTypes(ts, "")),
+        );
+      }
       // A mixed-width float COALESCE is f64: widen the f32 arguments (as CASE).
       if (unified.kind === "float") {
         args.forEach((a, i) => {
@@ -1938,7 +2044,15 @@ export function resolve(
       const name = e.greatest ? "greatest" : "least";
       const resolved = e.args.map((a) => resolve(scope, a, null, ag, params));
       const types = resolved.map((r) => r.type);
-      const unified = unifyCaseTypes(types, `${name.toUpperCase()} types must be compatible`);
+      let unified: ResolvedType;
+      try {
+        unified = unifyCaseTypes(types, `${name.toUpperCase()} types must be compatible`);
+      } catch (err) {
+        throw positionedAt(
+          err,
+          mismatchLocation(types, e.args, (ts) => unifyCaseTypes(ts, "")),
+        );
+      }
       classifyComparable(unified, unified);
       // A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
       const hint = scalarForParamHint(unified);
@@ -2716,8 +2830,9 @@ export function resolveBinary(
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
       const r = resolve(scope, rhs, null, ag, params);
-      requireBool(l.type, "AND/OR requires boolean operands");
-      requireBool(r.type, "AND/OR requires boolean operands");
+      // A non-boolean operand is located at that operand (PostgreSQL's coerce_to_boolean).
+      atPosition(exprLocation(lhs), () => requireBool(l.type, "AND/OR requires boolean operands"));
+      atPosition(exprLocation(rhs), () => requireBool(r.type, "AND/OR requires boolean operands"));
       return {
         node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node },
         type: { kind: "bool" },

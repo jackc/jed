@@ -44,6 +44,10 @@ pub struct EngineError {
     /// PostgreSQL's HINT suggestion (`Perhaps you meant to reference the column "t.name".`) —
     /// spec/design/error-fields.md §11. Never part of the rendered message.
     pub hint: Option<String>,
+    /// Set once an expression node's resolution has decided this error's position (stamped or
+    /// deliberately left absent), so an enclosing node never claims an error raised inside one of
+    /// its operands (spec/design/error-fields.md §10.2). Internal bookkeeping, not a field.
+    pub(crate) located: bool,
 }
 
 impl EngineError {
@@ -58,6 +62,7 @@ impl EngineError {
             detail: None,
             position: None,
             hint: None,
+            located: false,
         }
     }
 
@@ -103,6 +108,28 @@ impl EngineError {
             self.position = Some(pos);
         }
         self
+    }
+
+    /// Stamp an error leaving an expression node's resolution with `pos` unless an inner node already
+    /// decided its position, then mark it decided (spec/design/error-fields.md §10.2).
+    #[must_use]
+    pub(crate) fn locate(mut self, pos: u32) -> Self {
+        if !self.located {
+            self = self.with_position(pos);
+            self.located = true;
+        }
+        self
+    }
+
+    /// Position a DML target's `42P01` at the target's name (spec/design/error-fields.md §10.2); any
+    /// other error passes through.
+    #[must_use]
+    pub(crate) fn at_target(self, pos: u32) -> Self {
+        if self.state == SqlState::UndefinedTable {
+            self.with_position(pos)
+        } else {
+            self
+        }
     }
 
     /// Shift `Position` by `chars` characters — a statement's error moved into the coordinates of

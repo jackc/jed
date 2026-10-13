@@ -517,6 +517,732 @@ run: INSERT INTO t AS excluded VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = 
 code: 42P09
 position: 76
 
+# --- DML targets (42P01) -----------------------------------------------------------------------
+
+case: unknown INSERT target
+run: INSERT INTO nope VALUES (1)
+code: 42P01
+position: 13
+
+case: unknown INSERT target with an alias
+run: INSERT INTO nope AS n VALUES (1)
+code: 42P01
+position: 13
+
+case: unknown INSERT target with ON CONFLICT
+run: INSERT INTO nope VALUES (1) ON CONFLICT DO NOTHING
+code: 42P01
+position: 13
+
+# jed: `public` is an unattached database here, where PostgreSQL's is the `public` schema.
+case: unknown database-qualified INSERT target
+run: INSERT INTO public.nope VALUES (1)
+code: 42P01
+position: 13
+
+case: unknown UPDATE target
+run: UPDATE nope SET a = 1
+code: 42P01
+position: 8
+
+case: unknown DELETE target
+run: DELETE FROM nope WHERE a = 1
+code: 42P01
+position: 13
+
+case: unknown DELETE target under WITH
+run: WITH x AS (SELECT 1) DELETE FROM nope
+code: 42P01
+position: 34
+
+case: unknown INSERT target in a writable CTE
+run: WITH x AS (INSERT INTO nope VALUES (1) RETURNING 1) SELECT 1
+code: 42P01
+position: 24
+
+case: unknown EXPLAIN INSERT target
+run: EXPLAIN INSERT INTO nope VALUES (1)
+code: 42P01
+position: 21
+
+case: unknown DROP TABLE target
+run: DROP TABLE nope
+code: 42P01
+no-position
+
+case: unknown CREATE INDEX target
+run: CREATE INDEX ON nope (a)
+code: 42P01
+no-position
+
+case: unknown REFERENCES target
+run: CREATE TABLE c (a int REFERENCES nope)
+code: 42P01
+no-position
+
+# --- function lookup (42883) ---------------------------------------------------------------------
+# PostgreSQL also attaches "No function matches the given name and argument types. You might need to
+# add explicit type casts." here; jed's version of that hint is a separate follow-on
+# (error-fields.md §7), so these cases expect no hint.
+
+case: unknown function
+run: SELECT nofunc(1)
+code: 42883
+position: 8
+
+case: function argument types
+run: SELECT abs('a'::text)
+code: 42883
+position: 8
+
+case: function argument count
+run: SELECT abs(1, 2)
+code: 42883
+position: 8
+
+case: function counts characters
+run: SELECT  1, upper(1)
+code: 42883
+position: 12
+
+case: function nested in an argument
+run: SELECT abs(nofunc(1))
+code: 42883
+position: 12
+
+case: function in WHERE
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t WHERE nofunc(a) = 1
+code: 42883
+position: 23
+
+case: function in ORDER BY
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t ORDER BY nofunc(a)
+code: 42883
+position: 26
+
+case: function in GROUP BY
+setup: CREATE TABLE t (a int, b int)
+run: SELECT 1 FROM t GROUP BY nofunc(a)
+code: 42883
+position: 26
+
+case: function in PARTITION BY
+setup: CREATE TABLE t (a int, b int)
+run: SELECT row_number() OVER (PARTITION BY nofunc(a)) FROM t
+code: 42883
+position: 40
+
+case: function in RETURNING
+setup: CREATE TABLE t (a int, b int)
+run: INSERT INTO t VALUES (1, 2) RETURNING nofunc(a)
+code: 42883
+position: 39
+
+case: function in UPDATE WHERE
+setup: CREATE TABLE t (a int, b int)
+run: UPDATE t SET a = 1 WHERE nofunc(b)
+code: 42883
+position: 26
+
+case: function in an IN list
+run: SELECT 1 IN (nofunc(1))
+code: 42883
+position: 14
+
+case: function under NOT
+run: SELECT NOT nofunc()
+code: 42883
+position: 12
+
+case: function in a CASE result
+run: SELECT CASE 1 WHEN 2 THEN nofunc() END
+code: 42883
+position: 27
+
+case: aggregate argument type
+run: SELECT sum('a'::text)
+code: 42883
+position: 8
+
+case: aggregate in HAVING
+setup: CREATE TABLE t (a int, b int)
+run: SELECT 1 FROM t HAVING sum('a'::text) > 0
+code: 42883
+position: 24
+
+case: unknown window function
+run: SELECT nofunc() OVER ()
+code: 42883
+position: 8
+
+case: table function argument types
+setup: CREATE TABLE t (a int, b int)
+run: SELECT * FROM t, generate_series(1, 'a'::text)
+code: 42883
+position: 18
+
+case: function in a scalar subquery
+run: SELECT (SELECT nofunc(1))
+code: 42883
+position: 16
+
+case: function in EXISTS
+run: SELECT EXISTS (SELECT nofunc(1))
+code: 42883
+position: 23
+
+case: function in a CTE
+run: WITH x AS (SELECT nofunc(1)) SELECT * FROM x
+code: 42883
+position: 19
+
+case: function in a derived table
+run: SELECT * FROM (SELECT nofunc(1)) s
+code: 42883
+position: 23
+
+case: function in EXPLAIN
+run: EXPLAIN SELECT nofunc(1)
+code: 42883
+position: 16
+
+case: function in a view body
+run: CREATE VIEW v AS SELECT 1, nofunc(2)
+code: 42883
+position: 28
+
+case: function in a CHECK constraint
+run: CREATE TABLE c (a int CHECK (nofunc(a) > 0))
+code: 42883
+position: 30
+
+case: function in a column DEFAULT
+run: CREATE TABLE c (a int DEFAULT nofunc())
+code: 42883
+position: 31
+
+case: function in an index expression
+setup: CREATE TABLE t (a int, b int)
+run: CREATE INDEX ON t ((nofunc(a)))
+code: 42883
+position: 21
+
+case: SUBSTRING special form
+run: SELECT SUBSTRING(1 FROM 2)
+code: 42883
+position: 8
+
+case: POSITION special form
+run: SELECT POSITION(1 IN 2)
+code: 42883
+position: 8
+
+case: AT TIME ZONE points at AT
+run: SELECT 1 AT TIME ZONE 'UTC'
+code: 42883
+position: 10
+
+case: LIKE ESCAPE points at LIKE
+run: SELECT 'a'::text LIKE 'b' ESCAPE 1
+code: 42883
+position: 18
+
+case: NULLIF
+run: SELECT NULLIF(1, 'a'::text)
+code: 42883
+position: 8
+
+case: function position in a script
+script: SELECT 1; SELECT nofunc(2)
+code: 42883
+position: 18
+
+# --- operators (42883 / 42804) -------------------------------------------------------------------
+# An operator with no implementation for its operand types points at the operator — the `NOT` of
+# `NOT IN` / `NOT BETWEEN` / `NOT LIKE`, the `IS` of `IS DISTINCT FROM`, the `IN` / `BETWEEN` / `LIKE`
+# keyword. jed reports most of these as 42804 (its strict type check) where PostgreSQL's operator
+# lookup reports 42883; the token is the same. PostgreSQL's 42883 hint is not expected (above).
+
+case: quantified comparison
+run: SELECT 1 = ANY(ARRAY['a'::text])
+code: 42883
+position: 10
+
+case: quantified ALL
+run: SELECT 1 < ALL(ARRAY['a'::text])
+code: 42883
+position: 10
+
+case: quantified subquery
+run: SELECT 1 = ANY (SELECT 'a'::text)
+code: 42883
+position: 10
+
+case: concatenation
+run: SELECT 1 || 2
+code: 42883
+position: 10
+
+case: array concatenation
+run: SELECT ARRAY[1] || 'a'::text
+code: 42883
+position: 17
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: arithmetic operator
+run: SELECT 1 + 'a'::text
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: inner arithmetic operator
+run: SELECT 1 + 2 * 'a'::text
+code: 42804
+position: 14
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: comparison operator
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t WHERE a = 'x'::text
+code: 42804
+position: 25
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: prefix minus
+run: SELECT - 'a'::text
+code: 42804
+position: 8
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: IN list
+run: SELECT 1 IN ('a'::text)
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: NOT IN list
+run: SELECT 1 NOT IN ('a'::text, 'b'::text)
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: BETWEEN
+run: SELECT 1 BETWEEN 'a'::text AND 'b'::text
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: NOT BETWEEN
+run: SELECT 1 NOT BETWEEN 'a'::text AND 'b'::text
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: LIKE
+run: SELECT 'a'::text LIKE 1
+code: 42804
+position: 18
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: NOT LIKE
+run: SELECT 'a'::text NOT LIKE 1
+code: 42804
+position: 18
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: IS DISTINCT FROM
+run: SELECT 1 IS DISTINCT FROM 'a'::text
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: IN subquery
+run: SELECT 1 IN (SELECT 'a'::text)
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: NOT IN subquery
+run: SELECT 1 NOT IN (SELECT 'a'::text)
+code: 42804
+position: 10
+
+# jed: PostgreSQL reports 42883 (operator does not exist) at the same token.
+case: comparison with a scalar subquery
+run: SELECT 1 < (SELECT 'a'::text)
+code: 42804
+position: 10
+
+# --- boolean arguments (42804) -------------------------------------------------------------------
+# A clause or connective that needs a boolean points at its argument's leftmost token (PostgreSQL's
+# exprLocation): a function's name, an operator expression's left operand, a CASE's keyword.
+
+case: WHERE argument
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t WHERE a
+code: 42804
+position: 23
+
+case: WHERE expression argument
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t WHERE a + 1
+code: 42804
+position: 23
+
+case: WHERE parenthesized argument
+setup: CREATE TABLE t (a int, b int)
+run: SELECT 1 FROM t WHERE (a)
+code: 42804
+position: 24
+
+case: WHERE cast argument
+setup: CREATE TABLE t (a int, b int)
+run: SELECT 1 FROM t WHERE (a)::int
+code: 42804
+position: 24
+
+case: WHERE negated column
+setup: CREATE TABLE t (a int, b int)
+run: SELECT 1 FROM t WHERE -a
+code: 42804
+position: 23
+
+case: WHERE negative literal
+run: SELECT 1 WHERE -1
+code: 42804
+position: 16
+
+case: WHERE typed literal
+run: SELECT 1 WHERE int '1'
+code: 42804
+position: 20
+
+case: WHERE function
+run: SELECT 1 WHERE upper('a')
+code: 42804
+position: 16
+
+case: WHERE CASE
+run: SELECT 1 WHERE CASE WHEN true THEN 1 END
+code: 42804
+position: 16
+
+case: WHERE AT TIME ZONE
+run: SELECT 1 WHERE now() AT TIME ZONE 'UTC'
+code: 42804
+position: 22
+
+case: WHERE in a subquery
+setup: CREATE TABLE t (a int, b int)
+run: SELECT (SELECT a FROM t WHERE a)
+code: 42804
+position: 31
+
+case: DELETE WHERE argument
+setup: CREATE TABLE t (a int, b int)
+run: DELETE FROM t WHERE b
+code: 42804
+position: 21
+
+case: JOIN ON argument
+setup: CREATE TABLE t (a int, b int)
+setup: CREATE TABLE u (c int)
+run: SELECT * FROM t JOIN u ON c
+code: 42804
+position: 27
+
+case: HAVING argument
+setup: CREATE TABLE t (a int, b int)
+run: SELECT count(*) FROM t HAVING count(*)
+code: 42804
+position: 31
+
+case: AND right operand
+setup: CREATE TABLE t (a int, b int)
+run: SELECT a FROM t WHERE true AND b
+code: 42804
+position: 32
+
+case: AND left operand first
+run: SELECT 1 AND 2
+code: 42804
+position: 8
+
+case: OR operand
+run: SELECT true OR 1
+code: 42804
+position: 16
+
+case: NOT operand
+run: SELECT NOT 1
+code: 42804
+position: 12
+
+case: NOT parenthesized operand
+run: SELECT NOT (1 + 2)
+code: 42804
+position: 13
+
+case: CASE WHEN condition
+setup: CREATE TABLE t (a int, b int)
+run: SELECT CASE WHEN a THEN 1 END FROM t
+code: 42804
+position: 18
+
+case: FILTER condition
+setup: CREATE TABLE t (a int, b int)
+run: SELECT count(*) FILTER (WHERE a) FROM t
+code: 42804
+position: 31
+
+case: CHECK argument
+run: CREATE TABLE c (a int CHECK (a + 1))
+code: 42804
+position: 30
+
+# --- common types (42804) ------------------------------------------------------------------------
+# A set of expressions with no common type points at the first one that does not unify with those
+# before it, in PostgreSQL's order: a CASE's ELSE result first, then its THEN results.
+
+case: CASE results
+run: SELECT CASE WHEN true THEN 1 ELSE 'a'::text END
+code: 42804
+position: 28
+
+case: CASE results without ELSE
+run: SELECT CASE WHEN true THEN 1 WHEN false THEN 'a'::text END
+code: 42804
+position: 46
+
+case: CASE results ELSE first
+run: SELECT CASE WHEN true THEN 1 WHEN false THEN 'a'::text ELSE 2 END
+code: 42804
+position: 46
+
+case: COALESCE arguments
+run: SELECT COALESCE(1, 'a'::text)
+code: 42804
+position: 20
+
+case: COALESCE skips NULL
+run: SELECT COALESCE(NULL, 1, 'a'::text)
+code: 42804
+position: 26
+
+case: GREATEST arguments
+run: SELECT GREATEST(1, 'a'::text)
+code: 42804
+position: 20
+
+case: LEAST arguments
+run: SELECT LEAST(1, 2, 'a'::text)
+code: 42804
+position: 20
+
+case: ARRAY elements
+run: SELECT ARRAY[1, 'a'::text]
+code: 42804
+position: 17
+
+case: ARRAY later element
+run: SELECT ARRAY[1, 2, 'a'::text]
+code: 42804
+position: 20
+
+case: VALUES column
+run: VALUES (1), ('a'::text)
+code: 42804
+position: 14
+
+case: VALUES second column
+run: VALUES (1, 'x'::text), (2, 3)
+code: 42804
+position: 28
+
+case: VALUES derived table
+run: SELECT * FROM (VALUES (1), ('a'::text)) v
+code: 42804
+position: 29
+
+case: UNION column
+run: SELECT 1 UNION SELECT 'a'::text
+code: 42804
+position: 23
+
+case: UNION third operand
+run: SELECT 1 UNION SELECT 2 UNION SELECT 'a'::text
+code: 42804
+position: 38
+
+# --- assignments (42804) -------------------------------------------------------------------------
+# A value of the wrong type for its target column points at the value. PostgreSQL also attaches "You
+# will need to rewrite or cast the expression."; jed's is a separate follow-on (error-fields.md §7).
+
+case: INSERT VALUES expression
+setup: CREATE TABLE t (a int, b int)
+run: INSERT INTO t VALUES (1, 'a'::text)
+code: 42804
+position: 26
+
+case: INSERT SELECT column
+setup: CREATE TABLE t (a int, b int)
+run: INSERT INTO t SELECT 1, 'a'::text
+code: 42804
+position: 25
+
+case: UPDATE SET value
+setup: CREATE TABLE t (a int, b int)
+run: UPDATE t SET b = 'a'::text
+code: 42804
+position: 18
+
+case: ON CONFLICT DO UPDATE SET value
+setup: CREATE TABLE p (id int PRIMARY KEY, v int)
+run: INSERT INTO p VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = 'x'::text
+code: 42804
+position: 64
+
+# --- literal input --------------------------------------------------------------------------------
+# A string literal converted at resolve time — cast, typed, or adapting to its context — points any
+# input error at the literal, as PostgreSQL's parse-time coercion does. A conversion of a value at run
+# time has no position.
+
+case: cast literal
+run: SELECT 'abc'::int
+code: 22P02
+position: 8
+
+case: CAST literal
+run: SELECT CAST('abc' AS int)
+code: 22P02
+position: 13
+
+case: typed literal
+run: SELECT int 'abc'
+code: 22P02
+position: 12
+
+case: cast literal in a function argument
+run: SELECT abs('abc'::int)
+code: 22P02
+position: 12
+
+case: cast literal out of range
+run: SELECT '99999999999'::int
+code: 22003
+position: 8
+
+case: cast boolean literal
+run: SELECT 'maybe'::boolean
+code: 22P02
+position: 8
+
+case: cast numeric literal
+run: SELECT 'x'::numeric
+code: 22P02
+position: 8
+
+case: cast uuid literal
+run: SELECT 'x'::uuid
+code: 22P02
+position: 8
+
+case: cast jsonb literal
+run: SELECT '{'::jsonb
+code: 22P02
+position: 8
+
+case: cast date literal
+run: SELECT 'xx'::date
+code: 22007
+position: 8
+
+case: cast interval literal
+run: SELECT 'x'::interval
+code: 22007
+position: 8
+
+case: cast array literal element
+run: SELECT '{1,x}'::int[]
+code: 22P02
+position: 8
+
+case: cast malformed array literal
+run: SELECT '{1,2'::int[]
+code: 22P02
+position: 8
+
+case: cast range literal
+run: SELECT '[1,'::int4range
+code: 22P02
+position: 8
+
+case: typed range literal
+run: SELECT int4range '[1,'
+code: 22P02
+position: 18
+
+case: literal adapting to a uuid column
+setup: CREATE TABLE w (u uuid)
+run: SELECT * FROM w WHERE u = 'x'
+code: 22P02
+position: 27
+
+case: literal adapting to a date column
+setup: CREATE TABLE w (d date)
+run: SELECT * FROM w WHERE d < 'xx'
+code: 22007
+position: 27
+
+case: literal adapting to an interval column
+setup: CREATE TABLE w (i interval)
+run: SELECT * FROM w WHERE i = 'zz'
+code: 22007
+position: 27
+
+case: literal adapting to a timestamp column
+setup: CREATE TABLE w (ts timestamp)
+run: SELECT * FROM w WHERE ts = 'zz'
+code: 22007
+position: 28
+
+case: literal adapting to jsonb
+run: SELECT '{"a":1}'::jsonb @> '{'
+code: 22P02
+position: 28
+
+case: literal in UPDATE SET
+setup: CREATE TABLE w (u uuid)
+run: UPDATE w SET u = 'x'
+code: 22P02
+position: 18
+
+case: array literal in UPDATE SET
+setup: CREATE TABLE w (a int[])
+run: UPDATE w SET a = '{x}'
+code: 22P02
+position: 18
+
+case: literal expression in INSERT VALUES
+setup: CREATE TABLE w (u uuid)
+run: INSERT INTO w VALUES (('x'))
+code: 22P02
+position: 24
+
+case: cast of a text value at run time
+run: SELECT 'abc'::text::int
+code: 22P02
+no-position
+
+case: cast of a column at run time
+setup: CREATE TABLE u (a text)
+setup: INSERT INTO u VALUES ('abc')
+run: SELECT a::int FROM u
+code: 22P02
+no-position
+
 # --- scripts --------------------------------------------------------------------------------------
 
 case: script position counts from the start of the script

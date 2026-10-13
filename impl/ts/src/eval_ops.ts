@@ -82,7 +82,7 @@ import {
   scalarTypeFromName,
 } from "./types.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
-import type { Expr, OrderKey, SetOpKind, TypeMod } from "./ast.ts";
+import type { Expr, OrderKey, QueryExpr, SetOpKind, TypeMod } from "./ast.ts";
 export function evalArrayFunc(func: ArrayFuncName, vals: Value[], m: Meter): Value {
   switch (func) {
     case "array_ndims": {
@@ -649,6 +649,25 @@ export function arrayGetSlice(
 // GREATEST/LEAST's (§52) argument types — into one common type by folding commonType; NULL-typed
 // arms are skipped, an all-NULL list is text (PostgreSQL's unknown rule), and a pair with no common
 // type is 42804 with the caller's form-specific mismatch message.
+// mismatchLocation is the location of the expression a failed type unification names
+// (spec/design/error-fields.md §10.2): PostgreSQL's select_common_type scans the expressions in order
+// and reports the first whose type does not unify with those before it. unify is the unifier that
+// failed (it throws on a mismatch), run over each prefix; exprs is in PostgreSQL's scan order.
+export function mismatchLocation(
+  types: ResolvedType[],
+  exprs: Expr[],
+  unify: (types: ResolvedType[]) => unknown,
+): number | undefined {
+  for (let i = 1; i < types.length; i++) {
+    try {
+      unify(types.slice(0, i + 1));
+    } catch {
+      return exprLocation(exprs[i]!);
+    }
+  }
+  return undefined;
+}
+
 export function unifyCaseTypes(arms: ResolvedType[], mismatch: string): ResolvedType {
   let acc: ResolvedType | null = null;
   for (const t of arms) {
@@ -945,6 +964,67 @@ export function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
 // discriminated-union nodes, comparing primitives (incl. bigint and a Decimal's fields) by value.
 export function exprEqual(a: Expr, b: Expr): boolean {
   return astDeepEqual(a, b);
+}
+
+// exprLocation is an expression's location for an error that names the whole expression —
+// PostgreSQL's exprLocation, the leftmost character the expression was written at, its folded
+// grouping parentheses excluded (spec/design/error-fields.md §10.2). undefined when jed did not record
+// it (a bind parameter, a subquery, a constructor keyword, stored text): the error then carries no
+// position rather than a wrong one.
+export function exprLocation(e: Expr): number | undefined {
+  switch (e.kind) {
+    case "column":
+    case "qualifiedColumn":
+    case "literal":
+    case "typedLiteral":
+    case "unary":
+    case "case":
+    case "funcCall":
+      return e.loc;
+    case "cast": {
+      // A `::` cast is located at its operand (the leftmost token). CAST(x AS t) is located at a
+      // string or NULL literal operand (PostgreSQL coerces it in place); any other operand's location
+      // depends on whether the coercion is a no-op, so it is unknown.
+      const inner = e.inner;
+      if (
+        e.loc === undefined ||
+        (inner.kind === "literal" &&
+          (inner.literal.kind === "text" || inner.literal.kind === "null"))
+      ) {
+        return exprLocation(inner);
+      }
+      return undefined;
+    }
+    case "collate":
+      return exprLocation(e.inner);
+    case "fieldAccess":
+    case "subscript":
+      return exprLocation(e.base);
+    case "isNull":
+    case "isJson":
+      return exprLocation(e.operand);
+    case "binary":
+    case "isDistinct":
+    case "in":
+    case "between":
+    case "like":
+    case "regex":
+    case "inSubquery":
+    case "quantified":
+    case "quantifiedSubquery":
+      return exprLocation(e.lhs);
+    default:
+      return undefined;
+  }
+}
+
+// outputColumnLocation is the location of a query's output column i — a set-operation operand, an
+// INSERT … SELECT source (spec/design/error-fields.md §10.2): the select-list expression of a plain
+// SELECT; undefined for a `*` list or any other operand.
+export function outputColumnLocation(q: QueryExpr, i: number): number | undefined {
+  if (q.kind !== "select" || q.items.kind !== "list") return undefined;
+  const item = q.items.items[i];
+  return item === undefined ? undefined : exprLocation(item.expr);
 }
 
 export function astDeepEqual(a: unknown, b: unknown): boolean {

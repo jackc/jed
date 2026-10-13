@@ -807,7 +807,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 				return nil, err
 			}
 			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
-				return nil, err
+				return nil, positionError(err, exprLocation(a.Value))
 			}
 			src = resolved
 		}
@@ -928,7 +928,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		ic, allowCacheFill = nil, false
 	}
 	if err := db.checkTableQualifier(ins.DB, ins.Table); err != nil { // attached-databases.md §3
-		return outcome{}, err
+		return outcome{}, atTarget(err, ins.TablePos)
 	}
 	// ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md §8):
 	// the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
@@ -942,7 +942,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	}
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
-		return outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table)
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table).withPosition(int32(ins.TablePos))
 	}
 	// Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
 	// maintained B-tree would mix two orderings (collation.md §12, XX002).
@@ -1136,10 +1136,10 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 					continue
 				}
 				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) {
-					return outcome{}, typeError(fmt.Sprintf(
+					return outcome{}, positionError(typeError(fmt.Sprintf(
 						"column %s is of type %s but expression is of type %s",
 						col.Name, col.Type.CanonicalName(), rtName(q.columnTypes[p]),
-					))
+					)), outputColumnLocation(*ins.Query, p))
 				}
 			}
 		}
@@ -1404,10 +1404,10 @@ func (db *engine) resolveInsertRowExprs(values []insertValue, columns []catColum
 				))
 			case resolvedTypeEqual(ty, resolvedTypeOfCol(col.Type, db.readSnap())):
 			default:
-				return nil, typeError(fmt.Sprintf(
+				return nil, positionError(typeError(fmt.Sprintf(
 					"column %s is of type %s but expression is of type %s",
 					col.Name, col.Type.CanonicalName(), rtName(ty),
-				))
+				)), exprLocation(*v.Expr))
 			}
 			node = n
 		default:
@@ -1417,10 +1417,10 @@ func (db *engine) resolveInsertRowExprs(values []insertValue, columns []catColum
 				return nil, err
 			}
 			if !assignableTo(ty, target) {
-				return nil, typeError(fmt.Sprintf(
+				return nil, positionError(typeError(fmt.Sprintf(
 					"column %s is of type %s but expression is of type %s",
 					col.Name, col.Type.CanonicalName(), rtName(ty),
-				))
+				)), exprLocation(*v.Expr))
 			}
 			node = n
 		}
@@ -1494,7 +1494,7 @@ func (db *engine) executeInsertValuesCached(ins *insert, params []Value, ctx cte
 func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite) (*insertValuesPlan, error) {
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table)
 	if !ok {
-		return nil, newError(UndefinedTable, "table does not exist: "+ins.Table)
+		return nil, newError(UndefinedTable, "table does not exist: "+ins.Table).withPosition(int32(ins.TablePos))
 	}
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
 		return nil, err
@@ -3312,11 +3312,11 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(del.DB, del.Table); err != nil { // attached-databases.md §3
-		return outcome{}, err
+		return outcome{}, atTarget(err, del.TablePos)
 	}
 	table, ok := db.lkpTableScoped(del.DB, del.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
-		return outcome{}, newError(UndefinedTable, "table does not exist: "+del.Table)
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+del.Table).withPosition(int32(del.TablePos))
 	}
 	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): a
 	// DELETE must locate + remove a stored key, which a skewed encoding cannot match.
@@ -3568,11 +3568,11 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(upd.DB, upd.Table); err != nil { // attached-databases.md §3
-		return outcome{}, err
+		return outcome{}, atTarget(err, upd.TablePos)
 	}
 	table, ok := db.lkpTableScoped(upd.DB, upd.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
-		return outcome{}, newError(UndefinedTable, "table does not exist: "+upd.Table)
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+upd.Table).withPosition(int32(upd.TablePos))
 	}
 	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): an
 	// UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
@@ -3673,7 +3673,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				return outcome{}, err
 			}
 			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
-				return outcome{}, err
+				return outcome{}, positionError(err, exprLocation(a.Value))
 			}
 			plans = append(plans, assignPlan{
 				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,

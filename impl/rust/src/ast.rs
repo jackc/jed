@@ -576,6 +576,9 @@ pub struct TypeMod {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Insert {
     pub table: String,
+    /// The target name's character position — the database qualifier's for `db.t`
+    /// (spec/design/error-fields.md §10.2).
+    pub table_pos: SrcPos,
     /// The optional database qualifier on the target (`INSERT INTO reports.t …`), like
     /// [`TableRef::db`] (spec/design/attached-databases.md §3). `None` = implicit scope.
     pub db: Option<String>,
@@ -694,6 +697,8 @@ pub enum InsertValue {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Update {
     pub table: String,
+    /// The target name's character position (spec/design/error-fields.md §10.2).
+    pub table_pos: SrcPos,
     /// The optional database qualifier on the target (`UPDATE reports.t SET …`), like
     /// [`TableRef::db`] (spec/design/attached-databases.md §3). `None` = implicit scope.
     pub db: Option<String>,
@@ -725,6 +730,8 @@ pub struct Assignment {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Delete {
     pub table: String,
+    /// The target name's character position (spec/design/error-fields.md §10.2).
+    pub table_pos: SrcPos,
     /// The optional database qualifier on the target (`DELETE FROM reports.t …`), like
     /// [`TableRef::db`] (spec/design/attached-databases.md §3). `None` = implicit scope.
     pub db: Option<String>,
@@ -1216,7 +1223,9 @@ pub enum Expr {
         /// The qualifier's character position (spec/design/error-fields.md §10.2).
         pos: SrcPos,
     },
-    Literal(Literal),
+    /// A literal and its character position (spec/design/error-fields.md §10.2) — the minus sign of a
+    /// folded negative number.
+    Literal(Literal, SrcPos),
     /// A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value
     /// from the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The
     /// bare parenthesized `(a, b)` form is deferred (`0A000`) — only the keyword form is parsed.
@@ -1273,6 +1282,8 @@ pub enum Expr {
     TypedLiteral {
         type_name: String,
         text: String,
+        /// The string token's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// A bind parameter `$N` (1-based index). Like an integer/string literal it is an
     /// *adaptable* operand: its type is inferred from context at resolve (sibling operand,
@@ -1284,6 +1295,9 @@ pub enum Expr {
         type_name: String,
         /// An optional `numeric(p[,s])` type modifier on the CAST target.
         type_mod: Option<TypeMod>,
+        /// The `CAST` keyword's character position; `SrcPos::NONE` for the postfix `::` form, whose
+        /// location is its operand's (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `EXTRACT(field FROM source)` (spec/design/timezones.md §9.2, grammar.md §50) — the datetime
     /// field special form. `field` is the syntactic field name (an identifier or a string literal,
@@ -1304,14 +1318,20 @@ pub enum Expr {
         inner: Box<Expr>,
         collation: String,
     },
+    /// A prefix operator; `pos` is the operator token's character position
+    /// (spec/design/error-fields.md §10.2).
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,
+        pos: SrcPos,
     },
+    /// An infix operator; `pos` is the operator token's character position
+    /// (spec/design/error-fields.md §10.2).
     Binary {
         op: BinaryOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+        pos: SrcPos,
     },
     IsNull {
         operand: Box<Expr>,
@@ -1373,6 +1393,8 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
         negated: bool,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the `IS` keyword.
+        pos: SrcPos,
     },
     /// `lhs IN (list)` / `lhs NOT IN (list)` — membership over a non-empty value list
     /// (grammar.md §20). Desugared at resolve into the OR-chain PostgreSQL defines it as
@@ -1383,6 +1405,8 @@ pub enum Expr {
         lhs: Box<Expr>,
         list: Vec<Expr>,
         negated: bool,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the `NOT` of `NOT IN`, else `IN`.
+        pos: SrcPos,
     },
     /// `lhs BETWEEN lo AND hi` / `lhs NOT BETWEEN lo AND hi` — range test (grammar.md §21).
     /// Desugared at resolve into `lhs >= lo AND lhs <= hi` (NOT BETWEEN negates), inheriting the
@@ -1393,6 +1417,8 @@ pub enum Expr {
         lo: Box<Expr>,
         hi: Box<Expr>,
         negated: bool,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the `NOT` of `NOT BETWEEN`, else `BETWEEN`.
+        pos: SrcPos,
     },
     /// `lhs LIKE rhs` / `lhs NOT LIKE rhs` — text pattern match (grammar.md §22). `%` matches
     /// any run of characters, `_` one code point, with the default `\` escape. Both operands
@@ -1404,6 +1430,8 @@ pub enum Expr {
         rhs: Box<Expr>,
         negated: bool,
         insensitive: bool,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the `NOT` of `NOT LIKE`, else `LIKE` / `ILIKE`.
+        pos: SrcPos,
     },
     /// `lhs ~ rhs` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md).
     /// jed's own RE2-able flavor (not PostgreSQL-compatible), matched by a hand-written linear-time
@@ -1415,6 +1443,8 @@ pub enum Expr {
         rhs: Box<Expr>,
         negated: bool,
         insensitive: bool,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the `~` / `~*` / `!~` / `!~*` token.
+        pos: SrcPos,
     },
     /// A `CASE` expression (grammar.md §23). Searched form: `operand` is `None`, each `whens`
     /// condition must be boolean. Simple form: `operand` is `Some(x)`, each branch matches when
@@ -1425,6 +1455,8 @@ pub enum Expr {
         operand: Option<Box<Expr>>,
         whens: Vec<(Expr, Expr)>,
         els: Option<Box<Expr>>,
+        /// The `CASE` keyword's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     /// `COALESCE(a, b, …)` — the first non-NULL argument, lazily evaluated left to right like
     /// CASE (grammar.md §51). The argument list has ≥1 entries (an empty list is 42601 at
@@ -1500,6 +1532,9 @@ pub enum Expr {
         /// ordinal (PostgreSQL). `None` for every other call. Boxed so a plain call does not grow
         /// `Expr`.
         agg_order: Option<Box<Vec<OrderKey>>>,
+        /// The function name's character position (spec/design/error-fields.md §10.2) — the
+        /// keyword of a special form (`SUBSTRING`, `AT` of `AT TIME ZONE`, …).
+        pos: SrcPos,
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`
     /// plans it once against the scope chain; an uncorrelated one is then folded to a constant,
@@ -1514,6 +1549,8 @@ pub enum Expr {
         lhs: Box<Expr>,
         query: Box<QueryExpr>,
         negated: bool,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the `NOT` of `NOT IN`, else `IN`.
+        pos: SrcPos,
     },
     /// `lhs op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41,
     /// array-functions.md §11). `op` is a comparison (`= < > <= >=`); `all` is true for `ALL`,
@@ -1526,6 +1563,8 @@ pub enum Expr {
         all: bool,
         lhs: Box<Expr>,
         array: Box<Expr>,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the comparison token.
+        pos: SrcPos,
     },
     /// `lhs op ANY/SOME/ALL ( query_expr )` — the SUBQUERY form of the quantified comparison
     /// (array-functions.md §11.6), the subquery spelling of `IN`. Parallel to `InSubquery`: the
@@ -1537,7 +1576,56 @@ pub enum Expr {
         all: bool,
         lhs: Box<Expr>,
         query: Box<QueryExpr>,
+        /// The operator's character position (spec/design/error-fields.md §10.2): the comparison token.
+        pos: SrcPos,
     },
+}
+
+impl Expr {
+    /// The expression's location for an error that names the whole expression — PostgreSQL's
+    /// `exprLocation`, the leftmost character the expression was written at, its folded grouping
+    /// parentheses excluded (spec/design/error-fields.md §10.2). `SrcPos::NONE` when jed did not
+    /// record it (a bind parameter, a subquery, a constructor keyword, stored text): the error then
+    /// carries no position rather than a wrong one.
+    pub fn location(&self) -> SrcPos {
+        match self {
+            Expr::Column(_, pos)
+            | Expr::QualifiedColumn { pos, .. }
+            | Expr::Literal(_, pos)
+            | Expr::TypedLiteral { pos, .. }
+            | Expr::Unary { pos, .. }
+            | Expr::Case { pos, .. }
+            | Expr::FuncCall { pos, .. } => *pos,
+            // A `::` cast is located at its operand (the leftmost token). `CAST(x AS t)` is located
+            // at a string or NULL literal operand (PostgreSQL coerces it in place); any other
+            // operand's location depends on whether the coercion is a no-op, so it is unknown.
+            Expr::Cast { inner, pos, .. } => {
+                if pos.0 == 0
+                    || matches!(
+                        inner.as_ref(),
+                        Expr::Literal(Literal::Text(_) | Literal::Null, _)
+                    )
+                {
+                    inner.location()
+                } else {
+                    SrcPos::NONE
+                }
+            }
+            Expr::Collate { inner, .. } => inner.location(),
+            Expr::FieldAccess { base, .. } | Expr::Subscript { base, .. } => base.location(),
+            Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => operand.location(),
+            Expr::Binary { lhs, .. }
+            | Expr::IsDistinctFrom { lhs, .. }
+            | Expr::In { lhs, .. }
+            | Expr::Between { lhs, .. }
+            | Expr::Like { lhs, .. }
+            | Expr::Regex { lhs, .. }
+            | Expr::InSubquery { lhs, .. }
+            | Expr::Quantified { lhs, .. }
+            | Expr::QuantifiedSubquery { lhs, .. } => lhs.location(),
+            _ => SrcPos::NONE,
+        }
+    }
 }
 
 /// A constant `ON EMPTY` / `ON ERROR` behavior for the SQL/JSON query functions

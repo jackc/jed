@@ -129,17 +129,21 @@ export type Expr =
   // ambiguous (spec/design/grammar.md §15). Bare "column" stays the unqualified form. `loc` is the
   // qualifier's source character position (SrcLoc).
   | { kind: "qualifiedColumn"; qualifier: string; name: string; loc?: SrcLoc }
-  | { kind: "literal"; literal: Literal }
+  // A literal; `loc` is its source character position (the minus sign of a folded negative number).
+  | { kind: "literal"; literal: Literal; loc?: SrcLoc }
   // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's `type 'string'`,
   // equal to CAST('string' AS type) over a string-literal operand. typeName names the target scalar
   // (resolved by scalarFromName; unknown → 42704) and text is the literal's string; the string is
   // coerced to the type at resolve. The keyword names the type, so the literal carries it in any
   // expression position (`INTERVAL '1 day'`, `INTEGER '42'`).
-  | { kind: "typedLiteral"; typeName: string; text: string }
+  // `loc` is the string token's source character position.
+  | { kind: "typedLiteral"; typeName: string; text: string; loc?: SrcLoc }
   // A bind parameter $N (1-based index). Like an adaptable literal it takes its type from
   // context at resolve; the host binds a value at execute (spec/design/api.md §5).
   | { kind: "param"; index: number }
-  | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null }
+  // `loc` is the CAST keyword's source character position; absent for the postfix `::` form, whose
+  // location is its operand's (spec/design/error-fields.md §10.2).
+  | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null; loc?: SrcLoc }
   // EXTRACT(field FROM source) — the datetime field special form (timezones.md §9.2, grammar.md §50).
   // The field is syntactic (identifier or string literal, lowercased at parse); resolves to numeric.
   | { kind: "extract"; field: string; source: Expr }
@@ -149,8 +153,10 @@ export type Expr =
   // quoted identifier (case-sensitive, e.g. "C", "en-US"). A non-text inner is 42804, an unloaded
   // name 42704, two different explicit collations in one comparison 42P21.
   | { kind: "collate"; inner: Expr; collation: string }
-  | { kind: "unary"; op: UnaryOp; operand: Expr }
-  | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr }
+  // An operator node's `loc` is the operator token's source character position — the NOT of NOT IN /
+  // NOT BETWEEN / NOT LIKE, the IS of IS DISTINCT FROM (spec/design/error-fields.md §10.2).
+  | { kind: "unary"; op: UnaryOp; operand: Expr; loc?: SrcLoc }
+  | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr; loc?: SrcLoc }
   | { kind: "isNull"; operand: Expr; negated: boolean }
   // `operand IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]]` — the SQL/JSON
   // well-formedness predicate (spec/design/json-sql-functions.md §5): is `operand` (a character
@@ -199,30 +205,30 @@ export type Expr =
   // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
   // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).
-  | { kind: "isDistinct"; lhs: Expr; rhs: Expr; negated: boolean }
+  | { kind: "isDistinct"; lhs: Expr; rhs: Expr; negated: boolean; loc?: SrcLoc }
   // `lhs IN (list)` / `lhs NOT IN (list)` — membership over a non-empty value list
   // (spec/design/grammar.md §20). Desugared at resolve into the OR-chain PostgreSQL defines it
   // as (`x IN (a,b)` is `x = a OR x = b`; NOT IN is its negation), inheriting the three-valued
   // NULL semantics and per-element operand typing from `=`/OR/NOT. The parser guarantees `list`
   // is non-empty (`IN ()` is 42601).
-  | { kind: "in"; lhs: Expr; list: Expr[]; negated: boolean }
+  | { kind: "in"; lhs: Expr; list: Expr[]; negated: boolean; loc?: SrcLoc }
   // `lhs BETWEEN lo AND hi` / `lhs NOT BETWEEN lo AND hi` — a range test
   // (spec/design/grammar.md §21). Desugared at resolve into `lhs >= lo AND lhs <= hi` (NOT
   // BETWEEN negates), inheriting the three-valued NULL semantics from the comparisons and the
   // Kleene AND. The bounds parse at the additive level so the structural `AND` is not the
   // logical connective.
-  | { kind: "between"; lhs: Expr; lo: Expr; hi: Expr; negated: boolean }
+  | { kind: "between"; lhs: Expr; lo: Expr; hi: Expr; negated: boolean; loc?: SrcLoc }
   // `lhs LIKE rhs` / `lhs NOT LIKE rhs` — text pattern match (spec/design/grammar.md §22). `%`
   // matches any run of characters, `_` one code point, with the default `\` escape. Both
   // operands must be text; NULL propagates. A genuine operator (not desugared) with a
   // hand-written matcher. `negated` carries the NOT keyword; `insensitive` carries ILIKE
   // (case-insensitive matching, both sides simple-lowercased under the casing regime — collation.md §16).
-  | { kind: "like"; lhs: Expr; rhs: Expr; negated: boolean; insensitive: boolean }
+  | { kind: "like"; lhs: Expr; rhs: Expr; negated: boolean; insensitive: boolean; loc?: SrcLoc }
   // `lhs ~ rhs` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md). jed's
   // own RE2-able flavor (not PostgreSQL-compatible), matched by a hand-written linear-time Pike VM.
   // UNANCHORED (matches a substring). Both operands must be text; NULL propagates. `negated` carries
   // `!~`/`!~*`; `insensitive` carries `~*`/`!~*` (both sides simple-lowercased like ILIKE).
-  | { kind: "regex"; lhs: Expr; rhs: Expr; negated: boolean; insensitive: boolean }
+  | { kind: "regex"; lhs: Expr; rhs: Expr; negated: boolean; insensitive: boolean; loc?: SrcLoc }
   // A CASE expression (spec/design/grammar.md §23). Searched form: `operand` is null and each
   // `whens` condition must be boolean. Simple form: `operand` is non-null and each branch matches
   // when `operand = cond`. `whens` has ≥1 entry; `els` is the ELSE result, or null for an implicit
@@ -232,6 +238,8 @@ export type Expr =
       operand: Expr | null;
       whens: { cond: Expr; result: Expr }[];
       els: Expr | null;
+      // The CASE keyword's source character position.
+      loc?: SrcLoc;
     }
   // COALESCE(a, b, …) — the first non-NULL argument, lazily evaluated left to right like CASE
   // (spec/design/grammar.md §51). `args` has ≥1 entries (an empty list is 42601 at parse);
@@ -296,6 +304,9 @@ export type Expr =
       // COLLATE suffix; a bare integer is a constant, not an ordinal (PostgreSQL). Absent for every
       // other call (the key is only written when present, so an ordinary call's shape is unchanged).
       aggOrder?: OrderKey[] | null;
+      // The function name's source character position — a special form's keyword (SUBSTRING, the
+      // AT of AT TIME ZONE, …) (spec/design/error-fields.md §10.2).
+      loc?: SrcLoc;
     }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
@@ -305,13 +316,13 @@ export type Expr =
   | { kind: "exists"; query: QueryExpr }
   // `lhs [NOT] IN ( query_expr )` (spec/design/grammar.md §26) — membership of lhs in the
   // subquery's single output column (three-valued, like a literal IN).
-  | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean }
+  | { kind: "inSubquery"; lhs: Expr; query: QueryExpr; negated: boolean; loc?: SrcLoc }
   // `lhs op ANY/SOME/ALL ( array )` — a quantified array comparison (spec/design/array-functions.md
   // §11), the array spelling of IN. `op` is a comparison (eq/lt/gt/le/ge); `all` is true for ALL,
   // false for ANY/SOME (SOME folds to ANY at parse). The three-valued fold over the array's
   // flattened elements reuses the IN-list membership semantics, generalized to all five comparison
   // operators and both quantifiers.
-  | { kind: "quantified"; op: BinaryOp; all: boolean; lhs: Expr; array: Expr }
+  | { kind: "quantified"; op: BinaryOp; all: boolean; lhs: Expr; array: Expr; loc?: SrcLoc }
   // `lhs op ANY/SOME/ALL ( query_expr )` — the SUBQUERY form of the quantified comparison
   // (spec/design/array-functions.md §11.6), the subquery spelling of IN. Parallel to inSubquery: the
   // body's single column (42601 if >1) folds through the SAME three-valued fold as `quantified`.
@@ -322,6 +333,7 @@ export type Expr =
       all: boolean;
       lhs: Expr;
       query: QueryExpr;
+      loc?: SrcLoc;
     }
   // A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value from
   // the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The bare
@@ -858,6 +870,9 @@ export type AlterColumnAction = {
 export type Insert = {
   kind: "insert";
   table: string;
+  // The target name's source character position — the database qualifier's for `db.t`
+  // (spec/design/error-fields.md §10.2).
+  tableLoc?: SrcLoc;
   // The optional database qualifier on the target (`INSERT INTO reports.t …`), like TableRef.db
   // (spec/design/attached-databases.md §3). undefined = implicit scope.
   db?: string;
@@ -1155,6 +1170,9 @@ export type Select = {
 export type Update = {
   kind: "update";
   table: string;
+  // The target name's source character position — the database qualifier's for `db.t`
+  // (spec/design/error-fields.md §10.2).
+  tableLoc?: SrcLoc;
   // The optional database qualifier on the target (`UPDATE reports.t SET …`), like TableRef.db
   // (spec/design/attached-databases.md §3). undefined = implicit scope.
   db?: string;
@@ -1176,6 +1194,9 @@ export type Update = {
 export type Delete = {
   kind: "delete";
   table: string;
+  // The target name's source character position — the database qualifier's for `db.t`
+  // (spec/design/error-fields.md §10.2).
+  tableLoc?: SrcLoc;
   // The optional database qualifier on the target (`DELETE FROM reports.t …`), like TableRef.db
   // (spec/design/attached-databases.md §3). undefined = implicit scope.
   db?: string;

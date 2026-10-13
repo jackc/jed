@@ -213,9 +213,10 @@ function foldInt(magnitude: bigint, negate: boolean): bigint {
   return v;
 }
 
-// binaryExpr builds a binary-operator expression node.
-function binaryExpr(op: BinaryOp, lhs: Expr, rhs: Expr): Expr {
-  return { kind: "binary", op, lhs, rhs };
+// binaryExpr builds a binary-operator expression node; loc is the operator's source character
+// position (spec/design/error-fields.md §10.2).
+function binaryExpr(op: BinaryOp, lhs: Expr, rhs: Expr, loc: SrcLoc | undefined): Expr {
+  return { kind: "binary", op, lhs, rhs, loc };
 }
 
 // classifyOrderKey classifies a parsed ORDER BY key expression into one of the three OrderKey modes
@@ -2126,6 +2127,7 @@ class Parser {
   private parseInsert(): Insert {
     this.expectKeyword("insert");
     this.expectKeyword("into");
+    const tableLoc = this.here();
     const [db, table] = this.parseQualifiedTableName();
     // Optional target alias `AS alias` (spec/design/upsert.md §5). PostgreSQL requires the AS here
     // (no implicit alias), which also keeps a column list / source keyword unambiguous.
@@ -2193,6 +2195,7 @@ class Parser {
       return {
         kind: "insert",
         table,
+        tableLoc,
         db,
         ...(alias === undefined ? {} : { alias }),
         columns: [],
@@ -2220,6 +2223,7 @@ class Parser {
       return {
         kind: "insert",
         table,
+        tableLoc,
         db,
         ...(alias === undefined ? {} : { alias }),
         columns,
@@ -2243,6 +2247,7 @@ class Parser {
     return {
       kind: "insert",
       table,
+      tableLoc,
       db,
       ...(alias === undefined ? {} : { alias }),
       columns,
@@ -3820,6 +3825,7 @@ class Parser {
   // `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
   private parseUpdate(): Update {
     this.expectKeyword("update");
+    const tableLoc = this.here();
     const [db, table] = this.parseQualifiedTableName();
     this.expectKeyword("set");
 
@@ -3842,17 +3848,18 @@ class Parser {
 
     const filter = this.parseOptionalWhere();
     const returning = this.parseReturning();
-    return { kind: "update", table, db, assignments, filter, returning };
+    return { kind: "update", table, tableLoc, db, assignments, filter, returning };
   }
 
   // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
   private parseDelete(): Delete {
     this.expectKeyword("delete");
     this.expectKeyword("from");
+    const tableLoc = this.here();
     const [db, table] = this.parseQualifiedTableName();
     const filter = this.parseOptionalWhere();
     const returning = this.parseReturning();
-    return { kind: "delete", table, db, filter, returning };
+    return { kind: "delete", table, tableLoc, db, filter, returning };
   }
 
   // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
@@ -3989,8 +3996,9 @@ class Parser {
     let lhs = this.parseAnd();
     while (this.peekKeyword() === "or") {
       this.deepen(); // each chained OR is one more AST level
+      const loc = this.here();
       this.advance();
-      lhs = binaryExpr("or", lhs, this.parseAnd());
+      lhs = binaryExpr("or", lhs, this.parseAnd(), loc);
     }
     this.depth = base;
     return lhs;
@@ -4001,8 +4009,9 @@ class Parser {
     let lhs = this.parseNot();
     while (this.peekKeyword() === "and") {
       this.deepen(); // each chained AND is one more AST level
+      const loc = this.here();
       this.advance();
-      lhs = binaryExpr("and", lhs, this.parseNot());
+      lhs = binaryExpr("and", lhs, this.parseNot(), loc);
     }
     this.depth = base;
     return lhs;
@@ -4013,13 +4022,14 @@ class Parser {
     // starts with the relation label `not`, not the unary operator. The primary parser applies
     // the same rule before literals / CAST / CASE / current-date spellings.
     if (this.peekKeyword() === "not" && !this.atQualifiedColumnRef()) {
+      const loc = this.here();
       this.advance();
       // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so the
       // depth guard also protects the parser's own stack).
       this.deepen();
       const operand = this.parseNot();
       this.undeepen();
-      return { kind: "unary", op: "not", operand };
+      return { kind: "unary", op: "not", operand, loc };
     }
     return this.parseComparison();
   }
@@ -4032,6 +4042,7 @@ class Parser {
   private parseComparison(): Expr {
     const lhs = this.parseConcat();
     if (this.peekKeyword() === "is") {
+      const isLoc = this.here();
       this.advance();
       let negated = false;
       if (this.peekKeyword() === "not") {
@@ -4042,7 +4053,7 @@ class Parser {
       if (this.peekKeyword() === "distinct") {
         this.advance();
         this.expectKeyword("from");
-        return { kind: "isDistinct", lhs, rhs: this.parseConcat(), negated };
+        return { kind: "isDistinct", lhs, rhs: this.parseConcat(), negated, loc: isLoc };
       }
       // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
       // well-formedness predicate (json-sql-functions.md §5).
@@ -4092,6 +4103,8 @@ class Parser {
         this.peekKeywordAt(1) === "between" ||
         this.peekKeywordAt(1) === "like" ||
         this.peekKeywordAt(1) === "ilike");
+    // The operator's position: the `NOT` of a negated form, else the keyword (PostgreSQL's).
+    const opLoc = this.here();
     if (predNegated) {
       this.advance(); // NOT
     }
@@ -4104,7 +4117,7 @@ class Parser {
       if (this.atSubqueryStart()) {
         const query = this.parseSubquery();
         this.expect("rparen");
-        return { kind: "inSubquery", lhs, query, negated: predNegated };
+        return { kind: "inSubquery", lhs, query, negated: predNegated, loc: opLoc };
       }
       const list = [this.parseConcat()];
       while (this.peek().kind === "comma") {
@@ -4112,7 +4125,7 @@ class Parser {
         list.push(this.parseConcat());
       }
       this.expect("rparen");
-      return { kind: "in", lhs, list, negated: predNegated };
+      return { kind: "in", lhs, list, negated: predNegated, loc: opLoc };
     }
     if (this.peekKeyword() === "between") {
       this.advance();
@@ -4123,13 +4136,14 @@ class Parser {
       const lo = this.parseConcat();
       this.expectKeyword("and");
       const hi = this.parseConcat();
-      return { kind: "between", lhs, lo, hi, negated: predNegated };
+      return { kind: "between", lhs, lo, hi, negated: predNegated, loc: opLoc };
     }
     // LIKE / ILIKE (case-insensitive) — grammar.md §22. `ilike` is just another peeked keyword.
     // An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`; a bare NULL
     // or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
     if (this.peekKeyword() === "like" || this.peekKeyword() === "ilike") {
       const insensitive = this.peekKeyword() === "ilike";
+      const likeLoc = this.here();
       this.advance();
       let rhs = this.parseConcat();
       if (this.peekKeyword() === "escape") {
@@ -4143,9 +4157,10 @@ class Parser {
           star: false,
           distinct: false,
           variadic: false,
+          loc: likeLoc,
         };
       }
-      return { kind: "like", lhs, rhs, negated: predNegated, insensitive };
+      return { kind: "like", lhs, rhs, negated: predNegated, insensitive, loc: opLoc };
     }
     // `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
     // `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
@@ -4161,7 +4176,14 @@ class Parser {
       const rxInsensitive = rxKind === "tildeStar" || rxKind === "bangTildeStar";
       this.advance();
       const rhs = this.parseConcat();
-      return { kind: "regex", lhs, rhs, negated: rxNegated, insensitive: rxInsensitive };
+      return {
+        kind: "regex",
+        lhs,
+        rhs,
+        negated: rxNegated,
+        insensitive: rxInsensitive,
+        loc: opLoc,
+      };
     }
     let op: BinaryOp;
     switch (this.peek().kind) {
@@ -4200,13 +4222,13 @@ class Parser {
       if (this.atSubqueryStart()) {
         const query = this.parseSubquery();
         this.expect("rparen");
-        return { kind: "quantifiedSubquery", op, all, lhs, query };
+        return { kind: "quantifiedSubquery", op, all, lhs, query, loc: opLoc };
       }
       const array = this.parseExpr(); // a full expression resolving to an array
       this.expect("rparen");
-      return { kind: "quantified", op, all, lhs, array };
+      return { kind: "quantified", op, all, lhs, array, loc: opLoc };
     }
-    return binaryExpr(op, lhs, this.parseConcat());
+    return binaryExpr(op, lhs, this.parseConcat(), opLoc);
   }
 
   // parseConcat parses the "any other operator" level (grammar.md §39/§40, array-functions.md §8/§10):
@@ -4250,8 +4272,9 @@ class Parser {
         return lhs;
       }
       this.deepen(); // each chained operator is one more AST level
+      const loc = this.here();
       this.advance();
-      lhs = binaryExpr(op, lhs, this.parseAdditive());
+      lhs = binaryExpr(op, lhs, this.parseAdditive(), loc);
     }
   }
 
@@ -4267,8 +4290,9 @@ class Parser {
         return lhs;
       }
       this.deepen(); // each chained +/- is one more AST level (the `1+1+…` vector)
+      const loc = this.here();
       this.advance();
-      lhs = binaryExpr(op, lhs, this.parseMultiplicative());
+      lhs = binaryExpr(op, lhs, this.parseMultiplicative(), loc);
     }
   }
 
@@ -4285,8 +4309,9 @@ class Parser {
         return lhs;
       }
       this.deepen(); // each chained * / % is one more AST level
+      const loc = this.here();
       this.advance();
-      lhs = binaryExpr(op, lhs, this.parseAtTimeZone());
+      lhs = binaryExpr(op, lhs, this.parseAtTimeZone(), loc);
     }
   }
 
@@ -4305,6 +4330,7 @@ class Parser {
       this.peekKeywordAt(2) === "zone"
     ) {
       this.deepen(); // each chained AT TIME ZONE is one more AST level
+      const at = this.here();
       this.advance(); // AT
       this.advance(); // TIME
       this.advance(); // ZONE
@@ -4317,6 +4343,7 @@ class Parser {
         star: false,
         distinct: false,
         variadic: false,
+        loc: at,
       };
     }
     this.depth = base;
@@ -4325,6 +4352,7 @@ class Parser {
 
   private parseUnary(): Expr {
     if (this.peek().kind === "minus") {
+      const minus = this.here();
       this.advance();
       // Fold unary-minus-of-an-integer-literal into one negative literal, so i64's
       // minimum is representable and the literal range-checks against context. SUPPRESSED
@@ -4333,7 +4361,7 @@ class Parser {
       // (grammar.md §37). A one-token lookahead on the token AFTER the literal.
       if (this.peek().kind === "int" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
         const v = foldInt(this.advance().int!, true);
-        return { kind: "literal", literal: { kind: "int", int: v } };
+        return { kind: "literal", literal: { kind: "int", int: v }, loc: minus };
       }
       // Fold unary-minus of a decimal literal into one negative decimal literal (decimal
       // negation never overflows). Same `::` suppression.
@@ -4345,6 +4373,7 @@ class Parser {
             kind: "decimal",
             dec: Decimal.fromDigitsScale(true, t.decDigits!, t.decScale!),
           },
+          loc: minus,
         };
       }
       // each chained unary `-` is one more AST level (recursion here, so the depth guard also
@@ -4352,7 +4381,7 @@ class Parser {
       this.deepen();
       const operand = this.parseUnary();
       this.undeepen();
-      return { kind: "unary", op: "neg", operand };
+      return { kind: "unary", op: "neg", operand, loc: minus };
     }
     return this.parsePostfix();
   }
@@ -4560,8 +4589,9 @@ class Parser {
       this.tokens[this.pos + 1]?.kind === "str"
     ) {
       const typeName = this.expectIdentifier(); // the named type (folded or quoted — exact)
+      const loc = this.here();
       const t = this.advance();
-      return { kind: "typedLiteral", typeName, text: t.str! };
+      return { kind: "typedLiteral", typeName, text: t.str!, loc };
     }
     // The two-word `character varying '...'` typed literal (types.md §15).
     if (
@@ -4570,8 +4600,9 @@ class Parser {
       this.tokens[this.pos + 2]?.kind === "str"
     ) {
       const typeName = this.expectTypeName();
+      const loc = this.here();
       const t = this.advance();
-      return { kind: "typedLiteral", typeName, text: t.str! };
+      return { kind: "typedLiteral", typeName, text: t.str!, loc };
     }
     // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
     // (json-sql-functions.md §5, S2) — keyword-led primaries with sub-clauses, recognized when the
@@ -4636,6 +4667,7 @@ class Parser {
       return { kind: "jsonCtor", operand, uniqueKeys };
     }
     if (this.peekKeyword() === "cast") {
+      const loc = this.here();
       this.advance();
       this.expect("lparen");
       const inner = this.parseExpr();
@@ -4644,7 +4676,7 @@ class Parser {
       const typeMod = this.parseTypeMod();
       const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
       this.expect("rparen");
-      return { kind: "cast", inner, typeName, typeMod };
+      return { kind: "cast", inner, typeName, typeMod, loc };
     }
     // EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
     // is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
@@ -4712,6 +4744,7 @@ class Parser {
       }
     }
     if (this.peekKeyword() === "case") {
+      const caseLoc = this.here();
       this.advance();
       // Simple form has an operand between CASE and the first WHEN; the searched form starts
       // directly with WHEN (grammar.md §23).
@@ -4733,9 +4766,11 @@ class Parser {
         els = this.parseExpr();
       }
       this.expectKeyword("end");
-      return { kind: "case", operand, whens, els };
+      return { kind: "case", operand, whens, els, loc: caseLoc };
     }
     const t = this.peek();
+    // The primary token's source character position (spec/design/error-fields.md §10.2).
+    const primLoc = this.here();
     if (t.kind === "param") {
       return { kind: "param", index: this.advance().paramIndex! };
     }
@@ -4743,7 +4778,7 @@ class Parser {
       // The only magnitude > i64 max the lexer admits is 2^63, which fits no signed
       // integer type unless negated (handled by the unary-minus fold).
       const v = foldInt(this.advance().int!, false);
-      return { kind: "literal", literal: { kind: "int", int: v } };
+      return { kind: "literal", literal: { kind: "int", int: v }, loc: primLoc };
     }
     if (t.kind === "decimal") {
       this.advance();
@@ -4753,25 +4788,26 @@ class Parser {
           kind: "decimal",
           dec: Decimal.fromDigitsScale(false, t.decDigits!, t.decScale!),
         },
+        loc: primLoc,
       };
     }
     if (t.kind === "str") {
       this.advance();
-      return { kind: "literal", literal: { kind: "text", text: t.str! } };
+      return { kind: "literal", literal: { kind: "text", text: t.str! }, loc: primLoc };
     }
     if (t.kind === "word") {
       const w = t.word!;
       if (w === "null") {
         this.advance();
-        return { kind: "literal", literal: { kind: "null" } };
+        return { kind: "literal", literal: { kind: "null" }, loc: primLoc };
       }
       if (w === "true") {
         this.advance();
-        return { kind: "literal", literal: { kind: "bool", value: true } };
+        return { kind: "literal", literal: { kind: "bool", value: true }, loc: primLoc };
       }
       if (w === "false") {
         this.advance();
-        return { kind: "literal", literal: { kind: "bool", value: false } };
+        return { kind: "literal", literal: { kind: "bool", value: false }, loc: primLoc };
       }
       // `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the value
       // literals above. Pure sugar: desugar to a `now()` call so resolution / execution / cost /
@@ -4787,6 +4823,7 @@ class Parser {
           star: false,
           distinct: false,
           variadic: false,
+          loc: primLoc,
         };
       }
       // `current_date` — the SQL-standard bare keyword, desugared to the current_date() catalog
@@ -4803,6 +4840,7 @@ class Parser {
           star: false,
           distinct: false,
           variadic: false,
+          loc: primLoc,
         };
       }
       // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
@@ -4849,6 +4887,7 @@ class Parser {
     // (below).
     const substringForm = this.peek().kind === "word" && this.peek().word === "substring";
     const overlayForm = this.peek().kind === "word" && this.peek().word === "overlay";
+    const loc = this.here();
     const name = this.expectIdentifier();
     this.expect("lparen");
     // A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct argument
@@ -4924,7 +4963,7 @@ class Parser {
           args.length === 1 &&
           (this.peekKeyword() === "from" || this.peekKeyword() === "for")
         ) {
-          return this.parseSubstringTail(name, args[0]!);
+          return this.parseSubstringTail(name, args[0]!, loc);
         }
         // `OVERLAY(s PLACING r FROM start [FOR count])` (grammar.ebnf `overlay_expr`,
         // string-functions.md §3): a PLACING keyword after the first positional argument selects
@@ -4936,7 +4975,7 @@ class Parser {
           args.length === 1 &&
           this.peekKeyword() === "placing"
         ) {
-          return this.parseOverlayTail(name, args[0]!);
+          return this.parseOverlayTail(name, args[0]!, loc);
         }
         if (this.peekKeyword() === "order") {
           aggOrder = this.parseOrderBy(false);
@@ -5014,6 +5053,7 @@ class Parser {
           withinGroup,
           // Present only when written, so an ordinary call's AST shape is unchanged.
           ...(aggOrder !== null ? { aggOrder } : {}),
+          loc,
         };
       }
       this.expect("lparen");
@@ -5035,6 +5075,7 @@ class Parser {
       overName,
       withinGroup,
       ...(aggOrder !== null ? { aggOrder } : {}),
+      loc,
     };
   }
 
@@ -5045,6 +5086,7 @@ class Parser {
   // taken as an IN predicate; anything else after the first operand (a comma) is 42601, as in
   // PostgreSQL.
   private parsePositionForm(): Expr {
+    const loc = this.here();
     const name = this.expectIdentifier();
     this.expect("lparen");
     this.deepen();
@@ -5061,6 +5103,7 @@ class Parser {
       star: false,
       distinct: false,
       variadic: false,
+      loc,
     };
   }
 
@@ -5068,7 +5111,7 @@ class Parser {
   // count])` (grammar.ebnf `overlay_expr`), the cursor on PLACING. Desugars to the ordinary call
   // `overlay(s, r, start[, count])` — PostgreSQL's rewrite. FROM is required. No FILTER / OVER may
   // follow (the form is not a function application).
-  private parseOverlayTail(name: string, source: Expr): Expr {
+  private parseOverlayTail(name: string, source: Expr, loc: SrcLoc | undefined): Expr {
     this.expectKeyword("placing");
     const replacement = this.parseExpr();
     this.expectKeyword("from");
@@ -5086,6 +5129,7 @@ class Parser {
       star: false,
       distinct: false,
       variadic: false,
+      loc,
     };
   }
 
@@ -5093,7 +5137,7 @@ class Parser {
   // `SUBSTRING(x FOR l [FROM s])` (grammar.ebnf `substring_expr`), the cursor on FROM or FOR.
   // Desugars to the ordinary call `substring(x, s[, l])` — PostgreSQL's rewrite — with a FOR-only
   // form starting at 1. No FILTER / OVER may follow (the form is not a function application).
-  private parseSubstringTail(name: string, source: Expr): Expr {
+  private parseSubstringTail(name: string, source: Expr, loc: SrcLoc | undefined): Expr {
     let start: Expr | null = null;
     let count: Expr | null = null;
     if (this.peekKeyword() === "from") {
@@ -5122,6 +5166,7 @@ class Parser {
       star: false,
       distinct: false,
       variadic: false,
+      loc,
     };
   }
 

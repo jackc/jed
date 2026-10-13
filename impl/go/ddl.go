@@ -918,7 +918,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			return outcome{}, err
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
-			return outcome{}, typeError("argument of CHECK must be boolean")
+			return outcome{}, positionError(typeError("argument of CHECK must be boolean"), exprLocation(def.Expr))
 		}
 		// Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a component
 		// identity (42P17), and the resolved dependencies persist with the check.

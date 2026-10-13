@@ -239,6 +239,7 @@ import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
 import {
   checkViolation,
   EngineError,
+  atPosition,
   engineError,
   exclusionViolation,
   fkViolationDelete,
@@ -246,6 +247,7 @@ import {
   fkViolationMatchFull,
   notNullViolation,
   pkeyName,
+  positionedAt,
   stampTable,
   uniqueViolation,
 } from "./errors.ts";
@@ -455,6 +457,8 @@ import {
   coerceSetopRows,
   combineSetop,
   exprEqual,
+  exprLocation,
+  outputColumnLocation,
   requireAssignable,
   resolveSetopOrderKey,
   resolveTypeAndTypmod,
@@ -2019,6 +2023,17 @@ export class Engine {
   // named relation lives in the claimed database (else 42P01), and the downstream temp-first funnel
   // then resolves it to the matching scope. An undefined qualifier (a bare, implicit-scope name) always
   // passes. The qualifier is matched byte-exactly (a bare spelling is already folded — grammar.md §3).
+  // checkTargetQualifier is checkTableQualifier for a DML target: its 42P01 points at the target's
+  // name (spec/design/error-fields.md §10.2).
+  private checkTargetQualifier(qualifier: string | undefined, name: string, loc: number | undefined): void {
+    try {
+      this.checkTableQualifier(qualifier, name);
+    } catch (err) {
+      if (err instanceof EngineError) err.atTarget(loc);
+      throw err;
+    }
+  }
+
   private checkTableQualifier(qualifier: string | undefined, name: string): void {
     if (qualifier === undefined) {
       return;
@@ -4697,7 +4712,7 @@ export class Engine {
     if (inner.kind === "insert") {
       // A write through an updatable view estimates its base-table statement (views.md §15.5).
       const ins = this.rewriteInsertTarget(inner).ins;
-      if (this.lkpTableScoped(ins.db, ins.table) === undefined) throw engineError("undefined_table", "table does not exist: " + ins.table);
+      if (this.lkpTableScoped(ins.db, ins.table) === undefined) throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
       const source = ins.source.kind === "query"
         ? this.estimateQueryPlan(
             this.planQuery(ins.source.query, null, bindings, new ParamTypes()),
@@ -4712,7 +4727,7 @@ export class Engine {
       if (inner.kind === "update") ({ upd: stmt, vw } = this.rewriteUpdateTarget(inner));
       else ({ del: stmt, vw } = this.rewriteDeleteTarget(inner));
       const table = this.lkpTableScoped(stmt.db, stmt.table);
-      if (table === undefined) throw engineError("undefined_table", "table does not exist: " + stmt.table);
+      if (table === undefined) throw engineError("undefined_table", "table does not exist: " + stmt.table).atTarget(stmt.tableLoc);
       const filter = this.explainDmlFilter(table, stmt.filter, bindings, vw);
       const scan = this.estimateMutationScan(table, stmt.db, filter, ctx);
       return parentEstimatedPlan(scan.root, scan).nodes;
@@ -5060,7 +5075,7 @@ export class Engine {
     // A write through an updatable view renders its base-table statement (views.md §15.5).
     const ins = this.rewriteInsertTarget(written).ins;
     if (this.lkpTable(ins.table) === undefined) {
-      throw engineError("undefined_table", "table does not exist: " + ins.table);
+      throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
     }
     r.emit(depth, "Insert " + ins.table, insertDetail(ins));
     if (ins.source.kind === "query") {
@@ -5084,7 +5099,7 @@ export class Engine {
     const { upd, vw } = this.rewriteUpdateTarget(written);
     const table = this.lkpTable(upd.table);
     if (table === undefined) {
-      throw engineError("undefined_table", "table does not exist: " + upd.table);
+      throw engineError("undefined_table", "table does not exist: " + upd.table).atTarget(upd.tableLoc);
     }
     const filter = this.explainDmlFilter(table, upd.filter, bindings, vw);
     r.emit(depth, "Update " + upd.table, `sets=${upd.assignments.length}`);
@@ -5110,7 +5125,7 @@ export class Engine {
     const { del, vw } = this.rewriteDeleteTarget(written);
     const table = this.lkpTable(del.table);
     if (table === undefined) {
-      throw engineError("undefined_table", "table does not exist: " + del.table);
+      throw engineError("undefined_table", "table does not exist: " + del.table).atTarget(del.tableLoc);
     }
     const filter = this.explainDmlFilter(table, del.filter, bindings, vw);
     r.emit(depth, "Delete " + del.table, "-");
@@ -6188,7 +6203,7 @@ export class Engine {
         new ParamTypes(),
       );
       if (type.kind !== "bool" && type.kind !== "null") {
-        throw typeError("argument of CHECK must be boolean");
+        throw positionedAt(typeError("argument of CHECK must be boolean"), exprLocation(def.expr));
       }
       // Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a component
       // identity (42P17), and the resolved dependencies persist with the check.
@@ -7535,7 +7550,10 @@ export class Engine {
                 new ParamTypes(),
               );
               if (rt.kind !== "bool" && rt.kind !== "null")
-                throw typeError("argument of CHECK must be boolean");
+                throw positionedAt(
+                  typeError("argument of CHECK must be boolean"),
+                  exprLocation(d.expr),
+                );
               const hostDeps = collectCheckHostDeps(rn, this.session.extensions);
               let name: string;
               if (d.name === null) {
@@ -10011,8 +10029,11 @@ export class Engine {
       if (col.type.kind === "scalar") {
         const { node, type } = resolve(scope, value.expr, col.type.scalar, forbidden, ptypes);
         if (!assignableTo(type, col.type.scalar)) {
-          throw typeError(
-            `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+          throw positionedAt(
+            typeError(
+              `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+            ),
+            exprLocation(value.expr),
           );
         }
         out[p] = node;
@@ -10027,8 +10048,11 @@ export class Engine {
           );
         }
         if (type.kind !== "null" && !resolvedTypeEqual(type, resolvedTypeOfCol(col.type, this))) {
-          throw typeError(
-            `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+          throw positionedAt(
+            typeError(
+              `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+            ),
+            exprLocation(value.expr),
           );
         }
         out[p] = node;
@@ -10092,9 +10116,9 @@ export class Engine {
     // dispatch already checked lifetime admission and privileges for this execution.
     checkCatalogRelWrite(ins.table);
     this.checkAttachmentWritable(ins.db);
-    this.checkTableQualifier(ins.db, ins.table);
+    this.checkTargetQualifier(ins.db, ins.table, ins.tableLoc);
     const table = this.lkpTableScoped(ins.db, ins.table);
-    if (!table) throw engineError("undefined_table", "table does not exist: " + ins.table);
+    if (!table) throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
     this.ensureCollationsWritable(table.columns);
 
     const signature = this.insertTargetSignature(ins.db, ins.table);
@@ -10354,7 +10378,7 @@ export class Engine {
     // A write through an updatable view inserts into its base table (views.md §15); a view that is
     // not updatable is 55000.
     const { ins, vw } = this.rewriteInsertTarget(written);
-    this.checkTableQualifier(ins.db, ins.table); // attached-databases.md §3
+    this.checkTargetQualifier(ins.db, ins.table, ins.tableLoc); // attached-databases.md §3
     // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md §8):
     // the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
     if (ins.onConflict !== null && isAttachmentScope(ins.db)) {
@@ -10365,7 +10389,7 @@ export class Engine {
     }
     const table = this.lkpTableScoped(ins.db, ins.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + ins.table);
+      throw engineError("undefined_table", "table does not exist: " + ins.table).atTarget(ins.tableLoc);
     }
     // Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
     // maintained B-tree would mix two orderings (collation.md §12, XX002).
@@ -10526,8 +10550,11 @@ export class Engine {
           continue;
         }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
-          throw typeError(
-            `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
+          throw positionedAt(
+            typeError(
+              `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
+            ),
+            outputColumnLocation(ins.source.query, p),
           );
         }
       }
@@ -11270,7 +11297,7 @@ export class Engine {
           { collecting: false, groupKeys: [], specs: [] },
           ptypes,
         );
-        requireAssignable(type, targetScalar, a.column);
+        atPosition(exprLocation(a.value), () => requireAssignable(type, targetScalar, a.column));
         source = node;
       }
       plans.push({
@@ -12118,10 +12145,10 @@ export class Engine {
     // A write through an updatable view deletes from its base table (views.md §15); a view that is
     // not updatable is 55000.
     const { del, vw } = this.rewriteDeleteTarget(written);
-    this.checkTableQualifier(del.db, del.table); // attached-databases.md §3
+    this.checkTargetQualifier(del.db, del.table, del.tableLoc); // attached-databases.md §3
     const table = this.lkpTableScoped(del.db, del.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + del.table);
+      throw engineError("undefined_table", "table does not exist: " + del.table).atTarget(del.tableLoc);
     }
     // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): a
     // DELETE must locate + remove a stored key, which a skewed encoding cannot match.
@@ -12320,10 +12347,10 @@ export class Engine {
     // A write through an updatable view updates its base table (views.md §15); a view that is not
     // updatable is 55000.
     const { upd, vw } = this.rewriteUpdateTarget(written);
-    this.checkTableQualifier(upd.db, upd.table); // attached-databases.md §3
+    this.checkTargetQualifier(upd.db, upd.table, upd.tableLoc); // attached-databases.md §3
     const table = this.lkpTableScoped(upd.db, upd.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + upd.table);
+      throw engineError("undefined_table", "table does not exist: " + upd.table).atTarget(upd.tableLoc);
     }
     // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): an
     // UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
@@ -12428,7 +12455,7 @@ export class Engine {
           { collecting: false, groupKeys: [], specs: [] },
           ptypes,
         );
-        requireAssignable(type, targetScalar, a.column);
+        atPosition(exprLocation(a.value), () => requireAssignable(type, targetScalar, a.column));
         plans.push({
           idx,
           name: col.name,
@@ -13116,7 +13143,9 @@ export class Engine {
           : this.rewriteDeleteTarget(body).vw;
     const tdef = this.lkpTable(vw === null ? tableName : vw.table); // temp-first (temp-tables.md §3)
     if (tdef === undefined) {
-      throw engineError("undefined_table", "table does not exist: " + tableName);
+      throw engineError("undefined_table", "table does not exist: " + tableName).atTarget(
+        body.tableLoc,
+      );
     }
     if (returning === null) {
       const table = cteSyntheticTableCols(lname, [], [], null, null, rename);
@@ -14786,9 +14815,14 @@ export class Engine {
         `each ${setopName(so.op)} query must have the same number of columns`,
       );
     }
-    const columnTypes = lhs.columnTypes.map((l, i) =>
-      unifySetopColumn(l, rhs.columnTypes[i]!, so.op),
-    );
+    // A mismatch is located at the right operand's column (PostgreSQL's select_common_type).
+    const columnTypes = lhs.columnTypes.map((l, i) => {
+      try {
+        return unifySetopColumn(l, rhs.columnTypes[i]!, so.op);
+      } catch (err) {
+        throw positionedAt(err, outputColumnLocation(so.rhs, i));
+      }
+    });
     // Every form but UNION ALL matches rows, so each column needs an equality operator (42883 for
     // json / jsonpath, as PostgreSQL).
     if (so.op !== "union" || !so.all) for (const t of columnTypes) requireSetopEquality(t);
@@ -14954,7 +14988,10 @@ export class Engine {
         colDerivs[ci]!.push(deriveCollation(scope, val));
         colTypmods[ci]!.push(deriveTypmod(scope, val));
         if (ri === 0) colTypes.push(type);
-        else colTypes[ci] = unifyValuesColumn(colTypes[ci]!, type);
+        else
+          colTypes[ci] = atPosition(exprLocation(val), () =>
+            unifyValuesColumn(colTypes[ci]!, type),
+          );
         resolvedRow.push(node);
       });
       resolvedRows.push(resolvedRow);
@@ -15225,15 +15262,24 @@ export class Engine {
         // scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query /
         // params — functions.md §10), or inside a fenced parenthesized join its lateral view (§15).
         const srfParent = lateralEligible ? lateralParent : lateralParentScope;
-        const r = this.resolveSRF(
-          tref.name,
-          tref.args,
-          tref.alias,
-          tref.columnDefs ?? null,
-          srfParent,
-          ctes,
-          ptypes,
-        );
+        let r: ReturnType<typeof this.resolveSRF>;
+        try {
+          r = this.resolveSRF(
+            tref.name,
+            tref.args,
+            tref.alias,
+            tref.columnDefs ?? null,
+            srfParent,
+            ctes,
+            ptypes,
+          );
+        } catch (err) {
+          // A table function's own 42883 (no function for these argument types) points at its name,
+          // like a call in an expression (spec/design/error-fields.md §10.2); an argument's error
+          // keeps its own.
+          if (err instanceof EngineError && err.state === "undefined_function") err.locate(tref.loc);
+          throw err;
+        }
         applySrfColumnAliases(r.table, tref.alias ?? tref.name, tref.columnAliases ?? null);
         t = r.table;
         srf = r.srf;
@@ -15745,7 +15791,7 @@ export class Engine {
       };
       const { node, type } = resolve(scope, sel.having, null, hctx, ptypes);
       if (type.kind !== "bool" && type.kind !== "null") {
-        throw typeError("argument of HAVING must be boolean");
+        throw positionedAt(typeError("argument of HAVING must be boolean"), exprLocation(sel.having));
       }
       having = node;
       aggSpecs = hctx.specs;
@@ -32003,7 +32049,7 @@ function resolveAggFilter(scope: Scope, filter: Expr | null, params: ParamTypes)
   const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
   const rf = resolve(scope, filter, null, fsub, params);
   if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
-    throw typeError("argument of FILTER must be type boolean");
+    throw positionedAt(typeError("argument of FILTER must be type boolean"), exprLocation(filter));
   }
   return rf.node;
 }
@@ -32213,7 +32259,7 @@ export function resolveOrderedSetAggregate(
     const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const rf = resolve(scope, e.filter, null, fsub, params);
     if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
-      throw typeError("argument of FILTER must be type boolean");
+      throw positionedAt(typeError("argument of FILTER must be type boolean"), exprLocation(e.filter));
     }
     filter = rf.node;
   }
@@ -32648,7 +32694,10 @@ export function resolveWindowCall(
       const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
       const rf = resolve(scope, e.filter, null, fsub, params);
       if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
-        throw typeError("argument of FILTER must be type boolean");
+        throw positionedAt(
+          typeError("argument of FILTER must be type boolean"),
+          exprLocation(e.filter),
+        );
       }
       rfilter = rf.node;
     }

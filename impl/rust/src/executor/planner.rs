@@ -288,7 +288,8 @@ impl Engine {
                         Some(&prefix),
                         ctes,
                         ptypes,
-                    )?
+                    )
+                    .map_err(|e| locate_srf_error(e, tref))?
                 } else {
                     self.resolve_srf(
                         &tref.name,
@@ -298,7 +299,8 @@ impl Engine {
                         lateral_parent,
                         ctes,
                         ptypes,
-                    )?
+                    )
+                    .map_err(|e| locate_srf_error(e, tref))?
                 };
                 apply_srf_column_aliases(
                     &mut table,
@@ -735,10 +737,11 @@ impl Engine {
                             name: name.clone(),
                             pos: SrcPos::NONE,
                         },
+                        SrcPos::NONE,
                     );
                     pred_ast = Some(match pred_ast {
                         None => eq,
-                        Some(p) => binary_expr(BinaryOp::And, p, eq),
+                        Some(p) => binary_expr(BinaryOp::And, p, eq, SrcPos::NONE),
                     });
                     let mi = if matches!(j.kind, JoinKind::Right) {
                         ri
@@ -1113,7 +1116,10 @@ impl Engine {
                 }
                 match ty {
                     ResolvedType::Bool | ResolvedType::Null => Some(node),
-                    _ => return Err(type_error("argument of HAVING must be boolean")),
+                    _ => {
+                        return Err(type_error("argument of HAVING must be boolean")
+                            .with_position(h.location().0));
+                    }
                 }
             }
             None => None,
@@ -2111,5 +2117,15 @@ fn derived_join_group(plan: Option<&QueryPlan>) -> Option<&JoinGroupLayout> {
     match plan {
         Some(QueryPlan::Select(sel)) => sel.group.as_ref(),
         _ => None,
+    }
+}
+
+/// A table function's own `42883` (no function for these argument types) points at its name, like a
+/// call in an expression (spec/design/error-fields.md §10.2); an argument's error keeps its own.
+fn locate_srf_error(e: EngineError, tref: &TableRef) -> EngineError {
+    if e.state == SqlState::UndefinedFunction {
+        e.locate(tref.pos.src.0)
+    } else {
+        e
     }
 }

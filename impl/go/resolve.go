@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -1165,7 +1166,7 @@ func resolveBooleanFilter(s *scope, e *exprNode, params *paramTypes) (*rExpr, er
 		return nil, err
 	}
 	if ty.kind != rtBool && ty.kind != rtNull {
-		return nil, typeError("argument of WHERE must be boolean")
+		return nil, positionError(typeError("argument of WHERE must be boolean"), exprLocation(*e))
 	}
 	return node, nil
 }
@@ -1279,6 +1280,102 @@ func resolveSubscriptIntPtr(s *scope, e *exprNode, ag *aggCtx, params *paramType
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
 // defaults a bare literal to i64.
 func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	r, ty, err := resolveNode(s, e, ctx, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, locateNodeError(err, e)
+	}
+	return r, ty, nil
+}
+
+// locateNodeError decides the position of an error leaving node e's resolution
+// (spec/design/error-fields.md §10.2). A function call's 42883 points at its name; an operator's
+// 42883 / 42804 (no operator for these operand types) points at the operator. AND / OR / NOT name the
+// offending operand instead, at their raise site. A string literal's input error points at the
+// literal. An error an operand raised was already decided by that operand's own resolution, so the
+// enclosing node never claims it.
+func locateNodeError(err error, e exprNode) error {
+	var ee *EngineError
+	if !errors.As(err, &ee) {
+		return err
+	}
+	operatorError := ee.State == UndefinedFunction || ee.State == DatatypeMismatch
+	var pos srcPos
+	switch e.Kind {
+	case exprFuncCall:
+		if ee.State == UndefinedFunction {
+			pos = e.Pos
+		}
+	case exprBinary:
+		if operatorError && e.Binary.Op != opAnd && e.Binary.Op != opOr {
+			pos = e.Pos
+		}
+	case exprUnary:
+		if operatorError && e.Unary.Op == opNeg {
+			pos = e.Pos
+		}
+	case exprIsDistinct, exprLike, exprRegex, exprInSubquery, exprQuantified, exprQuantifiedSubquery:
+		if operatorError {
+			pos = e.Pos
+		}
+	case exprLiteral:
+		// A string literal adapting to its context (a uuid / bytea / date / json … sibling) is
+		// input-converted here, like PostgreSQL's parse-time coercion of an unknown literal.
+		if e.Literal.Kind == literalText {
+			pos = e.Pos
+		}
+	}
+	return locateError(err, pos)
+}
+
+// exprLocation is an expression's location for an error that names the whole expression —
+// PostgreSQL's exprLocation, the leftmost character the expression was written at, its folded
+// grouping parentheses excluded (spec/design/error-fields.md §10.2). 0 when jed did not record it (a
+// bind parameter, a subquery, a constructor keyword, stored text): the error then carries no position
+// rather than a wrong one.
+func exprLocation(e exprNode) srcPos {
+	switch e.Kind {
+	case exprColumn, exprQualifiedColumn, exprLiteral, exprTypedLiteral, exprUnary, exprCase, exprFuncCall:
+		return e.Pos
+	case exprCast:
+		// A `::` cast is located at its operand (the leftmost token). CAST(x AS t) is located at a
+		// string or NULL literal operand (PostgreSQL coerces it in place); any other operand's
+		// location depends on whether the coercion is a no-op, so it is unknown.
+		in := e.Cast.Inner
+		if e.Pos == 0 || (in.Kind == exprLiteral && (in.Literal.Kind == literalText || in.Literal.Kind == literalNull)) {
+			return exprLocation(in)
+		}
+		return 0
+	case exprCollate:
+		return exprLocation(e.Collate.Inner)
+	case exprFieldAccess, exprSubscript:
+		return exprLocation(*e.Base)
+	case exprIsNull:
+		return exprLocation(e.IsNullOf.Operand)
+	case exprIsJson:
+		return exprLocation(e.IsJsonOf.Operand)
+	case exprBinary:
+		return exprLocation(e.Binary.Lhs)
+	case exprIsDistinct:
+		return exprLocation(e.IsDistinct.Lhs)
+	case exprIn:
+		return exprLocation(e.In.Lhs)
+	case exprBetween:
+		return exprLocation(e.Between.Lhs)
+	case exprLike:
+		return exprLocation(e.Like.Lhs)
+	case exprRegex:
+		return exprLocation(e.Regex.Lhs)
+	case exprInSubquery:
+		return exprLocation(e.InSubquery.Lhs)
+	case exprQuantified:
+		return exprLocation(e.Quantified.Lhs)
+	case exprQuantifiedSubquery:
+		return exprLocation(e.QuantifiedSubquery.Lhs)
+	}
+	return 0
+}
+
+func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
 	// matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT a+b
 	// … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own path
@@ -1436,7 +1533,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		}
 		common, err := unifyArrayElementTypes(elemTypes)
 		if err != nil {
-			return nil, resolvedType{}, err
+			return nil, resolvedType{}, positionError(err, mismatchLocation(elemTypes, e.RowItems, arrayElementTypesUnify))
 		}
 		// If the items are themselves arrays, this is a nested (multidim-stacking) constructor and
 		// the result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D
@@ -1649,7 +1746,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			iz := s.catalog.inputZone()
 			node, rt, err := coerceStringToComposite(e.TypeLitText, ct, s.catalog, iz)
 			params.noteInputZone(iz)
-			return node, rt, err
+			return node, rt, positionError(err, e.Pos)
 		}
 		// A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
 		// against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
@@ -1657,7 +1754,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			iz := s.catalog.inputZone()
 			node, rt, err := coerceStringToRangeExpr(e.TypeLitText, desc, iz)
 			params.noteInputZone(iz)
-			return node, rt, err
+			return node, rt, positionError(err, e.Pos)
 		}
 		target, _, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
@@ -1673,7 +1770,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		iz := s.catalog.inputZone()
 		node, rt, err := coerceStringLiteral(e.TypeLitText, target, nil, nil, iz)
 		params.noteInputZone(iz)
-		return node, rt, err
+		return node, rt, positionError(err, e.Pos)
 	case exprScalarSubquery:
 		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
@@ -1796,7 +1893,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				iz := s.catalog.inputZone()
 				val, err := coerceStringToArray(in.Literal.Str, elemCol, iz)
 				if err != nil {
-					return nil, resolvedType{}, err
+					return nil, resolvedType{}, positionError(err, in.Pos)
 				}
 				params.noteInputZone(iz)
 				return valueToRExpr(val), resolvedType{kind: rtArray, elem: &elemRT}, nil
@@ -1863,7 +1960,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				iz := s.catalog.inputZone()
 				node, rt, err := coerceStringToRangeExpr(in.Literal.Str, desc, iz)
 				params.noteInputZone(iz)
-				return node, rt, err
+				return node, rt, positionError(err, in.Pos)
 			}
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalNull {
 				return &rExpr{kind: reConstNull}, resolvedType{kind: rtRange, elem: &elemRT}, nil
@@ -1886,7 +1983,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				iz := s.catalog.inputZone()
 				node, rt, err := coerceStringToComposite(in.Literal.Str, ct, s.catalog, iz)
 				params.noteInputZone(iz)
-				return node, rt, err
+				return node, rt, positionError(err, in.Pos)
 			}
 			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 			if err != nil {
@@ -1921,9 +2018,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				}
 			}
 			iz := s.catalog.inputZone()
+			// The literal's input error points at the literal (PostgreSQL coerces it at parse time —
+			// spec/design/error-fields.md §10.2).
 			node, rt, err := coerceStringLiteral(in.Literal.Str, target, typmod, varcharLen, iz)
 			params.noteInputZone(iz)
-			return node, rt, err
+			return node, rt, positionError(err, in.Pos)
 		}
 		// The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
 		// text/json/jsonb expression (a string LITERAL operand was already coerced above by
@@ -2231,7 +2330,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			return nil, resolvedType{}, err
 		}
 		if err := requireBool(ty, "NOT requires a boolean operand"); err != nil {
-			return nil, resolvedType{}, err
+			return nil, resolvedType{}, positionError(err, exprLocation(e.Unary.Operand))
 		}
 		return &rExpr{kind: reNot, operand: rop}, resolvedType{kind: rtBool}, nil
 	case exprIsNull:
@@ -2323,15 +2422,15 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// cost consequence, cost.md §3).
 		var folded exprNode
 		for i, elem := range e.In.List {
-			eq := newBinaryExpr(opEq, e.In.Lhs, elem)
+			eq := newBinaryExpr(opEq, e.In.Lhs, elem, e.Pos)
 			if i == 0 {
 				folded = eq
 			} else {
-				folded = newBinaryExpr(opOr, folded, eq)
+				folded = newBinaryExpr(opOr, folded, eq, e.Pos)
 			}
 		}
 		if e.In.Negated {
-			folded = exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: folded}}
+			folded = exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: folded}, Pos: e.Pos}
 		}
 		return resolve(s, folded, ctx, ag, params)
 	case exprBetween:
@@ -2340,11 +2439,12 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL. NOT BETWEEN
 		// negates the whole conjunction. The LHS is evaluated twice (the desugar model — a
 		// documented cost consequence, cost.md §3).
-		ge := newBinaryExpr(opGe, e.Between.Lhs, e.Between.Lo)
-		le := newBinaryExpr(opLe, e.Between.Lhs, e.Between.Hi)
-		folded := newBinaryExpr(opAnd, ge, le)
+		// The desugared comparisons carry the BETWEEN's operator position (PostgreSQL's).
+		ge := newBinaryExpr(opGe, e.Between.Lhs, e.Between.Lo, e.Pos)
+		le := newBinaryExpr(opLe, e.Between.Lhs, e.Between.Hi, e.Pos)
+		folded := newBinaryExpr(opAnd, ge, le, e.Pos)
 		if e.Between.Negated {
-			folded = exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: folded}}
+			folded = exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: folded}, Pos: e.Pos}
 		}
 		return resolve(s, folded, ctx, ag, params)
 	case exprLike:
@@ -2407,7 +2507,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		for _, w := range e.Case.Whens {
 			var rcond *rExpr
 			if e.Case.Operand != nil {
-				eq := newBinaryExpr(opEq, *e.Case.Operand, w.Cond)
+				eq := newBinaryExpr(opEq, *e.Case.Operand, w.Cond, 0)
 				rc, _, err := resolve(s, eq, nil, ag, params)
 				if err != nil {
 					return nil, resolvedType{}, err
@@ -2419,7 +2519,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 					return nil, resolvedType{}, err
 				}
 				if err := requireBool(cty, "CASE WHEN condition must be boolean"); err != nil {
-					return nil, resolvedType{}, err
+					return nil, resolvedType{}, positionError(err, exprLocation(w.Cond))
 				}
 				rcond = rc
 			}
@@ -2444,7 +2544,16 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		}
 		unified, err := unifyCaseTypes(resultTypes, "CASE result types must be compatible")
 		if err != nil {
-			return nil, resolvedType{}, err
+			// PostgreSQL scans the ELSE result first, then the THEN results in order.
+			types := append([]resolvedType{resultTypes[len(resultTypes)-1]}, resultTypes[:len(resultTypes)-1]...)
+			exprs := []exprNode{{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}}
+			if e.Case.Els != nil {
+				exprs[0] = *e.Case.Els
+			}
+			for _, w := range e.Case.Whens {
+				exprs = append(exprs, w.Result)
+			}
+			return nil, resolvedType{}, positionError(err, mismatchLocation(types, exprs, caseTypesUnify))
 		}
 		// A mixed-width float CASE is f64: widen the f32 arms (an ordinary cast, like GREATEST).
 		if unified.kind == rtFloat64 {
@@ -2487,7 +2596,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		}
 		unified, err := unifyCaseTypes(argTypes, "COALESCE types must be compatible")
 		if err != nil {
-			return nil, resolvedType{}, err
+			return nil, resolvedType{}, positionError(err, mismatchLocation(argTypes, e.Coalesce, caseTypesUnify))
 		}
 		// A mixed-width float COALESCE is f64: widen the f32 arguments (as CASE).
 		if unified.kind == rtFloat64 {
@@ -2528,7 +2637,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		}
 		unified, err := unifyCaseTypes(argTypes, strings.ToUpper(name)+" types must be compatible")
 		if err != nil {
-			return nil, resolvedType{}, err
+			return nil, resolvedType{}, positionError(err, mismatchLocation(argTypes, e.GreatestLeast, caseTypesUnify))
 		}
 		// The winner is chosen by the unified type's total order, so a non-orderable type
 		// (json/jsonpath) or an incomparable pair is 42883/42804 HERE — never silently mis-ordered
@@ -3484,11 +3593,12 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// A non-boolean operand is located at that operand (PostgreSQL's coerce_to_boolean).
 		if err := requireBool(lt, "AND/OR requires boolean operands"); err != nil {
-			return nil, resolvedType{}, err
+			return nil, resolvedType{}, positionError(err, exprLocation(b.Lhs))
 		}
 		if err := requireBool(rt, "AND/OR requires boolean operands"); err != nil {
-			return nil, resolvedType{}, err
+			return nil, resolvedType{}, positionError(err, exprLocation(b.Rhs))
 		}
 		kind := reAnd
 		if b.Op == opOr {

@@ -769,6 +769,20 @@ pub(crate) fn unify_case_types(arms: &[ResolvedType], mismatch: &str) -> Result<
     Ok(acc.unwrap_or(ResolvedType::Text))
 }
 
+/// The location of the expression a failed type unification names (spec/design/error-fields.md
+/// §10.2): PostgreSQL's `select_common_type` scans the expressions in order and reports the first
+/// whose type does not unify with those before it. `unifies` is the unifier that failed, run over
+/// each prefix; `exprs` is in PostgreSQL's scan order.
+pub(crate) fn mismatch_location(
+    types: &[ResolvedType],
+    exprs: &[&Expr],
+    unifies: impl Fn(&[ResolvedType]) -> bool,
+) -> SrcPos {
+    (1..types.len())
+        .find(|&i| !unifies(&types[..=i]))
+        .map_or(SrcPos::NONE, |i| exprs[i].location())
+}
+
 /// Coerce a CASE arm's value to the unified result type. The only runtime coercion needed is
 /// widening an integer result to decimal when the unified type is decimal — integer-width
 /// unification needs none (all integers are `i64`), and an all-NULL CASE is text but every arm
@@ -1372,26 +1386,28 @@ pub(crate) fn resolve_container_assign(
     let col_rt = resolved_type_of_col(&col.ty, scope.catalog);
     // A bare string literal adapts to the container context (the same string-adapts-to-context
     // rule the cast and INSERT VALUES paths use).
-    if let Expr::Literal(Literal::Text(s)) = e {
+    if let Expr::Literal(Literal::Text(s), pos) = e {
         let iz = scope.catalog.input_zone();
         match &col.ty {
             Type::Range(elem) => {
                 let desc = crate::range::range_for_element(elem.scalar())
                     .expect("a range column's element always has a range type");
-                let (node, _) = coerce_string_to_range_expr(s, desc, &iz)?;
+                let (node, _) = coerce_string_to_range_expr(s, desc, &iz)
+                    .map_err(|e| e.with_position(pos.0))?;
                 params.note_input_zone(&iz);
                 return Ok(node);
             }
             Type::Array(elem) => {
                 let elem_col = resolve_col_type(elem, &scope.catalog.read_snap().types);
-                let val = coerce_string_to_array(s, &elem_col, &iz)?;
+                let val = coerce_string_to_array(s, &elem_col, &iz)
+                    .map_err(|e| e.with_position(pos.0))?;
                 params.note_input_zone(&iz);
                 return Ok(value_to_rexpr(&val));
             }
             _ => unreachable!("resolve_container_assign is only called for range/array columns"),
         }
     }
-    if let Expr::Literal(Literal::Null) = e {
+    if let Expr::Literal(Literal::Null, _) = e {
         return Ok(RExpr::ConstNull);
     }
     if let Expr::Param(_) = e {
@@ -1422,7 +1438,8 @@ pub(crate) fn resolve_container_assign(
             col.name,
             col.ty.canonical_name(),
             ty.type_name()
-        )));
+        ))
+        .with_position(e.location().0));
     }
     Ok(node)
 }

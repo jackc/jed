@@ -155,7 +155,7 @@ func resolveAggFilter(s *scope, filter *exprNode, params *paramTypes) (*rExpr, e
 		return nil, err
 	}
 	if ft.kind != rtBool && ft.kind != rtNull {
-		return nil, typeError("argument of FILTER must be type boolean")
+		return nil, positionError(typeError("argument of FILTER must be type boolean"), exprLocation(*filter))
 	}
 	return rf, nil
 }
@@ -371,7 +371,7 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 			return nil, resolvedType{}, err
 		}
 		if ft.kind != rtBool && ft.kind != rtNull {
-			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
+			return nil, resolvedType{}, positionError(typeError("argument of FILTER must be type boolean"), exprLocation(*fc.Filter))
 		}
 		filter = rf
 	}
@@ -816,7 +816,7 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 			return nil, resolvedType{}, ferr
 		}
 		if ft.kind != rtBool && ft.kind != rtNull {
-			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
+			return nil, resolvedType{}, positionError(typeError("argument of FILTER must be type boolean"), exprLocation(*filter))
 		}
 		rfilter = rf
 	}

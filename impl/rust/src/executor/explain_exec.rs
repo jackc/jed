@@ -415,7 +415,8 @@ impl Engine {
             return Err(EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", ins.table),
-            ));
+            )
+            .at_target(ins.table_pos.0));
         }
         r.emit(depth, format!("Insert {}", ins.table), insert_detail(ins));
         match &ins.source {
@@ -450,6 +451,7 @@ impl Engine {
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", upd.table),
             )
+            .at_target(upd.table_pos.0)
         })?;
         let filter = self.explain_dml_filter(table, upd.filter.as_ref(), bindings, vw.as_ref())?;
         r.emit(
@@ -481,6 +483,7 @@ impl Engine {
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", del.table),
             )
+            .at_target(del.table_pos.0)
         })?;
         let filter = self.explain_dml_filter(table, del.filter.as_ref(), bindings, vw.as_ref())?;
         r.emit(depth, format!("Delete {}", del.table), "-");
