@@ -212,6 +212,7 @@ import {
   regexNinst,
   regexpCount,
   regexpNthMatch,
+  regexSlot,
   regexpSplitPieces,
 } from "./regex.ts";
 import type { RegexProgram } from "./regex.ts";
@@ -1105,16 +1106,15 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return intValue(BigInt(regexpCount(prog, matchCps, start0, m)));
         default: {
           // substr / instr — both find the N-th match's subexpr span.
-          const saves = regexpNthMatch(prog, matchCps, start0, nth, m);
+          const caps = regexpNthMatch(prog, matchCps, start0, nth, m);
           const noMatch = (): Value => (e.func === "substr" ? nullValue() : intValue(0n));
-          if (saves === null) return noMatch();
+          if (caps === null) return noMatch();
           // `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
           // or a non-participating group (-1) → NULL / 0.
-          const ng = saves.length / 2 - 1;
-          if (subexpr > ng) return noMatch();
+          if (subexpr > prog.ngroups) return noMatch();
           const si = 2 * subexpr;
-          const s2 = saves[si];
-          const e2 = saves[si + 1];
+          const s2 = regexSlot(prog, caps, si);
+          const e2 = regexSlot(prog, caps, si + 1);
           if (s2 < 0 || e2 < 0) return noMatch();
           if (e.func === "substr") {
             return { kind: "text", text: String.fromCodePoint(...origCps.slice(s2, e2)) };

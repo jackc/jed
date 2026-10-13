@@ -227,7 +227,7 @@ fn match_vectors_match() {
             c.input
         );
         let got: Vec<(i64, i64)> = caps
-            .map(|v| v.chunks(2).map(|p| (p[0], p[1])).collect())
+            .map(|c| prog.slots(&c).chunks(2).map(|p| (p[0], p[1])).collect())
             .unwrap_or_default();
         assert_eq!(got, c.caps, "caps for {:?}/{:?}", c.pattern, c.input);
         assert_eq!(

@@ -1591,6 +1591,23 @@ iterations = 20
 seed = 4220
 expect_rows_per_iter = 1
 
+# Capture-tracking regex over the same 1M notes: a global regexp_replace whose two groups the
+# template reorders and repeats, so every match records capture slots (the persistent capture-slot
+# tree, spec/design/regex.md §4.1) and expands the template (cost.md §8.1). Each match adds one
+# character, so the summed length checks the match count against PostgreSQL. The fixed-length
+# pattern matches the same spans under jed's leftmost-first and PG's leftmost-longest rules.
+[[bench]]
+name = "regex_replace_captures"
+description = "Global regexp_replace with two capture groups over the 1M-row note column"
+dataset = "large"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT sum(length(regexp_replace(note, '([aeiou])([a-z])', '\\2\\1\\1', 'g'))) FROM orders"
+warmup = 3
+iterations = 20
+seed = 4220
+expect_rows_per_iter = 1
+
 # Running (EXPANDING) window aggregate — the WINDOWED TOP-N optimization (spec/design/window.md §5.2a,
 # cost.md §3). The frame (UNBOUNDED PRECEDING TO CURRENT ROW) is BACKWARD over the id order, the window
 # ORDER BY id = the PK = the outer ORDER BY, and there is a LIMIT 100 — so the first 100 output rows

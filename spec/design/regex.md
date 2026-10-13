@@ -273,7 +273,7 @@ add_thread(list, t, sp):
     switch prog[t.pc]:
         Jmp x:        add_thread(list, {x, t.saves}, sp)
         Split x, y:   add_thread(list, {x, t.saves}, sp); add_thread(list, {y, t.saves}, sp)   # x first (priority)
-        Save n:       s2 := t.saves.clone(); s2[n] := sp; add_thread(list, {t.pc+1, s2}, sp)
+        Save n:       s2 := t.saves.with(n, sp); add_thread(list, {t.pc+1, s2}, sp)          # a new version (§4.1)
         AssertStart:  if sp == 0:   add_thread(list, {t.pc+1, t.saves}, sp)
         AssertEnd:    if sp == len: add_thread(list, {t.pc+1, t.saves}, sp)
         _:            list.append(t)             # Char / Any / Class / Match — parked for the consume loop
@@ -293,8 +293,44 @@ is the answer, with its capture slots. This is exactly Perl/PCRE leftmost-first 
 (Russ Cox, *Regular Expression Matching: the Virtual Machine Approach*).
 
 **Capture slots** are code-point offsets into the (possibly case-folded, §1) subject; `⊥` (unset)
-prints as NULL in `regexp_match` (Slice 2). Slot copying on `Save` is what the priority discipline
-costs; for the boolean operators it is dead weight but kept for engine uniformity.
+prints as NULL in `regexp_match` (Slice 2). A new version of the slots on `Save` is what the
+priority discipline costs; for the boolean operators it is dead weight but kept for engine
+uniformity.
+
+### 4.1 Capture slots — a persistent array
+
+`regex_step` is the meter's only measure of match work, so each step must stand for a bounded
+amount of it. A `Save` that copied the thread's whole slot array did `2·(ngroups+1)` work for one
+step, and `MAX_REGEX_PROGRAM` allows about 16k groups. With 4000 groups, a pattern did thousands of
+times the work its cost showed: a search took about 8 s to reach a ceiling of 10⁶.
+
+So a thread's slots are a **persistent array**. A `Save` does work bounded by a constant,
+independent of `ngroups`, and leaves the previous version intact for the other threads that hold
+it. Every core uses the same shape: a tree whose leaves hold 16 slots and whose interior nodes hold
+16 subtrees, with depth the smallest `d` such that `16^d ≥ 2·(ngroups+1)` (1 to 4 under
+`MAX_REGEX_PROGRAM`). A missing subtree means every slot under it is unset, so a search starts from
+an empty tree. `with(n, sp)` copies the nodes on the path from the root to slot `n`, at most four
+nodes of 16 entries, and shares every other node. A one-level tree is a single leaf of exactly
+`2·(ngroups+1)` slots, so a pattern of up to 7 groups copies what it always did.
+
+The representation is not observable. Matches, capture spans, `regex_step` counts, and abort points
+are those of the copying description above; the fixtures (§9) pin them, and
+`expr/regexp_many_groups.test` exercises three-level trees. Consumers read only the slots they need,
+`O(depth)` each. Only `regexp_match` and `regexp_matches` read every group of a match, and they pay
+for each through `scalar_byte` (§8).
+
+### 4.2 The dedup set
+
+The `visited` set is an array over the program's instructions, stamped with a generation number:
+`marks[pc] == generation` means `pc` was visited at the current position. Moving to the next
+position increments the generation instead of clearing the array. When the counter wraps, the
+array is cleared once.
+
+A compiled program keeps its set and reuses it for every search, both the searches of one call
+(the global loops of §8–§8c) and the calls of later rows. So a search does no setup work in
+proportion to the program, only the states it explores, which `regex_step` meters. Before, a
+30000-instruction program whose searches each explored a few states spent most of its time
+clearing a fresh array per search. Concurrent users of one program each get their own set.
 
 ---
 
@@ -399,6 +435,10 @@ metered). Both are amplifiers ([cost.md](cost.md) §8.1): `regexp_replace`'s tem
 the captures, and nested groups make `regexp_match`'s array repeat the subject once per group. Each
 sizes its exact output from the recorded capture slots, then charges `scalar_byte` for it and
 reserves it against the scalar allowance ([memory.md](memory.md) §1) before building it.
+`regexp_replace` expands its template once per match, and a reference to an unset or absent group
+expands to nothing, so the output alone does not pay for that walk. It also charges `scalar_byte`
+for the template's UTF-8 bytes once per match, before it sizes the output. `regexp_match` charges
+each match's array as it sizes it, so sizing stops at the ceiling (§8c).
 
 ---
 
@@ -504,8 +544,10 @@ compiles once per statement. The SELECT-list position stays deferred for every S
 **Cost.** The call node charges what `regexp_match` charges: one `operator_eval`, `regex_compile`
 (once per statement for a constant pattern with constant flags, else per call), and `regex_step`
 for every search, and, like `regexp_match`, `regexp_matches` is an amplifier ([cost.md](cost.md)
-§8.1): after the search it sizes every match's capture array from the recorded slots, charges
-`scalar_byte` for the total, and reserves it against the scalar allowance before building any row.
+§8.1): after the search it sizes every match's capture array from the recorded slots, charging
+`scalar_byte` for each array as it sizes it and guarding after each, then reserves the total against
+the scalar allowance before building any row. Sizing reads every group of every match, so a pattern
+with thousands of groups and many matches would otherwise do that work before any guard.
 Each produced row then charges one `generated_row` ([cost.md](cost.md) §3 "`generated_row`").
 `regexp_split_to_array` is a scalar, so it charges no `generated_row`. The split functions charge
 no `scalar_byte`: their pieces partition the subject, so their text never exceeds it.

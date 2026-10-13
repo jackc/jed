@@ -177,7 +177,8 @@ pub(crate) fn replace_text(s: &str, from: &str, to: &str, meter: &mut Meter) -> 
 
 /// `regexp_replace` (regex.md §8): run the whole search, then size the result exactly, cap it at
 /// `MAX_RESULT_CHARS` (`54000`), charge and reserve it, and splice it from the recorded matches. An
-/// amplifier (cost.md §8.1); the search's `regex_step`s are its input charge.
+/// amplifier (cost.md §8.1): its input charge is the search's `regex_step`s plus the replacement's
+/// UTF-8 bytes once per match, since sizing and building expand the template per match.
 pub(crate) fn regexp_replace_text(
     prog: &crate::regex::Program,
     match_chars: &[char],
@@ -187,7 +188,10 @@ pub(crate) fn regexp_replace_text(
     meter: &mut Meter,
 ) -> Result<String> {
     let found = prog.replace_matches(match_chars, global, meter)?;
-    let size = crate::regex::replace_size(orig_chars, repl, &found);
+    let repl_bytes: i64 = repl.iter().map(|c| c.len_utf8() as i64).sum();
+    meter.charge(COSTS.scalar_byte * repl_bytes * found.len() as i64);
+    meter.guard()?;
+    let size = prog.replace_size(orig_chars, repl, &found);
     if size > MAX_RESULT_CHARS {
         return Err(EngineError::new(
             SqlState::ProgramLimitExceeded,
@@ -197,14 +201,15 @@ pub(crate) fn regexp_replace_text(
     meter.charge(COSTS.scalar_byte * size);
     meter.guard()?;
     meter.reserve_scalar(size)?;
-    Ok(crate::regex::replace_build(orig_chars, repl, &found, size))
+    Ok(prog.replace_build(orig_chars, repl, &found, size))
 }
 
 /// `regexp_match` / `regexp_matches` (regex.md §8/§8c): one `text[]` capture array for the first
 /// match, or for every non-overlapping match when `global`; no match gives none. An amplifier
 /// (cost.md §8.1): nested groups capture the same text once each, so the pattern multiplies the
-/// subject. The search's `regex_step`s are its input charge; the arrays' exact payload is then
-/// computed from the capture spans, charged, and reserved before any is built.
+/// subject. The search's `regex_step`s are its input charge. Each array's exact payload is computed
+/// from the capture spans and charged as it is sized, so sizing many matches of a many-group pattern
+/// stops at the ceiling; the sum is reserved before any array is built.
 pub(crate) fn regexp_capture_arrays(
     prog: &crate::regex::Program,
     match_chars: &[char],
@@ -217,18 +222,19 @@ pub(crate) fn regexp_capture_arrays(
         return Ok(Vec::new());
     }
     let utf8_at = crate::regex::utf8_offsets(orig_chars);
-    let size: i64 = found
-        .iter()
-        .map(|saves| prog.capture_array_size(saves, &utf8_at))
-        .sum();
-    meter.charge(COSTS.scalar_byte * size);
-    meter.guard()?;
+    let mut size = 0i64;
+    for caps in &found {
+        let array_size = prog.capture_array_size(caps, &utf8_at);
+        meter.charge(COSTS.scalar_byte * array_size);
+        meter.guard()?;
+        size += array_size;
+    }
     meter.reserve_scalar(size)?;
     let arrays: Vec<Value> = found
         .iter()
-        .map(|saves| {
+        .map(|caps| {
             let elems = prog
-                .capture_array(saves, orig_chars)
+                .capture_array(caps, orig_chars)
                 .into_iter()
                 .map(|g| g.map_or(Value::Null, Value::Text))
                 .collect();

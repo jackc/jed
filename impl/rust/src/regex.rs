@@ -13,6 +13,7 @@ use crate::costs::COSTS;
 use crate::error::{EngineError, Result};
 use crate::sqlstate::SqlState;
 use std::rc::Rc;
+use std::sync::{Mutex, PoisonError};
 
 /// Maximum compiled-program size, in instructions (regex.md §6, cost.md §7c). A fixed cross-core
 /// constant — a pattern whose program would exceed it aborts `54001` at compile (the structural cap
@@ -58,12 +59,16 @@ impl CharClass {
 }
 
 /// A compiled pattern: the instruction array, the class table, and the capturing-group count
-/// (excluding group 0, the whole match).
+/// (excluding group 0, the whole match), plus the shape of its capture-slot trees ([`cap_shape`])
+/// and the dedup set ([`Seen`]) its searches reuse.
 #[derive(Clone, Debug)]
 pub struct Program {
     pub insts: Vec<Inst>,
     pub classes: Vec<CharClass>,
     pub ngroups: usize,
+    cap_depth: usize,
+    cap_leaf_len: usize,
+    seen_pool: SeenPool,
 }
 
 impl Program {
@@ -771,11 +776,107 @@ pub fn compile(pattern: &str) -> Result<Program> {
     c.emit(&root)?;
     c.push(Inst::Save(1))?;
     c.push(Inst::Match)?;
+    let (cap_depth, cap_leaf_len) = cap_shape(2 * (ngroups + 1));
     Ok(Program {
         insts: c.insts,
         classes: c.classes,
         ngroups,
+        cap_depth,
+        cap_leaf_len,
+        seen_pool: SeenPool::default(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Capture slots — a persistent array (regex.md §4.1)
+// ---------------------------------------------------------------------------
+
+/// A capture-slot tree's leaves hold `CAP_FAN` slots and its interior nodes `CAP_FAN` subtrees.
+/// Every group emits two Saves, so a program's `2·(ngroups+1)` slots never exceed
+/// [`MAX_REGEX_PROGRAM`] and fit in four levels.
+const CAP_FAN_BITS: usize = 4;
+const CAP_FAN: usize = 1 << CAP_FAN_BITS;
+
+/// A node of a thread's capture slots, a persistent array (regex.md §4.1). A Save makes a new
+/// version by copying only the nodes on the path to the slot it sets, at most `CAP_FAN` entries per
+/// level, so its work is bounded however many groups the pattern has; the older version stays intact
+/// for the threads still holding it. A leaf holds slot values (code-point offsets; `-1` = unset), an
+/// interior node its subtrees. A missing node means every slot under it is unset, so a search starts
+/// from no root. A match has set slots 0 and 1, so it always has a root.
+#[derive(Debug)]
+pub enum CapNode {
+    Leaf(Vec<i64>),
+    Inner(Vec<Option<Rc<CapNode>>>),
+}
+
+/// The depth of the capture-slot tree for `nslots` slots and the length of its leaves: a one-level
+/// tree is a single leaf of exactly `nslots` slots, a deeper one has full leaves.
+fn cap_shape(nslots: usize) -> (usize, usize) {
+    let mut depth = 1;
+    let mut span = CAP_FAN;
+    while span < nslots {
+        depth += 1;
+        span *= CAP_FAN;
+    }
+    if depth == 1 {
+        (1, nslots)
+    } else {
+        (depth, CAP_FAN)
+    }
+}
+
+impl Program {
+    /// Capture slot `i` of a match's slots (`-1` = unset).
+    pub fn slot(&self, caps: &CapNode, i: usize) -> i64 {
+        self.slot_in(Some(caps), i)
+    }
+
+    fn slot_in(&self, caps: Option<&CapNode>, i: usize) -> i64 {
+        let mut node = caps;
+        let mut shift = CAP_FAN_BITS * (self.cap_depth - 1);
+        while shift > 0 {
+            match node {
+                Some(CapNode::Inner(kids)) => node = kids[(i >> shift) & (CAP_FAN - 1)].as_deref(),
+                _ => return -1,
+            }
+            shift -= CAP_FAN_BITS;
+        }
+        match node {
+            Some(CapNode::Leaf(vals)) => vals[i & (CAP_FAN - 1)],
+            _ => -1,
+        }
+    }
+
+    /// The version of `caps` with slot `i` set to `v`, sharing every node off the path to it.
+    fn with_slot(&self, caps: Option<&CapNode>, i: usize, v: i64) -> Rc<CapNode> {
+        self.with_slot_at(caps, CAP_FAN_BITS * (self.cap_depth - 1), i, v)
+    }
+
+    fn with_slot_at(&self, node: Option<&CapNode>, shift: usize, i: usize, v: i64) -> Rc<CapNode> {
+        if shift == 0 {
+            let mut vals = match node {
+                Some(CapNode::Leaf(vals)) => vals.clone(),
+                _ => vec![-1; self.cap_leaf_len],
+            };
+            vals[i & (CAP_FAN - 1)] = v;
+            return Rc::new(CapNode::Leaf(vals));
+        }
+        let mut kids = match node {
+            Some(CapNode::Inner(kids)) => kids.clone(),
+            _ => vec![None; CAP_FAN],
+        };
+        let k = (i >> shift) & (CAP_FAN - 1);
+        let child = self.with_slot_at(kids[k].as_deref(), shift - CAP_FAN_BITS, i, v);
+        kids[k] = Some(child);
+        Rc::new(CapNode::Inner(kids))
+    }
+
+    /// Every capture slot of a match as a flat array.
+    pub fn slots(&self, caps: &CapNode) -> Vec<i64> {
+        (0..2 * (self.ngroups + 1))
+            .map(|i| self.slot(caps, i))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -784,19 +885,74 @@ pub fn compile(pattern: &str) -> Result<Program> {
 
 struct Thread {
     pc: usize,
-    saves: Rc<Vec<i64>>,
+    caps: Option<Rc<CapNode>>,
+}
+
+/// The per-position dedup set (regex.md §4): `marks[pc] == generation` means `pc` was visited at the
+/// current position, so moving to the next position is an increment, not a clear. A program pools
+/// its sets and reuses them across searches and rows, so a search does no setup work in proportion to
+/// the program, only the states it explores, which `regex_step` meters (§4.2).
+#[derive(Debug)]
+struct Seen {
+    marks: Vec<u32>,
+    generation: u32,
+}
+
+impl Seen {
+    /// Start a new generation. When the counter wraps, the stale marks could alias the new
+    /// generation, so they are cleared.
+    fn next(&mut self) -> u32 {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.marks.fill(0);
+            self.generation = 1;
+        }
+        self.generation
+    }
+}
+
+/// The dedup set a program keeps between calls (see [`Seen`]). A clone of the program starts empty.
+#[derive(Debug, Default)]
+struct SeenPool(Mutex<Option<Seen>>);
+
+impl Clone for SeenPool {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl Program {
+    /// Run `f` with a dedup set for one call's searches, taken from the program's pool when it has
+    /// one and returned to it afterwards.
+    fn with_seen<T>(&self, f: impl FnOnce(&mut Seen) -> T) -> T {
+        let pooled = self
+            .seen_pool
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let mut seen = pooled.unwrap_or_else(|| Seen {
+            marks: vec![0; self.insts.len()],
+            generation: 0,
+        });
+        let out = f(&mut seen);
+        *self
+            .seen_pool
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(seen);
+        out
+    }
+
     /// Boolean match — TRUE iff the pattern matches somewhere in `input` (the `~` operator).
     pub fn is_match(&self, input: &[char], m: &mut Meter) -> Result<bool> {
         Ok(self.run(input, m)?.is_some())
     }
 
     /// Run the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
-    /// capture slots on a match (code-point offsets; `-1` = unset), or `None`.
-    pub fn run(&self, input: &[char], m: &mut Meter) -> Result<Option<Vec<i64>>> {
-        self.search(input, 0, m)
+    /// capture slots on a match, or `None`.
+    pub fn run(&self, input: &[char], m: &mut Meter) -> Result<Option<Rc<CapNode>>> {
+        self.with_seen(|seen| self.search(seen, input, 0, m))
     }
 
     /// Run the Pike VM, considering only matches that START at code-point position `start` or later
@@ -806,84 +962,40 @@ impl Program {
     // `sp` is a logical input POSITION that must reach `len` (one past the end) so the final
     // epsilon-closure can fire `AssertEnd`/`Match` — enumerate() cannot express `start..=len`.
     #[allow(clippy::needless_range_loop)]
-    pub fn search(&self, input: &[char], start: usize, m: &mut Meter) -> Result<Option<Vec<i64>>> {
-        let nslots = 2 * (self.ngroups + 1);
+    fn search(
+        &self,
+        seen: &mut Seen,
+        input: &[char],
+        start: usize,
+        m: &mut Meter,
+    ) -> Result<Option<Rc<CapNode>>> {
         let len = input.len();
-        let mut seen = vec![0u32; self.insts.len()];
-        let mut generation: u32 = 0;
         let mut clist: Vec<Thread> = Vec::new();
         let mut nlist: Vec<Thread> = Vec::new();
-        let mut matched: Option<Vec<i64>> = None;
+        let mut matched: Option<Rc<CapNode>> = None;
 
-        generation += 1;
-        self.add_thread(
-            &mut clist,
-            &mut seen,
-            generation,
-            0,
-            Rc::new(vec![-1; nslots]),
-            start,
-            len,
-            m,
-        )?;
+        let generation = seen.next();
+        self.add_thread(&mut clist, seen, generation, 0, None, start, len, m)?;
 
         for sp in start..=len {
-            generation += 1;
+            let generation = seen.next();
             nlist.clear();
             let mut i = 0;
             while i < clist.len() {
                 let pc = clist[i].pc;
-                match &self.insts[pc] {
-                    Inst::Char(c) => {
-                        if sp < len && input[sp] == *c {
-                            let saves = Rc::clone(&clist[i].saves);
-                            self.add_thread(
-                                &mut nlist,
-                                &mut seen,
-                                generation,
-                                pc + 1,
-                                saves,
-                                sp + 1,
-                                len,
-                                m,
-                            )?;
-                        }
-                    }
-                    Inst::Any => {
-                        if sp < len && input[sp] != '\n' {
-                            let saves = Rc::clone(&clist[i].saves);
-                            self.add_thread(
-                                &mut nlist,
-                                &mut seen,
-                                generation,
-                                pc + 1,
-                                saves,
-                                sp + 1,
-                                len,
-                                m,
-                            )?;
-                        }
-                    }
-                    Inst::Class(k) => {
-                        if sp < len && self.classes[*k].admits(input[sp]) {
-                            let saves = Rc::clone(&clist[i].saves);
-                            self.add_thread(
-                                &mut nlist,
-                                &mut seen,
-                                generation,
-                                pc + 1,
-                                saves,
-                                sp + 1,
-                                len,
-                                m,
-                            )?;
-                        }
-                    }
+                let advances = match &self.insts[pc] {
+                    Inst::Char(c) => sp < len && input[sp] == *c,
+                    Inst::Any => sp < len && input[sp] != '\n',
+                    Inst::Class(k) => sp < len && self.classes[*k].admits(input[sp]),
                     Inst::Match => {
-                        matched = Some((*clist[i].saves).clone());
+                        matched = clist[i].caps.clone();
                         break; // cut lower-priority threads (leftmost-first, regex.md §4)
                     }
                     _ => unreachable!("epsilon instructions are resolved inside add_thread"),
+                };
+                if advances {
+                    let caps = clist[i].caps.clone();
+                    self.add_thread(&mut nlist, seen, generation, pc + 1, caps, sp + 1, len, m)?;
                 }
                 i += 1;
             }
@@ -904,82 +1016,98 @@ impl Program {
     fn add_thread(
         &self,
         list: &mut Vec<Thread>,
-        seen: &mut [u32],
+        seen: &mut Seen,
         generation: u32,
         pc0: usize,
-        saves0: Rc<Vec<i64>>,
+        caps0: Option<Rc<CapNode>>,
         sp: usize,
         len: usize,
         m: &mut Meter,
     ) -> Result<()> {
-        let mut stack: Vec<(usize, Rc<Vec<i64>>)> = vec![(pc0, saves0)];
-        while let Some((pc, saves)) = stack.pop() {
-            if seen[pc] == generation {
+        let mut stack: Vec<Thread> = vec![Thread {
+            pc: pc0,
+            caps: caps0,
+        }];
+        while let Some(Thread { pc, caps }) = stack.pop() {
+            if seen.marks[pc] == generation {
                 continue;
             }
-            seen[pc] = generation;
+            seen.marks[pc] = generation;
             m.charge(COSTS.regex_step);
             match &self.insts[pc] {
-                Inst::Jmp(x) => stack.push((*x, saves)),
+                Inst::Jmp(x) => stack.push(Thread { pc: *x, caps }),
                 Inst::Split(x, y) => {
                     // Push y first, then x, so x pops first = higher priority.
-                    stack.push((*y, Rc::clone(&saves)));
-                    stack.push((*x, saves));
+                    stack.push(Thread {
+                        pc: *y,
+                        caps: caps.clone(),
+                    });
+                    stack.push(Thread { pc: *x, caps });
                 }
                 Inst::Save(n) => {
-                    let mut s = (*saves).clone();
-                    s[*n] = sp as i64;
-                    stack.push((pc + 1, Rc::new(s)));
+                    let caps = self.with_slot(caps.as_deref(), *n, sp as i64);
+                    stack.push(Thread {
+                        pc: pc + 1,
+                        caps: Some(caps),
+                    });
                 }
                 Inst::AssertStart => {
                     if sp == 0 {
-                        stack.push((pc + 1, saves));
+                        stack.push(Thread { pc: pc + 1, caps });
                     }
                 }
                 Inst::AssertEnd => {
                     if sp == len {
-                        stack.push((pc + 1, saves));
+                        stack.push(Thread { pc: pc + 1, caps });
                     }
                 }
                 // Char / Any / Class / Match — parked for the consume loop.
-                _ => list.push(Thread { pc, saves }),
+                _ => list.push(Thread { pc, caps }),
             }
         }
         Ok(())
     }
 
+    /// The start and end of a match's whole span (group 0) as positions.
+    fn span(&self, caps: &CapNode) -> (usize, usize) {
+        (self.slot(caps, 0) as usize, self.slot(caps, 1) as usize)
+    }
+
     /// The matches `regexp_replace(source, pattern, replacement, …)` (regex.md §8) replaces: the first
     /// match, or every non-overlapping match when `global`. Each entry is a match's capture slots. The
     /// VM matches over `match_input` (possibly case-folded); this is the kernel's whole search, so it
-    /// charges every `regex_step` the replacement costs. [`replace_size`] and [`replace_build`] then
-    /// size and splice from these slots without searching again (cost.md §8.1). `regexp_match` (never
-    /// global) and `regexp_matches` run the same search, then size and slice their capture arrays from
-    /// the slots ([`Program::capture_array_size`], [`Program::capture_array`]).
+    /// charges every `regex_step` the replacement costs. [`Program::replace_size`] and
+    /// [`Program::replace_build`] then size and splice from these slots without searching again
+    /// (cost.md §8.1). `regexp_match` (never global) and `regexp_matches` run the same search, then
+    /// size and slice their capture arrays from the slots ([`Program::capture_array_size`],
+    /// [`Program::capture_array`]).
     pub fn replace_matches(
         &self,
         match_input: &[char],
         global: bool,
         m: &mut Meter,
-    ) -> Result<Vec<Vec<i64>>> {
-        let mut found = Vec::new();
-        let mut pos = 0usize;
-        loop {
-            let Some(saves) = self.search(match_input, pos, m)? else {
-                break;
-            };
-            let (s, e) = (saves[0] as usize, saves[1] as usize);
-            found.push(saves);
-            if !global {
-                break;
+    ) -> Result<Vec<Rc<CapNode>>> {
+        self.with_seen(|seen| {
+            let mut found = Vec::new();
+            let mut pos = 0usize;
+            loop {
+                let Some(caps) = self.search(seen, match_input, pos, m)? else {
+                    break;
+                };
+                let (s, e) = self.span(&caps);
+                found.push(caps);
+                if !global {
+                    break;
+                }
+                // Empty match: the next search starts past the char at `e`, so a pattern that can
+                // match empty (`a*`) cannot loop forever — the PG global rule.
+                pos = if e > s { e } else { e + 1 };
+                if pos > match_input.len() {
+                    break;
+                }
             }
-            // Empty match: the next search starts past the char at `e`, so a pattern that can match
-            // empty (`a*`) cannot loop forever — the PG global rule.
-            pos = if e > s { e } else { e + 1 };
-            if pos > match_input.len() {
-                break;
-            }
-        }
-        Ok(found)
+            Ok(found)
+        })
     }
 
     /// Count the non-overlapping matches at or after code-point position `start` (`regexp_count`,
@@ -988,19 +1116,20 @@ impl Program {
     /// `start` may be up to `len` (a match of the empty string at the very end still counts);
     /// `start > len` (the caller clamps it to `len+1`) yields 0.
     pub fn regexp_count(&self, input: &[char], start: usize, m: &mut Meter) -> Result<i64> {
-        let len = input.len();
-        let mut pos = start;
-        let mut count = 0i64;
-        while pos <= len {
-            let Some(saves) = self.search(input, pos, m)? else {
-                break;
-            };
-            count += 1;
-            let s = saves[0] as usize;
-            let e = saves[1] as usize;
-            pos = if e > s { e } else { e + 1 };
-        }
-        Ok(count)
+        self.with_seen(|seen| {
+            let len = input.len();
+            let mut pos = start;
+            let mut count = 0i64;
+            while pos <= len {
+                let Some(caps) = self.search(seen, input, pos, m)? else {
+                    break;
+                };
+                count += 1;
+                let (s, e) = self.span(&caps);
+                pos = if e > s { e } else { e + 1 };
+            }
+            Ok(count)
+        })
     }
 
     /// The capture groups `regexp_match` / `regexp_matches` report for a match (regex.md §8):
@@ -1017,10 +1146,10 @@ impl Program {
     /// match's slots, computed from the spans without building it (cost.md §8.1): `ARRAY_DIM`, plus
     /// `VALUE` and the span's UTF-8 bytes per reported group (an unset group is a bare `VALUE`).
     /// `utf8_at` is [`utf8_offsets`] of the subject, so each span is measured in O(1).
-    pub fn capture_array_size(&self, saves: &[i64], utf8_at: &[i64]) -> i64 {
+    pub fn capture_array_size(&self, caps: &CapNode, utf8_at: &[i64]) -> i64 {
         let mut size = crate::costs::MEMORY_ARRAY_DIM;
         for g in self.reported_groups() {
-            let (s, e) = (saves[2 * g], saves[2 * g + 1]);
+            let (s, e) = (self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1));
             size += crate::costs::MEMORY_VALUE;
             if s >= 0 && e >= 0 {
                 size += utf8_at[e as usize] - utf8_at[s as usize];
@@ -1031,9 +1160,9 @@ impl Program {
 
     /// The capture array for a match's slots, sliced from the ORIGINAL-case subject: the reported
     /// groups' substrings, an unset group `None`.
-    pub fn capture_array(&self, saves: &[i64], orig: &[char]) -> Vec<Option<String>> {
+    pub fn capture_array(&self, caps: &CapNode, orig: &[char]) -> Vec<Option<String>> {
         self.reported_groups()
-            .map(|g| slice_group(orig, saves[2 * g], saves[2 * g + 1]))
+            .map(|g| slice_group(orig, self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1)))
             .collect()
     }
 
@@ -1049,25 +1178,27 @@ impl Program {
         orig_input: &[char],
         m: &mut Meter,
     ) -> Result<Vec<String>> {
-        let len = match_input.len();
-        let mut pieces = Vec::new();
-        let mut pos = 0usize;
-        let mut prev_end = 0usize; // the end of the previous match, degenerate or not
-        let mut piece_start = 0usize; // the end of the previous SPLITTING match
-        while pos <= len {
-            let Some(saves) = self.search(match_input, pos, m)? else {
-                break;
-            };
-            let (s, e) = (saves[0] as usize, saves[1] as usize);
-            if s < len && e > prev_end {
-                pieces.push(orig_input[piece_start..s].iter().collect());
-                piece_start = e;
+        self.with_seen(|seen| {
+            let len = match_input.len();
+            let mut pieces = Vec::new();
+            let mut pos = 0usize;
+            let mut prev_end = 0usize; // the end of the previous match, degenerate or not
+            let mut piece_start = 0usize; // the end of the previous SPLITTING match
+            while pos <= len {
+                let Some(caps) = self.search(seen, match_input, pos, m)? else {
+                    break;
+                };
+                let (s, e) = self.span(&caps);
+                if s < len && e > prev_end {
+                    pieces.push(orig_input[piece_start..s].iter().collect());
+                    piece_start = e;
+                }
+                prev_end = e;
+                pos = if e > s { e } else { e + 1 };
             }
-            prev_end = e;
-            pos = if e > s { e } else { e + 1 };
-        }
-        pieces.push(orig_input[piece_start..len].iter().collect());
-        Ok(pieces)
+            pieces.push(orig_input[piece_start..len].iter().collect());
+            Ok(pieces)
+        })
     }
 
     /// The capture slots of the N-th (1-based) non-overlapping match at or after `start`
@@ -1079,23 +1210,118 @@ impl Program {
         start: usize,
         n: i64,
         m: &mut Meter,
-    ) -> Result<Option<Vec<i64>>> {
-        let len = input.len();
-        let mut pos = start;
-        let mut count = 0i64;
-        while pos <= len {
-            let Some(saves) = self.search(input, pos, m)? else {
-                break;
-            };
-            count += 1;
-            if count == n {
-                return Ok(Some(saves));
+    ) -> Result<Option<Rc<CapNode>>> {
+        self.with_seen(|seen| {
+            let len = input.len();
+            let mut pos = start;
+            let mut count = 0i64;
+            while pos <= len {
+                let Some(caps) = self.search(seen, input, pos, m)? else {
+                    break;
+                };
+                count += 1;
+                if count == n {
+                    return Ok(Some(caps));
+                }
+                let (s, e) = self.span(&caps);
+                pos = if e > s { e } else { e + 1 };
             }
-            let s = saves[0] as usize;
-            let e = saves[1] as usize;
-            pos = if e > s { e } else { e + 1 };
+            Ok(None)
+        })
+    }
+
+    /// Walk a replacement template, expanding `\1`..`\9` (capture group), `\&` (whole match), `\\`
+    /// (literal backslash), and `\<other>` (the literal `<other>`). A trailing lone `\` is literal,
+    /// and an unset or absent group expands to nothing. Sizing and building share this walk so they
+    /// cannot disagree.
+    fn for_each_piece(&self, repl: &[char], caps: &CapNode, mut f: impl FnMut(Piece)) {
+        // An unset (`-1`) group expands to nothing.
+        let span = |start: i64, end: i64| {
+            (start >= 0 && end >= 0).then(|| Piece::Span(start as usize, end as usize))
+        };
+        let mut i = 0;
+        while i < repl.len() {
+            let c = repl[i];
+            if c == '\\' && i + 1 < repl.len() {
+                let n = repl[i + 1];
+                if let Some(d) = n.to_digit(10) {
+                    let g = d as usize;
+                    if g <= self.ngroups {
+                        if let Some(p) = span(self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1)) {
+                            f(p);
+                        }
+                    }
+                } else if n == '&' {
+                    if let Some(p) = span(self.slot(caps, 0), self.slot(caps, 1)) {
+                        f(p);
+                    }
+                } else {
+                    f(Piece::Char(n));
+                }
+                i += 2;
+            } else {
+                f(Piece::Char(c));
+                i += 1;
+            }
         }
-        Ok(None)
+    }
+
+    /// The text spans and pieces of a replacement, in output order: unmatched source text from
+    /// `orig`, each match's expanded template, and, for an empty match, the char after it.
+    fn for_each_output(
+        &self,
+        orig: &[char],
+        repl: &[char],
+        found: &[Rc<CapNode>],
+        mut f: impl FnMut(Piece),
+    ) {
+        let mut pos = 0usize;
+        for caps in found {
+            let (s, e) = self.span(caps);
+            f(Piece::Span(pos, s));
+            self.for_each_piece(repl, caps, &mut f);
+            if e > s {
+                pos = e;
+            } else {
+                if e < orig.len() {
+                    f(Piece::Char(orig[e]));
+                }
+                pos = e + 1;
+            }
+        }
+        if pos <= orig.len() {
+            f(Piece::Span(pos, orig.len()));
+        }
+    }
+
+    /// The exact UTF-8 byte length of `regexp_replace`'s result for the matches
+    /// [`Program::replace_matches`] found, computed without building it (cost.md §8.1).
+    pub fn replace_size(&self, orig: &[char], repl: &[char], found: &[Rc<CapNode>]) -> i64 {
+        let mut size = 0i64;
+        self.for_each_output(orig, repl, found, |p| match p {
+            Piece::Char(c) => size += c.len_utf8() as i64,
+            Piece::Span(a, b) => {
+                size += orig[a..b].iter().map(|c| c.len_utf8() as i64).sum::<i64>()
+            }
+        });
+        size
+    }
+
+    /// Build `regexp_replace`'s result of `size` bytes from the matches
+    /// [`Program::replace_matches`] found.
+    pub fn replace_build(
+        &self,
+        orig: &[char],
+        repl: &[char],
+        found: &[Rc<CapNode>],
+        size: i64,
+    ) -> String {
+        let mut out = String::with_capacity(size as usize);
+        self.for_each_output(orig, repl, found, |p| match p {
+            Piece::Char(c) => out.push(c),
+            Piece::Span(a, b) => out.extend(orig[a..b].iter()),
+        });
+        out
     }
 }
 
@@ -1125,86 +1351,6 @@ fn slice_group(orig: &[char], start: i64, end: i64) -> Option<String> {
 enum Piece {
     Char(char),
     Span(usize, usize),
-}
-
-/// Walk a replacement template, expanding `\1`..`\9` (capture group), `\&` (whole match), `\\`
-/// (literal backslash), and `\<other>` (the literal `<other>`). A trailing lone `\` is literal, and
-/// an unset or absent group expands to nothing. Sizing and building share this walk so they cannot
-/// disagree.
-fn for_each_piece(repl: &[char], saves: &[i64], mut f: impl FnMut(Piece)) {
-    // An unset (`-1`) group expands to nothing.
-    let span = |start: i64, end: i64| {
-        (start >= 0 && end >= 0).then(|| Piece::Span(start as usize, end as usize))
-    };
-    let mut i = 0;
-    while i < repl.len() {
-        let c = repl[i];
-        if c == '\\' && i + 1 < repl.len() {
-            let n = repl[i + 1];
-            if let Some(d) = n.to_digit(10) {
-                let g = d as usize;
-                if 2 * g + 1 < saves.len() {
-                    if let Some(p) = span(saves[2 * g], saves[2 * g + 1]) {
-                        f(p);
-                    }
-                }
-            } else if n == '&' {
-                if let Some(p) = span(saves[0], saves[1]) {
-                    f(p);
-                }
-            } else {
-                f(Piece::Char(n));
-            }
-            i += 2;
-        } else {
-            f(Piece::Char(c));
-            i += 1;
-        }
-    }
-}
-
-/// The text spans and pieces of a replacement, in output order: unmatched source text from `orig`,
-/// each match's expanded template, and, for an empty match, the char after it.
-fn for_each_output(orig: &[char], repl: &[char], found: &[Vec<i64>], mut f: impl FnMut(Piece)) {
-    let mut pos = 0usize;
-    for saves in found {
-        let (s, e) = (saves[0] as usize, saves[1] as usize);
-        f(Piece::Span(pos, s));
-        for_each_piece(repl, saves, &mut f);
-        if e > s {
-            pos = e;
-        } else {
-            if e < orig.len() {
-                f(Piece::Char(orig[e]));
-            }
-            pos = e + 1;
-        }
-    }
-    if pos <= orig.len() {
-        f(Piece::Span(pos, orig.len()));
-    }
-}
-
-/// The exact UTF-8 byte length of `regexp_replace`'s result for the matches
-/// [`Program::replace_matches`] found, computed without building it (cost.md §8.1).
-pub fn replace_size(orig: &[char], repl: &[char], found: &[Vec<i64>]) -> i64 {
-    let mut size = 0i64;
-    for_each_output(orig, repl, found, |p| match p {
-        Piece::Char(c) => size += c.len_utf8() as i64,
-        Piece::Span(a, b) => size += orig[a..b].iter().map(|c| c.len_utf8() as i64).sum::<i64>(),
-    });
-    size
-}
-
-/// Build `regexp_replace`'s result of `size` bytes from the matches [`Program::replace_matches`]
-/// found.
-pub fn replace_build(orig: &[char], repl: &[char], found: &[Vec<i64>], size: i64) -> String {
-    let mut out = String::with_capacity(size as usize);
-    for_each_output(orig, repl, found, |p| match p {
-        Piece::Char(c) => out.push(c),
-        Piece::Span(a, b) => out.extend(orig[a..b].iter()),
-    });
-    out
 }
 
 #[cfg(test)]
@@ -1349,9 +1495,6 @@ mod tests {
             .unwrap()
             .unwrap();
         // group 0 = whole match "abbbc" at [1,6); group 1 = "bbb" at [2,5).
-        assert_eq!(caps[0], 1);
-        assert_eq!(caps[1], 6);
-        assert_eq!(caps[2], 2);
-        assert_eq!(caps[3], 5);
+        assert_eq!(p.slots(&caps), vec![1, 6, 2, 5]);
     }
 }

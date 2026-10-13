@@ -55,11 +55,15 @@ function classAdmits(c: RegexClass, cp: number): boolean {
 }
 
 // A compiled pattern: the instruction array, the class table, and the capturing-group count
-// (excluding group 0, the whole match).
+// (excluding group 0, the whole match), plus the shape of its capture-slot trees (capShape) and the
+// dedup set (RegexSeen) its searches reuse.
 export type RegexProgram = {
   insts: Inst[];
   classes: RegexClass[];
   ngroups: number;
+  capDepth: number;
+  capLeafLen: number;
+  seen: RegexSeen | null;
 };
 
 export function regexNinst(p: RegexProgram): number {
@@ -659,14 +663,114 @@ export function compileRegex(pattern: string): RegexProgram {
   c.emit(root);
   c.pushInst({ op: "save", x: 1, y: 0, ch: 0 });
   c.pushInst({ op: "match", x: 0, y: 0, ch: 0 });
-  return { insts: c.insts, classes: c.classes, ngroups };
+  const [capDepth, capLeafLen] = capShape(2 * (ngroups + 1));
+  return { insts: c.insts, classes: c.classes, ngroups, capDepth, capLeafLen, seen: null };
+}
+
+// ---------------------------------------------------------------------------
+// Capture slots — a persistent array (regex.md §4.1)
+// ---------------------------------------------------------------------------
+
+// A capture-slot tree's leaves hold CAP_FAN slots and its interior nodes CAP_FAN subtrees. Every
+// group emits two saves, so a program's 2·(ngroups+1) slots never exceed MAX_REGEX_PROGRAM and fit in
+// four levels.
+const CAP_FAN_BITS = 4;
+const CAP_FAN = 1 << CAP_FAN_BITS;
+
+// A node of a thread's capture slots, a persistent array (regex.md §4.1). A save makes a new version
+// by copying only the nodes on the path to the slot it sets, at most CAP_FAN entries per level, so its
+// work is bounded however many groups the pattern has; the older version stays intact for the threads
+// still holding it. A leaf is its slot values (code-point offsets; -1 = unset), an interior node its
+// subtrees. A null node means every slot under it is unset, so a search starts from a null root. A
+// match has set slots 0 and 1, so its root is never null.
+export type CapNode = number[] | (CapNode | null)[];
+
+// capShape returns the depth of the capture-slot tree for nslots slots and the length of its leaves:
+// a one-level tree is a single leaf of exactly nslots slots, a deeper one has full leaves.
+function capShape(nslots: number): [number, number] {
+  let depth = 1;
+  for (let span = CAP_FAN; span < nslots; span *= CAP_FAN) depth++;
+  return depth === 1 ? [1, nslots] : [depth, CAP_FAN];
+}
+
+// regexSlot returns capture slot i of a thread's or match's slots (-1 = unset).
+export function regexSlot(p: RegexProgram, caps: CapNode | null, i: number): number {
+  let n = caps;
+  for (
+    let shift = CAP_FAN_BITS * (p.capDepth - 1);
+    shift > 0 && n !== null;
+    shift -= CAP_FAN_BITS
+  ) {
+    n = (n as (CapNode | null)[])[(i >> shift) & (CAP_FAN - 1)];
+  }
+  return n === null ? -1 : (n as number[])[i & (CAP_FAN - 1)];
+}
+
+// withSlot returns the version of caps with slot i set to v, sharing every node off the path to it.
+function withSlot(p: RegexProgram, caps: CapNode | null, i: number, v: number): CapNode {
+  return withSlotAt(p, caps, CAP_FAN_BITS * (p.capDepth - 1), i, v);
+}
+
+function withSlotAt(
+  p: RegexProgram,
+  n: CapNode | null,
+  shift: number,
+  i: number,
+  v: number,
+): CapNode {
+  if (shift === 0) {
+    const vals = n === null ? new Array<number>(p.capLeafLen).fill(-1) : (n as number[]).slice();
+    vals[i & (CAP_FAN - 1)] = v;
+    return vals;
+  }
+  const kids =
+    n === null ? new Array<CapNode | null>(CAP_FAN).fill(null) : (n as (CapNode | null)[]).slice();
+  const k = (i >> shift) & (CAP_FAN - 1);
+  kids[k] = withSlotAt(p, kids[k], shift - CAP_FAN_BITS, i, v);
+  return kids;
+}
+
+// regexSlots returns every capture slot of caps as a flat array.
+export function regexSlots(p: RegexProgram, caps: CapNode): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < 2 * (p.ngroups + 1); i++) out.push(regexSlot(p, caps, i));
+  return out;
 }
 
 // ---------------------------------------------------------------------------
 // Pike VM (regex.md §4)
 // ---------------------------------------------------------------------------
 
-type Thread = { pc: number; saves: number[] };
+type Thread = { pc: number; caps: CapNode | null };
+
+// The per-position dedup set (regex.md §4): marks[pc] === generation means pc was visited at the
+// current position, so moving to the next position is an increment, not a clear. A program keeps its
+// set and reuses it across searches and rows, so a search does no setup work in proportion to the
+// program, only the states it explores, which regex_step meters (§4.2).
+export type RegexSeen = { marks: Uint32Array; generation: number };
+
+// nextGeneration starts a new generation. When the counter wraps, the stale marks could alias the new
+// generation, so they are cleared.
+function nextGeneration(seen: RegexSeen): number {
+  seen.generation = (seen.generation + 1) >>> 0;
+  if (seen.generation === 0) {
+    seen.marks.fill(0);
+    seen.generation = 1;
+  }
+  return seen.generation;
+}
+
+// withSeen runs f with a dedup set for one call's searches, taken from the program when it holds one
+// and returned to it afterwards.
+function withSeen<T>(p: RegexProgram, f: (seen: RegexSeen) => T): T {
+  const seen = p.seen ?? { marks: new Uint32Array(p.insts.length), generation: 0 };
+  p.seen = null;
+  try {
+    return f(seen);
+  } finally {
+    p.seen = seen;
+  }
+}
 
 // regexIsMatch reports whether the pattern matches somewhere in input (the `~` operator).
 export function regexIsMatch(p: RegexProgram, input: number[], m: Meter): boolean {
@@ -674,35 +778,31 @@ export function regexIsMatch(p: RegexProgram, input: number[], m: Meter): boolea
 }
 
 // regexRun executes the Pike VM from the start of the input (regex.md §4). Returns the winning
-// thread's capture slots on a match (code-point offsets; -1 = unset), or null.
-export function regexRun(p: RegexProgram, input: number[], m: Meter): number[] | null {
-  return regexSearch(p, input, 0, m);
+// thread's capture slots on a match, or null.
+export function regexRun(p: RegexProgram, input: number[], m: Meter): CapNode | null {
+  return withSeen(p, (seen) => regexSearch(p, seen, input, 0, m));
 }
 
 // regexSearch runs the Pike VM, considering only matches that START at code-point position `start` or
 // later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
 // input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
 // guards once per input position.
-export function regexSearch(
+function regexSearch(
   p: RegexProgram,
+  seen: RegexSeen,
   input: number[],
   start: number,
   m: Meter,
-): number[] | null {
-  const nslots = 2 * (p.ngroups + 1);
+): CapNode | null {
   const len = input.length;
-  const seen = new Int32Array(p.insts.length);
-  let generation = 0;
   let clist: Thread[] = [];
   let nlist: Thread[] = [];
-  let matched: number[] | null = null;
+  let matched: CapNode | null = null;
 
-  generation++;
-  const initSaves = new Array<number>(nslots).fill(-1);
-  addThread(p, clist, seen, generation, 0, initSaves, start, len, m);
+  addThread(p, clist, seen, nextGeneration(seen), 0, null, start, len, m);
 
   for (let sp = start; sp <= len; sp++) {
-    generation++;
+    const generation = nextGeneration(seen);
     nlist.length = 0;
     inner: for (let i = 0; i < clist.length; i++) {
       const th = clist[i];
@@ -710,21 +810,21 @@ export function regexSearch(
       switch (inst.op) {
         case "char":
           if (sp < len && input[sp] === inst.ch) {
-            addThread(p, nlist, seen, generation, th.pc + 1, th.saves, sp + 1, len, m);
+            addThread(p, nlist, seen, generation, th.pc + 1, th.caps, sp + 1, len, m);
           }
           break;
         case "any":
           if (sp < len && input[sp] !== 0x0a) {
-            addThread(p, nlist, seen, generation, th.pc + 1, th.saves, sp + 1, len, m);
+            addThread(p, nlist, seen, generation, th.pc + 1, th.caps, sp + 1, len, m);
           }
           break;
         case "class":
           if (sp < len && classAdmits(p.classes[inst.x], input[sp])) {
-            addThread(p, nlist, seen, generation, th.pc + 1, th.saves, sp + 1, len, m);
+            addThread(p, nlist, seen, generation, th.pc + 1, th.caps, sp + 1, len, m);
           }
           break;
         case "match":
-          matched = th.saves;
+          matched = th.caps;
           break inner; // cut lower-priority threads (leftmost-first, regex.md §4)
       }
     }
@@ -744,45 +844,42 @@ export function regexSearch(
 function addThread(
   p: RegexProgram,
   list: Thread[],
-  seen: Int32Array,
+  seen: RegexSeen,
   generation: number,
   pc0: number,
-  saves0: number[],
+  caps0: CapNode | null,
   sp: number,
   len: number,
   m: Meter,
 ): void {
-  const stack: Thread[] = [{ pc: pc0, saves: saves0 }];
+  const stack: Thread[] = [{ pc: pc0, caps: caps0 }];
   while (stack.length > 0) {
     const top = stack.pop() as Thread;
-    if (seen[top.pc] === generation) continue;
-    seen[top.pc] = generation;
+    if (seen.marks[top.pc] === generation) continue;
+    seen.marks[top.pc] = generation;
     m.charge(COSTS.regexStep);
     const inst = p.insts[top.pc];
     switch (inst.op) {
       case "jmp":
-        stack.push({ pc: inst.x, saves: top.saves });
+        stack.push({ pc: inst.x, caps: top.caps });
         break;
       case "split":
         // Push y first, then x, so x pops first = higher priority.
-        stack.push({ pc: inst.y, saves: top.saves });
-        stack.push({ pc: inst.x, saves: top.saves });
+        stack.push({ pc: inst.y, caps: top.caps });
+        stack.push({ pc: inst.x, caps: top.caps });
         break;
-      case "save": {
-        const s = top.saves.slice();
-        s[inst.x] = sp;
-        stack.push({ pc: top.pc + 1, saves: s });
+      case "save":
+        stack.push({ pc: top.pc + 1, caps: withSlot(p, top.caps, inst.x, sp) });
         break;
-      }
       case "assertStart":
-        if (sp === 0) stack.push({ pc: top.pc + 1, saves: top.saves });
+        if (sp === 0) stack.push({ pc: top.pc + 1, caps: top.caps });
         break;
       case "assertEnd":
-        if (sp === len) stack.push({ pc: top.pc + 1, saves: top.saves });
+        if (sp === len) stack.push({ pc: top.pc + 1, caps: top.caps });
         break;
       default:
         // char / any / class / match — parked for the consume loop.
-        list.push({ pc: top.pc, saves: top.saves });
+        list.push(top);
         break;
     }
   }
@@ -800,22 +897,24 @@ export function replaceMatches(
   matchInput: number[],
   global: boolean,
   m: Meter,
-): number[][] {
-  const found: number[][] = [];
-  let pos = 0;
-  for (;;) {
-    const saves = regexSearch(p, matchInput, pos, m);
-    if (saves === null) break;
-    const s = saves[0];
-    const e = saves[1];
-    found.push(saves);
-    if (!global) break;
-    // Empty match: the next search starts past the char at `e`, so a pattern that can match empty
-    // (`a*`) cannot loop forever — the PG global rule.
-    pos = e > s ? e : e + 1;
-    if (pos > matchInput.length) break;
-  }
-  return found;
+): CapNode[] {
+  return withSeen(p, (seen) => {
+    const found: CapNode[] = [];
+    let pos = 0;
+    for (;;) {
+      const caps = regexSearch(p, seen, matchInput, pos, m);
+      if (caps === null) break;
+      const s = regexSlot(p, caps, 0);
+      const e = regexSlot(p, caps, 1);
+      found.push(caps);
+      if (!global) break;
+      // Empty match: the next search starts past the char at `e`, so a pattern that can match empty
+      // (`a*`) cannot loop forever — the PG global rule.
+      pos = e > s ? e : e + 1;
+      if (pos > matchInput.length) break;
+    }
+    return found;
+  });
 }
 
 // reportedGroups returns the capture groups regexp_match / regexp_matches report for a match (regex.md
@@ -829,12 +928,12 @@ function reportedGroups(p: RegexProgram): [number, number] {
 // a match's slots, computed from the spans without building it (cost.md §8.1): ARRAY_DIM, plus VALUE
 // and the span's UTF-8 bytes per reported group (an unset group is a bare VALUE). utf8At is
 // utf8Offsets of the subject, so each span is measured in O(1).
-export function captureArraySize(p: RegexProgram, saves: number[], utf8At: number[]): number {
+export function captureArraySize(p: RegexProgram, caps: CapNode, utf8At: number[]): number {
   let size = MEMORY_ARRAY_DIM;
   const [lo, hi] = reportedGroups(p);
   for (let g = lo; g <= hi; g++) {
-    const s = saves[2 * g];
-    const e = saves[2 * g + 1];
+    const s = regexSlot(p, caps, 2 * g);
+    const e = regexSlot(p, caps, 2 * g + 1);
     size += MEMORY_VALUE;
     if (s >= 0 && e >= 0) size += utf8At[e] - utf8At[s];
   }
@@ -843,10 +942,12 @@ export function captureArraySize(p: RegexProgram, saves: number[], utf8At: numbe
 
 // captureArray returns the capture array for a match's slots, sliced from the ORIGINAL-case subject:
 // the reported groups' substrings, an unset group null.
-export function captureArray(p: RegexProgram, saves: number[], orig: number[]): (string | null)[] {
+export function captureArray(p: RegexProgram, caps: CapNode, orig: number[]): (string | null)[] {
   const [lo, hi] = reportedGroups(p);
   const groups: (string | null)[] = [];
-  for (let g = lo; g <= hi; g++) groups.push(sliceGroup(orig, saves[2 * g], saves[2 * g + 1]));
+  for (let g = lo; g <= hi; g++) {
+    groups.push(sliceGroup(orig, regexSlot(p, caps, 2 * g), regexSlot(p, caps, 2 * g + 1)));
+  }
   return groups;
 }
 
@@ -863,6 +964,13 @@ export function utf8Offsets(orig: number[]): number[] {
   return offsets;
 }
 
+// cpsUtf8Length returns the UTF-8 byte length of the code points cps.
+export function cpsUtf8Length(cps: number[]): number {
+  let n = 0;
+  for (const cp of cps) n += cpUtf8Len(cp);
+  return n;
+}
+
 // regexpSplitPieces returns the pieces of regexp_split_to_array / regexp_split_to_table (regex.md
 // §8c): the text between consecutive matches, found with the global advance, then the text after the
 // last. PostgreSQL's DEGENERATE matches split nothing: an empty match at the start or end of the
@@ -875,25 +983,27 @@ export function regexpSplitPieces(
   origInput: number[],
   m: Meter,
 ): string[] {
-  const len = matchInput.length;
-  const pieces: string[] = [];
-  let pos = 0;
-  let prevEnd = 0; // the end of the previous match, degenerate or not
-  let pieceStart = 0; // the end of the previous SPLITTING match
-  while (pos <= len) {
-    const saves = regexSearch(p, matchInput, pos, m);
-    if (saves === null) break;
-    const s = saves[0];
-    const e = saves[1];
-    if (s < len && e > prevEnd) {
-      pieces.push(cpSlice(origInput, pieceStart, s));
-      pieceStart = e;
+  return withSeen(p, (seen) => {
+    const len = matchInput.length;
+    const pieces: string[] = [];
+    let pos = 0;
+    let prevEnd = 0; // the end of the previous match, degenerate or not
+    let pieceStart = 0; // the end of the previous SPLITTING match
+    while (pos <= len) {
+      const caps = regexSearch(p, seen, matchInput, pos, m);
+      if (caps === null) break;
+      const s = regexSlot(p, caps, 0);
+      const e = regexSlot(p, caps, 1);
+      if (s < len && e > prevEnd) {
+        pieces.push(cpSlice(origInput, pieceStart, s));
+        pieceStart = e;
+      }
+      prevEnd = e;
+      pos = e > s ? e : e + 1;
     }
-    prevEnd = e;
-    pos = e > s ? e : e + 1;
-  }
-  pieces.push(cpSlice(origInput, pieceStart, len));
-  return pieces;
+    pieces.push(cpSlice(origInput, pieceStart, len));
+    return pieces;
+  });
 }
 
 // regexpCount counts the non-overlapping matches at or after code-point position `start`
@@ -902,18 +1012,20 @@ export function regexpSplitPieces(
 // len (an empty match at the very end still counts); start > len (clamped to len+1 by the caller)
 // yields 0.
 export function regexpCount(p: RegexProgram, input: number[], start: number, m: Meter): number {
-  const len = input.length;
-  let pos = start;
-  let count = 0;
-  while (pos <= len) {
-    const saves = regexSearch(p, input, pos, m);
-    if (saves === null) break;
-    count++;
-    const s = saves[0];
-    const e = saves[1];
-    pos = e > s ? e : e + 1;
-  }
-  return count;
+  return withSeen(p, (seen) => {
+    const len = input.length;
+    let pos = start;
+    let count = 0;
+    while (pos <= len) {
+      const caps = regexSearch(p, seen, input, pos, m);
+      if (caps === null) break;
+      count++;
+      const s = regexSlot(p, caps, 0);
+      const e = regexSlot(p, caps, 1);
+      pos = e > s ? e : e + 1;
+    }
+    return count;
+  });
 }
 
 // regexpNthMatch returns the capture slots of the N-th (1-based) non-overlapping match at or after
@@ -925,20 +1037,22 @@ export function regexpNthMatch(
   start: number,
   n: number,
   m: Meter,
-): number[] | null {
-  const len = input.length;
-  let pos = start;
-  let count = 0;
-  while (pos <= len) {
-    const saves = regexSearch(p, input, pos, m);
-    if (saves === null) break;
-    count++;
-    if (count === n) return saves;
-    const s = saves[0];
-    const e = saves[1];
-    pos = e > s ? e : e + 1;
-  }
-  return null;
+): CapNode | null {
+  return withSeen(p, (seen) => {
+    const len = input.length;
+    let pos = start;
+    let count = 0;
+    while (pos <= len) {
+      const caps = regexSearch(p, seen, input, pos, m);
+      if (caps === null) break;
+      count++;
+      if (count === n) return caps;
+      const s = regexSlot(p, caps, 0);
+      const e = regexSlot(p, caps, 1);
+      pos = e > s ? e : e + 1;
+    }
+    return null;
+  });
 }
 
 // sliceGroup slices orig[start..end] to a string, or null for an unset (-1) group.
@@ -964,7 +1078,7 @@ type PieceFn = (cp: number, lo: number, hi: number) => void;
 // forEachPiece walks a replacement template, expanding \1..\9 (capture group), \& (whole match), \\
 // (literal backslash), and \<other> (the literal <other>). A trailing lone \ is literal, and an unset
 // or absent group expands to nothing. Sizing and building share this walk so they cannot disagree.
-function forEachPiece(repl: number[], saves: number[], f: PieceFn): void {
+function forEachPiece(p: RegexProgram, repl: number[], caps: CapNode, f: PieceFn): void {
   const span = (start: number, end: number): void => {
     if (start >= 0 && end >= 0) f(0, start, end);
   };
@@ -974,9 +1088,9 @@ function forEachPiece(repl: number[], saves: number[], f: PieceFn): void {
       const n = repl[i + 1];
       if (n >= 0x30 && n <= 0x39 /* 0-9 */) {
         const g = n - 0x30;
-        if (2 * g + 1 < saves.length) span(saves[2 * g], saves[2 * g + 1]);
+        if (g <= p.ngroups) span(regexSlot(p, caps, 2 * g), regexSlot(p, caps, 2 * g + 1));
       } else if (n === 0x26 /* & */) {
-        span(saves[0], saves[1]);
+        span(regexSlot(p, caps, 0), regexSlot(p, caps, 1));
       } else {
         f(n, -1, -1); // \\ -> \, and \<other> -> <other>
       }
@@ -989,13 +1103,19 @@ function forEachPiece(repl: number[], saves: number[], f: PieceFn): void {
 
 // forEachOutput walks the pieces of a replacement in output order: unmatched source text, each match's
 // expanded template, and, for an empty match, the code point after it.
-function forEachOutput(orig: number[], repl: number[], found: number[][], f: PieceFn): void {
+function forEachOutput(
+  p: RegexProgram,
+  orig: number[],
+  repl: number[],
+  found: CapNode[],
+  f: PieceFn,
+): void {
   let pos = 0;
-  for (const saves of found) {
-    const s = saves[0];
-    const e = saves[1];
+  for (const caps of found) {
+    const s = regexSlot(p, caps, 0);
+    const e = regexSlot(p, caps, 1);
     f(0, pos, s);
-    forEachPiece(repl, saves, f);
+    forEachPiece(p, repl, caps, f);
     if (e > s) {
       pos = e;
     } else {
@@ -1012,9 +1132,14 @@ function cpUtf8Len(cp: number): number {
 
 // replaceSize is the exact UTF-8 byte length of regexp_replace's result for the matches replaceMatches
 // found, computed without building it (cost.md §8.1).
-export function replaceSize(orig: number[], repl: number[], found: number[][]): bigint {
+export function replaceSize(
+  p: RegexProgram,
+  orig: number[],
+  repl: number[],
+  found: CapNode[],
+): bigint {
   let size = 0;
-  forEachOutput(orig, repl, found, (cp, lo, hi) => {
+  forEachOutput(p, orig, repl, found, (cp, lo, hi) => {
     if (lo < 0) size += cpUtf8Len(cp);
     else for (let i = lo; i < hi; i++) size += cpUtf8Len(orig[i]);
   });
@@ -1023,7 +1148,12 @@ export function replaceSize(orig: number[], repl: number[], found: number[][]): 
 
 // replaceBuild builds regexp_replace's result from the matches replaceMatches found. Code points are
 // converted in bounded chunks: spreading a large array into String.fromCodePoint overflows the stack.
-export function replaceBuild(orig: number[], repl: number[], found: number[][]): string {
+export function replaceBuild(
+  p: RegexProgram,
+  orig: number[],
+  repl: number[],
+  found: CapNode[],
+): string {
   const parts: string[] = [];
   let chunk: number[] = [];
   const push = (cp: number): void => {
@@ -1033,7 +1163,7 @@ export function replaceBuild(orig: number[], repl: number[], found: number[][]):
       chunk = [];
     }
   };
-  forEachOutput(orig, repl, found, (cp, lo, hi) => {
+  forEachOutput(p, orig, repl, found, (cp, lo, hi) => {
     if (lo < 0) push(cp);
     else for (let i = lo; i < hi; i++) push(orig[i]);
   });

@@ -267,13 +267,18 @@ func replaceText(s, from, to string, m *costMeter) (string, error) {
 
 // regexpReplaceText is regexp_replace (regex.md §8): run the whole search, then size the result
 // exactly, cap it at maxResultChars (54000), charge and reserve it, and splice it from the recorded
-// matches. An amplifier (cost.md §8.1); the search's regex_steps are its input charge.
+// matches. An amplifier (cost.md §8.1): its input charge is the search's regex_steps plus the
+// replacement's UTF-8 bytes once per match, since sizing and building expand the template per match.
 func regexpReplaceText(prog *regexProgram, matchRunes, origRunes, repl []rune, global bool, m *costMeter) (string, error) {
 	found, err := prog.replaceMatches(matchRunes, global, m)
 	if err != nil {
 		return "", err
 	}
-	size := replaceSize(origRunes, repl, found)
+	m.Charge(costs.ScalarByte * utf8RunesLen(repl) * int64(len(found)))
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	size := prog.replaceSize(origRunes, repl, found)
 	if size > maxResultChars {
 		return "", newError(ProgramLimitExceeded, "requested length too large")
 	}
@@ -284,14 +289,15 @@ func regexpReplaceText(prog *regexProgram, matchRunes, origRunes, repl []rune, g
 	if err := m.ReserveScalar(size); err != nil {
 		return "", err
 	}
-	return replaceBuild(origRunes, repl, found, size), nil
+	return prog.replaceBuild(origRunes, repl, found, size), nil
 }
 
 // regexpCaptureArrays is regexp_match / regexp_matches (regex.md §8/§8c): one text[] capture array
 // for the first match, or for every non-overlapping match when global; no match gives none. An
 // amplifier (cost.md §8.1): nested groups capture the same text once each, so the pattern multiplies
-// the subject. The search's regex_steps are its input charge; the arrays' exact payload is then
-// computed from the capture spans, charged, and reserved before any is built.
+// the subject. The search's regex_steps are its input charge. Each array's exact payload is computed
+// from the capture spans and charged as it is sized, so sizing many matches of a many-group pattern
+// stops at the ceiling; the sum is reserved before any array is built.
 func regexpCaptureArrays(prog *regexProgram, matchRunes, origRunes []rune, global bool, m *costMeter) ([]Value, error) {
 	found, err := prog.replaceMatches(matchRunes, global, m)
 	if err != nil || len(found) == 0 {
@@ -299,19 +305,20 @@ func regexpCaptureArrays(prog *regexProgram, matchRunes, origRunes []rune, globa
 	}
 	utf8At := utf8Offsets(origRunes)
 	var size int64
-	for _, saves := range found {
-		size += prog.captureArraySize(saves, utf8At)
-	}
-	m.Charge(costs.ScalarByte * size)
-	if err := m.Guard(); err != nil {
-		return nil, err
+	for _, caps := range found {
+		arraySize := prog.captureArraySize(caps, utf8At)
+		m.Charge(costs.ScalarByte * arraySize)
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		size += arraySize
 	}
 	if err := m.ReserveScalar(size); err != nil {
 		return nil, err
 	}
 	arrays := make([]Value, len(found))
-	for i, saves := range found {
-		groups := prog.captureArray(saves, origRunes)
+	for i, caps := range found {
+		groups := prog.captureArray(caps, origRunes)
 		elems := make([]Value, len(groups))
 		for j, g := range groups {
 			if g == nil {

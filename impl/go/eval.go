@@ -2340,7 +2340,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return IntValue(cnt), nil
 		default: // rxSubstr, rxInstr — both find the N-th match's subexpr span.
-			saves, err := prog.nthMatch(matchRunes, int(start0), nth, m)
+			caps, err := prog.nthMatch(matchRunes, int(start0), nth, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2350,17 +2350,16 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				return IntValue(0)
 			}
-			if saves == nil {
+			if caps == nil {
 				return noMatch(), nil
 			}
 			// `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
 			// or a non-participating group (-1) → NULL / 0.
-			ng := int64(len(saves)/2 - 1)
-			if subexpr > ng {
+			if subexpr > int64(prog.ngroups) {
 				return noMatch(), nil
 			}
-			si := 2 * subexpr
-			s2, e2 := saves[si], saves[si+1]
+			si := 2 * int(subexpr)
+			s2, e2 := prog.slot(caps, si), prog.slot(caps, si+1)
 			if s2 < 0 || e2 < 0 {
 				return noMatch(), nil
 			}

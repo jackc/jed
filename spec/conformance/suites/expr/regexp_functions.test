@@ -17,9 +17,10 @@ INSERT INTO one VALUES (1)
 
 # regexp_replace replaces the FIRST match by default.
 # Cost (cost.md §3): operatorEval + regex_compile (pattern 'o' = 7 instructions, once) + regex_step
-# (16 — one search over 'foobar') + 1 scanned + 1 page + 1 produced = 1+1+1+7+16+1.
+# (16 — one search over 'foobar') + 1 scanned + 1 page + 1 produced, plus scalar_byte (cost.md §8.1)
+# for the replacement's 1 byte once per match and the 6-byte result = 1+1+1+7+16+1+1+6.
 # names: regexp_replace
-# cost: 33
+# cost: 34
 query T nosort
 SELECT regexp_replace('foobar', 'o', 'X') FROM one
 ----

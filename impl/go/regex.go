@@ -13,6 +13,7 @@ package jed
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -69,11 +70,15 @@ func (c *regexClass) admits(r rune) bool {
 }
 
 // regexProgram is a compiled pattern: the instruction array, the class table, and the capturing-
-// group count (excluding group 0, the whole match).
+// group count (excluding group 0, the whole match), plus the shape of its capture-slot trees (capShape)
+// and a pool of dedup sets (regexSeen) that its searches reuse.
 type regexProgram struct {
-	insts   []regexInst
-	classes []regexClass
-	ngroups int
+	insts      []regexInst
+	classes    []regexClass
+	ngroups    int
+	capDepth   int
+	capLeafLen int
+	seenPool   sync.Pool
 }
 
 func (p *regexProgram) ninst() int { return len(p.insts) }
@@ -806,7 +811,93 @@ func compileRegex(pattern string) (*regexProgram, error) {
 	if _, err := c.push(regexInst{op: opMatch}); err != nil {
 		return nil, err
 	}
-	return &regexProgram{insts: c.insts, classes: c.classes, ngroups: p.ngroups}, nil
+	prog := &regexProgram{insts: c.insts, classes: c.classes, ngroups: p.ngroups}
+	prog.capDepth, prog.capLeafLen = capShape(2 * (p.ngroups + 1))
+	return prog, nil
+}
+
+// ---------------------------------------------------------------------------
+// Capture slots — a persistent array (regex.md §4.1)
+// ---------------------------------------------------------------------------
+
+// A capture-slot tree's leaves hold capFan slots and its interior nodes capFan subtrees. Every group
+// emits two Saves, so a program's 2·(ngroups+1) slots never exceed maxRegexProgram and fit in four
+// levels.
+const (
+	capFanBits = 4
+	capFan     = 1 << capFanBits
+)
+
+// capNode is a node of a thread's capture slots, a persistent array (regex.md §4.1). A Save makes a
+// new version by copying only the nodes on the path to the slot it sets, at most capFan entries per
+// level, so its work is bounded however many groups the pattern has; the older version stays intact
+// for the threads still holding it. A leaf holds slot values (code-point offsets; -1 = unset), an
+// interior node its subtrees. A nil node means every slot under it is unset, so a search starts from
+// a nil root. A match has set slots 0 and 1, so its root is never nil.
+type capNode struct {
+	vals []int64
+	kids []*capNode
+}
+
+// capShape returns the depth of the capture-slot tree for nslots slots and the length of its leaves:
+// a one-level tree is a single leaf of exactly nslots slots, a deeper one has full leaves.
+func capShape(nslots int) (depth, leafLen int) {
+	depth = 1
+	for span := capFan; span < nslots; span *= capFan {
+		depth++
+	}
+	if depth == 1 {
+		return 1, nslots
+	}
+	return depth, capFan
+}
+
+// slot returns capture slot i of a thread's or match's slots (-1 = unset).
+func (p *regexProgram) slot(caps *capNode, i int) int64 {
+	n := caps
+	for shift := capFanBits * (p.capDepth - 1); shift > 0 && n != nil; shift -= capFanBits {
+		n = n.kids[(i>>shift)&(capFan-1)]
+	}
+	if n == nil {
+		return -1
+	}
+	return n.vals[i&(capFan-1)]
+}
+
+// withSlot returns the version of caps with slot i set to v, sharing every node off the path to it.
+func (p *regexProgram) withSlot(caps *capNode, i int, v int64) *capNode {
+	return p.withSlotAt(caps, capFanBits*(p.capDepth-1), i, v)
+}
+
+func (p *regexProgram) withSlotAt(n *capNode, shift, i int, v int64) *capNode {
+	if shift == 0 {
+		vals := make([]int64, p.capLeafLen)
+		if n != nil {
+			copy(vals, n.vals)
+		} else {
+			for j := range vals {
+				vals[j] = -1
+			}
+		}
+		vals[i&(capFan-1)] = v
+		return &capNode{vals: vals}
+	}
+	kids := make([]*capNode, capFan)
+	if n != nil {
+		copy(kids, n.kids)
+	}
+	k := (i >> shift) & (capFan - 1)
+	kids[k] = p.withSlotAt(kids[k], shift-capFanBits, i, v)
+	return &capNode{kids: kids}
+}
+
+// slots returns every capture slot of caps as a flat array.
+func (p *regexProgram) slots(caps *capNode) []int64 {
+	out := make([]int64, 2*(p.ngroups+1))
+	for i := range out {
+		out[i] = p.slot(caps, i)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +905,37 @@ func compileRegex(pattern string) (*regexProgram, error) {
 // ---------------------------------------------------------------------------
 
 type regexThread struct {
-	pc    int
-	saves []int64
+	pc   int
+	caps *capNode
+}
+
+// regexSeen is the per-position dedup set (regex.md §4): marks[pc] == generation means pc was visited
+// at the current position, so moving to the next position is an increment, not a clear. A program
+// pools its sets and reuses them across searches and rows, so a search does no setup work in
+// proportion to the program, only the states it explores, which regex_step meters (§4.2).
+type regexSeen struct {
+	marks      []uint32
+	generation uint32
+}
+
+// next starts a new generation. When the counter wraps, the stale marks could alias the new
+// generation, so they are cleared.
+func (s *regexSeen) next() uint32 {
+	s.generation++
+	if s.generation == 0 {
+		clear(s.marks)
+		s.generation = 1
+	}
+	return s.generation
+}
+
+// takeSeen returns a dedup set for one call's searches, from the program's pool when it has one. The
+// caller returns it with p.seenPool.Put.
+func (p *regexProgram) takeSeen() *regexSeen {
+	if s, ok := p.seenPool.Get().(*regexSeen); ok {
+		return s
+	}
+	return &regexSeen{marks: make([]uint32, len(p.insts))}
 }
 
 // isMatch reports whether the pattern matches somewhere in input (the `~` operator).
@@ -825,35 +945,29 @@ func (p *regexProgram) isMatch(input []rune, m *costMeter) (bool, error) {
 }
 
 // run executes the Pike VM from the start of the input (regex.md §4). Returns the winning thread's
-// capture slots on a match (code-point offsets; -1 = unset), or nil.
-func (p *regexProgram) run(input []rune, m *costMeter) ([]int64, error) {
-	return p.search(input, 0, m)
+// capture slots on a match, or nil.
+func (p *regexProgram) run(input []rune, m *costMeter) (*capNode, error) {
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
+	return p.search(seen, input, 0, m)
 }
 
 // search runs the Pike VM, considering only matches that START at code-point position `start` or
 // later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
 // input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
 // guards once per input position.
-func (p *regexProgram) search(input []rune, start int, m *costMeter) ([]int64, error) {
-	nslots := 2 * (p.ngroups + 1)
+func (p *regexProgram) search(seen *regexSeen, input []rune, start int, m *costMeter) (*capNode, error) {
 	length := len(input)
-	seen := make([]uint32, len(p.insts))
-	var generation uint32
 	clist := []regexThread{}
 	nlist := []regexThread{}
-	var matched []int64
+	var matched *capNode
 
-	generation++
-	initSaves := make([]int64, nslots)
-	for i := range initSaves {
-		initSaves[i] = -1
-	}
-	if err := p.addThread(&clist, seen, generation, 0, initSaves, start, length, m); err != nil {
+	if err := p.addThread(&clist, seen, seen.next(), 0, nil, start, length, m); err != nil {
 		return nil, err
 	}
 
 	for sp := start; sp <= length; sp++ {
-		generation++
+		generation := seen.next()
 		nlist = nlist[:0]
 	inner:
 		for i := 0; i < len(clist); i++ {
@@ -862,24 +976,24 @@ func (p *regexProgram) search(input []rune, start int, m *costMeter) ([]int64, e
 			switch in.op {
 			case opChar:
 				if sp < length && input[sp] == in.ch {
-					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.saves, sp+1, length, m); err != nil {
+					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
 						return nil, err
 					}
 				}
 			case opAny:
 				if sp < length && input[sp] != '\n' {
-					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.saves, sp+1, length, m); err != nil {
+					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
 						return nil, err
 					}
 				}
 			case opClass:
 				if sp < length && p.classes[in.x].admits(input[sp]) {
-					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.saves, sp+1, length, m); err != nil {
+					if err := p.addThread(&nlist, seen, generation, th.pc+1, th.caps, sp+1, length, m); err != nil {
 						return nil, err
 					}
 				}
 			case opMatch:
-				matched = th.saves
+				matched = th.caps
 				break inner // cut lower-priority threads (leftmost-first, regex.md §4)
 			}
 		}
@@ -898,44 +1012,37 @@ func (p *regexProgram) search(input []rune, start int, m *costMeter) ([]int64, e
 // consuming/Match threads to *list, deduping by pc within this generation. Iterative (explicit
 // stack) so a long Jmp/Split chain cannot overflow the native stack; the y arm of a Split is pushed
 // before x so x is processed first (higher priority). Charges regex_step per explored state.
-func (p *regexProgram) addThread(list *[]regexThread, seen []uint32, generation uint32, pc0 int, saves0 []int64, sp, length int, m *costMeter) error {
-	type frame struct {
-		pc    int
-		saves []int64
-	}
-	stack := []frame{{pc0, saves0}}
+func (p *regexProgram) addThread(list *[]regexThread, seen *regexSeen, generation uint32, pc0 int, caps0 *capNode, sp, length int, m *costMeter) error {
+	stack := []regexThread{{pc0, caps0}}
 	for len(stack) > 0 {
 		top := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if seen[top.pc] == generation {
+		if seen.marks[top.pc] == generation {
 			continue
 		}
-		seen[top.pc] = generation
+		seen.marks[top.pc] = generation
 		m.Charge(costs.RegexStep)
 		in := p.insts[top.pc]
 		switch in.op {
 		case opJmp:
-			stack = append(stack, frame{in.x, top.saves})
+			stack = append(stack, regexThread{in.x, top.caps})
 		case opSplit:
 			// Push y first, then x, so x pops first = higher priority.
-			stack = append(stack, frame{in.y, top.saves})
-			stack = append(stack, frame{in.x, top.saves})
+			stack = append(stack, regexThread{in.y, top.caps})
+			stack = append(stack, regexThread{in.x, top.caps})
 		case opSave:
-			s := make([]int64, len(top.saves))
-			copy(s, top.saves)
-			s[in.x] = int64(sp)
-			stack = append(stack, frame{top.pc + 1, s})
+			stack = append(stack, regexThread{top.pc + 1, p.withSlot(top.caps, in.x, int64(sp))})
 		case opAssertStart:
 			if sp == 0 {
-				stack = append(stack, frame{top.pc + 1, top.saves})
+				stack = append(stack, regexThread{top.pc + 1, top.caps})
 			}
 		case opAssertEnd:
 			if sp == length {
-				stack = append(stack, frame{top.pc + 1, top.saves})
+				stack = append(stack, regexThread{top.pc + 1, top.caps})
 			}
 		default:
 			// Char / Any / Class / Match — parked for the consume loop.
-			*list = append(*list, regexThread{pc: top.pc, saves: top.saves})
+			*list = append(*list, top)
 		}
 	}
 	return nil
@@ -955,11 +1062,11 @@ func (p *regexProgram) reportedGroups() (lo, hi int) {
 // a match's slots, computed from the spans without building it (cost.md §8.1): ARRAY_DIM, plus VALUE
 // and the span's UTF-8 bytes per reported group (an unset group is a bare VALUE). utf8At is
 // utf8Offsets of the subject, so each span is measured in O(1).
-func (p *regexProgram) captureArraySize(saves, utf8At []int64) int64 {
+func (p *regexProgram) captureArraySize(caps *capNode, utf8At []int64) int64 {
 	size := memoryArrayDim
 	lo, hi := p.reportedGroups()
 	for g := lo; g <= hi; g++ {
-		s, e := saves[2*g], saves[2*g+1]
+		s, e := p.slot(caps, 2*g), p.slot(caps, 2*g+1)
 		size += memoryValue
 		if s >= 0 && e >= 0 {
 			size += utf8At[e] - utf8At[s]
@@ -970,11 +1077,11 @@ func (p *regexProgram) captureArraySize(saves, utf8At []int64) int64 {
 
 // captureArray returns the capture array for a match's slots, sliced from the ORIGINAL-case subject:
 // the reported groups' substrings, an unset group nil.
-func (p *regexProgram) captureArray(saves []int64, orig []rune) []*string {
+func (p *regexProgram) captureArray(caps *capNode, orig []rune) []*string {
 	lo, hi := p.reportedGroups()
 	groups := make([]*string, 0, hi-lo+1)
 	for g := lo; g <= hi; g++ {
-		groups = append(groups, sliceGroup(orig, saves[2*g], saves[2*g+1]))
+		groups = append(groups, sliceGroup(orig, p.slot(caps, 2*g), p.slot(caps, 2*g+1)))
 	}
 	return groups
 }
@@ -991,6 +1098,15 @@ func utf8Offsets(orig []rune) []int64 {
 	return offsets
 }
 
+// utf8RunesLen returns the UTF-8 byte length of runes.
+func utf8RunesLen(runes []rune) int64 {
+	var n int64
+	for _, c := range runes {
+		n += int64(utf8.RuneLen(c))
+	}
+	return n
+}
+
 // splitPieces returns the pieces of regexp_split_to_array / regexp_split_to_table (regex.md §8c):
 // the text between consecutive matches, found with the global advance, then the text after the
 // last. PostgreSQL's DEGENERATE matches split nothing: an empty match at the start or end of the
@@ -998,20 +1114,22 @@ func utf8Offsets(orig []rune) []int64 {
 // split of the empty string is one empty piece. The pieces are sliced from the ORIGINAL-case subject
 // (same length as the matched one).
 func (p *regexProgram) splitPieces(matchInput, origInput []rune, m *costMeter) ([]string, error) {
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
 	length := len(matchInput)
 	var pieces []string
 	pos := 0
 	prevEnd := 0    // the end of the previous match, degenerate or not
 	pieceStart := 0 // the end of the previous SPLITTING match
 	for pos <= length {
-		saves, err := p.search(matchInput, pos, m)
+		caps, err := p.search(seen, matchInput, pos, m)
 		if err != nil {
 			return nil, err
 		}
-		if saves == nil {
+		if caps == nil {
 			break
 		}
-		s, e := int(saves[0]), int(saves[1])
+		s, e := int(p.slot(caps, 0)), int(p.slot(caps, 1))
 		if s < length && e > prevEnd {
 			pieces = append(pieces, string(origInput[pieceStart:s]))
 			pieceStart = e
@@ -1034,20 +1152,22 @@ func (p *regexProgram) splitPieces(matchInput, origInput []rune, m *costMeter) (
 // and splice from these slots without searching again (cost.md §8.1).
 // regexp_match (never global) and regexp_matches run the same search, then size and slice their
 // capture arrays from the slots (captureArraySize, captureArray).
-func (p *regexProgram) replaceMatches(matchInput []rune, global bool, m *costMeter) ([][]int64, error) {
-	var found [][]int64
+func (p *regexProgram) replaceMatches(matchInput []rune, global bool, m *costMeter) ([]*capNode, error) {
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
+	var found []*capNode
 	pos := 0
 	for {
-		saves, err := p.search(matchInput, pos, m)
+		caps, err := p.search(seen, matchInput, pos, m)
 		if err != nil {
 			return nil, err
 		}
-		if saves == nil {
+		if caps == nil {
 			break
 		}
-		s := int(saves[0])
-		e := int(saves[1])
-		found = append(found, saves)
+		s := int(p.slot(caps, 0))
+		e := int(p.slot(caps, 1))
+		found = append(found, caps)
 		if !global {
 			break
 		}
@@ -1071,19 +1191,21 @@ func (p *regexProgram) replaceMatches(matchInput []rune, global bool, m *costMet
 // len (an empty match at the very end still counts); start > len (clamped to len+1 by the caller)
 // yields 0.
 func (p *regexProgram) regexpCount(input []rune, start int, m *costMeter) (int64, error) {
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
 	length := len(input)
 	pos := start
 	var count int64
 	for pos <= length {
-		saves, err := p.search(input, pos, m)
+		caps, err := p.search(seen, input, pos, m)
 		if err != nil {
 			return 0, err
 		}
-		if saves == nil {
+		if caps == nil {
 			break
 		}
 		count++
-		s, e := int(saves[0]), int(saves[1])
+		s, e := int(p.slot(caps, 0)), int(p.slot(caps, 1))
 		if e > s {
 			pos = e
 		} else {
@@ -1096,23 +1218,25 @@ func (p *regexProgram) regexpCount(input []rune, start int, m *costMeter) (int64
 // nthMatch returns the capture slots of the N-th (1-based) non-overlapping match at or after `start`
 // (regexp_substr / regexp_instr, regex.md §8b), or nil when fewer than N matches exist. Same
 // non-overlapping advance as regexpCount.
-func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *costMeter) ([]int64, error) {
+func (p *regexProgram) nthMatch(input []rune, start int, n int64, m *costMeter) (*capNode, error) {
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
 	length := len(input)
 	pos := start
 	var count int64
 	for pos <= length {
-		saves, err := p.search(input, pos, m)
+		caps, err := p.search(seen, input, pos, m)
 		if err != nil {
 			return nil, err
 		}
-		if saves == nil {
+		if caps == nil {
 			break
 		}
 		count++
 		if count == n {
-			return saves, nil
+			return caps, nil
 		}
-		s, e := int(saves[0]), int(saves[1])
+		s, e := int(p.slot(caps, 0)), int(p.slot(caps, 1))
 		if e > s {
 			pos = e
 		} else {
@@ -1135,7 +1259,7 @@ func sliceGroup(orig []rune, start, end int64) *string {
 // (literal backslash), and \<other> (the literal <other>). A trailing lone \ is literal, and an unset
 // or absent group expands to nothing. Each piece is a literal rune (lo < 0) or the [lo, hi) span of
 // the original input. Sizing and building share this walk so they cannot disagree.
-func forEachPiece(repl []rune, saves []int64, f func(r rune, lo, hi int)) {
+func (p *regexProgram) forEachPiece(repl []rune, caps *capNode, f func(r rune, lo, hi int)) {
 	span := func(start, end int64) {
 		if start >= 0 && end >= 0 {
 			f(0, int(start), int(end))
@@ -1148,11 +1272,11 @@ func forEachPiece(repl []rune, saves []int64, f func(r rune, lo, hi int)) {
 			switch {
 			case n >= '0' && n <= '9':
 				g := int(n - '0')
-				if 2*g+1 < len(saves) {
-					span(saves[2*g], saves[2*g+1])
+				if g <= p.ngroups {
+					span(p.slot(caps, 2*g), p.slot(caps, 2*g+1))
 				}
 			case n == '&':
-				span(saves[0], saves[1])
+				span(p.slot(caps, 0), p.slot(caps, 1))
 			default:
 				f(n, -1, -1) // \\ -> \, and \<other> -> <other>
 			}
@@ -1165,13 +1289,13 @@ func forEachPiece(repl []rune, saves []int64, f func(r rune, lo, hi int)) {
 
 // forEachOutput walks the pieces of a replacement in output order: unmatched source text, each match's
 // expanded template, and, for an empty match, the rune after it.
-func forEachOutput(orig, repl []rune, found [][]int64, f func(r rune, lo, hi int)) {
+func (p *regexProgram) forEachOutput(orig, repl []rune, found []*capNode, f func(r rune, lo, hi int)) {
 	pos := 0
-	for _, saves := range found {
-		s := int(saves[0])
-		e := int(saves[1])
+	for _, caps := range found {
+		s := int(p.slot(caps, 0))
+		e := int(p.slot(caps, 1))
 		f(0, pos, s)
-		forEachPiece(repl, saves, f)
+		p.forEachPiece(repl, caps, f)
 		if e > s {
 			pos = e
 		} else {
@@ -1188,9 +1312,9 @@ func forEachOutput(orig, repl []rune, found [][]int64, f func(r rune, lo, hi int
 
 // replaceSize is the exact UTF-8 byte length of regexp_replace's result for the matches replaceMatches
 // found, computed without building it (cost.md §8.1).
-func replaceSize(orig, repl []rune, found [][]int64) int64 {
+func (p *regexProgram) replaceSize(orig, repl []rune, found []*capNode) int64 {
 	var size int64
-	forEachOutput(orig, repl, found, func(r rune, lo, hi int) {
+	p.forEachOutput(orig, repl, found, func(r rune, lo, hi int) {
 		if lo < 0 {
 			size += int64(utf8.RuneLen(r))
 			return
@@ -1203,10 +1327,10 @@ func replaceSize(orig, repl []rune, found [][]int64) int64 {
 }
 
 // replaceBuild builds regexp_replace's result of size bytes from the matches replaceMatches found.
-func replaceBuild(orig, repl []rune, found [][]int64, size int64) string {
+func (p *regexProgram) replaceBuild(orig, repl []rune, found []*capNode, size int64) string {
 	var b strings.Builder
 	b.Grow(int(size))
-	forEachOutput(orig, repl, found, func(r rune, lo, hi int) {
+	p.forEachOutput(orig, repl, found, func(r rune, lo, hi int) {
 		if lo < 0 {
 			b.WriteRune(r)
 			return

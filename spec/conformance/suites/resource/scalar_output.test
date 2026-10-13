@@ -324,12 +324,27 @@ hééllo
 statement error 54P04
 SELECT regexp_replace('héllo', '(é)', '\1\1')
 
-# The regex search cost is unchanged; the output adds its bytes ('bXana', 5).
-# cost: 37
+# The regex search cost is unchanged; the replacement adds its bytes once per match ('X', 1) and the
+# output its own ('bXana', 5).
+# cost: 38
 query T nosort
 SELECT regexp_replace('banana', 'an', 'X')
 ----
 bXana
+
+# The template is charged per match even where it expands to nothing: \9 names no group, so each of
+# the three matches charges the template's 2 bytes and the output is 'bnn', 3 bytes.
+# cost: 70
+query T nosort
+SELECT regexp_replace('banana', 'a', '\9', 'g')
+----
+bnn
+
+# So a template of empty references cannot expand over many matches for free: 100 matches of a
+# 200-byte template charge 20000, and the output is empty.
+# max_cost: 10000
+statement error 54P01
+SELECT regexp_replace(repeat('x', 100), 'x', repeat('\9', 100), 'g')
 
 # === array_replace ===
 

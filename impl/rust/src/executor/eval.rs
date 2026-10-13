@@ -1489,15 +1489,14 @@ impl RExpr {
                     }
                     RegexFunc::Substr => match prog.nth_match(&match_chars, start0, nth, m)? {
                         None => Ok(Value::Null),
-                        Some(saves) => {
+                        Some(caps) => {
                             // `subexpr` selects the whole match (0) or a capture group; out of range
                             // (> group count) or a non-participating group (-1) → NULL.
-                            let ng = (saves.len() / 2 - 1) as i64;
-                            if subexpr > ng {
+                            if subexpr > prog.ngroups as i64 {
                                 return Ok(Value::Null);
                             }
                             let si = 2 * subexpr as usize;
-                            let (s2, e2) = (saves[si], saves[si + 1]);
+                            let (s2, e2) = (prog.slot(&caps, si), prog.slot(&caps, si + 1));
                             if s2 < 0 || e2 < 0 {
                                 return Ok(Value::Null);
                             }
@@ -1508,13 +1507,12 @@ impl RExpr {
                     },
                     RegexFunc::Instr => match prog.nth_match(&match_chars, start0, nth, m)? {
                         None => Ok(Value::Int(0)),
-                        Some(saves) => {
-                            let ng = (saves.len() / 2 - 1) as i64;
-                            if subexpr > ng {
+                        Some(caps) => {
+                            if subexpr > prog.ngroups as i64 {
                                 return Ok(Value::Int(0));
                             }
                             let si = 2 * subexpr as usize;
-                            let (s2, e2) = (saves[si], saves[si + 1]);
+                            let (s2, e2) = (prog.slot(&caps, si), prog.slot(&caps, si + 1));
                             if s2 < 0 || e2 < 0 {
                                 return Ok(Value::Int(0));
                             }

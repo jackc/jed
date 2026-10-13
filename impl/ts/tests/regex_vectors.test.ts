@@ -16,6 +16,7 @@ import {
   regexListing,
   regexNinst,
   regexRun,
+  regexSlots,
 } from "../src/regex.ts";
 import { specPath } from "./tomlmini.ts";
 
@@ -124,7 +125,11 @@ test("regex match vectors match spec/regex/match_vectors.toml", () => {
     const wantMatched = c.get("matched") === "true";
     assert.equal(caps !== null, wantMatched, `matched for ${pattern}/${input}`);
     const wantCaps = wantMatched ? parsePairs(c.get("caps")) : [];
-    assert.deepEqual(caps ?? [], wantCaps, `caps for ${pattern}/${input}`);
+    assert.deepEqual(
+      caps === null ? [] : regexSlots(prog, caps),
+      wantCaps,
+      `caps for ${pattern}/${input}`,
+    );
     assert.equal(m.accrued, BigInt(Number(c.get("steps"))), `steps for ${pattern}/${input}`);
   }
 });

@@ -181,11 +181,12 @@ func TestRegexMatchVectors(t *testing.T) {
 		if wantMatched {
 			wantCaps = parsePairs(c["caps"])
 		}
-		if caps == nil {
-			caps = nil
+		var gotCaps []int64
+		if caps != nil {
+			gotCaps = prog.slots(caps)
 		}
-		if !reflect.DeepEqual(caps, wantCaps) {
-			t.Errorf("caps for %q/%q: got %v want %v", pattern, input, caps, wantCaps)
+		if !reflect.DeepEqual(gotCaps, wantCaps) {
+			t.Errorf("caps for %q/%q: got %v want %v", pattern, input, gotCaps, wantCaps)
 		}
 		wantSteps, _ := strconv.ParseInt(c["steps"], 10, 64)
 		if m.Accrued != wantSteps {

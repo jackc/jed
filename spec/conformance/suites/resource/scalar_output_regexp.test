@@ -2,8 +2,9 @@
 # memory.md §1). regexp_match and regexp_matches are amplifiers: nested groups capture the same text
 # once each, so the pattern multiplies the subject by its group count. Each runs its whole search,
 # then sizes its text[] capture arrays exactly from the capture spans (16 per dimension, plus 32 and
-# the UTF-8 bytes of each element; an unset group is a bare 32), charges scalar_byte for that size,
-# and reserves it against the scalar allowance before building anything, even over constants.
+# the UTF-8 bytes of each element; an unset group is a bare 32), charges scalar_byte for each array as
+# it sizes it, and reserves the total against the scalar allowance before building anything, even
+# over constants.
 # The splits and regexp_substr return pieces of the subject and are not covered.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.set_returning, func.array, func.regexp_match, func.regexp_matches, func.regexp_split_to_array, func.regexp_split_to_table, func.regexp_substr, types.array, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory

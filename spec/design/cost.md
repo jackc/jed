@@ -373,6 +373,9 @@ still real and an attacker can still drive it (a large pattern, a long subject, 
   consume loop or the epsilon-closure. The per-position **dedup-by-pc** bounds the threads at any
   input position to `≤ |program|`, so total `regex_step ≤ |program| × (|input| + 1)` — linear, the
   RE2 bound. Guarded once per input position, so a runaway match aborts `54P01` deterministically.
+  A step stands for bounded work: a `Save` makes a new version of the thread's capture slots by
+  copying at most four 16-entry nodes, however many groups the pattern has, and a search reuses the
+  program's dedup set rather than clearing one per search (regex.md §4.1–§4.2).
 
 The `~`/`~*`/`!~`/`!~*` node charges **one** `operator_eval` for the whole match (the LIKE
 precedent), and `regex_step` on top — which is the per-step work LIKE's matcher leaves unmetered
@@ -2020,7 +2023,7 @@ count (up to about 16k groups under `MAX_REGEX_PROGRAM`, [regex.md](regex.md) §
 | text `\|\|` | growth | S1 | — | UTF-8 bytes of the result |
 | `overlay` (text, bytea) | growth | S1 | — | UTF-8 bytes (text) or byte length (bytea) of the result |
 | `replace(s, from, to)` | amplifier | S1 | UTF-8 bytes of `s` | UTF-8 bytes of the result |
-| `regexp_replace` | amplifier | S1 | none beyond `regex_step` | UTF-8 bytes of the result |
+| `regexp_replace` | amplifier | S1 | `regex_step`, plus UTF-8 bytes of the replacement once per match | UTF-8 bytes of the result |
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
 | `regexp_match`, `regexp_matches` | amplifier | S4 | none beyond `regex_step` | Σ `payload` of the capture arrays |
 | jsonb `\|\|`, `jsonb_set`, `jsonb_set_lax` (its set branches), `jsonb_insert`, `json[b]_build_array`/`_object` (spread or `VARIADIC`), `json[b]_object(text[] [, text[]])`, `to_json`, `to_jsonb`, `array_to_json`, `row_to_json`, `JSON_SCALAR`, `JSON_SERIALIZE`, `jsonb_path_query_array`, `JSON_QUERY` when a wrapper builds an array | growth | S2 | — | `payload(result)` |
@@ -2037,7 +2040,10 @@ The amplifiers' exact sizes:
   boundaries in both encodings.
 - `regexp_replace`: the kernel first runs its whole search, recording every match's
   capture slots. That is the search the kernel already performs, and it charges the
-  same `regex_step`s. The size is the UTF-8 length of the unmatched spans plus each
+  same `regex_step`s. Sizing and building expand the template once per match, and a
+  reference to an unset or absent group (`` with fewer groups) expands to nothing, so
+  the output does not pay for that walk. The kernel therefore charges `scalar_byte` for
+  the replacement's UTF-8 bytes once per match, and guards, before it sizes. The size is the UTF-8 length of the unmatched spans plus each
   match's expanded replacement (literal characters, `\1`–`\9`, `\&`, `\\`). The
   build then splices from the recorded matches without searching again, so
   regex cost is unchanged.
@@ -2047,8 +2053,10 @@ The amplifiers' exact sizes:
   is `ARRAY_DIM + Σ (VALUE + UTF-8 bytes of the group's span)` over the reported groups (groups
   1..n, or the whole match when the pattern has no group); an unset group is a NULL element, a
   bare `VALUE`. A core measures each span in O(1) from a prefix of UTF-8 offsets over the subject,
-  so sizing never walks the output. `regexp_matches` charges and reserves the sum over its matches
-  once, before any row is built or produced. No match charges nothing.
+  so sizing never walks the output. Sizing does read every group of every match, so the kernel
+  charges each match's array as it sizes it and guards after each; a pattern with thousands of
+  groups cannot size many matches past the ceiling. It reserves the sum once, before any row is
+  built or produced. No match charges nothing.
 - `array_replace`: `payload(a) + Σ (value_bytes(new) − value_bytes(e))` over the
   matched elements `e`. Elements that compare equal can still differ in payload, for
   example decimals of different scale.

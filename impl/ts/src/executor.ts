@@ -433,6 +433,7 @@ import {
   captureArray,
   captureArraySize,
   compileRegex,
+  cpsUtf8Length,
   replaceBuild,
   replaceMatches,
   replaceSize,
@@ -1089,7 +1090,8 @@ export function replaceText(s: string, from: string, to: string, meter: Meter): 
 
 // regexpReplaceText is regexp_replace (regex.md §8): run the whole search, then size the result
 // exactly, cap it at MAX_RESULT_CHARS (54000), charge and reserve it, and splice it from the recorded
-// matches. An amplifier (cost.md §8.1); the search's regex_steps are its input charge.
+// matches. An amplifier (cost.md §8.1): its input charge is the search's regex_steps plus the
+// replacement's UTF-8 bytes once per match, since sizing and building expand the template per match.
 export function regexpReplaceText(
   prog: RegexProgram,
   matchCps: number[],
@@ -1099,20 +1101,23 @@ export function regexpReplaceText(
   meter: Meter,
 ): string {
   const found = replaceMatches(prog, matchCps, global, meter);
-  const size = replaceSize(origCps, repl, found);
+  meter.charge(COSTS.scalarByte * BigInt(cpsUtf8Length(repl)) * BigInt(found.length));
+  meter.guard();
+  const size = replaceSize(prog, origCps, repl, found);
   if (size > MAX_RESULT_CHARS)
     throw engineError("program_limit_exceeded", "requested length too large");
   meter.charge(COSTS.scalarByte * size);
   meter.guard();
   meter.reserveScalar(size);
-  return replaceBuild(origCps, repl, found);
+  return replaceBuild(prog, origCps, repl, found);
 }
 
 // regexpCaptureArrays is regexp_match / regexp_matches (regex.md §8/§8c): one text[] capture array
 // for the first match, or for every non-overlapping match when global; no match gives none. An
 // amplifier (cost.md §8.1): nested groups capture the same text once each, so the pattern multiplies
-// the subject. The search's regex_steps are its input charge; the arrays' exact payload is then
-// computed from the capture spans, charged, and reserved before any is built.
+// the subject. The search's regex_steps are its input charge. Each array's exact payload is computed
+// from the capture spans and charged as it is sized, so sizing many matches of a many-group pattern
+// stops at the ceiling; the sum is reserved before any array is built.
 export function regexpCaptureArrays(
   prog: RegexProgram,
   matchCps: number[],
@@ -1123,15 +1128,17 @@ export function regexpCaptureArrays(
   const found = replaceMatches(prog, matchCps, global, meter);
   if (found.length === 0) return [];
   const utf8At = utf8Offsets(origCps);
-  let total = 0;
-  for (const saves of found) total += captureArraySize(prog, saves, utf8At);
-  const size = BigInt(total);
-  meter.charge(COSTS.scalarByte * size);
-  meter.guard();
+  let size = 0n;
+  for (const caps of found) {
+    const arraySize = BigInt(captureArraySize(prog, caps, utf8At));
+    meter.charge(COSTS.scalarByte * arraySize);
+    meter.guard();
+    size += arraySize;
+  }
   meter.reserveScalar(size);
-  return found.map((saves) =>
+  return found.map((caps) =>
     arrayValue(
-      captureArray(prog, saves, origCps).map((g) =>
+      captureArray(prog, caps, origCps).map((g) =>
         g === null ? nullValue() : { kind: "text", text: g },
       ),
     ),
