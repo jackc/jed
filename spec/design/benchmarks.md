@@ -1461,8 +1461,15 @@ v1 began with six benchmarks (point lookup, secondary-index lookup, full-scan ag
 ORDER BY + LIMIT, insert+rollback throughput, durable single-row commits) over two
 datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 
-- a join benchmark (needs a second dataset table → `generator_version` bump);
-- GROUP BY aggregate; UPDATE / DELETE throughput; miss-heavy point lookups;
+- ✅ a join benchmark — the scratch-built join lanes (`hash_join_equijoin`, `join_inl_topn`, the
+  `join_nway_*` family) and `index_nested_loop_join` over `large`;
+- ✅ **GROUP BY aggregate** — `group_by_agg` (an expression key folding the 1M `large` rows into
+  100 groups, all returned) and `group_by_agg_high_card` (~100k `customer_id` groups, a `HAVING`
+  keeping the busiest ~0.3% so the grouping rather than the result transfer dominates), on every
+  engine;
+- ✅ UPDATE / DELETE throughput — `secondary_update`, `costed_update`, `secondary_pointset_delete`,
+  and the `fk_*delete*` lanes;
+- miss-heavy point lookups;
 - text-heavy / large-value rows (exercise the overflow + LZ4 path);
 - ✅ **`Database` concurrent-reader throughput** — landed as the `concurrent_read` kind
   (§8.1): `concurrent_read_pk_r{1,4}` over the resident `small` dataset plus

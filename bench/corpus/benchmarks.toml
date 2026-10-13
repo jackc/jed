@@ -1205,6 +1205,31 @@ gen = "int_uniform"
 min = 0
 max = 99999
 
+# Grouped aggregates over the 1M-row table (benchmarks.md §11). The low-cardinality lane folds every
+# row into 100 groups (an expression key, amount / 1000) and returns all of them; the high-cardinality
+# lane builds ~100k customer groups and a HAVING keeps the ~0.3% busiest, so its cost is the grouping,
+# not the result transfer. Every engine may hash or sort; checksum equality is the gate.
+[[bench]]
+name = "group_by_agg"
+description = "GROUP BY an expression into 100 groups over 1M rows (count + sum per group)"
+dataset = "large"
+kind = "query"
+sql = "SELECT amount / 1000 AS bucket, count(*), sum(amount) FROM orders GROUP BY amount / 1000 ORDER BY bucket"
+warmup = 2
+iterations = 10
+seed = 4287
+expect_rows_per_iter = 100
+
+[[bench]]
+name = "group_by_agg_high_card"
+description = "GROUP BY customer_id into ~100k groups over 1M rows, HAVING keeps the busiest ~0.3%"
+dataset = "large"
+kind = "query"
+sql = "SELECT customer_id, count(*), sum(amount) FROM orders GROUP BY customer_id HAVING count(*) >= 20 ORDER BY customer_id"
+warmup = 2
+iterations = 10
+seed = 4288
+
 [[bench]]
 name = "order_by_limit"
 description = "Top-100 by a non-indexed column over 1M fixed-width rows — blocking scan into the bounded stable top-k heap (K=100), with no spill runs"
