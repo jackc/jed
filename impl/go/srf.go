@@ -664,6 +664,8 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "ref_columns", Type: textArr},
 			// EXCLUDE: the WITH operators in element order; NULL otherwise (introspection.md §5.1).
 			{Name: "operators", Type: textArr},
+			// FOREIGN KEY: the match type, 'simple' | 'full'; NULL otherwise (introspection.md §5.1).
+			{Name: "match_type", Type: scalarT(scalarText)},
 		}}
 	case srfJedSequences:
 		return &catTable{Name: "jed_sequences", Columns: []catColumn{
@@ -972,6 +974,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				NullValue(),
 				NullValue(),
 				NullValue(),
+				NullValue(),
 			})
 		}
 		// UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
@@ -997,6 +1000,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				TextValue(t.Name),
 				TextValue("unique"),
 				textArr(cols),
+				NullValue(),
 				NullValue(),
 				NullValue(),
 				NullValue(),
@@ -1035,6 +1039,8 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				TextValue(refTable),
 				textArr(refCols),
 				NullValue(),
+				// The match type (constraints.md §6.3): full or the default simple.
+				TextValue(fkMatchType(fk.MatchFull)),
 			})
 		}
 		// EXCLUDE: the excluded columns and their WITH operators, both in element order.
@@ -1058,6 +1064,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				NullValue(),
 				NullValue(),
 				textArr(ops),
+				NullValue(),
 			})
 		}
 	}
@@ -1945,4 +1952,13 @@ func jsonVerbatimSrfRows(kind srfKind, text string, m *costMeter) ([]storedRow, 
 		}
 	}
 	return out, nil
+}
+
+// fkMatchType renders a foreign key's match type for jed_constraints.match_type
+// (introspection.md §5.1, constraints.md §6.3).
+func fkMatchType(matchFull bool) string {
+	if matchFull {
+		return "full"
+	}
+	return "simple"
 }

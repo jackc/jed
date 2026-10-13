@@ -2837,6 +2837,7 @@ column being defined):
 
 ```
 references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)* ")")?
+                       ("MATCH" ("FULL" | "SIMPLE" | "PARTIAL"))?
                        ("ON" ("DELETE" | "UPDATE") referential_action)*
 referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"
 ```
@@ -2844,10 +2845,15 @@ referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "
 and a `table_constraint` may be
 `["CONSTRAINT" identifier] "FOREIGN" "KEY" "(" identifier ("," identifier)* ")" references_clause`
 (the local-column list reuses the `PRIMARY KEY` list shape — bare names, non-empty). The
-referenced-column list is optional and defaults to the parent's primary key.
+referenced-column list is optional and defaults to the parent's primary key. The optional match
+type follows it and precedes the actions, at most once (PostgreSQL's `key_match`): `MATCH SIMPLE`
+(the default) or `MATCH FULL` ([constraints.md §6.3](constraints.md)); `MATCH PARTIAL` parses but is
+rejected `0A000` (`MATCH PARTIAL not yet implemented`, PostgreSQL's parse-time error). A `MATCH`
+after an action, a second `MATCH`, or `MATCH` followed by anything else is `42601`.
 
 **Disambiguation.** `FOREIGN`, `KEY`, `REFERENCES`, `ON`, `DELETE`, `CASCADE`, `RESTRICT`, `ACTION`,
-`NO`, `SET` stay non-reserved (§3). A table element beginning with the two keywords `FOREIGN KEY`
+`NO`, `SET`, `MATCH`, `SIMPLE`, `PARTIAL` stay non-reserved (§3); `MATCH` is recognized only directly
+after the referenced table / column list, where no other clause can begin with it. A table element beginning with the two keywords `FOREIGN KEY`
 parses as a foreign-key table constraint — a column named `foreign` would need a type named `key`
 (none exists), so nothing is lost (the `PRIMARY KEY` precedent, §28). One beginning with `CONSTRAINT`
 dispatches on the keyword after the name: `CHECK` (§29), `UNIQUE` (§31), or `FOREIGN`. In
@@ -2863,7 +2869,8 @@ count mismatch), type-checks corresponding columns (`42804`), names the constrai
 the per-table constraint namespace), and stores the selected `referential_action` for parent-side
 execution ([constraints.md §6](constraints.md)). PostgreSQL *reserves*
 `FOREIGN` / `REFERENCES`, so the jed-only non-reserved surface carries oracle overrides like `on`'s
-(conformance.md §5). `MATCH FULL` / `MATCH PARTIAL` are not in the grammar (MATCH SIMPLE only).
+(conformance.md §5). The match type is a parse-time choice stored with the FK; only `MATCH PARTIAL`
+errors at parse.
 
 ## 44. `LATERAL` joins (`… JOIN LATERAL ( query_expr ) ON …`, implicitly-lateral table functions)
 

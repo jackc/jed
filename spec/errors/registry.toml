@@ -283,8 +283,10 @@ class = "integrity constraint violation"
 # foreign-key value is absent in the referenced (parent) table: "insert or update on table {table}
 # violates foreign key constraint {name}". Parent side — a DELETE/UPDATE of a referenced row still
 # referenced by a child: "update or delete on table {table} violates foreign key constraint {name}".
-# {table} is the table the write targets; {name} is the foreign-key constraint. (Unlike PostgreSQL,
-# jed carries no separate DETAIL line — house style, codes match.)
+# {table} is the table the write targets; {name} is the foreign-key constraint. A MATCH FULL key
+# that mixes NULL and non-NULL values raises the child-side message (constraints.md §6.3). (Unlike
+# PostgreSQL, jed carries no separate DETAIL line — house style, codes match; PostgreSQL's DETAIL
+# text is the structured Detail field, spec/design/error-fields.md §9.)
 template = "insert or update on table {table} violates foreign key constraint {name}"
 
 [[error]]

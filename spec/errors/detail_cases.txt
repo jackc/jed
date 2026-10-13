@@ -144,6 +144,31 @@ run: ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES p (id)
 code: 23503
 detail: Key (a)=(1) is not present in table "p".
 
+case: foreign key match full mixed nulls
+setup: CREATE TABLE m (a i32, b text, PRIMARY KEY (a, b))
+setup: CREATE TABLE cm (id i32 PRIMARY KEY, k1 i32, k2 text, FOREIGN KEY (k1, k2) REFERENCES m MATCH FULL)
+run: INSERT INTO cm VALUES (1, 7, NULL)
+code: 23503
+detail: MATCH FULL does not allow mixing of null and nonnull key values.
+
+case: foreign key match full add constraint validation
+setup: CREATE TABLE m (a i32, b text, PRIMARY KEY (a, b))
+setup: CREATE TABLE cm (id i32 PRIMARY KEY, k1 i32, k2 text)
+setup: INSERT INTO cm VALUES (1, NULL, 'q')
+run: ALTER TABLE cm ADD FOREIGN KEY (k1, k2) REFERENCES m MATCH FULL
+code: 23503
+detail: MATCH FULL does not allow mixing of null and nonnull key values.
+
+# The MATCH FULL sentence names no values, so the privilege gate does not degrade it (PostgreSQL
+# emits it unconditionally too).
+case: gate keeps foreign key match full detail without select
+setup: CREATE TABLE m (a i32, b text, PRIMARY KEY (a, b))
+setup: CREATE TABLE cm (id i32 PRIMARY KEY, k1 i32, k2 text, FOREIGN KEY (k1, k2) REFERENCES m MATCH FULL)
+default_privileges: INSERT
+run: INSERT INTO cm VALUES (1, NULL, 'q')
+code: 23503
+detail: MATCH FULL does not allow mixing of null and nonnull key values.
+
 # --- 23P01 exclusion ------------------------------------------------------------------------------
 
 case: exclusion against stored row

@@ -17,7 +17,13 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 39)
+## Version scope (`format_version` 40)
+
+`format_version` **40** — **foreign-key match type** ([../design/constraints.md §6.3](../design/constraints.md)).
+Bit 6 of each foreign key's `fk_actions` byte is now `match_full` (`1` = `MATCH FULL`, `0` = `MATCH
+SIMPLE`); bit 7 stays reserved (written 0, `XX001` when set). A file with no `MATCH FULL` foreign key
+changes only by its version byte + meta CRC; the `fk_table` golden's composite FK sets the bit.
+Readers accept only the exact current version.
 
 `format_version` **39** — **view check options** ([../design/views.md §15.6](../design/views.md)).
 Every view entry gains a trailing `u8 check_option` after its dependency list: `0` = none, `1` =
@@ -793,7 +799,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`fk_ref_table` | UTF-8 (original case) — the referenced (parent) table name |
 | &nbsp;&nbsp;`fk_ref_count` | u16 — the referenced column count; must equal `fk_local_count` (else `XX001`) |
 | &nbsp;&nbsp;`fk_ref_ordinal` ×`fk_ref_count` | u16 each — referenced-column ordinals into the **parent** table, in list order |
-| &nbsp;&nbsp;`fk_actions` | u8 — **v30:** bits 0–2 `on_delete`, bits 3–5 `on_update` (`0` = NO ACTION, `1` = RESTRICT, `2` = CASCADE, `3` = SET NULL, `4` = SET DEFAULT; `5…7` reserved); bits 6–7 reserved, written 0. A set reserved bit or reserved action code is `XX001` |
+| &nbsp;&nbsp;`fk_actions` | u8 — **v30:** bits 0–2 `on_delete`, bits 3–5 `on_update` (`0` = NO ACTION, `1` = RESTRICT, `2` = CASCADE, `3` = SET NULL, `4` = SET DEFAULT; `5…7` reserved); **v40:** bit 6 `match_full` (`1` = MATCH FULL, `0` = MATCH SIMPLE — constraints.md §6.3); bit 7 reserved, written 0. A set reserved bit or reserved action code is `XX001` |
 | `excl_count` | u16 — the table's `EXCLUDE` constraint count (v21; 0 for a table with none) |
 | &nbsp;&nbsp;`excl_name_len` | u16 |
 | &nbsp;&nbsp;`excl_name` | UTF-8 (original case) — the constraint name |

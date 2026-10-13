@@ -4984,6 +4984,8 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 text_arr("ref_columns", false),
                 // EXCLUDE: the WITH operators in element order; NULL otherwise (§5.1).
                 text_arr("operators", false),
+                // FOREIGN KEY: the match type, 'simple' | 'full'; NULL otherwise (§5.1).
+                col("match_type", ScalarType::Text, false),
             ],
         ),
         SrfKind::JedStatistics => table(

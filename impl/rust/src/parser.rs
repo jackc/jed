@@ -831,24 +831,20 @@ impl Parser {
         self.expect_keyword("foreign")?;
         self.expect_keyword("key")?;
         let columns = self.parse_pk_column_list()?;
-        let (ref_table, ref_columns, on_delete, on_update) = self.parse_references_clause()?;
         Ok(ForeignKeyDef {
             name,
             columns,
-            ref_table,
-            ref_columns,
-            on_delete,
-            on_update,
+            ..self.parse_references_clause()?
         })
     }
 
     /// Parse a `references_clause` from the `REFERENCES` keyword onward (shared by the
     /// column-level and table-level forms — spec/design/grammar.md §43): the referenced table,
-    /// an optional referenced-column list (`None` defaults to the parent's primary key), and the
+    /// an optional referenced-column list (`None` defaults to the parent's primary key), an
+    /// optional `MATCH FULL | SIMPLE` (`MATCH PARTIAL` is 0A000, as in PostgreSQL), and the
     /// `ON DELETE` / `ON UPDATE` actions (each at most once, either order; a repeat is 42601).
-    fn parse_references_clause(
-        &mut self,
-    ) -> Result<(String, Option<Vec<String>>, RefAction, RefAction)> {
+    /// The returned definition carries no name and no local columns; the caller fills them in.
+    fn parse_references_clause(&mut self) -> Result<ForeignKeyDef> {
         self.expect_keyword("references")?;
         let ref_table = self.expect_identifier()?;
         let ref_columns = if matches!(self.peek(), Token::LParen) {
@@ -856,6 +852,22 @@ impl Parser {
         } else {
             None
         };
+        let mut match_full = false;
+        if self.peek_keyword().as_deref() == Some("match") {
+            self.advance();
+            match self.peek_keyword().as_deref() {
+                Some("full") => match_full = true,
+                Some("simple") => {}
+                Some("partial") => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "MATCH PARTIAL not yet implemented",
+                    ));
+                }
+                _ => return Err(syntax("expected FULL, PARTIAL, or SIMPLE after MATCH")),
+            }
+            self.advance();
+        }
         let mut on_delete = RefAction::NoAction;
         let mut on_update = RefAction::NoAction;
         let mut seen_delete = false;
@@ -882,7 +894,15 @@ impl Parser {
                 _ => return Err(syntax("expected DELETE or UPDATE after ON")),
             }
         }
-        Ok((ref_table, ref_columns, on_delete, on_update))
+        Ok(ForeignKeyDef {
+            name: None,
+            columns: Vec::new(),
+            ref_table,
+            ref_columns,
+            match_full,
+            on_delete,
+            on_update,
+        })
     }
 
     /// Parse one `referential_action` (spec/design/grammar.md §43). All five PG actions parse;
@@ -1061,15 +1081,10 @@ impl Parser {
             {
                 self.advance();
                 let cname = self.expect_identifier()?;
-                let (ref_table, ref_columns, on_delete, on_update) =
-                    self.parse_references_clause()?;
                 foreign_keys.push(ForeignKeyDef {
                     name: Some(cname),
                     columns: vec![name.clone()],
-                    ref_table,
-                    ref_columns,
-                    on_delete,
-                    on_update,
+                    ..self.parse_references_clause()?
                 });
                 continue;
             }
@@ -1151,15 +1166,9 @@ impl Parser {
                 Some("references") => {
                     // The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
                     // `parse_references_clause` consumes the `REFERENCES` keyword itself.
-                    let (ref_table, ref_columns, on_delete, on_update) =
-                        self.parse_references_clause()?;
                     foreign_keys.push(ForeignKeyDef {
-                        name: None,
                         columns: vec![name.clone()],
-                        ref_table,
-                        ref_columns,
-                        on_delete,
-                        on_update,
+                        ..self.parse_references_clause()?
                     });
                 }
                 _ => break,

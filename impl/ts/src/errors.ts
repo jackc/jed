@@ -148,6 +148,15 @@ export function fkViolationInsert(table: string, constraint: string): EngineErro
     .withConstraint(constraint);
 }
 
+// fkViolationMatchFull — 23503 child side under MATCH FULL, an INSERT/UPDATE on `table` writes a
+// referencing tuple that mixes NULL and non-NULL values under FK `constraint` (constraints.md §6.3).
+// PostgreSQL's DETAIL names no values, so it is never privilege-gated.
+export function fkViolationMatchFull(table: string, constraint: string): EngineError {
+  return fkViolationInsert(table, constraint).withDetail(
+    "MATCH FULL does not allow mixing of null and nonnull key values.",
+  );
+}
+
 // fkViolationDelete — 23503 parent side, a DELETE/UPDATE on `parent` strands a child of
 // `child` still referencing it under FK `constraint`.
 export function fkViolationDelete(parent: string, constraint: string, child: string): EngineError {

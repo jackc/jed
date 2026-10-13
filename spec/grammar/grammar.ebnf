@@ -152,8 +152,8 @@ table_element  ::= column_def | table_constraint
  *
  * "FOREIGN KEY (a, b, ...) REFERENCES parent (x, y, ...)" declares a referential constraint:
  * the local columns must, in every row, match an existing key of the parent table — or be
- * (partly) NULL, which is exempt (MATCH SIMPLE — ../design/constraints.md §6). The referenced
- * columns must be exactly the parent's PRIMARY KEY or a UNIQUE constraint's column set (42830);
+ * (partly) NULL, which is exempt (MATCH SIMPLE; MATCH FULL exempts only all-NULL —
+ * ../design/constraints.md §6.3). The referenced columns must be exactly the parent's PRIMARY KEY or a UNIQUE constraint's column set (42830);
  * omitting the "(x, y, ...)" list defaults them to the parent's primary key (42830 if it has
  * none). Referencing and referenced column counts must agree (42830) and corresponding columns
  * must be the SAME type (42804 — jed is stricter than PG, which allows comparable types). The
@@ -161,8 +161,8 @@ table_element  ::= column_def | table_constraint
  * (../design/constraints.md §6): a child INSERT/UPDATE whose key is absent in the parent, or a
  * parent DELETE/UPDATE of a row still referenced by a child, traps 23503. The optional
  * "ON DELETE"/"ON UPDATE" actions accept NO ACTION (default) and RESTRICT (identical in jed — no
- * deferrable constraints); CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE
- * TABLE (0A000, deferred). The column-level "REFERENCES" is the one-member form (its local column
+ * deferrable constraints) and CASCADE / SET NULL / SET DEFAULT (see references_clause). The
+ * column-level "REFERENCES" is the one-member form (its local column
  * is the column being defined). The constraint name is auto-derived lowercased
  * "<table>_<cols>_fkey" with the smallest free suffix, or takes the explicit CONSTRAINT name
  * (collision against the table's constraint names is 42710 — the per-table constraint namespace
@@ -218,8 +218,11 @@ column_constraint ::= "PRIMARY" "KEY"
  * The referenced-column list is optional (defaults to the parent's PRIMARY KEY). The ON
  * DELETE / ON UPDATE actions may appear in either order and at most once each; NO ACTION and
  * RESTRICT behave identically in jed; CASCADE / SET NULL / SET DEFAULT generate ordinary child
- * DML through the action closure. MATCH FULL / MATCH PARTIAL are not in the grammar. */
+ * DML through the action closure. The optional MATCH clause precedes the actions: MATCH SIMPLE (the
+ * default) exempts a referencing tuple with any NULL; MATCH FULL exempts only an all-NULL tuple and
+ * rejects a partly-NULL one (23503); MATCH PARTIAL is 0A000 (PostgreSQL: not yet implemented). */
 references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)* ")")?
+                       ("MATCH" ("FULL" | "SIMPLE" | "PARTIAL"))?
                        ("ON" ("DELETE" | "UPDATE") referential_action)*
 referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"
 

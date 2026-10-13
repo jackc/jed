@@ -211,7 +211,8 @@ pub enum RefAction {
 /// One parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md §43): the optional
 /// explicit `CONSTRAINT` name, the local (referencing) column names in list order, the referenced
 /// (parent) table name, the optional referenced column names (`None` = the parent's primary key),
-/// and the `ON DELETE` / `ON UPDATE` actions. Execution resolves it
+/// the match type (`MATCH FULL` vs the default `MATCH SIMPLE`), and the `ON DELETE` / `ON UPDATE`
+/// actions. Execution resolves it
 /// (42703/42701/42P01/42830/42804) and names the unnamed ones (42710) — spec/design/constraints.md
 /// §6.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -220,6 +221,7 @@ pub struct ForeignKeyDef {
     pub columns: Vec<String>,
     pub ref_table: String,
     pub ref_columns: Option<Vec<String>>,
+    pub match_full: bool,
     pub on_delete: RefAction,
     pub on_update: RefAction,
 }

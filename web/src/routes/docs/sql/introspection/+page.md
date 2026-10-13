@@ -56,8 +56,9 @@ Nine relations ship today:
 - **`jed_constraints`** — one row per `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` constraint:
   `name`, `table_name`, `type`, `columns` (a `text[]` of the member/local columns; `NULL` for a
   `CHECK`), `expression` (the `CHECK` text; `NULL` otherwise), and `ref_table` / `ref_columns`
-  (the foreign-key parent; `NULL` otherwise), and `operators` (an `EXCLUDE` constraint's `WITH`
-  operators, `&&` or `=`, in the same order as `columns`; `NULL` otherwise). A `UNIQUE` constraint
+  (the foreign-key parent; `NULL` otherwise), `operators` (an `EXCLUDE` constraint's `WITH`
+  operators, `&&` or `=`, in the same order as `columns`; `NULL` otherwise), and `match_type` (a
+  foreign key's `simple` or `full`; `NULL` otherwise). A `UNIQUE` constraint
   *is* its backing unique index,
   so it appears in both `jed_indexes` and `jed_constraints` under the same name.
 - **`jed_statistics`** — one summary per analyzed column: table/column name, analyzed row and NULL
@@ -92,7 +93,7 @@ Things to try in the panel above:
 - Advance one, then look again — `SELECT nextval('invoice_no');`
 - Describe a composite type — `SELECT name, ordinal, type, not_null FROM jed_type_fields WHERE type_name = 'addr' ORDER BY ordinal;`
 - Find the columns typed at a user-defined type — `SELECT c.table_name, c.name, t.name FROM jed_types t JOIN jed_columns c ON c.type = t.name;`
-- Find every foreign key and its parent — `SELECT table_name, columns, ref_table, ref_columns FROM jed_constraints WHERE type = 'foreign_key';`
+- Find every foreign key and its parent — `SELECT table_name, columns, ref_table, ref_columns, match_type FROM jed_constraints WHERE type = 'foreign_key';`
 - Count columns per table — `SELECT table_name, count(*) FROM jed_columns GROUP BY table_name;`
 - Show the column defaults — `SELECT table_name, name, column_default FROM jed_columns WHERE column_default IS NOT NULL;` (the `serial` key shows the `nextval` default it expands to; `DEFAULT 0` on `decimal(8,2)` shows the stored `0.00`)
 - Create a view, then list it — `CREATE VIEW adults AS SELECT id, name FROM customer WHERE age >= 18; SELECT name, definition, columns FROM jed_views;`

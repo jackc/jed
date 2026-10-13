@@ -1002,6 +1002,22 @@ type fkProbe struct {
 	index string
 }
 
+// fkMatchFullViolated reports whether row's referencing tuple for fk violates MATCH FULL
+// (constraints.md §6.3): the FK is MATCH FULL and its local columns mix NULL and non-NULL values.
+// MATCH SIMPLE exempts any tuple with a NULL; MATCH FULL exempts only the all-NULL one.
+func fkMatchFullViolated(fk *foreignKey, row storedRow) bool {
+	if !fk.MatchFull {
+		return false
+	}
+	nulls := 0
+	for _, c := range fk.Columns {
+		if row[c].Kind == ValNull {
+			nulls++
+		}
+	}
+	return nulls > 0 && nulls < len(fk.Columns)
+}
+
 // buildFkProbe builds the parent-key probe for fk from row, taking each referenced parent
 // column's value from row[ordinals[i]] where ordinals[i] supplies fk.RefColumns[i]. So the child
 // side passes ordinals = fk.Columns (local columns), and a self-reference batch entry passes

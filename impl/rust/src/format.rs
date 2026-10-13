@@ -121,7 +121,9 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // byte layout change.
 // v39: every view entry gains a trailing `u8 check_option` (0 none, 1 LOCAL, 2 CASCADED —
 // spec/design/views.md §15.6); no other byte layout change.
-const FORMAT_VERSION: u16 = 39;
+// v40: a foreign key's actions byte gains bit 6 `match_full` (MATCH FULL; 0 = MATCH SIMPLE — spec/
+// design/constraints.md §6.3/§6.9); bit 7 stays reserved 0. No other byte layout change.
+const FORMAT_VERSION: u16 = 40;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -3670,9 +3672,9 @@ fn table_entry_bytes(
     }
     // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
     // table, list order), the referenced table name, the referenced-column ordinals (into the
-    // PARENT, list order), and the v30 actions byte (bits 0-2 on_delete, bits 3-5 on_update) — in the
-    // catalog's ascending name byte order (spec/design/constraints.md §6.9). An FK owns no
-    // B-tree (no root page).
+    // PARENT, list order), and the v30 actions byte (bits 0-2 on_delete, bits 3-5 on_update; v40
+    // bit 6 MATCH FULL) — in the catalog's ascending name byte order
+    // (spec/design/constraints.md §6.9). An FK owns no B-tree (no root page).
     out.extend_from_slice(&(table.foreign_keys.len() as u16).to_be_bytes());
     for fk in &table.foreign_keys {
         let fnm = fk.name.as_bytes();
@@ -3689,7 +3691,11 @@ fn table_entry_bytes(
         for &c in &fk.ref_columns {
             out.extend_from_slice(&(c as u16).to_be_bytes());
         }
-        out.push(fk_action_code(fk.on_delete) | (fk_action_code(fk.on_update) << 3));
+        out.push(
+            fk_action_code(fk.on_delete)
+                | (fk_action_code(fk.on_update) << 3)
+                | (u8::from(fk.match_full) << 6),
+        );
     }
     // EXCLUDE constraints (v21): count, then per exclusion the name, the backing GiST index name,
     // and the `(column ordinal, operator strategy)` element vector — in the catalog's ascending
@@ -5116,7 +5122,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             ref_cols.push(read_u16(buf, pos)? as usize);
         }
         let actions = read_u8(buf, pos)?;
-        if actions & !0b11_1111 != 0 {
+        if actions & 0b1000_0000 != 0 {
             return Err(corrupt("reserved foreign-key action bit set"));
         }
         foreign_keys.push(ForeignKeyConstraint {
@@ -5124,6 +5130,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             columns: cols,
             ref_table,
             ref_columns: ref_cols,
+            match_full: actions & 0b100_0000 != 0,
             on_delete: fk_action_from_code(actions & 0b111)?,
             on_update: fk_action_from_code((actions >> 3) & 0b111)?,
         });

@@ -986,38 +986,49 @@ func (p *parser) parseForeignKeyTableConstraint() (foreignKeyDef, error) {
 	if err != nil {
 		return foreignKeyDef{}, err
 	}
-	refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
+	fk, err := p.parseReferencesClause()
 	if err != nil {
 		return foreignKeyDef{}, err
 	}
-	return foreignKeyDef{
-		Name:       name,
-		Columns:    columns,
-		RefTable:   refTable,
-		RefColumns: refColumns,
-		OnDelete:   onDelete,
-		OnUpdate:   onUpdate,
-	}, nil
+	fk.Name = name
+	fk.Columns = columns
+	return fk, nil
 }
 
 // parseReferencesClause parses a references_clause from the REFERENCES keyword onward (shared
 // by the column-level and table-level forms — spec/design/grammar.md §43): the referenced
-// table, an optional referenced-column list (nil defaults to the parent's primary key), and
-// the ON DELETE / ON UPDATE actions (each at most once, either order; a repeat is 42601).
-func (p *parser) parseReferencesClause() (string, []string, refAction, refAction, error) {
+// table, an optional referenced-column list (nil defaults to the parent's primary key), an
+// optional MATCH FULL | SIMPLE (MATCH PARTIAL is 0A000, as in PostgreSQL), and the ON DELETE /
+// ON UPDATE actions (each at most once, either order; a repeat is 42601). The returned
+// definition carries no name and no local columns; the caller fills them in.
+func (p *parser) parseReferencesClause() (foreignKeyDef, error) {
 	if err := p.expectKeyword("references"); err != nil {
-		return "", nil, 0, 0, err
+		return foreignKeyDef{}, err
 	}
 	refTable, err := p.expectIdentifier()
 	if err != nil {
-		return "", nil, 0, 0, err
+		return foreignKeyDef{}, err
 	}
 	var refColumns []string
 	if p.peek().Kind == tokLParen {
 		refColumns, err = p.parsePKColumnList()
 		if err != nil {
-			return "", nil, 0, 0, err
+			return foreignKeyDef{}, err
 		}
+	}
+	matchFull := false
+	if p.peekKeyword() == "match" {
+		p.advance()
+		switch p.peekKeyword() {
+		case "full":
+			matchFull = true
+		case "simple":
+		case "partial":
+			return foreignKeyDef{}, newError(FeatureNotSupported, "MATCH PARTIAL not yet implemented")
+		default:
+			return foreignKeyDef{}, newError(SyntaxError, "expected FULL, PARTIAL, or SIMPLE after MATCH")
+		}
+		p.advance()
 	}
 	onDelete := refNoAction
 	onUpdate := refNoAction
@@ -1029,28 +1040,34 @@ func (p *parser) parseReferencesClause() (string, []string, refAction, refAction
 		case "delete":
 			p.advance()
 			if seenDelete {
-				return "", nil, 0, 0, newError(SyntaxError, "ON DELETE specified more than once")
+				return foreignKeyDef{}, newError(SyntaxError, "ON DELETE specified more than once")
 			}
 			seenDelete = true
 			onDelete, err = p.parseReferentialAction()
 			if err != nil {
-				return "", nil, 0, 0, err
+				return foreignKeyDef{}, err
 			}
 		case "update":
 			p.advance()
 			if seenUpdate {
-				return "", nil, 0, 0, newError(SyntaxError, "ON UPDATE specified more than once")
+				return foreignKeyDef{}, newError(SyntaxError, "ON UPDATE specified more than once")
 			}
 			seenUpdate = true
 			onUpdate, err = p.parseReferentialAction()
 			if err != nil {
-				return "", nil, 0, 0, err
+				return foreignKeyDef{}, err
 			}
 		default:
-			return "", nil, 0, 0, newError(SyntaxError, "expected DELETE or UPDATE after ON")
+			return foreignKeyDef{}, newError(SyntaxError, "expected DELETE or UPDATE after ON")
 		}
 	}
-	return refTable, refColumns, onDelete, onUpdate, nil
+	return foreignKeyDef{
+		RefTable:   refTable,
+		RefColumns: refColumns,
+		MatchFull:  matchFull,
+		OnDelete:   onDelete,
+		OnUpdate:   onUpdate,
+	}, nil
 }
 
 // parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
@@ -1265,18 +1282,13 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 			if err != nil {
 				return columnDef{}, err
 			}
-			refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
+			fk, err := p.parseReferencesClause()
 			if err != nil {
 				return columnDef{}, err
 			}
-			*foreignKeys = append(*foreignKeys, foreignKeyDef{
-				Name:       cname,
-				Columns:    []string{name},
-				RefTable:   refTable,
-				RefColumns: refColumns,
-				OnDelete:   onDelete,
-				OnUpdate:   onUpdate,
-			})
+			fk.Name = cname
+			fk.Columns = []string{name}
+			*foreignKeys = append(*foreignKeys, fk)
 			continue
 		}
 		switch p.peekKeyword() {
@@ -1360,18 +1372,12 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 		case "references":
 			// The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
 			// parseReferencesClause consumes the REFERENCES keyword itself.
-			refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
+			fk, err := p.parseReferencesClause()
 			if err != nil {
 				return columnDef{}, err
 			}
-			*foreignKeys = append(*foreignKeys, foreignKeyDef{
-				Name:       "",
-				Columns:    []string{name},
-				RefTable:   refTable,
-				RefColumns: refColumns,
-				OnDelete:   onDelete,
-				OnUpdate:   onUpdate,
-			})
+			fk.Columns = []string{name}
+			*foreignKeys = append(*foreignKeys, fk)
 		default:
 			return columnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Collation: collation}, nil
 		}

@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 39 # v39: a trailing u8 check_option on every view entry (0 none, 1 LOCAL, 2 CASCADED —
+VERSION = 40 # v40: bit 6 of a foreign key's actions byte is match_full (MATCH FULL; 0 = MATCH SIMPLE —
+# constraints.md §6.3/§6.9); bit 7 stays reserved 0. No other byte layout change.
+# v39: a trailing u8 check_option on every view entry (0 none, 1 LOCAL, 2 CASCADED —
 # views.md §15.6); no other byte layout change.
 # v38: views — entry_kind 5 view entries emitted last, in name byte order (views.md §3);
 # no other byte layout change.
@@ -1115,15 +1117,15 @@ COMPOSITE_ARRAY_FIELD_TABLE = {
 # parent `p` (a PK + two UNIQUE constraints, the FK targets) and child `c` carrying four FKs that
 # cover every shape: `c_code_fk` (named, references the UNIQUE column code), `c_mgr_fkey` (a
 # self-reference to c's own PK), `c_pid_fkey` (auto-named, references the PK), and `c_x_y_fkey`
-# (auto-named, COMPOSITE — references the two-column UNIQUE (a,b)). Together their actions bytes pin
-# every v30 action code. FKs are emitted in ascending lowercased-name order; an FK owns no B-tree.
+# (auto-named, COMPOSITE — references the two-column UNIQUE (a,b), MATCH FULL). Together their actions
+# bytes pin every v30 action code and the v40 match_full bit. FKs are emitted in ascending lowercased-name order; an FK owns no B-tree.
 # The cores build this via
 #   CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))
 #   INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)
 #   CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32,
 #     FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE RESTRICT,
 #     CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code) ON DELETE SET NULL,
-#     FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE CASCADE ON UPDATE SET DEFAULT,
+#     FOREIGN KEY (x, y) REFERENCES p (a, b) MATCH FULL ON DELETE CASCADE ON UPDATE SET DEFAULT,
 #     FOREIGN KEY (mgr) REFERENCES c (id))
 #   INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)
 FK_TABLE = {
@@ -1143,7 +1145,7 @@ FK_TABLE = {
         { name: "c_code_fk", local: [2], ref_table: "p", ref: [1], actions: 3 },
         { name: "c_mgr_fkey", local: [5], ref_table: "c", ref: [0] },
         { name: "c_pid_fkey", local: [1], ref_table: "p", ref: [0], actions: 1 },
-        { name: "c_x_y_fkey", local: [3, 4], ref_table: "p", ref: [2, 3], actions: 34 }
+        { name: "c_x_y_fkey", local: [3, 4], ref_table: "p", ref: [2, 3], actions: 98 }
       ],
       rows: [[10, 1, 100, 10, 20, nil], [11, 2, 200, 30, 40, 10]] }
   ]
@@ -2117,9 +2119,9 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
   end
   # Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS table,
   # list order), the referenced table name, the referenced-column ordinals (into the PARENT
-  # table, list order), and the actions byte (bits 0-1 on_delete, bits 2-3 on_update; 0 = NO
-  # ACTION, 1 = RESTRICT). In ascending lowercased-name order (constraints.md §6.9). An FK owns
-  # no B-tree, so no root page.
+  # table, list order), and the actions byte (v30: bits 0-2 on_delete, bits 3-5 on_update; 0 = NO
+  # ACTION, 1 = RESTRICT, 2 = CASCADE, 3 = SET NULL, 4 = SET DEFAULT; v40: bit 6 match_full). In
+  # ascending name byte order (constraints.md §6.9). An FK owns no B-tree, so no root page.
   fks = table[:fks] || []
   out << u16(fks.size)
   fks.each do |fk|
@@ -3715,7 +3717,7 @@ def decode_table_entry(buf, pos)
 
     ab, pos = take(buf, pos, 1)
     raise "reserved fk action bits set / unsupported action code" \
-      if (ab.getbyte(0) & ~0b11_1111) != 0 || (ab.getbyte(0) & 0b111) > 4 || ((ab.getbyte(0) >> 3) & 0b111) > 4
+      if (ab.getbyte(0) & 0b1000_0000) != 0 || (ab.getbyte(0) & 0b111) > 4 || ((ab.getbyte(0) >> 3) & 0b111) > 4
     fks << { name: fname, local: local, ref_table: rtable, ref: ref, actions: ab.getbyte(0) }
   end
   # EXCLUDE constraints (v21): name + backing GiST index name + the (column ordinal, operator) element

@@ -225,6 +225,7 @@ when `Detail` is set ([cli.md](cli.md) §5).
 | 23505 | INSERT / UPDATE / upsert (a stored or in-statement duplicate) | `Key ({cols})=({vals}) already exists.` |
 | 23505 | `CREATE UNIQUE INDEX`, `ALTER TABLE … ADD UNIQUE / PRIMARY KEY` over existing rows | `Key ({cols})=({vals}) is duplicated.` |
 | 23503 | child side: INSERT/UPDATE (and `ADD FOREIGN KEY` validation) | `Key ({cols})=({vals}) is not present in table "{parent}".` |
+| 23503 | child side, `MATCH FULL`: a partly-NULL referencing tuple ([constraints.md](constraints.md) §6.3) | `MATCH FULL does not allow mixing of null and nonnull key values.` |
 | 23503 | parent side: DELETE/UPDATE stranding a child | `Key ({refcols})=({vals}) is still referenced from table "{child}".` |
 | 23P01 | INSERT / UPDATE | `Key ({cols})=({vals}) conflicts with existing key ({cols})=({other}).` |
 | 23P01 | `ALTER TABLE … ADD EXCLUDE` over existing rows | `Key ({cols})=({vals}) conflicts with key ({cols})=({other}).` |
@@ -288,8 +289,9 @@ session envelope (session.md §5.3):
   23505, 23P01, 23514, and 23502 that is the written table. For 23503 child side it is the child (the
   written table), and for parent side it is the parent (the written table).
 - Without that privilege, the 23503 forms degrade to PostgreSQL's value-free sentences
-  `Key is not present in table "{parent}".` / `Key is still referenced from table "{child}".`. Every
-  other form is **absent**.
+  `Key is not present in table "{parent}".` / `Key is still referenced from table "{child}".`. The
+  `MATCH FULL` sentence names no values and is kept unchanged, as PostgreSQL does. Every other form
+  is **absent**.
 - The check is on the **base** relation. A session privileged only on an updatable view
   ([views.md](views.md) §15) that writes through it does not see values. That is the conservative
   reading; a host that wants values grants SELECT on the base table.

@@ -222,8 +222,8 @@ func uniqueTableDB(t *testing.T) *Session {
 }
 
 // fkTableDB exercises FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): a child
-// table c with four FKs whose action bytes collectively pin every v30 action code — pinning the
-// catalog foreign-key list (the name + local/ref ordinals + actions byte). Must match FK_TABLE
+// table c with four FKs whose action bytes collectively pin every v30 action code and the v40
+// match_full bit (c_x_y_fkey is MATCH FULL) — pinning the catalog foreign-key list (the name + local/ref ordinals + actions byte). Must match FK_TABLE
 // (spec/fileformat/verify.rb).
 func fkTableDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
@@ -232,7 +232,7 @@ func fkTableDB(t *testing.T) *Session {
 	run(t, db, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, "+
 		"FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE RESTRICT, "+
 		"CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code) ON DELETE SET NULL, "+
-		"FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE CASCADE ON UPDATE SET DEFAULT, "+
+		"FOREIGN KEY (x, y) REFERENCES p (a, b) MATCH FULL ON DELETE CASCADE ON UPDATE SET DEFAULT, "+
 		"FOREIGN KEY (mgr) REFERENCES c (id))")
 	run(t, db, "INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)")
 	return db
@@ -1174,6 +1174,27 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 	}
 	if _, ok := empty.Table("t"); ok {
 		t.Errorf("empty_db should have no tables")
+	}
+}
+
+// READ side, FK match type: the v40 match_full bit of the actions byte decodes exactly — only
+// c_x_y_fkey is MATCH FULL (a rows-only check cannot see it).
+func TestReadGoldenFKMatchFull(t *testing.T) {
+	loaded, err := loadEngine(fixture(t, "fk_table.jed"))
+	if err != nil {
+		t.Fatalf("load fk_table: %v", err)
+	}
+	c, ok := loaded.Table("c")
+	if !ok {
+		t.Fatalf("table c missing")
+	}
+	var got []string
+	for _, fk := range c.ForeignKeys {
+		got = append(got, fmt.Sprintf("%s=%v", fk.Name, fk.MatchFull))
+	}
+	want := []string{"c_code_fk=false", "c_mgr_fkey=false", "c_pid_fkey=false", "c_x_y_fkey=true"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("match_full = %v, want %v", got, want)
 	}
 }
 

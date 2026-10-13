@@ -473,16 +473,17 @@ oracle-probed against PostgreSQL 18 (CLAUDE.md §1) except the documented diverg
 
 Both constraint positions, same constraint:
 
-- **column-level** `col type [CONSTRAINT name] REFERENCES parent [( refcol )] [actions]` — the
+- **column-level** `col type [CONSTRAINT name] REFERENCES parent [( refcol )] [MATCH …] [actions]` — the
   one-member form; the local column is the column being defined, and the referenced-column list is
   optional (defaults to the parent's primary key);
-- **table-level** `[CONSTRAINT name] FOREIGN KEY (a, b, …) REFERENCES parent (x, y, …) [actions]` —
+- **table-level** `[CONSTRAINT name] FOREIGN KEY (a, b, …) REFERENCES parent (x, y, …) [MATCH …] [actions]` —
   one or more local columns, paired positionally with the referenced columns.
 
 Constraints are collected in **textual definition order** (a column-level one at its column's
 position), like checks and uniques. The local-column and referenced-column lists reuse the
-`PRIMARY KEY` list shape (bare names, non-empty). `actions` is zero or more
-`ON DELETE` / `ON UPDATE referential_action` clauses, each at most once, in either order
+`PRIMARY KEY` list shape (bare names, non-empty). An optional `MATCH FULL | MATCH SIMPLE` follows
+the referenced-column list (§6.3). `actions` is zero or more `ON DELETE` / `ON UPDATE
+referential_action` clauses, each at most once, in either order, after the match type
 (grammar.md §43).
 
 ### 6.2 Resolution (at CREATE TABLE, deterministic, PG-matched)
@@ -536,15 +537,39 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
 
 All resolution precedes any write; a failure aborts CREATE TABLE having created nothing.
 
-### 6.3 MATCH SIMPLE (the NULL rule)
+### 6.3 MATCH SIMPLE and MATCH FULL (the NULL rule)
 
-jed implements **MATCH SIMPLE**, PostgreSQL's default: a child row is **exempt** from the FK check
-if **any** of its foreign-key columns is NULL (the whole tuple passes, even when the non-NULL
-components match no parent). Only a row whose FK columns are **all non-NULL** is checked. `MATCH
-FULL` (exempt only when *all* are NULL) and `MATCH PARTIAL` are not implemented and not in the
-grammar. Mechanically the exemption reuses the [indexes.md §3](indexes.md) NULLS-DISTINCT machinery:
-a row's **probe key** is built only when every FK component is present; a `None`/`null` probe (any
-NULL) skips the check — the same primitive `indexPrefixKey` returns for a NULL unique-index member.
+An FK carries a **match type**, written after the referenced-column list and before the actions
+(`REFERENCES p (a, b) MATCH FULL ON DELETE CASCADE`; grammar.md §43). It governs only a referencing
+tuple that contains a NULL — PostgreSQL's `ri_triggers.c` calls this "the only case that differs
+between the three kinds of MATCH":
+
+- **`MATCH SIMPLE`** — PostgreSQL's default, and jed's when the clause is omitted. A child row is
+  **exempt** from the FK check if **any** of its foreign-key columns is NULL (the whole tuple passes,
+  even when the non-NULL components match no parent).
+- **`MATCH FULL`** — a child row is exempt only when **all** of its foreign-key columns are NULL. A
+  tuple that mixes NULL and non-NULL values is a violation in itself, whatever the non-NULL values are:
+  **`23503`** with the child-side message (§6.4) and PostgreSQL's DETAIL sentence `MATCH FULL does not
+  allow mixing of null and nonnull key values.` in the structured `Detail` field
+  ([error-fields.md](error-fields.md) §9.2). The sentence names no values, so the §9.4 privilege gate
+  never degrades it (PostgreSQL emits it unconditionally too).
+- **`MATCH PARTIAL`** — not implemented by PostgreSQL either; it is rejected at parse with PostgreSQL's
+  **`0A000`** `MATCH PARTIAL not yet implemented`.
+
+Either way a row whose FK columns are **all non-NULL** is checked against the parent. For a
+single-column FK the two match types are indistinguishable. The MATCH FULL rule applies wherever
+the child side is checked: INSERT, UPDATE of an FK column, the `ON CONFLICT DO UPDATE` arm, the
+generated rows of a `SET NULL` / `SET DEFAULT` action (§6.6 — `SET NULL` nulls every member, so it
+always passes; a `SET DEFAULT` whose defaults mix NULL and non-NULL fails), and `ALTER TABLE … ADD
+FOREIGN KEY` validation of existing rows (PostgreSQL's `RI_Initial_Check` reports the mix rather than
+the missing parent). Within that order a partly-NULL row is reported at the position its existence
+check would have been. The **parent side** (§6.5) is unchanged: under MATCH FULL no partly-NULL child
+row can exist, and an all-NULL one references nothing, exactly as under MATCH SIMPLE.
+
+Mechanically the exemption reuses the [indexes.md §3](indexes.md) NULLS-DISTINCT machinery: a row's
+**probe key** is built only when every FK component is present; a `None`/`null` probe (any NULL)
+skips the check — the same primitive `indexPrefixKey` returns for a NULL unique-index member — after
+a MATCH FULL FK has rejected a partly-NULL tuple.
 
 ### 6.4 Enforcement — the child side (INSERT / UPDATE of the referencing table)
 
@@ -553,7 +578,7 @@ the row's own constraints (NOT NULL `23502`, CHECK `23514`, the PK/UNIQUE duplic
 FK fires **last**, PG's order), each FK on the table is checked **in name order**:
 
 - build the probe tuple from the candidate row's FK-column values; if any is NULL, **skip**
-  (§6.3);
+  (§6.3) — unless the FK is `MATCH FULL` and the tuple is only partly NULL, which is `23503`;
 - otherwise the key must exist in the parent — **either** in the parent's committed rows **or** in
   the **end state of this statement's own batch** (so a multi-row `INSERT` whose later rows supply
   the parent key for earlier rows succeeds, and a self-referential `INSERT` resolves within the
@@ -744,7 +769,7 @@ parent column's type ([encoding.md §2.3](encoding.md)). The concatenation is ex
 storage key (PK case) or unique-index prefix (UNIQUE case), so the probe is `memcmp`-correct with no
 special-casing.
 
-### 6.9 Persistence (`format_version` 11; action encoding revised in version 30)
+### 6.9 Persistence (`format_version` 11; action encoding revised in version 30, match type in 40)
 
 Each table's catalog entry has a **foreign-key list**, after the index list and before the
 trailing root-page pointer ([../fileformat/format.md](../fileformat/format.md)): an `fk_count`
@@ -753,7 +778,8 @@ in declaration/list order), the **referenced table name**, the **referenced-colu
 (count + ordinals, in list order — ordinals into the *parent* table), and a **flags/action byte**.
 Since `format_version` 30 each action occupies three bits (`NO ACTION = 0`, `RESTRICT = 1`,
 `CASCADE = 2`, `SET NULL = 3`, `SET DEFAULT = 4`): `on_delete` uses bits 0–2, `on_update` bits
-3–5, and bits 6–7 are reserved, written 0 and read-validated to `XX001`. This supersedes v11's
+3–5. Since `format_version` 40 bit 6 is the match type (`1` = `MATCH FULL`, `0` = `MATCH SIMPLE`,
+§6.3); bit 7 is reserved, written 0 and read-validated to `XX001`. This supersedes v11's
 two-bit-per-action layout, which could represent only the two actions then implemented. The list is
 held in **ascending name byte order** (the catalog's
 standing deterministic order, like checks and indexes), which is also the §6.4 child-side

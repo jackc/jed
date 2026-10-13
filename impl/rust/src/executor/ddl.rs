@@ -1397,6 +1397,7 @@ impl Engine {
                 columns: local,
                 ref_table: parent.name.clone(),
                 ref_columns: refs,
+                match_full: fk.match_full,
                 on_delete,
                 on_update,
             });
@@ -2588,6 +2589,7 @@ impl Engine {
                                     columns: local,
                                     ref_table: parent.name,
                                     ref_columns: refs,
+                                    match_full: d.match_full,
                                     on_delete: fk_action(d.on_delete, "DELETE")?,
                                     on_update: fk_action(d.on_update, "UPDATE")?,
                                 });
@@ -3377,6 +3379,9 @@ impl Engine {
                 let pc = self.column_collations(&parent.columns);
                 for (_, mut row) in rows.iter().cloned() {
                     store.resolve_inline_columns(&mut row)?;
+                    if fk_match_full_violated(fk, &row) {
+                        return Err(EngineError::fk_violation_match_full(&table.name, &fk.name));
+                    }
                     if let Some(p) = fk_probe(fk, parent, &pc, &row, &fk.columns)? {
                         let hit = if std::ptr::eq(parent, &table) {
                             let mut found = false;

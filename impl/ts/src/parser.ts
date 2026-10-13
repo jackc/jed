@@ -984,23 +984,32 @@ class Parser {
     this.expectKeyword("foreign");
     this.expectKeyword("key");
     const columns = this.parsePkColumnList();
-    const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
-    return { name, columns, refTable, refColumns, onDelete, onUpdate };
+    return { ...this.parseReferencesClause(), name, columns };
   }
 
   // parseReferencesClause parses a references_clause from the REFERENCES keyword onward (shared
   // by the column-level and table-level forms — spec/design/grammar.md §43): the referenced
-  // table, an optional referenced-column list (null defaults to the parent's primary key), and
-  // the `ON DELETE` / `ON UPDATE` actions (each at most once, either order; a repeat is 42601).
-  private parseReferencesClause(): {
-    refTable: string;
-    refColumns: string[] | null;
-    onDelete: RefAction;
-    onUpdate: RefAction;
-  } {
+  // table, an optional referenced-column list (null defaults to the parent's primary key), an
+  // optional `MATCH FULL | SIMPLE` (`MATCH PARTIAL` is 0A000, as in PostgreSQL), and the
+  // `ON DELETE` / `ON UPDATE` actions (each at most once, either order; a repeat is 42601). The
+  // returned definition carries no name and no local columns; the caller fills them in.
+  private parseReferencesClause(): ForeignKeyDef {
     this.expectKeyword("references");
     const refTable = this.expectIdentifier();
     const refColumns = this.peek().kind === "lparen" ? this.parsePkColumnList() : null;
+    let matchFull = false;
+    if (this.peekKeyword() === "match") {
+      this.advance();
+      const kw = this.peekKeyword();
+      if (kw === "full") {
+        matchFull = true;
+      } else if (kw === "partial") {
+        throw engineError("feature_not_supported", "MATCH PARTIAL not yet implemented");
+      } else if (kw !== "simple") {
+        throw engineError("syntax_error", "expected FULL, PARTIAL, or SIMPLE after MATCH");
+      }
+      this.advance();
+    }
     let onDelete: RefAction = "noAction";
     let onUpdate: RefAction = "noAction";
     let seenDelete = false;
@@ -1022,7 +1031,7 @@ class Parser {
         throw engineError("syntax_error", "expected DELETE or UPDATE after ON");
       }
     }
-    return { refTable, refColumns, onDelete, onUpdate };
+    return { name: null, columns: [], refTable, refColumns, matchFull, onDelete, onUpdate };
   }
 
   // parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
@@ -1184,15 +1193,7 @@ class Parser {
       if (this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "references") {
         this.advance();
         const cname = this.expectIdentifier();
-        const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
-        fks.push({
-          name: cname,
-          columns: [name],
-          refTable,
-          refColumns,
-          onDelete,
-          onUpdate,
-        });
+        fks.push({ ...this.parseReferencesClause(), name: cname, columns: [name] });
         continue;
       }
       const kw = this.peekKeyword();
@@ -1258,15 +1259,7 @@ class Parser {
       } else if (kw === "references") {
         // The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
         // parseReferencesClause consumes the REFERENCES keyword itself.
-        const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
-        fks.push({
-          name: null,
-          columns: [name],
-          refTable,
-          refColumns,
-          onDelete,
-          onUpdate,
-        });
+        fks.push({ ...this.parseReferencesClause(), columns: [name] });
       } else {
         break;
       }

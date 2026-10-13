@@ -353,8 +353,9 @@ jed_constraints(
   ref_table   text,              -- FOREIGN KEY: the referenced (parent) table name; NULL otherwise
   ref_columns text[],            -- FOREIGN KEY: the referenced parent column names (list order);
                                  --   NULL otherwise
-  operators   text[]             -- EXCLUDE: each element's WITH operator ('&&' | '='), in element
+  operators   text[],            -- EXCLUDE: each element's WITH operator ('&&' | '='), in element
                                  --   order, parallel to columns; NULL otherwise
+  match_type  text               -- FOREIGN KEY: 'simple' | 'full' (constraints.md §6.3); NULL otherwise
 )
 ```
 
@@ -381,7 +382,9 @@ constraint) and gives a consumer the complete uniqueness picture in one relation
 (`EXCLUDE USING gist (room WITH =, span WITH &&)` shows `{room,span}` and `{=,&&}`). The operator
 renders as written in SQL (`&&`, `=`) — PostgreSQL's `pg_constraint.conexclop` holds operator OIDs,
 which jed does not have. `operators` was added after I2 under the §5 "growth by adding columns"
-rule.
+rule, and so was `match_type`: an FK's match type, `'simple'` (the default, written or not) or
+`'full'`, lowercased like `type` and `jed_indexes.method` (PostgreSQL's `pg_constraint.confmatchtype`
+holds `s` / `f`).
 `expression` is populated for `type = 'check'` only, from the persisted canonical expression text
 (constraints.md §4.5), which is already cross-core byte-identical, so it needs no new
 canonical-form work (contrast the deferred `DEFAULT` rendering of §5).

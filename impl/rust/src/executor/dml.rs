@@ -1454,7 +1454,8 @@ impl Engine {
         // the check sees the statement's batch END STATE (a later row may supply an earlier row's
         // parent key; a self-reference resolves within the batch — PG's end-of-statement
         // semantics). Unmetered validation, like the PK/UNIQUE probes, and before any write
-        // (all-or-nothing). MATCH SIMPLE: a row with any NULL local column is exempt.
+        // (all-or-nothing). MATCH SIMPLE: a row with any NULL local column is exempt; MATCH FULL
+        // exempts only an all-NULL tuple and rejects a partly-NULL one (§6.3).
         let fks: Vec<ForeignKeyConstraint> = self
             .table(table)
             .map(|t| t.foreign_keys.clone())
@@ -1483,7 +1484,11 @@ impl Engine {
             };
             for (_, row) in &prepared {
                 let Some(probe) = fk_probe(fk, parent, &parent_colls, row, &fk.columns)? else {
-                    continue; // a NULL local column → exempt (MATCH SIMPLE)
+                    // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+                    if fk_match_full_violated(fk, row) {
+                        return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                    }
+                    continue;
                 };
                 if batch.contains(probe.bytes()) {
                     continue;
@@ -1710,6 +1715,10 @@ impl Engine {
                 None
             };
             let Some(probe) = fk_probe(&fk, parent, &parent_colls, &row, &fk.columns)? else {
+                // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+                if fk_match_full_violated(&fk, &row) {
+                    return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                }
                 continue;
             };
             if supplied.as_deref() == Some(probe.bytes()) {
@@ -2236,7 +2245,11 @@ impl Engine {
             );
             for row in to_check {
                 let Some(probe) = fk_probe(fk, parent, &parent_colls, row, &fk.columns)? else {
-                    continue; // a NULL local column → exempt (MATCH SIMPLE)
+                    // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+                    if fk_match_full_violated(fk, row) {
+                        return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                    }
+                    continue;
                 };
                 if batch.contains(probe.bytes()) {
                     continue;
@@ -4005,7 +4018,11 @@ impl Engine {
             };
             for (_, _, new_row, _) in &updates {
                 let Some(probe) = fk_probe(fk, parent, &parent_colls, new_row, &fk.columns)? else {
-                    continue; // a NULL local column → exempt (MATCH SIMPLE)
+                    // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+                    if fk_match_full_violated(fk, new_row) {
+                        return Err(EngineError::fk_violation_match_full(&relation, &fk.name));
+                    }
+                    continue;
                 };
                 if batch.contains(probe.bytes()) {
                     continue;

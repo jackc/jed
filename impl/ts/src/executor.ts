@@ -240,6 +240,7 @@ import {
   exclusionViolation,
   fkViolationDelete,
   fkViolationInsert,
+  fkViolationMatchFull,
   notNullViolation,
   pkeyName,
   stampTable,
@@ -6312,6 +6313,7 @@ export class Engine {
         columns: local,
         refTable: parent.name,
         refColumns: refs,
+        matchFull: fk.matchFull,
         onDelete,
         onUpdate,
       });
@@ -7585,6 +7587,7 @@ export class Engine {
                 columns: local,
                 refTable: parent.name,
                 refColumns: refs,
+                matchFull: d.matchFull,
                 onDelete: fkAction(d.onDelete, "DELETE"),
                 onUpdate: fkAction(d.onUpdate, "UPDATE"),
               });
@@ -8120,8 +8123,9 @@ export class Engine {
               : snap.table(fk.refTable)!;
           const pc = this.columnCollations(parent.columns);
           for (const entry of all.entries) {
-            const row = store.resolveInlineColumns(entry.row),
-              p = fkProbe(fk, parent, pc, row, fk.columns);
+            const row = store.resolveInlineColumns(entry.row);
+            if (fkMatchFullViolated(fk, row)) throw fkViolationMatchFull(table.name, fk.name);
+            const p = fkProbe(fk, parent, pc, row, fk.columns);
             if (p !== null) {
               let hit: boolean;
               if (parent === table) {
@@ -10773,7 +10777,11 @@ export class Engine {
       }
       for (const pr of prepared) {
         const probe = fkProbe(fk, parent, parentColls, pr.row, fk.columns);
-        if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
+        if (probe === null) {
+          // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+          if (fkMatchFullViolated(fk, pr.row)) throw fkViolationMatchFull(relation, fk.name);
+          continue;
+        }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         this.validateInsertFkStored(relation, table.columns, fk, probe, pr.row);
       }
@@ -10963,7 +10971,11 @@ export class Engine {
           ? fkProbe(fk, parent, parentColls, row, fk.refColumns)
           : null;
       const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
-      if (probe === null) continue;
+      if (probe === null) {
+        // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+        if (fkMatchFullViolated(fk, row)) throw fkViolationMatchFull(relation, fk.name);
+        continue;
+      }
       if (supplied !== null && cmpBytes(fkProbeBytes(supplied), fkProbeBytes(probe)) === 0) {
         continue;
       }
@@ -11529,7 +11541,11 @@ export class Engine {
       const toCheck = inserts.concat(checkUpdates ? updates.map((u) => u.newRow) : []);
       for (const row of toCheck) {
         const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
-        if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
+        if (probe === null) {
+          // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+          if (fkMatchFullViolated(fk, row)) throw fkViolationMatchFull(relation, fk.name);
+          continue;
+        }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
           throw fkViolationInsert(relation, fk.name).withDetail(
@@ -12616,7 +12632,11 @@ export class Engine {
       }
       for (const u of updates) {
         const probe = fkProbe(fk, parent, parentColls, u.row, fk.columns);
-        if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
+        if (probe === null) {
+          // A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+          if (fkMatchFullViolated(fk, u.row)) throw fkViolationMatchFull(relation, fk.name);
+          continue;
+        }
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
           throw fkViolationInsert(relation, fk.name).withDetail(
@@ -16963,6 +16983,7 @@ export class Engine {
           nullValue(),
           nullValue(),
           nullValue(),
+          nullValue(),
         ]);
       }
       // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
@@ -16975,6 +16996,7 @@ export class Engine {
           textValue(t.name),
           textValue("unique"),
           textArr(idx.keys.map((k) => indexKeyLabel(k, t))),
+          nullValue(),
           nullValue(),
           nullValue(),
           nullValue(),
@@ -16998,6 +17020,8 @@ export class Engine {
           textValue(refTable),
           textArr(fk.refColumns.map((ord) => parent?.columns[ord]?.name ?? "")),
           nullValue(),
+          // The match type (constraints.md §6.3): full or the default simple.
+          textValue(fk.matchFull ? "full" : "simple"),
         ]);
       }
       // EXCLUDE: the excluded columns and their WITH operators, both in element order.
@@ -17013,6 +17037,7 @@ export class Engine {
           nullValue(),
           nullValue(),
           textArr(exc.elements.map((el) => exclusionOpSymbol(el.op))),
+          nullValue(),
         ]);
       }
     }
@@ -25060,6 +25085,15 @@ export function fkProbeBytes(p: FkProbe): Uint8Array {
   return p.kind === "pk" ? p.bytes : p.prefix;
 }
 
+// fkMatchFullViolated reports whether `row`'s referencing tuple for `fk` violates MATCH FULL
+// (constraints.md §6.3): the FK is MATCH FULL and its local columns mix NULL and non-NULL values.
+// MATCH SIMPLE exempts any tuple with a NULL; MATCH FULL exempts only the all-NULL one.
+export function fkMatchFullViolated(fk: ForeignKey, row: Row): boolean {
+  if (!fk.matchFull) return false;
+  const nulls = fk.columns.filter((c) => row[c]!.kind === "null").length;
+  return nulls > 0 && nulls < fk.columns.length;
+}
+
 // fkProbe builds the parent-key probe for `fk` from `row`, taking each referenced parent column's
 // value from `row[ordinals[i]]` where `ordinals[i]` supplies `fk.refColumns[i]`. So the child side
 // passes `ordinals = fk.columns` (local columns), and a self-reference batch entry passes
@@ -28386,6 +28420,8 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         textArr("ref_columns", false),
         // EXCLUDE: the WITH operators in element order; NULL otherwise (introspection.md §5.1).
         textArr("operators", false),
+        // FOREIGN KEY: the match type, 'simple' | 'full'; NULL otherwise (introspection.md §5.1).
+        col("match_type", "text", false),
       ]);
     case "jed_sequences":
       return table("jed_sequences", [

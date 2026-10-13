@@ -305,7 +305,9 @@ pub enum FkAction {
 /// One resolved `FOREIGN KEY` constraint of a table (spec/design/constraints.md §6): its
 /// (per-table constraint-namespace) name, the referencing column ordinals into **this** table in
 /// list order, the referenced (parent) table name, the referenced column ordinals into the
-/// **parent** in list order (same length as `columns`), and the referential actions. An FK owns no
+/// **parent** in list order (same length as `columns`), the match type (`match_full`: `MATCH FULL`
+/// rejects a partly-NULL referencing tuple, `MATCH SIMPLE` exempts it — §6.3), and the referential
+/// actions. An FK owns no
 /// B-tree; enforcement probes the parent's PK store or a unique index (§6.4). Held in ascending
 /// name byte order on the table (the catalog's on-disk order and the child-side evaluation
 /// order — §6.9).
@@ -315,6 +317,7 @@ pub struct ForeignKeyConstraint {
     pub columns: Vec<usize>,
     pub ref_table: String,
     pub ref_columns: Vec<usize>,
+    pub match_full: bool,
     pub on_delete: FkAction,
     pub on_update: FkAction,
 }

@@ -405,7 +405,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				return newError(DatatypeMismatch, fmt.Sprintf("foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s", name, t.Columns[local[i]].Name, parent.Columns[refs[i]].Name, t.Columns[local[i]].Type.CanonicalName(), parent.Columns[refs[i]].Type.CanonicalName()))
 			}
 		}
-		t.ForeignKeys = append(t.ForeignKeys, foreignKey{Name: name, Columns: local, RefTable: parent.Name, RefColumns: refs, OnDelete: onDelete, OnUpdate: onUpdate})
+		t.ForeignKeys = append(t.ForeignKeys, foreignKey{Name: name, Columns: local, RefTable: parent.Name, RefColumns: refs, MatchFull: d.MatchFull, OnDelete: onDelete, OnUpdate: onUpdate})
 		sort.SliceStable(t.ForeignKeys, func(i, j int) bool {
 			return t.ForeignKeys[i].Name < t.ForeignKeys[j].Name
 		})
@@ -724,6 +724,9 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 			row, err := store.resolveInlineColumns(e.Row)
 			if err != nil {
 				return nil, err
+			}
+			if fkMatchFullViolated(&fk, row) {
+				return nil, newFKViolationMatchFull(t.Name, fk.Name)
 			}
 			probe, ok, err := buildFkProbe(&fk, parent, pc, row, fk.Columns)
 			if err != nil {

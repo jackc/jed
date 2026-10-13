@@ -1196,6 +1196,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			Columns:    local,
 			RefTable:   parent.Name,
 			RefColumns: refs,
+			MatchFull:  fk.MatchFull,
 			OnDelete:   onDelete,
 			OnUpdate:   onUpdate,
 		})

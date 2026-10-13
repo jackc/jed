@@ -3602,6 +3602,15 @@ pub(crate) fn fk_probe(
     }
 }
 
+/// Whether `row`'s referencing tuple for `fk` violates MATCH FULL (constraints.md §6.3): the FK is
+/// `MATCH FULL` and its local columns mix NULL and non-NULL values. MATCH SIMPLE exempts any tuple
+/// with a NULL; MATCH FULL exempts only the all-NULL one.
+pub(crate) fn fk_match_full_violated(fk: &ForeignKeyConstraint, row: &Row) -> bool {
+    fk.match_full
+        && fk.columns.iter().any(|&c| matches!(row[c], Value::Null))
+        && fk.columns.iter().any(|&c| !matches!(row[c], Value::Null))
+}
+
 /// The access path a parent-side reverse match uses on the child table
 /// (spec/design/constraints.md §6.5): the child's PK (`index == None`) or a plain-column ordered
 /// B-tree secondary index (`index` = its exact name). `cols` are the leading child key

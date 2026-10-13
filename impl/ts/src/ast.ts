@@ -562,7 +562,8 @@ export type RefAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDe
 // ForeignKeyDef is one parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md
 // §43): the optional explicit CONSTRAINT name (null = unnamed), the local (referencing) column
 // names in list order, the referenced (parent) table name, the optional referenced column names
-// (null = the parent's primary key), and the `ON DELETE` / `ON UPDATE` actions. Execution
+// (null = the parent's primary key), the match type (matchFull: `MATCH FULL` vs the default
+// `MATCH SIMPLE`), and the `ON DELETE` / `ON UPDATE` actions. Execution
 // resolves it (42703/42701/42P01/42830/42804) and names the unnamed ones (42710) —
 // spec/design/constraints.md §6.
 export type ForeignKeyDef = {
@@ -570,6 +571,7 @@ export type ForeignKeyDef = {
   columns: string[];
   refTable: string;
   refColumns: string[] | null;
+  matchFull: boolean;
   onDelete: RefAction;
   onUpdate: RefAction;
 };

@@ -245,14 +245,16 @@ const (
 // ForeignKeyDef is one parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md
 // §43): the optional explicit CONSTRAINT name (empty = unnamed), the local (referencing)
 // column names in list order, the referenced (parent) table name, the optional referenced
-// column names (RefColumns nil = the parent's primary key), and the ON DELETE / ON UPDATE
-// actions. Execution resolves it (42703/42701/42P01/42830/42804) and names the unnamed ones
-// (42710) — spec/design/constraints.md §6.
+// column names (RefColumns nil = the parent's primary key), the match type (MatchFull: MATCH FULL
+// vs the default MATCH SIMPLE), and the ON DELETE / ON UPDATE actions. Execution resolves it
+// (42703/42701/42P01/42830/42804) and names the unnamed ones (42710) — spec/design/constraints.md
+// §6.
 type foreignKeyDef struct {
 	Name       string
 	Columns    []string
 	RefTable   string
 	RefColumns []string // nil = default to the parent's primary key
+	MatchFull  bool
 	OnDelete   refAction
 	OnUpdate   refAction
 }

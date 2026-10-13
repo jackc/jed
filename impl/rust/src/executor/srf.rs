@@ -1139,6 +1139,7 @@ impl Engine {
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    Value::Null,
                 ]);
             }
             // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
@@ -1158,6 +1159,7 @@ impl Engine {
                     Value::Text(t.name.clone()),
                     Value::Text("unique".to_string()),
                     text_arr(cols),
+                    Value::Null,
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -1198,6 +1200,8 @@ impl Engine {
                     Value::Text(ref_table),
                     text_arr(ref_cols),
                     Value::Null,
+                    // The match type (constraints.md §6.3): `full` or the default `simple`.
+                    Value::Text(if fk.match_full { "full" } else { "simple" }.to_string()),
                 ]);
             }
             // EXCLUDE: the excluded columns and their WITH operators, both in element order.
@@ -1223,6 +1227,7 @@ impl Engine {
                     Value::Null,
                     Value::Null,
                     text_arr(ops),
+                    Value::Null,
                 ]);
             }
         }

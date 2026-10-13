@@ -673,8 +673,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   (`format_version` 10 — `type_code 15` + an inline element-type descriptor + the compact array
   value body, `spec/design/array.md`), **`FOREIGN KEY` constraints** (`format_version` 11 — the
   table catalog entry gains a per-table foreign-key list after the index list, referencing the
-  parent table/columns by name/ordinal with an `on_delete`/`on_update` action byte; an FK owns no
-  B-tree, so it adds no value-codec change, `spec/design/constraints.md` §6), and **sequences**
+  parent table/columns by name/ordinal with an `on_delete`/`on_update` action byte — since v40 also
+  carrying the `MATCH FULL` bit; an FK owns no B-tree, so it adds no value-codec change,
+  `spec/design/constraints.md` §6), and **sequences**
   (`format_version` 12 — a third kind-tagged catalog entry `entry_kind 2` carrying the name, six
   fixed i64 fields, and a flags byte; emitted composites→sequences→tables; a sequence owns no
   B-tree. `nextval` is **transactional** — the counter is a snapshot field that rolls back with its

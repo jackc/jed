@@ -357,8 +357,8 @@ fn hostfunc_check_table_db() -> Session {
 /// foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 /// four FKs covering every shape — a named FK to the UNIQUE column (`c_code_fk`), a self-reference
 /// to the PK (`c_mgr_fkey`), an auto-named FK to the PK (`c_pid_fkey`), and an auto-named COMPOSITE
-/// FK to the two-column UNIQUE (`c_x_y_fkey`). Their action bytes collectively pin every v30
-/// action code. Must match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
+/// FK to the two-column UNIQUE (`c_x_y_fkey`, MATCH FULL). Their action bytes collectively pin
+/// every v30 action code and the v40 match_full bit. Must match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
 fn fk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
         page_size: GOLDEN_PAGE_SIZE,
@@ -379,7 +379,7 @@ fn fk_table_db() -> Session {
         "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, \
          FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE RESTRICT, \
          CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code) ON DELETE SET NULL, \
-         FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE CASCADE ON UPDATE SET DEFAULT, \
+         FOREIGN KEY (x, y) REFERENCES p (a, b) MATCH FULL ON DELETE CASCADE ON UPDATE SET DEFAULT, \
          FOREIGN KEY (mgr) REFERENCES c (id))",
     );
     run(
@@ -1870,6 +1870,31 @@ fn read_goldens_reproduces_rows() {
         .unwrap()
         .session(SessionOptions::default());
     assert!(empty.table("t").is_none());
+}
+
+/// READ side, FK match type: the v40 match_full bit of the actions byte decodes exactly — only
+/// `c_x_y_fkey` is MATCH FULL (a rows-only check cannot see it).
+#[test]
+fn read_golden_fk_match_full() {
+    let loaded = Database::from_image(&fixture("fk_table.jed"))
+        .unwrap()
+        .session(SessionOptions::default());
+    let full: Vec<(String, bool)> = loaded
+        .table("c")
+        .expect("table c")
+        .foreign_keys
+        .iter()
+        .map(|f| (f.name.clone(), f.match_full))
+        .collect();
+    assert_eq!(
+        full,
+        vec![
+            ("c_code_fk".to_string(), false),
+            ("c_mgr_fkey".to_string(), false),
+            ("c_pid_fkey".to_string(), false),
+            ("c_x_y_fkey".to_string(), true),
+        ]
+    );
 }
 
 /// READ side, catalog detail: column names, types, and flags survive exactly (a read

@@ -1876,7 +1876,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 	// check sees the statement's batch END STATE (a later row may supply an earlier row's parent
 	// key; a self-reference resolves within the batch — PG's end-of-statement semantics). Unmetered
 	// validation, like the PK/UNIQUE probes, and before any write (all-or-nothing). MATCH SIMPLE: a
-	// row with any NULL local column is exempt.
+	// row with any NULL local column is exempt; MATCH FULL exempts only an all-NULL tuple (§6.3).
 	relation := table.Name
 	for fki := range table.ForeignKeys {
 		fk := &table.ForeignKeys[fki]
@@ -1909,7 +1909,11 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 				return nil, err
 			}
 			if !ok {
-				continue // a NULL local column → exempt (MATCH SIMPLE)
+				// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+				if fkMatchFullViolated(fk, pr.row) {
+					return nil, newFKViolationMatchFull(relation, fk.Name)
+				}
+				continue
 			}
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
@@ -2120,6 +2124,10 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 			return nil, err
 		}
 		if !probeOK {
+			// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+			if fkMatchFullViolated(fk, row) {
+				return nil, newFKViolationMatchFull(relation, fk.Name)
+			}
 			continue
 		}
 		if suppliedOK && bytes.Equal(supplied.bytes, probe.bytes) {
@@ -2637,7 +2645,11 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				return 0, nil, err
 			}
 			if !ok {
-				continue // a NULL local column → exempt (MATCH SIMPLE)
+				// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+				if fkMatchFullViolated(fk, row) {
+					return 0, nil, newFKViolationMatchFull(relation, fk.Name)
+				}
+				continue
 			}
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
@@ -4087,7 +4099,11 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				return outcome{}, err
 			}
 			if !ok {
-				continue // a NULL local column → exempt (MATCH SIMPLE)
+				// A NULL local column → exempt (MATCH SIMPLE); MATCH FULL exempts only all-NULL.
+				if fkMatchFullViolated(fk, u.row) {
+					return outcome{}, newFKViolationMatchFull(relation, fk.Name)
+				}
+				continue
 			}
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue

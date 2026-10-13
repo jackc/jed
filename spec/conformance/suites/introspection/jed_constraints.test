@@ -4,14 +4,14 @@
 # (text[], member/local columns; NULL for a CHECK) / expression (the persisted canonical CHECK text,
 # constraints.md §4.5 — cross-core byte-identical; NULL otherwise) / ref_table + ref_columns (FK
 # parent, NULL otherwise) / operators (text[], an EXCLUDE's WITH operators in element order, parallel
-# to columns; NULL otherwise). It covers those FOUR kinds only: the PRIMARY KEY and NOT NULL constraints
+# to columns; NULL otherwise) / match_type (an FK's 'simple' | 'full', NULL otherwise). It covers those FOUR kinds only: the PRIMARY KEY and NOT NULL constraints
 # own no named catalog object and are described by jed_columns (pk_ordinal, not_null). A jed UNIQUE
 # constraint IS its backing unique index (constraints.md §5 — the catalog cannot distinguish a
 # UNIQUE table constraint from a bare CREATE UNIQUE INDEX), so type='unique' lists every unique
 # b-tree index; a constraint-backing index appears in both jed_constraints and jed_indexes under the
 # same name. Resolution / scoping / read-only / privileges / cost are the jed_tables model.
 # jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: introspect.constraints, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.not_null, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range, types.array, expr.array_subscript, ddl.gist_scalar_index
+# requires: introspect.constraints, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.foreign_key_match_full, ddl.not_null, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range, types.array, expr.array_subscript, ddl.gist_scalar_index
 
 # --- an empty database lists no constraints -------------------------------------------------------
 
@@ -39,8 +39,8 @@ CREATE TABLE child (
 # every constraint across both tables — the PRIMARY KEY (parent's (code, id), child's x) is ABSENT
 # (owns no named object; described by jed_columns.pk_ordinal), so is NOT NULL. Per-table generation
 # order is by KIND (check, unique, foreign_key, exclude), then name.
-query TTTTTTTT nosort
-SELECT name, table_name, type, columns, expression, ref_table, ref_columns, operators
+query TTTTTTTTT nosort
+SELECT name, table_name, type, columns, expression, ref_table, ref_columns, operators, match_type
   FROM jed_constraints ORDER BY table_name, type, name
 ----
 child_amt_check
@@ -48,6 +48,7 @@ child
 check
 NULL
 amt >= 0
+NULL
 NULL
 NULL
 NULL
@@ -59,6 +60,7 @@ note <> ''
 NULL
 NULL
 NULL
+NULL
 child_span_excl
 child
 exclude
@@ -67,6 +69,7 @@ NULL
 NULL
 NULL
 {&&}
+NULL
 child_pid_fk
 child
 foreign_key
@@ -75,10 +78,12 @@ NULL
 parent
 {id}
 NULL
+simple
 parent_id_uq
 parent
 unique
 {id}
+NULL
 NULL
 NULL
 NULL
@@ -163,6 +168,23 @@ foreign_key
 {fb,fa}
 p2
 {b,a}
+
+# match_type is the FK's match type: 'simple' (the default, explicit or not) or 'full'
+statement ok
+CREATE TABLE c3 (x i32 PRIMARY KEY, fa i32, fb i32, ga i32, gb i32,
+  CONSTRAINT c3_full FOREIGN KEY (fa, fb) REFERENCES p2 MATCH FULL ON DELETE CASCADE,
+  CONSTRAINT c3_simple FOREIGN KEY (ga, gb) REFERENCES p2 MATCH SIMPLE)
+
+query TT nosort
+SELECT name, match_type FROM jed_constraints WHERE table_name = 'c3' ORDER BY name
+----
+c3_full
+full
+c3_simple
+simple
+
+statement ok
+DROP TABLE c3
 
 # --- resolution: case-insensitive, alias, qualifier scoping, CTE shadow --------------------------
 

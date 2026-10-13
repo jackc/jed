@@ -170,6 +170,15 @@ impl EngineError {
         .with_constraint(constraint)
     }
 
+    /// 23503, child side under MATCH FULL — an INSERT/UPDATE on `table` writes a referencing
+    /// tuple that mixes NULL and non-NULL values under foreign key `constraint`
+    /// (constraints.md §6.3). PostgreSQL's DETAIL names no values, so it is never privilege-gated.
+    pub(crate) fn fk_violation_match_full(table: &str, constraint: &str) -> Self {
+        Self::fk_violation_insert(table, constraint).with_detail(Some(
+            "MATCH FULL does not allow mixing of null and nonnull key values.".to_string(),
+        ))
+    }
+
     /// 23503, parent side — a DELETE/UPDATE on `parent` strands a child of `child` still
     /// referencing it under foreign key `constraint`.
     pub(crate) fn fk_violation_delete(parent: &str, constraint: &str, child: &str) -> Self {

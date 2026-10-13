@@ -68,6 +68,20 @@ scans the whole child table, and each action scans it once per statement. Create
 starts with the foreign-key columns (or make them the leading primary-key columns), and each check
 or action becomes one index lookup per parent row. This work counts toward a session's `max_cost`.
 
+A multi-column foreign key with a `NULL` in any referencing column is not checked: that row
+references nothing (`MATCH SIMPLE`, the default). Write `MATCH FULL` after the referenced columns to
+allow only all-`NULL` or all-non-`NULL` keys; a row that mixes them is error `23503`.
+`MATCH PARTIAL` is not supported (`0A000`), as in PostgreSQL.
+
+```sql
+CREATE TABLE shipment (
+  id i32 PRIMARY KEY, region text, code i32,
+  FOREIGN KEY (region, code) REFERENCES depot (region, code) MATCH FULL ON DELETE SET NULL
+);
+INSERT INTO shipment VALUES (1, NULL, NULL);   -- ok: references nothing
+INSERT INTO shipment VALUES (2, 'west', NULL); -- error 23503 under MATCH FULL
+```
+
 ## Names and quoted identifiers
 
 Names follow PostgreSQL's rules. A bare name is folded to lowercase, so `Orders`, `ORDERS`, and
