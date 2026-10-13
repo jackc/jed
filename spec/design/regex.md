@@ -587,7 +587,9 @@ Each is a transform at parse time; the instruction set, the VM, and the costs ar
 - **Quote** (the `q` flag). The whole pattern is a literal: every metacharacter of §2 is escaped
   with `\` before parsing, so the program is a sequence of `Char` instructions.
 
-Case-insensitive matching (`i`) is the `~*` fold of §1, applied before the quote transform.
+Case-insensitive matching (`i`) is the `~*` fold of §1, applied before the quote transform. A quoted
+pattern is all literal, so with `q` the fold covers every character; without it, the letter after a
+backslash is kept, so `\D \W \S \A` keep their meaning.
 
 ---
 

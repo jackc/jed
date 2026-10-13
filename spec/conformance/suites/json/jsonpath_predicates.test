@@ -419,6 +419,25 @@ true
 true
 true
 
+# flag "i" folds the pattern's literals but keeps the letter after a backslash (regex.md §1), so
+# \D \W \S keep their meaning and \A stays the start anchor.
+query BBBBBB nosort
+SELECT jsonb_path_exists('"a"', '$ ? (@ like_regex "\\D" flag "i")'), jsonb_path_exists('"1"', '$ ? (@ like_regex "\\D" flag "i")'), jsonb_path_exists('"A"', '$ ? (@ like_regex "\\W" flag "i")'), jsonb_path_exists('" "', '$ ? (@ like_regex "\\S" flag "i")'), jsonb_path_exists('"ABC"', '$ ? (@ like_regex "\\Aab" flag "i")'), jsonb_path_exists('"xABC"', '$ ? (@ like_regex "\\Aab" flag "i")')
+----
+true
+false
+false
+false
+true
+false
+
+# With q the whole pattern is literal, so i folds the letter after the backslash too.
+query BB nosort
+SELECT jsonb_path_exists('"x\\d"', '$ ? (@ like_regex "\\D" flag "iq")'), jsonb_path_exists('"x\\d"', '$ ? (@ like_regex "\\D" flag "q")')
+----
+true
+false
+
 # ^ and $ anchor the whole string.
 query BB nosort
 SELECT jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "^b")'), jsonb_path_exists('"a\nb"', '$ ? (@ like_regex "a$")')

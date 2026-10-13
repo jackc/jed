@@ -3405,12 +3405,18 @@ impl Parser<'_> {
 }
 
 /// Compile a `like_regex` pattern under its flags (jsonpath.md §4.3, regex.md §8d): `i` folds the
-/// pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+/// pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive. A quoted
+/// pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the letter
+/// after a backslash (regex.md §1).
 fn compile_like_regex(pattern: &str, flags: u8) -> Result<crate::regex::Program> {
     let folded;
     let pattern = if flags & REGEX_I != 0 {
         let prop = crate::collation::loaded_property();
-        folded = crate::collation::fold_lower_simple(pattern, prop.as_deref());
+        folded = if flags & REGEX_Q != 0 {
+            crate::collation::fold_lower_simple(pattern, prop.as_deref())
+        } else {
+            crate::regex::fold_pattern(pattern, prop.as_deref())
+        };
         folded.as_str()
     } else {
         pattern

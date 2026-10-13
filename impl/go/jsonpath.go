@@ -3666,9 +3666,15 @@ func (p *jpParser) parseLikeRegex(left *jpPathExpr) (jpParsed, error) {
 
 // jpCompileLikeRegex compiles a like_regex pattern under its flags (jsonpath.md §4.3, regex.md §8d):
 // `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+// A quoted pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the
+// letter after a backslash (regex.md §1).
 func jpCompileLikeRegex(pattern string, flags uint8) (*regexProgram, error) {
 	if flags&jpRegexI != 0 {
-		pattern = foldLowerSimple(pattern, loadedProperty())
+		if flags&jpRegexQ != 0 {
+			pattern = foldLowerSimple(pattern, loadedProperty())
+		} else {
+			pattern = foldRegexPattern(pattern, loadedProperty())
+		}
 	}
 	if flags&jpRegexQ != 0 {
 		return compileRegexMode(quoteRegex(pattern), regexMode{})

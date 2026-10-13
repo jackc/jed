@@ -33,6 +33,7 @@ import { foldLowerSimple, loadedProperty } from "./collation.ts";
 import {
   type RegexProgram,
   compileRegexMode,
+  foldRegexPattern,
   quoteRegex,
   regexIsMatch,
   regexNinst,
@@ -1214,8 +1215,16 @@ class Parser {
 
 // compileLikeRegex compiles a like_regex pattern under its flags (jsonpath.md §4.3, regex.md §8d):
 // `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
+// A quoted pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the
+// letter after a backslash (regex.md §1).
 function compileLikeRegex(pattern: string, flags: number): RegexProgram {
-  const p = (flags & REGEX_I) !== 0 ? foldLowerSimple(pattern, loadedProperty()) : pattern;
+  let p = pattern;
+  if ((flags & REGEX_I) !== 0) {
+    p =
+      (flags & REGEX_Q) !== 0
+        ? foldLowerSimple(pattern, loadedProperty())
+        : foldRegexPattern(pattern, loadedProperty());
+  }
   if ((flags & REGEX_Q) !== 0) {
     return compileRegexMode(quoteRegex(p), { nlStop: false, dotAll: false });
   }
