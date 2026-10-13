@@ -146,3 +146,33 @@ elem_max = 500
 name = "docs_tags_gin"
 columns = ["tags"]
 method = "gin"
+
+# Text dataset — long text values that exercise the large-value storage paths
+# (spec/design/large-values.md): the overflow chain and the LZ4 codec. At the default 8 KiB page a
+# record over RECORD_MAX = 4082 bytes first compresses its largest value, then externalizes what
+# still does not fit. `alphabet = 4` draws each character from 'a'..'d' instead of 'a'..'z', so a
+# body compresses (LZ4 finds a 4-byte match almost everywhere) but only to roughly two-thirds of its
+# length: the 1,000–16,000-byte bodies land in all three forms — inline plain (under RECORD_MAX),
+# inline compressed, and an external chain of the compressed block. PostgreSQL TOASTs the same values
+# (pglz) and SQLite moves them onto overflow pages.
+[[dataset]]
+name = "text"
+
+[[dataset.table]]
+name = "docs"
+rows = 5000
+seed = 401
+
+[[dataset.table.column]]
+name = "id"
+type = "i64"
+gen = "serial"
+primary_key = true
+
+[[dataset.table.column]]
+name = "body"
+type = "text"
+gen = "text"
+min_len = 1000
+max_len = 16000
+alphabet = 4

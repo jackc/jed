@@ -46,6 +46,7 @@ type Column struct {
 	Max        int64  `toml:"max"`
 	MinLen     int64  `toml:"min_len"` // text: string length range; int_array: array length range
 	MaxLen     int64  `toml:"max_len"`
+	Alphabet   int64  `toml:"alphabet"` // text: letters drawn from, 'a' onward (0 = all 26)
 	ElemMin    int64  `toml:"elem_min"` // int_array: element value range
 	ElemMax    int64  `toml:"elem_max"`
 }
@@ -186,7 +187,11 @@ func (r *RowStream) Next() []any {
 		case "int_uniform":
 			vals[i] = r.prng.IntUniform(c.Min, c.Max)
 		case "text":
-			vals[i] = r.prng.Text(c.MinLen, c.MaxLen)
+			alphabet := c.Alphabet
+			if alphabet == 0 {
+				alphabet = 26
+			}
+			vals[i] = r.prng.TextOver(c.MinLen, c.MaxLen, alphabet)
 		case "int_array":
 			// One length draw, then that many element draws — mirrors text generation.
 			n := r.prng.IntUniform(c.MinLen, c.MaxLen)

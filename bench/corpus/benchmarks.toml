@@ -1362,6 +1362,37 @@ gen = "text"
 min_len = 8
 max_len = 32
 
+# Text-heavy rows (benchmarks.md §11) over the `text` dataset: 5,000 bodies of 1,000–16,000
+# compressible characters, so most rows store their body LZ4-compressed and the longest ones in an
+# overflow chain (datasets.toml). The scan reads and decompresses every body; the point read returns
+# one whole body per probe. length() counts characters in all three engines and the bodies are ASCII.
+[[bench]]
+name = "text_scan"
+description = "Full scan of 5k long-text rows: sum(length(body)) reads every compressed / overflowed body"
+dataset = "text"
+kind = "query"
+sql = "SELECT count(*), sum(length(body)) FROM docs"
+warmup = 2
+iterations = 10
+seed = 4290
+expect_rows_per_iter = 1
+
+[[bench]]
+name = "text_point_read"
+description = "PK point read returning one 1,000–16,000-character body (LZ4 decompression + overflow chain)"
+dataset = "text"
+kind = "query"
+sql = "SELECT id, body FROM docs WHERE id = $1"
+warmup = 500
+iterations = 5000
+seed = 4291
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 5000
+
 [[bench]]
 name = "cte_materialized"
 description = "Multi-reference materialized CTE: a per-customer order-count aggregate (~100k rows) buffered once and scanned by two references (spec/design/cte.md, cost.md §3 cte_scan_row)"

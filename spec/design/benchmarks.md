@@ -929,7 +929,9 @@ bench-setup skips it elsewhere. The `gin` dataset's `docs` table is `["jed", "po
 stream with `table.seed`; for each row 1..rows, draw each non-`serial` column's value in
 declared column order. Any language reproduces the dataset exactly from the spec. (Today
 bench-setup is Go-only; the data files it produces are read by all three language
-harnesses, so the generators below live in `bench/go` alone.)
+harnesses, so the generators below live in `bench/go` alone.) `bench-setup` loads jed through
+multi-row literal `INSERT`s of up to 500 rows, cut early once a statement passes 512 KiB so the
+long `text` rows stay under jed's 1 MiB statement limit; the batching does not change the rows.
 
 **DDL is derived** from the spec per engine — never written as literal SQL — with this
 fixed type map:
@@ -970,6 +972,14 @@ Draws:
   "length-then-contents" shape as `text`. Rendered as the array text literal `'{1,2,3}'`
   (`'{}'` when empty) for the jed/SQL load, and passed as a native `[]int64` to PostgreSQL's
   `CopyFrom`. The `gin` dataset's `docs.tags bigint[]` column is the only user today.
+- a dataset `text` column may set `alphabet = k` (1–26, default 26): the same draws with
+  `'a' + next() % k` per character. A small alphabet makes the text compressible. The `text`
+  dataset's `docs.body` uses `k = 4`, which jed's pinned LZ4 encoder ([lz4.md](../fileformat/lz4.md))
+  shrinks to about 69%, so its 1,000–16,000-byte bodies cover all three large-value forms
+  ([large-values.md](large-values.md) §13): inline plain under `RECORD_MAX`, inline compressed,
+  and an overflow chain of the compressed block. PostgreSQL TOASTs the same bodies and SQLite
+  moves them onto overflow pages. The bench `[[bench.param]]` `text` generator has no
+  `alphabet`; only `bench-setup` reads it.
 
 Ruby reference (the snippet that generated the pinned vectors below):
 
@@ -1472,7 +1482,9 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 - ✅ **miss-heavy point lookups** — `point_lookup_pk_miss`: a scratch table holding every tenth key
   of 1..1,000,000, so ~90% of the uniform probes miss and each miss descends to a different leaf
   (probing past the end of the dense `large` keys would land on the one rightmost leaf every time);
-- text-heavy / large-value rows (exercise the overflow + LZ4 path);
+- ✅ **text-heavy / large-value rows** — `text_scan` (`sum(length(body))` reads every body) and
+  `text_point_read` (one whole body per probe) over the `text` dataset (§4), whose bodies land
+  inline plain, inline LZ4-compressed, and in compressed overflow chains, on every engine;
 - ✅ **`Database` concurrent-reader throughput** — landed as the `concurrent_read` kind
   (§8.1): `concurrent_read_pk_r{1,4}` over the resident `small` dataset plus
   `concurrent_read_pk_cold_r{1,4}` over cold population of the cache-fitting `large` dataset,

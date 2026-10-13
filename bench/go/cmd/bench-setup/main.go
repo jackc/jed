@@ -129,14 +129,19 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 			return err
 		}
 		stream := bench.NewRowStream(&t)
+		// A statement takes up to 500 rows, and is cut early once it passes 512 KiB so long text
+		// rows (the text dataset) stay under jed's 1 MiB statement limit (54000).
 		const batch = 500
+		const maxStmtBytes = 512 << 10
 		var sb strings.Builder
-		for {
+		done := false
+		for !done {
 			sb.Reset()
 			n := 0
-			for ; n < batch; n++ {
+			for n < batch && sb.Len() < maxStmtBytes {
 				row := stream.Next()
 				if row == nil {
+					done = true
 					break
 				}
 				if n == 0 {
@@ -145,15 +150,13 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 					sb.WriteString(", ")
 				}
 				writeLiteralRow(&sb, row)
+				n++
 			}
 			if n == 0 {
 				break
 			}
 			if err := exec(sb.String()); err != nil {
 				return err
-			}
-			if n < batch {
-				break
 			}
 		}
 		if err := exec("COMMIT"); err != nil {

@@ -32,11 +32,16 @@ func (p *Prng) IntUniform(lo, hi int64) int64 {
 
 // Text draws a lowercase ASCII string with length in [minLen, maxLen]: one bounded draw
 // for the length, then one per character ('a' + next() % 26).
-func (p *Prng) Text(minLen, maxLen int64) string {
+func (p *Prng) Text(minLen, maxLen int64) string { return p.TextOver(minLen, maxLen, 26) }
+
+// TextOver is Text over the first `alphabet` lowercase letters ('a' + next() % alphabet) — the
+// dataset generator's `alphabet` key (benchmarks.md §4). A smaller alphabet makes the text
+// compressible; Text is TextOver with all 26.
+func (p *Prng) TextOver(minLen, maxLen, alphabet int64) string {
 	n := p.IntUniform(minLen, maxLen)
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = byte('a' + p.Next()%26)
+		b[i] = byte('a' + p.Next()%uint64(alphabet))
 	}
 	return string(b)
 }
