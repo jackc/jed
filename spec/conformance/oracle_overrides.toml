@@ -575,6 +575,31 @@ file = "types/interval_duplicate_field.test"
 sql = "SELECT INTERVAL '1 day 1 day 99999999999 years'"
 reason = "jed: an out-of-range field to the right of a duplicate is read first (PG's right-to-left order, interval.md §3), so the overflow is reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."
 
+[[override]]
+file = "types/interval_input_forms.test"
+sql = "SELECT INTERVAL '1-12'"
+reason = "jed: the months of an SQL-standard years-months field must be 0..11 is an interval field overflow (interval.md §3), reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."
+
+[[override]]
+file = "types/interval_input_forms.test"
+sql = "SELECT INTERVAL '1:60'"
+reason = "jed: a time's minutes must be 0..59 is an interval field overflow (interval.md §3), reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."
+
+[[override]]
+file = "types/interval_input_forms.test"
+sql = "SELECT INTERVAL 'P2147483648D'"
+reason = "jed: an ISO 8601 day count beyond i32 is an interval field overflow (interval.md §3), reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."
+
+[[override]]
+file = "types/interval_input_forms.test"
+sql = "SELECT INTERVAL 'P1e15D'"
+reason = "jed: an ISO 8601 day count beyond i32 is an interval field overflow (interval.md §3), reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."
+
+[[override]]
+file = "types/interval_input_forms.test"
+sql = "SELECT s::interval FROM f WHERE id = 3"
+reason = "jed: the runtime text cast of '1-12' (months beyond 11) is an interval field overflow (interval.md §3), reported with jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. The same documented code divergence as `100000000000 years`."
+
 # --- G29 MIN/MAX(decimal) tie representation: 1.5 and 1.50 are the same value, so MIN/MAX return
 # one of them. jed keeps the FIRST-seen representation (scale-1 `1.5`); PostgreSQL surfaces `1.50`.
 # Same numeric value, only the rendered scale differs — a documented representation divergence.

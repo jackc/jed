@@ -4,8 +4,9 @@
 # (../design/interval.md §3/§4). Each core's unit test reproduces these byte-for-byte. Parsing
 # yields the three fields (months, days, micros); rendering takes the three fields to text.
 #
-# These pin jed's behavior (the "unit + time" input subset, the exact fractional-unit cascade,
-# half-away µs rounding, and the PG `IntervalStyle = postgres` render). The conformance suite
+# These pin jed's behavior (the port of PostgreSQL's interval input — its unit syntax, the
+# SQL-standard forms, ISO 8601 — the exact fractional-unit cascade, half-away µs rounding, and the
+# PG `IntervalStyle = postgres` render). The conformance suite
 # (../conformance/suites/types/interval.test) separately oracle-checks the rendered SQL against
 # the live PostgreSQL db where the two do not deliberately diverge.
 
@@ -36,7 +37,7 @@ cases = [
   { input = "0.5 seconds",      months = 0, days = 0, micros = 500000 },
   { input = "1 millisecond",    months = 0, days = 0, micros = 1000 },
   { input = "1 microsecond",    months = 0, days = 0, micros = 1 },
-  # a unitless number means seconds (PG), accepted only as the LAST field (interval.md §3)
+  # a unitless number is positional (interval.md §3.2): seconds at the right end
   { input = "5",                months = 0, days = 0, micros = 5000000 },
   { input = "1.5",              months = 0, days = 0, micros = 1500000 },
   { input = "-5",               months = 0, days = 0, micros = -5000000 },
@@ -44,6 +45,47 @@ cases = [
   { input = "1 day 2",          months = 0, days = 1, micros = 2000000 },
   { input = "1 day -5",         months = 0, days = 1, micros = -5000000 },
   { input = "1 hour 5",         months = 0, days = 0, micros = 3605000000 },
+  # a unitless number left of an hour or a time is days; N-M is SQL-standard years-months
+  { input = "1 1:00",           months = 0,  days = 1, micros = 3600000000 },
+  { input = "5 1 hour",         months = 0,  days = 5, micros = 3600000000 },
+  { input = "1-2",              months = 14, days = 0, micros = 0 },
+  { input = "-1-2",             months = -14, days = 0, micros = 0 },
+  { input = "1-2 3",            months = 14, days = 0, micros = 3000000 },
+  { input = "1-2 3 4:05:06",    months = 14, days = 3, micros = 14706000000 },
+  { input = "-1 2:03:04",       months = 0,  days = -1, micros = 7384000000 },  # the sign stays on its field
+  { input = "1 -2:03:04",       months = 0,  days = 1, micros = -7384000000 },
+  { input = "1-",               months = 12, days = 0, micros = 0 },
+  { input = "1:30.5",           months = 0,  days = 0, micros = 90500000 },  # two parts with a fraction: M:S.f
+  { input = "0:0:60",           months = 0,  days = 0, micros = 60000000 },
+  { input = "- 5 days",         months = 0,  days = -5, micros = 0 },
+  { input = ".5",               months = 0,  days = 0, micros = 500000 },
+  { input = "5. day",           months = 0,  days = 5, micros = 0 },
+  { input = "1;day",            months = 0,  days = 1, micros = 0 },  # punctuation separates fields
+  { input = "5 mm",             months = 0,  days = 0, micros = 300000000 },
+  { input = "1 mseconds 1 useconds", months = 0, days = 0, micros = 1001 },
+  { input = "1 millisecondsxyz", months = 0, days = 0, micros = 1000 },  # PG compares 10 letters
+  { input = "1 day at",         months = 0,  days = 1, micros = 0 },
+  { input = "2 days at 5",      months = 0,  days = 2, micros = 5000000 },  # `at` resets the unit to seconds
+  { input = "2:00 hour",        months = 0,  days = 0, micros = 7200000000 },  # a unit before a time is dropped
+  { input = "1.5 days 1:00",    months = 0,  days = 1, micros = 46800000000 },
+  { input = "1:00 1.5 days",    months = 0,  days = 1, micros = 3600000000 },  # a time replaces earlier µs
+  # ISO 8601 (interval.md §3.3)
+  { input = "P1Y2M3DT4H5M6S",   months = 14, days = 3, micros = 14706000000 },
+  { input = "P2W",              months = 0,  days = 14, micros = 0 },
+  { input = "P-1Y-2M",          months = -14, days = 0, micros = 0 },
+  { input = "P1.5Y",            months = 18, days = 0, micros = 0 },
+  { input = "P0.5M",            months = 0,  days = 15, micros = 0 },
+  { input = "PT1.5S",           months = 0,  days = 0, micros = 1500000 },
+  { input = "PT",               months = 0,  days = 0, micros = 0 },
+  { input = "P1D2D",            months = 0,  days = 3, micros = 0 },
+  { input = "P0001-02-03T04:05:06", months = 14, days = 3, micros = 14706000000 },
+  { input = "P00010203T040506", months = 14, days = 3, micros = 14706000000 },
+  { input = "P0001-02",         months = 14, days = 0, micros = 0 },
+  { input = "PT04:05",          months = 0,  days = 0, micros = 14700000000 },
+  { input = "P1e2D",            months = 0,  days = 100, micros = 0 },
+  { input = "PT0x10H",          months = 0,  days = 0, micros = 57600000000 },
+  { input = "PT0x1p-1050S",     months = 0,  days = 0, micros = 0 },  # an exact subnormal double
+  { input = "PT0e999999S",      months = 0,  days = 0, micros = 0 },
   # a unit word may directly follow its number; `ago` may directly follow a time
   { input = "1day",             months = 0, days = 1, micros = 0 },
   { input = "1hour 2min",       months = 0, days = 0, micros = 3720000000 },
@@ -52,9 +94,17 @@ cases = [
   { input = "1.5 days",         months = 0, days = 1,  micros = 43200000000 },
   { input = "1.5 months",       months = 1, days = 15, micros = 0 },
   { input = "1.5 years",        months = 18, days = 0, micros = 0 },
+  { input = "1.01 years",       months = 12, days = 0, micros = 0 },  # a year fraction: whole months only
+  { input = "1.375 years",      months = 16, days = 0, micros = 0 },  # 4.5 months, half to even (PG rint)
+  { input = "1.125 years",      months = 14, days = 0, micros = 0 },  # 1.5 months, half to even
+  { input = "1.5 weeks",        months = 0, days = 10, micros = 43200000000 },
   { input = "1.15 months",      months = 1, days = 4,  micros = 43200000000 },
-  # half-away µs rounding (a jed divergence from PG half-even on the exact tie)
+  # half-away µs rounding (a jed divergence: PG's float arithmetic rounds these ties down)
   { input = "0.0000005 seconds", months = 0, days = 0, micros = 1 },
+  { input = "4.5 us",           months = 0, days = 0, micros = 5 },
+  { input = "PT040506.5",       months = 0, days = 0, micros = 14706000001 },
+  # fraction digits past the 25th are dropped, but a nonzero one still makes a fraction
+  { input = "1.12345678901234567890123456789 sec", months = 0, days = 0, micros = 1123457 },
   # signs, ago, @
   { input = "-1 day",           months = 0,   days = -1, micros = 0 },
   { input = "1 day -02:00",     months = 0,   days = 1,  micros = -7200000000 },
@@ -83,26 +133,48 @@ cases = [
   { input = "1 fortnight", error = "22007" },  # unknown unit
   { input = "1 day foo",   error = "22007" },  # trailing junk
   { input = "abc",         error = "22007" },  # not a number
-  { input = "1 m",         error = "22007" },  # ambiguous bare `m` is not accepted
-  # SQL-standard / positional forms are deferred (interval.md §3) and fail closed. PG accepts
-  # these with a positional reading jed does not implement — rejecting them is a deliberate
-  # divergence, never a silent misread (`'1-2'` once parsed as `1 s` + `-2 s`).
-  { input = "1-2",         error = "22007" },  # PG: 1 year 2 mons (SQL-standard year-month)
-  { input = "-1-2",        error = "22007" },  # PG: -1 years -2 mons
-  { input = "1-2 3",       error = "22007" },  # PG: 1 year 2 mons 00:00:03
-  { input = "1 1:00",      error = "22007" },  # PG: 1 day 01:00:00 (SQL-standard day-time)
-  { input = "5 1 hour",    error = "22007" },  # PG: 5 days 01:00:00 (positional day)
-  # a unitless number that is not the last field (PG also rejects these)
+  { input = "1 m",         error = "22007" },  # ambiguous bare `m` is not accepted (PG: minutes)
+  { input = "infinity",    error = "22007" },  # jed has no infinite interval (PG accepts)
+  { input = "-infinity",   error = "22007" },
+  { input = "1 quarter",   error = "22007" },  # PG's other unit words take no number
+  { input = "1 jan",       error = "22007" },
+  { input = "1 day 2 days", error = "22007" },  # a unitless number repeats the unit to its right
+  # SQL-standard years-months: the months must be 0..11 (PG's field overflow)
+  { input = "1-12",        error = "22008" },
+  { input = "1--2",        error = "22008" },
+  { input = "1-2-3",       error = "22007" },
+  { input = "1:60",        error = "22008" },  # minutes 0..59
+  { input = "1:00:61",     error = "22008" },  # seconds 0..60
+  { input = "1:2:3:4",     error = "22007" },
+  # ISO 8601: the whole text, untrimmed
+  { input = "P",           error = "22007" },
+  { input = " P1D",        error = "22007" },
+  { input = "P1D ",        error = "22007" },
+  { input = "p1d",         error = "22007" },
+  { input = "P1D ago",     error = "22007" },
+  { input = "P1X",         error = "22007" },
+  { input = "P1-2X",       error = "22007" },
+  { input = "P1DT1H1D",    error = "22007" },  # a date unit after T
+  { input = "P1Y-2",       error = "22007" },  # the alternative format only before any designator
+  { input = "P1e15D",      error = "22008" },  # beyond i32 days
+  { input = "P1.5e15D",    error = "22008" },  # beyond ±1e15
+  { input = "P-infD",      error = "22008" },
+  { input = "PT1e309S",    error = "22007" },  # strtod's own range: malformed
+  { input = "PT1e-400S",   error = "22007" },
+  { input = "P2147483648D", error = "22008" },
+  # a unitless number that repeats the unit to its right (PG also rejects these)
   { input = "1 2",         error = "22007" },
   { input = "1 2 3",       error = "22007" },
   { input = "1 -2",        error = "22007" },
   { input = "5 ago",       error = "22007" },
   { input = "1 day 5 ago", error = "22007" },
-  # fields run together without whitespace (PG also rejects these)
+  # a word run into what follows is one malformed field (PG also rejects these)
   { input = "1day-2",      error = "22007" },
   { input = "1 day-1:00",  error = "22007" },
   { input = "1hour2min",   error = "22007" },
-  { input = "1:00-2",      error = "22007" },
+  { input = "1:00-2",      error = "22007" },  # `-2` is seconds, which the time claims too
+  # more than 25 fields
+  { input = "1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1", error = "22007" },
   # PG's duplicate-field rule (interval.md §3): a field named twice is rejected, not summed
   { input = "1 day 1 day",       error = "22007" },
   { input = "-1 day +1 day",     error = "22007" },

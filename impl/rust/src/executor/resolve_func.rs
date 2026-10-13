@@ -3800,7 +3800,7 @@ pub(crate) fn resolve(
                     }
                     Ok((RExpr::ConstDate(parse_date(s)?), ResolvedType::Date))
                 }
-                // A string adapts to an INTERVAL context (parse the "unit + time" subset,
+                // A string adapts to an INTERVAL context (PostgreSQL's interval input,
                 // 22007/22008 — spec/design/interval.md), exactly like timestamp adaptation.
                 Some(t) if t.is_interval() => Ok((
                     RExpr::ConstInterval(parse_interval(s)?),

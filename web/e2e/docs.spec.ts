@@ -98,6 +98,16 @@ test('the types page autoruns the bytea functions demo', async ({ page }) => {
   await expect(rows).toContainText('255');
 });
 
+test('the types page autoruns the interval input forms demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // SQL-standard '1-2' = 1 year 2 mons and '1 1:00' = 1 day 01:00:00; both ISO 8601 spellings
+  // = 1 year 2 mons 3 days 04:05:06.
+  const panel = livePanel(page, 'intervalInputDemo');
+  const rows = panel.getByTestId('result-rows');
+  await expect(rows).toContainText('1 day 01:00:00');
+  await expect(rows).toContainText('1 year 2 mons 3 days 04:05:06');
+});
+
 test('the types page autoruns the interval justify demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // justify_hours('50 hours') = 2 days 02:00:00, justify_days('45 days') = 1 mon 15 days,

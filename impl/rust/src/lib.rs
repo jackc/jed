@@ -804,7 +804,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // timestamp PRIMARY KEY (key encoding = i64). spec/design/timestamp.md.
     "types.timestamp",
     "types.timestamptz",
-    // interval scalar type (a span — months/days/micros): the "unit + time" input subset,
+    // interval scalar type (a span — months/days/micros): PostgreSQL's interval input,
     // PG render, and comparison/ordering/dedup by the canonical 128-bit span. Non-key column
     // only (interval PK → 0A000). spec/design/interval.md.
     "types.interval",

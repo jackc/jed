@@ -901,7 +901,7 @@ export function resolve(
             };
           }
           if (ctx !== null && isInterval(ctx)) {
-            // A string adapts to an INTERVAL context (parse the "unit + time" subset,
+            // A string adapts to an INTERVAL context (PostgreSQL's interval input,
             // 22007/22008 — spec/design/interval.md), like timestamp adaptation.
             return {
               node: {

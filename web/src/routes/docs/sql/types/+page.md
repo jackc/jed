@@ -26,6 +26,12 @@
   ('1 day 2 hours'::text)::interval            AS text_to_interval,
   ('\\x48656c6c6f'::text)::bytea               AS text_to_bytea;`;
 
+	const intervalInputDemo = `SELECT
+  interval '1-2'                    AS sql_year_month,
+  interval '1 1:00'                 AS sql_day_time,
+  interval 'P1Y2M3DT4H5M6S'         AS iso_designators,
+  interval 'P0001-02-03T04:05:06'   AS iso_alternative;`;
+
 	const toTextDemo = `SELECT
   42::text                                      AS int_to_text,
   CAST(1.50 AS text)                            AS keeps_scale,
@@ -213,12 +219,17 @@ A `timestamptz` *literal* such as `'2024-01-15 10:30'::timestamptz` reads an off
 same way, in the session time zone (see [Time zones](#time-zones)), so the literal and the `text`
 column cast agree.
 
-jed's input grammars are stricter than PostgreSQL's, the same as for literals: the `'now'`, `'today'`,
-and `'epoch'` timestamp words, ISO-8601 (`P1D`) and SQL-standard interval input (`'1-2'`,
-`'1 1:00'`) are rejected. A unit-less interval number is read as seconds only when it is the last
-field (`'5'`, `'1 day 2'`). As in PostgreSQL, an interval may name each field only once:
-`'1 day 1 day'` and `'1 hour 1:00'` raise `22007`, while `'1 week 1 day'` (week and day are
-different fields) is `8 days`.
+jed's timestamp input is stricter than PostgreSQL's, the same as for literals: the `'now'`,
+`'today'`, and `'epoch'` words are rejected. Interval input reads everything PostgreSQL's does — units
+(`'1 day 2 hours'`), the SQL-standard forms (`'1-2'` is `1 year 2 mons`, `'1 1:00'` is
+`1 day 01:00:00`), and ISO 8601 (`'P1Y2M3DT4H5M6S'`, `'P2W'`, `'P0001-02-03T04:05:06'`). A
+unit-less number takes its unit from its place: seconds at the end (`'1 day 2'`), days before an
+hour or a time. As in PostgreSQL, an interval may name each field only once: `'1 day 1 day'` and
+`'1 hour 1:00'` raise `22007`, while `'1 week 1 day'` (week and day are different fields) is
+`8 days`. jed rejects the ambiguous unit `m` (spell out `min` or `mon`) and `'infinity'`, since it
+has no infinite interval.
+
+<LiveSql demo="intervalInputDemo" query={intervalInputDemo} rows={1} />
 
 ## Casting to text
 

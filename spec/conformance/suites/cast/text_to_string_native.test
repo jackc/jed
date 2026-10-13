@@ -3,7 +3,7 @@
 # (here a text COLUMN) runs the same input parser the T literal folds at resolve, but per ROW in the
 # evaluator: parse_timestamp (an offset validated then ignored), the timestamptz parse (an explicit
 # offset fixes the instant; an offset-LESS wall clock is read in the SESSION zone, as PostgreSQL's
-# timestamptz_in does, charging one timezone unit), parse_interval (the "unit + time" subset), and the
+# timestamptz_in does, charging one timezone unit), parse_interval (PostgreSQL's interval_in), and the
 # bytea input (PostgreSQL's byteain: `\x` hex, otherwise the traditional escape format). Malformed
 # input traps 22007 (bytea: 22P02) and an out-of-range field 22008, PER ROW during the scan. The
 # three datetime casts are STABLE, like PostgreSQL's timestamp_in / timestamptz_in / interval_in, so
@@ -12,8 +12,8 @@
 #
 # OUT of this corpus (cannot live in the PG-clean oracle), covered by the per-core unit tests
 # (cast_text_string_native): the jed-stricter input grammars, identical to the literal path —
-# 'now'/'today'/'epoch' and DateStyle spellings for timestamp, ISO-8601 `P…` and SQL-standard
-# interval input (all accepted by PG, rejected by jed); the SQLSTATE subcode differences (an out-of-range offset 22008 vs PG 22009, interval overflow 22008 vs
+# 'now'/'today'/'epoch' and DateStyle spellings for timestamp (all accepted by PG, rejected
+# by jed); the SQLSTATE subcode differences (an out-of-range offset 22008 vs PG 22009, interval overflow 22008 vs
 # PG 22015, malformed hex 22P02 vs PG 22023); and a forbidden source (1::interval, 42804 vs PG 42846).
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.text, types.timestamp, types.timestamptz, types.interval, types.bytea, cast.explicit, cast.operator, cast.string_literal, cast.text_string_native, expr.timestamp_arithmetic, session.timezone, expr.at_time_zone, expr.interval_arithmetic, query.aggregates, expr.in_list, resource.cost_metering

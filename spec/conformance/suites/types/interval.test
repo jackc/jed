@@ -1,5 +1,5 @@
 # interval scalar type (spec/design/interval.md): a span of time held as three independent
-# fields (months/days/micros). Storage, the "unit + time" input subset (single-quoted string
+# fields (months/days/micros). Storage, the unit input (single-quoted string
 # adapting to an interval column, OR the INTERVAL '...' keyword literal in expression position),
 # PG `IntervalStyle = postgres` rendering, and comparison/ordering/dedup by the canonical 128-bit
 # SPAN (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days' = '720:00:00'). NULL, the

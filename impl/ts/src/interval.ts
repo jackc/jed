@@ -22,7 +22,8 @@ export const MICROS_PER_DAY = 86_400n * MICROS_PER_SEC;
 // Days in one month for the canonical span / fractional cascade (PG DAYS_PER_MONTH).
 export const DAYS_PER_MONTH = 30n;
 const MONTHS_PER_YEAR = 12n;
-// Bounds (spec/design/interval.md) so the exact cascade stays well-defined; over-long → 22008.
+// The digit bounds of an `interval × / number` factor (spec/design/interval.md §5), so the exact
+// cascade stays well-defined; over-long → 22008.
 const MAX_INT_DIGITS = 18;
 const MAX_FRAC_DIGITS = 9;
 const I32_MIN = -2147483648n;
@@ -408,16 +409,6 @@ function intervalFieldOverflow(detail: string): EngineError {
   return engineError("datetime_field_overflow", detail);
 }
 
-function isWs(b: number): boolean {
-  return b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0c || b === 0x0d;
-}
-function isDigit(b: number): boolean {
-  return b >= 0x30 && b <= 0x39;
-}
-function isAlpha(b: number): boolean {
-  return (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
-}
-
 // roundDivBig rounds num/den to the nearest integer, half away from zero (the engine's one
 // rounding mode). den > 0.
 function roundDivBig(num: bigint, den: bigint): bigint {
@@ -428,74 +419,73 @@ function roundDivBig(num: bigint, den: bigint): bigint {
   return q;
 }
 
-interface Acc {
-  months: bigint;
-  days: bigint;
-  micros: bigint;
-}
-
 const I64_MIN = -9223372036854775808n;
 const I64_MAX = 9223372036854775807n;
 
-function addChecked(a: bigint, b: bigint): bigint {
-  const s = a + b;
-  if (s < I64_MIN || s > I64_MAX) throw intervalFieldOverflow("interval out of range");
-  return s;
+// The interval text parser is a port of PostgreSQL 18's interval_in (datetime.c): the input is
+// broken into fields (ParseDateTime), the fields are read right to left (DecodeInterval), and only
+// if that finds the input malformed is it read as ISO 8601 (DecodeISO8601Interval). The one
+// numeric difference (spec/design/interval.md §3): PG carries a field's fraction in a double; jed
+// carries it exactly, as a signed numerator over 10^25 (FRAC_DEN), and rounds the µs half away
+// from zero (the engine's one mode).
+
+// PostgreSQL's datetime-decode failures, thrown as DtError: "bad" (DTERR_BAD_FORMAT, 22007) or
+// "overflow" (DTERR_FIELD_OVERFLOW, PG's 22015; jed's datetime field overflow 22008).
+class DtError {
+  kind: "bad" | "overflow";
+  constructor(kind: "bad" | "overflow") {
+    this.kind = kind;
+  }
+}
+const BAD = new DtError("bad");
+const OVERFLOW = new DtError("overflow");
+
+// A field's fractional part is numerator / 10^25, its digits past the 25th dropped (far below a
+// microsecond for every unit).
+const FRAC_DIGITS = 25;
+const FRAC_DEN = 10n ** 25n;
+
+const USECS_PER_SEC = MICROS_PER_SEC;
+const USECS_PER_MINUTE = 60n * USECS_PER_SEC;
+const USECS_PER_HOUR = 3600n * USECS_PER_SEC;
+
+// PG's struct pg_itm_in: the fields an interval is assembled from. Years stay apart from months
+// until the end (itmin2interval). All bigint, range-checked as PG's int32/int64.
+interface ItmIn {
+  usec: bigint;
+  mday: bigint;
+  mon: bigint;
+  year: bigint;
 }
 
-// applyUnit adds value = sign * intPart.fracNum/fracDen of a unit to the accumulator, where the
-// unit is measured in monthsPer, daysPer, or microsPer of one base field (exactly one nonzero).
-// The integer part lands in that field; the fractional part cascades to the next-lower fields
-// using 1 month = 30 days and 1 day = 24 h (spec/design/interval.md §3). All exact bigint math.
-function applyUnit(
-  acc: Acc,
-  neg: boolean,
-  intPart: bigint,
-  fracNum: bigint,
-  fracDen: bigint,
-  monthsPer: bigint,
-  daysPer: bigint,
-  microsPer: bigint,
-): void {
-  let n = intPart * fracDen + fracNum;
-  if (neg) n = -n;
-  const d = fracDen;
+// PG's DTK_* unit codes — the values DecodeInterval's `type` carries between fields.
+const DTK_NUMBER = 0; // the type after `ago`: no number may precede it
+const DTK_TZ = 4;
+const DTK_EARLY = 9;
+const DTK_LATE = 10;
+const IGNORE_DTF = 8; // the initial type: the rightmost unitless number is seconds
+const DTK_SECOND = 18;
+const DTK_MINUTE = 19;
+const DTK_HOUR = 20;
+const DTK_DAY = 21;
+const DTK_WEEK = 22;
+const DTK_MONTH = 23;
+const DTK_QUARTER = 24;
+const DTK_YEAR = 25;
+const DTK_DECADE = 26;
+const DTK_CENTURY = 27;
+const DTK_MILLENNIUM = 28;
+const DTK_MILLISEC = 29;
+const DTK_MICROSEC = 30;
+const DTK_JULIAN = 31;
+const DTK_DOW = 32;
+const DTK_DOY = 33;
+const DTK_ISOYEAR = 36;
+const DTK_ISODOW = 37;
 
-  let months = 0n;
-  let days = 0n;
-  let microsNum = 0n;
-
-  if (monthsPer !== 0n) {
-    const total = n * monthsPer; // months * d
-    months = total / d; // trunc toward zero
-    const rem = total - months * d;
-    const dayTotal = rem * DAYS_PER_MONTH;
-    const wholeDays = dayTotal / d;
-    days += wholeDays;
-    const remDays = dayTotal - wholeDays * d;
-    microsNum += remDays * MICROS_PER_DAY;
-  }
-  if (daysPer !== 0n) {
-    const total = n * daysPer;
-    const wholeDays = total / d;
-    days += wholeDays;
-    const remDays = total - wholeDays * d;
-    microsNum += remDays * MICROS_PER_DAY;
-  }
-  if (microsPer !== 0n) {
-    microsNum += n * microsPer;
-  }
-
-  if (months !== 0n) acc.months = addChecked(acc.months, months);
-  if (days !== 0n) acc.days = addChecked(acc.days, days);
-  if (microsNum !== 0n) acc.micros = addChecked(acc.micros, roundDivBig(microsNum, d));
-}
-
-// The per-field masks of PostgreSQL's DecodeInterval (spec/design/interval.md §3): each unit sets
-// its own bit, so an input that names the same field twice is rejected (22007). `week` and `day`
-// are DIFFERENT fields ('1 week 1 day' is valid), as are year/decade/century/millennium and
-// second/millisecond/microsecond. A bare HH:MM[:SS] time claims the whole time-of-day group, and
-// a seconds value with a nonzero fraction claims all three seconds bits.
+// The per-field masks of DecodeInterval (PG DTK_M): each field claims its bits, and a field whose
+// bits overlap an already-read field's is a duplicate (22007). week and day are DIFFERENT fields,
+// as are year/decade/century/millennium and second/millisecond/microsecond.
 const FIELD_MONTH = 1 << 1;
 const FIELD_YEAR = 1 << 2;
 const FIELD_DAY = 1 << 3;
@@ -510,330 +500,994 @@ const FIELD_CENTURY = 1 << 26;
 const FIELD_MILLENNIUM = 1 << 27;
 // Seconds with a fractional part (PG DTK_ALL_SECS_M).
 const FIELD_ALL_SECS = FIELD_SECOND | FIELD_MILLISECOND | FIELD_MICROSECOND;
-// A bare HH:MM[:SS[.ffffff]] time (PG DTK_TIME_M).
+// A time HH:MM[:SS[.ffffff]] (PG DTK_TIME_M).
 const FIELD_TIME = FIELD_HOUR | FIELD_MINUTE | FIELD_ALL_SECS;
+// PG DTK_DATE_M.
+const FIELD_DATE = FIELD_YEAR | FIELD_MONTH | FIELD_DAY;
 
-// The field mask a seconds value claims: a nonzero fraction also claims the millisecond and
-// microsecond fields (PG: '1.5 sec 1 ms' is a duplicate, '1 sec 1 ms' / '1.0 sec 1 ms' are not).
-function secondsMask(fracNum: bigint): number {
-  return fracNum === 0n ? FIELD_SECOND : FIELD_ALL_SECS;
+// PG's MAXDATEFIELDS and interval_in's 256-byte field buffer: more fields, or more field text, is
+// malformed.
+const MAX_DATE_FIELDS = 25;
+const FIELD_BUF_LEN = 256;
+
+// isspace in the C locale.
+function isPgSpace(b: number): boolean {
+  return b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0b || b === 0x0c || b === 0x0d;
+}
+function isDigit(b: number): boolean {
+  return b >= 0x30 && b <= 0x39;
+}
+function isAlpha(b: number): boolean {
+  return (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
+}
+function isAlnum(b: number): boolean {
+  return isDigit(b) || isAlpha(b);
+}
+function isHex(b: number): boolean {
+  return isDigit(b) || (b >= 0x41 && b <= 0x46) || (b >= 0x61 && b <= 0x66);
+}
+// ispunct in the C locale (ASCII punctuation).
+function isPunct(b: number): boolean {
+  return (
+    (b >= 0x21 && b <= 0x2f) ||
+    (b >= 0x3a && b <= 0x40) ||
+    (b >= 0x5b && b <= 0x60) ||
+    (b >= 0x7b && b <= 0x7e)
+  );
+}
+function lower(b: number): number {
+  return b >= 0x41 && b <= 0x5a ? b + 0x20 : b;
 }
 
-// One parsed field: its mask and the exact amount it added to each of the three accumulators.
-interface FieldPart {
-  mask: number;
-  months: bigint;
-  days: bigint;
-  micros: bigint;
+const CH_PLUS = 0x2b;
+const CH_MINUS = 0x2d;
+const CH_DOT = 0x2e;
+const CH_SLASH = 0x2f;
+const CH_COLON = 0x3a;
+const CH_UNDERSCORE = 0x5f;
+
+// The kind of one field (ParseDateTime's ftype): "number" — digits, possibly with one `.`
+// fraction (5, 1.5, .5); "string" — a lowercased word (day, ago); "date" — digits with - / .
+// separators, or a word run into digits (1-2, 5., p1d); "time" — digits then `:` (1:00:00.5);
+// "tz" — a sign then digits, `:`, `.`, `-` (-1, +02:03, -1-2); "special" — a sign then a word
+// (-infinity).
+type FieldType = "number" | "string" | "date" | "time" | "tz" | "special";
+
+interface DtField {
+  ftype: FieldType;
+  text: string;
 }
 
-// checkDuplicateFields applies PostgreSQL's duplicate-field rule (spec/design/interval.md §3). PG's
-// DecodeInterval reads the fields right to left, adding each into its running fields (an i32
-// month/day or i64 µs overflow is an out-of-range error) and THEN rejecting it as a duplicate if
-// its mask overlaps the fields already read. jed parses left to right, so it replays that order
-// here over the recorded fields: a duplicate traps 22007, unless the running total from the right
-// end through the duplicate already overflowed, in which case PG would have stopped there first
-// (22008).
-function checkDuplicateFields(input: string, fields: FieldPart[]): void {
-  let seen = 0;
-  let months = 0n;
-  let days = 0n;
-  let micros = 0n;
-  let overflowed = false;
-  for (let i = fields.length - 1; i >= 0; i--) {
-    const f = fields[i];
-    if (!overflowed) {
-      months += f.months;
-      days += f.days;
-      micros += f.micros;
-      overflowed =
-        months < I32_MIN ||
-        months > I32_MAX ||
-        days < I32_MIN ||
-        days > I32_MAX ||
-        micros < I64_MIN ||
-        micros > I64_MAX;
+// PostgreSQL's ParseDateTime, as interval_in uses it: split the input into fields. Whitespace
+// separates fields; any other punctuation starting a field is a separator too; text is lowercased.
+function parseDateTime(input: string): DtField[] {
+  const at = (k: number): number => (k < input.length ? input.charCodeAt(k) : 0);
+  const fields: DtField[] = [];
+  // Bytes of PG's field buffer used by the finished fields (each field's text plus its NUL).
+  let bufUsed = 0;
+  let i = 0;
+  while (i < input.length) {
+    const c = at(i);
+    if (isPgSpace(c)) {
+      i++;
+      continue;
     }
-    if ((f.mask & seen) !== 0) {
-      if (overflowed) throw intervalFieldOverflow("interval out of range");
-      throw invalidInterval(`invalid input syntax for type interval: "${input}"`);
+    if (fields.length >= MAX_DATE_FIELDS) throw BAD;
+    let text = "";
+    // PG's APPEND_CHAR: the buffer must keep room for the field's terminating NUL.
+    const push = (ch: number): void => {
+      if (bufUsed + text.length + 1 >= FIELD_BUF_LEN) throw BAD;
+      text += String.fromCharCode(ch);
+    };
+    let ftype: FieldType;
+    if (isDigit(c)) {
+      while (isDigit(at(i))) push(at(i++));
+      if (at(i) === CH_COLON) {
+        // a time field
+        ftype = "time";
+        push(CH_COLON);
+        i++;
+        while (isDigit(at(i)) || at(i) === CH_COLON || at(i) === CH_DOT) push(at(i++));
+      } else if (at(i) === CH_MINUS || at(i) === CH_SLASH || at(i) === CH_DOT) {
+        // a date field (or a number with a fraction)
+        const delim = at(i);
+        push(delim);
+        i++;
+        if (isDigit(at(i))) {
+          ftype = delim === CH_DOT ? "number" : "date";
+          while (isDigit(at(i))) push(at(i++));
+          // a second matching delimiter makes a three-field date
+          if (at(i) === delim) {
+            ftype = "date";
+            push(delim);
+            i++;
+            while (isDigit(at(i)) || at(i) === delim) push(at(i++));
+          }
+        } else {
+          ftype = "date";
+          while (isAlnum(at(i)) || at(i) === delim) push(lower(at(i++)));
+        }
+      } else {
+        ftype = "number";
+      }
+    } else if (c === CH_DOT) {
+      // a leading decimal point: fractional seconds
+      push(CH_DOT);
+      i++;
+      while (isDigit(at(i))) push(at(i++));
+      ftype = "number";
+    } else if (isAlpha(c)) {
+      ftype = "string";
+      while (isAlpha(at(i))) push(lower(at(i++)));
+      // A word may run into a date or zone name — unless it is a known date keyword.
+      let isDate = false;
+      if (at(i) === CH_MINUS || at(i) === CH_SLASH || at(i) === CH_DOT) isDate = true;
+      else if (at(i) === CH_PLUS || isDigit(at(i))) isDate = dateKeyword(text) === undefined;
+      if (isDate) {
+        ftype = "date";
+        for (;;) {
+          push(lower(at(i++)));
+          const n = at(i);
+          if (
+            !(
+              n === CH_PLUS ||
+              n === CH_MINUS ||
+              n === CH_SLASH ||
+              n === CH_UNDERSCORE ||
+              n === CH_DOT ||
+              n === CH_COLON ||
+              isAlnum(n)
+            )
+          ) {
+            break;
+          }
+        }
+      }
+    } else if (c === CH_PLUS || c === CH_MINUS) {
+      push(c);
+      i++;
+      // whitespace after the sign is skipped
+      while (isPgSpace(at(i))) i++;
+      if (isDigit(at(i))) {
+        ftype = "tz";
+        push(at(i++));
+        while (isDigit(at(i)) || at(i) === CH_COLON || at(i) === CH_DOT || at(i) === CH_MINUS)
+          push(at(i++));
+      } else if (isAlpha(at(i))) {
+        ftype = "special";
+        while (isAlpha(at(i))) push(lower(at(i++)));
+      } else {
+        throw BAD;
+      }
+    } else if (isPunct(c)) {
+      // other punctuation only separates fields
+      i++;
+      continue;
+    } else {
+      throw BAD;
     }
-    seen |= f.mask;
+    bufUsed += text.length + 1;
+    fields.push({ ftype, text });
   }
+  return fields;
 }
 
-// unitWeights returns the cascade weights [monthsPer, daysPer, microsPer] and the field mask for a
-// unit word (case-insensitive), or undefined for an unrecognized unit. Exactly one weight is
-// nonzero.
-function unitWeights(unit: string): [bigint, bigint, bigint, number] | undefined {
-  switch (unit.toLowerCase()) {
-    case "millennium":
-    case "millennia":
-    case "mil":
-    case "mils":
-      return [12000n, 0n, 0n, FIELD_MILLENNIUM];
-    case "century":
-    case "centuries":
-    case "cent":
+// What a word means to DecodeInterval: [kind, DTK value]. "ignore" — skipped (at, on); "units" —
+// a unit, the DTK_* code it gives the number to its left; "ago"; "reserv" — a reserved word
+// (infinity, epoch, …); "other" — a date keyword with no meaning in an interval (a month name, am,
+// …).
+type WordKind = "ignore" | "units" | "ago" | "reserv" | "other";
+
+// PG's interval unit table (deltatktbl), then its date keyword table (datetktbl) — the lookup
+// DecodeUnits then DecodeSpecial do. undefined is an unknown word. PG compares at most 10
+// characters, so any word starting with a 10-letter entry (millennium, microsecon, millisecon) is
+// that unit. jed's one difference: a bare `m` (PG's minute) is ambiguous with month and is
+// rejected.
+function intervalWord(w: string): [WordKind, number] | undefined {
+  if (w === "m") return undefined;
+  if (w.startsWith("millennium")) return ["units", DTK_MILLENNIUM];
+  if (w.startsWith("microsecon")) return ["units", DTK_MICROSEC];
+  if (w.startsWith("millisecon")) return ["units", DTK_MILLISEC];
+  switch (w) {
+    case "ago":
+      return ["ago", 0];
     case "c":
-      return [1200n, 0n, 0n, FIELD_CENTURY];
-    case "decade":
-    case "decades":
-    case "dec":
-    case "decs":
-      return [120n, 0n, 0n, FIELD_DECADE];
-    case "year":
-    case "years":
-    case "yr":
-    case "yrs":
-    case "y":
-      return [MONTHS_PER_YEAR, 0n, 0n, FIELD_YEAR];
-    case "month":
-    case "months":
-    case "mon":
-    case "mons":
-      return [1n, 0n, 0n, FIELD_MONTH];
-    case "week":
-    case "weeks":
-    case "w":
-      return [0n, 7n, 0n, FIELD_WEEK];
+    case "cent":
+    case "centuries":
+    case "century":
+      return ["units", DTK_CENTURY];
+    case "d":
     case "day":
     case "days":
-    case "d":
-      return [0n, 1n, 0n, FIELD_DAY];
+      return ["units", DTK_DAY];
+    case "dec":
+    case "decade":
+    case "decades":
+    case "decs":
+      return ["units", DTK_DECADE];
+    case "h":
     case "hour":
     case "hours":
     case "hr":
     case "hrs":
-    case "h":
-      return [0n, 0n, 3600n * MICROS_PER_SEC, FIELD_HOUR];
-    case "minute":
-    case "minutes":
+      return ["units", DTK_HOUR];
+    case "mil":
+    case "millennia":
+    case "millennium":
+    case "mils":
+      return ["units", DTK_MILLENNIUM];
     case "min":
     case "mins":
-      return [0n, 0n, 60n * MICROS_PER_SEC, FIELD_MINUTE];
+    case "minute":
+    case "minutes":
+      return ["units", DTK_MINUTE];
+    case "mon":
+    case "mons":
+    case "month":
+    case "months":
+      return ["units", DTK_MONTH];
+    case "ms":
+    case "msec":
+    case "msecond":
+    case "mseconds":
+    case "msecs":
+      return ["units", DTK_MILLISEC];
+    case "qtr":
+    case "quarter":
+      return ["units", DTK_QUARTER];
+    case "s":
+    case "sec":
     case "second":
     case "seconds":
-    case "sec":
     case "secs":
-    case "s":
-      return [0n, 0n, MICROS_PER_SEC, FIELD_SECOND];
-    case "millisecond":
-    case "milliseconds":
-    case "msec":
-    case "msecs":
-    case "ms":
-      return [0n, 0n, 1000n, FIELD_MILLISECOND];
-    case "microsecond":
-    case "microseconds":
-    case "usec":
-    case "usecs":
+      return ["units", DTK_SECOND];
+    case "timezone":
+      return ["units", DTK_TZ];
     case "us":
-      return [0n, 0n, 1n, FIELD_MICROSECOND];
-    default:
-      return undefined;
+    case "usec":
+    case "usecond":
+    case "useconds":
+    case "usecs":
+      return ["units", DTK_MICROSEC];
+    case "w":
+    case "week":
+    case "weeks":
+      return ["units", DTK_WEEK];
+    case "y":
+    case "year":
+    case "years":
+    case "yr":
+    case "yrs":
+      return ["units", DTK_YEAR];
   }
+  return dateKeyword(w);
 }
 
-class Cursor {
-  b: Uint8Array;
-  i = 0;
-  constructor(s: string) {
-    this.b = new TextEncoder().encode(s);
+// The date keywords with no meaning in an interval (month and weekday names, am/pm, …).
+const OTHER_DATE_KEYWORDS = new Set([
+  "ad",
+  "am",
+  "apr",
+  "april",
+  "aug",
+  "august",
+  "bc",
+  "dec",
+  "december",
+  "dst",
+  "feb",
+  "february",
+  "fri",
+  "friday",
+  "jan",
+  "january",
+  "jul",
+  "july",
+  "jun",
+  "june",
+  "mar",
+  "march",
+  "may",
+  "mon",
+  "monday",
+  "nov",
+  "november",
+  "oct",
+  "october",
+  "pm",
+  "sat",
+  "saturday",
+  "sep",
+  "sept",
+  "september",
+  "sun",
+  "sunday",
+  "t",
+  "thu",
+  "thur",
+  "thurs",
+  "thursday",
+  "tue",
+  "tues",
+  "tuesday",
+  "wed",
+  "wednesday",
+  "weds",
+]);
+
+// PG's date keyword table (datetktbl), as an interval reads it.
+function dateKeyword(w: string): [WordKind, number] | undefined {
+  switch (w) {
+    case "at":
+    case "on":
+      return ["ignore", 0];
+    case "infinity":
+    case "+infinity":
+      return ["reserv", DTK_LATE];
+    case "-infinity":
+      return ["reserv", DTK_EARLY];
+    case "allballs":
+    case "epoch":
+    case "now":
+    case "today":
+    case "tomorrow":
+    case "yesterday":
+      return ["reserv", DTK_NUMBER];
+    case "d":
+      return ["units", DTK_DAY];
+    case "dow":
+      return ["units", DTK_DOW];
+    case "doy":
+      return ["units", DTK_DOY];
+    case "h":
+      return ["units", DTK_HOUR];
+    case "isodow":
+      return ["units", DTK_ISODOW];
+    case "isoyear":
+      return ["units", DTK_ISOYEAR];
+    case "j":
+    case "jd":
+    case "julian":
+      return ["units", DTK_JULIAN];
+    case "m":
+      return ["units", DTK_MONTH];
+    case "mm":
+      return ["units", DTK_MINUTE];
+    case "s":
+      return ["units", DTK_SECOND];
+    case "y":
+      return ["units", DTK_YEAR];
   }
-  skipWs(): void {
-    while (this.i < this.b.length && isWs(this.b[this.i])) this.i++;
-  }
-  done(): boolean {
-    return this.i >= this.b.length;
-  }
-  peek(): number | undefined {
-    return this.i < this.b.length ? this.b[this.i] : undefined;
-  }
-  // Read a run of ASCII digits as a bigint; undefined for an empty run (22007); more than
-  // MAX_INT_DIGITS digits → 22008.
-  readDigits(): bigint | undefined {
-    const start = this.i;
-    while (this.i < this.b.length && isDigit(this.b[this.i])) this.i++;
-    if (this.i === start) return undefined;
-    if (this.i - start > MAX_INT_DIGITS) {
-      throw intervalFieldOverflow("interval field has too many digits");
-    }
-    return BigInt(new TextDecoder().decode(this.b.subarray(start, this.i)));
-  }
-  // Peek an ASCII-letter word (not consuming).
-  peekWord(): string | undefined {
-    const start = this.i;
-    let j = start;
-    while (j < this.b.length && isAlpha(this.b[j])) j++;
-    if (j === start) return undefined;
-    return new TextDecoder().decode(this.b.subarray(start, j));
-  }
+  return OTHER_DATE_KEYWORDS.has(w) ? ["other", 0] : undefined;
 }
 
-// Parse the time fields after an integer hour and a ':' — MM[:SS[.ffffff]] — adding their micros
-// to acc with the given sign. hour is the already-read integer hour (unbounded; PG allows
-// 100:00:00). Sub-µs digits round half away from zero (like timestamp).
-function parseTime(acc: Acc, c: Cursor, neg: boolean, hour: bigint): void {
-  c.i++; // consume ':'
-  const minute = c.readDigits();
-  if (minute === undefined) throw invalidInterval("expected minutes");
-  let second = 0n;
-  let fracUs = 0n;
-  if (c.peek() === 0x3a) {
-    c.i++;
-    const s = c.readDigits();
-    if (s === undefined) throw invalidInterval("expected seconds");
-    second = s;
-    if (c.peek() === 0x2e) {
-      c.i++;
-      fracUs = readFracUs(c);
-    }
+// C strtol (base 10) as PG's strtoi64 uses it on a field: an optional sign then digits. Returns
+// the value and the characters consumed — 0 consumed (value 0) when there are no digits. A value
+// beyond int64 is ERANGE, a field overflow.
+function strtoi64(s: string): [bigint, number] {
+  let i = 0;
+  let neg = false;
+  if (s.length > 0 && (s.charCodeAt(0) === CH_MINUS || s.charCodeAt(0) === CH_PLUS)) {
+    neg = s.charCodeAt(0) === CH_MINUS;
+    i = 1;
   }
-  let total =
-    hour * 3600n * MICROS_PER_SEC +
-    minute * 60n * MICROS_PER_SEC +
-    second * MICROS_PER_SEC +
-    fracUs;
-  if (neg) total = -total;
-  acc.micros = addChecked(acc.micros, total);
+  const start = i;
+  while (i < s.length && isDigit(s.charCodeAt(i))) i++;
+  if (i === start) return [0n, 0];
+  let v = BigInt(s.slice(start, i));
+  if (neg) v = -v;
+  if (v < I64_MIN || v > I64_MAX) throw OVERFLOW;
+  return [v, i];
 }
 
-// Read fractional-seconds digits after '.' into microseconds (0..1_000_000), 0–6 digits exact,
-// 7+ rounded half away from zero — identical to the timestamp rule.
-function readFracUs(c: Cursor): bigint {
-  const start = c.i;
-  while (c.i < c.b.length && isDigit(c.b[c.i])) c.i++;
-  const digits = c.b.subarray(start, c.i);
-  if (digits.length === 0) throw invalidInterval("expected fractional digits after '.'");
-  let us = 0n;
-  for (let k = 0; k < 6; k++) {
-    us *= 10n;
-    if (k < digits.length) us += BigInt(digits[k] - 0x30);
-  }
-  if (digits.length > 6 && digits[6] >= 0x35) us += 1n;
+// PG's strtoint: strtol limited to int32 (beyond it is ERANGE, a field overflow).
+function strtoint(s: string): [bigint, number] {
+  const [v, n] = strtoi64(s);
+  if (v < I32_MIN || v > I32_MAX) throw OVERFLOW;
+  return [v, n];
+}
+
+// The first FRAC_DIGITS of a digit run as a fraction numerator over FRAC_DEN. A fraction whose
+// nonzero digits all lie past the 25th stays nonzero (numerator 1) — too small to move any field,
+// but still "a fraction" (it decides whether seconds claim the sub-second fields).
+function fracFromDigits(digits: string): bigint {
+  const num = BigInt(digits.slice(0, FRAC_DIGITS).padEnd(FRAC_DIGITS, "0"));
+  if (num === 0n && /[1-9]/.test(digits)) return 1n;
+  return num;
+}
+
+// PG's ParseFraction: s is `.` then digits (or nothing) and nothing else.
+function parseFraction(s: string): bigint {
+  const digits = s.slice(1);
+  if (!/^[0-9]*$/.test(digits)) throw BAD;
+  return fracFromDigits(digits);
+}
+
+// ParseFractionalSecond: a `.digits` fraction of a second to whole µs — 0–6 digits exact, 7+
+// rounded half away from zero on the 7th digit (jed's one mode; PG rounds a double half to even).
+function parseFractionalSecond(s: string): bigint {
+  const digits = s.slice(1);
+  if (!/^[0-9]*$/.test(digits)) throw BAD;
+  let us = BigInt(digits.slice(0, 6).padEnd(6, "0"));
+  if (digits.length > 6 && digits.charCodeAt(6) >= 0x35) us += 1n;
   return us;
 }
 
-// Read a unit value's fractional digits after '.' as [numerator, denominator] with the
-// denominator a power of ten. More than MAX_FRAC_DIGITS digits → 22008.
-function readUnitFrac(c: Cursor): [bigint, bigint] {
-  const start = c.i;
-  while (c.i < c.b.length && isDigit(c.b[c.i])) c.i++;
-  const digits = c.b.subarray(start, c.i);
-  if (digits.length === 0) throw invalidInterval("expected fractional digits after '.'");
-  if (digits.length > MAX_FRAC_DIGITS) {
-    throw intervalFieldOverflow("interval value has too many fractional digits");
-  }
-  let num = 0n;
-  let den = 1n;
-  for (const dd of digits) {
-    num = num * 10n + BigInt(dd - 0x30);
-    den *= 10n;
-  }
-  return [num, den];
+// --- the Adjust* helpers of datetime.c: add a scaled value into the fields, failing on overflow ---
+
+function i32(v: bigint): bigint {
+  if (v < I32_MIN || v > I32_MAX) throw OVERFLOW;
+  return v;
+}
+function i64(v: bigint): bigint {
+  if (v < I64_MIN || v > I64_MAX) throw OVERFLOW;
+  return v;
 }
 
-// Parse an interval literal (the "unit + time" subset) into the three-field value. Errors:
-// malformed syntax → 22007; a field beyond the representable range → 22008.
-export function parseInterval(input: string): Interval {
-  const c = new Cursor(input.trim());
-  const acc: Acc = { months: 0n, days: 0n, micros: 0n };
+// AdjustFractMicroseconds: frac * scale µs, rounded half away from zero.
+function adjustFractMicros(frac: bigint, scale: bigint, itm: ItmIn): void {
+  if (frac === 0n) return;
+  itm.usec = i64(itm.usec + roundDivBig(frac * scale, FRAC_DEN));
+}
 
-  c.skipWs();
-  if (c.peek() === 0x40) {
-    c.i++; // an optional leading `@` (PG's verbose lead-in) is accepted and ignored
-    c.skipWs();
+// AdjustFractDays: frac * scale days — whole days, then the remaining fraction of a day as µs.
+function adjustFractDays(frac: bigint, scale: bigint, itm: ItmIn): void {
+  if (frac === 0n) return;
+  const total = frac * scale;
+  const extraDays = total / FRAC_DEN; // truncate toward zero
+  itm.mday = i32(itm.mday + extraDays);
+  adjustFractMicros(total - extraDays * FRAC_DEN, MICROS_PER_DAY, itm);
+}
+
+// AdjustFractYears: frac * scale years as whole months, rounded half to even (PG's rint); the rest
+// of a month is dropped, as in PG.
+function adjustFractYears(frac: bigint, scale: bigint, itm: ItmIn): void {
+  const total = frac * scale * MONTHS_PER_YEAR;
+  let extra = total / FRAC_DEN;
+  const rem = total - extra * FRAC_DEN;
+  const twiceRem = (rem < 0n ? -rem : rem) * 2n;
+  if (twiceRem > FRAC_DEN || (twiceRem === FRAC_DEN && extra % 2n !== 0n)) {
+    extra += total < 0n ? -1n : 1n;
   }
-  if (c.done()) throw invalidInterval("empty interval");
+  itm.mon = i32(itm.mon + extra);
+}
 
-  let ago = false;
-  // Every field read, in input order — for PG's duplicate-field rule, checked once the input is
-  // fully read (checkDuplicateFields).
-  const fields: FieldPart[] = [];
-  // Whether whitespace followed the previous field. Fields must be whitespace-separated, so
-  // run-together input such as the SQL-standard '1-2' (deferred, §3) fails closed rather than
-  // being read as two adjacent fields.
-  let separated = true;
-  while (!c.done()) {
-    const word0 = c.peekWord();
-    if (word0 !== undefined && word0.toLowerCase() === "ago") {
-      c.i += word0.length;
-      ago = true;
-      c.skipWs();
-      break;
+// AdjustMicroseconds: (val + frac) * scale µs.
+function adjustMicros(val: bigint, frac: bigint, scale: bigint, itm: ItmIn): void {
+  itm.usec = i64(itm.usec + i64(val * scale));
+  adjustFractMicros(frac, scale, itm);
+}
+
+// AdjustDays: val * scale days.
+function adjustDays(val: bigint, scale: bigint, itm: ItmIn): void {
+  itm.mday = i32(itm.mday + i32(i32(val) * scale));
+}
+
+// AdjustMonths: val months.
+function adjustMonths(val: bigint, itm: ItmIn): void {
+  itm.mon = i32(itm.mon + i32(val));
+}
+
+// AdjustYears: val * scale years.
+function adjustYears(val: bigint, scale: bigint, itm: ItmIn): void {
+  itm.year = i32(itm.year + i32(i32(val) * scale));
+}
+
+// PG's DecodeTimeForInterval (DecodeTimeCommon): a time field H:M, H:M:S[.f], or M:S.f (two parts
+// with a fraction are minutes and seconds). The time REPLACES itm.usec, as in PG — so a fractional
+// unit to the time's left (read earlier) loses its µs part.
+function decodeTimeForInterval(s: string, itm: ItmIn): void {
+  const h = strtoi64(s);
+  let hour = h[0];
+  let cp = s.slice(h[1]);
+  if (cp.charCodeAt(0) !== CH_COLON) throw BAD;
+  const m = strtoint(cp.slice(1));
+  let minute = m[0];
+  cp = cp.slice(1 + m[1]);
+  let sec = 0n;
+  let fsec = 0n;
+  if (cp.length === 0) {
+    // H:M
+  } else if (cp.charCodeAt(0) === CH_DOT) {
+    // mm:ss.fff
+    fsec = parseFractionalSecond(cp);
+    if (hour < I32_MIN || hour > I32_MAX) throw OVERFLOW;
+    sec = minute;
+    minute = hour;
+    hour = 0n;
+  } else if (cp.charCodeAt(0) === CH_COLON) {
+    const [s2, n3] = strtoint(cp.slice(1));
+    sec = s2;
+    cp = cp.slice(1 + n3);
+    if (cp.length > 0) {
+      if (cp.charCodeAt(0) !== CH_DOT) throw BAD;
+      fsec = parseFractionalSecond(cp);
     }
-    if (!separated) throw invalidInterval("interval fields must be separated by whitespace");
+  } else {
+    throw BAD;
+  }
+  if (hour < 0n || minute < 0n || minute > 59n || sec < 0n || sec > 60n || fsec > USECS_PER_SEC) {
+    throw OVERFLOW;
+  }
+  itm.usec = i64(
+    i64(i64(i64(hour * USECS_PER_HOUR) + minute * USECS_PER_MINUTE) + sec * USECS_PER_SEC) + fsec,
+  );
+}
 
-    let neg = false;
-    const p = c.peek();
-    if (p === 0x2d) {
-      neg = true;
-      c.i++;
-    } else if (p === 0x2b) {
-      c.i++;
-    }
-    const intPart = c.readDigits();
-    if (intPart === undefined) throw invalidInterval("expected a number");
-
-    const beforeMonths = acc.months;
-    const beforeDays = acc.days;
-    const beforeMicros = acc.micros;
-    let mask: number;
-    if (c.peek() === 0x3a) {
-      parseTime(acc, c, neg, intPart);
-      mask = FIELD_TIME;
-    } else {
-      let fracNum = 0n;
-      let fracDen = 1n;
-      if (c.peek() === 0x2e) {
-        c.i++;
-        [fracNum, fracDen] = readUnitFrac(c);
+// PG's DecodeInterval (IntervalStyle postgres, no field qualifier): read the fields right to left,
+// so a unit word is met before the number it applies to. A number with no unit takes the last unit
+// read: seconds at the right end, then whatever unit was read last — except that after an hour or
+// a time field the next unitless number is days ('1 1:00', '5 1 hour'). N-M is years-months.
+// Returns whether the input was `infinity` / `-infinity`.
+function decodeInterval(fields: DtField[], itm: ItmIn): boolean {
+  let isBefore = false;
+  let parsingUnitVal = false;
+  let infinite = false;
+  let fmask = 0;
+  let ty = IGNORE_DTF;
+  const nf = fields.length;
+  for (let i = nf - 1; i >= 0; i--) {
+    const f = fields[i];
+    let tmask = 0;
+    let ftype = f.ftype;
+    if (ftype === "time") {
+      decodeTimeForInterval(f.text, itm);
+      tmask = FIELD_TIME;
+      ty = DTK_DAY;
+      parsingUnitVal = false;
+    } else if (ftype === "tz") {
+      // A signed time (-1:00, +02:03) — else a signed number, read below.
+      let isTime = false;
+      if (f.text.slice(1).includes(":")) {
+        try {
+          decodeTimeForInterval(f.text.slice(1), itm);
+          isTime = true;
+        } catch (e) {
+          if (!(e instanceof DtError)) throw e;
+        }
       }
-      c.skipWs();
-      // A recognized unit applies its weights; else 22007. A number with no unit means SECONDS
-      // (PG), but only as the LAST field: elsewhere PG reads it positionally as a SQL-standard
-      // field ('1 1:00' is 1 day), which jed defers (§3), so it fails closed.
-      let weights: [bigint, bigint, bigint, number];
-      const word = c.peekWord();
-      if (word !== undefined && word.toLowerCase() !== "ago") {
-        c.i += word.length;
-        const w = unitWeights(word);
-        if (w === undefined) throw invalidInterval(`unknown interval unit "${word}"`);
-        weights = w;
-      } else if (!c.done()) {
-        throw invalidInterval("a number without a unit must be the last interval field");
+      if (isTime) {
+        if (f.text.charCodeAt(0) === CH_MINUS) itm.usec = i64(-itm.usec);
+        tmask = FIELD_TIME;
+        ty = DTK_DAY;
+        parsingUnitVal = false;
       } else {
-        weights = [0n, 0n, MICROS_PER_SEC, FIELD_SECOND];
+        ftype = "number";
       }
-      applyUnit(acc, neg, intPart, fracNum, fracDen, weights[0], weights[1], weights[2]);
-      mask = weights[3] === FIELD_SECOND ? secondsMask(fracNum) : weights[3];
     }
-    fields.push({
-      mask,
-      months: acc.months - beforeMonths,
-      days: acc.days - beforeDays,
-      micros: acc.micros - beforeMicros,
-    });
-    const before = c.i;
-    c.skipWs();
-    separated = c.i > before;
+    if (ftype === "number" || ftype === "date") {
+      if (ty === IGNORE_DTF) ty = DTK_SECOND;
+      const s = f.text;
+      const parsed = strtoi64(s);
+      let val = parsed[0];
+      const cp = s.slice(parsed[1]);
+      const negative = s.charCodeAt(0) === CH_MINUS;
+      let fval = 0n;
+      if (cp.length === 0) {
+        // a whole number
+      } else if (cp.charCodeAt(0) === CH_MINUS) {
+        // SQL-standard years-months
+        const ym = strtoint(cp.slice(1));
+        let v2 = ym[0];
+        if (v2 < 0n || v2 >= MONTHS_PER_YEAR) throw OVERFLOW;
+        if (cp.length !== 1 + ym[1]) throw BAD;
+        ty = DTK_MONTH;
+        if (negative) v2 = -v2;
+        val = i64(i64(val * MONTHS_PER_YEAR) + v2);
+      } else if (cp.charCodeAt(0) === CH_DOT) {
+        fval = parseFraction(cp);
+        if (negative) fval = -fval;
+      } else {
+        throw BAD;
+      }
+      switch (ty) {
+        case DTK_MICROSEC:
+          adjustMicros(val, fval, 1n, itm);
+          tmask = FIELD_MICROSECOND;
+          break;
+        case DTK_MILLISEC:
+          adjustMicros(val, fval, 1000n, itm);
+          tmask = FIELD_MILLISECOND;
+          break;
+        case DTK_SECOND:
+          adjustMicros(val, fval, USECS_PER_SEC, itm);
+          // fractional seconds claim the millisecond and microsecond fields too
+          tmask = fval === 0n ? FIELD_SECOND : FIELD_ALL_SECS;
+          break;
+        case DTK_MINUTE:
+          adjustMicros(val, fval, USECS_PER_MINUTE, itm);
+          tmask = FIELD_MINUTE;
+          break;
+        case DTK_HOUR:
+          adjustMicros(val, fval, USECS_PER_HOUR, itm);
+          tmask = FIELD_HOUR;
+          ty = DTK_DAY; // a unitless number left of an hour is days
+          break;
+        case DTK_DAY:
+          adjustDays(val, 1n, itm);
+          adjustFractMicros(fval, MICROS_PER_DAY, itm);
+          tmask = FIELD_DAY;
+          break;
+        case DTK_WEEK:
+          adjustDays(val, 7n, itm);
+          adjustFractDays(fval, 7n, itm);
+          tmask = FIELD_WEEK;
+          break;
+        case DTK_MONTH:
+          adjustMonths(val, itm);
+          adjustFractDays(fval, DAYS_PER_MONTH, itm);
+          tmask = FIELD_MONTH;
+          break;
+        case DTK_YEAR:
+        case DTK_DECADE:
+        case DTK_CENTURY:
+        case DTK_MILLENNIUM: {
+          let scale = 1n;
+          tmask = FIELD_YEAR;
+          if (ty === DTK_DECADE) {
+            scale = 10n;
+            tmask = FIELD_DECADE;
+          } else if (ty === DTK_CENTURY) {
+            scale = 100n;
+            tmask = FIELD_CENTURY;
+          } else if (ty === DTK_MILLENNIUM) {
+            scale = 1000n;
+            tmask = FIELD_MILLENNIUM;
+          }
+          adjustYears(val, scale, itm);
+          adjustFractYears(fval, scale, itm);
+          break;
+        }
+        default:
+          throw BAD;
+      }
+      parsingUnitVal = false;
+    } else if (ftype === "string" || ftype === "special") {
+      // two unit words in a row
+      if (parsingUnitVal) throw BAD;
+      const word = intervalWord(f.text);
+      if (word === undefined) throw BAD;
+      const [kind, value] = word;
+      if (kind === "ignore") {
+        // skipped — but, as in PG, it resets the unit a number to its left takes
+        ty = IGNORE_DTF;
+        continue;
+      } else if (kind === "units") {
+        ty = value;
+        parsingUnitVal = true;
+      } else if (kind === "ago") {
+        // `ago` only as the last field
+        if (i !== nf - 1) throw BAD;
+        isBefore = true;
+        ty = DTK_NUMBER;
+      } else if (kind === "reserv") {
+        tmask = FIELD_DATE | FIELD_TIME;
+        // only infinity / -infinity, and nothing after it
+        if ((value !== DTK_LATE && value !== DTK_EARLY) || i !== nf - 1) throw BAD;
+        infinite = true;
+      } else {
+        throw BAD;
+      }
+    }
+    if ((tmask & fmask) !== 0) throw BAD;
+    fmask |= tmask;
   }
-
-  if (!c.done()) throw invalidInterval("trailing characters in interval");
-  if (fields.length === 0) throw invalidInterval("empty interval");
-  checkDuplicateFields(input, fields);
-
-  if (ago) {
-    acc.months = -acc.months;
-    acc.days = -acc.days;
-    acc.micros = addChecked(0n, -acc.micros);
+  // at least one field, and no unit left without its number
+  if (fmask === 0 || parsingUnitVal) throw BAD;
+  if (isBefore) {
+    itm.usec = i64(-itm.usec);
+    itm.mday = i32(-itm.mday);
+    itm.mon = i32(-itm.mon);
+    itm.year = i32(-itm.year);
   }
+  return infinite;
+}
 
-  if (acc.months < I32_MIN || acc.months > I32_MAX || acc.days < I32_MIN || acc.days > I32_MAX) {
-    throw intervalFieldOverflow("interval out of range");
+// strtod's range limits, to 40 significant digits: a decimal at or above the overflow threshold
+// (2^1024 − 2^970, ~1.8e308) rounds to infinity, and a nonzero one below the underflow threshold
+// (2^-1022 − 2^-1076, ~2.2e-308) is too small for a normal double — both ERANGE, which PG reports
+// as malformed input.
+const STRTOD_OVERFLOW_DIGITS = "1797693134862315807937289714053034150799";
+const STRTOD_UNDERFLOW_DIGITS = "2225073858507201259573821257020768020077";
+
+// Compare a significand's leading 40 digits (zero-padded) with a 40-digit threshold.
+function cmpLeadDigits(d: string, t: string): number {
+  const lead = d.slice(0, t.length).padEnd(t.length, "0");
+  return lead < t ? -1 : lead > t ? 1 : 0;
+}
+
+// The signed-exponent tail [eE|pP][+-]digits of a strtod number at s[pos.i]; only consumed when
+// digits follow. The value saturates far beyond any meaningful exponent.
+function readExponentPart(s: string, pos: { i: number }, marker: number): bigint {
+  const at = (k: number): number => (k < s.length ? s.charCodeAt(k) : 0);
+  if (lower(at(pos.i)) !== marker) return 0n;
+  let j = pos.i + 1;
+  let neg = false;
+  if (at(j) === CH_PLUS || at(j) === CH_MINUS) {
+    neg = at(j) === CH_MINUS;
+    j++;
   }
-  return { months: Number(acc.months), days: Number(acc.days), micros: acc.micros };
+  if (!isDigit(at(j))) return 0n;
+  let e = 0n;
+  while (isDigit(at(j))) {
+    e = e * 10n + BigInt(at(j) - 0x30);
+    if (e > 1_000_000_000_000n) e = 1_000_000_000_000n;
+    j++;
+  }
+  pos.i = j;
+  return neg ? -e : e;
+}
+
+// A decimal strtod number digits[.digits][e[+-]digits] at s[i..] (no sign) as [integer part,
+// fraction numerator over FRAC_DEN, end], or the ParseISO8601Number error: a value strtod would
+// report ERANGE for is malformed, one beyond ±1e15 a field overflow.
+function scanDecimal(s: string, start: number): [bigint, bigint, number] {
+  const pos = { i: start };
+  const at = (k: number): number => (k < s.length ? s.charCodeAt(k) : 0);
+  let digits = "";
+  let fracCount = 0n;
+  let sawDigit = false;
+  while (isDigit(at(pos.i))) {
+    digits += s[pos.i++];
+    sawDigit = true;
+  }
+  if (at(pos.i) === CH_DOT && (sawDigit || isDigit(at(pos.i + 1)))) {
+    pos.i++;
+    while (isDigit(at(pos.i))) {
+      digits += s[pos.i++];
+      fracCount++;
+      sawDigit = true;
+    }
+  }
+  if (!sawDigit) throw BAD;
+  // value = significand * 10^exp, the significand without leading or trailing zeros
+  let exp = readExponentPart(s, pos, 0x65) - fracCount;
+  let sig = digits.replace(/^0+/, "");
+  if (sig === "") return [0n, 0n, pos.i];
+  const trimmed = sig.replace(/0+$/, "");
+  exp += BigInt(sig.length - trimmed.length);
+  sig = trimmed;
+  // the power of ten of the leading digit
+  const lead = BigInt(sig.length - 1) + exp;
+  if (lead > 308n || (lead === 308n && cmpLeadDigits(sig, STRTOD_OVERFLOW_DIGITS) > 0)) throw BAD;
+  if (lead < -308n || (lead === -308n && cmpLeadDigits(sig, STRTOD_UNDERFLOW_DIGITS) <= 0))
+    throw BAD;
+  if (lead > 15n || (lead === 15n && sig !== "1")) throw OVERFLOW;
+  if (exp >= 0n) return [BigInt(sig) * 10n ** exp, 0n, pos.i];
+  // k digits are after the decimal point
+  const k = Number(-exp);
+  if (sig.length > k) {
+    return [BigInt(sig.slice(0, sig.length - k)), fracFromDigits(sig.slice(sig.length - k)), pos.i];
+  }
+  const zeros = Math.min(k - sig.length, FRAC_DIGITS);
+  return [0n, fracFromDigits("0".repeat(zeros) + sig), pos.i];
+}
+
+// A hexadecimal strtod number 0x hex[.hex][p[+-]digits] whose digits start at s[i..] — as
+// scanDecimal, computed exactly from its bits (the fraction to 64 bits).
+function scanHex(s: string, start: number): [bigint, bigint, number] {
+  const pos = { i: start };
+  const at = (k: number): number => (k < s.length ? s.charCodeAt(k) : 0);
+  let bits = "";
+  let fracHex = 0n;
+  while (isHex(at(pos.i)))
+    bits += Number.parseInt(s[pos.i++], 16)
+      .toString(2)
+      .padStart(4, "0");
+  if (at(pos.i) === CH_DOT) {
+    pos.i++;
+    while (isHex(at(pos.i))) {
+      bits += Number.parseInt(s[pos.i++], 16)
+        .toString(2)
+        .padStart(4, "0");
+      fracHex++;
+    }
+  }
+  // value = bits * 2^e2
+  const e2 = readExponentPart(s, pos, 0x70) - 4n * fracHex;
+  bits = bits.replace(/^0+/, "");
+  if (bits === "") return [0n, 0n, pos.i];
+  const n = BigInt(bits.length);
+  // the power of two of the leading bit, and of the lowest set bit
+  const lead = n - 1n + e2;
+  const last = BigInt(bits.lastIndexOf("1"));
+  const low = n - 1n - last + e2;
+  // the leading 54 bits all ones: rounds up to the next power of two in 53-bit precision
+  const roundsUp = bits.length >= 54 && !bits.slice(0, 54).includes("0");
+  if (lead > 1023n || (lead === 1023n && roundsUp)) throw BAD;
+  // ERANGE on underflow: below the normal range and not exact in the subnormal range
+  const tiny = lead < -1022n && !(lead === -1023n && roundsUp);
+  if (tiny && low < -1074n) throw BAD;
+  if (lead >= 50n) throw OVERFLOW;
+  const bitAt = (pow: bigint): bigint => {
+    // the bit worth 2^pow
+    const p = lead - pow;
+    return p >= 0n && p < n && bits[Number(p)] === "1" ? 1n : 0n;
+  };
+  let ipart = 0n;
+  for (let pow = lead; pow >= 0n; pow--) ipart = ipart * 2n + bitAt(pow);
+  let f64bits = 0n;
+  for (let q = 1n; q <= 64n; q++) f64bits = f64bits * 2n + bitAt(-q);
+  if (ipart > 1_000_000_000_000_000n || (ipart === 1_000_000_000_000_000n && f64bits > 0n))
+    throw OVERFLOW;
+  // f64bits / 2^64 = f64bits * 5^25 / 2^39 / 10^25
+  return [ipart, (f64bits * 298_023_223_876_953_125n) >> 39n, pos.i];
+}
+
+// PG's ParseISO8601Number: a strtod number at s[i..] (it must start with a digit, `-`, or `.`) as
+// [integer part, fraction, end], both parts carrying the sign.
+function parseIso8601Number(s: string, i: number): [bigint, bigint, number] {
+  const at = (k: number): number => (k < s.length ? s.charCodeAt(k) : 0);
+  const c = at(i);
+  if (!(isDigit(c) || c === CH_MINUS || c === CH_DOT)) throw BAD;
+  const neg = c === CH_MINUS;
+  const j = neg ? i + 1 : i;
+  // strtod's infinity / NaN spellings: a value out of range
+  const head = s.slice(j, j + 3).toLowerCase();
+  if (head === "inf" || head === "nan") throw OVERFLOW;
+  const isHexNum =
+    at(j) === 0x30 &&
+    lower(at(j + 1)) === 0x78 &&
+    (isHex(at(j + 2)) || (at(j + 2) === CH_DOT && isHex(at(j + 3))));
+  const [ipart, frac, end] = isHexNum ? scanHex(s, j + 2) : scanDecimal(s, j);
+  return neg ? [-ipart, -frac, end] : [ipart, frac, end];
+}
+
+// PG's ISO8601IntegerWidth: the integer digits of a number field, past a leading `-`.
+function iso8601IntegerWidth(s: string): number {
+  let i = s.charCodeAt(0) === CH_MINUS ? 1 : 0;
+  const start = i;
+  while (isDigit(s.charCodeAt(i))) i++;
+  return i - start;
+}
+
+// PG's DecodeISO8601Interval: the ISO 8601 "format with designators" (P1Y2M3DT4H5M6S, P2W, any
+// field fractional or negative) and the "alternative format" (P0001-02-03T04:05:06, basic
+// P00010203T040506). The whole input, untrimmed, must be the value.
+function decodeIso8601Interval(s: string, itm: ItmIn): void {
+  itm.usec = 0n;
+  itm.mday = 0n;
+  itm.mon = 0n;
+  itm.year = 0n;
+  if (s.length < 2 || s[0] !== "P") throw BAD;
+  let i = 1;
+  let datepart = true;
+  let havefield = false;
+  while (i < s.length) {
+    if (s[i] === "T") {
+      // the start of the time part
+      datepart = false;
+      havefield = false;
+      i++;
+      continue;
+    }
+    const fieldstart = i;
+    let [val, fval, end] = parseIso8601Number(s, i);
+    i = end;
+    const unit = i < s.length ? s[i] : "";
+    i++;
+    if (datepart) {
+      if (unit === "Y") {
+        adjustYears(val, 1n, itm);
+        adjustFractYears(fval, 1n, itm);
+      } else if (unit === "M") {
+        adjustMonths(val, itm);
+        adjustFractDays(fval, DAYS_PER_MONTH, itm);
+      } else if (unit === "W") {
+        adjustDays(val, 7n, itm);
+        adjustFractDays(fval, 7n, itm);
+      } else if (unit === "D") {
+        adjustDays(val, 1n, itm);
+        adjustFractMicros(fval, MICROS_PER_DAY, itm);
+      } else if (unit === "T" || unit === "" || unit === "-") {
+        if (unit !== "-" && iso8601IntegerWidth(s.slice(fieldstart)) === 8 && !havefield) {
+          // alternative format, basic: YYYYMMDD
+          adjustYears(val / 10000n, 1n, itm);
+          adjustMonths((val / 100n) % 100n, itm);
+          adjustDays(val % 100n, 1n, itm);
+          adjustFractMicros(fval, MICROS_PER_DAY, itm);
+          if (unit === "") return;
+          datepart = false;
+          havefield = false;
+          continue;
+        }
+        // alternative format, extended: YYYY-MM-DD
+        if (havefield) throw BAD;
+        adjustYears(val, 1n, itm);
+        adjustFractYears(fval, 1n, itm);
+        if (unit === "") return;
+        if (unit === "T") {
+          datepart = false;
+          havefield = false;
+          continue;
+        }
+        [val, fval, end] = parseIso8601Number(s, i);
+        i = end;
+        adjustMonths(val, itm);
+        adjustFractDays(fval, DAYS_PER_MONTH, itm);
+        if (i >= s.length) return;
+        if (s[i] === "T") {
+          datepart = false;
+          havefield = false;
+          continue;
+        }
+        if (s[i] !== "-") throw BAD;
+        i++;
+        [val, fval, end] = parseIso8601Number(s, i);
+        i = end;
+        adjustDays(val, 1n, itm);
+        adjustFractMicros(fval, MICROS_PER_DAY, itm);
+        if (i >= s.length) return;
+        if (s[i] === "T") {
+          datepart = false;
+          havefield = false;
+          continue;
+        }
+        throw BAD;
+      } else {
+        throw BAD;
+      }
+    } else if (unit === "H") {
+      adjustMicros(val, fval, USECS_PER_HOUR, itm);
+    } else if (unit === "M") {
+      adjustMicros(val, fval, USECS_PER_MINUTE, itm);
+    } else if (unit === "S") {
+      adjustMicros(val, fval, USECS_PER_SEC, itm);
+    } else if (unit === "" || unit === ":") {
+      if (unit === "" && iso8601IntegerWidth(s.slice(fieldstart)) === 6 && !havefield) {
+        // alternative format, basic: HHMMSS
+        adjustMicros(val / 10000n, 0n, USECS_PER_HOUR, itm);
+        adjustMicros((val / 100n) % 100n, 0n, USECS_PER_MINUTE, itm);
+        adjustMicros(val % 100n, 0n, USECS_PER_SEC, itm);
+        adjustFractMicros(fval, 1n, itm);
+        return;
+      }
+      // alternative format, extended: HH:MM:SS
+      if (havefield) throw BAD;
+      adjustMicros(val, fval, USECS_PER_HOUR, itm);
+      if (unit === "") return;
+      [val, fval, end] = parseIso8601Number(s, i);
+      i = end;
+      adjustMicros(val, fval, USECS_PER_MINUTE, itm);
+      if (i >= s.length) return;
+      if (s[i] !== ":") throw BAD;
+      i++;
+      [val, fval, end] = parseIso8601Number(s, i);
+      i = end;
+      adjustMicros(val, fval, USECS_PER_SEC, itm);
+      if (i >= s.length) return;
+      throw BAD;
+    } else {
+      throw BAD;
+    }
+    havefield = true;
+  }
+}
+
+// Parse interval text into the three-field value — PostgreSQL's interval_in
+// (spec/design/interval.md §3): the PostgreSQL / SQL-standard field syntax, else ISO 8601.
+// Malformed input is 22007; a field beyond its range is 22008 (PG's 22015).
+export function parseInterval(input: string): Interval {
+  const itm: ItmIn = { usec: 0n, mday: 0n, mon: 0n, year: 0n };
+  let infinite = false;
+  try {
+    try {
+      infinite = decodeInterval(parseDateTime(input), itm);
+    } catch (e) {
+      if (e !== BAD) throw e;
+      decodeIso8601Interval(input, itm);
+    }
+  } catch (e) {
+    if (e === OVERFLOW)
+      throw intervalFieldOverflow(`interval field value out of range: "${input}"`);
+    if (e === BAD) throw invalidInterval(`invalid input syntax for type interval: "${input}"`);
+    throw e;
+  }
+  // (jed has no infinite interval, so `infinity` is not an interval value)
+  if (infinite) throw invalidInterval(`invalid input syntax for type interval: "${input}"`);
+  const months = itm.year * MONTHS_PER_YEAR + itm.mon;
+  if (months < I32_MIN || months > I32_MAX) throw intervalFieldOverflow("interval out of range");
+  return { months: Number(months), days: Number(itm.mday), micros: itm.usec };
 }
 
 // --- rendering ---------------------------------------------------------------

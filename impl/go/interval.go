@@ -9,8 +9,9 @@ import (
 // The interval type — value model, parsing, and rendering (spec/design/interval.md). A value is
 // PostgreSQL's three independent fields: Months (i32), Days (i32), Micros (i64). They are kept
 // separate so `+ 1 month` is calendar-aware; comparison/ordering/dedup collapse them via the
-// canonical 128-bit span (1 month = 30 days, 1 day = 24 h). Parsing accepts the "unit + time"
-// subset; rendering is PG `IntervalStyle = postgres`. A §8 determinism hotspot: the
+// canonical 128-bit span (1 month = 30 days, 1 day = 24 h). Parsing is a port of PostgreSQL's
+// interval_in (its unit syntax, the SQL-standard forms, ISO 8601); rendering is PG
+// `IntervalStyle = postgres`. A §8 determinism hotspot: the
 // fractional-unit cascade, the half-away µs rounding, and the render format must be byte-identical
 // across the Rust/Go/TS cores. The cascade and span use math/big (Go has no int128), so the exact
 // integer math matches Rust's i128 and TS's BigInt within the digit caps below.
@@ -19,7 +20,7 @@ const (
 	microsPerDay  = int64(86_400) * microsPerSec // canonical "1 day = 24 h" span weight
 	daysPerMonth  = int64(30)                    // canonical "1 month = 30 days"
 	monthsPerYear = int64(12)
-	maxIntDigits  = 18 // per spec/design/interval.md — bounds the exact cascade
+	maxIntDigits  = 18 // an interval × / number factor's digit bounds (spec/design/interval.md §5)
 	maxFracDigits = 9
 )
 
@@ -356,42 +357,6 @@ func justifyInterval(iv Interval) (Interval, error) {
 func invalidInterval(detail string) error       { return newError(InvalidDatetimeFormat, detail) }
 func intervalFieldOverflow(detail string) error { return newError(DatetimeFieldOverflow, detail) }
 
-// intervalAcc accumulates the three fields exactly. The fractional part of each unit token
-// cascades down (months→days→micros) using exact big.Int math, the µs result rounded half away
-// from zero. Field overflow traps 22008.
-type intervalAcc struct {
-	months int64
-	days   int64
-	micros int64
-}
-
-func (a *intervalAcc) addMonths(m int64) error {
-	s, ok := add64(a.months, m)
-	if !ok {
-		return intervalFieldOverflow("interval out of range")
-	}
-	a.months = s
-	return nil
-}
-
-func (a *intervalAcc) addDays(d int64) error {
-	s, ok := add64(a.days, d)
-	if !ok {
-		return intervalFieldOverflow("interval out of range")
-	}
-	a.days = s
-	return nil
-}
-
-func (a *intervalAcc) addMicros(u int64) error {
-	s, ok := add64(a.micros, u)
-	if !ok {
-		return intervalFieldOverflow("interval out of range")
-	}
-	a.micros = s
-	return nil
-}
-
 // roundDivBig rounds num/den to the nearest integer, half away from zero (the engine's one
 // rounding mode). den > 0.
 func roundDivBig(num, den *big.Int) *big.Int {
@@ -410,87 +375,74 @@ func roundDivBig(num, den *big.Int) *big.Int {
 	return q
 }
 
-// toI64 converts a big.Int to i64, trapping 22008 on overflow.
-func toI64(b *big.Int) (int64, error) {
-	if !b.IsInt64() {
-		return 0, intervalFieldOverflow("interval out of range")
-	}
-	return b.Int64(), nil
+// The interval text parser is a port of PostgreSQL 18's interval_in (datetime.c): the input is
+// broken into fields (ParseDateTime), the fields are read right to left (DecodeInterval), and only
+// if that finds the input malformed is it read as ISO 8601 (DecodeISO8601Interval). The one
+// numeric difference (spec/design/interval.md §3): PG carries a field's fraction in a double; jed
+// carries it exactly, as a signed numerator over 10^25 (fracDen), and rounds the µs half away from
+// zero (the engine's one mode).
+
+// dtErr is PostgreSQL's datetime-decode result: dtBadFormat (DTERR_BAD_FORMAT, 22007) or
+// dtFieldOverflow (DTERR_FIELD_OVERFLOW, PG's 22015; jed's datetime field overflow 22008).
+type dtErr int
+
+const (
+	dtOK dtErr = iota
+	dtBadFormat
+	dtFieldOverflow
+)
+
+// fracDigits / fracDen: a field's fractional part is numerator / 10^25, its digits past the 25th
+// dropped (far below a microsecond for every unit).
+const fracDigits = 25
+
+var fracDen = new(big.Int).Exp(big.NewInt(10), big.NewInt(fracDigits), nil)
+
+const (
+	usecsPerSec    = microsPerSec
+	usecsPerMinute = 60 * usecsPerSec
+	usecsPerHour   = 3600 * usecsPerSec
+)
+
+// itmIn is PG's struct pg_itm_in: the fields an interval is assembled from. Years stay apart from
+// months until the end (itmin2interval).
+type itmIn struct {
+	usec int64
+	mday int32
+	mon  int32
+	year int32
 }
 
-// applyUnit adds value = sign * intPart.fracNum/fracDen of a unit to the accumulator, where the
-// unit is measured in monthsPer, daysPer, or microsPer of one base field (exactly one nonzero).
-// The integer part lands in that field; the fractional part cascades to the next-lower fields
-// using 1 month = 30 days and 1 day = 24 h (spec/design/interval.md §3). All exact big.Int math.
-func (a *intervalAcc) applyUnit(neg bool, intPart, fracNum, fracDen *big.Int, monthsPer, daysPer, microsPer int64) error {
-	// n = sign * (intPart*fracDen + fracNum); d = fracDen.
-	n := new(big.Int).Mul(intPart, fracDen)
-	n.Add(n, fracNum)
-	if neg {
-		n.Neg(n)
-	}
-	d := fracDen
+// PG's DTK_* unit codes — the values DecodeInterval's `type` carries between fields.
+const (
+	dtkNumber     = 0 // the type after `ago`: no number may precede it
+	dtkTZ         = 4
+	dtkEarly      = 9
+	dtkLate       = 10
+	ignoreDTF     = 8 // the initial type: the rightmost unitless number is seconds
+	dtkSecond     = 18
+	dtkMinute     = 19
+	dtkHour       = 20
+	dtkDay        = 21
+	dtkWeek       = 22
+	dtkMonth      = 23
+	dtkQuarter    = 24
+	dtkYear       = 25
+	dtkDecade     = 26
+	dtkCentury    = 27
+	dtkMillennium = 28
+	dtkMillisec   = 29
+	dtkMicrosec   = 30
+	dtkJulian     = 31
+	dtkDOW        = 32
+	dtkDOY        = 33
+	dtkISOYear    = 36
+	dtkISODOW     = 37
+)
 
-	months := big.NewInt(0)
-	days := big.NewInt(0)
-	microsNum := big.NewInt(0) // exact micros numerator over d
-
-	if monthsPer != 0 {
-		total := new(big.Int).Mul(n, big.NewInt(monthsPer)) // months * d
-		months = new(big.Int).Quo(total, d)
-		rem := new(big.Int).Sub(total, new(big.Int).Mul(months, d))
-		dayTotal := rem.Mul(rem, big.NewInt(daysPerMonth)) // days * d
-		wholeDays := new(big.Int).Quo(dayTotal, d)
-		days.Add(days, wholeDays)
-		remDays := new(big.Int).Sub(dayTotal, new(big.Int).Mul(wholeDays, d))
-		microsNum.Add(microsNum, remDays.Mul(remDays, big.NewInt(microsPerDay)))
-	}
-	if daysPer != 0 {
-		total := new(big.Int).Mul(n, big.NewInt(daysPer)) // days * d
-		wholeDays := new(big.Int).Quo(total, d)
-		days.Add(days, wholeDays)
-		remDays := new(big.Int).Sub(total, new(big.Int).Mul(wholeDays, d))
-		microsNum.Add(microsNum, remDays.Mul(remDays, big.NewInt(microsPerDay)))
-	}
-	if microsPer != 0 {
-		microsNum.Add(microsNum, new(big.Int).Mul(n, big.NewInt(microsPer)))
-	}
-
-	if months.Sign() != 0 {
-		m, err := toI64(months)
-		if err != nil {
-			return err
-		}
-		if err := a.addMonths(m); err != nil {
-			return err
-		}
-	}
-	if days.Sign() != 0 {
-		dd, err := toI64(days)
-		if err != nil {
-			return err
-		}
-		if err := a.addDays(dd); err != nil {
-			return err
-		}
-	}
-	if microsNum.Sign() != 0 {
-		u, err := toI64(roundDivBig(microsNum, d))
-		if err != nil {
-			return err
-		}
-		if err := a.addMicros(u); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// The per-field masks of PostgreSQL's DecodeInterval (spec/design/interval.md §3): each unit sets
-// its own bit, so an input that names the same field twice is rejected (22007). `week` and `day`
-// are DIFFERENT fields ('1 week 1 day' is valid), as are year/decade/century/millennium and
-// second/millisecond/microsecond. A bare HH:MM[:SS] time claims the whole time-of-day group, and
-// a seconds value with a nonzero fraction claims all three seconds bits.
+// The per-field masks of DecodeInterval (PG DTK_M): each field claims its bits, and a field whose
+// bits overlap an already-read field's is a duplicate (22007). week and day are DIFFERENT fields,
+// as are year/decade/century/millennium and second/millisecond/microsecond.
 const (
 	fieldMonth       uint32 = 1 << 1
 	fieldYear        uint32 = 1 << 2
@@ -504,207 +456,426 @@ const (
 	fieldDecade      uint32 = 1 << 25
 	fieldCentury     uint32 = 1 << 26
 	fieldMillennium  uint32 = 1 << 27
-	// fieldAllSecs is seconds with a fractional part (PG DTK_ALL_SECS_M).
+	// seconds with a fractional part (PG DTK_ALL_SECS_M)
 	fieldAllSecs = fieldSecond | fieldMillisecond | fieldMicrosecond
-	// fieldTime is a bare HH:MM[:SS[.ffffff]] time (PG DTK_TIME_M).
+	// a time HH:MM[:SS[.ffffff]] (PG DTK_TIME_M)
 	fieldTime = fieldHour | fieldMinute | fieldAllSecs
+	// PG DTK_DATE_M
+	fieldDate = fieldYear | fieldMonth | fieldDay
 )
 
-// secondsMask is the field mask a seconds value claims: a nonzero fraction also claims the
-// millisecond and microsecond fields (PG: '1.5 sec 1 ms' is a duplicate, '1 sec 1 ms' /
-// '1.0 sec 1 ms' are not).
-func secondsMask(fracNum *big.Int) uint32 {
-	if fracNum.Sign() == 0 {
-		return fieldSecond
-	}
-	return fieldAllSecs
-}
+// PG's MAXDATEFIELDS and interval_in's 256-byte field buffer: more fields, or more field text, is
+// malformed.
+const (
+	maxDateFields = 25
+	fieldBufLen   = 256
+)
 
-// unitWeights returns the cascade weights (monthsPer, daysPer, microsPer) and the field mask for a
-// unit word (case-insensitive), or ok=false for an unrecognized unit. Exactly one weight is nonzero.
-func unitWeights(unit string) (int64, int64, int64, uint32, bool) {
-	switch strings.ToLower(unit) {
-	case "millennium", "millennia", "mil", "mils":
-		return 12000, 0, 0, fieldMillennium, true
-	case "century", "centuries", "cent", "c":
-		return 1200, 0, 0, fieldCentury, true
-	case "decade", "decades", "dec", "decs":
-		return 120, 0, 0, fieldDecade, true
-	case "year", "years", "yr", "yrs", "y":
-		return monthsPerYear, 0, 0, fieldYear, true
-	case "month", "months", "mon", "mons":
-		return 1, 0, 0, fieldMonth, true
-	case "week", "weeks", "w":
-		return 0, 7, 0, fieldWeek, true
-	case "day", "days", "d":
-		return 0, 1, 0, fieldDay, true
-	case "hour", "hours", "hr", "hrs", "h":
-		return 0, 0, 3600 * microsPerSec, fieldHour, true
-	case "minute", "minutes", "min", "mins":
-		return 0, 0, 60 * microsPerSec, fieldMinute, true
-	case "second", "seconds", "sec", "secs", "s":
-		return 0, 0, microsPerSec, fieldSecond, true
-	case "millisecond", "milliseconds", "msec", "msecs", "ms":
-		return 0, 0, 1000, fieldMillisecond, true
-	case "microsecond", "microseconds", "usec", "usecs", "us":
-		return 0, 0, 1, fieldMicrosecond, true
-	}
-	return 0, 0, 0, 0, false
-}
-
-// intervalFieldPart is one parsed field: its mask and the exact amount it added to each of the
-// three accumulators.
-type intervalFieldPart struct {
-	mask   uint32
-	months int64
-	days   int64
-	micros int64
-}
-
-// checkDuplicateIntervalFields applies PostgreSQL's duplicate-field rule (spec/design/interval.md
-// §3). PG's DecodeInterval reads the fields right to left, adding each into its running fields (an
-// i32 month/day or i64 µs overflow is an out-of-range error) and THEN rejecting it as a duplicate
-// if its mask overlaps the fields already read. jed parses left to right, so it replays that order
-// here over the recorded fields: a duplicate traps 22007, unless the running total from the right
-// end through the duplicate already overflowed, in which case PG would have stopped there first
-// (22008).
-func checkDuplicateIntervalFields(input string, fields []intervalFieldPart) error {
-	var seen uint32
-	var months, days, micros int64
-	overflowed := false
-	for i := len(fields) - 1; i >= 0; i-- {
-		f := fields[i]
-		if !overflowed {
-			m, okM := add64(months, f.months)
-			d, okD := add64(days, f.days)
-			u, okU := add64(micros, f.micros)
-			if okM && okD && okU && m >= -2147483648 && m <= 2147483647 && d >= -2147483648 && d <= 2147483647 {
-				months, days, micros = m, d, u
-			} else {
-				overflowed = true
-			}
-		}
-		if f.mask&seen != 0 {
-			if overflowed {
-				return intervalFieldOverflow("interval out of range")
-			}
-			return invalidInterval(fmt.Sprintf("invalid input syntax for type interval: \"%s\"", input))
-		}
-		seen |= f.mask
-	}
-	return nil
-}
-
-type intervalCursor struct {
-	b string
-	i int
-}
-
-func (c *intervalCursor) skipWS() {
-	for c.i < len(c.b) && isWS(c.b[c.i]) {
-		c.i++
-	}
-}
-
-func (c *intervalCursor) done() bool { return c.i >= len(c.b) }
-
-func (c *intervalCursor) peek() (byte, bool) {
-	if c.i < len(c.b) {
-		return c.b[c.i], true
-	}
-	return 0, false
-}
-
-// readIntervalDigits reads a run of ASCII digits as a big.Int. ok=false for an empty run (caller
-// raises 22007); more than maxIntDigits digits → err 22008.
-func (c *intervalCursor) readIntervalDigits() (*big.Int, bool, error) {
-	start := c.i
-	for c.i < len(c.b) && c.b[c.i] >= '0' && c.b[c.i] <= '9' {
-		c.i++
-	}
-	if c.i == start {
-		return nil, false, nil
-	}
-	if c.i-start > maxIntDigits {
-		return nil, false, intervalFieldOverflow("interval field has too many digits")
-	}
-	v, _ := new(big.Int).SetString(c.b[start:c.i], 10)
-	return v, true, nil
-}
-
-// peekIntervalWord peeks an ASCII-letter word at the cursor (not consuming).
-func (c *intervalCursor) peekWord() (string, bool) {
-	start := c.i
-	j := start
-	for j < len(c.b) && isAlpha(c.b[j]) {
-		j++
-	}
-	if j == start {
-		return "", false
-	}
-	return c.b[start:j], true
+// isPGSpace is isspace in the C locale.
+func isPGSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r'
 }
 
 func isAlpha(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
-// parseIntervalTime parses MM[:SS[.ffffff]] after an integer hour and a ':' — adding their micros
-// to acc with the given sign. hour is the already-read integer hour (unbounded; PG allows
-// 100:00:00). Sub-µs digits round half away from zero (like timestamp).
-func (a *intervalAcc) parseTime(c *intervalCursor, neg bool, hour *big.Int) error {
-	c.i++ // consume ':'
-	minute, ok, err := c.readIntervalDigits()
-	if err != nil {
-		return err
+func isDigitByte(b byte) bool { return b >= '0' && b <= '9' }
+func isAlnumByte(b byte) bool { return isDigitByte(b) || isAlpha(b) }
+func isHexByte(b byte) bool {
+	return isDigitByte(b) || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+// isPunctByte is ispunct in the C locale (ASCII punctuation).
+func isPunctByte(b byte) bool {
+	return (b >= '!' && b <= '/') || (b >= ':' && b <= '@') || (b >= '[' && b <= '`') || (b >= '{' && b <= '~')
+}
+
+func lowerByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
 	}
-	if !ok {
-		return invalidInterval("expected minutes")
+	return b
+}
+
+// fieldType is the kind of one field (ParseDateTime's ftype).
+type fieldType int
+
+const (
+	ftNumber  fieldType = iota // digits, possibly with one `.` fraction (5, 1.5, .5)
+	ftString                   // a lowercased word (day, ago)
+	ftDate                     // digits with - / . separators, or a word run into digits (1-2, 5., p1d)
+	ftTime                     // digits then `:` (1:00:00.5)
+	ftTZ                       // a sign then digits, `:`, `.`, `-` (-1, +02:03, -1-2)
+	ftSpecial                  // a sign then a word (-infinity)
+)
+
+type dtField struct {
+	ftype fieldType
+	text  []byte
+}
+
+// parseDateTime is PostgreSQL's ParseDateTime, as interval_in uses it: split the input into
+// fields. Whitespace separates fields; any other punctuation starting a field is a separator too;
+// text is lowercased.
+func parseDateTime(input string) ([]dtField, dtErr) {
+	at := func(k int) byte {
+		if k < len(input) {
+			return input[k]
+		}
+		return 0
 	}
-	second := big.NewInt(0)
-	fracUS := int64(0)
-	if b, has := c.peek(); has && b == ':' {
-		c.i++
-		second, ok, err = c.readIntervalDigits()
-		if err != nil {
-			return err
+	var fields []dtField
+	// bytes of PG's field buffer used by the finished fields (each field's text plus its NUL)
+	bufUsed := 0
+	i := 0
+	for i < len(input) {
+		c := input[i]
+		if isPGSpace(c) {
+			i++
+			continue
 		}
-		if !ok {
-			return invalidInterval("expected seconds")
+		if len(fields) >= maxDateFields {
+			return nil, dtBadFormat
 		}
-		if b2, has2 := c.peek(); has2 && b2 == '.' {
-			c.i++
-			fracUS, err = c.readIntervalFracUS()
-			if err != nil {
-				return err
+		var text []byte
+		// PG's APPEND_CHAR: the buffer must keep room for the field's terminating NUL (a field
+		// that overruns it is malformed, reported once the field is read)
+		full := false
+		push := func(ch byte) {
+			if bufUsed+len(text)+1 >= fieldBufLen {
+				full = true
+				return
+			}
+			text = append(text, ch)
+		}
+		var ftype fieldType
+		switch {
+		case isDigitByte(c):
+			for isDigitByte(at(i)) {
+				push(at(i))
+				i++
+			}
+			if at(i) == ':' {
+				// a time field
+				ftype = ftTime
+				push(':')
+				i++
+				for isDigitByte(at(i)) || at(i) == ':' || at(i) == '.' {
+					push(at(i))
+					i++
+				}
+			} else if at(i) == '-' || at(i) == '/' || at(i) == '.' {
+				// a date field (or a number with a fraction)
+				delim := at(i)
+				push(delim)
+				i++
+				if isDigitByte(at(i)) {
+					ftype = ftDate
+					if delim == '.' {
+						ftype = ftNumber
+					}
+					for isDigitByte(at(i)) {
+						push(at(i))
+						i++
+					}
+					// a second matching delimiter makes a three-field date
+					if at(i) == delim {
+						ftype = ftDate
+						push(delim)
+						i++
+						for isDigitByte(at(i)) || at(i) == delim {
+							push(at(i))
+							i++
+						}
+					}
+				} else {
+					ftype = ftDate
+					for isAlnumByte(at(i)) || at(i) == delim {
+						push(lowerByte(at(i)))
+						i++
+					}
+				}
+			} else {
+				ftype = ftNumber
+			}
+		case c == '.':
+			// a leading decimal point: fractional seconds
+			push('.')
+			i++
+			for isDigitByte(at(i)) {
+				push(at(i))
+				i++
+			}
+			ftype = ftNumber
+		case isAlpha(c):
+			ftype = ftString
+			for isAlpha(at(i)) {
+				push(lowerByte(at(i)))
+				i++
+			}
+			// A word may run into a date or zone name — unless it is a known date keyword.
+			isDate := false
+			if at(i) == '-' || at(i) == '/' || at(i) == '.' {
+				isDate = true
+			} else if at(i) == '+' || isDigitByte(at(i)) {
+				_, known := dateKeyword(string(text))
+				isDate = !known
+			}
+			if isDate {
+				ftype = ftDate
+				for {
+					push(lowerByte(at(i)))
+					i++
+					n := at(i)
+					if !(n == '+' || n == '-' || n == '/' || n == '_' || n == '.' || n == ':' || isAlnumByte(n)) {
+						break
+					}
+				}
+			}
+		case c == '+' || c == '-':
+			push(c)
+			i++
+			// whitespace after the sign is skipped
+			for isPGSpace(at(i)) {
+				i++
+			}
+			if isDigitByte(at(i)) {
+				ftype = ftTZ
+				push(at(i))
+				i++
+				for isDigitByte(at(i)) || at(i) == ':' || at(i) == '.' || at(i) == '-' {
+					push(at(i))
+					i++
+				}
+			} else if isAlpha(at(i)) {
+				ftype = ftSpecial
+				for isAlpha(at(i)) {
+					push(lowerByte(at(i)))
+					i++
+				}
+			} else {
+				return nil, dtBadFormat
+			}
+		case isPunctByte(c):
+			// other punctuation only separates fields
+			i++
+			continue
+		default:
+			return nil, dtBadFormat
+		}
+		if full {
+			return nil, dtBadFormat
+		}
+		bufUsed += len(text) + 1
+		fields = append(fields, dtField{ftype: ftype, text: text})
+	}
+	return fields, dtOK
+}
+
+// wordKind is what a word means to DecodeInterval.
+type wordKind int
+
+const (
+	wordUnknown wordKind = iota
+	wordIgnore           // skipped (at, on)
+	wordUnits            // a unit: the DTK_* code it gives the number to its left
+	wordAgo              // ago
+	wordReserv           // a reserved word (infinity, epoch, …): the DTK_* code
+	wordOther            // a date keyword with no meaning in an interval (a month name, am, …)
+)
+
+// intervalWord is PG's interval unit table (deltatktbl), then its date keyword table (datetktbl)
+// — the lookup DecodeUnits then DecodeSpecial do. PG compares at most 10 characters, so any word
+// starting with a 10-letter entry (millennium, microsecon, millisecon) is that unit. jed's one
+// difference: a bare `m` (PG's minute) is ambiguous with month and is rejected.
+func intervalWord(w string) (wordKind, int) {
+	if w == "m" {
+		return wordUnknown, 0
+	}
+	if strings.HasPrefix(w, "millennium") {
+		return wordUnits, dtkMillennium
+	}
+	if strings.HasPrefix(w, "microsecon") {
+		return wordUnits, dtkMicrosec
+	}
+	if strings.HasPrefix(w, "millisecon") {
+		return wordUnits, dtkMillisec
+	}
+	switch w {
+	case "ago":
+		return wordAgo, 0
+	case "c", "cent", "centuries", "century":
+		return wordUnits, dtkCentury
+	case "d", "day", "days":
+		return wordUnits, dtkDay
+	case "dec", "decade", "decades", "decs":
+		return wordUnits, dtkDecade
+	case "h", "hour", "hours", "hr", "hrs":
+		return wordUnits, dtkHour
+	case "mil", "millennia", "millennium", "mils":
+		return wordUnits, dtkMillennium
+	case "min", "mins", "minute", "minutes":
+		return wordUnits, dtkMinute
+	case "mon", "mons", "month", "months":
+		return wordUnits, dtkMonth
+	case "ms", "msec", "msecond", "mseconds", "msecs":
+		return wordUnits, dtkMillisec
+	case "qtr", "quarter":
+		return wordUnits, dtkQuarter
+	case "s", "sec", "second", "seconds", "secs":
+		return wordUnits, dtkSecond
+	case "timezone":
+		return wordUnits, dtkTZ
+	case "us", "usec", "usecond", "useconds", "usecs":
+		return wordUnits, dtkMicrosec
+	case "w", "week", "weeks":
+		return wordUnits, dtkWeek
+	case "y", "year", "years", "yr", "yrs":
+		return wordUnits, dtkYear
+	}
+	k, _ := dateKeyword(w)
+	return k.kind, k.value
+}
+
+type wordMeaning struct {
+	kind  wordKind
+	value int
+}
+
+// dateKeyword is PG's date keyword table (datetktbl), as an interval reads it.
+func dateKeyword(w string) (wordMeaning, bool) {
+	switch w {
+	case "at", "on":
+		return wordMeaning{wordIgnore, 0}, true
+	case "infinity", "+infinity":
+		return wordMeaning{wordReserv, dtkLate}, true
+	case "-infinity":
+		return wordMeaning{wordReserv, dtkEarly}, true
+	case "allballs", "epoch", "now", "today", "tomorrow", "yesterday":
+		return wordMeaning{wordReserv, dtkNumber}, true
+	case "d":
+		return wordMeaning{wordUnits, dtkDay}, true
+	case "dow":
+		return wordMeaning{wordUnits, dtkDOW}, true
+	case "doy":
+		return wordMeaning{wordUnits, dtkDOY}, true
+	case "h":
+		return wordMeaning{wordUnits, dtkHour}, true
+	case "isodow":
+		return wordMeaning{wordUnits, dtkISODOW}, true
+	case "isoyear":
+		return wordMeaning{wordUnits, dtkISOYear}, true
+	case "j", "jd", "julian":
+		return wordMeaning{wordUnits, dtkJulian}, true
+	case "m":
+		return wordMeaning{wordUnits, dtkMonth}, true
+	case "mm":
+		return wordMeaning{wordUnits, dtkMinute}, true
+	case "s":
+		return wordMeaning{wordUnits, dtkSecond}, true
+	case "y":
+		return wordMeaning{wordUnits, dtkYear}, true
+	case "ad", "am", "apr", "april", "aug", "august", "bc", "dec", "december", "dst", "feb",
+		"february", "fri", "friday", "jan", "january", "jul", "july", "jun", "june", "mar",
+		"march", "may", "mon", "monday", "nov", "november", "oct", "october", "pm", "sat",
+		"saturday", "sep", "sept", "september", "sun", "sunday", "t", "thu", "thur", "thurs",
+		"thursday", "tue", "tues", "tuesday", "wed", "wednesday", "weds":
+		return wordMeaning{wordOther, 0}, true
+	}
+	return wordMeaning{wordUnknown, 0}, false
+}
+
+// strtoi64 is C strtol (base 10) as PG's strtoi64 uses it on a field: an optional sign then
+// digits. It returns the value and the bytes consumed — 0 consumed (value 0) when there are no
+// digits. A value beyond int64 is ERANGE, a field overflow.
+func strtoi64(s []byte) (int64, int, dtErr) {
+	i := 0
+	neg := false
+	if len(s) > 0 && (s[0] == '-' || s[0] == '+') {
+		neg = s[0] == '-'
+		i = 1
+	}
+	start := i
+	var v uint64
+	overflow := false
+	for i < len(s) && isDigitByte(s[i]) {
+		if !overflow {
+			d := uint64(s[i] - '0')
+			if v > (1<<63)/10 || v*10+d > 1<<63 {
+				overflow = true
+			} else {
+				v = v*10 + d
+			}
+		}
+		i++
+	}
+	if i == start {
+		return 0, 0, dtOK
+	}
+	if overflow || (!neg && v > 1<<63-1) {
+		return 0, 0, dtFieldOverflow
+	}
+	if neg {
+		return int64(-v), i, dtOK // v <= 2^63, so -v wraps to the right int64
+	}
+	return int64(v), i, dtOK
+}
+
+// strtoint is PG's strtoint: strtol limited to int32 (beyond it is ERANGE, a field overflow).
+func strtoint(s []byte) (int32, int, dtErr) {
+	v, n, e := strtoi64(s)
+	if e != dtOK {
+		return 0, 0, e
+	}
+	if v < -2147483648 || v > 2147483647 {
+		return 0, 0, dtFieldOverflow
+	}
+	return int32(v), n, dtOK
+}
+
+// fracFromDigits is the first fracDigits of a digit run as a fraction numerator over fracDen. A
+// fraction whose nonzero digits all lie past the 25th stays nonzero (numerator 1) — too small to
+// move any field, but still "a fraction" (it decides whether seconds claim the sub-second fields).
+func fracFromDigits(digits []byte) *big.Int {
+	buf := make([]byte, fracDigits)
+	for k := 0; k < fracDigits; k++ {
+		buf[k] = '0'
+		if k < len(digits) {
+			buf[k] = digits[k]
+		}
+	}
+	num, _ := new(big.Int).SetString(string(buf), 10)
+	if num.Sign() == 0 {
+		for _, d := range digits {
+			if d != '0' {
+				return big.NewInt(1)
 			}
 		}
 	}
-	// total µs = hour*3600e6 + minute*60e6 + second*1e6 + fracUS (exact big.Int)
-	total := new(big.Int).Mul(hour, big.NewInt(3600*microsPerSec))
-	total.Add(total, new(big.Int).Mul(minute, big.NewInt(60*microsPerSec)))
-	total.Add(total, new(big.Int).Mul(second, big.NewInt(microsPerSec)))
-	total.Add(total, big.NewInt(fracUS))
-	if neg {
-		total.Neg(total)
-	}
-	u, err := toI64(total)
-	if err != nil {
-		return err
-	}
-	return a.addMicros(u)
+	return num
 }
 
-// readIntervalFracUS reads fractional-seconds digits after '.' into microseconds (0..1_000_000),
-// 0–6 digits exact, 7+ rounded half away from zero — identical to the timestamp rule.
-func (c *intervalCursor) readIntervalFracUS() (int64, error) {
-	start := c.i
-	for c.i < len(c.b) && c.b[c.i] >= '0' && c.b[c.i] <= '9' {
-		c.i++
+// parseFraction is PG's ParseFraction: s is `.` then digits (or nothing) and nothing else.
+func parseFraction(s []byte) (*big.Int, dtErr) {
+	digits := s[1:]
+	for _, d := range digits {
+		if !isDigitByte(d) {
+			return nil, dtBadFormat
+		}
 	}
-	digits := c.b[start:c.i]
-	if len(digits) == 0 {
-		return 0, invalidInterval("expected fractional digits after '.'")
+	return fracFromDigits(digits), dtOK
+}
+
+// parseFractionalSecond is ParseFractionalSecond: a `.digits` fraction of a second to whole µs —
+// 0–6 digits exact, 7+ rounded half away from zero on the 7th digit (jed's one mode; PG rounds a
+// double half to even).
+func parseFractionalSecond(s []byte) (int64, dtErr) {
+	digits := s[1:]
+	for _, d := range digits {
+		if !isDigitByte(d) {
+			return 0, dtBadFormat
+		}
 	}
 	var us int64
 	for k := 0; k < 6; k++ {
@@ -716,169 +887,920 @@ func (c *intervalCursor) readIntervalFracUS() (int64, error) {
 	if len(digits) > 6 && digits[6] >= '5' {
 		us++
 	}
-	return us, nil
+	return us, dtOK
 }
 
-// readIntervalUnitFrac reads a unit value's fractional digits after '.' as (numerator,
-// denominator) with the denominator a power of ten. More than maxFracDigits digits → err 22008.
-func (c *intervalCursor) readIntervalUnitFrac() (*big.Int, *big.Int, error) {
-	start := c.i
-	for c.i < len(c.b) && c.b[c.i] >= '0' && c.b[c.i] <= '9' {
-		c.i++
+// --- the Adjust* helpers of datetime.c: add a scaled value into the fields, failing on overflow ---
+
+// adjustFractMicros is AdjustFractMicroseconds: frac * scale µs, rounded half away from zero.
+func adjustFractMicros(frac *big.Int, scale int64, itm *itmIn) dtErr {
+	if frac.Sign() == 0 {
+		return dtOK
 	}
-	digits := c.b[start:c.i]
-	if len(digits) == 0 {
-		return nil, nil, invalidInterval("expected fractional digits after '.'")
+	usec := roundDivBig(new(big.Int).Mul(frac, big.NewInt(scale)), fracDen)
+	if !usec.IsInt64() {
+		return dtFieldOverflow
 	}
-	if len(digits) > maxFracDigits {
-		return nil, nil, intervalFieldOverflow("interval value has too many fractional digits")
+	s, ok := add64(itm.usec, usec.Int64())
+	if !ok {
+		return dtFieldOverflow
 	}
-	num, _ := new(big.Int).SetString(digits, 10)
-	den := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(len(digits))), nil)
-	return num, den, nil
+	itm.usec = s
+	return dtOK
 }
 
-// ParseInterval parses an interval literal (the "unit + time" subset) into the three-field value.
-// Errors: malformed syntax → 22007; a field beyond the representable range → 22008.
-func parseInterval(input string) (Interval, error) {
-	trimmed := trimASCIIWS(input)
-	c := &intervalCursor{b: trimmed}
-	a := &intervalAcc{}
-
-	c.skipWS()
-	// An optional leading `@` (PG's verbose lead-in) is accepted and ignored.
-	if b, ok := c.peek(); ok && b == '@' {
-		c.i++
-		c.skipWS()
+// adjustFractDays is AdjustFractDays: frac * scale days — whole days, then the remaining fraction
+// of a day as µs.
+func adjustFractDays(frac *big.Int, scale int64, itm *itmIn) dtErr {
+	if frac.Sign() == 0 {
+		return dtOK
 	}
-	if c.done() {
-		return Interval{}, invalidInterval("empty interval")
+	total := new(big.Int).Mul(frac, big.NewInt(scale))
+	extraDays, rem := new(big.Int).QuoRem(total, fracDen, new(big.Int)) // truncate toward zero
+	d, ok := addI32(itm.mday, int32(extraDays.Int64()))
+	if !ok {
+		return dtFieldOverflow
 	}
+	itm.mday = d
+	return adjustFractMicros(rem, microsPerDay, itm)
+}
 
-	ago := false
-	// Every field read, in input order — for PG's duplicate-field rule, checked once the input is
-	// fully read (checkDuplicateIntervalFields).
-	var fields []intervalFieldPart
-	// Whether whitespace followed the previous field. Fields must be whitespace-separated, so
-	// run-together input such as the SQL-standard '1-2' (deferred, §3) fails closed rather than
-	// being read as two adjacent fields.
-	separated := true
-	one := big.NewInt(1)
-	for !c.done() {
-		if word, ok := c.peekWord(); ok && strings.EqualFold(word, "ago") {
-			c.i += len(word)
-			ago = true
-			c.skipWS()
-			break
-		}
-		if !separated {
-			return Interval{}, invalidInterval("interval fields must be separated by whitespace")
-		}
+// adjustFractYears is AdjustFractYears: frac * scale years as whole months, rounded half to even
+// (PG's rint); the rest of a month is dropped, as in PG.
+func adjustFractYears(frac *big.Int, scale int64, itm *itmIn) dtErr {
+	total := new(big.Int).Mul(frac, big.NewInt(scale*monthsPerYear))
+	extra, rem := new(big.Int).QuoRem(total, fracDen, new(big.Int))
+	twiceRem := new(big.Int).Abs(rem)
+	twiceRem.Lsh(twiceRem, 1)
+	if c := twiceRem.Cmp(fracDen); c > 0 || (c == 0 && extra.Bit(0) != 0) {
+		extra.Add(extra, big.NewInt(int64(total.Sign())))
+	}
+	m, ok := addI32(itm.mon, int32(extra.Int64()))
+	if !ok {
+		return dtFieldOverflow
+	}
+	itm.mon = m
+	return dtOK
+}
 
-		neg := false
-		if b, ok := c.peek(); ok {
-			if b == '-' {
-				neg = true
-				c.i++
-			} else if b == '+' {
-				c.i++
+// adjustMicros is AdjustMicroseconds: (val + frac) * scale µs.
+func adjustMicros(val int64, frac *big.Int, scale int64, itm *itmIn) dtErr {
+	p, ok := mul64(val, scale)
+	if ok {
+		p, ok = add64(itm.usec, p)
+	}
+	if !ok {
+		return dtFieldOverflow
+	}
+	itm.usec = p
+	return adjustFractMicros(frac, scale, itm)
+}
+
+// toInt32 narrows an int64, ok=false beyond int32.
+func toInt32(v int64) (int32, bool) {
+	if v < -2147483648 || v > 2147483647 {
+		return 0, false
+	}
+	return int32(v), true
+}
+
+// adjustDays is AdjustDays: val * scale days.
+func adjustDays(val int64, scale int32, itm *itmIn) dtErr {
+	v, ok := toInt32(val)
+	if !ok {
+		return dtFieldOverflow
+	}
+	d, ok := toInt32(int64(v) * int64(scale))
+	if ok {
+		d, ok = addI32(itm.mday, d)
+	}
+	if !ok {
+		return dtFieldOverflow
+	}
+	itm.mday = d
+	return dtOK
+}
+
+// adjustMonths is AdjustMonths: val months.
+func adjustMonths(val int64, itm *itmIn) dtErr {
+	v, ok := toInt32(val)
+	if ok {
+		v, ok = addI32(itm.mon, v)
+	}
+	if !ok {
+		return dtFieldOverflow
+	}
+	itm.mon = v
+	return dtOK
+}
+
+// adjustYears is AdjustYears: val * scale years.
+func adjustYears(val int64, scale int32, itm *itmIn) dtErr {
+	v, ok := toInt32(val)
+	if !ok {
+		return dtFieldOverflow
+	}
+	y, ok := toInt32(int64(v) * int64(scale))
+	if ok {
+		y, ok = addI32(itm.year, y)
+	}
+	if !ok {
+		return dtFieldOverflow
+	}
+	itm.year = y
+	return dtOK
+}
+
+// decodeTimeForInterval is PG's DecodeTimeForInterval (DecodeTimeCommon): a time field H:M,
+// H:M:S[.f], or M:S.f (two parts with a fraction are minutes and seconds). The time REPLACES
+// itm.usec, as in PG — so a fractional unit to the time's left (read earlier) loses its µs part.
+func decodeTimeForInterval(s []byte, itm *itmIn) dtErr {
+	hour, n, e := strtoi64(s)
+	if e != dtOK {
+		return e
+	}
+	cp := s[n:]
+	if len(cp) == 0 || cp[0] != ':' {
+		return dtBadFormat
+	}
+	minute, n, e := strtoint(cp[1:])
+	if e != dtOK {
+		return e
+	}
+	cp = cp[1+n:]
+	var sec int32
+	var fsec int64
+	switch {
+	case len(cp) == 0:
+	case cp[0] == '.':
+		// mm:ss.fff
+		if fsec, e = parseFractionalSecond(cp); e != dtOK {
+			return e
+		}
+		if hour < -2147483648 || hour > 2147483647 {
+			return dtFieldOverflow
+		}
+		sec = minute
+		minute = int32(hour)
+		hour = 0
+	case cp[0] == ':':
+		s2, n, e := strtoint(cp[1:])
+		if e != dtOK {
+			return e
+		}
+		sec = s2
+		cp = cp[1+n:]
+		if len(cp) > 0 {
+			if cp[0] != '.' {
+				return dtBadFormat
+			}
+			if fsec, e = parseFractionalSecond(cp); e != dtOK {
+				return e
 			}
 		}
-		intPart, ok, err := c.readIntervalDigits()
-		if err != nil {
-			return Interval{}, err
-		}
-		if !ok {
-			return Interval{}, invalidInterval("expected a number")
-		}
+	default:
+		return dtBadFormat
+	}
+	if hour < 0 || minute < 0 || minute > 59 || sec < 0 || sec > 60 || fsec > usecsPerSec {
+		return dtFieldOverflow
+	}
+	usec, ok := mul64(hour, usecsPerHour)
+	if ok {
+		usec, ok = add64(usec, int64(minute)*usecsPerMinute)
+	}
+	if ok {
+		usec, ok = add64(usec, int64(sec)*usecsPerSec)
+	}
+	if ok {
+		usec, ok = add64(usec, fsec)
+	}
+	if !ok {
+		return dtFieldOverflow
+	}
+	itm.usec = usec
+	return dtOK
+}
 
-		beforeMonths, beforeDays, beforeMicros := a.months, a.days, a.micros
-		var mask uint32
-		if b, has := c.peek(); has && b == ':' {
-			if err := a.parseTime(c, neg, intPart); err != nil {
-				return Interval{}, err
+// decodeInterval is PG's DecodeInterval (IntervalStyle postgres, no field qualifier): read the
+// fields right to left, so a unit word is met before the number it applies to. A number with no
+// unit takes the last unit read: seconds at the right end, then whatever unit was read last —
+// except that after an hour or a time field the next unitless number is days ('1 1:00',
+// '5 1 hour'). N-M is years-months. infinite reports `infinity` / `-infinity`.
+func decodeInterval(fields []dtField, itm *itmIn) (infinite bool, err dtErr) {
+	isBefore := false
+	parsingUnitVal := false
+	var fmask uint32
+	ty := ignoreDTF
+	nf := len(fields)
+	for i := nf - 1; i >= 0; i-- {
+		f := fields[i]
+		var tmask uint32
+		ftype := f.ftype
+		if ftype == ftTime {
+			if e := decodeTimeForInterval(f.text, itm); e != dtOK {
+				return false, e
 			}
-			mask = fieldTime
-		} else {
-			fracNum, fracDen := big.NewInt(0), one
-			if b2, has2 := c.peek(); has2 && b2 == '.' {
-				c.i++
-				fracNum, fracDen, err = c.readIntervalUnitFrac()
-				if err != nil {
-					return Interval{}, err
+			tmask = fieldTime
+			ty = dtkDay
+			parsingUnitVal = false
+		} else if ftype == ftTZ {
+			// A signed time (-1:00, +02:03) — else a signed number, read below.
+			if strings.IndexByte(string(f.text[1:]), ':') >= 0 && decodeTimeForInterval(f.text[1:], itm) == dtOK {
+				if f.text[0] == '-' {
+					u, ok := neg64(itm.usec)
+					if !ok {
+						return false, dtFieldOverflow
+					}
+					itm.usec = u
 				}
-			}
-			c.skipWS()
-			// A recognized unit applies its weights; else 22007. A number with no unit means
-			// SECONDS (PG), but only as the LAST field: elsewhere PG reads it positionally as a
-			// SQL-standard field ('1 1:00' is 1 day), which jed defers (§3), so it fails closed.
-			var mper, dper, uper int64
-			var unitMask uint32
-			if word, has := c.peekWord(); has && !strings.EqualFold(word, "ago") {
-				c.i += len(word)
-				var known bool
-				mper, dper, uper, unitMask, known = unitWeights(word)
-				if !known {
-					return Interval{}, invalidInterval(fmt.Sprintf("unknown interval unit %q", word))
-				}
-			} else if !c.done() {
-				return Interval{}, invalidInterval("a number without a unit must be the last interval field")
+				tmask = fieldTime
+				ty = dtkDay
+				parsingUnitVal = false
 			} else {
-				mper, dper, uper, unitMask = 0, 0, microsPerSec, fieldSecond
-			}
-			if err := a.applyUnit(neg, intPart, fracNum, fracDen, mper, dper, uper); err != nil {
-				return Interval{}, err
-			}
-			mask = unitMask
-			if unitMask == fieldSecond {
-				mask = secondsMask(fracNum)
+				ftype = ftNumber
 			}
 		}
-		// Each accumulator add was checked, so the (wrapping) difference is exactly the field's
-		// int64 amount.
-		fields = append(fields, intervalFieldPart{
-			mask:   mask,
-			months: a.months - beforeMonths,
-			days:   a.days - beforeDays,
-			micros: a.micros - beforeMicros,
-		})
-		before := c.i
-		c.skipWS()
-		separated = c.i > before
-	}
-
-	if !c.done() {
-		return Interval{}, invalidInterval("trailing characters in interval")
-	}
-	if len(fields) == 0 {
-		return Interval{}, invalidInterval("empty interval")
-	}
-	if err := checkDuplicateIntervalFields(input, fields); err != nil {
-		return Interval{}, err
-	}
-
-	if ago {
-		var ok bool
-		if a.months, ok = neg64(a.months); !ok {
-			return Interval{}, intervalFieldOverflow("interval out of range")
+		switch ftype {
+		case ftTime, ftTZ:
+		case ftNumber, ftDate:
+			if ty == ignoreDTF {
+				ty = dtkSecond
+			}
+			s := f.text
+			val, n, e := strtoi64(s)
+			if e != dtOK {
+				return false, e
+			}
+			cp := s[n:]
+			negative := s[0] == '-'
+			fval := new(big.Int)
+			switch {
+			case len(cp) == 0:
+			case cp[0] == '-':
+				// SQL-standard years-months
+				v2, n2, e := strtoint(cp[1:])
+				if e != dtOK {
+					return false, e
+				}
+				if v2 < 0 || int64(v2) >= monthsPerYear {
+					return false, dtFieldOverflow
+				}
+				if len(cp) != 1+n2 {
+					return false, dtBadFormat
+				}
+				ty = dtkMonth
+				if negative {
+					v2 = -v2
+				}
+				m, ok := mul64(val, monthsPerYear)
+				if ok {
+					m, ok = add64(m, int64(v2))
+				}
+				if !ok {
+					return false, dtFieldOverflow
+				}
+				val = m
+			case cp[0] == '.':
+				fv, e := parseFraction(cp)
+				if e != dtOK {
+					return false, e
+				}
+				fval = fv
+				if negative {
+					fval.Neg(fval)
+				}
+			default:
+				return false, dtBadFormat
+			}
+			var e2 dtErr
+			switch ty {
+			case dtkMicrosec:
+				e2 = adjustMicros(val, fval, 1, itm)
+				tmask = fieldMicrosecond
+			case dtkMillisec:
+				e2 = adjustMicros(val, fval, 1000, itm)
+				tmask = fieldMillisecond
+			case dtkSecond:
+				e2 = adjustMicros(val, fval, usecsPerSec, itm)
+				// fractional seconds claim the millisecond and microsecond fields too
+				tmask = fieldSecond
+				if fval.Sign() != 0 {
+					tmask = fieldAllSecs
+				}
+			case dtkMinute:
+				e2 = adjustMicros(val, fval, usecsPerMinute, itm)
+				tmask = fieldMinute
+			case dtkHour:
+				e2 = adjustMicros(val, fval, usecsPerHour, itm)
+				tmask = fieldHour
+				ty = dtkDay // a unitless number left of an hour is days
+			case dtkDay:
+				if e2 = adjustDays(val, 1, itm); e2 == dtOK {
+					e2 = adjustFractMicros(fval, microsPerDay, itm)
+				}
+				tmask = fieldDay
+			case dtkWeek:
+				if e2 = adjustDays(val, 7, itm); e2 == dtOK {
+					e2 = adjustFractDays(fval, 7, itm)
+				}
+				tmask = fieldWeek
+			case dtkMonth:
+				if e2 = adjustMonths(val, itm); e2 == dtOK {
+					e2 = adjustFractDays(fval, daysPerMonth, itm)
+				}
+				tmask = fieldMonth
+			case dtkYear, dtkDecade, dtkCentury, dtkMillennium:
+				scale, mask := int32(1), fieldYear
+				switch ty {
+				case dtkDecade:
+					scale, mask = 10, fieldDecade
+				case dtkCentury:
+					scale, mask = 100, fieldCentury
+				case dtkMillennium:
+					scale, mask = 1000, fieldMillennium
+				}
+				if e2 = adjustYears(val, scale, itm); e2 == dtOK {
+					e2 = adjustFractYears(fval, int64(scale), itm)
+				}
+				tmask = mask
+			default:
+				return false, dtBadFormat
+			}
+			if e2 != dtOK {
+				return false, e2
+			}
+			parsingUnitVal = false
+		case ftString, ftSpecial:
+			// two unit words in a row
+			if parsingUnitVal {
+				return false, dtBadFormat
+			}
+			kind, value := intervalWord(string(f.text))
+			switch kind {
+			case wordIgnore:
+				// skipped — but, as in PG, it resets the unit a number to its left takes
+				ty = ignoreDTF
+				continue
+			case wordUnits:
+				ty = value
+				parsingUnitVal = true
+			case wordAgo:
+				// `ago` only as the last field
+				if i != nf-1 {
+					return false, dtBadFormat
+				}
+				isBefore = true
+				ty = dtkNumber
+			case wordReserv:
+				tmask = fieldDate | fieldTime
+				// only infinity / -infinity, and nothing after it
+				if (value != dtkLate && value != dtkEarly) || i != nf-1 {
+					return false, dtBadFormat
+				}
+				infinite = true
+			default:
+				return false, dtBadFormat
+			}
 		}
-		if a.days, ok = neg64(a.days); !ok {
-			return Interval{}, intervalFieldOverflow("interval out of range")
+		if tmask&fmask != 0 {
+			return false, dtBadFormat
 		}
-		if a.micros, ok = neg64(a.micros); !ok {
-			return Interval{}, intervalFieldOverflow("interval out of range")
+		fmask |= tmask
+	}
+	// at least one field, and no unit left without its number
+	if fmask == 0 || parsingUnitVal {
+		return false, dtBadFormat
+	}
+	if isBefore {
+		u, ok := neg64(itm.usec)
+		if !ok || itm.mday == -2147483648 || itm.mon == -2147483648 || itm.year == -2147483648 {
+			return false, dtFieldOverflow
 		}
+		itm.usec, itm.mday, itm.mon, itm.year = u, -itm.mday, -itm.mon, -itm.year
 	}
-
-	if a.months < -2147483648 || a.months > 2147483647 {
-		return Interval{}, intervalFieldOverflow("interval out of range")
-	}
-	if a.days < -2147483648 || a.days > 2147483647 {
-		return Interval{}, intervalFieldOverflow("interval out of range")
-	}
-	return Interval{Months: int32(a.months), Days: int32(a.days), Micros: a.micros}, nil
+	return infinite, dtOK
 }
 
+// strtod's range limits, to 40 significant digits: a decimal at or above the overflow threshold
+// (2^1024 − 2^970, ~1.8e308) rounds to infinity, and a nonzero one below the underflow threshold
+// (2^-1022 − 2^-1076, ~2.2e-308) is too small for a normal double — both ERANGE, which PG reports
+// as malformed input.
+const (
+	strtodOverflowDigits  = "1797693134862315807937289714053034150799"
+	strtodUnderflowDigits = "2225073858507201259573821257020768020077"
+)
+
+// cmpLeadDigits compares a significand's leading 40 digits (zero-padded) with a 40-digit threshold.
+func cmpLeadDigits(d []byte, t string) int {
+	for k := 0; k < len(t); k++ {
+		dk := byte('0')
+		if k < len(d) {
+			dk = d[k]
+		}
+		if dk != t[k] {
+			if dk < t[k] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// readExponentPart reads the signed-exponent tail [eE|pP][+-]digits of a strtod number at s[*i],
+// only consuming it when digits follow; the value saturates far beyond any meaningful exponent.
+func readExponentPart(s string, i *int, marker byte) int64 {
+	at := func(k int) byte {
+		if k < len(s) {
+			return s[k]
+		}
+		return 0
+	}
+	if lowerByte(at(*i)) != marker {
+		return 0
+	}
+	j := *i + 1
+	neg := false
+	if at(j) == '+' || at(j) == '-' {
+		neg = at(j) == '-'
+		j++
+	}
+	if !isDigitByte(at(j)) {
+		return 0
+	}
+	var e int64
+	for isDigitByte(at(j)) {
+		e = e*10 + int64(at(j)-'0')
+		if e > 1_000_000_000_000 {
+			e = 1_000_000_000_000
+		}
+		j++
+	}
+	*i = j
+	if neg {
+		return -e
+	}
+	return e
+}
+
+// scanDecimal reads a decimal strtod number digits[.digits][e[+-]digits] at s[i:] (no sign) as
+// (integer part, fraction numerator over fracDen, end), or the ParseISO8601Number error: a value
+// strtod would report ERANGE for is malformed, one beyond ±1e15 a field overflow.
+func scanDecimal(s string, i int) (int64, *big.Int, int, dtErr) {
+	var digits []byte
+	var fracCount int64
+	sawDigit := false
+	for i < len(s) && isDigitByte(s[i]) {
+		digits = append(digits, s[i])
+		sawDigit = true
+		i++
+	}
+	if i < len(s) && s[i] == '.' && (sawDigit || (i+1 < len(s) && isDigitByte(s[i+1]))) {
+		i++
+		for i < len(s) && isDigitByte(s[i]) {
+			digits = append(digits, s[i])
+			fracCount++
+			sawDigit = true
+			i++
+		}
+	}
+	if !sawDigit {
+		return 0, nil, 0, dtBadFormat
+	}
+	// value = significand * 10^exp, the significand without leading or trailing zeros
+	exp := readExponentPart(s, &i, 'e') - fracCount
+	first := 0
+	for first < len(digits) && digits[first] == '0' {
+		first++
+	}
+	if first == len(digits) {
+		return 0, new(big.Int), i, dtOK
+	}
+	sig := digits[first:]
+	for sig[len(sig)-1] == '0' {
+		sig = sig[:len(sig)-1]
+		exp++
+	}
+	// the power of ten of the leading digit
+	lead := int64(len(sig)) - 1 + exp
+	if lead > 308 || (lead == 308 && cmpLeadDigits(sig, strtodOverflowDigits) > 0) {
+		return 0, nil, 0, dtBadFormat
+	}
+	if lead < -308 || (lead == -308 && cmpLeadDigits(sig, strtodUnderflowDigits) <= 0) {
+		return 0, nil, 0, dtBadFormat
+	}
+	if lead > 15 || (lead == 15 && string(sig) != "1") {
+		return 0, nil, 0, dtFieldOverflow
+	}
+	if exp >= 0 {
+		var v int64
+		for _, d := range sig {
+			v = v*10 + int64(d-'0')
+		}
+		for k := int64(0); k < exp; k++ {
+			v *= 10
+		}
+		return v, new(big.Int), i, dtOK
+	}
+	// k digits are after the decimal point
+	k := int(-exp)
+	var intDigits, fracDigitRun []byte
+	if len(sig) > k {
+		intDigits = sig[:len(sig)-k]
+		fracDigitRun = sig[len(sig)-k:]
+	} else {
+		zeros := k - len(sig)
+		if zeros > fracDigits {
+			zeros = fracDigits
+		}
+		fracDigitRun = append([]byte(strings.Repeat("0", zeros)), sig...)
+	}
+	var v int64
+	for _, d := range intDigits {
+		v = v*10 + int64(d-'0')
+	}
+	return v, fracFromDigits(fracDigitRun), i, dtOK
+}
+
+// scanHex reads a hexadecimal strtod number 0x hex[.hex][p[+-]digits] whose digits start at
+// s[i:] — as scanDecimal, computed exactly from its bits (the fraction to 64 bits).
+func scanHex(s string, i int) (int64, *big.Int, int, dtErr) {
+	var bits []byte
+	var fracHex int64
+	pushHex := func(h byte) {
+		var v byte
+		switch {
+		case isDigitByte(h):
+			v = h - '0'
+		default:
+			v = lowerByte(h) - 'a' + 10
+		}
+		for b := 3; b >= 0; b-- {
+			bits = append(bits, (v>>b)&1)
+		}
+	}
+	for i < len(s) && isHexByte(s[i]) {
+		pushHex(s[i])
+		i++
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && isHexByte(s[i]) {
+			pushHex(s[i])
+			fracHex++
+			i++
+		}
+	}
+	// value = bits * 2^e2
+	e2 := readExponentPart(s, &i, 'p') - 4*fracHex
+	first := 0
+	for first < len(bits) && bits[first] == 0 {
+		first++
+	}
+	if first == len(bits) {
+		return 0, new(big.Int), i, dtOK
+	}
+	bits = bits[first:]
+	n := int64(len(bits))
+	// the power of two of the leading bit, and of the lowest set bit
+	lead := n - 1 + e2
+	last := int64(len(bits) - 1)
+	for bits[last] == 0 {
+		last--
+	}
+	low := n - 1 - last + e2
+	// the leading 54 bits all ones: rounds up to the next power of two in 53-bit precision
+	roundsUp := len(bits) >= 54
+	for k := 0; roundsUp && k < 54; k++ {
+		roundsUp = bits[k] == 1
+	}
+	if lead > 1023 || (lead == 1023 && roundsUp) {
+		return 0, nil, 0, dtBadFormat
+	}
+	// ERANGE on underflow: below the normal range and not exact in the subnormal range
+	tiny := lead < -1022 && !(lead == -1023 && roundsUp)
+	if tiny && low < -1074 {
+		return 0, nil, 0, dtBadFormat
+	}
+	if lead >= 50 {
+		return 0, nil, 0, dtFieldOverflow
+	}
+	bitAt := func(pow int64) uint64 {
+		// the bit worth 2^pow
+		p := lead - pow
+		if p >= 0 && p < n {
+			return uint64(bits[p])
+		}
+		return 0
+	}
+	var ipart int64
+	for pow := lead; pow >= 0; pow-- {
+		ipart = ipart*2 + int64(bitAt(pow))
+	}
+	var f64bits uint64
+	for q := int64(1); q <= 64; q++ {
+		f64bits = f64bits<<1 | bitAt(-q)
+	}
+	if ipart > 1_000_000_000_000_000 || (ipart == 1_000_000_000_000_000 && f64bits > 0) {
+		return 0, nil, 0, dtFieldOverflow
+	}
+	// f64bits / 2^64 = f64bits * 5^25 / 2^39 / 10^25
+	frac := new(big.Int).SetUint64(f64bits)
+	frac.Mul(frac, big.NewInt(298_023_223_876_953_125))
+	frac.Rsh(frac, 39)
+	return ipart, frac, i, dtOK
+}
+
+// parseISO8601Number is PG's ParseISO8601Number: a strtod number at s[i:] (it must start with a
+// digit, `-`, or `.`) as (integer part, fraction, end), both parts carrying the sign.
+func parseISO8601Number(s string, i int) (int64, *big.Int, int, dtErr) {
+	at := func(k int) byte {
+		if k < len(s) {
+			return s[k]
+		}
+		return 0
+	}
+	c := at(i)
+	if !(isDigitByte(c) || c == '-' || c == '.') {
+		return 0, nil, 0, dtBadFormat
+	}
+	neg := c == '-'
+	j := i
+	if neg {
+		j++
+	}
+	// strtod's infinity / NaN spellings: a value out of range
+	word := func(w string) bool {
+		for k := 0; k < len(w); k++ {
+			if lowerByte(at(j+k)) != w[k] {
+				return false
+			}
+		}
+		return true
+	}
+	if word("inf") || word("nan") {
+		return 0, nil, 0, dtFieldOverflow
+	}
+	isHex := at(j) == '0' && lowerByte(at(j+1)) == 'x' &&
+		(isHexByte(at(j+2)) || (at(j+2) == '.' && isHexByte(at(j+3))))
+	var ipart int64
+	var frac *big.Int
+	var end int
+	var e dtErr
+	if isHex {
+		ipart, frac, end, e = scanHex(s, j+2)
+	} else {
+		ipart, frac, end, e = scanDecimal(s, j)
+	}
+	if e != dtOK {
+		return 0, nil, 0, e
+	}
+	if neg {
+		ipart = -ipart
+		frac.Neg(frac)
+	}
+	return ipart, frac, end, dtOK
+}
+
+// iso8601IntegerWidth is PG's ISO8601IntegerWidth: the integer digits of a number field, past a
+// leading `-`.
+func iso8601IntegerWidth(s string) int {
+	if len(s) > 0 && s[0] == '-' {
+		s = s[1:]
+	}
+	n := 0
+	for n < len(s) && isDigitByte(s[n]) {
+		n++
+	}
+	return n
+}
+
+// decodeISO8601Interval is PG's DecodeISO8601Interval: the ISO 8601 "format with designators"
+// (P1Y2M3DT4H5M6S, P2W, any field fractional or negative) and the "alternative format"
+// (P0001-02-03T04:05:06, basic P00010203T040506). The whole input, untrimmed, must be the value.
+func decodeISO8601Interval(s string, itm *itmIn) dtErr {
+	*itm = itmIn{}
+	if len(s) < 2 || s[0] != 'P' {
+		return dtBadFormat
+	}
+	at := func(k int) byte {
+		if k < len(s) {
+			return s[k]
+		}
+		return 0
+	}
+	// first runs Adjust steps in order, stopping at the first failure
+	first := func(steps ...func() dtErr) dtErr {
+		for _, st := range steps {
+			if e := st(); e != dtOK {
+				return e
+			}
+		}
+		return dtOK
+	}
+	i := 1
+	datepart := true
+	havefield := false
+	for i < len(s) {
+		if s[i] == 'T' {
+			// the start of the time part
+			datepart = false
+			havefield = false
+			i++
+			continue
+		}
+		fieldstart := i
+		val, fval, end, e := parseISO8601Number(s, i)
+		if e != dtOK {
+			return e
+		}
+		i = end
+		unit := at(i)
+		i++
+		if datepart {
+			switch unit {
+			case 'Y':
+				e = first(func() dtErr { return adjustYears(val, 1, itm) },
+					func() dtErr { return adjustFractYears(fval, 1, itm) })
+			case 'M':
+				e = first(func() dtErr { return adjustMonths(val, itm) },
+					func() dtErr { return adjustFractDays(fval, daysPerMonth, itm) })
+			case 'W':
+				e = first(func() dtErr { return adjustDays(val, 7, itm) },
+					func() dtErr { return adjustFractDays(fval, 7, itm) })
+			case 'D':
+				e = first(func() dtErr { return adjustDays(val, 1, itm) },
+					func() dtErr { return adjustFractMicros(fval, microsPerDay, itm) })
+			case 'T', 0, '-':
+				if unit != '-' && iso8601IntegerWidth(s[fieldstart:]) == 8 && !havefield {
+					// alternative format, basic: YYYYMMDD
+					if e = first(func() dtErr { return adjustYears(val/10000, 1, itm) },
+						func() dtErr { return adjustMonths((val/100)%100, itm) },
+						func() dtErr { return adjustDays(val%100, 1, itm) },
+						func() dtErr { return adjustFractMicros(fval, microsPerDay, itm) }); e != dtOK {
+						return e
+					}
+					if unit == 0 {
+						return dtOK
+					}
+					datepart = false
+					havefield = false
+					continue
+				}
+				// alternative format, extended: YYYY-MM-DD
+				if havefield {
+					return dtBadFormat
+				}
+				if e = first(func() dtErr { return adjustYears(val, 1, itm) },
+					func() dtErr { return adjustFractYears(fval, 1, itm) }); e != dtOK {
+					return e
+				}
+				if unit == 0 {
+					return dtOK
+				}
+				if unit == 'T' {
+					datepart = false
+					havefield = false
+					continue
+				}
+				val, fval, end, e = parseISO8601Number(s, i)
+				if e != dtOK {
+					return e
+				}
+				i = end
+				if e = first(func() dtErr { return adjustMonths(val, itm) },
+					func() dtErr { return adjustFractDays(fval, daysPerMonth, itm) }); e != dtOK {
+					return e
+				}
+				if i >= len(s) {
+					return dtOK
+				}
+				if s[i] == 'T' {
+					datepart = false
+					havefield = false
+					continue
+				}
+				if s[i] != '-' {
+					return dtBadFormat
+				}
+				i++
+				val, fval, end, e = parseISO8601Number(s, i)
+				if e != dtOK {
+					return e
+				}
+				i = end
+				if e = first(func() dtErr { return adjustDays(val, 1, itm) },
+					func() dtErr { return adjustFractMicros(fval, microsPerDay, itm) }); e != dtOK {
+					return e
+				}
+				if i >= len(s) {
+					return dtOK
+				}
+				if s[i] == 'T' {
+					datepart = false
+					havefield = false
+					continue
+				}
+				return dtBadFormat
+			default:
+				return dtBadFormat
+			}
+		} else {
+			switch unit {
+			case 'H':
+				e = adjustMicros(val, fval, usecsPerHour, itm)
+			case 'M':
+				e = adjustMicros(val, fval, usecsPerMinute, itm)
+			case 'S':
+				e = adjustMicros(val, fval, usecsPerSec, itm)
+			case 0, ':':
+				if unit == 0 && iso8601IntegerWidth(s[fieldstart:]) == 6 && !havefield {
+					// alternative format, basic: HHMMSS
+					zero := new(big.Int)
+					return first(func() dtErr { return adjustMicros(val/10000, zero, usecsPerHour, itm) },
+						func() dtErr { return adjustMicros((val/100)%100, zero, usecsPerMinute, itm) },
+						func() dtErr { return adjustMicros(val%100, zero, usecsPerSec, itm) },
+						func() dtErr { return adjustFractMicros(fval, 1, itm) })
+				}
+				// alternative format, extended: HH:MM:SS
+				if havefield {
+					return dtBadFormat
+				}
+				if e = adjustMicros(val, fval, usecsPerHour, itm); e != dtOK {
+					return e
+				}
+				if unit == 0 {
+					return dtOK
+				}
+				val, fval, end, e = parseISO8601Number(s, i)
+				if e != dtOK {
+					return e
+				}
+				i = end
+				if e = adjustMicros(val, fval, usecsPerMinute, itm); e != dtOK {
+					return e
+				}
+				if i >= len(s) {
+					return dtOK
+				}
+				if s[i] != ':' {
+					return dtBadFormat
+				}
+				i++
+				val, fval, end, e = parseISO8601Number(s, i)
+				if e != dtOK {
+					return e
+				}
+				i = end
+				if e = adjustMicros(val, fval, usecsPerSec, itm); e != dtOK {
+					return e
+				}
+				if i >= len(s) {
+					return dtOK
+				}
+				return dtBadFormat
+			default:
+				return dtBadFormat
+			}
+		}
+		if e != dtOK {
+			return e
+		}
+		havefield = true
+	}
+	return dtOK
+}
+
+// parseInterval parses interval text into the three-field value — PostgreSQL's interval_in
+// (spec/design/interval.md §3): the PostgreSQL / SQL-standard field syntax, else ISO 8601.
+// Malformed input is 22007; a field beyond its range is 22008 (PG's 22015).
+func parseInterval(input string) (Interval, error) {
+	var itm itmIn
+	infinite := false
+	fields, e := parseDateTime(input)
+	if e == dtOK {
+		infinite, e = decodeInterval(fields, &itm)
+	}
+	if e == dtBadFormat {
+		infinite = false
+		e = decodeISO8601Interval(input, &itm)
+	}
+	switch {
+	case e == dtBadFormat || (e == dtOK && infinite):
+		// (jed has no infinite interval, so `infinity` is not an interval value)
+		return Interval{}, invalidInterval(fmt.Sprintf("invalid input syntax for type interval: \"%s\"", input))
+	case e == dtFieldOverflow:
+		return Interval{}, intervalFieldOverflow(fmt.Sprintf("interval field value out of range: \"%s\"", input))
+	}
+	months := int64(itm.year)*monthsPerYear + int64(itm.mon)
+	m, ok := toInt32(months)
+	if !ok {
+		return Interval{}, intervalFieldOverflow("interval out of range")
+	}
+	return Interval{Months: m, Days: itm.mday, Micros: itm.usec}, nil
+}
+
+// neg64 negates an int64, ok=false for the one value with no negation.
 func neg64(a int64) (int64, bool) {
 	if a == -9223372036854775808 {
 		return 0, false
@@ -909,9 +1831,9 @@ func renderInterval(iv Interval) string {
 
 	if micros != 0 || isZero {
 		neg := micros < 0
-		a := micros
+		a := uint64(micros)
 		if neg {
-			a = -a // micros is never math.MinInt64 in a valid interval
+			a = uint64(-micros) // as uint64, so math.MinInt64 negates to 2^63
 		}
 		h := a / (3600 * microsPerSec) // unbounded hour (micros not justified into days)
 		mi := (a / (60 * microsPerSec)) % 60

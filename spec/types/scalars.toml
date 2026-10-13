@@ -298,13 +298,13 @@ encoding = { method = "int-be-signflip", width_bytes = 8 }
 # micros, compared as a signed 128-bit integer (PG `interval_cmp_value`). So `'1 mon'` ==
 # `'30 days'` == `'720:00:00'`, while each value still RENDERS its own fields. A value is written
 # as a single-quoted string in an interval context (literal adaptation, like timestamp) OR with
-# the `INTERVAL '...'` keyword literal (context-free): the "unit + time" input subset (units with
-# abbreviations, per-field signs, trailing `ago`, the fractional-unit cascade `1.5 days` ->
-# `1 day 12:00:00`, and a bare `HH:MM:SS[.ffffff]`). Malformed input traps 22007; an out-of-range
-# field 22008. ISO-8601 `P…`, the SQL-standard combined forms (`1-2`/`3 4:05:06`), field
-# qualifiers (`YEAR TO MONTH`), the `interval(p)` precision typmod, and CAST to/from interval are
-# all DEFERRED. KEYABLE: a valid PRIMARY KEY / ordered index / UNIQUE / FK target / GIN element via
-# interval-span-i128 (the 16-byte canonical span — ../design/encoding.md §2.10); span-equal values
+# the `INTERVAL '...'` keyword literal (context-free): PostgreSQL's interval input, ported from
+# interval_in (units with abbreviations, per-field signs, trailing `ago`, the fractional-unit
+# cascade `1.5 days` -> `1 day 12:00:00`, `HH:MM:SS[.ffffff]` times, the SQL-standard forms
+# `1-2` / `3 4:05:06`, and ISO 8601 `P1Y2M3DT4H5M6S` / `P0001-02-03T04:05:06`). Malformed input
+# traps 22007; an out-of-range field 22008. Field qualifiers (`YEAR TO MONTH`) and the
+# `interval(p)` precision typmod are DEFERRED. KEYABLE: a valid PRIMARY KEY / ordered index /
+# UNIQUE / FK target / GIN element via interval-span-i128 (the 16-byte canonical span — ../design/encoding.md §2.10); span-equal values
 # (`'1 mon'` / `'30 days'`) share a key, so a UNIQUE interval index treats them as one (the "equal
 # but not identical" wrinkle, the decimal 1.5/1.50 precedent). No bits/min/max/overflow/rank (not
 # the integer family); no collation; no width_bytes (the value body is multi-field; the KEY is the

@@ -3,9 +3,8 @@
 //! A value is PostgreSQL's three independent fields: `months` (i32), `days` (i32), and
 //! `micros` (i64). They are kept separate so `+ 1 month` is calendar-aware (and distinct from
 //! `+ 30 days`); comparison/ordering/dedup collapse them via the canonical 128-bit **span**
-//! (1 month = 30 days, 1 day = 24 h). Parsing accepts the "unit + time" subset (units with
-//! abbreviations, per-field signs, trailing `ago`, the fractional-unit cascade, and a bare
-//! `HH:MM:SS[.ffffff]` time); ISO-8601 `P…` and the SQL-standard combined forms are deferred.
+//! (1 month = 30 days, 1 day = 24 h). Parsing is a port of PostgreSQL's `interval_in` — its unit
+//! syntax, the SQL-standard forms (`'1-2'`, `'1 1:00'`), and ISO 8601 (`'P1Y2M3DT4H5M6S'`).
 //!
 //! This is a §8 determinism hotspot: the fractional-unit cascade, the µs rounding (half away
 //! from zero — the engine's one mode), and the render format must be byte-identical across the
@@ -129,6 +128,11 @@ fn igcd(mut a: i128, mut b: i128) -> i128 {
     }
     a
 }
+
+/// The maximum integer and fractional digits of an `interval × / number` factor — bounds chosen so
+/// the exact i128 cascade math cannot overflow (and Go big.Int / TS BigInt agree).
+const MAX_INT_DIGITS: usize = 18;
+const MAX_FRAC_DIGITS: usize = 9;
 
 /// Parse a canonical decimal string `[-]int[.frac]` into an exact fraction `(num, den)` with
 /// `den = 10^len(frac) > 0` (the value = num/den). Caps the digit counts so the i128 cascade
@@ -441,55 +445,8 @@ pub fn make_interval(
     })
 }
 
-/// An ASCII-whitespace byte — the fixed set separating/trimming interval tokens (not
-/// locale/Unicode-dependent, identical across cores).
-fn is_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r')
-}
-
-/// An accumulator building the three fields exactly. The fractional part of each unit token
-/// cascades down (months→days→micros) using exact integer math (a numerator/denominator), with
-/// the µs result rounded half away from zero. Field overflow traps 22008.
-struct Acc {
-    months: i64,
-    days: i64,
-    micros: i64,
-}
-
-impl Acc {
-    fn new() -> Acc {
-        Acc {
-            months: 0,
-            days: 0,
-            micros: 0,
-        }
-    }
-
-    fn add_months(&mut self, m: i64) -> Result<()> {
-        self.months = self
-            .months
-            .checked_add(m)
-            .ok_or_else(|| field_overflow("interval out of range"))?;
-        Ok(())
-    }
-    fn add_days(&mut self, d: i64) -> Result<()> {
-        self.days = self
-            .days
-            .checked_add(d)
-            .ok_or_else(|| field_overflow("interval out of range"))?;
-        Ok(())
-    }
-    fn add_micros(&mut self, u: i64) -> Result<()> {
-        self.micros = self
-            .micros
-            .checked_add(u)
-            .ok_or_else(|| field_overflow("interval out of range"))?;
-        Ok(())
-    }
-}
-
 /// Round `num / den` to the nearest integer, half away from zero (the engine's one rounding mode
-/// — spec/design/decimal.md §3). `den > 0`. Used for the bottom-of-cascade µs result.
+/// — spec/design/decimal.md §3). `den > 0`.
 fn round_div(num: i128, den: i128) -> i128 {
     let q = num / den;
     let r = num - q * den;
@@ -501,71 +458,70 @@ fn round_div(num: i128, den: i128) -> i128 {
     }
 }
 
-/// Add `value = sign * whole.frac` of a unit to the accumulator, where the unit is measured in
-/// `months_per`, `days_per`, or `micros_per` of one base field (exactly one is nonzero). The
-/// integer part lands in that field; the fractional part cascades to the next-lower fields using
-/// 1 month = 30 days and 1 day = 24 h (spec/design/interval.md §3). All exact integer math.
-fn apply_unit(
-    acc: &mut Acc,
-    neg: bool,
-    int_part: i128,
-    frac_num: i128,
-    frac_den: i128, // a power of ten > 0; the fraction is frac_num/frac_den, 0 <= frac_num < frac_den
-    // The unit's cascade weights (months_per, days_per, micros_per) — exactly one is nonzero.
-    per: (i128, i128, i128),
-) -> Result<()> {
-    let (months_per, days_per, micros_per) = per;
-    // The exact value of the token as a fraction N/D (signed).
-    let sign = if neg { -1i128 } else { 1 };
-    let n = sign * (int_part * frac_den + frac_num);
-    let d = frac_den;
+// The interval text parser is a port of PostgreSQL 18's `interval_in` (datetime.c): the input is
+// broken into fields (`ParseDateTime`), the fields are read right to left (`DecodeInterval`), and
+// only if that finds the input malformed is it read as ISO 8601 (`DecodeISO8601Interval`). The one
+// numeric difference (spec/design/interval.md §3): PG carries a field's fraction in a `double`;
+// jed carries it exactly, as a signed numerator over 10^25 (`FRAC_DEN`), and rounds the µs half
+// away from zero (the engine's one mode).
 
-    let mut months = 0i128;
-    let mut days = 0i128;
-    // Exact micros numerator (over d) accumulated from every cascade level, rounded once at the end.
-    let mut micros_num = 0i128;
-
-    if months_per != 0 {
-        let total = n * months_per; // months * d
-        months = total / d; // trunc toward zero
-        let rem = total - months * d; // remaining fractional months * d
-        let day_total = rem * DAYS_PER_MONTH as i128; // days * d
-        let whole_days = day_total / d;
-        days += whole_days;
-        let rem_days = day_total - whole_days * d;
-        micros_num += rem_days * MICROS_PER_DAY as i128;
-    }
-    if days_per != 0 {
-        let total = n * days_per; // days * d
-        let whole_days = total / d;
-        days += whole_days;
-        let rem_days = total - whole_days * d;
-        micros_num += rem_days * MICROS_PER_DAY as i128;
-    }
-    if micros_per != 0 {
-        micros_num += n * micros_per; // micros * d
-    }
-
-    if months != 0 {
-        acc.add_months(
-            i64::try_from(months).map_err(|_| field_overflow("interval out of range"))?,
-        )?;
-    }
-    if days != 0 {
-        acc.add_days(i64::try_from(days).map_err(|_| field_overflow("interval out of range"))?)?;
-    }
-    if micros_num != 0 {
-        let u = round_div(micros_num, d);
-        acc.add_micros(i64::try_from(u).map_err(|_| field_overflow("interval out of range"))?)?;
-    }
-    Ok(())
+/// PostgreSQL's two datetime-decode failures: `DTERR_BAD_FORMAT` (22007) and
+/// `DTERR_FIELD_OVERFLOW` (PG's 22015; jed's datetime field overflow 22008).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DtErr {
+    BadFormat,
+    FieldOverflow,
 }
 
-// The per-field masks of PostgreSQL's `DecodeInterval` (spec/design/interval.md §3): each unit
-// sets its own bit, so an input that names the same field twice is rejected (22007). `week` and
-// `day` are DIFFERENT fields (`'1 week 1 day'` is valid), as are `year`/`decade`/`century`/
-// `millennium` and `second`/`millisecond`/`microsecond`. A bare `HH:MM[:SS]` time claims the whole
-// time-of-day group, and a seconds value with a nonzero fraction claims all three seconds bits.
+type Dt<T> = std::result::Result<T, DtErr>;
+
+/// A fraction's denominator: a field's fractional part is `numerator / 10^25`, its digits past the
+/// 25th dropped (far below a microsecond for every unit).
+const FRAC_DIGITS: usize = 25;
+const FRAC_DEN: i128 = 10_000_000_000_000_000_000_000_000;
+
+const USECS_PER_SEC: i64 = MICROS_PER_SEC;
+const USECS_PER_MINUTE: i64 = 60 * USECS_PER_SEC;
+const USECS_PER_HOUR: i64 = 3600 * USECS_PER_SEC;
+
+/// PG's `struct pg_itm_in`: the fields an interval is assembled from. Years stay apart from months
+/// until the end (`itmin2interval`).
+#[derive(Default)]
+struct ItmIn {
+    usec: i64,
+    mday: i32,
+    mon: i32,
+    year: i32,
+}
+
+// PG's `DTK_*` unit codes — the values `DecodeInterval`'s `type` carries between fields.
+const DTK_NUMBER: i32 = 0; // the `type` after `ago`: no number may precede it
+const DTK_TZ: i32 = 4;
+const DTK_EARLY: i32 = 9;
+const DTK_LATE: i32 = 10;
+const IGNORE_DTF: i32 = 8; // the initial `type`: the rightmost unitless number is seconds
+const DTK_SECOND: i32 = 18;
+const DTK_MINUTE: i32 = 19;
+const DTK_HOUR: i32 = 20;
+const DTK_DAY: i32 = 21;
+const DTK_WEEK: i32 = 22;
+const DTK_MONTH: i32 = 23;
+const DTK_QUARTER: i32 = 24;
+const DTK_YEAR: i32 = 25;
+const DTK_DECADE: i32 = 26;
+const DTK_CENTURY: i32 = 27;
+const DTK_MILLENNIUM: i32 = 28;
+const DTK_MILLISEC: i32 = 29;
+const DTK_MICROSEC: i32 = 30;
+const DTK_JULIAN: i32 = 31;
+const DTK_DOW: i32 = 32;
+const DTK_DOY: i32 = 33;
+const DTK_ISOYEAR: i32 = 36;
+const DTK_ISODOW: i32 = 37;
+
+// The per-field masks of `DecodeInterval` (PG `DTK_M`): each field claims its bits, and a field
+// whose bits overlap an already-read field's is a duplicate (22007). `week` and `day` are DIFFERENT
+// fields, as are `year`/`decade`/`century`/`millennium` and `second`/`millisecond`/`microsecond`.
 const FIELD_MONTH: u32 = 1 << 1;
 const FIELD_YEAR: u32 = 1 << 2;
 const FIELD_DAY: u32 = 1 << 3;
@@ -580,190 +536,362 @@ const FIELD_CENTURY: u32 = 1 << 26;
 const FIELD_MILLENNIUM: u32 = 1 << 27;
 /// Seconds with a fractional part (PG `DTK_ALL_SECS_M`).
 const FIELD_ALL_SECS: u32 = FIELD_SECOND | FIELD_MILLISECOND | FIELD_MICROSECOND;
-/// A bare `HH:MM[:SS[.ffffff]]` time (PG `DTK_TIME_M`).
+/// A time `HH:MM[:SS[.ffffff]]` (PG `DTK_TIME_M`).
 const FIELD_TIME: u32 = FIELD_HOUR | FIELD_MINUTE | FIELD_ALL_SECS;
+/// PG `DTK_DATE_M`.
+const FIELD_DATE: u32 = FIELD_YEAR | FIELD_MONTH | FIELD_DAY;
 
-/// The field mask a seconds value claims: a nonzero fraction also claims the millisecond and
-/// microsecond fields (PG: `'1.5 sec 1 ms'` is a duplicate, `'1 sec 1 ms'` / `'1.0 sec 1 ms'` are not).
-fn seconds_mask(frac_num: i128) -> u32 {
-    if frac_num == 0 {
-        FIELD_SECOND
-    } else {
-        FIELD_ALL_SECS
-    }
+/// PG's `MAXDATEFIELDS` and `interval_in`'s 256-byte field buffer: more fields, or more field
+/// text, is malformed.
+const MAX_DATE_FIELDS: usize = 25;
+const FIELD_BUF_LEN: usize = 256;
+
+/// `isspace` in the C locale.
+fn is_pg_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
 }
 
-/// The cascade weights (`months_per`, `days_per`, `micros_per`) and the field mask for a unit word
-/// (case-insensitive), or None for an unrecognized unit. Exactly one weight is nonzero. The "unit +
-/// time" subset (spec/design/interval.md §3); ambiguous bare `m` is intentionally not accepted.
-fn unit_weights(unit: &str) -> Option<((i128, i128, i128), u32)> {
-    let u = unit.to_ascii_lowercase();
-    Some(match u.as_str() {
-        "millennium" | "millennia" | "mil" | "mils" => (
-            (12000 * MONTHS_PER_YEAR as i128 / 12, 0, 0),
-            FIELD_MILLENNIUM,
-        ),
-        "century" | "centuries" | "cent" | "c" => ((1200, 0, 0), FIELD_CENTURY),
-        "decade" | "decades" | "dec" | "decs" => ((120, 0, 0), FIELD_DECADE),
-        "year" | "years" | "yr" | "yrs" | "y" => ((MONTHS_PER_YEAR as i128, 0, 0), FIELD_YEAR),
-        "month" | "months" | "mon" | "mons" => ((1, 0, 0), FIELD_MONTH),
-        "week" | "weeks" | "w" => ((0, 7, 0), FIELD_WEEK),
-        "day" | "days" | "d" => ((0, 1, 0), FIELD_DAY),
-        "hour" | "hours" | "hr" | "hrs" | "h" => {
-            ((0, 0, 3600 * MICROS_PER_SEC as i128), FIELD_HOUR)
+/// The kind of one field (`ParseDateTime`'s `ftype`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FieldType {
+    /// digits, possibly with one `.` fraction (`5`, `1.5`, `.5`)
+    Number,
+    /// a lowercased word (`day`, `ago`)
+    String,
+    /// digits with `-` / `/` / `.` separators, or a word run into digits (`1-2`, `5.`, `p1d`)
+    Date,
+    /// digits then `:` (`1:00:00.5`)
+    Time,
+    /// a sign then digits, `:`, `.`, `-` (`-1`, `+02:03`, `-1-2`)
+    Tz,
+    /// a sign then a word (`-infinity`)
+    Special,
+}
+
+struct Field {
+    ftype: FieldType,
+    text: Vec<u8>,
+}
+
+/// PostgreSQL's `ParseDateTime`, as `interval_in` uses it: split the input into fields. Whitespace
+/// separates fields; any other punctuation starting a field is a separator too; text is lowercased.
+fn parse_date_time(input: &[u8]) -> Dt<Vec<Field>> {
+    let at = |k: usize| -> u8 { input.get(k).copied().unwrap_or(0) };
+    let mut fields: Vec<Field> = Vec::new();
+    // Bytes of PG's field buffer used by the finished fields (each field's text plus its NUL).
+    let mut buf_used = 0usize;
+    let mut i = 0usize;
+    while i < input.len() {
+        let c = input[i];
+        if is_pg_space(c) {
+            i += 1;
+            continue;
         }
-        "minute" | "minutes" | "min" | "mins" => {
-            ((0, 0, 60 * MICROS_PER_SEC as i128), FIELD_MINUTE)
+        if fields.len() >= MAX_DATE_FIELDS {
+            return Err(DtErr::BadFormat);
         }
-        "second" | "seconds" | "sec" | "secs" | "s" => {
-            ((0, 0, MICROS_PER_SEC as i128), FIELD_SECOND)
+        let mut text: Vec<u8> = Vec::new();
+        // PG's APPEND_CHAR: the buffer must keep room for the field's terminating NUL.
+        let push = |text: &mut Vec<u8>, ch: u8| -> Dt<()> {
+            if buf_used + text.len() + 1 >= FIELD_BUF_LEN {
+                return Err(DtErr::BadFormat);
+            }
+            text.push(ch);
+            Ok(())
+        };
+        let ftype;
+        if c.is_ascii_digit() {
+            while at(i).is_ascii_digit() {
+                push(&mut text, at(i))?;
+                i += 1;
+            }
+            if at(i) == b':' {
+                // a time field
+                ftype = FieldType::Time;
+                push(&mut text, b':')?;
+                i += 1;
+                while at(i).is_ascii_digit() || at(i) == b':' || at(i) == b'.' {
+                    push(&mut text, at(i))?;
+                    i += 1;
+                }
+            } else if at(i) == b'-' || at(i) == b'/' || at(i) == b'.' {
+                // a date field (or a number with a fraction)
+                let delim = at(i);
+                push(&mut text, delim)?;
+                i += 1;
+                if at(i).is_ascii_digit() {
+                    let mut t = if delim == b'.' {
+                        FieldType::Number
+                    } else {
+                        FieldType::Date
+                    };
+                    while at(i).is_ascii_digit() {
+                        push(&mut text, at(i))?;
+                        i += 1;
+                    }
+                    // a second matching delimiter makes a three-field date
+                    if at(i) == delim {
+                        t = FieldType::Date;
+                        push(&mut text, delim)?;
+                        i += 1;
+                        while at(i).is_ascii_digit() || at(i) == delim {
+                            push(&mut text, at(i))?;
+                            i += 1;
+                        }
+                    }
+                    ftype = t;
+                } else {
+                    ftype = FieldType::Date;
+                    while at(i).is_ascii_alphanumeric() || at(i) == delim {
+                        push(&mut text, at(i).to_ascii_lowercase())?;
+                        i += 1;
+                    }
+                }
+            } else {
+                ftype = FieldType::Number;
+            }
+        } else if c == b'.' {
+            // a leading decimal point: fractional seconds
+            push(&mut text, b'.')?;
+            i += 1;
+            while at(i).is_ascii_digit() {
+                push(&mut text, at(i))?;
+                i += 1;
+            }
+            ftype = FieldType::Number;
+        } else if c.is_ascii_alphabetic() {
+            let mut t = FieldType::String;
+            while at(i).is_ascii_alphabetic() {
+                push(&mut text, at(i).to_ascii_lowercase())?;
+                i += 1;
+            }
+            // A word may run into a date or zone name — unless it is a known date keyword.
+            let is_date = if at(i) == b'-' || at(i) == b'/' || at(i) == b'.' {
+                true
+            } else if at(i) == b'+' || at(i).is_ascii_digit() {
+                !is_date_keyword(&text)
+            } else {
+                false
+            };
+            if is_date {
+                t = FieldType::Date;
+                loop {
+                    push(&mut text, at(i).to_ascii_lowercase())?;
+                    i += 1;
+                    let n = at(i);
+                    if !(matches!(n, b'+' | b'-' | b'/' | b'_' | b'.' | b':')
+                        || n.is_ascii_alphanumeric())
+                    {
+                        break;
+                    }
+                }
+            }
+            ftype = t;
+        } else if c == b'+' || c == b'-' {
+            push(&mut text, c)?;
+            i += 1;
+            // whitespace after the sign is skipped
+            while is_pg_space(at(i)) {
+                i += 1;
+            }
+            if at(i).is_ascii_digit() {
+                ftype = FieldType::Tz;
+                push(&mut text, at(i))?;
+                i += 1;
+                while at(i).is_ascii_digit() || at(i) == b':' || at(i) == b'.' || at(i) == b'-' {
+                    push(&mut text, at(i))?;
+                    i += 1;
+                }
+            } else if at(i).is_ascii_alphabetic() {
+                ftype = FieldType::Special;
+                while at(i).is_ascii_alphabetic() {
+                    push(&mut text, at(i).to_ascii_lowercase())?;
+                    i += 1;
+                }
+            } else {
+                return Err(DtErr::BadFormat);
+            }
+        } else if c.is_ascii_punctuation() {
+            // other punctuation only separates fields
+            i += 1;
+            continue;
+        } else {
+            return Err(DtErr::BadFormat);
         }
-        "millisecond" | "milliseconds" | "msec" | "msecs" | "ms" => {
-            ((0, 0, 1000), FIELD_MILLISECOND)
+        buf_used += text.len() + 1;
+        fields.push(Field { ftype, text });
+    }
+    Ok(fields)
+}
+
+/// Whether a word is in PG's date keyword table (`datetktbl`) — the test that keeps a keyword
+/// followed by a digit (`h2`) from being read as a run-on zone name.
+fn is_date_keyword(w: &[u8]) -> bool {
+    date_keyword(w).is_some()
+}
+
+/// What a word means to `DecodeInterval`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Word {
+    /// skipped (`at`, `on`)
+    Ignore,
+    /// a unit: the `DTK_*` code it gives the number to its left
+    Units(i32),
+    /// `ago`
+    Ago,
+    /// a reserved word (`infinity`, `epoch`, …): the `DTK_*` code
+    Reserv(i32),
+    /// a date keyword with no meaning in an interval (a month or weekday name, `am`, …)
+    Other,
+}
+
+/// PG's interval unit table (`deltatktbl`), then its date keyword table (`datetktbl`) — the lookup
+/// `DecodeUnits` then `DecodeSpecial` do. None is an unknown word. PG compares at most 10
+/// characters, so any word starting with a 10-letter entry (`millennium`, `microsecon`,
+/// `millisecon`) is that unit. jed's one difference: a bare `m` (PG's minute) is ambiguous with
+/// month and is rejected.
+fn interval_word(w: &[u8]) -> Option<Word> {
+    if w == b"m" {
+        return None;
+    }
+    if w.starts_with(b"millennium") {
+        return Some(Word::Units(DTK_MILLENNIUM));
+    }
+    if w.starts_with(b"microsecon") {
+        return Some(Word::Units(DTK_MICROSEC));
+    }
+    if w.starts_with(b"millisecon") {
+        return Some(Word::Units(DTK_MILLISEC));
+    }
+    let unit = match w {
+        b"ago" => return Some(Word::Ago),
+        b"c" | b"cent" | b"centuries" | b"century" => DTK_CENTURY,
+        b"d" | b"day" | b"days" => DTK_DAY,
+        b"dec" | b"decade" | b"decades" | b"decs" => DTK_DECADE,
+        b"h" | b"hour" | b"hours" | b"hr" | b"hrs" => DTK_HOUR,
+        b"mil" | b"millennia" | b"millennium" | b"mils" => DTK_MILLENNIUM,
+        b"min" | b"mins" | b"minute" | b"minutes" => DTK_MINUTE,
+        b"mon" | b"mons" | b"month" | b"months" => DTK_MONTH,
+        b"ms" | b"msec" | b"msecond" | b"mseconds" | b"msecs" => DTK_MILLISEC,
+        b"qtr" | b"quarter" => DTK_QUARTER,
+        b"s" | b"sec" | b"second" | b"seconds" | b"secs" => DTK_SECOND,
+        b"timezone" => DTK_TZ,
+        b"us" | b"usec" | b"usecond" | b"useconds" | b"usecs" => DTK_MICROSEC,
+        b"w" | b"week" | b"weeks" => DTK_WEEK,
+        b"y" | b"year" | b"years" | b"yr" | b"yrs" => DTK_YEAR,
+        _ => return date_keyword(w),
+    };
+    Some(Word::Units(unit))
+}
+
+/// PG's date keyword table (`datetktbl`), as an interval reads it.
+fn date_keyword(w: &[u8]) -> Option<Word> {
+    Some(match w {
+        b"at" | b"on" => Word::Ignore,
+        b"infinity" | b"+infinity" => Word::Reserv(DTK_LATE),
+        b"-infinity" => Word::Reserv(DTK_EARLY),
+        b"allballs" | b"epoch" | b"now" | b"today" | b"tomorrow" | b"yesterday" => {
+            Word::Reserv(DTK_NUMBER)
         }
-        "microsecond" | "microseconds" | "usec" | "usecs" | "us" => ((0, 0, 1), FIELD_MICROSECOND),
+        b"d" => Word::Units(DTK_DAY),
+        b"dow" => Word::Units(DTK_DOW),
+        b"doy" => Word::Units(DTK_DOY),
+        b"h" => Word::Units(DTK_HOUR),
+        b"isodow" => Word::Units(DTK_ISODOW),
+        b"isoyear" => Word::Units(DTK_ISOYEAR),
+        b"j" | b"jd" | b"julian" => Word::Units(DTK_JULIAN),
+        b"m" => Word::Units(DTK_MONTH),
+        b"mm" => Word::Units(DTK_MINUTE),
+        b"s" => Word::Units(DTK_SECOND),
+        b"y" => Word::Units(DTK_YEAR),
+        b"ad" | b"am" | b"apr" | b"april" | b"aug" | b"august" | b"bc" | b"dec" | b"december"
+        | b"dst" | b"feb" | b"february" | b"fri" | b"friday" | b"jan" | b"january" | b"jul"
+        | b"july" | b"jun" | b"june" | b"mar" | b"march" | b"may" | b"mon" | b"monday" | b"nov"
+        | b"november" | b"oct" | b"october" | b"pm" | b"sat" | b"saturday" | b"sep" | b"sept"
+        | b"september" | b"sun" | b"sunday" | b"t" | b"thu" | b"thur" | b"thurs" | b"thursday"
+        | b"tue" | b"tues" | b"tuesday" | b"wed" | b"wednesday" | b"weds" => Word::Other,
         _ => return None,
     })
 }
 
-/// One parsed field: its mask and the exact amount it added to each of the three accumulators.
-struct FieldPart {
-    mask: u32,
-    months: i64,
-    days: i64,
-    micros: i64,
-}
-
-/// PostgreSQL's duplicate-field rule (spec/design/interval.md §3). PG's `DecodeInterval` reads the
-/// fields right to left, adding each into its running fields (an `i32` month/day or `i64` µs
-/// overflow is an out-of-range error) and THEN rejecting it as a duplicate if its mask overlaps the
-/// fields already read. jed parses left to right, so it replays that order here over the recorded
-/// fields: a duplicate traps 22007, unless the running total from the right end through the
-/// duplicate already overflowed, in which case PG would have stopped there first (22008).
-fn check_duplicate_fields(input: &str, fields: &[FieldPart]) -> Result<()> {
-    let mut seen: u32 = 0;
-    let (mut months, mut days, mut micros) = (0i64, 0i64, 0i64);
-    let mut overflowed = false;
-    for f in fields.iter().rev() {
-        if !overflowed {
-            match (
-                months.checked_add(f.months),
-                days.checked_add(f.days),
-                micros.checked_add(f.micros),
-            ) {
-                (Some(m), Some(d), Some(u))
-                    if i32::try_from(m).is_ok() && i32::try_from(d).is_ok() =>
-                {
-                    (months, days, micros) = (m, d, u);
-                }
-                _ => overflowed = true,
-            }
+/// C `strtol` (base 10) as PG's `strtoi64` uses it on a field: an optional sign then digits.
+/// Returns the value and the bytes consumed — 0 consumed (value 0) when there are no digits. A
+/// value beyond `i64` is `ERANGE`, a field overflow.
+fn strtoi64(s: &[u8]) -> Dt<(i64, usize)> {
+    let mut i = 0;
+    let neg = match s.first() {
+        Some(b'-') => {
+            i = 1;
+            true
         }
-        if f.mask & seen != 0 {
-            if overflowed {
-                return Err(field_overflow("interval out of range"));
-            }
-            return Err(invalid_format(format!(
-                "invalid input syntax for type interval: \"{input}\""
-            )));
+        Some(b'+') => {
+            i = 1;
+            false
         }
-        seen |= f.mask;
-    }
-    Ok(())
-}
-
-struct Cursor<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn skip_ws(&mut self) {
-        while self.i < self.b.len() && is_ws(self.b[self.i]) {
-            self.i += 1;
-        }
-    }
-    fn done(&self) -> bool {
-        self.i >= self.b.len()
-    }
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-}
-
-/// The maximum integer digits in one numeric token, and the maximum fractional digits — bounds
-/// chosen so the exact i128 cascade math cannot overflow (and Go big.Int / TS BigInt agree). An
-/// over-long run traps 22008. Far beyond any real interval.
-const MAX_INT_DIGITS: usize = 18;
-const MAX_FRAC_DIGITS: usize = 9;
-
-/// Read a run of ASCII digits as an i128. Empty run → Ok(None) (caller raises 22007); more than
-/// `MAX_INT_DIGITS` digits → Err(22008).
-fn read_digits(c: &mut Cursor) -> Result<Option<i128>> {
-    let start = c.i;
+        _ => false,
+    };
+    let start = i;
     let mut v: i128 = 0;
-    while c.i < c.b.len() && c.b[c.i].is_ascii_digit() {
-        v = v * 10 + (c.b[c.i] - b'0') as i128;
-        c.i += 1;
-    }
-    if c.i == start {
-        return Ok(None);
-    }
-    if c.i - start > MAX_INT_DIGITS {
-        return Err(field_overflow("interval field has too many digits"));
-    }
-    Ok(Some(v))
-}
-
-/// Parse the time fields after an integer hour and a `:` — `MM[:SS[.ffffff]]` — adding their
-/// micros to `acc` with the given sign. `hour` is the already-read integer hour (unbounded; PG
-/// allows `100:00:00`). Sub-µs digits round half away from zero (like timestamp).
-fn parse_time(acc: &mut Acc, c: &mut Cursor, neg: bool, hour: i128) -> Result<()> {
-    // ':' already at cursor.
-    c.i += 1; // consume ':'
-    let minute = read_digits(c)?.ok_or_else(|| invalid_format("expected minutes"))?;
-    let mut second: i128 = 0;
-    let mut frac_us: i128 = 0;
-    if c.peek() == Some(b':') {
-        c.i += 1;
-        second = read_digits(c)?.ok_or_else(|| invalid_format("expected seconds"))?;
-        if c.peek() == Some(b'.') {
-            c.i += 1;
-            frac_us = read_frac_us(c)?;
+    let mut overflow = false;
+    while i < s.len() && s[i].is_ascii_digit() {
+        if !overflow {
+            v = v * 10 + (s[i] - b'0') as i128;
+            if v > i64::MAX as i128 + 1 {
+                overflow = true;
+            }
         }
+        i += 1;
     }
-    // Compose the time as exact µs and add with the sign.
-    let total_us = hour
-        .checked_mul(3600 * MICROS_PER_SEC as i128)
-        .and_then(|h| {
-            minute
-                .checked_mul(60 * MICROS_PER_SEC as i128)
-                .map(|m| h + m)
-        })
-        .and_then(|hm| second.checked_mul(MICROS_PER_SEC as i128).map(|s| hm + s))
-        .map(|hms| hms + frac_us)
-        .ok_or_else(|| field_overflow("interval out of range"))?;
-    let signed = if neg { -total_us } else { total_us };
-    acc.add_micros(i64::try_from(signed).map_err(|_| field_overflow("interval out of range"))?)
+    if i == start {
+        return Ok((0, 0));
+    }
+    let v = if neg { -v } else { v };
+    if overflow || v > i64::MAX as i128 || v < i64::MIN as i128 {
+        return Err(DtErr::FieldOverflow);
+    }
+    Ok((v as i64, i))
 }
 
-/// Read the fractional-seconds digits after `.` into microseconds (0..=1_000_000), 0–6 digits
-/// exact, 7+ rounded half away from zero — identical to the timestamp module's rule.
-fn read_frac_us(c: &mut Cursor) -> Result<i128> {
-    let start = c.i;
-    while c.i < c.b.len() && c.b[c.i].is_ascii_digit() {
-        c.i += 1;
+/// PG's `strtoint`: `strtol` limited to `i32` (beyond it is `ERANGE`, a field overflow).
+fn strtoint(s: &[u8]) -> Dt<(i32, usize)> {
+    let (v, n) = strtoi64(s)?;
+    let v = i32::try_from(v).map_err(|_| DtErr::FieldOverflow)?;
+    Ok((v, n))
+}
+
+/// The first `FRAC_DIGITS` of a digit run as a fraction numerator over `FRAC_DEN`. A fraction
+/// whose nonzero digits all lie past the 25th stays nonzero (numerator 1) — too small to move any
+/// field, but still "a fraction" (it decides whether seconds claim the sub-second fields).
+fn frac_from_digits(digits: &[u8]) -> i128 {
+    let mut num: i128 = 0;
+    for k in 0..FRAC_DIGITS {
+        num = num * 10 + digits.get(k).map_or(0, |d| (d - b'0') as i128);
     }
-    let digits = &c.b[start..c.i];
-    if digits.is_empty() {
-        return Err(invalid_format("expected fractional digits after '.'"));
+    if num == 0 && digits.iter().any(|&d| d != b'0') {
+        return 1;
     }
-    let mut us: i128 = 0;
+    num
+}
+
+/// PG's `ParseFraction`: `s` is `.` then digits (or nothing) and nothing else.
+fn parse_fraction(s: &[u8]) -> Dt<i128> {
+    let digits = &s[1..];
+    if !digits.iter().all(|d| d.is_ascii_digit()) {
+        return Err(DtErr::BadFormat);
+    }
+    Ok(frac_from_digits(digits))
+}
+
+/// `ParseFractionalSecond`: a `.digits` fraction of a second to whole µs — 0–6 digits exact, 7+
+/// rounded half away from zero on the 7th digit (jed's one mode; PG rounds a `double` half to even).
+fn parse_fractional_second(s: &[u8]) -> Dt<i64> {
+    let digits = &s[1..];
+    if !digits.iter().all(|d| d.is_ascii_digit()) {
+        return Err(DtErr::BadFormat);
+    }
+    let mut us: i64 = 0;
     for k in 0..6 {
-        us *= 10;
-        if k < digits.len() {
-            us += (digits[k] - b'0') as i128;
-        }
+        us = us * 10 + digits.get(k).map_or(0, |d| (d - b'0') as i64);
     }
     if digits.len() > 6 && digits[6] >= b'5' {
         us += 1;
@@ -771,181 +899,722 @@ fn read_frac_us(c: &mut Cursor) -> Result<i128> {
     Ok(us)
 }
 
-/// Parse an interval literal (the "unit + time" subset) into the three-field value. Errors:
-/// malformed syntax → 22007; a field beyond the representable range → 22008. Parsing happens at
-/// resolve time, before any scan, so a bad literal traps deterministically (like timestamp/bytea).
-pub fn parse_interval(input: &str) -> Result<Interval> {
-    let trimmed = input.trim_matches(|ch: char| ch.is_ascii_whitespace());
-    let b = trimmed.as_bytes();
-    let mut c = Cursor { b, i: 0 };
-    let mut acc = Acc::new();
+// --- the Adjust* helpers of datetime.c: add a scaled value into the fields, failing on overflow ---
 
-    c.skip_ws();
-    // An optional leading `@` (PG's verbose lead-in) is accepted and ignored.
-    if c.peek() == Some(b'@') {
-        c.i += 1;
-        c.skip_ws();
+/// `AdjustFractMicroseconds`: `frac * scale` µs, rounded half away from zero.
+fn adjust_fract_micros(frac: i128, scale: i64, itm: &mut ItmIn) -> Dt<()> {
+    if frac == 0 {
+        return Ok(());
     }
-    if c.done() {
-        return Err(invalid_format("empty interval"));
-    }
-
-    let mut ago = false;
-    // Every field read, in input order — for PG's duplicate-field rule, checked once the input is
-    // fully read (check_duplicate_fields).
-    let mut fields: Vec<FieldPart> = Vec::new();
-    // Whether whitespace followed the previous field. Fields must be whitespace-separated, so
-    // run-together input such as the SQL-standard `'1-2'` (deferred, §3) fails closed rather than
-    // being read as two adjacent fields.
-    let mut separated = true;
-    while !c.done() {
-        // Trailing `ago` negates the whole interval; nothing may follow it.
-        if let Some(word) = peek_word(&c)
-            && word.eq_ignore_ascii_case("ago")
-        {
-            c.i += word.len();
-            ago = true;
-            c.skip_ws();
-            break;
-        }
-        if !separated {
-            return Err(invalid_format(
-                "interval fields must be separated by whitespace",
-            ));
-        }
-
-        // Optional per-segment sign.
-        let mut neg = false;
-        match c.peek() {
-            Some(b'-') => {
-                neg = true;
-                c.i += 1;
-            }
-            Some(b'+') => {
-                c.i += 1;
-            }
-            _ => {}
-        }
-        let int_part = read_digits(&mut c)?.ok_or_else(|| invalid_format("expected a number"))?;
-
-        let (before_months, before_days, before_micros) = (acc.months, acc.days, acc.micros);
-        let mask;
-        if c.peek() == Some(b':') {
-            // A bare time: this integer is the hour. (No fractional hour before `:`.)
-            parse_time(&mut acc, &mut c, neg, int_part)?;
-            mask = FIELD_TIME;
-        } else {
-            // An optional fractional part on a unit (or bare-seconds) value.
-            let (frac_num, frac_den) = if c.peek() == Some(b'.') {
-                c.i += 1;
-                read_unit_frac(&mut c)?
-            } else {
-                (0, 1)
-            };
-            c.skip_ws();
-            // A recognized unit applies its weights; an unrecognized unit word is a 22007. A
-            // number with no unit means SECONDS (PG `interval '5'` = 5 seconds), but only as the
-            // LAST field: elsewhere PG reads it positionally as a SQL-standard field (`'1 1:00'`
-            // is 1 day), which jed defers (§3), so it fails closed instead of misreading.
-            let (per, unit_mask) = match peek_word(&c) {
-                Some(u) if !u.eq_ignore_ascii_case("ago") => {
-                    c.i += u.len();
-                    unit_weights(&u)
-                        .ok_or_else(|| invalid_format(format!("unknown interval unit \"{u}\"")))?
-                }
-                _ if !c.done() => {
-                    return Err(invalid_format(
-                        "a number without a unit must be the last interval field",
-                    ));
-                }
-                _ => ((0, 0, MICROS_PER_SEC as i128), FIELD_SECOND),
-            };
-            apply_unit(&mut acc, neg, int_part, frac_num, frac_den, per)?;
-            mask = if unit_mask == FIELD_SECOND {
-                seconds_mask(frac_num)
-            } else {
-                unit_mask
-            };
-        }
-        // Each accumulator add was checked, so the difference is exactly the field's i64 amount.
-        fields.push(FieldPart {
-            mask,
-            months: acc.months.wrapping_sub(before_months),
-            days: acc.days.wrapping_sub(before_days),
-            micros: acc.micros.wrapping_sub(before_micros),
-        });
-        let before = c.i;
-        c.skip_ws();
-        separated = c.i > before;
-    }
-
-    if !c.done() {
-        return Err(invalid_format("trailing characters in interval"));
-    }
-    if fields.is_empty() {
-        return Err(invalid_format("empty interval"));
-    }
-    check_duplicate_fields(input, &fields)?;
-
-    if ago {
-        acc.months = acc
-            .months
-            .checked_neg()
-            .ok_or_else(|| field_overflow("interval out of range"))?;
-        acc.days = acc
-            .days
-            .checked_neg()
-            .ok_or_else(|| field_overflow("interval out of range"))?;
-        acc.micros = acc
-            .micros
-            .checked_neg()
-            .ok_or_else(|| field_overflow("interval out of range"))?;
-    }
-
-    Ok(Interval {
-        months: i32::try_from(acc.months).map_err(|_| field_overflow("interval out of range"))?,
-        days: i32::try_from(acc.days).map_err(|_| field_overflow("interval out of range"))?,
-        micros: acc.micros,
-    })
+    let usec = round_div(frac * scale as i128, FRAC_DEN);
+    let usec = i64::try_from(usec).map_err(|_| DtErr::FieldOverflow)?;
+    itm.usec = itm.usec.checked_add(usec).ok_or(DtErr::FieldOverflow)?;
+    Ok(())
 }
 
-/// Read a unit value's fractional digits after `.` as `(numerator, denominator)` with the
-/// denominator a power of ten. Caps at 18 digits (more than enough; an overlong run traps 22007).
-fn read_unit_frac(c: &mut Cursor) -> Result<(i128, i128)> {
-    let start = c.i;
-    while c.i < c.b.len() && c.b[c.i].is_ascii_digit() {
-        c.i += 1;
+/// `AdjustFractDays`: `frac * scale` days — whole days, then the remaining fraction of a day as µs.
+fn adjust_fract_days(frac: i128, scale: i64, itm: &mut ItmIn) -> Dt<()> {
+    if frac == 0 {
+        return Ok(());
     }
-    let digits = &c.b[start..c.i];
-    if digits.is_empty() {
-        return Err(invalid_format("expected fractional digits after '.'"));
-    }
-    if digits.len() > MAX_FRAC_DIGITS {
-        return Err(field_overflow(
-            "interval value has too many fractional digits",
-        ));
-    }
-    let mut num: i128 = 0;
-    let mut den: i128 = 1;
-    for &d in digits {
-        num = num * 10 + (d - b'0') as i128;
-        den *= 10;
-    }
-    Ok((num, den))
+    let total = frac * scale as i128;
+    let extra_days = total / FRAC_DEN; // truncate toward zero, like C's (int) cast
+    itm.mday = itm
+        .mday
+        .checked_add(extra_days as i32)
+        .ok_or(DtErr::FieldOverflow)?;
+    adjust_fract_micros(total - extra_days * FRAC_DEN, MICROS_PER_DAY, itm)
 }
 
-/// Peek an ASCII-letter word at the cursor (not consuming). Interval units and `ago` are
-/// letters-only; a non-letter (digit, sign, `:`) ends the word.
-fn peek_word(c: &Cursor) -> Option<String> {
-    let start = c.i;
-    let mut j = start;
-    while j < c.b.len() && c.b[j].is_ascii_alphabetic() {
+/// `AdjustFractYears`: `frac * scale` years as whole months, rounded half to even (PG's `rint`);
+/// the rest of a month is dropped, as in PG.
+fn adjust_fract_years(frac: i128, scale: i64, itm: &mut ItmIn) -> Dt<()> {
+    let total = frac * scale as i128 * MONTHS_PER_YEAR as i128;
+    let mut extra_months = total / FRAC_DEN;
+    let twice_rem = (total - extra_months * FRAC_DEN).abs() * 2;
+    if twice_rem > FRAC_DEN || (twice_rem == FRAC_DEN && extra_months % 2 != 0) {
+        extra_months += total.signum();
+    }
+    itm.mon = itm
+        .mon
+        .checked_add(extra_months as i32)
+        .ok_or(DtErr::FieldOverflow)?;
+    Ok(())
+}
+
+/// `AdjustMicroseconds`: `(val + frac) * scale` µs.
+fn adjust_micros(val: i64, frac: i128, scale: i64, itm: &mut ItmIn) -> Dt<()> {
+    itm.usec = val
+        .checked_mul(scale)
+        .and_then(|p| itm.usec.checked_add(p))
+        .ok_or(DtErr::FieldOverflow)?;
+    adjust_fract_micros(frac, scale, itm)
+}
+
+/// `AdjustDays`: `val * scale` days.
+fn adjust_days(val: i64, scale: i32, itm: &mut ItmIn) -> Dt<()> {
+    let v = i32::try_from(val).map_err(|_| DtErr::FieldOverflow)?;
+    itm.mday = v
+        .checked_mul(scale)
+        .and_then(|d| itm.mday.checked_add(d))
+        .ok_or(DtErr::FieldOverflow)?;
+    Ok(())
+}
+
+/// `AdjustMonths`: `val` months.
+fn adjust_months(val: i64, itm: &mut ItmIn) -> Dt<()> {
+    let v = i32::try_from(val).map_err(|_| DtErr::FieldOverflow)?;
+    itm.mon = itm.mon.checked_add(v).ok_or(DtErr::FieldOverflow)?;
+    Ok(())
+}
+
+/// `AdjustYears`: `val * scale` years.
+fn adjust_years(val: i64, scale: i32, itm: &mut ItmIn) -> Dt<()> {
+    let v = i32::try_from(val).map_err(|_| DtErr::FieldOverflow)?;
+    itm.year = v
+        .checked_mul(scale)
+        .and_then(|y| itm.year.checked_add(y))
+        .ok_or(DtErr::FieldOverflow)?;
+    Ok(())
+}
+
+/// PG's `DecodeTimeForInterval` (`DecodeTimeCommon`): a time field `H:M`, `H:M:S[.f]`, or
+/// `M:S.f` (two parts with a fraction are minutes and seconds). The time REPLACES `itm.usec`, as
+/// in PG — so a fractional unit to the time's left (read earlier) loses its µs part.
+fn decode_time_for_interval(s: &[u8], itm: &mut ItmIn) -> Dt<()> {
+    let (mut hour, n) = strtoi64(s)?;
+    let mut cp = &s[n..];
+    if cp.first() != Some(&b':') {
+        return Err(DtErr::BadFormat);
+    }
+    let (mut min, n) = strtoint(&cp[1..])?;
+    cp = &cp[1 + n..];
+    let mut sec: i32 = 0;
+    let mut fsec: i64 = 0;
+    match cp.first() {
+        None => {}
+        Some(b'.') => {
+            // mm:ss.fff
+            fsec = parse_fractional_second(cp)?;
+            if i32::try_from(hour).is_err() {
+                return Err(DtErr::FieldOverflow);
+            }
+            sec = min;
+            min = hour as i32;
+            hour = 0;
+        }
+        Some(b':') => {
+            let (s2, n) = strtoint(&cp[1..])?;
+            sec = s2;
+            cp = &cp[1 + n..];
+            match cp.first() {
+                None => {}
+                Some(b'.') => fsec = parse_fractional_second(cp)?,
+                Some(_) => return Err(DtErr::BadFormat),
+            }
+        }
+        Some(_) => return Err(DtErr::BadFormat),
+    }
+    if hour < 0 || !(0..=59).contains(&min) || !(0..=60).contains(&sec) || fsec > USECS_PER_SEC {
+        return Err(DtErr::FieldOverflow);
+    }
+    itm.usec = hour
+        .checked_mul(USECS_PER_HOUR)
+        .and_then(|h| h.checked_add(min as i64 * USECS_PER_MINUTE))
+        .and_then(|hm| hm.checked_add(sec as i64 * USECS_PER_SEC))
+        .and_then(|hms| hms.checked_add(fsec))
+        .ok_or(DtErr::FieldOverflow)?;
+    Ok(())
+}
+
+/// PG's `DecodeInterval` (IntervalStyle `postgres`, no field qualifier): read the fields right to
+/// left, so a unit word is met before the number it applies to. A number with no unit takes the
+/// last unit read: seconds at the right end, then whatever unit was read last — except that after an
+/// `hour` or a time field the next unitless number is days (`'1 1:00'`, `'5 1 hour'`). `N-M` is
+/// years-months. Returns whether the input was `infinity` / `-infinity`.
+fn decode_interval(fields: &[Field], itm: &mut ItmIn) -> Dt<bool> {
+    let mut is_before = false;
+    let mut parsing_unit_val = false;
+    let mut infinite = false;
+    let mut fmask: u32 = 0;
+    let mut ty = IGNORE_DTF;
+    let nf = fields.len();
+    for i in (0..nf).rev() {
+        let f = &fields[i];
+        let mut tmask: u32 = 0;
+        let mut ftype = f.ftype;
+        if ftype == FieldType::Time {
+            decode_time_for_interval(&f.text, itm)?;
+            tmask = FIELD_TIME;
+            ty = DTK_DAY;
+            parsing_unit_val = false;
+        } else if ftype == FieldType::Tz {
+            // A signed time (`-1:00`, `+02:03`) — else a signed number, read below.
+            if f.text[1..].contains(&b':') && decode_time_for_interval(&f.text[1..], itm).is_ok() {
+                if f.text[0] == b'-' {
+                    itm.usec = itm.usec.checked_neg().ok_or(DtErr::FieldOverflow)?;
+                }
+                tmask = FIELD_TIME;
+                ty = DTK_DAY;
+                parsing_unit_val = false;
+            } else {
+                ftype = FieldType::Number;
+            }
+        }
+        match ftype {
+            FieldType::Time | FieldType::Tz => {}
+            FieldType::Number | FieldType::Date => {
+                if ty == IGNORE_DTF {
+                    ty = DTK_SECOND;
+                }
+                let s = &f.text[..];
+                let (mut val, n) = strtoi64(s)?;
+                let cp = &s[n..];
+                let negative = s[0] == b'-';
+                let mut fval: i128 = 0;
+                match cp.first() {
+                    Some(b'-') => {
+                        // SQL-standard years-months
+                        let (v2, n2) = strtoint(&cp[1..])?;
+                        if !(0..MONTHS_PER_YEAR as i32).contains(&v2) {
+                            return Err(DtErr::FieldOverflow);
+                        }
+                        if cp.len() != 1 + n2 {
+                            return Err(DtErr::BadFormat);
+                        }
+                        ty = DTK_MONTH;
+                        let v2 = if negative { -v2 } else { v2 };
+                        val = val
+                            .checked_mul(MONTHS_PER_YEAR)
+                            .and_then(|m| m.checked_add(v2 as i64))
+                            .ok_or(DtErr::FieldOverflow)?;
+                    }
+                    Some(b'.') => {
+                        fval = parse_fraction(cp)?;
+                        if negative {
+                            fval = -fval;
+                        }
+                    }
+                    None => {}
+                    Some(_) => return Err(DtErr::BadFormat),
+                }
+                match ty {
+                    DTK_MICROSEC => {
+                        adjust_micros(val, fval, 1, itm)?;
+                        tmask = FIELD_MICROSECOND;
+                    }
+                    DTK_MILLISEC => {
+                        adjust_micros(val, fval, 1000, itm)?;
+                        tmask = FIELD_MILLISECOND;
+                    }
+                    DTK_SECOND => {
+                        adjust_micros(val, fval, USECS_PER_SEC, itm)?;
+                        // fractional seconds claim the millisecond and microsecond fields too
+                        tmask = if fval == 0 {
+                            FIELD_SECOND
+                        } else {
+                            FIELD_ALL_SECS
+                        };
+                    }
+                    DTK_MINUTE => {
+                        adjust_micros(val, fval, USECS_PER_MINUTE, itm)?;
+                        tmask = FIELD_MINUTE;
+                    }
+                    DTK_HOUR => {
+                        adjust_micros(val, fval, USECS_PER_HOUR, itm)?;
+                        tmask = FIELD_HOUR;
+                        ty = DTK_DAY; // a unitless number left of an hour is days
+                    }
+                    DTK_DAY => {
+                        adjust_days(val, 1, itm)?;
+                        adjust_fract_micros(fval, MICROS_PER_DAY, itm)?;
+                        tmask = FIELD_DAY;
+                    }
+                    DTK_WEEK => {
+                        adjust_days(val, 7, itm)?;
+                        adjust_fract_days(fval, 7, itm)?;
+                        tmask = FIELD_WEEK;
+                    }
+                    DTK_MONTH => {
+                        adjust_months(val, itm)?;
+                        adjust_fract_days(fval, DAYS_PER_MONTH, itm)?;
+                        tmask = FIELD_MONTH;
+                    }
+                    DTK_YEAR | DTK_DECADE | DTK_CENTURY | DTK_MILLENNIUM => {
+                        let (scale, mask) = match ty {
+                            DTK_YEAR => (1, FIELD_YEAR),
+                            DTK_DECADE => (10, FIELD_DECADE),
+                            DTK_CENTURY => (100, FIELD_CENTURY),
+                            _ => (1000, FIELD_MILLENNIUM),
+                        };
+                        adjust_years(val, scale, itm)?;
+                        adjust_fract_years(fval, scale as i64, itm)?;
+                        tmask = mask;
+                    }
+                    _ => return Err(DtErr::BadFormat),
+                }
+                parsing_unit_val = false;
+            }
+            FieldType::String | FieldType::Special => {
+                // two unit words in a row
+                if parsing_unit_val {
+                    return Err(DtErr::BadFormat);
+                }
+                match interval_word(&f.text) {
+                    Some(Word::Ignore) => {
+                        // skipped — but, as in PG, it resets the unit a number to its left takes
+                        ty = IGNORE_DTF;
+                        continue;
+                    }
+                    Some(Word::Units(u)) => {
+                        ty = u;
+                        parsing_unit_val = true;
+                    }
+                    Some(Word::Ago) => {
+                        // `ago` only as the last field
+                        if i != nf - 1 {
+                            return Err(DtErr::BadFormat);
+                        }
+                        is_before = true;
+                        ty = DTK_NUMBER;
+                    }
+                    Some(Word::Reserv(r)) => {
+                        tmask = FIELD_DATE | FIELD_TIME;
+                        // only `infinity` / `-infinity`, and nothing after it
+                        if (r != DTK_LATE && r != DTK_EARLY) || i != nf - 1 {
+                            return Err(DtErr::BadFormat);
+                        }
+                        infinite = true;
+                    }
+                    Some(Word::Other) | None => return Err(DtErr::BadFormat),
+                }
+            }
+        }
+        if tmask & fmask != 0 {
+            return Err(DtErr::BadFormat);
+        }
+        fmask |= tmask;
+    }
+    // at least one field, and no unit left without its number
+    if fmask == 0 || parsing_unit_val {
+        return Err(DtErr::BadFormat);
+    }
+    if is_before {
+        itm.usec = itm.usec.checked_neg().ok_or(DtErr::FieldOverflow)?;
+        itm.mday = itm.mday.checked_neg().ok_or(DtErr::FieldOverflow)?;
+        itm.mon = itm.mon.checked_neg().ok_or(DtErr::FieldOverflow)?;
+        itm.year = itm.year.checked_neg().ok_or(DtErr::FieldOverflow)?;
+    }
+    Ok(infinite)
+}
+
+// `strtod`'s range limits, to 40 significant digits: a decimal at or above the overflow threshold
+// (2^1024 − 2^970, ~1.8e308) rounds to infinity, and a nonzero one below the underflow threshold
+// (2^-1022 − 2^-1076, ~2.2e-308) is too small for a normal double — both `ERANGE`, which PG
+// reports as malformed input.
+const STRTOD_OVERFLOW_DIGITS: &[u8; 40] = b"1797693134862315807937289714053034150799";
+const STRTOD_UNDERFLOW_DIGITS: &[u8; 40] = b"2225073858507201259573821257020768020077";
+
+/// Compare a significand's leading 40 digits (zero-padded) with a 40-digit threshold.
+fn cmp_lead_digits(d: &[u8], t: &[u8; 40]) -> std::cmp::Ordering {
+    for (k, &tk) in t.iter().enumerate() {
+        let dk = d.get(k).copied().unwrap_or(b'0');
+        if dk != tk {
+            return dk.cmp(&tk);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Read a run of decimal digits as an exponent, saturating far beyond any meaningful value.
+fn read_exponent(s: &[u8], i: &mut usize) -> i64 {
+    let mut e: i64 = 0;
+    while *i < s.len() && s[*i].is_ascii_digit() {
+        e = (e * 10 + (s[*i] - b'0') as i64).min(1_000_000_000_000);
+        *i += 1;
+    }
+    e
+}
+
+/// The signed-exponent tail `[eE|pP][+-]digits` of a `strtod` number; only consumed when digits
+/// follow.
+fn read_exponent_part(s: &[u8], i: &mut usize, marker: u8) -> i64 {
+    let at = |k: usize| -> u8 { s.get(k).copied().unwrap_or(0) };
+    if at(*i).to_ascii_lowercase() != marker {
+        return 0;
+    }
+    let mut j = *i + 1;
+    let mut neg = false;
+    if at(j) == b'+' || at(j) == b'-' {
+        neg = at(j) == b'-';
         j += 1;
     }
-    if j == start {
-        None
+    if !at(j).is_ascii_digit() {
+        return 0;
+    }
+    let e = read_exponent(s, &mut j);
+    *i = j;
+    if neg { -e } else { e }
+}
+
+/// A decimal `strtod` number `digits[.digits][e[+-]digits]` at `s[i..]` (no sign) as
+/// `(integer part, fraction numerator over FRAC_DEN, end)`, or the `ParseISO8601Number` error: a
+/// value `strtod` would report `ERANGE` for is malformed, one beyond ±1e15 a field overflow.
+fn scan_decimal(s: &[u8], mut i: usize) -> Dt<(i64, i128, usize)> {
+    let mut digits: Vec<u8> = Vec::new();
+    let mut frac_count: i64 = 0;
+    let mut any = false;
+    while i < s.len() && s[i].is_ascii_digit() {
+        digits.push(s[i]);
+        any = true;
+        i += 1;
+    }
+    if i < s.len() && s[i] == b'.' && (any || s.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
+        i += 1;
+        while i < s.len() && s[i].is_ascii_digit() {
+            digits.push(s[i]);
+            frac_count += 1;
+            any = true;
+            i += 1;
+        }
+    }
+    if !any {
+        return Err(DtErr::BadFormat);
+    }
+    // value = significand * 10^exp, the significand without leading or trailing zeros
+    let mut exp = read_exponent_part(s, &mut i, b'e') - frac_count;
+    let first = digits.iter().position(|&d| d != b'0');
+    let Some(first) = first else {
+        return Ok((0, 0, i));
+    };
+    let mut sig: Vec<u8> = digits[first..].to_vec();
+    while sig.last() == Some(&b'0') {
+        sig.pop();
+        exp += 1;
+    }
+    // the power of ten of the leading digit
+    let lead = sig.len() as i64 - 1 + exp;
+    if lead > 308 || (lead == 308 && cmp_lead_digits(&sig, STRTOD_OVERFLOW_DIGITS).is_gt()) {
+        return Err(DtErr::BadFormat);
+    }
+    if lead < -308 || (lead == -308 && cmp_lead_digits(&sig, STRTOD_UNDERFLOW_DIGITS).is_le()) {
+        return Err(DtErr::BadFormat);
+    }
+    if lead > 15 || (lead == 15 && sig != b"1") {
+        return Err(DtErr::FieldOverflow);
+    }
+    if exp >= 0 {
+        let mut v: i64 = 0;
+        for &d in &sig {
+            v = v * 10 + (d - b'0') as i64;
+        }
+        return Ok((v * 10i64.pow(exp as u32), 0, i));
+    }
+    // `k` digits are after the decimal point
+    let k = (-exp) as usize;
+    let (int_digits, frac_digits): (&[u8], Vec<u8>) = if sig.len() > k {
+        (&sig[..sig.len() - k], sig[sig.len() - k..].to_vec())
     } else {
-        Some(String::from_utf8_lossy(&c.b[start..j]).into_owned())
+        let zeros = (k - sig.len()).min(FRAC_DIGITS);
+        let mut fd = vec![b'0'; zeros];
+        fd.extend_from_slice(&sig);
+        (&[], fd)
+    };
+    let mut v: i64 = 0;
+    for &d in int_digits {
+        v = v * 10 + (d - b'0') as i64;
+    }
+    Ok((v, frac_from_digits(&frac_digits), i))
+}
+
+/// A hexadecimal `strtod` number `0x` `hex[.hex][p[+-]digits]` whose digits start at `s[i..]` —
+/// as [`scan_decimal`], computed exactly from its bits (the fraction to 64 bits).
+fn scan_hex(s: &[u8], mut i: usize) -> Dt<(i64, i128, usize)> {
+    let mut bits: Vec<u8> = Vec::new();
+    let mut frac_hex: i64 = 0;
+    let push_hex = |bits: &mut Vec<u8>, h: u8| {
+        let v = (h as char).to_digit(16).unwrap_or(0) as u8;
+        for b in (0..4).rev() {
+            bits.push((v >> b) & 1);
+        }
+    };
+    while i < s.len() && s[i].is_ascii_hexdigit() {
+        push_hex(&mut bits, s[i]);
+        i += 1;
+    }
+    if i < s.len() && s[i] == b'.' {
+        i += 1;
+        while i < s.len() && s[i].is_ascii_hexdigit() {
+            push_hex(&mut bits, s[i]);
+            frac_hex += 1;
+            i += 1;
+        }
+    }
+    // value = bits * 2^e2
+    let e2 = read_exponent_part(s, &mut i, b'p') - 4 * frac_hex;
+    let Some(first) = bits.iter().position(|&b| b == 1) else {
+        return Ok((0, 0, i));
+    };
+    let bits = &bits[first..];
+    let len = bits.len() as i64;
+    // the power of two of the leading bit, and of the lowest set bit
+    let lead = len - 1 + e2;
+    let last = bits.iter().rposition(|&b| b == 1).unwrap_or(0) as i64;
+    let low = len - 1 - last + e2;
+    // the leading 54 bits all ones: rounds up to the next power of two in 53-bit precision
+    let rounds_up = bits.len() >= 54 && bits[..54].iter().all(|&b| b == 1);
+    if lead > 1023 || (lead == 1023 && rounds_up) {
+        return Err(DtErr::BadFormat);
+    }
+    // ERANGE on underflow: below the normal range and not exact in the subnormal range
+    let tiny = lead < -1022 && !(lead == -1023 && rounds_up);
+    if tiny && low < -1074 {
+        return Err(DtErr::BadFormat);
+    }
+    if lead >= 50 {
+        return Err(DtErr::FieldOverflow);
+    }
+    let bit_at = |pow: i64| -> i128 {
+        // the bit worth 2^pow
+        let p = lead - pow;
+        if p >= 0 && p < len {
+            bits[p as usize] as i128
+        } else {
+            0
+        }
+    };
+    let mut ipart: i128 = 0;
+    for pow in (0..=lead).rev() {
+        ipart = ipart * 2 + bit_at(pow);
+    }
+    let mut f64bits: i128 = 0;
+    for q in 1..=64 {
+        f64bits = f64bits * 2 + bit_at(-q);
+    }
+    if ipart > 1_000_000_000_000_000 || (ipart == 1_000_000_000_000_000 && f64bits > 0) {
+        return Err(DtErr::FieldOverflow);
+    }
+    // f64bits / 2^64 = f64bits * 5^25 / 2^39 / 10^25
+    let frac = (f64bits * 298_023_223_876_953_125) >> 39;
+    Ok((ipart as i64, frac, i))
+}
+
+/// PG's `ParseISO8601Number`: a `strtod` number at `s[i..]` (it must start with a digit, `-`, or
+/// `.`) as `(integer part, fraction, end)`, both parts carrying the sign.
+fn parse_iso8601_number(s: &[u8], i: usize) -> Dt<(i64, i128, usize)> {
+    let at = |k: usize| -> u8 { s.get(k).copied().unwrap_or(0) };
+    let c = at(i);
+    if !(c.is_ascii_digit() || c == b'-' || c == b'.') {
+        return Err(DtErr::BadFormat);
+    }
+    let neg = c == b'-';
+    let j = if neg { i + 1 } else { i };
+    // strtod's infinity / NaN spellings: a value out of range
+    let word = |w: &[u8]| (0..w.len()).all(|k| at(j + k).to_ascii_lowercase() == w[k]);
+    if word(b"inf") || word(b"nan") {
+        return Err(DtErr::FieldOverflow);
+    }
+    let is_hex = at(j) == b'0'
+        && at(j + 1).to_ascii_lowercase() == b'x'
+        && (at(j + 2).is_ascii_hexdigit() || (at(j + 2) == b'.' && at(j + 3).is_ascii_hexdigit()));
+    let (ipart, frac, end) = if is_hex {
+        scan_hex(s, j + 2)?
+    } else {
+        scan_decimal(s, j)?
+    };
+    if neg {
+        Ok((-ipart, -frac, end))
+    } else {
+        Ok((ipart, frac, end))
+    }
+}
+
+/// PG's `ISO8601IntegerWidth`: the integer digits of a number field, past a leading `-`.
+fn iso8601_integer_width(s: &[u8]) -> usize {
+    let s = if s.first() == Some(&b'-') { &s[1..] } else { s };
+    s.iter().take_while(|d| d.is_ascii_digit()).count()
+}
+
+/// PG's `DecodeISO8601Interval`: the ISO 8601 "format with designators" (`P1Y2M3DT4H5M6S`, `P2W`,
+/// any field fractional or negative) and the "alternative format" (`P0001-02-03T04:05:06`, basic
+/// `P00010203T040506`). The whole input, untrimmed, must be the value.
+fn decode_iso8601_interval(s: &[u8], itm: &mut ItmIn) -> Dt<()> {
+    *itm = ItmIn::default();
+    if s.len() < 2 || s[0] != b'P' {
+        return Err(DtErr::BadFormat);
+    }
+    let at = |k: usize| -> u8 { s.get(k).copied().unwrap_or(0) };
+    let mut i = 1usize;
+    let mut datepart = true;
+    let mut havefield = false;
+    while i < s.len() {
+        if s[i] == b'T' {
+            // the start of the time part
+            datepart = false;
+            havefield = false;
+            i += 1;
+            continue;
+        }
+        let fieldstart = i;
+        let (val, fval, end) = parse_iso8601_number(s, i)?;
+        i = end;
+        let unit = at(i);
+        i += 1;
+        if datepart {
+            match unit {
+                b'Y' => {
+                    adjust_years(val, 1, itm)?;
+                    adjust_fract_years(fval, 1, itm)?;
+                }
+                b'M' => {
+                    adjust_months(val, itm)?;
+                    adjust_fract_days(fval, DAYS_PER_MONTH, itm)?;
+                }
+                b'W' => {
+                    adjust_days(val, 7, itm)?;
+                    adjust_fract_days(fval, 7, itm)?;
+                }
+                b'D' => {
+                    adjust_days(val, 1, itm)?;
+                    adjust_fract_micros(fval, MICROS_PER_DAY, itm)?;
+                }
+                b'T' | 0 | b'-' => {
+                    if unit != b'-' && iso8601_integer_width(&s[fieldstart..]) == 8 && !havefield {
+                        // alternative format, basic: YYYYMMDD
+                        adjust_years(val / 10000, 1, itm)?;
+                        adjust_months((val / 100) % 100, itm)?;
+                        adjust_days(val % 100, 1, itm)?;
+                        adjust_fract_micros(fval, MICROS_PER_DAY, itm)?;
+                        if unit == 0 {
+                            return Ok(());
+                        }
+                        datepart = false;
+                        havefield = false;
+                        continue;
+                    }
+                    // alternative format, extended: YYYY-MM-DD
+                    if havefield {
+                        return Err(DtErr::BadFormat);
+                    }
+                    adjust_years(val, 1, itm)?;
+                    adjust_fract_years(fval, 1, itm)?;
+                    if unit == 0 {
+                        return Ok(());
+                    }
+                    if unit == b'T' {
+                        datepart = false;
+                        havefield = false;
+                        continue;
+                    }
+                    let (val, fval, end) = parse_iso8601_number(s, i)?;
+                    i = end;
+                    adjust_months(val, itm)?;
+                    adjust_fract_days(fval, DAYS_PER_MONTH, itm)?;
+                    if i >= s.len() {
+                        return Ok(());
+                    }
+                    if s[i] == b'T' {
+                        datepart = false;
+                        havefield = false;
+                        continue;
+                    }
+                    if s[i] != b'-' {
+                        return Err(DtErr::BadFormat);
+                    }
+                    i += 1;
+                    let (val, fval, end) = parse_iso8601_number(s, i)?;
+                    i = end;
+                    adjust_days(val, 1, itm)?;
+                    adjust_fract_micros(fval, MICROS_PER_DAY, itm)?;
+                    if i >= s.len() {
+                        return Ok(());
+                    }
+                    if s[i] == b'T' {
+                        datepart = false;
+                        havefield = false;
+                        continue;
+                    }
+                    return Err(DtErr::BadFormat);
+                }
+                _ => return Err(DtErr::BadFormat),
+            }
+        } else {
+            match unit {
+                b'H' => adjust_micros(val, fval, USECS_PER_HOUR, itm)?,
+                b'M' => adjust_micros(val, fval, USECS_PER_MINUTE, itm)?,
+                b'S' => adjust_micros(val, fval, USECS_PER_SEC, itm)?,
+                0 | b':' => {
+                    if unit == 0 && iso8601_integer_width(&s[fieldstart..]) == 6 && !havefield {
+                        // alternative format, basic: HHMMSS
+                        adjust_micros(val / 10000, 0, USECS_PER_HOUR, itm)?;
+                        adjust_micros((val / 100) % 100, 0, USECS_PER_MINUTE, itm)?;
+                        adjust_micros(val % 100, 0, USECS_PER_SEC, itm)?;
+                        adjust_fract_micros(fval, 1, itm)?;
+                        return Ok(());
+                    }
+                    // alternative format, extended: HH:MM:SS
+                    if havefield {
+                        return Err(DtErr::BadFormat);
+                    }
+                    adjust_micros(val, fval, USECS_PER_HOUR, itm)?;
+                    if unit == 0 {
+                        return Ok(());
+                    }
+                    let (val, fval, end) = parse_iso8601_number(s, i)?;
+                    i = end;
+                    adjust_micros(val, fval, USECS_PER_MINUTE, itm)?;
+                    if i >= s.len() {
+                        return Ok(());
+                    }
+                    if s[i] != b':' {
+                        return Err(DtErr::BadFormat);
+                    }
+                    i += 1;
+                    let (val, fval, end) = parse_iso8601_number(s, i)?;
+                    i = end;
+                    adjust_micros(val, fval, USECS_PER_SEC, itm)?;
+                    if i >= s.len() {
+                        return Ok(());
+                    }
+                    return Err(DtErr::BadFormat);
+                }
+                _ => return Err(DtErr::BadFormat),
+            }
+        }
+        havefield = true;
+    }
+    Ok(())
+}
+
+/// Parse interval text into the three-field value — PostgreSQL's `interval_in`
+/// (spec/design/interval.md §3): the PostgreSQL / SQL-standard field syntax, else ISO 8601.
+/// Malformed input is 22007; a field beyond its range is 22008 (PG's 22015).
+pub fn parse_interval(input: &str) -> Result<Interval> {
+    let b = input.as_bytes();
+    let mut itm = ItmIn::default();
+    let mut res = parse_date_time(b).and_then(|fields| decode_interval(&fields, &mut itm));
+    if res == Err(DtErr::BadFormat) {
+        res = decode_iso8601_interval(b, &mut itm).map(|()| false);
+    }
+    match res {
+        Err(DtErr::BadFormat) | Ok(true) => {
+            // (jed has no infinite interval, so `infinity` is not an interval value)
+            Err(invalid_format(format!(
+                "invalid input syntax for type interval: \"{input}\""
+            )))
+        }
+        Err(DtErr::FieldOverflow) => Err(field_overflow(format!(
+            "interval field value out of range: \"{input}\""
+        ))),
+        Ok(false) => {
+            let months = itm.year as i64 * MONTHS_PER_YEAR + itm.mon as i64;
+            Ok(Interval {
+                months: i32::try_from(months)
+                    .map_err(|_| field_overflow("interval out of range"))?,
+                days: itm.mday,
+                micros: itm.usec,
+            })
+        }
     }
 }
 

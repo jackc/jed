@@ -1452,7 +1452,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				}
 				return &rExpr{kind: reConstDate, cInt: int64(m)}, resolvedType{kind: rtDate}, nil
 			case ctx != nil && ctx.IsInterval():
-				// A string adapts to an INTERVAL context (parse the "unit + time" subset,
+				// A string adapts to an INTERVAL context (PostgreSQL's interval input,
 				// 22007/22008 — spec/design/interval.md), like timestamp adaptation.
 				iv, err := parseInterval(e.Literal.Str)
 				if err != nil {
