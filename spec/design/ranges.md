@@ -193,6 +193,10 @@ per-core divergence tests): a top-level `$N` parameter into a range column (INSE
 param-to-container handling is special and not generalized to the assignment RHS), and the
 `ON CONFLICT DO UPDATE` conflict-action path (the upsert follow-on, [upsert.md §9](upsert.md)).
 
+**`INSERT … SELECT` into a range column** follows the same same-type rule: a projection of exactly the
+column's range type, or an untyped `NULL`, is stored through `store_range`; a different range type is
+`42804` ([grammar.md](grammar.md) §24).
+
 ## 5. Text I/O — `range_in` / `range_out`
 
 `range_out` (render) and `range_in` (parse) match PostgreSQL (oracle-pinned):

@@ -90,6 +90,19 @@ wrote), and an `ON COMMIT DROP` table disappears as soon as its `CREATE` finishe
 discards a transaction's changes as usual, so no action runs. `ON COMMIT` is only for temporary
 tables; on any other table it is error `42P16`.
 
+## From a query (`CREATE TEMP TABLE … AS`)
+
+A temp table can be created from a query's result, columns and rows, just like a
+[persistent one](../tables/). `ON COMMIT` goes before `AS`, as in PostgreSQL:
+
+```sql
+CREATE TEMP TABLE top_tags AS SELECT tag, n FROM scratch WHERE n >= 20;
+BEGIN;
+CREATE TEMP TABLE batch ON COMMIT DROP AS SELECT id FROM scratch WITH NO DATA;
+-- … fill and use batch …
+COMMIT;                     -- batch is gone
+```
+
 ## Bounded storage
 
 Temp tables retain rows across statements, which the per-statement cost ceiling does not bound — so

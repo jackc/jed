@@ -1,0 +1,561 @@
+# CREATE TABLE … AS query [WITH [NO] DATA] (spec/design/create-table-as.md, grammar.md §13):
+# PostgreSQL's CREATE TABLE AS. Each column takes the query output's name (or the column list's),
+# its type (an untyped NULL or string is text), the typmod the output keeps (a column reference, a
+# typmod cast, COALESCE / CASE / GREATEST / LEAST and set-operation / VALUES columns whose inputs
+# agree, a scalar subquery, a composite field), and no constraint, default, or key. WITH DATA (the
+# default) fills the table in the same statement exactly as INSERT INTO t <query> would — rows,
+# cost, and errors; WITH NO DATA creates it empty without running the query. The query is analyzed
+# before the name check, so IF NOT EXISTS skips only a query that plans. The created column types
+# are pinned by create_table_as_types.test; here they are observed through what the new table
+# accepts. Oracle-checked against PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: ddl.create_table_as, ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, ddl.not_null, ddl.column_default, ddl.unique, ddl.check, ddl.view, dml.insert, dml.insert_multi_row, dml.insert_select, dml.insert_column_list, query.select, query.select_star, query.select_no_from, query.where_eq, query.order_by, query.limit, query.union, query.intersect, query.except, query.values_query, query.derived_table, query.cte, query.cte_nested, query.cte_recursive, query.subquery_scalar, query.aggregates, query.group_by, query.having, query.window, expr.coalesce, expr.case, expr.greatest_least, expr.arithmetic, expr.text_concat, func.abs, cast.explicit, types.i32, types.i64, types.decimal, types.text, types.varchar_length, types.composite, types.array, types.range, expr.array_subscript, query.cross_join, resource.cost_metering
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, price decimal(10,2) NOT NULL DEFAULT 1, name varchar(5) UNIQUE, note text CHECK (note <> 'bad'))
+
+statement ok
+INSERT INTO src VALUES (1, 1.5, 'ab', 'x'), (2, 2.25, 'cde', NULL), (3, 10, NULL, 'z')
+
+# --- the rows and the column names -----------------------------------------------------------------
+
+# cost: 7
+statement ok
+CREATE TABLE c1 AS SELECT * FROM src
+
+query IDTT rowsort
+SELECT id, price, name, note FROM c1
+----
+1
+1.50
+ab
+x
+2
+2.25
+cde
+NULL
+3
+10.00
+NULL
+z
+
+# the cost is the INSERT … SELECT's
+statement ok
+CREATE TABLE c1b AS SELECT * FROM src WITH NO DATA
+
+# cost: 7
+statement ok
+INSERT INTO c1b SELECT * FROM src
+
+# no constraint, default, or key is copied: duplicates, NULLs, and 'bad' are accepted, and an omitted
+# column is NULL
+statement ok
+INSERT INTO c1 (id, name, note) VALUES (1, 'ab', 'bad'), (NULL, NULL, 'bad')
+
+query IDTT rowsort
+SELECT id, price, name, note FROM c1 WHERE note = 'bad'
+----
+1
+NULL
+ab
+bad
+NULL
+NULL
+NULL
+bad
+
+# an expression's column is named as the query names it
+statement ok
+CREATE TABLE c2 AS SELECT id + 1 AS next, abs(id - 5), count(*) OVER () AS n FROM src WHERE id < 3
+
+query III rowsort
+SELECT next, abs, n FROM c2
+----
+2
+4
+2
+3
+3
+2
+
+# --- the column list --------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE c3 (a, b) AS SELECT id, name, note FROM src WHERE id = 1
+
+query ITT nosort
+SELECT a, b, note FROM c3
+----
+1
+ab
+x
+
+statement error 42601
+CREATE TABLE bad (a, b, c, d, e) AS SELECT id, name FROM src
+
+statement error 42601
+CREATE TABLE bad (a, b) AS SELECT id FROM src
+
+# a repeated name — written, from the query, or from the list — is 42701
+statement error 42701
+CREATE TABLE bad AS SELECT id AS a, name AS a FROM src
+
+statement error 42701
+CREATE TABLE bad AS SELECT 1, 2
+
+statement error 42701
+CREATE TABLE bad (a, a) AS SELECT id, name FROM src
+
+statement error 42701
+CREATE TABLE bad (name) AS SELECT id, name FROM src
+
+statement ok
+CREATE TABLE c4 (x) AS SELECT 1, 2
+
+query II nosort
+SELECT x, "?column?" FROM c4
+----
+1
+2
+
+# --- the column types the table accepts -------------------------------------------------------------
+
+# a column reference keeps its typmod: decimal(10,2) rounds to two places, varchar(5) refuses six
+statement ok
+CREATE TABLE t1 AS SELECT price, name, note FROM src WHERE false
+
+statement ok
+INSERT INTO t1 VALUES (1.234, 'abcde', 'any length at all')
+
+query DTT nosort
+SELECT price, name, note FROM t1
+----
+1.23
+abcde
+any length at all
+
+statement error 22001
+INSERT INTO t1 (name) VALUES ('abcdef')
+
+statement error 22003
+INSERT INTO t1 (price) VALUES (123456789.5)
+
+# an expression keeps no typmod: the arithmetic result is an unconstrained decimal, the function
+# result plain text
+statement ok
+CREATE TABLE t2 AS SELECT price + 0 AS p, name || '' AS n FROM src WHERE false
+
+statement ok
+INSERT INTO t2 VALUES (1.234, 'abcdefgh')
+
+query DT nosort
+SELECT p, n FROM t2
+----
+1.234
+abcdefgh
+
+# a typmod cast keeps the cast's typmod; a cast without one keeps none
+statement ok
+CREATE TABLE t3 AS SELECT price::decimal(6,1) AS p1, CAST(name AS varchar(3)) AS n3, price::decimal AS p, name::text AS n FROM src WHERE id = 1
+
+query DTDT nosort
+SELECT p1, n3, p, n FROM t3
+----
+1.5
+ab
+1.50
+ab
+
+statement ok
+INSERT INTO t3 VALUES (1.25, 'abc', 1.234, 'abcdefgh')
+
+statement error 22001
+INSERT INTO t3 (n3) VALUES ('abcd')
+
+query DTDT rowsort
+SELECT p1, n3, p, n FROM t3
+----
+1.3
+abc
+1.234
+abcdefgh
+1.5
+ab
+1.50
+ab
+
+# COALESCE / CASE / GREATEST / LEAST keep a typmod their inputs agree on; CASE needs an ELSE
+statement ok
+CREATE TABLE t4 AS SELECT coalesce(price, price) AS co, CASE WHEN id = 1 THEN name ELSE name END AS ca, greatest(price, price) AS g, least(name, name) AS l, coalesce(name, 'x') AS cx, CASE WHEN id = 1 THEN price END AS noelse FROM src WHERE false
+
+statement ok
+INSERT INTO t4 VALUES (1.234, 'abcde', 1.234, 'abcde', 'abcdefgh', 1.234)
+
+query DTDTTD nosort
+SELECT co, ca, g, l, cx, noelse FROM t4
+----
+1.23
+abcde
+1.23
+abcde
+abcdefgh
+1.234
+
+statement error 22001
+INSERT INTO t4 (ca) VALUES ('abcdef')
+
+statement error 22001
+INSERT INTO t4 (l) VALUES ('abcdef')
+
+# a scalar subquery keeps its column's typmod
+statement ok
+CREATE TABLE t5 AS SELECT (SELECT price FROM src WHERE id = 1) AS sq
+
+statement ok
+INSERT INTO t5 VALUES (9.999)
+
+query D rowsort
+SELECT sq FROM t5
+----
+1.50
+10.00
+
+# a derived table, a CTE, and a view pass their columns' typmods through
+statement ok
+CREATE VIEW vsrc AS SELECT price, name FROM src
+
+statement ok
+CREATE TABLE t6 AS WITH w AS (SELECT price FROM src) SELECT d.name, w.price, v.price AS vp FROM (SELECT id, name FROM src) d JOIN w ON true JOIN vsrc v ON v.name = d.name WHERE false
+
+statement ok
+INSERT INTO t6 VALUES ('abcde', 1.234, 5.678)
+
+query TDD nosort
+SELECT name, price, vp FROM t6
+----
+abcde
+1.23
+5.68
+
+statement error 22001
+INSERT INTO t6 (name) VALUES ('abcdef')
+
+# a set operation keeps the typmod both operands agree on, and none otherwise
+statement ok
+CREATE TABLE t7 AS SELECT price, name FROM src UNION ALL SELECT price, name FROM src WHERE id = 1
+
+statement ok
+CREATE TABLE t8 AS SELECT price, name FROM src UNION SELECT 1.234, 'abcdefgh'
+
+statement ok
+INSERT INTO t7 VALUES (1.234, 'abcde')
+
+statement error 22001
+INSERT INTO t7 (name) VALUES ('abcdef')
+
+query DT rowsort
+SELECT price, name FROM t8
+----
+1.234
+abcdefgh
+1.50
+ab
+10.00
+NULL
+2.25
+cde
+
+# a VALUES column keeps the typmod every row agrees on
+statement ok
+CREATE TABLE t9 AS VALUES (1.5::decimal(4,1), 'a'::varchar(2)), (2.25::decimal(4,1), 'b'::varchar(2))
+
+statement ok
+CREATE TABLE t10 AS VALUES (1.5::decimal(4,1)), (2.25)
+
+statement ok
+INSERT INTO t9 VALUES (3.33, 'bc')
+
+statement ok
+INSERT INTO t10 VALUES (3.33)
+
+query DT rowsort
+SELECT column1, column2 FROM t9
+----
+1.5
+a
+2.3
+b
+3.3
+bc
+
+query D rowsort
+SELECT column1 FROM t10
+----
+1.5
+2.25
+3.33
+
+statement error 22001
+INSERT INTO t9 (column2) VALUES ('abc')
+
+# a composite field keeps the field's typmod, through a column, a field, and `.*`
+statement ok
+CREATE TYPE money2 AS (amt decimal(6,2), cur varchar(3))
+
+statement ok
+CREATE TYPE wallet AS (owner text, cash money2)
+
+statement ok
+CREATE TABLE purse (id i32 PRIMARY KEY, w wallet)
+
+statement ok
+INSERT INTO purse VALUES (1, ROW('ann', ROW(1.5, 'usd')))
+
+statement ok
+CREATE TABLE t11 AS SELECT (w).owner, (w).cash, ((w).cash).amt, (purse.w).cash.cur FROM purse
+
+query TDTDT nosort
+SELECT owner, (cash).amt, (cash).cur, amt, cur FROM t11
+----
+ann
+1.50
+usd
+1.50
+usd
+
+statement error 42701
+CREATE TABLE bad AS SELECT ((w).cash).amt, ((w).cash).* FROM purse
+
+statement ok
+CREATE TABLE t12 AS SELECT ((w).cash).amt AS a, (w).cash.cur AS c, ((w).cash).* FROM purse
+
+statement ok
+INSERT INTO t12 VALUES (1.234, 'eur', 5.678, 'gbp')
+
+statement error 22001
+INSERT INTO t12 (c) VALUES ('abcd')
+
+statement error 22001
+INSERT INTO t12 (cur) VALUES ('abcd')
+
+query DTDT rowsort
+SELECT a, c, amt, cur FROM t12
+----
+1.23
+eur
+5.68
+gbp
+1.50
+usd
+1.50
+usd
+
+# an untyped NULL and a string literal are text
+statement ok
+CREATE TABLE t13 AS SELECT NULL AS n, 'abc' AS s
+
+statement ok
+INSERT INTO t13 VALUES ('any text', 'more text')
+
+query TT rowsort
+SELECT n, s FROM t13
+----
+NULL
+abc
+any text
+more text
+
+# array, range, and composite columns are filled like any other
+statement ok
+CREATE TABLE box (id i32 PRIMARY KEY, xs i32[], r int4range)
+
+statement ok
+INSERT INTO box VALUES (1, ARRAY[1, 2], '[1,5)'), (2, NULL, 'empty')
+
+statement ok
+CREATE TABLE t14 AS SELECT xs, r, xs[1] AS x1, w FROM box, purse ORDER BY box.id
+
+query TTIT nosort
+SELECT xs, r, x1, (w).owner FROM t14 ORDER BY x1
+----
+{1,2}
+[1,5)
+1
+ann
+NULL
+empty
+NULL
+ann
+
+# --- the query forms --------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE q1 AS SELECT id, name FROM src ORDER BY id DESC LIMIT 2
+
+query IT rowsort
+SELECT id, name FROM q1
+----
+2
+cde
+3
+NULL
+
+statement ok
+CREATE TABLE q2 AS VALUES (1, 'one'), (2, 'two')
+
+query IT rowsort
+SELECT column1, column2 FROM q2
+----
+1
+one
+2
+two
+
+statement ok
+CREATE TABLE q3 (n) AS WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 4) SELECT n FROM r
+
+query I rowsort
+SELECT n FROM q3
+----
+1
+2
+3
+4
+
+statement ok
+CREATE TABLE q4 AS SELECT id FROM src INTERSECT SELECT id FROM src WHERE id > 1 EXCEPT SELECT 3
+
+query I nosort
+SELECT id FROM q4
+----
+2
+
+statement ok
+CREATE TABLE q5 AS (SELECT id, count(*) AS c FROM src GROUP BY id HAVING id > 2)
+
+query II nosort
+SELECT id, c FROM q5
+----
+3
+1
+
+# --- WITH DATA, WITH NO DATA ------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE d1 AS SELECT id FROM src WITH DATA
+
+query I rowsort
+SELECT id FROM d1
+----
+1
+2
+3
+
+# WITH NO DATA creates the table empty and never runs the query, so its errors never fire
+# cost: 0
+statement ok
+CREATE TABLE d2 AS SELECT id, price / (id - id) AS boom FROM src WITH NO DATA
+
+query I nosort
+SELECT count(*) FROM d2
+----
+0
+
+statement ok
+INSERT INTO d2 VALUES (7, 1.5)
+
+query ID nosort
+SELECT id, boom FROM d2
+----
+7
+1.5
+
+# a table name `with` / a column named `data` still parse
+statement ok
+CREATE TABLE d3 AS SELECT id AS data FROM src AS "with" WHERE id = 1 WITH NO DATA
+
+query I nosort
+SELECT count(*) FROM d3
+----
+0
+
+# --- errors, and their order -------------------------------------------------------------------------
+
+# a runtime error while filling creates nothing
+statement error 22012
+CREATE TABLE e1 AS SELECT id / (id - id) FROM src
+
+statement error 42P01
+SELECT * FROM e1
+
+# a taken name is 42P07; IF NOT EXISTS skips it without running the query
+statement error 42P07
+CREATE TABLE src AS SELECT 1 AS a
+
+statement ok
+CREATE TABLE IF NOT EXISTS src AS SELECT id / (id - id) AS a FROM src
+
+query I nosort
+SELECT count(*) FROM src
+----
+3
+
+# the query is analyzed first: its errors come before the name check, even under IF NOT EXISTS
+statement error 42P01
+CREATE TABLE src AS SELECT * FROM nosuch
+
+statement error 42P01
+CREATE TABLE IF NOT EXISTS src AS SELECT * FROM nosuch
+
+statement error 42703
+CREATE TABLE IF NOT EXISTS src AS SELECT nosuch FROM src
+
+# too many column names before ON COMMIT, ON COMMIT before a repeated name, a repeated name before a
+# record column
+statement error 42601
+CREATE TABLE bad (a, b, c) ON COMMIT DROP AS SELECT 1 AS x
+
+statement error 42P16
+CREATE TABLE bad ON COMMIT DROP AS SELECT 1 AS a, 2 AS a
+
+statement error 42P16
+CREATE TABLE bad ON COMMIT PRESERVE ROWS AS SELECT 1 AS a
+
+statement error 42701
+CREATE TABLE bad AS SELECT ROW(1, 2) AS a, 2 AS a
+
+# an anonymous record has no storable type (PostgreSQL's pseudo-type record)
+statement error 42P16
+CREATE TABLE bad AS SELECT 1 AS a, ROW(1, 2) AS r
+
+# a recursive CTE whose recursive term changes the typmod its non-recursive term fixed is 42804
+statement error 42804
+CREATE TABLE bad AS WITH RECURSIVE r(n) AS (SELECT price FROM src WHERE id = 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
+
+statement error 42804
+WITH RECURSIVE r(n) AS (SELECT name FROM src WHERE id = 1 UNION ALL SELECT n || 'x' FROM r WHERE n < 'abx') SELECT n FROM r
+
+query D rowsort
+WITH RECURSIVE r(n) AS (SELECT price FROM src WHERE id = 1 UNION ALL SELECT n FROM r WHERE n < 0) SELECT n FROM r
+----
+1.50
+
+query D rowsort
+WITH RECURSIVE r(n) AS (SELECT 1.5 UNION ALL SELECT price FROM src, r WHERE false) SELECT n FROM r
+----
+1.5
+
+statement error 42601
+CREATE TABLE bad (a,) AS SELECT 1
+
+statement error 42601
+CREATE TABLE bad AS
+
+statement error 42601
+CREATE TABLE bad AS SELECT 1 WITH
+
+statement error 42601
+CREATE TABLE bad AS SELECT 1 WITH SOME DATA
+
+# a data-modifying WITH in the query is not supported yet (create-table-as.md §5); PostgreSQL runs it
+statement error 0A000
+CREATE TABLE bad AS WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id FROM d

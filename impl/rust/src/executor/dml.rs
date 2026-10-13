@@ -686,38 +686,31 @@ impl Engine {
                                     )));
                                 }
                             }
-                            // INSERT ... SELECT into a composite column lands in a later slice
-                            // (the VALUES + ROW(…) path is S3 — spec/design/composite.md §12).
-                            Type::Composite(_) => {
-                                return Err(EngineError::new(
-                                    SqlState::FeatureNotSupported,
-                                    format!(
-                                        "INSERT ... SELECT into composite column {} is not supported yet",
-                                        col.name
-                                    ),
-                                ));
-                            }
-                            // INSERT ... SELECT into an array column is deferred (the VALUES +
-                            // ARRAY[…] path is the supported input — spec/design/array.md §12).
-                            Type::Array(_) => {
-                                return Err(EngineError::new(
-                                    SqlState::FeatureNotSupported,
-                                    format!(
-                                        "INSERT ... SELECT into array column {} is not supported yet",
-                                        col.name
-                                    ),
-                                ));
-                            }
-                            // INSERT ... SELECT into a range column is deferred (the VALUES + range
-                            // literal/cast path is the supported input — spec/design/ranges.md §1).
-                            Type::Range(_) => {
-                                return Err(EngineError::new(
-                                    SqlState::FeatureNotSupported,
-                                    format!(
-                                        "INSERT ... SELECT into range column {} is not supported yet",
-                                        col.name
-                                    ),
-                                ));
+                            // A container column takes a source column of exactly its own type, or an
+                            // untyped NULL — the container assignment rule UPDATE and an INSERT VALUES
+                            // expression share (array.md §4, ranges.md §4, composite.md §12). An
+                            // anonymous ROW(…) column has no composite type to match (0A000).
+                            Type::Composite(_) | Type::Array(_) | Type::Range(_) => {
+                                let src = &q.column_types[p];
+                                if matches!(src, ResolvedType::Composite(c) if c.name.is_none()) {
+                                    return Err(EngineError::new(
+                                        SqlState::FeatureNotSupported,
+                                        format!(
+                                            "inserting a ROW expression into composite column {} is not supported yet",
+                                            col.name
+                                        ),
+                                    ));
+                                }
+                                if !matches!(src, ResolvedType::Null)
+                                    && *src != resolved_type_of_col(&col.ty, self)
+                                {
+                                    return Err(type_error(format!(
+                                        "column {} is of type {} but expression is of type {}",
+                                        col.name,
+                                        col.ty.canonical_name(),
+                                        src.type_name(),
+                                    )));
+                                }
                             }
                         }
                     }
@@ -2749,7 +2742,7 @@ impl Engine {
             .expect("INSERT target resolved above");
         let mut scope = Scope::returning(self, tdef, base_is_old, returning, vw, alias)?;
         scope.ctes = ctes;
-        let (nodes, names, types, _) =
+        let (nodes, names, types, _, _) =
             resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
         Ok((nodes, names, type_names(&types)))
     }
@@ -3259,7 +3252,7 @@ impl Engine {
             Some(returning) => {
                 let mut rscope = Scope::returning(self, table, true, returning, vw.as_ref(), None)?;
                 rscope.ctes = ctx.bindings;
-                let (nodes, names, types, _) = resolve_projections(
+                let (nodes, names, types, _, _) = resolve_projections(
                     &rscope,
                     &returning.items,
                     &mut AggCtx::Forbidden,
@@ -3688,7 +3681,7 @@ impl Engine {
                 let mut rscope =
                     Scope::returning(self, table, false, returning, vw.as_ref(), None)?;
                 rscope.ctes = ctx.bindings;
-                let (nodes, names, types, _) = resolve_projections(
+                let (nodes, names, types, _, _) = resolve_projections(
                     &rscope,
                     &returning.items,
                     &mut AggCtx::Forbidden,

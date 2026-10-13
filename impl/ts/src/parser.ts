@@ -871,6 +871,9 @@ class Parser {
     // INTO the named database (`main` / `temp` / a host attachment). A bare name uses the implicit
     // scope. The `.` after the first identifier makes it the qualifier and the next the table name.
     const [db, name] = this.parseQualifiedTableName();
+    if (this.atCreateTableAs()) {
+      return this.parseCreateTableAs(name, db, temp, ifNotExists);
+    }
     this.expect("lparen");
 
     const columns: ColumnDef[] = [];
@@ -917,7 +920,97 @@ class Parser {
       fks,
       excludes,
       ...(onCommit === undefined ? {} : { onCommit }),
+      asQuery: null,
     };
+  }
+
+  // atCreateTableAs reports whether the cursor, just past a CREATE TABLE's name, begins the `CREATE
+  // TABLE … AS` form (spec/design/create-table-as.md §1): the keyword AS, the keyword ON (an ON COMMIT
+  // clause precedes AS; the column-definition form needs `(` here), or a parenthesized list of bare
+  // column names followed by AS or ON. A column definition always has a type after its name, so
+  // `( name , … )` of single identifiers is never the column-definition form.
+  private atCreateTableAs(): boolean {
+    const kw = (i: number): boolean => {
+      const w = this.peekKeywordAt(i);
+      return w === "as" || w === "on";
+    };
+    if (kw(0)) return true;
+    if (this.peekKindAt(0) !== "lparen") return false;
+    let i = 1;
+    for (;;) {
+      const k = this.peekKindAt(i);
+      if (k !== "word" && k !== "quotedIdent") return false;
+      const next = this.peekKindAt(i + 1);
+      if (next === "comma") {
+        i += 2;
+      } else if (next === "rparen") {
+        return kw(i + 2);
+      } else {
+        return false;
+      }
+    }
+  }
+
+  // parseCreateTableAs parses the rest of `CREATE [TEMP] TABLE [IF NOT EXISTS] name [( col [, …] )]
+  // [ON COMMIT …] AS query [WITH [NO] DATA]` (spec/design/create-table-as.md §1, grammar.md §13). The
+  // query is a `subquery_expr`. A trailing `WITH [NO] DATA` is cut off before the query is parsed, as
+  // CREATE VIEW cuts off its check option: an unreserved `with` would otherwise read as a table alias.
+  private parseCreateTableAs(
+    name: string,
+    db: string | undefined,
+    temp: boolean,
+    ifNotExists: boolean,
+  ): Statement {
+    let columnNames: string[] | null = null;
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      columnNames = [this.expectIdentifier()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        columnNames.push(this.expectIdentifier());
+      }
+      this.expect("rparen");
+    }
+    const onCommit = this.parseOnCommit();
+    this.expectKeyword("as");
+    const trailing = this.trailingWithData();
+    if (trailing !== null) this.tokens[trailing.at] = { kind: "eof" };
+    const query = this.parseSubquery();
+    if (trailing !== null && this.pos !== trailing.at) {
+      throw engineError("syntax_error", "unexpected trailing input");
+    }
+    return {
+      kind: "createTable",
+      name,
+      db,
+      temp,
+      ifNotExists,
+      columns: [],
+      tablePks: [],
+      checks: [],
+      uniques: [],
+      fks: [],
+      excludes: [],
+      ...(onCommit === undefined ? {} : { onCommit }),
+      asQuery: { columnNames, query, withData: trailing === null || trailing.withData },
+    };
+  }
+
+  // trailingWithData returns the token index of a trailing `WITH DATA` / `WITH NO DATA` ending the
+  // statement and whether the table is filled (spec/design/create-table-as.md §1), or null when absent.
+  private trailingWithData(): { at: number; withData: boolean } | null {
+    let end = this.tokens.length;
+    if (this.tokens[end - 1]?.kind === "eof") end--;
+    const word = (i: number, w: string): boolean => {
+      const t = this.tokens[i];
+      return t !== undefined && t.kind === "word" && t.word === w;
+    };
+    if (end < this.pos + 2 || !word(end - 1, "data")) return null;
+    if (word(end - 2, "with")) return { at: end - 2, withData: true };
+    if (end >= this.pos + 3 && word(end - 2, "no") && word(end - 3, "with")) {
+      return { at: end - 3, withData: false };
+    }
+    return null;
   }
 
   // parseOnCommit parses the optional trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` of a

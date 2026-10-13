@@ -23,7 +23,7 @@ test("multidim / custom-lower-bound array key order (jed's array_cmp, not PG's O
 
 // (b) float-element arrays ARE keyable; the order recurses into the float-order-preserving element
 // key (float total order: -0=+0, NaN largest, shorter-prefix first). The '{…}' literal coerces the
-// specials (NaN/Infinity) without an INSERT ... SELECT (0A000 into an array column this slice).
+// specials (NaN/Infinity), so they arrive as plain literals.
 test("float-element array key is keyable", () => {
   const db = dbWith(["CREATE TABLE m (k f64[] PRIMARY KEY)"]);
   for (const v of ["{1.5,2.5}", "{1.5}", "{-Infinity}", "{NaN}", "{1.5,2.0}"]) {

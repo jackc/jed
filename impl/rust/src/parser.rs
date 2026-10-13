@@ -8,13 +8,14 @@ use crate::ast::{
     AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence,
     AlterTable, AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, Assignment,
     BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictTarget, CreateIndex, CreateSequence,
-    CreateTable, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence,
-    DropTable, DropType, DropView, ExcludeDef, Expr, ForeignKeyDef, GroupItem, IdentitySpec,
-    IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
-    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
-    OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItem, SelectItems,
-    SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos,
-    TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete,
+    DropIndex, DropSequence, DropTable, DropType, DropView, ExcludeDef, Expr, ForeignKeyDef,
+    GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
+    JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
+    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select,
+    SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement,
+    SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
+    WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -703,6 +704,9 @@ impl Parser {
         // table INTO the named database (`main` / `temp` / a host attachment). A bare name uses the
         // implicit scope. The `.` after the first identifier makes it the qualifier, the next the name.
         let (db, name) = self.parse_qualified_table_name()?;
+        if self.at_create_table_as() {
+            return self.parse_create_table_as(name, db, temp, if_not_exists);
+        }
         self.expect(&Token::LParen)?;
 
         let mut columns = Vec::new();
@@ -756,7 +760,172 @@ impl Parser {
             excludes,
             db,
             on_commit,
+            as_query: None,
         })
+    }
+
+    /// The rest of a `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` call after its keyword was peeked
+    /// (json-sql-functions.md §5). Kept out of `parse_primary` (never inlined) so its several `Expr`
+    /// temporaries do not enlarge the frame every parenthesis level of an expression recurses through
+    /// (the MAX_EXPR_DEPTH native-stack bound, cost.md §7).
+    #[inline(never)]
+    fn parse_json_query_function(&mut self, kw: &str) -> Result<Expr> {
+        self.advance(); // the function keyword
+        self.advance(); // (
+        let ctx = self.parse_expr()?;
+        // `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb
+        // context is coerced to jsonb regardless).
+        self.skip_format_json();
+        self.expect(&Token::Comma)?;
+        let path = self.parse_expr()?;
+        // `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
+        if self.peek_keyword().as_deref() == Some("passing") {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "JSON query function PASSING clause is not supported yet",
+            ));
+        }
+        let expr = match kw {
+            "json_exists" => {
+                let on_error = self.parse_json_on_error_only()?;
+                Expr::JsonExists {
+                    ctx: Box::new(ctx),
+                    path: Box::new(path),
+                    on_error,
+                }
+            }
+            "json_value" => {
+                let returning = self.parse_json_returning()?;
+                let (on_empty, on_error) = self.parse_json_on_clauses()?;
+                Expr::JsonValue {
+                    ctx: Box::new(ctx),
+                    path: Box::new(path),
+                    returning,
+                    on_empty,
+                    on_error,
+                }
+            }
+            _ => {
+                let returning = self.parse_json_returning()?;
+                let (wrapper, keep_quotes) = self.parse_json_wrapper_quotes()?;
+                let (on_empty, on_error) = self.parse_json_on_clauses()?;
+                Expr::JsonQuery {
+                    ctx: Box::new(ctx),
+                    path: Box::new(path),
+                    returning,
+                    wrapper,
+                    keep_quotes,
+                    on_empty,
+                    on_error,
+                }
+            }
+        };
+        self.expect(&Token::RParen)?;
+        Ok(expr)
+    }
+
+    /// Whether the cursor, just past a CREATE TABLE's name, begins the `CREATE TABLE … AS` form
+    /// (spec/design/create-table-as.md §1): the keyword `AS`, the keyword `ON` (an `ON COMMIT` clause
+    /// precedes `AS`; the column-definition form needs `(` here), or a parenthesized list of bare
+    /// column names followed by `AS` or `ON`. A column definition always has a type after its name,
+    /// so `( name , … )` of single identifiers is never the column-definition form.
+    fn at_create_table_as(&self) -> bool {
+        let kw = |i: usize| matches!(self.peek_at(i), Token::Word(w) if w == "as" || w == "on");
+        if kw(0) {
+            return true;
+        }
+        if !matches!(self.peek_at(0), Token::LParen) {
+            return false;
+        }
+        let mut i = 1;
+        loop {
+            if !matches!(self.peek_at(i), Token::Word(_) | Token::QuotedIdent(_)) {
+                return false;
+            }
+            match self.peek_at(i + 1) {
+                Token::Comma => i += 2,
+                Token::RParen => return kw(i + 2),
+                _ => return false,
+            }
+        }
+    }
+
+    /// The rest of `CREATE [TEMP] TABLE [IF NOT EXISTS] name [( col [, …] )] [ON COMMIT …] AS query
+    /// [WITH [NO] DATA]` (spec/design/create-table-as.md §1, grammar.md §13). The query is a
+    /// `subquery_expr`. A trailing `WITH [NO] DATA` is cut off before the query is parsed, as CREATE
+    /// VIEW cuts off its check option: an unreserved `with` would otherwise read as a table alias.
+    fn parse_create_table_as(
+        &mut self,
+        name: String,
+        db: Option<String>,
+        temp: bool,
+        if_not_exists: bool,
+    ) -> Result<CreateTable> {
+        let column_names = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut cols = vec![self.expect_identifier()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                cols.push(self.expect_identifier()?);
+            }
+            self.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        let on_commit = self.parse_on_commit()?;
+        self.expect_keyword("as")?;
+        let trailing = self.trailing_with_data();
+        if let Some((at, _)) = trailing {
+            self.tokens[at] = Token::Eof;
+        }
+        let query = self.parse_subquery()?;
+        if let Some((at, _)) = trailing {
+            if self.pos != at {
+                return Err(syntax(format!(
+                    "unexpected trailing input: {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        Ok(CreateTable {
+            name,
+            temp,
+            if_not_exists,
+            columns: Vec::new(),
+            table_pks: Vec::new(),
+            checks: Vec::new(),
+            uniques: Vec::new(),
+            foreign_keys: Vec::new(),
+            excludes: Vec::new(),
+            db,
+            on_commit,
+            as_query: Some(Box::new(CreateTableAs {
+                column_names,
+                query,
+                with_data: trailing.is_none_or(|(_, with_data)| with_data),
+            })),
+        })
+    }
+
+    /// A trailing `WITH DATA` / `WITH NO DATA` ending the statement (spec/design/create-table-as.md
+    /// §1): the token index of its `WITH` and whether the table is filled. `None` when absent.
+    fn trailing_with_data(&self) -> Option<(usize, bool)> {
+        let mut end = self.tokens.len();
+        if matches!(self.tokens.last(), Some(Token::Eof)) {
+            end -= 1;
+        }
+        let word = |i: usize, w: &str| matches!(self.tokens.get(i), Some(Token::Word(x)) if x == w);
+        if end < self.pos + 2 || !word(end - 1, "data") {
+            return None;
+        }
+        if word(end - 2, "with") {
+            return Some((end - 2, true));
+        }
+        if end >= self.pos + 3 && word(end - 2, "no") && word(end - 3, "with") {
+            return Some((end - 3, false));
+        }
+        None
     }
 
     /// Parse the optional trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` of a CREATE TABLE
@@ -5183,58 +5352,7 @@ impl Parser {
             && matches!(self.peek_at(1), Token::LParen)
         {
             let kw = kw.to_string();
-            self.advance(); // the function keyword
-            self.advance(); // (
-            let ctx = self.parse_expr()?;
-            // `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb
-            // context is coerced to jsonb regardless).
-            self.skip_format_json();
-            self.expect(&Token::Comma)?;
-            let path = self.parse_expr()?;
-            // `PASSING arg AS name, …` (the path-variable surface) is the deferred S2 follow-on.
-            if self.peek_keyword().as_deref() == Some("passing") {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "JSON query function PASSING clause is not supported yet",
-                ));
-            }
-            let expr = match kw.as_str() {
-                "json_exists" => {
-                    let on_error = self.parse_json_on_error_only()?;
-                    Expr::JsonExists {
-                        ctx: Box::new(ctx),
-                        path: Box::new(path),
-                        on_error,
-                    }
-                }
-                "json_value" => {
-                    let returning = self.parse_json_returning()?;
-                    let (on_empty, on_error) = self.parse_json_on_clauses()?;
-                    Expr::JsonValue {
-                        ctx: Box::new(ctx),
-                        path: Box::new(path),
-                        returning,
-                        on_empty,
-                        on_error,
-                    }
-                }
-                _ => {
-                    let returning = self.parse_json_returning()?;
-                    let (wrapper, keep_quotes) = self.parse_json_wrapper_quotes()?;
-                    let (on_empty, on_error) = self.parse_json_on_clauses()?;
-                    Expr::JsonQuery {
-                        ctx: Box::new(ctx),
-                        path: Box::new(path),
-                        returning,
-                        wrapper,
-                        keep_quotes,
-                        on_empty,
-                        on_error,
-                    }
-                }
-            };
-            self.expect(&Token::RParen)?;
-            return Ok(expr);
+            return self.parse_json_query_function(&kw);
         }
         // `COALESCE(a, b, …)` — the first-non-NULL conditional (grammar.md §51). Recognized only
         // when COALESCE is immediately followed by `(` (the JSON(/EXTRACT( one-token lookahead),

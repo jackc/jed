@@ -551,6 +551,22 @@ export type CreateTable = {
   // (spec/design/temp-tables.md §5.1), undefined when absent. Any clause — PRESERVE ROWS included — on
   // a table that is not temporary is 42P16 at execution (PostgreSQL's ONCOMMIT_NOOP distinction).
   onCommit?: OnCommitAction;
+  // `CREATE TABLE … AS query` (spec/design/create-table-as.md): the table's columns come from the
+  // query's output and its rows from running it. null for the column-definition form; when set,
+  // columns and every constraint list are empty.
+  asQuery: CreateTableAs | null;
+};
+
+// CreateTableAs is the `[( col [, …] )] AS query [WITH [NO] DATA]` part of a `CREATE TABLE … AS`
+// (spec/design/create-table-as.md §1).
+export type CreateTableAs = {
+  // The optional column-name list. It renames the query's output columns left to right; a shorter
+  // list leaves the rest with their query names, a longer one is 42601.
+  columnNames: string[] | null;
+  // The query (`subquery_expr`): a SELECT, VALUES, set operation, or nested WITH.
+  query: QueryExpr;
+  // false for `WITH NO DATA`: the table is created empty and the query is never run.
+  withData: boolean;
 };
 
 // ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional

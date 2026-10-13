@@ -1,0 +1,101 @@
+# The collation of a CREATE TABLE … AS column (spec/design/create-table-as.md §2, collation.md §1): a
+# text column takes the collation its query output derives — a column's, an explicit COLLATE, or a
+# collatable function's propagated one — and an output that derives none (a literal) takes the
+# database default, as a declared column without COLLATE does. An output whose collation cannot be
+# derived (two different implicit collations meeting in a UNION ALL or an expression) is 42P22, as
+# in PostgreSQL. Each created column's collation is observed through its sort order. Loads the
+# vendored `unicode` collation, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.create_table_as, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.is_null, query.union, expr.collate, expr.text_concat, ddl.collate_column, types.i32, types.text
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE t (k i32 PRIMARY KEY, b text, u text COLLATE "unicode")
+
+statement ok
+INSERT INTO t VALUES (1, 'b', 'b'), (2, 'A', 'A'), (3, 'a', 'a')
+
+# u keeps "unicode", b keeps C, the COLLATE "unicode" output is "unicode", and the literal's column
+# takes the default (C)
+statement ok
+CREATE TABLE c AS SELECT b, u, b COLLATE "unicode" AS bu, u COLLATE "C" AS uc, 'x' AS lit, k FROM t
+
+query T nosort
+SELECT b FROM c ORDER BY b
+----
+A
+a
+b
+
+query T nosort
+SELECT u FROM c ORDER BY u
+----
+a
+A
+b
+
+query T nosort
+SELECT bu FROM c ORDER BY bu
+----
+a
+A
+b
+
+query T nosort
+SELECT uc FROM c ORDER BY uc
+----
+A
+a
+b
+
+statement ok
+INSERT INTO c (lit) VALUES ('B'), ('a')
+
+query T nosort
+SELECT lit FROM c WHERE k IS NULL ORDER BY lit
+----
+B
+a
+
+# the column list renames without changing the collation
+statement ok
+CREATE TABLE c2 (x) AS SELECT u FROM t
+
+query T nosort
+SELECT x FROM c2 ORDER BY x
+----
+a
+A
+b
+
+# a UNION ALL column over two different implicit collations has none: 42P22
+statement error 42P22
+CREATE TABLE bad AS SELECT b FROM t UNION ALL SELECT u FROM t
+
+# as has an expression combining them
+statement error 42P22
+CREATE TABLE bad AS SELECT b || u AS x FROM t
+
+# an explicit COLLATE settles either
+statement ok
+CREATE TABLE c3 AS SELECT b COLLATE "unicode" AS x FROM t UNION ALL SELECT u FROM t
+
+query T nosort
+SELECT x FROM c3 ORDER BY x
+----
+a
+a
+A
+A
+b
+b
+
+statement ok
+CREATE TABLE c4 AS SELECT (b || u) COLLATE "C" AS x FROM t
+
+query T nosort
+SELECT x FROM c4 ORDER BY x
+----
+AA
+aa
+bb

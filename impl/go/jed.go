@@ -46,6 +46,8 @@ var SupportedCapabilities = []string{
 	// session.allow_temp_ddl; storage budget resource.temp_budget.
 	"ddl.temp_table",
 	"ddl.temp_on_commit",
+	// CREATE TABLE … AS query [WITH [NO] DATA] (spec/design/create-table-as.md).
+	"ddl.create_table_as",
 	// CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write
 	// and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
 	"ddl.secondary_index",
@@ -182,6 +184,8 @@ var SupportedCapabilities = []string{
 	// type-assignability (42804) gates, then the same two-phase validation (grammar.md §24).
 	"dml.insert_select",
 	"dml.insert_select_setop",
+	// INSERT ... SELECT into an array / range / composite column of exactly the source's type.
+	"dml.insert_select_container",
 	// General expressions (incl. scalar subqueries) in INSERT ... VALUES slots (grammar.md §16).
 	"dml.insert_values_expr",
 	"error.overflow_trap",

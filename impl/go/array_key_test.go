@@ -54,7 +54,7 @@ func firstColRows(t *testing.T, db dbHandle, sql string) []string {
 
 // TestFloatElementArrayKeyIsKeyable: a f64[] PRIMARY KEY is now allowed (the §2.8 float-key lift) and
 // the store iterates in array_cmp order over the float total order (-0=+0, NaN largest, shorter-prefix
-// first). The '{…}' literal coerces the specials (NaN/Infinity) without an INSERT ... SELECT.
+// first). The '{…}' literal coerces the specials (NaN/Infinity), so they arrive as plain literals.
 func TestFloatElementArrayKeyIsKeyable(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t, "CREATE TABLE m (k f64[] PRIMARY KEY)")

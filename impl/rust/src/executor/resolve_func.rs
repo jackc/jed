@@ -1020,6 +1020,16 @@ pub(crate) fn grouping_error_column(name: &str) -> EngineError {
     )
 }
 
+/// A resolved select list: the evaluable projections and, per output column, its name, type,
+/// collation derivation, and typmod.
+pub(crate) type Projections = (
+    Vec<RExpr>,
+    Vec<String>,
+    Vec<ResolvedType>,
+    Vec<Deriv>,
+    Vec<Typmod>,
+);
+
 /// Resolve `SELECT` items against the FROM scope into evaluable projections (any result type
 /// is allowed in the select list, including boolean — `SELECT a = b`), each paired with its
 /// output column name (spec/design/grammar.md §8) and collation derivation (spec/design/
@@ -1030,7 +1040,7 @@ pub(crate) fn resolve_projections(
     items: &SelectItems,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<(Vec<RExpr>, Vec<String>, Vec<ResolvedType>, Vec<Deriv>)> {
+) -> Result<Projections> {
     match items {
         SelectItems::All(star_pos) => {
             // `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
@@ -1046,6 +1056,7 @@ pub(crate) fn resolve_projections(
             let mut names = Vec::new();
             let mut types = Vec::new();
             let mut derivs = Vec::new();
+            let mut typmods = Vec::new();
             // The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
             // grammar.md §15); a merge's underlying copies are hidden and so absent from it.
             if let Some(star) = &scope.star {
@@ -1055,6 +1066,7 @@ pub(crate) fn resolve_projections(
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
                     derivs.push(cat_column_deriv(c));
+                    typmods.push(Typmod::of_column(c));
                     scope.trace_flat(idx);
                 }
                 // A written `*` in a view body is frozen into its expansion (views.md §5).
@@ -1067,7 +1079,7 @@ pub(crate) fn resolve_projections(
                         scope.catalog.trace_star(pos, false, cols);
                     }
                 }
-                return Ok((nodes, names, types, derivs));
+                return Ok((nodes, names, types, derivs, typmods));
             }
             // The RETURNING `old`/`new` pseudo-relations are qualifier-only: `*` expands the
             // real relations' columns exactly as before (grammar.md §32).
@@ -1087,6 +1099,7 @@ pub(crate) fn resolve_projections(
                         &mut names,
                         &mut types,
                         &mut derivs,
+                        &mut typmods,
                     )?;
                     continue;
                 }
@@ -1099,15 +1112,17 @@ pub(crate) fn resolve_projections(
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
                     derivs.push(cat_column_deriv(c));
+                    typmods.push(Typmod::of_column(c));
                 }
             }
-            Ok((nodes, names, types, derivs))
+            Ok((nodes, names, types, derivs, typmods))
         }
         SelectItems::Items(items) => {
             let mut nodes = Vec::new();
             let mut names = Vec::new();
             let mut types = Vec::new();
             let mut derivs = Vec::new();
+            let mut typmods = Vec::new();
             for it in items {
                 // `t.*` expands the FROM relation labeled `qualifier` into one output column per
                 // column, in catalog order (grammar.md §15) — like bare `*` but for one named
@@ -1129,6 +1144,7 @@ pub(crate) fn resolve_projections(
                             &mut names,
                             &mut types,
                             &mut derivs,
+                            &mut typmods,
                         )?;
                         continue;
                     }
@@ -1156,6 +1172,7 @@ pub(crate) fn resolve_projections(
                         names.push(c.name.clone());
                         types.push(resolved_type_of_col(&c.ty, scope.catalog));
                         derivs.push(cat_column_deriv(c));
+                        typmods.push(Typmod::of_column(c));
                         scope.trace_flat(slots[i]);
                     }
                     // A written `rel.*` in a view body is frozen into `"rel" . "col"` references
@@ -1179,6 +1196,10 @@ pub(crate) fn resolve_projections(
                 // parser does not attach one to a star item in practice).
                 if let Expr::FieldStar { base } = &it.expr {
                     let (_, base_ty) = resolve(scope, base, None, agg, params)?;
+                    // Each field keeps its declared typmod (PostgreSQL's FieldSelect).
+                    let field_typmods: Vec<Typmod> = composite_of_expr(scope, base)
+                        .map(|def| def.fields.iter().map(Typmod::of_field).collect())
+                        .unwrap_or_default();
                     let fields = match base_ty {
                         ResolvedType::Composite(c) => c.fields,
                         other => {
@@ -1200,6 +1221,7 @@ pub(crate) fn resolve_projections(
                         names.push(fname);
                         types.push(fty);
                         derivs.push(Deriv::None);
+                        typmods.push(field_typmods.get(i).copied().unwrap_or_default());
                     }
                     continue;
                 }
@@ -1217,16 +1239,18 @@ pub(crate) fn resolve_projections(
                     Deriv::None
                 };
                 derivs.push(d);
+                typmods.push(derive_typmod(scope, &it.expr));
                 nodes.push(node);
                 types.push(ty);
             }
-            Ok((nodes, names, types, derivs))
+            Ok((nodes, names, types, derivs, typmods))
         }
     }
 }
 
 /// Expand a layered relation's `*` (a write through a view, views.md §15.2): each of the view's
 /// columns, by name, resolved through the layer.
+#[allow(clippy::too_many_arguments)]
 fn push_layer_columns(
     scope: &Scope,
     rel: usize,
@@ -1235,6 +1259,7 @@ fn push_layer_columns(
     names: &mut Vec<String>,
     types: &mut Vec<ResolvedType>,
     derivs: &mut Vec<Deriv>,
+    typmods: &mut Vec<Typmod>,
 ) -> Result<()> {
     let layer = scope.rels[rel].layer.expect("a layered relation");
     for (col, c) in layer.columns.iter().enumerate() {
@@ -1244,6 +1269,7 @@ fn push_layer_columns(
         names.push(c.name.clone());
         types.push(ty);
         derivs.push(cat_column_deriv(c));
+        typmods.push(Typmod::of_column(c));
     }
     Ok(())
 }
@@ -2844,6 +2870,14 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
             // A temp table's DDL is gated by the temp-scoped split of `allow_ddl` (temp-tables.md §5):
             // `allow_temp_ddl` for a session-local temp table.
             req.is_temp_ddl = ct.temp;
+            // `CREATE TABLE … AS` reads what its query reads, as PostgreSQL checks it when the query
+            // runs; `WITH NO DATA` never runs the query, so it needs nothing on what the query names
+            // (spec/design/create-table-as.md §4).
+            if let Some(cta) = &ct.as_query
+                && cta.with_data
+            {
+                collect_query_privs(&cta.query, req, &locals);
+            }
         }
         Statement::DropTable(_)
         | Statement::CreateIndex(_)
@@ -4054,7 +4088,12 @@ pub(crate) fn resolve(
                 ));
             }
             let out_type = plan.column_types()[0].clone();
-            note_subquery_deriv(scope, inner, &plan.column_derivs()[0]);
+            note_subquery_deriv(
+                scope,
+                inner,
+                &plan.column_derivs()[0],
+                plan.column_typmods()[0],
+            );
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -5399,8 +5438,8 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
                 .borrow()
                 .iter()
                 .rev()
-                .find(|(k, _)| *k == key)
-                .map_or(Deriv::None, |(_, d)| d.clone())
+                .find(|(k, _, _)| *k == key)
+                .map_or(Deriv::None, |(_, d, _)| d.clone())
         }
         _ => Deriv::None,
     })
@@ -5414,6 +5453,150 @@ pub(crate) fn combine_derivs(scope: &Scope, args: &[Expr]) -> Result<Deriv> {
         d = combine_deriv(d, derive_collation(scope, a)?)?;
     }
     Ok(d)
+}
+
+/// A query output column's type modifier (spec/design/create-table-as.md §2): the `numeric(p,s)`
+/// precision and scale, or the `varchar(n)` length, that a `CREATE TABLE … AS` column keeps. Both
+/// `None` is no typmod. Only a decimal or text scalar carries one; an array's element typmod is not
+/// tracked (an array column cannot declare one — array.md §12).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Typmod {
+    pub(crate) decimal: Option<DecimalTypmod>,
+    pub(crate) varchar_len: Option<u32>,
+}
+
+impl Typmod {
+    pub(crate) const NONE: Typmod = Typmod {
+        decimal: None,
+        varchar_len: None,
+    };
+
+    /// A column's declared typmod (a catalog column, or a synthetic one that recorded its body's).
+    pub(crate) fn of_column(col: &Column) -> Typmod {
+        Typmod {
+            decimal: col.decimal,
+            varchar_len: col.varchar_len,
+        }
+    }
+
+    /// The typmod of a composite field (PostgreSQL's FieldSelect keeps it).
+    fn of_field(field: &crate::catalog::CompositeField) -> Typmod {
+        Typmod {
+            decimal: field.decimal,
+            varchar_len: field.varchar_len,
+        }
+    }
+}
+
+/// The common typmod of several inputs (PostgreSQL's `select_common_typmod`, and `exprTypmod` for
+/// `CASE` / `COALESCE` / `GREATEST` / `LEAST`): their typmod when every input has the same one, else
+/// none. Typmods only exist on decimal and text values, so equal typmods mean one type.
+pub(crate) fn common_typmod(inputs: impl IntoIterator<Item = Typmod>) -> Typmod {
+    let mut it = inputs.into_iter();
+    let Some(first) = it.next() else {
+        return Typmod::NONE;
+    };
+    if it.all(|t| t == first) {
+        first
+    } else {
+        Typmod::NONE
+    }
+}
+
+/// The typmod an expression keeps (spec/design/create-table-as.md §2, PostgreSQL's `exprTypmod`): a
+/// column reference keeps its column's, a cast to `numeric(p,s)` / `varchar(n)` has the cast's, a
+/// `COLLATE` keeps its operand's, `CASE` (with an `ELSE`), `COALESCE`, `GREATEST`, and `LEAST` keep
+/// their inputs' common typmod, a scalar subquery keeps its output column's, and a composite field
+/// selection keeps the field's. Every other expression — an operator, a function, an aggregate, a
+/// literal, a parameter, a cast without a typmod — has none.
+pub(crate) fn derive_typmod(scope: &Scope, e: &Expr) -> Typmod {
+    match e {
+        Expr::Column(name, _) => scope
+            .resolve_bare(name)
+            .ok()
+            .map_or(Typmod::NONE, |r| Typmod::of_column(scope.column_of(r))),
+        Expr::QualifiedColumn {
+            qualifier, name, ..
+        } => scope
+            .resolve_qualified(qualifier, name)
+            .ok()
+            .map_or(Typmod::NONE, |r| Typmod::of_column(scope.column_of(r))),
+        Expr::Collate { inner, .. } => derive_typmod(scope, inner),
+        Expr::Cast {
+            type_name,
+            type_mod,
+            ..
+        } if type_mod.is_some() && !type_name.ends_with("[]") => {
+            match resolve_type_and_typmod(type_name, type_mod) {
+                Ok((_, decimal, varchar_len)) => Typmod {
+                    decimal,
+                    varchar_len,
+                },
+                Err(_) => Typmod::NONE,
+            }
+        }
+        // CASE without an ELSE can yield a NULL of no typmod (PostgreSQL returns none).
+        Expr::Case {
+            whens,
+            els: Some(els),
+            ..
+        } => common_typmod(
+            std::iter::once(els.as_ref())
+                .chain(whens.iter().map(|(_, r)| r))
+                .map(|x| derive_typmod(scope, x)),
+        ),
+        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } => {
+            common_typmod(args.iter().map(|a| derive_typmod(scope, a)))
+        }
+        // A scalar subquery: its output column's typmod, recorded when `resolve` planned it.
+        Expr::ScalarSubquery(q) => {
+            let key: *const QueryExpr = q.as_ref();
+            scope
+                .subquery_derivs
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(k, _, _)| *k == key)
+                .map_or(Typmod::NONE, |(_, _, t)| *t)
+        }
+        Expr::FieldAccess { base, field } => composite_of_expr(scope, base)
+            .and_then(|def| def.fields.iter().find(|f| f.name == *field))
+            .map_or(Typmod::NONE, Typmod::of_field),
+        _ => Typmod::NONE,
+    }
+}
+
+/// The catalog composite type of an expression whose type is statically a named composite and whose
+/// fields' typmods are known: a composite column, a composite field of one, or a cast to a
+/// composite. `None` for any other expression (its fields' typmods are then not tracked).
+pub(crate) fn composite_of_expr<'s>(
+    scope: &Scope<'s>,
+    e: &Expr,
+) -> Option<&'s crate::catalog::CompositeType> {
+    let named = |ty: &Type| match ty {
+        Type::Composite(r) => scope.catalog.composite_type(&r.name),
+        _ => None,
+    };
+    match e {
+        Expr::Column(name, _) => named(&scope.column_of(scope.resolve_bare(name).ok()?).ty),
+        Expr::QualifiedColumn {
+            qualifier, name, ..
+        } => named(
+            &scope
+                .column_of(scope.resolve_qualified(qualifier, name).ok()?)
+                .ty,
+        ),
+        Expr::FieldAccess { base, field } => {
+            let def = composite_of_expr(scope, base)?;
+            named(&def.fields.iter().find(|f| f.name == *field)?.ty)
+        }
+        Expr::Cast {
+            type_name,
+            type_mod: None,
+            ..
+        } => scope.catalog.composite_type(type_name),
+        _ => None,
+    }
 }
 
 /// The derivation of an ORDER BY / WITHIN GROUP key: a trailing `COLLATE` is explicit, else the key
@@ -5448,13 +5631,14 @@ fn agg_result_collatable(name: &str) -> bool {
 /// Record a scalar subquery's output-column derivation on the scope it was resolved against
 /// (`Scope::subquery_derivs`), as the subquery expression derives it (collation.md §1 "Scalar
 /// subqueries"): a body collation, explicit or implicit, is implicit outside; a conflicted or
-/// indeterminate body output makes the subquery indeterminate.
-fn note_subquery_deriv(scope: &Scope, q: &QueryExpr, body: &Deriv) {
+/// indeterminate body output makes the subquery indeterminate. The output column's typmod rides
+/// along unchanged (create-table-as.md §2).
+fn note_subquery_deriv(scope: &Scope, q: &QueryExpr, body: &Deriv, typmod: Typmod) {
     let d = subquery_output_deriv(body);
     let key: *const QueryExpr = q;
     let mut memo = scope.subquery_derivs.borrow_mut();
-    memo.retain(|(k, _)| *k != key);
-    memo.push((key, d));
+    memo.retain(|(k, _, _)| *k != key);
+    memo.push((key, d, typmod));
 }
 
 /// A subquery output column's derivation as seen from outside it (collation.md §1): implicit for a

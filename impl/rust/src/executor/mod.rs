@@ -8,13 +8,13 @@ pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
     AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, BinaryOp, CheckOption,
-    ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType,
-    CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
-    DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind,
-    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
-    OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItems, SeqOptions,
-    SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef,
-    TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateTableAs,
+    CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable,
+    DropType, DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue,
+    JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal,
+    OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItems,
+    SeqOptions, SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef, TableRefPos,
+    TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -56,6 +56,7 @@ mod aggregate;
 pub(crate) use aggregate::{agg_order_tuple, sort_agg_order_rows};
 mod autoname;
 pub(crate) use autoname::*;
+mod create_table_as;
 mod ddl;
 mod index_dependencies;
 pub(crate) use index_dependencies::*;
@@ -1854,11 +1855,12 @@ pub(crate) struct Scope<'a> {
     /// partial-index membership never change meaning under the query-side function propagation.
     storage_collation: bool,
     /// Each scalar subquery resolved against this scope, keyed by its AST node, with its output
-    /// column's collation derivation (spec/design/collation.md §1 "Scalar subqueries"). `resolve`
-    /// records it when it plans the body, so `derive_collation` — which works on the AST — can read
-    /// it without planning the body again. Keyed by address: a lookup always follows the resolve of
-    /// the same node, which overwrites any stale entry.
-    subquery_derivs: std::cell::RefCell<Vec<(*const crate::ast::QueryExpr, Deriv)>>,
+    /// column's collation derivation (spec/design/collation.md §1 "Scalar subqueries") and typmod
+    /// (spec/design/create-table-as.md §2). `resolve` records them when it plans the body, so
+    /// `derive_collation` / `derive_typmod` — which work on the AST — can read them without planning
+    /// the body again. Keyed by address: a lookup always follows the resolve of the same node, which
+    /// overwrites any stale entry.
+    subquery_derivs: std::cell::RefCell<Vec<(*const crate::ast::QueryExpr, Deriv, Typmod)>>,
     /// Set on a LATERAL FENCE only (spec/design/grammar.md §15): the empty scope a parenthesized
     /// join's body is planned against when the join is not the first item of its FROM. The fence
     /// hides the relations to the join's left from the body's ON clauses and non-LATERAL items
@@ -3904,6 +3906,17 @@ impl QueryPlan {
             QueryPlan::With(w) => w.body.column_derivs(),
         }
     }
+
+    /// The per-output-column typmods (spec/design/create-table-as.md §2) — what a derived table /
+    /// CTE synthetic column records and a `CREATE TABLE … AS` column keeps.
+    fn column_typmods(&self) -> &[Typmod] {
+        match self {
+            QueryPlan::Select(s) => &s.column_typmods,
+            QueryPlan::SetOp(s) => &s.column_typmods,
+            QueryPlan::Values(v) => &v.column_typmods,
+            QueryPlan::With(w) => w.body.column_typmods(),
+        }
+    }
 }
 
 /// A resolved VALUES-body relation (spec/design/grammar.md §42), executable to its literal rows.
@@ -3920,6 +3933,8 @@ pub(crate) struct ValuesPlan {
     /// Each column's common collation across the rows (spec/design/collation.md §1), as for a
     /// UNION ALL column — a VALUES list never errors on an implicit conflict.
     column_derivs: Vec<Deriv>,
+    /// Each column's common typmod across the rows (create-table-as.md §2).
+    column_typmods: Vec<Typmod>,
 }
 
 // === WITH RECURSIVE analysis (spec/design/recursive-cte.md) ==========================
@@ -4096,6 +4111,21 @@ fn check_recursive_column_types(
                 ),
             ));
         }
+        // The non-recursive term also fixed the column's typmod, so the overall common typmod must
+        // equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
+        let at_mod = anchor.column_typmods()[i];
+        let overall_mod = common_typmod([at_mod, recursive.column_typmods()[i]]);
+        if overall_mod != at_mod {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "recursive query \"{name}\" column {} has type {} in non-recursive term but type {} overall",
+                    i + 1,
+                    typmod_type_name(at, at_mod),
+                    typmod_type_name(at, overall_mod),
+                ),
+            ));
+        }
         if !union_all {
             require_setop_equality(at)?;
         }
@@ -4121,6 +4151,16 @@ fn check_recursive_column_types(
         }
     }
     Ok(())
+}
+
+/// A resolved type's name with its typmod applied (`decimal(10,2)`, `varchar(5)`), as a column of it
+/// would be declared.
+fn typmod_type_name(ty: &ResolvedType, typmod: Typmod) -> String {
+    match (ty, typmod.decimal, typmod.varchar_len) {
+        (ResolvedType::Decimal, Some(d), _) => format!("decimal({},{})", d.precision, d.scale),
+        (ResolvedType::Text, _, Some(n)) => format!("varchar({n})"),
+        _ => ty.type_name(),
+    }
 }
 
 /// The collation a derivation settles to, named as PostgreSQL reports it (the recursive-CTE check,
@@ -4471,19 +4511,22 @@ fn cte_synthetic_table(
         plan.column_names(),
         plan.column_types(),
         Some(plan.column_derivs()),
+        Some(plan.column_typmods()),
         rename,
     )
 }
 
 /// The shared core of [`cte_synthetic_table`], over explicit body column names + types + collation
-/// derivations (`None` = none for every column) — so a data-modifying CTE (whose "body output" is
-/// its `RETURNING` projection, not a `QueryPlan`) builds its synthetic relation the same way
-/// (spec/design/writable-cte.md §1).
+/// derivations + typmods (`None` = none for every column) — so a data-modifying CTE (whose "body
+/// output" is its `RETURNING` projection, not a `QueryPlan`) builds its synthetic relation the same
+/// way (spec/design/writable-cte.md §1). Each column records its body output's typmod, so a
+/// reference to it keeps the typmod (spec/design/create-table-as.md §2).
 fn cte_synthetic_table_cols(
     name: &str,
     body_names: &[String],
     body_types: &[ResolvedType],
     body_derivs: Option<&[Deriv]>,
+    body_typmods: Option<&[Typmod]>,
     rename: Option<&[String]>,
 ) -> Result<Box<Table>> {
     let col_names: Vec<String> = match rename {
@@ -4532,6 +4575,9 @@ fn cte_synthetic_table_cols(
             };
             let d = body_derivs.map_or(&Deriv::None, |ds| &ds[i]);
             set_synthetic_collation(&mut col, d);
+            let t = body_typmods.map_or(Typmod::NONE, |ts| ts[i]);
+            col.decimal = t.decimal;
+            col.varchar_len = t.varchar_len;
             Ok(col)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -5862,6 +5908,8 @@ pub(crate) struct SelectPlan {
     /// Each output column's collation derivation (collation.md §1 "Derived relations"), carried
     /// into a derived table / CTE over this SELECT.
     column_derivs: Vec<Deriv>,
+    /// Each output column's typmod (create-table-as.md §2), carried the same way.
+    column_typmods: Vec<Typmod>,
     distinct: bool,
     limit: Option<i64>,
     offset: Option<i64>,

@@ -72,6 +72,15 @@ non-recursive term but type bigint overall*. Mechanically jed computes the would
 type of the two and requires it to **equal** the anchor type; any widening of the anchor is the
 error.
 
+**The typmod is fixed too** (PostgreSQL compares type *and* typmod). An anchor column that keeps a
+`numeric(p,s)` / `varchar(n)` typmod ([create-table-as.md](create-table-as.md) §2) — a base-table
+column, a typmod cast — fixes it, and a recursive term whose common typmod with the anchor differs is
+`42804` *recursive query "r" column 1 has type decimal(10,2) in non-recursive term but type decimal
+overall*: `SELECT price FROM src UNION ALL SELECT n + 1 FROM r` over a `decimal(10,2)` `price`
+widens the typmod away. A recursive term of the same typmod (`SELECT n FROM r`) passes, as does an
+anchor with no typmod (`SELECT 1.5 UNION ALL SELECT price …`). The self-reference's columns carry the
+anchor's typmod.
+
 > jed's bare integer literal defaults to `i64` (a pre-existing documented divergence —
 > [types.md](types.md) §6), so `SELECT 1` seeds an `i64` column where PostgreSQL would use
 > `integer`. This affects only the render *width* of an all-literal recursion, never a value or a

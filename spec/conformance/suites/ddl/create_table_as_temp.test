@@ -1,0 +1,181 @@
+# skip: disk — session-local temp tables and multi-record transactions do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# CREATE TEMP TABLE … AS (spec/design/create-table-as.md, temp-tables.md §1): a temporary table made
+# from a query, with its ON COMMIT action (which, as in PostgreSQL, precedes AS) and the session
+# envelope: the temp DDL gate (allow_temp_ddl, temp-tables.md §5) and the query's SELECT privileges
+# (session.md §5.3), which WITH NO DATA does not need because it never runs the query. The fill is
+# atomic with the statement and its transaction. jed-specific (the preclude-overlaps namespace, the
+# host envelope) and ON COMMIT needs real commits, which the oracle importer never makes, so
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked. Format: ../../../design/conformance.md.
+# requires: ddl.create_table_as, ddl.temp_table, ddl.temp_on_commit, ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, ddl.drop_table, txn.explicit, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.qualified_table, expr.arithmetic, types.i32, types.text, session.allow_temp_ddl, session.allow_ddl, session.privileges
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO src VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+# --- a temporary table from a query --------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE t1 AS SELECT id, name FROM src WHERE id < 3
+
+query IT rowsort
+SELECT id, name FROM temp.t1
+----
+1
+one
+2
+two
+
+statement ok
+CREATE TABLE temp.t2 (k) AS SELECT id FROM src WHERE id = 3
+
+query I nosort
+SELECT k FROM t2
+----
+3
+
+# the temp name precludes a persistent one, and a temp name a persistent one has is taken
+statement error 42P07
+CREATE TABLE t1 AS SELECT 1 AS a
+
+statement error 42P07
+CREATE TEMP TABLE src AS SELECT 1 AS a
+
+statement ok
+CREATE TEMP TABLE IF NOT EXISTS src AS SELECT 1 AS a
+
+statement error 42601
+CREATE TEMP TABLE main.bad AS SELECT 1 AS a
+
+statement ok
+DROP TABLE t1, t2
+
+# --- ON COMMIT ---------------------------------------------------------------------------------------
+
+# DROP: an autocommit CREATE … AS commits, so the table is gone by the next statement
+statement ok
+CREATE TEMP TABLE od ON COMMIT DROP AS SELECT id FROM src
+
+statement error 42P01
+SELECT * FROM od
+
+# DELETE ROWS: the filled rows are emptied by the same commit
+statement ok
+CREATE TEMPORARY TABLE odr (n) ON COMMIT DELETE ROWS AS SELECT id FROM src
+
+query I nosort
+SELECT count(*) FROM odr
+----
+0
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE od2 ON COMMIT DROP AS SELECT id FROM src
+
+statement ok
+INSERT INTO odr SELECT id FROM od2
+
+query I nosort
+SELECT count(*) FROM odr
+----
+3
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT count(*) FROM odr
+----
+0
+
+statement error 42P01
+SELECT * FROM od2
+
+statement ok
+CREATE TEMP TABLE op ON COMMIT PRESERVE ROWS AS SELECT id FROM src WITH NO DATA
+
+query I nosort
+SELECT count(*) FROM op
+----
+0
+
+# --- atomicity ---------------------------------------------------------------------------------------
+
+# a failed fill creates nothing
+statement error 22012
+CREATE TEMP TABLE e1 AS SELECT id / (id - id) AS x FROM src
+
+statement error 42P01
+SELECT * FROM e1
+
+# a rolled-back transaction takes the table and its rows with it
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE r1 AS SELECT id FROM src
+
+statement ok
+CREATE TABLE r2 AS SELECT id FROM src
+
+query I nosort
+SELECT count(*) FROM r2
+----
+3
+
+statement ok
+ROLLBACK
+
+statement error 42P01
+SELECT * FROM r1
+
+statement error 42P01
+SELECT * FROM r2
+
+# --- the session envelope ----------------------------------------------------------------------------
+
+# a temp CREATE … AS needs only the temp DDL gate, a persistent one allow_ddl
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+CREATE TEMP TABLE g1 AS SELECT id FROM src
+
+# allow_ddl: off
+statement error 42501
+CREATE TABLE g2 AS SELECT id FROM src
+
+# allow_temp_ddl: off
+statement error 42501
+CREATE TEMP TABLE g3 AS SELECT id FROM src
+
+# the query's reads need SELECT on what it reads...
+# revoke: SELECT ON src
+statement error 42501
+CREATE TEMP TABLE g4 AS SELECT id FROM src
+
+# revoke: SELECT ON src
+statement error 42501
+CREATE TABLE g4 AS SELECT * FROM (SELECT id FROM src) s
+
+# ...but WITH NO DATA never runs the query, so it needs nothing on what the query names
+# revoke: SELECT ON src
+statement ok
+CREATE TEMP TABLE g5 AS SELECT id, name FROM src WITH NO DATA
+
+query I nosort
+SELECT count(*) FROM g5
+----
+0
+
+# the new table needs no INSERT privilege to be filled (PostgreSQL 18 checks none)
+# default_privileges: SELECT
+statement ok
+CREATE TABLE g6 AS SELECT id FROM src
+
+query I nosort
+SELECT count(*) FROM g6
+----
+3

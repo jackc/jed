@@ -288,7 +288,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	}
 	if returning == nil {
 		dm.noReturning = true
-		table, err := cteSyntheticTableCols(lname, nil, nil, nil, rename)
+		table, err := cteSyntheticTableCols(lname, nil, nil, nil, nil, rename)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -299,11 +299,11 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 		return nil, nil, err
 	}
 	s.ctes = bindings
-	_, names, types, derivs, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
+	_, names, types, derivs, typmods, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, err
 	}
-	table, err := cteSyntheticTableCols(lname, names, types, derivs, rename)
+	table, err := cteSyntheticTableCols(lname, names, types, derivs, typmods, rename)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1223,6 +1223,16 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 				name, i+1, rtName(a[i]), rtName(unified),
 			))
 		}
+		// The non-recursive term also fixed the column's typmod, so the overall common typmod must
+		// equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
+		atMod := anchor.columnTypmods()[i]
+		overallMod := commonTypmod([]typmod{atMod, recursive.columnTypmods()[i]})
+		if !overallMod.equal(atMod) {
+			return newError(DatatypeMismatch, fmt.Sprintf(
+				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
+				name, i+1, typmodTypeName(a[i], atMod), typmodTypeName(a[i], overallMod),
+			))
+		}
 		if !unionAll {
 			if err := requireSetopEquality(a[i]); err != nil {
 				return err
@@ -1249,6 +1259,19 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 	return nil
 }
 
+// typmodTypeName is a resolved type's name with its typmod applied (decimal(10,2), varchar(5)), as a
+// column of it would be declared.
+func typmodTypeName(ty resolvedType, tm typmod) string {
+	switch {
+	case ty.kind == rtDecimal && tm.Decimal != nil:
+		return fmt.Sprintf("decimal(%d,%d)", tm.Decimal.Precision, tm.Decimal.Scale)
+	case ty.kind == rtText && tm.VarcharLen != nil:
+		return fmt.Sprintf("varchar(%d)", *tm.VarcharLen)
+	default:
+		return rtName(ty)
+	}
+}
+
 // collationIdentity is the collation a derivation settles to, named as PostgreSQL reports it (the
 // recursive-CTE check, spec/design/collation.md §1): a collation's name, default for no collation
 // (PG's default collation — a literal's), (null) for a conflicted / indeterminate one (PG's
@@ -1271,14 +1294,15 @@ func collationIdentity(d deriv) string {
 // column carries its body output's collation derivation (spec/design/collation.md §1 "Derived
 // relations").
 func cteSyntheticTable(name string, plan *queryPlan, rename []string) (*catTable, error) {
-	return cteSyntheticTableCols(name, plan.columnNames(), plan.columnTypes(), plan.columnDerivs(), rename)
+	return cteSyntheticTableCols(name, plan.columnNames(), plan.columnTypes(), plan.columnDerivs(), plan.columnTypmods(), rename)
 }
 
 // cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
-// types + collation derivations (nil = none for every column) — so a data-modifying CTE (whose "body
-// output" is its RETURNING projection, not a queryPlan) builds its synthetic relation the same way
-// (spec/design/writable-cte.md §1).
-func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolvedType, bodyDerivs []deriv, rename []string) (*catTable, error) {
+// types + collation derivations + typmods (nil = none for every column) — so a data-modifying CTE
+// (whose "body output" is its RETURNING projection, not a queryPlan) builds its synthetic relation the
+// same way (spec/design/writable-cte.md §1). Each column records its body output's typmod, so a
+// reference to it keeps the typmod (spec/design/create-table-as.md §2).
+func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolvedType, bodyDerivs []deriv, bodyTypmods []typmod, rename []string) (*catTable, error) {
 	var colNames []string
 	if rename != nil {
 		// PostgreSQL allows FEWER aliases than the body has columns — the first len(rename) columns
@@ -1313,6 +1337,10 @@ func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolved
 			d = bodyDerivs[i]
 		}
 		setSyntheticCollation(&columns[i], d)
+		if bodyTypmods != nil {
+			columns[i].Decimal = bodyTypmods[i].Decimal
+			columns[i].VarcharLen = bodyTypmods[i].VarcharLen
+		}
 	}
 	return &catTable{Name: name, Columns: columns}, nil
 }
@@ -1590,6 +1618,12 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 		}
 		columnDerivs[i] = d
 	}
+	// Each column keeps the operands' typmod when they agree (PostgreSQL's select_common_typmod,
+	// create-table-as.md §2).
+	columnTypmods := make([]typmod, len(columnTypes))
+	for i := range columnTypes {
+		columnTypmods[i] = commonTypmod([]typmod{lhs.columnTypmods()[i], rhs.columnTypmods()[i]})
+	}
 
 	order := make([]orderSlot, 0, len(so.OrderBy))
 	for i := range so.OrderBy {
@@ -1619,7 +1653,7 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 
 	return &setOpPlan{
 		op: so.Op, all: so.All, lhs: lhs, rhs: rhs,
-		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs,
+		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs, columnTypmods: columnTypmods,
 		order: order, limit: so.Limit, offset: so.Offset,
 	}, nil
 }
@@ -1713,6 +1747,8 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 	colParams := make([][]int, arity)
 	// Per column: each row's collation derivation, combined after the loop (collation.md §1).
 	colDerivs := make([][]deriv, arity)
+	// Per column: each row's typmod, combined after the loop (create-table-as.md §2).
+	colTypmods := make([][]typmod, arity)
 	for ri, row := range rows {
 		if len(row) != arity {
 			return nil, newError(SyntaxError, "VALUES lists must all be the same length")
@@ -1731,6 +1767,7 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 				return nil, err
 			}
 			colDerivs[ci] = append(colDerivs[ci], d)
+			colTypmods[ci] = append(colTypmods[ci], deriveTypmod(s, *val))
 			if ri == 0 {
 				colTypes[ci] = ty
 			} else {
@@ -1773,7 +1810,11 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 		}
 		colDerivsOut[ci] = d
 	}
-	return &valuesPlan{rows: resolvedRows, columnTypes: colTypes, columnNames: colNames, columnDerivs: colDerivsOut}, nil
+	colTypmodsOut := make([]typmod, arity)
+	for ci := range colTypmodsOut {
+		colTypmodsOut[ci] = commonTypmod(colTypmods[ci])
+	}
+	return &valuesPlan{rows: resolvedRows, columnTypes: colTypes, columnNames: colNames, columnDerivs: colDerivsOut, columnTypmods: colTypmodsOut}, nil
 }
 
 // execValuesPlan executes a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate

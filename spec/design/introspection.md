@@ -292,10 +292,12 @@ body**, exactly as a reference to the view would plan it. The `type` text is the
 query over the view produces, rendered by the same rules as above with two consequences of being a
 *result* type:
 
-- **No typmods.** A planned result type carries no typmod, so a `varchar(10)` column reads as
-  `text` and `decimal(8,2)` as `decimal`. This is the comparison `CREATE OR REPLACE VIEW` already
-  makes ("type without typmods", views.md §1.2). PostgreSQL keeps a typmod through a bare column
-  reference; jed does not track one through a query, so this is a recorded divergence.
+- **No typmods.** The `type` text is the result type without a typmod, so a `varchar(10)` column
+  reads as `text` and `decimal(8,2)` as `decimal`. This is the comparison `CREATE OR REPLACE VIEW`
+  already makes ("type without typmods", views.md §1.2). PostgreSQL keeps a typmod through a bare
+  column reference; jed's planner now tracks those typmods too (`CREATE TABLE … AS` keeps them,
+  [create-table-as.md](create-table-as.md) §2), but view columns do not report them yet, so this is a
+  recorded divergence and a follow-on.
 - **An untyped NULL reads as `text`**, the type a derived-table column of unknown type takes, and
   what PostgreSQL resolves an `unknown` view column to.
 

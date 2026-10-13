@@ -4680,6 +4680,8 @@ pub(crate) struct SetOpPlan {
     /// the inputs' common collation, implicit (an explicit input is demoted), `Conflicted` for a
     /// UNION ALL column over conflicting implicit collations, `None` for a non-text column.
     pub(crate) column_derivs: Vec<Deriv>,
+    /// Each output column's typmod: the inputs' common typmod (create-table-as.md §2).
+    pub(crate) column_typmods: Vec<Typmod>,
     /// (output slot, descending, nulls_first) — the trailing ORDER BY resolved by output name.
     pub(crate) order: Vec<crate::spill::SortKey>,
     pub(crate) limit: Option<i64>,

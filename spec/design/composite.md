@@ -350,8 +350,12 @@ quantifiers), while a whole-element `NULL` still folds to UNKNOWN.
 Still deferred `0A000` on the key axis: an **array-of-composite** field as a key, and a composite
 **FK** pairing (which needs composite same-type FK resolution).
 
-**Still narrowed (relaxed in a later slice):** `INSERT … SELECT` into a composite column and
-`UPDATE` of a composite column remain `0A000`; `DEFAULT` on a composite column is `0A000`; the runtime (non-literal) text→composite
+**`INSERT … SELECT` into a composite column** takes a source column of the same composite type or an
+untyped `NULL` (an anonymous `ROW(…)` column is `0A000`, any other type `42804` — the rule an `INSERT …
+VALUES` expression already follows, [grammar.md](grammar.md) §24; `CREATE TABLE … AS` fills its
+composite columns through it, [create-table-as.md](create-table-as.md) §3).
+
+**Still narrowed (relaxed in a later slice):** `UPDATE` of a composite column remains `0A000`; `DEFAULT` on a composite column is `0A000`; the runtime (non-literal) text→composite
 cast, the `composite::text` cast, the anonymous `ROW(…)::type` structural cast, and the nested
 `ROW(ROW(…),…)`-into-column constructor (a jed extension PG rejects — covered by unit tests, not the
 PG-oracle corpus) are each `0A000` / jed-only. Composite **value** comparison (`WHERE c = ROW(…)`),

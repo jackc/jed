@@ -556,6 +556,9 @@ empty table charges 0. `CREATE UNIQUE INDEX` charges **exactly the same** — it
 verification (indexes.md §8) is unmetered validation, like the uniqueness probes below.
 `DROP INDEX` charges 0 (a pure catalog edit, like DROP TABLE). Index **maintenance** at
 INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
+`CREATE TABLE … AS` charges exactly what `INSERT INTO t <query>` charges for its fill — the query's
+accrued cost, storing unmetered (grammar.md §24) — and `WITH NO DATA` charges 0
+([create-table-as.md](create-table-as.md) §3).
 
 ### GIN-bounded scan — an inverted index narrows an array-column scan
 

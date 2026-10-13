@@ -1,0 +1,93 @@
+# skip: disk — in-memory host attachments do not survive the disk-mode per-record reopen (a fresh
+# Database handle is opened from the file, and an in-memory attachment lives only on the old handle;
+# spec/design/conformance.md §3, attached-databases.md §5).
+# CREATE TABLE … AS with an attached database (spec/design/create-table-as.md §3, attached-databases.md
+# §3/§6): the target follows CREATE TABLE's rules — `db.name` creates the table in that attachment,
+# a bare or `main.` name in main — and the query reads any database, by its qualifier. The new
+# table's name is checked in its own database only. jed-specific (PostgreSQL has no embedded
+# multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# attach: mydb
+# requires: ddl.create_table_as, attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.order_by, types.i32, types.text, types.decimal, types.varchar_length, introspect.columns
+
+statement ok
+CREATE TABLE item (id i32 PRIMARY KEY, name varchar(8), price decimal(6,2))
+
+statement ok
+INSERT INTO item VALUES (1, 'apple', 1.5), (2, 'pear', 2.25)
+
+statement ok
+CREATE TABLE mydb.item (id i32 PRIMARY KEY, qty i32)
+
+statement ok
+INSERT INTO mydb.item VALUES (1, 10), (2, 20)
+
+# into the attachment, from main and the attachment joined
+statement ok
+CREATE TABLE mydb.stock AS SELECT m.id, m.name, m.price, a.qty FROM main.item m JOIN mydb.item a ON a.id = m.id
+
+query ITDI nosort
+SELECT id, name, price, qty FROM mydb.stock ORDER BY id
+----
+1
+apple
+1.50
+10
+2
+pear
+2.25
+20
+
+# the bare name is main's, so `stock` is not there
+statement error 42P01
+SELECT * FROM stock
+
+query TT nosort
+SELECT name, type FROM mydb.jed_columns WHERE table_name = 'stock' ORDER BY ordinal
+----
+id
+i32
+name
+varchar(8)
+price
+decimal(6,2)
+qty
+i32
+
+# into main, from the attachment; the name only has to be free in main
+statement ok
+CREATE TABLE stock AS SELECT id, qty FROM mydb.item WHERE qty > 10
+
+query II nosort
+SELECT id, qty FROM main.stock
+----
+2
+20
+
+# a name taken in the attachment
+statement error 42P07
+CREATE TABLE mydb.item AS SELECT 1 AS a
+
+statement ok
+CREATE TABLE IF NOT EXISTS mydb.item AS SELECT 1 AS a
+
+query I nosort
+SELECT count(*) FROM mydb.item
+----
+2
+
+# an unknown database
+statement error 42P01
+CREATE TABLE nosuch.t AS SELECT 1 AS a
+
+# ON COMMIT is for temporary tables only
+statement error 42P16
+CREATE TABLE mydb.oc ON COMMIT DROP AS SELECT 1 AS a
+
+# WITH NO DATA
+statement ok
+CREATE TABLE mydb.empty AS SELECT id, name FROM item WITH NO DATA
+
+query I nosort
+SELECT count(*) FROM mydb.empty
+----
+0

@@ -597,7 +597,7 @@ jed_views(
 Their columns **are** listed in `jed_columns`, as in PostgreSQL's `information_schema.columns`: one
 row per output column, nullable, keyless, with no default. A view's column types are not catalog
 facts (§3), so reading `jed_columns` plans each view's body to type its columns; the types are
-result types and carry no typmod ([introspection.md](introspection.md) §5 *View columns*).
+result types reported without a typmod ([introspection.md](introspection.md) §5 *View columns*).
 
 **The CLI dump** (`jed --dump`, [cli.md](cli.md)) emits each view as
 `CREATE VIEW <name> (<columns>) AS <definition>;`, after every table, its rows, and its indexes, and
@@ -625,7 +625,7 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | `ALTER TABLE` that would capture or make ambiguous a view's reference is `0A000` | text binds by name (§8) |
 | `CREATE OR REPLACE VIEW` whose appended column would capture or make ambiguous a dependent view's reference is `0A000` | text binds by name (§8) |
 | `CREATE OR REPLACE VIEW` of a view that would read itself, directly or through other views, is `42P17`; PG accepts it and fails every use with `42P17` | the catalog stays acyclic, so open can check it (§3) |
-| `CREATE OR REPLACE VIEW` compares column types without typmods: `varchar(3)` → `varchar(4)` or `text`, and `decimal(5,2)` → `decimal(6,2)`, are accepted; PG refuses them (`42P16`) | jed's query output columns carry no typmod |
+| `CREATE OR REPLACE VIEW` compares column types without typmods: `varchar(3)` → `varchar(4)` or `text`, and `decimal(5,2)` → `decimal(6,2)`, are accepted; PG refuses them (`42P16`) | view column types are compared without typmods (the planner's output typmods, [create-table-as.md](create-table-as.md) §2, are not yet a view-column fact) |
 | A bare integer literal cannot replace an `i32` view column (`0 AS d`); PG accepts it | a projected integer literal is `i64` in jed ([types.md](types.md) §6) |
 | `CREATE OR REPLACE VIEW` compares collation names: a column of the default collation replaced by the same collation named explicitly is accepted; PG refuses (`default` and `"C"` are different collation objects there) | jed has no separate default-collation object |
 | `ALTER VIEW t RENAME COLUMN …` on a table is `42809`; PG renames the table's column | `ALTER VIEW` names views only, as its `RENAME TO` already does in PG |

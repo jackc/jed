@@ -1,7 +1,6 @@
 //! Range storage (spec/design/ranges.md, R2–R4) — the divergences + introspection the oracle corpus
-//! cannot express (CLAUDE.md §10): the deliberate `0A000` narrowings PostgreSQL does NOT share that
-//! remain after range became a key (a range DEFAULT and INSERT…SELECT into a range column — PG accepts
-//! the DEFAULT outright), the jed-canonical `i32range` spelling (PG reports `int4range`), the
+//! cannot express (CLAUDE.md §10): the deliberate `0A000` narrowing PostgreSQL does NOT share that
+//! remains after range became a key (a range DEFAULT — PG accepts it outright), the jed-canonical `i32range` spelling (PG reports `int4range`), the
 //! cross-element comparison code (jed's uniform `42804` where PG reports `42883`), and the
 //! whole-image store/load round-trip of a range column (the byte layout is pinned cross-core by
 //! range_table.jed; this is the behavioral check). A range PRIMARY KEY / ordered index / `UNIQUE` / FK
@@ -109,11 +108,11 @@ fn canonical_name_and_aliases() {
     assert!(msg.contains("i32range"), "message names i32range: {msg}");
 }
 
-/// The staged `0A000` narrowings PostgreSQL does NOT share that REMAIN after range became a key (R4):
-/// a range DEFAULT and INSERT…SELECT into a range column (PG accepts a range DEFAULT outright —
-/// spec/design/ranges.md §8). A range PRIMARY KEY / ordered index / `UNIQUE` now work (oracle-clean,
-/// types/range.test) — PG also allows them via its range btree opclass. These remaining cases are
-/// jed-stricter, so they cannot live in the oracle-clean corpus.
+/// The staged `0A000` narrowing PostgreSQL does NOT share that REMAINS after range became a key (R4):
+/// a range DEFAULT (PG accepts it outright — spec/design/ranges.md §8). A range PRIMARY KEY /
+/// ordered index / `UNIQUE` now work (oracle-clean, types/range.test) — PG also allows them via its
+/// range btree opclass. This remaining case is jed-stricter, so it cannot live in the oracle-clean
+/// corpus.
 #[test]
 fn range_narrowings_are_0a000() {
     let mut db = Database::create(CreateOptions::default())
@@ -130,10 +129,8 @@ fn range_narrowings_are_0a000() {
     // A range ordered (btree) index now WORKS (the range-bounds key, encoding.md §2.11) — a positive
     // check that the former 0A000 narrowing is lifted.
     run(&mut db, "CREATE INDEX ri ON t (r)");
-    // INSERT … SELECT into a range column is deferred (the VALUES + literal path is the input).
-    run(&mut db, "CREATE TABLE src (id i32 PRIMARY KEY, r i32range)");
-    run(&mut db, "INSERT INTO src VALUES (1, '[1,5)')");
-    assert_eq!(err(&mut db, "INSERT INTO t SELECT id, r FROM src"), "0A000",);
+    // INSERT … SELECT into a range column of the same range type now works too (oracle-clean in
+    // dml/insert_select_container.test).
 }
 
 /// Updating a range COLUMN works (ranges.md §4, oracle-clean in types/range.test) but three sub-cases

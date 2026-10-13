@@ -21,6 +21,7 @@ import {
   placeNamedArgs,
   polyResultType,
   queryPlanColumnDerivs,
+  queryPlanColumnTypmods,
   rangeBoundAssignable,
   resolveFuncCall,
   resolveHypotheticalSetAggregate,
@@ -68,7 +69,7 @@ import type { Meter } from "./cost.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import { exprEqual, resolveTypeAndTypmod, scalarForParamHint, unifyCaseTypes } from "./eval_ops.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
-import type { ScalarType } from "./types.ts";
+import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import { followLayer } from "./view_write.ts";
 import {
   classifyComparable,
@@ -129,7 +130,7 @@ import {
 } from "./jsonpath.ts";
 import type { ExtractSrc } from "./datetime_fn.ts";
 import { extractField } from "./datetime_fn.ts";
-import type { ColType, Column, Table } from "./catalog.ts";
+import type { ColType, Column, CompositeType, Table } from "./catalog.ts";
 import type { RegexProgram } from "./regex.ts";
 import { foldLowerSimple, loadedProperty, sortKey as collationSortKey } from "./collation.ts";
 import { compileRegex } from "./regex.ts";
@@ -141,12 +142,22 @@ import { COSTS } from "./costs.ts";
 import { valueCmp } from "./window.ts";
 import type { JsonNode, PathSetMode } from "./json.ts";
 import { Decimal } from "./decimal.ts";
+// Projections is a resolved select list: the evaluable projections and, per output column, its
+// name, type, collation derivation, and typmod.
+export type Projections = {
+  nodes: RExpr[];
+  names: string[];
+  types: ResolvedType[];
+  derivs: Deriv[];
+  typmods: Typmod[];
+};
+
 export function resolveProjections(
   scope: Scope,
   items: SelectItems,
   ag: AggCtx,
   params: ParamTypes,
-): { nodes: RExpr[]; names: string[]; types: ResolvedType[]; derivs: Deriv[] } {
+): Projections {
   if (items.kind === "all") {
     // `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
     // (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
@@ -158,6 +169,7 @@ export function resolveProjections(
     const names: string[] = [];
     const types: ResolvedType[] = [];
     const derivs: Deriv[] = [];
+    const typmods: Typmod[] = [];
     // The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
     // grammar.md §15); a merge's underlying copies are hidden and so absent from it.
     if (scope.star !== null) {
@@ -167,6 +179,7 @@ export function resolveProjections(
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
+        typmods.push(typmodOfColumn(c));
         scope.traceFlat(idx);
       }
       // A written `*` in a view body is frozen into its expansion (views.md §5).
@@ -180,7 +193,7 @@ export function resolveProjections(
           ]),
         );
       }
-      return { nodes, names, types, derivs };
+      return { nodes, names, types, derivs, typmods };
     }
     // The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
     // relations' columns exactly as before (grammar.md §32).
@@ -189,7 +202,7 @@ export function resolveProjections(
       if (r.qualifierOnly) continue;
       // A write through a view returns the view's columns (views.md §15.2).
       if (r.layer !== undefined) {
-        expandLayerColumns(scope, ri, ag, { nodes, names, types, derivs });
+        expandLayerColumns(scope, ri, ag, { nodes, names, types, derivs, typmods });
         continue;
       }
       r.table.columns.forEach((c, i) => {
@@ -199,14 +212,16 @@ export function resolveProjections(
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
+        typmods.push(typmodOfColumn(c));
       });
     }
-    return { nodes, names, types, derivs };
+    return { nodes, names, types, derivs, typmods };
   }
   const nodes: RExpr[] = [];
   const names: string[] = [];
   const types: ResolvedType[] = [];
   const derivs: Deriv[] = [];
+  const typmods: Typmod[] = [];
   for (const it of items.items) {
     // `t.*` expands the FROM relation labeled `qualifier` into one output column per column, in
     // catalog order (grammar.md §15) — like bare `*` but for one named relation and mixable with
@@ -217,7 +232,7 @@ export function resolveProjections(
       // `v.*` (or `old.*` / `new.*`) over a write through a view (views.md §15.2).
       const layered = scope.rels.findIndex((r) => r.label === want && r.layer !== undefined);
       if (layered >= 0) {
-        expandLayerColumns(scope, layered, ag, { nodes, names, types, derivs });
+        expandLayerColumns(scope, layered, ag, { nodes, names, types, derivs, typmods });
         continue;
       }
       let table: Table | undefined;
@@ -245,6 +260,7 @@ export function resolveProjections(
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
+        typmods.push(typmodOfColumn(c));
         scope.traceFlat(slots[i]!);
       });
       // A written `rel.*` in a view body is frozen into `"rel" . "col"` references (views.md §5).
@@ -263,6 +279,8 @@ export function resolveProjections(
     if (it.expr.kind === "fieldStar") {
       const base = it.expr.base;
       const { type: baseType } = resolve(scope, base, null, ag, params);
+      // Each field keeps its declared typmod (PostgreSQL's FieldSelect).
+      const fieldTypmods = (compositeOfExpr(scope, base)?.fields ?? []).map(typmodOfColumn);
       if (baseType.kind !== "composite") {
         throw engineError(
           "wrong_object_type",
@@ -277,6 +295,7 @@ export function resolveProjections(
         names.push(f.name);
         types.push(f.type);
         derivs.push({ kind: "none" });
+        typmods.push(fieldTypmods[i] ?? TYPMOD_NONE);
       });
       continue;
     }
@@ -286,9 +305,10 @@ export function resolveProjections(
     // The output column's collation derivation (spec/design/collation.md §1 "Derived relations"),
     // which a derived table / CTE over this body carries into its synthetic column.
     derivs.push(rtCollatable(type) ? deriveCollation(scope, it.expr) : { kind: "none" });
+    typmods.push(deriveTypmod(scope, it.expr));
     names.push(it.alias ?? outputName(scope, it.expr));
   }
-  return { nodes, names, types, derivs };
+  return { nodes, names, types, derivs, typmods };
 }
 
 // outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a
@@ -420,12 +440,7 @@ export function resolveLayerRef(
 
 // expandLayerColumns expands a layered relation's `*` (a write through a view, views.md §15.2): each
 // of the view's columns, by name, resolved through the layer.
-function expandLayerColumns(
-  scope: Scope,
-  rel: number,
-  ag: AggCtx,
-  out: { nodes: RExpr[]; names: string[]; types: ResolvedType[]; derivs: Deriv[] },
-): void {
+function expandLayerColumns(scope: Scope, rel: number, ag: AggCtx, out: Projections): void {
   scope.rels[rel]!.layer!.columns.forEach((c, col) => {
     const { node, type } = resolveColumnRef(
       scope,
@@ -437,6 +452,7 @@ function expandLayerColumns(
     out.names.push(c.name);
     out.types.push(type);
     out.derivs.push(catColumnDeriv(c));
+    out.typmods.push(typmodOfColumn(c));
   });
 }
 
@@ -990,7 +1006,12 @@ export function resolve(
       if (plan.columnTypes.length !== 1) {
         throw engineError("syntax_error", "subquery must return only one column");
       }
-      noteSubqueryDeriv(scope, e.query, queryPlanColumnDerivs(plan)[0]!);
+      noteSubqueryDeriv(
+        scope,
+        e.query,
+        queryPlanColumnDerivs(plan)[0]!,
+        queryPlanColumnTypmods(plan)[0]!,
+      );
       return {
         node: {
           kind: "subquery",
@@ -2043,7 +2064,7 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
   }
   // A scalar subquery: its output column's collation, recorded when resolve planned it.
   if (e.kind === "scalarSubquery") {
-    return scope.subqueryDerivs.get(e.query) ?? { kind: "none" };
+    return scope.subqueryDerivs.get(e.query)?.deriv ?? { kind: "none" };
   }
   return { kind: "none" };
 }
@@ -2061,6 +2082,127 @@ export function combineDerivs(scope: Scope, args: Expr[]): Deriv {
   let d: Deriv = { kind: "none" };
   for (const a of args) d = combineDeriv(d, deriveCollation(scope, a));
   return d;
+}
+
+// Typmod is a query output column's type modifier (spec/design/create-table-as.md §2): the
+// numeric(p,s) precision and scale, or the varchar(n) length, that a `CREATE TABLE … AS` column
+// keeps. Both null is no typmod. Only a decimal or text scalar carries one; an array's element typmod
+// is not tracked (an array column cannot declare one — array.md §12).
+export type Typmod = { decimal: DecimalTypmod | null; varcharLen: number | null };
+
+// TYPMOD_NONE is no typmod. Typmods are never mutated, so it is shared.
+export const TYPMOD_NONE: Typmod = { decimal: null, varcharLen: null };
+
+// typmodOfColumn is a column's declared typmod (a catalog column, or a synthetic one that recorded
+// its body's). A composite field (PostgreSQL's FieldSelect keeps its typmod) has the same shape.
+export function typmodOfColumn(col: {
+  decimal: DecimalTypmod | null;
+  varcharLen: number | null;
+}): Typmod {
+  return { decimal: col.decimal, varcharLen: col.varcharLen };
+}
+
+// typmodEqual reports whether two typmods are the same.
+export function typmodEqual(a: Typmod, b: Typmod): boolean {
+  const decEq =
+    a.decimal === null || b.decimal === null
+      ? a.decimal === b.decimal
+      : a.decimal.precision === b.decimal.precision && a.decimal.scale === b.decimal.scale;
+  return decEq && a.varcharLen === b.varcharLen;
+}
+
+// commonTypmod is the common typmod of several inputs (PostgreSQL's select_common_typmod, and
+// exprTypmod for CASE / COALESCE / GREATEST / LEAST): their typmod when every input has the same one,
+// else none. Typmods only exist on decimal and text values, so equal typmods mean one type.
+export function commonTypmod(inputs: Typmod[]): Typmod {
+  if (inputs.length === 0) return TYPMOD_NONE;
+  const first = inputs[0]!;
+  return inputs.every((t) => typmodEqual(t, first)) ? first : TYPMOD_NONE;
+}
+
+// deriveTypmod is the typmod an expression keeps (spec/design/create-table-as.md §2, PostgreSQL's
+// exprTypmod): a column reference keeps its column's, a cast to numeric(p,s) / varchar(n) has the
+// cast's, a COLLATE keeps its operand's, CASE (with an ELSE), COALESCE, GREATEST, and LEAST keep their
+// inputs' common typmod, a scalar subquery keeps its output column's, and a composite field selection
+// keeps the field's. Every other expression — an operator, a function, an aggregate, a literal, a
+// parameter, a cast without a typmod — has none.
+export function deriveTypmod(scope: Scope, e: Expr): Typmod {
+  switch (e.kind) {
+    case "column":
+      return columnTypmod(scope, () => scope.resolveBare(e.name));
+    case "qualifiedColumn":
+      return columnTypmod(scope, () => scope.resolveQualified(e.qualifier, e.name));
+    case "collate":
+      return deriveTypmod(scope, e.inner);
+    case "cast": {
+      if (e.typeMod === null || e.typeName.endsWith("[]")) return TYPMOD_NONE;
+      try {
+        const [, decimal, varcharLen] = resolveTypeAndTypmod(e.typeName, e.typeMod);
+        return { decimal, varcharLen };
+      } catch {
+        return TYPMOD_NONE;
+      }
+    }
+    case "case":
+      // CASE without an ELSE can yield a NULL of no typmod (PostgreSQL returns none).
+      if (e.els === null) return TYPMOD_NONE;
+      return commonTypmod([
+        deriveTypmod(scope, e.els),
+        ...e.whens.map((w) => deriveTypmod(scope, w.result)),
+      ]);
+    case "coalesce":
+    case "greatestLeast":
+      return commonTypmod(e.args.map((a) => deriveTypmod(scope, a)));
+    case "scalarSubquery":
+      // A scalar subquery: its output column's typmod, recorded when resolve planned it.
+      return scope.subqueryDerivs.get(e.query)?.typmod ?? TYPMOD_NONE;
+    case "fieldAccess": {
+      const field = compositeOfExpr(scope, e.base)?.fields.find((f) => f.name === e.field);
+      return field === undefined ? TYPMOD_NONE : typmodOfColumn(field);
+    }
+    default:
+      return TYPMOD_NONE;
+  }
+}
+
+// columnTypmod is the typmod of a column reference, none if it does not resolve.
+function columnTypmod(scope: Scope, resolve: () => Resolved): Typmod {
+  try {
+    return typmodOfColumn(scope.columnOf(resolve()));
+  } catch {
+    return TYPMOD_NONE;
+  }
+}
+
+// compositeOfExpr is the catalog composite type of an expression whose type is statically a named
+// composite and whose fields' typmods are known: a composite column, a composite field of one, or a
+// cast to a composite. undefined for any other expression (its fields' typmods are then not tracked).
+export function compositeOfExpr(scope: Scope, e: Expr): CompositeType | undefined {
+  const named = (ty: Type): CompositeType | undefined =>
+    ty.kind === "composite" ? scope.catalog.compositeType(ty.name) : undefined;
+  const ofColumn = (resolve: () => Resolved): CompositeType | undefined => {
+    let col: Column;
+    try {
+      col = scope.columnOf(resolve());
+    } catch {
+      return undefined;
+    }
+    return named(col.type);
+  };
+  switch (e.kind) {
+    case "column":
+      return ofColumn(() => scope.resolveBare(e.name));
+    case "qualifiedColumn":
+      return ofColumn(() => scope.resolveQualified(e.qualifier, e.name));
+    case "fieldAccess": {
+      const field = compositeOfExpr(scope, e.base)?.fields.find((f) => f.name === e.field);
+      return field === undefined ? undefined : named(field.type);
+    }
+    case "cast":
+      return e.typeMod === null ? scope.catalog.compositeType(e.typeName) : undefined;
+    default:
+      return undefined;
+  }
 }
 
 // orderKeyDeriv is the derivation of an ORDER BY / WITHIN GROUP key: a trailing COLLATE is
@@ -2098,9 +2240,10 @@ function aggResultCollatable(name: string): boolean {
 // noteSubqueryDeriv records a scalar subquery's output-column derivation on the scope it was
 // resolved against (Scope.subqueryDerivs), as the subquery expression derives it (collation.md §1
 // "Scalar subqueries"): a body collation, explicit or implicit, is implicit outside; a conflicted
-// or indeterminate body output makes the subquery indeterminate.
-function noteSubqueryDeriv(scope: Scope, q: QueryExpr, body: Deriv): void {
-  scope.subqueryDerivs.set(q, subqueryOutputDeriv(body));
+// or indeterminate body output makes the subquery indeterminate. The output column's typmod rides
+// along unchanged (create-table-as.md §2).
+function noteSubqueryDeriv(scope: Scope, q: QueryExpr, body: Deriv, typmod: Typmod): void {
+  scope.subqueryDerivs.set(q, { deriv: subqueryOutputDeriv(body), typmod });
 }
 
 // subqueryOutputDeriv is a subquery output column's derivation as seen from outside it

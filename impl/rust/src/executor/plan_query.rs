@@ -287,7 +287,7 @@ impl Engine {
         })?;
         match returning {
             None => {
-                let table = cte_synthetic_table_cols(lname, &[], &[], None, rename)?;
+                let table = cte_synthetic_table_cols(lname, &[], &[], None, None, rename)?;
                 Ok((
                     table,
                     DmCte {
@@ -300,9 +300,16 @@ impl Engine {
                 let mut scope =
                     Scope::returning(self, tdef, base_is_old, returning, vw.as_ref(), alias)?;
                 scope.ctes = bindings;
-                let (_, names, types, derivs) =
+                let (_, names, types, derivs, typmods) =
                     resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
-                let table = cte_synthetic_table_cols(lname, &names, &types, Some(&derivs), rename)?;
+                let table = cte_synthetic_table_cols(
+                    lname,
+                    &names,
+                    &types,
+                    Some(&derivs),
+                    Some(&typmods),
+                    rename,
+                )?;
                 Ok((
                     table,
                     DmCte {
@@ -962,6 +969,11 @@ impl Engine {
                 common_collation(&inputs, none_ok)
             })
             .collect::<Result<_>>()?;
+        // Each column keeps the operands' typmod when they agree (PostgreSQL's
+        // select_common_typmod, create-table-as.md §2).
+        let column_typmods: Vec<Typmod> = (0..column_types.len())
+            .map(|i| common_typmod([lhs.column_typmods()[i], rhs.column_typmods()[i]]))
+            .collect();
 
         // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
         // operation): a qualified key is 42P01, an unknown name is 42703.
@@ -996,6 +1008,7 @@ impl Engine {
             column_names,
             column_types,
             column_derivs,
+            column_typmods,
             order,
             limit: so.limit,
             offset: so.offset,
@@ -1046,6 +1059,8 @@ impl Engine {
         let mut col_params: Vec<Vec<usize>> = vec![Vec::new(); arity];
         // Per column: each row's collation derivation, combined after the loop (collation.md §1).
         let mut col_derivs: Vec<Vec<Deriv>> = vec![Vec::with_capacity(rows.len()); arity];
+        // Per column: each row's typmod, combined after the loop (create-table-as.md §2).
+        let mut col_typmods: Vec<Vec<Typmod>> = vec![Vec::with_capacity(rows.len()); arity];
         for (ri, row) in rows.iter().enumerate() {
             if row.len() != arity {
                 return Err(EngineError::new(
@@ -1062,6 +1077,7 @@ impl Engine {
                     col_params[ci].push(*idx0);
                 }
                 col_derivs[ci].push(derive_collation(&scope, val)?);
+                col_typmods[ci].push(derive_typmod(&scope, val));
                 if ri == 0 {
                     col_types.push(ty);
                 } else {
@@ -1095,11 +1111,13 @@ impl Engine {
                 }
             })
             .collect::<Result<_>>()?;
+        let column_typmods = col_typmods.into_iter().map(common_typmod).collect();
         Ok(ValuesPlan {
             rows: resolved_rows,
             column_types: col_types,
             column_names,
             column_derivs,
+            column_typmods,
         })
     }
 

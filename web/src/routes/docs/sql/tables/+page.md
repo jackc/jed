@@ -23,7 +23,7 @@ INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;
 
 <svelte:head>
 	<title>Tables &amp; constraints — jed</title>
-	<meta name="description" content="Create and alter typed tables with serial and identity auto-numbering, defaults, and enforced PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints." />
+	<meta name="description" content="Create and alter typed tables — from column definitions or from a query with CREATE TABLE AS — with serial and identity auto-numbering, defaults, and enforced PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints." />
 </svelte:head>
 
 # Tables & constraints
@@ -84,6 +84,35 @@ CREATE TABLE shipment (
 INSERT INTO shipment VALUES (1, NULL, NULL);   -- ok: references nothing
 INSERT INTO shipment VALUES (2, 'west', NULL); -- error 23503 under MATCH FULL
 ```
+
+## Creating a table from a query
+
+`CREATE TABLE … AS query` creates a table from a query's result and fills it with the query's rows
+in the same statement, as in PostgreSQL. Each column takes the query column's name and type. A
+column copied straight from a table keeps its `numeric(p,s)` or `varchar(n)` limit; a computed
+column such as `balance * 2` does not. Constraints, defaults, and keys are not copied. Try it in the
+panel above:
+
+```sql
+CREATE TABLE big_spender AS SELECT owner, balance FROM account WHERE balance > 60;
+INSERT INTO big_spender VALUES ('Eve', 1.234);    -- balance keeps numeric(12,2): stored 1.23
+SELECT owner, balance FROM big_spender ORDER BY owner;
+```
+
+A column list after the table name renames the columns, left to right. `WITH NO DATA` at the end
+creates the table empty without running the query. The query can be any query: joins, aggregates,
+`UNION`, `VALUES`, or a `WITH` clause.
+
+```sql
+CREATE TABLE totals (owner, spent) AS
+  SELECT a.owner, sum(t.amount) FROM account a JOIN txn t ON t.account_id = a.id GROUP BY a.owner;
+CREATE TABLE account_shape AS SELECT * FROM account WITH NO DATA;   -- same columns, no rows
+```
+
+The query is checked before the table name, so `CREATE TABLE IF NOT EXISTS … AS` still reports an
+error in the query even when the table exists. A query that reads tables needs the `SELECT`
+privilege on them, unless `WITH NO DATA` is used. A data-modifying `WITH` in the query is not
+supported yet (`0A000`). See [temporary tables](../temp-tables/) for `CREATE TEMP TABLE … AS`.
 
 ## Names and quoted identifiers
 

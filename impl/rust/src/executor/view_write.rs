@@ -494,9 +494,15 @@ impl Engine {
                 .cloned()
                 .expect("planning the target plans every view in its chain");
             let names = renamed(level.view.columns.clone(), level.rename.as_deref());
-            let columns =
-                cte_synthetic_table_cols(&level.view.name, &names, &types, Some(&derivs), None)?
-                    .columns;
+            let columns = cte_synthetic_table_cols(
+                &level.view.name,
+                &names,
+                &types,
+                Some(&derivs),
+                None,
+                None,
+            )?
+            .columns;
             layer = WriteLayer {
                 view: Some(level.view.name.clone()),
                 columns,

@@ -717,6 +717,12 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 		// A temp table's DDL is gated by the temp-scoped split of allowDDL (temp-tables.md §5):
 		// allowTempDDL for a session-local temp table.
 		req.isTempDDL = stmt.CreateTable.Temp
+		// `CREATE TABLE … AS` reads what its query reads, as PostgreSQL checks it when the query runs;
+		// `WITH NO DATA` never runs the query, so it needs nothing on what the query names
+		// (spec/design/create-table-as.md §4).
+		if cta := stmt.CreateTable.AsQuery; cta != nil && cta.WithData {
+			collectQueryPrivs(&cta.Query, req, locals)
+		}
 	case stmt.DropTable != nil, stmt.AlterTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
 		stmt.CreateType != nil, stmt.DropType != nil, stmt.CreateSequence != nil, stmt.DropSequence != nil,
 		stmt.AlterSequence != nil, stmt.CreateView != nil, stmt.DropView != nil, stmt.AlterView != nil:

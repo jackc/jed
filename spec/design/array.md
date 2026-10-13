@@ -210,6 +210,11 @@ move as INSERT/DELETE). A top-level `$N` parameter into an array column stays `0
 param-to-container handling is special — a per-core divergence test), as does the
 `ON CONFLICT DO UPDATE` conflict-action path.
 
+**`INSERT … SELECT` into an array column** follows the same same-type rule: a projection of exactly the
+column's array type, or an untyped `NULL`, is stored through `store_array`; any other type is `42804`
+— including a bare `ARRAY[1]`, which is `i64[]` in a select list (no target hint reaches a `SELECT`),
+into an `i32[]` column, where PostgreSQL assignment-casts ([grammar.md](grammar.md) §24).
+
 ## 5. Comparison, ordering, and NULL — PG btree semantics, NOT composite 3VL
 
 Array comparison is **recursive / structural**, so — like composite — it is a hand-written special

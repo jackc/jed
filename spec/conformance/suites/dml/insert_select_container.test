@@ -1,0 +1,76 @@
+# INSERT ... SELECT into a container column — an array, a range, or a composite (spec/design/
+# grammar.md §24, array.md §4, ranges.md §4, composite.md §12): a source column of exactly the
+# column's type, or an untyped NULL, is stored through the INSERT ... VALUES container codec, so the
+# row round-trips identically. The type gate runs up front, before any row; a different element,
+# range, or composite type is 42804 (jed's strict container rule — UPDATE's; PostgreSQL would
+# assignment-cast, so that case is pinned in types/array.test with its override). CREATE TABLE … AS
+# fills its container columns through this path. Oracle-checked against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: dml.insert_select_container, dml.insert_select, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.where_eq, query.order_by, query.union, types.i32, types.text, types.decimal, types.array, types.range, types.composite
+
+statement ok
+CREATE TYPE addr AS (street text, zip varchar(5))
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, xs i32[], tags text[], r int4range, nr numrange, a addr)
+
+statement ok
+INSERT INTO src VALUES (1, ARRAY[1, 2], ARRAY['a', NULL], '[1,5)', '(1.5,2.5]', ROW('main', '12345'))
+
+statement ok
+INSERT INTO src (id) VALUES (2)
+
+statement ok
+CREATE TABLE dst (id i32 PRIMARY KEY, xs i32[], tags text[], r int4range, nr numrange, a addr)
+
+statement ok
+INSERT INTO dst SELECT id, xs, tags, r, nr, a FROM src
+
+query ITTTTTT rowsort
+SELECT id, xs, tags, r, nr, (a).street, (a).zip FROM dst
+----
+1
+{1,2}
+{a,NULL}
+[1,5)
+(1.5,2.5]
+main
+12345
+2
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# an expression of the column's type, a set operation, and an untyped NULL
+statement ok
+INSERT INTO dst (id, xs, r, a) SELECT id + 10, xs || 3, r * '[2,9)'::int4range, a FROM src WHERE id = 1 UNION ALL SELECT 20, NULL, NULL, NULL
+
+query ITTT rowsort
+SELECT id, xs, r, (a).zip FROM dst WHERE id >= 10
+----
+11
+{1,2,3}
+[2,5)
+12345
+20
+NULL
+NULL
+NULL
+
+# a different container type is refused before any row
+statement error 42804
+INSERT INTO dst (id, xs) SELECT 30, tags FROM src
+
+statement error 42804
+INSERT INTO dst (id, r) SELECT 30, nr FROM src
+
+statement error 42804
+INSERT INTO dst (id, xs) SELECT 30, r FROM src
+
+query I nosort
+SELECT count(*) FROM dst
+----
+4

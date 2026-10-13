@@ -1,0 +1,215 @@
+# The column types CREATE TABLE … AS creates (spec/design/create-table-as.md §2), read back through
+# jed_columns: each column is the query output's type with the typmod the output keeps (PostgreSQL's
+# exprTypmod), nullable, keyless, with no default. Two recorded divergences show here: a bare integer
+# literal in a select list is i64 (types.md §6), where PostgreSQL makes an integer column, and an
+# array keeps no element typmod (ARRAY[name] over a varchar(5) is text[]; array typmods are deferred,
+# array.md §12). PostgreSQL's planner also reports the left input's typmod for a filled INTERSECT or
+# EXCEPT column where the operands disagree; jed uses the operands' common typmod, PostgreSQL's own
+# WITH NO DATA answer. jed_columns is jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-
+# checked; ddl/create_table_as.test observes the same typmods through PostgreSQL-checked behavior.
+# requires: ddl.create_table_as, introspect.columns, ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.union, query.intersect, query.except, query.values_query, query.join_left, query.join_using, query.subquery_scalar, query.window, query.aggregates, expr.coalesce, expr.arithmetic, cast.explicit, types.i32, types.i64, types.decimal, types.text, types.varchar_length, types.array, types.range, types.composite
+
+statement ok
+CREATE TYPE pt AS (label varchar(4), x decimal(6,2))
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, price decimal(10,2) NOT NULL DEFAULT 1, name varchar(5), note text, tags text[], r i32range, p pt)
+
+statement ok
+INSERT INTO src VALUES (1, 1.5, 'ab', 'x', ARRAY['a'], '[1,5)', ROW('one', 1.5))
+
+statement ok
+INSERT INTO src (id, price, name) VALUES (2, 2.25, 'cde')
+
+# every column of a bare `*`: the declared types and typmods, with no NOT NULL, key, or default
+statement ok
+CREATE TABLE c1 AS SELECT * FROM src
+
+query ITTBIT nosort
+SELECT ordinal, name, type, not_null, pk_ordinal, column_default FROM jed_columns WHERE table_name = 'c1' ORDER BY ordinal
+----
+1
+id
+i32
+false
+NULL
+NULL
+2
+price
+decimal(10,2)
+false
+NULL
+NULL
+3
+name
+varchar(5)
+false
+NULL
+NULL
+4
+note
+text
+false
+NULL
+NULL
+5
+tags
+text[]
+false
+NULL
+NULL
+6
+r
+i32range
+false
+NULL
+NULL
+7
+p
+pt
+false
+NULL
+NULL
+
+query ITDTT rowsort
+SELECT id, name, price, tags, r FROM c1
+----
+1
+ab
+1.50
+{a}
+[1,5)
+2
+cde
+2.25
+NULL
+NULL
+
+# expressions: what keeps a typmod and what does not
+statement ok
+CREATE TABLE c2 AS SELECT 1 AS lit, 1.5 AS dec, NULL AS n, 'abc' AS s, price + 1 AS p1, price::decimal(5,1) AS pc, name::varchar(3) AS n3, price::decimal AS pd, coalesce(price, price) AS co, coalesce(price, 0) AS co0, (SELECT name FROM src WHERE id = 1) AS sq, (p).label AS pl, (p).x AS px, ARRAY[name] AS an, count(*) OVER () AS cnt, min(price) OVER () AS mn FROM src
+
+query IT nosort
+SELECT ordinal, type FROM jed_columns WHERE table_name = 'c2' ORDER BY ordinal
+----
+1
+i64
+2
+decimal
+3
+text
+4
+text
+5
+decimal
+6
+decimal(5,1)
+7
+varchar(3)
+8
+decimal
+9
+decimal(10,2)
+10
+decimal
+11
+varchar(5)
+12
+varchar(4)
+13
+decimal(6,2)
+14
+text[]
+15
+i64
+16
+decimal
+
+# `(c).*` keeps each field's typmod
+statement ok
+CREATE TABLE c3 AS SELECT (p).* FROM src
+
+query TT nosort
+SELECT name, type FROM jed_columns WHERE table_name = 'c3' ORDER BY ordinal
+----
+label
+varchar(4)
+x
+decimal(6,2)
+
+# a set operation and VALUES keep the typmod their inputs agree on
+statement ok
+CREATE TABLE c4 AS SELECT price, name FROM src UNION ALL SELECT price, name FROM src
+
+statement ok
+CREATE TABLE c5 AS SELECT price, name FROM src UNION SELECT 1.5, 'abc'
+
+statement ok
+CREATE TABLE c6 AS SELECT price FROM src INTERSECT SELECT 1.5
+
+statement ok
+CREATE TABLE c7 AS SELECT price FROM src EXCEPT SELECT price FROM src WHERE id = 2
+
+statement ok
+CREATE TABLE c8 AS VALUES (1.5::decimal(4,1), 'a'::varchar(2)), (2.5::decimal(4,1), NULL)
+
+query TTT nosort
+SELECT table_name, name, type FROM jed_columns WHERE table_name IN ('c4', 'c5', 'c6', 'c7', 'c8') ORDER BY table_name, ordinal
+----
+c4
+price
+decimal(10,2)
+c4
+name
+varchar(5)
+c5
+price
+decimal
+c5
+name
+text
+c6
+price
+decimal
+c7
+price
+decimal(10,2)
+c8
+column1
+decimal(4,1)
+c8
+column2
+text
+
+# a USING join's merged column keeps its column's typmod
+statement ok
+CREATE TABLE c9 AS SELECT price, a.id, b.name FROM src a LEFT JOIN src b USING (price)
+
+query TT nosort
+SELECT name, type FROM jed_columns WHERE table_name = 'c9' ORDER BY ordinal
+----
+price
+decimal(10,2)
+id
+i32
+name
+varchar(5)
+
+# the column list renames; WITH NO DATA creates the same columns
+statement ok
+CREATE TABLE c10 (a, b) AS SELECT price, name, note FROM src WITH NO DATA
+
+query TT nosort
+SELECT name, type FROM jed_columns WHERE table_name = 'c10' ORDER BY ordinal
+----
+a
+decimal(10,2)
+b
+varchar(5)
+note
+text
+
+query I nosort
+SELECT count(*) FROM c10
+----
+0

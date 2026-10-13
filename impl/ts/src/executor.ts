@@ -18,6 +18,7 @@ import type {
   CreateIndex,
   CreateSequence,
   CreateTable,
+  CreateTableAs,
   CreateType,
   AlterView,
   CreateView,
@@ -111,6 +112,7 @@ import {
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { optimizeSelect } from "./optimize.ts";
+import { ctasColumns } from "./create_table_as.ts";
 import {
   type WherePushdown,
   accessPredicate,
@@ -471,13 +473,17 @@ import {
 } from "./kernels.ts";
 import {
   type Deriv,
+  type Typmod,
+  TYPMOD_NONE,
   catColumnDeriv,
   collatedOrValueCmp,
   collatedSortKey,
   columnCollation,
   commonCollation,
   combineDerivs,
+  commonTypmod,
   deriveCollation,
+  deriveTypmod,
   elemJsonText,
   jsonArgNode,
   objectKeyText,
@@ -497,6 +503,7 @@ import {
   resolveColumnRef,
   resolveProjections,
   sortTargetCollation,
+  typmodOfColumn,
   valueToNode,
 } from "./resolve.ts";
 import {
@@ -3570,6 +3577,9 @@ export class Engine {
         rejectParamsForDDL(params);
         return this.executeAnalyze(stmt);
       case "createTable":
+        // `CREATE TABLE … AS` runs a query, so its `$N` parameters bind like the query's
+        // (spec/design/create-table-as.md §1); the column-definition form takes none.
+        if (stmt.asQuery !== null) return this.executeCreateTableAs(stmt, stmt.asQuery, params);
         rejectParamsForDDL(params);
         return this.executeCreateTable(stmt);
       case "dropTable":
@@ -5609,7 +5619,7 @@ export class Engine {
   // relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
   // §3); an attachment target checks its OWN snapshot's namespace (each attached database is
   // independent, attached-databases.md §3).
-  private createTableNameTaken(name: string, attachName: string): boolean {
+  createTableNameTaken(name: string, attachName: string): boolean {
     if (attachName === "") return this.relationExists(name);
     const as = this.attachReadSnap(attachName)!;
     return (
@@ -5625,16 +5635,59 @@ export class Engine {
   // resolve left to right (unknown 42703, repeated 42701); then the jed narrowings — the
   // declaration-order rule and the per-member key-type gate — trap 0A000.
   private executeCreateTable(ct: CreateTable): Outcome {
-    // A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
-    // one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
-    // FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
-    // parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
-    // columns, serial/IDENTITY) are checked just before registration, once the columns are built.
-    //
-    // Resolve the optional database qualifier (attached-databases.md §3, Slice 1b): `main`/`temp` fold
-    // into the implicit scope (main = bare persistent, temp = TEMP); a host-attached name routes the new
-    // table INTO that attachment's working snapshot (§6). TEMP with an explicit database is
-    // contradictory unless the database IS `temp` (42601).
+    return this.createTableWithColumns(ct, null);
+  }
+
+  // executeCreateTableAs executes a `CREATE TABLE … AS` (spec/design/create-table-as.md §3). The checks
+  // run in PostgreSQL's order: the target database and the `jed_` reservation, then everything
+  // planning the query raises, then a taken name (IF NOT EXISTS skips here, after the query was
+  // analyzed), then the column checks of ctasColumns (create_table_as.ts). The table is created
+  // through CREATE TABLE's shared registration; WITH DATA then fills it by running `INSERT INTO
+  // <table> <query>`, whose outcome (rows, cost, errors) is the statement's.
+  private executeCreateTableAs(ct: CreateTable, cta: CreateTableAs, params: Value[]): Outcome {
+    const { targetTemp, attachName } = this.createTableTarget(ct);
+    checkReservedName("table", ct.name);
+    // Plan the query once, for its output columns. Its `$N` parameters are typed and bound as a
+    // query's are, so a wrong parameter count or an untyped parameter fails here.
+    const ptypes = new ParamTypes();
+    const plan = this.planQuery(cta.query, null, [], ptypes);
+    bindParams(params, ptypes.finalize(), this.inputZone());
+    if (this.createTableNameTaken(ct.name, attachName)) {
+      if (ct.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError("duplicate_table", "relation already exists: " + ct.name);
+    }
+    const columns = ctasColumns(
+      ct,
+      cta,
+      plan,
+      targetTemp,
+      this.readSnap().defaultCollation,
+    );
+    this.createTableWithColumns(ct, columns);
+    if (!cta.withData) return { kind: "statement", cost: 0n, rowsAffected: null };
+    // Fill the new table: the rows, cost, and errors are exactly `INSERT INTO t <query>`'s. The target
+    // is named in its own database, so no other relation of the same name can capture it.
+    const db = attachName !== "" ? attachName : targetTemp ? "temp" : "main";
+    const ins: Insert = {
+      kind: "insert",
+      table: ct.name,
+      db,
+      columns: null,
+      overriding: null,
+      source: { kind: "query", query: cta.query },
+      onConflict: null,
+      returning: null,
+    };
+    return this.executeInsertCached(ins, params, EMPTY_CTE_CTX, null, false);
+  }
+
+  // createTableTarget resolves the database a CREATE TABLE writes into (attached-databases.md §3,
+  // Slice 1b): whether the new table is session-local temp, and the attachment it is created in (""
+  // for main / temp). `main`/`temp` fold into the implicit scope (main = bare persistent, temp =
+  // TEMP); a host-attached name routes the new table INTO that attachment's working snapshot (§6).
+  // TEMP with an explicit database is contradictory unless the database IS `temp` (42601); an unknown
+  // database is 42P01 and a read-only attachment 25006.
+  createTableTarget(ct: CreateTable): { targetTemp: boolean; attachName: string } {
     let targetTemp = ct.temp;
     let attachName = "";
     if (ct.db !== undefined) {
@@ -5659,6 +5712,22 @@ export class Engine {
           this.checkAttachmentWritable(ct.db);
       }
     }
+    return { targetTemp, attachName };
+  }
+
+  // createTableWithColumns is CREATE TABLE over either column definitions (prebuilt is null) or the
+  // columns a `CREATE TABLE … AS` derived from its query (spec/design/create-table-as.md §3), which
+  // then skip the column-definition walk; everything after it — the target checks, the temp and
+  // attachment narrowings, and the registration — is shared.
+  createTableWithColumns(ct: CreateTable, prebuilt: Column[] | null): Outcome {
+    // A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
+    // one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
+    // FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
+    // parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
+    // columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+    //
+    // Resolve the optional database qualifier (attached-databases.md §3, Slice 1b).
+    const { targetTemp, attachName } = this.createTableTarget(ct);
     // The reservation is not a collision, so IF NOT EXISTS does not suppress it
     // (spec/design/introspection.md §4).
     checkReservedName("table", ct.name);
@@ -5714,7 +5783,7 @@ export class Engine {
       throw engineError("duplicate_table", "relation already exists: " + ct.name);
     }
 
-    const columns: Column[] = [];
+    const columns: Column[] = prebuilt ?? [];
     // pk is the primary-key member ordinals in KEY order (constraints.md §3): the
     // column-level form is the one-member case; the table-level list below records its
     // own order.
@@ -10426,27 +10495,24 @@ export class Engine {
         const p = provided[i]!;
         if (p < 0) continue;
         const col = table.columns[i]!;
-        // INSERT ... SELECT into a composite column lands in a later slice (the VALUES + ROW(…)
-        // path is S3 — spec/design/composite.md §12).
-        if (col.type.kind === "composite") {
-          throw engineError(
-            "feature_not_supported",
-            "INSERT ... SELECT into composite column " + col.name + " is not supported yet",
-          );
-        }
-        if (col.type.kind === "array") {
-          throw engineError(
-            "feature_not_supported",
-            "INSERT ... SELECT into array column " + col.name + " is not supported yet",
-          );
-        }
-        if (col.type.kind === "range") {
-          // INSERT ... SELECT into a range column is deferred (the VALUES + range literal/cast path
-          // is the supported input — spec/design/ranges.md §1), like array.
-          throw engineError(
-            "feature_not_supported",
-            "INSERT ... SELECT into range column " + col.name + " is not supported yet",
-          );
+        // A container column takes a source column of exactly its own type, or an untyped NULL —
+        // the container assignment rule UPDATE and an INSERT VALUES expression share (array.md §6,
+        // ranges.md §1, composite.md §12). An anonymous ROW(…) column has no composite type to
+        // match (0A000).
+        if (col.type.kind !== "scalar") {
+          const src = q.columnTypes[p]!;
+          if (src.kind === "composite" && src.name === null) {
+            throw engineError(
+              "feature_not_supported",
+              `inserting a ROW expression into composite column ${col.name} is not supported yet`,
+            );
+          }
+          if (src.kind !== "null" && !resolvedTypeEqual(src, resolvedTypeOfCol(col.type, this))) {
+            throw typeError(
+              `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(src)}`,
+            );
+          }
+          continue;
         }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
           throw typeError(
@@ -13042,19 +13108,19 @@ export class Engine {
       throw engineError("undefined_table", "table does not exist: " + tableName);
     }
     if (returning === null) {
-      const table = cteSyntheticTableCols(lname, [], [], null, rename);
+      const table = cteSyntheticTableCols(lname, [], [], null, null, rename);
       return { table, dm: { stmt, noReturning: true } };
     }
     const alias = body.kind === "insert" ? body.alias : undefined;
     const scope = Scope.returning(this, tdef, baseIsOld, returning, vw, alias);
     scope.ctes = bindings;
-    const { names, types, derivs } = resolveProjections(
+    const { names, types, derivs, typmods } = resolveProjections(
       scope,
       returning.items,
       { collecting: false, groupKeys: [], specs: [] },
       ptypes,
     );
-    const table = cteSyntheticTableCols(lname, names, types, derivs, rename);
+    const table = cteSyntheticTableCols(lname, names, types, derivs, typmods, rename);
     return { table, dm: { stmt, noReturning: false } };
   }
 
@@ -13659,6 +13725,7 @@ export class Engine {
           columnTypes: plan.columnTypes,
           columnNames: plan.columnNames,
           columnDerivs: queryPlanColumnDerivs(plan),
+          columnTypmods: plan.columnTypes.map(() => TYPMOD_NONE),
         });
       }
       return plan;
@@ -13884,7 +13951,14 @@ export class Engine {
       const level = levels[i]!;
       const meta = metas.get(level.view.name)!;
       const names = renamedNames(level.view.columns, level.rename);
-      const synth = cteSyntheticTableCols(level.view.name, names, meta.columnTypes, meta.columnDerivs, null);
+      const synth = cteSyntheticTableCols(
+        level.view.name,
+        names,
+        meta.columnTypes,
+        meta.columnDerivs,
+        null,
+        null,
+      );
       layer = {
         view: level.view.name,
         columns: synth.columns,
@@ -13917,6 +13991,7 @@ export class Engine {
         columnTypes: plan.columnTypes,
         columnNames: plan.columnNames,
         columnDerivs: queryPlanColumnDerivs(plan),
+        columnTypmods: plan.columnTypes.map(() => TYPMOD_NONE),
       });
       return metas;
     });
@@ -14717,6 +14792,13 @@ export class Engine {
       if (!rtCollatable(t)) return { kind: "none" };
       return commonCollation([lhsDerivs[i]!, rhsDerivs[i]!], noneOk);
     });
+    // Each column keeps the operands' typmod when they agree (PostgreSQL's select_common_typmod,
+    // create-table-as.md §2).
+    const lhsTypmods = queryPlanColumnTypmods(lhs);
+    const rhsTypmods = queryPlanColumnTypmods(rhs);
+    const columnTypmods: Typmod[] = columnTypes.map((_t, i) =>
+      commonTypmod([lhsTypmods[i]!, rhsTypmods[i]!]),
+    );
     const order: OrderSlot[] = so.orderBy.map((key) => {
       const idx = resolveSetopOrderKey(key, columnNames);
       // An explicit COLLATE on a set-operation ORDER BY key (spec/design/collation.md §1): the output
@@ -14749,6 +14831,7 @@ export class Engine {
       columnNames,
       columnTypes,
       columnDerivs,
+      columnTypmods,
       order,
       limit: so.limit,
       offset: so.offset,
@@ -14840,6 +14923,8 @@ export class Engine {
     const colParams: number[][] = Array.from({ length: arity }, () => []);
     // Per column: each row's collation derivation, combined after the loop (collation.md §1).
     const colDerivs: Deriv[][] = Array.from({ length: arity }, () => []);
+    // Per column: each row's typmod, combined after the loop (create-table-as.md §2).
+    const colTypmods: Typmod[][] = Array.from({ length: arity }, () => []);
     rows.forEach((row, ri) => {
       if (row.length !== arity) {
         throw engineError("syntax_error", "VALUES lists must all be the same length");
@@ -14856,6 +14941,7 @@ export class Engine {
         );
         if (node.kind === "param") colParams[ci]!.push(node.index);
         colDerivs[ci]!.push(deriveCollation(scope, val));
+        colTypmods[ci]!.push(deriveTypmod(scope, val));
         if (ri === 0) colTypes.push(type);
         else colTypes[ci] = unifyValuesColumn(colTypes[ci]!, type);
         resolvedRow.push(node);
@@ -14876,12 +14962,14 @@ export class Engine {
     const columnDerivs: Deriv[] = colTypes.map((t, ci) =>
       rtCollatable(t) ? commonCollation(colDerivs[ci]!, true) : { kind: "none" },
     );
+    const columnTypmods = colTypmods.map(commonTypmod);
     return {
       kind: "values",
       rows: resolvedRows,
       columnTypes: colTypes,
       columnNames,
       columnDerivs,
+      columnTypmods,
     };
   }
 
@@ -15586,7 +15674,7 @@ export class Engine {
     // an undefined window is 42704. A plain query with no window clause/refs clones nothing extra.
     let itemsRef = sel.items;
     if (hasWindowSyntax) {
-      const cloned = structuredClone(sel.items);
+      const cloned = cloneAst(sel.items);
       desugarItems(cloned, windowsResolved);
       itemsRef = cloned;
     }
@@ -15595,10 +15683,18 @@ export class Engine {
       names: columnNames,
       types: columnTypes,
       derivs: columnDerivs,
+      typmods: columnTypmods,
     } = resolveProjections(scope, itemsRef, projAgg, ptypes);
     const group =
       sel.joinGroup === true
-        ? joinGroupOutputs(scope, projections, columnNames, columnTypes, columnDerivs)
+        ? joinGroupOutputs(
+            scope,
+            projections,
+            columnNames,
+            columnTypes,
+            columnDerivs,
+            columnTypmods,
+          )
         : null;
     let aggSpecs = projAgg.specs;
     let groupingSpecs: number[][] = projAgg.groupingSpecs ?? [];
@@ -16011,6 +16107,7 @@ export class Engine {
       columnNames,
       columnTypes,
       columnDerivs,
+      columnTypmods,
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
@@ -26576,6 +26673,7 @@ function joinGroupOutputs(
   names: string[],
   types: ResolvedType[],
   derivs: Deriv[],
+  typmods: Typmod[],
 ): JoinGroupLayout {
   const pos = new Map<number, number>();
   projections.forEach((pr, p) => {
@@ -26592,18 +26690,20 @@ function joinGroupOutputs(
     names.push(c.name);
     types.push(resolvedTypeOfCol(c.type, s.catalog));
     derivs.push(catColumnDeriv(c));
+    typmods.push(typmodOfColumn(c));
   }
   for (const pr of projections) {
     const c = s.columnAt(starColumnIndex(pr));
-    group.columns.push(
-      groupColumn(
-        c.name,
-        c.type,
-        c.collation,
-        c.noCollation === true,
-        c.collationConflict === true,
-      ),
+    const col = groupColumn(
+      c.name,
+      c.type,
+      c.collation,
+      c.noCollation === true,
+      c.collationConflict === true,
     );
+    col.decimal = c.decimal;
+    col.varcharLen = c.varcharLen;
+    group.columns.push(col);
   }
   for (const r of s.rels) {
     if (r.label === "") continue;
@@ -29317,6 +29417,8 @@ export type SelectPlan = {
   // columnDerivs is each output column's collation derivation (collation.md §1 "Derived relations"),
   // carried into a derived table / CTE over this SELECT.
   columnDerivs: Deriv[];
+  // columnTypmods is each output column's typmod (create-table-as.md §2), carried the same way.
+  columnTypmods: Typmod[];
   distinct: boolean;
   limit: bigint | null;
   offset: bigint | null;
@@ -29494,6 +29596,8 @@ export type SetOpPlan = {
   // operations"): the inputs' common collation, implicit (an explicit input is demoted), "conflicted"
   // for a UNION ALL column over conflicting implicit collations, none for a non-text column.
   columnDerivs: Deriv[];
+  // columnTypmods is each output column's typmod: the inputs' common typmod (create-table-as.md §2).
+  columnTypmods: Typmod[];
   order: OrderSlot[];
   limit: bigint | null;
   offset: bigint | null;
@@ -29514,6 +29618,8 @@ export type ValuesPlan = {
   // columnDerivs is each column's common collation across the rows (spec/design/collation.md §1), as
   // for a UNION ALL column — a VALUES list never errors on an implicit conflict.
   columnDerivs: Deriv[];
+  // columnTypmods is each column's common typmod across the rows (create-table-as.md §2).
+  columnTypmods: Typmod[];
 };
 
 // WithPlan is a planned nested `WITH … query_expr` (spec/design/cte.md §7): the nested CTE bindings
@@ -29554,6 +29660,13 @@ export type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
 export function queryPlanColumnDerivs(plan: QueryPlan): Deriv[] {
   if (plan.kind === "with") return queryPlanColumnDerivs(plan.body);
   return plan.columnDerivs;
+}
+
+// queryPlanColumnTypmods returns the plan's per-output-column typmods (spec/design/create-table-as.md
+// §2) — what a derived table / CTE synthetic column records and a `CREATE TABLE … AS` column keeps.
+export function queryPlanColumnTypmods(plan: QueryPlan): Typmod[] {
+  if (plan.kind === "with") return queryPlanColumnTypmods(plan.body);
+  return plan.columnTypmods;
 }
 
 // ScanCache is a prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved
@@ -31077,6 +31190,19 @@ export function lookupWindow(windows: [string, WindowDef][], name: string): Wind
     throw engineError("undefined_object", `window "${name}" does not exist`);
   }
   return structuredClone(found[1]);
+}
+
+// cloneAst deep-copies an AST subtree's plain objects and arrays, sharing every other object (a
+// literal's Decimal, …) by reference: those are immutable values, and structuredClone would strip
+// their prototypes (a decimal literal in a window query's select list would lose its methods).
+export function cloneAst<T>(v: T): T {
+  if (Array.isArray(v)) return v.map((x) => cloneAst(x)) as T;
+  if (v === null || typeof v !== "object") return v;
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return v;
+  const out: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(v)) out[k] = cloneAst(x);
+  return out as T;
 }
 
 // desugarItems rewrites `OVER name` / `OVER (base …)` references in a select list to their
@@ -32731,8 +32857,9 @@ export function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
       return typeIsDecimal(kt) ? decimalValue(Decimal.fromBigInt(n)) : intValue(n);
     }
     if (e.kind === "literal" && e.literal.kind === "decimal") {
-      // The select items (and so this frame offset) are structuredClone'd during window desugaring,
-      // which strips the Decimal prototype — rebuild a real Decimal from its parts.
+      // A named window's definition (and so this frame offset) is structuredClone'd during window
+      // desugaring (lookupWindow), which strips the Decimal prototype — rebuild a real Decimal from
+      // its parts.
       const lit = e.literal.dec;
       const d = Decimal.fromParts(lit.neg, lit.scale, lit.limbs);
       if (d.neg && !d.isZero()) {

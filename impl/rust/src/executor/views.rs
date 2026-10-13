@@ -406,6 +406,7 @@ impl Engine {
             column_types: types.clone(),
             column_names: names.clone(),
             column_derivs: derivs.clone(),
+            column_typmods: vec![Typmod::NONE; types.len()],
         }))
     }
 

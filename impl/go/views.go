@@ -345,8 +345,10 @@ func (db *engine) planViewReference(viewName string, body *queryExpr, written *t
 			db.viewColumns = make(map[string]*valuesPlan)
 		}
 		if _, ok := db.viewColumns[viewName]; !ok {
+			// The stand-in records no typmods (a shape reads only its outputs' types and pushability).
 			db.viewColumns[viewName] = &valuesPlan{
 				columnTypes: plan.columnTypes(), columnNames: plan.columnNames(), columnDerivs: plan.columnDerivs(),
+				columnTypmods: make([]typmod, len(plan.columnTypes())),
 			}
 		}
 		return nil

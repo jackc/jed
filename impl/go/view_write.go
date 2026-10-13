@@ -461,7 +461,7 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 		level := levels[i]
 		meta := metas[level.view.Name]
 		names := renamedNames(level.view.Columns, level.rename)
-		synth, err := cteSyntheticTableCols(level.view.Name, names, meta.columnTypes, meta.columnDerivs, nil)
+		synth, err := cteSyntheticTableCols(level.view.Name, names, meta.columnTypes, meta.columnDerivs, nil, nil)
 		if err != nil {
 			return nil, err
 		}

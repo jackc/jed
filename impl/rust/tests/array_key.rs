@@ -70,7 +70,7 @@ fn float_element_array_key_is_keyable() {
     db.query_outcome("CREATE TABLE m (k f64[] PRIMARY KEY)", &[])
         .unwrap();
     // The '{…}' array literal coerces each element through f64 input, so the specials (NaN/Infinity)
-    // arrive without an INSERT ... SELECT (which is 0A000 into an array column this slice).
+    // arrive as plain literals.
     for v in ["{1.5,2.5}", "{1.5}", "{-Infinity}", "{NaN}", "{1.5,2.0}"] {
         db.query_outcome(&format!("INSERT INTO m VALUES ('{v}')"), &[])
             .unwrap();

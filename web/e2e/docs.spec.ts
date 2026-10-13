@@ -221,6 +221,31 @@ test('the tables page enforces a FOREIGN KEY and cascades parent deletes', async
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
+test('the tables page creates a table from a query with CREATE TABLE AS live', async ({ page }) => {
+  await page.goto('/docs/sql/tables/');
+  const panel = livePanel(page, 'accountDemo');
+  await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+
+  // The new table takes the query's rows, and its balance column keeps numeric(12,2): 1.234 is
+  // stored as 1.23 (create-table-as.md §2).
+  await panel
+    .getByTestId('sql-input')
+    .fill(
+      "CREATE TABLE big_spender AS SELECT owner, balance FROM account WHERE balance > 60; INSERT INTO big_spender VALUES ('Eve', 1.234); SELECT owner, balance FROM big_spender ORDER BY owner"
+    );
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+  await expect(panel.getByTestId('result-rows').locator('td')).toHaveText([
+    'Ada',
+    '100.00',
+    'Eve',
+    '1.23'
+  ]);
+
+  await panel.getByTestId('reset-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+});
+
 test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   const panel = livePanel(page, 'accountDemo');

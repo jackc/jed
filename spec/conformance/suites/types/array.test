@@ -114,10 +114,11 @@ INSERT INTO o VALUES (1, ARRAY[100000])
 statement error 22P02
 INSERT INTO t VALUES (4, '{1,2', NULL)
 
-# INSERT ... SELECT into an array column is deferred (0A000 — the VALUES + ARRAY[…] path above is
-# the supported input, array.md §12). Rejected up front at the type-assignability gate, before any
-# row is produced.
-statement error 0A000
+# INSERT ... SELECT into an array column takes a source column of exactly the column's type (the
+# container assignment rule UPDATE shares, array.md §6). A bare ARRAY[1] in a select list is i64[]
+# (no target hint reaches a SELECT), so it is 42804 at the type-assignability gate, before any row
+# is produced; PostgreSQL assignment-casts it.
+statement error 42804
 INSERT INTO t (id, xs) SELECT 9, ARRAY[1]
 
 # Comparing arrays of different element types is 42804.

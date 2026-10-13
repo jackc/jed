@@ -824,6 +824,9 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	if err != nil {
 		return nil, err
 	}
+	if p.atCreateTableAs() {
+		return p.parseCreateTableAs(name, dbQualifier, temp, ifNotExists)
+	}
 	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
@@ -891,6 +894,106 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 		return nil, err
 	}
 	return &createTable{Name: name, Temp: temp, IfNotExists: ifNotExists, DB: dbQualifier, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes, OnCommit: onCommit}, nil
+}
+
+// atCreateTableAs reports whether the cursor, just past a CREATE TABLE's name, begins the `CREATE
+// TABLE … AS` form (spec/design/create-table-as.md §1): the keyword AS, the keyword ON (an ON COMMIT
+// clause precedes AS; the column-definition form needs `(` here), or a parenthesized list of bare
+// column names followed by AS or ON. A column definition always has a type after its name, so
+// `( name , … )` of single identifiers is never the column-definition form.
+func (p *parser) atCreateTableAs() bool {
+	kw := func(i int) bool {
+		w := p.peekKeywordAt(i)
+		return w == "as" || w == "on"
+	}
+	if kw(0) {
+		return true
+	}
+	if p.peekKindAt(0) != tokLParen {
+		return false
+	}
+	i := 1
+	for {
+		if !isIdentKind(p.peekKindAt(i)) {
+			return false
+		}
+		switch p.peekKindAt(i + 1) {
+		case tokComma:
+			i += 2
+		case tokRParen:
+			return kw(i + 2)
+		default:
+			return false
+		}
+	}
+}
+
+// parseCreateTableAs parses the rest of `CREATE [TEMP] TABLE [IF NOT EXISTS] name [( col [, …] )]
+// [ON COMMIT …] AS query [WITH [NO] DATA]` (spec/design/create-table-as.md §1, grammar.md §13). The
+// query is a `subquery_expr`. A trailing `WITH [NO] DATA` is cut off before the query is parsed, as
+// CREATE VIEW cuts off its check option: an unreserved `with` would otherwise read as a table alias.
+func (p *parser) parseCreateTableAs(name string, db *string, temp, ifNotExists bool) (*createTable, error) {
+	var columnNames []string
+	if p.peekKindAt(0) == tokLParen {
+		p.advance()
+		col, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		columnNames = append(columnNames, col)
+		for p.peek().Kind == tokComma {
+			p.advance()
+			if col, err = p.expectIdentifier(); err != nil {
+				return nil, err
+			}
+			columnNames = append(columnNames, col)
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return nil, err
+		}
+	}
+	onCommit, err := p.parseOnCommit()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("as"); err != nil {
+		return nil, err
+	}
+	dataAt, withData := p.trailingWithData()
+	if dataAt >= 0 {
+		p.tokens[dataAt] = token{Kind: tokEof}
+	}
+	query, err := p.parseSubquery()
+	if err != nil {
+		return nil, err
+	}
+	if dataAt >= 0 && p.pos != dataAt {
+		return nil, newError(SyntaxError, "unexpected trailing input")
+	}
+	return &createTable{Name: name, Temp: temp, IfNotExists: ifNotExists, DB: db, OnCommit: onCommit, AsQuery: &createTableAs{ColumnNames: columnNames, Query: query, WithData: withData}}, nil
+}
+
+// trailingWithData returns the token index of a trailing `WITH DATA` / `WITH NO DATA` ending the
+// statement (spec/design/create-table-as.md §1) and whether the table is filled; -1 and true when
+// absent.
+func (p *parser) trailingWithData() (int, bool) {
+	end := len(p.tokens)
+	if end > 0 && p.tokens[end-1].Kind == tokEof {
+		end--
+	}
+	word := func(i int, w string) bool {
+		return i >= 0 && i < len(p.tokens) && p.tokens[i].Kind == tokWord && p.tokens[i].Word == w
+	}
+	if end < p.pos+2 || !word(end-1, "data") {
+		return -1, true
+	}
+	if word(end-2, "with") {
+		return end - 2, true
+	}
+	if end >= p.pos+3 && word(end-2, "no") && word(end-3, "with") {
+		return end - 3, false
+	}
+	return -1, true
 }
 
 // parseOnCommit parses the optional trailing `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` of a

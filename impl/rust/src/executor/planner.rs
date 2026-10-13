@@ -1016,8 +1016,13 @@ impl Engine {
         } else {
             &sel.items
         };
-        let (mut projections, mut column_names, mut column_types, mut column_derivs) =
-            resolve_projections(&scope, items_ref, &mut agg_ctx, ptypes)?;
+        let (
+            mut projections,
+            mut column_names,
+            mut column_types,
+            mut column_derivs,
+            mut column_typmods,
+        ) = resolve_projections(&scope, items_ref, &mut agg_ctx, ptypes)?;
         let group = if sel.join_group {
             Some(join_group_outputs(
                 &scope,
@@ -1025,6 +1030,7 @@ impl Engine {
                 &mut column_names,
                 &mut column_types,
                 &mut column_derivs,
+                &mut column_typmods,
             ))
         } else {
             None
@@ -1631,6 +1637,7 @@ impl Engine {
             column_names,
             column_types,
             column_derivs,
+            column_typmods,
             distinct: sel.distinct,
             limit: sel.limit,
             offset: sel.offset,
@@ -1809,6 +1816,7 @@ impl Engine {
                     column_names,
                     column_types,
                     column_derivs,
+                    column_typmods,
                     order,
                     limit,
                     offset,
@@ -1823,6 +1831,7 @@ impl Engine {
                     column_names,
                     column_types,
                     column_derivs,
+                    column_typmods,
                     order,
                     limit,
                     offset,
@@ -2020,6 +2029,7 @@ fn join_group_outputs(
     names: &mut Vec<String>,
     types: &mut Vec<ResolvedType>,
     derivs: &mut Vec<Deriv>,
+    typmods: &mut Vec<Typmod>,
 ) -> JoinGroupLayout {
     // `pos[flat]` is the output position of the scope's flat column `flat`.
     let mut pos: Vec<usize> = vec![usize::MAX; scope.width()];
@@ -2047,6 +2057,7 @@ fn join_group_outputs(
         names.push(c.name.clone());
         types.push(resolved_type_of_col(&c.ty, scope.catalog));
         derivs.push(cat_column_deriv(c));
+        typmods.push(Typmod::of_column(c));
     }
     for pr in projections.iter() {
         let RExpr::Column(idx) = pr else {
@@ -2056,8 +2067,8 @@ fn join_group_outputs(
         group.columns.push(Column {
             name: c.name.clone(),
             ty: c.ty.clone(),
-            decimal: None,
-            varchar_len: None,
+            decimal: c.decimal,
+            varchar_len: c.varchar_len,
             primary_key: false,
             not_null: false,
             default: None,

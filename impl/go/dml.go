@@ -1113,26 +1113,24 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		// values (22003) and enforces NOT NULL.
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 {
-				// INSERT ... SELECT into a composite column lands in a later slice (the VALUES +
-				// ROW(...) path is S3 — spec/design/composite.md §12).
-				if col.Type.IsComposite() {
-					return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
-						"INSERT ... SELECT into composite column %s is not supported yet", col.Name,
-					))
-				}
-				// INSERT ... SELECT into an array column is deferred (the VALUES + ARRAY[…] path
-				// is the supported input — spec/design/array.md §12).
-				if col.Type.IsArray() {
-					return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
-						"INSERT ... SELECT into array column %s is not supported yet", col.Name,
-					))
-				}
-				// INSERT ... SELECT into a range column is deferred (the VALUES + range literal/cast
-				// path is the supported input — spec/design/ranges.md §1).
-				if col.Type.IsRange() {
-					return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
-						"INSERT ... SELECT into range column %s is not supported yet", col.Name,
-					))
+				// A container column takes a source column of exactly its own type, or an untyped
+				// NULL — the container assignment rule UPDATE and an INSERT VALUES expression share
+				// (array.md §6, ranges.md §1, composite.md §12). An anonymous ROW(…) column has no
+				// composite type to match (0A000).
+				if col.Type.IsComposite() || col.Type.IsArray() || col.Type.IsRange() {
+					src := q.columnTypes[p]
+					if src.kind == rtComposite && !src.comp.named {
+						return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+							"inserting a ROW expression into composite column %s is not supported yet", col.Name,
+						))
+					}
+					if src.kind != rtNull && !resolvedTypeEqual(src, resolvedTypeOfCol(col.Type, db.readSnap())) {
+						return outcome{}, typeError(fmt.Sprintf(
+							"column %s is of type %s but expression is of type %s",
+							col.Name, col.Type.CanonicalName(), rtName(src),
+						))
+					}
+					continue
 				}
 				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) {
 					return outcome{}, typeError(fmt.Sprintf(
@@ -2877,7 +2875,7 @@ func (db *engine) resolveReturning(table *catTable, returning returningClause, b
 		return nil, nil, nil, err
 	}
 	s.ctes = ctes
-	nodes, names, types, _, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
+	nodes, names, types, _, _, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, nil, err
 	}

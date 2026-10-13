@@ -1319,6 +1319,21 @@ func (p *queryPlan) columnDerivs() []deriv {
 	return p.setop.columnDerivs
 }
 
+// columnTypmods returns the plan's per-output-column typmods (spec/design/create-table-as.md §2) —
+// what a derived table / CTE synthetic column records and a `CREATE TABLE … AS` column keeps.
+func (p *queryPlan) columnTypmods() []typmod {
+	if p.sel != nil {
+		return p.sel.columnTypmods
+	}
+	if p.values != nil {
+		return p.values.columnTypmods
+	}
+	if p.with != nil {
+		return p.with.body.columnTypmods()
+	}
+	return p.setop.columnTypmods
+}
+
 // valuesPlan is a resolved VALUES-body relation (spec/design/grammar.md §42), executable to its
 // literal rows — the FROM-position sibling of INSERT … VALUES. rows[r][c] is row r, column c, each
 // resolved against no FROM row (a non-LATERAL body sees no sibling; it may correlate to an enclosing
@@ -1333,6 +1348,8 @@ type valuesPlan struct {
 	// columnDerivs is each column's common collation across the rows (spec/design/collation.md §1),
 	// as for a UNION ALL column — a VALUES list never errors on an implicit conflict.
 	columnDerivs []deriv
+	// columnTypmods is each column's common typmod across the rows (create-table-as.md §2).
+	columnTypmods []typmod
 }
 
 // cteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
@@ -1743,9 +1760,11 @@ type selectPlan struct {
 	// columnDerivs is each output column's collation derivation (collation.md §1 "Derived relations"),
 	// carried into a derived table / CTE over this SELECT.
 	columnDerivs []deriv
-	distinct     bool
-	limit        *int64
-	offset       *int64
+	// columnTypmods is each output column's typmod (create-table-as.md §2), carried the same way.
+	columnTypmods []typmod
+	distinct      bool
+	limit         *int64
+	offset        *int64
 	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
 	// §14): which of its columns this query statically references. Drives the chain-page_read /
 	// value_decompress portion of the scan's up-front cost block — an untouched spilled or
@@ -1858,9 +1877,11 @@ type setOpPlan struct {
 	// derivConflicted for a UNION ALL column over conflicting implicit collations, derivNone for a
 	// non-text column.
 	columnDerivs []deriv
-	order        []orderSlot
-	limit        *int64
-	offset       *int64
+	// columnTypmods is each output column's typmod: the inputs' common typmod (create-table-as.md §2).
+	columnTypmods []typmod
+	order         []orderSlot
+	limit         *int64
+	offset        *int64
 }
 
 // evalEnv is the environment threaded into the per-row evaluator (spec/design/grammar.md §26):

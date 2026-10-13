@@ -735,6 +735,11 @@ not temporary — `PRESERVE ROWS` included, and a `main.`- or attachment-qualifi
 before any column or constraint work. The words are recognized positionally after `)`, so none
 becomes reserved; anything else there is `42601`.
 
+**`CREATE TABLE … AS query`** creates a table from a query's output columns and fills it with the
+query's rows (§57, [create-table-as.md](create-table-as.md)). Unlike the column-definition form, its
+`IF NOT EXISTS` skip comes **after** the query is analyzed (PostgreSQL's order), so the query's own
+errors are reported even for a taken name.
+
 **Multi-table drop.** `DROP TABLE a, b, c` removes several tables in one statement. It is
 **two-phase / all-or-nothing** (the discipline §12 uses for multi-row work): every name is
 resolved and validated *first* — a missing one is `42P01` (unless `IF EXISTS`, which skips
@@ -1732,6 +1737,15 @@ bytea (the documented text-adaptation, [types.md](types.md) §6), boolean→bool
 bytea→bytea, and a **NULL-typed** projection to **any** column (a `NOT NULL` target then traps
 `23502` per row, if any). A column the list omits is not type-checked — it takes its default
 else NULL.
+
+**A container column** — an array, a range, or a composite — takes a projection of **exactly its
+own type** or a NULL-typed one, the container rule `UPDATE` and an `INSERT … VALUES` expression
+already share ([array.md](array.md) §4, [ranges.md](ranges.md) §4): a different element, range, or
+composite type is `42804` (PostgreSQL would assignment-cast — e.g. a bare `ARRAY[1]`, which is `i64[]`
+in a select list, into an `i32[]` column; ledgered), and an anonymous `ROW(…)` projection into a
+composite column is `0A000`. The values are stored through the same container codec as `INSERT …
+VALUES`. (Formerly every container column was `0A000` here; `CREATE TABLE … AS` fills its container
+columns through this path — [create-table-as.md](create-table-as.md) §3.)
 
 **Same two-phase / all-or-nothing pass as §12.** Once arity and assignability pass, every
 produced row runs through the identical validation the `VALUES` path uses: each value is
@@ -3589,3 +3603,23 @@ SELECT overlay(bytea '\x0102' PLACING bytea '\xff' FROM 2)  -- \x01ff (FOR defau
   `OVERLAY(s PLACING n FROM st [FOR c])` becomes `overlay(s, n, st[, c])` — PostgreSQL's own
   rewrites — so resolution, NULL handling, errors, cost, and the output labels (`position`,
   `overlay`) are those of the calls. No `WITHIN GROUP`, `FILTER`, or `OVER` may follow.
+
+## 57. `CREATE TABLE … AS` ([create-table-as.md](create-table-as.md))
+
+`CREATE [TEMP | TEMPORARY] TABLE [IF NOT EXISTS] [db.]name [( col [, …] )] [ON COMMIT …] AS query
+[WITH [NO] DATA]` (`create_table` / `create_table_as` in the grammar) is PostgreSQL's `CREATE TABLE
+AS`. The query is a `subquery_expr` — what a derived table or view body accepts (§42). Each output
+column becomes a column with the output's name (or the column list's), type, typmod, and collation,
+and nothing else (create-table-as.md §2); `WITH DATA` (the default) fills the table exactly as
+`INSERT INTO t <query>` would (§24) — rows, cost, errors — and `WITH NO DATA` creates it empty without
+running the query.
+
+Recognition after the table name: the keyword `AS`, the keyword `ON` (an `ON COMMIT` clause comes
+before `AS`, PostgreSQL's position), or a parenthesized list of bare names followed by `AS` or `ON`.
+The column-definition form always has `(` there and a type after each column name, so the two never
+overlap and no word becomes reserved. A trailing `WITH DATA` / `WITH NO DATA` ends the statement; it
+is cut off before the query is parsed, the CREATE VIEW check-option precedent (§54), because an
+unreserved `with` after a `FROM` item would otherwise read as its alias — `AS SELECT … FROM t AS
+"with" WITH NO DATA` still parses. Any other trailing word is `42601`. The query's `$N` placeholders
+bind as a query's do (create-table-as.md §1); PostgreSQL's `AS TABLE name` / `AS EXECUTE name` forms
+are absent.

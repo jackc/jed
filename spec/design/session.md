@@ -501,6 +501,12 @@ a function (the deny-list — `revoke uuidv4`/`now()` to pin determinism). A fun
 (default-off + per-function `grant`) is the symmetric shape but needs a function-default toggle the v1
 `SessionOptions` (which carries only the *table* `default_privileges`) does not expose; deferred (§11).
 
+**`CREATE TABLE … AS`** ([create-table-as.md](create-table-as.md) §4) is `CREATE TABLE`'s DDL gate
+(`allow_ddl`, or `allow_temp_ddl` for a temp table) plus everything its query needs — `SELECT` on what
+it reads, `EXECUTE` on what it calls — as PostgreSQL checks it when the query runs. `WITH NO DATA`
+never runs the query, so it needs nothing on what the query names, and the new table needs no
+`INSERT` to be filled (PostgreSQL 18 checks none).
+
 **Views** ([views.md](views.md) §9). A view is a relation for privilege purposes: grants and
 `default_privileges` name it like a table. Reading a view needs `SELECT` on the view only; the
 relations its body reads are not checked against the reading session (PostgreSQL's default view

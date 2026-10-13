@@ -19,7 +19,8 @@
 > domain's committed **page** bytes (§6/§7). **Slice 3 (spill-to-disk) has landed:** past
 > `temp_buffers` a file host migrates the domain to a scratch file in its spill directory and bounds
 > the domain's page cache by `temp_buffers` (§6). **`ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }`
-> has landed** (§5.1), PostgreSQL's end-of-transaction actions. This doc was written first, spec-first
+> has landed** (§5.1), PostgreSQL's end-of-transaction actions, and so has **`CREATE TEMP TABLE … AS`**
+> (§1, [create-table-as.md](create-table-as.md)). This doc was written first, spec-first
 > (CLAUDE.md §11).
 >
 > **A database-wide `SHARED` temp kind was designed and briefly shipped (former slice 2), then REMOVED**
@@ -42,11 +43,13 @@ overriding reason" rule.
 ```sql
 CREATE [ TEMP | TEMPORARY ] TABLE name ( table_element [, ...] )
     [ ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } ]
+CREATE [ TEMP | TEMPORARY ] TABLE name [ ( column_name [, ...] ) ]
+    [ ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } ] AS query [ WITH [ NO ] DATA ]
 ```
 
 ```ebnf
 create_table   ::= "CREATE" table_scope? "TABLE" identifier
-                   "(" table_element ("," table_element)* ")" on_commit?
+                   ( "(" table_element ("," table_element)* ")" on_commit? | create_table_as )
 table_scope    ::= "TEMPORARY" | "TEMP"
 on_commit      ::= "ON" "COMMIT" ( "PRESERVE" "ROWS" | "DELETE" "ROWS" | "DROP" )
 ```
@@ -65,8 +68,11 @@ on_commit      ::= "ON" "COMMIT" ( "PRESERVE" "ROWS" | "DELETE" "ROWS" | "DROP" 
   ROWS` (the default) keeps it, `DELETE ROWS` empties it, `DROP` drops it. Writing any `ON COMMIT`
   clause on a table that is not temporary, `PRESERVE ROWS` included, is **`42P16`** *"ON COMMIT can
   only be used on temporary tables"* (PostgreSQL).
-- **Deferred surface** (absent from the grammar, not foreclosed — §14): `CREATE TEMP TABLE … AS
-  SELECT`.
+- **`CREATE TEMP TABLE … AS query [WITH [NO] DATA]`** makes a temp table from a query
+  ([create-table-as.md](create-table-as.md)): its columns are the query's output columns and, unless
+  `WITH NO DATA`, its rows the query's, filled in the same statement. `ON COMMIT` comes before `AS`
+  (PostgreSQL's position): `CREATE TEMP TABLE t ON COMMIT DROP AS SELECT …`. The gate, the namespace,
+  and the §8 narrowings are this section's — a collated text column is the §8 `0A000`.
 - `CREATE [TEMP|TEMPORARY] TABLE IF NOT EXISTS` is supported exactly as for a persistent table
   ([grammar.md](grammar.md) §13): a collision under the preclude-overlaps namespace (§3) — a temp
   name already taken by a temp **or** persistent relation — is a no-op success rather than `42P07`.
@@ -548,12 +554,15 @@ and memory-only per the design decision:
   temp snapshot before it stages. All three cores; no `format_version` change (temp catalog entries
   are never serialized). Driven by a new `ddl.temp_on_commit` conformance capability.
 
+- **`CREATE TABLE … AS` (landed).** The query form of `CREATE TABLE`, temp and persistent alike
+  ([create-table-as.md](create-table-as.md)): a temp target follows this doc's gate, namespace, `ON
+  COMMIT`, and narrowings. All three cores; capability `ddl.create_table_as`.
+
 ## 14. Deferred / follow-ons (none foreclosed)
 
 - **Database-wide shared temp — removed, not a follow-on.** The former `SHARED` kind (slice 2) is
   retired (Slice 0, §13); a `Database`-scoped in-memory **attachment** is its replacement
   ([attached-databases.md](attached-databases.md) §6). Not deferred — deliberately not part of temp.
-- `CREATE TEMP TABLE … AS SELECT` (§1).
 - `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.
 - A host-configurable spill directory (shared with the external sort — spill.md), so a WASI or OPFS
   host could offer a temp spill target; and migrating a shrunken spilled domain back into RAM.

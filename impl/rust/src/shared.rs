@@ -3991,6 +3991,67 @@ mod temp_reclaim_internal_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // CREATE TABLE … AS (spec/design/create-table-as.md): the SQL-visible behavior is the corpus's
+    // (ddl/create_table_as*.test); this covers the host surface it cannot drive — the query's bound
+    // parameters (§1), the affected-row count, and the column-definition form's refusal of parameters.
+    // Mirrors the Go create_table_as_test.go and the TS create_table_as test.
+
+    #[test]
+    fn create_table_as_binds_parameters() {
+        let db = Database::create(CreateOptions::default()).unwrap();
+        let mut sess = db.session(SessionOptions::default());
+        sess.query_outcome("CREATE TABLE src (id i32 PRIMARY KEY, name text)", &[])
+            .unwrap();
+        sess.query_outcome("INSERT INTO src VALUES (1, 'a'), (2, 'b'), (3, 'c')", &[])
+            .unwrap();
+        let sql = "CREATE TABLE t AS SELECT id, name, $2::text AS tag FROM src WHERE id >= $1";
+        let params = [Value::Int(2), Value::Text("x".to_string())];
+        match sess.query_outcome(sql, &params).unwrap() {
+            Outcome::Statement { rows_affected, .. } => assert_eq!(rows_affected, Some(2)),
+            other => panic!("expected a statement, got {other:?}"),
+        }
+        let got = rows(&mut sess, "SELECT id, name, tag FROM t ORDER BY id");
+        assert_eq!(
+            got,
+            vec![
+                vec![
+                    Value::Int(2),
+                    Value::Text("b".into()),
+                    Value::Text("x".into())
+                ],
+                vec![
+                    Value::Int(3),
+                    Value::Text("c".into()),
+                    Value::Text("x".into())
+                ],
+            ]
+        );
+        // A missing parameter is the query's own count mismatch, and nothing is created.
+        let err = sess
+            .query_outcome("CREATE TABLE u AS SELECT $1::i32 AS a", &[])
+            .unwrap_err();
+        assert_eq!(err.code(), "42601");
+        let err = sess.query_outcome("SELECT a FROM u", &[]).unwrap_err();
+        assert_eq!(err.code(), "42P01");
+        // WITH NO DATA binds the parameters but runs nothing.
+        match sess
+            .query_outcome(
+                "CREATE TABLE v AS SELECT $1::i32 AS a WITH NO DATA",
+                &[Value::Int(1)],
+            )
+            .unwrap()
+        {
+            Outcome::Statement { rows_affected, .. } => assert_eq!(rows_affected, None),
+            other => panic!("expected a statement, got {other:?}"),
+        }
+        assert!(rows(&mut sess, "SELECT a FROM v").is_empty());
+        // The column-definition form is plain DDL: it takes no parameters.
+        let err = sess
+            .query_outcome("CREATE TABLE w (a i32)", &[Value::Int(1)])
+            .unwrap_err();
+        assert_eq!(err.code(), "42601");
+    }
+
     // CREATE TEMP TABLE … ON COMMIT (spec/design/temp-tables.md §5.1): the SQL-visible behavior is the
     // corpus's (ddl/temp_on_commit.test); these cover the host transaction and prepared-statement
     // surfaces, the zero-main-file-write invariant, and the footprint under max_temp_storage_bytes.

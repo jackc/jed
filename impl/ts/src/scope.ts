@@ -18,13 +18,21 @@ import type {
 import {
   type Engine,
   queryPlanColumnDerivs,
+  queryPlanColumnTypmods,
   astSubscriptExprs,
   exprHasAggregate,
   itemsHaveAggregate,
   outerOf,
 } from "./executor.ts";
 import type { Column, SeqDataType, SeqOwner, SequenceDef, Table } from "./catalog.ts";
-import { type Deriv, commonCollation } from "./resolve.ts";
+import {
+  type Deriv,
+  type Typmod,
+  TYPMOD_NONE,
+  commonCollation,
+  commonTypmod,
+  typmodEqual,
+} from "./resolve.ts";
 import {
   columnIndex,
   seqDataTypeDefaultBounds,
@@ -141,11 +149,12 @@ export class Scope {
   // membership never change meaning under the query-side function propagation.
   storageCollation = false;
   // Each scalar subquery resolved against this scope, keyed by its AST node, with its output
-  // column's collation derivation (spec/design/collation.md §1 "Scalar subqueries"). resolve
-  // records it when it plans the body, so deriveCollation — which works on the AST — can read it
-  // without planning the body again. Keyed by identity: a lookup always follows the resolve of the
-  // same node, which overwrites any stale entry.
-  subqueryDerivs: Map<QueryExpr, Deriv> = new Map();
+  // column's collation derivation (spec/design/collation.md §1 "Scalar subqueries") and typmod
+  // (spec/design/create-table-as.md §2). resolve records them when it plans the body, so
+  // deriveCollation / deriveTypmod — which work on the AST — can read them without planning the body
+  // again. Keyed by identity: a lookup always follows the resolve of the same node, which overwrites
+  // any stale entry.
+  subqueryDerivs: Map<QueryExpr, { deriv: Deriv; typmod: Typmod }> = new Map();
   // Set on a LATERAL FENCE only (spec/design/grammar.md §15): the empty scope a parenthesized join's
   // body is planned against when the join is not the first item of its FROM. The fence hides the
   // relations to the join's left from the body's ON clauses and non-LATERAL items (PostgreSQL's
@@ -1165,6 +1174,16 @@ export function checkRecursiveColumnTypes(
         `recursive query "${name}" column ${i + 1} has type ${rtName(a[i]!)} in non-recursive term but type ${rtName(unified)} overall`,
       );
     }
+    // The non-recursive term also fixed the column's typmod, so the overall common typmod must
+    // equal it (PostgreSQL compares type and typmod — create-table-as.md §2).
+    const atMod = queryPlanColumnTypmods(anchor)[i]!;
+    const overallMod = commonTypmod([atMod, queryPlanColumnTypmods(recursive)[i]!]);
+    if (!typmodEqual(overallMod, atMod)) {
+      throw engineError(
+        "datatype_mismatch",
+        `recursive query "${name}" column ${i + 1} has type ${typmodTypeName(a[i]!, atMod)} in non-recursive term but type ${typmodTypeName(a[i]!, overallMod)} overall`,
+      );
+    }
     if (!unionAll) requireSetopEquality(a[i]!);
     // The non-recursive term fixed the relation's collation, so the UNION's overall common
     // collation must equal it (PostgreSQL's recursive-CTE check, spec/design/collation.md §1): a
@@ -1182,6 +1201,16 @@ export function checkRecursiveColumnTypes(
       }
     }
   }
+}
+
+// typmodTypeName is a resolved type's name with its typmod applied (`decimal(10,2)`, `varchar(5)`),
+// as a column of it would be declared.
+function typmodTypeName(ty: ResolvedType, typmod: Typmod): string {
+  if (ty.kind === "decimal" && typmod.decimal !== null) {
+    return `decimal(${typmod.decimal.precision},${typmod.decimal.scale})`;
+  }
+  if (ty.kind === "text" && typmod.varcharLen !== null) return `varchar(${typmod.varcharLen})`;
+  return rtName(ty);
 }
 
 // collationIdentity is the collation a derivation settles to, named as PostgreSQL reports it (the
@@ -1206,19 +1235,22 @@ export function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[
     plan.columnNames,
     plan.columnTypes,
     queryPlanColumnDerivs(plan),
+    queryPlanColumnTypmods(plan),
     rename,
   );
 }
 
 // cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
-// types + collation derivations (null = none for every column) — so a data-modifying CTE (whose
-// "body output" is its RETURNING projection, not a QueryPlan) builds its synthetic relation the same
-// way (spec/design/writable-cte.md §1).
+// types + collation derivations + typmods (null = none for every column) — so a data-modifying CTE
+// (whose "body output" is its RETURNING projection, not a QueryPlan) builds its synthetic relation
+// the same way (spec/design/writable-cte.md §1). Each column records its body output's typmod, so a
+// reference to it keeps the typmod (spec/design/create-table-as.md §2).
 export function cteSyntheticTableCols(
   name: string,
   bodyNames: string[],
   bodyTypes: ResolvedType[],
   bodyDerivs: Deriv[] | null,
+  bodyTypmods: Typmod[] | null,
   rename: string[] | null,
 ): Table {
   let colNames: string[];
@@ -1250,6 +1282,9 @@ export function cteSyntheticTableCols(
   }));
   columns.forEach((col, i) => {
     setSyntheticCollation(col, bodyDerivs === null ? { kind: "none" } : bodyDerivs[i]!);
+    const t = bodyTypmods === null ? TYPMOD_NONE : bodyTypmods[i]!;
+    col.decimal = t.decimal;
+    col.varcharLen = t.varcharLen;
   });
   return { name, columns, pk: [], checks: [], indexes: [], fks: [], exclusions: [] };
 }
@@ -1878,6 +1913,12 @@ export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
       // A temp table's DDL is gated by the temp-scoped split of allowDdl (temp-tables.md §5):
       // allowTempDdl for a session-local temp table.
       req.isTempDdl = stmt.temp;
+      // `CREATE TABLE … AS` reads what its query reads, as PostgreSQL checks it when the query runs;
+      // `WITH NO DATA` never runs the query, so it needs nothing on what the query names
+      // (spec/design/create-table-as.md §4).
+      if (stmt.asQuery?.withData) {
+        collectQueryPrivs(stmt.asQuery.query, req, locals);
+      }
       break;
     case "dropTable":
     case "alterTable":

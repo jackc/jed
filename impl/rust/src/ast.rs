@@ -200,6 +200,23 @@ pub struct CreateTable {
     /// (spec/design/temp-tables.md §5.1), `None` when absent. Any clause — `PRESERVE ROWS` included —
     /// on a table that is not temporary is 42P16 at execution (PostgreSQL's `ONCOMMIT_NOOP`).
     pub on_commit: Option<crate::catalog::OnCommit>,
+    /// `CREATE TABLE … AS query` (spec/design/create-table-as.md): the table's columns come from the
+    /// query's output and its rows from running it. `None` for the column-definition form; when
+    /// `Some`, `columns` and every constraint list are empty.
+    pub as_query: Option<Box<CreateTableAs>>,
+}
+
+/// The `[( col [, …] )] AS query [WITH [NO] DATA]` part of a `CREATE TABLE … AS`
+/// (spec/design/create-table-as.md §1).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateTableAs {
+    /// The optional column-name list. It renames the query's output columns left to right; a
+    /// shorter list leaves the rest with their query names, a longer one is 42601.
+    pub column_names: Option<Vec<String>>,
+    /// The query (`subquery_expr`): a `SELECT`, `VALUES`, set operation, or nested `WITH`.
+    pub query: QueryExpr,
+    /// `false` for `WITH NO DATA`: the table is created empty and the query is never run.
+    pub with_data: bool,
 }
 
 /// A referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md §6.6).

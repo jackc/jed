@@ -607,7 +607,9 @@ A statement result carries `cost` and the **affected-row count**: an INSERT, UPD
 DELETE without RETURNING reports how many rows it touched — PostgreSQL's command-tag count
 (`UPDATE 3`). A DML statement that matched nothing reports **0**; DDL and transaction
 control report **no count** (Rust `Option<i64>` `None` / Go `HasRowsAffected == false` /
-TS `null`) — mirroring PG, whose DDL tags carry no row count. DML *with* RETURNING is a
+TS `null`) — mirroring PG, whose DDL tags carry no row count. `CREATE TABLE … AS` reports the
+rows it filled the table with (PostgreSQL's `SELECT n` tag), and no count under `WITH NO DATA` or
+when `IF NOT EXISTS` skips it ([create-table-as.md](create-table-as.md) §3). DML *with* RETURNING is a
 query result; its count is the result's row length. A query result carries `column_names`,
 the materialized `rows`, and `cost`.
 
@@ -616,7 +618,9 @@ the materialized `rows`, and `cost`.
 A bind parameter is `$` followed by a 1-based decimal index (`$1`, `$2`, …; grammar.md §5,
 [../grammar/grammar.ebnf](../grammar/grammar.ebnf)). Parameters are an **API construct**:
 the corpus stays literal-only (§conformance.md 1.2), but the parser accepts `$N` anywhere a
-primary expression is accepted and as an `INSERT` value slot.
+primary expression is accepted and as an `INSERT` value slot. DDL takes none (`42601`), except the
+query of a `CREATE TABLE … AS`, which binds them as the query would
+([create-table-as.md](create-table-as.md) §1).
 
 **Typing is by context, statically, before execution.** The engine has a strict static type
 system (CLAUDE.md §4); a parameter has no intrinsic type, so it adopts one from its context

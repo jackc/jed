@@ -295,6 +295,10 @@ func (db *engine) dispatchStmtBodyCached(stmt statement, params []Value, ic *ins
 			return outcome{}, err
 		}
 		return db.executeAnalyze(stmt.Analyze)
+	case stmt.CreateTable != nil && stmt.CreateTable.AsQuery != nil:
+		// `CREATE TABLE … AS` runs a query, so its `$N` parameters bind like the query's
+		// (spec/design/create-table-as.md §1); the column-definition form takes none.
+		return db.executeCreateTableAs(stmt.CreateTable, params)
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
 			return outcome{}, err
@@ -434,39 +438,58 @@ func (db *engine) createTableNameTaken(name, attachName string) bool {
 }
 
 func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
-	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
-	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
-	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
-	// parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
-	// columns, serial/IDENTITY) are checked just before registration, once the columns are built.
-	//
-	// Resolve the optional database qualifier (attached-databases.md §3, Slice 1b): `main`/`temp` fold
-	// into the implicit scope (main = bare persistent, temp = TEMP); a host-attached name routes the new
-	// table INTO that attachment's working snapshot (§6). TEMP with an explicit database is
-	// contradictory unless the database IS `temp` (42601).
+	return db.createTableWithColumns(ct, nil)
+}
+
+// createTableTarget resolves the database a CREATE TABLE writes into (attached-databases.md §3,
+// Slice 1b): whether the new table is session-local temp, and the attachment it is created in ("" for
+// main / temp). `main`/`temp` fold into the implicit scope (main = bare persistent, temp = TEMP); a
+// host-attached name routes the new table INTO that attachment's working snapshot (§6). TEMP with an
+// explicit database is contradictory unless the database IS `temp` (42601); an unknown database is
+// 42P01 and a read-only attachment 25006.
+func (db *engine) createTableTarget(ct *createTable) (bool, string, error) {
 	targetTemp := ct.Temp
 	attachName := ""
 	if ct.DB != nil {
 		switch *ct.DB {
 		case "main":
 			if ct.Temp {
-				return outcome{}, newError(SyntaxError, `cannot create a TEMP table in database "main"`)
+				return false, "", newError(SyntaxError, `cannot create a TEMP table in database "main"`)
 			}
 		case "temp":
 			targetTemp = true
 		default:
 			if ct.Temp {
-				return outcome{}, newError(SyntaxError, "cannot create a TEMP table in an attached database")
+				return false, "", newError(SyntaxError, "cannot create a TEMP table in an attached database")
 			}
 			attachName = *ct.DB
 			if db.attachReadSnap(attachName) == nil {
-				return outcome{}, newError(UndefinedTable, `database "`+*ct.DB+`" is not attached`)
+				return false, "", newError(UndefinedTable, `database "`+*ct.DB+`" is not attached`)
 			}
 			// A DDL write to a READ-ONLY attachment is 25006 before any work (attached-databases.md §4).
 			if err := db.checkAttachmentWritable(ct.DB); err != nil {
-				return outcome{}, err
+				return false, "", err
 			}
 		}
+	}
+	return targetTemp, attachName, nil
+}
+
+// createTableWithColumns runs a CREATE TABLE over either column definitions (prebuilt is nil) or the
+// columns a `CREATE TABLE … AS` derived from its query (spec/design/create-table-as.md §3), which then
+// skip the column-definition walk; everything after it — the target checks, the temp and attachment
+// narrowings, and the registration — is shared.
+func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) (outcome, error) {
+	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
+	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
+	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
+	// parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
+	// columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+	//
+	// Resolve the optional database qualifier (attached-databases.md §3, Slice 1b).
+	targetTemp, attachName, err := db.createTableTarget(ct)
+	if err != nil {
+		return outcome{}, err
 	}
 	// The reservation is not a collision, so IF NOT EXISTS does not suppress it
 	// (spec/design/introspection.md §4).
@@ -510,7 +533,10 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		return outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
 	}
 
-	columns := make([]catColumn, 0, len(ct.Columns))
+	columns := prebuilt
+	if columns == nil {
+		columns = make([]catColumn, 0, len(ct.Columns))
+	}
 	// pk is the primary-key member ordinals in KEY order (constraints.md §3): the
 	// column-level form is the one-member case; the table-level list below records its
 	// own order.

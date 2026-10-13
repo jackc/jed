@@ -499,7 +499,7 @@ reason = "jed: comparing i32[] to text[] is a cross-type error 42804 (the strict
 [[override]]
 file = "types/array.test"
 sql = "INSERT INTO t (id, xs) SELECT 9, ARRAY[1]"
-reason = "jed: INSERT ... SELECT into an array column is deferred this slice (0A000 — array.md §12; the VALUES + ARRAY[…] / '{…}' literal path is the supported input), like the composite and range columns. PostgreSQL inserts the row. A documented narrowing."
+reason = "jed: an INSERT ... SELECT source column must have exactly the container column's type (the container assignment rule UPDATE and an INSERT VALUES expression share — array.md §6), and a bare ARRAY[1] in a select list is i64[] (no target hint reaches a SELECT; types.md §6), so i64[] into i32[] is 42804. PostgreSQL assignment-casts the array and inserts the row. The strict type system (§4)."
 
 [[override]]
 file = "types/array.test"
@@ -1420,3 +1420,10 @@ reason = "jed: no age(date, date) overload — jed has no implicit date → time
 file = "expr/age.test"
 sql = "SELECT age(timestamp '2024-03-01', timestamptz '2024-01-31 00:00:00+00')"
 reason = "jed: no mixed age(timestamp, timestamptz) overload — jed has no implicit timestamp → timestamptz cast in function resolution (timezones.md §9.1), so 42883; cast explicitly. PostgreSQL implicitly casts the timestamp to timestamptz."
+
+# --- CREATE TABLE … AS with a data-modifying WITH (spec/design/create-table-as.md §5). The query is a
+# nested subquery_expr, where a data-modifying CTE is top-level-only (cte.md §7), so jed refuses it.
+[[override]]
+file = "ddl/create_table_as.test"
+sql = "CREATE TABLE bad AS WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id FROM d"
+reason = "jed: a data-modifying WITH in CREATE TABLE … AS is 0A000 — the query is planned as a nested subquery_expr, where a data-modifying CTE is refused (cte.md §7); running it as the statement's own writable WITH is a deferred follow-on (create-table-as.md §5). PostgreSQL treats the CTAS query as a top-level statement and runs the DELETE, creating the table from its RETURNING rows."

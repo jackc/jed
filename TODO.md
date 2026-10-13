@@ -84,7 +84,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`json` / `jsonb` + SQL/JSON** — the committed XL headline feature: all non-deferred slices across all three cores, oracle-clean; spec'd across [json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md), [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md); type codes 18/19/20, one `format_version` bump (v18→v19).
   - [ ] _follow-ons (deferred `0A000`, hoisted from the done slices):_ the string-**dictionary builder** (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index ([encoding.md §2.13](spec/design/encoding.md)); GIN **`jsonb_ops`** opclass for `@>`/`?`; `JSON_TABLE` explicit `PLAN` (T2); `ON ERROR/EMPTY DEFAULT <expr>` (S3); the remaining **jsonpath** surface (`like_regex` → Pike VM, item methods `.type()`/`.size()`/`.double()`/…, arithmetic, `vars`/`silent` args, the `_tz` query-function variants — P2/P3); `row_to_json`.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — COMPLETE (S0–S6): the open `Type { Scalar | Composite(catalog-ref) }`, `CREATE`/`DROP TYPE`, nested + recursive types, storable composite column + recursive codec (`format_version` 9), `ROW(…)`, field access, element-wise compare/ORDER BY/DISTINCT/GROUP BY. Named composites only. → [composite.md](spec/design/composite.md)
-  - [ ] _still narrowed (relaxable later):_ `INSERT … SELECT` / `UPDATE` of a composite column, and an anonymous `ROW(…)` *expression* (non-literal fields) in an `INSERT … VALUES` slot; an **array-of-composite** field as a key + a composite **FK** pairing (the remaining `0A000` key axes); `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` + anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor.
+  - [ ] _still narrowed (relaxable later):_ `UPDATE` of a composite column, and an anonymous `ROW(…)` *expression* (non-literal fields) in an `INSERT … VALUES` slot; an **array-of-composite** field as a key + a composite **FK** pairing (the remaining `0A000` key axes); `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` + anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor.
 
 ---
 
@@ -125,7 +125,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   → [temp-tables.md](spec/design/temp-tables.md)
   - [ ] _follow-on:_ a host-configurable spill directory (shared with the external sort) so WASI/OPFS
     hosts can offer a temp spill target; migrating a shrunken spilled domain back into RAM.
-  - [ ] _follow-on:_ `CREATE TEMP TABLE … AS SELECT`; FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
+  - [ ] _follow-on:_ FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
+- [x] **`CREATE TABLE … AS`** — `CREATE [TEMP] TABLE [IF NOT EXISTS] name [(cols)] [ON COMMIT …] AS
+  query [WITH [NO] DATA]`, PostgreSQL's: columns typed from the query with the typmods its outputs
+  keep (`exprTypmod`, now tracked through every query output), filled as `INSERT … SELECT` (which now
+  accepts a same-typed array/range/composite source). → [create-table-as.md](spec/design/create-table-as.md)
+  - [ ] _follow-on:_ a data-modifying `WITH` in the query (`0A000`); `SELECT … INTO`; `EXPLAIN CREATE
+    TABLE … AS`; view columns reporting their bodies' typmods. → [create-table-as.md §5](spec/design/create-table-as.md)
 - [x] **Views** (`CREATE [OR REPLACE] VIEW` / `ALTER VIEW … RENAME` / `DROP VIEW`, writes through
   updatable views) — a named persisted query read as the equivalent derived table (identical rows,
   cost, plan);

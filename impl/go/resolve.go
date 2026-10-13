@@ -121,11 +121,11 @@ type scope struct {
 	storageCollation bool
 	// subqueryDerivs records each scalar subquery resolved against this scope, keyed by its AST
 	// node, with its output column's collation derivation (spec/design/collation.md §1 "Scalar
-	// subqueries"). resolve records it when it plans the body, so deriveCollation — which works on
-	// the AST — can read it without planning the body again. Nil until the first record (lazily
-	// allocated); a lookup always follows the resolve of the same node, which overwrites any stale
-	// entry.
-	subqueryDerivs map[*queryExpr]deriv
+	// subqueries") and typmod (spec/design/create-table-as.md §2). resolve records them when it plans
+	// the body, so deriveCollation / deriveTypmod — which work on the AST — can read them without
+	// planning the body again. Nil until the first record (lazily allocated); a lookup always follows
+	// the resolve of the same node, which overwrites any stale entry.
+	subqueryDerivs map[*queryExpr]subqueryOutput
 	// lateralView is set on a LATERAL FENCE only (spec/design/grammar.md §15): the empty scope a
 	// parenthesized join's body is planned against when the join is not the first item of its FROM.
 	// The fence hides the relations to the join's left from the body's ON clauses and non-LATERAL
@@ -152,6 +152,13 @@ func lateralFence(parent, view *scope, catalog *engine, ctes []*cteBinding) *sco
 // that is not the parenthesized join the fence was built for (§15).
 func (s *scope) withoutLateralView() *scope {
 	return &scope{parent: s.parent, catalog: s.catalog, allowSubquery: true, ctes: s.ctes}
+}
+
+// subqueryOutput is a scalar subquery's recorded output column (scope.subqueryDerivs): its
+// derivation as seen from outside the subquery, and its typmod.
+type subqueryOutput struct {
+	d  deriv
+	tm typmod
 }
 
 // subRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
@@ -800,31 +807,34 @@ func resolvedTypeOfCol(ty dataType, snap *snapshot) resolvedType {
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type is
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
-// column name (spec/design/grammar.md §8) and collation derivation (spec/design/collation.md §1).
+// column name (spec/design/grammar.md §8), collation derivation (spec/design/collation.md §1), and
+// typmod (spec/design/create-table-as.md §2).
 // `*` expands across ALL relations in FROM order, each relation's columns in catalog order (§15).
 // expandLayerColumns expands a layered relation's `*` (a write through a view, views.md §15.2): each
 // of the view's columns, by name, resolved through the layer.
-func expandLayerColumns(s *scope, rel int, ag *aggCtx) ([]*rExpr, []string, []resolvedType, []deriv, error) {
+func expandLayerColumns(s *scope, rel int, ag *aggCtx) ([]*rExpr, []string, []resolvedType, []deriv, []typmod, error) {
 	layer := s.rels[rel].layer
 	var ps []*rExpr
 	var names []string
 	var types []resolvedType
 	var derivs []deriv
+	var typmods []typmod
 	for col := range layer.columns {
 		c := &layer.columns[col]
 		node, ty, err := resolveColumnRef(s, ag, resolved{layered: true, rel: rel, col: col}, c.Name)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		ps = append(ps, node)
 		names = append(names, c.Name)
 		types = append(types, ty)
 		derivs = append(derivs, catColumnDeriv(c))
+		typmods = append(typmods, columnTypmod(c))
 	}
-	return ps, names, types, derivs, nil
+	return ps, names, types, derivs, typmods, nil
 }
 
-func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, []deriv, error) {
+func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, []deriv, []typmod, error) {
 	if items.All {
 		// `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
 		// (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
@@ -837,12 +847,13 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			}
 		}
 		if !expandable {
-			return nil, nil, nil, nil, newError(SyntaxError, "SELECT * with no tables specified is not valid")
+			return nil, nil, nil, nil, nil, newError(SyntaxError, "SELECT * with no tables specified is not valid")
 		}
 		var ps []*rExpr
 		var names []string
 		var types []resolvedType
 		var derivs []deriv
+		var typmods []typmod
 		// A write through a view returns the view's columns (views.md §15.2).
 		for ri, r := range s.rels {
 			if r.layer != nil && !r.qualifierOnly {
@@ -880,6 +891,7 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			names = append(names, c.Name)
 			types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
 			derivs = append(derivs, catColumnDeriv(c))
+			typmods = append(typmods, columnTypmod(c))
 			s.traceFlat(idx)
 		}
 		// A written `*` in a view body is frozen into its expansion (views.md §5).
@@ -891,12 +903,13 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			}
 			s.catalog.traceStar(items.StarPos, false, cols)
 		}
-		return ps, names, types, derivs, nil
+		return ps, names, types, derivs, typmods, nil
 	}
 	ps := make([]*rExpr, 0, len(items.Items))
 	names := make([]string, 0, len(items.Items))
 	types := make([]resolvedType, 0, len(items.Items))
 	derivs := make([]deriv, 0, len(items.Items))
+	typmods := make([]typmod, 0, len(items.Items))
 	for _, it := range items.Items {
 		// `t.*` expands the FROM relation labeled Qualifier into one output column per column, in
 		// catalog order (grammar.md §15) — like bare `*` but for one named relation and mixable with
@@ -908,12 +921,13 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			layered := false
 			for ri := range s.rels {
 				if s.rels[ri].label == want && s.rels[ri].layer != nil {
-					lps, lnames, ltypes, lderivs, err := expandLayerColumns(s, ri, ag)
+					lps, lnames, ltypes, lderivs, ltypmods, err := expandLayerColumns(s, ri, ag)
 					if err != nil {
-						return nil, nil, nil, nil, err
+						return nil, nil, nil, nil, nil, err
 					}
 					ps, names = append(ps, lps...), append(names, lnames...)
 					types, derivs = append(types, ltypes...), append(derivs, lderivs...)
+					typmods = append(typmods, ltypmods...)
 					layered = true
 					break
 				}
@@ -939,13 +953,14 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 				}
 			}
 			if table == nil {
-				return nil, nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
+				return nil, nil, nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
 			}
 			for i := range table.Columns {
 				ps = append(ps, &rExpr{kind: reColumn, index: slots[i]})
 				names = append(names, table.Columns[i].Name)
 				types = append(types, resolvedTypeOfCol(table.Columns[i].Type, s.catalog.readSnap()))
 				derivs = append(derivs, catColumnDeriv(&table.Columns[i]))
+				typmods = append(typmods, columnTypmod(&table.Columns[i]))
 				s.traceFlat(slots[i])
 			}
 			// A written `rel.*` in a view body is frozen into `"rel" . "col"` references (views.md §5).
@@ -965,25 +980,37 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		if it.Expr.Kind == exprFieldStar {
 			baseNode, baseTy, err := resolve(s, *it.Expr.Base, nil, ag, params)
 			if err != nil {
-				return nil, nil, nil, nil, err
+				return nil, nil, nil, nil, nil, err
 			}
 			if baseTy.kind != rtComposite {
-				return nil, nil, nil, nil, newError(WrongObjectType, fmt.Sprintf(
+				return nil, nil, nil, nil, nil, newError(WrongObjectType, fmt.Sprintf(
 					"column notation .* applied to type %s, which is not a composite type",
 					rtName(baseTy),
 				))
+			}
+			// Each field keeps its declared typmod (PostgreSQL's FieldSelect).
+			var fieldTypmods []typmod
+			if def := compositeOfExpr(s, *it.Expr.Base); def != nil {
+				for j := range def.Fields {
+					fieldTypmods = append(fieldTypmods, fieldTypmod(&def.Fields[j]))
+				}
 			}
 			for i, f := range baseTy.comp.fields {
 				ps = append(ps, &rExpr{kind: reField, operand: baseNode, index: i})
 				names = append(names, f.name)
 				types = append(types, f.ty)
 				derivs = append(derivs, deriv{})
+				tm := typmod{}
+				if i < len(fieldTypmods) {
+					tm = fieldTypmods[i]
+				}
+				typmods = append(typmods, tm)
 			}
 			continue
 		}
 		node, ty, err := resolve(s, it.Expr, nil, ag, params)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		ps = append(ps, node)
 		types = append(types, ty)
@@ -992,17 +1019,18 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		d := deriv{}
 		if ty.collatable() {
 			if d, err = deriveCollation(s, it.Expr); err != nil {
-				return nil, nil, nil, nil, err
+				return nil, nil, nil, nil, nil, err
 			}
 		}
 		derivs = append(derivs, d)
+		typmods = append(typmods, deriveTypmod(s, it.Expr))
 		if it.Alias != nil {
 			names = append(names, *it.Alias)
 		} else {
 			names = append(names, outputName(s, it.Expr))
 		}
 	}
-	return ps, names, types, derivs, nil
+	return ps, names, types, derivs, typmods, nil
 }
 
 // outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a
@@ -1611,7 +1639,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			return nil, resolvedType{}, newError(SyntaxError, "subquery must return only one column")
 		}
 		outType := plan.columnTypes()[0]
-		noteSubqueryDeriv(s, e.Subquery, plan.columnDerivs()[0])
+		noteSubqueryDeriv(s, e.Subquery, plan.columnDerivs()[0], plan.columnTypmods()[0])
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqScalar}, outType, nil
 	case exprExists:
 		// EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
@@ -2650,8 +2678,8 @@ func deriveCollation(s *scope, e exprNode) (deriv, error) {
 		return combineDerivList(s, e.GreatestLeast)
 	case exprScalarSubquery:
 		// A scalar subquery: its output column's collation, recorded when resolve planned it.
-		if d, ok := s.subqueryDerivs[e.Subquery]; ok {
-			return d, nil
+		if o, ok := s.subqueryDerivs[e.Subquery]; ok {
+			return o.d, nil
 		}
 		return deriv{}, nil
 	default:
@@ -2688,6 +2716,167 @@ func combineDerivList(s *scope, args []exprNode) (deriv, error) {
 		}
 	}
 	return d, nil
+}
+
+// typmod is a query output column's type modifier (spec/design/create-table-as.md §2): the
+// numeric(p,s) precision and scale, or the varchar(n) length, that a `CREATE TABLE … AS` column keeps.
+// Both nil is no typmod. Only a decimal or text scalar carries one; an array's element typmod is not
+// tracked (an array column cannot declare one — array.md §12). The zero value is no typmod.
+type typmod struct {
+	Decimal    *decimalTypmod
+	VarcharLen *uint32
+}
+
+// columnTypmod is a column's declared typmod (a catalog column, or a synthetic one that recorded its
+// body's).
+func columnTypmod(col *catColumn) typmod {
+	return typmod{Decimal: col.Decimal, VarcharLen: col.VarcharLen}
+}
+
+// fieldTypmod is the typmod of a composite field (PostgreSQL's FieldSelect keeps it).
+func fieldTypmod(f *compositeField) typmod {
+	return typmod{Decimal: f.Decimal, VarcharLen: f.VarcharLen}
+}
+
+// equal reports whether two typmods are the same (by value — the pointers may differ).
+func (t typmod) equal(o typmod) bool {
+	if (t.Decimal == nil) != (o.Decimal == nil) || (t.VarcharLen == nil) != (o.VarcharLen == nil) {
+		return false
+	}
+	if t.Decimal != nil && *t.Decimal != *o.Decimal {
+		return false
+	}
+	return t.VarcharLen == nil || *t.VarcharLen == *o.VarcharLen
+}
+
+// commonTypmod is the common typmod of several inputs (PostgreSQL's select_common_typmod, and
+// exprTypmod for CASE / COALESCE / GREATEST / LEAST): their typmod when every input has the same one,
+// else none. Typmods only exist on decimal and text values, so equal typmods mean one type.
+func commonTypmod(inputs []typmod) typmod {
+	if len(inputs) == 0 {
+		return typmod{}
+	}
+	for _, t := range inputs[1:] {
+		if !t.equal(inputs[0]) {
+			return typmod{}
+		}
+	}
+	return inputs[0]
+}
+
+// deriveTypmod is the typmod an expression keeps (spec/design/create-table-as.md §2, PostgreSQL's
+// exprTypmod): a column reference keeps its column's, a cast to numeric(p,s) / varchar(n) has the
+// cast's, a COLLATE keeps its operand's, CASE (with an ELSE), COALESCE, GREATEST, and LEAST keep their
+// inputs' common typmod, a scalar subquery keeps its output column's, and a composite field selection
+// keeps the field's. Every other expression — an operator, a function, an aggregate, a literal, a
+// parameter, a cast without a typmod — has none.
+func deriveTypmod(s *scope, e exprNode) typmod {
+	switch e.Kind {
+	case exprColumn:
+		if r, err := s.resolveBare(e.Column); err == nil {
+			return columnTypmod(s.columnOf(r))
+		}
+		return typmod{}
+	case exprQualifiedColumn:
+		if r, err := s.resolveQualified(e.Qualifier, e.Column); err == nil {
+			return columnTypmod(s.columnOf(r))
+		}
+		return typmod{}
+	case exprCollate:
+		return deriveTypmod(s, e.Collate.Inner)
+	case exprCast:
+		if e.Cast.TypeMod == nil || strings.HasSuffix(e.Cast.TypeName, "[]") {
+			return typmod{}
+		}
+		if _, d, vl, err := resolveTypeAndTypmod(e.Cast.TypeName, e.Cast.TypeMod); err == nil {
+			return typmod{Decimal: d, VarcharLen: vl}
+		}
+		return typmod{}
+	case exprCase:
+		// CASE without an ELSE can yield a NULL of no typmod (PostgreSQL returns none).
+		if e.Case.Els == nil {
+			return typmod{}
+		}
+		tms := []typmod{deriveTypmod(s, *e.Case.Els)}
+		for i := range e.Case.Whens {
+			tms = append(tms, deriveTypmod(s, e.Case.Whens[i].Result))
+		}
+		return commonTypmod(tms)
+	case exprCoalesce:
+		return commonTypmodList(s, e.Coalesce)
+	case exprGreatestLeast:
+		return commonTypmodList(s, e.GreatestLeast)
+	case exprScalarSubquery:
+		// A scalar subquery: its output column's typmod, recorded when resolve planned it.
+		if o, ok := s.subqueryDerivs[e.Subquery]; ok {
+			return o.tm
+		}
+		return typmod{}
+	case exprFieldAccess:
+		if def := compositeOfExpr(s, *e.Base); def != nil {
+			for i := range def.Fields {
+				if def.Fields[i].Name == e.Field {
+					return fieldTypmod(&def.Fields[i])
+				}
+			}
+		}
+		return typmod{}
+	default:
+		return typmod{}
+	}
+}
+
+// commonTypmodList is commonTypmod over an inline argument list (COALESCE / GREATEST / LEAST).
+func commonTypmodList(s *scope, args []exprNode) typmod {
+	tms := make([]typmod, len(args))
+	for i := range args {
+		tms[i] = deriveTypmod(s, args[i])
+	}
+	return commonTypmod(tms)
+}
+
+// compositeOfExpr is the catalog composite type of an expression whose type is statically a named
+// composite and whose fields' typmods are known: a composite column, a composite field of one, or a
+// cast to a composite. nil for any other expression (its fields' typmods are then not tracked).
+func compositeOfExpr(s *scope, e exprNode) *compositeType {
+	named := func(ty dataType) *compositeType {
+		if ty.Comp == nil || s.catalog == nil {
+			return nil
+		}
+		return s.catalog.readSnap().compositeType(ty.Comp.Name)
+	}
+	switch e.Kind {
+	case exprColumn:
+		r, err := s.resolveBare(e.Column)
+		if err != nil {
+			return nil
+		}
+		return named(s.columnOf(r).Type)
+	case exprQualifiedColumn:
+		r, err := s.resolveQualified(e.Qualifier, e.Column)
+		if err != nil {
+			return nil
+		}
+		return named(s.columnOf(r).Type)
+	case exprFieldAccess:
+		def := compositeOfExpr(s, *e.Base)
+		if def == nil {
+			return nil
+		}
+		for i := range def.Fields {
+			if def.Fields[i].Name == e.Field {
+				return named(def.Fields[i].Type)
+			}
+		}
+		return nil
+	case exprCast:
+		if e.Cast.TypeMod != nil || s.catalog == nil {
+			return nil
+		}
+		return s.catalog.readSnap().compositeType(e.Cast.TypeName)
+	default:
+		return nil
+	}
 }
 
 // orderKeyDeriv is the derivation of an ORDER BY / WITHIN GROUP key: a trailing COLLATE is explicit,
@@ -2727,12 +2916,13 @@ func aggResultCollatable(name string) bool {
 
 // noteSubqueryDeriv records a scalar subquery's output-column derivation on the scope it was resolved
 // against (scope.subqueryDerivs), as the subquery expression derives it (collation.md §1 "Scalar
-// subqueries"; subqueryOutputDeriv).
-func noteSubqueryDeriv(s *scope, q *queryExpr, body deriv) {
+// subqueries"; subqueryOutputDeriv). The output column's typmod rides along unchanged
+// (create-table-as.md §2).
+func noteSubqueryDeriv(s *scope, q *queryExpr, body deriv, tm typmod) {
 	if s.subqueryDerivs == nil {
-		s.subqueryDerivs = make(map[*queryExpr]deriv)
+		s.subqueryDerivs = make(map[*queryExpr]subqueryOutput)
 	}
-	s.subqueryDerivs[q] = subqueryOutputDeriv(body)
+	s.subqueryDerivs[q] = subqueryOutput{d: subqueryOutputDeriv(body), tm: tm}
 }
 
 // subqueryOutputDeriv is a subquery output column's derivation as seen from outside it (collation.md

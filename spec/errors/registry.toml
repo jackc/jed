@@ -448,6 +448,8 @@ class = "syntax error or access rule violation"
 # Also CREATE OR REPLACE VIEW whose new output columns are incompatible with the view's existing
 # ones (spec/design/views.md §1.2): fewer columns ("cannot drop columns from view"), or an existing
 # column whose name, type, or collation changes. PostgreSQL's checkViewColumns, same code and order.
+# And CREATE TABLE … AS whose query outputs an anonymous ROW(…) column ("column "r" has pseudo-type
+# record" — spec/design/create-table-as.md §2), PostgreSQL's CheckAttributeType.
 template = "invalid table definition: {detail}"
 
 [[error]]
@@ -545,7 +547,9 @@ class = "syntax error or access rule violation"
 # break the tie (spec/design/collation.md §1/§7): two columns with different collations — e.g. a
 # `text COLLATE "C"` column compared to a `text COLLATE "en-US"` column. PG-matching; reachable since
 # slice 1d (per-column collations). Resolved by adding an explicit COLLATE to one side. C counts as a
-# distinct implicit collation (so C-vs-en-US conflicts), matching PostgreSQL.
+# distinct implicit collation (so C-vs-en-US conflicts), matching PostgreSQL. Also a CREATE TABLE … AS
+# text column whose query output derives no collation ("no collation was derived for column "x" with
+# collatable type text" — spec/design/create-table-as.md §2), PostgreSQL's intorel_startup check.
 template = "could not determine which collation to use for string comparison"
 
 [[error]]
