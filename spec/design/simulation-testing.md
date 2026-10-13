@@ -137,8 +137,11 @@ checks are part of the step. There is no separate `recover` step.
 
 **Header knobs** are `seed`, `page_size`, `cache_bytes` (0 or absent: the engine default), `clock`
 (the simulated clock's start, in microseconds), `sector` (the tear granularity, default 64 bytes),
-and the informational `profile`. Further handle settings (`work_mem`, `max_storage_bytes`) arrive
-with slice S3. The most important is a **small page size**
+and the informational `profile`. Three handle settings are applied at every open: `work_mem` (a trace
+session's; non-zero also gives the database a real scratch spill directory, whose bytes are not
+durable state), `max_query_memory_bytes` (a trace session's; the oracles' own reads are unlimited),
+and `max_storage_bytes` (the database's file form, memory.md §8.7). Under either limit a commit can
+fail for size reasons the generator cannot predict, so it treats every commit as uncertain. The most important is a **small page size**
 (256 or 512). It produces deep trees, multi-page overflow chains, and manifest overflow with very
 little data. At 256-byte pages the inline manifest holds `floor((256 − 64) / 12) = 16` entries, so
 any commit dirtying more than 16 pages exercises the overflow chain. A small database also keeps the
@@ -190,6 +193,7 @@ keeps independent decisions uncorrelated, and its values are part of the cross-c
 | 6 | `process_crash`: was this write issued before the process died? |
 | 7 | `io_error op=sync`: does this pending write land or vanish (`% 2`)? |
 | 8 | a session's entropy-seam seed (`decide(seed, 8, step, 0, 0)` for the session opened at `step`) |
+| 9 | `read_error`: do reads of this offset fail during the step? |
 
 This is what makes crash images **comparable across cores** (§8.4). Within a commit, write order is
 not a cross-core contract and may differ by core, but the set of `(offset, bytes)` pairs does not.
@@ -208,8 +212,12 @@ is sound: a failure under it is a real protocol violation, not a modeling artifa
 | `process_crash issue=‰` | Each write of the step is independently issued or not (§6.2). The live process sees all of its own writes; at its death, at the step's first `sync`, the never-issued ones vanish from the cache. Issued writes stay **pending**, not durable, so a later power loss can still drop them. | The next opener sees the cache. Before its first write, a writable opener must stabilize an adopted unacknowledged generation (validated-cow §3). A later power loss checks that it did. | Image + transcript |
 | `io_error op=write p=‰` | The first write whose `decide` falls under `p` fails and lands nothing. | The commit fails `58030` and the handle is poisoned; recovery yields the prior generation. | Transcript |
 | `io_error op=sync nth=N` | The step's `N`th `sync` fails with Linux "fsyncgate" semantics: each pending write independently became durable or was dropped from the cache, and the error is reported once. | As above, but recovery may yield the in-flight generation if all of it landed. | Transcript |
-| `enospc`, `read_error p=‰` | Slice S3. `set_size` growth fails; `read_at` fails. A read error must surface `58030` or correct rows, and must never make recovery select an older commit (validated-cow §1). | Per-core only: which reads happen depends on buffer-pool policy, which is per-core. | Per-core |
-| `corrupt flips=n` | Slice S3. Opt-in: flip bits in durable, non-pending pages. | `XX001` on access, or inert if the page is dead. **Never wrong rows.** | Per-core only, intrinsic oracle |
+| `read_error p=‰` | Every read of an offset whose lane-9 `decide` falls under `p` fails during the step. The runner's own oracle reads (digests, the live checker) are exempt — an early version applied the fault to them too and reported false violations. | The statement fails `58030`, never `XX001` or wrong rows. | Per-core: which reads happen depends on buffer-pool policy |
+| `enospc` | The step's first growing `set_size` fails. | The commit fails `58030`. | Per-core: when the file grows depends on preallocation policy |
+| `corrupt flips=n` | Not built yet. Opt-in: flip bits in durable, non-pending pages. | `XX001` on access, or inert if the page is dead. **Never wrong rows.** | Per-core only, intrinsic oracle |
+
+A trace containing a per-core fault runs every oracle on every core but is not compared across
+cores (`scripts/sim.rb`), since one core may read or grow where another does not.
 
 A fault that never reaches a `sync` (an unchanged commit, a statement inside a transaction) fires
 at the end of the step. `set_size` is never a fault point: preallocation is a host-policy detail,
@@ -344,7 +352,8 @@ JSON object per line, keys in exactly this order, no whitespace, hashes as 16 lo
 ```
 
 `hash` folds the statement's rendered rows, sorted (row order is not what this harness tests), with
-FNV-1a 64; `fired` is `barrier`, `write`, `sync`, `end`, or `none` (a standalone `crash` step). The
+FNV-1a 64; `fired` is `barrier`, `write`, `sync`, `read`, `enospc`, `end` (the fault reached no
+fault point and fired as the step ended), or `none` (a standalone `crash` step). The
 `live`/`pages`/`free` counts come from the meta page and persisted free list, which are byte-exact
 across cores. `image` is the FNV-1a 64 of the **logical image** — the first `pages × page_size`
 bytes, ignoring preallocated tails — of the disk at a `check`, or of the post-crash disk recovery
@@ -502,5 +511,6 @@ primitive) gets a simulated implementation.
   host-supplied `BlockStore`" become a real host-API capability? hosts.md already treats hosts as
   pluggable. That decision belongs to the API, not this harness.
 - **CI budget.** How many regression traces and how long a sweep slice `mise run ci` can afford.
-- **Sector size defaults.** 512-byte tears are the adversarial default. Whether to also sweep
-  4 KiB, which matches SSD atomic-write units, is a profile choice.
+- **Sector size defaults.** 64-byte tears are the default because they keep tearing possible at
+  256-byte pages. Whether to also sweep 512-byte or 4 KiB units, which match real atomic-write
+  sizes, is a profile choice.

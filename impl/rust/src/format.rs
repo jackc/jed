@@ -2864,7 +2864,7 @@ impl Snapshot {
     }
 }
 
-fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
+pub(crate) fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
     let page = node.page.load(std::sync::atomic::Ordering::Acquire);
     if page != 0 {
         reached.insert(page);
@@ -3991,6 +3991,43 @@ struct Meta {
     free_list_head: u32,
     /// The exact live page count (v34 — meta offset 56, spec/design/memory.md §8.7).
     live_pages: u32,
+}
+
+/// The meta page a demand-paged open selected (deterministic-simulation integrity checker,
+/// spec/design/simulation-testing.md §8.3): its version, catalog root, page high-water, live page
+/// count, and the generation's manifest dependencies.
+#[cfg(feature = "sim")]
+pub(crate) struct SimMeta {
+    pub(crate) txid: u64,
+    pub(crate) root_page: u32,
+    pub(crate) page_count: u32,
+    pub(crate) live_pages: u32,
+    pub(crate) protected: Arc<HashSet<u32>>,
+}
+
+/// The meta [`Engine::open_shared_paging`] selected through `paging`: the newest valid candidate
+/// whose validation the open cached (it caches exactly the generation it adopts). Reads only.
+#[cfg(feature = "sim")]
+pub(crate) fn sim_selected_meta(paging: &SharedPaging) -> Result<SimMeta> {
+    let mut pg = paging.pager();
+    let blocks = [pg.read_block(0)?, pg.read_block(1)?];
+    let mut candidates: Vec<_> = blocks
+        .iter()
+        .filter_map(|b| parse_meta(b).map(|m| (m, b)))
+        .collect();
+    candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
+    for (m, bytes) in candidates {
+        if let Some(protected) = pg.cached_validation(bytes) {
+            return Ok(SimMeta {
+                txid: m.txid,
+                root_page: m.root_page,
+                page_count: m.page_count,
+                live_pages: m.live_pages,
+                protected,
+            });
+        }
+    }
+    Err(corrupt("no meta page was selected by the open"))
 }
 
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole
@@ -5935,7 +5972,11 @@ pub(crate) fn resolve_unfetched_self(u: &Unfetched) -> Result<Value> {
 /// `next_page` hops and reading **headers only** — no payload assembly, no decompression
 /// (spec/design/large-values.md §14). The open-time reachability walk marks live chains with
 /// this, so opening a file never materializes its large values.
-fn chain_pages(first: u32, len: usize, fetch: &dyn Fn(u32) -> Result<Vec<u8>>) -> Result<Vec<u32>> {
+pub(crate) fn chain_pages(
+    first: u32,
+    len: usize,
+    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     let mut gathered = 0usize;
     let mut p = first;

@@ -18,6 +18,16 @@ path = "src/lib.rs"
 name = "conformance"
 path = "src/bin/conformance.rs"
 
+# The deterministic-simulation runner (spec/design/simulation-testing.md §11): test-only, so behind a
+# non-default feature that adds no dependency. Built and run by scripts/sim.rb.
+[[bin]]
+name = "sim"
+path = "src/bin/sim.rs"
+required-features = ["sim"]
+
+[features]
+sim = []
+
 [dependencies]
 # OS entropy for the uuid generators' production path (spec/design/entropy.md §6). Rust `std`
 # has no OS RNG; the engine reads one u64 seed per statement only when a generator runs unseeded

@@ -191,6 +191,10 @@ func simFaultOf(st simStep) (*simFault, error) {
 		case "sync":
 			return &simFault{kind: simIOSync, nth: st.intParam("nth")}, nil
 		}
+	case "read_error":
+		return &simFault{kind: simReadError, p: st.intParam("p")}, nil
+	case "enospc":
+		return &simFault{kind: simENOSPC}, nil
 	}
 	return nil, fmt.Errorf("line %d: unsupported fault %s %v", st.line, st.mode, st.params)
 }
@@ -296,6 +300,12 @@ type simRunner struct {
 	cacheBytes int
 	clock      int64
 
+	// Handle settings from the header (simulation-testing.md §5, slice S3), applied at every open.
+	workMem         int    // a session's work_mem; > 0 also gives the database a spill directory
+	maxQueryMemory  int64  // a trace session's max_query_memory_bytes (the oracles' own reads are unlimited)
+	maxStorageBytes int64  // the database's max_storage_bytes
+	spillDir        string // the real scratch directory spill files go to; their bytes are not durable state
+
 	disk     *simDisk
 	db       *Database
 	sessions map[string]*simSession
@@ -336,16 +346,27 @@ func newSimRunner(tr simTrace) *simRunner {
 	if err != nil {
 		panic("an empty image always serializes: " + err.Error())
 	}
+	workMem, _ := strconv.Atoi(tr.header["work_mem"])
+	maxQueryMemory, _ := strconv.ParseInt(tr.header["max_query_memory_bytes"], 10, 64)
+	maxStorageBytes, _ := strconv.ParseInt(tr.header["max_storage_bytes"], 10, 64)
+	spillDir := ""
+	if workMem > 0 {
+		spillDir = os.TempDir()
+	}
 	return &simRunner{
-		tr:            tr,
-		seed:          seed,
-		pageSize:      uint32(ps),
-		cacheBytes:    cache,
-		clock:         clock,
-		disk:          newSimDisk(seed, sector, image),
-		sessions:      map[string]*simSession{},
-		history:       map[uint64]map[string]bool{},
-		violationStep: -1,
+		tr:              tr,
+		seed:            seed,
+		pageSize:        uint32(ps),
+		cacheBytes:      cache,
+		clock:           clock,
+		workMem:         workMem,
+		maxQueryMemory:  maxQueryMemory,
+		maxStorageBytes: maxStorageBytes,
+		spillDir:        spillDir,
+		disk:            newSimDisk(seed, sector, image),
+		sessions:        map[string]*simSession{},
+		history:         map[uint64]map[string]bool{},
+		violationStep:   -1,
 	}
 }
 
@@ -377,8 +398,13 @@ func (r *simRunner) open() error {
 		return err
 	}
 	e.path = simDiskPath
-	e.spillDir = ""
+	e.spillDir = r.spillDir
 	r.db = databaseOver(sharedCoreFromEngine(e))
+	if r.maxStorageBytes > 0 {
+		if err := r.db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -508,6 +534,12 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 	}
 	s.SetRandomSource(SeededRandomSource(simDecide(r.seed, simLaneSession, uint64(i), 0, 0)))
 	s.SetClockSource(func() int64 { return r.clock })
+	if r.workMem > 0 {
+		s.SetWorkMem(r.workMem)
+	}
+	if r.maxQueryMemory > 0 {
+		s.SetMaxQueryMemoryBytes(r.maxQueryMemory)
+	}
 	r.sessions[st.sid] = &simSession{s: s, write: st.mode == "write", pin: s.Version()}
 	r.emit(`{"i":%d,"op":"open","sid":%q,"version":%d}`, i, st.sid, s.Version())
 }
@@ -579,6 +611,14 @@ var simDigestRelations = []string{"jed_tables", "jed_columns", "jed_indexes", "j
 // digest is the logical digest of what s sees: the catalog relations plus every table's rows, all
 // rendered and sorted, folded with FNV-1a. ok is false if any query failed (an aborted block).
 func (r *simRunner) digest(s *Session) (string, bool) {
+	// An armed read fault targets the trace's statements, not the oracle checking them.
+	r.disk.oracle = true
+	defer func() { r.disk.oracle = false }()
+	// The oracle's own reads must not trip a trace session's memory limit.
+	if limit := s.MaxQueryMemoryBytes(); limit > 0 {
+		s.SetMaxQueryMemoryBytes(0)
+		defer s.SetMaxQueryMemoryBytes(limit)
+	}
 	var b strings.Builder
 	var tables []string
 	r.lastDigestText = ""
@@ -628,6 +668,13 @@ func (r *simRunner) digest(s *Session) (string, bool) {
 	}
 	r.lastDigestText = b.String()
 	return fmt.Sprintf("%016x", simFNV(b.String())), true
+}
+
+// checkLive runs the live integrity checker with read faults suspended, like every oracle read.
+func (r *simRunner) checkLive() error {
+	r.disk.oracle = true
+	defer func() { r.disk.oracle = false }()
+	return simCheckLive(r.db)
 }
 
 func (r *simRunner) committedDigest() (string, bool) {
@@ -687,7 +734,7 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			r.fail(i, "version %d does not contain what its transaction saw before commit", now)
 			return
 		}
-		if err := simCheckLive(r.db); err != nil {
+		if err := r.checkLive(); err != nil {
 			r.fail(i, "after commit: %v", err)
 			return
 		}
@@ -731,7 +778,7 @@ func (r *simRunner) stepCheck(i int) {
 		r.fail(i, "a read session does not see the last committed version's contents")
 		return
 	}
-	if err := simCheckLive(r.db); err != nil {
+	if err := r.checkLive(); err != nil {
 		r.fail(i, "live integrity: %v", err)
 		return
 	}

@@ -83,6 +83,12 @@ module Sim
     results
   end
 
+  # A trace with a per-core fault (simulation-testing.md §6.3) is checked by every core's oracles but
+  # not compared across cores: whether a read or a file growth happens at all is host policy.
+  def per_core?(path)
+    File.foreach(path).any? { |line| line.start_with?("fault read_error", "fault enospc") }
+  end
+
   def transcript(out, name, core)
     path = File.join(out, "#{name}.#{core}.jsonl")
     File.exist?(path) ? File.read(path) : nil
@@ -105,6 +111,7 @@ module Sim
       end
       transcripts = cores.to_h { |core| [core, transcript(out, name, core)] }.compact
       next if transcripts.values.uniq.size <= 1
+      next if per_core?(path)
 
       a, b = transcripts.keys.first(2).map { |c| [c, transcripts[c].lines] }
       diff = a[1].each_with_index.find { |line, i| line != b[1][i] }

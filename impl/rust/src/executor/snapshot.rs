@@ -1280,6 +1280,34 @@ impl Snapshot {
         std::sync::Arc::make_mut(&mut self.index_stores).insert(name_key, store);
     }
 
+    /// A table's data store by exact name, or `None` (the deterministic-simulation checkers).
+    #[cfg(feature = "sim")]
+    pub(crate) fn sim_store(&self, name: &str) -> Option<&TableStore> {
+        self.stores.get(name)
+    }
+
+    /// A secondary index's store by exact name, or `None` (the deterministic-simulation checkers).
+    #[cfg(feature = "sim")]
+    pub(crate) fn sim_index_store(&self, name: &str) -> Option<&TableStore> {
+        self.index_stores.get(name)
+    }
+
+    /// Every table data store's name, sorted (the deterministic-simulation live checker).
+    #[cfg(feature = "sim")]
+    pub(crate) fn sim_store_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.stores.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Every secondary index store's name, sorted (the deterministic-simulation live checker).
+    #[cfg(feature = "sim")]
+    pub(crate) fn sim_index_store_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.index_stores.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Iterate every table data store — the store-page reachability walk (format.rs `reachable_pages`,
     /// the within-session compaction basis) reads each store's tree root + column types.
     pub(crate) fn stores_iter(&self) -> impl Iterator<Item = &TableStore> {

@@ -1990,7 +1990,7 @@ impl Database {
     /// constructor for both hosts. The committed snapshot's stores already carry the shared
     /// `Arc<SharedPaging>`, so every pinned/cloned snapshot faults clean pages through the one pool
     /// (spec/design/pager.md).
-    fn from_engine(engine: Engine) -> Database {
+    pub(crate) fn from_engine(engine: Engine) -> Database {
         Self::from_engine_coordinated(
             engine,
             None,
@@ -3551,6 +3551,37 @@ impl Drop for Session {
         // releases the gate; a still-registered read pin deregisters (advancing the watermark). After
         // an explicit commit/rollback/close these are already cleared, so this is then a no-op.
         self.finish_block();
+    }
+}
+
+/// The deterministic-simulation runner's view of the live process (spec/design/simulation-testing.md
+/// §8.3, the live checker): the published committed snapshot, the page high-water, the in-memory
+/// free list the next commit allocates from, and the shared paging context. Read-only.
+#[cfg(feature = "sim")]
+pub(crate) struct SimLiveState {
+    pub(crate) committed: Arc<Snapshot>,
+    pub(crate) page_count: u32,
+    pub(crate) free_pages: Vec<u32>,
+    pub(crate) paging: Arc<crate::paging::SharedPaging>,
+}
+
+#[cfg(feature = "sim")]
+impl Database {
+    pub(crate) fn sim_live_state(&self) -> SimLiveState {
+        let committed = self
+            .0
+            .roots
+            .read()
+            .expect("roots lock not poisoned")
+            .committed
+            .clone();
+        let st = self.0.storage.lock().expect("storage lock not poisoned");
+        SimLiveState {
+            committed,
+            page_count: st.page_count,
+            free_pages: st.free_pages.clone(),
+            paging: st.paging.clone(),
+        }
     }
 }
 

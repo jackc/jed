@@ -77,6 +77,12 @@ mod value;
 #[cfg(test)]
 mod integration_tests;
 
+// The deterministic-simulation runner (spec/design/simulation-testing.md): test-only, behind the
+// non-default `sim` feature, run by the `sim` binary (src/bin/sim.rs).
+#[cfg(feature = "sim")]
+#[doc(hidden)]
+pub mod sim;
+
 // --- public façade: the host-embedding API (CLAUDE.md §2). ---
 // The primary embedding surface is Database/Session (the converged §2.4 handle). `Engine` is the
 // lower-level single-threaded handle the in-repo conformance bin and the Ruby/WASM C-ABI wraps build

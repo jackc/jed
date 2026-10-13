@@ -30,6 +30,7 @@ const (
 	simLaneIssue   = 6 // process_crash: was this write issued before the process died?
 	simLaneLand    = 7 // io_error op=sync: does this pending write land or vanish (fsyncgate)?
 	simLaneSession = 8 // a session's entropy-seam seed
+	simLaneRead    = 9 // read_error: do reads of this offset fail during the step?
 )
 
 const simGamma = 0x9E3779B97F4A7C15
@@ -57,6 +58,8 @@ const (
 	simProcessCrash
 	simIOWrite
 	simIOSync
+	simReadError // per-core: which reads happen depends on buffer-pool policy
+	simENOSPC    // per-core: when the file grows depends on preallocation policy
 )
 
 // simFault is one armed fault (simulation-testing.md §6.3). Permille fields are 0..1000.
@@ -65,7 +68,7 @@ type simFault struct {
 	survive int // power_loss
 	tear    int // power_loss
 	issue   int // process_crash
-	p       int // io_error op=write
+	p       int // io_error op=write, read_error
 	nth     int // io_error op=sync
 }
 
@@ -86,6 +89,7 @@ type simDisk struct {
 	syncs     int
 	writes    int
 	barrierOK bool // a barrier completed this step
+	oracle    bool // the runner's own oracle reads are in progress: read faults do not apply
 
 	ops uint64 // FNV-1a fold of every mutating call, for the self-determinism check (§8.5)
 
@@ -138,6 +142,11 @@ func (d *simDisk) fold(kind byte, off int64, p []byte) {
 }
 
 func (d *simDisk) readAt(off int64, length int) ([]byte, error) {
+	if f := d.fault; f != nil && f.kind == simReadError && !d.dead && !d.oracle &&
+		simDecide(d.seed, simLaneRead, d.step, uint64(off), 0)%1000 < uint64(f.p) {
+		d.fired = "read"
+		return nil, simInjected("read error")
+	}
 	if off < 0 || off+int64(length) > int64(len(d.cache)) {
 		return nil, newError(IoError, "I/O error: short read past the end of the simulated disk")
 	}
@@ -264,6 +273,10 @@ func (d *simDisk) setSize(n int64) error {
 		return simInjected("set_size after process death")
 	}
 	cur := int64(len(d.cache))
+	if f := d.fault; f != nil && f.kind == simENOSPC && n > cur && d.fired == "" {
+		d.fired = "enospc"
+		return simInjected("no space left on device")
+	}
 	switch {
 	case n > cur:
 		d.cache = append(d.cache, make([]byte, n-cur)...)

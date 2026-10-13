@@ -32,6 +32,9 @@ module SimGen
   DEFAULTS = {
     "page_sizes" => [256, 512, 1024],
     "cache_bytes" => [0, 2048, 8192],
+    "work_mem" => [0],
+    "max_query_memory_bytes" => [0],
+    "max_storage_bytes" => [0],
     "steps" => 300,
     "max_tables" => 3,
     "max_rows" => 300,
@@ -50,7 +53,7 @@ module SimGen
     },
     "faults" => {
       "commit_fault" => 150, "chain" => 150, "power_loss" => 5, "process_crash" => 3,
-      "io_error_write" => 1, "io_error_sync" => 1,
+      "io_error_write" => 1, "io_error_sync" => 1, "read_error" => 0, "enospc" => 0,
       "survive" => [100, 900], "tear" => [0, 400], "issue" => [200, 900], "io_p" => [50, 500]
     }
   }.freeze
@@ -146,6 +149,15 @@ module SimGen
       header = ["# format: simulation", "# profile: #{@p['name']}", "# seed: #{@seed}",
                 "# page_size: #{page_size}"]
       header << "# cache_bytes: #{cache}" if cache.positive?
+      # Handle settings (slice S3). A single-valued list draws nothing, so profiles that leave them at
+      # the default generate exactly the traces they did before the settings existed.
+      %w[work_mem max_query_memory_bytes max_storage_bytes].each do |knob|
+        value = knob_value(@p[knob])
+        header << "# #{knob}: #{value}" if value.positive?
+        # Under a storage or memory limit a commit can fail for reasons the model cannot predict
+        # (54P06, or a 54P05 that aborted the block), so every commit is as uncertain as a faulted one.
+        @limited ||= value.positive? && knob != "work_mem"
+      end
       header << "# clock: 1700000000000000"
       bootstrap
       step_once while @lines.length < @steps
@@ -156,6 +168,8 @@ module SimGen
     private
 
     def emit(line) = @lines << line
+
+    def knob_value(choices) = choices.length == 1 ? choices.first : @rng.pick(choices)
 
     def fresh(prefix)
       @next[prefix] += 1
@@ -233,6 +247,10 @@ module SimGen
       if faulted
         merge_uncertain
         kill_sessions
+      elsif @limited
+        merge_uncertain
+        @writer = nil
+        @working = nil
       else
         @committed = @working unless @aborted
         @writer = nil
@@ -284,11 +302,13 @@ module SimGen
     end
 
     def fault_line
-      kind = @rng.weighted(@p["faults"].slice("power_loss", "process_crash", "io_error_write", "io_error_sync"))
-      case kind
+      kinds = %w[power_loss process_crash io_error_write io_error_sync read_error enospc]
+      case @rng.weighted(@p["faults"].slice(*kinds))
       when "power_loss" then "fault power_loss survive=#{draw('survive')} tear=#{draw('tear')}"
       when "process_crash" then "fault process_crash issue=#{draw('issue')}"
       when "io_error_write" then "fault io_error op=write p=#{draw('io_p')}"
+      when "read_error" then "fault read_error p=#{draw('io_p')}"
+      when "enospc" then "fault enospc"
       else "fault io_error op=sync nth=#{@rng.range(1, 2)}"
       end
     end
