@@ -2185,7 +2185,9 @@ aggregate call is **`42803`** (*aggregate functions are not allowed in RETURNING
 reports its standing generic message under the same code). Subqueries are **allowed**,
 correlated ones included — an outer reference reads the row being returned (the new row
 under UPDATE, the old row under DELETE, the candidate row under INSERT). `$N` binds as
-anywhere else (api.md §5); a parameter typed by nothing is `42P18`.
+anywhere else (api.md §5); a parameter typed by nothing is `42P18`. An `INSERT INTO t AS a`
+target alias ([upsert.md](upsert.md) §5) replaces the target's label: items qualify it as `a`,
+and `t.col` is `42P01` with the table-alias hint ([error-fields.md](error-fields.md) §11.2).
 
 **The pre-statement snapshot.** A subquery in the list observes the database **as of the
 start of the statement** — `INSERT INTO t ... RETURNING (SELECT count(*) FROM t)` counts
@@ -2225,7 +2227,8 @@ probed: `RETURNING (SELECT old.v + s.a FROM s ...)`). Resolution rules:
 - **The table name shadows an unaliased qualifier** (probed): if the target table is itself
   named `old` (or `new`), that qualifier keeps its ordinary table-qualified meaning and the
   same-named row-version pseudo-relation is suppressed. The aliasing form below recovers the
-  hidden version.
+  hidden version. The shadowing label is the target's *label*: an `INSERT INTO old AS a` frees
+  `old` for the row version, and `INSERT INTO t AS old` shadows it.
 - An unknown column under a qualifier is `42703`; **bare** `old`/`new` are ordinary column
   references (a column may be named either — they resolve normally, never to a row
   version). `old.*`/`new.*` are **qualified stars** (§15) — they expand that row version's
@@ -2987,6 +2990,10 @@ constraint takes a **conflict action** instead of trapping `23505`.
 ```
 ON CONFLICT [ ( col [, …] ) | ON CONSTRAINT name ] { DO NOTHING | DO UPDATE SET … [WHERE …] }
 ```
+
+The target may carry an alias (`INSERT INTO t AS a …`, `AS` required): it replaces the table's
+name as the qualifier for the existing row in `SET`/`WHERE` (and in `RETURNING`), so `t.col` is
+`42P01`; a target labeled `excluded` makes `excluded.col` `42P09` ([upsert.md](upsert.md) §5).
 
 - **`DO NOTHING`** skips the offending row; **`DO UPDATE SET … [WHERE …]`** updates the
   existing conflicting row. In `DO UPDATE`, the **`excluded`** pseudo-relation names the row

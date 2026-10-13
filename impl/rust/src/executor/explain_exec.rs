@@ -555,12 +555,14 @@ impl Engine {
         }
         if let Some(items) = &del.returning {
             let (nodes, _, _) = self.resolve_returning(
+                del.db.as_deref(),
                 &del.table,
                 items,
                 true,
                 bindings,
                 &mut ParamTypes::default(),
                 vw,
+                None,
             )?;
             let mut ret_mask = vec![false; 2 * mask.len()];
             for node in &nodes {
@@ -632,8 +634,16 @@ impl Engine {
             collect_touched(&source, 0, &mut mask);
         }
         if let Some(items) = &upd.returning {
-            let (nodes, _, _) =
-                self.resolve_returning(&upd.table, items, false, bindings, &mut ptypes, vw)?;
+            let (nodes, _, _) = self.resolve_returning(
+                upd.db.as_deref(),
+                &upd.table,
+                items,
+                false,
+                bindings,
+                &mut ptypes,
+                vw,
+                None,
+            )?;
             let n = mask.len();
             let mut ret_mask = vec![false; 2 * n];
             for node in &nodes {

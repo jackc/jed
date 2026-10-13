@@ -239,26 +239,30 @@ impl Engine {
         rename: Option<&[String]>,
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, DmCte)> {
-        let (table_name, returning, base_is_old, stmt): (
+        let (table_name, alias, returning, base_is_old, stmt): (
             &str,
+            Option<&str>,
             &Option<ReturningClause>,
             bool,
             DmStmt,
         ) = match body {
             CteBody::Insert(ins) => (
                 &ins.table,
+                ins.alias.as_deref(),
                 &ins.returning,
                 false,
                 DmStmt::Insert(ins.clone()),
             ),
             CteBody::Update(upd) => (
                 &upd.table,
+                None,
                 &upd.returning,
                 false,
                 DmStmt::Update(upd.clone()),
             ),
             CteBody::Delete(del) => (
                 &del.table,
+                None,
                 &del.returning,
                 true,
                 DmStmt::Delete(del.clone()),
@@ -293,7 +297,8 @@ impl Engine {
                 ))
             }
             Some(returning) => {
-                let mut scope = Scope::returning(self, tdef, base_is_old, returning, vw.as_ref())?;
+                let mut scope =
+                    Scope::returning(self, tdef, base_is_old, returning, vw.as_ref(), alias)?;
                 scope.ctes = bindings;
                 let (_, names, types, derivs) =
                     resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;

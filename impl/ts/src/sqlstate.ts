@@ -58,6 +58,7 @@ export type SqlState =
   | "undefined_table" // 42P01 — table does not exist: {name}
   | "undefined_column" // 42703 — column does not exist: {name}
   | "ambiguous_column" // 42702 — column reference {name} is ambiguous
+  | "ambiguous_alias" // 42P09 — table reference {name} is ambiguous
   | "undefined_object" // 42704 — {kind} does not exist: {name}
   | "invalid_column_reference" // 42P10 — for SELECT DISTINCT, ORDER BY expressions must appear in select list
   | "datatype_mismatch" // 42804 — datatype mismatch: {detail}
@@ -152,6 +153,7 @@ const CODES: Record<SqlState, string> = {
   undefined_table: "42P01",
   undefined_column: "42703",
   ambiguous_column: "42702",
+  ambiguous_alias: "42P09",
   undefined_object: "42704",
   invalid_column_reference: "42P10",
   datatype_mismatch: "42804",
@@ -262,6 +264,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "42P01", name: "undefined_table", class: "syntax error or access rule violation" },
   { code: "42703", name: "undefined_column", class: "syntax error or access rule violation" },
   { code: "42702", name: "ambiguous_column", class: "syntax error or access rule violation" },
+  { code: "42P09", name: "ambiguous_alias", class: "syntax error or access rule violation" },
   { code: "42704", name: "undefined_object", class: "syntax error or access rule violation" },
   { code: "42P10", name: "invalid_column_reference", class: "syntax error or access rule violation" },
   { code: "42804", name: "datatype_mismatch", class: "syntax error or access rule violation" },

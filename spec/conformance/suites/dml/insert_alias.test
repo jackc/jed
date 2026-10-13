@@ -1,0 +1,272 @@
+# INSERT INTO t AS alias — the target alias (spec/design/upsert.md §5, grammar.md §32/§46). The
+# alias REPLACES the target's name as its reference name: an ON CONFLICT DO UPDATE's SET/WHERE and
+# RETURNING read the target through the alias, and the bare table (or view) name is no longer a
+# visible qualifier (42P01). `excluded` stays available in DO UPDATE; a target labeled `excluded`
+# makes `excluded.col` there 42P09. Probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: dml.insert_alias, ddl.create_table, ddl.primary_key, ddl.column_default, ddl.view, dml.view_write, dml.insert, dml.insert_column_list, dml.insert_select, dml.insert_default_values, dml.insert_on_conflict, dml.returning, dml.returning_old_new, query.select, query.select_star, query.qualified_star, query.table_alias, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32
+
+statement ok
+CREATE TABLE ia (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO ia VALUES (1, 10)
+
+# --- RETURNING without ON CONFLICT -----------------------------------------------------------
+
+query II rowsort
+INSERT INTO ia AS a VALUES (2, 20) RETURNING a.id, a.v
+----
+2
+20
+
+# the alias precedes the column list
+query I rowsort
+INSERT INTO ia AS b (id, v) VALUES (3, 30) RETURNING b.v
+----
+30
+
+# a qualified star through the alias; bare columns still resolve
+query III rowsort
+INSERT INTO ia AS a VALUES (4, 40) RETURNING a.*, v
+----
+4
+40
+40
+
+# INSERT ... SELECT: the source's own FROM may name the table; the alias labels the target
+query I rowsort
+INSERT INTO ia AS a SELECT id + 100, v FROM ia WHERE id = 1 RETURNING a.id
+----
+101
+
+# the hidden table name is 42P01 in RETURNING, qualified star included
+statement error 42P01
+INSERT INTO ia AS a VALUES (5, 50) RETURNING ia.id
+
+statement error 42P01
+INSERT INTO ia AS a VALUES (5, 50) RETURNING ia.*
+
+# ... and inside a correlated item subquery
+statement error 42P01
+INSERT INTO ia AS a VALUES (5, 50) RETURNING (SELECT ia.v)
+
+# an unknown column under the alias is 42703
+statement error 42703
+INSERT INTO ia AS a VALUES (5, 50) RETURNING a.nope
+
+# a subquery's own FROM still names the table (a new relation), correlated to the alias
+query I rowsort
+INSERT INTO ia AS a VALUES (5, 50) RETURNING (SELECT count(*) FROM ia x WHERE x.id < a.id)
+----
+4
+
+# the failed statements inserted nothing
+query I nosort
+SELECT count(*) FROM ia
+----
+6
+
+# AS is required: an implicit alias is a syntax error
+statement error 42601
+INSERT INTO ia a VALUES (6, 60)
+
+# DEFAULT VALUES takes the alias too
+statement ok
+CREATE TABLE ib (id i32 PRIMARY KEY DEFAULT 7, v i32 DEFAULT 70)
+
+query II rowsort
+INSERT INTO ib AS z DEFAULT VALUES RETURNING z.id, z.v
+----
+7
+70
+
+# --- ON CONFLICT DO UPDATE --------------------------------------------------------------------
+
+# SET and WHERE read the existing row through the alias; excluded is the proposed row
+query II rowsort
+INSERT INTO ia AS a VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = a.v + excluded.v WHERE a.v < 100 RETURNING a.id, a.v
+----
+1
+15
+
+# a WHERE through the alias that is false skips the update
+query I rowsort
+INSERT INTO ia AS a VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = 0 WHERE a.v > 1000 RETURNING a.v
+----
+
+# ON CONSTRAINT with an alias
+query I rowsort
+INSERT INTO ia AS a VALUES (1, 1) ON CONFLICT ON CONSTRAINT ia_pkey DO UPDATE SET v = a.v + excluded.v RETURNING a.v
+----
+16
+
+# the hidden table name is 42P01 in SET, in WHERE, and in a SET subquery
+statement error 42P01
+INSERT INTO ia AS a VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = ia.v + 1
+
+statement error 42P01
+INSERT INTO ia AS a VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = 1 WHERE ia.v > 0
+
+statement error 42P01
+INSERT INTO ia AS a VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = (SELECT ia.v)
+
+# an unknown column under the alias is 42703
+statement error 42703
+INSERT INTO ia AS a VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = a.nope
+
+# the failed statements left the row alone
+query I nosort
+SELECT v FROM ia WHERE id = 1
+----
+16
+
+# DO NOTHING with an alias: RETURNING projects only the inserted row
+query II rowsort
+INSERT INTO ia AS a VALUES (1, 99), (6, 60) ON CONFLICT DO NOTHING RETURNING a.id, a.v
+----
+6
+60
+
+# --- the old/new row-version qualifiers -------------------------------------------------------
+
+# old/new keep their meaning beside the alias, on both the inserted and the updated row
+query III rowsort
+INSERT INTO ia AS a VALUES (1, 1), (7, 70) ON CONFLICT (id) DO UPDATE SET v = a.v + 1 RETURNING old.v, new.v, a.v
+----
+16
+17
+17
+NULL
+70
+70
+
+# an alias named old occupies that label, so old reads the target (the new row)
+query II rowsort
+INSERT INTO ia AS old VALUES (8, 80) RETURNING old.v, new.v
+----
+80
+80
+
+query II rowsort
+INSERT INTO ia AS new VALUES (9, 90) RETURNING old.v, new.v
+----
+NULL
+90
+
+# a WITH (OLD AS …) alias may not collide with the target alias
+statement error 42712
+INSERT INTO ia AS a VALUES (10, 100) RETURNING WITH (OLD AS a) a.v
+
+# a table named old is no longer shadowing old once aliased
+statement ok
+CREATE TABLE old (id i32 PRIMARY KEY, v i32)
+
+query II rowsort
+INSERT INTO old AS a VALUES (1, 5) RETURNING old.v, a.v
+----
+NULL
+5
+
+# --- an alias named excluded ------------------------------------------------------------------
+
+# without ON CONFLICT (or with DO NOTHING) it is an ordinary alias
+query I rowsort
+INSERT INTO ia AS excluded VALUES (11, 110) RETURNING excluded.v
+----
+110
+
+query I rowsort
+INSERT INTO ia AS excluded VALUES (1, 5) ON CONFLICT DO NOTHING RETURNING excluded.v
+----
+
+# in DO UPDATE the target and the pseudo-relation share the label: excluded.col is 42P09
+statement error 42P09
+INSERT INTO ia AS excluded VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = excluded.v
+
+statement error 42P09
+INSERT INTO ia AS excluded VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = 1 WHERE excluded.v > 0
+
+# RETURNING never sees the pseudo-relation, so there excluded is the target
+query I rowsort
+INSERT INTO ia AS excluded VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = 3 RETURNING excluded.v
+----
+3
+
+# a table literally named excluded is the same case; aliasing it frees the pseudo-relation
+statement ok
+CREATE TABLE excluded (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO excluded VALUES (1, 1)
+
+statement error 42P09
+INSERT INTO excluded VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = excluded.v
+
+query I rowsort
+INSERT INTO excluded AS e VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET v = e.v + excluded.v RETURNING e.v
+----
+8
+
+# --- writable CTEs and views ------------------------------------------------------------------
+
+query II rowsort
+WITH x AS (INSERT INTO ia AS q VALUES (12, 120) RETURNING q.*) SELECT id, v FROM x
+----
+12
+120
+
+query II rowsort
+WITH x AS (INSERT INTO ia AS q VALUES (1, 4) ON CONFLICT (id) DO UPDATE SET v = q.v + excluded.v RETURNING q.id, q.v) SELECT id, v FROM x
+----
+1
+7
+
+statement error 42P01
+WITH x AS (INSERT INTO ia AS q VALUES (13, 130) RETURNING ia.id) SELECT * FROM x
+
+statement ok
+CREATE VIEW iav AS SELECT id, v FROM ia
+
+query II rowsort
+INSERT INTO iav AS w VALUES (14, 140) RETURNING w.id, w.v
+----
+14
+140
+
+# through a view, both the view's and the base table's names are hidden
+statement error 42P01
+INSERT INTO iav AS w VALUES (15, 150) RETURNING iav.id
+
+statement error 42P01
+INSERT INTO iav AS w VALUES (15, 150) RETURNING ia.id
+
+query II nosort
+SELECT id, v FROM ia ORDER BY id
+----
+1
+7
+2
+20
+3
+30
+4
+40
+5
+50
+6
+60
+7
+70
+8
+80
+9
+90
+11
+110
+12
+120
+14
+140
+101
+10

@@ -108,6 +108,8 @@ pub enum SqlState {
     UndefinedColumn,
     /// 42702 — column reference {name} is ambiguous
     AmbiguousColumn,
+    /// 42P09 — table reference {name} is ambiguous
+    AmbiguousAlias,
     /// 42704 — {kind} does not exist: {name}
     UndefinedObject,
     /// 42P10 — for SELECT DISTINCT, ORDER BY expressions must appear in select list
@@ -250,6 +252,7 @@ impl SqlState {
             SqlState::UndefinedTable => "42P01",
             SqlState::UndefinedColumn => "42703",
             SqlState::AmbiguousColumn => "42702",
+            SqlState::AmbiguousAlias => "42P09",
             SqlState::UndefinedObject => "42704",
             SqlState::InvalidColumnReference => "42P10",
             SqlState::DatatypeMismatch => "42804",
@@ -350,6 +353,7 @@ impl SqlState {
             "42P01" => Some(SqlState::UndefinedTable),
             "42703" => Some(SqlState::UndefinedColumn),
             "42702" => Some(SqlState::AmbiguousColumn),
+            "42P09" => Some(SqlState::AmbiguousAlias),
             "42704" => Some(SqlState::UndefinedObject),
             "42P10" => Some(SqlState::InvalidColumnReference),
             "42804" => Some(SqlState::DatatypeMismatch),
@@ -459,6 +463,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "42P01", name: "undefined_table", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42703", name: "undefined_column", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42702", name: "ambiguous_column", class: "syntax error or access rule violation" },
+    ErrorDesc { code: "42P09", name: "ambiguous_alias", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42704", name: "undefined_object", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P10", name: "invalid_column_reference", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42804", name: "datatype_mismatch", class: "syntax error or access rule violation" },

@@ -9,7 +9,7 @@
 # no embedded multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # attach: mydb
 # attach: refs
-# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.create_index_if_not_exists, ddl.drop_table, ddl.temp_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text, session.allow_temp_ddl
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.create_index_if_not_exists, ddl.drop_table, ddl.temp_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.insert_alias, dml.returning, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text, session.allow_temp_ddl
 
 # --- CREATE TABLE into an attachment + populate it --------------------------------------------
 
@@ -136,6 +136,18 @@ apple
 pear
 3
 plum
+
+# --- an aliased INSERT target in an attachment (spec/design/upsert.md §5) ---------------------
+
+query IT rowsort
+INSERT INTO mydb.copy AS c VALUES (9, 'fig') RETURNING c.id, c.name
+----
+9
+fig
+
+# the alias hides the table name
+statement error 42P01
+INSERT INTO mydb.copy AS c VALUES (10, 'kiwi') RETURNING copy.id
 
 # --- UPDATE / DELETE on an attachment ---------------------------------------------------------
 

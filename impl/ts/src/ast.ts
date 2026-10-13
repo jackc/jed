@@ -832,6 +832,11 @@ export type Insert = {
   // The optional database qualifier on the target (`INSERT INTO reports.t …`), like TableRef.db
   // (spec/design/attached-databases.md §3). undefined = implicit scope.
   db?: string;
+  // The optional `AS alias` on the target (`INSERT INTO t AS a …` — spec/design/upsert.md §5,
+  // grammar.md §32). When set it REPLACES the table's name as the target's reference name in the
+  // ON CONFLICT DO UPDATE scope and in RETURNING; the bare table name is then no longer a visible
+  // qualifier (42P01). undefined = the target is referred to by its own name.
+  alias?: string;
   columns: string[] | null;
   // Each `columns` name's source character position (SrcLoc), index-aligned; undefined when there is
   // no list or no positions were recorded.

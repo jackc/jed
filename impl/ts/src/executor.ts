@@ -10044,7 +10044,7 @@ export class Engine {
     }
     const returning =
       ins.returning !== null
-        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes)
+        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, null, ins.alias)
         : null;
     const ptys = ptypes.finalize();
     return {
@@ -10290,10 +10290,10 @@ export class Engine {
       const plan = this.planQuery(ins.source.select, null, ctx.bindings, ptypes);
       const ret =
         ins.returning !== null
-          ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw)
+          ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw, ins.alias)
           : null;
       const cplan =
-        ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
+        ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, ptypes) : null;
       const bound = bindParams(params, ptypes.finalize(), this.inputZone());
       const meter = this.session.newMeter();
       const foldCost = { value: 0n };
@@ -10430,10 +10430,10 @@ export class Engine {
     // before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
     const ret =
       ins.returning !== null
-        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw)
+        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw, ins.alias)
         : null;
     const cplan =
-      ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
+      ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ins.alias, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
 
     // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
@@ -10994,7 +10994,12 @@ export class Engine {
   // ConflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
   // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
   // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
-  private resolveOnConflict(table: Table, oc: OnConflict, ptypes: ParamTypes): ConflictPlan {
+  private resolveOnConflict(
+    table: Table,
+    oc: OnConflict,
+    alias: string | undefined,
+    ptypes: ParamTypes,
+  ): ConflictPlan {
     const arb = resolveArbiter(table, oc.target);
     if (!oc.doUpdate) {
       return { arb, doUpdate: false, assignments: [], filter: null };
@@ -11006,7 +11011,7 @@ export class Engine {
         "ON CONFLICT DO UPDATE requires inference specification or constraint name",
       );
     }
-    const scope = Scope.onConflictExcluded(this, table);
+    const scope = Scope.onConflictExcluded(this, table, alias);
     const pkMembers = pkIndices(table);
     const plans: AssignPlan[] = [];
     for (const a of oc.assignments) {
@@ -11549,7 +11554,8 @@ export class Engine {
   // projection nodes, names, and the canonical type names (Outcome columnTypes — conformance.md §7).
   // The scope is the RETURNING scope (Scope.returning — the table at offset 0 plus the
   // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
-  // baseIsOld true for DELETE).
+  // baseIsOld true for DELETE). alias is an INSERT's AS alias (upsert.md §5), which replaces the
+  // target's label; undefined for UPDATE/DELETE.
   private resolveReturning(
     table: Table,
     returning: ReturningClause,
@@ -11557,8 +11563,9 @@ export class Engine {
     ctes: CteBinding[],
     ptypes: ParamTypes,
     vw: ViewWrite | null = null,
+    alias?: string,
   ): { nodes: RExpr[]; names: string[]; types: string[] } {
-    const scope = Scope.returning(this, table, baseIsOld, returning, vw);
+    const scope = Scope.returning(this, table, baseIsOld, returning, vw, alias);
     scope.ctes = ctes;
     const { nodes, names, types } = resolveProjections(
       scope,
@@ -12887,7 +12894,8 @@ export class Engine {
       const table = cteSyntheticTableCols(lname, [], [], null, rename);
       return { table, dm: { stmt, noReturning: true } };
     }
-    const scope = Scope.returning(this, tdef, baseIsOld, returning, vw);
+    const alias = body.kind === "insert" ? body.alias : undefined;
+    const scope = Scope.returning(this, tdef, baseIsOld, returning, vw, alias);
     scope.ctes = bindings;
     const { names, types, derivs } = resolveProjections(
       scope,

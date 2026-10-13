@@ -2577,6 +2577,17 @@ func (p *parser) parseInsert() (*insert, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Optional target alias `AS alias` (spec/design/upsert.md §5). PostgreSQL requires the AS here
+	// (no implicit alias), which also keeps a column list / source keyword unambiguous.
+	var alias *string
+	if p.peekKeyword() == "as" {
+		p.advance()
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		alias = &name
+	}
 
 	// Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
 	// first expectIdentifier errors 42601 on `)`).
@@ -2645,7 +2656,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &insert{Table: table, DB: dbQualifier, Columns: []string{}, Rows: [][]insertValue{{}}, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: []string{}, Rows: [][]insertValue{{}}, OnConflict: onConflict, Returning: returning}, nil
 	}
 	if p.peekKeyword() == "select" {
 		sel, err := p.parseSelect()
@@ -2660,7 +2671,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &insert{Table: table, DB: dbQualifier, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
@@ -2688,7 +2699,7 @@ func (p *parser) parseInsert() (*insert, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &insert{Table: table, DB: dbQualifier, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
+	return &insert{Table: table, DB: dbQualifier, Alias: alias, Columns: columns, ColumnPos: columnPos, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
 }
 
 // parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —

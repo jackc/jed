@@ -1972,33 +1972,21 @@ impl<'a> Scope<'a> {
     /// row the caller appends. Explicit `WITH (OLD AS o, NEW AS n)` aliases are installed
     /// first and hide that version's standard name; an unaliased default is suppressed when
     /// its label is already occupied (including by the target table). Explicit aliases may not
-    /// collide with the target or each other (`42712`).
+    /// collide with the target or each other (`42712`). An INSERT's `AS alias` (upsert.md §5)
+    /// replaces the target's label, so the table (or view) name is no longer a visible qualifier —
+    /// referencing it is `42P01` with the table-alias hint (error-fields.md §11.2).
     fn returning(
         catalog: &'a Engine,
         table: &'a Table,
         base_is_old: bool,
         returning: &ReturningClause,
         vw: Option<&'a ViewWrite>,
+        alias: Option<&str>,
     ) -> Result<Scope<'a>> {
         let n = table.columns.len();
-        // A write through a view returns the view's columns under the view's name (views.md §15.2).
-        let label = match vw {
-            Some(vw) => vw.view.clone(),
-            None => table.name.to_string(),
-        };
         let layer = vw.map(|vw| &vw.top);
         let (old_offset, new_offset) = if base_is_old { (0, n) } else { (n, 0) };
-        let mut rels = vec![ScopeRel {
-            label: label.clone(),
-            table,
-            offset: 0,
-            qualifier_only: false,
-            view: None,
-            base: false,
-            cte: None,
-            db: None,
-            layer,
-        }];
+        let mut rels = vec![Scope::target_rel(table, vw, alias)];
         for (alias, offset) in [
             (returning.old_alias.as_deref(), old_offset),
             (returning.new_alias.as_deref(), new_offset),
@@ -2057,28 +2045,49 @@ impl<'a> Scope<'a> {
         })
     }
 
-    /// The scope a DO UPDATE's `SET`/`WHERE` resolve against (spec/design/upsert.md §5): the
-    /// target table at offset 0 (bare and table-qualified references read the EXISTING
-    /// conflicting row), plus `excluded` as a QUALIFIER-ONLY relation at offset `n` over the
-    /// combined row `[existing | proposed]` (`excluded.col` reads the proposed row). A target
-    /// table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like
-    /// the RETURNING `old`/`new` qualifiers, §32).
-    fn on_conflict_excluded(catalog: &'a Engine, table: &'a Table) -> Scope<'a> {
-        let n = table.columns.len();
-        let label = table.name.to_string();
-        let mut rels = vec![ScopeRel {
-            label: label.clone(),
+    /// The target relation of an INSERT's RETURNING / DO UPDATE scope (or an UPDATE/DELETE's
+    /// RETURNING) at offset 0: labeled by the INSERT's `AS alias` when given (upsert.md §5), else by
+    /// the view's name for a write through a view (views.md §15.2), else by the table's name. The
+    /// catalog name is recorded (`base` / `view`) so a reference by the hidden table or view name
+    /// gets the table-alias hint (error-fields.md §11.2).
+    fn target_rel(
+        table: &'a Table,
+        vw: Option<&'a ViewWrite>,
+        alias: Option<&str>,
+    ) -> ScopeRel<'a> {
+        let catalog_label = match vw {
+            Some(vw) => vw.view.clone(),
+            None => table.name.to_string(),
+        };
+        ScopeRel {
+            label: alias.map_or(catalog_label, str::to_string),
             table,
             offset: 0,
             qualifier_only: false,
-            view: None,
-            base: false,
+            view: vw.map(|vw| vw.view.clone()),
+            base: vw.is_none(),
             cte: None,
             db: None,
-            layer: None,
-        }];
-        if label != "excluded" {
-            rels.push(ScopeRel {
+            layer: vw.map(|vw| &vw.top),
+        }
+    }
+
+    /// The scope a DO UPDATE's `SET`/`WHERE` resolve against (spec/design/upsert.md §5): the
+    /// target table at offset 0 — labeled by the INSERT's `AS alias` when given — whose bare and
+    /// label-qualified references read the EXISTING conflicting row, plus `excluded` as a
+    /// QUALIFIER-ONLY relation at offset `n` over the combined row `[existing | proposed]`
+    /// (`excluded.col` reads the proposed row). A target labeled `excluded` (a table so named, or
+    /// `AS excluded`) keeps BOTH relations under the one label, so `excluded.col` is `42P09`
+    /// (PostgreSQL's rule — `resolve_qualified`).
+    fn on_conflict_excluded(
+        catalog: &'a Engine,
+        table: &'a Table,
+        alias: Option<&str>,
+    ) -> Scope<'a> {
+        let n = table.columns.len();
+        let rels = vec![
+            Scope::target_rel(table, None, alias),
+            ScopeRel {
                 label: "excluded".to_string(),
                 table,
                 offset: n,
@@ -2088,8 +2097,8 @@ impl<'a> Scope<'a> {
                 cte: None,
                 db: None,
                 layer: None,
-            });
-        }
+            },
+        ];
         Scope {
             rels,
             parent: None,
@@ -2216,6 +2225,15 @@ impl<'a> Scope<'a> {
     /// outward (42P01 if no ancestor has it).
     fn resolve_qualified(&self, qualifier: &str, name: &str) -> Result<Resolved> {
         let q = qualifier.to_string();
+        // Two relations under one label at this level — only the DO UPDATE scope of a target
+        // labeled `excluded` builds one (every FROM rejects a duplicate label up front, 42712):
+        // PostgreSQL's 42P09 (upsert.md §5).
+        if self.rels.iter().filter(|r| r.label == q).count() > 1 {
+            return Err(EngineError::new(
+                SqlState::AmbiguousAlias,
+                format!("table reference {qualifier} is ambiguous"),
+            ));
+        }
         if let Some(ri) = self
             .rels
             .iter()
@@ -2311,7 +2329,10 @@ impl<'a> Scope<'a> {
         if e.position.is_some()
             || !matches!(
                 e.state,
-                SqlState::UndefinedColumn | SqlState::AmbiguousColumn | SqlState::UndefinedTable
+                SqlState::UndefinedColumn
+                    | SqlState::AmbiguousColumn
+                    | SqlState::UndefinedTable
+                    | SqlState::AmbiguousAlias
             )
         {
             return e;

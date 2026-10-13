@@ -216,21 +216,22 @@ export class Scope {
   // caller appends. Explicit WITH (OLD AS o, NEW AS n) aliases are installed first and hide that
   // version's standard name; an unaliased default is suppressed when its label is already occupied
   // (including by the target table). Explicit aliases may not collide with the target or each other
-  // (42712).
+  // (42712). An INSERT's AS alias (upsert.md §5) replaces the target's label, so the table (or view)
+  // name is no longer a visible qualifier — referencing it is 42P01 with the table-alias hint
+  // (error-fields.md §11.2).
   static returning(
     catalog: Engine,
     t: Table,
     baseIsOld: boolean,
     returning: ReturningClause,
     vw: ViewWrite | null = null,
+    alias?: string,
   ): Scope {
     const n = t.columns.length;
-    // A write through a view returns the view's columns under the view's name (views.md §15.2).
-    const label = vw === null ? t.name : vw.view;
     const layer = vw === null ? {} : { layer: vw.top };
     const oldOffset = baseIsOld ? 0 : n;
     const newOffset = baseIsOld ? n : 0;
-    const rels: ScopeRel[] = [{ label, table: t, offset: 0, ...layer }];
+    const rels: ScopeRel[] = [Scope.targetRel(t, vw, alias)];
     for (const explicit of [
       { alias: returning.oldAlias, offset: oldOffset },
       { alias: returning.newAlias, offset: newOffset },
@@ -266,24 +267,33 @@ export class Scope {
     return new Scope(rels, catalog, null, true);
   }
 
+  // targetRel is the target relation of an INSERT's RETURNING / DO UPDATE scope (or an
+  // UPDATE/DELETE's RETURNING) at offset 0: labeled by the INSERT's AS alias when given (upsert.md
+  // §5), else by the view's name for a write through a view (views.md §15.2), else by the table's
+  // name. The catalog name is recorded (base / view) so a reference by the hidden table or view name
+  // gets the table-alias hint (error-fields.md §11.2).
+  static targetRel(t: Table, vw: ViewWrite | null, alias: string | undefined): ScopeRel {
+    const rel: ScopeRel =
+      vw === null
+        ? { label: t.name, table: t, offset: 0, base: true }
+        : { label: vw.view, table: t, offset: 0, view: vw.view, layer: vw.top };
+    if (alias !== undefined) rel.label = alias;
+    return rel;
+  }
+
   // onConflictExcluded is the scope a DO UPDATE's SET/WHERE resolve against
-  // (spec/design/upsert.md §5): the target table at offset 0 (bare and table-qualified references
-  // read the EXISTING conflicting row), plus `excluded` as a QUALIFIER-ONLY relation at offset n
-  // over the combined row [existing | proposed] (excluded.col reads the proposed row). A target
-  // table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like the
-  // RETURNING old/new qualifiers).
-  static onConflictExcluded(catalog: Engine, t: Table): Scope {
+  // (spec/design/upsert.md §5): the target table at offset 0 — labeled by the INSERT's AS alias when
+  // given — whose bare and label-qualified references read the EXISTING conflicting row, plus
+  // `excluded` as a QUALIFIER-ONLY relation at offset n over the combined row [existing | proposed]
+  // (excluded.col reads the proposed row). A target labeled `excluded` (a table so named, or AS
+  // excluded) keeps BOTH relations under the one label, so excluded.col is 42P09 (PostgreSQL's rule
+  // — resolveQualified).
+  static onConflictExcluded(catalog: Engine, t: Table, alias?: string): Scope {
     const n = t.columns.length;
-    const label = t.name;
-    const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
-    if (label !== "excluded") {
-      rels.push({
-        label: "excluded",
-        table: t,
-        offset: n,
-        qualifierOnly: true,
-      });
-    }
+    const rels: ScopeRel[] = [
+      Scope.targetRel(t, null, alias),
+      { label: "excluded", table: t, offset: n, qualifierOnly: true },
+    ];
     return new Scope(rels, catalog, null, true);
   }
 
@@ -378,6 +388,12 @@ export class Scope {
   // unknown qualifier walks outward (42P01 if no ancestor has it).
   resolveQualified(qualifier: string, name: string): Resolved {
     const q = qualifier;
+    // Two relations under one label at this level — only the DO UPDATE scope of a target labeled
+    // `excluded` builds one (every FROM rejects a duplicate label up front, 42712): PostgreSQL's
+    // 42P09 (upsert.md §5).
+    if (this.rels.filter((r) => r.label === q).length > 1) {
+      throw engineError("ambiguous_alias", `table reference ${qualifier} is ambiguous`);
+    }
     for (let ri = 0; ri < this.rels.length; ri++) {
       const layer = this.rels[ri]!.layer;
       if (this.rels[ri]!.label !== q || layer === undefined) continue;
@@ -445,7 +461,7 @@ export class Scope {
     }
   }
 
-  // locateColumnError stamps a column reference's 42703 / 42702 / 42P01 with its position, and adds
+  // locateColumnError stamps a column reference's 42703 / 42702 / 42P01 / 42P09 with its position, and adds
   // the misspelled-column (§11.1) or table-alias (§11.2) hint. An error already positioned came from
   // an inner site, which wins. Returns the (possibly annotated) error for the caller to rethrow.
   private locateColumnError(
@@ -456,7 +472,7 @@ export class Scope {
   ): unknown {
     if (!(e instanceof EngineError) || e.position !== undefined) return e;
     const code = e.code();
-    if (code !== "42703" && code !== "42702" && code !== "42P01") return e;
+    if (code !== "42703" && code !== "42702" && code !== "42P01" && code !== "42P09") return e;
     let hint: string | undefined;
     if (code === "42703") hint = this.fuzzyColumnHint(qualifier, name);
     else if (code === "42P01" && qualifier !== null) hint = this.tableAliasHint(qualifier);

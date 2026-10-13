@@ -376,7 +376,7 @@ query surfaces (CLAUDE.md §13). jed adds it as a sixth structured field.
 |---|---|---|
 | the lexer | every code except class 54 | the first character of the lexeme being scanned (the opening `'` of an unterminated string, the `/*` of an unterminated comment, the bad character) |
 | the parser | every code except class 54 | the token at which the parse stopped (§10.3) |
-| a column reference in an expression (select list, WHERE, ON, GROUP BY, HAVING, ORDER BY, RETURNING, SET values, …) | `42703`, `42702`, `42P01` | the reference's first character — the qualifier of `t.c` |
+| a column reference in an expression (select list, WHERE, ON, GROUP BY, HAVING, ORDER BY, RETURNING, SET values, …) | `42703`, `42702`, `42P01`, `42P09` | the reference's first character — the qualifier of `t.c` |
 | an `INSERT` column-list name or an `UPDATE … SET` / `ON CONFLICT DO UPDATE SET` target | `42703` | the column name |
 | a FROM-clause table or view name | `42P01` | the name — the database qualifier of `db.t` |
 
@@ -417,7 +417,7 @@ token positions (`TableRefPos`, `StarPos`, views.md §5): `a + b` written twice 
 BY expression. A parse of stored text records no positions (§10.1).
 
 A column-reference error is stamped where the resolver resolves that node: the error's position is
-set from the node when the error is `42703`, `42702`, or `42P01` and has no position yet.
+set from the node when the error is `42703`, `42702`, `42P01`, or `42P09` and has no position yet.
 
 ### 10.5 Testing
 

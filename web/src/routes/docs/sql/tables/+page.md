@@ -286,6 +286,10 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
 - **A filtered update** — add `WHERE excluded.balance > account.balance` to a `DO UPDATE` to apply it
   only when the proposed balance is larger; otherwise the row is left untouched.
 - **`RETURNING`** — append `RETURNING id, balance` to see the affected (inserted or updated) rows.
+- **A target alias** — `INSERT INTO account AS a VALUES (1, 'Ada', 5.00) ON CONFLICT (id) DO UPDATE
+  SET balance = a.balance + excluded.balance RETURNING a.balance;` names the existing row `a`. Once
+  aliased, the table is referred to only by its alias (`account.balance` would be `42P01`), in the
+  `DO UPDATE` and in `RETURNING` alike.
 
 `RETURNING` can also compare row versions. `old.balance` is the value before the change and
 `new.balance` the value after it; an `INSERT` has an all-`NULL` old row and a `DELETE` an all-`NULL`

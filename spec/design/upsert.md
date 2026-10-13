@@ -4,8 +4,8 @@
 > action: skip the offending row (`DO NOTHING`) or update the existing conflicting row
 > (`DO UPDATE`). The **grammar is authoritative** for the surface
 > ([../grammar/grammar.ebnf](../grammar/grammar.ebnf) — `on_conflict`); the **error
-> registry** ([../errors/registry.toml](../errors/registry.toml)) owns the codes (no new
-> code — the feature reuses existing ones); this doc is the *why* and the precise behavior
+> registry** ([../errors/registry.toml](../errors/registry.toml)) owns the codes (the
+> feature reuses existing ones, plus `42P09` for the `AS excluded` case — §5); this doc is the *why* and the precise behavior
 > the three cores reproduce identically (CLAUDE.md §2, §8). Everything here is
 > oracle-probed against PostgreSQL 18 (CLAUDE.md §1) except the documented divergences
 > (§9). When a decision here changes, change the grammar and this doc in the same edit.
@@ -15,12 +15,12 @@
 ([indexes.md §8](indexes.md), [constraints.md §5](constraints.md)) and the `INSERT`/`UPDATE`
 two-phase machinery ([grammar.md §12/§32](grammar.md)). It adds **no on-disk format change**
 (pure DML/execution — no catalog, value-codec, or `format_version` change; no golden/Ruby
-move) and **no new error code** (matching is by code — §8).
+move) and one new error code, `42P09` (§5, §8).
 
 ## 1. Surface
 
 ```sql
-INSERT INTO t [(cols)] { VALUES ... | SELECT ... }
+INSERT INTO t [ AS alias ] [(cols)] { VALUES ... | SELECT ... }
   ON CONFLICT [ conflict_target ] conflict_action
   [ RETURNING ... ]
 
@@ -39,6 +39,9 @@ conflict_action ::= DO NOTHING
   for insertion* (after column-list / `DEFAULT` fill-in and coercion). A **bare** or
   **table-qualified** column reference in `SET`/`WHERE` names the **existing** (conflicting)
   row; `excluded.col` names the proposed row.
+- An optional **`AS alias`** on the target renames it: the alias replaces the table's name as
+  the qualifier for the existing row (and in `RETURNING`), and the table's own name is then no
+  longer visible (§5).
 
 ## 2. The arbiter (conflict target) and which conflicts it covers
 
@@ -146,8 +149,28 @@ row `[existing | proposed]`:
   reads the **existing** conflicting row;
 - the **`excluded`** pseudo-relation at offset *n* — **qualifier-only** (like `old`/`new` in
   `RETURNING`, grammar.md §32): `excluded.v` reads the **proposed** row; bare `excluded` is
-  an ordinary identifier (never the pseudo-relation), and a target table literally named
-  `excluded` shadows it (the same rule `old`/`new` follow).
+  an ordinary identifier (never the pseudo-relation).
+
+**The target alias** (`INSERT INTO t AS a …`, PostgreSQL semantics, probed). The alias
+**replaces** the table's name as the target's label: `a.v` reads the existing row, and `t.v` is
+**`42P01`** — PostgreSQL's *invalid reference to FROM-clause entry for table "t"*, with its hint
+*Perhaps you meant to reference the table alias "a".* ([error-fields.md](error-fields.md) §11.2;
+jed keeps its own message text). This holds in `SET`, in `WHERE`, inside their subqueries, and in
+`RETURNING` (§6), with or without an `ON CONFLICT` clause. A subquery's own `FROM t` is a new
+relation and is unaffected. `AS` is required: PostgreSQL has no implicit `INSERT` alias, so
+`INSERT INTO t a VALUES …` is `42601`. For a write through an updatable view (views.md §15) the
+alias hides both the view's name and the base table's; for a database-qualified target
+(`INSERT INTO reports.t AS a`) the label is the alias, as for a FROM item. In a writable CTE the
+alias labels the body's `RETURNING` the same way.
+
+**A target labeled `excluded`.** When the target's label is `excluded` — `INSERT INTO t AS
+excluded`, or a table literally named `excluded` without an alias — the `DO UPDATE` scope holds
+two relations under one label, and `excluded.v` there is **`42P09`** (*table reference
+"excluded" is ambiguous*, PostgreSQL's code and rule; probed). Aliasing such a table
+(`INSERT INTO excluded AS e …`) frees the pseudo-relation. Without `DO UPDATE` (no `ON CONFLICT`,
+or `DO NOTHING`) there is no pseudo-relation, so `excluded` is an ordinary alias; `RETURNING`
+never sees the pseudo-relation, so there `excluded.v` reads the target. (`42P09` is raised only
+here: every FROM rejects a duplicate label up front with `42712`.)
 
 Each `SET col = expr` is resolved, type-checked assignable to `col` (`42804` otherwise),
 evaluated against `[E | R]`, and coerced through the same `store_value` chokepoint `UPDATE`
@@ -173,7 +196,10 @@ rows and the **updated** rows — using the ordinary returning scope (grammar.md
 **nothing** (probed). `excluded` is **not** visible in `RETURNING` (only in the
 conflict_action) — there, the PG-18 `old`/`new` qualifiers apply: for an updated row
 `old` is the pre-update existing row and `new` the updated row; for an inserted row `old` is
-the all-NULL row and `new` the inserted row. Row order is unspecified (`rowsort`).
+the all-NULL row and `new` the inserted row. With an `AS alias` the target is qualified by the
+alias here too (§5); the alias occupies its label, so `INSERT INTO t AS old … RETURNING old.v`
+reads the target and `WITH (OLD AS a)` under alias `a` is `42712` (grammar.md §32). Row order is
+unspecified (`rowsort`).
 
 ## 7. Cost
 
@@ -185,10 +211,11 @@ validation work, like the uniqueness probes they reuse (cost.md §3 "what is NOT
 §32, cost.md §3). The `max_cost` ceiling (`54P01`) bounds the `DO UPDATE` evaluation and the
 `RETURNING` projection deterministically.
 
-## 8. Error codes (all pre-existing — registry unchanged)
+## 8. Error codes
 
 Matching in the conformance corpus is by **code** (conformance.md §7), so reusing a code with
-an `ON CONFLICT`-specific message needs no registry edit. The codes:
+an `ON CONFLICT`-specific message needs no registry edit. Every code below predates the feature
+except `42P09` (`ambiguous_alias`), added with the target alias (§5). The codes:
 
 | Code | When |
 |---|---|
@@ -197,6 +224,8 @@ an `ON CONFLICT`-specific message needs no registry edit. The codes:
 | `42P10` | A column-list target matches no unique index / PK (§2). Message: *there is no unique or exclusion constraint matching the ON CONFLICT specification*. |
 | `42704` | `ON CONSTRAINT name` names no unique constraint (§2). Message: *constraint "name" for table "table" does not exist*. |
 | `42703` | An unknown column in the target list or `SET` (§2, §5). |
+| `42P01` | A `SET`/`WHERE`/`RETURNING` reference qualified by the table's name under an `AS alias` (§5). |
+| `42P09` | `excluded.col` in `DO UPDATE` when the target is itself labeled `excluded` (§5). |
 | `23505` | A conflict on a **non-arbiter** constraint (§2), or any conflict with no `ON CONFLICT` clause. |
 | `23502` / `23514` / `22003` / `42804` / `23503` / `0A000` / `428C9` | The ordinary `INSERT`/`UPDATE` per-row checks, applied to proposed and updated rows (§3, §5). |
 
@@ -213,16 +242,13 @@ an `ON CONFLICT`-specific message needs no registry edit. The codes:
 - **Which constraint name a `23505` reports** when several are violated follows jed's standing
   deterministic order (PK first, then unique indexes by name byte order), not PG's
   index-creation order (constraints.md §5.4). The code is identical.
-- **No `INSERT INTO t AS alias`.** Table aliasing on `INSERT` is not in the grammar this
-  slice, so the existing row is referenced by the table's own name (PG allows an alias). A
-  relaxable narrowing.
 - **No `DETAIL` line in the message.** jed's messages are single-line house style; the codes match.
   The `Key (…)=(…) already exists.` text is the structured `Detail` field
   ([error-fields.md](error-fields.md) §9).
 
 ## 10. Deferred (each its own later slice)
 
-`SET col = DEFAULT` on the conflict-action path; `INSERT INTO t AS alias`;
+`SET col = DEFAULT` on the conflict-action path;
 the partial-index `WHERE index_predicate` in a conflict target (jed has no partial indexes)
 and `COLLATE`/opclass inference decorations; multi-column `SET (a,b) = (...)`; and the GIN /
 ordered-index acceleration of the arbiter probe (the probe reuses the unique-index point/range

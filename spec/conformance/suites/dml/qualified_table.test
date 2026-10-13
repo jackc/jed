@@ -7,7 +7,7 @@
 # (PostgreSQL has no `main` database/schema qualifier), so CROSS-CORE-checked, NOT PostgreSQL-oracle-
 # checked. These cases use only PERSISTENT tables, so they run in BOTH storage modes (a qualified name
 # resolves the same after a file reopen — resolution is catalog-level, storage-agnostic).
-# requires: query.qualified_table, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32
+# requires: query.qualified_table, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_alias, dml.insert_on_conflict, dml.returning, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -69,6 +69,26 @@ SELECT id FROM t ORDER BY id
 1
 2
 3
+
+# --- an aliased qualified INSERT target (spec/design/upsert.md §5) ----------------------------
+
+query II rowsort
+INSERT INTO main.t AS a VALUES (5, 50) ON CONFLICT (id) DO UPDATE SET v = a.v + excluded.v RETURNING a.id, a.v
+----
+5
+50
+
+query I rowsort
+INSERT INTO main.t AS a VALUES (5, 1) ON CONFLICT (id) DO UPDATE SET v = a.v + excluded.v RETURNING a.v
+----
+51
+
+# the alias hides the table name
+statement error 42P01
+INSERT INTO main.t AS a VALUES (6, 60) RETURNING t.v
+
+statement ok
+DELETE FROM main.t WHERE id = 5
 
 # --- a qualified name inside a subquery / INSERT ... SELECT ------------------------------------
 

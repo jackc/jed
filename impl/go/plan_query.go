@@ -248,10 +248,12 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	var tableName string
 	var returning *returningClause
 	var baseIsOld bool
+	var alias *string
 	dm := &dmCte{}
 	switch {
 	case body.Insert != nil:
 		tableName, returning, baseIsOld = body.Insert.Table, body.Insert.Returning, false
+		alias = body.Insert.Alias
 		dm.insert = body.Insert
 	case body.Update != nil:
 		tableName, returning, baseIsOld = body.Update.Table, body.Update.Returning, false
@@ -292,7 +294,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 		}
 		return table, dm, nil
 	}
-	s, err := returningScope(db, tdef, baseIsOld, returning, vw)
+	s, err := returningScope(db, tdef, baseIsOld, returning, vw, alias)
 	if err != nil {
 		return nil, nil, err
 	}

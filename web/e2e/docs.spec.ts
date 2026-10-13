@@ -192,6 +192,31 @@ test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
+test('the tables page upserts through an INSERT target alias live', async ({ page }) => {
+  await page.goto('/docs/sql/tables/');
+  const panel = page.getByTestId('live-sql');
+  await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+
+  // The alias replaces the table's name (upsert.md §5): balance 100 + 5 = 105 through `a`.
+  await panel
+    .getByTestId('sql-input')
+    .fill(
+      "INSERT INTO account AS a VALUES (1, 'Ada', 5.00) ON CONFLICT (id) DO UPDATE SET balance = a.balance + excluded.balance RETURNING a.balance"
+    );
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('105.00');
+
+  // ... and the table's own name is no longer visible.
+  await panel
+    .getByTestId('sql-input')
+    .fill("INSERT INTO account AS a VALUES (9, 'Zed', 1.00) RETURNING account.id");
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('42P01');
+
+  await panel.getByTestId('reset-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+});
+
 test('the select page names a column with a bare label (no AS)', async ({ page }) => {
   await page.goto('/docs/sql/select/');
   // The grouped demo: `count(*) items` labels its column without AS

@@ -389,6 +389,33 @@ run: SELECT * FROM t x WHERE y.abc = 1
 code: 42P01
 position: 25
 
+case: hint table name instead of INSERT alias in RETURNING
+setup: CREATE TABLE t (id int PRIMARY KEY, v int)
+run: INSERT INTO t AS a VALUES (1, 1) RETURNING t.id
+code: 42P01
+position: 44
+hint: Perhaps you meant to reference the table alias "a".
+
+case: hint table name instead of INSERT alias in a RETURNING subquery
+setup: CREATE TABLE t (id int PRIMARY KEY, v int)
+run: INSERT INTO t AS a VALUES (1, 1) RETURNING (SELECT t.v)
+code: 42P01
+position: 52
+hint: Perhaps you meant to reference the table alias "a".
+
+case: hint table name instead of INSERT alias in DO UPDATE
+setup: CREATE TABLE t (id int PRIMARY KEY, v int)
+run: INSERT INTO t AS a VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = t.v + 1
+code: 42P01
+position: 69
+hint: Perhaps you meant to reference the table alias "a".
+
+case: excluded is ambiguous under an INSERT aliased excluded
+setup: CREATE TABLE t (id int PRIMARY KEY, v int)
+run: INSERT INTO t AS excluded VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = excluded.v
+code: 42P09
+position: 76
+
 # --- scripts --------------------------------------------------------------------------------------
 
 case: script position counts from the start of the script

@@ -379,6 +379,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // (spec/design/upsert.md, grammar.md §46): arbiter inference / ON CONSTRAINT, the
     // `excluded` pseudo-relation, the 21000 second-affect rule, non-arbiter 23505.
     "dml.insert_on_conflict",
+    // INSERT INTO t AS alias — the alias replaces the target's reference name in DO UPDATE and
+    // RETURNING (upsert.md §5).
+    "dml.insert_alias",
     // Phase D/E — SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts,
     // cross-type comparison via the promotion tower, and all three integer types.
     "query.select",

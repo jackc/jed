@@ -206,6 +206,7 @@ impl Engine {
         let Insert {
             table,
             db,
+            alias,
             columns: col_list,
             column_pos,
             overriding,
@@ -402,19 +403,23 @@ impl Engine {
                 // (grammar.md §32).
                 let ret = match &returning {
                     Some(items) => Some(self.resolve_returning(
+                        db.as_deref(),
                         &table,
                         items,
                         false,
                         ctx.bindings,
                         &mut ptypes,
                         vw.as_ref(),
+                        alias.as_deref(),
                     )?),
                     None => None,
                 };
                 // Resolve the ON CONFLICT clause (its DO UPDATE SET/WHERE share this statement's
                 // ptypes so a `$N` unifies) before binding (spec/design/upsert.md §2/§5).
                 let mut conflict_plan = match &on_conflict {
-                    Some(oc) => Some(self.resolve_on_conflict(&table, oc, &mut ptypes)?),
+                    Some(oc) => {
+                        Some(self.resolve_on_conflict(&table, oc, alias.as_deref(), &mut ptypes)?)
+                    }
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
@@ -607,17 +612,21 @@ impl Engine {
                     self.plan_query(&QueryExpr::Select(sel), None, ctx.bindings, &mut ptypes)?;
                 let ret = match &returning {
                     Some(items) => Some(self.resolve_returning(
+                        db.as_deref(),
                         &table,
                         items,
                         false,
                         ctx.bindings,
                         &mut ptypes,
                         vw.as_ref(),
+                        alias.as_deref(),
                     )?),
                     None => None,
                 };
                 let mut conflict_plan = match &on_conflict {
-                    Some(oc) => Some(self.resolve_on_conflict(&table, oc, &mut ptypes)?),
+                    Some(oc) => {
+                        Some(self.resolve_on_conflict(&table, oc, alias.as_deref(), &mut ptypes)?)
+                    }
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
@@ -1068,12 +1077,14 @@ impl Engine {
         }
         let returning = match &ins.returning {
             Some(items) => Some(self.resolve_returning(
+                ins.db.as_deref(),
                 &ins.table,
                 items,
                 false,
                 ctx.bindings,
                 &mut ptypes,
                 None,
+                ins.alias.as_deref(),
             )?),
             None => None,
         };
@@ -1774,6 +1785,7 @@ impl Engine {
         &self,
         table: &str,
         oc: &OnConflict,
+        alias: Option<&str>,
         ptypes: &mut ParamTypes,
     ) -> Result<ConflictPlan> {
         let tdef = self.table(table).ok_or_else(|| {
@@ -1796,7 +1808,7 @@ impl Engine {
                         "ON CONFLICT DO UPDATE requires inference specification or constraint name",
                     ));
                 }
-                let scope = Scope::on_conflict_excluded(self, tdef);
+                let scope = Scope::on_conflict_excluded(self, tdef, alias);
                 let pk_members = tdef.pk_indices();
                 let mut plans: Vec<AssignPlan> = Vec::with_capacity(assignments.len());
                 for a in assignments {
@@ -2637,18 +2649,26 @@ impl Engine {
     /// `base_is_old` true for DELETE): aggregates are 42803 (`Forbidden`), subqueries
     /// resolve (and may correlate against either row version), output names follow §8.
     /// Returns the projection nodes and names; the item types have no consumer. The INSERT
-    /// path uses this (its target borrow ends early); UPDATE/DELETE resolve inline.
+    /// path uses this (its target borrow ends early); UPDATE/DELETE resolve inline. `alias` is an
+    /// INSERT's `AS alias` (upsert.md §5), which replaces the target's label; `db` is the target's
+    /// database qualifier (attached-databases.md §3), so an attachment's table resolves in its own
+    /// database.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_returning(
         &self,
+        db: Option<&str>,
         table: &str,
         returning: &ReturningClause,
         base_is_old: bool,
         ctes: &[&CteBinding],
         ptypes: &mut ParamTypes,
         vw: Option<&ViewWrite>,
+        alias: Option<&str>,
     ) -> Result<(Vec<RExpr>, Vec<String>, Vec<String>)> {
-        let tdef = self.table(table).expect("INSERT target resolved above");
-        let mut scope = Scope::returning(self, tdef, base_is_old, returning, vw)?;
+        let tdef = self
+            .table_scoped(db, table)
+            .expect("INSERT target resolved above");
+        let mut scope = Scope::returning(self, tdef, base_is_old, returning, vw, alias)?;
         scope.ctes = ctes;
         let (nodes, names, types, _) =
             resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
@@ -3158,7 +3178,7 @@ impl Engine {
         // (bare = `old.` = the deleted values; `new.` is the all-NULL side — grammar.md §32).
         let mut ret = match &del.returning {
             Some(returning) => {
-                let mut rscope = Scope::returning(self, table, true, returning, vw.as_ref())?;
+                let mut rscope = Scope::returning(self, table, true, returning, vw.as_ref(), None)?;
                 rscope.ctes = ctx.bindings;
                 let (nodes, names, types, _) = resolve_projections(
                     &rscope,
@@ -3586,7 +3606,8 @@ impl Engine {
         // `old.` reads the pre-update half of [base | other] (grammar.md §32).
         let mut ret = match &upd.returning {
             Some(returning) => {
-                let mut rscope = Scope::returning(self, table, false, returning, vw.as_ref())?;
+                let mut rscope =
+                    Scope::returning(self, table, false, returning, vw.as_ref(), None)?;
                 rscope.ctes = ctx.bindings;
                 let (nodes, names, types, _) = resolve_projections(
                     &rscope,

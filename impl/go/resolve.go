@@ -191,20 +191,21 @@ func emptyScope(catalog *engine) *scope {
 // `new` reads the other half) — the absent version is the all-NULL row the caller appends.
 // Explicit WITH (OLD AS o, NEW AS n) aliases are installed first and hide that version's standard
 // name; an unaliased default is suppressed when its label is already occupied (including by the
-// target table). Explicit aliases may not collide with the target or each other (42712).
-func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *returningClause, vw *viewWrite) (*scope, error) {
+// target table). Explicit aliases may not collide with the target or each other (42712). An
+// INSERT's AS alias (upsert.md §5) replaces the target's label, so the table (or view) name is no
+// longer a visible qualifier — referencing it is 42P01 with the table-alias hint (error-fields.md
+// §11.2).
+func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *returningClause, vw *viewWrite, alias *string) (*scope, error) {
 	n := len(t.Columns)
-	// A write through a view returns the view's columns under the view's name (views.md §15.2).
-	label := t.Name
 	var layer *writeLayer
 	if vw != nil {
-		label, layer = vw.view, vw.top
+		layer = vw.top
 	}
 	oldOffset, newOffset := n, 0
 	if baseIsOld {
 		oldOffset, newOffset = 0, n
 	}
-	rels := []scopeRel{{label: label, table: t, offset: 0, layer: layer}}
+	rels := []scopeRel{targetRel(t, vw, alias)}
 	for _, explicit := range []struct {
 		alias  *string
 		offset int
@@ -235,18 +236,34 @@ func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *ret
 	return &scope{rels: rels, catalog: catalog, allowSubquery: true}, nil
 }
 
+// targetRel is the target relation of an INSERT's RETURNING / DO UPDATE scope (or an
+// UPDATE/DELETE's RETURNING) at offset 0: labeled by the INSERT's AS alias when given (upsert.md
+// §5), else by the view's name for a write through a view (views.md §15.2), else by the table's
+// name. The catalog name is recorded (base / view) so a reference by the hidden table or view name
+// gets the table-alias hint (error-fields.md §11.2).
+func targetRel(t *catTable, vw *viewWrite, alias *string) scopeRel {
+	rel := scopeRel{label: t.Name, table: t, offset: 0, base: true}
+	if vw != nil {
+		rel.label, rel.view, rel.base, rel.layer = vw.view, vw.view, false, vw.top
+	}
+	if alias != nil {
+		rel.label = *alias
+	}
+	return rel
+}
+
 // onConflictExcludedScope is the scope a DO UPDATE's SET/WHERE resolve against
-// (spec/design/upsert.md §5): the target table at offset 0 (bare and table-qualified references
-// read the EXISTING conflicting row), plus `excluded` as a QUALIFIER-ONLY relation at offset n
-// over the combined row [existing | proposed] (excluded.col reads the proposed row). A target
-// table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like the
-// RETURNING old/new qualifiers).
-func onConflictExcludedScope(catalog *engine, t *catTable) *scope {
+// (spec/design/upsert.md §5): the target table at offset 0 — labeled by the INSERT's AS alias when
+// given — whose bare and label-qualified references read the EXISTING conflicting row, plus
+// `excluded` as a QUALIFIER-ONLY relation at offset n over the combined row [existing | proposed]
+// (excluded.col reads the proposed row). A target labeled `excluded` (a table so named, or AS
+// excluded) keeps BOTH relations under the one label, so excluded.col is 42P09 (PostgreSQL's rule
+// — resolveQualified).
+func onConflictExcludedScope(catalog *engine, t *catTable, alias *string) *scope {
 	n := len(t.Columns)
-	label := t.Name
-	rels := []scopeRel{{label: label, table: t, offset: 0}}
-	if label != "excluded" {
-		rels = append(rels, scopeRel{label: "excluded", table: t, offset: n, qualifierOnly: true})
+	rels := []scopeRel{
+		targetRel(t, nil, alias),
+		{label: "excluded", table: t, offset: n, qualifierOnly: true},
 	}
 	return &scope{rels: rels, catalog: catalog, allowSubquery: true}
 }
@@ -374,6 +391,18 @@ func (s *scope) traceFlat(idx int) {
 // unknown qualifier walks outward (42P01 if no ancestor has it).
 func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 	q := qualifier
+	// Two relations under one label at this level — only the DO UPDATE scope of a target labeled
+	// `excluded` builds one (every FROM rejects a duplicate label up front, 42712): PostgreSQL's
+	// 42P09 (upsert.md §5).
+	labeled := 0
+	for _, r := range s.rels {
+		if r.label == q {
+			labeled++
+		}
+	}
+	if labeled > 1 {
+		return resolved{}, newError(AmbiguousAlias, "table reference "+qualifier+" is ambiguous")
+	}
 	for ri, r := range s.rels {
 		if r.label == q && r.layer != nil {
 			found := -1

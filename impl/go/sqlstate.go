@@ -111,6 +111,8 @@ const (
 	UndefinedColumn
 	// AmbiguousColumn is 42702 — column reference {name} is ambiguous.
 	AmbiguousColumn
+	// AmbiguousAlias is 42P09 — table reference {name} is ambiguous.
+	AmbiguousAlias
 	// UndefinedObject is 42704 — {kind} does not exist: {name}.
 	UndefinedObject
 	// InvalidColumnReference is 42P10 — for SELECT DISTINCT, ORDER BY expressions must appear in select list.
@@ -300,6 +302,8 @@ func (s SqlState) Code() string {
 		return "42703"
 	case AmbiguousColumn:
 		return "42702"
+	case AmbiguousAlias:
+		return "42P09"
 	case UndefinedObject:
 		return "42704"
 	case InvalidColumnReference:
@@ -452,6 +456,7 @@ var errorDescs = []errorDesc{
 	{Code: "42P01", Name: "undefined_table", Class: "syntax error or access rule violation"},
 	{Code: "42703", Name: "undefined_column", Class: "syntax error or access rule violation"},
 	{Code: "42702", Name: "ambiguous_column", Class: "syntax error or access rule violation"},
+	{Code: "42P09", Name: "ambiguous_alias", Class: "syntax error or access rule violation"},
 	{Code: "42704", Name: "undefined_object", Class: "syntax error or access rule violation"},
 	{Code: "42P10", Name: "invalid_column_reference", Class: "syntax error or access rule violation"},
 	{Code: "42804", Name: "datatype_mismatch", Class: "syntax error or access rule violation"},

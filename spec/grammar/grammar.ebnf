@@ -459,8 +459,13 @@ type_word      ::= "character" "varying" | identifier
  * source) governs IDENTITY columns (../design/sequences.md §13): "OVERRIDING SYSTEM VALUE" lets an
  * explicit value land in a GENERATED ALWAYS column (otherwise 428C9); "OVERRIDING USER VALUE"
  * discards any supplied value and uses the column's identity sequence instead. It is accepted (a
- * no-op) on a statement with no identity target, matching PostgreSQL. */
-insert         ::= "INSERT" "INTO" qualified_table
+ * no-op) on a statement with no identity target, matching PostgreSQL.
+ *   The optional "AS" alias after the target (../design/upsert.md §5) REPLACES the table's name as
+ * the target's reference name in an ON CONFLICT DO UPDATE's SET/WHERE and in RETURNING: there the
+ * target is qualified by the alias, and the bare table (or view) name is an unknown qualifier
+ * (42P01). "AS" is required (PostgreSQL has no implicit INSERT alias), so an alias never collides
+ * with the column list or the source keyword. */
+insert         ::= "INSERT" "INTO" qualified_table ("AS" identifier)?
                    ( "DEFAULT" "VALUES"
                    | ("(" identifier ("," identifier)* ")")?
                      ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
@@ -483,7 +488,8 @@ literal_value  ::= literal | parameter
 /* ON CONFLICT (UPSERT — ../design/upsert.md): a row that would violate a UNIQUE / PRIMARY KEY
  * constraint takes the conflict_action instead of trapping 23505. "DO NOTHING" skips it;
  * "DO UPDATE" updates the existing conflicting row, whose proposed (would-be-inserted) version is
- * the "excluded" pseudo-relation (a bare/qualified column = the EXISTING row). The optional
+ * the "excluded" pseudo-relation (a bare/qualified column = the EXISTING row; with an INSERT alias the
+ * qualifier is the alias, and a target labeled "excluded" makes `excluded.col` 42P09). The optional
  * conflict_target names the arbiter: a column list (matched as a SET against a unique index / the
  * primary key — no match is 42P10) or "ON CONSTRAINT name" (a unique-index name or the synthesized
  * <table>_pkey — a miss is 42704). "DO UPDATE" REQUIRES a target (42601 without one); "DO NOTHING"

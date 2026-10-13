@@ -588,6 +588,11 @@ type insert struct {
 	// DB is the optional database qualifier on the target (`INSERT INTO reports.t …`), like
 	// tableRef.DB (spec/design/attached-databases.md §3). Nil = implicit scope.
 	DB *string
+	// Alias is the optional `AS alias` on the target (`INSERT INTO t AS a …` — spec/design/upsert.md
+	// §5, grammar.md §32). When set it REPLACES the table's name as the target's reference name in
+	// the ON CONFLICT DO UPDATE scope and in RETURNING; the bare table name is then no longer a
+	// visible qualifier (42P01). Nil = the target is referred to by its own name.
+	Alias *string
 	// Columns is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...` /
 	// `... SELECT ...`); nil is the positional form (every column, in declaration order). Names
 	// resolve at execution time (unknown → 42703, duplicate → 42701); an unlisted column takes

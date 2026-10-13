@@ -574,7 +574,7 @@ func (db *engine) explainDeleteTouched(table *catTable, del *deleteStmt, filter 
 	if del.Returning == nil {
 		return mask, nil
 	}
-	nodes, _, _, err := db.resolveReturning(table, *del.Returning, true, bindings, &paramTypes{}, vw)
+	nodes, _, _, err := db.resolveReturning(table, *del.Returning, true, bindings, &paramTypes{}, vw, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -618,7 +618,7 @@ func (db *engine) explainUpdateTouched(table *catTable, upd *update, filter *rEx
 		collectTouched(node, 0, mask)
 	}
 	if upd.Returning != nil {
-		nodes, _, _, err := db.resolveReturning(table, *upd.Returning, false, bindings, ptypes, vw)
+		nodes, _, _, err := db.resolveReturning(table, *upd.Returning, false, bindings, ptypes, vw, nil)
 		if err != nil {
 			return nil, err
 		}

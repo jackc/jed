@@ -2001,6 +2001,13 @@ class Parser {
     this.expectKeyword("insert");
     this.expectKeyword("into");
     const [db, table] = this.parseQualifiedTableName();
+    // Optional target alias `AS alias` (spec/design/upsert.md §5). PostgreSQL requires the AS here
+    // (no implicit alias), which also keeps a column list / source keyword unambiguous.
+    let alias: string | undefined;
+    if (this.peekKeyword() === "as") {
+      this.advance();
+      alias = this.expectIdentifier();
+    }
 
     // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
     // first expectIdentifier errors 42601 on `)`).
@@ -2060,6 +2067,7 @@ class Parser {
         kind: "insert",
         table,
         db,
+        ...(alias === undefined ? {} : { alias }),
         columns: [],
         overriding: null,
         source: { kind: "values", rows: [[]] },
@@ -2077,6 +2085,7 @@ class Parser {
         kind: "insert",
         table,
         db,
+        ...(alias === undefined ? {} : { alias }),
         columns,
         columnLocs,
         overriding,
@@ -2103,6 +2112,7 @@ class Parser {
       kind: "insert",
       table,
       db,
+      ...(alias === undefined ? {} : { alias }),
       columns,
       columnLocs,
       overriding,

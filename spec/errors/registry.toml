@@ -380,6 +380,16 @@ name = "ambiguous_column"
 class = "syntax error or access rule violation"
 template = "column reference {name} is ambiguous"
 
+# A qualifier names two relations at one scope level. PostgreSQL raises it for `excluded.col` in an
+# `ON CONFLICT ... DO UPDATE` whose target is itself labeled `excluded` (a table so named, or
+# `INSERT INTO t AS excluded`) — ../design/upsert.md §5. Everywhere else jed rejects a duplicate
+# label up front (42712), so this is the only site.
+[[error]]
+code = "42P09"
+name = "ambiguous_alias"
+class = "syntax error or access rule violation"
+template = "table reference {name} is ambiguous"
+
 [[error]]
 code = "42704"
 name = "undefined_object"

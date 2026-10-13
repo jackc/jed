@@ -2201,6 +2201,14 @@ impl Parser {
         self.expect_keyword("insert")?;
         self.expect_keyword("into")?;
         let (db, table) = self.parse_qualified_table_name()?;
+        // Optional target alias `AS alias` (spec/design/upsert.md §5). PostgreSQL requires the `AS`
+        // here (no implicit alias), which also keeps a column list / source keyword unambiguous.
+        let alias = if self.peek_keyword().as_deref() == Some("as") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
 
         // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected
         // (the first `expect_identifier` errors 42601 on `)`).
@@ -2277,6 +2285,7 @@ impl Parser {
         Ok(Insert {
             table,
             db,
+            alias,
             columns,
             column_pos,
             overriding,

@@ -709,7 +709,7 @@ func arbiterKey(arb *arbiter, colTypes []colType, pk []int, colls []*Collation, 
 // conflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
 // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
 // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
-func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, ptypes *paramTypes) (*conflictPlan, error) {
+func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *string, ptypes *paramTypes) (*conflictPlan, error) {
 	arb, err := resolveArbiter(table, oc.Target)
 	if err != nil {
 		return nil, err
@@ -722,7 +722,7 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, ptypes *par
 		return nil, newError(SyntaxError,
 			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
 	}
-	s := onConflictExcludedScope(db, table)
+	s := onConflictExcludedScope(db, table, alias)
 	pkMembers := table.PKIndices()
 	plans := make([]assignPlan, 0, len(oc.Assignments))
 	for _, a := range oc.Assignments {
@@ -1012,13 +1012,13 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		var retNames []string
 		var retTypes []string
 		if ins.Returning != nil {
-			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw); err != nil {
+			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw, ins.Alias); err != nil {
 				return outcome{}, err
 			}
 		}
 		var cplan *conflictPlan
 		if ins.OnConflict != nil {
-			if cplan, err = db.resolveOnConflict(table, ins.OnConflict, ptypes); err != nil {
+			if cplan, err = db.resolveOnConflict(table, ins.OnConflict, ins.Alias, ptypes); err != nil {
 				return outcome{}, err
 			}
 		}
@@ -1174,14 +1174,14 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	var retTypes []string
 	if ins.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw, ins.Alias); rerr != nil {
 			return outcome{}, rerr
 		}
 	}
 	var cplan *conflictPlan
 	if ins.OnConflict != nil {
 		var cerr error
-		if cplan, cerr = db.resolveOnConflict(table, ins.OnConflict, ptypes); cerr != nil {
+		if cplan, cerr = db.resolveOnConflict(table, ins.OnConflict, ins.Alias, ptypes); cerr != nil {
 			return outcome{}, cerr
 		}
 	}
@@ -1564,7 +1564,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 	var retNames []string
 	var retTypes []string
 	if ins.Returning != nil {
-		if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw); err != nil {
+		if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes, vw, ins.Alias); err != nil {
 			return nil, err
 		}
 	}
@@ -2794,9 +2794,10 @@ func defaultOrNull(col catColumn) Value {
 // projection nodes and names; the item types have no consumer.
 // The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
 // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
-// baseIsOld true for DELETE).
-func (db *engine) resolveReturning(table *catTable, returning returningClause, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes, vw *viewWrite) ([]*rExpr, []string, []string, error) {
-	s, err := returningScope(db, table, baseIsOld, &returning, vw)
+// baseIsOld true for DELETE). alias is an INSERT's AS alias (upsert.md §5), which replaces the
+// target's label; nil for UPDATE/DELETE.
+func (db *engine) resolveReturning(table *catTable, returning returningClause, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes, vw *viewWrite, alias *string) ([]*rExpr, []string, []string, error) {
+	s, err := returningScope(db, table, baseIsOld, &returning, vw, alias)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -3265,7 +3266,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	var retTypes []string
 	if del.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ctx.bindings, ptypes, vw); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ctx.bindings, ptypes, vw, nil); rerr != nil {
 			return outcome{}, rerr
 		}
 	}
@@ -3633,7 +3634,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	var retTypes []string
 	if upd.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ctx.bindings, ptypes, vw); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ctx.bindings, ptypes, vw, nil); rerr != nil {
 			return outcome{}, rerr
 		}
 	}
