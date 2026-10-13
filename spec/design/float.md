@@ -161,7 +161,7 @@ identical key bytes and dedup to one bucket** (§10). The value codec stores the
 
 ## 4. Literals
 
-There is no dedicated float literal token; a float value is written one of two ways (the
+There is no dedicated float literal token; a float value is written one of three ways (the
 existing literal machinery — types.md §6, grammar.md §36):
 
 - **A decimal literal adapting to a float context.** A `.`-bearing numeric constant is an
@@ -187,6 +187,19 @@ existing literal machinery — types.md §6, grammar.md §36):
   **`Infinity`/`+Infinity`/`-Infinity`/`inf`/`NaN`** (PG's `float8in` spellings). Malformed
   input traps **`22P02`** (`invalid_text_representation`) deterministically at resolve, before
   any row is scanned; a value outside the binary64 range traps **`22003`**.
+- **A bare string literal adapting to a float column.** An untyped string literal stored into an
+  `f32`/`f64` column — an `INSERT … VALUES` cell or an `UPDATE … SET` value — is parsed by that
+  column's float input function, exactly as the typed literal above (same grammar, same special
+  words, binary32 rounding at `f32`), as it is for the other string-input types (`date`,
+  `timestamp`, `uuid`, … — types.md §6). This matches PostgreSQL, which resolves an `unknown`
+  literal against the target column, and it is how a `VALUES` row spells `NaN`/`±Infinity`, which
+  no bare numeric literal can. Each row of a multi-row `VALUES` adapts independently, so
+  `VALUES (1, 1.5), (2, 'Infinity')` mixes numeric and string literals in one float column.
+  Malformed input traps **`22P02`**, a finite value outside the column's range **`22003`** (at
+  store for an `INSERT` row; at resolve for an `UPDATE`/`ON CONFLICT DO UPDATE` value, like the
+  typed literal). Only a *literal* adapts: a text-typed expression (`'Inf' || 'inity'`, a text
+  column) is not assignable to a float column (`42804`, as in PostgreSQL), keeping §6's "a value
+  never silently becomes a float". (`suites/types/float_string_literal.test`.)
 
 ## 5. Arithmetic — the correctly-rounded kernel
 

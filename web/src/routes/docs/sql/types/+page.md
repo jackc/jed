@@ -236,6 +236,12 @@ The type must be **named** — a bare string never silently becomes a number, so
 a type error (`42804`). jed uses its own literal grammar, so hex, digit underscores, and `NaN` are
 rejected (`22P02`) where PostgreSQL accepts them. 
 
+One exception, as in PostgreSQL: a bare string **literal** stored into an `f32` / `f64` column — an
+`INSERT … VALUES` cell or an `UPDATE … SET` value — is read with the float's input rules, so
+`INSERT INTO t (f) VALUES ('NaN'), ('-Infinity'), (1.5)` works. It is how to write `NaN` and
+`±Infinity` without a cast. A text *expression* (a text column, `'Inf' || 'inity'`) is still a type
+error (`42804`).
+
 ## Parsing text into dates, times, intervals, and bytea
 
 A runtime `text` value also casts to **`date`**, **`timestamp`**, **`timestamptz`**, **`interval`**,

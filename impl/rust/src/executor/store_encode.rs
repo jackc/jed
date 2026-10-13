@@ -113,6 +113,14 @@ pub(crate) fn store_value(
                 // A string literal adapts to a date column (spec/design/date.md); malformed
                 // input traps 22007, an out-of-range field 22008.
                 Ok(Value::Date(parse_date(&s)?))
+            } else if col_ty.is_float32() {
+                // A string literal adapts to a float column via float's input parse (the float8in
+                // spellings — sign/digits/e-notation/Infinity/NaN; spec/design/float.md §4).
+                // Malformed input traps 22P02, out of range 22003. So `INSERT ... VALUES ('NaN')`
+                // works (a bare decimal literal cannot spell NaN/Infinity).
+                Ok(Value::Float32(parse_f32_literal(&s)?))
+            } else if col_ty.is_float64() {
+                Ok(Value::Float64(parse_f64_literal(&s)?))
             } else if col_ty.is_json() {
                 // A string literal adapts to a json column (spec/design/json.md §4): validate,
                 // store verbatim; malformed → 22P02.

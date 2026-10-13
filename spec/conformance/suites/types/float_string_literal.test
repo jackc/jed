@@ -1,0 +1,157 @@
+# A bare (untyped) string literal ADAPTS to an f32/f64 column on INSERT/UPDATE (spec/design/float.md
+# §4): the string is parsed by the column's float input function — the same parse as `f64 '…'` /
+# CAST('…' AS f64), PostgreSQL's float8in/float4in spellings. It is how a VALUES row spells
+# NaN/±Infinity, which no bare numeric literal can. Each row of a multi-row VALUES adapts on its own,
+# so string and numeric literals mix freely in one column. Malformed input traps 22P02; a finite value
+# outside the column's range traps 22003. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.insert_on_conflict, query.select, query.where_eq, query.order_by, query.aggregates, expr.text_concat, types.f32, types.f64, types.i32
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, d f64, r f32)
+
+# --- single-row VALUES: the special words, both widths ------------------------------------------
+statement ok
+INSERT INTO p VALUES (1, 'NaN', 'NaN')
+
+statement ok
+INSERT INTO p VALUES (2, 'Infinity', '-Infinity')
+
+statement ok
+INSERT INTO p (id, d, r) VALUES (3, '-inf', '+inf')
+
+# case-insensitive, surrounding whitespace trimmed
+statement ok
+INSERT INTO p VALUES (4, '  nan  ', 'INFINITY')
+
+# finite spellings: digits, a point, e-notation
+statement ok
+INSERT INTO p VALUES (5, '1.5e3', '-2.25')
+
+statement ok
+INSERT INTO p VALUES (6, '.5', '1E-2')
+
+query IRR nosort
+SELECT id, d, r FROM p ORDER BY id
+----
+1
+NaN
+NaN
+2
+Infinity
+-Infinity
+3
+-Infinity
+Infinity
+4
+NaN
+Infinity
+5
+1500
+-2.25
+6
+0.5
+0.01
+
+# --- multi-row VALUES: string literals only, and mixed with numeric literals in the same column ---
+statement ok
+INSERT INTO p VALUES (10, 'NaN', 'Infinity'), (11, '-Infinity', 'NaN')
+
+statement ok
+INSERT INTO p VALUES (12, 1.5, 2.5), (13, 'Infinity', 'NaN')
+
+statement ok
+INSERT INTO p VALUES (14, 'NaN', '-inf'), (15, 7.25, 3)
+
+statement ok
+INSERT INTO p VALUES (16, 2, 'NaN'), (17, '0.125', 0.5), (18, 'Infinity', -1)
+
+query IRR nosort
+SELECT id, d, r FROM p WHERE id >= 10 ORDER BY id
+----
+10
+NaN
+Infinity
+11
+-Infinity
+NaN
+12
+1.5
+2.5
+13
+Infinity
+NaN
+14
+NaN
+-Infinity
+15
+7.25
+3
+16
+2
+NaN
+17
+0.125
+0.5
+18
+Infinity
+-1
+
+# --- UPDATE: a string literal adapts to the assigned float column the same way --------------------
+statement ok
+UPDATE p SET d = 'Infinity', r = 'NaN' WHERE id = 12
+
+query RR nosort
+SELECT d, r FROM p WHERE id = 12
+----
+Infinity
+NaN
+
+statement ok
+UPDATE p SET d = '-1.5e-1' WHERE id = 15
+
+query R nosort
+SELECT d FROM p WHERE id = 15
+----
+-0.15
+
+# ON CONFLICT DO UPDATE assigns the same way
+statement ok
+INSERT INTO p VALUES (16, 0, 0) ON CONFLICT (id) DO UPDATE SET d = '-Infinity', r = '2.5e-1'
+
+query RR nosort
+SELECT d, r FROM p WHERE id = 16
+----
+-Infinity
+0.25
+
+# only a bare LITERAL adapts: a text-typed expression is not assignable to a float column
+statement error 42804
+UPDATE p SET d = 'Inf' || 'inity' WHERE id = 1
+
+# --- errors: malformed input is 22P02, a finite value out of range is 22003 ----------------------
+statement error 22P02
+INSERT INTO p VALUES (20, 'abc', 1)
+
+statement error 22P02
+INSERT INTO p VALUES (21, 1, 'NaNx')
+
+statement error 22P02
+INSERT INTO p VALUES (22, '', 1)
+
+# a bad string in a later row of a multi-row VALUES fails the whole statement
+statement error 22P02
+INSERT INTO p VALUES (23, 1.5, 1), (24, '1.5.5', 1)
+
+statement error 22003
+INSERT INTO p VALUES (25, '1e400', 1)
+
+statement error 22003
+INSERT INTO p VALUES (26, 1, '1e39')
+
+statement error 22P02
+UPDATE p SET r = 'infinite' WHERE id = 1
+
+query I nosort
+SELECT count(*) FROM p WHERE id >= 20
+----
+0

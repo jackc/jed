@@ -51,6 +51,7 @@ import {
 } from "./types.ts";
 import { Decimal } from "./decimal.ts";
 import { decimalCmpWork, makeFloat } from "./eval.ts";
+import { parseFloatLiteral } from "./kernels.ts";
 import {
   arraySubscriptErr,
   buildNestedArray,
@@ -142,6 +143,13 @@ export function storeValue(
       if (isDate(colTy)) return dateValue(parseDate(v.text));
       // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
       if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
+      // ... or to a float column via float's input parse (the float8in spellings — sign/digits/
+      // e-notation/Infinity/NaN; spec/design/float.md §4); malformed → 22P02, out of range → 22003.
+      // So `INSERT ... VALUES ('NaN')` works (a bare decimal literal cannot spell NaN/Infinity).
+      if (isFloat(colTy)) {
+        const n = parseFloatLiteral(v.text, colTy);
+        return colTy === "f32" ? float32Value(n) : float64Value(n);
+      }
       // ... or to a json column (spec/design/json.md §4): validate, store verbatim; malformed → 22P02.
       if (isJson(colTy)) {
         validateJson(v.text);

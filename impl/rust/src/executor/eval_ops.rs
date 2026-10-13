@@ -1106,6 +1106,28 @@ pub(crate) fn require_assignable(ty: &ResolvedType, col_ty: ScalarType, col: &st
     }
 }
 
+/// Resolve a scalar column's UPDATE / ON CONFLICT DO UPDATE value against the column's type and
+/// apply the assignability gate. A bare string literal assigned to a float column adapts through
+/// float's input parse at resolve (float.md §4) — the same adaptation INSERT VALUES applies at
+/// store. Only a *literal* adapts: a text-typed expression stays text and fails the gate (42804).
+pub(crate) fn resolve_scalar_assign(
+    scope: &Scope,
+    e: &Expr,
+    target: ScalarType,
+    col: &str,
+    params: &mut ParamTypes,
+) -> Result<RExpr> {
+    if let (true, Expr::Literal(Literal::Text(s), pos)) = (target.is_float(), e) {
+        let iz = scope.catalog.input_zone();
+        let (node, _) = coerce_string_literal(s, target, None, None, &iz)
+            .map_err(|err| err.with_position(pos.0))?;
+        return Ok(node);
+    }
+    let (source, ty) = resolve(scope, e, Some(target), &mut AggCtx::Forbidden, params)?;
+    require_assignable(&ty, target, col).map_err(|err| err.with_position(e.location().0))?;
+    Ok(source)
+}
+
 pub(crate) fn col_idx(table: &Table, name: &str) -> Result<usize> {
     table
         .column_index(name)

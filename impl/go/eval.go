@@ -947,6 +947,29 @@ func requireAssignable(t resolvedType, colTy scalarType, col string) error {
 	return nil
 }
 
+// resolveScalarAssign resolves a scalar column's UPDATE / ON CONFLICT DO UPDATE value against the
+// column's type and applies the assignability gate. A bare string literal assigned to a float
+// column adapts through float's input parse at resolve (float.md §4) — the same adaptation INSERT
+// VALUES applies at store. Only a *literal* adapts: a text-typed expression stays text and fails
+// the gate (42804).
+func resolveScalarAssign(s *scope, e exprNode, colTy scalarType, col string, params *paramTypes) (*rExpr, error) {
+	if colTy.IsFloat() && e.Kind == exprLiteral && e.Literal.Kind == literalText {
+		node, _, err := coerceStringLiteral(e.Literal.Str, colTy, nil, nil, s.catalog.inputZone())
+		if err != nil {
+			return nil, positionError(err, exprLocation(e))
+		}
+		return node, nil
+	}
+	src, ty, err := resolve(s, e, &colTy, &aggCtx{collecting: false}, params)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireAssignable(ty, colTy, col); err != nil {
+		return nil, positionError(err, exprLocation(e))
+	}
+	return src, nil
+}
+
 // resolveTypeAndTypmod resolves a column-definition or CAST target type name + optional type
 // modifier. All canonical names and aliases (including boolean/bool and numeric/decimal/dec)
 // resolve here; a genuinely unknown name is a 42704. A type modifier is meaningful only for

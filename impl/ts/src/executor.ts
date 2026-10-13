@@ -648,6 +648,36 @@ export type Outcome =
 
 // Retype an IDENTITY-owned sequence with PostgreSQL's ALTER SEQUENCE AS rules: old default bounds
 // become the new type defaults, explicit bounds are preserved, and START/current must fit.
+// resolveScalarAssign resolves a scalar column's UPDATE / ON CONFLICT DO UPDATE value against the
+// column's type and applies the assignability gate. A bare string literal assigned to a float
+// column adapts through float's input parse at resolve (float.md §4) — the same adaptation INSERT
+// VALUES applies at store. Only a *literal* adapts: a text-typed expression stays text and fails
+// the gate (42804).
+function resolveScalarAssign(
+  scope: Scope,
+  e: Expr,
+  colTy: ScalarType,
+  col: string,
+  ptypes: ParamTypes,
+): RExpr {
+  if (isFloat(colTy) && e.kind === "literal" && e.literal.kind === "text") {
+    const text = e.literal.text;
+    return atPosition(
+      exprLocation(e),
+      () => coerceStringLiteral(text, colTy, null, null, scope.catalog.inputZone()).node,
+    );
+  }
+  const { node, type } = resolve(
+    scope,
+    e,
+    colTy,
+    { collecting: false, groupKeys: [], specs: [] },
+    ptypes,
+  );
+  atPosition(exprLocation(e), () => requireAssignable(type, colTy, col));
+  return node;
+}
+
 function retypeIdentitySequence(
   existing: SequenceDef,
   oldType: SeqDataType,
@@ -11422,15 +11452,7 @@ export class Engine {
       if (a.isDefault) {
         source = defaultExprs[idx] ?? valueToRExpr(col.default ?? nullValue());
       } else {
-        const { node, type } = resolve(
-          scope,
-          a.value,
-          targetScalar,
-          { collecting: false, groupKeys: [], specs: [] },
-          ptypes,
-        );
-        atPosition(exprLocation(a.value), () => requireAssignable(type, targetScalar, a.column));
-        source = node;
+        source = resolveScalarAssign(scope, a.value, targetScalar, a.column, ptypes);
       }
       plans.push({
         idx,
@@ -12589,14 +12611,7 @@ export class Engine {
         // The RHS is a general expression evaluated against the OLD row; a literal operand
         // adapts to the target column's type. The result must be assignable to the column's
         // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-        const { node, type } = resolve(
-          scope,
-          a.value,
-          targetScalar,
-          { collecting: false, groupKeys: [], specs: [] },
-          ptypes,
-        );
-        atPosition(exprLocation(a.value), () => requireAssignable(type, targetScalar, a.column));
+        const node = resolveScalarAssign(scope, a.value, targetScalar, a.column, ptypes);
         plans.push({
           idx,
           name: col.name,

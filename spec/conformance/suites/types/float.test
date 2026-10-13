@@ -21,8 +21,9 @@ INSERT INTO t VALUES
   (2, -0.5, 100.25),
   (5, 0.0, 0.0)
 
-# Infinity / NaN have no bare-literal form, so they enter via a typed literal in INSERT ... SELECT
-# (a multi-row VALUES slot takes only bare literals this slice). Row 4 also stores a NULL f32.
+# Infinity / NaN have no bare numeric-literal form; here they enter via a typed literal in
+# INSERT ... SELECT (a bare string literal in VALUES also works — float_string_literal.test). Row 4
+# also stores a NULL f32.
 statement ok
 INSERT INTO t SELECT 3, f64 'Infinity', f32 '-Infinity'
 

@@ -807,12 +807,9 @@ func (db *engine) resolveOnConflict(table *catTable, oc *onConflict, alias *stri
 			}
 			plan.source = resolved
 		default:
-			resolved, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
+			resolved, err := resolveScalarAssign(s, a.Value, colScalar, a.Column, ptypes)
 			if err != nil {
 				return nil, err
-			}
-			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
-				return nil, positionError(err, exprLocation(a.Value))
 			}
 			plan.source = resolved
 		}
@@ -3670,12 +3667,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			// adapts to the target column's type. The result must be assignable to the column's
 			// family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
 			colScalar := scalar
-			src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
+			src, err := resolveScalarAssign(s, a.Value, colScalar, a.Column, ptypes)
 			if err != nil {
 				return outcome{}, err
-			}
-			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
-				return outcome{}, positionError(err, exprLocation(a.Value))
 			}
 			plans = append(plans, assignPlan{
 				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,

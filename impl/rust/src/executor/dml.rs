@@ -1908,16 +1908,7 @@ impl Engine {
                             ptypes,
                         )?
                     } else {
-                        let (source, ty) = resolve(
-                            &scope,
-                            &a.value,
-                            Some(target),
-                            &mut AggCtx::Forbidden,
-                            ptypes,
-                        )?;
-                        require_assignable(&ty, target, &a.column)
-                            .map_err(|e| e.with_position(a.value.location().0))?;
-                        source
+                        resolve_scalar_assign(&scope, &a.value, target, &a.column, ptypes)?
                     };
                     plans.push(AssignPlan {
                         idx,
@@ -3647,15 +3638,13 @@ impl Engine {
                     // operand adapts to the target column's type. The result must be assignable to
                     // the column's family (integer/decimal/text or NULL; never boolean; decimal→int
                     // is explicit-CAST only) — spec/design/decimal.md §6.
-                    let (source, ty) = resolve(
+                    let source = resolve_scalar_assign(
                         &scope,
                         &a.value,
-                        Some(target_scalar),
-                        &mut AggCtx::Forbidden,
+                        target_scalar,
+                        &a.column,
                         &mut ptypes,
                     )?;
-                    require_assignable(&ty, target_scalar, &a.column)
-                        .map_err(|e| e.with_position(a.value.location().0))?;
                     plans.push(AssignPlan {
                         idx,
                         name: col.name.clone(),
