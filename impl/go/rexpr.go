@@ -536,11 +536,11 @@ const (
 	// NULL array → SQL NULL). `jbJson` true ⇒ the json result (insertion order + dups + " : "
 	// spacing); false ⇒ the jsonb result (canonical: last-wins dedup + sorted keys).
 	reJsonObject
-	// reRowToJson is `row_to_json(record [, pretty])` (json-sql-functions.md §2.2): the composite
-	// record rendered as a json object. `sargs` = [record] or [record, pretty boolean]; STRICT (any
-	// NULL → SQL NULL). `recordType` is the record's static type — a composite, whose field names key
-	// the members, or rtNull for an untyped NULL argument.
-	reRowToJson
+	// reJsonImage is a JSON-image function — to_json / to_jsonb / array_to_json / row_to_json
+	// (json-sql-functions.md §2.2), selected by `jiFunc`. `sargs` = [value] or, for the array/row
+	// forms, [value, pretty boolean]; STRICT (any NULL → SQL NULL). `jiType` is the value's static type
+	// (a composite's field names key its members), or rtNull for an untyped NULL argument.
+	reJsonImage
 	// reJsonPathFn is a scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists /
 	// jsonb_path_query_first / jsonb_path_query_array. `sargs` = [ctx jsonb, path jsonpath]; STRICT
 	// (any NULL → SQL NULL). `jpFnKind` selects which function. The path is recompiled from its
@@ -833,11 +833,6 @@ const (
 	sfJsonStripNulls
 	// jsonb_pretty → an indented multi-line render.
 	sfJsonbPretty
-	// to_jsonb(anyelement) → the JSON image of any value (the valueToNode kernel). STRICT.
-	sfToJsonb
-	// to_json(anyelement) → the JSON image as `json` (the valueToNode kernel rendered per elemJsonText:
-	// a jsonb input canonical-spaced, a json input verbatim, everything else compact). STRICT.
-	sfToJson
 	// json_scalar(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
 	// Other source types (date/timestamp/uuid/bytea/interval/float) are a deferred 0A000.
 	sfJsonScalar
@@ -950,7 +945,6 @@ const (
 	afReplace                      // array_replace(anyarray, anyelement, anyelement) → anyarray; any dim, shape preserved
 	afPosition                     // array_position(anyarray, anyelement[, integer]) → i32; 1-D/empty (0A000); NULL start 22004
 	afPositions                    // array_positions(anyarray, anyelement) → i32[]; 1-D/empty only (0A000)
-	afToJson                       // array_to_json(anyarray) → json; compact to_jsonb kernel; STRICT; multidim 0A000
 	afContains                     // a @> b (anyarray, anyarray) → boolean; does a contain b; strict eq; any dim (§10)
 	afContainedBy                  // a <@ b (anyarray, anyarray) → boolean; is a contained by b (b @> a) (§10)
 	afOverlaps                     // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
@@ -1041,6 +1035,16 @@ type jsonBuildKind int
 const (
 	jbArray  jsonBuildKind = iota // json[b]_build_array — every argument is one array element (NULL → JSON null)
 	jbObject                      // json[b]_build_object — alternating key/value args (odd count / NULL key → 22023)
+)
+
+// jsonImageFunc selects which JSON-image function an reJsonImage node is (json-sql-functions.md §2.2).
+type jsonImageFunc int
+
+const (
+	jiToJson      jsonImageFunc = iota // to_json(anyelement) → the value's json image
+	jiToJsonb                          // to_jsonb(anyelement) → the value's jsonb image
+	jiArrayToJson                      // array_to_json(anyarray [, pretty]) → the array's json image
+	jiRowToJson                        // row_to_json(record [, pretty]) → the composite's json object
 )
 
 // jsonSqlKind selects which SQL/JSON query function an reJsonSqlFn node is (json-sql-functions.md §5).
@@ -1180,8 +1184,12 @@ type rExpr struct {
 	psMode pathSetMode
 	psLax  bool
 
-	// reRowToJson: the record argument's static type (its field names key the object's members).
-	recordType *resolvedType
+	// reJsonImage: which JSON-image function, and the value argument's static type (its field names
+	// key a composite's members).
+	jiFunc jsonImageFunc
+	jiType *resolvedType
+	// reJsonBuild: each argument's static type (the VARIADIC-array form: the lone array's type).
+	jbTypes []resolvedType
 
 	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
 	// arrays, stacked into one higher dimension — spec/design/array.md §4).

@@ -22,11 +22,9 @@ import {
   emptyArray,
   float64Value,
   intValue,
-  jsonValue,
   nullValue,
   textValue,
 } from "./value.ts";
-import { checkDepth as jsonCheckDepth, jsonCompactOut } from "./json.ts";
 import { type QueryAccount, StateCharge } from "./cost.ts";
 import { entryBytes, payloadBytes, valueBytes } from "./memsize.ts";
 import { COSTS } from "./costs.ts";
@@ -36,7 +34,6 @@ import {
   promote,
   resolvedTypeEqual,
   rtName,
-  valueToNode,
 } from "./executor.ts";
 import { classifyComparable } from "./kernels.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
@@ -128,16 +125,6 @@ export function evalArrayFunc(func: ArrayFuncName, vals: Value[], m: Meter): Val
       return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
     case "array_positions":
       return arrayPositionsValue(vals[0]!, vals[1]!);
-    case "array_to_json": {
-      // array_to_json(anyarray) → the array's compact JSON image (the to_jsonb node kernel). STRICT;
-      // a multidimensional array propagates the to_jsonb 0A000.
-      const a = vals[0]!;
-      if (a.kind === "null") return nullValue();
-      // An array of json/jsonb elements nests them one level (json.md §6.4).
-      const node = valueToNode(a);
-      jsonCheckDepth(node);
-      return jsonValue(jsonCompactOut(node));
-    }
     case "contains":
       return arrayContainsValue(vals[0]!, vals[1]!);
     case "contained_by":

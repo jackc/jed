@@ -3060,8 +3060,8 @@ export function renderRExpr(e: RExpr): string {
       return renderExplainJsonSql(e);
     case "jsonObjectFromArrays":
       return explainCall(e.json ? "json_object" : "jsonb_object", e.args);
-    case "rowToJson":
-      return explainCall("row_to_json", e.args);
+    case "jsonImage":
+      return explainCall(e.func, e.args);
     case "jsonSetInsert":
       return explainCall(e.lax ? "jsonb_set_lax" : `jsonb_${e.mode}`, e.args);
     case "jsonBuild":

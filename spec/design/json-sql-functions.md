@@ -78,15 +78,15 @@ Cost is the jsonb accessors' (one `operator_eval`); the scan is bounded by the i
 
 ## 2. Scalar processing & builder functions
 
-New scalar `[[operator]]` rows (`kind = "function"`); hand-written kernels. `to_json`/
-`to_jsonb` and the builders use the polymorphic `anyelement` resolution the array surface
-already built.
+New scalar `[[operator]]` rows (`kind = "function"`); hand-written kernels. The builders take
+`VARIADIC "any"`; `to_json`, `to_jsonb`, and `array_to_json` are hand-resolved over their catalog
+rows, because the conversion needs the argument's static type (§2.2).
 
 | function | signature | result | notes |
 |---|---|---|---|
-| `to_json(anyelement)` / `to_jsonb(anyelement)` | any value | `json` / `jsonb` | any jed value → its JSON image; uses `anyelement` resolution |
+| `to_json(anyelement)` / `to_jsonb(anyelement)` | any value | `json` / `jsonb` | any jed value → its JSON image (§2.2) |
 | `json_build_array(VARIADIC "any")` / `jsonb_build_array` | variadic | `json`/`jsonb` | array from heterogeneous args (existing `variadic` facility) |
-| `json_build_object(VARIADIC "any")` / `jsonb_build_object` | variadic key/value pairs | `json`/`jsonb` | odd arg count → `22023` |
+| `json_build_object(VARIADIC "any")` / `jsonb_build_object` | variadic key/value pairs | `json`/`jsonb` | odd arg count → `22023`; keys and values per §2.2 |
 | `json_object(text[])` / `json_object(text[], text[])` / `jsonb_object(…)` | text array(s) | `json`/`jsonb` | the one-array (k,v,…) and two-array (keys, values) forms |
 | `json_array_length(json)` / `jsonb_array_length(jsonb)` | array | `i32` | `22023` on non-array |
 | `json_typeof(json)` / `jsonb_typeof(jsonb)` | any | `text` | `object`/`array`/`string`/`number`/`boolean`/`null` (SQL NULL → SQL NULL) |
@@ -96,7 +96,7 @@ already built.
 | `jsonb_insert(jsonb, text[], jsonb [, insert_after bool])` | | `jsonb` | insert at path |
 | `jsonb_pretty(jsonb)` | any | `text` | indented render |
 | `row_to_json(record [, pretty bool])` | composite | `json` | composite value → object (§2.2) |
-| `array_to_json(anyarray [, pretty bool])` | array | `json` | array value → JSON array |
+| `array_to_json(anyarray [, pretty bool])` | array | `json` | array value → JSON array (§2.2) |
 
 **The path mutators' signatures.** `jsonb_set`, `jsonb_set_lax`, and `jsonb_insert` are resolved by
 name, not from catalog rows: the `text[]` path takes a bare `'{a,b}'` literal, the value takes a bare
@@ -163,19 +163,72 @@ check (jsonb_set_lax: the order above), the checks run in PostgreSQL's order:
 scalar`, and then **skips** a NULL key. The extractors differ: `#>`, `#>>` (jsonb and the verbatim
 json overloads, §1.1) return SQL NULL when the path holds any NULL element.
 
-### 2.2 `row_to_json(record [, pretty boolean])`
+### 2.2 The JSON image of a value
 
-`row_to_json` renders a composite value as a `json` object. It is a port of PostgreSQL's
-`composite_to_json` and `datum_to_json` (json.c). The function is hand-resolved: the catalog has no
-`record` family.
+`to_json`, `to_jsonb`, `array_to_json`, `row_to_json`, the builders, and the aggregates (§4) convert
+their arguments with one rule, a port of PostgreSQL's `datum_to_json` (json.c) and `datum_to_jsonb`
+(jsonb.c). Each core implements it once (`row_json.rs` / `row_json.go` / `row_json.ts`). The
+conversion reads the argument's static type, because a composite's field names key its members. So
+the four functions are hand-resolved, and the builders and aggregates carry their arguments' types to
+evaluation. The catalog rows of `to_json`, `to_jsonb`, and `array_to_json` remain as data; `row_to_json`
+has none, because the catalog has no `record` family.
 
-**The argument.** A named composite takes its member names from the type's fields. An anonymous
-`ROW(…)` names its fields `f1`, `f2`, …, as PostgreSQL does. The argument must be a composite.
-An untyped `NULL` is accepted and yields `NULL`. A bare string literal is `0A000` `input of anonymous
-composite types is not implemented`, because PostgreSQL reads it as an anonymous `record`. Any
-other type is `42883`. The optional flag must be a boolean; a bare string literal adapts to it.
-Any other flag type, and any other argument count, is `42883`. The function is STRICT: a `NULL`
-record or flag yields `NULL`.
+**The value's JSON image:**
+
+| Value | `json` image | `jsonb` image |
+|---|---|---|
+| `NULL` (a field, element, or builder argument) | `null` | `null` |
+| `boolean` | `true` / `false` | the same |
+| integer, `decimal` | the number's text, exact (`1.50` keeps its scale) | a number, exact |
+| `text` | an escaped JSON string (`\"`, `\\`, `\n`, `\t`, …, other controls as `\u00XX`) | a string |
+| `json` | the value's text, verbatim | the parsed document (duplicate keys collapse, the last wins) |
+| `jsonb` | the canonical, spaced text (`{"a": 1}`) | the value itself |
+| array | `[`…`]` with `,` separators, elements by these rules. A multidimensional array nests one level per dimension; the lower bounds are dropped; an empty array is `[]` | nested arrays, the same shape |
+| composite | an object, `{"name":value,…}` in declaration order | an object in canonical key order (json.md §2.3) |
+| `date` | `"2024-01-15"` (a BC date keeps its ` BC` suffix) | the same string |
+| `timestamp` | ISO 8601 with a `T` separator: `"2024-01-15T10:30:00.5"`, fraction trimmed, ` BC` suffix | the same string |
+| `timestamptz` | in the session zone, with an offset of at least hours and minutes: `"2024-01-15T17:30:00+05:30"`, `"…+00:00"`, an LMT `"…-04:56:02"` | the same string |
+| `interval`, `uuid`, `bytea`, range, `jsonpath` | the JSON string of the type's text output (`"1 day 02:00:00"`, `"\\x0102"`, `"[1,5)"`). A `timestamptz` range bound renders in the session zone | the same string |
+| `f32` / `f64` | `0A000` (below) | `0A000` |
+
+The datetime forms are PostgreSQL's `JsonEncodeDateTime` (the `XSD` date style). They differ from
+the text output in two places: the `T` separator, and a `timestamptz` offset that always shows
+minutes. `±infinity` renders as the words `"infinity"` and `"-infinity"`. A `json` value renders as
+`json` text inside an array or composite, so `to_json(ARRAY['{"a" :1}'::json])` is `[{"a" :1}]`; a `jsonb`
+element renders spaced, so `to_json(ARRAY['{"a":1}'::jsonb])` is `[{"a": 1}]`.
+
+**The functions.**
+
+- `to_json(anyelement)` is the value's `json` image; `to_jsonb(anyelement)` its `jsonb` image. Any type
+  is accepted. Both are STRICT.
+- `array_to_json(anyarray [, pretty boolean])` is an array's `json` image. With `pretty = true`, the
+  items of the outermost dimension are separated by `,\n ` (a comma, a newline, and one space). Inner
+  dimensions and the elements never break lines.
+- `row_to_json(record [, pretty boolean])` is a composite's `json` object. A named composite takes its
+  member names from the type's fields. An anonymous `ROW(…)` names its fields `f1`, `f2`, …, as
+  PostgreSQL does. `ROW()` renders as `{}`. With `pretty = true`, the separator between top-level
+  members is `,\n `; nested composites and arrays never break lines.
+
+`array_to_json` must take an array and `row_to_json` a composite. An untyped `NULL` is accepted and
+yields `NULL`. A bare string literal passed to `row_to_json` is `0A000` `input of anonymous composite
+types is not implemented`, because PostgreSQL reads it as an anonymous `record`. Any other argument type
+is `42883`. The optional flag must be a boolean; a bare string literal adapts to it (`22P02` if it is
+not a boolean). Any other flag type, and any other argument count, is `42883`. A `NULL` argument or
+flag yields `NULL`.
+
+**Object keys.** `json[b]_build_object` and `json[b]_object_agg` (§4) take any scalar as a key, and a
+key is always a JSON string. A number or boolean is its text (`1.50` → `"1.50"`, `true` → `"true"`). A
+`date`, `timestamp`, or `timestamptz` is its ISO 8601 form above, without the quotes. Any other scalar is
+its text output. An array, composite, `json`, or `jsonb` key is `22023` `key value must be scalar, not
+array, composite, or json`. A NULL key is an error, as in PostgreSQL: `json_build_object` and
+`json_object_agg` give `22004` `null value not allowed for object key`; `jsonb_build_object` gives
+`22023` `argument N: key must not be null`; `jsonb_object_agg` gives `22023` `field name must not be
+null`.
+
+**Builders.** `json_build_array` joins its arguments' `json` images with `, ` inside `[`…`]`.
+`json_build_object` writes `key : value` pairs joined with `, ` inside `{`…`}`, in argument order, with
+duplicate keys kept. The `jsonb` builders build the `jsonb` images; `jsonb_build_object` keeps the last of
+duplicate keys. In the `VARIADIC`-array form, each element is converted by the array's element type.
 
 **Whole-row references are not expressible.** PostgreSQL's common `row_to_json(t)` passes a table
 alias as its row. jed has no implicit per-table row type ([composite.md](composite.md) §10.4) and
@@ -183,54 +236,28 @@ no row-valued table reference ([grammar.md](grammar.md) §15). There, `t` resolv
 column (`42703`). Use a composite column or `ROW(t.a, t.b, …)` instead. This divergence is
 recorded in the override ledger.
 
-**The object.** The output is `{`, then one `"name":value` member per field in declaration order,
-then `}`. The name is escaped as a JSON string. Members are separated by `,` with no spaces. With
-`pretty = true`, the separator between **top-level** members is `,\n ` (a comma, a newline, and
-one space). Nested composites and arrays never break lines. `ROW()` renders as `{}`.
+**Floats are a deferred `0A000`.** PostgreSQL writes the `float8out` text as a JSON number (`to_jsonb`
+parses it to a `numeric`) and as a key's text. jed keeps binary floats out of its byte-identical text
+outputs, because each core's shortest round-trip layout differs ([determinism.md](determinism.md),
+`float-render-layout`). That ledger entry covers a float result cell and an explicit `CAST(float AS
+text)`, not a float inside a JSON document, so a float source, element, field, key, or aggregate input
+is `0A000`. This divergence is recorded in the override ledger.
 
-**Each field's value** follows PostgreSQL's `datum_to_json`:
+**Session zone.** A `timestamptz` anywhere in an argument's type (the value itself, an array element,
+a field, a range bound, at any depth) is rendered in the session zone. Such a call to `to_json`,
+`to_jsonb`, `array_to_json`, `row_to_json`, or a builder is nonimmutable: it is `42P17` in an index
+expression or predicate. Other calls are admitted, under the per-operation dependency rule of
+[index-dependencies.md](index-dependencies.md). PostgreSQL marks these functions STABLE for every
+argument.
 
-| Field | JSON |
-|---|---|
-| `NULL` | `null` |
-| `boolean` | `true` / `false` |
-| integer, `decimal` | the number's text, exact (`1.50` keeps its scale) |
-| `text` | an escaped JSON string (`\"`, `\\`, `\n`, `\t`, …, other controls as `\u00XX`) |
-| `json` | the value's text, verbatim |
-| `jsonb` | the canonical, spaced text (`{"a": 1}`) |
-| array | `[`…`]` with `,` separators, elements by these rules. A multidimensional array nests one level per dimension; the lower bounds are dropped; an empty array is `[]` |
-| composite | a nested object, rendered the same way |
-| `date` | `"2024-01-15"` (a BC date keeps its ` BC` suffix) |
-| `timestamp` | ISO 8601 with a `T` separator: `"2024-01-15T10:30:00.5"`, fraction trimmed, ` BC` suffix |
-| `timestamptz` | in the session zone, with an offset of at least hours and minutes: `"2024-01-15T17:30:00+05:30"`, `"…+00:00"`, an LMT `"…-04:56:02"` |
-| `interval`, `uuid`, `bytea`, range, `jsonpath` | the JSON string of the type's text output (`"1 day 02:00:00"`, `"\\x0102"`, `"[1,5)"`). A `timestamptz` range bound renders in the session zone |
-| `f32` / `f64` | `0A000` (below) |
-
-The datetime forms are PostgreSQL's `JsonEncodeDateTime` (the `XSD` date style). They differ from
-the text output in two places: the `T` separator, and a `timestamptz` offset that always shows
-minutes. `±infinity` renders as the words `"infinity"` and `"-infinity"`.
-
-**Float fields are a deferred `0A000`.** `to_json` and `to_jsonb` defer a float source too.
-PostgreSQL writes the `float8out` text as a JSON number. jed keeps binary floats out of its
-byte-identical text outputs, because each core's shortest round-trip layout differs
-([determinism.md](determinism.md), `float-render-layout`). This divergence is recorded in the
-override ledger.
-
-**Session zone.** A `timestamptz` anywhere in the argument's type (a field, an array element, a
-range bound, at any depth) is rendered in the session zone. Such a call is nonimmutable: it is
-`42P17` in an index expression or predicate. Other calls are admitted, under the per-operation
-dependency rule of [index-dependencies.md](index-dependencies.md). PostgreSQL marks `row_to_json`
-STABLE for every argument.
-
-**Cost.** One `operator_eval` for the call. Then one `timezone` unit per finite `timestamptz`
-rendered, charged and guarded before rendering, as for the array → text cast
-([timezones.md](timezones.md) §9.5). The function is a growth kernel ([cost.md](cost.md) §8.1): it
-charges `scalar_byte` × the result's UTF-8 bytes, and nothing when every argument is constant. The
-result passes the textual depth check ([json.md](json.md) §6.4), since a `jsonb` field can nest deep.
-
-`row_to_json(x)` is `to_json(x)` for a composite in PostgreSQL. jed's `to_json` and `to_jsonb` still
-defer composite, datetime, `uuid`, `bytea`, `interval`, and range sources (`0A000`). `row_to_json`
-does not share their kernel.
+**Cost.** Each function charges one `operator_eval` for the call; a builder also charges one
+`operator_eval` per argument value. Then each finite `timestamptz` rendered charges one `timezone`
+unit, charged and guarded before rendering, as for the array → text cast ([timezones.md](timezones.md)
+§9.5). An aggregate charges the `timezone` units of each input (key and value) as it folds it, with its
+`generated_row`. The functions and builders are growth kernels ([cost.md](cost.md) §8.1): they charge
+`scalar_byte` × the result's payload (`json`: UTF-8 bytes), and nothing when every argument is
+constant. A result passes the depth check ([json.md](json.md) §6.4), since a `jsonb` field or element
+can nest deep.
 
 ---
 
@@ -283,7 +310,11 @@ share **one duplicate-key kernel** (§6.2).
 | `json_object_agg_unique` / `jsonb_object_agg_unique` | k, v | `json`/`jsonb` | `22030` on duplicate key (shared kernel §6.2) |
 | `json_object_agg_unique_strict` / `jsonb_object_agg_unique_strict` | k, v | | both unique + strict |
 
-`json_object_agg` with a NULL key → `22023` (*"field name must not be null"*, PG); ordering inside the
+Each input is converted as it is folded, by the rule of §2.2 (keys too). `json_agg` joins the element
+images with `, `; an array or composite element after the first also starts a new line (`, ` then
+`\n `), as PostgreSQL's `json_agg_transfn` does. `json_object_agg` writes `key : value` pairs joined
+with `, ` inside padded braces, `{ "a" : 1, "b" : 2 }`. A NULL key is `22004` for `json_object_agg` and
+`22023` (*"field name must not be null"*) for `jsonb_object_agg`, as in PostgreSQL; ordering inside the
 aggregate follows any `ORDER BY` in the aggregate call (`jsonb_agg(x ORDER BY y)`,
 `jsonb_object_agg(k, v ORDER BY ts)` — the generic in-aggregate `ORDER BY`, [aggregates.md](aggregates.md)
 §22), so `jsonb_object_agg`'s last-wins duplicate key is the last in key order. `DISTINCT` and `FILTER`

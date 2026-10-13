@@ -567,8 +567,14 @@ export type LaneAt = (j: number, col: number) => Value;
 // state, hence finalizeAcc, to the scalar path), charging aggregateAccumulate once per (survivor × spec)
 // in bulk — the identical total to the scalar loop (per row × spec), cost-safe because the caller gates
 // to the unmetered lane (no per-row guard to preserve).
-export function foldAggWhole(specs: AggSpec[], at: LaneAt, nsurv: number, meter: Meter): Value[] {
-  const accs = specs.map((s) => newAccFromSpec(s));
+export function foldAggWhole(
+  specs: AggSpec[],
+  at: LaneAt,
+  nsurv: number,
+  zone: ZoneRef,
+  meter: Meter,
+): Value[] {
+  const accs = specs.map((s) => newAccFromSpec(s, zone));
   // The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
   const charge = meter.stateCharge();
   if (charge.active()) charge.reserve(meter, entryBytes([]));
@@ -597,6 +603,7 @@ export function groupByIntKey(
   keyCol: number,
   at: LaneAt,
   nsurv: number,
+  zone: ZoneRef,
   meter: Meter,
 ): Value[][] {
   const groups: { key: Value; accs: Acc[] }[] = [];
@@ -616,7 +623,7 @@ export function groupByIntKey(
         if (charge.active()) charge.reserve(meter, entryBytes([kv]));
         gi = groups.length;
         index.set(kv.int, gi);
-        groups.push({ key: kv, accs: specs.map((s) => newAccFromSpec(s)) });
+        groups.push({ key: kv, accs: specs.map((s) => newAccFromSpec(s, zone)) });
       } else {
         gi = g;
       }
@@ -626,7 +633,7 @@ export function groupByIntKey(
       if (nullGi < 0) {
         if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
         nullGi = groups.length;
-        groups.push({ key: nullValue(), accs: specs.map((s) => newAccFromSpec(s)) });
+        groups.push({ key: nullValue(), accs: specs.map((s) => newAccFromSpec(s, zone)) });
       }
       gi = nullGi;
     }

@@ -41,8 +41,8 @@ func blockingAccRow(a *acc) storedRow {
 	}
 }
 
-func blockingAccFromRow(spec aggSpec, r storedRow) *acc {
-	a := newAccFromSpec(spec)
+func blockingAccFromRow(spec aggSpec, r storedRow, zone ZoneRef) *acc {
+	a := newAccFromSpec(spec, zone)
 	if a.ordered {
 		return a
 	}
@@ -106,7 +106,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 	fresh := func(ordinal int64) storedRow {
 		state := storedRow{IntValue(ordinal)}
 		for _, spec := range p.aggSpecs {
-			state = append(state, CompositeValue(blockingAccRow(newAccFromSpec(spec))))
+			state = append(state, CompositeValue(blockingAccRow(newAccFromSpec(spec, env.exec.session.timeZone))))
 		}
 		return state
 	}
@@ -214,7 +214,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 						}
 						continue
 					}
-					a := blockingAccFromRow(spec, *state[si+1].composite())
+					a := blockingAccFromRow(spec, *state[si+1].composite(), env.exec.session.timeZone)
 					if err := blockingFold(a, v, m, unique, []Value{state[0], IntValue(int64(si))}, collections, owner); err != nil {
 						return err
 					}
@@ -239,7 +239,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 					}
 				}
 				for si, spec := range p.aggSpecs {
-					a := blockingAccFromRow(spec, *state[si+1].composite())
+					a := blockingAccFromRow(spec, *state[si+1].composite(), env.exec.session.timeZone)
 					v, err := db.finalizeSpilledAcc(a, spec, out, collections, group*nspecs+uint64(si), env, m)
 					if err != nil {
 						return err
@@ -283,15 +283,15 @@ func blockingFold(a *acc, v Value, m *costMeter, unique *stateMap, prefix []Valu
 	}
 	// The retained input now lives in the collection rows; drop it from the accumulator so a
 	// long-lived one (an ordered aggregate's finalize fold) never re-retains it.
-	a.jsonNodes, a.objPairs, a.osaVals, a.osaFloats = nil, nil, nil, nil
+	a.jsonElems, a.objPairs, a.osaVals, a.osaFloats = nil, nil, nil, nil
 	return nil
 }
 
 // blockingRetain moves what a fold retained (JSON elements, object pairs, ordered-set values) out of
 // the unpacked accumulator into its group's collection rows.
 func blockingRetain(a *acc, owner uint64, collections *hashRows) error {
-	for i := range a.jsonNodes {
-		if err := collections.push(owner, storedRow{JsonbValue(a.jsonNodes[i])}); err != nil {
+	for i := range a.jsonElems {
+		if err := collections.push(owner, storedRow{a.jsonElems[i]}); err != nil {
 			return err
 		}
 	}
@@ -336,7 +336,7 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			return NullValue(), err
 		}
 		defer sorted.close()
-		inner := newAccFromSpecUnordered(spec)
+		inner := newAccFromSpecUnordered(spec, env.exec.session.timeZone)
 		unique := newStateMap(db)
 		defer unique.close()
 		folded := newHashRows(db)
@@ -428,15 +428,13 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			return NullValue(), nil
 		}
 		if a.jsonAsJSON {
+			breaks := jsonAggBreaksLine(a.jsonTypes[0])
 			var out strings.Builder
 			out.WriteByte('[')
-			first := true
+			i := 0
 			err := collections.each(owner, func(row storedRow) error {
-				if !first {
-					out.WriteString(", ")
-				}
-				first = false
-				out.WriteString(jsonbOut(row[0].jsonb()))
+				writeJSONAggElem(&out, i, row[0], breaks)
+				i++
 				return nil
 			})
 			if err != nil {
@@ -466,20 +464,10 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 		if a.jsonAsJSON {
 			var out strings.Builder
 			out.WriteString("{ ")
-			first := true
+			i := 0
 			err := collections.each(owner, func(row storedRow) error {
-				img, err := elemJsonText(row[1])
-				if err != nil {
-					return err
-				}
-				if !first {
-					out.WriteString(", ")
-				}
-				first = false
-				n := JsonNode{Kind: JString, S: row[0].str()}
-				out.WriteString(jsonCompactOut(&n))
-				out.WriteString(" : ")
-				out.WriteString(img)
+				writeJSONObjectAggPair(&out, i, row[0].str(), row[1])
+				i++
 				return nil
 			})
 			if err != nil {
@@ -491,18 +479,13 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			}
 			return JsonValue(out.String()), nil
 		}
-		// Convert every input value in original order before sorting/dedup, including overwritten
-		// duplicate keys: conversion errors retain their visitation order. The sort orders keys
+		// The values were converted as they were folded, in input order. The sort orders keys
 		// canonically (length, then bytes); within a key it is stable, so the last value wins.
 		s := db.newSorterFor([]orderSlot{{idx: 0}, {idx: 1}})
 		defer s.close()
 		err := collections.each(owner, func(row storedRow) error {
 			key := row[0].str()
-			node, err := valueToNode(row[1])
-			if err != nil {
-				return err
-			}
-			return s.push(storedRow{IntValue(int64(len(key))), TextValue(key), JsonbValue(node)})
+			return s.push(storedRow{IntValue(int64(len(key))), TextValue(key), row[1]})
 		})
 		if err != nil {
 			return NullValue(), err

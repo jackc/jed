@@ -55,6 +55,7 @@ import type {
   DeleteKind,
   HasKeyKind,
   JsonGetOp,
+  JsonImageFunc,
   JsonPathFnKind,
   JsonSqlKind,
   QueryPlan,
@@ -135,14 +136,7 @@ import { parseTimestamp } from "./timestamp.ts";
 import type { InputZone } from "./timezone.ts";
 import { dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval } from "./interval.ts";
-import {
-  jsonCompactOut,
-  jsonbIn,
-  jsonbOut,
-  parsePreservingJson,
-  parseShapeJson,
-  validateJson,
-} from "./json.ts";
+import { jsonbIn, parsePreservingJson, parseShapeJson, validateJson } from "./json.ts";
 import {
   compile as jsonPathCompile,
   compileMetered as jsonPathCompileMetered,
@@ -3206,99 +3200,6 @@ export function jsonPredKindMatches(node: JsonNode, kind: JsonPredicateKind): bo
   }
 }
 
-// valueToNode is the JSON image of any value — the to_jsonb kernel (json-sql-functions.md §2), also
-// reused by the json aggregates (B4). Numbers stay exact (decimal, never float); a json/jsonb value
-// canonicalizes; a 1-D array maps to a JSON array recursively (a NULL element → JSON null). The
-// type-info-dependent / float-divergent sources — composite (needs field names), float (the
-// binary→decimal divergence), datetime/uuid/bytea/interval (string-render divergences), and a
-// multidimensional array — are a deferred 0A000 follow-on.
-export function valueToNode(v: Value): JsonNode {
-  switch (v.kind) {
-    case "null": // an array element (a top-level NULL is strict-propagated)
-      return { kind: "null" };
-    case "bool":
-      return { kind: "bool", value: v.value };
-    case "int":
-      return { kind: "number", dec: Decimal.fromBigInt(v.int) };
-    case "decimal":
-      return { kind: "number", dec: v.dec };
-    case "text":
-      return { kind: "string", value: v.text };
-    case "jsonb":
-      return v.node;
-    case "json":
-      return jsonbIn(v.text);
-    case "array": {
-      if (v.dims.length > 1) {
-        throw engineError(
-          "feature_not_supported",
-          "to_jsonb of a multidimensional array is not supported yet",
-        );
-      }
-      const elements = v.elements.map((e) => valueToNode(e));
-      return { kind: "array", elements };
-    }
-    case "f32":
-    case "f64":
-      throw engineError("feature_not_supported", "to_jsonb of a float value is not supported yet");
-    case "composite":
-      throw engineError(
-        "feature_not_supported",
-        "to_jsonb of a composite value is not supported yet",
-      );
-    case "uuid":
-    case "date":
-    case "timestamp":
-    case "timestamptz":
-    case "interval":
-    case "bytea":
-      throw engineError("feature_not_supported", "to_jsonb of this type is not supported yet");
-    case "range":
-      throw engineError("feature_not_supported", "to_jsonb of a range value is not supported yet");
-    case "jsonpath":
-      throw engineError(
-        "feature_not_supported",
-        "to_jsonb of a jsonpath value is not supported yet",
-      );
-    default: // unfetched
-      throw new Error("BUG: unfetched large value escaped the storage layer");
-  }
-}
-
-// elemJsonText is one element's `json`-builder text image (json-sql-functions.md §2): a `json` value
-// embeds VERBATIM, a `jsonb` value its canonical (spaced) render, everything else the compact
-// to_jsonb image (valueToNode → jsonCompactOut). This is how PG's json_build_array/json_build_object
-// (and to_json) embed an argument's own json form.
-export function elemJsonText(v: Value): string {
-  if (v.kind === "json") return v.text;
-  if (v.kind === "jsonb") return jsonbOut(v.node);
-  return jsonCompactOut(valueToNode(v));
-}
-
-// objectKeyText is the text form of a `json[b]_build_object` KEY argument (1-based `pos` for the
-// error message). PG coerces a key to text via the type's output: text as-is, integer/decimal/boolean
-// rendered. A NULL key is `22023`; a non-scalar key type is a deferred `0A000` follow-on. jed integers
-// are bigint, rendered via toString (never a float path — CLAUDE.md §2).
-export function objectKeyText(v: Value, pos: number): string {
-  switch (v.kind) {
-    case "null":
-      throw engineError("invalid_parameter_value", `argument ${pos}: key must not be null`);
-    case "text":
-      return v.text;
-    case "int":
-      return v.int.toString();
-    case "decimal":
-      return v.dec.render();
-    case "bool":
-      return v.value ? "true" : "false";
-    default:
-      throw engineError(
-        "feature_not_supported",
-        "a json_build_object key of this type is not supported yet",
-      );
-  }
-}
-
 // objectKeyNull is the `22004` raised when a `json_object` / `jsonb_object` key element is NULL.
 export function objectKeyNull(): EngineError {
   return engineError("null_value_not_allowed", "null value not allowed for object key");
@@ -3658,30 +3559,38 @@ export function resolveJsonObject(
   };
 }
 
-// resolveRowToJson resolves `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) →
-// json. The record is any composite (named or an anonymous ROW(…)) or an untyped NULL; a bare string
-// literal is PG's anonymous `record`, which has no input function (0A000); any other type is 42883.
-// The optional flag is a boolean (a bare string literal adapts). A timestamptz anywhere in the
-// record's type renders in the session zone, which makes the call nonimmutable (42P17 in an index
-// expression).
-export function resolveRowToJson(
+// resolveJsonImage resolves a JSON-image function (json-sql-functions.md §2.2) → json (to_jsonb:
+// jsonb): to_json(anyelement) / to_jsonb(anyelement) take any value; array_to_json(anyarray [, pretty])
+// an array; row_to_json(record [, pretty]) any composite (named or an anonymous ROW(…)). An untyped
+// NULL is accepted (STRICT → NULL). For row_to_json a bare string literal is PG's anonymous `record`,
+// which has no input function (0A000); any other wrong type is 42883. The optional flag is a boolean
+// (a bare string literal adapts). A timestamptz anywhere in the value's type renders in the session
+// zone, which makes the call nonimmutable (42P17 in an index expression).
+export function resolveJsonImage(
   scope: Scope,
+  func: JsonImageFunc,
   args: Expr[],
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (args.length === 0 || args.length > 2) throw noFuncOverload("row_to_json");
-  if (isStringLiteral(args[0])) {
+  const takesFlag = func === "array_to_json" || func === "row_to_json";
+  if (args.length === 0 || args.length > (takesFlag ? 2 : 1)) throw noFuncOverload(func);
+  if (func === "row_to_json" && isStringLiteral(args[0])) {
     throw engineError(
       "feature_not_supported",
       "input of anonymous composite types is not implemented",
     );
   }
-  const record = resolve(scope, args[0], null, ag, params);
-  if (record.type.kind !== "composite" && record.type.kind !== "null") {
-    throw noFuncOverload("row_to_json");
-  }
-  const rargs: RExpr[] = [record.node];
+  const value = resolve(scope, args[0], null, ag, params);
+  const k = value.type.kind;
+  const admitted =
+    func === "array_to_json"
+      ? k === "array" || k === "null"
+      : func === "row_to_json"
+        ? k === "composite" || k === "null"
+        : true;
+  if (!admitted) throw noFuncOverload(func);
+  const rargs: RExpr[] = [value.node];
   if (args.length === 2) {
     const flag = args[1];
     if (flag.kind === "literal" && flag.literal.kind === "text") {
@@ -3689,14 +3598,14 @@ export function resolveRowToJson(
       rargs.push({ kind: "constBool", value: parseBoolLiteral(flag.literal.text) });
     } else {
       const f = resolve(scope, flag, "boolean", ag, params);
-      if (f.type.kind !== "bool" && f.type.kind !== "null") throw noFuncOverload("row_to_json");
+      if (f.type.kind !== "bool" && f.type.kind !== "null") throw noFuncOverload(func);
       rargs.push(f.node);
     }
   }
-  params.nonimmutable ||= containsTimestamptz(record.type);
+  params.nonimmutable ||= containsTimestamptz(value.type);
   return {
-    node: { kind: "rowToJson", args: rargs, recordType: record.type },
-    type: { kind: "json" },
+    node: { kind: "jsonImage", func, args: rargs, valueType: value.type },
+    type: { kind: func === "to_jsonb" ? "jsonb" : "json" },
   };
 }
 

@@ -55,7 +55,10 @@ pub(crate) use window::*;
 mod access_path;
 pub(crate) use access_path::index_store_bound_entries;
 mod aggregate;
-pub(crate) use aggregate::{agg_order_tuple, sort_agg_order_rows};
+pub(crate) use aggregate::{
+    agg_order_tuple, jsonb_image_node, push_json_agg_elem, push_json_object_agg_pair,
+    sort_agg_order_rows,
+};
 mod autoname;
 pub(crate) use autoname::*;
 mod create_table_as;
@@ -3258,10 +3261,6 @@ pub(crate) enum ScalarFunc {
     JsonStripNulls,
     /// jsonb_pretty → an indented multi-line render.
     JsonbPretty,
-    /// to_jsonb(anyelement) → the JSON image of any value (the `value_to_node` kernel). STRICT.
-    ToJsonb,
-    /// to_json(anyelement) → the JSON image as `json` (the `value_to_node` kernel, rendered compact).
-    ToJson,
     /// JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
     JsonScalar,
     /// JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
@@ -3404,10 +3403,6 @@ pub(crate) enum ArrayFunc {
     /// `a && b` (anyarray, anyarray) → boolean — do `a` and `b` OVERLAP: share at least one element
     /// (STRICT equality) over the flattened multiset, any dimensionality (§10).
     Overlaps,
-    /// `array_to_json(anyarray)` → json — the array as a JSON array, rendered COMPACT (the `to_jsonb`
-    /// node kernel). STRICT. A multidimensional array is a deferred `0A000` (like to_jsonb); the
-    /// optional 2nd `pretty boolean` argument is a deferred follow-on. (json-sql-functions.md §2)
-    ArrayToJson,
 }
 
 /// The polymorphic range ACCESSOR functions (spec/design/range-functions.md §1, RF1). Like
@@ -3559,6 +3554,19 @@ pub(crate) enum JsonBuildKind {
     Array,
     /// json[b]_build_object — alternating key/value arguments (odd count / NULL key → 22023).
     Object,
+}
+
+/// Which JSON-image function an [`RExpr::JsonImage`] node is (json-sql-functions.md §2.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JsonImageFunc {
+    /// `to_json(anyelement)` → the value's `json` image.
+    ToJson,
+    /// `to_jsonb(anyelement)` → the value's `jsonb` image.
+    ToJsonb,
+    /// `array_to_json(anyarray [, pretty])` → the array's `json` image.
+    ArrayToJson,
+    /// `row_to_json(record [, pretty])` → the composite's `json` object.
+    RowToJson,
 }
 
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
@@ -4052,11 +4060,16 @@ pub(crate) enum RExpr {
         json: bool,
         args: Vec<RExpr>,
         array_form: bool,
+        /// Each argument's static type (the VARIADIC-array form: the lone array's type), which keys
+        /// a composite argument's members.
+        tys: Vec<ResolvedType>,
     },
-    /// `row_to_json(record [, pretty])` (json-sql-functions.md §2.2): `args` are the record and the
-    /// optional boolean flag; `ty` is the record's static type — a composite, whose field names key
-    /// the members, or `Null` for an untyped NULL argument. STRICT (a NULL operand → NULL).
-    RowToJson {
+    /// A JSON-image function — `to_json`, `to_jsonb`, `array_to_json`, `row_to_json`
+    /// (json-sql-functions.md §2.2): `args` are the value and, for the array/row forms, the optional
+    /// boolean `pretty` flag; `ty` is the value's static type (a composite's field names key its
+    /// members), or `Null` for an untyped NULL argument. STRICT (a NULL operand → NULL).
+    JsonImage {
+        func: JsonImageFunc,
         args: Vec<RExpr>,
         ty: ResolvedType,
     },

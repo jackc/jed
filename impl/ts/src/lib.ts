@@ -164,7 +164,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
   "func.to_jsonb",
   // to_json + json[b]_build_array / json[b]_build_object (B1, json-sql-functions.md §2) — the
-  // json/jsonb construction builders over the same valueToNode element kernel.
+  // json/jsonb construction builders over the same JSON-image conversion (row_json.ts).
   "func.json_builders",
   // row_to_json(record [, pretty]) — a composite as a json object (json-sql-functions.md §2.2).
   "func.row_to_json",

@@ -2870,6 +2870,7 @@ impl Engine {
                         &plan.agg_specs,
                         &src,
                         survivors.len(),
+                        &self.session.time_zone,
                         meter,
                     )?]
                 } else {
@@ -2878,6 +2879,7 @@ impl Engine {
                         gset.key_cols[0],
                         &src,
                         survivors.len(),
+                        &self.session.time_zone,
                         meter,
                     )?
                 };
@@ -2978,7 +2980,10 @@ impl Engine {
         let mut whole: Vec<Acc> = if grouped {
             Vec::new()
         } else {
-            plan.agg_specs.iter().map(Acc::from_spec).collect()
+            plan.agg_specs
+                .iter()
+                .map(|s| Acc::from_spec(s, &self.session.time_zone))
+                .collect()
         };
         let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
         let mut index: HashMap<i64, usize> = HashMap::new();
@@ -3024,7 +3029,10 @@ impl Engine {
                                 index.insert(k, g);
                                 groups.push((
                                     Value::Int(k),
-                                    plan.agg_specs.iter().map(Acc::from_spec).collect(),
+                                    plan.agg_specs
+                                        .iter()
+                                        .map(|s| Acc::from_spec(s, &self.session.time_zone))
+                                        .collect(),
                                 ));
                                 g
                             }
@@ -3044,7 +3052,10 @@ impl Engine {
                                 null_gi = Some(g);
                                 groups.push((
                                     Value::Null,
-                                    plan.agg_specs.iter().map(Acc::from_spec).collect(),
+                                    plan.agg_specs
+                                        .iter()
+                                        .map(|s| Acc::from_spec(s, &self.session.time_zone))
+                                        .collect(),
                                 ));
                                 g
                             }

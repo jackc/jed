@@ -94,6 +94,8 @@ type windowSpec struct {
 	filter *rExpr
 	// aggCollation is a text MIN/MAX window aggregate's comparison collation (see aggSpec.collation).
 	aggCollation *Collation
+	// aggJSONTypes is a JSON window aggregate's operand type (see aggSpec.jsonTypes).
+	aggJSONTypes []resolvedType
 }
 
 // resolvedFrame is a resolved window frame (spec/design/window.md §6). ROWS physical offsets,
@@ -183,7 +185,7 @@ const (
 	planMin
 	planMax
 	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
-	planJsonAgg        // json_agg(x) — same array, typed json (spaced canonical render)
+	planJsonAgg        // json_agg(x) — the json images joined with ", " (PG json_agg_transfn)
 	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
 	planJsonAggStrict  // json_agg_strict(x) — skip NULL-valued rows; json array
 	// json[b]_object_agg[_unique] (B4) — aggregate (key, value) pairs (a Row operand) into a JSON
@@ -250,6 +252,9 @@ type aggSpec struct {
 	// "Aggregates and window functions"): the operand's derivation; nil for C, a non-text operand, or
 	// any other aggregate.
 	collation *Collation
+	// jsonTypes is a JSON aggregate's operand type(s) — [value] for json[b]_agg, [key, value] for
+	// json[b]_object_agg (json-sql-functions.md §4); nil for every other aggregate.
+	jsonTypes []resolvedType
 }
 
 // keySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
@@ -303,13 +308,18 @@ type acc struct {
 	floatSum *floatSumAcc // non-nil for the float SUM/AVG plans (the streaming scan-order fold — float.md §7)
 	// collation is a text MIN/MAX's comparison collation (spec/design/collation.md §1); nil is C.
 	collation *Collation
-	// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. jsonAsJSON
+	// json_agg / jsonb_agg accumulator (B4): the inputs' JSON images in row order — a json text
+	// (JsonValue; a NULL input NullValue) for json_agg, a JsonbValue node for jsonb_agg. jsonAsJSON
 	// selects the `json` result type (vs jsonb); jsonStrict skips a NULL-valued row. `seen` is reused
 	// to mark the group non-empty even when the strict filter drops every row (empty group → NULL,
-	// all-skipped group → `[]`).
-	jsonNodes  []JsonNode
+	// all-skipped group → `[]`). jsonTypes/jsonZone convert each input as it is folded: the
+	// operand's static type(s) — [value] for json[b]_agg, [key, value] for json[b]_object_agg — and
+	// the session zone a timestamptz renders in.
+	jsonElems  []Value
 	jsonAsJSON bool
 	jsonStrict bool
+	jsonTypes  []resolvedType
+	jsonZone   ZoneRef
 	// json[b]_object_agg[_unique] accumulator (B4): the (key, value) pairs in row order. objAgg is
 	// true for the object-agg plans; objUnique errors 22030 on a duplicate key. jsonAsJSON selects
 	// the json (brace-padded, row order, dups) vs jsonb (canonical, last-wins) finalize render, and
@@ -345,8 +355,8 @@ type acc struct {
 	ordRows [][]Value
 }
 
-// objAggPair is one (key, value) pair accumulated by json[b]_object_agg (the key already coerced to
-// text, the value its raw Value carried to finalize where it becomes its to_jsonb / json image).
+// objAggPair is one (key, value) pair accumulated by json[b]_object_agg: the key's text and the
+// value's JSON image (as for acc.jsonElems).
 type objAggPair struct {
 	key string
 	val Value
@@ -386,18 +396,20 @@ func newAcc(plan aggPlan) *acc {
 // the spec, not the plan); every other plan delegates to newAcc. Only the aggregation stage builds
 // ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
 // ordered-set aggregate with OVER is 0A000, rejected at resolve).
-func newAccFromSpec(s aggSpec) *acc {
+//
+// zone is the session zone a JSON aggregate renders a timestamptz input in.
+func newAccFromSpec(s aggSpec, zone ZoneRef) *acc {
 	// An in-aggregate ORDER BY buffers the passing rows first (aggregates.md §22); the plan's own
 	// accumulator is built at finalize (newAccFromSpecUnordered) and fed in key order.
 	if s.order != nil {
 		return &acc{plan: s.plan, ordered: true}
 	}
-	return newAccFromSpecUnordered(s)
+	return newAccFromSpecUnordered(s, zone)
 }
 
 // newAccFromSpecUnordered is newAccFromSpec ignoring any in-aggregate ORDER BY — the accumulator an
 // ordered aggregate's sorted arguments are finally folded into.
-func newAccFromSpecUnordered(s aggSpec) *acc {
+func newAccFromSpecUnordered(s aggSpec, zone ZoneRef) *acc {
 	switch s.plan {
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		// The per-group fraction (osaFrac) is filled in just before finalize (the direct argument
@@ -408,17 +420,19 @@ func newAccFromSpecUnordered(s aggSpec) *acc {
 		// it is finalized inline in the group-emission loop (it needs the spec's sort specs).
 		return &acc{plan: s.plan}
 	default:
-		return newAccWithCollation(s.plan, s.collation)
+		return newAccWithContext(s.plan, s.collation, s.jsonTypes, zone)
 	}
 }
 
-// newAccWithCollation is newAcc with a text MIN/MAX's comparison collation (spec/design/collation.md
-// §1); every other plan ignores it.
-func newAccWithCollation(plan aggPlan, coll *Collation) *acc {
+// newAccWithContext is newAcc with a text MIN/MAX's comparison collation (spec/design/collation.md
+// §1) and a JSON aggregate's operand type(s) + session zone; every other plan ignores them.
+func newAccWithContext(plan aggPlan, coll *Collation, jsonTypes []resolvedType, zone ZoneRef) *acc {
 	a := newAcc(plan)
 	if plan == planMin || plan == planMax {
 		a.collation = coll
 	}
+	a.jsonTypes = jsonTypes
+	a.jsonZone = zone
 	return a
 }
 
@@ -435,13 +449,13 @@ func (a *acc) clone() *acc {
 		fs := *a.floatSum
 		c.floatSum = &fs
 	}
-	if a.jsonNodes != nil {
-		// Deep-copy the node slice so a window peer-group's finalize doesn't consume the running
-		// acc's nodes (mirrors the floatSum slice clone above).
-		c.jsonNodes = append([]JsonNode(nil), a.jsonNodes...)
+	if a.jsonElems != nil {
+		// Deep-copy the image slice so a window peer-group's finalize doesn't consume the running
+		// acc's images (mirrors the floatSum slice clone above).
+		c.jsonElems = append([]Value(nil), a.jsonElems...)
 	}
 	if a.objPairs != nil {
-		// Deep-copy the (key, value) pairs slice (as jsonNodes above) so a cloned-finalize over a
+		// Deep-copy the (key, value) pairs slice (as jsonElems above) so a cloned-finalize over a
 		// window peer-group doesn't alias the still-running acc.
 		c.objPairs = append([]objAggPair(nil), a.objPairs...)
 	}
@@ -538,40 +552,44 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		// Mark the group non-empty even when the strict filter drops this row (an all-skipped group
 		// still finalizes to `[]`, not NULL — only a zero-row group is NULL).
 		a.seen = true
-		// Non-strict: a NULL input contributes a JSON null; `_strict` skips it. Each input's JSON
-		// image is the to_jsonb kernel (deferred 0A000 sources propagate here). One generated_row
-		// per appended element.
+		// Non-strict: a NULL input contributes a JSON null; `_strict` skips it. Each input is
+		// converted to its JSON image as it is folded (PG's transition function); a finite timestamptz
+		// in it renders in the session zone, one timezone unit each. One generated_row per element.
 		if !(a.jsonStrict && v.IsNull()) {
 			m.Charge(costs.GeneratedRow)
+			m.Charge(costs.Timezone * v.zoneRenderCount())
 			if err := m.Guard(); err != nil {
 				return err
 			}
-			node, err := valueToNode(v)
+			img, err := jsonAggImage(v, a.jsonAsJSON, a.jsonTypes[0], a.jsonZone)
 			if err != nil {
 				return err
 			}
-			a.jsonNodes = append(a.jsonNodes, node)
+			a.jsonElems = append(a.jsonElems, img)
 		}
 	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
 		// The operand is a Row(key, value) composite; mark the group non-empty (an empty group → NULL,
 		// not `{}`) and split the two fields back out.
 		a.seen = true
 		m.Charge(costs.GeneratedRow)
-		if err := m.Guard(); err != nil {
-			return err
-		}
 		if v.Kind != ValComposite || v.composite() == nil || len(*v.composite()) != 2 {
 			panic("BUG: object_agg operand is a 2-field Row")
 		}
 		fields := *v.composite()
 		kv, vv := fields[0], fields[1]
-		// The key coerces to text (text/integer/decimal/boolean); a NULL key → 22023, but with a
-		// DIFFERENT message from build_object's "key must not be null" (NULL handled here, before
-		// objectKeyText, so the non-NULL coercion + the non-scalar 0A000 still reuse it).
+		m.Charge(costs.Timezone * (kv.zoneRenderCount() + vv.zoneRenderCount()))
+		if err := m.Guard(); err != nil {
+			return err
+		}
+		// A NULL key: json_object_agg 22004, jsonb_object_agg 22023 (PG's two messages).
 		if kv.Kind == ValNull {
+			if a.jsonAsJSON {
+				return objectKeyNull()
+			}
 			return newError(InvalidParameterValue, "field name must not be null")
 		}
-		key, err := objectKeyText(kv, 1)
+		// The key is always a JSON string (an array/composite/json key is 22023).
+		key, err := jsonKeyText(kv, a.jsonZone)
 		if err != nil {
 			return err
 		}
@@ -582,7 +600,11 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				}
 			}
 		}
-		a.objPairs = append(a.objPairs, objAggPair{key: key, val: vv})
+		img, err := jsonAggImage(vv, a.jsonAsJSON, a.jsonTypes[1], a.jsonZone)
+		if err != nil {
+			return err
+		}
+		a.objPairs = append(a.objPairs, objAggPair{key: key, val: img})
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		// Collect the non-NULL aggregated argument (the WITHIN GROUP order key, evaluated per row).
 		// percentile_cont (numeric) widens each value to f64 up front (the correctly-rounded cast,
@@ -726,21 +748,34 @@ func (a *acc) finalize() (Value, error) {
 		}
 		return Float64Value(f), nil
 	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
-		// json_agg/jsonb_agg: NULL over an empty (zero-row) group; else the JSON array. A non-empty
-		// group the strict filter emptied still finalizes to `[]` (seen is true, jsonNodes empty).
+		// json_agg/jsonb_agg: NULL over an empty (zero-row) group; else the JSON array (json: PG's
+		// ", "-joined element texts; jsonb: the canonical array). A non-empty group the strict filter
+		// emptied still finalizes to `[]` (seen is true, jsonElems empty).
 		if !a.seen {
 			return NullValue(), nil
 		}
-		arr := JsonNode{Kind: JArray, Arr: a.jsonNodes}
-		// The aggregate nests each input one level (json.md §6.4).
+		if a.jsonAsJSON {
+			breaks := jsonAggBreaksLine(a.jsonTypes[0])
+			var b strings.Builder
+			b.WriteByte('[')
+			for i, e := range a.jsonElems {
+				writeJSONAggElem(&b, i, e, breaks)
+			}
+			b.WriteByte(']')
+			out := b.String()
+			// The aggregate nests each input one level (json.md §6.4).
+			if err := checkJSONTextDepth(out); err != nil {
+				return NullValue(), err
+			}
+			return JsonValue(out), nil
+		}
+		nodes := make([]JsonNode, len(a.jsonElems))
+		for i, e := range a.jsonElems {
+			nodes[i] = *e.jsonb()
+		}
+		arr := JsonNode{Kind: JArray, Arr: nodes}
 		if err := checkJSONDepth(&arr); err != nil {
 			return NullValue(), err
-		}
-		// Both json_agg and jsonb_agg render the SPACED canonical form (PG joins the element texts
-		// with ", "); the json variant is just typed `json` carrying that same text. (A json input
-		// element is canonicalized by valueToNode — a documented divergence from PG's verbatim.)
-		if a.jsonAsJSON {
-			return JsonValue(jsonbOut(&arr)), nil
 		}
 		return JsonbValue(arr), nil
 	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
@@ -751,20 +786,14 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), nil
 		}
 		if a.jsonAsJSON {
-			parts := make([]string, 0, len(a.objPairs))
-			for _, p := range a.objPairs {
-				// The key's json-quoted form (jsonCompactOut of a JSON string node), then ` : `, then
-				// the value's json image (json verbatim / jsonb canonical-spaced / else compact).
-				img, err := elemJsonText(p.val)
-				if err != nil {
-					return NullValue(), err
-				}
-				keyNode := JsonNode{Kind: JString, S: p.key}
-				parts = append(parts, jsonCompactOut(&keyNode)+" : "+img)
+			var b strings.Builder
+			b.WriteString("{ ")
+			for i, p := range a.objPairs {
+				writeJSONObjectAggPair(&b, i, p.key, p.val)
 			}
-			// PG's json_object_agg PADS the braces (`{ … }`) — distinct from json_build_object, which
-			// does NOT pad.
-			out := "{ " + strings.Join(parts, ", ") + " }"
+			// PG's json_object_agg PADS the braces (`{ … }`) — distinct from json_build_object.
+			b.WriteString(" }")
+			out := b.String()
 			// The aggregate nests each value one level (json.md §6.4).
 			if err := checkJSONTextDepth(out); err != nil {
 				return NullValue(), err
@@ -773,11 +802,7 @@ func (a *acc) finalize() (Value, error) {
 		}
 		members := make([]JsonMember, 0, len(a.objPairs))
 		for _, p := range a.objPairs {
-			node, err := valueToNode(p.val)
-			if err != nil {
-				return NullValue(), err
-			}
-			members = append(members, JsonMember{Key: p.key, Val: node})
+			members = append(members, JsonMember{Key: p.key, Val: *p.val.jsonb()})
 		}
 		out := makeObject(members)
 		if err := checkJSONDepth(&out); err != nil {
@@ -2155,4 +2180,60 @@ func surfaceMatches(surface, name string) bool {
 		}
 	}
 	return true
+}
+
+// jsonAggImage is a JSON aggregate input's image (json-sql-functions.md §4): for the json aggregates
+// its json text (NullValue for a NULL input, rendered null), for the jsonb aggregates a JsonbValue.
+func jsonAggImage(v Value, asJSON bool, ty resolvedType, zone ZoneRef) (Value, error) {
+	if asJSON {
+		if v.IsNull() {
+			return NullValue(), nil
+		}
+		var b strings.Builder
+		if err := datumToJSON(v, ty, zone, &b); err != nil {
+			return NullValue(), err
+		}
+		return JsonValue(b.String()), nil
+	}
+	node, err := datumToJSONB(v, ty, zone)
+	if err != nil {
+		return NullValue(), err
+	}
+	return JsonbValue(node), nil
+}
+
+// writeJSONAggElem appends the i-th json_agg element image onto b (PostgreSQL's json_agg_transfn):
+// elements are separated by ", ", and a non-NULL array or composite after the first (breaks) also
+// starts a new line ("\n ").
+func writeJSONAggElem(b *strings.Builder, i int, e Value, breaks bool) {
+	if i > 0 {
+		b.WriteString(", ")
+	}
+	if e.IsNull() {
+		b.WriteString("null")
+		return
+	}
+	if i > 0 && breaks {
+		b.WriteString("\n ")
+	}
+	b.WriteString(e.str())
+}
+
+// writeJSONObjectAggPair appends the i-th json_object_agg `key : value` pair onto b, ", "-separated.
+func writeJSONObjectAggPair(b *strings.Builder, i int, key string, v Value) {
+	if i > 0 {
+		b.WriteString(", ")
+	}
+	writeJSONString(key, b)
+	b.WriteString(" : ")
+	if v.IsNull() {
+		b.WriteString("null")
+		return
+	}
+	b.WriteString(v.str())
+}
+
+// isJSONAggPlan reports whether plan is a json[b]_agg[_strict] array aggregate.
+func isJSONAggPlan(plan aggPlan) bool {
+	return plan == planJsonbAgg || plan == planJsonAgg || plan == planJsonbAggStrict || plan == planJsonAggStrict
 }

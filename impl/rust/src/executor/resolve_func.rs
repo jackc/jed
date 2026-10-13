@@ -144,9 +144,18 @@ pub(crate) fn resolve_func_call(
     // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
     // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
     // literal are outside the catalog family mold), like jsonb_set.
-    // `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) takes any composite — the
-    // catalog has no `record` family — so it is hand-resolved too.
-    if lname == "row_to_json" {
+    // The JSON-image functions (json-sql-functions.md §2.2) carry their argument's static type to
+    // eval (a composite's field names key its members), so they are hand-resolved: `row_to_json`
+    // takes any composite (the catalog has no `record` family); `to_json` / `to_jsonb` /
+    // `array_to_json` keep their catalog rows as data.
+    let image = match lname.as_str() {
+        "to_json" => Some(JsonImageFunc::ToJson),
+        "to_jsonb" => Some(JsonImageFunc::ToJsonb),
+        "array_to_json" => Some(JsonImageFunc::ArrayToJson),
+        "row_to_json" => Some(JsonImageFunc::RowToJson),
+        _ => None,
+    };
+    if let Some(func) = image {
         reject_named(&lname, arg_names)?;
         if star {
             return Err(EngineError::new(
@@ -154,7 +163,7 @@ pub(crate) fn resolve_func_call(
                 "* is only valid as the argument of COUNT",
             ));
         }
-        return resolve_row_to_json(scope, args, agg, params);
+        return resolve_json_image(scope, func, args, agg, params);
     }
     if lname == "json_object" || lname == "jsonb_object" {
         reject_named(&lname, arg_names)?;
@@ -950,6 +959,7 @@ pub(crate) fn resolve_variadic_func(
     let var_family = desc.arg_families[k - 1]; // the variadic element family (last slot)
 
     let mut rargs = Vec::with_capacity(args.len());
+    let mut rtys = Vec::with_capacity(args.len());
     if variadic {
         // VARIADIC-array form: exactly `k` args (the fixed params + the one array). The fixed
         // params match their concrete families; the last operand MUST be an array (else 42804).
@@ -974,6 +984,7 @@ pub(crate) fn resolve_variadic_func(
                 return Err(no_func_overload(name));
             }
             rargs.push(r);
+            rtys.push(t);
         }
     } else {
         // Spread form: at least `k` args (so a variadic function needs ≥1 variadic arg —
@@ -1000,6 +1011,7 @@ pub(crate) fn resolve_variadic_func(
                 return Err(no_func_overload(name));
             }
             rargs.push(r);
+            rtys.push(t);
         }
     }
 
@@ -1007,12 +1019,15 @@ pub(crate) fn resolve_variadic_func(
     // The json/jsonb builders share the spread/array-form validation above but their own eval node
     // and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep RExpr::Variadic.
     if let Some((kind, json)) = json_build_classify(name) {
+        // A timestamptz argument renders in the session zone (json-sql-functions.md §2.2).
+        params.nonimmutable |= rtys.iter().any(ResolvedType::contains_timestamptz);
         return Ok((
             RExpr::JsonBuild {
                 kind,
                 json,
                 args: rargs,
                 array_form: variadic,
+                tys: rtys,
             },
             resolved_type_of(result),
         ));
@@ -1892,7 +1907,6 @@ fn explain_array_func(func: &ArrayFunc) -> &str {
         ArrayFunc::Contains => "contains",
         ArrayFunc::ContainedBy => "contained_by",
         ArrayFunc::Overlaps => "overlaps",
-        ArrayFunc::ArrayToJson => "array_to_json",
     }
 }
 
@@ -2172,7 +2186,15 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
         RExpr::JsonObjectFromArrays { json, args } => {
             explain_call(if *json { "json_object" } else { "jsonb_object" }, args)
         }
-        RExpr::RowToJson { args, .. } => explain_call("row_to_json", args),
+        RExpr::JsonImage { func, args, .. } => explain_call(
+            match func {
+                JsonImageFunc::ToJson => "to_json",
+                JsonImageFunc::ToJsonb => "to_jsonb",
+                JsonImageFunc::ArrayToJson => "array_to_json",
+                JsonImageFunc::RowToJson => "row_to_json",
+            },
+            args,
+        ),
         RExpr::JsonPathFn { kind, args } => explain_call(explain_jsonpath_func(*kind), args),
         RExpr::JsonSqlFn {
             kind,

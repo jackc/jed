@@ -502,6 +502,14 @@ func TestRegistryCoversCatalog(t *testing.T) {
 		if o.Kind != "function" {
 			continue
 		}
+		if _, ok := jsonImageClassify(o.Name); ok {
+			// A JSON-image function (json-sql-functions.md §2.2): no kernel id — the kernel is the
+			// reJsonImage eval, reached from resolveJSONImage. Its result is json/jsonb.
+			if o.Result != "json" && o.Result != "jsonb" {
+				t.Fatalf("JSON-image function %s has unhandled result code %s", o.Name, o.Result)
+			}
+			continue
+		}
 		if isArrayFuncName(o.Name) {
 			// A polymorphic array function (array-functions.md §2): its kernel id comes from
 			// arrayFuncID and its result is a reserved poly code or a scalar id.

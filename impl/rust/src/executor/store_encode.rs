@@ -1913,8 +1913,6 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         | ScalarFunc::JsonbStripNulls
         | ScalarFunc::JsonStripNulls
         | ScalarFunc::JsonbPretty
-        | ScalarFunc::ToJsonb
-        | ScalarFunc::ToJson
         | ScalarFunc::JsonScalar
         | ScalarFunc::JsonSerialize
         | ScalarFunc::Length

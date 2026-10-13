@@ -22,9 +22,10 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	name := fc.Name
 	sub := &aggCtx{collecting: false}
 	var (
-		plan    aggPlan
-		operand *rExpr
-		result  resolvedType
+		plan      aggPlan
+		operand   *rExpr
+		result    resolvedType
+		jsonTypes []resolvedType
 	)
 	// json[b]_object_agg[_unique] take TWO operands (key, value) — resolve both and encode as a Row
 	// operand for the single-operand aggregate framework (the fold splits the composite back out).
@@ -67,7 +68,7 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 			result = resolvedType{kind: rtJson}
 		}
 		slot := len(ag.groupKeys) + len(ag.specs)
-		ag.specs = append(ag.specs, aggSpec{plan: objPlan, operand: operand, distinct: fc.Distinct, filter: filter, order: order})
+		ag.specs = append(ag.specs, aggSpec{plan: objPlan, operand: operand, distinct: fc.Distinct, filter: filter, order: order, jsonTypes: []resolvedType{kt, vt}})
 		return &rExpr{kind: reColumn, index: slot}, result, nil
 	}
 	if fc.Star {
@@ -99,6 +100,10 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		}
 		plan, result = aggregatePlan(name, desc.Result, t)
 		operand = r
+		// A JSON aggregate converts each input by its static type (json-sql-functions.md §4).
+		if isJSONAggPlan(plan) {
+			jsonTypes = []resolvedType{t}
+		}
 		if fc.Distinct {
 			if err := rejectJSONDistinct(t); err != nil {
 				return nil, resolvedType{}, err
@@ -127,7 +132,7 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	}
 	// Aggregate results follow the group-key values in the synthetic row.
 	slot := len(ag.groupKeys) + len(ag.specs)
-	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter, order: order, collation: collation})
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter, order: order, collation: collation, jsonTypes: jsonTypes})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -615,6 +620,8 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		wagg   aggPlan // the aggregate plan, valid only when plan == planAgg
 		// aggColl is a text MIN/MAX window aggregate's comparison collation (minmaxCollation).
 		aggColl *Collation
+		// aggJSONTypes is a JSON window aggregate's operand type (aggSpec.jsonTypes).
+		aggJSONTypes []resolvedType
 	)
 	// The sub-context window ARGUMENTS resolve in (spec/design/window.md §5.1). In a grouped query
 	// (ag.collecting) they resolve against the grouped row — a nested aggregate collects into the
@@ -759,6 +766,9 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 			}
 			wagg, result = aggregatePlan(name, desc.Result, t)
 			wargs = append(wargs, r) // the aggregate operand → args[0]
+			if isJSONAggPlan(wagg) {
+				aggJSONTypes = []resolvedType{t}
+			}
 		}
 		var err error
 		if aggColl, err = minmaxCollation(s, wagg, fc.Args, result); err != nil {
@@ -848,7 +858,7 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		ag.groupingSpecs = sub.groupingSpecs
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
-	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame, filter: rfilter, aggCollation: aggColl})
+	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame, filter: rfilter, aggCollation: aggColl, aggJSONTypes: aggJSONTypes})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 

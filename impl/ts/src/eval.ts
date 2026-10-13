@@ -1,4 +1,4 @@
-import type { EvalEnv, JsonGetOp, RExpr, ScalarFuncName } from "./executor.ts";
+import type { EvalEnv, JsonGetOp, RExpr, ResolvedType, ScalarFuncName } from "./executor.ts";
 import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
@@ -57,7 +57,6 @@ import {
   decodeByteaLiteral,
   decodeText,
   decodeUuidLiteral,
-  elemJsonText,
   encodeBytea,
   dateClockValue,
   dateMidnightMicros,
@@ -87,7 +86,6 @@ import {
   leftChars,
   minScaleOf,
   objectKeyNull,
-  objectKeyText,
   overflow,
   padChars,
   parseBoolLiteral,
@@ -119,7 +117,6 @@ import {
   truncateToChars,
   typeError,
   utf8ByteLength,
-  valueToNode,
   valueToOptTextArray,
   jsonTextPathArg,
   widthBucketErr,
@@ -197,6 +194,7 @@ import {
   stripNulls as jsonStripNulls,
   typeofName as jsonTypeofName,
   validateJson,
+  writeJsonString,
 } from "./json.ts";
 import { type Collation, foldCase, foldLowerSimple, loadedProperty } from "./collation.ts";
 import {
@@ -231,7 +229,13 @@ import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import type { BinaryOp } from "./ast.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import { OPERATORS } from "./operators.ts";
-import { compositeToJson } from "./row_json.ts";
+import {
+  arrayToJson,
+  compositeToJson,
+  datumToJson,
+  datumToJsonb,
+  jsonKeyText,
+} from "./row_json.ts";
 // evalFilter evaluates a predicate in a filter context — WHERE, ON, HAVING, a partial index's WHERE,
 // ON CONFLICT … WHERE — and reports whether it keeps the row (it is TRUE). The top-level AND chain
 // stops at the first conjunct that is not TRUE (FALSE or NULL: the predicate can no longer be TRUE),
@@ -1546,22 +1550,6 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "jsonb_pretty") {
         return textValue(jsonbPrettyText(vals[0]!, m));
       }
-      if (e.func === "to_jsonb") {
-        // to_jsonb(anyelement) → the JSON image of the value (json-sql-functions.md §2). STRICT:
-        // the NULL-input case is handled by the blanket propagation above.
-        // An array of json/jsonb elements nests them one level (json.md §6.4).
-        const out = valueToNode(vals[0]!);
-        jsonCheckDepth(out);
-        return growthResult(m, e.args, jsonbValue(out));
-      }
-      if (e.func === "to_json") {
-        // to_json(anyelement) → the value's `json` image: a jsonb input renders canonical-spaced, a
-        // json input verbatim, everything else the compact to_jsonb render (PG's datum_to_json) —
-        // the same per-type rule the json builders embed. STRICT (NULL handled above).
-        const out = elemJsonText(vals[0]!);
-        jsonCheckTextDepth(out);
-        return growthResult(m, e.args, jsonValue(out));
-      }
       if (e.func === "json_scalar") {
         // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string), rendered
         // compact (json-sql-functions.md §5). STRICT (NULL handled above). The datetime/uuid/bytea/
@@ -2048,10 +2036,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const out = evalArrayFunc(e.func, vals, m);
       // The builders are growth kernels (cost.md §8.1), free over constant operands.
       if (
-        (e.func === "array_append" ||
-          e.func === "array_prepend" ||
-          e.func === "array_cat" ||
-          e.func === "array_to_json") &&
+        (e.func === "array_append" || e.func === "array_prepend" || e.func === "array_cat") &&
         !e.args.every(rexprIsConstant)
       )
         chargeOutput(m, out);
@@ -2128,18 +2113,39 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         for (const a of e.args) vals.push(evalExpr(a, row, env, m));
       }
       m.charge(COSTS.operatorEval * BigInt(vals.length));
+      // A finite timestamptz at any depth renders in the session zone: one timezone unit each,
+      // charged before rendering (json-sql-functions.md §2.2).
+      let zoned = 0;
+      for (const v of vals) zoned += zoneRenderCount(v);
+      m.charge(COSTS.timezone * BigInt(zoned));
       m.guard();
+      // Each argument's static type: the spread form's own, the VARIADIC-array form's element.
+      const elemType = (i: number): ResolvedType => {
+        if (!e.arrayForm) return e.types[i]!;
+        const t = e.types[0]!;
+        if (t.kind !== "array") throw new Error("a VARIADIC operand is an array");
+        return t.elem;
+      };
+      const zone = env.exec.session.timeZone;
       if (e.buildKind === "array") {
         if (e.json) {
-          // json_build_array → a `json` value: each element's own json text image (a json arg
-          // verbatim, a jsonb arg spaced, else compact), joined `, ` inside `[...]`.
+          // json_build_array → a `json` value: each element's json image, joined `, ` inside `[...]`.
+          const out: string[] = ["["];
+          vals.forEach((v, i) => {
+            if (i > 0) out.push(", ");
+            datumToJson(v, elemType(i), zone, out);
+          });
+          out.push("]");
           // The builders nest their arguments one level (json.md §6.4).
-          const out = `[${vals.map(elemJsonText).join(", ")}]`;
-          jsonCheckTextDepth(out);
-          return growthResult(m, e.args, jsonValue(out));
+          const text = out.join("");
+          jsonCheckTextDepth(text);
+          return growthResult(m, e.args, jsonValue(text));
         }
-        // jsonb_build_array → a jsonb value: each argument's valueToNode image, canonical render.
-        const out: JsonNode = { kind: "array", elements: vals.map(valueToNode) };
+        // jsonb_build_array → a jsonb value: each argument's jsonb image, canonical render.
+        const out: JsonNode = {
+          kind: "array",
+          elements: vals.map((v, i) => datumToJsonb(v, elemType(i), zone)),
+        };
         jsonCheckDepth(out);
         return growthResult(m, e.args, jsonbValue(out));
       }
@@ -2152,25 +2158,30 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (e.json) {
         // json_build_object → a `json` value keeping argument order + duplicate keys: the key as a
-        // JSON string, `" : "` (space-colon-space) before the value's element json text, members
-        // joined `, ` inside `{...}`.
-        const parts: string[] = [];
+        // JSON string, `" : "` (space-colon-space) before the value's json image, members joined `, `
+        // inside `{...}`. A NULL key is 22004 (the jsonb form's is 22023).
+        const out: string[] = ["{"];
         for (let i = 0; i < vals.length; i += 2) {
-          const key = objectKeyText(vals[i]!, i + 1);
-          parts.push(
-            `${jsonCompactOut({ kind: "string", value: key })} : ${elemJsonText(vals[i + 1]!)}`,
-          );
+          if (vals[i]!.kind === "null") throw objectKeyNull();
+          if (i > 0) out.push(", ");
+          writeJsonString(jsonKeyText(vals[i]!, zone), out);
+          out.push(" : ");
+          datumToJson(vals[i + 1]!, elemType(i + 1), zone, out);
         }
-        const out = `{${parts.join(", ")}}`;
-        jsonCheckTextDepth(out);
-        return growthResult(m, e.args, jsonValue(out));
+        out.push("}");
+        const text = out.join("");
+        jsonCheckTextDepth(text);
+        return growthResult(m, e.args, jsonValue(text));
       }
-      // jsonb_build_object → a jsonb object: (key, valueToNode) members, last-wins dedup + canonical
+      // jsonb_build_object → a jsonb object: (key, jsonb image) members, last-wins dedup + canonical
       // key sort via makeObject.
       const members: JsonMember[] = [];
       for (let i = 0; i < vals.length; i += 2) {
-        const key = objectKeyText(vals[i]!, i + 1);
-        members.push({ key, value: valueToNode(vals[i + 1]!) });
+        if (vals[i]!.kind === "null") {
+          throw engineError("invalid_parameter_value", `argument ${i + 1}: key must not be null`);
+        }
+        const key = jsonKeyText(vals[i]!, zone);
+        members.push({ key, value: datumToJsonb(vals[i + 1]!, elemType(i + 1), zone) });
       }
       const out = jsonMakeObject(members);
       jsonCheckDepth(out);
@@ -2236,27 +2247,43 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       jsonCheckDepth(out);
       return growthResult(m, e.args, jsonbValue(out));
     }
-    case "rowToJson": {
-      // row_to_json(record [, pretty]) (json-sql-functions.md §2.2): the composite rendered as a json
-      // object. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
+    case "jsonImage": {
+      // A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
+      // row_to_json. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
       // guarded before rendering (the array → text cast's rule, timezones.md §9.5).
       m.charge(COSTS.operatorEval);
       const vals = e.args.map((a) => evalExpr(a, row, env, m));
       if (vals.some((v) => v.kind === "null")) return nullValue();
-      const record = vals[0];
-      if (record.kind !== "composite" || e.recordType.kind !== "composite") {
-        throw new Error("resolver restricts row_to_json to a composite record");
-      }
-      const pretty = vals.length === 2 && vals[1].kind === "bool" && vals[1].value;
-      const zoned = zoneRenderCount(record);
+      const value = vals[0]!;
+      const pretty = vals.length === 2 && vals[1]!.kind === "bool" && vals[1]!.value;
+      const zoned = zoneRenderCount(value);
       if (zoned > 0) {
         m.charge(COSTS.timezone * BigInt(zoned));
         m.guard();
       }
+      const zone = env.exec.session.timeZone;
+      if (e.func === "to_jsonb") {
+        const node = datumToJsonb(value, e.valueType, zone);
+        // An array or composite of json/jsonb nests them deeper (json.md §6.4).
+        jsonCheckDepth(node);
+        return growthResult(m, e.args, jsonbValue(node));
+      }
       const out: string[] = [];
-      compositeToJson(record.fields, e.recordType, pretty, env.exec.session.timeZone, out);
+      if (e.func === "row_to_json") {
+        if (value.kind !== "composite" || e.valueType.kind !== "composite") {
+          throw new Error("resolver restricts row_to_json to a composite record");
+        }
+        compositeToJson(value.fields, e.valueType, pretty, zone, out);
+      } else if (e.func === "array_to_json") {
+        if (value.kind !== "array" || e.valueType.kind !== "array") {
+          throw new Error("resolver restricts array_to_json to an array");
+        }
+        arrayToJson(value, e.valueType.elem, pretty, zone, out);
+      } else {
+        datumToJson(value, e.valueType, zone, out);
+      }
       const text = out.join("");
-      // A jsonb field can nest a deep document (json.md §6.4).
+      // A jsonb element or field can nest a deep document (json.md §6.4).
       jsonCheckTextDepth(text);
       return growthResult(m, e.args, jsonValue(text));
     }

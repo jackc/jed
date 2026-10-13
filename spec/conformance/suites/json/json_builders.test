@@ -1,9 +1,10 @@
 # json/jsonb construction builders (B1 builders, spec/design/json-sql-functions.md §2): to_json,
-# json[b]_build_array, json[b]_build_object. to_json renders the to_jsonb image COMPACT as json; the
+# json[b]_build_array, json[b]_build_object. to_json renders the value's json image (compact); the
 # jsonb builders canonicalize (last-wins dedup, canonical key order, spaced); the json builders keep
 # argument order + duplicate keys and use PG's idiosyncratic builder spacing (", " between elements,
-# " : " in objects). A zero-arg build is valid ([] / {}); build_object odd count / NULL key → 22023;
-# a key coerces to text (1 → "1", true → "true"). Output matches the postgres:18 oracle.
+# " : " in objects). A zero-arg build is valid ([] / {}); jsonb_build_object odd count / NULL key →
+# 22023; a key coerces to text (1 → "1", true → "true"). Every other source type is in
+# to_json_sources.test. Output matches the postgres:18 oracle.
 # Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, types.array, func.json_builders
 

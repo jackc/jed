@@ -82,6 +82,45 @@ SELECT row_to_json(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
 ----
 {"f1":"2024-01-15T12:00:00+00:00","f2":1}
 
+# The other JSON-image conversions charge the same way: their rendered bytes (jsonb: its payload),
+# one operator_eval per argument value for the builders, and one timezone unit per finite
+# timestamptz, charged before rendering.
+# cost: 25
+query T nosort
+SELECT to_json(ROW(s, id)) FROM t
+----
+{"f1":"q\"x","f2":1}
+
+# cost: 103
+query T nosort
+SELECT to_jsonb(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
+----
+{"f1": "2024-01-15T12:00:00+00:00", "f2": 1}
+
+# cost: 39
+query T nosort
+SELECT json_build_array(timestamptz '2024-01-15 12:00:00+00', id) FROM t
+----
+["2024-01-15T12:00:00+00:00", 1]
+
+# cost: 68
+query T nosort
+SELECT jsonb_build_object(timestamptz '2024-01-15 12:00:00+00', id) FROM t
+----
+{"2024-01-15T12:00:00+00:00": 1}
+
+# cost: 7
+query T nosort
+SELECT json_agg(ARRAY[timestamptz '2024-01-15 12:00:00+00', NULL]) FROM t
+----
+[["2024-01-15T12:00:00+00:00",null]]
+
+# cost: 7
+query T nosort
+SELECT jsonb_object_agg(timestamptz '2024-01-15 12:00:00+00', id) FROM t
+----
+{"2024-01-15T12:00:00+00:00": 1}
+
 # jsonb_set and jsonb_object(text[]).
 # cost: 234
 query TT nosort

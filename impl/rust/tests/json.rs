@@ -109,22 +109,6 @@ fn invalid_json_cast_source_is_42804() {
     assert_eq!(err(&mut db, "SELECT true::jsonb"), "42804");
 }
 
-/// `to_jsonb` over the type-info-dependent / float-divergent sources (float, composite, datetime,
-/// uuid, bytea, interval, multidim array) is a deferred `0A000` follow-on; the supported set
-/// (scalars/jsonb/json/1-D arrays) is oracle-clean in suites/json/json_to_jsonb.test.
-#[test]
-fn to_jsonb_unsupported_sources_are_deferred() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(err(&mut db, "SELECT to_jsonb(1.5::f64)"), "0A000");
-    assert_eq!(err(&mut db, "SELECT to_jsonb('2020-01-01'::date)"), "0A000");
-    assert_eq!(
-        err(&mut db, "SELECT to_jsonb(ARRAY[ARRAY[1,2],ARRAY[3,4]])"),
-        "0A000"
-    );
-}
-
 /// `jsonb_pretty` renders the PG indented multi-line form (4-space indent, one space after `:`, a
 /// container ALWAYS multi-lines — an empty `{}` is `{` newline `}`). Pinned against the postgres:18
 /// oracle; the multi-line output can't live in the line-based corpus.
@@ -214,24 +198,6 @@ fn large_json_spills_verbatim() {
     assert_eq!(rows[0][0], verbatim); // verbatim bytes, whitespace preserved
 }
 
-/// The json/jsonb construction builders (to_json / json[b]_build_array / _object) reuse the
-/// `to_jsonb` element kernel, so a deferred-source element (float, like to_jsonb) is `0A000`. PG
-/// supports these sources, so this is a documented divergence; the supported set is oracle-clean in
-/// suites/json/json_builders.test.
-#[test]
-fn json_builder_deferred_element_source_is_0a000() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(err(&mut db, "SELECT to_json(1.5::f64)"), "0A000");
-    assert_eq!(err(&mut db, "SELECT jsonb_build_array(1.5::f64)"), "0A000");
-    assert_eq!(err(&mut db, "SELECT json_build_array(1.5::f64)"), "0A000");
-    assert_eq!(
-        err(&mut db, "SELECT jsonb_build_object('k', 1.5::f64)"),
-        "0A000"
-    );
-}
-
 /// `JSON_SERIALIZE` over a `jsonb` value renders its canonical text — a documented divergence from
 /// PostgreSQL 18, which returns SQL NULL for a jsonb input (a PG quirk; only `json` input serializes).
 /// The json-input behavior is oracle-clean in suites/json/json_ctor.test.
@@ -259,53 +225,6 @@ fn json_scalar_deferred_types_are_0a000() {
         "0A000"
     );
     assert_eq!(err(&mut db, "SELECT JSON_SCALAR(1.5::f64)"), "0A000");
-}
-
-/// `array_to_json` of a MULTIDIMENSIONAL array is a deferred `0A000` (the to_jsonb multidim
-/// deferral) — a documented divergence from PostgreSQL, which renders nested arrays. The 1-D case is
-/// oracle-clean in suites/json/json_builders.test.
-#[test]
-fn array_to_json_multidim_is_0a000() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        err(
-            &mut db,
-            "SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]])"
-        ),
-        "0A000"
-    );
-}
-
-/// A non-scalar `json[b]_build_object` KEY (e.g. a date) is a deferred `0A000` — only text / integer /
-/// decimal / boolean keys coerce to text this slice. PostgreSQL renders any type's text output as the
-/// key, so this is a documented divergence (the text/int/bool key coercions are oracle-clean in the
-/// suite).
-#[test]
-fn json_build_object_non_scalar_key_is_0a000() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(
-        err(&mut db, "SELECT jsonb_build_object('2020-01-01'::date, 1)"),
-        "0A000"
-    );
-}
-
-/// `json[b]_agg` over a deferred-source value (float, like to_jsonb) is `0A000` — the aggregate
-/// reuses the `to_jsonb` element kernel, so the same float/datetime/composite/uuid/bytea/interval
-/// sources propagate the deferral (json-sql-functions.md §4). The supported element types are
-/// oracle-clean in suites/json/json_agg.test.
-#[test]
-fn json_agg_deferred_element_source_is_0a000() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    run(&mut db, "CREATE TABLE f (id i32 PRIMARY KEY, x f64)");
-    run(&mut db, "INSERT INTO f VALUES (1, 1.5)");
-    assert_eq!(err(&mut db, "SELECT jsonb_agg(x) FROM f"), "0A000");
-    assert_eq!(err(&mut db, "SELECT json_agg(x) FROM f"), "0A000");
 }
 
 /// `json[b]_populate_record` over a NON-composite base argument is `42804` (jed's datatype-mismatch
@@ -357,44 +276,6 @@ fn json_record_composite_array_column_is_0a000() {
             "SELECT * FROM jsonb_to_record('{\"a\":1}') AS t(a i32[])"
         ),
         "0A000"
-    );
-}
-
-/// `json[b]_object_agg` over a deferred-source VALUE (float, like to_jsonb) is `0A000` — the value
-/// conversion reuses the to_jsonb element kernel. PG supports it, so this is a documented divergence;
-/// the supported value types are oracle-clean in suites/json/json_object_agg.test.
-#[test]
-fn json_object_agg_deferred_value_source_is_0a000() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    run(
-        &mut db,
-        "CREATE TABLE f (id i32 PRIMARY KEY, k text, x f64)",
-    );
-    run(&mut db, "INSERT INTO f VALUES (1, 'a', 1.5)");
-    assert_eq!(
-        err(&mut db, "SELECT jsonb_object_agg(k, x) FROM f"),
-        "0A000"
-    );
-    assert_eq!(err(&mut db, "SELECT json_object_agg(k, x) FROM f"), "0A000");
-}
-
-/// `json_agg` over a `json` element CANONICALIZES it (the element conversion runs through the
-/// jsonb node tree), dropping the input whitespace — a documented divergence from PostgreSQL, which
-/// preserves the verbatim sub-text (`[{ "a" : 1 }]`). (The json SRFs / accessor operators do return
-/// verbatim sub-text — json.md §4.) It can't live in the PG-clean corpus.
-#[test]
-fn json_agg_canonicalizes_json_elements() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    run(&mut db, "CREATE TABLE j (id i32 PRIMARY KEY, doc json)");
-    run(&mut db, "INSERT INTO j VALUES (1, '{ \"a\" : 1 }')");
-    // jed canonicalizes the element; PG would render the verbatim `[{ "a" : 1 }]`.
-    assert_eq!(
-        query(&mut db, "SELECT json_agg(doc) FROM j")[0][0],
-        "[{\"a\": 1}]"
     );
 }
 

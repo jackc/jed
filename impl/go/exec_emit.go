@@ -1044,7 +1044,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		newAccs := func() []*acc {
 			a := make([]*acc, len(plan.aggSpecs))
 			for i, spec := range plan.aggSpecs {
-				a[i] = newAccFromSpec(spec)
+				a[i] = newAccFromSpec(spec, db.session.timeZone)
 			}
 			return a
 		}
@@ -1265,7 +1265,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					// generated_row and its retention) as usual.
 					if a.ordered {
 						spec := plan.aggSpecs[si]
-						inner := newAccFromSpecUnordered(spec)
+						inner := newAccFromSpecUnordered(spec, db.session.timeZone)
 						for _, v := range sortAggOrderRows(a.ordRows, spec.order) {
 							if err := meter.Guard(); err != nil {
 								return emitter{}, err

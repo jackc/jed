@@ -108,6 +108,13 @@ SELECT
   row_to_json(ROW(1, NULL, ARRAY[1, 2], '{"b":2}'::jsonb)) AS anonymous,
   row_to_json(ROW(timestamp '2024-01-15 10:30:00'))     AS stamp;`;
 
+	const toJsonDemo = `SELECT
+  to_jsonb(ROW('b', 1))                                   AS jsonb_row,
+  to_json('{{1,2},{3,4}}'::i32[])                         AS nested,
+  json_build_object(date '2024-01-15', interval '1 day') AS date_key,
+  jsonb_agg(d)                                            AS dates
+FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -392,7 +399,7 @@ building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the l
 `54001`. PostgreSQL's limit depends on its stack size and is much higher (about 10 000 levels by
 default). jed's fixed limit is the same in every core.
 
-## Rows as JSON
+## Values as JSON
 
 `row_to_json(record [, pretty])` renders a composite value as a `json` object, as in PostgreSQL. A
 named composite type keys the members by its field names, and an anonymous `ROW(…)` names them
@@ -400,10 +407,18 @@ named composite type keys the members by its field names, and an anonymous `ROW(
 canonical text, arrays and nested composites nest, and dates and timestamps become ISO 8601 strings
 (a `timestamptz` in the session time zone). With `pretty` set to `true`, each top-level member goes
 on its own line. jed has no implicit row type per table, so PostgreSQL's `row_to_json(t)` over a
-table alias is not available: build the row with `ROW(t.a, t.b)` or use a composite column. A
-float (`f32`/`f64`) field is not supported yet (`0A000`):
+table alias is not available: build the row with `ROW(t.a, t.b)` or use a composite column:
 
 <LiveSql demo="rowToJsonDemo" query={rowToJsonDemo} rows={1} />
+
+Every other conversion to JSON uses the same rule: `to_json`, `to_jsonb`, `array_to_json(array [,
+pretty])`, `json_build_array`, `json_build_object`, and the `json_agg` and `json_object_agg`
+aggregates, each with its `jsonb` variant. A `jsonb` result keeps an object's keys in canonical order.
+An object key is always a string: a date or timestamp key takes the same ISO 8601 form, and an array,
+composite, or JSON key is an error (`22023`). Converting a float (`f32`/`f64`) value to JSON is not
+supported yet (`0A000`):
+
+<LiveSql demo="toJsonDemo" query={toJsonDemo} rows={1} />
 
 ## Three-valued NULL logic
 

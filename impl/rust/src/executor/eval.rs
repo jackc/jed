@@ -2585,17 +2585,6 @@ impl RExpr {
                         ))))
                     }
                     ScalarFunc::JsonbPretty => Ok(Value::Text(jsonb_pretty_text(&vals[0], m)?)),
-                    ScalarFunc::ToJsonb => {
-                        // An array of json/jsonb elements nests them one level (json.md §6.4).
-                        let out = value_to_node(&vals[0])?;
-                        json::check_depth(&out)?;
-                        let out = Value::Jsonb(out);
-                        // A growth kernel (cost.md §8.1), free over constant operands.
-                        if !args.iter().all(rexpr_is_constant) {
-                            charge_output(m, &out)?;
-                        }
-                        Ok(out)
-                    }
                     // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string). The
                     // datetime/uuid/bytea/interval/float sources are a deferred 0A000 follow-on.
                     ScalarFunc::JsonScalar => {
@@ -2625,19 +2614,6 @@ impl RExpr {
                             Value::Jsonb(n) => json::jsonb_out(n),
                             _ => unreachable!("resolver restricts JSON_SERIALIZE to json/jsonb"),
                         });
-                        // A growth kernel (cost.md §8.1), free over constant operands.
-                        if !args.iter().all(rexpr_is_constant) {
-                            charge_output(m, &out)?;
-                        }
-                        Ok(out)
-                    }
-                    // to_json → the value's `json` image: a jsonb input renders canonical-spaced, a
-                    // json input verbatim, everything else the compact to_jsonb render (PG's
-                    // datum_to_json). This is the same per-type rule the json builders embed.
-                    ScalarFunc::ToJson => {
-                        let out = elem_json_text(&vals[0])?;
-                        json::check_text_depth(&out)?;
-                        let out = Value::Json(out);
                         // A growth kernel (cost.md §8.1), free over constant operands.
                         if !args.iter().all(rexpr_is_constant) {
                             charge_output(m, &out)?;
@@ -3010,10 +2986,7 @@ impl RExpr {
                 // The builders are growth kernels (cost.md §8.1), free over constant operands.
                 if matches!(
                     func,
-                    ArrayFunc::ArrayAppend
-                        | ArrayFunc::ArrayPrepend
-                        | ArrayFunc::ArrayCat
-                        | ArrayFunc::ArrayToJson
+                    ArrayFunc::ArrayAppend | ArrayFunc::ArrayPrepend | ArrayFunc::ArrayCat
                 ) && !args.iter().all(rexpr_is_constant)
                 {
                     charge_output(m, &out)?;
@@ -3085,10 +3058,10 @@ impl RExpr {
                 };
                 Ok(Value::Int(count as i64))
             }
-            // row_to_json(record [, pretty]) (json-sql-functions.md §2.2): the composite rendered as a
-            // json object. STRICT. A finite timestamptz at any depth charges one `timezone` unit,
+            // A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
+            // row_to_json. STRICT. A finite timestamptz at any depth charges one `timezone` unit,
             // charged and guarded before rendering (the array → text cast's rule, timezones.md §9.5).
-            RExpr::RowToJson { args, ty } => {
+            RExpr::JsonImage { func, args, ty } => {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -3097,20 +3070,38 @@ impl RExpr {
                 if vals.iter().any(|v| matches!(v, Value::Null)) {
                     return Ok(Value::Null);
                 }
-                let (Value::Composite(fields), ResolvedType::Composite(c)) = (&vals[0], ty) else {
-                    unreachable!("resolver restricts row_to_json to a composite record")
-                };
                 let pretty = matches!(vals.get(1), Some(Value::Bool(true)));
                 let zoned = vals[0].zone_render_count();
                 if zoned > 0 {
                     m.charge(COSTS.timezone * zoned as i64);
                     m.guard()?;
                 }
-                let mut text = String::new();
-                composite_to_json(fields, c, pretty, &env.exec.session.time_zone, &mut text)?;
-                // A jsonb field can nest a deep document (json.md §6.4).
-                json::check_text_depth(&text)?;
-                let out = Value::Json(text);
+                let zone = &env.exec.session.time_zone;
+                let out = if *func == JsonImageFunc::ToJsonb {
+                    let node = datum_to_jsonb(&vals[0], ty, zone)?;
+                    // An array or composite of json/jsonb nests them deeper (json.md §6.4).
+                    json::check_depth(&node)?;
+                    Value::Jsonb(node)
+                } else {
+                    let mut text = String::new();
+                    match (func, &vals[0], ty) {
+                        (
+                            JsonImageFunc::RowToJson,
+                            Value::Composite(fields),
+                            ResolvedType::Composite(c),
+                        ) => composite_to_json(fields, c, pretty, zone, &mut text)?,
+                        (
+                            JsonImageFunc::ArrayToJson,
+                            Value::Array(a),
+                            ResolvedType::Array(elem),
+                        ) => array_to_json(a, elem, pretty, zone, &mut text)?,
+                        (JsonImageFunc::ToJson, v, ty) => datum_to_json(v, ty, zone, &mut text)?,
+                        _ => unreachable!("resolver restricts the JSON-image argument types"),
+                    }
+                    // A jsonb element or field can nest a deep document (json.md §6.4).
+                    json::check_text_depth(&text)?;
+                    Value::Json(text)
+                };
                 // A growth kernel (cost.md §8.1), free over constant operands.
                 if !args.iter().all(rexpr_is_constant) {
                     charge_output(m, &out)?;
@@ -3125,6 +3116,7 @@ impl RExpr {
                 json,
                 args,
                 array_form,
+                tys,
             } => {
                 m.charge(COSTS.operator_eval);
                 let vals: Vec<Value> = if *array_form {
@@ -3141,22 +3133,42 @@ impl RExpr {
                     vs
                 };
                 m.charge(COSTS.operator_eval * vals.len() as i64);
+                // A finite timestamptz at any depth renders in the session zone: one `timezone` unit
+                // each, charged before rendering (json-sql-functions.md §2.2).
+                let zoned: u64 = vals.iter().map(Value::zone_render_count).sum();
+                m.charge(COSTS.timezone * zoned as i64);
                 m.guard()?;
+                // Each argument's static type: the spread form's own, the VARIADIC-array form's element.
+                let elem_ty = |i: usize| -> &ResolvedType {
+                    if *array_form {
+                        match &tys[0] {
+                            ResolvedType::Array(e) => e,
+                            _ => &ResolvedType::Null,
+                        }
+                    } else {
+                        &tys[i]
+                    }
+                };
+                let zone = &env.exec.session.time_zone;
                 let out = match kind {
                     JsonBuildKind::Array => {
                         if *json {
-                            let mut parts = Vec::with_capacity(vals.len());
-                            for v in &vals {
-                                parts.push(elem_json_text(v)?);
+                            // PG's json_build_array: each element's json image, joined with ", ".
+                            let mut out = String::from("[");
+                            for (i, v) in vals.iter().enumerate() {
+                                if i > 0 {
+                                    out.push_str(", ");
+                                }
+                                datum_to_json(v, elem_ty(i), zone, &mut out)?;
                             }
+                            out.push(']');
                             // The builders nest their arguments one level (json.md §6.4).
-                            let out = format!("[{}]", parts.join(", "));
                             json::check_text_depth(&out)?;
                             Value::Json(out)
                         } else {
                             let mut nodes = Vec::with_capacity(vals.len());
-                            for v in &vals {
-                                nodes.push(value_to_node(v)?);
+                            for (i, v) in vals.iter().enumerate() {
+                                nodes.push(datum_to_jsonb(v, elem_ty(i), zone)?);
                             }
                             let out = JsonNode::Array(nodes);
                             json::check_depth(&out)?;
@@ -3171,23 +3183,37 @@ impl RExpr {
                             ));
                         }
                         if *json {
-                            let mut parts = Vec::with_capacity(vals.len() / 2);
+                            // PG's json_build_object: `key : value` pairs joined with ", "; a key is
+                            // always a JSON string. A NULL key is 22004 (the jsonb form's is 22023).
+                            let mut out = String::from("{");
                             for (i, pair) in vals.chunks_exact(2).enumerate() {
-                                let key = object_key_text(&pair[0], 2 * i + 1)?;
-                                parts.push(format!(
-                                    "{} : {}",
-                                    json::json_compact_out(&JsonNode::String(key)),
-                                    elem_json_text(&pair[1])?
-                                ));
+                                if matches!(pair[0], Value::Null) {
+                                    return Err(object_key_null());
+                                }
+                                if i > 0 {
+                                    out.push_str(", ");
+                                }
+                                json::write_json_string(&json_key_text(&pair[0], zone)?, &mut out);
+                                out.push_str(" : ");
+                                datum_to_json(&pair[1], elem_ty(2 * i + 1), zone, &mut out)?;
                             }
-                            let out = format!("{{{}}}", parts.join(", "));
+                            out.push('}');
                             json::check_text_depth(&out)?;
                             Value::Json(out)
                         } else {
                             let mut members = Vec::with_capacity(vals.len() / 2);
                             for (i, pair) in vals.chunks_exact(2).enumerate() {
-                                let key = object_key_text(&pair[0], 2 * i + 1)?;
-                                members.push((key, value_to_node(&pair[1])?));
+                                if matches!(pair[0], Value::Null) {
+                                    return Err(EngineError::new(
+                                        SqlState::InvalidParameterValue,
+                                        format!("argument {}: key must not be null", 2 * i + 1),
+                                    ));
+                                }
+                                let key = json_key_text(&pair[0], zone)?;
+                                members.push((
+                                    key,
+                                    datum_to_jsonb(&pair[1], elem_ty(2 * i + 1), zone)?,
+                                ));
                             }
                             let out = json::make_object(members);
                             json::check_depth(&out)?;

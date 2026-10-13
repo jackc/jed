@@ -1,0 +1,374 @@
+# The JSON image of every value type (spec/design/json-sql-functions.md §2.2), through to_json,
+# to_jsonb, array_to_json, the json[b] builders, and the json[b] aggregates — PostgreSQL's
+# datum_to_json (json.c) and datum_to_jsonb (jsonb.c). A composite is an object (to_jsonb: canonical
+# key order); an array of any dimensionality nests (lower bounds dropped); date/timestamp/timestamptz
+# are ISO 8601 strings (a timestamptz in the session zone); interval/uuid/bytea/range/jsonpath are the
+# string of their text output. A json value embeds verbatim in json and parses into jsonb; a jsonb value
+# embeds its canonical spaced text in json. An object key is always a string; an array, composite,
+# json, or jsonb key is 22023. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.group_by, types.composite, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.i64, types.text, types.boolean, types.decimal, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.uuid, types.bytea, types.range, func.range_constructors, cast.explicit, cast.operator, session.timezone, func.to_jsonb, func.json_builders, func.json_agg, func.json_object_agg
+
+# load-timezone: Asia/Kolkata
+
+# --- to_json / to_jsonb of each source type ---
+
+# A composite: an anonymous ROW's fields are f1, f2, …. to_json keeps declaration order; to_jsonb is
+# a jsonb object, so its keys take the canonical order (shorter first, then bytewise).
+statement ok
+CREATE TYPE pair AS (zz i32, a text)
+
+query TT nosort
+SELECT to_json(ROW(1, 'x', NULL)), to_jsonb(ROW(1, 'x', NULL))
+----
+{"f1":1,"f2":"x","f3":null}
+{"f1": 1, "f2": "x", "f3": null}
+
+query TT nosort
+SELECT to_json('(5,b)'::pair), to_jsonb('(5,b)'::pair)
+----
+{"zz":5,"a":"b"}
+{"a": "b", "zz": 5}
+
+# A nested composite and a composite with array / json / jsonb fields. to_jsonb parses a json field,
+# so its duplicate key collapses (last wins); to_json embeds it verbatim.
+query T nosort
+SELECT to_json(ROW(ROW(1, 2), ARRAY['a', NULL], '{"k" : 1, "k": 2}'::json, '{"b":1, "a":2}'::jsonb))
+----
+{"f1":{"f1":1,"f2":2},"f2":["a",null],"f3":{"k" : 1, "k": 2},"f4":{"a": 2, "b": 1}}
+
+query T nosort
+SELECT to_jsonb(ROW(ROW(1, 2), ARRAY['a', NULL], '{"k" : 1, "k": 2}'::json, '{"b":1, "a":2}'::jsonb))
+----
+{"f1": {"f1": 1, "f2": 2}, "f2": ["a", null], "f3": {"k": 2}, "f4": {"a": 2, "b": 1}}
+
+# Datetimes: ISO 8601 strings — a T separator, a trimmed fraction, ±infinity as words, a BC suffix.
+query TTTTT nosort
+SELECT to_json(date '2024-01-15'), to_json(timestamp '2024-01-15 10:30:00.5'), to_json(date 'infinity'), to_json(timestamp '-infinity'), to_json(timestamp '0044-03-15 10:00:00 BC')
+----
+"2024-01-15"
+"2024-01-15T10:30:00.5"
+"infinity"
+"-infinity"
+"0044-03-15T10:00:00 BC"
+
+query TTT nosort
+SELECT to_jsonb(date '2024-01-15'), to_jsonb(timestamp '2024-01-15 10:30:00'), to_jsonb(date '0044-03-15 BC')
+----
+"2024-01-15"
+"2024-01-15T10:30:00"
+"0044-03-15 BC"
+
+# A timestamptz renders in the session zone, with an offset of at least hours and minutes.
+query TT nosort
+SELECT to_json(timestamptz '2024-01-15 12:00:00+00'), to_jsonb(timestamptz '2024-01-15 12:00:00.25+00')
+----
+"2024-01-15T12:00:00+00:00"
+"2024-01-15T12:00:00.25+00:00"
+
+# timezone: Asia/Kolkata
+query TT nosort
+SELECT to_json(timestamptz '2024-01-15 12:00:00+00'), to_jsonb(ARRAY[timestamptz '2024-01-15 12:00:00+00'])
+----
+"2024-01-15T17:30:00+05:30"
+["2024-01-15T17:30:00+05:30"]
+
+# Every other type is the JSON string of its text output.
+query TTTTTTT nosort
+SELECT to_json(interval '1 day 02:00:00'), to_json(uuid 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), to_json('\x0102'::bytea), to_json(int4range(1, 5)), to_json('empty'::int4range), to_json('[1.5,2.5]'::numrange), to_json('$.a[*] ? (@ > 1)'::jsonpath)
+----
+"1 day 02:00:00"
+"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+"\\x0102"
+"[1,5)"
+"empty"
+"[1.5,2.5]"
+"$.\"a\"[*]?(@ > 1)"
+
+query TTTTT nosort
+SELECT to_jsonb(interval '-3 mons'), to_jsonb(uuid 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), to_jsonb('\xff'::bytea), to_jsonb(daterange('2024-01-01', '2024-02-01')), to_jsonb('$.a'::jsonpath)
+----
+"-3 mons"
+"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+"\\xff"
+"[2024-01-01,2024-02-01)"
+"$.\"a\""
+
+# timezone: Asia/Kolkata
+query T nosort
+SELECT to_jsonb(tstzrange('2024-01-01 00:00:00+00', '2024-02-01 00:00:00+00'))
+----
+"[\"2024-01-01 05:30:00+05:30\",\"2024-02-01 05:30:00+05:30\")"
+
+# Arrays: multidimensional arrays nest, a non-default lower bound is dropped, an empty array is [].
+# to_json renders compact; to_jsonb spaced.
+query TTTT nosort
+SELECT to_json('{{1,2},{3,4}}'::i32[]), to_jsonb('{{1,2},{3,4}}'::i32[]), to_json('[2:3]={5,6}'::i32[]), to_jsonb('{}'::i32[])
+----
+[[1,2],[3,4]]
+[[1, 2], [3, 4]]
+[5,6]
+[]
+
+# Array elements of every kind: a jsonb element embeds its spaced canonical text in json, a json
+# element verbatim; composite and date elements take their own images.
+query TT nosort
+SELECT to_json(ARRAY['{"a":1}'::jsonb, '[1,2]'::jsonb]), to_json(ARRAY['{"a" :1}'::json])
+----
+[{"a": 1},[1, 2]]
+[{"a" :1}]
+
+query TT nosort
+SELECT to_json(ARRAY['(1,x)'::pair, NULL]), to_jsonb(ARRAY['(1,x)'::pair, NULL])
+----
+[{"zz":1,"a":"x"},null]
+[{"a": "x", "zz": 1}, null]
+
+query TT nosort
+SELECT to_json(ARRAY[date '2024-01-15', NULL]), to_jsonb('{{2024-01-15},{2024-02-15}}'::date[])
+----
+["2024-01-15",null]
+[["2024-01-15"], ["2024-02-15"]]
+
+# --- array_to_json(anyarray [, pretty]) ---
+
+# Multidimensional arrays nest; an array of a composite renders objects.
+query TT nosort
+SELECT array_to_json('{{1,2},{3,4}}'::i32[]), array_to_json(ARRAY['(1,x)'::pair])
+----
+[[1,2],[3,4]]
+[{"zz":1,"a":"x"}]
+
+# pretty = true breaks only the outermost dimension's items onto new lines (shown with the newline
+# replaced by ~); inner dimensions and elements stay on one line.
+query TTTT nosort
+SELECT replace(array_to_json('{{1,2},{3,4}}'::i32[], true)::text, chr(10), '~'), replace(array_to_json(ARRAY[1, 2, 3], true)::text, chr(10), '~'), array_to_json(ARRAY[7], true), array_to_json('{}'::i32[], true)
+----
+[[1,2],~ [3,4]]
+[1,~ 2,~ 3]
+[7]
+[]
+
+query T nosort
+SELECT replace(array_to_json(ARRAY['(1,x)'::pair, '(2,y)'::pair], true)::text, chr(10), '~')
+----
+[{"zz":1,"a":"x"},~ {"zz":2,"a":"y"}]
+
+# pretty = false is the compact form; a bare string literal adapts to the flag; NULL operands → NULL.
+query TTTT nosort
+SELECT array_to_json(ARRAY[1, 2], false), array_to_json(ARRAY[1, 2], 'false'), array_to_json(ARRAY[1, 2], NULL), array_to_json(NULL::i32[], true)
+----
+[1,2]
+[1,2]
+NULL
+NULL
+
+statement error 22P02
+SELECT array_to_json(ARRAY[1], 'maybe')
+
+statement error 42883
+SELECT array_to_json(1)
+
+statement error 42883
+SELECT array_to_json(ARRAY[1], 1)
+
+statement error 42883
+SELECT array_to_json(ARRAY[1], true, true)
+
+# --- the builders ---
+
+# A builder value takes the same image as to_json / to_jsonb.
+query T nosort
+SELECT json_build_array(ROW(1, 'a'), date '2024-01-15', timestamp '2024-01-15 10:30:00', interval '1 day', '{{1,2},{3,4}}'::i32[], '{"a":1}'::jsonb, '{"a" :1}'::json)
+----
+[{"f1":1,"f2":"a"}, "2024-01-15", "2024-01-15T10:30:00", "1 day", [[1,2],[3,4]], {"a": 1}, {"a" :1}]
+
+query T nosort
+SELECT jsonb_build_array(ROW(1, 'a'), date '2024-01-15', timestamp '2024-01-15 10:30:00', interval '1 day', '{{1,2},{3,4}}'::i32[], '{"a":1}'::jsonb, '{"a" :1, "a": 2}'::json)
+----
+[{"f1": 1, "f2": "a"}, "2024-01-15", "2024-01-15T10:30:00", "1 day", [[1, 2], [3, 4]], {"a": 1}, {"a": 2}]
+
+query TT nosort
+SELECT json_build_object('p', '(1,x)'::pair, 'u', uuid 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'r', int4range(1, 5)), jsonb_build_object('p', '(1,x)'::pair, 'b', '\x01'::bytea)
+----
+{"p" : {"zz":1,"a":"x"}, "u" : "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "r" : "[1,5)"}
+{"b": "\\x01", "p": {"a": "x", "zz": 1}}
+
+# The VARIADIC-array form converts each element by the array's element type.
+query TT nosort
+SELECT json_build_array(VARIADIC ARRAY[date '2024-01-15', date '2024-02-15']), jsonb_build_array(VARIADIC ARRAY['(1,x)'::pair])
+----
+["2024-01-15", "2024-02-15"]
+[{"a": "x", "zz": 1}]
+
+# A key is always a JSON string: a number or boolean is its text, a datetime its ISO 8601 form, any
+# other scalar its text output.
+query T nosort
+SELECT json_build_object(1.50, 1, true, 2, date '2024-01-15', 3, timestamp '2024-01-15 10:30:00', 4, timestamptz '2024-01-15 12:00:00+00', 5, interval '1 day', 6, int4range(1, 5), 7)
+----
+{"1.50" : 1, "true" : 2, "2024-01-15" : 3, "2024-01-15T10:30:00" : 4, "2024-01-15T12:00:00+00:00" : 5, "1 day" : 6, "[1,5)" : 7}
+
+query T nosort
+SELECT jsonb_build_object(date '2024-01-15', 1, uuid 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 2, '\x01'::bytea, 3)
+----
+{"\\x01": 3, "2024-01-15": 1, "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11": 2}
+
+# An array, composite, json, or jsonb key is 22023.
+statement error 22023
+SELECT json_build_object(ARRAY[1], 1)
+
+statement error 22023
+SELECT json_build_object(ROW(1), 1)
+
+statement error 22023
+SELECT json_build_object('{"a":1}'::json, 1)
+
+statement error 22023
+SELECT jsonb_build_object('{"a":1}'::jsonb, 1)
+
+statement error 22023
+SELECT jsonb_build_object(ARRAY['a'], 1)
+
+# A NULL key: json_build_object 22004, jsonb_build_object 22023.
+statement error 22004
+SELECT json_build_object(NULL, 1)
+
+statement error 22023
+SELECT jsonb_build_object(NULL, 1)
+
+# --- the aggregates ---
+
+statement ok
+CREATE TABLE ev (id i32 PRIMARY KEY, grp i32, p pair, d date, at timestamptz, tags i32[], doc json, body jsonb)
+
+statement ok
+INSERT INTO ev VALUES (1, 1, '(1,x)'::pair, '2024-01-15', '2024-01-15 12:00:00+00', '{1,2}', '{"a" :1}', '{"b":1, "a":2}')
+
+statement ok
+INSERT INTO ev (id, grp) VALUES (2, 1)
+
+statement ok
+INSERT INTO ev VALUES (3, 2, '(3,z)'::pair, '2024-03-15', '2024-03-15 06:00:00+00', '{{1,2},{3,4}}', '[1,  2]', '[true]')
+
+# json_agg: elements joined with ", "; an array or composite element after the first also starts a new
+# line (shown with the newline replaced by ~); a json element verbatim, a jsonb element spaced.
+query T nosort
+SELECT replace(json_agg(p ORDER BY id)::text, chr(10), '~') FROM ev
+----
+[{"zz":1,"a":"x"}, null, ~ {"zz":3,"a":"z"}]
+
+query T nosort
+SELECT replace(json_agg(tags ORDER BY id)::text, chr(10), '~') FROM ev
+----
+[[1,2], null, ~ [[1,2],[3,4]]]
+
+query TTT nosort
+SELECT json_agg(d ORDER BY id), json_agg(doc ORDER BY id), json_agg(body ORDER BY id) FROM ev
+----
+["2024-01-15", null, "2024-03-15"]
+[{"a" :1}, null, [1,  2]]
+[{"a": 2, "b": 1}, null, [true]]
+
+query TT nosort
+SELECT json_agg_strict(at ORDER BY id), replace(json_agg_strict(p ORDER BY id)::text, chr(10), '~') FROM ev
+----
+["2024-01-15T12:00:00+00:00", "2024-03-15T06:00:00+00:00"]
+[{"zz":1,"a":"x"}, ~ {"zz":3,"a":"z"}]
+
+# jsonb_agg: each input's jsonb image (a json input parsed, a composite in canonical key order).
+query TT nosort
+SELECT jsonb_agg(p ORDER BY id), jsonb_agg(tags ORDER BY id) FROM ev
+----
+[{"a": "x", "zz": 1}, null, {"a": "z", "zz": 3}]
+[[1, 2], null, [[1, 2], [3, 4]]]
+
+query TT nosort
+SELECT jsonb_agg(doc ORDER BY id), jsonb_agg_strict(d ORDER BY id) FROM ev
+----
+[{"a": 1}, null, [1, 2]]
+["2024-01-15", "2024-03-15"]
+
+# timezone: Asia/Kolkata
+query IT nosort
+SELECT grp, jsonb_agg(at ORDER BY id) FROM ev GROUP BY grp ORDER BY grp
+----
+1
+["2024-01-15T17:30:00+05:30", null]
+2
+["2024-03-15T11:30:00+05:30"]
+
+# As a window aggregate: the running frame's images.
+query IT nosort
+SELECT id, replace(json_agg(p) OVER (ORDER BY id)::text, chr(10), '~') FROM ev ORDER BY id
+----
+1
+[{"zz":1,"a":"x"}]
+2
+[{"zz":1,"a":"x"}, null]
+3
+[{"zz":1,"a":"x"}, null, ~ {"zz":3,"a":"z"}]
+
+# json_object_agg / jsonb_object_agg: a key is always a string, a value its JSON image.
+query T nosort
+SELECT json_object_agg(d, p ORDER BY id) FROM ev WHERE d IS NOT NULL
+----
+{ "2024-01-15" : {"zz":1,"a":"x"}, "2024-03-15" : {"zz":3,"a":"z"} }
+
+query T nosort
+SELECT jsonb_object_agg(id, p ORDER BY id) FROM ev
+----
+{"1": {"a": "x", "zz": 1}, "2": null, "3": {"a": "z", "zz": 3}}
+
+query TT nosort
+SELECT json_object_agg(at, doc ORDER BY id), jsonb_object_agg(at, doc ORDER BY id) FROM ev WHERE at IS NOT NULL
+----
+{ "2024-01-15T12:00:00+00:00" : {"a" :1}, "2024-03-15T06:00:00+00:00" : [1,  2] }
+{"2024-01-15T12:00:00+00:00": {"a": 1}, "2024-03-15T06:00:00+00:00": [1, 2]}
+
+# A NULL key: json_object_agg 22004, jsonb_object_agg 22023. A non-scalar key is 22023.
+statement error 22004
+SELECT json_object_agg(d, id) FROM ev
+
+statement error 22023
+SELECT jsonb_object_agg(d, id) FROM ev
+
+statement error 22023
+SELECT json_object_agg(tags, id) FROM ev WHERE id = 1
+
+statement error 22023
+SELECT jsonb_object_agg(p, id) FROM ev WHERE id = 1
+
+# --- session zone ---
+
+# A conversion that renders a timestamptz follows the session zone, so it cannot be an index
+# expression (PostgreSQL marks these functions STABLE).
+statement ok
+CREATE TABLE stamps (id i32 PRIMARY KEY, at timestamptz, ats timestamptz[])
+
+statement error 42P17
+CREATE INDEX stamps_json ON stamps ((to_json(at)::text))
+
+statement error 42P17
+CREATE INDEX stamps_jsonb ON stamps ((to_jsonb(ats)))
+
+statement error 42P17
+CREATE INDEX stamps_arr ON stamps ((array_to_json(ats)::text))
+
+statement error 42P17
+CREATE INDEX stamps_build ON stamps ((jsonb_build_object('at', at)))
+
+# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
+
+# A float is a deferred 0A000 wherever it is converted to JSON (float.md: binary floats stay out of
+# jed's text output paths). PostgreSQL renders the float8out text as a JSON number.
+statement error 0A000
+SELECT to_json(1.5::f64)
+
+statement error 0A000
+SELECT to_jsonb(ARRAY[1.5::f64])
+
+statement error 0A000
+SELECT json_build_object(1.5::f64, 1)
+
+statement error 0A000
+SELECT jsonb_agg(x) FROM (VALUES (1.5::f64)) v(x)

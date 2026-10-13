@@ -396,10 +396,6 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfJsonStripNulls
 	case "jsonb_pretty":
 		return sfJsonbPretty
-	case "to_jsonb":
-		return sfToJsonb
-	case "to_json":
-		return sfToJson
 	case "json_scalar":
 		return sfJsonScalar
 	case "json_serialize":
@@ -561,8 +557,6 @@ func arrayFuncID(name string) arrayFunc {
 		return afPosition
 	case "array_positions":
 		return afPositions
-	case "array_to_json":
-		return afToJson
 	default:
 		panic("arrayFuncID: " + name + " is not a catalog array function")
 	}
@@ -1955,107 +1949,6 @@ func jsonArgShape(v Value) (JsonNode, error) {
 	}
 }
 
-// valueToNode is the JSON image of any value — the to_jsonb kernel (json-sql-functions.md §2), also
-// reused by the json aggregates (B4). Numbers stay exact (decimal, never float); a json/jsonb value
-// canonicalizes; a 1-D array maps to a JSON array recursively (a NULL element → JSON null). The
-// type-info-dependent / float-divergent sources — composite (needs field names), float (the
-// binary→decimal divergence), datetime/uuid/bytea/interval (string-render divergences), and a
-// multidimensional array — are a deferred 0A000 follow-on.
-func valueToNode(v Value) (JsonNode, error) {
-	switch v.Kind {
-	case ValNull: // an array element (a top-level NULL is strict-propagated)
-		return JsonNode{Kind: JNull}, nil
-	case ValBool:
-		return JsonNode{Kind: JBool, B: v.boolVal()}, nil
-	case ValInt:
-		return JsonNode{Kind: JNumber, Num: decimalFromInt64(v.Int)}, nil
-	case ValDecimal:
-		return JsonNode{Kind: JNumber, Num: *v.decimal()}, nil
-	case ValText:
-		return JsonNode{Kind: JString, S: v.str()}, nil
-	case ValJsonb:
-		return *v.jsonb(), nil
-	case ValJson:
-		return jsonbIn(v.str())
-	case ValArray:
-		arr := v.arrayVal()
-		if arr.Ndim() > 1 {
-			return JsonNode{}, newError(FeatureNotSupported,
-				"to_jsonb of a multidimensional array is not supported yet")
-		}
-		elems := make([]JsonNode, 0, len(arr.Elements))
-		for i := range arr.Elements {
-			node, err := valueToNode(arr.Elements[i])
-			if err != nil {
-				return JsonNode{}, err
-			}
-			elems = append(elems, node)
-		}
-		return JsonNode{Kind: JArray, Arr: elems}, nil
-	case ValFloat32, ValFloat64:
-		return JsonNode{}, newError(FeatureNotSupported,
-			"to_jsonb of a float value is not supported yet")
-	case ValComposite:
-		return JsonNode{}, newError(FeatureNotSupported,
-			"to_jsonb of a composite value is not supported yet")
-	case ValUuid, ValDate, ValTimestamp, ValTimestamptz, ValInterval, ValBytea:
-		return JsonNode{}, newError(FeatureNotSupported,
-			"to_jsonb of this type is not supported yet")
-	case ValRange:
-		return JsonNode{}, newError(FeatureNotSupported,
-			"to_jsonb of a range value is not supported yet")
-	case ValJsonPath:
-		return JsonNode{}, newError(FeatureNotSupported,
-			"to_jsonb of a jsonpath value is not supported yet")
-	default: // ValUnfetched
-		panic("BUG: unfetched large value escaped the storage layer")
-	}
-}
-
-// elemJsonText is one element's `json`-builder text image (json-sql-functions.md §2): a `json` value
-// embeds VERBATIM, a `jsonb` value its canonical (spaced) render, everything else the compact
-// to_jsonb image. This is how PG's json_build_array / json_build_object (and to_json) embed an
-// argument's own json form.
-func elemJsonText(v Value) (string, error) {
-	switch v.Kind {
-	case ValJson:
-		return v.str(), nil
-	case ValJsonb:
-		return jsonbOut(v.jsonb()), nil
-	default:
-		node, err := valueToNode(v)
-		if err != nil {
-			return "", err
-		}
-		return jsonCompactOut(&node), nil
-	}
-}
-
-// objectKeyText is the text form of a json[b]_build_object KEY argument (1-based `pos` for the error
-// message). PG coerces a key to text via the type's output: text as-is, integer/decimal/boolean
-// rendered. A NULL key is 22023; a non-scalar key type is a deferred 0A000 follow-on.
-func objectKeyText(v Value, pos int) (string, error) {
-	switch v.Kind {
-	case ValNull:
-		return "", newError(InvalidParameterValue,
-			"argument "+strconv.Itoa(pos)+": key must not be null")
-	case ValText:
-		return v.str(), nil
-	case ValInt:
-		return strconv.FormatInt(v.Int, 10), nil
-	case ValDecimal:
-		return v.decimal().Render(), nil
-	case ValBool:
-		if v.boolVal() {
-			return "true", nil
-		}
-		return "false", nil
-	default:
-		return "", newError(FeatureNotSupported,
-			"a json_build_object key of this type is not supported yet")
-	}
-}
-
 // objectKeyNull is the 22004 raised when a json_object / jsonb_object key element is NULL.
 func objectKeyNull() error {
 	return newError(NullValueNotAllowed, "null value not allowed for object key")
@@ -2579,27 +2472,55 @@ func resolveJSONObject(s *scope, name string, jsonResult bool, fc *funcCallExpr,
 	return &rExpr{kind: reJsonObject, jbJson: jsonResult, sargs: rargs}, resolvedType{kind: result}, nil
 }
 
-// resolveRowToJSON resolves `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) →
-// json. The record is any composite (named or an anonymous ROW(…)) or an untyped NULL; a bare string
-// literal is PG's anonymous `record`, which has no input function (0A000); any other type is 42883.
-// The optional flag is a boolean (a bare string literal adapts). A timestamptz anywhere in the
-// record's type renders in the session zone, which makes the call nonimmutable (42P17 in an index
-// expression).
-func resolveRowToJSON(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	if len(fc.Args) == 0 || len(fc.Args) > 2 {
-		return nil, resolvedType{}, noFuncOverload("row_to_json")
+// jsonImageClassify maps a JSON-image function name to its jsonImageFunc (json-sql-functions.md §2.2).
+func jsonImageClassify(name string) (jsonImageFunc, bool) {
+	switch name {
+	case "to_json":
+		return jiToJson, true
+	case "to_jsonb":
+		return jiToJsonb, true
+	case "array_to_json":
+		return jiArrayToJson, true
+	case "row_to_json":
+		return jiRowToJson, true
 	}
-	if isStringLiteral(*fc.Args[0]) {
+	return 0, false
+}
+
+// resolveJSONImage resolves a JSON-image function (json-sql-functions.md §2.2) → json (to_jsonb:
+// jsonb): to_json(anyelement) / to_jsonb(anyelement) take any value; array_to_json(anyarray [, pretty])
+// an array; row_to_json(record [, pretty]) any composite (named or an anonymous ROW(…)). An untyped
+// NULL is accepted (STRICT → NULL). For row_to_json a bare string literal is PG's anonymous `record`,
+// which has no input function (0A000); any other wrong type is 42883. The optional flag is a boolean
+// (a bare string literal adapts). A timestamptz anywhere in the value's type renders in the session
+// zone, which makes the call nonimmutable (42P17 in an index expression).
+func resolveJSONImage(s *scope, fn jsonImageFunc, name string, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	takesFlag := fn == jiArrayToJson || fn == jiRowToJson
+	maxArgs := 1
+	if takesFlag {
+		maxArgs = 2
+	}
+	if len(fc.Args) == 0 || len(fc.Args) > maxArgs {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	if fn == jiRowToJson && isStringLiteral(*fc.Args[0]) {
 		return nil, resolvedType{}, newError(FeatureNotSupported, "input of anonymous composite types is not implemented")
 	}
-	record, ty, err := resolve(s, *fc.Args[0], nil, ag, params)
+	value, ty, err := resolve(s, *fc.Args[0], nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	if ty.kind != rtComposite && ty.kind != rtNull {
-		return nil, resolvedType{}, noFuncOverload("row_to_json")
+	admitted := true
+	switch fn {
+	case jiArrayToJson:
+		admitted = ty.kind == rtArray || ty.kind == rtNull
+	case jiRowToJson:
+		admitted = ty.kind == rtComposite || ty.kind == rtNull
 	}
-	sargs := []*rExpr{record}
+	if !admitted {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	sargs := []*rExpr{value}
 	if len(fc.Args) == 2 {
 		flag := *fc.Args[1]
 		var f *rExpr
@@ -2617,14 +2538,18 @@ func resolveRowToJSON(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 				return nil, resolvedType{}, err
 			}
 			if tf.kind != rtBool && tf.kind != rtNull {
-				return nil, resolvedType{}, noFuncOverload("row_to_json")
+				return nil, resolvedType{}, noFuncOverload(name)
 			}
 			f = r
 		}
 		sargs = append(sargs, f)
 	}
 	params.nonimmutable = params.nonimmutable || ty.containsTimestamptz()
-	return &rExpr{kind: reRowToJson, sargs: sargs, recordType: &ty}, resolvedType{kind: rtJson}, nil
+	result := resolvedType{kind: rtJson}
+	if fn == jiToJsonb {
+		result = resolvedType{kind: rtJsonb}
+	}
+	return &rExpr{kind: reJsonImage, jiFunc: fn, sargs: sargs, jiType: &ty}, result, nil
 }
 
 // valueToOptTextArray extracts a `text[]` value into a []*string, preserving NULL elements (a nil
@@ -2895,16 +2820,18 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveJSONSetInsert(s, name, mode, fc, ag, params)
 	}
-	// row_to_json(record [, pretty boolean]) (json-sql-functions.md §2.2) takes any composite — the
-	// catalog has no `record` family — so it is hand-resolved too.
-	if name == "row_to_json" {
+	// The JSON-image functions (json-sql-functions.md §2.2) carry their argument's static type to
+	// eval (a composite's field names key its members), so they are hand-resolved: row_to_json takes
+	// any composite (the catalog has no `record` family); to_json / to_jsonb / array_to_json keep
+	// their catalog rows as data.
+	if fn, ok := jsonImageClassify(name); ok {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
 		if fc.Star {
 			return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
-		return resolveRowToJSON(s, fc, ag, params)
+		return resolveJSONImage(s, fn, name, fc, ag, params)
 	}
 	// json_object / jsonb_object (json-sql-functions.md §2) build an object from one text[] of
 	// alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
@@ -3487,6 +3414,7 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 	k := desc.Arity                    // declared parameter count (the last is variadic)
 	varFamily := desc.ArgFamilies[k-1] // the variadic element family (last slot)
 	rargs := make([]*rExpr, 0, len(fc.Args))
+	rtys := make([]resolvedType, 0, len(fc.Args))
 
 	if fc.Variadic {
 		// VARIADIC-array form: exactly k args (fixed params + the one array). The fixed params
@@ -3513,6 +3441,7 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 				return nil, resolvedType{}, noFuncOverload(name)
 			}
 			rargs = append(rargs, r)
+			rtys = append(rtys, t)
 		}
 	} else {
 		// Spread form: at least k args (so a variadic function needs ≥1 variadic arg — num_nulls()
@@ -3540,6 +3469,7 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 				return nil, resolvedType{}, noFuncOverload(name)
 			}
 			rargs = append(rargs, r)
+			rtys = append(rtys, t)
 		}
 	}
 
@@ -3547,7 +3477,11 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 	// The json/jsonb builders share the spread/array-form validation above but their own eval node
 	// and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep reVariadic.
 	if kind, isJSON, ok := jsonBuildClassify(name); ok {
-		return &rExpr{kind: reJsonBuild, jbKind: kind, jbJson: isJSON, sargs: rargs, variadicArray: fc.Variadic}, resolvedTypeOf(result), nil
+		// A timestamptz argument renders in the session zone (json-sql-functions.md §2.2).
+		for _, t := range rtys {
+			params.nonimmutable = params.nonimmutable || t.containsTimestamptz()
+		}
+		return &rExpr{kind: reJsonBuild, jbKind: kind, jbJson: isJSON, sargs: rargs, variadicArray: fc.Variadic, jbTypes: rtys}, resolvedTypeOf(result), nil
 	}
 	return &rExpr{kind: reVariadic, vfunc: variadicFuncID(name), sargs: rargs, variadicArray: fc.Variadic}, resolvedTypeOf(result), nil
 }

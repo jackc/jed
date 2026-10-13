@@ -1,7 +1,7 @@
 # json[b]_object_agg[_unique] — the JSON-object aggregate builders (B4,
 # spec/design/json-sql-functions.md §4). Aggregate a group's (key, value) pairs into one JSON object.
 # jsonb canonicalizes (last-wins dedup); json keeps row order + dups + the '{ … }' brace-padded
-# spacing. A key coerces to text; a NULL key → 22023; _unique on a duplicate → 22030. An empty group
+# spacing. A key coerces to text; a NULL key is an error; _unique on a duplicate → 22030. An empty group
 # → SQL NULL. The pairs follow the group's row order, deterministic under ORDER BY of the source.
 # Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.group_by, query.derived_table, types.jsonb, types.json, func.json_object_agg

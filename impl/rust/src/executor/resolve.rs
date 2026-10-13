@@ -445,114 +445,6 @@ pub(crate) fn json_pred_kind_matches(node: &JsonNode, kind: JsonPredicateKind) -
     }
 }
 
-/// The JSON image of any value — the `to_jsonb` kernel (json-sql-functions.md §2), also reused by
-/// the json aggregates (B4). Numbers stay exact (`decimal`, never float); a `json`/`jsonb` value
-/// canonicalizes; a 1-D array maps to a JSON array recursively (a NULL element → JSON null). The
-/// type-info-dependent / float-divergent sources — composite (needs field names), float (the
-/// binary→decimal divergence), datetime/uuid/bytea/interval (string-render divergences), and a
-/// multidimensional array — are a deferred `0A000` follow-on.
-pub(crate) fn value_to_node(v: &Value) -> Result<JsonNode> {
-    Ok(match v {
-        Value::Null => JsonNode::Null, // an array element (a top-level NULL is strict-propagated)
-        Value::Bool(b) => JsonNode::Bool(*b),
-        Value::Int(n) => JsonNode::Number(Decimal::from_i64(*n)),
-        Value::Decimal(d) => JsonNode::Number(d.clone()),
-        Value::Text(s) => JsonNode::String(s.clone()),
-        Value::Jsonb(n) => n.clone(),
-        Value::Json(s) => json::jsonb_in(s)?,
-        Value::Array(arr) => {
-            if arr.ndim() > 1 {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "to_jsonb of a multidimensional array is not supported yet",
-                ));
-            }
-            let mut elems = Vec::with_capacity(arr.elements.len());
-            for e in &arr.elements {
-                elems.push(value_to_node(e)?);
-            }
-            JsonNode::Array(elems)
-        }
-        Value::Float32(_) | Value::Float64(_) => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "to_jsonb of a float value is not supported yet",
-            ));
-        }
-        Value::Composite(_) => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "to_jsonb of a composite value is not supported yet",
-            ));
-        }
-        Value::Uuid(_)
-        | Value::Date(_)
-        | Value::Timestamp(_)
-        | Value::Timestamptz(_)
-        | Value::Interval(_)
-        | Value::Bytea(_) => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "to_jsonb of this type is not supported yet",
-            ));
-        }
-        Value::Range(_) => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "to_jsonb of a range value is not supported yet",
-            ));
-        }
-        Value::JsonPath(_) => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "to_jsonb of a jsonpath value is not supported yet",
-            ));
-        }
-        Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
-    })
-}
-
-/// One element's `json`-builder text image (json-sql-functions.md §2): a `json` value embeds VERBATIM,
-/// a `jsonb` value its canonical (spaced) render, everything else the compact `to_jsonb` image. This
-/// is how PG's `json_build_array`/`json_build_object` embed an argument's own json form.
-pub(crate) fn elem_json_text(v: &Value) -> Result<String> {
-    Ok(match v {
-        Value::Json(s) => s.clone(),
-        Value::Jsonb(n) => json::jsonb_out(n),
-        _ => json::json_compact_out(&value_to_node(v)?),
-    })
-}
-
-/// The text form of a `json[b]_build_object` KEY argument (1-based `pos` for the error message). PG
-/// coerces a key to text via the type's output: text as-is, integer/decimal/boolean rendered. A NULL
-/// key is `22023`; a non-scalar key type is a deferred `0A000` follow-on.
-pub(crate) fn object_key_text(v: &Value, pos: usize) -> Result<String> {
-    Ok(match v {
-        Value::Null => {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!("argument {pos}: key must not be null"),
-            ));
-        }
-        Value::Text(s) => s.clone(),
-        Value::Int(n) => n.to_string(),
-        Value::Decimal(d) => d.render(),
-        Value::Bool(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        _ => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "a json_build_object key of this type is not supported yet",
-            ));
-        }
-    })
-}
-
 /// The `22004` raised when a `json_object` / `jsonb_object` key element is NULL.
 pub(crate) fn object_key_null() -> EngineError {
     EngineError::new(
@@ -1081,31 +973,46 @@ pub(crate) fn resolve_json_object(
     Ok((RExpr::JsonObjectFromArrays { json, args: rargs }, result))
 }
 
-/// Resolve `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) → json. The record
-/// is any composite (named or an anonymous `ROW(…)`) or an untyped NULL; a bare string literal is PG's
-/// anonymous `record`, which has no input function (0A000); any other type is 42883. The optional
-/// flag is a boolean (a bare string literal adapts). A `timestamptz` anywhere in the record's type
-/// renders in the session zone, which makes the call nonimmutable (42P17 in an index expression).
-pub(crate) fn resolve_row_to_json(
+/// Resolve a JSON-image function (json-sql-functions.md §2.2) → json (`to_jsonb`: jsonb):
+/// `to_json(anyelement)` / `to_jsonb(anyelement)` take any value; `array_to_json(anyarray [, pretty])`
+/// an array; `row_to_json(record [, pretty])` any composite (named or an anonymous `ROW(…)`). An
+/// untyped NULL is accepted (STRICT → NULL). For `row_to_json` a bare string literal is PG's anonymous
+/// `record`, which has no input function (0A000); any other wrong type is 42883. The optional flag is a
+/// boolean (a bare string literal adapts). A `timestamptz` anywhere in the value's type renders in the
+/// session zone, which makes the call nonimmutable (42P17 in an index expression).
+pub(crate) fn resolve_json_image(
     scope: &Scope,
+    func: JsonImageFunc,
     args: &[Expr],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(no_func_overload("row_to_json"));
+    let name = match func {
+        JsonImageFunc::ToJson => "to_json",
+        JsonImageFunc::ToJsonb => "to_jsonb",
+        JsonImageFunc::ArrayToJson => "array_to_json",
+        JsonImageFunc::RowToJson => "row_to_json",
+    };
+    let takes_flag = matches!(func, JsonImageFunc::ArrayToJson | JsonImageFunc::RowToJson);
+    if args.is_empty() || args.len() > if takes_flag { 2 } else { 1 } {
+        return Err(no_func_overload(name));
     }
-    if is_string_literal(&args[0]) {
+    if func == JsonImageFunc::RowToJson && is_string_literal(&args[0]) {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "input of anonymous composite types is not implemented",
         ));
     }
-    let (record, ty) = resolve(scope, &args[0], None, agg, params)?;
-    if !matches!(ty, ResolvedType::Composite(_) | ResolvedType::Null) {
-        return Err(no_func_overload("row_to_json"));
+    let (value, ty) = resolve(scope, &args[0], None, agg, params)?;
+    let admitted = match func {
+        JsonImageFunc::ToJson | JsonImageFunc::ToJsonb => true,
+        JsonImageFunc::ArrayToJson => matches!(ty, ResolvedType::Array(_) | ResolvedType::Null),
+        JsonImageFunc::RowToJson => matches!(ty, ResolvedType::Composite(_) | ResolvedType::Null),
+    };
+    if !admitted {
+        return Err(no_func_overload(name));
     }
-    let mut rargs = vec![record];
+    let mut rargs = vec![value];
     if let Some(flag) = args.get(1) {
         // A bare string literal adapts to the boolean through PG's boolin (22P02 if malformed).
         let f = if let Expr::Literal(Literal::Text(s), _) = flag {
@@ -1113,14 +1020,26 @@ pub(crate) fn resolve_row_to_json(
         } else {
             let (f, tf) = resolve(scope, flag, Some(ScalarType::Bool), agg, params)?;
             if !matches!(tf, ResolvedType::Bool | ResolvedType::Null) {
-                return Err(no_func_overload("row_to_json"));
+                return Err(no_func_overload(name));
             }
             f
         };
         rargs.push(f);
     }
     params.nonimmutable |= ty.contains_timestamptz();
-    Ok((RExpr::RowToJson { args: rargs, ty }, ResolvedType::Json))
+    let result = if func == JsonImageFunc::ToJsonb {
+        ResolvedType::Jsonb
+    } else {
+        ResolvedType::Json
+    };
+    Ok((
+        RExpr::JsonImage {
+            func,
+            args: rargs,
+            ty,
+        },
+        result,
+    ))
 }
 
 /// Resolve a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb, path jsonpath)`. A

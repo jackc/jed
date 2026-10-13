@@ -31,9 +31,10 @@ pub(crate) fn fold_agg_whole(
     specs: &[AggSpec],
     src: &LaneSrc,
     nsurv: usize,
+    zone: &crate::timezone::ZoneRef,
     meter: &mut Meter,
 ) -> Result<Vec<Value>> {
-    let mut accs: Vec<Acc> = specs.iter().map(Acc::from_spec).collect();
+    let mut accs: Vec<Acc> = specs.iter().map(|s| Acc::from_spec(s, zone)).collect();
     // The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
     let mut charge = meter.state_charge();
     if charge.active() {
@@ -68,6 +69,7 @@ pub(crate) fn group_by_int_key(
     key_col: usize,
     src: &LaneSrc,
     nsurv: usize,
+    zone: &crate::timezone::ZoneRef,
     meter: &mut Meter,
 ) -> Result<Vec<Vec<Value>>> {
     let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
@@ -92,7 +94,10 @@ pub(crate) fn group_by_int_key(
                     }
                     let g = groups.len();
                     index.insert(*k, g);
-                    groups.push((kv.clone(), specs.iter().map(Acc::from_spec).collect()));
+                    groups.push((
+                        kv.clone(),
+                        specs.iter().map(|s| Acc::from_spec(s, zone)).collect(),
+                    ));
                     g
                 }
             },
@@ -106,7 +111,10 @@ pub(crate) fn group_by_int_key(
                     }
                     let g = groups.len();
                     null_gi = Some(g);
-                    groups.push((Value::Null, specs.iter().map(Acc::from_spec).collect()));
+                    groups.push((
+                        Value::Null,
+                        specs.iter().map(|s| Acc::from_spec(s, zone)).collect(),
+                    ));
                     g
                 }
             },
@@ -1102,7 +1110,7 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
-        | RExpr::RowToJson { args, .. }
+        | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::JsonSqlFn { ctx, path, .. } => {
             rexpr_references_outer(ctx, depth) || rexpr_references_outer(path, depth)
@@ -1265,7 +1273,7 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
-        | RExpr::RowToJson { args, .. }
+        | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);

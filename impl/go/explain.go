@@ -1508,8 +1508,8 @@ func renderRExpr(e *rExpr) string {
 			name = "json_object"
 		}
 		return explainExprCall(name, e.sargs)
-	case reRowToJson:
-		return explainExprCall("row_to_json", e.sargs)
+	case reJsonImage:
+		return explainExprCall(explainJSONImageFunc(e.jiFunc), e.sargs)
 	case reJsonPathFn:
 		return explainExprCall(explainJSONPathFunc(e.jpFnKind), e.sargs)
 	case reJsonSqlFn:
@@ -1674,10 +1674,6 @@ func explainScalarFunc(f scalarFunc) string {
 		return "json_strip_nulls"
 	case sfJsonbPretty:
 		return "jsonb_pretty"
-	case sfToJsonb:
-		return "to_jsonb"
-	case sfToJson:
-		return "to_json"
 	case sfJsonScalar:
 		return "json_scalar"
 	case sfJsonSerialize:
@@ -1774,6 +1770,20 @@ func explainRangeSetOp(op rangeSetOp) string {
 
 func explainVariadicFunc(f variadicFunc) string {
 	return [...]string{"num_nulls", "num_nonnulls"}[f]
+}
+
+// explainJSONImageFunc is the SQL name of a JSON-image function (json-sql-functions.md §2.2).
+func explainJSONImageFunc(f jsonImageFunc) string {
+	switch f {
+	case jiToJson:
+		return "to_json"
+	case jiToJsonb:
+		return "to_jsonb"
+	case jiArrayToJson:
+		return "array_to_json"
+	default: // jiRowToJson
+		return "row_to_json"
+	}
 }
 
 func explainJSONBuildKind(k jsonBuildKind) string {

@@ -187,6 +187,16 @@ test('the types page autoruns the row_to_json demo', async ({ page }) => {
   await expect(rows).toContainText('{"f1":"2024-01-15T10:30:00"}');
 });
 
+test('the types page autoruns the to_json demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // A jsonb object sorts its keys; arrays nest; a date key and value take the ISO 8601 form.
+  const rows = livePanel(page, 'toJsonDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('{"f1": "b", "f2": 1}');
+  await expect(rows).toContainText('[[1,2],[3,4]]');
+  await expect(rows).toContainText('{"2024-01-15" : "1 day"}');
+  await expect(rows).toContainText('["2024-01-15", "2024-02-15"]');
+});
+
 test('the tables page decodes Unicode-escape literals and names live', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   // U&'caf\00e9' is café in a column named näme; the UESCAPE '!' form decodes to data.

@@ -224,7 +224,7 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
         | RExpr::Variadic { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
-        | RExpr::RowToJson { args, .. }
+        | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. }
         | RExpr::JsonBuild { args, .. } => {
             for a in args {
@@ -670,8 +670,6 @@ pub(crate) fn scalar_func_id(name: &str) -> ScalarFunc {
         "jsonb_strip_nulls" => ScalarFunc::JsonbStripNulls,
         "json_strip_nulls" => ScalarFunc::JsonStripNulls,
         "jsonb_pretty" => ScalarFunc::JsonbPretty,
-        "to_jsonb" => ScalarFunc::ToJsonb,
-        "to_json" => ScalarFunc::ToJson,
         "json_scalar" => ScalarFunc::JsonScalar,
         "json_serialize" => ScalarFunc::JsonSerialize,
         // string / text functions (string-functions.md). char_length/character_length are
@@ -809,7 +807,6 @@ pub(crate) fn array_func_id(name: &str) -> ArrayFunc {
         "array_replace" => ArrayFunc::ArrayReplace,
         "array_position" => ArrayFunc::ArrayPosition,
         "array_positions" => ArrayFunc::ArrayPositions,
-        "array_to_json" => ArrayFunc::ArrayToJson,
         _ => unreachable!("array_func_id: {name} is not a catalog array function"),
     }
 }
@@ -1463,6 +1460,7 @@ pub(crate) fn resolve_aggregate(
                     hypo: None,
                     order,
                     collation: None,
+                    json_tys: vec![kt.clone(), vt.clone()],
                 });
                 Ok((RExpr::Column(slot), result))
             }
@@ -1481,13 +1479,14 @@ pub(crate) fn resolve_aggregate(
                     hypo: None,
                     order,
                     collation: None,
+                    json_tys: vec![kt.clone(), vt.clone()],
                 });
                 Ok((RExpr::Column(slot), result))
             }
             _ => unreachable!("an aggregate in a non-collecting context is handled above"),
         };
     }
-    let (plan, operand, result) = if star {
+    let (plan, operand, result, json_tys) = if star {
         // Only COUNT has a star overload (aggregates.md §3); `SUM(*)` etc. is a syntax error.
         if !aggregate_has_star(name) {
             return Err(EngineError::new(
@@ -1499,6 +1498,7 @@ pub(crate) fn resolve_aggregate(
             AggPlan::CountStar,
             None,
             ResolvedType::Int(ScalarType::Int64),
+            Vec::new(),
         )
     } else {
         // One operand, resolved in a fresh Forbidden sub-context. The registry validates the
@@ -1519,7 +1519,13 @@ pub(crate) fn resolve_aggregate(
         if distinct {
             reject_json_distinct(&t)?;
         }
-        (plan, Some(r), result)
+        // A JSON aggregate converts each input by its static type (json-sql-functions.md §4).
+        let json_tys = if matches!(plan, AggPlan::JsonAgg { .. }) {
+            vec![t]
+        } else {
+            Vec::new()
+        };
+        (plan, Some(r), result, json_tys)
     };
     // The in-aggregate ORDER BY (aggregates.md §22) — resolved after the overload, like PG.
     let order = match agg_order {
@@ -1554,6 +1560,7 @@ pub(crate) fn resolve_aggregate(
                 hypo: None,
                 order,
                 collation: collation.clone(),
+                json_tys: json_tys.clone(),
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -1572,6 +1579,7 @@ pub(crate) fn resolve_aggregate(
                 hypo: None,
                 order,
                 collation: collation.clone(),
+                json_tys: json_tys.clone(),
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -1888,6 +1896,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
                 hypo: None,
                 order: None,
                 collation: None,
+                json_tys: Vec::new(),
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -1906,6 +1915,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
                 hypo: None,
                 order: None,
                 collation: None,
+                json_tys: Vec::new(),
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -2016,6 +2026,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 hypo: Some(hypo),
                 order: None,
                 collation: None,
+                json_tys: Vec::new(),
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -2034,6 +2045,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 hypo: Some(hypo),
                 order: None,
                 collation: None,
+                json_tys: Vec::new(),
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -2352,6 +2364,7 @@ pub(crate) fn resolve_window_call(
     };
     let mut wargs: Vec<RExpr> = Vec::new();
     let mut agg_collation = None;
+    let mut agg_json_tys = Vec::new();
     let (plan, result) = if let Some(p) = no_arg_i64 {
         if star || !args.is_empty() {
             return Err(EngineError::new(
@@ -2446,6 +2459,9 @@ pub(crate) fn resolve_window_call(
                 lookup_aggregate_overload(&lname, &t).ok_or_else(|| no_agg_overload(&lname))?;
             let (plan, result) = aggregate_plan(&lname, desc.result, &t);
             wargs.push(r); // the aggregate operand → args[0]
+            if matches!(plan, AggPlan::JsonAgg { .. }) {
+                agg_json_tys = vec![t];
+            }
             (plan, result)
         };
         agg_collation = minmax_collation(scope, aggplan, args, &result)?;
@@ -2530,6 +2546,7 @@ pub(crate) fn resolve_window_call(
         frame,
         filter: rfilter,
         agg_collation,
+        agg_json_tys,
     };
     // Append the spec and resolve the result slot (the PLACEHOLDER `WINDOW_RESULT_BASE + w`, rebased to
     // its real slot after the row layout is final — window.md §5.1). Restore the borrowed `agg_specs`

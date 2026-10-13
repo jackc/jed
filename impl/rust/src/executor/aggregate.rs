@@ -10,18 +10,19 @@ impl Acc {
     /// through here; every other plan delegates to [`Acc::new`]. Only the aggregation stage builds
     /// ordered-set accumulators — the window stage (which calls [`Acc::new`] directly) never sees
     /// one (an ordered-set aggregate with `OVER` is 0A000, rejected at resolve).
-    pub(crate) fn from_spec(s: &AggSpec) -> Acc {
+    /// `zone` is the session zone a JSON aggregate renders a `timestamptz` input in.
+    pub(crate) fn from_spec(s: &AggSpec, zone: &crate::timezone::ZoneRef) -> Acc {
         // An in-aggregate ORDER BY buffers the passing rows first (aggregates.md §22); the plan's own
         // accumulator is built at finalize ([`Acc::from_spec_unordered`]) and fed in key order.
         if s.order.is_some() {
             return Acc::Ordered { rows: Vec::new() };
         }
-        Acc::from_spec_unordered(s)
+        Acc::from_spec_unordered(s, zone)
     }
 
     /// [`Acc::from_spec`] ignoring any in-aggregate `ORDER BY` — the accumulator an ordered
     /// aggregate's sorted arguments are finally folded into.
-    pub(crate) fn from_spec_unordered(s: &AggSpec) -> Acc {
+    pub(crate) fn from_spec_unordered(s: &AggSpec, zone: &crate::timezone::ZoneRef) -> Acc {
         match s.plan {
             AggPlan::OrderedSetMode
             | AggPlan::OrderedSetDisc
@@ -49,21 +50,33 @@ impl Acc {
                 kind: s.plan,
                 rows: Vec::new(),
             },
-            _ => Acc::with_collation(s.plan, s.collation.clone()),
+            _ => Acc::with_context(s.plan, s.collation.clone(), &s.json_tys, zone),
         }
     }
 
-    /// [`Acc::new`] with a text MIN/MAX's comparison collation (spec/design/collation.md §1); the
-    /// collation is ignored by every other plan.
-    pub(crate) fn with_collation(plan: AggPlan, coll: Option<std::sync::Arc<Collation>>) -> Acc {
-        let mut acc = Acc::new(plan);
+    /// [`Acc::new`] with a text MIN/MAX's comparison collation (spec/design/collation.md §1) and a
+    /// JSON aggregate's operand type(s) + session zone ([`JsonAggConv`]); every other plan ignores
+    /// them.
+    pub(crate) fn with_context(
+        plan: AggPlan,
+        coll: Option<std::sync::Arc<Collation>>,
+        json_tys: &[ResolvedType],
+        zone: &crate::timezone::ZoneRef,
+    ) -> Acc {
+        let mut acc = Acc::new(
+            plan,
+            JsonAggConv {
+                tys: json_tys.to_vec(),
+                zone: zone.clone(),
+            },
+        );
         if let Acc::MinMax { collation, .. } = &mut acc {
             *collation = coll;
         }
         acc
     }
 
-    pub(crate) fn new(plan: AggPlan) -> Acc {
+    pub(crate) fn new(plan: AggPlan, conv: JsonAggConv) -> Acc {
         match plan {
             AggPlan::CountStar => Acc::CountStar(0),
             AggPlan::Count => Acc::Count(0),
@@ -108,16 +121,18 @@ impl Acc {
                 collation: None,
             },
             AggPlan::JsonAgg { compact, strict } => Acc::JsonAgg {
-                nodes: Vec::new(),
+                elems: Vec::new(),
                 compact,
                 strict,
                 seen: false,
+                conv,
             },
             AggPlan::JsonObjectAgg { json, unique } => Acc::JsonObjectAgg {
                 pairs: Vec::new(),
                 json,
                 unique,
                 seen: false,
+                conv,
             },
             AggPlan::OrderedSetMode
             | AggPlan::OrderedSetDisc
@@ -240,31 +255,34 @@ impl Acc {
                 }
             }
             Acc::JsonAgg {
-                nodes,
+                elems,
+                compact,
                 strict,
                 seen,
-                ..
+                conv,
             } => {
                 // Mark the group non-empty even when the strict filter drops this row (an all-skipped
                 // group still finalizes to `[]`, not NULL — only a zero-row group is NULL).
                 *seen = true;
-                // Non-strict: a NULL input contributes a JSON null; `_strict` skips it. Each input's
-                // JSON image is the `to_jsonb` kernel (deferred 0A000 sources propagate here).
+                // Non-strict: a NULL input contributes a JSON null; `_strict` skips it. Each input is
+                // converted to its JSON image as it is folded (PG's transition function); a finite
+                // timestamptz in it renders in the session zone, one `timezone` unit each.
                 if !(*strict && matches!(value, Value::Null)) {
                     m.charge(COSTS.generated_row);
+                    m.charge(COSTS.timezone * value.zone_render_count() as i64);
                     m.guard()?;
-                    nodes.push(value_to_node(&value)?);
+                    elems.push(json_agg_image(&value, *compact, &conv.tys[0], &conv.zone)?);
                 }
             }
             Acc::JsonObjectAgg {
                 pairs,
+                json,
                 unique,
                 seen,
-                ..
+                conv,
             } => {
                 *seen = true;
                 m.charge(COSTS.generated_row);
-                m.guard()?;
                 // The operand is a Row(key, value); split it back out.
                 let (kv, vv) = match value {
                     Value::Composite(mut fields) if fields.len() == 2 => {
@@ -274,23 +292,28 @@ impl Acc {
                     }
                     _ => unreachable!("object_agg operand is a 2-field Row"),
                 };
-                // The key is coerced to text (text/integer/decimal/boolean); a NULL key → 22023.
-                let key = match &kv {
-                    Value::Null => {
-                        return Err(EngineError::new(
-                            SqlState::InvalidParameterValue,
-                            "field name must not be null",
-                        ));
+                m.charge(COSTS.timezone * (kv.zone_render_count() + vv.zone_render_count()) as i64);
+                m.guard()?;
+                // A NULL key: json_object_agg 22004, jsonb_object_agg 22023 (PG's two messages).
+                if matches!(kv, Value::Null) {
+                    if *json {
+                        return Err(object_key_null());
                     }
-                    _ => object_key_text(&kv, 1)?,
-                };
+                    return Err(EngineError::new(
+                        SqlState::InvalidParameterValue,
+                        "field name must not be null",
+                    ));
+                }
+                // The key is always a JSON string (an array/composite/json key is 22023).
+                let key = json_key_text(&kv, &conv.zone)?;
                 if *unique && pairs.iter().any(|(k, _)| k == &key) {
                     return Err(EngineError::new(
                         SqlState::DuplicateJsonObjectKeyValue,
                         "duplicate JSON object key value",
                     ));
                 }
-                pairs.push((key, vv));
+                let image = json_agg_image(&vv, *json, &conv.tys[1], &conv.zone)?;
+                pairs.push((key, image));
             }
             Acc::OrderedSet {
                 kind, vals, floats, ..
@@ -424,32 +447,34 @@ impl Acc {
                 neg_inf,
             } => finalize_float_fold(width, is_avg, total, count, any_nan, pos_inf, neg_inf)?,
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
-            // json_agg/jsonb_agg: NULL over an empty group; else the JSON array (json compact /
-            // jsonb canonical).
+            // json_agg/jsonb_agg: NULL over an empty group; else the JSON array (json: PG's
+            // `", "`-joined element texts; jsonb: the canonical array).
             Acc::JsonAgg {
-                nodes,
+                elems,
                 compact,
                 strict: _,
                 seen,
+                conv,
             } => {
                 if !seen {
                     // A zero-row group → SQL NULL. (A non-empty group the strict filter emptied still
-                    // finalizes to `[]` below — `seen` is true, `nodes` is empty.)
+                    // finalizes to `[]` below — `seen` is true, `elems` is empty.)
                     Value::Null
-                } else {
-                    let arr = JsonNode::Array(nodes);
-                    // The aggregate nests each input one level (json.md §6.4).
-                    json::check_depth(&arr)?;
-                    // Both json_agg and jsonb_agg render the spaced canonical form (PG joins the
-                    // element texts with ", "); the json variant is just typed `json`. (A json input
-                    // element is canonicalized by `value_to_node`, a documented divergence from PG's
-                    // verbatim element text.) `compact` = the json result.
-                    let text = json::jsonb_out(&arr);
-                    if compact {
-                        Value::Json(text)
-                    } else {
-                        Value::Jsonb(arr)
+                } else if compact {
+                    let breaks = json_agg_breaks_line(&conv.tys[0]);
+                    let mut out = String::from("[");
+                    for (i, e) in elems.iter().enumerate() {
+                        push_json_agg_elem(&mut out, i, e, breaks);
                     }
+                    out.push(']');
+                    // The aggregate nests each input one level (json.md §6.4).
+                    json::check_text_depth(&out)?;
+                    Value::Json(out)
+                } else {
+                    let nodes = elems.into_iter().map(jsonb_image_node).collect();
+                    let arr = JsonNode::Array(nodes);
+                    json::check_depth(&arr)?;
+                    Value::Jsonb(arr)
                 }
             }
             // json_object_agg/jsonb_object_agg: NULL over an empty group; else the JSON object (json
@@ -460,24 +485,20 @@ impl Acc {
                 if !seen {
                     Value::Null
                 } else if json {
-                    let mut parts = Vec::with_capacity(pairs.len());
-                    for (k, v) in &pairs {
-                        parts.push(format!(
-                            "{} : {}",
-                            json::json_compact_out(&JsonNode::String(k.clone())),
-                            elem_json_text(v)?
-                        ));
+                    let mut out = String::from("{ ");
+                    for (i, (k, v)) in pairs.iter().enumerate() {
+                        push_json_object_agg_pair(&mut out, i, k, v);
                     }
                     // PG's json_object_agg PADS the braces (`{ … }`) — distinct from json_build_object.
-                    let out = format!("{{ {} }}", parts.join(", "));
+                    out.push_str(" }");
                     // The aggregate nests each value one level (json.md §6.4).
                     json::check_text_depth(&out)?;
                     Value::Json(out)
                 } else {
-                    let mut members = Vec::with_capacity(pairs.len());
-                    for (k, v) in pairs {
-                        members.push((k, value_to_node(&v)?));
-                    }
+                    let members = pairs
+                        .into_iter()
+                        .map(|(k, v)| (k, jsonb_image_node(v)))
+                        .collect();
                     let out = json::make_object(members);
                     json::check_depth(&out)?;
                     Value::Jsonb(out)
@@ -558,4 +579,63 @@ pub(crate) fn sort_agg_order_rows(mut rows: Vec<Vec<Value>>, order: &AggOrder) -
     rows.into_iter()
         .map(|mut r| r.pop().expect("an ordered tuple ends with its value"))
         .collect()
+}
+
+/// A JSON aggregate input's image (json-sql-functions.md §4): for the json aggregates its `json` text
+/// (`Value::Null` for a NULL input, rendered `null`), for the jsonb aggregates a `Value::Jsonb` node.
+pub(crate) fn json_agg_image(
+    v: &Value,
+    json: bool,
+    ty: &ResolvedType,
+    zone: &crate::timezone::ZoneRef,
+) -> Result<Value> {
+    if json {
+        if matches!(v, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let mut text = String::new();
+        datum_to_json(v, ty, zone, &mut text)?;
+        Ok(Value::Json(text))
+    } else {
+        Ok(Value::Jsonb(datum_to_jsonb(v, ty, zone)?))
+    }
+}
+
+/// The node of a jsonb aggregate's buffered image ([`json_agg_image`]).
+pub(crate) fn jsonb_image_node(v: Value) -> JsonNode {
+    match v {
+        Value::Jsonb(n) => n,
+        _ => unreachable!("a jsonb aggregate buffers jsonb images"),
+    }
+}
+
+/// Append the `i`-th json_agg element image onto `out` (PostgreSQL's json_agg_transfn): elements are
+/// separated by `", "`, and a non-NULL array or composite after the first (`breaks`) also starts a
+/// new line (`"\n "`).
+pub(crate) fn push_json_agg_elem(out: &mut String, i: usize, e: &Value, breaks: bool) {
+    if i > 0 {
+        out.push_str(", ");
+    }
+    match e {
+        Value::Json(t) => {
+            if i > 0 && breaks {
+                out.push_str("\n ");
+            }
+            out.push_str(t);
+        }
+        _ => out.push_str("null"),
+    }
+}
+
+/// Append the `i`-th json_object_agg `key : value` pair onto `out`, `", "`-separated.
+pub(crate) fn push_json_object_agg_pair(out: &mut String, i: usize, key: &str, v: &Value) {
+    if i > 0 {
+        out.push_str(", ");
+    }
+    json::write_json_string(key, out);
+    out.push_str(" : ");
+    match v {
+        Value::Json(t) => out.push_str(t),
+        _ => out.push_str("null"),
+    }
 }

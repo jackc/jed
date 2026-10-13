@@ -1,8 +1,9 @@
 # to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2): a
 # number stays exact, text → a JSON string, boolean → a JSON boolean, a json/jsonb value
 # canonicalizes, a 1-D array → a JSON array recursively (a NULL element → JSON null). STRICT — a
-# top-level NULL → SQL NULL. The float / datetime / composite sources are a deferred 0A000 follow-on
-# (a per-core test). Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# top-level NULL → SQL NULL. The other source types (composite, datetime, multidimensional array, …)
+# are in to_json_sources.test. Output matches the postgres:18 oracle. Format:
+# ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, types.jsonb, types.json, func.to_jsonb
 
 # Scalars: number stays exact (scale preserved), text → string, boolean → boolean.

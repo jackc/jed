@@ -214,7 +214,9 @@ import {
   loadTimeZoneData as loadTimeZoneDataGlobal,
   loadedTimeZones as loadedTimeZonesGlobal,
   type TimeZoneInfo,
+  type ZoneRef,
 } from "./timezone.ts";
+import { datumToJson, datumToJsonb, jsonAggBreaksLine, jsonKeyText } from "./row_json.ts";
 import {
   crc32Ieee,
   type LiveCount,
@@ -386,6 +388,7 @@ import {
   timestampValue,
   timestamptzValue,
   uuidValue,
+  zoneRenderCount,
 } from "./value.ts";
 import {
   compile as jsonPathCompile,
@@ -410,6 +413,7 @@ import {
   verbatimToText,
   pretty as jsonPretty,
   prettySize as jsonPrettySize,
+  writeJsonString,
 } from "./json.ts";
 import { elementScalar, encodeRangeKey, rangeByName, rangeOverlaps } from "./range.ts";
 import {
@@ -497,9 +501,8 @@ import {
   commonTypmod,
   deriveCollation,
   deriveTypmod,
-  elemJsonText,
   jsonArgNode,
-  objectKeyText,
+  objectKeyNull,
   orderAliasMatch,
   orderKeyDeriv,
   rejectIndeterminateTarget,
@@ -510,7 +513,7 @@ import {
   resolveDeriv,
   resolveIntOrDecimalPair,
   resolveJsonObject,
-  resolveRowToJson,
+  resolveJsonImage,
   resolveJsonbSetInsert,
   resolveJsonpathArgs,
   resolveJsonpathFn,
@@ -519,7 +522,6 @@ import {
   resolveWidthBucketArray,
   sortTargetCollation,
   typmodOfColumn,
-  valueToNode,
 } from "./resolve.ts";
 import {
   type LayerCol,
@@ -3832,7 +3834,7 @@ export class Engine {
       case "greatestLeast": case "coalesce": case "scalarFunc": case "hostFunc": case "arrayFunc":
       case "regexFunc": case "rangeFunc": case "rangeCtor": case "rangeOp":
       case "rangeSetOp": case "variadic": case "jsonBuild": case "jsonSetInsert":
-      case "jsonObjectFromArrays": case "rowToJson": case "jsonPathFn": case "jsonSqlFn":
+      case "jsonObjectFromArrays": case "jsonImage": case "jsonPathFn": case "jsonSqlFn":
         addMany(expr.args); return;
       case "row": addMany(expr.fields); return;
       case "array": addMany(expr.elements); return;
@@ -19826,8 +19828,15 @@ export class Engine {
       const at: LaneAt = (j, col) => survivors[j]![col]!;
       srows =
         gset.keyCols.length === 0
-          ? [foldAggWhole(plan.aggSpecs, at, survivors.length, meter)]
-          : groupByIntKey(plan.aggSpecs, gset.keyCols[0]!, at, survivors.length, meter);
+          ? [foldAggWhole(plan.aggSpecs, at, survivors.length, this.session.timeZone, meter)]
+          : groupByIntKey(
+              plan.aggSpecs,
+              gset.keyCols[0]!,
+              at,
+              survivors.length,
+              this.session.timeZone,
+              meter,
+            );
       for (const r of srows) meter.admitRow(r);
       meter.releaseRowsMasked(survivors, mask);
     }
@@ -19896,7 +19905,7 @@ export class Engine {
     // of the O(rows) whole-column gather the lane path paid (float.md §7, packed-leaf.md §11). A WHERE
     // predicate (A3) is evaluated over a single reusable masked scratch row read via colAt (untouched
     // columns NULL) — byte-identical input + operator_eval to the lane filter.
-    const whole: Acc[] = grouped ? [] : plan.aggSpecs.map((s) => newAccFromSpec(s));
+    const whole: Acc[] = grouped ? [] : plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
     const groups: { key: Value; accs: Acc[] }[] = [];
     const index = new Map<bigint, number>();
     let nullGi = -1;
@@ -19928,7 +19937,7 @@ export class Engine {
               if (charge.active()) charge.reserve(meter, entryBytes([kv]));
               gi = groups.length;
               index.set(kv.int, gi);
-              groups.push({ key: kv, accs: plan.aggSpecs.map((s) => newAccFromSpec(s)) });
+              groups.push({ key: kv, accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)) });
             } else {
               gi = g;
             }
@@ -19937,7 +19946,7 @@ export class Engine {
             if (nullGi < 0) {
               if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
               nullGi = groups.length;
-              groups.push({ key: nullValue(), accs: plan.aggSpecs.map((s) => newAccFromSpec(s)) });
+              groups.push({ key: nullValue(), accs: plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone)) });
             }
             gi = nullGi;
           }
@@ -20579,7 +20588,7 @@ export class Engine {
           const seen = map();
           const unique = map();
           const collections = hashRows();
-          const fresh = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s));
+          const fresh = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
           if (gset.keyCols.length === 0) {
             const accs = fresh();
             states.set("", encodeBlockingAccs([], accs), 0, packedStateBytes(accs));
@@ -20591,7 +20600,7 @@ export class Engine {
             const key = distinctRowKey(keys);
             const previous = states.get(key);
             const accs =
-              previous === undefined ? fresh() : decodeBlockingAccs(previous, plan.aggSpecs).accs;
+              previous === undefined ? fresh() : decodeBlockingAccs(previous, plan.aggSpecs, this.session.timeZone).accs;
             if (previous === undefined) order.push(keys);
             for (let si = 0; si < plan.aggSpecs.length; si++) {
               const spec = plan.aggSpecs[si]!;
@@ -20644,7 +20653,7 @@ export class Engine {
           }
           for (const keys of order) {
             const key = distinctRowKey(keys);
-            const group = decodeBlockingAccs(states.get(key)!, plan.aggSpecs);
+            const group = decodeBlockingAccs(states.get(key)!, plan.aggSpecs, this.session.timeZone);
             const row = gset.slotSrc.map((src) => (src < 0 ? nullValue() : keys[src]!));
             for (let si = 0; si < group.accs.length; si++)
               row.push(
@@ -21226,7 +21235,7 @@ export class Engine {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s));
+      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
       // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
       // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
       // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
@@ -21392,7 +21401,7 @@ export class Engine {
             // its retention) as usual.
             if (a.ordRows !== undefined) {
               const spec = plan.aggSpecs[si]!;
-              const inner = newAccFromSpecUnordered(spec);
+              const inner = newAccFromSpecUnordered(spec, this.session.timeZone);
               for (const v of sortAggOrderRows(a.ordRows, spec.order!)) {
                 meter.guard();
                 g.charge += foldAccCharged(inner, v, meter);
@@ -21751,7 +21760,7 @@ export class Engine {
       case "jsonBuild":
       case "jsonSetInsert":
       case "jsonObjectFromArrays":
-      case "rowToJson":
+      case "jsonImage":
       case "jsonPathFn":
       case "jsonSqlFn":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
@@ -23667,7 +23676,7 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
-    case "rowToJson":
+    case "jsonImage":
     case "jsonPathFn":
     case "jsonSqlFn":
       children = expr.args.reduce<bigint>(
@@ -24610,7 +24619,7 @@ export function rexprIsConstant(e: RExpr): boolean {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
-    case "rowToJson":
+    case "jsonImage":
     case "jsonPathFn":
     case "jsonSqlFn":
       return e.args.every(rexprIsConstant);
@@ -26826,7 +26835,7 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
-    case "rowToJson":
+    case "jsonImage":
     case "jsonPathFn":
     case "jsonSqlFn":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
@@ -27283,7 +27292,7 @@ function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
-    case "rowToJson":
+    case "jsonImage":
     case "jsonPathFn":
     case "jsonSqlFn":
       for (const a of e.args) collectHostFuncNodes(a, out);
@@ -27565,7 +27574,7 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
-    case "rowToJson":
+    case "jsonImage":
     case "jsonPathFn":
     case "jsonSqlFn":
       for (const a of e.args) collectTouched(a, depth, touched);
@@ -27974,7 +27983,7 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
     case "jsonBuild":
     case "jsonSetInsert":
     case "jsonObjectFromArrays":
-    case "rowToJson":
+    case "jsonImage":
     case "jsonPathFn":
     case "jsonSqlFn":
       for (const a of e.args) rebasePlaceholderCols(a, from, target);
@@ -28503,6 +28512,9 @@ export type RExpr =
       json: boolean;
       args: RExpr[];
       arrayForm: boolean;
+      // Each argument's static type (the VARIADIC-array form: the lone array's type), which keys a
+      // composite argument's members.
+      types: ResolvedType[];
     }
   // `jsonb_set` / `jsonb_insert` (json-sql-functions.md §2): a jsonb path mutation. `args` is
   // `[target jsonb, path text[], value jsonb, flag boolean]` — STRICT (any NULL → SQL NULL). `mode`
@@ -28526,14 +28538,15 @@ export type RExpr =
       json: boolean;
       args: RExpr[];
     }
-  // `row_to_json(record [, pretty])` (json-sql-functions.md §2.2): the composite record rendered as
-  // a json object. `args` is [record] or [record, pretty boolean]; STRICT (any NULL → SQL NULL).
-  // `recordType` is the record's static type — a composite, whose field names key the members, or
-  // null for an untyped NULL argument.
+  // A JSON-image function — to_json / to_jsonb / array_to_json / row_to_json
+  // (json-sql-functions.md §2.2), selected by `func`. `args` is [value] or, for the array/row forms,
+  // [value, pretty boolean]; STRICT (any NULL → SQL NULL). `valueType` is the value's static type (a
+  // composite's field names key its members), or null for an untyped NULL argument.
   | {
-      kind: "rowToJson";
+      kind: "jsonImage";
+      func: JsonImageFunc;
       args: RExpr[];
-      recordType: ResolvedType;
+      valueType: ResolvedType;
     }
   // A scalar jsonpath query function (P2, jsonpath.md §5): jsonb_path_exists / jsonb_path_query_first
   // / jsonb_path_query_array. `args` = `[ctx jsonb, path jsonpath]`; STRICT (any NULL → SQL NULL).
@@ -28776,11 +28789,6 @@ export type ScalarFuncName =
   | "json_strip_nulls"
   // jsonb_pretty → an indented multi-line render.
   | "jsonb_pretty"
-  // to_jsonb(anyelement) → the JSON image of any value (the valueToNode kernel). STRICT.
-  | "to_jsonb"
-  // to_json(anyelement) → the value's JSON image as `json` (the same kernel, per-type rendered:
-  // a jsonb input spaced-canonical, a json input verbatim, else compact). STRICT.
-  | "to_json"
   // JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
   | "json_scalar"
   // JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
@@ -28885,7 +28893,6 @@ export type ArrayFuncName =
   | "array_replace"
   | "array_position"
   | "array_positions"
-  | "array_to_json"
   // The containment/overlap operators `@>`/`<@`/`&&` (array-functions.md §10) — not catalog function
   // names; resolved via resolveContainment, which selects these kernel ids directly.
   | "contains"
@@ -28953,6 +28960,9 @@ export type VariadicFuncName = "num_nulls" | "num_nonnulls";
 // §2): "array" — json[b]_build_array, every argument is one array element (NULL → JSON null);
 // "object" — json[b]_build_object, alternating key/value arguments (odd count / NULL key → 22023).
 export type JsonBuildKind = "array" | "object";
+
+// Which JSON-image function a `jsonImage` node is (json-sql-functions.md §2.2).
+export type JsonImageFunc = "to_json" | "to_jsonb" | "array_to_json" | "row_to_json";
 
 // JsonPathFnKind selects which scalar jsonpath query function a "jsonPathFn" RExpr node is
 // (jsonpath.md §5): "exists" — jsonb_path_exists → boolean (the sequence is non-empty);
@@ -30394,9 +30404,9 @@ export type AggPlan =
   | "min"
   | "max"
   // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
-  // a group's values into one JSON array, one element per input row in scan order. The element image
-  // is the to_jsonb kernel (valueToNode), so deferred sources (float/datetime/composite/…) propagate
-  // 0A000. `asJson` selects the json result type (vs jsonb) — BOTH render via the spaced jsonb_out;
+  // a group's values into one JSON array, one element per input row in scan order. Each element is
+  // its JSON image (row_json.ts — PG's datum_to_json / datum_to_jsonb), so a float source is the
+  // deferred 0A000. `asJson` selects the json result (PG's ", "-joined element texts) vs jsonb;
   // `strict` skips a NULL-valued row (the non-strict variants keep it as JSON null). An empty/zero-row
   // group → SQL NULL, but a group whose rows were all dropped by the strict filter → an empty array []
   // (the `seen` flag distinguishes the two).
@@ -30449,6 +30459,9 @@ export type AggSpec = {
   // For the "jsonObjectAgg" plan (B4): unique → error 22030 on a duplicate key. asJson rides on
   // jsonAsJson above (json vs jsonb render). Fixed at resolve.
   jsonUnique?: boolean;
+  // For the JSON plans: the operand's static type(s) — [value] for json[b]_agg, [key, value] for
+  // json[b]_object_agg — each input is converted by (json-sql-functions.md §4).
+  jsonTypes?: ResolvedType[];
   // Ordered-set aggregate parameters (mode/percentile_* — aggregates.md §13/§17), set only for the
   // mode/percentileDisc/percentileCont plans. osaDesc is the WITHIN GROUP sort direction; osaFrac is
   // the resolved **direct argument** (the percentile fraction) — resolved in the grouped context so
@@ -30569,10 +30582,11 @@ export type WindowSpec = {
   // float width (riding on the Acc), fixed at resolve from the function + operand type.
   aggPlan?: AggPlan;
   aggFloatWidth?: ScalarType;
-  // For a json[b]_agg window aggregate (B4 plan "jsonAgg"): the asJson / strict flags fixed at
-  // resolve, threaded into newAcc by applyWindowStage.
+  // For a json[b]_agg window aggregate (B4 plan "jsonAgg"): the asJson / strict flags and the
+  // operand's static type fixed at resolve, threaded into newAcc by applyWindowStage.
   aggJsonAsJson?: boolean;
   aggJsonStrict?: boolean;
+  aggJsonTypes?: ResolvedType[];
   // The resolved explicit frame (S4, ROWS mode); undefined/null is the default frame (RANGE
   // UNBOUNDED PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
   frame?: ResolvedFrame | null;
@@ -30655,16 +30669,21 @@ export type Acc = {
   floatPosInf: boolean;
   floatNegInf: boolean;
   floatWidth: ScalarType;
-  // For the "jsonAgg" plan (B4): the accumulated element nodes (the array body, in scan order) and
-  // the two flags fixed at resolve (asJson → json result; strict → skip a NULL-valued row).
-  jsonNodes: JsonNode[];
+  // For the "jsonAgg" plan (B4): the inputs' JSON images in scan order — a json text value (a NULL
+  // input nullValue()) for json_agg, a jsonb value for jsonb_agg — and the two flags fixed at
+  // resolve (asJson → json result; strict → skip a NULL-valued row).
+  jsonElems: Value[];
   jsonAsJson: boolean;
   jsonStrict: boolean;
-  // For the "jsonObjectAgg" plan (B4): the (key, value) pairs in row order (the key already coerced
-  // to text). `jsonUnique` errors 22030 on a duplicate key; `jsonAsJson` (above) selects json vs jsonb
-  // finalize; `seen` (above) distinguishes a zero-row group (→ NULL) from a non-empty one.
+  // For the "jsonObjectAgg" plan (B4): the (key text, value image) pairs in row order (the image as
+  // for jsonElems). `jsonUnique` errors 22030 on a duplicate key; `jsonAsJson` (above) selects json vs
+  // jsonb finalize; `seen` (above) distinguishes a zero-row group (→ NULL) from a non-empty one.
   jsonPairs: [string, Value][];
   jsonUnique: boolean;
+  // For the JSON plans: what each input is converted with — the operand's static type(s) ([value],
+  // or [key, value] for the object aggregates) and the session zone a timestamptz renders in.
+  jsonTypes: ResolvedType[];
+  jsonZone: ZoneRef | null;
   // Ordered-set aggregate state (spec/design/aggregates.md §13): the WITHIN GROUP direction +
   // the **evaluated** percentile fraction for this group, plus the collected non-NULL values
   // (percentileCont widens to f64 into osaFloats; mode/percentileDisc keep the Value in osaVals).
@@ -30699,6 +30718,8 @@ export function newAcc(
   jsonAsJson = false,
   jsonStrict = false,
   jsonUnique = false,
+  jsonTypes: ResolvedType[] = [],
+  jsonZone: ZoneRef | null = null,
 ): Acc {
   return {
     plan,
@@ -30712,11 +30733,13 @@ export function newAcc(
     floatPosInf: false,
     floatNegInf: false,
     floatWidth,
-    jsonNodes: [],
+    jsonElems: [],
     jsonAsJson,
     jsonStrict,
     jsonPairs: [],
     jsonUnique,
+    jsonTypes,
+    jsonZone,
   };
 }
 
@@ -30724,8 +30747,9 @@ export function newAcc(
 // (mode/percentile_* — aggregates.md §13) need their WITHIN GROUP direction + fraction (carried on
 // the spec, not the plan); every other plan delegates to newAcc. Only the aggregation stage builds
 // ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
-// ordered-set aggregate with OVER is 0A000, rejected at resolve).
-export function newAccFromSpec(s: AggSpec): Acc {
+// ordered-set aggregate with OVER is 0A000, rejected at resolve). zone is the session zone a JSON
+// aggregate renders a timestamptz input in.
+export function newAccFromSpec(s: AggSpec, zone: ZoneRef): Acc {
   // An in-aggregate ORDER BY buffers the passing rows first (aggregates.md §22); the plan's own
   // accumulator is built at finalize (newAccFromSpecUnordered) and fed in key order.
   if (s.order !== undefined && s.order !== null) {
@@ -30733,12 +30757,12 @@ export function newAccFromSpec(s: AggSpec): Acc {
     a.ordRows = [];
     return a;
   }
-  return newAccFromSpecUnordered(s);
+  return newAccFromSpecUnordered(s, zone);
 }
 
 // newAccFromSpecUnordered is newAccFromSpec ignoring any in-aggregate ORDER BY — the accumulator an
 // ordered aggregate's sorted arguments are finally folded into.
-export function newAccFromSpecUnordered(s: AggSpec): Acc {
+export function newAccFromSpecUnordered(s: AggSpec, zone: ZoneRef): Acc {
   if (
     s.plan === "mode" ||
     s.plan === "percentileDisc" ||
@@ -30774,6 +30798,8 @@ export function newAccFromSpecUnordered(s: AggSpec): Acc {
     s.jsonAsJson ?? false,
     s.jsonStrict ?? false,
     s.jsonUnique ?? false,
+    s.jsonTypes ?? [],
+    zone,
   );
   a.collation = s.collation ?? null;
   return a;
@@ -30789,7 +30815,7 @@ export function cloneAcc(a: Acc): Acc {
   // collected slices anyway so a clone never aliases the original.
   return {
     ...a,
-    jsonNodes: a.jsonNodes.slice(),
+    jsonElems: a.jsonElems.slice(),
     jsonPairs: a.jsonPairs.slice(),
     osaVals: a.osaVals ? a.osaVals.slice() : undefined,
     osaFloats: a.osaFloats ? a.osaFloats.slice() : undefined,
@@ -30874,13 +30900,15 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
     case "jsonAgg":
       // Called once per group row, NULL-valued rows INCLUDED. `seen` marks the group non-empty even
       // when the strict filter drops this row (so a one-NULL-row strict group finalizes to [] not
-      // NULL). A kept element charges one generatedRow (the per-appended-element cost), then its JSON
-      // image is the to_jsonb kernel (valueToNode) — deferred sources propagate 0A000.
+      // NULL). A kept element charges one generatedRow (the per-appended-element cost) and one
+      // timezone unit per finite timestamptz in it, then is converted to its JSON image as it is
+      // folded (PG's transition function).
       a.seen = true;
       if (!(a.jsonStrict && v.kind === "null")) {
         m.charge(COSTS.generatedRow);
+        m.charge(COSTS.timezone * BigInt(zoneRenderCount(v)));
         m.guard();
-        a.jsonNodes.push(valueToNode(v));
+        a.jsonElems.push(jsonAggImage(v, a.jsonAsJson, a.jsonTypes[0]!, a.jsonZone!));
       }
       break;
     case "jsonObjectAgg": {
@@ -30890,22 +30918,24 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       // _unique variant errors 22030 on a key already accumulated. Charges one generatedRow per pair.
       a.seen = true;
       m.charge(COSTS.generatedRow);
-      m.guard();
       if (v.kind !== "composite" || v.fields.length !== 2) {
         throw new Error("BUG: object_agg operand is a 2-field Row");
       }
       const kv = v.fields[0]!;
       const vv = v.fields[1]!;
-      // The key is coerced to text (text/integer/decimal/boolean); a NULL key → 22023 (a DIFFERENT
-      // message from build_object's "key must not be null"), so it is handled before objectKeyText.
+      m.charge(COSTS.timezone * BigInt(zoneRenderCount(kv) + zoneRenderCount(vv)));
+      m.guard();
+      // A NULL key: json_object_agg 22004, jsonb_object_agg 22023 (PG's two messages).
       if (kv.kind === "null") {
+        if (a.jsonAsJson) throw objectKeyNull();
         throw engineError("invalid_parameter_value", "field name must not be null");
       }
-      const key = objectKeyText(kv, 1);
+      // The key is always a JSON string (an array/composite/json key is 22023).
+      const key = jsonKeyText(kv, a.jsonZone!);
       if (a.jsonUnique && a.jsonPairs.some(([k]) => k === key)) {
         throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
       }
-      a.jsonPairs.push([key, vv]);
+      a.jsonPairs.push([key, jsonAggImage(vv, a.jsonAsJson, a.jsonTypes[1]!, a.jsonZone!)]);
       break;
     }
     case "mode":
@@ -31013,15 +31043,21 @@ export function finalizeAcc(a: Acc): Value {
     case "max":
       return a.cur ?? nullValue();
     case "jsonAgg": {
-      // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array.
-      // Both result types render via the SAME spaced jsonb_out: jsonb carries the array node, json
-      // carries that same canonical text (json_agg canonicalizes a json element — a documented
-      // PG divergence, B4).
+      // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array (json:
+      // PG's ", "-joined element texts; jsonb: the canonical array).
       if (!a.seen) return nullValue();
-      const arr: JsonNode = { kind: "array", elements: a.jsonNodes };
-      // The aggregate nests each input one level (json.md §6.4).
+      if (a.jsonAsJson) {
+        const breaks = jsonAggBreaksLine(a.jsonTypes[0]!);
+        const out: string[] = ["["];
+        a.jsonElems.forEach((e, i) => pushJsonAggElem(out, i, e, breaks));
+        out.push("]");
+        const text = out.join("");
+        // The aggregate nests each input one level (json.md §6.4).
+        jsonCheckTextDepth(text);
+        return jsonValue(text);
+      }
+      const arr: JsonNode = { kind: "array", elements: a.jsonElems.map(jsonbImageNode) };
       jsonCheckDepth(arr);
-      if (a.jsonAsJson) return jsonValue(jsonbOut(arr));
       return jsonbValue(arr);
     }
     case "jsonObjectAgg": {
@@ -31030,18 +31066,18 @@ export function finalizeAcc(a: Acc): Value {
       // which does NOT pad); jsonb canonicalizes last-wins (makeObject).
       if (!a.seen) return nullValue();
       if (a.jsonAsJson) {
-        const parts = a.jsonPairs.map(
-          ([k, v]) => `${jsonCompactOut({ kind: "string", value: k })} : ${elemJsonText(v)}`,
-        );
+        const parts: string[] = ["{ "];
+        a.jsonPairs.forEach(([k, v], i) => pushJsonObjectAggPair(parts, i, k, v));
         // PG's json_object_agg PADS the braces (`{ … }`).
-        const out = `{ ${parts.join(", ")} }`;
+        parts.push(" }");
+        const out = parts.join("");
         // The aggregate nests each value one level (json.md §6.4).
         jsonCheckTextDepth(out);
         return jsonValue(out);
       }
       const members: JsonMember[] = a.jsonPairs.map(([k, v]) => ({
         key: k,
-        value: valueToNode(v),
+        value: jsonbImageNode(v),
       }));
       const out = jsonMakeObject(members);
       jsonCheckDepth(out);
@@ -32366,6 +32402,7 @@ export function resolveAggregate(
       order,
       jsonAsJson: objAgg.asJson,
       jsonUnique: objAgg.unique,
+      jsonTypes: [rk.type, rv.type],
     });
     return { node: { kind: "column", index: slot }, type: result };
   }
@@ -32374,8 +32411,9 @@ export function resolveAggregate(
   let result: ResolvedType;
   // The input float width for a float SUM/AVG (so the canonical fold rounds at the right width).
   let floatWidth: ScalarType | undefined;
-  // The B4 json[b]_agg flags (asJson / strict), set for the "jsonAgg" plan only.
+  // The B4 json[b]_agg flags (asJson / strict) and operand type, set for the "jsonAgg" plan only.
   let jsonFlags: JsonAggFlags | undefined;
+  let jsonTypes: ResolvedType[] | undefined;
   if (e.star) {
     // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
     if (!aggregateHasStar(name))
@@ -32406,6 +32444,8 @@ export function resolveAggregate(
     const desc = lookupAggregateOverload(name, r.type);
     if (!desc) throw noAggOverload(name);
     [plan, result, floatWidth, jsonFlags] = aggregatePlan(name, desc.result, r.type);
+    // A JSON aggregate converts each input by its static type (json-sql-functions.md §4).
+    if (plan === "jsonAgg") jsonTypes = [r.type];
     if (e.distinct) rejectJsonDistinct(r.type);
   }
   // The in-aggregate ORDER BY (aggregates.md §22) — resolved after the overload, like PG.
@@ -32433,6 +32473,7 @@ export function resolveAggregate(
     order,
     jsonAsJson: jsonFlags?.asJson,
     jsonStrict: jsonFlags?.strict,
+    jsonTypes,
     collation,
   });
   return { node: { kind: "column", index: slot }, type: result };
@@ -33079,6 +33120,7 @@ export function resolveWindowCall(
     let aggPlan: AggPlan;
     let aggFloatWidth: ScalarType | undefined;
     let aggJsonFlags: JsonAggFlags | undefined;
+    let aggJsonTypes: ResolvedType[] | undefined;
     let aggCollation: Collation | null = null;
     if (e.star) {
       // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
@@ -33100,6 +33142,7 @@ export function resolveWindowCall(
       if (!desc) throw noAggOverload(lname);
       [aggPlan, result, aggFloatWidth, aggJsonFlags] = aggregatePlan(lname, desc.result, r.type);
       wargs.push(r.node); // the aggregate operand → args[0]
+      if (aggPlan === "jsonAgg") aggJsonTypes = [r.type];
       aggCollation = minmaxCollation(scope, aggPlan, e.args, result);
     }
     plan = "agg";
@@ -33140,6 +33183,7 @@ export function resolveWindowCall(
       aggFloatWidth,
       aggJsonAsJson: aggJsonFlags?.asJson,
       aggJsonStrict: aggJsonFlags?.strict,
+      aggJsonTypes,
       frame,
       filter: rfilter,
       aggCollation,
@@ -33783,12 +33827,19 @@ export function resolveFuncCall(
       params,
     );
   }
-  // `row_to_json(record [, pretty boolean])` (json-sql-functions.md §2.2) takes any composite — the
-  // catalog has no `record` family — so it is hand-resolved too.
-  if (lname === "row_to_json") {
+  // The JSON-image functions (json-sql-functions.md §2.2) carry their argument's static type to eval
+  // (a composite's field names key its members), so they are hand-resolved: row_to_json takes any
+  // composite (the catalog has no `record` family); to_json / to_jsonb / array_to_json keep their
+  // catalog rows as data.
+  if (
+    lname === "to_json" ||
+    lname === "to_jsonb" ||
+    lname === "array_to_json" ||
+    lname === "row_to_json"
+  ) {
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-    return resolveRowToJson(scope, e.args, ag, params);
+    return resolveJsonImage(scope, lname, e.args, ag, params);
   }
   // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
   // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
@@ -34422,6 +34473,7 @@ export function resolveVariadicFunc(
   // and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep RExpr "variadic".
   const jsonBuild = jsonBuildClassify(name);
   const rargs: RExpr[] = [];
+  const rtypes: ResolvedType[] = [];
 
   if (e.variadic) {
     // VARIADIC-array form: exactly k args (fixed params + the one array). The fixed params match
@@ -34442,6 +34494,7 @@ export function resolveVariadicFunc(
         throw noFuncOverload(name);
       }
       rargs.push(r.node);
+      rtypes.push(r.type);
     }
   } else {
     // Spread form: at least `k` args (so a variadic function needs ≥1 variadic arg — num_nulls() is
@@ -34456,11 +34509,14 @@ export function resolveVariadicFunc(
       const slot = i < k - 1 ? desc.argFamilies[i]! : varFamily;
       if (!familyMatches(slot, r.type)) throw noFuncOverload(name);
       rargs.push(r.node);
+      rtypes.push(r.type);
     }
   }
 
   const result = scalarResultType(desc.result, []);
   if (jsonBuild !== null) {
+    // A timestamptz argument renders in the session zone (json-sql-functions.md §2.2).
+    params.nonimmutable ||= rtypes.some(containsTimestamptz);
     return {
       node: {
         kind: "jsonBuild",
@@ -34468,6 +34524,7 @@ export function resolveVariadicFunc(
         json: jsonBuild.json,
         args: rargs,
         arrayForm: e.variadic,
+        types: rtypes,
       },
       type: resolvedTypeOf(result),
     };
@@ -35144,12 +35201,16 @@ function encodeBlockingAccs(keys: Value[], accs: Acc[]): Row {
     );
   return row;
 }
-function decodeBlockingAccs(row: Row, specs: AggSpec[]): { keys: Value[]; accs: Acc[] } {
+function decodeBlockingAccs(
+  row: Row,
+  specs: AggSpec[],
+  zone: ZoneRef,
+): { keys: Value[]; accs: Acc[] } {
   const n = Number((row[0]! as { int: bigint }).int);
   const keys = row.slice(1, n + 1);
   const accs = specs.map((s, i) => {
     const at = n + 1 + i * 9;
-    const a = newAccFromSpec(s);
+    const a = newAccFromSpec(s, zone);
     a.count = (row[at]! as { int: bigint }).int;
     a.sumInt = (row[at + 1]! as { int: bigint }).int;
     a.sumDec = (row[at + 2]! as { dec: Decimal }).dec;
@@ -35231,11 +35292,11 @@ function foldBlockingCollection(
   if (a.plan === "jsonAgg" || a.plan === "jsonObjectAgg") {
     // Run the existing one-row fold for its conversion, validation, charge and failure order;
     // move only that row's contribution into scratch, never serialize a growing accumulator.
-    const single = newAccFromSpecUnordered(spec);
+    const single = newAccFromSpecUnordered(spec, a.jsonZone!);
     foldAcc(single, value, meter);
     a.seen = single.seen;
     if (a.plan === "jsonAgg") {
-      for (const node of single.jsonNodes) collections.append(key, [jsonbValue(node)]);
+      for (const elem of single.jsonElems) collections.append(key, [elem]);
     } else {
       const pair = single.jsonPairs[0]!;
       const uniqueKey = key + pair[0];
@@ -35289,7 +35350,7 @@ function finalizeBlockingCollection(
     try {
       for (const row of collections.get(key)) sorter.push(row);
       sorted = sorter.finishSpool();
-      const inner = newAccFromSpecUnordered(spec);
+      const inner = newAccFromSpecUnordered(spec, env.exec.session.timeZone);
       for (const row of sorted) {
         meter.guard();
         const value = row[row.length - 1]!;
@@ -35355,13 +35416,12 @@ function finalizeBlockingCollection(
   if (a.plan === "jsonAgg") {
     if (!a.seen) return nullValue();
     if (a.jsonAsJson) {
-      let output = "[";
-      let separator = "";
-      for (const row of collections.get(key)) {
-        output += separator + jsonbOut((row[0]! as { node: JsonNode }).node);
-        separator = ", ";
-      }
-      output += "]";
+      const breaks = jsonAggBreaksLine(a.jsonTypes[0]!);
+      const parts: string[] = ["["];
+      let i = 0;
+      for (const row of collections.get(key)) pushJsonAggElem(parts, i++, row[0]!, breaks);
+      parts.push("]");
+      const output = parts.join("");
       // The aggregate nests each input one level (json.md §6.4).
       jsonCheckTextDepth(output);
       return jsonValue(output);
@@ -35375,16 +35435,13 @@ function finalizeBlockingCollection(
   if (a.plan === "jsonObjectAgg") {
     if (!a.seen) return nullValue();
     if (a.jsonAsJson) {
-      let output = "{ ";
-      let separator = "";
+      const parts: string[] = ["{ "];
+      let i = 0;
       for (const pair of collections.get(key)) {
-        const name = (pair[0]! as { text: string }).text;
-        output +=
-          separator +
-          `${jsonCompactOut({ kind: "string", value: name })} : ${elemJsonText(pair[1]!)}`;
-        separator = ", ";
+        pushJsonObjectAggPair(parts, i++, (pair[0]! as { text: string }).text, pair[1]!);
       }
-      output += " }";
+      parts.push(" }");
+      const output = parts.join("");
       jsonCheckTextDepth(output);
       return jsonValue(output);
     }
@@ -35401,14 +35458,10 @@ function finalizeBlockingCollection(
     );
     let sorted: RowSpool | null = null;
     try {
-      // Conversion visits every input pair in input order, including overwritten duplicates.
+      // The values were converted as they were folded, in input order.
       for (const pair of collections.get(key)) {
         const name = (pair[0]! as { text: string }).text;
-        sorter.push([
-          intValue(BigInt(utf8Length(name))),
-          pair[0]!,
-          jsonbValue(valueToNode(pair[1]!)),
-        ]);
+        sorter.push([intValue(BigInt(utf8Length(name))), pair[0]!, pair[1]!]);
       }
       sorted = sorter.finishSpool();
       const members: JsonMember[] = [];
@@ -35596,4 +35649,43 @@ function jsonVerbatimSrfRows(kind: SrfKind, text: string, meter: Meter): Row[] {
     }
   }
   return out;
+}
+
+// jsonAggImage is a JSON aggregate input's image (json-sql-functions.md §4): for the json aggregates
+// its json text (nullValue() for a NULL input, rendered null), for the jsonb aggregates a jsonb value.
+function jsonAggImage(v: Value, asJson: boolean, ty: ResolvedType, zone: ZoneRef): Value {
+  if (asJson) {
+    if (v.kind === "null") return nullValue();
+    const out: string[] = [];
+    datumToJson(v, ty, zone, out);
+    return jsonValue(out.join(""));
+  }
+  return jsonbValue(datumToJsonb(v, ty, zone));
+}
+
+// jsonbImageNode is the node of a jsonb aggregate's buffered image (jsonAggImage).
+function jsonbImageNode(v: Value): JsonNode {
+  if (v.kind !== "jsonb") throw new Error("a jsonb aggregate buffers jsonb images");
+  return v.node;
+}
+
+// pushJsonAggElem appends the i-th json_agg element image onto out (PostgreSQL's json_agg_transfn):
+// elements are separated by ", ", and a non-NULL array or composite after the first (breaks) also
+// starts a new line ("\n ").
+function pushJsonAggElem(out: string[], i: number, e: Value, breaks: boolean): void {
+  if (i > 0) out.push(", ");
+  if (e.kind !== "json") {
+    out.push("null");
+    return;
+  }
+  if (i > 0 && breaks) out.push("\n ");
+  out.push(e.text);
+}
+
+// pushJsonObjectAggPair appends the i-th json_object_agg `key : value` pair onto out, ", "-separated.
+function pushJsonObjectAggPair(out: string[], i: number, key: string, v: Value): void {
+  if (i > 0) out.push(", ");
+  writeJsonString(key, out);
+  out.push(" : ");
+  out.push(v.kind === "json" ? v.text : "null");
 }

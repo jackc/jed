@@ -739,11 +739,9 @@ impl Engine {
             let mut collections = self.blocking_hash_rows();
             let fresh = |ordinal: usize| -> Row {
                 let mut state = vec![Value::Int(ordinal as i64)];
-                state.extend(
-                    plan.agg_specs
-                        .iter()
-                        .map(|s| Value::Composite(pack_acc(Acc::from_spec(s)))),
-                );
+                state.extend(plan.agg_specs.iter().map(|s| {
+                    Value::Composite(pack_acc(Acc::from_spec(s, &env.exec.session.time_zone)))
+                }));
                 state
             };
             if gset.key_cols.is_empty() {
@@ -811,7 +809,7 @@ impl Engine {
                     let Value::Composite(packed) = packed else {
                         unreachable!()
                     };
-                    let mut acc = unpack_acc(spec, packed);
+                    let mut acc = unpack_acc(spec, packed, &env.exec.session.time_zone);
                     fold_spilled_value(
                         &mut acc,
                         v,
@@ -846,7 +844,7 @@ impl Engine {
                     let Value::Composite(packed) = packed else {
                         unreachable!()
                     };
-                    let acc = unpack_acc(spec, packed);
+                    let acc = unpack_acc(spec, packed, &env.exec.session.time_zone);
                     out.push(self.finalize_spilled_acc(
                         acc,
                         spec,
@@ -895,7 +893,7 @@ impl Engine {
                     sorter.push(row)?;
                 }
                 let mut sorted = sorter.finish()?;
-                let mut inner = Acc::from_spec_unordered(spec);
+                let mut inner = Acc::from_spec_unordered(spec, &env.exec.session.time_zone);
                 let mut unique = self.blocking_map();
                 let mut folded = self.blocking_hash_rows();
                 // A _unique key entry keeps the per-group map's (group, aggregate, key) shape, so its
@@ -1039,22 +1037,22 @@ impl Engine {
                     _ => unreachable!(),
                 })
             }
-            Acc::JsonAgg { compact, seen, .. } => {
+            Acc::JsonAgg {
+                compact,
+                seen,
+                conv,
+                ..
+            } => {
                 if !seen {
                     return Ok(Value::Null);
                 }
                 if compact {
+                    let breaks = json_agg_breaks_line(&conv.tys[0]);
                     let mut out = String::from("[");
-                    let mut first = true;
+                    let mut i = 0;
                     while let Some(mut row) = values.next()? {
-                        let Value::Jsonb(node) = row.remove(0) else {
-                            unreachable!()
-                        };
-                        if !first {
-                            out.push_str(", ");
-                        }
-                        first = false;
-                        out.push_str(&json::jsonb_out(&node));
+                        push_json_agg_elem(&mut out, i, &row.remove(0), breaks);
+                        i += 1;
                     }
                     out.push(']');
                     // The aggregate nests each input one level (json.md §6.4).
@@ -1063,10 +1061,7 @@ impl Engine {
                 } else {
                     let mut nodes = Vec::new();
                     while let Some(mut row) = values.next()? {
-                        let Value::Jsonb(node) = row.remove(0) else {
-                            unreachable!()
-                        };
-                        nodes.push(node);
+                        nodes.push(jsonb_image_node(row.remove(0)));
                     }
                     let out = JsonNode::Array(nodes);
                     json::check_depth(&out)?;
@@ -1083,26 +1078,21 @@ impl Engine {
                 }
                 if text_json {
                     let mut out = String::from("{ ");
-                    let mut first = true;
+                    let mut i = 0;
                     while let Some(mut row) = values.next()? {
                         let value = row.pop().unwrap();
                         let Value::Text(key) = row.pop().unwrap() else {
                             unreachable!()
                         };
-                        if !first {
-                            out.push_str(", ");
-                        }
-                        first = false;
-                        out.push_str(&json::json_compact_out(&JsonNode::String(key)));
-                        out.push_str(" : ");
-                        out.push_str(&elem_json_text(&value)?);
+                        push_json_object_agg_pair(&mut out, i, &key, &value);
+                        i += 1;
                     }
                     out.push_str(" }");
                     json::check_text_depth(&out)?;
                     Ok(Value::Json(out))
                 } else {
-                    // Convert every input value in original order before sorting/dedup, including
-                    // overwritten duplicate keys: conversion errors retain their visitation order.
+                    // The values were converted as they were folded, in input order; sort by key
+                    // (length, then bytes — the canonical order) and keep the last of equal keys.
                     let mut sorter =
                         self.new_sorter(&[(0, false, false, None), (1, false, false, None)]);
                     while let Some(mut row) = values.next()? {
@@ -1110,18 +1100,12 @@ impl Engine {
                         let Value::Text(key) = row.pop().unwrap() else {
                             unreachable!()
                         };
-                        sorter.push(vec![
-                            Value::Int(key.len() as i64),
-                            Value::Text(key),
-                            Value::Jsonb(value_to_node(&value)?),
-                        ])?;
+                        sorter.push(vec![Value::Int(key.len() as i64), Value::Text(key), value])?;
                     }
                     let mut sorted = sorter.finish()?;
                     let mut members: Vec<(String, JsonNode)> = Vec::new();
                     while let Some(mut row) = sorted.next()? {
-                        let Value::Jsonb(value) = row.pop().unwrap() else {
-                            unreachable!()
-                        };
+                        let value = jsonb_image_node(row.pop().unwrap());
                         let Value::Text(key) = row.pop().unwrap() else {
                             unreachable!()
                         };
@@ -1175,9 +1159,9 @@ fn fold_spilled_value(
         }
     }
     match acc {
-        Acc::JsonAgg { nodes, .. } => {
-            for node in nodes.drain(..) {
-                collections.push(owner, vec![Value::Jsonb(node)])?;
+        Acc::JsonAgg { elems, .. } => {
+            for elem in elems.drain(..) {
+                collections.push(owner, vec![elem])?;
             }
         }
         Acc::JsonObjectAgg { pairs, .. } => {
@@ -1223,8 +1207,8 @@ fn pack_acc(acc: Acc) -> Row {
         Acc::OrderedSet { .. } | Acc::Hypothetical { .. } | Acc::Ordered { .. } => Vec::new(),
     }
 }
-fn unpack_acc(spec: &AggSpec, state: Row) -> Acc {
-    let mut acc = Acc::from_spec(spec);
+fn unpack_acc(spec: &AggSpec, state: Row, zone: &crate::timezone::ZoneRef) -> Acc {
+    let mut acc = Acc::from_spec(spec, zone);
     let int = |i| match state[i] {
         Value::Int(n) => n,
         _ => unreachable!(),

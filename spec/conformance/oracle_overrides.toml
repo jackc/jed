@@ -1522,3 +1522,25 @@ reason = "jed: no implicit per-table row type (composite.md §10.4) and no row-v
 file = "json/row_to_json.test"
 sql = "SELECT row_to_json(ROW(1.5::f64))"
 reason = "jed: a float field is a deferred 0A000, the same deferral to_json/to_jsonb carry for a float source (json-sql-functions.md §2.2): binary floats stay out of jed's byte-identical text outputs (CLAUDE.md §8, float.md), and each core's shortest round-trip layout differs (determinism_exceptions.toml float-render-layout). PostgreSQL renders the float8out text as a JSON number (1.5)."
+
+# --- to_json / to_jsonb / the json builders / the json aggregates: a float source keeps its deferral
+# (json-sql-functions.md §2.2), as row_to_json's float field does.
+[[override]]
+file = "json/to_json_sources.test"
+sql = "SELECT to_json(1.5::f64)"
+reason = "jed: converting a float to JSON is a deferred 0A000 (json-sql-functions.md §2.2): binary floats stay out of jed's byte-identical text outputs (CLAUDE.md §8, float.md), and each core's shortest round-trip layout differs (determinism_exceptions.toml float-render-layout, whose surface does not include JSON). PostgreSQL renders the float8out text as a JSON number (1.5)."
+
+[[override]]
+file = "json/to_json_sources.test"
+sql = "SELECT to_jsonb(ARRAY[1.5::f64])"
+reason = "jed: a float array element is the same deferred 0A000 as a float source (json-sql-functions.md §2.2). PostgreSQL converts the float8out text to a jsonb number ([1.5])."
+
+[[override]]
+file = "json/to_json_sources.test"
+sql = "SELECT json_build_object(1.5::f64, 1)"
+reason = "jed: a float object key is the same deferred 0A000 (json-sql-functions.md §2.2) — its text is the float's output layout. PostgreSQL keys the member by the float8out text ({\"1.5\" : 1})."
+
+[[override]]
+file = "json/to_json_sources.test"
+sql = "SELECT jsonb_agg(x) FROM (VALUES (1.5::f64)) v(x)"
+reason = "jed: a float aggregate input is the same deferred 0A000 (json-sql-functions.md §2.2, §4). PostgreSQL aggregates the jsonb number ([1.5])."

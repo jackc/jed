@@ -166,21 +166,6 @@ func evalArrayFunc(fn arrayFunc, vals []Value, m *costMeter) (Value, error) {
 		return arrayPositionValue(vals[0], vals[1], start)
 	case afPositions:
 		return arrayPositionsValue(vals[0], vals[1])
-	case afToJson:
-		// array_to_json(anyarray) → the array's compact JSON image (the to_jsonb node kernel). STRICT;
-		// a multidimensional array propagates the to_jsonb 0A000.
-		if vals[0].Kind == ValNull {
-			return NullValue(), nil
-		}
-		node, err := valueToNode(vals[0])
-		if err != nil {
-			return NullValue(), err
-		}
-		// An array of json/jsonb elements nests them one level (json.md §6.4).
-		if err := checkJSONDepth(&node); err != nil {
-			return NullValue(), err
-		}
-		return JsonValue(jsonCompactOut(&node)), nil
 	case afContains:
 		return arrayContainsValue(vals[0], vals[1])
 	case afContainedBy:
@@ -3118,31 +3103,6 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(r), nil
-		case sfToJsonb:
-			// to_jsonb(anyelement) → the JSON image of the value (json-sql-functions.md §2). STRICT:
-			// the NULL-input case is handled by the blanket propagation above.
-			node, err := valueToNode(vals[0])
-			if err != nil {
-				return Value{}, err
-			}
-			// An array of json/jsonb elements nests them one level (json.md §6.4).
-			if err := checkJSONDepth(&node); err != nil {
-				return Value{}, err
-			}
-			return growthResult(m, e.sargs, JsonbValue(node))
-		case sfToJson:
-			// to_json(anyelement) → the value's `json` image (json-sql-functions.md §2): a jsonb input
-			// renders canonical-spaced, a json input verbatim, everything else the compact to_jsonb
-			// render. The same per-type rule the json builders embed (elemJsonText). STRICT: the
-			// NULL-input case is handled by the blanket propagation above.
-			s, err := elemJsonText(vals[0])
-			if err != nil {
-				return Value{}, err
-			}
-			if err := checkJSONTextDepth(s); err != nil {
-				return Value{}, err
-			}
-			return growthResult(m, e.sargs, JsonValue(s))
 		case sfJsonScalar:
 			// JSON_SCALAR(v) → the value's JSON scalar as `json`, rendered compact (json-sql-functions.md
 			// §5): an integer/decimal → a JSON number, a boolean → a JSON boolean, text → a JSON string.
@@ -3666,7 +3626,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		// The builders are growth kernels (cost.md §8.1), free over constant operands.
-		if (e.afunc == afAppend || e.afunc == afPrepend || e.afunc == afCat || e.afunc == afToJson) && !allConstant(e.sargs) {
+		if (e.afunc == afAppend || e.afunc == afPrepend || e.afunc == afCat) && !allConstant(e.sargs) {
 			if err := chargeOutput(m, out); err != nil {
 				return Value{}, err
 			}
@@ -3755,8 +3715,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 	case reJsonBuild:
 		// A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values (the
 		// spread form directly; the VARIADIC-array form spreads the lone array — a NULL array → NULL),
-		// then build an array / object node. Non-strict — a NULL argument is a JSON null (array) or a
-		// value (object), so there is no blanket NULL short-circuit.
+		// then build an array / object. Non-strict — a NULL argument is a JSON null (array) or a value
+		// (object), so there is no blanket NULL short-circuit.
 		m.Charge(costs.OperatorEval)
 		var vals []Value
 		if e.variadicArray {
@@ -3780,22 +3740,41 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 		}
 		m.Charge(costs.OperatorEval * int64(len(vals)))
+		// A finite timestamptz at any depth renders in the session zone: one timezone unit each,
+		// charged before rendering (json-sql-functions.md §2.2).
+		var zoned int64
+		for _, v := range vals {
+			zoned += v.zoneRenderCount()
+		}
+		m.Charge(costs.Timezone * zoned)
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
+		// Each argument's static type: the spread form's own, the VARIADIC-array form's element.
+		elemTy := func(i int) resolvedType {
+			if e.variadicArray {
+				return *e.jbTypes[0].elem
+			}
+			return e.jbTypes[i]
+		}
+		zone := env.exec.session.timeZone
 		switch e.jbKind {
 		case jbArray:
 			if e.jbJson {
-				parts := make([]string, len(vals))
+				// PG's json_build_array: each element's json image, joined with ", ".
+				var b strings.Builder
+				b.WriteByte('[')
 				for i := range vals {
-					s, err := elemJsonText(vals[i])
-					if err != nil {
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					if err := datumToJSON(vals[i], elemTy(i), zone, &b); err != nil {
 						return Value{}, err
 					}
-					parts[i] = s
 				}
+				b.WriteByte(']')
 				// The builders nest their arguments one level (json.md §6.4).
-				out := "[" + strings.Join(parts, ", ") + "]"
+				out := b.String()
 				if err := checkJSONTextDepth(out); err != nil {
 					return Value{}, err
 				}
@@ -3803,7 +3782,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			nodes := make([]JsonNode, len(vals))
 			for i := range vals {
-				node, err := valueToNode(vals[i])
+				node, err := datumToJSONB(vals[i], elemTy(i), zone)
 				if err != nil {
 					return Value{}, err
 				}
@@ -3820,19 +3799,29 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					"argument list must have even number of elements")
 			}
 			if e.jbJson {
-				parts := make([]string, 0, len(vals)/2)
+				// PG's json_build_object: `key : value` pairs joined with ", "; a key is always a JSON
+				// string. A NULL key is 22004 (the jsonb form's is 22023).
+				var b strings.Builder
+				b.WriteByte('{')
 				for i := 0; i < len(vals); i += 2 {
-					key, err := objectKeyText(vals[i], i+1)
+					if vals[i].IsNull() {
+						return Value{}, objectKeyNull()
+					}
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					key, err := jsonKeyText(vals[i], zone)
 					if err != nil {
 						return Value{}, err
 					}
-					valText, err := elemJsonText(vals[i+1])
-					if err != nil {
+					writeJSONString(key, &b)
+					b.WriteString(" : ")
+					if err := datumToJSON(vals[i+1], elemTy(i+1), zone, &b); err != nil {
 						return Value{}, err
 					}
-					parts = append(parts, jsonCompactOut(&JsonNode{Kind: JString, S: key})+" : "+valText)
 				}
-				out := "{" + strings.Join(parts, ", ") + "}"
+				b.WriteByte('}')
+				out := b.String()
 				if err := checkJSONTextDepth(out); err != nil {
 					return Value{}, err
 				}
@@ -3840,11 +3829,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			members := make([]JsonMember, 0, len(vals)/2)
 			for i := 0; i < len(vals); i += 2 {
-				key, err := objectKeyText(vals[i], i+1)
+				if vals[i].IsNull() {
+					return Value{}, newError(InvalidParameterValue,
+						"argument "+strconv.Itoa(i+1)+": key must not be null")
+				}
+				key, err := jsonKeyText(vals[i], zone)
 				if err != nil {
 					return Value{}, err
 				}
-				node, err := valueToNode(vals[i+1])
+				node, err := datumToJSONB(vals[i+1], elemTy(i+1), zone)
 				if err != nil {
 					return Value{}, err
 				}
@@ -3923,9 +3916,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			members = append(members, JsonMember{Key: *p.key, Val: node})
 		}
 		return growthResult(m, e.sargs, JsonbValue(makeObject(members)))
-	case reRowToJson:
-		// row_to_json(record [, pretty]) (json-sql-functions.md §2.2): the composite rendered as a json
-		// object. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
+	case reJsonImage:
+		// A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
+		// row_to_json. STRICT. A finite timestamptz at any depth charges one timezone unit, charged and
 		// guarded before rendering (the array → text cast's rule, timezones.md §9.5).
 		m.Charge(costs.OperatorEval)
 		vals := make([]Value, len(e.sargs))
@@ -3948,11 +3941,32 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 		}
+		zone := env.exec.session.timeZone
+		if e.jiFunc == jiToJsonb {
+			node, err := datumToJSONB(vals[0], *e.jiType, zone)
+			if err != nil {
+				return Value{}, err
+			}
+			// An array or composite of json/jsonb nests them deeper (json.md §6.4).
+			if err := checkJSONDepth(&node); err != nil {
+				return Value{}, err
+			}
+			return growthResult(m, e.sargs, JsonbValue(node))
+		}
 		var b strings.Builder
-		if err := compositeToJSON(*vals[0].composite(), e.recordType.comp, pretty, env.exec.session.timeZone, &b); err != nil {
+		var err error
+		switch e.jiFunc {
+		case jiRowToJson:
+			err = compositeToJSON(*vals[0].composite(), e.jiType.comp, pretty, zone, &b)
+		case jiArrayToJson:
+			err = arrayToJSON(vals[0].arrayVal(), *e.jiType.elem, pretty, zone, &b)
+		default: // jiToJson
+			err = datumToJSON(vals[0], *e.jiType, zone, &b)
+		}
+		if err != nil {
 			return Value{}, err
 		}
-		// A jsonb field can nest a deep document (json.md §6.4).
+		// A jsonb element or field can nest a deep document (json.md §6.4).
 		text := b.String()
 		if err := checkJSONTextDepth(text); err != nil {
 			return Value{}, err

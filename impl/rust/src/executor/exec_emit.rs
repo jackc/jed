@@ -858,7 +858,12 @@ impl Engine {
             // DISTINCT aggregate (`None` for a plain aggregate — `COUNT(DISTINCT x)`,
             // aggregates.md §5). The set is value-canonical (`Value`'s own Eq/Hash, so `1.5`/`1.50`
             // and `-0`/`+0` collapse, identical to the group-key bucketing).
-            let new_accs = || -> Vec<Acc> { plan.agg_specs.iter().map(Acc::from_spec).collect() };
+            let new_accs = || -> Vec<Acc> {
+                plan.agg_specs
+                    .iter()
+                    .map(|s| Acc::from_spec(s, &self.session.time_zone))
+                    .collect()
+            };
             let new_seen = || -> Vec<Option<HashSet<Value>>> {
                 plan.agg_specs
                     .iter()
@@ -1060,7 +1065,7 @@ impl Engine {
                             // fold (its decimal_work / generated_row and its retention) as usual.
                             let spec = &plan.agg_specs[si];
                             let order = spec.order.as_ref().expect("an ordered acc has its order");
-                            let mut inner = Acc::from_spec_unordered(spec);
+                            let mut inner = Acc::from_spec_unordered(spec, &self.session.time_zone);
                             for v in sort_agg_order_rows(rows, order) {
                                 meter.guard()?;
                                 inner.fold_charged(v, meter, &mut charge)?;
@@ -1543,7 +1548,7 @@ impl Engine {
             | RExpr::JsonBuild { args, .. }
             | RExpr::JsonSetInsert { args, .. }
             | RExpr::JsonObjectFromArrays { args, .. }
-            | RExpr::RowToJson { args, .. }
+            | RExpr::JsonImage { args, .. }
             | RExpr::JsonPathFn { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;

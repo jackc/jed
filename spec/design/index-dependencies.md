@@ -19,7 +19,7 @@ and overloads apply these argument-sensitive rules:
 | Other EXTRACT / date_part from timestamptz | session timezone |
 | timestamp/date conversion crossing the timestamptz boundary | session timezone |
 | timestamptz → text, or array → text whose element type contains timestamptz (timezones.md §9.5) | session timezone |
-| row_to_json whose record type contains timestamptz ([json-sql-functions.md](json-sql-functions.md) §2.2) | session timezone |
+| to_json / to_jsonb / array_to_json / row_to_json / json[b]_build_array / json[b]_build_object whose argument type contains timestamptz ([json-sql-functions.md](json-sql-functions.md) §2.2) | session timezone |
 | timestamptz interval arithmetic | arguments only under jed's existing UTC arithmetic contract (interval.md) |
 | Two-argument date_trunc on timestamptz; six-argument make_timestamptz; age(timestamptz, timestamptz) | session timezone |
 | AT TIME ZONE, explicit-zone date_trunc / make_timestamptz | arguments plus the explicit zone |

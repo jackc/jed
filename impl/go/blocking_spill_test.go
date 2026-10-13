@@ -131,13 +131,20 @@ func TestBlockingVariableAggregatesSpill(t *testing.T) {
 			collections := newHashRows(db)
 			defer collections.close()
 			spec := aggSpec{plan: plan}
-			state := blockingAccRow(newAccFromSpec(spec))
+			switch plan {
+			case planJsonbAgg:
+				spec.jsonTypes = []resolvedType{{kind: rtInt, intTy: scalarInt64}}
+			case planJsonbObjectAgg:
+				spec.jsonTypes = []resolvedType{{kind: rtText}, {kind: rtInt, intTy: scalarInt64}}
+			}
+			zone := db.session.timeZone
+			state := blockingAccRow(newAccFromSpec(spec, zone))
 			for i := 0; i < 300; i++ {
 				v := IntValue(int64(i))
 				if plan == planJsonbObjectAgg {
 					v = CompositeValue([]Value{TextValue(fmt.Sprint(i % 17)), v})
 				}
-				a := blockingAccFromRow(spec, state)
+				a := blockingAccFromRow(spec, state, zone)
 				if err := a.fold(v, &costMeter{}); err != nil {
 					t.Fatalf("fold: %v", err)
 				}
@@ -149,7 +156,7 @@ func TestBlockingVariableAggregatesSpill(t *testing.T) {
 			if collections.disk == nil || len(collections.mem) != 0 {
 				t.Fatal("one group retained its growing collection in memory")
 			}
-			a := blockingAccFromRow(spec, state)
+			a := blockingAccFromRow(spec, state, zone)
 			var v Value
 			var err error
 			if plan == planPercentileDisc || plan == planMode {

@@ -3479,15 +3479,28 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
-# array_to_json(anyarray) → the array as a `json` array, rendered COMPACT (the to_jsonb node kernel
-# over an array). STRICT. A multidimensional array is a deferred 0A000 follow-on (like to_jsonb); the
-# optional 2nd `pretty boolean` argument is a deferred follow-on. (json-sql-functions.md §2)
+# array_to_json(anyarray [, pretty boolean]) → the array as a `json` array (PG's array_to_json): one
+# bracket level per dimension (lower bounds dropped), each element its json image. pretty = true
+# breaks the outermost dimension's items onto new lines (",\n "). STRICT. Hand-resolved (the value's
+# static type keys a composite element's members), like row_to_json; these rows are the catalog data.
+# A float element is a deferred 0A000. (json-sql-functions.md §2.2)
 [[operator]]
 volatility     = "immutable"
 name           = "array_to_json"
 kind           = "function"
 arity          = 1
 arg_families   = ["anyarray"]
+arg_resolution = "none"
+result         = "json"
+null           = "propagates"
+errors         = ["0A000"]
+
+[[operator]]
+volatility     = "immutable"
+name           = "array_to_json"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyarray", "boolean"]
 arg_resolution = "none"
 result         = "json"
 null           = "propagates"
@@ -5350,12 +5363,13 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
-# to_jsonb(anyelement) → the JSON image of any value (a number stays exact, text → string, bool →
-# bool, a json/jsonb value canonicalizes, a 1-D array → a JSON array recursively). STRICT (a
-# top-level NULL → SQL NULL; a NULL array element → JSON null). The "any" arg family accepts every
-# type; the type-info-dependent / float-divergent sources (composite, float, datetime, uuid, bytea,
-# interval, multidim array) are a deferred 0A000 follow-on (json-sql-functions.md §2). to_json + the
-# json[b]_build_* builders + jsonb_set/insert are a follow-on slice.
+# to_jsonb(anyelement) → the jsonb image of any value (PG's datum_to_jsonb): a number stays exact,
+# text → string, bool → bool, a json value parses, a jsonb value is itself, an array (any
+# dimensionality) → nested JSON arrays, a composite → an object (canonical key order), a datetime →
+# its ISO 8601 string (a timestamptz in the session zone), any other type → the string of its text
+# output. STRICT (a top-level NULL → SQL NULL; a NULL element/field → JSON null). Hand-resolved (the
+# value's static type keys a composite's members); these rows are the catalog data. A float source is a
+# deferred 0A000 (json-sql-functions.md §2.2).
 [[operator]]
 volatility     = "immutable"
 name           = "to_jsonb"
@@ -5367,9 +5381,10 @@ result         = "jsonb"
 null           = "propagates"
 errors         = ["0A000"]
 
-# to_json(anyelement) → the JSON image as `json` — the to_jsonb kernel rendered COMPACT (PG's json
-# output style: no space after ':'/','). STRICT. Same deferred 0A000 sources as to_jsonb. (json-sql-
-# functions.md §2.) A `json` input is canonicalized (a documented divergence — PG keeps it verbatim).
+# to_json(anyelement) → the json image of any value (PG's datum_to_json): as to_jsonb, but rendered as
+# json text — compact arrays/objects in declaration order, a json value verbatim, a jsonb value its
+# canonical spaced text. STRICT. Hand-resolved; a float source is a deferred 0A000
+# (json-sql-functions.md §2.2).
 [[operator]]
 volatility     = "immutable"
 name           = "to_json"
@@ -5423,10 +5438,10 @@ null           = "propagates"
 errors         = []
 
 # json[b]_build_array(VARIADIC "any") → a JSON array built from the (heterogeneous) arguments, one
-# element each, NULLs INCLUDED (as JSON null) — NOT strict. jsonb canonicalizes / spaced; json renders
-# PG's idiosyncratic builder spacing (", " between elements, an element's own json image inside: a
-# scalar/array compact, a jsonb canonical-spaced, a json verbatim). Same deferred 0A000 element sources
-# as to_jsonb. The VARIADIC array form (json_build_array(VARIADIC arr)) spreads. (json-sql-functions.md §2.)
+# element each, NULLs INCLUDED (as JSON null) — NOT strict. Each element is its to_jsonb / to_json image
+# (json-sql-functions.md §2.2); jsonb canonicalizes / spaced; json joins the element images with ", ".
+# A float element is a deferred 0A000. The VARIADIC array form (json_build_array(VARIADIC arr))
+# spreads. (json-sql-functions.md §2.)
 [[operator]]
 volatility     = "immutable"
 name           = "jsonb_build_array"
@@ -5452,11 +5467,12 @@ null           = "none"
 errors         = ["0A000"]
 
 # json[b]_build_object(VARIADIC "any") → a JSON object from alternating key/value arguments. An ODD
-# argument count → 22023; a NULL key → 22023 ("argument N: key must not be null"). A key is coerced to
-# text (text/integer/decimal/boolean — e.g. 1 → "1", true → "true"); a non-scalar key type is a deferred
-# 0A000. The value is the to_jsonb image (NULL value → JSON null). jsonb canonicalizes (last-wins dedup,
-# canonical key order); json preserves argument order + duplicate keys and uses PG's " : " / ", "
-# builder spacing. (json-sql-functions.md §2.)
+# argument count → 22023; a NULL key → 22023 for jsonb ("argument N: key must not be null"), 22004 for
+# json ("null value not allowed for object key"). A key is always a JSON string: a number/boolean its
+# text, a datetime its ISO 8601 form, any other scalar its text output; an array/composite/json/jsonb
+# key → 22023. The value is its to_jsonb / to_json image (NULL value → JSON null). jsonb canonicalizes
+# (last-wins dedup, canonical key order); json preserves argument order + duplicate keys and uses PG's
+# " : " / ", " builder spacing. A float key or value is a deferred 0A000. (json-sql-functions.md §2.2.)
 [[operator]]
 volatility     = "immutable"
 name           = "jsonb_build_object"
@@ -5479,7 +5495,7 @@ variadic       = true
 arg_resolution = "none"
 result         = "json"
 null           = "none"
-errors         = ["22023", "0A000"]
+errors         = ["22023", "22004", "0A000"]
 
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
@@ -5626,10 +5642,11 @@ null         = "aggregate"
 errors       = []
 
 # json/jsonb array aggregates (B4, json-sql-functions.md §4): aggregate the input values into a JSON
-# array, in the group's row order (jed has no in-aggregate ORDER BY yet). json_agg/jsonb_agg INCLUDE
-# a NULL input (as JSON null); the _strict variants SKIP a NULL input. Result NULL over an empty
-# group. Each input's JSON image is the to_jsonb kernel (so the same deferred 0A000 sources apply).
-# The object_agg variants (2-arg key/value) + the _unique dup-key variants are a follow-on slice.
+# array, in the group's row order (or the in-aggregate ORDER BY). json_agg/jsonb_agg INCLUDE a NULL
+# input (as JSON null); the _strict variants SKIP a NULL input. Result NULL over an empty group. Each
+# input is its to_json / to_jsonb image (json-sql-functions.md §2.2); json_agg joins the images with
+# ", " (an array or composite after the first also starts a new line). A float input is a deferred
+# 0A000. The object_agg variants (2-arg key/value) are hand-resolved, outside this table.
 [[aggregate]]
 name         = "jsonb_agg"
 kind         = "aggregate"

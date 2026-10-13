@@ -1306,7 +1306,7 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
-        | RExpr::RowToJson { args, .. }
+        | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().fold(0, |total, arg| {
             sat_add(total, estimator_operator_nodes(Some(arg)))
         }),
@@ -1404,7 +1404,7 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
-        | RExpr::RowToJson { args, .. }
+        | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().collect(),
         RExpr::JsonSqlFn { ctx, path, .. } => vec![ctx, path],
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => fields.iter().collect(),
@@ -2762,7 +2762,7 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::JsonBuild { args, .. }
         | RExpr::JsonSetInsert { args, .. }
         | RExpr::JsonObjectFromArrays { args, .. }
-        | RExpr::RowToJson { args, .. }
+        | RExpr::JsonImage { args, .. }
         | RExpr::JsonPathFn { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::JsonSqlFn { ctx, path, .. } => rexpr_is_constant(ctx) && rexpr_is_constant(path),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
@@ -4890,6 +4890,8 @@ pub(crate) struct WindowSpec {
     pub(crate) filter: Option<RExpr>,
     /// A text `MIN`/`MAX` window aggregate's comparison collation (see [`AggSpec::collation`]).
     pub(crate) agg_collation: Option<std::sync::Arc<Collation>>,
+    /// A JSON window aggregate's operand type (see [`AggSpec::json_tys`]).
+    pub(crate) agg_json_tys: Vec<ResolvedType>,
 }
 
 /// A resolved window frame (spec/design/window.md §6). `ROWS` physical offsets, `GROUPS` peer-group
@@ -5063,6 +5065,8 @@ pub(crate) struct AggSpec {
     /// window functions"): the operand's derivation; `None` for `C`, a non-text operand, or any
     /// other aggregate.
     pub(crate) collation: Option<std::sync::Arc<Collation>>,
+    /// A JSON aggregate's operand type(s) (see [`JsonAggConv`]); empty for every other aggregate.
+    pub(crate) json_tys: Vec<ResolvedType>,
 }
 
 /// A single `WITHIN GROUP` ordering-key sort spec (aggregates.md §13/§19): direction, NULL
@@ -5093,6 +5097,15 @@ pub(crate) struct AggOrder {
 }
 
 /// A running aggregate accumulator (one per AggSpec), folded per input row then finalized.
+/// What a JSON aggregate converts its inputs with (json-sql-functions.md §4): the operand's static
+/// type(s) — `[value]` for json[b]_agg, `[key, value]` for json[b]_object_agg — and the session zone
+/// a `timestamptz` renders in. Empty types for every other aggregate.
+#[derive(Clone)]
+pub(crate) struct JsonAggConv {
+    pub(crate) tys: Vec<ResolvedType>,
+    pub(crate) zone: crate::timezone::ZoneRef,
+}
+
 /// `Clone` so the window stage can snapshot a running accumulator at each peer-group boundary
 /// (a running aggregate window's default frame — spec/design/window.md §6) without consuming it.
 #[derive(Clone)]
@@ -5132,24 +5145,30 @@ pub(crate) enum Acc {
         /// `C`.
         collation: Option<std::sync::Arc<Collation>>,
     },
-    /// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. `compact`
-    /// selects the json vs jsonb finalize type; `strict` skips NULL inputs. `seen` records whether the
-    /// group had ANY input row: a zero-row group → SQL NULL, but a non-empty group all of whose rows
-    /// the strict filter dropped → an empty array `[]` (PG distinguishes the two).
+    /// json_agg / jsonb_agg accumulator (B4): the inputs' JSON images in row order — a `Value::Json`
+    /// text (a NULL input `Value::Null`) for json_agg, a `Value::Jsonb` node for jsonb_agg. `compact`
+    /// selects the json vs jsonb result; `strict` skips NULL inputs. `seen` records whether the group
+    /// had ANY input row: a zero-row group → SQL NULL, but a non-empty group all of whose rows the
+    /// strict filter dropped → an empty array `[]` (PG distinguishes the two). `conv` converts each
+    /// input as it is folded.
     JsonAgg {
-        nodes: Vec<JsonNode>,
+        elems: Vec<Value>,
         compact: bool,
         strict: bool,
         seen: bool,
+        conv: JsonAggConv,
     },
-    /// json_object_agg / jsonb_object_agg accumulator (B4): the (key, value) pairs in row order.
-    /// `json` selects the json vs jsonb finalize render; `unique` errors `22030` on a duplicate key.
-    /// `seen` distinguishes a zero-row group (→ NULL) from a non-empty one (→ an object, maybe `{}`).
+    /// json_object_agg / jsonb_object_agg accumulator (B4): the (key text, value image) pairs in row
+    /// order — the value a `Value::Json` text (`Value::Null` for NULL) or a `Value::Jsonb` node, as
+    /// for [`Acc::JsonAgg`]. `json` selects the json vs jsonb finalize render; `unique` errors `22030`
+    /// on a duplicate key. `seen` distinguishes a zero-row group (→ NULL) from a non-empty one (→ an
+    /// object, maybe `{}`).
     JsonObjectAgg {
         pairs: Vec<(String, Value)>,
         json: bool,
         unique: bool,
         seen: bool,
+        conv: JsonAggConv,
     },
     /// An ordered-set aggregate (`mode`/`percentile_disc`/`percentile_cont` — aggregates.md §13):
     /// buffer every non-NULL operand value, then sort + compute at finalize. `kind` selects the

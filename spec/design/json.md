@@ -425,8 +425,8 @@ over a value therefore recurses at most 256 levels.
    reports the same error for the same input.
 2. **Constructors → `54001`.** An operation that places an existing value *inside* a new
    container can return a deeper document than its inputs. Each one checks its result:
-   `json[b]_build_array` / `json[b]_build_object`, `to_json[b]` / `array_to_json` (an array of
-   JSON elements), `row_to_json` (a composite with JSON fields), `json[b]_agg[_strict]` and
+   `json[b]_build_array` / `json[b]_build_object`, `to_json[b]` / `array_to_json` / `row_to_json` (an
+   array or composite with JSON elements or fields), `json[b]_agg[_strict]` and
    `json[b]_object_agg[_unique]`, `jsonb || jsonb` (which wraps a non-array operand in an
    array), `jsonb_set` / `jsonb_set_lax` / `jsonb_insert` (which insert a document at a path inside
    another), `jsonb_path_query_array`, and `JSON_QUERY … WITH [CONDITIONAL] WRAPPER`. A `jsonb`

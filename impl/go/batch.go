@@ -257,7 +257,7 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 	// positionally, exactly like the scalar synthetic row.
 	var srows []storedRow
 	if len(gset.keyCols) == 0 {
-		accs := newAccsForSpecs(plan.aggSpecs)
+		accs := newAccsForSpecs(plan.aggSpecs, db.session.timeZone)
 		// The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
 		charge := meter.stateCharge()
 		if charge.active() {
@@ -382,7 +382,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	// stay NULL (the zero Value), like the row/lane filter's masked scratch.
 	var accs []*acc // whole-table grand-total accumulators (grouped == false)
 	if !grouped {
-		accs = newAccsForSpecs(plan.aggSpecs)
+		accs = newAccsForSpecs(plan.aggSpecs, db.session.timeZone)
 	}
 	type vgroup struct {
 		key  Value
@@ -448,7 +448,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 							}
 						}
 						nullGI = len(groups)
-						groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+						groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, db.session.timeZone)})
 					}
 					gi = nullGI
 				} else if g, ok := groupIdx[kv.Int]; ok {
@@ -461,7 +461,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 					}
 					gi = len(groups)
 					groupIdx[kv.Int] = gi
-					groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+					groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, db.session.timeZone)})
 				}
 				a = groups[gi].accs
 			}
@@ -706,10 +706,10 @@ func aggWindowBounds(plan *selectPlan, n int64) (int64, int64) {
 
 // newAccsForSpecs builds one accumulator per aggregate spec (whole-table or one group), via the same
 // newAccFromSpec the scalar group machinery uses — so acc state + finalize are identical.
-func newAccsForSpecs(specs []aggSpec) []*acc {
+func newAccsForSpecs(specs []aggSpec, zone ZoneRef) []*acc {
 	accs := make([]*acc, len(specs))
 	for i := range specs {
-		accs[i] = newAccFromSpec(specs[i])
+		accs[i] = newAccFromSpec(specs[i], zone)
 	}
 	return accs
 }
@@ -765,7 +765,7 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 					}
 				}
 				nullGI = len(groups)
-				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, db.session.timeZone)})
 			}
 			gi = nullGI
 		} else {
@@ -778,7 +778,7 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 				}
 				gi = len(groups)
 				index[kv.Int] = gi
-				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
+				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs, db.session.timeZone)})
 			}
 		}
 		// Fold each aggregate into this row's group. acc.fold charges nothing for the eligible plans
