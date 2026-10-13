@@ -623,9 +623,33 @@ impl TableStore {
     /// form is the R-tree, so its `PMap` nodes keep page 0 — or a bare scratch engine). A store
     /// created in-session bound the domain pager at creation (`Snapshot::store_paging`), so it flips
     /// like a loaded one; the flipped leaves fault back through the pool.
+    ///
+    /// A root leaf has no parent to hold an `OnDisk` reference, so it stays resident. When the
+    /// commit that just persisted it resolved unfetched overflow references to re-encode its rows,
+    /// it wrote those values into fresh chains and the old chains joined the free list
+    /// (large-values.md §14) — the resident rows' references would then point at pages the next
+    /// commit may reuse. Such a root is re-faulted from the page just written, so its references are
+    /// the ones on disk. If that read fails the pager is poisoned: no later commit can reuse the old
+    /// chains, which stay intact until reopen.
     pub(crate) fn demote_clean_leaves(&mut self) {
-        if self.paging.is_some() {
-            self.rows.demote_clean_leaves();
+        let Some(paging) = self.paging.clone() else {
+            return;
+        };
+        self.rows.demote_clean_leaves();
+        let Some(root) = self.rows.root() else {
+            return;
+        };
+        let page = root.page.load(std::sync::atomic::Ordering::Acquire);
+        if !root.is_leaf()
+            || page == 0
+            || root.packed.is_some()
+            || !rows_reference_chains(&root.vals)
+        {
+            return;
+        }
+        match paging.fault_leaf(page, &self.col_types) {
+            Ok(fresh) => self.rows.replace_root(fresh),
+            Err(_) => paging.pager().poison(),
         }
     }
 
@@ -681,4 +705,14 @@ impl TableStore {
     pub(crate) fn stored_bytes(&self) -> u64 {
         self.rows.resident_record_bytes()
     }
+}
+
+/// Whether any value is an unfetched reference to an overflow chain.
+fn rows_reference_chains(rows: &[Row]) -> bool {
+    rows.iter().flatten().any(|v| {
+        matches!(
+            v,
+            Value::Unfetched(Unfetched::External { .. } | Unfetched::ExternalComp { .. })
+        )
+    })
 }

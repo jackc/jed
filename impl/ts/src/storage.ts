@@ -506,8 +506,27 @@ export class TableStore {
   // R-tree, so its PMap nodes keep page 0 — or a bare scratch engine). A store created in-session
   // bound the domain pager at creation (Snapshot.storePaging), so it flips like a loaded one; the
   // flipped leaves fault back through the pool.
+  //
+  // A root leaf has no parent to hold an OnDisk reference, so it stays resident. When the commit
+  // that just persisted it resolved unfetched overflow references to re-encode its rows, it wrote
+  // those values into fresh chains and the old chains joined the free list (large-values.md §14) —
+  // the resident rows' references would then point at pages the next commit may reuse. Such a root
+  // is re-faulted from the page just written, so its references are the ones on disk. If that read
+  // fails the pager is poisoned: no later commit can reuse the old chains, which stay intact until
+  // reopen.
   demoteCleanLeaves(): void {
-    if (this.paging !== null) this.rows.demoteCleanLeaves();
+    const paging = this.paging;
+    if (paging === null) return;
+    this.rows.demoteCleanLeaves();
+    const root = this.rows.rootNode();
+    if (root === null || root.children.length > 0 || root.page === 0 || root.packed !== undefined)
+      return;
+    if (!rowsReferenceChains(root.vals)) return;
+    try {
+      this.rows.replaceRoot(paging.faultLeaf(root.page, this.colTypes));
+    } catch {
+      paging.poison();
+    }
   }
 
   // faultLeaf faults the clean leaf at page through this store's pool — the whole-image
@@ -544,4 +563,24 @@ export class TableStore {
   storedBytes(): number {
     return this.rows.residentRecordBytes();
   }
+}
+
+// The external value-codec forms (spec/fileformat/format.md): a value stored in an overflow chain,
+// plain or LZ4-compressed.
+const FORM_EXTERNAL = 0x02;
+const FORM_EXTERNAL_COMP = 0x04;
+
+// rowsReferenceChains reports whether any value is an unfetched reference to an overflow chain.
+function rowsReferenceChains(rows: Row[]): boolean {
+  for (const row of rows) {
+    for (const v of row) {
+      if (
+        v.kind === "unfetched" &&
+        (v.ref.form === FORM_EXTERNAL || v.ref.form === FORM_EXTERNAL_COMP)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }

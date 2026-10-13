@@ -515,10 +515,42 @@ func (s *tableStore) treeRoot() *pnode { return s.rows.rootNode() }
 // so its pMap nodes keep page 0 — or a bare scratch engine). A store created in-session bound the
 // domain pager at creation (snapshot.storePaging), so it flips like a loaded one; the flipped
 // leaves fault back through the pool.
+//
+// A root leaf has no parent to hold an OnDisk reference, so it stays resident. When the commit that
+// just persisted it resolved unfetched overflow references to re-encode its rows, it wrote those
+// values into fresh chains and the old chains joined the free list (large-values.md §14) — the
+// resident rows' references would then point at pages the next commit may reuse. Such a root is
+// re-faulted from the page just written, so its references are the ones on disk. If that read fails
+// the pager is poisoned: no later commit can reuse the old chains, which stay intact until reopen.
 func (s *tableStore) demoteCleanLeaves() {
-	if s.paging != nil {
-		s.rows.demoteCleanLeaves()
+	if s.paging == nil {
+		return
 	}
+	s.rows.demoteCleanLeaves()
+	root := s.rows.root
+	if root == nil || !root.isLeaf() || root.page == 0 || root.packed != nil || !rowsReferenceChains(root.vals) {
+		return
+	}
+	fresh, err := s.paging.faultLeaf(root.page, s.colTypes)
+	if err != nil {
+		_ = s.paging.withPager(func(p *pager) error { p.poison(); return nil })
+		return
+	}
+	s.rows.root = fresh
+}
+
+// rowsReferenceChains reports whether any value is an unfetched reference to an overflow chain.
+func rowsReferenceChains(rows []storedRow) bool {
+	for _, row := range rows {
+		for _, v := range row {
+			if v.Kind == ValUnfetched {
+				if f := v.unfetched().Form; f == tagExternal || f == tagExternalComp {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // faultLeaf faults the clean leaf at page through this store's pool — the whole-image serializer's

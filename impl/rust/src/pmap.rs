@@ -703,6 +703,12 @@ impl PMap {
         self.root.as_ref()
     }
 
+    /// Replace the root with an equivalent node — the same page, freshly faulted
+    /// ([`crate::storage::TableStore::demote_clean_leaves`]). The row count is unchanged.
+    pub(crate) fn replace_root(&mut self, root: Arc<Node>) {
+        self.root = Some(root);
+    }
+
     /// Reconstruct a map from a disk-loaded skeleton root (format.rs `read_skeleton`). Table maps
     /// receive the exact v28 catalog count; index maps pass `None`.
     pub(crate) fn from_skeleton(root: Option<Arc<Node>>, count: Option<i64>) -> Self {

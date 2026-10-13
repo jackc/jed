@@ -407,6 +407,12 @@ export class PMap {
     return this.root;
   }
 
+  // replaceRoot swaps in an equivalent root — the same page, freshly faulted (storage.ts
+  // TableStore.demoteCleanLeaves). The row count is unchanged.
+  replaceRoot(root: PNode): void {
+    this.root = root;
+  }
+
   // get looks up the row at key — a root→leaf descent (interior nodes only route, v24). src faults
   // an OnDisk leaf on the descent (null for a fully-resident in-memory tree); an I/O error
   // propagates as a thrown EngineError.
