@@ -654,8 +654,42 @@ fn parse_param_values(mut rest: &str) -> std::result::Result<Vec<jed::Value>, St
 }
 
 /// Read one `# params:` value from the front of `s`: a single-quoted text (a doubled `''` is one
-/// quote), `NULL`, `true`/`false`, an integer, or a decimal with its written scale.
+/// quote), `NULL`, `true`/`false`, an integer, a decimal with its written scale, or an `ARRAY[…]` /
+/// `ROW(…)` of values.
 fn take_param_value(s: &str) -> std::result::Result<(jed::Value, &str), String> {
+    let list = [("ARRAY", '[', ']'), ("ROW", '(', ')')]
+        .into_iter()
+        .find_map(|(word, open, close)| {
+            let rest = s.strip_prefix(word)?.trim_start().strip_prefix(open)?;
+            Some((word, close, rest))
+        });
+    if let Some((word, close, rest)) = list {
+        let mut rest = rest.trim();
+        let mut items = Vec::new();
+        while !rest.starts_with(close) {
+            if rest.is_empty() {
+                return Err(format!("unterminated list value {s:?}"));
+            }
+            let (item, after) = take_param_value(rest)?;
+            items.push(item);
+            rest = after.trim();
+            if rest.starts_with(close) {
+                break;
+            }
+            rest = rest
+                .strip_prefix(',')
+                .ok_or_else(|| format!("expected `,` or `{close}` before {rest:?}"))?
+                .trim();
+        }
+        let value = if word == "ARRAY" {
+            jed::Value::Array(jed::ArrayVal::one_dim(items))
+        } else if items.is_empty() {
+            return Err("ROW() needs at least one field".to_string());
+        } else {
+            jed::Value::Composite(items)
+        };
+        return Ok((value, &rest[1..]));
+    }
     if let Some(body) = s.strip_prefix('\'') {
         let mut text = String::new();
         let mut chars = body.char_indices().peekable();
@@ -673,8 +707,9 @@ fn take_param_value(s: &str) -> std::result::Result<(jed::Value, &str), String> 
         }
         return Err(format!("unterminated text value {s:?}"));
     }
-    let (token, rest) = match s.find(',') {
-        Some(comma) => (&s[..comma], &s[comma..]),
+    // A scalar token runs to the next separator or the close of an enclosing ARRAY[…] / ROW(…).
+    let (token, rest) = match s.find([',', ']', ')']) {
+        Some(end) => (&s[..end], &s[end..]),
         None => (s, ""),
     };
     let token = token.trim();

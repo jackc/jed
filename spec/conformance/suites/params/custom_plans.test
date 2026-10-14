@@ -301,6 +301,109 @@ SELECT id FROM items WHERE 'r7' = ANY(tags)
 ----
 7
 
+# A bound array operand reads the GIN term statistics too; its literal twin is the constant cast
+# (an ARRAY[…] constructor is an expression evaluated per row, a bound value is not).
+# params: ARRAY['a']
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> $1
+----
+0
+Filter
+conjuncts=1
+1000
+3006
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> '{a}'::text[]
+----
+0
+Filter
+conjuncts=1
+1000
+3006
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+# params: ARRAY['r7']
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> $1
+----
+0
+Filter
+conjuncts=1
+1
+8
+1
+Scan items
+GIN bound: using items_tags; touched=2
+1
+6
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> '{r7}'::text[]
+----
+0
+Filter
+conjuncts=1
+1
+8
+1
+Scan items
+GIN bound: using items_tags; touched=2
+1
+6
+
+# params: ARRAY['r7']
+# cost: 8
+query I nosort
+SELECT id FROM items WHERE tags @> $1
+----
+7
+
+# cost: 8
+query I nosort
+SELECT id FROM items WHERE tags @> '{r7}'::text[]
+----
+7
+
+# A bound list of keys.
+# params: ARRAY[70, 80]
+query ITTII nosort
+EXPLAIN SELECT cat FROM items WHERE id = ANY($1)
+----
+0
+Filter
+conjuncts=1
+334
+2340
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+query ITTII nosort
+EXPLAIN SELECT cat FROM items WHERE id = ANY('{70,80}'::i32[])
+----
+0
+Filter
+conjuncts=1
+334
+2340
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
 # --- a bound generate_series bound ----------------------------------------------------------------
 
 # params: 50

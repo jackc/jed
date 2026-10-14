@@ -63,7 +63,7 @@ type insertValuesPlan struct {
 	retNodes       []*rExpr
 	retNames       []string
 	retTypes       []string
-	ptys           []scalarType
+	ptys           []colType
 	cacheable      bool
 	alwaysTargeted []insertAlwaysTarget
 }
@@ -1267,11 +1267,10 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		}
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 && p < len(values) {
-				// Only a scalar column gives a top-level $N an inferable type; a composite-column
-				// param stays untyped (42P18 at finalize this slice — composite.md §12).
-				if iv := values[p]; iv.IsParam && !col.Type.IsComposite() {
-					ct := col.Type.ScalarTy()
-					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
+				// A top-level $N takes its column's type, a scalar or a container (api.md §5).
+				if iv := values[p]; iv.IsParam {
+					ct := resolveColType(col.Type, db.readSnap().types)
+					if err := ptypes.noteCol(int(iv.Param)-1, &ct); err != nil {
 						return outcome{}, err
 					}
 				}
@@ -1673,9 +1672,10 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx, vw *viewWrite
 		}
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 {
-				if iv := values[p]; iv.IsParam && !col.Type.IsComposite() {
-					ct := col.Type.ScalarTy()
-					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
+				// A top-level $N takes its column's type, a scalar or a container (api.md §5).
+				if iv := values[p]; iv.IsParam {
+					ct := resolveColType(col.Type, db.readSnap().types)
+					if err := ptypes.noteCol(int(iv.Param)-1, &ct); err != nil {
 						return nil, err
 					}
 				}

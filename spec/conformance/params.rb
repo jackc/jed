@@ -36,6 +36,26 @@ module CorpusParams
   end
 
   def self.take_value(s)
+    if (m = s.match(/\A(ARRAY\s*\[|ROW\s*\()/))
+      kind, close = m[1].start_with?("ARRAY") ? [:array, "]"] : [:row, ")"]
+      rest = s[m[0].length..].lstrip
+      items = []
+      until rest.start_with?(close)
+        raise ArgumentError, "unterminated #{kind} value #{s.inspect}" if rest.empty?
+
+        item, rest = take_value(rest)
+        items << item
+        rest = rest.lstrip
+        next if rest.start_with?(close)
+        raise ArgumentError, "expected `,` or `#{close}` before #{rest.inspect}" unless rest.start_with?(",")
+
+        rest = rest[1..].lstrip
+      end
+      raise ArgumentError, "ROW() needs at least one field" if kind == :row && items.empty?
+
+      open = kind == :array ? "ARRAY[" : "ROW("
+      return [Value.new(kind, items, "#{open}#{items.map(&:sql).join(', ')}#{close}"), rest[1..]]
+    end
     if s.start_with?("'")
       text = +""
       i = 1
@@ -54,9 +74,10 @@ module CorpusParams
         i += 1
       end
     end
-    token, rest = s.split(",", 2)
+    # A scalar token runs to the next separator or the close of an enclosing ARRAY[…] / ROW(…).
+    token = s[/\A[^,\])]*/]
+    rest = s[token.length..]
     token = token.strip
-    rest = rest.nil? ? "" : ",#{rest}"
     value =
       case token
       when "NULL" then Value.new(:null, nil, token)

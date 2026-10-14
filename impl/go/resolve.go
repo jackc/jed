@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -792,7 +793,9 @@ func missingFromEntry(qualifier string) error {
 // statement (spec/design/api.md §5). types[i] is the inferred scalar type of $(i+1); a nil entry
 // marks a parameter referenced before any context fixed its type.
 type paramTypes struct {
-	types []*scalarType
+	// types is each parameter's inferred type: a scalar, or a container — an array, range, or named
+	// composite (spec/design/api.md §5) — as the resolved column type the binder coerces into.
+	types []*colType
 	// uncacheable is set during resolution when a node is created that makes the resolved plan
 	// un-reusable across executions: an reSubquery (the uncorrelated-subquery fold rewrites it to a
 	// constant baking in THIS execution's bound params) or a precompiled-regex node (whose one-shot
@@ -811,10 +814,20 @@ type paramTypes struct {
 	frame *planFrame
 }
 
-// note records that $(idx0+1) appears with context type ty (nil = no context here). It unifies
-// with any prior inference: equal types agree, two integer widths widen to the wider, an
-// incompatible concrete pair is 42804.
+// note records that $(idx0+1) appears with scalar context type ty (nil = no context here). It
+// unifies with any prior inference (noteCol).
 func (p *paramTypes) note(idx0 int, ty *scalarType) error {
+	if ty == nil {
+		return p.noteCol(idx0, nil)
+	}
+	ct := scalarColType(*ty)
+	return p.noteCol(idx0, &ct)
+}
+
+// noteCol records that $(idx0+1) appears with context type ty, a scalar or a container (nil = no
+// context here). It unifies with any prior inference: equal types agree, two integer widths widen to
+// the wider, an incompatible pair is 42804.
+func (p *paramTypes) noteCol(idx0 int, ty *colType) error {
 	for idx0 >= len(p.types) {
 		p.types = append(p.types, nil)
 	}
@@ -849,8 +862,8 @@ func (p *paramTypes) noteInputZone(iz *inputZone) {
 
 // finalize returns the ordered parameter types. A slot referenced but never typed — including a
 // gap in $1..$N — is 42P18 indeterminate_datatype.
-func (p *paramTypes) finalize() ([]scalarType, error) {
-	out := make([]scalarType, 0, len(p.types))
+func (p *paramTypes) finalize() ([]colType, error) {
+	out := make([]colType, 0, len(p.types))
 	for i, t := range p.types {
 		if t == nil {
 			return nil, newError(IndeterminateDatatype,
@@ -861,20 +874,26 @@ func (p *paramTypes) finalize() ([]scalarType, error) {
 	return out, nil
 }
 
+// isScalar reports whether t is a scalar column type (not an array, range, or composite).
+func (t colType) isScalar() bool { return !t.Composite && t.Elem == nil && t.RangeElem == nil }
+
 // unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
 // widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
-func unifyParamType(a, b scalarType, idx0 int) (scalarType, error) {
-	if a == b {
-		return a, nil
-	}
-	if a.IsInteger() && b.IsInteger() {
-		if a.Rank() >= b.Rank() {
+func unifyParamType(a, b colType, idx0 int) (colType, error) {
+	if a.isScalar() && b.isScalar() {
+		if a.Scalar == b.Scalar {
 			return a, nil
 		}
-		return b, nil
+		if a.Scalar.IsInteger() && b.Scalar.IsInteger() {
+			if a.Scalar.Rank() >= b.Scalar.Rank() {
+				return a, nil
+			}
+			return b, nil
+		}
+	} else if reflect.DeepEqual(a, b) {
+		return a, nil
 	}
-	var zero scalarType
-	return zero, newError(DatatypeMismatch,
+	return colType{}, newError(DatatypeMismatch,
 		fmt.Sprintf("inconsistent types inferred for parameter $%d", idx0+1))
 }
 
@@ -902,7 +921,7 @@ func dateClockLiteral(s string, params *paramTypes) (*rExpr, resolvedType, bool)
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
 // all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
 // is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
-func bindParams(supplied []Value, types []scalarType, iz *inputZone) ([]Value, error) {
+func bindParams(supplied []Value, types []colType, iz *inputZone) ([]Value, error) {
 	return bindParamsWithLabels(supplied, types, paramLabels(len(types)), iz)
 }
 
@@ -914,7 +933,7 @@ func paramLabels(n int) []string {
 	return labels
 }
 
-func bindParamsWithLabels(supplied []Value, types []scalarType, labels []string, iz *inputZone) ([]Value, error) {
+func bindParamsWithLabels(supplied []Value, types []colType, labels []string, iz *inputZone) ([]Value, error) {
 	if len(supplied) != len(types) {
 		return nil, newError(SyntaxError, fmt.Sprintf(
 			"bind parameter count mismatch: statement expects %d, got %d", len(types), len(supplied),
@@ -922,15 +941,77 @@ func bindParamsWithLabels(supplied []Value, types []scalarType, labels []string,
 	}
 	bound := make([]Value, len(types))
 	for i, ty := range types {
-		// A text value bound to a timestamptz parameter reads an offset-less string in the session
-		// zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
-		v, err := storeValue(supplied[i], ty, nil, nil, false, labels[i], iz)
+		var v Value
+		var err error
+		if ty.isScalar() {
+			// A text value bound to a timestamptz parameter reads an offset-less string in the session
+			// zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
+			v, err = storeValue(supplied[i], ty.Scalar, nil, nil, false, labels[i], iz)
+		} else {
+			v, err = bindContainerParam(supplied[i], ty, labels[i], iz)
+		}
 		if err != nil {
 			return nil, err
 		}
 		bound[i] = v
 	}
 	return bound, nil
+}
+
+// bindContainerParam coerces a host value to an array, range, or composite parameter type
+// (spec/design/api.md §5). A text value is read by the type's input function, as a string literal
+// assigned to the type is; a range value is canonicalized as a range constructor's result is; every
+// other value takes the storage coercion of a column of the type.
+func bindContainerParam(v Value, ty colType, label string, iz *inputZone) (Value, error) {
+	if v.Kind == ValText {
+		switch {
+		case ty.Elem != nil:
+			return coerceStringToArray(v.str(), *ty.Elem, iz)
+		case ty.RangeElem != nil:
+			desc, _ := rangeForElement(ty.RangeElem.Scalar)
+			rv, err := coerceStringToRange(v.str(), desc, iz)
+			if err != nil {
+				return Value{}, err
+			}
+			return RangeValue(rv), nil
+		default:
+			return coerceRecordTextToValue(v.str(), ty, iz)
+		}
+	}
+	if v.Kind == ValRange && ty.RangeElem != nil {
+		rv := v.rangeVal()
+		if rv.Empty {
+			return v, nil
+		}
+		lower, err := coerceRangeParamBound(rv.Lower, ty.RangeElem.Scalar, label, iz)
+		if err != nil {
+			return Value{}, err
+		}
+		upper, err := coerceRangeParamBound(rv.Upper, ty.RangeElem.Scalar, label, iz)
+		if err != nil {
+			return Value{}, err
+		}
+		desc, _ := rangeForElement(ty.RangeElem.Scalar)
+		out, err := finalizeRange(desc, lower, upper, rv.LowerInc, rv.UpperInc)
+		if err != nil {
+			return Value{}, err
+		}
+		return RangeValue(out), nil
+	}
+	return coerceForStore(v, ty, nil, nil, false, label, iz)
+}
+
+// coerceRangeParamBound coerces a bound range value's finite bound to the element type (nil, an
+// infinite bound, stays nil).
+func coerceRangeParamBound(b *Value, elem scalarType, label string, iz *inputZone) (*Value, error) {
+	if b == nil {
+		return nil, nil
+	}
+	v, err := storeValue(*b, elem, nil, nil, false, label, iz)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 // resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
@@ -1545,6 +1626,71 @@ func exprLocation(e exprNode) srcPos {
 	return 0
 }
 
+// resolveParamNode resolves the bare parameter e as type ct (nil = no context here), whose resolved
+// form is rty, recording the inference.
+func resolveParamNode(s *scope, e exprNode, ct *colType, rty resolvedType, params *paramTypes) (*rExpr, resolvedType, error) {
+	// A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets it, so
+	// earlier resolution errors keep PostgreSQL's order.
+	if s != nil && s.catalog != nil && s.catalog.viewTracing() {
+		return nil, resolvedType{}, newError(UndefinedParameter, fmt.Sprintf("there is no parameter $%d", e.Param))
+	}
+	idx0 := int(e.Param) - 1
+	if err := params.noteCol(idx0, ct); err != nil {
+		return nil, resolvedType{}, err
+	}
+	var frame *planFrame
+	if s != nil {
+		frame = s.catalog.currentPlanFrame()
+	}
+	return &rExpr{kind: reParam, index: idx0, plan: frame}, rty, nil
+}
+
+// adoptContainerParam types e, when it is a bare parameter, as the container type other — an array,
+// range, or named composite (spec/design/api.md §5, container-typed parameters). ok is false when e
+// is not a parameter or other is not such a container.
+func adoptContainerParam(s *scope, e exprNode, other resolvedType, params *paramTypes) (*rExpr, resolvedType, bool, error) {
+	if e.Kind != exprParam {
+		return nil, resolvedType{}, false, nil
+	}
+	ct, ok := containerParamType(s, other)
+	if !ok {
+		return nil, resolvedType{}, false, nil
+	}
+	node, ty, err := resolveParamNode(s, e, &ct, other, params)
+	return node, ty, true, err
+}
+
+// containerParamType is the parameter type of a container-typed context: an array whose element is a
+// scalar or a named composite, a range, or a named composite. ok is false for anything else (a
+// scalar, an anonymous record, an untyped NULL).
+func containerParamType(s *scope, rt resolvedType) (colType, bool) {
+	switch rt.kind {
+	case rtArray:
+		var elem colType
+		if h := ctxOf(*rt.elem); h != nil {
+			elem = scalarColType(*h)
+		} else if rt.elem.kind == rtComposite && rt.elem.comp.named {
+			elem = resolveColType(compositeT(rt.elem.comp.name), s.catalog.readSnap().types)
+		} else {
+			return colType{}, false
+		}
+		return colType{Elem: &elem}, true
+	case rtRange:
+		es, ok := resolvedRangeElementScalar(rt.elem)
+		if !ok {
+			return colType{}, false
+		}
+		elem := scalarColType(es)
+		return colType{RangeElem: &elem}, true
+	case rtComposite:
+		if !rt.comp.named {
+			return colType{}, false
+		}
+		return resolveColType(compositeT(rt.comp.name), s.catalog.readSnap().types), true
+	}
+	return colType{}, false
+}
+
 func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// GROUP BY a general expression (aggregates.md §15): a non-column expression that structurally
 	// matches a grouping-expression key resolves to that group's synthetic key slot — so `SELECT a+b
@@ -1558,29 +1704,14 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 	}
 	switch e.Kind {
 	case exprParam:
-		// A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets it, so
-		// earlier resolution errors keep PostgreSQL's order.
-		if s.catalog != nil && s.catalog.viewTracing() {
-			return nil, resolvedType{}, newError(UndefinedParameter, fmt.Sprintf("there is no parameter $%d", e.Param))
-		}
 		// A bind parameter is an adaptable operand (like an integer/string literal): it takes its
 		// type from ctx — the sibling operand, target column, or CAST target. Record the inferred
 		// type (nil = no context here; finalize 42P18s a parameter that never gets one).
-		idx0 := int(e.Param) - 1
-		if err := params.note(idx0, ctx); err != nil {
-			return nil, resolvedType{}, err
+		if ctx == nil {
+			return resolveParamNode(s, e, nil, resolvedType{kind: rtNull}, params)
 		}
-		var rty resolvedType
-		if ctx != nil {
-			rty = resolvedTypeOf(*ctx)
-		} else {
-			rty = resolvedType{kind: rtNull}
-		}
-		var frame *planFrame
-		if s != nil {
-			frame = s.catalog.currentPlanFrame()
-		}
-		return &rExpr{kind: reParam, index: idx0, plan: frame}, rty, nil
+		ct := scalarColType(*ctx)
+		return resolveParamNode(s, e, &ct, resolvedTypeOf(*ctx), params)
 	case exprColumn:
 		// Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
 		// (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
@@ -2075,11 +2206,10 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalNull {
 				return &rExpr{kind: reConstNull}, resolvedType{kind: rtArray, elem: &elemRT}, nil
 			}
-			// A bind parameter into an array stays the container-param narrowing (0A000), like
-			// INSERT's $N-into-a-container handling (spec/design/array.md §4).
+			// A bind parameter cast to an array type takes that type (api.md §5).
 			if e.Cast.Inner.Kind == exprParam {
-				return nil, resolvedType{}, newError(FeatureNotSupported,
-					"casting a parameter to an array type is not supported yet")
+				ct := colType{Elem: &elemCol}
+				return resolveParamNode(s, e.Cast.Inner, &ct, resolvedType{kind: rtArray, elem: &elemRT}, params)
 			}
 			// A runtime (non-literal) operand: the two follow-on array-producing casts (array.md §7).
 			// A text expression coerces per row via array_in (runtime text→T[]); an array of the SAME
@@ -2139,6 +2269,12 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalNull {
 				return &rExpr{kind: reConstNull}, resolvedType{kind: rtRange, elem: &elemRT}, nil
 			}
+			// A bind parameter cast to a range type takes that type (api.md §5).
+			if e.Cast.Inner.Kind == exprParam {
+				elemCol := scalarColType(elementScalar(desc))
+				ct := colType{RangeElem: &elemCol}
+				return resolveParamNode(s, e.Cast.Inner, &ct, resolvedType{kind: rtRange, elem: &elemRT}, params)
+			}
 			return nil, resolvedType{}, newError(FeatureNotSupported,
 				"casting to a range type is only supported from a string literal this slice")
 		}
@@ -2158,6 +2294,12 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				node, rt, err := coerceStringToComposite(in.Literal.Str, ct, s.catalog, iz)
 				params.noteInputZone(iz)
 				return node, rt, positionError(err, in.Pos)
+			}
+			// A bind parameter cast to a composite type takes that type (api.md §5).
+			if e.Cast.Inner.Kind == exprParam {
+				snap := s.catalog.readSnap()
+				pct := resolveColType(compositeT(ct.Name), snap.types)
+				return resolveParamNode(s, e.Cast.Inner, &pct, resolvedTypeOfCol(compositeT(ct.Name), snap), params)
 			}
 			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 			if err != nil {
@@ -3833,12 +3975,19 @@ func resolveOperandPair(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTy
 		if rr, rt, err = resolve(s, rhs, nil, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rl, lt, err = resolve(s, lhs, ctxOf(rt), ag, params)
+		// A bare parameter facing a container takes the container's type (api.md §5).
+		var adopted bool
+		if rl, lt, adopted, err = adoptContainerParam(s, lhs, rt, params); !adopted && err == nil {
+			rl, lt, err = resolve(s, lhs, ctxOf(rt), ag, params)
+		}
 	case rhsLit:
 		if rl, lt, err = resolve(s, lhs, nil, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
-		rr, rt, err = resolve(s, rhs, ctxOf(lt), ag, params)
+		var adopted bool
+		if rr, rt, adopted, err = adoptContainerParam(s, rhs, lt, params); !adopted && err == nil {
+			rr, rt, err = resolve(s, rhs, ctxOf(lt), ag, params)
+		}
 	default:
 		if rl, lt, err = resolve(s, lhs, nil, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err

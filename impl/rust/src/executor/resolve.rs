@@ -488,8 +488,25 @@ pub(crate) fn resolve_set_op(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     // Pass 1: resolve both operands with no hint.
-    let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-    let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
+    let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
+    let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    // A bare parameter facing an array or range takes its type (api.md §5): `tags @> $1` binds an
+    // array, `during && $1` a range. A range's element needs a cast (`during @> $1::i32`).
+    let array_or_range =
+        |t: &ResolvedType| matches!(t, ResolvedType::Array(_) | ResolvedType::Range(_));
+    let (mut adopted_l, mut adopted_r) = (false, false);
+    if array_or_range(&lt) {
+        if let Some(adopted) = adopt_container_param(scope, rhs, &lt, params)? {
+            (rr, rt) = adopted;
+            adopted_r = true;
+        }
+    }
+    if !adopted_r && array_or_range(&rt) {
+        if let Some(adopted) = adopt_container_param(scope, lhs, &rt, params)? {
+            (rl, lt) = adopted;
+            adopted_l = true;
+        }
+    }
     // RANGE axis if either operand is a range. (The five positional operators are range-only; on a
     // non-range pair they fall through to the array branch below, which rejects them as 42883.)
     if matches!(lt, ResolvedType::Range(_)) || matches!(rt, ResolvedType::Range(_)) {
@@ -513,8 +530,6 @@ pub(crate) fn resolve_set_op(
         // A positional/adjacency operator on non-range operands — no array overload exists.
         _ => return Err(no_set_op_overload()),
     };
-    let (mut rl, mut lt) = (rl, lt);
-    let (mut rr, mut rt) = (rr, rt);
     // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8), so a
     // bare `ARRAY[…]` constructor adapts to the column's element type (`xs @> ARRAY[20]`).
     let hint = match (&lt, &rt) {
@@ -525,10 +540,10 @@ pub(crate) fn resolve_set_op(
     // Pass 2: re-resolve the NON-NULL operands with the hint. A bare NULL (pass-1 type `Null`) is
     // left untyped — it defers in the anyarray slot and the boolean result is unaffected.
     if let Some(s) = hint {
-        if !matches!(lt, ResolvedType::Null) {
+        if !matches!(lt, ResolvedType::Null) && !adopted_l {
             (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
         }
-        if !matches!(rt, ResolvedType::Null) {
+        if !matches!(rt, ResolvedType::Null) && !adopted_r {
             (rr, rt) = resolve(scope, rhs, Some(s), agg, params)?;
         }
     }
@@ -1364,6 +1379,21 @@ pub(crate) fn resolve_scalar_array_operands(
     // Pass 1: resolve both operands with no hint.
     let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
     let (mut ra, mut at) = resolve(scope, array, None, agg, params)?;
+    // A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)`
+    // binds a list of ids.
+    if let Expr::Param(n1) = array {
+        if let Some(elem) = array_param_elem(scope, &lt) {
+            let arr_rt = ResolvedType::Array(Box::new(lt.clone()));
+            let (ra, at) = resolve_param_node(
+                scope,
+                *n1,
+                Some(ColType::Array(Box::new(elem))),
+                arr_rt,
+                params,
+            )?;
+            return Ok((rl, lt, ra, at));
+        }
+    }
     // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
     // bare `ARRAY[…]` constructor, re-resolve the array with `x`'s type as the element hint so the
     // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
@@ -1586,6 +1616,20 @@ pub(crate) fn resolve_concat(
     // Pass 1: resolve both operands with no hint.
     let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
     let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    // A bare parameter beside an array takes the array's type (array || array, api.md §5); an
+    // element needs a cast, as in PostgreSQL.
+    let (mut adopted_l, mut adopted_r) = (false, false);
+    if matches!(lt, ResolvedType::Array(_)) {
+        if let Some(adopted) = adopt_container_param(scope, rhs, &lt, params)? {
+            (rr, rt) = adopted;
+            adopted_r = true;
+        }
+    } else if matches!(rt, ResolvedType::Array(_)) {
+        if let Some(adopted) = adopt_container_param(scope, lhs, &rt, params)? {
+            (rl, lt) = adopted;
+            adopted_l = true;
+        }
+    }
     // A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
     // takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
     // `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
@@ -1620,10 +1664,10 @@ pub(crate) fn resolve_concat(
     // `ARRAY[…]` adapts to the array's element type. A bare NULL (pass-1 type `Null`) is skipped —
     // it must stay untyped so the cat-first overload order matches PG (see the doc comment).
     if let Some(s) = hint {
-        if !matches!(lt, ResolvedType::Null) {
+        if !matches!(lt, ResolvedType::Null) && !adopted_l {
             (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
         }
-        if !matches!(rt, ResolvedType::Null) {
+        if !matches!(rt, ResolvedType::Null) && !adopted_r {
             (rr, rt) = resolve(scope, rhs, Some(s), agg, params)?;
         }
     }
@@ -1880,11 +1924,18 @@ pub(crate) fn resolve_operand_pair(
         (rl, lt, rr, rt)
     } else if lhs_lit {
         let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
-        let (rl, lt) = resolve(scope, lhs, ctx_of(&rt), agg, params)?;
+        // A bare parameter facing a container takes the container's type (api.md §5).
+        let (rl, lt) = match adopt_container_param(scope, lhs, &rt, params)? {
+            Some(adopted) => adopted,
+            None => resolve(scope, lhs, ctx_of(&rt), agg, params)?,
+        };
         (rl, lt, rr, rt)
     } else if rhs_lit {
         let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-        let (rr, rt) = resolve(scope, rhs, ctx_of(&lt), agg, params)?;
+        let (rr, rt) = match adopt_container_param(scope, rhs, &lt, params)? {
+            Some(adopted) => adopted,
+            None => resolve(scope, rhs, ctx_of(&lt), agg, params)?,
+        };
         (rl, lt, rr, rt)
     } else {
         let (rl, lt) = resolve(scope, lhs, None, agg, params)?;

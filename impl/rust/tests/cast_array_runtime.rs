@@ -105,8 +105,6 @@ fn forbidden_element_pairs() {
         ),
         "0A000",
     );
-    // A bind parameter into an array type stays the container-param narrowing (0A000).
-    assert_eq!(err(&mut db, "SELECT $1::i32[]"), "0A000");
 }
 
 // --- (d) runtime text → f32[] / f64[] element casts (float renderer is determinism-exempt) -------

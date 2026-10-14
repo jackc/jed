@@ -1537,15 +1537,11 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 	if e.Kind == exprLiteral && e.Literal != nil && e.Literal.Kind == literalNull {
 		return &rExpr{kind: reConstNull}, nil
 	}
+	// A bind parameter assigned to a container column takes the column's type (api.md §5).
 	if e.Kind == exprParam {
-		kind := "range"
-		if col.Type.IsArray() {
-			kind = "array"
-		} else if col.Type.IsComposite() {
-			kind = "composite"
-		}
-		return nil, newError(FeatureNotSupported,
-			"updating "+kind+" column "+col.Name+" from a parameter is not supported yet")
+		ct := resolveColType(col.Type, snap.types)
+		node, _, err := resolveParamNode(s, e, &ct, colRT, params)
+		return node, err
 	}
 	// For an array column over a SCALAR element, pass the element type as the hint so a bare
 	// `ARRAY[1,2]` constructor adapts its literal elements to the column's element type (the same

@@ -401,8 +401,8 @@ catalog bytes) and `jed_columns.column_default` is NULL.
 
 **Still narrowed (relaxed in a later slice):** an anonymous `ROW(…)` *expression* assigned by
 `UPDATE`/`DO UPDATE` (or as a non-literal-field `INSERT … VALUES` slot) is `0A000` — the
-anonymous-record → named-composite assignment coercion; a `$N` parameter as an `UPDATE`/`DO UPDATE`
-composite RHS is `0A000` (the container rule); a non-NULL `DEFAULT` on a composite column is `0A000`;
+anonymous-record → named-composite assignment coercion; a non-NULL `DEFAULT` on a composite column is
+`0A000`;
 the runtime (non-literal) text→composite
 cast, the `composite::text` cast, the anonymous `ROW(…)::type` structural cast, and the nested
 `ROW(ROW(…),…)`-into-column constructor (a jed extension PG rejects — covered by unit tests, not the

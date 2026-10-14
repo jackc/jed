@@ -15,7 +15,7 @@
 // The core is single-threaded and planning is synchronous, so the frames are one module-level stack,
 // strictly nested.
 
-import type { ScalarType } from "./types.ts";
+import type { ColType } from "./catalog.ts";
 import type { Value } from "./value.ts";
 import { render } from "./value.ts";
 
@@ -25,7 +25,7 @@ interface Frame {
   sensitive: boolean;
   nullRead: boolean;
   // every type a $N was given while probing (the EXPLAIN typing pass reads it)
-  types: (ScalarType | null)[];
+  types: (ColType | null)[];
   // a restarted statement adopts this custom frame at its own begin instead of probing again
   adopt: boolean;
 }
@@ -62,7 +62,7 @@ export function paramIsNull(i: number): boolean {
 
 // noteParamType records the type a probe frame's resolution gave $(idx0+1) (ParamTypes.note, after
 // its own unification; null = no context here, which still makes the slot exist).
-export function noteParamType(idx0: number, ty: ScalarType | null): void {
+export function noteParamType(idx0: number, ty: ColType | null): void {
   const f = top();
   if (f === undefined || f.custom) return;
   while (idx0 >= f.types.length) f.types.push(null);
@@ -115,7 +115,7 @@ export class Planning {
   }
 
   // probeTypes: the parameter types the probe saw.
-  probeTypes(): (ScalarType | null)[] {
+  probeTypes(): (ColType | null)[] {
     return this.probing() ? [...this.frame.types] : [];
   }
 

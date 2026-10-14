@@ -79,10 +79,6 @@ func TestArrayForbiddenElementPairs(t *testing.T) {
 	if got := castErr(t, db, "SELECT (ARRAY[ROW('Main',90210)::addr]::addr[])::text[]"); got != "0A000" {
 		t.Fatalf("addr[] → text[]: want 0A000, got %s", got)
 	}
-	// A bind parameter into an array type stays the container-param narrowing (0A000).
-	if got := castErr(t, db, "SELECT $1::i32[]"); got != "0A000" {
-		t.Fatalf("$1::i32[]: want 0A000, got %s", got)
-	}
 }
 
 // --- (d) runtime text → f32[] / f64[] element casts (float renderer is determinism-exempt) -------

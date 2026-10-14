@@ -1713,3 +1713,25 @@ reason = "jed types the string literal 'x' text, so no left(…, text) candidate
 file = "params/binding.test"
 sql = "SELECT 5::interval"
 reason = "jed reports a forbidden cast pair as 42804 datatype_mismatch (types.md §9, the cast matrix); PostgreSQL reports integer to interval as 42846 cannot_coerce. Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "params/containers.test"
+sql = "SELECT id FROM t WHERE id = ANY($1)"
+params = "ARRAY[]"
+reason = "jed binds typed host values, and an empty host array is a valid value of any array parameter type (here i32[]), so the list matches nothing. The oracle's EXECUTE argument ARRAY[] is an untyped empty array literal, which PostgreSQL rejects (\"cannot determine type of empty array\"); a PostgreSQL client binding an empty list sends a typed value or the text '{}', which agrees with jed."
+
+[[override]]
+file = "params/containers.test"
+sql = "SELECT id FROM t WHERE nums = $1 OR id = $1"
+reason = "jed: two contexts inferring different types (i32[] and i32) for one parameter is 42804 datatype_mismatch (api.md §5). PostgreSQL types $1 from its first use (integer[]) and then finds no integer = integer[] operator, 42883."
+
+[[override]]
+file = "params/containers.test"
+sql = "SELECT id FROM c WHERE ROW(1, 2) = $1"
+reason = "jed: an anonymous record does not type a parameter, so $1 stays 42P18 indeterminate_datatype (api.md §5). PostgreSQL types $1 as record and accepts the ROW(1, 2) argument."
+
+[[override]]
+file = "params/containers.test"
+sql = "SELECT id FROM c WHERE p = $1"
+params = "'(3,4)'"
+reason = "jed types a parameter compared with a named composite as that composite (api.md §5), so a text value is read by its record input. PostgreSQL types the parameter as the anonymous record (record_eq's argument type) and cannot read text into it (0A000, input of anonymous composite types is not implemented)."

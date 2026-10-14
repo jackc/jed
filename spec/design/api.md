@@ -659,12 +659,41 @@ the same index (`i16` here, `text` there) are `42804 datatype_mismatch`. Two ada
 with no anchoring type (`$1 = $2`, `$1 = 5`) default the parameter to `i64`, matching the
 existing integer-literal default (a documented local-consistency divergence from PG).
 
+**Container-typed parameters.** A parameter's type may be an array, a range, or a named composite
+type, not only a scalar. PostgreSQL's rule carries over: an untyped operand facing a container
+takes the container's own type. So:
+
+- A bare `$N` operand of a binary operator whose other operand is an array, range, or named
+  composite takes that same type: the comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT]
+  DISTINCT FROM`), the containment, overlap, and positional operators (`@>`, `<@`, `&&`, `<<`, `>>`,
+  `&<`, `&>`, `-|-`), the range set operators (`+`, `-`, `*`), and `||`. So `tags @> $1` types `$1`
+  `text[]`, `during && $1` and `during @> $1` type it the range, `arr || $1` the array, and
+  `addr = $1` the composite. An element on the other side needs a cast (`during @> $1::i32`,
+  `arr || $1::i32`), as in PostgreSQL.
+- `x op ANY ($N)` / `ALL ($N)` types `$N` as the array of `x`'s type, so `id = ANY($1)` binds a
+  list of ids. (`$N = ANY(arr)` already takes the element type.)
+- A cast to a container type, `CAST($1 AS i32[])` or `$1::i32range`, types `$1` as that type.
+- An `INSERT … VALUES` slot, an `UPDATE … SET`, or an `ON CONFLICT … DO UPDATE SET` assigned to a
+  container column types the parameter as the column's type.
+
+An anonymous record (a `ROW(…)` expression) does not type a parameter (`42P18`; PostgreSQL types it
+`record` and then cannot read a text value into it), and neither does a polymorphic function slot
+(`array_length($1, 1)`, functions.md §9.1).
+
 **Binding is two-phase / all-or-nothing**, like `INSERT`/`UPDATE`: every supplied value is
 coerced to its inferred type up front (out-of-range → `22003`, wrong family → `42804`, NULL
 into a NOT NULL target → `23502`, bad `bytea`/`uuid` text → `22P02`) **before any row is
 touched**, so a bad binding fails deterministically with no partial work. Supplying the
 wrong number of values is `42601` (a malformed invocation — PG's `08P01` is wire-protocol
 only and the engine has no wire protocol).
+
+A container parameter accepts the matching host value or its text form. An array value has each
+element coerced to the element type, keeping its shape; a range value has each bound coerced to the
+element type and is then canonicalized exactly as a range constructor's result is (a discrete
+`[1,3]` binds as `[1,4)`; crossed bounds are `22000`); a composite value must have the type's field
+count and has each field coerced (`42804` otherwise). A text value is read by the type's input
+function, as a string literal assigned to that type is (`'{1,2}'`, `'[1,5)'`, `'(1,x)'`; malformed
+input is `22P02`). Any other value is `42804`.
 
 **Plans see the values.** Types never depend on values, but the plan does: each execution is planned
 as if its bound values were literals of their parameters' types ([estimator.md](estimator.md) §6.1),
@@ -962,8 +991,11 @@ no path around the strict type system**, it only saves the caller from hand-buil
 **Args (native → `Value`).** A type switch with an escape hatch (`Valuer`): `nil`→NULL; `bool`;
 the integer widths (range-checked into `i64`); `f32`/`f64`; `string`→`text`; bytes→`bytea`;
 the host time type→a temporal `Value`; the engine's own `Decimal`/`Interval`/`uuid` types (Go builds
-a `Decimal` from its text form with `ParseDecimal`, keeping the written scale); a bare `Value` passes
-through. **The one impedance point is temporal**: Go's single `time.Time` (and the
+a `Decimal` from its text form with `ParseDecimal`, keeping the written scale); a list→a
+one-dimensional array, for an array parameter (§5: a Go slice other than `[]byte`, nil binding NULL;
+a JS array; in Rust the `Array(vec![…])` newtype, because a bare `Vec<T>` is a parameter *set* and
+`Vec<u8>` is `bytea`); a bare `Value` passes through, which is how a host binds a range or composite
+value. **The one impedance point is temporal**: Go's single `time.Time` (and the
 equivalents) maps to three jed types — it is bound as `timestamptz` and the §5 binder re-coerces to
 the inferred column type (`timestamp`/`date`); a host that needs an exact target casts (`$1 ::
 date`) or passes a `Value`.
@@ -1080,7 +1112,7 @@ ergonomic surface stabilizes across cores (CLAUDE.md §10).
 harness depend on them), so the ergonomic methods are a *new, non-colliding* set rather than a
 generic-ized signature. Three pieces mirror rusqlite's `ToSql`/`FromSql`/`Row`: **`ToValue`** (native
 → `Value`: the int/float primitives, `bool`, `&str`/`String`, byte slices, `Decimal`, `Option<T>` as
-the nullable binder, and `Value`/`&Value` as the identity) and **`Params`** (a *set* — `()`, tuples
+the nullable binder, `Array<T>` as an array parameter, and `Value`/`&Value` as the identity) and **`Params`** (a *set* — `()`, tuples
 to 12-arity, `[T; N]`/`&[T]`/`Vec<T>`, so a raw `&[Value]` is still a `Params` via `Value: ToValue`);
 **`FromValue`** (column `Value` → native, with `Option<T>` the only NULL-accepting target — a bare
 scalar rejects NULL with `22004`, a narrowing overflow is `22003`, a family mismatch `42804`) and
@@ -1122,7 +1154,7 @@ idiom, **additive** — the raw `Value[]` `execute`/`query` are unchanged. `db.p
 exist as one-shot shorthands on the handle (`db.run`/`get`/`all`). Params and columns spread/return
 **plain JS values**: a param maps `bigint`→int, an integer-valued `number`→int (so `run(1)` binds an
 integer — JS can't tell `1` from `1.0`), other `number`→f64, `boolean`/`string`/`Uint8Array`/`Decimal`
-to their types, `null`/`undefined`→NULL, a raw `Value` passes through; a result maps int→**`bigint`**
+to their types, a JS array→an array, `null`/`undefined`→NULL, a raw `Value` passes through; a result maps int→**`bigint`**
 (i64 is exact — jed's identity), `bool`/`f32`/`f64`/`text`/`bytea` to their JS natives, and every
 other type (decimal, uuid, the temporal types, array/range/json/composite) to its **canonical text**
 — lossless and predictable, with the raw `query` path kept for the engine `Value` itself (a

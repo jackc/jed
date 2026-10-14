@@ -221,8 +221,11 @@ per-core tests.
   | `-?[0-9]+` | an integer (i64; a token outside i64 is a harness error) |
   | `-?[0-9]+\.[0-9]+` | a decimal, its scale as written (`1.50` has scale 2) |
   | `'…'` (a doubled `''` is one quote) | a text value |
+  | `ARRAY[v, …]` | a one-dimensional array of the listed values (`ARRAY[]` is empty) |
+  | `ROW(v, …)` | a composite value of the listed fields |
 
-  Commas inside a quoted value do not separate values. A host value carries no SQL type: binding
+  `ARRAY` and `ROW` nest, and commas inside a quoted value or a nested list do not separate values.
+  A range has no host-value spelling; bind its text form (`'[1,5)'`). A host value carries no SQL type: binding
   coerces it to the parameter's inferred type (an integer into a decimal parameter, a text into a
   `uuid`/`timestamp`/`bytea` parameter by that type's input form, and so on — api.md §5), with the
   binding errors api.md §5 lists (`22003`, `42804`, `22P02`, `23502`, `42601`).

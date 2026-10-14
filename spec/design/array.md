@@ -209,9 +209,9 @@ reaches the same answer through §5's integer-width rule instead), a bare `'{…
 `array_in`, and a bare `NULL` to the typed NULL; any other
 expression must resolve to the **same** array type (a different element type, or a scalar RHS, is
 `42804`). A GIN index over the column is maintained over the new value (the same per-term entry
-move as INSERT/DELETE). A top-level `$N` parameter into an array column stays `0A000` (INSERT's
-param-to-container handling is special — a per-core divergence test), as does the
-`ON CONFLICT DO UPDATE` conflict-action path.
+move as INSERT/DELETE). The `ON CONFLICT DO UPDATE` conflict-action path assigns the same way, and a
+`$N` parameter there takes the column's type and binds an array value ([api.md](api.md) §5,
+`suites/params/containers.test`).
 
 **`INSERT … SELECT` into an array column** follows the same same-type rule: a projection of exactly the
 column's array type, or an untyped `NULL`, is stored through `store_array`; any other type is `42804`
@@ -374,7 +374,7 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
     `jsonpath`-element — array cast is `0A000` (the container cast surface stays deferred). Overflow
     traps `22003` per element.
 
-  A bind parameter into an array type (`$1::i32[]`) stays `0A000` (the container-param narrowing, §4).
+  A bind parameter cast to an array type (`$1::i32[]`) takes that type ([api.md](api.md) §5).
   No on-disk format change. The numeric/text element pairs agree with PostgreSQL and are oracle-checked
   (`suites/cast/array_casts.test`); the jed-only `uuid`⇄`bytea` element casts and the forbidden-pair /
   explicit-only divergences are per-core unit tests (`cast_array_runtime`).

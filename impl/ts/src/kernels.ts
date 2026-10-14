@@ -32,7 +32,8 @@ import { exprLocation } from "./eval_ops.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import { emptyRangeValue, parseByteaHex, parseRecordTokens, parseUuid } from "./value.ts";
 import { canonicalName, inRange, rank, roundToWidth, typeCanonicalName } from "./types.ts";
-import type { Column, CompositeType } from "./catalog.ts";
+import type { ColType, Column, CompositeType } from "./catalog.ts";
+import { resolvedRangeElementScalar } from "./scope.ts";
 import { elementScalar, finalizeRange, parseRangeText, rangeForElement } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 import type { Value } from "./value.ts";
@@ -109,6 +110,70 @@ export function resolveTextOperandPair(
   return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
 }
 
+// resolveParamNode resolves the bare parameter e as type ct (null = no context here), whose resolved
+// form is type, recording the inference.
+export function resolveParamNode(
+  scope: Scope,
+  e: Expr & { kind: "param" },
+  ct: ColType | null,
+  type: ResolvedType,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets it, so
+  // earlier resolution errors keep PostgreSQL's order.
+  if (scope.catalog.viewTrace !== null) {
+    throw engineError("undefined_parameter", `there is no parameter $${e.index}`);
+  }
+  const idx0 = e.index - 1;
+  params.noteCol(idx0, ct);
+  return { node: { kind: "param", index: idx0 }, type };
+}
+
+// adoptContainerParam types e, when it is a bare parameter, as the container type other — an array,
+// range, or named composite (spec/design/api.md §5, container-typed parameters). null when e is not
+// a parameter or other is not such a container.
+export function adoptContainerParam(
+  scope: Scope,
+  e: Expr,
+  other: ResolvedType,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } | null {
+  if (e.kind !== "param") return null;
+  const ct = containerParamType(scope, other);
+  if (ct === null) return null;
+  return resolveParamNode(scope, e, ct, other, params);
+}
+
+// containerParamType is the parameter type of a container-typed context: an array whose element is a
+// scalar or a named composite, a range, or a named composite. null for anything else (a scalar, an
+// anonymous record, an untyped NULL).
+export function containerParamType(scope: Scope, rt: ResolvedType): ColType | null {
+  switch (rt.kind) {
+    case "array": {
+      const elem = arrayParamElem(scope, rt.elem);
+      return elem === null ? null : { kind: "array", elem };
+    }
+    case "range": {
+      const es = resolvedRangeElementScalar(rt.elem);
+      return es === undefined ? null : { kind: "range", elem: { kind: "scalar", scalar: es } };
+    }
+    case "composite":
+      return rt.name === null
+        ? null
+        : scope.catalog.colTypeOf({ kind: "composite", name: rt.name });
+    default:
+      return null;
+  }
+}
+
+// arrayParamElem is the element type an array parameter takes beside an operand of type t: t itself
+// when it is a scalar or a named composite (an array of arrays or ranges is not a jed type).
+export function arrayParamElem(scope: Scope, t: ResolvedType): ColType | null {
+  const s = ctxOf(t);
+  if (s !== null) return { kind: "scalar", scalar: s };
+  return t.kind === "composite" ? containerParamType(scope, t) : null;
+}
+
 export function resolveOperandPair(
   scope: Scope,
   lhs: Expr,
@@ -125,10 +190,15 @@ export function resolveOperandPair(
     r = resolve(scope, rhs, "i64", ag, params);
   } else if (lhsLit) {
     r = resolve(scope, rhs, null, ag, params);
-    l = resolve(scope, lhs, ctxOf(r.type), ag, params);
+    // A bare parameter facing a container takes the container's type (api.md §5).
+    l =
+      adoptContainerParam(scope, lhs, r.type, params) ??
+      resolve(scope, lhs, ctxOf(r.type), ag, params);
   } else if (rhsLit) {
     l = resolve(scope, lhs, null, ag, params);
-    r = resolve(scope, rhs, ctxOf(l.type), ag, params);
+    r =
+      adoptContainerParam(scope, rhs, l.type, params) ??
+      resolve(scope, rhs, ctxOf(l.type), ag, params);
   } else {
     l = resolve(scope, lhs, null, ag, params);
     r = resolve(scope, rhs, null, ag, params);
@@ -439,12 +509,10 @@ export function resolveContainerAssign(
   if (e.kind === "literal" && e.literal.kind === "null") {
     return { kind: "constNull" };
   }
+  // A bind parameter assigned to a container column takes the column's type (api.md §5).
   if (e.kind === "param") {
-    const kind = col.type.kind;
-    throw engineError(
-      "feature_not_supported",
-      `updating ${kind} column ${col.name} from a parameter is not supported yet`,
-    );
+    const colRt = resolvedTypeOfCol(col.type, scope.catalog);
+    return resolveParamNode(scope, e, scope.catalog.colTypeOf(col.type), colRt, params).node;
   }
   // For an array column over a SCALAR element, pass the element type as the hint so a bare
   // ARRAY[1,2] constructor adapts its literal elements to the column's element type (the same

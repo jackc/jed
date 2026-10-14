@@ -852,6 +852,40 @@ func parseParamsDirective(line string) ([]jed.Value, bool, error) {
 // takeParamValue reads one `# params:` value from the front of s: a single-quoted text (a doubled
 // ” is one quote), NULL, true/false, an integer, or a decimal with its written scale.
 func takeParamValue(s string) (jed.Value, string, error) {
+	if m := paramListRe.FindString(s); m != "" {
+		closer, isArray := ")", strings.HasPrefix(m, "ARRAY")
+		if isArray {
+			closer = "]"
+		}
+		rest := strings.TrimSpace(s[len(m):])
+		var items []jed.Value
+		for !strings.HasPrefix(rest, closer) {
+			if rest == "" {
+				return jed.Value{}, "", fmt.Errorf("unterminated list value %q", s)
+			}
+			item, after, err := takeParamValue(rest)
+			if err != nil {
+				return jed.Value{}, "", err
+			}
+			items = append(items, item)
+			rest = strings.TrimSpace(after)
+			if strings.HasPrefix(rest, closer) {
+				break
+			}
+			after, ok := strings.CutPrefix(rest, ",")
+			if !ok {
+				return jed.Value{}, "", fmt.Errorf("expected `,` or `%s` before %q", closer, rest)
+			}
+			rest = strings.TrimSpace(after)
+		}
+		if isArray {
+			return jed.ArrayValue(items), rest[1:], nil
+		}
+		if len(items) == 0 {
+			return jed.Value{}, "", fmt.Errorf("ROW() needs at least one field")
+		}
+		return jed.CompositeValue(items), rest[1:], nil
+	}
 	if strings.HasPrefix(s, "'") {
 		var text strings.Builder
 		for i := 1; i < len(s); i++ {
@@ -869,8 +903,9 @@ func takeParamValue(s string) (jed.Value, string, error) {
 		return jed.Value{}, "", fmt.Errorf("unterminated text value %q", s)
 	}
 	token, rest := s, ""
-	if comma := strings.IndexByte(s, ','); comma >= 0 {
-		token, rest = s[:comma], s[comma:]
+	// A scalar token runs to the next separator or the close of an enclosing ARRAY[…] / ROW(…).
+	if end := strings.IndexAny(s, ",])"); end >= 0 {
+		token, rest = s[:end], s[end:]
 	}
 	token = strings.TrimSpace(token)
 	switch {
@@ -895,6 +930,7 @@ func takeParamValue(s string) (jed.Value, string, error) {
 }
 
 var (
+	paramListRe    = regexp.MustCompile(`^(ARRAY\s*\[|ROW\s*\()`)
 	paramIntRe     = regexp.MustCompile(`^-?[0-9]+$`)
 	paramDecimalRe = regexp.MustCompile(`^-?[0-9]+\.[0-9]+$`)
 )

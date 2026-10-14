@@ -82,7 +82,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`json` / `jsonb` + SQL/JSON** — the committed XL headline feature: all non-deferred slices across all three cores, oracle-clean; spec'd across [json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md), [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md); type codes 18/19/20, one `format_version` bump (v18→v19).
   - [ ] _follow-ons (deferred `0A000`, hoisted from the done slices):_ the string-**dictionary builder** (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index ([encoding.md §2.13](spec/design/encoding.md)); `JSON_TABLE` explicit `PLAN` (T2); `ON ERROR/EMPTY DEFAULT <expr>` (S3); the jsonpath `like_regex` `m` flag (needs line anchors in the regex VM, [jsonpath.md §4.3](spec/design/jsonpath.md)); `PASSING … FORMAT JSON` of a `bytea` value ([json-sql-functions.md §5.4](spec/design/json-sql-functions.md)); and a NaN or ±Infinity float `PASSING` value (a `numeric` NaN/Infinity item in PG, which jed's finite `decimal` cannot hold, [json-sql-functions.md §5.4](spec/design/json-sql-functions.md)).
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — COMPLETE (S0–S6): the open `Type { Scalar | Composite(catalog-ref) }`, `CREATE`/`DROP TYPE`, nested + recursive types, storable composite column + recursive codec (`format_version` 9), `ROW(…)`, field access, element-wise compare/ORDER BY/DISTINCT/GROUP BY; array- and range-typed fields (the range field is `format_version` 41). Named composites only. → [composite.md](spec/design/composite.md)
-  - [ ] _still narrowed (relaxable later):_ an anonymous `ROW(…)` *expression* (non-literal fields) assigned to a composite column — an `INSERT … VALUES` slot or an `UPDATE`/`ON CONFLICT DO UPDATE` RHS — and a `$N` composite `UPDATE` RHS; an **array-of-composite** field as a key + a composite **FK** pairing (the remaining `0A000` key axes); a non-NULL `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` + anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor.
+  - [ ] _still narrowed (relaxable later):_ an anonymous `ROW(…)` *expression* (non-literal fields) assigned to a composite column — an `INSERT … VALUES` slot or an `UPDATE`/`ON CONFLICT DO UPDATE` RHS; an **array-of-composite** field as a key + a composite **FK** pairing (the remaining `0A000` key axes); a non-NULL `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` + anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor.
 
 ---
 
@@ -200,6 +200,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     PostgreSQL-style switch to a generic plan after five executions.
     - [ ] _follow-on:_ subqueries in a top-level plain `INSERT ... VALUES` slot still plan unbound
       (the fast path opens no boundary); custom-plan them if a workload needs it.
+  - [ ] _follow-on:_ a key access path for `col = ANY(<array>)` — a literal, cast, or bound array
+    (`id = ANY($1)`, the usual way to bind a list since container parameters landed). It is a full
+    scan + filter today, where `id IN (1, 3)` takes PK/index point lookups (the interval-set path);
+    the bound case needs the custom plan to read the array's elements. _(size: M)_
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
     composite/array/json/jsonb, GIN term statistics for `<@`, and an element-count
@@ -299,19 +303,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `42883` there today); the dedicated resolvers (array, range-constructor, json-set functions)
     still type their own arguments; a parameter already typed by an earlier occurrence still counts
     as unknown in a later function argument.
-- [ ] **Container-typed bind parameters** — a `$N` of array, range, or composite type. PostgreSQL
-  types `tags @> $1` as `text[]` from context and accepts `$1::i32[]`; jed's parameter typing is
-  scalar-only (`ParamTypes` holds a `ScalarType`), so every container `$N` fails, with four
-  different errors today: `col @> $1` is `42P18`, `id = ANY($1)` is `42809`, `$1::i32[]` and
-  `UPDATE … SET arr = $1` are `0A000`, and `INSERT … VALUES (…, $1)` into an array column is
-  `42601` "expects 0, got 1" (the parameter is not counted at all, which looks like a bug of its
-  own). Embedded hosts hit this constantly: `WHERE id = ANY($1)` with a host array is the usual
-  way to bind a list. Lifting it means parameter inference over the open `Type`; the binder
-  coercing a host value into a container (`Value::Array`/range/composite, and the per-language
-  ergonomic mappings, api.md §6 follow-up (a)); and the INSERT/UPDATE/`DO UPDATE` assignment
-  paths. All three cores. Scalar parameters inside a constructor (`ARRAY[$1, $2]`,
-  `$1 = ANY(col)`) already work and bound GIN scans. → [array.md §4/§7](spec/design/array.md),
-  [ranges.md](spec/design/ranges.md), [composite.md](spec/design/composite.md), [api.md §5](spec/design/api.md)
 - [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, a Playwright real-browser e2e run inside `mise run ci`). **Open:** OPFS disk-spill. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **jed-migrate — the schema-migration library** — tern-modeled, opt-in migration packages at
   `/migrate` (Go + Rust + TS; a NON-CORE consumer per language) over one shared contract +

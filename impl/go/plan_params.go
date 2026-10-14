@@ -28,7 +28,7 @@ type planFrame struct {
 	sensitive bool
 	nullRead  bool
 	// every type a $N was given while probing (the EXPLAIN typing pass reads it)
-	types []*scalarType
+	types []*colType
 	// a restarted statement adopts this custom frame at its own begin instead of probing again
 	adopt bool
 }
@@ -69,7 +69,7 @@ func (f *planFrame) isNull(i int) bool {
 
 // noteType records the type a probe frame's resolution gave $(idx0+1) (nil = no context here,
 // which still makes the slot exist).
-func (f *planFrame) noteType(idx0 int, ty *scalarType) {
+func (f *planFrame) noteType(idx0 int, ty *colType) {
 	if f == nil || f.ended || f.custom {
 		return
 	}

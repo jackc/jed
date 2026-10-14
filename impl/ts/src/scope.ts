@@ -103,7 +103,16 @@ import { cteBodyAsQuery, cteBodyIsDataModifying, forEachGroupExpr } from "./ast.
 import { requireSetopEquality, unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
 import { render, renderFloatPg } from "./value.ts";
-import { storeValue } from "./store.ts";
+import {
+  coerceForStore,
+  coerceRecordTextToValue,
+  coerceStringToArray,
+  storeValue,
+} from "./store.ts";
+import { coerceStringToRange } from "./kernels.ts";
+import { finalizeRange, rangeForElement } from "./range.ts";
+import type { RangeDesc } from "./ranges_gen.ts";
+import { type ColType, colTypeScalar } from "./catalog.ts";
 import { quoteIdentifier } from "./parser.ts";
 import type { Privilege } from "./privileges.ts";
 import type { TableStore } from "./storage.ts";
@@ -1638,7 +1647,9 @@ export function typeFromResolved(rt: ResolvedType): Type {
 // marks a parameter referenced before any context fixed its type. Shared across every clause so a
 // $1 used in both WHERE and the select list unifies, then finalized.
 export class ParamTypes {
-  types: (ScalarType | null)[] = [];
+  // types[i] is $(i+1)'s inferred type: a scalar, or a container — an array, range, or named
+  // composite (spec/design/api.md §5) — as the resolved column type the binder coerces into.
+  types: (ColType | null)[] = [];
   // uncacheable is set during resolution when a node is created that makes the resolved plan
   // un-reusable across executions: a subquery (the uncorrelated-subquery fold rewrites it to a
   // constant baking in THIS execution's bound params) or a precompiled-regex node (whose one-shot
@@ -1669,10 +1680,16 @@ export class ParamTypes {
     }
   }
 
-  // note records that $(idx0+1) appears with context type ty (null = no context here). It unifies
-  // with any prior inference: equal types agree, two integer widths widen to the wider, an
-  // incompatible concrete pair is 42804.
+  // note records that $(idx0+1) appears with scalar context type ty (null = no context here). It
+  // unifies with any prior inference (noteCol).
   note(idx0: number, ty: ScalarType | null): void {
+    this.noteCol(idx0, ty === null ? null : { kind: "scalar", scalar: ty });
+  }
+
+  // noteCol records that $(idx0+1) appears with context type ty, a scalar or a container (null = no
+  // context here). It unifies with any prior inference: equal types agree, two integer widths widen
+  // to the wider, an incompatible pair is 42804.
+  noteCol(idx0: number, ty: ColType | null): void {
     while (idx0 >= this.types.length) this.types.push(null);
     if (ty !== null) {
       const prev = this.types[idx0]!;
@@ -1683,8 +1700,8 @@ export class ParamTypes {
 
   // finalize returns the ordered parameter types. A slot referenced but never typed — including a
   // gap in $1..$N — is 42P18 indeterminate_datatype.
-  finalize(): ScalarType[] {
-    const out: ScalarType[] = [];
+  finalize(): ColType[] {
+    const out: ColType[] = [];
     for (let i = 0; i < this.types.length; i++) {
       const t = this.types[i]!;
       if (t === null) {
@@ -1701,10 +1718,42 @@ export class ParamTypes {
 
 // unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
 // widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
-export function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): ScalarType {
-  if (a === b) return a;
-  if (isInteger(a) && isInteger(b)) return rank(a) >= rank(b) ? a : b;
+export function unifyParamType(a: ColType, b: ColType, idx0: number): ColType {
+  if (a.kind === "scalar" && b.kind === "scalar") {
+    if (a.scalar === b.scalar) return a;
+    if (isInteger(a.scalar) && isInteger(b.scalar)) return rank(a.scalar) >= rank(b.scalar) ? a : b;
+  } else if (colTypeEqual(a, b)) {
+    return a;
+  }
   throw engineError("datatype_mismatch", `inconsistent types inferred for parameter $${idx0 + 1}`);
+}
+
+// colTypeEqual is structural equality of two resolved column types.
+function colTypeEqual(a: ColType, b: ColType): boolean {
+  switch (a.kind) {
+    case "scalar":
+      return b.kind === "scalar" && a.scalar === b.scalar;
+    case "array":
+    case "range":
+      return b.kind === a.kind && colTypeEqual(a.elem, b.elem);
+    case "composite":
+      return (
+        b.kind === "composite" &&
+        a.name === b.name &&
+        a.fields.length === b.fields.length &&
+        a.fields.every((f, i) => {
+          const g = b.fields[i]!;
+          return (
+            f.name === g.name &&
+            f.notNull === g.notNull &&
+            f.varcharLen === g.varcharLen &&
+            f.typmod?.precision === g.typmod?.precision &&
+            f.typmod?.scale === g.typmod?.scale &&
+            colTypeEqual(f.type, g.type)
+          );
+        })
+      );
+  }
 }
 
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
@@ -1716,7 +1765,7 @@ export function paramLabels(n: number): string[] {
 
 export function bindParams(
   supplied: Value[],
-  types: ScalarType[],
+  types: ColType[],
   iz: InputZone,
   labels: readonly string[] = paramLabels(types.length),
 ): Value[] {
@@ -1728,7 +1777,43 @@ export function bindParams(
   }
   // A text value bound to a timestamptz parameter reads an offset-less string in the session zone,
   // as PostgreSQL's text-format parameter input does (timezones.md §9.3).
-  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, null, false, labels[i]!, iz));
+  return types.map((ty, i) =>
+    ty.kind === "scalar"
+      ? storeValue(supplied[i]!, ty.scalar, null, null, false, labels[i]!, iz)
+      : bindContainerParam(supplied[i]!, ty, labels[i]!, iz),
+  );
+}
+
+// bindContainerParam coerces a host value to an array, range, or composite parameter type
+// (spec/design/api.md §5). A text value is read by the type's input function, as a string literal
+// assigned to the type is; a range value is canonicalized as a range constructor's result is; every
+// other value takes the storage coercion of a column of the type.
+function bindContainerParam(v: Value, ty: ColType, label: string, iz: InputZone): Value {
+  if (v.kind === "text") {
+    if (ty.kind === "array") return coerceStringToArray(v.text, ty.elem, iz);
+    if (ty.kind === "range") return coerceStringToRange(v.text, rangeParamDesc(ty), iz);
+    if (ty.kind === "composite") return coerceRecordTextToValue(v.text, ty, iz);
+  }
+  if (v.kind === "range" && ty.kind === "range" && !v.empty) {
+    const elem = colTypeScalar(ty.elem);
+    const bound = (b: Value | null): Value | null =>
+      b === null ? null : storeValue(b, elem, null, null, false, label, iz);
+    return finalizeRange(
+      rangeParamDesc(ty),
+      bound(v.lower),
+      bound(v.upper),
+      v.lowerInc,
+      v.upperInc,
+    );
+  }
+  return coerceForStore(v, ty, null, null, false, label, iz);
+}
+
+// rangeParamDesc is the range descriptor of a range parameter type.
+function rangeParamDesc(ty: { kind: "range"; elem: ColType }): RangeDesc {
+  const desc = rangeForElement(colTypeScalar(ty.elem));
+  if (desc === undefined) throw new Error("a range parameter's element has a range type");
+  return desc;
 }
 
 // rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which

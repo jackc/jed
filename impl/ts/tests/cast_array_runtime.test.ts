@@ -66,11 +66,6 @@ test("forbidden array element pairs: 42804 (no scalar cast) / 0A000 (composite e
     errCode(() => db.execute("SELECT (ARRAY[ROW('Main',90210)::addr]::addr[])::text[]")),
     "0A000",
   );
-  // A bind parameter into an array type stays the container-param narrowing (0A000).
-  assert.equal(
-    errCode(() => db.execute("SELECT $1::i32[]")),
-    "0A000",
-  );
 });
 
 // --- (d) runtime text → f32[] / f64[] element casts (float renderer is determinism-exempt) -------

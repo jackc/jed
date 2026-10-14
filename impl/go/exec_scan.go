@@ -82,7 +82,7 @@ type scanCache struct {
 	core        *sharedCore
 	inputs      []estimatorInputSignature
 	sp          *selectPlan
-	ptys        []scalarType
+	ptys        []colType
 	plabels     []string
 	resultTypes []string
 	// sensitive: the probe plan read a parameter's value (estimator.md §6.1), so sp is not reused —

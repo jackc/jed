@@ -179,6 +179,23 @@ impl<T: ToValue> ToValue for Option<T> {
     }
 }
 
+/// A list bound as one array parameter (`id = ANY($1)` — spec/design/api.md §5): `Array(vec![1, 2])`
+/// binds the one-dimensional array of its converted elements. A newtype, because a bare `Vec<T>` is a
+/// *set* of parameters and `Vec<u8>` binds as `bytea`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Array<T>(pub Vec<T>);
+
+impl<T: ToValue> ToValue for Array<T> {
+    fn to_value(&self) -> Result<Value> {
+        let elements = self
+            .0
+            .iter()
+            .map(ToValue::to_value)
+            .collect::<Result<_>>()?;
+        Ok(Value::Array(crate::value::ArrayVal::one_dim(elements)))
+    }
+}
+
 // ───────────────────────────── Params (a set of binds) ─────────────────────────────
 
 /// A set of bind parameters (rusqlite's `Params`). Implemented for `()` (no parameters), tuples up

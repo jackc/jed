@@ -19,7 +19,16 @@ import { loadedCollation, loadUnicodeData } from "../collation.ts";
 import { Decimal } from "../decimal.ts";
 import { DEFAULT_WORK_MEM } from "../spill.ts";
 import { loadTimeZoneData, resolveZone } from "../timezone.ts";
-import { boolValue, decimalValue, intValue, nullValue, textValue, type Value } from "../value.ts";
+import {
+  arrayValue,
+  boolValue,
+  compositeValue,
+  decimalValue,
+  intValue,
+  nullValue,
+  textValue,
+  type Value,
+} from "../value.ts";
 import {
   advancingClock,
   attachMemory,
@@ -622,8 +631,30 @@ function parseParamsDirective(line: string): Value[] | null {
 }
 
 // takeParamValue reads one `# params:` value from the front of s: a single-quoted text (a doubled ''
-// is one quote), NULL, true/false, an integer, or a decimal with its written scale.
+// is one quote), NULL, true/false, an integer, a decimal with its written scale, or an ARRAY[…] /
+// ROW(…) of values.
 function takeParamValue(s: string): [Value, string] {
+  const list = s.match(/^(ARRAY\s*\[|ROW\s*\()/);
+  if (list !== null) {
+    const isArray = list[0].startsWith("ARRAY");
+    const close = isArray ? "]" : ")";
+    let rest = s.slice(list[0].length).trim();
+    const items: Value[] = [];
+    while (!rest.startsWith(close)) {
+      if (rest === "") throw new Error(`# params: unterminated list value ${JSON.stringify(s)}`);
+      const [item, after] = takeParamValue(rest);
+      items.push(item);
+      rest = after.trim();
+      if (rest.startsWith(close)) break;
+      if (!rest.startsWith(",")) {
+        throw new Error(`# params: expected \`,\` or \`${close}\` before ${JSON.stringify(rest)}`);
+      }
+      rest = rest.slice(1).trim();
+    }
+    if (isArray) return [arrayValue(items), rest.slice(1)];
+    if (items.length === 0) throw new Error("# params: ROW() needs at least one field");
+    return [compositeValue(items), rest.slice(1)];
+  }
   if (s.startsWith("'")) {
     let text = "";
     for (let i = 1; i < s.length; i++) {
@@ -640,9 +671,10 @@ function takeParamValue(s: string): [Value, string] {
     }
     throw new Error(`# params: unterminated text value ${JSON.stringify(s)}`);
   }
-  const comma = s.indexOf(",");
-  const token = (comma < 0 ? s : s.slice(0, comma)).trim();
-  const rest = comma < 0 ? "" : s.slice(comma);
+  // A scalar token runs to the next separator or the close of an enclosing ARRAY[…] / ROW(…).
+  const end = s.search(/[,\])]/);
+  const token = (end < 0 ? s : s.slice(0, end)).trim();
+  const rest = end < 0 ? "" : s.slice(end);
   if (token === "NULL") return [nullValue(), rest];
   if (token === "true" || token === "false") return [boolValue(token === "true"), rest];
   if (/^-?[0-9]+$/.test(token)) {

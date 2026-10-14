@@ -1491,19 +1491,10 @@ pub(crate) fn resolve_container_assign(
     if let Expr::Literal(Literal::Null, _) = e {
         return Ok(RExpr::ConstNull);
     }
-    if let Expr::Param(_) = e {
-        let kind = match &col.ty {
-            Type::Array(_) => "array",
-            Type::Range(_) => "range",
-            _ => "composite",
-        };
-        return Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            format!(
-                "updating {kind} column {} from a parameter is not supported yet",
-                col.name
-            ),
-        ));
+    // A bind parameter assigned to a container column takes the column's type (api.md §5).
+    if let Expr::Param(n1) = e {
+        let ct = resolve_col_type(&col.ty, &scope.catalog.read_snap().types);
+        return Ok(resolve_param_node(scope, *n1, Some(ct), col_rt, params)?.0);
     }
     // For an array column over a SCALAR element, pass the element type as the hint so a bare
     // `ARRAY[1,2]` constructor adapts its literal elements to the column's element type (the same

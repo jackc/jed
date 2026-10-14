@@ -157,7 +157,7 @@ pub(crate) struct CachedPlan {
     pub(crate) core: std::sync::Weak<crate::shared::Shared>,
     pub(crate) inputs: Vec<EstimatorInputSignature>,
     pub(crate) plan: std::rc::Rc<SelectPlan>,
-    pub(crate) param_types: Vec<ScalarType>,
+    pub(crate) param_types: Vec<ColType>,
     pub(crate) param_labels: Vec<String>,
     pub(crate) metadata: ResultMetadata,
     /// The probe plan read a parameter's value (estimator.md §6.1): `plan` is then not reused —

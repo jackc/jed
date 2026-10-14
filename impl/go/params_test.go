@@ -3,9 +3,13 @@ package jed
 // Bound parameters ($N) — spec/design/api.md §5. Typing, binding, and the errors they raise are pinned
 // once for every core by the shared corpus (suites/params, the `# params:` directive —
 // conformance.md §1.2). What stays here binds host value kinds the directive does not spell (a binary
-// float, raw bytes); the helpers are shared by other tests in the package.
+// float, raw bytes, a range value) and the Go-native slice mapping; the helpers are shared by other
+// tests in the package.
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // queryRows runs a parameterized query and returns its rows; t.Fatal on error.
 func queryRows(t *testing.T, db dbHandle, sql string, params ...Value) [][]Value {
@@ -71,5 +75,53 @@ func TestByteaHostValueBindsToAdoptedSlot(t *testing.T) {
 	}
 	if code := paramErrCode(t, db, "SELECT length($1)", ByteaValue([]byte{1, 2})); code != "42804" {
 		t.Fatalf("length(bytea value): code %s, want 42804", code)
+	}
+}
+
+// A range host value binds canonicalized, as a range constructor's result is (api.md §5): an
+// inclusive discrete upper bound moves to the canonical `[)` form, and crossed bounds are 22000.
+func TestRangeHostValueBindsCanonicalized(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t)
+	three, one := IntValue(3), IntValue(1)
+	inclusive := RangeValue(&RangeVal{Lower: &one, Upper: &three, LowerInc: true, UpperInc: true})
+	rows := queryRows(t, db, "SELECT $1::i32range", inclusive)
+	if got := rows[0][0].Render(); got != "[1,4)" {
+		t.Fatalf("got %s want [1,4)", got)
+	}
+	crossed := RangeValue(&RangeVal{Lower: &three, Upper: &one, LowerInc: true})
+	if code := paramErrCode(t, db, "SELECT $1::i32range", crossed); code != "22000" {
+		t.Fatalf("crossed bounds: code %s, want 22000", code)
+	}
+}
+
+// A Go slice binds as an array parameter, and a nil slice as NULL (api.md §11.2).
+func TestSliceArgBindsAsArray(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, tags text[])")
+	mustExec(t, s, "INSERT INTO t VALUES (1, '{a}'), (2, '{b}'), (3, '{a,b}')")
+	rows, err := s.Query(context.Background(), "SELECT id FROM t WHERE id = ANY($1) ORDER BY id", []int64{1, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil || !eqInts(ids, 1, 3) {
+		t.Fatalf("ids %v err %v, want [1 3]", ids, err)
+	}
+	var n int64
+	if err := s.QueryRow(context.Background(), "SELECT count(*) FROM t WHERE tags @> $1", []string{"a"}).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("tags @> [a]: %d %v, want 2", n, err)
+	}
+	var none []int64
+	if err := s.QueryRow(context.Background(), "SELECT count(*) FROM t WHERE id = ANY($1)", none).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("nil slice: %d %v, want 0", n, err)
 	}
 }

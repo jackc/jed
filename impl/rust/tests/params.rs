@@ -1,10 +1,10 @@
 //! Bound parameters (`$N`) — spec/design/api.md §5. Typing, binding, and the errors they raise are
 //! pinned once for every core by the shared corpus (suites/params, the `# params:` directive —
 //! conformance.md §1.2). What stays here binds host value kinds the directive does not spell (a
-//! binary float, raw bytes).
+//! binary float, raw bytes, a range value) and the ergonomic `Array` mapping.
 
-use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::value::{RangeVal, Value};
+use jed::{Array, CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
     let mut db = Database::create(CreateOptions::default())
@@ -65,4 +65,51 @@ fn bytea_host_value_binds_to_adopted_slot() {
         err_code(&mut db, "SELECT length($1)", &[Value::Bytea(vec![1, 2])]),
         "42804"
     );
+}
+
+/// A range host value binds canonicalized, as a range constructor's result is (api.md §5): an
+/// inclusive discrete upper bound moves to the canonical `[)` form, and crossed bounds are 22000.
+#[test]
+fn range_host_value_binds_canonicalized() {
+    let mut db = db_with(&[]);
+    let range = |lower: i64, upper: i64, upper_inc: bool| {
+        Value::Range(RangeVal {
+            empty: false,
+            lower: Some(Box::new(Value::Int(lower))),
+            upper: Some(Box::new(Value::Int(upper))),
+            lower_inc: true,
+            upper_inc,
+        })
+    };
+    let got = rows(&mut db, "SELECT $1::i32range", &[range(1, 3, true)]);
+    assert_eq!(got[0][0].render(), "[1,4)");
+    assert_eq!(
+        err_code(&mut db, "SELECT $1::i32range", &[range(3, 1, false)]),
+        "22000"
+    );
+}
+
+/// `Array(vec![…])` binds a list as one array parameter (api.md §11).
+#[test]
+fn array_newtype_binds_as_array() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (id i32 PRIMARY KEY, tags text[])",
+        "INSERT INTO t VALUES (1, '{a}'), (2, '{b}'), (3, '{a,b}')",
+    ]);
+    let ids: Vec<i64> = db
+        .query_map(
+            "SELECT id FROM t WHERE id = ANY($1) ORDER BY id",
+            (Array(vec![1i64, 3]),),
+            |row| row.get::<i64>(0),
+        )
+        .unwrap();
+    assert_eq!(ids, vec![1, 3]);
+    let n: Option<i64> = db
+        .query_row(
+            "SELECT count(*) FROM t WHERE tags @> $1",
+            (Array(vec!["a"]),),
+            |row| row.get::<i64>(0),
+        )
+        .unwrap();
+    assert_eq!(n, Some(2));
 }

@@ -10407,8 +10407,10 @@ export class Engine {
         const p = provided[i]!;
         if (p >= 0 && p < values.length) {
           const iv = values[p]!;
-          const ct = table.columns[i]!.type;
-          if (iv.kind === "param" && ct.kind === "scalar") ptypes.note(iv.index - 1, ct.scalar);
+          // A top-level $N takes its column's type, a scalar or a container (api.md §5).
+          if (iv.kind === "param") {
+            ptypes.noteCol(iv.index - 1, this.colTypeOf(table.columns[i]!.type));
+          }
         }
       }
       valueExprs.push(
@@ -10802,11 +10804,9 @@ export class Engine {
         const p = provided[i]!;
         if (p >= 0 && p < values.length) {
           const iv = values[p]!;
-          // A top-level $N slot takes its target column's scalar type; a composite-column param
-          // stays untyped (42P18 at finalize this slice — materializeInsertValue handles ROW(…)).
-          const ct = table.columns[i]!.type;
-          if (iv.kind === "param" && ct.kind === "scalar") {
-            ptypes.note(iv.index - 1, ct.scalar);
+          // A top-level $N takes its column's type, a scalar or a container (api.md §5).
+          if (iv.kind === "param") {
+            ptypes.noteCol(iv.index - 1, this.colTypeOf(table.columns[i]!.type));
           }
         }
       }
@@ -18214,7 +18214,7 @@ export class Engine {
     let probe: SelectPlan;
     let sp: SelectPlan;
     let ptypes: ParamTypes;
-    let ptys: ScalarType[];
+    let ptys: ColType[];
     let plabels: string[];
     let bound: Value[];
     let facts: { sensitive: boolean; nullRead: boolean };
@@ -31123,7 +31123,7 @@ export type ScanCache = {
   core: AttachmentCore | Engine;
   inputs: EstimatorInputSignature[];
   sp: SelectPlan;
-  ptys: ScalarType[];
+  ptys: ColType[];
   plabels: string[];
   resultTypes: string[];
   // sensitive: the probe plan read a parameter's value (estimator.md §6.1), so sp is not reused —
@@ -31171,7 +31171,7 @@ export type InsertValuesPlan = {
   // [row][value position]. A row with no expression slot holds an empty array.
   valueExprs: (RExpr | null)[][];
   returning: { nodes: RExpr[]; names: string[]; types: string[] } | null;
-  ptys: ScalarType[];
+  ptys: ColType[];
   cacheable: boolean;
 };
 export type InsertCache = {

@@ -97,25 +97,15 @@ test("range narrowings are 0A000", () => {
 
 // Updating a range or composite COLUMN works — standalone UPDATE and the ON CONFLICT DO UPDATE
 // conflict-action path (ranges.md §4 / composite.md §12, oracle-clean in types/range.test and
-// dml/composite_assign.test) — but two sub-cases stay 0A000. PG supports them, so they are
-// jed-stricter and cannot live in the oracle corpus: a $N parameter into a container column, and an
-// anonymous ROW(…) expression assigned to a composite column (the anonymous-record → named-composite
-// coercion, composite.md §12).
+// dml/composite_assign.test) — but an anonymous ROW(…) expression assigned to a composite column
+// stays 0A000 (the anonymous-record → named-composite coercion, composite.md §12). PG supports it, so
+// it is jed-stricter and cannot live in the oracle corpus. (A $N parameter into a container column
+// now binds — params/containers.test.)
 test("container update deferrals are 0A000", () => {
   const db = dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)",
     "INSERT INTO t VALUES (1, '[1,5)')",
   ]);
-  assert.equal(
-    errCode(() => db.execute("UPDATE t SET r = $1 WHERE id = 1")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() =>
-      db.execute("INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = $1"),
-    ),
-    "0A000",
-  );
   db.execute("CREATE TYPE addr AS (street text, zip i32)");
   db.execute("CREATE TABLE p (id i32 PRIMARY KEY, a addr)");
   db.execute("INSERT INTO p VALUES (1, ROW('x', 5))");
@@ -127,10 +117,6 @@ test("container update deferrals are 0A000", () => {
     errCode(() =>
       db.execute("INSERT INTO p VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET a = ROW('y', 9)"),
     ),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("UPDATE p SET a = $1 WHERE id = 1")),
     "0A000",
   );
 });

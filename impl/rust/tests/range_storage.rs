@@ -135,10 +135,10 @@ fn range_narrowings_are_0a000() {
 
 /// Updating a range or composite COLUMN works — standalone UPDATE and the ON CONFLICT DO UPDATE
 /// conflict-action path (ranges.md §4 / composite.md §12, oracle-clean in types/range.test and
-/// dml/composite_assign.test) — but two sub-cases stay `0A000`. PG supports them, so they are
-/// jed-stricter and cannot live in the oracle corpus: a `$N` parameter into a container column, and
-/// an anonymous `ROW(…)` expression assigned to a composite column (the anonymous-record →
-/// named-composite coercion, composite.md §12).
+/// dml/composite_assign.test) — but an anonymous `ROW(…)` expression assigned to a composite column
+/// stays `0A000` (the anonymous-record → named-composite coercion, composite.md §12). PG supports it,
+/// so it is jed-stricter and cannot live in the oracle corpus. (A `$N` parameter into a container
+/// column now binds — params/containers.test.)
 #[test]
 fn container_update_deferrals_are_0a000() {
     let mut db = Database::create(CreateOptions::default())
@@ -146,14 +146,6 @@ fn container_update_deferrals_are_0a000() {
         .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
     run(&mut db, "INSERT INTO t VALUES (1, '[1,5)')");
-    assert_eq!(err(&mut db, "UPDATE t SET r = $1 WHERE id = 1"), "0A000");
-    assert_eq!(
-        err(
-            &mut db,
-            "INSERT INTO t VALUES (1, '[2,6)') ON CONFLICT (id) DO UPDATE SET r = $1",
-        ),
-        "0A000",
-    );
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY, a addr)");
     run(&mut db, "INSERT INTO p VALUES (1, ROW('x', 5))");
@@ -168,7 +160,6 @@ fn container_update_deferrals_are_0a000() {
         ),
         "0A000"
     );
-    assert_eq!(err(&mut db, "UPDATE p SET a = $1 WHERE id = 1"), "0A000");
 }
 
 /// Range comparison (R3) is restricted to the SAME element type (spec/design/ranges.md §6): a range

@@ -193,10 +193,9 @@ mismatched element subtype, or a scalar RHS, is `42804` — the §6 same-element
 assignment). When the range column is (part of) the `PRIMARY KEY` the assignment **re-keys** the row
 via the §-above `range-bounds` key (an end-state collision is `23505`, like any re-key); when it is
 indexed by GiST (an `EXCLUDE` backing index, [gist.md §7](gist.md)) the constraint is re-checked over
-the statement's end state (a real conflict is `23P01`). Two sub-cases stay `0A000` (PG supports them —
-per-core divergence tests): a top-level `$N` parameter into a range column (INSERT's
-param-to-container handling is special and not generalized to the assignment RHS), and the
-`ON CONFLICT DO UPDATE` conflict-action path (the upsert follow-on, [upsert.md §9](upsert.md)).
+the statement's end state (a real conflict is `23P01`). The `ON CONFLICT DO UPDATE` conflict-action
+path assigns the same way, and a `$N` parameter takes the column's type and binds a range value
+([api.md](api.md) §5, `suites/params/containers.test`).
 
 **`INSERT … SELECT` into a range column** follows the same same-type rule: a projection of exactly the
 column's range type, or an untyped `NULL`, is stored through `store_range`; a different range type is

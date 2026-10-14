@@ -96,7 +96,7 @@ pub use decimal::Decimal;
 // The rusqlite-style ergonomic layer (spec/design/api.md §11): native-typed params + typed row
 // scanning over the raw `Database`/`Session`/`Transaction` handles. Additive — the raw `&[Value]`
 // path is unchanged.
-pub use ergonomic::{FromValue, Params, Row, ToValue};
+pub use ergonomic::{Array, FromValue, Params, Row, ToValue};
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_MAX_TEMP_STORAGE_BYTES, DEFAULT_PAGE_SIZE,
@@ -124,7 +124,8 @@ pub use shared::{AttachSource, Database, Session};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
 pub use timezone::{load_time_zone_data, resolve_zone};
-pub use value::Value;
+// The container value types a host builds to bind an array or range parameter (spec/design/api.md §5).
+pub use value::{ArrayVal, RangeVal, Value};
 
 /// Internal building blocks for the in-repo tools (the `src/bin/{build,gen}_*` codegen/bundle binaries
 /// and the `cli/` REPL). NOT part of the stable embedding API — `#[doc(hidden)]`, and only those

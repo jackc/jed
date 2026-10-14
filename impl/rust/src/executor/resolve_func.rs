@@ -1486,7 +1486,9 @@ pub(crate) fn resolve_boolean_filter(
 /// statement (so a `$1` used in both WHERE and the select list unifies), then `finalize`d.
 #[derive(Default)]
 pub(crate) struct ParamTypes {
-    pub(crate) types: Vec<Option<ScalarType>>,
+    /// Each parameter's inferred type: a scalar, or a container — an array, range, or named
+    /// composite (spec/design/api.md §5) — as the resolved column type the binder coerces into.
+    pub(crate) types: Vec<Option<ColType>>,
     /// Set during resolution when a node is created that makes the resolved plan un-reusable across
     /// executions: an `RExpr::Subquery` (the uncorrelated-subquery fold rewrites it to a constant
     /// baking in THIS execution's bound params) or a precompiled-regex node (whose one-shot
@@ -1550,12 +1552,18 @@ impl ParamTypes {
     /// Unifies with any prior inference for the same index: equal types agree, two integer
     /// widths widen to the wider, an incompatible concrete pair is 42804.
     pub(crate) fn note(&mut self, idx0: usize, ty: Option<ScalarType>) -> Result<()> {
+        self.note_col(idx0, ty.map(ColType::Scalar))
+    }
+
+    /// Record that `$(idx0+1)` appears with context type `ty`, a scalar or a container (`None` = no
+    /// context here). It unifies with any prior inference (`unify_param_type`).
+    pub(crate) fn note_col(&mut self, idx0: usize, ty: Option<ColType>) -> Result<()> {
         if idx0 >= self.types.len() {
             self.types.resize(idx0 + 1, None);
         }
-        plan_params::note_type(idx0, ty);
+        plan_params::note_type(idx0, ty.clone());
         if let Some(new) = ty {
-            self.types[idx0] = Some(match self.types[idx0] {
+            self.types[idx0] = Some(match self.types[idx0].take() {
                 None => new,
                 Some(old) => unify_param_type(old, new, idx0)?,
             });
@@ -1565,7 +1573,7 @@ impl ParamTypes {
 
     /// Finalize to the ordered parameter types. A slot referenced but never typed — including a
     /// gap in `$1..$N` — is 42P18 indeterminate_datatype.
-    pub(crate) fn finalize(self) -> Result<Vec<ScalarType>> {
+    pub(crate) fn finalize(self) -> Result<Vec<ColType>> {
         let mut out = Vec::with_capacity(self.types.len());
         for (i, t) in self.types.into_iter().enumerate() {
             match t {
@@ -1582,15 +1590,89 @@ impl ParamTypes {
     }
 }
 
+/// Resolve bind parameter `$n1` as type `ct` (`None` = no context here), whose resolved form is
+/// `rty`, recording the inference.
+pub(crate) fn resolve_param_node(
+    scope: &Scope,
+    n1: u32,
+    ct: Option<ColType>,
+    rty: ResolvedType,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    // A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets it, so
+    // earlier resolution errors keep PostgreSQL's order.
+    if scope.catalog.view_tracing() {
+        return Err(EngineError::new(
+            SqlState::UndefinedParameter,
+            format!("there is no parameter ${n1}"),
+        ));
+    }
+    let idx0 = (n1 as usize) - 1;
+    params.note_col(idx0, ct)?;
+    Ok((RExpr::Param(idx0), rty))
+}
+
+/// Type `e`, when it is a bare parameter, as the container type `other` — an array, range, or named
+/// composite (spec/design/api.md §5, container-typed parameters). `None` when `e` is not a
+/// parameter or `other` is not such a container.
+pub(crate) fn adopt_container_param(
+    scope: &Scope,
+    e: &Expr,
+    other: &ResolvedType,
+    params: &mut ParamTypes,
+) -> Result<Option<(RExpr, ResolvedType)>> {
+    let Expr::Param(n1) = e else {
+        return Ok(None);
+    };
+    let Some(ct) = container_param_type(scope, other) else {
+        return Ok(None);
+    };
+    resolve_param_node(scope, *n1, Some(ct), other.clone(), params).map(Some)
+}
+
+/// The parameter type of a container-typed context: an array whose element is a scalar or a named
+/// composite, a range, or a named composite. `None` for anything else (a scalar, an anonymous
+/// record, an untyped NULL).
+pub(crate) fn container_param_type(scope: &Scope, rt: &ResolvedType) -> Option<ColType> {
+    match rt {
+        ResolvedType::Array(elem) => Some(ColType::Array(Box::new(array_param_elem(scope, elem)?))),
+        ResolvedType::Range(elem) => Some(ColType::Range(Box::new(ColType::Scalar(
+            resolved_range_element_scalar(elem)?,
+        )))),
+        ResolvedType::Composite(c) => {
+            let name = c.name.clone()?;
+            Some(resolve_col_type(
+                &Type::Composite(crate::types::CompositeRef { name }),
+                &scope.catalog.read_snap().types,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The element type an array parameter takes beside an operand of type `t`: `t` itself when it is a
+/// scalar or a named composite (an array of arrays or ranges is not a jed type).
+pub(crate) fn array_param_elem(scope: &Scope, t: &ResolvedType) -> Option<ColType> {
+    if let Some(s) = ctx_of(t) {
+        return Some(ColType::Scalar(s));
+    }
+    match t {
+        ResolvedType::Composite(_) => container_param_type(scope, t),
+        _ => None,
+    }
+}
+
 /// Unify two inferred types for the same bind parameter: equal agrees; two integer widths
 /// widen to the wider (so `$1` works against both an i16 and an i32 column); any other
 /// mismatch is 42804 (spec/design/api.md §5).
-pub(crate) fn unify_param_type(a: ScalarType, b: ScalarType, idx0: usize) -> Result<ScalarType> {
+pub(crate) fn unify_param_type(a: ColType, b: ColType, idx0: usize) -> Result<ColType> {
     if a == b {
         return Ok(a);
     }
-    if a.is_integer() && b.is_integer() {
-        return Ok(if a.rank() >= b.rank() { a } else { b });
+    if let (ColType::Scalar(x), ColType::Scalar(y)) = (&a, &b) {
+        if x.is_integer() && y.is_integer() {
+            return Ok(if x.rank() >= y.rank() { a } else { b });
+        }
     }
     Err(EngineError::new(
         SqlState::DatatypeMismatch,
@@ -1603,7 +1685,7 @@ pub(crate) fn unify_param_type(a: ScalarType, b: ScalarType, idx0: usize) -> Res
 /// up front (22003/42804/22P02/23502 via `store_value`) before any row is touched.
 pub(crate) fn bind_params(
     supplied: &[Value],
-    types: &[ScalarType],
+    types: &[ColType],
     iz: &InputZone,
 ) -> Result<Vec<Value>> {
     let labels = param_labels(types.len());
@@ -1616,7 +1698,7 @@ pub(crate) fn param_labels(len: usize) -> Vec<String> {
 
 pub(crate) fn bind_params_with_labels(
     supplied: &[Value],
-    types: &[ScalarType],
+    types: &[ColType],
     labels: &[String],
     iz: &InputZone,
 ) -> Result<Vec<Value>> {
@@ -1637,17 +1719,57 @@ pub(crate) fn bind_params_with_labels(
         // not_null is false (NULL is a legal bound value; a NOT NULL target re-checks at store).
         // A text value bound to a timestamptz parameter reads an offset-less string in the session
         // zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
-        bound.push(store_value(
-            v.clone(),
-            *ty,
-            None,
-            None,
-            false,
-            &labels[i],
-            iz,
-        )?);
+        bound.push(match ty {
+            ColType::Scalar(s) => store_value(v.clone(), *s, None, None, false, &labels[i], iz)?,
+            _ => bind_container_param(v.clone(), ty, &labels[i], iz)?,
+        });
     }
     Ok(bound)
+}
+
+/// Coerce a host value to an array, range, or composite parameter type (spec/design/api.md §5). A
+/// text value is read by the type's input function, as a string literal assigned to the type is; a
+/// range value is canonicalized as a range constructor's result is; every other value takes the
+/// storage coercion of a column of the type.
+fn bind_container_param(v: Value, ty: &ColType, label: &str, iz: &InputZone) -> Result<Value> {
+    match (v, ty) {
+        (Value::Text(s), ColType::Array(elem)) => coerce_string_to_array(&s, elem, iz),
+        (Value::Text(s), ColType::Range(elem)) => {
+            let desc = range_for_col_elem(elem);
+            Ok(Value::Range(coerce_string_to_range(&s, desc, iz)?))
+        }
+        (Value::Text(s), ColType::Composite { name, fields }) => {
+            coerce_record_text(&s, name, fields, iz)
+        }
+        (Value::Range(rv), ColType::Range(elem)) if !rv.empty => {
+            let ColType::Scalar(es) = elem.as_ref() else {
+                unreachable!("a range element is a scalar")
+            };
+            let bound = |b: Option<Box<Value>>| -> Result<Option<Value>> {
+                b.map(|b| store_value(*b, *es, None, None, false, label, iz))
+                    .transpose()
+            };
+            let lower = bound(rv.lower)?;
+            let upper = bound(rv.upper)?;
+            let desc = range_for_col_elem(elem);
+            Ok(Value::Range(crate::range::finalize(
+                desc,
+                lower,
+                upper,
+                rv.lower_inc,
+                rv.upper_inc,
+            )?))
+        }
+        (v, _) => coerce_for_store(v, ty, None, None, false, label, iz),
+    }
+}
+
+/// The range descriptor of a range parameter's element type.
+fn range_for_col_elem(elem: &ColType) -> &'static crate::ranges_gen::RangeDesc {
+    let ColType::Scalar(es) = elem else {
+        unreachable!("a range element is a scalar")
+    };
+    crate::range::range_for_element(*es).expect("a range parameter's element has a range type")
 }
 
 /// A DDL statement (CREATE/DROP TABLE) has no expressions and so takes no bind parameters;
@@ -4055,25 +4177,15 @@ fn resolve_node(
             "t.* is only allowed in a select list",
         )),
         Expr::Param(n1) => {
-            // A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets
-            // it, so earlier resolution errors keep PostgreSQL's order.
-            if scope.catalog.view_tracing() {
-                return Err(EngineError::new(
-                    SqlState::UndefinedParameter,
-                    format!("there is no parameter ${n1}"),
-                ));
-            }
             // A bind parameter is an adaptable operand (like an integer/string literal): it
             // takes its type from `ctx` — the sibling operand, target column, or CAST target.
             // Record the inferred type (None = no context here; `finalize` 42P18s a parameter
             // that never gets one). spec/design/api.md §5.
-            let idx0 = (*n1 as usize) - 1;
-            params.note(idx0, ctx)?;
             let rty = match ctx {
                 Some(t) => resolved_type_of(t),
                 None => ResolvedType::Null,
             };
-            Ok((RExpr::Param(idx0), rty))
+            resolve_param_node(scope, *n1, ctx.map(ColType::Scalar), rty, params)
         }
         Expr::FuncCall {
             name,
@@ -4540,13 +4652,15 @@ fn resolve_node(
                 if let Expr::Literal(Literal::Null, _) = inner.as_ref() {
                     return Ok((RExpr::ConstNull, ResolvedType::Array(Box::new(elem_rt))));
                 }
-                // A bind parameter into an array stays the documented container-param narrowing
-                // (0A000), like INSERT's `$N`-into-a-container handling (spec/design/array.md §4).
-                if matches!(inner.as_ref(), Expr::Param(_)) {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "casting a parameter to an array type is not supported yet".to_string(),
-                    ));
+                // A bind parameter cast to an array type takes that type (api.md §5).
+                if let Expr::Param(n1) = inner.as_ref() {
+                    return resolve_param_node(
+                        scope,
+                        *n1,
+                        Some(ColType::Array(Box::new(elem_col))),
+                        ResolvedType::Array(Box::new(elem_rt)),
+                        params,
+                    );
                 }
                 // A runtime (non-literal) operand: the two follow-on array-producing casts
                 // (spec/design/array.md §7). A `text` expression coerces per row via `array_in`
@@ -4624,6 +4738,17 @@ fn resolve_node(
                 if let Expr::Literal(Literal::Null, _) = inner.as_ref() {
                     return Ok((RExpr::ConstNull, ResolvedType::Range(Box::new(elem_rt))));
                 }
+                // A bind parameter cast to a range type takes that type (api.md §5).
+                if let Expr::Param(n1) = inner.as_ref() {
+                    let elem = ColType::Scalar(crate::range::element_scalar(desc));
+                    return resolve_param_node(
+                        scope,
+                        *n1,
+                        Some(ColType::Range(Box::new(elem))),
+                        ResolvedType::Range(Box::new(elem_rt)),
+                        params,
+                    );
+                }
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "casting to a range type is only supported from a string literal this slice"
@@ -4650,6 +4775,13 @@ fn resolve_node(
                     .map_err(|e| e.with_position(pos.0));
                 }
                 let ct_name = ct.name.clone();
+                // A bind parameter cast to a composite type takes that type (api.md §5).
+                if let Expr::Param(n1) = inner.as_ref() {
+                    let cty = Type::Composite(crate::types::CompositeRef { name: ct_name });
+                    let col = resolve_col_type(&cty, &scope.catalog.read_snap().types);
+                    let rt = resolved_type_of_col(&cty, scope.catalog);
+                    return resolve_param_node(scope, *n1, Some(col), rt, params);
+                }
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
                 return match &ity {
                     ResolvedType::Null => Ok((

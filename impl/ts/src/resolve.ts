@@ -105,7 +105,10 @@ import {
   requireBool,
   requireNumericOperand,
   requireTextOrNull,
+  adoptContainerParam,
+  arrayParamElem,
   resolveOperandPair,
+  resolveParamNode,
   resolveTextOperandPair,
   temporalArithResult,
   unifyArrayElementTypes,
@@ -834,18 +837,17 @@ function resolveNode(
       };
     }
     case "param": {
-      // A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets it, so
-      // earlier resolution errors keep PostgreSQL's order.
-      if (scope.catalog.viewTrace !== null) {
-        throw engineError("undefined_parameter", `there is no parameter $${e.index}`);
-      }
       // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
       // type from ctx — the sibling operand, target column, or CAST target. Record the inferred
       // type (null = no context here; finalize 42P18s a parameter that never gets one).
-      const idx0 = e.index - 1;
-      params.note(idx0, ctx);
       const type: ResolvedType = ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
-      return { node: { kind: "param", index: idx0 }, type };
+      return resolveParamNode(
+        scope,
+        e,
+        ctx === null ? null : { kind: "scalar", scalar: ctx },
+        type,
+        params,
+      );
     }
     case "funcCall": {
       // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19) is
@@ -1299,12 +1301,14 @@ function resolveNode(
             type: { kind: "array", elem: elemRt },
           };
         }
-        // A bind parameter into an array stays the container-param narrowing (0A000), like INSERT's
-        // $N-into-a-container handling (spec/design/array.md §4).
+        // A bind parameter cast to an array type takes that type (api.md §5).
         if (e.inner.kind === "param") {
-          throw engineError(
-            "feature_not_supported",
-            "casting a parameter to an array type is not supported yet",
+          return resolveParamNode(
+            scope,
+            e.inner,
+            { kind: "array", elem: elemCol },
+            { kind: "array", elem: elemRt },
+            params,
           );
         }
         // A runtime (non-literal) operand: the two follow-on array-producing casts (array.md §7).
@@ -1384,6 +1388,16 @@ function resolveNode(
               type: { kind: "range", elem: elemRt },
             };
           }
+          // A bind parameter cast to a range type takes that type (api.md §5).
+          if (e.inner.kind === "param") {
+            return resolveParamNode(
+              scope,
+              e.inner,
+              { kind: "range", elem: { kind: "scalar", scalar: elementScalar(rdesc) } },
+              { kind: "range", elem: elemRt },
+              params,
+            );
+          }
           throw engineError(
             "feature_not_supported",
             "casting to a range type is only supported from a string literal this slice",
@@ -1410,6 +1424,17 @@ function resolveNode(
             foldInSessionZone(scope, params, (iz) =>
               coerceStringToComposite(text, ct, scope.catalog, iz),
             ),
+          );
+        }
+        // A bind parameter cast to a composite type takes that type (api.md §5).
+        if (e.inner.kind === "param") {
+          const cty: Type = { kind: "composite", name: ct.name };
+          return resolveParamNode(
+            scope,
+            e.inner,
+            scope.catalog.colTypeOf(cty),
+            resolvedTypeOfCol(cty, scope.catalog),
+            params,
           );
         }
         const inner = resolve(scope, e.inner, null, ag, params);
@@ -2913,6 +2938,17 @@ export function resolveConcat(
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
   let rr = resolve(scope, rhs, null, ag, params);
+  // A bare parameter beside an array takes the array's type (array || array, api.md §5); an element
+  // needs a cast, as in PostgreSQL.
+  let adoptedL = false;
+  let adoptedR = false;
+  if (rl.type.kind === "array") {
+    const adopted = adoptContainerParam(scope, rhs, rl.type, params);
+    if (adopted !== null) [rr, adoptedR] = [adopted, true];
+  } else if (rr.type.kind === "array") {
+    const adopted = adoptContainerParam(scope, lhs, rr.type, params);
+    if (adopted !== null) [rl, adoptedL] = [adopted, true];
+  }
   // A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
   // takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
   // `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
@@ -2946,8 +2982,8 @@ export function resolveConcat(
   // ARRAY[…] adapts. A bare NULL (pass-1 kind "null") is skipped — it must stay untyped so the
   // cat-first overload order matches PG (see the doc comment).
   if (hint !== null) {
-    if (rl.type.kind !== "null") rl = resolve(scope, lhs, hint, ag, params);
-    if (rr.type.kind !== "null") rr = resolve(scope, rhs, hint, ag, params);
+    if (rl.type.kind !== "null" && !adoptedL) rl = resolve(scope, lhs, hint, ag, params);
+    if (rr.type.kind !== "null" && !adoptedR) rr = resolve(scope, rhs, hint, ag, params);
   }
   // Try the three concat overloads in catalog order; the first whose slots unify wins.
   const tys: ResolvedType[] = [rl.type, rr.type];
@@ -3009,6 +3045,19 @@ export function resolveSetOp(
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
   let rr = resolve(scope, rhs, null, ag, params);
+  // A bare parameter facing an array or range takes its type (api.md §5): `tags @> $1` binds an
+  // array, `during && $1` a range. A range's element needs a cast (`during @> $1::i32`).
+  const arrayOrRange = (t: ResolvedType) => t.kind === "array" || t.kind === "range";
+  let adoptedL = false;
+  let adoptedR = false;
+  if (arrayOrRange(rl.type)) {
+    const adopted = adoptContainerParam(scope, rhs, rl.type, params);
+    if (adopted !== null) [rr, adoptedR] = [adopted, true];
+  }
+  if (!adoptedR && arrayOrRange(rr.type)) {
+    const adopted = adoptContainerParam(scope, lhs, rr.type, params);
+    if (adopted !== null) [rl, adoptedL] = [adopted, true];
+  }
   // RANGE axis if either operand is a range. (The five positional operators are range-only; on a
   // non-range pair they fall through to the array branch below, which rejects them as 42883.)
   if (rl.type.kind === "range" || rr.type.kind === "range") {
@@ -3040,8 +3089,8 @@ export function resolveSetOp(
   // Pass 2: re-resolve the NON-NULL operands with the hint so a bare ARRAY[…] adapts. A bare NULL
   // (pass-1 kind "null") is left untyped — it defers in the anyarray slot, result is boolean anyway.
   if (hint !== null) {
-    if (rl.type.kind !== "null") rl = resolve(scope, lhs, hint, ag, params);
-    if (rr.type.kind !== "null") rr = resolve(scope, rhs, hint, ag, params);
+    if (rl.type.kind !== "null" && !adoptedL) rl = resolve(scope, lhs, hint, ag, params);
+    if (rr.type.kind !== "null" && !adoptedR) rr = resolve(scope, rhs, hint, ag, params);
   }
   // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
   const tys: ResolvedType[] = [rl.type, rr.type];
@@ -4055,6 +4104,15 @@ export function resolveScalarArrayOperands(
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
   let ra = resolve(scope, array, null, ag, params);
+  // A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)` binds a
+  // list of ids.
+  if (array.kind === "param") {
+    const elem = arrayParamElem(scope, rl.type);
+    if (elem !== null) {
+      const arrayType: ResolvedType = { kind: "array", elem: rl.type };
+      return [rl, resolveParamNode(scope, array, { kind: "array", elem }, arrayType, params)];
+    }
+  }
   // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
   // bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
   // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a

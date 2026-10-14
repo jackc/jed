@@ -22,7 +22,7 @@ enum Frame {
         sensitive: bool,
         null_read: bool,
         /// Every type a `$N` was given during this frame (the EXPLAIN typing pass reads it).
-        types: Vec<Option<ScalarType>>,
+        types: Vec<Option<ColType>>,
     },
     Custom {
         values: std::rc::Rc<Vec<Value>>,
@@ -64,15 +64,15 @@ pub(crate) fn param_is_null(i: usize) -> bool {
 
 /// Record the type a probe frame's resolution gave `$(idx0+1)` (`ParamTypes::note`; `None` = no
 /// context here, which still makes the slot exist).
-pub(crate) fn note_type(idx0: usize, ty: Option<ScalarType>) {
+pub(crate) fn note_type(idx0: usize, ty: Option<ColType>) {
     FRAMES.with(|frames| {
         if let Some(Frame::Probe { types, .. }) = frames.borrow_mut().last_mut() {
             if idx0 >= types.len() {
                 types.resize(idx0 + 1, None);
             }
             if let Some(ty) = ty {
-                types[idx0] = Some(match types[idx0] {
-                    Some(old) => unify_param_type(old, ty, idx0).unwrap_or(ty),
+                types[idx0] = Some(match types[idx0].take() {
+                    Some(old) => unify_param_type(old, ty.clone(), idx0).unwrap_or(ty),
                     None => ty,
                 });
             }
@@ -189,7 +189,7 @@ impl Planning {
     }
 
     /// The parameter types the probe frame saw (`None` for a parameter never typed).
-    pub(crate) fn probe_types(&self) -> Vec<Option<ScalarType>> {
+    pub(crate) fn probe_types(&self) -> Vec<Option<ColType>> {
         if self.depth == 0 {
             return Vec::new();
         }

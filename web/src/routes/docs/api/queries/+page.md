@@ -50,6 +50,22 @@ An exact `decimal` binds from the engine's own `Decimal` type, which keeps its w
 `jed.ParseDecimal("12.50")` builds one from text. An integer or a `Decimal` also binds to a `f32`/`f64`
 parameter, rounded to the nearest float.
 
+### Arrays, ranges, and composite values
+
+A parameter can also be an array, a range, or a composite type. It takes the container type it is
+compared or assigned to: `tags @> $1` and `UPDATE t SET tags = $1` bind a `text[]`, `during && $1`
+binds the range, `home = $1` binds the composite, and `$1::i32[]` binds an `i32[]`. `id = ANY($1)`
+binds the array of `id`'s type, which is how you pass a list:
+
+- **Rust** — wrap the list: `session.query_map("… WHERE id = ANY($1)", (jed::Array(vec![1, 3]),), …)`.
+  A bare `Vec` is a list of separate parameters, and `Vec<u8>` binds as `bytea`.
+- **Go** — pass a slice: `session.Query(ctx, "… WHERE id = ANY($1)", []int64{1, 3})`. A nil slice
+  binds `NULL`; `[]byte` stays `bytea`.
+- **TypeScript** — pass a JS array: `db.prepare("… WHERE id = ANY($1)").all([1, 3])`.
+
+Any container also binds from its text form, read like a string literal of that type: `'{1,3}'`,
+`'[1,5)'`, or `'(1,x)'`. To bind a range or composite value directly, pass the engine `Value`.
+
 ## Reading rows
 
 How a row arrives depends on the idiom:

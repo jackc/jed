@@ -29,6 +29,7 @@ import { Decimal } from "./decimal.ts";
 import {
   type Value,
   boolValue,
+  arrayValue,
   byteaValue,
   decimalValue,
   float64Value,
@@ -48,7 +49,9 @@ export type JsParam =
   | string
   | Uint8Array
   | Decimal
-  | Value;
+  | Value
+  // A JS array binds as a one-dimensional array parameter (`id = ANY($1)` — api.md §5).
+  | readonly JsParam[];
 
 // JsValue is a native column value the ergonomic methods return. Non-"clean-scalar" engine types
 // (decimal/uuid/temporal/array/range/json/composite) arrive as their canonical text (a string).
@@ -107,6 +110,7 @@ export function toValue(arg: JsParam): Value {
     case "string":
       return textValue(arg);
     case "object":
+      if (Array.isArray(arg)) return arrayValue(arg.map(toValue));
       if (arg instanceof Uint8Array) return byteaValue(arg);
       if (arg instanceof Decimal) return decimalValue(arg);
       if ("kind" in arg) return arg as Value; // a raw engine Value passes through

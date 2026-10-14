@@ -619,6 +619,22 @@ func toValue(a any) (Value, error) {
 		// column type (timestamp / date) — the one Go↔jed temporal impedance point (api.md §11).
 		return TimestamptzValue(v.UnixMicro()), nil
 	default:
+		// Any other slice binds as a one-dimensional array of its converted elements, for an array
+		// parameter (`id = ANY($1)` — api.md §5); a nil slice is NULL.
+		if rv := reflect.ValueOf(a); rv.Kind() == reflect.Slice {
+			if rv.IsNil() {
+				return NullValue(), nil
+			}
+			elems := make([]Value, rv.Len())
+			for i := range elems {
+				ev, err := toValue(rv.Index(i).Interface())
+				if err != nil {
+					return Value{}, fmt.Errorf("element %d: %w", i, err)
+				}
+				elems[i] = ev
+			}
+			return ArrayValue(elems), nil
+		}
 		return Value{}, fmt.Errorf("cannot use %T as a parameter", a)
 	}
 }

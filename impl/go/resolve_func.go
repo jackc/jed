@@ -1413,6 +1413,31 @@ func resolveRangeCtor(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 // left un-adapted. matchPoly defers a bare NULL in an anyarray slot, so cat-first makes `arr || NULL`
 // / `NULL || arr` resolve to array_cat (the NULL array = identity), matching PostgreSQL; adapting the
 // bare NULL to a typed element would wrongly steer it into array_append.
+// adoptArrayParam types e, a bare parameter already resolved untyped as (node, ty), as the array type
+// other (api.md §5). It returns the operand unchanged, adopted false, when e is not a parameter.
+func adoptArrayParam(s *scope, e exprNode, node *rExpr, ty resolvedType, other resolvedType, params *paramTypes) (*rExpr, resolvedType, bool, error) {
+	if other.kind != rtArray {
+		return node, ty, false, nil
+	}
+	n, t, ok, err := adoptContainerParam(s, e, other, params)
+	if !ok || err != nil {
+		return node, ty, false, err
+	}
+	return n, t, true, nil
+}
+
+// adoptArrayOrRangeParam is adoptArrayParam over an array or a range context.
+func adoptArrayOrRangeParam(s *scope, e exprNode, node *rExpr, ty resolvedType, other resolvedType, params *paramTypes) (*rExpr, resolvedType, bool, error) {
+	if other.kind != rtArray && other.kind != rtRange {
+		return node, ty, false, nil
+	}
+	n, t, ok, err := adoptContainerParam(s, e, other, params)
+	if !ok || err != nil {
+		return node, ty, false, err
+	}
+	return n, t, true, nil
+}
+
 func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	noOverload := func() error {
 		return newError(UndefinedFunction,
@@ -1426,6 +1451,18 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	rr, rt, err := resolve(s, rhs, nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
+	}
+	// A bare parameter beside an array takes the array's type (array || array, api.md §5); an element
+	// needs a cast, as in PostgreSQL.
+	adoptedL, adoptedR := false, false
+	if lt.kind == rtArray {
+		if rr, rt, adoptedR, err = adoptArrayParam(s, rhs, rr, rt, lt, params); err != nil {
+			return nil, resolvedType{}, err
+		}
+	} else if rt.kind == rtArray {
+		if rl, lt, adoptedL, err = adoptArrayParam(s, lhs, rl, lt, rt, params); err != nil {
+			return nil, resolvedType{}, err
+		}
 	}
 	// A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
 	// takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
@@ -1462,12 +1499,12 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	// ARRAY[…] adapts. A bare NULL (pass-1 kind rtNull) is skipped — it must stay untyped so the
 	// cat-first overload order matches PG (see the doc comment).
 	if hint != nil {
-		if lt.kind != rtNull {
+		if lt.kind != rtNull && !adoptedL {
 			if rl, lt, err = resolve(s, lhs, hint, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}
-		if rt.kind != rtNull {
+		if rt.kind != rtNull && !adoptedR {
 			if rr, rt, err = resolve(s, rhs, hint, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1559,6 +1596,17 @@ func resolveSetOp(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
+	// A bare parameter facing an array or range takes its type (api.md §5): `tags @> $1` binds an
+	// array, `during && $1` a range. A range's element needs a cast (`during @> $1::i32`).
+	adoptedL, adoptedR := false, false
+	if rr, rt, adoptedR, err = adoptArrayOrRangeParam(s, rhs, rr, rt, lt, params); err != nil {
+		return nil, resolvedType{}, err
+	}
+	if !adoptedR {
+		if rl, lt, adoptedL, err = adoptArrayOrRangeParam(s, lhs, rl, lt, rt, params); err != nil {
+			return nil, resolvedType{}, err
+		}
+	}
 	// RANGE axis if either operand is a range. (The five positional operators are range-only; on a
 	// non-range pair they fall through to the array branch below, which rejects them as 42883.)
 	if lt.kind == rtRange || rt.kind == rtRange {
@@ -1591,12 +1639,12 @@ func resolveSetOp(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *
 	// Pass 2: re-resolve the NON-NULL operands with the hint so a bare ARRAY[…] adapts. A bare NULL
 	// (pass-1 kind rtNull) is left untyped — it defers in the anyarray slot, result is boolean anyway.
 	if hint != nil {
-		if lt.kind != rtNull {
+		if lt.kind != rtNull && !adoptedL {
 			if rl, lt, err = resolve(s, lhs, hint, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}
-		if rt.kind != rtNull {
+		if rt.kind != rtNull && !adoptedR {
 			if rr, rt, err = resolve(s, rhs, hint, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1749,6 +1797,18 @@ func resolveRangeSetOp(op binaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt re
 		resolvedType{kind: rtRange, elem: &elemRT}, nil
 }
 
+// arrayParamElem is the element type an array parameter takes beside an operand of type t: t itself
+// when it is a scalar or a named composite (an array of arrays or ranges is not a jed type).
+func arrayParamElem(s *scope, t resolvedType) (colType, bool) {
+	if h := ctxOf(t); h != nil {
+		return scalarColType(*h), true
+	}
+	if t.kind == rtComposite && t.comp.named {
+		return containerParamType(s, t)
+	}
+	return colType{}, false
+}
+
 // resolveScalarArrayOperands resolves a scalar operand `x` against an array operand with the
 // comparison operators' literal adaptation (array-functions.md §11.3) — shared by the quantified
 // comparisons and the width_bucket(operand, thresholds) array variant (§14). Both resolve with no
@@ -1763,6 +1823,18 @@ func resolveScalarArrayOperands(s *scope, lhs, array exprNode, ag *aggCtx, param
 	ra, at, err := resolve(s, array, nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	// A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)` binds
+	// a list of ids.
+	if array.Kind == exprParam {
+		if elem, ok := arrayParamElem(s, lt); ok {
+			arrRT := resolvedType{kind: rtArray, elem: &lt}
+			ct := colType{Elem: &elem}
+			if ra, at, err = resolveParamNode(s, array, &ct, arrRT, params); err != nil {
+				return nil, resolvedType{}, nil, resolvedType{}, err
+			}
+			return rl, lt, ra, at, nil
+		}
 	}
 	// If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
 	// bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the

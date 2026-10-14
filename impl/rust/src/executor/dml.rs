@@ -53,7 +53,7 @@ pub(crate) struct InsertValuesPlan {
     arity: usize,
     value_exprs: ValueExprs,
     returning: Option<(Vec<RExpr>, Vec<String>, Vec<String>)>,
-    param_types: Vec<ScalarType>,
+    param_types: Vec<ColType>,
     cacheable: bool,
 }
 
@@ -383,12 +383,11 @@ impl Engine {
                     }
                     for (i, col) in columns.iter().enumerate() {
                         if let Some(p) = provided[i] {
-                            // Only a scalar column gives a top-level `$N` an inferable type; a
-                            // composite-column param stays untyped (42P18 at finalize this slice).
-                            if let (Some(InsertValue::Param(nn)), Type::Scalar(s)) =
-                                (values.get(p), &col.ty)
-                            {
-                                ptypes.note((*nn as usize) - 1, Some(*s))?;
+                            // A top-level `$N` takes its column's type, a scalar or a container
+                            // (api.md §5).
+                            if let Some(InsertValue::Param(nn)) = values.get(p) {
+                                let ct = self.read_snap().resolve_col_type(&col.ty);
+                                ptypes.note_col((*nn as usize) - 1, Some(ct))?;
                             }
                         }
                     }
@@ -1092,10 +1091,10 @@ impl Engine {
             }
             for (i, col) in table.columns.iter().enumerate() {
                 if let Some(p) = provided[i] {
-                    if let (Some(InsertValue::Param(nn)), Type::Scalar(s)) =
-                        (values.get(p), &col.ty)
-                    {
-                        ptypes.note((*nn as usize) - 1, Some(*s))?;
+                    // A top-level `$N` takes its column's type, a scalar or a container (api.md §5).
+                    if let Some(InsertValue::Param(nn)) = values.get(p) {
+                        let ct = self.read_snap().resolve_col_type(&col.ty);
+                        ptypes.note_col((*nn as usize) - 1, Some(ct))?;
                     }
                 }
             }
