@@ -325,6 +325,36 @@ sits so the options stay open (CLAUDE.md §9).
   the encryption-at-rest / authenticated-page door below, not this), and it is **not** metered
   (physical I/O, invisible to `page_read` cost). A dedicated per-core corruption test
   complements the fault-injection matrix.
+- **Structural validation of CRC-valid pages** — the CRC proves a page was written whole, not that
+  it is the page its referrer meant, nor that its lengths and offsets agree with each other. A
+  misdirected pointer, a page copied from another tree, or a page whose structure lies with a
+  resealed CRC (the shapes the deterministic simulator produces when pages are reused wrongly)
+  reaches the decoders, so every decoder treats its input as untrusted (CLAUDE.md §13): any
+  inconsistency is `XX001`, never a panic, an unbounded loop or recursion, an allocation sized by
+  a stored count, or an index past a slice. Concretely, in every core: page-to-page walks (B-tree
+  and GiST trees, the catalog chain, overflow chains) reject a page reached twice; recursive tree
+  walks stop at depth 256 (far beyond any real tree, but within every core's native stack); B-tree
+  leaves must sit at one depth; an item count must fit its page before it sizes anything; a stored
+  length or count only hints a preallocation up to a fixed cap (decoding grows past it as bytes
+  actually arrive); a leaf served from the buffer pool must have the column layout of the tree
+  asking for it — the same value codec per column (the pool is keyed by page alone, so a pointer
+  into another table's cached leaf is otherwise read with the wrong regions or types); a decimal
+  digit group is ≤ 9999, a stored range's finite bounds are ordered, an array's upper bounds fit
+  `i32`, no stored body is a jsonpath, a stored key column is never NULL, and a key value matches
+  its column type; and the catalog facts the executor relies on are checked once at open — table
+  names and index names are unique, a decimal typmod is one DDL accepts, a no-PK table's last
+  rowid key is an in-range 8-byte key, a composite type has a field and every composite reference
+  resolves before a table uses it, key columns are keyable, a GIN or GiST column has an operator
+  class, a foreign key names its parent's PK or UNIQUE columns with equal types, an exclusion
+  constraint matches its GiST index's columns with fitting operators, and a row count fits the
+  file. A row count that disagrees with its tree is caught when a commit writes it, as is a GiST
+  node rebuilt from corrupt keys that no longer fits its page; an index entry that disagrees with
+  its table's rows is caught where the executor meets it. The shared regression is the Ruby-forged
+  `malformed_*` fixture family ([../fileformat/verify.rb](../fileformat/verify.rb),
+  `suites/storage/malformed_*.test`; the open-time cases use the `# fixture: <path> error XX001`
+  form, conformance.md); per-core resealed-corruption fuzzers mutate every body page of every
+  golden, reseal its CRC, and require an engine error or success. Wrong rows from a whole-page
+  transposition between same-shaped trees remain undetectable here, as above.
 - **Alternative physical layouts & direct-access API** — kept open (§5), not scheduled.
 - **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9); **designed in
   [encryption.md](encryption.md)**. The insertion point is a **page codec in the core, just

@@ -931,7 +931,7 @@ func (db *engine) arbiterExisting(arb *arbiter, store *tableStore, table *catTab
 		return nil, nil, false, err
 	}
 	if !exists {
-		panic("a unique-index entry points at a live row")
+		return nil, nil, false, newError(DataCorrupted, "a unique-index entry points at a live row")
 	}
 	row, err = store.resolveAll(row)
 	if err != nil {
@@ -2374,11 +2374,13 @@ func (db *engine) insertExclusionConflictsStored(dbScope *string, table string, 
 	if !found {
 		return nil, false, nil
 	}
-	// A matched entry always names a stored row; should it not, a nil row only omits the Detail
-	// (the 23P01 itself is decided by the match).
-	other, _, err := db.lkpStoreScoped(dbScope, table).Get(first)
+	// A matched entry names a stored row unless the index pages disagree with the table's.
+	other, exists, err := db.lkpStoreScoped(dbScope, table).Get(first)
 	if err != nil {
 		return nil, false, err
+	}
+	if !exists {
+		return nil, false, newError(DataCorrupted, "a GiST entry references a stored row")
 	}
 	return other, true, nil
 }
@@ -2927,7 +2929,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				return 0, nil, err
 			}
 			if !inserted {
-				panic("index entry keys are unique (storage-key suffix)")
+				return 0, nil, newError(DataCorrupted, "index entry keys are unique (storage-key suffix)")
 			}
 		}
 		for _, mv := range indexMoves[k] {
@@ -2942,7 +2944,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 					return 0, nil, err
 				}
 				if !inserted {
-					panic("index entry keys are unique (storage-key suffix)")
+					return 0, nil, newError(DataCorrupted, "index entry keys are unique (storage-key suffix)")
 				}
 			}
 		}
@@ -3257,7 +3259,7 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 		}
 		child, ok := db.fkSnap(temp).table(r.childTable)
 		if !ok {
-			panic("foreign-key child exists")
+			return newError(DataCorrupted, "foreign-key child exists")
 		}
 		var oldTuples [][]Value
 		for _, row := range rows {
@@ -3326,7 +3328,7 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 		}
 		child, ok := db.fkSnap(temp).table(r.childTable)
 		if !ok {
-			panic("foreign-key child exists")
+			return newError(DataCorrupted, "foreign-key child exists")
 		}
 		var transitions [][2][]Value
 		for _, u := range updates {
@@ -4177,9 +4179,12 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 					hit, conflict = leastKey(hits, rewritten)
 				}
 				if conflict {
-					other, _, err := store.Get(hit)
+					other, exists, err := store.Get(hit)
 					if err != nil {
 						return outcome{}, err
+					}
+					if !exists {
+						return outcome{}, newError(DataCorrupted, "a GiST entry references a stored row")
 					}
 					return outcome{}, newExclusionViolation(table.Name, exc.Name).
 						withDetail(db.exclusionDetail(table.Name, table.Columns, exc, u.row, other, true))
@@ -4398,7 +4403,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 						return outcome{}, err
 					}
 					if !inserted {
-						panic("index entry keys are unique (storage-key suffix)")
+						return outcome{}, newError(DataCorrupted, "index entry keys are unique (storage-key suffix)")
 					}
 				}
 			}

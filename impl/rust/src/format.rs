@@ -126,7 +126,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v41: a composite-type entry admits a range-typed field — `field_type_code 17` followed by the
 // one-byte range element descriptor, before the field flags byte (spec/design/composite.md §3);
 // no other byte layout change.
-const FORMAT_VERSION: u16 = 42;
+pub(crate) const FORMAT_VERSION: u16 = 42;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -402,7 +402,7 @@ pub(crate) fn meta_crc(page: &[u8]) -> u32 {
 /// page's bytes **excluding its own 4-byte `crc32` field** at `[12, 16)` — i.e. `[0, 12)` then
 /// `[16, page_size)`, covering the header, payload, and zero-fill tail. `make_page` writes it;
 /// `parse_page` re-verifies it (mismatch → `XX001`). `page` is one full page (`page_size` bytes).
-fn page_crc(page: &[u8]) -> u32 {
+pub(crate) fn page_crc(page: &[u8]) -> u32 {
     crc32_extend(crc32_extend(0, &page[0..12]), &page[PAGE_HEADER..])
 }
 
@@ -1455,6 +1455,9 @@ impl Snapshot {
                         serialize_gist_index(self, table, idx, &mut alloc)?
                     };
                     for p in gpages {
+                        if p.payload.len() > cap {
+                            return Err(corrupt("GiST node overflows its page"));
+                        }
                         body.page(p.page_no, p.page_type, p.item_count, 0, &p.payload)?;
                     }
                     root
@@ -1500,14 +1503,16 @@ impl Snapshot {
             cat_entries.push(e);
         }
         for (ti, (_, t, store)) in tables.iter().enumerate() {
+            let row_count = store
+                .count()
+                .expect("table stores always carry an exact row count");
+            check_table_row_count(root_data_page[ti], row_count)?;
             let mut e = vec![0u8];
             e.extend_from_slice(&table_entry_bytes(
                 t,
                 root_data_page[ti],
                 &index_roots[ti],
-                store
-                    .count()
-                    .expect("table stores always carry an exact row count"),
+                row_count,
             ));
             cat_entries.push(e);
         }
@@ -1971,6 +1976,11 @@ impl Snapshot {
                     };
                     gist_pages += gpages.len() as u32;
                     for p in gpages {
+                        // A tree rebuilt from valid leaf keys always fits; an oversized node means
+                        // the loaded keys were corrupt.
+                        if p.payload.len() > cap {
+                            return Err(corrupt("GiST node overflows its page"));
+                        }
                         pages.push((
                             p.page_no,
                             make_page(ps, p.page_type, p.item_count, 0, &p.payload),
@@ -2027,14 +2037,16 @@ impl Snapshot {
             cat_entries.push(e);
         }
         for (ti, (_, t, store)) in tables.iter().enumerate() {
+            let row_count = store
+                .count()
+                .expect("table stores always carry an exact row count");
+            check_table_row_count(root_data_page[ti], row_count)?;
             let mut e = vec![0u8];
             e.extend_from_slice(&table_entry_bytes(
                 t,
                 root_data_page[ti],
                 &index_roots[ti],
-                store
-                    .count()
-                    .expect("table stores always carry an exact row count"),
+                row_count,
             ));
             cat_entries.push(e);
         }
@@ -2385,7 +2397,17 @@ impl Engine {
             catalog: 0,
             gist: 0,
         };
+        let mut cat_seen: HashSet<u32> = HashSet::new();
+        // Index stores are keyed by index name alone, so a repeated name would share one tree.
+        let mut index_names: HashSet<String> = HashSet::new();
+        // Whether every composite type registered so far has passed `validate_composite_types`. A
+        // table resolves its column types as it is registered, so the types it reaches must be
+        // known-present and acyclic first (composite.md §3).
+        let mut types_checked = true;
         while cat_page != 0 {
+            if !cat_seen.insert(cat_page) {
+                return Err(corrupt("catalog chain revisits a page"));
+            }
             let block = paging.pager().read_block(cat_page)?;
             let page = parse_page(&block)?;
             if page.page_type != PAGE_CATALOG {
@@ -2400,6 +2422,7 @@ impl Engine {
                 if kind == 1 {
                     let ct = decode_composite_type_entry(page.payload, &mut pos)?;
                     snap.put_type(ct);
+                    types_checked = false;
                     continue;
                 }
                 if kind == 2 {
@@ -2439,6 +2462,36 @@ impl Engine {
                 }
                 let (table, root_data_page, row_count, index_roots) =
                     decode_table_entry(page.payload, &mut pos)?;
+                // Every record costs at least its 4-byte key-directory entry in some leaf, so no
+                // table holds more rows than the file has room for. Checking keeps a corrupt count
+                // from sizing allocations later.
+                if row_count as u64
+                    > meta.page_count as u64 * ((page_size - PAGE_HEADER) / 4) as u64
+                {
+                    return Err(corrupt("table row count exceeds the file"));
+                }
+                if !types_checked {
+                    snap.validate_composite_types()?;
+                    types_checked = true;
+                }
+                for c in &table.columns {
+                    if let Some(r) = c.ty.composite_ref() {
+                        if snap.composite_type(&r.name).is_none() {
+                            return Err(corrupt(&format!(
+                                "table {} references unknown type {}",
+                                table.name, r.name
+                            )));
+                        }
+                    }
+                }
+                if snap.table(&table.name).is_some() {
+                    return Err(corrupt(&format!("duplicate table name {}", table.name)));
+                }
+                for idx in &table.indexes {
+                    if !index_names.insert(idx.name.clone()) {
+                        return Err(corrupt(&format!("duplicate index name {}", idx.name)));
+                    }
+                }
                 let name = table.name.clone();
                 let has_pk = !table.pk_indices().is_empty();
                 let indexes = table.indexes.clone();
@@ -2457,9 +2510,15 @@ impl Engine {
                         // No-PK rowid reconstruction faults the leaves to find the largest key; only
                         // for keyless tables (most have a PK), and bounded by the pool.
                         let entries = store.iter_entries()?;
-                        if let Some((k, _)) = entries.last() {
-                            store.bump_rowid_to(decode_int(ScalarType::Int64, k) + 1);
-                        }
+                        let Some((k, _)) = entries.last() else {
+                            return Err(corrupt("non-empty table tree holds no rows"));
+                        };
+                        // A rowid key is the 8-byte i64 encoding; the next rowid must not overflow.
+                        let next = (k.len() == 8)
+                            .then(|| decode_int(ScalarType::Int64, k).checked_add(1))
+                            .flatten()
+                            .ok_or_else(|| corrupt("table rowid key out of range"))?;
+                        store.bump_rowid_to(next);
                     }
                 }
                 // The table's index trees (v5): zero-column demand-paged stores of entry
@@ -2484,6 +2543,8 @@ impl Engine {
                                 },
                                 iroot,
                                 &mut keys,
+                                &mut HashSet::new(),
+                                1,
                             )?;
                             live.gist += gist_pages.get();
                             for k in keys {
@@ -2520,6 +2581,7 @@ impl Engine {
         // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
         // reference (spec/design/composite.md §3).
         snap.validate_composite_types()?;
+        validate_loaded_references(&snap)?;
         // Views (v38): structural checks only — the bodies are parsed, never planned (views.md §3).
         install_views(&mut snap, loaded_views)?;
         // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
@@ -2564,7 +2626,15 @@ fn collect_leaf_overflow(
     page_idx: u32,
     col_types: &Arc<Vec<ColType>>,
     reached: &mut HashSet<u32>,
+    seen: &mut HashSet<u32>,
+    depth: usize,
 ) -> Result<()> {
+    if !seen.insert(page_idx) {
+        return Err(corrupt("B-tree page reached twice"));
+    }
+    if depth > MAX_TREE_DEPTH {
+        return Err(corrupt("B-tree deeper than any valid tree"));
+    }
     let block = paging.pager().read_block(page_idx)?;
     let page = parse_page(&block)?;
     match page.page_type {
@@ -2604,13 +2674,16 @@ fn collect_leaf_overflow(
         }
         PAGE_INTERIOR => {
             let n = page.item_count as usize;
+            if 8 * n + 4 > page.payload.len() {
+                return Err(corrupt("B-tree interior item count overruns page"));
+            }
             let mut pos = 0usize;
             let mut cps = Vec::with_capacity(n + 1);
             for _ in 0..=n {
                 cps.push(read_u32(page.payload, &mut pos)?);
             }
             for cp in cps {
-                collect_leaf_overflow(paging, cp, col_types, reached)?;
+                collect_leaf_overflow(paging, cp, col_types, reached, seen, depth + 1)?;
             }
             Ok(())
         }
@@ -2638,7 +2711,9 @@ pub(crate) fn reachable_pages(
     // what compaction reclaims).
     let mut p = cat_root;
     while p != 0 {
-        reached.insert(p);
+        if !reached.insert(p) {
+            return Err(corrupt("catalog chain revisits a page"));
+        }
         let block = paging.pager().read_block(p)?;
         let page = parse_page(&block)?;
         if page.page_type != PAGE_CATALOG {
@@ -2654,7 +2729,14 @@ pub(crate) fn reachable_pages(
             if root_page != 0 {
                 let col_types = Arc::new(st.col_types().to_vec());
                 if any_spillable(&col_types) {
-                    collect_leaf_overflow(paging, root_page, &col_types, &mut reached)?;
+                    collect_leaf_overflow(
+                        paging,
+                        root_page,
+                        &col_types,
+                        &mut reached,
+                        &mut HashSet::new(),
+                        1,
+                    )?;
                 }
             }
         }
@@ -2890,7 +2972,7 @@ fn read_skeleton(
     root_page: u32,
     col_types: &Arc<Vec<ColType>>,
 ) -> Result<Arc<Node>> {
-    match read_skeleton_node(paging, root_page, col_types)? {
+    match read_skeleton_node(paging, root_page, col_types, &mut HashSet::new(), 1)?.0 {
         Child::Resident(node) => Ok(node),
         Child::OnDisk(page) => paging.fault_leaf(page, col_types),
     }
@@ -2911,18 +2993,35 @@ fn read_skeleton(
 /// (to classify the level), i.e. ~`leaves / fanout` leaf reads, negligible beside the former per-leaf
 /// walk. A corrupt leaf is now surfaced at fault rather than at open (still `XX001`, never wrong
 /// rows — spec/design/storage.md §7); the interior spine is still CRC-validated here at open.
+/// `seen` holds the interior pages already read: a tree is acyclic and no interior has two parents,
+/// so a repeat is a misdirected pointer (`data_corrupted`) rather than a reason to recurse without
+/// bound. The returned height (1 for a leaf) lets each interior check that its resolved children sit
+/// at one depth, the invariant the scan and rebalance code relies on.
 fn read_skeleton_node(
     paging: &SharedPaging,
     page_idx: u32,
     col_types: &[ColType],
-) -> Result<Child> {
+    seen: &mut HashSet<u32>,
+    depth: usize,
+) -> Result<(Child, usize)> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(corrupt("B-tree deeper than any valid tree"));
+    }
     let block = paging.pager().read_block(page_idx)?;
     let page = parse_page(&block)?;
     match page.page_type {
-        PAGE_LEAF => Ok(Child::OnDisk(page_idx)),
+        PAGE_LEAF => Ok((Child::OnDisk(page_idx), 1)),
         PAGE_INTERIOR => {
+            if !seen.insert(page_idx) {
+                return Err(corrupt("B-tree interior page reached twice"));
+            }
             let n = page.item_count as usize;
             let payload = page.payload;
+            // n+1 child pointers plus an n-entry separator directory must fit the payload; checking
+            // first keeps a corrupt count from sizing the allocations below.
+            if 8 * n + 4 > payload.len() {
+                return Err(corrupt("B-tree interior item count overruns page"));
+            }
             let mut pos = 0usize;
             // Child pointers precede the separator directory (format.md "Interior node").
             let mut child_ptrs = Vec::with_capacity(n + 1);
@@ -2932,21 +3031,28 @@ fn read_skeleton_node(
             // v24: the record-free routing skeleton — an end-offset separator directory + key
             // blob. Separators carry no values, so no lazy decode and no chains to mark.
             let keys = read_separators(payload, &mut pos, n)?;
-            // Resolve the first child to classify the level, then avoid reading leaf siblings.
+            // Resolve the first child to classify the level, then avoid reading leaf siblings. A
+            // leaf sibling that is not a leaf is caught when it faults (`decode_leaf_node`).
             let mut children = Vec::with_capacity(n + 1);
-            let first = read_skeleton_node(paging, child_ptrs[0], col_types)?;
+            let (first, height) =
+                read_skeleton_node(paging, child_ptrs[0], col_types, seen, depth + 1)?;
             let children_are_leaves = matches!(first, Child::OnDisk(_));
             children.push(first);
             for &cp in &child_ptrs[1..] {
                 children.push(if children_are_leaves {
                     Child::OnDisk(cp) // a leaf sibling — not read at open
                 } else {
-                    read_skeleton_node(paging, cp, col_types)?
+                    let (child, h) = read_skeleton_node(paging, cp, col_types, seen, depth + 1)?;
+                    if h != height {
+                        return Err(corrupt("B-tree leaves at unequal depths"));
+                    }
+                    child
                 });
             }
-            Ok(Child::Resident(Node::loaded_interior(
-                keys, children, page_idx,
-            )))
+            Ok((
+                Child::Resident(Node::loaded_interior(keys, children, page_idx)),
+                height + 1,
+            ))
         }
         _ => Err(corrupt("expected a B-tree node page")),
     }
@@ -3014,10 +3120,24 @@ fn serialize_gist_index<A: FnMut() -> u32>(
 /// R-tree the planner descends is rebuilt canonically from them afterward
 /// (`Snapshot::rebuild_gist_trees`). `read` returns one page's `(page_type, item_count, payload)`,
 /// reading from the whole image or through the pager.
-fn read_gist_leaf_keys<F>(read: &F, page_no: u32, out: &mut Vec<Vec<u8>>) -> Result<()>
+/// `seen` holds the pages already walked: a page reached twice is a misdirected child pointer
+/// (`data_corrupted`), not a reason to recurse without bound.
+fn read_gist_leaf_keys<F>(
+    read: &F,
+    page_no: u32,
+    out: &mut Vec<Vec<u8>>,
+    seen: &mut HashSet<u32>,
+    depth: usize,
+) -> Result<()>
 where
     F: Fn(u32) -> Result<(u8, u32, Vec<u8>)>,
 {
+    if !seen.insert(page_no) {
+        return Err(corrupt("GiST page reached twice"));
+    }
+    if depth > MAX_TREE_DEPTH {
+        return Err(corrupt("GiST tree deeper than any valid tree"));
+    }
     let (page_type, n, payload) = read(page_no)?;
     let mut pos = 0usize;
     match page_type {
@@ -3034,6 +3154,11 @@ where
             Ok(())
         }
         t if t == crate::gist::PAGE_GIST_INTERIOR => {
+            // Each entry is at least a u16 bound length and a u32 child pointer; checking first
+            // keeps a corrupt count from sizing the allocation.
+            if n as usize * 6 > payload.len() {
+                return Err(corrupt("GiST interior item count overruns page"));
+            }
             // Collect child pages first (the payload borrow ends before recursing).
             let mut children = Vec::with_capacity(n as usize);
             for _ in 0..n {
@@ -3042,7 +3167,7 @@ where
                 children.push(read_u32(&payload, &mut pos)?);
             }
             for cp in children {
-                read_gist_leaf_keys(read, cp, out)?;
+                read_gist_leaf_keys(read, cp, out, seen, depth + 1)?;
             }
             Ok(())
         }
@@ -3576,6 +3701,16 @@ fn decode_statistics_entry(
             terms.entries.push((term, rows));
         }
         _ => return Err(corrupt("unknown statistics entry subkind")),
+    }
+    Ok(())
+}
+
+/// Reject a row count that disagrees with its tree before `table_entry_bytes` asserts it. The engine
+/// maintains the count exactly, so a disagreement here means the count restored from the catalog did
+/// not match the leaves it described: a corrupt or misdirected page (storage.md §7).
+fn check_table_row_count(root_data_page: u32, row_count: i64) -> Result<()> {
+    if row_count < 0 || (root_data_page == 0) != (row_count == 0) {
+        return Err(corrupt("table row count disagrees with its tree"));
     }
     Ok(())
 }
@@ -4371,6 +4506,11 @@ impl PackedLeaf {
         Ok(())
     }
 
+    /// The column types this leaf was decoded (and its directories validated) against.
+    pub(crate) fn col_types(&self) -> &Arc<Vec<ColType>> {
+        &self.col_types
+    }
+
     /// The shared page block — the buffer-pool pin (§7). Exposed for the fault-path invariant tests.
     #[cfg(test)]
     pub(crate) fn block(&self) -> &Arc<Vec<u8>> {
@@ -4458,6 +4598,28 @@ fn parse_pax_leaf(payload: &[u8], n: usize, col_types: &[ColType]) -> Result<Pax
         key_blob,
         regions,
     })
+}
+
+/// Whether a leaf decoded for columns `a` serves a tree of columns `b`: the same column count, and
+/// each column the same value codec. The same fixed width or variable class keeps every region and
+/// slot access in bounds; the same codec also keeps a value of one type from reaching code that
+/// expects another (the comparator, the commit-time encoder). Composite names are not compared, so
+/// a renamed type still matches.
+pub(crate) fn same_leaf_shape(a: &Arc<Vec<ColType>>, b: &Arc<Vec<ColType>>) -> bool {
+    fn same_codec(x: &ColType, y: &ColType) -> bool {
+        match (x, y) {
+            (ColType::Scalar(s), ColType::Scalar(t)) => s == t,
+            (ColType::Array(e), ColType::Array(f)) | (ColType::Range(e), ColType::Range(f)) => {
+                same_codec(e, f)
+            }
+            (ColType::Composite { fields: f, .. }, ColType::Composite { fields: g, .. }) => {
+                f.len() == g.len() && f.iter().zip(g).all(|(p, q)| same_codec(&p.ty, &q.ty))
+            }
+            _ => false,
+        }
+    }
+    Arc::ptr_eq(a, b)
+        || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| same_codec(x, y)))
 }
 
 /// Decode a single **leaf** page block into a resident node, for the demand-paging fault path
@@ -4566,6 +4728,11 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
 fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeType> {
     let name = read_string(buf, pos)?;
     let field_count = read_u16(buf, pos)? as usize;
+    // CREATE TYPE requires a field. A zero-field body is zero bytes, so an array of them would decode
+    // any stored element count without consuming input.
+    if field_count == 0 {
+        return Err(corrupt("composite type has no fields"));
+    }
     let mut fields = Vec::with_capacity(field_count);
     for _ in 0..field_count {
         let fname = read_string(buf, pos)?;
@@ -4598,13 +4765,7 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
         let mut varchar_len: Option<u32> = None;
         if let Type::Scalar(s) = &ty {
             if s.is_decimal() {
-                let precision = read_u16(buf, pos)?;
-                let scale = read_u16(buf, pos)?;
-                decimal = if precision == 0 {
-                    None
-                } else {
-                    Some(DecimalTypmod { precision, scale })
-                };
+                decimal = read_decimal_typmod(buf, pos)?;
             }
             // A text field carries its `varchar(n)` max length (v22); `0` = unbounded — §15.
             if s.is_text() {
@@ -4938,6 +5099,139 @@ fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, boo
     Ok((coll, is_default))
 }
 
+/// Check the catalog facts that need resolved types or other entries, which `decode_table_entry`
+/// cannot see one entry at a time: primary-key and plain B-tree index columns are keyable, a GIN
+/// index covers one column whose type has an operator class, a GiST index's columns have a GiST
+/// operator class, a foreign key names a loaded parent's PK or UNIQUE column set with same-typed
+/// columns (constraints.md §6.2), and an exclusion constraint names a GiST index of its own table.
+/// The engine never writes a file that breaks these, and the executor relies on them, so a
+/// violation is `data_corrupted` (storage.md §7). Tables are visited in name order so the reported
+/// violation is deterministic.
+fn validate_loaded_references(snap: &Snapshot) -> Result<()> {
+    fn sorted_unique(v: &[usize]) -> Vec<usize> {
+        let mut s = v.to_vec();
+        s.sort_unstable();
+        s.dedup();
+        s
+    }
+    for t in snap.tables_sorted() {
+        let col_types = snap.store(&t.name).col_types();
+        for &o in &t.pk {
+            if !col_types[o].keyable() {
+                return Err(corrupt(&format!(
+                    "primary key column of table {} is not keyable",
+                    t.name
+                )));
+            }
+        }
+        for idx in &t.indexes {
+            match idx.kind {
+                IndexKind::Btree => {
+                    for key in &idx.keys {
+                        if let IndexKey::Column(c) = key
+                            && !col_types[*c].keyable()
+                        {
+                            return Err(corrupt(&format!(
+                                "index {} column is not keyable",
+                                idx.name
+                            )));
+                        }
+                    }
+                }
+                IndexKind::Gin => {
+                    if idx.keys.len() != 1 {
+                        return Err(corrupt(&format!(
+                            "GIN index {} does not have exactly one column",
+                            idx.name
+                        )));
+                    }
+                    let IndexKey::Column(c) = idx.keys[0] else {
+                        return Err(corrupt("a non-btree index cannot have an expression key"));
+                    };
+                    if !crate::executor::term_eligible(&t.columns[c].ty) {
+                        return Err(corrupt(&format!(
+                            "GIN index {} column has no operator class",
+                            idx.name
+                        )));
+                    }
+                }
+                IndexKind::Gist => {
+                    for key in &idx.keys {
+                        let IndexKey::Column(c) = key else {
+                            return Err(corrupt("a non-btree index cannot have an expression key"));
+                        };
+                        let ty = &t.columns[*c].ty;
+                        if !ty.is_range() && !crate::executor::is_gist_scalar_type(ty) {
+                            return Err(corrupt(&format!(
+                                "GiST index {} column has no operator class",
+                                idx.name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        for fk in &t.foreign_keys {
+            let parent = snap.table(&fk.ref_table).ok_or_else(|| {
+                corrupt(&format!(
+                    "foreign key {} references a missing table",
+                    fk.name
+                ))
+            })?;
+            for (&local, &o) in fk.columns.iter().zip(&fk.ref_columns) {
+                if o >= parent.columns.len() {
+                    return Err(corrupt("invalid foreign-key referenced column ordinal"));
+                }
+                if t.columns[local].ty != parent.columns[o].ty {
+                    return Err(corrupt(&format!(
+                        "foreign key {} pairs columns of different types",
+                        fk.name
+                    )));
+                }
+            }
+            let ref_set = sorted_unique(&fk.ref_columns);
+            let matches = (!parent.pk.is_empty() && sorted_unique(&parent.pk) == ref_set)
+                || parent.indexes.iter().any(|i| {
+                    i.unique
+                        && i.column_ordinals()
+                            .is_some_and(|c| sorted_unique(&c) == ref_set)
+                });
+            if !matches {
+                return Err(corrupt(&format!(
+                    "foreign key {} does not reference a unique key",
+                    fk.name
+                )));
+            }
+        }
+        for ex in &t.exclusions {
+            let Some(index) = t
+                .indexes
+                .iter()
+                .find(|i| i.name == ex.index && i.kind == IndexKind::Gist)
+            else {
+                return Err(corrupt(&format!(
+                    "exclusion constraint {} has no backing GiST index",
+                    ex.name
+                )));
+            };
+            // The probe pairs element i with index column i and builds its query from the
+            // operator, so the two lists must agree and each operator must fit its column.
+            let element_columns: Vec<usize> = ex.elements.iter().map(|e| e.column).collect();
+            let fits = |e: &ExclusionElement| match e.op {
+                ExclusionOp::Overlaps => t.columns[e.column].ty.is_range(),
+                ExclusionOp::Equal => crate::executor::is_gist_scalar_type(&t.columns[e.column].ty),
+            };
+            if index.column_ordinals() != Some(element_columns) || !ex.elements.iter().all(fits) {
+                return Err(corrupt(&format!(
+                    "exclusion constraint {} does not match its backing GiST index",
+                    ex.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, Vec<u32>)> {
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)? as usize;
@@ -5054,13 +5348,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         };
         // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
         let decimal = if ty.is_decimal() {
-            let precision = read_u16(buf, pos)?;
-            let scale = read_u16(buf, pos)?;
-            if precision == 0 {
-                None
-            } else {
-                Some(DecimalTypmod { precision, scale })
-            }
+            read_decimal_typmod(buf, pos)?
         } else {
             None
         };
@@ -5522,12 +5810,21 @@ pub(crate) fn read_range_body(
     if !mode.constructs() {
         return Ok(Value::Null);
     }
+    let (lower_inc, upper_inc) = (flags & 0x08 != 0, flags & 0x10 != 0);
+    // A writer stores only finalized ranges, whose finite bounds are ordered and, when equal, both
+    // inclusive (anything else is the empty range). The range operators rely on that order.
+    if let (Some(lo), Some(hi)) = (&lower, &upper) {
+        let c = crate::range::elem_cmp(lo, hi);
+        if c.is_gt() || (c.is_eq() && !(lower_inc && upper_inc)) {
+            return Err(corrupt("range bounds are out of order"));
+        }
+    }
     Ok(Value::Range(RangeVal {
         empty: false,
         lower,
         upper,
-        lower_inc: flags & 0x08 != 0,
-        upper_inc: flags & 0x10 != 0,
+        lower_inc,
+        upper_inc,
     }))
 }
 
@@ -5560,6 +5857,12 @@ fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize, mode: DecodeMode
     for _ in 0..ndim {
         let len = read_u32(buf, pos)? as usize;
         let lb = read_u32(buf, pos)? as i32; // lower bound (i32 two's-complement)
+        // The upper bound `lb + len - 1` must fit an i32; the engine never stores an array whose
+        // bound does not.
+        let ub = lb as i64 + len as i64 - 1;
+        if ub > i32::MAX as i64 || ub < i32::MIN as i64 {
+            return Err(corrupt("array dimension bounds out of range"));
+        }
         n = n
             .checked_mul(len)
             .ok_or_else(|| corrupt("array element count overflow"))?;
@@ -5573,7 +5876,7 @@ fn read_array_body(elem: &ColType, buf: &[u8], pos: &mut usize, mode: DecodeMode
         Vec::new()
     };
     let mut elements = if mode.constructs() {
-        Vec::with_capacity(n)
+        Vec::with_capacity(n.min(DECODE_PREALLOC_CAP))
     } else {
         Vec::new()
     };
@@ -5648,6 +5951,11 @@ fn read_inline_scalar(
     pos: &mut usize,
     mode: DecodeMode,
 ) -> Result<Value> {
+    // `jsonpath` reserves a type code but has no value codec; a catalog naming it for a column,
+    // field, or element must not reach the fixed-width decoder below.
+    if ty == ScalarType::JsonPath {
+        return Err(corrupt("a stored body holds a jsonpath value"));
+    }
     if ty.is_text() {
         let len = read_u16(buf, pos)? as usize;
         let bytes = take(buf, pos, len)?;
@@ -5764,6 +6072,9 @@ fn decode_decimal_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<
     };
     for _ in 0..ndigits {
         let g = read_u16(buf, pos)?; // advance in both modes
+        if g > 9999 {
+            return Err(corrupt("decimal digit group out of range"));
+        }
         if mode.constructs() {
             groups.push(g);
         }
@@ -5784,11 +6095,15 @@ fn read_overflow_chain(
     fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
     visited: &mut Vec<u32>,
 ) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(len);
+    let mut out = Vec::with_capacity(len.min(DECODE_PREALLOC_CAP));
+    let mut seen = HashSet::new();
     let mut p = first;
     while out.len() < len {
         if p == 0 {
             return Err(corrupt("overflow chain ended before the value length"));
+        }
+        if !seen.insert(p) {
+            return Err(corrupt("overflow chain revisits a page"));
         }
         visited.push(p);
         let block = fetch(p)?;
@@ -5978,11 +6293,15 @@ pub(crate) fn chain_pages(
     fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
 ) -> Result<Vec<u32>> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     let mut gathered = 0usize;
     let mut p = first;
     while gathered < len {
         if p == 0 {
             return Err(corrupt("overflow chain ended before the value length"));
+        }
+        if !seen.insert(p) {
+            return Err(corrupt("overflow chain revisits a page"));
         }
         out.push(p);
         let block = fetch(p)?;
@@ -6031,10 +6350,22 @@ fn mark_chains(
     Ok(())
 }
 
+/// Bounds the recursion of the on-disk tree walks (the root is depth 1). A tree only grows a level
+/// when its root splits, so a tree the engine writes stays far shallower than this; a deeper chain
+/// is misdirected pointers, and following it could overflow the native stack before a seen set
+/// caught a repeat.
+pub(crate) const MAX_TREE_DEPTH: usize = 256;
+
+/// Bounds a capacity hint taken from a stored length or count. The stored value is only validated
+/// as the bytes behind it are read, so trusting it up front would let one corrupt field size an
+/// allocation of gigabytes (an abort, not an error); past the cap, buffers grow as the data arrives.
+pub(crate) const DECODE_PREALLOC_CAP: usize = 1 << 16;
+
 // --- bounds-checked big-endian readers over a payload cursor ---
 
 fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
-    if *pos + n > buf.len() {
+    // `n` may be a stored length up to u64::MAX (a jsonb varint), so the bound must not overflow.
+    if n > buf.len().saturating_sub(*pos) {
         return Err(corrupt("unexpected end of page data"));
     }
     let s = &buf[*pos..*pos + n];
@@ -6066,6 +6397,21 @@ fn read_u32_at(buf: &[u8], at: usize) -> Result<u32> {
         buf[at + 2],
         buf[at + 3],
     ]))
+}
+
+/// Read a decimal column/field typmod (`u16 precision ‖ u16 scale`; precision 0 = unconstrained).
+/// DDL admits only `1 <= p <= MAX_PRECISION` and `s <= p` (decimal.md §2), and coercion relies on
+/// `s <= p`, so any other pair is `XX001`.
+fn read_decimal_typmod(buf: &[u8], pos: &mut usize) -> Result<Option<DecimalTypmod>> {
+    let precision = read_u16(buf, pos)?;
+    let scale = read_u16(buf, pos)?;
+    if precision == 0 {
+        return Ok(None);
+    }
+    if precision as u32 > crate::decimal::MAX_PRECISION || scale > precision {
+        return Err(corrupt("invalid decimal typmod"));
+    }
+    Ok(Some(DecimalTypmod { precision, scale }))
 }
 
 fn read_string(buf: &[u8], pos: &mut usize) -> Result<String> {

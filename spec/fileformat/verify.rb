@@ -1532,6 +1532,47 @@ COW_FIXTURES = [
     expected_open_error: mutation == :invalid_free_list ? "invalid free-list entry" : nil }
 end.freeze
 
+# Malformed-page fixtures (../design/storage.md §6): images whose pages are CRC-valid, so they
+# pass the checksum, but whose structure lies — the shapes a misdirected or stale page presents.
+# Each is a clean image plus one forged mutation (malformed_fixture_image), page CRCs resealed so
+# the rejection is structural rather than a checksum mismatch. The cores must answer every one with
+# XX001 (suites/storage/malformed_*.test), never a crash, hang, or wrong rows; the decoder below
+# rejects the ones whose lie it can see (`reject:`). `wrong_tree_leaf` is the simulator's case: a
+# child pointer into another table's leaf, whose column layout differs.
+MALFORMED_SHAPE_TABLE = {
+  name: "u",
+  columns: [col("id", "i32", pk: true), col("a", "text"), col("b", "text"), col("c", "boolean")],
+  rows: [[1, "x", "y", true], [2, "z", nil, false]]
+}.freeze
+
+MALFORMED_FK_TYPE_TABLES = [
+  { name: "c", columns: [col("id", "i32", pk: true), col("pid", "i64")],
+    fks: [{ name: "c_pid_fkey", local: [1], ref_table: "p", ref: [0] }], rows: [] },
+  { name: "p", columns: [col("pid", "i32", pk: true)], rows: [] }
+].freeze
+
+MALFORMED_FIXTURES = [
+  { file: "malformed_leaf_directory.jed", page_size: 256, tables: [PK_TABLE],
+    malformed: :leaf_directory, reject: true },
+  { file: "malformed_wrong_tree_leaf.jed", page_size: 256, tables: [PK_TABLE, MALFORMED_SHAPE_TABLE],
+    malformed: :wrong_tree_leaf, reject: true },
+  { file: "malformed_interior_cycle.jed", page_size: 256, tables: [PK_TABLE],
+    malformed: :interior_cycle, reject: true },
+  { file: "malformed_decimal_group.jed", page_size: 256, tables: [DECIMAL_TABLE],
+    malformed: :decimal_group, reject: true },
+  { file: "malformed_overflow_cycle.jed", page_size: 256, tables: [OVERFLOW_TABLE],
+    malformed: :overflow_cycle, reject: true },
+  # The catalog claims 25 rows over a 20-row tree: invisible until a write's count disagrees with it.
+  { file: "malformed_row_count.jed", page_size: 256, tables: [PK_TABLE.merge(row_count: 25)],
+    malformed: :none, reject: true },
+  # Semantic lies the decoder does not model: an FK pairing i64 with an i32 key, a column whose
+  # composite type is not in the catalog.
+  { file: "malformed_fk_type.jed", page_size: 256, tables: MALFORMED_FK_TYPE_TABLES, malformed: :none },
+  { file: "malformed_missing_type.jed", page_size: 256, types: [ctype("ghost", [field("x", "i32")])],
+    tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("home", "ghost")], rows: [] }],
+    malformed: :drop_types }
+].freeze
+
 FIXTURES = ([
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -1626,7 +1667,7 @@ FIXTURES = ([
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
   { file: "torn_meta_slot1.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
-] + COW_FIXTURES).freeze
+] + COW_FIXTURES + MALFORMED_FIXTURES).freeze
 
 # --- primitives -------------------------------------------------------------
 
@@ -3470,7 +3511,7 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
   sorted_seqs.each { |s| cat_entries << ("\x02".b + sequence_entry_bytes(s)) }
   sorted_colls.each { |c| cat_entries << ("\x03".b + collation_entry_bytes(c)) }
   sorted.each_with_index do |t, ti|
-    cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti], t[:rows].length))
+    cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti], t[:row_count] || t[:rows].length))
   end
   sorted.each { |t| cat_entries.concat(statistics_entries(t)) }
   # View entries (kind 5, v38) come last, in view-name byte order (format.md *View entry*).
@@ -3497,6 +3538,7 @@ end
 # The bytes a fixture should contain (applying any torn-slot corruption).
 def fixture_image(fx)
   return cow_fixture_image(fx) if fx[:cow]
+  return malformed_fixture_image(fx) if fx[:malformed]
 
   image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size],
                       fx[:collations] || [], views: fx[:views] || [])
@@ -3608,6 +3650,84 @@ def cow_fixture_image(fx)
   when :bad_padding
     image.setbyte(ps - 1, 1)
     refresh_meta_crc(image, ps, 0)
+  end
+  image
+end
+
+# Each table's root data page, read back from a clean image's catalog.
+def table_root_pages(image, ps)
+  roots = {}
+  cat = select_meta(image, ps)[:root_page]
+  while cat != 0
+    pg = read_page(image, ps, cat)
+    pos = 0
+    pg[:item_count].times do
+      kind = pg[:payload].getbyte(pos)
+      pos += 1
+      if kind == 1
+        _ct, pos = decode_composite_type_entry(pg[:payload], pos)
+        next
+      end
+      raise "malformed fixtures carry only types and tables" unless kind.zero?
+
+      entry, pos = decode_table_entry(pg[:payload], pos)
+      roots[entry[:name]] = entry[:root_data_page]
+    end
+    cat = pg[:next_page]
+  end
+  roots
+end
+
+def page_u32(image, ps, index, offset) = image.byteslice(index * ps + offset, 4).unpack1("N")
+
+def set_page_u32(image, ps, index, offset, value)
+  image[index * ps + offset, 4] = u32(value)
+  refresh_body_crc(image, ps, index)
+end
+
+def malformed_fixture_image(fx)
+  ps = fx[:page_size]
+  image = build_image(fx[:types] || [], [], fx[:tables], ps)
+  roots = table_root_pages(image, ps)
+  case fx[:malformed]
+  when :leaf_directory
+    # t's second leaf: its first key-directory end offset now runs past the page.
+    leaf = page_u32(image, ps, roots["t"], PAGE_HEADER + 4)
+    set_page_u32(image, ps, leaf, PAGE_HEADER, 0xFFFF_FFF0)
+  when :wrong_tree_leaf
+    # t's second child pointer now names u's root leaf (two text columns and a boolean, not i16).
+    set_page_u32(image, ps, roots["t"], PAGE_HEADER + 4, roots["u"])
+  when :interior_cycle
+    # t's root interior names itself as its first child.
+    set_page_u32(image, ps, roots["t"], PAGE_HEADER, roots["t"])
+  when :decimal_group
+    # The first base-10^4 group of row 2's d (-12345.6789) is now 65535.
+    leaf = roots["t"]
+    pattern = encode_value("decimal", "-12345.6789")
+    payload = image.byteslice(leaf * ps, ps)
+    at = payload.index(pattern)
+    raise "decimal pattern not unique" unless at && payload.index(pattern, at + 1).nil?
+
+    image[leaf * ps + at + 6, 2] = u16(0xFFFF)
+    refresh_body_crc(image, ps, leaf)
+  when :overflow_cycle
+    # The first overflow page of a multi-page chain now links back to itself.
+    first = (2...image.bytesize / ps).find do |i|
+      image.getbyte(i * ps) == PAGE_OVERFLOW && page_u32(image, ps, i, 8) != 0
+    end
+    set_page_u32(image, ps, first, 8, first)
+  when :drop_types
+    # The catalog keeps the table but loses the composite-type entries ahead of it.
+    cat = select_meta(image, ps)[:root_page]
+    dropped = fx[:types].sum { |t| 1 + composite_type_entry_bytes(t).bytesize }
+    payload = image.byteslice(cat * ps + PAGE_HEADER + dropped, ps - PAGE_HEADER - dropped)
+    image[cat * ps + PAGE_HEADER, ps - PAGE_HEADER] = payload + "\x00".b * dropped
+    image[cat * ps + 4, 4] = u32(page_u32(image, ps, cat, 4) - fx[:types].size)
+    refresh_body_crc(image, ps, cat)
+  when :none
+    nil
+  else
+    raise "unknown malformed mutation #{fx[:malformed]}"
   end
   image
 end
@@ -4099,6 +4219,8 @@ def decode_decimal_body(buf, pos)
   coeff = 0
   ndb.unpack1("n").times do
     gb, pos = take(buf, pos, 2)
+    raise "decimal digit group out of range" if gb.unpack1("n") > 9999
+
     coeff = coeff * 10_000 + gb.unpack1("n")
   end
   [render_decimal((fb.getbyte(0) & 1) != 0, scb.unpack1("n"), coeff), pos]
@@ -4120,9 +4242,11 @@ end
 # each page is page_type 4, carries item_count payload bytes, chained via next_page (0 terminates).
 def read_overflow_chain(first, len, fetch)
   out = +"".b
+  seen = Set.new
   p = first
   while out.bytesize < len
     raise "overflow chain ended before the value length" if p.zero?
+    raise "overflow chain revisits a page" unless seen.add?(p)
 
     pg = fetch.call(p)
     raise "expected an overflow page" unless pg[:type] == PAGE_OVERFLOW
@@ -4393,7 +4517,11 @@ end
 def parse_pax_leaf(payload, n, cols)
   pos = 0
   key_end = (0...n).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
+  raise "PAX leaf key directory not ascending" unless key_end.each_cons(2).all? { |a, b| a <= b }
+
   key_blob = pos
+  raise "PAX leaf key blob overruns page" if key_blob + (key_end.last || 0) > payload.bytesize
+
   keys = (0...n).map do |i|
     lo = i.zero? ? 0 : key_end[i - 1]
     payload.byteslice(key_blob + lo, key_end[i] - lo)
@@ -4450,9 +4578,11 @@ end
 # built. An external value's chain is followed through `fetch` (large-values.md §12).
 def read_tree_rows(image, ps, root_page, columns)
   rows = []
+  seen = Set.new
   fetch = ->(p) { read_page(image, ps, p) }
   walk = lambda do |idx|
     return if idx.zero?
+    raise "B-tree page reached twice" unless seen.add?(idx)
 
     pg = read_page(image, ps, idx)
     case pg[:type]
@@ -4478,8 +4608,10 @@ end
 # alone (format.md "Index trees"); interior separators are routing copies, not entries.
 def read_tree_keys(image, ps, root_page)
   keys = []
+  seen = Set.new
   walk = lambda do |idx|
     return if idx.zero?
+    raise "B-tree page reached twice" unless seen.add?(idx)
 
     pg = read_page(image, ps, idx)
     case pg[:type]
@@ -4891,6 +5023,15 @@ def verify
             "(disk #{on_disk.bytesize}B vs reference #{reference.bytesize}B)")
     end
 
+    if fx[:reject]
+      begin
+        decode_image(on_disk)
+      rescue RuntimeError
+        next
+      end
+      fail!("#{fx[:file]}: accepted a malformed image")
+    end
+    next if fx[:malformed] # a semantic lie this decoder does not model: the bytes are the check
     if fx[:expected_open_error]
       # Completeness selects the newer root, then semantic free-list validation
       # rejects it; falling back here would conceal a different corruption class.

@@ -860,7 +860,7 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 			if idx.Kind == indexGist {
 				// GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md
 				// §4.1). Serialize the canonical tree, allocating from the same counter.
-				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, func() uint32 { p := nextIndex; nextIndex++; return p })
+				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, int(pageSize)-pageHeader, func() uint32 { p := nextIndex; nextIndex++; return p })
 				if err != nil {
 					return 0, err
 				}
@@ -908,6 +908,9 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 		rowCount, known := s.stores[k].Count()
 		if !known {
 			panic("table stores always carry an exact row count")
+		}
+		if err := checkTableRowCount(rootDataPage[ti], rowCount); err != nil {
+			return 0, err
 		}
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount)...))
 	}
@@ -971,7 +974,7 @@ func (b *pageSink) page(index uint32, pageType byte, itemCount, nextPage uint32,
 // its bytes are a pure function of the set — content-deterministic and cross-core identical (§3).
 // alloc hands out page numbers (a counter for the whole image, the free-list allocator for an
 // incremental commit). Returns the node pages + the root; an empty index returns no pages and root 0.
-func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, alloc func() uint32) ([]gistPage, uint32, error) {
+func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int, alloc func() uint32) ([]gistPage, uint32, error) {
 	// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per WITH column
 	// for an EXCLUDE backing index. A GiST index is always plain-column (columnOrdinals non-nil).
 	ops := gistOpclassesFor(idx.columnOrdinals(), table.Columns)
@@ -994,6 +997,13 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, alloc func()
 		return nil, 0, err
 	}
 	pages, root := serializeGistTree(tree, ops, alloc)
+	// Leaf keys are rebuilt from the stored index, so a corrupt key length can grow a node past its
+	// page, which makePage would otherwise truncate.
+	for _, p := range pages {
+		if len(p.payload) > capacity {
+			return nil, 0, newError(DataCorrupted, "GiST node overflows its page")
+		}
+	}
 	return pages, root, nil
 }
 
@@ -1180,7 +1190,7 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 			if idx.Kind == indexGist {
 				// GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from the
 				// allocator (free-list first), the old tree's pages reclaimed on the next open.
-				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, alloc.take)
+				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, capacity, alloc.take)
 				if err != nil {
 					return incrementalWrite{}, err
 				}
@@ -1227,6 +1237,9 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 		rowCount, known := s.stores[k].Count()
 		if !known {
 			panic("table stores always carry an exact row count")
+		}
+		if err := checkTableRowCount(rootDataPage[ti], rowCount); err != nil {
+			return incrementalWrite{}, err
 		}
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount)...))
 	}
@@ -1471,7 +1484,19 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 	// (v34); the catalog chain and the GiST R-trees it rewrites whole are counted as they are read.
 	live := liveCount{live: mt.livePages}
 	catPage := mt.rootPage
+	catSeen := map[uint32]bool{}
+	// typesChecked records that every composite type registered so far has passed
+	// validateCompositeTypes. A table resolves its column types as it is registered, so the types it
+	// reaches must be known-present and acyclic first (composite.md §3).
+	typesChecked := true
+	// Index stores are keyed by index name alone, so a name repeated across tables would make two
+	// tables share one index tree.
+	indexNames := map[string]bool{}
 	for catPage != 0 {
+		if catSeen[catPage] {
+			return nil, newError(DataCorrupted, "catalog chain revisits a page")
+		}
+		catSeen[catPage] = true
 		block, err := paging.readBlock(catPage)
 		if err != nil {
 			return nil, err
@@ -1498,6 +1523,7 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 					return nil, err
 				}
 				snap.putType(ct)
+				typesChecked = false
 				continue
 			}
 			if kind == 2 {
@@ -1546,6 +1572,32 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Every record costs at least its 4-byte key-directory entry in some leaf, so no table
+			// holds more rows than the file has room for. Checking keeps a corrupt count from sizing
+			// allocations later.
+			if uint64(rowCount) > uint64(mt.pageCount)*uint64((pageSize-pageHeader)/4) {
+				return nil, newError(DataCorrupted, "table row count exceeds the file")
+			}
+			if !typesChecked {
+				if err := snap.validateCompositeTypes(); err != nil {
+					return nil, err
+				}
+				typesChecked = true
+			}
+			for _, c := range table.Columns {
+				if r := c.Type.CompositeRefOf(); r != nil && snap.compositeType(r.Name) == nil {
+					return nil, newError(DataCorrupted, "table "+table.Name+" references unknown type "+r.Name)
+				}
+			}
+			if _, dup := snap.tables[table.Name]; dup {
+				return nil, newError(DataCorrupted, "duplicate table name "+table.Name)
+			}
+			for _, idx := range table.Indexes {
+				if indexNames[idx.Name] {
+					return nil, newError(DataCorrupted, "duplicate index name "+idx.Name)
+				}
+				indexNames[idx.Name] = true
+			}
 			name := table.Name
 			hasPK := len(table.PKIndices()) > 0
 			snap.putTable(table, uint32(pageSize))
@@ -1569,7 +1621,14 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 					if err != nil {
 						return nil, err
 					}
-					store.BumpRowidTo(decodeInt(scalarInt64, keys[len(keys)-1]) + 1)
+					if len(keys) == 0 {
+						return nil, newError(DataCorrupted, "non-empty table tree holds no rows")
+					}
+					last := keys[len(keys)-1]
+					if len(last) != 8 || decodeInt(scalarInt64, last) == math.MaxInt64 {
+						return nil, newError(DataCorrupted, "table rowid key out of range")
+					}
+					store.BumpRowidTo(decodeInt(scalarInt64, last) + 1)
 				}
 			}
 			// The table's index trees (v5): zero-column demand-paged stores of entry keys
@@ -1593,7 +1652,7 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 						}
 						return pg.pageType, pg.itemCount, pg.payload, nil
 					}
-					if err := readGistLeafKeys(read, indexRoots[k], &keys); err != nil {
+					if err := readGistLeafKeys(read, indexRoots[k], &keys, map[uint32]bool{}, 1); err != nil {
 						return nil, err
 					}
 					for _, key := range keys {
@@ -1639,6 +1698,9 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 	// Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
 	// reference (spec/design/composite.md §3).
 	if err := snap.validateCompositeTypes(); err != nil {
+		return nil, err
+	}
+	if err := validateLoadedReferences(snap); err != nil {
 		return nil, err
 	}
 	// Views (v38): structural checks only — the bodies are parsed, never planned (views.md §3).
@@ -1706,7 +1768,14 @@ func anySpillable(colTypes []colType) bool {
 // decodes each non-null variable-width span lazily and follows its chains by HEADERS only
 // (chainPages — large-values.md §14), so opening a file never materializes or decompresses a large
 // value.
-func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached map[uint32]bool) error {
+func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
+	if depth > maxTreeDepth {
+		return newError(DataCorrupted, "B-tree deeper than any valid tree")
+	}
+	if seen[pageIdx] {
+		return newError(DataCorrupted, "B-tree page reached twice")
+	}
+	seen[pageIdx] = true
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
 		return err
@@ -1752,6 +1821,9 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 		return nil
 	case pageInterior:
 		n := int(pg.itemCount)
+		if 8*n+4 > len(pg.payload) {
+			return newError(DataCorrupted, "B-tree interior item count overruns page")
+		}
 		pos := 0
 		cps := make([]uint32, 0, n+1)
 		for i := 0; i < n+1; i++ {
@@ -1762,7 +1834,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 			cps = append(cps, cp)
 		}
 		for _, cp := range cps {
-			if err := collectLeafOverflow(paging, cp, colTypes, reached); err != nil {
+			if err := collectLeafOverflow(paging, cp, colTypes, reached, seen, depth+1); err != nil {
 				return err
 			}
 		}
@@ -1786,6 +1858,9 @@ func (s *snapshot) reachablePages(paging *sharedPaging, catRoot uint32) (map[uin
 	// The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
 	// what compaction reclaims).
 	for p := catRoot; p != 0; {
+		if reached[p] {
+			return nil, newError(DataCorrupted, "catalog chain revisits a page")
+		}
 		reached[p] = true
 		block, err := paging.pgr.readBlock(p)
 		if err != nil {
@@ -1805,7 +1880,7 @@ func (s *snapshot) reachablePages(paging *sharedPaging, catRoot uint32) (map[uin
 		root := st.treeRoot()
 		collectTreePages(root, reached)
 		if root != nil && root.page != 0 && anySpillable(st.colTypes) {
-			if err := collectLeafOverflow(paging, root.page, st.colTypes, reached); err != nil {
+			if err := collectLeafOverflow(paging, root.page, st.colTypes, reached, map[uint32]bool{}, 1); err != nil {
 				return nil, err
 			}
 		}
@@ -2212,7 +2287,7 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, wr
 // has no interior parent to hold an OnDisk reference, so the root leaf is faulted resident
 // (spec/design/pager.md §1/§4).
 func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode, error) {
-	c, err := readSkeletonNode(paging, root, colTypes)
+	c, _, err := readSkeletonNode(paging, root, colTypes, map[uint32]bool{}, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -2236,28 +2311,44 @@ func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode
 // The cost: the first child of each bottom-level interior is still read (to classify the level), i.e.
 // ~leaves/fanout leaf reads, negligible beside the former per-leaf walk. A corrupt leaf is now
 // surfaced at fault rather than at open (still XX001, never wrong rows — spec/design/storage.md §7);
-// the interior spine is still CRC-validated here at open.
-func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType) (childRef, error) {
+// the interior spine is still CRC-validated here at open. seen holds the interior pages already
+// read: a tree is acyclic and no interior has two parents, so a repeat is a misdirected pointer
+// (data_corrupted) rather than a reason to recurse without bound. The returned height (1 for a leaf)
+// lets each interior check that its resolved children sit at one depth, the invariant the scan and
+// rebalance code relies on.
+func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, seen map[uint32]bool, depth int) (childRef, int, error) {
+	if depth > maxTreeDepth {
+		return childRef{}, 0, newError(DataCorrupted, "B-tree deeper than any valid tree")
+	}
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
-		return childRef{}, err
+		return childRef{}, 0, err
 	}
 	pg, err := parsePage(block)
 	if err != nil {
-		return childRef{}, err
+		return childRef{}, 0, err
 	}
 	switch pg.pageType {
 	case pageLeaf:
-		return onDiskRef(pageIdx), nil
+		return onDiskRef(pageIdx), 1, nil
 	case pageInterior:
+		if seen[pageIdx] {
+			return childRef{}, 0, newError(DataCorrupted, "B-tree interior page reached twice")
+		}
+		seen[pageIdx] = true
 		n := int(pg.itemCount)
+		// n+1 child pointers plus an n-entry separator directory must fit the payload; checking
+		// first keeps a corrupt count from sizing the allocations below.
+		if 8*n+4 > len(pg.payload) {
+			return childRef{}, 0, newError(DataCorrupted, "B-tree interior item count overruns page")
+		}
 		pos := 0
 		// Child pointers precede the separator directory (format.md "Interior node").
 		childPtrs := make([]uint32, 0, n+1)
 		for i := 0; i < n+1; i++ {
 			cp, err := readU32(pg.payload, &pos)
 			if err != nil {
-				return childRef{}, err
+				return childRef{}, 0, err
 			}
 			childPtrs = append(childPtrs, cp)
 		}
@@ -2265,13 +2356,14 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType) 
 		// Separators carry no values, so no lazy decode and no chains to mark.
 		keys, err := readSeparators(pg.payload, &pos, n)
 		if err != nil {
-			return childRef{}, err
+			return childRef{}, 0, err
 		}
-		// Resolve the first child to classify the level, then avoid reading leaf siblings.
+		// Resolve the first child to classify the level, then avoid reading leaf siblings. A leaf
+		// sibling that is not a leaf is caught when it faults (decodeLeafNode).
 		children := make([]childRef, 0, n+1)
-		first, err := readSkeletonNode(paging, childPtrs[0], colTypes)
+		first, height, err := readSkeletonNode(paging, childPtrs[0], colTypes, seen, depth+1)
 		if err != nil {
-			return childRef{}, err
+			return childRef{}, 0, err
 		}
 		childrenAreLeaves := first.node == nil
 		children = append(children, first)
@@ -2280,15 +2372,18 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType) 
 				children = append(children, onDiskRef(cp)) // a leaf sibling — not read at open
 				continue
 			}
-			child, err := readSkeletonNode(paging, cp, colTypes)
+			child, h, err := readSkeletonNode(paging, cp, colTypes, seen, depth+1)
 			if err != nil {
-				return childRef{}, err
+				return childRef{}, 0, err
+			}
+			if h != height {
+				return childRef{}, 0, newError(DataCorrupted, "B-tree leaves at unequal depths")
 			}
 			children = append(children, child)
 		}
-		return residentRef(&pnode{keys: keys, children: children, page: pageIdx}), nil
+		return residentRef(&pnode{keys: keys, children: children, page: pageIdx}), height + 1, nil
 	default:
-		return childRef{}, newError(DataCorrupted, "expected a B-tree node page")
+		return childRef{}, 0, newError(DataCorrupted, "expected a B-tree node page")
 	}
 }
 
@@ -3029,6 +3124,10 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*compositeType, error) {
 	if err != nil {
 		return nil, err
 	}
+	// CREATE TYPE requires a field; a fieldless type would also give array elements zero-byte bodies.
+	if fieldCount == 0 {
+		return nil, newError(DataCorrupted, "composite type has no fields")
+	}
 	fields := make([]compositeField, 0, fieldCount)
 	for i := uint16(0); i < fieldCount; i++ {
 		fname, err := readString(buf, pos)
@@ -3089,6 +3188,9 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*compositeType, error) {
 			scale, err := readU16(buf, pos)
 			if err != nil {
 				return nil, err
+			}
+			if precision != 0 && (precision > maxPrecision || scale > precision) {
+				return nil, newError(DataCorrupted, "invalid decimal typmod")
 			}
 			if precision != 0 {
 				decimal = &decimalTypmod{Precision: precision, Scale: scale}
@@ -3805,6 +3907,114 @@ func decodeStatisticsEntry(buf []byte, pos *int, s *snapshot, expected map[strin
 		terms.Entries = append(terms.Entries, termStatisticsEntry{Term: term, Rows: rows})
 	default:
 		return newError(DataCorrupted, "unknown statistics entry subkind")
+	}
+	return nil
+}
+
+// validateLoadedReferences checks the catalog facts that need resolved types or span entries, which
+// decodeTableEntry cannot see one entry at a time: primary-key and plain B-tree index columns are
+// keyable, a GIN index covers one column whose type has an operator class, a foreign key names a
+// loaded parent's PK or UNIQUE column set with same-typed columns (constraints.md §6.2), and an
+// exclusion constraint names a GiST index of its own table. The engine never writes a file that
+// breaks these, and the executor relies on them, so a violation is data_corrupted (storage.md §6).
+// Tables are visited in name order so the reported violation is deterministic.
+func validateLoadedReferences(snap *snapshot) error {
+	keys := make([]string, 0, len(snap.tables))
+	for k := range snap.tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		t := snap.tables[k]
+		colTypes := snap.stores[k].colTypes
+		for _, o := range t.PK {
+			if !colTypes[o].keyable() {
+				return newError(DataCorrupted, "primary key column of table "+t.Name+" is not keyable")
+			}
+		}
+		for _, idx := range t.Indexes {
+			if idx.Kind == indexBtree {
+				for _, key := range idx.Keys {
+					if key.Expr == nil && !colTypes[key.Col].keyable() {
+						return newError(DataCorrupted, "index "+idx.Name+" column is not keyable")
+					}
+				}
+			}
+			if idx.Kind == indexGist {
+				for _, key := range idx.Keys {
+					ty := t.Columns[key.Col].Type
+					if _, isRange := ty.RangeElement(); !isRange && !isGistScalarType(ty) {
+						return newError(DataCorrupted, "GiST index "+idx.Name+" column has no operator class")
+					}
+				}
+			}
+			if idx.Kind != indexGin {
+				continue
+			}
+			if len(idx.Keys) != 1 {
+				return newError(DataCorrupted, "GIN index "+idx.Name+" does not have exactly one column")
+			}
+			if _, ok := ginOpclassFor(t.Columns[idx.Keys[0].Col].Type); !ok {
+				return newError(DataCorrupted, "GIN index "+idx.Name+" column has no operator class")
+			}
+		}
+		for _, fk := range t.ForeignKeys {
+			parent, ok := snap.tables[fk.RefTable]
+			if !ok {
+				return newError(DataCorrupted, "foreign key "+fk.Name+" references a missing table")
+			}
+			for i, o := range fk.RefColumns {
+				if o >= len(parent.Columns) {
+					return newError(DataCorrupted, "invalid foreign-key referenced column ordinal")
+				}
+				if !typesEqual(t.Columns[fk.Columns[i]].Type, parent.Columns[o].Type) {
+					return newError(DataCorrupted, "foreign key "+fk.Name+" pairs columns of different types")
+				}
+			}
+			refSet := sortedUnique(fk.RefColumns)
+			matches := len(parent.PK) > 0 && slices.Equal(sortedUnique(parent.PK), refSet)
+			for _, ix := range parent.Indexes {
+				if cols := ix.columnOrdinals(); ix.Unique && cols != nil && slices.Equal(sortedUnique(cols), refSet) {
+					matches = true
+				}
+			}
+			if !matches {
+				return newError(DataCorrupted, "foreign key "+fk.Name+" does not reference a unique key")
+			}
+		}
+		for _, ex := range t.Exclusions {
+			var backing *indexDef
+			for i := range t.Indexes {
+				if t.Indexes[i].Name == ex.Index && t.Indexes[i].Kind == indexGist {
+					backing = &t.Indexes[i]
+					break
+				}
+			}
+			if backing == nil {
+				return newError(DataCorrupted, "exclusion constraint "+ex.Name+" has no backing GiST index")
+			}
+			cols := backing.columnOrdinals()
+			matches := len(cols) == len(ex.Elements)
+			for i := 0; matches && i < len(cols); i++ {
+				el := ex.Elements[i]
+				_, isRange := t.Columns[el.Column].Type.RangeElement()
+				fits := (el.Op == exclOverlaps && isRange) || (el.Op == exclEqual && isGistScalarType(t.Columns[el.Column].Type))
+				matches = el.Column == cols[i] && fits
+			}
+			if !matches {
+				return newError(DataCorrupted, "exclusion constraint "+ex.Name+" does not match its backing GiST index")
+			}
+		}
+	}
+	return nil
+}
+
+// checkTableRowCount rejects a row count that disagrees with its tree before tableEntryBytes asserts
+// it. The engine maintains the count exactly, so a disagreement here means the count restored from
+// the catalog did not match the leaves it described: a corrupt or misdirected page (storage.md §6).
+func checkTableRowCount(rootDataPage uint32, rowCount int64) error {
+	if rowCount < 0 || (rootDataPage == 0) != (rowCount == 0) {
+		return newError(DataCorrupted, "table row count disagrees with its tree")
 	}
 	return nil
 }
@@ -4750,6 +4960,9 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			if err != nil {
 				return nil, 0, nil, err
 			}
+			if precision != 0 && (precision > maxPrecision || scale > precision) {
+				return nil, 0, nil, newError(DataCorrupted, "invalid decimal typmod")
+			}
 			if precision != 0 {
 				decimal = &decimalTypmod{Precision: precision, Scale: scale}
 			}
@@ -5317,12 +5530,17 @@ func resolveUnfetchedSelf(u *Unfetched) (Value, error) {
 // chains with this, so opening a file never materializes its large values.
 func chainPages(first uint32, length int, fetch func(uint32) ([]byte, error)) ([]uint32, error) {
 	var out []uint32
+	seen := map[uint32]bool{}
 	gathered := 0
 	p := first
 	for gathered < length {
 		if p == 0 {
 			return nil, newError(DataCorrupted, "overflow chain ended before the value length")
 		}
+		if seen[p] {
+			return nil, newError(DataCorrupted, "overflow chain revisits a page")
+		}
+		seen[p] = true
 		out = append(out, p)
 		block, err := fetch(p)
 		if err != nil {
@@ -5540,6 +5758,13 @@ func readRangeBody(elem colType, buf []byte, pos *int, mode decodeMode) (Value, 
 	if !mode.constructs() {
 		return NullValue(), nil
 	}
+	// A stored range is canonical and non-empty, so finite bounds are ordered; the range operators
+	// assume it.
+	if lower != nil && upper != nil {
+		if c := rangeElemCmp(*lower, *upper); c > 0 || (c == 0 && (flags&0x18 != 0x18)) {
+			return Value{}, newError(DataCorrupted, "range bounds are out of order")
+		}
+	}
 	return RangeValue(&RangeVal{
 		Empty:    false,
 		Lower:    lower,
@@ -5592,6 +5817,9 @@ func readArrayBody(ty colType, buf []byte, pos *int, mode decodeMode) (Value, er
 		if err != nil {
 			return Value{}, err
 		}
+		if ub := int64(int32(lb)) + int64(ln) - 1; ub > math.MaxInt32 || ub < math.MinInt32 {
+			return Value{}, newError(DataCorrupted, "array dimension bounds out of range")
+		}
 		dims[d] = int(ln)
 		lbounds[d] = int32(lb)
 		n *= int(ln)
@@ -5609,12 +5837,12 @@ func readArrayBody(ty colType, buf []byte, pos *int, mode decodeMode) (Value, er
 	}
 	var elems []Value
 	if mode.constructs() {
-		elems = make([]Value, n)
+		elems = make([]Value, 0, min(n, decodePreallocCap))
 	}
 	for i := 0; i < n; i++ {
 		if hasNulls && bitmap[i/8]&(0x80>>uint(i%8)) != 0 {
 			if mode.constructs() {
-				elems[i] = NullValue()
+				elems = append(elems, NullValue())
 			}
 		} else {
 			v, err := readInlineBody(*ty.Elem, buf, pos, mode) // advance in both modes
@@ -5622,7 +5850,7 @@ func readArrayBody(ty colType, buf []byte, pos *int, mode decodeMode) (Value, er
 				return Value{}, err
 			}
 			if mode.constructs() {
-				elems[i] = v
+				elems = append(elems, v)
 			}
 		}
 	}
@@ -5810,6 +6038,10 @@ func readInlineScalar(ty scalarType, buf []byte, pos *int, mode decodeMode) (Val
 		micros := int64(uint64(ub[0])<<56 | uint64(ub[1])<<48 | uint64(ub[2])<<40 | uint64(ub[3])<<32 |
 			uint64(ub[4])<<24 | uint64(ub[5])<<16 | uint64(ub[6])<<8 | uint64(ub[7]))
 		return IntervalValue(Interval{Months: months, Days: days, Micros: micros}), nil
+	case ty == scalarJsonPath:
+		// A jsonpath type code is legal in a catalog (a composite field, an array element), but no
+		// stored body holds one, and it has no width to read.
+		return Value{}, newError(DataCorrupted, "a stored body holds a jsonpath value")
 	default:
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {
@@ -5844,6 +6076,9 @@ func decodeDecimalBody(buf []byte, pos *int, mode decodeMode) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		if g > 9999 {
+			return Value{}, newError(DataCorrupted, "decimal digit group out of range")
+		}
 		if mode.constructs() {
 			groups[i] = g
 		}
@@ -5859,12 +6094,17 @@ func decodeDecimalBody(buf []byte, pos *int, mode decodeMode) (Value, error) {
 // and chains via nextPage (0 terminates). Every visited page is appended to *visited (the free-list
 // reachability walk). fetch returns a page's full block by index.
 func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, error), visited *[]uint32) ([]byte, error) {
-	out := make([]byte, 0, length)
+	out := make([]byte, 0, min(length, decodePreallocCap))
+	seen := map[uint32]bool{}
 	p := first
 	for len(out) < length {
 		if p == 0 {
 			return nil, newError(DataCorrupted, "overflow chain ended before the value length")
 		}
+		if seen[p] {
+			return nil, newError(DataCorrupted, "overflow chain revisits a page")
+		}
+		seen[p] = true
 		*visited = append(*visited, p)
 		block, err := fetch(p)
 		if err != nil {
@@ -5887,10 +6127,21 @@ func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, err
 	return out, nil
 }
 
+// decodePreallocCap bounds a capacity hint taken from a stored length or count. The stored value is
+// only validated as the bytes behind it are read, so trusting it up front would let one corrupt field
+// size an allocation of gigabytes; past the cap, buffers grow as the data actually arrives.
+const decodePreallocCap = 1 << 16
+
+// maxTreeDepth bounds the recursive walks over a stored B-tree or GiST tree (root = depth 1). A real
+// tree is far shallower, even with the occasional 0-key interior; the bound keeps a forged chain of
+// interiors from exhausting a fixed native stack, and every core stops at the same depth.
+const maxTreeDepth = 256
+
 // --- bounds-checked big-endian readers over a payload cursor ---
 
 func take(buf []byte, pos *int, n int) ([]byte, error) {
-	if *pos+n > len(buf) {
+	// n comes from a stored length; a huge one converts negative, and *pos+n could wrap.
+	if n < 0 || n > len(buf)-*pos {
 		return nil, newError(DataCorrupted, "unexpected end of page data")
 	}
 	s := buf[*pos : *pos+n]

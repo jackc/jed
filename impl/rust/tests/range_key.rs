@@ -26,7 +26,7 @@ fn i32r(lo: Option<i32>, hi: Option<i32>) -> RangeVal {
 }
 
 fn enc(rv: &RangeVal) -> Vec<u8> {
-    encode_range_key(ScalarType::Int32, rv)
+    encode_range_key(ScalarType::Int32, rv).unwrap()
 }
 
 /// The byte layout is exactly the §2.11 worked vectors (i32 element = 4-byte `int-be-signflip`).
@@ -88,7 +88,7 @@ fn inclusivity_tiebreak() {
         lower_inc: lo_inc,
         upper_inc: hi_inc,
     };
-    let enc_n = |rv: &RangeVal| encode_range_key(ScalarType::Decimal, rv);
+    let enc_n = |rv: &RangeVal| encode_range_key(ScalarType::Decimal, rv).unwrap();
     // [1,2) < (1,2)  (inclusive lower sorts before exclusive lower)
     assert!(enc_n(&numr(true, false)) < enc_n(&numr(false, false)));
     // (1,2) < (1,2]  (exclusive upper sorts before inclusive upper)
@@ -113,7 +113,7 @@ fn decimal_bound_scale_independence() {
     };
     // 1.5 (digits "15", scale 1) and 1.50 (digits "150", scale 2) are equal → same key
     assert_eq!(
-        encode_range_key(ScalarType::Decimal, &r(dec("15", 1))),
-        encode_range_key(ScalarType::Decimal, &r(dec("150", 2))),
+        encode_range_key(ScalarType::Decimal, &r(dec("15", 1))).unwrap(),
+        encode_range_key(ScalarType::Decimal, &r(dec("150", 2))).unwrap(),
     );
 }

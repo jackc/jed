@@ -1217,6 +1217,9 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				at += 1 + ty.WidthBytes()
 			}
 		}
+		if at > len(ekey) {
+			return nil // a short entry names no row
+		}
 		return ekey[at:]
 	}
 	scanIndexInterval := func(nameKey string, b keyBound, prefixLen int, suffix []scalarType, charge bool) (bool, error) {
@@ -1242,7 +1245,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				return false, err
 			}
 			if !ok {
-				panic("an index entry references a stored row")
+				return false, newError(DataCorrupted, "an index entry references a stored row")
 			}
 			meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 			keepGoing, err = visitRow(row, true, -1)
@@ -1353,7 +1356,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 						return selectResult{}, err
 					}
 					if !ok {
-						panic("an opclass entry references a stored row")
+						return selectResult{}, newError(DataCorrupted, "an opclass entry references a stored row")
 					}
 					meter.Charge(costs.PageRead*int64(n) + costs.ValueDecompress*int64(sl))
 				}
@@ -1531,13 +1534,16 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 			// Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3):
 			// the entry key is `<index columns> ‖ storage_key`, and storage_key is exactly
 			// io.pkWidth bytes — so the suffix is the row's storage key with no prefix parse.
-			rowKey := ekey[len(ekey)-io.pkWidth:]
+			var rowKey []byte // a short entry names no row
+			if len(ekey) >= io.pkWidth {
+				rowKey = ekey[len(ekey)-io.pkWidth:]
+			}
 			row, ok, n, sl, err := store.GetWithUnits(rowKey, plan.relMasks[0])
 			if err != nil {
 				return false, err
 			}
 			if !ok {
-				panic("an index entry references a stored row")
+				return false, newError(DataCorrupted, "an index entry references a stored row")
 			}
 			meter.Charge(costs.PageRead*int64(n) + costs.ValueDecompress*int64(sl) + costs.StorageRowRead)
 			row, err = store.resolveColumns(row, plan.relMasks[0])

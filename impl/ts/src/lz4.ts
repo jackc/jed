@@ -92,7 +92,11 @@ function corrupt(msg: string): Error {
 
 // lz4Decompress decodes comp to exactly rawLen bytes or fails data_corrupted (lz4.md §3).
 export function lz4Decompress(comp: Uint8Array, rawLen: number): Uint8Array {
-  const out = new Uint8Array(rawLen);
+  // No block expands more than 255x (a match-length extension byte adds at most 255 bytes), so this
+  // is rawLen for any valid block and keeps a corrupt rawLen from sizing the buffer; a block that
+  // would decode past it cannot reach rawLen and is caught below.
+  const limit = Math.min(rawLen, 255 * comp.length + 16);
+  const out = new Uint8Array(limit);
   let o = 0; // bytes decoded so far
   let i = 0;
   const n = comp.length;
@@ -111,7 +115,7 @@ export function lz4Decompress(comp: Uint8Array, rawLen: number): Uint8Array {
       }
     }
     if (i + lit > n) throw corrupt("truncated compressed block");
-    if (o + lit > rawLen) throw corrupt("decompressed length overflow");
+    if (o + lit > limit) throw corrupt("decompressed length overflow");
     out.set(comp.subarray(i, i + lit), o);
     o += lit;
     i += lit;
@@ -131,7 +135,7 @@ export function lz4Decompress(comp: Uint8Array, rawLen: number): Uint8Array {
       }
     }
     ml += MIN_MATCH;
-    if (o + ml > rawLen) throw corrupt("decompressed length overflow");
+    if (o + ml > limit) throw corrupt("decompressed length overflow");
     const from = o - offset;
     for (let k = 0; k < ml; k++) {
       // Byte-by-byte ascending: an overlapping match replicates the run (lz4.md §3).

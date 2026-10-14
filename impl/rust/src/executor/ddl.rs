@@ -4817,10 +4817,11 @@ impl Engine {
         // the built tree's shape across cores.
         entries.sort_unstable();
         for ek in entries {
-            assert!(
-                istore.insert(ek, Vec::new())?,
-                "index entry keys are unique (storage-key suffix)"
-            );
+            if !istore.insert(ek, Vec::new())? {
+                return Err(crate::error::EngineError::data_corrupted(
+                    "index entry keys are unique (storage-key suffix)",
+                ));
+            }
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,

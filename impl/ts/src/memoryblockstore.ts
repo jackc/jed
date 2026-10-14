@@ -7,6 +7,7 @@
 // Browser-clean: no node:* imports.
 
 import type { BlockStore } from "./blockstore.ts";
+import { engineError } from "./errors.ts";
 
 export class MemoryBlockStore implements BlockStore {
   private bytes: Uint8Array;
@@ -18,7 +19,9 @@ export class MemoryBlockStore implements BlockStore {
   readAt(offset: number, len: number): Uint8Array {
     this.checkOffset(offset);
     if (len < 0 || offset + len > this.bytes.length) {
-      throw new Error("I/O error: short read in memory block store");
+      // A page id past the end is a misdirected pointer in the image; like a file host's short read
+      // it is the host's I/O error (58030), never a bare Error.
+      throw engineError("io_error", "I/O error: short read in memory block store");
     }
     return this.bytes.slice(offset, offset + len);
   }
@@ -48,7 +51,7 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   private checkOffset(offset: number): void {
-    if (offset < 0) throw new Error("I/O error: negative memory block store offset");
+    if (offset < 0) throw engineError("io_error", "I/O error: negative memory block store offset");
   }
 
   private resize(size: number): void {

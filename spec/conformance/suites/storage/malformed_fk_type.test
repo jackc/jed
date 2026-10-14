@@ -1,0 +1,6 @@
+# Malformed catalog: a foreign key pairing an i64 column with an i32 key (storage.md §6;
+# constraints.md §6.2). Ruby-forged (verify.rb MALFORMED_FIXTURES); every page is well formed, but the
+# engine never writes this pairing and its key probes assume it, so open rejects it as XX001.
+# requires: harness.fixture_open, harness.fixture_open_error
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_fk_type.jed error XX001

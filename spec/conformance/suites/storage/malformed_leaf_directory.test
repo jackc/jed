@@ -1,0 +1,16 @@
+# Malformed page: a CRC-valid leaf whose key directory runs past the page (storage.md §6).
+# Ruby-forged (verify.rb MALFORMED_FIXTURES): the 20-row t spans two leaves; the second leaf's first
+# key-directory end offset is 0xFFFFFFF0 and its checksum is resealed, so only the structural check
+# can catch it. Leaves fault on first touch, so the database opens and the intact leaf still serves;
+# reading the bad leaf is XX001, never a crash or wrong rows.
+# requires: harness.fixture_open, query.select, query.where_eq, query.order_by, types.i32, types.i16
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_leaf_directory.jed
+
+query I nosort
+SELECT v FROM t WHERE id = 1
+----
+10
+
+statement error XX001
+SELECT id, v FROM t ORDER BY id

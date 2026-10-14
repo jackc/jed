@@ -16,7 +16,8 @@ import type { BlockStore } from "./blockstore.ts";
 import type { ColType } from "./catalog.ts";
 import type { PNode } from "./pmap.ts";
 import { BufferPool } from "./bufferpool.ts";
-import { decodeLeafNode } from "./format.ts";
+import { engineError } from "./errors.ts";
+import { decodeLeafNode, sameLeafShape } from "./format.ts";
 import type { CommitFault, Pager } from "./pager.ts";
 
 // DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
@@ -57,9 +58,15 @@ export class SharedPaging {
     // columns a query touches through readBlock below; `this` is stamped into each deferred
     // external value so a touched-set miss self-resolves (the B4 demand-fault backstop,
     // format.ts resolveUnfetchedSelf).
-    return this.pool.getOrLoad(page, () =>
+    const node = this.pool.getOrLoad(page, () =>
       decodeLeafNode(this.pager.readBlock(page), page, colTypes, this),
     );
+    // The pool is keyed by page alone, so a pointer into another tree's leaf can return a node
+    // decoded for that tree's columns. Its directories were validated against those columns, not
+    // these, so serving it would index regions that do not exist (storage.md §7).
+    if (!sameLeafShape(node.packed!.colTypes, colTypes))
+      throw engineError("data_corrupted", "leaf page belongs to a different tree");
+    return node;
   }
 
   // readBlock reads one page through the pager — the demand-paged loader reads the meta, catalog, and

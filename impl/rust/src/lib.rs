@@ -990,6 +990,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
     // §12/§14, spec/design/conformance.md). Reconstructed in memory via `Engine::from_image`.
     "harness.fixture_open",
+    // The `# fixture: <path> error <SQLSTATE>` form: opening the pre-built image must FAIL with that
+    // SQLSTATE and the file runs no records — the open-time half of the malformed-page regressions
+    // (spec/design/storage.md §6).
+    "harness.fixture_open_error",
     // The `# attach: <name>` directive attaches a fresh empty read-write in-memory database to the
     // running handle before the records run, so the corpus can populate + join across attachments
     // (spec/design/attached-databases.md §6). In-memory attachments cannot survive the disk reopen, so

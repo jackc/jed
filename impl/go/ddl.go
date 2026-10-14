@@ -3717,7 +3717,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, err
 		}
 		if !inserted {
-			panic("index entry keys are unique (storage-key suffix)")
+			return outcome{}, newError(DataCorrupted, "index entry keys are unique (storage-key suffix)")
 		}
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil

@@ -593,8 +593,17 @@ func gistCollectLeafKeys(node *gistNode, ops []gistOpclass, out *[][]byte) {
 // readGistLeafKeys walks a persisted GiST R-tree (rooted at root, page types 5/6), collecting each
 // leaf's leaf key (bound ‖ skey — the tuple's self-delimiting bound bytes concatenated with the
 // storage key). OPCLASS-AGNOSTIC: the whole bound blob is copied verbatim (single- or multi-column),
-// so no element type is needed. read returns one page's (pageType, itemCount, payload).
-func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo uint32, out *[][]byte) error {
+// so no element type is needed. read returns one page's (pageType, itemCount, payload). seen holds
+// the pages already walked: a page reached twice is a misdirected child pointer (data_corrupted), not
+// a reason to recurse without bound.
+func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo uint32, out *[][]byte, seen map[uint32]bool, depth int) error {
+	if depth > maxTreeDepth {
+		return newError(DataCorrupted, "GiST tree deeper than any valid tree")
+	}
+	if seen[pageNo] {
+		return newError(DataCorrupted, "GiST page reached twice")
+	}
+	seen[pageNo] = true
 	pageType, n, payload, err := read(pageNo)
 	if err != nil {
 		return err
@@ -624,6 +633,11 @@ func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo ui
 		}
 		return nil
 	case pageGistInterior:
+		// Each entry is at least a u16 bound length and a u32 child pointer; checking first keeps a
+		// corrupt count from sizing the allocation.
+		if uint64(n)*6 > uint64(len(payload)) {
+			return newError(DataCorrupted, "GiST interior item count overruns page")
+		}
 		children := make([]uint32, 0, n)
 		for i := uint32(0); i < n; i++ {
 			blen, err := gistReadU16(payload, &pos)
@@ -640,7 +654,7 @@ func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo ui
 			children = append(children, cp)
 		}
 		for _, cp := range children {
-			if err := readGistLeafKeys(read, cp, out); err != nil {
+			if err := readGistLeafKeys(read, cp, out, seen, depth+1); err != nil {
 				return err
 			}
 		}

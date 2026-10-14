@@ -1443,7 +1443,11 @@ func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType,
 				at += 1 + ty.WidthBytes()
 			}
 		}
-		rowKey := e.Key[at:]
+		// A short entry (a page that disagrees with its index) yields an empty key, which names no row.
+		var rowKey []byte
+		if at <= len(e.Key) {
+			rowKey = e.Key[at:]
+		}
 		row, ok, n, sl, err := store.GetWithUnits(rowKey, mask)
 		if err != nil {
 			return nil, 0, 0, err
@@ -1451,7 +1455,7 @@ func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType,
 		pages += n
 		slabs += sl
 		if !ok {
-			panic("an index entry references a stored row")
+			return nil, 0, 0, newError(DataCorrupted, "an index entry references a stored row")
 		}
 		out = append(out, entry{Key: append([]byte(nil), rowKey...), Row: row})
 	}
@@ -1933,7 +1937,7 @@ func (db *engine) ginGather(store *tableStore, gb *ginBoundPlan, terms [][]byte,
 		pages += n
 		slabs += sl
 		if !ok {
-			panic("a GIN entry references a stored row")
+			return nil, 0, 0, newError(DataCorrupted, "a GIN entry references a stored row")
 		}
 		out = append(out, entry{Key: key, Row: row})
 	}
@@ -2104,7 +2108,7 @@ func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 		pages += n
 		slabs += sl
 		if !ok {
-			panic("a GiST entry references a stored row")
+			return nil, 0, 0, newError(DataCorrupted, "a GiST entry references a stored row")
 		}
 		out = append(out, entry{Key: key, Row: row})
 	}

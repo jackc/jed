@@ -57,7 +57,7 @@ func newSharedPaging(p *pager, capacity int) *sharedPaging {
 // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
 // with a caller-supplied decoder is consistent (pager.md §4).
 func (s *sharedPaging) faultLeaf(page uint32, colTypes []colType) (*pnode, error) {
-	return s.pool.getOrLoad(page, func() (*pnode, error) {
+	node, err := s.pool.getOrLoad(page, func() (*pnode, error) {
 		block, err := s.readBlock(page)
 		if err != nil {
 			return nil, err
@@ -68,6 +68,61 @@ func (s *sharedPaging) faultLeaf(page uint32, colTypes []colType) (*pnode, error
 		// missed self-resolves through the paging handle stamped here (bplus-reshape.md §5, B4).
 		return decodeLeafNode(block, page, colTypes, s)
 	})
+	if err != nil {
+		return nil, err
+	}
+	// The pool is keyed by page alone, so a pointer into another tree's leaf can return a node
+	// decoded for that tree's columns. Its directories were validated against those columns, not
+	// these, so serving it would index regions that do not exist (storage.md §6).
+	if !sameLeafShape(node.packed.colTypes, colTypes) {
+		return nil, newError(DataCorrupted, "leaf page belongs to a different tree")
+	}
+	return node, nil
+}
+
+// sameLeafShape reports whether a leaf decoded for columns a can be read as columns b: the same
+// column count and, per column, the same value codec. A same-width leaf of another type (bytea served
+// as text) would stay in bounds here but reach the encoders and comparators as the wrong kind.
+func sameLeafShape(a, b []colType) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 || &a[0] == &b[0] {
+		return true
+	}
+	for i := range a {
+		if !sameValueCodec(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameValueCodec compares two column types by their stored value codec: the scalar, array element,
+// range element, or composite fields, recursively. Names, typmods, and nullability do not change the
+// stored bytes, so they are ignored.
+func sameValueCodec(a, b colType) bool {
+	if a.Composite != b.Composite || (a.Elem == nil) != (b.Elem == nil) || (a.RangeElem == nil) != (b.RangeElem == nil) {
+		return false
+	}
+	switch {
+	case a.Composite:
+		if len(a.Fields) != len(b.Fields) {
+			return false
+		}
+		for i := range a.Fields {
+			if !sameValueCodec(a.Fields[i].Type, b.Fields[i].Type) {
+				return false
+			}
+		}
+		return true
+	case a.Elem != nil:
+		return sameValueCodec(*a.Elem, *b.Elem)
+	case a.RangeElem != nil:
+		return sameValueCodec(*a.RangeElem, *b.RangeElem)
+	default:
+		return a.Scalar == b.Scalar
+	}
 }
 
 // readBlock reads one page through the shared pager under the pager lock — the overflow-chain read

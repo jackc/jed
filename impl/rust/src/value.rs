@@ -354,7 +354,7 @@ impl ArrayVal {
 
     /// The per-dimension upper bound `lb + len - 1` for dimension `d`.
     pub fn ubound(&self, d: usize) -> i32 {
-        self.lbounds[d] + self.dims[d] as i32 - 1
+        (self.lbounds[d] as i64 + self.dims[d] as i64 - 1) as i32
     }
 }
 

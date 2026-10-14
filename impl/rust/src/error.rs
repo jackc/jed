@@ -75,6 +75,12 @@ impl EngineError {
         self.state.code()
     }
 
+    /// `XX001` data_corrupted: persisted state that disagrees with itself (storage.md §7) — e.g. an
+    /// index entry naming a row the table does not hold. Such a file must fail closed, not panic.
+    pub(crate) fn data_corrupted(message: impl Into<String>) -> Self {
+        EngineError::new(SqlState::DataCorrupted, message)
+    }
+
     // --- structured-field builders (spec/design/error-fields.md §5) -----------------
     // Chainable setters. `new()` leaves every field `None`, so existing call sites are
     // unaffected; only the raise sites that know an identifier opt in.

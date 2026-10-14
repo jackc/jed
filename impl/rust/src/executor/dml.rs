@@ -1987,10 +1987,11 @@ impl Engine {
                     None => None,
                     Some((ekey, _)) => {
                         let suffix = ekey[ak.len()..].to_vec();
-                        let row = self
-                            .store(table)
-                            .get(&suffix)?
-                            .expect("a unique-index entry points at a live row");
+                        let row = self.store(table).get(&suffix)?.ok_or_else(|| {
+                            crate::error::EngineError::data_corrupted(
+                                "a unique-index entry points at a live row",
+                            )
+                        })?;
                         Some((suffix, row))
                     }
                 }
@@ -2446,20 +2447,22 @@ impl Engine {
         for (k, def) in indexes.iter().enumerate() {
             let istore = self.index_store_mut(&def.name.to_string());
             for ek in index_adds[k].drain(..) {
-                assert!(
-                    istore.insert(ek, Vec::new())?,
-                    "index entry keys are unique (storage-key suffix)"
-                );
+                if !istore.insert(ek, Vec::new())? {
+                    return Err(crate::error::EngineError::data_corrupted(
+                        "index entry keys are unique (storage-key suffix)",
+                    ));
+                }
             }
             for (removals, insertions) in index_moves[k].drain(..) {
                 for old_ek in removals {
                     istore.remove(&old_ek)?;
                 }
                 for new_ek in insertions {
-                    assert!(
-                        istore.insert(new_ek, Vec::new())?,
-                        "index entry keys are unique (storage-key suffix)"
-                    );
+                    if !istore.insert(new_ek, Vec::new())? {
+                        return Err(crate::error::EngineError::data_corrupted(
+                            "index entry keys are unique (storage-key suffix)",
+                        ));
+                    }
                 }
             }
         }
@@ -2513,9 +2516,11 @@ impl Engine {
         else {
             return Ok(None);
         };
-        // A matched entry always names a stored row; an empty row stands in should it not, which
-        // only omits the Detail (the 23P01 itself is decided by the match).
-        Ok(Some(self.store(table).get(&first)?.unwrap_or_default()))
+        // A matched entry always names a stored row; one that does not is a corrupt index.
+        let row = self.store(table).get(&first)?.ok_or_else(|| {
+            crate::error::EngineError::data_corrupted("a GiST entry references a stored row")
+        })?;
+        Ok(Some(row))
     }
 
     /// Evaluate the table's CHECK constraints on one candidate row (constraints.md §4.4): TRUE
@@ -3102,7 +3107,9 @@ impl Engine {
                 let child = self
                     .fk_snap(temp)
                     .table(child_name)
-                    .expect("foreign-key child exists")
+                    .ok_or_else(|| {
+                        crate::error::EngineError::data_corrupted("foreign-key child exists")
+                    })?
                     .clone();
                 let mut old_tuples = Vec::new();
                 for (_, row) in rows {
@@ -3177,7 +3184,9 @@ impl Engine {
                 let child = self
                     .fk_snap(temp)
                     .table(child_name)
-                    .expect("foreign-key child exists")
+                    .ok_or_else(|| {
+                        crate::error::EngineError::data_corrupted("foreign-key child exists")
+                    })?
                     .clone();
                 let mut transitions = Vec::new();
                 for (_, _, new_row, old_row) in updates {
@@ -4064,7 +4073,9 @@ impl Engine {
                             None => None,
                         };
                         if let Some(hit) = hit {
-                            let other = self.store(&upd.table).get(&hit)?.unwrap_or_default();
+                            let other = self.store(&upd.table).get(&hit)?.ok_or_else(|| {
+                                EngineError::data_corrupted("a GiST entry references a stored row")
+                            })?;
                             return Err(EngineError::exclusion_violation(&relation, &exc.name)
                                 .with_detail(self.exclusion_detail(
                                     &relation, &tcolumns, exc, new_row, &other, true,
@@ -4250,10 +4261,11 @@ impl Engine {
                         istore.remove(&old_ek)?;
                     }
                     for new_ek in insertions {
-                        assert!(
-                            istore.insert(new_ek, Vec::new())?,
-                            "index entry keys are unique (storage-key suffix)"
-                        );
+                        if !istore.insert(new_ek, Vec::new())? {
+                            return Err(crate::error::EngineError::data_corrupted(
+                                "index entry keys are unique (storage-key suffix)",
+                            ));
+                        }
                     }
                 }
             }

@@ -852,7 +852,9 @@ func encodeKeyValue(ty scalarType, value Value, coll *Collation) ([]byte, error)
 	case ValFloat32:
 		return encodeFloat32Key(uint32(value.Int)), nil
 	default:
-		panic("encodeKeyValue: a non-keyable scalar value (every key site's type passes a keyability gate)")
+		// Every key site's type passes a keyability gate, so a value of another kind came from a page
+		// that disagrees with its column type.
+		return nil, newError(DataCorrupted, "a key value does not match its column type")
 	}
 }
 
@@ -885,13 +887,13 @@ func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
 	if value.Kind == ValRange {
 		elem, ok := ty.RangeElement()
 		if !ok {
-			panic("a range key value has a range column type")
+			return nil, newError(DataCorrupted, "a key value does not match its column type")
 		}
 		return encodeRangeKey(elem.ScalarTy(), value.rangeVal()), nil
 	}
 	if value.Kind == ValArray {
 		if ty.Array == nil {
-			panic("an array key value has an array column type")
+			return nil, newError(DataCorrupted, "a key value does not match its column type")
 		}
 		return encodeArrayKey(ty.Array.ScalarTy(), value.arrayVal(), coll)
 	}
@@ -942,6 +944,11 @@ func encodeColTypeKey(ct colType, value Value, coll *Collation) ([]byte, error) 
 	value, err := residentValue(value)
 	if err != nil {
 		return nil, err
+	}
+	// Writes reject a NULL key member (23502) before encoding, so a NULL here was read from a page
+	// whose null bitmap lies.
+	if value.IsNull() {
+		return nil, newError(DataCorrupted, "a stored key column holds NULL")
 	}
 	switch {
 	case ct.Composite:
@@ -1253,7 +1260,7 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 	snap := db.fkSnap(temp)
 	child, ok := snap.table(childTable)
 	if !ok {
-		panic("foreign-key child exists")
+		return false, newError(DataCorrupted, "foreign-key child exists")
 	}
 	store := snap.store(childTable)
 	if path := fkChooseReversePath(snap, fk, child, parent); path.cols != nil {
@@ -1389,7 +1396,7 @@ func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) 
 	snap := db.fkSnap(t.temp)
 	child, ok := snap.table(childTable)
 	if !ok {
-		panic("foreign-key child exists")
+		return mutationScanBatch{}, newError(DataCorrupted, "foreign-key child exists")
 	}
 	store := snap.store(childTable)
 	path := fkChooseReversePath(snap, t.fk, child, t.parent)

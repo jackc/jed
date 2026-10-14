@@ -8921,7 +8921,7 @@ export class Engine {
   ): boolean {
     const snap = this.fkSnap(temp);
     const child = snap.table(childTable);
-    if (child === undefined) throw new Error("foreign-key child exists");
+    if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
     const store = snap.store(childTable);
     const path = fkChooseReversePath(snap, fk, child, parent);
     if (path !== null) {
@@ -9021,7 +9021,7 @@ export class Engine {
   private fkKeyedScan(t: FkKeyedTarget, childTable: string, mask: boolean[]): MutationScanBatch {
     const snap = this.fkSnap(t.temp);
     const child = snap.table(childTable);
-    if (child === undefined) throw new Error("foreign-key child exists");
+    if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
     const store = snap.store(childTable);
     const path = fkChooseReversePath(snap, t.fk, child, t.parent);
     if (path === null) {
@@ -9404,7 +9404,7 @@ export class Engine {
     entries.sort(compareBytes);
     for (const ek of entries) {
       if (!istore.insert(ek, [])) {
-        throw new Error("index entry keys are unique (storage-key suffix)");
+        throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
       }
     }
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
@@ -10002,7 +10002,8 @@ export class Engine {
       const u = store.getWithUnits(key, mask);
       pages += u.pages;
       slabs += u.slabs;
-      if (u.row === undefined) throw new Error("a GIN entry references a stored row");
+      if (u.row === undefined)
+        throw engineError("data_corrupted", "a GIN entry references a stored row");
       entries.push({ key, row: u.row });
     }
     return { entries, pages, slabs };
@@ -10079,7 +10080,8 @@ export class Engine {
       const u = store.getWithUnits(key, mask);
       pages += u.pages;
       slabs += u.slabs;
-      if (u.row === undefined) throw new Error("a GiST entry references a stored row");
+      if (u.row === undefined)
+        throw engineError("data_corrupted", "a GiST entry references a stored row");
       entries.push({ key, row: u.row });
     }
     return { entries, pages, slabs };
@@ -11397,9 +11399,12 @@ export class Engine {
     if (tree === undefined) return null;
     const first = leastKey(gistSearch(tree, probe.query, probe.strats).keys);
     if (first === null) return null;
-    // A matched entry always names a stored row; an empty row stands in should it not, which only
-    // omits the Detail (the 23P01 itself is decided by the match).
-    return this.lkpStoreScoped(dbScope, table.name).get(first) ?? [];
+    // The engine keeps the tree and the rows in step, so an entry naming no stored row is a corrupt
+    // index (storage.md §7).
+    const other = this.lkpStoreScoped(dbScope, table.name).get(first);
+    if (other === undefined)
+      throw engineError("data_corrupted", "a GiST entry references a stored row");
+    return other;
   }
 
   // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
@@ -11538,7 +11543,8 @@ export class Engine {
     if (entries.length === 0) return null;
     const suffix = entries[0]!.key.slice(ak.length);
     const row = store.get(suffix);
-    if (row === undefined) throw new Error("a unique-index entry points at a live row");
+    if (row === undefined)
+      throw engineError("data_corrupted", "a unique-index entry points at a live row");
     return { key: suffix, row: store.resolveAll(row) };
   }
 
@@ -11988,13 +11994,13 @@ export class Engine {
       const istore = this.writeIndexStore(table.indexes[k]!.name);
       for (const ek of indexAdds[k]!) {
         if (!istore.insert(ek, []))
-          throw new Error("index entry keys are unique (storage-key suffix)");
+          throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
       }
       for (const mv of indexMoves[k]!) {
         for (const oldEk of mv.removals) istore.remove(oldEk);
         for (const newEk of mv.insertions) {
           if (!istore.insert(newEk, []))
-            throw new Error("index entry keys are unique (storage-key suffix)");
+            throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
         }
       }
     }
@@ -12260,7 +12266,7 @@ export class Engine {
       for (const { childTable, fk } of referencers) {
         if (fk.onDelete === "noAction" || fk.onDelete === "restrict") continue;
         const child = this.fkSnap(temp).table(childTable);
-        if (child === undefined) throw new Error("foreign-key child exists");
+        if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
         const oldTuples: Value[][] = [];
         for (const row of rows) {
           if (fkProbe(fk, parent, parentColls, row, fk.refColumns) !== null)
@@ -12314,7 +12320,7 @@ export class Engine {
       for (const { childTable, fk } of referencers) {
         if (fk.onUpdate === "noAction" || fk.onUpdate === "restrict") continue;
         const child = this.fkSnap(temp).table(childTable);
-        if (child === undefined) throw new Error("foreign-key child exists");
+        if (child === undefined) throw engineError("data_corrupted", "foreign-key child exists");
         const transitions: [Value[], Value[]][] = [];
         for (const u of updates) {
           const oldProbe = fkProbe(fk, parent, parentColls, u.oldRow, fk.refColumns);
@@ -12984,7 +12990,9 @@ export class Engine {
                   ),
                 );
           if (hit !== null) {
-            const other = store.get(hit) ?? [];
+            const other = store.get(hit);
+            if (other === undefined)
+              throw engineError("data_corrupted", "a GiST entry references a stored row");
             throw exclusionViolation(table.name, exc.name).withDetail(
               exclusionDetail(this.session, table.name, table.columns, exc, u.row, other, true),
             );
@@ -13131,7 +13139,10 @@ export class Engine {
           for (const oldEk of mv.removals) istore.remove(oldEk);
           for (const newEk of mv.insertions) {
             if (!istore.insert(newEk, [])) {
-              throw new Error("index entry keys are unique (storage-key suffix)");
+              throw engineError(
+                "data_corrupted",
+                "index entry keys are unique (storage-key suffix)",
+              );
             }
           }
         }
@@ -18683,7 +18694,8 @@ export class Engine {
         meter.guard();
         const rowKey = rowKeyFromIndex(entryKey, prefixLen, suffix);
         const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
-        if (u.row === undefined) throw new Error("an index entry references a stored row");
+        if (u.row === undefined)
+          throw engineError("data_corrupted", "an index entry references a stored row");
         meter.charge(COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs));
         more = processRow(u.row, true, -1);
         return more;
@@ -18775,7 +18787,8 @@ export class Engine {
           let row = candidate.row;
           if (row.length === 0) {
             const u = store.getWithUnits(candidate.key, plan.relMasks[0]!);
-            if (u.row === undefined) throw new Error("an opclass entry references a stored row");
+            if (u.row === undefined)
+              throw engineError("data_corrupted", "an opclass entry references a stored row");
             meter.charge(
               COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs),
             );
@@ -18994,9 +19007,13 @@ export class Engine {
         meter.guard(); // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
         // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3): the
         // entry key is `<index columns> ‖ storage_key`, and storage_key is exactly io.pkWidth bytes.
+        // An entry shorter than the suffix is corrupt: it names no row.
+        if (ekey.length < io.pkWidth)
+          throw engineError("data_corrupted", "an index entry references a stored row");
         const rowKey = ekey.slice(ekey.length - io.pkWidth);
         const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
-        if (u.row === undefined) throw new Error("an index entry references a stored row");
+        if (u.row === undefined)
+          throw engineError("data_corrupted", "an index entry references a stored row");
         meter.charge(
           COSTS.pageRead * BigInt(u.pages) +
             COSTS.valueDecompress * BigInt(u.slabs) +
@@ -26301,11 +26318,15 @@ function indexStoreBoundEntries(
     for (const ty of suffixTypes) {
       at += e.key[at] === 0x01 ? 1 : 1 + widthBytes(ty);
     }
+    // An entry too short for its slots is corrupt: it names no row.
+    if (at > e.key.length)
+      throw engineError("data_corrupted", "an index entry references a stored row");
     const rowKey = e.key.slice(at);
     const u = store.getWithUnits(rowKey, mask);
     pages += u.pages;
     slabs += u.slabs;
-    if (u.row === undefined) throw new Error("an index entry references a stored row");
+    if (u.row === undefined)
+      throw engineError("data_corrupted", "an index entry references a stored row");
     rows.push({ key: rowKey, row: u.row });
   }
   return { entries: rows, pages, slabs };
@@ -26362,9 +26383,9 @@ export function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | n
   if (value.kind === "f64") return encodeFloat64Key(value.value);
   if (value.kind === "f32") return encodeFloat32Key(value.value);
   if (value.kind === "unfetched") return encodeKeyValue(ty, resolveUnfetchedSelf(value.ref), coll);
-  throw new Error(
-    "encodeKeyValue: a non-keyable scalar value (every key site's type passes a keyability gate)",
-  );
+  // Every key site's type passes a keyability gate and every write type-checks its values, so a
+  // value of another kind can only come from a stored row that lies about its column (storage.md §7).
+  throw engineError("data_corrupted", "a key value does not match its column type");
 }
 
 // encodeTypedKey is the order-preserving key bytes for one keyable value given its column Type — the
@@ -26377,15 +26398,13 @@ export function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | n
 export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Array {
   value = residentValue(value);
   if (value.kind === "range") {
-    if (ty.kind !== "range") {
-      throw new Error("a range key value has a range column type");
-    }
+    if (ty.kind !== "range")
+      throw engineError("data_corrupted", "a key value does not match its column type");
     return encodeRangeKey(typeScalar(ty.elem), value);
   }
   if (value.kind === "array") {
-    if (ty.kind !== "array") {
-      throw new Error("an array key value has an array column type");
-    }
+    if (ty.kind !== "array")
+      throw engineError("data_corrupted", "a key value does not match its column type");
     return encodeArrayKey(typeScalar(ty.elem), value, coll);
   }
   return encodeKeyValue(typeScalar(ty), value, coll);
@@ -26400,16 +26419,22 @@ export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): 
 // column's collated key form (§2.12/§2.14); it never applies to a composite field.
 export function encodeColTypeKey(ct: ColType, value: Value, coll: Collation | null): Uint8Array {
   value = residentValue(value);
+  // Writes reject a NULL key member (23502) before encoding, so a NULL here is a stored row whose
+  // null bitmap lies (storage.md §7).
+  if (value.kind === "null") throw engineError("data_corrupted", "a stored key column holds NULL");
   if (ct.kind === "composite") {
-    if (value.kind !== "composite") throw new Error("composite ColType requires a composite value");
+    if (value.kind !== "composite")
+      throw engineError("data_corrupted", "a key value does not match its column type");
     return encodeCompositeKey(ct.fields, value.fields);
   }
   if (ct.kind === "range") {
-    if (value.kind !== "range") throw new Error("range ColType requires a range value");
+    if (value.kind !== "range")
+      throw engineError("data_corrupted", "a key value does not match its column type");
     return encodeRangeKey(colTypeScalar(ct.elem), value);
   }
   if (ct.kind === "array") {
-    if (value.kind !== "array") throw new Error("array ColType requires an array value");
+    if (value.kind !== "array")
+      throw engineError("data_corrupted", "a key value does not match its column type");
     return encodeArrayKey(colTypeScalar(ct.elem), value, coll);
   }
   return encodeKeyValue(ct.scalar, value, coll);

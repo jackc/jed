@@ -306,9 +306,18 @@ fn parse_max_storage_bytes_directive(rest: &str) -> Option<(i64, String)> {
     Some((bytes, name))
 }
 
-fn parse_fixture_directive(rest: &str) -> Option<String> {
-    let body = rest.trim_start().strip_prefix("fixture:")?.trim();
-    (!body.is_empty()).then(|| body.to_string())
+/// The form `<path> error <SQLSTATE>` (capability `harness.fixture_open_error`) instead asserts that
+/// opening the image fails with that SQLSTATE — a forged image whose corruption is detected at open —
+/// and the file runs no records. Returns the path and the expected open-error code (`None` for a plain
+/// fixture), or None if not this directive.
+fn parse_fixture_directive(rest: &str) -> Option<(String, Option<String>)> {
+    let body = rest.trim_start().strip_prefix("fixture:")?;
+    let fields: Vec<&str> = body.split_whitespace().collect();
+    match fields.as_slice() {
+        [path] => Some((path.to_string(), None)),
+        [path, "error", code] => Some((path.to_string(), Some(code.to_string()))),
+        _ => None,
+    }
 }
 
 /// Whether a file carries a `# skip: <mode>[ — free-text reason]` directive (spec/design/conformance.md
@@ -352,6 +361,14 @@ fn parse_upgrade_collations_directive(rest: &str) -> bool {
 /// write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 /// read-only-handle error.
 fn open_fixture(rel: &str) -> std::result::Result<Database, String> {
+    open_fixture_image(rel)?.map_err(|e| format!("fixture: open {rel}: {}", e.message))
+}
+
+/// [`open_fixture`]'s open, keeping the engine error: the outer `Err` is a harness failure (the image
+/// could not be read), the inner result is the engine's verdict on the image.
+fn open_fixture_image(
+    rel: &str,
+) -> std::result::Result<std::result::Result<Database, jed::EngineError>, String> {
     let bundle =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
     if let Ok(bytes) = std::fs::read(&bundle) {
@@ -362,7 +379,7 @@ fn open_fixture(rel: &str) -> std::result::Result<Database, String> {
         .join(rel);
     let bytes =
         std::fs::read(&path).map_err(|e| format!("fixture: read {}: {e}", path.display()))?;
-    Database::from_image(&bytes).map_err(|e| format!("fixture: open {rel}: {}", e.message))
+    Ok(Database::from_image(&bytes))
 }
 
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -800,7 +817,20 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             }
             // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Engine::new()`
             // above — appears in the header before any record (spec/design/conformance.md).
-            if let Some(rel) = parse_fixture_directive(rest) {
+            if let Some((rel, want_code)) = parse_fixture_directive(rest) {
+                if let Some(want) = want_code {
+                    // `# fixture: <path> error <SQLSTATE>`: the open itself must fail with that code;
+                    // the file has no records.
+                    return match open_fixture_image(&rel)? {
+                        Ok(_) => Err(format!("fixture {rel} opened, expected error {want}")),
+                        Err(e) if e.code() == want => Ok(()),
+                        Err(e) => Err(format!(
+                            "fixture {rel}: expected open error {want}, got {}: {}",
+                            e.code(),
+                            e.message
+                        )),
+                    };
+                }
                 db = open_fixture(&rel)?;
                 sess = db.session(jed::SessionOptions::default());
                 on_temp = false; // the handle is now the fixture image, not the reopenable temp file
@@ -1107,9 +1137,10 @@ fn rebaseline_file(text: &str) -> Option<String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
-            if let Some(rel) = parse_fixture_directive(rest) {
+            if let Some((rel, _)) = parse_fixture_directive(rest) {
                 // Mirror `run_file`: a fixture file evolves DB state from the pre-built image, not a
-                // fresh DB, so the cost walk sees the same starting state.
+                // fresh DB, so the cost walk sees the same starting state. (An open-error fixture
+                // fails here and the file has no records to walk.)
                 db = open_fixture(&rel).ok()?;
                 sess = db.session(jed::SessionOptions::default());
             } else if let Some(name) = parse_load_timezone_directive(rest) {
@@ -2292,5 +2323,36 @@ mod concurrency_threaded_tests {
             err.contains("w1") && err.contains("w2"),
             "want a leftover error naming w1 and w2, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fixture_directive_tests {
+    use super::*;
+
+    /// `# fixture: <path> error <SQLSTATE>` passes only when the open fails with exactly that code;
+    /// the corpus can pin the passing case but not the harness's own failure verdicts.
+    #[test]
+    fn fixture_open_error_requires_the_named_code() {
+        assert_eq!(
+            parse_fixture_directive(" fixture: a/b.jed"),
+            Some(("a/b.jed".to_string(), None))
+        );
+        assert_eq!(
+            parse_fixture_directive(" fixture: a/b.jed error XX001"),
+            Some(("a/b.jed".to_string(), Some("XX001".to_string())))
+        );
+        assert_eq!(
+            parse_fixture_directive(" fixture: a/b.jed oops XX001"),
+            None
+        );
+        let run =
+            |rel: &str, code: &str| run_file(&format!("# fixture: {rel} error {code}\n"), false);
+        let bad = "fileformat/fixtures/malformed_fk_type.jed";
+        assert_eq!(run(bad, "XX001"), Ok(()));
+        let err = run(bad, "22000").expect_err("a different code fails the file");
+        assert!(err.contains("expected open error 22000"), "{err}");
+        let err = run("fileformat/fixtures/pk_table.jed", "XX001").expect_err("a clean open fails");
+        assert!(err.contains("opened, expected error XX001"), "{err}");
     }
 }

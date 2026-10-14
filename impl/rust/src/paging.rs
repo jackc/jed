@@ -63,7 +63,7 @@ impl SharedPaging {
         page: u32,
         col_types: &Arc<Vec<ColType>>,
     ) -> Result<Arc<Node>> {
-        self.pool.get_or_load(page, || {
+        let node = self.pool.get_or_load(page, || {
             let block = self
                 .pager
                 .lock()
@@ -79,7 +79,19 @@ impl SharedPaging {
                 Arc::clone(col_types),
                 Arc::downgrade(self),
             )
-        })
+        })?;
+        // The pool is keyed by page alone, so a pointer into another tree's leaf can return a node
+        // decoded for that tree's columns. Its directories were validated against those columns,
+        // not these, so serving it would index regions that do not exist (storage.md §7).
+        if let Some(packed) = &node.packed
+            && !crate::format::same_leaf_shape(packed.col_types(), col_types)
+        {
+            return Err(crate::error::EngineError::new(
+                crate::error::SqlState::DataCorrupted,
+                "leaf page belongs to a different tree",
+            ));
+        }
+        Ok(node)
     }
 
     /// Lock the pager for the commit write path (file.rs `persist` pwrites dirty pages + meta).

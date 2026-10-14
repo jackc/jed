@@ -1746,7 +1746,9 @@ impl Engine {
         meter: &mut Meter,
     ) -> Result<bool> {
         let snap = self.fk_snap(temp);
-        let child = snap.table(child_table).expect("foreign-key child exists");
+        let child = snap
+            .table(child_table)
+            .ok_or_else(|| crate::error::EngineError::data_corrupted("foreign-key child exists"))?;
         let store = snap.store(child_table);
         if let Some(path) = fk_choose_reverse_path(snap, fk, child, parent) {
             let child_colls = self.column_collations(&child.columns);
@@ -1845,7 +1847,9 @@ impl Engine {
         mask: &[bool],
     ) -> Result<MutationScanBatch> {
         let snap = self.fk_snap(t.temp);
-        let child = snap.table(child_table).expect("foreign-key child exists");
+        let child = snap
+            .table(child_table)
+            .ok_or_else(|| crate::error::EngineError::data_corrupted("foreign-key child exists"))?;
         let store = snap.store(child_table);
         let Some(path) = fk_choose_reverse_path(snap, &t.fk, child, &t.parent) else {
             let (entries, pages, slabs) = store.scan_with_units(mask)?;

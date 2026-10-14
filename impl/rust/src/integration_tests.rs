@@ -161,6 +161,8 @@ mod range_storage;
 mod reclamation;
 #[path = "../tests/regex_vectors.rs"]
 mod regex_vectors;
+#[path = "../tests/resealed_corruption.rs"]
+mod resealed_corruption;
 #[path = "../tests/returning.rs"]
 mod returning;
 #[path = "../tests/secondary_index.rs"]

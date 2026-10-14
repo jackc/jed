@@ -23,7 +23,7 @@
 
 import type { ColType } from "./catalog.ts";
 import { engineError } from "./errors.ts";
-import { encodeRangeBody, readRangeBody } from "./format.ts";
+import { encodeRangeBody, MAX_TREE_DEPTH, readRangeBody } from "./format.ts";
 import { rangeContains, rangeOverlaps, rangeTotalCmp, rangeUnion } from "./range.ts";
 import type { Value } from "./value.ts";
 
@@ -513,12 +513,20 @@ export function buildGistFromLeafKeys(ops: GistOpclass[], keys: Uint8Array[]): G
 // readGistLeafKeys walks a persisted GiST R-tree (rooted at root, page types 5/6), collecting each
 // leaf's leaf key (bound ‖ skey — the tuple's self-delimiting bound bytes concatenated with the storage
 // key). OPCLASS-AGNOSTIC: the whole bound blob is copied verbatim (single- or multi-column), so no
-// element type is needed. read returns one page's { pageType, itemCount, payload }.
+// element type is needed. read returns one page's { pageType, itemCount, payload }. seen holds the
+// pages already walked: a page reached twice is a misdirected child pointer (data_corrupted), not a
+// reason to recurse without bound; depth bounds the recursion the same way (MAX_TREE_DEPTH).
 export function readGistLeafKeys(
   read: (pageNo: number) => { pageType: number; itemCount: number; payload: Uint8Array },
   pageNo: number,
   out: Uint8Array[],
+  seen: Set<number> = new Set<number>(),
+  depth = 1,
 ): void {
+  if (seen.has(pageNo)) throw engineError("data_corrupted", "GiST page reached twice");
+  seen.add(pageNo);
+  if (depth > MAX_TREE_DEPTH)
+    throw engineError("data_corrupted", "GiST tree deeper than any valid tree");
   const { pageType, itemCount, payload } = read(pageNo);
   const cur = { pos: 0 };
   if (pageType === PAGE_GIST_LEAF) {
@@ -532,13 +540,17 @@ export function readGistLeafKeys(
     return;
   }
   if (pageType === PAGE_GIST_INTERIOR) {
+    // Each entry is at least a u16 bound length and a u32 child pointer; checking first keeps a
+    // corrupt count from sizing the array.
+    if (itemCount * 6 > payload.length)
+      throw engineError("data_corrupted", "GiST interior item count overruns page");
     const children: number[] = [];
     for (let i = 0; i < itemCount; i++) {
       const blen = readU16(payload, cur);
       takeBytes(payload, cur, blen); // skip the union bound
       children.push(readU32(payload, cur));
     }
-    for (const cp of children) readGistLeafKeys(read, cp, out);
+    for (const cp of children) readGistLeafKeys(read, cp, out, seen, depth + 1);
     return;
   }
   throw engineError("data_corrupted", "expected a GiST node page");
@@ -562,7 +574,7 @@ function readU32(buf: Uint8Array, cur: { pos: number }): number {
   return v;
 }
 function takeBytes(buf: Uint8Array, cur: { pos: number }, n: number): Uint8Array {
-  if (cur.pos + n > buf.length) throw engineError("data_corrupted", "gist: truncated bytes");
+  if (n > buf.length - cur.pos) throw engineError("data_corrupted", "gist: truncated bytes");
   const v = buf.subarray(cur.pos, cur.pos + n);
   cur.pos += n;
   return v;

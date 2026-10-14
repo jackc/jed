@@ -154,6 +154,13 @@ Conventions, fixed here so every implementation renders identically:
   the collation version-skew read-safety regression `suites/collation/skew.test` /
   `skew_full.test` ([collation.md](collation.md) §12/§14).
 
+  The form `# fixture: <path> error <SQLSTATE>` instead asserts that **opening** the image fails
+  with that SQLSTATE; any other outcome (a successful open, another code, a crash) fails the file,
+  and the file runs no records. It pins corruption that is detected at open (the catalog and the
+  interior spine are read there), the open-time half of the malformed-page regressions
+  ([storage.md](storage.md) §6, `suites/storage/malformed_*.test`). Gated by
+  **`harness.fixture_open_error`**.
+
   - **Why [verify.rb](../fileformat/verify.rb) is kept, not retired in favor of a core authoring
     the goldens.** This forging is the file-format reference's *distinctive, irreplaceable* value,
     and it is the reason `verify.rb` is **not** merely a redundant fourth byte-encoder. The two

@@ -900,6 +900,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
   // §12/§14, spec/design/conformance.md). Reconstructed in memory via loadEngine.
   "harness.fixture_open",
+  // The `# fixture: <path> error <SQLSTATE>` form: opening the pre-built image must fail with that
+  // engine error (a forged, CRC-valid but structurally wrong image is XX001, never a crash), and the
+  // file runs no records (spec/design/conformance.md).
+  "harness.fixture_open_error",
   // The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
   // (db.upgradeCollations) on the running DB — clears a version-skew so a corpus test can drive
   // skew→migrate→writable end to end (spec/design/collation.md §12).

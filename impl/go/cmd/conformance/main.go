@@ -13,6 +13,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -315,17 +316,24 @@ func parseTimezoneDirective(line string) (string, bool) {
 // to run a file against a PRE-BUILT database image instead of a fresh database, so a test can exercise
 // on-disk state SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded index — the
 // skew read-safety regression, spec/design/collation.md §12/§14). The path is relative to spec/.
-// Gated by the harness.fixture_open capability. Returns the path, or false if not this directive.
-func parseFixtureDirective(line string) (string, bool) {
+// Gated by the harness.fixture_open capability. The form `<path> error <SQLSTATE>` (capability
+// harness.fixture_open_error) instead asserts that opening the image fails with that SQLSTATE — a
+// forged image whose corruption is detected at open — and the file runs no records. Returns the path
+// and the expected open-error code ("" for a plain fixture), or false if not this directive.
+func parseFixtureDirective(line string) (string, string, bool) {
 	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "fixture:")
 	if !ok {
-		return "", false
+		return "", "", false
 	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return "", false
+	fields := strings.Fields(body)
+	switch {
+	case len(fields) == 1:
+		return fields[0], "", true
+	case len(fields) == 3 && fields[1] == "error":
+		return fields[0], fields[2], true
+	default:
+		return "", "", false
 	}
-	return body, true
 }
 
 // parseUpgradeCollationsDirective reports whether the line is a `# upgrade-collations:` directive — a
@@ -1022,8 +1030,19 @@ func runFile(text string, disk bool) error {
 			}
 			// `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh NewEngine()
 			// above — appears in the header before any record (spec/design/conformance.md).
-			if rel, ok := parseFixtureDirective(line); ok {
+			if rel, wantCode, ok := parseFixtureDirective(line); ok {
 				fixtureDB, fixtureCleanup, err := openFixture(rel)
+				if wantCode != "" {
+					if err == nil {
+						fixtureCleanup()
+						return fmt.Errorf("fixture %s opened, expected error %s", rel, wantCode)
+					}
+					var ee *jed.EngineError
+					if !errors.As(err, &ee) || ee.Code() != wantCode {
+						return fmt.Errorf("fixture %s: expected open error %s, got %v", rel, wantCode, err)
+					}
+					return nil // the open failed as required; the file has no records
+				}
 				if err != nil {
 					return err
 				}

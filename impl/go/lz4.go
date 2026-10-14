@@ -92,7 +92,9 @@ func lz4Compress(src []byte) []byte {
 
 // lz4Decompress decodes comp to exactly rawLen bytes or fails data_corrupted (lz4.md §3).
 func lz4Decompress(comp []byte, rawLen int) ([]byte, error) {
-	out := make([]byte, 0, rawLen)
+	// No block expands more than 255x (a match-length extension byte adds at most 255 bytes), so this
+	// is rawLen for any valid block and keeps a corrupt rawLen from sizing the buffer.
+	out := make([]byte, 0, min(rawLen, 255*len(comp)+16))
 	i := 0
 	n := len(comp)
 	for {

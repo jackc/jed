@@ -1,0 +1,6 @@
+# Malformed page: a B-tree interior page that names itself as its first child (storage.md §6).
+# Ruby-forged (verify.rb MALFORMED_FIXTURES), checksum resealed. Open reads the interior spine, so the
+# loop is met there: a page reached twice is XX001, not unbounded recursion.
+# requires: harness.fixture_open, harness.fixture_open_error
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_interior_cycle.jed error XX001

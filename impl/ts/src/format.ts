@@ -34,6 +34,7 @@ import {
   type Table,
   type ViewDef,
   type ViewDep,
+  colTypeKeyable,
   indexColumnOrdinals,
   pkIndices,
 } from "./catalog.ts";
@@ -54,11 +55,21 @@ import {
 } from "./commit_manifest.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
-import { encodeTypedKey, Engine, Snapshot } from "./executor.ts";
+import {
+  encodeTypedKey,
+  Engine,
+  fkTypesEqual,
+  isGinElementType,
+  isGistScalarType,
+  sameSet,
+  Snapshot,
+  sortedUnique,
+} from "./executor.ts";
 import {
   buildGistFromLeafKeys,
   GIST_SCALAR_OPCLASS,
   type GistOpclass,
+  type GistPage,
   gistRangeOpclass,
   readGistLeafKeys,
   serializeGistTree,
@@ -67,7 +78,7 @@ import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
 import { Pager } from "./pager.ts";
 import { compareBytes, decodedRows, keyViews, nodeLen, onDiskRef, residentRef } from "./pmap.ts";
-import { rangeForElement } from "./range.ts";
+import { rangeElemCmp, rangeForElement } from "./range.ts";
 import type { Child, LeafShape, PackedLeaf, PNode, Span } from "./pmap.ts";
 import { SharedPaging } from "./paging.ts";
 import { TableStore, type Row } from "./storage.ts";
@@ -76,6 +87,7 @@ import {
   type ScalarType,
   type Type,
   arrayT,
+  compositeRefName,
   compositeT,
   isBool,
   isBytea,
@@ -89,6 +101,7 @@ import {
   isJsonb,
   rangeT,
   scalarT,
+  typeIsJsonb,
   typeScalar,
   widthBytes,
 } from "./types.ts";
@@ -276,14 +289,22 @@ function pushArrayElementType(w: ByteWriter, elem: Type): void {
   w.u8(typeCodeForScalar(elem.scalar));
 }
 
+// readDecimalTypmod reads a decimal column or field typmod (u16 precision ‖ u16 scale; precision 0 =
+// unconstrained). DDL admits precision 1…1000 with 0 ≤ scale ≤ precision, and the value coercion
+// sizes its work from the typmod, so anything else is data_corrupted.
+function readDecimalTypmod(buf: Uint8Array, cur: Cursor): DecimalTypmod | null {
+  const precision = readU16(buf, cur);
+  const scale = readU16(buf, cur);
+  if (precision === 0) return null;
+  if (precision > 1000 || scale > precision)
+    throw engineError("data_corrupted", "invalid decimal typmod");
+  return { precision, scale };
+}
+
 // readArrayElementType decodes an array column's element type descriptor (inverse of the above).
 function readArrayElementType(buf: Uint8Array, cur: Cursor): Type {
   const code = readU8(buf, cur);
-  if (code === 14) {
-    const n = readU16(buf, cur);
-    const name = UTF8_DECODE.decode(take(buf, cur, n));
-    return compositeT(name);
-  }
+  if (code === 14) return compositeT(readString(buf, cur));
   const s = scalarForTypeCode(code);
   if (s === undefined) throw engineError("data_corrupted", "invalid array element code");
   return scalarT(s);
@@ -1455,7 +1476,7 @@ function decodeViewEntry(buf: Uint8Array, cur: Cursor): ViewDef {
   const columns: string[] = [];
   for (let i = 0; i < colCount; i++) columns.push(readString(buf, cur));
   const defLen = readU32(buf, cur);
-  if (cur.pos + defLen > buf.length) {
+  if (defLen > buf.length - cur.pos) {
     throw engineError("data_corrupted", "truncated view definition");
   }
   let definition: string;
@@ -1834,7 +1855,7 @@ function decodeStatisticsEntry(
     if (
       termLength === 0 ||
       termLength > STATISTICS_MAX_VALUE_BYTES ||
-      cur.pos + termLength > buf.length
+      termLength > buf.length - cur.pos
     ) {
       throw engineError("data_corrupted", "invalid statistics term length");
     }
@@ -1861,6 +1882,14 @@ function decodeStatisticsEntry(
     return;
   }
   throw engineError("data_corrupted", "unknown statistics entry subkind");
+}
+
+// checkTableRowCount rejects a row count that disagrees with its tree before tableEntryBytes asserts
+// it. The engine maintains the count exactly, so a disagreement here means the count restored from
+// the catalog did not match the leaves it described: a corrupt or misdirected page (storage.md §7).
+function checkTableRowCount(rootDataPage: number, rowCount: bigint): void {
+  if (rowCount < 0n || (rootDataPage === 0) !== (rowCount === 0n))
+    throw engineError("data_corrupted", "table row count disagrees with its tree");
 }
 
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
@@ -2172,6 +2201,9 @@ function compositeTypeEntryBytes(ct: CompositeType): Uint8Array {
 function decodeCompositeTypeEntry(buf: Uint8Array, cur: Cursor): CompositeType {
   const name = readString(buf, cur);
   const fieldCount = readU16(buf, cur);
+  // CREATE TYPE requires a field, and a field-less type would give its values zero-byte bodies, so
+  // an array of them could claim billions of elements without the decoder ever running out of bytes.
+  if (fieldCount === 0) throw engineError("data_corrupted", "composite type has no fields");
   const fields: CompositeField[] = [];
   for (let i = 0; i < fieldCount; i++) {
     const fname = readString(buf, cur);
@@ -2200,9 +2232,7 @@ function decodeCompositeTypeEntry(buf: Uint8Array, cur: Cursor): CompositeType {
     }
     const notNull = (flags & 0b1) !== 0;
     if (fty.kind === "scalar" && fty.scalar === "decimal") {
-      const precision = readU16(buf, cur);
-      const scale = readU16(buf, cur);
-      if (precision !== 0) decimal = { precision, scale };
+      decimal = readDecimalTypmod(buf, cur);
     }
     // A text field carries its varchar(n) max length (v22); 0 = unbounded (types.md §15).
     let varcharLen: number | null = null;
@@ -2443,6 +2473,7 @@ export function writeImage(
           gistColOpclasses(store, indexColumnOrdinals(idx)!),
           nextIndex,
           body,
+          ps,
         );
         ir = r.index;
         nextIndex = r.next;
@@ -2484,6 +2515,7 @@ export function writeImage(
     const t = snap.tables.get(keys[ti]!)!;
     const rowCount = snap.stores.get(keys[ti]!)!.count();
     if (rowCount === null) throw new Error("table stores always carry an exact row count");
+    checkTableRowCount(rootDataPage[ti]!, rowCount);
     catEntries.push(
       concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!, rowCount)]),
     );
@@ -2554,17 +2586,29 @@ function gistColOpclasses(tableStore: TableStore, cols: number[]): GistOpclass[]
 // CANONICALLY from the leaf set, so its bytes are a pure function of the set — content-deterministic
 // and cross-core identical (§3). Returns the root page + the next free index; an empty index returns
 // root 0 and writes no pages.
+// checkGistPages rejects a rebuilt GiST node that cannot fit its page: the leaf keys a valid file
+// yields always fit, so an oversized node comes from keys read back from a corrupt or misdirected
+// page (storage.md §7), and writing it would overrun the page buffer.
+function checkGistPages(pages: GistPage[], ps: number): void {
+  for (const p of pages) {
+    if (p.payload.length > ps - PAGE_HEADER)
+      throw engineError("data_corrupted", "GiST node overflows its page");
+  }
+}
+
 function serializeGistIndex(
   istore: TableStore,
   ops: GistOpclass[],
   nextIndex: number,
   body: PageSink,
+  ps: number,
 ): { index: number; next: number } {
   const keys = istore.entriesInKeyOrder().map((e) => e.key);
   if (keys.length === 0) return { index: 0, next: nextIndex };
   const tree = buildGistFromLeafKeys(ops, keys);
   let n = nextIndex;
   const { pages, root } = serializeGistTree(tree, ops, () => n++);
+  checkGistPages(pages, ps);
   for (const p of pages) body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload);
   return { index: root, next: n };
 }
@@ -2873,6 +2917,7 @@ export function incrementalImage(
           const ops = gistColOpclasses(store, indexColumnOrdinals(idx)!);
           const tree = buildGistFromLeafKeys(ops, keysList);
           const { pages: gpages, root } = serializeGistTree(tree, ops, () => alloc.take());
+          checkGistPages(gpages, ps);
           gistPages += gpages.length;
           for (const p of gpages) {
             pages.push({
@@ -2917,6 +2962,7 @@ export function incrementalImage(
     const t = snap.tables.get(keys[ti]!)!;
     const rowCount = snap.stores.get(keys[ti]!)!.count();
     if (rowCount === null) throw new Error("table stores always carry an exact row count");
+    checkTableRowCount(rootDataPage[ti]!, rowCount);
     catEntries.push(
       concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!, rowCount)]),
     );
@@ -3100,7 +3146,13 @@ function collectLeafOverflow(
   pageIdx: number,
   colTypes: ColType[],
   reached: Set<number>,
+  seen: Set<number>,
+  depth: number,
 ): void {
+  if (seen.has(pageIdx)) throw engineError("data_corrupted", "B-tree page reached twice");
+  seen.add(pageIdx);
+  if (depth > MAX_TREE_DEPTH)
+    throw engineError("data_corrupted", "B-tree deeper than any valid tree");
   const pg = parsePage(paging.readBlock(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
     const fetch = (p: number): Uint8Array => paging.readBlock(p);
@@ -3125,10 +3177,12 @@ function collectLeafOverflow(
     return;
   }
   if (pg.pageType === PAGE_INTERIOR) {
+    if (8 * pg.itemCount + 4 > pg.payload.length)
+      throw engineError("data_corrupted", "B-tree interior item count overruns page");
     const cur = { pos: 0 };
     const cps: number[] = [];
     for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readU32(pg.payload, cur));
-    for (const cp of cps) collectLeafOverflow(paging, cp, colTypes, reached);
+    for (const cp of cps) collectLeafOverflow(paging, cp, colTypes, reached, seen, depth + 1);
     return;
   }
   throw engineError("data_corrupted", "expected a B-tree node page");
@@ -3148,6 +3202,7 @@ export function reachablePages(snap: Snapshot, paging: SharedPaging, catRoot: nu
   // The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
   // what compaction reclaims).
   for (let p = catRoot; p !== 0; ) {
+    if (reached.has(p)) throw engineError("data_corrupted", "catalog chain revisits a page");
     reached.add(p);
     const pg = parsePage(paging.readBlock(p));
     if (pg.pageType !== PAGE_CATALOG)
@@ -3159,7 +3214,7 @@ export function reachablePages(snap: Snapshot, paging: SharedPaging, catRoot: nu
     const root = st.treeRoot();
     collectTreePages(root, reached);
     if (root !== null && root.page !== 0 && anySpillable(st.columnTypes())) {
-      collectLeafOverflow(paging, root.page, st.columnTypes(), reached);
+      collectLeafOverflow(paging, root.page, st.columnTypes(), reached, new Set<number>(), 1);
     }
   }
   // Secondary/unique index trees (empty-payload, never spillable).
@@ -3451,7 +3506,16 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   // from the meta (v34); its catalog and GiST parts are counted as the load reads them (memory.md §8.7).
   const live: LiveCount = { live: mt.livePages, catalog: 0, gist: 0 };
   let catPage = mt.rootPage;
+  const catSeen = new Set<number>();
+  // typesChecked records that every composite type registered so far has passed
+  // validateCompositeTypes. A table resolves its column types as it is registered, so the types it
+  // reaches must be known-present and acyclic first (composite.md §3).
+  let typesChecked = true;
+  // Index stores are keyed by index name alone, so a name may appear once across all tables.
+  const indexNames = new Set<string>();
   while (catPage !== 0) {
+    if (catSeen.has(catPage)) throw engineError("data_corrupted", "catalog chain revisits a page");
+    catSeen.add(catPage);
     const pg = parsePage(paging.readBlock(catPage));
     if (pg.pageType !== PAGE_CATALOG)
       throw engineError("data_corrupted", "expected a catalog page");
@@ -3464,6 +3528,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
       const kind = readU8(pg.payload, cur);
       if (kind === 1) {
         snap.putType(decodeCompositeTypeEntry(pg.payload, cur));
+        typesChecked = false;
         continue;
       }
       if (kind === 2) {
@@ -3490,6 +3555,29 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
       const { table, root, rowCount, indexRoots } = decodeTableEntry(pg.payload, cur);
+      // Every record costs at least its 4-byte key-directory entry in some leaf, so no table holds
+      // more rows than the file has room for. Checking keeps a corrupt count from sizing work later.
+      if (rowCount > BigInt(mt.pageCount) * BigInt(Math.floor((pageSize - PAGE_HEADER) / 4)))
+        throw engineError("data_corrupted", "table row count exceeds the file");
+      if (!typesChecked) {
+        snap.validateCompositeTypes();
+        typesChecked = true;
+      }
+      for (const c of table.columns) {
+        const r = compositeRefName(c.type);
+        if (r !== null && snap.compositeType(r) === undefined)
+          throw engineError(
+            "data_corrupted",
+            "table " + table.name + " references unknown type " + r,
+          );
+      }
+      if (snap.tables.has(table.name))
+        throw engineError("data_corrupted", "duplicate table name " + table.name);
+      for (const idx of table.indexes) {
+        if (indexNames.has(idx.name))
+          throw engineError("data_corrupted", "duplicate index name " + idx.name);
+        indexNames.add(idx.name);
+      }
       const hasPK = pkIndices(table).length > 0;
       snap.putTable(table, pageSize);
       const store = snap.stores.get(table.name)!;
@@ -3505,7 +3593,14 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
           // No-PK rowid reconstruction faults the leaves to find the largest key; only for keyless
           // tables (most have a PK), and bounded by the pool. root !== 0 ⇒ the table is non-empty.
           const entries = store.entriesInKeyOrder();
-          store.bumpRowidTo(decodeInt("i64", entries[entries.length - 1]!.key) + 1n);
+          if (entries.length === 0)
+            throw engineError("data_corrupted", "non-empty table tree holds no rows");
+          // A rowid key is exactly an encoded i64, and the next rowid must still be one.
+          const last = entries[entries.length - 1]!.key;
+          const rowid = last.length === 8 ? decodeInt("i64", last) : null;
+          if (rowid === null || rowid >= 0x7fff_ffff_ffff_ffffn)
+            throw engineError("data_corrupted", "table rowid key out of range");
+          store.bumpRowidTo(rowid + 1n);
         }
       }
       // The table's index trees (v5): zero-column demand-paged stores of entry keys
@@ -3557,6 +3652,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
   // reference (spec/design/composite.md §3).
   snap.validateCompositeTypes();
+  validateLoadedReferences(snap);
   // Views (v38): structural checks only — the bodies are parsed, never planned (views.md §3).
   installViews(snap, loadedViews);
   // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
@@ -3586,6 +3682,121 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   return db;
 }
 
+// validateLoadedReferences checks the catalog facts that need resolved types or other entries, which
+// decodeTableEntry cannot see one entry at a time: primary-key and plain B-tree index columns are
+// keyable, GIN and GiST index columns have an operator class (a GIN index exactly one), a foreign key
+// names a loaded parent's PK or UNIQUE column set with same-typed columns (constraints.md §6.2), and
+// an exclusion constraint matches a GiST index of its own table. The engine never writes a file that
+// breaks these, and the executor relies on them, so a violation is data_corrupted (storage.md §7).
+// Tables are visited in name byte order so the reported violation is deterministic.
+function validateLoadedReferences(snap: Snapshot): void {
+  const names = [...snap.tables.keys()].sort(compareTextC);
+  for (const name of names) {
+    const t = snap.tables.get(name)!;
+    const colTypes = snap.stores.get(name)!.columnTypes();
+    for (const o of t.pk) {
+      if (!colTypeKeyable(colTypes[o]!))
+        throw engineError(
+          "data_corrupted",
+          "primary key column of table " + t.name + " is not keyable",
+        );
+    }
+    for (const idx of t.indexes) {
+      if (idx.kind === "btree") {
+        for (const key of idx.keys) {
+          if (key.kind === "column" && !colTypeKeyable(colTypes[key.column]!))
+            throw engineError("data_corrupted", "index " + idx.name + " column is not keyable");
+        }
+      }
+      if (idx.kind === "gist") {
+        for (const key of idx.keys) {
+          const ty = key.kind === "column" ? t.columns[key.column]!.type : null;
+          if (ty === null || !(ty.kind === "range" || isGistScalarType(ty)))
+            throw engineError(
+              "data_corrupted",
+              "GiST index " + idx.name + " column has no operator class",
+            );
+        }
+      }
+      if (idx.kind !== "gin") continue;
+      if (idx.keys.length !== 1)
+        throw engineError(
+          "data_corrupted",
+          "GIN index " + idx.name + " does not have exactly one column",
+        );
+      const key = idx.keys[0]!;
+      const ty = key.kind === "column" ? t.columns[key.column]!.type : null;
+      if (ty === null || !(typeIsJsonb(ty) || (ty.kind === "array" && isGinElementType(ty.elem))))
+        throw engineError(
+          "data_corrupted",
+          "GIN index " + idx.name + " column has no operator class",
+        );
+    }
+    for (const fk of t.fks) {
+      const parent = snap.tables.get(fk.refTable);
+      if (parent === undefined)
+        throw engineError(
+          "data_corrupted",
+          "foreign key " + fk.name + " references a missing table",
+        );
+      for (let i = 0; i < fk.refColumns.length; i++) {
+        const o = fk.refColumns[i]!;
+        if (o >= parent.columns.length)
+          throw engineError("data_corrupted", "invalid foreign-key referenced column ordinal");
+        if (!fkTypesEqual(t.columns[fk.columns[i]!]!.type, parent.columns[o]!.type))
+          throw engineError(
+            "data_corrupted",
+            "foreign key " + fk.name + " pairs columns of different types",
+          );
+      }
+      const refSet = sortedUnique(fk.refColumns);
+      const matches =
+        (parent.pk.length > 0 && sameSet(sortedUnique(parent.pk), refSet)) ||
+        parent.indexes.some((ix) => {
+          const cols = indexColumnOrdinals(ix);
+          return ix.unique && cols !== null && sameSet(sortedUnique(cols), refSet);
+        });
+      if (!matches)
+        throw engineError(
+          "data_corrupted",
+          "foreign key " + fk.name + " does not reference a unique key",
+        );
+    }
+    for (const ex of t.exclusions) {
+      const backing = t.indexes.find((idx) => idx.name === ex.index && idx.kind === "gist");
+      if (backing === undefined)
+        throw engineError(
+          "data_corrupted",
+          "exclusion constraint " + ex.name + " has no backing GiST index",
+        );
+      // The probe pairs each element's operator with the backing index's column bound, so the two
+      // must name the same columns in order, each with the operator its type supports (gist.md §7).
+      const cols = indexColumnOrdinals(backing);
+      const matches =
+        cols !== null &&
+        cols.length === ex.elements.length &&
+        ex.elements.every((el, i) => {
+          const ty = t.columns[el.column]!.type;
+          return (
+            el.column === cols[i] &&
+            (el.op === "overlaps" ? ty.kind === "range" : isGistScalarType(ty))
+          );
+        });
+      if (!matches)
+        throw engineError(
+          "data_corrupted",
+          "exclusion constraint " + ex.name + " does not match its backing GiST index",
+        );
+    }
+  }
+}
+
+// MAX_TREE_DEPTH bounds the recursion of the on-disk tree walks. A tree only grows a level when its
+// root splits, so with u32 page ids a tree the engine writes stays far shallower than this; a deeper
+// chain is misdirected pointers, and following it would overflow the native stack before a seen set
+// caught a repeat (JS stacks are far shallower than Go's growable ones).
+export const MAX_TREE_DEPTH = 256;
+
 // readSkeleton reads a table's on-disk B-tree (rooted at root) into a demand-paged skeleton: interior
 // nodes resident, every leaf left OnDisk (faulted on first access). It does not compute a row count;
 // the caller installs the exact v28 catalog count alongside the skeleton (spec/design/storage.md
@@ -3593,7 +3804,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
 // interior parent to hold an OnDisk reference, so the root leaf is faulted resident
 // (spec/design/pager.md §1/§4).
 function readSkeleton(paging: SharedPaging, root: number, colTypes: ColType[]): PNode {
-  const child = readSkeletonNode(paging, root);
+  const child = readSkeletonNode(paging, root, new Set<number>(), 1).child;
   if (child.node !== null) return child.node;
   return paging.faultLeaf(child.page, colTypes);
 }
@@ -3612,14 +3823,32 @@ function readSkeleton(paging: SharedPaging, root: number, colTypes: ColType[]): 
 // The cost: the first child of each bottom-level interior is still read (to classify the level), i.e.
 // ~leaves/fanout leaf reads, negligible beside the former per-leaf walk. A corrupt leaf is now
 // surfaced at fault rather than at open (still XX001, never wrong rows — spec/design/storage.md §7);
-// the interior spine is still CRC-validated here at open.
-function readSkeletonNode(paging: SharedPaging, pageIdx: number): Child {
+// the interior spine is still CRC-validated here at open. seen holds the interior pages already
+// read: a tree is acyclic and no interior has two parents, so a repeat is a misdirected pointer
+// (data_corrupted) rather than a reason to recurse without bound. The returned height (1 for a leaf)
+// lets each interior check that its resolved children sit at one depth, the invariant the scan and
+// rebalance code relies on. depth is this node's level from the root (MAX_TREE_DEPTH).
+function readSkeletonNode(
+  paging: SharedPaging,
+  pageIdx: number,
+  seen: Set<number>,
+  depth: number,
+): { child: Child; height: number } {
+  if (depth > MAX_TREE_DEPTH)
+    throw engineError("data_corrupted", "B-tree deeper than any valid tree");
   const pg = parsePage(paging.readBlock(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
-    return onDiskRef(pageIdx);
+    return { child: onDiskRef(pageIdx), height: 1 };
   }
   if (pg.pageType === PAGE_INTERIOR) {
+    if (seen.has(pageIdx))
+      throw engineError("data_corrupted", "B-tree interior page reached twice");
+    seen.add(pageIdx);
     const n = pg.itemCount;
+    // n+1 child pointers plus an n-entry separator directory must fit the payload; checking first
+    // keeps a corrupt count from sizing the arrays below.
+    if (8 * n + 4 > pg.payload.length)
+      throw engineError("data_corrupted", "B-tree interior item count overruns page");
     const cur = { pos: 0 };
     // Child pointers precede the separator directory (format.md "Interior node").
     const childPtrs: number[] = [];
@@ -3627,16 +3856,25 @@ function readSkeletonNode(paging: SharedPaging, pageIdx: number): Child {
     // v24: the record-free routing skeleton — an end-offset separator directory + key blob.
     // Separators carry no values, so no lazy decode and no chains to mark.
     const keys = readSeparators(pg.payload, cur, n);
-    // Resolve the first child to classify the level, then avoid reading leaf siblings.
-    const first = readSkeletonNode(paging, childPtrs[0]!);
-    const childrenAreLeaves = first.node === null;
-    const children: Child[] = [first];
+    // Resolve the first child to classify the level, then avoid reading leaf siblings. A leaf
+    // sibling that is not a leaf is caught when it faults (decodeLeafNode).
+    const first = readSkeletonNode(paging, childPtrs[0]!, seen, depth + 1);
+    const childrenAreLeaves = first.child.node === null;
+    const children: Child[] = [first.child];
     for (let i = 1; i < childPtrs.length; i++) {
-      children.push(
-        childrenAreLeaves ? onDiskRef(childPtrs[i]!) : readSkeletonNode(paging, childPtrs[i]!),
-      );
+      if (childrenAreLeaves) {
+        children.push(onDiskRef(childPtrs[i]!)); // a leaf sibling — not read at open
+        continue;
+      }
+      const next = readSkeletonNode(paging, childPtrs[i]!, seen, depth + 1);
+      if (next.height !== first.height)
+        throw engineError("data_corrupted", "B-tree leaves at unequal depths");
+      children.push(next.child);
     }
-    return residentRef({ keys, vals: [], weights: [], children, page: pageIdx });
+    return {
+      child: residentRef({ keys, vals: [], weights: [], children, page: pageIdx }),
+      height: first.height + 1,
+    };
   }
   throw engineError("data_corrupted", "expected a B-tree node page");
 }
@@ -3859,6 +4097,40 @@ function paxValueLen(payload: Uint8Array, d: PaxDirs, c: number, i: number): num
   return paxDirEnd(payload, r.ends, i) - (i === 0 ? 0 : paxDirEnd(payload, r.ends, i - 1));
 }
 
+// sameLeafShape reports whether a leaf decoded for columns a can serve columns b: the same column
+// count and, per column, the same value codec (sameValueCodec). The directories were validated and
+// the values are decoded against a's types, so any other pairing indexes regions or reads bodies as a
+// type they are not.
+export function sameLeafShape(a: ColType[], b: ColType[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!sameValueCodec(a[i]!, b[i]!)) return false;
+  }
+  return true;
+}
+
+// sameValueCodec reports whether two resolved types store values in the same byte form: the same
+// scalar, or the same container over pairwise-same element/field codecs. Names, typmods, collations,
+// and NOT NULL do not change the bytes, so they are ignored. Composite nesting is depth-bounded
+// (composite.md §3), so the recursion is too.
+function sameValueCodec(a: ColType, b: ColType): boolean {
+  switch (a.kind) {
+    case "scalar":
+      return b.kind === "scalar" && a.scalar === b.scalar;
+    case "array":
+      return b.kind === "array" && sameValueCodec(a.elem, b.elem);
+    case "range":
+      return b.kind === "range" && sameValueCodec(a.elem, b.elem);
+    case "composite":
+      return (
+        b.kind === "composite" &&
+        a.fields.length === b.fields.length &&
+        a.fields.every((f, i) => sameValueCodec(f.type, b.fields[i]!.type))
+      );
+  }
+}
+
 export function decodeLeafNode(
   block: Uint8Array,
   page: number,
@@ -3898,6 +4170,7 @@ export function decodeLeafNode(
   };
   const packed: PackedLeaf = {
     n,
+    colTypes,
     payload,
     isNull(i: number, c: number): boolean {
       return paxIsNull(payload, dirs, c, i);
@@ -4042,9 +4315,7 @@ function decodeTableEntry(
     // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
     let decimal: DecimalTypmod | null = null;
     if (ty === "decimal") {
-      const precision = readU16(buf, cur);
-      const scale = readU16(buf, cur);
-      if (precision !== 0) decimal = { precision, scale };
+      decimal = readDecimalTypmod(buf, cur);
     }
     // A text column carries its varchar(n) max length (v22); 0 = unbounded (types.md §15).
     let varcharLen: number | null = null;
@@ -4491,11 +4762,14 @@ export function chainPages(
   fetch: (page: number) => Uint8Array,
 ): number[] {
   const out: number[] = [];
+  const seen = new Set<number>();
   let gathered = 0;
   let p = first;
   while (gathered < length) {
     if (p === 0)
       throw engineError("data_corrupted", "overflow chain ended before the value length");
+    if (seen.has(p)) throw engineError("data_corrupted", "overflow chain revisits a page");
+    seen.add(p);
     out.push(p);
     const pg = parsePage(fetch(p));
     if (pg.pageType !== PAGE_OVERFLOW)
@@ -4615,7 +4889,16 @@ export function readRangeBody(
   const lower = lbInf ? null : readInlineBody(elem, buf, cur, mode);
   const upper = ubInf ? null : readInlineBody(elem, buf, cur, mode);
   if (mode === "skip") return nullValue();
-  return rangeValue(lower, upper, (flags & 0x08) !== 0, (flags & 0x10) !== 0);
+  const lowerInc = (flags & 0x08) !== 0;
+  const upperInc = (flags & 0x10) !== 0;
+  // A writer stores only finalized ranges, whose finite bounds are ordered and, when equal, both
+  // inclusive (anything else is the empty range). The range operators rely on that order.
+  if (lower !== null && upper !== null) {
+    const c = rangeElemCmp(lower, upper);
+    if (c > 0 || (c === 0 && !(lowerInc && upperInc)))
+      throw engineError("data_corrupted", "range bounds are out of order");
+  }
+  return rangeValue(lower, upper, lowerInc, upperInc);
 }
 
 // readArrayBody reads an array value's present BODY (after the 0x00 tag): inverse of encodeArrayBody
@@ -4638,20 +4921,26 @@ function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor, mode: DecodeMo
   for (let d = 0; d < ndim; d++) {
     dims[d] = readU32(buf, cur);
     lbounds[d] = readU32(buf, cur) | 0; // lower bound (i32 two's-complement)
+    // The upper bound lb + len - 1 must be an i32, as every array the engine builds is (array.md
+    // §4); exact here since both operands are well inside the safe-integer range.
+    const ub = lbounds[d]! + dims[d]! - 1;
+    if (ub < -0x80000000 || ub > 0x7fffffff)
+      throw engineError("data_corrupted", "array dimension bounds out of range");
     n *= dims[d]!;
     if (n > 0x7fffffff) throw engineError("data_corrupted", "array element count overflow");
   }
   const hasNulls = (flags & 0x01) !== 0;
   let bitmap: Uint8Array | null = null;
   if (hasNulls) bitmap = take(buf, cur, Math.ceil(n / 8));
-  const elements: Value[] | null = mode === "construct" ? new Array(n) : null;
+  // Pushed, not preallocated: n is validated only as the element bodies behind it are read.
+  const elements: Value[] | null = mode === "construct" ? [] : null;
   for (let i = 0; i < n; i++) {
     const isNull = hasNulls && (bitmap![i >> 3]! & (0x80 >> (i % 8))) !== 0;
     if (isNull) {
-      if (elements) elements[i] = nullValue();
+      if (elements) elements.push(nullValue());
     } else {
       const v = readInlineBody(ty.elem, buf, cur, mode); // advance in both modes
-      if (elements) elements[i] = v;
+      if (elements) elements.push(v);
     }
   }
   if (!elements) return nullValue();
@@ -4746,6 +5035,10 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor, mode: De
     const b = take(buf, cur, 4);
     return float32Value(new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat32(0, false));
   }
+  // jsonpath is never stored (a jsonpath[] column or composite field can exist, but only NULL fits
+  // it), so a present jsonpath body is corrupt rather than a fixed-width integer to decode.
+  if (ty === "jsonpath")
+    throw engineError("data_corrupted", "a stored body holds a jsonpath value");
   if (isTimestamp(ty)) return timestampValue(readIntBody(ty, buf, cur));
   if (isTimestamptz(ty)) return timestamptzValue(readIntBody(ty, buf, cur));
   // A date is a 4-byte i32 day count, same order-preserving codec as i32 (spec/design/date.md).
@@ -4767,7 +5060,7 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor, mode: De
 // value; the leaf-fault hot path).
 function readIntBody(ty: ScalarType, buf: Uint8Array, cur: Cursor): bigint {
   const w = widthBytes(ty);
-  if (cur.pos + w > buf.length) {
+  if (w > buf.length - cur.pos) {
     throw engineError("data_corrupted", "unexpected end of page data");
   }
   const v = decodeIntAt(ty, buf, cur.pos);
@@ -4785,6 +5078,7 @@ function decodeDecimalBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): Valu
   const groups: number[] | null = mode === "construct" ? new Array(ndigits) : null;
   for (let i = 0; i < ndigits; i++) {
     const g = readU16(buf, cur); // advance in both modes
+    if (g > 9999) throw engineError("data_corrupted", "decimal digit group out of range");
     if (groups) groups[i] = g;
   }
   if (!groups) return nullValue(); // skip-mode placeholder (no Decimal built)
@@ -4801,12 +5095,17 @@ function readOverflowChain(
   fetch: (page: number) => Uint8Array,
   visited: number[],
 ): Uint8Array {
-  const out = new Uint8Array(length);
+  // The stored length is validated only as the chain delivers it, so the buffer starts at most
+  // DECODE_PREALLOC_CAP and grows with the data rather than letting one corrupt field size it.
+  let out = new Uint8Array(Math.min(length, DECODE_PREALLOC_CAP));
+  const seen = new Set<number>();
   let got = 0;
   let p = first;
   while (got < length) {
     if (p === 0)
       throw engineError("data_corrupted", "overflow chain ended before the value length");
+    if (seen.has(p)) throw engineError("data_corrupted", "overflow chain revisits a page");
+    seen.add(p);
     visited.push(p);
     const pg = parsePage(fetch(p));
     if (pg.pageType !== PAGE_OVERFLOW)
@@ -4815,6 +5114,11 @@ function readOverflowChain(
     if (n === 0 || n > pg.payload.length || got + n > length) {
       throw engineError("data_corrupted", "overflow page slab out of range");
     }
+    if (got + n > out.length) {
+      const grown = new Uint8Array(Math.min(length, Math.max(2 * out.length, got + n)));
+      grown.set(out.subarray(0, got));
+      out = grown;
+    }
     out.set(pg.payload.subarray(0, n), got);
     got += n;
     p = pg.nextPage;
@@ -4822,10 +5126,17 @@ function readOverflowChain(
   return out;
 }
 
+// DECODE_PREALLOC_CAP bounds an allocation sized from a stored length or count. The stored value is
+// only validated as the bytes behind it are read, so trusting it up front would let one corrupt field
+// size an allocation of gigabytes; past the cap, buffers grow as the data actually arrives.
+const DECODE_PREALLOC_CAP = 1 << 16;
+
 // --- bounds-checked big-endian readers over a payload cursor ---
 
 function take(buf: Uint8Array, cur: Cursor, n: number): Uint8Array {
-  if (cur.pos + n > buf.length) {
+  // Compared against the remaining length so a huge stored length (a varint near 2^53) cannot lose
+  // precision in a sum.
+  if (n > buf.length - cur.pos) {
     throw engineError("data_corrupted", "unexpected end of page data");
   }
   const s = buf.subarray(cur.pos, cur.pos + n);

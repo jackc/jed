@@ -96,7 +96,9 @@ fn corrupt(msg: &str) -> EngineError {
 
 /// The decoder (lz4.md §3): decode `comp` to exactly `raw_len` bytes or fail `data_corrupted`.
 pub fn decompress(comp: &[u8], raw_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(raw_len);
+    // No block expands more than 255x (a match-length extension byte adds at most 255 bytes), so
+    // this is raw_len for any valid block and keeps a corrupt raw_len from sizing the buffer.
+    let mut out = Vec::with_capacity(raw_len.min(255 * comp.len() + 16));
     let mut i = 0usize;
     let n = comp.len();
     loop {

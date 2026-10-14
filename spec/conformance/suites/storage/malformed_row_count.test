@@ -1,0 +1,15 @@
+# Malformed catalog: a persisted row count (25) larger than the rows its tree holds (20)
+# (storage.md §6/§7). Ruby-forged (verify.rb MALFORMED_FIXTURES). Open restores the count without
+# reading the leaves, so the lie surfaces only when a write leaves an empty tree with a nonzero count:
+# the commit rejects that as XX001 rather than tripping the catalog writer's invariant.
+# requires: harness.fixture_open, query.select, query.where_eq, dml.delete, types.i32, types.i16
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_row_count.jed
+
+query I nosort
+SELECT v FROM t WHERE id = 20
+----
+200
+
+statement error XX001
+DELETE FROM t

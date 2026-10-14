@@ -363,7 +363,7 @@ function encodeRangeElem(elem: ScalarType, v: Value): Uint8Array {
   if (v.kind === "date") return encodeInt(elem, v.days);
   if (v.kind === "timestamp" || v.kind === "timestamptz") return encodeInt(elem, v.micros);
   if (v.kind === "int") return encodeInt(elem, v.int);
-  throw new Error("a range element is i32/i64/decimal/date/timestamp/timestamptz");
+  throw engineError("data_corrupted", "a key value does not match its column type");
 }
 
 // --- boolean operators (RF3, spec/design/range-functions.md §3) -------------

@@ -19,6 +19,7 @@
 // TableStore). Delete rebalances by merge-then-maybe-split (no borrow — format.md "Delete"; an
 // interior merge whose result cannot 2-way split is ABANDONED).
 
+import type { ColType } from "./catalog.ts";
 import type { Row } from "./storage.ts";
 import type { Value } from "./value.ts";
 
@@ -41,6 +42,8 @@ function newMutationGeneration(): MutationGeneration {
 // below). Built by format.ts decodeLeafNode.
 export interface PackedLeaf {
   readonly n: number;
+  // The column types the leaf was decoded (and its directories validated) against.
+  readonly colTypes: ColType[];
   // Borrow key i directly from the retained page block and derive its record weight lazily.
   key(i: number): Uint8Array;
   weight(i: number): number;

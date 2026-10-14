@@ -149,7 +149,8 @@ fn index_row_key<'a>(entry_key: &'a [u8], prefix_len: usize, suffix: &[ScalarTyp
             1 + ty.width_bytes()
         };
     }
-    &entry_key[at..]
+    // A corrupt entry shorter than its components yields an empty storage key, which names no row.
+    entry_key.get(at..).unwrap_or(&[])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +354,11 @@ impl Engine {
                             let row_key = index_row_key(entry_key, prefix_len, &ib.suffix_types);
                             let (row, pages, slabs) =
                                 store.get_with_units(row_key, &plan.rel_masks[0])?;
-                            let row = row.expect("an index entry references a stored row");
+                            let row = row.ok_or_else(|| {
+                                crate::error::EngineError::data_corrupted(
+                                    "an index entry references a stored row",
+                                )
+                            })?;
                             meter.charge(
                                 COSTS.page_read * pages as i64
                                     + COSTS.value_decompress * slabs as i64,
@@ -412,7 +417,11 @@ impl Engine {
                             let row_key = index_row_key(entry_key, prefix_len, &suffix);
                             let (row, pages, slabs) =
                                 store.get_with_units(row_key, &plan.rel_masks[0])?;
-                            let row = row.expect("an index entry references a stored row");
+                            let row = row.ok_or_else(|| {
+                                crate::error::EngineError::data_corrupted(
+                                    "an index entry references a stored row",
+                                )
+                            })?;
                             meter.charge(
                                 COSTS.page_read * pages as i64
                                     + COSTS.value_decompress * slabs as i64,
@@ -469,7 +478,11 @@ impl Engine {
                                 COSTS.page_read * pages as i64
                                     + COSTS.value_decompress * slabs as i64,
                             );
-                            row.expect("a GIN entry references a stored row")
+                            row.ok_or_else(|| {
+                                crate::error::EngineError::data_corrupted(
+                                    "a GIN entry references a stored row",
+                                )
+                            })?
                         } else {
                             candidate
                         };
@@ -522,7 +535,11 @@ impl Engine {
                                 COSTS.page_read * pages as i64
                                     + COSTS.value_decompress * slabs as i64,
                             );
-                            row.expect("a GiST entry references a stored row")
+                            row.ok_or_else(|| {
+                                crate::error::EngineError::data_corrupted(
+                                    "a GiST entry references a stored row",
+                                )
+                            })?
                         } else {
                             candidate
                         };
@@ -1396,9 +1413,16 @@ impl Engine {
                 // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3):
                 // the entry key is `<index columns> ‖ storage_key`, and `storage_key` is exactly
                 // `io.pk_width` bytes — so the suffix is the row's storage key with no prefix parse.
-                let row_key = &ekey[ekey.len() - io.pk_width..];
+                let row_key = ekey
+                    .len()
+                    .checked_sub(io.pk_width)
+                    .map_or(&[][..], |at| &ekey[at..]);
                 let (row, pages, slabs) = store.get_with_units(row_key, &plan.rel_masks[0])?;
-                let mut row = row.expect("an index entry references a stored row");
+                let mut row = row.ok_or_else(|| {
+                    crate::error::EngineError::data_corrupted(
+                        "an index entry references a stored row",
+                    )
+                })?;
                 meter.charge(
                     COSTS.page_read * pages as i64
                         + COSTS.value_decompress * slabs as i64

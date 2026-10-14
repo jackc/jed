@@ -790,6 +790,9 @@ var SupportedCapabilities = []string{
 	// cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
 	// §12/§14, spec/design/conformance.md). Reconstructed in memory via LoadEngine.
 	"harness.fixture_open",
+	// The `# fixture: <path> error <SQLSTATE>` form asserts that opening a forged image fails with
+	// that SQLSTATE — the open-time half of the malformed-page regressions (storage.md §6).
+	"harness.fixture_open_error",
 	// The `# attach: <name>` directive attaches a fresh empty read-write in-memory database to the
 	// running handle before the records run, so the corpus can populate + join across attachments
 	// (spec/design/attached-databases.md §6). In-memory attachments cannot survive the disk reopen, so

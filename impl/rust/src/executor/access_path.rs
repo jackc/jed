@@ -324,7 +324,12 @@ impl Engine {
             let (row, n, s) = store.get_with_units(&key, mask)?;
             pages += n;
             slabs += s;
-            rows.push((key, row.expect("a GIN entry references a stored row")));
+            rows.push((
+                key,
+                row.ok_or_else(|| {
+                    crate::error::EngineError::data_corrupted("a GIN entry references a stored row")
+                })?,
+            ));
         }
         Ok((rows, (pages, slabs)))
     }
@@ -422,7 +427,14 @@ impl Engine {
             let (row, n, s) = store.get_with_units(&key, mask)?;
             pages += n;
             slabs += s;
-            rows.push((key, row.expect("a GiST entry references a stored row")));
+            rows.push((
+                key,
+                row.ok_or_else(|| {
+                    crate::error::EngineError::data_corrupted(
+                        "a GiST entry references a stored row",
+                    )
+                })?,
+            ));
         }
         Ok((rows, (pages, slabs)))
     }
@@ -456,13 +468,16 @@ pub(crate) fn index_store_bound_entries(
                 _ => 1 + ty.width_bytes(),
             };
         }
-        let row_key = &ekey[at..];
+        // A corrupt entry shorter than its components yields an empty storage key (no row).
+        let row_key = ekey.get(at..).unwrap_or(&[]);
         let (row, n, s) = store.get_with_units(row_key, mask)?;
         pages += n;
         slabs += s;
         rows.push((
             row_key.to_vec(),
-            row.expect("an index entry references a stored row"),
+            row.ok_or_else(|| {
+                crate::error::EngineError::data_corrupted("an index entry references a stored row")
+            })?,
         ));
     }
     Ok((rows, (pages, slabs)))

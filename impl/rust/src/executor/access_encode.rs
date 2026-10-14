@@ -3584,12 +3584,22 @@ pub(crate) fn encode_key_value(
     value: &Value,
     coll: Option<&Collation>,
 ) -> Result<Vec<u8>> {
+    // The integer codec takes its width from `ty`, which must then be a fixed-width integer-coded type.
+    let int_key = |n: i64| match ty {
+        ScalarType::Int16
+        | ScalarType::Int32
+        | ScalarType::Int64
+        | ScalarType::Timestamp
+        | ScalarType::Timestamptz
+        | ScalarType::Date => Ok(encode_int(ty, n)),
+        _ => Err(key_kind_mismatch()),
+    };
     Ok(match value {
-        Value::Int(n) => encode_int(ty, *n),
+        Value::Int(n) => int_key(*n)?,
         Value::Bool(b) => encode_bool(*b),
         Value::Uuid(u) => u.to_vec(),
-        Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(ty, *m),
-        Value::Date(d) => encode_int(ty, *d as i64),
+        Value::Timestamp(m) | Value::Timestamptz(m) => int_key(*m)?,
+        Value::Date(d) => int_key(*d as i64)?,
         Value::Text(s) => match coll {
             Some(c) => collation::sort_key(c, s)?,
             None => encode_terminated(s.as_bytes()),
@@ -3602,10 +3612,15 @@ pub(crate) fn encode_key_value(
         Value::Unfetched(u) => {
             return encode_key_value(ty, &crate::format::resolve_unfetched_self(u)?, coll);
         }
-        _ => unreachable!(
-            "encode_key_value: a non-keyable scalar value (every key site's type passes a keyability gate)"
-        ),
+        // Every key site's type passes a keyability gate, so a value of another kind came from a
+        // page that disagrees with its column type.
+        _ => return Err(key_kind_mismatch()),
     })
+}
+
+/// `XX001` for a key value whose kind does not match its column type (storage.md §7).
+fn key_kind_mismatch() -> EngineError {
+    EngineError::data_corrupted("a key value does not match its column type")
 }
 
 /// `value` with a lazily-**deferred** large value (`Value::Unfetched` — a spilled/compressed column
@@ -3659,21 +3674,18 @@ pub(crate) fn encode_typed_key(
         Value::Unfetched(u) => {
             encode_typed_key(ty, &crate::format::resolve_unfetched_self(u)?, coll)
         }
-        Value::Range(rv) => {
-            let elem = ty
-                .range_element()
-                .expect("a range key value has a range column type")
-                .scalar();
-            Ok(crate::range::encode_range_key(elem, rv))
-        }
-        Value::Array(a) => {
-            let elem = ty
-                .array_element()
-                .expect("an array key value has an array column type")
-                .scalar();
-            encode_array_key(elem, a, coll)
-        }
-        _ => encode_key_value(ty.scalar(), value, coll),
+        Value::Range(rv) => match ty.range_element() {
+            Some(Type::Scalar(elem)) => crate::range::encode_range_key(*elem, rv),
+            _ => Err(key_kind_mismatch()),
+        },
+        Value::Array(a) => match ty.array_element() {
+            Some(Type::Scalar(elem)) => encode_array_key(*elem, a, coll),
+            _ => Err(key_kind_mismatch()),
+        },
+        _ => match ty {
+            Type::Scalar(s) => encode_key_value(*s, value, coll),
+            _ => Err(key_kind_mismatch()),
+        },
     }
 }
 
@@ -3694,15 +3706,24 @@ pub(crate) fn encode_key_ct(
         (_, Value::Unfetched(u)) => {
             encode_key_ct(ct, &crate::format::resolve_unfetched_self(u)?, coll)
         }
+        // Writes reject a NULL key member (23502) before encoding, so a NULL here was read from a
+        // page whose null bitmap lies.
+        (_, Value::Null) => Err(EngineError::data_corrupted(
+            "a stored key column holds NULL",
+        )),
         (ColType::Composite { fields, .. }, Value::Composite(vals)) => {
             encode_composite_key(fields, vals)
         }
-        (ColType::Range(elem), Value::Range(rv)) => {
-            Ok(crate::range::encode_range_key(elem.scalar(), rv))
-        }
-        (ColType::Array(elem), Value::Array(a)) => encode_array_key(elem.scalar(), a, coll),
+        (ColType::Range(elem), Value::Range(rv)) => match &**elem {
+            ColType::Scalar(s) => crate::range::encode_range_key(*s, rv),
+            _ => Err(key_kind_mismatch()),
+        },
+        (ColType::Array(elem), Value::Array(a)) => match &**elem {
+            ColType::Scalar(s) => encode_array_key(*s, a, coll),
+            _ => Err(key_kind_mismatch()),
+        },
         (ColType::Scalar(s), _) => encode_key_value(*s, value, coll),
-        _ => unreachable!("ColType/Value kind mismatch in encode_key_ct (resolver-checked)"),
+        _ => Err(key_kind_mismatch()),
     }
 }
 

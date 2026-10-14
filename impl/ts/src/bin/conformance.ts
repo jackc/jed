@@ -124,12 +124,22 @@ function parseTimezoneDirective(line: string): string | null {
 // to run a file against a PRE-BUILT database image instead of a fresh database, so a test can exercise
 // on-disk state SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded index — the
 // skew read-safety regression, spec/design/collation.md §12/§14). The path is relative to spec/.
-// Gated by the harness.fixture_open capability. Returns the path, or null if not this directive.
-function parseFixtureDirective(line: string): string | null {
+// Gated by the harness.fixture_open capability. The form `# fixture: <path> error <SQLSTATE>`
+// (harness.fixture_open_error) instead requires the open to FAIL with that engine error, and the file
+// then runs no records. Returns the path and the expected open error (null for a plain fixture), or
+// null if not this directive.
+function parseFixtureDirective(line: string): { path: string; wantCode: string | null } | null {
   const rest = line.replace(/^#/, "").trim();
   if (!rest.startsWith("fixture:")) return null;
-  const body = rest.slice("fixture:".length).trim();
-  return body === "" ? null : body;
+  const fields = rest
+    .slice("fixture:".length)
+    .trim()
+    .split(/\s+/)
+    .filter((f) => f !== "");
+  if (fields.length === 1) return { path: fields[0]!, wantCode: null };
+  if (fields.length === 3 && fields[1] === "error")
+    return { path: fields[0]!, wantCode: fields[2]! };
+  return null;
 }
 
 // parseUpgradeCollationsDirective reports whether the line is a `# upgrade-collations:` directive — a
@@ -732,8 +742,21 @@ function runFile(text: string, disk: boolean): void {
         // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `new Engine()`
         // above — appears in the header before any record (spec/design/conformance.md).
         const fx = parseFixtureDirective(line);
+        if (fx !== null && fx.wantCode !== null) {
+          let opened: Database;
+          try {
+            opened = openFixture(fx.path);
+          } catch (e) {
+            if (e instanceof EngineError && e.code() === fx.wantCode) return; // failed as required
+            throw new Error(
+              `fixture ${fx.path}: expected open error ${fx.wantCode}, got ${String(e)}`,
+            );
+          }
+          opened.close();
+          throw new Error(`fixture ${fx.path} opened, expected error ${fx.wantCode}`);
+        }
         if (fx !== null) {
-          attachDb = openFixture(fx);
+          attachDb = openFixture(fx.path);
           db = attachDb.session();
           onTemp = false; // the handle is now the fixture image, not the reopenable temp file
           c.i++;
