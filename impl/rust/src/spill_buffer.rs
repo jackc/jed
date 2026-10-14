@@ -1,38 +1,32 @@
 //! Repeatable row spools and lookup-only state for blocking operators. Scratch I/O is unmetered.
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::io::{BufReader, BufWriter, Write};
 use std::sync::Arc;
 
 use crate::cost::StateCharge;
 use crate::error::{EngineError, Result, SqlState};
 use crate::memsize::{hash_row_bytes, key_bytes, map_entry_bytes};
-use crate::spill::{create_spill_file, read_row, row_bytes, write_row};
+use crate::spill::{read_row, row_bytes, write_row};
+use crate::spillhost::{SpillAppender, SpillFile, SpillHost, SpillReader, read_exact_at};
 use crate::storage::Row;
 
 fn io_error(e: std::io::Error) -> EngineError {
     EngineError::new(SqlState::IoError, format!("blocking operator scratch: {e}"))
 }
 
-pub(crate) struct Scratch {
-    path: PathBuf,
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
+/// A scratch file from the spill host, shared by its writer and readers; it is deleted when the last
+/// of them drops.
+type Scratch = Arc<dyn SpillFile>;
 
 pub(crate) struct RowSpool {
     budget: usize,
-    dir: PathBuf,
+    spill: Arc<dyn SpillHost>,
     bytes: usize,
     rows: Arc<Vec<Row>>,
-    scratch: Option<Arc<Scratch>>,
-    file: Option<RefCell<BufWriter<File>>>,
+    scratch: Option<Scratch>,
+    file: Option<RefCell<BufWriter<SpillAppender>>>,
     total: usize,
     /// The resident rows' query-memory charge (memory.md §6.6): `row_bytes` per resident row, returned
     /// when the spool spills, and otherwise when the spool (or the reader it was consumed into) is
@@ -42,16 +36,16 @@ pub(crate) struct RowSpool {
 
 impl Drop for RowSpool {
     fn drop(&mut self) {
-        // Windows cannot unlink an open scratch file. Close the writer before its owner unlinks.
+        // Flush-free teardown: the scratch file is deleted when its last owner drops.
         drop(self.file.take());
     }
 }
 
 impl RowSpool {
-    pub(crate) fn new(budget: usize, dir: PathBuf, charge: StateCharge) -> Self {
+    pub(crate) fn new(budget: usize, spill: Arc<dyn SpillHost>, charge: StateCharge) -> Self {
         Self {
             budget,
-            dir,
+            spill,
             bytes: 0,
             rows: Arc::new(Vec::new()),
             scratch: None,
@@ -74,9 +68,9 @@ impl RowSpool {
             self.bytes = self.bytes.saturating_add(bytes);
         }
         if self.file.is_none() && (rejected || self.bytes > self.budget) {
-            let (path, file) = create_spill_file(&self.dir)?;
-            let mut file = BufWriter::new(file);
-            self.scratch = Some(Arc::new(Scratch { path }));
+            let scratch: Scratch = Arc::from(self.spill.create("rows")?);
+            let mut file = BufWriter::new(SpillAppender::new(scratch.clone(), 0));
+            self.scratch = Some(scratch);
             for old in self.rows.iter() {
                 write_row(&mut file, old).map_err(io_error)?;
             }
@@ -99,8 +93,7 @@ impl RowSpool {
         }
         let reader = match &self.scratch {
             Some(scratch) => SpoolReaderInner::File {
-                file: BufReader::new(File::open(&scratch.path).map_err(io_error)?),
-                scratch: scratch.clone(),
+                file: BufReader::new(SpillReader::new(scratch.clone(), 0)),
                 remaining: self.total,
             },
             None => SpoolReaderInner::Shared {
@@ -143,9 +136,9 @@ enum SpoolReaderInner {
         rows: Arc<Vec<Row>>,
         position: usize,
     },
+    /// The reader shares ownership of the scratch file, so it outlives the spool.
     File {
-        file: BufReader<File>,
-        scratch: Arc<Scratch>,
+        file: BufReader<SpillReader>,
         remaining: usize,
     },
 }
@@ -166,12 +159,7 @@ impl SpoolReader {
                 }
                 Ok(row)
             }
-            SpoolReaderInner::File {
-                file,
-                remaining,
-                scratch,
-            } => {
-                let _ = scratch; // retain cleanup ownership until this reader is dropped
+            SpoolReaderInner::File { file, remaining } => {
                 if *remaining == 0 {
                     return Ok(None);
                 }
@@ -188,22 +176,14 @@ impl SpoolReader {
 /// absent: a separate source-order spool owns group emission order.
 pub(crate) struct StateMap {
     budget: usize,
-    dir: PathBuf,
+    spill: Arc<dyn SpillHost>,
     bytes: usize,
     memory: HashMap<Row, Row>,
-    disk: Option<(Arc<Scratch>, File)>,
+    /// The scratch file once spilled, and its end (where the next record appends).
+    disk: Option<(Scratch, u64)>,
     heads: Box<[u64; 4096]>,
     /// The resident entries' query-memory charge (memory.md §6.6), returned on spill or discard.
     charge: StateCharge,
-}
-
-impl Drop for StateMap {
-    fn drop(&mut self) {
-        if let Some((scratch, file)) = self.disk.take() {
-            drop(file);
-            drop(scratch);
-        }
-    }
 }
 
 /// A DISTINCT dedup set: an in-memory set (an in-memory database or unlimited `work_mem`), or a
@@ -214,9 +194,13 @@ pub(crate) enum SeenRows {
     Spill(StateMap),
 }
 impl SeenRows {
-    pub(crate) fn new(budget: usize, dir: Option<PathBuf>, charge: StateCharge) -> Self {
-        match dir {
-            Some(dir) if budget > 0 => Self::Spill(StateMap::new(budget, dir, charge)),
+    pub(crate) fn new(
+        budget: usize,
+        spill: Option<Arc<dyn SpillHost>>,
+        charge: StateCharge,
+    ) -> Self {
+        match spill {
+            Some(spill) if budget > 0 => Self::Spill(StateMap::new(budget, spill, charge)),
             _ => Self::Memory(std::collections::HashSet::new(), charge),
         }
     }
@@ -249,10 +233,10 @@ impl SeenRows {
     }
 }
 impl StateMap {
-    pub(crate) fn new(budget: usize, dir: PathBuf, charge: StateCharge) -> Self {
+    pub(crate) fn new(budget: usize, spill: Arc<dyn SpillHost>, charge: StateCharge) -> Self {
         Self {
             budget,
-            dir,
+            spill,
             bytes: 0,
             memory: HashMap::new(),
             disk: None,
@@ -269,20 +253,20 @@ impl StateMap {
         h.finish()
     }
     pub(crate) fn get(&mut self, key: &Row) -> Result<Option<Row>> {
-        let Some((_, file)) = &mut self.disk else {
+        let Some((file, _)) = &self.disk else {
             return Ok(self.memory.get(key).cloned());
         };
         let hash = Self::hash(key);
         let mut offset = self.heads[hash as usize % 4096];
         while offset != 0 {
-            file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+            let at = offset;
             let mut head = [0u8; 16];
-            file.read_exact(&mut head).map_err(io_error)?;
+            read_exact_at(file.as_ref(), at, &mut head).map_err(io_error)?;
             offset = u64::from_be_bytes(head[..8].try_into().unwrap());
             if u64::from_be_bytes(head[8..].try_into().unwrap()) != hash {
                 continue;
             }
-            let mut reader = BufReader::new(&mut *file);
+            let mut reader = BufReader::new(SpillReader::new(file.clone(), at + 16));
             let found = read_row(&mut reader).map_err(io_error)?;
             let value = read_row(&mut reader).map_err(io_error)?;
             if &found == key {
@@ -312,16 +296,11 @@ impl StateMap {
             if !rejected && self.bytes <= self.budget {
                 return Ok(());
             }
-            let (path, file) = create_spill_file(&self.dir)?;
-            let scratch = Arc::new(Scratch { path });
-            self.disk = Some((scratch, file));
-            // Install ownership before the first fallible write, including close-before-unlink.
-            self.disk
-                .as_mut()
-                .unwrap()
-                .1
-                .write_all(&[0])
-                .map_err(io_error)?;
+            let scratch: Scratch = Arc::from(self.spill.create("hash")?);
+            // Install ownership before the first fallible write. Offset 0 is a pad byte, so a
+            // record offset of 0 can mean "no record".
+            self.disk = Some((scratch.clone(), 1));
+            scratch.write_at(0, &[0]).map_err(io_error)?;
             // The entries left memory: the map's whole resident charge goes with them.
             self.charge.release_all();
             for (key, value) in std::mem::take(&mut self.memory) {
@@ -334,14 +313,15 @@ impl StateMap {
     fn append(&mut self, key: Row, value: Row) -> Result<()> {
         let hash = Self::hash(&key);
         let bucket = hash as usize % 4096;
-        let (_, file) = self.disk.as_mut().unwrap();
-        let offset = file.seek(SeekFrom::End(0)).map_err(io_error)?;
+        let (file, end) = self.disk.as_mut().unwrap();
+        let offset = *end;
         let mut record = Vec::new();
         record.extend_from_slice(&self.heads[bucket].to_be_bytes());
         record.extend_from_slice(&hash.to_be_bytes());
         write_row(&mut record, &key).map_err(io_error)?;
         write_row(&mut record, &value).map_err(io_error)?;
-        file.write_all(&record).map_err(io_error)?;
+        file.write_at(offset, &record).map_err(io_error)?;
+        *end += record.len() as u64;
         self.heads[bucket] = offset;
         Ok(())
     }
@@ -358,29 +338,22 @@ impl StateMap {
 /// order. Nonmatching hashes are skipped from a fixed-width header without decoding wide records.
 pub(crate) struct HashRows {
     budget: usize,
-    dir: PathBuf,
+    spill: Arc<dyn SpillHost>,
     bytes: usize,
     memory: HashMap<u64, Arc<Vec<Row>>>,
-    disk: Option<(Arc<Scratch>, File)>,
+    /// The scratch file once spilled, and its end (where the next record appends).
+    disk: Option<(Scratch, u64)>,
     heads: Box<[u64; 4096]>,
     tails: Box<[u64; 4096]>,
     /// The resident rows' query-memory charge (memory.md §6.6), returned on spill or discard.
     charge: StateCharge,
 }
 
-impl Drop for HashRows {
-    fn drop(&mut self) {
-        if let Some((scratch, file)) = self.disk.take() {
-            drop(file);
-            drop(scratch);
-        }
-    }
-}
 impl HashRows {
-    pub(crate) fn new(budget: usize, dir: PathBuf, charge: StateCharge) -> Self {
+    pub(crate) fn new(budget: usize, spill: Arc<dyn SpillHost>, charge: StateCharge) -> Self {
         Self {
             budget,
-            dir,
+            spill,
             bytes: 0,
             memory: HashMap::new(),
             disk: None,
@@ -400,15 +373,9 @@ impl HashRows {
             if !rejected && self.bytes <= self.budget {
                 return Ok(());
             }
-            let (path, file) = create_spill_file(&self.dir)?;
-            let scratch = Arc::new(Scratch { path });
-            self.disk = Some((scratch, file));
-            self.disk
-                .as_mut()
-                .unwrap()
-                .1
-                .write_all(&[0])
-                .map_err(io_error)?;
+            let scratch: Scratch = Arc::from(self.spill.create("hash")?);
+            self.disk = Some((scratch.clone(), 1));
+            scratch.write_at(0, &[0]).map_err(io_error)?;
             // The rows left memory: the table's whole resident charge goes with them.
             self.charge.release_all();
             for (hash, rows) in std::mem::take(&mut self.memory) {
@@ -422,16 +389,16 @@ impl HashRows {
     }
     fn append(&mut self, hash: u64, row: Row) -> Result<()> {
         let bucket = hash as usize % 4096;
-        let (_, file) = self.disk.as_mut().unwrap();
-        let offset = file.seek(SeekFrom::End(0)).map_err(io_error)?;
+        let (file, end) = self.disk.as_mut().unwrap();
+        let offset = *end;
         let mut record = vec![0; 8];
         record.extend_from_slice(&hash.to_be_bytes());
         write_row(&mut record, &row).map_err(io_error)?;
-        file.write_all(&record).map_err(io_error)?;
+        file.write_at(offset, &record).map_err(io_error)?;
+        *end += record.len() as u64;
         if self.tails[bucket] != 0 {
-            file.seek(SeekFrom::Start(self.tails[bucket]))
+            file.write_at(self.tails[bucket], &offset.to_be_bytes())
                 .map_err(io_error)?;
-            file.write_all(&offset.to_be_bytes()).map_err(io_error)?;
         } else {
             self.heads[bucket] = offset;
         }
@@ -441,8 +408,7 @@ impl HashRows {
     pub(crate) fn reader(&self, hash: u64) -> Result<HashRowsReader> {
         if let Some((scratch, _)) = &self.disk {
             Ok(HashRowsReader::File {
-                file: File::open(&scratch.path).map_err(io_error)?,
-                scratch: scratch.clone(),
+                file: scratch.clone(),
                 offset: self.heads[hash as usize % 4096],
                 hash,
             })
@@ -460,9 +426,9 @@ pub(crate) enum HashRowsReader {
         rows: Arc<Vec<Row>>,
         position: usize,
     },
+    /// The reader shares ownership of the scratch file, so it outlives the table.
     File {
-        file: File,
-        scratch: Arc<Scratch>,
+        file: Scratch,
         offset: u64,
         hash: u64,
     },
@@ -477,20 +443,15 @@ impl HashRowsReader {
                 }
                 Ok(row)
             }
-            Self::File {
-                file,
-                scratch,
-                offset,
-                hash,
-            } => {
-                let _ = scratch;
+            Self::File { file, offset, hash } => {
                 while *offset != 0 {
-                    file.seek(SeekFrom::Start(*offset)).map_err(io_error)?;
+                    let at = *offset;
                     let mut header = [0u8; 16];
-                    file.read_exact(&mut header).map_err(io_error)?;
+                    read_exact_at(file.as_ref(), at, &mut header).map_err(io_error)?;
                     *offset = u64::from_be_bytes(header[..8].try_into().unwrap());
                     if u64::from_be_bytes(header[8..].try_into().unwrap()) == *hash {
-                        return Ok(Some(read_row(&mut BufReader::new(file)).map_err(io_error)?));
+                        let mut reader = BufReader::new(SpillReader::new(file.clone(), at + 16));
+                        return Ok(Some(read_row(&mut reader).map_err(io_error)?));
                     }
                 }
                 Ok(None)
@@ -502,19 +463,20 @@ impl HashRowsReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spillhost::os_spill_host;
     use crate::value::{ArrayVal, Value};
 
     #[test]
     fn spilling_spool_replays_bounded_rows_and_owns_cursor_cleanup() {
         let dir = std::env::temp_dir();
-        let mut spool = RowSpool::new(64, dir, StateCharge::default());
+        let mut spool = RowSpool::new(64, os_spill_host(dir), StateCharge::default());
         for i in 0..2048 {
             spool
                 .push(vec![Value::Int(i), Value::Array(ArrayVal::empty())])
                 .unwrap();
         }
         assert!(spool.rows.is_empty());
-        let path = spool.scratch.as_ref().unwrap().path.clone();
+        let path = spool.scratch.as_ref().unwrap().path().unwrap();
         for _ in 0..2 {
             let mut reader = spool.reader().unwrap();
             for i in 0..2048 {
@@ -531,14 +493,18 @@ mod tests {
 
     #[test]
     fn spilling_state_map_retains_no_resident_key_directory() {
-        let mut state = StateMap::new(64, std::env::temp_dir(), StateCharge::default());
+        let mut state = StateMap::new(
+            64,
+            os_spill_host(std::env::temp_dir()),
+            StateCharge::default(),
+        );
         for i in 0..4096 {
             state
                 .put(vec![Value::Int(i)], vec![Value::Int(i * 3)])
                 .unwrap();
         }
         assert!(state.memory.is_empty());
-        let path = state.disk.as_ref().unwrap().0.path.clone();
+        let path = state.disk.as_ref().unwrap().0.path().unwrap();
         for i in 0..4096 {
             assert_eq!(
                 state.get(&vec![Value::Int(i)]).unwrap(),
@@ -559,7 +525,11 @@ mod tests {
 
     #[test]
     fn spilling_hash_rows_bounds_hot_keys_collisions_and_descriptors() {
-        let mut rows = HashRows::new(64, std::env::temp_dir(), StateCharge::default());
+        let mut rows = HashRows::new(
+            64,
+            os_spill_host(std::env::temp_dir()),
+            StateCharge::default(),
+        );
         for i in 0..4096 {
             // Same directory slot, different full hash. The reader must skip the other chain's
             // payload and retain insertion order for the hot key, even when every record spills.
@@ -568,7 +538,7 @@ mod tests {
         }
         assert!(rows.memory.is_empty());
         assert_eq!(rows.heads.len(), 4096);
-        let path = rows.disk.as_ref().unwrap().0.path.clone();
+        let path = rows.disk.as_ref().unwrap().0.path().unwrap();
         let mut scan = rows.reader(7).unwrap();
         for i in 0..4096 {
             if i % 3 != 0 {
@@ -597,7 +567,11 @@ mod tests {
         let row = |i: i64| vec![Value::Int(i), Value::Text("x".repeat(40))];
 
         let acct = account();
-        let mut spool = RowSpool::new(budget, std::env::temp_dir(), StateCharge::new(acct.clone()));
+        let mut spool = RowSpool::new(
+            budget,
+            os_spill_host(std::env::temp_dir()),
+            StateCharge::new(acct.clone()),
+        );
         for i in 0..100 {
             spool.push(row(i)).unwrap();
             assert!(acct.used.get() <= acct.limit);
@@ -610,7 +584,11 @@ mod tests {
         }
 
         let acct = account();
-        let mut state = StateMap::new(budget, std::env::temp_dir(), StateCharge::new(acct.clone()));
+        let mut state = StateMap::new(
+            budget,
+            os_spill_host(std::env::temp_dir()),
+            StateCharge::new(acct.clone()),
+        );
         for i in 0..100 {
             state.put(vec![Value::Int(i)], row(i)).unwrap();
         }
@@ -619,7 +597,11 @@ mod tests {
         assert_eq!(state.get(&vec![Value::Int(42)]).unwrap(), Some(row(42)));
 
         let acct = account();
-        let mut rows = HashRows::new(budget, std::env::temp_dir(), StateCharge::new(acct.clone()));
+        let mut rows = HashRows::new(
+            budget,
+            os_spill_host(std::env::temp_dir()),
+            StateCharge::new(acct.clone()),
+        );
         for i in 0..100 {
             rows.push(7, row(i)).unwrap();
         }
@@ -633,10 +615,14 @@ mod tests {
 
     #[test]
     fn scratch_read_failures_return_io_error_and_cleanup() {
-        let mut spool = RowSpool::new(1, std::env::temp_dir(), StateCharge::default());
+        let mut spool = RowSpool::new(
+            1,
+            os_spill_host(std::env::temp_dir()),
+            StateCharge::default(),
+        );
         spool.push(vec![Value::Int(123)]).unwrap();
         let mut reader = spool.reader().unwrap();
-        let path = spool.scratch.as_ref().unwrap().path.clone();
+        let path = spool.scratch.as_ref().unwrap().path().unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)

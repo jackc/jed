@@ -238,7 +238,7 @@ impl Engine {
         let mut passed = 0i64;
         let mut seen = crate::spill_buffer::SeenRows::new(
             self.session.work_mem,
-            self.spill_dir.clone(),
+            self.spill.clone(),
             meter.state_charge(),
         );
         let can_pull = plan.limit != Some(0);
@@ -829,7 +829,7 @@ impl Engine {
         e.page_size = self.page_size;
         e.paging = self.paging.clone();
         e.path = self.path.clone();
-        e.spill_dir = self.spill_dir.clone();
+        e.spill = self.spill.clone();
         e.read_only = self.read_only;
         let src = &self.session;
         let dst = &mut e.session;
@@ -1156,7 +1156,7 @@ impl Engine {
                 distinct,
                 seen: crate::spill_buffer::SeenRows::new(
                     self.session.work_mem,
-                    self.spill_dir.clone(),
+                    self.spill.clone(),
                     seen_charge,
                 ),
                 passed: 0,
@@ -2106,7 +2106,7 @@ impl Engine {
         crate::spill::Sorter::new(
             order.to_vec(),
             self.session.work_mem,
-            self.spill_dir.clone(),
+            self.spill.clone(),
             crate::cost::StateCharge::new(self.session.query_account()),
         )
     }

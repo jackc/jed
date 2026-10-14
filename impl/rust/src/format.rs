@@ -4165,6 +4165,16 @@ pub(crate) fn sim_selected_meta(paging: &SharedPaging) -> Result<SimMeta> {
     Err(corrupt("no meta page was selected by the open"))
 }
 
+/// The page high-water and live page count of the meta slot of `image` holding version `v`
+/// (the simulator's bounded-growth check, spec/design/simulation-testing.md §8.3).
+#[cfg(feature = "sim")]
+pub(crate) fn sim_meta_of(image: &[u8], ps: u32, v: u64) -> Option<(u32, u32)> {
+    (0..2)
+        .filter_map(|slot| read_meta(image, ps as usize, slot))
+        .find(|m| m.txid == v)
+        .map(|m| (m.page_count, m.live_pages))
+}
+
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole
 /// image) and the demand-paged loader (which reads meta slots 0/1 as individual blocks).
 fn parse_meta(m: &[u8]) -> Option<Meta> {

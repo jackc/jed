@@ -15,7 +15,7 @@ func TestBlockingSpillMatchesResidentAndCleansUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.spillDir = dir
+	db.spill = osSpillHost{dir: dir}
 	mustExec(t, db, "CREATE TABLE a(id i32 PRIMARY KEY, k i32, v decimal, f f64)")
 	mustExec(t, db, "CREATE TABLE b(id i32 PRIMARY KEY, k i32)")
 	for i := 0; i < 80; i++ {
@@ -74,7 +74,7 @@ func assertNoBlockingScratch(t *testing.T, dir string) {
 
 func TestBlockingSpoolAndHashStateStayBounded(t *testing.T) {
 	dir := t.TempDir()
-	db := &engine{spillDir: dir, session: newSession()}
+	db := &engine{spill: osSpillHost{dir: dir}, session: newSession()}
 	db.session.workMem = 128
 	spool := newRowSpool(db)
 	defer spool.close()
@@ -115,7 +115,7 @@ func TestBlockingSpillScratchFailure(t *testing.T) {
 	mustExec(t, db, "CREATE TABLE a(id i32 PRIMARY KEY, k i32)")
 	mustExec(t, db, "INSERT INTO a VALUES (1,1),(2,1),(3,2)")
 	db.SetWorkMem(1)
-	db.spillDir = filepath.Join(dir, "missing")
+	db.spill = osSpillHost{dir: filepath.Join(dir, "missing")}
 	_, err = queryOutcome(db, "SELECT k,count(*) FROM a GROUP BY k", nil)
 	if err == nil || !strings.Contains(err.Error(), "58030") {
 		t.Fatalf("scratch failure: %v", err)
@@ -124,7 +124,7 @@ func TestBlockingSpillScratchFailure(t *testing.T) {
 
 func TestBlockingVariableAggregatesSpill(t *testing.T) {
 	dir := t.TempDir()
-	db := &engine{spillDir: dir, session: newSession()}
+	db := &engine{spill: osSpillHost{dir: dir}, session: newSession()}
 	db.session.workMem = 128
 	for _, plan := range []aggPlan{planPercentileDisc, planMode, planJsonbAgg, planJsonbObjectAgg} {
 		t.Run(fmt.Sprint(plan), func(t *testing.T) {
@@ -249,7 +249,7 @@ func TestBlockingSpillFailuresAndEarlyCursorClose(t *testing.T) {
 
 func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 	dir := t.TempDir()
-	s := newSorter([]orderSlot{{idx: 0}}, 1, dir, nil)
+	s := newSorter([]orderSlot{{idx: 0}}, 1, osSpillHost{dir: dir}, nil)
 	defer s.close()
 	for i := 0; i < 1000; i++ {
 		if err := s.push(storedRow{IntValue(int64(i % 7)), IntValue(int64(i))}); err != nil {
@@ -279,7 +279,7 @@ func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 		}
 		key, previous = r[0].Int, r[1].Int
 	}
-	d, err := newDiskBuckets(dir)
+	d, err := newDiskBuckets(osSpillHost{dir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 // (memory.md §6.6).
 func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
 	dir := t.TempDir()
-	db := &engine{spillDir: dir, session: newSession()}
+	db := &engine{spill: osSpillHost{dir: dir}, session: newSession()}
 	db.session.workMem = 1 << 30
 	account := func() (queryAccount, *stateCharge) {
 		acct := queryAccount{used: new(int64), limit: 200}
@@ -336,7 +336,7 @@ func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
 	rows.charge = charge3
 	defer rows.close()
 	acct4, charge4 := account()
-	sorter := newSorter([]orderSlot{{idx: 0}}, db.session.workMem, dir, charge4)
+	sorter := newSorter([]orderSlot{{idx: 0}}, db.session.workMem, osSpillHost{dir: dir}, charge4)
 	defer sorter.close()
 	for i := 0; i < 100; i++ {
 		if err := spool.push(row(i)); err != nil {

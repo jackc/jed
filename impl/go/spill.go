@@ -16,7 +16,6 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"io"
-	"os"
 	"slices"
 )
 
@@ -47,16 +46,16 @@ func cmpRows(keys []orderSlot, a, b storedRow) int {
 
 // sorter is the external merge sorter (spec/design/spill.md §4). Push rows, then finish to read them
 // back in ORDER BY order. Bounds resident memory to budget bytes by spilling sorted runs; an
-// in-memory database (spillDir == "") or unlimited budget keeps everything resident and just
+// in-memory database (no spill host) or unlimited budget keeps everything resident and just
 // stable-sorts at the end.
 type sorter struct {
 	keys      []orderSlot
-	budget    int    // 0 ⇒ unlimited (never spill)
-	spillDir  string // "" ⇒ never spill (in-memory database)
+	budget    int       // 0 ⇒ unlimited (never spill)
+	spill     spillHost // nil ⇒ never spill (in-memory database)
 	buf       []storedRow
 	bufBytes  int
-	runLevels []uint8  // binary compaction levels; at most 64 live runs
-	runs      []string // spilled run file paths, in input order (run 0 = first chunk — spill.md §6)
+	runLevels []uint8     // binary compaction levels; at most 64 live runs
+	runs      []spillFile // spilled run files, in input order (run 0 = first chunk — spill.md §6)
 	total     int
 	// charge is the query-memory charge of the resident run (memory.md §6.4): reserved per pushed
 	// row, returned when a run spills, and handed to the sortedRows at finish so it is returned when
@@ -64,20 +63,20 @@ type sorter struct {
 	charge *stateCharge
 }
 
-func newSorter(keys []orderSlot, budget int, spillDir string, charge *stateCharge) *sorter {
-	return &sorter{keys: keys, budget: budget, spillDir: spillDir, charge: charge}
+func newSorter(keys []orderSlot, budget int, spill spillHost, charge *stateCharge) *sorter {
+	return &sorter{keys: keys, budget: budget, spill: spill, charge: charge}
 }
 
 func (s *sorter) close() {
-	for _, path := range s.runs {
-		_ = os.Remove(path)
+	for _, run := range s.runs {
+		_ = run.close()
 	}
 	s.runs = nil
 	s.buf = nil
 	s.charge.releaseAll()
 }
 
-func (s *sorter) canSpill() bool { return s.spillDir != "" && s.budget > 0 }
+func (s *sorter) canSpill() bool { return s.spill != nil && s.budget > 0 }
 
 // push adds one row, spilling the current run when the in-memory buffer exceeds the budget or when
 // the account rejects the row's reservation — the rejected row is never charged and leaves with the
@@ -109,33 +108,21 @@ func (s *sorter) sortBuf() {
 // spillRun stable-sorts the in-memory buffer and writes it as one sorted run file, then clears it.
 func (s *sorter) spillRun() error {
 	s.sortBuf()
-	f, err := os.CreateTemp(s.spillDir, "jed-spill-*.tmp")
+	f, err := s.spill.create("sort")
 	if err != nil {
-		return ioError(err)
+		return err
 	}
-	path := f.Name()
-	keep := false
-	defer func() {
-		if !keep {
-			_ = f.Close()
-			_ = os.Remove(path)
-		}
-	}()
-	w := bufio.NewWriter(f)
+	w := bufio.NewWriter(&spillAppender{f: f})
 	spillWriteU64(w, uint64(len(s.buf)))
 	for _, row := range s.buf {
 		spillWriteRow(w, row)
 	}
 	if err := w.Flush(); err != nil {
-		_ = f.Close()
+		_ = f.close()
 		return ioError(err)
 	}
-	if err := f.Close(); err != nil {
-		return ioError(err)
-	}
-	s.runs = append(s.runs, path)
+	s.runs = append(s.runs, f)
 	s.runLevels = append(s.runLevels, 0)
-	keep = true
 	s.buf = nil
 	s.bufBytes = 0
 	// The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6).
@@ -158,38 +145,38 @@ func (s *sorter) spillRun() error {
 
 // Binary compaction bounds both the final merge fan-in and the run directory.
 // Merges join adjacent input intervals, retaining the old stable tie-break.
-func (s *sorter) mergeRunPair(left, right string) (string, error) {
+// The merged run replaces both inputs, which it closes (deleting them) on success or failure.
+func (s *sorter) mergeRunPair(left, right spillFile) (spillFile, error) {
 	a, err := openRunSource(left)
 	if err != nil {
-		return "", err
+		_ = right.close()
+		return nil, err
 	}
 	defer a.close()
 	b, err := openRunSource(right)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer b.close()
-	f, err := os.CreateTemp(s.spillDir, "jed-spill-merge-*.tmp")
+	f, err := s.spill.create("merge")
 	if err != nil {
-		return "", ioError(err)
+		return nil, err
 	}
-	path := f.Name()
 	keep := false
 	defer func() {
-		_ = f.Close()
 		if !keep {
-			_ = os.Remove(path)
+			_ = f.close()
 		}
 	}()
-	w := bufio.NewWriter(f)
+	w := bufio.NewWriter(&spillAppender{f: f})
 	spillWriteU64(w, a.remaining+b.remaining)
 	ar, ah, err := a.next()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	br, bh, err := b.next()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	for ah || bh {
 		if ah && (!bh || cmpRows(s.keys, ar, br) <= 0) {
@@ -200,17 +187,14 @@ func (s *sorter) mergeRunPair(left, right string) (string, error) {
 			br, bh, err = b.next()
 		}
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 	if err = w.Flush(); err != nil {
-		return "", ioError(err)
-	}
-	if err = f.Close(); err != nil {
-		return "", ioError(err)
+		return nil, ioError(err)
 	}
 	keep = true
-	return path, nil
+	return f, nil
 }
 
 // finish returns the rows in ORDER BY order. With no spilled run this is the unchanged in-memory
@@ -228,12 +212,16 @@ func (s *sorter) finish() (*sortedRows, error) {
 	// Sources: each spilled run, then the final in-memory buffer last (the latest input positions →
 	// the highest source index, the tie-break that reproduces input order — spill.md §6).
 	sources := make([]*mergeSource, 0, len(s.runs)+1)
-	for _, path := range s.runs {
-		src, err := openRunSource(path)
+	for i, run := range s.runs {
+		src, err := openRunSource(run)
 		if err != nil {
 			for _, o := range sources {
 				o.close()
 			}
+			for _, rest := range s.runs[i+1:] {
+				_ = rest.close()
+			}
+			s.runs = nil
 			charge.releaseAll()
 			return nil, err
 		}
@@ -338,27 +326,23 @@ func (m *merger) next() (storedRow, bool, error) {
 // final in-memory buffer.
 type mergeSource struct {
 	isFile    bool
-	f         *os.File
+	f         spillFile
 	r         *bufio.Reader
-	path      string
 	remaining uint64
 	mem       []storedRow
 	memIdx    int
 }
 
-func openRunSource(path string) (*mergeSource, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, ioError(err)
-	}
-	r := bufio.NewReader(f)
+// openRunSource reads a spilled run back from its start; it owns f, closing (deleting) it when the
+// run is exhausted, on close, or here on failure.
+func openRunSource(f spillFile) (*mergeSource, error) {
+	r := bufio.NewReader(spillReader(f))
 	remaining, err := spillReadU64(r)
 	if err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
+		_ = f.close()
 		return nil, ioError(err)
 	}
-	return &mergeSource{isFile: true, f: f, r: r, path: path, remaining: remaining}, nil
+	return &mergeSource{isFile: true, f: f, r: r, remaining: remaining}, nil
 }
 
 func (s *mergeSource) next() (storedRow, bool, error) {
@@ -384,8 +368,7 @@ func (s *mergeSource) next() (storedRow, bool, error) {
 
 func (s *mergeSource) close() {
 	if s.isFile && s.f != nil {
-		_ = s.f.Close()
-		_ = os.Remove(s.path)
+		_ = s.f.close()
 		s.f = nil
 	}
 }

@@ -11,6 +11,8 @@ max_tables = 3
 max_rows = 300                   # a table stops growing past this many ids
 batch = [1, 40]                  # rows per INSERT / upsert
 max_readers = 3
+attachments = 0                  # file attachments a1..aN the generator may attach (attachments.toml)
+attached_writes = 0              # the chance a write transaction or a new table targets an attachment
 
 # Relative weights of generator actions (scripts/sim_gen.rb). An action that is impossible in the
 # current state (e.g. a statement with no write session open) is skipped for that draw.
@@ -38,6 +40,12 @@ reopen = 1
 clock = 1
 crash_power = 1
 crash_process = 1
+compact = 0
+attach = 0
+corrupt = 0
+temp_table = 0
+temp_insert = 0
+temp_read = 0
 
 # Value shapes for text/bytea columns (relative weights).
 [values]
@@ -60,3 +68,7 @@ survive = [100, 900]
 tear = [0, 400]
 issue = [200, 900]
 io_p = [50, 500]
+attach_fault = 0                # the chance an attach that creates its file is crashed
+spill_fault = 0                 # the chance a statement that may spill is armed with spill_error
+flips = [1, 3]                  # corrupt: bits flipped per step
+reseal = 0                      # corrupt: the chance a step recomputes the flipped pages' checksums

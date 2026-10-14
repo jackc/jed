@@ -13,21 +13,26 @@
 //! `JED_SIM_IN` is one .sim file, a directory of them, or a file listing trace paths one per line.
 //! Results append to `JED_SIM_RESULTS` (default `JED_SIM_OUT/rust.results.jsonl`). With
 //! `JED_SIM_IMAGES` set, every image a recovery opens is written to
-//! `JED_SIM_OUT/<trace>.rust.step<N>.img` for the independent checker.
+//! `JED_SIM_OUT/<trace>.rust.step<N>.img` (and each file attachment's to
+//! `JED_SIM_OUT/<trace>.rust.step<N>.<name>.img`) for the independent checker.
 
 mod check;
 mod disk;
 mod locks;
 
 use crate::coordinator::FileCoordinator;
+use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES};
 use crate::error::EngineError;
-use crate::executor::{Engine, Snapshot};
-use crate::file::Locking;
+use crate::executor::Engine;
+use crate::file::{DatabaseOptions, Locking};
+use crate::format::sim_meta_of;
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, cache_leaves};
 use crate::seam::seeded_random_source;
-use crate::shared::{Database, Session};
-use disk::{Fault, FaultKind, LANE_SESSION, MAIN_FILE, SimFs, SimHost, SimStore, decide, fnv};
+use crate::shared::{AttachSource, Database, Session};
+use disk::{
+    Fault, FaultKind, LANE_SESSION, MAIN_FILE, SimFs, SimHost, SimSpill, SimStore, decide, fnv,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -171,6 +176,15 @@ fn parse(text: &str) -> Result<Trace, String> {
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
+        let params = |st: &mut Step, kvs: &[&str]| -> Result<(), String> {
+            for kv in kvs {
+                let Some((k, v)) = kv.split_once('=') else {
+                    return Err(format!("line {}: bad parameter {}", n + 1, go_quote(kv)));
+                };
+                st.params.insert(k.to_string(), v.to_string());
+            }
+            Ok(())
+        };
         let mut st = Step {
             line: n + 1,
             kind: fields[0].to_string(),
@@ -216,12 +230,7 @@ fn parse(text: &str) -> Result<Trace, String> {
                     return Err(format!("line {}: {} <kind> [k=v ...]", n + 1, st.kind));
                 }
                 st.mode = fields[1].to_string();
-                for kv in &fields[2..] {
-                    let Some((k, v)) = kv.split_once('=') else {
-                        return Err(format!("line {}: bad parameter {}", n + 1, go_quote(kv)));
-                    };
-                    st.params.insert(k.to_string(), v.to_string());
-                }
+                params(&mut st, &fields[2..])?;
             }
             "clock" => {
                 if fields.len() != 2 || !fields[1].starts_with('+') {
@@ -230,7 +239,20 @@ fn parse(text: &str) -> Result<Trace, String> {
                 st.params
                     .insert("delta".to_string(), fields[1][1..].to_string());
             }
-            "check" | "reopen" | "compact" | "tick" => {}
+            "attach" => {
+                if fields.len() != 2 || fields[1] == "main" || fields[1] == "temp" {
+                    return Err(format!("line {}: attach <name>", n + 1));
+                }
+                st.sid = fields[1].to_string();
+            }
+            "compact" => {
+                if fields.len() > 2 {
+                    return Err(format!("line {}: compact [<database>]", n + 1));
+                }
+                st.sid = fields.get(1).copied().unwrap_or("main").to_string();
+            }
+            "corrupt" => params(&mut st, &fields[1..])?,
+            "check" | "reopen" | "tick" => {}
             other => return Err(format!("line {}: unknown step {}", n + 1, go_quote(other))),
         }
         tr.steps.push(st);
@@ -283,6 +305,11 @@ fn fault_of(st: &Step) -> Result<Fault, String> {
             return Ok(f);
         }
         "enospc" => return Ok(Fault::new(FaultKind::Enospc)),
+        "spill_error" => {
+            let mut f = Fault::new(FaultKind::SpillError);
+            f.p = st.int_param("p");
+            return Ok(f);
+        }
         _ => {}
     }
     let mut params: Vec<_> = st.params.iter().collect();
@@ -453,8 +480,8 @@ fn first_diff(a: &str, b: &str) -> String {
 struct SimSession {
     s: Session,
     write: bool,
-    /// The version a read session pinned (§8.1: what it must keep seeing).
-    pin: u64,
+    /// The version of each database a read session pinned (§8.1: what it must keep seeing).
+    pins: HashMap<String, u64>,
     /// The process the session lives in.
     pid: u32,
 }
@@ -463,6 +490,75 @@ struct SimSession {
 /// its own coordinator over the simulated lock table — S5).
 struct Proc {
     db: Database,
+}
+
+/// One database's oracle state (simulation-testing.md §8.1–8.3): main, or a file attachment (S4),
+/// each with its own versions, history, and durability floor.
+struct SimDb {
+    /// Its file in the simulated filesystem.
+    file: String,
+    /// version → digests of every generation attempted at it
+    history: HashMap<u64, HashSet<String>>,
+    /// The published version.
+    version: u64,
+    /// Its digest.
+    last_digest: String,
+    /// Recovery may never return an older version; 0: the file may vanish ...
+    floor: u64,
+    /// ... nor a newer one than was ever attempted.
+    max_attempted: u64,
+
+    // Bounded growth (§8.3), tracked over one process lifetime: an upper bound on the live count the
+    // engine's reclamation trigger compares against, and what the previous commit left.
+    /// The page high-water now.
+    high: u32,
+    /// ≥ the engine's live-at-last-reclamation.
+    lac_bound: u32,
+    /// The previous commit in this lifetime.
+    last: Growth,
+}
+
+/// What a commit left behind, for the next commit's bounded-growth check.
+#[derive(Clone, Copy, Default)]
+struct Growth {
+    /// A quiet commit that must have reclaimed: its free list holds every dead page.
+    reclaimed: bool,
+    /// Its page high-water.
+    high: u32,
+    /// Its free-list length.
+    free: u32,
+}
+
+impl SimDb {
+    fn new(file: &str) -> SimDb {
+        SimDb {
+            file: file.to_string(),
+            history: HashMap::new(),
+            version: 0,
+            last_digest: String::new(),
+            floor: 0,
+            max_attempted: 0,
+            high: 0,
+            lac_bound: 0,
+            last: Growth::default(),
+        }
+    }
+
+    fn add_history(&mut self, v: u64, d: String) {
+        self.history.entry(v).or_default().insert(d);
+    }
+
+    fn in_history(&self, v: u64, d: &str) -> bool {
+        self.history.get(&v).is_some_and(|set| set.contains(d))
+    }
+}
+
+/// The result of one logical digest: the hash (`None` if a query failed), the text folded (or, on a
+/// failure, what was folded plus the error), and why it failed.
+struct Digest {
+    hash: Option<String>,
+    text: String,
+    err: Option<EngineError>,
 }
 
 struct Runner<'a> {
@@ -474,14 +570,14 @@ struct Runner<'a> {
     clock: Arc<AtomicI64>,
 
     // Handle settings from the header (simulation-testing.md §5, slice S3), applied at every open.
-    /// A session's work_mem; > 0 also gives the database a spill directory.
+    /// A session's work_mem.
     work_mem: i64,
+    /// A session's temp_buffers: past it, a temp domain spills (temp-tables.md §6).
+    temp_buffers: i64,
     /// A trace session's max_query_memory_bytes (the oracles' own reads are unlimited).
     max_query_memory: i64,
     /// The database's max_storage_bytes.
     max_storage_bytes: i64,
-    /// The real scratch directory spill files go to; their bytes are not durable state.
-    spill_dir: Option<PathBuf>,
 
     sessions: HashMap<String, SimSession>,
     /// The database of the process running the current step.
@@ -499,17 +595,9 @@ struct Runner<'a> {
 
     transcript: String,
 
-    // Oracle state (simulation-testing.md §8.1–8.2).
-    /// version → digests of every generation attempted at it
-    history: HashMap<u64, HashSet<String>>,
-    /// The published version.
-    version: u64,
-    /// Its digest.
-    last_digest: String,
-    /// Recovery may never return an older version ...
-    floor: u64,
-    /// ... nor a newer one than was ever attempted.
-    max_attempted: u64,
+    /// Oracle state (simulation-testing.md §8.1–8.3), one per database: main, and each file
+    /// attachment (S4).
+    dbs: BTreeMap<String, SimDb>,
 
     violation: String,
     violation_step: i64,
@@ -519,9 +607,11 @@ struct Runner<'a> {
 
     /// The text the most recent digest folded.
     last_digest_text: String,
+    /// Why the most recent digest failed.
+    digest_err: Option<EngineError>,
     /// Artifact name → contents, written on a violation.
     diagnostics: Vec<(String, String)>,
-    /// When set, each recovery's image is written to `<prefix>.step<N>.img`.
+    /// When set, each recovery's image is written to `<prefix>.step<N>[.<db>].img`.
     image_prefix: Option<PathBuf>,
 }
 
@@ -562,16 +652,17 @@ fn sim_query(s: &mut Session, sql: &str) -> Result<(usize, i64, u64, i64), Engin
 }
 
 /// Fold one digest query's sorted rendered rows into `b`, collecting `jed_tables` names into
-/// `tables`. `Err` carries the diagnostic text the Go reference keeps for that failure.
+/// `tables`. `Err` carries the diagnostic text the Go reference keeps for that failure, and the
+/// error.
 fn digest_fold(
     s: &mut Session,
     sql: &str,
     b: &mut String,
     tables: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), (String, EngineError)> {
     let mut rows = match s.query(sql, &[]) {
         Ok(r) => r,
-        Err(e) => return Err(format!("{b}{sql}\nERROR: {e}\n")),
+        Err(e) => return Err((format!("{b}{sql}\nERROR: {e}\n"), e)),
     };
     let mut rendered: Vec<String> = Vec::new();
     for row in &mut rows {
@@ -579,16 +670,16 @@ fn digest_fold(
         for v in &row {
             match s.render(v) {
                 Ok(t) => cells.push(t),
-                Err(_) => return Err(String::new()),
+                Err(e) => return Err((String::new(), e)),
             }
         }
-        if sql == "SELECT * FROM jed_tables" {
+        if sql.ends_with("jed_tables") {
             tables.push(cells[0].clone());
         }
         rendered.push(cells.join("\x1f"));
     }
     if let Err(e) = rows.error() {
-        return Err(format!("{b}{sql}\nERROR: {e}\n"));
+        return Err((format!("{b}{sql}\nERROR: {e}\n"), e));
     }
     rendered.sort();
     b.push_str(sql);
@@ -598,39 +689,67 @@ fn digest_fold(
     Ok(())
 }
 
-/// The logical digest of what `s` sees: the catalog relations plus every table's rows, all rendered
-/// and sorted, folded with FNV-1a. `None` if any query failed (an aborted block). The second value
-/// is the text folded (or, on a failure, what was folded plus the error).
-fn digest(s: &mut Session) -> (Option<String>, String) {
+/// The prefix that names database `name`'s relations: none for main, `name.` for an attachment.
+fn qualifier(name: &str) -> String {
+    if name == "main" {
+        String::new()
+    } else {
+        format!("{name}.")
+    }
+}
+
+/// The digest of a freshly created database (an attachment's version 1): every catalog relation
+/// empty and no table.
+fn empty_digest(name: &str) -> String {
+    let q = qualifier(name);
+    let mut b = String::new();
+    for rel in DIGEST_RELATIONS {
+        b.push_str(&format!("SELECT * FROM {q}{rel}\n\n\n"));
+    }
+    format!("{:016x}", fnv(b.as_bytes()))
+}
+
+/// The logical digest of what `s` sees of database `name`: the catalog relations plus every
+/// table's rows, all rendered and sorted, folded with FNV-1a.
+fn digest(s: &mut Session, name: &str) -> Digest {
     // The oracle's own reads must not trip a trace session's memory limit.
     let limit = s.max_query_memory_bytes();
     if limit > 0 {
         s.set_max_query_memory_bytes(0);
     }
-    let result = digest_unlimited(s);
+    let result = digest_unlimited(s, &qualifier(name));
     if limit > 0 {
         s.set_max_query_memory_bytes(limit);
     }
     result
 }
 
-fn digest_unlimited(s: &mut Session) -> (Option<String>, String) {
+fn digest_unlimited(s: &mut Session, q: &str) -> Digest {
     let mut b = String::new();
     let mut tables: Vec<String> = Vec::new();
+    let failed = |(text, e): (String, EngineError)| Digest {
+        hash: None,
+        text,
+        err: Some(e),
+    };
     for rel in DIGEST_RELATIONS {
-        if let Err(text) = digest_fold(s, &format!("SELECT * FROM {rel}"), &mut b, &mut tables) {
-            return (None, text);
+        if let Err(e) = digest_fold(s, &format!("SELECT * FROM {q}{rel}"), &mut b, &mut tables) {
+            return failed(e);
         }
     }
     tables.sort();
     let mut unused = Vec::new();
     for t in &tables {
-        if let Err(text) = digest_fold(s, &format!("SELECT * FROM \"{t}\""), &mut b, &mut unused) {
-            return (None, text);
+        if let Err(e) = digest_fold(s, &format!("SELECT * FROM {q}\"{t}\""), &mut b, &mut unused) {
+            return failed(e);
         }
     }
     let hash = format!("{:016x}", fnv(b.as_bytes()));
-    (Some(hash), b)
+    Digest {
+        hash: Some(hash),
+        text: b,
+        err: None,
+    }
 }
 
 /// The logical image — the pages below the high-water — folded into FNV-1a 64 (§8.4). Preallocated
@@ -638,6 +757,14 @@ fn digest_unlimited(s: &mut Session) -> (Option<String>, String) {
 fn image_hash(image: &[u8], pages: u32, page_size: u32) -> u64 {
     let n = (pages as usize * page_size as usize).min(image.len());
     fnv(&image[..n])
+}
+
+/// The attachments' check/recovery state as `,"dbs":{"a1":{...},...}`, or "" with none.
+fn dbs_json(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    format!(",\"dbs\":{{{}}}", entries.join(","))
 }
 
 impl<'a> Runner<'a> {
@@ -654,12 +781,9 @@ impl<'a> Runner<'a> {
             sector = SECTOR_DEFAULT as i64;
         }
         let work_mem: i64 = tr.header("work_mem").parse().unwrap_or(0);
+        let temp_buffers: i64 = tr.header("temp_buffers").parse().unwrap_or(0);
         let max_query_memory: i64 = tr.header("max_query_memory_bytes").parse().unwrap_or(0);
         let max_storage_bytes: i64 = tr.header("max_storage_bytes").parse().unwrap_or(0);
-        let spill_dir = (work_mem > 0).then(std::env::temp_dir);
-        let image = Snapshot::default()
-            .to_image(ps as u32, 1)
-            .expect("an empty image always serializes");
         Runner {
             tr,
             seed,
@@ -667,28 +791,25 @@ impl<'a> Runner<'a> {
             cache_bytes: cache,
             clock: Arc::new(AtomicI64::new(clock)),
             work_mem,
+            temp_buffers,
             max_query_memory,
             max_storage_bytes,
-            spill_dir,
             sessions: HashMap::new(),
             db: None,
             shared: tr.header("processes") == "shared",
             procs: BTreeMap::new(),
             cur: 0,
             locks: None,
-            fs: Arc::new(Mutex::new(SimFs::new(seed, sector as usize, &image))),
+            fs: Arc::new(Mutex::new(SimFs::new(seed, sector as usize, ps as u32))),
             armed: None,
             transcript: String::new(),
-            history: HashMap::new(),
-            version: 0,
-            last_digest: String::new(),
-            floor: 0,
-            max_attempted: 0,
+            dbs: BTreeMap::new(),
             violation: String::new(),
             violation_step: -1,
             crash_image: None,
             stack: String::new(),
             last_digest_text: String::new(),
+            digest_err: None,
             diagnostics: Vec::new(),
             image_prefix: None,
         }
@@ -698,7 +819,7 @@ impl<'a> Runner<'a> {
         self.fs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Run one of the runner's own oracle reads with read faults suspended: an armed read fault
+    /// Run one of the runner's own oracle reads with read and spill faults suspended: an armed fault
     /// targets the trace's statements, not the oracle checking them.
     fn oracle<T>(&self, f: impl FnOnce() -> T) -> T {
         self.disk().oracle = true;
@@ -727,10 +848,53 @@ impl<'a> Runner<'a> {
         self.transcript.push('\n');
     }
 
+    /// The main database's oracle state.
+    fn main_db(&self) -> &SimDb {
+        &self.dbs["main"]
+    }
+
+    fn main_db_mut(&mut self) -> &mut SimDb {
+        self.dbs.get_mut("main").expect("main is tracked")
+    }
+
+    fn sdb(&mut self, name: &str) -> &mut SimDb {
+        self.dbs.get_mut(name).expect("a tracked database")
+    }
+
+    /// The attachments the runner tracks, in name order.
+    fn attached_names(&self) -> Vec<String> {
+        self.dbs.keys().filter(|n| *n != "main").cloned().collect()
+    }
+
+    /// Every tracked database: main, then the attachments in name order.
+    fn order(&self) -> Vec<String> {
+        let mut out = vec!["main".to_string()];
+        out.extend(self.attached_names());
+        out
+    }
+
     /// Open p0 over the simulated disk through the ordinary demand-paged loader — the path a
-    /// reopening process takes, including validated-COW recovery (validated-cow.md §1).
-    fn open(&mut self) -> Result<(), EngineError> {
-        self.open_proc(0)
+    /// reopening process takes, including validated-COW recovery (validated-cow.md §1) — and
+    /// re-attach every tracked attachment whose file exists.
+    fn open(&mut self) -> Result<(), String> {
+        self.open_proc(0).map_err(|e| e.to_string())?;
+        for name in self.attached_names() {
+            let file = self.dbs[&name].file.clone();
+            if self.disk().file(&file).is_none() {
+                continue; // the caller decides whether losing it was allowed
+            }
+            if let Err(e) = self.attach(&name) {
+                return Err(format!("re-attach {name}: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach the existing file of attachment `name` read-write to the current process.
+    fn attach(&self, name: &str) -> Result<(), EngineError> {
+        let file = &self.dbs[name].file;
+        self.db()
+            .attach(name, AttachSource::file(file).locking(Locking::None), false)
     }
 
     /// Start process `pid`. A shared trace acquires the file coordinator through the simulated lock
@@ -774,7 +938,7 @@ impl<'a> Runner<'a> {
         } else {
             Database::from_engine(self.open_engine()?)
         };
-        // Compaction's temp file, rename, and directory barrier go through the simulated filesystem.
+        // Create, compaction, and attachments go through the simulated filesystem.
         db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
         if self.max_storage_bytes > 0 {
             db.set_max_storage_bytes("main", self.max_storage_bytes)?;
@@ -787,7 +951,7 @@ impl<'a> Runner<'a> {
 
     /// Load the engine over the simulated main file.
     fn open_engine(&self) -> Result<Engine, EngineError> {
-        let Some(main) = self.disk().main() else {
+        let Some(main) = self.disk().file(MAIN_FILE) else {
             return Err(EngineError::new(
                 crate::error::SqlState::IoError,
                 "the database file is gone",
@@ -806,7 +970,8 @@ impl<'a> Runner<'a> {
         let mut engine = Engine::open_paged(pager, cache_leaves(cache, page_size))?;
         // The path marks the engine durable; the simulated filesystem is its only storage.
         engine.path = Some(PathBuf::from(MAIN_FILE));
-        engine.spill_dir = self.spill_dir.clone();
+        // Spill and temp-table spill scratch files, whose operations can fail.
+        engine.spill = Some(Arc::new(SimSpill(self.fs.clone())));
         Ok(engine)
     }
 
@@ -880,22 +1045,23 @@ impl<'a> Runner<'a> {
         }
     }
 
-    /// Check the version and contents a process sees when it begins (S5): in a shared trace another
-    /// process may have committed — or died mid-commit, leaving a complete generation another
-    /// process adopts — so the version may be newer than the last this runner saw, but never older,
-    /// and its contents must be a generation the history records.
+    /// Check the version and contents a process sees of main when it begins (S5): in a shared trace
+    /// another process may have committed — or died mid-commit, leaving a complete generation
+    /// another process adopts — so the version may be newer than the last this runner saw, but never
+    /// older, and its contents must be a generation the history records.
     fn observe(&mut self, i: usize, who: &str, v: u64, d: Option<String>) -> bool {
+        let m = self.main_db();
         let msg = match &d {
             None => Some(format!("{who}: version {v} is unreadable")),
-            Some(_) if v < self.version => Some(format!(
+            Some(_) if v < m.version => Some(format!(
                 "{who} sees version {v} after version {} was published",
-                self.version
+                m.version
             )),
-            Some(_) if v > self.max_attempted => Some(format!(
+            Some(_) if v > m.max_attempted => Some(format!(
                 "{who} sees version {v}, which was never attempted (latest attempted {})",
-                self.max_attempted
+                m.max_attempted
             )),
-            Some(d) if !self.in_history(v, d) => Some(format!(
+            Some(d) if !m.in_history(v, d) => Some(format!(
                 "{who} sees version {v} with contents (digest {d}) no transaction produced"
             )),
             Some(_) => None,
@@ -904,8 +1070,9 @@ impl<'a> Runner<'a> {
             self.fail(i, msg);
             return false;
         }
-        self.version = v;
-        self.last_digest = d.expect("checked above");
+        let m = self.main_db_mut();
+        m.version = v;
+        m.last_digest = d.expect("checked above");
         true
     }
 
@@ -947,7 +1114,7 @@ impl<'a> Runner<'a> {
             return;
         }
         let v = self.db().version();
-        let d = self.committed_digest();
+        let d = self.committed_digest("main");
         if !self.observe(i, &format!("spawned p{pid}"), v, d) {
             return;
         }
@@ -956,43 +1123,114 @@ impl<'a> Runner<'a> {
         ));
     }
 
-    /// The version and digest a fresh read session sees.
-    fn committed_view(&mut self) -> (u64, Option<String>) {
+    /// The version of database `name` the current process has published.
+    fn db_version(&self, name: &str) -> u64 {
+        if name == "main" {
+            return self.db().version();
+        }
+        self.db().sim_attached_version(name).unwrap_or(0)
+    }
+
+    /// The attachments' versions as `,"dbs":{"a1":V,...}`, or "" with none, so a trace without
+    /// attachments keeps its transcript shape.
+    fn versions_json(&self, versions: &HashMap<String, u64>) -> String {
+        let names = self.attached_names();
+        if names.is_empty() {
+            return String::new();
+        }
+        let entries: Vec<String> = names
+            .iter()
+            .filter_map(|name| {
+                versions
+                    .get(name)
+                    .map(|v| format!("{}:{v}", go_quote(name)))
+            })
+            .collect();
+        format!(",\"dbs\":{{{}}}", entries.join(","))
+    }
+
+    /// The digest of what `s` sees of database `name`, as an oracle read.
+    fn digest_of(&mut self, s: &mut Session, name: &str) -> Option<String> {
+        let d = self.oracle(|| digest(s, name));
+        self.last_digest_text = d.text;
+        self.digest_err = d.err;
+        d.hash
+    }
+
+    /// The version and digest of database `name` a fresh read session sees.
+    fn committed_view(&mut self, name: &str) -> (u64, Option<String>) {
         let mut rs = self.db().read_session();
-        let (d, text) = self.oracle(|| digest(&mut rs));
-        self.last_digest_text = text;
-        let v = rs.version();
+        let d = self.digest_of(&mut rs, name);
         rs.close();
-        (v, d)
+        (self.db_version(name), d)
+    }
+
+    fn committed_digest(&mut self, name: &str) -> Option<String> {
+        let mut rs = self.db().read_session();
+        let d = self.digest_of(&mut rs, name);
+        rs.close();
+        d
+    }
+
+    /// The image of database `name`'s file — what a new process would open — or `None` if it is
+    /// gone.
+    fn image(&self, name: &str) -> Option<Vec<u8>> {
+        let file = self.dbs[name].file.clone();
+        self.disk().image(&file)
+    }
+
+    /// Whether the commit being checked ran with nothing that may hold reclamation back: no other
+    /// session (a reader pins its snapshot), no other process (co-resident commits are append-only),
+    /// and no fault.
+    fn quiet(&self) -> bool {
+        !self.shared && self.sessions.is_empty() && !self.disk().armed()
     }
 
     fn run(&mut self) {
+        // Create the database through the simulated filesystem, as the host's create does: a temp
+        // file, its sync, the rename, and the directory barrier (S4).
+        let created = Engine::create_via(
+            &SimHost(self.fs.clone()),
+            Path::new(MAIN_FILE),
+            DatabaseOptions {
+                page_size: self.page_size,
+                no_sync: false,
+            },
+        );
+        match created {
+            Ok(e) => {
+                let _ = e.close();
+            }
+            Err(e) => {
+                self.violation = format!("create: {e}");
+                return;
+            }
+        }
+        self.dbs.insert("main".to_string(), SimDb::new(MAIN_FILE));
         if let Err(e) = self.open() {
             self.violation = format!("initial open: {e}");
             return;
         }
-        self.version = self.db().version();
-        self.floor = self.version;
-        self.max_attempted = self.version;
-        let Some(d) = self.committed_digest() else {
+        let v = self.db().version();
+        {
+            let m = self.main_db_mut();
+            m.version = v;
+            m.floor = v;
+            m.max_attempted = v;
+        }
+        let Some(d) = self.committed_digest("main") else {
             self.violation = "initial digest failed".to_string();
             return;
         };
-        self.last_digest = d.clone();
-        self.add_history(self.version, d);
+        let m = self.main_db_mut();
+        m.last_digest = d.clone();
+        m.add_history(v, d);
+        self.observe_growth("main");
         for i in 0..self.tr.steps.len() {
             if !self.step(i) || !self.violation.is_empty() {
                 return;
             }
         }
-    }
-
-    fn add_history(&mut self, v: u64, d: String) {
-        self.history.entry(v).or_default().insert(d);
-    }
-
-    fn in_history(&self, v: u64, d: &str) -> bool {
-        self.history.get(&v).is_some_and(|set| set.contains(d))
     }
 
     /// Run one trace step; false stops the run. A panic anywhere is a violation.
@@ -1093,6 +1331,10 @@ impl<'a> Runner<'a> {
                 self.emit(format!("{{\"i\":{i},\"op\":\"kill\",\"pid\":{pid}}}"));
                 return true;
             }
+            "corrupt" => {
+                self.disk().begin_step(i as u64, None);
+                return self.step_corrupt(i, st);
+            }
             _ => {}
         }
 
@@ -1108,7 +1350,11 @@ impl<'a> Runner<'a> {
             }
         }
         let armed = self.armed.take();
-        let start_version = self.version;
+        let start: HashMap<String, u64> = self
+            .dbs
+            .iter()
+            .map(|(name, d)| (name.clone(), d.version))
+            .collect();
         if let Some(pid) = self.step_pid(st)
             && st.kind != "spawn"
             && !self.select_proc(pid)
@@ -1133,7 +1379,8 @@ impl<'a> Runner<'a> {
             "commit" => self.step_commit(i, st),
             "rollback" | "close" => self.step_end(i, st),
             "check" => self.step_check(i),
-            "compact" => self.step_compact(i),
+            "compact" => self.step_compact(i, &st.sid),
+            "attach" => self.step_attach(i, &st.sid),
             "reopen" => {
                 if !self.step_reopen(i) {
                     return false;
@@ -1144,10 +1391,19 @@ impl<'a> Runner<'a> {
         if !self.violation.is_empty() {
             return false;
         }
-        // A completed barrier made every earlier write durable: the generation published when the
-        // step began can no longer be lost (§8.2).
-        if self.disk().barrier_ok && start_version > self.floor {
-            self.floor = start_version;
+        // A completed barrier made every earlier write durable: the generation a database published
+        // when the step began can no longer be lost (§8.2).
+        {
+            let disk = self.fs.lock().unwrap_or_else(|e| e.into_inner());
+            for (name, d) in self.dbs.iter_mut() {
+                let began = start.get(name).copied().unwrap_or(0);
+                if let Some(id) = disk.file(&d.file)
+                    && disk.barrier_ok(id)
+                    && began > d.floor
+                {
+                    d.floor = began;
+                }
+            }
         }
         let Some(armed) = armed else {
             return true;
@@ -1220,30 +1476,42 @@ impl<'a> Runner<'a> {
         if self.work_mem > 0 {
             s.set_work_mem(self.work_mem as usize);
         }
+        if self.temp_buffers > 0 {
+            s.set_temp_buffers(self.temp_buffers as usize);
+        }
         if self.max_query_memory > 0 {
             s.set_max_query_memory_bytes(self.max_query_memory);
         }
         if self.shared {
-            let (d, text) = self.oracle(|| digest(&mut s));
-            self.last_digest_text = text;
+            let d = self.digest_of(&mut s, "main");
             let v = s.version();
             if !self.observe(i, &format!("session {}", st.sid), v, d) {
                 return;
             }
         }
+        // A session pins every database's committed root when it opens.
         let version = s.version();
+        let mut pins: HashMap<String, u64> = HashMap::new();
+        pins.insert("main".to_string(), version);
+        for name in self.attached_names() {
+            let v = self.db_version(&name);
+            if v != 0 {
+                pins.insert(name, v);
+            }
+        }
+        let dbs = self.versions_json(&pins);
         self.sessions.insert(
             st.sid.clone(),
             SimSession {
                 s,
                 write: st.mode == "write",
-                pin: version,
+                pins,
                 pid: self.cur,
             },
         );
         self.sessions_changed();
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"open\",\"sid\":{},\"version\":{version}}}",
+            "{{\"i\":{i},\"op\":\"open\",\"sid\":{},\"version\":{version}{dbs}}}",
             go_quote(&st.sid)
         ));
     }
@@ -1275,12 +1543,8 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn committed_digest(&mut self) -> Option<String> {
-        let mut rs = self.db().read_session();
-        let (d, text) = self.oracle(|| digest(&mut rs));
-        self.last_digest_text = text;
-        rs.close();
-        d
+    fn check_live(&self) -> Result<(), String> {
+        self.oracle(|| check::check_live(self.db()))
     }
 
     fn step_commit(&mut self, i: usize, st: &Step) {
@@ -1292,11 +1556,19 @@ impl<'a> Runner<'a> {
             return;
         };
         self.sessions_changed();
-        let base = self.version;
-        let (inflight, inflight_text) = self.oracle(|| digest(&mut ss.s));
-        self.last_digest_text = inflight_text.clone();
+        let dbs = self.order();
+        // What the transaction saw of each database before commit: (digest, text). A database
+        // attached after this session opened is skipped: it cannot have written it.
+        let mut before: Vec<(Option<String>, String)> = Vec::with_capacity(dbs.len());
+        for name in &dbs {
+            if !ss.pins.contains_key(name) {
+                before.push((None, String::new()));
+                continue;
+            }
+            let d = self.digest_of(&mut ss.s, name);
+            before.push((d, self.last_digest_text.clone()));
+        }
         let result = ss.s.commit();
-        let now = self.db().version();
         if let Err(e) = result {
             let code = engine_code(&e);
             self.emit(format!(
@@ -1307,71 +1579,202 @@ impl<'a> Runner<'a> {
                 self.fail(i, format!("corruption: commit reported XX001: {e}"));
                 return;
             }
-            if now != base {
-                self.fail(
-                    i,
-                    format!("a failed commit published version {now} (was {base})"),
-                );
-                return;
-            }
-            // The commit reached storage, so a crash may still recover its generation (§8.1).
-            if let Some(inflight) = inflight
-                && self.disk().writes > 0
-            {
-                self.add_history(base + 1, inflight);
-                self.max_attempted = self.max_attempted.max(base + 1);
+            for (k, name) in dbs.iter().enumerate() {
+                let now = self.db_version(name);
+                let (version, file) = {
+                    let d = &self.dbs[name];
+                    (d.version, d.file.clone())
+                };
+                if now != version {
+                    self.fail(
+                        i,
+                        format!(
+                            "a failed commit published version {now} of {name} (was {version})"
+                        ),
+                    );
+                    return;
+                }
+                // The commit reached storage, so a crash may still recover its generation (§8.1).
+                let wrote = {
+                    let disk = self.disk();
+                    disk.file(&file).is_some_and(|id| disk.file_writes(id) > 0)
+                };
+                if let (true, Some(inflight)) = (wrote, before[k].0.clone()) {
+                    let d = self.sdb(name);
+                    d.add_history(version + 1, inflight);
+                    d.max_attempted = d.max_attempted.max(version + 1);
+                }
             }
             return;
         }
+        let versions: HashMap<String, u64> = dbs
+            .iter()
+            .map(|name| (name.clone(), self.db_version(name)))
+            .collect();
+        let main_version = versions["main"];
+        let dbs_field = self.versions_json(&versions);
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"commit\",\"sid\":{sid},\"version\":{now}}}"
+            "{{\"i\":{i},\"op\":\"commit\",\"sid\":{sid},\"version\":{main_version}{dbs_field}}}"
         ));
-        if now == base {
-            if let Some(inflight) = &inflight
-                && *inflight != self.last_digest
-            {
+        let quiet = self.quiet();
+        for (k, name) in dbs.iter().enumerate() {
+            let (base, last_digest) = {
+                let d = &self.dbs[name];
+                (d.version, d.last_digest.clone())
+            };
+            let now = versions[name];
+            let (inflight, inflight_text) = before[k].clone();
+            if now == base {
+                if let Some(inflight) = &inflight
+                    && *inflight != last_digest
+                {
+                    self.fail(
+                        i,
+                        format!(
+                            "commit succeeded without publishing the transaction's changes to {name}"
+                        ),
+                    );
+                    return;
+                }
+            } else if now == base + 1 {
+                let Some(inflight) = inflight else {
+                    self.fail(
+                        i,
+                        format!(
+                            "commit published version {now} of {name} from a transaction whose reads failed"
+                        ),
+                    );
+                    return;
+                };
+                let published = self.committed_digest(name);
+                if published.as_deref() != Some(inflight.as_str()) {
+                    self.diagnostics = vec![
+                        ("before-commit.txt".to_string(), inflight_text),
+                        (
+                            "after-commit.txt".to_string(),
+                            self.last_digest_text.clone(),
+                        ),
+                    ];
+                    self.fail(
+                        i,
+                        format!(
+                            "version {now} of {name} does not contain what its transaction saw before commit"
+                        ),
+                    );
+                    return;
+                }
+                let d = self.sdb(name);
+                d.add_history(now, inflight.clone());
+                d.version = now;
+                d.last_digest = inflight;
+                d.max_attempted = d.max_attempted.max(now);
+                d.floor = now; // acknowledged under synchronous = on (§8.2)
+                self.check_growth(i, name, quiet);
+                if !self.violation.is_empty() {
+                    return;
+                }
+            } else {
                 self.fail(
                     i,
-                    "commit succeeded without publishing the transaction's changes".to_string(),
-                );
-            }
-        } else if now == base + 1 {
-            let Some(inflight) = inflight else {
-                self.fail(
-                    i,
-                    format!("commit published version {now} from a transaction whose reads failed"),
+                    format!("commit jumped {name} from version {base} to {now}"),
                 );
                 return;
-            };
-            let published = self.committed_digest();
-            if published.as_deref() != Some(inflight.as_str()) {
-                self.diagnostics = vec![
-                    ("before-commit.txt".to_string(), inflight_text),
-                    (
-                        "after-commit.txt".to_string(),
-                        self.last_digest_text.clone(),
-                    ),
-                ];
+            }
+        }
+        if let Err(e) = self.check_live() {
+            self.fail(i, format!("after commit: {e}"));
+        }
+    }
+
+    // --- bounded growth (simulation-testing.md §8.3) ---
+
+    /// Database `name`'s page high-water and free-list length in the running process — the allocator
+    /// state the next commit draws from.
+    fn allocator(&self, name: &str) -> (u32, u32) {
+        self.db().sim_allocator(name).unwrap_or((0, 0))
+    }
+
+    /// Start a new bounded-growth lifetime for database `name` (an open, a recovery, a compaction, an
+    /// attach). The engine seeds its reclamation trigger with the page count minus the free list
+    /// (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only
+    /// after it doubles.
+    fn observe_growth(&mut self, name: &str) {
+        let (pc, free) = self.allocator(name);
+        let d = self.sdb(name);
+        d.high = pc;
+        d.lac_bound = pc.wrapping_sub(free);
+        d.last = Growth::default();
+    }
+
+    /// Check the reader-aware bounded-growth invariant after a commit published a new version of
+    /// database `name` (simulation-testing.md §8.3). With no reader pinned, no other process, and no
+    /// fault, the engine reclaims in the commit once the high-water passes compact_growth × the live
+    /// count at its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so
+    /// a commit with one open is not checked. Two checks follow:
+    ///   - a quiet commit that began past max(compact_min_pages, compact_growth × an upper bound on
+    ///     that live count) must have reclaimed: every page below the high-water is meta, live, free,
+    ///     or written by the commit itself (its manifest and free-list pages);
+    ///   - the next quiet commit reuses that free list before it grows the file.
+    fn check_growth(&mut self, i: usize, name: &str, quiet: bool) {
+        if self.shared {
+            return;
+        }
+        let version = self.dbs[name].version;
+        let Some((pc, live)) = self
+            .image(name)
+            .and_then(|image| sim_meta_of(&image, self.page_size, version))
+        else {
+            return;
+        };
+        let (_, free) = self.allocator(name);
+        let written = {
+            let file = self.dbs[name].file.clone();
+            let disk = self.disk();
+            disk.file(&file).map_or(0, |id| {
+                disk.written_pages(id).iter().filter(|pg| **pg >= 2).count() as u32
+            })
+        };
+        let (before, high, lac_bound) = {
+            let d = &self.dbs[name];
+            (d.last, d.high, d.lac_bound)
+        };
+        if quiet
+            && before.reclaimed
+            && pc > before.high
+            && pc - before.high > written - written.min(before.free)
+        {
+            self.fail(
+                i,
+                format!(
+                    "bounded growth: {name} grew from {} to {pc} pages writing {written}, with {} free pages to reuse",
+                    before.high, before.free
+                ),
+            );
+            return;
+        }
+        let mut reclaimed = false;
+        if quiet && high as u64 > (COMPACT_MIN_PAGES as u64).max(COMPACT_GROWTH * lac_bound as u64)
+        {
+            reclaimed = true;
+            let leaked = pc.wrapping_sub(2).wrapping_sub(live).wrapping_sub(free);
+            if (pc as u64) < 2 + live as u64 + free as u64 || leaked > written {
                 self.fail(
                     i,
                     format!(
-                        "version {now} does not contain what its transaction saw before commit"
+                        "bounded growth: {name} has {pc} pages, {live} live and {free} free, after a commit that wrote {written} must have reclaimed every dead page"
                     ),
                 );
                 return;
             }
-            if let Err(e) = self.oracle(|| check::check_live(self.db())) {
-                self.fail(i, format!("after commit: {e}"));
-                return;
-            }
-            self.add_history(now, inflight.clone());
-            self.version = now;
-            self.last_digest = inflight;
-            self.max_attempted = self.max_attempted.max(now);
-            self.floor = now; // acknowledged under synchronous = on (§8.2)
-        } else {
-            self.fail(i, format!("commit jumped from version {base} to {now}"));
         }
+        let d = self.sdb(name);
+        d.high = pc;
+        d.lac_bound = d.lac_bound.max(live.wrapping_add(written));
+        d.last = Growth {
+            reclaimed,
+            high: pc,
+            free,
+        };
     }
 
     fn step_end(&mut self, i: usize, st: &Step) {
@@ -1393,20 +1796,25 @@ impl<'a> Runner<'a> {
                 return;
             }
         } else {
-            // Snapshot isolation: a reader still sees exactly the version it pinned, however many
-            // commits, reclamations, and page reuses happened since.
+            // Snapshot isolation: a reader still sees exactly the version of every database it
+            // pinned, however many commits, reclamations, and page reuses happened since.
             if !ss.write {
-                let (d, text) = self.oracle(|| digest(&mut ss.s));
-                self.last_digest_text = text;
-                let ok = d.is_some_and(|d| self.in_history(ss.pin, &d));
-                if !ok {
-                    self.fail(
-                        i,
-                        format!(
-                            "isolation: reader {} no longer sees version {}",
-                            st.sid, ss.pin
-                        ),
-                    );
+                for name in self.order() {
+                    let Some(&pin) = ss.pins.get(&name) else {
+                        continue;
+                    };
+                    let d = self.digest_of(&mut ss.s, &name);
+                    let ok = d.is_some_and(|d| self.dbs[&name].in_history(pin, &d));
+                    if !ok {
+                        self.fail(
+                            i,
+                            format!(
+                                "isolation: reader {} no longer sees version {pin} of {name}",
+                                st.sid
+                            ),
+                        );
+                        break;
+                    }
                 }
             }
             ss.s.close();
@@ -1414,19 +1822,35 @@ impl<'a> Runner<'a> {
         self.emit(format!("{{\"i\":{i},\"op\":{op},\"sid\":{sid}}}"));
     }
 
-    /// Host compaction (api.md §2.6): the committed snapshot rewritten as a fresh image at the next
-    /// version, through the simulated filesystem's temp file, rename, and directory barrier. Its
-    /// contents are unchanged, so a crash may recover either version with the same digest.
-    fn step_compact(&mut self, i: usize) {
-        let base = self.version;
-        self.add_history(base + 1, self.last_digest.clone());
-        self.max_attempted = self.max_attempted.max(base + 1);
-        let result = self.db().compact("main");
-        let now = self.db().version();
+    /// Host compaction (api.md §2.6) of database `name`: the committed snapshot rewritten as a fresh
+    /// image at the next version, through the simulated filesystem's temp file, rename, and
+    /// directory barrier. Its contents are unchanged, so a crash may recover either version with the
+    /// same digest.
+    fn step_compact(&mut self, i: usize, name: &str) {
+        if !self.dbs.contains_key(name) || self.db_version(name) == 0 {
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"compact\",\"db\":{},\"skip\":true}}",
+                go_quote(name)
+            ));
+            return;
+        }
+        let (base, last_digest) = {
+            let d = self.sdb(name);
+            d.add_history(d.version + 1, d.last_digest.clone());
+            d.max_attempted = d.max_attempted.max(d.version + 1);
+            (d.version, d.last_digest.clone())
+        };
+        let result = self.db().compact(name);
+        let now = self.db_version(name);
+        let db_field = if name == "main" {
+            String::new()
+        } else {
+            format!(",\"db\":{}", go_quote(name))
+        };
         if let Err(e) = result {
             let code = engine_code(&e);
             self.emit(format!(
-                "{{\"i\":{i},\"op\":\"compact\",\"error\":{}}}",
+                "{{\"i\":{i},\"op\":\"compact\"{db_field},\"error\":{}}}",
                 go_quote(&code)
             ));
             if code == "XX001" {
@@ -1434,74 +1858,177 @@ impl<'a> Runner<'a> {
             } else if now != base {
                 self.fail(
                     i,
-                    format!("a failed compaction published version {now} (was {base})"),
+                    format!("a failed compaction published version {now} of {name} (was {base})"),
                 );
             }
             return;
         }
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"compact\",\"version\":{now}}}"
+            "{{\"i\":{i},\"op\":\"compact\"{db_field},\"version\":{now}}}"
         ));
         if now != base + 1 {
-            self.fail(i, format!("compaction moved version {base} to {now}"));
+            self.fail(
+                i,
+                format!("compaction moved {name} from version {base} to {now}"),
+            );
             return;
         }
-        let d = self.committed_digest();
-        if d.as_deref() != Some(self.last_digest.as_str()) {
-            self.fail(i, "compaction changed the database's contents".to_string());
+        let d = self.committed_digest(name);
+        if d.as_deref() != Some(last_digest.as_str()) {
+            self.fail(i, format!("compaction changed the contents of {name}"));
             return;
         }
-        if let Err(e) = self.oracle(|| check::check_live(self.db())) {
+        if let Err(e) = self.check_live() {
             self.fail(i, format!("after compaction: {e}"));
             return;
         }
-        self.version = now;
-        self.floor = now; // the rename and the directory barrier completed
+        let d = self.sdb(name);
+        d.version = now;
+        d.floor = now; // the rename and the directory barrier completed
+        self.observe_growth(name);
     }
 
-    fn step_check(&mut self, i: usize) {
-        let (v, d) = self.committed_view();
-        let d = if self.shared {
-            // Another process may have died leaving a newer complete generation this one now adopts.
-            if !self.observe(i, "check", v, d) {
-                return;
+    /// Attach file database `name` to the running process (S4), first creating its file through the
+    /// simulated filesystem if it does not exist — create's temp file, sync, rename, and directory
+    /// barrier, any of which a fault may interrupt. Already attached, it only reports.
+    fn step_attach(&mut self, i: usize, name: &str) {
+        if self.shared {
+            self.fail(i, "attach is single-process only".to_string());
+            return;
+        }
+        if self.dbs.contains_key(name) && self.db_version(name) != 0 {
+            let v = self.dbs[name].version;
+            self.emit(format!(
+                "{{\"i\":{i},\"op\":\"attach\",\"db\":{},\"version\":{v}}}",
+                go_quote(name)
+            ));
+            return;
+        }
+        if !self.dbs.contains_key(name) {
+            self.dbs
+                .insert(name.to_string(), SimDb::new(&format!("{name}.jed")));
+        }
+        let file = self.dbs[name].file.clone();
+        if self.disk().file(&file).is_none() {
+            // A fresh file is version 1, empty. Until create returns it may vanish in a crash
+            // (floor 0).
+            let empty = empty_digest(name);
+            {
+                let d = self.sdb(name);
+                d.history = HashMap::new();
+                d.add_history(1, empty.clone());
+                d.version = 1;
+                d.last_digest = empty;
+                d.floor = 0;
+                d.max_attempted = 1;
             }
-            self.last_digest.clone()
-        } else {
-            match d.filter(|d| v == self.version && *d == self.last_digest) {
-                Some(d) => d,
-                None => {
-                    self.fail(
-                        i,
-                        "a read session does not see the last committed version's contents"
-                            .to_string(),
-                    );
+            let created = Engine::create_via(
+                &SimHost(self.fs.clone()),
+                Path::new(&file),
+                DatabaseOptions {
+                    page_size: self.page_size,
+                    no_sync: false,
+                },
+            );
+            match created {
+                Ok(e) => {
+                    let _ = e.close();
+                }
+                Err(e) => {
+                    self.attach_failed(i, name, e);
                     return;
                 }
             }
-        };
-        if let Err(e) = self.oracle(|| check::check_live(self.db())) {
+            self.sdb(name).floor = 1; // create returned: the file and its directory entry are durable
+        }
+        if let Err(e) = self.attach(name) {
+            self.attach_failed(i, name, e);
+            return;
+        }
+        let v = self.db_version(name);
+        let d = self.committed_digest(name);
+        if !self.check_recovered(i, name, v, d, "attached") {
+            return;
+        }
+        self.observe_growth(name);
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"attach\",\"db\":{},\"version\":{v}}}",
+            go_quote(name)
+        ));
+    }
+
+    fn attach_failed(&mut self, i: usize, name: &str, e: EngineError) {
+        let code = engine_code(&e);
+        if code == "XX001" {
+            self.fail(i, format!("attach {name}: {e}"));
+            return;
+        }
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"attach\",\"db\":{},\"error\":{}}}",
+            go_quote(name),
+            go_quote(&code)
+        ));
+    }
+
+    fn step_check(&mut self, i: usize) {
+        let mut entries: Vec<String> = Vec::new();
+        let mut main_line = String::new();
+        for name in self.order() {
+            let (v, d) = self.committed_view(&name);
+            let d = if self.shared && name == "main" {
+                // Another process may have died leaving a newer complete generation this one now
+                // adopts.
+                if !self.observe(i, "check", v, d) {
+                    return;
+                }
+                self.main_db().last_digest.clone()
+            } else {
+                let db = &self.dbs[&name];
+                match d.filter(|d| v == db.version && *d == db.last_digest) {
+                    Some(d) => d,
+                    None => {
+                        self.fail(
+                            i,
+                            format!(
+                                "a read session does not see the last committed version of {name}"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            };
+            let version = self.dbs[&name].version;
+            let image = self.image(&name).unwrap_or_default();
+            let (live, pages, free) = match check::integrity(&image, version) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.fail(i, format!("integrity of {name}: {e}"));
+                    return;
+                }
+            };
+            let hash = image_hash(&image, pages, self.page_size);
+            let body = format!(
+                "\"version\":{version},\"digest\":{},\"live\":{live},\"pages\":{pages},\"free\":{free},\"image\":\"{hash:016x}\"",
+                go_quote(&d)
+            );
+            if name == "main" {
+                main_line = body;
+            } else {
+                entries.push(format!("{}:{{{body}}}", go_quote(&name)));
+            }
+        }
+        if let Err(e) = self.check_live() {
             self.fail(i, format!("live integrity: {e}"));
             return;
         }
-        let image = self.disk().main_image();
-        let (live, pages, free) = match check::integrity(&image, self.version) {
-            Ok(r) => r,
-            Err(e) => {
-                self.fail(i, format!("integrity: {e}"));
-                return;
-            }
-        };
-        let hash = image_hash(&image, pages, self.page_size);
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"check\",\"version\":{},\"digest\":{},\"live\":{live},\"pages\":{pages},\"free\":{free},\"image\":\"{hash:016x}\"}}",
-            self.version,
-            go_quote(&d)
+            "{{\"i\":{i},\"op\":\"check\",{main_line}{}}}",
+            dbs_json(&entries)
         ));
     }
 
     /// End every session cleanly, close the Database, and reopen it: the result must be exactly the
-    /// last committed version.
+    /// last committed version of every database.
     fn step_reopen(&mut self, i: usize) -> bool {
         for pid in self.live_pids() {
             if let Err(e) = self.close_proc(pid) {
@@ -1514,88 +2041,289 @@ impl<'a> Runner<'a> {
             self.fail(i, format!("reopen failed: {e}"));
             return false;
         }
-        let v = self.db().version();
-        let d = self.committed_digest();
-        let shown = d.clone().unwrap_or_default();
-        if self.shared {
-            // A process killed mid-commit may have left a complete generation no survivor began on yet.
-            if !self.observe(i, "reopened p0", v, d) {
+        let mut entries: Vec<String> = Vec::new();
+        let mut main_v = 0;
+        let mut main_d = String::new();
+        for name in self.order() {
+            let v = self.db_version(&name);
+            if v == 0 {
+                self.fail(i, format!("a clean reopen lost attachment {name}"));
                 return false;
             }
-        } else if v != self.version || d.as_deref() != Some(self.last_digest.as_str()) {
-            let msg = format!(
-                "a clean reopen returned version {v} (digest {shown}), want version {} (digest {})",
-                self.version, self.last_digest
-            );
-            self.fail(i, msg);
-            return false;
+            let d = self.committed_digest(&name);
+            let shown = d.clone().unwrap_or_default();
+            if self.shared && name == "main" {
+                // A process killed mid-commit may have left a complete generation no survivor began
+                // on yet.
+                if !self.observe(i, "reopened p0", v, d) {
+                    return false;
+                }
+            } else {
+                let db = &self.dbs[&name];
+                if v != db.version || d.as_deref() != Some(db.last_digest.as_str()) {
+                    let msg = format!(
+                        "a clean reopen returned version {v} of {name} (digest {shown}), want version {} (digest {})",
+                        db.version, db.last_digest
+                    );
+                    self.fail(i, msg);
+                    return false;
+                }
+            }
+            self.observe_growth(&name);
+            if name == "main" {
+                main_v = v;
+                main_d = shown;
+            } else {
+                entries.push(format!(
+                    "{}:{{\"version\":{v},\"digest\":{}}}",
+                    go_quote(&name),
+                    go_quote(&shown)
+                ));
+            }
         }
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"reopen\",\"version\":{v},\"digest\":{}}}",
-            go_quote(&shown)
+            "{{\"i\":{i},\"op\":\"reopen\",\"version\":{main_v},\"digest\":{}{}}}",
+            go_quote(&main_d),
+            dbs_json(&entries)
         ));
         true
     }
 
-    /// Abandon the crashed process — its sessions and Database — and open the disk as a new process
-    /// would, then check the recovered generation against the history and the durability floor
-    /// (§8.1–8.2) and the image against the integrity checker (§8.3).
-    fn recover(&mut self, i: usize, fired: &str) -> bool {
-        for pid in self.live_pids() {
-            self.drop_proc(pid);
-        }
-        let image = {
-            let mut disk = self.disk();
-            disk.process_death();
-            disk.main_image()
-        };
-        if let Some(prefix) = &self.image_prefix {
-            let _ = std::fs::write(format!("{}.step{i}.img", prefix.display()), &image);
-        }
-        if let Err(e) = self.open() {
-            self.crash_image = Some(image);
-            self.fail(i, format!("recovery: open failed: {e}"));
-            return false;
-        }
-        let v = self.db().version();
-        let d = self.committed_digest();
+    /// Check database `name`'s version and contents after a recovery or an attach against its
+    /// history and durability floor (§8.1–8.2).
+    fn check_recovered(
+        &mut self,
+        i: usize,
+        name: &str,
+        v: u64,
+        d: Option<String>,
+        what: &str,
+    ) -> bool {
+        let db = &self.dbs[name];
         let msg = match &d {
-            None => Some(format!("recovery: version {v} is unreadable")),
-            Some(_) if v < self.floor => Some(format!(
-                "durability: recovered version {v}, but version {} was durable",
-                self.floor
+            None => Some(format!(
+                "{what}: version {v} of {name} is unreadable: {}",
+                self.digest_err
+                    .as_ref()
+                    .map_or("<nil>".to_string(), |e| e.to_string())
             )),
-            Some(_) if v > self.max_attempted => Some(format!(
-                "recovery: version {v} was never attempted (latest attempted {})",
-                self.max_attempted
+            Some(_) if v < db.floor => Some(format!(
+                "durability: {what} version {v} of {name}, but version {} was durable",
+                db.floor
             )),
-            Some(d) if !self.in_history(v, d) => Some(format!(
-                "recovery: version {v} has contents (digest {d}) no transaction produced"
+            Some(_) if v > db.max_attempted => Some(format!(
+                "{what}: version {v} of {name} was never attempted (latest attempted {})",
+                db.max_attempted
+            )),
+            Some(d) if !db.in_history(v, d) => Some(format!(
+                "{what}: version {v} of {name} has contents (digest {d}) no transaction produced"
             )),
             Some(_) => None,
         };
         if let Some(msg) = msg {
-            self.crash_image = Some(image);
             self.fail(i, msg);
             return false;
         }
-        let d = d.expect("checked above");
-        let (live, pages, free) = match check::integrity(&image, v) {
-            Ok(r) => r,
-            Err(e) => {
-                self.crash_image = Some(image);
-                self.fail(i, format!("recovery integrity: {e}"));
+        let db = self.sdb(name);
+        db.version = v;
+        db.last_digest = d.expect("checked above");
+        true
+    }
+
+    /// Abandon the crashed process — its sessions and Database — and open the disk as a new process
+    /// would, then check every database's recovered generation against its history and durability
+    /// floor (§8.1–8.2) and its image against the integrity checker (§8.3).
+    fn recover(&mut self, i: usize, fired: &str) -> bool {
+        for pid in self.live_pids() {
+            self.drop_proc(pid);
+        }
+        self.disk().process_death();
+        let mut images: HashMap<String, Vec<u8>> = HashMap::new();
+        for name in self.order() {
+            let image = self.image(&name);
+            let Some(image) = image.or_else(|| (name == "main").then(Vec::new)) else {
+                // A crash during the attachment's create: allowed only while create had not
+                // returned.
+                let floor = self.dbs[&name].floor;
+                if floor > 0 {
+                    self.fail(
+                        i,
+                        format!(
+                            "durability: attachment {name}'s file is gone, but version {floor} was durable"
+                        ),
+                    );
+                    return false;
+                }
+                self.dbs.remove(&name);
+                continue;
+            };
+            if let Some(prefix) = &self.image_prefix {
+                let suffix = if name == "main" {
+                    String::new()
+                } else {
+                    format!(".{name}")
+                };
+                let _ = std::fs::write(format!("{}.step{i}{suffix}.img", prefix.display()), &image);
+            }
+            images.insert(name, image);
+        }
+        if let Err(e) = self.open() {
+            self.crash_image = images.remove("main");
+            self.fail(i, format!("recovery: open failed: {e}"));
+            return false;
+        }
+        let mut entries: Vec<String> = Vec::new();
+        let mut main_line = String::new();
+        for name in self.order() {
+            let v = self.db_version(&name);
+            let d = self.committed_digest(&name);
+            if !self.check_recovered(i, &name, v, d.clone(), "recovered") {
+                self.crash_image = images.remove(&name);
                 return false;
             }
-        };
-        self.version = v;
-        self.last_digest = d.clone();
-        let hash = image_hash(&image, pages, self.page_size);
+            let d = d.expect("checked above");
+            let image = &images[&name];
+            let (live, pages, free) = match check::integrity(image, v) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.crash_image = images.remove(&name);
+                    self.fail(i, format!("recovery integrity of {name}: {e}"));
+                    return false;
+                }
+            };
+            let hash = image_hash(image, pages, self.page_size);
+            self.observe_growth(&name);
+            let body = format!(
+                "\"recovered\":{v},\"digest\":{},\"live\":{live},\"pages\":{pages},\"free\":{free},\"image\":\"{hash:016x}\"",
+                go_quote(&d)
+            );
+            if name == "main" {
+                main_line = body;
+            } else {
+                entries.push(format!("{}:{{{body}}}", go_quote(&name)));
+            }
+        }
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"crash\",\"fired\":{},\"recovered\":{v},\"digest\":{},\"live\":{live},\"pages\":{pages},\"free\":{free},\"image\":\"{hash:016x}\"}}",
+            "{{\"i\":{i},\"op\":\"crash\",\"fired\":{},{main_line}{}}}",
             go_quote(fired),
-            go_quote(&d)
+            dbs_json(&entries)
         ));
         true
+    }
+
+    /// `corrupt flips=N [reseal=1]` (simulation-testing.md §6.3): every process ends cleanly; bits
+    /// flip in durable body pages of the main database; a new process opens it and reads
+    /// everything; then the bits are repaired and the database must reopen exactly as it was.
+    /// Without reseal a flip breaks its page's CRC, so every outcome must be XX001 or the right rows
+    /// — never wrong rows. With reseal the CRC is recomputed, so only the engine's structural checks
+    /// stand in the way: any engine error, or any rows, is allowed, but never a panic.
+    fn step_corrupt(&mut self, i: usize, st: &Step) -> bool {
+        let reseal = st.params.get("reseal").map(String::as_str) == Some("1");
+        for pid in self.live_pids() {
+            if let Err(e) = self.close_proc(pid) {
+                self.fail(i, format!("close: {e}"));
+                return false;
+            }
+        }
+        self.disk().process_death();
+        let (version, page_size) = (self.main_db().version, self.page_size);
+        let Some(file) = self.disk().file(MAIN_FILE) else {
+            self.fail(i, "corrupt: the database file is gone".to_string());
+            return false;
+        };
+        let pc = {
+            let image = self.image("main").unwrap_or_default();
+            sim_meta_of(&image, page_size, version).map(|(pc, _)| pc)
+        };
+        let Some(pc) = pc else {
+            self.fail(i, format!("corrupt: no meta holds version {version}"));
+            return false;
+        };
+        let flips = self
+            .disk()
+            .corrupt(file, i as u64, st.int_param("flips"), pc, reseal);
+        let mut opened = "ok".to_string();
+        let mut read = "-".to_string();
+        match self.open_proc(0) {
+            Err(e) => match self.corrupt_outcome(i, reseal, &e) {
+                Some(code) => opened = code,
+                None => return false,
+            },
+            Ok(()) => {
+                read = "ok".to_string();
+                let v = self.db().version();
+                match self.committed_digest("main") {
+                    None => {
+                        let e = self
+                            .digest_err
+                            .take()
+                            .expect("a failed digest records its error");
+                        match self.corrupt_outcome(i, reseal, &e) {
+                            Some(code) => read = code,
+                            None => return false,
+                        }
+                    }
+                    Some(_) if reseal => {}
+                    Some(d) => {
+                        let m = self.main_db();
+                        if !m.in_history(v, &d)
+                            || v > m.version
+                            || (v < m.version && v + 1 != m.version)
+                        {
+                            // A flip in the newest generation's dirty pages fails its validation,
+                            // and recovery falls back to the previous generation
+                            // (validated-cow.md §1), which is intact.
+                            self.fail(
+                                i,
+                                format!(
+                                    "corrupt: version {v} read back with contents (digest {d}) no transaction produced"
+                                ),
+                            );
+                            return false;
+                        }
+                    }
+                }
+                self.drop_proc(0);
+            }
+        }
+        self.disk().repair(file, &flips);
+        if let Err(e) = self.open() {
+            self.fail(i, format!("corrupt: reopen after repair failed: {e}"));
+            return false;
+        }
+        let v = self.db().version();
+        if v != version {
+            self.fail(
+                i,
+                format!("corrupt: after repair version {v}, want {version}"),
+            );
+            return false;
+        }
+        let d = self.committed_digest("main");
+        if d.as_deref() != Some(self.main_db().last_digest.as_str()) {
+            self.fail(i, "corrupt: after repair the contents differ".to_string());
+            return false;
+        }
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"corrupt\",\"flipped\":{},\"open\":{},\"read\":{}}}",
+            flips.len(),
+            go_quote(&opened),
+            go_quote(&read)
+        ));
+        true
+    }
+
+    /// The outcome of opening or reading a corrupted database: without reseal it must be XX001;
+    /// with it, any engine error.
+    fn corrupt_outcome(&mut self, i: usize, reseal: bool, e: &EngineError) -> Option<String> {
+        let code = engine_code(e);
+        if code != "XX001" && !reseal {
+            self.fail(
+                i,
+                format!("corrupt: a flipped checksum surfaced as {code}, not XX001: {e}"),
+            );
+            return None;
+        }
+        Some(code)
     }
 }

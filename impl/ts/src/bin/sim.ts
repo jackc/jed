@@ -5,8 +5,8 @@
 //
 // JED_SIM_IN is one .sim file, a directory of them, or a file listing trace paths one per line.
 // Results append to JED_SIM_RESULTS (default JED_SIM_OUT/ts.results.jsonl). With JED_SIM_IMAGES set,
-// every image a recovery opens is written to JED_SIM_OUT/<trace>.ts.step<N>.img. Each transcript is
-// JED_SIM_OUT/<trace>.ts.jsonl. Exits 1 if any trace failed.
+// every image a recovery opens is written to JED_SIM_OUT/<trace>.ts.step<N>[.<db>].img. Each
+// transcript is JED_SIM_OUT/<trace>.ts.jsonl. Exits 1 if any trace failed.
 
 import "../crc32_node.ts";
 

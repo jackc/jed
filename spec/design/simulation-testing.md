@@ -1,6 +1,7 @@
 # Deterministic simulation testing — design
 
-> **Status: S1–S6 landed in all three cores** (§14), with a few follow-ons open. A seeded simulator that runs long, randomized
+> **Status: S1–S6 landed in all three cores** (§14), including spill faults, temp-table spill, file
+> attachments, `create`, the bounded-growth invariant, and the `corrupt` mode. A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -63,8 +64,8 @@ Those stay with the race-detector modes, Layer 4, and the durability benchmarks 
 **In scope:** the validated-COW commit and recovery protocol, free-list reuse and the reader
 watermark, manifest overflow, live-page-count bookkeeping, unchanged-commit elision, poisoned
 handles, recovered-generation stabilization, large-value overflow chains, buffer-pool eviction,
-spill, temp storage, `max_storage_bytes`, and, in later slices, compaction, file attachments, and
-the shared-process lock protocol.
+spill and temp-table spill, `max_storage_bytes`, `create`, compaction, file attachments, the
+shared-process lock protocol, and at-rest corruption.
 
 **Non-goals:**
 - **SQL semantics.** The PostgreSQL oracle, the cross-core corpus, and NoREC already cover them. The
@@ -128,7 +129,9 @@ check
 | `fault <kind> <params>` | Arms a fault (§6.3) for the **next** step only. |
 | `crash process` / `crash power survive=‰ tear=‰` | An immediate crash between steps. |
 | `reopen` | Ends every session (rolling back a writer), closes cleanly, and opens again. |
-| `compact` | Host compaction of `main` (api.md §2.6), through the simulated filesystem. |
+| `compact [<db>]` | Host compaction of `main` or a file attachment (api.md §2.6), through the simulated filesystem. |
+| `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. Single-process traces only. |
+| `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
 
@@ -138,8 +141,8 @@ checks are part of the step. There is no separate `recover` step.
 
 **Header knobs** are `seed`, `page_size`, `cache_bytes` (0 or absent: the engine default), `clock`
 (the simulated clock's start, in microseconds), `sector` (the tear granularity, default 64 bytes),
-and the informational `profile`. Three handle settings are applied at every open: `work_mem` (a trace
-session's; non-zero also gives the database a real scratch spill directory, whose bytes are not
+and the informational `profile`. Four handle settings are applied at every open: `work_mem` and
+`temp_buffers` (a trace session's; spill goes to the simulated spill host, §6.1, whose bytes are not
 durable state), `max_query_memory_bytes` (a trace session's; the oracles' own reads are unlimited),
 and `max_storage_bytes` (the database's file form, memory.md §8.7). Under either limit a commit can
 fail for size reasons the generator cannot predict, so it treats every commit as uncertain. The most important is a **small page size**
@@ -157,9 +160,17 @@ A crash ends every session of the crashed `Database`. The generator never refere
 The disk is a small **simulated filesystem** (`simFS`): named files, a directory, and the per-step
 fault state. The directory has a kernel view and a durable view; creates, renames, and removes join
 an ordered list of pending changes until a directory sync makes them durable. The database file is
-`sim.jed`; host compaction (S4) adds its sibling temp file. The filesystem is also the database's
-file host (the seam compaction's temp file, rename, directory sync, and reopen go through in every
-core), so a crash can land between any two of those steps.
+`sim.jed`; each file attachment is `<name>.jed`; `create` and host compaction add their sibling
+`.jedtmp` temp files. The filesystem is also the database's **file host** (`filehost.{go,rs,ts}`):
+`create`'s existence check, temp file, rename, and directory sync, compaction's, and the open of a
+file attachment all go through it in every core, so a crash can land between any two of those steps.
+The runner creates `sim.jed` through it before the first step.
+
+Spill scratch files go through a second seam, the **spill host** (`spillhost.go`, Rust's
+`spillhost.rs`, TypeScript's `SpillSink`): sort runs, blocking-operator spools and hash partitions,
+and a spilled temp domain's scratch block store. The simulated spill host keeps scratch files in
+memory, outside the filesystem: their bytes are never durable state and vanish with the process. Its
+operations (create, read, write) are what `spill_error` fails.
 
 Each file implements `BlockStore` over three pieces of state:
 
@@ -203,6 +214,9 @@ keeps independent decisions uncorrelated, and its values are part of the cross-c
 | 8 | a session's entropy-seam seed (`decide(seed, 8, step, 0, 0)` for the session opened at `step`) |
 | 9 | `read_error`: do reads of this offset fail during the step? |
 | 10 | power loss: how many pending directory changes survive (`% (changes + 1)`, an ordered prefix) |
+| 11 | `spill_error`: does this spill-host operation fail? (`offset` is the operation's ordinal in the step) |
+| 12 | `corrupt`: the page a flip lands in (`2 + h % (page_count − 2)`; `offset` is the flip's ordinal) |
+| 13 | `corrupt`: the bit of that page it flips (`h % (page_size × 8)`; `offset` is the flip's ordinal) |
 
 A file other than `sim.jed` adds `(FNV-1a 32(name) + 1) << 40` to every offset it decides on, so two
 files' decisions stay independent while the database file's are unchanged by the others' existence.
@@ -226,10 +240,12 @@ is sound: a failure under it is a real protocol violation, not a modeling artifa
 | `io_error op=sync nth=N` | The step's `N`th `sync` fails with Linux "fsyncgate" semantics: each pending write independently became durable or was dropped from the cache, and the error is reported once. | As above, but recovery may yield the in-flight generation if all of it landed. | Transcript |
 | `read_error p=‰` | Every read of an offset whose lane-9 `decide` falls under `p` fails during the step. The runner's own oracle reads (digests, the live checker) are exempt — an early version applied the fault to them too and reported false violations. | The statement fails `58030`, never `XX001` or wrong rows. | Per-core: which reads happen depends on buffer-pool policy |
 | `enospc` | The step's first growing `set_size` fails. | The commit fails `58030`. | Per-core: when the file grows depends on preallocation policy |
-| `corrupt flips=n` | Not built yet. Opt-in: flip bits in durable, non-pending pages. | `XX001` on access, or inert if the page is dead. **Never wrong rows.** | Per-core only, intrinsic oracle |
+| `spill_error p=‰` | Each spill-host operation of the step fails when its lane-11 `decide` falls under `p`. | The statement fails `58030`; durable state is untouched. | Per-core: which operations spill, and how, is each core's own codec |
+| `corrupt flips=n [reseal=1]` | A standalone step, not an armed fault. Every process ends cleanly; `n` bits flip in durable body pages of `sim.jed` below its page count (lanes 12–13), skipping a page with a pending write; durable bytes and cache both change. A new process opens the file and reads every row through the digest. Then the bits are repaired and the database must reopen exactly as it was. | Without `reseal`, every flip breaks its page's CRC: open and read each yield `XX001` or the right rows — the current version, or the previous one when a flip lands in the newest generation's dirty pages and recovery falls back (validated-cow.md §1). **Never wrong rows.** With `reseal`, the CRC is recomputed, so only the decoders' structural checks stand between the flip and the engine (storage.md §6): any engine error or any rows, but **never a panic or a non-engine error**. | Per-core only, intrinsic oracle |
 
-A trace containing a per-core fault runs every oracle on every core but is not compared across
-cores (`scripts/sim.rb`), since one core may read or grow where another does not.
+A trace containing a per-core fault or a `corrupt` step runs every oracle on every core but is not
+compared across cores (`scripts/sim.rb`), since one core may read, grow, or spill where another does
+not.
 
 A fault that never reaches its barrier (an unchanged commit, a statement inside a transaction) fires
 at the end of the step. A directory sync with no pending change is not a fault point and does
@@ -279,21 +295,30 @@ wall time or OS entropy.
 
 ### 8.1 The generation history
 
-The runner keeps a history of **logical digests**: for each version, the digests of every
-generation attempted at it. (A version can have several: after recovery to version 5, a new commit
-produces a different version 6.)
+The runner keeps a history of **logical digests** per database — `main` and each file attachment,
+each with its own version counter: for each version, the digests of every generation attempted at
+it. (A version can have several: after recovery to version 5, a new commit produces a different
+version 6.)
 
 - Immediately before each commit, it computes the digest of the in-flight version **inside the write
   session**, which sees its own writes.
 - After an acknowledged commit, a fresh read session's digest of the new version must equal that
   in-flight digest: the commit published exactly what its transaction saw. The digest is recorded.
-- After a failed commit that wrote at least one page, the in-flight digest is recorded as attempted
-  at the next version, since a crash may still recover it.
+- After a failed commit that wrote at least one page **of a database's file**, the in-flight digest is
+  recorded as attempted at that database's next version, since a crash may still recover it.
+- A commit that leaves a database's version unchanged must leave its digest unchanged too.
 
 A digest is computed through SQL so every core can produce it identically:
 `SELECT * FROM` each of `jed_tables`, `jed_columns`, `jed_indexes`, `jed_constraints`, and
 `jed_sequences` ([introspection.md](introspection.md)), then `SELECT * FROM` every table in name
-order. Each result's rendered rows are sorted and folded, with the query text, into FNV-1a 64.
+order. Each result's rendered rows are sorted and folded, with the query text, into FNV-1a 64. An
+attachment's digest qualifies every relation with its name (`a1.jed_tables`, `a1."t3"`). A freshly
+created attachment is version 1 with every relation empty, so its digest is known before it opens:
+the fold of each catalog query text followed by an empty row list.
+
+A session pins every attached database's root when it opens (attached-databases.md §5), so the
+isolation check compares a closing reader's digest of **each** database it pinned with that
+database's history.
 
 **After every recovery, the recovered version must be in the allowed set (§8.2) and its digest must
 be one recorded for that version.** This catches torn or mixed snapshots, lost index
@@ -315,6 +340,10 @@ belongs to the corpus.
   durability point.
 - **Recovering below the floor is a durability violation.** Recovering above the latest attempted
   version, or failing with `XX001` outside corruption mode, is a corruption violation.
+- Each database has its own floor. An attachment's floor is **0** from the moment `attach` starts
+  creating its file until `create` returns: until then a crash may lose the file, and the runner
+  forgets the attachment. Once `create` returns (it syncs the directory), the floor is 1 and the file
+  must survive every crash.
 
 ### 8.3 Structural invariants
 
@@ -341,11 +370,29 @@ re-derives everything from disk, so it cannot see a resident node whose referenc
 stale-root bug in §14 passed the image checker and was caught only when its corruption surfaced; the
 live checker flags it at the commit that creates it.
 
-Two invariants from the original plan are not checked yet. Separator bounds and chain decoding are
-implied by the digest, which reads every row, but are not checked structurally. **Bounded growth**
-needs a reader-aware form: the engine reclaims only when no reader is pinned behind the new version
-(transactions.md §8), so a workload that always holds a reader legitimately grows without bound
-until the readers close.
+Separator bounds and chain decoding are implied by the digest, which reads every row, but are not
+checked structurally.
+
+**Bounded growth** is checked in a reader-aware form after every commit that publishes a new version
+of a database. The engine reclaims only when no reader is pinned behind the new version
+(transactions.md §8), so a workload that holds a reader legitimately grows until the readers close;
+only a **quiet** commit — no other session open, a single process, no armed fault — is held to a
+bound. A file commit reclaims in-commit once its high-water passes `max(compact_min_pages,
+compact_growth × L)`, where `L` is the live count at its last reclamation (memory.md §8.4). The
+runner cannot see `L`, so it tracks an upper bound per process lifetime: at an open (or recovery,
+compaction, attach), the page count minus the free list, which is what the engine seeds `L` with
+(format.md *Reclamation*); after each commit, the maximum of that and its live pages plus the pages
+it wrote. Then:
+
+- a quiet commit that **began** past that threshold must have reclaimed: every page below its
+  high-water is a meta page, live, on the free list, or written by the commit itself (its manifest
+  and free-list pages) — `page_count − 2 − live − free ≤ written`;
+- the next commit, if quiet too, reuses that free list before it grows the file: its high-water grows
+  by at most `max(0, written − free)`.
+
+`written` counts the distinct pages of the database's file (other than the two meta pages) the step
+wrote; `free` is the in-memory free list the next commit allocates from. Shared traces are exempt:
+co-resident commits are append-only by design (locking.md §5.3).
 
 **Two more violations** need no checker: any statement or commit that reports `XX001` (corruption
 must never surface outside corruption mode), and **snapshot isolation** — when a reader closes, its
@@ -368,11 +415,22 @@ JSON object per line, keys in exactly this order, no whitespace, hashes as 16 lo
 {"i":N,"op":"check","version":V,"digest":D,"live":L,"pages":P,"free":F,"image":I}
 {"i":N,"op":"reopen","version":V,"digest":D}
 {"i":N,"op":"crash","fired":X,"recovered":V,"digest":D,"live":L,"pages":P,"free":F,"image":I}
+{"i":N,"op":"compact","version":V}   {"i":N,"op":"compact","db":"a1","version":V}   or   …,"error":CODE}
+{"i":N,"op":"attach","db":"a1","version":V}   or   {"i":N,"op":"attach","db":"a1","error":CODE}
+{"i":N,"op":"corrupt","flipped":F,"open":"ok"|CODE,"read":"ok"|CODE|"-"}
 ```
 
+While file attachments are tracked, `open`, `commit` (success), `check`, `reopen`, and `crash` lines
+gain a trailing `"dbs"` object keyed by attachment name in byte order: `{"a1":V}` (the version each
+session pinned, or each database's version after the commit) on `open` and `commit`, and on the others
+an object of the same fields the line carries for `main` (`{"a1":{"version":V,"digest":D,…}}`, with
+`recovered` in place of `version` on `crash`). A trace without attachments keeps exactly the shape
+above. With `JED_SIM_IMAGES`, an attachment's recovered image is written beside main's as
+`<trace>.<core>.step<N>.<name>.img`, and the independent checker decodes it too.
+
 `hash` folds the statement's rendered rows, sorted (row order is not what this harness tests), with
-FNV-1a 64; `fired` is `barrier`, `write`, `sync`, `read`, `enospc`, `end` (the fault reached no
-fault point and fired as the step ended), or `none` (a standalone `crash` step). The
+FNV-1a 64; `fired` is `barrier`, `write`, `sync`, `read`, `enospc`, `spill`, `end` (the fault reached
+no fault point and fired as the step ended), or `none` (a standalone `crash` step). The
 `live`/`pages`/`free` counts come from the meta page and persisted free list, which are byte-exact
 across cores. `image` is the FNV-1a 64 of the **logical image** — the first `pages × page_size`
 bytes, ignoring preallocated tails — of the disk at a `check`, or of the post-crash disk recovery
@@ -402,6 +460,15 @@ only when intended. After a faulted commit the model cannot know whether the com
 table the transaction changed becomes *maybe*: its next use re-establishes it idempotently
 (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`).
 
+With attachments, the model keys an attachment's tables by qualified name (`a1.t3`) and tracks each
+attachment as attached or *maybe* (its `attach` step crashed, so its file may not exist). A write
+transaction writes one durable database: its first statement that names a table fixes it, so no
+transaction trips the one-durable-writer `0A000`. An attachment takes no `DROP` (the grammar takes no
+qualifier there), no `ON CONFLICT`, and no sequence (attached-databases.md §8), and `attach` waits for
+no writer, since attaching takes the writer gate. Temp tables live in the write session only and die
+with it. A spill fault arms only a statement that can spill under the drawn knobs: a sorting or
+grouping read under a small `work_mem`, a temp-table statement under a small `temp_buffers`.
+
 Fault parameters are drawn from per-profile permille ranges, except that a quarter of the draws take
 the extreme (every write lands or is issued; nothing torn), because a complete in-flight generation
 is what a random subset rarely produces. `chain` is the fault chance for the first commit after a
@@ -422,6 +489,10 @@ defaults, which `mixed.toml` restates):
 | `resource` | Tiny caches, spill, storage and query-memory limits, `read_error`, `enospc` |
 | `compaction` | Host compaction with crashes at the temp-file and directory barriers (`nth`) |
 | `shared` | Processes joining, leaving, and dying around a shared file (S5) |
+| `spill` | Sort, aggregate, and temp-table spill under small `work_mem` and `temp_buffers`, with `spill_error` |
+| `attachments` | File attachments created under crashes, per-database recovery, writes to one durable database per transaction |
+| `growth` | Short-lived readers between long runs of quiet commits, for the bounded-growth check (§8.3) |
+| `corruption` | `corrupt` steps, with and without `reseal` |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
@@ -449,6 +520,9 @@ oracles are what the test means.
   state through a few feature-gated accessors. TypeScript's is `impl/ts/src/sim/` with
   `src/bin/sim.ts`, imported by nothing the library or browser build loads. A runner reads
   `JED_SIM_IN` (a trace, a directory, or a list file) and writes transcripts under `JED_SIM_OUT`.
+- **Seams:** the file host (`create`, compaction, attachment opens) and the spill host (spill and
+  temp-table spill scratch files) are internal per-core interfaces whose production form is the OS;
+  only the simulator substitutes them. They change no behavior, bytes, or public API.
 - **Tasks:**
   - `mise run sim:sweep [seeds] [profile] [cores]` runs a seed sweep. `mise run ci` runs a fixed
     eight-seed sweep of every profile on all three cores (about 15 seconds); longer sweeps are
@@ -517,16 +591,22 @@ primitive) gets a simulated implementation.
    byte-identical to Go's. The decision function is pinned in `prng.toml` ([[sim_decide]]) and
    recomputed by `prng_verify.rb`. `sim:regress` and a fixed sweep run in `mise run ci`. Each port
    also caught the planted stabilization and watermark bugs in its own engine.
-3. **S3 — Resource knobs. Landed, except spill faults.** The `resource` profile: tiny caches force
-   buffer-pool eviction, small `work_mem` spills the generator's sorting and grouping reads, and
-   storage and query-memory limits fail commits and statements mid-history. `read_error` and
-   `enospc` are per-core faults (§6.3). Not done: giving Go and Rust the `SpillSink` seam TypeScript
-   has, so a fault could target spill I/O itself, and temp-table spill.
-4. **S4 — Simulated filesystem. Compaction landed; attachments and `create` not yet.** Every core's
-   compaction goes through a file-host seam (`filehost.{go,rs,ts}`); the simulated filesystem
-   implements it, with named files, ordered directory changes, and a directory barrier where a rename
-   becomes durable only after its directory sync. The `compaction` profile crashes at either of
-   compaction's barriers (`nth`).
+3. **S3 — Resource knobs. Landed.** The `resource` profile: tiny caches force buffer-pool eviction,
+   small `work_mem` spills the generator's sorting and grouping reads, small `temp_buffers` spills
+   session temp tables, and storage and query-memory limits fail commits and statements
+   mid-history. `read_error` and `enospc` are per-core faults (§6.3). Every core's spill goes through
+   a spill-host seam (Go's `spillhost.go` and Rust's `spillhost.rs` mirror TypeScript's `SpillSink`):
+   sort runs, spools, hash partitions, and a spilled temp domain's scratch store. The simulated host
+   keeps scratch files in memory, and `spill_error` fails their operations; the `spill` profile
+   arms it on statements that do spill.
+4. **S4 — Simulated filesystem. Landed.** Every core's compaction, `create`, and file-attachment open
+   go through a file-host seam (`filehost.{go,rs,ts}`); the simulated filesystem implements it, with
+   named files, ordered directory changes, and a directory barrier where a rename becomes durable
+   only after its directory sync. The runner creates the database through it, the `compaction`
+   profile crashes at either of compaction's barriers (`nth`), and the `attachments` profile creates
+   file attachments under crashes at `create`'s barriers, writes them one durable database per
+   transaction, compacts them, and checks every database's recovery against its own history and
+   floor (§8.1–8.2).
 
    **Engine bug found.** A process that died between a compaction's rename and its directory sync
    left the new file in place with an unsynced entry; the next opener adopted it and committed with
@@ -535,9 +615,6 @@ primitive) gets a simulated implementation.
    (validated-cow.md §3). The same sweep also corrected the floor rule (§8.2), which had trusted a
    compaction's temp-file sync.
 
-   Not done: file attachments (the generator would need a schema per attachment and the N-root
-   commit's at-most-one-durable-database rule), and `create` (its temp-file recipe is the same as
-   compaction's, so only the open path is new).
 5. **S5 — Simulated lock host and multiple processes. Landed.** Every core's coordinator goes through a
    lock-host seam (bundle files, whole-file locks, the deadline clock, the pause between polls of a
    contended lock, the presence probe, and the in-process open registry); the OS host keeps today's
@@ -576,6 +653,22 @@ primitive) gets a simulated implementation.
    voice: it selects the generation recovery must select and checks the live count and free list.
    The driver compares its decision with every recovery a core reports (`sim:regress` always,
    sweeps with `--check-images`); in testing it agreed on every one of tens of thousands of images.
+7. **S7 — Bounded growth and corruption. Landed.** The reader-aware bounded-growth check (§8.3), with
+   the `growth` profile built to reach it, and the `corrupt` step (§6.3), with the `corruption`
+   profile. Each is held to a plant (`scripts/sim_plant.rb`, 60 seeds of its profile):
+
+   | Planted bug | Profile | Traces that caught it |
+   |---|---|---|
+   | a closed reader never releases its pin | `growth` | 59 / 60 |
+   | a commit never reuses the free list | `growth` | 60 / 60 |
+   | an attachment's commit ignores pinned readers | `attachments` | 50 / 60 |
+   | a page whose checksum does not match is decoded anyway | `corruption` | 43 / 60 |
+
+   No engine bug surfaced in any core: a flipped checksum surfaced only as `XX001` or not at all, and
+   the CRC-valid malformed pages `reseal` produces failed closed (the decoder hardening that landed
+   just before, storage.md §6). One gap remains: the generated reads never spill an `ORDER BY`
+   sorter run (only spools, hash partitions, and temp stores spill), so `spill_error` does not yet
+   reach the `sort`/`merge` scratch files; the unit and forced-spill corpus runs still cover them.
 
 ## 15. Open questions
 

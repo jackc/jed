@@ -15,6 +15,8 @@
 import type { BlockStore } from "../blockstore.ts";
 import { engineError, type EngineError } from "../errors.ts";
 import type { FileHost, WriteAt } from "../filehost.ts";
+import { pageCrc } from "../format.ts";
+import type { SpillByteReader, SpillRun, SpillScratch, SpillSink } from "../spill.ts";
 import { compareUtf8, decide, Fnv64, utf8 } from "./util.ts";
 
 // Decision lanes (§6.2); the values are part of the cross-core contract.
@@ -28,21 +30,26 @@ const LANE_LAND = 7n; // io_error op=sync: does this pending write land or vanis
 export const LANE_SESSION = 8n; // a session's entropy-seam seed
 const LANE_READ = 9n; // read_error: do reads of this offset fail during the step?
 const LANE_DIR = 10n; // power loss: how many pending directory changes survive (% changes+1)
+const LANE_SPILL = 11n; // spill_error: does this spill-file operation fail?
+const LANE_PAGE = 12n; // corrupt: which page a flip lands in
+const LANE_BIT = 13n; // corrupt: which bit of that page it flips
 
 const MASK64 = 0xffff_ffff_ffff_ffffn;
 
 // The database file's name in the simulated filesystem — the path the engine is given.
 export const MAIN_FILE = "sim.jed";
 
-// read_error and enospc are per-core faults: which reads happen depends on buffer-pool policy, and
-// when the file grows on preallocation policy (simulation-testing.md §6.3).
+// read_error, enospc, and spill_error are per-core faults: which reads happen depends on buffer-pool
+// policy, when the file grows on preallocation policy, and what a core spills, and in which
+// operations, on its own codec (simulation-testing.md §6.3).
 export type SimFaultKind =
   | "power_loss"
   | "process_crash"
   | "io_write"
   | "io_sync"
   | "read_error"
-  | "enospc";
+  | "enospc"
+  | "spill_error";
 
 // SimFault is one armed fault (simulation-testing.md §6.3). Permille fields are 0..1000.
 export type SimFault = {
@@ -50,7 +57,7 @@ export type SimFault = {
   survive: number; // power_loss
   tear: number; // power_loss
   issue: number; // process_crash
-  p: number; // io_error op=write, read_error
+  p: number; // io_error op=write, read_error, spill_error
   nth: number; // power_loss/process_crash: the barrier it fires at (default 1); io_error op=sync: the sync
 };
 
@@ -87,6 +94,7 @@ function fileKey(name: string): bigint {
 export class SimFS implements FileHost {
   readonly seed: bigint;
   readonly sector: number;
+  readonly pageSize: number;
 
   files = new Map<string, SimFile>(); // the kernel's view of the directory
   private durable = new Map<string, SimFile>(); // the directory as of the last directory barrier
@@ -95,24 +103,21 @@ export class SimFS implements FileHost {
   // Per-step state, reset by beginStep.
   step = 0n;
   fault: SimFault | null = null;
-  fired = ""; // "" | "barrier" | "write" | "sync" | "read" | "enospc"
+  fired = ""; // "" | "barrier" | "write" | "sync" | "read" | "enospc" | "spill"
   dead = false; // the process died mid-step; every later call fails
   syncs = 0; // file syncs this step (io_error op=sync nth)
   private barriers = 0; // file and directory barriers this step (power_loss/process_crash nth)
   writes = 0;
-  barrierOK = false; // the database file's barrier completed this step, its directory entry durable
   oracle = false; // the runner's own oracle reads are in progress: read faults do not apply
+  private spillOps = 0n; // spill-file operations this step (spill_error decisions)
 
   private ops = new Fnv64(); // FNV-1a fold of every mutating call, for self-determinism (§8.5)
 
-  constructor(seed: bigint, sector: number, image: Uint8Array) {
+  // An empty simulated filesystem; the runner creates the database in it (S4).
+  constructor(seed: bigint, sector: number, pageSize: number) {
     this.seed = seed;
     this.sector = sector;
-    const main = new SimFile(this, MAIN_FILE);
-    main.durable = image.slice();
-    main.cache = image.slice();
-    this.files.set(MAIN_FILE, main);
-    this.durable = new Map([[MAIN_FILE, main]]);
+    this.pageSize = pageSize;
   }
 
   // main is the database file, or undefined if a crash lost it.
@@ -133,8 +138,13 @@ export class SimFS implements FileHost {
     this.syncs = 0;
     this.barriers = 0;
     this.writes = 0;
-    this.barrierOK = false;
-    for (const d of this.allFiles()) d.unissued = [];
+    this.spillOps = 0n;
+    for (const d of this.allFiles()) {
+      d.unissued = [];
+      d.barrierOK = false;
+      d.writes = 0;
+      d.pages = new Set();
+    }
   }
 
   // allFiles lists every file the directory, its durable state, or a pending change refers to, each
@@ -221,6 +231,11 @@ export class SimFS implements FileHost {
     return path;
   }
 
+  exists(path: string): boolean {
+    if (this.dead) throw injected("stat after process death");
+    return this.files.has(path);
+  }
+
   writeFile(
     path: string,
     _modeFrom: string,
@@ -266,13 +281,186 @@ export class SimFS implements FileHost {
     this.dirOps = [];
   }
 
-  openStore(path: string, _noSync: boolean): BlockStore {
+  openStore(path: string, _noSync: boolean, _readOnly: boolean): BlockStore {
     if (this.dead) throw injected("open after process death");
     const d = this.files.get(path);
-    if (d === undefined) throw engineError("io_error", "I/O error: no such file " + path);
+    if (d === undefined)
+      throw engineError("undefined_file", "database file does not exist: " + path);
     return d;
   }
+
+  // --- the spill sink (spill.ts): scratch files in memory, whose operations can fail ------------
+
+  // spillSink is the simulated spill sink. Scratch bytes are never durable state, so its files live
+  // outside the filesystem and vanish with the process; spill_error fails an operation (S3).
+  spillSink(): SpillSink {
+    return new SimSpillSink(this);
+  }
+
+  // spillFault throws if the step's armed spill_error fails the next spill operation: each operation
+  // is decided by its ordinal in the step (lane 11). Which operations a core performs is its own
+  // business, so the fault is per-core (§6.3).
+  spillFault(): void {
+    if (this.dead) throw injected("spill after process death");
+    const n = this.spillOps++;
+    const f = this.fault;
+    if (
+      f !== null &&
+      f.kind === "spill_error" &&
+      !this.oracle &&
+      decide(this.seed, LANE_SPILL, this.step, n, 0n) % 1000n < BigInt(f.p)
+    ) {
+      this.fired = "spill";
+      throw injected("spill I/O error");
+    }
+  }
 }
+
+// SIM_SPILL_CHUNK is how many bytes one simulated run read returns: a reader refills a bounded
+// buffer, and each refill is one spill operation.
+const SIM_SPILL_CHUNK = 4096;
+
+// SimSpillSink maps the SpillSink seam onto spill operations: creating a run, scratch, or scratch
+// store is one; writing a run's bytes is one; each reader refill, scratch read, and scratch write is
+// one; a scratch store's readAt and writeAt each are one (its size and setSize are not, as a file's
+// stat and truncate are not in the Go host).
+class SimSpillSink implements SpillSink {
+  private fs: SimFS;
+
+  constructor(fs: SimFS) {
+    this.fs = fs;
+  }
+
+  writeRun(bytes: Uint8Array): SpillRun {
+    this.fs.spillFault(); // create
+    this.fs.spillFault(); // write
+    const data = bytes.slice();
+    const fs = this.fs;
+    return { open: () => new SimSpillReader(fs, data) };
+  }
+
+  createScratch(): SpillScratch {
+    this.fs.spillFault();
+    return new SimSpillScratch(this.fs);
+  }
+
+  createScratchStore(): BlockStore {
+    this.fs.spillFault();
+    return new SimScratchStore(this.fs);
+  }
+}
+
+class SimSpillReader implements SpillByteReader {
+  private fs: SimFS;
+  private data: Uint8Array;
+  private pos = 0; // the next byte to read
+  private end = 0; // the end of what reads have fetched so far
+
+  constructor(fs: SimFS, data: Uint8Array) {
+    this.fs = fs;
+    this.data = data;
+  }
+
+  private need(n: number): void {
+    while (this.end < this.pos + n) {
+      if (this.end >= this.data.length) throw new Error("unexpected EOF in spill run");
+      this.fs.spillFault();
+      this.end = Math.min(this.data.length, this.end + SIM_SPILL_CHUNK);
+    }
+  }
+
+  byte(): number {
+    this.need(1);
+    return this.data[this.pos++]!;
+  }
+
+  bytes(n: number): Uint8Array {
+    this.need(n);
+    const out = this.data.slice(this.pos, this.pos + n);
+    this.pos += n;
+    return out;
+  }
+
+  u64(): bigint {
+    let n = 0n;
+    for (let i = 0n; i < 8n; i++) n |= BigInt(this.byte()) << (i * 8n);
+    return n;
+  }
+
+  close(): void {}
+}
+
+class SimSpillScratch implements SpillScratch {
+  size = 0;
+  private fs: SimFS;
+  private data: Uint8Array = new Uint8Array();
+
+  constructor(fs: SimFS) {
+    this.fs = fs;
+  }
+
+  read(position: number, length: number): Uint8Array {
+    this.fs.spillFault();
+    if (position + length > this.data.length) throw new Error("unexpected EOF in spill scratch");
+    return this.data.slice(position, position + length);
+  }
+
+  write(position: number, bytes: Uint8Array): void {
+    this.fs.spillFault();
+    this.data = grow(this.data, position + bytes.length);
+    this.data.set(bytes, position);
+    this.size = Math.max(this.size, position + bytes.length);
+  }
+
+  close(): void {
+    this.data = new Uint8Array();
+  }
+}
+
+// SimScratchStore is a spilled temp domain's scratch BlockStore: never reopened, never durable.
+class SimScratchStore implements BlockStore {
+  private fs: SimFS;
+  private data: Uint8Array = new Uint8Array();
+
+  constructor(fs: SimFS) {
+    this.fs = fs;
+  }
+
+  readAt(offset: number, len: number): Uint8Array {
+    this.fs.spillFault();
+    if (offset < 0 || offset + len > this.data.length) {
+      throw engineError("io_error", "I/O error: short read past the end of a spill file");
+    }
+    return this.data.slice(offset, offset + len);
+  }
+
+  writeAt(offset: number, bytes: Uint8Array): void {
+    this.fs.spillFault();
+    this.data = grow(this.data, offset + bytes.length);
+    this.data.set(bytes, offset);
+  }
+
+  sync(): void {}
+
+  size(): number {
+    return this.data.length;
+  }
+
+  setSize(n: number): void {
+    this.data = n <= this.data.length ? this.data.slice(0, n) : grow(this.data, n);
+  }
+
+  skipsSync(): boolean {
+    return true;
+  }
+
+  close(): void {
+    this.data = new Uint8Array();
+  }
+}
+
+// SimFlip is one flipped page, remembered so the step can repair it.
+export type SimFlip = { page: number; orig: Uint8Array };
 
 // SimFile is one simulated file (the Go runner's simDisk).
 export class SimFile implements BlockStore {
@@ -281,6 +469,11 @@ export class SimFile implements BlockStore {
   durable: Uint8Array = new Uint8Array();
   cache: Uint8Array = new Uint8Array();
   private pending = new Map<number, Uint8Array[]>();
+  // Per-step state, reset by beginStep: whether this file's own barrier completed with every directory
+  // change durable (the floor, §8.2), how many writes reached it, and which pages.
+  barrierOK = false;
+  writes = 0;
+  pages = new Set<number>();
   // unissued are the writes an armed process_crash decided never reached the kernel; processDeath
   // removes them.
   unissued: SimWrite[] = [];
@@ -336,6 +529,14 @@ export class SimFile implements BlockStore {
       }
     }
     fs.writes++;
+    this.writes++;
+    for (
+      let pg = Math.floor(offset / fs.pageSize);
+      pg * fs.pageSize < offset + bytes.length;
+      pg++
+    ) {
+      this.pages.add(pg);
+    }
     this.cache = grow(this.cache, offset + bytes.length);
     this.cache.set(bytes, offset);
     const vs = this.pending.get(offset);
@@ -361,9 +562,9 @@ export class SimFile implements BlockStore {
     }
     this.durable = grow(this.durable, this.cache.length);
     this.pending = new Map();
-    // Only the database file's own barrier, with its directory entry durable, makes the generation it
+    // Only a database file's own barrier, with its directory entry durable, makes the generation it
     // holds durable (the floor, §8.2); a compaction's temp file syncing proves nothing about it.
-    if (this === this.fs.main() && this.fs.dirOps.length === 0) this.fs.barrierOK = true;
+    if (this.fs.dirOps.length === 0) this.barrierOK = true;
     this.unissued = []; // reaching a barrier means every earlier write was issued
   }
 
@@ -472,5 +673,62 @@ export class SimFile implements BlockStore {
       }
     }
     this.unissued = [];
+  }
+
+  // corrupt flips n bits in this file's durable body pages below pageCount, choosing each page (lane
+  // 12) and bit (lane 13) by the flip's ordinal, and skipping a page with a pending write: bit rot
+  // strikes data at rest. Both durable and cache change, as if the kernel's cached copy were dropped
+  // too. With reseal, each touched page's CRC is recomputed, so only the engine's structural checks
+  // stand between the flip and a wrong answer. Returns what to restore.
+  corrupt(step: number, n: number, pageCount: number, reseal: boolean): SimFlip[] {
+    const ps = this.fs.pageSize;
+    if (pageCount <= 2) return [];
+    const flips: SimFlip[] = [];
+    const touched = new Set<number>();
+    const st = BigInt(step);
+    for (let k = 0; k < n; k++) {
+      const pg =
+        2 + Number(decide(this.fs.seed, LANE_PAGE, st, BigInt(k), 0n) % BigInt(pageCount - 2));
+      const bit = Number(decide(this.fs.seed, LANE_BIT, st, BigInt(k), 0n) % BigInt(ps * 8));
+      const start = pg * ps;
+      if (
+        start + ps > this.durable.length ||
+        start + ps > this.cache.length ||
+        this.pendingIn(start, start + ps)
+      ) {
+        continue;
+      }
+      if (!touched.has(pg)) {
+        touched.add(pg);
+        flips.push({ page: pg, orig: this.durable.slice(start, start + ps) });
+      }
+      const at = start + Math.floor(bit / 8);
+      this.durable[at] = this.durable[at]! ^ (1 << (bit % 8));
+    }
+    for (const f of flips) {
+      const start = f.page * ps;
+      const page = this.durable.subarray(start, start + ps);
+      if (reseal)
+        new DataView(page.buffer, page.byteOffset, ps).setUint32(12, pageCrc(page), false);
+      this.cache.set(page, start);
+    }
+    return flips;
+  }
+
+  // repair restores the pages corrupt flipped.
+  repair(flips: SimFlip[]): void {
+    for (const f of flips) {
+      const start = f.page * this.fs.pageSize;
+      this.durable.set(f.orig, start);
+      this.cache.set(f.orig, start);
+    }
+  }
+
+  // pendingIn reports whether any pending write overlaps [lo, hi).
+  private pendingIn(lo: number, hi: number): boolean {
+    for (const [off, vs] of this.pending) {
+      if (off < hi && off + vs[vs.length - 1]!.length > lo) return true;
+    }
+    return false;
   }
 }

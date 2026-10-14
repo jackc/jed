@@ -259,9 +259,10 @@ pub(crate) struct Storage {
     read_only: bool,
     /// The backing file path; `None` for an in-memory database. Surfaced by [`Database::path`].
     path: Option<std::path::PathBuf>,
-    /// Host scratch directory for external-sort runs; independent of `path` so read-only database
-    /// directories never receive spill files. `None` for hosts with no spill backing.
-    spill_dir: Option<std::path::PathBuf>,
+    /// Host scratch files for spill and temp-table spill ([`crate::spillhost`]); independent of `path`
+    /// so read-only database directories never receive spill files. `None` for hosts with no spill
+    /// backing.
+    spill: Option<Arc<dyn crate::spillhost::SpillHost>>,
     /// Turns on within-session free-list compaction ([`Storage::maybe_compact`]): the never-reopened
     /// in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their copy-on-write orphans
     /// are reclaimed rather than leaked. The main file/in-memory domain ALSO sets it (v25 — continuous
@@ -379,7 +380,7 @@ impl Storage {
             paging: crate::paging::SharedPaging::new(pager, usize::MAX),
             read_only: false,
             path: None,
-            spill_dir: None,
+            spill: None,
             reclaim_within_session: true,
             spilled: false,
             live_at_compaction: 0,
@@ -419,15 +420,15 @@ impl Storage {
         &mut self,
         snap: &mut Snapshot,
         temp_buffers: usize,
-        spill_dir: Option<&std::path::Path>,
+        spill: Option<&Arc<dyn crate::spillhost::SpillHost>>,
     ) -> Result<StagedCommit> {
         // A temp/in-memory store keeps its free-list in RAM (no meta), so it persists no free-list
         // pages; within-session reclamation is the post-commit RAM rebuild (`maybe_compact`).
         let staged = self.stage_in_memory(snap, None, String::new())?;
         let bytes = staged.page_count as u64 * self.page_size as u64;
         if !self.spilled && temp_buffers > 0 && bytes > temp_buffers as u64 {
-            if let Some(dir) = spill_dir {
-                let store = crate::blockstore::ScratchBlockStore::create(dir)?;
+            if let Some(spill) = spill {
+                let store = crate::blockstore::ScratchBlockStore::create(spill.as_ref())?;
                 self.paging.pager().migrate_store(Box::new(store))?;
                 self.spilled = true;
                 TEMP_SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1817,7 +1818,7 @@ impl Shared {
         let storage = self.storage.lock().expect("storage lock not poisoned");
         engine.page_size = storage.page_size;
         engine.path = storage.path.clone();
-        engine.spill_dir = storage.spill_dir.clone();
+        engine.spill = storage.spill.clone();
         engine.read_only = storage.read_only;
     }
 
@@ -2067,7 +2068,7 @@ impl Database {
             paging,
             read_only: engine.read_only,
             path: engine.path.clone(),
-            spill_dir: engine.spill_dir.clone(),
+            spill: engine.spill.clone(),
             // v25: the main domain (file or in-memory) now reclaims within-session — the open path
             // reads the persisted free-list and no longer reconstructs it, so mid-session orphans must
             // be returned at each commit or they would leak permanently (format.md *Reclamation*).
@@ -2259,7 +2260,7 @@ impl Database {
             .storage
             .lock()
             .expect("storage lock not poisoned")
-            .spill_dir = Some(dir);
+            .spill = Some(crate::spillhost::os_spill_host(dir));
     }
 
     /// Whether this database was opened read-only (a write is `25006`). In-memory databases are
@@ -2416,7 +2417,22 @@ impl Database {
                 Some(coordinator) => Some(coordinator.lock_commit_shared()?),
                 None => None,
             };
-            let engine = Engine::open_with_options(
+            // Through main's file host (crate::filehost), so the simulated filesystem serves
+            // attachments too.
+            let files = self
+                .0
+                .storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .files
+                .clone();
+            let os = crate::filehost::OsFileHost;
+            let host: &dyn crate::filehost::FileHost = match &files {
+                Some(files) => files.as_ref(),
+                None => &os,
+            };
+            let engine = Engine::open_via(
+                host,
                 canonical,
                 OpenOptions {
                     read_only,
@@ -2436,7 +2452,7 @@ impl Database {
                 paging,
                 read_only: engine.read_only,
                 path: engine.path.clone(),
-                spill_dir: engine.spill_dir.clone(),
+                spill: engine.spill.clone(),
                 // v25: a file attachment persists + reclaims like the main file domain (above).
                 reclaim_within_session: true,
                 spilled: false,
@@ -2447,7 +2463,7 @@ impl Database {
                     ..StorageBudget::default()
                 },
                 live: engine.live,
-                files: None,
+                files,
                 dir_synced: false,
             };
             Some((storage, engine.committed, coordinator))
@@ -3653,14 +3669,41 @@ impl Database {
         )
     }
 
-    /// Route MAIN's file operations (compaction, the first commit's directory barrier) through the
-    /// simulator's filesystem instead of the OS.
+    /// Route MAIN's file operations (compaction, the first commit's directory barrier, opening a
+    /// file attachment) through the simulator's filesystem instead of the OS.
     pub(crate) fn sim_set_files(&self, files: Arc<dyn crate::filehost::FileHost>) {
         self.0
             .storage
             .lock()
             .expect("storage lock not poisoned")
             .files = Some(files);
+    }
+
+    /// The committed version of attachment `name`, or `None` if it is not attached.
+    pub(crate) fn sim_attached_version(&self, name: &str) -> Option<u64> {
+        self.0
+            .roots
+            .read()
+            .expect("roots lock not poisoned")
+            .attached
+            .get(name)
+            .map(|snap| snap.txid)
+    }
+
+    /// Database `name`'s page high-water and in-memory free-list length — the allocator state its
+    /// next commit draws from (`main` or an attachment); `None` if there is no such database.
+    pub(crate) fn sim_allocator(&self, name: &str) -> Option<(u32, u32)> {
+        if name == "main" {
+            let st = self.0.storage.lock().expect("storage lock not poisoned");
+            return Some((st.page_count, st.free_pages.len() as u32));
+        }
+        let atts = self
+            .0
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned");
+        atts.get(name)
+            .map(|a| (a.storage.page_count, a.storage.free_pages.len() as u32))
     }
 }
 

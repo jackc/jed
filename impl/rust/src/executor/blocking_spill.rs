@@ -25,21 +25,21 @@ impl Engine {
     fn blocking_spool(&self) -> RowSpool {
         RowSpool::new(
             self.session.work_mem,
-            self.spill_dir.clone().unwrap(),
+            self.spill.clone().unwrap(),
             crate::cost::StateCharge::new(self.session.query_account()),
         )
     }
     fn blocking_map(&self) -> StateMap {
         StateMap::new(
             self.session.work_mem,
-            self.spill_dir.clone().unwrap(),
+            self.spill.clone().unwrap(),
             crate::cost::StateCharge::new(self.session.query_account()),
         )
     }
     fn blocking_hash_rows(&self) -> HashRows {
         HashRows::new(
             self.session.work_mem,
-            self.spill_dir.clone().unwrap(),
+            self.spill.clone().unwrap(),
             crate::cost::StateCharge::new(self.session.query_account()),
         )
     }
@@ -62,7 +62,7 @@ impl Engine {
 
     pub(crate) fn blocking_spill_eligible(&self, plan: &SelectPlan) -> bool {
         self.session.work_mem > 0
-            && self.spill_dir.is_some()
+            && self.spill.is_some()
             && (plan.is_agg
                 || plan.distinct
                 || plan.phys.hash_join.is_some()
@@ -1268,7 +1268,7 @@ struct SpillHashTable {
     left_indices: Vec<usize>,
     types: Vec<Type>,
     budget: usize,
-    dir: std::path::PathBuf,
+    spill: std::sync::Arc<dyn crate::spillhost::SpillHost>,
     acct: crate::cost::QueryAccount,
 }
 impl SpillHashTable {
@@ -1283,7 +1283,7 @@ impl SpillHashTable {
         let left_indices = hash.keys.iter().map(|k| k.left - probe_offset).collect();
         let right_indices: Vec<usize> = hash.keys.iter().map(|k| k.right - build_offset).collect();
         let types: Vec<&Type> = hash.keys.iter().map(|k| &k.ty).collect();
-        let dir = engine.spill_dir.clone().unwrap();
+        let spill = engine.spill.clone().unwrap();
         let budget = engine.session.work_mem;
         let mut entries = engine.blocking_hash_rows();
         let mut build = rows.reader()?;
@@ -1302,14 +1302,14 @@ impl SpillHashTable {
             left_indices,
             types: hash.keys.iter().map(|k| k.ty.clone()).collect(),
             budget,
-            dir,
+            spill,
             acct: engine.session.query_account(),
         })
     }
     fn probe(&self, left: &Row, meter: &mut Meter) -> Result<RowSpool> {
         let mut matches = RowSpool::new(
             self.budget,
-            self.dir.clone(),
+            self.spill.clone(),
             crate::cost::StateCharge::new(self.acct.clone()),
         );
         if let Some(key) = hash_join_row_key(
@@ -1441,8 +1441,8 @@ mod tests {
             .unwrap()
         };
         let hash = hash_join_fnv1a(&key(2));
-        let dir = std::env::temp_dir();
-        let mut entries = HashRows::new(1, dir.clone(), crate::cost::StateCharge::default());
+        let spill = crate::spillhost::os_spill_host(std::env::temp_dir());
+        let mut entries = HashRows::new(1, spill.clone(), crate::cost::StateCharge::default());
         // Force distinct complete keys into the same full-hash bucket; a one-byte budget means
         // every record is backed by scratch, including the duplicate matches for one hot key.
         for (n, ordinal) in [(1, 10), (2, 20), (2, 21)] {
@@ -1461,7 +1461,7 @@ mod tests {
             left_indices: vec![0],
             types: vec![ty],
             budget: 1,
-            dir,
+            spill,
             acct: crate::cost::QueryAccount::default(),
         };
         let mut meter = Meter::new();

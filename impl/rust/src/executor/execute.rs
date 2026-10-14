@@ -1013,7 +1013,7 @@ impl Engine {
             (true, Some(ts)) => Some(ts.stage_temp(
                 &mut temp_working,
                 self.session.temp_buffers,
-                self.spill_dir.as_deref(),
+                self.spill.as_ref(),
             )?),
             _ => None,
         };

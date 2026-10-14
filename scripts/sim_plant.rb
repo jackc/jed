@@ -68,6 +68,42 @@ module SimPlant
                "canReclaim := !shared && oldest == snap.txid\n\tcanReuse := !shared && oldest >= c.storage.freeGenTxid",
                "canReclaim := !shared && oldest <= snap.txid\n\tcanReuse := !shared && oldest >= 0"]]
     ),
+    # Bounded growth (simulation-testing.md §8.3): a reader that never releases its pin holds
+    # reclamation back for good, so the file grows without bound after every reader has closed.
+    Plant.new(
+      name: "leak-reader-pin",
+      protection: "a closed reader releases its pin, so reclamation resumes (transactions.md §8)",
+      profile: "growth",
+      edits: [["impl/go/shared.go",
+               "\tif c.live[v]--; c.live[v] <= 0 {\n\t\tdelete(c.live, v)\n\t}",
+               "\tif c.live[v]--; false && c.live[v] <= 0 {\n\t\tdelete(c.live, v)\n\t}"]]
+    ),
+    Plant.new(
+      name: "never-reuse",
+      protection: "a commit reuses the free list before it grows the file (storage.md §6)",
+      profile: "growth",
+      edits: [["impl/go/shared.go",
+               "canReuse := !shared && oldest >= c.storage.freeGenTxid",
+               "canReuse := false && !shared && oldest >= c.storage.freeGenTxid"]]
+    ),
+    # File attachments (S4): an attachment's commit is gated by the same reader watermark as main's.
+    Plant.new(
+      name: "attachment-ignores-readers",
+      protection: "an attachment's pages a pinned reader still needs are neither reclaimed nor reused (attached-databases.md §5)",
+      profile: "attachments",
+      edits: [["impl/go/execute.go",
+               "canReclaim := db.core == nil || !db.core.hasLiveReaders()",
+               "canReclaim := true || db.core == nil || !db.core.hasLiveReaders()"]]
+    ),
+    # Corruption (§6.3 `corrupt`): a page whose checksum no longer matches must never be decoded.
+    Plant.new(
+      name: "skip-page-checksum",
+      protection: "a body page whose CRC does not match is XX001, never decoded (storage.md §6)",
+      profile: "corruption",
+      edits: [["impl/go/format.go",
+               "\tif pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) {\n\t\treturn page{}, newError(DataCorrupted, \"page checksum mismatch",
+               "\tif false && pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) {\n\t\treturn page{}, newError(DataCorrupted, \"page checksum mismatch"]]
+    ),
     # Shared-file coordination (locking.md §5.3): co-resident processes must commit append-only and
     # refresh meta at begin. The plant makes every process act as if it were alone.
     Plant.new(

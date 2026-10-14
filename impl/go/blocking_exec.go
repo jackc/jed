@@ -17,7 +17,7 @@ import (
 )
 
 func (db *engine) boundedBlockingEligible(p *selectPlan) bool {
-	if db.spillDir == "" || db.session.workMem == 0 {
+	if db.spill == nil || db.session.workMem == 0 {
 		return false
 	}
 	if len(p.rels) == 0 && !p.isAgg && !p.distinct {

@@ -84,9 +84,10 @@ module Sim
   end
 
   # A trace with a per-core fault (simulation-testing.md §6.3) is checked by every core's oracles but
-  # not compared across cores: whether a read or a file growth happens at all is host policy.
+  # not compared across cores: whether a read, a file growth, or a spill happens at all is host
+  # policy, and which pages a corrupted open reads is the core's own.
   def per_core?(path)
-    File.foreach(path).any? { |line| line.start_with?("fault read_error", "fault enospc") }
+    File.foreach(path).any? { |line| line.start_with?("fault read_error", "fault enospc", "fault spill_error", "corrupt") }
   end
 
   def transcript(out, name, core)
@@ -137,6 +138,11 @@ module Sim
 
         img = File.join(out, "#{name}.#{core}.step#{j['i']}.img")
         expected[img] = j if File.exist?(img)
+        # Each recovered file attachment's image too (S4), named by its database.
+        (j["dbs"] || {}).each do |db, state|
+          img = File.join(out, "#{name}.#{core}.step#{j['i']}.#{db}.img")
+          expected[img] = state if File.exist?(img)
+        end
       end
     end
     return [] if expected.empty?

@@ -8,15 +8,13 @@
 //! query observes (results + cost are invariant — the sort is unmetered, cost.md §3). So the run
 //! file's bytes are a **per-core internal** self-describing row codec, round-tripped only within one
 //! core during one query while the database file is unchanged — *not* the §8 on-disk record format.
-//! Stdlib file I/O only (no dependency — CLAUDE.md §14; no `unsafe`/cgo — §13).
+//! Run files come from the spill host ([`crate::spillhost`]); no dependency (CLAUDE.md §14), no
+//! `unsafe` (§13).
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::collation::Collation;
 use crate::cost::StateCharge;
@@ -25,6 +23,7 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::executor::key_cmp;
 use crate::interval::Interval;
 use crate::json;
+use crate::spillhost::{SpillAppender, SpillFile, SpillHost, SpillReader};
 use crate::storage::Row;
 use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
@@ -41,10 +40,6 @@ pub const DEFAULT_WORK_MEM: usize = 256 * 1024 * 1024;
 /// `cmp_rows` only ever sees `None` here and ignores the field.
 pub(crate) type SortKey = (usize, bool, bool, Option<Arc<Collation>>);
 
-/// A unique-per-process suffix for spill file names, so concurrent sorters never collide. Combined
-/// with the process id; the value is internal (it never affects results — spill.md §6).
-static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// A row's resident bytes for the `work_mem` spill decision: the shared logical size schedule of
 /// spec/design/memory.md §3 — the same number the query-memory account charges for sort and spill
 /// state (§6.6), so every core spills at the same input row. Rows reach a sorter or spill structure
@@ -60,13 +55,14 @@ pub(crate) struct Sorter {
     keys: Arc<Vec<SortKey>>,
     /// The work-memory budget in bytes (`0` ⇒ unlimited — never spill).
     budget: usize,
-    /// The directory spill runs are written to, or `None` for an in-memory database (never spill).
-    spill_dir: Option<PathBuf>,
+    /// The spill host runs are written to, or `None` for an in-memory database (never spill).
+    spill: Option<Arc<dyn SpillHost>>,
     /// The current in-memory run buffer (drained into a run when it exceeds `budget`).
     buf: Vec<Row>,
     buf_bytes: usize,
-    /// Spilled sorted runs, in input order (run 0 = the first chunk of input — spill.md §6).
-    runs: Vec<PathBuf>,
+    /// Spilled sorted runs, in input order (run 0 = the first chunk of input — spill.md §6). Each
+    /// run file is deleted when it is dropped.
+    runs: Vec<Arc<dyn SpillFile>>,
     run_levels: Vec<usize>,
     /// The total rows pushed (the count `LIMIT`/`OFFSET` windows against — spill.md §5).
     total: usize,
@@ -77,18 +73,18 @@ pub(crate) struct Sorter {
 }
 
 impl Sorter {
-    /// A sorter over the `keys`, bounded by `budget` bytes, spilling into `spill_dir` (or `None` =
+    /// A sorter over the `keys`, bounded by `budget` bytes, spilling through `spill` (or `None` =
     /// never spill, the in-memory database / unlimited case).
     pub(crate) fn new(
         keys: Vec<SortKey>,
         budget: usize,
-        spill_dir: Option<PathBuf>,
+        spill: Option<Arc<dyn SpillHost>>,
         charge: StateCharge,
     ) -> Sorter {
         Sorter {
             keys: Arc::new(keys),
             budget,
-            spill_dir,
+            spill,
             buf: Vec::new(),
             buf_bytes: 0,
             runs: Vec::new(),
@@ -100,7 +96,7 @@ impl Sorter {
 
     /// Whether this sorter may spill (a file-backed database with a positive budget).
     fn can_spill(&self) -> bool {
-        self.spill_dir.is_some() && self.budget > 0
+        self.spill.is_some() && self.budget > 0
     }
 
     /// Push one row into the sorter. Spills the current run to disk when the in-memory buffer
@@ -148,12 +144,9 @@ impl Sorter {
     fn spill_run(&mut self) -> Result<()> {
         let keys = self.keys.clone();
         self.buf.sort_by(|a, b| Sorter::cmp_rows(&keys, a, b));
-        let dir = self
-            .spill_dir
-            .as_ref()
-            .expect("spill_run requires a spill dir");
-        let (path, file) = create_spill_file(dir)?;
-        let mut w = BufWriter::new(file);
+        let spill = self.spill.clone().expect("spill_run requires a spill host");
+        let file: Arc<dyn SpillFile> = Arc::from(spill.create("sort")?);
+        let mut w = BufWriter::new(SpillAppender::new(file.clone(), 0));
         let write_result = (|| -> io::Result<()> {
             write_u64(&mut w, self.buf.len() as u64)?;
             for row in &self.buf {
@@ -161,12 +154,12 @@ impl Sorter {
             }
             w.flush()
         })();
+        drop(w);
         if let Err(e) = write_result {
-            drop(w);
-            let _ = fs::remove_file(&path);
+            file.close();
             return Err(io_error(e));
         }
-        self.runs.push(path);
+        self.runs.push(file);
         self.run_levels.push(0);
         self.buf.clear();
         self.buf_bytes = 0;
@@ -191,7 +184,7 @@ impl Sorter {
                     _ => 0,
                 })
                 .sum();
-            let merged = merge_pair_to_file(sources, count, self.keys.clone(), dir)?;
+            let merged = merge_pair_to_file(sources, count, self.keys.clone(), spill.as_ref())?;
             self.runs.truncate(n - 2);
             self.run_levels.truncate(n - 2);
             self.runs.push(merged);
@@ -215,9 +208,10 @@ impl Sorter {
         }
         // Sources: each spilled run, then the final in-memory buffer last (it holds the latest input
         // positions, so it is the highest source index — the tie-break that reproduces input order).
+        // A run that fails to open is deleted, and so are the rest as `self` drops.
         let mut sources: Vec<Source> = Vec::with_capacity(self.runs.len() + 1);
-        for path in &self.runs {
-            sources.push(Source::open_file(path.clone())?);
+        for run in std::mem::take(&mut self.runs) {
+            sources.push(Source::open_file(run)?);
         }
         sources.push(Source::Mem(std::mem::take(&mut self.buf).into_iter()));
         let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(sources.len());
@@ -239,8 +233,8 @@ fn merge_pair_to_file(
     mut sources: Vec<Source>,
     count: u64,
     keys: Arc<Vec<SortKey>>,
-    dir: &std::path::Path,
-) -> Result<PathBuf> {
+    spill: &dyn SpillHost,
+) -> Result<Arc<dyn SpillFile>> {
     let mut heap = BinaryHeap::new();
     for (source, src) in sources.iter_mut().enumerate() {
         if let Some(row) = src.next()? {
@@ -252,8 +246,8 @@ fn merge_pair_to_file(
         }
     }
     let mut merger = Merger { sources, heap };
-    let (path, file) = create_spill_file(dir)?;
-    let mut writer = BufWriter::new(file);
+    let file: Arc<dyn SpillFile> = Arc::from(spill.create("merge")?);
+    let mut writer = BufWriter::new(SpillAppender::new(file.clone(), 0));
     let result = (|| -> Result<()> {
         write_u64(&mut writer, count).map_err(io_error)?;
         while let Some(row) = merger.next()? {
@@ -263,32 +257,10 @@ fn merge_pair_to_file(
     })();
     drop(writer);
     if let Err(err) = result {
-        let _ = fs::remove_file(&path);
+        file.close();
         return Err(err);
     }
-    Ok(path)
-}
-
-/// Securely create one run in the host scratch directory. The OS temp directory can be shared by
-/// mutually untrusted users, so creation must be exclusive and the initial Unix mode private; a
-/// predictable pid/counter name is then only an identifier, never an overwrite primitive.
-pub(crate) fn create_spill_file(dir: &std::path::Path) -> Result<(PathBuf, File)> {
-    loop {
-        let seq = SPILL_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
-        let path = dir.join(format!("jed-spill-{}-{}.tmp", std::process::id(), seq));
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        match opts.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(io_error(e)),
-        }
-    }
+    Ok(file)
 }
 
 /// The sorted output stream (spec/design/spill.md §4). The window/projection loop pulls rows one at
@@ -323,8 +295,8 @@ impl SortedRows {
 /// buffer.
 enum Source {
     File {
-        reader: Option<BufReader<File>>,
-        path: PathBuf,
+        reader: Option<BufReader<SpillReader>>,
+        file: Arc<dyn SpillFile>,
         remaining: u64,
     },
     Mem(std::vec::IntoIter<Row>),
@@ -337,13 +309,20 @@ impl Drop for Source {
 }
 
 impl Source {
-    fn open_file(path: PathBuf) -> Result<Source> {
-        let file = File::open(&path).map_err(io_error)?;
-        let mut reader = BufReader::new(file);
-        let remaining = read_u64(&mut reader).map_err(io_error)?;
+    /// Read a spilled run back from its start. The source owns the run: it is deleted when the run
+    /// is exhausted, on cleanup, or here on failure.
+    fn open_file(file: Arc<dyn SpillFile>) -> Result<Source> {
+        let mut reader = BufReader::new(SpillReader::new(file.clone(), 0));
+        let remaining = match read_u64(&mut reader) {
+            Ok(n) => n,
+            Err(e) => {
+                file.close();
+                return Err(io_error(e));
+            }
+        };
         Ok(Source::File {
             reader: Some(reader),
-            path,
+            file,
             remaining,
         })
     }
@@ -353,13 +332,13 @@ impl Source {
             Source::Mem(it) => Ok(it.next()),
             Source::File {
                 reader,
-                path,
+                file,
                 remaining,
             } => {
                 if *remaining == 0 {
                     // Exhausted — delete the run file eagerly so a long merge never holds them all.
                     drop(reader.take());
-                    let _ = fs::remove_file(&*path);
+                    file.close();
                     return Ok(None);
                 }
                 *remaining -= 1;
@@ -373,9 +352,9 @@ impl Source {
 
     /// Best-effort cleanup of an undrained run file (a `LIMIT` may stop the merge early).
     fn cleanup(&mut self) {
-        if let Source::File { path, reader, .. } = self {
+        if let Source::File { file, reader, .. } = self {
             drop(reader.take());
-            let _ = fs::remove_file(path);
+            file.close();
         }
     }
 }
@@ -855,7 +834,7 @@ mod bounded_run_tests {
         let mut sort = Sorter::new(
             vec![(0, false, false, None)],
             1,
-            Some(std::env::temp_dir()),
+            Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
             StateCharge::default(),
         );
         for i in 0..2048 {
@@ -892,7 +871,7 @@ mod bounded_run_tests {
         let mut sort = Sorter::new(
             vec![(0, false, false, None)],
             1 << 30,
-            Some(std::env::temp_dir()),
+            Some(crate::spillhost::os_spill_host(std::env::temp_dir())),
             StateCharge::new(acct.clone()),
         );
         for i in 0..200 {

@@ -531,9 +531,9 @@ type storage struct {
 	// older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
 	// on-disk byte layout is byte-for-byte unchanged.
 	freeGenTxid uint64
-	readOnly    bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
-	path        string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
-	spillDir    string // host scratch directory for external-sort runs; independent of path, "" when unavailable
+	readOnly    bool      // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
+	path        string    // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
+	spill       spillHost // host scratch files for spill and temp-table spill; independent of path, nil when unavailable
 	// budget is the committed-storage budget (memory.md §8): the in-memory form (Q4a) or the file form
 	// (§8.7).
 	budget storageBudget
@@ -1207,7 +1207,7 @@ func TempSpills() uint64 { return tempSpills.Load() }
 // the host has a spill directory, the in-RAM store migrates to a scratch file there and the pool is
 // bounded by tempBuffers — re-applied every commit so a later tempBuffers change takes effect.
 // Residency only: the page layout, and so results, cost, and the 54P03 point, are unchanged.
-func (st *storage) stageTemp(snap *snapshot, tempBuffers int, spillDir string) (stagedCommit, error) {
+func (st *storage) stageTemp(snap *snapshot, tempBuffers int, spill spillHost) (stagedCommit, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	// A temp/in-memory store keeps its free-list in RAM (no meta), so it persists no free-list pages;
@@ -1217,8 +1217,8 @@ func (st *storage) stageTemp(snap *snapshot, tempBuffers int, spillDir string) (
 		return stagedCommit{}, err
 	}
 	bytes := uint64(staged.pageCount) * uint64(st.pageSize)
-	if !st.spilled && tempBuffers > 0 && bytes > uint64(tempBuffers) && spillDir != "" {
-		store, err := newScratchBlockStore(spillDir)
+	if !st.spilled && tempBuffers > 0 && bytes > uint64(tempBuffers) && spill != nil {
+		store, err := newScratchBlockStore(spill)
 		if err != nil {
 			return stagedCommit{}, err
 		}
@@ -1434,7 +1434,7 @@ func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *s
 		paging:    e.paging,
 		readOnly:  e.readOnly,
 		path:      e.path,
-		spillDir:  e.spillDir,
+		spill:     e.spill,
 		// v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
 		// persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at
 		// each commit or they would leak permanently (format.md *Reclamation*).
@@ -1707,7 +1707,8 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 				return err
 			}
 		}
-		e, err := openWithOptions(real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone})
+		// Through main's file host (filehost.go), so the simulated filesystem serves attachments too.
+		e, err := openVia(db.core.storage.fileHost(), real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone})
 		if coordinator != nil {
 			coordinator.unlockCommit()
 		}
@@ -1724,7 +1725,8 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			paging:    e.paging,
 			readOnly:  e.readOnly,
 			path:      e.path,
-			spillDir:  e.spillDir,
+			spill:     e.spill,
+			files:     db.core.storage.files,
 			// v25: a file attachment persists + reclaims like the main file domain.
 			reclaimWithinSession: true,
 			liveAtCompaction:     e.liveAtCompaction,
@@ -1984,7 +1986,7 @@ func (s *Database) Path() string { return s.core.path() }
 // harness's forced temp-spill mode (SetSpillDirForTooling). Production file hosts install os.TempDir at
 // open/create; keeping this a tooling hook keeps the configurable spill-target follow-on out of the
 // embedding API. Sessions minted afterwards inherit it.
-func (s *Database) setSpillDirForTest(dir string) { s.core.storage.spillDir = dir }
+func (s *Database) setSpillDirForTest(dir string) { s.core.storage.spill = osSpillHost{dir: dir} }
 
 // SetSpillDirForTooling gives db (and the sessions minted from it afterwards) a spill directory — the
 // conformance harness's forced temp-spill mode runs in-memory databases, which otherwise have none
@@ -2004,7 +2006,7 @@ func (s *Database) ReadSession() *Session {
 	snap := rt.committed
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSession()}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession()}
 	engine.core = s.core
 	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
@@ -2033,7 +2035,7 @@ func (s *Database) WriteSession() *Session {
 	rt := s.core.roots.Load()
 	base := rt.committed
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSession()}
+	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession()}
 	engine.core = s.core
 	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
@@ -2053,7 +2055,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
 	if s.core.readOnlyMode() {
 		rt, v := s.core.pinLatest()
-		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSessionWithOptions(opts)}
+		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts)}
 		engine.core = s.core
 		engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 		engine.attachedCommitted = rt.attached
@@ -2063,7 +2065,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSessionWithOptions(opts)}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts)}
 	engine.core = s.core
 	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached

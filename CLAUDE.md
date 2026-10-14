@@ -382,11 +382,14 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   A seeded generator (`scripts/sim_gen.rb`) writes multi-session histories; each core's runner executes
   them over a simulated disk whose power losses, process crashes, torn sectors, and I/O errors are
   decided by a content-keyed function, so a run replays exactly from its seed and the three cores must
-  produce **byte-identical transcripts and crash images**. The simulated filesystem covers compaction's
-  rename and directory barrier, and simulated processes share one file under the real locking protocol
-  through a lock-host seam. Oracles: recovery lands between the durability
-  floor and the newest attempted commit and matches a recorded generation; a reader sees its pinned
-  version; no `XX001`; image and live integrity checks; and `spec/fileformat/verify.rb --check-image`
+  produce **byte-identical transcripts and crash images**. The simulated filesystem covers `create`,
+  compaction's rename and directory barrier, and file attachments; spill and temp-table spill go
+  through a simulated spill host whose I/O can fail; and simulated processes share one file under the
+  real locking protocol through a lock-host seam. Oracles, per database: recovery lands between the
+  durability floor and the newest attempted commit and matches a recorded generation; a reader sees
+  its pinned version; no `XX001`; image and live integrity checks; with no reader pinned the file
+  stops growing (the reader-aware bounded-growth check); a bit flipped at rest is `XX001` or harmless,
+  never wrong rows or a panic (the `corrupt` step); and `spec/fileformat/verify.rb --check-image`
   re-decides every recovery independently. `mise run ci` runs the regression traces and a fixed sweep;
   `mise run sim:sweep` explores further and `sim:shrink` minimizes a failure. When a storage feature
   lands (a page type, commit path, host operation, or setting), grow the generator and checkers with it.

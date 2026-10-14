@@ -5,13 +5,9 @@
 //! pages, published by alternating the meta slot (spec/fileformat/format.md, P6.1 part B) — the
 //! block seam below pwrites pages into the open file rather than rewriting it.
 
-use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-
 use std::sync::Arc;
 
-use crate::blockstore::FileBlockStore;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Engine, Snapshot};
 use crate::extension::ExtensionRegistry;
@@ -158,19 +154,20 @@ impl Default for OpenOptions {
     }
 }
 
-/// The native file host spills blocking operators into the OS scratch directory. Rust's
+/// The native file host spills blocking operators into the OS scratch directory (the OS spill host,
+/// [`crate::spillhost`]). Rust's
 /// `wasm32-wasip1` standard library deliberately has no `temp_dir` implementation (it panics even
 /// when the WASI host exposes preopened database paths), so that host has no spill backing until a
 /// caller-selectable spill target lands. A missing spill target keeps sorts resident; it does not
 /// affect ordinary file paging through a WASI preopen.
-fn default_spill_dir() -> Option<PathBuf> {
+fn default_spill_host() -> Option<Arc<dyn crate::spillhost::SpillHost>> {
     #[cfg(target_os = "wasi")]
     {
         None
     }
     #[cfg(not(target_os = "wasi"))]
     {
-        Some(std::env::temp_dir())
+        Some(crate::spillhost::os_spill_host(std::env::temp_dir()))
     }
 }
 
@@ -179,8 +176,17 @@ impl Engine {
     /// the file). The path must not already exist — `58P02` otherwise. An initial empty image is
     /// written durably immediately, so the file exists with its page size fixed (api.md §2).
     pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Engine> {
-        let path = path.as_ref();
-        if path.exists() {
+        Engine::create_via(&crate::filehost::OsFileHost, path.as_ref(), opts)
+    }
+
+    /// [`create`](Engine::create) through the file host `files` ([`crate::filehost`]): the existence
+    /// check, the temp file, its rename, the directory barrier, and the open all go through it.
+    pub(crate) fn create_via(
+        files: &dyn FileHost,
+        path: &Path,
+        opts: DatabaseOptions,
+    ) -> Result<Engine> {
+        if files.exists(path)? {
             return Err(EngineError::new(
                 SqlState::DuplicateFile,
                 format!("database file already exists: {}", path.display()),
@@ -188,21 +194,17 @@ impl Engine {
         }
         let mut db = Engine::new();
         db.path = Some(path.to_path_buf());
-        db.spill_dir = default_spill_dir();
+        db.spill = default_spill_host();
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
-        db.write_full_image(opts.no_sync)?; // lay down the from-scratch image; later commits are incremental
+        db.write_full_image(files, opts.no_sync)?; // lay down the from-scratch image; later commits are incremental
         // Adopt the just-written file as the open pager + buffer pool, so later commits write through
         // the seam without re-opening (spec/design/pager.md). Tables built in this session bind this
         // pager at creation (`Snapshot::store_paging`), so their committed leaves demote at each
         // commit and fault back through the pool — same residency shape as after a reopen.
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(io_error)?;
+        let store = files.open_store(path, opts.no_sync, false)?;
         let paging = SharedPaging::new(
-            Pager::from_store(Box::new(FileBlockStore::new(file, opts.no_sync)))?,
+            Pager::from_store(store)?,
             cache_leaves(DEFAULT_CACHE_BYTES, db.page_size),
         );
         db.committed.set_store_paging(paging.clone());
@@ -228,31 +230,21 @@ impl Engine {
     /// the file's page size (`cache_leaves`). The budget is a **handle** setting, not stored in the file
     /// (§3). Later commits write through the same pager kept open for the handle's life.
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Engine> {
-        let path = path.as_ref();
-        // A read-only open never writes the file, so it is not opened for writing at all —
-        // the OS enforces what the executor's 25006 guards promise (api.md §2.1).
-        let file = match fs::OpenOptions::new()
-            .read(true)
-            .write(!opts.read_only)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(EngineError::new(
-                    SqlState::UndefinedFile,
-                    format!("database file does not exist: {}", path.display()),
-                ));
-            }
-            Err(e) => return Err(io_error(e)),
-        };
-        let pager = Pager::from_store(Box::new(FileBlockStore::new(file, opts.skip_fsync)))?;
+        Engine::open_via(&crate::filehost::OsFileHost, path.as_ref(), opts)
+    }
+
+    /// [`open_with_options`](Engine::open_with_options) through the file host `files`
+    /// ([`crate::filehost`]).
+    pub(crate) fn open_via(files: &dyn FileHost, path: &Path, opts: OpenOptions) -> Result<Engine> {
+        let store = files.open_store(path, opts.skip_fsync, opts.read_only)?;
+        let pager = Pager::from_store(store)?;
         // Convert the byte budget to a leaf-page capacity by the file's page size; `open_paged`
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
         let mut db = Engine::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
-        db.spill_dir = default_spill_dir();
+        db.spill = default_spill_host();
         db.read_only = opts.read_only;
         // `0` means "the default budget", not "unlimited" — the zero value is a safe finite budget
         // (matching Go/TS). Unbounded/never-spill is a runtime-only mode via `set_work_mem(0)`.
@@ -273,12 +265,12 @@ impl Engine {
     /// spec/fileformat/format.md) durably via temp-file + rename, and record the on-disk page
     /// high-water. Used by `create` to establish a fresh file with both meta slots seeded; every later
     /// commit is incremental (`persist`).
-    fn write_full_image(&mut self, no_sync: bool) -> Result<()> {
+    fn write_full_image(&mut self, files: &dyn FileHost, no_sync: bool) -> Result<()> {
         let path = self.path.clone().expect("write_full_image requires a path");
         let bytes = self
             .committed
             .to_image(self.page_size, self.committed.txid)?;
-        write_atomic(&path, &bytes, no_sync)?;
+        write_atomic(files, &path, &bytes, no_sync)?;
         self.page_count = (bytes.len() / self.page_size as usize) as u32;
         // `create` writes an empty database: every body page is live, and every one is a catalog page.
         debug_assert_eq!(self.committed.stores_iter().count(), 0);
@@ -449,29 +441,21 @@ impl Engine {
 /// atomic rename over the target, then a best-effort directory fsync so the rename is durable. Under
 /// `no_sync` (fsync=off) the two fsyncs are skipped — the write + rename still happen, but the bytes
 /// are only in the OS page cache (dev/testing; no durability on an OS crash).
-fn write_atomic(path: &Path, bytes: &[u8], no_sync: bool) -> Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+fn write_atomic(files: &dyn FileHost, path: &Path, bytes: &[u8], no_sync: bool) -> Result<()> {
     let tmp = tmp_path(path);
-    {
-        let mut f = File::create(&tmp).map_err(io_error)?;
-        f.write_all(bytes).map_err(io_error)?;
-        if !no_sync {
-            f.sync_all().map_err(io_error)?;
-        }
+    if let Err(e) = files.write_file(&tmp, None, no_sync, &mut |write_at| write_at(0, bytes)) {
+        files.remove(&tmp);
+        return Err(e);
     }
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(io_error(e));
+    if let Err(e) = files.rename(&tmp, path) {
+        files.remove(&tmp);
+        return Err(e);
     }
     // Directory fsync makes the rename itself durable. Best-effort: not every platform allows
     // opening a directory for fsync (Windows), and the rename is already atomic there. Skipped under
     // no_sync (fsync=off).
     if !no_sync {
-        if let Some(dir) = dir {
-            if let Ok(d) = File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
+        files.sync_dir(path.parent().unwrap_or(Path::new("")));
     }
     Ok(())
 }
@@ -502,7 +486,7 @@ pub(crate) fn compact_file(
     // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
     let path = files.real_path(path)?;
     let tmp = tmp_path(&path);
-    if let Err(error) = files.write_file(&tmp, &path, no_sync, &mut |write_at| {
+    if let Err(error) = files.write_file(&tmp, Some(&path), no_sync, &mut |write_at| {
         snap.write_image(page_size, txid, &mut |index, page| {
             write_at(index as u64 * page_size as u64, page)
         })
@@ -516,7 +500,7 @@ pub(crate) fn compact_file(
     drop(old.pager().swap_store(Box::new(ClosedBlockStore)));
     if let Err(error) = files.rename(&tmp, &path) {
         files.remove(&tmp);
-        match files.open_store(&path, no_sync) {
+        match files.open_store(&path, no_sync, false) {
             Ok(store) => drop(old.pager().swap_store(store)),
             Err(_) => old.pager().poison(),
         }
@@ -528,7 +512,7 @@ pub(crate) fn compact_file(
             files.sync_dir(dir);
         }
     }
-    let pager = Pager::from_store(files.open_store(&path, no_sync)?)?;
+    let pager = Pager::from_store(files.open_store(&path, no_sync, false)?)?;
     Ok(SharedPaging::new(pager, capacity))
 }
 
@@ -538,10 +522,6 @@ fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".jedtmp");
     PathBuf::from(s)
-}
-
-fn io_error(e: std::io::Error) -> EngineError {
-    EngineError::new(SqlState::IoError, format!("I/O error: {e}"))
 }
 
 #[cfg(test)]

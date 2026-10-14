@@ -17,7 +17,6 @@ import {
   renameSync,
   statSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -82,7 +81,13 @@ export type CreateOptions = {
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
 // durably immediately, so the file exists with its page size fixed (api.md §2).
 export function create(path: string, opts: DatabaseOptions = {}): Engine {
-  if (existsSync(path)) {
+  return createVia(osFiles, path, opts);
+}
+
+// createVia is create through the file host files (filehost.ts): the existence check, the temp file,
+// its rename, the directory barrier, and the open all go through it.
+export function createVia(files: FileHost, path: string, opts: DatabaseOptions = {}): Engine {
+  if (files.exists(path)) {
     throw engineError("duplicate_file", "database file already exists: " + path);
   }
   const db = new Engine();
@@ -91,21 +96,20 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
   const noSync = opts.noSync ?? false;
-  writeFullImage(db, noSync); // lay down the from-scratch image; later commits are incremental
+  writeFullImage(files, db, noSync); // lay down the from-scratch image; later commits are incremental
   // Adopt the just-written file as the open pager + buffer pool, so later commits write through the
   // seam without re-opening (spec/design/pager.md). Tables built in this session bind this pager at
   // creation (Snapshot.storePaging), so their committed leaves demote at each commit and fault back
   // through the pool — same residency shape as after a reopen.
-  let fd: number;
+  const store = files.openStore(path, noSync, false);
+  let pager: Pager;
   try {
-    fd = openSync(path, "r+");
+    pager = Pager.fromStore(store); // valid header
   } catch (e) {
-    throw ioError(e);
+    store.close();
+    throw e;
   }
-  db.paging = new SharedPaging(
-    Pager.fromStore(new FileBlockStore(fd, noSync)),
-    cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
-  ); // valid header
+  db.paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize));
   db.committed.storePaging = db.paging;
   // Scratch is independent of the persistence path: a read-only database directory must still be
   // able to serve a bounded ORDER BY (spill.md §4, api.md §2.1).
@@ -117,10 +121,10 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persistImpl).
-function writeFullImage(db: Engine, noSync: boolean): void {
+function writeFullImage(files: FileHost, db: Engine, noSync: boolean): void {
   if (db.path === null) return;
   const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
-  writeAtomic(db.path, bytes, noSync);
+  writeAtomic(files, db.path, bytes, noSync);
   db.pageCount = Math.floor(bytes.length / db.pageSize);
   // The image is of an empty database: every body page is live, and every one is a catalog page
   // (spec/design/memory.md §8.7).
@@ -177,24 +181,19 @@ export type OpenOptions = {
 // The budget is a handle setting, not stored in the file (§3). Later commits write through the same
 // pager kept open for the handle's life.
 export function open(path: string, opts: OpenOptions = {}): Engine {
-  if (!existsSync(path)) {
-    throw engineError("undefined_file", "database file does not exist: " + path);
-  }
+  return openVia(osFiles, path, opts);
+}
+
+// openVia is open through the file host files (filehost.ts).
+export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): Engine {
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   const readOnly = opts.readOnly ?? false;
-  let fd: number;
-  try {
-    // A read-only open never writes the file, so it is not opened for writing at all — the OS
-    // enforces what the executor's 25006 guards promise (api.md §2.1).
-    fd = openSync(path, readOnly ? "r" : "r+");
-  } catch (e) {
-    throw ioError(e);
-  }
+  const store = files.openStore(path, opts.skipFsync ?? false, readOnly);
   try {
     // Read the file's page size first, then convert the byte budget to a leaf-page capacity; the loader
     // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
     // page_size = 0 cannot divide by zero before that check runs).
-    const pager = Pager.fromStore(new FileBlockStore(fd, opts.skipFsync ?? false));
+    const pager = Pager.fromStore(store);
     const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
@@ -208,7 +207,7 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     if (opts.workMem) db.session.workMem = opts.workMem;
     return db;
   } catch (e) {
-    closeSync(fd); // a malformed file / read failure must not leak the fd
+    store.close(); // a malformed file / read failure must not leak the fd
     if (e instanceof Error && e.name === "EngineError") throw e;
     throw ioError(e);
   }
@@ -217,14 +216,16 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
 // Register the Node file host as the file-attach opener (attached-databases.md §4, Slice 2): importing
 // file.ts (the node host) enables `db.attach(name, attachFile(path))` without shared.ts importing a host
 // module (it stays browser-clean). The OPFS host registers its own. Read-only opens the file O_RDONLY.
-registerFileAttachOpener((source, readOnly) => {
+// The file opens through main's file host (null is the OS), so the simulated filesystem serves
+// attachments too.
+registerFileAttachOpener((source, readOnly, files) => {
   const path = source.path!;
   const coordinator = FileCoordinator.open(path, source.locking, source.fileLockTimeoutMs);
   try {
     coordinator?.lockCommitShared();
     let engine: Engine;
     try {
-      engine = open(coordinator?.path ?? path, { readOnly, locking: "none" });
+      engine = openVia(files ?? osFiles, coordinator?.path ?? path, { readOnly, locking: "none" });
     } finally {
       coordinator?.unlockCommit();
     }
@@ -281,7 +282,7 @@ export function compactFile(
   } catch (e) {
     files.remove(tmp);
     try {
-      old.swapStore(files.openStore(real, noSync));
+      old.swapStore(files.openStore(real, noSync, false));
     } catch {
       old.poison();
     }
@@ -289,7 +290,7 @@ export function compactFile(
   }
   old.poison();
   if (!noSync) files.syncDir(dirname(real));
-  const store = files.openStore(real, noSync);
+  const store = files.openStore(real, noSync, false);
   try {
     return new SharedPaging(Pager.fromStore(store), capacity);
   } catch (e) {
@@ -298,13 +299,23 @@ export function compactFile(
   }
 }
 
-// osFiles is the Node file host (filehost.ts): compaction's temp file, rename, directory barrier, and
-// reopen on the real filesystem. Every OS error surfaces as io_error.
+// osFiles is the Node file host (filehost.ts): create's and compaction's temp file, rename, directory
+// barrier, and open on the real filesystem. A missing file is 58P01; every other OS error surfaces as
+// io_error.
 export const osFiles: FileHost = {
   realPath(path: string): string {
     try {
       return realpathSync(path);
     } catch (e) {
+      throw ioError(e);
+    }
+  },
+  exists(path: string): boolean {
+    try {
+      statSync(path);
+      return true;
+    } catch (e) {
+      if (errnoCode(e) === "ENOENT") return false;
       throw ioError(e);
     }
   },
@@ -325,7 +336,7 @@ export const osFiles: FileHost = {
             done += count;
           }
         });
-        chmodSync(path, statSync(modeFrom).mode & 0o7777);
+        if (modeFrom !== "") chmodSync(path, statSync(modeFrom).mode & 0o7777);
         if (!noSync) fsyncSync(fd);
       } finally {
         closeSync(fd);
@@ -358,11 +369,16 @@ export const osFiles: FileHost = {
       // directory fsync unsupported on this platform — acceptable (api.md §3)
     }
   },
-  openStore(path: string, noSync: boolean): BlockStore {
+  openStore(path: string, noSync: boolean, readOnly: boolean): BlockStore {
     let fd: number;
     try {
-      fd = openSync(path, "r+");
+      // A read-only open never writes the file, so it is not opened for writing at all — the OS
+      // enforces what the executor's 25006 guards promise (api.md §2.1).
+      fd = openSync(path, readOnly ? "r" : "r+");
     } catch (e) {
+      if (errnoCode(e) === "ENOENT") {
+        throw engineError("undefined_file", "database file does not exist: " + path);
+      }
       throw ioError(e);
     }
     return new FileBlockStore(fd, noSync);
@@ -471,42 +487,34 @@ export function close(db: Engine): void {
   }
 }
 
-// writeAtomic writes bytes to path crash-safely (spec/design/api.md §3): a sibling temp file,
-// fsync, atomic rename over the target, then a best-effort directory fsync so the rename is
-// durable. Under noSync (fsync=off) the two fsyncs are skipped — the write + rename still happen,
-// but the bytes are only in the OS page cache (dev/testing; no durability on an OS crash).
-function writeAtomic(path: string, bytes: Uint8Array, noSync: boolean): void {
+// writeAtomic writes bytes to path crash-safely through the file host files (spec/design/api.md §3):
+// a sibling temp file, fsync, atomic rename over the target, then a best-effort directory fsync so the
+// rename is durable. Under noSync (fsync=off) the two fsyncs are skipped — the write + rename still
+// happen, but the bytes are only in the OS page cache (dev/testing; no durability on an OS crash).
+function writeAtomic(files: FileHost, path: string, bytes: Uint8Array, noSync: boolean): void {
   const tmp = path + ".jedtmp";
   try {
-    const fd = openSync(tmp, "w");
-    try {
-      writeFileSync(fd, bytes);
-      if (!noSync) fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(tmp, path);
+    files.writeFile(tmp, "", noSync, (writeAt) => writeAt(0, bytes));
   } catch (e) {
-    try {
-      if (existsSync(tmp)) unlinkSync(tmp);
-    } catch {
-      // best-effort cleanup
-    }
-    throw ioError(e);
+    files.remove(tmp);
+    throw e;
   }
-  if (noSync) return; // fsync=off: skip the directory-fsync barrier too (dev/testing).
-  // Directory fsync makes the rename itself durable. Best-effort: not every platform allows
-  // opening a directory for fsync (Windows), and the rename is already atomic there.
   try {
-    const dfd = openSync(dirname(path), "r");
-    try {
-      fsyncSync(dfd);
-    } finally {
-      closeSync(dfd);
-    }
-  } catch {
-    // directory fsync unsupported on this platform — acceptable (api.md §3)
+    files.rename(tmp, path);
+  } catch (e) {
+    files.remove(tmp);
+    throw e;
   }
+  // Directory fsync makes the rename itself durable. Best-effort: not every platform allows opening a
+  // directory for fsync (Windows), and the rename is already atomic there. Skipped under noSync.
+  if (!noSync) files.syncDir(dirname(path));
+}
+
+// errnoCode is a Node fs error's code ("ENOENT", ...), or undefined.
+function errnoCode(e: unknown): string | undefined {
+  return typeof e === "object" && e !== null && "code" in e && typeof e.code === "string"
+    ? e.code
+    : undefined;
 }
 
 function ioError(e: unknown): Error {

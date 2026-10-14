@@ -63,7 +63,7 @@ func (db *engine) snapshotEngine() *engine {
 		pageSize:  db.pageSize,
 		paging:    db.paging,
 		path:      db.path,
-		spillDir:  db.spillDir,
+		spill:     db.spill,
 		readOnly:  db.readOnly,
 		// The frozen read engine carries the same pinned attachment view so a streaming read of an
 		// attached database (attached-databases.md §5) resolves through it; it never commits (read-only),
@@ -2165,7 +2165,7 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 // the database path, so read-only filesystems remain readable; in-memory hosts leave it empty and
 // never spill (spill.md §2/§4).
 func (db *engine) newSorterFor(order []orderSlot) *sorter {
-	return newSorter(order, db.session.workMem, db.spillDir, newStateCharge(db.session.queryAccount()))
+	return newSorter(order, db.session.workMem, db.spill, newStateCharge(db.session.queryAccount()))
 }
 
 // rowsFromValues reinterprets a result-row slice ([][]Value) as a join-feed buffer ([]Row). Row is

@@ -4,21 +4,21 @@
 // §8, and writes a transcript the driver (scripts/sim.rb) compares across cores byte for byte.
 
 import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { parseCommitMeta } from "../commit_manifest.ts";
+import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
 import { EngineError, engineError } from "../errors.ts";
-import { Snapshot } from "../executor.ts";
-// The Node file host registers the file compactor and the directory barrier the engine reaches
-// through Engine.fileHost (here the simulated filesystem).
-import "../file.ts";
-import { loadEnginePaged, toImage } from "../format.ts";
+import type { Engine } from "../executor.ts";
+// The Node file host registers the file compactor, the attach opener, and the directory barrier the
+// engine reaches through Engine.fileHost (here the simulated filesystem).
+import { close as closeEngine, createVia } from "../file.ts";
+import { loadEnginePaged } from "../format.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import { persistImpl } from "../persist.ts";
 import { seededRandomSource } from "../seam.ts";
-import { Database, type Session } from "../shared.ts";
-import { FileSpillSink } from "../spillfile.ts";
+import { attachFile, Database, type Session } from "../shared.ts";
 import { FileCoordinator } from "../coordinator.ts";
 import { CheckError, checkImage, checkLive as checkLiveDatabase } from "./check.ts";
 import { SimDeadlock, SimLockHost, SimLockTable } from "./locks.ts";
@@ -111,11 +111,7 @@ export function parseTrace(text: string): SimTrace {
       case "crash":
         if (f.length < 2) throw new Error(`line ${n + 1}: ${st.kind} <kind> [k=v ...]`);
         st.mode = f[1]!;
-        for (const kv of f.slice(2)) {
-          const eq = kv.indexOf("=");
-          if (eq < 0) throw new Error(`line ${n + 1}: bad parameter ${JSON.stringify(kv)}`);
-          st.params.set(kv.slice(0, eq), kv.slice(eq + 1));
-        }
+        parseParams(st, f.slice(2), n + 1);
         break;
       case "clock":
         if (f.length !== 2 || !f[1]!.startsWith("+")) {
@@ -123,9 +119,21 @@ export function parseTrace(text: string): SimTrace {
         }
         st.params.set("delta", f[1]!.slice(1));
         break;
+      case "attach":
+        if (f.length !== 2 || f[1] === "main" || f[1] === "temp") {
+          throw new Error(`line ${n + 1}: attach <name>`);
+        }
+        st.sid = f[1]!;
+        break;
+      case "compact":
+        if (f.length > 2) throw new Error(`line ${n + 1}: compact [<database>]`);
+        st.sid = f.length === 2 ? f[1]! : "main";
+        break;
+      case "corrupt":
+        parseParams(st, f.slice(1), n + 1);
+        break;
       case "check":
       case "reopen":
-      case "compact":
       case "tick":
         break;
       default:
@@ -137,6 +145,14 @@ export function parseTrace(text: string): SimTrace {
     throw new Error("missing `# format: simulation` header");
   }
   return tr;
+}
+
+function parseParams(st: SimStep, kvs: string[], line: number): void {
+  for (const kv of kvs) {
+    const eq = kv.indexOf("=");
+    if (eq < 0) throw new Error(`line ${line}: bad parameter ${JSON.stringify(kv)}`);
+    st.params.set(kv.slice(0, eq), kv.slice(eq + 1));
+  }
 }
 
 // parsePid parses a process name, p<N>.
@@ -179,6 +195,8 @@ function faultOf(st: SimStep): SimFault {
       return { ...f, kind: "read_error", p: intParam(st, "p") };
     case "enospc":
       return { ...f, kind: "enospc" };
+    case "spill_error":
+      return { ...f, kind: "spill_error", p: intParam(st, "p") };
   }
   const params = [...st.params].map(([k, v]) => `${k}:${v}`).join(" ");
   throw new CheckError(`line ${st.line}: unsupported fault ${st.mode} map[${params}]`);
@@ -282,7 +300,7 @@ function errText(e: unknown): string {
 type SimSession = {
   s: Session;
   write: boolean;
-  pin: bigint; // the version a read session pinned (§8.1: what it must keep seeing)
+  pins: Map<string, bigint>; // the version of each database a read session pinned (§8.1: what it must keep seeing)
   pid: number; // the process the session lives in
 };
 
@@ -290,10 +308,65 @@ type SimSession = {
 // trace its own lock host (S5).
 type SimProc = { pid: number; db: Database; host: SimLockHost | null };
 
+// SimGrowth is what a commit left behind, for the next commit's bounded-growth check.
+type SimGrowth = {
+  reclaimed: boolean; // a quiet commit that must have reclaimed: its free list holds every dead page
+  high: number; // its page high-water
+  free: number; // its free-list length
+};
+
+// SimDB is one database's oracle state (simulation-testing.md §8.1–8.3): main, or a file attachment
+// (S4), each with its own versions, history, and durability floor.
+class SimDB {
+  readonly name: string;
+  readonly file: string; // its file in the simulated filesystem
+  history = new Map<bigint, Set<string>>(); // version → digests of every generation attempted at it
+  version = 0n; // the published version
+  lastDigest = ""; // its digest
+  floor = 0n; // recovery may never return an older version; 0: the file may vanish
+  maxAttempted = 0n; // ... nor a newer one than was ever attempted
+
+  // Bounded growth (§8.3), tracked over one process lifetime: an upper bound on the live count the
+  // engine's reclamation trigger compares against, and what the previous commit left.
+  high = 0; // the page high-water now
+  lacBound = 0; // ≥ the engine's live-at-last-reclamation
+  last: SimGrowth = { reclaimed: false, high: 0, free: 0 }; // the previous commit in this lifetime
+
+  constructor(name: string, file: string) {
+    this.name = name;
+    this.file = file;
+  }
+
+  addHistory(v: bigint, digest: string): void {
+    let set = this.history.get(v);
+    if (set === undefined) {
+      set = new Set();
+      this.history.set(v, set);
+    }
+    set.add(digest);
+  }
+
+  inHistory(v: bigint, digest: string): boolean {
+    return this.history.get(v)?.has(digest) ?? false;
+  }
+}
+
+// The internals of a Database the runner reads: the published roots and each domain's storage owner.
+type CoreView = {
+  committed: { txid: bigint };
+  attached: Map<string, { txid: bigint }>;
+  storage: Engine;
+  attachments: Map<string, { storage: Engine }>;
+};
+
+function coreOf(db: Database): CoreView {
+  return (db as unknown as { core: CoreView }).core;
+}
+
 // versionOf is the version db has published, without refreshing from another process (Go's
 // Database.Version; the TS getter also adopts a newer shared generation).
 function versionOf(db: Database): bigint {
-  return (db as unknown as { core: { committed: { txid: bigint } } }).core.committed.txid;
+  return coreOf(db).committed.txid;
 }
 
 const DIGEST_RELATIONS = [
@@ -304,6 +377,42 @@ const DIGEST_RELATIONS = [
   "jed_sequences",
 ];
 
+// qualifier is the prefix that names database d's relations: none for main, `name.` for an
+// attachment.
+function qualifier(d: SimDB): string {
+  return d.name === "main" ? "" : d.name + ".";
+}
+
+// emptyDigest is the digest of a freshly created database (an attachment's version 1): every catalog
+// relation empty and no table.
+function emptyDigest(d: SimDB): string {
+  let b = "";
+  for (const rel of DIGEST_RELATIONS) b += "SELECT * FROM " + qualifier(d) + rel + "\n\n\n";
+  return fnvStringHex(b);
+}
+
+// dbsJSON renders the attachments' check/recovery state as `,"dbs":{"a1":{...},...}`, or "" with
+// none.
+function dbsJSON(entries: string[]): string {
+  return entries.length === 0 ? "" : `,"dbs":{` + entries.join(",") + "}";
+}
+
+// metaOf reads the page high-water and live page count of the meta slot holding version v.
+function metaOf(
+  image: Uint8Array | null,
+  ps: number,
+  v: bigint,
+): { pageCount: number; live: number } | null {
+  if (image === null) return null;
+  for (let slot = 0; slot < 2; slot++) {
+    const off = slot * ps;
+    if (off + ps > image.length) continue;
+    const m = parseCommitMeta(image.subarray(off, off + ps), ps, 0xffff_ffff);
+    if (m !== null && m.txid === v) return { pageCount: m.pageCount, live: m.livePages };
+  }
+  return null;
+}
+
 export class SimRunner {
   private tr: SimTrace;
   private seed: bigint;
@@ -312,10 +421,10 @@ export class SimRunner {
   private clock: bigint;
 
   // Handle settings from the header (simulation-testing.md §5, slice S3), applied at every open.
-  private workMem: number; // a session's work_mem; > 0 also gives the database a spill directory
+  private workMem: number; // a session's work_mem
+  private tempBuffers: number; // a session's temp_buffers: past it, a temp domain spills (temp-tables.md §6)
   private maxQueryMemory: bigint; // a trace session's max_query_memory_bytes (oracle reads: unlimited)
   private maxStorageBytes: bigint; // the database's max_storage_bytes
-  private spillDir: string; // the real scratch directory spill files go to; not durable state
 
   fs: SimFS;
   private db: Database | null = null; // the database of the process running the current step
@@ -331,12 +440,9 @@ export class SimRunner {
 
   transcript: string[] = [];
 
-  // Oracle state (simulation-testing.md §8.1–8.2).
-  private history = new Map<bigint, Set<string>>(); // version → digests of every attempted generation
-  private version = 0n; // the published version
-  private lastDigest = ""; // its digest
-  private floor = 0n; // recovery may never return an older version
-  private maxAttempted = 0n; // ... nor a newer one than was ever attempted
+  // Oracle state (simulation-testing.md §8.1–8.3), one per database: main first, then each file
+  // attachment (S4) in name order.
+  private dbs = new Map<string, SimDB>();
 
   violation = "";
   violationStep = -1;
@@ -344,8 +450,9 @@ export class SimRunner {
   stack = ""; // the stack of an unexpected throw (Go: a panic)
 
   private lastDigestText = ""; // the text the most recent digest folded
+  private digestErr: unknown = null; // why the most recent digest failed
   diagnostics = new Map<string, string>(); // artifact name → contents, written on a violation
-  imagePrefix = ""; // when set, each recovery's image is written to <prefix>.step<N>.img
+  imagePrefix = ""; // when set, each recovery's image is written to <prefix>.step<N>[.<db>].img
 
   constructor(tr: SimTrace) {
     this.tr = tr;
@@ -356,19 +463,19 @@ export class SimRunner {
     this.cacheBytes = atoi(tr.header.get("cache_bytes"));
     this.clock = parseInt64(tr.header.get("clock"));
     this.workMem = atoi(tr.header.get("work_mem"));
+    this.tempBuffers = atoi(tr.header.get("temp_buffers"));
     this.maxQueryMemory = parseInt64(tr.header.get("max_query_memory_bytes"));
     this.maxStorageBytes = parseInt64(tr.header.get("max_storage_bytes"));
-    this.spillDir = this.workMem > 0 ? tmpdir() : "";
     let sector = atoi(tr.header.get("sector"));
     if (sector <= 0) sector = SECTOR_DEFAULT;
-    const image = toImage(new Snapshot(1n), ps, 1n);
-    this.fs = new SimFS(this.seed, sector, image);
+    this.fs = new SimFS(this.seed, sector, ps);
     this.shared = tr.header.get("processes") === "shared";
   }
 
   private fail(step: number, msg: string): void {
     if (this.violation === "") {
-      this.violation = `step ${step} (line ${this.tr.steps[step]!.line}): ` + msg;
+      const where = step >= 0 ? `step ${step} (line ${this.tr.steps[step]!.line}): ` : "setup: ";
+      this.violation = where + msg;
       this.violationStep = step;
     }
   }
@@ -381,10 +488,41 @@ export class SimRunner {
     return this.db!;
   }
 
-  // open opens a Database over the simulated disk through the ordinary demand-paged loader — the
-  // path a reopening process takes, including validated-COW recovery (validated-cow.md §1).
+  // main is the main database's oracle state.
+  private main(): SimDB {
+    return this.dbs.get("main")!;
+  }
+
+  // attachedNames lists the attachments the runner tracks, in name order.
+  private attachedNames(): string[] {
+    return [...this.dbs.keys()].filter((n) => n !== "main").sort(compareUtf8);
+  }
+
+  // order lists every tracked database: main, then the attachments in name order.
+  private order(): SimDB[] {
+    return [this.main(), ...this.attachedNames().map((n) => this.dbs.get(n)!)];
+  }
+
+  // open opens a Database over the simulated disk through the ordinary demand-paged loader — the path
+  // a reopening process takes, including validated-COW recovery (validated-cow.md §1) — and
+  // re-attaches every tracked attachment whose file exists.
   private open(): void {
     this.openProc(0);
+    for (const name of this.attachedNames()) {
+      const d = this.dbs.get(name)!;
+      if (!this.fs.files.has(d.file)) continue; // the caller decides whether losing it was allowed
+      try {
+        this.attach(name);
+      } catch (e) {
+        if (e instanceof EngineError) e.message = `re-attach ${name}: ${e.message}`;
+        throw e;
+      }
+    }
+  }
+
+  // attach attaches the existing file of attachment name read-write to the current process.
+  private attach(name: string): void {
+    this.database.attach(name, attachFile(this.dbs.get(name)!.file, { locking: "none" }), false);
   }
 
   // openProc starts process pid. A shared trace acquires the file coordinator through the simulated
@@ -450,9 +588,11 @@ export class SimRunner {
     const cache = this.cacheBytes > 0 ? this.cacheBytes : DEFAULT_CACHE_BYTES;
     const e = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cache, pager.pageSize)));
     e.path = MAIN_FILE; // marks the engine durable; the simulated filesystem is its only storage
-    e.fileHost = this.fs; // compaction's temp file, rename, and directory barrier
+    // Create, compaction, and attachments go through the simulated filesystem.
+    e.fileHost = this.fs;
     e.persistHook = persistImpl;
-    e.spillSink = this.spillDir !== "" ? new FileSpillSink(this.spillDir) : null;
+    // Spill and temp-table spill scratch files, whose operations can fail.
+    e.spillSink = this.fs.spillSink();
     coord?.unlockCommit();
     const db = Database.fromEngine(e, coord, null);
     if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
@@ -460,43 +600,41 @@ export class SimRunner {
   }
 
   run(): void {
+    // Create the database through the simulated filesystem, as the host's create does: a temp file,
+    // its sync, the rename, and the directory barrier (S4).
+    try {
+      closeEngine(createVia(this.fs, MAIN_FILE, { pageSize: this.pageSize }));
+    } catch (e) {
+      this.violation = "create: " + errText(e);
+      return;
+    }
+    const m = new SimDB("main", MAIN_FILE);
+    this.dbs.set("main", m);
     try {
       this.open();
     } catch (e) {
       this.violation = "initial open: " + errText(e);
       return;
     }
-    this.version = versionOf(this.database);
-    this.floor = this.version;
-    this.maxAttempted = this.version;
-    const d = this.committedDigest();
+    m.version = versionOf(this.database);
+    m.floor = m.version;
+    m.maxAttempted = m.version;
+    const d = this.committedDigest(m);
     if (d === null) {
       this.violation = "initial digest failed";
       return;
     }
-    this.lastDigest = d;
-    this.addHistory(this.version, d);
+    m.lastDigest = d;
+    m.addHistory(m.version, d);
+    this.observeGrowth(m);
     for (let i = 0; i < this.tr.steps.length; i++) {
       if (!this.step(i) || this.violation !== "") return;
     }
   }
 
-  // mainImage copies the database file's cache — what a new process would open — or null if gone.
-  private mainImage(): Uint8Array | null {
-    return this.fs.main()?.cache.slice() ?? null;
-  }
-
-  private addHistory(v: bigint, d: string): void {
-    let set = this.history.get(v);
-    if (set === undefined) {
-      set = new Set();
-      this.history.set(v, set);
-    }
-    set.add(d);
-  }
-
-  private inHistory(v: bigint, d: string): boolean {
-    return this.history.get(v)?.has(d) ?? false;
+  // image copies a database file's cache — what a new process would open — or null if it is gone.
+  private image(d: SimDB): Uint8Array | null {
+    return this.fs.files.get(d.file)?.cache.slice() ?? null;
   }
 
   // step runs one trace step; false stops the run. An unexpected throw anywhere is a violation.
@@ -566,6 +704,9 @@ export class SimRunner {
         }
         this.emit(`{"i":${i},"op":"kill","pid":${st.pid}}`);
         return true;
+      case "corrupt":
+        this.fs.beginStep(i, null);
+        return this.stepCorrupt(i, st);
     }
 
     // A step that needs a process when none is running (the last one exited) restarts p0 first.
@@ -579,7 +720,8 @@ export class SimRunner {
     }
     const armed = this.armed;
     this.armed = null;
-    const startVersion = this.version;
+    const start = new Map<string, bigint>();
+    for (const [name, d] of this.dbs) start.set(name, d.version);
     const pid = this.stepPid(st);
     if (pid !== null && st.kind !== "spawn" && !this.selectProc(pid)) {
       if (st.kind === "open") {
@@ -613,16 +755,23 @@ export class SimRunner {
         this.stepCheck(i);
         break;
       case "compact":
-        this.stepCompact(i);
+        this.stepCompact(i, st.sid);
+        break;
+      case "attach":
+        this.stepAttach(i, st.sid);
         break;
       case "reopen":
         if (!this.stepReopen(i)) return false;
         break;
     }
     if (this.violation !== "") return false;
-    // A completed barrier made every earlier write durable: the generation published when the step
-    // began can no longer be lost (§8.2).
-    if (this.fs.barrierOK && startVersion > this.floor) this.floor = startVersion;
+    // A completed barrier made every earlier write durable: the generation a database published when
+    // the step began can no longer be lost (§8.2).
+    for (const [name, d] of this.dbs) {
+      const f = this.fs.files.get(d.file);
+      const s0 = start.get(name);
+      if (f?.barrierOK && s0 !== undefined && s0 > d.floor) d.floor = s0;
+    }
     if (armed === null) return true;
     // Every faulted step ends the process; a power loss also discards the unsynced writes (§5).
     const fired = this.fs.fired === "" ? "end" : this.fs.fired;
@@ -640,6 +789,25 @@ export class SimRunner {
       return true;
     }
     return this.recover(i, fired);
+  }
+
+  // dbVersion is the version of database d the current process has published.
+  private dbVersion(d: SimDB): bigint {
+    if (d.name === "main") return versionOf(this.database);
+    return coreOf(this.database).attached.get(d.name)?.txid ?? 0n;
+  }
+
+  // versionsJSON renders the attachments' versions as `,"dbs":{"a1":V,...}`, or "" with none, so a
+  // trace without attachments keeps its transcript shape.
+  private versionsJSON(versions: Map<string, bigint>): string {
+    const names = this.attachedNames();
+    if (names.length === 0) return "";
+    const parts: string[] = [];
+    for (const name of names) {
+      const v = versions.get(name);
+      if (v !== undefined) parts.push(`${goQuote(name)}:${v}`);
+    }
+    return `,"dbs":{` + parts.join(",") + "}";
   }
 
   private stepOpen(i: number, st: SimStep): void {
@@ -665,13 +833,22 @@ export class SimRunner {
     s.setRandomSource(seededRandomSource(decide(this.seed, LANE_SESSION, BigInt(i), 0n, 0n)));
     s.setClockSource(() => this.clock);
     if (this.workMem > 0) s.setWorkMem(this.workMem);
+    if (this.tempBuffers > 0) s.setTempBuffers(this.tempBuffers);
     if (this.maxQueryMemory > 0n) s.setMaxQueryMemoryBytes(this.maxQueryMemory);
     if (this.shared) {
-      const d = this.digest(s);
+      const d = this.digest(s, this.main());
       if (!this.observe(i, "session " + st.sid, s.version, d)) return;
     }
-    this.sessions.set(st.sid, { s, write: st.mode === "write", pin: s.version, pid: this.cur });
-    this.emit(`{"i":${i},"op":"open","sid":${goQuote(st.sid)},"version":${s.version}}`);
+    // A session pins every database's committed root when it opens.
+    const pins = new Map<string, bigint>([["main", s.version]]);
+    for (const name of this.attachedNames()) {
+      const v = this.dbVersion(this.dbs.get(name)!);
+      if (v !== 0n) pins.set(name, v);
+    }
+    this.sessions.set(st.sid, { s, write: st.mode === "write", pins, pid: this.cur });
+    this.emit(
+      `{"i":${i},"op":"open","sid":${goQuote(st.sid)},"version":${s.version}${this.versionsJSON(pins)}}`,
+    );
   }
 
   private stepOn(i: number, st: SimStep): void {
@@ -699,16 +876,18 @@ export class SimRunner {
     );
   }
 
-  // digest is the logical digest of what s sees: the catalog relations plus every table's rows, all
-  // rendered and sorted, folded with FNV-1a. null if any query failed (an aborted block).
-  private digest(s: Session): string | null {
+  // digest is the logical digest of what s sees of database d: the catalog relations plus every
+  // table's rows, all rendered and sorted, folded with FNV-1a. null if any query failed (an aborted
+  // block); digestErr then holds that error.
+  private digest(s: Session, d: SimDB): string | null {
+    this.digestErr = null;
     // An armed read fault targets the trace's statements, not the oracle checking them.
     this.fs.oracle = true;
     // The oracle's own reads must not trip a trace session's memory limit.
     const limit = s.maxQueryMemoryBytes;
     if (limit > 0n) s.setMaxQueryMemoryBytes(0n);
     try {
-      return this.digestReads(s);
+      return this.digestReads(s, qualifier(d));
     } finally {
       if (limit > 0n) s.setMaxQueryMemoryBytes(limit);
       this.fs.oracle = false;
@@ -725,7 +904,7 @@ export class SimRunner {
     }
   }
 
-  private digestReads(s: Session): string | null {
+  private digestReads(s: Session, q: string): string | null {
     let b = "";
     const tables: string[] = [];
     this.lastDigestText = "";
@@ -735,6 +914,7 @@ export class SimRunner {
         rows = s.query(sql);
       } catch (e) {
         if (!isEngineError(e)) throw e;
+        this.digestErr = e;
         this.lastDigestText = b + sql + "\nERROR: " + errText(e) + "\n";
         return false;
       }
@@ -747,14 +927,16 @@ export class SimRunner {
               cells.push(s.render(v));
             } catch (e) {
               if (!isEngineError(e)) throw e;
+              this.digestErr = e;
               return false;
             }
           }
-          if (sql === "SELECT * FROM jed_tables") tables.push(cells[0]!);
+          if (sql.endsWith("jed_tables")) tables.push(cells[0]!);
           rendered.push(cells.join("\x1f"));
         }
       } catch (e) {
         if (!isEngineError(e)) throw e;
+        this.digestErr = e;
         this.lastDigestText = b + sql + "\nERROR: " + errText(e) + "\n";
         return false;
       } finally {
@@ -764,31 +946,38 @@ export class SimRunner {
       b += sql + "\n" + rendered.join("\n") + "\n\n";
       return true;
     };
-    for (const rel of DIGEST_RELATIONS) if (!fold("SELECT * FROM " + rel)) return null;
+    for (const rel of DIGEST_RELATIONS) if (!fold("SELECT * FROM " + q + rel)) return null;
     tables.sort(compareUtf8);
-    for (const t of tables) if (!fold(`SELECT * FROM "${t}"`)) return null;
+    for (const t of tables) if (!fold(`SELECT * FROM ${q}"${t}"`)) return null;
     this.lastDigestText = b;
     return fnvStringHex(b);
   }
 
-  // committedView is the version and digest a fresh read session sees.
-  private committedView(): { v: bigint; d: string | null } {
+  // committedView is the version and digest of database d a fresh read session sees.
+  private committedView(d: SimDB): { v: bigint; dg: string | null } {
     const rs = this.database.readSession();
     try {
-      const d = this.digest(rs);
-      return { v: rs.version, d };
+      const dg = this.digest(rs, d);
+      return { v: this.dbVersion(d), dg };
     } finally {
       rs.close();
     }
   }
 
-  private committedDigest(): string | null {
+  private committedDigest(d: SimDB): string | null {
     const rs = this.database.readSession();
     try {
-      return this.digest(rs);
+      return this.digest(rs, d);
     } finally {
       rs.close();
     }
+  }
+
+  // quiet reports whether the commit being checked ran with nothing that may hold reclamation back: no
+  // other session (a reader pins its snapshot), no other process (co-resident commits are
+  // append-only), and no fault.
+  private quiet(): boolean {
+    return !this.shared && this.sessions.size === 0 && this.fs.fault === null;
   }
 
   private stepCommit(i: number, st: SimStep): void {
@@ -798,16 +987,19 @@ export class SimRunner {
       return;
     }
     this.sessions.delete(st.sid);
-    const base = this.version;
-    const inflight = this.digest(ss.s);
-    const inflightText = this.lastDigestText;
+    const dbs = this.order();
+    const before = dbs.map((d) => {
+      // Attached after this session opened: it cannot have written it.
+      if (!ss.pins.has(d.name)) return { digest: null as string | null, text: "" };
+      const dg = this.digest(ss.s, d);
+      return { digest: dg, text: this.lastDigestText };
+    });
     let err: unknown = null;
     try {
       ss.s.commit();
     } catch (e) {
       err = e;
     }
-    const now = versionOf(this.database);
     if (err !== null) {
       const code = errCode(err);
       if (code.startsWith("non-engine")) {
@@ -819,50 +1011,151 @@ export class SimRunner {
         this.fail(i, "corruption: commit reported XX001: " + errText(err));
         return;
       }
-      if (now !== base) {
-        this.fail(i, `a failed commit published version ${now} (was ${base})`);
-        return;
-      }
-      // The commit reached storage, so a crash may still recover its generation (§8.1).
-      if (inflight !== null && this.fs.writes > 0) {
-        this.addHistory(base + 1n, inflight);
-        if (base + 1n > this.maxAttempted) this.maxAttempted = base + 1n;
+      for (let k = 0; k < dbs.length; k++) {
+        const d = dbs[k]!;
+        const now = this.dbVersion(d);
+        if (now !== d.version) {
+          this.fail(i, `a failed commit published version ${now} of ${d.name} (was ${d.version})`);
+          return;
+        }
+        // The commit reached storage, so a crash may still recover its generation (§8.1).
+        const f = this.fs.files.get(d.file);
+        const dg = before[k]!.digest;
+        if (f !== undefined && f.writes > 0 && dg !== null) {
+          d.addHistory(d.version + 1n, dg);
+          if (d.version + 1n > d.maxAttempted) d.maxAttempted = d.version + 1n;
+        }
       }
       return;
     }
-    this.emit(`{"i":${i},"op":"commit","sid":${goQuote(st.sid)},"version":${now}}`);
-    if (now === base) {
-      if (inflight !== null && inflight !== this.lastDigest) {
-        this.fail(i, "commit succeeded without publishing the transaction's changes");
-      }
-    } else if (now === base + 1n) {
-      if (inflight === null) {
-        this.fail(i, `commit published version ${now} from a transaction whose reads failed`);
+    const versions = new Map<string, bigint>();
+    for (const d of dbs) versions.set(d.name, this.dbVersion(d));
+    this.emit(
+      `{"i":${i},"op":"commit","sid":${goQuote(st.sid)},"version":${versions.get("main")}` +
+        `${this.versionsJSON(versions)}}`,
+    );
+    const quiet = this.quiet();
+    for (let k = 0; k < dbs.length; k++) {
+      const d = dbs[k]!;
+      const base = d.version;
+      const now = versions.get(d.name)!;
+      const inflight = before[k]!;
+      if (now === base) {
+        if (inflight.digest !== null && inflight.digest !== d.lastDigest) {
+          this.fail(
+            i,
+            `commit succeeded without publishing the transaction's changes to ${d.name}`,
+          );
+          return;
+        }
+      } else if (now === base + 1n) {
+        if (inflight.digest === null) {
+          this.fail(
+            i,
+            `commit published version ${now} of ${d.name} from a transaction whose reads failed`,
+          );
+          return;
+        }
+        const published = this.committedDigest(d);
+        if (published === null || published !== inflight.digest) {
+          this.diagnostics = new Map([
+            ["before-commit.txt", inflight.text],
+            ["after-commit.txt", this.lastDigestText],
+          ]);
+          this.fail(
+            i,
+            `version ${now} of ${d.name} does not contain what its transaction saw before commit`,
+          );
+          return;
+        }
+        d.addHistory(now, inflight.digest);
+        d.version = now;
+        d.lastDigest = inflight.digest;
+        if (now > d.maxAttempted) d.maxAttempted = now;
+        d.floor = now; // acknowledged under synchronous = on (§8.2)
+        this.checkGrowth(i, d, quiet);
+        if (this.violation !== "") return;
+      } else {
+        this.fail(i, `commit jumped ${d.name} from version ${base} to ${now}`);
         return;
       }
-      const published = this.committedDigest();
-      if (published === null || published !== inflight) {
-        this.diagnostics = new Map([
-          ["before-commit.txt", inflightText],
-          ["after-commit.txt", this.lastDigestText],
-        ]);
-        this.fail(i, `version ${now} does not contain what its transaction saw before commit`);
-        return;
-      }
-      try {
-        this.checkLive();
-      } catch (e) {
-        this.fail(i, "after commit: " + errText(e));
-        return;
-      }
-      this.addHistory(now, inflight);
-      this.version = now;
-      this.lastDigest = inflight;
-      if (now > this.maxAttempted) this.maxAttempted = now;
-      this.floor = now; // acknowledged under synchronous = on (§8.2)
-    } else {
-      this.fail(i, `commit jumped from version ${base} to ${now}`);
     }
+    try {
+      this.checkLive();
+    } catch (e) {
+      this.fail(i, "after commit: " + errText(e));
+    }
+  }
+
+  // --- bounded growth (simulation-testing.md §8.3) ----------------------------------------------
+
+  // allocator is database d's page high-water and free-list length in the running process — the
+  // allocator state the next commit draws from.
+  private allocator(d: SimDB): { pageCount: number; free: number } {
+    const core = coreOf(this.database);
+    const st = d.name === "main" ? core.storage : core.attachments.get(d.name)?.storage;
+    if (st === undefined) return { pageCount: 0, free: 0 };
+    return { pageCount: st.pageCount, free: st.freePages.length };
+  }
+
+  // observeGrowth starts a new bounded-growth lifetime for d (an open, a recovery, a compaction, an
+  // attach). The engine seeds its reclamation trigger with the page count minus the free list
+  // (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only after
+  // it doubles.
+  private observeGrowth(d: SimDB): void {
+    const { pageCount, free } = this.allocator(d);
+    d.high = pageCount;
+    d.lacBound = (pageCount - free) >>> 0;
+    d.last = { reclaimed: false, high: 0, free: 0 };
+  }
+
+  // checkGrowth checks the reader-aware bounded-growth invariant after a commit published a new
+  // version of d (simulation-testing.md §8.3). With no reader pinned, no other process, and no fault,
+  // the engine reclaims in the commit once the high-water passes compact_growth × the live count at
+  // its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a commit
+  // with one open is not checked. Two checks follow:
+  //   - a quiet commit that began past max(compact_min_pages, compact_growth × an upper bound on that
+  //     live count) must have reclaimed: every page below the high-water is meta, live, free, or
+  //     written by the commit itself (its manifest and free-list pages);
+  //   - the next quiet commit reuses that free list before it grows the file.
+  private checkGrowth(i: number, d: SimDB, quiet: boolean): void {
+    if (this.shared) return;
+    const meta = metaOf(this.image(d), this.pageSize, d.version);
+    if (meta === null) return;
+    const pc = meta.pageCount;
+    const live = meta.live;
+    const { free } = this.allocator(d);
+    let written = 0;
+    for (const pg of this.fs.files.get(d.file)!.pages) if (pg >= 2) written++;
+    const before = d.last;
+    if (
+      quiet &&
+      before.reclaimed &&
+      pc > before.high &&
+      pc - before.high > written - Math.min(written, before.free)
+    ) {
+      this.fail(
+        i,
+        `bounded growth: ${d.name} grew from ${before.high} to ${pc} pages writing ${written}, ` +
+          `with ${before.free} free pages to reuse`,
+      );
+      return;
+    }
+    let reclaimed = false;
+    if (quiet && d.high > Math.max(COMPACT_MIN_PAGES, COMPACT_GROWTH * d.lacBound)) {
+      reclaimed = true;
+      if (pc < 2 + live + free || pc - 2 - live - free > written) {
+        this.fail(
+          i,
+          `bounded growth: ${d.name} has ${pc} pages, ${live} live and ${free} free, after a commit ` +
+            `that wrote ${written} must have reclaimed every dead page`,
+        );
+        return;
+      }
+    }
+    d.high = pc;
+    d.lacBound = Math.max(d.lacBound, live + written);
+    d.last = { reclaimed, high: pc, free };
   }
 
   private stepEnd(i: number, st: SimStep): void {
@@ -882,12 +1175,17 @@ export class SimRunner {
         return;
       }
     } else {
-      // Snapshot isolation: a reader still sees exactly the version it pinned, however many
-      // commits, reclamations, and page reuses happened since.
+      // Snapshot isolation: a reader still sees exactly the version of every database it pinned,
+      // however many commits, reclamations, and page reuses happened since.
       if (!ss.write) {
-        const d = this.digest(ss.s);
-        if (d === null || !this.inHistory(ss.pin, d)) {
-          this.fail(i, `isolation: reader ${st.sid} no longer sees version ${ss.pin}`);
+        for (const d of this.order()) {
+          const pin = ss.pins.get(d.name);
+          if (pin === undefined) continue;
+          const dg = this.digest(ss.s, d);
+          if (dg === null || !d.inHistory(pin, dg)) {
+            this.fail(i, `isolation: reader ${st.sid} no longer sees version ${pin} of ${d.name}`);
+            break;
+          }
         }
       }
       closeQuietly(ss.s);
@@ -895,40 +1193,47 @@ export class SimRunner {
     this.emit(`{"i":${i},"op":${goQuote(st.kind)},"sid":${goQuote(st.sid)}}`);
   }
 
-  // stepCompact runs host compaction (api.md §2.6): the committed snapshot rewritten as a fresh image
-  // at the next version, through the simulated filesystem's temp file, rename, and directory barrier.
-  // Its contents are unchanged, so a crash may recover either version with the same digest.
-  private stepCompact(i: number): void {
-    const base = this.version;
-    this.addHistory(base + 1n, this.lastDigest);
-    if (base + 1n > this.maxAttempted) this.maxAttempted = base + 1n;
+  // stepCompact runs host compaction (api.md §2.6) of database name: the committed snapshot rewritten
+  // as a fresh image at the next version, through the simulated filesystem's temp file, rename, and
+  // directory barrier. Its contents are unchanged, so a crash may recover either version with the
+  // same digest.
+  private stepCompact(i: number, name: string): void {
+    const d = this.dbs.get(name);
+    if (d === undefined || this.dbVersion(d) === 0n) {
+      this.emit(`{"i":${i},"op":"compact","db":${goQuote(name)},"skip":true}`);
+      return;
+    }
+    const base = d.version;
+    d.addHistory(base + 1n, d.lastDigest);
+    if (base + 1n > d.maxAttempted) d.maxAttempted = base + 1n;
     let err: unknown = null;
     try {
-      this.database.compact("main");
+      this.database.compact(name);
     } catch (e) {
       err = e;
     }
-    const now = versionOf(this.database);
+    const now = this.dbVersion(d);
+    const dbField = name !== "main" ? `,"db":${goQuote(name)}` : "";
     if (err !== null) {
       const code = errCode(err);
       if (code.startsWith("non-engine")) {
         this.fail(i, code);
         return;
       }
-      this.emit(`{"i":${i},"op":"compact","error":${goQuote(code)}}`);
+      this.emit(`{"i":${i},"op":"compact"${dbField},"error":${goQuote(code)}}`);
       if (code === "XX001") this.fail(i, "corruption: compaction reported XX001: " + errText(err));
       else if (now !== base)
-        this.fail(i, `a failed compaction published version ${now} (was ${base})`);
+        this.fail(i, `a failed compaction published version ${now} of ${name} (was ${base})`);
       return;
     }
-    this.emit(`{"i":${i},"op":"compact","version":${now}}`);
+    this.emit(`{"i":${i},"op":"compact"${dbField},"version":${now}}`);
     if (now !== base + 1n) {
-      this.fail(i, `compaction moved version ${base} to ${now}`);
+      this.fail(i, `compaction moved ${name} from version ${base} to ${now}`);
       return;
     }
-    const d = this.committedDigest();
-    if (d === null || d !== this.lastDigest) {
-      this.fail(i, "compaction changed the database's contents");
+    const dg = this.committedDigest(d);
+    if (dg === null || dg !== d.lastDigest) {
+      this.fail(i, `compaction changed the contents of ${name}`);
       return;
     }
     try {
@@ -937,43 +1242,105 @@ export class SimRunner {
       this.fail(i, "after compaction: " + errText(e));
       return;
     }
-    this.version = now;
-    this.floor = now; // the rename and the directory barrier completed
+    d.version = now;
+    d.floor = now; // the rename and the directory barrier completed
+    this.observeGrowth(d);
+  }
+
+  // stepAttach attaches file database name to the running process (S4), first creating its file
+  // through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
+  // directory barrier, any of which a fault may interrupt. Already attached, it only reports.
+  private stepAttach(i: number, name: string): void {
+    if (this.shared) {
+      this.fail(i, "attach is single-process only");
+      return;
+    }
+    let d = this.dbs.get(name);
+    if (d !== undefined && this.dbVersion(d) !== 0n) {
+      this.emit(`{"i":${i},"op":"attach","db":${goQuote(name)},"version":${d.version}}`);
+      return;
+    }
+    if (d === undefined) {
+      d = new SimDB(name, name + ".jed");
+      this.dbs.set(name, d);
+    }
+    if (!this.fs.files.has(d.file)) {
+      // A fresh file is version 1, empty. Until create returns it may vanish in a crash (floor 0).
+      d.history = new Map();
+      d.addHistory(1n, emptyDigest(d));
+      d.version = 1n;
+      d.lastDigest = emptyDigest(d);
+      d.floor = 0n;
+      d.maxAttempted = 1n;
+      try {
+        closeEngine(createVia(this.fs, d.file, { pageSize: this.pageSize }));
+      } catch (e) {
+        this.attachFailed(i, name, e);
+        return;
+      }
+      d.floor = 1n; // create returned: the file and its directory entry are durable
+    }
+    try {
+      this.attach(name);
+    } catch (e) {
+      this.attachFailed(i, name, e);
+      return;
+    }
+    const v = this.dbVersion(d);
+    const dg = this.committedDigest(d);
+    if (!this.checkRecovered(i, d, v, dg, "attached")) return;
+    this.observeGrowth(d);
+    this.emit(`{"i":${i},"op":"attach","db":${goQuote(name)},"version":${v}}`);
+  }
+
+  private attachFailed(i: number, name: string, e: unknown): void {
+    if (e instanceof SimDeadlock) throw e;
+    const code = errCode(e);
+    if (code.startsWith("non-engine") || code === "XX001") {
+      this.fail(i, `attach ${name}: ${errText(e)}`);
+      return;
+    }
+    this.emit(`{"i":${i},"op":"attach","db":${goQuote(name)},"error":${goQuote(code)}}`);
   }
 
   private stepCheck(i: number): void {
-    const view = this.committedView();
-    if (this.shared) {
-      // Another process may have died leaving a newer complete generation this one now adopts.
-      if (!this.observe(i, "check", view.v, view.d)) return;
-    } else if (view.d === null || view.v !== this.version || view.d !== this.lastDigest) {
-      this.fail(i, "a read session does not see the last committed version's contents");
-      return;
+    const entries: string[] = [];
+    let mainLine = "";
+    for (const d of this.order()) {
+      const { v, dg } = this.committedView(d);
+      if (this.shared && d.name === "main") {
+        // Another process may have died leaving a newer complete generation this one now adopts.
+        if (!this.observe(i, "check", v, dg)) return;
+      } else if (dg === null || v !== d.version || dg !== d.lastDigest) {
+        this.fail(i, `a read session does not see the last committed version of ${d.name}`);
+        return;
+      }
+      const image = this.image(d);
+      let counts: [number, number, number];
+      try {
+        counts = checkImage(image ?? new Uint8Array(), d.version);
+      } catch (e) {
+        this.fail(i, `integrity of ${d.name}: ` + errText(e));
+        return;
+      }
+      const [live, pages, free] = counts;
+      const body =
+        `"version":${d.version},"digest":${goQuote(dg!)},"live":${live},"pages":${pages},` +
+        `"free":${free},"image":"${imageHash(image!, pages, this.pageSize)}"`;
+      if (d.name === "main") mainLine = body;
+      else entries.push(`${goQuote(d.name)}:{${body}}`);
     }
-    const d = view.d!;
     try {
       this.checkLive();
     } catch (e) {
       this.fail(i, "live integrity: " + errText(e));
       return;
     }
-    const image = this.mainImage();
-    let counts: [number, number, number];
-    try {
-      counts = checkImage(image ?? new Uint8Array(), this.version);
-    } catch (e) {
-      this.fail(i, "integrity: " + errText(e));
-      return;
-    }
-    const [live, pages, free] = counts;
-    this.emit(
-      `{"i":${i},"op":"check","version":${this.version},"digest":${goQuote(d)},"live":${live},` +
-        `"pages":${pages},"free":${free},"image":"${imageHash(image!, pages, this.pageSize)}"}`,
-    );
+    this.emit(`{"i":${i},"op":"check",${mainLine}${dbsJSON(entries)}}`);
   }
 
   // stepReopen ends every session cleanly, closes the Database, and reopens it: the result must be
-  // exactly the last committed version.
+  // exactly the last committed version of every database.
   private stepReopen(i: number): boolean {
     for (const pid of this.livePids()) {
       try {
@@ -991,71 +1358,229 @@ export class SimRunner {
       this.fail(i, "reopen failed: " + errText(e));
       return false;
     }
-    const v = versionOf(this.database);
-    const d = this.committedDigest();
-    if (this.shared) {
-      // A process killed mid-commit may have left a complete generation no survivor began on yet.
-      if (!this.observe(i, "reopened p0", v, d)) return false;
-    } else if (v !== this.version || d === null || d !== this.lastDigest) {
+    const entries: string[] = [];
+    let mainV = 0n;
+    let mainD = "";
+    for (const d of this.order()) {
+      if (this.dbVersion(d) === 0n) {
+        this.fail(i, `a clean reopen lost attachment ${d.name}`);
+        return false;
+      }
+      const v = this.dbVersion(d);
+      const dg = this.committedDigest(d);
+      if (this.shared && d.name === "main") {
+        // A process killed mid-commit may have left a complete generation no survivor began on yet.
+        if (!this.observe(i, "reopened p0", v, dg)) return false;
+      } else if (v !== d.version || dg === null || dg !== d.lastDigest) {
+        this.fail(
+          i,
+          `a clean reopen returned version ${v} of ${d.name} (digest ${dg ?? ""}), want version ` +
+            `${d.version} (digest ${d.lastDigest})`,
+        );
+        return false;
+      }
+      this.observeGrowth(d);
+      if (d.name === "main") {
+        mainV = v;
+        mainD = dg!;
+      } else entries.push(`${goQuote(d.name)}:{"version":${v},"digest":${goQuote(dg!)}}`);
+    }
+    this.emit(
+      `{"i":${i},"op":"reopen","version":${mainV},"digest":${goQuote(mainD)}${dbsJSON(entries)}}`,
+    );
+    return true;
+  }
+
+  // checkRecovered checks a database's version and contents after a recovery or an attach against
+  // its history and durability floor (§8.1–8.2).
+  private checkRecovered(i: number, d: SimDB, v: bigint, dg: string | null, what: string): boolean {
+    if (dg === null) {
+      this.fail(i, `${what}: version ${v} of ${d.name} is unreadable: ${errText(this.digestErr)}`);
+    } else if (v < d.floor) {
       this.fail(
         i,
-        `a clean reopen returned version ${v} (digest ${d ?? ""}), want version ${this.version} (digest ${this.lastDigest})`,
+        `durability: ${what} version ${v} of ${d.name}, but version ${d.floor} was durable`,
       );
-      return false;
+    } else if (v > d.maxAttempted) {
+      this.fail(
+        i,
+        `${what}: version ${v} of ${d.name} was never attempted (latest attempted ${d.maxAttempted})`,
+      );
+    } else if (!d.inHistory(v, dg)) {
+      this.fail(
+        i,
+        `${what}: version ${v} of ${d.name} has contents (digest ${dg}) no transaction produced`,
+      );
     }
-    this.emit(`{"i":${i},"op":"reopen","version":${v},"digest":${goQuote(d!)}}`);
+    if (this.violation !== "") return false;
+    d.version = v;
+    d.lastDigest = dg!;
     return true;
   }
 
   // recover abandons the crashed process — its sessions and Database — and opens the disk as a new
-  // process would, then checks the recovered generation against the history and the durability
-  // floor (§8.1–8.2) and the image against the integrity checker (§8.3).
+  // process would, then checks every database's recovered generation against its history and
+  // durability floor (§8.1–8.2) and its image against the integrity checker (§8.3).
   private recover(i: number, fired: string): boolean {
     for (const pid of this.livePids()) this.dropProc(pid);
     this.fs.processDeath();
-    const image = this.mainImage();
-    if (this.imagePrefix !== "")
-      writeFileSync(`${this.imagePrefix}.step${i}.img`, image ?? new Uint8Array());
+    const images = new Map<string, Uint8Array | null>();
+    for (const d of this.order()) {
+      const image = this.image(d);
+      images.set(d.name, image);
+      if (d.name !== "main" && image === null) {
+        // A crash during the attachment's create: allowed only while create had not returned.
+        if (d.floor > 0n) {
+          this.fail(
+            i,
+            `durability: attachment ${d.name}'s file is gone, but version ${d.floor} was durable`,
+          );
+          return false;
+        }
+        this.dbs.delete(d.name);
+        continue;
+      }
+      if (this.imagePrefix !== "") {
+        const suffix = d.name !== "main" ? "." + d.name : "";
+        writeFileSync(`${this.imagePrefix}.step${i}${suffix}.img`, image ?? new Uint8Array());
+      }
+    }
     try {
       this.open();
     } catch (e) {
-      this.crashImage = image;
+      this.crashImage = images.get("main") ?? null;
       this.fail(i, "recovery: open failed: " + errText(e));
       return false;
     }
-    const v = versionOf(this.database);
-    const d = this.committedDigest();
-    if (d === null) {
-      this.crashImage = image;
-      this.fail(i, `recovery: version ${v} is unreadable`);
-    } else if (v < this.floor) {
-      this.crashImage = image;
-      this.fail(i, `durability: recovered version ${v}, but version ${this.floor} was durable`);
-    } else if (v > this.maxAttempted) {
-      this.crashImage = image;
-      this.fail(
-        i,
-        `recovery: version ${v} was never attempted (latest attempted ${this.maxAttempted})`,
-      );
-    } else if (!this.inHistory(v, d)) {
-      this.crashImage = image;
-      this.fail(i, `recovery: version ${v} has contents (digest ${d}) no transaction produced`);
+    const entries: string[] = [];
+    let mainLine = "";
+    for (const d of this.order()) {
+      const image = images.get(d.name) ?? null;
+      const v = this.dbVersion(d);
+      const dg = this.committedDigest(d);
+      if (!this.checkRecovered(i, d, v, dg, "recovered")) {
+        this.crashImage = image;
+        return false;
+      }
+      let counts: [number, number, number];
+      try {
+        counts = checkImage(image ?? new Uint8Array(), v);
+      } catch (e) {
+        this.crashImage = image;
+        this.fail(i, `recovery integrity of ${d.name}: ` + errText(e));
+        return false;
+      }
+      const [live, pages, free] = counts;
+      this.observeGrowth(d);
+      const body =
+        `"recovered":${v},"digest":${goQuote(dg!)},"live":${live},"pages":${pages},` +
+        `"free":${free},"image":"${imageHash(image!, pages, this.pageSize)}"`;
+      if (d.name === "main") mainLine = body;
+      else entries.push(`${goQuote(d.name)}:{${body}}`);
     }
-    if (this.violation !== "") return false;
-    let counts: [number, number, number];
-    try {
-      counts = checkImage(image ?? new Uint8Array(), v);
-    } catch (e) {
-      this.crashImage = image;
-      this.fail(i, "recovery integrity: " + errText(e));
+    this.emit(`{"i":${i},"op":"crash","fired":${goQuote(fired)},${mainLine}${dbsJSON(entries)}}`);
+    return true;
+  }
+
+  // stepCorrupt is `corrupt flips=N [reseal=1]` (simulation-testing.md §6.3): every process ends
+  // cleanly; bits flip in durable body pages of the main database; a new process opens it and reads
+  // everything; then the bits are repaired and the database must reopen exactly as it was. Without
+  // reseal a flip breaks its page's CRC, so every outcome must be XX001 or the right rows — never
+  // wrong rows. With reseal the CRC is recomputed, so only the engine's structural checks stand in
+  // the way: any engine error, or any rows, is allowed, but never a non-engine error.
+  private stepCorrupt(i: number, st: SimStep): boolean {
+    const reseal = st.params.get("reseal") === "1";
+    for (const pid of this.livePids()) {
+      try {
+        this.closeProc(pid);
+      } catch (e) {
+        if (!isEngineError(e)) throw e;
+        this.fail(i, "close: " + errText(e));
+        return false;
+      }
+    }
+    this.fs.processDeath();
+    const m = this.main();
+    const file = this.fs.main()!;
+    const meta = metaOf(file.cache, this.pageSize, m.version);
+    if (meta === null) {
+      this.fail(i, `corrupt: no meta holds version ${m.version}`);
       return false;
     }
-    const [live, pages, free] = counts;
-    this.version = v;
-    this.lastDigest = d!;
+    const flips = file.corrupt(i, intParam(st, "flips"), meta.pageCount, reseal);
+    const outcome = (e: unknown): string | null => {
+      const code = errCode(e);
+      if (code.startsWith("non-engine")) {
+        this.fail(i, "corrupt: " + code);
+        return null;
+      }
+      if (code !== "XX001" && !reseal) {
+        this.fail(i, `corrupt: a flipped checksum surfaced as ${code}, not XX001: ${errText(e)}`);
+        return null;
+      }
+      return code;
+    };
+    let opened = "ok";
+    let read = "-";
+    let openErr: unknown = null;
+    try {
+      this.openProc(0);
+    } catch (e) {
+      if (e instanceof SimDeadlock) throw e;
+      openErr = e;
+    }
+    if (openErr !== null) {
+      const code = outcome(openErr);
+      if (code === null) return false;
+      opened = code;
+    } else {
+      read = "ok";
+      const v = versionOf(this.database);
+      let dg: string | null;
+      try {
+        dg = this.committedDigest(m);
+      } catch (e) {
+        // A non-engine throw from a corrupted read is a violation, as Go's digest reports it.
+        this.digestErr = e;
+        dg = null;
+      }
+      if (dg === null) {
+        const code = outcome(this.digestErr);
+        if (code === null) return false;
+        read = code;
+      } else if (
+        !reseal &&
+        (!m.inHistory(v, dg) || v > m.version || (v < m.version && v + 1n !== m.version))
+      ) {
+        // A flip in the newest generation's dirty pages fails its validation, and recovery falls
+        // back to the previous generation (validated-cow.md §1), which is intact.
+        this.fail(
+          i,
+          `corrupt: version ${v} read back with contents (digest ${dg}) no transaction produced`,
+        );
+        return false;
+      }
+      this.dropProc(0);
+    }
+    file.repair(flips);
+    try {
+      this.open();
+    } catch (e) {
+      this.fail(i, "corrupt: reopen after repair failed: " + errText(e));
+      return false;
+    }
+    const v = versionOf(this.database);
+    if (v !== m.version) {
+      this.fail(i, `corrupt: after repair version ${v}, want ${m.version}`);
+      return false;
+    }
+    const dg = this.committedDigest(m);
+    if (dg === null || dg !== m.lastDigest) {
+      this.fail(i, "corrupt: after repair the contents differ");
+      return false;
+    }
     this.emit(
-      `{"i":${i},"op":"crash","fired":${goQuote(fired)},"recovered":${v},"digest":${goQuote(d!)},` +
-        `"live":${live},"pages":${pages},"free":${free},"image":"${imageHash(image!, pages, this.pageSize)}"}`,
+      `{"i":${i},"op":"corrupt","flipped":${flips.length},"open":${goQuote(opened)},"read":${goQuote(read)}}`,
     );
     return true;
   }
@@ -1103,25 +1628,26 @@ export class SimRunner {
     if (this.cur === pid) this.db = null;
   }
 
-  // observe checks the version and contents a process sees when it begins (S5): in a shared trace
-  // another process may have committed — or died mid-commit, leaving a complete generation another
-  // process adopts — so the version may be newer than the last this runner saw, but never older, and
-  // its contents must be a generation the history records.
+  // observe checks the version and contents a process sees of main when it begins (S5): in a shared
+  // trace another process may have committed — or died mid-commit, leaving a complete generation
+  // another process adopts — so the version may be newer than the last this runner saw, but never
+  // older, and its contents must be a generation the history records.
   private observe(i: number, who: string, v: bigint, d: string | null): boolean {
+    const m = this.main();
     if (d === null) this.fail(i, `${who}: version ${v} is unreadable`);
-    else if (v < this.version) {
-      this.fail(i, `${who} sees version ${v} after version ${this.version} was published`);
-    } else if (v > this.maxAttempted) {
+    else if (v < m.version) {
+      this.fail(i, `${who} sees version ${v} after version ${m.version} was published`);
+    } else if (v > m.maxAttempted) {
       this.fail(
         i,
-        `${who} sees version ${v}, which was never attempted (latest attempted ${this.maxAttempted})`,
+        `${who} sees version ${v}, which was never attempted (latest attempted ${m.maxAttempted})`,
       );
-    } else if (!this.inHistory(v, d)) {
+    } else if (!m.inHistory(v, d)) {
       this.fail(i, `${who} sees version ${v} with contents (digest ${d}) no transaction produced`);
     }
     if (this.violation !== "") return false;
-    this.version = v;
-    this.lastDigest = d!;
+    m.version = v;
+    m.lastDigest = d!;
     return true;
   }
 
@@ -1171,7 +1697,7 @@ export class SimRunner {
       return;
     }
     const v = versionOf(this.database);
-    const d = this.committedDigest();
+    const d = this.committedDigest(this.main());
     if (!this.observe(i, `spawned p${pid}`, v, d)) return;
     this.emit(`{"i":${i},"op":"spawn","pid":${pid},"version":${v}}`);
   }

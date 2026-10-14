@@ -1,16 +1,24 @@
 # Resource limits and per-core I/O faults (simulation-testing.md §6.3, §9; slice S3): tiny buffer
-# pools force eviction, small work_mem forces spill, and storage/query-memory limits make commits and
-# statements fail mid-history (54P06, 54P05). read_error and enospc are per-core faults, so a trace
-# that arms one runs every oracle on every core but skips the cross-core comparison.
+# pools force eviction, small work_mem forces spill, small temp_buffers spills session temp tables to
+# scratch files, and storage/query-memory limits make commits and statements fail mid-history (54P06,
+# 54P05). read_error, enospc, and spill_error are per-core faults, so a trace that arms one runs
+# every oracle on every core but skips the cross-core comparison.
 
 description = "Tiny caches, spill, storage and query-memory limits, read errors, out-of-space"
 
 page_sizes = [256, 512]
 cache_bytes = [512, 2048]
 work_mem = [0, 1024, 4096]
+temp_buffers = [0, 1024, 4096]
 max_query_memory_bytes = [0, 65536, 262144]
 max_storage_bytes = [0, 32768, 131072]
+
+[weights]
+temp_table = 2
+temp_insert = 4
+temp_read = 2
 
 [faults]
 read_error = 3
 enospc = 1
+spill_fault = 60   # the permille chance a statement that may spill is armed with spill_error

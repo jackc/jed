@@ -256,53 +256,34 @@ impl BlockStore for MemoryBlockStore {
 }
 
 /// The **scratch** storage host for a spilled session-local temp domain (spec/design/temp-tables.md
-/// §6): a private file in the host spill directory, never the database file. A temp domain is never
-/// reopened and has no durability barrier, so `sync` and the grow barrier are no-ops. The file is
-/// unlinked as soon as it is created where the OS allows an open file to be unlinked (so a crash
-/// leaves nothing behind), and otherwise when this store drops.
+/// §6): a private scratch file from the spill host ([`crate::spillhost`]), never the database file. A
+/// temp domain is never reopened and has no durability barrier, so `sync` and the grow barrier are
+/// no-ops. Under the OS host the file is unlinked as soon as it is created where the OS allows an
+/// open file to be unlinked (so a crash leaves nothing behind); dropping this store deletes it.
 pub(crate) struct ScratchBlockStore {
-    /// The open scratch file; `None` only while dropping (closed before the unlink, for Windows).
-    inner: Option<FileBlockStore>,
-    /// The path still to remove on drop; `None` once unlinked.
-    path: Option<std::path::PathBuf>,
+    file: Box<dyn crate::spillhost::SpillFile>,
 }
 
 impl ScratchBlockStore {
-    /// Create an empty scratch file under `dir` (exclusive, private mode — spill.rs).
-    pub(crate) fn create(dir: &std::path::Path) -> Result<ScratchBlockStore> {
-        let (path, file) = crate::spill::create_spill_file(dir)?;
-        let path = match std::fs::remove_file(&path) {
-            Ok(()) => None,
-            Err(_) => Some(path),
-        };
+    /// Create an empty scratch file through `spill` (the `"temp"` kind).
+    pub(crate) fn create(spill: &dyn crate::spillhost::SpillHost) -> Result<ScratchBlockStore> {
         Ok(ScratchBlockStore {
-            inner: Some(FileBlockStore::new(file, true)),
-            path,
+            file: spill.create("temp")?,
         })
-    }
-
-    fn file(&mut self) -> &mut FileBlockStore {
-        self.inner.as_mut().expect("scratch file open until drop")
-    }
-}
-
-impl Drop for ScratchBlockStore {
-    fn drop(&mut self) {
-        // Close before unlinking: Windows cannot remove an open file.
-        drop(self.inner.take());
-        if let Some(path) = self.path.take() {
-            let _ = std::fs::remove_file(path);
-        }
     }
 }
 
 impl BlockStore for ScratchBlockStore {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        self.file().read_at(offset, len)
+        checked_end(offset, len)?;
+        let mut buf = vec![0u8; len];
+        crate::spillhost::read_exact_at(self.file.as_ref(), offset, &mut buf).map_err(io_error)?;
+        Ok(buf)
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        self.file().write_at(offset, bytes)
+        checked_end(offset, bytes.len())?;
+        self.file.write_at(offset, bytes).map_err(io_error)
     }
 
     fn sync(&mut self) -> Result<()> {
@@ -310,11 +291,12 @@ impl BlockStore for ScratchBlockStore {
     }
 
     fn size(&mut self) -> Result<u64> {
-        self.file().size()
+        self.file.size().map_err(io_error)
     }
 
+    /// Grow (with zeros) or truncate; a scratch file has no durable-grow barrier.
     fn set_size(&mut self, bytes: u64) -> Result<()> {
-        self.file().set_size(bytes)
+        self.file.truncate(bytes).map_err(io_error)
     }
 
     fn skips_sync(&self) -> bool {

@@ -255,7 +255,7 @@ func (db *engine) commitTx() (outcome, error) {
 	// still-committed root. Zero main-file writes (temp-tables.md §6).
 	var tempStaged *stagedCommit
 	if tx.tempDirty && db.tempStorage != nil {
-		staged, err := db.tempStorage.stageTemp(tx.tempWorking, db.session.tempBuffers, db.spillDir)
+		staged, err := db.tempStorage.stageTemp(tx.tempWorking, db.session.tempBuffers, db.spill)
 		if err != nil {
 			return outcome{}, err
 		}

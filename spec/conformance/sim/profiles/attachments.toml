@@ -1,0 +1,37 @@
+# File attachments (attached-databases.md; simulation-testing.md §14 S4): up to two attached file
+# databases, each created through the simulated filesystem by `attach` — create's temp file, sync,
+# rename, and directory barrier, which a fault may crash between — and re-attached by every later
+# process. A write transaction writes main or one attachment (the one-durable-writer rule); each
+# database keeps its own versions, history, and durability floor, and compaction may target either.
+# Standalone crashes are off so readers stay pinned across many attachment commits (an attachment's
+# reclamation is gated by the same reader watermark as main's); faulted commits, attaches, and
+# compactions still crash it.
+
+description = "Attached file databases: create under crashes, per-database recovery, one durable writer"
+
+page_sizes = [256, 512]
+steps = 500
+max_tables = 5
+max_readers = 4
+attachments = 2
+attached_writes = 600   # the chance a write transaction (or a new table) targets an attachment
+
+[weights]
+attach = 6
+compact = 1
+open_read = 8
+close_read = 3
+create_table = 3
+crash_power = 0
+crash_process = 0
+reopen = 0
+update = 14
+commit = 14
+upsert = 2
+sequence = 0
+
+[faults]
+commit_fault = 60
+attach_fault = 300
+compact_fault = 300
+nth_max = 2

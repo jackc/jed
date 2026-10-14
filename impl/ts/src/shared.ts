@@ -729,14 +729,19 @@ export function attachFile(
 // file.ts, not shared.ts, owns open/create). Returns the opened storage Engine (its committed snapshot +
 // paging become the attachment). null until a host registers one → a file attach then throws
 // feature_not_supported (a pure in-memory build has no file layer to reach).
+// files is main's file host (null is the host's own), so an attachment opens through the same
+// filesystem as main — the deterministic simulator's (simulation-testing.md §14 S4) included.
 type OpenedAttachment = { engine: Engine; coordinator: FileCoordinatorHost | null };
-let fileAttachOpener: ((source: AttachSource, readOnly: boolean) => OpenedAttachment) | null = null;
+type FileAttachOpener = (
+  source: AttachSource,
+  readOnly: boolean,
+  files: FileHost | null,
+) => OpenedAttachment;
+let fileAttachOpener: FileAttachOpener | null = null;
 
 // registerFileAttachOpener installs the host file layer that Database.attach uses for a file source
 // (called once, at file.ts module load). The OPFS host would register its own.
-export function registerFileAttachOpener(
-  fn: (source: AttachSource, readOnly: boolean) => OpenedAttachment,
-): void {
+export function registerFileAttachOpener(fn: FileAttachOpener): void {
   fileAttachOpener = fn;
 }
 
@@ -823,8 +828,10 @@ export class Database {
         throw engineError("feature_not_supported", "file attachment needs a host file layer");
       }
       // Open the file BEFORE the dup check (an open may throw 58P01/XX001); on a name conflict close it.
-      const opened = fileAttachOpener(source, readOnly);
+      const opened = fileAttachOpener(source, readOnly, c.storage.fileHost);
       const engine = opened.engine;
+      // The attachment's storage reaches the same file host as main (compaction, directory barrier).
+      engine.fileHost = c.storage.fileHost;
       coordinator = opened.coordinator;
       if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
         engine.paging?.close(); // release the just-opened file — the name is taken

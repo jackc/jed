@@ -213,57 +213,58 @@ func (s *memoryBlockStore) setSize(n int64) error {
 func (s *memoryBlockStore) close() error { return nil }
 
 // scratchBlockStore is the SCRATCH storage host for a spilled session-local temp domain
-// (spec/design/temp-tables.md §6): a private file in the host spill directory, never the database file.
-// A temp domain is never reopened and has no durability barrier, so sync and the grow barrier are
-// no-ops. The file is unlinked as soon as it is created where the OS allows an open file to be
-// unlinked (so a crash leaves nothing behind), and otherwise removed by close (Windows). Go has no
-// destructor, so the owner must close it: the session's temp domain is released on Session.Close
-// (engine.releaseTempDomain).
+// (spec/design/temp-tables.md §6): a private scratch file from the spill host (spillhost.go), never
+// the database file. A temp domain is never reopened and has no durability barrier, so sync and the
+// grow barrier are no-ops. Go has no destructor, so the owner must close it, which deletes the file:
+// the session's temp domain is released on Session.Close (engine.releaseTempDomain).
 type scratchBlockStore struct {
-	file *fileBlockStore
-	// path is the path still to remove on close; "" once unlinked.
-	path string
+	file spillFile
 }
 
-// newScratchBlockStore creates an empty scratch file under dir — exclusive, private mode, the
-// external-sort spill file's creation rule (spill.go spillRun, spill.md §6) — and unlinks it at once.
-func newScratchBlockStore(dir string) (*scratchBlockStore, error) {
-	f, err := os.CreateTemp(dir, "jed-spill-*.tmp")
+// newScratchBlockStore creates an empty scratch file through the spill host — under the OS host,
+// exclusive, private mode, unlinked at once (the external-sort spill file's creation rule, spill.md §6).
+func newScratchBlockStore(spill spillHost) (*scratchBlockStore, error) {
+	f, err := spill.create("temp")
 	if err != nil {
-		return nil, ioError(err)
+		return nil, err
 	}
-	path := f.Name()
-	if os.Remove(path) == nil {
-		path = ""
-	}
-	return &scratchBlockStore{file: &fileBlockStore{f: f, noSync: true}, path: path}, nil
+	return &scratchBlockStore{file: f}, nil
 }
 
 func (s *scratchBlockStore) readAt(off int64, length int) ([]byte, error) {
-	return s.file.readAt(off, length)
+	buf := make([]byte, length)
+	if _, err := s.file.ReadAt(buf, off); err != nil {
+		return nil, ioError(err)
+	}
+	return buf, nil
 }
 
-func (s *scratchBlockStore) writeAt(off int64, p []byte) error { return s.file.writeAt(off, p) }
+func (s *scratchBlockStore) writeAt(off int64, p []byte) error {
+	if _, err := s.file.WriteAt(p, off); err != nil {
+		return ioError(err)
+	}
+	return nil
+}
 
 func (s *scratchBlockStore) sync() error { return nil }
 
-func (s *scratchBlockStore) size() (int64, error) { return s.file.size() }
-
-// setSize grows or truncates; the wrapped store's noSync makes the durable-grow barrier a no-op.
-func (s *scratchBlockStore) setSize(n int64) error { return s.file.setSize(n) }
-
-// close closes the file, then removes it if it could not be unlinked while open (Windows cannot
-// remove an open file). Idempotent.
-func (s *scratchBlockStore) close() error {
-	err := s.file.close()
-	if s.path != "" {
-		_ = os.Remove(s.path)
-		s.path = ""
+func (s *scratchBlockStore) size() (int64, error) {
+	n, err := s.file.size()
+	if err != nil {
+		return 0, ioError(err)
 	}
-	if errors.Is(err, os.ErrClosed) {
-		return nil
-	}
-	return err
+	return n, nil
 }
+
+// setSize grows (with zeros) or truncates; a scratch file has no durable-grow barrier.
+func (s *scratchBlockStore) setSize(n int64) error {
+	if err := s.file.truncate(n); err != nil {
+		return ioError(err)
+	}
+	return nil
+}
+
+// close closes and deletes the scratch file. Idempotent.
+func (s *scratchBlockStore) close() error { return s.file.close() }
 
 func (s *scratchBlockStore) skipsSync() bool { return true }

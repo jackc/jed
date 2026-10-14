@@ -168,7 +168,7 @@ func TestSpillLeavesNoTempFiles(t *testing.T) {
 	}
 	// Isolate this cleanup assertion from other parallel spill tests. Production file hosts use the
 	// OS temp directory; this white-box override is test-only.
-	db.spillDir = dir
+	db.spill = osSpillHost{dir: dir}
 	seedSpill(t, db, 150)
 	db.SetWorkMem(64) // force heavy spilling
 
@@ -243,7 +243,7 @@ func TestSpillScratchFailureAbortsWith58030(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedSpill(t, db, 50)
-	db.spillDir = filepath.Join(t.TempDir(), "missing")
+	db.spill = osSpillHost{dir: filepath.Join(t.TempDir(), "missing")}
 	db.SetWorkMem(64)
 	if _, err := queryOutcome(db, "SELECT id FROM t ORDER BY k, id", nil); err == nil || errCodeOf(err) != "58030" {
 		t.Fatalf("unavailable spill target: got %v, want 58030", err)

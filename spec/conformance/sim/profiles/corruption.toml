@@ -1,0 +1,18 @@
+# Bit rot at rest (simulation-testing.md §6.3 `corrupt`): every session ends, bits flip in durable body
+# pages of the main file, and a fresh process opens it and reads every row. A flip that breaks a page's
+# checksum must surface as XX001 or not at all — never as wrong rows. With `reseal` the checksum is
+# recomputed, so only the decoders' structural checks stand between the flip and the engine: any engine
+# error or any rows is allowed, never a panic. The runner then repairs the bits and reopens. A
+# per-core tier: which pages a core reads at open is its own business.
+
+description = "Bit flips in durable pages, with and without a valid checksum; never wrong rows or panics"
+
+page_sizes = [256, 512]
+
+[weights]
+corrupt = 4
+check = 1
+
+[faults]
+flips = [1, 4]
+reseal = 500

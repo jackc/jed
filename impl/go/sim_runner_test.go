@@ -127,6 +127,16 @@ func simParse(text string) (simTrace, error) {
 		}
 		fields := strings.Fields(line)
 		st := simStep{line: n + 1, kind: fields[0], params: map[string]string{}}
+		params := func(kvs []string) error {
+			for _, kv := range kvs {
+				k, v, ok := strings.Cut(kv, "=")
+				if !ok {
+					return fmt.Errorf("line %d: bad parameter %q", n+1, kv)
+				}
+				st.params[k] = v
+			}
+			return nil
+		}
 		switch st.kind {
 		case "open":
 			if len(fields) != 3 && len(fields) != 4 {
@@ -166,19 +176,32 @@ func simParse(text string) (simTrace, error) {
 				return tr, fmt.Errorf("line %d: %s <kind> [k=v ...]", n+1, st.kind)
 			}
 			st.mode = fields[1]
-			for _, kv := range fields[2:] {
-				k, v, ok := strings.Cut(kv, "=")
-				if !ok {
-					return tr, fmt.Errorf("line %d: bad parameter %q", n+1, kv)
-				}
-				st.params[k] = v
+			if err := params(fields[2:]); err != nil {
+				return tr, err
 			}
 		case "clock":
 			if len(fields) != 2 || !strings.HasPrefix(fields[1], "+") {
 				return tr, fmt.Errorf("line %d: clock +<micros>", n+1)
 			}
 			st.params["delta"] = fields[1][1:]
-		case "check", "reopen", "compact", "tick":
+		case "attach":
+			if len(fields) != 2 || fields[1] == "main" || fields[1] == "temp" {
+				return tr, fmt.Errorf("line %d: attach <name>", n+1)
+			}
+			st.sid = fields[1]
+		case "compact":
+			if len(fields) > 2 {
+				return tr, fmt.Errorf("line %d: compact [<database>]", n+1)
+			}
+			st.sid = "main"
+			if len(fields) == 2 {
+				st.sid = fields[1]
+			}
+		case "corrupt":
+			if err := params(fields[1:]); err != nil {
+				return tr, err
+			}
+		case "check", "reopen", "tick":
 		default:
 			return tr, fmt.Errorf("line %d: unknown step %q", n+1, st.kind)
 		}
@@ -222,6 +245,8 @@ func simFaultOf(st simStep) (*simFault, error) {
 		return &simFault{kind: simReadError, p: st.intParam("p")}, nil
 	case "enospc":
 		return &simFault{kind: simENOSPC}, nil
+	case "spill_error":
+		return &simFault{kind: simSpillError, p: st.intParam("p")}, nil
 	}
 	return nil, fmt.Errorf("line %d: unsupported fault %s %v", st.line, st.mode, st.params)
 }
@@ -323,8 +348,8 @@ func simFNV(s string) uint64 {
 type simSession struct {
 	s     *Session
 	write bool
-	pin   uint64 // the version a read session pinned (§8.1: what it must keep seeing)
-	pid   int    // the process the session lives in
+	pins  map[string]uint64 // the version of each database a read session pinned (§8.1: what it must keep seeing)
+	pid   int               // the process the session lives in
 }
 
 // simProc is one simulated process: a Database over the shared simulated filesystem, and in a
@@ -335,6 +360,38 @@ type simProc struct {
 	host *simLockHost
 }
 
+// simDB is one database's oracle state (simulation-testing.md §8.1–8.3): main, or a file attachment
+// (S4), each with its own versions, history, and durability floor.
+type simDB struct {
+	name         string
+	file         string                     // its file in the simulated filesystem
+	history      map[uint64]map[string]bool // version → digests of every generation attempted at it
+	version      uint64                     // the published version
+	lastDigest   string                     // its digest
+	floor        uint64                     // recovery may never return an older version; 0: the file may vanish
+	maxAttempted uint64                     // ... nor a newer one than was ever attempted
+
+	// Bounded growth (§8.3), tracked over one process lifetime: an upper bound on the live count the
+	// engine's reclamation trigger compares against, and what the previous commit left.
+	high     uint32    // the page high-water now
+	lacBound uint32    // ≥ the engine's live-at-last-reclamation
+	last     simGrowth // the previous commit in this lifetime
+}
+
+// simGrowth is what a commit left behind, for the next commit's bounded-growth check.
+type simGrowth struct {
+	reclaimed bool   // a quiet commit that must have reclaimed: its free list holds every dead page
+	high      uint32 // its page high-water
+	free      uint32 // its free-list length
+}
+
+func (d *simDB) addHistory(v uint64, digest string) {
+	if d.history[v] == nil {
+		d.history[v] = map[string]bool{}
+	}
+	d.history[v][digest] = true
+}
+
 type simRunner struct {
 	tr         simTrace
 	seed       uint64
@@ -343,10 +400,10 @@ type simRunner struct {
 	clock      int64
 
 	// Handle settings from the header (simulation-testing.md §5, slice S3), applied at every open.
-	workMem         int    // a session's work_mem; > 0 also gives the database a spill directory
-	maxQueryMemory  int64  // a trace session's max_query_memory_bytes (the oracles' own reads are unlimited)
-	maxStorageBytes int64  // the database's max_storage_bytes
-	spillDir        string // the real scratch directory spill files go to; their bytes are not durable state
+	workMem         int   // a session's work_mem
+	tempBuffers     int   // a session's temp_buffers: past it, a temp domain spills (temp-tables.md §6)
+	maxQueryMemory  int64 // a trace session's max_query_memory_bytes (the oracles' own reads are unlimited)
+	maxStorageBytes int64 // the database's max_storage_bytes
 
 	fs       *simFS
 	db       *Database // the database of the process running the current step
@@ -362,12 +419,9 @@ type simRunner struct {
 
 	transcript strings.Builder
 
-	// Oracle state (simulation-testing.md §8.1–8.2).
-	history      map[uint64]map[string]bool // version → digests of every generation attempted at it
-	version      uint64                     // the published version
-	lastDigest   string                     // its digest
-	floor        uint64                     // recovery may never return an older version
-	maxAttempted uint64                     // ... nor a newer one than was ever attempted
+	// Oracle state (simulation-testing.md §8.1–8.3), one per database: main first, then each file
+	// attachment (S4) in name order.
+	dbs map[string]*simDB
 
 	violation     string
 	violationStep int
@@ -375,8 +429,9 @@ type simRunner struct {
 	stack         string // the goroutine stack of a panic violation
 
 	lastDigestText string            // the text the most recent digest folded
+	digestErr      error             // why the most recent digest failed
 	diagnostics    map[string]string // artifact name → contents, written on a violation
-	imagePrefix    string            // when set, each recovery's image is written to <prefix>.step<N>.img
+	imagePrefix    string            // when set, each recovery's image is written to <prefix>.step<N>[.<db>].img
 }
 
 func newSimRunner(tr simTrace) *simRunner {
@@ -391,17 +446,10 @@ func newSimRunner(tr simTrace) *simRunner {
 	if sector <= 0 {
 		sector = simSectorDefault
 	}
-	image, err := newSnapshot().ToImage(uint32(ps), 1)
-	if err != nil {
-		panic("an empty image always serializes: " + err.Error())
-	}
 	workMem, _ := strconv.Atoi(tr.header["work_mem"])
+	tempBuffers, _ := strconv.Atoi(tr.header["temp_buffers"])
 	maxQueryMemory, _ := strconv.ParseInt(tr.header["max_query_memory_bytes"], 10, 64)
 	maxStorageBytes, _ := strconv.ParseInt(tr.header["max_storage_bytes"], 10, 64)
-	spillDir := ""
-	if workMem > 0 {
-		spillDir = os.TempDir()
-	}
 	return &simRunner{
 		tr:              tr,
 		seed:            seed,
@@ -409,21 +457,25 @@ func newSimRunner(tr simTrace) *simRunner {
 		cacheBytes:      cache,
 		clock:           clock,
 		workMem:         workMem,
+		tempBuffers:     tempBuffers,
 		maxQueryMemory:  maxQueryMemory,
 		maxStorageBytes: maxStorageBytes,
-		spillDir:        spillDir,
-		fs:              newSimFS(seed, sector, image),
+		fs:              newSimFS(seed, sector, uint32(ps)),
 		sessions:        map[string]*simSession{},
 		shared:          tr.header["processes"] == "shared",
 		procs:           map[int]*simProc{},
-		history:         map[uint64]map[string]bool{},
+		dbs:             map[string]*simDB{},
 		violationStep:   -1,
 	}
 }
 
 func (r *simRunner) fail(step int, format string, args ...any) {
 	if r.violation == "" {
-		r.violation = fmt.Sprintf("step %d (line %d): ", step, r.tr.steps[step].line) + fmt.Sprintf(format, args...)
+		where := "setup: "
+		if step >= 0 {
+			where = fmt.Sprintf("step %d (line %d): ", step, r.tr.steps[step].line)
+		}
+		r.violation = where + fmt.Sprintf(format, args...)
 		r.violationStep = step
 	}
 }
@@ -433,9 +485,57 @@ func (r *simRunner) emit(format string, args ...any) {
 	r.transcript.WriteByte('\n')
 }
 
+// main is the main database's oracle state.
+func (r *simRunner) main() *simDB { return r.dbs["main"] }
+
+// attachedNames lists the attachments the runner tracks, in name order.
+func (r *simRunner) attachedNames() []string {
+	var names []string
+	for name := range r.dbs {
+		if name != "main" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// order lists every tracked database: main, then the attachments in name order.
+func (r *simRunner) order() []*simDB {
+	out := []*simDB{r.main()}
+	for _, name := range r.attachedNames() {
+		out = append(out, r.dbs[name])
+	}
+	return out
+}
+
+func newSimDB(name, file string) *simDB {
+	return &simDB{name: name, file: file, history: map[uint64]map[string]bool{}}
+}
+
 // open opens a Database over the simulated disk through the ordinary demand-paged loader — the
-// path a reopening process takes, including validated-COW recovery (validated-cow.md §1).
-func (r *simRunner) open() error { return r.openProc(0) }
+// path a reopening process takes, including validated-COW recovery (validated-cow.md §1) — and
+// re-attaches every tracked attachment whose file exists.
+func (r *simRunner) open() error {
+	if err := r.openProc(0); err != nil {
+		return err
+	}
+	for _, name := range r.attachedNames() {
+		d := r.dbs[name]
+		if r.fs.files[d.file] == nil {
+			continue // the caller decides whether losing it was allowed
+		}
+		if err := r.attach(name); err != nil {
+			return fmt.Errorf("re-attach %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// attach attaches the existing file of attachment name read-write to the current process.
+func (r *simRunner) attach(name string) error {
+	return r.db.Attach(name, AttachFileWithOptions(r.dbs[name].file, AttachFileOptions{Locking: LockingNone}), false)
+}
 
 // openProc starts process pid. A shared trace acquires the file coordinator through the simulated
 // lock host first, exactly as OpenDatabaseWithOptions does through the OS host.
@@ -505,12 +605,12 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 		return nil, err
 	}
 	e.path = simDiskPath
-	e.spillDir = r.spillDir
+	e.spill = r.fs.spillHost() // spill and temp-table spill scratch files, whose operations can fail
 	if coord != nil {
 		coord.unlockCommit()
 	}
 	db := databaseOver(sharedCoreFromEngineCoordinated(e, coord))
-	db.core.storage.files = r.fs // compaction's temp file, rename, and directory barrier
+	db.core.storage.files = r.fs // create, compaction, and attachments go through the simulated filesystem
 	if r.maxStorageBytes > 0 {
 		if err := db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
 			return nil, err
@@ -520,19 +620,30 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 }
 
 func (r *simRunner) run() {
+	// Create the database through the simulated filesystem, as the host's create does: a temp file,
+	// its sync, the rename, and the directory barrier (S4).
+	e, err := createVia(r.fs, simDiskPath, databaseOptions{PageSize: r.pageSize})
+	if err != nil {
+		r.violation = "create: " + err.Error()
+		return
+	}
+	_ = e.Close()
+	m := newSimDB("main", simDiskPath)
+	r.dbs["main"] = m
 	if err := r.open(); err != nil {
 		r.violation = "initial open: " + err.Error()
 		return
 	}
-	r.version = r.db.Version()
-	r.floor, r.maxAttempted = r.version, r.version
-	d, ok := r.committedDigest()
+	m.version = r.db.Version()
+	m.floor, m.maxAttempted = m.version, m.version
+	d, ok := r.committedDigest(m)
 	if !ok {
 		r.violation = "initial digest failed"
 		return
 	}
-	r.lastDigest = d
-	r.addHistory(r.version, d)
+	m.lastDigest = d
+	m.addHistory(m.version, d)
+	r.observeGrowth(m)
 	for i := range r.tr.steps {
 		if !r.step(i) || r.violation != "" {
 			return
@@ -540,20 +651,15 @@ func (r *simRunner) run() {
 	}
 }
 
-// mainImage copies the database file's cache — what a new process would open — or nil if it is gone.
-func (r *simRunner) mainImage() []byte {
-	if main := r.fs.main(); main != nil {
-		return append([]byte(nil), main.cache...)
+// image copies a database file's cache — what a new process would open — or nil if it is gone.
+func (r *simRunner) image(d *simDB) []byte {
+	if f := r.fs.files[d.file]; f != nil {
+		return append([]byte(nil), f.cache...)
 	}
 	return nil
 }
 
-func (r *simRunner) addHistory(v uint64, d string) {
-	if r.history[v] == nil {
-		r.history[v] = map[string]bool{}
-	}
-	r.history[v][d] = true
-}
+func (r *simRunner) mainImage() []byte { return r.image(r.main()) }
 
 // step runs one trace step; false stops the run. A panic anywhere is a violation.
 func (r *simRunner) step(i int) (cont bool) {
@@ -615,6 +721,9 @@ func (r *simRunner) step(i int) (cont bool) {
 		}
 		r.emit(`{"i":%d,"op":"kill","pid":%d}`, i, st.pid)
 		return true
+	case "corrupt":
+		r.fs.beginStep(uint64(i), nil)
+		return r.stepCorrupt(i, st)
 	}
 
 	// A step that needs a process when none is running (the last one exited) restarts p0 first.
@@ -630,7 +739,10 @@ func (r *simRunner) step(i int) (cont bool) {
 	}
 	armed := r.armed
 	r.armed = nil
-	startVersion := r.version
+	start := map[string]uint64{}
+	for name, d := range r.dbs {
+		start[name] = d.version
+	}
 	if pid, ok := r.stepPid(st); ok {
 		if st.kind != "spawn" && !r.selectProc(pid) {
 			if st.kind == "open" {
@@ -658,7 +770,9 @@ func (r *simRunner) step(i int) (cont bool) {
 	case "check":
 		r.stepCheck(i)
 	case "compact":
-		r.stepCompact(i)
+		r.stepCompact(i, st.sid)
+	case "attach":
+		r.stepAttach(i, st.sid)
 	case "reopen":
 		if !r.stepReopen(i) {
 			return false
@@ -667,10 +781,12 @@ func (r *simRunner) step(i int) (cont bool) {
 	if r.violation != "" {
 		return false
 	}
-	// A completed barrier made every earlier write durable: the generation published when the step
-	// began can no longer be lost (§8.2).
-	if r.fs.barrierOK && startVersion > r.floor {
-		r.floor = startVersion
+	// A completed barrier made every earlier write durable: the generation a database published when
+	// the step began can no longer be lost (§8.2).
+	for name, d := range r.dbs {
+		if f := r.fs.files[d.file]; f != nil && f.barrierOK && start[name] > d.floor {
+			d.floor = start[name]
+		}
 	}
 	if armed == nil {
 		return true
@@ -694,6 +810,42 @@ func (r *simRunner) step(i int) (cont bool) {
 		return true
 	}
 	return r.recover(i, fired)
+}
+
+// dbVersion is the version of database d the current process has published.
+func (r *simRunner) dbVersion(d *simDB) uint64 {
+	if d.name == "main" {
+		return r.db.Version()
+	}
+	if snap := r.db.core.roots.Load().attached[d.name]; snap != nil {
+		return snap.txid
+	}
+	return 0
+}
+
+// versionsJSON renders the attachments' versions as `,"dbs":{"a1":V,...}`, or "" with none, so a
+// trace without attachments keeps its transcript shape.
+func (r *simRunner) versionsJSON(versions map[string]uint64) string {
+	names := r.attachedNames()
+	if len(names) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(`,"dbs":{`)
+	n := 0
+	for _, name := range names {
+		v, ok := versions[name]
+		if !ok {
+			continue
+		}
+		if n > 0 {
+			b.WriteByte(',')
+		}
+		n++
+		fmt.Fprintf(&b, "%q:%d", name, v)
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 func (r *simRunner) stepOpen(i int, st simStep) {
@@ -722,17 +874,27 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 	if r.workMem > 0 {
 		s.SetWorkMem(r.workMem)
 	}
+	if r.tempBuffers > 0 {
+		s.SetTempBuffers(r.tempBuffers)
+	}
 	if r.maxQueryMemory > 0 {
 		s.SetMaxQueryMemoryBytes(r.maxQueryMemory)
 	}
 	if r.shared {
-		d, ok := r.digest(s)
+		d, ok := r.digest(s, r.main())
 		if !r.observe(i, "session "+st.sid, s.Version(), d, ok) {
 			return
 		}
 	}
-	r.sessions[st.sid] = &simSession{s: s, write: st.mode == "write", pin: s.Version(), pid: r.cur}
-	r.emit(`{"i":%d,"op":"open","sid":%q,"version":%d}`, i, st.sid, s.Version())
+	// A session pins every database's committed root when it opens.
+	pins := map[string]uint64{"main": s.Version()}
+	for _, name := range r.attachedNames() {
+		if v := r.dbVersion(r.dbs[name]); v != 0 {
+			pins[name] = v
+		}
+	}
+	r.sessions[st.sid] = &simSession{s: s, write: st.mode == "write", pins: pins, pid: r.cur}
+	r.emit(`{"i":%d,"op":"open","sid":%q,"version":%d%s}`, i, st.sid, s.Version(), r.versionsJSON(pins))
 }
 
 func simCode(err error) string {
@@ -799,9 +961,30 @@ func simQuery(s *Session, sql string) (n int, affected int64, hash uint64, cost 
 // simDigestRelations is the catalog part of the logical digest (§8.1).
 var simDigestRelations = []string{"jed_tables", "jed_columns", "jed_indexes", "jed_constraints", "jed_sequences"}
 
-// digest is the logical digest of what s sees: the catalog relations plus every table's rows, all
-// rendered and sorted, folded with FNV-1a. ok is false if any query failed (an aborted block).
-func (r *simRunner) digest(s *Session) (string, bool) {
+// simQualifier is the prefix that names database d's relations: none for main, `name.` for an
+// attachment.
+func simQualifier(d *simDB) string {
+	if d.name == "main" {
+		return ""
+	}
+	return d.name + "."
+}
+
+// simEmptyDigest is the digest of a freshly created database (an attachment's version 1): every
+// catalog relation empty and no table.
+func simEmptyDigest(d *simDB) string {
+	var b strings.Builder
+	for _, rel := range simDigestRelations {
+		b.WriteString("SELECT * FROM " + simQualifier(d) + rel + "\n\n\n")
+	}
+	return fmt.Sprintf("%016x", simFNV(b.String()))
+}
+
+// digest is the logical digest of what s sees of database d: the catalog relations plus every
+// table's rows, all rendered and sorted, folded with FNV-1a. ok is false if any query failed (an
+// aborted block, say); r.digestErr then holds that error.
+func (r *simRunner) digest(s *Session, d *simDB) (string, bool) {
+	r.digestErr = nil
 	// An armed read fault targets the trace's statements, not the oracle checking them.
 	r.fs.oracle = true
 	defer func() { r.fs.oracle = false }()
@@ -810,12 +993,14 @@ func (r *simRunner) digest(s *Session) (string, bool) {
 		s.SetMaxQueryMemoryBytes(0)
 		defer s.SetMaxQueryMemoryBytes(limit)
 	}
+	q := simQualifier(d)
 	var b strings.Builder
 	var tables []string
 	r.lastDigestText = ""
 	fold := func(sql string) bool {
 		rows, err := s.Query(context.Background(), sql)
 		if err != nil {
+			r.digestErr = err
 			r.lastDigestText = b.String() + sql + "\nERROR: " + err.Error() + "\n"
 			return false
 		}
@@ -826,16 +1011,18 @@ func (r *simRunner) digest(s *Session) (string, bool) {
 			for _, v := range rows.Row() {
 				text, err := s.Render(v)
 				if err != nil {
+					r.digestErr = err
 					return false
 				}
 				cells = append(cells, text)
 			}
-			if sql == "SELECT * FROM jed_tables" {
+			if strings.HasSuffix(sql, "jed_tables") {
 				tables = append(tables, cells[0])
 			}
 			rendered = append(rendered, strings.Join(cells, "\x1f"))
 		}
 		if err := rows.Err(); err != nil {
+			r.digestErr = err
 			r.lastDigestText = b.String() + sql + "\nERROR: " + err.Error() + "\n"
 			return false
 		}
@@ -847,13 +1034,13 @@ func (r *simRunner) digest(s *Session) (string, bool) {
 		return true
 	}
 	for _, rel := range simDigestRelations {
-		if !fold("SELECT * FROM " + rel) {
+		if !fold("SELECT * FROM " + q + rel) {
 			return "", false
 		}
 	}
 	sort.Strings(tables)
 	for _, t := range tables {
-		if !fold(`SELECT * FROM "` + t + `"`) {
+		if !fold(`SELECT * FROM ` + q + `"` + t + `"`) {
 			return "", false
 		}
 	}
@@ -868,18 +1055,25 @@ func (r *simRunner) checkLive() error {
 	return simCheckLive(r.db)
 }
 
-// committedView is the version and digest a fresh read session sees.
-func (r *simRunner) committedView() (uint64, string, bool) {
+// committedView is the version and digest of database d a fresh read session sees.
+func (r *simRunner) committedView(d *simDB) (uint64, string, bool) {
 	rs := r.db.ReadSession()
 	defer rs.Close()
-	d, ok := r.digest(rs)
-	return rs.Version(), d, ok
+	digest, ok := r.digest(rs, d)
+	return r.dbVersion(d), digest, ok
 }
 
-func (r *simRunner) committedDigest() (string, bool) {
+func (r *simRunner) committedDigest(d *simDB) (string, bool) {
 	rs := r.db.ReadSession()
 	defer rs.Close()
-	return r.digest(rs)
+	return r.digest(rs, d)
+}
+
+// quiet reports whether the commit being checked ran with nothing that may hold reclamation back: no
+// other session (a reader pins its snapshot), no other process (co-resident commits are append-only),
+// and no fault.
+func (r *simRunner) quiet() bool {
+	return !r.shared && len(r.sessions) == 0 && r.fs.fault == nil
 }
 
 func (r *simRunner) stepCommit(i int, st simStep) {
@@ -889,11 +1083,20 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 		return
 	}
 	delete(r.sessions, st.sid)
-	base := r.version
-	inflight, digestOK := r.digest(ss.s)
-	inflightText := r.lastDigestText
+	dbs := r.order()
+	type inflight struct {
+		digest, text string
+		ok           bool
+	}
+	before := make([]inflight, len(dbs))
+	for k, d := range dbs {
+		if _, pinned := ss.pins[d.name]; !pinned {
+			continue // attached after this session opened: it cannot have written it
+		}
+		dg, okd := r.digest(ss.s, d)
+		before[k] = inflight{dg, r.lastDigestText, okd}
+	}
 	err := ss.s.Commit()
-	now := r.db.Version()
 	if err != nil {
 		code := simCode(err)
 		if strings.HasPrefix(code, "non-engine") {
@@ -905,45 +1108,138 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			r.fail(i, "corruption: commit reported XX001: %v", err)
 			return
 		}
-		if now != base {
-			r.fail(i, "a failed commit published version %d (was %d)", now, base)
-			return
-		}
-		// The commit reached storage, so a crash may still recover its generation (§8.1).
-		if digestOK && r.fs.writes > 0 {
-			r.addHistory(base+1, inflight)
-			r.maxAttempted = max(r.maxAttempted, base+1)
+		for k, d := range dbs {
+			if now := r.dbVersion(d); now != d.version {
+				r.fail(i, "a failed commit published version %d of %s (was %d)", now, d.name, d.version)
+				return
+			}
+			// The commit reached storage, so a crash may still recover its generation (§8.1).
+			if f := r.fs.files[d.file]; f != nil && f.writes > 0 && before[k].ok {
+				d.addHistory(d.version+1, before[k].digest)
+				d.maxAttempted = max(d.maxAttempted, d.version+1)
+			}
 		}
 		return
 	}
-	r.emit(`{"i":%d,"op":"commit","sid":%q,"version":%d}`, i, st.sid, now)
-	switch now {
-	case base:
-		if digestOK && inflight != r.lastDigest {
-			r.fail(i, "commit succeeded without publishing the transaction's changes")
-		}
-	case base + 1:
-		if !digestOK {
-			r.fail(i, "commit published version %d from a transaction whose reads failed", now)
-			return
-		}
-		published, ok := r.committedDigest()
-		if !ok || published != inflight {
-			r.diagnostics = map[string]string{"before-commit.txt": inflightText, "after-commit.txt": r.lastDigestText}
-			r.fail(i, "version %d does not contain what its transaction saw before commit", now)
-			return
-		}
-		if err := r.checkLive(); err != nil {
-			r.fail(i, "after commit: %v", err)
-			return
-		}
-		r.addHistory(now, inflight)
-		r.version, r.lastDigest = now, inflight
-		r.maxAttempted = max(r.maxAttempted, now)
-		r.floor = now // acknowledged under synchronous = on (§8.2)
-	default:
-		r.fail(i, "commit jumped from version %d to %d", base, now)
+	versions := map[string]uint64{}
+	for _, d := range dbs {
+		versions[d.name] = r.dbVersion(d)
 	}
+	r.emit(`{"i":%d,"op":"commit","sid":%q,"version":%d%s}`, i, st.sid, versions["main"], r.versionsJSON(versions))
+	quiet := r.quiet()
+	for k, d := range dbs {
+		base, now, in := d.version, versions[d.name], before[k]
+		switch now {
+		case base:
+			if in.ok && in.digest != d.lastDigest {
+				r.fail(i, "commit succeeded without publishing the transaction's changes to %s", d.name)
+				return
+			}
+		case base + 1:
+			if !in.ok {
+				r.fail(i, "commit published version %d of %s from a transaction whose reads failed", now, d.name)
+				return
+			}
+			published, ok := r.committedDigest(d)
+			if !ok || published != in.digest {
+				r.diagnostics = map[string]string{"before-commit.txt": in.text, "after-commit.txt": r.lastDigestText}
+				r.fail(i, "version %d of %s does not contain what its transaction saw before commit", now, d.name)
+				return
+			}
+			d.addHistory(now, in.digest)
+			d.version, d.lastDigest = now, in.digest
+			d.maxAttempted = max(d.maxAttempted, now)
+			d.floor = now // acknowledged under synchronous = on (§8.2)
+			r.checkGrowth(i, d, quiet)
+			if r.violation != "" {
+				return
+			}
+		default:
+			r.fail(i, "commit jumped %s from version %d to %d", d.name, base, now)
+			return
+		}
+	}
+	if err := r.checkLive(); err != nil {
+		r.fail(i, "after commit: %v", err)
+	}
+}
+
+// --- bounded growth (simulation-testing.md §8.3) ------------------------------------------------
+
+// simMetaOf reads the page high-water and live page count of the meta slot holding version v.
+func simMetaOf(image []byte, ps uint32, v uint64) (pageCount, live uint32, ok bool) {
+	for slot := 0; slot < 2; slot++ {
+		if m, valid := readMeta(image, int(ps), slot); valid && m.txid == v {
+			return m.pageCount, m.livePages, true
+		}
+	}
+	return 0, 0, false
+}
+
+// simAllocator is database d's page high-water and free-list length in the running process — the
+// allocator state the next commit draws from.
+func (r *simRunner) simAllocator(d *simDB) (pageCount, free uint32) {
+	st, err := r.db.core.withStorage(d.name)
+	if err != nil {
+		return 0, 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.pageCount, uint32(len(st.freePages))
+}
+
+// observeGrowth starts a new bounded-growth lifetime for d (an open, a recovery, a compaction, an
+// attach). The engine seeds its reclamation trigger with the page count minus the free list
+// (format.md *Reclamation*), so a file whose dead pages are not all listed is reclaimed only after it
+// doubles.
+func (r *simRunner) observeGrowth(d *simDB) {
+	pc, free := r.simAllocator(d)
+	d.high, d.lacBound = pc, pc-free
+	d.last = simGrowth{}
+}
+
+// checkGrowth checks the reader-aware bounded-growth invariant after a commit published a new
+// version of d (simulation-testing.md §8.3). With no reader pinned, no other process, and no fault,
+// the engine reclaims in the commit once the high-water passes compact_growth × the live count at
+// its last reclamation (memory.md §8.4); readers legitimately hold reclamation back, so a commit
+// with one open is not checked. Two checks follow:
+//   - a quiet commit that began past max(compact_min_pages, compact_growth × an upper bound on that
+//     live count) must have reclaimed: every page below the high-water is meta, live, free, or
+//     written by the commit itself (its manifest and free-list pages);
+//   - the next quiet commit reuses that free list before it grows the file.
+func (r *simRunner) checkGrowth(i int, d *simDB, quiet bool) {
+	if r.shared {
+		return
+	}
+	pc, live, ok := simMetaOf(r.image(d), r.pageSize, d.version)
+	if !ok {
+		return
+	}
+	_, free := r.simAllocator(d)
+	var written uint32
+	for pg := range r.fs.files[d.file].pages {
+		if pg >= 2 {
+			written++
+		}
+	}
+	before := d.last
+	if quiet && before.reclaimed && pc > before.high && pc-before.high > written-min(written, before.free) {
+		r.fail(i, "bounded growth: %s grew from %d to %d pages writing %d, with %d free pages to reuse",
+			d.name, before.high, pc, written, before.free)
+		return
+	}
+	reclaimed := false
+	if quiet && d.high > max(compactMinPages, uint32(compactGrowth)*d.lacBound) {
+		reclaimed = true
+		if leaked := pc - 2 - live - free; pc < 2+live+free || leaked > written {
+			r.fail(i, "bounded growth: %s has %d pages, %d live and %d free, after a commit that wrote %d "+
+				"must have reclaimed every dead page", d.name, pc, live, free, written)
+			return
+		}
+	}
+	d.high = pc
+	d.lacBound = max(d.lacBound, live+written)
+	d.last = simGrowth{reclaimed: reclaimed, high: pc, free: free}
 }
 
 func (r *simRunner) stepEnd(i int, st simStep) {
@@ -959,11 +1255,18 @@ func (r *simRunner) stepEnd(i int, st simStep) {
 			return
 		}
 	} else {
-		// Snapshot isolation: a reader still sees exactly the version it pinned, however many
-		// commits, reclamations, and page reuses happened since.
+		// Snapshot isolation: a reader still sees exactly the version of every database it pinned,
+		// however many commits, reclamations, and page reuses happened since.
 		if !ss.write {
-			if d, ok := r.digest(ss.s); !ok || !r.history[ss.pin][d] {
-				r.fail(i, "isolation: reader %s no longer sees version %d", st.sid, ss.pin)
+			for _, d := range r.order() {
+				pin, pinned := ss.pins[d.name]
+				if !pinned {
+					continue
+				}
+				if dg, ok := r.digest(ss.s, d); !ok || !d.history[pin][dg] {
+					r.fail(i, "isolation: reader %s no longer sees version %d of %s", st.sid, pin, d.name)
+					break
+				}
 			}
 		}
 		ss.s.Close()
@@ -971,75 +1274,157 @@ func (r *simRunner) stepEnd(i int, st simStep) {
 	r.emit(`{"i":%d,"op":%q,"sid":%q}`, i, st.kind, st.sid)
 }
 
-// stepCompact runs host compaction (api.md §2.6): the committed snapshot rewritten as a fresh image
-// at the next version, through the simulated filesystem's temp file, rename, and directory barrier.
-// Its contents are unchanged, so a crash may recover either version with the same digest.
-func (r *simRunner) stepCompact(i int) {
-	base := r.version
-	r.addHistory(base+1, r.lastDigest)
-	r.maxAttempted = max(r.maxAttempted, base+1)
-	err := r.db.Compact("main")
-	now := r.db.Version()
+// stepCompact runs host compaction (api.md §2.6) of database name: the committed snapshot rewritten
+// as a fresh image at the next version, through the simulated filesystem's temp file, rename, and
+// directory barrier. Its contents are unchanged, so a crash may recover either version with the
+// same digest.
+func (r *simRunner) stepCompact(i int, name string) {
+	d := r.dbs[name]
+	if d == nil || r.dbVersion(d) == 0 {
+		r.emit(`{"i":%d,"op":"compact","db":%q,"skip":true}`, i, name)
+		return
+	}
+	base := d.version
+	d.addHistory(base+1, d.lastDigest)
+	d.maxAttempted = max(d.maxAttempted, base+1)
+	err := r.db.Compact(name)
+	now := r.dbVersion(d)
+	dbField := ""
+	if name != "main" {
+		dbField = fmt.Sprintf(`,"db":%q`, name)
+	}
 	if err != nil {
 		code := simCode(err)
 		if strings.HasPrefix(code, "non-engine") {
 			r.fail(i, "%s", code)
 			return
 		}
-		r.emit(`{"i":%d,"op":"compact","error":%q}`, i, code)
+		r.emit(`{"i":%d,"op":"compact"%s,"error":%q}`, i, dbField, code)
 		switch {
 		case code == "XX001":
 			r.fail(i, "corruption: compaction reported XX001: %v", err)
 		case now != base:
-			r.fail(i, "a failed compaction published version %d (was %d)", now, base)
+			r.fail(i, "a failed compaction published version %d of %s (was %d)", now, name, base)
 		}
 		return
 	}
-	r.emit(`{"i":%d,"op":"compact","version":%d}`, i, now)
+	r.emit(`{"i":%d,"op":"compact"%s,"version":%d}`, i, dbField, now)
 	if now != base+1 {
-		r.fail(i, "compaction moved version %d to %d", base, now)
+		r.fail(i, "compaction moved %s from version %d to %d", name, base, now)
 		return
 	}
-	if d, ok := r.committedDigest(); !ok || d != r.lastDigest {
-		r.fail(i, "compaction changed the database's contents")
+	if dg, ok := r.committedDigest(d); !ok || dg != d.lastDigest {
+		r.fail(i, "compaction changed the contents of %s", name)
 		return
 	}
 	if err := r.checkLive(); err != nil {
 		r.fail(i, "after compaction: %v", err)
 		return
 	}
-	r.version = now
-	r.floor = now // the rename and the directory barrier completed
+	d.version = now
+	d.floor = now // the rename and the directory barrier completed
+	r.observeGrowth(d)
+}
+
+// stepAttach attaches file database name to the running process (S4), first creating its file
+// through the simulated filesystem if it does not exist — create's temp file, sync, rename, and
+// directory barrier, any of which a fault may interrupt. Already attached, it only reports.
+func (r *simRunner) stepAttach(i int, name string) {
+	if r.shared {
+		r.fail(i, "attach is single-process only")
+		return
+	}
+	d := r.dbs[name]
+	if d != nil && r.dbVersion(d) != 0 {
+		r.emit(`{"i":%d,"op":"attach","db":%q,"version":%d}`, i, name, d.version)
+		return
+	}
+	if d == nil {
+		d = newSimDB(name, name+".jed")
+		r.dbs[name] = d
+	}
+	if r.fs.files[d.file] == nil {
+		// A fresh file is version 1, empty. Until create returns it may vanish in a crash (floor 0).
+		d.history = map[uint64]map[string]bool{}
+		d.addHistory(1, simEmptyDigest(d))
+		d.version, d.lastDigest, d.floor, d.maxAttempted = 1, simEmptyDigest(d), 0, 1
+		e, err := createVia(r.fs, d.file, databaseOptions{PageSize: r.pageSize})
+		if err != nil {
+			r.attachFailed(i, name, err)
+			return
+		}
+		_ = e.Close()
+		d.floor = 1 // create returned: the file and its directory entry are durable
+	}
+	if err := r.attach(name); err != nil {
+		r.attachFailed(i, name, err)
+		return
+	}
+	v := r.dbVersion(d)
+	dg, ok := r.committedDigest(d)
+	if !r.checkRecovered(i, d, v, dg, ok, "attached") {
+		return
+	}
+	r.observeGrowth(d)
+	r.emit(`{"i":%d,"op":"attach","db":%q,"version":%d}`, i, name, v)
+}
+
+func (r *simRunner) attachFailed(i int, name string, err error) {
+	code := simCode(err)
+	if strings.HasPrefix(code, "non-engine") || code == "XX001" {
+		r.fail(i, "attach %s: %v", name, err)
+		return
+	}
+	r.emit(`{"i":%d,"op":"attach","db":%q,"error":%q}`, i, name, code)
+}
+
+// dbsJSON renders the attachments' check/recovery state as `,"dbs":{"a1":{...},...}`, or "" with
+// none.
+func simDbsJSON(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	return `,"dbs":{` + strings.Join(entries, ",") + `}`
 }
 
 func (r *simRunner) stepCheck(i int) {
-	v, d, ok := r.committedView()
-	switch {
-	case r.shared:
-		// Another process may have died leaving a newer complete generation this one now adopts.
-		if !r.observe(i, "check", v, d, ok) {
+	var entries []string
+	var mainLine string
+	for _, d := range r.order() {
+		v, dg, ok := r.committedView(d)
+		switch {
+		case r.shared && d.name == "main":
+			// Another process may have died leaving a newer complete generation this one now adopts.
+			if !r.observe(i, "check", v, dg, ok) {
+				return
+			}
+		case !ok || v != d.version || dg != d.lastDigest:
+			r.fail(i, "a read session does not see the last committed version of %s", d.name)
 			return
 		}
-	case !ok || v != r.version || d != r.lastDigest:
-		r.fail(i, "a read session does not see the last committed version's contents")
-		return
+		image := r.image(d)
+		live, pages, free, err := simIntegrity(image, d.version)
+		if err != nil {
+			r.fail(i, "integrity of %s: %v", d.name, err)
+			return
+		}
+		body := fmt.Sprintf(`"version":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"`,
+			d.version, dg, live, pages, free, simImageHash(image, pages, r.pageSize))
+		if d.name == "main" {
+			mainLine = body
+		} else {
+			entries = append(entries, fmt.Sprintf(`%q:{%s}`, d.name, body))
+		}
 	}
 	if err := r.checkLive(); err != nil {
 		r.fail(i, "live integrity: %v", err)
 		return
 	}
-	image := r.mainImage()
-	live, pages, free, err := simIntegrity(image, r.version)
-	if err != nil {
-		r.fail(i, "integrity: %v", err)
-		return
-	}
-	r.emit(`{"i":%d,"op":"check","version":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"}`,
-		i, r.version, d, live, pages, free, simImageHash(image, pages, r.pageSize))
+	r.emit(`{"i":%d,"op":"check",%s%s}`, i, mainLine, simDbsJSON(entries))
 }
 
 // stepReopen ends every session cleanly, closes the Database, and reopens it: the result must be
-// exactly the last committed version.
+// exactly the last committed version of every database.
 func (r *simRunner) stepReopen(i int) bool {
 	for _, pid := range r.livePids() {
 		if err := r.closeProc(pid); err != nil {
@@ -1052,66 +1437,189 @@ func (r *simRunner) stepReopen(i int) bool {
 		r.fail(i, "reopen failed: %v", err)
 		return false
 	}
-	v := r.db.Version()
-	d, ok := r.committedDigest()
-	if r.shared {
-		// A process killed mid-commit may have left a complete generation no survivor began on yet.
-		if !r.observe(i, "reopened p0", v, d, ok) {
+	var entries []string
+	var mainV uint64
+	var mainD string
+	for _, d := range r.order() {
+		if r.dbVersion(d) == 0 {
+			r.fail(i, "a clean reopen lost attachment %s", d.name)
 			return false
 		}
-	} else if v != r.version || !ok || d != r.lastDigest {
-		r.fail(i, "a clean reopen returned version %d (digest %s), want version %d (digest %s)", v, d, r.version, r.lastDigest)
+		v := r.dbVersion(d)
+		dg, ok := r.committedDigest(d)
+		if r.shared && d.name == "main" {
+			// A process killed mid-commit may have left a complete generation no survivor began on yet.
+			if !r.observe(i, "reopened p0", v, dg, ok) {
+				return false
+			}
+		} else if v != d.version || !ok || dg != d.lastDigest {
+			r.fail(i, "a clean reopen returned version %d of %s (digest %s), want version %d (digest %s)", v, d.name, dg, d.version, d.lastDigest)
+			return false
+		}
+		r.observeGrowth(d)
+		if d.name == "main" {
+			mainV, mainD = v, dg
+		} else {
+			entries = append(entries, fmt.Sprintf(`%q:{"version":%d,"digest":%q}`, d.name, v, dg))
+		}
+	}
+	r.emit(`{"i":%d,"op":"reopen","version":%d,"digest":%q%s}`, i, mainV, mainD, simDbsJSON(entries))
+	return true
+}
+
+// checkRecovered checks a database's version and contents after a recovery or an attach against
+// its history and durability floor (§8.1–8.2).
+func (r *simRunner) checkRecovered(i int, d *simDB, v uint64, dg string, ok bool, what string) bool {
+	switch {
+	case !ok:
+		r.fail(i, "%s: version %d of %s is unreadable: %v", what, v, d.name, r.digestErr)
+	case v < d.floor:
+		r.fail(i, "durability: %s version %d of %s, but version %d was durable", what, v, d.name, d.floor)
+	case v > d.maxAttempted:
+		r.fail(i, "%s: version %d of %s was never attempted (latest attempted %d)", what, v, d.name, d.maxAttempted)
+	case !d.history[v][dg]:
+		r.fail(i, "%s: version %d of %s has contents (digest %s) no transaction produced", what, v, d.name, dg)
+	}
+	if r.violation != "" {
 		return false
 	}
-	r.emit(`{"i":%d,"op":"reopen","version":%d,"digest":%q}`, i, v, d)
+	d.version, d.lastDigest = v, dg
 	return true
 }
 
 // recover abandons the crashed process — its sessions and Database — and opens the disk as a new
-// process would, then checks the recovered generation against the history and the durability
-// floor (§8.1–8.2) and the image against the integrity checker (§8.3).
+// process would, then checks every database's recovered generation against its history and
+// durability floor (§8.1–8.2) and its image against the integrity checker (§8.3).
 func (r *simRunner) recover(i int, fired string) bool {
 	for _, pid := range r.livePids() {
 		r.dropProc(pid)
 	}
 	r.fs.processDeath()
-	image := r.mainImage()
-	if r.imagePrefix != "" {
-		_ = os.WriteFile(fmt.Sprintf("%s.step%d.img", r.imagePrefix, i), image, 0o644)
+	images := map[string][]byte{}
+	for _, d := range r.order() {
+		images[d.name] = r.image(d)
+		if d.name != "main" && images[d.name] == nil {
+			// A crash during the attachment's create: allowed only while create had not returned.
+			if d.floor > 0 {
+				r.fail(i, "durability: attachment %s's file is gone, but version %d was durable", d.name, d.floor)
+				return false
+			}
+			delete(r.dbs, d.name)
+			continue
+		}
+		if r.imagePrefix != "" {
+			suffix := ""
+			if d.name != "main" {
+				suffix = "." + d.name
+			}
+			_ = os.WriteFile(fmt.Sprintf("%s.step%d%s.img", r.imagePrefix, i, suffix), images[d.name], 0o644)
+		}
 	}
 	if err := r.open(); err != nil {
-		r.crashImage = image
+		r.crashImage = images["main"]
 		r.fail(i, "recovery: open failed: %v", err)
 		return false
 	}
-	v := r.db.Version()
-	d, ok := r.committedDigest()
-	switch {
-	case !ok:
-		r.crashImage = image
-		r.fail(i, "recovery: version %d is unreadable", v)
-	case v < r.floor:
-		r.crashImage = image
-		r.fail(i, "durability: recovered version %d, but version %d was durable", v, r.floor)
-	case v > r.maxAttempted:
-		r.crashImage = image
-		r.fail(i, "recovery: version %d was never attempted (latest attempted %d)", v, r.maxAttempted)
-	case !r.history[v][d]:
-		r.crashImage = image
-		r.fail(i, "recovery: version %d has contents (digest %s) no transaction produced", v, d)
+	var entries []string
+	var mainLine string
+	for _, d := range r.order() {
+		v := r.dbVersion(d)
+		dg, ok := r.committedDigest(d)
+		if !r.checkRecovered(i, d, v, dg, ok, "recovered") {
+			r.crashImage = images[d.name]
+			return false
+		}
+		live, pages, free, err := simIntegrity(images[d.name], v)
+		if err != nil {
+			r.crashImage = images[d.name]
+			r.fail(i, "recovery integrity of %s: %v", d.name, err)
+			return false
+		}
+		r.observeGrowth(d)
+		body := fmt.Sprintf(`"recovered":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"`,
+			v, dg, live, pages, free, simImageHash(images[d.name], pages, r.pageSize))
+		if d.name == "main" {
+			mainLine = body
+		} else {
+			entries = append(entries, fmt.Sprintf(`%q:{%s}`, d.name, body))
+		}
 	}
-	if r.violation != "" {
+	r.emit(`{"i":%d,"op":"crash","fired":%q,%s%s}`, i, fired, mainLine, simDbsJSON(entries))
+	return true
+}
+
+// stepCorrupt is `corrupt flips=N [reseal=1]` (simulation-testing.md §6.3): every process ends
+// cleanly; bits flip in durable body pages of the main database; a new process opens it and reads
+// everything; then the bits are repaired and the database must reopen exactly as it was. Without
+// reseal a flip breaks its page's CRC, so every outcome must be XX001 or the right rows — never
+// wrong rows. With reseal the CRC is recomputed, so only the engine's structural checks stand in
+// the way: any engine error, or any rows, is allowed, but never a panic or a non-engine error.
+func (r *simRunner) stepCorrupt(i int, st simStep) bool {
+	reseal := st.params["reseal"] == "1"
+	for _, pid := range r.livePids() {
+		if err := r.closeProc(pid); err != nil {
+			r.fail(i, "close: %v", err)
+			return false
+		}
+	}
+	r.fs.processDeath()
+	m := r.main()
+	file := r.fs.main()
+	pc, _, ok := simMetaOf(file.cache, r.pageSize, m.version)
+	if !ok {
+		r.fail(i, "corrupt: no meta holds version %d", m.version)
 		return false
 	}
-	live, pages, free, err := simIntegrity(image, v)
-	if err != nil {
-		r.crashImage = image
-		r.fail(i, "recovery integrity: %v", err)
+	flips := file.corrupt(uint64(i), st.intParam("flips"), pc, reseal)
+	outcome := func(err error) (string, bool) {
+		code := simCode(err)
+		switch {
+		case strings.HasPrefix(code, "non-engine"):
+			r.fail(i, "corrupt: %s", code)
+			return "", false
+		case code != "XX001" && !reseal:
+			r.fail(i, "corrupt: a flipped checksum surfaced as %s, not XX001: %v", code, err)
+			return "", false
+		}
+		return code, true
+	}
+	opened, read := "ok", "-"
+	if err := r.openProc(0); err != nil {
+		if opened, ok = outcome(err); !ok {
+			return false
+		}
+	} else {
+		read = "ok"
+		v := r.db.Version()
+		dg, ok := r.committedDigest(m)
+		switch {
+		case !ok:
+			if read, ok = outcome(r.digestErr); !ok {
+				return false
+			}
+		case reseal:
+		case !m.history[v][dg] || v > m.version || (v < m.version && v+1 != m.version):
+			// A flip in the newest generation's dirty pages fails its validation, and recovery falls
+			// back to the previous generation (validated-cow.md §1), which is intact.
+			r.fail(i, "corrupt: version %d read back with contents (digest %s) no transaction produced", v, dg)
+			return false
+		}
+		r.dropProc(0)
+	}
+	file.repair(flips)
+	if err := r.open(); err != nil {
+		r.fail(i, "corrupt: reopen after repair failed: %v", err)
 		return false
 	}
-	r.version, r.lastDigest = v, d
-	r.emit(`{"i":%d,"op":"crash","fired":%q,"recovered":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"}`,
-		i, fired, v, d, live, pages, free, simImageHash(image, pages, r.pageSize))
+	if v := r.db.Version(); v != m.version {
+		r.fail(i, "corrupt: after repair version %d, want %d", v, m.version)
+		return false
+	}
+	if dg, ok := r.committedDigest(m); !ok || dg != m.lastDigest {
+		r.fail(i, "corrupt: after repair the contents differ")
+		return false
+	}
+	r.emit(`{"i":%d,"op":"corrupt","flipped":%d,"open":%q,"read":%q}`, i, len(flips), opened, read)
 	return true
 }
 
@@ -1171,25 +1679,26 @@ func (r *simRunner) dropProc(pid int) {
 	}
 }
 
-// observe checks the version and contents a process sees when it begins (S5): in a shared trace
-// another process may have committed — or died mid-commit, leaving a complete generation another
-// process adopts — so the version may be newer than the last this runner saw, but never older, and
-// its contents must be a generation the history records.
-func (r *simRunner) observe(i int, who string, v uint64, d string, ok bool) bool {
+// observe checks the version and contents a process sees of main when it begins (S5): in a shared
+// trace another process may have committed — or died mid-commit, leaving a complete generation
+// another process adopts — so the version may be newer than the last this runner saw, but never
+// older, and its contents must be a generation the history records.
+func (r *simRunner) observe(i int, who string, v uint64, dg string, ok bool) bool {
+	m := r.main()
 	switch {
 	case !ok:
 		r.fail(i, "%s: version %d is unreadable", who, v)
-	case v < r.version:
-		r.fail(i, "%s sees version %d after version %d was published", who, v, r.version)
-	case v > r.maxAttempted:
-		r.fail(i, "%s sees version %d, which was never attempted (latest attempted %d)", who, v, r.maxAttempted)
-	case !r.history[v][d]:
-		r.fail(i, "%s sees version %d with contents (digest %s) no transaction produced", who, v, d)
+	case v < m.version:
+		r.fail(i, "%s sees version %d after version %d was published", who, v, m.version)
+	case v > m.maxAttempted:
+		r.fail(i, "%s sees version %d, which was never attempted (latest attempted %d)", who, v, m.maxAttempted)
+	case !m.history[v][dg]:
+		r.fail(i, "%s sees version %d with contents (digest %s) no transaction produced", who, v, dg)
 	}
 	if r.violation != "" {
 		return false
 	}
-	r.version, r.lastDigest = v, d
+	m.version, m.lastDigest = v, dg
 	return true
 }
 
@@ -1236,8 +1745,8 @@ func (r *simRunner) stepSpawn(i int, pid int) {
 		return
 	}
 	v := r.db.Version()
-	d, ok := r.committedDigest()
-	if !r.observe(i, fmt.Sprintf("spawned p%d", pid), v, d, ok) {
+	dg, ok := r.committedDigest(r.main())
+	if !r.observe(i, fmt.Sprintf("spawned p%d", pid), v, dg, ok) {
 		return
 	}
 	r.emit(`{"i":%d,"op":"spawn","pid":%d,"version":%d}`, i, pid, v)

@@ -8,9 +8,7 @@ package jed
 // into the open file rather than rewriting it.
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -44,30 +42,36 @@ func defaultDatabaseOptions() databaseOptions {
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
 // durably immediately, so the file exists with its page size fixed (api.md §2).
 func create(path string, opts databaseOptions) (*engine, error) {
-	if _, err := os.Stat(path); err == nil {
+	return createVia(osFiles, path, opts)
+}
+
+// createVia is create through the file host files (filehost.go): the existence check, the temp file,
+// its rename, the directory barrier, and the open all go through it.
+func createVia(files fileHost, path string, opts databaseOptions) (*engine, error) {
+	if exists, err := files.exists(path); err != nil {
+		return nil, err
+	} else if exists {
 		return nil, newError(DuplicateFile, "database file already exists: "+path)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, ioError(err)
 	}
 	db := newEngine()
 	db.path = path
-	db.spillDir = os.TempDir()
+	db.spill = osSpillHost{dir: os.TempDir()}
 	db.pageSize = opts.PageSize
-	db.committed.txid = 1                                  // the initial empty image is committed as txid 1
-	if err := db.writeFullImage(opts.noSync); err != nil { // lay down the from-scratch image; later commits are incremental
+	db.committed.txid = 1                                         // the initial empty image is committed as txid 1
+	if err := db.writeFullImage(files, opts.noSync); err != nil { // lay down the from-scratch image; later commits are incremental
 		return nil, err
 	}
 	// Adopt the just-written file as the open pager + buffer pool, so later commits write through the
 	// seam without re-opening (spec/design/pager.md). Tables built in this session bind this pager at
 	// creation (snapshot.storePaging), so their committed leaves demote at each commit and fault back
 	// through the pool — same residency shape as after a reopen.
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	store, err := files.openStore(path, opts.noSync, false)
 	if err != nil {
-		return nil, ioError(err)
+		return nil, err
 	}
-	p, err := pagerFromStore(&fileBlockStore{f: f, noSync: opts.noSync})
+	p, err := pagerFromStore(store)
 	if err != nil {
-		_ = f.Close()
+		_ = store.close()
 		return nil, err
 	}
 	db.paging = newSharedPaging(p, cacheLeaves(defaultCacheBytes, db.pageSize))
@@ -131,26 +135,22 @@ func open(path string) (*engine, error) {
 // The budget is a handle setting, not stored in the file (§3). Later commits write through the same
 // pager kept open for the handle's life.
 func openWithOptions(path string, opts OpenOptions) (*engine, error) {
+	return openVia(osFiles, path, opts)
+}
+
+// openVia is openWithOptions through the file host files (filehost.go).
+func openVia(files fileHost, path string, opts OpenOptions) (*engine, error) {
 	cacheBytes := opts.CacheBytes
 	if cacheBytes <= 0 {
 		cacheBytes = defaultCacheBytes
 	}
-	// A read-only open never writes the file, so it is not opened for writing at all — the OS
-	// enforces what the executor's 25006 guards promise (api.md §2.1).
-	flag := os.O_RDWR
-	if opts.ReadOnly {
-		flag = os.O_RDONLY
-	}
-	f, err := os.OpenFile(path, flag, 0)
+	store, err := files.openStore(path, opts.SkipFsync, opts.ReadOnly)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, newError(UndefinedFile, "database file does not exist: "+path)
-		}
-		return nil, ioError(err)
+		return nil, err
 	}
-	p, err := pagerFromStore(&fileBlockStore{f: f, noSync: opts.SkipFsync})
+	p, err := pagerFromStore(store)
 	if err != nil {
-		_ = f.Close()
+		_ = store.close()
 		return nil, err
 	}
 	// Convert the byte budget to a leaf-page capacity by the file's page size; LoadEnginePaged
@@ -158,11 +158,11 @@ func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 	// pageSize = 0 cannot divide by zero before that check runs).
 	db, err := loadEnginePaged(p, cacheLeaves(cacheBytes, p.pageSize))
 	if err != nil {
-		_ = f.Close()
+		_ = store.close()
 		return nil, err
 	}
 	db.path = path
-	db.spillDir = os.TempDir()
+	db.spill = osSpillHost{dir: os.TempDir()}
 	db.readOnly = opts.ReadOnly
 	if opts.WorkMem != 0 {
 		db.session.workMem = opts.WorkMem
@@ -174,12 +174,12 @@ func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by Create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persist).
-func (db *engine) writeFullImage(noSync bool) error {
+func (db *engine) writeFullImage(files fileHost, noSync bool) error {
 	bytes, err := db.committed.ToImage(db.pageSize, db.committed.txid)
 	if err != nil {
 		return err
 	}
-	if err := writeAtomic(db.path, bytes, noSync); err != nil {
+	if err := writeAtomic(files, db.path, bytes, noSync); err != nil {
 		return err
 	}
 	db.pageCount = uint32(len(bytes) / int(db.pageSize))
@@ -272,41 +272,23 @@ func (db *engine) Close() error {
 // fsync, atomic rename over the target, then a best-effort directory fsync so the rename is
 // durable. Under noSync (fsync=off) the two fsyncs are skipped — the write + rename still happen,
 // but the bytes are only in the OS page cache (dev/testing; no durability on an OS crash).
-func writeAtomic(path string, bytes []byte, noSync bool) error {
-	dir := filepath.Dir(path)
+func writeAtomic(files fileHost, path string, bytes []byte, noSync bool) error {
 	tmp := path + ".jedtmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return ioError(err)
+	if err := files.writeFile(tmp, "", noSync, func(writeAt func(off int64, p []byte) error) error {
+		return writeAt(0, bytes)
+	}); err != nil {
+		files.remove(tmp)
+		return err
 	}
-	if _, err := f.Write(bytes); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return ioError(err)
-	}
-	if !noSync {
-		if err := f.Sync(); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return ioError(err)
-		}
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return ioError(err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return ioError(err)
+	if err := files.rename(tmp, path); err != nil {
+		files.remove(tmp)
+		return err
 	}
 	// Directory fsync makes the rename itself durable. Best-effort: not every platform allows
 	// opening a directory for fsync (Windows), and the rename is already atomic there. Skipped under
 	// noSync (fsync=off).
 	if !noSync {
-		if d, derr := os.Open(dir); derr == nil {
-			_ = d.Sync()
-			_ = d.Close()
-		}
+		files.syncDir(filepath.Dir(path))
 	}
 	return nil
 }
@@ -346,7 +328,7 @@ func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, t
 	if err := files.rename(tmp, real); err != nil {
 		files.remove(tmp)
 		_ = old.withPager(func(p *pager) error {
-			store, oerr := files.openStore(real, noSync)
+			store, oerr := files.openStore(real, noSync, false)
 			if oerr != nil {
 				p.poison()
 				return nil
@@ -361,7 +343,7 @@ func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, t
 	if !noSync {
 		files.syncDir(filepath.Dir(real))
 	}
-	store, err := files.openStore(real, noSync)
+	store, err := files.openStore(real, noSync, false)
 	if err != nil {
 		return nil, err
 	}

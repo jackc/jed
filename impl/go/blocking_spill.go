@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
-	"os"
 )
 
 // rowSpool is a repeatable row stream: resident until its rows exceed work_mem, then backed by one
@@ -17,17 +16,17 @@ import (
 // left when the spool is discarded (Go has no destructor — every owner calls it at its spec'd point).
 type rowSpool struct {
 	budget int
-	dir    string
+	spill  spillHost
 	rows   []storedRow
 	bytes  int
 	count  int64
-	file   *os.File
+	file   spillFile
 	writer *bufio.Writer
 	charge *stateCharge
 }
 
 func newRowSpool(db *engine) *rowSpool {
-	return &rowSpool{budget: db.session.workMem, dir: db.spillDir, charge: newStateCharge(db.session.queryAccount())}
+	return &rowSpool{budget: db.session.workMem, spill: db.spill, charge: newStateCharge(db.session.queryAccount())}
 }
 
 // push appends row. While resident it reserves its row_bytes. The spool spills when its residency
@@ -39,12 +38,12 @@ func (s *rowSpool) push(row storedRow) error {
 		rejected := !s.charge.tryReserveDirect(int64(bytes))
 		s.bytes += bytes
 		if rejected || s.bytes > s.budget {
-			f, err := os.CreateTemp(s.dir, "jed-spill-rows-*.tmp")
+			f, err := s.spill.create("rows")
 			if err != nil {
-				return ioError(err)
+				return err
 			}
 			s.file = f
-			s.writer = bufio.NewWriter(f)
+			s.writer = bufio.NewWriter(&spillAppender{f: f})
 			for _, old := range s.rows {
 				spillWriteRow(s.writer, old)
 			}
@@ -90,7 +89,7 @@ func (s *rowSpool) each(fn func(storedRow) error) error {
 		}
 		return nil
 	}
-	r := bufio.NewReader(io.NewSectionReader(s.file, 0, 1<<63-1))
+	r := bufio.NewReader(spillReader(s.file))
 	for i := int64(0); i < s.count; i++ {
 		row, err := spillReadRow(r)
 		if err != nil {
@@ -117,8 +116,7 @@ func (s *rowSpool) close() {
 		return
 	}
 	if s.file != nil {
-		_ = s.file.Close()
-		_ = os.Remove(s.file.Name())
+		_ = s.file.close()
 		s.file = nil
 	}
 	s.rows = nil
@@ -167,7 +165,7 @@ func (r *spoolOutput) close() { r.spool.close() }
 // and the same number is charged (memory.md §6.6): a new entry reserves it, a replaced value its
 // growth (or releases its shrinkage); a spill releases the whole resident charge.
 type stateMap struct {
-	dir     string
+	spill   spillHost
 	budget  int
 	bytes   int64
 	entries map[string]storedRow
@@ -180,10 +178,10 @@ func newStateMap(db *engine) *stateMap {
 }
 
 func newStateMapCharged(db *engine, charge *stateCharge) *stateMap {
-	return &stateMap{dir: db.spillDir, budget: db.session.workMem, entries: make(map[string]storedRow), charge: charge}
+	return &stateMap{spill: db.spill, budget: db.session.workMem, entries: make(map[string]storedRow), charge: charge}
 }
 
-func (m *stateMap) canSpill() bool { return m.budget > 0 && m.dir != "" }
+func (m *stateMap) canSpill() bool { return m.budget > 0 && m.spill != nil }
 
 // release returns the resident charge — the map is discarded at this stage boundary.
 func (m *stateMap) release() {
@@ -247,7 +245,7 @@ func (m *stateMap) put(key []Value, value storedRow) error {
 	if !m.canSpill() || (!rejected && m.bytes <= int64(m.budget)) {
 		return nil
 	}
-	d, err := newDiskBuckets(m.dir)
+	d, err := newDiskBuckets(m.spill)
 	if err != nil {
 		return err
 	}
@@ -280,7 +278,7 @@ func (m *stateMap) insert(key []Value) (bool, error) {
 // then forward disk chains preserving insertion order. Each resident row reserves ENTRY +
 // row_bytes(row) (memory.md §6.6); a spill releases the whole resident charge.
 type hashRows struct {
-	dir    string
+	spill  spillHost
 	budget int
 	bytes  int64
 	mem    map[uint64][]storedRow
@@ -289,7 +287,7 @@ type hashRows struct {
 }
 
 func newHashRows(db *engine) *hashRows {
-	return &hashRows{dir: db.spillDir, budget: db.session.workMem, mem: make(map[uint64][]storedRow), charge: newStateCharge(db.session.queryAccount())}
+	return &hashRows{spill: db.spill, budget: db.session.workMem, mem: make(map[uint64][]storedRow), charge: newStateCharge(db.session.queryAccount())}
 }
 
 // release returns the resident charge — the table is discarded at this stage boundary.
@@ -324,7 +322,7 @@ func (h *hashRows) push(hash uint64, row storedRow) error {
 	if !rejected && h.bytes <= int64(h.budget) {
 		return nil
 	}
-	d, err := newDiskBuckets(h.dir)
+	d, err := newDiskBuckets(h.spill)
 	if err != nil {
 		return err
 	}
@@ -365,7 +363,7 @@ type diskBuckets struct {
 	reader *bufio.Reader
 	writer *bufio.Writer
 	buffer bytes.Buffer
-	file   *os.File
+	file   spillFile
 	heads  [blockingPartitions]uint64
 	tails  [blockingPartitions]uint64
 	end    uint64
@@ -376,21 +374,20 @@ type bucketRecord struct {
 	row              storedRow
 }
 
-func newDiskBuckets(dir string) (*diskBuckets, error) {
-	f, err := os.CreateTemp(dir, "jed-spill-hash-*.tmp")
+func newDiskBuckets(spill spillHost) (*diskBuckets, error) {
+	f, err := spill.create("hash")
 	if err != nil {
-		return nil, ioError(err)
+		return nil, err
 	}
 	d := &diskBuckets{file: f}
-	d.reader = bufio.NewReader(f)
+	d.reader = bufio.NewReader(spillReader(f))
 	d.writer = bufio.NewWriter(&d.buffer)
 	return d, nil
 }
 
 func (d *diskBuckets) close() {
 	if d.file != nil {
-		_ = d.file.Close()
-		_ = os.Remove(d.file.Name())
+		_ = d.file.close()
 		d.file = nil
 		d.buffer = bytes.Buffer{}
 		d.writer = nil

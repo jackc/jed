@@ -7,8 +7,10 @@
 //! A file's state (§6.1): `durable` bytes survive a power loss unconditionally; `pending` holds, per
 //! byte offset, every version written since that offset was last covered by a barrier; `cache` is
 //! what reads see (durable overlaid with the newest pending version). `sync` and a growing
-//! `set_size` are barriers. The filesystem implements the engine's [`FileHost`], so compaction's
-//! temp file, rename, and directory barrier go through it too.
+//! `set_size` are barriers. The filesystem implements the engine's [`FileHost`], so create's and
+//! compaction's temp files, renames, and directory barriers, and the open of a file attachment, go
+//! through it too. Spill scratch files go through a second seam, the [`SpillHost`]: the simulated one
+//! keeps them in memory, outside the filesystem, and `spill_error` fails their operations.
 //!
 //! Every fault decision is [`decide`]`(seed, lane, step, offset, version)` (§6.2): keyed by WHAT was
 //! written WHERE, never by a write's position in the op log, so cores whose write order differs
@@ -17,7 +19,8 @@
 use crate::blockstore::BlockStore;
 use crate::error::{EngineError, Result, SqlState};
 use crate::filehost::{FileHost, WriteAt};
-use std::collections::{BTreeMap, HashSet};
+use crate::spillhost::{SpillFile, SpillHost};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +36,9 @@ const LANE_LAND: u64 = 7; // io_error op=sync: does this pending write land or v
 pub(crate) const LANE_SESSION: u64 = 8; // a session's entropy-seam seed
 const LANE_READ: u64 = 9; // read_error: do reads of this offset fail during the step?
 const LANE_DIR: u64 = 10; // power loss: how many pending directory changes survive (% changes+1)
+const LANE_SPILL: u64 = 11; // spill_error: does this spill-file operation fail?
+const LANE_PAGE: u64 = 12; // corrupt: which page a flip lands in
+const LANE_BIT: u64 = 13; // corrupt: which bit of that page it flips
 
 const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -79,6 +85,8 @@ pub(crate) enum FaultKind {
     ReadError,
     /// Per-core: when the file grows depends on preallocation policy.
     Enospc,
+    /// Per-core: what a core spills, and in which operations, is its own codec's business.
+    SpillError,
 }
 
 /// One armed fault (simulation-testing.md §6.3). Permille fields are 0..1000.
@@ -88,7 +96,7 @@ pub(crate) struct Fault {
     pub(crate) survive: i64, // power_loss
     pub(crate) tear: i64,    // power_loss
     pub(crate) issue: i64,   // process_crash
-    pub(crate) p: i64,       // io_error op=write, read_error
+    pub(crate) p: i64,       // io_error op=write, read_error, spill_error
     /// power_loss/process_crash: the barrier it fires at (default 1); io_error op=sync: the sync
     pub(crate) nth: i64,
 }
@@ -140,6 +148,13 @@ struct SimFile {
     pending: BTreeMap<u64, Vec<Vec<u8>>>,
     /// The writes an armed process_crash decided never reached the kernel; process death removes them.
     unissued: Vec<(u64, usize)>,
+
+    // Per-step state, reset by begin_step.
+    /// This file's own barrier completed with every directory change durable (the floor, §8.2).
+    barrier_ok: bool,
+    /// How many writes reached it, and which pages.
+    writes: usize,
+    pages: BTreeSet<u64>,
 }
 
 /// One directory change: create a file, rename one over another, or remove one.
@@ -172,6 +187,7 @@ fn apply_dir_op(dir: &mut BTreeMap<String, usize>, op: &DirOp) {
 pub(crate) struct SimFs {
     seed: u64,
     sector: usize,
+    page_size: u64,
 
     arena: Vec<SimFile>,
     /// The kernel's view of the directory.
@@ -184,7 +200,7 @@ pub(crate) struct SimFs {
     // Per-step state, reset by begin_step.
     step: u64,
     fault: Option<Fault>,
-    /// "" | "barrier" | "write" | "sync" | "read" | "enospc"
+    /// "" | "barrier" | "write" | "sync" | "read" | "enospc" | "spill"
     pub(crate) fired: &'static str,
     /// The process died mid-step; every later call fails.
     dead: bool,
@@ -192,11 +208,10 @@ pub(crate) struct SimFs {
     syncs: i64,
     /// File and directory barriers this step (power_loss/process_crash nth).
     barriers: i64,
-    pub(crate) writes: usize,
-    /// The database file's barrier completed this step, its directory entry durable.
-    pub(crate) barrier_ok: bool,
-    /// The runner's own oracle reads are in progress: read faults do not apply.
+    /// The runner's own oracle reads are in progress: read and spill faults do not apply.
     pub(crate) oracle: bool,
+    /// Spill-file operations this step (spill_error decisions).
+    spill_ops: u64,
 
     /// FNV-1a fold of every mutating call, for the self-determinism check (§8.5).
     pub(crate) ops: u64,
@@ -207,10 +222,12 @@ fn injected(what: &str) -> EngineError {
 }
 
 impl SimFs {
-    pub(crate) fn new(seed: u64, sector: usize, image: &[u8]) -> SimFs {
-        let mut fs = SimFs {
+    /// An empty simulated filesystem; the runner creates the database in it (S4).
+    pub(crate) fn new(seed: u64, sector: usize, page_size: u32) -> SimFs {
+        SimFs {
             seed,
             sector,
+            page_size: page_size as u64,
             arena: Vec::new(),
             files: BTreeMap::new(),
             durable: BTreeMap::new(),
@@ -221,17 +238,10 @@ impl SimFs {
             dead: false,
             syncs: 0,
             barriers: 0,
-            writes: 0,
-            barrier_ok: false,
             oracle: false,
+            spill_ops: 0,
             ops: FNV_OFFSET,
-        };
-        let main = fs.new_file(MAIN_FILE);
-        fs.arena[main].durable = image.to_vec();
-        fs.arena[main].cache = image.to_vec();
-        fs.files.insert(MAIN_FILE.to_string(), main);
-        fs.durable.insert(MAIN_FILE.to_string(), main);
-        fs
+        }
     }
 
     fn new_file(&mut self, name: &str) -> usize {
@@ -241,20 +251,41 @@ impl SimFs {
             cache: Vec::new(),
             pending: BTreeMap::new(),
             unissued: Vec::new(),
+            barrier_ok: false,
+            writes: 0,
+            pages: BTreeSet::new(),
         });
         self.arena.len() - 1
     }
 
-    /// The database file, or `None` if a crash lost it.
-    pub(crate) fn main(&self) -> Option<usize> {
-        self.files.get(MAIN_FILE).copied()
+    /// Whether a fault is armed for the current step.
+    pub(crate) fn armed(&self) -> bool {
+        self.fault.is_some()
     }
 
-    /// A copy of the database file's cache — what a new process would open — or empty if it is gone.
-    pub(crate) fn main_image(&self) -> Vec<u8> {
-        self.main()
-            .map(|id| self.arena[id].cache.clone())
-            .unwrap_or_default()
+    /// The file named `name`, or `None` if there is none (a crash may have lost it).
+    pub(crate) fn file(&self, name: &str) -> Option<usize> {
+        self.files.get(name).copied()
+    }
+
+    /// A copy of file `name`'s cache — what a new process would open — or `None` if it is gone.
+    pub(crate) fn image(&self, name: &str) -> Option<Vec<u8>> {
+        self.file(name).map(|id| self.arena[id].cache.clone())
+    }
+
+    /// Whether file `id`'s own barrier completed this step with every directory change durable.
+    pub(crate) fn barrier_ok(&self, id: usize) -> bool {
+        self.arena[id].barrier_ok
+    }
+
+    /// How many writes reached file `id` this step.
+    pub(crate) fn file_writes(&self, id: usize) -> usize {
+        self.arena[id].writes
+    }
+
+    /// The distinct pages of file `id` this step wrote.
+    pub(crate) fn written_pages(&self, id: usize) -> &BTreeSet<u64> {
+        &self.arena[id].pages
     }
 
     /// Reset the per-step state and arm `f` (`None` for an unfaulted step).
@@ -265,10 +296,13 @@ impl SimFs {
         self.dead = false;
         self.syncs = 0;
         self.barriers = 0;
-        self.writes = 0;
-        self.barrier_ok = false;
+        self.spill_ops = 0;
         for id in self.all_files() {
-            self.arena[id].unissued.clear();
+            let file = &mut self.arena[id];
+            file.unissued.clear();
+            file.barrier_ok = false;
+            file.writes = 0;
+            file.pages.clear();
         }
     }
 
@@ -384,8 +418,14 @@ impl SimFs {
                 _ => {}
             }
         }
-        self.writes += 1;
+        let ps = self.page_size;
         let file = &mut self.arena[id];
+        file.writes += 1;
+        let mut pg = off / ps;
+        while pg * ps < off + p.len() as u64 {
+            file.pages.insert(pg);
+            pg += 1;
+        }
         let start = off as usize;
         let end = start + p.len();
         if end > file.cache.len() {
@@ -412,11 +452,11 @@ impl SimFs {
             file.durable.resize(n, 0);
         }
         file.unissued.clear(); // reaching a barrier means every earlier write was issued
-        // Only the database file's own barrier, with its directory entry durable, makes the
+        // Only a database file's own barrier, with its directory entry durable, makes the
         // generation it holds durable (the floor, §8.2); a compaction's temp file syncing proves
         // nothing about it.
-        if self.main() == Some(id) && self.dir_ops.is_empty() {
-            self.barrier_ok = true;
+        if self.dir_ops.is_empty() {
+            file.barrier_ok = true;
         }
     }
 
@@ -674,9 +714,111 @@ impl SimFs {
             return Err(injected("open after process death"));
         }
         self.files.get(name).copied().ok_or_else(|| {
-            EngineError::new(SqlState::IoError, format!("I/O error: no such file {name}"))
+            EngineError::new(
+                SqlState::UndefinedFile,
+                format!("database file does not exist: {name}"),
+            )
         })
     }
+
+    fn exists(&self, name: &str) -> Result<bool> {
+        if self.dead {
+            return Err(injected("stat after process death"));
+        }
+        Ok(self.files.contains_key(name))
+    }
+
+    // --- the spill host (crate::spillhost): scratch files in memory, whose operations can fail ---
+
+    /// Whether the step's armed spill_error fails the next spill operation: each operation is decided
+    /// by its ordinal in the step (lane 11). Which operations a core performs is its own business, so
+    /// the fault is per-core (§6.3).
+    fn spill_fault(&mut self) -> std::result::Result<(), String> {
+        if self.dead {
+            return Err("I/O error: simulated spill after process death".to_string());
+        }
+        let n = self.spill_ops;
+        self.spill_ops += 1;
+        if let Some(f) = self.fault
+            && f.kind == FaultKind::SpillError
+            && !self.oracle
+            && decide(self.seed, LANE_SPILL, self.step, n, 0) % 1000 < permille(f.p)
+        {
+            self.fired = "spill";
+            return Err("I/O error: simulated spill I/O error".to_string());
+        }
+        Ok(())
+    }
+
+    // --- corruption (simulation-testing.md §6.3 `corrupt`) ---
+
+    /// Flip `n` bits in file `id`'s durable body pages below `page_count`, choosing each page (lane
+    /// 12) and bit (lane 13) by the flip's ordinal, and skipping a page with a pending write: bit rot
+    /// strikes data at rest. Both durable and cache change, as if the kernel's cached copy were
+    /// dropped too. With `reseal`, each touched page's CRC is recomputed, so only the engine's
+    /// structural checks stand between the flip and a wrong answer. Returns what to restore: each
+    /// flipped page and its durable bytes before the flips.
+    pub(crate) fn corrupt(
+        &mut self,
+        id: usize,
+        step: u64,
+        n: i64,
+        page_count: u32,
+        reseal: bool,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let ps = self.page_size;
+        if page_count <= 2 {
+            return Vec::new();
+        }
+        let mut flips: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut touched: HashSet<u64> = HashSet::new();
+        for k in 0..n.max(0) as u64 {
+            let pg = 2 + decide(self.seed, LANE_PAGE, step, k, 0) % (page_count as u64 - 2);
+            let bit = decide(self.seed, LANE_BIT, step, k, 0) % (ps * 8);
+            let start = pg * ps;
+            let file = &mut self.arena[id];
+            if start + ps > file.durable.len() as u64
+                || start + ps > file.cache.len() as u64
+                || pending_in(file, start, start + ps)
+            {
+                continue;
+            }
+            let (lo, hi) = (start as usize, (start + ps) as usize);
+            if touched.insert(pg) {
+                flips.push((pg, file.durable[lo..hi].to_vec()));
+            }
+            file.durable[lo + (bit / 8) as usize] ^= 1 << (bit % 8);
+        }
+        let file = &mut self.arena[id];
+        for (pg, _) in &flips {
+            let (lo, hi) = ((pg * ps) as usize, ((pg + 1) * ps) as usize);
+            if reseal {
+                let crc = crate::format::page_crc(&file.durable[lo..hi]);
+                file.durable[lo + 12..lo + 16].copy_from_slice(&crc.to_be_bytes());
+            }
+            let page = file.durable[lo..hi].to_vec();
+            file.cache[lo..hi].copy_from_slice(&page);
+        }
+        flips
+    }
+
+    /// Restore the pages [`corrupt`](SimFs::corrupt) flipped.
+    pub(crate) fn repair(&mut self, id: usize, flips: &[(u64, Vec<u8>)]) {
+        let ps = self.page_size as usize;
+        let file = &mut self.arena[id];
+        for (pg, orig) in flips {
+            let lo = *pg as usize * ps;
+            file.durable[lo..lo + orig.len()].copy_from_slice(orig);
+            file.cache[lo..lo + orig.len()].copy_from_slice(orig);
+        }
+    }
+}
+
+/// Whether any pending write of `file` overlaps `[lo, hi)`.
+fn pending_in(file: &SimFile, lo: u64, hi: u64) -> bool {
+    file.pending.iter().any(|(off, vs)| {
+        *off < hi && off + vs.last().expect("a pending offset holds a version").len() as u64 > lo
+    })
 }
 
 fn put_durable(durable: &mut Vec<u8>, off: u64, p: &[u8]) {
@@ -720,8 +862,9 @@ impl BlockStore for SimStore {
     }
 }
 
-/// The file host the simulated database's compaction (and first-commit directory barrier) goes
-/// through. Paths are names in the one simulated directory; `real_path` is the identity.
+/// The file host the simulated database's create, compaction, attachment opens, and first-commit
+/// directory barrier go through. Paths are names in the one simulated directory; `real_path` is the
+/// identity.
 pub(crate) struct SimHost(pub(crate) SharedFs);
 
 fn name_of(path: &Path) -> String {
@@ -733,10 +876,14 @@ impl FileHost for SimHost {
         Ok(path.to_path_buf())
     }
 
+    fn exists(&self, path: &Path) -> Result<bool> {
+        lock(&self.0).exists(&name_of(path))
+    }
+
     fn write_file(
         &self,
         path: &Path,
-        _mode_from: &Path,
+        _mode_from: Option<&Path>,
         no_sync: bool,
         fill: &mut dyn FnMut(&mut WriteAt<'_>) -> Result<()>,
     ) -> Result<()> {
@@ -762,12 +909,87 @@ impl FileHost for SimHost {
         lock(&self.0).sync_dir();
     }
 
-    fn open_store(&self, path: &Path, _no_sync: bool) -> Result<Box<dyn BlockStore>> {
+    fn open_store(
+        &self,
+        path: &Path,
+        _no_sync: bool,
+        _read_only: bool,
+    ) -> Result<Box<dyn BlockStore>> {
         let file = lock(&self.0).open(&name_of(path))?;
         Ok(Box::new(SimStore {
             fs: self.0.clone(),
             file,
         }))
+    }
+}
+
+/// The simulated spill host: scratch bytes are never durable state, so its files live outside the
+/// filesystem and vanish with the process; `spill_error` fails an operation (S3).
+pub(crate) struct SimSpill(pub(crate) SharedFs);
+
+/// One simulated scratch file.
+struct SimSpillFile {
+    fs: SharedFs,
+    data: Mutex<Vec<u8>>,
+}
+
+fn spill_io(msg: String) -> std::io::Error {
+    std::io::Error::other(msg)
+}
+
+impl SpillHost for SimSpill {
+    fn create(&self, _kind: &str) -> Result<Box<dyn SpillFile>> {
+        lock(&self.0)
+            .spill_fault()
+            .map_err(|msg| EngineError::new(SqlState::IoError, msg))?;
+        Ok(Box::new(SimSpillFile {
+            fs: self.0.clone(),
+            data: Mutex::new(Vec::new()),
+        }))
+    }
+}
+
+impl SimSpillFile {
+    fn data(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.data.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl SpillFile for SimSpillFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        lock(&self.fs).spill_fault().map_err(spill_io)?;
+        let data = self.data();
+        if offset >= data.len() as u64 {
+            return Ok(0);
+        }
+        let from = &data[offset as usize..];
+        let n = from.len().min(buf.len());
+        buf[..n].copy_from_slice(&from[..n]);
+        Ok(n)
+    }
+
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        lock(&self.fs).spill_fault().map_err(spill_io)?;
+        let mut data = self.data();
+        let end = offset as usize + bytes.len();
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[offset as usize..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(self.data().len() as u64)
+    }
+
+    fn truncate(&self, n: u64) -> std::io::Result<()> {
+        self.data().resize(n as usize, 0);
+        Ok(())
+    }
+
+    fn close(&self) {
+        *self.data() = Vec::new();
     }
 }
 

@@ -15,6 +15,7 @@ package jed
 import (
 	"encoding/binary"
 	"hash/fnv"
+	"io"
 	"sort"
 	"testing"
 )
@@ -32,6 +33,9 @@ const (
 	simLaneSession = 8  // a session's entropy-seam seed
 	simLaneRead    = 9  // read_error: do reads of this offset fail during the step?
 	simLaneDir     = 10 // power loss: how many pending directory changes survive (% changes+1)
+	simLaneSpill   = 11 // spill_error: does this spill-file operation fail?
+	simLanePage    = 12 // corrupt: which page a flip lands in
+	simLaneBit     = 13 // corrupt: which bit of that page it flips
 )
 
 const simGamma = 0x9E3779B97F4A7C15
@@ -59,8 +63,9 @@ const (
 	simProcessCrash
 	simIOWrite
 	simIOSync
-	simReadError // per-core: which reads happen depends on buffer-pool policy
-	simENOSPC    // per-core: when the file grows depends on preallocation policy
+	simReadError  // per-core: which reads happen depends on buffer-pool policy
+	simENOSPC     // per-core: when the file grows depends on preallocation policy
+	simSpillError // per-core: what a core spills, and in which operations, is its own codec's business
 )
 
 // simFault is one armed fault (simulation-testing.md §6.3). Permille fields are 0..1000.
@@ -69,7 +74,7 @@ type simFault struct {
 	survive int // power_loss
 	tear    int // power_loss
 	issue   int // process_crash
-	p       int // io_error op=write, read_error
+	p       int // io_error op=write, read_error, spill_error
 	nth     int // power_loss/process_crash: the barrier it fires at (default 1); io_error op=sync: the sync
 }
 
@@ -81,23 +86,24 @@ const simMainFile = simDiskPath
 // it: a crash discards the process but keeps the disk, as a real filesystem would. The per-step
 // fault state lives here, because a fault arms a step, not a file.
 type simFS struct {
-	seed   uint64
-	sector int
+	seed     uint64
+	sector   int
+	pageSize int64
 
 	files   map[string]*simDisk // the kernel's view of the directory
 	durable map[string]*simDisk // the directory as of the last directory barrier
 	dirOps  []simDirOp          // directory changes since that barrier, in order
 
 	// Per-step state, reset by beginStep.
-	step      uint64
-	fault     *simFault
-	fired     string // "" | "barrier" | "write" | "sync" | "read" | "enospc"
-	dead      bool   // the process died mid-step; every later call fails
-	syncs     int    // file syncs this step (io_error op=sync nth)
-	barriers  int    // file and directory barriers this step (power_loss/process_crash nth)
-	writes    int
-	barrierOK bool // the database file's barrier completed this step, its directory entry durable
-	oracle    bool // the runner's own oracle reads are in progress: read faults do not apply
+	step     uint64
+	fault    *simFault
+	fired    string // "" | "barrier" | "write" | "sync" | "read" | "enospc"
+	dead     bool   // the process died mid-step; every later call fails
+	syncs    int    // file syncs this step (io_error op=sync nth)
+	barriers int    // file and directory barriers this step (power_loss/process_crash nth)
+	writes   int
+	oracle   bool   // the runner's own oracle reads are in progress: read faults do not apply
+	spillOps uint64 // spill-file operations this step (spill_error decisions)
 
 	ops uint64 // FNV-1a fold of every mutating call, for the self-determinism check (§8.5)
 }
@@ -118,6 +124,12 @@ type simDisk struct {
 	durable []byte
 	cache   []byte
 	pending map[int64][][]byte
+
+	// Per-step state, reset by beginStep: whether this file's own barrier completed with every
+	// directory change durable (the floor, §8.2), how many writes reached it, and which pages.
+	barrierOK bool
+	writes    int
+	pages     map[int64]bool
 
 	// unissued are the writes an armed process_crash decided never reached the kernel; processDeath
 	// removes them.
@@ -141,18 +153,16 @@ func simFileKey(name string) uint64 {
 	return (uint64(h.Sum32()) + 1) << 40
 }
 
-func newSimFS(seed uint64, sector int, image []byte) *simFS {
-	fs := &simFS{seed: seed, sector: sector, files: map[string]*simDisk{}, ops: 14695981039346656037}
-	main := fs.newFile(simMainFile)
-	main.durable = append([]byte(nil), image...)
-	main.cache = append([]byte(nil), image...)
-	fs.files[simMainFile] = main
-	fs.durable = map[string]*simDisk{simMainFile: main}
-	return fs
+// newSimFS is an empty simulated filesystem; the runner creates the database in it (S4).
+func newSimFS(seed uint64, sector int, pageSize uint32) *simFS {
+	return &simFS{
+		seed: seed, sector: sector, pageSize: int64(pageSize), files: map[string]*simDisk{},
+		durable: map[string]*simDisk{}, ops: 14695981039346656037,
+	}
 }
 
 func (fs *simFS) newFile(name string) *simDisk {
-	return &simDisk{fs: fs, key: simFileKey(name), pending: make(map[int64][][]byte)}
+	return &simDisk{fs: fs, key: simFileKey(name), pending: make(map[int64][][]byte), pages: map[int64]bool{}}
 }
 
 // main is the database file, or nil if a crash lost it.
@@ -171,9 +181,12 @@ func (fs *simFS) beginStep(step uint64, f *simFault) {
 	fs.syncs = 0
 	fs.barriers = 0
 	fs.writes = 0
-	fs.barrierOK = false
+	fs.spillOps = 0
 	for _, d := range fs.allFiles() {
 		d.unissued = nil
+		d.barrierOK = false
+		d.writes = 0
+		d.pages = map[int64]bool{}
 	}
 }
 
@@ -276,6 +289,10 @@ func (d *simDisk) writeAt(off int64, p []byte) error {
 		}
 	}
 	fs.writes++
+	d.writes++
+	for pg := off / fs.pageSize; pg*fs.pageSize < off+int64(len(p)); pg++ {
+		d.pages[pg] = true
+	}
 	end := off + int64(len(p))
 	if end > int64(len(d.cache)) {
 		d.cache = append(d.cache, make([]byte, end-int64(len(d.cache)))...)
@@ -313,10 +330,10 @@ func (d *simDisk) flush() {
 		d.durable = append(d.durable, make([]byte, len(d.cache)-len(d.durable))...)
 	}
 	d.pending = make(map[int64][][]byte)
-	// Only the database file's own barrier, with its directory entry durable, makes the generation it
+	// Only a database file's own barrier, with its directory entry durable, makes the generation it
 	// holds durable (the floor, §8.2); a compaction's temp file syncing proves nothing about it.
-	if d == d.fs.main() && len(d.fs.dirOps) == 0 {
-		d.fs.barrierOK = true
+	if len(d.fs.dirOps) == 0 {
+		d.barrierOK = true
 	}
 	d.unissued = nil // reaching a barrier means every earlier write was issued
 }
@@ -511,6 +528,13 @@ func (d *simDisk) processDeath() {
 
 func (fs *simFS) realPath(path string) (string, error) { return path, nil }
 
+func (fs *simFS) exists(path string) (bool, error) {
+	if fs.dead {
+		return false, simInjected("stat after process death")
+	}
+	return fs.files[path] != nil, nil
+}
+
 func (fs *simFS) writeFile(path, _ string, noSync bool, fill func(writeAt func(off int64, p []byte) error) error) error {
 	if fs.dead {
 		return simInjected("create after process death")
@@ -568,15 +592,156 @@ func (fs *simFS) syncDir(string) {
 	fs.dirOps = nil
 }
 
-func (fs *simFS) openStore(path string, _ bool) (blockStore, error) {
+func (fs *simFS) openStore(path string, _, _ bool) (blockStore, error) {
 	if fs.dead {
 		return nil, simInjected("open after process death")
 	}
 	d := fs.files[path]
 	if d == nil {
-		return nil, newError(IoError, "I/O error: no such file "+path)
+		return nil, newError(UndefinedFile, "database file does not exist: "+path)
 	}
 	return d, nil
+}
+
+// --- the spill host (spillhost.go): scratch files in memory, whose operations can fail ----------
+
+// spillHost is the simulated spill host. Scratch bytes are never durable state, so its files live
+// outside the filesystem and vanish with the process; spill_error fails an operation (S3).
+func (fs *simFS) spillHost() spillHost { return simSpill{fs: fs} }
+
+type simSpill struct{ fs *simFS }
+
+type simSpillFile struct {
+	fs     *simFS
+	data   []byte
+	closed bool
+}
+
+// spillFault reports whether the step's armed spill_error fails the next spill operation: each
+// operation is decided by its ordinal in the step (lane 11). Which operations a core performs is
+// its own business, so the fault is per-core (§6.3).
+func (fs *simFS) spillFault() error {
+	if fs.dead {
+		return simInjected("spill after process death")
+	}
+	n := fs.spillOps
+	fs.spillOps++
+	if f := fs.fault; f != nil && f.kind == simSpillError && !fs.oracle &&
+		simDecide(fs.seed, simLaneSpill, fs.step, n, 0)%1000 < uint64(f.p) {
+		fs.fired = "spill"
+		return simInjected("spill I/O error")
+	}
+	return nil
+}
+
+func (h simSpill) create(string) (spillFile, error) {
+	if err := h.fs.spillFault(); err != nil {
+		return nil, err
+	}
+	return &simSpillFile{fs: h.fs}, nil
+}
+
+func (f *simSpillFile) ReadAt(p []byte, off int64) (int, error) {
+	if err := f.fs.spillFault(); err != nil {
+		return 0, err
+	}
+	if off >= int64(len(f.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *simSpillFile) WriteAt(p []byte, off int64) (int, error) {
+	if err := f.fs.spillFault(); err != nil {
+		return 0, err
+	}
+	if end := off + int64(len(p)); end > int64(len(f.data)) {
+		f.data = append(f.data, make([]byte, end-int64(len(f.data)))...)
+	}
+	return copy(f.data[off:], p), nil
+}
+
+func (f *simSpillFile) size() (int64, error) { return int64(len(f.data)), nil }
+
+func (f *simSpillFile) truncate(n int64) error {
+	if n <= int64(len(f.data)) {
+		f.data = f.data[:n]
+	} else {
+		f.data = append(f.data, make([]byte, n-int64(len(f.data)))...)
+	}
+	return nil
+}
+
+func (f *simSpillFile) close() error {
+	f.closed, f.data = true, nil
+	return nil
+}
+
+// --- corruption (simulation-testing.md §6.3 `corrupt`) -------------------------------------------
+
+// simFlip is one flipped bit, remembered so the step can repair it.
+type simFlip struct {
+	page int64
+	orig []byte // the page's durable bytes before the flip
+}
+
+// corrupt flips n bits in d's durable body pages below pageCount, choosing each page (lane 12) and
+// bit (lane 13) by the flip's ordinal, and skipping a page with a pending write: bit rot strikes data
+// at rest. Both durable and cache change, as if the kernel's cached copy were dropped too. With
+// reseal, each touched page's CRC is recomputed, so only the engine's structural checks stand
+// between the flip and a wrong answer. Returns what to restore.
+func (d *simDisk) corrupt(step uint64, n int, pageCount uint32, reseal bool) []simFlip {
+	ps := d.fs.pageSize
+	if pageCount <= 2 {
+		return nil
+	}
+	var flips []simFlip
+	touched := map[int64]bool{}
+	for k := 0; k < n; k++ {
+		pg := 2 + int64(simDecide(d.fs.seed, simLanePage, step, uint64(k), 0)%uint64(pageCount-2))
+		bit := int64(simDecide(d.fs.seed, simLaneBit, step, uint64(k), 0) % uint64(ps*8))
+		start := pg * ps
+		if start+ps > int64(len(d.durable)) || start+ps > int64(len(d.cache)) || d.pendingIn(start, start+ps) {
+			continue
+		}
+		if !touched[pg] {
+			touched[pg] = true
+			flips = append(flips, simFlip{page: pg, orig: append([]byte(nil), d.durable[start:start+ps]...)})
+		}
+		d.durable[start+bit/8] ^= 1 << (bit % 8)
+	}
+	for _, f := range flips {
+		start := f.page * ps
+		page := d.durable[start : start+ps]
+		if reseal {
+			binary.BigEndian.PutUint32(page[12:16], pageCRC(page))
+		}
+		copy(d.cache[start:start+ps], page)
+	}
+	return flips
+}
+
+// repair restores the pages corrupt flipped.
+func (d *simDisk) repair(flips []simFlip) {
+	for _, f := range flips {
+		start := f.page * d.fs.pageSize
+		copy(d.durable[start:], f.orig)
+		copy(d.cache[start:], f.orig)
+	}
+}
+
+// pendingIn reports whether any pending write overlaps [lo, hi).
+func (d *simDisk) pendingIn(lo, hi int64) bool {
+	for off, vs := range d.pending {
+		if off < hi && off+int64(len(vs[len(vs)-1])) > lo {
+			return true
+		}
+	}
+	return false
 }
 
 // TestSimDecideVectors pins simDecide to the shared vectors in spec/encoding/prng.toml
