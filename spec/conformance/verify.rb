@@ -15,11 +15,14 @@
 #   7. the oracle profile (oracle_profile.toml) is structurally complete — every asserted
 #      cluster key present and well-typed, every session pin a non-empty string. Static only:
 #      whether the LIVE oracle matches is PgOracle.assert_profile!'s job, which needs a server.
+#   8. every `# params:` value list parses (conformance.md §1.2), and any file using one
+#      declares the `harness.params` capability
 #
 # Exit 0 = taxonomy is internally coherent; nonzero = the offending problem.
 
 require "bundler/setup"
 require "toml-rb"
+require_relative "params"
 
 CONF_DIR = __dir__
 SUITES_DIR = File.join(CONF_DIR, "suites")
@@ -167,6 +170,18 @@ def main
     unless query_limits.empty?
       query_limits.each { |tok| fail!("#{rel}: invalid max_query_memory_bytes #{tok}") unless tok.match?(/\A\d+\z/) }
       fail!("#{rel}: max_query_memory_bytes requires resource.query_memory") unless reqs.include?("resource.query_memory")
+    end
+
+    # (8) params directives: each value list parses (conformance.md §1.2), and the file must require
+    # the harness capability (so a core without the directive skips it instead of binding nothing).
+    params_lines = File.readlines(path).select { |l| l.match?(/^#\s*params:/) }
+    unless params_lines.empty?
+      params_lines.each do |l|
+        CorpusParams.parse_line(l.chomp)
+      rescue ArgumentError => e
+        fail!("#{rel}: malformed `#{l.strip}`: #{e.message}")
+      end
+      fail!("#{rel}: uses `# params:` but does not require `harness.params`") unless reqs.include?("harness.params")
     end
 
     # (6) max_sql_length directives: each is a non-negative integer, and the file must require

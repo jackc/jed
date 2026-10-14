@@ -1,0 +1,580 @@
+# Custom plans (spec/design/estimator.md §6.1): every execution is planned with its bound values as
+# plan-time literals, so statistics reach a parameterized statement exactly as they reach the literal
+# one. Each bound record below is paired with its literal twin, whose plan, estimates, actual cost,
+# and rows it must equal; only EXPLAIN's detail differs, where a $N still renders symbolically. The
+# plan cache's memo and value-blind classification are per-core host-API tests (custom_plans). The
+# plans and estimates are jed-owned, so this file is cross-core checked, not oracle-checked.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: harness.params, maintenance.analyze, maintenance.analyze_gin_terms, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_scan, query.gin_any_eq, dml.insert, dml.insert_select, dml.insert_on_conflict, dml.update, dml.delete, dml.explain, dml.explain_analyze, query.select, query.where_eq, query.comparison_order, query.set_returning, query.aggregates, query.explain, query.explain_analyze, query.subquery_in, expr.text_concat, expr.arithmetic, expr.case, cast.explicit, func.array_quantified, types.i32, types.i64, types.text, types.array, null.three_valued, resource.cost_metering
+
+# cat is 1 for nine rows in ten (a most-common value) and unique otherwise; tags holds the common tag
+# 'a' on every row and a rare tag 'r<id>' on one.
+statement ok
+CREATE TABLE items (id i32 PRIMARY KEY, cat i32, tags text[])
+
+statement ok
+INSERT INTO items SELECT CAST(g AS i32), CAST(CASE WHEN g % 10 = 0 THEN g ELSE 1 END AS i32), ARRAY['a', 'r' || CAST(g AS text)] FROM generate_series(1, 1000) AS g
+
+statement ok
+CREATE INDEX items_cat ON items (cat)
+
+statement ok
+CREATE INDEX items_tags ON items USING gin (tags)
+
+statement ok
+ANALYZE items
+
+# --- a most-common value against a rare one: the data flips the plan ------------------------------
+
+# params: 1
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = $1
+----
+0
+Filter
+conjuncts=1
+900
+2906
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = 1
+----
+0
+Filter
+conjuncts=1
+900
+2906
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+# params: 70
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = $1
+----
+0
+Filter
+conjuncts=1
+1
+7
+1
+Scan items
+Index bound: using items_cat; touched=2
+1
+5
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = 70
+----
+0
+Filter
+conjuncts=1
+1
+7
+1
+Scan items
+Index bound: using items_cat; touched=2
+1
+5
+
+# params: 70
+# cost: 7
+query I nosort
+SELECT id FROM items WHERE cat = $1
+----
+70
+
+# cost: 7
+query I nosort
+SELECT id FROM items WHERE cat = 70
+----
+70
+
+# params: 1
+# cost: 2907
+query I nosort
+SELECT count(*) FROM items WHERE cat = $1
+----
+900
+
+# cost: 2907
+query I nosort
+SELECT count(*) FROM items WHERE cat = 1
+----
+900
+
+# A bound range reads the histogram.
+# params: 500
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat > $1
+----
+0
+Filter
+conjuncts=1
+49
+247
+1
+Scan items
+Index bound: using items_cat; touched=2
+49
+149
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat > 500
+----
+0
+Filter
+conjuncts=1
+49
+247
+1
+Scan items
+Index bound: using items_cat; touched=2
+49
+149
+
+# A NULL key proves no row.
+# params: NULL
+query ITTII nosort
+EXPLAIN SELECT cat FROM items WHERE id = $1
+----
+0
+Filter
+conjuncts=1; contradiction
+0
+0
+1
+Scan items
+PK bound: id = $1; touched=2
+0
+0
+
+query ITTII nosort
+EXPLAIN SELECT cat FROM items WHERE id = NULL
+----
+0
+Filter
+conjuncts=1; contradiction
+0
+0
+1
+Scan items
+PK bound: id = <value>; touched=2
+0
+0
+
+# --- GIN term statistics reach a bound tag --------------------------------------------------------
+
+# params: 'a'
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> ARRAY[$1]
+----
+0
+Filter
+conjuncts=1
+1000
+4006
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['a']
+----
+0
+Filter
+conjuncts=1
+1000
+4006
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+# params: 'r7'
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> ARRAY[$1]
+----
+0
+Filter
+conjuncts=1
+1
+9
+1
+Scan items
+GIN bound: using items_tags; touched=2
+1
+6
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['r7']
+----
+0
+Filter
+conjuncts=1
+1
+9
+1
+Scan items
+GIN bound: using items_tags; touched=2
+1
+6
+
+# params: 'a'
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE $1 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+1000
+3006
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE 'a' = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+1000
+3006
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+# params: 'r7'
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE $1 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+1
+8
+1
+Scan items
+GIN bound: using items_tags; touched=2
+1
+6
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE 'r7' = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+1
+8
+1
+Scan items
+GIN bound: using items_tags; touched=2
+1
+6
+
+# params: 'r7'
+# cost: 10
+query I nosort
+SELECT id FROM items WHERE $1 = ANY(tags)
+----
+7
+
+# cost: 10
+query I nosort
+SELECT id FROM items WHERE 'r7' = ANY(tags)
+----
+7
+
+# --- a bound generate_series bound ----------------------------------------------------------------
+
+# params: 50
+query ITTII nosort
+EXPLAIN SELECT count(*) FROM generate_series(1, $1) AS g
+----
+0
+Aggregate
+groups=0 aggs=1
+1
+101
+1
+SRF generate_series
+-
+50
+50
+
+query ITTII nosort
+EXPLAIN SELECT count(*) FROM generate_series(1, 50) AS g
+----
+0
+Aggregate
+groups=0 aggs=1
+1
+101
+1
+SRF generate_series
+-
+50
+50
+
+# --- UPDATE / DELETE choose their target scan with the bound value --------------------------------
+
+# params: 70
+query ITTII nosort
+EXPLAIN UPDATE items SET tags = NULL WHERE cat = $1
+----
+0
+Update items
+sets=1
+1
+6
+1
+Filter
+conjuncts=1
+1
+6
+2
+Scan items
+Index bound: using items_cat; touched=1
+1
+5
+
+query ITTII nosort
+EXPLAIN UPDATE items SET tags = NULL WHERE cat = 70
+----
+0
+Update items
+sets=1
+1
+6
+1
+Filter
+conjuncts=1
+1
+6
+2
+Scan items
+Index bound: using items_cat; touched=1
+1
+5
+
+# params: 70
+query ITTII nosort
+EXPLAIN DELETE FROM items WHERE cat = $1
+----
+0
+Delete items
+-
+1
+6
+1
+Filter
+conjuncts=1
+1
+6
+2
+Scan items
+Index bound: using items_cat; touched=1
+1
+5
+
+query ITTII nosort
+EXPLAIN DELETE FROM items WHERE cat = 70
+----
+0
+Delete items
+-
+1
+6
+1
+Filter
+conjuncts=1
+1
+6
+2
+Scan items
+Index bound: using items_cat; touched=1
+1
+5
+
+# params: 70
+query ITTII nosort
+EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = $1)
+----
+0
+Delete items
+-
+334
+2013
+1
+Filter
+conjuncts=1
+334
+2013
+2
+Scan items
+Full scan; touched=1
+1000
+1006
+
+query ITTII nosort
+EXPLAIN DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)
+----
+0
+Delete items
+-
+334
+2013
+1
+Filter
+conjuncts=1
+334
+2013
+2
+Scan items
+Full scan; touched=1
+1000
+1006
+
+# EXPLAIN ANALYZE executes, so each run is followed by restoring row 70.
+# params: 70
+query ITTIII nosort
+EXPLAIN ANALYZE DELETE FROM items WHERE cat = $1
+----
+0
+Analyze
+cost=6 rows=1
+1
+6
+6
+1
+Delete items
+-
+1
+6
+6
+2
+Filter
+conjuncts=1
+1
+6
+6
+3
+Scan items
+Index bound: using items_cat; touched=1
+1
+5
+5
+
+statement ok
+INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']
+
+query ITTIII nosort
+EXPLAIN ANALYZE DELETE FROM items WHERE cat = 70
+----
+0
+Analyze
+cost=6 rows=1
+1
+6
+6
+1
+Delete items
+-
+1
+6
+6
+2
+Filter
+conjuncts=1
+1
+6
+6
+3
+Scan items
+Index bound: using items_cat; touched=1
+1
+5
+5
+
+statement ok
+INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']
+
+# An INSERT ... SELECT source is planned with the bound value too.
+statement ok
+CREATE TABLE picked (id i32 PRIMARY KEY)
+
+# params: 70
+query ITTIII nosort
+EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = $1
+----
+0
+Analyze
+cost=7 rows=1
+1
+7
+7
+1
+Insert picked
+-
+1
+7
+7
+2
+Filter
+conjuncts=1
+1
+7
+7
+3
+Scan items
+Index bound: using items_cat; touched=2
+1
+5
+5
+
+statement ok
+DELETE FROM picked
+
+query ITTIII nosort
+EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = 70
+----
+0
+Analyze
+cost=7 rows=1
+1
+7
+7
+1
+Insert picked
+-
+1
+7
+7
+2
+Filter
+conjuncts=1
+1
+7
+7
+3
+Scan items
+Index bound: using items_cat; touched=2
+1
+5
+5

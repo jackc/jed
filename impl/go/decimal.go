@@ -84,6 +84,11 @@ func decimalFromDigitsScale(neg bool, digits string, scale uint32) Decimal {
 	return newDecimal(neg, scale, magFromDecimalStr(digits))
 }
 
+// ParseDecimal parses s as a decimal for a host to bind as a parameter (spec/design/api.md §5): the
+// text→decimal input form (optional sign, digits with at most one '.', optional e-notation), its
+// scale as written ("1.50" has scale 2). Malformed input is a 22P02 engine error.
+func ParseDecimal(s string) (Decimal, error) { return parseDecimalLiteral(s) }
+
 // decimalFromParts is the canonical (coefficient digits, scale) for a decimal literal, from its
 // mantissa (intPart+frac) and an optional scientific exponent (already clamped to ±expLimit by the
 // caller's scanner; hasExp false means no exponent). The display scale is max(0, fracLen-exp); when

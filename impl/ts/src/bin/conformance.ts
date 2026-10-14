@@ -16,8 +16,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { loadedCollation, loadUnicodeData } from "../collation.ts";
+import { Decimal } from "../decimal.ts";
 import { DEFAULT_WORK_MEM } from "../spill.ts";
 import { loadTimeZoneData, resolveZone } from "../timezone.ts";
+import { boolValue, decimalValue, intValue, nullValue, textValue, type Value } from "../value.ts";
 import {
   advancingClock,
   attachMemory,
@@ -265,8 +267,8 @@ type Drained = { outcome: Outcome; cells: string[][] };
 // drainQuery runs sql on sess and renders every result cell while the record's session zone is still
 // in effect; a render failure (22008, only at jed's out-of-PG-range extremes) throws, failing the
 // record like an output-time error fails a PG query. Mirrors the Rust harness's drain_query.
-function drainQuery(sess: Session, sql: string): Drained {
-  const outcome = queryOutcome(sess, sql);
+function drainQuery(sess: Session, sql: string, params: Value[] = []): Drained {
+  const outcome = queryOutcome(sess, sql, params);
   const cells =
     outcome.kind === "query" ? outcome.rows.map((row) => row.map((v) => sess.render(v))) : [];
   return { outcome, cells };
@@ -599,6 +601,67 @@ function parseTypesDirective(line: string): string[] | null {
     .filter((s) => s !== "");
 }
 
+// parseParamsDirective parses a `# params: 1, 'a', NULL` directive line (conformance.md §1.2): the
+// host values the next record binds as $1..$N; null if not a params directive. A malformed value list
+// throws.
+function parseParamsDirective(line: string): Value[] | null {
+  const m = line.match(/^#\s*params:(.*)$/);
+  if (!m) return null;
+  const values: Value[] = [];
+  let rest = m[1]!.trim();
+  while (rest !== "") {
+    const [value, after] = takeParamValue(rest);
+    values.push(value);
+    rest = after.trim();
+    if (rest === "") break;
+    if (!rest.startsWith(","))
+      throw new Error(`# params: expected \`,\` before ${JSON.stringify(rest)}`);
+    rest = rest.slice(1).trim();
+  }
+  return values;
+}
+
+// takeParamValue reads one `# params:` value from the front of s: a single-quoted text (a doubled ''
+// is one quote), NULL, true/false, an integer, or a decimal with its written scale.
+function takeParamValue(s: string): [Value, string] {
+  if (s.startsWith("'")) {
+    let text = "";
+    for (let i = 1; i < s.length; i++) {
+      if (s[i] !== "'") {
+        text += s[i];
+        continue;
+      }
+      if (s[i + 1] === "'") {
+        text += "'";
+        i++;
+        continue;
+      }
+      return [textValue(text), s.slice(i + 1)];
+    }
+    throw new Error(`# params: unterminated text value ${JSON.stringify(s)}`);
+  }
+  const comma = s.indexOf(",");
+  const token = (comma < 0 ? s : s.slice(0, comma)).trim();
+  const rest = comma < 0 ? "" : s.slice(comma);
+  if (token === "NULL") return [nullValue(), rest];
+  if (token === "true" || token === "false") return [boolValue(token === "true"), rest];
+  if (/^-?[0-9]+$/.test(token)) {
+    const n = BigInt(token);
+    if (n < -(2n ** 63n) || n > 2n ** 63n - 1n) {
+      throw new Error(`# params: integer ${token} is outside i64`);
+    }
+    return [intValue(n), rest];
+  }
+  const dec = token.match(/^(-?)([0-9]+)\.([0-9]+)$/);
+  if (dec) {
+    return [
+      decimalValue(Decimal.fromDigitsScale(dec[1] === "-", dec[2]! + dec[3]!, dec[3]!.length)),
+      rest,
+    ];
+  }
+  throw new Error(`# params: unrecognized value ${JSON.stringify(token)}`);
+}
+
 // assertTypes checks the query's output column types match a pending `# types:` directive.
 function assertTypes(expected: string[] | null, actual: string[], sql: string): void {
   if (expected !== null && !arrEq(expected, actual)) {
@@ -692,6 +755,7 @@ function runFile(text: string, disk: boolean): void {
     let pendingCost: bigint | null = null;
     let pendingNames: string[] | null = null;
     let pendingTypes: string[] | null = null;
+    let pendingParams: Value[] = [];
     let pendingMaxCost: bigint | null = null;
     let pendingMaxSqlLength: number | null = null;
     let pendingSeed: bigint | null = null;
@@ -857,7 +921,12 @@ function runFile(text: string, disk: boolean): void {
             pendingNames = names;
           } else {
             const types = parseTypesDirective(line);
-            if (types !== null) pendingTypes = types;
+            if (types !== null) {
+              pendingTypes = types;
+            } else {
+              const params = parseParamsDirective(line);
+              if (params !== null) pendingParams = params;
+            }
           }
         }
         c.i++;
@@ -897,6 +966,8 @@ function runFile(text: string, disk: boolean): void {
       pendingCost = null;
       pendingNames = null;
       pendingTypes = null;
+      const params = pendingParams;
+      pendingParams = [];
       // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
       db.setMaxCost(pendingMaxCost ?? 0n);
       pendingMaxCost = null;
@@ -975,7 +1046,7 @@ function runFile(text: string, disk: boolean): void {
         let err: unknown = null;
         let outcome: Outcome | null = null;
         try {
-          outcome = drainQuery(db, sql).outcome;
+          outcome = drainQuery(db, sql, params).outcome;
         } catch (e) {
           err = e;
         }
@@ -1008,7 +1079,7 @@ function runFile(text: string, disk: boolean): void {
         }
         let drained: Drained;
         try {
-          drained = drainQuery(db, sql);
+          drained = drainQuery(db, sql, params);
         } catch (e) {
           throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
         }

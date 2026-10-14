@@ -9,6 +9,8 @@
 #
 #   file    path suffix of the .test (e.g. "types/decimal.test")
 #   sql     the record's SQL, matched after whitespace-normalization
+#   params  optional: the record's `# params:` value list (conformance.md §1.2) — the entry then
+#           matches only that binding of the SQL, not every binding
 #   reason  why jed departs from PostgreSQL here
 
 [[override]]
@@ -1619,3 +1621,95 @@ reason = "jed: an ordered index over a non-key-encodable type reports 0A000 (a j
 file = "ddl/create_gin_jsonb_index.test"
 sql = "CREATE INDEX i ON t USING gin (doc, tags)"
 reason = "jed: a multi-column GIN index is deferred 0A000 (gin.md §3/§10). PostgreSQL builds a multicolumn GIN over a jsonb and an int[] column."
+
+# --- bound parameters (params/*.test, conformance.md §1.2): the oracle replays a bound record as
+# PREPARE + EXECUTE. jed binds TYPED host values and infers parameter types by its own rules
+# (api.md §5); PostgreSQL's EXECUTE argument is an untyped literal and its inference differs.
+[[override]]
+file = "params/binding.test"
+sql = "INSERT INTO people VALUES ($1, $2, $3)"
+params = "'nine', 'carol', 1.00"
+reason = "jed binds typed host values: a text value for an i32 parameter is the wrong family, 42804 (api.md §5). PostgreSQL's EXECUTE argument 'nine' is an untyped literal, so it attempts int4 input and raises 22P02."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT $1 FROM t"
+reason = "jed: a parameter with no context to adopt a type from is 42P18 indeterminate_datatype (api.md §5). PostgreSQL resolves an unknown parameter in a select list to text."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT a FROM named WHERE a = $1 OR name = $1"
+reason = "jed: two contexts inferring different types (i32 and text) for one parameter is 42804 datatype_mismatch (api.md §5). PostgreSQL types $1 from its first use (integer) and then finds no integer = text operator, 42883."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT id FROM t WHERE id = $0"
+reason = "jed's lexer accepts only $1-based indices without leading zeros, so $0 is a 42601 syntax error (grammar.md §5). PostgreSQL lexes $0 as a parameter and reports it absent, 42P02."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT id FROM t WHERE id = $01"
+reason = "jed's lexer rejects a parameter index with a leading zero, 42601 (grammar.md §5). PostgreSQL lexes $01 as parameter 1 and reports it absent in an unbound query, 42P02."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT 'x' LIKE $1"
+params = "1"
+reason = "jed binds typed host values: an integer value for a LIKE pattern (a text parameter) is the wrong family, 42804 (api.md §5). PostgreSQL's EXECUTE argument 1 is assignment-coerced to the text parameter."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT 5 LIKE $1"
+reason = "jed types a LIKE operand parameter text and then rejects the i32 subject as a LIKE operand type error, 42804 (api.md §5). PostgreSQL finds no integer ~~ unknown operator, 42883."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT $1 || id FROM t"
+params = "5"
+reason = "jed binds typed host values: an integer value for a text `||` operand is the wrong family, 42804 (api.md §5, string-functions.md §5). PostgreSQL's EXECUTE argument 5 is assignment-coerced to the text parameter."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT left($1, $2)"
+params = "'abcd', '2'"
+reason = "jed binds typed host values: a text value for left's i64 count parameter is the wrong family, 42804 (api.md §5). PostgreSQL's EXECUTE argument '2' is an untyped literal read by int4 input."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT left($1, 1) FROM t WHERE id = $1"
+reason = "jed: the text slot of left and the i32 key comparison infer different types for $1, 42804 (api.md §5). PostgreSQL types $1 from its first use (text) and then finds no integer = text operator, 42883."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT abs($1)"
+reason = "jed stops at 42725 where the overloads disagree and none takes text; it does not apply PostgreSQL's preferred-type heuristic, which picks float8 (functions.md §9.1)."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT round($1, 2)"
+reason = "jed stops at 42725 where the overloads disagree and none takes text; PostgreSQL's preferred-type heuristic types $1 numeric, which jed leaves to an explicit cast (functions.md §9.1)."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT sqrt($1)"
+reason = "jed stops at 42725 where the overloads disagree and none takes text; PostgreSQL's preferred-type heuristic picks float8 (functions.md §9.1)."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT pow($1, $2)"
+reason = "jed stops at 42725 where the overloads disagree and none takes text; PostgreSQL's preferred-type heuristic picks float8 (functions.md §9.1)."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT to_jsonb($1)"
+reason = "jed: an `any` slot fixes no type, so the parameter stays 42P18 indeterminate_datatype; PostgreSQL raises 42804 for its polymorphic anyelement (functions.md §9.1)."
+
+[[override]]
+file = "params/inference.test"
+sql = "SELECT left($1, 'x')"
+reason = "jed types the string literal 'x' text, so no left(…, text) candidate exists, 42883 (functions.md §9.1). PostgreSQL types 'x' unknown, resolves left(text, int4), and fails reading 'x' as int4, 22P02."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT 5::interval"
+reason = "jed reports a forbidden cast pair as 42804 datatype_mismatch (types.md §9, the cast matrix); PostgreSQL reports integer to interval as 42846 cannot_coerce. Both reject; only the SQLSTATE differs."

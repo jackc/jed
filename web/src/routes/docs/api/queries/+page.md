@@ -46,6 +46,10 @@ jed uses **`bigint`** for integer values — an integer-valued `number` like `1`
 integer (you write `run(1)`, not `run(1n)`), but values _read back_ come as `bigint` so a large
 `i64` never loses precision.
 
+An exact `decimal` binds from the engine's own `Decimal` type, which keeps its written scale; in Go,
+`jed.ParseDecimal("12.50")` builds one from text. An integer or a `Decimal` also binds to a `f32`/`f64`
+parameter, rounded to the nearest float.
+
 ## Reading rows
 
 How a row arrives depends on the idiom:

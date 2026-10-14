@@ -1,15 +1,13 @@
 package jed
 
-// Parameter-sensitive ("custom") plans (spec/design/estimator.md §6.1). The shared corpus binds no
-// parameters, and its literal EXPLAIN records already pin every custom plan, so these white-box
-// tests pin the binding path: a statement planned with bound values estimates, selects, and costs
-// exactly like the equivalent literal query; a value-blind statement keeps one cached plan; a
-// sensitive one re-plans as its value moves between statistics classes; and a memo hit equals fresh
-// planning.
+// Parameter-sensitive ("custom") plans (spec/design/estimator.md §6.1). That a bound statement plans,
+// estimates, and costs exactly like its literal twin is pinned for every core by the shared corpus
+// (suites/params/custom_plans.test). These white-box tests pin the plan cache: a value-blind statement
+// keeps one cached plan, a sensitive one re-plans as its value moves between statistics classes, a
+// memo hit equals fresh planning, and the cache is safe under concurrent sessions.
 
 import (
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -55,81 +53,6 @@ func seedItems(t *testing.T, s *Session) {
 	mustExec(t, s, "ANALYZE items")
 }
 
-// stripDetail blanks the detail column: a $N still renders symbolically, so the comparison with the
-// literal query is over everything else.
-func stripDetail(plan [][]Value) [][]Value {
-	out := make([][]Value, len(plan))
-	for i, row := range plan {
-		out[i] = append([]Value(nil), row...)
-		out[i][2] = TextValue("")
-	}
-	return out
-}
-
-func assertCustomMatchesLiteral(t *testing.T, s *Session, paramSQL string, params []Value, literalSQL string) {
-	t.Helper()
-	custom, _ := runValues(t, s, "EXPLAIN "+paramSQL, params...)
-	literal, _ := runValues(t, s, "EXPLAIN "+literalSQL)
-	if !reflect.DeepEqual(stripDetail(custom), stripDetail(literal)) {
-		t.Fatalf("custom plan of %s %v differs from %s:\n%v\n%v", paramSQL, params, literalSQL, custom, literal)
-	}
-	stmt, err := s.Prepare(paramSQL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prepared, preparedCost := drainValues(t, s, stmt, &stmt.sc, params...)
-	want, literalCost := runValues(t, s, literalSQL)
-	if !reflect.DeepEqual(prepared, want) || preparedCost != literalCost {
-		t.Fatalf("%s %v: rows/cost %v/%d, literal %v/%d", paramSQL, params, prepared, preparedCost, want, literalCost)
-	}
-}
-
-func accessDetails(plan [][]Value) string {
-	var parts []string
-	for _, row := range plan {
-		if d := row[2].Render(); strings.Contains(d, "scan") || strings.Contains(d, "bound") {
-			parts = append(parts, d)
-		}
-	}
-	return strings.Join(parts, " | ")
-}
-
-func TestCustomPlanMCVAndRareValues(t *testing.T) {
-	t.Parallel()
-	s := memDB().Session(SessionOptions{})
-	seedItems(t, s)
-	common, _ := runValues(t, s, "EXPLAIN SELECT id FROM items WHERE cat = 1")
-	rare, _ := runValues(t, s, "EXPLAIN SELECT id FROM items WHERE cat = 70")
-	if accessDetails(common) == accessDetails(rare) {
-		t.Fatal("the data must flip the plan")
-	}
-	sql := "SELECT id FROM items WHERE cat = $1"
-	assertCustomMatchesLiteral(t, s, sql, []Value{IntValue(1)}, "SELECT id FROM items WHERE cat = 1")
-	assertCustomMatchesLiteral(t, s, sql, []Value{IntValue(70)}, "SELECT id FROM items WHERE cat = 70")
-	assertCustomMatchesLiteral(t, s, "SELECT id FROM items WHERE cat > $1", []Value{IntValue(500)},
-		"SELECT id FROM items WHERE cat > 500")
-}
-
-func TestCustomPlanGINTermFacts(t *testing.T) {
-	t.Parallel()
-	s := memDB().Session(SessionOptions{})
-	seedItems(t, s)
-	common, _ := runValues(t, s, "EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['a']")
-	rare, _ := runValues(t, s, "EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['r7']")
-	if reflect.DeepEqual(common, rare) {
-		t.Fatal("the term facts must change the plan")
-	}
-	for _, sql := range []string{
-		"SELECT id FROM items WHERE tags @> ARRAY[$1]",
-		"SELECT id FROM items WHERE $1 = ANY(tags)",
-	} {
-		for _, tag := range []string{"a", "r7"} {
-			literal := strings.ReplaceAll(sql, "$1", "'"+tag+"'")
-			assertCustomMatchesLiteral(t, s, sql, []Value{TextValue(tag)}, literal)
-		}
-	}
-}
-
 func TestCustomPlanKeyLookupPlannedOnce(t *testing.T) {
 	t.Parallel()
 	s := memDB().Session(SessionOptions{})
@@ -156,8 +79,6 @@ func TestCustomPlanKeyLookupPlannedOnce(t *testing.T) {
 	if len(r3) != 0 || stmt.sc.p.Load() != entry {
 		t.Fatalf("NULL lookup: %v", r3)
 	}
-	assertCustomMatchesLiteral(t, s, "SELECT cat FROM items WHERE id = $1", []Value{NullValue()},
-		"SELECT cat FROM items WHERE id = NULL")
 }
 
 func TestCustomPlanSensitiveReplansAndMemoizes(t *testing.T) {
@@ -200,54 +121,6 @@ func TestCustomPlanSensitiveReplansAndMemoizes(t *testing.T) {
 	if len(after) != 2 || stmt.sc.p.Load() == entry || stmt.sc.p.Load().memo.len() != 1 {
 		t.Fatal("the refreshed entry starts a new memo")
 	}
-}
-
-func TestCustomPlanDMLTargetScans(t *testing.T) {
-	t.Parallel()
-	s := memDB().Session(SessionOptions{})
-	seedItems(t, s)
-	restore := "INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']"
-	for _, c := range [][2]string{
-		{"UPDATE items SET tags = NULL WHERE cat = $1", "UPDATE items SET tags = NULL WHERE cat = 70"},
-		{"DELETE FROM items WHERE cat = $1", "DELETE FROM items WHERE cat = 70"},
-		{
-			"DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = $1)",
-			"DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)",
-		},
-	} {
-		custom, _ := runValues(t, s, "EXPLAIN "+c[0], IntValue(70))
-		literal, _ := runValues(t, s, "EXPLAIN "+c[1])
-		if !reflect.DeepEqual(stripDetail(custom), stripDetail(literal)) {
-			t.Fatalf("%s:\n%v\n%v", c[0], custom, literal)
-		}
-		custom, _ = runValues(t, s, "EXPLAIN ANALYZE "+c[0], IntValue(70))
-		mustExec(t, s, restore)
-		literal, _ = runValues(t, s, "EXPLAIN ANALYZE "+c[1])
-		if !reflect.DeepEqual(stripDetail(custom), stripDetail(literal)) {
-			t.Fatalf("ANALYZE %s:\n%v\n%v", c[0], custom, literal)
-		}
-		mustExec(t, s, restore)
-	}
-}
-
-func TestCustomPlanInsertSelectSource(t *testing.T) {
-	t.Parallel()
-	s := memDB().Session(SessionOptions{})
-	seedItems(t, s)
-	mustExec(t, s, "CREATE TABLE picked (id i32 PRIMARY KEY)")
-	custom, _ := runValues(t, s, "EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = $1", IntValue(70))
-	mustExec(t, s, "DELETE FROM picked")
-	literal, _ := runValues(t, s, "EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = 70")
-	if !reflect.DeepEqual(stripDetail(custom), stripDetail(literal)) {
-		t.Fatalf("%v\n%v", custom, literal)
-	}
-}
-
-func TestCustomPlanGenerateSeriesBounds(t *testing.T) {
-	t.Parallel()
-	s := memDB().Session(SessionOptions{})
-	assertCustomMatchesLiteral(t, s, "SELECT count(*) FROM generate_series(1, $1) AS g",
-		[]Value{IntValue(50)}, "SELECT count(*) FROM generate_series(1, 50) AS g")
 }
 
 // The classification's soundness (estimator.md §6.1, "never the reverse"): a statement classified

@@ -1,8 +1,8 @@
-// Parameter-sensitive ("custom") plans (spec/design/estimator.md §6.1). The shared corpus binds no
-// parameters, and its literal EXPLAIN records already pin every custom plan, so these per-core tests
-// pin the binding path: a statement planned with bound values estimates, selects, and costs exactly
-// like the equivalent literal query; a value-blind statement keeps one cached plan; a sensitive one
-// re-plans as its value moves between statistics classes; and a memo hit equals fresh planning.
+// Parameter-sensitive ("custom") plans (spec/design/estimator.md §6.1). That a bound statement plans,
+// estimates, and costs exactly like its literal twin is pinned for every core by the shared corpus
+// (suites/params/custom_plans.test). These per-core tests pin the plan cache: a value-blind statement
+// keeps one cached plan, a sensitive one re-plans as its value moves between statistics classes, and
+// a memo hit equals fresh planning.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -54,65 +54,6 @@ function seed(): Engine {
   return db;
 }
 
-// A $N still renders symbolically; the comparison with the literal query is over everything else.
-function stripDetail(plan: Value[][]): Value[][] {
-  return plan.map((row) => row.map((cell, i) => (i === 2 ? textValue("") : cell)));
-}
-
-function assertCustomMatchesLiteral(
-  db: Engine,
-  paramSql: string,
-  params: Value[],
-  literalSql: string,
-): void {
-  const custom = run(db, `EXPLAIN ${paramSql}`, params).rows;
-  const literal = run(db, `EXPLAIN ${literalSql}`).rows;
-  assert.deepEqual(stripDetail(custom), stripDetail(literal), `${paramSql} vs ${literalSql}`);
-  const stmt = prepare(db, paramSql);
-  const prepared = drain(db, stmt, params);
-  const want = run(db, literalSql);
-  assert.deepEqual(prepared.rows, want.rows);
-  assert.equal(prepared.cost, want.cost, `actual cost of ${paramSql}`);
-}
-
-function accessDetails(plan: Value[][]): string {
-  return plan
-    .map((row) => render(row[2]!))
-    .filter((d) => d.includes("scan") || d.includes("bound"))
-    .join(" | ");
-}
-
-test("custom plans: MCV and rare values take their literal plans", () => {
-  const db = seed();
-  const common = run(db, "EXPLAIN SELECT id FROM items WHERE cat = 1").rows;
-  const rare = run(db, "EXPLAIN SELECT id FROM items WHERE cat = 70").rows;
-  assert.notEqual(accessDetails(common), accessDetails(rare), "the data must flip the plan");
-  const sql = "SELECT id FROM items WHERE cat = $1";
-  assertCustomMatchesLiteral(db, sql, [intValue(1n)], "SELECT id FROM items WHERE cat = 1");
-  assertCustomMatchesLiteral(db, sql, [intValue(70n)], "SELECT id FROM items WHERE cat = 70");
-  assertCustomMatchesLiteral(
-    db,
-    "SELECT id FROM items WHERE cat > $1",
-    [intValue(500n)],
-    "SELECT id FROM items WHERE cat > 500",
-  );
-});
-
-test("custom plans: GIN term facts apply to a bound operand", () => {
-  const db = seed();
-  const common = run(db, "EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['a']").rows;
-  const rare = run(db, "EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['r7']").rows;
-  assert.notDeepEqual(common, rare);
-  for (const sql of [
-    "SELECT id FROM items WHERE tags @> ARRAY[$1]",
-    "SELECT id FROM items WHERE $1 = ANY(tags)",
-  ]) {
-    for (const tag of ["a", "r7"]) {
-      assertCustomMatchesLiteral(db, sql, [textValue(tag)], sql.replaceAll("$1", `'${tag}'`));
-    }
-  }
-});
-
 test("custom plans: a key lookup is planned once", () => {
   const db = seed();
   const stmt = prepare(db, "SELECT cat FROM items WHERE id = $1");
@@ -128,12 +69,6 @@ test("custom plans: a key lookup is planned once", () => {
   // cached one.
   assert.deepEqual(drain(db, stmt, [nullValue()]).rows, []);
   assert.equal(cacheOf(stmt), entry);
-  assertCustomMatchesLiteral(
-    db,
-    "SELECT cat FROM items WHERE id = $1",
-    [nullValue()],
-    "SELECT cat FROM items WHERE id = NULL",
-  );
 });
 
 test("custom plans: a sensitive statement re-plans and memoizes", () => {
@@ -161,53 +96,6 @@ test("custom plans: a sensitive statement re-plans and memoizes", () => {
   assert.equal(drain(db, stmt, [intValue(70n)]).rows.length, 2);
   assert.notEqual(cacheOf(stmt), entry);
   assert.equal(cacheOf(stmt)!.memo.length, 1);
-});
-
-test("custom plans: DML target scans use the custom plan", () => {
-  const db = seed();
-  const restore =
-    "INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']";
-  for (const [paramSql, literalSql] of [
-    ["UPDATE items SET tags = NULL WHERE cat = $1", "UPDATE items SET tags = NULL WHERE cat = 70"],
-    ["DELETE FROM items WHERE cat = $1", "DELETE FROM items WHERE cat = 70"],
-    [
-      "DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = $1)",
-      "DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)",
-    ],
-  ] as const) {
-    let custom = run(db, `EXPLAIN ${paramSql}`, [intValue(70n)]).rows;
-    let literal = run(db, `EXPLAIN ${literalSql}`).rows;
-    assert.deepEqual(stripDetail(custom), stripDetail(literal), paramSql);
-    custom = run(db, `EXPLAIN ANALYZE ${paramSql}`, [intValue(70n)]).rows;
-    execute(db, restore);
-    literal = run(db, `EXPLAIN ANALYZE ${literalSql}`).rows;
-    assert.deepEqual(stripDetail(custom), stripDetail(literal), paramSql);
-    execute(db, restore);
-  }
-});
-
-test("custom plans: an INSERT ... SELECT source uses the custom plan", () => {
-  const db = seed();
-  execute(db, "CREATE TABLE picked (id i32 PRIMARY KEY)");
-  const custom = run(db, "EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = $1", [
-    intValue(70n),
-  ]).rows;
-  execute(db, "DELETE FROM picked");
-  const literal = run(
-    db,
-    "EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = 70",
-  ).rows;
-  assert.deepEqual(stripDetail(custom), stripDetail(literal));
-});
-
-test("custom plans: generate_series bounds are plan-time literals", () => {
-  const db = new Engine();
-  assertCustomMatchesLiteral(
-    db,
-    "SELECT count(*) FROM generate_series(1, $1) AS g",
-    [intValue(50n)],
-    "SELECT count(*) FROM generate_series(1, 50) AS g",
-  );
 });
 
 // The classification's soundness (estimator.md §6.1, "never the reverse"): a statement classified

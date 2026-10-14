@@ -29,8 +29,16 @@ class OracleOverrides
   end
 
   def normalize(sql) = sql.strip.gsub(/\s+/, " ").chomp(";")
-  def overridden?(sql) = @overrides.key?(normalize(sql))
-  def reason(sql) = @overrides[normalize(sql)]
+
+  # An entry with a `params` key matches only a record bound with that `# params:` value list
+  # (spec/design/conformance.md §1.2, compared after whitespace normalization); an entry without
+  # one matches the SQL under any binding, or none.
+  def overridden?(sql, params: nil) = !reason(sql, params: params).nil?
+
+  def reason(sql, params: nil)
+    key = normalize(sql)
+    (params && @overrides[[key, normalize(params)]]) || @overrides[[key, nil]]
+  end
 
   private
 
@@ -41,7 +49,7 @@ class OracleOverrides
     (doc["override"] || []).each_with_object({}) do |o, h|
       next if @path && !@path.end_with?(o["file"])
 
-      h[normalize(o["sql"])] = o["reason"]
+      h[[normalize(o["sql"]), o["params"] && normalize(o["params"])]] = o["reason"]
     end
   end
 end

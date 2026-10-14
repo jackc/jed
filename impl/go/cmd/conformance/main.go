@@ -18,6 +18,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -817,6 +818,87 @@ func parseTypesDirective(line string) ([]string, bool) {
 	return types, true
 }
 
+// parseParamsDirective parses a `# params: 1, 'a', NULL` directive line (spec/design/conformance.md
+// §1.2): the host values the next record binds as $1..$N. (nil, false, nil) if not a params directive;
+// a malformed value list is an error.
+func parseParamsDirective(line string) ([]jed.Value, bool, error) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "params:")
+	if !ok {
+		return nil, false, nil
+	}
+	values := []jed.Value{}
+	rest = strings.TrimSpace(rest)
+	for rest != "" {
+		var v jed.Value
+		var err error
+		v, rest, err = takeParamValue(rest)
+		if err != nil {
+			return nil, true, fmt.Errorf("# params: %w", err)
+		}
+		values = append(values, v)
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			break
+		}
+		after, ok := strings.CutPrefix(rest, ",")
+		if !ok {
+			return nil, true, fmt.Errorf("# params: expected `,` before %q", rest)
+		}
+		rest = strings.TrimSpace(after)
+	}
+	return values, true, nil
+}
+
+// takeParamValue reads one `# params:` value from the front of s: a single-quoted text (a doubled
+// ” is one quote), NULL, true/false, an integer, or a decimal with its written scale.
+func takeParamValue(s string) (jed.Value, string, error) {
+	if strings.HasPrefix(s, "'") {
+		var text strings.Builder
+		for i := 1; i < len(s); i++ {
+			if s[i] != '\'' {
+				text.WriteByte(s[i])
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '\'' {
+				text.WriteByte('\'')
+				i++
+				continue
+			}
+			return jed.TextValue(text.String()), s[i+1:], nil
+		}
+		return jed.Value{}, "", fmt.Errorf("unterminated text value %q", s)
+	}
+	token, rest := s, ""
+	if comma := strings.IndexByte(s, ','); comma >= 0 {
+		token, rest = s[:comma], s[comma:]
+	}
+	token = strings.TrimSpace(token)
+	switch {
+	case token == "NULL":
+		return jed.NullValue(), rest, nil
+	case token == "true" || token == "false":
+		return jed.BoolValue(token == "true"), rest, nil
+	case paramIntRe.MatchString(token):
+		n, err := strconv.ParseInt(token, 10, 64)
+		if err != nil {
+			return jed.Value{}, "", fmt.Errorf("integer %s is outside i64", token)
+		}
+		return jed.IntValue(n), rest, nil
+	case paramDecimalRe.MatchString(token):
+		d, err := jed.ParseDecimal(token)
+		if err != nil {
+			return jed.Value{}, "", err
+		}
+		return jed.DecimalValue(d), rest, nil
+	}
+	return jed.Value{}, "", fmt.Errorf("unrecognized value %q", token)
+}
+
+var (
+	paramIntRe     = regexp.MustCompile(`^-?[0-9]+$`)
+	paramDecimalRe = regexp.MustCompile(`^-?[0-9]+\.[0-9]+$`)
+)
+
 // assertTypes checks the query's output column types match a pending `# types:` directive.
 func assertTypes(expected []string, actual []string, sql string) error {
 	if expected != nil && !equal(expected, actual) {
@@ -948,6 +1030,7 @@ func runFile(text string, disk bool) error {
 	var pendingCost *int64
 	var pendingNames []string
 	var pendingTypes []string
+	var pendingParams []jed.Value
 	var pendingMaxCost *int64
 	var pendingMaxSQLLength *int
 	var pendingSeed *uint64
@@ -1109,6 +1192,11 @@ func runFile(text string, disk bool) error {
 				pendingNames = names
 			} else if types, ok := parseTypesDirective(line); ok {
 				pendingTypes = types
+			} else if params, ok, err := parseParamsDirective(line); ok {
+				if err != nil {
+					return err
+				}
+				pendingParams = params
 			}
 			i++
 			continue
@@ -1147,9 +1235,11 @@ func runFile(text string, disk bool) error {
 		expectedCost := pendingCost
 		expectedNames := pendingNames
 		expectedTypes := pendingTypes
+		params := pendingParams
 		pendingCost = nil
 		pendingNames = nil
 		pendingTypes = nil
+		pendingParams = nil
 		// Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
 		var maxCost int64
 		if pendingMaxCost != nil {
@@ -1273,7 +1363,7 @@ func runFile(text string, disk bool) error {
 			i++
 			sql := takeSQL(lines, &i)
 			// A statement runs through the total Query seam too (a no-row statement is a valid Query).
-			_, _, _, cost, err := drainQuery(sess, sql, "nosort", 1)
+			_, _, _, cost, err := drainQuery(sess, sql, params, "nosort", 1)
 			switch expect {
 			case "ok":
 				if err != nil {
@@ -1316,7 +1406,7 @@ func runFile(text string, disk bool) error {
 			if cols == 0 {
 				cols = 1
 			}
-			actual, names, types, cost, err := drainQuery(sess, sql, sortmode, cols)
+			actual, names, types, cost, err := drainQuery(sess, sql, params, sortmode, cols)
 			if err != nil {
 				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
 			}
@@ -1380,8 +1470,12 @@ func takeSQLUntilSeparator(lines []string, i *int) string {
 // no rows is a valid query with an empty column list (spec/design/api.md §11). The cursor is always
 // Closed (releasing any streaming reader-liveness pin), and Cost is read after the full drain — a
 // streaming query's cost is final only at exhaustion.
-func drainQuery(sess *jed.Session, sql, sortmode string, cols int) (cells, names, types []string, cost int64, err error) {
-	rows, qerr := sess.Query(context.Background(), sql)
+func drainQuery(sess *jed.Session, sql string, params []jed.Value, sortmode string, cols int) (cells, names, types []string, cost int64, err error) {
+	args := make([]any, len(params))
+	for i, p := range params {
+		args[i] = p
+	}
+	rows, qerr := sess.Query(context.Background(), sql, args...)
 	if qerr != nil {
 		return nil, nil, nil, 0, qerr
 	}

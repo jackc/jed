@@ -913,6 +913,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // (spec/design/attached-databases.md §6). In-memory attachments cannot survive the disk reopen, so
   // an # attach: file is # skip: disk.
   "harness.attach",
+  // The `# params:` directive binds host values as $1..$N for the next record through the session's
+  // query(sql, params) seam (spec/design/conformance.md §1.2).
+  "harness.params",
   // The jed_tables catalog relation (I1, spec/design/introspection.md §5): a read-only computed
   // relation — one row per user table of the qualified database, derived at execution from its
   // pinned catalog snapshot; SELECT-gated like a user table; write/DDL targets are 42809.

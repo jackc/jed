@@ -1,0 +1,293 @@
+# Bound parameters ($N) through the host API (spec/design/api.md §5): a parameter's type comes from
+# its context, each value is coerced to it before any row is touched, and a bound value reads exactly
+# like the literal it replaces. Each `# params:` record binds host values (conformance.md §1.2).
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_no_from, query.where_eq, query.order_by, query.interval_set, expr.in_list, cast.operator, cast.explicit, types.i16, types.i32, types.i64, types.text, types.f64, types.decimal, types.uuid, types.timestamp, types.date, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+# A point lookup on the primary key, bound and literal, reads the same row at the same cost.
+# params: 2
+# cost: 4
+query I nosort
+SELECT v FROM t WHERE id = $1
+----
+20
+
+# cost: 4
+query I nosort
+SELECT v FROM t WHERE id = 2
+----
+20
+
+# A NULL key matches nothing (three-valued) and performs no descent.
+# params: NULL
+# cost: 0
+query I nosort
+SELECT v FROM t WHERE id = $1
+----
+
+# The parameter adopts the key column's i32, so a value outside i32 fails at binding.
+# params: 2147483648
+statement error 22003
+SELECT v FROM t WHERE id = $1
+
+# A NULL compared against a non-key column is unknown, so nothing matches.
+# params: NULL
+query I nosort
+SELECT id FROM t WHERE v = $1
+----
+
+# params: 1, 3
+query I rowsort
+SELECT id FROM t WHERE id IN ($1, $2)
+----
+1
+3
+
+# A union of bound key ranges, and an IN list clipped by a bound bound (interval sets).
+# params: 3, 4
+query I nosort
+SELECT id FROM t WHERE id < $1 OR id >= $2 ORDER BY id
+----
+1
+2
+4
+
+# params: 1, 3, 4, 2
+query I nosort
+SELECT id FROM t WHERE id IN ($1, $2, $3) AND id > $4 ORDER BY id
+----
+3
+4
+
+# A parameter compared with an i16 column is typed i16.
+statement ok
+CREATE TABLE narrow (id i32 PRIMARY KEY, s i16)
+
+statement ok
+INSERT INTO narrow VALUES (1, 100)
+
+# params: 100000
+statement error 22003
+SELECT id FROM narrow WHERE s = $1
+
+# params: 100
+# types: i32
+query I nosort
+SELECT id FROM narrow WHERE s = $1
+----
+1
+
+# A composite primary key bounded by a bound prefix and range.
+statement ok
+CREATE TABLE ck (a i32, b i16, v i32, PRIMARY KEY (b, a))
+
+statement ok
+INSERT INTO ck VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (1, 2, 40)
+
+# params: 1, 2
+query I nosort
+SELECT v FROM ck WHERE b = $1 AND a >= $2 ORDER BY a
+----
+20
+30
+
+# A decimal value binds into an f64 key column (decimal-to-float adaptation, float.md §4).
+statement ok
+CREATE TABLE fk (f f64, a i32, v i32, PRIMARY KEY (f, a))
+
+statement ok
+INSERT INTO fk VALUES (1.5, 1, 10), (2.5, 1, 20)
+
+# params: 1.5, 1
+query I nosort
+SELECT v FROM fk WHERE f = $1 AND a = $2
+----
+10
+
+# An integer value binds into an f64 column too.
+# params: 3, 1, 30
+statement ok
+INSERT INTO fk VALUES ($1, $2, $3)
+
+# params: 3
+# types: f64
+query R nosort
+SELECT f FROM fk WHERE f = $1
+----
+3
+
+# INSERT, UPDATE, and DELETE bind their values and keys.
+statement ok
+CREATE TABLE people (id i32 PRIMARY KEY, name text NOT NULL, balance decimal)
+
+# params: 7, 'alice', 12.50
+statement ok
+INSERT INTO people VALUES ($1, $2, $3)
+
+# An integer binds into a decimal column at scale 0.
+# params: 8, 'bob', 3
+statement ok
+INSERT INTO people VALUES ($1, $2, $3)
+
+# params: 7
+query ITD nosort
+SELECT id, name, balance FROM people WHERE id = $1
+----
+7
+alice
+12.50
+
+# params: 'bob'
+query ID nosort
+SELECT id, balance FROM people WHERE name = $1
+----
+8
+3
+
+# A NULL into a NOT NULL column fails at binding.
+# params: 9, NULL, 1.00
+statement error 23502
+INSERT INTO people VALUES ($1, $2, $3)
+
+# A text value for an integer column is the wrong family.
+# params: 'nine', 'carol', 1.00
+statement error 42804
+INSERT INTO people VALUES ($1, $2, $3)
+
+# A text containing a quote and a comma binds verbatim.
+# params: 9, 'o''neil, jr', NULL
+statement ok
+INSERT INTO people VALUES ($1, $2, $3)
+
+# params: 9
+query TD nosort
+SELECT name, balance FROM people WHERE id = $1
+----
+o'neil, jr
+NULL
+
+# params: 99.99, 8
+statement ok
+UPDATE people SET balance = $1 WHERE id = $2
+
+# params: 7
+statement ok
+DELETE FROM people WHERE id = $1
+
+query ID nosort
+SELECT id, balance FROM people ORDER BY id
+----
+8
+99.99
+9
+NULL
+
+# A text value adapts to a uuid, timestamp, or date parameter by that type's input form; malformed
+# text is that type's input error.
+statement ok
+CREATE TABLE events (id uuid PRIMARY KEY, at timestamp, day date)
+
+# params: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-02-29 12:30:00', '2024-03-01'
+statement ok
+INSERT INTO events VALUES ($1, $2, $3)
+
+# params: 'A0EEBC999C0B4EF8BB6D6BB9BD380A11'
+query TT nosort
+SELECT at, day FROM events WHERE id = $1
+----
+2024-02-29 12:30:00
+2024-03-01
+
+# params: 'not-a-uuid'
+statement error 22P02
+SELECT at FROM events WHERE id = $1
+
+# A cast declares the parameter's type, in either spelling.
+# params: 42
+# types: i32
+query I nosort
+SELECT $1::int
+----
+42
+
+# params: 7
+# types: i32
+query I nosort
+SELECT CAST($1 AS int)
+----
+7
+
+# params: 100000
+statement error 22003
+SELECT $1::smallint
+
+# `::` desugars to CAST, so integer to interval is the same forbidden pair, and a lone `:` is not
+# part of the surface.
+statement error 42804
+SELECT 5::interval
+
+statement error 42601
+SELECT 1 : 2
+
+# A cast to numeric(p,s) types the parameter decimal and rescales the bound value.
+# params: 1.005
+query D nosort
+SELECT $1::numeric(10,2)
+----
+1.01
+
+# Two adaptable operands with no anchoring type default the parameter to i64.
+# params: 5
+# types: boolean
+query B nosort
+SELECT $1 = 5
+----
+true
+
+# A bare parameter has no type to adopt.
+# params: 1
+statement error 42P18
+SELECT $1 FROM t
+
+# A gap in the parameter indices leaves the missing one untyped.
+# params: 1, 2, 3
+statement error 42P18
+SELECT id FROM t WHERE id = $1 OR v = $3
+
+# One parameter inferred as both i32 and text.
+statement ok
+CREATE TABLE named (a i32 PRIMARY KEY, name text)
+
+# params: 1
+statement error 42804
+SELECT a FROM named WHERE a = $1 OR name = $1
+
+# The wrong number of values for the statement's parameters.
+# params:
+statement error 42601
+SELECT id FROM t WHERE id = $1
+
+# params: 1, 2
+statement error 42601
+SELECT id FROM t WHERE id = $1
+
+# DDL takes no parameters.
+# params: 1
+statement error 42601
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+# Malformed parameter tokens are syntax errors.
+statement error 42601
+SELECT id FROM t WHERE id = $0
+
+statement error 42601
+SELECT id FROM t WHERE id = $
+
+statement error 42601
+SELECT id FROM t WHERE id = $01

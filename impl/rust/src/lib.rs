@@ -999,6 +999,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // (spec/design/attached-databases.md §6). In-memory attachments cannot survive the disk reopen, so
     // an # attach: file is # skip: disk.
     "harness.attach",
+    // The `# params:` directive binds host values as $1..$N for the next record through the session's
+    // query(sql, params) seam (spec/design/conformance.md §1.2).
+    "harness.params",
     // The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
     // (`db.upgrade_collations`) on the running DB — clears a version-skew so a corpus test can drive
     // skew→migrate→writable end to end (spec/design/collation.md §12).

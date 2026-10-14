@@ -201,13 +201,48 @@ would reject.
 
 ### 1.2 Parameters
 
-The corpus uses **literal SQL** (`WHERE id = 1`), never bound parameters. The
-parameterized lookup API implied by CLAUDE.md §11 step 5 (`SELECT ... WHERE pk = $1`) has
-**landed** as each implementation's own host-API surface ([api.md](api.md), grammar.md §5):
-`$N` placeholders are parsed and bound through `prepare`/`execute`, with a parameter's type
-inferred from context (`42P18` if indeterminate). That surface — and its `42P18` code — is
-tested **in-impl**, not by the shared corpus, which still fixes **semantics** with literal
-SQL only, not the binding API.
+The corpus is predominantly **literal SQL** (`WHERE id = 1`). A record may instead bind
+parameters through the host API ([api.md](api.md) §5, grammar.md §5) with the **`# params:`
+directive**, so parameter typing, binding, and the plans that bound values select
+([estimator.md](estimator.md) §6.1) are pinned once for every core rather than in mirrored
+per-core tests.
+
+- **Form.** `# params: <value>, <value>, …` binds to the **next record** (a `statement` or a
+  `query`) and is reset after it, like `# seed:`. The values are `$1`, `$2`, … in order; an empty
+  list (`# params:`) binds zero values. Without the directive a record binds zero values, so a
+  record with a `$N` and no directive fails `42601` (the count mismatch) as it always has.
+- **Values** are written in a small, host-neutral spelling, each mapping to one host value (the
+  `Value` every core's `query(sql, params)` takes):
+
+  | spelling | host value |
+  |---|---|
+  | `NULL` | the null value |
+  | `true` / `false` | a boolean |
+  | `-?[0-9]+` | an integer (i64; a token outside i64 is a harness error) |
+  | `-?[0-9]+\.[0-9]+` | a decimal, its scale as written (`1.50` has scale 2) |
+  | `'…'` (a doubled `''` is one quote) | a text value |
+
+  Commas inside a quoted value do not separate values. A host value carries no SQL type: binding
+  coerces it to the parameter's inferred type (an integer into a decimal parameter, a text into a
+  `uuid`/`timestamp`/`bytea` parameter by that type's input form, and so on — api.md §5), with the
+  binding errors api.md §5 lists (`22003`, `42804`, `22P02`, `23502`, `42601`).
+- **Execution.** The harness runs the record through the session's one-shot
+  `query(sql, params)` seam, the same seam every other record uses with an empty parameter list,
+  and drains it as usual; every other directive (`# cost:`, `# names:`, `# types:`, `# max_cost:`,
+  …) applies unchanged. `EXPLAIN` given values shows the custom plan with each `$N` still rendered
+  symbolically ([explain.md](explain.md)), so a bound `EXPLAIN` record pins the plan the values
+  select.
+- **Gate.** A file using `# params:` requires the **`harness.params`** capability (§3), so a core
+  whose harness has not wired the directive skips the file instead of running every record with
+  zero values. `mise run verify` checks each directive parses and that its file declares the
+  capability.
+- **Oracle.** The importer replays a bound record as `PREPARE __jed_params AS <sql>;` followed by
+  `EXECUTE __jed_params(<values>)` — every value spelling above is also a PostgreSQL literal that
+  `EXECUTE` accepts as an argument. PostgreSQL infers parameter types and coerces `EXECUTE`
+  arguments by its own rules, which differ from jed's at the edges (`SELECT $1` is `text` in
+  PostgreSQL and `42P18` in jed; `$1 = $2` defaults to `i64` in jed; PostgreSQL's `EXECUTE`
+  assignment-coerces an integer into a `text` parameter where jed's binder raises `42804`). Those
+  records carry an override like any other divergence (§5).
 
 ## 2. Structured-error matching
 

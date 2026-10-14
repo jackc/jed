@@ -628,6 +628,81 @@ fn parse_types_directive(rest: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Parse a `# params: 1, 'a', NULL` directive body (spec/design/conformance.md §1.2): the host values
+/// the next record binds as `$1..$N`. None if this comment is not a params directive; a malformed
+/// value list is an error.
+fn parse_params_directive(rest: &str) -> Option<std::result::Result<Vec<jed::Value>, String>> {
+    let body = rest.trim_start().strip_prefix("params:")?;
+    Some(parse_param_values(body.trim()).map_err(|e| format!("# params: {e}")))
+}
+
+fn parse_param_values(mut rest: &str) -> std::result::Result<Vec<jed::Value>, String> {
+    let mut values = Vec::new();
+    while !rest.is_empty() {
+        let (value, after) = take_param_value(rest)?;
+        values.push(value);
+        rest = after.trim();
+        if rest.is_empty() {
+            break;
+        }
+        rest = rest
+            .strip_prefix(',')
+            .ok_or_else(|| format!("expected `,` before {rest:?}"))?
+            .trim();
+    }
+    Ok(values)
+}
+
+/// Read one `# params:` value from the front of `s`: a single-quoted text (a doubled `''` is one
+/// quote), `NULL`, `true`/`false`, an integer, or a decimal with its written scale.
+fn take_param_value(s: &str) -> std::result::Result<(jed::Value, &str), String> {
+    if let Some(body) = s.strip_prefix('\'') {
+        let mut text = String::new();
+        let mut chars = body.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if c != '\'' {
+                text.push(c);
+                continue;
+            }
+            if chars.peek().map(|&(_, n)| n) == Some('\'') {
+                text.push('\'');
+                chars.next();
+                continue;
+            }
+            return Ok((jed::Value::Text(text), &body[i + 1..]));
+        }
+        return Err(format!("unterminated text value {s:?}"));
+    }
+    let (token, rest) = match s.find(',') {
+        Some(comma) => (&s[..comma], &s[comma..]),
+        None => (s, ""),
+    };
+    let token = token.trim();
+    let digits = token.strip_prefix('-').unwrap_or(token);
+    let all_digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let value = match token {
+        "NULL" => jed::Value::Null,
+        "true" => jed::Value::Bool(true),
+        "false" => jed::Value::Bool(false),
+        _ if all_digits(digits) => jed::Value::Int(
+            token
+                .parse()
+                .map_err(|_| format!("integer {token} is outside i64"))?,
+        ),
+        _ => match digits.split_once('.') {
+            Some((int, frac)) if all_digits(int) && all_digits(frac) => {
+                jed::Value::Decimal(jed::Decimal::from_digits_scale(
+                    token.starts_with('-'),
+                    &format!("{int}{frac}"),
+                    frac.len() as u32,
+                ))
+            }
+            _ => return Err(format!("unrecognized value {token:?}")),
+        },
+    };
+    Ok((value, rest))
+}
+
 /// Assert the accrued execution cost matches a pending `# cost:` directive (if any).
 fn assert_cost(expected: Option<i64>, actual: i64, sql: &str) -> std::result::Result<(), String> {
     match expected {
@@ -747,6 +822,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_cost: Option<i64> = None;
     let mut pending_names: Option<Vec<String>> = None;
     let mut pending_types: Option<Vec<String>> = None;
+    let mut pending_params: Option<Vec<jed::Value>> = None;
     let mut pending_max_cost: Option<i64> = None;
     let mut pending_max_sql_length: Option<usize> = None;
     let mut pending_seed: Option<u64> = None;
@@ -897,6 +973,8 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 pending_names = Some(names);
             } else if let Some(types) = parse_types_directive(rest) {
                 pending_types = Some(types);
+            } else if let Some(params) = parse_params_directive(rest) {
+                pending_params = Some(params?);
             }
             continue;
         }
@@ -939,6 +1017,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         let expected_cost = pending_cost.take();
         let expected_names = pending_names.take();
         let expected_types = pending_types.take();
+        let params = pending_params.take().unwrap_or_default();
         // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
         sess.set_max_cost(pending_max_cost.take().unwrap_or(0));
         // Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
@@ -1028,7 +1107,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 }
                 let expect = parts.next().unwrap_or("");
                 let sql = take_sql(&mut lines);
-                let result = drain_query(&mut sess, &sql);
+                let result = drain_query(&mut sess, &sql, &params);
                 match expect {
                     "ok" => match result {
                         Ok(outcome) => assert_cost(expected_cost, outcome.cost(), &sql)?,
@@ -1071,7 +1150,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     }
                     expected.push(l.trim().to_string());
                 }
-                let outcome = drain_query(&mut sess, &sql).map_err(|e| {
+                let outcome = drain_query(&mut sess, &sql, &params).map_err(|e| {
                     format!(
                         "query failed with {}: {}\n  SQL: {sql}",
                         e.code(),
@@ -1128,6 +1207,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
     let mut pending_seed: Option<u64> = None;
     let mut pending_clock: Option<i64> = None;
     let mut pending_clock_advance: Option<(i64, i64)> = None;
+    let mut pending_params: Vec<jed::Value> = Vec::new();
     let mut changed = false;
     let mut i = 0;
     while i < out.len() {
@@ -1171,6 +1251,8 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 pending_clock = Some(c);
             } else if let Some(sa) = parse_clock_advance_directive(rest) {
                 pending_clock_advance = Some(sa);
+            } else if let Some(params) = parse_params_directive(rest) {
+                pending_params = params.ok()?;
             }
             i += 1;
             continue;
@@ -1193,6 +1275,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
             (None, Some(c)) => sess.set_clock_source(jed::fixed_clock(c)),
             (None, None) => sess.clear_clock_source(),
         }
+        let params = std::mem::take(&mut pending_params);
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
         let actual_cost: Option<i64> = match kind {
@@ -1204,7 +1287,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                     sql.push(out[i].clone());
                     i += 1;
                 }
-                let result = drain_query(&mut sess, &sql.join("\n"));
+                let result = drain_query(&mut sess, &sql.join("\n"), &params);
                 // Only a `statement ok` carries a cost; an error record never does.
                 if expect == "ok" {
                     result.ok().map(|o| o.cost())
@@ -1226,7 +1309,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 while i < out.len() && !out[i].trim().is_empty() {
                     i += 1;
                 }
-                drain_query(&mut sess, &sql.join("\n"))
+                drain_query(&mut sess, &sql.join("\n"), &params)
                     .ok()
                     .map(|o| o.cost())
             }
@@ -1309,8 +1392,8 @@ impl Drained {
 /// (`54P01` cost abort, `57014` cancellation, or an arithmetic trap — streaming.md §6) surfaces here,
 /// exactly matching the materialized path's error; a failing read inside a block poisons it via the
 /// cursor's drain hook (transactions.md §6).
-fn drain_query(sess: &mut JedSession, sql: &str) -> jed::Result<Drained> {
-    let mut rows = sess.query(sql, &[])?;
+fn drain_query(sess: &mut JedSession, sql: &str, params: &[jed::Value]) -> jed::Result<Drained> {
+    let mut rows = sess.query(sql, params)?;
     let column_names = rows.column_names().to_vec();
     let column_types = rows.column_types().to_vec();
     let mut values = Vec::new();
@@ -1526,7 +1609,7 @@ impl Session {
 fn run_record(sess: &mut JedSession, sid: &str, record: &Record) -> Result<(), String> {
     match record {
         Record::Statement { expect, code, sql } => {
-            let result = drain_query(sess, sql);
+            let result = drain_query(sess, sql, &[]);
             match expect.as_str() {
                 "ok" => {
                     if let Err(e) = result {
@@ -1560,7 +1643,7 @@ fn run_record(sess: &mut JedSession, sid: &str, record: &Record) -> Result<(), S
             sql,
             expected,
         } => {
-            let outcome = drain_query(sess, sql).map_err(|e| {
+            let outcome = drain_query(sess, sql, &[]).map_err(|e| {
                 format!(
                     "[{sid}] query failed with {}: {}\n  SQL: {sql}",
                     e.code(),

@@ -1221,9 +1221,9 @@ primary        ::= number
  * documented §36 divergences). */
 typed_literal  ::= type_word string
 
-/* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). NOT part of
- * the conformance corpus (which is literal-only, ../design/conformance.md §1.2): a
- * parameter is bound by the host API (../design/api.md), and its type is inferred from
+/* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). A parameter
+ * is bound by the host API (../design/api.md; the corpus binds through the `# params:`
+ * directive, ../design/conformance.md §1.2), and its type is inferred from
  * context (sibling operand, target column, or CAST target; 42P18 if indeterminate). The
  * lexer rejects "$0", a leading zero ("$01"), and "$" with no following digit (42601).
  * Allowed anywhere `primary` is and as an `insert_value`; NOT in LIMIT/OFFSET, GROUP BY,

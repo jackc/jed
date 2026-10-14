@@ -1,9 +1,8 @@
-// Parameter-sensitive ("custom") plans (spec/design/estimator.md §6.1). The shared corpus binds no
-// parameters, and its literal EXPLAIN records already pin every custom plan, so these per-core tests
-// pin the binding path through the public API: a statement planned with bound values estimates,
-// selects, and costs exactly like the equivalent literal query; a value-blind statement keeps one
-// cached plan; a sensitive one re-plans as its value moves between statistics classes; and a memo
-// hit equals fresh planning.
+// Parameter-sensitive ("custom") plans (spec/design/estimator.md §6.1). That a bound statement plans,
+// estimates, and costs exactly like its literal twin is pinned for every core by the shared corpus
+// (suites/params/custom_plans.test). These per-core tests pin the plan cache through the public API:
+// a value-blind statement keeps one cached plan, a sensitive one re-plans as its value moves between
+// statistics classes, and a memo hit equals fresh planning.
 
 use jed::value::Value;
 use jed::{CreateOptions, Database, Session, SessionOptions};
@@ -84,112 +83,6 @@ fn cached(stmt: &jed::PreparedStatement) -> (bool, usize, *const ()) {
     )
 }
 
-/// EXPLAIN with bound values equals EXPLAIN of the literal query, row for row (the estimates and
-/// the selected access path), and the prepared execution's actual cost equals the literal's.
-fn assert_custom_matches_literal(
-    s: &mut Session,
-    param_sql: &str,
-    params: &[Value],
-    literal_sql: &str,
-) {
-    let custom = rows(s, &format!("EXPLAIN {param_sql}"), params);
-    let literal = rows(s, &format!("EXPLAIN {literal_sql}"), &[]);
-    assert_eq!(
-        strip_params(&custom),
-        strip_params(&literal),
-        "custom plan of {param_sql} {params:?} differs from {literal_sql}"
-    );
-    let stmt = s.prepare(param_sql).unwrap();
-    let (prepared_rows, prepared_cost) = drain(s, &stmt, params);
-    let (literal_rows, literal_cost) = drain_sql(s, literal_sql, &[]);
-    assert_eq!(prepared_rows, literal_rows);
-    assert_eq!(
-        prepared_cost, literal_cost,
-        "actual cost of {param_sql} {params:?}"
-    );
-}
-
-/// A `$N` still renders symbolically; the comparison is over everything else.
-fn strip_params(plan: &[Vec<Value>]) -> Vec<Vec<Value>> {
-    plan.iter()
-        .map(|row| {
-            let mut row = row.clone();
-            row[2] = Value::Text(String::new());
-            row
-        })
-        .collect()
-}
-
-fn access(plan: &[Vec<Value>]) -> String {
-    plan.iter()
-        .filter_map(|row| match &row[2] {
-            Value::Text(t) if t.contains("scan") || t.contains("bound") => Some(t.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-#[test]
-fn mcv_and_rare_values_take_their_literal_plans() {
-    let mut s = mem();
-    seed(&mut s);
-    let common = rows(&mut s, "EXPLAIN SELECT id FROM items WHERE cat = 1", &[]);
-    let rare = rows(&mut s, "EXPLAIN SELECT id FROM items WHERE cat = 70", &[]);
-    assert_ne!(
-        access(&common),
-        access(&rare),
-        "the data must flip the plan"
-    );
-    let sql = "SELECT id FROM items WHERE cat = $1";
-    assert_custom_matches_literal(
-        &mut s,
-        sql,
-        &[Value::Int(1)],
-        "SELECT id FROM items WHERE cat = 1",
-    );
-    assert_custom_matches_literal(
-        &mut s,
-        sql,
-        &[Value::Int(70)],
-        "SELECT id FROM items WHERE cat = 70",
-    );
-    // A histogram range.
-    assert_custom_matches_literal(
-        &mut s,
-        "SELECT id FROM items WHERE cat > $1",
-        &[Value::Int(500)],
-        "SELECT id FROM items WHERE cat > 500",
-    );
-}
-
-#[test]
-fn gin_term_facts_apply_to_a_bound_operand() {
-    let mut s = mem();
-    seed(&mut s);
-    let common = rows(
-        &mut s,
-        "EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['a']",
-        &[],
-    );
-    let rare = rows(
-        &mut s,
-        "EXPLAIN SELECT id FROM items WHERE tags @> ARRAY['r7']",
-        &[],
-    );
-    assert_ne!(common, rare);
-    let tag = |t: &str| Value::Text(t.to_string());
-    for sql in [
-        "SELECT id FROM items WHERE tags @> ARRAY[$1]",
-        "SELECT id FROM items WHERE $1 = ANY(tags)",
-    ] {
-        for t in ["a", "r7"] {
-            let literal = sql.replace("$1", &format!("'{t}'"));
-            assert_custom_matches_literal(&mut s, sql, &[tag(t)], &literal);
-        }
-    }
-}
-
 #[test]
 fn key_lookup_is_planned_once() {
     let mut s = mem();
@@ -208,12 +101,6 @@ fn key_lookup_is_planned_once() {
     let (r3, _) = drain(&mut s, &stmt, &[Value::Null]);
     assert!(r3.is_empty());
     assert_eq!(cached(&stmt).2, plan);
-    assert_custom_matches_literal(
-        &mut s,
-        "SELECT cat FROM items WHERE id = $1",
-        &[Value::Null],
-        "SELECT cat FROM items WHERE id = NULL",
-    );
 }
 
 #[test]
@@ -253,75 +140,6 @@ fn sensitive_statement_replans_and_memoizes() {
     let (after, _) = drain(&mut s, &stmt, &[Value::Int(70)]);
     assert_eq!(after.len(), 2);
     assert_eq!(cached(&stmt).1, 1);
-}
-
-#[test]
-fn dml_target_scans_use_the_custom_plan() {
-    let mut s = mem();
-    seed(&mut s);
-    for (param_sql, literal_sql) in [
-        (
-            "UPDATE items SET tags = NULL WHERE cat = $1",
-            "UPDATE items SET tags = NULL WHERE cat = 70",
-        ),
-        (
-            "DELETE FROM items WHERE cat = $1",
-            "DELETE FROM items WHERE cat = 70",
-        ),
-        (
-            "DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = $1)",
-            "DELETE FROM items WHERE id IN (SELECT id FROM items WHERE cat = 70)",
-        ),
-    ] {
-        let custom = rows(&mut s, &format!("EXPLAIN {param_sql}"), &[Value::Int(70)]);
-        let literal = rows(&mut s, &format!("EXPLAIN {literal_sql}"), &[]);
-        assert_eq!(strip_params(&custom), strip_params(&literal), "{param_sql}");
-        let custom = rows(
-            &mut s,
-            &format!("EXPLAIN ANALYZE {param_sql}"),
-            &[Value::Int(70)],
-        );
-        exec(
-            &mut s,
-            "INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']",
-        );
-        let literal = rows(&mut s, &format!("EXPLAIN ANALYZE {literal_sql}"), &[]);
-        assert_eq!(strip_params(&custom), strip_params(&literal), "{param_sql}");
-        exec(
-            &mut s,
-            "INSERT INTO items VALUES (70, 70, ARRAY['a', 'r70']) ON CONFLICT (id) DO UPDATE SET cat = 70, tags = ARRAY['a', 'r70']",
-        );
-    }
-}
-
-#[test]
-fn insert_select_source_uses_the_custom_plan() {
-    let mut s = mem();
-    seed(&mut s);
-    exec(&mut s, "CREATE TABLE picked (id i32 PRIMARY KEY)");
-    let custom = rows(
-        &mut s,
-        "EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = $1",
-        &[Value::Int(70)],
-    );
-    exec(&mut s, "DELETE FROM picked");
-    let literal = rows(
-        &mut s,
-        "EXPLAIN ANALYZE INSERT INTO picked SELECT id FROM items WHERE cat = 70",
-        &[],
-    );
-    assert_eq!(strip_params(&custom), strip_params(&literal));
-}
-
-#[test]
-fn generate_series_bounds_are_plan_time_literals() {
-    let mut s = mem();
-    assert_custom_matches_literal(
-        &mut s,
-        "SELECT count(*) FROM generate_series(1, $1) AS g",
-        &[Value::Int(50)],
-        "SELECT count(*) FROM generate_series(1, 50) AS g",
-    );
 }
 
 /// The classification's soundness (estimator.md §6.1, "never the reverse"): a statement classified

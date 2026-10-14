@@ -154,12 +154,13 @@ class PgOracle
     end
   end
 
-  attr_accessor :applied, :tz
+  attr_accessor :applied, :tz, :prelude
 
   def initialize(label: "oracle", tz: "UTC")
     @label = label    # used only in the "sentinels missing" raise message
     @applied = []      # [PG-rewritten SQL, zone] of statements known to succeed (the replay prefix)
     @tz = tz           # the session zone for the CURRENT probe (`# timezone:` directive)
+    @prelude = nil     # SQL run after the replay prefix, before the probe (a bound record's PREPARE)
     PgOracle.assert_profile!
   end
 
@@ -192,6 +193,7 @@ class PgOracle
     script = +"BEGIN;\n"
     script << session_preamble
     script << replay_prefix
+    script << @prelude.to_s
     script << "\\echo @@@S\n" << body << "\n\\echo @@@E\n" << "ROLLBACK;\n"
     out, err, = Open3.capture3(*args, stdin_data: script)
     s = out.lines.index { |l| l.chomp == "@@@S" }
@@ -291,6 +293,7 @@ class PgOracle
     script = +"BEGIN;\n"
     script << session_preamble
     script << replay_prefix
+    script << @prelude.to_s
     script << "\\echo @@@S\n" << pg_sql << ";\n" << "\\echo @@@E\n" << "ROLLBACK;\n"
     script
   end

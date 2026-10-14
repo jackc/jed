@@ -25,6 +25,7 @@
 
 require_relative "lib/pg_oracle"
 require_relative "lib/oracle_overrides"
+require_relative "../spec/conformance/params"
 
 class OracleImport
   def initialize(path)
@@ -34,10 +35,12 @@ class OracleImport
     @ledger = OracleOverrides.new(path: @path)
     @warnings = []
     @next_tz = nil # a pending `# timezone:` set by a comment, consumed by the next record
+    @next_params = nil # a pending `# params:` value list, consumed by the next record
+    @params = nil      # the current record's bound values (conformance.md §1.2), or nil
   end
 
   def normalize(sql) = @ledger.normalize(sql)
-  def overridden?(sql) = @ledger.overridden?(sql)
+  def overridden?(sql) = @ledger.overridden?(sql, params: @params_text)
 
   # Returns the regenerated file as a String.
   def regenerate
@@ -52,13 +55,15 @@ class OracleImport
       if record_start
         @oracle.tz = @next_tz || "UTC"
         @next_tz = nil
+        @params, @params_text = @next_params
+        @next_params = nil
       end
       case line
       when /^statement\s+ok\s*$/
         sql, i = take_sql(i + 1)
         out << line << sql.join
         verify_ok(sql)
-        @oracle.add_applied(sql.join)
+        @oracle.add_applied(applied_sql(sql.join))
       when /^statement\s+error\s+(\S+)/
         declared = Regexp.last_match(1)
         sql, i = take_sql(i + 1)
@@ -85,7 +90,7 @@ class OracleImport
         is_dml_query = joined =~ /\A\s*(insert|update|delete)\b/i ||
                        (joined =~ /\A\s*with\b/i &&
                         joined =~ /\b(insert\s+into|update\b[\s\S]*\bset\b|delete\s+from)\b/i)
-        @oracle.add_applied(joined) if is_dml_query
+        @oracle.add_applied(applied_sql(joined)) if is_dml_query
       else
         # A `# timezone: <zone>` directive sets the session zone for the next record (timezones.md
         # §9.4); record it so `run` issues a matching `SET LOCAL TimeZone`. `# load-timezone:` is a
@@ -93,6 +98,9 @@ class OracleImport
         if line =~ /^#\s*timezone:\s*(\S+)/
           @next_tz = Regexp.last_match(1)
         end
+        # A `# params:` list binds the next record's $N: it replays as PREPARE + EXECUTE.
+        params = CorpusParams.parse_line(line.chomp)
+        @next_params = [params, line.chomp.sub(/\A#\s*params:/, "")] if params
         out << line # comment / blank / directive — pass through verbatim
         i += 1
       end
@@ -119,10 +127,24 @@ class OracleImport
     [@lines[start...j], j]
   end
 
+  # A bound record runs as PREPARE + EXECUTE (conformance.md §1.2): each value's spelling is also the
+  # PostgreSQL literal EXECUTE takes as its argument. Unbound records run as written.
+  def prepare_sql(sql) = "PREPARE __jed_params AS #{@oracle.pg_sql(sql)};\n"
+  def execute_sql = "EXECUTE __jed_params(#{@params.map(&:sql).join(', ')})"
+  def bound_body(sql) = @params ? "#{prepare_sql(sql)}#{execute_sql};" : @oracle.terminate(sql)
+
+  # The replay-prefix form of a successful record: a bound one deallocates its statement so the next
+  # bound record can PREPARE the same name.
+  def applied_sql(sql)
+    return sql unless @params
+
+    "#{prepare_sql(sql)}#{execute_sql};\nDEALLOCATE __jed_params"
+  end
+
   def verify_ok(sql)
     return if overridden?(sql.join)
 
-    _stdout, err = @oracle.run(@oracle.terminate(sql.join))
+    _stdout, err = @oracle.run(bound_body(sql.join))
     bad = err[/^ERROR:.*/]
     @warnings << "expected `statement ok` but PG raised: #{bad.strip}\n  #{sql.join.strip}" if bad
   end
@@ -130,9 +152,11 @@ class OracleImport
   def check_error(sql, declared)
     return if overridden?(sql.join) # documented divergence — PG's disagreement is expected
 
-    _stdout, err = @oracle.run("\\set VERBOSITY sqlstate\n" + @oracle.terminate(sql.join))
-    # The prefix is clean (all `statement ok`), so the LAST error on stderr is the target's.
-    got = err.scan(/ERROR:\s+([0-9A-Za-z]{5})/).last&.first
+    _stdout, err = @oracle.run("\\set VERBOSITY sqlstate\n" + bound_body(sql.join))
+    # The prefix is clean (all `statement ok`), so the LAST error on stderr is the target's — or, for a
+    # bound record, the FIRST: a failed PREPARE leaves the transaction aborted, so EXECUTE fails 25P02.
+    codes = err.scan(/ERROR:\s+([0-9A-Za-z]{5})/)
+    got = (@params ? codes.first : codes.last)&.first
     if got.nil?
       @warnings << "expected error #{declared} but PG did not raise one — add an override " \
                    "(true divergence): #{sql.join.strip}"
@@ -143,7 +167,14 @@ class OracleImport
   end
 
   def regenerate_query(sql, declared_coltypes, sortmode, old)
-    pg_sql = @oracle.pg_sql(sql)
+    @oracle.prelude = @params && prepare_sql(sql)
+    pg_sql = @params ? execute_sql : @oracle.pg_sql(sql)
+    regenerate_pg_query(sql, pg_sql, declared_coltypes, sortmode, old)
+  ensure
+    @oracle.prelude = nil
+  end
+
+  def regenerate_pg_query(sql, pg_sql, declared_coltypes, sortmode, old)
 
     # Type pass: `\gdesc` describes result columns without executing.
     types = @oracle.describe(pg_sql)

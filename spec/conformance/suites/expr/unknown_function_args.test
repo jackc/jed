@@ -2,8 +2,7 @@
 # argument adopts the family the catalog declares for its slot: a single candidate decides
 # outright, `text` wins among several (length/substr pick text over bytea), and an overload set
 # that cannot decide is 42725 (ambiguous_function). A strict function then returns NULL. The
-# same rule types a bind parameter, which the literal-only corpus cannot express (per-core params
-# tests). jed omits PostgreSQL's preferred-type step, so abs(NULL) / round(NULL, 2) are 42725 where
+# same rule types a bind parameter (params/inference.test). jed omits PostgreSQL's preferred-type step, so abs(NULL) / round(NULL, 2) are 42725 where
 # PostgreSQL picks float8 / numeric (oracle_overrides.toml). PostgreSQL-oracle-verified (postgres:18).
 # requires: query.select_no_from, types.i32, types.text, types.bytea, types.date, func.unknown_args
 

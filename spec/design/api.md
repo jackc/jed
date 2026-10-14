@@ -632,7 +632,8 @@ the materialized `rows`, and `cost`.
 
 A bind parameter is `$` followed by a 1-based decimal index (`$1`, `$2`, …; grammar.md §5,
 [../grammar/grammar.ebnf](../grammar/grammar.ebnf)). Parameters are an **API construct**:
-the corpus stays literal-only (§conformance.md 1.2), but the parser accepts `$N` anywhere a
+the corpus binds them through the `# params:` directive ([conformance.md](conformance.md) §1.2),
+and the parser accepts `$N` anywhere a
 primary expression is accepted and as an `INSERT` value slot. DDL takes none (`42601`), except the
 query of a `CREATE TABLE … AS`, which binds them as the query would
 ([create-table-as.md](create-table-as.md) §1).
@@ -960,8 +961,9 @@ no path around the strict type system**, it only saves the caller from hand-buil
 
 **Args (native → `Value`).** A type switch with an escape hatch (`Valuer`): `nil`→NULL; `bool`;
 the integer widths (range-checked into `i64`); `f32`/`f64`; `string`→`text`; bytes→`bytea`;
-the host time type→a temporal `Value`; the engine's own `Decimal`/`Interval`/`uuid` types; a bare
-`Value` passes through. **The one impedance point is temporal**: Go's single `time.Time` (and the
+the host time type→a temporal `Value`; the engine's own `Decimal`/`Interval`/`uuid` types (Go builds
+a `Decimal` from its text form with `ParseDecimal`, keeping the written scale); a bare `Value` passes
+through. **The one impedance point is temporal**: Go's single `time.Time` (and the
 equivalents) maps to three jed types — it is bound as `timestamptz` and the §5 binder re-coerces to
 the inferred column type (`timestamp`/`date`); a host that needs an exact target casts (`$1 ::
 date`) or passes a `Value`.

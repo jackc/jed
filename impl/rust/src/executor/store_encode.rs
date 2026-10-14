@@ -68,6 +68,11 @@ pub(crate) fn store_value(
                     Decimal::from_i64(n),
                     typmod,
                 )?))
+            } else if col_ty.is_float() {
+                // An integer adapts to a float column or parameter (spec/design/float.md §4); an
+                // INSERT ... SELECT integer value is gated out upstream (42804), so this adapts a
+                // literal or a bound host value.
+                Ok(int_to_float(n, col_ty))
             } else {
                 Err(type_error(format!(
                     "cannot store an integer value in {} column {col_name}",
@@ -78,6 +83,10 @@ pub(crate) fn store_value(
         Value::Decimal(d) => {
             if col_ty.is_decimal() {
                 Ok(Value::Decimal(coerce_decimal(d, typmod)?))
+            } else if col_ty.is_float() {
+                // A decimal adapts to a float column or parameter at its width, ties-to-even; a
+                // magnitude beyond the width traps 22003 (float.md §4). Same rule as the integer arm.
+                decimal_to_float(&d, col_ty)
             } else {
                 Err(type_error(format!(
                     "cannot store a decimal value in {} column {col_name}",
