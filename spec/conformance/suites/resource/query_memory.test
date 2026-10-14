@@ -145,8 +145,9 @@ statement error 54P05
 SELECT * FROM (VALUES (1, 'x'), (2, 'yy')) v(a, b)
 
 # Set operations: UNION's peak is the combine — both arms' rows (195 + 131) plus its five dedup
-# entries (ENTRY 32 + key: 326, memory.md §6.2). INTERSECT's left arm (relation 387 + output 195) stays
-# above its combine.
+# entries (ENTRY 32 + key: 326, memory.md §6.2). INTERSECT's is its combine too — both arms' rows plus
+# the right arm's two dedup entries (131); each arm reads its relation through the columnar projection
+# lane, whose gathered values (99, 67) are returned before the combine (memory.md §6.5).
 # max_query_memory_bytes: 652
 query T rowsort
 SELECT v FROM t UNION SELECT w FROM u
@@ -161,12 +162,12 @@ qq
 statement error 54P05
 SELECT v FROM t UNION SELECT w FROM u
 
-# max_query_memory_bytes: 582
+# max_query_memory_bytes: 457
 query T rowsort
 SELECT v FROM t INTERSECT SELECT w FROM u
 ----
 
-# max_query_memory_bytes: 581
+# max_query_memory_bytes: 456
 statement error 54P05
 SELECT v FROM t INTERSECT SELECT w FROM u
 
@@ -273,13 +274,13 @@ NULL
 2
 bb
 
-# INSERT ... SELECT: the source relation (387) and its projected rows (291). A failed
-# statement writes nothing.
-# max_query_memory_bytes: 677
+# INSERT ... SELECT: the source's columnar projection lanes (id 96 + v 99, memory.md §6.5) and its
+# projected rows (291). A failed statement writes nothing.
+# max_query_memory_bytes: 485
 statement error 54P05
 INSERT INTO sink SELECT id, v FROM t
 
-# max_query_memory_bytes: 678
+# max_query_memory_bytes: 486
 statement ok
 INSERT INTO sink SELECT id, v FROM t
 

@@ -14,9 +14,10 @@ impl Engine {
         if rel.srf.is_some() || rel.derived.is_some() || rel.cte.is_some() {
             return false;
         }
-        let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
-        store.is_file_backed()
-            && !crate::format::any_spillable_masked(store.col_types(), &plan.rel_masks[0])
+        // A variable-width touched column no longer declines the columnar aggregate lane (packed-leaf.md
+        // §11 Track A4), whose whole-table fold holds constant state.
+        self.store_scoped(rel.db.as_deref(), &rel.table_name)
+            .is_file_backed()
     }
     // Every spill structure charges its resident elements to the statement's query-memory account
     // (memory.md §6.6) and returns them on spill or when discarded — a spool or map feeding a stage is

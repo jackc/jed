@@ -6906,40 +6906,6 @@ pub(crate) fn vectorized_project_eligible(plan: &SelectPlan) -> bool {
         .all(|p| matches!(p, RExpr::Column(_)))
 }
 
-/// Evaluate `filter` over the gathered per-column lanes and return the surviving row indices (the
-/// selection vector) — filter vectorization (packed-leaf.md §11 Track A3). It reuses the scalar
-/// [`RExpr::eval`] verbatim over a SINGLE reusable scratch row (the masked columns filled from the lanes
-/// at that row index, untouched columns left `Null`), so the predicate's `operator_eval` charges and its
-/// 3VL survivor test (keep iff `TRUE`) are byte-identical to the scalar `WHERE` loop — and the result is
-/// identical too, because the row path also feeds the filter a MASKED row (untouched columns `Null` via
-/// resolve_columns / row_at_masked) and the filter references only masked columns (`collect_touched`
-/// includes the filter), so a scratch row filled from the lanes is the same input. The one reusable
-/// scratch row is the allocation win: no full-width row per scanned row, only the `i32` survivor indices.
-/// The caller has verified no touched column spills, so every masked lane is a non-empty `Vec<Value>` of
-/// length `row_count` (an untouched column's lane stays empty but is never read).
-pub(crate) fn filter_columnar(
-    filter: &RExpr,
-    cols: &[Vec<Value>],
-    mask: &[bool],
-    row_count: usize,
-    env: &EvalEnv,
-    meter: &mut Meter,
-) -> Result<Vec<i32>> {
-    let mut sel = Vec::new();
-    let mut scratch: Vec<Value> = vec![Value::Null; mask.len()];
-    for i in 0..row_count {
-        for (c, &m) in mask.iter().enumerate() {
-            if m {
-                scratch[c] = cols[c][i].clone();
-            }
-        }
-        if filter.eval_filter(&scratch, env, meter)? {
-            sel.push(i as i32);
-        }
-    }
-    Ok(sel)
-}
-
 /// Whether one aggregate is a specialized numeric kernel the vectorized aggregate path folds: a plain
 /// (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) `COUNT(*)` / `COUNT(col)` /
 /// `SUM(i16|i32)` / `SUM`|`AVG(f32|f64)` / `MIN(col)` / `MAX(col)` whose operand (where it has one) is
@@ -6978,19 +6944,11 @@ pub(crate) fn operand_col(spec: &AggSpec) -> Option<usize> {
     }
 }
 
-/// The survivor value source for the vectorized fold — the ONE seam that differs between the row path
-/// (a `Vec<Row>` of full rows) and the columnar path (dense per-column lanes + an optional A3 selection
-/// vector). `at(j, col)` reads survivor `j`'s value in column `col`, so the fold kernels below are
-/// written once and run either way. Cost is unaffected: both feed the same values in scan order.
+/// The survivor value source for the vectorized fold's row path (a `Vec<Row>` of full rows): `at(j,
+/// col)` reads survivor `j`'s value in column `col`. (The file-backed lane folds during its tree walk
+/// instead — `agg_columnar`.)
 pub(crate) enum LaneSrc<'a> {
-    /// The row path: survivors are full rows; `at(j, col)` is `rows[j][col]`.
     Rows(&'a [Row]),
-    /// The columnar path: `cols[col]` is a dense lane; `sel` (A3) maps survivor `j` to lane index
-    /// `sel[j]` (or `j` itself when there is no filter).
-    Cols {
-        cols: &'a [Vec<Value>],
-        sel: Option<&'a [i32]>,
-    },
 }
 
 #[cfg(test)]

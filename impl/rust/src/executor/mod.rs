@@ -116,6 +116,8 @@ mod view_write;
 pub(crate) use view_write::*;
 mod row_json;
 pub(crate) use row_json::*;
+mod span_filter;
+pub(crate) use span_filter::{LaneFilter, ScratchRow};
 // __SUBMODULES__
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -270,18 +272,16 @@ pub(crate) enum Emitter {
         sorted: crate::spill::SortedRows,
         remaining: usize,
     },
-    /// The columnar projection fast path (`project_columnar`, packed-leaf.md §11 Track A2/A3). `cols`
-    /// holds the pre-gathered dense per-column lanes (indexed by table ordinal) and `proj_cols` the
-    /// projection's column indices into them; emission builds output row `j` as `[cols[proj_cols[0]][l],
-    /// …]` where `l = sel[j]` (the A3 selection vector's survivor — a filtered scan) or `j` (all rows,
-    /// `sel = None`) — a bare-column projection with no full-width row, charging `row_produced` per
+    /// The columnar projection fast path (`project_columnar`, packed-leaf.md §11 Tracks A2–A4). `cols`
+    /// holds the pre-gathered dense per-column lanes of the surviving records (indexed by table ordinal)
+    /// and `proj_cols` the projection's column indices into them; emission builds output row `j` as
+    /// `[cols[proj_cols[0]][j], …]` — a bare-column projection with no full-width row, charging `row_produced` per
     /// windowed row exactly like the `Project` path over a bare column ref (a zero-cost slot read, so the
     /// lane read is cost-identical). Windowed to `[start, end)`. Lazy on the `query()` path: an early exit
     /// skips the `row_produced` of the rows it never pulls.
     Columnar {
         cols: Vec<Vec<Value>>,
         proj_cols: Vec<usize>,
-        sel: Option<Vec<i32>>,
         start: usize,
         end: usize,
         /// The gathered lanes' query-memory charge (memory.md §6.5), returned when emission completes.

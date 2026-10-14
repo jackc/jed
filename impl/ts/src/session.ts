@@ -23,7 +23,7 @@ import { resolveZone } from "./timezone.ts";
 import { engineError } from "./errors.ts";
 import type { PrivilegeSet } from "./privileges.ts";
 import type { ClockFunc, RandomFill } from "./seam.ts";
-import type { Acc, AggSpec, EvalEnv, RExpr, ResolvedFrame, SelectPlan } from "./executor.ts";
+import type { Acc, AggSpec, EvalEnv, ResolvedFrame, SelectPlan } from "./executor.ts";
 import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { nullValue } from "./value.ts";
@@ -492,36 +492,6 @@ export function vectorizedProjectEligible(plan: SelectPlan): boolean {
   return plan.projections.every((p) => p.kind === "column");
 }
 
-// filterColumnar evaluates filter over the gathered per-column lanes and returns the surviving row
-// indices (the selection vector) — filter vectorization (packed-leaf.md §11 Track A3). It reuses the
-// scalar evalExpr verbatim over a SINGLE reusable scratch row (the masked columns filled from the lanes
-// at that row index, untouched columns left NULL), so the predicate's operator_eval charges and its 3VL
-// survivor test (keep iff TRUE) are byte-identical to the scalar WHERE loop — and the result is identical
-// too, because the row path also feeds the filter a MASKED row (untouched columns NULL via
-// resolveColumns / rowAtMasked) and the filter references only masked columns (collectTouched includes
-// the filter), so a scratch row filled from the lanes is the same input. The one reusable scratch row is
-// the allocation win: no full-width row per scanned row, only the survivor indices. The caller has
-// verified no touched column spills, so every masked lane is a non-empty Value[] of length rowCount (an
-// untouched column's lane stays empty but is never read).
-export function filterColumnar(
-  filter: RExpr,
-  cols: Value[][],
-  mask: boolean[],
-  rowCount: number,
-  env: EvalEnv,
-  meter: Meter,
-): number[] {
-  const sel: number[] = [];
-  const scratch: Row = new Array(mask.length).fill(nullValue());
-  for (let i = 0; i < rowCount; i++) {
-    for (let c = 0; c < mask.length; c++) {
-      if (mask[c]) scratch[c] = cols[c]![i]!;
-    }
-    if (evalFilter(filter, scratch, env, meter)) sel.push(i);
-  }
-  return sel;
-}
-
 // vectorizedSpecEligible reports whether one aggregate is a specialized numeric kernel the vectorized
 // aggregate path folds: a plain (non-DISTINCT, non-FILTER, non-ordered-set, non-hypothetical) COUNT(*)
 // / COUNT(col) / SUM(i16|i32) / SUM|AVG(f32|f64) / MIN(col) / MAX(col) whose operand (where it has one)
@@ -825,19 +795,16 @@ export function* bufferedRows(
     return;
   }
   if (em.mode === "columnar") {
-    // Columnar projection (packed-leaf.md §11 Track A2/A3): gather each row from the dense lanes — a
+    // Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather each row from the dense lanes — a
     // bare-column projection with no full-width row — charging only rowProduced (a bare column ref is a
-    // zero-cost slot read). A set `sel` (the A3 filter's survivors) maps output row j to lane position
-    // sel[j]. An early exit skips the rowProduced of the rows it never pulls.
+    // zero-cost slot read). An early exit skips the rowProduced of the rows it never pulls.
     const cols = em.cols!;
     const projCols = em.projCols!;
-    const sel = em.sel;
     try {
       for (let j = em.start; j < em.end; j++) {
         meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
-        const l = sel === undefined ? j : sel[j]!;
-        yield projCols.map((c) => cols[c]![l]!);
+        yield projCols.map((c) => cols[c]![j]!);
       }
     } finally {
       // Exhausted or closed: the lanes' charge is returned with them (memory.md §6.5).

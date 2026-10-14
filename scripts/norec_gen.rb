@@ -174,6 +174,12 @@
 #   gin_bytea — GIN over bytea[] (gin.md §4.3): the same pair over each element's bytea key cut at 128
 #              bytes (embedded 0x00 bytes, the empty value, long values sharing a prefix). Both must
 #              return the by-construction rows of byte-exact equality.
+#   varwidth_span — the columnar lanes' stored-byte atoms (packed-leaf.md §11 Track A4): `s = k` /
+#              `s <> k`, `b = k`, `col IS [NOT] NULL`, `tags @>/<@/&& Q` (Q on either side), and
+#              COUNT(col) against wrapped spellings (`s || ''`, `COALESCE(tags, NULL)`, `NOT (…)`,
+#              `count(s || '')`) the span compiler leaves to the evaluator, over NULLs, '', multibyte
+#              text, zero bytes, NULL elements, and compressed / out-of-line values. Both must return
+#              the by-construction rows of byte-exact comparison.
 #   gin_stats — GIN term statistics (statistics.md §4.5/§6.1): the same `tags @> Q AND n = k` and
 #              `c = ANY(tags)` queries before and after ANALYZE, which flips their plans between the GIN
 #              index, the ordered index on n, and a full scan, plus the `<@` full-scan spellings. All
@@ -2162,6 +2168,112 @@ def gen_gin_bytea(seed)
   q(out, "I", "SELECT id FROM t WHERE b @> #{arr.call(pair)} ORDER BY id", contains.call(pair))
   out << "# full scan — MUST match"
   q(out, "I", "SELECT id FROM t WHERE #{arr.call(pair)} <@ b ORDER BY id", contains.call(pair))
+  out.join("\n") + "\n"
+end
+
+# --- scenario: variable-width span predicates (columnar lanes on stored bytes vs the evaluator) ---
+# The columnar lanes evaluate `col IS [NOT] NULL`, text/bytea `=`/`<>` against a constant, and array
+# `@>`/`<@`/`&&` against a constant array on a leaf's stored bytes, and COUNT(col) from nullness alone
+# (spec/design/packed-leaf.md §11 Track A4). Wrapping the column (`s || ''`, `b || ''::bytea`,
+# `COALESCE(tags, NULL)`, `NOT (… IS NOT NULL)`, `count(s || '')`) keeps the same value but is not a
+# span atom, so the ordinary evaluator decides it. Values mix NULLs, the empty string, multibyte text,
+# embedded zero bytes, NULL array elements, and long values stored compressed or out of line (whose
+# atoms fall back to the evaluator). Expected rows: byte-exact comparison, known by construction.
+VARWIDTH_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                  query.order_by query.aggregates query.is_null query.logical_connectives types.i32
+                  types.text types.bytea types.array func.array func.array_containment expr.text_concat
+                  cast.operator].freeze
+VARWIDTH_WORDS = ["a", "b", "", "é", "ñandú", "ab", "A", "a b"].freeze
+VARWIDTH_BYTES = ["00", "0000", "", "61", "6100", "ff"].freeze
+
+def gen_varwidth_span(seed)
+  rng = Random.new(seed)
+  long_rng = Random.new(seed * 7919)
+  noise = ->(n) { Array.new(n) { (97 + long_rng.rand(26)).chr }.join }
+  longs = ["x" * 12_000, noise.call(20_000)]
+  word = -> { rng.rand(6).zero? ? nil : VARWIDTH_WORDS.sample(random: rng) }
+  rows = (1..24).map do |id|
+    s = case rng.rand(8)
+        when 0 then nil
+        when 1 then longs.sample(random: rng)
+        else VARWIDTH_WORDS.sample(random: rng)
+        end
+    b = rng.rand(6).zero? ? nil : VARWIDTH_BYTES.sample(random: rng)
+    tags = rng.rand(6).zero? ? nil : Array.new(rng.rand(0..3)) { word.call }
+    [id, s, b, tags]
+  end
+  str = ->(w) { "'#{w.gsub("'", "''")}'" }
+  byt = ->(h) { "'\\x#{h}'::bytea" }
+  arr = lambda do |ws|
+    ws.empty? ? "'{}'::text[]" : "ARRAY[#{ws.map { |w| w.nil? ? 'NULL' : str.call(w) }.join(', ')}]::text[]"
+  end
+
+  out = header(seed, VARWIDTH_REQ, "variable-width span predicates (stored-byte atoms vs the evaluator)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, s text, b bytea, tags text[])")
+  rows.each_slice(6) do |chunk|
+    vals = chunk.map do |id, s, b, tags|
+      "(#{id}, #{s.nil? ? 'NULL' : str.call(s)}, #{b.nil? ? 'NULL' : byt.call(b)}, #{tags.nil? ? 'NULL' : arr.call(tags)})"
+    end
+    stmt(out, "INSERT INTO t VALUES #{vals.join(', ')}")
+  end
+
+  ids = ->(&pred) { rows.select { |r| pred.call(r) }.map { |r| r[0].to_s } }
+  count = ->(&pred) { [rows.count { |r| pred.call(r) }.to_s] }
+  pair = lambda do |label, fast, slow, exp, proj: false|
+    out << "# #{label}"
+    if proj
+      q(out, "I", "SELECT id FROM t WHERE #{fast} ORDER BY id", exp)
+      out << "# the columnar projection lane (no ORDER BY) — MUST match"
+      out << "query I rowsort" << "SELECT id FROM t WHERE #{fast}" << "----"
+      out.concat(exp.sort)
+      out << ""
+      out << "# not a span atom — MUST match"
+      q(out, "I", "SELECT id FROM t WHERE #{slow} ORDER BY id", exp)
+    else
+      q(out, "I", "SELECT count(*) FROM t WHERE #{fast}", exp)
+      out << "# not a span atom — MUST match"
+      q(out, "I", "SELECT count(*) FROM t WHERE #{slow}", exp)
+    end
+  end
+
+  k = (rows.filter_map { |r| r[1] }.reject { |v| v.length > 100 }.sample(random: rng)) || "a"
+  pair.call("s = #{k.inspect}", "s = #{str.call(k)}", "s || '' = #{str.call(k)}", ids.call { |r| r[1] == k }, proj: true)
+  pair.call("s <> #{k.inspect}", "s <> #{str.call(k)}", "s || '' <> #{str.call(k)}",
+            count.call { |r| !r[1].nil? && r[1] != k })
+  pair.call("s = the long value", "s = #{str.call(longs[1])}", "s || '' = #{str.call(longs[1])}",
+            count.call { |r| r[1] == longs[1] })
+  pair.call("s IS NULL", "s IS NULL", "NOT (s IS NOT NULL)", count.call { |r| r[1].nil? })
+  pair.call("tags IS NOT NULL", "tags IS NOT NULL", "NOT (tags IS NULL)", count.call { |r| !r[3].nil? })
+  hb = VARWIDTH_BYTES.sample(random: rng)
+  pair.call("b = \\x#{hb}", "b = #{byt.call(hb)}", "b || ''::bytea = #{byt.call(hb)}", ids.call { |r| r[2] == hb },
+            proj: true)
+  pair.call("b <> \\x#{hb}", "b <> #{byt.call(hb)}", "b || ''::bytea <> #{byt.call(hb)}",
+            count.call { |r| !r[2].nil? && r[2] != hb })
+
+  present = rows.filter_map { |r| r[3] }.flatten.compact
+  q1 = [present.sample(random: rng) || "a"]
+  q2 = [present.sample(random: rng) || "a", VARWIDTH_WORDS.sample(random: rng)]
+  q3 = VARWIDTH_WORDS.sample(3, random: rng)
+  qn = [present.sample(random: rng) || "a", nil]
+  wrapped = "COALESCE(tags, NULL)"
+  [q1, q2, []].each do |qq|
+    pair.call("tags @> #{qq.inspect}", "tags @> #{arr.call(qq)}", "#{wrapped} @> #{arr.call(qq)}",
+              ids.call { |r| !r[3].nil? && qq.all? { |w| r[3].include?(w) } }, proj: true)
+  end
+  pair.call("tags @> #{qn.inspect} (a NULL element matches nothing)", "tags @> #{arr.call(qn)}",
+            "#{wrapped} @> #{arr.call(qn)}", count.call { |r| !r[3].nil? && qn.all? { |w| !w.nil? && r[3].include?(w) } })
+  pair.call("tags <@ #{q3.inspect}", "tags <@ #{arr.call(q3)}", "#{wrapped} <@ #{arr.call(q3)}",
+            count.call { |r| !r[3].nil? && r[3].all? { |e| !e.nil? && q3.include?(e) } })
+  pair.call("#{q3.inspect} @> tags", "#{arr.call(q3)} @> tags", "#{arr.call(q3)} @> #{wrapped}",
+            count.call { |r| !r[3].nil? && r[3].all? { |e| !e.nil? && q3.include?(e) } })
+  pair.call("tags && #{q2.inspect}", "tags && #{arr.call(q2)}", "#{wrapped} && #{arr.call(q2)}",
+            count.call { |r| !r[3].nil? && r[3].any? { |e| !e.nil? && q2.include?(e) } })
+
+  out << "# COUNT(col) folds nullness only — count(expr) is not a lane operand"
+  q(out, "III", "SELECT count(s), count(b), count(tags) FROM t",
+    [rows.count { |r| !r[1].nil? }, rows.count { |r| !r[2].nil? }, rows.count { |r| !r[3].nil? }].map(&:to_s))
+  q(out, "III", "SELECT count(s || ''), count(b || ''::bytea), count(#{wrapped}) FROM t",
+    [rows.count { |r| !r[1].nil? }, rows.count { |r| !r[2].nil? }, rows.count { |r| !r[3].nil? }].map(&:to_s))
   out.join("\n") + "\n"
 end
 
@@ -4318,6 +4430,7 @@ SCENARIOS = {
   "gin_stats" => method(:gen_gin_stats),
   "gin_dec" => method(:gen_gin_decimal),
   "gin_bytea" => method(:gen_gin_bytea),
+  "varwidth_span" => method(:gen_varwidth_span),
   "gist" => method(:gen_gist),
   "gist_scalar" => method(:gen_gist_scalar),
   "tlp" => method(:gen_tlp),

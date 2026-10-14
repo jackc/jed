@@ -93,6 +93,49 @@ func (n *pnode) colAt(i, c int) (Value, error) {
 	return n.packed.value(c, i)
 }
 
+// colIsNull reports whether column c of row i is NULL without reconstructing the value
+// (packed-leaf.md §11 Track A4): the PAX null bitmap / zero-length span on a Packed leaf. A deferred
+// large value is never NULL.
+func (n *pnode) colIsNull(i, c int) bool {
+	if n.packed == nil {
+		return n.vals[i][c].IsNull()
+	}
+	return n.packed.dirs.isNull(c, i)
+}
+
+// colSpan returns the stored bytes of column c of row i, borrowed from a Packed leaf's page (Track
+// A4): present=false for NULL. ok=false on a Decoded leaf, which holds values rather than stored
+// bytes.
+func (n *pnode) colSpan(i, c int) (span []byte, present, ok bool) {
+	if n.packed == nil {
+		return nil, false, false
+	}
+	span, present = n.packed.valueSpan(c, i)
+	return span, present, true
+}
+
+// recordScanUnits returns the large-value scan units (chain pages, decompress slabs) record i adds
+// for the touched columns mask — on a Packed leaf read off each touched variable column's stored tag
+// (spanScanUnits), on a Decoded leaf the row path's recordScanUnits over the row (Track A4; cost.md
+// §3).
+func (n *pnode) recordScanUnits(i int, colTypes []colType, capacity int, mask []bool) (pages, decompress int) {
+	if n.packed == nil {
+		return recordScanUnits(colTypes, n.keyAt(i), n.vals[i], capacity, mask)
+	}
+	for c, ty := range colTypes {
+		if !mask[c] {
+			continue
+		}
+		if _, fixed := fixedValueWidth(ty); fixed {
+			continue
+		}
+		if span, present := n.packed.valueSpan(c, i); present {
+			spanScanUnits(span, capacity, &pages, &decompress)
+		}
+	}
+	return pages, decompress
+}
+
 // decodedRows returns every value row of a LEAF — the mutation-descent materialization
 // (packed-leaf.md §7). A Decoded leaf clones vals; a Packed leaf reconstructs every row so the
 // rebuilt node is Decoded (buildLeaf / nodeInsert / nodeRemove / mergeAt then run unchanged).
@@ -721,65 +764,11 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []stor
 	return keys, vals, nodes, nil
 }
 
-// columnarScan walks the bounded scan gathering ONLY the columns mask selects into dense per-column
-// lanes (cols[c] of length rowCount for each selected c; nil otherwise), never building a full-width
-// storedRow — the A2 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation dividend A1
-// leaves on the table). It mirrors rangeEntriesCounted's traversal EXACTLY (same node visits ⇒ the
-// same page_read count; same in-order record sequence — leaf-only, v24), but reads each admitted
-// row's selected columns via colAt — an O(1) PAX column span on a Packed leaf, vals[i][c] on a
-// Decoded leaf — so a wide-table single-column scan never materializes the untouched columns NOR a
-// full-width row. Each cols[c] is in scan order, so it equals the column-c stride of
-// rangeEntriesCounted's rows. rowCount is the admitted entry count.
-func (m *pMap) columnarScan(b keyBound, src leafSource, mask []bool) ([][]Value, int, int, error) {
-	k := len(mask)
-	cols := make([][]Value, k)
-	rowCount, nodes := 0, 0
-	var walk func(n *pnode) error
-	walk = func(n *pnode) error {
-		nodes++
-		if n.isLeaf() {
-			ef, el := b.entryWindow(n)
-			for i := ef; i < el; i++ {
-				for c := 0; c < k; c++ {
-					if !mask[c] {
-						continue
-					}
-					v, err := n.colAt(i, c)
-					if err != nil {
-						return err
-					}
-					cols[c] = append(cols[c], v)
-				}
-				rowCount++
-			}
-			return nil
-		}
-		cf, cl := b.childWindow(n)
-		for i := cf; i <= cl; i++ {
-			child, err := resolveChild(n.children[i], src)
-			if err != nil {
-				return err
-			}
-			if err := walk(child); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if m.root != nil {
-		if err := walk(m.root); err != nil {
-			return nil, 0, 0, err
-		}
-	}
-	return cols, rowCount, nodes, nil
-}
-
 // foldScan walks the bounded scan calling visit(n, i) for each admitted leaf record i (in scan / key
-// order) of the leaf n it belongs to, faulting leaves via src — the fold-during-walk twin of
-// columnarScan (packed-leaf.md §11): the aggregate folds each row's touched columns (read on demand
-// via n.colAt) straight into its accumulator, so a whole-table/grouped aggregate never materializes a
-// per-column lane (O(1) memory instead of O(rows)). It visits the IDENTICAL nodes columnarScan does
-// and returns the same (rowCount, nodeCount), so the caller charges the identical page_read /
+// order) of the leaf n it belongs to, faulting leaves via src — the columnar lanes' walk
+// (packed-leaf.md §11 Tracks A2–A4): visit reads each record's touched columns (via n.colAt, or their
+// stored bytes) instead of reconstructing a row. It visits the IDENTICAL nodes rangeEntriesCounted
+// does and returns (rowCount, nodeCount), so the caller charges the identical page_read /
 // storage_row_read. visit's error aborts the walk.
 func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) error) (rowCount, nodes int, err error) {
 	var walk func(n *pnode) error

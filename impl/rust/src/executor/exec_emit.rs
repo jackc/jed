@@ -414,14 +414,14 @@ impl Engine {
             return self.exec_window_top_n(plan, &env, meter, params);
         }
 
-        // Columnar projection fast path (batch, packed-leaf.md §11 Track A2/A3): a bare-column projection
+        // Columnar projection fast path (batch, packed-leaf.md §11 Tracks A2–A4): a bare-column projection
         // over a single-table full/PK-bounded scan with no ORDER BY / LIMIT / OFFSET / blocking operator
-        // gathers only its touched columns into dense lanes and emits from them — never the full-width row
-        // the materialize path below allocates per record (the allocation dividend on a wide table). A
-        // WHERE predicate (A3) is applied over the lanes into a selection vector rather than forcing the row
-        // path. Gated to the unmetered lane (so a metered query's per-eval guards stay the row path's) and
-        // to file-backed stores with no spillable touched column (project_columnar declines otherwise,
-        // falling through to the identical-cost row path). Cost-neutral by construction.
+        // gathers only its projected columns of the surviving records into dense lanes and emits from them
+        // — never the full-width row the materialize path below allocates per record. A WHERE predicate is
+        // evaluated during the walk, on the stored bytes where it can (A4). Gated to the unmetered lane (so
+        // a metered query's per-eval guards stay the row path's) and to file-backed stores
+        // (project_columnar declines otherwise, falling through to the identical-cost row path).
+        // Cost-neutral by construction.
         if fast
             && meter.is_unmetered()
             && self.explain_actual.borrow().is_none()

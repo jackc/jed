@@ -411,8 +411,10 @@ charged buffer adds nothing.
 
 ### 6.5 Columnar lanes
 
-The columnar projection lane gathers the touched columns of a file-backed relation
-into dense lanes in one bulk read. Once the gather completes it reserves
+The columnar projection lane gathers the projected columns of a file-backed
+relation's surviving records (every record when there is no `WHERE`; the filter
+runs during the walk — packed-leaf.md §11 Track A4) into dense lanes in one bulk
+read. Once the gather completes it reserves
 `key_bytes` of every gathered value (the bounded overshoot of a bulk read, like a
 base relation's storage read, §5), and releases them when its emission completes
 (as in §6.4). The columnar aggregate lane folds during the tree walk without

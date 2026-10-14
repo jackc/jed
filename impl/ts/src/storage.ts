@@ -13,18 +13,23 @@
 import type { Value } from "./value.ts";
 import type { ColType } from "./catalog.ts";
 import { PMap, pmapFromSkeleton, unboundedBound } from "./pmap.ts";
-import type { KeyBound, LeafShape, LeafSource, PNode } from "./pmap.ts";
+import type { KeyBound, LeafShape, LeafSource, PNode, Span } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
   resolveUnfetched,
   anySpillable,
   anySpillableMasked,
+  fixedValueWidth,
   leafShape,
   recordCompressUnits,
   recordFootprint,
   recordScanUnits,
+  spanScanUnits,
 } from "./format.ts";
 import { isInteger } from "./types.ts";
+
+// The reusable span scratch for laneScanUnits (single-threaded).
+const LANE_SPAN: Span = { start: 0, end: 0 };
 
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
@@ -321,28 +326,35 @@ export class TableStore {
     return this.rangeScanWithUnits(unboundedBound(), mask);
   }
 
-  // columnarScanMasked gathers the mask-selected columns of a bounded scan into dense per-column lanes
-  // (cols[c], length rowCount, for each selected c) PLUS the (page_read, value_decompress) cost block —
-  // the A2/A3 columnar feed for the vectorized projection path (packed-leaf.md §11 Track A2/A3). It never
-  // materializes a full-width Row: a wide-table projection touches a few columns instead of allocating
-  // the whole row per record (the B/op win the masked row feed leaves on the table). Invoked ONLY when no
-  // touched column can spill (the caller gates on !anySpillableTouched), so the value_decompress slab
-  // count is always 0 and no unfetched value needs resolving. Cost is byte-identical to
-  // scanWithUnitsMasked(mask) over the same bound: the same node visits (page_read, computed in the same
-  // single descent) and the same slab count (0). The caller charges storageRowRead × rowCount.
-  columnarScanMasked(
-    b: KeyBound,
+  // laneScanUnits adds the large-value scan units (chain pages, decompress slabs) record i of leaf n
+  // contributes for the touched columns mask (packed-leaf.md §11 Track A4; cost.md §3): on a Packed leaf
+  // read off each touched variable column's stored tag (spanScanUnits), on a Decoded leaf the row path's
+  // recordScanUnits over the row.
+  laneScanUnits(
+    n: PNode,
+    i: number,
     mask: boolean[],
-  ): { cols: Value[][]; rowCount: number; pages: number; slabs: number } {
-    const { cols, rowCount, nodes } = this.rows.columnarScan(b, this.leafSrc(), mask);
-    return { cols, rowCount, pages: nodes, slabs: 0 };
+    units: { pages: number; decompress: number },
+  ): void {
+    const p = n.packed;
+    if (p === undefined) {
+      const u = recordScanUnits(this.colTypes, n.keys[i]!, n.vals[i]!, this.cap, mask);
+      units.pages += u.pages;
+      units.decompress += u.decompress;
+      return;
+    }
+    const span = LANE_SPAN;
+    for (let c = 0; c < this.colTypes.length; c++) {
+      if (!mask[c] || fixedValueWidth(this.colTypes[c]!) !== null) continue;
+      if (p.span(i, c, span)) spanScanUnits(p.payload, span.start, span.end, this.cap, units);
+    }
   }
 
-  // foldScanMasked is the fold-during-walk twin of columnarScanMasked (packed-leaf.md §11): it walks the
-  // bounded scan calling visit(n, i) per admitted row — which reads only the touched columns via colAt
-  // and folds them into an accumulator — so an aggregate never materializes a per-column lane (O(1)
-  // memory). Returns { rowCount, nodes } identical to the columnar scan, so the caller charges the same
-  // page_read / storage_row_read; value_decompress is 0 (the caller gates on !anySpillableTouched).
+  // foldScanMasked is the columnar lanes' walk (packed-leaf.md §11 Tracks A2–A4): it walks the bounded
+  // scan calling visit(n, i) per admitted row — which reads only the touched columns (via colAt, or their
+  // stored bytes) — so a lane never materializes a full-width row. Returns { rowCount, nodes }, so the
+  // caller charges the same page_read / storage_row_read as the row feed, adding each admitted record's
+  // large-value units (laneScanUnits) itself.
   foldScanMasked(
     b: KeyBound,
     visit: (n: PNode, i: number) => void,
@@ -357,8 +369,8 @@ export class TableStore {
     return this.paging !== null;
   }
 
-  // anySpillableTouched reports whether any column mask selects can spill/compress — the gate the
-  // columnar gather declines on (its lanes carry no unfetched values, and the feed has no resolve step).
+  // anySpillableTouched reports whether any column mask selects can spill/compress — whether a scan's
+  // cost block can include large-value units.
   anySpillableTouched(mask: boolean[]): boolean {
     return anySpillableMasked(this.colTypes, mask);
   }

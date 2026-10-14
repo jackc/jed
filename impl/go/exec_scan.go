@@ -719,10 +719,9 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		c.meter.releaseRow(row) // it leaves engine ownership (memory.md §5.3)
 		return row, true, nil
 	case emitColumnar:
-		// Columnar projection (packed-leaf.md §11 Track A2/A3): gather this row from the dense lanes — a
+		// Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather this row from the dense lanes — a
 		// bare-column projection with no full-width row — charging only row_produced (a bare column ref
-		// evaluates to a zero-cost slot read, so there is no projection operator_eval to charge). A non-nil
-		// `sel` (the A3 filter's survivors) maps output row j to lane position sel[j].
+		// evaluates to a zero-cost slot read, so there is no projection operator_eval to charge).
 		if c.idx >= c.em.end {
 			c.done = true
 			c.em.colCharge.releaseAll() // exhausted: the lanes' charge is returned (memory.md §6.5)
@@ -734,13 +733,9 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
-		li := j
-		if c.em.sel != nil {
-			li = int64(c.em.sel[j])
-		}
 		projected := make([]Value, len(c.em.projCols))
 		for k, cc := range c.em.projCols {
-			projected[k] = c.em.cols[cc][li]
+			projected[k] = c.em.cols[cc][j]
 		}
 		return projected, true, nil
 	default: // emitProject — project the buffer row on emission (charging row_produced + projection)

@@ -2573,14 +2573,13 @@ impl Engine {
                     out
                 }
             },
-            // Columnar projection (packed-leaf.md §11 Track A2/A3): gather each windowed output row from
+            // Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather each windowed output row from
             // the dense lanes — a bare-column projection with no full-width row — charging row_produced per
             // row, exactly the Project drive over a bare-column projection (whose eval is a zero-cost slot
-            // read). A non-None `sel` (the A3 filter's survivors) maps output row j to lane position sel[j].
+            // read).
             Emitter::Columnar {
                 cols,
                 proj_cols,
-                sel,
                 start,
                 end,
                 mut charge,
@@ -2589,13 +2588,9 @@ impl Engine {
                 for j in start..end {
                     meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                     meter.charge(COSTS.row_produced);
-                    let l = match &sel {
-                        Some(s) => s[j] as usize,
-                        None => j,
-                    };
                     let mut o = Vec::with_capacity(proj_cols.len());
                     for &c in &proj_cols {
-                        o.push(cols[c][l].clone());
+                        o.push(cols[c][j].clone());
                     }
                     meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                     out.push(o);
@@ -2615,18 +2610,19 @@ impl Engine {
         })
     }
 
-    /// Run the A2/A3 columnar gather for a [`vectorized_project_eligible`] plan (packed-leaf.md §11 Track
-    /// A2/A3): scan only the touched columns of the single base relation into dense per-column lanes
-    /// (never a full-width [`Row`]), charge the identical scan cost block, apply any `WHERE` predicate over
-    /// the lanes into a selection vector (A3), and return an [`Emitter::Columnar`] that gathers each
-    /// surviving output row from the lanes on emission. Returns `None` (declining to the caller's row path)
-    /// for an in-memory store (its Decoded leaves share rows zero-copy, so a lane gather would only add
-    /// allocation), a spillable touched column (the columnar feed has no value-resolution step — this also
-    /// covers a filter over a spillable column), or a projection column out of range / unmasked (a safety
-    /// net, never expected — a projected column is touched, hence masked). Cost-neutral by construction:
-    /// the same `page_read` (same node visits) / `value_decompress` (0) / `storage_row_read` (× row_count)
-    /// / `operator_eval` (the filter over each scanned row) as the row path, then `row_produced` per emitted
-    /// (surviving) row charged by the emitter drive — exactly the `Project` drive over a bare-column
+    /// Run the columnar projection lane for a [`vectorized_project_eligible`] plan (packed-leaf.md §11
+    /// Tracks A2–A4): walk the single base relation's bound once, evaluate any `WHERE` per record as a
+    /// span filter ([`LaneFilter`] — atoms on the stored bytes, generic predicates over a reusable masked
+    /// scratch row), gather the projected columns of the SURVIVING records into dense per-column lanes
+    /// (never a full-width [`Row`]; a non-survivor's variable-width values are never decoded), charge the
+    /// identical scan cost block, and return an [`Emitter::Columnar`] that builds each output row from the
+    /// lanes on emission. Returns `None` (declining to the caller's row path) for an in-memory store (its
+    /// Decoded leaves share rows zero-copy, so a lane gather would only add allocation), or a projection
+    /// column out of range / unmasked (a safety net, never expected — a projected column is touched,
+    /// hence masked). Cost-neutral by construction: the same `page_read` (same node visits, plus each
+    /// admitted record's chain pages) / `value_decompress` / `storage_row_read` (× row_count) /
+    /// `operator_eval` (the filter over each scanned record) as the row path, then `row_produced` per
+    /// emitted row charged by the emitter drive — exactly the `Project` drive over a bare-column
     /// projection.
     pub(crate) fn project_columnar(
         &self,
@@ -2643,16 +2639,12 @@ impl Engine {
             return Ok(None);
         }
         let mask = &plan.rel_masks[0];
-        // No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched
-        // value is left unresolved. The mask includes the filter's columns (collect_touched), so this also
-        // declines a filter over a spillable column to the row path.
-        if crate::format::any_spillable_masked(store.col_types(), mask) {
-            return Ok(None);
-        }
+        let col_types = store.col_types();
         // Each projected column must be a valid, masked table ordinal — else its gathered lane would be
         // empty. A projected column is always touched (hence masked), so this holds; the check also
         // declines a (never-expected) synthetic slot or non-column projection.
         let mut proj_cols = Vec::with_capacity(plan.projections.len());
+        let mut gather = vec![false; mask.len()];
         for p in &plan.projections {
             let RExpr::Column(idx) = p else {
                 return Ok(None);
@@ -2662,14 +2654,25 @@ impl Engine {
                 return Ok(None);
             }
             proj_cols.push(idx);
+            gather[idx] = true;
         }
+        let gather_cols: Vec<usize> = (0..mask.len()).filter(|&c| gather[c]).collect();
+        // A variable-width projected column may already be resolved by the filter — reuse it then; any
+        // other column reads straight from the leaf (a fixed-width decode is cheaper than the reuse).
+        let reuse: Vec<bool> = gather_cols
+            .iter()
+            .map(|&c| {
+                plan.filter.get().is_some()
+                    && crate::format::fixed_value_width(&col_types[c]).is_none()
+            })
+            .collect();
+        // A touched variable-width column adds each admitted record's large-value units (chain pages,
+        // decompress slabs) to the scan block, read off its stored tag (Track A4).
+        let spillable = crate::format::any_spillable_masked(col_types, mask);
+        let cap = store.cap();
 
         // Determine the scan bound exactly as materialize_rel does: a PK-range bound, or the full scan. An
         // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely (0 pages/rows).
-        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); mask.len()];
-        let mut row_count = 0usize;
-        let mut pages = 0usize;
-        let slabs = 0usize;
         let mut do_scan = true;
         let mut b = KeyBound::unbounded();
         if let Some(ScanBound::Pk(bp)) = &plan.phys.rel_bounds[0] {
@@ -2678,24 +2681,59 @@ impl Engine {
                 None => do_scan = false,
             }
         }
-        if do_scan {
-            let (c, rc, p, _s) = store.columnar_scan_masked(&b, mask)?;
-            cols = c;
-            row_count = rc;
-            pages = p;
-        }
+        let span = plan
+            .filter
+            .get()
+            .map(|f| LaneFilter::compile(f, col_types, mask, env));
+        let mut scratch = ScratchRow::new(mask.len());
+        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); mask.len()];
+        let mut units = crate::format::ScanUnits {
+            pages: 0,
+            decompress: 0,
+        };
+        let mut n_emit = 0usize;
+        let (row_count, pages) = if do_scan {
+            let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
+                if spillable {
+                    let u = node.record_scan_units(i, col_types, cap, mask);
+                    units.pages += u.pages;
+                    units.decompress += u.decompress;
+                }
+                if let Some(filter) = &span
+                    && !filter.keep(node, i, &mut scratch, env, meter)?
+                {
+                    return Ok(());
+                }
+                for (g, &c) in gather_cols.iter().enumerate() {
+                    cols[c].push(if reuse[g] {
+                        scratch.read(node, i, c)?
+                    } else {
+                        // A fixed-width slot never defers; a variable value resolves here.
+                        match node.col_at(i, c)? {
+                            Value::Unfetched(u) => crate::format::resolve_unfetched_self(&u)?,
+                            v => v,
+                        }
+                    });
+                }
+                n_emit += 1;
+                Ok(())
+            };
+            store.fold_scan_masked(&b, &mut visit)?
+        } else {
+            (0, 0)
+        };
+        // Charge the scan cost block identically to materialize_rel + ScanSource: page_read × (nodes +
+        // chain pages), value_decompress × slabs, storage_row_read × row_count. On the unmetered lane (the
+        // caller gates) this bulk charge reproduces the per-row accrual (guard is a no-op); the filter's
+        // operator_eval was charged per scanned record inside the walk.
+        meter.charge(
+            COSTS.page_read * (pages + units.pages) as i64
+                + COSTS.value_decompress * units.decompress as i64
+                + COSTS.storage_row_read * row_count as i64,
+        );
         // The gathered lanes are operator state, reserved once the bulk gather completes (memory.md
         // §6.5) and returned when the emission completes.
         let mut charge = meter.state_charge();
-        // Charge the scan cost block identically to materialize_rel + ScanSource: page_read × nodes,
-        // value_decompress × slabs (0 here), storage_row_read × row_count. On the unmetered lane (the caller
-        // gates) this bulk charge reproduces the per-row accrual (guard is a no-op).
-        meter.charge(
-            COSTS.page_read * pages as i64
-                + COSTS.value_decompress * slabs as i64
-                + COSTS.storage_row_read * row_count as i64,
-        );
-
         if charge.active() {
             let bytes = cols
                 .iter()
@@ -2703,21 +2741,9 @@ impl Engine {
                 .sum();
             charge.reserve(&mut *meter, bytes)?;
         }
-
-        // A3: apply the WHERE predicate over the lanes into a selection vector (None ⇒ all rows survive).
-        let (sel, n_emit) = match plan.filter.get() {
-            Some(filter) => {
-                let s = filter_columnar(filter, &cols, mask, row_count, env, meter)?;
-                let n = s.len();
-                (Some(s), n)
-            }
-            None => (None, row_count),
-        };
-
         Ok(Some(Emitter::Columnar {
             cols,
             proj_cols,
-            sel,
             start: 0,
             end: n_emit,
             charge,
@@ -2909,18 +2935,17 @@ impl Engine {
         })
     }
 
-    /// Run the A2/A3 columnar gather for a vectorized aggregate (packed-leaf.md §11 Track A2/A3): scan
-    /// only the touched columns of the single base relation into dense per-column lanes (never a
-    /// full-width row), charge the identical scan cost block, apply any `WHERE` predicate over the
-    /// lanes into a selection vector (A3), and fold each aggregate columnar over the survivors —
-    /// returning the finalized synthetic rows (the whole-table grand total or one per group). Returns
-    /// `None` (declining to the caller's row path) when the store is in-memory (its Decoded leaves
-    /// share their rows zero-copy, so a lane gather would only add allocation), when a touched column
-    /// can spill (the columnar feed has no value-resolution step — this also covers a filter over a
-    /// spillable column), or when a needed column ordinal is out of range / unmasked (a safety net,
-    /// never expected for an eligible plan). Cost-neutral by construction: same page_read /
-    /// value_decompress (0) / storage_row_read / operator_eval (the filter) / aggregate_accumulate /
-    /// row_produced as the row path.
+    /// Run the columnar aggregate lane (packed-leaf.md §11 Tracks A2–A4): walk the single base
+    /// relation's bound once, evaluate any `WHERE` per record as a span filter ([`LaneFilter`] — atoms on
+    /// the stored bytes, generic predicates over a reusable masked scratch row), and fold each
+    /// survivor's touched columns straight into its accumulator — never a full-width row, and
+    /// `COUNT(col)` reads only nullness — returning the finalized synthetic rows (the whole-table grand
+    /// total or one per group). Returns `None` (declining to the caller's row path) when the store is
+    /// in-memory (its Decoded leaves share their rows zero-copy, so a lane gather would only add
+    /// allocation), or when a needed column ordinal is out of range / unmasked (a safety net, never
+    /// expected for an eligible plan). Cost-neutral by construction: same page_read (plus each admitted
+    /// record's chain pages) / value_decompress / storage_row_read / operator_eval (the filter) /
+    /// aggregate_accumulate / row_produced as the row path.
     pub(crate) fn agg_columnar(
         &self,
         plan: &SelectPlan,
@@ -2935,12 +2960,11 @@ impl Engine {
             return Ok(None);
         }
         let mask = &plan.rel_masks[0];
-        // No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched
-        // value is left unresolved. An eligible aggregate touches only integer operands + an integer
-        // key (plus the filter's columns); this declines a filter or operand over a spillable column.
-        if crate::format::any_spillable_masked(store.col_types(), mask) {
-            return Ok(None);
-        }
+        let col_types = store.col_types();
+        // A touched variable-width column adds each admitted record's large-value units (chain pages,
+        // decompress slabs) to the scan block, read off its stored tag (Track A4).
+        let spillable = crate::format::any_spillable_masked(col_types, mask);
+        let cap = store.cap();
         // Every column the fold reads (each aggregate operand + the group key) must be a valid, masked
         // table ordinal — else its gathered lane would be empty. This also declines a (never-expected)
         // non-zero relation offset.
@@ -2974,9 +2998,7 @@ impl Engine {
 
         // Fold each scanned row's touched columns straight into its accumulator during ONE tree walk —
         // no per-column lane is materialized, so a whole-table / single-int-key aggregate is O(1) memory
-        // instead of the O(rows) whole-column gather the lane path paid (float.md §7, packed-leaf.md
-        // §11). A WHERE predicate (A3) is evaluated over a single reusable masked scratch row read via
-        // col_at (untouched columns NULL) — byte-identical input + operator_eval to the lane filter.
+        // (float.md §7, packed-leaf.md §11).
         let mut whole: Vec<Acc> = if grouped {
             Vec::new()
         } else {
@@ -2988,10 +3010,33 @@ impl Engine {
         let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
         let mut index: HashMap<i64, usize> = HashMap::new();
         let mut null_gi: Option<usize> = None;
-        let mut scratch: Vec<Value> = if plan.filter.is_some() {
-            vec![Value::Null; mask.len()]
-        } else {
-            Vec::new()
+        // The WHERE compiles once into span atoms over the stored bytes plus generic predicates over a
+        // reusable masked scratch row (Track A4) — byte-identical survivors + operator_eval to the row
+        // path's eval_filter over a masked row.
+        let span = plan
+            .filter
+            .get()
+            .map(|f| LaneFilter::compile(f, col_types, mask, env));
+        let mut scratch = ScratchRow::new(mask.len());
+        // How each aggregate reads its operand, decided once: COUNT(col) reads only nullness (Track A4);
+        // a variable-width operand reuses the value the filter resolved, if any; any other operand
+        // reads straight from the leaf (a fixed-width slot never defers).
+        let operands: Vec<OperandRead> = plan
+            .agg_specs
+            .iter()
+            .map(|spec| match operand_col(spec) {
+                None => OperandRead::None,
+                Some(c) if matches!(spec.plan, AggPlan::Count) => OperandRead::Nullness(c),
+                Some(c) if crate::format::fixed_value_width(&col_types[c]).is_some() => {
+                    OperandRead::Fixed(c)
+                }
+                Some(c) if span.is_some() => OperandRead::Reuse(c),
+                Some(c) => OperandRead::Variable(c),
+            })
+            .collect();
+        let mut units = crate::format::ScanUnits {
+            pages: 0,
+            decompress: 0,
         };
         let mut nsurv = 0usize;
         // The group table (memory.md §6.2): the whole-table group's entry up front, a grouped entry as
@@ -3003,15 +3048,15 @@ impl Engine {
 
         let (row_count, pages) = if do_scan {
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
-                if let Some(filter) = plan.filter.get() {
-                    for (c, &m) in mask.iter().enumerate() {
-                        if m {
-                            scratch[c] = node.col_at(i, c)?;
-                        }
-                    }
-                    if !filter.eval_filter(&scratch, env, meter)? {
-                        return Ok(());
-                    }
+                if spillable {
+                    let u = node.record_scan_units(i, col_types, cap, mask);
+                    units.pages += u.pages;
+                    units.decompress += u.decompress;
+                }
+                if let Some(filter) = &span
+                    && !filter.keep(node, i, &mut scratch, env, meter)?
+                {
+                    return Ok(());
                 }
                 nsurv += 1;
                 let accs: &mut Vec<Acc> = if grouped {
@@ -3065,10 +3110,22 @@ impl Engine {
                 } else {
                     &mut whole
                 };
-                for (si, spec) in plan.agg_specs.iter().enumerate() {
-                    let v = match operand_col(spec) {
-                        Some(c) => node.col_at(i, c)?,
-                        None => Value::Null, // COUNT(*) folds no value
+                for (si, read) in operands.iter().enumerate() {
+                    let v = match *read {
+                        OperandRead::None => Value::Null, // COUNT(*) folds no value
+                        OperandRead::Nullness(c) => {
+                            if node.col_is_null(i, c) {
+                                Value::Null
+                            } else {
+                                Value::Bool(true)
+                            }
+                        }
+                        OperandRead::Fixed(c) => node.col_at(i, c)?,
+                        OperandRead::Reuse(c) => scratch.read(node, i, c)?,
+                        OperandRead::Variable(c) => match node.col_at(i, c)? {
+                            Value::Unfetched(u) => crate::format::resolve_unfetched_self(&u)?,
+                            v => v,
+                        },
                     };
                     accs[si].fold(v, meter)?;
                 }
@@ -3080,10 +3137,14 @@ impl Engine {
         };
 
         // Charge the identical cost totals (unmetered lane — charge order is invisible): the scan block
-        // (page_read × nodes; value_decompress × 0 — no spillable touched column gated above;
-        // storage_row_read × row_count) and aggregate_accumulate once per (survivor × spec). The
-        // filter's operator_eval was charged per scanned row inside the walk.
-        meter.charge(COSTS.page_read * pages as i64 + COSTS.storage_row_read * row_count as i64);
+        // (page_read × (nodes + chain pages); value_decompress × slabs; storage_row_read × row_count)
+        // and aggregate_accumulate once per (survivor × spec). The filter's operator_eval was charged
+        // per scanned row inside the walk.
+        meter.charge(
+            COSTS.page_read * (pages + units.pages) as i64
+                + COSTS.value_decompress * units.decompress as i64
+                + COSTS.storage_row_read * row_count as i64,
+        );
         meter.charge(COSTS.aggregate_accumulate * nsurv as i64 * plan.agg_specs.len() as i64);
 
         let srows = if grouped {
@@ -3109,4 +3170,20 @@ impl Engine {
         charge.release_all();
         Ok(Some(srows))
     }
+}
+
+/// How the columnar aggregate lane reads one aggregate's operand per record (packed-leaf.md §11
+/// Track A4), decided once per statement.
+#[derive(Clone, Copy)]
+enum OperandRead {
+    /// `COUNT(*)`: no operand.
+    None,
+    /// `COUNT(col)`: only the column's nullness.
+    Nullness(usize),
+    /// A fixed-width column: its slot, decoded in place (never deferred).
+    Fixed(usize),
+    /// A variable-width column beside a filter: the value the filter resolved, if it did.
+    Reuse(usize),
+    /// A variable-width column with no filter: resolved straight from the leaf.
+    Variable(usize),
 }

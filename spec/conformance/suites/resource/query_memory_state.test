@@ -156,24 +156,25 @@ SELECT id, count(*) OVER (PARTITION BY g) FROM n
 statement error 54P05
 SELECT id, count(*) OVER (PARTITION BY g) FROM n
 
-# Set operations: INTERSECT ALL counts the distinct right-arm rows; EXCEPT also dedups what it keeps.
-# max_query_memory_bytes: 778
+# Set operations: INTERSECT ALL counts the distinct right-arm rows (both arms' rows 196 + 195, plus
+# three count entries 195); EXCEPT also dedups what it keeps (one more entry, 66).
+# max_query_memory_bytes: 586
 query T rowsort
 SELECT w FROM u INTERSECT ALL SELECT v FROM t
 ----
 a
 
-# max_query_memory_bytes: 777
+# max_query_memory_bytes: 585
 statement error 54P05
 SELECT w FROM u INTERSECT ALL SELECT v FROM t
 
-# max_query_memory_bytes: 778
+# max_query_memory_bytes: 652
 query T rowsort
 SELECT w FROM u EXCEPT SELECT v FROM t
 ----
 qq
 
-# max_query_memory_bytes: 777
+# max_query_memory_bytes: 651
 statement error 54P05
 SELECT w FROM u EXCEPT SELECT v FROM t
 

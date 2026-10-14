@@ -63,6 +63,36 @@ timings and RSS remain diagnostics. In-memory/OPFS/WASI scratch limitations,
 upstream materializers, final scalar values, result collectors and whole-query
 admission are documented in [spill.md](spill.md) and [memory.md](memory.md).
 
+**Variable-width scan result (2026-10-13).** Track A4 ([packed-leaf.md §11](packed-leaf.md)) lets the
+columnar lanes read text, bytea, and array columns in place. The seven `varscan_*` lanes run over a
+100k-row scratch table (nullable text, `text[]`, `bytea`; no secondary index); `gin_stats_common_tag`
+is the full-scan `tags @> ARRAY['all']` after ANALYZE. Median ms per query, base → after, two
+alternating base/after rounds (PostgreSQL in brackets); every lane's checksum agreed across engines and
+rounds:
+
+| Lane | Rust | Go | [PG] |
+|---|---|---|---|
+| `varscan_text_eq` | 59.8 → 2.4 | 64.6 → 2.3 | 1.9 |
+| `varscan_text_isnull` | 63.2 → 1.6 | 63.6 → 1.5 | 1.9 |
+| `varscan_bytea_eq` | 61.7 → 2.3 | 63.4 → 2.1 | 2.3–3.3 |
+| `varscan_array_count` | 97.2 → 1.7 | 102.3 → 1.5–2.4 | 2.3 |
+| `varscan_array_contains` | 79.1 → 2.9 | 88.1 → 3.1 | 6.9 |
+| `varscan_text_max` | 76.8 → 6.4 | 81.8 → 5.4–6.0 | 2.5 |
+| `varscan_project_needle` | 40.1 → 5.6–6.1 | 44.5 → 3.7 | 1.7 |
+| `gin_stats_common_tag` | 75.2 → 3.5 | 85.6 → 3.2 | 7.3 |
+| `regex_filter_scan` | 1,542 → 1,288 | 1,640 → 1,173 | 69 |
+
+The TypeScript lanes moved little (e.g. `gin_stats_common_tag` 413 → 311–353 ms) because the TS
+harness drives the bare tooling `Engine`, whose commit never runs the post-commit residency flip: its
+tables stay as Decoded leaves, on which every record's large-value cost units are recomputed by
+re-encoding the row. Through the public `Database` API the same TS build answers `s IS NULL` in 4.5 ms
+on the lane versus 113.5 ms on the row path (`count(tags)` 4.1 vs 156.8 ms). Moving the TS harness to
+the `Database` API is a separate follow-on. The fixed-width lanes, re-run three alternating rounds after
+the change, stayed within run-to-run spread in Rust (`full_scan_agg` 20.4–20.6 → 20.9–21.2 ms,
+`full_scan_minmax` 35.1–35.6 → 34.9–36.2, `full_scan_agg_filter` 60.7–63.9 → 62.1–65.2) and within 2–8%
+in Go (`full_scan_agg` 11.6–12.3 → 12.5–12.9, `full_scan_minmax` 21.3–21.8 → 21.7–22.3,
+`full_scan_agg_filter` 35.2–35.4 → 35.4–36.7).
+
 **Native Node wrapper experiment (2026-07-16).** `impl/node` and
 `bench/ts/src/bench-node-rust.ts` provide a Node-API wrapper around the safe Rust core and run all 53
 jed lanes against the pure TypeScript core. The same-host control run also included the native Rust
@@ -1525,6 +1555,9 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 - ✅ **miss-heavy point lookups** — `point_lookup_pk_miss`: a scratch table holding every tenth key
   of 1..1,000,000, so ~90% of the uniform probes miss and each miss descends to a different leaf
   (probing past the end of the dense `large` keys would land on the one rightmost leaf every time);
+- ✅ **variable-width full scans** — the `varscan_*` lanes (text `=`/`IS NULL`, bytea `=`, `text[]`
+  `@>` and `count`, text `max`, and a fixed-width filter projecting a text column) over a 100k-row
+  scratch table with no secondary index (packed-leaf.md §11 Track A4);
 - ✅ **text-heavy / large-value rows** — `text_scan` (`sum(length(body))` reads every body) and
   `text_point_read` (one whole body per probe) over the `text` dataset (§4), whose bodies land
   inline plain, inline LZ4-compressed, and in compressed overflow chains, on every engine;

@@ -430,33 +430,12 @@ impl TableStore {
         self.range_scan_with_units(&KeyBound::unbounded(), mask)
     }
 
-    /// Gather the mask-selected columns of a bounded scan into dense per-column lanes (`cols[c]`, length
-    /// `row_count`, for each selected `c`) PLUS the `(page_read, value_decompress)` cost block — the A2/A3
-    /// columnar feed for the vectorized projection path (packed-leaf.md §11 Track A2/A3). It never
-    /// materializes a full-width [`Row`]: a wide-table projection touches a few columns instead of
-    /// allocating the whole row per record (the B/op win the masked row feed leaves on the table). Invoked
-    /// ONLY when no touched column can spill (the caller gates on `!any_spillable_masked`), so the
-    /// `value_decompress` slab count is always 0 and no unfetched value needs resolving. Cost is
-    /// byte-identical to `scan_with_units_masked(mask)` over the same bound: the same node visits
-    /// (`page_read`, computed in the same single descent) and the same slab count (0). The caller charges
-    /// `storage_row_read × row_count`.
-    pub(crate) fn columnar_scan_masked(
-        &self,
-        b: &KeyBound,
-        mask: &[bool],
-    ) -> Result<(Vec<Vec<Value>>, usize, usize, usize)> {
-        let src = make_src(&self.paging, &self.col_types);
-        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        let (cols, row_count, pages) = self.rows.columnar_scan(b, src_ref, mask)?;
-        Ok((cols, row_count, pages, 0))
-    }
-
-    /// The fold-during-walk twin of [`columnar_scan_masked`](TableStore::columnar_scan_masked)
-    /// (packed-leaf.md §11): walks the bounded scan calling `visit(node, i)` per admitted row — which
-    /// reads only the touched columns via [`crate::pmap::Node::col_at`] and folds them into an
-    /// accumulator — so an aggregate never materializes a per-column lane (O(1) memory). Returns
-    /// `(row_count, node_count)`, identical to the columnar scan, so the caller charges the same
-    /// `page_read` / `storage_row_read`; `value_decompress` is 0 (the caller gates on `!any_spillable`).
+    /// The columnar lanes' walk (packed-leaf.md §11 Tracks A2–A4): visits the bounded scan calling
+    /// `visit(node, i)` per admitted row — which reads only the touched columns (their values via
+    /// [`crate::pmap::Node::col_at`], or their stored bytes) — so a lane never materializes a full-width
+    /// row. Returns `(row_count, node_count)` — the same node visits as the row feed, so the caller
+    /// charges the same `page_read` / `storage_row_read`, adding each admitted record's large-value
+    /// units itself.
     pub(crate) fn fold_scan_masked(
         &self,
         b: &KeyBound,
@@ -666,6 +645,12 @@ impl TableStore {
     /// (spec/design/composite.md §4). Empty for an index store (records are the key alone).
     pub(crate) fn col_types(&self) -> &[ColType] {
         &self.col_types
+    }
+
+    /// The page payload capacity `C` — the divisor of the per-record large-value scan units
+    /// (chain pages, decompress slabs; cost.md §3).
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
     }
 
     /// Whether this store is file-backed (has a demand-paging pool) — the gate for the Track A2/A3

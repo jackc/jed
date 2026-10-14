@@ -10,13 +10,6 @@ impl LaneSrc<'_> {
     pub(crate) fn at(&self, j: usize, col: usize) -> &Value {
         match self {
             LaneSrc::Rows(rows) => &rows[j][col],
-            LaneSrc::Cols { cols, sel } => {
-                let i = match sel {
-                    Some(s) => s[j] as usize,
-                    None => j,
-                };
-                &cols[col][i]
-            }
         }
     }
 }
@@ -479,14 +472,13 @@ pub(crate) enum BufState {
         /// The projection's read-ahead window (extensibility.md §4.2.1), if a call in it is eligible.
         ahead: Option<ReadAhead>,
     },
-    /// The columnar projection fast path's lazy state (packed-leaf.md §11 Track A2/A3): the pre-gathered
-    /// dense lanes + the projection's column indices, windowed to `[idx, end)`, with the optional A3
-    /// selection vector. Each emission gathers output row `j` from the lanes at lane position `sel[j]`
-    /// (or `j`) and charges `row_produced` — an early exit skips the rows it never pulls.
+    /// The columnar projection fast path's lazy state (packed-leaf.md §11 Tracks A2–A4): the pre-gathered
+    /// dense lanes of the surviving records + the projection's column indices, windowed to `[idx, end)`.
+    /// Each emission gathers output row `j` from the lanes and charges `row_produced` — an early exit
+    /// skips the rows it never pulls.
     Columnar {
         cols: Vec<Vec<Value>>,
         proj_cols: Vec<usize>,
-        sel: Option<Vec<i32>>,
         idx: usize,
         end: usize,
         /// The lanes' query-memory charge (memory.md §6.5), returned at exhaustion or close.
@@ -565,14 +557,12 @@ impl crate::cursor::RowStream for BufferedScan {
                 Emitter::Columnar {
                     cols,
                     proj_cols,
-                    sel,
                     start,
                     end,
                     charge,
                 } => BufState::Columnar {
                     cols,
                     proj_cols,
-                    sel,
                     idx: start,
                     end,
                     charge,
@@ -769,14 +759,12 @@ impl crate::cursor::RowStream for BufferedScan {
                     Ok(Some(row))
                 }
             }
-            // Columnar projection (packed-leaf.md §11 Track A2/A3): gather this row from the dense lanes —
+            // Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather this row from the dense lanes —
             // a bare-column projection with no full-width row — charging only row_produced (a bare column
-            // ref is a zero-cost slot read). A non-None `sel` (the A3 filter's survivors) maps output row
-            // j to lane position sel[j].
+            // ref is a zero-cost slot read).
             BufState::Columnar {
                 cols,
                 proj_cols,
-                sel,
                 idx,
                 end,
                 ..
@@ -790,13 +778,9 @@ impl crate::cursor::RowStream for BufferedScan {
                 *idx += 1;
                 self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
-                let l = match sel {
-                    Some(s) => s[j] as usize,
-                    None => j,
-                };
                 let mut out = Vec::with_capacity(proj_cols.len());
                 for &c in proj_cols.iter() {
-                    out.push(cols[c][l].clone());
+                    out.push(cols[c][j].clone());
                 }
                 Ok(Some(out))
             }

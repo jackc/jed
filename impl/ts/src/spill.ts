@@ -557,6 +557,10 @@ function readRow(r: SpillByteReader): Row {
   return row;
 }
 
+// ignoreBOM keeps a leading U+FEFF in a reloaded text value (an ordinary code point, never a byte-order
+// mark).
+const SPILL_UTF8 = new TextDecoder("utf-8", { ignoreBOM: true });
+
 function readValue(r: SpillByteReader): Value {
   const tag = r.byte();
   switch (tag) {
@@ -567,9 +571,9 @@ function readValue(r: SpillByteReader): Value {
     case 2:
       return { kind: "bool", value: r.byte() !== 0 };
     case 3:
-      return { kind: "text", text: new TextDecoder().decode(r.bytes(readU32(r))) };
+      return { kind: "text", text: SPILL_UTF8.decode(r.bytes(readU32(r))) };
     case 22:
-      return { kind: "jsonpath", text: new TextDecoder().decode(r.bytes(readU32(r))) };
+      return { kind: "jsonpath", text: SPILL_UTF8.decode(r.bytes(readU32(r))) };
     case 4: {
       const neg = r.byte() !== 0;
       const scale = readU32(r);
@@ -692,9 +696,9 @@ function readValue(r: SpillByteReader): Value {
       return rangeValue(lower, upper, (flags & 0x08) !== 0, (flags & 0x10) !== 0);
     }
     case 19:
-      return jsonValue(new TextDecoder().decode(r.bytes(readU32(r))));
+      return jsonValue(SPILL_UTF8.decode(r.bytes(readU32(r))));
     case 20:
-      return jsonbValue(jsonbIn(new TextDecoder().decode(r.bytes(readU32(r)))));
+      return jsonbValue(jsonbIn(SPILL_UTF8.decode(r.bytes(readU32(r)))));
     default:
       throw new Error("bad spill value tag");
   }

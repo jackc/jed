@@ -451,6 +451,81 @@ expanded row vectors.
   columnar path and must agree with the resident row path on rows **and** cost, so a mis-indexed selection
   vector diverges loudly.
 
+- **Track A4 — variable-width lanes + encoded-span predicates.** *Landed in all three cores 2026-10
+  (per-core internal, like A1–A3 — results/cost/plan/byte-neutral, no `format_version` bump; the only
+  corpus change is the query-memory thresholds of the statements whose lane moved, memory.md §5.4).*
+  A2/A3 **declined** whenever a touched column was spillable (text, bytea, decimal, json/jsonb,
+  arrays, ranges, composites), so any scan touching one fell back to the row path: a full owned row per
+  stored row, a heap `String` per text value, an array value plus a `String` per element — measured at
+  ~400–800 ns/row in Rust (~4× that in TS), ~10× PostgreSQL, which evaluates `WHERE s = 'x'` as a
+  `memcmp` against its shared-buffer tuple. `count(tags)` cost the same as `tags @> '{all}'`, and
+  `s IS NULL` already paid most of it for a value it never reads: the cost was materialization, not the
+  operators. A4 lifts the decline and teaches the lanes to read variable-width values **in place**:
+  1. **Admission.** `agg_columnar` / `project_columnar` (and the bounded-whole-aggregate test that
+     routes a file-backed whole-table aggregate to the vectorized executor instead of the bounded-spill
+     lane) accept spillable touched columns. Each admitted record's touched spillable columns add the
+     record's large-value units read straight off its stored tag — one `page_read` per overflow-chain
+     page, `ceil(raw/C)` `value_decompress` slabs per compressed value — exactly the numbers
+     `record_scan_units` reads off the unfetched references on the row path. A consumer that needs a
+     column's **value** (an aggregate operand other than `COUNT(col)`, a projected column, a predicate
+     the span evaluator cannot handle) resolves it exactly as `resolve_columns` does: inline decode,
+     chain read, or decompression.
+  2. **Encoded-span predicates.** At lane entry the `WHERE` compiles once into a *span filter* that
+     mirrors `eval_filter`'s structure exactly: each `AND` node stays a node (guard + its `and` charge on
+     entry, left-then-right short-circuit), so charge order and the stop point are unchanged. A leaf of
+     one of the shapes below becomes a **span atom**; every other leaf stays a generic predicate,
+     evaluated by the ordinary evaluator over a reusable scratch row after the columns it reads (its
+     `collect_touched` set — the analysis that built the lane's mask) are resolved, each at most once
+     per record. An atom reads its column's page span — the null bitmap / zero-length
+     span for NULL, otherwise the inline-plain (`0x00`) body — and evaluates on the encoded bytes:
+     - `col IS [NOT] NULL` over any non-composite column (a composite's `IS NULL` is the all-fields
+       rule, composite.md §5, so it stays generic): reads only nullness, never the value (an
+       out-of-line value is non-NULL by construction).
+     - `col = k` / `col <> k` (either operand order) over `text` or `bytea`, `k` a constant: equality
+       is byte identity under every collation (collation.md §7), so the atom compares the body's bytes
+       (after the `u16` length) with `k`'s bytes.
+     - `col @> k` / `col <@ k` / `col && k` (either operand order) over a `text[]` / `bytea[]` /
+       `i16[]` / `i32[]` / `i64[]` column, `k` a constant array: the array body (array.md §4) is walked
+       and its non-NULL element bodies compared bytewise with `k`'s encoded element bodies — equal
+       bodies ⇔ `strict_elem_eq` for these element types; a NULL element matches nothing, any
+       dimensionality.
+     The constant operand `k` must be a literal shape — a text / bytea / integer / NULL literal, a
+     folded array constant, a bind parameter, or a flat `ARRAY[...]` of those — whose evaluation
+     charges at most the constructor's `operator_eval` and reserves nothing; any other operand keeps
+     the leaf generic. It is evaluated **once** at compile time with a private meter; its value is
+     encoded and its charge is replayed per evaluated row, so a per-row atom charges exactly what the
+     evaluator charges for the same subtree: the node's operator charge, the constant's replayed
+     charge, and for `=`/`<>` the data-dependent `varlen_compare × (max(min(W_col, W_k), 1) − 1)`
+     (`W` = code points of text, bytes of bytea; nothing extra for a NULL operand) — the code points
+     counted from the UTF-8 bytes. A constant whose value does not fit the column (a NULL `k`, an
+     integer outside the element type, an element too long for a `u16` length) keeps the leaf
+     generic.
+     **Fallback.** An atom evaluates through the ordinary evaluator over the resolved value whenever
+     the span is not available in place: a Decoded (writer-dirty) leaf, an out-of-line or compressed
+     value, or a body that is not exactly well-formed (length overruns, trailing bytes, invalid UTF-8,
+     a malformed array header). So a malformed inline body still surfaces `XX001` through the decoder,
+     and results, charges, and errors are those of the evaluator by construction.
+  3. **Aggregates.** `COUNT(col)` folds the column's nullness only — no value is decoded; every other
+     eligible aggregate operand resolves its value.
+  4. **Projection lane — survivors only.** With a `WHERE`, the projection lane now evaluates the span
+     filter **during** the tree walk and gathers the projected columns of **surviving** records only
+     (no selection vector), so a non-survivor's variable-width values are never decoded. Without a
+     `WHERE` every record is gathered, as before. The lane's operator-state reservation (memory.md
+     §6.5) is the `key_bytes` of the gathered survivor values.
+  The one observable timing consequence is the established lazy-decode one (§8): a malformed body in a
+  column a query reads only for nullness (`IS NULL`, `COUNT(col)`), or one a span atom never reaches,
+  is not decoded and does not raise — corruption below the page checksum is an engine bug, never user
+  data. Verified by each core's `varwidth_lanes` battery — a variable-width table (NULLs, empty
+  values, embedded `0x00` bytes, multibyte text, `NULL` array elements, compressed and out-of-line
+  values, a writer's dirty leaves) where every query runs on the lane (unmetered) and on the row path
+  (the same session under a `max_cost` it never reaches, which disables the lanes) and must agree on
+  rows **and** cost — plus the `varwidth_span` NoREC relation pairing each atom shape with a spelling
+  the span compiler does not recognize (conformance.md §8).
+  Deferred follow-ons (none foreclosed): span atoms on the row-path scans that the lanes do not take
+  (an `ORDER BY` / `LIMIT` streaming scan, joins); ordering comparisons, `LIKE 'prefix%'`, and the
+  GIN-relevant `jsonb` operators as atoms; a fixed-width comparison atom (an integer filter is still a
+  generic predicate).
+
 The columnar read-path work is now **complete across all three cores** (2026-07): A1 (touched-column scan
 wiring), the A2 projection feed + aggregate gather, and A3 filter vectorization for both projections and
 aggregates — including the **vectorized aggregate executor** (single-base-table SUM/COUNT/MIN/MAX/AVG,

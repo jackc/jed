@@ -196,3 +196,23 @@ SELECT s FROM astral ORDER BY s
 ----
 豈
 😀
+
+# --- a leading U+FEFF is ordinary text, not a byte-order mark ---------------
+# A stored value keeps every code point, including a leading U+FEFF (ZERO WIDTH NO-BREAK SPACE):
+# '﻿a' is a different value from 'a' and sorts after it (UTF-8 EF BB BF > 61).
+statement ok
+CREATE TABLE bom (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO bom VALUES (1, '﻿a'), (2, 'a')
+
+query I nosort
+SELECT id FROM bom WHERE s = 'a'
+----
+2
+
+query I nosort
+SELECT id FROM bom ORDER BY s
+----
+2
+1

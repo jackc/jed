@@ -203,6 +203,8 @@ mod update;
 mod values_body;
 #[path = "../tests/variables.rs"]
 mod variables;
+#[path = "../tests/varwidth_lanes.rs"]
+mod varwidth_lanes;
 #[path = "../tests/views.rs"]
 mod views;
 #[path = "../tests/where_rewrite.rs"]

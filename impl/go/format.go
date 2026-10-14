@@ -2582,6 +2582,51 @@ func recordFootprint(colTypes []colType, key []byte, row storedRow, capacity int
 // external-plain, the COMPRESSED block for external-compressed) and decompress = ceil(raw/capacity)
 // value_decompress slabs per compressed stored value (inline- or external-). Zero/zero for a
 // fully-inline-plain record or an untouched column.
+// spanScanUnits adds the large-value units one stored variable-column span contributes to a scan's
+// cost block (cost.md §3) — read straight off its presence tag and pointer fields, the same numbers
+// recordScanUnits reads off the unfetched reference readValueLazy would build from these bytes: one
+// page_read per overflow-chain page and ceil(raw_len / cap) value_decompress slabs per compressed
+// value; nothing for an inline-plain value. A malformed span adds nothing (resolving it reports the
+// corruption). Packed-leaf.md §11 Track A4.
+func spanScanUnits(span []byte, capacity int, pages, decompress *int) {
+	field := func(at int) (int, bool) {
+		if at+4 > len(span) {
+			return 0, false
+		}
+		return int(binary.BigEndian.Uint32(span[at:])), true
+	}
+	if len(span) == 0 {
+		return
+	}
+	switch span[0] {
+	case tagExternal:
+		if n, ok := field(5); ok {
+			*pages += (n + capacity - 1) / capacity
+		}
+	case tagInlineComp:
+		if raw, ok := field(1); ok {
+			*decompress += (raw + capacity - 1) / capacity
+		}
+	case tagExternalComp:
+		stored, ok1 := field(5)
+		raw, ok2 := field(9)
+		if ok1 && ok2 {
+			*pages += (stored + capacity - 1) / capacity
+			*decompress += (raw + capacity - 1) / capacity
+		}
+	}
+}
+
+// inlinePlainBody returns the inline-plain body of a stored variable-column span — the bytes after a
+// 0x00 presence tag — and false when the value is stored out of line or compressed (packed-leaf.md
+// §11 Track A4).
+func inlinePlainBody(span []byte) ([]byte, bool) {
+	if len(span) == 0 || span[0] != 0x00 {
+		return nil, false
+	}
+	return span[1:], true
+}
+
 func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int, mask []bool) (pages, decompress int) {
 	// A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
 	// §14): read the units straight off them — no disposition re-plan, which would need the
@@ -4507,6 +4552,22 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 		return readInlineBody(p.colTypes[c], vb, &pos, decodeConstruct)
 	}
 	return readValueLazy(p.colTypes, c, vb, &pos, p.paging)
+}
+
+// valueSpan returns the stored bytes of value (record i, column c), borrowed from the page — a
+// variable column's tagged codec bytes (presence tag + inline body or out-of-line pointer), a
+// fixed-width column's untagged slot — and false for NULL (packed-leaf.md §11 Track A4). A span the
+// directories place outside the payload yields an empty slice, which no span reader accepts (the
+// caller falls back to the decoder, which reports the corruption).
+func (p *packedLeaf) valueSpan(c, i int) ([]byte, bool) {
+	if p.dirs.isNull(c, i) {
+		return nil, false
+	}
+	vb, err := p.dirs.value(c, i)
+	if err != nil {
+		return []byte{}, true
+	}
+	return vb, true
 }
 
 // row reconstructs the whole value row i (every column). The rowAt whole-record path.

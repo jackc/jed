@@ -1660,6 +1660,130 @@ setup_sql = [
   "ANALYZE tstats"
 ]
 
+# Variable-width full scans (spec/design/packed-leaf.md §11 Track A4). A 100k-row scratch table with
+# a nullable text column (100 values, every fifth row NULL), a text[] column, and a bytea column, with
+# no secondary index, so every query scans the table. Before A4 any scan touching a variable-width
+# column built an owned row per record (a String per text value, an array of Strings per text[]);
+# the columnar lanes now read nullness and inline values in place on the leaf page.
+[[bench]]
+name = "varscan_text_eq"
+description = "Full scan, text equality: count rows where s = 'v7' (1,000 of 100k) — a byte compare on the stored span"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM vscan WHERE s = 'v7'"
+warmup = 5
+iterations = 50
+seed = 4807
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS vscan",
+  "CREATE TABLE vscan (id bigint PRIMARY KEY, n bigint, s text, tags text[], b bytea)",
+  "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "varscan_text_isnull"
+description = "Full scan, text IS NULL: count the 20,000 NULL s values — nullness from the leaf directory, no value read"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM vscan WHERE s IS NULL"
+warmup = 5
+iterations = 50
+seed = 4808
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS vscan",
+  "CREATE TABLE vscan (id bigint PRIMARY KEY, n bigint, s text, tags text[], b bytea)",
+  "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "varscan_bytea_eq"
+description = "Full scan, bytea equality: count rows where b = 'b7' (2,000 of 100k)"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM vscan WHERE b = 'b7'::bytea"
+warmup = 5
+iterations = 50
+seed = 4809
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS vscan",
+  "CREATE TABLE vscan (id bigint PRIMARY KEY, n bigint, s text, tags text[], b bytea)",
+  "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "varscan_array_count"
+description = "Full scan, count(tags) over a text[] column — nullness only, no array decoded"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(tags) FROM vscan"
+warmup = 5
+iterations = 50
+seed = 4810
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS vscan",
+  "CREATE TABLE vscan (id bigint PRIMARY KEY, n bigint, s text, tags text[], b bytea)",
+  "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "varscan_array_contains"
+description = "Full scan (no GIN index), text[] containment: count rows whose tags contain 'u7' (100 of 100k)"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM vscan WHERE tags @> ARRAY['u7']"
+warmup = 5
+iterations = 50
+seed = 4811
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS vscan",
+  "CREATE TABLE vscan (id bigint PRIMARY KEY, n bigint, s text, tags text[], b bytea)",
+  "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "varscan_text_max"
+description = "Full scan, max(s) — every non-NULL text value decoded and compared"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT max(s) FROM vscan"
+warmup = 5
+iterations = 50
+seed = 4812
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS vscan",
+  "CREATE TABLE vscan (id bigint PRIMARY KEY, n bigint, s text, tags text[], b bytea)",
+  "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "varscan_project_needle"
+description = "Full scan, integer filter projecting the text column of the one survivor (n = 4242) — no other record's text decoded"
+dataset = "scratch"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id, s FROM vscan WHERE n = 4242"
+warmup = 5
+iterations = 50
+seed = 4813
+expect_rows_per_iter = 1
+setup_sql = [
+  "DROP TABLE IF EXISTS vscan",
+  "CREATE TABLE vscan (id bigint PRIMARY KEY, n bigint, s text, tags text[], b bytea)",
+  "INSERT INTO vscan SELECT g, g, CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 100)::text END, ARRAY['all', 'u' || (g % 1000)::text], ('b' || (g % 50)::text)::bytea FROM generate_series(1, 100000) AS g"
+]
+
 # GIN jsonb_ops (spec/design/gin.md §2.1; query.gin_jsonb_ops). A 100k-row scratch table of small
 # documents behind a jsonb GIN index: `n` takes 1000 values (100 rows each) and the `tag<g % 97>`
 # key 97 values (~1031 rows each). `doc @> {"n": $1}` gathers the posting list of one number term

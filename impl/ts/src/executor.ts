@@ -313,7 +313,14 @@ import {
   forgetViews,
   viewsInDependencyOrder,
 } from "./views.ts";
-import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
+import { type KeyBound, type PNode, colAt, colIsNull, compareBytes, unboundedBound } from "./pmap.ts";
+import {
+  compileLaneFilter,
+  laneKeep,
+  laneReuse,
+  readLeafColumn,
+  ScratchRow,
+} from "./span_filter.ts";
 import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
 import { RowSpool, SpillMap, SpillMultiMap, SpillSet, SpoolSorter } from "./blocking.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
@@ -624,7 +631,6 @@ import { Snapshot, txStatusOf } from "./snapshot.ts";
 import type { AttachmentCore, LaneAt, ReadPin } from "./session.ts";
 import {
   SessionState,
-  filterColumnar,
   foldAggWhole,
   frameBackwardSafe,
   groupByIntKey,
@@ -769,15 +775,14 @@ export type Emitter = {
   sorted?: Pick<SortedRows, "next" | "close">;
   sortedIdentity?: boolean;
   sortedFinal?: boolean;
-  // Set only for "columnar" (the projectColumnar fast path, packed-leaf.md §11 Track A2/A3): `cols` are
-  // the pre-gathered dense per-column lanes (indexed by table ordinal) and `projCols` the projection's
-  // column indices into them; emission builds output row j as [cols[projCols[0]][l], …] where l = sel[j]
-  // (the A3 selection vector's survivor — a filtered scan) or j (all rows, sel undefined) — a bare-column
-  // projection with no full-width row, charging rowProduced per windowed row exactly like "project" over
-  // a bare column ref (a zero-cost slot read). Windowed to [start, end).
+  // Set only for "columnar" (the projectColumnar fast path, packed-leaf.md §11 Tracks A2–A4): `cols` are
+  // the pre-gathered dense per-column lanes of the surviving records (indexed by table ordinal) and
+  // `projCols` the projection's column indices into them; emission builds output row j as
+  // [cols[projCols[0]][j], …] — a bare-column projection with no full-width row, charging rowProduced
+  // per windowed row exactly like "project" over a bare column ref (a zero-cost slot read). Windowed to
+  // [start, end).
   cols?: Value[][];
   projCols?: number[];
-  sel?: number[];
   // The gathered lanes' query-memory charge (memory.md §6.5), returned when the emission completes.
   columnarCharge?: StateCharge;
 };
@@ -19726,19 +19731,16 @@ export class Engine {
       }
     }
     if (em.mode === "columnar") {
-      // Columnar projection (packed-leaf.md §11 Track A2/A3): gather each windowed output row from the
+      // Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather each windowed output row from the
       // dense lanes — a bare-column projection with no full-width row — charging rowProduced per row,
-      // exactly the "project" drive over a bare-column projection (whose eval is a zero-cost slot read). A
-      // set `sel` (the A3 filter's survivors) maps output row j to lane position sel[j].
+      // exactly the "project" drive over a bare-column projection (whose eval is a zero-cost slot read).
       const cols = em.cols!;
       const projCols = em.projCols!;
-      const sel = em.sel;
       const out: Value[][] = [];
       for (let j = em.start; j < em.end; j++) {
         meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
-        const l = sel === undefined ? j : sel[j]!;
-        const o = projCols.map((c) => cols[c]![l]!);
+        const o = projCols.map((c) => cols[c]![j]!);
         meter.admitRow(o); // the buffered result collector (memory.md §5.1)
         out.push(o);
       }
@@ -19778,18 +19780,19 @@ export class Engine {
     return out;
   }
 
-  // projectColumnar runs the A2/A3 columnar gather for a vectorizedProjectEligible plan (packed-leaf.md
-  // §11 Track A2/A3): it scans only the touched columns of the single base relation into dense per-column
-  // lanes (never a full-width Row), charges the identical scan cost block, applies any WHERE predicate over
-  // the lanes into a selection vector (A3), and returns a "columnar" Emitter that gathers each surviving
-  // output row from the lanes on emission. Returns null (declining to the caller's row path) for an
-  // in-memory store (its Decoded leaves share rows zero-copy, so a lane gather would only add allocation),
-  // a spillable touched column (the columnar feed has no value-resolution step — this also covers a filter
-  // over a spillable column), or a projection column out of range / unmasked (a safety net, never expected
-  // — a projected column is touched, hence masked). Cost-neutral by construction: the same page_read (same
-  // node visits) / value_decompress (0) / storage_row_read (× rowCount) / operator_eval (the filter over
-  // each scanned row) as the row path, then rowProduced per emitted (surviving) row charged by the emitter
-  // drive — exactly the "project" drive over a bare-column projection.
+  // projectColumnar runs the columnar projection lane for a vectorizedProjectEligible plan (packed-leaf.md
+  // §11 Tracks A2–A4): it walks the single base relation's bound once, evaluates any WHERE per record as a
+  // span filter (compileLaneFilter — atoms on the stored bytes, generic predicates over a reusable scratch
+  // row), gathers the projected columns of the SURVIVING records into dense per-column lanes (never a
+  // full-width Row; a non-survivor's variable-width values are never decoded), charges the identical scan
+  // cost block, and returns a "columnar" Emitter that builds each output row from the lanes on emission.
+  // Returns null (declining to the caller's row path) for an in-memory store (its Decoded leaves share
+  // rows zero-copy, so a lane gather would only add allocation), or a projection column out of range /
+  // unmasked (a safety net, never expected — a projected column is touched, hence masked). Cost-neutral
+  // by construction: the same page_read (same node visits, plus each admitted record's chain pages) /
+  // value_decompress / storage_row_read (× rowCount) / operator_eval (the filter over each scanned record)
+  // as the row path, then rowProduced per emitted row charged by the emitter drive — exactly the
+  // "project" drive over a bare-column projection.
   private projectColumnar(
     plan: SelectPlan,
     env: EvalEnv,
@@ -19801,25 +19804,24 @@ export class Engine {
     // File-backed only: an in-memory store's row path is already zero-copy.
     if (!store.isFileBacked()) return null;
     const mask = plan.relMasks[0]!;
-    // No touched column may spill — so the feed's value_decompress slab count is 0 and no unfetched value
-    // is left unresolved. The mask includes the filter's columns (collectTouched), so this also declines a
-    // filter over a spillable column to the row path.
-    if (store.anySpillableTouched(mask)) return null;
     // Each projected column must be a valid, masked table ordinal — else its gathered lane would be empty.
     const projCols: number[] = [];
+    const gather: boolean[] = new Array(mask.length).fill(false);
     for (const p of plan.projections) {
       if (p.kind !== "column") return null;
       const idx = p.index;
       if (idx < 0 || idx >= mask.length || !mask[idx]) return null;
       projCols.push(idx);
+      gather[idx] = true;
     }
+    const gatherCols: number[] = [];
+    for (let c = 0; c < mask.length; c++) if (gather[c]) gatherCols.push(c);
+    // A touched variable-width column adds each admitted record's large-value units (chain pages,
+    // decompress slabs) to the scan block, read off its stored tag (Track A4).
+    const spillable = store.anySpillableTouched(mask);
 
     // Determine the scan bound exactly as materializeRel does: a PK-range bound, or the full scan. An
     // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely (0 pages/rows).
-    let cols: Value[][] = mask.map(() => []);
-    let rowCount = 0;
-    let pages = 0;
-    const slabs = 0;
     let doScan = true;
     let b = unboundedBound();
     const relBound = plan.phys.relBounds[0];
@@ -19828,18 +19830,34 @@ export class Engine {
       if (bb === null) doScan = false;
       else b = bb;
     }
+    const span =
+      plan.filter === null ? null : compileLaneFilter(plan.filter, store.columnTypes(), mask, env);
+    const scratch = new ScratchRow(mask.length);
+    const cols: Value[][] = mask.map(() => []);
+    const units = { pages: 0, decompress: 0 };
+    let nEmit = 0;
+    let rowCount = 0;
+    let pages = 0;
     if (doScan) {
-      const r = store.columnarScanMasked(b, mask);
-      cols = r.cols;
+      const reuse = laneReuse(store.columnTypes(), span !== null);
+      const visit = (n: PNode, i: number): void => {
+        if (spillable) store.laneScanUnits(n, i, mask, units);
+        if (span !== null && !laneKeep(span, n, i, scratch, env, meter)) return;
+        for (const c of gatherCols)
+          cols[c]!.push(reuse[c] ? scratch.read(n, i, c) : readLeafColumn(n, i, c));
+        nEmit++;
+      };
+      const r = store.foldScanMasked(b, visit);
       rowCount = r.rowCount;
-      pages = r.pages;
+      pages = r.nodes;
     }
-    // Charge the scan cost block identically to materializeRel + scanSource: page_read × nodes,
-    // value_decompress × slabs (0 here), storage_row_read × rowCount. On the unmetered lane (the caller
-    // gates) this bulk charge reproduces the per-row accrual (guard is a no-op).
+    // Charge the scan cost block identically to materializeRel + scanSource: page_read × (nodes + chain
+    // pages), value_decompress × slabs, storage_row_read × rowCount. On the unmetered lane (the caller
+    // gates) this bulk charge reproduces the per-row accrual (guard is a no-op); the filter's
+    // operator_eval was charged per scanned record inside the walk.
     meter.charge(
-      COSTS.pageRead * BigInt(pages) +
-        COSTS.valueDecompress * BigInt(slabs) +
+      COSTS.pageRead * BigInt(pages + units.pages) +
+        COSTS.valueDecompress * BigInt(units.decompress) +
         COSTS.storageRowRead * BigInt(rowCount),
     );
     // The gathered lanes are operator state, reserved once the bulk gather completes (memory.md §6.5)
@@ -19850,15 +19868,6 @@ export class Engine {
       for (const lane of cols) bytes += keyBytes(lane);
       charge.reserve(meter, bytes);
     }
-
-    // A3: apply the WHERE predicate over the lanes into a selection vector (undefined ⇒ all rows survive).
-    let sel: number[] | undefined;
-    let nEmit = rowCount;
-    if (plan.filter !== null) {
-      sel = filterColumnar(plan.filter, cols, mask, rowCount, env, meter);
-      nEmit = sel.length;
-    }
-
     return {
       rows: [],
       start: 0,
@@ -19866,7 +19875,6 @@ export class Engine {
       mode: "columnar",
       cols,
       projCols,
-      sel,
       columnarCharge: charge,
     };
   }
@@ -19941,11 +19949,10 @@ export class Engine {
   ): Emitter {
     const gset = plan.groupSets[0]!;
 
-    // A2/A3 columnar fast path (packed-leaf.md §11 Track A2/A3): a file-backed aggregate gathers only its
-    // touched columns into dense lanes and folds columnar — never a full-width row. A WHERE (A3) is
-    // applied over the lanes into a selection vector rather than forcing the row path. Declines (null) to
-    // the row path below for an in-memory store or a spillable touched column. Cost-neutral by
-    // construction (aggColumnar charges the identical scan block).
+    // Columnar fast path (packed-leaf.md §11 Tracks A2–A4): a file-backed aggregate folds only its
+    // touched columns during the tree walk — never a full-width row — evaluating any WHERE per record on
+    // the stored bytes where it can. Declines (null) to the row path below for an in-memory store.
+    // Cost-neutral by construction (aggColumnar charges the identical scan block).
     let srows = this.aggColumnar(plan, gset, env, params, meter);
     if (srows !== null) {
       // Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
@@ -19993,17 +20000,16 @@ export class Engine {
     return { rows: srows, start: Number(start), end: Number(end), mode: "project" };
   }
 
-  // aggColumnar runs the A2/A3 columnar gather for a vectorized aggregate (packed-leaf.md §11 Track
-  // A2/A3): it scans only the touched columns of the single base relation into dense per-column lanes
-  // (never a full-width Row), charges the identical scan cost block, applies any WHERE predicate over the
-  // lanes into a selection vector (A3), and folds each aggregate columnar over the survivors — returning
-  // the finalized synthetic rows (the whole-table grand total or one per group). Returns null (declining
-  // to the caller's row path) when the store is in-memory (its Decoded leaves share rows zero-copy), when
-  // a touched column can spill (the columnar feed has no value-resolution step — this also covers a
-  // filter over a spillable column), or when a needed column ordinal is out of range / unmasked (a safety
-  // net, never expected for an eligible plan). Cost-neutral by construction: same pageRead /
-  // valueDecompress (0) / storageRowRead / operatorEval (the filter) / aggregateAccumulate / rowProduced
-  // as the row path.
+  // aggColumnar runs the columnar aggregate lane (packed-leaf.md §11 Tracks A2–A4): it walks the single
+  // base relation's bound once, evaluates any WHERE per record as a span filter (compileSpanPred — atoms
+  // on the stored bytes, generic predicates over a reusable scratch row), and folds each survivor's
+  // touched columns straight into its accumulator — never a full-width Row, and COUNT(col) reads only
+  // nullness — returning the finalized synthetic rows (the whole-table grand total or one per group).
+  // Returns null (declining to the caller's row path) when the store is in-memory (its Decoded leaves
+  // share rows zero-copy), or when a needed column ordinal is out of range / unmasked (a safety net, never
+  // expected for an eligible plan). Cost-neutral by construction: same pageRead (plus each admitted
+  // record's chain pages) / valueDecompress / storageRowRead / operatorEval (the filter) /
+  // aggregateAccumulate / rowProduced as the row path.
   private aggColumnar(
     plan: SelectPlan,
     gset: GroupSet,
@@ -20016,9 +20022,9 @@ export class Engine {
     // File-backed only: an in-memory store's row path is already zero-copy.
     if (!store.isFileBacked()) return null;
     const mask = plan.relMasks[0]!;
-    // No touched column may spill — so the feed's valueDecompress slab count is 0 and no unfetched value
-    // is left unresolved. This declines a filter or operand over a spillable column to the row path.
-    if (store.anySpillableTouched(mask)) return null;
+    // A touched variable-width column adds each admitted record's large-value units (chain pages,
+    // decompress slabs) to the scan block, read off its stored tag (Track A4).
+    const spillable = store.anySpillableTouched(mask);
     // Every column the fold reads (each aggregate operand + the group key) must be a valid, masked table
     // ordinal — else its gathered lane would be empty. Also declines a (never-expected) non-zero offset.
     const need = (idx: number): boolean => idx >= 0 && idx < mask.length && mask[idx] === true;
@@ -20044,15 +20050,18 @@ export class Engine {
     const keyCol = grouped ? gset.keyCols[0]! : 0;
 
     // Fold each scanned row's touched columns straight into its accumulator during ONE tree walk — no
-    // per-column lane is materialized, so a whole-table / single-int-key aggregate is O(1) memory instead
-    // of the O(rows) whole-column gather the lane path paid (float.md §7, packed-leaf.md §11). A WHERE
-    // predicate (A3) is evaluated over a single reusable masked scratch row read via colAt (untouched
-    // columns NULL) — byte-identical input + operator_eval to the lane filter.
+    // per-column lane is materialized, so a whole-table / single-int-key aggregate is O(1) memory
+    // (float.md §7, packed-leaf.md §11). The WHERE compiles once into span atoms over the stored bytes
+    // plus generic predicates over a reusable scratch row (Track A4) — byte-identical survivors +
+    // operator_eval to the row path's evalFilter.
     const whole: Acc[] = grouped ? [] : plan.aggSpecs.map((s) => newAccFromSpec(s, this.session.timeZone));
     const groups: { key: Value; accs: Acc[] }[] = [];
     const index = new Map<bigint, number>();
     let nullGi = -1;
-    const scratch: Row = plan.filter !== null ? new Array(mask.length).fill(nullValue()) : [];
+    const span =
+      plan.filter === null ? null : compileLaneFilter(plan.filter, store.columnTypes(), mask, env);
+    const scratch = new ScratchRow(mask.length);
+    const units = { pages: 0, decompress: 0 };
     let nsurv = 0;
     let rowCount = 0;
     let pages = 0;
@@ -20062,13 +20071,10 @@ export class Engine {
     if (!grouped && charge.active()) charge.reserve(meter, entryBytes([]));
 
     if (doScan) {
+      const reuse = laneReuse(store.columnTypes(), span !== null);
       const visit = (n: PNode, i: number): void => {
-        if (plan.filter !== null) {
-          for (let c = 0; c < mask.length; c++) {
-            if (mask[c]) scratch[c] = colAt(n, i, c);
-          }
-          if (!evalFilter(plan.filter, scratch, env, meter)) return;
-        }
+        if (spillable) store.laneScanUnits(n, i, mask, units);
+        if (span !== null && !laneKeep(span, n, i, scratch, env, meter)) return;
         nsurv++;
         let accs: Acc[];
         if (grouped) {
@@ -20100,7 +20106,13 @@ export class Engine {
         for (let s = 0; s < plan.aggSpecs.length; s++) {
           const spec = plan.aggSpecs[s]!;
           const oc = operandCol(spec);
-          foldAcc(accs[s]!, oc === null ? nullValue() : colAt(n, i, oc), meter);
+          let v: Value;
+          if (oc === null) v = nullValue(); // COUNT(*) folds no value
+          else if (spec.plan === "count")
+            // COUNT(col) folds only nullness — the value is never decoded (Track A4).
+            v = colIsNull(n, i, oc) ? nullValue() : { kind: "bool", value: true };
+          else v = reuse[oc] ? scratch.read(n, i, oc) : readLeafColumn(n, i, oc);
+          foldAcc(accs[s]!, v, meter);
         }
       };
       const r = store.foldScanMasked(b, visit);
@@ -20109,10 +20121,14 @@ export class Engine {
     }
 
     // Charge the identical cost totals (unmetered lane — charge order is invisible): the scan block
-    // (pageRead × nodes; valueDecompress × 0 — no spillable touched column gated above; storageRowRead ×
-    // rowCount) and aggregateAccumulate once per (survivor × spec). The filter's operator_eval was
-    // charged per scanned row inside the walk.
-    meter.charge(COSTS.pageRead * BigInt(pages) + COSTS.storageRowRead * BigInt(rowCount));
+    // (pageRead × (nodes + chain pages); valueDecompress × slabs; storageRowRead × rowCount) and
+    // aggregateAccumulate once per (survivor × spec). The filter's operator_eval was charged per scanned
+    // row inside the walk.
+    meter.charge(
+      COSTS.pageRead * BigInt(pages + units.pages) +
+        COSTS.valueDecompress * BigInt(units.decompress) +
+        COSTS.storageRowRead * BigInt(rowCount),
+    );
     meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length));
 
     const srows = grouped
@@ -20954,8 +20970,7 @@ export class Engine {
       this.vectorizedAggEligible(plan)
     ) {
       const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
-      if (store.isFileBacked() && !store.anySpillableTouched(plan.relMasks[0]!))
-        return this.execVectorizedAgg(plan, env, meter, params);
+      if (store.isFileBacked()) return this.execVectorizedAgg(plan, env, meter, params);
     }
     if (fast && this.boundedBlockingEligible(plan))
       return this.execBoundedBlocking(plan, env, meter, params);

@@ -560,7 +560,11 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   under a column alias list must return the same rows; **view_write** — UPDATE, DELETE, and INSERT
   through an updatable view and through a view over it, beside the same writes on an identically
   seeded table with the views' conditions and read-only columns inlined ([views.md §15](views.md)):
-  the same `RETURNING` rows and the same final contents; **contradiction** — a plan-time-proven
+  the same `RETURNING` rows and the same final contents; **varwidth_span** — the columnar lanes'
+  stored-byte atoms ([packed-leaf.md §11 Track A4](packed-leaf.md)): text/bytea `=`/`<>`, `IS [NOT]
+  NULL`, array `@>`/`<@`/`&&` against a constant, and `COUNT(col)`, against wrapped spellings the span
+  compiler leaves to the evaluator (`s || ''`, `COALESCE(tags, NULL)`, `NOT (…)`, `count(s || '')`),
+  over NULLs, empty and multibyte values, NULL elements, and compressed / out-of-line values; **contradiction** — a plan-time-proven
   empty bare-column literal AND-chain reads nothing ([planner.md §3.1](planner.md)) and must agree with
   the unproven `col + 0` spelling (empty rows, a zero ungrouped COUNT), plus satisfiable near-miss
   ranges; **dml_contradiction** — UPDATE/DELETE whose WHERE is a proven contradiction read nothing,

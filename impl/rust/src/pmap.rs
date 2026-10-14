@@ -37,6 +37,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::catalog::ColType;
 use crate::error::Result;
 use crate::format::{LeafShape, PackedLeaf, leaf_overhead};
 use crate::storage::Row;
@@ -303,6 +304,60 @@ impl Node {
         match &self.packed {
             None => Ok(self.vals[i][c].clone()),
             Some(p) => p.value(c, i),
+        }
+    }
+
+    /// Whether column `c` of row `i` is NULL, without reconstructing the value (packed-leaf.md §11
+    /// Track A4): the PAX null bitmap / zero-length span on a Packed leaf. A deferred large value is
+    /// never NULL.
+    pub(crate) fn col_is_null(&self, i: usize, c: usize) -> bool {
+        match &self.packed {
+            None => matches!(self.vals[i][c], Value::Null),
+            Some(p) => p.is_null(c, i),
+        }
+    }
+
+    /// The stored bytes of column `c` of row `i`, borrowed from a Packed leaf's page (Track A4):
+    /// `Some(None)` for NULL, `Some(Some(span))` for the tagged codec bytes. `None` on a Decoded leaf,
+    /// which holds values rather than stored bytes.
+    pub(crate) fn col_span(&self, i: usize, c: usize) -> Option<Option<&[u8]>> {
+        self.packed.as_ref().map(|p| p.value_span(c, i))
+    }
+
+    /// The large-value scan units (chain pages, decompress slabs) record `i` adds for the touched
+    /// columns `mask` — on a Packed leaf read off each touched variable column's stored tag
+    /// ([`crate::format::span_scan_units`]), on a Decoded leaf the row path's
+    /// [`crate::format::record_scan_units`] over the row (Track A4; cost.md §3).
+    pub(crate) fn record_scan_units(
+        &self,
+        i: usize,
+        col_types: &[ColType],
+        cap: usize,
+        mask: &[bool],
+    ) -> crate::format::ScanUnits {
+        match &self.packed {
+            None => crate::format::record_scan_units(
+                col_types,
+                self.key_at(i),
+                &self.vals[i],
+                cap,
+                mask,
+            ),
+            Some(p) => {
+                let mut units = crate::format::ScanUnits {
+                    pages: 0,
+                    decompress: 0,
+                };
+                for (c, ty) in col_types.iter().enumerate() {
+                    if mask[c]
+                        && crate::format::fixed_value_width(ty).is_none()
+                        && let Some(span) = p.value_span(c, i)
+                    {
+                        crate::format::span_scan_units(span, cap, &mut units);
+                    }
+                }
+                units
+            }
         }
     }
 
@@ -942,37 +997,11 @@ impl PMap {
         Ok((out, nodes))
     }
 
-    /// Walk the bounded scan gathering ONLY the columns `mask` selects into dense per-column lanes
-    /// (`cols[c]` of length `row_count` for each selected `c`, empty otherwise), never building a
-    /// full-width [`Row`] — the A2/A3 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation
-    /// dividend A1 leaves on the table). It mirrors [`range_entries_counted`]'s traversal EXACTLY (same
-    /// node visits ⇒ the same `page_read` count; same in-order record sequence — leaf-only, v24), but
-    /// reads each admitted row's selected columns via [`Node::col_at`] — an O(1) PAX column span on a
-    /// Packed leaf, `vals[i][c]` on a Decoded leaf — so a wide-table single-column scan never
-    /// materializes the untouched columns NOR a full-width row. Each `cols[c]` is in scan order, so it
-    /// equals the column-`c` stride of the row feed. Returns `(cols, row_count, nodes)`.
-    pub(crate) fn columnar_scan(
-        &self,
-        b: &KeyBound,
-        src: Option<&dyn LeafSource>,
-        mask: &[bool],
-    ) -> Result<(Vec<Vec<Value>>, usize, usize)> {
-        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); mask.len()];
-        let mut row_count = 0usize;
-        let mut nodes = 0usize;
-        if let Some(root) = &self.root {
-            columnar_collect(root, b, src, mask, &mut cols, &mut row_count, &mut nodes)?;
-        }
-        Ok((cols, row_count, nodes))
-    }
-
-    /// The fold-during-walk twin of [`columnar_scan`](PMap::columnar_scan) (packed-leaf.md §11): the
-    /// same windowed walk (identical visited-node set → identical `page_read`), but calls
-    /// `visit(node, i)` per admitted leaf record — which reads only the row's touched columns via
-    /// [`Node::col_at`] and folds them straight into an accumulator — instead of gathering a
-    /// per-column lane. So a whole-table / single-int-key aggregate is O(1) memory, never O(rows).
-    /// Returns `(row_count, node_count)`, identical to `columnar_scan`, so the caller charges the same
-    /// `page_read` / `storage_row_read`.
+    /// The columnar lanes' walk (packed-leaf.md §11 Tracks A2–A4): the same windowed walk as
+    /// [`range_entries_counted`](PMap::range_entries_counted) (identical visited-node set → identical
+    /// `page_read`), calling `visit(node, i)` per admitted leaf record — which reads only the record's
+    /// touched columns via [`Node::col_at`] or their stored bytes — instead of reconstructing a row.
+    /// Returns `(row_count, node_count)`.
     pub(crate) fn fold_scan(
         &self,
         b: &KeyBound,
@@ -1494,52 +1523,10 @@ fn collect_range(
     Ok(())
 }
 
-/// Gather the columns `mask` selects of leaf row `i` into the per-column lanes (the A2 columnar
-/// feed's per-entry step). Reads each selected column via [`Node::col_at`] — an O(1) PAX span on a
-/// Packed leaf — so no full-width row is built. The untouched lanes are left untouched.
-fn gather_cols(node: &Node, i: usize, mask: &[bool], cols: &mut [Vec<Value>]) -> Result<()> {
-    for (c, &m) in mask.iter().enumerate() {
-        if m {
-            cols[c].push(node.col_at(i, c)?);
-        }
-    }
-    Ok(())
-}
-
-/// The columnar twin of [`collect_range`] (packed-leaf.md §11 Track A2): the same windowed walk (so
-/// the visited-node set — and the `page_read` cost — is identical), but gathers each admitted leaf
-/// record's selected columns into `cols` lanes via [`gather_cols`] instead of pushing a
-/// `(key, row)` pair. `row_count` counts the admitted records.
-fn columnar_collect(
-    node: &Node,
-    b: &KeyBound,
-    src: Option<&dyn LeafSource>,
-    mask: &[bool],
-    cols: &mut [Vec<Value>],
-    row_count: &mut usize,
-    nodes: &mut usize,
-) -> Result<()> {
-    *nodes += 1;
-    if node.is_leaf() {
-        let (ef, el) = b.entry_window(node);
-        for i in ef..el {
-            gather_cols(node, i, mask, cols)?;
-            *row_count += 1;
-        }
-        return Ok(());
-    }
-    let (cf, cl) = b.child_window(node);
-    for i in cf..=cl {
-        let ch = child(node, i, src)?;
-        columnar_collect(&ch, b, src, mask, cols, row_count, nodes)?;
-    }
-    Ok(())
-}
-
-/// The fold-during-walk twin of [`columnar_collect`] (packed-leaf.md §11 Track A2): the identical
-/// windowed walk (so the visited-node set — and `page_read` — is identical), but calls
-/// `visit(node, i)` per admitted leaf record instead of gathering its columns into lanes. `visit`
-/// reads the record's touched columns via [`Node::col_at`]. `row_count` counts admitted records;
+/// The columnar lanes' walk (packed-leaf.md §11 Tracks A2–A4): [`collect_range`]'s windowed walk (so
+/// the visited-node set — and `page_read` — is identical), calling `visit(node, i)` per admitted leaf
+/// record instead of reconstructing a row. `visit` reads the record's touched columns via
+/// [`Node::col_at`] or their stored bytes. `row_count` counts admitted records;
 /// `nodes` counts visited nodes.
 fn fold_walk(
     node: &Node,

@@ -1234,6 +1234,47 @@ pub(crate) fn record_scan_units(
     units
 }
 
+/// The large-value units one stored variable-column span adds to a scan's cost block (cost.md §3) —
+/// read straight off its presence tag and pointer fields, the same numbers [`record_scan_units`]
+/// reads off the unfetched reference [`read_value_lazy`] would build from these bytes: one
+/// `page_read` per overflow-chain page and `ceil(raw_len / cap)` `value_decompress` slabs per
+/// compressed value; nothing for an inline-plain value. A malformed span adds nothing (resolving
+/// it reports the corruption). Packed-leaf.md §11 Track A4.
+pub(crate) fn span_scan_units(span: &[u8], cap: usize, units: &mut ScanUnits) {
+    let field = |at: usize| -> Option<usize> {
+        let b = span.get(at..at + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    match span.first() {
+        Some(&TAG_EXTERNAL) => {
+            if let Some(len) = field(5) {
+                units.pages += len.div_ceil(cap);
+            }
+        }
+        Some(&TAG_INLINE_COMP) => {
+            if let Some(raw_len) = field(1) {
+                units.decompress += raw_len.div_ceil(cap);
+            }
+        }
+        Some(&TAG_EXTERNAL_COMP) => {
+            if let (Some(stored_len), Some(raw_len)) = (field(5), field(9)) {
+                units.pages += stored_len.div_ceil(cap);
+                units.decompress += raw_len.div_ceil(cap);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The inline-plain body of a stored variable-column span — the bytes after a `0x00` presence tag —
+/// or `None` when the value is stored out of line or compressed (packed-leaf.md §11 Track A4).
+pub(crate) fn inline_plain_body(span: &[u8]) -> Option<&[u8]> {
+    match span.split_first() {
+        Some((0x00, body)) => Some(body),
+        _ => None,
+    }
+}
+
 /// The `value_compress` slabs storing this record costs — one `ceil(raw_len / cap)` block per
 /// pass-1 compression attempt, adopted or not (cost.md §3; large-values.md §13). Charged once
 /// per stored row version at the statement's write site, never for B-tree re-encodes.
@@ -4260,6 +4301,27 @@ impl PackedLeaf {
         (0..self.col_types.len())
             .map(|c| self.value(c, i))
             .collect()
+    }
+
+    /// Whether value `(record i, column c)` is NULL — read from the region bitmap or zero-length span,
+    /// with no value decode (packed-leaf.md §11 Track A4).
+    pub(crate) fn is_null(&self, c: usize, i: usize) -> bool {
+        self.dirs.is_null(&self.block[self.payload_off..], c, i)
+    }
+
+    /// The stored bytes of a non-NULL value `(record i, column c)`, borrowed from the page: a
+    /// variable column's tagged codec bytes (presence tag + inline body or out-of-line pointer), a
+    /// fixed-width column's untagged slot. `None` for NULL. A span the directories place outside the
+    /// payload yields an empty slice, which no span reader accepts (the caller falls back to the
+    /// decoder, which reports the corruption).
+    pub(crate) fn value_span(&self, c: usize, i: usize) -> Option<&[u8]> {
+        let payload = &self.block[self.payload_off..];
+        if self.dirs.is_null(payload, c, i) {
+            return None;
+        }
+        let off = self.dirs.value_off(payload, c, i);
+        let len = self.dirs.value_len(payload, c, i);
+        Some(payload.get(off..off + len).unwrap_or(&[]))
     }
 
     /// [`row`](Self::row) into a caller-owned buffer, reusing its allocation. On error `out` holds a

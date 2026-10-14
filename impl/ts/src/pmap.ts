@@ -49,7 +49,17 @@ export interface PackedLeaf {
   row(i: number): Row;
   // Reconstruct only column c of row i — the touched-column path (the A2/A3 columnar gather).
   col(i: number, c: number): Value;
+  // The retained page payload the stored spans below index (packed-leaf.md §11 Track A4).
+  readonly payload: Uint8Array;
+  // Whether column c of row i is NULL — the null bitmap / zero-length span, no value decode.
+  isNull(i: number, c: number): boolean;
+  // The stored bytes of a non-NULL column c of row i as payload offsets [out.start, out.end): a
+  // variable column's tagged codec bytes, a fixed-width column's untagged slot. False for NULL.
+  span(i: number, c: number, out: Span): boolean;
 }
+
+// A stored value's [start, end) byte range within a Packed leaf's payload.
+export type Span = { start: number; end: number };
 
 // One B+tree node. `children` is empty for a leaf; otherwise children.length === keys.length+1 and
 // the node is a record-free interior (v24): its keys are the routing separators and its
@@ -94,6 +104,13 @@ export function rowAt(n: PNode, i: number): Row {
 // OP_Column model).
 export function colAt(n: PNode, i: number, c: number): Value {
   return n.packed ? n.packed.col(i, c) : n.vals[i]![c]!;
+}
+
+// colIsNull reports whether column c of row i is NULL without reconstructing the value (packed-leaf.md
+// §11 Track A4): the PAX null bitmap / zero-length span on a Packed leaf. A deferred large value is never
+// NULL.
+export function colIsNull(n: PNode, i: number, c: number): boolean {
+  return n.packed ? n.packed.isNull(i, c) : n.vals[i]![c]!.kind === "null";
 }
 
 // decodedRows returns every value row of a LEAF — the mutation-descent materialization
@@ -587,50 +604,11 @@ export class PMap {
     return { keys, vals, nodes };
   }
 
-  // columnarScan walks the bounded scan gathering ONLY the columns mask selects into dense per-column
-  // lanes (cols[c] of length rowCount for each selected c, empty otherwise), never building a full-width
-  // Row — the A2/A3 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation dividend A1 leaves
-  // on the table). It mirrors rangeEntriesCounted's traversal EXACTLY (same node visits ⇒ the same
-  // page_read count; same in-order record sequence — leaf-only, v24), but reads each admitted row's
-  // selected columns via colAt — an O(1) PAX column span on a Packed leaf, vals[i][c] on a Decoded
-  // leaf — so a wide-table single-column scan never materializes the untouched columns NOR a
-  // full-width row. Each cols[c] is in scan order, so it equals the column-c stride of the row feed.
-  // rowCount is the admitted record count.
-  columnarScan(
-    b: KeyBound,
-    src: LeafSource | null,
-    mask: boolean[],
-  ): { cols: Value[][]; rowCount: number; nodes: number } {
-    const k = mask.length;
-    const cols: Value[][] = Array.from({ length: k }, () => []);
-    let rowCount = 0;
-    let nodes = 0;
-    const gather = (n: PNode, i: number): void => {
-      for (let c = 0; c < k; c++) {
-        if (mask[c]) cols[c]!.push(colAt(n, i, c));
-      }
-      rowCount++;
-    };
-    const walk = (n: PNode): void => {
-      nodes++;
-      if (isLeaf(n)) {
-        const [ef, el] = entryWindow(b, n);
-        for (let i = ef; i < el; i++) gather(n, i);
-        return;
-      }
-      const [cf, cl] = childWindow(b, n);
-      for (let i = cf; i <= cl; i++) walk(resolveChild(n.children[i], src));
-    };
-    if (this.root !== null) walk(this.root);
-    return { cols, rowCount, nodes };
-  }
-
-  // foldScan is the fold-during-walk twin of columnarScan (packed-leaf.md §11): the identical windowed
-  // walk (so the visited-node set — and page_read — is identical), but calls visit(n, i) per admitted
-  // leaf record instead of gathering its columns into lanes. visit reads the record's touched columns
-  // via colAt and folds them straight into an accumulator, so a whole-table / single-int-key
-  // aggregate is O(1) memory instead of O(rows). Returns the same { rowCount, nodes } as
-  // columnarScan, so the caller charges the same page_read / storage_row_read.
+  // foldScan is the columnar lanes' walk (packed-leaf.md §11 Tracks A2–A4): rangeEntriesCounted's
+  // windowed walk (so the visited-node set — and page_read — is identical), calling visit(n, i) per
+  // admitted leaf record instead of reconstructing a row. visit reads the record's touched columns via
+  // colAt or their stored bytes. Returns { rowCount, nodes }, so the caller charges the same page_read /
+  // storage_row_read as the row feed.
   foldScan(
     b: KeyBound,
     src: LeafSource | null,

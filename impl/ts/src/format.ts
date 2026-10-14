@@ -68,7 +68,7 @@ import { MemoryBlockStore } from "./memoryblockstore.ts";
 import { Pager } from "./pager.ts";
 import { compareBytes, decodedRows, keyViews, nodeLen, onDiskRef, residentRef } from "./pmap.ts";
 import { rangeForElement } from "./range.ts";
-import type { Child, LeafShape, PackedLeaf, PNode } from "./pmap.ts";
+import type { Child, LeafShape, PackedLeaf, PNode, Span } from "./pmap.ts";
 import { SharedPaging } from "./paging.ts";
 import { TableStore, type Row } from "./storage.ts";
 import {
@@ -162,7 +162,9 @@ function pageSizeValid(ps: number): boolean {
 }
 
 const UTF8 = new TextEncoder();
-const UTF8_DECODE = new TextDecoder("utf-8", { fatal: true });
+// ignoreBOM keeps a leading U+FEFF: in a stored value it is an ordinary code point, never a byte-order
+// mark (the TextDecoder default would silently drop it).
+const UTF8_DECODE = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 // typeCodeForScalar maps a scalar type to its stable on-disk code, independent of any
 // in-memory ordering. See format.md.
@@ -1047,6 +1049,45 @@ export function recordFootprint(
 ): [number, number] {
   const plan = planDispositions(colTypes, key, row, capacity);
   return [plan.size, plan.size + plan.external];
+}
+
+// spanScanUnits returns the large-value units one stored variable-column span payload[start, end)
+// contributes to a scan's cost block (cost.md §3) — read straight off its presence tag and pointer
+// fields, the same numbers recordScanUnits reads off the unfetched reference readValueLazy would build
+// from these bytes: one page_read per overflow-chain page and ceil(raw_len / capacity) value_decompress
+// slabs per compressed value; nothing for an inline-plain value. A malformed span adds nothing
+// (resolving it reports the corruption). Packed-leaf.md §11 Track A4.
+export function spanScanUnits(
+  payload: Uint8Array,
+  start: number,
+  end: number,
+  capacity: number,
+  units: { pages: number; decompress: number },
+): void {
+  const field = (at: number): number | null => {
+    const p = start + at;
+    if (p + 4 > end) return null;
+    return (
+      ((payload[p]! << 24) | (payload[p + 1]! << 16) | (payload[p + 2]! << 8) | payload[p + 3]!) >>>
+      0
+    );
+  };
+  if (start >= end) return;
+  const tag = payload[start]!;
+  if (tag === TAG_EXTERNAL) {
+    const len = field(5);
+    if (len !== null) units.pages += Math.ceil(len / capacity);
+  } else if (tag === TAG_INLINE_COMP) {
+    const raw = field(1);
+    if (raw !== null) units.decompress += Math.ceil(raw / capacity);
+  } else if (tag === TAG_EXTERNAL_COMP) {
+    const stored = field(5);
+    const raw = field(9);
+    if (stored !== null && raw !== null) {
+      units.pages += Math.ceil(stored / capacity);
+      units.decompress += Math.ceil(raw / capacity);
+    }
+  }
 }
 
 // recordScanUnits returns the per-record units a scan's up-front cost block charges beyond the
@@ -3857,6 +3898,19 @@ export function decodeLeafNode(
   };
   const packed: PackedLeaf = {
     n,
+    payload,
+    isNull(i: number, c: number): boolean {
+      return paxIsNull(payload, dirs, c, i);
+    },
+    span(i: number, c: number, out: Span): boolean {
+      if (paxIsNull(payload, dirs, c, i)) return false;
+      out.start = paxValueOff(payload, dirs, c, i);
+      out.end = out.start + paxValueLen(payload, dirs, c, i);
+      // A span the directories place outside the payload reads as empty, which no span reader
+      // accepts (the caller falls back to the decoder, which reports the corruption).
+      if (out.end > payload.length) out.end = out.start;
+      return true;
+    },
     key(i: number): Uint8Array {
       return paxKey(payload, dirs, i);
     },

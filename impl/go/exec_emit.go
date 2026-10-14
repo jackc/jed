@@ -34,13 +34,12 @@ const (
 	// (streaming.md §4/§7).
 	emitSorted
 	// emitColumnar: the columnar projection fast path (batch.go projectColumnar, packed-leaf.md §11
-	// Track A2/A3). `cols` holds the pre-gathered dense per-column lanes and `projCols` the projection's
-	// column indices into them; emission builds output row j as [cols[projCols[0]][lane(j)], …] — a
-	// bare-column projection with no full-width storedRow, charging row_produced per windowed row exactly
-	// like emitProject (a bare column ref evaluates to row[index] with zero operator_eval, so the lane
-	// read is cost-identical). `sel` is the optional A3 selection vector: when non-nil, output row j maps
-	// to lane position sel[j] (a filtered scan's survivors); when nil, lane position j (all rows). Lazy
-	// like emitProject: a caller's early exit skips the row_produced of the rows it never pulls.
+	// Tracks A2–A4). `cols` holds the pre-gathered dense per-column lanes of the surviving records and
+	// `projCols` the projection's column indices into them; emission builds output row j as
+	// [cols[projCols[0]][j], …] — a bare-column projection with no full-width storedRow, charging
+	// row_produced per windowed row exactly like emitProject (a bare column ref evaluates to row[index]
+	// with zero operator_eval, so the lane read is cost-identical). Lazy like emitProject: a caller's
+	// early exit skips the row_produced of the rows it never pulls.
 	emitColumnar
 )
 
@@ -60,8 +59,8 @@ const (
 //     [0, end) windowed — emission pulls + projects + charges row_produced per row (streaming.md §4/§7).
 //   - emitColumnar: `cols` are the dense per-column lanes and `projCols` the projection's column indices
 //     into them, [start, end) windowed — emission gathers output row j from the lanes (a bare-column
-//     projection, no full-width row) at lane position sel[j] (or j when sel is nil) and charges
-//     row_produced per row (packed-leaf.md §11 Track A2/A3).
+//     projection, no full-width row) and charges row_produced per row (packed-leaf.md §11 Tracks
+//     A2–A4).
 type emitter struct {
 	precharged bool         // the limited join projection accrued during blocking work
 	identity   bool         // emitSorted stream already projected by DISTINCT
@@ -70,7 +69,6 @@ type emitter struct {
 	sorted     *sortedRows  // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
 	cols       [][]Value    // emitColumnar: the dense per-column lanes (indexed by table ordinal)
 	projCols   []int        // emitColumnar: projection column indices into cols (one per output column)
-	sel        []int32      // emitColumnar: optional A3 selection vector — output row j → lane position sel[j]
 	colCharge  *stateCharge // emitColumnar: the gathered lanes' query-memory charge (memory.md §6.5), returned when emission completes
 	start      int64
 	end        int64
@@ -396,23 +394,19 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		}
 		return out, nil
 	case emitColumnar:
-		// Columnar projection (packed-leaf.md §11 Track A2/A3): gather each windowed output row from the
-		// dense lanes — a bare-column projection with no full-width row — charging row_produced per row,
-		// exactly the emitProject drive over a bare-column projection (whose p.eval is a zero-cost slot
-		// read). A non-nil `sel` (the A3 filter's survivors) maps output row j to lane position sel[j].
+		// Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather each windowed output row from the
+		// dense lanes of the surviving records — a bare-column projection with no full-width row —
+		// charging row_produced per row, exactly the emitProject drive over a bare-column projection
+		// (whose p.eval is a zero-cost slot read).
 		out := make([][]Value, 0, em.end-em.start)
 		for j := em.start; j < em.end; j++ {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
-			li := j
-			if em.sel != nil {
-				li = int64(em.sel[j])
-			}
 			projected := make([]Value, len(em.projCols))
 			for k, c := range em.projCols {
-				projected[k] = em.cols[c][li]
+				projected[k] = em.cols[c][j]
 			}
 			if err := meter.admitRow(projected); err != nil {
 				return nil, err
