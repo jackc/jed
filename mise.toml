@@ -512,7 +512,7 @@ run = [
   "cd bench/go && CGO_ENABLED=0 go build -o bin/ ./cmd/bench-setup ./cmd/bench-jed ./cmd/bench-pg ./cmd/bench-sqlite",
   "cd bench/go && CGO_ENABLED=1 go build -o bin/ ./cmd/bench-sqlite-cgo",
   "cargo build --release --quiet --manifest-path bench/rust/Cargo.toml",
-  "ruby scripts/npm_ci.rb impl/ts",
+  { task = "ts:lock_build" }, # the TS harness opens through Database (Node file locking); installs impl/ts deps
   "ruby scripts/npm_ci.rb bench/ts",
   "cargo build --release --quiet --manifest-path impl/ruby/ext/Cargo.toml",
   "cargo build --release --quiet --target wasm32-wasip1 --manifest-path impl/wasm/Cargo.toml",
@@ -555,10 +555,9 @@ ruby scripts/bench_html.rb "$dir"
 
 [tasks."bench:node_compare"]
 description = "Compare every jed benchmark through pure TS, Node/Rust wrap, and native Rust control"
-depends = ["node:build"]
+depends = ["node:build", "ts:lock_build"]
 usage = 'arg "[filter]" help="Run only benchmarks whose name contains this substring"'
 run = '''
-ruby scripts/npm_ci.rb impl/ts
 ruby scripts/npm_ci.rb bench/ts
 cargo build --release --quiet --manifest-path bench/rust/Cargo.toml --bin bench-jed
 dir="bench/results/$(date -u +%Y%m%d-%H%M%S)-node-compare"

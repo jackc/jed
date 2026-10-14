@@ -86,12 +86,46 @@ The TypeScript lanes moved little (e.g. `gin_stats_common_tag` 413 → 311–353
 harness drives the bare tooling `Engine`, whose commit never runs the post-commit residency flip: its
 tables stay as Decoded leaves, on which every record's large-value cost units are recomputed by
 re-encoding the row. Through the public `Database` API the same TS build answers `s IS NULL` in 4.5 ms
-on the lane versus 113.5 ms on the row path (`count(tags)` 4.1 vs 156.8 ms). Moving the TS harness to
-the `Database` API is a separate follow-on. The fixed-width lanes, re-run three alternating rounds after
+on the lane versus 113.5 ms on the row path (`count(tags)` 4.1 vs 156.8 ms). The TS harness has since
+moved to the `Database` API (next result). The fixed-width lanes, re-run three alternating rounds after
 the change, stayed within run-to-run spread in Rust (`full_scan_agg` 20.4–20.6 → 20.9–21.2 ms,
 `full_scan_minmax` 35.1–35.6 → 34.9–36.2, `full_scan_agg_filter` 60.7–63.9 → 62.1–65.2) and within 2–8%
 in Go (`full_scan_agg` 11.6–12.3 → 12.5–12.9, `full_scan_minmax` 21.3–21.8 → 21.7–22.3,
 `full_scan_agg_filter` 35.2–35.4 → 35.4–36.7).
+
+**TS harness on the `Database` API (2026-10-13).** `bench/ts/src/bench-jed.ts` used to drive the bare
+tooling `Engine` (`create`/`open` + `executeParams`/`queryPrepared`). That engine's autocommit persists
+but skips the post-commit residency flip that `Session.publish` runs ([bplus-reshape.md](bplus-reshape.md)
+B4), so every table a TS lane built or wrote stayed as resident Decoded leaves. It now opens through
+`createDatabase`/`openDatabase` with `extensions` and drives one persistent `Session`, like the Go and
+Rust harnesses; `concurrent_read` mints its reader Sessions from that same `Database`. The Node lock
+adapter is now built by `bench:build`, since every TS lane opens through `Database`. Two alternating
+base/after rounds over all 109 TS lanes (median ms per query, both rounds shown) agreed on every
+checksum. Lanes over the file-opened datasets (`large`, `gin`, `text`, `small`) stayed within run-to-run
+spread, so the `Session` path adds no measurable cost. Scratch-built tables now take the same
+fault-through-the-pool path as Rust and Go, which moves those lanes both ways:
+
+| Lane | TS base | TS after | Go | Rust |
+|---|---:|---:|---:|---:|
+| `varscan_text_isnull` | 479–499 | 4.9–5.0 | 1.7 | 1.6 |
+| `varscan_array_count` | 498–505 | 4.0–4.5 | | |
+| `gin_stats_common_tag` | 329–395 | 9.6–9.8 | | |
+| `custom_plan_gin_common_tag` | 192–205 | 10.2–10.4 | | |
+| `varscan_text_max` | 545–626 | 106–123 | | |
+| `join_inl_topn` | 0.46–0.50 | 1.79–1.93 | 1.38 | 1.06 |
+| `fk_delete_parent_indexed` | 0.11 | 0.25–0.26 | 0.11 | 0.29 |
+| `fk_cascade_delete_unindexed` | 36–43 | 76–99 | 31.5 | 40.8 |
+| `statistics_skew_before` | 32.5–34.3 | 53.3–54.5 | 27.0 | 19.7 |
+| `derived_pushdown_pk_residual` | 26.6–28.9 | 39.1–39.8 | 17.9 | 13.9 |
+
+Go and Rust are single samples from the same host. The old TS numbers were wrong in both directions: on
+Decoded leaves every record's large-value cost units are recomputed by re-encoding the row (the
+variable-width scans), while lanes that touch only a few rows ran faster than any core that faults
+Packed leaves. An attribution run that kept the new harness but disabled only the flip in
+`Session.publish` restored the base numbers (`join_inl_topn` 1.63 → 0.44 ms, `fk_delete_parent_indexed`
+0.25 → 0.13, `varscan_text_isnull` 4.6 → 378), so every change in either direction comes from leaf residency, not
+the harness. The 2026-07-16 Node wrapper comparison below ran against the old harness, so its pure-TS
+figures on scratch lanes carry the same skew. Linux x86-64, Intel Core Ultra 9 285K, Node 26.10.0.
 
 **Native Node wrapper experiment (2026-07-16).** `impl/node` and
 `bench/ts/src/bench-node-rust.ts` provide a Node-API wrapper around the safe Rust core and run all 53
@@ -1169,7 +1203,7 @@ by the independent Ruby reference, like the PRNG vectors).
 | | `postgres` (sync) | PG client; `$N` native |
 | | `rusqlite` (`bundled`) | SQLite, self-contained build |
 | | `toml` | corpus parsing (same crate family as the core's dev-dep) |
-| `bench/ts` | jed via relative import of `impl/ts/src/lib.ts` | system under test |
+| `bench/ts` | jed via relative import of `impl/ts/src/lib.ts` (`Database`/`Session`; Node file locking uses `impl/ts/native-lock`) | system under test |
 | | `postgres` (porsager) | PG client; raw `$N` via `sql.unsafe` |
 | | `node:sqlite` | built-in (Node ≥ 22), zero dep |
 | | `smol-toml` | corpus parsing (Node has no built-in TOML) |
