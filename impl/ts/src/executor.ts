@@ -215,6 +215,7 @@ import {
   ACCESS_GIST_EQUAL,
   ACCESS_GIST_RANGE,
   ACCESS_UNSUPPORTED,
+  DEFAULT_ARRAY_ELEMENTS,
   SELECTIVITY_OPAQUE,
   UNIT_AGGREGATE_ACCUMULATE,
   UNIT_CTE_SCAN_ROW,
@@ -5850,16 +5851,14 @@ export class Engine {
           prefix +
           "PK interval set: " +
           this.firstPKColName(tableName) +
-          "; intervals=" +
-          b.pkSet.specs.length
+          intervalSpecsLabel(b.pkSet.specs)
         );
       case "indexSet":
         return (
           prefix +
           "Index interval set: using " +
           b.indexSet.nameKey +
-          "; intervals=" +
-          b.indexSet.specs.length
+          intervalSpecsLabel(b.indexSet.specs)
         );
     }
   }
@@ -22309,7 +22308,9 @@ export function needsEagerScan(sb: ScanBound | null | undefined): boolean {
 
 // One OR disjunct becomes an IntervalSpec; co-present direct comparisons become clip terms. Runtime
 // encoding turns them into a sorted, disjoint key-interval list. The full WHERE remains residual.
-export type IntervalSpec = { terms: BoundTerm[] };
+// An array spec (array !== undefined, no terms) is a `key = ANY(array)` disjunct: at execution it
+// becomes one point per non-NULL element of the array's value.
+export type IntervalSpec = { terms: BoundTerm[]; array?: RExpr };
 export type PkKeySet = {
   pkType: ScalarType;
   coll: Collation | null;
@@ -23301,6 +23302,9 @@ function statisticsLeafSelectivity(
     if (expr.negated) rows = hasNull ? 0n : current.nonnullRows - rows;
     return statisticsSelectivity(rows, current.rows);
   }
+  if (estimatorAnyArray(expr) && expr.elemExact === true) {
+    return statisticsAnyArraySelectivity(expr, rel, engine);
+  }
   const comparison = statisticsComparison(expr, rel);
   if (comparison === null) return null;
   const current = currentColumnStatistics(engine, rel, comparison.column);
@@ -23315,6 +23319,42 @@ function statisticsLeafSelectivity(
     engine,
   );
   return rows === null ? null : statisticsSelectivity(rows, current.rows);
+}
+
+// statisticsAnyArraySelectivity estimates `column = ANY(array)` from column statistics
+// (statistics.md §6): the IN-list rule over the array's estimator elements — each distinct non-NULL
+// element by statistics key adds its equality rows, a NULL element adds none, and an element of
+// unknown value adds the NDV average.
+function statisticsAnyArraySelectivity(
+  expr: Extract<RExpr, { kind: "quantified" }>,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity | null {
+  const column = statisticsColumn(expr.lhs, rel);
+  if (column === null) return null;
+  const current = currentColumnStatistics(engine, rel, column);
+  if (current === null) return null;
+  const seen = new Set<string>();
+  let rows = 0n;
+  for (const elem of estimatorArrayElements(expr.array)) {
+    if (estimatorIsNull(elem)) continue;
+    const key = statisticsLiteralKey(elem, rel, column, engine);
+    if (key !== null) {
+      const id = encodeBytea(key, "hex");
+      if (!seen.has(id)) {
+        seen.add(id);
+        rows = saturatingEstimateAdd(rows, statisticsEqualityRows(current, key));
+      }
+    } else {
+      if (current.ndv === null) return null;
+      rows = saturatingEstimateAdd(
+        rows,
+        statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv),
+      );
+    }
+    if (rows > current.nonnullRows) rows = current.nonnullRows;
+  }
+  return statisticsSelectivity(rows, current.rows);
 }
 
 function collectStatisticsEqualityDisjunction(
@@ -23634,6 +23674,18 @@ function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
     }
     case "column":
       return fractionSelectivity(SELECTIVITY_BOOLEAN);
+    case "quantified": {
+      if (!estimatorAnyArray(expr)) return selectivityClass(ACCESS_UNSUPPORTED);
+      // `x = ANY(array)` is the OR of `x = element` over its elements (estimator.md §7); a NULL
+      // element contributes zero true rows.
+      const parts: Selectivity[] = [];
+      for (const elem of estimatorArrayElements(expr.array)) {
+        parts.push(
+          estimatorIsNull(elem) ? { kind: "zero" } : fractionSelectivity(SELECTIVITY_EQUALITY),
+        );
+      }
+      return orSelectivities(parts);
+    }
     default:
       return selectivityClass(ACCESS_UNSUPPORTED);
   }
@@ -23971,14 +24023,88 @@ function estimatorEqualityPrefix(count: number): Selectivity {
   return result;
 }
 
+// orSelectivities folds disjunct estimates with the OR rule as a balanced tree (the halves split
+// at len/2), so an array of many elements cannot nest the program deeply. The OR rule's capped sum
+// is associative, so the tree shape never changes an estimate.
+function orSelectivities(parts: Selectivity[]): Selectivity {
+  return orSelectivitiesRange(parts, 0, parts.length);
+}
+
+function orSelectivitiesRange(parts: Selectivity[], start: number, end: number): Selectivity {
+  const n = end - start;
+  if (n === 0) return { kind: "zero" };
+  if (n === 1) return parts[start]!;
+  const mid = start + Math.floor(n / 2);
+  return orSelectivity(
+    orSelectivitiesRange(parts, start, mid),
+    orSelectivitiesRange(parts, mid, end),
+  );
+}
+
+// estimatorArrayElements is the element sources of an `= ANY` array operand for the estimator
+// (estimator.md §7): an ARRAY[...] constructor's element nodes; a plan-time-readable array's
+// elements as literals, flattened in storage order (a NULL array has none); otherwise — a parameter
+// whose value is unavailable, a correlated outer column — DEFAULT_ARRAY_ELEMENTS stand-ins of
+// unknown value (the operand itself).
+function estimatorArrayElements(array: RExpr): RExpr[] {
+  if (array.kind === "array" && !array.nested) return array.elements;
+  const c = estimatorValue(array);
+  if (c !== null) {
+    if (c.kind === "constNull") return [];
+    if (c.kind === "constArray" && c.value.kind === "array") {
+      return c.value.elements.map((elem) => valueToRExpr(elem));
+    }
+  }
+  const elems: RExpr[] = [];
+  for (let i = 0; i < DEFAULT_ARRAY_ELEMENTS; i++) elems.push(array);
+  return elems;
+}
+
+// estimatorIntervalSpecs expands each `key = ANY(array)` disjunct into one equality disjunct per
+// estimator element, in order, so an array set estimates as the IN-list of its elements.
+function estimatorIntervalSpecs(specs: IntervalSpec[]): IntervalSpec[] {
+  const out: IntervalSpec[] = [];
+  for (const spec of specs) {
+    if (spec.array === undefined) {
+      out.push(spec);
+      continue;
+    }
+    for (const elem of estimatorArrayElements(spec.array)) {
+      out.push({ terms: [{ op: "eq", src: elem }] });
+    }
+  }
+  return out;
+}
+
+// estimatorAnyArray reports whether e is a `x = ANY(array)` the estimator reads as a disjunction of
+// equalities: ANY (not ALL) equality over an array operand constant for the whole relation.
+function estimatorAnyArray(e: RExpr): e is Extract<RExpr, { kind: "quantified" }> {
+  if (e.kind !== "quantified" || e.op !== "eq" || e.all || e.rowWise) return false;
+  switch (e.array.kind) {
+    case "param":
+    case "constArray":
+    case "constNull":
+    case "outerColumn":
+      return true;
+    case "array":
+      if (e.array.nested) return false;
+      for (const elem of e.array.elements) {
+        if (!estimatorLiteral(elem) && elem.kind !== "outerColumn") return false;
+      }
+      return true;
+    default:
+      return false;
+  }
+}
+
 function estimatorIntervalSelectivity(
   specs: IntervalSpec[],
   clip: BoundTerm[],
   uniquePoints: boolean,
   keyType: ScalarType,
 ): Selectivity {
-  let result: Selectivity | null = null;
-  for (const spec of specs) {
+  const parts: Selectivity[] = [];
+  for (const spec of estimatorIntervalSpecs(specs)) {
     const structural = estimatorRangeTerms(spec.terms, keyType);
     const term =
       structural.kind === "zero"
@@ -23986,9 +24112,9 @@ function estimatorIntervalSelectivity(
         : uniquePoints && spec.terms.length > 0 && spec.terms.every((bound) => bound.op === "eq")
         ? ({ kind: "unique" } as const)
         : structural;
-    result = result === null ? term : orSelectivity(result, term);
+    parts.push(term);
   }
-  result ??= { kind: "zero" };
+  const result = orSelectivities(parts);
   return clip.length === 0 ? result : andSelectivity(result, estimatorRangeTerms(clip, keyType));
 }
 
@@ -24074,8 +24200,8 @@ function estimatorIntervalSelectivityWithStatistics(
   rel: ScopeRel,
   engine: Engine,
 ): Selectivity {
-  let result: Selectivity | null = null;
-  for (const spec of specs) {
+  const parts: Selectivity[] = [];
+  for (const spec of estimatorIntervalSpecs(specs)) {
     const structural = estimatorRangeTerms(spec.terms, keyType);
     const term =
       structural.kind === "zero"
@@ -24083,9 +24209,9 @@ function estimatorIntervalSelectivityWithStatistics(
         : uniquePoints && spec.terms.length > 0 && spec.terms.every((bound) => bound.op === "eq")
           ? ({ kind: "unique" } as const)
           : (statisticsBoundTermsSelectivity(rel, column, spec.terms, engine) ?? structural);
-    result = result === null ? term : orSelectivity(result, term);
+    parts.push(term);
   }
-  result ??= { kind: "zero" };
+  const result = orSelectivities(parts);
   return clip.length === 0
     ? result
     : andSelectivity(
@@ -24520,7 +24646,7 @@ export function detectIntervalSet(
   let found = -1;
   let specs: IntervalSpec[] | null = null;
   for (let i = 0; i < conjuncts.length; i++) {
-    if (conjuncts[i]!.kind !== "or") continue;
+    if (conjuncts[i]!.kind !== "or" && conjuncts[i]!.kind !== "quantified") continue;
     const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, keyType, colColl);
     if (reduced !== null) {
       found = i;
@@ -24559,6 +24685,8 @@ export function reduceIntervalUnion(
     if (r === null) return null;
     return l.concat(r);
   }
+  const arraySpec = asArrayPointSpec(e, keyIdx, keyType, colColl);
+  if (arraySpec !== null) return [arraySpec];
   const terms: BoundTerm[] = [];
   const walk = (x: RExpr): boolean => {
     if (x.kind === "and") return walk(x.lhs) && walk(x.rhs);
@@ -24568,6 +24696,103 @@ export function reduceIntervalUnion(
     return true;
   };
   return walk(e) && terms.length > 0 ? [{ terms }] : null;
+}
+
+// asArrayPointSpec reports whether e is `key = ANY(array)` whose array elements are points of the
+// key (cost.md §3 "OR / IN-list"): ANY (not ALL) equality on the bare key column, an element type
+// exactly the key's type, the key's own collation (as asBoundTerm), and an array that is constant for
+// the whole scan.
+function asArrayPointSpec(
+  e: RExpr,
+  keyIdx: number,
+  keyType: ScalarType,
+  colColl: string | null,
+): IntervalSpec | null {
+  if (
+    e.kind !== "quantified" ||
+    e.op !== "eq" ||
+    e.all ||
+    e.rowWise ||
+    e.elemExact !== true ||
+    e.lhs.kind !== "column" ||
+    e.lhs.index !== keyIdx
+  )
+    return null;
+  const cmpColl = e.collation !== null ? e.collation.name : null;
+  if (cmpColl !== colColl || !isArrayPointSource(e.array, keyType)) return null;
+  return { terms: [], array: e.array };
+}
+
+// isArrayPointSource reports whether an `= ANY` array operand is constant for the whole scan and
+// readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
+// outer column, or a one-dimensional ARRAY[...] whose every element is a constant key source.
+function isArrayPointSource(e: RExpr, keyType: ScalarType): boolean {
+  switch (e.kind) {
+    case "param":
+    case "constArray":
+    case "constNull":
+    case "outerColumn":
+      return true;
+    case "array":
+      if (e.nested) return false;
+      for (const elem of e.elements) {
+        if (!isConstSource(elem, keyType, null)) return false;
+      }
+      return true;
+    default:
+      return false;
+  }
+}
+
+// arrayPointKeys encodes an array spec's elements as key points, in element order: a NULL array,
+// a NULL element, and an element no key can equal (an out-of-range integer, an unmapped collated
+// text) contribute no point, exactly as the equivalent IN-list's disjuncts would.
+function arrayPointKeys(
+  keyType: ScalarType,
+  src: RExpr,
+  params: Value[],
+  outer: Row[],
+  coll: Collation | null,
+): Uint8Array[] {
+  const keys: Uint8Array[] = [];
+  if (src.kind === "array") {
+    for (const elem of src.elements) {
+      const encoded = encodeBoundKey(keyType, elem, params, outer, coll, []);
+      if (encoded.kind === "key") keys.push(encoded.key);
+    }
+    return keys;
+  }
+  let v: Value | null = null;
+  switch (src.kind) {
+    case "param":
+      v = params[src.index]!;
+      break;
+    case "outerColumn":
+      v = outer[outer.length - src.level]![src.index]!;
+      break;
+    case "constArray":
+      v = src.value;
+      break;
+  }
+  if (v === null || v.kind !== "array") return keys;
+  for (const elem of v.elements) {
+    const encoded = encodeValueKey(keyType, elem, coll);
+    if (encoded.kind === "key") keys.push(encoded.key);
+  }
+  return keys;
+}
+
+// intervalSpecsLabel is an interval set's structural disjunct count, plus how many of those
+// disjuncts are `key = ANY(array)` arrays, whose point count is known only at execution
+// (explain.md §5).
+function intervalSpecsLabel(specs: IntervalSpec[]): string {
+  let arrays = 0;
+  for (const spec of specs) {
+    if (spec.array !== undefined) arrays++;
+  }
+  let label = "; intervals=" + specs.length;
+  if (arrays > 0) label += "; arrays=" + arrays;
+  return label;
 }
 
 // detectINLBound detects an index-nested-loop scan bound for a join inner relation rel (cost.md §3
@@ -27471,6 +27696,16 @@ export function canonicalIntervalSet(
   if (clip === null) return [];
   const intervals: KeyBound[] = [];
   for (const spec of specs) {
+    if (spec.array !== undefined) {
+      for (const key of arrayPointKeys(keyType, spec.array, params, outer, coll)) {
+        const point = unboundedBound();
+        intersectLo(point, key, true);
+        intersectHi(point, key, true);
+        const b = intersectBounds(point, clip);
+        if (!boundEmpty(b)) intervals.push(b);
+      }
+      continue;
+    }
     const raw = buildLogicalInterval(keyType, spec.terms, params, outer, coll, left);
     if (raw === null) continue;
     const b = intersectBounds(raw, clip);
@@ -29520,6 +29755,10 @@ export type RExpr =
       // sorts by it. The left operand's derivation for the array form (an array carries none), the
       // subquery form's combined one when folded from it; null for C / a non-text pair.
       collation: Collation | null;
+      // The array's element type is exactly the scalar type of `lhs` (no promotion), so each element
+      // is a point in `lhs`'s key space — what lets `key = ANY(array)` bound a key scan (cost.md §3
+      // "OR / IN-list"). Absent (false) for the folded quantified-subquery form.
+      elemExact?: boolean;
     }
   // `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14),
   // PostgreSQL's width_bucket_array: a binary search over a thresholds array ASSUMED sorted ascending

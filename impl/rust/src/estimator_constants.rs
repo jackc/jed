@@ -11,6 +11,7 @@ pub const MAX_ESTIMATE: i64 = 9223372036854775807;
 pub const DEFAULT_DISTINCT_VALUES: i64 = 200;
 pub const DEFAULT_SRF_ROWS: i64 = 1000;
 pub const DEFAULT_VARIABLE_KEY_BYTES: i64 = 1;
+pub const DEFAULT_ARRAY_ELEMENTS: usize = 10;
 pub const JOIN_DP_LIMIT: usize = 8;
 pub const STATISTICS_TARGET: usize = 100;
 pub const STATISTICS_SAMPLE_ROWS: usize = 30000;

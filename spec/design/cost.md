@@ -505,6 +505,27 @@ point-set/range intersection).
   reads nothing. Because the key encoding is order-preserving, byte-dedup is value-dedup and the
   sorted probes yield rows in ascending key order (for the PK, the same order a full scan would).
 
+- **`key = ANY(array)` — the array spelling of IN.** An ANY equality whose left operand is the bare
+  key (`query.any_array_point_lookup`) is one disjunct of the same interval set, so it may be the
+  bounding conjunct itself, a leaf of a same-key OR (`key = ANY(a) OR key = 7`), or be clipped by a
+  same-key range (`key = ANY(a) AND key > 3`). It qualifies only when (a) it is `= ANY`/`= SOME` — not
+  `ALL`, not another operator, not the row-valued subquery form; (b) the array's resolved element type
+  is **exactly** the key's scalar type, so every element is already a point in the key's space (an
+  `i32[]` against an `i64` key is a promoted comparison and falls back — a bare `ARRAY[…]` and a `$N`
+  adapt to the key's type, so they qualify); (c) its comparison collation is the key's (as for a
+  comparison leaf); and (d) the array is constant for the scan and readable without evaluation: a bind
+  parameter, a folded array constant (a cast literal such as `'{1,2}'::i32[]`), a correlated outer
+  column, or a one-dimensional `ARRAY[…]` whose every element is itself a constant key source (a
+  literal, `$N`, or outer column). At execution, the disjunct contributes **one point per element**,
+  over all of a multidimensional array's elements in storage order; a NULL element, an element no key
+  can equal, and a NULL or empty array contribute none. The points are then canonicalized with every
+  other disjunct exactly as an IN-list's equalities are — clipped, sorted, de-duplicated, merged — so
+  `key = ANY('{1,3}')` and `key IN (1, 3)` read the same intervals and charge the same access cost
+  (only their residual filters differ, per §11.4 of [array-functions.md](array-functions.md)).
+  Building the points is unmetered, like encoding an IN-list's literals. ANY over a correlated array
+  bounds the inner scan per outer row (the correlated-pushdown seam above); an array that is a column
+  of the scanned relation, or any other expression, does not bound.
+
 A canonical interval-set bound takes the **eager materialize path** — the single-table streaming / columnar
 / vectorized-aggregate fast paths (which each interpret only a single contiguous bound) gate **off**
 it, exactly as they do an index / GIN / GiST bound. `spec/conformance/suites/query/or_in_point_lookup.test`

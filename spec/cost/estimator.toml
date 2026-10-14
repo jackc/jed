@@ -32,6 +32,9 @@ large_join_strategy = "greedy_cheapest_next"
 default_distinct_values = 200
 default_srf_rows = 1000
 default_variable_key_bytes = 1
+# Elements assumed for a `= ANY(array)` operand whose value the estimator cannot read (a probe pass,
+# EXPLAIN without values, a correlated outer column) — PostgreSQL's estimate_array_length default.
+default_array_elements = 10
 
 # P9 deterministic ANALYZE/statistics limits (statistics.md). These are cross-core mechanical facts,
 # never handle settings: changing work_mem cannot change persisted statistics or a selected plan.

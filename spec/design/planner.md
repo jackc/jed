@@ -502,7 +502,8 @@ is:
    GIN-indexed column.
 5. **OR / IN interval set** (normally last resort) — a pure same-key disjunction of equality/range
    leaves on a single-column PK or leading index column, runtime-canonicalized to disjoint key
-   intervals. A co-present direct range on that same key clips the set; this clipped set deliberately
+   intervals. A `key = ANY(array)` over an exact-element-type constant array is one such disjunct,
+   expanding to a point per element at execution ([cost.md §3](cost.md) "OR / IN-list"). A co-present direct range on that same key clips the set; this clipped set deliberately
    wins over the broader contiguous clip alone.
 6. Else: **full scan**.
 

@@ -578,6 +578,21 @@ pub(crate) fn estimator_predicate_selectivity(
             if *negated { matched.not() } else { matched }
         }
         RExpr::Column(_) => Selectivity::fraction(SELECTIVITY_BOOLEAN),
+        // `x = ANY(array)` is the OR of `x = element` over its elements (estimator.md §7); a NULL
+        // element contributes zero true rows. Any other quantified comparison stays opaque.
+        RExpr::Quantified { array, .. } if estimator_any_array(expr) => {
+            let parts = estimator_array_elements(array)
+                .iter()
+                .map(|elem| {
+                    if estimator_is_null(elem) {
+                        Selectivity::Zero
+                    } else {
+                        Selectivity::fraction(SELECTIVITY_EQUALITY)
+                    }
+                })
+                .collect();
+            crate::estimator::or_selectivities(parts)
+        }
         _ => crate::estimator::selectivity_class(ACCESS_UNSUPPORTED),
     }
 }
@@ -1067,29 +1082,141 @@ fn estimator_interval_selectivity(
     key_type: ScalarType,
 ) -> crate::estimator::Selectivity {
     use crate::estimator::Selectivity;
-    let mut disjunction: Option<Selectivity> = None;
-    for spec in specs {
-        let structural = estimator_range_terms(&spec.terms, key_type);
+    let mut parts = Vec::with_capacity(specs.len());
+    for terms in estimator_interval_terms(specs, key_type) {
+        let structural = estimator_range_terms(&terms, key_type);
         let term = if matches!(structural, Selectivity::Zero) {
             structural
         } else if unique_points
-            && !spec.terms.is_empty()
-            && spec.terms.iter().all(|term| term.op == CmpOp::Eq)
+            && !terms.is_empty()
+            && terms.iter().all(|term| term.op == CmpOp::Eq)
         {
             Selectivity::Unique
         } else {
             structural
         };
-        disjunction = Some(match disjunction {
-            None => term,
-            Some(lhs) => lhs.or(term),
-        });
+        parts.push(term);
     }
-    let mut result = disjunction.unwrap_or(Selectivity::Zero);
+    let mut result = crate::estimator::or_selectivities(parts);
     if !clip.is_empty() {
         result = result.and(estimator_range_terms(clip, key_type));
     }
     result
+}
+
+/// Each interval-set disjunct's bound terms for the estimator, in order, with every
+/// `key = ANY(array)` disjunct expanded into one `= element` disjunct per estimator element
+/// ([`estimator_array_point_sources`]), so an array set estimates as the IN-list of its elements.
+fn estimator_interval_terms(
+    specs: &[IntervalSpec],
+    key_type: ScalarType,
+) -> Vec<Cow<'_, [BoundTerm]>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let Some(array) = &spec.array else {
+            out.push(Cow::Borrowed(spec.terms.as_slice()));
+            continue;
+        };
+        for src in estimator_array_point_sources(array, key_type) {
+            out.push(Cow::Owned(vec![BoundTerm { op: CmpOp::Eq, src }]));
+        }
+    }
+    out
+}
+
+/// The element sources of an interval-set array spec for the estimator (estimator.md §7) — the
+/// [`estimator_array_elements`] rule over the plan's owned form: an `ARRAY[...]` constructor's
+/// element sources; a plan-time-readable array's elements, flattened in storage order (a NULL array
+/// has none); otherwise — a parameter whose value is unavailable, a correlated outer column —
+/// `default_array_elements` stand-ins of unknown value (the operand itself).
+fn estimator_array_point_sources(array: &ArrayPointSource, key_type: ScalarType) -> Vec<BoundSrc> {
+    use crate::estimator_constants::DEFAULT_ARRAY_ELEMENTS;
+    let stand_in = match array {
+        ArrayPointSource::Elements(elems) => return elems.clone(),
+        ArrayPointSource::Null => return Vec::new(),
+        ArrayPointSource::Const(a) => return estimator_array_value_sources(a, key_type),
+        ArrayPointSource::Param(i) => {
+            match plan_params::param_value(*i) {
+                Some(RExpr::ConstNull) => return Vec::new(),
+                Some(RExpr::ConstArray(a)) => return estimator_array_value_sources(&a, key_type),
+                _ => {}
+            }
+            BoundSrc::Param(*i)
+        }
+        ArrayPointSource::Outer { level, index } => BoundSrc::Outer {
+            level: *level,
+            index: *index,
+        },
+    };
+    vec![stand_in; DEFAULT_ARRAY_ELEMENTS]
+}
+
+/// A plan-time array value's elements as the bound sources literals of the key type would produce
+/// (every element of an array whose element type is exactly the key's has one).
+fn estimator_array_value_sources(arr: &ArrayVal, key_type: ScalarType) -> Vec<BoundSrc> {
+    arr.elements
+        .iter()
+        .filter_map(|elem| const_source(&value_to_rexpr(elem), key_type, None))
+        .collect()
+}
+
+/// The element sources of an `= ANY` array operand for the estimator (estimator.md §7): an
+/// `ARRAY[...]` constructor's element nodes; a plan-time-readable array's elements as literals,
+/// flattened in storage order (a NULL array has none); otherwise — a parameter whose value is
+/// unavailable, a correlated outer column — `default_array_elements` stand-ins of unknown value (the
+/// operand itself).
+pub(crate) fn estimator_array_elements(array: &RExpr) -> Vec<EstimatorValue<'_>> {
+    use crate::estimator_constants::DEFAULT_ARRAY_ELEMENTS;
+    if let RExpr::Array {
+        elems,
+        nested: false,
+    } = array
+    {
+        return elems.iter().map(EstimatorValue::Literal).collect();
+    }
+    if let Some(c) = estimator_value(array) {
+        match &*c {
+            RExpr::ConstNull => return Vec::new(),
+            RExpr::ConstArray(a) => {
+                return a
+                    .elements
+                    .iter()
+                    .map(|elem| EstimatorValue::Bound(value_to_rexpr(elem)))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    (0..DEFAULT_ARRAY_ELEMENTS)
+        .map(|_| EstimatorValue::Literal(array))
+        .collect()
+}
+
+/// Whether `e` is a `x = ANY(array)` the estimator reads as a disjunction of equalities: ANY (not
+/// ALL) equality over an array operand constant for the whole relation.
+pub(crate) fn estimator_any_array(e: &RExpr) -> bool {
+    let RExpr::Quantified {
+        op: CmpOp::Eq,
+        all: false,
+        row_wise: false,
+        array,
+        ..
+    } = e
+    else {
+        return false;
+    };
+    match array.as_ref() {
+        RExpr::Param(_) | RExpr::ConstArray(_) | RExpr::ConstNull | RExpr::OuterColumn { .. } => {
+            true
+        }
+        RExpr::Array {
+            elems,
+            nested: false,
+        } => elems
+            .iter()
+            .all(|elem| estimator_literal(elem) || matches!(elem, RExpr::OuterColumn { .. })),
+        _ => false,
+    }
 }
 
 fn estimator_candidate_selectivity(
@@ -1172,26 +1299,22 @@ fn estimator_interval_selectivity_with_statistics(
     catalog: &Engine,
 ) -> crate::estimator::Selectivity {
     use crate::estimator::Selectivity;
-    let mut disjunction: Option<Selectivity> = None;
-    for spec in specs {
-        let structural = estimator_range_terms(&spec.terms, key_type);
+    let mut parts = Vec::with_capacity(specs.len());
+    for terms in estimator_interval_terms(specs, key_type) {
+        let structural = estimator_range_terms(&terms, key_type);
         let term = if matches!(structural, Selectivity::Zero) {
             structural
         } else if unique_points
-            && !spec.terms.is_empty()
-            && spec.terms.iter().all(|term| term.op == CmpOp::Eq)
+            && !terms.is_empty()
+            && terms.iter().all(|term| term.op == CmpOp::Eq)
         {
             Selectivity::Unique
         } else {
-            statistics_bound_terms_selectivity(rel, column, &spec.terms, catalog)
-                .unwrap_or(structural)
+            statistics_bound_terms_selectivity(rel, column, &terms, catalog).unwrap_or(structural)
         };
-        disjunction = Some(match disjunction {
-            None => term,
-            Some(lhs) => lhs.or(term),
-        });
+        parts.push(term);
     }
-    let mut result = disjunction.unwrap_or(Selectivity::Zero);
+    let mut result = crate::estimator::or_selectivities(parts);
     if !clip.is_empty() {
         result = result.and(
             statistics_bound_terms_selectivity(rel, column, clip, catalog)
@@ -2023,7 +2146,8 @@ impl Engine {
 }
 
 /// Find the first top-level conjunct that is a pure OR of intervals on one key. A leaf is a single
-/// comparison or an AND of same-key comparisons (BETWEEN's resolved shape). Direct same-key
+/// comparison, an AND of same-key comparisons (BETWEEN's resolved shape), or a `key = ANY(array)`
+/// (the array spelling of IN — one array spec, cost.md §3 "OR / IN-list"). Direct same-key
 /// comparisons in the remaining top-level conjuncts become a global clip. The full predicate stays
 /// residual, so rejecting any other shape is conservative and widening an unencodable endpoint is
 /// sound.
@@ -2046,7 +2170,7 @@ pub(crate) fn detect_interval_set(
     flatten(filter, &mut conjuncts);
     let mut found = None;
     for (i, e) in conjuncts.iter().enumerate() {
-        if !matches!(e, RExpr::Or(_, _)) {
+        if !matches!(e, RExpr::Or(_, _) | RExpr::Quantified { .. }) {
             continue;
         }
         if let Some(specs) = reduce_interval_union(e, key_idx, key_type, col_coll) {
@@ -2085,6 +2209,9 @@ pub(crate) fn reduce_interval_union(
         left.extend(right);
         return Some(left);
     }
+    if let Some(spec) = as_array_point_spec(e, key_idx, key_type, col_coll) {
+        return Some(vec![spec]);
+    }
     fn leaf_terms(
         e: &RExpr,
         key_idx: usize,
@@ -2102,8 +2229,114 @@ pub(crate) fn reduce_interval_union(
     }
     let mut terms = Vec::new();
     leaf_terms(e, key_idx, key_type, col_coll, &mut terms)
-        .then_some(IntervalSpec { terms })
+        .then_some(IntervalSpec { terms, array: None })
         .map(|s| vec![s])
+}
+
+/// Whether `e` is `key = ANY(array)` whose array elements are points of the key (cost.md §3
+/// "OR / IN-list"): ANY (not ALL) equality on the bare key column, an element type exactly the
+/// key's type, the key's own collation (as `collect_bound_terms`), and an array that is constant
+/// for the whole scan. Returns that array as one array spec.
+fn as_array_point_spec(
+    e: &RExpr,
+    key_idx: usize,
+    key_type: ScalarType,
+    col_coll: Option<&str>,
+) -> Option<IntervalSpec> {
+    let RExpr::Quantified {
+        op: CmpOp::Eq,
+        all: false,
+        lhs,
+        array,
+        row_wise: false,
+        elem_exact: true,
+        collation,
+    } = e
+    else {
+        return None;
+    };
+    if !is_column(lhs, key_idx) || collation.as_ref().map(|c| c.name.as_str()) != col_coll {
+        return None;
+    }
+    let array = array_point_source(array, key_type)?;
+    Some(IntervalSpec {
+        terms: Vec::new(),
+        array: Some(array),
+    })
+}
+
+/// The array-point source of an `= ANY` array operand that is constant for the whole scan and
+/// readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
+/// outer column, or a one-dimensional `ARRAY[...]` whose every element is a constant key source.
+fn array_point_source(e: &RExpr, key_type: ScalarType) -> Option<ArrayPointSource> {
+    match e {
+        RExpr::Param(i) => Some(ArrayPointSource::Param(*i)),
+        RExpr::ConstArray(a) => Some(ArrayPointSource::Const(a.clone())),
+        RExpr::ConstNull => Some(ArrayPointSource::Null),
+        RExpr::OuterColumn { level, index } => Some(ArrayPointSource::Outer {
+            level: *level,
+            index: *index,
+        }),
+        RExpr::Array {
+            elems,
+            nested: false,
+        } => elems
+            .iter()
+            .map(|elem| const_source(elem, key_type, None))
+            .collect::<Option<Vec<_>>>()
+            .map(ArrayPointSource::Elements),
+        _ => None,
+    }
+}
+
+/// Encode an array spec's elements as key points, in element order: a NULL array, a NULL element,
+/// and an element no key can equal (an out-of-range integer, an unmapped collated text) contribute
+/// no point, exactly as the equivalent IN-list's disjuncts would. A multidimensional array value's
+/// elements are flat in storage order.
+fn array_point_keys(
+    key_type: ScalarType,
+    src: &ArrayPointSource,
+    params: &[Value],
+    outer: &[&[Value]],
+    coll: Option<&Collation>,
+) -> Vec<Vec<u8>> {
+    let value = match src {
+        ArrayPointSource::Elements(elems) => {
+            return elems
+                .iter()
+                .filter_map(|elem| {
+                    match encode_bound_key(key_type, elem, params, outer, coll, &[]) {
+                        BoundKey::Key(k) => Some(k),
+                        BoundKey::Null | BoundKey::OutOfRange => None,
+                    }
+                })
+                .collect();
+        }
+        ArrayPointSource::Null => return Vec::new(),
+        ArrayPointSource::Param(i) => &params[*i],
+        ArrayPointSource::Outer { level, index } => &outer[outer.len() - level][*index],
+        ArrayPointSource::Const(a) => {
+            return array_value_point_keys(key_type, a, coll);
+        }
+    };
+    match value {
+        Value::Array(a) => array_value_point_keys(key_type, a, coll),
+        _ => Vec::new(),
+    }
+}
+
+fn array_value_point_keys(
+    key_type: ScalarType,
+    arr: &ArrayVal,
+    coll: Option<&Collation>,
+) -> Vec<Vec<u8>> {
+    arr.elements
+        .iter()
+        .filter_map(|elem| match encode_value_key(key_type, elem, coll) {
+            BoundKey::Key(k) => Some(k),
+            BoundKey::Null | BoundKey::OutOfRange => None,
+        })
+        .collect()
 }
 
 /// Detect an **index-nested-loop** scan bound for a join inner relation `rel` (spec/design/cost.md
@@ -4494,14 +4727,29 @@ pub(crate) fn canonical_interval_set(
     } else {
         return Vec::new();
     };
-    let mut intervals: Vec<KeyBound> = specs
-        .iter()
-        .filter_map(|spec| {
-            let b = build_logical_interval(key_type, &spec.terms, params, outer, coll, left)?;
-            let b = intersect_bounds(b, &clip);
-            (!bound_empty(&b)).then_some(b)
-        })
-        .collect();
+    let mut intervals: Vec<KeyBound> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if let Some(array) = &spec.array {
+            for key in array_point_keys(key_type, array, params, outer, coll) {
+                let mut point = KeyBound::unbounded();
+                intersect_lo(&mut point, &key, true);
+                intersect_hi(&mut point, &key, true);
+                let b = intersect_bounds(point, &clip);
+                if !bound_empty(&b) {
+                    intervals.push(b);
+                }
+            }
+            continue;
+        }
+        let Some(b) = build_logical_interval(key_type, &spec.terms, params, outer, coll, left)
+        else {
+            continue;
+        };
+        let b = intersect_bounds(b, &clip);
+        if !bound_empty(&b) {
+            intervals.push(b);
+        }
+    }
     intervals.sort_by(|a, b| match (&a.lo, &b.lo) {
         (None, None) => b.lo_inc.cmp(&a.lo_inc),
         (None, Some(_)) => std::cmp::Ordering::Less,

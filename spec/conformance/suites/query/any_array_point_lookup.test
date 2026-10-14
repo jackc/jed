@@ -1,0 +1,333 @@
+# `key = ANY(array)` → point lookups (spec/design/cost.md §3 "OR / IN-list"). `x = ANY(a)` is the
+# array spelling of IN (array-functions.md §11), and the usual way a host binds a list: `id =
+# ANY($1)`. When the key is a single-column PK or a leading B-tree index column, the array's element
+# type is exactly the key's type, and the array is constant for the scan, the ANY is one disjunct of
+# the canonical interval set: at execution each non-NULL element becomes a point, and the points are
+# sorted, de-duplicated, clipped, and merged exactly as an IN-list's are. The whole WHERE stays the
+# residual filter, so the rows are unchanged and only the cost drops.
+#
+# The metered cost is the sum of the per-probe bounded scans, as for an IN-list: `t` is six rows in
+# one leaf, so each point probe charges 1 page_read whether it hits or misses. The residual `x =
+# ANY(a)` charges its node plus one operator_eval per element compared, stopping at the first match
+# (a non-matching row compares every element). Rows verified against the live PostgreSQL 18 oracle;
+# the costs are jed-owned, so the `# cost:` lines are the cross-core pin. The plans are pinned by
+# EXPLAIN in any_array_point_lookup_explain.test.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, query.subquery_scalar, query.subquery_correlated, query.aggregates, func.array_quantified, func.array, types.array, types.array_multidim, cast.array, types.i32, types.i64, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)
+
+# --- the array spellings --------------------------------------------------------------------------
+
+# An ARRAY[...] of literals → three point probes over {1,3,5}: 3 page_read + 3 storage_row_read + the
+# residual (the ANY node, the ARRAY[...] constructor it evaluates per row, and elements up to the
+# match: 3 for id 1, 4 for id 3, 5 for id 5 = 12) + 3 row_produced = 21. A full scan would read all
+# six rows and compare every element of the misses.
+# cost: 21
+query I rowsort
+SELECT a FROM t WHERE id = ANY(ARRAY[1, 3, 5])
+----
+10
+30
+50
+
+# A cast array literal is a constant array.
+# cost: 11
+query I rowsort
+SELECT a FROM t WHERE id = ANY('{2,4}'::i32[])
+----
+20
+40
+
+# A bound array — the list a host passes.
+# params: ARRAY[1, 6]
+# cost: 11
+query I rowsort
+SELECT a FROM t WHERE id = ANY($1)
+----
+10
+60
+
+# The text form of the array binds the same way.
+# params: '{3,5}'
+# cost: 11
+query I rowsort
+SELECT a FROM t WHERE id = ANY($1)
+----
+30
+50
+
+# An ARRAY[...] whose elements are parameters and literals.
+# params: 2
+# cost: 13
+query I rowsort
+SELECT a FROM t WHERE id = ANY(ARRAY[$1, 4])
+----
+20
+40
+
+# --- elements --------------------------------------------------------------------------------------
+
+# Duplicate elements merge to one probe.
+# cost: 6
+query I rowsort
+SELECT a FROM t WHERE id = ANY(ARRAY[3, 3, 3])
+----
+30
+
+# A NULL element contributes no point; the residual still sees it (unknown, never true).
+# cost: 14
+query I rowsort
+SELECT id FROM t WHERE id = ANY(ARRAY[2, NULL, 4])
+----
+2
+4
+
+# A missing key still visits the leaf it would live in.
+# cost: 7
+query I rowsort
+SELECT a FROM t WHERE id = ANY(ARRAY[2, 99])
+----
+20
+
+# A multidimensional array contributes every element.
+# params: '{{1,2},{5,6}}'
+# cost: 24
+query I rowsort
+SELECT a FROM t WHERE id = ANY($1)
+----
+10
+20
+50
+60
+
+# An empty array matches nothing and reads nothing.
+# params: '{}'
+# cost: 0
+query I rowsort
+SELECT a FROM t WHERE id = ANY($1)
+----
+
+# cost: 0
+query I rowsort
+SELECT a FROM t WHERE id = ANY('{}'::i32[])
+----
+
+# A NULL array is unknown for every row and reads nothing.
+# params: NULL
+# cost: 0
+query I rowsort
+SELECT a FROM t WHERE id = ANY($1)
+----
+
+# --- composing with the rest of the set ------------------------------------------------------------
+
+# A same-key range clips the points: {1,3,5} ∩ (2, ∞) probes only {3,5}.
+# cost: 19
+query I rowsort
+SELECT a FROM t WHERE id = ANY(ARRAY[1, 3, 5]) AND id > 2
+----
+30
+50
+
+# The ANY may be one disjunct of a same-key OR.
+# cost: 23
+query I rowsort
+SELECT a FROM t WHERE id = ANY(ARRAY[1, 2]) OR id = 6
+----
+10
+20
+60
+
+# A disjunction with a non-key leaf does not bound the key: full scan.
+# cost: 43
+query I rowsort
+SELECT id FROM t WHERE id = ANY(ARRAY[1, 2]) OR a = 60
+----
+1
+2
+6
+
+# ALL, and an ANY under another operator, do not lower.
+# cost: 39
+query I rowsort
+SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2, 3, 4])
+----
+5
+6
+
+# cost: 27
+query I rowsort
+SELECT id FROM t WHERE id < ANY(ARRAY[3])
+----
+1
+2
+
+# A LIMIT stops at the first survivors, so an interval it never reaches charges nothing.
+# cost: 7
+query I nosort
+SELECT a FROM t WHERE id = ANY(ARRAY[5, 1, 3]) ORDER BY id LIMIT 1
+----
+10
+
+# --- element type and collation ---------------------------------------------------------------------
+
+statement ok
+CREATE TABLE big (id i64 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO big VALUES (1, 10), (2, 20), (3, 30)
+
+query I rowsort
+SELECT a FROM big WHERE id = ANY('{1,3}'::i32[])
+----
+10
+30
+
+statement ok
+CREATE TABLE w (name text PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO w VALUES ('alice', 1), ('bob', 2), ('carol', 3), ('dave', 4)
+
+# A text key's points are its C-collation keys.
+# cost: 14
+query T rowsort
+SELECT name FROM w WHERE name = ANY(ARRAY['carol', 'alice', 'erin'])
+----
+alice
+carol
+
+# --- secondary index --------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, x i32)
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 10)
+
+statement ok
+CREATE INDEX sx ON s (x)
+
+# Each distinct value is an index point probe plus a row lookup per entry: 10 → rows 1 and 5, 30 →
+# row 3.
+# cost: 22
+query I rowsort
+SELECT id FROM s WHERE x = ANY(ARRAY[30, 10])
+----
+1
+3
+5
+
+# --- a correlated array ------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE o (k i32 PRIMARY KEY, ids i32[])
+
+statement ok
+INSERT INTO o VALUES (1, '{1,2}'), (2, '{6}'), (3, '{}'), (4, NULL)
+
+# The outer row's array bounds the inner scan for that row.
+# cost: 32
+query II rowsort
+SELECT k, (SELECT count(*) FROM t WHERE t.id = ANY(o.ids)) FROM o
+----
+1
+2
+2
+1
+3
+0
+4
+0
+
+# A large outer array — 4100 elements, stored compressed out of the row — is read whole before it
+# bounds the inner scan.
+statement ok
+CREATE TABLE big_o (k i32 PRIMARY KEY, ids i32[])
+
+statement ok
+INSERT INTO big_o VALUES (1, ARRAY[3]), (2, ARRAY[5])
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ids WHERE k = 1
+
+statement ok
+UPDATE big_o SET ids = ids || ARRAY[1, 6, 99] WHERE k = 1
+
+query II rowsort
+SELECT k, (SELECT count(*) FROM t WHERE t.id = ANY(big_o.ids)) FROM big_o
+----
+1
+3
+2
+1
+
+# --- UPDATE / DELETE --------------------------------------------------------------------------------
+
+# A mutation target takes the same point set.
+# params: ARRAY[2, 4]
+# cost: 9
+statement ok
+DELETE FROM t WHERE id = ANY($1)
+
+query I rowsort
+SELECT id FROM t
+----
+1
+3
+5
+6
+
+# cost: 11
+statement ok
+UPDATE t SET a = 0 WHERE id = ANY(ARRAY[1, 6])
+
+query II rowsort
+SELECT id, a FROM t
+----
+1
+0
+3
+30
+5
+50
+6
+0

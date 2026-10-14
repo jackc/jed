@@ -56,6 +56,10 @@
 #              key, and across a PK-IN-list UPDATE/DELETE (the point-set DML path).
 #   interval_set — same-key OR range leaves and IN∩range lower to canonical disjoint intervals;
 #              wrapping the key in `+ 0` defeats the rule. Query rows and mutation end states match.
+#   any_array — `key = ANY(array)` over a PK or leading index column lowers to one point per element
+#              (cost.md §3 "OR / IN-list"); `key + 0 = ANY(array)` full-scans. Constructor, cast, and
+#              multidimensional arrays, NULL/duplicate/absent elements, an empty array, an OR
+#              disjunct, a range clip, and a mutation end state must all agree.
 #   bounded_limit — LIMIT/OFFSET windows over PK interval sets, a compatible ordered secondary-index
 #              bound, and a GIN candidate gather match semantically-equivalent unbounded spellings.
 #              This checks that stopping table work early never changes the chosen result window.
@@ -334,6 +338,11 @@ INTERVAL_SET_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_mul
                       query.select query.where_eq query.comparison_order query.order_by
                       query.logical_connectives query.point_lookup query.or_in_point_lookup
                       query.interval_set expr.in_list expr.between expr.arithmetic types.i32].freeze
+ANY_ARRAY_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert dml.insert_multi_row
+                   dml.update query.select query.where_eq query.comparison_order query.order_by
+                   query.logical_connectives query.point_lookup query.or_in_point_lookup
+                   query.interval_set query.any_array_point_lookup func.array_quantified types.array
+                   types.array_multidim cast.array expr.arithmetic types.i32 null.three_valued].freeze
 BOUNDED_LIMIT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.gin_index dml.insert
                        dml.insert_multi_row query.select query.comparison_order query.logical_connectives
                        query.order_by query.order_by_keys query.limit query.offset query.index_range
@@ -1488,6 +1497,66 @@ def gen_interval_set(seed)
   out << "# canonical and full-scan mutation end states"
   q(out, "II", "SELECT id, v FROM t ORDER BY id", flat.call(updated))
   q(out, "II", "SELECT id, v FROM t_scan ORDER BY id", flat.call(updated))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: `key = ANY(array)` point sets ----------------------------------------------------
+def gen_any_array(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_v = ids.sample(random: rng)
+  rows = ids.map { |id| [id, id == null_v ? nil : rng.rand(0..4), rng.rand(-50..50)] }
+  flat = ->(rs) { rs.flat_map { |id, _v, w| [id.to_s, w.to_s] } }
+  by_id = ->(set) { flat.call(rows.select { |id, _v, _w| set.include?(id) }) }
+
+  out = header(seed, ANY_ARRAY_REQ, "key = ANY(array) point sets (one point per element vs full scan)")
+  values = rows.map { |id, v, w| "(#{id}, #{v.nil? ? 'NULL' : v}, #{w})" }.join(', ')
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{values}")
+  stmt(out, "CREATE INDEX t_v_idx ON t (v)")
+
+  # The bare key lowers to point probes; `+ 0` makes the left operand an expression, so it full-scans.
+  pair = lambda do |title, key, array, exp, extra = ""|
+    out << "# #{title}"
+    q(out, "II", "SELECT id, w FROM t WHERE #{key} = ANY(#{array})#{extra.gsub('KEY', key)} ORDER BY id", exp)
+    q(out, "II", "SELECT id, w FROM t WHERE #{key} + 0 = ANY(#{array})#{extra.gsub('KEY', "#{key} + 0")} ORDER BY id", exp)
+  end
+
+  pick = ids.sample(4, random: rng)
+  absent = ((1..40).to_a - ids).sample(random: rng)
+  elems = (pick + [absent, pick[0]]).shuffle(random: rng)
+  pair.call("constructor with an absent key and a duplicate", "id", "ARRAY[#{elems.join(', ')}]", by_id.call(pick))
+  pair.call("cast array literal", "id", "'{#{pick.first(2).join(',')}}'::i32[]", by_id.call(pick.first(2)))
+  pair.call("NULL element", "id", "ARRAY[#{pick[0]}, NULL, #{pick[1]}]", by_id.call(pick.first(2)))
+  pair.call("multidimensional array", "id", "'{{#{pick[0]},#{pick[1]}},{#{pick[2]},#{absent}}}'::i32[]",
+            by_id.call(pick.first(3)))
+  pair.call("empty array", "id", "'{}'::i32[]", [])
+
+  other = (ids - pick).sample(random: rng)
+  out << "# an ANY disjunct beside a same-key equality"
+  q(out, "II", "SELECT id, w FROM t WHERE id = ANY(ARRAY[#{pick[0]}, #{pick[1]}]) OR id = #{other} ORDER BY id",
+    by_id.call([pick[0], pick[1], other]))
+  q(out, "II", "SELECT id, w FROM t WHERE id + 0 = ANY(ARRAY[#{pick[0]}, #{pick[1]}]) OR id + 0 = #{other} ORDER BY id",
+    by_id.call([pick[0], pick[1], other]))
+
+  cut = pick.sort[1]
+  pair.call("a range clip", "id", "ARRAY[#{pick.join(', ')}]", by_id.call(pick.select { |id| id > cut }), " AND KEY > #{cut}")
+
+  vals = rows.map { |_id, v, _w| v }.compact.uniq.sample(2, random: rng)
+  vals = [0, 1] if vals.size < 2
+  pair.call("secondary index", "v", "ARRAY[#{vals.join(', ')}, NULL]",
+            flat.call(rows.select { |_id, v, _w| vals.include?(v) }))
+
+  stmt(out, "CREATE TABLE t_scan (id i32 PRIMARY KEY, v i32, w i32)")
+  stmt(out, "INSERT INTO t_scan VALUES #{values}")
+  bump = pick.first(3)
+  stmt(out, "UPDATE t SET w = w + 1000 WHERE id = ANY(ARRAY[#{bump.join(', ')}, #{absent}])")
+  stmt(out, "UPDATE t_scan SET w = w + 1000 WHERE id + 0 = ANY(ARRAY[#{bump.join(', ')}, #{absent}])")
+  updated = rows.map { |id, v, w| [id, v, bump.include?(id) ? w + 1000 : w] }
+  out << "# point-set and full-scan mutation end states"
+  q(out, "II", "SELECT id, w FROM t ORDER BY id", flat.call(updated))
+  q(out, "II", "SELECT id, w FROM t_scan ORDER BY id", flat.call(updated))
 
   out.join("\n") + "\n"
 end
@@ -4408,6 +4477,7 @@ SCENARIOS = {
   "index_prefix" => method(:gen_index_prefix),
   "or_in" => method(:gen_or_in),
   "interval_set" => method(:gen_interval_set),
+  "any_array" => method(:gen_any_array),
   "bounded_limit" => method(:gen_bounded_limit),
   "topk" => method(:gen_topk),
   "hash_join" => method(:gen_hash_join),

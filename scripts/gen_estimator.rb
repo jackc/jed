@@ -55,6 +55,7 @@ def rust_file(data, units)
     pub const DEFAULT_DISTINCT_VALUES: i64 = #{data.fetch('default_distinct_values')};
     pub const DEFAULT_SRF_ROWS: i64 = #{data.fetch('default_srf_rows')};
     pub const DEFAULT_VARIABLE_KEY_BYTES: i64 = #{data.fetch('default_variable_key_bytes')};
+    pub const DEFAULT_ARRAY_ELEMENTS: usize = #{data.fetch('default_array_elements')};
     pub const JOIN_DP_LIMIT: usize = #{data.fetch('join_dp_limit')};
     pub const STATISTICS_TARGET: usize = #{data.fetch('statistics_target')};
     pub const STATISTICS_SAMPLE_ROWS: usize = #{data.fetch('statistics_sample_rows')};
@@ -116,6 +117,7 @@ def go_file(data, units)
     \tdefaultDistinctValues   int64 = #{data.fetch('default_distinct_values')}
     \tdefaultSRFRows          int64 = #{data.fetch('default_srf_rows')}
     \tdefaultVariableKeyBytes int64 = #{data.fetch('default_variable_key_bytes')}
+    \tdefaultArrayElements          = #{data.fetch('default_array_elements')}
     \tjoinDPLimit                   = #{data.fetch('join_dp_limit')}
     \tstatisticsTarget              = #{data.fetch('statistics_target')}
     \tstatisticsSampleRows          = #{data.fetch('statistics_sample_rows')}
@@ -176,6 +178,7 @@ def ts_file(data, units)
     export const DEFAULT_DISTINCT_VALUES = #{data.fetch('default_distinct_values')}n;
     export const DEFAULT_SRF_ROWS = #{data.fetch('default_srf_rows')}n;
     export const DEFAULT_VARIABLE_KEY_BYTES = #{data.fetch('default_variable_key_bytes')}n;
+    export const DEFAULT_ARRAY_ELEMENTS = #{data.fetch('default_array_elements')};
     export const JOIN_DP_LIMIT = #{data.fetch('join_dp_limit')};
     export const STATISTICS_TARGET = #{data.fetch('statistics_target')};
     export const STATISTICS_SAMPLE_ROWS = #{data.fetch('statistics_sample_rows')};

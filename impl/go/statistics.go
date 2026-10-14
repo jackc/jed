@@ -776,6 +776,9 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 		}
 		return statisticsSelectivity(rows, current.rows), true
 	}
+	if estimatorAnyArray(expr) && expr.elemExact {
+		return db.statisticsAnyArraySelectivity(expr, rel)
+	}
 	column, op, literal, ok := statisticsComparison(expr, rel)
 	if !ok {
 		return selectivityExpr{}, false
@@ -790,6 +793,42 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 	rows, ok := db.statisticsLiteralRows(current, op, literal, rel, column)
 	if !ok {
 		return selectivityExpr{}, false
+	}
+	return statisticsSelectivity(rows, current.rows), true
+}
+
+// statisticsAnyArraySelectivity estimates `column = ANY(array)` from column statistics
+// (statistics.md §6): the IN-list rule over the array's estimator elements — each distinct non-NULL
+// element by statistics key adds its equality rows, a NULL element adds none, and an element of
+// unknown value adds the NDV average.
+func (db *engine) statisticsAnyArraySelectivity(expr *rExpr, rel scopeRel) (selectivityExpr, bool) {
+	column, ok := statisticsColumn(expr.lhs, rel)
+	if !ok {
+		return selectivityExpr{}, false
+	}
+	current := db.currentColumnStatistics(rel, column)
+	if current == nil {
+		return selectivityExpr{}, false
+	}
+	seen, rows := make(map[string]bool), int64(0)
+	for _, elem := range estimatorArrayElements(expr.rhs) {
+		if estimatorIsNull(elem) {
+			continue
+		}
+		if key, ok := db.statisticsLiteralKey(elem, rel, column); ok {
+			if !seen[string(key)] {
+				seen[string(key)] = true
+				rows = satEstimateAdd(rows, statisticsEqualityRows(current, key))
+			}
+		} else {
+			if current.ndv == nil {
+				return selectivityExpr{}, false
+			}
+			rows = satEstimateAdd(rows, statisticsScale(current.nonnullRows, 1, max64(1, *current.ndv)))
+		}
+		if rows > current.nonnullRows {
+			rows = current.nonnullRows
+		}
 	}
 	return statisticsSelectivity(rows, current.rows), true
 }

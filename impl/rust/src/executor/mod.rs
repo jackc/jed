@@ -4156,6 +4156,10 @@ pub(crate) enum RExpr {
         /// compared by the row-constructor 3VL (`eq3`/`lt3`/`gt3`, like `RExpr::Compare`), not the
         /// composite total order the array form uses for composite elements (array-functions.md §13).
         row_wise: bool,
+        /// The array's element type is exactly the scalar type of `lhs` (no promotion), so each
+        /// element is a point in `lhs`'s key space — what lets `key = ANY(array)` bound a key scan
+        /// (cost.md §3 "OR / IN-list").
+        elem_exact: bool,
         /// The comparison collation (spec/design/collation.md §1): an ordering quantifier over text
         /// sorts by it. The left operand's derivation for the array form (an array carries none), the
         /// subquery form's combined one when folded from it; `None` for `C` / a non-text pair.
@@ -6631,6 +6635,7 @@ pub(crate) enum BoundSrc {
 
 /// One `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side (a
 /// `5 < pk` flips to `pk > 5`).
+#[derive(Clone)]
 pub(crate) struct BoundTerm {
     op: CmpOp,
     src: BoundSrc,
@@ -6659,8 +6664,29 @@ pub(crate) struct PkBound {
     member_count: usize,
 }
 
+/// One OR disjunct represented as the conjunction of its bound terms. It becomes one logical key
+/// interval at execution, after params/outer sources are known. An array spec (`array` set, no
+/// terms) is a `key = ANY(array)` disjunct: at execution it becomes one point per non-NULL element
+/// of the array's value.
 pub(crate) struct IntervalSpec {
     terms: Vec<BoundTerm>,
+    array: Option<ArrayPointSource>,
+}
+
+/// The array operand of a `key = ANY(array)` interval-set disjunct (cost.md §3 "OR / IN-list") —
+/// constant for the whole scan and readable without evaluation — in the owned form the plan keeps
+/// (the `BoundSrc` precedent).
+pub(crate) enum ArrayPointSource {
+    /// A one-dimensional `ARRAY[...]` constructor: each element a constant source of the key.
+    Elements(Vec<BoundSrc>),
+    /// A bind parameter's array value.
+    Param(usize),
+    /// A correlated outer column's array value (the `BoundSrc::Outer` indexing).
+    Outer { level: usize, index: usize },
+    /// A folded array constant.
+    Const(Box<ArrayVal>),
+    /// A NULL array: no points.
+    Null,
 }
 
 /// Canonical interval-set plan over a single-column PK. Specs are OR disjuncts; `clip` is the

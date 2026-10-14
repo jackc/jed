@@ -63,6 +63,7 @@ def main
   expect_equal(data, "default_distinct_values", 200)
   expect_equal(data, "default_srf_rows", 1000)
   expect_equal(data, "default_variable_key_bytes", 1)
+  expect_equal(data, "default_array_elements", 10)
   expect_equal(data, "statistics_target", 100)
   expect_equal(data, "statistics_sample_rows", 30_000)
   expect_equal(data, "statistics_kmv_hashes", 4_096)

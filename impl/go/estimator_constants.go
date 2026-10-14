@@ -13,6 +13,7 @@ const (
 	defaultDistinctValues         int64 = 200
 	defaultSRFRows                int64 = 1000
 	defaultVariableKeyBytes       int64 = 1
+	defaultArrayElements                = 10
 	joinDPLimit                         = 8
 	statisticsTarget                    = 100
 	statisticsSampleRows                = 30000

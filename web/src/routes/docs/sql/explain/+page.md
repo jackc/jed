@@ -32,6 +32,7 @@ INSERT INTO region VALUES
 	const indexBound = `EXPLAIN SELECT name FROM city WHERE region = 1;`;
 	const indexRange = `EXPLAIN SELECT name FROM city WHERE region > 1;`;
 	const pointSet = `EXPLAIN SELECT name FROM city WHERE id IN (1, 3, 5);`;
+	const anyPointSet = `EXPLAIN SELECT name FROM city WHERE id = ANY(ARRAY[1, 3, 5]);`;
 	const indexNestedLoop = `EXPLAIN SELECT c.name
 FROM city c JOIN trip t ON c.id = t.city_id;`;
 	const hashJoin = `EXPLAIN SELECT c.name, t.id
@@ -168,6 +169,16 @@ and merges duplicates/overlaps before scanning each disjoint interval once. The 
 indexed non-key column (`Index interval set: using <index>`).
 
 <LiveSql demo="pointSet" seed={seed} query={pointSet} rows={8} />
+
+`key = ANY(array)` is the array spelling of the same list, and it takes the same path: each element
+of the array becomes one point in the interval set. That is what makes a bound list — `WHERE id =
+ANY($1)` — a set of key lookups rather than a full scan. The array must be constant for the query (a
+parameter, a literal or cast array, or an `ARRAY[...]` of constants), and its element type must be
+exactly the key's type. EXPLAIN counts it as one of the set's intervals and marks it `arrays=1`,
+since its point count is known only when the query runs. The estimate reads the array's elements,
+so a bound list is planned with the values each execution binds.
+
+<LiveSql demo="anyPointSet" seed={seed} query={anyPointSet} rows={8} />
 
 ## An index-nested-loop join
 

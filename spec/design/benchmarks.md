@@ -5,8 +5,8 @@ cores). Grown since with `cte_materialized`, `lateral_top_n_per_group`, the GIN-
 benchmarks (`gin_contains` / `gin_overlaps` / `gin_member` / `gin_array_eq` / `gin_delete`)
 over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **concurrent-reader
 throughput** benchmarks (the `concurrent_read` kind, §8.1). Rule-based access-path work is pinned by
-scratch workloads including `composite_pk_lookup`, `interval_set_pk`, and
-`bounded_index_limit`; P6b adds `order_only_index_limit` and `gist_range_select` while reusing
+scratch workloads including `composite_pk_lookup`, `interval_set_pk`, `any_array_pk` (`key =
+ANY(array)` point sets), and `bounded_index_limit`; P6b adds `order_only_index_limit` and `gist_range_select` while reusing
 `gin_contains` and `interval_set_pk` for its cross-method matrix. `join_inl_topn` covers the
 combined join rule, while P7 adds the reversed-source-order
 `join_reverse_inl` / `join_reverse_nested_fallback` pair alongside `gin_inl` and the

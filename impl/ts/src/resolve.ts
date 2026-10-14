@@ -4229,8 +4229,22 @@ export function resolveQuantified(
           combineDeriv(deriveCollation(scope, lhs), deriveCollation(scope, array)),
         )
       : null;
+  // The element type is exactly the left operand's scalar type (same integer width too): each
+  // element is then a point in the left operand's key space (cost.md §3 "OR / IN-list").
+  const lc = ctxOf(rl.type);
+  const ec = ctxOf(elem);
+  const elemExact = lc !== null && ec !== null && lc === ec;
   return {
-    node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node, rowWise: false, collation },
+    node: {
+      kind: "quantified",
+      op,
+      all,
+      lhs: rl.node,
+      array: ra.node,
+      rowWise: false,
+      collation,
+      elemExact,
+    },
     type: { kind: "bool" },
   };
 }

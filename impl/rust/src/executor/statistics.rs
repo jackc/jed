@@ -904,12 +904,54 @@ pub(crate) fn statistics_leaf_selectivity(
         }
         return Some(statistics_fraction(rows, current.rows));
     }
+    if let RExpr::Quantified {
+        lhs,
+        array,
+        elem_exact: true,
+        ..
+    } = expr
+        && estimator_any_array(expr)
+    {
+        return statistics_any_array_selectivity(lhs, array, rel, catalog);
+    }
     let (column, op, literal) = statistics_comparison(expr, rel)?;
     let current = current_column_statistics(rel, column, catalog)?;
     if estimator_is_null(literal) {
         return Some(crate::estimator::Selectivity::Zero);
     }
     let rows = statistics_literal_rows(&current, op, literal, rel, column, catalog)?;
+    Some(statistics_fraction(rows, current.rows))
+}
+
+/// Estimate `column = ANY(array)` from column statistics (statistics.md §6): the IN-list rule over
+/// the array's estimator elements — each distinct non-NULL element by statistics key adds its
+/// equality rows, a NULL element adds none, and an element of unknown value adds the NDV average.
+fn statistics_any_array_selectivity(
+    lhs: &RExpr,
+    array: &RExpr,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> Option<crate::estimator::Selectivity> {
+    use crate::estimator::sat_add;
+    let column = statistics_column(lhs, rel)?;
+    let current = current_column_statistics(rel, column, catalog)?;
+    let mut seen = HashSet::new();
+    let mut rows = 0i64;
+    for elem in estimator_array_elements(array) {
+        if estimator_is_null(&elem) {
+            continue;
+        }
+        if let Some(key) = statistics_literal_key(&elem, rel, column, catalog) {
+            if !seen.contains(&key) {
+                rows = sat_add(rows, statistics_equality_rows(&current, &key));
+                seen.insert(key);
+            }
+        } else {
+            let ndv = current.ndv?;
+            rows = sat_add(rows, statistics_scale(current.nonnull_rows, 1, ndv.max(1)));
+        }
+        rows = rows.min(current.nonnull_rows);
+    }
     Some(statistics_fraction(rows, current.rows))
 }
 

@@ -122,7 +122,10 @@ precedence: a SELECT containing `nextval`/`setval`, or a top-level WITH containi
 Attributes are separated by `; `. A node with no attributes is `-`.
 
 - Scans render `Full scan`, `PK bound: ...`, `Index bound: using <index>`, `GIN bound: ...`,
-  `GiST bound: ...`, or an interval-set form. Bound operators are `= <> < > <= >=`; sources are
+  `GiST bound: ...`, or an interval-set form: `PK interval set: <key>; intervals=N` or
+  `Index interval set: using <index>; intervals=N`, where `N` counts the set's structural disjuncts
+  and a following `arrays=K` (only when `K > 0`) counts those that are `key = ANY(array)` arrays,
+  whose points are known only at execution ([cost.md §3](cost.md)). Bound operators are `= <> < > <= >=`; sources are
   `$N`, `outer`, or canonical literals. A float bound is its PostgreSQL `float8out` text
   ([float.md](float.md) §9) rather than the old `<float>` placeholder.
 - `touched=K` is the exact number of statically referenced stored columns. It is emitted for SELECT

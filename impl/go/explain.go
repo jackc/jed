@@ -1154,9 +1154,9 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 	case b.gist != nil:
 		return prefix + "GiST bound: using " + b.gist.nameKey
 	case b.pkSet != nil:
-		return prefix + "PK interval set: " + db.firstPKColName(tableName) + "; intervals=" + strconv.Itoa(len(b.pkSet.specs))
+		return prefix + "PK interval set: " + db.firstPKColName(tableName) + intervalSpecsLabel(b.pkSet.specs)
 	case b.indexSet != nil:
-		return prefix + "Index interval set: using " + b.indexSet.nameKey + "; intervals=" + strconv.Itoa(len(b.indexSet.specs))
+		return prefix + "Index interval set: using " + b.indexSet.nameKey + intervalSpecsLabel(b.indexSet.specs)
 	default:
 		return "Full scan"
 	}
@@ -1982,4 +1982,21 @@ func subqueryNode(label string) string {
 		return "Subquery"
 	}
 	return "Subquery " + label
+}
+
+// intervalSpecsLabel is an interval set's structural disjunct count, plus how many of those
+// disjuncts are `key = ANY(array)` arrays, whose point count is known only at execution
+// (explain.md §5).
+func intervalSpecsLabel(specs []intervalSpec) string {
+	arrays := 0
+	for _, spec := range specs {
+		if spec.array != nil {
+			arrays++
+		}
+	}
+	label := "; intervals=" + strconv.Itoa(len(specs))
+	if arrays > 0 {
+		label += "; arrays=" + strconv.Itoa(arrays)
+	}
+	return label
 }

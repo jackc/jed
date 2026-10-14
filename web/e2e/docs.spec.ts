@@ -838,6 +838,17 @@ test('the explain page shows the OR / IN-list interval-set access path', async (
   await expect(panel.getByTestId('result-rows')).toContainText('PK interval set: id; intervals=3');
 });
 
+test('the explain page shows key = ANY(array) as an interval set', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // EXPLAIN SELECT ... WHERE id = ANY(ARRAY[1, 3, 5]): one array disjunct whose elements are the
+  // point probes (cost.md §3 "OR / IN-list").
+  const panel = livePanel(page, 'anyPointSet');
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
+  await expect(panel.getByTestId('result-rows')).toContainText(
+    'PK interval set: id; intervals=1; arrays=1'
+  );
+});
+
 test('the explain page shows the index-nested-loop access path on a join', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
   // The demo authors city first, but P7 physically drives trip and makes city the per-outer-row

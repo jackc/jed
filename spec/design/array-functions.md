@@ -666,6 +666,11 @@ follows its `IN`-list lineage rather than the array-comparator lineage. The `lhs
 charge their own evaluation cost once, up front. Deterministic and cross-core-identical, asserted
 with `# cost:` in the corpus.
 
+As a **WHERE access path**, `key = ANY(array)` over a single-column PK or leading B-tree index key
+lowers like the IN-list it spells: a point per element of a constant array whose element type is
+exactly the key's ([cost.md §3](cost.md) "OR / IN-list"). The node above is still the residual filter,
+so this per-row cost is unchanged; only the scanned rows shrink.
+
 ### 11.5 Ratified divergences
 
 14. **A non-array right side is `42809`; an incomparable element type is `42883`; a bare untyped

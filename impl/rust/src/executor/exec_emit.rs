@@ -1467,6 +1467,7 @@ impl Engine {
                         lhs: lhs.expect("a quantified subquery carries its resolved lhs"),
                         array: Box::new(RExpr::ConstArray(Box::new(arr))),
                         row_wise: row_valued,
+                        elem_exact: false,
                         collation,
                     }
                 }

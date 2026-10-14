@@ -1,0 +1,135 @@
+# EXPLAIN of `key = ANY(array)` point sets (spec/design/cost.md §3 "OR / IN-list", explain.md §5): the
+# array is one disjunct of the PK / index interval set, counted among its `intervals=` and named by
+# `arrays=`, since its point count is known only at execution. The estimator reads a readable array as
+# the IN-list of its elements (estimator.md §7); a bound array is read in its custom plan (§6.1).
+# Rows and costs are pinned in any_array_point_lookup.test. The plans are jed-owned, so this file is
+# cross-core checked, not oracle-checked.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.logical_connectives, query.explain, func.array_quantified, types.array, cast.array, types.i32, types.i64
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)
+
+# An array disjunct is counted among the set's intervals and named by `arrays=`; its point count is
+# known only at execution.
+query ITTII nosort
+EXPLAIN SELECT a FROM t WHERE id = ANY(ARRAY[1, 3, 5])
+----
+0
+Filter
+conjuncts=1
+3
+13
+1
+Scan t
+PK interval set: id; intervals=1; arrays=1; touched=2
+3
+4
+
+# params: ARRAY[1, 6]
+query ITTII nosort
+EXPLAIN SELECT a FROM t WHERE id = ANY($1)
+----
+0
+Filter
+conjuncts=1
+2
+7
+1
+Scan t
+PK interval set: id; intervals=1; arrays=1; touched=2
+2
+3
+
+# The ANY may be one disjunct of a same-key OR.
+query ITTII nosort
+EXPLAIN SELECT a FROM t WHERE id = ANY(ARRAY[1, 2]) OR id = 6
+----
+0
+Filter
+conjuncts=1
+3
+19
+1
+Scan t
+PK interval set: id; intervals=2; arrays=1; touched=2
+3
+4
+
+# ALL does not lower.
+query ITTII nosort
+EXPLAIN SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2, 3, 4])
+----
+0
+Filter
+conjuncts=1
+2
+21
+1
+Scan t
+Full scan; touched=1
+6
+7
+
+statement ok
+CREATE TABLE big (id i64 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO big VALUES (1, 10), (2, 20), (3, 30)
+
+# An i32[] against an i64 key is a promoted comparison: it does not bound the key.
+query ITTII nosort
+EXPLAIN SELECT a FROM big WHERE id = ANY('{1,3}'::i32[])
+----
+0
+Filter
+conjuncts=1
+2
+9
+1
+Scan big
+Full scan; touched=2
+3
+4
+
+# An ARRAY[...] of literals adapts to the key's type, so it does bound.
+query ITTII nosort
+EXPLAIN SELECT a FROM big WHERE id = ANY(ARRAY[1, 3])
+----
+0
+Filter
+conjuncts=1
+2
+9
+1
+Scan big
+PK interval set: id; intervals=1; arrays=1; touched=2
+2
+3
+
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, x i32)
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 10)
+
+statement ok
+CREATE INDEX sx ON s (x)
+
+# A secondary index's leading column takes the same set.
+query ITTII nosort
+EXPLAIN SELECT id FROM s WHERE x = ANY(ARRAY[30, 10])
+----
+0
+Filter
+conjuncts=1
+2
+11
+1
+Scan s
+Index interval set: using sx; intervals=1; arrays=1; touched=2
+2
+5

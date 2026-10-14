@@ -7,6 +7,7 @@ export const MAX_ESTIMATE = 9223372036854775807n;
 export const DEFAULT_DISTINCT_VALUES = 200n;
 export const DEFAULT_SRF_ROWS = 1000n;
 export const DEFAULT_VARIABLE_KEY_BYTES = 1n;
+export const DEFAULT_ARRAY_ELEMENTS = 10;
 export const JOIN_DP_LIMIT = 8;
 export const STATISTICS_TARGET = 100;
 export const STATISTICS_SAMPLE_ROWS = 30000;

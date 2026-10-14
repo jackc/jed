@@ -1484,6 +1484,10 @@ pub(crate) fn resolve_quantified(
     } else {
         None
     };
+    let elem_exact = match (ctx_of(&lt), ctx_of(&elem)) {
+        (Some(l), Some(e)) => l == e,
+        _ => false,
+    };
     Ok((
         RExpr::Quantified {
             op: cop,
@@ -1491,6 +1495,7 @@ pub(crate) fn resolve_quantified(
             lhs: Box::new(rl),
             array: Box::new(ra),
             row_wise: false,
+            elem_exact,
             collation,
         },
         ResolvedType::Bool,

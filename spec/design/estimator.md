@@ -250,6 +250,8 @@ when its probe read a value. The reads are:
   collation, whose NDV average is the literal estimate for every value;
 - a GIN-served operand on a column with GIN term facts ([statistics.md §6.1](statistics.md)),
   including an `ARRAY[...]` of parameters;
+- the array operand of an `x = ANY(array)` (§7), and so of a `key = ANY(array)` interval set: its
+  element count shapes every such estimate, so a bound list always plans per execution;
 - a contradiction proof that compares two literals: two comparisons on one operand, a comparison
   between two literals, or two scan-bound sources of one key (§7, [planner.md](planner.md) §3.1);
   and a bare boolean parameter conjunct;
@@ -305,6 +307,17 @@ Let `N` be a base relation's exact row count.
   contributes zero true rows. Canonically equal resolved literals are de-duplicated with the first
   occurrence retained; parameters are compared by position, never by value (§6.1). `NOT IN`
   uses the NOT rule, except that a known literal NULL anywhere in the list proves zero true rows.
+- `x = ANY(A)` (or `= SOME`) over an array operand constant for the relation — a parameter, an
+  array constant, a correlated outer column, or a one-dimensional `ARRAY[...]` of literals,
+  parameters, and outer columns: §7.1's OR rule over one equality entry per *estimator element* of
+  `A`, in order. A one-dimensional `ARRAY[...]`'s elements are its element expressions; an array
+  readable at plan time (a literal, or a bound parameter in its custom plan, §6.1) has its elements,
+  flattened in storage order, as literals; a NULL array has none; any other array — an unbound
+  parameter, an outer column — has `default_array_elements` entries of unknown value
+  (`estimator.toml`; PostgreSQL's assumed length for a non-constant array). A NULL element contributes
+  zero true rows, and an empty array gives zero. Unlike an IN list, elements are not de-duplicated
+  structurally (column statistics de-duplicate known values by key, [statistics.md §6](statistics.md)).
+  `ALL`, other operators, and other array operands keep `opaque`.
 - `<>`: `N - equality_rows`.
 - One-sided `<`, `<=`, `>`, or `>=`: `scale_ceil(N, inequality)`.
 - A lower and upper comparison on the same resolved operand in one AND chain:
@@ -415,6 +428,10 @@ weight; the owning base unit still counts the operation. Runtime metering remain
   admitted resident structural descent count where available, otherwise the estimated non-leaf
   pages of its bound. Both retain their ordinary table-fetch and residual costs.
 - Interval sets sum disjoint interval page estimates in canonical interval order with saturation.
+  A `key = ANY(A)` disjunct contributes one equality disjunct per estimator element of `A` (§7), so
+  an interval set estimates exactly as the IN-list of its points; the OR fold over many elements is
+  evaluated as a balanced tree (halves split at `len / 2`), which the OR rule's capped sum makes
+  shape-independent.
   A LIMIT-aware candidate estimates only intervals it expects to start, in execution order.
 
 ### 8.2 Expressions and size-dependent work

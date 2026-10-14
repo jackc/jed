@@ -31,6 +31,19 @@ impl Selectivity {
     }
 }
 
+/// Fold disjunct estimates with the OR rule as a balanced tree (the halves split at `len / 2`), so
+/// an array of many elements cannot nest the program deeply. The OR rule's capped sum is
+/// associative, so the tree shape never changes an estimate. No parts is `Zero`.
+pub(crate) fn or_selectivities(mut parts: Vec<Selectivity>) -> Selectivity {
+    match parts.len() {
+        0 => return Selectivity::Zero,
+        1 => return parts.pop().expect("one part"),
+        _ => {}
+    }
+    let right = parts.split_off(parts.len() / 2);
+    or_selectivities(parts).or(or_selectivities(right))
+}
+
 pub(crate) fn sat_add(a: i64, b: i64) -> i64 {
     a.saturating_add(b).min(MAX_ESTIMATE)
 }

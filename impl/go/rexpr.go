@@ -1247,6 +1247,10 @@ type rExpr struct {
 	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
 	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
 	quantAll bool
+	// reQuantified: the array's element type is exactly the scalar type of `lhs` (no promotion), so
+	// each element is a point in `lhs`'s key space — what lets `key = ANY(array)` bound a key scan
+	// (cost.md §3 "OR / IN-list").
+	elemExact bool
 	// reQuantified: the folded form of a ROW-VALUED quantified subquery (grammar.md §26) — each
 	// element is compared by the row-constructor 3VL (Eq3/Lt3/Gt3, like reCompare), not the
 	// composite total order the array form uses for composite elements (array-functions.md §13).

@@ -1109,14 +1109,14 @@ impl Engine {
             Some(ScanBound::Gin(gb)) => format!("{prefix}GIN bound: using {}", gb.name_key),
             Some(ScanBound::Gist(gp)) => format!("{prefix}GiST bound: using {}", gp.name_key),
             Some(ScanBound::PkSet(ks)) => format!(
-                "{prefix}PK interval set: {}; intervals={}",
+                "{prefix}PK interval set: {}{}",
                 self.first_pk_col_name(table_name),
-                ks.specs.len()
+                interval_specs_label(&ks.specs)
             ),
             Some(ScanBound::IndexSet(ks)) => format!(
-                "{prefix}Index interval set: using {}; intervals={}",
+                "{prefix}Index interval set: using {}{}",
                 ks.name_key,
-                ks.specs.len()
+                interval_specs_label(&ks.specs)
             ),
         }
     }
@@ -1160,4 +1160,15 @@ fn subquery_node(label: &str) -> String {
     } else {
         format!("Subquery {label}")
     }
+}
+
+/// An interval set's structural disjunct count, plus how many of those disjuncts are
+/// `key = ANY(array)` arrays, whose point count is known only at execution (explain.md §5).
+fn interval_specs_label(specs: &[IntervalSpec]) -> String {
+    let arrays = specs.iter().filter(|spec| spec.array.is_some()).count();
+    let mut label = format!("; intervals={}", specs.len());
+    if arrays > 0 {
+        label.push_str(&format!("; arrays={arrays}"));
+    }
+    label
 }

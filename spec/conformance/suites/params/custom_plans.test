@@ -5,7 +5,7 @@
 # plan cache's memo and value-blind classification are per-core host-API tests (custom_plans). The
 # plans and estimates are jed-owned, so this file is cross-core checked, not oracle-checked.
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: harness.params, maintenance.analyze, maintenance.analyze_gin_terms, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_scan, query.gin_any_eq, dml.insert, dml.insert_select, dml.insert_on_conflict, dml.update, dml.delete, dml.explain, dml.explain_analyze, query.select, query.where_eq, query.comparison_order, query.set_returning, query.aggregates, query.explain, query.explain_analyze, query.subquery_in, expr.text_concat, expr.arithmetic, expr.case, cast.explicit, func.array_quantified, types.i32, types.i64, types.text, types.array, null.three_valued, resource.cost_metering
+# requires: harness.params, maintenance.analyze, maintenance.analyze_gin_terms, query.any_array_point_lookup, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_scan, query.gin_any_eq, dml.insert, dml.insert_select, dml.insert_on_conflict, dml.update, dml.delete, dml.explain, dml.explain_analyze, query.select, query.where_eq, query.comparison_order, query.set_returning, query.aggregates, query.explain, query.explain_analyze, query.subquery_in, expr.text_concat, expr.arithmetic, expr.case, cast.explicit, func.array_quantified, types.i32, types.i64, types.text, types.array, null.three_valued, resource.cost_metering
 
 # cat is 1 for nine rows in ten (a most-common value) and unique otherwise; tags holds the common tag
 # 'a' on every row and a rare tag 'r<id>' on one.
@@ -374,7 +374,11 @@ SELECT id FROM items WHERE tags @> '{r7}'::text[]
 ----
 7
 
-# A bound list of keys.
+# --- a bound list of keys ------------------------------------------------------------------------
+
+# `id = ANY($1)` reads the array's elements, so the bound list is planned as its literal twin: a PK
+# interval set of one point per element (cost.md §3 "OR / IN-list"), estimated as the IN-list of
+# those elements.
 # params: ARRAY[70, 80]
 query ITTII nosort
 EXPLAIN SELECT cat FROM items WHERE id = ANY($1)
@@ -382,13 +386,13 @@ EXPLAIN SELECT cat FROM items WHERE id = ANY($1)
 0
 Filter
 conjuncts=1
-334
-2340
+2
+8
 1
 Scan items
-Full scan; touched=2
-1000
-1006
+PK interval set: id; intervals=1; arrays=1; touched=2
+2
+4
 
 query ITTII nosort
 EXPLAIN SELECT cat FROM items WHERE id = ANY('{70,80}'::i32[])
@@ -396,13 +400,103 @@ EXPLAIN SELECT cat FROM items WHERE id = ANY('{70,80}'::i32[])
 0
 Filter
 conjuncts=1
-334
-2340
+2
+8
+1
+Scan items
+PK interval set: id; intervals=1; arrays=1; touched=2
+2
+4
+
+# params: ARRAY[70, 80]
+# cost: 13
+query I nosort
+SELECT cat FROM items WHERE id = ANY($1) ORDER BY cat
+----
+70
+80
+
+# cost: 13
+query I nosort
+SELECT cat FROM items WHERE id = ANY('{70,80}'::i32[]) ORDER BY cat
+----
+70
+80
+
+# The elements meet the column statistics: a list of the most-common value keeps the full scan, a
+# list of rare values takes the items_cat interval set.
+# params: ARRAY[1]
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = ANY($1)
+----
+0
+Filter
+conjuncts=1
+900
+2906
 1
 Scan items
 Full scan; touched=2
 1000
 1006
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = ANY('{1}'::i32[])
+----
+0
+Filter
+conjuncts=1
+900
+2906
+1
+Scan items
+Full scan; touched=2
+1000
+1006
+
+# params: ARRAY[10, 20]
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = ANY($1)
+----
+0
+Filter
+conjuncts=1
+2
+12
+1
+Scan items
+Index interval set: using items_cat; intervals=1; arrays=1; touched=2
+2
+8
+
+query ITTII nosort
+EXPLAIN SELECT id FROM items WHERE cat = ANY('{10,20}'::i32[])
+----
+0
+Filter
+conjuncts=1
+2
+12
+1
+Scan items
+Index interval set: using items_cat; intervals=1; arrays=1; touched=2
+2
+8
+
+# params: ARRAY[10, 20]
+# cost: 17
+query I nosort
+SELECT id FROM items WHERE cat = ANY($1) ORDER BY id
+----
+10
+20
+
+# cost: 17
+query I nosort
+SELECT id FROM items WHERE cat = ANY('{10,20}'::i32[]) ORDER BY id
+----
+10
+20
 
 # --- a bound generate_series bound ----------------------------------------------------------------
 

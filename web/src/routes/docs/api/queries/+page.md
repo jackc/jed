@@ -63,6 +63,9 @@ binds the array of `id`'s type, which is how you pass a list:
   binds `NULL`; `[]byte` stays `bytea`.
 - **TypeScript** — pass a JS array: `db.prepare("… WHERE id = ANY($1)").all([1, 3])`.
 
+On a primary key or an indexed column, `id = ANY($1)` looks up each element of the list, like
+`id IN (1, 3)` ([EXPLAIN](/docs/sql/explain) shows it as an interval set).
+
 Any container also binds from its text form, read like a string literal of that type: `'{1,3}'`,
 `'[1,5)'`, or `'(1,x)'`. To bind a range or composite value directly, pass the engine `Value`.
 

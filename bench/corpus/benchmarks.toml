@@ -134,6 +134,70 @@ base = 2
 off_min = 8
 off_max = 16
 
+# `key = ANY(array)` point sets (query.any_array_point_lookup). Eight uniformly drawn keys of a
+# 100k-row scratch table, as one array; the array is an ARRAY[...] of eight parameters so every harness
+# and PostgreSQL bind plain integers. Before the slice jed full-scanned every row and compared each
+# against the array; the ANY now lowers to one PK point probe per element, like the equivalent IN-list.
+[[bench]]
+name = "any_array_pk"
+description = "PK = ANY(ARRAY[$1..$8]) on 100k rows; one point probe per element vs. a full scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM any_orders WHERE id = ANY(ARRAY[$1, $2, $3, $4, $5, $6, $7, $8]) ORDER BY id"
+warmup = 500
+iterations = 15000
+seed = 4291
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS any_orders",
+  "CREATE TABLE any_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO any_orders SELECT g, g * 3 FROM generate_series(1, 100000) AS g"
+]
+
+# PostgreSQL types an ARRAY[...] of untyped parameters as text[]; jed types it from the key.
+[bench.sql_override]
+postgres = "SELECT id, v FROM any_orders WHERE id = ANY(ARRAY[$1::bigint, $2::bigint, $3::bigint, $4::bigint, $5::bigint, $6::bigint, $7::bigint, $8::bigint]) ORDER BY id"
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
 # Bounded LIMIT streaming over an ordered secondary-index range
 # (query.bounded_limit_streaming). The range admits 65–129 rows, but ORDER BY the same index lets
 # each core stop its index walk and table point-lookups after five rows. Before this slice the bound

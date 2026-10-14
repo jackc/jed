@@ -3357,6 +3357,7 @@ impl RExpr {
                 array,
                 row_wise,
                 collation,
+                ..
             } => {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;

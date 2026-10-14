@@ -395,6 +395,22 @@ func predicateSelectivity(expr *rExpr) selectivityExpr {
 		return s
 	case reColumn:
 		return fractionSelectivity(selectivityBoolean)
+	case reQuantified:
+		if !estimatorAnyArray(expr) {
+			return estimatorSelectivityClass(accessUnsupported)
+		}
+		// `x = ANY(array)` is the OR of `x = element` over its elements (estimator.md §7); a NULL
+		// element contributes zero true rows.
+		elems := estimatorArrayElements(expr.rhs)
+		parts := make([]selectivityExpr, len(elems))
+		for i, elem := range elems {
+			if estimatorIsNull(elem) {
+				parts[i] = selectivityExpr{kind: selectivityZero}
+			} else {
+				parts[i] = fractionSelectivity(selectivityEquality)
+			}
+		}
+		return orSelectivities(parts)
 	default:
 		return estimatorSelectivityClass(accessUnsupported)
 	}
@@ -758,9 +774,90 @@ func foldEqualityPrefix(count int) selectivityExpr {
 	return result
 }
 
-func intervalSelectivity(specs []intervalSpec, clip []boundTerm, uniquePoints bool, keyType scalarType) selectivityExpr {
-	var disjunction *selectivityExpr
+// orSelectivities folds disjunct estimates with the OR rule as a balanced tree (the halves split
+// at len/2), so an array of many elements cannot nest the program deeply. The OR rule's capped sum
+// is associative, so the tree shape never changes an estimate.
+func orSelectivities(parts []selectivityExpr) selectivityExpr {
+	switch len(parts) {
+	case 0:
+		return selectivityExpr{kind: selectivityZero}
+	case 1:
+		return parts[0]
+	}
+	mid := len(parts) / 2
+	return orSelectivities(parts[:mid]).Or(orSelectivities(parts[mid:]))
+}
+
+// estimatorArrayElements is the element sources of an `= ANY` array operand for the estimator
+// (estimator.md §7): an ARRAY[...] constructor's element nodes; a plan-time-readable array's
+// elements as literals, flattened in storage order (a NULL array has none); otherwise — a parameter
+// whose value is unavailable, a correlated outer column — default_array_elements stand-ins of
+// unknown value (the operand itself).
+func estimatorArrayElements(array *rExpr) []*rExpr {
+	if array.kind == reArray && !array.nested {
+		return array.sargs
+	}
+	if c := estimatorValue(array); c != nil {
+		switch c.kind {
+		case reConstNull:
+			return nil
+		case reConstArray:
+			elems := make([]*rExpr, len(c.cArray.Elements))
+			for i, elem := range c.cArray.Elements {
+				elems[i] = valueToRExpr(elem)
+			}
+			return elems
+		}
+	}
+	elems := make([]*rExpr, defaultArrayElements)
+	for i := range elems {
+		elems[i] = array
+	}
+	return elems
+}
+
+// estimatorIntervalSpecs expands each `key = ANY(array)` disjunct into one equality disjunct per
+// estimator element, in order, so an array set estimates as the IN-list of its elements.
+func estimatorIntervalSpecs(specs []intervalSpec) []intervalSpec {
+	out := specs[:0:0]
 	for _, spec := range specs {
+		if spec.array == nil {
+			out = append(out, spec)
+			continue
+		}
+		for _, elem := range estimatorArrayElements(spec.array) {
+			out = append(out, intervalSpec{terms: []boundTerm{{op: opEq, src: elem}}})
+		}
+	}
+	return out
+}
+
+// estimatorAnyArray reports whether e is a `x = ANY(array)` the estimator reads as a disjunction of
+// equalities: ANY (not ALL) equality over an array operand constant for the whole relation.
+func estimatorAnyArray(e *rExpr) bool {
+	if e.kind != reQuantified || e.op != opEq || e.quantAll || e.rowWise {
+		return false
+	}
+	switch e.rhs.kind {
+	case reParam, reConstArray, reConstNull, reOuterColumn:
+		return true
+	case reArray:
+		if e.rhs.nested {
+			return false
+		}
+		for _, elem := range e.rhs.sargs {
+			if !estimatorLiteral(elem) && elem.kind != reOuterColumn {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func intervalSelectivity(specs []intervalSpec, clip []boundTerm, uniquePoints bool, keyType scalarType) selectivityExpr {
+	var parts []selectivityExpr
+	for _, spec := range estimatorIntervalSpecs(specs) {
 		var s selectivityExpr
 		if uniquePoints && len(spec.terms) > 0 {
 			allEqual := true
@@ -779,22 +876,13 @@ func intervalSelectivity(specs []intervalSpec, clip []boundTerm, uniquePoints bo
 		} else {
 			s = rangeTermsSelectivity(spec.terms, keyType)
 		}
-		if disjunction == nil {
-			disjunction = &s
-		} else {
-			combined := disjunction.Or(s)
-			disjunction = &combined
-		}
+		parts = append(parts, s)
 	}
-	if disjunction == nil {
-		zero := selectivityExpr{kind: selectivityZero}
-		disjunction = &zero
-	}
+	disjunction := orSelectivities(parts)
 	if len(clip) > 0 {
-		combined := disjunction.And(rangeTermsSelectivity(clip, keyType))
-		return combined
+		return disjunction.And(rangeTermsSelectivity(clip, keyType))
 	}
-	return *disjunction
+	return disjunction
 }
 
 func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivityExpr {
@@ -884,8 +972,8 @@ func (db *engine) intervalSelectivityWithStatistics(
 	column int,
 	rel scopeRel,
 ) selectivityExpr {
-	var disjunction *selectivityExpr
-	for _, spec := range specs {
+	var parts []selectivityExpr
+	for _, spec := range estimatorIntervalSpecs(specs) {
 		structural := rangeTermsSelectivity(spec.terms, keyType)
 		term := structural
 		allEqual := len(spec.terms) > 0
@@ -899,17 +987,9 @@ func (db *engine) intervalSelectivityWithStatistics(
 				term = estimated
 			}
 		}
-		if disjunction == nil {
-			disjunction = &term
-		} else {
-			combined := disjunction.Or(term)
-			disjunction = &combined
-		}
+		parts = append(parts, term)
 	}
-	if disjunction == nil {
-		zero := selectivityExpr{kind: selectivityZero}
-		disjunction = &zero
-	}
+	disjunction := orSelectivities(parts)
 	if len(clip) > 0 {
 		clipEstimate := rangeTermsSelectivity(clip, keyType)
 		if estimated, ok := db.statisticsBoundTermsSelectivity(rel, column, clip); ok {
@@ -917,7 +997,7 @@ func (db *engine) intervalSelectivityWithStatistics(
 		}
 		return disjunction.And(clipEstimate)
 	}
-	return *disjunction
+	return disjunction
 }
 
 func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandidate, rel scopeRel) selectivityExpr {

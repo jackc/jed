@@ -244,9 +244,12 @@ func (sb *scanBound) needsEagerScan() bool {
 }
 
 // intervalSpec is one OR disjunct represented as the conjunction of its bound terms. It becomes
-// one logical key interval at execution, after params/outer sources are known.
+// one logical key interval at execution, after params/outer sources are known. An array spec
+// (array != nil, no terms) is a `key = ANY(array)` disjunct: at execution it becomes one point per
+// non-NULL element of the array's value.
 type intervalSpec struct {
 	terms []boundTerm
+	array *rExpr
 }
 
 // pkKeySetPlan is the generalized OR/IN interval-set plan over a single-column PK. Each spec is a
@@ -726,7 +729,7 @@ func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Coll
 	flatten(filter)
 	found := -1
 	for i, e := range conjuncts {
-		if e.kind != reOr {
+		if e.kind != reOr && e.kind != reQuantified {
 			continue
 		}
 		if reduced, ok := reduceIntervalUnion(e, keyIdx, keyType, colColl); ok {
@@ -763,6 +766,9 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 		}
 		return append(l, r...), true
 	}
+	if spec, ok := asArrayPointSpec(e, keyIdx, keyType, colColl); ok {
+		return []intervalSpec{spec}, true
+	}
 	var terms []boundTerm
 	var walk func(*rExpr) bool
 	walk = func(x *rExpr) bool {
@@ -779,6 +785,78 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 		return []intervalSpec{{terms: terms}}, true
 	}
 	return nil, false
+}
+
+// asArrayPointSpec reports whether e is `key = ANY(array)` whose array elements are points of the
+// key (cost.md §3 "OR / IN-list"): ANY (not ALL) equality on the bare key column, an element type
+// exactly the key's type, the key's own collation (as asBoundTerm), and an array that is constant for
+// the whole scan.
+func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string) (intervalSpec, bool) {
+	if e.kind != reQuantified || e.op != opEq || e.quantAll || e.rowWise || !e.elemExact || !isColumn(e.lhs, keyIdx) {
+		return intervalSpec{}, false
+	}
+	cmpColl := ""
+	if e.collation != nil {
+		cmpColl = e.collation.Name
+	}
+	if cmpColl != colColl || !isArrayPointSource(e.rhs, keyType) {
+		return intervalSpec{}, false
+	}
+	return intervalSpec{array: e.rhs}, true
+}
+
+// isArrayPointSource reports whether an `= ANY` array operand is constant for the whole scan and
+// readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
+// outer column, or a one-dimensional ARRAY[...] whose every element is a constant key source.
+func isArrayPointSource(e *rExpr, keyType scalarType) bool {
+	switch e.kind {
+	case reParam, reConstArray, reConstNull, reOuterColumn:
+		return true
+	case reArray:
+		if e.nested {
+			return false
+		}
+		for _, elem := range e.sargs {
+			if !isConstSource(elem, keyType, nil) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// arrayPointKeys encodes an array spec's elements as key points, in element order: a NULL array,
+// a NULL element, and an element no key can equal (an out-of-range integer, an unmapped collated
+// text) contribute no point, exactly as the equivalent IN-list's disjuncts would.
+func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation) [][]byte {
+	var keys [][]byte
+	if src.kind == reArray {
+		for _, elem := range src.sargs {
+			if key, isNull, ok := encodeBoundKey(keyType, elem, params, outer, coll, nil); ok && !isNull {
+				keys = append(keys, key)
+			}
+		}
+		return keys
+	}
+	var v Value
+	switch src.kind {
+	case reParam:
+		v = params[src.index]
+	case reOuterColumn:
+		v = outer[len(outer)-src.level][src.index]
+	case reConstArray:
+		v = arrayValueOf(src.cArray)
+	}
+	if v.Kind != ValArray {
+		return nil
+	}
+	for _, elem := range v.arrayVal().Elements {
+		if key, isNull, ok := encodeValueKey(keyType, elem, coll); ok && !isNull {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 // detectINLBound detects an index-nested-loop scan bound for a join inner relation rel (cost.md §3
@@ -1537,6 +1615,15 @@ func canonicalIntervalSet(keyType scalarType, specs []intervalSpec, clipTerms []
 	}
 	intervals := make([]keyBound, 0, len(specs))
 	for _, spec := range specs {
+		if spec.array != nil {
+			for _, key := range arrayPointKeys(keyType, spec.array, params, outer, coll) {
+				b := intersectBounds(intersectHi(intersectLo(unboundedBound(), key, true), key, true), clip)
+				if !boundEmpty(b) {
+					intervals = append(intervals, b)
+				}
+			}
+			continue
+		}
 		b, empty := buildLogicalInterval(keyType, spec.terms, params, outer, coll, left)
 		if empty {
 			continue

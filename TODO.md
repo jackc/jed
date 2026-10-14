@@ -200,10 +200,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     PostgreSQL-style switch to a generic plan after five executions.
     - [ ] _follow-on:_ subqueries in a top-level plain `INSERT ... VALUES` slot still plan unbound
       (the fast path opens no boundary); custom-plan them if a workload needs it.
-  - [ ] _follow-on:_ a key access path for `col = ANY(<array>)` — a literal, cast, or bound array
-    (`id = ANY($1)`, the usual way to bind a list since container parameters landed). It is a full
-    scan + filter today, where `id IN (1, 3)` takes PK/index point lookups (the interval-set path);
-    the bound case needs the custom plan to read the array's elements. _(size: M)_
+  - [x] **`key = ANY(array)` point sets** — a literal, cast, or bound array (`id = ANY($1)`) over a
+    single-column PK or leading index key is one interval-set disjunct, a point per element at
+    execution; the estimator reads the elements (a bound array in its custom plan). →
+    [cost.md §3](spec/design/cost.md) "OR / IN-list", [estimator.md §7](spec/design/estimator.md)
+    - [ ] _follow-on:_ the shapes that still full-scan — an array of a *promoted* element type (`i32[]`
+      against an `i64` key: convert each element, dropping unrepresentable ones), a folded uncorrelated
+      `IN (SELECT …)` / `= ANY(SELECT …)` (its value list is known only after folding), an ANY under
+      an AND leaf of an OR, an index-nested-loop sibling array column, and a composite PK's trailing
+      member (`a = 1 AND b = ANY($1)`). The `<> ALL` / `NOT IN` complement estimate, and pricing the
+      residual's per-element `operator_eval` for a known array. A bench param generator that binds a
+      real array (`any_array_pk` builds one from eight scalars). _(size: M)_
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
     composite/array/json/jsonb, GIN term statistics for `<@`, and an element-count
