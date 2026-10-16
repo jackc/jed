@@ -9,6 +9,10 @@
 > options; [storage.md](storage.md) §4/§6 own persistence and reclamation. When a decision here changes,
 > update those docs, [CLAUDE.md](../../CLAUDE.md) §9, [AGENTS.md](../../AGENTS.md), and
 > [TODO.md](../../TODO.md) together.
+>
+> **Proposed successor (unratified):** [page-service.md](page-service.md) would replace shared mode
+> with one owner process that alone touches the file and serves pages to client processes. Until it
+> is ratified and its handoff phase lands, this document is the binding protocol.
 
 ## 1. Decision and status
 

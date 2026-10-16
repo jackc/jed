@@ -7,6 +7,11 @@
 > does not foreclose it, and records *why* blocks suffice and a WAL is not needed. The change
 > object it ships is the one [storage.md](storage.md) §4 already produces. When a decision here
 > changes, update [CLAUDE.md](../../CLAUDE.md) §9 and [storage.md](storage.md) §6 in the same edit.
+>
+> **Proposed amendments (unratified):** [page-service.md](page-service.md) §9–§10 would move the tee to
+> a single owner's commit point, seed replicas from a page-identical snapshot (a renumbered
+> whole-image serialization cannot take the primary's deltas), and add lineage/timelines, a
+> durability floor, retention, and a stream-break policy.
 
 ## 1. The decision, and why it falls out of the existing design
 

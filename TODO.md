@@ -424,6 +424,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   WAL: COW + the root swap already give atomicity *and* lock-free concurrency. Trade:
   write-amplification. A **logical** changeset stream is a separate higher-layer door, not
   foreclosed, not scheduled.
+- **Page service (proposal, unratified).** One owner process alone touches the database file and
+  serves pages and whole-commit deltas to client processes, each running its own engine, over a
+  local socket or SSH. It would replace shared multi-process mode and carry remote access, backup,
+  and replication. → [page-service.md](spec/design/page-service.md)
 
 ## Resource admission follow-through
 
