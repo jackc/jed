@@ -316,7 +316,10 @@ Let `N` be a base relation's exact row count.
   flattened in storage order, as literals; a NULL array has none; any other array — an unbound
   parameter, an outer column — has `default_array_elements` entries of unknown value
   (`estimator.toml`; PostgreSQL's assumed length for a non-constant array). A NULL element contributes
-  zero true rows, and an empty array gives zero. Unlike an IN list, elements are not de-duplicated
+  zero true rows, and an empty array gives zero. Over an interval set, and in column statistics, a
+  known element of a promoted element type ([cost.md §3](cost.md)) is first converted to the key's
+  type exactly as execution converts it; an element no key value can equal is read as NULL and
+  contributes zero rows. Unlike an IN list, elements are not de-duplicated
   structurally (column statistics de-duplicate known values by key, [statistics.md §6](statistics.md)).
   `ALL`, other operators, and other array operands keep `opaque`.
 - `<>`: `N - equality_rows`.

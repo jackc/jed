@@ -4266,6 +4266,14 @@ pub(crate) enum RExpr {
         /// element is a point in `lhs`'s key space — what lets `key = ANY(array)` bound a key scan
         /// (cost.md §3 "OR / IN-list").
         elem_exact: bool,
+        /// The element type is not the scalar type of `lhs`, but every element value either
+        /// converts exactly to it or provably equals none of its values — an integer of another
+        /// width, or an integer against a decimal in either direction — so a value-readable array
+        /// still yields points in `lhs`'s key space after conversion ([`point_value`]; cost.md §3
+        /// "OR / IN-list").
+        ///
+        /// [`point_value`]: crate::executor::access_encode::point_value
+        elem_promoted: bool,
         /// The comparison collation (spec/design/collation.md §1): an ordering quantifier over text
         /// sorts by it. The left operand's derivation for the array form (an array carries none), the
         /// subquery form's combined one when folded from it; `None` for `C` / a non-text pair.

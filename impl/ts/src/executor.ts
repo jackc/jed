@@ -24292,7 +24292,7 @@ function statisticsLeafSelectivity(
     if (expr.negated) rows = hasNull ? 0n : current.nonnullRows - rows;
     return statisticsSelectivity(rows, current.rows);
   }
-  if (estimatorAnyArray(expr) && expr.elemExact === true) {
+  if (estimatorAnyArray(expr) && (expr.elemExact === true || expr.elemPromoted === true)) {
     return statisticsAnyArraySelectivity(expr, rel, engine);
   }
   const comparison = statisticsComparison(expr, rel);
@@ -24314,7 +24314,8 @@ function statisticsLeafSelectivity(
 // statisticsAnyArraySelectivity estimates `column = ANY(array)` from column statistics
 // (statistics.md §6): the IN-list rule over the array's estimator elements — each distinct non-NULL
 // element by statistics key adds its equality rows, a NULL element adds none, and an element of
-// unknown value adds the NDV average.
+// unknown value adds the NDV average. A promoted element type converts each known element to the
+// column's type first, so an element no value can equal adds none.
 function statisticsAnyArraySelectivity(
   expr: Extract<RExpr, { kind: "quantified" }>,
   rel: ScopeRel,
@@ -24326,7 +24327,11 @@ function statisticsAnyArraySelectivity(
   if (current === null) return null;
   const seen = new Set<string>();
   let rows = 0n;
-  for (const elem of estimatorArrayElements(expr.array)) {
+  const keyType = rel.table.columns[column]!.type;
+  for (let elem of estimatorArrayElements(expr.array)) {
+    if (expr.elemPromoted === true && keyType.kind === "scalar") {
+      elem = estimatorPointElement(keyType.scalar, elem);
+    }
     if (estimatorIsNull(elem)) continue;
     const key = statisticsLiteralKey(elem, rel, column, engine);
     if (key !== null) {
@@ -25051,8 +25056,9 @@ function estimatorArrayElements(array: RExpr): RExpr[] {
 }
 
 // estimatorIntervalSpecs expands each `key = ANY(array)` disjunct into one equality disjunct per
-// estimator element, in order, so an array set estimates as the IN-list of its elements.
-function estimatorIntervalSpecs(specs: IntervalSpec[]): IntervalSpec[] {
+// estimator element, in order and converted to the key's type (estimatorPointElement), so an array
+// set estimates as the IN-list of its points.
+function estimatorIntervalSpecs(specs: IntervalSpec[], keyType: ScalarType): IntervalSpec[] {
   const out: IntervalSpec[] = [];
   for (const spec of specs) {
     if (spec.array === undefined) {
@@ -25060,10 +25066,27 @@ function estimatorIntervalSpecs(specs: IntervalSpec[]): IntervalSpec[] {
       continue;
     }
     for (const elem of estimatorArrayElements(spec.array)) {
-      out.push({ terms: [{ op: "eq", src: elem }] });
+      out.push({ terms: [{ op: "eq", src: estimatorPointElement(keyType, elem) }] });
     }
   }
   return out;
+}
+
+// estimatorPointElement converts a known estimator element of a `key = ANY(array)` to the key's
+// type exactly as execution converts it (pointValue, estimator.md §7): an element no key value can
+// equal becomes a NULL literal, contributing zero rows. An element of unknown value is unchanged.
+function estimatorPointElement(keyType: ScalarType, elem: RExpr): RExpr {
+  const c = estimatorValue(elem);
+  if (c === null || c.kind === "constNull") return elem;
+  let v: Value;
+  try {
+    v = rexprConstToValue(c);
+  } catch {
+    return elem;
+  }
+  const point = pointValue(keyType, v);
+  if (point === null) return { kind: "constNull" };
+  return point === v ? elem : valueToRExpr(point);
 }
 
 // estimatorAnyArray reports whether e is a `x = ANY(array)` the estimator reads as a disjunction of
@@ -25094,7 +25117,7 @@ function estimatorIntervalSelectivity(
   keyType: ScalarType,
 ): Selectivity {
   const parts: Selectivity[] = [];
-  for (const spec of estimatorIntervalSpecs(specs)) {
+  for (const spec of estimatorIntervalSpecs(specs, keyType)) {
     const structural = estimatorRangeTerms(spec.terms, keyType);
     const term =
       structural.kind === "zero"
@@ -25205,7 +25228,7 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
 function tupleMemberCount(m: TupleMember): number {
   if (m.specs === null) return 1;
   let count = 0;
-  for (const spec of estimatorIntervalSpecs(m.specs)) {
+  for (const spec of estimatorIntervalSpecs(m.specs, m.colType)) {
     if (estimatorRangeTerms(spec.terms, m.colType).kind !== "zero") count++;
   }
   return count;
@@ -25306,7 +25329,7 @@ function estimatorIntervalSelectivityWithStatistics(
   engine: Engine,
 ): Selectivity {
   const parts: Selectivity[] = [];
-  for (const spec of estimatorIntervalSpecs(specs)) {
+  for (const spec of estimatorIntervalSpecs(specs, keyType)) {
     const structural = estimatorRangeTerms(spec.terms, keyType);
     const term =
       structural.kind === "zero"
@@ -25926,9 +25949,11 @@ export function reduceIntervalUnion(
 }
 
 // asArrayPointSpec reports whether e is `key = ANY(array)` whose array elements are points of the
-// key (cost.md §3 "OR / IN-list"): ANY (not ALL) equality on the bare key column, an element type
-// exactly the key's type, the key's own collation (as asBoundTerm), and an array that is constant for
-// the whole scan.
+// key (cost.md §3 "OR / IN-list"): ANY (not ALL) equality on the bare key column, the key's own
+// collation (as asBoundTerm), and an array that is constant for the whole scan. The element type
+// is exactly the key's type, or a promoted type whose values convert exactly to the key
+// (elemPromoted); a promoted array must be readable as a value, since its elements convert through
+// pointValue.
 function asArrayPointSpec(
   e: RExpr,
   keyIdx: number,
@@ -25940,20 +25965,23 @@ function asArrayPointSpec(
     e.op !== "eq" ||
     e.all ||
     e.rowWise ||
-    e.elemExact !== true ||
+    (e.elemExact !== true && e.elemPromoted !== true) ||
     e.lhs.kind !== "column" ||
     e.lhs.index !== keyIdx
   )
     return null;
   const cmpColl = e.collation !== null ? e.collation.name : null;
-  if (cmpColl !== colColl || !isArrayPointSource(e.array, keyType)) return null;
+  if (cmpColl !== colColl || !isArrayPointSource(e.array, keyType, e.elemExact === true)) {
+    return null;
+  }
   return { terms: [], array: e.array };
 }
 
 // isArrayPointSource reports whether an `= ANY` array operand is constant for the whole scan and
 // readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
-// outer column, or a one-dimensional ARRAY[...] whose every element is a constant key source.
-function isArrayPointSource(e: RExpr, keyType: ScalarType): boolean {
+// outer column, or — for an exact element type only — a one-dimensional ARRAY[...] whose every
+// element is a constant key source.
+function isArrayPointSource(e: RExpr, keyType: ScalarType, exact: boolean): boolean {
   switch (e.kind) {
     case "param":
     case "constArray":
@@ -25961,7 +25989,7 @@ function isArrayPointSource(e: RExpr, keyType: ScalarType): boolean {
     case "outerColumn":
       return true;
     case "array":
-      if (e.nested) return false;
+      if (e.nested || !exact) return false;
       for (const elem of e.elements) {
         if (!isConstSource(elem, keyType, null)) return false;
       }
@@ -25971,9 +25999,39 @@ function isArrayPointSource(e: RExpr, keyType: ScalarType): boolean {
   }
 }
 
+// pointPromotable reports whether `key = ANY(elem[])` over a key of type key and elements of a
+// different type elem still reads as key points (cost.md §3 "OR / IN-list"): every element value
+// either converts exactly to the key's type or equals no key value. That holds for integers of
+// different widths and for an integer against a decimal in either direction.
+export function pointPromotable(key: ScalarType, elem: ScalarType): boolean {
+  return (
+    (isInteger(key) || isDecimal(key)) &&
+    (isInteger(elem) || isDecimal(elem)) &&
+    !(isDecimal(key) && isDecimal(elem))
+  );
+}
+
+// pointValue converts an element value of a `key = ANY(array)` to the key's type (cost.md §3 "OR /
+// IN-list"). null means no key value can equal the element — an integer outside the key's width,
+// a decimal with a fractional part or outside i64 — so it contributes no point. A NULL, and a
+// value already of the key's type, pass through unchanged (the same object).
+function pointValue(keyType: ScalarType, v: Value): Value | null {
+  if (isInteger(keyType) && v.kind === "int") return inRange(keyType, v.int) ? v : null;
+  if (isInteger(keyType) && v.kind === "decimal") {
+    const n = v.dec.toBigIntRound();
+    if (n === null || Decimal.fromBigInt(n).cmpValue(v.dec) !== 0 || !inRange(keyType, n)) {
+      return null;
+    }
+    return intValue(n);
+  }
+  if (isDecimal(keyType) && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
+  return v;
+}
+
 // arrayPointKeys encodes an array spec's elements as key points, in element order: a NULL array,
-// a NULL element, and an element no key can equal (an out-of-range integer, an unmapped collated
-// text) contribute no point, exactly as the equivalent IN-list's disjuncts would.
+// a NULL element, and an element no key can equal (an out-of-range integer, a non-integral decimal
+// against an integer key, an unmapped collated text) contribute no point, exactly as the equivalent
+// IN-list's disjuncts would.
 function arrayPointKeys(
   keyType: ScalarType,
   src: RExpr,
@@ -26003,7 +26061,9 @@ function arrayPointKeys(
   }
   if (v === null || v.kind !== "array") return keys;
   for (const elem of v.elements) {
-    const encoded = encodeValueKey(keyType, elem, coll);
+    const point = pointValue(keyType, elem);
+    if (point === null) continue;
+    const encoded = encodeValueKey(keyType, point, coll);
     if (encoded.kind === "key") keys.push(encoded.key);
   }
   return keys;
@@ -31226,6 +31286,11 @@ export type RExpr =
       // is a point in `lhs`'s key space — what lets `key = ANY(array)` bound a key scan (cost.md §3
       // "OR / IN-list"). Absent (false) for the folded quantified-subquery form.
       elemExact?: boolean;
+      // The element type is not the scalar type of `lhs`, but every element value either converts
+      // exactly to it or provably equals none of its values — an integer of another width, or an
+      // integer against a decimal in either direction — so a value-readable array still yields
+      // points in `lhs`'s key space after conversion (pointValue; cost.md §3 "OR / IN-list").
+      elemPromoted?: boolean;
     }
   // `width_bucket(operand, thresholds)` — the array-threshold variant (array-functions.md §14),
   // PostgreSQL's width_bucket_array: a binary search over a thresholds array ASSUMED sorted ascending

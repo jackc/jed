@@ -255,12 +255,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       (the fast path opens no boundary); custom-plan them if a workload needs it.
   - [x] **`key = ANY(array)` point sets** — a literal, cast, or bound array (`id = ANY($1)`) over a
     single-column PK or leading index key is one interval-set disjunct, a point per element at
-    execution; the estimator reads the elements (a bound array in its custom plan). →
+    execution; the estimator reads the elements (a bound array in its custom plan). A promoted
+    integer/decimal element type (`i32[]` against an `i64` key, `decimal[]` against an `i32` key)
+    converts each element to the key's type, dropping one no key can equal. →
     [cost.md §3](spec/design/cost.md) "OR / IN-list", [estimator.md §7](spec/design/estimator.md)
-    - [ ] _follow-on:_ the shapes that still full-scan — an array of a *promoted* element type (`i32[]`
-      against an `i64` key: convert each element, dropping unrepresentable ones), a folded uncorrelated
-      `IN (SELECT …)` / `= ANY(SELECT …)` (its value list is known only after folding), an ANY under
-      an AND leaf of an OR, and an index-nested-loop sibling array column. The `<> ALL` / `NOT IN`
+    - [ ] _follow-on:_ the shapes that still full-scan — a promoted `ARRAY[...]` constructor
+      (`ARRAY[1::i32, 3::i32]` against an `i64` key) and promoted floats (`f32[]` against an `f64`
+      key), a folded uncorrelated `IN (SELECT …)` / `= ANY(SELECT …)` (its value list is known only
+      after folding), an ANY under an AND leaf of an OR, and an index-nested-loop sibling array column. The `<> ALL` / `NOT IN`
       complement estimate, and pricing the
       residual's per-element `operator_eval` for a known array. A bench param generator that binds a
       real array (`any_array_pk` and `composite_pk_any` build one from eight scalars). _(size: M)_

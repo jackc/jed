@@ -1155,13 +1155,34 @@ fn estimator_array_point_sources(array: &ArrayPointSource, key_type: ScalarType)
     vec![stand_in; DEFAULT_ARRAY_ELEMENTS]
 }
 
-/// A plan-time array value's elements as the bound sources literals of the key type would produce
-/// (every element of an array whose element type is exactly the key's has one).
+/// A plan-time array value's elements as the bound sources literals of the key type would produce,
+/// each converted to the key's type exactly as execution converts it ([`point_value`]): an element
+/// no key value can equal becomes a NULL source, contributing zero rows (estimator.md §7).
 fn estimator_array_value_sources(arr: &ArrayVal, key_type: ScalarType) -> Vec<BoundSrc> {
     arr.elements
         .iter()
-        .filter_map(|elem| const_source(&value_to_rexpr(elem), key_type, None))
+        .filter_map(|elem| match point_value(key_type, elem) {
+            Some(point) => const_source(&value_to_rexpr(&point), key_type, None),
+            None => Some(BoundSrc::Null),
+        })
         .collect()
+}
+
+/// [`point_value`] over a known estimator element of a promoted `key = ANY(array)` (estimator.md
+/// §7): the element converted to the key's type, or a NULL literal when no key value can equal it.
+/// An element of unknown value is unchanged.
+pub(crate) fn estimator_point_element(
+    key_type: ScalarType,
+    elem: EstimatorValue<'_>,
+) -> EstimatorValue<'_> {
+    let Some(value) = estimator_value(&elem).and_then(|c| rexpr_const_to_value(&c).ok()) else {
+        return elem;
+    };
+    match point_value(key_type, &value) {
+        None => EstimatorValue::Bound(RExpr::ConstNull),
+        Some(Cow::Owned(point)) => EstimatorValue::Bound(value_to_rexpr(&point)),
+        Some(Cow::Borrowed(_)) => elem,
+    }
 }
 
 /// The element sources of an `= ANY` array operand for the estimator (estimator.md §7): an
@@ -2544,9 +2565,11 @@ pub(crate) fn reduce_interval_union(
 }
 
 /// Whether `e` is `key = ANY(array)` whose array elements are points of the key (cost.md §3
-/// "OR / IN-list"): ANY (not ALL) equality on the bare key column, an element type exactly the
-/// key's type, the key's own collation (as `collect_bound_terms`), and an array that is constant
-/// for the whole scan. Returns that array as one array spec.
+/// "OR / IN-list"): ANY (not ALL) equality on the bare key column, the key's own collation (as
+/// `collect_bound_terms`), and an array that is constant for the whole scan. The element type is
+/// exactly the key's type, or a promoted type whose values convert exactly to the key
+/// (`elem_promoted`); a promoted array must be readable as a value, since its elements convert
+/// through [`point_value`]. Returns that array as one array spec.
 fn as_array_point_spec(
     e: &RExpr,
     key_idx: usize,
@@ -2559,16 +2582,20 @@ fn as_array_point_spec(
         lhs,
         array,
         row_wise: false,
-        elem_exact: true,
+        elem_exact,
+        elem_promoted,
         collation,
     } = e
     else {
         return None;
     };
-    if !is_column(lhs, key_idx) || collation.as_ref().map(|c| c.name.as_str()) != col_coll {
+    if !(*elem_exact || *elem_promoted)
+        || !is_column(lhs, key_idx)
+        || collation.as_ref().map(|c| c.name.as_str()) != col_coll
+    {
         return None;
     }
-    let array = array_point_source(array, key_type)?;
+    let array = array_point_source(array, key_type, *elem_exact)?;
     Some(IntervalSpec {
         terms: Vec::new(),
         array: Some(array),
@@ -2577,8 +2604,9 @@ fn as_array_point_spec(
 
 /// The array-point source of an `= ANY` array operand that is constant for the whole scan and
 /// readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
-/// outer column, or a one-dimensional `ARRAY[...]` whose every element is a constant key source.
-fn array_point_source(e: &RExpr, key_type: ScalarType) -> Option<ArrayPointSource> {
+/// outer column, or — for an exact element type only — a one-dimensional `ARRAY[...]` whose every
+/// element is a constant key source.
+fn array_point_source(e: &RExpr, key_type: ScalarType, exact: bool) -> Option<ArrayPointSource> {
     match e {
         RExpr::Param(i) => Some(ArrayPointSource::Param(*i)),
         RExpr::ConstArray(a) => Some(ArrayPointSource::Const(a.clone())),
@@ -2590,7 +2618,7 @@ fn array_point_source(e: &RExpr, key_type: ScalarType) -> Option<ArrayPointSourc
         RExpr::Array {
             elems,
             nested: false,
-        } => elems
+        } if exact => elems
             .iter()
             .map(|elem| const_source(elem, key_type, None))
             .collect::<Option<Vec<_>>>()
@@ -2599,9 +2627,39 @@ fn array_point_source(e: &RExpr, key_type: ScalarType) -> Option<ArrayPointSourc
     }
 }
 
+/// Whether `key = ANY(elem[])` over a key of type `key` and elements of a different type `elem`
+/// still reads as key points (cost.md §3 "OR / IN-list"): every element value either converts
+/// exactly to the key's type or equals no key value. That holds for integers of different widths
+/// and for an integer against a decimal in either direction.
+pub(crate) fn point_promotable(key: ScalarType, elem: ScalarType) -> bool {
+    (key.is_integer() || key.is_decimal())
+        && (elem.is_integer() || elem.is_decimal())
+        && !(key.is_decimal() && elem.is_decimal())
+}
+
+/// Convert an element value of a `key = ANY(array)` to the key's type (cost.md §3 "OR / IN-list").
+/// `None` means no key value can equal the element — an integer outside the key's width, a decimal
+/// with a fractional part or outside `i64` — so it contributes no point. A NULL, and a value
+/// already of the key's type, pass through unchanged.
+pub(crate) fn point_value(key_type: ScalarType, v: &Value) -> Option<Cow<'_, Value>> {
+    match v {
+        Value::Int(n) if key_type.is_integer() => key_type.in_range(*n).then_some(Cow::Borrowed(v)),
+        Value::Decimal(d) if key_type.is_integer() => {
+            let n = d.to_i64_round()?;
+            (Decimal::from_i64(n).cmp_value(d) == std::cmp::Ordering::Equal && key_type.in_range(n))
+                .then_some(Cow::Owned(Value::Int(n)))
+        }
+        Value::Int(n) if key_type.is_decimal() => {
+            Some(Cow::Owned(Value::Decimal(Decimal::from_i64(*n))))
+        }
+        _ => Some(Cow::Borrowed(v)),
+    }
+}
+
 /// Encode an array spec's elements as key points, in element order: a NULL array, a NULL element,
-/// and an element no key can equal (an out-of-range integer, an unmapped collated text) contribute
-/// no point, exactly as the equivalent IN-list's disjuncts would. A multidimensional array value's
+/// and an element no key can equal (an out-of-range integer, a non-integral decimal against an
+/// integer key, an unmapped collated text) contribute no point, exactly as the equivalent IN-list's
+/// disjuncts would. A multidimensional array value's
 /// elements are flat in storage order.
 fn array_point_keys(
     key_type: ScalarType,
@@ -2642,10 +2700,12 @@ fn array_value_point_keys(
 ) -> Vec<Vec<u8>> {
     arr.elements
         .iter()
-        .filter_map(|elem| match encode_value_key(key_type, elem, coll) {
-            BoundKey::Key(k) => Some(k),
-            BoundKey::Null | BoundKey::OutOfRange => None,
-        })
+        .filter_map(
+            |elem| match encode_value_key(key_type, &*point_value(key_type, elem)?, coll) {
+                BoundKey::Key(k) => Some(k),
+                BoundKey::Null | BoundKey::OutOfRange => None,
+            },
+        )
         .collect()
 }
 

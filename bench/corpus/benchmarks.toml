@@ -337,6 +337,35 @@ gen = "int_uniform"
 min = 1
 max = 1000
 
+# A promoted `key = ANY(array)` (query.any_array_point_lookup): an outer row's integer[] list of keys
+# bounds a bigint PK per outer row, the common shape of an int-array column referencing bigint ids.
+# Each list holds eight keys of a 100k-row table. Before the promoted-element slice jed full-scanned the
+# inner table for the outer row, since the element type was not exactly the key's; it now converts
+# each element to the key's type and probes it.
+[[bench]]
+name = "any_array_pk_promoted"
+description = "bigint PK = ANY(outer integer[] column) on 100k rows; eight converted point probes vs. a full scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT l.k, (SELECT count(*) FROM promoted_orders o WHERE o.id = ANY(l.ids)) FROM promoted_lists l WHERE l.k = $1"
+warmup = 200
+iterations = 3000
+seed = 4292
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS promoted_lists",
+  "DROP TABLE IF EXISTS promoted_orders",
+  "CREATE TABLE promoted_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO promoted_orders SELECT g, g * 3 FROM generate_series(1, 100000) AS g",
+  "CREATE TABLE promoted_lists (k bigint PRIMARY KEY, ids integer[])",
+  "INSERT INTO promoted_lists SELECT g, ARRAY[CAST(CAST(g AS bigint) * 7919 % 100000 + 1 AS integer), CAST(CAST(g AS bigint) * 104729 % 100000 + 1 AS integer), CAST(CAST(g AS bigint) * 1299709 % 100000 + 1 AS integer), CAST(CAST(g AS bigint) * 15485863 % 100000 + 1 AS integer), CAST(CAST(g AS bigint) * 49979687 % 100000 + 1 AS integer), CAST(CAST(g AS bigint) * 86028121 % 100000 + 1 AS integer), CAST(CAST(g AS bigint) * 122949823 % 100000 + 1 AS integer), CAST(CAST(g AS bigint) * 179424673 % 100000 + 1 AS integer)] FROM generate_series(1, 1000) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000
+
 # Bounded LIMIT streaming over an ordered secondary-index range
 # (query.bounded_limit_streaming). The range admits 65–129 rows, but ORDER BY the same index lets
 # each core stop its index walk and table point-lookups after five rows. Before this slice the bound

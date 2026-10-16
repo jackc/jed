@@ -1299,6 +1299,11 @@ type rExpr struct {
 	// each element is a point in `lhs`'s key space — what lets `key = ANY(array)` bound a key scan
 	// (cost.md §3 "OR / IN-list").
 	elemExact bool
+	// reQuantified: the element type is not the scalar type of `lhs` but every element value either
+	// converts exactly to it or provably equals none of its values — an integer of another width, or
+	// an integer against a decimal in either direction — so a value-readable array still yields
+	// points in `lhs`'s key space after conversion (pointValue; cost.md §3 "OR / IN-list").
+	elemPromoted bool
 	// reQuantified: the folded form of a ROW-VALUED quantified subquery (grammar.md §26) — each
 	// element is compared by the row-constructor 3VL (Eq3/Lt3/Gt3, like reCompare), not the
 	// composite total order the array form uses for composite elements (array-functions.md §13).

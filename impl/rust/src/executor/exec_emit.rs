@@ -1485,6 +1485,7 @@ impl Engine {
                         array: Box::new(RExpr::ConstArray(Box::new(arr))),
                         row_wise: row_valued,
                         elem_exact: false,
+                        elem_promoted: false,
                         collation,
                     }
                 }

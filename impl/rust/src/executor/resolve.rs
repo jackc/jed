@@ -1562,9 +1562,9 @@ pub(crate) fn resolve_quantified(
     } else {
         None
     };
-    let elem_exact = match (ctx_of(&lt), ctx_of(&elem)) {
-        (Some(l), Some(e)) => l == e,
-        _ => false,
+    let (elem_exact, elem_promoted) = match (ctx_of(&lt), ctx_of(&elem)) {
+        (Some(l), Some(e)) => (l == e, l != e && point_promotable(l, e)),
+        _ => (false, false),
     };
     Ok((
         RExpr::Quantified {
@@ -1574,6 +1574,7 @@ pub(crate) fn resolve_quantified(
             array: Box::new(ra),
             row_wise: false,
             elem_exact,
+            elem_promoted,
             collation,
         },
         ResolvedType::Bool,

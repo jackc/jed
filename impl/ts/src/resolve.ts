@@ -39,6 +39,7 @@ import {
   rtCollatable,
   rtName,
   scalarPairCastable,
+  pointPromotable,
   undefinedColumn,
   valueToRExpr,
 } from "./executor.ts";
@@ -4862,6 +4863,7 @@ export function resolveQuantified(
   const lc = ctxOf(rl.type);
   const ec = ctxOf(elem);
   const elemExact = lc !== null && ec !== null && lc === ec;
+  const elemPromoted = !elemExact && lc !== null && ec !== null && pointPromotable(lc, ec);
   return {
     node: {
       kind: "quantified",
@@ -4872,6 +4874,7 @@ export function resolveQuantified(
       rowWise: false,
       collation,
       elemExact,
+      elemPromoted,
     },
     type: { kind: "bool" },
   };

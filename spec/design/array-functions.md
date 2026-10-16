@@ -669,7 +669,8 @@ with `# cost:` in the corpus.
 
 As a **WHERE access path**, `key = ANY(array)` over a single-column PK or leading B-tree index key
 lowers like the IN-list it spells: a point per element of a constant array whose element type is
-exactly the key's ([cost.md §3](cost.md) "OR / IN-list"). The node above is still the residual filter,
+the key's, or an integer/decimal type whose elements convert exactly to it ([cost.md §3](cost.md)
+"OR / IN-list"). The node above is still the residual filter,
 so this per-row cost is unchanged; only the scanned rows shrink.
 
 ### 11.5 Ratified divergences
