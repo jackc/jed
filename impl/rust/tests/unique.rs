@@ -44,6 +44,7 @@ fn err_msg(db: &mut Session, sql: &str) -> String {
     db.query_outcome(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .message
+        .clone()
 }
 
 fn index_names(db: &Session, table: &str) -> Vec<(String, bool)> {

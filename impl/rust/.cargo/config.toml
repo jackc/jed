@@ -16,9 +16,9 @@
 # The deeper §13 engine gap this stack bump originally flagged — deeply-nested UNTRUSTED input
 # overflowing the native stack during parse/resolve, BEFORE cost metering, so the 54P01 cost ceiling
 # can't catch it — is now CLOSED in the engine itself: a deterministic max expression-nesting depth
-# (parser::MAX_EXPR_DEPTH = 256) aborts with 54001 statement_too_complex (spec/design/cost.md §7;
-# impl/rust/tests/depth_limit.rs). Because the limit (256) is well below the debug giant-frame stack
-# ceiling, a rejected statement never recurses deep enough to overflow even in debug — this knob
-# remains only for the pre-existing 80-deep eval test above, not for the new gate.
+# (parser::MAX_EXPR_DEPTH = 256) aborts with 54001 statement_too_complex (spec/design/cost.md §7),
+# and an optimized build keeps any statement at that depth within a 1 MiB native stack (§7.1).
+# impl/rust/tests/depth_limit.rs checks that budget on threads it spawns with an explicit stack
+# size, so it does not depend on this knob, which remains only for the 80-deep eval test above.
 [env]
 RUST_MIN_STACK = "8388608" # 8 MiB

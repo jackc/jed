@@ -14,237 +14,13 @@ pub(crate) fn resolve_binary(
 ) -> Result<(RExpr, ResolvedType)> {
     match op {
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-            // jsonb `-` is the delete operator (json-sql-functions.md §1, J6), NOT arithmetic — its
-            // right operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a
-            // jsonb LHS with `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ *
-            // / %` over a jsonb operand fall through and 42804 in the numeric path.)
-            if matches!(op, BinaryOp::Sub) {
-                let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-                if matches!(lt, ResolvedType::Jsonb) {
-                    return resolve_jsonb_delete(scope, false, lhs, rhs, rl, agg, params);
-                }
-            }
-            // Arithmetic is overloaded across integer and decimal. Resolve the operand pair
-            // (an integer literal adapts to an integer sibling), then pick the family: both
-            // integer → integer arithmetic (promotion tower); at least one decimal → decimal
-            // arithmetic (the integer operand widens at eval); a text/boolean operand is a
-            // 42804 (spec/design/decimal.md §4).
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
-            // Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-`
-            // difference, `*` intersection over two ranges. A range operand in any of these three is
-            // the set-op axis — both operands must be ranges of a common element type, else 42883
-            // (matching PG's "operator does not exist"); the numeric/temporal arithmetic below never
-            // sees a range. `/` and `%` have no range meaning and fall straight through.
-            if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
-                && (matches!(lt, ResolvedType::Range(_)) || matches!(rt, ResolvedType::Range(_)))
-            {
-                return resolve_range_set_op(op, rl, lt, rr, rt);
-            }
-            // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32
-            // (days between), date ± interval → timestamp. Checked BEFORE the interval/timestamp
-            // rules below: a `date ± interval` pair has an interval operand, which would otherwise
-            // make `temporal_arith_result` report a 42804 (date is not one of its temporal types).
-            // Any other arithmetic combination involving a date is a 42804 from `date_arith_result`.
-            if matches!(lt, ResolvedType::Date) || matches!(rt, ResolvedType::Date) {
-                let result = date_arith_result(op, &lt, &rt)?;
-                let aop = if matches!(op, BinaryOp::Add) {
-                    ArithOp::Add
-                } else {
-                    ArithOp::Sub
-                };
-                return Ok((
-                    RExpr::Arith {
-                        op: aop,
-                        lhs: Box::new(rl),
-                        rhs: Box::new(rr),
-                        result,
-                    },
-                    resolved_type_of(result),
-                ));
-            }
-            // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
-            // interval * number, number * interval (commute), interval / number. Checked before
-            // the ±-only temporal rule below.
-            if let Some(res) = interval_scale_result(op, &lt, &rt) {
-                let result = res?;
-                let aop = if matches!(op, BinaryOp::Mul) {
-                    ArithOp::Mul
-                } else {
-                    ArithOp::Div
-                };
-                return Ok((
-                    RExpr::Arith {
-                        op: aop,
-                        lhs: Box::new(rl),
-                        rhs: Box::new(rr),
-                        result,
-                    },
-                    resolved_type_of(result),
-                ));
-            }
-            // Temporal arithmetic (spec/design/interval.md §5): interval ± interval, timestamp[tz]
-            // ± interval, interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval.
-            // The eval dispatches on the value kinds; here we settle the result type. A temporal
-            // operand in any other combination is a 42804.
-            if let Some(res) = temporal_arith_result(op, &lt, &rt) {
-                let result = res?;
-                let aop = if matches!(op, BinaryOp::Add) {
-                    ArithOp::Add
-                } else {
-                    ArithOp::Sub
-                };
-                return Ok((
-                    RExpr::Arith {
-                        op: aop,
-                        lhs: Box::new(rl),
-                        rhs: Box::new(rr),
-                        result,
-                    },
-                    resolved_type_of(result),
-                ));
-            }
-            // Float arithmetic (spec/design/float.md §5): float ⊕ float → float, mixed widths
-            // PROMOTE to f64 first (the implicit f32 → f64 cast). A float paired with
-            // any non-float family is a 42804 (the strict island), reported by require_numeric
-            // below since one side is Float. A pure float pair (or float × NULL) is handled here.
-            if matches!(lt, ResolvedType::Float(_)) || matches!(rt, ResolvedType::Float(_)) {
-                match promote_float_arith(rl, lt, rr, rt) {
-                    Some((rl, rr, result)) => {
-                        let aop = match op {
-                            BinaryOp::Add => ArithOp::Add,
-                            BinaryOp::Sub => ArithOp::Sub,
-                            BinaryOp::Mul => ArithOp::Mul,
-                            BinaryOp::Div => ArithOp::Div,
-                            BinaryOp::Mod => ArithOp::Mod,
-                            _ => unreachable!(),
-                        };
-                        return Ok((
-                            RExpr::Arith {
-                                op: aop,
-                                lhs: Box::new(rl),
-                                rhs: Box::new(rr),
-                                result,
-                            },
-                            ResolvedType::Float(result),
-                        ));
-                    }
-                    // A float paired with a non-float, non-NULL family — the strict island
-                    // (int/decimal × float is 42804, spec/design/float.md §6).
-                    None => {
-                        return Err(type_error("arithmetic operators require numeric operands"));
-                    }
-                }
-            }
-            require_numeric_operand(&lt)?;
-            require_numeric_operand(&rt)?;
-            let aop = match op {
-                BinaryOp::Add => ArithOp::Add,
-                BinaryOp::Sub => ArithOp::Sub,
-                BinaryOp::Mul => ArithOp::Mul,
-                BinaryOp::Div => ArithOp::Div,
-                BinaryOp::Mod => ArithOp::Mod,
-                _ => unreachable!(),
-            };
-            let (result, rty) = if lt == ResolvedType::Decimal || rt == ResolvedType::Decimal {
-                (ScalarType::Decimal, ResolvedType::Decimal)
-            } else {
-                let p = promote(&lt, &rt);
-                (p, ResolvedType::Int(p))
-            };
-            Ok((
-                RExpr::Arith {
-                    op: aop,
-                    lhs: Box::new(rl),
-                    rhs: Box::new(rr),
-                    result,
-                },
-                rty,
-            ))
+            resolve_arith(scope, op, lhs, rhs, agg, params)
         }
         BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
-            // Comparison is overloaded across families: integer×integer or text×text.
-            // Resolve the operands (a literal adapts to its sibling; text literals stay
-            // text), then require they be comparable — a mixed integer/text pair is 42804.
-            // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
-            // `ROW(a, b) op (SELECT x, y …)` — a row constructor compared with a subquery is a
-            // ROW-VALUED subquery (grammar.md §26): the body must have exactly as many columns as the
-            // row, and its single row compares as an anonymous composite. Only this direction — a
-            // subquery on the left stays a scalar subquery (42601 for >1 column), like PostgreSQL.
-            let (rl, lt, rr, rt) = match (lhs, rhs) {
-                (Expr::Row(items), Expr::ScalarSubquery(q)) => {
-                    let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-                    let (plan, rt) = plan_row_subquery(scope, q, items.len(), params)?;
-                    let rr = RExpr::Subquery {
-                        plan: Box::new(plan),
-                        kind: SubqueryKind::Scalar,
-                        lhs: None,
-                        negated: false,
-                        row_valued: true,
-                    };
-                    (rl, lt, rr, rt)
-                }
-                _ => resolve_operand_pair(scope, lhs, rhs, agg, params)?,
-            };
-            classify_comparable(&lt, &rt)?;
-            // A mixed-width float comparison promotes the f32 side to f64 first (the
-            // implicit cast — spec/design/float.md §2/§3), so the runtime compare sees one width.
-            let (rl, rr) =
-                if matches!(lt, ResolvedType::Float(_)) && matches!(rt, ResolvedType::Float(_)) {
-                    (widen_float_to_f64(rl, &lt), widen_float_to_f64(rr, &rt))
-                } else {
-                    (rl, rr)
-                };
-            let cop = match op {
-                BinaryOp::Eq => CmpOp::Eq,
-                BinaryOp::Ne => CmpOp::Ne,
-                BinaryOp::Lt => CmpOp::Lt,
-                BinaryOp::Gt => CmpOp::Gt,
-                BinaryOp::Le => CmpOp::Le,
-                BinaryOp::Ge => CmpOp::Ge,
-                _ => unreachable!(),
-            };
-            // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text or
-            // text[]×text[] comparison is collatable; for any other operand family collation is
-            // irrelevant (and a COLLATE on a non-collatable operand was already rejected 42804 at the
-            // Collate node). Each
-            // operand's derivation (explicit COLLATE / implicit column collation / none) is combined
-            // per PG's rules: two different EXPLICIT collations conflict (42P21); two different
-            // IMPLICIT collations are indeterminate (42P22 when consumed here). The derivation runs
-            // for ALL comparison ops including `=`/`<>` (PG raises the conflict regardless), even
-            // though `=`/`<>` ignore the collation at eval (byte equality, §7).
-            let collation = if lt.collatable() && rt.collatable() {
-                let d =
-                    combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?;
-                resolve_deriv(scope.catalog, d)?
-            } else {
-                None
-            };
-            Ok((
-                RExpr::Compare {
-                    op: cop,
-                    lhs: Box::new(rl),
-                    rhs: Box::new(rr),
-                    collation,
-                },
-                ResolvedType::Bool,
-            ))
+            resolve_comparison(scope, op, lhs, rhs, agg, params)
         }
-        BinaryOp::And | BinaryOp::Or => {
-            let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-            let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
-            // A non-boolean operand is located at that operand (PostgreSQL's coerce_to_boolean).
-            require_bool(&lt, "AND/OR requires boolean operands")
-                .map_err(|e| e.with_position(lhs.location().0))?;
-            require_bool(&rt, "AND/OR requires boolean operands")
-                .map_err(|e| e.with_position(rhs.location().0))?;
-            let node = if matches!(op, BinaryOp::And) {
-                RExpr::And(Box::new(rl), Box::new(rr))
-            } else {
-                RExpr::Or(Box::new(rl), Box::new(rr))
-            };
-            Ok((node, ResolvedType::Bool))
-        }
-        BinaryOp::Concat => resolve_concat(scope, lhs, rhs, agg, params),
+        BinaryOp::And | BinaryOp::Or => resolve_and_or(scope, op, lhs, rhs, agg, params),
+        BinaryOp::Concat => outline(|| resolve_concat(scope, lhs, rhs, agg, params)),
         // The containment/overlap operators (@>/<@/&&, shared by arrays and ranges) and the five
         // range-only positional/adjacency operators (<</>>/&</&>/-|-) all dispatch here: the operand
         // type chooses the array axis (array-functions.md §10) or the range axis (range-functions.md §3).
@@ -255,23 +31,27 @@ pub(crate) fn resolve_binary(
         | BinaryOp::StrictlyRight
         | BinaryOp::NotExtendRight
         | BinaryOp::NotExtendLeft
-        | BinaryOp::Adjacent => resolve_set_op(scope, op, lhs, rhs, agg, params),
+        | BinaryOp::Adjacent => outline(|| resolve_set_op(scope, op, lhs, rhs, agg, params)),
         // The jsonb accessor operators (spec/design/json-sql-functions.md §1, J4).
         BinaryOp::JsonGet
         | BinaryOp::JsonGetText
         | BinaryOp::JsonGetPath
-        | BinaryOp::JsonGetPathText => resolve_json_access(scope, op, lhs, rhs, agg, params),
+        | BinaryOp::JsonGetPathText => {
+            outline(|| resolve_json_access(scope, op, lhs, rhs, agg, params))
+        }
         // The jsonb key-existence operators (spec/design/json-sql-functions.md §1, J5).
-        BinaryOp::JsonHasKey => resolve_json_has_key(scope, HasKeyKind::One, lhs, rhs, agg, params),
+        BinaryOp::JsonHasKey => {
+            outline(|| resolve_json_has_key(scope, HasKeyKind::One, lhs, rhs, agg, params))
+        }
         BinaryOp::JsonHasAnyKey => {
-            resolve_json_has_key(scope, HasKeyKind::Any, lhs, rhs, agg, params)
+            outline(|| resolve_json_has_key(scope, HasKeyKind::Any, lhs, rhs, agg, params))
         }
         BinaryOp::JsonHasAllKeys => {
-            resolve_json_has_key(scope, HasKeyKind::All, lhs, rhs, agg, params)
+            outline(|| resolve_json_has_key(scope, HasKeyKind::All, lhs, rhs, agg, params))
         }
         // The jsonb delete-at-path operator `#-` (spec/design/json-sql-functions.md §1, J6). `||`
         // and `-` (delete) are dispatched by operand type in resolve_concat / the arithmetic arm.
-        BinaryOp::JsonDeletePath => {
+        BinaryOp::JsonDeletePath => outline(|| {
             let (rbase, base_ty) = resolve(scope, lhs, Some(ScalarType::Jsonb), agg, params)?;
             match base_ty {
                 ResolvedType::Jsonb | ResolvedType::Null => {}
@@ -283,10 +63,10 @@ pub(crate) fn resolve_binary(
                 }
             }
             resolve_jsonb_delete(scope, true, lhs, rhs, rbase, agg, params)
-        }
+        }),
         // `jsonb @? jsonpath` = jsonb_path_exists, `jsonb @@ jsonpath` = jsonb_path_match
         // (jsonpath.md §6). Both reuse the jsonpath kernels.
-        BinaryOp::JsonPathExists | BinaryOp::JsonPathMatch => {
+        BinaryOp::JsonPathExists | BinaryOp::JsonPathMatch => outline(|| {
             let (sym, kind) = if matches!(op, BinaryOp::JsonPathExists) {
                 ("@?", JsonPathFnKind::ExistsSilent)
             } else {
@@ -314,8 +94,277 @@ pub(crate) fn resolve_binary(
                 },
                 ResolvedType::Bool,
             ))
+        }),
+    }
+}
+
+/// Resolve an arithmetic operator `+ - * / %`. Its own never-inlined frame: it is on the recursive path of an operator chain
+/// (spec/design/cost.md §7.1).
+#[inline(never)]
+fn resolve_arith(
+    scope: &Scope,
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    // jsonb `-` is the delete operator (json-sql-functions.md §1, J6), NOT arithmetic — its
+    // right operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a
+    // jsonb LHS with `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ *
+    // / %` over a jsonb operand fall through and 42804 in the numeric path.)
+    if matches!(op, BinaryOp::Sub) {
+        let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+        if matches!(lt, ResolvedType::Jsonb) {
+            return resolve_jsonb_delete(scope, false, lhs, rhs, rl, agg, params);
         }
     }
+    // Arithmetic is overloaded across integer and decimal. Resolve the operand pair
+    // (an integer literal adapts to an integer sibling), then pick the family: both
+    // integer → integer arithmetic (promotion tower); at least one decimal → decimal
+    // arithmetic (the integer operand widens at eval); a text/boolean operand is a
+    // 42804 (spec/design/decimal.md §4).
+    let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+    // The rest of the arm runs in its own frame, off the recursive path (cost.md §7.1).
+    outline(|| {
+        // Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-`
+        // difference, `*` intersection over two ranges. A range operand in any of these three is
+        // the set-op axis — both operands must be ranges of a common element type, else 42883
+        // (matching PG's "operator does not exist"); the numeric/temporal arithmetic below never
+        // sees a range. `/` and `%` have no range meaning and fall straight through.
+        if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+            && (matches!(lt, ResolvedType::Range(_)) || matches!(rt, ResolvedType::Range(_)))
+        {
+            return resolve_range_set_op(op, rl, lt, rr, rt);
+        }
+        // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32
+        // (days between), date ± interval → timestamp. Checked BEFORE the interval/timestamp
+        // rules below: a `date ± interval` pair has an interval operand, which would otherwise
+        // make `temporal_arith_result` report a 42804 (date is not one of its temporal types).
+        // Any other arithmetic combination involving a date is a 42804 from `date_arith_result`.
+        if matches!(lt, ResolvedType::Date) || matches!(rt, ResolvedType::Date) {
+            let result = date_arith_result(op, &lt, &rt)?;
+            let aop = if matches!(op, BinaryOp::Add) {
+                ArithOp::Add
+            } else {
+                ArithOp::Sub
+            };
+            return Ok((
+                RExpr::Arith {
+                    op: aop,
+                    lhs: Box::new(rl),
+                    rhs: Box::new(rr),
+                    result,
+                },
+                resolved_type_of(result),
+            ));
+        }
+        // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
+        // interval * number, number * interval (commute), interval / number. Checked before
+        // the ±-only temporal rule below.
+        if let Some(res) = interval_scale_result(op, &lt, &rt) {
+            let result = res?;
+            let aop = if matches!(op, BinaryOp::Mul) {
+                ArithOp::Mul
+            } else {
+                ArithOp::Div
+            };
+            return Ok((
+                RExpr::Arith {
+                    op: aop,
+                    lhs: Box::new(rl),
+                    rhs: Box::new(rr),
+                    result,
+                },
+                resolved_type_of(result),
+            ));
+        }
+        // Temporal arithmetic (spec/design/interval.md §5): interval ± interval, timestamp[tz]
+        // ± interval, interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval.
+        // The eval dispatches on the value kinds; here we settle the result type. A temporal
+        // operand in any other combination is a 42804.
+        if let Some(res) = temporal_arith_result(op, &lt, &rt) {
+            let result = res?;
+            let aop = if matches!(op, BinaryOp::Add) {
+                ArithOp::Add
+            } else {
+                ArithOp::Sub
+            };
+            return Ok((
+                RExpr::Arith {
+                    op: aop,
+                    lhs: Box::new(rl),
+                    rhs: Box::new(rr),
+                    result,
+                },
+                resolved_type_of(result),
+            ));
+        }
+        // Float arithmetic (spec/design/float.md §5): float ⊕ float → float, mixed widths
+        // PROMOTE to f64 first (the implicit f32 → f64 cast). A float paired with
+        // any non-float family is a 42804 (the strict island), reported by require_numeric
+        // below since one side is Float. A pure float pair (or float × NULL) is handled here.
+        if matches!(lt, ResolvedType::Float(_)) || matches!(rt, ResolvedType::Float(_)) {
+            match promote_float_arith(rl, lt, rr, rt) {
+                Some((rl, rr, result)) => {
+                    let aop = match op {
+                        BinaryOp::Add => ArithOp::Add,
+                        BinaryOp::Sub => ArithOp::Sub,
+                        BinaryOp::Mul => ArithOp::Mul,
+                        BinaryOp::Div => ArithOp::Div,
+                        BinaryOp::Mod => ArithOp::Mod,
+                        _ => unreachable!(),
+                    };
+                    return Ok((
+                        RExpr::Arith {
+                            op: aop,
+                            lhs: Box::new(rl),
+                            rhs: Box::new(rr),
+                            result,
+                        },
+                        ResolvedType::Float(result),
+                    ));
+                }
+                // A float paired with a non-float, non-NULL family — the strict island
+                // (int/decimal × float is 42804, spec/design/float.md §6).
+                None => {
+                    return Err(type_error("arithmetic operators require numeric operands"));
+                }
+            }
+        }
+        require_numeric_operand(&lt)?;
+        require_numeric_operand(&rt)?;
+        let aop = match op {
+            BinaryOp::Add => ArithOp::Add,
+            BinaryOp::Sub => ArithOp::Sub,
+            BinaryOp::Mul => ArithOp::Mul,
+            BinaryOp::Div => ArithOp::Div,
+            BinaryOp::Mod => ArithOp::Mod,
+            _ => unreachable!(),
+        };
+        let (result, rty) = if lt == ResolvedType::Decimal || rt == ResolvedType::Decimal {
+            (ScalarType::Decimal, ResolvedType::Decimal)
+        } else {
+            let p = promote(&lt, &rt);
+            (p, ResolvedType::Int(p))
+        };
+        Ok((
+            RExpr::Arith {
+                op: aop,
+                lhs: Box::new(rl),
+                rhs: Box::new(rr),
+                result,
+            },
+            rty,
+        ))
+    })
+}
+
+/// Resolve a comparison operator `= <> < > <= >=`. Its own never-inlined frame: it is on the recursive path of an operator chain
+/// (spec/design/cost.md §7.1).
+#[inline(never)]
+fn resolve_comparison(
+    scope: &Scope,
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    // Comparison is overloaded across families: integer×integer or text×text.
+    // Resolve the operands (a literal adapts to its sibling; text literals stay
+    // text), then require they be comparable — a mixed integer/text pair is 42804.
+    // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
+    // `ROW(a, b) op (SELECT x, y …)` — a row constructor compared with a subquery is a
+    // ROW-VALUED subquery (grammar.md §26): the body must have exactly as many columns as the
+    // row, and its single row compares as an anonymous composite. Only this direction — a
+    // subquery on the left stays a scalar subquery (42601 for >1 column), like PostgreSQL.
+    let (rl, lt, rr, rt) = match (lhs, rhs) {
+        (Expr::Row(items), Expr::ScalarSubquery(q)) => outline(|| {
+            let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+            let (plan, rt) = plan_row_subquery(scope, q, items.len(), params)?;
+            let rr = RExpr::Subquery {
+                plan: Box::new(plan),
+                kind: SubqueryKind::Scalar,
+                lhs: None,
+                negated: false,
+                row_valued: true,
+            };
+            Ok((rl, lt, rr, rt))
+        })?,
+        _ => resolve_operand_pair(scope, lhs, rhs, agg, params)?,
+    };
+    // The rest of the arm runs in its own frame, off the recursive path (cost.md §7.1).
+    outline(|| {
+        classify_comparable(&lt, &rt)?;
+        // A mixed-width float comparison promotes the f32 side to f64 first (the
+        // implicit cast — spec/design/float.md §2/§3), so the runtime compare sees one width.
+        let (rl, rr) =
+            if matches!(lt, ResolvedType::Float(_)) && matches!(rt, ResolvedType::Float(_)) {
+                (widen_float_to_f64(rl, &lt), widen_float_to_f64(rr, &rt))
+            } else {
+                (rl, rr)
+            };
+        let cop = match op {
+            BinaryOp::Eq => CmpOp::Eq,
+            BinaryOp::Ne => CmpOp::Ne,
+            BinaryOp::Lt => CmpOp::Lt,
+            BinaryOp::Gt => CmpOp::Gt,
+            BinaryOp::Le => CmpOp::Le,
+            BinaryOp::Ge => CmpOp::Ge,
+            _ => unreachable!(),
+        };
+        // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text or
+        // text[]×text[] comparison is collatable; for any other operand family collation is
+        // irrelevant (and a COLLATE on a non-collatable operand was already rejected 42804 at the
+        // Collate node). Each
+        // operand's derivation (explicit COLLATE / implicit column collation / none) is combined
+        // per PG's rules: two different EXPLICIT collations conflict (42P21); two different
+        // IMPLICIT collations are indeterminate (42P22 when consumed here). The derivation runs
+        // for ALL comparison ops including `=`/`<>` (PG raises the conflict regardless), even
+        // though `=`/`<>` ignore the collation at eval (byte equality, §7).
+        let collation = if lt.collatable() && rt.collatable() {
+            let d = combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?;
+            resolve_deriv(scope.catalog, d)?
+        } else {
+            None
+        };
+        Ok((
+            RExpr::Compare {
+                op: cop,
+                lhs: Box::new(rl),
+                rhs: Box::new(rr),
+                collation,
+            },
+            ResolvedType::Bool,
+        ))
+    })
+}
+
+/// Resolve `AND` / `OR`. Its own never-inlined frame: it is on the recursive path of an operator chain
+/// (spec/design/cost.md §7.1).
+#[inline(never)]
+fn resolve_and_or(
+    scope: &Scope,
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+    let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
+    // A non-boolean operand is located at that operand (PostgreSQL's coerce_to_boolean).
+    require_bool(&lt, "AND/OR requires boolean operands")
+        .map_err(|e| e.with_position(lhs.location().0))?;
+    require_bool(&rt, "AND/OR requires boolean operands")
+        .map_err(|e| e.with_position(rhs.location().0))?;
+    let node = if matches!(op, BinaryOp::And) {
+        RExpr::And(Box::new(rl), Box::new(rr))
+    } else {
+        RExpr::Or(Box::new(rl), Box::new(rr))
+    };
+    Ok((node, ResolvedType::Bool))
 }
 
 /// Resolve a json/jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1).
@@ -1925,33 +1974,44 @@ pub(crate) fn resolve_operand_pair(
 ) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
     let lhs_lit = is_adaptable_operand(lhs);
     let rhs_lit = is_adaptable_operand(rhs);
-    let (rl, lt, rr, rt) = if lhs_lit && rhs_lit {
-        // Two bare adaptable operands: no column context. Default an integer literal (and a
-        // bind parameter) to i64; a string literal stays text (no bytea context — types.md §6).
-        let (rl, lt) = resolve(scope, lhs, Some(ScalarType::Int64), agg, params)?;
-        let (rr, rt) = resolve(scope, rhs, Some(ScalarType::Int64), agg, params)?;
-        (rl, lt, rr, rt)
-    } else if lhs_lit {
+    // Few temporaries on purpose: this frame is on the recursive path of every operator chain
+    // (spec/design/cost.md §7.1).
+    if lhs_lit && !rhs_lit {
+        // The adaptable LHS takes its context from the RHS, so the RHS resolves first.
         let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
-        // A bare parameter facing a container takes the container's type (api.md §5).
-        let (rl, lt) = match adopt_container_param(scope, lhs, &rt, params)? {
-            Some(adopted) => adopted,
-            None => resolve(scope, lhs, ctx_of(&rt), agg, params)?,
-        };
-        (rl, lt, rr, rt)
-    } else if rhs_lit {
-        let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-        let (rr, rt) = match adopt_container_param(scope, rhs, &lt, params)? {
-            Some(adopted) => adopted,
-            None => resolve(scope, rhs, ctx_of(&lt), agg, params)?,
-        };
-        (rl, lt, rr, rt)
+        let (rl, lt) = resolve_adapted(scope, lhs, &rt, agg, params)?;
+        return Ok((rl, lt, rr, rt));
+    }
+    // Two bare adaptable operands have no column context: an integer literal (and a bind
+    // parameter) defaults to i64; a string literal stays text (no bytea context — types.md §6).
+    let both_ctx = if lhs_lit {
+        Some(ScalarType::Int64)
     } else {
-        let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-        let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
-        (rl, lt, rr, rt)
+        None
+    };
+    let (rl, lt) = resolve(scope, lhs, both_ctx, agg, params)?;
+    let (rr, rt) = if rhs_lit && !lhs_lit {
+        resolve_adapted(scope, rhs, &lt, agg, params)?
+    } else {
+        resolve(scope, rhs, both_ctx, agg, params)?
     };
     Ok((rl, lt, rr, rt))
+}
+
+/// Resolve the adaptable operand `e` against its sibling's type `sibling`: a bare parameter facing
+/// a container takes the container's type (api.md §5); otherwise `e` adapts to `ctx_of(sibling)`.
+#[inline(never)]
+fn resolve_adapted(
+    scope: &Scope,
+    e: &Expr,
+    sibling: &ResolvedType,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    match adopt_container_param(scope, e, sibling, params)? {
+        Some(adopted) => Ok(adopted),
+        None => resolve(scope, e, ctx_of(sibling), agg, params),
+    }
 }
 
 /// Resolve the operand pair of a text-only operator (LIKE/ILIKE, the regex matches): as

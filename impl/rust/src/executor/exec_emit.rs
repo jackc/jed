@@ -467,654 +467,324 @@ impl Engine {
             rel_work[ri] = meter.accrued - before;
         }
 
-        // Left-deep nested-loop join. `running` holds the combined rows over the relations
-        // joined so far (starting with the first table's rows). For each join, concatenate
-        // every running row with every right-table row; CROSS keeps all pairs, INNER keeps a
-        // pair iff its ON predicate is TRUE (three-valued — a NULL join key never matches).
-        // LEFT/FULL additionally emit each unmatched left row NULL-extended over the right
-        // side; RIGHT/FULL emit each unmatched right row NULL-extended over the left side.
-        // The NULL-extension pushes evaluate no ON (no operator_eval — spec/design/cost.md §3).
-        // Output order is deterministic: running order (outer) then right key order (inner),
-        // each unmatched left row after its (empty) match run, all unmatched right rows last in
-        // right key order — so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
-        // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
-        // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
-        let mut running: Vec<Row>;
-        if plan.phys.join_steps.len() + 1 == plan.rels.len()
-            && plan.phys.relation_order.len() == plan.rels.len()
-            && plan.rels.len() >= 3
-        {
-            running = self.exec_costed_nway_join(
-                plan,
-                &env,
-                params,
-                outer,
-                &materialized,
-                &mut rel_work,
-                plan.phys.join_steps.len(),
-                stmt_rng,
-                meter,
-            )?;
-        } else if plan.phys.relation_order.len() == 2 {
-            running = self.exec_costed_two_relation_join(
-                plan,
-                &env,
-                params,
-                outer,
-                &materialized,
-                &mut rel_work,
-                stmt_rng,
-                meter,
-            )?;
-        } else {
-            running = if plan.rels.is_empty() {
-                // (A FROM-less contradiction produces no virtual row either.)
-                if fast {
-                    meter.admit_row(&[])?;
-                    vec![Vec::new()]
-                } else {
-                    Vec::new()
-                }
-            } else {
-                std::mem::take(&mut materialized[0])
-            };
-            for (k, pj) in plan.joins.iter().enumerate() {
-                // The residual ON after an ON pushdown (planner.md §3.3), else the complete ON.
-                let on = plan.join_on(k);
-                let emit_left = matches!(pj.kind, JoinKind::Left | JoinKind::Full);
-                let emit_right = matches!(pj.kind, JoinKind::Right | JoinKind::Full);
-                // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even
-                // when `running`/`right_rows` is empty: the right table begins at flat offset
-                // rels[k+1].offset (= the width of every running row) and is that many columns wide.
-                let left_pad = plan.rels[k + 1].offset;
-                let right_pad = plan.rels[k + 1].col_count;
-                let mut next: Vec<Row> = Vec::new();
-                // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row,
-                // with that row pushed onto the outer-row stack as the body's immediate outer (the
-                // correlated-subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL
-                // to a correlated lateral is 42P10), so there is no unmatched-right emission.
-                if plan.rels[k + 1].lateral {
-                    for left in &running {
-                        let mut lat_outer: Vec<&[Value]> = outer.to_vec();
-                        lat_outer.push(left);
-                        let before = meter.accrued;
-                        let right_rows = self.materialize_rel(
-                            plan,
-                            k + 1,
-                            params,
-                            &lat_outer,
-                            &[],
-                            stmt_rng,
-                            env.ctes,
-                            meter,
-                        )?;
-                        rel_work[k + 1] += meter.accrued - before;
-                        let mut left_matched = false;
-                        for right in &right_rows {
-                            let mut combined = left.clone();
-                            combined.extend_from_slice(right);
-                            let keep = match &on {
-                                None => true,
-                                Some(pred) => pred.eval_filter(&combined, &env, meter)?,
-                            };
-                            if keep {
-                                meter.admit_row_masked(&combined, &mem_mask)?;
-                                next.push(combined);
-                                left_matched = true;
-                            }
-                        }
-                        if emit_left && !left_matched {
-                            let mut combined = left.clone();
-                            combined.resize(combined.len() + right_pad, Value::Null);
-                            meter.admit_row_masked(&combined, &mem_mask)?;
-                            next.push(combined);
-                        }
-                        // The per-left-row re-materialization is consumed (memory.md §5.3).
-                        meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
-                    }
-                    meter.release_rows_masked(&running, &mem_mask);
-                    running = next;
-                    continue;
-                }
-                // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER
-                // combined left-hand row, its scan bounded per outer row by the `Sibling` columns of that
-                // row (a per-outer-row seek instead of a full scan). Detection restricts this to the
-                // RIGHT/nullable side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT
-                // emission (RIGHT/FULL are excluded — a preserved side cannot be bounded per outer row).
-                // The whole ON/WHERE stays applied (the ON here, the WHERE below), so rows are unchanged.
-                if plan.phys.rel_inl_bounds[k + 1].is_some() {
-                    debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
-                    for left in &running {
-                        let before = meter.accrued;
-                        let right_rows = self.materialize_rel(
-                            plan,
-                            k + 1,
-                            params,
-                            outer,
-                            left,
-                            stmt_rng,
-                            env.ctes,
-                            meter,
-                        )?;
-                        rel_work[k + 1] += meter.accrued - before;
-                        let mut left_matched = false;
-                        for right in &right_rows {
-                            let mut combined = left.clone();
-                            combined.extend_from_slice(right);
-                            let keep = match &on {
-                                None => true,
-                                Some(pred) => pred.eval_filter(&combined, &env, meter)?,
-                            };
-                            if keep {
-                                meter.admit_row_masked(&combined, &mem_mask)?;
-                                next.push(combined);
-                                left_matched = true;
-                            }
-                        }
-                        if emit_left && !left_matched {
-                            let mut combined = left.clone();
-                            combined.resize(combined.len() + right_pad, Value::Null);
-                            meter.admit_row_masked(&combined, &mem_mask)?;
-                            next.push(combined);
-                        }
-                        // The per-left-row re-materialization is consumed (memory.md §5.3).
-                        meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
-                    }
-                    meter.release_rows_masked(&running, &mem_mask);
-                    running = next;
-                    continue;
-                }
-                let right_rows = &materialized[k + 1];
-                // The hash rule is exactly two inputs, so it can only own join 0. Build the right input
-                // once, then probe running rows in left order. Bucket indices retain right order and the
-                // full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
-                if k == 0
-                    && let Some(hash_plan) = &plan.phys.hash_join
-                {
-                    let table = HashJoinTable::build(
-                        hash_plan,
-                        plan.rels[1].offset,
-                        plan.rels[0].offset,
-                        right_rows,
-                        meter,
-                    )?;
-                    let pred = on.as_ref().expect("a hash join always has an ON predicate");
-                    for left in &running {
-                        let candidates = table.probe(hash_plan, left, meter)?;
-                        let mut left_matched = false;
-                        for ri in candidates {
-                            let mut combined = left.clone();
-                            combined.extend_from_slice(&right_rows[ri]);
-                            if pred.eval_filter(&combined, &env, meter)? {
-                                meter.admit_row_masked(&combined, &mem_mask)?;
-                                next.push(combined);
-                                left_matched = true;
-                            }
-                        }
-                        if emit_left && !left_matched {
-                            let mut combined = left.clone();
-                            combined.resize(combined.len() + right_pad, Value::Null);
-                            meter.admit_row_masked(&combined, &mem_mask)?;
-                            next.push(combined);
-                        }
-                    }
-                    meter.release_rows_masked(&running, &mem_mask);
-                    running = next;
-                    continue;
-                }
-                let mut right_matched = vec![false; right_rows.len()];
-                for left in &running {
-                    let mut left_matched = false;
-                    for (ri, right) in right_rows.iter().enumerate() {
-                        let mut combined = left.clone();
-                        combined.extend_from_slice(right);
-                        let keep = match &on {
-                            None => true,
-                            Some(pred) => pred.eval_filter(&combined, &env, meter)?,
-                        };
-                        if keep {
-                            meter.admit_row_masked(&combined, &mem_mask)?;
-                            next.push(combined);
-                            left_matched = true;
-                            right_matched[ri] = true;
-                        }
-                    }
-                    if emit_left && !left_matched {
-                        let mut combined = left.clone();
-                        combined.resize(combined.len() + right_pad, Value::Null);
-                        meter.admit_row_masked(&combined, &mem_mask)?;
-                        next.push(combined);
-                    }
-                }
-                if emit_right {
-                    for (ri, right) in right_rows.iter().enumerate() {
-                        if !right_matched[ri] {
-                            let mut combined: Row = vec![Value::Null; left_pad];
-                            combined.extend_from_slice(right);
-                            meter.admit_row_masked(&combined, &mem_mask)?;
-                            next.push(combined);
-                        }
-                    }
-                }
-                meter.release_rows_masked(&running, &mem_mask);
-                running = next;
-            }
-        }
-        // The join phase is complete: its relation buffers are consumed (memory.md §5.3). A relation
-        // moved into `running` left an empty buffer here.
-        for (ri, rows) in materialized.iter().enumerate() {
-            meter.release_rows_masked(rows, &plan.rel_masks[ri]);
-        }
-
-        // Scan labels can repeat (self joins), while the optimizer may render relations in physical
-        // rather than authored order. Publish the accumulated leaf work in that same render order so
-        // the label queues remain deterministic; dynamic INL/LATERAL probes contribute to one leaf.
-        let physical_tree = (plan.rels.len() == 2 && plan.phys.relation_order.len() == 2)
-            || (plan.rels.len() >= 3
+        // Everything after the relations are materialized runs in its own frame: a derived table
+        // nests through `materialize_rel` above, so that recursion carries only this prefix
+        // (spec/design/cost.md §7.1).
+        outline(|| {
+            // Left-deep nested-loop join. `running` holds the combined rows over the relations
+            // joined so far (starting with the first table's rows). For each join, concatenate
+            // every running row with every right-table row; CROSS keeps all pairs, INNER keeps a
+            // pair iff its ON predicate is TRUE (three-valued — a NULL join key never matches).
+            // LEFT/FULL additionally emit each unmatched left row NULL-extended over the right
+            // side; RIGHT/FULL emit each unmatched right row NULL-extended over the left side.
+            // The NULL-extension pushes evaluate no ON (no operator_eval — spec/design/cost.md §3).
+            // Output order is deterministic: running order (outer) then right key order (inner),
+            // each unmatched left row after its (empty) match run, all unmatched right rows last in
+            // right key order — so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
+            // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
+            // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
+            let mut running: Vec<Row>;
+            if plan.phys.join_steps.len() + 1 == plan.rels.len()
                 && plan.phys.relation_order.len() == plan.rels.len()
-                && plan.phys.join_steps.len() + 1 == plan.rels.len());
-        let relation_order: Vec<usize> = if physical_tree {
-            plan.phys.relation_order.clone()
-        } else {
-            (0..plan.rels.len()).collect()
-        };
-        for ordinal in relation_order {
-            let node = select_actual_rel_node(&plan.rels[ordinal]);
-            if select_actual_root_node(plan) != node
-                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                && plan.rels.len() >= 3
             {
-                profile.record(node, rel_work[ordinal]);
-            }
-        }
-
-        if plan.rels.len() > 1 {
-            let is_hash = (plan.rels.len() == 2 && plan.phys.hash_join.is_some())
-                || plan
-                    .phys
-                    .join_steps
-                    .last()
-                    .is_some_and(|step| step.hash_join.is_some());
-            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-                if select_actual_root_node(plan)
-                    != if is_hash { "Hash Join" } else { "Nested Loop" }
-                {
-                    profile.record_parent(
-                        if is_hash { "Hash Join" } else { "Nested Loop" }.to_string(),
-                        meter.accrued,
-                    );
-                }
-            }
-        }
-
-        // WHERE over the combined rows (consume `running`, no extra clone). A WHERE arithmetic
-        // can trap (22003/22012); each surviving combined row's filter accrues operator_eval.
-        // After a pushdown only the residual remains (planner.md §3.2); the pushed conjuncts
-        // already ran as each relation was read.
-        let filter = plan.post_join_filter();
-        let mut rows: Vec<Row> = Vec::new();
-        for row in running {
-            let keep = match &filter {
-                None => true,
-                Some(f) => f.eval_filter(&row, &env, meter)?,
-            };
-            if keep {
-                rows.push(row);
+                running = self.exec_costed_nway_join(
+                    plan,
+                    &env,
+                    params,
+                    outer,
+                    &materialized,
+                    &mut rel_work,
+                    plan.phys.join_steps.len(),
+                    stmt_rng,
+                    meter,
+                )?;
+            } else if plan.phys.relation_order.len() == 2 {
+                running = self.exec_costed_two_relation_join(
+                    plan,
+                    &env,
+                    params,
+                    outer,
+                    &materialized,
+                    &mut rel_work,
+                    stmt_rng,
+                    meter,
+                )?;
             } else {
-                meter.release_row_masked(&row, &mem_mask);
-            }
-        }
-        if filter.is_some()
-            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-        {
-            if select_actual_root_node(plan) != "Filter" {
-                profile.record_parent("Filter".to_string(), meter.accrued);
-            }
-        }
-
-        // WINDOW stage (spec/design/window.md §5.2): a blocking operator over the post-WHERE rows,
-        // running BEFORE the query ORDER BY / DISTINCT / LIMIT. Each window function's per-row
-        // result is APPENDED to its row (so the projection reads result `i` at flat slot
-        // `input_width + i`); the rows keep their scan order, and the query ORDER BY below re-sorts
-        // the extended rows. A window query never enters the streaming fast-paths above. A GROUPED
-        // window query (§2) runs the window stage over the GROUPED rows instead, inside the aggregate
-        // branch below (after GROUP BY/HAVING) — so it is gated to plain (non-aggregate) windows here.
-        if plan.has_window && !plan.is_agg {
-            apply_window_stage(
-                &mut rows,
-                &plan.window_specs,
-                &plan.window_keys,
-                &env,
-                meter,
-            )?;
-            if select_actual_root_node(plan) != "Window"
-                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-            {
-                profile.record_parent("Window".to_string(), meter.accrued);
-            }
-        }
-
-        // ORDER BY: a stable sort applying each key left to right — the first non-equal key
-        // decides, and a full tie keeps the scan order (the sort is stable). Each key's NULL
-        // placement is decoupled from its value-direction flip, so an explicit NULLS
-        // FIRST|LAST overrides the default (spec/design/grammar.md §10).
-        // (Aggregate queries sort their GROUP rows in the aggregate branch below — not these
-        // pre-aggregation rows — so the sort here is gated to plain queries.)
-        if !plan.is_agg && !plan.order.is_empty() {
-            // Materialize each general-expression ORDER BY key (grammar.md §10): evaluate it against the
-            // post-WHERE (post-window) row and append the value, so its sort slot `final_width + k` reads
-            // the appended column and the slot-based sort below is unchanged — the window-key precedent.
-            // The evaluation is metered per node (cost.md §3); empty for a column/ordinal-only ORDER BY.
-            materialize_order_exprs(&mut rows, &plan.order_exprs, &env, meter)?;
-            if let Some(k) = plan.phys.top_k {
-                // Rows the top-k selection drops are discarded (memory.md §5.3): release the input,
-                // then re-reserve the kept rows (never more than was released).
-                meter.release_rows_masked(&rows, &mem_mask);
-                rows = top_k_rows(rows, &plan.order, k)?;
-                for row in &rows {
-                    meter.admit_row_masked(row, &mem_mask)?;
-                }
-            } else {
-                sort_rows(&mut rows, &plan.order)?;
-            }
-            if select_actual_root_node(plan) != "Sort"
-                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-            {
-                profile.record_parent("Sort".to_string(), meter.accrued);
-            }
-        }
-
-        // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the integer
-        // domain against the row count before indexing — never truncate a huge count into
-        // usize (CLAUDE.md §8; spec/design/grammar.md §9). The counts are already
-        // non-negative (parser).
-        let window_bounds = |len: usize| -> (usize, usize) {
-            let start = plan.offset.unwrap_or(0).min(len as i64) as usize;
-            let end = match plan.limit {
-                Some(lim) if lim < (len - start) as i64 => start + lim as usize,
-                _ => len,
-            };
-            (start, end)
-        };
-
-        // Build the output rows. The two paths differ in pipeline order
-        // (spec/design/grammar.md §11): without DISTINCT the window slices the sorted
-        // source rows and ONLY the windowed rows are projected; with DISTINCT every
-        // (sorted) filtered row is projected — dedup must see them all — duplicates drop
-        // by first occurrence, and the window then slices the DISTINCT rows.
-        let emitter = if plan.is_agg {
-            // Aggregate query — group + accumulate (aggregates.md §5). Fold every filtered row into
-            // the accumulators — charging aggregate_accumulate per (row × aggregate) and the
-            // operand's own operator_evals — then finalize to the synthetic row [agg_0..] and
-            // project it. Even an empty input yields ONE group row (COUNT 0, others NULL —
-            // spec/design/aggregates.md §4). The bucketing/finalize is unmetered (cost.md §3).
-            // Bucket the post-WHERE rows by their group-key values. The bucket key is the
-            // value-canonical Vec<Value> (its Eq/Hash collapse 1.5/1.50 and group NULL with
-            // NULL — value.rs); the map is only an index, never iterated, so output order comes
-            // from the insertion-ordered `groups` (no hashmap-order leak — CLAUDE.md §8/§10).
-            // Whole-table aggregation (no GROUP BY) is one pre-created empty-key group, so it
-            // emits ONE row even over zero input (COUNT 0, others NULL); GROUP BY over an empty
-            // table creates no groups -> zero rows.
-            // Per group: its key values, one Acc per aggregate, and one DISTINCT dedup set per
-            // DISTINCT aggregate (`None` for a plain aggregate — `COUNT(DISTINCT x)`,
-            // aggregates.md §5). The set is value-canonical (`Value`'s own Eq/Hash, so `1.5`/`1.50`
-            // and `-0`/`+0` collapse, identical to the group-key bucketing).
-            let new_accs = || -> Vec<Acc> {
-                plan.agg_specs
-                    .iter()
-                    .map(|s| Acc::from_spec(s, &self.session.time_zone))
-                    .collect()
-            };
-            let new_seen = || -> Vec<Option<HashSet<Value>>> {
-                plan.agg_specs
-                    .iter()
-                    .map(|s| s.distinct.then(HashSet::new))
-                    .collect()
-            };
-            // One grouping set per `plan.group_sets` (spec/design/aggregates.md §12): a plain GROUP BY
-            // / whole-table aggregate has exactly one; ROLLUP / CUBE / GROUPING SETS have several. Each
-            // set is bucketed independently over the SAME post-WHERE rows and its groups projected into
-            // the shared synthetic row `[master_columns…, aggregate_results…, GROUPING_results…]`: a
-            // column not grouped in this set is NULL, and each GROUPING() call's value comes from this
-            // set's mask. The scan (storage_row_read) is upstream and counted once; aggregate_accumulate
-            // + operand evals accrue per (set × row × passing aggregate). The per-set bucket index is
-            // never iterated — output order comes from the insertion-ordered `groups` then the set order
-            // (no hashmap-order leak — CLAUDE.md §8/§10).
-            // Materialize the general-expression GROUP BY keys (aggregates.md §15): evaluate each per
-            // post-WHERE row ONCE (charging its operator_evals, like an aggregate operand) and append
-            // the value at flat slot `input_width + k`, so a master grouping-key index pointing there
-            // reads it. Done before the (possibly multi-) grouping-set loop so each row is extended
-            // once and the values are shared across sets. A plain column GROUP BY appends nothing.
-            if !plan.group_exprs.is_empty() {
-                for row in rows.iter_mut() {
-                    meter.guard()?;
-                    for ge in &plan.group_exprs {
-                        let v = ge.eval(row, &env, meter)?;
-                        meter.admit_value(&v)?;
-                        row.push(v);
-                    }
-                }
-            }
-            let mut group_rows: Vec<Vec<Value>> = Vec::new();
-            for gset in &plan.group_sets {
-                let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
-                // Per group: key, accumulators, DISTINCT sets, and the group's query-memory charge —
-                // its entry plus everything its accumulators retain (memory.md §6.2/§6.3).
-                #[allow(clippy::type_complexity)]
-                let mut groups: Vec<(
-                    Vec<Value>,
-                    Vec<Acc>,
-                    Vec<Option<HashSet<Value>>>,
-                    i64,
-                )> = Vec::new();
-                // An empty grouping set (the `()` / whole-table grand total) is one pre-created group,
-                // so it emits ONE row even over zero input; a non-empty set over an empty input emits
-                // nothing (spec/design/aggregates.md §4/§12).
-                if gset.key_cols.is_empty() {
-                    let entry = if meter.query_memory_active() {
-                        crate::memsize::entry_bytes(&[])
+                running = if plan.rels.is_empty() {
+                    // (A FROM-less contradiction produces no virtual row either.)
+                    if fast {
+                        meter.admit_row(&[])?;
+                        vec![Vec::new()]
                     } else {
-                        0
-                    };
-                    meter.reserve_query(entry)?;
-                    groups.push((Vec::new(), new_accs(), new_seen(), entry));
-                    index.insert(Vec::new(), 0);
-                }
-                for row in &rows {
-                    meter.guard()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
-                    let key: Vec<Value> = gset.key_cols.iter().map(|&gk| row[gk].clone()).collect();
-                    let gi = match index.get(&key) {
-                        Some(&i) => i,
-                        None => {
-                            let entry = if meter.query_memory_active() {
-                                crate::memsize::entry_bytes(&key)
-                            } else {
-                                0
+                        Vec::new()
+                    }
+                } else {
+                    std::mem::take(&mut materialized[0])
+                };
+                for (k, pj) in plan.joins.iter().enumerate() {
+                    // The residual ON after an ON pushdown (planner.md §3.3), else the complete ON.
+                    let on = plan.join_on(k);
+                    let emit_left = matches!(pj.kind, JoinKind::Left | JoinKind::Full);
+                    let emit_right = matches!(pj.kind, JoinKind::Right | JoinKind::Full);
+                    // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even
+                    // when `running`/`right_rows` is empty: the right table begins at flat offset
+                    // rels[k+1].offset (= the width of every running row) and is that many columns wide.
+                    let left_pad = plan.rels[k + 1].offset;
+                    let right_pad = plan.rels[k + 1].col_count;
+                    let mut next: Vec<Row> = Vec::new();
+                    // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row,
+                    // with that row pushed onto the outer-row stack as the body's immediate outer (the
+                    // correlated-subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL
+                    // to a correlated lateral is 42P10), so there is no unmatched-right emission.
+                    if plan.rels[k + 1].lateral {
+                        for left in &running {
+                            let mut lat_outer: Vec<&[Value]> = outer.to_vec();
+                            lat_outer.push(left);
+                            let before = meter.accrued;
+                            let right_rows = self.materialize_rel(
+                                plan,
+                                k + 1,
+                                params,
+                                &lat_outer,
+                                &[],
+                                stmt_rng,
+                                env.ctes,
+                                meter,
+                            )?;
+                            rel_work[k + 1] += meter.accrued - before;
+                            let mut left_matched = false;
+                            for right in &right_rows {
+                                let mut combined = left.clone();
+                                combined.extend_from_slice(right);
+                                let keep = match &on {
+                                    None => true,
+                                    Some(pred) => pred.eval_filter(&combined, &env, meter)?,
+                                };
+                                if keep {
+                                    meter.admit_row_masked(&combined, &mem_mask)?;
+                                    next.push(combined);
+                                    left_matched = true;
+                                }
+                            }
+                            if emit_left && !left_matched {
+                                let mut combined = left.clone();
+                                combined.resize(combined.len() + right_pad, Value::Null);
+                                meter.admit_row_masked(&combined, &mem_mask)?;
+                                next.push(combined);
+                            }
+                            // The per-left-row re-materialization is consumed (memory.md §5.3).
+                            meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
+                        }
+                        meter.release_rows_masked(&running, &mem_mask);
+                        running = next;
+                        continue;
+                    }
+                    // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER
+                    // combined left-hand row, its scan bounded per outer row by the `Sibling` columns of that
+                    // row (a per-outer-row seek instead of a full scan). Detection restricts this to the
+                    // RIGHT/nullable side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT
+                    // emission (RIGHT/FULL are excluded — a preserved side cannot be bounded per outer row).
+                    // The whole ON/WHERE stays applied (the ON here, the WHERE below), so rows are unchanged.
+                    if plan.phys.rel_inl_bounds[k + 1].is_some() {
+                        debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
+                        for left in &running {
+                            let before = meter.accrued;
+                            let right_rows = self.materialize_rel(
+                                plan,
+                                k + 1,
+                                params,
+                                outer,
+                                left,
+                                stmt_rng,
+                                env.ctes,
+                                meter,
+                            )?;
+                            rel_work[k + 1] += meter.accrued - before;
+                            let mut left_matched = false;
+                            for right in &right_rows {
+                                let mut combined = left.clone();
+                                combined.extend_from_slice(right);
+                                let keep = match &on {
+                                    None => true,
+                                    Some(pred) => pred.eval_filter(&combined, &env, meter)?,
+                                };
+                                if keep {
+                                    meter.admit_row_masked(&combined, &mem_mask)?;
+                                    next.push(combined);
+                                    left_matched = true;
+                                }
+                            }
+                            if emit_left && !left_matched {
+                                let mut combined = left.clone();
+                                combined.resize(combined.len() + right_pad, Value::Null);
+                                meter.admit_row_masked(&combined, &mem_mask)?;
+                                next.push(combined);
+                            }
+                            // The per-left-row re-materialization is consumed (memory.md §5.3).
+                            meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
+                        }
+                        meter.release_rows_masked(&running, &mem_mask);
+                        running = next;
+                        continue;
+                    }
+                    let right_rows = &materialized[k + 1];
+                    // The hash rule is exactly two inputs, so it can only own join 0. Build the right input
+                    // once, then probe running rows in left order. Bucket indices retain right order and the
+                    // full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
+                    if k == 0
+                        && let Some(hash_plan) = &plan.phys.hash_join
+                    {
+                        let table = HashJoinTable::build(
+                            hash_plan,
+                            plan.rels[1].offset,
+                            plan.rels[0].offset,
+                            right_rows,
+                            meter,
+                        )?;
+                        let pred = on.as_ref().expect("a hash join always has an ON predicate");
+                        for left in &running {
+                            let candidates = table.probe(hash_plan, left, meter)?;
+                            let mut left_matched = false;
+                            for ri in candidates {
+                                let mut combined = left.clone();
+                                combined.extend_from_slice(&right_rows[ri]);
+                                if pred.eval_filter(&combined, &env, meter)? {
+                                    meter.admit_row_masked(&combined, &mem_mask)?;
+                                    next.push(combined);
+                                    left_matched = true;
+                                }
+                            }
+                            if emit_left && !left_matched {
+                                let mut combined = left.clone();
+                                combined.resize(combined.len() + right_pad, Value::Null);
+                                meter.admit_row_masked(&combined, &mem_mask)?;
+                                next.push(combined);
+                            }
+                        }
+                        meter.release_rows_masked(&running, &mem_mask);
+                        running = next;
+                        continue;
+                    }
+                    let mut right_matched = vec![false; right_rows.len()];
+                    for left in &running {
+                        let mut left_matched = false;
+                        for (ri, right) in right_rows.iter().enumerate() {
+                            let mut combined = left.clone();
+                            combined.extend_from_slice(right);
+                            let keep = match &on {
+                                None => true,
+                                Some(pred) => pred.eval_filter(&combined, &env, meter)?,
                             };
-                            meter.reserve_query(entry)?;
-                            let i = groups.len();
-                            index.insert(key.clone(), i);
-                            groups.push((key, new_accs(), new_seen(), entry));
-                            i
-                        }
-                    };
-                    for (si, spec) in plan.agg_specs.iter().enumerate() {
-                        // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
-                        // contributes nothing to THIS aggregate — its operand is not evaluated and it
-                        // is not accumulated (aggregates.md §11). The filter's own operator_evals are
-                        // charged (it is evaluated per row, like the operand); aggregate_accumulate is
-                        // charged only for a row that passes. The pass/fold decision is deterministic
-                        // (scan order is cross-core identical), so the metered cost is identical.
-                        if let Some(f) = &spec.filter
-                            && !f.eval(row, &env, meter)?.is_true()
-                        {
-                            continue;
-                        }
-                        meter.charge(COSTS.aggregate_accumulate);
-                        // A hypothetical-set aggregate (rank/dense_rank/… — aggregates.md §19) buffers
-                        // the row's WITHIN GROUP key TUPLE (no NULL-skip — every row counts, sorted by
-                        // NULLS FIRST/LAST). The hypothetical row itself is evaluated per group at
-                        // finalize. No DISTINCT (rejected at resolve).
-                        if let Some(hp) = &spec.hypo {
-                            let tuple = hp
-                                .keys
-                                .iter()
-                                .map(|k| k.eval(row, &env, meter))
-                                .collect::<Result<Vec<Value>>>()?;
-                            if meter.query_memory_active() {
-                                let bytes = crate::memsize::row_bytes(&tuple);
-                                meter.reserve_query(bytes)?;
-                                groups[gi].3 += bytes;
-                            }
-                            if let Acc::Hypothetical { rows, .. } = &mut groups[gi].1[si] {
-                                rows.push(tuple);
-                            }
-                            continue;
-                        }
-                        let v = match &spec.operand {
-                            Some(op) => op.eval(row, &env, meter)?,
-                            None => Value::Null, // COUNT(*) ignores the value
-                        };
-                        // An in-aggregate ORDER BY's keys are evaluated per passing row, after the
-                        // argument and before the DISTINCT check (aggregates.md §22).
-                        let tuple = match &spec.order {
-                            Some(order) => {
-                                Some(agg_order_tuple(order, v.clone(), row, &env, meter)?)
-                            }
-                            None => None,
-                        };
-                        // DISTINCT: skip any value already folded into this group — the FIRST
-                        // occurrence in scan order wins, so the set of folded values (and the
-                        // decimal_work fold charges) is order-deterministic and cross-core identical.
-                        // `insert` returns false when the value is a repeat. A NULL is skipped too,
-                        // except by the JSON array aggregates, which fold it (aggregates.md §5).
-                        if let Some(seen) = &mut groups[gi].2[si] {
-                            if (matches!(v, Value::Null) && !spec.plan.distinct_keeps_null())
-                                || !seen.insert(v.clone())
-                            {
-                                continue;
-                            }
-                            if meter.query_memory_active() {
-                                let bytes = crate::memsize::entry_bytes(std::slice::from_ref(&v));
-                                meter.reserve_query(bytes)?;
-                                groups[gi].3 += bytes;
+                            if keep {
+                                meter.admit_row_masked(&combined, &mem_mask)?;
+                                next.push(combined);
+                                left_matched = true;
+                                right_matched[ri] = true;
                             }
                         }
-                        // An ordered aggregate buffers the tuple (its retention charged like the
-                        // hypothetical-set tuples); the fold runs in key order at finalize.
-                        if let Some(tuple) = tuple {
-                            if meter.query_memory_active() {
-                                let bytes = crate::memsize::row_bytes(&tuple);
-                                meter.reserve_query(bytes)?;
-                                groups[gi].3 += bytes;
-                            }
-                            if let Acc::Ordered { rows } = &mut groups[gi].1[si] {
-                                rows.push(tuple);
-                            }
-                            continue;
+                        if emit_left && !left_matched {
+                            let mut combined = left.clone();
+                            combined.resize(combined.len() + right_pad, Value::Null);
+                            meter.admit_row_masked(&combined, &mem_mask)?;
+                            next.push(combined);
                         }
-                        let group = &mut groups[gi];
-                        group.1[si].fold_charged(v, meter, &mut group.3)?;
                     }
-                }
-                // Build one synthetic row per group of this set: each master grouping column's value
-                // (NULL where this set doesn't group it), then the aggregate results, then each
-                // GROUPING() value (computed from this set's mask — spec/design/aggregates.md §12).
-                for (key, accs, _seen, mut charge) in groups {
-                    let mut srow: Vec<Value> = Vec::with_capacity(
-                        plan.group_keys.len() + plan.agg_specs.len() + plan.grouping_specs.len(),
-                    );
-                    for src in &gset.slot_src {
-                        srow.push(match src {
-                            Some(j) => key[*j].clone(),
-                            None => Value::Null,
-                        });
-                    }
-                    for (si, mut acc) in accs.into_iter().enumerate() {
-                        // An ordered-set aggregate's percentile fraction (the direct argument) is
-                        // evaluated PER GROUP here, against the synthetic row's grouping-key values
-                        // (aggregates.md §13/§17) — so it may reference grouping columns. Unmetered
-                        // (the finalize step, like the sort), via a scratch meter. `mode` has none.
-                        if let Acc::OrderedSet { frac, .. } = &mut acc
-                            && let Some(osa) = &plan.agg_specs[si].osa
-                            && let Some(fe) = &osa.frac
-                        {
-                            *frac = Some(fe.eval(
-                                &srow,
-                                &env,
-                                &mut env.exec.session.scratch_meter(),
-                            )?);
-                        }
-                        // A hypothetical-set aggregate is finalized here (not via `Acc::finalize`)
-                        // because it needs the spec's per-key sort specs: evaluate the hypothetical
-                        // row's direct args per group (against the synthetic row, like a fraction),
-                        // then count its rank among the buffered key tuples (aggregates.md §19).
-                        let result = if let Acc::Hypothetical { kind, rows, .. } = &acc {
-                            let hp = plan.agg_specs[si]
-                                .hypo
-                                .as_ref()
-                                .expect("a hypothetical plan carries its HypoParams");
-                            let hyp = hp
-                                .args
-                                .iter()
-                                .map(|a| a.eval(&srow, &env, &mut env.exec.session.scratch_meter()))
-                                .collect::<Result<Vec<Value>>>()?;
-                            finalize_hypothetical(*kind, rows, &hyp, &hp.sorts)?
-                        } else if let Acc::Ordered { rows } = acc {
-                            // An in-aggregate ORDER BY (aggregates.md §22): fold the buffered
-                            // arguments in key order into the plan's own accumulator, charging the
-                            // fold (its decimal_work / generated_row and its retention) as usual.
-                            let spec = &plan.agg_specs[si];
-                            let order = spec.order.as_ref().expect("an ordered acc has its order");
-                            let mut inner = Acc::from_spec_unordered(spec, &self.session.time_zone);
-                            for v in sort_agg_order_rows(rows, order) {
-                                meter.guard()?;
-                                inner.fold_charged(v, meter, &mut charge)?;
+                    if emit_right {
+                        for (ri, right) in right_rows.iter().enumerate() {
+                            if !right_matched[ri] {
+                                let mut combined: Row = vec![Value::Null; left_pad];
+                                combined.extend_from_slice(right);
+                                meter.admit_row_masked(&combined, &mem_mask)?;
+                                next.push(combined);
                             }
-                            inner.finalize()?
-                        } else {
-                            acc.finalize()?
-                        };
-                        srow.push(result);
+                        }
                     }
-                    for positions in &plan.grouping_specs {
-                        srow.push(Value::Int(grouping_value(positions, gset.mask)));
-                    }
-                    // The finalized group's operator state gives way to its row (memory.md §6.2).
-                    meter.release_query(charge);
-                    meter.admit_row(&srow)?;
-                    group_rows.push(srow);
+                    meter.release_rows_masked(&running, &mem_mask);
+                    running = next;
                 }
             }
-            // Aggregation consumed the post-WHERE rows (memory.md §5.3).
-            meter.release_rows_masked(&rows, &mem_mask);
-            // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The
-            // predicate is evaluated against each group's synthetic row (charging its
-            // operator_evals per group); only a TRUE result keeps the group. A dropped group
-            // then charges no row_produced (spec/design/aggregates.md §8).
-            if let Some(h) = &plan.having {
-                let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
-                for srow in group_rows {
-                    if h.eval_filter(&srow, &env, meter)? {
-                        kept.push(srow);
-                    } else {
-                        meter.release_row(&srow);
+            // The join phase is complete: its relation buffers are consumed (memory.md §5.3). A relation
+            // moved into `running` left an empty buffer here.
+            for (ri, rows) in materialized.iter().enumerate() {
+                meter.release_rows_masked(rows, &plan.rel_masks[ri]);
+            }
+
+            // Scan labels can repeat (self joins), while the optimizer may render relations in physical
+            // rather than authored order. Publish the accumulated leaf work in that same render order so
+            // the label queues remain deterministic; dynamic INL/LATERAL probes contribute to one leaf.
+            let physical_tree = (plan.rels.len() == 2 && plan.phys.relation_order.len() == 2)
+                || (plan.rels.len() >= 3
+                    && plan.phys.relation_order.len() == plan.rels.len()
+                    && plan.phys.join_steps.len() + 1 == plan.rels.len());
+            let relation_order: Vec<usize> = if physical_tree {
+                plan.phys.relation_order.clone()
+            } else {
+                (0..plan.rels.len()).collect()
+            };
+            for ordinal in relation_order {
+                let node = select_actual_rel_node(&plan.rels[ordinal]);
+                if select_actual_root_node(plan) != node
+                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                {
+                    profile.record(node, rel_work[ordinal]);
+                }
+            }
+
+            if plan.rels.len() > 1 {
+                let is_hash = (plan.rels.len() == 2 && plan.phys.hash_join.is_some())
+                    || plan
+                        .phys
+                        .join_steps
+                        .last()
+                        .is_some_and(|step| step.hash_join.is_some());
+                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                    if select_actual_root_node(plan)
+                        != if is_hash { "Hash Join" } else { "Nested Loop" }
+                    {
+                        profile.record_parent(
+                            if is_hash { "Hash Join" } else { "Nested Loop" }.to_string(),
+                            meter.accrued,
+                        );
                     }
                 }
-                group_rows = kept;
             }
-            if select_actual_root_node(plan) != "Aggregate"
+
+            // WHERE over the combined rows (consume `running`, no extra clone). A WHERE arithmetic
+            // can trap (22003/22012); each surviving combined row's filter accrues operator_eval.
+            // After a pushdown only the residual remains (planner.md §3.2); the pushed conjuncts
+            // already ran as each relation was read.
+            let filter = plan.post_join_filter();
+            let mut rows: Vec<Row> = Vec::new();
+            for row in running {
+                let keep = match &filter {
+                    None => true,
+                    Some(f) => f.eval_filter(&row, &env, meter)?,
+                };
+                if keep {
+                    rows.push(row);
+                } else {
+                    meter.release_row_masked(&row, &mem_mask);
+                }
+            }
+            if filter.is_some()
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
             {
-                profile.record_parent("Aggregate".to_string(), meter.accrued);
+                if select_actual_root_node(plan) != "Filter" {
+                    profile.record_parent("Filter".to_string(), meter.accrued);
+                }
             }
-            // WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP
-            // BY/HAVING and BEFORE the query ORDER BY. It appends each window result to the grouped
-            // row [group_keys…, agg_results…], so the projection reads window result `w` at slot
-            // group_keys.len()+agg_specs.len()+w (the rebased slot — §5.1). The group-key slots the
-            // ORDER BY below sorts on are unchanged (they precede the appended results).
-            if plan.has_window {
+
+            // WINDOW stage (spec/design/window.md §5.2): a blocking operator over the post-WHERE rows,
+            // running BEFORE the query ORDER BY / DISTINCT / LIMIT. Each window function's per-row
+            // result is APPENDED to its row (so the projection reads result `i` at flat slot
+            // `input_width + i`); the rows keep their scan order, and the query ORDER BY below re-sorts
+            // the extended rows. A window query never enters the streaming fast-paths above. A GROUPED
+            // window query (§2) runs the window stage over the GROUPED rows instead, inside the aggregate
+            // branch below (after GROUP BY/HAVING) — so it is gated to plain (non-aggregate) windows here.
+            if plan.has_window && !plan.is_agg {
                 apply_window_stage(
-                    &mut group_rows,
+                    &mut rows,
                     &plan.window_specs,
                     &plan.window_keys,
                     &env,
@@ -1126,31 +796,424 @@ impl Engine {
                     profile.record_parent("Window".to_string(), meter.accrued);
                 }
             }
-            // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
-            // expression key is materialized against the grouped row and appended — grammar.md §10).
-            if !plan.order.is_empty() {
-                materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, meter)?;
-                sort_rows(&mut group_rows, &plan.order)?;
+
+            // ORDER BY: a stable sort applying each key left to right — the first non-equal key
+            // decides, and a full tie keeps the scan order (the sort is stable). Each key's NULL
+            // placement is decoupled from its value-direction flip, so an explicit NULLS
+            // FIRST|LAST overrides the default (spec/design/grammar.md §10).
+            // (Aggregate queries sort their GROUP rows in the aggregate branch below — not these
+            // pre-aggregation rows — so the sort here is gated to plain queries.)
+            if !plan.is_agg && !plan.order.is_empty() {
+                // Materialize each general-expression ORDER BY key (grammar.md §10): evaluate it against the
+                // post-WHERE (post-window) row and append the value, so its sort slot `final_width + k` reads
+                // the appended column and the slot-based sort below is unchanged — the window-key precedent.
+                // The evaluation is metered per node (cost.md §3); empty for a column/ordinal-only ORDER BY.
+                materialize_order_exprs(&mut rows, &plan.order_exprs, &env, meter)?;
+                if let Some(k) = plan.phys.top_k {
+                    // Rows the top-k selection drops are discarded (memory.md §5.3): release the input,
+                    // then re-reserve the kept rows (never more than was released).
+                    meter.release_rows_masked(&rows, &mem_mask);
+                    rows = top_k_rows(rows, &plan.order, k)?;
+                    for row in &rows {
+                        meter.admit_row_masked(row, &mem_mask)?;
+                    }
+                } else {
+                    sort_rows(&mut rows, &plan.order)?;
+                }
                 if select_actual_root_node(plan) != "Sort"
                     && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                 {
                     profile.record_parent("Sort".to_string(), meter.accrued);
                 }
             }
-            if plan.distinct {
-                // SELECT DISTINCT: project EVERY grouped row (charging its projection operator_evals,
-                // the §3 asymmetry — like the non-aggregate DISTINCT path below), dedup by equality
-                // keeping the first occurrence in the (already ORDER-BY-sorted) order, then apply
-                // LIMIT/OFFSET. `seen` is membership-only; output order comes from the deterministic
-                // group iteration / sort, never set iteration (no hashmap-order leak — CLAUDE.md §8/§10).
+
+            // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the integer
+            // domain against the row count before indexing — never truncate a huge count into
+            // usize (CLAUDE.md §8; spec/design/grammar.md §9). The counts are already
+            // non-negative (parser).
+            let window_bounds = |len: usize| -> (usize, usize) {
+                let start = plan.offset.unwrap_or(0).min(len as i64) as usize;
+                let end = match plan.limit {
+                    Some(lim) if lim < (len - start) as i64 => start + lim as usize,
+                    _ => len,
+                };
+                (start, end)
+            };
+
+            // Build the output rows. The two paths differ in pipeline order
+            // (spec/design/grammar.md §11): without DISTINCT the window slices the sorted
+            // source rows and ONLY the windowed rows are projected; with DISTINCT every
+            // (sorted) filtered row is projected — dedup must see them all — duplicates drop
+            // by first occurrence, and the window then slices the DISTINCT rows.
+            let emitter = if plan.is_agg {
+                // Aggregate query — group + accumulate (aggregates.md §5). Fold every filtered row into
+                // the accumulators — charging aggregate_accumulate per (row × aggregate) and the
+                // operand's own operator_evals — then finalize to the synthetic row [agg_0..] and
+                // project it. Even an empty input yields ONE group row (COUNT 0, others NULL —
+                // spec/design/aggregates.md §4). The bucketing/finalize is unmetered (cost.md §3).
+                // Bucket the post-WHERE rows by their group-key values. The bucket key is the
+                // value-canonical Vec<Value> (its Eq/Hash collapse 1.5/1.50 and group NULL with
+                // NULL — value.rs); the map is only an index, never iterated, so output order comes
+                // from the insertion-ordered `groups` (no hashmap-order leak — CLAUDE.md §8/§10).
+                // Whole-table aggregation (no GROUP BY) is one pre-created empty-key group, so it
+                // emits ONE row even over zero input (COUNT 0, others NULL); GROUP BY over an empty
+                // table creates no groups -> zero rows.
+                // Per group: its key values, one Acc per aggregate, and one DISTINCT dedup set per
+                // DISTINCT aggregate (`None` for a plain aggregate — `COUNT(DISTINCT x)`,
+                // aggregates.md §5). The set is value-canonical (`Value`'s own Eq/Hash, so `1.5`/`1.50`
+                // and `-0`/`+0` collapse, identical to the group-key bucketing).
+                let new_accs = || -> Vec<Acc> {
+                    plan.agg_specs
+                        .iter()
+                        .map(|s| Acc::from_spec(s, &self.session.time_zone))
+                        .collect()
+                };
+                let new_seen = || -> Vec<Option<HashSet<Value>>> {
+                    plan.agg_specs
+                        .iter()
+                        .map(|s| s.distinct.then(HashSet::new))
+                        .collect()
+                };
+                // One grouping set per `plan.group_sets` (spec/design/aggregates.md §12): a plain GROUP BY
+                // / whole-table aggregate has exactly one; ROLLUP / CUBE / GROUPING SETS have several. Each
+                // set is bucketed independently over the SAME post-WHERE rows and its groups projected into
+                // the shared synthetic row `[master_columns…, aggregate_results…, GROUPING_results…]`: a
+                // column not grouped in this set is NULL, and each GROUPING() call's value comes from this
+                // set's mask. The scan (storage_row_read) is upstream and counted once; aggregate_accumulate
+                // + operand evals accrue per (set × row × passing aggregate). The per-set bucket index is
+                // never iterated — output order comes from the insertion-ordered `groups` then the set order
+                // (no hashmap-order leak — CLAUDE.md §8/§10).
+                // Materialize the general-expression GROUP BY keys (aggregates.md §15): evaluate each per
+                // post-WHERE row ONCE (charging its operator_evals, like an aggregate operand) and append
+                // the value at flat slot `input_width + k`, so a master grouping-key index pointing there
+                // reads it. Done before the (possibly multi-) grouping-set loop so each row is extended
+                // once and the values are shared across sets. A plain column GROUP BY appends nothing.
+                if !plan.group_exprs.is_empty() {
+                    for row in rows.iter_mut() {
+                        meter.guard()?;
+                        for ge in &plan.group_exprs {
+                            let v = ge.eval(row, &env, meter)?;
+                            meter.admit_value(&v)?;
+                            row.push(v);
+                        }
+                    }
+                }
+                let mut group_rows: Vec<Vec<Value>> = Vec::new();
+                for gset in &plan.group_sets {
+                    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+                    // Per group: key, accumulators, DISTINCT sets, and the group's query-memory charge —
+                    // its entry plus everything its accumulators retain (memory.md §6.2/§6.3).
+                    #[allow(clippy::type_complexity)]
+                    let mut groups: Vec<(
+                        Vec<Value>,
+                        Vec<Acc>,
+                        Vec<Option<HashSet<Value>>>,
+                        i64,
+                    )> = Vec::new();
+                    // An empty grouping set (the `()` / whole-table grand total) is one pre-created group,
+                    // so it emits ONE row even over zero input; a non-empty set over an empty input emits
+                    // nothing (spec/design/aggregates.md §4/§12).
+                    if gset.key_cols.is_empty() {
+                        let entry = if meter.query_memory_active() {
+                            crate::memsize::entry_bytes(&[])
+                        } else {
+                            0
+                        };
+                        meter.reserve_query(entry)?;
+                        groups.push((Vec::new(), new_accs(), new_seen(), entry));
+                        index.insert(Vec::new(), 0);
+                    }
+                    for row in &rows {
+                        meter.guard()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
+                        let key: Vec<Value> =
+                            gset.key_cols.iter().map(|&gk| row[gk].clone()).collect();
+                        let gi = match index.get(&key) {
+                            Some(&i) => i,
+                            None => {
+                                let entry = if meter.query_memory_active() {
+                                    crate::memsize::entry_bytes(&key)
+                                } else {
+                                    0
+                                };
+                                meter.reserve_query(entry)?;
+                                let i = groups.len();
+                                index.insert(key.clone(), i);
+                                groups.push((key, new_accs(), new_seen(), entry));
+                                i
+                            }
+                        };
+                        for (si, spec) in plan.agg_specs.iter().enumerate() {
+                            // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
+                            // contributes nothing to THIS aggregate — its operand is not evaluated and it
+                            // is not accumulated (aggregates.md §11). The filter's own operator_evals are
+                            // charged (it is evaluated per row, like the operand); aggregate_accumulate is
+                            // charged only for a row that passes. The pass/fold decision is deterministic
+                            // (scan order is cross-core identical), so the metered cost is identical.
+                            if let Some(f) = &spec.filter
+                                && !f.eval(row, &env, meter)?.is_true()
+                            {
+                                continue;
+                            }
+                            meter.charge(COSTS.aggregate_accumulate);
+                            // A hypothetical-set aggregate (rank/dense_rank/… — aggregates.md §19) buffers
+                            // the row's WITHIN GROUP key TUPLE (no NULL-skip — every row counts, sorted by
+                            // NULLS FIRST/LAST). The hypothetical row itself is evaluated per group at
+                            // finalize. No DISTINCT (rejected at resolve).
+                            if let Some(hp) = &spec.hypo {
+                                let tuple = hp
+                                    .keys
+                                    .iter()
+                                    .map(|k| k.eval(row, &env, meter))
+                                    .collect::<Result<Vec<Value>>>()?;
+                                if meter.query_memory_active() {
+                                    let bytes = crate::memsize::row_bytes(&tuple);
+                                    meter.reserve_query(bytes)?;
+                                    groups[gi].3 += bytes;
+                                }
+                                if let Acc::Hypothetical { rows, .. } = &mut groups[gi].1[si] {
+                                    rows.push(tuple);
+                                }
+                                continue;
+                            }
+                            let v = match &spec.operand {
+                                Some(op) => op.eval(row, &env, meter)?,
+                                None => Value::Null, // COUNT(*) ignores the value
+                            };
+                            // An in-aggregate ORDER BY's keys are evaluated per passing row, after the
+                            // argument and before the DISTINCT check (aggregates.md §22).
+                            let tuple = match &spec.order {
+                                Some(order) => {
+                                    Some(agg_order_tuple(order, v.clone(), row, &env, meter)?)
+                                }
+                                None => None,
+                            };
+                            // DISTINCT: skip any value already folded into this group — the FIRST
+                            // occurrence in scan order wins, so the set of folded values (and the
+                            // decimal_work fold charges) is order-deterministic and cross-core identical.
+                            // `insert` returns false when the value is a repeat. A NULL is skipped too,
+                            // except by the JSON array aggregates, which fold it (aggregates.md §5).
+                            if let Some(seen) = &mut groups[gi].2[si] {
+                                if (matches!(v, Value::Null) && !spec.plan.distinct_keeps_null())
+                                    || !seen.insert(v.clone())
+                                {
+                                    continue;
+                                }
+                                if meter.query_memory_active() {
+                                    let bytes =
+                                        crate::memsize::entry_bytes(std::slice::from_ref(&v));
+                                    meter.reserve_query(bytes)?;
+                                    groups[gi].3 += bytes;
+                                }
+                            }
+                            // An ordered aggregate buffers the tuple (its retention charged like the
+                            // hypothetical-set tuples); the fold runs in key order at finalize.
+                            if let Some(tuple) = tuple {
+                                if meter.query_memory_active() {
+                                    let bytes = crate::memsize::row_bytes(&tuple);
+                                    meter.reserve_query(bytes)?;
+                                    groups[gi].3 += bytes;
+                                }
+                                if let Acc::Ordered { rows } = &mut groups[gi].1[si] {
+                                    rows.push(tuple);
+                                }
+                                continue;
+                            }
+                            let group = &mut groups[gi];
+                            group.1[si].fold_charged(v, meter, &mut group.3)?;
+                        }
+                    }
+                    // Build one synthetic row per group of this set: each master grouping column's value
+                    // (NULL where this set doesn't group it), then the aggregate results, then each
+                    // GROUPING() value (computed from this set's mask — spec/design/aggregates.md §12).
+                    for (key, accs, _seen, mut charge) in groups {
+                        let mut srow: Vec<Value> = Vec::with_capacity(
+                            plan.group_keys.len()
+                                + plan.agg_specs.len()
+                                + plan.grouping_specs.len(),
+                        );
+                        for src in &gset.slot_src {
+                            srow.push(match src {
+                                Some(j) => key[*j].clone(),
+                                None => Value::Null,
+                            });
+                        }
+                        for (si, mut acc) in accs.into_iter().enumerate() {
+                            // An ordered-set aggregate's percentile fraction (the direct argument) is
+                            // evaluated PER GROUP here, against the synthetic row's grouping-key values
+                            // (aggregates.md §13/§17) — so it may reference grouping columns. Unmetered
+                            // (the finalize step, like the sort), via a scratch meter. `mode` has none.
+                            if let Acc::OrderedSet { frac, .. } = &mut acc
+                                && let Some(osa) = &plan.agg_specs[si].osa
+                                && let Some(fe) = &osa.frac
+                            {
+                                *frac = Some(fe.eval(
+                                    &srow,
+                                    &env,
+                                    &mut env.exec.session.scratch_meter(),
+                                )?);
+                            }
+                            // A hypothetical-set aggregate is finalized here (not via `Acc::finalize`)
+                            // because it needs the spec's per-key sort specs: evaluate the hypothetical
+                            // row's direct args per group (against the synthetic row, like a fraction),
+                            // then count its rank among the buffered key tuples (aggregates.md §19).
+                            let result = if let Acc::Hypothetical { kind, rows, .. } = &acc {
+                                let hp = plan.agg_specs[si]
+                                    .hypo
+                                    .as_ref()
+                                    .expect("a hypothetical plan carries its HypoParams");
+                                let hyp = hp
+                                    .args
+                                    .iter()
+                                    .map(|a| {
+                                        a.eval(&srow, &env, &mut env.exec.session.scratch_meter())
+                                    })
+                                    .collect::<Result<Vec<Value>>>()?;
+                                finalize_hypothetical(*kind, rows, &hyp, &hp.sorts)?
+                            } else if let Acc::Ordered { rows } = acc {
+                                // An in-aggregate ORDER BY (aggregates.md §22): fold the buffered
+                                // arguments in key order into the plan's own accumulator, charging the
+                                // fold (its decimal_work / generated_row and its retention) as usual.
+                                let spec = &plan.agg_specs[si];
+                                let order =
+                                    spec.order.as_ref().expect("an ordered acc has its order");
+                                let mut inner =
+                                    Acc::from_spec_unordered(spec, &self.session.time_zone);
+                                for v in sort_agg_order_rows(rows, order) {
+                                    meter.guard()?;
+                                    inner.fold_charged(v, meter, &mut charge)?;
+                                }
+                                inner.finalize()?
+                            } else {
+                                acc.finalize()?
+                            };
+                            srow.push(result);
+                        }
+                        for positions in &plan.grouping_specs {
+                            srow.push(Value::Int(grouping_value(positions, gset.mask)));
+                        }
+                        // The finalized group's operator state gives way to its row (memory.md §6.2).
+                        meter.release_query(charge);
+                        meter.admit_row(&srow)?;
+                        group_rows.push(srow);
+                    }
+                }
+                // Aggregation consumed the post-WHERE rows (memory.md §5.3).
+                meter.release_rows_masked(&rows, &mem_mask);
+                // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The
+                // predicate is evaluated against each group's synthetic row (charging its
+                // operator_evals per group); only a TRUE result keeps the group. A dropped group
+                // then charges no row_produced (spec/design/aggregates.md §8).
+                if let Some(h) = &plan.having {
+                    let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
+                    for srow in group_rows {
+                        if h.eval_filter(&srow, &env, meter)? {
+                            kept.push(srow);
+                        } else {
+                            meter.release_row(&srow);
+                        }
+                    }
+                    group_rows = kept;
+                }
+                if select_actual_root_node(plan) != "Aggregate"
+                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                {
+                    profile.record_parent("Aggregate".to_string(), meter.accrued);
+                }
+                // WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP
+                // BY/HAVING and BEFORE the query ORDER BY. It appends each window result to the grouped
+                // row [group_keys…, agg_results…], so the projection reads window result `w` at slot
+                // group_keys.len()+agg_specs.len()+w (the rebased slot — §5.1). The group-key slots the
+                // ORDER BY below sorts on are unchanged (they precede the appended results).
+                if plan.has_window {
+                    apply_window_stage(
+                        &mut group_rows,
+                        &plan.window_specs,
+                        &plan.window_keys,
+                        &env,
+                        meter,
+                    )?;
+                    if select_actual_root_node(plan) != "Window"
+                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                    {
+                        profile.record_parent("Window".to_string(), meter.accrued);
+                    }
+                }
+                // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
+                // expression key is materialized against the grouped row and appended — grammar.md §10).
+                if !plan.order.is_empty() {
+                    materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, meter)?;
+                    sort_rows(&mut group_rows, &plan.order)?;
+                    if select_actual_root_node(plan) != "Sort"
+                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                    {
+                        profile.record_parent("Sort".to_string(), meter.accrued);
+                    }
+                }
+                if plan.distinct {
+                    // SELECT DISTINCT: project EVERY grouped row (charging its projection operator_evals,
+                    // the §3 asymmetry — like the non-aggregate DISTINCT path below), dedup by equality
+                    // keeping the first occurrence in the (already ORDER-BY-sorted) order, then apply
+                    // LIMIT/OFFSET. `seen` is membership-only; output order comes from the deterministic
+                    // group iteration / sort, never set iteration (no hashmap-order leak — CLAUDE.md §8/§10).
+                    let mut seen: std::collections::HashSet<Vec<Value>> =
+                        std::collections::HashSet::new();
+                    let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
+                    let mut seen_charge = 0i64; // the dedup set's entries (memory.md §6.2)
+                    for srow in &group_rows {
+                        let mut out = Vec::with_capacity(plan.projections.len());
+                        for p in &plan.projections {
+                            out.push(p.eval(srow, &env, meter)?);
+                        }
+                        if seen.insert(out.clone()) {
+                            if meter.query_memory_active() {
+                                let bytes = crate::memsize::entry_bytes(&out);
+                                meter.reserve_query(bytes)?;
+                                seen_charge += bytes;
+                            }
+                            meter.admit_row(&out)?;
+                            distinct_rows.push(out);
+                        }
+                    }
+                    meter.release_query(seen_charge);
+                    meter.release_rows(&group_rows);
+                    if select_actual_root_node(plan) != "Distinct"
+                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                    {
+                        profile.record_parent("Distinct".to_string(), meter.accrued);
+                    }
+                    // The dedup already projected every grouped row (the §3 asymmetry, charged above), so
+                    // emission is Identity — window + charge row_produced, deferred to the drive (streaming.md §4).
+                    let (start, end) = window_bounds(distinct_rows.len());
+                    Emitter::Buffer {
+                        rows: distinct_rows,
+                        start,
+                        end,
+                        mode: EmitMode::Identity,
+                    }
+                } else {
+                    // Window then project on emission; only an emitted row charges row_produced +
+                    // projection cost. Deferred to the drive (streaming.md §4).
+                    let (start, end) = window_bounds(group_rows.len());
+                    Emitter::Buffer {
+                        rows: group_rows,
+                        start,
+                        end,
+                        mode: EmitMode::Project,
+                    }
+                }
+            } else if plan.distinct {
+                // Project every filtered row (charging projection cost per row, the §3
+                // asymmetry), keeping first occurrences. `seen` is membership-only: the
+                // output order comes from the deterministic source iteration, never from set
+                // iteration (no hashmap-order leak — CLAUDE.md §8/§10).
                 let mut seen: std::collections::HashSet<Vec<Value>> =
                     std::collections::HashSet::new();
                 let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
                 let mut seen_charge = 0i64; // the dedup set's entries (memory.md §6.2)
-                for srow in &group_rows {
+                for row in &rows {
                     let mut out = Vec::with_capacity(plan.projections.len());
                     for p in &plan.projections {
-                        out.push(p.eval(srow, &env, meter)?);
+                        out.push(p.eval(row, &env, meter)?);
                     }
                     if seen.insert(out.clone()) {
                         if meter.query_memory_active() {
@@ -1163,14 +1226,15 @@ impl Engine {
                     }
                 }
                 meter.release_query(seen_charge);
-                meter.release_rows(&group_rows);
+                meter.release_rows_masked(&rows, &mem_mask);
                 if select_actual_root_node(plan) != "Distinct"
                     && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                 {
                     profile.record_parent("Distinct".to_string(), meter.accrued);
                 }
-                // The dedup already projected every grouped row (the §3 asymmetry, charged above), so
-                // emission is Identity — window + charge row_produced, deferred to the drive (streaming.md §4).
+                // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge row_produced
+                // (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
+                // asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
                 let (start, end) = window_bounds(distinct_rows.len());
                 Emitter::Buffer {
                     rows: distinct_rows,
@@ -1179,70 +1243,20 @@ impl Engine {
                     mode: EmitMode::Identity,
                 }
             } else {
-                // Window then project on emission; only an emitted row charges row_produced +
-                // projection cost. Deferred to the drive (streaming.md §4).
-                let (start, end) = window_bounds(group_rows.len());
+                // Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by LIMIT
+                // accrue no row_produced/projection cost (they were still scanned + filtered above).
+                // Producing a row, and each projection-list evaluation, accrue cost on emission — deferred
+                // to the drive (streaming.md §4). (ORDER BY's sort comparisons are not metered — cost.md §3.)
+                let (start, end) = window_bounds(rows.len());
                 Emitter::Buffer {
-                    rows: group_rows,
+                    rows,
                     start,
                     end,
                     mode: EmitMode::Project,
                 }
-            }
-        } else if plan.distinct {
-            // Project every filtered row (charging projection cost per row, the §3
-            // asymmetry), keeping first occurrences. `seen` is membership-only: the
-            // output order comes from the deterministic source iteration, never from set
-            // iteration (no hashmap-order leak — CLAUDE.md §8/§10).
-            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
-            let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
-            let mut seen_charge = 0i64; // the dedup set's entries (memory.md §6.2)
-            for row in &rows {
-                let mut out = Vec::with_capacity(plan.projections.len());
-                for p in &plan.projections {
-                    out.push(p.eval(row, &env, meter)?);
-                }
-                if seen.insert(out.clone()) {
-                    if meter.query_memory_active() {
-                        let bytes = crate::memsize::entry_bytes(&out);
-                        meter.reserve_query(bytes)?;
-                        seen_charge += bytes;
-                    }
-                    meter.admit_row(&out)?;
-                    distinct_rows.push(out);
-                }
-            }
-            meter.release_query(seen_charge);
-            meter.release_rows_masked(&rows, &mem_mask);
-            if select_actual_root_node(plan) != "Distinct"
-                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
-            {
-                profile.record_parent("Distinct".to_string(), meter.accrued);
-            }
-            // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge row_produced
-            // (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
-            // asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
-            let (start, end) = window_bounds(distinct_rows.len());
-            Emitter::Buffer {
-                rows: distinct_rows,
-                start,
-                end,
-                mode: EmitMode::Identity,
-            }
-        } else {
-            // Window the sorted rows BEFORE projection, so rows skipped by OFFSET or excluded by LIMIT
-            // accrue no row_produced/projection cost (they were still scanned + filtered above).
-            // Producing a row, and each projection-list evaluation, accrue cost on emission — deferred
-            // to the drive (streaming.md §4). (ORDER BY's sort comparisons are not metered — cost.md §3.)
-            let (start, end) = window_bounds(rows.len());
-            Emitter::Buffer {
-                rows,
-                start,
-                end,
-                mode: EmitMode::Project,
-            }
-        };
-        Ok(emitter)
+            };
+            Ok(emitter)
+        })
     }
 
     // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------

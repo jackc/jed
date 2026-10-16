@@ -339,6 +339,7 @@ impl Engine {
     /// Plan a view reference's body (views.md §4.1): a fresh top-level scope with no correlation,
     /// no outer CTEs, and no parameters. While a view body is traced, the reference records the
     /// dependency on the view itself.
+    #[inline(never)]
     pub(crate) fn plan_view_reference(
         &self,
         view_name: &str,
@@ -347,30 +348,39 @@ impl Engine {
         site: ViewSite,
         ptypes: &mut ParamTypes,
     ) -> Result<QueryPlan> {
-        if let Some(trace) = self.view_trace.borrow_mut().as_mut() {
-            trace.items.insert(
-                written.pos.name,
-                TraceItem {
-                    kind: ViewDepKind::View,
-                    name: view_name.to_string(),
-                    pos: written.pos,
-                },
-            );
-        }
+        // The bookkeeping around the body's planning runs in frames of its own: a chain of views
+        // nests through here (spec/design/cost.md §7.1).
+        outline(|| {
+            if let Some(trace) = self.view_trace.borrow_mut().as_mut() {
+                trace.items.insert(
+                    written.pos.name,
+                    TraceItem {
+                        kind: ViewDepKind::View,
+                        name: view_name.to_string(),
+                        pos: written.pos,
+                    },
+                );
+            }
+        });
         self.in_view_body(site, || {
             let plan = self.plan_query(body, None, &[], ptypes)?;
-            self.view_columns
-                .borrow_mut()
-                .entry(view_name.to_string())
-                .or_insert_with(|| {
-                    (
-                        plan.column_names().to_vec(),
-                        plan.column_types().to_vec(),
-                        plan.column_derivs().to_vec(),
-                    )
-                });
+            outline(|| self.record_view_columns(view_name, &plan));
             Ok(plan)
         })
+    }
+
+    /// Remember a view's output columns from the plan of its body (first planning wins).
+    fn record_view_columns(&self, view_name: &str, plan: &QueryPlan) {
+        self.view_columns
+            .borrow_mut()
+            .entry(view_name.to_string())
+            .or_insert_with(|| {
+                (
+                    plan.column_names().to_vec(),
+                    plan.column_types().to_vec(),
+                    plan.column_derivs().to_vec(),
+                )
+            });
     }
 
     /// The canonical type text of each output column of `view` (introspection.md §5): the body is

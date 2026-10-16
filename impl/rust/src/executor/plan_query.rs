@@ -122,7 +122,7 @@ impl Engine {
                 _ => CteShape::NonRecursive,
             };
             match shape {
-                CteShape::Recursive { union_all } => {
+                CteShape::Recursive { union_all } => outline(|| -> Result<()> {
                     // The body is `anchor UNION[ALL] recursive_term` (analyze_recursive_cte verified).
                     let q = cte
                         .body
@@ -142,51 +142,56 @@ impl Engine {
                     let visible: Vec<&CteBinding> =
                         inherited.iter().copied().chain(bindings.iter()).collect();
                     let anchor_plan = self.plan_query(anchor, parent, &visible, ptypes)?;
-                    let mut table =
-                        cte_synthetic_table(&lname, &anchor_plan, cte.columns.as_deref())?;
-                    // SEARCH / CYCLE add columns after the CTE's own (recursive-cte.md §9).
-                    let sc = if search_cycle {
-                        let sc = self.plan_search_cycle(
-                            cte,
-                            &table,
-                            anchor_plan.column_types(),
-                            mark.as_ref(),
-                            ptypes,
-                        )?;
-                        let mut names: Vec<String> =
-                            table.columns.iter().map(|c| c.name.clone()).collect();
-                        names.extend(sc.names.iter().cloned());
-                        let mut types = anchor_plan.column_types().to_vec();
-                        types.extend(sc.types.iter().cloned());
-                        let mut derivs = anchor_plan.column_derivs().to_vec();
-                        derivs.extend(sc.types.iter().map(|_| Deriv::None));
-                        let mut typmods = anchor_plan.column_typmods().to_vec();
-                        typmods.extend(sc.types.iter().map(|_| Typmod::NONE));
-                        table = cte_synthetic_table_cols(
-                            &lname,
-                            &names,
-                            &types,
-                            Some(&derivs),
-                            Some(&typmods),
-                            None,
-                        )?;
-                        Some(sc)
-                    } else {
-                        None
-                    };
-                    let added = sc.as_ref().map_or(0, |sc| sc.names.len());
-                    bindings.push(CteBinding {
-                        name: lname,
-                        table,
-                        source: CteSource::Query(anchor_plan),
-                        recursive: None,
-                        hint: cte.materialized,
-                        refs: std::cell::Cell::new(0),
-                        at_reference: false,
-                        body_ast: None,
-                        expanded: std::cell::Cell::new(false),
-                        star_hidden: std::cell::Cell::new(added),
-                    });
+                    drop(visible);
+                    // The anchor's binding is built in its own frame, off both recursions.
+                    let (added, sc) = outline(|| -> Result<_> {
+                        let mut table =
+                            cte_synthetic_table(&lname, &anchor_plan, cte.columns.as_deref())?;
+                        // SEARCH / CYCLE add columns after the CTE's own (recursive-cte.md §9).
+                        let sc = if search_cycle {
+                            let sc = self.plan_search_cycle(
+                                cte,
+                                &table,
+                                anchor_plan.column_types(),
+                                mark.as_ref(),
+                                ptypes,
+                            )?;
+                            let mut names: Vec<String> =
+                                table.columns.iter().map(|c| c.name.clone()).collect();
+                            names.extend(sc.names.iter().cloned());
+                            let mut types = anchor_plan.column_types().to_vec();
+                            types.extend(sc.types.iter().cloned());
+                            let mut derivs = anchor_plan.column_derivs().to_vec();
+                            derivs.extend(sc.types.iter().map(|_| Deriv::None));
+                            let mut typmods = anchor_plan.column_typmods().to_vec();
+                            typmods.extend(sc.types.iter().map(|_| Typmod::NONE));
+                            table = cte_synthetic_table_cols(
+                                &lname,
+                                &names,
+                                &types,
+                                Some(&derivs),
+                                Some(&typmods),
+                                None,
+                            )?;
+                            Some(sc)
+                        } else {
+                            None
+                        };
+                        let added = sc.as_ref().map_or(0, |sc| sc.names.len());
+                        bindings.push(CteBinding {
+                            name: lname,
+                            table,
+                            source: CteSource::Query(anchor_plan),
+                            recursive: None,
+                            hint: cte.materialized,
+                            refs: std::cell::Cell::new(0),
+                            at_reference: false,
+                            body_ast: None,
+                            expanded: std::cell::Cell::new(false),
+                            star_hidden: std::cell::Cell::new(added),
+                        });
+                        Ok((added, sc))
+                    })?;
                     // Plan the recursive term with the self-binding now visible. Under SEARCH /
                     // CYCLE it carries the self-reference's added columns as hidden trailing
                     // outputs — the parent row's, from which the executor computes the child's.
@@ -218,9 +223,10 @@ impl Engine {
                         union_all,
                         search_cycle: sc,
                     });
-                }
+                    Ok(())
+                })?,
                 CteShape::NonRecursive => match &cte.body {
-                    CteBody::Query(q) => {
+                    CteBody::Query(q) => outline(|| -> Result<()> {
                         let visible: Vec<&CteBinding> =
                             inherited.iter().copied().chain(bindings.iter()).collect();
                         // Named exactly once, by a query part, and not MATERIALIZED: a candidate
@@ -242,21 +248,27 @@ impl Engine {
                                 self.plan_query(q, parent, &visible, ptypes)
                             })?;
                         }
-                        let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
-                        bindings.push(CteBinding {
-                            name: lname,
-                            table,
-                            source: CteSource::Query(plan),
-                            recursive: None,
-                            hint: cte.materialized,
-                            refs: std::cell::Cell::new(0),
-                            at_reference,
-                            body_ast: at_reference.then(|| q.clone()),
-                            expanded: std::cell::Cell::new(false),
-                            star_hidden: std::cell::Cell::new(0),
-                        });
-                    }
-                    dm_body => {
+                        drop(visible);
+                        // The binding is built in its own frame, off the recursion above.
+                        outline(|| -> Result<()> {
+                            let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
+                            bindings.push(CteBinding {
+                                name: lname,
+                                table,
+                                source: CteSource::Query(plan),
+                                recursive: None,
+                                hint: cte.materialized,
+                                refs: std::cell::Cell::new(0),
+                                at_reference,
+                                body_ast: at_reference.then(|| q.clone()),
+                                expanded: std::cell::Cell::new(false),
+                                star_hidden: std::cell::Cell::new(0),
+                            });
+                            Ok(())
+                        })?;
+                        Ok(())
+                    })?,
+                    dm_body => outline(|| -> Result<()> {
                         // A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the
                         // synthetic relation + capture the statement to run later.
                         let visible: Vec<&CteBinding> =
@@ -280,7 +292,8 @@ impl Engine {
                             expanded: std::cell::Cell::new(false),
                             star_hidden: std::cell::Cell::new(0),
                         });
-                    }
+                        Ok(())
+                    })?,
                 },
             }
             // SEARCH / CYCLE on a CTE that does not reference itself (recursive-cte.md §9), reported
@@ -922,16 +935,22 @@ impl Engine {
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<QueryPlan> {
+        // Each arm plans in its own frame: this dispatch is on every query-nesting recursion
+        // (spec/design/cost.md §7.1).
         match qe {
             QueryExpr::Select(sel) => Ok(QueryPlan::Select(
                 self.plan_select(sel, parent, ctes, ptypes)?,
             )),
-            QueryExpr::SetOp(so) => Ok(QueryPlan::SetOp(Box::new(
-                self.plan_set_op(so, parent, ctes, ptypes)?,
-            ))),
-            QueryExpr::With(we) => Ok(QueryPlan::With(Box::new(
-                self.plan_with_expr(we, parent, ctes, ptypes)?,
-            ))),
+            QueryExpr::SetOp(so) => outline(|| {
+                Ok(QueryPlan::SetOp(Box::new(
+                    self.plan_set_op(so, parent, ctes, ptypes)?,
+                )))
+            }),
+            QueryExpr::With(we) => outline(|| {
+                Ok(QueryPlan::With(Box::new(
+                    self.plan_with_expr(we, parent, ctes, ptypes)?,
+                )))
+            }),
         }
     }
 
@@ -986,18 +1005,24 @@ impl Engine {
         params: &[Value],
         ctes: CteCtx,
     ) -> Result<SelectResult> {
-        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-            profile.begin_frame();
-        }
+        // The EXPLAIN ANALYZE bookkeeping and each arm run in their own frames: this dispatch is
+        // on every query-nesting recursion (spec/design/cost.md §7.1).
+        outline(|| {
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.begin_frame();
+            }
+        });
         let result = match plan {
-            QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params, ctes),
-            QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params, ctes),
-            QueryPlan::Values(vp) => self.exec_values_plan(vp, outer, params, ctes),
-            QueryPlan::With(wp) => self.exec_with_plan(wp, outer, params, ctes),
+            QueryPlan::Select(sp) => outline(|| self.exec_select_plan(sp, outer, params, ctes)),
+            QueryPlan::SetOp(sop) => outline(|| self.exec_set_op_plan(sop, outer, params, ctes)),
+            QueryPlan::Values(vp) => outline(|| self.exec_values_plan(vp, outer, params, ctes)),
+            QueryPlan::With(wp) => outline(|| self.exec_with_plan(wp, outer, params, ctes)),
         };
-        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-            profile.end_frame();
-        }
+        outline(|| {
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.end_frame();
+            }
+        });
         result
     }
 
@@ -1034,7 +1059,7 @@ impl Engine {
     ) -> Result<SelectResult> {
         let inherited = ctes.prefix(wp.inherited_len);
         let (buffers, total_cost) =
-            self.materialize_ctes(&wp.bindings, &wp.modes, params, inherited, outer)?;
+            outline(|| self.materialize_ctes(&wp.bindings, &wp.modes, params, inherited, outer))?;
         let view = CteCtxView::extend_at(inherited, outer, &wp.modes, &wp.bindings, &buffers);
         let ctx = view.ctx();
         let mut r = self.exec_query_plan(&wp.body, outer, params, ctx)?;

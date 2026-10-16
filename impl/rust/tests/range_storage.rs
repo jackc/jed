@@ -104,7 +104,8 @@ fn canonical_name_and_aliases() {
     let msg = db3
         .query_outcome("CREATE INDEX ON u USING gin (r)", &[])
         .expect_err("a gin index over a plain range column is rejected")
-        .message;
+        .message
+        .clone();
     assert!(msg.contains("i32range"), "message names i32range: {msg}");
 }
 

@@ -37,6 +37,7 @@ pub(crate) use crate::operators::{
 };
 pub(crate) use crate::pmap::KeyBound;
 pub(crate) use crate::privileges::{Privilege, PrivilegeSet};
+pub(crate) use crate::stack::outline;
 pub(crate) use crate::storage::{Row, TableStore};
 pub(crate) use crate::timestamp::{InputZone, parse_timestamp};
 pub(crate) use crate::types::{DecimalTypmod, ScalarType, Type};
@@ -3875,7 +3876,7 @@ pub(crate) enum RExpr {
         rhs: Box<RExpr>,
         negated: bool,
         insensitive: bool,
-        program: Option<crate::regex::Program>,
+        program: Option<Box<crate::regex::Program>>,
         compile_charged: std::cell::Cell<bool>,
     },
     /// `upper(text)` / `lower(text)` — Unicode case folding (collation.md §16). `upper` selects the
@@ -4015,7 +4016,7 @@ pub(crate) enum RExpr {
     RegexFunc {
         func: RegexFunc,
         args: Vec<RExpr>,
-        program: Option<crate::regex::Program>,
+        program: Option<Box<crate::regex::Program>>,
         compile_charged: std::cell::Cell<bool>,
     },
     /// A range CONSTRUCTOR call (spec/design/range-functions.md §2 — `i32range(lo, hi[, bounds])` and
@@ -4185,7 +4186,9 @@ pub(crate) enum SubqueryKind {
 
 /// A resolved query expression: a SELECT plan or a set-operation plan (mirrors `QueryExpr`).
 pub(crate) enum QueryPlan {
-    Select(SelectPlan),
+    /// Boxed to keep `QueryPlan` (and every `Result<QueryPlan>` on the recursive planning path —
+    /// spec/design/cost.md §7.1) small.
+    Select(Box<SelectPlan>),
     SetOp(Box<SetOpPlan>),
     /// A VALUES-body relation — `FROM (VALUES …) AS v` (spec/design/grammar.md §42): a computed
     /// relation of literal rows, the FROM-position sibling of `INSERT … VALUES`. Only ever produced

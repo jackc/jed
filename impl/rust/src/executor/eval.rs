@@ -45,28 +45,28 @@ impl RExpr {
             // (1 = immediate parent). A leaf — reads from the outer-row environment (§26), with
             // the same demand-fault backstop as `Column`.
             RExpr::OuterColumn { level, index } => {
-                match &env.outer[env.outer.len() - level][*index] {
+                outline(|| match &env.outer[env.outer.len() - level][*index] {
                     Value::Unfetched(u) => crate::format::resolve_unfetched_self(u),
                     v => Ok(v.clone()),
-                }
+                })
             }
             // A bind parameter — the supplied value, already coerced to its inferred type by
             // `bind_params` before execution (spec/design/api.md §5).
             RExpr::Param(i) => Ok(env.params[*i].clone()),
             // A ROW(...) constructor — one operator_eval, then build the composite from the
             // evaluated fields (spec/design/composite.md §1, cost.md §9).
-            RExpr::Row(fields) => {
+            RExpr::Row(fields) => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(fields.len());
                 for f in fields {
                     vals.push(f.eval(row, env, m)?);
                 }
                 Ok(Value::Composite(vals))
-            }
+            }),
             // An ARRAY[…] constructor — one operator_eval, then evaluate each element (already
             // coerced to the element type at resolve). A `nested` constructor stacks its sub-arrays
             // into one higher dimension (spec/design/array.md §4); otherwise it is a flat 1-D array.
-            RExpr::Array { elems, nested } => {
+            RExpr::Array { elems, nested } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(elems.len());
                 for e in elems {
@@ -82,14 +82,14 @@ impl RExpr {
                     charge_output(m, &out)?;
                 }
                 Ok(out)
-            }
+            }),
             // A folded array constant (shape preserved) — return it directly.
             RExpr::ConstArray(a) => Ok(Value::Array((**a).clone())),
             RExpr::ConstRange(r) => Ok(Value::Range((**r).clone())),
             // Field selection — one operator_eval, then pull the resolved field ordinal out of the
             // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in
             // range by construction (resolve fixed it against the static field list).
-            RExpr::Field { base, index } => {
+            RExpr::Field { base, index } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 match base.eval(row, env, m)? {
                     Value::Composite(fields) => Ok(fields[*index].clone()),
@@ -98,7 +98,7 @@ impl RExpr {
                         unreachable!("field access on a non-composite value: {other:?}")
                     }
                 }
-            }
+            }),
             // Array subscript `base[..][..]` (spec/design/array.md §6) — one operator_eval. A NULL
             // array or any NULL subscript bound yields NULL. Element access (`!is_slice`) returns
             // the element when the subscript count equals `ndim` and every index is in range, else
@@ -135,7 +135,7 @@ impl RExpr {
                 target,
                 typmod,
                 varchar_len,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let out = match inner.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
@@ -311,13 +311,13 @@ impl RExpr {
                     }
                     (_, v) => Ok(v),
                 }
-            }
+            }),
             // The three array-involving casts (spec/design/array.md §7), none expressible by the
             // scalar `Cast` node: array→text (`array_out`), runtime text→T[] (`array_in` per row),
             // and element-wise array→array (each element through the scalar cast). The node carries
             // the cast's `operator_eval` charge (no new cost unit). `to_elem` is `None` for the
             // text target and `Some(target element)` for the two array-producing casts.
-            RExpr::ArrayCast { inner, to_elem } => {
+            RExpr::ArrayCast { inner, to_elem } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 match inner.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
@@ -380,8 +380,8 @@ impl RExpr {
                     }
                     _ => unreachable!("an ArrayCast operand is text or array (resolver-gated)"),
                 }
-            }
-            RExpr::Neg { operand, result } => {
+            }),
+            RExpr::Neg { operand, result } => outline(|| {
                 m.charge(operator_cost("neg"));
                 match operand.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
@@ -427,18 +427,18 @@ impl RExpr {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
                 }
-            }
-            RExpr::Not(e) => {
+            }),
+            RExpr::Not(e) => outline(|| {
                 m.charge(operator_cost("not"));
                 let v = e.eval(row, env, m)?;
                 Ok(not3(&v))
-            }
+            }),
             RExpr::Arith {
                 op,
                 lhs,
                 rhs,
                 result,
-            } => {
+            } => outline(|| {
                 m.charge(operator_cost(op.op_name()));
                 let a = lhs.eval(row, env, m)?;
                 let b = rhs.eval(row, env, m)?;
@@ -538,13 +538,13 @@ impl RExpr {
                         _ => unreachable!("resolver rejects non-integer arithmetic operands"),
                     }
                 }
-            }
+            }),
             RExpr::Compare {
                 op,
                 lhs,
                 rhs,
                 collation,
-            } => {
+            } => outline(|| {
                 m.charge(operator_cost(op.op_name()));
                 let a = lhs.eval(row, env, m)?;
                 let b = rhs.eval(row, env, m)?;
@@ -607,8 +607,8 @@ impl RExpr {
                     CmpOp::Ge => a.gt3(&b).or(a.eq3(&b)),
                 };
                 Ok(from3(tv))
-            }
-            RExpr::JsonGet { op, base, arg } => {
+            }),
+            RExpr::JsonGet { op, base, arg } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let bv = base.eval(row, env, m)?;
                 let av = arg.eval(row, env, m)?;
@@ -670,8 +670,8 @@ impl RExpr {
                         Ok(json::node_to_text(n).map_or(Value::Null, Value::Text))
                     }
                 }
-            }
-            RExpr::JsonContains { a, b } => {
+            }),
+            RExpr::JsonContains { a, b } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let av = a.eval(row, env, m)?;
                 let bv = b.eval(row, env, m)?;
@@ -682,8 +682,8 @@ impl RExpr {
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     _ => unreachable!("resolver guarantees jsonb operands for @> / <@"),
                 }
-            }
-            RExpr::JsonHasKey { kind, base, arg } => {
+            }),
+            RExpr::JsonHasKey { kind, base, arg } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let bv = base.eval(row, env, m)?;
                 let av = arg.eval(row, env, m)?;
@@ -724,8 +724,8 @@ impl RExpr {
                     },
                 };
                 Ok(Value::Bool(result))
-            }
-            RExpr::JsonConcat { a, b } => {
+            }),
+            RExpr::JsonConcat { a, b } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let av = a.eval(row, env, m)?;
                 let bv = b.eval(row, env, m)?;
@@ -745,8 +745,8 @@ impl RExpr {
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     _ => unreachable!("resolver guarantees jsonb operands for ||"),
                 }
-            }
-            RExpr::JsonDelete { kind, base, arg } => {
+            }),
+            RExpr::JsonDelete { kind, base, arg } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let bv = base.eval(row, env, m)?;
                 let av = arg.eval(row, env, m)?;
@@ -773,11 +773,11 @@ impl RExpr {
                     DeleteKind::Path => json::delete_path(node, &json_text_path_arg(&av)?)?,
                 };
                 Ok(Value::Jsonb(result))
-            }
+            }),
             // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL
             // argument → SQL NULL (a NULL path element is the kernel's 22004). jsonb_set_lax is jsonb_set that is not
             // strict in the value: a SQL NULL value is handled by its null_value_treatment.
-            RExpr::JsonSetInsert { mode, lax, args } => {
+            RExpr::JsonSetInsert { mode, lax, args } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let target = args[0].eval(row, env, m)?;
                 let path_v = args[1].eval(row, env, m)?;
@@ -841,9 +841,9 @@ impl RExpr {
                     charge_output(m, &out)?;
                 }
                 Ok(out)
-            }
+            }),
             // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
-            RExpr::JsonObjectFromArrays { json, args } => {
+            RExpr::JsonObjectFromArrays { json, args } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 // STRICT: a NULL whole-array argument → SQL NULL.
                 let mut arrays = Vec::with_capacity(args.len());
@@ -916,9 +916,9 @@ impl RExpr {
                     charge_output(m, &out)?;
                 }
                 Ok(out)
-            }
+            }),
             // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL argument → NULL.
-            RExpr::JsonPathFn { kind, args, .. } => {
+            RExpr::JsonPathFn { kind, args, .. } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -995,7 +995,7 @@ impl RExpr {
                         }
                     }
                 }
-            }
+            }),
             // A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md
             // §5, S2). A NULL context / path → NULL; a SQL/JSON (class-22) error honors ON ERROR.
             RExpr::JsonSqlFn {
@@ -1009,7 +1009,7 @@ impl RExpr {
                 wrapper,
                 on_empty,
                 on_error,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let cv = ctx.eval(row, env, m)?;
                 let pv = path.eval(row, env, m)?;
@@ -1052,10 +1052,10 @@ impl RExpr {
                     *kind, seq, *returning, *decimal, *wrapper, *on_empty, *on_error, constant,
                     env, m,
                 )
-            }
+            }),
             // AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND,
             // a TRUE one decides OR, and the right operand is then never evaluated or charged.
-            RExpr::And(l, r) => {
+            RExpr::And(l, r) => outline(|| {
                 m.charge(operator_cost("and"));
                 let lv = l.eval(row, env, m)?;
                 if matches!(lv, Value::Bool(false)) {
@@ -1063,8 +1063,8 @@ impl RExpr {
                 }
                 let rv = r.eval(row, env, m)?;
                 Ok(and3(&lv, &rv))
-            }
-            RExpr::Or(l, r) => {
+            }),
+            RExpr::Or(l, r) => outline(|| {
                 m.charge(operator_cost("or"));
                 let lv = l.eval(row, env, m)?;
                 if matches!(lv, Value::Bool(true)) {
@@ -1072,8 +1072,8 @@ impl RExpr {
                 }
                 let rv = r.eval(row, env, m)?;
                 Ok(or3(&lv, &rv))
-            }
-            RExpr::IsNull { operand, negated } => {
+            }),
+            RExpr::IsNull { operand, negated } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 // IS [NOT] NULL is always a definite boolean, never unknown (CLAUDE.md §4). For a
                 // composite operand this is PG's recursive all-fields rule (NOT a negation —
@@ -1081,13 +1081,13 @@ impl RExpr {
                 // unifies both.
                 let v = operand.eval(row, env, m)?;
                 Ok(Value::Bool(v.is_null_test(*negated)))
-            }
+            }),
             RExpr::IsJson {
                 operand,
                 negated,
                 kind,
                 unique_keys,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let v = operand.eval(row, env, m)?;
                 let ok = match v {
@@ -1114,11 +1114,11 @@ impl RExpr {
                     ),
                 };
                 Ok(Value::Bool(ok ^ *negated))
-            }
+            }),
             RExpr::JsonCtor {
                 operand,
                 unique_keys,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let v = operand.eval(row, env, m)?;
                 match v {
@@ -1143,8 +1143,8 @@ impl RExpr {
                     }
                     _ => unreachable!("resolver restricts JSON() to a text operand"),
                 }
-            }
-            RExpr::Distinct { lhs, rhs, negated } => {
+            }),
+            RExpr::Distinct { lhs, rhs, negated } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
                 let rv = rhs.eval(row, env, m)?;
@@ -1158,13 +1158,13 @@ impl RExpr {
                 // way the result is a definite boolean — never unknown (the null_safe
                 // discipline, functions.md §3).
                 Ok(Value::Bool(same == *negated))
-            }
+            }),
             RExpr::Like {
                 lhs,
                 rhs,
                 negated,
                 insensitive,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let subject = lhs.eval(row, env, m)?;
                 let pattern = rhs.eval(row, env, m)?;
@@ -1190,7 +1190,7 @@ impl RExpr {
                 };
                 // `negated` carries NOT LIKE/ILIKE: matched != negated flips for the NOT form.
                 Ok(Value::Bool(matched != *negated))
-            }
+            }),
             RExpr::Regex {
                 lhs,
                 rhs,
@@ -1198,7 +1198,7 @@ impl RExpr {
                 insensitive,
                 program,
                 compile_charged,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let subject = lhs.eval(row, env, m)?;
                 let pattern = rhs.eval(row, env, m)?;
@@ -1254,13 +1254,13 @@ impl RExpr {
                 };
                 // `negated` carries !~ / !~*: matched != negated flips for the negated form.
                 Ok(Value::Bool(matched != *negated))
-            }
+            }),
             RExpr::RegexFunc {
                 func,
                 args,
                 program,
                 compile_charged,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
                 let mut vals = Vec::with_capacity(args.len());
@@ -1524,8 +1524,8 @@ impl RExpr {
                         }
                     },
                 }
-            }
-            RExpr::Casing { upper, arg } => {
+            }),
+            RExpr::Casing { upper, arg } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 match arg.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
@@ -1539,12 +1539,12 @@ impl RExpr {
                     }
                     _ => unreachable!("resolver restricts upper/lower to text operands"),
                 }
-            }
+            }),
             RExpr::AtTimeZone {
                 zone,
                 value,
                 to_timestamptz,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let zv = zone.eval(row, env, m)?;
                 let vv = value.eval(row, env, m)?;
@@ -1589,8 +1589,8 @@ impl RExpr {
                             .ok_or_else(crate::timestamp::zone_shift_out_of_range)?,
                     )
                 })
-            }
-            RExpr::DateTrunc { unit, value, zone } => {
+            }),
+            RExpr::DateTrunc { unit, value, zone } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let uv = unit.eval(row, env, m)?;
                 let vv = value.eval(row, env, m)?;
@@ -1650,8 +1650,8 @@ impl RExpr {
                     }
                     _ => unreachable!("resolver restricts date_trunc to ts/tstz/interval"),
                 }
-            }
-            RExpr::Extract { field, value } => {
+            }),
+            RExpr::Extract { field, value } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let vv = value.eval(row, env, m)?;
                 use crate::datetime_fn::ExtractSrc;
@@ -1694,28 +1694,28 @@ impl RExpr {
                     Some(d) => Value::Decimal(d),
                     None => Value::Null,
                 })
-            }
-            RExpr::DateConvert { inner, to } => {
+            }),
+            RExpr::DateConvert { inner, to } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let v = inner.eval(row, env, m)?;
                 if matches!(v, Value::Null) {
                     return Ok(Value::Null);
                 }
                 eval_date_convert(v, *to, env, m)
-            }
-            RExpr::DateClock { offset_days } => {
+            }),
+            RExpr::DateClock { offset_days } => outline(|| {
                 // A clock-relative date literal ('today'/'now'/'tomorrow'/'yesterday' —
                 // date.md §6): the statement clock's day in the session zone + offset_days.
                 // STABLE — the clock is read once per statement, so every evaluation in the
                 // statement yields the same day.
                 m.charge(COSTS.operator_eval);
                 date_clock_value(env.exec, env.rng, m, *offset_days)
-            }
+            }),
             RExpr::Case {
                 arms,
                 els,
                 coerce_decimal,
-            } => {
+            } => outline(|| {
                 // CASE is a sanctioned short-circuit (cost.md §3), like AND / OR and COALESCE:
                 // conditions are evaluated in order and evaluation STOPS at the first TRUE — a
                 // FALSE or NULL/UNKNOWN condition falls through, and later arms (and their
@@ -1729,11 +1729,11 @@ impl RExpr {
                     }
                 }
                 Ok(coerce_case(els.eval(row, env, m)?, *coerce_decimal))
-            }
+            }),
             RExpr::Coalesce {
                 args,
                 coerce_decimal,
-            } => {
+            } => outline(|| {
                 // COALESCE shares CASE's sanctioned short-circuit (cost.md §3): charge the node,
                 // then evaluate arguments left to right — each at most ONCE — stopping at the
                 // first non-NULL, which is the result. All-NULL → NULL. Later arguments are never
@@ -1747,13 +1747,13 @@ impl RExpr {
                     }
                 }
                 Ok(Value::Null)
-            }
+            }),
             RExpr::GreatestLeast {
                 args,
                 coerce_decimal,
                 greatest,
                 collation,
-            } => {
+            } => outline(|| {
                 // GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY
                 // argument (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments
                 // are ignored; the running winner is the max (greatest) or min (least) under the
@@ -1800,10 +1800,10 @@ impl RExpr {
                     }
                 }
                 Ok(best.unwrap_or(Value::Null))
-            }
+            }),
             RExpr::HostFunc {
                 id, args, result, ..
-            } => {
+            } => outline(|| {
                 // A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the
                 // injection seam. The kernel is reached BY ID through the frozen registry — the path
                 // a compiled `match` on the closed `ScalarFunc` enum cannot offer a host.
@@ -1857,8 +1857,8 @@ impl RExpr {
                     return Err(overflow(*result));
                 }
                 Ok(out)
-            }
-            RExpr::ScalarFunc { func, args, result } => {
+            }),
+            RExpr::ScalarFunc { func, args, result } => outline(|| {
                 // One operator_eval per call (the uniform weight); arguments charge their own.
                 m.charge(COSTS.operator_eval);
                 // quote_nullable is the one NON-STRICT scalar function (null = "none"): a NULL
@@ -3003,12 +3003,12 @@ impl RExpr {
                         unreachable!("quote_nullable is handled by the non-strict pre-check")
                     }
                 }
-            }
+            }),
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
             // per call; arguments charge their own. NULL handling is per-kernel (the introspectors
             // propagate, the builders are non-strict), so — unlike `ScalarFunc` — there is no
             // blanket NULL short-circuit here.
-            RExpr::ArrayFunc { func, args } => {
+            RExpr::ArrayFunc { func, args } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -3024,44 +3024,44 @@ impl RExpr {
                     charge_output(m, &out)?;
                 }
                 Ok(out)
-            }
-            RExpr::RangeFunc { func, args } => {
+            }),
+            RExpr::RangeFunc { func, args } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(a.eval(row, env, m)?);
                 }
                 eval_range_func(func, &vals)
-            }
+            }),
             // A range CONSTRUCTOR call (spec/design/range-functions.md §2). One operator_eval (like
             // the range accessors); arguments charge their own evaluation. Non-strict — the kernel
             // turns a NULL bound into an infinite bound, so there is no blanket NULL short-circuit.
-            RExpr::RangeCtor { elem, args } => {
+            RExpr::RangeCtor { elem, args } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(a.eval(row, env, m)?);
                 }
                 eval_range_ctor(*elem, &vals, &env.exec.input_zone())
-            }
+            }),
             // A range BOOLEAN operator (spec/design/range-functions.md §3). One operator_eval; the
             // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
             // `eval_range_op`.
-            RExpr::RangeOp { op, args, elem } => {
+            RExpr::RangeOp { op, args, elem } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let l = args[0].eval(row, env, m)?;
                 let r = args[1].eval(row, env, m)?;
                 eval_range_op(*op, &l, &r, *elem, &env.exec.input_zone())
-            }
+            }),
             // A range SET operator (spec/design/range-functions.md §4). One operator_eval; the
             // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
             // `eval_range_set_op`.
-            RExpr::RangeSetOp { op, args } => {
+            RExpr::RangeSetOp { op, args } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let l = args[0].eval(row, env, m)?;
                 let r = args[1].eval(row, env, m)?;
                 eval_range_set_op(*op, &l, &r)
-            }
+            }),
             // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One
             // operator_eval (the per-element/arg count walk is unmetered, like the array
             // introspectors §3.3); arguments charge their own evaluation. Non-strict — no blanket
@@ -3072,7 +3072,7 @@ impl RExpr {
                 func,
                 args,
                 array_form,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let want_nulls = matches!(func, VariadicFunc::NumNulls);
                 let count = if *array_form {
@@ -3089,11 +3089,11 @@ impl RExpr {
                     count_nulls(vals.iter(), want_nulls)
                 };
                 Ok(Value::Int(count as i64))
-            }
+            }),
             // A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
             // row_to_json / JSON_SCALAR. STRICT. A finite timestamptz at any depth charges one `timezone` unit,
             // charged and guarded before rendering (the array → text cast's rule, timezones.md §9.5).
-            RExpr::JsonImage { func, args, ty } => {
+            RExpr::JsonImage { func, args, ty } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -3141,7 +3141,7 @@ impl RExpr {
                     charge_output(m, &out)?;
                 }
                 Ok(out)
-            }
+            }),
             // A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values
             // (the spread form directly; the VARIADIC-array form spreads the lone array — a NULL
             // array → NULL), then build an array / object node.
@@ -3151,7 +3151,7 @@ impl RExpr {
                 args,
                 array_form,
                 tys,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let vals: Vec<Value> = if *array_form {
                     match args[0].eval(row, env, m)? {
@@ -3260,7 +3260,7 @@ impl RExpr {
                     charge_output(m, &out)?;
                 }
                 Ok(out)
-            }
+            }),
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
             // Push the current row onto the outer-row stack, run the inner plan against it, fold
             // its accrued cost into this meter, plus one operator_eval for the node. (Uncorrelated
@@ -3271,7 +3271,7 @@ impl RExpr {
                 lhs,
                 negated,
                 row_valued,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let mut child: Vec<&[Value]> = env.outer.to_vec();
                 child.push(row);
@@ -3346,13 +3346,13 @@ impl RExpr {
                 };
                 m.release_query(held);
                 out
-            }
+            }),
             // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
-            RExpr::InValues { lhs, list, negated } => {
+            RExpr::InValues { lhs, list, negated } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
                 in_membership(&lv, list, *negated, m)
-            }
+            }),
             // A quantified array comparison `lhs op ANY/ALL(array)` (array-functions.md §11) — the
             // array spelling of IN, the 3VL fold over the array's flattened elements.
             RExpr::Quantified {
@@ -3363,19 +3363,19 @@ impl RExpr {
                 row_wise,
                 collation,
                 ..
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
                 let av = array.eval(row, env, m)?;
                 quantified_membership(*op, *all, *row_wise, &lv, &av, collation.as_deref(), m)
-            }
+            }),
             // `width_bucket(operand, thresholds)` (array-functions.md §14): strict like a scalar
             // function — a NULL operand short-circuits before `thresholds` is evaluated.
             RExpr::WidthBucketArray {
                 operand,
                 thresholds,
                 collation,
-            } => {
+            } => outline(|| {
                 m.charge(COSTS.operator_eval);
                 let ov = operand.eval(row, env, m)?;
                 if matches!(ov, Value::Null) {
@@ -3386,7 +3386,7 @@ impl RExpr {
                     return Ok(Value::Null);
                 }
                 width_bucket_array(&ov, &tv, collation.as_deref(), m)
-            }
+            }),
         }
     }
 }

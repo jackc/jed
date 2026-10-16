@@ -175,7 +175,10 @@ fn prepared_statement_error_has_position() {
 fn position_absent_off_the_named_paths() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     let e = err(&mut db, "SELECT 1 / 0");
-    assert_eq!((e.code(), e.position, e.hint), ("22012", None, None));
+    assert_eq!(
+        (e.code(), e.position, e.hint.clone()),
+        ("22012", None, None)
+    );
     let e = jed::parser::parse_expression("'abc").unwrap_err();
     assert_eq!((e.code(), e.position), ("42601", None));
     let e = jed::parser::parse_expression("a +").unwrap_err();

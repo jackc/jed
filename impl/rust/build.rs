@@ -9,5 +9,12 @@ fn main() {
     let dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("test-tmp");
     std::fs::create_dir_all(&dir).expect("create CARGO_TARGET_TMPDIR scratch dir");
     println!("cargo:rustc-env=CARGO_TARGET_TMPDIR={}", dir.display());
+    // `jed_optimized`: an optimized build, the one the native-stack budget is stated for
+    // (spec/design/cost.md §7.1). impl/rust/tests/depth_limit.rs runs every nesting vector on a
+    // thread of exactly that budget only then; unoptimized frames are several times larger.
+    println!("cargo::rustc-check-cfg=cfg(jed_optimized)");
+    if std::env::var("OPT_LEVEL").is_ok_and(|level| level != "0") {
+        println!("cargo:rustc-cfg=jed_optimized");
+    }
     println!("cargo:rerun-if-changed=build.rs");
 }

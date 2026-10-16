@@ -69,6 +69,7 @@ mod spill_buffer;
 mod spillhost;
 mod split;
 mod sqlstate;
+mod stack;
 mod storage;
 mod timestamp;
 mod timezone;

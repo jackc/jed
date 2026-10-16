@@ -18,11 +18,22 @@ use std::fmt;
 pub use crate::sqlstate::SqlState;
 
 /// An engine error: a SQLSTATE plus an informational (never-matched) message, and
-/// optional structured diagnostic fields (spec/design/error-fields.md §3). The fields
-/// mirror pgx's `pgconn.PgError` names: `None` means the field does not apply to this
-/// error (the idiomatic Rust spelling of PostgreSQL's empty-string "absent").
+/// optional structured diagnostic fields (spec/design/error-fields.md §3), read through `Deref`
+/// (`err.state`, `err.message`, …).
+///
+/// The fields live behind one `Box` so an `EngineError` is a single pointer: every `Result<T>` in
+/// the engine is then only as large as `T`, not ~190 bytes. That keeps the recursive
+/// parse/resolve/eval frames small enough for the `MAX_EXPR_DEPTH` native-stack budget
+/// (spec/design/cost.md §7.1); an error is the cold path, so the allocation costs nothing that
+/// matters.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EngineError(Box<ErrorFields>);
+
+/// The fields of an [`EngineError`]. They mirror pgx's `pgconn.PgError` names: `None` means the
+/// field does not apply to this error (the idiomatic Rust spelling of PostgreSQL's empty-string
+/// "absent").
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct EngineError {
+pub struct ErrorFields {
     pub state: SqlState,
     pub message: String,
     /// The violated constraint's name — set for 23505/23514/23503/23P01.
@@ -54,9 +65,28 @@ pub struct EngineError {
     pub(crate) hint_decided: bool,
 }
 
+impl std::ops::Deref for EngineError {
+    type Target = ErrorFields;
+    fn deref(&self) -> &ErrorFields {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for EngineError {
+    fn deref_mut(&mut self) -> &mut ErrorFields {
+        &mut self.0
+    }
+}
+
+impl fmt::Debug for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
 impl EngineError {
     pub fn new(state: SqlState, message: impl Into<String>) -> Self {
-        EngineError {
+        EngineError(Box::new(ErrorFields {
             state,
             message: message.into(),
             constraint_name: None,
@@ -68,7 +98,7 @@ impl EngineError {
             hint: None,
             located: false,
             hint_decided: false,
-        }
+        }))
     }
 
     pub fn code(&self) -> &'static str {

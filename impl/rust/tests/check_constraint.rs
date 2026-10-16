@@ -23,7 +23,7 @@ fn err(db: &mut Session, sql: &str) -> (String, String) {
     let e = db
         .query_outcome(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"));
-    (e.code().to_string(), e.message)
+    (e.code().to_string(), e.message.clone())
 }
 
 fn check_names(db: &Session, table: &str) -> Vec<String> {

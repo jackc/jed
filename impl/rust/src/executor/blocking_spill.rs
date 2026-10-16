@@ -152,6 +152,7 @@ impl Engine {
 
     /// The bounded-spill lane. Its spill structures reserve without the meter in reach, so a rejected
     /// reservation is passed through [`Meter::cost_first`] here (memory.md §6.7).
+    #[inline(never)]
     pub(crate) fn exec_blocking_spill(
         &self,
         plan: &SelectPlan,

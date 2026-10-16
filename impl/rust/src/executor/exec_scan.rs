@@ -225,6 +225,7 @@ impl Engine {
     /// canonical PK/index interval sets, and compatible ordered-index scans stop at the
     /// LIMIT/OFFSET window. GIN/GiST complete their candidate gather, then stop table point-lookups
     /// at that window. Only started interval blocks are charged; an opclass gather is charged in full.
+    #[inline(never)]
     pub(crate) fn exec_streaming_scan(
         &self,
         plan: &SelectPlan,
@@ -695,6 +696,7 @@ impl Engine {
     /// eager whole-table path; only the accrued cost is lower (fewer rows scanned, filtered, and
     /// folded) — the deliberate short-circuit, mirroring [`Engine::exec_streaming_scan`]'s LIMIT stop.
     /// page_read is the full block up front (only per-row work short-circuits, like the streaming scan).
+    #[inline(never)]
     pub(crate) fn exec_window_top_n(
         &self,
         plan: &SelectPlan,
@@ -949,7 +951,7 @@ impl Engine {
                             CteCtx::empty(),
                             &mut subquery_cost,
                         )?;
-                        let plan = std::rc::Rc::new(sp);
+                        let plan = std::rc::Rc::new(*sp);
                         if reusable && let Some(cp) = cell.borrow().as_ref() {
                             let mut memo = cp.memo.borrow_mut();
                             if memo.len() == plan_params::MEMO_CAPACITY {
@@ -1014,7 +1016,7 @@ impl Engine {
                     CteCtx::empty(),
                     &mut subquery_cost,
                 )?;
-                let probe = std::rc::Rc::new(probe);
+                let probe = std::rc::Rc::new(*probe);
                 (std::rc::Rc::clone(&probe), probe, Vec::new())
             }
             Some((mut sp, custom_uncacheable)) => {
@@ -1025,7 +1027,7 @@ impl Engine {
                     CteCtx::empty(),
                     &mut subquery_cost,
                 )?;
-                let plan = std::rc::Rc::new(sp);
+                let plan = std::rc::Rc::new(*sp);
                 let memo = if reusable {
                     vec![(
                         plan_params::memo_key(&bound_params),
@@ -1034,7 +1036,7 @@ impl Engine {
                 } else {
                     Vec::new()
                 };
-                (std::rc::Rc::new(probe), plan, memo)
+                (std::rc::Rc::new(*probe), plan, memo)
             }
         };
         let metadata = ResultMetadata::from_plan(&plan);
@@ -1387,6 +1389,7 @@ impl Engine {
     /// point-lookup's `page_read`/`value_decompress` + one `storage_row_read`, plus `row_produced`
     /// and projection `operator_eval`s per produced row. The rows match the eager sort exactly (the
     /// index order IS `ORDER BY <indexed columns> ASC NULLS LAST`, ties by PK — the stable tie-break).
+    #[inline(never)]
     pub(crate) fn exec_index_order_scan(
         &self,
         plan: &SelectPlan,
@@ -1496,6 +1499,7 @@ impl Engine {
     /// row, filter `operator_eval`, and `row_produced` per windowed row accrue — only the sort, which
     /// is unmetered (cost.md §3), now spills. Gated (by the caller) to a single table, no join,
     /// non-aggregate, non-DISTINCT, with an `ORDER BY` and no index bound.
+    #[inline(never)]
     pub(crate) fn exec_streaming_sort(
         &self,
         plan: &SelectPlan,
@@ -1738,6 +1742,7 @@ impl Engine {
     /// skipped when the window fills. Gated (by the caller / `plan.phys.join_pk_ordered`) to exactly
     /// two non-lateral base relations, an INNER or CROSS join, a `LIMIT`, and an `ORDER BY` the outer
     /// PK satisfies.
+    #[inline(never)]
     pub(crate) fn exec_streaming_join(
         &self,
         plan: &SelectPlan,
@@ -1928,6 +1933,7 @@ impl Engine {
 
     /// P8 N-way join top-N. The selected left subtree is fully materialized in driver-PK order;
     /// only the final append step streams and stops after the OFFSET/LIMIT window fills.
+    #[inline(never)]
     pub(crate) fn exec_streaming_nway_join(
         &self,
         plan: &SelectPlan,
@@ -2137,23 +2143,26 @@ impl Engine {
         // A computed relation's scan-pushed filter (planner.md §3.2) runs over its produced rows in
         // production order; each rejected row's reservation is released before the join reads them.
         let rows = self.materialize_rel_rows(plan, ri, params, outer, left, rng, ctes, meter)?;
-        let env = EvalEnv {
-            exec: self,
-            params,
-            outer,
-            rng,
-            ctes,
-            host_batch: None,
-        };
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows {
-            if pushed.eval_filter(&row, &env, meter)? {
-                kept.push(row);
-            } else {
-                meter.release_row_masked(&row, &plan.rel_masks[ri]);
+        // The filter runs in its own frame, off the relation recursion above (cost.md §7.1).
+        outline(|| {
+            let env = EvalEnv {
+                exec: self,
+                params,
+                outer,
+                rng,
+                ctes,
+                host_batch: None,
+            };
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows {
+                if pushed.eval_filter(&row, &env, meter)? {
+                    kept.push(row);
+                } else {
+                    meter.release_row_masked(&row, &plan.rel_masks[ri]);
+                }
             }
-        }
-        Ok(kept)
+            Ok(kept)
+        })
     }
 
     /// Produce relation `ri`'s rows; a base table applies its pushed filter as its access path
@@ -2191,83 +2200,88 @@ impl Engine {
         // producers are bounded by an existing input value or the catalog and admit their output.
         let mask = &plan.rel_masks[ri];
         if let Some(srf) = &rel.srf {
-            let rows = match srf.kind {
-                SrfKind::GenerateSeries => {
-                    return self.generate_series_rows(srf, &env, meter, mask);
+            return outline(|| {
+                let rows = match srf.kind {
+                    SrfKind::GenerateSeries => {
+                        return self.generate_series_rows(srf, &env, meter, mask);
+                    }
+                    SrfKind::Unnest => return self.unnest_rows(srf, &env, meter, mask),
+                    SrfKind::JsonbArrayElements
+                    | SrfKind::JsonbArrayElementsText
+                    | SrfKind::JsonbObjectKeys
+                    | SrfKind::JsonObjectKeys
+                    | SrfKind::JsonbEach
+                    | SrfKind::JsonbEachText
+                    | SrfKind::JsonArrayElements
+                    | SrfKind::JsonArrayElementsText
+                    | SrfKind::JsonEach
+                    | SrfKind::JsonEachText
+                    | SrfKind::JsonRecord { .. }
+                    | SrfKind::JsonbPathQuery => self.json_srf_rows(srf, &env, meter),
+                    SrfKind::RegexpMatches | SrfKind::RegexpSplitToTable => {
+                        self.regex_srf_rows(srf, &env, meter)
+                    }
+                    SrfKind::JsonTable => self.json_table_rows(srf, &env, meter),
+                    SrfKind::JedTables => self.jed_tables_rows(srf, meter),
+                    SrfKind::JedColumns => self.jed_columns_rows(srf, meter),
+                    SrfKind::JedIndexes => self.jed_indexes_rows(srf, meter),
+                    SrfKind::JedConstraints => self.jed_constraints_rows(srf, meter),
+                    SrfKind::JedStatistics => self.jed_statistics_rows(srf, meter),
+                    SrfKind::JedSequences => self.jed_sequences_rows(srf, meter),
+                    SrfKind::JedTypes => self.jed_types_rows(srf, meter),
+                    SrfKind::JedTypeFields => self.jed_type_fields_rows(srf, meter),
+                    SrfKind::JedViews => self.jed_views_rows(srf, meter),
+                }?;
+                for row in &rows {
+                    meter.admit_row_masked(row, mask)?;
                 }
-                SrfKind::Unnest => return self.unnest_rows(srf, &env, meter, mask),
-                SrfKind::JsonbArrayElements
-                | SrfKind::JsonbArrayElementsText
-                | SrfKind::JsonbObjectKeys
-                | SrfKind::JsonObjectKeys
-                | SrfKind::JsonbEach
-                | SrfKind::JsonbEachText
-                | SrfKind::JsonArrayElements
-                | SrfKind::JsonArrayElementsText
-                | SrfKind::JsonEach
-                | SrfKind::JsonEachText
-                | SrfKind::JsonRecord { .. }
-                | SrfKind::JsonbPathQuery => self.json_srf_rows(srf, &env, meter),
-                SrfKind::RegexpMatches | SrfKind::RegexpSplitToTable => {
-                    self.regex_srf_rows(srf, &env, meter)
-                }
-                SrfKind::JsonTable => self.json_table_rows(srf, &env, meter),
-                SrfKind::JedTables => self.jed_tables_rows(srf, meter),
-                SrfKind::JedColumns => self.jed_columns_rows(srf, meter),
-                SrfKind::JedIndexes => self.jed_indexes_rows(srf, meter),
-                SrfKind::JedConstraints => self.jed_constraints_rows(srf, meter),
-                SrfKind::JedStatistics => self.jed_statistics_rows(srf, meter),
-                SrfKind::JedSequences => self.jed_sequences_rows(srf, meter),
-                SrfKind::JedTypes => self.jed_types_rows(srf, meter),
-                SrfKind::JedTypeFields => self.jed_type_fields_rows(srf, meter),
-                SrfKind::JedViews => self.jed_views_rows(srf, meter),
-            }?;
-            for row in &rows {
-                meter.admit_row_masked(row, mask)?;
-            }
-            return Ok(rows);
+                return Ok(rows);
+            });
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
         // MATERIALIZED CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts
         // 54P01); an INLINE CTE runs its body in place. (A CTE is never lateral.)
         if let Some(ci) = rel.cte {
-            let rows = match env.ctes.modes[ci] {
-                CteMode::Materialize => {
-                    let buf = env.ctes.buffers[ci];
-                    for _ in buf {
-                        meter.guard()?;
-                        meter.charge(COSTS.cte_scan_row);
+            return outline(|| {
+                let rows = match env.ctes.modes[ci] {
+                    CteMode::Materialize => {
+                        let buf = env.ctes.buffers[ci];
+                        for _ in buf {
+                            meter.guard()?;
+                            meter.charge(COSTS.cte_scan_row);
+                        }
+                        // The reference copies the CTE buffer into its own relation rows.
+                        for row in buf {
+                            meter.admit_row_masked(row, mask)?;
+                        }
+                        buf.to_vec()
                     }
-                    // The reference copies the CTE buffer into its own relation rows.
-                    for row in buf {
-                        meter.admit_row_masked(row, mask)?;
+                    CteMode::Inline => {
+                        // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always
+                        // materialized (writable-cte.md §3), so its buffer was filled above. A
+                        // reference that planned the body itself runs that plan (planner.md §3.4).
+                        let plan = match &rel.derived {
+                            Some(body) => body.as_ref(),
+                            None => match &env.ctes.bindings[ci].source {
+                                CteSource::Query(plan) => plan,
+                                CteSource::Dml(_) => unreachable!(
+                                    "a data-modifying CTE is always materialized, never inlined"
+                                ),
+                            },
+                        };
+                        // The body runs in the frame of the WITH node that declared it (cte.md §7) —
+                        // not this reference site's, which may sit deeper.
+                        let r =
+                            self.exec_query_plan(plan, env.ctes.outers[ci], params, env.ctes)?;
+                        meter.charge(r.cost);
+                        // The body's charged result becomes this relation's rows (memory.md §5.2),
+                        // re-measured under the relation's touched mask.
+                        rebase_rows_masked(meter, &r.rows, mask);
+                        r.rows
                     }
-                    buf.to_vec()
-                }
-                CteMode::Inline => {
-                    // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always
-                    // materialized (writable-cte.md §3), so its buffer was filled above. A
-                    // reference that planned the body itself runs that plan (planner.md §3.4).
-                    let plan = match &rel.derived {
-                        Some(body) => body.as_ref(),
-                        None => match &env.ctes.bindings[ci].source {
-                            CteSource::Query(plan) => plan,
-                            CteSource::Dml(_) => unreachable!(
-                                "a data-modifying CTE is always materialized, never inlined"
-                            ),
-                        },
-                    };
-                    // The body runs in the frame of the WITH node that declared it (cte.md §7) —
-                    // not this reference site's, which may sit deeper.
-                    let r = self.exec_query_plan(plan, env.ctes.outers[ci], params, env.ctes)?;
-                    meter.charge(r.cost);
-                    // The body's charged result becomes this relation's rows (memory.md §5.2),
-                    // re-measured under the relation's touched mask.
-                    rebase_rows_masked(meter, &r.rows, mask);
-                    r.rows
-                }
-            };
-            return Ok(rows);
+                };
+                return Ok(rows);
+            });
         }
         // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
         // cte_scan_row. Non-lateral it was planned against the enclosing scope and reads this
@@ -2278,187 +2292,191 @@ impl Engine {
             rebase_rows_masked(meter, &r.rows, mask);
             return Ok(r.rows);
         }
-        // A base table: scan in primary-key order via a ScanSource (the page_read block + per-row
-        // storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead
-        // of a full walk; an empty bound reads nothing. An index-nested-loop bound (`rel_inl_bounds`)
-        // takes precedence and resolves its `Sibling` source from the current left row (cost.md §3
-        // "JOIN"); else the once-materialized `rel_bounds`.
-        let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
-        let inl = plan.phys.rel_inl_bounds[ri].is_some();
-        let bound = plan.phys.rel_inl_bounds[ri]
-            .as_ref()
-            .or(plan.phys.rel_bounds[ri].as_ref());
-        let (inl_filters, sibling_columns): (Vec<&RExpr>, Vec<(usize, usize)>) = if inl
-            && plan.phys.join_steps.len() + 1 == plan.rels.len()
-            && plan.phys.relation_order.len() == plan.rels.len()
-        {
-            let position = plan
-                .phys
-                .relation_order
-                .iter()
-                .position(|ordinal| *ordinal == ri)
-                .expect("an N-way INL relation is in physical order");
-            let filters = plan.phys.join_steps[position - 1]
-                .on_indices
-                .iter()
-                .filter_map(|index| plan.joins[*index].on.as_ref())
-                .collect();
-            let ranges = plan.phys.relation_order[..position]
-                .iter()
-                .map(|ordinal| {
-                    let outer_rel = &plan.rels[*ordinal];
-                    (outer_rel.offset, outer_rel.offset + outer_rel.col_count)
-                })
-                .collect();
-            (filters, ranges)
-        } else if inl && plan.phys.relation_order.len() == 2 {
-            let outer_ordinal = super::optimize::physical_rel_ordinal(plan, 0);
-            let outer_rel = &plan.rels[outer_ordinal];
-            (
-                plan.joins[0].on.iter().collect(),
-                vec![(outer_rel.offset, outer_rel.offset + outer_rel.col_count)],
-            )
-        } else if inl {
-            (
-                plan.joins[ri - 1].on.iter().collect(),
-                vec![(0, rel.offset)],
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let (mut rows, (node_count, slabs)) = match bound {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer, left) {
-                Some(b) => {
-                    // Read-only SELECT feed: reconstruct only the touched columns (Track A1) — a Packed
-                    // leaf skips decoding the untouched ones. Cost- and result-identical to the whole-row
-                    // scan for a consumer that reads only the touched set (packed-leaf.md §11).
-                    let (entries, pages, slabs) =
-                        store.range_scan_with_units(&b, &plan.rel_masks[ri])?;
+        // The base-table scan runs in its own frame, off the derived-table recursion above
+        // (spec/design/cost.md §7.1).
+        outline(|| {
+            // A base table: scan in primary-key order via a ScanSource (the page_read block + per-row
+            // storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead
+            // of a full walk; an empty bound reads nothing. An index-nested-loop bound (`rel_inl_bounds`)
+            // takes precedence and resolves its `Sibling` source from the current left row (cost.md §3
+            // "JOIN"); else the once-materialized `rel_bounds`.
+            let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
+            let inl = plan.phys.rel_inl_bounds[ri].is_some();
+            let bound = plan.phys.rel_inl_bounds[ri]
+                .as_ref()
+                .or(plan.phys.rel_bounds[ri].as_ref());
+            let (inl_filters, sibling_columns): (Vec<&RExpr>, Vec<(usize, usize)>) = if inl
+                && plan.phys.join_steps.len() + 1 == plan.rels.len()
+                && plan.phys.relation_order.len() == plan.rels.len()
+            {
+                let position = plan
+                    .phys
+                    .relation_order
+                    .iter()
+                    .position(|ordinal| *ordinal == ri)
+                    .expect("an N-way INL relation is in physical order");
+                let filters = plan.phys.join_steps[position - 1]
+                    .on_indices
+                    .iter()
+                    .filter_map(|index| plan.joins[*index].on.as_ref())
+                    .collect();
+                let ranges = plan.phys.relation_order[..position]
+                    .iter()
+                    .map(|ordinal| {
+                        let outer_rel = &plan.rels[*ordinal];
+                        (outer_rel.offset, outer_rel.offset + outer_rel.col_count)
+                    })
+                    .collect();
+                (filters, ranges)
+            } else if inl && plan.phys.relation_order.len() == 2 {
+                let outer_ordinal = super::optimize::physical_rel_ordinal(plan, 0);
+                let outer_rel = &plan.rels[outer_ordinal];
+                (
+                    plan.joins[0].on.iter().collect(),
+                    vec![(outer_rel.offset, outer_rel.offset + outer_rel.col_count)],
+                )
+            } else if inl {
+                (
+                    plan.joins[ri - 1].on.iter().collect(),
+                    vec![(0, rel.offset)],
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let (mut rows, (node_count, slabs)) = match bound {
+                Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer, left) {
+                    Some(b) => {
+                        // Read-only SELECT feed: reconstruct only the touched columns (Track A1) — a Packed
+                        // leaf skips decoding the untouched ones. Cost- and result-identical to the whole-row
+                        // scan for a consumer that reads only the touched set (packed-leaf.md §11).
+                        let (entries, pages, slabs) =
+                            store.range_scan_with_units(&b, &plan.rel_masks[ri])?;
+                        let rows = entries.into_iter().map(|(_, v)| v).collect();
+                        (rows, (pages, slabs))
+                    }
+                    None => (Vec::new(), (0, 0)),
+                },
+                Some(ScanBound::Index(ib)) => self.index_bound_rows(
+                    &rel.table_name,
+                    ib,
+                    params,
+                    outer,
+                    &plan.rel_masks[ri],
+                    left,
+                )?,
+                Some(ScanBound::Gin(gb)) => {
+                    let query = if inl {
+                        inl_filters
+                            .iter()
+                            .copied()
+                            .chain(plan.filter.get())
+                            .find_map(|f| {
+                                gin_sibling_match(f, gb.col_global, gb.opclass, &sibling_columns)
+                                    .map(|(_, q)| q)
+                            })
+                    } else {
+                        plan.filter
+                            .access()
+                            .and_then(|f| gin_match(f, gb.col_global, gb.opclass).map(|(_, q)| q))
+                    };
+                    let (pairs, units) = self.gin_bound_rows(
+                        &rel.table_name,
+                        gb,
+                        query,
+                        left,
+                        &env,
+                        meter,
+                        &plan.rel_masks[ri],
+                        false,
+                    )?;
+                    // SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
+                    (pairs.into_iter().map(|(_, v)| v).collect(), units)
+                }
+                Some(ScanBound::Gist(gb)) => {
+                    let query = if inl {
+                        inl_filters
+                            .iter()
+                            .copied()
+                            .chain(plan.filter.get())
+                            .find_map(|f| match gb.strategy {
+                                crate::gist::GistStrategy::Equal => {
+                                    gist_scalar_sibling_match(f, gb.col_global, &sibling_columns)
+                                        .map(|(_, q)| q)
+                                }
+                                _ => gist_sibling_match(f, gb.col_global, &sibling_columns)
+                                    .map(|(_, q)| q),
+                            })
+                    } else {
+                        plan.filter.access().and_then(|f| gist_query_operand(f, gb))
+                    };
+                    let (pairs, units) = self.gist_bound_rows(
+                        &rel.table_name,
+                        gb,
+                        query,
+                        left,
+                        &env,
+                        meter,
+                        &plan.rel_masks[ri],
+                        false,
+                    )?;
+                    // SELECT discards the storage keys (UPDATE/DELETE keep them — gist.md §5).
+                    (pairs.into_iter().map(|(_, v)| v).collect(), units)
+                }
+                Some(ScanBound::PkSet(ks)) => {
+                    // Merged PK point-set (cost.md §3 "OR / IN-list"): a union of point probes over the
+                    // distinct sorted keys; the whole WHERE stays the residual filter downstream.
+                    let (entries, units) = self.pk_key_set_rows(
+                        store,
+                        ks,
+                        params,
+                        outer,
+                        &plan.rel_masks[ri],
+                        left,
+                        true,
+                    )?;
+                    // SELECT discards the storage keys (UPDATE/DELETE keep them).
+                    (entries.into_iter().map(|(_, v)| v).collect(), units)
+                }
+                Some(ScanBound::IndexSet(ks)) => {
+                    // Merged secondary-index point-set (cost.md §3 "OR / IN-list").
+                    self.index_key_set_rows(
+                        &rel.table_name,
+                        ks,
+                        params,
+                        outer,
+                        &plan.rel_masks[ri],
+                        left,
+                    )?
+                }
+                None => {
+                    // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
+                    let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
                     let rows = entries.into_iter().map(|(_, v)| v).collect();
                     (rows, (pages, slabs))
                 }
-                None => (Vec::new(), (0, 0)),
-            },
-            Some(ScanBound::Index(ib)) => self.index_bound_rows(
-                &rel.table_name,
-                ib,
-                params,
-                outer,
-                &plan.rel_masks[ri],
-                left,
-            )?,
-            Some(ScanBound::Gin(gb)) => {
-                let query = if inl {
-                    inl_filters
-                        .iter()
-                        .copied()
-                        .chain(plan.filter.get())
-                        .find_map(|f| {
-                            gin_sibling_match(f, gb.col_global, gb.opclass, &sibling_columns)
-                                .map(|(_, q)| q)
-                        })
-                } else {
-                    plan.filter
-                        .access()
-                        .and_then(|f| gin_match(f, gb.col_global, gb.opclass).map(|(_, q)| q))
-                };
-                let (pairs, units) = self.gin_bound_rows(
-                    &rel.table_name,
-                    gb,
-                    query,
-                    left,
-                    &env,
-                    meter,
-                    &plan.rel_masks[ri],
-                    false,
-                )?;
-                // SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
-                (pairs.into_iter().map(|(_, v)| v).collect(), units)
+            };
+            // Materialize this relation's touched columns where the lazy load left unfetched references
+            // (large-values.md §14) — exactly the static set the cost block charges.
+            for row in &mut rows {
+                store.resolve_columns(row, &plan.rel_masks[ri])?;
             }
-            Some(ScanBound::Gist(gb)) => {
-                let query = if inl {
-                    inl_filters
-                        .iter()
-                        .copied()
-                        .chain(plan.filter.get())
-                        .find_map(|f| match gb.strategy {
-                            crate::gist::GistStrategy::Equal => {
-                                gist_scalar_sibling_match(f, gb.col_global, &sibling_columns)
-                                    .map(|(_, q)| q)
-                            }
-                            _ => gist_sibling_match(f, gb.col_global, &sibling_columns)
-                                .map(|(_, q)| q),
-                        })
-                } else {
-                    plan.filter.access().and_then(|f| gist_query_operand(f, gb))
-                };
-                let (pairs, units) = self.gist_bound_rows(
-                    &rel.table_name,
-                    gb,
-                    query,
-                    left,
-                    &env,
-                    meter,
-                    &plan.rel_masks[ri],
-                    false,
-                )?;
-                // SELECT discards the storage keys (UPDATE/DELETE keep them — gist.md §5).
-                (pairs.into_iter().map(|(_, v)| v).collect(), units)
+            meter.charge(COSTS.value_decompress * slabs as i64);
+            let mut src = ScanSource::new(rows, node_count as i64);
+            // The relation's pushed WHERE conjuncts (planner.md §3.2) run on each admitted row, after its
+            // storage_row_read and before it is admitted to the join: a failing row never enters it.
+            let pushed = plan.pushed_local_filter(ri);
+            let mut table_rows: Vec<Row> = Vec::new();
+            while let Some(row) = src.next(meter)? {
+                if let Some(f) = pushed
+                    && !f.eval_filter(&row, &env, meter)?
+                {
+                    continue;
+                }
+                meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
+                table_rows.push(row);
             }
-            Some(ScanBound::PkSet(ks)) => {
-                // Merged PK point-set (cost.md §3 "OR / IN-list"): a union of point probes over the
-                // distinct sorted keys; the whole WHERE stays the residual filter downstream.
-                let (entries, units) = self.pk_key_set_rows(
-                    store,
-                    ks,
-                    params,
-                    outer,
-                    &plan.rel_masks[ri],
-                    left,
-                    true,
-                )?;
-                // SELECT discards the storage keys (UPDATE/DELETE keep them).
-                (entries.into_iter().map(|(_, v)| v).collect(), units)
-            }
-            Some(ScanBound::IndexSet(ks)) => {
-                // Merged secondary-index point-set (cost.md §3 "OR / IN-list").
-                self.index_key_set_rows(
-                    &rel.table_name,
-                    ks,
-                    params,
-                    outer,
-                    &plan.rel_masks[ri],
-                    left,
-                )?
-            }
-            None => {
-                // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
-                let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
-                let rows = entries.into_iter().map(|(_, v)| v).collect();
-                (rows, (pages, slabs))
-            }
-        };
-        // Materialize this relation's touched columns where the lazy load left unfetched references
-        // (large-values.md §14) — exactly the static set the cost block charges.
-        for row in &mut rows {
-            store.resolve_columns(row, &plan.rel_masks[ri])?;
-        }
-        meter.charge(COSTS.value_decompress * slabs as i64);
-        let mut src = ScanSource::new(rows, node_count as i64);
-        // The relation's pushed WHERE conjuncts (planner.md §3.2) run on each admitted row, after its
-        // storage_row_read and before it is admitted to the join: a failing row never enters it.
-        let pushed = plan.pushed_local_filter(ri);
-        let mut table_rows: Vec<Row> = Vec::new();
-        while let Some(row) = src.next(meter)? {
-            if let Some(f) = pushed
-                && !f.eval_filter(&row, &env, meter)?
-            {
-                continue;
-            }
-            meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
-            table_rows.push(row);
-        }
-        Ok(table_rows)
+            Ok(table_rows)
+        })
     }
 
     /// Execute a resolved SELECT against an outer-row environment (`outer` = the enclosing
@@ -2480,106 +2498,37 @@ impl Engine {
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let mut meter = self.session.new_meter();
         let emitter = self.exec_select_emit(plan, outer, params, ctes, &stmt_rng, &mut meter)?;
-        let out_rows = match emitter {
-            Emitter::Spool {
-                mut rows,
-                remaining,
-                mode,
-                charged,
-            } => {
-                let env = EvalEnv {
-                    exec: self,
-                    params,
-                    outer,
-                    rng: &stmt_rng,
-                    ctes,
-                    host_batch: None,
-                };
-                // A projecting spool with an eligible host call reads ahead into a window and
-                // replays it row by row (extensibility.md §4.2.1).
-                let mut ahead = match mode {
-                    EmitMode::Project => {
-                        ReadAhead::for_site(None, &plan.projections, self.session.env.functions())
-                    }
-                    EmitMode::Identity => None,
-                };
-                let mut out = Vec::new();
-                for k in 0..remaining {
-                    if let Some(ra) = &mut ahead {
-                        let cap = || {
-                            read_ahead_cap(&meter, COSTS.row_produced, Some((remaining - k) as i64))
-                        };
-                        let i = ra
-                            .next_owned(cap, || rows.next())?
-                            .expect("spool cardinality");
-                        if !charged {
-                            meter.guard()?;
-                            meter.charge(COSTS.row_produced);
-                        }
-                        let ra: &ReadAhead = ra;
-                        if let Some(b) = &ra.project {
-                            ra.set_row(b, i, &env, &meter);
-                        }
-                        let penv = EvalEnv {
-                            host_batch: ra.project.as_ref(),
-                            ..env
-                        };
-                        let o = plan
-                            .projections
-                            .iter()
-                            .map(|p| p.eval(&ra.rows[i], &penv, &mut meter))
-                            .collect::<Result<Row>>()?;
-                        meter.admit_row(&o)?;
-                        out.push(o);
-                        continue;
-                    }
-                    let row = rows.next()?.expect("spool cardinality");
-                    if !charged {
-                        meter.guard()?;
-                        meter.charge(COSTS.row_produced);
-                    }
-                    let o = match mode {
-                        EmitMode::Identity => row,
-                        EmitMode::Project => plan
-                            .projections
-                            .iter()
-                            .map(|p| p.eval(&row, &env, &mut meter))
-                            .collect::<Result<Row>>()?,
+        // Draining the emitter runs in its own frame, off the query-nesting recursion above
+        // (spec/design/cost.md §7.1).
+        outline(|| {
+            let out_rows = match emitter {
+                Emitter::Spool {
+                    mut rows,
+                    remaining,
+                    mode,
+                    charged,
+                } => {
+                    let env = EvalEnv {
+                        exec: self,
+                        params,
+                        outer,
+                        rng: &stmt_rng,
+                        ctes,
+                        host_batch: None,
                     };
-                    // Spool residency is operator state; the collected result is a row buffer.
-                    meter.admit_row(&o)?;
-                    out.push(o);
-                }
-                rows.release(); // the emission completed (memory.md §6.6)
-                out
-            }
-            // Already projected + charged (the special input-streaming paths) — hand the rows out.
-            Emitter::Final { rows } => rows,
-            // The streaming sort's lazy output: pull every windowed row from the `SortedRows`
-            // iterator, charging `row_produced` + the projection per row — exactly the eager window
-            // loop `exec_streaming_sort` ran before its output went lazy (streaming.md §4/§7).
-            Emitter::Sorted {
-                mut sorted,
-                remaining,
-            } => {
-                let env = EvalEnv {
-                    exec: self,
-                    params,
-                    outer,
-                    rng: &stmt_rng,
-                    ctes,
-                    host_batch: None,
-                };
-                // An eligible host call in the projection reads the sorted output ahead into a
-                // window and replays it row by row (extensibility.md §4.2.1): the pull is unmetered
-                // and the sort's charge is returned only below, so no charge moves.
-                let mut ahead =
-                    ReadAhead::for_site(None, &plan.projections, self.session.env.functions());
-                let mut out = Vec::with_capacity(remaining);
-                for k in 0..remaining {
-                    let pulled;
-                    let (row, at): (&Row, Option<(&ReadAhead, usize)>) = match &mut ahead {
-                        Some(ra) => {
+                    // A projecting spool with an eligible host call reads ahead into a window and
+                    // replays it row by row (extensibility.md §4.2.1).
+                    let mut ahead = match mode {
+                        EmitMode::Project => ReadAhead::for_site(
+                            None,
+                            &plan.projections,
+                            self.session.env.functions(),
+                        ),
+                        EmitMode::Identity => None,
+                    };
+                    let mut out = Vec::new();
+                    for k in 0..remaining {
+                        if let Some(ra) = &mut ahead {
                             let cap = || {
                                 read_ahead_cap(
                                     &meter,
@@ -2588,66 +2537,59 @@ impl Engine {
                                 )
                             };
                             let i = ra
-                                .next_owned(cap, || sorted.next())?
-                                .expect("the sorter yields exactly the windowed rows");
+                                .next_owned(cap, || rows.next())?
+                                .expect("spool cardinality");
+                            if !charged {
+                                meter.guard()?;
+                                meter.charge(COSTS.row_produced);
+                            }
                             let ra: &ReadAhead = ra;
-                            (&ra.rows[i], Some((ra, i)))
-                        }
-                        None => {
-                            pulled = sorted
-                                .next()?
-                                .expect("the sorter yields exactly the windowed rows");
-                            (&pulled, None)
-                        }
-                    };
-                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                    meter.charge(COSTS.row_produced);
-                    let penv = match at {
-                        Some((ra, i)) => {
                             if let Some(b) = &ra.project {
                                 ra.set_row(b, i, &env, &meter);
                             }
-                            EvalEnv {
+                            let penv = EvalEnv {
                                 host_batch: ra.project.as_ref(),
                                 ..env
-                            }
+                            };
+                            let o = plan
+                                .projections
+                                .iter()
+                                .map(|p| p.eval(&ra.rows[i], &penv, &mut meter))
+                                .collect::<Result<Row>>()?;
+                            meter.admit_row(&o)?;
+                            out.push(o);
+                            continue;
                         }
-                        None => EvalEnv { ..env },
-                    };
-                    let mut o = Vec::with_capacity(plan.projections.len());
-                    for p in &plan.projections {
-                        o.push(p.eval(row, &penv, &mut meter)?);
+                        let row = rows.next()?.expect("spool cardinality");
+                        if !charged {
+                            meter.guard()?;
+                            meter.charge(COSTS.row_produced);
+                        }
+                        let o = match mode {
+                            EmitMode::Identity => row,
+                            EmitMode::Project => plan
+                                .projections
+                                .iter()
+                                .map(|p| p.eval(&row, &env, &mut meter))
+                                .collect::<Result<Row>>()?,
+                        };
+                        // Spool residency is operator state; the collected result is a row buffer.
+                        meter.admit_row(&o)?;
+                        out.push(o);
                     }
-                    meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
-                    out.push(o);
-                }
-                sorted.release(); // the emission completed (memory.md §6.4)
-                out
-            }
-            // The general blocking buffer: window it, charging `row_produced` per emitted row (and,
-            // in `Project` mode, the projection list) — exactly the eager emission these branches ran
-            // before the S4 split.
-            Emitter::Buffer {
-                mut rows,
-                start,
-                end,
-                mode,
-            } => match mode {
-                EmitMode::Identity => {
-                    // Rows outside the LIMIT/OFFSET window are discarded; the windowed rows transfer
-                    // into the result (memory.md §5.2/§5.3).
-                    meter.release_rows(&rows[..start]);
-                    meter.release_rows(&rows[end..]);
-                    let mut out = Vec::with_capacity(end - start);
-                    for row in rows.drain(start..end) {
-                        meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                        meter.charge(COSTS.row_produced);
-                        out.push(row);
-                    }
+                    rows.release(); // the emission completed (memory.md §6.6)
                     out
                 }
-                EmitMode::Project => {
-                    let base = EvalEnv {
+                // Already projected + charged (the special input-streaming paths) — hand the rows out.
+                Emitter::Final { rows } => rows,
+                // The streaming sort's lazy output: pull every windowed row from the `SortedRows`
+                // iterator, charging `row_produced` + the projection per row — exactly the eager window
+                // loop `exec_streaming_sort` ran before its output went lazy (streaming.md §4/§7).
+                Emitter::Sorted {
+                    mut sorted,
+                    remaining,
+                } => {
+                    let env = EvalEnv {
                         exec: self,
                         params,
                         outer,
@@ -2655,73 +2597,159 @@ impl Engine {
                         ctes,
                         host_batch: None,
                     };
-                    // Host calls in the projection prefetch a chunk at a time and replay row by
-                    // row (extensibility.md §4.2.1).
-                    let batch =
-                        HostBatch::for_exprs(&plan.projections, self.session.env.functions());
-                    let mut out = Vec::with_capacity(end - start);
-                    for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+                    // An eligible host call in the projection reads the sorted output ahead into a
+                    // window and replays it row by row (extensibility.md §4.2.1): the pull is unmetered
+                    // and the sort's charge is returned only below, so no charge moves.
+                    let mut ahead =
+                        ReadAhead::for_site(None, &plan.projections, self.session.env.functions());
+                    let mut out = Vec::with_capacity(remaining);
+                    for k in 0..remaining {
+                        let pulled;
+                        let (row, at): (&Row, Option<(&ReadAhead, usize)>) = match &mut ahead {
+                            Some(ra) => {
+                                let cap = || {
+                                    read_ahead_cap(
+                                        &meter,
+                                        COSTS.row_produced,
+                                        Some((remaining - k) as i64),
+                                    )
+                                };
+                                let i = ra
+                                    .next_owned(cap, || sorted.next())?
+                                    .expect("the sorter yields exactly the windowed rows");
+                                let ra: &ReadAhead = ra;
+                                (&ra.rows[i], Some((ra, i)))
+                            }
+                            None => {
+                                pulled = sorted
+                                    .next()?
+                                    .expect("the sorter yields exactly the windowed rows");
+                                (&pulled, None)
+                            }
+                        };
                         meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                         meter.charge(COSTS.row_produced);
-                        if let Some(b) = &batch {
-                            b.set_row(i, &rows, end, &base, &meter);
-                        }
-                        let env = EvalEnv {
-                            host_batch: batch.as_ref(),
-                            ..base
+                        let penv = match at {
+                            Some((ra, i)) => {
+                                if let Some(b) = &ra.project {
+                                    ra.set_row(b, i, &env, &meter);
+                                }
+                                EvalEnv {
+                                    host_batch: ra.project.as_ref(),
+                                    ..env
+                                }
+                            }
+                            None => EvalEnv { ..env },
                         };
                         let mut o = Vec::with_capacity(plan.projections.len());
                         for p in &plan.projections {
-                            o.push(p.eval(row, &env, &mut meter)?);
+                            o.push(p.eval(row, &penv, &mut meter)?);
                         }
                         meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                         out.push(o);
                     }
-                    // The projecting drive consumed its source buffer: pre-projection rows under the
-                    // touched mask, or an aggregate's group rows (memory.md §5.3).
-                    let mask = if plan.is_agg {
-                        Vec::new()
-                    } else {
-                        plan.memory_mask(&meter)
-                    };
-                    meter.release_rows_masked(&rows, &mask);
+                    sorted.release(); // the emission completed (memory.md §6.4)
                     out
                 }
-            },
-            // Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather each windowed output row from
-            // the dense lanes — a bare-column projection with no full-width row — charging row_produced per
-            // row, exactly the Project drive over a bare-column projection (whose eval is a zero-cost slot
-            // read).
-            Emitter::Columnar {
-                cols,
-                proj_cols,
-                start,
-                end,
-                mut charge,
-            } => {
-                let mut out = Vec::with_capacity(end - start);
-                for j in start..end {
-                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
-                    meter.charge(COSTS.row_produced);
-                    let mut o = Vec::with_capacity(proj_cols.len());
-                    for &c in &proj_cols {
-                        o.push(cols[c][j].clone());
+                // The general blocking buffer: window it, charging `row_produced` per emitted row (and,
+                // in `Project` mode, the projection list) — exactly the eager emission these branches ran
+                // before the S4 split.
+                Emitter::Buffer {
+                    mut rows,
+                    start,
+                    end,
+                    mode,
+                } => match mode {
+                    EmitMode::Identity => {
+                        // Rows outside the LIMIT/OFFSET window are discarded; the windowed rows transfer
+                        // into the result (memory.md §5.2/§5.3).
+                        meter.release_rows(&rows[..start]);
+                        meter.release_rows(&rows[end..]);
+                        let mut out = Vec::with_capacity(end - start);
+                        for row in rows.drain(start..end) {
+                            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                            meter.charge(COSTS.row_produced);
+                            out.push(row);
+                        }
+                        out
                     }
-                    meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
-                    out.push(o);
+                    EmitMode::Project => {
+                        let base = EvalEnv {
+                            exec: self,
+                            params,
+                            outer,
+                            rng: &stmt_rng,
+                            ctes,
+                            host_batch: None,
+                        };
+                        // Host calls in the projection prefetch a chunk at a time and replay row by
+                        // row (extensibility.md §4.2.1).
+                        let batch =
+                            HostBatch::for_exprs(&plan.projections, self.session.env.functions());
+                        let mut out = Vec::with_capacity(end - start);
+                        for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+                            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                            meter.charge(COSTS.row_produced);
+                            if let Some(b) = &batch {
+                                b.set_row(i, &rows, end, &base, &meter);
+                            }
+                            let env = EvalEnv {
+                                host_batch: batch.as_ref(),
+                                ..base
+                            };
+                            let mut o = Vec::with_capacity(plan.projections.len());
+                            for p in &plan.projections {
+                                o.push(p.eval(row, &env, &mut meter)?);
+                            }
+                            meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
+                            out.push(o);
+                        }
+                        // The projecting drive consumed its source buffer: pre-projection rows under the
+                        // touched mask, or an aggregate's group rows (memory.md §5.3).
+                        let mask = if plan.is_agg {
+                            Vec::new()
+                        } else {
+                            plan.memory_mask(&meter)
+                        };
+                        meter.release_rows_masked(&rows, &mask);
+                        out
+                    }
+                },
+                // Columnar projection (packed-leaf.md §11 Tracks A2–A4): gather each windowed output row from
+                // the dense lanes — a bare-column projection with no full-width row — charging row_produced per
+                // row, exactly the Project drive over a bare-column projection (whose eval is a zero-cost slot
+                // read).
+                Emitter::Columnar {
+                    cols,
+                    proj_cols,
+                    start,
+                    end,
+                    mut charge,
+                } => {
+                    let mut out = Vec::with_capacity(end - start);
+                    for j in start..end {
+                        meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                        meter.charge(COSTS.row_produced);
+                        let mut o = Vec::with_capacity(proj_cols.len());
+                        for &c in &proj_cols {
+                            o.push(cols[c][j].clone());
+                        }
+                        meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
+                        out.push(o);
+                    }
+                    charge.release_all(); // the emission completed (memory.md §6.5)
+                    out
                 }
-                charge.release_all(); // the emission completed (memory.md §6.5)
-                out
+            };
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.record_parent(select_actual_root_node(plan), meter.accrued);
             }
-        };
-        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
-            profile.record_parent(select_actual_root_node(plan), meter.accrued);
-        }
-        Ok(SelectResult {
-            column_names: plan.column_names.clone(),
-            column_types: plan.column_types.clone(),
-            rows: out_rows,
-            cost: meter.accrued,
+            Ok(SelectResult {
+                column_names: plan.column_names.clone(),
+                column_types: plan.column_types.clone(),
+                rows: out_rows,
+                cost: meter.accrued,
+            })
         })
     }
 
@@ -2739,6 +2767,7 @@ impl Engine {
     /// `operator_eval` (the filter over each scanned record) as the row path, then `row_produced` per
     /// emitted row charged by the emitter drive — exactly the `Project` drive over a bare-column
     /// projection.
+    #[inline(never)]
     pub(crate) fn project_columnar(
         &self,
         plan: &SelectPlan,
@@ -2952,6 +2981,7 @@ impl Engine {
     /// only its touched columns columnar ([`agg_columnar`](Engine::agg_columnar) — never a full-width
     /// row, the allocation dividend); an in-memory store (or a columnar decline) folds over the
     /// materialized rows. Only runs on the unmetered lane (the caller gates).
+    #[inline(never)]
     pub(crate) fn exec_vectorized_agg(
         &self,
         plan: &SelectPlan,

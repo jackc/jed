@@ -22,6 +22,7 @@ use crate::ast::{CycleClause, SearchClause};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::{lex, lex_with_positions};
+use crate::stack::outline;
 use crate::token::Token;
 
 /// Maximum expression / subquery / set-operation **nesting depth** a statement may reach
@@ -30,9 +31,9 @@ use crate::token::Token;
 /// nesting depth, so deeply-nested SQL would overflow the call stack BEFORE the cost meter runs
 /// (`54P01` cannot catch it). Counting logical depth against this **fixed** bound — rather than
 /// PG's runtime stack-pointer probe — is deterministic and **cross-core identical** (§8): the
-/// constant is the SAME in every core (Rust / Go / TS). `256` sits with a >2× margin under the
-/// weakest core's native ceiling (the TS/Node default stack: ~547 nested subqueries) yet far
-/// above any realistic query. Exceeding it aborts with `54001 statement_too_complex`.
+/// constant is the SAME in every core (Rust / Go / TS), far above any realistic query. Exceeding it
+/// aborts with `54001 statement_too_complex`. In this core a statement at the limit stays within a
+/// 1 MiB native stack in an optimized build (spec/design/cost.md §7.1).
 pub const MAX_EXPR_DEPTH: usize = 256;
 
 /// Maximum length, in **bytes**, of a single identifier — table / column / type / alias /
@@ -3283,7 +3284,7 @@ impl Parser {
             let rows = self.parse_values_body()?;
             return Ok(values_query(rows, Vec::new(), None, None));
         }
-        Ok(QueryExpr::Select(Box::new(self.parse_select_core()?)))
+        Ok(QueryExpr::Select(self.parse_select_core()?))
     }
 
     /// The optional quantifier after a set operator: `ALL` (multiset) or `DISTINCT` (the explicit
@@ -3307,7 +3308,8 @@ impl Parser {
     /// operand form of a set operation). The returned `Select` has empty `order_by` and no
     /// `limit`/`offset`. The FROM clause is optional: with no `from` keyword the SELECT is
     /// FROM-less — one virtual zero-column row (spec/design/grammar.md §34).
-    fn parse_select_core(&mut self) -> Result<Select> {
+    #[inline(never)]
+    fn parse_select_core(&mut self) -> Result<Box<Select>> {
         self.expect_keyword("select")?;
 
         let distinct = if self.peek_keyword().as_deref() == Some("distinct") {
@@ -3324,45 +3326,37 @@ impl Parser {
             false
         };
 
-        let items = self.parse_select_items()?;
-        let (from, joins) = if self.peek_keyword().as_deref() == Some("from") {
+        // The SELECT is filled in place on the heap, so the clauses below — each of which may
+        // recurse into a subquery — share a small frame (spec/design/cost.md §7.1).
+        let mut sel = empty_select(distinct);
+        outline(|| -> Result<()> {
+            sel.items = self.parse_select_items()?;
+            Ok(())
+        })?;
+        if self.peek_keyword().as_deref() == Some("from") {
             self.advance(); // FROM
             let (f, j) = self.parse_from_clause()?;
-            (Some(f), j)
-        } else {
-            (None, Vec::new())
-        };
+            sel.from = Some(f);
+            sel.joins = j;
+        }
+        outline(|| -> Result<()> {
+            sel.filter = self.parse_optional_where()?;
 
-        let filter = self.parse_optional_where()?;
+            sel.group_by = self.parse_group_by()?;
 
-        let group_by = self.parse_group_by()?;
+            sel.having = self.parse_having()?;
 
-        let having = self.parse_having()?;
-
-        // WINDOW name AS ( definition ) (, …) — named windows referenced by OVER name (window.md §5).
-        let windows = self.parse_window_clause()?;
-
-        Ok(Select {
-            distinct,
-            items,
-            from,
-            joins,
-            filter,
-            group_by,
-            having,
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            windows,
-            join_group: false,
-            paren_join: false,
-            tail: Vec::new(),
-        })
+            // WINDOW name AS ( definition ) (, …) — named windows referenced by OVER name (window.md §5).
+            sel.windows = self.parse_window_clause()?;
+            Ok(())
+        })?;
+        Ok(sel)
     }
 
     /// `window_clause ::= "WINDOW" identifier "AS" "(" window_definition ")" ("," …)*` (window.md
     /// §5). Each entry is a full inline window definition (a base-window reference inside the
     /// definition is deferred). Empty when no WINDOW keyword is present. WINDOW is non-reserved.
+    #[inline(never)]
     fn parse_window_clause(&mut self) -> Result<Vec<(String, WindowDef)>> {
         if self.peek_keyword().as_deref() != Some("window") {
             return Ok(Vec::new());
@@ -3444,6 +3438,7 @@ impl Parser {
     /// `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and before ORDER BY.
     /// `HAVING` is not reserved, so it is a clause only in this position; the predicate is a
     /// general expression (it may reference aggregates) checked for boolean at resolve.
+    #[inline(never)]
     fn parse_having(&mut self) -> Result<Option<Expr>> {
         if self.peek_keyword().as_deref() != Some("having") {
             return Ok(None);
@@ -3458,6 +3453,7 @@ impl Parser {
     /// grouping column is a bare/qualified column (the same narrowing ORDER BY makes — never an
     /// expression/alias/ordinal). `GROUP` is not reserved, so it is a clause only when immediately
     /// followed by `BY`.
+    #[inline(never)]
     fn parse_group_by(&mut self) -> Result<Vec<GroupItem>> {
         if self.peek_keyword().as_deref() != Some("group") {
             return Ok(Vec::new());
@@ -3559,8 +3555,19 @@ impl Parser {
     /// join keywords are not reserved (§3); the loop recognizes a join only by a leading
     /// join keyword (`JOIN` / `INNER`/`CROSS`/`LEFT`/`RIGHT`/`FULL` ... `JOIN`), so any other
     /// trailing word ends the FROM clause.
+    #[inline(never)]
     fn parse_from_clause(&mut self) -> Result<(TableRef, Vec<JoinClause>)> {
-        let first = self.parse_table_ref()?;
+        // The first item in a small frame; the join/comma loop in its own (cost.md §7.1).
+        let first = self.parse_table_ref();
+        self.parse_from_clause_tail(first)
+    }
+
+    #[inline(never)]
+    fn parse_from_clause_tail(
+        &mut self,
+        first: Result<TableRef>,
+    ) -> Result<(TableRef, Vec<JoinClause>)> {
+        let first = first?;
         // A leading unaliased parenthesized join is the same left-deep chain without its parentheses.
         let (from, mut joins) = splice_leading_group(first, Vec::new());
         // Where the current comma item's `comma` join sits in `joins` (none for the first item).
@@ -3603,6 +3610,7 @@ impl Parser {
     /// (spec/design/grammar.md §15) after its `(`, stopping before the `)`. The group may not contain
     /// a comma, and must contain at least one join (`FROM (a)` is 42601, as in PostgreSQL). Its body
     /// is a `SELECT *` over the chain; the caller marks it `join_group` when no alias follows.
+    #[inline(never)]
     fn parse_join_group(&mut self) -> Result<QueryExpr> {
         self.deepen()?;
         let first = self.parse_table_ref()?;
@@ -3646,9 +3654,11 @@ impl Parser {
             self.advance();
         }
         if matches!(self.peek(), Token::LParen) {
-            let mut tr = self.parse_derived_table(lateral)?;
-            tr.lateral = lateral;
-            return Ok(tr);
+            let mut tr = self.parse_derived_table(lateral);
+            if let Ok(tr) = &mut tr {
+                tr.lateral = lateral;
+            }
+            return tr;
         }
         // `JSON_TABLE(ctx, path [AS n] COLUMNS (…))` — a table source (json-table.md §3, T1),
         // recognized by the keyword followed by `(`.
@@ -3657,6 +3667,13 @@ impl Parser {
         {
             return self.parse_json_table();
         }
+        self.parse_named_table_ref(lateral)
+    }
+
+    /// A base table, view, or table function reference — the non-derived `table_ref` forms — in its
+    /// own frame, off the derived-table recursion (spec/design/cost.md §7.1).
+    #[inline(never)]
+    fn parse_named_table_ref(&mut self, lateral: bool) -> Result<TableRef> {
         let mut name_pos = self.pos;
         let src = self.here();
         let mut name = self.expect_identifier()?;
@@ -3811,8 +3828,21 @@ impl Parser {
     /// (`join_group`). `alias`/`name` carry the alias (empty when none).
     fn parse_derived_table(&mut self, lateral: bool) -> Result<TableRef> {
         // Consume the opening `(`. A leading `SELECT`/`WITH` is a query-expr body; a leading `VALUES`
-        // is a VALUES-body relation; any other leading `(` is a parenthesized join.
+        // is a VALUES-body relation; any other leading `(` is a parenthesized join. The body, the
+        // nesting recursion, and the alias tail each take their own frame (cost.md §7.1).
         self.advance();
+        let body = self.parse_derived_body(lateral);
+        self.finish_derived_table(body)
+    }
+
+    /// The body of a derived table after its `(`: the subquery (or a VALUES list, or a
+    /// parenthesized join), and whether it is a join group.
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn parse_derived_body(
+        &mut self,
+        lateral: bool,
+    ) -> Result<(Option<Box<QueryExpr>>, Option<Vec<Vec<Expr>>>, bool)> {
         // The body is EITHER a query_expr (a leading `SELECT`) OR a VALUES list (a leading
         // `VALUES`) — `(VALUES (e…),(e…))`, a computed relation of literal rows (grammar.md §42).
         // The VALUES body's values are GENERAL expressions (resolved as constants at plan time,
@@ -3836,7 +3866,7 @@ impl Parser {
                 values_rows = Some(rows);
             }
         }
-        let (mut subquery, values) = if let Some(rows) = values_rows {
+        let (subquery, values) = if let Some(rows) = values_rows {
             let order_by = self.parse_order_by(true)?;
             let (limit, offset) = self.parse_limit_offset()?;
             if order_by.is_empty() && limit.is_none() && offset.is_none() {
@@ -3858,6 +3888,17 @@ impl Parser {
             join_group = true;
             (Some(Box::new(self.parse_join_group()?)), None)
         };
+        Ok((subquery, values, join_group))
+    }
+
+    /// The `)` and optional alias / column list after a derived table's body.
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn finish_derived_table(
+        &mut self,
+        body: Result<(Option<Box<QueryExpr>>, Option<Vec<Vec<Expr>>>, bool)>,
+    ) -> Result<TableRef> {
+        let (mut subquery, values, join_group) = body?;
         self.expect(&Token::RParen)?;
         // The alias is optional, parsed exactly like a base table's: an explicit `AS` takes the
         // next identifier; an implicit alias is a word that is not a clause/join stop keyword.
@@ -3920,6 +3961,7 @@ impl Parser {
 
     /// Parse `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md §3, T1). The
     /// caller has verified the `JSON_TABLE` keyword + `(`.
+    #[inline(never)]
     fn parse_json_table(&mut self) -> Result<TableRef> {
         self.advance(); // JSON_TABLE
         self.advance(); // (
@@ -4086,6 +4128,7 @@ impl Parser {
     /// per-column type unification are resolve-time concerns (the executor's `plan_values`). At
     /// least one row, each with at least one value (an empty `()` is a 42601). A trailing
     /// ORDER BY / LIMIT / OFFSET is the caller's (`parse_derived_table`).
+    #[inline(never)]
     fn parse_values_body(&mut self) -> Result<Vec<Vec<Expr>>> {
         self.expect_keyword("values")?;
         let mut rows = Vec::new();
@@ -4220,6 +4263,7 @@ impl Parser {
     /// and set-operation ORDER BY) a bare integer literal (the unary-minus fold makes `-1` one negative
     /// `Int`) is an **ordinal**; when clear (WITHIN GROUP) a bare integer is just a constant expression
     /// key, matching PostgreSQL where a WITHIN GROUP integer is a constant, not an ordinal.
+    #[inline(never)]
     fn parse_order_by(&mut self, allow_ordinal: bool) -> Result<Vec<OrderKey>> {
         let mut keys = Vec::new();
         if self.peek_keyword().as_deref() != Some("order") {
@@ -4397,6 +4441,7 @@ impl Parser {
     /// Parse an optional trailing `LIMIT <count>` and/or `OFFSET <count>` in either
     /// order, each at most once (a repeat is a syntax error, 42601). Returns the
     /// resolved non-negative counts (spec/grammar/grammar.ebnf `limit_offset`).
+    #[inline(never)]
     fn parse_limit_offset(&mut self) -> Result<(Option<i64>, Option<i64>)> {
         let mut limit = None;
         let mut offset = None;
@@ -4607,6 +4652,7 @@ impl Parser {
 
     /// Parse an optional trailing `WHERE <expr>` (shared by SELECT/UPDATE/DELETE). The
     /// expression must resolve to boolean (checked by the executor).
+    #[inline(never)]
     fn parse_optional_where(&mut self) -> Result<Option<Expr>> {
         if self.peek_keyword().as_deref() == Some("where") {
             self.advance();
@@ -4616,6 +4662,7 @@ impl Parser {
         }
     }
 
+    #[inline(never)]
     fn parse_select_items(&mut self) -> Result<SelectItems> {
         if matches!(self.peek(), Token::Star) {
             let pos = self.pos;
@@ -4692,8 +4739,19 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
+        // The operand, and an early return when no operator of this rung follows, take a small
+        // frame; the chain loop runs in its own (spec/design/cost.md §7.1).
+        let lhs = self.parse_and();
+        if lhs.is_ok() && self.peek_keyword().as_deref() == Some("or") {
+            return self.parse_or_tail(lhs);
+        }
+        lhs
+    }
+
+    #[inline(never)]
+    fn parse_or_tail(&mut self, lhs: Result<Expr>) -> Result<Expr> {
+        let mut lhs = lhs?;
         let base = self.depth;
-        let mut lhs = self.parse_and()?;
         while self.peek_keyword().as_deref() == Some("or") {
             self.deepen()?; // each chained OR is one more AST level
             let pos = self.here();
@@ -4706,8 +4764,19 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr> {
+        // The operand, and an early return when no operator of this rung follows, take a small
+        // frame; the chain loop runs in its own (spec/design/cost.md §7.1).
+        let lhs = self.parse_not();
+        if lhs.is_ok() && self.peek_keyword().as_deref() == Some("and") {
+            return self.parse_and_tail(lhs);
+        }
+        lhs
+    }
+
+    #[inline(never)]
+    fn parse_and_tail(&mut self, lhs: Result<Expr>) -> Result<Expr> {
+        let mut lhs = lhs?;
         let base = self.depth;
-        let mut lhs = self.parse_not()?;
         while self.peek_keyword().as_deref() == Some("and") {
             self.deepen()?; // each chained AND is one more AST level
             let pos = self.here();
@@ -4724,20 +4793,26 @@ impl Parser {
         // starts with the relation label `not`, not the unary operator. The primary parser applies
         // the same rule before literals / CAST / CASE / current-date spellings.
         if self.peek_keyword().as_deref() == Some("not") && !self.at_qualified_column_ref() {
-            let not = self.here();
-            self.advance();
-            // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so
-            // the depth guard also protects the parser's own stack).
-            self.deepen()?;
-            let operand = self.parse_not()?;
-            self.undeepen();
-            return Ok(Expr::Unary {
-                op: UnaryOp::Not,
-                operand: Box::new(operand),
-                pos: not,
-            });
+            return self.parse_not_operand();
         }
         self.parse_comparison()
+    }
+
+    /// A prefix `NOT` and its operand, in its own frame (spec/design/cost.md §7.1).
+    #[inline(never)]
+    fn parse_not_operand(&mut self) -> Result<Expr> {
+        let not = self.here();
+        self.advance();
+        // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so
+        // the depth guard also protects the parser's own stack).
+        self.deepen()?;
+        let operand = self.parse_not()?;
+        self.undeepen();
+        Ok(Expr::Unary {
+            op: UnaryOp::Not,
+            operand: Box::new(operand),
+            pos: not,
+        })
     }
 
     /// One comparison, a postfix `IS [NOT] NULL`, or `IS [NOT] DISTINCT FROM`, all
@@ -4745,78 +4820,118 @@ impl Parser {
     /// `(a + 1) IS NULL`. After the shared `IS` `NOT`? the parser dispatches on the
     /// `NULL` vs `DISTINCT FROM` keyword (spec/grammar/grammar.ebnf `comparison`).
     fn parse_comparison(&mut self) -> Result<Expr> {
-        let lhs = self.parse_concat()?;
+        // The operand, and an early return when no comparison follows, take a small frame; the
+        // comparison itself is parsed in its own (spec/design/cost.md §7.1).
+        let lhs = self.parse_concat();
+        if lhs.is_ok() && self.at_comparison() {
+            return self.parse_comparison_tail(lhs);
+        }
+        lhs
+    }
+
+    /// Whether a comparison-level operator follows an operand: `IS`, `[NOT] IN | BETWEEN | LIKE |
+    /// ILIKE`, a regex match, or a comparison operator. Exactly the forms `parse_comparison_tail`
+    /// consumes, so returning the bare operand otherwise is the same parse.
+    fn at_comparison(&self) -> bool {
+        match self.peek() {
+            Token::Eq
+            | Token::Ne
+            | Token::Lt
+            | Token::Gt
+            | Token::Le
+            | Token::Ge
+            | Token::Tilde
+            | Token::TildeStar
+            | Token::BangTilde
+            | Token::BangTildeStar => true,
+            Token::Word(_) => match self.peek_keyword().as_deref() {
+                Some("is" | "in" | "between" | "like" | "ilike") => true,
+                Some("not") => matches!(
+                    self.peek_keyword_at(1).as_deref(),
+                    Some("in" | "between" | "like" | "ilike")
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    #[inline(never)]
+    fn parse_comparison_tail(&mut self, lhs: Result<Expr>) -> Result<Expr> {
+        let lhs = lhs?;
         if self.peek_keyword().as_deref() == Some("is") {
-            let is_pos = self.here();
-            self.advance();
-            let negated = if self.peek_keyword().as_deref() == Some("not") {
+            return outline(|| {
+                let is_pos = self.here();
                 self.advance();
-                true
-            } else {
-                false
-            };
-            // IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
-            if self.peek_keyword().as_deref() == Some("distinct") {
-                self.advance();
-                self.expect_keyword("from")?;
-                let rhs = self.parse_concat()?;
-                return Ok(Expr::IsDistinctFrom {
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                    negated,
-                    pos: is_pos,
-                });
-            }
-            // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
-            // well-formedness predicate (json-sql-functions.md §5).
-            if self.peek_keyword().as_deref() == Some("json") {
-                self.advance();
-                let kind = match self.peek_keyword().as_deref() {
-                    Some("value") => {
-                        self.advance();
-                        JsonPredicateKind::Value
-                    }
-                    Some("scalar") => {
-                        self.advance();
-                        JsonPredicateKind::Scalar
-                    }
-                    Some("array") => {
-                        self.advance();
-                        JsonPredicateKind::Array
-                    }
-                    Some("object") => {
-                        self.advance();
-                        JsonPredicateKind::Object
-                    }
-                    _ => JsonPredicateKind::Value,
+                let negated = if self.peek_keyword().as_deref() == Some("not") {
+                    self.advance();
+                    true
+                } else {
+                    false
                 };
-                // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT`
-                // only when `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no
-                // expression-level clause here). `KEYS` is optional.
-                let unique_keys = match self.peek_keyword().as_deref() {
-                    Some(w @ ("with" | "without"))
-                        if self.peek_keyword_at(1).as_deref() == Some("unique") =>
-                    {
-                        self.advance(); // WITH / WITHOUT
-                        self.advance(); // UNIQUE
-                        if self.peek_keyword().as_deref() == Some("keys") {
+                // IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
+                if self.peek_keyword().as_deref() == Some("distinct") {
+                    self.advance();
+                    self.expect_keyword("from")?;
+                    let rhs = self.parse_concat()?;
+                    return Ok(Expr::IsDistinctFrom {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                        negated,
+                        pos: is_pos,
+                    });
+                }
+                // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
+                // well-formedness predicate (json-sql-functions.md §5).
+                if self.peek_keyword().as_deref() == Some("json") {
+                    self.advance();
+                    let kind = match self.peek_keyword().as_deref() {
+                        Some("value") => {
                             self.advance();
+                            JsonPredicateKind::Value
                         }
-                        w == "with"
-                    }
-                    _ => false,
-                };
-                return Ok(Expr::IsJson {
+                        Some("scalar") => {
+                            self.advance();
+                            JsonPredicateKind::Scalar
+                        }
+                        Some("array") => {
+                            self.advance();
+                            JsonPredicateKind::Array
+                        }
+                        Some("object") => {
+                            self.advance();
+                            JsonPredicateKind::Object
+                        }
+                        _ => JsonPredicateKind::Value,
+                    };
+                    // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT`
+                    // only when `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no
+                    // expression-level clause here). `KEYS` is optional.
+                    let unique_keys = match self.peek_keyword().as_deref() {
+                        Some(w @ ("with" | "without"))
+                            if self.peek_keyword_at(1).as_deref() == Some("unique") =>
+                        {
+                            self.advance(); // WITH / WITHOUT
+                            self.advance(); // UNIQUE
+                            if self.peek_keyword().as_deref() == Some("keys") {
+                                self.advance();
+                            }
+                            w == "with"
+                        }
+                        _ => false,
+                    };
+                    return Ok(Expr::IsJson {
+                        operand: Box::new(lhs),
+                        negated,
+                        kind,
+                        unique_keys,
+                    });
+                }
+                self.expect_keyword("null")?;
+                return Ok(Expr::IsNull {
                     operand: Box::new(lhs),
                     negated,
-                    kind,
-                    unique_keys,
                 });
-            }
-            self.expect_keyword("null")?;
-            return Ok(Expr::IsNull {
-                operand: Box::new(lhs),
-                negated,
             });
         }
         // `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when
@@ -4834,49 +4949,53 @@ impl Parser {
             self.advance(); // NOT
         }
         if self.peek_keyword().as_deref() == Some("in") {
-            self.advance();
-            self.expect(&Token::LParen)?;
-            // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by
-            // a leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
-            // (`IN ()` is rejected: parse_concat on `)` is 42601).
-            if self.at_subquery_start() {
-                let q = self.parse_subquery()?;
+            return outline(|| {
+                self.advance();
+                self.expect(&Token::LParen)?;
+                // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by
+                // a leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
+                // (`IN ()` is rejected: parse_concat on `)` is 42601).
+                if self.at_subquery_start() {
+                    let q = self.parse_subquery()?;
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::InSubquery {
+                        lhs: Box::new(lhs),
+                        query: Box::new(q),
+                        negated,
+                        pos: op_pos,
+                    });
+                }
+                let mut list = vec![self.parse_concat()?];
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    list.push(self.parse_concat()?);
+                }
                 self.expect(&Token::RParen)?;
-                return Ok(Expr::InSubquery {
+                return Ok(Expr::In {
                     lhs: Box::new(lhs),
-                    query: Box::new(q),
+                    list,
                     negated,
                     pos: op_pos,
                 });
-            }
-            let mut list = vec![self.parse_concat()?];
-            while matches!(self.peek(), Token::Comma) {
-                self.advance();
-                list.push(self.parse_concat()?);
-            }
-            self.expect(&Token::RParen)?;
-            return Ok(Expr::In {
-                lhs: Box::new(lhs),
-                list,
-                negated,
-                pos: op_pos,
             });
         }
         if self.peek_keyword().as_deref() == Some("between") {
-            self.advance();
-            // Both bounds parse at the CONCAT level (one tighter than comparison), which never
-            // consumes `AND` (a looser level owned by parse_and). So the BETWEEN's structural `AND`
-            // is matched here and `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c`
-            // (grammar.md §21); a `||` bound (`x BETWEEN a || b AND c`) still works.
-            let lo = self.parse_concat()?;
-            self.expect_keyword("and")?;
-            let hi = self.parse_concat()?;
-            return Ok(Expr::Between {
-                lhs: Box::new(lhs),
-                lo: Box::new(lo),
-                hi: Box::new(hi),
-                negated,
-                pos: op_pos,
+            return outline(|| {
+                self.advance();
+                // Both bounds parse at the CONCAT level (one tighter than comparison), which never
+                // consumes `AND` (a looser level owned by parse_and). So the BETWEEN's structural `AND`
+                // is matched here and `x BETWEEN a AND b AND c` parses as `(x BETWEEN a AND b) AND c`
+                // (grammar.md §21); a `||` bound (`x BETWEEN a || b AND c`) still works.
+                let lo = self.parse_concat()?;
+                self.expect_keyword("and")?;
+                let hi = self.parse_concat()?;
+                return Ok(Expr::Between {
+                    lhs: Box::new(lhs),
+                    lo: Box::new(lo),
+                    hi: Box::new(hi),
+                    negated,
+                    pos: op_pos,
+                });
             });
         }
         // LIKE / ILIKE (case-insensitive) — grammar.md §22. Both bind at the comparison level; the
@@ -4884,34 +5003,36 @@ impl Parser {
         // An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`; a bare
         // NULL or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
         if matches!(self.peek_keyword().as_deref(), Some("like") | Some("ilike")) {
-            let insensitive = self.peek_keyword().as_deref() == Some("ilike");
-            let like_pos = self.here();
-            self.advance();
-            let mut rhs = self.parse_concat()?;
-            if self.peek_keyword().as_deref() == Some("escape") {
+            return outline(|| {
+                let insensitive = self.peek_keyword().as_deref() == Some("ilike");
+                let like_pos = self.here();
                 self.advance();
-                let escape = self.parse_concat()?;
-                rhs = Expr::FuncCall {
-                    name: "like_escape".to_string(),
-                    args: vec![rhs, escape],
-                    arg_names: None,
-                    star: false,
-                    distinct: false,
-                    filter: None,
-                    variadic: false,
-                    over: None,
-                    over_name: None,
-                    within_group: None,
-                    agg_order: None,
-                    pos: like_pos,
-                };
-            }
-            return Ok(Expr::Like {
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                negated,
-                insensitive,
-                pos: op_pos,
+                let mut rhs = self.parse_concat()?;
+                if self.peek_keyword().as_deref() == Some("escape") {
+                    self.advance();
+                    let escape = self.parse_concat()?;
+                    rhs = Expr::FuncCall {
+                        name: "like_escape".to_string(),
+                        args: vec![rhs, escape],
+                        arg_names: None,
+                        star: false,
+                        distinct: false,
+                        filter: None,
+                        variadic: false,
+                        over: None,
+                        over_name: None,
+                        within_group: None,
+                        agg_order: None,
+                        pos: like_pos,
+                    };
+                }
+                return Ok(Expr::Like {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    negated,
+                    insensitive,
+                    pos: op_pos,
+                });
             });
         }
         // `~` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md). These are
@@ -4926,14 +5047,16 @@ impl Parser {
             _ => None,
         };
         if let Some((rx_negated, rx_insensitive)) = regex {
-            self.advance();
-            let rhs = self.parse_concat()?;
-            return Ok(Expr::Regex {
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                negated: rx_negated,
-                insensitive: rx_insensitive,
-                pos: op_pos,
+            return outline(|| {
+                self.advance();
+                let rhs = self.parse_concat()?;
+                return Ok(Expr::Regex {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    negated: rx_negated,
+                    insensitive: rx_insensitive,
+                    pos: op_pos,
+                });
             });
         }
         let op = match self.peek() {
@@ -4946,7 +5069,7 @@ impl Parser {
             _ => None,
         };
         match op {
-            Some(op) => {
+            Some(op) => outline(|| {
                 self.advance();
                 let pos = op_pos;
                 // `op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41):
@@ -4986,7 +5109,7 @@ impl Parser {
                 }
                 let rhs = self.parse_concat()?;
                 Ok(binary(op, lhs, rhs, pos))
-            }
+            }),
             None => Ok(lhs),
         }
     }
@@ -4997,33 +5120,53 @@ impl Parser {
     /// precedence in PostgreSQL. Each operand is an additive expression, so `a + b || c` is
     /// `(a + b) || c`; chaining mixes freely (`a || b @> c` is `(a || b) @> c`).
     fn parse_concat(&mut self) -> Result<Expr> {
+        // The operand, and an early return when no operator of this rung follows, take a small
+        // frame; the chain loop runs in its own (spec/design/cost.md §7.1).
+        let lhs = self.parse_additive();
+        if lhs.is_ok() && self.at_concat_op() {
+            return self.parse_concat_tail(lhs);
+        }
+        lhs
+    }
+
+    /// Whether the next token is an operator of the "any other operator" rung (parse_concat).
+    fn at_concat_op(&self) -> bool {
+        Self::concat_op(self.peek()).is_some()
+    }
+
+    /// The binary operator a token denotes at the "any other operator" rung.
+    fn concat_op(t: &Token) -> Option<BinaryOp> {
+        Some(match t {
+            Token::Concat => BinaryOp::Concat,
+            Token::Contains => BinaryOp::Contains,
+            Token::JsonPathExists => BinaryOp::JsonPathExists,
+            Token::JsonPathMatch => BinaryOp::JsonPathMatch,
+            Token::ContainedBy => BinaryOp::ContainedBy,
+            Token::Overlaps => BinaryOp::Overlaps,
+            Token::StrictlyLeft => BinaryOp::StrictlyLeft,
+            Token::StrictlyRight => BinaryOp::StrictlyRight,
+            Token::NotExtendRight => BinaryOp::NotExtendRight,
+            Token::NotExtendLeft => BinaryOp::NotExtendLeft,
+            Token::Adjacent => BinaryOp::Adjacent,
+            // The jsonb accessor operators (json-sql-functions.md §1) — "any other operator"
+            // precedence, same level as `@>`/`||`, left-associative (`doc -> 'a' -> 'b'`).
+            Token::Arrow => BinaryOp::JsonGet,
+            Token::ArrowText => BinaryOp::JsonGetText,
+            Token::HashArrow => BinaryOp::JsonGetPath,
+            Token::HashArrowText => BinaryOp::JsonGetPathText,
+            Token::Question => BinaryOp::JsonHasKey,
+            Token::QuestionPipe => BinaryOp::JsonHasAnyKey,
+            Token::QuestionAmp => BinaryOp::JsonHasAllKeys,
+            Token::HashMinus => BinaryOp::JsonDeletePath,
+            _ => return None,
+        })
+    }
+
+    #[inline(never)]
+    fn parse_concat_tail(&mut self, lhs: Result<Expr>) -> Result<Expr> {
+        let mut lhs = lhs?;
         let base = self.depth;
-        let mut lhs = self.parse_additive()?;
-        loop {
-            let op = match self.peek() {
-                Token::Concat => BinaryOp::Concat,
-                Token::Contains => BinaryOp::Contains,
-                Token::JsonPathExists => BinaryOp::JsonPathExists,
-                Token::JsonPathMatch => BinaryOp::JsonPathMatch,
-                Token::ContainedBy => BinaryOp::ContainedBy,
-                Token::Overlaps => BinaryOp::Overlaps,
-                Token::StrictlyLeft => BinaryOp::StrictlyLeft,
-                Token::StrictlyRight => BinaryOp::StrictlyRight,
-                Token::NotExtendRight => BinaryOp::NotExtendRight,
-                Token::NotExtendLeft => BinaryOp::NotExtendLeft,
-                Token::Adjacent => BinaryOp::Adjacent,
-                // The jsonb accessor operators (json-sql-functions.md §1) — "any other operator"
-                // precedence, same level as `@>`/`||`, left-associative (`doc -> 'a' -> 'b'`).
-                Token::Arrow => BinaryOp::JsonGet,
-                Token::ArrowText => BinaryOp::JsonGetText,
-                Token::HashArrow => BinaryOp::JsonGetPath,
-                Token::HashArrowText => BinaryOp::JsonGetPathText,
-                Token::Question => BinaryOp::JsonHasKey,
-                Token::QuestionPipe => BinaryOp::JsonHasAnyKey,
-                Token::QuestionAmp => BinaryOp::JsonHasAllKeys,
-                Token::HashMinus => BinaryOp::JsonDeletePath,
-                _ => break,
-            };
+        while let Some(op) = Self::concat_op(self.peek()) {
             self.deepen()?; // each chained operator is one more AST level
             let pos = self.here();
             self.advance();
@@ -5035,8 +5178,18 @@ impl Parser {
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
+        // See parse_or: a small frame for the operand, the chain loop in its own.
+        let lhs = self.parse_multiplicative();
+        if lhs.is_ok() && matches!(self.peek(), Token::Plus | Token::Minus) {
+            return self.parse_additive_tail(lhs);
+        }
+        lhs
+    }
+
+    #[inline(never)]
+    fn parse_additive_tail(&mut self, lhs: Result<Expr>) -> Result<Expr> {
+        let mut lhs = lhs?;
         let base = self.depth;
-        let mut lhs = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinaryOp::Add,
@@ -5054,8 +5207,19 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr> {
+        // The operand, and an early return when no operator of this rung follows, take a small
+        // frame; the chain loop runs in its own (spec/design/cost.md §7.1).
+        let lhs = self.parse_at_time_zone();
+        if lhs.is_ok() && matches!(self.peek(), Token::Star | Token::Slash | Token::Percent) {
+            return self.parse_multiplicative_tail(lhs);
+        }
+        lhs
+    }
+
+    #[inline(never)]
+    fn parse_multiplicative_tail(&mut self, lhs: Result<Expr>) -> Result<Expr> {
+        let mut lhs = lhs?;
         let base = self.depth;
-        let mut lhs = self.parse_at_time_zone()?;
         loop {
             let op = match self.peek() {
                 Token::Star => BinaryOp::Mul,
@@ -5081,8 +5245,19 @@ impl Parser {
     /// `timezone(...)` call. `AT`/`TIME`/`ZONE` are non-reserved words (matched as a three-token
     /// sequence, never reserved), so a bare column named `at`/`time`/`zone` is unaffected.
     fn parse_at_time_zone(&mut self) -> Result<Expr> {
+        // The operand, and an early return when no operator of this rung follows, take a small
+        // frame; the chain loop runs in its own (spec/design/cost.md §7.1).
+        let lhs = self.parse_unary();
+        if lhs.is_ok() && self.peek_at_time_zone() {
+            return self.parse_at_time_zone_tail(lhs);
+        }
+        lhs
+    }
+
+    #[inline(never)]
+    fn parse_at_time_zone_tail(&mut self, lhs: Result<Expr>) -> Result<Expr> {
+        let mut lhs = lhs?;
         let base = self.depth;
-        let mut lhs = self.parse_unary()?;
         while self.peek_at_time_zone() {
             self.deepen()?; // each chained AT TIME ZONE is one more AST level
             let at = self.here();
@@ -5118,47 +5293,53 @@ impl Parser {
 
     fn parse_unary(&mut self) -> Result<Expr> {
         if matches!(self.peek(), Token::Minus) {
-            let minus = self.here();
-            self.advance();
-            // Fold unary-minus-of-an-integer-literal into one negative literal: this
-            // makes i64::MIN representable (`-(2^63)`) and lets the negative value
-            // range-check against its context like any literal (spec/design/types.md §6).
-            // SUPPRESSED when a `::` immediately follows the literal: `::` binds tighter than
-            // unary minus (PostgreSQL), so `-N::T` is `-(N::T)` — the cast applies to the
-            // unsigned magnitude first (grammar.md §37). A one-token lookahead on the token
-            // AFTER the literal, a §8 cross-core determinism surface.
-            if let Token::Int(m) = self.peek()
-                && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
-            {
-                let m = *m;
-                self.advance();
-                let folded = -(m as i128); // m <= 2^63 ⇒ folded ∈ [-2^63, 0] ⊆ i64
-                return Ok(Expr::Literal(Literal::Int(folded as i64), minus));
-            }
-            // Fold unary-minus of a decimal literal into one negative decimal literal (like
-            // the integer fold). Decimal negation never overflows. Same `::` suppression.
-            if matches!(self.peek(), Token::Decimal(..))
-                && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
-            {
-                if let Token::Decimal(digits, scale) = self.advance() {
-                    return Ok(Expr::Literal(
-                        Literal::Decimal(Decimal::from_digits_scale(true, &digits, scale)),
-                        minus,
-                    ));
-                }
-            }
-            // each chained unary `-` is one more AST level (recursion here, so the depth guard
-            // also protects the parser's own stack against `- - - … x`).
-            self.deepen()?;
-            let operand = self.parse_unary()?;
-            self.undeepen();
-            return Ok(Expr::Unary {
-                op: UnaryOp::Neg,
-                operand: Box::new(operand),
-                pos: minus,
-            });
+            return self.parse_negation();
         }
         self.parse_postfix()
+    }
+
+    /// A unary `-` and its operand, in its own frame (spec/design/cost.md §7.1).
+    #[inline(never)]
+    fn parse_negation(&mut self) -> Result<Expr> {
+        let minus = self.here();
+        self.advance();
+        // Fold unary-minus-of-an-integer-literal into one negative literal: this
+        // makes i64::MIN representable (`-(2^63)`) and lets the negative value
+        // range-check against its context like any literal (spec/design/types.md §6).
+        // SUPPRESSED when a `::` immediately follows the literal: `::` binds tighter than
+        // unary minus (PostgreSQL), so `-N::T` is `-(N::T)` — the cast applies to the
+        // unsigned magnitude first (grammar.md §37). A one-token lookahead on the token
+        // AFTER the literal, a §8 cross-core determinism surface.
+        if let Token::Int(m) = self.peek()
+            && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
+        {
+            let m = *m;
+            self.advance();
+            let folded = -(m as i128); // m <= 2^63 ⇒ folded ∈ [-2^63, 0] ⊆ i64
+            return Ok(Expr::Literal(Literal::Int(folded as i64), minus));
+        }
+        // Fold unary-minus of a decimal literal into one negative decimal literal (like
+        // the integer fold). Decimal negation never overflows. Same `::` suppression.
+        if matches!(self.peek(), Token::Decimal(..))
+            && self.tokens.get(self.pos + 1) != Some(&Token::DoubleColon)
+        {
+            if let Token::Decimal(digits, scale) = self.advance() {
+                return Ok(Expr::Literal(
+                    Literal::Decimal(Decimal::from_digits_scale(true, &digits, scale)),
+                    minus,
+                ));
+            }
+        }
+        // each chained unary `-` is one more AST level (recursion here, so the depth guard
+        // also protects the parser's own stack against `- - - … x`).
+        self.deepen()?;
+        let operand = self.parse_unary()?;
+        self.undeepen();
+        Ok(Expr::Unary {
+            op: UnaryOp::Neg,
+            operand: Box::new(operand),
+            pos: minus,
+        })
     }
 
     /// A primary optionally followed by one or more postfix operators, applied left-to-right in
@@ -5177,12 +5358,31 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr> {
         // Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A
         // subsequent `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
-        let base = self.depth;
-        let mut field_accessible = matches!(self.peek(), Token::LParen);
-        let mut expr = self.parse_primary()?;
-        if self.pos == self.bare_row_end {
-            field_accessible = false;
+        // The primary, and an early return when no postfix follows, take a small frame; the
+        // postfix loop runs in its own (spec/design/cost.md §7.1).
+        let paren = matches!(self.peek(), Token::LParen);
+        let expr = self.parse_primary();
+        if expr.is_ok() && self.at_postfix(paren && self.pos != self.bare_row_end) {
+            return self.parse_postfix_tail(expr, paren);
         }
+        expr
+    }
+
+    /// Whether a postfix operator follows; `.field` only when `field_accessible`.
+    fn at_postfix(&self, field_accessible: bool) -> bool {
+        match self.peek() {
+            Token::DoubleColon | Token::LBracket => true,
+            Token::Dot => field_accessible,
+            Token::Word(_) => self.peek_keyword().as_deref() == Some("collate"),
+            _ => false,
+        }
+    }
+
+    #[inline(never)]
+    fn parse_postfix_tail(&mut self, expr: Result<Expr>, paren: bool) -> Result<Expr> {
+        let mut expr = expr?;
+        let base = self.depth;
+        let mut field_accessible = paren && self.pos != self.bare_row_end;
         loop {
             // each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only
             // when a postfix actually follows (not on the terminating non-postfix token).
@@ -5300,42 +5500,46 @@ impl Parser {
         // below as literals or keyword-led expressions. Recognize the unambiguous
         // `identifier.identifier` shape first so aliases such as `null`, `cast`, or `case` work.
         if self.at_qualified_column_ref() {
-            let pos = self.here();
-            let qualifier = self.expect_identifier()?;
-            self.expect(&Token::Dot)?;
-            let name = self.expect_identifier()?;
-            return Ok(Expr::QualifiedColumn {
-                qualifier,
-                name,
-                pos,
+            return outline(|| {
+                let pos = self.here();
+                let qualifier = self.expect_identifier()?;
+                self.expect(&Token::Dot)?;
+                let name = self.expect_identifier()?;
+                return Ok(Expr::QualifiedColumn {
+                    qualifier,
+                    name,
+                    pos,
+                });
             });
         }
         if matches!(self.peek(), Token::LParen) {
-            self.advance();
-            // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
-            // `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise this is a
-            // parenthesized expression.
-            if self.at_subquery_start() {
-                let q = self.parse_subquery()?;
-                self.expect(&Token::RParen)?;
-                return Ok(Expr::ScalarSubquery(Box::new(q)));
-            }
-            let e = self.parse_expr()?;
-            // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
-            // spelling: two or more comma-separated expressions in parentheses. Identical to
-            // `ROW(a, b, …)`; a single parenthesized expression stays a grouping.
-            if matches!(self.peek(), Token::Comma) {
-                let mut fields = vec![e];
-                while matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                    fields.push(self.parse_expr()?);
+            return outline(|| {
+                self.advance();
+                // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
+                // `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise this is a
+                // parenthesized expression.
+                if self.at_subquery_start() {
+                    let q = self.parse_subquery()?;
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::ScalarSubquery(Box::new(q)));
+                }
+                let e = self.parse_expr()?;
+                // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
+                // spelling: two or more comma-separated expressions in parentheses. Identical to
+                // `ROW(a, b, …)`; a single parenthesized expression stays a grouping.
+                if matches!(self.peek(), Token::Comma) {
+                    let mut fields = vec![e];
+                    while matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        fields.push(self.parse_expr()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                    self.bare_row_end = self.pos;
+                    return Ok(Expr::Row(fields));
                 }
                 self.expect(&Token::RParen)?;
-                self.bare_row_end = self.pos;
-                return Ok(Expr::Row(fields));
-            }
-            self.expect(&Token::RParen)?;
-            return Ok(e);
+                return Ok(e);
+            });
         }
         // `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when
         // an open-paren + a query start (`SELECT`, or a nested `WITH` — cte.md §7) follows, so
@@ -5344,32 +5548,36 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
             && self.is_query_start_at(self.pos + 2)
         {
-            self.advance(); // EXISTS
-            self.expect(&Token::LParen)?;
-            let q = self.parse_subquery()?;
-            self.expect(&Token::RParen)?;
-            return Ok(Expr::Exists(Box::new(q)));
+            return outline(|| {
+                self.advance(); // EXISTS
+                self.expect(&Token::LParen)?;
+                let q = self.parse_subquery()?;
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::Exists(Box::new(q)));
+            });
         }
         if self.peek_keyword().as_deref() == Some("cast") {
-            let cast_pos = self.here();
-            self.advance();
-            self.expect(&Token::LParen)?;
-            let inner = self.parse_expr()?;
-            self.expect_keyword("as")?;
-            let base_type = self.expect_type_name()?;
-            let type_mod = self.parse_type_mod()?;
-            let is_array = self.consume_array_brackets()?;
-            let type_name = if is_array {
-                format!("{base_type}[]")
-            } else {
-                base_type
-            };
-            self.expect(&Token::RParen)?;
-            return Ok(Expr::Cast {
-                inner: Box::new(inner),
-                type_name,
-                type_mod,
-                pos: cast_pos,
+            return outline(|| {
+                let cast_pos = self.here();
+                self.advance();
+                self.expect(&Token::LParen)?;
+                let inner = self.parse_expr()?;
+                self.expect_keyword("as")?;
+                let base_type = self.expect_type_name()?;
+                let type_mod = self.parse_type_mod()?;
+                let is_array = self.consume_array_brackets()?;
+                let type_name = if is_array {
+                    format!("{base_type}[]")
+                } else {
+                    base_type
+                };
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::Cast {
+                    inner: Box::new(inner),
+                    type_name,
+                    type_mod,
+                    pos: cast_pos,
+                });
             });
         }
         // `EXTRACT(field FROM source)` (grammar.md §50, timezones.md §9.2). Recognized only when
@@ -5380,29 +5588,31 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("extract")
             && matches!(self.peek_at(1), Token::LParen)
         {
-            self.advance(); // EXTRACT
-            self.expect(&Token::LParen)?;
-            let field = match self.peek() {
-                Token::Str(_) => {
-                    if let Token::Str(s) = self.advance() {
-                        s
-                    } else {
-                        unreachable!()
+            return outline(|| {
+                self.advance(); // EXTRACT
+                self.expect(&Token::LParen)?;
+                let field = match self.peek() {
+                    Token::Str(_) => {
+                        if let Token::Str(s) = self.advance() {
+                            s
+                        } else {
+                            unreachable!()
+                        }
                     }
-                }
-                Token::Word(_) | Token::QuotedIdent(_) => self.expect_identifier()?,
-                other => {
-                    return Err(syntax(format!(
-                        "expected an EXTRACT field, found {other:?}"
-                    )));
-                }
-            };
-            self.expect_keyword("from")?;
-            let source = self.parse_expr()?;
-            self.expect(&Token::RParen)?;
-            return Ok(Expr::Extract {
-                field: field.to_ascii_lowercase(),
-                source: Box::new(source),
+                    Token::Word(_) | Token::QuotedIdent(_) => self.expect_identifier()?,
+                    other => {
+                        return Err(syntax(format!(
+                            "expected an EXTRACT field, found {other:?}"
+                        )));
+                    }
+                };
+                self.expect_keyword("from")?;
+                let source = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::Extract {
+                    field: field.to_ascii_lowercase(),
+                    source: Box::new(source),
+                });
             });
         }
         // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when
@@ -5410,24 +5620,28 @@ impl Parser {
         // otherwise. The bare `(a, b)` form is parsed with the parenthesized expression above.
         if self.peek_keyword().as_deref() == Some("row") && matches!(self.peek_at(1), Token::LParen)
         {
-            self.advance(); // ROW
-            self.expect(&Token::LParen)?;
-            let mut fields = Vec::new();
-            if !matches!(self.peek(), Token::RParen) {
-                loop {
-                    fields.push(self.parse_expr()?);
-                    match self.advance() {
-                        Token::Comma => continue,
-                        Token::RParen => break,
-                        other => {
-                            return Err(syntax(format!("expected ',' or ')', found {other:?}")));
+            return outline(|| {
+                self.advance(); // ROW
+                self.expect(&Token::LParen)?;
+                let mut fields = Vec::new();
+                if !matches!(self.peek(), Token::RParen) {
+                    loop {
+                        fields.push(self.parse_expr()?);
+                        match self.advance() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(syntax(format!(
+                                    "expected ',' or ')', found {other:?}"
+                                )));
+                            }
                         }
                     }
+                } else {
+                    self.advance(); // the empty ROW() — consume ')'
                 }
-            } else {
-                self.advance(); // the empty ROW() — consume ')'
-            }
-            return Ok(Expr::Row(fields));
+                return Ok(Expr::Row(fields));
+            });
         }
         // `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized only when
         // `ARRAY` is immediately followed by `[`, so `array` stays usable as an identifier
@@ -5435,24 +5649,28 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("array")
             && matches!(self.peek_at(1), Token::LBracket)
         {
-            self.advance(); // ARRAY
-            self.expect(&Token::LBracket)?;
-            let mut elems = Vec::new();
-            if !matches!(self.peek(), Token::RBracket) {
-                loop {
-                    elems.push(self.parse_expr()?);
-                    match self.advance() {
-                        Token::Comma => continue,
-                        Token::RBracket => break,
-                        other => {
-                            return Err(syntax(format!("expected ',' or ']', found {other:?}")));
+            return outline(|| {
+                self.advance(); // ARRAY
+                self.expect(&Token::LBracket)?;
+                let mut elems = Vec::new();
+                if !matches!(self.peek(), Token::RBracket) {
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        match self.advance() {
+                            Token::Comma => continue,
+                            Token::RBracket => break,
+                            other => {
+                                return Err(syntax(format!(
+                                    "expected ',' or ']', found {other:?}"
+                                )));
+                            }
                         }
                     }
+                } else {
+                    self.advance(); // the empty ARRAY[] — consume ']'
                 }
-            } else {
-                self.advance(); // the empty ARRAY[] — consume ']'
-            }
-            return Ok(Expr::Array(elems));
+                return Ok(Expr::Array(elems));
+            });
         }
         // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`,
         // equal to `CAST('string' AS type)` over a string-literal operand: ANY type-naming word
@@ -5466,32 +5684,36 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Str(_)))
             && !matches!(self.peek(), Token::Word(w) if matches!(w.as_str(), "null" | "true" | "false"))
         {
-            let type_name = self.expect_identifier()?;
-            let pos = self.here();
-            if let Token::Str(text) = self.advance() {
-                return Ok(Expr::TypedLiteral {
-                    type_name,
-                    text,
-                    pos,
-                });
-            }
-            unreachable!("peeked a string literal after the type name");
+            return outline(|| {
+                let type_name = self.expect_identifier()?;
+                let pos = self.here();
+                if let Token::Str(text) = self.advance() {
+                    return Ok(Expr::TypedLiteral {
+                        type_name,
+                        text,
+                        pos,
+                    });
+                }
+                unreachable!("peeked a string literal after the type name");
+            });
         }
         // The two-word `character varying '...'` typed literal (types.md §15).
         if self.peek_keyword().as_deref() == Some("character")
             && self.peek_keyword_at(1).as_deref() == Some("varying")
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Str(_)))
         {
-            let type_name = self.expect_type_name()?;
-            let pos = self.here();
-            if let Token::Str(text) = self.advance() {
-                return Ok(Expr::TypedLiteral {
-                    type_name,
-                    text,
-                    pos,
-                });
-            }
-            unreachable!("peeked a string literal after the type name");
+            return outline(|| {
+                let type_name = self.expect_type_name()?;
+                let pos = self.here();
+                if let Token::Str(text) = self.advance() {
+                    return Ok(Expr::TypedLiteral {
+                        type_name,
+                        text,
+                        pos,
+                    });
+                }
+                unreachable!("peeked a string literal after the type name");
+            });
         }
         // `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
         // (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled
@@ -5499,26 +5721,28 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("json")
             && matches!(self.peek_at(1), Token::LParen)
         {
-            self.advance(); // JSON
-            self.advance(); // (
-            let operand = self.parse_expr()?;
-            let unique_keys = match self.peek_keyword().as_deref() {
-                Some(w @ ("with" | "without"))
-                    if self.peek_keyword_at(1).as_deref() == Some("unique") =>
-                {
-                    self.advance(); // WITH / WITHOUT
-                    self.advance(); // UNIQUE
-                    if self.peek_keyword().as_deref() == Some("keys") {
-                        self.advance();
+            return outline(|| {
+                self.advance(); // JSON
+                self.advance(); // (
+                let operand = self.parse_expr()?;
+                let unique_keys = match self.peek_keyword().as_deref() {
+                    Some(w @ ("with" | "without"))
+                        if self.peek_keyword_at(1).as_deref() == Some("unique") =>
+                    {
+                        self.advance(); // WITH / WITHOUT
+                        self.advance(); // UNIQUE
+                        if self.peek_keyword().as_deref() == Some("keys") {
+                            self.advance();
+                        }
+                        w == "with"
                     }
-                    w == "with"
-                }
-                _ => false,
-            };
-            self.expect(&Token::RParen)?;
-            return Ok(Expr::JsonCtor {
-                operand: Box::new(operand),
-                unique_keys,
+                    _ => false,
+                };
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::JsonCtor {
+                    operand: Box::new(operand),
+                    unique_keys,
+                });
             });
         }
         // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
@@ -5537,21 +5761,23 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("coalesce")
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
-            self.advance(); // COALESCE
-            self.advance(); // (
-            if matches!(self.peek(), Token::RParen) {
-                return Err(syntax("COALESCE requires at least one argument"));
-            }
-            let mut args = Vec::new();
-            loop {
-                args.push(self.parse_expr()?);
-                if !matches!(self.peek(), Token::Comma) {
-                    break;
+            return outline(|| {
+                self.advance(); // COALESCE
+                self.advance(); // (
+                if matches!(self.peek(), Token::RParen) {
+                    return Err(syntax("COALESCE requires at least one argument"));
                 }
-                self.advance(); // ,
-            }
-            self.expect(&Token::RParen)?;
-            return Ok(Expr::Coalesce(args));
+                let mut args = Vec::new();
+                loop {
+                    args.push(self.parse_expr()?);
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.advance(); // ,
+                }
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::Coalesce(args));
+            });
         }
         // `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52).
         // Recognized only when the keyword is immediately followed by `(` (the same one-token
@@ -5561,60 +5787,64 @@ impl Parser {
         if matches!(gl_kw.as_deref(), Some("greatest") | Some("least"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
         {
-            let greatest = gl_kw.as_deref() == Some("greatest");
-            self.advance(); // GREATEST / LEAST
-            self.advance(); // (
-            if matches!(self.peek(), Token::RParen) {
-                return Err(syntax(if greatest {
-                    "GREATEST requires at least one argument"
-                } else {
-                    "LEAST requires at least one argument"
-                }));
-            }
-            let mut args = Vec::new();
-            loop {
-                args.push(self.parse_expr()?);
-                if !matches!(self.peek(), Token::Comma) {
-                    break;
+            return outline(|| {
+                let greatest = gl_kw.as_deref() == Some("greatest");
+                self.advance(); // GREATEST / LEAST
+                self.advance(); // (
+                if matches!(self.peek(), Token::RParen) {
+                    return Err(syntax(if greatest {
+                        "GREATEST requires at least one argument"
+                    } else {
+                        "LEAST requires at least one argument"
+                    }));
                 }
-                self.advance(); // ,
-            }
-            self.expect(&Token::RParen)?;
-            return Ok(Expr::GreatestLeast { args, greatest });
+                let mut args = Vec::new();
+                loop {
+                    args.push(self.parse_expr()?);
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.advance(); // ,
+                }
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::GreatestLeast { args, greatest });
+            });
         }
         if self.peek_keyword().as_deref() == Some("case") {
-            let case_pos = self.here();
-            self.advance();
-            // Simple form has an operand between CASE and the first WHEN; the searched form
-            // starts directly with WHEN (grammar.md §23).
-            let operand = if self.peek_keyword().as_deref() == Some("when") {
-                None
-            } else {
-                Some(Box::new(self.parse_expr()?))
-            };
-            let mut whens = Vec::new();
-            while self.peek_keyword().as_deref() == Some("when") {
+            return outline(|| {
+                let case_pos = self.here();
                 self.advance();
-                let cond = self.parse_expr()?;
-                self.expect_keyword("then")?;
-                let res = self.parse_expr()?;
-                whens.push((cond, res));
-            }
-            if whens.is_empty() {
-                return Err(syntax("CASE requires at least one WHEN clause"));
-            }
-            let els = if self.peek_keyword().as_deref() == Some("else") {
-                self.advance();
-                Some(Box::new(self.parse_expr()?))
-            } else {
-                None
-            };
-            self.expect_keyword("end")?;
-            return Ok(Expr::Case {
-                operand,
-                whens,
-                els,
-                pos: case_pos,
+                // Simple form has an operand between CASE and the first WHEN; the searched form
+                // starts directly with WHEN (grammar.md §23).
+                let operand = if self.peek_keyword().as_deref() == Some("when") {
+                    None
+                } else {
+                    Some(Box::new(self.parse_expr()?))
+                };
+                let mut whens = Vec::new();
+                while self.peek_keyword().as_deref() == Some("when") {
+                    self.advance();
+                    let cond = self.parse_expr()?;
+                    self.expect_keyword("then")?;
+                    let res = self.parse_expr()?;
+                    whens.push((cond, res));
+                }
+                if whens.is_empty() {
+                    return Err(syntax("CASE requires at least one WHEN clause"));
+                }
+                let els = if self.peek_keyword().as_deref() == Some("else") {
+                    self.advance();
+                    Some(Box::new(self.parse_expr()?))
+                } else {
+                    None
+                };
+                self.expect_keyword("end")?;
+                return Ok(Expr::Case {
+                    operand,
+                    whens,
+                    els,
+                    pos: case_pos,
+                });
             });
         }
         // The primary token's character position (spec/design/error-fields.md §10.2).
@@ -6659,6 +6889,28 @@ fn group_outer_join_item(joins: &mut Vec<JoinClause>, seg: usize) {
 
 /// The label of a `VALUES` query's relation (PostgreSQL's `"*VALUES*"`).
 const VALUES_LABEL: &str = "*VALUES*";
+
+/// A heap-allocated SELECT with no clauses, built in its own frame so `parse_select_core` does not
+/// hold a `Select`-sized temporary on the recursive path (spec/design/cost.md §7.1).
+#[inline(never)]
+fn empty_select(distinct: bool) -> Box<Select> {
+    Box::new(Select {
+        distinct,
+        items: SelectItems::Items(Vec::new()),
+        from: None,
+        joins: Vec::new(),
+        filter: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        windows: Vec::new(),
+        join_group: false,
+        paren_join: false,
+        tail: Vec::new(),
+    })
+}
 
 /// A `VALUES` query (grammar.md §25) — a statement, a set-operation operand, or a VALUES body with
 /// trailing `ORDER BY` / `LIMIT` / `OFFSET` (§42) — as the query `SELECT * FROM (VALUES …) ORDER BY …

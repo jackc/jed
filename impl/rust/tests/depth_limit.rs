@@ -122,3 +122,267 @@ fn deep_nesting_in_where_and_check_is_bounded() {
         "54001"
     );
 }
+
+/// The native-stack budget the depth gate holds an optimized build to (spec/design/cost.md §7.1):
+/// every nesting vector, at the deepest depth the parser accepts, parses, plans, and executes within
+/// it, and the over-limit form is rejected within it. An unoptimized build's frames are several
+/// times larger, so there the shapes still run end to end, on a stack sized for that build.
+#[cfg(jed_optimized)]
+const TEST_STACK: usize = 1 << 20;
+#[cfg(not(jed_optimized))]
+const TEST_STACK: usize = 256 << 20;
+
+/// One recursion vector: its nesting `shape(n)` and any statements it needs first.
+struct Shape {
+    name: &'static str,
+    shape: fn(usize) -> String,
+    setup: fn(usize) -> Vec<String>,
+}
+
+fn no_setup(_: usize) -> Vec<String> {
+    Vec::new()
+}
+
+fn nest(open: &str, inner: &str, close: &str, n: usize) -> String {
+    format!("{}{inner}{}", open.repeat(n), close.repeat(n))
+}
+
+fn shapes() -> Vec<Shape> {
+    fn s(name: &'static str, shape: fn(usize) -> String) -> Shape {
+        Shape {
+            name,
+            shape,
+            setup: no_setup,
+        }
+    }
+    vec![
+        s("parens", |n| {
+            format!("SELECT {} FROM t", nest("(", "1", ")", n))
+        }),
+        s("ARRAY", |n| {
+            format!("SELECT {} FROM t", nest("ARRAY[", "1", "]", n))
+        }),
+        s("ROW", |n| {
+            format!("SELECT {} FROM t", nest("ROW(", "1", ")", n))
+        }),
+        s("NOT", |n| format!("SELECT {}true FROM t", "NOT ".repeat(n))),
+        s("unary minus", |n| {
+            format!("SELECT {}1 FROM t", "- ".repeat(n))
+        }),
+        s("operator chain", |n| {
+            format!("SELECT {} FROM t", vec!["v"; n + 1].join(" + "))
+        }),
+        s("AND chain", |n| {
+            format!("SELECT {} FROM t", vec!["true"; n + 1].join(" AND "))
+        }),
+        s("comparison operand", |n| {
+            format!("SELECT {} FROM t", nest("(true = ", "true", ")", n))
+        }),
+        s("cast chain", |n| {
+            format!("SELECT 1{} FROM t", "::int4".repeat(n))
+        }),
+        s("CAST", |n| {
+            format!("SELECT {} FROM t", nest("CAST(", "1", " AS i64)", n))
+        }),
+        s("function call", |n| {
+            format!("SELECT {} FROM t", nest("abs(", "1", ")", n))
+        }),
+        s("COALESCE", |n| {
+            format!("SELECT {} FROM t", nest("coalesce(NULL, ", "1", ")", n))
+        }),
+        s("CASE", |n| {
+            format!(
+                "SELECT {} FROM t",
+                nest("CASE WHEN true THEN ", "1", " END", n)
+            )
+        }),
+        s("subscript index", |n| {
+            format!("SELECT {} FROM t", nest("ARRAY[1, 2][", "1", "]", n))
+        }),
+        s("scalar subquery", |n| {
+            format!("SELECT {} FROM t", nest("(SELECT ", "1", ")", n))
+        }),
+        s("correlated subquery", |n| {
+            format!("SELECT {} FROM t", nest("(SELECT ", "t.v", ")", n))
+        }),
+        s("EXISTS", |n| {
+            format!("SELECT {} FROM t", nest("EXISTS (SELECT ", "true", ")", n))
+        }),
+        s("IN subquery", |n| {
+            format!("SELECT {} FROM t", nest("true IN (SELECT ", "true", ")", n))
+        }),
+        s("derived table", |n| {
+            format!(
+                "SELECT * FROM {}",
+                nest("(SELECT * FROM ", "t", ") AS x", n)
+            )
+        }),
+        s("parenthesized query", |n| nest("(", "SELECT 1", ")", n)),
+        s("parenthesized join", |n| {
+            format!(
+                "SELECT * FROM {}",
+                nest("(", "t AS a JOIN t AS b ON true", ")", n)
+            )
+        }),
+        s("UNION chain", |n| {
+            format!("SELECT 1{}", " UNION ALL SELECT 1".repeat(n))
+        }),
+        s("nested WITH", |n| {
+            nest("WITH x AS (", "SELECT 1", ") SELECT * FROM x", n)
+        }),
+        s("WHERE", |n| {
+            format!("SELECT v FROM t WHERE {} = 1", nest("(", "v", " + 0)", n))
+        }),
+        s("GROUP BY expression", |n| {
+            let e = nest("(", "v", " + 1)", n);
+            format!("SELECT {e} FROM t GROUP BY {e}")
+        }),
+        s("ORDER BY expression", |n| {
+            format!("SELECT v FROM t ORDER BY {}", nest("(", "v", " + 1)", n))
+        }),
+        s("aggregate argument", |n| {
+            format!("SELECT sum({}) FROM t", nest("(", "v", " + 1)", n))
+        }),
+        s("EXPLAIN VERBOSE", |n| {
+            format!(
+                "EXPLAIN (VERBOSE) SELECT {} FROM t",
+                nest("(", "v", " + 1)", n)
+            )
+        }),
+        s("UPDATE", |n| {
+            format!("UPDATE t SET v = {}", nest("(", "v", " + 0)", n))
+        }),
+        s("INSERT SELECT", |n| {
+            format!(
+                "INSERT INTO t SELECT id + 10, {} FROM t",
+                nest("(", "v", " + 0)", n)
+            )
+        }),
+        s("DELETE", |n| {
+            format!("DELETE FROM t WHERE {} = 99", nest("(", "v", " + 0)", n))
+        }),
+        Shape {
+            name: "CHECK",
+            shape: |_| "INSERT INTO c VALUES (1)".to_string(),
+            setup: |n| {
+                vec![format!(
+                    "CREATE TABLE c (a i32 CHECK ({} > 0))",
+                    nest("(", "a", " + 0)", n)
+                )]
+            },
+        },
+        Shape {
+            name: "DEFAULT",
+            shape: |_| "INSERT INTO d (k) VALUES (1)".to_string(),
+            setup: |n| {
+                vec![format!(
+                    "CREATE TABLE d (k i32 PRIMARY KEY, a i32 DEFAULT {})",
+                    nest("(", "1", " + 0)", n)
+                )]
+            },
+        },
+        Shape {
+            name: "view",
+            shape: |_| "SELECT x FROM vp".to_string(),
+            setup: |n| {
+                vec![format!(
+                    "CREATE VIEW vp AS SELECT {} AS x FROM t",
+                    nest("(", "v", " + 0)", n)
+                )]
+            },
+        },
+    ]
+}
+
+/// The SQLSTATE of running `stmts` in order, or `"ok"`; stops at the first error.
+fn run_all(db: &mut Session, stmts: &[String]) -> String {
+    for sql in stmts {
+        let c = code(db, sql);
+        if c != "ok" {
+            return c;
+        }
+    }
+    "ok".to_string()
+}
+
+/// The deepest `n` at which `shape` + its setup is not rejected `54001`, by binary search (the
+/// rejection is monotone in `n`).
+fn deepest_accepted(sh: &Shape) -> usize {
+    let rejected = |n: usize| {
+        let mut stmts = (sh.setup)(n);
+        stmts.push((sh.shape)(n));
+        stmts
+            .iter()
+            .any(|sql| matches!(Parser::parse_sql(sql), Err(e) if e.code() == "54001"))
+    };
+    let (mut lo, mut hi) = (1, MAX_EXPR_DEPTH * 2);
+    assert!(
+        !rejected(lo) && rejected(hi),
+        "{}: no 54001 boundary",
+        sh.name
+    );
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if rejected(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    lo
+}
+
+#[test]
+fn every_nesting_vector_fits_the_stack_budget() {
+    // Each shape runs end to end at its deepest accepted depth, and is rejected 54001 past it, on a
+    // thread of exactly the documented budget — so the bound does not depend on the host thread or on
+    // RUST_MIN_STACK (impl/rust/.cargo/config.toml). Exceeding the budget aborts this test binary.
+    std::thread::Builder::new()
+        .stack_size(TEST_STACK)
+        .spawn(|| {
+            for sh in shapes() {
+                let n = deepest_accepted(&sh);
+                let mut stmts = (sh.setup)(n);
+                stmts.push((sh.shape)(n));
+                assert_eq!(run_all(&mut db(), &stmts), "ok", "{} at depth {n}", sh.name);
+                let mut stmts = (sh.setup)(MAX_EXPR_DEPTH * 2);
+                stmts.push((sh.shape)(MAX_EXPR_DEPTH * 2));
+                assert_eq!(
+                    run_all(&mut db(), &stmts),
+                    "54001",
+                    "{} past the limit",
+                    sh.name
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn a_view_chain_fits_the_stack_budget() {
+    // Each view reference adds its body's depth (spec/design/views.md §4.1): a chain of views is as
+    // deep as the nested derived tables it stands for. Create the chain until the next view would be
+    // rejected, then read through all of it.
+    std::thread::Builder::new()
+        .stack_size(TEST_STACK)
+        .spawn(|| {
+            let mut db = db();
+            assert_eq!(code(&mut db, "CREATE VIEW v0 AS SELECT id, v FROM t"), "ok");
+            let mut last = 0;
+            loop {
+                let next = format!("CREATE VIEW v{} AS SELECT id, v FROM v{last}", last + 1);
+                match code(&mut db, &next).as_str() {
+                    "ok" => last += 1,
+                    "54001" => break,
+                    other => panic!("unexpected {other} creating view {}", last + 1),
+                }
+            }
+            assert!(last > MAX_EXPR_DEPTH / 2, "the chain reached {last}");
+            assert_eq!(code(&mut db, &format!("SELECT * FROM v{last}")), "ok");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

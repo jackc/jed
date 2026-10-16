@@ -1781,13 +1781,11 @@ it is **non-deterministic and not cross-core reproducible**. jed instead counts 
 nesting depth** against a **fixed** limit: deterministic, identical in every core, independent
 of build mode (debug vs. release) and platform — exactly the §8 cross-core-identity contract
 (the same `(statement)` is accepted or rejected with `54001` in Rust, Go, and TS alike). The
-constant is chosen for **native-stack headroom in the *weakest* core**: the TS core, running on
-a default Node/V8 call stack, overflows at roughly ~547 nested subqueries, ~860 operator-chain
-levels, and ~940 nested parens; the Rust and Go cores tolerate far more (Go's stack grows;
-Rust release frames are small). `256` sits with a **>2× margin** under the tightest of those
-(nested subqueries, which cost two depth units per level and so trip the limit at ~128 actual
-levels), while remaining **far** above any realistic query — hand-written or ORM-generated
-SQL does not nest expressions hundreds deep. It is a deliberate, documented divergence from
+constant was chosen for **native-stack headroom in the *weakest* core** — the TS core on a
+default Node/V8 call stack — while remaining **far** above any realistic query: hand-written or
+ORM-generated SQL does not nest expressions hundreds deep. The headroom the limit actually leaves
+each core is stated and measured in §7.1; it is a per-core obligation, not a property of the
+constant. It is a deliberate, documented divergence from
 PG's effectively-larger limit (the *overriding reason*: cross-core determinism + the weakest
 core's stack, CLAUDE.md §1/§8/§13), recorded here at the point it is taken.
 
@@ -1819,6 +1817,50 @@ parenthesized body ([views.md §4.1](views.md), conformance
 gated by `resource.view_depth_limit`). (A literal-field `ROW(…)` / `ARRAY[…]` nest in
 an `INSERT … VALUES` slot is parsed outside `parse_expr`, so it counts one nesting level per
 constructor itself and aborts `54001` like the expression form — grammar.md §16.)
+
+## 7.1 The native-stack budget each core owes the depth limit
+
+`MAX_EXPR_DEPTH` bounds how many levels the parse / plan / execute recursions go. It does not by
+itself bound the native stack: that is the depth times the size of the frames on each recursive
+path, and a large enough frame overflows a host's thread below the limit. A host runs the engine on
+whatever thread it has (a tokio worker has 2 MiB; a macOS secondary pthread has 512 KiB), so each
+core states the stack a statement at the limit may need and keeps to it.
+
+**Rust: 1 MiB, optimized builds.** Every statement the parser accepts parses, plans, and executes,
+and every statement it rejects is rejected, within 1 MiB of thread stack. A host must give the
+engine at least that much plus its own usage. Unoptimized builds have frames several times larger
+and are not held to this budget. impl/rust/tests/depth_limit.rs enforces it on a thread of exactly
+1 MiB. That test runs every nesting vector at the deepest depth the parser accepts and just past
+it. The vectors cover expressions, subqueries, derived tables, set operations, CTEs, views, DML,
+CHECK/DEFAULT, and EXPLAIN. The bound is therefore tested independently of `RUST_MIN_STACK` and of
+the thread the test harness provides. Measured worst cases on x86_64 at the limit: nested
+`BETWEEN` ~930 KiB, nested `WITH` ~910 KiB, nested derived tables under EXPLAIN ~830 KiB, scalar
+subqueries ~700–770 KiB, and nested parentheses ~510 KiB. Before this budget, nested derived
+tables needed ~5.9 MiB.
+
+The budget is kept by keeping frames on recursive paths small, not by counting stack:
+
+- A function that dispatches over node kinds reserves one frame large enough for its largest arm,
+  and every recursion through it pays that size. The arm bodies therefore run out of line, via
+  `crate::stack::outline`, a never-inlined call. Only the arm taken pushes its locals.
+- A function that recurses and then does heavy work recurses first in a small frame, then runs the
+  rest out of line. Examples: building a SELECT's FROM before planning its clauses, and
+  materializing relations before joining and projecting them.
+- Large values travel boxed: `EngineError` and `QueryPlan::Select` are boxed, and a regex program
+  inside an `RExpr` is boxed. A `Result<T>` is then the size of `T`, not of the error.
+
+A change that grows a frame on one of these paths shows up as that test aborting.
+
+**Go: unbounded in practice.** Goroutine stacks grow on demand up to the runtime maximum (1 GB by
+default), so the depth limit is the only bound needed.
+
+**TS: thin headroom (a known gap).** V8's default stack is ~984 KB. Measured on Node 26 at the
+limit, the scalar-expression shapes need ~950 KB. These are 255-deep `NOT` / unary minus / `+` /
+`ARRAY` / `CASE` chains, and the cost comes from `evalExpr`'s ~3.5 KB interpreter frame per level.
+Nested derived tables need ~775 KB and nested subqueries ~590 KB. An overflow there is a catchable
+`RangeError`, not a process abort. The headroom is still too small to rely on, especially on worker
+threads with smaller stacks. The fix is the Rust one: move `evalExpr`'s case bodies out of its
+frame.
 
 ## 7a. Input-size and identifier-length limits (landed)
 

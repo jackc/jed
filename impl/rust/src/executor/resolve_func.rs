@@ -510,7 +510,7 @@ pub(crate) fn resolve_regex_func(
         RExpr::RegexFunc {
             func,
             args: rargs,
-            program,
+            program: program.map(Box::new),
             compile_charged: std::cell::Cell::new(false),
         },
         result,
@@ -3934,6 +3934,8 @@ pub(crate) fn resolve(
 /// hint (§11.7). AND / OR / NOT name the offending operand instead, at their raise site. A string
 /// literal's input error points at the literal. An error an operand raised was already decided by
 /// that operand's own resolution, so the enclosing node never claims it.
+#[cold]
+#[inline(never)]
 fn locate_node_error(err: EngineError, e: &Expr) -> EngineError {
     let operator_error = matches!(
         err.state,
@@ -4026,7 +4028,7 @@ fn resolve_node(
         // context (its natural type), producing an ANONYMOUS composite (`name = None`, fields named
         // `f1, f2, …` per PG). Storing it into a named composite column matches structurally
         // (assignability at the store site coerces each field to the target's declared type).
-        Expr::Row(items) => {
+        Expr::Row(items) => outline(|| {
             let mut nodes = Vec::with_capacity(items.len());
             let mut fields = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
@@ -4038,11 +4040,11 @@ fn resolve_node(
                 RExpr::Row(nodes),
                 ResolvedType::Composite(Box::new(CompositeRType { name: None, fields })),
             ))
-        }
+        }),
         // An `ARRAY[…]` constructor (spec/design/array.md §1): resolve each element (natural type),
         // unify to a common element type, and build a `RExpr::Array`. A bare empty `ARRAY[]` has no
         // element type to infer — use `'{}'::T[]` instead (the cast supplies the element type).
-        Expr::Array(items) => {
+        Expr::Array(items) => outline(|| {
             if items.is_empty() {
                 return Err(type_error(
                     "cannot determine the element type of an empty ARRAY[]; write '{}'::T[]"
@@ -4082,19 +4084,19 @@ fn resolve_node(
                 },
                 result_ty,
             ))
-        }
-        Expr::Column(name, pos) => {
+        }),
+        Expr::Column(name, pos) => outline(|| {
             // Resolve against the scope CHAIN (§26). Existence first (42703/42702 take priority,
             // matching PostgreSQL); a Local match then obeys the grouping rule, an Outer
             // (correlated) match is a per-outer-row constant exempt from it (see helper).
             let r = scope.resolve_bare_at(name, *pos)?;
             resolve_column_ref(scope, agg, r, name)
-        }
+        }),
         Expr::QualifiedColumn {
             qualifier,
             name,
             pos,
-        } => {
+        } => outline(|| {
             // A bare `rel.col` resolves strictly against the FROM relations — `qualifier` MUST name
             // a relation (else 42P01), matching PostgreSQL. Composite field access on a column is
             // the **parens-required** `(col).field` form (spec/design/composite.md §1/§S4), an
@@ -4102,7 +4104,7 @@ fn resolve_node(
             // unparenthesized `col.field` / `t.col.field` spellings).
             let r = scope.resolve_qualified_at(qualifier, name, *pos)?;
             resolve_column_ref(scope, agg, r, name)
-        }
+        }),
         // `(expr).field` — composite field selection (spec/design/composite.md §S4).
         Expr::FieldAccess { base, field } => {
             let (node, ty) = resolve(scope, base, None, agg, params)?;
@@ -4113,7 +4115,7 @@ fn resolve_node(
         // non-integer is 42804. If any spec is a slice the result is the array type (a sub-array);
         // otherwise it is the element type (a single element). OOB / NULL → NULL is an
         // evaluation-time rule, not a resolve error.
-        Expr::Subscript { base, subscripts } => {
+        Expr::Subscript { base, subscripts } => outline(|| {
             let (base_node, base_ty) = resolve(scope, base, None, agg, params)?;
             let elem_ty = match &base_ty {
                 ResolvedType::Array(elem) => (**elem).clone(),
@@ -4162,7 +4164,7 @@ fn resolve_node(
                 },
                 result_ty,
             ))
-        }
+        }),
         // `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
         // expression position it is unsupported (PG rejects row expansion here — 0A000).
         Expr::FieldStar { .. } => Err(EngineError::new(
@@ -4176,7 +4178,7 @@ fn resolve_node(
             SqlState::SyntaxError,
             "t.* is only allowed in a select list",
         )),
-        Expr::Param(n1) => {
+        Expr::Param(n1) => outline(|| {
             // A bind parameter is an adaptable operand (like an integer/string literal): it
             // takes its type from `ctx` — the sibling operand, target column, or CAST target.
             // Record the inferred type (None = no context here; `finalize` 42P18s a parameter
@@ -4186,7 +4188,7 @@ fn resolve_node(
                 None => ResolvedType::Null,
             };
             resolve_param_node(scope, *n1, ctx.map(ColType::Scalar), rty, params)
-        }
+        }),
         Expr::FuncCall {
             name,
             args,
@@ -4200,7 +4202,7 @@ fn resolve_node(
             within_group,
             agg_order,
             ..
-        } => {
+        } => outline(|| {
             // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md
             // §19) is one of these window-function names used WITH a WITHIN GROUP clause; that clause
             // routes it here instead of the window path. OVER + WITHIN GROUP together is 0A000.
@@ -4327,10 +4329,10 @@ fn resolve_node(
                 agg,
                 params,
             )
-        }
+        }),
         Expr::Literal(Literal::Null, _) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b), _) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
-        Expr::Literal(Literal::Int(n), _) => {
+        Expr::Literal(Literal::Int(n), _) => outline(|| {
             // An integer literal ADAPTS to a float context — decimal/int literal → float at the
             // context width (nearest, round-ties-to-even — spec/design/float.md §4). This is
             // literal adaptation, not an implicit cross-family cast (a *value* never silently
@@ -4347,8 +4349,8 @@ fn resolve_node(
                 return Err(overflow(ty));
             }
             Ok((RExpr::ConstInt(*n), ResolvedType::Int(ty)))
-        }
-        Expr::Literal(Literal::Text(s), _) => {
+        }),
+        Expr::Literal(Literal::Text(s), _) => outline(|| {
             // A string literal is text by default (collation `C`). It adapts to a BYTEA context
             // (decode the hex or escape input, 22P02), a UUID context (PG-flexible uuid input,
             // 22P02 — types.md §6/§13/§14), or a TIMESTAMP/TIMESTAMPTZ context (parse the datetime,
@@ -4415,8 +4417,8 @@ fn resolve_node(
                 )),
                 _ => Ok((RExpr::ConstText(s.clone()), ResolvedType::Text)),
             }
-        }
-        Expr::Literal(Literal::Decimal(d), _) => {
+        }),
+        Expr::Literal(Literal::Decimal(d), _) => outline(|| {
             // A decimal literal ADAPTS to a float context — decimal → float at the context width
             // (nearest binary value, round-ties-to-even — spec/design/float.md §4). Otherwise it
             // stays decimal (it does not adapt to other contexts, like text). Cap-check the
@@ -4431,7 +4433,7 @@ fn resolve_node(
             }
             let d = d.clone().check_cap()?;
             Ok((RExpr::ConstDecimal(d), ResolvedType::Decimal))
-        }
+        }),
         // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
         // `type 'string'`, equal to `CAST('string' AS type)` over a string-literal operand. Resolve
         // the type by name (unknown → 42704) and coerce the string to it at resolve, independent of
@@ -4440,7 +4442,7 @@ fn resolve_node(
             type_name,
             text,
             pos,
-        } => {
+        } => outline(|| {
             // A composite type name (`addr '(Main,90210)'`) coerces the string via `record_in`
             // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
             if let Some(ct) = scope.catalog.composite_type(type_name) {
@@ -4470,13 +4472,13 @@ fn resolve_node(
                 coerce_string_literal(text, target, None, None, iz)
             })
             .map_err(|e| e.with_position(pos.0))
-        }
+        }),
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
         // scope chain here, so its column-count / type errors fire even over an empty outer.
         // `plan_subquery` rejects a non-SELECT context and a `$N` inside (both 0A000). The fold
         // pass folds an uncorrelated one to a constant; a correlated one (an OuterColumn in its
         // plan) is re-executed per outer row by the evaluator.
-        Expr::ScalarSubquery(inner) => {
+        Expr::ScalarSubquery(inner) => outline(|| {
             let plan = plan_subquery(scope, inner, params)?;
             if plan.column_types().len() != 1 {
                 return Err(EngineError::new(
@@ -4501,8 +4503,8 @@ fn resolve_node(
                 },
                 out_type,
             ))
-        }
-        Expr::Exists(inner) => {
+        }),
+        Expr::Exists(inner) => outline(|| {
             // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
             // EXISTS parses as the unary `NOT` wrapping this, so `negated` here is always false.
             let plan = plan_subquery(scope, inner, params)?;
@@ -4516,13 +4518,13 @@ fn resolve_node(
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         Expr::InSubquery {
             lhs,
             query,
             negated,
             ..
-        } => {
+        } => outline(|| {
             // The LHS is an OUTER expression (resolved in the current scope / agg context); the
             // subquery yields the single membership column. The test is `lhs = element`, so the
             // pair must be comparable (42804), exactly like a literal IN. A row-constructor LHS
@@ -4544,14 +4546,14 @@ fn resolve_node(
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         // `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
         // the inner expression, require a collatable (text / text[]) type (42804, PG-matching), and validate
         // the named collation exists ("C" or loaded, else 42704). The node is a runtime PASSTHROUGH:
         // a collation only changes the ORDERING comparisons / ORDER BY, derived from the AST at those
         // sites (`explicit_collation` / `OrderKey.collation`), so resolving returns the inner resolved
         // expr + type unchanged. The hint flows through (COLLATE never changes the type).
-        Expr::Collate { inner, collation } => {
+        Expr::Collate { inner, collation } => outline(|| {
             let (rinner, ty) = resolve(scope, inner, ctx, agg, params)?;
             if !ty.collatable() && ty != ResolvedType::Null {
                 return Err(type_error(format!(
@@ -4563,12 +4565,12 @@ fn resolve_node(
             // recovered at the comparison/ORDER BY site, so it is discarded here.
             resolve_collation_name(scope.catalog, collation)?;
             Ok((rinner, ty))
-        }
+        }),
         // `EXTRACT(field FROM source)` (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
         // validated at RESOLVE (not per row): an unsupported field for the source type is `0A000`, an
         // unrecognized field is `22023` — surfaced by probing the kernel with a zero value of the
         // source's family. The source must be a datetime type (else `42883`); the result is `numeric`.
-        Expr::Extract { field, source } => {
+        Expr::Extract { field, source } => outline(|| {
             use crate::datetime_fn::{ExtractSrc, extract_field};
             let (src_r, src_t) = resolve(scope, source, None, agg, params)?;
             // A NULL source has no resolvable family; the value propagates to NULL at eval (the field
@@ -4610,13 +4612,13 @@ fn resolve_node(
                 },
                 ResolvedType::Decimal,
             ))
-        }
+        }),
         Expr::Cast {
             inner,
             type_name,
             type_mod,
             ..
-        } => {
+        } => outline(|| {
             // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
             // string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
             // text→array, array→text, element-wise array→array) is a documented 0A000 narrowing.
@@ -5194,12 +5196,12 @@ fn resolve_node(
                 },
                 result_ty,
             ))
-        }
+        }),
         Expr::Unary {
             op: UnaryOp::Neg,
             operand,
             ..
-        } => {
+        } => outline(|| {
             let (rop, ty) = resolve(scope, operand, ctx, agg, params)?;
             let result = match ty {
                 ResolvedType::Int(t) => t,
@@ -5241,18 +5243,18 @@ fn resolve_node(
                 },
                 rty,
             ))
-        }
+        }),
         Expr::Unary {
             op: UnaryOp::Not,
             operand,
             ..
-        } => {
+        } => outline(|| {
             let (rop, ty) = resolve(scope, operand, None, agg, params)?;
             require_bool(&ty, "NOT requires a boolean operand")
                 .map_err(|e| e.with_position(operand.location().0))?;
             Ok((RExpr::Not(Box::new(rop)), ResolvedType::Bool))
-        }
-        Expr::IsNull { operand, negated } => {
+        }),
+        Expr::IsNull { operand, negated } => outline(|| {
             // IS [NOT] NULL accepts any operand type and always yields a definite boolean.
             let (rop, _ty) = resolve(scope, operand, None, agg, params)?;
             Ok((
@@ -5262,13 +5264,13 @@ fn resolve_node(
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         Expr::IsJson {
             operand,
             negated,
             kind,
             unique_keys,
-        } => {
+        } => outline(|| {
             // The operand must be a character string / json / jsonb (else 42804); a bare string
             // literal resolves as text. The predicate is always a definite boolean (NULL operand →
             // NULL at eval).
@@ -5295,11 +5297,11 @@ fn resolve_node(
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         Expr::JsonCtor {
             operand,
             unique_keys,
-        } => {
+        } => outline(|| {
             // JSON(text) parses a character string to a `json` value (verbatim). The operand must be
             // text (a bare string literal stays text); a non-text operand → 42804.
             let (rop, ty) = resolve(scope, operand, Some(ScalarType::Text), agg, params)?;
@@ -5319,7 +5321,7 @@ fn resolve_node(
                 },
                 ResolvedType::Json,
             ))
-        }
+        }),
         Expr::JsonExists {
             ctx,
             path,
@@ -5385,7 +5387,7 @@ fn resolve_node(
         ),
         Expr::IsDistinctFrom {
             lhs, rhs, negated, ..
-        } => {
+        } => outline(|| {
             // NULL-safe equality: the SAME operand contract as `=` — resolve the pair
             // (a literal adapts to its sibling; a text literal stays text), then require
             // the operands be comparable (both integer-ish or both text-ish; a mixed pair
@@ -5400,7 +5402,7 @@ fn resolve_node(
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         Expr::Binary { op, lhs, rhs, .. } => resolve_binary(scope, *op, lhs, rhs, agg, params),
         Expr::Quantified {
             op,
@@ -5415,7 +5417,7 @@ fn resolve_node(
             lhs,
             query,
             ..
-        } => {
+        } => outline(|| {
             // The subquery spelling of the quantifier (array-functions.md §11.6) — the IN-subquery
             // pattern, with the comparison + 3VL fold of the array form. Resolve the outer `lhs`,
             // plan the body, require ONE column (42601), and require comparability — reporting
@@ -5460,13 +5462,13 @@ fn resolve_node(
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         Expr::In {
             lhs,
             list,
             negated,
             pos,
-        } => {
+        } => outline(|| {
             // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
             // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant
             // — `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL.
@@ -5500,14 +5502,14 @@ fn resolve_node(
                 };
             }
             resolve(scope, &desugared, ctx, agg, params)
-        }
+        }),
         Expr::Between {
             lhs,
             lo,
             hi,
             negated,
             pos,
-        } => {
+        } => outline(|| {
             // Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
             // result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a
             // FALSE operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL.
@@ -5524,14 +5526,14 @@ fn resolve_node(
                 };
             }
             resolve(scope, &desugared, ctx, agg, params)
-        }
+        }),
         Expr::Like {
             lhs,
             rhs,
             negated,
             insensitive,
             ..
-        } => {
+        } => outline(|| {
             // LIKE / ILIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
             // stays text), then require BOTH operands be text (or a bare NULL); a non-text
             // operand is 42804. We do NOT use classify_comparable here — it would wrongly accept
@@ -5548,14 +5550,14 @@ fn resolve_node(
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         Expr::Regex {
             lhs,
             rhs,
             negated,
             insensitive,
             ..
-        } => {
+        } => outline(|| {
             // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand
             // typing as LIKE: resolve the pair, require both text (or a bare NULL); non-text 42804.
             let (rl, lt, rr, rt) = resolve_text_operand_pair(scope, lhs, rhs, agg, params)?;
@@ -5589,18 +5591,18 @@ fn resolve_node(
                     rhs: Box::new(rr),
                     negated: *negated,
                     insensitive: *insensitive,
-                    program,
+                    program: program.map(Box::new),
                     compile_charged: std::cell::Cell::new(false),
                 },
                 ResolvedType::Bool,
             ))
-        }
+        }),
         Expr::Case {
             operand,
             whens,
             els,
             ..
-        } => {
+        } => outline(|| {
             // Resolve each branch's condition: searched form requires a boolean WHEN (42804
             // otherwise); simple form desugars to `operand = value` (reusing the `=` operand
             // pairing + comparability check, so the value adapts to the operand's type). The
@@ -5673,8 +5675,8 @@ fn resolve_node(
                 },
                 unified,
             ))
-        }
-        Expr::Coalesce(args) => {
+        }),
+        Expr::Coalesce(args) => outline(|| {
             // COALESCE(a, b, …) (grammar.md §51): each argument resolves in the same agg context
             // (an aggregate argument is legal wherever an aggregate is), and the argument types
             // unify to one common type exactly like CASE's result arms.
@@ -5716,8 +5718,8 @@ fn resolve_node(
                 },
                 unified,
             ))
-        }
-        Expr::GreatestLeast { args, greatest } => {
+        }),
+        Expr::GreatestLeast { args, greatest } => outline(|| {
             // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg
             // context, and the argument types unify by CASE's rule (`unify_case_types`). The
             // winner is chosen by the unified type's total order at eval, so — unlike
@@ -5780,7 +5782,7 @@ fn resolve_node(
                 },
                 unified,
             ))
-        }
+        }),
     }
 }
 
