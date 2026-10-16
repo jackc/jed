@@ -22,13 +22,14 @@ mod locks;
 
 use crate::coordinator::FileCoordinator;
 use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES};
+use crate::environment::Environment;
 use crate::error::EngineError;
 use crate::executor::Engine;
 use crate::file::{DatabaseOptions, Locking};
 use crate::format::sim_meta_of;
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, cache_leaves};
-use crate::seam::seeded_random_source;
+use crate::seam::{ClockSource, RandomSource, SeededRandom, seeded_random_source};
 use crate::shared::{AttachSource, Database, Session};
 use disk::{
     Fault, FaultKind, LANE_SESSION, MAIN_FILE, SimFs, SimHost, SimSpill, SimStore, decide, fnv,
@@ -477,8 +478,41 @@ fn first_diff(a: &str, b: &str) -> String {
     String::new()
 }
 
+/// The simulator's random source: each trace session has its own seeded stream, and a draw comes
+/// from the stream of the session whose step is running (the simulator runs one step at a time).
+/// Outside any session's step it falls back to OS entropy, which no oracle query draws.
+struct SimRandom {
+    current: Mutex<Option<Arc<SeededRandom>>>,
+}
+
+impl RandomSource for SimRandom {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), EngineError> {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match current {
+            Some(stream) => stream.fill(buf),
+            None => crate::seam::os_random_source().fill(buf),
+        }
+    }
+}
+
+/// The simulator's clock source: the simulated clock (§7).
+struct SimClock(Arc<AtomicI64>);
+
+impl ClockSource for SimClock {
+    fn now_micros(&self) -> i64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 struct SimSession {
     s: Session,
+    /// The session's own seeded random stream (seeded from the trace seed and the open step), which
+    /// the environment's random source draws from while a step on this session runs.
+    random: Arc<SeededRandom>,
     write: bool,
     /// The version of each database a read session pinned (§8.1: what it must keep seeing).
     pins: HashMap<String, u64>,
@@ -566,8 +600,13 @@ struct Runner<'a> {
     seed: u64,
     page_size: u32,
     cache_bytes: i64,
-    /// The simulated clock (§7), shared with every session's clock source.
+    /// The simulated clock (§7), which the environment's clock source reads.
     clock: Arc<AtomicI64>,
+    /// The environment every simulated process opens its database in: its random source draws from
+    /// the stream of the session the current step runs on, its clock reads `clock`.
+    env: Environment,
+    /// The random source installed in `env`, switched to the current step's session.
+    random: Arc<SimRandom>,
 
     // Handle settings from the header (simulation-testing.md §5, slice S3), applied at every open.
     /// A session's work_mem.
@@ -784,12 +823,22 @@ impl<'a> Runner<'a> {
         let temp_buffers: i64 = tr.header("temp_buffers").parse().unwrap_or(0);
         let max_query_memory: i64 = tr.header("max_query_memory_bytes").parse().unwrap_or(0);
         let max_storage_bytes: i64 = tr.header("max_storage_bytes").parse().unwrap_or(0);
+        let clock = Arc::new(AtomicI64::new(clock));
+        let random = Arc::new(SimRandom {
+            current: Mutex::new(None),
+        });
+        let env = Environment::builder()
+            .random_source(random.clone())
+            .clock_source(Arc::new(SimClock(clock.clone())))
+            .build();
         Runner {
             tr,
             seed,
             page_size: ps as u32,
             cache_bytes: cache,
-            clock: Arc::new(AtomicI64::new(clock)),
+            clock,
+            env,
+            random,
             work_mem,
             temp_buffers,
             max_query_memory,
@@ -967,7 +1016,7 @@ impl<'a> Runner<'a> {
             self.cache_bytes as usize
         };
         let page_size = pager.page_size();
-        let mut engine = Engine::open_paged(pager, cache_leaves(cache, page_size))?;
+        let mut engine = Engine::open_paged(pager, cache_leaves(cache, page_size), &self.env)?;
         // The path marks the engine durable; the simulated filesystem is its only storage.
         engine.path = Some(PathBuf::from(MAIN_FILE));
         // Spill and temp-table spill scratch files, whose operations can fail.
@@ -1257,6 +1306,14 @@ impl<'a> Runner<'a> {
     fn step_inner(&mut self, i: usize) -> bool {
         let tr = self.tr;
         let st = &tr.steps[i];
+        // Draws during this step come from the stream of the session it runs on (none for a step
+        // on no open session).
+        *self
+            .random
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            self.sessions.get(&st.sid).map(|ss| ss.random.clone());
         match st.kind.as_str() {
             "fault" => {
                 let f = match fault_of(st) {
@@ -1464,15 +1521,7 @@ impl<'a> Runner<'a> {
                 return;
             }
         };
-        s.set_random_source(seeded_random_source(decide(
-            self.seed,
-            LANE_SESSION,
-            i as u64,
-            0,
-            0,
-        )));
-        let clock = self.clock.clone();
-        s.set_clock_source(Box::new(move || clock.load(Ordering::Relaxed)));
+        let random = seeded_random_source(decide(self.seed, LANE_SESSION, i as u64, 0, 0));
         if self.work_mem > 0 {
             s.set_work_mem(self.work_mem as usize);
         }
@@ -1504,6 +1553,7 @@ impl<'a> Runner<'a> {
             st.sid.clone(),
             SimSession {
                 s,
+                random,
                 write: st.mode == "write",
                 pins,
                 pid: self.cur,

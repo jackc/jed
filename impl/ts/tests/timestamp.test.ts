@@ -6,11 +6,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError } from "../src/errors.ts";
 import { parseTimestamp, renderTimestamp, renderTimestamptz } from "../src/timestamp.ts";
+import { Environment } from "../src/environment.ts";
 import { parseTimestamptz, resolveZone } from "../src/timezone.ts";
 import { readTimestampCases, specPath } from "./tomlmini.ts";
 
 // The vectors are UTC-session parses (an offset-less wall clock reads as UTC).
-const UTC = resolveZone("UTC")!;
+const UTC = resolveZone("UTC", new Environment())!;
 
 function tsParse(typ: string, input: string): bigint {
   return typ === "timestamp" ? parseTimestamp(input) : parseTimestamptz(input, UTC);

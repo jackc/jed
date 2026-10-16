@@ -1997,7 +1997,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			case ctx != nil && ctx.IsJsonPath():
 				// A string literal adapts to a jsonpath context (a jsonpath function argument) — it
 				// is compiled to a path at resolve (jsonpath.md §1); malformed → 42601.
-				jp, err := compile(e.Literal.Str)
+				jp, err := compile(e.Literal.Str, s.catalog.session.env.propertyTable())
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
@@ -2799,7 +2799,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if rr.kind == reConstText {
 			pat := rr.cText
 			if e.Regex.Insensitive {
-				pat = foldRegexPattern(pat, loadedProperty())
+				pat = foldRegexPattern(pat, s.catalog.session.env.propertyTable())
 			}
 			prog, err = compileRegex(pat)
 			if err != nil {

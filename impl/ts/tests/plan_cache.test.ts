@@ -13,14 +13,13 @@ import {
   Engine,
   EngineError,
   execute,
+  Environment,
   intValue,
-  loadUnicodeData,
   prepare,
   PrivilegeSet,
   queryPrepared,
   toImage,
 } from "../src/tooling.ts";
-import { loadedCollation } from "../src/collation.ts";
 import { attachMemory } from "../src/shared.ts";
 import { ExplainRender } from "../src/scope.ts";
 import type { Value } from "../src/value.ts";
@@ -316,13 +315,15 @@ test("insert cache: every execute rechecks privilege and read-only gates", () =>
 });
 
 test("insert cache: collation upgrade invalidates resolved collation identities", () => {
-  loadUnicodeData(readFileSync(specPath("collation/fixtures/unicode.jucd")));
-  const db = new Engine();
+  const env = Environment.builder()
+    .loadUnicodeData(readFileSync(specPath("collation/fixtures/unicode.jucd")))
+    .build();
+  const db = new Engine(env);
   execute(db, 'CREATE TABLE t (id i32 PRIMARY KEY, x text COLLATE "unicode")');
   const stmt = prepare(db, "INSERT INTO t VALUES ($1, $2)");
   drain(db, stmt, [intValue(1n), textValue("a")]);
   const plan = insertCacheOf(stmt)!.plan;
-  const loaded = loadedCollation("unicode")!;
+  const loaded = env.collation("unicode")!;
   db.committed.collations.set("unicode", { ...loaded, unicodeVersion: "0.0.0" });
   assert.equal(db.upgradeCollations(), 1);
   drain(db, stmt, [intValue(2n), textValue("b")]);

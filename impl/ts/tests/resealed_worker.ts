@@ -6,7 +6,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { pageCrc } from "../src/format.ts";
-import { EngineError, close, execute, loadEngine, loadUnicodeData } from "../src/tooling.ts";
+import { EngineError, Environment, close, execute, loadEngine } from "../src/tooling.ts";
 import { specPath } from "./tomlmini.ts";
 
 const PAGE_HEADER = 16;
@@ -140,11 +140,12 @@ export function quote(name: string): string {
 }
 
 // runCase opens image and runs stmts: "ok" when everything succeeded, "closed" when some step
-// failed with an engine error, otherwise the first non-engine thrown value.
-export function runCase(image: Uint8Array, stmts: string[]): unknown {
+// failed with an engine error, otherwise the first non-engine thrown value. env is the environment the
+// image opens with (the collated fixtures need the Unicode bundle).
+export function runCase(image: Uint8Array, stmts: string[], env: Environment): unknown {
   let outcome = "ok";
   try {
-    const db = loadEngine(image);
+    const db = loadEngine(image, env);
     try {
       for (const s of stmts) {
         try {
@@ -186,7 +187,9 @@ if (!isMainThread) runAll();
 function runAll(): void {
   const { per, progress } = workerData as { per: number; progress: SharedArrayBuffer };
   const cell = new Int32Array(progress);
-  loadUnicodeData(new Uint8Array(readFileSync(specPath("collation/fixtures/unicode.jucd"))));
+  const env = Environment.builder()
+    .loadUnicodeData(new Uint8Array(readFileSync(specPath("collation/fixtures/unicode.jucd"))))
+    .build();
   const dir = dirname(specPath("fileformat/fixtures/empty_db.jed"));
   const paths = readdirSync(dir)
     .filter((f) => f.endsWith(".jed"))
@@ -202,7 +205,7 @@ function runAll(): void {
     let names: string[];
     const updates = new Map<string, string>();
     try {
-      const clean = loadEngine(raw);
+      const clean = loadEngine(raw, env);
       names = [...clean.committed.tables.keys()].sort();
       for (const n of names) {
         const t = clean.committed.tables.get(n)!;
@@ -241,7 +244,7 @@ function runAll(): void {
         Atomics.store(cell, 2, m);
         Atomics.add(cell, 3, 1);
         cases++;
-        const outcome = runCase(mutated, stmts);
+        const outcome = runCase(mutated, stmts, env);
         if (outcome === "closed") failedClosed++;
         else if (outcome !== "ok") {
           parentPort!.postMessage({

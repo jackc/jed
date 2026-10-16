@@ -185,6 +185,15 @@ impl Snapshot {
         self.store_paging = Some(paging);
     }
 
+    /// An empty snapshot over the handle's environment `env` (spec/design/environment.md) — a fresh
+    /// session temp domain or an attached in-memory database.
+    pub(crate) fn with_environment(env: crate::environment::Environment) -> Snapshot {
+        Snapshot {
+            env,
+            ..Snapshot::default()
+        }
+    }
+
     /// Register a composite type (CREATE TYPE). The exact name is the key. The caller has
     /// already resolved field types and checked for a duplicate.
     pub(crate) fn put_type(&mut self, ty: CompositeType) {
@@ -287,15 +296,15 @@ impl Snapshot {
 
     /// Resolve a collation name for USE — query resolution and key encoding (spec/design/collation.md
     /// §2/§9). The collations the database has resolved (a cache populated on open from the file's
-    /// reference entries, carrying their version pin) first, then the engine-global **loaded** set
-    /// (`db.LoadUnicodeData`, §4). `None` ⇒ neither has it (the resolver raises 42704). `C` is handled
+    /// reference entries, carrying their version pin) first, then the loaded set of the handle's
+    /// environment (spec/design/environment.md). `None` ⇒ neither has it (the resolver raises 42704). `C` is handled
     /// by the caller (built-in). This is the reference-only read path: a collation is never baked into
     /// the file — the file references it by name and the table comes from a loaded bundle.
     pub(crate) fn resolve_collation(&self, name: &str) -> Option<std::sync::Arc<Collation>> {
         self.collations
             .get(name)
             .cloned()
-            .or_else(|| crate::collation::loaded_collation(name))
+            .or_else(|| self.env.collation(name))
     }
 
     /// Record a collation resolved from a file reference entry on open (its file metadata + the
@@ -309,21 +318,21 @@ impl Snapshot {
     /// built under a different `(unicode, cldr)` than the loaded bundle provides — the object that
     /// uses it is read-only (`XX002` on write). `None` ⇒ `Full` (same version, or this collation has
     /// no catalog-local file pin so it is freshly the loaded version — an in-memory-only database).
-    /// A pure comparison of the file pin already in the catalog (§5) vs the engine-global loaded set;
-    /// `loaded_collation` is `Some` post-open (open refuses an absent reference), so a missing loaded
-    /// table is not skew. The `Snapshot`-level wiring of `collation::version_skew`.
+    /// A pure comparison of the file pin already in the catalog (§5) vs the environment's loaded set;
+    /// the loaded table is present post-open (open refuses an absent reference), so a missing loaded
+    /// table is not skew. The `Snapshot`-level wiring of `Environment::version_skew`.
     pub(crate) fn collation_skew(&self, name: &str) -> Option<(String, String, String, String)> {
         let cat = self.collations.get(name)?;
-        crate::collation::version_skew(name, &cat.unicode_version, &cat.cldr_version).map(
-            |(lu, lc)| {
+        self.env
+            .version_skew(name, &cat.unicode_version, &cat.cldr_version)
+            .map(|(lu, lc)| {
                 (
                     cat.unicode_version.clone(),
                     cat.cldr_version.clone(),
                     lu,
                     lc,
                 )
-            },
-        )
+            })
     }
 
     /// The collations the database **schema references** — every column's frozen collation plus the
@@ -516,7 +525,7 @@ impl Snapshot {
         // table data already in use). `referenced_collations` then resolves the advanced pin and the
         // commit persists it; `collation_skew` now returns `None` (Full) for each.
         for name in &skewed {
-            if let Some(loaded) = crate::collation::loaded_collation(name) {
+            if let Some(loaded) = self.env.collation(name) {
                 self.put_collation(loaded);
             }
         }

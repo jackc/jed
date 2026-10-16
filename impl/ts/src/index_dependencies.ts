@@ -1,4 +1,5 @@
 import type { TimeZoneDeps } from "./catalog.ts";
+import type { Environment } from "./environment.ts";
 import type { RExpr } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { indexZoneDeps, resolveZone } from "./timezone.ts";
@@ -41,10 +42,11 @@ export function mergeTimezoneDeps(target: TimeZoneDeps, other: TimeZoneDeps): vo
   target.zones.sort((a, b) => compareTextC(a.name, b.name));
 }
 
-export function noteIndexZone(deps: TimeZoneDeps, node: RExpr): void {
+// env is the handle's environment: a named zone resolves against (and pins) its loaded data.
+export function noteIndexZone(deps: TimeZoneDeps, node: RExpr, env: Environment): void {
   if (node.kind === "constNull") return;
   if (node.kind === "constText") {
-    const zr = resolveZone(node.value);
+    const zr = resolveZone(node.value, env);
     if (!zr)
       throw engineError("invalid_parameter_value", `time zone not recognized: ${node.value}`);
     if (!zr.fixed)
@@ -58,12 +60,12 @@ export function noteIndexZone(deps: TimeZoneDeps, node: RExpr): void {
           },
         ],
       });
-  } else mergeTimezoneDeps(deps, { dynamic: true, zones: indexZoneDeps() });
+  } else mergeTimezoneDeps(deps, { dynamic: true, zones: indexZoneDeps(env) });
 }
 
-export function verifyIndexTimezoneDeps(deps: TimeZoneDeps | undefined): void {
+export function verifyIndexTimezoneDeps(deps: TimeZoneDeps | undefined, env: Environment): void {
   if (!deps || (!deps.dynamic && deps.zones.length === 0)) return;
-  const current = indexZoneDeps();
+  const current = indexZoneDeps(env);
   if (
     (deps.dynamic && current.length !== deps.zones.length) ||
     !deps.zones.every((d) =>

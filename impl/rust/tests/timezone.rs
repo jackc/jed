@@ -4,7 +4,7 @@
 //! offsets and parse the bundle identically. Mirrors impl/go/timezone_test.go and
 //! impl/ts/tests/timezone.test.ts.
 
-use jed::timezone::{load_time_zone_data, offset_at_ref, open_bundle, resolve_zone, save_bundle};
+use jed::timezone::{offset_at_ref, open_bundle, save_bundle};
 use std::path::Path;
 
 fn spec(rel: &str) -> String {
@@ -21,14 +21,19 @@ fn bundle_bytes() -> Vec<u8> {
 
 #[test]
 fn reader_matches_the_pinned_vectors() {
-    load_time_zone_data(&bundle_bytes()).expect("load tzdata.jtz");
+    let env = jed::Environment::builder()
+        .load_time_zone_data(&bundle_bytes())
+        .expect("load tzdata.jtz")
+        .build();
     let v: toml::Value = toml::from_str(&spec("tz/vectors/tzif.toml")).unwrap();
     let cases = v["case"].as_array().expect("[[case]] array");
     assert!(!cases.is_empty(), "no tzif vectors");
     for c in cases {
         let zone = c["zone"].as_str().unwrap();
         let inst = c["instant_micros"].as_integer().unwrap();
-        let zr = resolve_zone(zone).unwrap_or_else(|| panic!("resolve {zone}"));
+        let zr = env
+            .resolve_zone(zone)
+            .unwrap_or_else(|| panic!("resolve {zone}"));
         let off = offset_at_ref(&zr, inst.div_euclid(1_000_000));
         assert_eq!(
             off.utoff as i64,

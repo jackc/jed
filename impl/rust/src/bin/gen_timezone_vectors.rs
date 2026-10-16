@@ -4,9 +4,8 @@
 //! precedent, CLAUDE.md §8). `tzif.toml` pins the reader `(zone, instant) → (offset, abbrev, dst)`
 //! (§4); `bundle.toml` pins the parsed manifest + the `Open`∘`Save` round-trip (§3). Do not hand-edit.
 
-use jed::tooling::timezone::{
-    load_time_zone_data, offset_at_ref, open_bundle, resolve_zone, save_bundle,
-};
+use jed::Environment;
+use jed::tooling::timezone::{offset_at_ref, open_bundle, resolve_zone, save_bundle};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -34,7 +33,10 @@ fn micros(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
 fn main() {
     let bundle_bytes =
         std::fs::read(tz_dir().join("fixtures/tzdata.jtz")).expect("read tzdata.jtz");
-    load_time_zone_data(&bundle_bytes).expect("load bundle");
+    let env = Environment::builder()
+        .load_time_zone_data(&bundle_bytes)
+        .expect("load bundle")
+        .build();
 
     // (zone, y, mo, d, H, M, S, note) — the §6 corner cases. Instants are UTC.
     let cases: &[(&str, i64, i64, i64, i64, i64, i64, &str)] = &[
@@ -159,7 +161,7 @@ fn main() {
     );
     for (zone, y, mo, d, h, mi, s, note) in cases {
         let inst = micros(*y, *mo, *d, *h, *mi, *s);
-        let zr = resolve_zone(zone).unwrap_or_else(|| panic!("resolve {zone}"));
+        let zr = resolve_zone(&env, zone).unwrap_or_else(|| panic!("resolve {zone}"));
         let off = offset_at_ref(&zr, inst.div_euclid(1_000_000));
         write!(
             tzif,

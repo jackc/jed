@@ -145,8 +145,8 @@ Conventions, fixed here so every implementation renders identically:
   version-**skewed** collation pin paired with a wrong-for-loaded index can only come from a
   hand-authored fixture (the byte-pinned goldens in [../fileformat/fixtures/](../fileformat/fixtures/),
   authored declaratively in [verify.rb](../fileformat/verify.rb)). The directive appears in the
-  header (before any record); when present the harness loads jed's production `JUCD` bundle first, so
-  a referenced collation resolves on open (a skewed pin resolves to a *different* loaded version —
+  header (before any record); when present the harness loads jed's production `JUCD` bundle into the
+  file's environment first, so a referenced collation resolves on open (a skewed pin resolves to a *different* loaded version —
   the point). Gated by the **`harness.fixture_open`** capability (§3), so a core whose harness has
   not yet implemented it skips the file cleanly rather than mis-parsing the directive as a comment
   and running against an empty DB. It is a stock-runner-ignored comment (§1.1) — but unlike the
@@ -179,11 +179,18 @@ Conventions, fixed here so every implementation renders identically:
     cross-core assurance and still leaves a format-aware forge to maintain, so it is worth doing
     **only if** the per-format-bump update cost of the full reference becomes the binding pain.
 
+- **`# load-collation:` / `# load-timezone:` — declared per file.** A database's loaded data is fixed
+  by its immutable environment ([environment.md](environment.md)), so these directives cannot load
+  mid-file. The harness scans each file for them (and for `# fixture:`) **before** creating the
+  database and builds that file's environment with every bundle they name; at their own position a
+  directive only asserts that the name is available. Each file therefore starts from exactly the
+  data it declares — nothing loaded by an earlier file leaks into a later one.
+
 - **`# upgrade-collations:` action** — a file-level `# upgrade-collations:` comment that runs the
   **COLLATION UPGRADE migration** (`db.upgrade_collations()`) on the running database mid-file — the
   privileged host op that clears a version-skew by rebuilding the skewed collated keys against the
-  loaded version and re-pinning the stamp ([collation.md §12](collation.md)). It is an *action*, like
-  `# load-collation:` (it runs when read, binds to no record), not a pending assertion. Paired with
+  loaded version and re-pinning the stamp ([collation.md §12](collation.md)). It is an *action* (it
+  runs when read, binds to no record), not a pending assertion. Paired with
   `# fixture:` it lets a shared corpus test drive the full **skew → migrate → writable** arc on a
   pre-built skewed image: assert a write is `XX002` (still skewed), `# upgrade-collations:`, then
   assert the same write succeeds and a query is served correctly (and cheaply — pushdown) by the

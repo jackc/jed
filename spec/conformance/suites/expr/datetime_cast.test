@@ -7,6 +7,8 @@
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: query.select, query.select_no_from, types.timestamp, types.timestamptz, types.date, cast.datetime, expr.at_time_zone, session.timezone
 
+# load-timezone: America/New_York
+
 # ============================================================================================
 # zone-free pairs: timestamp <-> date (no session zone involved)
 # ============================================================================================

@@ -1,17 +1,16 @@
-import { createDatabase, ExtensionRegistry, intValue, render } from 'jed-ts';
+import { createDatabase, Environment, intValue, render } from 'jed-ts';
 
-// A host registers its own SCALAR FUNCTIONS over the built-in types. Build a registry, add
-// functions, and hand it to createDatabase/openDatabase — the engine freezes it for the handle's
-// lifetime and shares it into every session. It is a handle setting, never written to the file (a
-// reopening host brings its own).
-const registry = new ExtensionRegistry();
+// A host registers its own SCALAR FUNCTIONS over the built-in types on an EnvironmentBuilder, builds
+// the (immutable) Environment, and hands it to createDatabase/openDatabase — every session of the
+// handle shares it. It is never written to the file (a reopening host brings its own).
+const builder = Environment.builder();
 
 // discount(cents, pct) -> the price after a whole-percent discount. STRICT — a NULL argument
 // short-circuits to NULL before the kernel runs, so the closure never sees one — and reached by an
 // EXACT (i64, i64) signature (no implicit promotion; a built-in of the same signature would win).
 // `cost: 2n` is charged once per call and gated against a session's maxCost, so the function stays
 // inside the untrusted-query bound.
-registry.registerFunction({
+builder.registerFunction({
   name: 'discount',
   argTypes: ['i64', 'i64'],
   result: 'i64',
@@ -32,7 +31,7 @@ registry.registerFunction({
 // call (args[0][i] is row i's argument) and pushes one result per row to `out`. jed calls it once
 // per chunk where it already holds the rows, and one row at a time elsewhere — same rows, cost, and
 // errors either way.
-registry.registerFunction({
+builder.registerFunction({
   name: 'with_tax',
   argTypes: ['i64'],
   result: 'i64',
@@ -45,13 +44,13 @@ registry.registerFunction({
   }
 });
 
-const db = createDatabase({ extensions: registry });
+const db = createDatabase({ environment: builder.build() });
 
 db.execute('CREATE TABLE product (id i32 PRIMARY KEY, name text, price_cents i64)');
 db.execute("INSERT INTO product VALUES (1, 'Mug', 1250), (2, 'Notebook', 400)");
 
 // Because discount is IMMUTABLE and carries a component identity, it can back a persisted index.
-// On reopen, if the registry supplies a different component/version, the index is skipped for
+// On reopen, if the environment supplies a different component/version, the index is skipped for
 // reads (a correct heap scan) and refused for writes — never a silently stale result.
 db.execute('CREATE INDEX ON product (discount(price_cents, 10))');
 

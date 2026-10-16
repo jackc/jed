@@ -29,7 +29,7 @@ const (
 // (3-page chain), `control` keeps every value inline. Row 2 is inline in both.
 func overflowTables(t *testing.T) *Session {
 	t.Helper()
-	db := newInMemoryWithPageSize(overflowPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(overflowPageSize, NewEnvironment()).Session(SessionOptions{})
 	big := fillerText(overflowBodyLength)
 	mustExec(t, db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO spill VALUES (1, '"+big+"'), (2, 'small')")
@@ -76,7 +76,7 @@ func TestOverflowCostLimitDoesNotLowerTheBlock(t *testing.T) {
 	// The spilled record is row 2, so LIMIT 1 emits only the inline row 1 — yet the page_read
 	// block (which never short-circuits — cost.md §3 "LIMIT short-circuit") still counts the
 	// bound's chain pages.
-	db := newInMemoryWithPageSize(overflowPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(overflowPageSize, NewEnvironment()).Session(SessionOptions{})
 	big := fillerText(overflowBodyLength)
 	mustExec(t, db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO spill VALUES (1, 'small'), (2, '"+big+"')")
@@ -138,7 +138,7 @@ func TestOverflowCostUntouchedColumnsChargeNothing(t *testing.T) {
 func TestOverflowCostMultipleChainsSum(t *testing.T) {
 	t.Parallel()
 	// One record with two externalized values charges the sum of both chains: 3 + 2 = 5.
-	db := newInMemoryWithPageSize(overflowPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(overflowPageSize, NewEnvironment()).Session(SessionOptions{})
 	bigText := fillerText(overflowBodyLength)
 	bigHex := fillerBytesHex(300)
 	mustExec(t, db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)")

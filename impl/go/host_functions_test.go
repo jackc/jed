@@ -32,20 +32,21 @@ func hostAddText() *HostFunction {
 		})
 }
 
-func regWith(t *testing.T, funcs ...*HostFunction) *ExtensionRegistry {
+// envWith builds an Environment with funcs registered as host functions.
+func envWith(t *testing.T, funcs ...*HostFunction) *Environment {
 	t.Helper()
-	r := NewExtensionRegistry()
+	b := NewEnvironmentBuilder()
 	for _, f := range funcs {
-		if err := r.RegisterFunction(f); err != nil {
+		if err := b.RegisterFunction(f); err != nil {
 			t.Fatalf("register: %v", err)
 		}
 	}
-	return r
+	return b.Build()
 }
 
-func dbExt(t *testing.T, ext *ExtensionRegistry, stmts ...string) *Session {
+func dbExt(t *testing.T, env *Environment, stmts ...string) *Session {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{Extensions: ext})
+	db, err := CreateDatabase(CreateOptions{Environment: env})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -78,7 +79,7 @@ func oneVal(t *testing.T, s *Session, sql string) Value {
 
 func TestHostScalarFunctionOverLiterals(t *testing.T) {
 	t.Parallel()
-	s := dbExt(t, regWith(t, hostAdd()))
+	s := dbExt(t, envWith(t, hostAdd()))
 	if v := oneVal(t, s, "SELECT host_add(2, 3)"); v.Int != 5 {
 		t.Fatalf("host_add(2,3) = %v, want 5", v.Int)
 	}
@@ -89,7 +90,7 @@ func TestHostScalarFunctionOverLiterals(t *testing.T) {
 
 func TestHostScalarFunctionOverColumns(t *testing.T) {
 	t.Parallel()
-	s := dbExt(t, regWith(t, hostAdd()),
+	s := dbExt(t, envWith(t, hostAdd()),
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i64, b i64)",
 		"INSERT INTO t VALUES (1, 10, 20), (2, 100, 1)")
 	rows := hostRows(t, s, "SELECT host_add(a, b) FROM t ORDER BY id")
@@ -102,7 +103,7 @@ func TestHostFunctionIsStrictOnTypedNull(t *testing.T) {
 	t.Parallel()
 	// A NULL-valued argument of a KNOWN type short-circuits to NULL before the kernel runs (§4.2);
 	// the kernel (which would panic on a NULL Int) is never called.
-	s := dbExt(t, regWith(t, hostAdd()),
+	s := dbExt(t, envWith(t, hostAdd()),
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i64, b i64)",
 		"INSERT INTO t VALUES (1, NULL, 20)")
 	if v := oneVal(t, s, "SELECT host_add(a, b) FROM t"); !v.IsNull() {
@@ -114,13 +115,13 @@ func TestBareNullLiteralFindsNoOverload(t *testing.T) {
 	t.Parallel()
 	// A bare untyped NULL matches no concrete scalar signature — 42883, exactly as a built-in
 	// (abs(NULL)) behaves. Strictness is an eval-time property of a TYPED null, not a resolution one.
-	s := dbExt(t, regWith(t, hostAdd()))
+	s := dbExt(t, envWith(t, hostAdd()))
 	wantErr(t, s, "SELECT host_add(NULL, 3)", "42883")
 }
 
 func TestHostOverloadBySignature(t *testing.T) {
 	t.Parallel()
-	s := dbExt(t, regWith(t, hostAdd(), hostAddText()))
+	s := dbExt(t, envWith(t, hostAdd(), hostAddText()))
 	if v := oneVal(t, s, "SELECT host_add(2, 3)"); v.Int != 5 {
 		t.Fatalf("host_add(2,3) = %v, want 5", v.Int)
 	}
@@ -135,7 +136,7 @@ func TestBuiltinWinsOverHostSameSignature(t *testing.T) {
 	// If the host kernel (returning a sentinel 999) ran, abs(-5) would be 999.
 	hostAbs := NewHostFunction("abs", []string{"i64"}, "i64",
 		func(args []Value) (Value, error) { return IntValue(999), nil })
-	s := dbExt(t, regWith(t, hostAbs))
+	s := dbExt(t, envWith(t, hostAbs))
 	if v := oneVal(t, s, "SELECT abs(-5)"); v.Int != 5 {
 		t.Fatalf("abs(-5) = %v, want 5 (built-in wins)", v.Int)
 	}
@@ -148,7 +149,7 @@ func TestHostTextOverloadWinsOverLiteralAdaptation(t *testing.T) {
 	// that first pass, so it is reached instead (functions.md §9.1).
 	hostSha := NewHostFunction("sha256", []string{"text"}, "text",
 		func(args []Value) (Value, error) { return TextValue("host:" + args[0].str()), nil })
-	s := dbExt(t, regWith(t, hostSha))
+	s := dbExt(t, envWith(t, hostSha))
 	if v := oneVal(t, s, "SELECT sha256('abc')"); v.str() != "host:abc" {
 		t.Fatalf("sha256('abc') = %q, want host:abc (host text overload wins)", v.str())
 	}
@@ -159,7 +160,7 @@ func TestHostTextOverloadWinsOverLiteralAdaptation(t *testing.T) {
 
 func TestDuplicateSignatureRejected(t *testing.T) {
 	t.Parallel()
-	r := NewExtensionRegistry()
+	r := NewEnvironmentBuilder()
 	if err := r.RegisterFunction(hostAdd()); err != nil {
 		t.Fatalf("first register: %v", err)
 	}
@@ -176,7 +177,7 @@ func TestDuplicateSignatureRejected(t *testing.T) {
 
 func TestNegativeCostRejected(t *testing.T) {
 	t.Parallel()
-	r := NewExtensionRegistry()
+	r := NewEnvironmentBuilder()
 	bad := NewHostFunction("host_neg", nil, "i64",
 		func(args []Value) (Value, error) { return IntValue(0), nil }).WithCost(-1)
 	if ee, ok := r.RegisterFunction(bad).(*EngineError); !ok || ee.Code() != "22023" {
@@ -186,7 +187,7 @@ func TestNegativeCostRejected(t *testing.T) {
 
 func TestUnknownTypeNameRejected(t *testing.T) {
 	t.Parallel()
-	r := NewExtensionRegistry()
+	r := NewEnvironmentBuilder()
 	bad := NewHostFunction("host_bad", []string{"not_a_type"}, "i64",
 		func(args []Value) (Value, error) { return IntValue(0), nil })
 	if ee, ok := r.RegisterFunction(bad).(*EngineError); !ok || ee.Code() != "42704" {
@@ -202,7 +203,7 @@ func TestDeclaredCostIsChargedPerCall(t *testing.T) {
 		return NewHostFunction(name, nil, "i64",
 			func(args []Value) (Value, error) { return IntValue(0), nil }).WithCost(cost)
 	}
-	s := dbExt(t, regWith(t, const0("host_c0", 0), const0("host_c1000", 1000)))
+	s := dbExt(t, envWith(t, const0("host_c0", 0), const0("host_c1000", 1000)))
 	out0, _ := queryOutcome(s, "SELECT host_c0()", nil)
 	out1000, _ := queryOutcome(s, "SELECT host_c1000()", nil)
 	if diff := out1000.Cost - out0.Cost; diff != 1000 {
@@ -215,7 +216,7 @@ func TestDeclaredCostGatesMaxCostCeiling(t *testing.T) {
 	// A declared weight above the ceiling aborts 54P01 before the kernel runs (guard after charge).
 	heavy := NewHostFunction("host_heavy", nil, "i64",
 		func(args []Value) (Value, error) { return IntValue(0), nil }).WithCost(1_000_000)
-	db, _ := CreateDatabase(CreateOptions{Extensions: regWith(t, heavy)})
+	db, _ := CreateDatabase(CreateOptions{Environment: envWith(t, heavy)})
 	s := db.Session(SessionOptions{})
 	s.SetMaxCost(1000)
 	_, err := queryOutcome(s, "SELECT host_heavy()", nil)
@@ -230,19 +231,19 @@ func TestWrongResultTypeIsRejected(t *testing.T) {
 	// leaking a wrong-typed value into jed's strict type system (CLAUDE.md §13).
 	liar := NewHostFunction("host_liar", nil, "i64",
 		func(args []Value) (Value, error) { return TextValue("oops"), nil })
-	s := dbExt(t, regWith(t, liar))
+	s := dbExt(t, envWith(t, liar))
 	wantErr(t, s, "SELECT host_liar()", "22000")
 }
 
 func TestUnknownHostFunctionStillUndefined(t *testing.T) {
 	t.Parallel()
-	s := dbExt(t, regWith(t, hostAdd()))
+	s := dbExt(t, envWith(t, hostAdd()))
 	wantErr(t, s, "SELECT host_missing(1)", "42883")
 }
 
 func TestExplainRendersHostFunctionName(t *testing.T) {
 	t.Parallel()
-	s := dbExt(t, regWith(t, hostAdd()), "CREATE TABLE t (id i32 PRIMARY KEY, a i64, b i64)")
+	s := dbExt(t, envWith(t, hostAdd()), "CREATE TABLE t (id i32 PRIMARY KEY, a i64, b i64)")
 	rows := hostRows(t, s, "EXPLAIN (VERBOSE) SELECT host_add(a, b) FROM t")
 	found := false
 	for _, r := range rows {
@@ -259,14 +260,14 @@ func TestExplainRendersHostFunctionName(t *testing.T) {
 
 func TestNoExtensionsIsUnaffected(t *testing.T) {
 	t.Parallel()
-	// The built-in-only path is untouched: an empty registry resolves nothing new, and a call to a
+	// The built-in-only path is untouched: an environment with no host functions resolves nothing new, and a call to a
 	// would-be host name is 42883.
-	s := dbExt(t, NewExtensionRegistry())
+	s := dbExt(t, NewEnvironment())
 	if v := oneVal(t, s, "SELECT abs(-7)"); v.Int != 7 {
 		t.Fatalf("abs(-7) = %v, want 7", v.Int)
 	}
 	wantErr(t, s, "SELECT host_add(1, 2)", "42883")
-	// A nil registry (no Extensions option) behaves the same.
+	// No Environment option (a fresh empty environment) behaves the same.
 	s2 := memDB().Session(SessionOptions{})
 	wantErr(t, s2, "SELECT host_add(1, 2)", "42883")
 }
@@ -313,11 +314,11 @@ func geoIDs(t *testing.T, q valueQuerier, sql string) []int64 {
 	return ids
 }
 
-// createGeoFile creates a file-backed database with reg registered and runs the setup statements
+// createGeoFile creates a file-backed database with env's host functions and runs the setup statements
 // (each autocommits durably), then closes it.
-func createGeoFile(t *testing.T, path string, reg *ExtensionRegistry, stmts ...string) {
+func createGeoFile(t *testing.T, path string, env *Environment, stmts ...string) {
 	t.Helper()
-	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, Extensions: reg})
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, Environment: env})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -329,10 +330,10 @@ func createGeoFile(t *testing.T, path string, reg *ExtensionRegistry, stmts ...s
 	}
 }
 
-// openGeoFile reopens a file-backed database (v31 deserialize) with reg registered.
-func openGeoFile(t *testing.T, path string, reg *ExtensionRegistry) *Database {
+// openGeoFile reopens a file-backed database (v31 deserialize) with env's host functions.
+func openGeoFile(t *testing.T, path string, env *Environment) *Database {
 	t.Helper()
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Extensions: reg})
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Environment: env})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -346,7 +347,7 @@ func TestHostFuncVolatileInIndexRejected(t *testing.T) {
 	volatile := NewHostFunction("geo_hash", []string{"i64"}, "i64",
 		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
 		WithComponentID("com.example/geo_hash") // Volatile by default
-	s := dbExt(t, regWith(t, volatile), "CREATE TABLE t (a i64)")
+	s := dbExt(t, envWith(t, volatile), "CREATE TABLE t (a i64)")
 	wantErr(t, s, "CREATE INDEX ix ON t (geo_hash(a))", "42P17")
 }
 
@@ -356,13 +357,13 @@ func TestHostFuncUnversionedInIndexRejected(t *testing.T) {
 	unversioned := NewHostFunction("geo_hash", []string{"i64"}, "i64",
 		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
 		WithVolatility(VolatilityImmutable)
-	s := dbExt(t, regWith(t, unversioned), "CREATE TABLE t (a i64)")
+	s := dbExt(t, envWith(t, unversioned), "CREATE TABLE t (a i64)")
 	wantErr(t, s, "CREATE INDEX ix ON t (geo_hash(a))", "42P17")
 }
 
 func TestHostFuncImmutableVersionedInIndexOK(t *testing.T) {
 	t.Parallel()
-	s := dbExt(t, regWith(t, geoHash("com.example/geo_hash", 1)),
+	s := dbExt(t, envWith(t, geoHash("com.example/geo_hash", 1)),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
 		"INSERT INTO t VALUES (1, 3), (2, 7)",
 		"CREATE INDEX ix ON t (geo_hash(a))")
@@ -375,13 +376,13 @@ func TestHostFuncImmutableVersionedInIndexOK(t *testing.T) {
 func TestHostFuncIndexReopenMatchingOK(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_index_match.jed")
-	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+	createGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 1)),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
 		"INSERT INTO t VALUES (1, 3), (2, 7)",
 		"CREATE INDEX ix ON t (geo_hash(a))")
 	// Reopen (v31 deserialize) with the SAME component + version: the dependency matches, so reads use
 	// the index and writes maintain it.
-	db := openGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)))
+	db := openGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 1)))
 	defer db.Close()
 	if got := geoIDs(t, db, "SELECT id FROM t WHERE geo_hash(a) = 30"); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("matching reopen read = %v, want [1]", got)
@@ -397,12 +398,12 @@ func TestHostFuncIndexReopenMatchingOK(t *testing.T) {
 func TestHostFuncIndexReopenVersionBumpUnusable(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_index_bump.jed")
-	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+	createGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 1)),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
 		"INSERT INTO t VALUES (1, 3), (2, 7)",
 		"CREATE INDEX ix ON t (geo_hash(a))")
 	// Reopen with a BUMPED semantic_version → the index's stored keys are stale.
-	db := openGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 2)))
+	db := openGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 2)))
 	defer db.Close()
 	// Reads still correct: a plain read (no index) and one that COULD use the index (skipped → heap
 	// scan) both return the right rows — never a silent stale-key read.
@@ -421,12 +422,12 @@ func TestHostFuncIndexReopenVersionBumpUnusable(t *testing.T) {
 func TestHostFuncIndexReopenDifferentComponentUnusable(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_index_component.jed")
-	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+	createGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 1)),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
 		"INSERT INTO t VALUES (1, 3)",
 		"CREATE INDEX ix ON t (geo_hash(a))")
 	// Reopen with a DIFFERENT component id for the same name/signature → a different implementation.
-	db := openGeoFile(t, path, regWith(t, geoHash("org.other/geo_hash", 1)))
+	db := openGeoFile(t, path, envWith(t, geoHash("org.other/geo_hash", 1)))
 	defer db.Close()
 	if got := geoIDs(t, db, "SELECT id FROM t WHERE geo_hash(a) = 30"); len(got) != 1 || got[0] != 1 {
 		t.Fatalf("different-component read = %v, want [1]", got)
@@ -439,12 +440,12 @@ func TestHostFuncIndexReopenDifferentComponentUnusable(t *testing.T) {
 func TestHostFuncIndexReopenMissingFunction(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_index_missing.jed")
-	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+	createGeoFile(t, path, envWith(t, geoHash("com.example/geo_hash", 1)),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
 		"INSERT INTO t VALUES (1, 3), (2, 7)",
 		"CREATE INDEX ix ON t (geo_hash(a))")
 	// Reopen with NO extensions: the index expression can no longer resolve.
-	db := openGeoFile(t, path, NewExtensionRegistry())
+	db := openGeoFile(t, path, NewEnvironment())
 	defer db.Close()
 	// A read that does not reference the missing function still works (the index is simply unused).
 	if got := geoIDs(t, db, "SELECT id FROM t ORDER BY id"); len(got) != 2 || got[0] != 1 || got[1] != 2 {
@@ -509,7 +510,7 @@ func twiceRow(calls *hostCalls, failAt int64) *HostFunction {
 // batchDB is a table t(id i64 PRIMARY KEY, a i64) of n rows (g, g), with a NULL where g % 10 = 0.
 func batchDB(t *testing.T, f *HostFunction, n int) *Session {
 	t.Helper()
-	return dbExt(t, regWith(t, f),
+	return dbExt(t, envWith(t, f),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
 		fmt.Sprintf("INSERT INTO t SELECT g, CASE WHEN g %% 10 = 0 THEN NULL ELSE g END FROM generate_series(1, %d) AS g", n))
 }
@@ -771,7 +772,7 @@ func TestOutOfRangeIntegerResultIs22003(t *testing.T) {
 	// extensibility.md §4.2) — before the fix it surfaced as an "i32" 1099511627776, compared as one,
 	// and CAST to i64 silently kept it; only a column write's own range check caught it.
 	id := func(x int64) int64 { return x }
-	s := dbExt(t, regWith(t,
+	s := dbExt(t, envWith(t,
 		hostNarrow("host_i16", "i16", id),
 		hostNarrow("host_i32", "i32", id),
 		hostNarrow("host_i64", "i64", id)),
@@ -1094,7 +1095,7 @@ func TestHostBatchStreamingScanStorageErrorsMatchRowKernel(t *testing.T) {
 		if err := os.WriteFile(p, bytes, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		d, err := OpenDatabaseWithOptions(p, OpenOptions{SkipFsync: true, Extensions: regWith(t, f)})
+		d, err := OpenDatabaseWithOptions(p, OpenOptions{SkipFsync: true, Environment: envWith(t, f)})
 		if err != nil {
 			return nil // a corrupted routing/catalog page fails at open, before any scan
 		}
@@ -1168,7 +1169,7 @@ func wantHostOK(t *testing.T, q valueQuerier, sql string) {
 func TestHostFuncCheckAdmission(t *testing.T) {
 	t.Parallel()
 	// An unversioned host function cannot back a CHECK in any position (42P17)...
-	s := dbExt(t, regWith(t, unversionedGeo()), "CREATE TABLE u (a i64)")
+	s := dbExt(t, envWith(t, unversionedGeo()), "CREATE TABLE u (a i64)")
 	wantErr(t, s, "CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))", "42P17")
 	wantErr(t, s, "CREATE TABLE t (a i64, CHECK (geo_hash(a) < 100))", "42P17")
 	wantErr(t, s, "ALTER TABLE u ADD CONSTRAINT c CHECK (geo_hash(a) < 100)", "42P17")
@@ -1179,7 +1180,7 @@ func TestHostFuncCheckAdmission(t *testing.T) {
 		t.Fatalf("host-function default = %v, want 50", got)
 	}
 	// A VOLATILE but versioned host function is admitted into a CHECK and enforced.
-	s2 := dbExt(t, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
+	s2 := dbExt(t, envWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
 		"CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))")
 	run(t, s2, "INSERT INTO t VALUES (9)")
 	wantErr(t, s2, "INSERT INTO t VALUES (10)", "23514")
@@ -1189,7 +1190,7 @@ func TestHostFuncCheckAdmission(t *testing.T) {
 // holding the row (1, 9).
 func createCheckFile(t *testing.T, path string) {
 	t.Helper()
-	createGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
+	createGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64, CONSTRAINT small CHECK (geo_hash(a) < 100))",
 		"INSERT INTO t VALUES (1, 9)")
 }
@@ -1198,7 +1199,7 @@ func TestHostFuncCheckReopenMatching(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_check_match.jed")
 	createCheckFile(t, path)
-	db := openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)))
+	db := openGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 1, 10)))
 	defer db.Close()
 	wantHostOK(t, db, "INSERT INTO t VALUES (2, 5)")
 	wantHostCode(t, db, "INSERT INTO t VALUES (3, 10)", "23514")
@@ -1233,7 +1234,7 @@ func TestHostFuncCheckReopenMismatch(t *testing.T) {
 			t.Parallel()
 			path := filepath.Join(t.TempDir(), "hostfunc_check_mismatch.jed")
 			createCheckFile(t, path)
-			db := openGeoFile(t, path, regWith(t, fn))
+			db := openGeoFile(t, path, envWith(t, fn))
 			defer db.Close()
 			// Every write that evaluates the stale check is refused before mutating anything.
 			wantHostCode(t, db, "INSERT INTO t VALUES (2, 1)", "XX002")
@@ -1252,7 +1253,7 @@ func TestHostFuncCheckRebuild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hostfunc_check_rebuild.jed")
 	createCheckFile(t, path)
 	// v2 doubles the factor: the rule becomes a < 5, which the stored row (1, 9) violates.
-	v2 := func() *ExtensionRegistry { return regWith(t, scaledGeo("com.example/geo_hash", 2, 20)) }
+	v2 := func() *Environment { return envWith(t, scaledGeo("com.example/geo_hash", 2, 20)) }
 	rebuild := "ALTER TABLE t DROP CONSTRAINT small, ADD CONSTRAINT small CHECK (geo_hash(a) < 100)"
 	db := openGeoFile(t, path, v2())
 	// The one-statement rebuild re-validates every row with the current implementation: 23514, and the
@@ -1268,7 +1269,7 @@ func TestHostFuncCheckRebuild(t *testing.T) {
 	db = openGeoFile(t, path, v2())
 	wantHostOK(t, db, "INSERT INTO t VALUES (4, 2)")
 	db.Close()
-	db = openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)))
+	db = openGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 1, 10)))
 	defer db.Close()
 	wantHostCode(t, db, "INSERT INTO t VALUES (5, 2)", "XX002")
 }
@@ -1276,14 +1277,14 @@ func TestHostFuncCheckRebuild(t *testing.T) {
 func TestHostFuncCheckUnrelatedStatements(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_check_unrelated.jed")
-	createGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
+	createGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
 		"CREATE TABLE p1 (id i64 PRIMARY KEY)",
 		"CREATE TABLE p2 (id i64 PRIMARY KEY)",
 		"CREATE TABLE c (id i64 PRIMARY KEY, pid i64 REFERENCES p1 ON DELETE SET NULL, a i64, CHECK (geo_hash(a) < 100))",
 		"CREATE TABLE k (id i64 PRIMARY KEY, pid i64 REFERENCES p2 ON DELETE CASCADE, a i64, CHECK (geo_hash(a) < 100))",
 		"INSERT INTO p1 VALUES (1)", "INSERT INTO p2 VALUES (1)",
 		"INSERT INTO c VALUES (1, 1, 1)", "INSERT INTO k VALUES (1, 1, 1)")
-	db := openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 2, 10)))
+	db := openGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 2, 10)))
 	defer db.Close()
 	// Adding an unrelated constraint validates only the new one, so the stale check does not block it.
 	wantHostOK(t, db, "ALTER TABLE c ADD CONSTRAINT pos CHECK (a > -100)")
@@ -1308,20 +1309,20 @@ func TestHostFuncCheckAlterTypeRecollects(t *testing.T) {
 			func(args []Value) (Value, error) { return IntValue(args[0].Int), nil }).WithComponentID("b/lim")
 	}
 	path := filepath.Join(t.TempDir(), "hostfunc_check_retype.jed")
-	createGeoFile(t, path, regWith(t, lim32, lim64()),
+	createGeoFile(t, path, envWith(t, lim32, lim64()),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i32, CHECK (lim(a) < 100))",
 		"INSERT INTO t VALUES (1, 5)")
 	// The check depends on lim(i32), so a registry without it cannot write.
-	db := openGeoFile(t, path, regWith(t, lim64()))
+	db := openGeoFile(t, path, envWith(t, lim64()))
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (2, 6)", nil); err == nil {
 		t.Fatal("a write without the lim(i32) dependency should be refused")
 	}
 	db.Close()
 	// ALTER COLUMN TYPE re-validates every row and re-collects the dependency from the new resolution.
-	db = openGeoFile(t, path, regWith(t, lim32, lim64()))
+	db = openGeoFile(t, path, envWith(t, lim32, lim64()))
 	wantHostOK(t, db, "ALTER TABLE t ALTER COLUMN a TYPE i64")
 	db.Close()
-	db = openGeoFile(t, path, regWith(t, lim64()))
+	db = openGeoFile(t, path, envWith(t, lim64()))
 	defer db.Close()
 	wantHostOK(t, db, "INSERT INTO t VALUES (2, 6)")
 	wantHostCode(t, db, "INSERT INTO t VALUES (3, 100)", "23514")
@@ -1330,7 +1331,7 @@ func TestHostFuncCheckAlterTypeRecollects(t *testing.T) {
 func TestHostFuncDefaultResolvedOnlyWhenApplied(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "hostfunc_default_lazy.jed")
-	createGeoFile(t, path, regWith(t, unversionedGeo()),
+	createGeoFile(t, path, envWith(t, unversionedGeo()),
 		"CREATE TABLE t (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5), c i64)",
 		"INSERT INTO t (id) VALUES (1)",
 		"CREATE TABLE p (id i64 PRIMARY KEY)",
@@ -1362,10 +1363,10 @@ func TestHostFuncCheckErrorPrecedesDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hostfunc_check_default_order.jed")
 	lim := NewHostFunction("lim", []string{"i64"}, "i64",
 		func(args []Value) (Value, error) { return IntValue(args[0].Int), nil })
-	createGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10), lim),
+	createGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 1, 10), lim),
 		"CREATE TABLE t (id i64 PRIMARY KEY, a i64, b i64 DEFAULT lim(1), CHECK (geo_hash(a) < 100))")
 	// A stale check (XX002) and a missing default function (42883): the check resolves first.
-	db := openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 2, 10)))
+	db := openGeoFile(t, path, envWith(t, scaledGeo("com.example/geo_hash", 2, 10)))
 	defer db.Close()
 	wantHostCode(t, db, "INSERT INTO t (id, a) VALUES (1, 1)", "XX002")
 }

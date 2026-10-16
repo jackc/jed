@@ -128,19 +128,21 @@ returns NULL).
 
 ## 5. The seam in the cores
 
-The injected **random and clock functions** live on the `Database` handle in a small `Seam`
-(the random source `None`/`nil`/`undefined` ⇒ the OS CSPRNG; the clock source likewise ⇒ the wall
-clock). The evaluator reaches it from the per-statement `EvalEnv` (Rust/Go via `exec.seam`; TS via
-an `EvalEnv.seam` reference to the handle's `Seam`). A small per-statement `StmtRng` carries the
-uuidv7 monotonic **counter** and the once-resolved **clock** (read once — §1 stability); it is
-created where the cost `Meter` is. Rust holds it as `Cell<StmtRng>` borrowed by `EvalEnv` (interior
-mutability — the seam state advances and `EvalEnv` is `&`-shared; the draw order is fixed by eval
-order regardless); Go a `*StmtRng`; TS a `StmtRng` object. **No syscall on the hot path**: a query
-with no generator never calls the random/clock source.
+The **random and clock sources** are installed in the handle's **environment**
+([environment.md](environment.md) §4) — the default environment carries the OS random source and
+the wall clock. The evaluator reaches them through the session's environment from the per-statement
+`EvalEnv`. A small per-statement `StmtRng` carries the uuidv7 monotonic **counter** and the
+once-resolved **clock** (read once — §1 stability); it is created where the cost `Meter` is. Rust
+holds it as `Cell<StmtRng>` borrowed by `EvalEnv` (interior mutability — the seam state advances and
+`EvalEnv` is `&`-shared; the draw order is fixed by eval order regardless); Go a `*StmtRng`; TS a
+`StmtRng` object. **No syscall on the hot path**: a query with no generator never calls the
+random/clock source.
 
-If a *deterministic* source is injected, its PRNG state lives inside that source closure
-(**handle-scoped**, advancing across the statements run on the handle), not in `StmtRng`. The
-production CSPRNG is stateless from the engine's view (each fill is fresh OS entropy).
+A source is an **object** the environment shares by reference. A *deterministic* source keeps its
+PRNG state inside itself (**environment-scoped**, advancing across every statement of every database
+and session that uses the environment), not in `StmtRng`; Rust and Go sources are thread-safe because
+sessions may run concurrently. The production OS source is stateless from the engine's view (each fill
+is fresh OS entropy).
 
 **Per-statement, not per-block (a documented bound).** The `StmtRng` is created per query-block
 execution (where `EvalEnv` is built), so the monotonic counter and cached clock reset per block. A
@@ -151,38 +153,45 @@ row_key)`), deferred with parallelism; until then a generator's natural home is 
 (projection / `INSERT … SELECT` / a `generate_series` feed), where it is both deterministic and
 ordered.
 
-## 6. Host API — two injectable seam functions (mirror `max_cost`)
+## 6. Host API — sources in the environment
 
-The random and clock sources are **handle settings** ([api.md](api.md) §6/§10), not stored in the
-file and not per-statement arguments — the host injects them once on the handle:
+The random and clock sources are part of the handle's **environment** ([environment.md](environment.md)),
+not stored in the file and not per-statement arguments. The host chooses them on the environment
+builder; the built environment is immutable, so the *installed* source never changes while a database
+is open. A source is a controllable object, so a host (or a test) keeps a reference and steers its
+state instead of swapping it:
 
 | Setting | Rust | Go | TS |
 |---|---|---|---|
-| inject random source | `db.set_random_source(f)` | `db.SetRandomSource(f)` | `db.setRandomSource(f)` |
-| inject clock source | `db.set_clock_source(f)` | `db.SetClockSource(f)` | `db.setClockSource(f)` |
-| clear (back to platform) | `db.clear_random_source()` / `db.clear_clock_source()` | `ClearRandomSource` / `ClearClockSource` | `clearRandomSource` / `clearClockSource` |
+| install random source | `builder.random_source(Arc<dyn RandomSource>)` | `b.SetRandomSource(RandomSource)` | `builder.randomSource(s)` |
+| install clock source | `builder.clock_source(Arc<dyn ClockSource>)` | `b.SetClockSource(ClockSource)` | `builder.clockSource(c)` |
+| source interface | `trait RandomSource { fn fill(&self, &mut [u8]) -> Result<()> }`, `trait ClockSource { fn now_micros(&self) -> i64 }` | `RandomSource { Fill([]byte) error }`, `ClockSource { NowMicros() int64 }` | `RandomSource { fill(Uint8Array) }`, `ClockSource { nowMicros(): bigint }` |
 
-The engine provides these constructors for the deterministic / reproducible path:
+The engine provides these sources:
 
-| Provided source | Rust | Go | TS |
-|---|---|---|---|
-| seeded PRNG source | `seeded_random_source(u64)` | `SeededRandomSource(uint64)` | `seededRandomSource(bigint)` |
-| fixed clock | `fixed_clock(i64)` | `FixedClock(i64)` | `fixedClock(bigint)` |
-| advancing clock | `advancing_clock(start, step)` | `AdvancingClock(start, step)` | `advancingClock(start, step)` |
+| Provided source | Rust | Go | TS | Control |
+|---|---|---|---|---|
+| OS random (default) | `os_random_source()` | `OSRandomSource()` | `osRandomSource()` | none |
+| wall clock (default) | `wall_clock()` | `WallClock()` | `wallClock()` | none |
+| seeded PRNG | `seeded_random_source(u64)` → `SeededRandom` | `NewSeededRandom(uint64)` | `seededRandomSource(bigint)` → `SeededRandom` | `reseed(seed)` restarts the stream |
+| manual clock | `manual_clock(i64)` → `ManualClock` | `NewManualClock(int64)` | `manualClock(bigint)` → `ManualClock` | `set(micros)`, `advance(step)` |
+| advancing clock | `advancing_clock(start, step)` → `AdvancingClock` | `NewAdvancingClock(start, step)` | `advancingClock(start, step)` → `AdvancingClock` | `reset(start, step)` |
 
-The **advancing clock** returns `start`, then `start+step`, `start+2·step`, … — one increment per
-read (captured state; the `ClockSource` is `FnMut`/a closure). It makes `clock_timestamp()`'s per-call
-reads deterministic and distinguishable from the statement-stable `now()` (which reads the source only
+The **manual clock** replaces the former `fixed_clock`: it returns the instant it was last set to
+(or advanced to) on every read. The **advancing clock** returns `start`, then `start+step`,
+`start+2·step`, … — one increment per read. It makes `clock_timestamp()`'s per-call reads
+deterministic and distinguishable from the statement-stable `now()` (which reads the source only
 once): under it, two `now()` in a statement are equal while two `clock_timestamp()` differ. The
-conformance harness injects it via the **`# clock_advance: start,step`** directive
+conformance harness drives it via the **`# clock_advance: start,step`** directive
 ([conformance.md](conformance.md) §4), the advancing counterpart to `# clock:`.
 
-Unset, the random source reads **OS entropy per value** and the clock reads the **wall clock**: Go
-`crypto/rand` + `time`, TS `node:crypto` + `Date`, Rust `getrandom` (the approved CLAUDE.md §14
-dependency — Rust `std` has no OS RNG; Go/TS use their stdlib) + `SystemTime`. Tests inject
-`seeded_random_source` + `fixed_clock` via the `# seed:` / `# clock:` corpus directives
-([conformance.md](conformance.md) §4), which set them on the handle for the next record and reset
-after — exactly the `# max_cost:` pattern.
+By default the random source reads **OS entropy per value** and the clock reads the **wall clock**:
+Go `crypto/rand` + `time`, TS `node:crypto` + `Date`, Rust `getrandom` (the approved CLAUDE.md §14
+dependency — Rust `std` has no OS RNG; Go/TS use their stdlib) + `SystemTime`. The conformance
+harness builds its database's environment with its own switchable sources, which default to OS
+entropy and the wall clock and, for a record carrying `# seed:` / `# clock:` / `# clock_advance:`,
+draw from a reseeded `SeededRandom` / a set `ManualClock` / a reset `AdvancingClock` for that record
+and switch back after — exactly the `# max_cost:` pattern ([conformance.md](conformance.md) §4).
 
 ## 7. Cost
 

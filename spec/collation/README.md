@@ -14,7 +14,7 @@
 >    ([../design/collation.md §4](../design/collation.md)).
 > 4. **The `JUCD` bundle** — the runtime-loaded multi-collation container (§5): a manifest + a shared
 >    DUCET **root** + per-locale tailoring **deltas** + the Unicode **property/casing** section, what a
->    host hands `db.LoadUnicodeData` (Slice 3, [../design/collation.md §13/§14](../design/collation.md)).
+>    host hands the environment builder's `LoadUnicodeData` (Slice 3, [../design/collation.md §13/§14](../design/collation.md)).
 >
 > The **sort key** the executor emits (§4) is the byte string whose `memcmp` order *is* the
 > collation order — the bridge to jed's `memcmp` storage ([encoding.md §1](../design/encoding.md)).
@@ -224,7 +224,7 @@ after `"a"` — exactly the deterministic-collation "adjacent, not equal" proper
 
 ## 5. The `JUCD` bundle (the shippable Unicode-data container)
 
-The container a host **loads** at runtime via `db.LoadUnicodeData`
+The container a host **loads** at runtime via the environment builder's `LoadUnicodeData`
 ([../design/collation.md §4](../design/collation.md)) — the production delivery vehicle for the §2
 tables and the Unicode property/casing data ([../design/collation.md §16](../design/collation.md)).
 **One Unicode version per bundle.** It is a **manifest-indexed container** of independently-addressable
@@ -311,7 +311,7 @@ bundle {
 
 ### 5.1 Load-time merge (`root` + `tailoring` → the §2 table)
 
-Because a tailoring is sparse, `db.LoadUnicodeData` reconstructs the table the executor (§2/§4) expects
+Because a tailoring is sparse, the environment builder's `LoadUnicodeData` reconstructs the table the executor (§2/§4) expects
 by a **deterministic, spec'd merge** — the executor itself is unchanged:
 
 1. Start from the **root** section's `single` / `contraction` maps.

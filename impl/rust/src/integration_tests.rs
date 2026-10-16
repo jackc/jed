@@ -91,6 +91,8 @@ mod depth_limit;
 mod drop_table;
 #[path = "../tests/encoding.rs"]
 mod encoding;
+#[path = "../tests/environment.rs"]
+mod environment;
 #[path = "../tests/ergonomic.rs"]
 mod ergonomic;
 #[path = "../tests/error_fields.rs"]

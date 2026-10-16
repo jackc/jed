@@ -97,7 +97,7 @@ func TestTempOnCommitZeroFileWrites(t *testing.T) {
 // same inserts into an ordinary temp table cross (TestSessionLocalTempPageBudgetBoundsMultiLeaf).
 func TestTempOnCommitDeleteRowsStaysUnderBudget(t *testing.T) {
 	t.Parallel()
-	db := newInMemoryWithPageSize(256)
+	db := newInMemoryWithPageSize(256, NewEnvironment())
 	budget := 20 * 256
 	sess := db.Session(SessionOptions{MaxTempStorageBytes: &budget})
 	defer sess.Close()

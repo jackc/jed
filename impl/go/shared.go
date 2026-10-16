@@ -125,10 +125,10 @@ type sharedCore struct {
 	attachmentCount atomic.Int64
 	coordinator     *fileCoordinator
 	planEpoch       atomic.Uint64
-	// extensions is the frozen host extension registry (spec/design/extensibility.md §7): the scalar
-	// functions the host supplied in the create/open options, shared (by pointer) into every minted
-	// session's sessionState. nil when no extensions were supplied.
-	extensions *ExtensionRegistry
+	// env is the handle's Environment (spec/design/environment.md), supplied in the create/open
+	// options (or a fresh empty one), shared (by pointer) into every minted session's sessionState and
+	// every attachment's snapshot. Never nil; immutable for the handle's lifetime.
+	env *Environment
 }
 
 func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
@@ -310,7 +310,7 @@ func (c *sharedCore) reloadFromPager() error {
 		c.storage.mu.Unlock()
 		return err
 	}
-	loaded, err := loadEngineSharedPaging(c.storage.paging)
+	loaded, err := loadEngineSharedPaging(c.storage.paging, c.env)
 	if err != nil {
 		c.storage.mu.Unlock()
 		return err
@@ -342,7 +342,7 @@ func (c *sharedCore) reloadAttachmentFromPager(name string) error {
 		attachment.storage.mu.Unlock()
 		return err
 	}
-	loaded, err := loadEngineSharedPaging(attachment.storage.paging)
+	loaded, err := loadEngineSharedPaging(attachment.storage.paging, c.env)
 	if err != nil {
 		attachment.storage.mu.Unlock()
 		return err
@@ -1063,7 +1063,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	}
 	// A file's old pager is already closed and poisoned here, so a failed reload leaves the handle
 	// needing a reopen; an in-memory domain keeps its old store untouched.
-	loaded, err := loadEngineSharedPaging(paging)
+	loaded, err := loadEngineSharedPaging(paging, snap.env)
 	if err != nil {
 		return nil, err
 	}
@@ -1425,7 +1425,7 @@ func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *s
 	if e.paging == nil {
 		panic("every engine lifted into a shared core carries a paging context (B3)")
 	}
-	c := &sharedCore{live: make(map[uint64]int), coordinator: coordinator}
+	c := &sharedCore{live: make(map[uint64]int), coordinator: coordinator, env: e.session.env}
 	c.roots.Store(&roots{committed: e.committed})
 	c.storage = &storage{
 		pageSize:  e.pageSize,
@@ -1518,11 +1518,11 @@ type CreateOptions struct {
 	Locking   Locking
 	// nil is the 5s default; &0 requests one immediate acquisition attempt.
 	FileLockTimeoutMs *uint64
-	// Extensions are host extensions to register on this database (spec/design/extensibility.md §7):
-	// scalar functions the host supplies, FROZEN for the handle's lifetime and shared into every
-	// session. nil ⇒ no extensions. Not stored in the file — a host reopens with its own registry
-	// (the ephemeral, no-persisted-use rule of §14 step 3).
-	Extensions *ExtensionRegistry
+	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
+	// time-zone data, the host functions, and the random + clock sources, shared by every session,
+	// attachment, and temp domain of the handle. Not stored in the file — a host reopens with its own.
+	// nil ⇒ a fresh empty environment (no process-wide default).
+	Environment *Environment
 	// MaxStorageBytes is the committed-storage limit in bytes (spec/design/memory.md §8): a commit that
 	// would grow the database past it fails 54P06. An in-memory database measures its page high-water
 	// (pageCount × pageSize, §8.2), a file-backed one its live pages (livePages × pageSize, §8.7). Zero
@@ -1540,9 +1540,12 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	if pageSize == 0 {
 		pageSize = DefaultPageSize
 	}
+	env := opts.Environment
+	if env == nil {
+		env = NewEnvironment()
+	}
 	if opts.Path == "" {
-		db := newInMemoryWithPageSize(pageSize)
-		db.core.extensions = opts.Extensions // frozen at create, shared into every session (§7)
+		db := newInMemoryWithPageSize(pageSize, env)
 		db.core.storage.budget.limit = opts.MaxStorageBytes
 		return db, nil
 	}
@@ -1550,7 +1553,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	e, err := create(path, databaseOptions{PageSize: pageSize, noSync: opts.SkipFsync})
+	e, err := create(path, databaseOptions{PageSize: pageSize, noSync: opts.SkipFsync, env: env})
 	if err != nil {
 		if coordinator != nil {
 			coordinator.close()
@@ -1558,7 +1561,6 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		return nil, err
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
-	c.extensions = opts.Extensions // frozen at create, shared into every session (§7)
 	c.storage.budget.limit = opts.MaxStorageBytes
 	return databaseOver(c), nil
 }
@@ -1572,13 +1574,13 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 // B3 (bplus-reshape.md): an in-memory database is a memoryBlockStore seeded with the empty
 // from-scratch image, read/written through the same pager + Packed path as a file. txid 0 is the
 // pre-first-commit version (the same committed version an in-memory core always started at); the
-// first commit publishes txid 1 into the alternate meta slot.
-func newInMemoryWithPageSize(pageSize uint32) *Database {
-	image, err := newSnapshot().ToImage(pageSize, 0)
+// first commit publishes txid 1 into the alternate meta slot. env is the handle's Environment.
+func newInMemoryWithPageSize(pageSize uint32, env *Environment) *Database {
+	image, err := newSnapshot(env).ToImage(pageSize, 0)
 	if err != nil {
 		panic("an empty in-memory image always serializes: " + err.Error())
 	}
-	e, err := loadEngine(image)
+	e, err := loadEngine(image, env)
 	if err != nil {
 		panic("an empty in-memory image always loads: " + err.Error())
 	}
@@ -1617,7 +1619,6 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 		return nil, err
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
-	c.extensions = opts.Extensions // frozen at open, shared into every session (§7)
 	c.storage.budget.limit = opts.MaxStorageBytes
 	return databaseOver(c), nil
 }
@@ -1626,6 +1627,18 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 func databaseOver(c *sharedCore) *Database {
 	return &Database{core: c}
 }
+
+// Environment returns the handle's Environment (spec/design/environment.md §6) — the one every
+// session, attachment, and temp domain of this database uses.
+func (s *Database) Environment() *Environment { return s.core.env }
+
+// LoadedCollations introspects the handle Environment's loaded collation set (collation.md §4.2),
+// ascending by name. C is built in and not listed.
+func (s *Database) LoadedCollations() []collationInfo { return s.core.env.LoadedCollations() }
+
+// LoadedTimeZones introspects the handle Environment's loaded zone set (timezones.md §3.3),
+// ascending by name. UTC and fixed offsets are built in and not listed.
+func (s *Database) LoadedTimeZones() []timeZoneInfo { return s.core.env.LoadedTimeZones() }
 
 // Version is the committed version currently published (the monotonic commit counter,
 // transactions.md §8). Advances by 1 on every WriteHandle.Commit.
@@ -1708,7 +1721,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			}
 		}
 		// Through main's file host (filehost.go), so the simulated filesystem serves attachments too.
-		e, err := openVia(db.core.storage.fileHost(), real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone})
+		e, err := openVia(db.core.storage.fileHost(), real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone, Environment: db.core.env})
 		if coordinator != nil {
 			coordinator.unlockCommit()
 		}
@@ -1763,7 +1776,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		// seam session-local temp uses — a snapshot's storePaging is "the paging new stores bind to").
 		st = newAttachedStorage(c.pageSize())
 		st.budget.limit = source.maxStorageBytes
-		empty := newSnapshot()
+		empty := newSnapshot(c.env)
 		empty.storePaging = st.paging
 		root = empty
 	}
@@ -1942,7 +1955,7 @@ func (s *Database) committedEngine() *engine {
 	return &engine{
 		committed: rt.committed,
 		pageSize:  s.core.pageSize(),
-		session:   newSession(),
+		session:   newSession(s.core.env),
 	}
 }
 
@@ -2006,9 +2019,8 @@ func (s *Database) ReadSession() *Session {
 	snap := rt.committed
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession()}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession(s.core.env)}
 	engine.core = s.core
-	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
 	refresh := s.core.hasSharedCoordinator()
@@ -2035,9 +2047,8 @@ func (s *Database) WriteSession() *Session {
 	rt := s.core.roots.Load()
 	base := rt.committed
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession()}
+	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSession(s.core.env)}
 	engine.core = s.core
-	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
 	_, _ = engine.beginTx(true, true)
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, planEpoch: s.core.planEpoch.Load()}
@@ -2055,9 +2066,8 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
 	if s.core.readOnlyMode() {
 		rt, v := s.core.pinLatest()
-		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts)}
+		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts, s.core.env)}
 		engine.core = s.core
-		engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
 		refresh := s.core.hasSharedCoordinator()
@@ -2065,9 +2075,8 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts)}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spill: s.core.storage.spill, session: newSessionWithOptions(opts, s.core.env)}
 	engine.core = s.core
-	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid, planEpoch: s.core.planEpoch.Load()}
 }
@@ -2721,6 +2730,9 @@ func (s *Session) Collations() []collationInfo { return s.engine.Collations() }
 // LoadedCollations are the host-loaded collations currently in effect (collation.md §9).
 func (s *Session) LoadedCollations() []collationInfo { return s.engine.LoadedCollations() }
 
+// LoadedTimeZones are the host-loaded time zones currently in effect (timezones.md §3.3).
+func (s *Session) LoadedTimeZones() []timeZoneInfo { return s.engine.LoadedTimeZones() }
+
 // SetDefaultCollation sets the per-database default collation for new text columns (collation.md §4);
 // 2C000 for an unknown collation. The default is committed snapshot state (persisted as the is_default
 // flag), so outside a block this COMMITS — take the gate, re-pin the latest committed, set, publish —
@@ -2812,13 +2824,8 @@ func (s *Session) SetTimeZone(zone string) error { return s.engine.session.SetTi
 // range. Value.Render stays the zone-free (UTC) canonical form.
 func (s *Session) Render(v Value) (string, error) { return v.renderIn(s.engine.session.timeZone) }
 
-// SetRandomSource / ClearRandomSource — the uuid-generator entropy seam (entropy.md §6).
-func (s *Session) SetRandomSource(f RandomSource) { s.engine.session.seam.SetRandom(f) }
-func (s *Session) ClearRandomSource()             { s.engine.session.seam.ClearRandom() }
-
-// SetClockSource / ClearClockSource — the uuidv7 / clock-function clock seam (entropy.md §6).
-func (s *Session) SetClockSource(f ClockSource) { s.engine.session.seam.SetClock(f) }
-func (s *Session) ClearClockSource()            { s.engine.session.seam.ClearClock() }
+// Environment returns the Environment of this session's database handle (environment.md §6).
+func (s *Session) Environment() *Environment { return s.engine.session.env }
 
 // ResetPrivileges resets this session's authorization envelope to fully permissive (every table
 // privilege, DDL + temp-DDL allowed) — the RESET-style hook for the privilege envelope (§5.3).

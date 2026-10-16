@@ -42,7 +42,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   columns / host functions register into (CLAUDE.md §13).
 - [timezones.md](timezones.md) — time zones for `timestamptz` (design decided, not yet built):
   the **host-loaded `JTZ` bundle** (manifest + per-zone **RFC 8536 TZif** sections + alias links,
-  byte format in [../tz/README.md](../tz/README.md)), the privileged `db.LoadTimeZoneData` seam, the
+  byte format in [../tz/README.md](../tz/README.md)), the privileged `LoadTimeZoneData` environment-builder seam, the
   per-core TZif reader, and the single `AT TIME ZONE` consumer — copying collation's host-load model.
   `timestamptz` is UTC, so plain column indexes need no timezone data. Derived expressions
   use the persisted pins and rebuild contract in [index-dependencies.md](index-dependencies.md).
@@ -122,7 +122,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   `now()`/`current_timestamp`/`clock_timestamp()`, kept deterministic-given-the-seam.
 - [environment.md](environment.md) — one explicit `Environment` holding every outside input except
   storage (Unicode/time-zone data, host functions, entropy, clock), immutable once built, replacing
-  process-global loaded data and per-handle setters (**UNRATIFIED PROPOSAL**).
+  process-global loaded data and per-handle setters (landed).
 - [cli.md](cli.md) — the `jed` CLI host program: the TUI + script runner, output formats, CSV
   import, `--dump`, and `--readonly` (a host of the engine, not a core).
 - [benchmarks.md](benchmarks.md) — the wall-clock benchmark harness comparing the three cores

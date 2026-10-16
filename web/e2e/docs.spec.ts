@@ -778,12 +778,12 @@ test('the host-functions API page wires up the idiomatic example for each langua
   page
 }) => {
   await page.goto('/docs/api/host-functions/');
-  // Default (Rust): build an ExtensionRegistry and register a HostFunction.
+  // Default (Rust): build an Environment and register a HostFunction.
   await expect(page.getByTestId('code-rust')).toBeVisible();
-  await expect(page.getByTestId('code-rust')).toContainText('ExtensionRegistry');
+  await expect(page.getByTestId('code-rust')).toContainText('Environment::builder');
   await expect(page.getByTestId('code-rust')).toContainText('register_function');
 
-  // Go: NewHostFunction + RegisterFunction on the registry.
+  // Go: NewHostFunction + RegisterFunction on the environment builder.
   await page.getByTestId('lang-go').click();
   await expect(page.getByTestId('code-go')).toContainText('NewHostFunction');
   await expect(page.getByTestId('code-go')).toContainText('RegisterFunction');

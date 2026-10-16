@@ -9,6 +9,8 @@
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: query.select, query.select_no_from, types.timestamp, types.timestamptz, types.interval, expr.date_trunc, expr.at_time_zone, session.timezone
 
+# load-timezone: America/New_York
+
 # ============================================================================================
 # timestamp (zone-free): truncate the stored wall clock
 # ============================================================================================

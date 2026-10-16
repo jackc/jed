@@ -938,12 +938,15 @@ impl RExpr {
                     }
                     _ => (crate::jsonpath::Vars::None, true),
                 };
-                let Some((node, compiled)) = jsonpath_operands(&vals[0], &vals[1], m)? else {
+                let casing = env.exec.session.env.property();
+                let Some((node, compiled)) = jsonpath_operands(&vals[0], &vals[1], casing, m)?
+                else {
                     return Ok(Value::Null);
                 };
                 let opts = crate::jsonpath::EvalOpts {
                     exists: matches!(kind, JsonPathFnKind::Exists | JsonPathFnKind::ExistsSilent),
                     vars,
+                    casing,
                 };
                 let (seq, errored) = if silent {
                     crate::jsonpath::eval_silent(&compiled, &node, opts, m)?
@@ -1016,7 +1019,8 @@ impl RExpr {
                 // Reading a `json` context as jsonb (a `\u0000` / unpaired surrogate raises) is the
                 // context's conversion, not path evaluation, so ON ERROR does not catch it — as in
                 // PostgreSQL (json.md §4.2).
-                let Some((node, compiled)) = jsonpath_operands(&cv, &pv, m)? else {
+                let casing = env.exec.session.env.property();
+                let Some((node, compiled)) = jsonpath_operands(&cv, &pv, casing, m)? else {
                     return Ok(Value::Null);
                 };
                 // The PASSING values, evaluated after the context and path (as in PostgreSQL) and
@@ -1025,6 +1029,7 @@ impl RExpr {
                 // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR;
                 // anything else (a cost abort, a missing variable, etc.) propagates.
                 let opts = crate::jsonpath::EvalOpts {
+                    casing,
                     exists: matches!(kind, JsonSqlKind::Exists),
                     vars: crate::jsonpath::Vars::Passing {
                         vars: &vars,
@@ -1175,7 +1180,7 @@ impl RExpr {
                 // ILIKE: simple-lowercase both sides under the engine casing regime (collation.md
                 // §16) before matching — 1:1 folding so `_`/length semantics survive.
                 let matched = if *insensitive {
-                    let prop = crate::collation::loaded_property();
+                    let prop = env.exec.session.env.property();
                     let p_ref = prop.as_deref();
                     let s = crate::collation::fold_lower_simple(s, p_ref);
                     let p = crate::collation::fold_lower_simple(p, p_ref);
@@ -1210,7 +1215,7 @@ impl RExpr {
                 // §16). The subject is folded here; the constant pattern was folded at resolve, a
                 // non-constant pattern is folded below before compiling.
                 let prop = if *insensitive {
-                    crate::collation::loaded_property()
+                    env.exec.session.env.property()
                 } else {
                     None
                 };
@@ -1415,7 +1420,7 @@ impl RExpr {
                 // when case-insensitive — same length, so offsets carry over, regex.md §8).
                 let orig_chars: Vec<char> = source.chars().collect();
                 let prop = if insensitive {
-                    crate::collation::loaded_property()
+                    env.exec.session.env.property()
                 } else {
                     None
                 };
@@ -1525,7 +1530,7 @@ impl RExpr {
                 match arg.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Text(s) => {
-                        let prop = crate::collation::loaded_property();
+                        let prop = env.exec.session.env.property();
                         Ok(Value::Text(crate::collation::fold_case(
                             &s,
                             *upper,
@@ -1566,7 +1571,7 @@ impl RExpr {
                         Value::Timestamp(micros)
                     });
                 }
-                let zr = crate::timezone::resolve_zone(zone_str).ok_or_else(|| {
+                let zr = env.exec.session.env.resolve_zone(zone_str).ok_or_else(|| {
                     EngineError::new(
                         SqlState::InvalidParameterValue,
                         format!("time zone \"{zone_str}\" not recognized"),
@@ -1623,7 +1628,7 @@ impl RExpr {
                         // Truncate in the explicit zone (3-arg) or the session zone (2-arg).
                         let zr = match &zv {
                             Some(Value::Text(s)) => {
-                                crate::timezone::resolve_zone(s).ok_or_else(|| {
+                                env.exec.session.env.resolve_zone(s).ok_or_else(|| {
                                     EngineError::new(
                                         SqlState::InvalidParameterValue,
                                         format!("time zone \"{s}\" not recognized"),
@@ -1802,7 +1807,7 @@ impl RExpr {
                 // A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the
                 // injection seam. The kernel is reached BY ID through the frozen registry — the path
                 // a compiled `match` on the closed `ScalarFunc` enum cannot offer a host.
-                let hf = env.exec.session.extensions.function(*id);
+                let hf = env.exec.session.env.functions().function(*id);
                 // The declared static cost (cost.md §6 design (a)), charged once per call; arguments
                 // charge their own. Guard immediately after (the size-scaled-charge discipline,
                 // cost.md §3) so a large declared weight aborts BEFORE the kernel runs.
@@ -2281,7 +2286,7 @@ impl RExpr {
                                 Value::Text(s) => s.as_str(),
                                 _ => unreachable!("resolver restricts the timezone arg to text"),
                             };
-                            crate::timezone::resolve_zone(zone_str).ok_or_else(|| {
+                            env.exec.session.env.resolve_zone(zone_str).ok_or_else(|| {
                                 EngineError::new(
                                     SqlState::InvalidParameterValue,
                                     format!("time zone \"{zone_str}\" not recognized"),
@@ -2489,13 +2494,13 @@ impl RExpr {
                     // NULL-arg case (uuidv7(NULL)) already returned NULL above.
                     ScalarFunc::Uuidv4 => {
                         let mut r = env.rng.get();
-                        let b = r.uuid_v4(&env.exec.session.seam)?;
+                        let b = r.uuid_v4(&env.exec.session.env)?;
                         env.rng.set(r);
                         Ok(Value::Uuid(b))
                     }
                     ScalarFunc::Uuidv7 => {
                         let mut r = env.rng.get();
-                        let clock = r.statement_clock_micros(&env.exec.session.seam);
+                        let clock = r.statement_clock_micros(&env.exec.session.env);
                         // The optional interval arg shifts the embedded instant via the existing
                         // calendar-aware timestamptz arithmetic (entropy.md §4).
                         let shifted = match vals.first() {
@@ -2507,7 +2512,7 @@ impl RExpr {
                             }
                             None => clock,
                         };
-                        let b = r.uuid_v7(&env.exec.session.seam, shifted)?;
+                        let b = r.uuid_v7(&env.exec.session.env, shifted)?;
                         env.rng.set(r);
                         Ok(Value::Uuid(b))
                     }
@@ -2516,13 +2521,13 @@ impl RExpr {
                     // call (VOLATILE). Both return the seam's micros directly as timestamptz.
                     ScalarFunc::Now => {
                         let mut r = env.rng.get();
-                        let micros = r.statement_clock_micros(&env.exec.session.seam);
+                        let micros = r.statement_clock_micros(&env.exec.session.env);
                         env.rng.set(r);
                         Ok(Value::Timestamptz(micros))
                     }
                     ScalarFunc::ClockTimestamp => {
                         let r = env.rng.get();
-                        let micros = r.clock_now_micros(&env.exec.session.seam);
+                        let micros = r.clock_now_micros(&env.exec.session.env);
                         Ok(Value::Timestamptz(micros))
                     }
                     // Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an

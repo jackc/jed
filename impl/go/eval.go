@@ -1258,7 +1258,7 @@ func dateClockValue(exec *engine, rng *stmtRng, m *costMeter, offsetDays int64) 
 	if err := m.Guard(); err != nil {
 		return Value{}, err
 	}
-	clock := rng.statementClockMicros(&exec.session.seam)
+	clock := rng.statementClockMicros(exec.session.env)
 	// An injected extreme clock can shift past the timestamp range: 22008, like the day bound.
 	local, ok := instantToLocalMicros(zr, clock)
 	if !ok {
@@ -2098,7 +2098,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16)
 		// before matching — 1:1 folding so _/length semantics survive.
 		if e.insensitive {
-			prop := loadedProperty()
+			prop := env.exec.session.env.propertyTable()
 			sub = foldLowerSimple(sub, prop)
 			pat = foldLowerSimple(pat, prop)
 		}
@@ -2129,7 +2129,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// ~* (insensitive): simple-lowercase the subject under the engine casing regime
 			// (collation.md §16). The constant pattern was folded at resolve; a non-constant pattern
 			// is folded below before compiling.
-			prop = loadedProperty()
+			prop = env.exec.session.env.propertyTable()
 			sub = foldLowerSimple(sub, prop)
 		}
 		subjRunes := []rune(sub)
@@ -2290,7 +2290,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		matchRunes := origRunes
 		var prop *propertyTable
 		if insensitive {
-			prop = loadedProperty()
+			prop = env.exec.session.env.propertyTable()
 			matchRunes = []rune(foldLowerSimple(source, prop))
 		}
 		var prog *regexProgram
@@ -2412,7 +2412,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
-		return TextValue(foldCase(v.str(), e.casingUpper, loadedProperty())), nil
+		return TextValue(foldCase(v.str(), e.casingUpper, env.exec.session.env.propertyTable())), nil
 	case reAtTimeZone:
 		m.Charge(costs.OperatorEval)
 		zv, err := e.lhs.eval(row, env, m)
@@ -2438,7 +2438,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return TimestampValue(micros), nil
 		}
-		zr, ok := ResolveZone(zv.str())
+		zr, ok := env.exec.session.env.resolveZone(zv.str())
 		if !ok {
 			return Value{}, newError(InvalidParameterValue,
 				fmt.Sprintf("time zone %q not recognized", zv.str()))
@@ -2501,7 +2501,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			var zr ZoneRef
 			if zv != nil {
-				z, ok := ResolveZone(zv.str())
+				z, ok := env.exec.session.env.resolveZone(zv.str())
 				if !ok {
 					return Value{}, newError(InvalidParameterValue,
 						fmt.Sprintf("time zone %q not recognized", zv.str()))
@@ -2693,7 +2693,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the injection
 		// seam. The kernel is reached BY ID through the frozen registry — the path the compiled
 		// scalarFunc switch cannot offer a host.
-		hf := env.exec.session.extensions.function(e.index)
+		hf := env.exec.session.env.hosts.function(e.index)
 		// The declared static cost (cost.md §6 design (a)), charged once per call; arguments charge
 		// their own. Guard immediately after (the size-scaled-charge discipline) so a large declared
 		// weight aborts BEFORE the kernel runs.
@@ -2837,7 +2837,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			var zr ZoneRef
 			if len(vals) == 7 {
-				z, ok := ResolveZone(vals[6].str())
+				z, ok := env.exec.session.env.resolveZone(vals[6].str())
 				if !ok {
 					return Value{}, newError(InvalidParameterValue,
 						fmt.Sprintf("time zone %q not recognized", vals[6].str()))
@@ -3022,13 +3022,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfUuidv4:
 			// uuid generators (spec/design/entropy.md §3): draw from the per-statement seam
 			// (env.rng), advancing the PRNG/counter. The NULL-arg case is handled above.
-			b, err := env.rng.uuidV4(&env.exec.session.seam)
+			b, err := env.rng.uuidV4(env.exec.session.env)
 			if err != nil {
 				return Value{}, err
 			}
 			return UuidValue(b), nil
 		case sfUuidv7:
-			clock := env.rng.statementClockMicros(&env.exec.session.seam)
+			clock := env.rng.statementClockMicros(env.exec.session.env)
 			shifted := clock
 			if len(vals) == 1 {
 				// The optional interval arg shifts the embedded instant via the existing
@@ -3039,7 +3039,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				shifted = s
 			}
-			b, err := env.rng.uuidV7(&env.exec.session.seam, shifted)
+			b, err := env.rng.uuidV7(env.exec.session.env, shifted)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3048,9 +3048,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// current-time functions (spec/design/entropy.md §5): now() reads the statement clock
 			// ONCE and reuses it (STABLE); clock_timestamp() reads the seam on every call
 			// (VOLATILE). Both return the seam's micros directly as timestamptz.
-			return TimestamptzValue(env.rng.statementClockMicros(&env.exec.session.seam)), nil
+			return TimestamptzValue(env.rng.statementClockMicros(env.exec.session.env)), nil
 		case sfClockTimestamp:
-			return TimestamptzValue(env.rng.clockNowMicros(&env.exec.session.seam)), nil
+			return TimestamptzValue(env.rng.clockNowMicros(env.exec.session.env)), nil
 		case sfNextval:
 			// Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an
 			// additional sequence_advance unit (the catalog-tuple read+rewrite) and mutates the
@@ -4121,7 +4121,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			vars = jpObjectVars(varsNode)
 			silent = vals[3].boolVal()
 		}
-		opts := jpEvalOpts{exists: e.jpFnKind == jpfExists || e.jpFnKind == jpfExistsSilent, vars: vars}
+		opts := jpEvalOpts{exists: e.jpFnKind == jpfExists || e.jpFnKind == jpfExistsSilent, vars: vars, prop: env.exec.session.env.propertyTable()}
 		seq, ok, errored, err := evalJsonpath(vals[0], vals[1], opts, silent, m)
 		if err != nil {
 			return Value{}, err
@@ -4191,7 +4191,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		compiled, err := compileMetered(pv.str(), m)
+		compiled, err := compileMetered(pv.str(), m, env.exec.session.env.propertyTable())
 		if err != nil {
 			return Value{}, err
 		}

@@ -87,6 +87,30 @@ browser — the same engine, no file. Create one by calling the unified create c
 `Database::create(CreateOptions::default())` (Rust), `jed.CreateDatabase(jed.CreateOptions{})` (Go), or
 `createDatabase({})` (TypeScript).
 
+## The environment
+
+Everything a database takes from outside the engine, except its storage, arrives in one immutable
+**`Environment`** passed in the open/create options: the Unicode collation and casing data, the
+time-zone data, [host functions](../host-functions/), and the random and clock sources behind
+`uuidv4`/`uuidv7` and `now()`. Build it once with a builder and pass the same environment to every
+database that should share those inputs; omit it and the database gets a fresh, empty one (`C`
+collation and ASCII casing, `UTC` and fixed offsets, no host functions, OS randomness, the wall
+clock).
+
+```rust
+let env = jed::Environment::builder()
+    .load_unicode_data(&std::fs::read("unicode.jucd")?)?
+    .load_time_zone_data(&std::fs::read("tzdata.jtz")?)?
+    .build();
+let db = Database::open_with_options(path, OpenOptions { environment: env.clone(), ..Default::default() })?;
+```
+
+An environment cannot change once built, so a database's inputs never shift while it is open, and two
+libraries or tests in one process cannot interfere through it. To vary one input, derive a new
+environment with `env.to_builder()` (Go `env.ToBuilder()`, TypeScript `env.toBuilder()`), which shares
+everything you don't replace. For reproducible tests, install a seeded random source and a manual
+clock, keep a reference to them, and reseed or set them between cases.
+
 ## Running untrusted queries
 
 jed's built-in surface is pure: SQL cannot access the filesystem, network, processes, or

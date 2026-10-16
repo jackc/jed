@@ -8,9 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::environment::Environment;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Engine, Snapshot};
-use crate::extension::ExtensionRegistry;
 use crate::filehost::FileHost;
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
@@ -65,11 +65,12 @@ pub struct CreateOptions {
     pub skip_fsync: bool,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
-    /// Host extensions to register on this database (spec/design/extensibility.md §7): scalar
-    /// functions the host supplies, **frozen** for the handle's lifetime and shared into every
-    /// session. Default empty (no extensions). Not stored in the file — a host reopens with its own
-    /// registry (the ephemeral, no-persisted-use rule of §14 step 3).
-    pub extensions: Arc<ExtensionRegistry>,
+    /// The environment this database runs in (spec/design/environment.md): the loaded Unicode and
+    /// time-zone data, the host functions, and the random and clock sources. One per handle — its
+    /// attachments, temp domains, and every session use it. The default is a fresh empty environment
+    /// (built-in `C` collation and ASCII casing, `UTC` and fixed offsets, no host functions, OS
+    /// randomness, the wall clock). Not stored in the file — a reopening host brings its own.
+    pub environment: Environment,
     /// The committed-storage limit in bytes (spec/design/memory.md §8): a commit that would grow the
     /// database past it fails `54P06`. An in-memory database measures its page high-water
     /// (`page_count × page_size`, §8.2), a file-backed one its live pages (`live_pages × page_size`,
@@ -86,7 +87,7 @@ impl Default for CreateOptions {
             skip_fsync: false,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
-            extensions: Arc::new(ExtensionRegistry::default()),
+            environment: Environment::default(),
             max_storage_bytes: 0,
         }
     }
@@ -96,7 +97,7 @@ impl Default for CreateOptions {
 /// [`DatabaseOptions`] (create-time, fixed into the file), these are **handle** settings — not stored
 /// in the file, so a different host may reopen the same file with different ones.
 ///
-/// No longer `Copy` since it carries the host extension registry (`Arc`); still cheap to `Clone`.
+/// Not `Copy` since it carries the environment (an `Arc`); still cheap to `Clone`.
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     /// The buffer-pool budget **in bytes**: roughly the maximum memory the resident leaf cache holds
@@ -127,11 +128,12 @@ pub struct OpenOptions {
     pub skip_fsync: bool,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
-    /// Host extensions to register on this handle (spec/design/extensibility.md §7): scalar functions
-    /// the host supplies, **frozen** for the handle's lifetime. A handle setting like the rest — not
-    /// stored in the file, so a reopening host brings its own (§14 step 3: no persisted use). Default
-    /// empty.
-    pub extensions: Arc<ExtensionRegistry>,
+    /// The environment this handle runs in (spec/design/environment.md): the loaded Unicode and
+    /// time-zone data, the host functions, and the random and clock sources. The file's collation
+    /// references resolve against it at open (a collation it does not provide is `XX002`). One per
+    /// handle — attachments, temp domains, and every session use it. The default is a fresh empty
+    /// environment. A handle setting like the rest — not stored in the file.
+    pub environment: Environment,
     /// The committed-storage limit in bytes over the file's live pages (spec/design/memory.md §8.7):
     /// a commit that would grow `live_pages × page_size` past it fails `54P06`. Zero or negative is
     /// unlimited (the default). A handle setting, not stored in the file;
@@ -148,7 +150,7 @@ impl Default for OpenOptions {
             skip_fsync: false,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
-            extensions: Arc::new(ExtensionRegistry::default()),
+            environment: Environment::default(),
             max_storage_bytes: 0,
         }
     }
@@ -242,7 +244,7 @@ impl Engine {
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
-        let mut db = Engine::open_paged(pager, capacity)?;
+        let mut db = Engine::open_paged(pager, capacity, &opts.environment)?;
         db.path = Some(path.to_path_buf());
         db.spill = default_spill_host();
         db.read_only = opts.read_only;

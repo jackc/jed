@@ -57,7 +57,7 @@ fn range_image_roundtrip() {
     run(&mut db, "INSERT INTO t VALUES (4, '(,)', '(5,)')"); // canonical [6,)
     run(&mut db, "INSERT INTO t VALUES (5, NULL, '[1,1]')"); // canonical [1,2)
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .expect("load image")
         .session(SessionOptions::default());
     assert_eq!(

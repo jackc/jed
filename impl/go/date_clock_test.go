@@ -10,12 +10,20 @@ package jed
 
 import "testing"
 
-// clockDB builds a session over `stmts` with a FIXED injected clock (µs since the epoch).
-func clockDB(t *testing.T, micros int64, stmts ...string) *Session {
+// clockDB builds a session over `stmts` whose environment has a MANUAL clock (µs since the epoch),
+// returned so a test can move it.
+func clockDB(t *testing.T, micros int64, stmts ...string) (*Session, *ManualClock) {
 	t.Helper()
-	db := dbWith(t, stmts...)
-	db.SetClockSource(FixedClock(micros))
-	return db
+	clock := NewManualClock(micros)
+	b := NewEnvironmentBuilder()
+	b.SetClockSource(clock)
+	db := memDBIn(b.Build()).Session(SessionOptions{})
+	for _, s := range stmts {
+		if _, err := queryOutcome(db, s, nil); err != nil {
+			t.Fatalf("setup %q: %v", s, err)
+		}
+	}
+	return db, clock
 }
 
 // 2024-07-15 23:30:00 UTC — half an hour before a UTC midnight, so a positive-offset session
@@ -36,7 +44,7 @@ func dateAt(t *testing.T, db *Session, expr string) string {
 
 func TestDateClockUsesSessionZone(t *testing.T) {
 	t.Parallel()
-	db := clockDB(t, nearMidnightUTC)
+	db, _ := clockDB(t, nearMidnightUTC)
 	// Default UTC session: still 2024-07-15.
 	if d := dateAt(t, db, "'today'::date"); d != "2024-07-15" {
 		t.Fatalf("UTC today = %s", d)
@@ -65,12 +73,12 @@ func TestDateClockDefaultNeverFolds(t *testing.T) {
 	t.Parallel()
 	// The DEFAULT is created under clock A; an INSERT under clock B (a day later) must see B's
 	// day — a CREATE-TABLE-folded constant (PostgreSQL's behavior) could not. Same handle.
-	db := clockDB(t, nearMidnightUTC,
+	db, clock := clockDB(t, nearMidnightUTC,
 		"CREATE TABLE d (id i32 PRIMARY KEY, dt date DEFAULT 'today')")
 	if _, err := queryOutcome(db, "INSERT INTO d (id) VALUES (1)", nil); err != nil {
 		t.Fatal(err)
 	}
-	db.SetClockSource(FixedClock(nearMidnightUTC + 86_400_000_000))
+	clock.Advance(86_400_000_000)
 	if _, err := queryOutcome(db, "INSERT INTO d (id) VALUES (2)", nil); err != nil {
 		t.Fatal(err)
 	}

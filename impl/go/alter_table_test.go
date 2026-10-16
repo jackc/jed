@@ -107,7 +107,7 @@ func TestRenameRewriteQuotesTheSubstitutedName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}

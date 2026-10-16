@@ -1,4 +1,5 @@
 import type { TimeZoneDeps } from "./catalog.ts";
+import type { Environment } from "./environment.ts";
 import type { InputZone } from "./timezone.ts";
 import { noteIndexZone } from "./index_dependencies.ts";
 import { noteParamType } from "./plan_params.ts";
@@ -1664,8 +1665,8 @@ export class ParamTypes {
   nonimmutable = false;
   indexContext = false;
   timezoneDeps: TimeZoneDeps = { dynamic: false, zones: [] };
-  noteIndexZone(node: RExpr): void {
-    if (this.indexContext) noteIndexZone(this.timezoneDeps, node);
+  noteIndexZone(node: RExpr, env: Environment): void {
+    if (this.indexContext) noteIndexZone(this.timezoneDeps, node, env);
   }
 
   // noteInputZone records a resolve-time literal fold that read an offset-less timestamptz in the

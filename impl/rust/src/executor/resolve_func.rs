@@ -401,7 +401,7 @@ pub(crate) fn resolve_func_call(
     // A built-in scalar function OR a host-registered one (extensibility.md §4.2 — a host-only name
     // routes here too; `resolve_scalar_func` tries the built-in catalog first, then the host
     // registry). Host functions are positional-only, so `reject_named` applies to them as well.
-    if is_scalar_func_name(&lname) || scope.catalog.session.extensions.has_function(&lname) {
+    if is_scalar_func_name(&lname) || scope.catalog.session.env.functions().has_function(&lname) {
         reject_named(&lname, arg_names)?;
         return resolve_scalar_func(scope, &lname, args, star, agg, params);
     }
@@ -480,7 +480,7 @@ pub(crate) fn resolve_regex_func(
     let program = match (&rargs[1], insensitive) {
         (RExpr::ConstText(pat), Some(insensitive)) => {
             let pat = if insensitive {
-                let prop = crate::collation::loaded_property();
+                let prop = scope.catalog.session.env.property();
                 crate::regex::fold_pattern(pat, prop.as_deref())
             } else {
                 pat.clone()
@@ -774,7 +774,7 @@ pub(crate) fn resolve_make_timestamp(
     }
     if is_tz {
         if rargs.len() == 7 {
-            params.note_index_zone(&rargs[6])?;
+            params.note_index_zone(&rargs[6], &scope.catalog.session.env)?;
         } else {
             params.nonimmutable = true;
         }
@@ -964,7 +964,7 @@ fn resolve_host_scalar(
     name: &str,
     tys: &[ResolvedType],
 ) -> Option<(usize, ScalarType)> {
-    let registry = &scope.catalog.session.extensions;
+    let registry = scope.catalog.session.env.functions();
     let mut arg_scalars = Vec::with_capacity(tys.len());
     for t in tys {
         arg_scalars.push(resolved_to_scalar(t)?);
@@ -4404,7 +4404,13 @@ fn resolve_node(
                 // A string literal adapts to a jsonpath context (a jsonpath function argument) — it is
                 // compiled to a path at resolve (jsonpath.md §1); malformed → 42601.
                 Some(ScalarType::JsonPath) => Ok((
-                    RExpr::ConstJsonPath(crate::jsonpath::JsonPath::compile(s)?.render()),
+                    RExpr::ConstJsonPath(
+                        crate::jsonpath::JsonPath::compile(
+                            s,
+                            scope.catalog.session.env.property(),
+                        )?
+                        .render(),
+                    ),
                     ResolvedType::JsonPath,
                 )),
                 _ => Ok((RExpr::ConstText(s.clone()), ResolvedType::Text)),
@@ -5562,7 +5568,7 @@ fn resolve_node(
             let program = if let RExpr::ConstText(pat) = &rr {
                 let folded;
                 let pat_ref = if *insensitive {
-                    let prop = crate::collation::loaded_property();
+                    let prop = scope.catalog.session.env.property();
                     folded = crate::regex::fold_pattern(pat, prop.as_deref());
                     folded.as_str()
                 } else {

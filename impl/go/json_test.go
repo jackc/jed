@@ -107,7 +107,7 @@ func TestInvalidJSONCastSourceIs42804(t *testing.T) {
 // fresh cursor off the gathered chain). The rendered canonical form is preserved exactly.
 func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
 	t.Parallel()
-	db := newInMemoryWithPageSize(4096).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(4096, NewEnvironment()).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	// A ~6000-byte string node — far above RECORD_MAX (~2034 at page 4096) — forces a spill.
 	big := strings.Repeat("a", 6000)
@@ -119,7 +119,7 @@ func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("load image: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
 // input bytes EXACTLY (insignificant whitespace included — the json verbatim contract, §4).
 func TestLargeJsonSpillsVerbatim(t *testing.T) {
 	t.Parallel()
-	db := newInMemoryWithPageSize(4096).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(4096, NewEnvironment()).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
 	// Verbatim text with irregular internal spacing, padded past RECORD_MAX.
 	pad := strings.Repeat(" ", 6000)
@@ -152,7 +152,7 @@ func TestLargeJsonSpillsVerbatim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("load image: %v", err)
 	}
@@ -167,14 +167,14 @@ func TestLargeJsonSpillsVerbatim(t *testing.T) {
 // value codec decodes back to the canonical render.
 func TestJsonbAllNodeKindsRoundTrip(t *testing.T) {
 	t.Parallel()
-	db := newInMemoryWithPageSize(4096).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(4096, NewEnvironment()).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, false, null], \"c\": \"x\"}')")
 	image, err := db.ToImage(4096, 1)
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("load image: %v", err)
 	}

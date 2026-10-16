@@ -213,7 +213,7 @@ type foreignKey struct {
 // hostFuncDep is a HOST-FUNCTION DEPENDENCY persisted with an index whose key/predicate expression
 // calls a host scalar function (spec/design/extensibility.md §8.1, format_version 31, delivery step
 // 4). One entry per DISTINCT host-function signature the index's expressions reference; it is the
-// RESOLVED dependency the file records so a reopening binary can detect that the registry now supplies
+// RESOLVED dependency the file records so a reopening binary can detect that its environment now supplies
 // a DIFFERENT implementation (a mismatch makes the index unusable — skipped for reads, refused for
 // writes — never a silent stale-key read). Sorted by (Name, ArgTypes) when stored so registration
 // order never leaks (CLAUDE.md §8).

@@ -50,7 +50,7 @@ func TestRangeImageRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize image: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("load image: %v", err)
 	}

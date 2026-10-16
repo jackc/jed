@@ -491,6 +491,9 @@ func parseTimestamptz(s string, zone ZoneRef) (int64, error) {
 type inputZone struct {
 	zone      ZoneRef
 	consulted bool
+	// prop is the handle Environment's casing table (nil ⇒ ASCII) — the one text-input parse that
+	// needs it is a jsonpath literal, whose like_regex `i` flag folds its pattern at compile.
+	prop *propertyTable
 }
 
 // parseTimestamptz is the package parseTimestamptz in this zone, recording a zone consult for an

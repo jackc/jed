@@ -2303,9 +2303,18 @@ impl Engine {
         self.committed().to_image(page_size, txid)
     }
 
-    /// Reconstruct a database from an on-disk image (inverse of `to_image`). Returns
-    /// a structured `data_corrupted` (XX001) error for any malformed input.
+    /// Reconstruct a database from an on-disk image (inverse of `to_image`) over a fresh empty
+    /// environment. Returns a structured `data_corrupted` (XX001) error for any malformed input.
     pub fn from_image(image: &[u8]) -> Result<Engine> {
+        Engine::from_image_in(image, &crate::environment::Environment::default())
+    }
+
+    /// [`from_image`](Engine::from_image) over the environment `env` (spec/design/environment.md):
+    /// the image's collation references resolve against it.
+    pub(crate) fn from_image_in(
+        image: &[u8],
+        env: &crate::environment::Environment,
+    ) -> Result<Engine> {
         // B3 (bplus-reshape.md): the image becomes the engine's byte store — a `MemoryBlockStore`
         // read through the SAME demand-paged loader, pager, and Packed leaf path as a file (one
         // read path; the eager whole-image `read_tree` loader is gone). The pool is pinned
@@ -2320,7 +2329,7 @@ impl Engine {
         }
         let store = crate::blockstore::MemoryBlockStore::new(image.to_vec());
         let pager = Pager::from_store(Box::new(store))?;
-        Engine::open_paged(pager, usize::MAX)
+        Engine::open_paged(pager, usize::MAX, env)
     }
 
     /// Open a file-backed database **demand-paged** (spec/design/pager.md, P6.4b): load only the
@@ -2332,19 +2341,30 @@ impl Engine {
     /// the free-list), then discards it — memory stays bounded (only the skeleton is retained), but
     /// open is O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a
     /// deferred follow-on, pager.md §6); the residency win — a bounded *resident* set — already holds.
-    pub(crate) fn open_paged(pager: Pager, capacity: usize) -> Result<Engine> {
+    ///
+    /// The file's collation references resolve against `env`, which becomes the handle's environment
+    /// (spec/design/environment.md).
+    pub(crate) fn open_paged(
+        pager: Pager,
+        capacity: usize,
+        env: &crate::environment::Environment,
+    ) -> Result<Engine> {
         let page_size = pager.page_size() as usize;
         if !page_size_valid(page_size) {
             return Err(corrupt("invalid page size"));
         }
         let paging = SharedPaging::new(pager, capacity);
-        Self::open_shared_paging(paging)
+        Self::open_shared_paging(paging, env)
     }
 
     /// Reload the newest committed snapshot through an existing pager/pool. Shared-file participants
     /// use this after reading the two meta slots under `commit SH`; body pages remain immutable while
     /// co-resident, so the existing buffer pool is valid and only the catalog/interior skeleton changes.
-    pub(crate) fn open_shared_paging(paging: Arc<SharedPaging>) -> Result<Engine> {
+    /// Collation references resolve against `env`.
+    pub(crate) fn open_shared_paging(
+        paging: Arc<SharedPaging>,
+        env: &crate::environment::Environment,
+    ) -> Result<Engine> {
         let page_size = paging.pager().page_size() as usize;
         if !page_size_valid(page_size) {
             return Err(corrupt("invalid page size"));
@@ -2382,7 +2402,7 @@ impl Engine {
             selected.ok_or_else(|| corrupt("no complete valid meta page"))?
         };
 
-        let mut snap = Snapshot::default();
+        let mut snap = Snapshot::with_environment(env.clone());
         snap.txid = meta.txid;
         // v25: the free-list is read from the persisted chain (below), not reconstructed by a
         // reachability walk — so the catalog + skeleton load no longer tracks a `reached` set.
@@ -2435,7 +2455,7 @@ impl Engine {
                     // A collation snapshot (v17): the baked `.coll` artifact + an `is_default` flag
                     // (spec/design/collation.md §5). Registered directly; the default restores the
                     // per-database default collation.
-                    let (coll, is_default) = decode_collation_entry(page.payload, &mut pos)?;
+                    let (coll, is_default) = decode_collation_entry(page.payload, &mut pos, env)?;
                     if is_default {
                         snap.set_default_collation(Some(coll.name.clone()));
                     }
@@ -2587,6 +2607,7 @@ impl Engine {
         // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
         snap.rebuild_gist_trees()?;
         let mut db = Engine::new();
+        db.set_environment(env.clone());
         db.page_size = page_size as u32;
         db.page_count = meta.page_count;
         // v25: load the free-list directly from the persisted chain (meta offset 28) — no
@@ -5071,10 +5092,14 @@ fn collation_entry_bytes(coll: &Collation, is_default: bool) -> Vec<u8> {
 }
 
 /// Decode a collation reference entry's body (inverse of `collation_entry_bytes`); the caller has
-/// consumed the `entry_kind` byte. Reads the metadata, then resolves the compiled table from the
-/// binary's **vendored** set by name (§2/§9) — the table is no longer in the file. Returns the
-/// resolved collation and whether it is the per-database default (the `is_default` flag bit).
-fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, bool)> {
+/// consumed the `entry_kind` byte. Reads the metadata, then resolves the compiled table by name from
+/// the environment `env` the file is opened with (§2/§9) — the table is not in the file. Returns
+/// the resolved collation and whether it is the per-database default (the `is_default` flag bit).
+fn decode_collation_entry(
+    buf: &[u8],
+    pos: &mut usize,
+    env: &crate::environment::Environment,
+) -> Result<(Collation, bool)> {
     let flags = read_u8(buf, pos)?;
     if flags & !0b1 != 0 {
         return Err(corrupt("reserved collation flag set"));
@@ -5084,13 +5109,13 @@ fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, boo
     let unicode_version = read_string(buf, pos)?;
     let cldr_version = read_string(buf, pos)?;
     let description = read_string(buf, pos)?;
-    // The file records only the version PIN; the table comes from a loaded bundle (the host must have
-    // loaded one providing this collation before opening — collation.md §4/§9). A name no loaded
+    // The file records only the version PIN; the table comes from a loaded bundle (the environment the
+    // host opens the file with must provide this collation — collation.md §4/§9, environment.md). A name no loaded
     // bundle provides at all is the graded verdict's **legible refusal** (slice 2d, collation.md §12 /
     // compatibility.md §7): the open is refused with XX002 naming the collation + version, rather than
     // degrading the rest of the database (the conservative resolution of compatibility.md §12 open #3 —
     // a *version-skewed* collation, by contrast, opens and is enforced read-only at write time §14).
-    let loaded = crate::collation::loaded_collation(&name).ok_or_else(|| {
+    let loaded = env.collation(&name).ok_or_else(|| {
         EngineError::new(
             SqlState::CollationVersionMismatch,
             format!(
@@ -6591,8 +6616,8 @@ mod tests {
         // A file that references a collation NO loaded bundle provides is the graded verdict's
         // legible refusal (spec/design/collation.md §12, slice 2d): decoding the reference entry
         // fails with XX002 (collation_version_mismatch) naming it + its version, rather than the old
-        // bare 42704. "zz-absent-collation" is never in any bundle, so this is independent of the
-        // engine-global loaded set (no bundle load needed). A *version-skewed* collation, by
+        // bare 42704. "zz-absent-collation" is never in any bundle, so the empty environment serves
+        // (no bundle load needed). A *version-skewed* collation, by
         // contrast, decodes fine and is enforced read-only at write time (executor skew_tests).
         let coll = Collation {
             name: "zz-absent-collation".to_string(),
@@ -6604,8 +6629,8 @@ mod tests {
         };
         let bytes = collation_entry_bytes(&coll, false);
         let mut pos = 0;
-        let err =
-            decode_collation_entry(&bytes, &mut pos).expect_err("absent reference must refuse");
+        let err = decode_collation_entry(&bytes, &mut pos, &crate::Environment::default())
+            .expect_err("absent reference must refuse");
         assert_eq!(err.code(), "XX002");
         assert!(err.message.contains("zz-absent-collation"));
         assert!(err.message.contains("17.0.0/48"));

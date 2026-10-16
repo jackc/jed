@@ -17,7 +17,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 // Ce is one collation element — a weight triple plus a flags byte. 7 bytes on disk
@@ -687,116 +686,20 @@ func openCollation(bytes []byte) (*Collation, error) {
 	}, nil
 }
 
-// --- The engine-global loaded collation set (spec/design/collation.md §4/§9) --------------------
+// --- Loaded collations live on the Environment (spec/design/environment.md) -------------------
 //
 // The bare binary carries NO Unicode data — no embedded .coll, no casing tables (§9/§16, the SQLite
-// model). All collations arrive at runtime: a host hands the engine a JUCD bundle's bytes via
-// LoadUnicodeData (db.LoadUnicodeData), the engine merges its root + per-locale deltas (§5.1) and
-// adds the resulting collations here. This set is PROCESS-GLOBAL — a property of the running engine,
-// not of one Engine handle (the spec's "loaded set available to any database on this handle",
-// §4.2). Global is what lets a file REFERENCING a collation be opened after the bundle is loaded:
-// open resolves the referenced table from here (format.go), and open mints the handle, so the data
-// cannot live on the handle. "C" is never here (table-free, built in).
+// model). All collations arrive at runtime: a host hands an EnvironmentBuilder a JUCD bundle's bytes
+// (EnvironmentBuilder.LoadUnicodeData, environment.go), which merges its root + per-locale deltas
+// (§5.1) into the builder's set; the built Environment is passed to open/create, so a file
+// REFERENCING a collation resolves it against the handle's environment. "C" is never loaded
+// (table-free, built in).
 //
 // The bytes are jed's OWN pinned tables (byte-identical across cores, §9/§10), so loading restores
 // no nondeterminism — a use stays pure regardless of where the host sourced the bytes (file / fetch
 // / compiled-in asset). The real version-pinned production bundle is
 // spec/collation/fixtures/unicode.jucd (unicode = the CLDR-DUCET root, es = root + the Spanish ñ
 // tailoring); the dev-* fixtures are not part of it (they only drive the cross-core vectors).
-
-var (
-	loadedMu   sync.RWMutex
-	loadedColl = map[string]*Collation{}
-	// loadedProp is the engine-global Unicode property/casing table (spec/design/collation.md §16),
-	// nil until a bundle carrying a property section is loaded. Its presence is the binary "casing
-	// regime" the C/ASCII baseline flips on: nil ⇒ casing is ASCII-only, table-free, version-free.
-	// FIRST-WINS, like loadedColl.
-	loadedProp *propertyTable
-)
-
-// LoadUnicodeData loads a JUCD Unicode-data bundle into the engine-global loaded set
-// (spec/design/collation.md §4/§9): parse the bundle, merge the root + each per-locale delta (§5.1),
-// register every collation by name, and store the property/casing section (§16). ADDITIVE /
-// FIRST-WINS — a collation name already present is NOT replaced (the first bundle to provide it wins;
-// resolution is by name in load order, §4.2), and a property table is only stored if none is loaded
-// yet, so re-loading the same bundle is an idempotent no-op. A malformed bundle is XX001.
-//
-// This is the engine primitive behind db.LoadUnicodeData. Because the set is process-global it may
-// be called BEFORE opening any file (which is required: opening a file that references a collation
-// resolves its table from this set). Privileged host op — the engine reads no file path and reaches
-// no host data (§11); the host sources the bytes.
-func LoadUnicodeData(data []byte) error {
-	bundle, err := openBundle(data)
-	if err != nil {
-		return err
-	}
-	colls, prop, err := loadBundle(bundle)
-	if err != nil {
-		return err
-	}
-	loadedMu.Lock()
-	defer loadedMu.Unlock()
-	for _, c := range colls {
-		if _, ok := loadedColl[c.Name]; !ok {
-			loadedColl[c.Name] = c
-		}
-	}
-	if prop != nil && loadedProp == nil {
-		loadedProp = prop
-	}
-	return nil
-}
-
-// LoadedProperty returns the engine-global property/casing table, or nil if no bundle providing one
-// has been loaded (§16) — nil ⇒ the ASCII-casing baseline. The casing functions look this up ONCE per
-// evaluation and pass it to the pure kernels below, which keeps the un-loaded (ASCII) regime testable.
-func loadedProperty() *propertyTable {
-	loadedMu.RLock()
-	defer loadedMu.RUnlock()
-	return loadedProp
-}
-
-// LoadedCollation looks up a collation in the engine-global LOADED set by its exact (case-sensitive)
-// name (spec/design/collation.md §4/§9). nil ⇒ no loaded bundle provides it. "C" is never here
-// (table-free, built in). The resolver consults the database's referenced collations first, then
-// this set.
-func LoadedCollation(name string) *Collation {
-	loadedMu.RLock()
-	defer loadedMu.RUnlock()
-	return loadedColl[name]
-}
-
-// VersionSkew is the slice-2d version-skew verdict (spec/design/collation.md §12, compatibility.md
-// §7): given a collation name and the (unicode, cldr) version the FILE pinned its keys under (§5),
-// it returns (loadedUnicode, loadedCldr, true) when a loaded bundle provides name at a DIFFERENT
-// version — the object using it is read-only (XX002 on write) — else ("", "", false) (Full: the same
-// version, or no loaded table to disagree). A pure, total comparison so EVERY core computes the
-// identical verdict (the §10 cross-core contract). The read side never consults this — a skewed read
-// recomputes against the loaded table (the heap-scan fallback, compatibility.md §8).
-func versionSkew(name, fileUnicode, fileCldr string) (loadedUnicode, loadedCldr string, skewed bool) {
-	loaded := LoadedCollation(name)
-	if loaded == nil {
-		return "", "", false
-	}
-	if loaded.UnicodeVersion != fileUnicode || loaded.CldrVersion != fileCldr {
-		return loaded.UnicodeVersion, loaded.CldrVersion, true
-	}
-	return "", "", false
-}
-
-// loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
-// with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
-// Engine.LoadedCollations method (executor.go).
-func loadedCollationTables() []*Collation {
-	loadedMu.RLock()
-	defer loadedMu.RUnlock()
-	out := make([]*Collation, 0, len(loadedColl))
-	for _, c := range loadedColl {
-		out = append(out, c)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
 
 func deserializeTable(table []byte) ([]singleEntry, []contractionEntry, error) {
 	r := &reader{b: table}
@@ -1005,7 +908,7 @@ type propertyTable struct {
 // ============================================================================================
 // Casing kernels (spec/design/collation.md §16) — the production upper/lower/ILIKE folds. Each
 // takes the resolved property table EXPLICITLY (nil ⇒ the ASCII baseline), so the evaluator does the
-// one engine-global LoadedProperty() lookup and the kernels stay pure — which makes the un-loaded
+// one Environment.propertyTable() lookup and the kernels stay pure — which makes the un-loaded
 // (ASCII) regime deterministically unit-testable. Cross-core byte-identical given identical input
 // (the corpus pins it incl. an astral cased letter, the TS UTF-16 trap; Go ranges over runes).
 // ============================================================================================

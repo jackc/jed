@@ -26,7 +26,7 @@ import { type BlockStore, ClosedBlockStore } from "./blockstore.ts";
 import { FileBlockStore } from "./fileblockstore.ts";
 import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import type { ExtensionRegistry } from "./extension.ts";
+import { Environment } from "./environment.ts";
 import type { FileHost, WriteAt } from "./filehost.ts";
 import { loadEnginePaged, ROOT_PAGE, toImage, writeImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
@@ -45,8 +45,9 @@ import { FileCoordinator } from "./coordinator.ts";
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
 // noSync is the fsync=off host setting (api.md §2.1): a commit writes identical bytes in the same order
 // but skips the fdatasync barrier. Unlike pageSize it is NOT fixed into the file — it is a runtime handle
-// setting. DEV/TESTING only (durable across a process crash, not an OS crash).
-export type DatabaseOptions = { pageSize?: number; noSync?: boolean };
+// setting. DEV/TESTING only (durable across a process crash, not an OS crash). environment is the
+// handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one (§7).
+export type DatabaseOptions = { pageSize?: number; noSync?: boolean; environment?: Environment };
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1/§2.1.1). path
 // selects the backing: absent → an in-memory database (never touches the filesystem); present → a
@@ -66,10 +67,11 @@ export type CreateOptions = {
   skipFsync?: boolean;
   locking?: Locking;
   fileLockTimeoutMs?: number;
-  // Host extensions to register on this database (spec/design/extensibility.md §7): scalar functions
-  // the host supplies, FROZEN for the handle's lifetime and shared into every session. Not stored in
-  // the file — a host reopens with its own registry (the ephemeral, no-persisted-use rule of §14).
-  extensions?: ExtensionRegistry;
+  // The handle's Environment (spec/design/environment.md): its loaded Unicode and time-zone data,
+  // host functions, and random + clock sources, fixed for the handle's lifetime and shared by every
+  // session, attachment, and temp domain. Not stored in the file — a reopening host supplies its own.
+  // Absent ⇒ a fresh empty environment (§7), never a process-wide default.
+  environment?: Environment;
   // The committed-storage limit in bytes (spec/design/memory.md §8): a commit that would grow the
   // database past it fails 54P06. An in-memory database measures its page high-water (pageCount ×
   // pageSize, §8.2), a file-backed one its live pages (livePages × pageSize, §8.7). Zero, negative, or
@@ -90,7 +92,7 @@ export function createVia(files: FileHost, path: string, opts: DatabaseOptions =
   if (files.exists(path)) {
     throw engineError("duplicate_file", "database file already exists: " + path);
   }
-  const db = new Engine();
+  const db = new Engine(opts.environment ?? new Environment());
   db.path = path;
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
@@ -160,10 +162,10 @@ export type OpenOptions = {
   skipFsync?: boolean;
   locking?: Locking;
   fileLockTimeoutMs?: number;
-  // Host extensions to register on this handle (spec/design/extensibility.md §7): scalar functions
-  // the host supplies, FROZEN for the handle's lifetime. A handle setting like the rest — not stored
-  // in the file, so a reopening host brings its own (§14 step 3).
-  extensions?: ExtensionRegistry;
+  // The handle's Environment (spec/design/environment.md): the file's referenced collations, zones,
+  // and host functions resolve against it at open, and it supplies the random + clock sources. A
+  // handle setting like the rest — not stored in the file. Absent ⇒ a fresh empty environment (§7).
+  environment?: Environment;
   // The committed-storage limit in bytes over the file's live pages (spec/design/memory.md §8.7): a
   // commit that would grow livePages × pageSize past it fails 54P06. Zero, negative, or absent is
   // unlimited (the default). A handle setting, not stored in the file; Database.setMaxStorageBytes
@@ -194,7 +196,10 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
     // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
     // page_size = 0 cannot divide by zero before that check runs).
     const pager = Pager.fromStore(store);
-    const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
+    const db = loadEnginePaged(
+      new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)),
+      opts.environment ?? new Environment(),
+    );
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
@@ -218,14 +223,18 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
 // module (it stays browser-clean). The OPFS host registers its own. Read-only opens the file O_RDONLY.
 // The file opens through main's file host (null is the OS), so the simulated filesystem serves
 // attachments too.
-registerFileAttachOpener((source, readOnly, files) => {
+registerFileAttachOpener((source, readOnly, files, environment) => {
   const path = source.path!;
   const coordinator = FileCoordinator.open(path, source.locking, source.fileLockTimeoutMs);
   try {
     coordinator?.lockCommitShared();
     let engine: Engine;
     try {
-      engine = openVia(files ?? osFiles, coordinator?.path ?? path, { readOnly, locking: "none" });
+      engine = openVia(files ?? osFiles, coordinator?.path ?? path, {
+        readOnly,
+        locking: "none",
+        environment,
+      });
     } finally {
       coordinator?.unlockCommit();
     }
@@ -419,16 +428,17 @@ export function createDatabase(opts: CreateOptions = {}): Database {
       const engine = create(coordinator?.path ?? opts.path, {
         pageSize,
         noSync: opts.skipFsync,
+        environment: opts.environment,
       });
       engine.storageBudget.limit = maxStorageBytes;
-      return Database.fromEngine(engine, coordinator, opts.extensions ?? null);
+      return Database.fromEngine(engine, coordinator);
     } catch (error) {
       coordinator?.close();
       throw error;
     }
   }
   // in-memory never fsyncs; skipFsync is a no-op
-  return buildInMemory(pageSize, opts.extensions ?? null, maxStorageBytes);
+  return buildInMemory(pageSize, opts.environment ?? new Environment(), maxStorageBytes);
 }
 
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
@@ -443,7 +453,7 @@ export function openDatabase(path: string, opts: OpenOptions = {}): Database {
     } finally {
       coordinator?.unlockCommit();
     }
-    return Database.fromEngine(engine, coordinator, opts.extensions ?? null);
+    return Database.fromEngine(engine, coordinator);
   } catch (error) {
     coordinator?.close();
     throw error;

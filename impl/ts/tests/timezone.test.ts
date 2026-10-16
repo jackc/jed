@@ -5,13 +5,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import {
-  loadTimeZoneData,
-  offsetAtRef,
-  openTzBundle,
-  resolveZone,
-  saveTzBundle,
-} from "../src/timezone.ts";
+import { Environment } from "../src/environment.ts";
+import { offsetAtRef, openTzBundle, resolveZone, saveTzBundle } from "../src/timezone.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 
 function bundleBytes(): Uint8Array {
@@ -23,13 +18,13 @@ function bundleBytes(): Uint8Array {
 const SECS = 1_000_000n;
 
 test("timezone reader matches the pinned vectors", () => {
-  loadTimeZoneData(bundleBytes());
+  const env = Environment.builder().loadTimeZoneData(bundleBytes()).build();
   const rows = readTomlTables(specPath("tz/vectors/tzif.toml"), "case");
   assert.ok(rows.length > 0, "no tzif vectors");
   for (const row of rows) {
     const zone = row.str("zone");
     const inst = row.big("instant_micros");
-    const zr = resolveZone(zone);
+    const zr = resolveZone(zone, env);
     assert.ok(zr !== undefined, `resolve ${zone}`);
     const off = offsetAtRef(zr, inst / SECS - (inst < 0n && inst % SECS !== 0n ? 1n : 0n));
     assert.equal(BigInt(off.utoff), row.big("utoff_secs"), `${zone} @ ${inst}: utoff`);

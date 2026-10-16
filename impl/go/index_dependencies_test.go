@@ -11,10 +11,7 @@ import (
 const zoneIndexSQL = "CREATE UNIQUE INDEX zone_idx ON t (account) WHERE (ts AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01'"
 
 func buildZoneIndex(t *testing.T) *Session {
-	if err := LoadTimeZoneData(tzBundleBytes(t)); err != nil {
-		t.Fatal(err)
-	}
-	db := memDB().Session(SessionOptions{})
+	db := memDBIn(testEnv("tz")).Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t(id int PRIMARY KEY, account int, ts timestamptz)")
 	mustExec(t, db, "INSERT INTO t VALUES (1,7,'2024-06-01 00:00:00+00'),(2,7,'2020-01-01 00:00:00+00')")
 	mustExec(t, db, zoneIndexSQL)
@@ -64,12 +61,12 @@ func TestIndexTimezoneLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, mode := range []string{"mode", "empty-static", "empty-name", "empty-version"} {
-		_, err := loadEngine(skewZonePin(t, image, mode))
+		_, err := loadEngine(skewZonePin(t, image, mode), testEnv("tz"))
 		if errCodeOf(err) != "XX001" {
 			t.Fatalf("%s: %v", mode, err)
 		}
 	}
-	matching, err := loadEngine(image)
+	matching, err := loadEngine(image, testEnv("tz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +75,7 @@ func TestIndexTimezoneLifetime(t *testing.T) {
 	}
 	for _, mode := range []string{"version", "checksum", "missing"} {
 		t.Run(mode, func(t *testing.T) {
-			db, err := loadEngine(skewZonePin(t, image, mode))
+			db, err := loadEngine(skewZonePin(t, image, mode), testEnv("tz"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -137,10 +134,7 @@ func TestIndexTimezoneSessionIndependence(t *testing.T) {
 }
 
 func TestIndexDynamicZoneCache(t *testing.T) {
-	if err := LoadTimeZoneData(tzBundleBytes(t)); err != nil {
-		t.Fatal(err)
-	}
-	db := memDB().Session(SessionOptions{})
+	db := memDBIn(testEnv("tz")).Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE d (id int PRIMARY KEY, account int, ts timestamptz, zone text)")
 	mustExec(t, db, "INSERT INTO d VALUES (1,7,'2024-06-01 00:00:00+00','UTC')")
 	ddl := "CREATE INDEX dynamic_idx ON d (account) WHERE (ts AT TIME ZONE zone)::date >= DATE '2024-01-01'"
@@ -163,32 +157,32 @@ func TestIndexDynamicZoneCache(t *testing.T) {
 	if ins.ic.p.Load() != nil {
 		t.Fatal("dynamic-zone insert was cached")
 	}
+	// A dynamic-zone index records the whole loaded zone set, so reopening under an environment that
+	// loads one more zone makes it unusable for writes (XX002) until it is rebuilt.
 	b, err := openTzBundle(tzBundleBytes(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	b.Zones = []tzZoneSection{{Name: "Test/IndexAdded", Raw: b.Zones[0].Raw}}
 	b.Links = nil
-	if err := LoadTimeZoneData(saveTzBundle(b)); err != nil {
+	grown := testEnv("tz").ToBuilder()
+	if err := grown.LoadTimeZoneData(saveTzBundle(b)); err != nil {
 		t.Fatal(err)
 	}
-	drainQ(t, db, stmt)
-	rows, err := db.queryStmt(ins.ast, []Value{IntValue(92)}, &ins.sc, &ins.ic)
-	if err == nil {
-		for rows.Next() {
-		}
-		err = rows.Err()
-		rows.Close()
+	image, err := db.ToImage(4096, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if errCodeOf(err) != "XX002" {
-		t.Fatalf("prepared insert after load: %v", err)
+	reopened, err := loadEngine(image, grown.Build())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if c := errCode(t, db, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')"); c != "XX002" {
+	if c := errCode(t, reopened, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')"); c != "XX002" {
 		t.Fatal(c)
 	}
-	mustExec(t, db, "BEGIN")
-	mustExec(t, db, "DROP INDEX dynamic_idx")
-	mustExec(t, db, ddl)
-	mustExec(t, db, "COMMIT")
-	mustExec(t, db, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')")
+	mustExec(t, reopened, "BEGIN")
+	mustExec(t, reopened, "DROP INDEX dynamic_idx")
+	mustExec(t, reopened, ddl)
+	mustExec(t, reopened, "COMMIT")
+	mustExec(t, reopened, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')")
 }

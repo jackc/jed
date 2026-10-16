@@ -9,7 +9,7 @@
 >    jed reads it, never writes it (no `zic`), so cross-core agreement is **by construction**
 >    ([../design/timezones.md §3.4](../design/timezones.md)).
 > 2. **The `JTZ` bundle** (§3) — the runtime-loaded multi-zone container: a manifest + per-zone TZif
->    sections + alias links, what a host hands `db.LoadTimeZoneData` ([../design/timezones.md §4](../design/timezones.md)).
+>    sections + alias links, what a host hands the environment builder's `LoadTimeZoneData` ([../design/timezones.md §4](../design/timezones.md)).
 >
 > The reader's output (§4) is `(zone, instant) → (utc_offset_seconds, abbrev, is_dst)` — the local-time
 > type in effect at an instant, the bridge from a UTC `i64` to a wall-clock reading.
@@ -101,7 +101,7 @@ transition's type continues indefinitely. The footer is the analogue of collatio
 
 ## 3. The `JTZ` bundle
 
-The container a host **loads** at runtime via `db.LoadTimeZoneData`
+The container a host **loads** at runtime via the environment builder's `LoadTimeZoneData`
 ([../design/timezones.md §4](../design/timezones.md)). **One tzdata version per bundle.** A
 manifest-indexed container of independently-addressable sections (a loader takes only what it needs),
 reusing jed's conventions verbatim — big-endian wrapper, `str` = `u16` len + UTF-8, CRC-32/IEEE, LZ4

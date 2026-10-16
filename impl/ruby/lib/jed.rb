@@ -7,8 +7,9 @@ require_relative "jed/codec"
 require_relative "jed/coerce"
 require_relative "jed/params"
 require_relative "jed/result"
+require_relative "jed/host_function"
+require_relative "jed/environment"
 require_relative "jed/database"
-require_relative "jed/extension"
 
 # jed — an embedded SQL database with PostgreSQL behavior and a strict, static type system.
 #
@@ -23,39 +24,17 @@ require_relative "jed/extension"
 #   end
 module Jed
   class << self
-    # Open a new in-memory database (see {Database.memory}). `extensions:` is a
-    # {Jed::ExtensionRegistry} of host functions (spec/design/ruby.md §5b).
-    def memory(extensions: nil, &) = Database.memory(extensions: extensions, &)
+    # Open a new in-memory database (see {Database.memory}). `environment:` is a {Jed::Environment}
+    # (loaded bundles, host functions, random and clock sources — spec/design/ruby.md §5a); without
+    # one the database gets a fresh empty environment.
+    def memory(environment: nil, &) = Database.memory(environment: environment, &)
 
     # Create a new file-backed database at `path` (see {Database.create}).
-    def create(path, extensions: nil, &) = Database.create(path, extensions: extensions, &)
+    def create(path, environment: nil, &) = Database.create(path, environment: environment, &)
 
     # Open an existing file-backed database at `path` (see {Database.open}).
-    def open(path, read_only: false, extensions: nil, &)
-      Database.open(path, read_only: read_only, extensions: extensions, &)
-    end
-
-    # Load a Unicode collation bundle (a `JUCD` byte string) into the **engine-global** collation
-    # set (spec/design/collation.md). The bare engine ships `C`-collation only; this adds the
-    # linguistic collations the bundle provides (e.g. `COLLATE "unicode"`, case folding, `ILIKE`).
-    # Process-global (the SQLite model) — affects every open and future database. Raises
-    # {Jed::Error} on a malformed bundle. Typical use: `Jed.load_unicode_data(File.binread(path))`.
-    def load_unicode_data(bytes) = load_bundle(Jed::FFI::LOAD_UNICODE, bytes)
-
-    # Load an IANA time-zone bundle (a `JTZ` byte string) into the **engine-global** zone set
-    # (spec/design/timezones.md). The bare engine ships `UTC` + fixed offsets only; this adds the
-    # named zones the bundle provides (`AT TIME ZONE 'America/New_York'`, `date_trunc(…, zone)`, the
-    # session `time_zone` setting). Process-global. Raises {Jed::Error} on a malformed bundle.
-    def load_time_zone_data(bytes) = load_bundle(Jed::FFI::LOAD_TIMEZONE, bytes)
-
-    private
-
-    def load_bundle(fn, bytes)
-      raw = bytes.to_s.b # a binary copy; Fiddle passes a pointer to its bytes
-      result = Jed::Codec.take(fn.call(raw, raw.bytesize))
-      raise Jed::Error.new(result[:sqlstate], result[:message]) if result[:kind] == :error
-
-      nil
+    def open(path, read_only: false, environment: nil, &)
+      Database.open(path, read_only: read_only, environment: environment, &)
     end
   end
 end

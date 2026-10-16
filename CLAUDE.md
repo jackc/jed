@@ -784,9 +784,12 @@ The design is optimized for AI agents even more than for humans. In practice:
   `f64` transcendental values and `SUM`/`AVG` fold order (class A), and the **`uuidv4`/`uuidv7`
   generators** plus the **clock functions `now()`/`current_timestamp`/`clock_timestamp()`**, which
   read entropy + the clock through
-  a **host-injected seam** (`spec/design/entropy.md`) and so stay *deterministic given the seam
-  inputs* (tests inject a fixed seed + a fixed/advancing clock → byte-identical cross-core; production
-  reads OS entropy + wall clock). The seam joins the storage and cost seams as the engine's third
+  a **host-supplied seam** (`spec/design/entropy.md`) and so stay *deterministic given the
+  environment* (tests install a seeded source + a manual/advancing clock → byte-identical cross-core;
+  production reads OS entropy + wall clock). The sources live in the handle's immutable
+  **`Environment`** (`spec/design/environment.md`), which holds every outside input except storage —
+  loaded Unicode/time-zone data, host functions, entropy, clock — passed to `open`/`create`; there is
+  no process-global loaded data. The seam joins the storage and cost seams as the engine's third
   "host supplies it" boundary. Cost-based planning stays exact: the estimator's inputs, rational
   arithmetic, candidate ties, and bounded search are specified in `spec/design/estimator.md`, and
   plan divergence has no determinism-ledger exception.

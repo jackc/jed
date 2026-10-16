@@ -1391,7 +1391,7 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 // pagerFromStore reads the page size and pageCount starts past the meta slots. Zero file writes: this
 // byte store is entirely separate from the main database file.
 func newTempStorage(pageSize uint32) *storage {
-	image, err := newSnapshot().ToImage(pageSize, 0)
+	image, err := newSnapshot(nil).ToImage(pageSize, 0) // an empty image resolves nothing
 	if err != nil {
 		panic("a fresh temp image always serializes: " + err.Error())
 	}
@@ -1426,8 +1426,9 @@ func newAttachedStorage(pageSize uint32) *storage {
 // eager whole-image readTree loader is gone). The pool is pinned (unbounded): an in-memory
 // database is resident by definition (§5), so CacheBytes bounds only file-backed eviction and the
 // observable default is unchanged. Basic image validation stays up front so a malformed image is
-// XX001 before any store is built.
-func loadEngine(image []byte) (*engine, error) {
+// XX001 before any store is built. env is the handle's Environment: referenced collations resolve
+// against it.
+func loadEngine(image []byte, env *Environment) (*engine, error) {
 	if len(image) < 12 {
 		return nil, newError(DataCorrupted, "image smaller than a meta header")
 	}
@@ -1439,7 +1440,7 @@ func loadEngine(image []byte) (*engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return loadEnginePaged(p, math.MaxInt)
+	return loadEnginePaged(p, math.MaxInt, env)
 }
 
 // LoadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
@@ -1451,19 +1452,19 @@ func loadEngine(image []byte) (*engine, error) {
 // free-list), then discards it — memory stays bounded (only the skeleton is retained), but open is
 // O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a deferred follow-on,
 // pager.md §6); the residency win — a bounded resident set — already holds.
-func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
+func loadEnginePaged(pgr *pager, capacity int, env *Environment) (*engine, error) {
 	pageSize := int(pgr.pageSize)
 	if !pageSizeValid(pageSize) {
 		return nil, newError(DataCorrupted, "invalid page size")
 	}
 	paging := newSharedPaging(pgr, capacity)
-	return loadEngineSharedPaging(paging)
+	return loadEngineSharedPaging(paging, env)
 }
 
 // loadEngineSharedPaging reloads the newest committed root through an existing pager/pool while a
 // shared-file participant holds commit SH. Co-resident body pages are append-only, so cached leaves
 // remain valid and only the catalog/interior skeleton is rebuilt.
-func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
+func loadEngineSharedPaging(paging *sharedPaging, env *Environment) (*engine, error) {
 	pgr := paging.pgr
 	pageSize := int(pgr.pageSize)
 	if !pageSizeValid(pageSize) {
@@ -1475,7 +1476,7 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 		return nil, err
 	}
 
-	snap := newSnapshot()
+	snap := newSnapshot(env)
 	snap.txid = mt.txid
 	statisticsExpected := make(map[string][3]int)
 	var loadedViews []*viewDef
@@ -1538,7 +1539,7 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 			if kind == 3 {
 				// A collation snapshot (v17): the baked .coll artifact + an is_default flag
 				// (spec/design/collation.md §5). The default restores the per-database default.
-				coll, isDefault, err := decodeCollationEntry(pg.payload, &pos)
+				coll, isDefault, err := decodeCollationEntry(pg.payload, &pos, env)
 				if err != nil {
 					return nil, err
 				}
@@ -1711,7 +1712,7 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 	if err := snap.rebuildGistTrees(); err != nil {
 		return nil, err
 	}
-	db := newEngine()
+	db := newEngineIn(env)
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount
 	// v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability
@@ -3331,9 +3332,9 @@ func collationEntryBytes(c *Collation, isDefault bool) []byte {
 
 // decodeCollationEntry decodes a collation reference entry's body (inverse of collationEntryBytes);
 // the caller has consumed the entry_kind byte. Reads the metadata, then resolves the compiled table
-// from the binary's VENDORED set by name (§2/§9) — the table is no longer in the file. Returns the
+// from env's loaded set by name (§2/§9) — the table is no longer in the file. Returns the
 // resolved collation + whether it is the per-database default (the is_default flag bit).
-func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
+func decodeCollationEntry(buf []byte, pos *int, env *Environment) (*Collation, bool, error) {
 	flags, err := readU8(buf, pos)
 	if err != nil {
 		return nil, false, err
@@ -3358,13 +3359,13 @@ func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	// The file records only the version PIN; the table comes from a loaded bundle (the host must have
-	// loaded one providing this collation before opening — collation.md §4/§9). A name no loaded bundle
+	// The file records only the version PIN; the table comes from a loaded bundle (the handle's
+	// Environment must provide this collation — collation.md §4/§9). A name no loaded bundle
 	// provides at all is the graded verdict's legible refusal (slice 2d, collation.md §12 /
 	// compatibility.md §7): the open is refused with XX002 naming the collation + version, rather than
 	// degrading the rest of the database (the conservative resolution of compatibility.md §12 open #3 —
 	// a version-skewed collation, by contrast, opens and is enforced read-only at write time §14).
-	loaded := LoadedCollation(name)
+	loaded := env.collation(name)
 	if loaded == nil {
 		return nil, false, newError(CollationVersionMismatch,
 			fmt.Sprintf("collation %q (@ %s/%s) is not provided by any loaded bundle", name, unicode, cldr))

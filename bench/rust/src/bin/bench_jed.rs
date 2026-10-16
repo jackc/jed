@@ -2,11 +2,9 @@
 
 use std::time::Instant;
 
-use std::sync::Arc;
-
 use jed::{
-    CreateOptions, Database, ExtensionRegistry, HostFunction, Locking, OpenOptions,
-    PreparedStatement, ScalarType, Session, SessionOptions, Value, Volatility,
+    CreateOptions, Database, Environment, HostFunction, Locking, OpenOptions, PreparedStatement,
+    ScalarType, Session, SessionOptions, Value, Volatility,
 };
 
 use jed_bench::{
@@ -42,7 +40,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
         let db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(format!("{dir}/scratch.jed"))),
             locking,
-            extensions: bench_extensions()?,
+            environment: bench_environment()?,
             ..Default::default()
         })
         .map_err(|e| e.to_string())?;
@@ -60,7 +58,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
         format!("{data_dir}/{dataset}.jed"),
         OpenOptions {
             locking,
-            extensions: bench_extensions()?,
+            environment: bench_environment()?,
             ..Default::default()
         },
     )
@@ -77,39 +75,41 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
 }
 
 /// The bench host functions (benchmarks.md §8.2): the same cheap arithmetic as a single-row
-/// kernel (`bench_mix_row`) and a batch kernel (`bench_mix_batch`), registered on every handle.
-fn bench_extensions() -> BoxResult<Arc<ExtensionRegistry>> {
+/// kernel (`bench_mix_row`) and a batch kernel (`bench_mix_batch`), registered in every handle's
+/// environment.
+fn bench_environment() -> BoxResult<Environment> {
     fn mix(v: &Value) -> Value {
         let Value::Int(x) = v else {
             unreachable!("strict + resolved i32 arg")
         };
         Value::Int(x * 2654435761 % 1000003)
     }
-    let mut reg = ExtensionRegistry::new();
-    reg.register_function(
-        HostFunction::new(
-            "bench_mix_row",
-            vec![ScalarType::Int32],
-            ScalarType::Int64,
-            Box::new(|args: &[Value]| Ok(mix(&args[0]))),
+    let env = Environment::builder()
+        .register_function(
+            HostFunction::new(
+                "bench_mix_row",
+                vec![ScalarType::Int32],
+                ScalarType::Int64,
+                Box::new(|args: &[Value]| Ok(mix(&args[0]))),
+            )
+            .volatility(Volatility::Immutable),
         )
-        .volatility(Volatility::Immutable),
-    )
-    .map_err(|e| e.to_string())?;
-    reg.register_function(
-        HostFunction::batched(
-            "bench_mix_batch",
-            vec![ScalarType::Int32],
-            ScalarType::Int64,
-            Box::new(|args: &[Vec<Value>], out: &mut Vec<Value>| {
-                out.extend(args[0].iter().map(mix));
-                Ok(())
-            }),
+        .map_err(|e| e.to_string())?
+        .register_function(
+            HostFunction::batched(
+                "bench_mix_batch",
+                vec![ScalarType::Int32],
+                ScalarType::Int64,
+                Box::new(|args: &[Vec<Value>], out: &mut Vec<Value>| {
+                    out.extend(args[0].iter().map(mix));
+                    Ok(())
+                }),
+            )
+            .volatility(Volatility::Immutable),
         )
-        .volatility(Volatility::Immutable),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(Arc::new(reg))
+        .map_err(|e| e.to_string())?
+        .build();
+    Ok(env)
 }
 
 /// Optional benchmark-only coordination override. Ordinary runs keep the public API's `auto`

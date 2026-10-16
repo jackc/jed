@@ -17,7 +17,7 @@ import {
   createDatabase,
   openDatabase,
 } from "../../../impl/ts/src/lib.ts";
-import { ExtensionRegistry } from "../../../impl/ts/src/extension.ts";
+import { Environment } from "../../../impl/ts/src/environment.ts";
 import { intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
 
 import {
@@ -140,27 +140,27 @@ function benchMix(v: Value): Value {
   return intValue(((v as { kind: "int"; int: bigint }).int * 2654435761n) % 1000003n);
 }
 
-// benchExtensions registers the bench host functions on every handle: the same arithmetic as a
-// single-row kernel (bench_mix_row) and a batch kernel (bench_mix_batch).
-function benchExtensions(): ExtensionRegistry {
-  const reg = new ExtensionRegistry();
-  reg.registerFunction({
-    name: "bench_mix_row",
-    argTypes: ["i32"],
-    result: "i64",
-    volatility: "immutable",
-    kernel: (args) => benchMix(args[0]),
-  });
-  reg.registerFunction({
-    name: "bench_mix_batch",
-    argTypes: ["i32"],
-    result: "i64",
-    volatility: "immutable",
-    batchKernel: (args, out) => {
-      for (const v of args[0]) out.push(benchMix(v));
-    },
-  });
-  return reg;
+// benchEnvironment registers the bench host functions in the environment every handle opens with: the
+// same arithmetic as a single-row kernel (bench_mix_row) and a batch kernel (bench_mix_batch).
+function benchEnvironment(): Environment {
+  return Environment.builder()
+    .registerFunction({
+      name: "bench_mix_row",
+      argTypes: ["i32"],
+      result: "i64",
+      volatility: "immutable",
+      kernel: (args) => benchMix(args[0]),
+    })
+    .registerFunction({
+      name: "bench_mix_batch",
+      argTypes: ["i32"],
+      result: "i64",
+      volatility: "immutable",
+      batchKernel: (args, out) => {
+        for (const v of args[0]) out.push(benchMix(v));
+      },
+    })
+    .build();
 }
 
 function bindArgs(args: Arg[]): Value[] {
@@ -212,10 +212,13 @@ await mainWith({
   async open(dataDir: string, dataset: string): Promise<Engine> {
     if (dataset === "scratch") {
       const dir = mkdtempSync(join(dataDir, "scratch-"));
-      const db = createDatabase({ path: join(dir, "scratch.jed"), extensions: benchExtensions() });
+      const db = createDatabase({
+        path: join(dir, "scratch.jed"),
+        environment: benchEnvironment(),
+      });
       return new JedEngine(db, dataDir, dataset, dir);
     }
-    const db = openDatabase(join(dataDir, `${dataset}.jed`), { extensions: benchExtensions() });
+    const db = openDatabase(join(dataDir, `${dataset}.jed`), { environment: benchEnvironment() });
     return new JedEngine(db, dataDir, dataset, null);
   },
 });

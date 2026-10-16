@@ -1,6 +1,6 @@
 package jed
 
-// Time zones: the JTZ bundle codec + an RFC 8536 TZif reader + the engine-global loaded zone set.
+// Time zones: the JTZ bundle codec + an RFC 8536 TZif reader (the loaded zone set is the Environment's).
 // The cross-core contract for time-zone conversion (spec/design/timezones.md §4/§5): the reader is
 // hand-written per core (CLAUDE.md §5) and byte-identical given identical input — it reads the
 // standardized TZif layout, so cores agree by construction (§3.4). Byte formats: spec/tz/README.md.
@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 )
 
 // secsPerDay and floorMod are defined in timestamp.go (the calendar core this reader reuses).
@@ -687,83 +686,16 @@ func openTzBundle(data []byte) (*tzBundle, error) {
 	return &tzBundle{TzdataVersion: version, Description: desc, Zones: zones, Links: links}, nil
 }
 
-// --- the engine-global loaded zone set + the load seam (timezones.md §3.3) ---
+// --- loaded zones live on the Environment (environment.go, spec/design/environment.md) ---
 
-var (
-	loadedTzMu sync.RWMutex
-	loadedTz   = map[string]*zone{}
-)
-
-// LoadTimeZoneData loads a JTZ bundle into the engine-global loaded set (§3.3/§4): parse each zone's
-// TZif, register by name, then resolve each link alias onto its target's tables. ADDITIVE /
-// FIRST-WINS — a name already present is not replaced (idempotent re-load). A malformed bundle (or
-// TZif) is XX001. The engine primitive behind db.LoadTimeZoneData; may be called before opening any
-// file, reads no path, reaches no host data (§10).
-func LoadTimeZoneData(data []byte) error {
-	bundle, err := openTzBundle(data)
-	if err != nil {
-		return err
-	}
-	parsed := make(map[string]*zone, len(bundle.Zones))
-	for _, z := range bundle.Zones {
-		td, err := parseTzif(z.Raw)
-		if err != nil {
-			return err
-		}
-		parsed[z.Name] = &zone{Name: z.Name, TzdataVersion: bundle.TzdataVersion, Data: td, Checksum: crc32IEEE(z.Raw)}
-	}
-	loadedTzMu.Lock()
-	defer loadedTzMu.Unlock()
-	for name, z := range parsed {
-		if _, ok := loadedTz[name]; !ok {
-			loadedTz[name] = z
-		}
-	}
-	for _, l := range bundle.Links {
-		if z, ok := parsed[l.Target]; ok {
-			if _, exists := loadedTz[l.Alias]; !exists {
-				loadedTz[l.Alias] = &zone{Name: l.Alias, TzdataVersion: bundle.TzdataVersion, Data: z.Data, Checksum: z.Checksum}
-			}
-		}
-	}
-	return nil
-}
-
-// LoadedZone looks up a loaded named zone by exact name (nil ⇒ no loaded bundle provides it).
-func loadedZone(name string) *zone {
-	loadedTzMu.RLock()
-	defer loadedTzMu.RUnlock()
-	return loadedTz[name]
-}
-
-// LoadedTimeZones introspects the engine-global loaded zone set (db.LoadedTimeZones, §3.3): every
-// zone + alias a loaded bundle provides, ascending by name.
-func loadedTimeZones() []timeZoneInfo {
-	loadedTzMu.RLock()
-	defer loadedTzMu.RUnlock()
-	names := make([]string, 0, len(loadedTz))
-	for n := range loadedTz {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	out := make([]timeZoneInfo, len(names))
-	for i, n := range names {
-		out[i] = timeZoneInfo{Name: n, TzdataVersion: loadedTz[n].TzdataVersion}
-	}
-	return out
-}
-
-// ResolveZone resolves a zone name to a built-in fixed offset (UTC / ±HH[:MM[:SS]], §3.2) or a
-// loaded named zone. Returns (ZoneRef, true) or (_, false) ⇒ unknown (the caller raises 22023).
-func ResolveZone(name string) (ZoneRef, bool) {
+// builtinZone resolves a built-in zone name — UTC or a fixed ±HH[:MM[:SS]] offset (§3.2) — with no
+// loaded data. Named zones come from the handle's Environment (Environment.resolveZone).
+func builtinZone(name string) (ZoneRef, bool) {
 	if name == "UTC" {
 		return ZoneRef{Fixed: true, Off: 0}, true
 	}
 	if off, ok := parseFixedOffset(name); ok {
 		return ZoneRef{Fixed: true, Off: off}, true
-	}
-	if z := loadedZone(name); z != nil {
-		return ZoneRef{zone: z}, true
 	}
 	return ZoneRef{}, false
 }
@@ -901,15 +833,4 @@ func (r *reader) i64() (int64, error) {
 func (r *reader) skip(n int) error {
 	_, err := r.take(n)
 	return err
-}
-
-func indexZoneDeps() []timeZoneDep {
-	loadedTzMu.RLock()
-	defer loadedTzMu.RUnlock()
-	out := make([]timeZoneDep, 0, len(loadedTz))
-	for _, z := range loadedTz {
-		out = append(out, timeZoneDep{Name: z.Name, Version: z.TzdataVersion, Checksum: z.Checksum})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }

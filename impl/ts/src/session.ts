@@ -1,8 +1,7 @@
 import { SpillSet } from "./blocking.ts";
 import type { ActiveTx, SessionOptions, TxStatus } from "./snapshot.ts";
 import { LifetimeBudget, Meter, newQueryAccount, type QueryAccount } from "./cost.ts";
-import { Seam } from "./seam.ts";
-import type { ExtensionRegistry } from "./extension.ts";
+import type { Environment } from "./environment.ts";
 import type { SequenceDef } from "./catalog.ts";
 import { Privileges } from "./privileges.ts";
 import { Snapshot, requireCustomVarName, txStatusOf } from "./snapshot.ts";
@@ -22,7 +21,6 @@ import { DEFAULT_WORK_MEM } from "./spill.ts";
 import { resolveZone } from "./timezone.ts";
 import { engineError } from "./errors.ts";
 import type { PrivilegeSet } from "./privileges.ts";
-import type { ClockFunc, RandomFill } from "./seam.ts";
 import type { Acc, AggSpec, EvalEnv, ResolvedFrame, SelectPlan } from "./executor.ts";
 import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
@@ -73,15 +71,10 @@ export class SessionState {
   // The work-memory budget in bytes (spec/design/spill.md §2): the memory a blocking operator holds
   // before it spills. 0 = unlimited; default DEFAULT_WORK_MEM. Never changes what a query observes.
   workMem: number;
-  // The entropy + clock seam for the uuid generators / clock functions (entropy.md): two
-  // host-injectable functions, each unset ⇒ the platform primitive. Tests inject seededRandomSource +
-  // fixedClock (the # seed: / # clock: directives) for byte-identical cross-core output.
-  seam: Seam;
-  // The frozen host extension registry (spec/design/extensibility.md §7): the scalar functions the
-  // host registered at open/create. Set from the shared core at session mint; a streaming cursor's
-  // frozen engine shares the same SessionState reference (so it sees the same functions). null when
-  // no extensions were supplied — the built-in-only path.
-  extensions: ExtensionRegistry | null;
+  // The database handle's Environment (spec/design/environment.md): its loaded collations, casing
+  // table, and zones, its host functions, and its random + clock sources. Every session of one handle
+  // shares the handle's environment; a streaming cursor's frozen session shares it too.
+  environment: Environment;
   // SESSION currval state (sequences.md §6): the last value nextval/setval(…,true) produced IN THIS
   // SESSION for each sequence (exact name). NOT in the snapshot, NOT persisted.
   sessionSeq: Map<string, bigint>;
@@ -139,7 +132,8 @@ export class SessionState {
   // working/committed snapshots as usual (readSnap, tempSnap, attachReadSnap).
   readPin: ReadPin | null;
 
-  constructor(opts: SessionOptions = {}) {
+  constructor(environment: Environment, opts: SessionOptions = {}) {
+    this.environment = environment;
     this.tx = null;
     this.maxScalarBytes = opts.maxScalarBytes ?? 0n;
     this.maxQueryMemoryBytes = opts.maxQueryMemoryBytes ?? 0n;
@@ -153,8 +147,6 @@ export class SessionState {
     // (unlike maxCost/lifetimeMaxCost, whose default genuinely is 0 ⇒ unlimited). Unbounded/never-spill
     // is reached at runtime via setWorkMem(0). Matches Go/Rust (api.md §2.1).
     this.workMem = opts.workMem ? opts.workMem : DEFAULT_WORK_MEM;
-    this.seam = new Seam();
-    this.extensions = null; // set from the shared core at session mint (extensibility.md §7)
     this.sessionSeq = new Map();
     this.sessionLastName = null;
     this.pendingSeq = new Map();
@@ -170,16 +162,16 @@ export class SessionState {
     this.allowTempDdl = opts.allowTempDdl ?? this.allowDdl;
     this.tempBuffers = opts.tempBuffers ?? DEFAULT_TEMP_BUFFERS;
     this.maxTempStorageBytes = opts.maxTempStorageBytes ?? DEFAULT_MAX_TEMP_STORAGE_BYTES;
-    this.tempCommitted = new Snapshot();
+    this.tempCommitted = new Snapshot(environment);
     this.vars = new Map();
     // Resolve the configured zone once; an invalid value falls back to UTC at construction (the
     // validated path is setTimeZone, which surfaces 22023). timezones.md §9.4.
-    this.timeZone = resolveZone(opts.timeZone ?? "UTC") ?? { fixed: true, off: 0 };
+    this.timeZone = resolveZone(opts.timeZone ?? "UTC", environment) ?? { fixed: true, off: 0 };
     this.readPin = null;
   }
 
   // Build the session envelope for a frozen read cursor without constructing and then discarding a
-  // fresh temp Snapshot, LifetimeBudget, Seam, Privileges, and five Maps. Planning/admission has
+  // fresh temp Snapshot, LifetimeBudget, Privileges, and five Maps. Planning/admission has
   // already completed before a cursor is created, and the frozen executor is read-only, so it needs
   // only the state evaluation and metering can observe. Mutable per-statement sequence staging stays
   // independently empty, matching a fresh SessionState; stable session facts are shared exactly as
@@ -197,8 +189,7 @@ export class SessionState {
     frozen.maxSqlLength = source.maxSqlLength;
     frozen.lockTimeoutMs = source.lockTimeoutMs;
     frozen.workMem = source.workMem;
-    frozen.seam = source.seam;
-    frozen.extensions = source.extensions; // shared frozen host-function registry (extensibility.md §7)
+    frozen.environment = source.environment; // the handle's environment (environment.md §3)
     frozen.sessionSeq = source.sessionSeq;
     frozen.sessionLastName = source.sessionLastName;
     frozen.pendingSeq = new Map();
@@ -218,9 +209,10 @@ export class SessionState {
 
   // setTimeZone sets the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone
   // a timestamptz is decomposed in. Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded
-  // JTZ bundle provides; a name no bundle provides (and not a built-in) is 22023, the value unchanged.
+  // JTZ bundle in the handle's environment provides; a name no bundle provides (and not a built-in)
+  // is 22023, the value unchanged.
   setTimeZone(zone: string): void {
-    const zr = resolveZone(zone);
+    const zr = resolveZone(zone, this.environment);
     if (zr === undefined) {
       throw engineError("invalid_parameter_value", `time zone "${zone}" not recognized`);
     }
@@ -380,18 +372,6 @@ export class SessionState {
   // the per-record reset hook the conformance harness's # set: directive uses).
   resetVars(): void {
     this.vars.clear();
-  }
-  setRandomSource(f: RandomFill): void {
-    this.seam.randomFill = f;
-  }
-  clearRandomSource(): void {
-    this.seam.randomFill = undefined;
-  }
-  setClockSource(f: ClockFunc): void {
-    this.seam.clock = f;
-  }
-  clearClockSource(): void {
-    this.seam.clock = undefined;
   }
 }
 
@@ -658,7 +638,11 @@ export function* streamRows(
   // A host call in the WHERE or projection reads the scan ahead into a window and replays it row by
   // row (extensibility.md §4.2.1 "In-hand and pulled sites"): the pull charges nothing, and a storage
   // error is deferred to the row at which the per-row pull would have met it.
-  const ra = ReadAhead.forSite(sp.filter, sp.projections, env.exec.session.extensions);
+  const ra = ReadAhead.forSite(
+    sp.filter,
+    sp.projections,
+    env.exec.session.environment.hostFunctions(),
+  );
   const filterEnv: EvalEnv = ra?.filter ? { ...env, hostBatch: ra.filter } : env;
   const projectEnv: EvalEnv = ra?.project ? { ...env, hostBatch: ra.project } : env;
   try {
@@ -763,7 +747,7 @@ export function* bufferedRows(
     const ra =
       em.sortedFinal || em.sortedIdentity
         ? null
-        : ReadAhead.forSite(null, plan.projections, engine.session.extensions);
+        : ReadAhead.forSite(null, plan.projections, engine.session.environment.hostFunctions());
     const projectEnv: EvalEnv = ra === null ? env : { ...env, hostBatch: ra.project! };
     try {
       for (let i = 0; i < em.end; i++) {
@@ -815,7 +799,9 @@ export function* bufferedRows(
   // The projection's host-function batch prefetch (extensibility.md §4.2.1), if any call in it is
   // eligible: host calls prefetch a chunk at a time and replay row by row.
   const batch =
-    em.mode === "project" ? HostBatch.forExprs(plan.projections, engine.session.extensions) : null;
+    em.mode === "project"
+      ? HostBatch.forExprs(plan.projections, engine.session.environment.hostFunctions())
+      : null;
   const benv: EvalEnv = batch === null ? env : { ...env, hostBatch: batch };
   for (let i = em.start; i < em.end; i++) {
     meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)

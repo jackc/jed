@@ -17,7 +17,7 @@
 import { Meter } from "./cost.ts";
 import { evalExpr } from "./eval.ts";
 import type { EvalEnv, RExpr } from "./executor.ts";
-import type { ExtensionRegistry, HostOutcome } from "./extension.ts";
+import type { HostFunctions, HostOutcome } from "./extension.ts";
 import type { Row } from "./storage.ts";
 import type { Value } from "./value.ts";
 
@@ -88,7 +88,7 @@ function unfetchedArg(a: RExpr, row: Row, env: EvalEnv): boolean {
 // Collect the eligible call nodes reachable from `e` (extensibility.md §4.2.1): a batch-kernel,
 // non-volatile host call with at least one argument, all trivially evaluable, reached only through
 // nodes that evaluate every operand (a cast, unary minus, NOT, IS [NOT] NULL, arithmetic, comparison).
-function collect(e: RExpr, registry: ExtensionRegistry, out: Slot[]): void {
+function collect(e: RExpr, registry: HostFunctions, out: Slot[]): void {
   switch (e.kind) {
     case "hostFunc":
       // A zero-argument call is never prefetched: its kernel receives no columns, so it could not
@@ -122,16 +122,16 @@ export class HostBatch {
   // The site's current row index, set by setRow before each row's evaluation.
   private row = 0;
   private readonly slots: Slot[];
-  private readonly registry: ExtensionRegistry;
+  private readonly registry: HostFunctions;
 
-  private constructor(slots: Slot[], registry: ExtensionRegistry) {
+  private constructor(slots: Slot[], registry: HostFunctions) {
     this.slots = slots;
     this.registry = registry;
   }
 
   // The batch for a site that evaluates every expression of `exprs` once per row, or null when no call
   // in them is eligible (§4.2.1).
-  static forExprs(exprs: RExpr[], registry: ExtensionRegistry | null): HostBatch | null {
+  static forExprs(exprs: RExpr[], registry: HostFunctions | null): HostBatch | null {
     if (registry === null) return null;
     const slots: Slot[] = [];
     for (const e of exprs) collect(e, registry, slots);
@@ -268,7 +268,7 @@ export class ReadAhead {
   static forSite(
     filter: RExpr | null,
     project: RExpr[],
-    registry: ExtensionRegistry | null,
+    registry: HostFunctions | null,
   ): ReadAhead | null {
     const f = filter === null ? null : HostBatch.forExprs([filter], registry);
     const p = HostBatch.forExprs(project, registry);

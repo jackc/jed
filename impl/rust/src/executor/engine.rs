@@ -7,13 +7,25 @@ use super::*;
 
 impl Engine {
     /// The session zone as a text-input context (timezones.md §9.3): every parse of an offset-less
-    /// `timestamptz` string — literal, assignment, bound parameter, container text — reads it.
+    /// `timestamptz` string — literal, assignment, bound parameter, container text — reads it. It
+    /// carries the environment's casing table for jsonpath text input.
     pub(crate) fn input_zone(&self) -> InputZone<'_> {
-        InputZone::new(&self.session.time_zone)
+        InputZone::with_casing(&self.session.time_zone, self.session.env.property())
     }
 
+    /// A fresh in-memory handle over a fresh empty environment (spec/design/environment.md §7).
     pub fn new() -> Self {
         Engine::with_page_size(DEFAULT_PAGE_SIZE)
+    }
+
+    /// Give this handle the environment `env` (spec/design/environment.md): its committed snapshot,
+    /// its default session, and that session's temp domain all resolve against it. For a freshly
+    /// created handle, before any statement runs — an opened file is decoded against its environment
+    /// already ([`Engine::open_paged`]).
+    pub(crate) fn set_environment(&mut self, env: crate::environment::Environment) {
+        self.committed.env = env.clone();
+        self.session.temp_committed.env = env.clone();
+        self.session.env = env;
     }
 
     /// An in-memory handle that serializes at `page_size`. The page-backed B-tree's fan-out tracks
@@ -33,7 +45,7 @@ impl Engine {
             free_gen_txid: 0,
             paging: None,
             read_only: false,
-            session: SessionState::new(),
+            session: SessionState::new(crate::environment::Environment::default()),
             temp_storage: None,
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             commit_stages_rows: false,
@@ -60,7 +72,9 @@ impl Engine {
     /// a snapshot it has pinned from the shared committed cell: a read handle keeps one of these
     /// with no open transaction (reads hit `committed` = the pinned snapshot); a write handle keeps
     /// one with an open READ WRITE block and publishes its working set back to the shared cell.
+    /// The session runs over the snapshot's environment — the handle's (spec/design/environment.md).
     pub(crate) fn from_snapshot(snap: Snapshot) -> Self {
+        let env = snap.env.clone();
         Engine {
             committed: snap,
             path: None,
@@ -73,7 +87,7 @@ impl Engine {
             free_gen_txid: 0,
             paging: None,
             read_only: false,
-            session: SessionState::new(),
+            session: SessionState::new(env),
             temp_storage: None,
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             commit_stages_rows: false,

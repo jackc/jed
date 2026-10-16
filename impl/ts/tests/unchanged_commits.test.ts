@@ -9,9 +9,10 @@ import { Pager } from "../src/pager.ts";
 import { SharedPaging } from "../src/paging.ts";
 import { Database } from "../src/shared.ts";
 import { createDatabase, openDatabase, attachFile } from "../src/lib.ts";
+import { Environment } from "../src/environment.ts";
 
 class CountingStore implements BlockStore {
-  memory = new MemoryBlockStore(toImage(new Snapshot(1n), 4096, 1n));
+  memory = new MemoryBlockStore(toImage(new Snapshot(new Environment(), 1n), 4096, 1n));
   writes = 0;
   syncs = 0;
   grows = 0;

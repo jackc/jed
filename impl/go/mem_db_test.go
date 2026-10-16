@@ -6,7 +6,12 @@ package jed
 // being the "caller who wants an infallible in-memory handle" the spec describes — a test helper,
 // never public surface.
 func memDB() *Database {
-	db, err := CreateDatabase(CreateOptions{})
+	return memDBIn(nil)
+}
+
+// memDBIn is memDB over env (nil ⇒ a fresh empty environment).
+func memDBIn(env *Environment) *Database {
+	db, err := CreateDatabase(CreateOptions{Environment: env})
 	if err != nil {
 		panic("in-memory CreateDatabase is infallible: " + err.Error())
 	}

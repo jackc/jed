@@ -29,7 +29,7 @@ func TestPartialUniqueConstrainsOnlyQualifyingAndPersists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	re, err := loadEngine(img)
+	re, err := loadEngine(img, NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -399,7 +399,7 @@ fn round_trip_preserves_unique() {
     run(&mut db, "CREATE INDEX plain ON t (w)");
     run(&mut db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)");
     let image = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(

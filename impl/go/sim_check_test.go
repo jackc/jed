@@ -23,7 +23,7 @@ func simIntegrity(image []byte, want uint64) (live, pages, free uint32, err erro
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
-	e, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize))
+	e, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment())
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}

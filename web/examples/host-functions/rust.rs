@@ -1,20 +1,17 @@
-use std::sync::Arc;
-
-use jed::{CreateOptions, Database, ExtensionRegistry, HostFunction, ScalarType, Value, Volatility};
+use jed::{CreateOptions, Database, Environment, HostFunction, ScalarType, Value, Volatility};
 
 fn main() -> jed::Result<()> {
-    // A host registers its own SCALAR FUNCTIONS over the built-in types. Build a registry, add
-    // functions, and hand it to create/open — the engine freezes it for the handle's lifetime and
-    // shares it into every session. It is a *handle* setting, never written to the file (a reopening
-    // host brings its own).
-    let mut registry = ExtensionRegistry::new();
+    // A host registers its own SCALAR FUNCTIONS over the built-in types on an environment builder,
+    // then hands the built Environment to create/open — it is frozen once built and shared by every
+    // session of the handle. It is never written to the file (a reopening host brings its own).
+    let env = Environment::builder()
 
     // discount(cents, pct) -> the price after a whole-percent discount. STRICT — a NULL argument
     // short-circuits to NULL before the kernel runs, so the closure never sees one — and reached by
     // an EXACT (i64, i64) signature (no implicit promotion; a built-in of the same signature would
     // win). `.cost(2)` is charged once per call and gated against a session's max_cost, so the
     // function stays inside the untrusted-query bound.
-    registry.register_function(
+        .register_function(
         HostFunction::new(
             "discount",
             vec![ScalarType::Int64, ScalarType::Int64],
@@ -31,13 +28,13 @@ fn main() -> jed::Result<()> {
         .cost(2)
         .component_id("com.example/discount") // a stable identity for index-backing
         .semantic_version(1), // bump when a formula change would invalidate stored index keys
-    )?;
+    )?
 
     // with_tax(cents) -> cents plus 8% tax, as a BATCH kernel: it receives a whole column of rows per
     // call (args[0][i] is row i's argument) and appends one result per row to `out`. jed calls it
     // once per chunk where it already holds the rows, and one row at a time elsewhere — same rows,
     // cost, and errors either way.
-    registry.register_function(
+        .register_function(
         HostFunction::batched(
             "with_tax",
             vec![ScalarType::Int64],
@@ -51,15 +48,16 @@ fn main() -> jed::Result<()> {
             }),
         )
         .volatility(Volatility::Immutable),
-    )?;
+    )?
+        .build();
 
-    let mut db = Database::create(CreateOptions { extensions: Arc::new(registry), ..Default::default() })?;
+    let mut db = Database::create(CreateOptions { environment: env, ..Default::default() })?;
 
     db.execute("CREATE TABLE product (id i32 PRIMARY KEY, name text, price_cents i64)", &[])?;
     db.execute("INSERT INTO product VALUES (1, 'Mug', 1250), (2, 'Notebook', 400)", &[])?;
 
     // Because discount is IMMUTABLE and carries a component identity, it can back a persisted index.
-    // On reopen, if the registry supplies a different component/version, the index is skipped for
+    // On reopen, if the environment supplies a different component/version, the index is skipped for
     // reads (a correct heap scan) and refused for writes — never a silently stale result.
     db.execute("CREATE INDEX ON product (discount(price_cents, 10))", &[])?;
 

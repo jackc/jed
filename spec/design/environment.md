@@ -1,12 +1,9 @@
-# Environment — one explicit home for the engine's outside inputs (design PROPOSAL)
+# Environment — one explicit home for the engine's outside inputs
 
-> ⚠️ **PROPOSAL — NOT A SETTLED SPECIFICATION.** Nothing here is built. The current behavior
-> remains in force: process-global loaded collation and timezone data ([collation.md](collation.md)
-> §4.2, [timezones.md](timezones.md) §3.3), the `ExtensionRegistry` passed in open/create options
-> ([api.md](api.md) §12), and the random and clock sources set on the database handle (api.md §10,
-> [entropy.md](entropy.md) §5/§6). Agreed so far: the environment holds every input from outside
-> the engine except storage (§2), and it is produced by a builder and immutable once built (§3).
-> Remaining open decisions are in §10.
+> **Status: landed in all three cores.** The process-global loaded collation and time-zone sets,
+> the free-function and handle-level loads, the per-handle `ExtensionRegistry`, and the entropy/clock
+> setters are gone; every outside input except storage arrives in one immutable `Environment` passed
+> to `open`/`create`. The §10 decisions are settled there. §1 records the problem as it stood.
 
 ## 1. The problem
 
@@ -55,7 +52,7 @@ ones.
 **The environment holds every input the engine takes from outside itself, except storage.** The
 database handle and its sessions keep policy and resource settings.
 
-| Input | Today | Proposed |
+| Input | Before | Now |
 |---|---|---|
 | Unicode data (collations, casing) | process-global | environment |
 | Timezone data | process-global | environment |
@@ -206,12 +203,21 @@ and changes only what it is told to), and lifetime (a database outlives the call
 Amended on adoption: collation.md §4.2/§11, timezones.md §3.3, entropy.md §5/§6, api.md §10/§12,
 extensibility.md §7, determinism.md §5, and the CLAUDE.md §10 wording of the entropy/clock seam.
 
-## 10. Open decisions
+## 10. Settled decisions
 
-1. **The name.** `Environment` is a working name (cf. RocksDB's `Env`). Alternatives: `Runtime`,
-   `Host`, `Context`.
-2. **The controllable-source API** (§4): method names, and whether the harness needs anything
-   beyond reseed/set/advance/reset.
-3. **What a derived builder may change** (§3): add bundles and functions and replace sources
-   only, or also remove. Removing is rarely needed and makes "derived from" a weaker statement about
-   shared contents; add-and-replace is recommended.
+1. **The name** is `Environment` (cf. RocksDB's `Env`); the builder is `EnvironmentBuilder`.
+2. **The controllable-source API** (§4) is reseed / set / advance / reset, and nothing more: the
+   conformance harness wraps the provided sources in its own switchable source objects (implementing
+   the public source interfaces) that default to OS entropy and the wall clock between records.
+
+   | | Rust | Go | TS |
+   |---|---|---|---|
+   | interfaces | `trait RandomSource { fn fill(&self, &mut [u8]) -> Result<()> }`, `trait ClockSource { fn now_micros(&self) -> i64 }` (`Send + Sync`) | `RandomSource { Fill([]byte) error }`, `ClockSource { NowMicros() int64 }` | `RandomSource { fill(Uint8Array) }`, `ClockSource { nowMicros(): bigint }` |
+   | defaults | `os_random_source()`, `wall_clock()` | `OSRandomSource()`, `WallClock()` | `osRandomSource()`, `wallClock()` |
+   | seeded | `seeded_random_source(seed)` → `SeededRandom` (`reseed`) | `NewSeededRandom(seed)` (`Reseed`) | `seededRandomSource(seed)` → `SeededRandom` (`reseed`) |
+   | manual clock | `manual_clock(micros)` → `ManualClock` (`set`, `advance`) | `NewManualClock(micros)` (`Set`, `Advance`) | `manualClock(micros)` → `ManualClock` (`set`, `advance`) |
+   | advancing clock | `advancing_clock(start, step)` → `AdvancingClock` (`reset`) | `NewAdvancingClock(start, step)` (`Reset`) | `advancingClock(start, step)` → `AdvancingClock` (`reset`) |
+
+3. **A derived builder may only add and replace** (§3): more bundles and functions (first-wins, as
+   in any builder), and replacement random/clock sources. Nothing can be removed, so a derived
+   environment is always a superset of the one it came from.

@@ -469,8 +469,8 @@ func TestInsertCacheRechecksPrivilegeAndReadOnly(t *testing.T) {
 }
 
 func TestInsertCacheCollationUpgradeInvalidates(t *testing.T) {
-	loadFixtureBundle(t)
-	base := memDB()
+	env := loadFixtureBundle(t)
+	base := memDBIn(env)
 	s := base.Session(SessionOptions{})
 	mustExec(t, s, `CREATE TABLE t (id i32 PRIMARY KEY, x text COLLATE "unicode")`)
 	stmt, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
@@ -481,7 +481,7 @@ func TestInsertCacheCollationUpgradeInvalidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := stmt.ic.p.Load().plan
-	loaded := LoadedCollation("unicode")
+	loaded := env.collation("unicode")
 	skewed := *loaded
 	skewed.UnicodeVersion = "0.0.0"
 	s.engine.committed.collations["unicode"] = &skewed

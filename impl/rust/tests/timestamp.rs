@@ -20,9 +20,7 @@ fn parse(ty: &str, input: &str) -> jed::Result<i64> {
     match ty {
         "timestamp" => parse_timestamp(input),
         // The vectors are UTC-session parses (an offset-less wall clock reads as UTC).
-        "timestamptz" => {
-            parse_timestamptz(input, &jed::tooling::timezone::resolve_zone("UTC").unwrap())
-        }
+        "timestamptz" => parse_timestamptz(input, &jed::tooling::timezone::ZoneRef::Fixed(0)),
         other => panic!("unknown type {other}"),
     }
 }

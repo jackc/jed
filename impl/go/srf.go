@@ -349,7 +349,7 @@ func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn) ([]
 			if !query && c.Wrapper != jWWithout {
 				return nil, newError(FeatureNotSupported, "a WRAPPER on a scalar JSON_TABLE column is not supported yet")
 			}
-			compiled, err := jtCompilePath(c.Path, c.Name)
+			compiled, err := jtCompilePath(c.Path, c.Name, db.session.env.propertyTable())
 			if err != nil {
 				return nil, err
 			}
@@ -370,7 +370,7 @@ func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn) ([]
 			if err != nil {
 				return nil, err
 			}
-			compiled, err := jtCompilePath(c.Path, c.Name)
+			compiled, err := jtCompilePath(c.Path, c.Name, db.session.env.propertyTable())
 			if err != nil {
 				return nil, err
 			}
@@ -383,7 +383,7 @@ func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn) ([]
 				onError:   jtBehavior(c.OnError, jOBFalse),
 			})
 		case *jtColumnNested:
-			compiled, err := compile(c.Path)
+			compiled, err := compile(c.Path, db.session.env.propertyTable())
 			if err != nil {
 				return nil, err
 			}
@@ -1470,7 +1470,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		if err := checkVarsObject(varsNode); err != nil {
 			return nil, err
 		}
-		compiled, err := compileMetered(path.str(), m)
+		compiled, err := compileMetered(path.str(), m, db.session.env.propertyTable())
 		if err != nil {
 			return nil, err
 		}
@@ -1706,7 +1706,7 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 		return nil, err
 	}
 	// The root path → the sequence of row items (a structural error here yields no rows).
-	root, err := compileMetered(plan.rootPath, m)
+	root, err := compileMetered(plan.rootPath, m, db.session.env.propertyTable())
 	if err != nil {
 		return nil, err
 	}
@@ -1769,12 +1769,12 @@ func jtScalarType(db *engine, typeName string) (scalarType, *decimalTypmod, erro
 
 // jtCompilePath compiles a JSON_TABLE column path — the explicit `PATH p`, or the default
 // `$.<column_name>` — to its canonical rendered form (validating; malformed → 42601).
-func jtCompilePath(path *string, name string) (string, error) {
+func jtCompilePath(path *string, name string, prop *propertyTable) (string, error) {
 	src := "$." + name
 	if path != nil {
 		src = *path
 	}
-	compiled, err := compile(src)
+	compiled, err := compile(src, prop)
 	if err != nil {
 		return "", err
 	}
@@ -1809,7 +1809,7 @@ func expandJtLevel(cols []jtCol, items []JsonNode, vars jpVars, env *evalEnv, m 
 				}
 				local = append(local, jtAssign{idx: c.idx, v: v})
 			case *jtColExists:
-				v, err := evalJtExists(item, c, vars, m)
+				v, err := evalJtExists(item, c, vars, env.exec.session.env.propertyTable(), m)
 				if err != nil {
 					return nil, err
 				}
@@ -1848,7 +1848,7 @@ func expandJtNested(children []*jtColNested, item *JsonNode, vars jpVars, env *e
 	}
 	var union [][]jtAssign
 	for _, child := range children {
-		p, err := compileMetered(child.path, m)
+		p, err := compileMetered(child.path, m, env.exec.session.env.propertyTable())
 		if err != nil {
 			return nil, err
 		}
@@ -1875,7 +1875,7 @@ func expandJtNested(children []*jtColNested, item *JsonNode, vars jpVars, env *e
 // evalJtRegular evaluates a regular JSON_TABLE column over a row item — JSON_VALUE (scalar) /
 // JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
 func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m *costMeter) (Value, error) {
-	p, err := compileMetered(c.path, m)
+	p, err := compileMetered(c.path, m, env.exec.session.env.propertyTable())
 	if err != nil {
 		return Value{}, err
 	}
@@ -1896,8 +1896,8 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, vars jpVars, env *evalEnv, m
 
 // evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the
 // column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
-func evalJtExists(item *JsonNode, c *jtColExists, vars jpVars, m *costMeter) (Value, error) {
-	p, err := compileMetered(c.path, m)
+func evalJtExists(item *JsonNode, c *jtColExists, vars jpVars, prop *propertyTable, m *costMeter) (Value, error) {
+	p, err := compileMetered(c.path, m, prop)
 	if err != nil {
 		return Value{}, err
 	}

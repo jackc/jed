@@ -12,8 +12,6 @@ import {
   foldCase,
   foldLowerSimple,
   loadBundle,
-  loadedCollation,
-  loadUnicodeData,
   openBundle,
   openCollation,
   type PropertyTable,
@@ -22,6 +20,7 @@ import {
   serializeTable,
   sortKey,
 } from "../src/collation.ts";
+import { Environment } from "../src/environment.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 import { bytesToHex } from "./util.ts";
 
@@ -29,10 +28,12 @@ function definition(files: string[]): string {
   return files.map((f) => readFileSync(specPath(f), "utf8")).join("\n");
 }
 
-// Load jed's pinned production JUCD bundle (spec/collation/fixtures/unicode.jucd) into the
-// engine-global loaded set — the production read path the cores now take (no embed). Idempotent.
-function loadFixtureBundle(): void {
-  loadUnicodeData(readFileSync(specPath("collation/fixtures/unicode.jucd")));
+// An environment with jed's pinned production JUCD bundle (spec/collation/fixtures/unicode.jucd)
+// loaded — the production read path the cores now take (no embed).
+function loadFixtureBundle(): Environment {
+  return Environment.builder()
+    .loadUnicodeData(readFileSync(specPath("collation/fixtures/unicode.jucd")))
+    .build();
 }
 
 function cmpBytes(a: Uint8Array, b: Uint8Array): number {
@@ -64,7 +65,7 @@ test("collation sort keys match vectors and are strictly ascending", () => {
   // The real version-pinned collations (unicode, es) resolve from the loaded production bundle (the
   // host-load read path), not by recompiling their ~2.3 MB source; the small dev fixtures (not in the
   // bundle) fall back to compiling from their definition files.
-  loadFixtureBundle();
+  const env = loadFixtureBundle();
   const rows = readTomlTables(specPath("collation/vectors/sortkey.toml"), "sortkey");
   assert.ok(rows.length > 0, "no sortkey vectors");
 
@@ -78,7 +79,7 @@ test("collation sort keys match vectors and are strictly ascending", () => {
     const want = row.str("sortkey_hex");
     if (collName !== lastColl) {
       coll =
-        loadedCollation(collName) ?? compileCollation(collName, definition(row.strs("def_files")));
+        env.collation(collName) ?? compileCollation(collName, definition(row.strs("def_files")));
       lastColl = collName;
       prev = null;
     }
@@ -149,7 +150,7 @@ test("openCollation rejects a tampered artifact", () => {
 // The casing kernels' DIVERGENCES from the PG/glibc oracle (collation.md §16) — what the oracle corpus
 // cannot express (CLAUDE.md §10): the ASCII baseline (non-ASCII passes through) and full SpecialCasing
 // (ß→SS). The kernels take an EXPLICIT property table, so the un-loaded (ASCII) regime is deterministic
-// regardless of the engine-global loaded set. Mirrors collation.rs casing_tests / collation_test.go.
+// regardless of any environment's loaded set. Mirrors collation.rs casing_tests / collation_test.go.
 test("casing kernels: ASCII baseline, full Unicode, and simple-only ILIKE folding", () => {
   const p: PropertyTable = {
     simple: [

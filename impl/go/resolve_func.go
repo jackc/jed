@@ -1077,7 +1077,7 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	if rargs[1].kind == reConstText && insensitiveKnown {
 		pat := rargs[1].cText
 		if insensitive {
-			pat = foldRegexPattern(pat, loadedProperty())
+			pat = foldRegexPattern(pat, s.catalog.session.env.propertyTable())
 		}
 		var err error
 		prog, err = compileRegex(pat)
@@ -1208,7 +1208,7 @@ func resolveTimezone(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	default:
 		return nil, resolvedType{}, noFuncOverload("timezone")
 	}
-	if err := params.noteIndexZone(zoneR); err != nil {
+	if err := params.noteIndexZone(zoneR, s.catalog.session.env); err != nil {
 		return nil, resolvedType{}, err
 	}
 	return &rExpr{kind: reAtTimeZone, lhs: zoneR, rhs: valueR, atTzToTimestamptz: toTimestamptz}, result, nil
@@ -1257,7 +1257,7 @@ func resolveDateTrunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		sargs = append(sargs, zoneR)
 	}
 	if len(sargs) == 3 {
-		if err := params.noteIndexZone(sargs[2]); err != nil {
+		if err := params.noteIndexZone(sargs[2], s.catalog.session.env); err != nil {
 			return nil, resolvedType{}, err
 		}
 	} else {
@@ -2677,7 +2677,7 @@ func evalJsonpath(ctx, path Value, opts jpEvalOpts, silent bool, m *costMeter) (
 // ends the evaluation: the items found before it are returned with errored = true.
 func evalJsonpathOn(node JsonNode, path Value, opts jpEvalOpts, silent bool, m *costMeter) (seq []JsonNode, errored bool, err error) {
 	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
-	compiled, err := compileMetered(path.str(), m)
+	compiled, err := compileMetered(path.str(), m, opts.prop)
 	if err != nil {
 		return nil, false, err
 	}
@@ -3343,7 +3343,7 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	// A built-in scalar function OR a host-registered one (extensibility.md §4.2 — a host-only name
 	// routes here too; resolveScalarFunc tries the built-in catalog first, then the host registry).
 	// Host functions are positional-only, so rejectNamed applies to them as well.
-	if isScalarFuncName(name) || s.catalog.session.extensions.hasFunction(name) {
+	if isScalarFuncName(name) || s.catalog.session.env.hosts.hasFunction(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -3596,7 +3596,7 @@ func resolveMakeTimestamp(s *scope, name string, fc *funcCallExpr, ag *aggCtx, p
 	}
 	if isTz {
 		if len(rargs) == 7 {
-			if err := params.noteIndexZone(rargs[6]); err != nil {
+			if err := params.noteIndexZone(rargs[6], s.catalog.session.env); err != nil {
 				return nil, resolvedType{}, err
 			}
 		} else {
@@ -3737,7 +3737,7 @@ func adoptScalarOverload(s *scope, fc *funcCallExpr, desc *operatorDesc, rargs [
 // function exactly. Returns the host-function id (a stable registry index) + its declared scalar
 // result type, or ok=false (the caller falls through to 42883).
 func resolveHostScalar(s *scope, name string, tys []resolvedType) (int, scalarType, bool) {
-	reg := s.catalog.session.extensions
+	reg := s.catalog.session.env.hosts
 	if reg == nil {
 		return 0, 0, false
 	}

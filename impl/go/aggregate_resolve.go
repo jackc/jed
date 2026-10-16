@@ -817,7 +817,7 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		// A known non-window function is PostgreSQL's 42809 (no hint); an unknown name is its
 		// function-lookup failure (error-fields.md §11.7).
 		err := newError(UndefinedFunction, name+" is not a window function")
-		if isScalarFuncName(name) || s.catalog.session.extensions.hasFunction(name) {
+		if isScalarFuncName(name) || s.catalog.session.env.hosts.hasFunction(name) {
 			return nil, resolvedType{}, err.noHint()
 		}
 		return nil, resolvedType{}, err.hinted(hintFunctionNoMatch)

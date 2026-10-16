@@ -933,7 +933,7 @@ impl Storage {
         };
         // A file's old pager is already closed and poisoned here, so a failed reload leaves the
         // handle needing a reopen; an in-memory domain keeps its old store untouched.
-        let engine = Engine::open_shared_paging(Arc::clone(&paging))?;
+        let engine = Engine::open_shared_paging(Arc::clone(&paging), &snap.env)?;
         self.paging = paging;
         self.page_count = engine.page_count;
         self.free_pages = engine.free_pages.clone();
@@ -978,11 +978,11 @@ pub(crate) struct Shared {
     coordinator: Option<Arc<FileCoordinator>>,
     /// Advances when a foreign txid is adopted; prepared plans clear lazily when this changes.
     plan_epoch: AtomicU64,
-    /// The frozen host extension registry (spec/design/extensibility.md §7): the scalar functions the
-    /// host supplied in the create/open options, shared into every minted session's [`SessionState`].
-    /// An empty default when no extensions were supplied. `Send + Sync` (its kernels are), so the
-    /// `Send + Sync` [`Database`] is unaffected.
-    extensions: Arc<crate::extension::ExtensionRegistry>,
+    /// The handle's environment (spec/design/environment.md), given in the create/open options: the
+    /// loaded Unicode and time-zone data, the host functions, and the random and clock sources. Every
+    /// minted session, attachment, temp domain, and reload uses it. `Send + Sync`, so the `Send +
+    /// Sync` [`Database`] is unaffected.
+    env: crate::environment::Environment,
 }
 
 impl Shared {
@@ -1224,7 +1224,7 @@ impl Shared {
             .paging
             .clone();
         paging.pager().refresh_allocated_pages()?;
-        let engine = Engine::open_shared_paging(paging)?;
+        let engine = Engine::open_shared_paging(paging, &self.env)?;
         let current = self
             .roots
             .read()
@@ -1260,7 +1260,7 @@ impl Shared {
             attachment.storage.paging.clone()
         };
         paging.pager().refresh_allocated_pages()?;
-        let engine = Engine::open_shared_paging(paging)?;
+        let engine = Engine::open_shared_paging(paging, &self.env)?;
         let current = self
             .roots
             .read()
@@ -2013,18 +2013,12 @@ impl Database {
     /// so an in-memory tree must be built at the size it will serialize to; that is why
     /// [`CreateOptions::page_size`] is meaningful for the in-memory backing too.
     fn in_memory(page_size: u32) -> Database {
-        Self::in_memory_with(
-            page_size,
-            Arc::new(crate::extension::ExtensionRegistry::default()),
-        )
+        Self::in_memory_with(page_size, &crate::environment::Environment::default())
     }
 
-    /// [`in_memory`](Self::in_memory) carrying a host extension registry (the in-memory branch of
-    /// [`Database::create`] with `CreateOptions::extensions`).
-    fn in_memory_with(
-        page_size: u32,
-        extensions: Arc<crate::extension::ExtensionRegistry>,
-    ) -> Database {
+    /// [`in_memory`](Self::in_memory) over the environment `env` (the in-memory branch of
+    /// [`Database::create`] with `CreateOptions::environment`).
+    fn in_memory_with(page_size: u32, env: &crate::environment::Environment) -> Database {
         // B3 (bplus-reshape.md): an in-memory database is a `MemoryBlockStore` seeded with the
         // empty from-scratch image, read/written through the same pager + Packed path as a file.
         // txid 0 is the pre-first-commit version (the same committed version an in-memory core
@@ -2032,8 +2026,9 @@ impl Database {
         let image = Snapshot::default()
             .to_image(page_size, 0)
             .expect("an empty in-memory image always serializes");
-        let engine = Engine::from_image(&image).expect("an empty in-memory image always loads");
-        Database::from_engine_coordinated(engine, None, extensions)
+        let engine =
+            Engine::from_image_in(&image, env).expect("an empty in-memory image always loads");
+        Database::from_engine_coordinated(engine, None)
     }
 
     /// Build a shared core from a freshly opened/created/loaded [`Engine`] (file.rs / `from_image`):
@@ -2042,20 +2037,13 @@ impl Database {
     /// a file's `FileBlockStore` or an in-memory `MemoryBlockStore` — so this is the one
     /// constructor for both hosts. The committed snapshot's stores already carry the shared
     /// `Arc<SharedPaging>`, so every pinned/cloned snapshot faults clean pages through the one pool
-    /// (spec/design/pager.md).
+    /// (spec/design/pager.md). The engine's environment becomes the handle's.
     pub(crate) fn from_engine(engine: Engine) -> Database {
-        Self::from_engine_coordinated(
-            engine,
-            None,
-            Arc::new(crate::extension::ExtensionRegistry::default()),
-        )
+        Self::from_engine_coordinated(engine, None)
     }
 
-    fn from_engine_coordinated(
-        engine: Engine,
-        coordinator: Option<FileCoordinator>,
-        extensions: Arc<crate::extension::ExtensionRegistry>,
-    ) -> Database {
+    fn from_engine_coordinated(engine: Engine, coordinator: Option<FileCoordinator>) -> Database {
+        let env = engine.session.env.clone();
         let coordinator = coordinator.map(Arc::new);
         let paging = engine
             .paging
@@ -2096,7 +2084,7 @@ impl Database {
             attachment_count: AtomicUsize::new(0),
             coordinator,
             plan_epoch: AtomicU64::new(0),
-            extensions,
+            env,
         });
         if let Some(coordinator) = &shared.coordinator {
             let weak: Weak<Shared> = Arc::downgrade(&shared);
@@ -2117,8 +2105,16 @@ impl Database {
     /// Reconstruct an **in-memory** shared core from a database image (`XX001` on a malformed image).
     /// The shared-core analogue of [`Engine::from_image`] — since B3 the image becomes the core's
     /// `MemoryBlockStore`, demand-paged like a file (one read path).
-    pub fn from_image(image: &[u8]) -> Result<Database> {
-        Ok(Database::from_engine(Engine::from_image(image)?))
+    ///
+    /// The image's collation references resolve against `environment`, which becomes the handle's.
+    pub fn from_image(
+        image: &[u8],
+        environment: crate::environment::Environment,
+    ) -> Result<Database> {
+        Ok(Database::from_engine(Engine::from_image_in(
+            image,
+            &environment,
+        )?))
     }
 
     /// Serialize the whole committed state to a single, clean from-scratch on-disk image (the inverse
@@ -2289,9 +2285,9 @@ impl Database {
         } else {
             opts.page_size
         };
-        // Frozen at create, shared into every minted session (extensibility.md §7). Captured before
-        // the `opts.path` move below.
-        let extensions = opts.extensions.clone();
+        // The handle's environment (environment.md), shared into every minted session. Captured
+        // before the `opts.path` move below.
+        let env = opts.environment.clone();
         match opts.path {
             Some(path) => {
                 let coordinator =
@@ -2299,14 +2295,15 @@ impl Database {
                 let canonical = coordinator
                     .as_ref()
                     .map_or(path.as_path(), FileCoordinator::path);
-                let engine = Engine::create(
+                let mut engine = Engine::create(
                     canonical,
                     DatabaseOptions {
                         page_size,
                         no_sync: opts.skip_fsync,
                     },
                 )?;
-                let db = Database::from_engine_coordinated(engine, coordinator, extensions);
+                engine.set_environment(env);
+                let db = Database::from_engine_coordinated(engine, coordinator);
                 db.0.storage
                     .lock()
                     .expect("storage lock not poisoned")
@@ -2316,7 +2313,7 @@ impl Database {
             }
             // in-memory never fsyncs; skip_fsync is a no-op
             None => {
-                let db = Database::in_memory_with(page_size, extensions);
+                let db = Database::in_memory_with(page_size, &env);
                 db.0.storage
                     .lock()
                     .expect("storage lock not poisoned")
@@ -2336,9 +2333,6 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
-        // Frozen at open, shared into every minted session (extensibility.md §7). Captured before the
-        // `..opts` move below (the Engine layer ignores it — extensions live on the shared core).
-        let extensions = opts.extensions.clone();
         let max_storage_bytes = opts.max_storage_bytes;
         let coordinator =
             FileCoordinator::open(path.as_ref(), opts.locking, opts.file_lock_timeout_ms)?;
@@ -2358,13 +2352,20 @@ impl Database {
             },
         )?;
         drop(commit);
-        let db = Database::from_engine_coordinated(engine, coordinator, extensions);
+        let db = Database::from_engine_coordinated(engine, coordinator);
         db.0.storage
             .lock()
             .expect("storage lock not poisoned")
             .budget
             .limit = max_storage_bytes;
         Ok(db)
+    }
+
+    /// The environment this handle was created or opened with (spec/design/environment.md): its
+    /// loaded collations and time zones, host functions, and random and clock sources. Every session,
+    /// attachment, and temp domain of this handle uses it.
+    pub fn environment(&self) -> &crate::environment::Environment {
+        &self.0.env
     }
 
     /// The committed version currently published (the monotonic commit counter, transactions.md
@@ -2437,6 +2438,8 @@ impl Database {
                 OpenOptions {
                     read_only,
                     locking: Locking::None,
+                    // An attachment uses its handle's environment (environment.md §3).
+                    environment: self.0.env.clone(),
                     ..OpenOptions::default()
                 },
             )?;
@@ -2493,7 +2496,7 @@ impl Database {
                 None => {
                     let mut storage = Storage::new_temp(self.0.page_size());
                     storage.budget.limit = source.max_storage_bytes;
-                    let mut empty = Snapshot::default();
+                    let mut empty = Snapshot::with_environment(self.0.env.clone());
                     empty.set_store_paging(storage.paging().clone());
                     (storage, empty, None)
                 }
@@ -2603,7 +2606,6 @@ impl Database {
         engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
-        engine.session.extensions = self.0.extensions.clone(); // the frozen host registry (extensibility.md §7)
         Session {
             shared: self.0.clone(),
             engine,
@@ -2640,7 +2642,6 @@ impl Database {
         self.0.configure_engine(&mut engine);
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
-        engine.session.extensions = self.0.extensions.clone(); // the frozen host registry (extensibility.md §7)
         engine
             .begin_tx(Some(true))
             .expect("a fresh handle has no open transaction");
@@ -2680,8 +2681,7 @@ impl Database {
         self.0.configure_engine(&mut engine);
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
-        engine.session = SessionState::with_options(opts);
-        engine.session.extensions = self.0.extensions.clone(); // the frozen host registry (extensibility.md §7)
+        engine.session = SessionState::with_options(opts, self.0.env.clone());
         if pinned.is_some() {
             // The engine enforces read-only too, so `begin_tx` rejects an explicit `BEGIN READ WRITE`
             // (25006) and downgrades a plain `BEGIN` to a read-only block (the access check above only
@@ -3518,21 +3518,9 @@ impl Session {
     pub fn render(&self, v: &Value) -> Result<String> {
         v.render_in(&self.engine.session.time_zone)
     }
-    /// Inject a random source for the uuid generators (entropy.md §6).
-    pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
-        self.engine.session.set_random_source(f);
-    }
-    /// Clear the injected random source (return to the OS CSPRNG).
-    pub fn clear_random_source(&mut self) {
-        self.engine.session.clear_random_source();
-    }
-    /// Inject a clock source for `uuidv7` / the clock functions (entropy.md §6).
-    pub fn set_clock_source(&mut self, f: crate::seam::ClockSource) {
-        self.engine.session.set_clock_source(f);
-    }
-    /// Clear the injected clock source (return to the wall clock).
-    pub fn clear_clock_source(&mut self) {
-        self.engine.session.clear_clock_source();
+    /// The environment this session runs in — its database handle's (spec/design/environment.md).
+    pub fn environment(&self) -> &crate::environment::Environment {
+        &self.engine.session.env
     }
     /// Reset the authorization envelope to fully permissive — every table privilege, no per-object
     /// delta, DDL (incl. temp DDL) allowed (§5.3).
@@ -3662,11 +3650,7 @@ impl Database {
         engine: Engine,
         coordinator: FileCoordinator,
     ) -> Database {
-        Self::from_engine_coordinated(
-            engine,
-            Some(coordinator),
-            Arc::new(crate::extension::ExtensionRegistry::default()),
-        )
+        Self::from_engine_coordinated(engine, Some(coordinator))
     }
 
     /// Route MAIN's file operations (compaction, the first commit's directory barrier, opening a

@@ -103,7 +103,7 @@ fn composite_values_persist_through_image() {
     run(&mut db, "INSERT INTO p VALUES (1, ROW('Main', 90210))");
     run(&mut db, "INSERT INTO p VALUES (2, ROW('Oak', NULL))");
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .expect("reload")
         .session(SessionOptions::default());
     assert_eq!(
@@ -255,7 +255,7 @@ fn types_persist_through_image() {
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
 
     let image = db.to_image(256, 1).unwrap();
-    let loaded = Database::from_image(&image)
+    let loaded = Database::from_image(&image, jed::Environment::default())
         .expect("reload")
         .session(SessionOptions::default());
 
@@ -311,7 +311,7 @@ fn composite_with_array_field_image_roundtrip() {
     );
     run(&mut db, "INSERT INTO t VALUES (2, ROW('b', NULL))");
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .expect("reload")
         .session(SessionOptions::default());
     let ct = loaded.composite_type("poly").expect("poly persists");
@@ -342,7 +342,7 @@ fn composite_with_array_of_composite_field() {
         "INSERT INTO t VALUES (1, ROW('jo', '{\"(Main,1)\",\"(Oak,2)\"}'))",
     );
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .expect("reload")
         .session(SessionOptions::default());
     // The persisted array-of-composite field re-resolves and the value round-trips.

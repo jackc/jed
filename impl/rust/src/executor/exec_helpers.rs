@@ -527,7 +527,7 @@ impl crate::cursor::RowStream for BufferedScan {
                         EmitMode::Project => ReadAhead::for_site(
                             None,
                             &self.plan.projections,
-                            &self.engine.session.extensions,
+                            self.engine.session.env.functions(),
                         ),
                         EmitMode::Identity => None,
                     },
@@ -545,7 +545,7 @@ impl crate::cursor::RowStream for BufferedScan {
                     batch: match mode {
                         EmitMode::Project => HostBatch::for_exprs(
                             &self.plan.projections,
-                            &self.engine.session.extensions,
+                            self.engine.session.env.functions(),
                         ),
                         EmitMode::Identity => None,
                     },
@@ -559,7 +559,7 @@ impl crate::cursor::RowStream for BufferedScan {
                     ahead: ReadAhead::for_site(
                         None,
                         &self.plan.projections,
-                        &self.engine.session.extensions,
+                        self.engine.session.env.functions(),
                     ),
                 },
                 Emitter::Columnar {

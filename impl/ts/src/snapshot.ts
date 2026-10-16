@@ -27,7 +27,8 @@ import {
   indexEntryKeysColumns,
 } from "./executor.ts";
 import { buildGistFromLeafKeys } from "./gist.ts";
-import { loadedCollation, versionSkew } from "./collation.ts";
+import { versionSkew } from "./collation.ts";
+import type { Environment } from "./environment.ts";
 import { engineError } from "./errors.ts";
 import type { Entry, Row } from "./storage.ts";
 import { compareBytes } from "./pmap.ts";
@@ -112,8 +113,13 @@ export class Snapshot {
   // Carried through clone() so a tx's working snapshot creates stores against the same domain page
   // space. NEVER serialized.
   storePaging: SharedPaging | null = null;
+  // environment is the Environment of the database handle this snapshot belongs to
+  // (spec/design/environment.md §3): the loaded collations a referenced name resolves against.
+  // Carried through clone() like storePaging; NEVER serialized.
+  environment: Environment;
 
   constructor(
+    environment: Environment,
     txid: bigint = 0n,
     tables: Map<string, Table> = new Map(),
     stores: Map<string, TableStore> = new Map(),
@@ -123,6 +129,7 @@ export class Snapshot {
     collations: Map<string, Collation> = new Map(),
     defaultCollation: string | null = null,
   ) {
+    this.environment = environment;
     this.txid = txid;
     this.tables = tables;
     this.stores = stores;
@@ -138,6 +145,7 @@ export class Snapshot {
   // is an O(1) persistent-map clone (pmap.ts).
   clone(): Snapshot {
     const c = new Snapshot(
+      this.environment,
       this.txid,
       new Map(this.tables),
       cloneStores(this.stores),
@@ -333,12 +341,13 @@ export class Snapshot {
 
   // resolveCollation resolves a collation name for USE — query resolution and key encoding
   // (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
-  // open from the file's reference entries, carrying their version pin) first, then the engine-global
-  // LOADED set (db.loadUnicodeData, §4). undefined ⇒ neither has it (resolver → 42704). C is handled
+  // open from the file's reference entries, carrying their version pin) first, then the collations
+  // the handle's environment loaded (§4, environment.md). undefined ⇒ neither has it (resolver →
+  // 42704). C is handled
   // by the caller (built-in). This is the reference-only read path: a collation is never baked into
   // the file — the file references it by name and the table comes from a loaded bundle.
   resolveCollation(name: string): Collation | undefined {
-    return this.collations.get(name) ?? loadedCollation(name);
+    return this.collations.get(name) ?? this.environment.collation(name);
   }
 
   // collationSkew is the slice-2d version-skew verdict for a referenced collation (collation.md §12):
@@ -346,11 +355,15 @@ export class Snapshot {
   // different (unicode, cldr) than the loaded bundle provides — the object using it is read-only
   // (XX002 on write) — else undefined (Full: same version, or this collation has no catalog-local file
   // pin so it is freshly the loaded version, an in-memory-only database). A pure comparison of the file
-  // pin already in the catalog (§5) vs the engine-global loaded set; the Snapshot wiring of versionSkew.
+  // pin already in the catalog (§5) vs the environment's loaded set; the Snapshot wiring of versionSkew.
   collationSkew(name: string): [string, string, string, string] | undefined {
     const cat = this.collations.get(name);
     if (cat === undefined) return undefined;
-    const loaded = versionSkew(name, cat.unicodeVersion, cat.cldrVersion);
+    const loaded = versionSkew(
+      this.environment.collation(name),
+      cat.unicodeVersion,
+      cat.cldrVersion,
+    );
     if (loaded === undefined) return undefined;
     return [cat.unicodeVersion, cat.cldrVersion, loaded[0], loaded[1]];
   }
@@ -576,7 +589,7 @@ export class Snapshot {
     }
     // Advance each skewed collation's pin to the loaded version.
     for (const name of skewed) {
-      const loaded = loadedCollation(name);
+      const loaded = this.environment.collation(name);
       if (loaded !== undefined) this.collations.set(name, loaded);
     }
     // A prepared DML plan may retain resolved collation identities even when the skewed collation
@@ -1172,8 +1185,8 @@ export type ActiveTx = {
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
 // envelope subset landed in S1): the cost ceiling, the input-size limit, and the work-memory budget.
-// Passed to (db.newSession). An absent field takes its default. The entropy/clock seam is injected
-// via Session.setRandomSource / setClockSource, not here.
+// Passed to (db.newSession). An absent field takes its default. The entropy/clock sources are the
+// handle's Environment's (spec/design/environment.md §4), not a session setting.
 export type SessionOptions = {
   maxScalarBytes?: bigint;
   // The live logical query-memory budget per statement (spec/design/memory.md §2); absent or

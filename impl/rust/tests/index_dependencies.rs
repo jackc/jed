@@ -1,7 +1,14 @@
 //! Host state, persisted dependency lifetime, and argument-sensitive PG admission extensions.
-use jed::timezone::{load_time_zone_data, open_bundle, save_bundle};
-use jed::{CreateOptions, Database, Engine, Outcome, SessionOptions, Value};
+use jed::timezone::{open_bundle, save_bundle};
+use jed::{CreateOptions, Database, Engine, Environment, Outcome, SessionOptions, Value};
 const BUNDLE: &[u8] = include_bytes!("../../../spec/tz/fixtures/tzdata.jtz");
+/// An environment that loaded the pinned tz bundle.
+fn tz_env() -> Environment {
+    Environment::builder()
+        .load_time_zone_data(BUNDLE)
+        .unwrap()
+        .build()
+}
 const INDEX: &str = "CREATE UNIQUE INDEX zone_idx ON t (account) WHERE (ts AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01'";
 fn run(db: &mut Engine, sql: &str) -> Outcome {
     jed::execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
@@ -10,8 +17,8 @@ fn code(db: &mut Engine, sql: &str, expected: &str) {
     assert_eq!(jed::execute(db, sql).unwrap_err().code(), expected, "{sql}");
 }
 fn build() -> Engine {
-    load_time_zone_data(BUNDLE).unwrap();
     let mut db = Engine::new();
+    db.set_environment(tz_env());
     run(
         &mut db,
         "CREATE TABLE t(id int PRIMARY KEY, account int, ts timestamptz)",
@@ -62,20 +69,21 @@ fn skew_pin(original: &[u8], mode: &str) -> Vec<u8> {
 #[test]
 fn timezone_lifetime() {
     let image = build().to_image(4096, 1).unwrap();
+    let env = tz_env();
     for mode in ["mode", "empty-static", "empty-name", "empty-version"] {
-        match Engine::from_image(&skew_pin(&image, mode)) {
+        match Engine::from_image_in(&skew_pin(&image, mode), &env) {
             Err(e) => assert_eq!(e.code(), "XX001", "{mode}"),
             Ok(_) => panic!("accepted {mode}"),
         }
     }
-    let mut matching = Engine::from_image(&image).unwrap();
+    let mut matching = Engine::from_image_in(&image, &env).unwrap();
     code(
         &mut matching,
         "INSERT INTO t VALUES (3,7,'2024-06-01 00:00:00+00')",
         "23505",
     );
     for mode in ["version", "checksum", "missing"] {
-        let mut db = Engine::from_image(&skew_pin(&image, mode)).unwrap();
+        let mut db = Engine::from_image_in(&skew_pin(&image, mode), &env).unwrap();
         let Outcome::Query { rows: plan, .. } = run(
             &mut db,
             "EXPLAIN SELECT id FROM t WHERE (ts AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01' AND account = 7",
@@ -157,10 +165,13 @@ fn timezone_session_independence() {
 }
 #[test]
 fn dynamic_zone_cache() {
-    load_time_zone_data(BUNDLE).unwrap();
-    let mut s = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let env = tz_env();
+    let db = Database::create(CreateOptions {
+        environment: env.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut s = db.session(SessionOptions::default());
     let ddl = "CREATE INDEX dynamic_idx ON d (account) WHERE (ts AT TIME ZONE zone)::date >= DATE '2024-01-01'";
     for sql in [
         "CREATE TABLE d (id int PRIMARY KEY, account int, ts timestamptz, zone text)",
@@ -189,10 +200,24 @@ fn dynamic_zone_cache() {
         q.error().unwrap();
     }
     assert!(ins.insert_cache().borrow().is_none());
+    // A new zone changes the dynamic dependency: the host derives an environment that adds it and
+    // reopens the database in it (environment.md §3 — inputs never change under an open handle).
     let mut b = open_bundle(BUNDLE).unwrap();
     b.zones = vec![("Test/IndexAdded".into(), b.zones[0].1.clone())];
     b.links.clear();
-    load_time_zone_data(&save_bundle(&b)).unwrap();
+    let added = env
+        .to_builder()
+        .load_time_zone_data(&save_bundle(&b))
+        .unwrap()
+        .build();
+    let image = db.to_image(4096, 1).unwrap();
+    drop(s);
+    let db = Database::from_image(&image, added).unwrap();
+    let mut s = db.session(SessionOptions::default());
+    let stmt=s.prepare("SELECT id FROM d WHERE (ts AT TIME ZONE zone)::date >= DATE '2024-01-01' AND account = 7").unwrap();
+    let ins = s
+        .prepare("INSERT INTO d VALUES ($1,7,'2024-06-01 00:00:00+00','UTC') RETURNING id")
+        .unwrap();
     {
         let mut q = s.query_prepared(&stmt, &[]).unwrap();
         for row in &mut q {

@@ -10,6 +10,7 @@
 //! compiled program is a pure function of the source — kept byte-identical cross-core by the
 //! conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
 
+use crate::collation::PropertyTable;
 use crate::cost::Meter;
 use crate::costs::COSTS;
 use crate::decimal::{self, Decimal};
@@ -262,19 +263,21 @@ fn malformed(detail: &str) -> EngineError {
 
 impl JsonPath {
     /// Compile a jsonpath source string. Malformed → `42601`; a valid-PG but unsupported construct
-    /// → `0A000`.
-    pub fn compile(src: &str) -> Result<JsonPath> {
-        let path = JsonPath::parse(src)?;
+    /// → `0A000`. `casing` is the environment's property table (`None` ⇒ ASCII), which an `i`-flagged
+    /// `like_regex` pattern folds under.
+    pub fn compile(src: &str, casing: Option<&PropertyTable>) -> Result<JsonPath> {
+        let path = JsonPath::parse(src, casing)?;
         // A path is evaluated from its canonical text, whose parenthesization can nest deeper than
         // the source (`1 + 1 + 1` renders `((1 + 1) + 1)`), so that text must compile too (§8).
-        JsonPath::parse(&path.render())?;
+        JsonPath::parse(&path.render(), casing)?;
         Ok(path)
     }
 
     /// Parse a jsonpath source string (see [`JsonPath::compile`]).
-    fn parse(src: &str) -> Result<JsonPath> {
+    fn parse(src: &str, casing: Option<&PropertyTable>) -> Result<JsonPath> {
         let mut p = Parser {
             s: src.as_bytes(),
+            casing,
             i: 0,
             depth: 0,
             in_filter: 0,
@@ -585,6 +588,9 @@ pub struct EvalOpts<'d> {
     pub exists: bool,
     /// The variables the path's `$name` references read (§5).
     pub vars: Vars<'d>,
+    /// The environment's property table (`None` ⇒ ASCII casing), which an `i`-flagged
+    /// `like_regex` folds its subject under (collation.md §16).
+    pub casing: Option<&'d PropertyTable>,
 }
 
 /// The variables a path's `$name` references are bound to (jsonpath.md §5), and the variable base
@@ -659,12 +665,16 @@ pub fn check_vars_object(vars: &JsonNode) -> Result<()> {
 
 /// Compile a path for evaluation, charging `jsonpath_compile` for each source byte first
 /// (jsonpath.md §7). Every evaluation compiles its path; there is no cache.
-pub fn compile_metered(src: &str, m: &mut Meter) -> Result<JsonPath> {
+pub fn compile_metered(
+    src: &str,
+    casing: Option<&PropertyTable>,
+    m: &mut Meter,
+) -> Result<JsonPath> {
     m.charge(COSTS.jsonpath_compile * src.len() as i64);
     m.guard()?;
     // The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
     // `compile` at resolve.
-    let path = JsonPath::parse(src)?;
+    let path = JsonPath::parse(src, casing)?;
     // Each like_regex pattern was compiled with the path (jsonpath.md §7).
     m.charge(COSTS.regex_compile * path.regex_insts);
     m.guard()?;
@@ -722,6 +732,7 @@ fn eval_items<'d>(
         ignore: false,
         m,
         next_gen: 1 + opts.vars.count(),
+        casing: opts.casing,
         offsets: HashMap::new(),
         laid_out: Vec::new(),
     };
@@ -827,6 +838,8 @@ enum Base<'d> {
 /// The evaluation context shared by a path and the filter operands nested in it.
 struct Ctx<'d, 'm> {
     root: &'d JsonNode,
+    /// The environment's property table an `i`-flagged `like_regex` folds its subject under.
+    casing: Option<&'d PropertyTable>,
     vars: Vars<'d>,
     strict: bool,
     /// Suppresses navigation errors while the rest of a path below `.**` runs, in either mode
@@ -1717,8 +1730,7 @@ fn eval_like_regex<'d>(
             return Ok(None);
         };
         let chars: Vec<char> = if re.flags & REGEX_I != 0 {
-            let prop = crate::collation::loaded_property();
-            crate::collation::fold_lower_simple(subject, prop.as_deref())
+            crate::collation::fold_lower_simple(subject, cx.casing)
                 .chars()
                 .collect()
         } else {
@@ -2368,6 +2380,8 @@ fn keyword_is(w: &str, kw: &str) -> bool {
 
 struct Parser<'a> {
     s: &'a [u8],
+    /// The environment's property table an `i`-flagged `like_regex` pattern folds under.
+    casing: Option<&'a PropertyTable>,
     i: usize,
     /// The program nesting depth (spec/design/json.md §6.4): +1 per filter `?(`, parenthesized
     /// group, `exists (`, `!`, `&&`/`||` chain step, arithmetic operator, and subscript list,
@@ -3294,7 +3308,7 @@ impl Parser<'_> {
                 return Err(unsupported("like_regex \"m\" flag"));
             }
         }
-        let program = compile_like_regex(&pattern, flags)?;
+        let program = compile_like_regex(&pattern, flags, self.casing)?;
         self.regex_insts += program.ninst() as i64;
         Ok(Parsed::Pred(Pred::LikeRegex(
             left,
@@ -3408,14 +3422,17 @@ impl Parser<'_> {
 /// pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive. A quoted
 /// pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the letter
 /// after a backslash (regex.md §1).
-fn compile_like_regex(pattern: &str, flags: u8) -> Result<crate::regex::Program> {
+fn compile_like_regex(
+    pattern: &str,
+    flags: u8,
+    casing: Option<&PropertyTable>,
+) -> Result<crate::regex::Program> {
     let folded;
     let pattern = if flags & REGEX_I != 0 {
-        let prop = crate::collation::loaded_property();
         folded = if flags & REGEX_Q != 0 {
-            crate::collation::fold_lower_simple(pattern, prop.as_deref())
+            crate::collation::fold_lower_simple(pattern, casing)
         } else {
-            crate::regex::fold_pattern(pattern, prop.as_deref())
+            crate::regex::fold_pattern(pattern, casing)
         };
         folded.as_str()
     } else {

@@ -251,25 +251,18 @@ func parseLoadCollationDirective(line string) (string, []string, bool) {
 	return strings.TrimSpace(name), paths, true
 }
 
-// loadCollation makes a collation named `name` available to the records that follow
-// (spec/design/collation.md §2/§9/§10). The harness acts as the HOST: it loads jed's own pinned
-// production JUCD bundle (spec/collation/fixtures/unicode.jucd) into the engine-global set via
-// db.LoadUnicodeData (idempotent — the set is global), exactly as a production host would, then
-// asserts the named collation now resolves. A name no loaded bundle provides fails the test, naming
-// it (the directive's fixture paths are now a documentary provenance note, not loaded).
-func loadCollation(name string) error {
-	path := filepath.Join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("load-collation: read %s: %w", path, err)
+// loadCollation asserts a collation named `name` is available to the records that follow
+// (spec/design/collation.md §2/§9/§10). The harness acts as the HOST: the file's environment was built
+// with jed's own pinned production JUCD bundle (spec/collation/fixtures/unicode.jucd) loaded, exactly
+// as a production host would (fileEnvironment); a name that bundle does not provide fails the test,
+// naming it (the directive's fixture paths are a documentary provenance note, not loaded).
+func loadCollation(name string, env *jed.Environment) error {
+	for _, c := range env.LoadedCollations() {
+		if c.Name == name {
+			return nil
+		}
 	}
-	if err := jed.LoadUnicodeData(data); err != nil {
-		return fmt.Errorf("load-collation: load unicode.jucd: %w", err)
-	}
-	if jed.LoadedCollation(name) == nil {
-		return fmt.Errorf("load-collation: collation %q is not provided by the loaded bundle", name)
-	}
-	return nil
+	return fmt.Errorf("load-collation: collation %q is not provided by the loaded bundle", name)
 }
 
 // parseLoadTimezoneDirective parses a `# load-timezone: [<zone>]` line — the corpus's host-free way to
@@ -283,23 +276,20 @@ func parseLoadTimezoneDirective(line string) (string, bool) {
 	return strings.TrimSpace(body), true
 }
 
-// loadTimezone makes the IANA time zones available to the records that follow (timezones.md §3.3/§11).
-// The harness acts as the HOST: it loads jed's pinned production JTZ bundle (spec/tz/fixtures/tzdata.jtz)
-// into the engine-global set via db.LoadTimeZoneData (idempotent — the set is global), then, if a zone
-// name was given, asserts it now resolves. A named zone no loaded bundle provides fails the test.
-func loadTimezone(name string) error {
-	path := filepath.Join(repoRoot(), "spec", "tz", "fixtures", "tzdata.jtz")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("load-timezone: read %s: %w", path, err)
+// loadTimezone asserts the IANA time zones are available to the records that follow
+// (timezones.md §3.3/§11). The harness acts as the HOST: the file's environment was built with jed's
+// pinned production JTZ bundle (spec/tz/fixtures/tzdata.jtz) loaded (fileEnvironment); if a zone name
+// was given, it must be one that bundle provides, or the test fails.
+func loadTimezone(name string, env *jed.Environment) error {
+	if name == "" {
+		return nil
 	}
-	if err := jed.LoadTimeZoneData(data); err != nil {
-		return fmt.Errorf("load-timezone: load tzdata.jtz: %w", err)
+	for _, z := range env.LoadedTimeZones() {
+		if z.Name == name {
+			return nil
+		}
 	}
-	if _, ok := jed.ResolveZone(name); name != "" && !ok {
-		return fmt.Errorf("load-timezone: zone %q is not provided by the loaded bundle", name)
-	}
-	return nil
+	return fmt.Errorf("load-timezone: zone %q is not provided by the loaded bundle", name)
 }
 
 // parseTimezoneDirective parses a `# timezone: <zone>` line (spec/design/session.md §6.2, timezones.md
@@ -346,17 +336,13 @@ func parseUpgradeCollationsDirective(line string) bool {
 }
 
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
-// spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
-// referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
-// is the point), then opens the database via the public host API. The golden image is COPIED to a
+// spec/). The harness acts as the host: env carries jed's pinned production bundle so any referenced
+// collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which is the
+// point), and the database is opened via the public host API. The golden image is COPIED to a
 // temp file and that copy is opened read-WRITE — so a write against a skewed table exercises the real
 // XX002 guard (collation.md §12), not a read-only-handle error, while the committed golden stays
 // pristine. The returned cleanup closes the handle and removes the temp file.
-func openFixture(rel string) (*jed.Database, func(), error) {
-	bundle := filepath.Join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd")
-	if data, err := os.ReadFile(bundle); err == nil {
-		_ = jed.LoadUnicodeData(data) // idempotent: the loaded set is engine-global
-	}
+func openFixture(rel string, env *jed.Environment) (*jed.Database, func(), error) {
 	path := filepath.Join(repoRoot(), "spec", rel)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -373,7 +359,7 @@ func openFixture(rel string) (*jed.Database, func(), error) {
 		os.Remove(tmpPath)
 		return nil, nil, fmt.Errorf("fixture: write temp: %w", cmp.Or(werr, cerr))
 	}
-	db, err := jed.OpenDatabase(tmpPath)
+	db, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{Environment: env})
 	if err != nil {
 		removeTempDB(tmpPath)
 		return nil, nil, fmt.Errorf("fixture: open %s: %w", rel, err)
@@ -981,6 +967,15 @@ func runFile(text string, disk bool) error {
 	if err != nil {
 		return err
 	}
+	lines := strings.Split(text, "\n")
+	// The file's environment: its data bundles + the switchable sources the per-record # seed: /
+	// # clock: / # clock_advance: directives drive. Every handle of the file (the disk reopens, a
+	// fixture) opens under it.
+	random, clock := newHarnessRandom(), newHarnessClock()
+	env, err := fileEnvironment(lines, random, clock)
+	if err != nil {
+		return err
+	}
 	// In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
 	// committed read faults from disk; in MEMORY mode it is a fresh in-memory Database. tmpPath is "" in
 	// memory mode. (spec/design/conformance.md §3.)
@@ -997,14 +992,14 @@ func runFile(text string, disk bool) error {
 		// fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to
 		// exercise the on-disk faulted read path — durability across an OS crash is irrelevant, so skip
 		// the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true})
+		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true, Environment: env})
 		if err != nil {
 			removeTempDB(tmpPath)
 			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
 		}
 	} else {
 		var err error
-		db, err = jed.CreateDatabase(jed.CreateOptions{}) // in-memory: no path
+		db, err = jed.CreateDatabase(jed.CreateOptions{Environment: env}) // in-memory: no path
 		if err != nil {
 			return fmt.Errorf("in-memory create: %w", err)
 		}
@@ -1037,7 +1032,7 @@ func runFile(text string, disk bool) error {
 		if err := db.Close(); err != nil {
 			return fmt.Errorf("disk reopen: close: %w", err)
 		}
-		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true}) // fsync=off (throwaway image)
+		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true, Environment: env}) // fsync=off (throwaway image)
 		if err != nil {
 			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
 		}
@@ -1059,7 +1054,6 @@ func runFile(text string, disk bool) error {
 		}
 	}
 	defer func() { cleanup() }()
-	lines := strings.Split(text, "\n")
 	i := 0
 	// A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
 	// next record consumes them.
@@ -1104,20 +1098,20 @@ func runFile(text string, disk bool) error {
 		}
 		if strings.HasPrefix(line, "#") {
 			// `# load-collation:` is an ACTION (assert available now), not a pending assertion: the
-			// named collation must be vendored in this build before the records run
+			// named collation must be provided by the file's environment before the records run
 			// (spec/design/collation.md §2/§9/§10).
 			if name, _, ok := parseLoadCollationDirective(line); ok {
-				if err := loadCollation(name); err != nil {
+				if err := loadCollation(name, env); err != nil {
 					return err
 				}
 				i++
 				continue
 			}
-			// `# load-timezone: [<zone>]` is an ACTION: load jed's pinned JTZ bundle into the
-			// engine-global set (and optionally assert a zone resolves) before the records that use
+			// `# load-timezone: [<zone>]` is an ACTION: the file's environment carries jed's pinned JTZ
+			// bundle (and the directive optionally asserts a zone resolves) before the records that use
 			// AT TIME ZONE (timezones.md §11).
 			if name, ok := parseLoadTimezoneDirective(line); ok {
-				if err := loadTimezone(name); err != nil {
+				if err := loadTimezone(name, env); err != nil {
 					return err
 				}
 				i++
@@ -1150,7 +1144,7 @@ func runFile(text string, disk bool) error {
 			// `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh NewEngine()
 			// above — appears in the header before any record (spec/design/conformance.md).
 			if rel, wantCode, ok := parseFixtureDirective(line); ok {
-				fixtureDB, fixtureCleanup, err := openFixture(rel)
+				fixtureDB, fixtureCleanup, err := openFixture(rel, env)
 				if wantCode != "" {
 					if err == nil {
 						fixtureCleanup()
@@ -1292,22 +1286,12 @@ func runFile(text string, disk bool) error {
 		sess.SetMaxSQLLength(maxSQLLength)
 		pendingMaxSQLLength = nil
 		// Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
-		// §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
-		if pendingSeed != nil {
-			sess.SetRandomSource(jed.SeededRandomSource(*pendingSeed))
-		} else {
-			sess.ClearRandomSource()
-		}
+		// §6) by switching the environment's harness sources; absent ⇒ OS entropy / the wall clock, so
+		// a directive never leaks forward. `# clock_advance:` (an advancing clock) takes precedence
+		// over `# clock:` (a fixed one); a record uses at most one.
+		random.seed(pendingSeed)
 		pendingSeed = nil
-		// `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one);
-		// a record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
-		if pendingClockAdvance != nil {
-			sess.SetClockSource(jed.AdvancingClock(pendingClockAdvance.start, pendingClockAdvance.step))
-		} else if pendingClock != nil {
-			sess.SetClockSource(jed.FixedClock(*pendingClock))
-		} else {
-			sess.ClearClockSource()
-		}
+		clock.set(pendingClock, pendingClockAdvance)
 		pendingClock = nil
 		pendingClockAdvance = nil
 		// Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to fully

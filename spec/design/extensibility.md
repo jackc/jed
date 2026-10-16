@@ -21,7 +21,7 @@
 > tables (§5, all three cores, behaviour-preserving); (b) **composite (row) types have shipped** as a
 > landed feature ([composite.md](composite.md), `format_version` 9 — the *open type* pivot §3 rests
 > on); (c) **host scalar functions over existing types have shipped** (§4.2 / §14 step 3, all three
-> cores): a host registers scalar functions into a frozen `ExtensionRegistry` at open/create and they
+> cores): a host registers scalar functions on the immutable `Environment` passed at open/create (originally a frozen `ExtensionRegistry`) and they
 > resolve + evaluate through a registry dispatch arm beside the built-in one — the function *seam* of
 > §5.1; (d) **host functions may back a persisted expression / partial index** (§7 Model B, §8.1,
 > §14 step 4, `format_version` 31, all three cores): the registry entry carries a `component_id` +
@@ -624,7 +624,7 @@ is the next free**). Built-in types stay compiled-in and keep their codes. The a
 ## 7. Registration — code at open, dependencies persisted on use (Model B, ✅ landed for functions)
 
 > **Decided 2026-07-18: Model B (registry-only), not SQL DDL.** The host declares its extensions
-> **entirely through the host-language `ExtensionRegistry`**; there is **no** `CREATE FUNCTION …
+> **entirely through the host-language `Environment` builder**; there is **no** `CREATE FUNCTION …
 > LANGUAGE HOST` / `CREATE TYPE … AS HOST` SQL. The realization that settled it: host *code* can
 > never live in SQL anyway (it is host-language code passed through the registry), so a `CREATE
 > FUNCTION` statement could only *name a binding* to an already-registered component — largely
@@ -638,18 +638,20 @@ is the next free**). Built-in types stay compiled-in and keep their codes. The a
 
 The two moving parts, and how they stay separate:
 
-1. **The host supplies an immutable `ExtensionRegistry` in the open/create options** — the function
-   kernels (and, later, codecs / comparators / key-encoders / opclass routines) its extensions name,
-   each carrying its **component identity** (below). The registry is **frozen for the database
-   handle's lifetime**: late mutation would invalidate prepared plans, overload resolution, and index
-   assumptions mid-session, so it is fixed at open. The registry *is* the declaration — registering a
-   function makes it resolvable in ad-hoc queries (the step-3 behavior).
+1. **The host registers its extensions on the immutable `Environment` passed in the open/create
+   options** ([environment.md](environment.md) §5; originally a separate `ExtensionRegistry`, now
+   absorbed) — the function kernels (and, later, codecs / comparators / key-encoders / opclass
+   routines) its extensions name, each carrying its **component identity** (below). The environment
+   is **immutable**, so the function set is fixed for the database handle's lifetime: late mutation
+   would invalidate prepared plans, overload resolution, and index assumptions mid-session. The
+   registration *is* the declaration — registering a function makes it resolvable in ad-hoc queries
+   (the step-3 behavior).
 
 2. **A persisted schema object records the *resolved dependency* when a host function is baked into
    it** — and only such a use persists anything. When `CREATE INDEX … (host_fn(col))` (or a partial
    predicate) admits a host function, the index catalog entry stores the function's resolved
    dependency (component identity + signature + version — §8.1); on reopen the engine re-checks it
-   against the current registry. Merely linking a newer library never silently mutates the schema
+   against the current environment. Merely linking a newer library never silently mutates the schema
    (nothing is persisted by registration alone); a *behavioral* change the host forgot to version is
    the host's own concern, exactly as it would be under a SQL-DDL model.
 
@@ -1099,7 +1101,7 @@ cleanup, not a prerequisite. A suggested sequence:
    remaining `0A000` key axis is an array-of-composite element.
 3. **Runtime host scalar *functions* over existing types only** (§4.2), *no persisted use* — the
    function-registry injection seam + signature overloading + volatility/cross-core/cost, batch-of-one.
-   ✅ **landed (all three cores)**: an `ExtensionRegistry` a host builds and passes in
+   ✅ **landed (all three cores)**: an `ExtensionRegistry` (since absorbed into the `Environment`, environment.md) a host builds and passes in
    `CreateOptions`/`OpenOptions`, frozen for the handle and shared into every session (streaming
    included); a separate `HostFunc`/`hostFunc` resolved node reached **by id** through the registry
    alongside the untouched built-in dispatch; built-ins win an exact-signature collision; `cost`
@@ -1139,7 +1141,7 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 - **[TODO.md](../../TODO.md)** — the Phase 9 items point here; add the §14 slices (composite-as-key,
   the host-function injection seam, resolved-dependency index persistence, host scalar types tiered
   per §4.3, host opclasses).
-- **[api.md](api.md)** — the `ExtensionRegistry` open/create option (§7), the **`component_id` /
+- **[api.md](api.md)** — the `Environment` open/create option carrying host functions (§7, §10/§12), the **`component_id` /
   `semantic_version`** builder fields + the index-backing behavior (§14 step 4, ✅ done); the host-type
   DDL surface is **not applicable** under Model B (§7 — registration is registry-only, no
   `CREATE FUNCTION … LANGUAGE HOST` / `CREATE TYPE … AS HOST`).

@@ -31,6 +31,8 @@ type databaseOptions struct {
 	// order but skips the fdatasync barriers. Unlike PageSize this is NOT fixed into the file — it is a
 	// runtime handle setting. DEV/TESTING only (durable across a process crash, not an OS crash).
 	noSync bool
+	// env is the handle's Environment (spec/design/environment.md); nil ⇒ a fresh empty one.
+	env *Environment
 }
 
 // defaultDatabaseOptions returns the default create settings (the default page size).
@@ -53,7 +55,11 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 	} else if exists {
 		return nil, newError(DuplicateFile, "database file already exists: "+path)
 	}
-	db := newEngine()
+	env := opts.env
+	if env == nil {
+		env = NewEnvironment()
+	}
+	db := newEngineIn(env)
 	db.path = path
 	db.spill = osSpillHost{dir: os.TempDir()}
 	db.pageSize = opts.PageSize
@@ -108,10 +114,11 @@ type OpenOptions struct {
 	Locking   Locking
 	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
 	FileLockTimeoutMs *uint64
-	// Extensions are host extensions to register on this handle (spec/design/extensibility.md §7):
-	// scalar functions the host supplies, FROZEN for the handle's lifetime. A handle setting like the
-	// rest — not stored in the file, so a reopening host brings its own (§14 step 3). nil ⇒ none.
-	Extensions *ExtensionRegistry
+	// Environment is the handle's outside inputs (spec/design/environment.md): the loaded Unicode and
+	// time-zone data the file's references resolve against, the host functions, and the random + clock
+	// sources. Shared by the handle's sessions, attachments, and temp domains; not stored in the file,
+	// so a reopening host brings its own. nil ⇒ a fresh empty environment (no process-wide default).
+	Environment *Environment
 	// MaxStorageBytes is the committed-storage limit in bytes over the file's live pages
 	// (spec/design/memory.md §8.7): a commit that would grow livePages × pageSize past it fails 54P06.
 	// Zero or negative is unlimited (the default). A handle setting, not stored in the file;
@@ -156,7 +163,11 @@ func openVia(files fileHost, path string, opts OpenOptions) (*engine, error) {
 	// Convert the byte budget to a leaf-page capacity by the file's page size; LoadEnginePaged
 	// rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
 	// pageSize = 0 cannot divide by zero before that check runs).
-	db, err := loadEnginePaged(p, cacheLeaves(cacheBytes, p.pageSize))
+	env := opts.Environment
+	if env == nil {
+		env = NewEnvironment()
+	}
+	db, err := loadEnginePaged(p, cacheLeaves(cacheBytes, p.pageSize), env)
 	if err != nil {
 		_ = store.close()
 		return nil, err

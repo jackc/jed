@@ -158,7 +158,7 @@ fn large_jsonb_spills_and_round_trips() {
     run(&mut db, "INSERT INTO t VALUES (2, '{\"k\": 42}')");
 
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .expect("load image")
         .session(SessionOptions::default());
 
@@ -191,7 +191,7 @@ fn large_json_spills_verbatim() {
     );
 
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .expect("load image")
         .session(SessionOptions::default());
     let rows = query(&mut loaded, "SELECT j FROM t WHERE id = 1");
@@ -324,7 +324,7 @@ fn jsonb_all_node_kinds_round_trip() {
         "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, false, null], \"c\": \"x\"}')",
     );
     let image = db.to_image(4096, 1).expect("serialize image");
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .expect("load image")
         .session(SessionOptions::default());
     let rows = query(&mut loaded, "SELECT j FROM t WHERE id = 1");

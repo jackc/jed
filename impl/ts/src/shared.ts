@@ -49,6 +49,7 @@
 // single-handle path and mints additional sessions.
 
 import type { FileHost } from "./filehost.ts";
+import type { TimeZoneInfo } from "./timezone.ts";
 import {
   type Attachment,
   type CollationInfo,
@@ -70,7 +71,7 @@ import {
   toImage as toImageBytes,
 } from "./format.ts";
 import type { CompositeType, Table, ViewDef } from "./catalog.ts";
-import type { ExtensionRegistry } from "./extension.ts";
+import { Environment } from "./environment.ts";
 import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
 import { throwIfAborted } from "./cancel.ts";
@@ -111,7 +112,6 @@ export function setAfterPersistHook(
 }
 import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
-import type { ClockFunc, RandomFill } from "./seam.ts";
 import { renderIn, type Value } from "./value.ts";
 
 const pathEncoder = new TextEncoder();
@@ -131,7 +131,7 @@ function compareFilePaths(left: string, right: string): number {
 // A read handle keeps no open transaction (reads hit committed = the pinned snapshot); a write handle
 // keeps an open READ WRITE block and publishes its working set.
 function databaseFromSnapshot(snap: Snapshot, core: SharedCore): Engine {
-  const db = new Engine();
+  const db = new Engine(core.environment);
   db.committed = snap;
   // A minted session MUST serialize/split at the FILE's page size (not the in-memory default), so its
   // stores' cap matches the physical pages persist writes — and so every core builds byte-identical
@@ -186,15 +186,15 @@ class SharedCore {
   readOnly = false;
   coordinator: FileCoordinatorHost | null;
   planEpoch = 0;
-  // The frozen host extension registry (spec/design/extensibility.md §7): the scalar functions the
-  // host supplied in the create/open options, shared (by reference) into every minted session's
-  // SessionState. null when no extensions were supplied.
-  extensions: ExtensionRegistry | null = null;
+  // The handle's Environment (spec/design/environment.md §3): fixed at open/create and shared (by
+  // reference) by every minted session, attachment, and temp domain — the storage owner's.
+  readonly environment: Environment;
 
   constructor(snap: Snapshot, storage: Engine, coordinator: FileCoordinatorHost | null = null) {
     this.committed = snap;
     this.storage = storage;
     this.coordinator = coordinator;
+    this.environment = storage.environment;
   }
 
   acquireWriter(timeoutMs: number): void {
@@ -314,7 +314,7 @@ class SharedCore {
     const paging = this.storage.paging;
     if (paging === null) return;
     paging.refreshAllocatedPages();
-    const loaded = loadEnginePaged(paging);
+    const loaded = loadEnginePaged(paging, this.environment);
     if (loaded.committed.txid <= this.committed.txid) return;
     this.storage.pageCount = loaded.pageCount;
     this.storage.freePages = loaded.freePages;
@@ -329,7 +329,7 @@ class SharedCore {
     const paging = attachment.storage.paging;
     if (paging === null) return;
     paging.refreshAllocatedPages();
-    const loaded = loadEnginePaged(paging);
+    const loaded = loadEnginePaged(paging, this.environment);
     const current = this.attached.get(name);
     if (current !== undefined && loaded.committed.txid <= current.txid) return;
     attachment.storage.pageCount = loaded.pageCount;
@@ -652,7 +652,7 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
   // needing a reopen; an in-memory domain keeps its old store untouched.
   let loaded: Engine;
   try {
-    loaded = loadEnginePaged(paging);
+    loaded = loadEnginePaged(paging, st.environment);
   } catch (error) {
     paging.close();
     throw error;
@@ -736,6 +736,7 @@ type FileAttachOpener = (
   source: AttachSource,
   readOnly: boolean,
   files: FileHost | null,
+  environment: Environment,
 ) => OpenedAttachment;
 let fileAttachOpener: FileAttachOpener | null = null;
 
@@ -772,18 +773,14 @@ export class Database {
   // shared.ts stays browser-clean by not importing it). The committed snapshot's stores already
   // carry the shared paging, so every pinned/cloned snapshot faults clean pages through the one pool
   // (spec/design/pager.md).
-  static fromEngine(
-    engine: Engine,
-    coordinator: FileCoordinatorHost | null = null,
-    extensions: ExtensionRegistry | null = null,
-  ): Database {
+  // The engine carries the handle's Environment (its session's), which the shared core adopts.
+  static fromEngine(engine: Engine, coordinator: FileCoordinatorHost | null = null): Database {
     // v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
     // persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at each
     // commit or they would leak permanently (format.md *Reclamation*).
     engine.reclaimWithinSession = true;
     const core = new SharedCore(engine.committed, engine, coordinator);
     core.readOnly = engine.readOnly;
-    core.extensions = extensions; // frozen at open/create, shared into every session (§7)
     coordinator?.startProbe(() => core.coordinationTick());
     return Database.over(core);
   }
@@ -828,7 +825,8 @@ export class Database {
         throw engineError("feature_not_supported", "file attachment needs a host file layer");
       }
       // Open the file BEFORE the dup check (an open may throw 58P01/XX001); on a name conflict close it.
-      const opened = fileAttachOpener(source, readOnly, c.storage.fileHost);
+      // The attachment resolves against, and runs with, main's environment (environment.md §3).
+      const opened = fileAttachOpener(source, readOnly, c.storage.fileHost, c.environment);
       const engine = opened.engine;
       // The attachment's storage reaches the same file host as main (compaction, directory barrier).
       engine.fileHost = c.storage.fileHost;
@@ -847,12 +845,12 @@ export class Database {
       if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
         throw engineError("duplicate_object", `database "${name}" already exists`);
       }
-      storage = newAttachedStorage(c.pageSize);
+      storage = newAttachedStorage(c.pageSize, c.environment);
       storage.storageBudget.limit = source.maxStorageBytes ?? 0n;
       // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
       // (the same storePaging seam session-local temp uses — a snapshot's storePaging is "the paging new
       // stores bind to").
-      const empty = new Snapshot(0n);
+      const empty = new Snapshot(c.environment, 0n);
       empty.storePaging = storage.paging;
       root = empty;
     }
@@ -969,7 +967,6 @@ export class Database {
     // The attached roots are pinned together with the committed root (attached-databases.md §5), so the
     // session sees a consistent cross-database snapshot; it routes attachment persists via the core.
     engine.core = this.core;
-    engine.session.extensions = this.core.extensions; // the frozen host registry (extensibility.md §7)
     engine.attachedCommitted = this.core.attached;
     return new Session(this.core, engine, "ro", snap.txid, snap.txid);
   }
@@ -991,7 +988,6 @@ export class Database {
       // committed = the immutable base; beginTx clones it to working.
       const engine = databaseFromSnapshot(base, this.core);
       engine.core = this.core;
-      engine.session.extensions = this.core.extensions; // the frozen host registry (extensibility.md §7)
       engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
       engine.beginTx(true);
       return new Session(this.core, engine, "rw", base.txid, null, true);
@@ -1013,9 +1009,8 @@ export class Database {
     if (this.core.readOnly) this.core.refreshShared();
     const snap = this.core.committed;
     const engine = databaseFromSnapshot(snap, this.core);
-    engine.session = new SessionState(opts);
+    engine.session = new SessionState(this.core.environment, opts);
     engine.core = this.core;
-    engine.session.extensions = this.core.extensions; // the frozen host registry (extensibility.md §7)
     engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
     // A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
     // version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
@@ -1184,8 +1179,9 @@ export class Database {
   // rehydrating an in-memory database from bytes. Since B3 the image becomes the core's
   // MemoryBlockStore, demand-paged like a file (one read path); there is no backing file (path stays
   // null) and a commit packs pages into the memory store.
-  static fromImage(image: Uint8Array): Database {
-    return Database.fromEngine(loadEngine(image));
+  // environment: absent ⇒ a fresh empty one (environment.md §7).
+  static fromImage(image: Uint8Array, environment: Environment = new Environment()): Database {
+    return Database.fromEngine(loadEngine(image, environment));
   }
 
   // --- Catalog / storage introspection (spec/design/api.md §6): reads the latest committed snapshot.
@@ -1252,7 +1248,16 @@ export class Database {
     return this.committedEngine().collations();
   }
   loadedCollations(): CollationInfo[] {
-    return this.committedEngine().loadedCollations();
+    return this.core.environment.loadedCollations();
+  }
+  // loadedTimeZones lists the zones the handle's environment loaded (timezones.md §3.3).
+  loadedTimeZones(): TimeZoneInfo[] {
+    return this.core.environment.loadedTimeZones();
+  }
+  // environment is the handle's Environment (spec/design/environment.md §6): fixed at open/create,
+  // shared by every session, attachment, and temp domain.
+  environment(): Environment {
+    return this.core.environment;
   }
   defaultCollation(): string {
     return this.committedEngine().defaultCollation();
@@ -1294,13 +1299,13 @@ export class Database {
 // maxStorageBytes is the database's committed-storage limit (memory.md §8.1); <= 0n is unlimited.
 export function buildInMemory(
   pageSize: number,
-  extensions: ExtensionRegistry | null = null,
+  environment: Environment = new Environment(),
   maxStorageBytes = 0n,
 ): Database {
-  const image = toImageBytes(new Snapshot(0n), pageSize, 0n);
-  const engine = loadEngine(image);
+  const image = toImageBytes(new Snapshot(environment, 0n), pageSize, 0n);
+  const engine = loadEngine(image, environment);
   engine.storageBudget.limit = maxStorageBytes;
-  return Database.fromEngine(engine, null, extensions);
+  return Database.fromEngine(engine, null);
 }
 
 // Access is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1). Distinct
@@ -1881,17 +1886,10 @@ export class Session {
   render(v: Value): string {
     return renderIn(v, this.engine.session.timeZone);
   }
-  setRandomSource(f: RandomFill): void {
-    this.engine.session.seam.randomFill = f;
-  }
-  clearRandomSource(): void {
-    this.engine.session.seam.randomFill = undefined;
-  }
-  setClockSource(f: ClockFunc): void {
-    this.engine.session.seam.clock = f;
-  }
-  clearClockSource(): void {
-    this.engine.session.seam.clock = undefined;
+  // environment is the Environment of the database this session belongs to
+  // (spec/design/environment.md §6).
+  environment(): Environment {
+    return this.engine.environment;
   }
 
   // --- Catalog / storage introspection (spec/design/api.md §6): reads this session's engine (its
@@ -1938,6 +1936,9 @@ export class Session {
   }
   loadedCollations(): CollationInfo[] {
     return this.engine.loadedCollations();
+  }
+  loadedTimeZones(): TimeZoneInfo[] {
+    return this.engine.loadedTimeZones();
   }
   defaultCollation(): string {
     return this.engine.defaultCollation();

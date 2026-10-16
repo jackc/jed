@@ -671,7 +671,8 @@ impl Engine {
                             "a WRAPPER on a scalar JSON_TABLE column is not supported yet",
                         ));
                     }
-                    let compiled = jt_compile_path(path.as_deref(), name)?;
+                    let compiled =
+                        jt_compile_path(path.as_deref(), name, self.session.env.property())?;
                     let idx = out_columns.len();
                     out_columns.push(jt_column(name, st, None));
                     resolved.push(JtCol::Regular {
@@ -692,7 +693,8 @@ impl Engine {
                     on_error,
                 } => {
                     let st = jt_scalar_type(self, type_name)?;
-                    let compiled = jt_compile_path(path.as_deref(), name)?;
+                    let compiled =
+                        jt_compile_path(path.as_deref(), name, self.session.env.property())?;
                     let idx = out_columns.len();
                     out_columns.push(jt_column(name, st, None));
                     resolved.push(JtCol::Exists {
@@ -703,7 +705,9 @@ impl Engine {
                     });
                 }
                 JtColumn::Nested { path, columns } => {
-                    let compiled = crate::jsonpath::JsonPath::compile(path)?.render();
+                    let compiled =
+                        crate::jsonpath::JsonPath::compile(path, self.session.env.property())?
+                            .render();
                     let nested = self.resolve_jt_columns(columns, out_columns)?;
                     resolved.push(JtCol::Nested {
                         path: compiled,
@@ -744,10 +748,11 @@ impl Engine {
             other => json_arg_node(other)?,
         };
         // The root path → the sequence of row items (a structural error here yields no rows).
-        let root = crate::jsonpath::compile_metered(&plan.root_path, meter)?;
+        let casing = env.exec.session.env.property();
+        let root = crate::jsonpath::compile_metered(&plan.root_path, casing, meter)?;
         // A navigation error yields no rows; a cost abort or a missing variable propagates
         // (jsonpath.md §7).
-        let items = match crate::jsonpath::eval(&root, &node, jt_eval(vars), meter) {
+        let items = match crate::jsonpath::eval(&root, &node, jt_eval(vars, casing), meter) {
             Ok(items) => items,
             Err(e) if e.code().starts_with("22") => Vec::new(),
             Err(e) => return Err(e),
@@ -1485,10 +1490,12 @@ impl Engine {
                     _ => return Ok(out),
                 };
                 crate::jsonpath::check_vars_object(vars)?;
-                let compiled = crate::jsonpath::compile_metered(text, meter)?;
+                let casing = env.exec.session.env.property();
+                let compiled = crate::jsonpath::compile_metered(text, casing, meter)?;
                 let opts = crate::jsonpath::EvalOpts {
                     exists: false,
                     vars: crate::jsonpath::Vars::Object(vars),
+                    casing,
                 };
                 let items = if silent {
                     crate::jsonpath::eval_silent(&compiled, &node, opts, meter)?.0

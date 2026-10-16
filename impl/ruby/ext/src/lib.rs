@@ -49,11 +49,14 @@
 //! bound value two-phase before any row is touched (api.md §5) — e.g. an integer bound to an `i16`
 //! column that overflows traps `22003` at bind.
 //!
-//! ## Host functions (ruby.md §5b)
+//! ## Environments (ruby.md §5a/§5b)
 //!
-//! A host registers scalar functions in a [`Registry`] ([`jed_registry_new`] /
-//! [`jed_registry_register`]) and passes it to an open call, which builds a fresh, frozen
-//! `ExtensionRegistry` from it. Each function's kernel is an **upcall** through a C callback:
+//! Everything the engine takes from outside itself except storage lives in an immutable
+//! `jed::Environment` (spec/design/environment.md). The host builds one through an [`EnvBuilder`]
+//! ([`jed_env_builder_new`], the bundle loaders, [`jed_env_builder_register`], the source setters,
+//! [`jed_env_builder_build`]) and passes the resulting [`Env`] to an open call (null = a fresh empty
+//! environment). Host functions register on the builder; each function's kernel is an **upcall**
+//! through a C callback:
 //!
 //! ```text
 //! i64 callback(uintptr user_data, uintptr args, u64 args_len, uintptr out, u64 out_cap, uintptr sink)
@@ -74,8 +77,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use jed::{
-    CreateOptions, Database, EngineError, ExtensionRegistry, HostFunction, OpenOptions, Rows,
-    ScalarType, Session, SessionOptions, SqlState, Value, Volatility,
+    AdvancingClock, ClockSource, CreateOptions, Database, EngineError, Environment,
+    EnvironmentBuilder, HostFunction, ManualClock, OpenOptions, RandomSource, Rows, ScalarType,
+    SeededRandom, Session, SessionOptions, SqlState, Value, Volatility,
 };
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -85,10 +89,12 @@ use std::sync::Arc;
 /// The ABI version. The Ruby side checks this against its own constant on load and refuses a
 /// mismatch (ruby.md §5), so a stale cdylib next to a newer gem fails loudly, never silently.
 /// Bumped to 2 when [`jed_execute`] grew its bind-parameter arguments, to 3 for the decimal/date/
-/// timestamp param tags, to 4 for the [`jed_load_unicode_data`] / [`jed_load_time_zone_data`]
+/// timestamp param tags, to 4 for the `jed_load_unicode_data` / `jed_load_time_zone_data`
 /// host-bundle loaders, to 5 for host functions (the registry calls, and the registry argument of
-/// [`jed_open_memory`] / [`jed_create`] / [`jed_open`]).
-const ABI_VERSION: u32 = 5;
+/// [`jed_open_memory`] / [`jed_create`] / [`jed_open`]), to 6 for environments (the builder,
+/// environment, and source calls replace the registry and the engine-global loaders, and the opens
+/// take an environment).
+const ABI_VERSION: u32 = 6;
 
 const TAG_ERROR: u8 = 0;
 const TAG_STATEMENT: u8 = 1;
@@ -156,7 +162,7 @@ fn err_buf(state: &str, msg: &str) -> *mut u8 {
 /// the one long-lived [`Session`] the gem drives. `Database` no longer owns a default session, so the
 /// connection owns its own — this is what makes `jed_execute("BEGIN")` … `jed_commit()` span calls,
 /// exactly like a PostgreSQL/SQLite connection.
-struct Conn {
+pub struct Conn {
     db: Database,
     sess: Session,
 }
@@ -372,15 +378,15 @@ pub extern "C" fn jed_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// Open a new in-memory database with the host functions of `reg` (null for none). Infallible;
+/// Open a new in-memory database in the environment `env` (null for a fresh empty one). Infallible;
 /// returns an opaque handle (null only on an internal panic, which cannot happen for the in-memory
 /// `Database::create`).
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_open_memory(reg: *const Registry) -> *mut Conn {
+pub extern "C" fn jed_open_memory(env: *const Env) -> *mut Conn {
     match catch_unwind(AssertUnwindSafe(|| {
         Box::into_raw(Box::new(new_conn(
             Database::create(CreateOptions {
-                extensions: extensions(reg),
+                environment: environment(env),
                 ..Default::default()
             })
             .expect("in-memory create is infallible"),
@@ -391,11 +397,11 @@ pub extern "C" fn jed_open_memory(reg: *const Registry) -> *mut Conn {
     }
 }
 
-/// Create a new file-backed database at `path` with the host functions of `reg` (null for none).
+/// Create a new file-backed database at `path` in the environment `env` (null for a fresh empty one).
 /// Returns a HANDLE buffer on success, an ERROR buffer otherwise (`58P02` if the file already
 /// exists, …). Free the buffer with [`jed_free`].
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_create(path: *const c_char, reg: *const Registry) -> *mut u8 {
+pub extern "C" fn jed_create(path: *const c_char, env: *const Env) -> *mut u8 {
     guard(|| {
         let path = match cstr(path) {
             Ok(s) => s,
@@ -403,7 +409,7 @@ pub extern "C" fn jed_create(path: *const c_char, reg: *const Registry) -> *mut 
         };
         match Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(path)),
-            extensions: extensions(reg),
+            environment: environment(env),
             ..Default::default()
         }) {
             Ok(db) => ok_handle(db),
@@ -412,11 +418,11 @@ pub extern "C" fn jed_create(path: *const c_char, reg: *const Registry) -> *mut 
     })
 }
 
-/// Open an existing file-backed database at `path` (read-only iff `read_only != 0`) with the host
-/// functions of `reg` (null for none). Returns a HANDLE buffer on success, an ERROR buffer otherwise
+/// Open an existing file-backed database at `path` (read-only iff `read_only != 0`) in the
+/// environment `env` (null for a fresh empty one). Returns a HANDLE buffer on success, an ERROR buffer otherwise
 /// (`58P01` missing, `XX001` malformed, …).
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_open(path: *const c_char, read_only: u8, reg: *const Registry) -> *mut u8 {
+pub extern "C" fn jed_open(path: *const c_char, read_only: u8, env: *const Env) -> *mut u8 {
     guard(|| {
         let path = match cstr(path) {
             Ok(s) => s,
@@ -424,7 +430,7 @@ pub extern "C" fn jed_open(path: *const c_char, read_only: u8, reg: *const Regis
         };
         let opts = OpenOptions {
             read_only: read_only != 0,
-            extensions: extensions(reg),
+            environment: environment(env),
             ..OpenOptions::default()
         };
         match Database::open_with_options(path, opts) {
@@ -481,39 +487,6 @@ pub extern "C" fn jed_commit(db: *mut Conn) -> *mut u8 {
             Err(e) => err_buf(e.code(), &e.message),
         }
     })
-}
-
-/// Load a host bundle (`load` = [`jed::load_unicode_data`] / [`jed::load_time_zone_data`]) from
-/// `len` bytes at `ptr`. Returns a UNIT buffer on success or an ERROR buffer for a malformed bundle.
-fn load_bundle(ptr: *const u8, len: u32, load: fn(&[u8]) -> jed::Result<()>) -> *mut u8 {
-    guard(|| {
-        let bytes: &[u8] = if ptr.is_null() || len == 0 {
-            &[]
-        } else {
-            // SAFETY: the gem passes a pointer to `len` contiguous bytes valid for the call.
-            unsafe { std::slice::from_raw_parts(ptr, len as usize) }
-        };
-        match load(bytes) {
-            Ok(()) => Buf::new(TAG_UNIT).finish(),
-            Err(e) => err_buf(e.code(), &e.message),
-        }
-    })
-}
-
-/// Load a Unicode collation bundle (JUCD) into the **engine-global** collation set
-/// (spec/design/collation.md) — usable by every database in the process (the SQLite model). The
-/// bare binary ships `C`-collation only; this adds the linguistic collations the bundle provides.
-#[unsafe(no_mangle)]
-pub extern "C" fn jed_load_unicode_data(ptr: *const u8, len: u32) -> *mut u8 {
-    load_bundle(ptr, len, jed::load_unicode_data)
-}
-
-/// Load an IANA time-zone bundle (JTZ) into the **engine-global** zone set
-/// (spec/design/timezones.md) — usable by every database in the process. The bare binary ships
-/// `UTC` + fixed offsets only; this adds the named zones the bundle provides.
-#[unsafe(no_mangle)]
-pub extern "C" fn jed_load_time_zone_data(ptr: *const u8, len: u32) -> *mut u8 {
-    load_bundle(ptr, len, jed::load_time_zone_data)
 }
 
 /// Close a database handle, rolling back any open explicit transaction (it never commits implicitly
@@ -580,8 +553,8 @@ const HOST_TYPES: &[ScalarType] = &[
     ScalarType::Timestamptz,
 ];
 
-/// One registered host function as plain data — everything needed to build a fresh `HostFunction`
-/// for each handle opened with the registry.
+/// One host function being registered, as plain data — everything needed to build its
+/// `HostFunction`.
 struct HostSpec {
     name: String,
     arg_types: Vec<ScalarType>,
@@ -593,30 +566,48 @@ struct HostSpec {
     user_data: usize,
 }
 
-/// A host's function registry (ruby.md §5b). Opens *borrow* it to build their own frozen
-/// `ExtensionRegistry`, so one registry serves any number of handles and later registrations reach
-/// only later opens. `shadow` holds the same signatures with inert kernels, so registration is
-/// validated by the engine's own `register_function` (`42723` duplicate, `22023` negative cost).
-pub struct Registry {
-    specs: Vec<HostSpec>,
-    shadow: ExtensionRegistry,
+/// A host's environment builder (ruby.md §5a/§5b): the engine's `EnvironmentBuilder`. Every load and
+/// registration is applied to a copy and kept only when it succeeds, so a failed call leaves the
+/// builder exactly as it was (the engine's builder methods consume the builder).
+pub struct EnvBuilder {
+    inner: EnvironmentBuilder,
 }
 
-/// The frozen engine registry for one open: a fresh `HostFunction` per spec, or an empty registry for
-/// a null `reg`.
-fn extensions(reg: *const Registry) -> Arc<ExtensionRegistry> {
-    let mut ext = ExtensionRegistry::new();
-    if !reg.is_null() {
-        // SAFETY: `reg` is a live registry from jed_registry_new, not yet passed to
-        // jed_registry_free; the gem serializes registration against opens, so this shared borrow
-        // never overlaps a `&mut` from jed_registry_register.
-        let reg = unsafe { &*reg };
-        for spec in &reg.specs {
-            ext.register_function(spec.host_function())
-                .expect("a host function validated at registration registers again");
-        }
+impl EnvBuilder {
+    /// Apply `f` to a copy of the builder; keep the result on success. The copy shares every table by
+    /// reference, so it is cheap.
+    fn update(
+        &mut self,
+        f: impl FnOnce(EnvironmentBuilder) -> jed::Result<EnvironmentBuilder>,
+    ) -> jed::Result<()> {
+        self.inner = f(self.inner.clone())?;
+        Ok(())
     }
-    Arc::new(ext)
+}
+
+/// A frozen environment (ruby.md §5a): the engine's `Environment`. Each open clones it (an `Arc`), so
+/// a database never refers to this box again and the host may free it while databases stay open.
+pub struct Env {
+    inner: Environment,
+}
+
+/// A controllable random or clock source the host keeps a handle to (ruby.md §5c): installing it in a
+/// builder shares the same object, so reseeding or setting it reaches every database whose
+/// environment holds it.
+pub enum Source {
+    Seeded(Arc<SeededRandom>),
+    Manual(Arc<ManualClock>),
+    Advancing(Arc<AdvancingClock>),
+}
+
+/// The environment for one open: a clone of `env`'s, or a fresh empty one for a null `env`.
+fn environment(env: *const Env) -> Environment {
+    if env.is_null() {
+        return Environment::default();
+    }
+    // SAFETY: `env` is a live environment from jed_env_builder_build / jed_env_to_builder's build, not
+    // yet passed to jed_env_free; an environment is immutable, so a shared borrow is all anyone takes.
+    unsafe { &*env }.inner.clone()
 }
 
 impl HostSpec {
@@ -893,26 +884,249 @@ impl Upcall {
     }
 }
 
-/// A new, empty host-function registry. Free it with [`jed_registry_free`]; handles opened with it do
-/// not refer to it afterwards.
+/// A new builder starting from the empty environment. Free it with [`jed_env_builder_free`].
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_registry_new() -> *mut Registry {
-    Box::into_raw(Box::new(Registry {
-        specs: Vec::new(),
-        shadow: ExtensionRegistry::new(),
+pub extern "C" fn jed_env_builder_new() -> *mut EnvBuilder {
+    Box::into_raw(Box::new(EnvBuilder {
+        inner: Environment::builder(),
     }))
 }
 
-/// Free a registry from [`jed_registry_new`]. A null pointer is a no-op.
+/// Free a builder from [`jed_env_builder_new`] / [`jed_env_to_builder`]. A null pointer is a no-op.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_registry_free(reg: *mut Registry) {
-    if reg.is_null() {
+pub extern "C" fn jed_env_builder_free(b: *mut EnvBuilder) {
+    if b.is_null() {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: `reg` came from Box::into_raw in jed_registry_new and is freed exactly once (the gem
-        // frees it only from its registry's finalizer).
-        drop(unsafe { Box::from_raw(reg) });
+        // SAFETY: `b` came from Box::into_raw and is freed exactly once (the gem frees it only from
+        // its builder's finalizer).
+        drop(unsafe { Box::from_raw(b) });
+    }));
+}
+
+/// Borrow a live builder mutably, or an `XX000` ERROR buffer for null.
+fn builder<'a>(b: *mut EnvBuilder) -> Result<&'a mut EnvBuilder, *mut u8> {
+    if b.is_null() {
+        return Err(err_buf("XX000", "null environment builder handle"));
+    }
+    // SAFETY: `b` is a live builder not yet freed; the gem holds the builder's lock for the call, so
+    // this is the only reference.
+    Ok(unsafe { &mut *b })
+}
+
+/// A UNIT buffer for `Ok`, an ERROR buffer for `Err`.
+fn unit_or_err(r: jed::Result<()>) -> *mut u8 {
+    match r {
+        Ok(()) => Buf::new(TAG_UNIT).finish(),
+        Err(e) => err_buf(e.code(), &e.message),
+    }
+}
+
+/// Load a bundle (`load` = `EnvironmentBuilder::load_unicode_data` / `load_time_zone_data`) of `len`
+/// bytes at `ptr` into the builder. Returns a UNIT buffer, or an ERROR buffer (`XX001`) for a
+/// malformed bundle, which leaves the builder unchanged.
+fn load_bundle(
+    b: *mut EnvBuilder,
+    ptr: *const u8,
+    len: u32,
+    load: fn(EnvironmentBuilder, &[u8]) -> jed::Result<EnvironmentBuilder>,
+) -> *mut u8 {
+    guard(|| {
+        let b = match builder(b) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let bytes: &[u8] = if ptr.is_null() || len == 0 {
+            &[]
+        } else {
+            // SAFETY: the gem passes a pointer to `len` contiguous bytes valid for the call.
+            unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+        };
+        unit_or_err(b.update(|inner| load(inner, bytes)))
+    })
+}
+
+/// Load a Unicode bundle (JUCD — collations and the casing table, spec/design/collation.md) into the
+/// builder. First-wins, like the engine's builder.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_env_builder_load_unicode_data(
+    b: *mut EnvBuilder,
+    ptr: *const u8,
+    len: u32,
+) -> *mut u8 {
+    load_bundle(b, ptr, len, |inner, bytes| inner.load_unicode_data(bytes))
+}
+
+/// Load an IANA time-zone bundle (JTZ, spec/design/timezones.md) into the builder. First-wins.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_env_builder_load_time_zone_data(
+    b: *mut EnvBuilder,
+    ptr: *const u8,
+    len: u32,
+) -> *mut u8 {
+    load_bundle(b, ptr, len, |inner, bytes| inner.load_time_zone_data(bytes))
+}
+
+/// Install `src` (a seeded random source; null = OS randomness) as the builder's random source.
+/// Returns a UNIT buffer, or `22023` for a clock source.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_env_builder_random_source(b: *mut EnvBuilder, src: *const Source) -> *mut u8 {
+    guard(|| {
+        let b = match builder(b) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let source: Arc<dyn RandomSource> = if src.is_null() {
+            jed::os_random_source()
+        } else {
+            // SAFETY: `src` is a live source from one of the source constructors, not yet freed.
+            match unsafe { &*src } {
+                Source::Seeded(s) => s.clone(),
+                _ => return err_buf("22023", "a clock source is not a random source"),
+            }
+        };
+        unit_or_err(b.update(|inner| Ok(inner.random_source(source))))
+    })
+}
+
+/// Install `src` (a manual or advancing clock; null = the wall clock) as the builder's clock source.
+/// Returns a UNIT buffer, or `22023` for a random source.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_env_builder_clock_source(b: *mut EnvBuilder, src: *const Source) -> *mut u8 {
+    guard(|| {
+        let b = match builder(b) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let source: Arc<dyn ClockSource> = if src.is_null() {
+            jed::wall_clock()
+        } else {
+            // SAFETY: `src` is a live source from one of the source constructors, not yet freed.
+            match unsafe { &*src } {
+                Source::Manual(c) => c.clone(),
+                Source::Advancing(c) => c.clone(),
+                Source::Seeded(_) => {
+                    return err_buf("22023", "a random source is not a clock source");
+                }
+            }
+        };
+        unit_or_err(b.update(|inner| Ok(inner.clock_source(source))))
+    })
+}
+
+/// Freeze the builder's current contents into a new environment (the builder stays usable). Free it
+/// with [`jed_env_free`]. Null only for a null builder or an internal panic.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_env_builder_build(b: *const EnvBuilder) -> *mut Env {
+    if b.is_null() {
+        return std::ptr::null_mut();
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `b` is a live builder; the gem holds its lock for the call.
+        let inner = unsafe { &*b }.inner.clone().build();
+        Box::into_raw(Box::new(Env { inner }))
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// A new builder pre-filled with `env`'s contents (shared by reference). Free it with
+/// [`jed_env_builder_free`]. Null only for a null environment or an internal panic.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_env_to_builder(env: *const Env) -> *mut EnvBuilder {
+    if env.is_null() {
+        return std::ptr::null_mut();
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `env` is a live environment; environments are immutable.
+        let inner = unsafe { &*env }.inner.to_builder();
+        Box::into_raw(Box::new(EnvBuilder { inner }))
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Free an environment from [`jed_env_builder_build`]. Databases opened with it keep their own
+/// reference. A null pointer is a no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_env_free(env: *mut Env) {
+    if env.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `env` came from Box::into_raw and is freed exactly once (the gem's finalizer).
+        drop(unsafe { Box::from_raw(env) });
+    }));
+}
+
+/// A new seeded random source (splitmix64, spec/encoding/prng.toml) seeded with `seed`.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_seeded_random_new(seed: u64) -> *mut Source {
+    Box::into_raw(Box::new(Source::Seeded(jed::seeded_random_source(seed))))
+}
+
+/// A new manual clock reading `micros` (µs since the Unix epoch).
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_manual_clock_new(micros: i64) -> *mut Source {
+    Box::into_raw(Box::new(Source::Manual(jed::manual_clock(micros))))
+}
+
+/// A new advancing clock: its next read returns `start`, each later read `step` more.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_advancing_clock_new(start: i64, step: i64) -> *mut Source {
+    Box::into_raw(Box::new(Source::Advancing(jed::advancing_clock(
+        start, step,
+    ))))
+}
+
+/// Borrow a live source, or `None` for null.
+fn source<'a>(src: *const Source) -> Option<&'a Source> {
+    // SAFETY: a non-null `src` is a live source from one of the constructors above, not yet freed;
+    // every control below goes through the source's own interior synchronization.
+    (!src.is_null()).then(|| unsafe { &*src })
+}
+
+/// Restart a seeded random source as if freshly seeded with `seed`. A no-op on another kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_seeded_random_reseed(src: *const Source, seed: u64) {
+    if let Some(Source::Seeded(s)) = source(src) {
+        s.reseed(seed);
+    }
+}
+
+/// Set a manual clock's reading to `micros`. A no-op on another kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_manual_clock_set(src: *const Source, micros: i64) {
+    if let Some(Source::Manual(c)) = source(src) {
+        c.set(micros);
+    }
+}
+
+/// Move a manual clock's reading forward by `step` micros. A no-op on another kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_manual_clock_advance(src: *const Source, step: i64) {
+    if let Some(Source::Manual(c)) = source(src) {
+        c.advance(step);
+    }
+}
+
+/// Restart an advancing clock at `start`, stepping `step`. A no-op on another kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_advancing_clock_reset(src: *const Source, start: i64, step: i64) {
+    if let Some(Source::Advancing(c)) = source(src) {
+        c.reset(start, step);
+    }
+}
+
+/// Free a source handle. Environments that hold the source keep their own reference. A null pointer
+/// is a no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn jed_source_free(src: *mut Source) {
+    if src.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `src` came from Box::into_raw and is freed exactly once (the gem's finalizer).
+        drop(unsafe { Box::from_raw(src) });
     }));
 }
 
@@ -925,8 +1139,8 @@ pub extern "C" fn jed_registry_free(reg: *mut Registry) {
 /// unsupported type).
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn jed_registry_register(
-    reg: *mut Registry,
+pub extern "C" fn jed_env_builder_register(
+    b: *mut EnvBuilder,
     name: *const c_char,
     arg_types: *const c_char,
     result: *const c_char,
@@ -937,12 +1151,10 @@ pub extern "C" fn jed_registry_register(
     user_data: usize,
 ) -> *mut u8 {
     guard(|| {
-        if reg.is_null() {
-            return err_buf("XX000", "null registry handle");
-        }
-        // SAFETY: `reg` is a live registry from jed_registry_new; the gem holds its lock for the call,
-        // so this is the only reference.
-        let reg = unsafe { &mut *reg };
+        let b = match builder(b) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
         let Some(callback) = callback else {
             return err_buf("XX000", "null host-function callback");
         };
@@ -967,27 +1179,25 @@ pub extern "C" fn jed_registry_register(
             2 => Volatility::Volatile,
             _ => return err_buf("22023", "host function volatility must be 0, 1, or 2"),
         };
-        let inert = HostFunction::new(name, types.clone(), result, Box::new(|_| Ok(Value::Null)))
-            .cost(cost);
-        if let Err(e) = reg.shadow.register_function(inert) {
-            return err_buf(e.code(), &e.message);
-        }
-        let mut b = Buf::new(TAG_TYPES);
-        b.u32(types.len() as u32 + 1);
-        for ty in types.iter().chain([&result]) {
-            b.str(ty.canonical_name());
-        }
-        reg.specs.push(HostSpec {
+        let spec = HostSpec {
             name: name.to_string(),
-            arg_types: types,
+            arg_types: types.clone(),
             result,
             volatility,
             cost,
             batched: batched != 0,
             callback,
             user_data,
-        });
-        b.finish()
+        };
+        if let Err(e) = b.update(|inner| inner.register_function(spec.host_function())) {
+            return err_buf(e.code(), &e.message);
+        }
+        let mut out = Buf::new(TAG_TYPES);
+        out.u32(types.len() as u32 + 1);
+        for ty in types.iter().chain([&result]) {
+            out.str(ty.canonical_name());
+        }
+        out.finish()
     })
 }
 

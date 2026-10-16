@@ -8,14 +8,15 @@ module Jed
   # (CLAUDE.md §3). Prefer the block forms ({Database.memory}, {.create}, {.open}), which close the
   # handle automatically; otherwise call {#close} when done.
   #
-  # Each open takes an optional `extensions:` {Jed::ExtensionRegistry}; the handle gets the host
-  # functions registered so far, frozen for its life (spec/design/ruby.md §5b).
+  # Each open takes an optional `environment:` {Jed::Environment} — the loaded bundles, host functions,
+  # and random and clock sources the database runs with, fixed for its life (spec/design/ruby.md §5a).
+  # Without one the database gets a fresh empty environment.
   class Database
     class << self
       # Open a new in-memory database. With a block, yields the database and closes it after.
-      def memory(extensions: nil)
-        handle, functions = with_registry(extensions) { |reg| Jed::FFI::OPEN_MEMORY.call(reg) }
-        db = new(handle, functions)
+      def memory(environment: nil)
+        env = environment_pointer(environment)
+        db = new(Jed::FFI::OPEN_MEMORY.call(env), environment)
         return db unless block_given?
 
         manage(db) { yield db }
@@ -23,11 +24,9 @@ module Jed
 
       # Create a new file-backed database at `path` (`58P02` if it already exists). With a block,
       # yields the database and closes it after.
-      def create(path, extensions: nil)
-        result, functions = with_registry(extensions) do |reg|
-          Jed::Codec.take(Jed::FFI::CREATE.call(path.to_s, reg))
-        end
-        db = handle_or_raise(result, functions)
+      def create(path, environment: nil)
+        env = environment_pointer(environment)
+        db = handle_or_raise(Jed::Codec.take(Jed::FFI::CREATE.call(path.to_s, env)), environment)
         return db unless block_given?
 
         manage(db) { yield db }
@@ -35,11 +34,9 @@ module Jed
 
       # Open an existing file-backed database at `path` (`58P01` if missing). `read_only: true`
       # opens it like a PG hot standby — every write is `25006`. With a block, yields and closes.
-      def open(path, read_only: false, extensions: nil)
-        result, functions = with_registry(extensions) do |reg|
-          Jed::Codec.take(Jed::FFI::OPEN.call(path.to_s, read_only ? 1 : 0, reg))
-        end
-        db = handle_or_raise(result, functions)
+      def open(path, read_only: false, environment: nil)
+        env = environment_pointer(environment)
+        db = handle_or_raise(Jed::Codec.take(Jed::FFI::OPEN.call(path.to_s, read_only ? 1 : 0, env)), environment)
         return db unless block_given?
 
         manage(db) { yield db }
@@ -47,21 +44,20 @@ module Jed
 
       private
 
-      # Run an open with the native registry pointer (null for none), returning its value and the
-      # host functions the handle must keep alive.
-      def with_registry(extensions)
-        return [yield(Fiddle::NULL), [].freeze] if extensions.nil?
-        unless extensions.is_a?(Jed::ExtensionRegistry)
-          raise ArgumentError, "extensions: must be a Jed::ExtensionRegistry, got #{extensions.class}"
+      # The native environment pointer for an open (null = a fresh empty environment).
+      def environment_pointer(environment)
+        return Fiddle::NULL if environment.nil?
+        unless environment.is_a?(Jed::Environment)
+          raise ArgumentError, "environment: must be a Jed::Environment, got #{environment.class}"
         end
 
-        extensions.open_with { |reg| yield reg }
+        environment.native_pointer
       end
 
-      def handle_or_raise(result, functions)
+      def handle_or_raise(result, environment)
         raise Jed::Error.new(result[:sqlstate], result[:message]) if result[:kind] == :error
 
-        new(Fiddle::Pointer.new(result[:ptr]), functions)
+        new(Fiddle::Pointer.new(result[:ptr]), environment)
       end
 
       def manage(db)
@@ -71,13 +67,14 @@ module Jed
       end
     end
 
-    def initialize(handle, host_functions = [].freeze)
+    def initialize(handle, environment = nil)
       @handle = handle
       @addr = handle.to_i
       @closed = false
-      # The host functions this handle was opened with. Holding them keeps their Fiddle closures —
-      # whose trampolines the engine calls — alive for the handle's life (ruby.md §5b "Lifetime").
-      @host_functions = host_functions
+      # The environment this handle was opened with (nil = the fresh empty one). Holding it keeps its
+      # host functions' Fiddle closures — whose trampolines the engine calls — alive for the handle's
+      # life (ruby.md §5b "Lifetime").
+      @environment = environment
       # Serializes every native call on this handle: one thread at a time while the GVL is released
       # during a query, and a re-entrant call from a host function is refused (ruby.md §5b).
       @lock = Mutex.new
@@ -154,6 +151,9 @@ module Jed
     end
 
     def closed? = @closed
+
+    # The {Jed::Environment} this database was opened with, or nil when it runs in a fresh empty one.
+    attr_reader :environment
 
     def self.finalizer(addr)
       proc { Jed::FFI::CLOSE.call(Fiddle::Pointer.new(addr)) }

@@ -34,6 +34,7 @@ mod datetime_fn;
 mod datetime_units_gen;
 mod decimal;
 mod encoding;
+mod environment;
 mod ergonomic;
 mod error;
 mod estimator;
@@ -92,7 +93,6 @@ pub mod sim;
 // embedders should reach for Database/Session. `execute`/`execute_params` are its one-shot helpers.
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use cancel::CancellationToken;
-pub use collation::{load_unicode_data, loaded_collation};
 pub use decimal::Decimal;
 // The rusqlite-style ergonomic layer (spec/design/api.md §11): native-typed params + typed row
 // scanning over the raw `Database`/`Session`/`Transaction` handles. Additive — the raw `&[Value]`
@@ -103,9 +103,13 @@ pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_MAX_TEMP_STORAGE_BYTES, DEFAULT_PAGE_SIZE,
     DEFAULT_TEMP_BUFFERS, ScriptSummary, SessionOptions, TxStatus,
 };
-// Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions into
-// an `ExtensionRegistry` and hands it to `create`/`open` via `CreateOptions`/`OpenOptions`.
-pub use extension::{ExtensionRegistry, HostBatchKernel, HostFunction, HostKernel, Volatility};
+// The environment (spec/design/environment.md) — every input from outside the engine except storage:
+// loaded Unicode and time-zone data, host functions, and the random and clock sources. A host builds
+// one and hands it to `create`/`open` via `CreateOptions`/`OpenOptions`.
+pub use environment::{Environment, EnvironmentBuilder};
+// Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions on an
+// `EnvironmentBuilder`.
+pub use extension::{HostBatchKernel, HostFunction, HostKernel, Volatility};
 // The scalar type set is on the public surface (a host names it to declare host-function signatures).
 pub use types::ScalarType;
 // The low-level single-threaded `Engine` is a purely INTERNAL concern — not the public embedding
@@ -120,11 +124,14 @@ pub(crate) use executor::Engine;
 pub(crate) use executor::Outcome;
 pub use file::{CreateOptions, Locking, OpenOptions};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
-pub use seam::{ClockSource, RandomSource, advancing_clock, fixed_clock, seeded_random_source};
+pub use seam::{
+    AdvancingClock, ClockSource, ManualClock, RandomSource, SeededRandom, advancing_clock,
+    manual_clock, os_random_source, seeded_random_source, wall_clock,
+};
 pub use shared::{AttachSource, Database, Session};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
-pub use timezone::{load_time_zone_data, resolve_zone};
+pub use timezone::TimeZoneInfo;
 // The container value types a host builds to bind an array or range parameter (spec/design/api.md §5).
 pub use value::{ArrayVal, RangeVal, Value};
 
@@ -172,9 +179,13 @@ pub mod tooling {
         };
     }
     pub mod timezone {
-        pub use crate::timezone::{
-            TzBundle, load_time_zone_data, offset_at_ref, open_bundle, resolve_zone, save_bundle,
-        };
+        pub use crate::timezone::{TzBundle, ZoneRef, offset_at_ref, open_bundle, save_bundle};
+
+        /// Resolve a zone name in `env`: a built-in fixed offset (`UTC` / `±HH[:MM[:SS]]`) or one of
+        /// its loaded zones (spec/design/timezones.md §3.2) — for the vector generator.
+        pub fn resolve_zone(env: &crate::Environment, name: &str) -> Option<ZoneRef> {
+            env.resolve_zone(name)
+        }
     }
 }
 

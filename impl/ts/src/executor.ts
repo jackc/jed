@@ -146,12 +146,10 @@ import {
 } from "./rewrite.ts";
 import {
   type Collation,
-  loadedCollationTables,
-  loadedProperty,
-  loadUnicodeData as loadUnicodeDataGlobal,
   serializeTable,
   sortKey as collationSortKey,
 } from "./collation.ts";
+import { Environment } from "./environment.ts";
 import { COSTS, MEMORY_ENTRY, MEMORY_ROW, MEMORY_VALUE } from "./costs.ts";
 import {
   entryBytes,
@@ -233,8 +231,6 @@ import { Cursor, type RowSource } from "./cursor.ts";
 import type { RunResult } from "./ergonomic.ts";
 import {
   InputZone,
-  loadTimeZoneData as loadTimeZoneDataGlobal,
-  loadedTimeZones as loadedTimeZonesGlobal,
   type TimeZoneInfo,
   type ZoneRef,
 } from "./timezone.ts";
@@ -289,7 +285,7 @@ import {
   pkDetail,
 } from "./error_detail.ts";
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
-import type { ExtensionRegistry, HostFuncEntry } from "./extension.ts";
+import type { HostFunctions, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { FileHost } from "./filehost.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -380,7 +376,7 @@ import {
   widthBytes,
   isFixedWidth,
 } from "./types.ts";
-import { type ClockFunc, type RandomFill, type Seam, StmtRng } from "./seam.ts";
+import { StmtRng } from "./seam.ts";
 import { ginJsonbIndexTerms, ginJsonbKeyTerm } from "./gin_jsonb.ts";
 import { type Interval, intervalEncodeKey, intervalLerp, intervalSpan } from "./interval.ts";
 import {
@@ -1616,7 +1612,7 @@ export type CollationVerdict = "full" | "skewed";
 // CollationInfo is introspection metadata for one loaded collation (db.collations,
 // spec/design/collation.md §1). contentHash is the CRC-32 of the compiled table (the reference-mode
 // stamp, §3/§4); description is provenance, excluded from the hash. verdict is the slice-2d
-// version-skew verdict (§12) — "full" for the engine-global loaded set (it IS the reference); for a
+// version-skew verdict (§12) — "full" for the environment's loaded set (it IS the reference); for a
 // database's referenced collations it is "skewed" when the file's pin differs from the loaded bundle's.
 export type CollationInfo = {
   name: string;
@@ -1670,7 +1666,7 @@ export class Engine {
   attachedCommitted: Map<string, Snapshot> = new Map();
   // The DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this handle runs
   // statements through — the open transaction (the Idle/Open/Failed machine, §2.2), the relocated
-  // settings (maxCost/maxSqlLength/workMem, the entropy/clock seam), and the currval/lastval session
+  // settings (maxCost/maxSqlLength/workMem), the handle's Environment, and the currval/lastval session
   // state. A bare Engine IS committed storage + this one long-lived stateful default session; the
   // convenience methods operate on it. newSession mints additional independent sessions (run
   // sequentially on this single-threaded handle by swapping into this slot for a call).
@@ -1821,9 +1817,11 @@ export class Engine {
     temp: boolean;
   }[] = [];
 
-  constructor() {
-    this.committed = new Snapshot();
-    this.session = new SessionState();
+  // environment is the handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one
+  // (§7). Every session minted over this engine receives it.
+  constructor(environment: Environment = new Environment()) {
+    this.committed = new Snapshot(environment);
+    this.session = new SessionState(environment);
     this.path = null;
     this.pageSize = DEFAULT_PAGE_SIZE;
     this.pageCount = 0;
@@ -1970,7 +1968,7 @@ export class Engine {
   releaseTempStorage(): void {
     const ts = this.tempStorage;
     this.tempStorage = null;
-    this.session.tempCommitted = new Snapshot();
+    this.session.tempCommitted = new Snapshot(this.environment);
     if (ts !== null && ts.paging !== null) {
       ts.paging.close();
       ts.paging = null;
@@ -2038,26 +2036,10 @@ export class Engine {
     return parseSQL(sql);
   }
 
-  // setRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) —
-  // the deterministic / reproducible path. Pass seededRandomSource for a byte-identical cross-core
-  // stream (the conformance # seed: directive). clearRandomSource returns to the OS CSPRNG, drawn
-  // per value (production — unpredictable output).
-  setRandomSource(f: RandomFill): void {
-    this.session.seam.randomFill = f;
-  }
-
-  clearRandomSource(): void {
-    this.session.seam.randomFill = undefined;
-  }
-
-  // setClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. fixedClock (the # clock:
-  // directive). clearClockSource returns to the wall clock.
-  setClockSource(f: ClockFunc): void {
-    this.session.seam.clock = f;
-  }
-
-  clearClockSource(): void {
-    this.session.seam.clock = undefined;
+  // environment is the handle's Environment (spec/design/environment.md): its loaded Unicode and
+  // time-zone data, host functions, and random + clock sources. Fixed for the handle's lifetime.
+  get environment(): Environment {
+    return this.session.environment;
   }
 
   // setWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
@@ -2141,7 +2123,9 @@ export class Engine {
   // (temp-tables.md §6), lazily creating the domain's storage Engine (newTempStorage — a private
   // in-RAM store + pinned pool with within-session compaction on) on first use.
   tempDomainPaging(): SharedPaging {
-    if (this.tempStorage === null) this.tempStorage = newTempStorage(this.pageSize);
+    if (this.tempStorage === null) {
+      this.tempStorage = newTempStorage(this.pageSize, this.environment);
+    }
     return this.tempStorage.paging!;
   }
 
@@ -2840,7 +2824,7 @@ export class Engine {
   }
 
   // resolveCollationByName resolves a collation for USE — the database's resolved set then the
-  // engine-global loaded set (spec/design/collation.md §2/§9). The reference-only read path; undefined
+  // environment's loaded set (spec/design/collation.md §2/§9). The reference-only read path; undefined
   // ⇒ neither has it (resolver → 42704).
   resolveCollationByName(name: string): Collation | undefined {
     return this.readSnap().resolveCollation(name);
@@ -2938,52 +2922,21 @@ export class Engine {
   // importCollation / exportCollation are GONE (the reference-only pivot, spec/design/collation.md
   // §4.2): a collation is provided by a host-loaded bundle and used by name, never loaded into a
   // database. There is no runtime path that constructs or bakes a collation table — the only load is
-  // loadUnicodeData of jed's own pinned bundle bytes.
+  // EnvironmentBuilder.loadUnicodeData of jed's own pinned bundle bytes (environment.md).
 
-  // loadUnicodeData loads a JUCD Unicode-data bundle (db.loadUnicodeData, spec/design/collation.md
-  // §4.2): its collations become resolvable by name for COLLATE, per-column collation, and ORDER BY …
-  // COLLATE. The loaded set is ENGINE-GLOBAL (§9), so a bundle loaded through any handle is visible
-  // everywhere — including to a later Engine.open of a file that REFERENCES one of its collations.
-  // Privileged host op (not SQL-reachable, no path, no engine I/O — §11); ADDITIVE and idempotent for
-  // an already-loaded bundle. Browser-safe (Uint8Array, no node:fs). A malformed bundle is XX001.
-  // (Mirrors the free loadUnicodeData, which the host may call before opening any file.)
-  loadUnicodeData(data: Uint8Array): void {
-    loadUnicodeDataGlobal(data);
-  }
-
-  // loadTimeZoneData loads a JTZ time-zone bundle into the engine-global loaded set
-  // (db.loadTimeZoneData, spec/design/timezones.md §3.3). The bytes are jed's own pinned TZif (RFC
-  // 8536) wrapped in a manifest; the loaded zones become usable by AT TIME ZONE. Like the collation
-  // seam, this is a privileged host op (not SQL-reachable, no path, no engine I/O — §10), additive and
-  // idempotent, engine-global so it may be called before open. Browser-safe. A malformed bundle is
-  // XX001. (UTC and fixed offsets are built in and need no load.)
-  loadTimeZoneData(data: Uint8Array): void {
-    loadTimeZoneDataGlobal(data);
-  }
-
-  // loadedTimeZones introspects the engine-global loaded zone set (db.loadedTimeZones, timezones.md
-  // §3.3) — every named zone (and alias) a loaded bundle provides, ascending by name. A property of
-  // the running engine, not of this database. UTC and fixed offsets are built in and not listed.
+  // loadedTimeZones introspects the zones the handle's environment loaded (timezones.md §3.3,
+  // environment.md §6) — every named zone (and alias), ascending by name. UTC and fixed offsets are
+  // built in and not listed.
   loadedTimeZones(): TimeZoneInfo[] {
-    return loadedTimeZonesGlobal();
+    return this.environment.loadedTimeZones();
   }
 
-  // loadedCollations introspects the engine-global LOADED collation set (db.loadedCollations,
-  // spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
-  // database on this handle, ascending by name. A property of the running ENGINE, not of this
-  // database; for the collations this database references, use Engine.collations. isDefault is
-  // always false here (that is a per-database property). C is built in and not listed.
+  // loadedCollations introspects the collations the handle's environment loaded
+  // (spec/design/collation.md §4.2, environment.md §6), ascending by name. For the collations this
+  // database references, use Engine.collations. isDefault is always false here (that is a
+  // per-database property). C is built in and not listed.
   loadedCollations(): CollationInfo[] {
-    return loadedCollationTables().map((c) => ({
-      name: c.name,
-      unicodeVersion: c.unicodeVersion,
-      cldrVersion: c.cldrVersion,
-      contentHash: crc32Ieee(serializeTable(c)),
-      description: c.description,
-      isDefault: false,
-      // The loaded set IS the version reference — it can never be skewed against itself.
-      verdict: "full" as const,
-    }));
+    return this.environment.loadedCollations();
   }
 
   // setDefaultCollation sets the per-database default collation (db.setDefaultCollation,
@@ -3069,7 +3022,7 @@ export class Engine {
 
   // collations introspects the collations THIS DATABASE references (db.collations,
   // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
-  // per-database default), in ascending name order. This is the per-file view; for the engine-global
+  // per-database default), in ascending name order. This is the per-file view; for the environment's
   // LOADED set, use Engine.loadedCollations. C is built in and not listed.
   collations(): CollationInfo[] {
     const dflt = this.committed.defaultCollation;
@@ -6446,7 +6399,7 @@ export class Engine {
       }
       // Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a component
       // identity (42P17), and the resolved dependencies persist with the check.
-      checkDeps.push(collectCheckHostDeps(node, this.session.extensions));
+      checkDeps.push(collectCheckHostDeps(node, this.session.environment.hostFunctions()));
     }
     // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
     // used as written; a derived name is built from the exact table/column names —
@@ -6884,7 +6837,7 @@ export class Engine {
       ).node;
       // Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match the
       // dependency persisted with the check, else XX002 before any mutation.
-      verifyCheckHostDeps(c.name, node, this.session.extensions, c.hostDeps ?? []);
+      verifyCheckHostDeps(c.name, node, this.session.environment.hostFunctions(), c.hostDeps ?? []);
       return { name: c.name, node };
     });
   }
@@ -6898,7 +6851,7 @@ export class Engine {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng,
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -6918,7 +6871,7 @@ export class Engine {
     ptypes: ParamTypes = new ParamTypes(),
   ): ResolvedIndex {
     ptypes.uncacheable ||= def.timezoneDeps?.dynamic ?? false;
-    verifyIndexTimezoneDeps(def.timezoneDeps);
+    verifyIndexTimezoneDeps(def.timezoneDeps, this.environment);
     const keys: ResolvedKey[] = def.keys.map((k) => {
       if (k.kind === "column") return { kind: "column", column: k.column };
       const scope = Scope.index(this, table);
@@ -6952,8 +6905,8 @@ export class Engine {
     // scans) and a WRITE propagates (the table is read-only until a rebuild). A no-op for the common
     // index that records no host dependency (and for GIN/GiST whose keys are plain columns). A MISSING
     // function is caught earlier by resolution itself above (42883).
-    if (def.hostDeps && def.hostDeps.length > 0 && this.session.extensions) {
-      const reg = this.session.extensions;
+    const reg = this.session.environment.hostFunctions();
+    if (def.hostDeps && def.hostDeps.length > 0 && reg) {
       for (const k of keys) {
         if (k.kind === "expr") verifyIndexHostDeps(k.expr, reg, def.hostDeps);
       }
@@ -7068,7 +7021,7 @@ export class Engine {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng,
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -7810,7 +7763,7 @@ export class Engine {
                   typeError("argument of CHECK must be boolean"),
                   exprLocation(d.expr),
                 );
-              const hostDeps = collectCheckHostDeps(rn, this.session.extensions);
+              const hostDeps = collectCheckHostDeps(rn, this.session.environment.hostFunctions());
               let name: string;
               if (d.name === null) {
                 const rs = checkReferencedColumns(d.expr, table.columns);
@@ -8451,7 +8404,8 @@ export class Engine {
           { collecting: false, groupKeys: [], specs: [] },
           new ParamTypes(),
         ).node;
-        table.checks[i] = { ...c, hostDeps: collectCheckHostDeps(node, this.session.extensions) };
+        const hostFns = this.session.environment.hostFunctions();
+        table.checks[i] = { ...c, hostDeps: collectCheckHostDeps(node, hostFns) };
         checks.push({ name: c.name, node });
       }
       const colls = this.columnCollations(table.columns),
@@ -9190,9 +9144,8 @@ export class Engine {
         // Collect + admit any host functions the key expression calls (§8.1, step 4): each must be
         // IMMUTABLE + carry a component identity, else 42P17 (this also closes the latent leak where a
         // volatile host function passed the syntactic immutability walk above).
-        if (this.session.extensions) {
-          collectIndexHostDeps(node, this.session.extensions, hostDeps);
-        }
+        const hostFns = this.session.environment.hostFunctions();
+        if (hostFns) collectIndexHostDeps(node, hostFns, hostDeps);
         mergeTimezoneDeps(timezoneDeps, pt.timezoneDeps);
         ciKeys.push({ kind: "expr", exprText: elem.text, expr: elem.expr });
         continue;
@@ -9277,9 +9230,8 @@ export class Engine {
       }
       // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as a key
       // expression (IMMUTABLE + component identity, else 42P17).
-      if (this.session.extensions) {
-        collectIndexHostDeps(predNode, this.session.extensions, hostDeps);
-      }
+      const hostFns = this.session.environment.hostFunctions();
+      if (hostFns) collectIndexHostDeps(predNode, hostFns, hostDeps);
       mergeTimezoneDeps(timezoneDeps, predPt.timezoneDeps);
       predicate = { exprText: ci.predicate.text, expr: ci.predicate.expr };
     }
@@ -10279,7 +10231,7 @@ export class Engine {
       params,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctx),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng,
       ctes: ctx,
       exec: this,
@@ -10486,7 +10438,7 @@ export class Engine {
           const sp = dateClockSpecial(iv.lit.text)!;
           rv[p] = sp.epoch
             ? dateValue(0n)
-            : dateClockValue(this, rng, this.session.seam, meter, sp.offsetDays);
+            : dateClockValue(this, rng, this.session.environment, meter, sp.offsetDays);
         } else {
           rv[p] = withAssignmentHint(() => materializeInsertValue(iv, ct, bound, this.inputZone()));
         }
@@ -10889,7 +10841,7 @@ export class Engine {
             const sp = dateClockSpecial(iv.lit.text)!;
             rv[p] = sp.epoch
               ? dateValue(0n)
-              : dateClockValue(this, stmtRng, this.session.seam, meter, sp.offsetDays);
+              : dateClockValue(this, stmtRng, this.session.environment, meter, sp.offsetDays);
           } else {
             rv[p] = withAssignmentHint(() =>
               materializeInsertValue(iv, ct, bound, this.inputZone()),
@@ -11032,7 +10984,7 @@ export class Engine {
           params: [],
           outer: [],
           runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
-          seam: this.session.seam,
+          environment: this.session.environment,
           rng,
           ctes: EMPTY_CTE_CTX,
           exec: this,
@@ -11252,7 +11204,7 @@ export class Engine {
         params: [],
         outer: [],
         runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
-        seam: this.session.seam,
+        environment: this.session.environment,
         rng,
         ctes: EMPTY_CTE_CTX,
         exec: this,
@@ -11712,7 +11664,7 @@ export class Engine {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng,
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -11795,7 +11747,7 @@ export class Engine {
         params,
         outer: [],
         runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, EMPTY_CTE_CTX),
-        seam: this.session.seam,
+        environment: this.session.environment,
         rng,
         ctes: EMPTY_CTE_CTX,
         exec: this,
@@ -12055,7 +12007,7 @@ export class Engine {
       params,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng: new StmtRng(),
       ctes,
       exec: this,
@@ -12439,7 +12391,7 @@ export class Engine {
       params: bound,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, bound, ctx),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng: new StmtRng(),
       ctes: ctx,
       exec: this,
@@ -12779,7 +12731,7 @@ export class Engine {
       params: bound,
       outer: [],
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, bound, ctx),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng: new StmtRng(),
       ctes: ctx,
       exec: this,
@@ -13622,7 +13574,7 @@ export class Engine {
       params,
       outer,
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, EMPTY_CTE_CTX),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -15389,7 +15341,7 @@ export class Engine {
       params,
       outer,
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng: new StmtRng(),
       ctes,
       exec: this,
@@ -17340,7 +17292,8 @@ export class Engine {
           break;
         }
         case "nested": {
-          const compiled = jsonPathRender(jsonPathCompile(col.path));
+          // Canonical text only — a like_regex fold never changes it, so no casing table is needed.
+          const compiled = jsonPathRender(jsonPathCompile(col.path, undefined));
           const nested = this.resolveJtColumns(col.columns, outColumns);
           resolved.push({ kind: "nested", path: compiled, columns: nested });
           break;
@@ -17369,7 +17322,7 @@ export class Engine {
     // A json context is converted to jsonb, as PostgreSQL casts it (jsonpath.md §5).
     const node = jsonpathContextNode(ctx);
     // The root path → the sequence of row items (a structural error here yields no rows).
-    const root = jsonPathCompileMetered(plan.rootPath, meter);
+    const root = jsonPathCompileMetered(plan.rootPath, meter, env.environment.property());
     // A navigation error yields no rows; a cost abort or a missing variable propagates
     // (jsonpath.md §7).
     let items: JsonNode[];
@@ -18051,7 +18004,7 @@ export class Engine {
           return out;
         }
         checkVarsObject(varsVal.node);
-        const compiled = jsonPathCompileMetered(path.text, meter);
+        const compiled = jsonPathCompileMetered(path.text, meter, env.environment.property());
         const opts: JsonPathEvalOpts = {
           exists: false,
           vars: { kind: "object", node: varsVal.node },
@@ -18086,8 +18039,8 @@ export class Engine {
   // isolated from later writes on the live handle) with NO open transaction — so the engine's reads see
   // exactly the captured frozen state — plus the session envelope the per-row eval / the cost meter read:
   // the cost ceilings + the SHARED lifetime gauge (the LifetimeBudget object — so streaming cost still
-  // counts against lifetimeMaxCost), the SHARED seam (same object — uuid/clock draw from the injected
-  // source), session vars, the time zone, and the currval/lastval session state. The cursor evaluates
+  // counts against lifetimeMaxCost), the SHARED Environment (same object — uuid/clock draw from its
+  // sources), session vars, the time zone, and the currval/lastval session state. The cursor evaluates
   // its filter/projection against this engine, so the streaming cursor is self-contained — it does not
   // reference the live handle, so it survives Database.query's transient session (streaming.md §5).
   snapshotEngine(): Engine {
@@ -18328,7 +18281,7 @@ export class Engine {
         params: bound,
         outer: [],
         runSubquery: (p, o) => snap.execHiddenQueryPlan(p, o, bound, EMPTY_CTE_CTX),
-        seam: snap.session.seam,
+        environment: snap.session.environment,
         rng: new StmtRng(),
         ctes: EMPTY_CTE_CTX,
         exec: snap,
@@ -18361,7 +18314,7 @@ export class Engine {
       params: bound,
       outer: [],
       runSubquery: (p, o) => snap.execHiddenQueryPlan(p, o, bound, EMPTY_CTE_CTX),
-      seam: snap.session.seam,
+      environment: snap.session.environment,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
       exec: snap,
@@ -18590,7 +18543,8 @@ export class Engine {
     // A host call in the WHERE or projection reads each table interval ahead into a window and replays
     // it row by row (extensibility.md §4.2.1 "In-hand and pulled sites"); the filter's and the
     // projection's prefetches each run on their own env.
-    const ra = ReadAhead.forSite(plan.filter, plan.projections, this.session.extensions);
+    const hostFns = this.session.environment.hostFunctions();
+    const ra = ReadAhead.forSite(plan.filter, plan.projections, hostFns);
     const filterEnv: EvalEnv = ra?.filter ? { ...env, hostBatch: ra.filter } : env;
     const projectEnv: EvalEnv = ra?.project ? { ...env, hostBatch: ra.project } : env;
     // processRow runs one scanned row through the pipeline; `at` is its read-ahead window index, or -1.
@@ -19847,7 +19801,7 @@ export class Engine {
       // A subquery inherits the same CTE context (a CTE reference works at any nesting depth —
       // cte.md §2/§5).
       runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
-      seam: this.session.seam,
+      environment: this.session.environment,
       rng: new StmtRng(),
       ctes,
       exec: this,
@@ -19880,7 +19834,7 @@ export class Engine {
       const ra =
         em.sortedFinal || em.sortedIdentity
           ? null
-          : ReadAhead.forSite(null, plan.projections, this.session.extensions);
+          : ReadAhead.forSite(null, plan.projections, this.session.environment.hostFunctions());
       const projectEnv: EvalEnv = ra === null ? env : { ...env, hostBatch: ra.project! };
       try {
         const out: Value[][] = [];
@@ -19950,7 +19904,7 @@ export class Engine {
     }
     // Host calls in the projection prefetch a chunk at a time and replay row by row
     // (extensibility.md §4.2.1).
-    const batch = HostBatch.forExprs(plan.projections, this.session.extensions);
+    const batch = HostBatch.forExprs(plan.projections, this.session.environment.hostFunctions());
     const benv: EvalEnv = batch === null ? env : { ...env, hostBatch: batch };
     for (let i = em.start; i < em.end; i++) {
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -27158,7 +27112,7 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
     case "casing":
       // lower(x)/upper(x) (spec/design/collation.md §16) resolve to a dedicated "casing" node —
       // NOT "scalarFunc" — so an index on lower(email) (the headline expression-index shape)
-      // matches ONLY if this arm is present. The fold is deterministic (engine-global casing
+      // matches ONLY if this arm is present. The fold is deterministic (the handle environment's casing
       // regime, identical at index-build and query-eval), so the match is sound: same direction
       // + a matching argument.
       return b.kind === "casing" && a.upper === b.upper && rexprEqShifted(a.arg, b.arg, offset);
@@ -28457,7 +28411,7 @@ function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
 //   - a componentId — without a stable identity + version the file cannot record a dependency it can
 //     re-check on reopen (42P17, §7).
 // Deduplicated by (name, argTypes); the caller sorts for a stable on-disk order.
-function collectIndexHostDeps(node: RExpr, reg: ExtensionRegistry, out: HostFuncDep[]): void {
+function collectIndexHostDeps(node: RExpr, reg: HostFunctions, out: HostFuncDep[]): void {
   collectHostDeps(node, reg, true, "an index expression", out);
 }
 
@@ -28468,7 +28422,7 @@ function collectIndexHostDeps(node: RExpr, reg: ExtensionRegistry, out: HostFunc
 // swapped implementation is detectable. undefined for a check that calls no host function.
 function collectCheckHostDeps(
   node: RExpr,
-  reg: ExtensionRegistry | null,
+  reg: HostFunctions | null,
 ): HostFuncDep[] | undefined {
   if (reg === null) return undefined;
   const deps: HostFuncDep[] = [];
@@ -28488,7 +28442,7 @@ function sortHostDeps(deps: HostFuncDep[]): void {
 // (name, arg types) signature to out.
 function collectHostDeps(
   node: RExpr,
-  reg: ExtensionRegistry,
+  reg: HostFunctions,
   requireImmutable: boolean,
   site: string,
   out: HostFuncDep[],
@@ -28529,7 +28483,7 @@ function collectHostDeps(
 // (buildIndexAccessPredicate try/catch → the planner skips the index, a correct heap scan) and a WRITE
 // propagates (the table is read-only until a rebuild). A MISSING function is caught earlier by
 // resolution itself (42883). A no-op for an index that records no host dependency.
-function verifyIndexHostDeps(node: RExpr, reg: ExtensionRegistry, deps: HostFuncDep[]): void {
+function verifyIndexHostDeps(node: RExpr, reg: HostFunctions, deps: HostFuncDep[]): void {
   const nodes: HostFuncNode[] = [];
   collectHostFuncNodes(node, nodes);
   for (const hn of nodes) {
@@ -28552,7 +28506,7 @@ function verifyIndexHostDeps(node: RExpr, reg: ExtensionRegistry, deps: HostFunc
 function verifyCheckHostDeps(
   name: string,
   node: RExpr,
-  reg: ExtensionRegistry | null,
+  reg: HostFunctions | null,
   deps: readonly HostFuncDep[],
 ): void {
   const nodes: HostFuncNode[] = [];
@@ -29513,7 +29467,7 @@ export type RExpr =
       compileCharged: boolean;
     }
   // upper(text)/lower(text) — Unicode case folding (collation.md §16). upper selects the direction;
-  // folds via the engine-global property table or the ASCII baseline. A NULL operand propagates.
+  // folds via the environment's property table or the ASCII baseline. A NULL operand propagates.
   | { kind: "casing"; upper: boolean; arg: RExpr }
   | { kind: "atTimeZone"; zone: RExpr; value: RExpr; toTimestamptz: boolean }
   // date_trunc(unit, value[, zone]) (timezones.md §9.1): truncate value down to unit. For a
@@ -29571,7 +29525,7 @@ export type RExpr =
     }
   // A HOST-defined scalar-function call (spec/design/extensibility.md §4.2 / §5.1) — the injection
   // seam that reaches a host-registered kernel, which the compiled scalarFunc dispatch cannot. `id`
-  // indexes the frozen ExtensionRegistry on the session; `name` is carried so EXPLAIN renders it
+  // indexes the frozen HostFunctions on the session; `name` is carried so EXPLAIN renders it
   // without the registry; `result` is the declared scalar result type. STRICT (a NULL arg → NULL,
   // short-circuited in eval like "scalarFunc"). A distinct kind so the built-in path stays
   // monomorphized (§5) and no built-in id-reasoning applies to host code.
@@ -30859,7 +30813,8 @@ export function jtScalarType(db: Engine, typeName: string): ScalarType {
 // impl/rust/src/executor.rs `jt_compile_path`.
 export function jtCompilePath(path: string | null, name: string): string {
   const src = path ?? `$.${name}`;
-  return jsonPathRender(jsonPathCompile(src));
+  // Canonical text only — a like_regex fold never changes it, so no casing table is needed.
+  return jsonPathRender(jsonPathCompile(src, undefined));
 }
 
 // jtEval is how JSON_TABLE evaluates its row, NESTED, and value-column paths: the full sequence,
@@ -30908,7 +30863,7 @@ export function expandJtLevel(
           break;
         }
         case "exists": {
-          const v = evalJtExists(item, col.path, vars, col.returning, col.onError, meter);
+          const v = evalJtExists(item, col.path, vars, col.returning, col.onError, env, meter);
           local.push([col.idx, v]);
           break;
         }
@@ -30940,7 +30895,7 @@ export function expandJtNested(
   if (children.length === 0) return [[]];
   const union: JtAssign[] = [];
   for (const child of children) {
-    const p = jsonPathCompileMetered(child.path, meter);
+    const p = jsonPathCompileMetered(child.path, meter, env.environment.property());
     // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
     let childSeq: JsonNode[];
     try {
@@ -30971,7 +30926,7 @@ export function evalJtRegular(
   env: EvalEnv,
   meter: Meter,
 ): Value {
-  const p = jsonPathCompileMetered(path, meter);
+  const p = jsonPathCompileMetered(path, meter, env.environment.property());
   let seq: JsonNode[];
   try {
     seq = jsonPathEval(p, item, jtEval(vars), meter);
@@ -30995,9 +30950,10 @@ export function evalJtExists(
   vars: JsonPathVars,
   returning: ScalarType,
   onError: JsonOnBehavior,
+  env: EvalEnv,
   meter: Meter,
 ): Value {
-  const p = jsonPathCompileMetered(path, meter);
+  const p = jsonPathCompileMetered(path, meter, env.environment.property());
   let exists: boolean;
   try {
     exists = jsonPathEval(p, item, { exists: true, vars }, meter).length > 0;
@@ -31547,10 +31503,10 @@ export type EvalEnv = {
   params: Value[];
   outer: Row[];
   runSubquery(plan: QueryPlan, outer: Row[]): SelectResult;
-  // The entropy+clock seam (spec/design/entropy.md §5): `seam` is the handle's injected random/clock
-  // functions (a reference to the Engine's Seam — handle-scoped); `rng` is the per-statement
-  // uuidv7 counter + once-resolved clock. Only the volatile uuid generators touch either.
-  seam: Seam;
+  // The entropy+clock seam (spec/design/entropy.md §5): `environment` is the handle's Environment
+  // (its random + clock sources, spec/design/environment.md §4); `rng` is the per-statement uuidv7
+  // counter + once-resolved clock. Only the volatile uuid generators and clock functions touch them.
+  environment: Environment;
   rng: StmtRng;
   // The statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at any
   // nesting depth delivers a CTE's rows. EMPTY_CTE_CTX for every non-WITH statement.
@@ -34429,8 +34385,8 @@ export function resolveWindowCall(
     // A known non-window function is PostgreSQL's 42809 (no hint); an unknown name is its
     // function-lookup failure (error-fields.md §11.7).
     const err = engineError("undefined_function", `${lname} is not a window function`);
-    const known =
-      isScalarFuncName(lname) || (scope.catalog.session.extensions?.hasFunction(lname) ?? false);
+    const hostFns = scope.catalog.environment.hostFunctions();
+    const known = isScalarFuncName(lname) || (hostFns?.hasFunction(lname) ?? false);
     throw known ? err.noHint() : err.hinted(FUNCTION_NO_MATCH);
   }
   // Resolve the window definition (PARTITION BY / ORDER BY expressions → slots, explicit frame).
@@ -35226,7 +35182,8 @@ export function resolveFuncCall(
   // A built-in scalar function OR a host-registered one (extensibility.md §4.2 — a host-only name
   // routes here too; resolveScalarFunc tries the built-in catalog first, then the host registry).
   // Host functions are positional-only, so rejectNamed applies to them as well.
-  if (isScalarFuncName(lname) || (scope.catalog.session.extensions?.hasFunction(lname) ?? false)) {
+  const hostFns = scope.catalog.environment.hostFunctions();
+  if (isScalarFuncName(lname) || (hostFns?.hasFunction(lname) ?? false)) {
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);
   }
@@ -35340,7 +35297,9 @@ export function resolveRegexFunc(
   }
   let program: RegexProgram | null = null;
   if (rargs[1].kind === "constText" && insensitive !== null) {
-    const pat = insensitive ? foldRegexPattern(rargs[1].value, loadedProperty()) : rargs[1].value;
+    const pat = insensitive
+      ? foldRegexPattern(rargs[1].value, scope.catalog.environment.property())
+      : rargs[1].value;
     program = compileRegex(pat);
   }
   // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so a
@@ -35553,7 +35512,7 @@ export function resolveMakeTimestamp(
     rargs.push(r.node);
   }
   if (isTz) {
-    if (rargs.length === 7) params.noteIndexZone(rargs[6]!);
+    if (rargs.length === 7) params.noteIndexZone(rargs[6]!, scope.catalog.environment);
     else params.nonimmutable = true;
   } else params.nonimmutable ||= desc.volatility !== "immutable";
   if (name === "make_date") return scalarFuncNode("make_date", rargs, "date", undefined);
@@ -35695,7 +35654,7 @@ function resolveHostScalar(
   rargs: RExpr[],
   tys: ResolvedType[],
 ): { node: RExpr; type: ResolvedType } | null {
-  const registry = scope.catalog.session.extensions;
+  const registry = scope.catalog.session.environment.hostFunctions();
   if (!registry) return null;
   const argScalars: ScalarType[] = [];
   for (const t of tys) {
@@ -36232,14 +36191,14 @@ export function resolveTimezone(
   // propagates to NULL at eval).
   const zoneOk = zone.type.kind === "text" || zone.type.kind === "null";
   if (zoneOk && value.type.kind === "timestamptz") {
-    params.noteIndexZone(zone.node);
+    params.noteIndexZone(zone.node, scope.catalog.environment);
     return {
       node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: false },
       type: { kind: "timestamp" },
     };
   }
   if (zoneOk && value.type.kind === "timestamp") {
-    params.noteIndexZone(zone.node);
+    params.noteIndexZone(zone.node, scope.catalog.environment);
     return {
       node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: true },
       type: { kind: "timestamptz" },
@@ -36274,7 +36233,7 @@ export function resolveDateTrunc(
     if (z.type.kind !== "text" && z.type.kind !== "null") throw noFuncOverload("date_trunc");
     zone = z.node;
   }
-  if (zone) params.noteIndexZone(zone);
+  if (zone) params.noteIndexZone(zone, scope.catalog.environment);
   else params.nonimmutable ||= vk === "timestamptz";
   return {
     node: { kind: "dateTrunc", unit: unit.node, value: value.node, zone },

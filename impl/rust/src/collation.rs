@@ -667,16 +667,15 @@ pub fn open_collation(bytes: &[u8]) -> Result<Collation> {
     })
 }
 
-// --- The engine-global loaded collation set (spec/design/collation.md §4/§9) --------------------
+// --- Loaded collations (spec/design/collation.md §4/§9) -------------------------------------------
 //
 // The bare binary carries **no** Unicode data — no embedded `.coll`, no casing tables (§9/§16, the
-// SQLite model). All collations arrive at runtime: a host hands the engine a `JUCD` bundle's bytes
-// via [`load_unicode_data`] (`db.LoadUnicodeData`), the engine merges its root + per-locale deltas
-// (§5.1) and adds the resulting collations here. This set is **process-global** — a property of the
-// running engine, not of one `Engine` handle (the spec's "loaded set available to any database on
-// this handle", §4.2). Global is what lets a file *referencing* a collation be opened after the
-// bundle is loaded: open resolves the referenced table from here (format.rs), and `open` mints the
-// handle, so the data cannot live on the handle. `C` is never here (table-free, built in).
+// SQLite model). All collations arrive at runtime: a host hands a `JUCD` bundle's bytes to an
+// `EnvironmentBuilder` (`load_unicode_data`, crate::environment), which merges its root + per-locale
+// deltas (§5.1, `load_bundle` below) into the environment's loaded set. A database resolves its
+// collations against the environment it was opened with (spec/design/environment.md), so a file
+// *referencing* a collation opens only when that environment provides it. `C` is never loaded
+// (table-free, built in).
 //
 // The bytes are jed's **own pinned** tables (byte-identical across cores, §9/§10), so loading
 // restores no nondeterminism — a *use* stays pure regardless of where the host sourced the bytes
@@ -685,107 +684,12 @@ pub fn open_collation(bytes: &[u8]) -> Result<Collation> {
 // ñ tailoring, UCA/UCD 17.0.0 / CLDR 48); the `dev-*` fixtures are not part of it (they only drive
 // the cross-core compiler/sort-key vectors).
 
-static LOADED: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::BTreeMap<String, std::sync::Arc<Collation>>>,
-> = std::sync::OnceLock::new();
-
-fn loaded_set()
--> &'static std::sync::RwLock<std::collections::BTreeMap<String, std::sync::Arc<Collation>>> {
-    LOADED.get_or_init(|| std::sync::RwLock::new(std::collections::BTreeMap::new()))
-}
-
-/// The engine-global Unicode property/casing table (spec/design/collation.md §16). `None` until a
-/// bundle carrying a property section is loaded; thereafter the casing functions (`upper`/`lower`/
-/// `ILIKE`) fold via it. **First-wins**, like the collation set. Its presence is the binary "casing
-/// regime" the `C`/ASCII baseline (§16) flips on: with `None` casing is ASCII-only, table-free, and
-/// version-independent.
-static LOADED_PROPERTY: std::sync::OnceLock<
-    std::sync::RwLock<Option<std::sync::Arc<PropertyTable>>>,
-> = std::sync::OnceLock::new();
-
-fn property_slot() -> &'static std::sync::RwLock<Option<std::sync::Arc<PropertyTable>>> {
-    LOADED_PROPERTY.get_or_init(|| std::sync::RwLock::new(None))
-}
-
-/// Load a `JUCD` Unicode-data bundle into the engine-global loaded set (§4/§9): parse the bundle,
-/// merge the root + each per-locale delta (§5.1), register every collation by name, and store the
-/// **property/casing** section (§16). **Additive / first-wins** — a collation name already present is
-/// **not** replaced (the first bundle to provide it wins; resolution is by name in load order, §4.2),
-/// and a property table is only stored if none is loaded yet, so re-loading the same bundle is an
-/// idempotent no-op. A malformed bundle is `XX001` (`data_corrupted`).
-///
-/// This is the engine primitive behind `db.LoadUnicodeData`. Because the set is process-global it
-/// may be called **before** opening any file (which is required: opening a file that references a
-/// collation resolves its table from this set). It is a privileged host op — the engine reads no
-/// file path and reaches no host data (§11); the host sources the bytes.
-pub fn load_unicode_data(bytes: &[u8]) -> Result<()> {
-    let bundle = open_bundle(bytes)?;
-    let (colls, property) = load_bundle(&bundle)?;
-    {
-        let mut set = loaded_set()
-            .write()
-            .expect("loaded-collation lock poisoned");
-        for c in colls {
-            set.entry(c.name.clone())
-                .or_insert_with(|| std::sync::Arc::new(c));
-        }
-    }
-    if let Some(p) = property {
-        let mut slot = property_slot()
-            .write()
-            .expect("loaded-property lock poisoned");
-        if slot.is_none() {
-            *slot = Some(std::sync::Arc::new(p));
-        }
-    }
-    Ok(())
-}
-
-/// The engine-global property/casing table, if a bundle providing one has been loaded (§16). `None` ⇒
-/// the ASCII-casing baseline. The casing functions look this up **once per evaluation** and pass it to
-/// the pure kernels below, which is what keeps the un-loaded (ASCII) regime deterministically testable.
-pub fn loaded_property() -> Option<std::sync::Arc<PropertyTable>> {
-    property_slot()
-        .read()
-        .expect("loaded-property lock poisoned")
-        .clone()
-}
-
-/// Look up a collation in the engine-global **loaded** set by its exact (case-sensitive) name
-/// (spec/design/collation.md §4/§9). `None` ⇒ no loaded bundle provides it. `C` is never here
-/// (table-free, built in). The resolver consults the database's referenced collations first, then
-/// this set.
-pub fn loaded_collation(name: &str) -> Option<std::sync::Arc<Collation>> {
-    loaded_set()
-        .read()
-        .expect("loaded-collation lock poisoned")
-        .get(name)
-        .cloned()
-}
-
-/// The slice-2d version-skew verdict (spec/design/collation.md §12, compatibility.md §7): given a
-/// collation `name` and the `(unicode, cldr)` version the FILE pinned its keys under (§5), return
-/// `Some((loaded_unicode, loaded_cldr))` when a loaded bundle provides `name` at a **different**
-/// version — the object using it is read-only (`XX002` on write) — else `None` (`Full`: the same
-/// version, or no loaded table to disagree). A pure, total comparison with no host or global-state
-/// side effect beyond the read of the engine-global loaded set, so **every core computes the
-/// identical verdict** (the §10 cross-core contract). The read side never consults this — a skewed
-/// read recomputes against the loaded table (the heap-scan fallback, compatibility.md §8).
-pub fn version_skew(name: &str, file_unicode: &str, file_cldr: &str) -> Option<(String, String)> {
-    let loaded = loaded_collation(name)?;
-    if loaded.unicode_version != file_unicode || loaded.cldr_version != file_cldr {
-        Some((loaded.unicode_version.clone(), loaded.cldr_version.clone()))
-    } else {
-        None
-    }
-}
-
 // ============================================================================================
 // Casing kernels (spec/design/collation.md §16) — the production `upper`/`lower`/`ILIKE` folds.
 //
 // Each takes the resolved property table EXPLICITLY (`None` ⇒ the ASCII baseline), so the evaluator
-// does the one engine-global `loaded_property()` lookup and the kernels stay pure functions — which
-// is what makes the un-loaded (ASCII) regime deterministically unit-testable despite the global set.
+// does the one lookup in its environment and the kernels stay pure functions — which is what makes
+// the un-loaded (ASCII) regime deterministically unit-testable.
 // Cross-core byte-identical given identical input (the casing vectors pin it, §10), including the TS
 // UTF-16-vs-code-point trap (an astral cased letter like Deseret U+10428).
 // ============================================================================================
@@ -860,17 +764,6 @@ fn prop_lookup_special(p: &PropertyTable, cp: u32) -> Option<&SpecialCasing> {
         .binary_search_by_key(&cp, |sc| sc.cp)
         .ok()
         .map(|i| &p.special[i])
-}
-
-/// Every loaded collation, ascending by name — a deterministic order with no hash-iteration leak
-/// (CLAUDE.md §8; the `BTreeMap` is already key-ordered). Backs introspection (`db.LoadedCollations`).
-pub fn loaded_collation_tables() -> Vec<std::sync::Arc<Collation>> {
-    loaded_set()
-        .read()
-        .expect("loaded-collation lock poisoned")
-        .values()
-        .cloned()
-        .collect()
 }
 
 #[allow(clippy::type_complexity)]
@@ -1367,17 +1260,21 @@ fn deserialize_property(raw: &[u8]) -> Result<PropertyTable> {
 mod bundle_tests {
     use super::*;
 
-    /// Load the real version-pinned production bundle (spec/collation/fixtures/unicode.jucd) into the
-    /// engine-global set, then hand back its `unicode`/`es` collations — the production read path the
-    /// cores now take (no embed). Idempotent (the loaded set is global + first-wins).
+    /// Load the real version-pinned production bundle (spec/collation/fixtures/unicode.jucd) into an
+    /// environment, then hand back its `unicode`/`es` collations — the production read path the cores
+    /// now take (no embed).
     fn real(name: &str) -> std::sync::Arc<Collation> {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../spec/collation/fixtures/unicode.jucd"
         );
         let bytes = std::fs::read(path).expect("read unicode.jucd fixture");
-        load_unicode_data(&bytes).expect("load unicode.jucd");
-        loaded_collation(name).unwrap_or_else(|| panic!("loaded collation {name}"))
+        let env = crate::Environment::builder()
+            .load_unicode_data(&bytes)
+            .expect("load unicode.jucd")
+            .build();
+        env.collation(name)
+            .unwrap_or_else(|| panic!("loaded collation {name}"))
     }
 
     // A small synthetic property section so the casing codec is exercised before `lower`/`upper`
@@ -1454,7 +1351,7 @@ mod casing_tests {
     // The casing kernels' DIVERGENCES from the PostgreSQL/glibc oracle (collation.md §16) — what the
     // oracle corpus cannot express (CLAUDE.md §10): the ASCII baseline (non-ASCII passes through, where
     // glibc folds) and full SpecialCasing (ß→SS, where glibc gives ß). Both call the pure kernels with
-    // an EXPLICIT property table, so they are deterministic regardless of the engine-global loaded set.
+    // an EXPLICIT property table, so they are deterministic regardless of any environment.
     use super::*;
 
     // A small property table: ASCII a/A, é/É (simple), and ß→SS (special, no simple form). Sorted

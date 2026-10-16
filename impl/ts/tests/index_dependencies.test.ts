@@ -2,20 +2,29 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Engine, EngineError, execute, prepare, queryPrepared, intValue } from "../src/tooling.ts";
+import {
+  Engine,
+  EngineError,
+  Environment,
+  execute,
+  prepare,
+  queryPrepared,
+  intValue,
+} from "../src/tooling.ts";
 import { crc32Ieee, loadEngine, toImage } from "../src/format.ts";
-import { loadTimeZoneData, openTzBundle, saveTzBundle } from "../src/timezone.ts";
+import { openTzBundle, saveTzBundle } from "../src/timezone.ts";
 import { specPath } from "./tomlmini.ts";
 
 const bundle = () => new Uint8Array(readFileSync(specPath("tz/fixtures/tzdata.jtz")));
+// The handle environment with jed's pinned JTZ bundle loaded (environment.md §3).
+const TZ_ENV = Environment.builder().loadTimeZoneData(bundle()).build();
 const run = (db: Engine, sql: string) => execute(db, sql);
 const code = (f: () => unknown, expected: string) =>
   assert.throws(f, (e: unknown) => e instanceof EngineError && e.code() === expected);
 const indexSQL =
   "CREATE UNIQUE INDEX zone_idx ON t (account) WHERE (ts AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01'";
 function build(): Engine {
-  loadTimeZoneData(bundle());
-  const db = new Engine();
+  const db = new Engine(TZ_ENV);
   run(db, "CREATE TABLE t(id int PRIMARY KEY, account int, ts timestamptz)");
   run(db, "INSERT INTO t VALUES (1,7,'2024-06-01 00:00:00+00'),(2,7,'2020-01-01 00:00:00+00')");
   run(db, indexSQL);
@@ -50,12 +59,12 @@ function corruptPin(original: Uint8Array, mode: string): Uint8Array {
 test("timezone pins persist; skew excludes reads and blocks writes; transactional rebuild", () => {
   const image = toImage(build(), 4096, 1n);
   for (const mode of ["mode", "empty-static", "empty-name", "empty-version"]) {
-    code(() => loadEngine(corruptPin(image, mode)), "XX001");
+    code(() => loadEngine(corruptPin(image, mode), TZ_ENV), "XX001");
   }
-  const matching = loadEngine(image);
+  const matching = loadEngine(image, TZ_ENV);
   code(() => run(matching, "INSERT INTO t VALUES (3,7,'2024-06-01 00:00:00+00')"), "23505");
   for (const mode of ["version", "checksum", "missing"] as const) {
-    const db = loadEngine(corruptPin(image, mode));
+    const db = loadEngine(corruptPin(image, mode), TZ_ENV);
     const explain = run(
       db,
       "EXPLAIN SELECT id FROM t WHERE (ts AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01' AND account = 7",
@@ -105,8 +114,7 @@ test("safe timestamptz expressions remain indexed across session changes", () =>
 });
 
 test("dynamic zone sets disable read and insert caching, and additions require rebuilding", () => {
-  loadTimeZoneData(bundle());
-  const db = new Engine();
+  const db = new Engine(TZ_ENV);
   run(db, "CREATE TABLE d (id int PRIMARY KEY, account int, ts timestamptz, zone text)");
   run(db, "INSERT INTO d VALUES (1,7,'2024-06-01 00:00:00+00','UTC')");
   const ddl =
@@ -135,16 +143,20 @@ test("dynamic zone sets disable read and insert caching, and additions require r
   insert(90n);
   insert(91n);
   assert.equal((ins as unknown as { icHolder: { cache: unknown } }).icHolder.cache, null);
+  // The loaded zone set changes only through a new environment and a reopen (environment.md §3): a
+  // derived environment adding one zone makes the dynamic index's dependency set stale.
   const b = openTzBundle(bundle());
   b.zones = [{ name: "Test/IndexAdded", raw: b.zones[0]!.raw }];
   b.links = [];
-  loadTimeZoneData(saveTzBundle(b));
-  drain();
-  code(() => insert(92n), "XX002");
-  code(() => run(db, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')"), "XX002");
-  run(db, "BEGIN");
-  run(db, "DROP INDEX dynamic_idx");
-  run(db, ddl);
-  run(db, "COMMIT");
-  run(db, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')");
+  const added = TZ_ENV.toBuilder().loadTimeZoneData(saveTzBundle(b)).build();
+  const re = loadEngine(toImage(db, db.pageSize, 1n), added);
+  const rows = run(re, selectSQL);
+  assert.equal(rows.kind === "query" && rows.rows.length, 3);
+  code(() => run(re, "INSERT INTO d VALUES (92,7,'2024-06-01 00:00:00+00','UTC')"), "XX002");
+  code(() => run(re, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')"), "XX002");
+  run(re, "BEGIN");
+  run(re, "DROP INDEX dynamic_idx");
+  run(re, ddl);
+  run(re, "COMMIT");
+  run(re, "INSERT INTO d VALUES (2,7,'2024-06-01 00:00:00+00','UTC')");
 });

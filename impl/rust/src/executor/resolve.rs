@@ -1149,6 +1149,7 @@ pub(crate) fn resolve_jsonpath_args(
 pub(crate) fn jsonpath_operands<'v>(
     ctx: &'v Value,
     path: &Value,
+    casing: Option<&crate::collation::PropertyTable>,
     m: &mut Meter,
 ) -> Result<Option<(Cow<'v, JsonNode>, crate::jsonpath::JsonPath)>> {
     let node = match ctx {
@@ -1162,7 +1163,10 @@ pub(crate) fn jsonpath_operands<'v>(
         Value::JsonPath(s) => s,
         _ => unreachable!("resolver restricts a jsonpath argument to jsonpath"),
     };
-    Ok(Some((node, crate::jsonpath::compile_metered(text, m)?)))
+    Ok(Some((
+        node,
+        crate::jsonpath::compile_metered(text, casing, m)?,
+    )))
 }
 
 /// Extract a `text[]` value into `Vec<Option<String>>`, preserving NULL elements — `None` if the

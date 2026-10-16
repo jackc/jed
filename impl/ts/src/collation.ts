@@ -515,16 +515,15 @@ export function openCollation(bytes: Uint8Array): Collation {
   return { name, unicodeVersion, cldrVersion, description, singles, contractions };
 }
 
-// --- The engine-global loaded collation set (spec/design/collation.md §4/§9) --------------------
+// --- Loaded collations (spec/design/collation.md §4/§9, spec/design/environment.md) -------------
 //
 // The bare binary carries NO Unicode data — no embedded .coll, no casing tables (§9/§16, the SQLite
-// model). All collations arrive at runtime: a host hands the engine a JUCD bundle's bytes via
-// loadUnicodeData (db.loadUnicodeData), the engine merges its root + per-locale deltas (§5.1) and
-// adds the resulting collations here. This set is PROCESS-GLOBAL (module-scoped) — a property of the
-// running engine, not of one Engine handle (the spec's "loaded set available to any database on
-// this handle", §4.2). Global is what lets a file REFERENCING a collation be opened after the bundle
-// is loaded: open resolves the referenced table from here (format.ts), and open mints the handle, so
-// the data cannot live on the handle. "C" is never here (table-free, built in).
+// model). All collations arrive at runtime: a host hands a JUCD bundle's bytes to
+// EnvironmentBuilder.loadUnicodeData, which merges its root + per-locale deltas (loadBundle, §5.1)
+// and adds the resulting collations to the environment it builds. The loaded set belongs to that
+// Environment — never to the process — and a database resolves the collations its file references
+// against the environment it was opened with (environment.md §3). "C" is never loaded (table-free,
+// built in).
 //
 // The bytes are jed's OWN pinned tables (byte-identical across cores, §9/§10), so loading restores no
 // nondeterminism — a use stays pure regardless of where the host sourced the bytes (file / fetch /
@@ -532,73 +531,23 @@ export function openCollation(bytes: Uint8Array): Collation {
 // spec/collation/fixtures/unicode.jucd (unicode = the CLDR-DUCET root, es = root + the Spanish ñ
 // tailoring); the dev-* fixtures are not part of it (they only drive the cross-core vectors).
 
-const loadedColl = new Map<string, Collation>();
-
-// loadedProp is the engine-global Unicode property/casing table (spec/design/collation.md §16),
-// undefined until a bundle carrying a property section is loaded. Its presence is the binary "casing
-// regime" the C/ASCII baseline flips on: undefined ⇒ casing is ASCII-only, table-free, version-free.
-// FIRST-WINS, like loadedColl. (Module-scoped, so a let with a private accessor.)
-let loadedProp: PropertyTable | undefined;
-
-// loadUnicodeData loads a JUCD Unicode-data bundle into the engine-global loaded set
-// (spec/design/collation.md §4/§9): parse the bundle, merge the root + each per-locale delta (§5.1),
-// register every collation by name, and store the property/casing section (§16). ADDITIVE /
-// FIRST-WINS — a collation name already present is NOT replaced (the first bundle to provide it wins;
-// resolution is by name in load order, §4.2), and a property table is only stored if none is loaded
-// yet, so re-loading the same bundle is an idempotent no-op. A malformed bundle is XX001.
-//
-// This is the engine primitive behind db.loadUnicodeData. Because the set is process-global it may be
-// called BEFORE opening any file (which is required: opening a file that references a collation
-// resolves its table from this set). Privileged host op — the engine reads no file path and reaches
-// no host data (§11); the host sources the bytes (browser-safe — Uint8Array, no node:fs).
-export function loadUnicodeData(data: Uint8Array): void {
-  const { collations, property } = loadBundle(openBundle(data));
-  for (const c of collations) {
-    if (!loadedColl.has(c.name)) loadedColl.set(c.name, c);
-  }
-  if (property !== undefined && loadedProp === undefined) loadedProp = property;
-}
-
-// loadedProperty returns the engine-global property/casing table, or undefined if no bundle providing
-// one has been loaded (§16) — undefined ⇒ the ASCII-casing baseline. The casing functions look this up
-// ONCE per evaluation and pass it to the pure kernels below, which keeps the un-loaded regime testable.
-export function loadedProperty(): PropertyTable | undefined {
-  return loadedProp;
-}
-
-// loadedCollation looks up a collation in the engine-global LOADED set by its exact (case-sensitive)
-// name (spec/design/collation.md §4/§9). undefined ⇒ no loaded bundle provides it. "C" is never here
-// (table-free, built in). The resolver consults the database's referenced collations first, then this
-// set.
-export function loadedCollation(name: string): Collation | undefined {
-  return loadedColl.get(name);
-}
-
 // versionSkew is the slice-2d version-skew verdict (spec/design/collation.md §12, compatibility.md
-// §7): given a collation name and the (unicode, cldr) version the FILE pinned its keys under (§5), it
-// returns [loadedUnicode, loadedCldr] when a loaded bundle provides name at a DIFFERENT version — the
-// object using it is read-only (XX002 on write) — else undefined (Full: the same version, or no
-// loaded table to disagree). A pure, total comparison so EVERY core computes the identical verdict
-// (the §10 cross-core contract). The read side never consults this — a skewed read recomputes against
-// the loaded table (the heap-scan fallback, compatibility.md §8).
+// §7): given the environment's loaded table for a collation (undefined ⇒ none) and the (unicode, cldr)
+// version the FILE pinned its keys under (§5), it returns [loadedUnicode, loadedCldr] when the loaded
+// table is at a DIFFERENT version — the object using it is read-only (XX002 on write) — else undefined
+// (Full: the same version, or no loaded table to disagree). A pure, total comparison so EVERY core
+// computes the identical verdict (the §10 cross-core contract). The read side never consults this — a
+// skewed read recomputes against the loaded table (the heap-scan fallback, compatibility.md §8).
 export function versionSkew(
-  name: string,
+  loaded: Collation | undefined,
   fileUnicode: string,
   fileCldr: string,
 ): [string, string] | undefined {
-  const loaded = loadedColl.get(name);
   if (loaded === undefined) return undefined;
   if (loaded.unicodeVersion !== fileUnicode || loaded.cldrVersion !== fileCldr) {
     return [loaded.unicodeVersion, loaded.cldrVersion];
   }
   return undefined;
-}
-
-// loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
-// with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
-// Engine.loadedCollations method (executor.ts).
-export function loadedCollationTables(): Collation[] {
-  return [...loadedColl.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
 function deserializeTable(table: Uint8Array): [SingleEntry[], ContractionEntry[]] {
@@ -700,7 +649,7 @@ export interface PropertyTable {
 // ============================================================================================
 // Casing kernels (spec/design/collation.md §16) — the production upper/lower/ILIKE folds. Each takes
 // the resolved property table EXPLICITLY (undefined ⇒ the ASCII baseline), so the evaluator does the
-// one engine-global loadedProperty() lookup and the kernels stay pure — making the un-loaded (ASCII)
+// one lookup in the handle's environment and the kernels stay pure — making the un-loaded (ASCII)
 // regime deterministically testable. CODE-POINT iteration (for...of / fromCodePoint), so an astral
 // cased letter folds correctly despite TS's UTF-16 strings (the cross-core trap, types.md §11).
 // ============================================================================================

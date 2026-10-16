@@ -34,8 +34,12 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
     let pager = Pager::from_store(Box::new(MemoryBlockStore::new(image.to_vec())))
         .map_err(|e| format!("open: {e}"))?;
     let page_size = pager.page_size();
-    let engine = Engine::open_paged(pager, cache_leaves(DEFAULT_CACHE_BYTES, page_size))
-        .map_err(|e| format!("open: {e}"))?;
+    let engine = Engine::open_paged(
+        pager,
+        cache_leaves(DEFAULT_CACHE_BYTES, page_size),
+        &crate::environment::Environment::default(),
+    )
+    .map_err(|e| format!("open: {e}"))?;
     let paging = engine
         .paging
         .clone()

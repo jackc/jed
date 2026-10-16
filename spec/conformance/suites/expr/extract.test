@@ -9,6 +9,8 @@
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: query.select, query.select_no_from, query.derived_table, types.timestamp, types.timestamptz, types.date, types.interval, expr.extract, session.timezone
 
+# load-timezone: America/New_York
+
 # ============================================================================================
 # timestamp: every supported field of 2024-03-15 13:47:23.456789
 # ============================================================================================

@@ -47,7 +47,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 	if n := countPageType(image, 256, pageOverflow); n < 2 {
 		t.Fatalf("a large value should span several overflow pages, got %d", n)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestLoadReclaimsOnlyDeadOverflowPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1612,7 +1612,7 @@ pub(crate) fn coerce_string_literal(
         // `'…'::jsonpath` / `jsonpath '…'` — compile (P1a structural subset) + store the canonical
         // normalized text. Malformed → 42601; an unsupported (valid-PG) construct → 0A000.
         ScalarType::JsonPath => (
-            RExpr::ConstJsonPath(crate::jsonpath::JsonPath::compile(s)?.render()),
+            RExpr::ConstJsonPath(crate::jsonpath::JsonPath::compile(s, iz.casing())?.render()),
             ResolvedType::JsonPath,
         ),
         // `text 'x'` is identity — the string IS the value. A `varchar(n) 'x'` typed literal /

@@ -5,7 +5,7 @@
 > `Europe/Paris`), exposed through the `AT TIME ZONE` operator. It deliberately copies the **collation
 > data-handling architecture** ([collation.md](collation.md)): the bare binary carries **no** tz data,
 > a host hands the engine a **`JTZ` bundle of bytes** through a privileged, bytes/reader-based call
-> (`db.LoadTimeZoneData`) — never a file path, so the engine does no I/O — and the named zones in it
+> (the environment builder's `LoadTimeZoneData`) — never a file path, so the engine does no I/O — and the named zones in it
 > become usable. The bundle is a manifest-indexed container wrapping the standardized **RFC 8536 TZif**
 > per-zone blobs (§4); each core reads TZif with a small hand-written reader (§5). `UTC` and fixed
 > `±HH:MM` offsets are **built-in and table-free** — the `C`-collation analogue — so a database that
@@ -130,32 +130,32 @@ loaded tz data and **pins no tz version at all** — portable to every jed binar
 exact parallel of "a `C`/ASCII-only database carries zero collation data and pins no Unicode version"
 ([collation.md §3/§16](collation.md)).
 
-### 3.3 The load seam — `db.LoadTimeZoneData(bytes)`
+### 3.3 The load seam — `LoadTimeZoneData(bytes)` on an environment builder
 
 Loading is a **privileged host operation** that hands the engine bundle **bytes** — *not* SQL-reachable
 and *not* a filesystem path, so an untrusted query can only ever *use* an already-loaded zone by name,
 never trigger a load, and the engine itself does no I/O (the [hosts.md](hosts.md) BlockStore principle).
-The API mirrors `db.LoadUnicodeData` ([collation.md §4.2](collation.md)) one-for-one:
+The API mirrors the Unicode-data load ([collation.md §4.2](collation.md)) one-for-one: both are calls on
+an **environment builder** ([environment.md](environment.md)), and the built, immutable `Environment` is
+passed to `open`/`create`:
 
 ```
 // production host API (privileged — not untrusted SQL, §10):
 
-db.LoadTimeZoneData(bytesOrReader)  // load a JTZ bundle: its named zones + links (§4); additive
-db.LoadedTimeZones()                // introspect the loaded set: zone names, tzdata_version, description
+builder.LoadTimeZoneData(bytesOrReader)  // load a JTZ bundle: its named zones + links (§4); additive
+db.LoadedTimeZones()                     // introspect the handle environment's loaded set: zone names, tzdata_version
 
 // build-time tooling ONLY — compiled out of the production engine (§7):
 //   the BUILDER TOOL   committed TZif blobs → a JTZ bundle (zones + links)
 //   the VECTOR GEN     (zone, instant) → (offset, abbrev, dst) cross-core vectors
 ```
 
-- **The loaded set is engine-global**, a property of the running engine, not of one handle — identical
-  to collation's `LOADED` set ([collation.md §4.2](collation.md), the `static`/global declarations).
-  Engine-global *because* a host may load a bundle **before `open`**; though tz needs no on-disk
-  reference today (§2), keeping the seam identical to collation's means the latent derived-key path
-  (§8) inherits the "open resolves references against the already-loaded set" behavior for free. Each
-  core exposes the load both as the `db.` method and as an engine-level call the host may invoke prior
-  to `open` (Rust `jed::load_time_zone_data`, Go `jed.LoadTimeZoneData`, TS `loadTimeZoneData`); both
-  populate the one engine-global set.
+- **The loaded set belongs to the environment**, not to the process and not to one handle — identical
+  to collation's loaded set ([collation.md §4.2](collation.md)). Because the environment exists before
+  `open`, a file whose objects depend on a zone resolves it against the already-loaded set (the latent
+  derived-key path, §8), and a database's zone set never changes while it is open. Rust
+  `Environment::builder().load_time_zone_data(&b)?`, Go `b.LoadTimeZoneData(data)`, TS
+  `builder.loadTimeZoneData(bytes)`.
 - **Additive** — multiple bundles may be loaded; resolution is by name in load order (a name an
   earlier bundle already provides is kept — first-wins, matching collation's load merge).
 - **No host-zoneinfo import path.** There is no `db.ImportTimeZone` / `LoadHostTimeZone` — the only
@@ -184,7 +184,7 @@ choice is the exact analogue of collation's "the `.coll` table is the one shared
 
 ## 4. The `JTZ` bundle — wrapping standard TZif
 
-The container a host **loads** at runtime via `db.LoadTimeZoneData` — the production delivery vehicle for
+The container a host **loads** at runtime via the environment builder's `LoadTimeZoneData` — the production delivery vehicle for
 the tz database. **One tzdata version per bundle.** It is a **manifest-indexed container** (the byte
 format is pinned in [../tz/README.md §3](../tz/README.md)) of independently-addressable sections, so a
 loader can take only the zones it needs (a browser fetches the manifest, then a zone on demand). It
@@ -626,7 +626,7 @@ accepts `EXTRACT(dec FROM …)` — jed reserves no keywords (grammar.md §3). O
 
 Identical posture to collation ([collation.md §11](collation.md)):
 
-- **Loading is a privileged host op; using is pure** (CLAUDE.md §13). `db.LoadTimeZoneData` is a
+- **Loading is a privileged host op; using is pure** (CLAUDE.md §13). The environment builder's `LoadTimeZoneData` is a
   privileged host-API call taking pinned bundle **bytes** (or a reader): **not SQL-reachable** (an
   adversarial query cannot trigger a load), takes **no filesystem path** (the engine does no I/O — the
   host sources the bytes, [hosts.md](hosts.md)), and constructs nothing from host data (it deserializes
@@ -711,7 +711,7 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
 
 **Decided (this revision):**
 
-- **Host-loaded, not vendored.** Tz data is loaded via `db.LoadTimeZoneData` from a `JTZ` bundle; the
+- **Host-loaded, not vendored.** Tz data is loaded via the environment builder's `LoadTimeZoneData` from a `JTZ` bundle; the
   bare binary carries no tz data (`UTC` + fixed offsets excepted) — mirroring collation's Slice-3 pivot
   ([collation.md §2/§9](collation.md)). *(Supersedes the earlier vendor-into-each-core proposal.)*
 - **`JTZ` bundle wrapping standard TZif** ([../tz/README.md §3](../tz/README.md)) — a manifest +

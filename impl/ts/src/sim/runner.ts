@@ -17,7 +17,8 @@ import { loadEnginePaged } from "../format.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import { persistImpl } from "../persist.ts";
-import { seededRandomSource } from "../seam.ts";
+import { Environment } from "../environment.ts";
+import { type ClockSource, osRandomSource, type RandomSource, SeededRandom } from "../seam.ts";
 import { attachFile, Database, type Session } from "../shared.ts";
 import { FileCoordinator } from "../coordinator.ts";
 import { CheckError, checkImage, checkLive as checkLiveDatabase } from "./check.ts";
@@ -299,6 +300,9 @@ function errText(e: unknown): string {
 
 type SimSession = {
   s: Session;
+  // The session's own entropy stream (simulation-testing.md §7: lane 8 of the decision function),
+  // made the environment's active stream while one of this session's steps runs.
+  random: SeededRandom;
   write: boolean;
   pins: Map<string, bigint>; // the version of each database a read session pinned (§8.1: what it must keep seeing)
   pid: number; // the process the session lives in
@@ -413,12 +417,29 @@ function metaOf(
   return null;
 }
 
+// SimRandom is the runner's environment random source: it draws from the stream of the session whose
+// step is running (each session keeps its own SeededRandom, as simulation-testing.md §7 specifies),
+// and from OS entropy outside any session — where nothing reads it.
+class SimRandom implements RandomSource {
+  active: SeededRandom | null = null;
+
+  fill(buf: Uint8Array): void {
+    if (this.active !== null) this.active.fill(buf);
+    else osRandomSource().fill(buf);
+  }
+}
+
 export class SimRunner {
   private tr: SimTrace;
   private seed: bigint;
   private pageSize: number;
   private cacheBytes: number;
   private clock: bigint;
+  // The Environment every process opens its databases with (spec/design/environment.md): the
+  // per-session random streams and the trace clock, which starts at the `clock` header and advances
+  // only on `clock` steps.
+  private random = new SimRandom();
+  private environment: Environment;
 
   // Handle settings from the header (simulation-testing.md §5, slice S3), applied at every open.
   private workMem: number; // a session's work_mem
@@ -462,6 +483,8 @@ export class SimRunner {
     this.pageSize = ps;
     this.cacheBytes = atoi(tr.header.get("cache_bytes"));
     this.clock = parseInt64(tr.header.get("clock"));
+    const clock: ClockSource = { nowMicros: () => this.clock };
+    this.environment = Environment.builder().randomSource(this.random).clockSource(clock).build();
     this.workMem = atoi(tr.header.get("work_mem"));
     this.tempBuffers = atoi(tr.header.get("temp_buffers"));
     this.maxQueryMemory = parseInt64(tr.header.get("max_query_memory_bytes"));
@@ -586,7 +609,10 @@ export class SimRunner {
     if (main === undefined) throw engineError("io_error", "the database file is gone");
     const pager = Pager.fromStore(main);
     const cache = this.cacheBytes > 0 ? this.cacheBytes : DEFAULT_CACHE_BYTES;
-    const e = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cache, pager.pageSize)));
+    const e = loadEnginePaged(
+      new SharedPaging(pager, cacheLeaves(cache, pager.pageSize)),
+      this.environment,
+    );
     e.path = MAIN_FILE; // marks the engine durable; the simulated filesystem is its only storage
     // Create, compaction, and attachments go through the simulated filesystem.
     e.fileHost = this.fs;
@@ -594,7 +620,7 @@ export class SimRunner {
     // Spill and temp-table spill scratch files, whose operations can fail.
     e.spillSink = this.fs.spillSink();
     coord?.unlockCommit();
-    const db = Database.fromEngine(e, coord, null);
+    const db = Database.fromEngine(e, coord);
     if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
     return db;
   }
@@ -734,6 +760,8 @@ export class SimRunner {
       }
     }
     this.fs.beginStep(i, armed);
+    // Entropy drawn during this step comes from its session's stream (none outside a session step).
+    this.random.active = this.sessions.get(st.sid)?.random ?? null;
     switch (st.kind) {
       case "spawn":
         this.stepSpawn(i, st.pid);
@@ -830,8 +858,7 @@ export class SimRunner {
       this.fail(i, `unknown session mode ${goQuote(st.mode)}`);
       return;
     }
-    s.setRandomSource(seededRandomSource(decide(this.seed, LANE_SESSION, BigInt(i), 0n, 0n)));
-    s.setClockSource(() => this.clock);
+    const random = new SeededRandom(decide(this.seed, LANE_SESSION, BigInt(i), 0n, 0n));
     if (this.workMem > 0) s.setWorkMem(this.workMem);
     if (this.tempBuffers > 0) s.setTempBuffers(this.tempBuffers);
     if (this.maxQueryMemory > 0n) s.setMaxQueryMemoryBytes(this.maxQueryMemory);
@@ -845,7 +872,7 @@ export class SimRunner {
       const v = this.dbVersion(this.dbs.get(name)!);
       if (v !== 0n) pins.set(name, v);
     }
-    this.sessions.set(st.sid, { s, write: st.mode === "write", pins, pid: this.cur });
+    this.sessions.set(st.sid, { s, random, write: st.mode === "write", pins, pid: this.cur });
     this.emit(
       `{"i":${i},"op":"open","sid":${goQuote(st.sid)},"version":${s.version}${this.versionsJSON(pins)}}`,
     );

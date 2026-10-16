@@ -82,7 +82,7 @@ module Jed
         "(rebuild with `mise run ruby:build`)"
     end
 
-    # The trailing VOIDP of the three opens is the host-function registry (null = none, ruby.md §5b).
+    # The trailing VOIDP of the three opens is the environment (null = a fresh empty one, ruby.md §5a).
     OPEN_MEMORY    = fn(:jed_open_memory, [VOIDP], VOIDP)
     CREATE         = fn(:jed_create, [VOIDP, VOIDP], VOIDP)
     OPEN           = fn(:jed_open, [VOIDP, CHAR, VOIDP], VOIDP)
@@ -91,16 +91,32 @@ module Jed
     COMMIT         = fn(:jed_commit, [VOIDP], VOIDP)
     CLOSE          = fn(:jed_close, [VOIDP], VOID)
     FREE           = fn(:jed_free, [VOIDP], VOID)
-    # (bytes, len) → engine-global host-bundle loaders; UNIT on success / ERROR on a bad bundle.
-    LOAD_UNICODE   = fn(:jed_load_unicode_data, [VOIDP, UINT], VOIDP)
-    LOAD_TIMEZONE  = fn(:jed_load_time_zone_data, [VOIDP, UINT], VOIDP)
-    # Host functions (ruby.md §5b): the registry, and the large-result sink a callback calls while it
-    # holds the GVL (need_gvl: true — a memcpy, so releasing and re-acquiring the GVL would only cost).
-    REGISTRY_NEW      = fn(:jed_registry_new, [], VOIDP)
-    REGISTRY_FREE     = fn(:jed_registry_free, [VOIDP], VOID)
-    # (registry, name, arg_types csv, result, volatility, cost, batched, callback, user_data) → TYPES|ERROR
-    REGISTRY_REGISTER = fn(:jed_registry_register,
+    # Environments (ruby.md §5a): the builder, the frozen environment, and derivation.
+    ENV_BUILDER_NEW      = fn(:jed_env_builder_new, [], VOIDP)
+    ENV_BUILDER_FREE     = fn(:jed_env_builder_free, [VOIDP], VOID)
+    # (builder, bytes, len) → UNIT | ERROR (a malformed bundle; the builder is unchanged).
+    ENV_LOAD_UNICODE     = fn(:jed_env_builder_load_unicode_data, [VOIDP, VOIDP, UINT], VOIDP)
+    ENV_LOAD_TIMEZONE    = fn(:jed_env_builder_load_time_zone_data, [VOIDP, VOIDP, UINT], VOIDP)
+    # (builder, name, arg_types csv, result, volatility, cost, batched, callback, user_data) → TYPES|ERROR
+    ENV_REGISTER         = fn(:jed_env_builder_register,
       [VOIDP, VOIDP, VOIDP, VOIDP, CHAR, I64, CHAR, VOIDP, UINTPTR], VOIDP)
+    # (builder, source or null for the default) → UNIT | ERROR (the wrong kind of source).
+    ENV_RANDOM_SOURCE    = fn(:jed_env_builder_random_source, [VOIDP, VOIDP], VOIDP)
+    ENV_CLOCK_SOURCE     = fn(:jed_env_builder_clock_source, [VOIDP, VOIDP], VOIDP)
+    ENV_BUILD            = fn(:jed_env_builder_build, [VOIDP], VOIDP)
+    ENV_TO_BUILDER       = fn(:jed_env_to_builder, [VOIDP], VOIDP)
+    ENV_FREE             = fn(:jed_env_free, [VOIDP], VOID)
+    # Controllable random and clock sources (ruby.md §5c).
+    SEEDED_RANDOM_NEW    = fn(:jed_seeded_random_new, [U64], VOIDP)
+    SEEDED_RANDOM_RESEED = fn(:jed_seeded_random_reseed, [VOIDP, U64], VOID)
+    MANUAL_CLOCK_NEW     = fn(:jed_manual_clock_new, [I64], VOIDP)
+    MANUAL_CLOCK_SET     = fn(:jed_manual_clock_set, [VOIDP, I64], VOID)
+    MANUAL_CLOCK_ADVANCE = fn(:jed_manual_clock_advance, [VOIDP, I64], VOID)
+    ADVANCING_CLOCK_NEW  = fn(:jed_advancing_clock_new, [I64, I64], VOIDP)
+    ADVANCING_CLOCK_RESET = fn(:jed_advancing_clock_reset, [VOIDP, I64, I64], VOID)
+    SOURCE_FREE          = fn(:jed_source_free, [VOIDP], VOID)
+    # The large-result sink a host-function callback calls while it holds the GVL (ruby.md §5b;
+    # need_gvl: true — a memcpy, so releasing and re-acquiring the GVL would only cost).
     HOST_RESULT       = fn(:jed_host_result, [UINTPTR, VOIDP, U64], VOID, need_gvl: true)
   end
 end

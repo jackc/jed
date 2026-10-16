@@ -480,7 +480,7 @@ metadata authority. A host that wants ANALYZE without general DDL can run it thr
 trusted session; splitting a maintenance capability is deferred.
 
 The capability envelope governs the **SQL surface** only. Privileged **host-API** maintenance ops —
-`db.load_unicode_data`, `db.set_default_collation`, and `db.upgrade_collations()` (the COLLATION
+building the environment (loading Unicode data, [environment.md](environment.md)), `db.set_default_collation`, and `db.upgrade_collations()` (the COLLATION
 UPGRADE migration, [collation.md §12](collation.md)) — are **not SQL-reachable**, so they sit
 **outside** this envelope entirely: no `allow_ddl` gate applies, and an untrusted query can never
 trigger them ([collation.md §11](collation.md), CLAUDE.md §13). The host decides when to call them.

@@ -988,10 +988,23 @@ export { Statement } from "./ergonomic.ts";
 export type { JsParam, JsValue, Row, RunResult } from "./ergonomic.ts";
 export { createDatabase, openDatabase } from "./file.ts";
 export type { CreateOptions, Locking, OpenOptions } from "./file.ts";
-// Host extensibility (spec/design/extensibility.md §4.2): the host registers scalar functions into an
-// ExtensionRegistry and hands it to createDatabase/openDatabase via CreateOptions/OpenOptions.
-export { ExtensionRegistry } from "./extension.ts";
+// The Environment (spec/design/environment.md): every outside input except storage — loaded Unicode
+// and time-zone data, host functions (extensibility.md §4.2), and the random + clock sources — built
+// by an EnvironmentBuilder and handed to createDatabase/openDatabase via CreateOptions/OpenOptions.
+export { Environment, EnvironmentBuilder } from "./environment.ts";
 export type { HostBatchKernel, HostFunctionSpec, HostKernel, Volatility } from "./extension.ts";
+export {
+  AdvancingClock,
+  advancingClock,
+  ManualClock,
+  manualClock,
+  osRandomSource,
+  SeededRandom,
+  seededRandomSource,
+  wallClock,
+} from "./seam.ts";
+export type { ClockSource, RandomSource } from "./seam.ts";
+export type { TimeZoneInfo } from "./timezone.ts";
 // `Outcome` is the engine's INTERNAL materialized statement result (the pre-total-`query` shape) — NOT
 // part of the public embedding surface. The public seam is `query -> Rows` (a non-query statement is a
 // Rows with no output columns, carrying the command tag); `run`/`execute` return `RunResult`. Outcome
@@ -1005,9 +1018,6 @@ export { PrivilegeSet, Privileges, privilegeFromName } from "./privileges.ts";
 export type { Privilege } from "./privileges.ts";
 export { splitStatements } from "./split.ts";
 export type { ScriptSummary, StatementSpan } from "./split.ts";
-export { loadUnicodeData } from "./collation.ts";
-export { advancingClock, fixedClock, seededRandomSource } from "./seam.ts";
-export type { ClockFunc, RandomFill } from "./seam.ts";
 export {
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_MAX_TEMP_STORAGE_BYTES,

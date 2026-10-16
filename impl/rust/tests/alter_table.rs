@@ -122,7 +122,7 @@ fn rename_rewrite_quotes_the_substituted_name() {
     ];
     assert_eq!(texts(&db), want);
     let image = db.to_image(8192, 1).unwrap();
-    let loaded = Database::from_image(&image)
+    let loaded = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(texts(&loaded), want);

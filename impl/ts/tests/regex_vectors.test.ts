@@ -8,7 +8,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { foldLowerSimple, loadedProperty } from "../src/collation.ts";
+import { foldLowerSimple } from "../src/collation.ts";
+
+// The vectors fold under the ASCII casing baseline: no Unicode property table is loaded.
+const NO_PROPERTY = undefined;
 import { Meter } from "../src/cost.ts";
 import {
   compileRegex,
@@ -97,7 +100,7 @@ test("regex program vectors match spec/regex/program_vectors.toml", () => {
   for (const c of blocks) {
     const pattern = tomlUnquote(c.get("pattern"));
     const pat = tomlUnquote(c.get("flags")).includes("i")
-      ? foldRegexPattern(pattern, loadedProperty())
+      ? foldRegexPattern(pattern, NO_PROPERTY)
       : pattern;
     const prog = compileRegex(pat);
     assert.deepEqual(regexListing(prog), parseStrArray(c.get("prog")), `program for ${pattern}`);
@@ -117,8 +120,8 @@ test("regex match vectors match spec/regex/match_vectors.toml", () => {
     const pattern = tomlUnquote(c.get("pattern"));
     const input = tomlUnquote(c.get("input"));
     const insensitive = tomlUnquote(c.get("flags")).includes("i");
-    const pat = insensitive ? foldRegexPattern(pattern, loadedProperty()) : pattern;
-    const subj = insensitive ? foldLowerSimple(input, loadedProperty()) : input;
+    const pat = insensitive ? foldRegexPattern(pattern, NO_PROPERTY) : pattern;
+    const subj = insensitive ? foldLowerSimple(input, NO_PROPERTY) : input;
     const prog = compileRegex(pat);
     const cps = Array.from(subj, (ch) => ch.codePointAt(0) as number);
     const m = new Meter();

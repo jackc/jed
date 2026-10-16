@@ -19,7 +19,7 @@ import (
 // life, isolated from later writes on the live handle) with NO open transaction — so the engine's
 // reads see exactly the captured frozen state — plus the session envelope the per-row eval / the cost
 // meter read: the cost ceilings + the SHARED lifetime gauge (the *int64 pointer — so streaming cost
-// still counts against LifetimeMaxCost), the cancel poll, the entropy/clock seam, session vars, the
+// still counts against LifetimeMaxCost), the cancel poll, the Environment (entropy/clock sources), session vars, the
 // time zone, and the currval/lastval session state. The cursor evaluates its filter/projection against
 // this engine, so the streaming Rows is self-contained (it does not reference the live handle, so it
 // survives Database.queryValues's transient session, streaming.md §5).
@@ -46,7 +46,7 @@ func (db *engine) snapshotEngine() *engine {
 			attached = view
 		}
 	}
-	s := db.session // struct copy: shares the seam (func fields), the lifetime gauge (pointer), and the
+	s := db.session // struct copy: shares the Environment (pointer), the lifetime gauge (pointer), and the
 	// read-only maps (vars/sessionSeq); reset the per-statement / transaction state below.
 	s.tx = nil
 	s.readPin = nil
@@ -495,7 +495,7 @@ func (db *engine) buildScanRows(sp *selectPlan, resultTypes []string, bound []Va
 			} else {
 				cur.scan = store.storeScan(b, sp.phys.pkReverse)
 			}
-			if ra := newReadAhead(sp.filter, sp.projections, snap.session.extensions); ra != nil {
+			if ra := newReadAhead(sp.filter, sp.projections, snap.session.env.hosts); ra != nil {
 				fe, pe := *cur.env, *cur.env
 				fe.hostBatch, pe.hostBatch = ra.filter, ra.project
 				cur.ahead, cur.filterEnv, cur.projectEnv = ra, &fe, &pe
@@ -743,10 +743,10 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			c.idx = em.start
 		}
 		if em.mode == emitProject {
-			c.batch = newHostBatch(c.plan.projections, c.eng.session.extensions)
+			c.batch = newHostBatch(c.plan.projections, c.eng.session.env.hosts)
 		}
 		if em.mode == emitSorted && !em.precharged && !em.identity {
-			if ra := newReadAhead(nil, c.plan.projections, c.eng.session.extensions); ra != nil {
+			if ra := newReadAhead(nil, c.plan.projections, c.eng.session.env.hosts); ra != nil {
 				c.ahead = ra
 				c.projectEnv = &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}, hostBatch: ra.project}
 			}
@@ -1053,7 +1053,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	// A host call in the WHERE or projection reads each table interval ahead into a window and replays
 	// it row by row (extensibility.md §4.2.1 "In-hand and pulled sites"); the filter's and the
 	// projection's prefetches each run on their own env.
-	ra := newReadAhead(plan.filter, plan.projections, db.session.extensions)
+	ra := newReadAhead(plan.filter, plan.projections, db.session.env.hosts)
 	filterEnv, projectEnv := env, env
 	if ra != nil {
 		fe, pe := *env, *env

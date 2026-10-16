@@ -335,7 +335,7 @@ fn round_trips_through_the_on_disk_image() {
          (3, 100, 0.50, 'ok')",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
 
@@ -374,7 +374,7 @@ fn round_trips_through_the_on_disk_image() {
     // A second generation (load → image → load) is byte-stable: the text is written back
     // verbatim.
     let image2 = loaded.to_image(256, 1).unwrap();
-    let reloaded = Database::from_image(&image2)
+    let reloaded = Database::from_image(&image2, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
@@ -391,7 +391,7 @@ fn round_trips_through_the_on_disk_image() {
         .expect("stored check text in image");
     let mut corrupt = image.clone();
     corrupt[at + 4] = b'(';
-    let e = match Database::from_image(&corrupt) {
+    let e = match Database::from_image(&corrupt, jed::Environment::default()) {
         Err(e) => e,
         Ok(_) => panic!("corrupt check text must fail to load"),
     };

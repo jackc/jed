@@ -576,7 +576,7 @@ means UTC−5:30, matching PostgreSQL):
 Named IANA zones (`America/New_York`, `Europe/Paris`, …) come from a time-zone database the host
 **loads** as bytes — the engine ships none by itself, so a query can only ever *use* an
 already-loaded zone (an unknown zone raises `22023`). This is the same host-loaded-data model jed
-uses for Unicode collation; see the design notes for the `JTZ` bundle and the `db.loadTimeZoneData`
+uses for Unicode collation; see the design notes for the `JTZ` bundle and the environment's `loadTimeZoneData`
 host call.
 
 ### Rendering in the session time zone

@@ -4,8 +4,9 @@ import "fmt"
 
 // Host extensions (spec/design/extensibility.md §4.2 / §5.1 / §7) — the injection seam a host
 // application uses to register its own SCALAR FUNCTIONS OVER EXISTING TYPES. This is delivery step 3
-// (extensibility.md §14): runtime host functions, resolved + evaluated through a registry the host
-// supplies at open/create and the engine freezes for the handle's lifetime. Deliberately narrow
+// (extensibility.md §14): runtime host functions, registered on an EnvironmentBuilder
+// (environment.md §5) and resolved + evaluated through the frozen registry of the handle's
+// Environment. Deliberately narrow
 // (mirrors impl/rust/src/extension.rs):
 //
 //   - Functions only (no host types, no format bump).
@@ -219,43 +220,34 @@ func (f *hostFuncEntry) shapeError(n, got int) error {
 	return newError(DataException, fmt.Sprintf("host function %s returned %d results for a batch of %d rows", f.name, got, n))
 }
 
-// ExtensionRegistry is the immutable set of host extensions supplied at open/create and FROZEN for
-// the database handle's lifetime (extensibility.md §7). This slice holds host scalar functions over
-// existing types only. Shared (by pointer) across every session minted from the handle; a streaming
-// cursor's frozen engine copies the sessionState struct and so shares it too.
-type ExtensionRegistry struct {
+// hostRegistry is the frozen set of host functions an Environment holds (extensibility.md §7,
+// environment.md §5) — built once by EnvironmentBuilder.Build and never mutated, so it is shared (by
+// pointer) across every session of every handle using that environment; a function's index is its
+// stable resolved id.
+type hostRegistry struct {
 	functions []hostFuncEntry
 }
 
-// NewExtensionRegistry returns an empty registry.
-func NewExtensionRegistry() *ExtensionRegistry { return &ExtensionRegistry{} }
-
-// RegisterFunction registers a host scalar function. Errors on a negative cost (22023), an unknown
-// argument/result type name (42704), or a second function with an identical (name, arg-types)
-// signature (42723 — signature-level, not name-level: a host may overload a name across argument
-// types, §4.2). A signature that shadows a built-in is accepted but never reached (built-ins win).
-func (r *ExtensionRegistry) RegisterFunction(f *HostFunction) error {
+// resolveHostFunction validates a host function and resolves its type names (the registration half
+// of EnvironmentBuilder.RegisterFunction): a negative cost is 22023, an unknown argument/result type
+// name 42704.
+func resolveHostFunction(f *HostFunction) (hostFuncEntry, error) {
 	if f.cost < 0 {
-		return newError(InvalidParameterValue, "host function "+f.name+": cost must be non-negative")
+		return hostFuncEntry{}, newError(InvalidParameterValue, "host function "+f.name+": cost must be non-negative")
 	}
 	argTypes := make([]scalarType, len(f.argTypeNames))
 	for i, n := range f.argTypeNames {
 		st, ok := scalarTypeFromName(n)
 		if !ok {
-			return newError(UndefinedObject, "host function "+f.name+": unknown argument type "+n)
+			return hostFuncEntry{}, newError(UndefinedObject, "host function "+f.name+": unknown argument type "+n)
 		}
 		argTypes[i] = st
 	}
 	result, ok := scalarTypeFromName(f.resultName)
 	if !ok {
-		return newError(UndefinedObject, "host function "+f.name+": unknown result type "+f.resultName)
+		return hostFuncEntry{}, newError(UndefinedObject, "host function "+f.name+": unknown result type "+f.resultName)
 	}
-	for i := range r.functions {
-		if r.functions[i].name == f.name && sameHostSig(r.functions[i].argTypes, argTypes) {
-			return newError(DuplicateFunction, "host function "+f.name+" already registered with this signature")
-		}
-	}
-	r.functions = append(r.functions, hostFuncEntry{
+	return hostFuncEntry{
 		name:            f.name,
 		argTypes:        argTypes,
 		result:          result,
@@ -266,13 +258,12 @@ func (r *ExtensionRegistry) RegisterFunction(f *HostFunction) error {
 		semanticVersion: f.semanticVersion,
 		kernel:          f.kernel,
 		batchKernel:     f.batchKernel,
-	})
-	return nil
+	}, nil
 }
 
 // hasFunction reports whether any registered host function has this (exact) name — the
-// resolve-time routing gate. nil-safe (a handle with no extensions).
-func (r *ExtensionRegistry) hasFunction(name string) bool {
+// resolve-time routing gate. nil-safe.
+func (r *hostRegistry) hasFunction(name string) bool {
 	if r == nil {
 		return false
 	}
@@ -286,7 +277,7 @@ func (r *ExtensionRegistry) hasFunction(name string) bool {
 
 // resolveHost resolves (name, arg types) to a host-function id (a stable index) by exact scalar
 // signature. Reports false ⇒ no host overload (the caller falls through to 42883). nil-safe.
-func (r *ExtensionRegistry) resolveHost(name string, argTypes []scalarType) (int, bool) {
+func (r *hostRegistry) resolveHost(name string, argTypes []scalarType) (int, bool) {
 	if r == nil {
 		return 0, false
 	}
@@ -299,7 +290,7 @@ func (r *ExtensionRegistry) resolveHost(name string, argTypes []scalarType) (int
 }
 
 // function returns the registered function at id (an index from resolveHost).
-func (r *ExtensionRegistry) function(id int) *hostFuncEntry { return &r.functions[id] }
+func (r *hostRegistry) function(id int) *hostFuncEntry { return &r.functions[id] }
 
 func sameHostSig(a, b []scalarType) bool {
 	if len(a) != len(b) {

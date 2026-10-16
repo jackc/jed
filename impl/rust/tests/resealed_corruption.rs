@@ -164,8 +164,8 @@ fn resealed_statements(db: &Database) -> Vec<String> {
 }
 
 /// Open `image` and run `stmts`, rendering every cell. Engine errors are the acceptable failure.
-fn run_case(image: &[u8], stmts: &[String]) {
-    let Ok(db) = Database::from_image(image) else {
+fn run_case(image: &[u8], stmts: &[String], env: &jed::Environment) {
+    let Ok(db) = Database::from_image(image, env.clone()) else {
         return;
     };
     let mut s = db.session(SessionOptions::default());
@@ -209,13 +209,13 @@ fn install_panic_hook() {
 }
 
 /// Run one case on its own thread: a panic or a hang becomes an `Err` naming it.
-fn guarded(image: Vec<u8>, stmts: Vec<String>) -> Result<(), String> {
+fn guarded(image: Vec<u8>, stmts: Vec<String>, env: jed::Environment) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name(CASE_THREAD.to_string())
         .stack_size(8 << 20)
         .spawn(move || {
-            run_case(&image, &stmts);
+            run_case(&image, &stmts, &env);
             let _ = tx.send(());
         })
         .expect("spawn case thread");
@@ -239,7 +239,12 @@ fn guarded(image: Vec<u8>, stmts: Vec<String>) -> Result<(), String> {
 fn resealed_page_corruption_fails_closed() {
     let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../spec/collation/fixtures/unicode.jucd");
-    jed::load_unicode_data(&std::fs::read(&bundle).unwrap()).expect("load unicode.jucd");
+    let env = jed::Environment::builder()
+        .load_unicode_data(&std::fs::read(&bundle).unwrap())
+        .expect("load unicode.jucd")
+        .load_time_zone_data(include_bytes!("../../../spec/tz/fixtures/tzdata.jtz"))
+        .expect("load tzdata.jtz")
+        .build();
     install_panic_hook();
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/fileformat/fixtures");
@@ -256,7 +261,7 @@ fn resealed_page_corruption_fails_closed() {
     for path in &paths {
         let base = path.file_name().unwrap().to_str().unwrap().to_string();
         let raw = std::fs::read(path).unwrap();
-        let clean = match Database::from_image(&raw) {
+        let clean = match Database::from_image(&raw, env.clone()) {
             Ok(db) => db,
             Err(_) => {
                 skipped += 1; // a fixture that is malformed by design
@@ -276,7 +281,7 @@ fn resealed_page_corruption_fails_closed() {
                 let mut mutated = image.to_vec();
                 let what = mutate_page(&mut mutated, ps, p, pages, &mut r);
                 cases += 1;
-                if let Err(e) = guarded(mutated, stmts.clone()) {
+                if let Err(e) = guarded(mutated, stmts.clone(), env.clone()) {
                     failures.push(format!("{base} page {p} mutation {m} ({what}): {e}"));
                 }
             }

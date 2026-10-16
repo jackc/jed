@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use jed::value::Value;
 use jed::{
-    CreateOptions, Database, ExtensionRegistry, HostFunction, OpenOptions, Outcome, ScalarType,
-    Session, SessionOptions, Volatility,
+    CreateOptions, Database, Environment, HostFunction, OpenOptions, Outcome, ScalarType, Session,
+    SessionOptions, Volatility,
 };
 
 /// `host_add(i64, i64) -> i64` — integer sum (strict: never sees NULL).
@@ -44,18 +44,20 @@ fn add_text() -> HostFunction {
     )
 }
 
-fn registry(funcs: Vec<HostFunction>) -> Arc<ExtensionRegistry> {
-    let mut reg = ExtensionRegistry::new();
+/// An environment registering `funcs`.
+fn registry(funcs: Vec<HostFunction>) -> Environment {
+    let mut env = Environment::builder();
     for f in funcs {
-        reg.register_function(f)
+        env = env
+            .register_function(f)
             .unwrap_or_else(|e| panic!("register: {}", e.message));
     }
-    Arc::new(reg)
+    env.build()
 }
 
-fn db_with_ext(extensions: Arc<ExtensionRegistry>, stmts: &[&str]) -> Session {
+fn db_with_ext(environment: Environment, stmts: &[&str]) -> Session {
     let mut db = Database::create(CreateOptions {
-        extensions,
+        environment,
         ..Default::default()
     })
     .unwrap()
@@ -191,10 +193,9 @@ fn host_text_overload_wins_over_literal_adaptation() {
 
 #[test]
 fn duplicate_signature_rejected() {
-    let mut reg = ExtensionRegistry::new();
-    reg.register_function(add_i64()).unwrap();
+    let reg = Environment::builder().register_function(add_i64()).unwrap();
     // Same (name, arg_types) — rejected 42723 (signature-level, §4.2).
-    let err = reg.register_function(add_i64()).unwrap_err();
+    let err = reg.clone().register_function(add_i64()).unwrap_err();
     assert_eq!(err.code(), "42723");
     // A different signature on the same name is fine (overloading).
     reg.register_function(add_text()).unwrap();
@@ -202,7 +203,7 @@ fn duplicate_signature_rejected() {
 
 #[test]
 fn negative_cost_rejected() {
-    let mut reg = ExtensionRegistry::new();
+    let reg = Environment::builder();
     let bad = HostFunction::new(
         "host_neg",
         vec![],
@@ -246,7 +247,7 @@ fn declared_cost_gates_max_cost_ceiling() {
     )
     .cost(1_000_000);
     let mut db = Database::create(CreateOptions {
-        extensions: registry(vec![heavy]),
+        environment: registry(vec![heavy]),
         ..Default::default()
     })
     .unwrap()
@@ -376,12 +377,12 @@ fn remove_db(path: &std::path::Path) {
     let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
 }
 
-fn create_file(path: &std::path::Path, ext: std::sync::Arc<ExtensionRegistry>, stmts: &[&str]) {
+fn create_file(path: &std::path::Path, ext: Environment, stmts: &[&str]) {
     let _ = std::fs::remove_file(path);
     let mut db = Database::create(CreateOptions {
         path: Some(path.to_path_buf()),
         skip_fsync: true,
-        extensions: ext,
+        environment: ext,
         ..Default::default()
     })
     .unwrap();
@@ -391,12 +392,12 @@ fn create_file(path: &std::path::Path, ext: std::sync::Arc<ExtensionRegistry>, s
     }
 }
 
-fn open_file(path: &std::path::Path, ext: std::sync::Arc<ExtensionRegistry>) -> Database {
+fn open_file(path: &std::path::Path, ext: Environment) -> Database {
     Database::open_with_options(
         path,
         OpenOptions {
             skip_fsync: true,
-            extensions: ext,
+            environment: ext,
             ..OpenOptions::default()
         },
     )
@@ -573,7 +574,7 @@ fn hostfunc_index_reopen_missing_function() {
         ],
     );
     // Reopen with NO extensions: the index expression can no longer resolve.
-    let mut db = open_file(&path, std::sync::Arc::new(ExtensionRegistry::new()));
+    let mut db = open_file(&path, Environment::default());
     // A read that does not reference the missing function still works (the index is simply unused).
     assert_eq!(
         ids(&mut db, "SELECT id FROM t ORDER BY id"),
@@ -1276,7 +1277,7 @@ fn batch_streaming_scan_storage_errors_match_row_kernel() {
             p,
             OpenOptions {
                 skip_fsync: true,
-                extensions: registry(vec![f]),
+                environment: registry(vec![f]),
                 ..OpenOptions::default()
             },
         )
@@ -1451,7 +1452,7 @@ fn hostfunc_check_reopen_matching() {
 fn hostfunc_check_reopen_missing() {
     let path = tmp("hostfunc_check_missing.jed");
     create_check_file(&path);
-    let mut db = open_file(&path, Arc::new(ExtensionRegistry::new()));
+    let mut db = open_file(&path, Environment::default());
     // Writes that evaluate the check cannot resolve it (42883); reads and DELETE never evaluate it.
     assert_eq!(ids(&mut db, "SELECT id FROM t"), vec![Value::Int(1)]);
     want_host_code(&mut db, "INSERT INTO t VALUES (2, 1)", "42883");
@@ -1599,7 +1600,7 @@ fn hostfunc_default_resolved_only_when_applied() {
             "INSERT INTO ch VALUES (1, 1)",
         ],
     );
-    let mut db = open_file(&path, Arc::new(ExtensionRegistry::new()));
+    let mut db = open_file(&path, Environment::default());
     // Statements that never apply the default do not need its host function.
     want_host_ok(&mut db, "INSERT INTO t VALUES (2, 7, 7)");
     want_host_ok(&mut db, "INSERT INTO t (id, b) VALUES (3, 1)");

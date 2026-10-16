@@ -9,7 +9,7 @@
 > **The load-bearing decision: attaching is a *host-API* act, never a SQL statement.** Opening a file
 > reaches the filesystem, and jed's SQL surface is **pure** (CLAUDE.md §13) — there is no
 > `pg_read_file`, no `COPY … FROM`, and there will be no SQL `ATTACH 'path'`. So the *host* attaches
-> and detaches (like `db.open`/`db.load_unicode_data`, [api.md](api.md), [hosts.md](hosts.md) §4); the
+> and detaches (like `db.open` and loading Unicode data into an environment, [api.md](api.md), [hosts.md](hosts.md) §4); the
 > **SQL** surface gains only the power to *name* what the host already attached. Qualified names are
 > pure — they can reference attached data but cannot attach anything or reach the filesystem — so the
 > §13 guarantee is preserved unchanged.

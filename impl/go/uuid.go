@@ -6,7 +6,7 @@ import "encoding/binary"
 // lives in value.go; this is the SEMANTIC bit work — extracting the version and embedded
 // timestamp from the 16 raw big-endian bytes (byte 0 is the most-significant), plus the pure
 // generator byte builders (buildUUIDv4/buildUUIDv7 below). The PRNG draws + clock for the
-// generators live on the entropy+clock seam (seam.go); the functions here are PURE —
+// generators read the Environment's random + clock sources (seam.go); the functions here are PURE —
 // deterministic functions of their input bytes.
 
 // gregorianOffset100ns is the number of 100-ns intervals between the Gregorian UUID epoch

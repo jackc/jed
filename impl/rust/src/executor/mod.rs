@@ -429,6 +429,13 @@ pub struct Snapshot {
     /// creates stores against the same domain page space, and `#[derive(Default)]` (`None`).
     /// NEVER serialized.
     store_paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
+    /// The environment this snapshot's database was opened with (spec/design/environment.md) — what
+    /// a collation name resolves against when the catalog has no file pin for it, and the version a
+    /// pin is checked against (`resolve_collation` / `collation_skew`). One per handle: the main
+    /// database, its attachments, and its sessions' temp domains all carry the handle's. Rides
+    /// `#[derive(Clone)]` (an `Arc` bump); `#[derive(Default)]` is the empty environment, which only a
+    /// bare scratch snapshot keeps. NEVER serialized.
+    pub(crate) env: crate::environment::Environment,
 }
 
 /// Non-persisted equality tokens used only by prepared-plan cache validation.
@@ -475,7 +482,7 @@ pub struct Engine {
     pub(crate) committed: Snapshot,
     /// The **default session** (spec/design/session.md §2.1): the per-connection state this handle
     /// runs statements through — the open transaction (the `Idle`/`Open`/`Failed` machine, §2.2),
-    /// the relocated settings (`max_cost`, `max_sql_length`, `work_mem`, the entropy/clock seam),
+    /// the relocated settings (`max_cost`, `max_sql_length`, `work_mem`), the handle's environment,
     /// and the `currval`/`lastval` session state. A bare `Engine` IS committed storage + this one
     /// long-lived stateful default session; the convenience methods (`execute`/`begin`/
     /// `set_max_cost`/…) operate on it. `db.session(opts)` mints additional, independent sessions
@@ -780,8 +787,8 @@ impl Drop for OpenStreamGuard {
 /// The relocatable session settings (spec/design/session.md §3 — the bucket-A envelope subset that
 /// has landed in S1): the per-statement cost ceiling, the input-size limit, and the work-memory
 /// budget. Passed to [`Engine::session`] to mint an additional session; an absent field takes its
-/// default. (The entropy/clock seam is injected via [`SessionState::set_random_source`] /
-/// [`SessionState::set_clock_source`], not here.)
+/// default. (The random and clock sources belong to the handle's environment, not here —
+/// spec/design/environment.md.)
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
     /// Cumulative scalar allocation bytes per statement; zero restores the finite default.
@@ -893,7 +900,7 @@ pub(crate) struct ReadPin {
 /// The per-connection **session** state (spec/design/session.md §2.1): the configured, stateful
 /// context a host runs statements through, un-fused from the committed storage on [`Engine`]. It
 /// owns the open transaction (the `Idle`/`Open`/`Failed` machine), the relocated handle settings,
-/// the entropy/clock seam, and the `currval`/`lastval` session state. A [`Engine`] holds one as
+/// the handle's environment, and the `currval`/`lastval` session state. A [`Engine`] holds one as
 /// its long-lived default session; [`Engine::session`] mints additional independent ones that run
 /// sequentially on a single-threaded handle (by swapping into the default slot for a call).
 pub struct SessionState {
@@ -944,23 +951,11 @@ pub struct SessionState {
     /// spill); default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM). Never changes what a
     /// query observes (spill.md §6); an in-memory database ignores it.
     pub(crate) work_mem: usize,
-    /// The entropy + clock seam for the uuid generators / clock functions (spec/design/entropy.md):
-    /// two host-injectable functions (a random source + a clock), each defaulting to the platform
-    /// primitive. Tests inject `seeded_random_source` + `fixed_clock` (the `# seed:`/`# clock:`
-    /// directives) for byte-identical cross-core output.
-    ///
-    /// Behind an `Rc` so a streaming cursor's frozen snapshot engine (streaming.md §5) **shares** the
-    /// live session's seam rather than copying it (the seam holds boxed `FnMut` closures and so is not
-    /// `Clone`): a `uuidv7()` / `now()` in a streaming projection then draws from the same injected
-    /// source as the eager path, keeping the result byte-identical under full drain (streaming.md §6).
-    pub(crate) seam: std::rc::Rc<crate::seam::Seam>,
-    /// The host-supplied extension registry (spec/design/extensibility.md §7): the scalar functions a
-    /// host registered at open/create, **frozen** for the handle's lifetime and shared (`Arc`) across
-    /// every session minted from the handle (and a streaming cursor's frozen engine). An empty default
-    /// registry for a handle opened with no extensions, so the built-in-only path is unaffected. `Arc`
-    /// (not `Rc` like the seam) because the `Send + Sync` [`Database`](crate::Database) holds the master
-    /// copy on its shared core — the kernels are `Send + Sync`.
-    pub(crate) extensions: std::sync::Arc<crate::extension::ExtensionRegistry>,
+    /// The handle's environment (spec/design/environment.md): the loaded Unicode and time-zone data,
+    /// the host functions, and the random + clock sources the uuid generators / clock functions read.
+    /// Every session minted from a handle (and a streaming cursor's frozen engine) shares the handle's
+    /// one environment; it never changes while the handle is open.
+    pub(crate) env: crate::environment::Environment,
     /// **SessionState** `currval` state (spec/design/sequences.md §6): the last value `nextval`/
     /// `setval(…,true)` produced **in this session** for each sequence (exact name). NOT in the
     /// snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
@@ -1049,12 +1044,6 @@ fn require_custom_var_name(name: &str) -> Result<String> {
     }
 }
 
-impl Default for SessionState {
-    fn default() -> Self {
-        SessionState::new()
-    }
-}
-
 impl SessionState {
     /// Legacy unreported evaluation cost still shares the statement's scalar admission.
     pub(crate) fn scratch_meter(&self) -> Meter {
@@ -1136,14 +1125,16 @@ impl SessionState {
         })
     }
 
-    /// A fresh default session: no open transaction, default settings, empty sequence state.
-    pub fn new() -> Self {
-        SessionState::with_options(SessionOptions::default())
+    /// A fresh default session over `env`: no open transaction, default settings, empty sequence
+    /// state.
+    pub fn new(env: crate::environment::Environment) -> Self {
+        SessionState::with_options(SessionOptions::default(), env)
     }
 
-    /// A fresh session configured from `opts` (spec/design/session.md §2.1); the rest of the
-    /// per-connection state (transaction, seam, sequence state) starts empty/default.
-    pub fn with_options(opts: SessionOptions) -> Self {
+    /// A fresh session configured from `opts` (spec/design/session.md §2.1) over the handle's
+    /// environment `env`; the rest of the per-connection state (transaction, sequence state) starts
+    /// empty/default.
+    pub fn with_options(opts: SessionOptions, env: crate::environment::Environment) -> Self {
         let mut privileges = crate::privileges::Privileges::default();
         privileges.set_default_table(opts.default_privileges);
         SessionState {
@@ -1166,10 +1157,6 @@ impl SessionState {
             } else {
                 opts.work_mem
             },
-            seam: std::rc::Rc::new(crate::seam::Seam::default()),
-            // Default = no host extensions; a handle created/opened with a registry overrides this on
-            // its minted sessions (shared.rs) — the bare/default session stays extension-free.
-            extensions: std::sync::Arc::new(crate::extension::ExtensionRegistry::default()),
             session_seq: HashMap::new(),
             session_last_name: None,
             pending_seq: std::cell::RefCell::new(HashMap::new()),
@@ -1183,12 +1170,14 @@ impl SessionState {
             allow_temp_ddl: opts.allow_temp_ddl.unwrap_or(opts.allow_ddl),
             temp_buffers: opts.temp_buffers,
             max_temp_storage_bytes: opts.max_temp_storage_bytes,
-            temp_committed: Snapshot::default(),
+            temp_committed: Snapshot::with_environment(env.clone()),
             vars: HashMap::new(),
             // Resolve the configured zone once; an invalid value falls back to UTC at mint (the
             // validated path is `set_time_zone`, which surfaces 22023). timezones.md §9.4.
-            time_zone: crate::timezone::resolve_zone(&opts.time_zone)
+            time_zone: env
+                .resolve_zone(&opts.time_zone)
                 .unwrap_or(crate::timezone::ZoneRef::Fixed(0)),
+            env,
             read_pin: None,
             fk_action_depth: 0,
             fk_deferred_checks: Vec::new(),
@@ -1200,7 +1189,7 @@ impl SessionState {
     /// a loaded `JTZ` bundle provides; a name no bundle provides (and not a built-in) is **`22023`**
     /// (`invalid_parameter_value`), the value unchanged. The resolved zone is cached on the session.
     pub fn set_time_zone(&mut self, zone: &str) -> Result<()> {
-        match crate::timezone::resolve_zone(zone) {
+        match self.env.resolve_zone(zone) {
             Some(zr) => {
                 self.time_zone = zr;
                 Ok(())
@@ -1363,22 +1352,6 @@ impl SessionState {
     /// leaks past its record).
     pub fn reset_vars(&mut self) {
         self.vars.clear();
-    }
-    /// Inject a random source for the uuid generators (entropy.md §6).
-    pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
-        self.seam.set_random(f);
-    }
-    /// Clear the injected random source (return to the OS CSPRNG).
-    pub fn clear_random_source(&mut self) {
-        self.seam.clear_random();
-    }
-    /// Inject a clock source for `uuidv7` / the clock functions (entropy.md §6).
-    pub fn set_clock_source(&mut self, f: crate::seam::ClockSource) {
-        self.seam.set_clock(f);
-    }
-    /// Clear the injected clock source (return to the wall clock).
-    pub fn clear_clock_source(&mut self) {
-        self.seam.clear_clock();
     }
 }
 
@@ -4001,8 +3974,8 @@ pub(crate) enum RExpr {
     },
     /// A **host-defined** scalar-function call (spec/design/extensibility.md §4.2 / §5.1) — the
     /// injection seam that reaches a host-registered kernel a compiled `match` on the closed
-    /// [`ScalarFunc`] enum cannot. `id` indexes the frozen [`ExtensionRegistry`](crate::extension)
-    /// on the session; `result` is the host's declared scalar result type. STRICT (a NULL arg → NULL,
+    /// [`ScalarFunc`] enum cannot. `id` indexes the host functions of the session's frozen
+    /// [`Environment`](crate::Environment); `result` is the host's declared scalar result type. STRICT (a NULL arg → NULL,
     /// short-circuited in eval like [`RExpr::ScalarFunc`]). Kept a **separate** variant so the
     /// built-in path stays a monomorphized inline `match` (§5) and no built-in id-reasoning applies
     /// to host code.
@@ -6163,20 +6136,28 @@ fn jt_scalar_type(db: &Engine, type_name: &str) -> Result<ScalarType> {
 
 /// Compile a `JSON_TABLE` column path — the explicit `PATH p`, or the default `$.<column_name>` —
 /// to its canonical rendered form (validating; malformed → 42601).
-fn jt_compile_path(path: Option<&str>, name: &str) -> Result<String> {
+fn jt_compile_path(
+    path: Option<&str>,
+    name: &str,
+    casing: Option<&crate::collation::PropertyTable>,
+) -> Result<String> {
     let src = match path {
         Some(p) => p.to_string(),
         None => format!("$.{name}"),
     };
-    Ok(crate::jsonpath::JsonPath::compile(&src)?.render())
+    Ok(crate::jsonpath::JsonPath::compile(&src, casing)?.render())
 }
 
 /// How `JSON_TABLE` evaluates its row, NESTED, and value-column paths: the full sequence, with its
-/// `PASSING` variables (jsonpath.md §3.1, §5).
-pub(crate) fn jt_eval(vars: crate::jsonpath::Vars<'_>) -> crate::jsonpath::EvalOpts<'_> {
+/// `PASSING` variables (jsonpath.md §3.1, §5), folding an `i`-flagged `like_regex` under `casing`.
+pub(crate) fn jt_eval<'d>(
+    vars: crate::jsonpath::Vars<'d>,
+    casing: Option<&'d crate::collation::PropertyTable>,
+) -> crate::jsonpath::EvalOpts<'d> {
     crate::jsonpath::EvalOpts {
         exists: false,
         vars,
+        casing,
     }
 }
 
@@ -6221,7 +6202,8 @@ fn expand_jt_level(
                     path,
                     on_error,
                 } => {
-                    let v = eval_jt_exists(item, path, vars, *returning, *on_error, meter)?;
+                    let casing = env.exec.session.env.property();
+                    let v = eval_jt_exists(item, path, vars, casing, *returning, *on_error, meter)?;
                     local.push((*idx, v));
                 }
                 JtCol::Nested { .. } => {}
@@ -6258,9 +6240,10 @@ fn expand_jt_nested(
     let mut union: Vec<JtAssign> = Vec::new();
     for child in children {
         if let JtCol::Nested { path, columns } = child {
-            let p = crate::jsonpath::compile_metered(path, meter)?;
+            let casing = env.exec.session.env.property();
+            let p = crate::jsonpath::compile_metered(path, casing, meter)?;
             // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
-            let child_seq = match crate::jsonpath::eval(&p, item, jt_eval(vars), meter) {
+            let child_seq = match crate::jsonpath::eval(&p, item, jt_eval(vars, casing), meter) {
                 Ok(seq) => seq,
                 Err(e) if is_sqljson_error(&e) => Vec::new(),
                 Err(e) => return Err(e),
@@ -6290,8 +6273,9 @@ fn eval_jt_regular(
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Value> {
-    let p = crate::jsonpath::compile_metered(path, meter)?;
-    let seq = match crate::jsonpath::eval(&p, item, jt_eval(vars), meter) {
+    let casing = env.exec.session.env.property();
+    let p = crate::jsonpath::compile_metered(path, casing, meter)?;
+    let seq = match crate::jsonpath::eval(&p, item, jt_eval(vars, casing), meter) {
         Ok(s) => s,
         Err(e) if is_sqljson_error(&e) => {
             return apply_json_behavior(on_error, e, returning, env, meter);
@@ -6315,12 +6299,17 @@ fn eval_jt_exists(
     item: &JsonNode,
     path: &str,
     vars: crate::jsonpath::Vars<'_>,
+    casing: Option<&crate::collation::PropertyTable>,
     returning: ScalarType,
     on_error: JsonOnBehavior,
     meter: &mut Meter,
 ) -> Result<Value> {
-    let p = crate::jsonpath::compile_metered(path, meter)?;
-    let opts = crate::jsonpath::EvalOpts { exists: true, vars };
+    let p = crate::jsonpath::compile_metered(path, casing, meter)?;
+    let opts = crate::jsonpath::EvalOpts {
+        exists: true,
+        vars,
+        casing,
+    };
     let exists = match crate::jsonpath::eval(&p, item, opts, meter) {
         Ok(seq) => !seq.is_empty(),
         Err(e) if is_sqljson_error(&e) => match on_error {

@@ -166,13 +166,15 @@ ledger entries `uuidv4-entropy` / `uuidv7-clock-entropy`) **and the clock functi
 lands. This is the jed-idiomatic move and it collapses almost all of class **B** back into the
 deterministic contract. Do not make *the engine* non-deterministic; make
 the engine a **deterministic function of two new host inputs**, behind seams — exactly like
-the storage seam (CLAUDE.md §9, [storage.md](storage.md)):
+the storage seam (CLAUDE.md §9, [storage.md](storage.md)). Both sources are installed in the handle's
+**environment** ([environment.md](environment.md) §4), so results are deterministic *given the
+environment* (its loaded data, host functions, and the state of its sources):
 
-- **Clock seam** — `now()` / `current_timestamp` read it. The host injects a clock *function*;
-  production returns the wall clock, tests inject a fixed instant (entropy.md §6). The injected path
+- **Clock seam** — `now()` / `current_timestamp` read it. The host installs a clock *source*;
+  production returns the wall clock, tests install a manual clock set to a fixed instant (entropy.md §6). The injected path
   is fully G1+G2 (every core, given the same injected instant, renders byte-identical).
-- **Entropy seam** — `gen_random_uuid()` (v4) and unseeded `random()` draw from it. The host injects
-  a random-bytes *function*; **production's default reads the OS CSPRNG per value** (so output is
+- **Entropy seam** — `gen_random_uuid()` (v4) and unseeded `random()` draw from it. The host installs
+  a random-bytes *source*; **production's default reads the OS CSPRNG per value** (so output is
   unpredictable — not reconstructable from one sample, the security posture), and tests inject the
   engine's provided deterministic source.
 - **A spec'd PRNG as shared data** (CLAUDE.md §5) — one algorithm pinned byte-for-byte, the way

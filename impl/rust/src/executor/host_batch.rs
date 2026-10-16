@@ -223,7 +223,7 @@ fn prefetch(
     env: &EvalEnv,
     headroom: Option<i64>,
 ) {
-    let hf = env.exec.session.extensions.function(slot.id);
+    let hf = env.exec.session.env.functions().function(slot.id);
     let mut n = (end - start).min(HOST_BATCH_ROWS);
     // Every replayed row charges at least the declared cost, so the kernel never runs on more rows
     // than the remaining budget could pay for, plus the one that trips it (§4.2.1).

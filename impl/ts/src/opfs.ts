@@ -22,6 +22,7 @@
 //     in-memory database — spill.md §2); spilling via OPFS is a later enhancement.
 
 import { Engine, DEFAULT_PAGE_SIZE } from "./executor.ts";
+import { Environment } from "./environment.ts";
 import { engineError } from "./errors.ts";
 import { loadEnginePaged, ROOT_PAGE, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
@@ -31,8 +32,14 @@ import { OpfsBlockStore, type SyncAccessHandle } from "./opfsblockstore.ts";
 
 // DatabaseOptions / OpenOptions mirror file.ts (spec/design/api.md §2/§2.1): create-time pageSize is
 // fixed into the file's meta; open-time cacheBytes / readOnly / workMem are handle settings.
-export type DatabaseOptions = { pageSize?: number };
-export type OpenOptions = { cacheBytes?: number; readOnly?: boolean; workMem?: number };
+// environment is the handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one.
+export type DatabaseOptions = { pageSize?: number; environment?: Environment };
+export type OpenOptions = {
+  cacheBytes?: number;
+  readOnly?: boolean;
+  workMem?: number;
+  environment?: Environment;
+};
 
 // createOpfsWithHandle creates a new file-backed database over an already-acquired, EMPTY OPFS sync
 // access handle (the async createOpfs acquires it; the parity test passes a fake one). Writes the
@@ -40,7 +47,7 @@ export type OpenOptions = { cacheBytes?: number; readOnly?: boolean; workMem?: n
 // through the seam incrementally (api.md §3, hosts.md §5). toImage validates the page size (0A000 if out
 // of range / not a power of two) BEFORE any write, so an invalid page size leaves the handle untouched.
 export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOptions = {}): Engine {
-  const db = new Engine();
+  const db = new Engine(opts.environment ?? new Environment());
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
@@ -77,7 +84,10 @@ export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions =
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   const readOnly = opts.readOnly ?? false;
   const pager = Pager.fromStore(new OpfsBlockStore(handle));
-  const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
+  const db = loadEnginePaged(
+    new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)),
+    opts.environment ?? new Environment(),
+  );
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.readOnly = readOnly;
   // 0 (or unset) ⇒ the default budget, not unlimited (matching Go/Rust); unbounded is setWorkMem(0).

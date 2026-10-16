@@ -417,32 +417,6 @@ impl Engine {
         self.session.max_cost
     }
 
-    /// Inject a random source for the uuid generators (spec/design/entropy.md §6) — the
-    /// deterministic / reproducible path. Pass [`seeded_random_source`](crate::seam::seeded_random_source)
-    /// for a byte-identical cross-core stream (the conformance path; tests use the `# seed:`
-    /// directive). A handle setting, not stored in the file.
-    pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
-        self.session.seam.set_random(f);
-    }
-
-    /// Clear the injected random source: the generators return to the OS CSPRNG, drawn per value
-    /// (production — unpredictable output).
-    pub fn clear_random_source(&mut self) {
-        self.session.seam.clear_random();
-    }
-
-    /// Inject a clock source for `uuidv7` (entropy.md §6) — e.g. [`fixed_clock`](crate::seam::fixed_clock)
-    /// (the `# clock:` directive). After this, `uuidv7()` embeds the source's instant instead of the
-    /// wall clock. A handle setting, not stored in the file.
-    pub fn set_clock_source(&mut self, f: crate::seam::ClockSource) {
-        self.session.seam.set_clock(f);
-    }
-
-    /// Clear the injected clock source: `uuidv7` returns to reading the wall clock (production).
-    pub fn clear_clock_source(&mut self) {
-        self.session.seam.clear_clock();
-    }
-
     /// Set the work-memory budget (in **bytes**) for blocking operators run on this handle
     /// (spec/design/spill.md §3, api.md §2.1): the `ORDER BY` external merge sort holds at most
     /// roughly this many bytes of rows resident before it spills sorted runs to disk. `0` is
@@ -521,59 +495,22 @@ impl Engine {
     // `import_collation` / `export_collation` are GONE (the reference-only pivot,
     // spec/design/collation.md §4.2): a collation is provided by a host-loaded bundle and used by
     // name, never loaded into a *database*. There is no runtime path that constructs or bakes a
-    // collation table — the only load is `load_unicode_data` of jed's own pinned bundle bytes.
+    // collation table — the only load is an environment's `load_unicode_data` of jed's own pinned
+    // bundle bytes.
 
-    /// Load a `JUCD` Unicode-data bundle (`db.LoadUnicodeData`, spec/design/collation.md §4.2): its
-    /// collations become resolvable by name for `COLLATE`, per-column collation, and `ORDER BY …
-    /// COLLATE`. The loaded set is **engine-global** (§9), so a bundle loaded through any handle is
-    /// visible everywhere — including to a later `Engine::open` of a file that *references* one of
-    /// its collations. Privileged host op (not SQL-reachable, no path, no engine I/O — §11);
-    /// **additive** and idempotent for an already-loaded bundle. A malformed bundle is `XX001`.
-    /// (Mirrors the engine-global [`crate::collation::load_unicode_data`], which the host may call
-    /// before opening any file.)
-    pub fn load_unicode_data(&self, bytes: &[u8]) -> Result<()> {
-        crate::collation::load_unicode_data(bytes)
-    }
-
-    /// Load a `JTZ` time-zone bundle into the engine-global loaded set (`db.LoadTimeZoneData`,
-    /// spec/design/timezones.md §3.3). The bytes are jed's own pinned TZif (RFC 8536) wrapped in a
-    /// manifest; the loaded zones become usable by `AT TIME ZONE`. Like the collation seam, this is a
-    /// privileged host op (not SQL-reachable, no path, no engine I/O — §10), **additive** and
-    /// idempotent for an already-loaded bundle, engine-global so it may be called before `open`. A
-    /// malformed bundle is `XX001`. (`UTC` and fixed offsets are built in and need no load.)
-    pub fn load_time_zone_data(&self, bytes: &[u8]) -> Result<()> {
-        crate::timezone::load_time_zone_data(bytes)
-    }
-
-    /// Introspect the engine-global **loaded** zone set (`db.LoadedTimeZones`, timezones.md §3.3) —
-    /// every named zone (and alias) a loaded bundle provides, each as `(name, tzdata_version)`,
-    /// ascending by name. A property of the running engine, not of this database. `UTC` and fixed
-    /// offsets are built in and not listed.
+    /// The loaded zone set of the handle's environment (`db.LoadedTimeZones`, timezones.md §3.3,
+    /// spec/design/environment.md) — every named zone (and alias) a loaded bundle provides, each as
+    /// `(name, tzdata_version)`, ascending by name. `UTC` and fixed offsets are built in and not listed.
     pub fn loaded_time_zones(&self) -> Vec<crate::timezone::TimeZoneInfo> {
-        crate::timezone::loaded_time_zones()
+        self.session.env.loaded_time_zones()
     }
 
-    /// Introspect the engine-global **loaded** collation set (`db.LoadedCollations`,
+    /// The loaded collation set of the handle's environment (`db.LoadedCollations`,
     /// spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
-    /// database on this handle, each as `(name, unicode_version, cldr_version, content_hash,
-    /// description, is_default)`, ascending by name. A property of the running *engine*, not of this
+    /// database on this handle, ascending by name. A property of the environment, not of this
     /// database; for the collations this database *references*, use [`Engine::collations`].
-    /// `is_default` is always `false` here (that is a per-database property). `C` is built in and not
-    /// listed.
     pub fn loaded_collations(&self) -> Vec<CollationInfo> {
-        collation::loaded_collation_tables()
-            .into_iter()
-            .map(|c| CollationInfo {
-                name: c.name.clone(),
-                unicode_version: c.unicode_version.clone(),
-                cldr_version: c.cldr_version.clone(),
-                content_hash: crate::format::crc32_ieee(&collation::serialize_table(&c)),
-                description: c.description.clone(),
-                is_default: false,
-                // The loaded set IS the version reference — it can never be skewed against itself.
-                verdict: CollationVerdict::Full,
-            })
-            .collect()
+        self.session.env.loaded_collations()
     }
 
     /// Set the per-database default collation (`db.SetDefaultCollation`, spec/design/collation.md
@@ -676,7 +613,7 @@ impl Engine {
     /// spec/design/collation.md §4.2) — every collation its schema uses (a column's `COLLATE`, or the
     /// per-database default), each as `(name, unicode_version, cldr_version, content_hash,
     /// description, is_default)`, in ascending name order. This is the *per-file* view; for the
-    /// engine-global **loaded** set, use [`Engine::loaded_collations`]. `C` is built in and not
+    /// environment's **loaded** set, use [`Engine::loaded_collations`]. `C` is built in and not
     /// listed.
     pub fn collations(&self) -> Vec<CollationInfo> {
         let default = self.committed.default_collation();

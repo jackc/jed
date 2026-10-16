@@ -13,7 +13,7 @@ func TestCompleteManifestWithSelfFreeingDependenciesIsCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = loadEngine(image)
+	_, err = loadEngine(image, NewEnvironment())
 	engineErr, ok := err.(*EngineError)
 	if !ok || engineErr.Code() != "XX001" {
 		t.Fatalf("complete manifest with corrupt free-list must fail after selection: %v", err)
@@ -34,7 +34,7 @@ func recordedCommitEngine(t *testing.T, image []byte) (*engine, *recordingStore,
 	if err != nil {
 		t.Fatal(err)
 	}
-	db, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize))
+	db, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func recordedCommitEngine(t *testing.T, image []byte) (*engine, *recordingStore,
 }
 
 func TestValidatedCommitUsesOneBarrierAndPoisonsFailedWriter(t *testing.T) {
-	image, err := newSnapshot().ToImage(256, 1)
+	image, err := newSnapshot(NewEnvironment()).ToImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestValidatedCommitUsesOneBarrierAndPoisonsFailedWriter(t *testing.T) {
 func TestSerializationErrorLeavesWriterUsable(t *testing.T) {
 	for _, recovered := range []bool{false, true} {
 		t.Run(fmt.Sprintf("recovered=%v", recovered), func(t *testing.T) {
-			image, err := newSnapshot().ToImage(256, 1)
+			image, err := newSnapshot(NewEnvironment()).ToImage(256, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -155,7 +155,7 @@ func TestValidatedManifestRejectsStaleChecksummedBodyAndBrokenChain(t *testing.T
 }
 
 func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing.T) {
-	image, err := newSnapshot().ToImage(256, 1)
+	image, err := newSnapshot(NewEnvironment()).ToImage(256, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 }
 
 func TestValidatedAllocatorRejectsPageHighWaterOverflow(t *testing.T) {
-	_, err := newSnapshot().incrementalImage(256, ^uint32(0), nil, true, nil)
+	_, err := newSnapshot(NewEnvironment()).incrementalImage(256, ^uint32(0), nil, true, nil)
 	if e, ok := err.(*EngineError); !ok || e.Code() != "54000" {
 		t.Fatalf("body high-water overflow: %v", err)
 	}

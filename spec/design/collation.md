@@ -76,7 +76,7 @@
 > - **Landed (Slice 3 — host-loaded `JUCD` bundle):** the **bundle codec** (`JUCD`, §9 /
 >   [../collation/README.md §5](../collation/README.md)) with **root-sharing** (the DUCET root once +
 >   per-locale sparse deltas merged at load, byte-identical to the full `.coll` — the merge-identity
->   vectors) in all three cores; the **bytes/reader load seam** `db.LoadUnicodeData` + introspection
+>   vectors) in all three cores; the **bytes/reader load seam** the environment builder's `LoadUnicodeData` + introspection
 >   `db.LoadedCollations` (§4.2); the **builder tool** `build_collation_bundle` (3b — `--preset`
 >   non-CJK/everything/casing-only + `--out`, the preset-driven assembler that produces the shippable
 >   bundle, §4.1); and the real production bundle `spec/collation/fixtures/unicode.jucd` (root `unicode`
@@ -125,7 +125,7 @@ this document makes safe.
 A collation is **provided by a loaded Unicode-data bundle** (§9/§13) — the bare binary carries none.
 A collation name is usable in a database iff a loaded bundle provides it; naming one no loaded bundle
 provides is **`42704`** (`undefined_object`), the same code an unknown array/range element type
-raises. Loading is a **privileged host operation** (`db.LoadUnicodeData`, below) that hands the
+raises. Loading is a **privileged host operation** (the environment builder's `LoadUnicodeData`, below) that hands the
 engine bundle **bytes** — *not* SQL-reachable and *not* a filesystem path, so an untrusted query can
 only ever *use* an already-loaded collation by name, never trigger a load, and the engine itself does
 no I/O (§11). This is categorically distinct from the host-`LC_COLLATE`/ICU **runtime read** the
@@ -138,7 +138,7 @@ privileged load of jed's own pinned bytes.)
 ```
 // production host API (privileged — not untrusted SQL, §11):
 
-db.LoadUnicodeData(bytesOrReader)  // load a JUCD bundle: its collations + Unicode property tables (§4/§9); additive
+builder.LoadUnicodeData(bytesOrReader)  // load a JUCD bundle: its collations + Unicode property tables (§4/§9); additive
 db.SetDefaultCollation("en-US")    // set the per-database default (must be provided by a loaded bundle)
 db.DefaultCollation()              // read the per-database default
 db.Collations()                    // introspect THIS database's referenced collations: name, (unicode, cldr), description
@@ -149,7 +149,7 @@ db.LoadedCollations()              // introspect the loaded set available to any
 //   CompileCollation(name, defReader) definition     → compiled `.coll` table
 //   SaveCollation / OpenCollation     `.coll` artifact serialize / deserialize
 //   (builder tool)                    selected `.coll` tables → a JUCD bundle (shared root + deltas, §9)
-// These produce the shippable bundle; production LOADS one via db.LoadUnicodeData and reads its
+// These produce the shippable bundle; production LOADS one via an environment builder's LoadUnicodeData and reads its
 // tables via OpenCollation, and never compiles or reaches the host.
 ```
 
@@ -449,31 +449,32 @@ The shipped engine carries **`OpenCollation` + the root+delta merge (§9) + the 
 layer 2). The host supplies a bundle's bytes; the engine reads its `.coll` set into in-memory tables;
 thereafter:
 
-- **`db.LoadUnicodeData(bytesOrReader)`** — privileged host op (not SQL-reachable, no path, no I/O in
-  the engine, §11): parse a `JUCD` bundle, merge root + deltas (§9), and add its collations + property
-  tables to the loaded set. **Additive** — multiple bundles may be loaded; resolution is by name in
-  load order (a name an earlier bundle already provides is kept, §9). The host sources the bytes (file
-  / fetch / compiled-in asset), which is the whole of the "self-contained binary vs. external file"
-  choice — there is no engine-side mode. The loaded set is **engine-global** (a property of the running
-  engine, not of one handle — "the loaded set available to any database on this handle"), which is what
-  lets a host load a bundle **before opening** a file that *references* one of its collations: open
-  resolves the referenced table from the loaded set (§5), and `open` mints the handle, so the data
-  cannot live on the handle. Each core therefore exposes the load as both the `db.` method here and an
-  engine-level call the host may invoke prior to `open` (Rust `jed::load_unicode_data`, Go
-  `jed.LoadUnicodeData`, TS `loadUnicodeData`); both populate the one engine-global set.
+- **`LoadUnicodeData(bytesOrReader)` on an environment builder** ([environment.md](environment.md)) —
+  privileged host op (not SQL-reachable, no path, no I/O in the engine, §11): parse a `JUCD` bundle,
+  merge root + deltas (§9), and add its collations + property tables to the builder's loaded set.
+  **Additive** — multiple bundles may be loaded; resolution is by name in load order (a name an
+  earlier bundle already provides is kept, §9). The host sources the bytes (file / fetch / compiled-in
+  asset), which is the whole of the "self-contained binary vs. external file" choice — there is no
+  engine-side mode. The built `Environment` is immutable and is passed to `open`/`create`, which is
+  what lets a file that *references* a collation be opened: open resolves the referenced table from
+  the handle's environment (§5). The loaded set is **per environment, not process-wide**: two
+  libraries, or two tests, in one process each build their own and cannot interfere, and a database's
+  loaded set never changes while it is open (environment.md §1/§3). Rust
+  `Environment::builder().load_unicode_data(&b)?`, Go `b.LoadUnicodeData(data)`, TS
+  `builder.loadUnicodeData(bytes)`.
 - **`db.SetDefaultCollation(name)` / `db.DefaultCollation()`** set/read the per-database default
   (the name must be in a loaded bundle, else `42704`). Like `db.UpgradeCollations()`, setting it is a
   write: outside a block it commits (publishing only when the value changes); inside an open block it
   stages into the working set and obeys the block's write rules (`25P02` when aborted, `25006` in a
   READ ONLY block).
 - **`db.Collations()`** introspects **this database's referenced** collations; **`db.LoadedCollations()`**
-  introspects the loaded set available on the handle: `name`, `(unicode, cldr)` version, `description`.
+  introspects the loaded set of the handle's environment: `name`, `(unicode, cldr)` version, `description`.
 - the SQL surface (`COLLATE`, per-column collation, `ORDER BY … COLLATE`) **references** loaded
   collations by name.
 
 There is still **no host-ICU import path** — `db.ImportCollation` / `ExportCollation` /
 `LoadHostCollation` do not exist; the only load is of jed's **own pinned bundle** via
-`db.LoadUnicodeData`, which constructs no table (it deserializes pinned bytes) and reaches no host
+the environment builder's `LoadUnicodeData`, which constructs no table (it deserializes pinned bytes) and reaches no host
 data. **`C` is never bundled, loaded, or referenced** — it is table-free and built in.
 
 ## 5. On-disk representation
@@ -660,7 +661,7 @@ compiled artifacts          spec/collation/<ver>/*.coll                         
         ▼
 shippable bundle            *.jucd                                                    (committed / distributed; README §5)
         │   the HOST sources these bytes (file / fetch / include_bytes! / //go:embed / TS asset)
-        │   db.LoadUnicodeData → merge root + deltas → OpenCollation  (production — the ONLY stage that ships)
+        │   builder.LoadUnicodeData → merge root + deltas → OpenCollation  (production — the ONLY stage that ships)
         ▼
 in-memory jed tables → the executor (§6)
 ```
@@ -685,7 +686,7 @@ Three properties make this safe, small, and cheap:
 - **Root-sharing via delta + load-time merge.** Because a tailoring resolves *into* a full table
   (README §2 — `es.coll` and the root differ by a handful of entries), a bundle stores the root once
   and each locale as a **sparse override** (the `single`/`contraction` entries it adds-or-replaces).
-  `db.LoadUnicodeData` performs a deterministic, spec'd **merge** — start from the root maps, apply
+  The environment builder's `LoadUnicodeData` performs a deterministic, spec'd **merge** — start from the root maps, apply
   the delta by key, re-sort — producing a table **byte-identical to the fully-resolved `.coll`** the
   build produced for that locale. The executor (§6) is **unchanged**; only the load gains a merge
   step, and the merge is a §10 byte fixture (`merge(root, es-delta).table == es-full.table`). This is
@@ -751,13 +752,13 @@ Collation is a §8 divergence hotspot handled by the established machinery:
 
 - **Loading is a privileged host op; using is pure** (CLAUDE.md §13). Slice 3 reintroduces a load
   path — but a *narrow, safe* one, categorically unlike the host-ICU read the architecture forbids
-  (§2). `db.LoadUnicodeData` is a **privileged host-API call** taking pinned bundle **bytes** (or a
+  (§2). The environment builder's `LoadUnicodeData` is a **privileged host-API call** taking pinned bundle **bytes** (or a
   reader): it is **not SQL-reachable** (an adversarial query cannot trigger a load), takes **no
   filesystem path** (the engine does no I/O — the host sources the bytes, [hosts.md](hosts.md)), and
   constructs no table from host data (it deserializes + merges jed's **own pinned bytes**, §9). So an
   untrusted query can only ever *use* an already-loaded collation by name, or get `42704`. Using a
   collation is **pure** — a string and a loaded table in, a sort key out; no host reach, no I/O, no
-  nondeterminism. (`db.LoadUnicodeData` / `db.SetDefaultCollation` / introspection are privileged
+  nondeterminism. (The environment builder's `LoadUnicodeData` / `db.SetDefaultCollation` / introspection are privileged
   host-API ops, never on the untrusted surface.) The only thing that ever *read the host*
   (`ExtractHostCollation`) remains **build-time tooling, compiled out of the production engine**
   (§4.1).
@@ -817,7 +818,7 @@ the graded verdict make any genuine version move legible:
   old bake-forever model: after a jed Unicode bump an old file is **read-only until
   `upgrade_collations()`** on the new binary, rather than fully usable forever — accepted because the
   data stays readable, the degradation is legible, and collation versions move rarely.) The migration
-  is a **privileged host op** (like `db.LoadUnicodeData` — §4.2/§11), **not SQL-reachable**: an
+  is a **privileged host op** (like the environment builder's `LoadUnicodeData` — §4.2/§11), **not SQL-reachable**: an
   untrusted query can never trigger it (CLAUDE.md §13), and the host that loaded the new bundle is the
   natural actor. It is **whole-database, per-collation**: the pin is one entry per collation name (§5),
   so a collation's pin may advance only once *every* key under it is rebuilt (else a not-yet-rebuilt
@@ -1084,7 +1085,7 @@ leans on:
 - **COLLATION UPGRADE migration** ✅ *landed (all three cores)*: the 2d follow-on that clears a
   version-skew. A **privileged host op** `db.upgrade_collations()` (Rust `upgrade_collations`, Go
   `UpgradeCollations`, TS `upgradeCollations`) — **not SQL-reachable** (an untrusted query can never
-  trigger it, CLAUDE.md §13), like `db.LoadUnicodeData`. For every collation whose file pin differs
+  trigger it, CLAUDE.md §13), like the environment builder's `LoadUnicodeData`. For every collation whose file pin differs
   from the loaded bundle (`Skewed`) it rebuilds the collated keys under the loaded table and re-pins
   the stamp, clearing the skew so the affected tables are read-write again and their collated indexes
   regain pushdown. **Whole-database, per-collation, atomic** (the pin is one entry per name §5, so all
@@ -1116,9 +1117,9 @@ file entry are all retained (§5), so the on-disk goldens do not move.
   `casing-only` / non-CJK / everything (§13) and `--out`; it writes the canonical
   `spec/collation/fixtures/unicode.jucd` at `non-cjk`. Rust-only build-time tooling, compiled out of
   production (§4.1). `casing-only` is recognized but deferred — its property section is 3e (§16).
-- **3c — the load seam** ✅ **landed:** `db.LoadUnicodeData(bytesOrReader)` in all three cores
+- **3c — the load seam** ✅ **landed:** `LoadUnicodeData(bytesOrReader)` (an environment-builder call, environment.md) in all three cores
   (privileged, bytes/reader, **not** SQL-reachable, no engine I/O — §11, [api.md §10](api.md));
-  `resolveCollation` searches the engine-global **loaded** set (in load order) instead of a compiled-in
+  `resolveCollation` searches the **loaded** set (since environment.md, the handle environment's; originally engine-global) (in load order) instead of a compiled-in
   embed; the unconditional `include_bytes!` / `//go:embed` / base64 embed is **removed** (embedding is
   now a host choice — the host hands the same bytes to `LoadUnicodeData`). `db.Collations` (referenced)
   + `db.LoadedCollations` (loaded set).
@@ -1155,7 +1156,7 @@ Because the only runtime load is of jed's **own pinned bundle** (never host data
 host-collation loading surface to design** — no `CREATE COLLATION … FROM HOST | FROM DEFINITION`, no
 host-ICU import. The only collation surface in a production build *references* an already-loaded
 collation by name (§1); producing the bundle is the build-time pipeline + builder tool (§9), and
-loading it is the single privileged `db.LoadUnicodeData` call (§4).
+loading it is the single privileged `LoadUnicodeData` environment-builder call (§4).
 
 ## 15. Divergences from PostgreSQL
 
@@ -1187,7 +1188,7 @@ Recorded per CLAUDE.md §1:
   collations from the start.
 - **No `CREATE COLLATION` and no host-collation import** (§14); a collation comes from a **loaded jed
   bundle** or it does not exist for that database — there is no SQL DDL to define one and no host-ICU
-  import path (the only load is the privileged `db.LoadUnicodeData` of jed's own pinned bytes, §4).
+  import path (the only load is the privileged environment-builder `LoadUnicodeData` of jed's own pinned bytes, §4).
 - **A conflicted UNION ALL / VALUES column used as a `GROUP BY` key** groups by byte equality
   (§7) and returns the rows; PostgreSQL's hashing / sorting needs a collation and raises `42P22`.
   Relatedly, jed raises a `min`/`max` comparison conflict (`42P22`) when the query is planned, where

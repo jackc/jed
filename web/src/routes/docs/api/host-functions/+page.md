@@ -4,7 +4,7 @@
 
 <svelte:head>
 	<title>Host functions — jed</title>
-	<meta name="description" content="Register your own scalar functions over jed's built-in types: a frozen ExtensionRegistry supplied at open/create, resolved and evaluated beside the built-in catalog. Strict, exact-typed, cost-metered, with single-row or batch kernels." />
+	<meta name="description" content="Register your own scalar functions over jed's built-in types: registered on the immutable Environment supplied at open/create, resolved and evaluated beside the built-in catalog. Strict, exact-typed, cost-metered, with single-row or batch kernels." />
 </svelte:head>
 
 # Host functions
@@ -15,9 +15,10 @@ rule, a scoring formula, a company-specific transform. You register those as **h
 functions** — your own code, callable from SQL by name, resolved and evaluated **beside** the
 built-in catalog.
 
-A host builds an **`ExtensionRegistry`**, adds functions to it, and passes it in the create/open
-options. The engine **freezes the registry for the handle's lifetime** and shares it into every
-session, so the set of functions is fixed once the handle is open. Registering code never mutates
+A host registers functions on an **environment builder**, builds the **`Environment`**, and passes it
+in the create/open options. An environment is immutable — it also carries the loaded Unicode and
+time-zone data and the random and clock sources — so the set of functions is fixed for the handle's
+lifetime and shared into every session. One environment can serve many databases. Registering code never mutates
 schema, and the function itself is never written to the file: a reopening host brings its own. Only
 an index or `CHECK` that uses a host function records which implementation it was built against
 (below).
@@ -114,7 +115,7 @@ whether the code still matches. So an index-backing function declares two more t
 - **`semantic_version`** — a number you bump whenever a change to the results would invalidate keys
   built from the old code.
 
-The file records that dependency. On reopen, if your registry supplies a **different `component_id`**,
+The file records that dependency. On reopen, if your environment supplies a **different `component_id`**,
 a **bumped `semantic_version`**, or **no such function**, the index is treated as **unusable**:
 reads simply skip it (you still get correct rows from a heap scan) and any write that would maintain
 it is refused (`XX002` on a mismatch, `42883` when the function is missing) — never a silently stale
@@ -158,8 +159,8 @@ ALTER TABLE items DROP CONSTRAINT items_sku_check, ADD CONSTRAINT items_sku_chec
 ```
 
 Registration stays a **host-API act, never SQL** — there is no `CREATE FUNCTION` statement, so an
-untrusted query surface can never register or redefine host code. The registry itself is a handle
-setting a reopening host brings; only the *dependency* of an index or check on a function is
+untrusted query surface can never register or redefine host code. The environment itself is a host
+input a reopening host brings; only the *dependency* of an index or check on a function is
 written to the file.
 
 ## The boundary

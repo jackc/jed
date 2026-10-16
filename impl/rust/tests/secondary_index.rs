@@ -202,7 +202,7 @@ fn round_trips_through_the_on_disk_image() {
     run(&mut db, "CREATE INDEX t_v_idx ON t (v)");
     run(&mut db, "INSERT INTO t VALUES (100, NULL, 0)");
     let img = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&img)
+    let mut loaded = Database::from_image(&img, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(loaded.to_image(8192, 1).unwrap(), img, "byte-stable reload");

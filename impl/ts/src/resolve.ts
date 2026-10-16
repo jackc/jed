@@ -155,7 +155,7 @@ import type { ExtractSrc } from "./datetime_fn.ts";
 import { extractField } from "./datetime_fn.ts";
 import type { ColType, Column, CompositeType, Table } from "./catalog.ts";
 import type { RegexProgram } from "./regex.ts";
-import { loadedProperty, sortKey as collationSortKey } from "./collation.ts";
+import { type PropertyTable, sortKey as collationSortKey } from "./collation.ts";
 import { compileRegex, foldRegexPattern } from "./regex.ts";
 import type { Collation } from "./collation.ts";
 import { AGGREGATES, OPERATORS, WINDOWS } from "./operators.ts";
@@ -1067,7 +1067,8 @@ function resolveNode(
             return {
               node: {
                 kind: "constJsonPath",
-                value: jsonPathRender(jsonPathCompile(e.literal.text)),
+                // Canonical text only — a like_regex fold never changes it (no casing table).
+                value: jsonPathRender(jsonPathCompile(e.literal.text, undefined)),
               },
               type: { kind: "jsonpath" },
             };
@@ -1964,7 +1965,9 @@ function resolveNode(
       // pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
       let program: RegexProgram | null = null;
       if (p.rr.kind === "constText") {
-        const pat = e.insensitive ? foldRegexPattern(p.rr.value, loadedProperty()) : p.rr.value;
+        const pat = e.insensitive
+          ? foldRegexPattern(p.rr.value, scope.catalog.environment.property())
+          : p.rr.value;
         program = compileRegex(pat);
       }
       // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so
@@ -3250,10 +3253,11 @@ export function evalJsonpath(
   path: Value,
   opts: JsonPathEvalOpts,
   silent: boolean,
+  prop: PropertyTable | undefined,
   m: Meter,
 ): { seq: JsonNode[]; errored: boolean } | null {
   if (ctx.kind === "null" || path.kind === "null") return null;
-  return evalJsonpathOn(jsonpathContextNode(ctx), path, opts, silent, m);
+  return evalJsonpathOn(jsonpathContextNode(ctx), path, opts, silent, prop, m);
 }
 
 // evalJsonpathOn evaluates a non-NULL jsonpath over an already-read context node: recompiling the
@@ -3264,12 +3268,13 @@ export function evalJsonpathOn(
   path: Value,
   opts: JsonPathEvalOpts,
   silent: boolean,
+  prop: PropertyTable | undefined,
   m: Meter,
 ): { seq: JsonNode[]; errored: boolean } {
   if (path.kind !== "jsonpath") {
     throw new Error("resolver restricts a jsonpath argument to jsonpath");
   }
-  const compiled = jsonPathCompileMetered(path.text, m);
+  const compiled = jsonPathCompileMetered(path.text, m, prop);
   if (silent) return jsonPathEvalSilent(compiled, node, opts, m);
   return { seq: jsonPathEval(compiled, node, opts, m), errored: false };
 }

@@ -84,7 +84,7 @@ func hostDepArgCodes(d hostFuncDep) []byte {
 //     even a volatile one — silently passed the syntactic immutability walk.)
 //
 // Deduplicated by (name, arg types); the caller sorts for a stable on-disk order.
-func collectIndexHostDeps(node *rExpr, reg *ExtensionRegistry, out *[]hostFuncDep) error {
+func collectIndexHostDeps(node *rExpr, reg *hostRegistry, out *[]hostFuncDep) error {
 	return collectHostDeps(node, reg, true, "an index expression", out)
 }
 
@@ -93,7 +93,7 @@ func collectIndexHostDeps(node *rExpr, reg *ExtensionRegistry, out *[]hostFuncDe
 // has no volatility gate — the built-in rule admits CHECK (ts < now()), and nothing relies on a
 // check being immutable — but each host function must declare a component identity (42P17) so a
 // swapped implementation is detectable. nil for a check that calls no host function.
-func collectCheckHostDeps(node *rExpr, reg *ExtensionRegistry) ([]hostFuncDep, error) {
+func collectCheckHostDeps(node *rExpr, reg *hostRegistry) ([]hostFuncDep, error) {
 	var deps []hostFuncDep
 	if err := collectHostDeps(node, reg, false, "a check constraint", &deps); err != nil {
 		return nil, err
@@ -116,7 +116,7 @@ func sortHostDeps(deps []hostFuncDep) {
 // collectHostDeps is the shared walk behind collectIndexHostDeps / collectCheckHostDeps: it admits
 // each host call (requireImmutable only for an index) and appends one dependency per distinct
 // (name, arg types) signature to out.
-func collectHostDeps(node *rExpr, reg *ExtensionRegistry, requireImmutable bool, site string, out *[]hostFuncDep) error {
+func collectHostDeps(node *rExpr, reg *hostRegistry, requireImmutable bool, site string, out *[]hostFuncDep) error {
 	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
 		hf := reg.function(n.index)
 		if requireImmutable && hf.volatility != VolatilityImmutable {
@@ -151,7 +151,7 @@ func collectHostDeps(node *rExpr, reg *ExtensionRegistry, requireImmutable bool,
 // (resolveIndex's error → the planner skips the index, a correct heap scan) and a WRITE propagates
 // (the table is read-only until a rebuild). A MISSING function is caught earlier by resolution itself
 // (42883). A no-op for an index that records no host dependency.
-func verifyIndexHostDeps(node *rExpr, reg *ExtensionRegistry, deps []hostFuncDep) error {
+func verifyIndexHostDeps(node *rExpr, reg *hostRegistry, deps []hostFuncDep) error {
 	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
 		if hostDepMatches(reg.function(n.index), deps) {
 			return nil
@@ -166,7 +166,7 @@ func verifyIndexHostDeps(node *rExpr, reg *ExtensionRegistry, deps []hostFuncDep
 // host call the resolved check makes must match a dependency persisted with it, else XX002. Unlike an
 // index there is no read-side fallback to take — only a statement that evaluates the check resolves it.
 // A check that persisted no dependency but now resolves to a host function fails the same way.
-func verifyCheckHostDeps(name string, node *rExpr, reg *ExtensionRegistry, deps []hostFuncDep) error {
+func verifyCheckHostDeps(name string, node *rExpr, reg *hostRegistry, deps []hostFuncDep) error {
 	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
 		if hostDepMatches(reg.function(n.index), deps) {
 			return nil
@@ -962,7 +962,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		}
 		// Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a component
 		// identity (42P17), and the resolved dependencies persist with the check.
-		if checkDeps[i], err = collectCheckHostDeps(node, db.session.extensions); err != nil {
+		if checkDeps[i], err = collectCheckHostDeps(node, db.session.env.hosts); err != nil {
 			return outcome{}, err
 		}
 	}
@@ -1513,7 +1513,7 @@ func (db *engine) resolveChecksWithParams(table *catTable, ptypes *paramTypes) (
 		}
 		// Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match the
 		// dependency persisted with the check, else XX002 before any mutation.
-		if err := verifyCheckHostDeps(table.Checks[i].Name, node, db.session.extensions, table.Checks[i].HostDeps); err != nil {
+		if err := verifyCheckHostDeps(table.Checks[i].Name, node, db.session.env.hosts, table.Checks[i].HostDeps); err != nil {
 			return nil, err
 		}
 		out = append(out, namedCheck{name: table.Checks[i].Name, node: node})
@@ -1568,7 +1568,7 @@ func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, er
 
 func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *paramTypes) (resolvedIndex, error) {
 	ptypes.uncacheable = ptypes.uncacheable || def.TimezoneDeps.Dynamic
-	if err := verifyIndexTimezoneDeps(def.TimezoneDeps); err != nil {
+	if err := verifyIndexTimezoneDeps(def.TimezoneDeps, db.session.env); err != nil {
 		return resolvedIndex{}, err
 	}
 	keys := make([]resolvedKey, 0, len(def.Keys))
@@ -1613,7 +1613,7 @@ func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *
 	// write propagates (the table is read-only until a rebuild). A no-op for the common index that
 	// records no host dependency.
 	if len(def.HostDeps) > 0 {
-		reg := db.session.extensions
+		reg := db.session.env.hosts
 		for i := range keys {
 			if keys[i].Expr != nil {
 				if err := verifyIndexHostDeps(keys[i].Expr, reg, def.HostDeps); err != nil {
@@ -3476,7 +3476,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			// Collect + admit any host functions the key expression calls (§8.1, step 4): each must be
 			// IMMUTABLE + carry a component identity, else 42P17 (this also closes the latent leak where a
 			// volatile host function passed the syntactic immutability walk above).
-			if err := collectIndexHostDeps(node, db.session.extensions, &hostDeps); err != nil {
+			if err := collectIndexHostDeps(node, db.session.env.hosts, &hostDeps); err != nil {
 				return outcome{}, err
 			}
 			// The result type must be key-encodable (a composite result is 0A000).
@@ -3557,7 +3557,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 		// Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as a key
 		// expression (IMMUTABLE + component identity, else 42P17).
-		if err := collectIndexHostDeps(pnode, db.session.extensions, &hostDeps); err != nil {
+		if err := collectIndexHostDeps(pnode, db.session.env.hosts, &hostDeps); err != nil {
 			return outcome{}, err
 		}
 		timezoneDeps.merge(pt.timezoneDeps)

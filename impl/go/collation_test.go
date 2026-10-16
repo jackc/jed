@@ -14,18 +14,12 @@ import (
 	"testing"
 )
 
-// loadFixtureBundle loads jed's pinned production JUCD bundle (spec/collation/fixtures/unicode.jucd)
-// into the engine-global loaded set — the production read path the cores now take (no embed).
-// Idempotent (the set is global + first-wins).
-func loadFixtureBundle(t *testing.T) {
+// loadFixtureBundle returns an Environment with jed's pinned production JUCD bundle
+// (spec/collation/fixtures/unicode.jucd) loaded — the production read path the cores take (no
+// embed). Cached and shared (an Environment is immutable; see testEnv).
+func loadFixtureBundle(t *testing.T) *Environment {
 	t.Helper()
-	data, err := os.ReadFile(specPath(t, "collation/fixtures/unicode.jucd"))
-	if err != nil {
-		t.Fatalf("read unicode.jucd: %v", err)
-	}
-	if err := LoadUnicodeData(data); err != nil {
-		t.Fatalf("load unicode.jucd: %v", err)
-	}
+	return testEnv("unicode")
 }
 
 func collDefinition(t *testing.T, files []string) string {
@@ -83,7 +77,7 @@ func TestCollationCompilerMatchesVectors(t *testing.T) {
 
 func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 	t.Parallel()
-	loadFixtureBundle(t)
+	env := loadFixtureBundle(t)
 	rows := readTomlTables(t, specPath(t, "collation/vectors/sortkey.toml"), "sortkey")
 	if len(rows) == 0 {
 		t.Fatal("no sortkey vectors")
@@ -99,7 +93,7 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 			// The real version-pinned collations (unicode, es) resolve from the loaded production
 			// bundle (the host-load read path), not by recompiling their ~2.3 MB source. The small dev
 			// fixtures (not in the bundle) fall back to compiling from their definition files.
-			if vc := LoadedCollation(collName); vc != nil {
+			if vc := env.collation(collName); vc != nil {
 				coll = vc
 			} else {
 				c, err := compileCollation(collName, collDefinition(t, row.strs("def_files")))
@@ -211,7 +205,7 @@ func TestCollationOpenRejectsTamperedArtifact(t *testing.T) {
 // TestCasingKernels pins the casing kernels' DIVERGENCES from the PG/glibc oracle (collation.md §16) —
 // what the oracle corpus cannot express (CLAUDE.md §10): the ASCII baseline (non-ASCII passes through)
 // and full SpecialCasing (ß→SS). The kernels take an EXPLICIT property table, so the un-loaded (ASCII)
-// regime is deterministic regardless of the engine-global loaded set. Mirrors collation.rs casing_tests.
+// regime is deterministic regardless of any loaded bundle. Mirrors collation.rs casing_tests.
 func TestCasingKernels(t *testing.T) {
 	t.Parallel()
 	p := &propertyTable{

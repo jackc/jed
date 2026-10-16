@@ -15,11 +15,16 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{CreateOptions, Database, SUPPORTED_CAPABILITIES, Session as JedSession};
+use jed::{
+    ClockSource, CreateOptions, Database, Environment, RandomSource, SUPPORTED_CAPABILITIES,
+    Session as JedSession,
+};
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 // The stepped-threaded mode (and its channel/thread machinery) is test-only — gate its imports so
 // the ordinary `cargo run --bin conformance` build (sequential mode) carries no unused imports.
 #[cfg(test)]
@@ -220,19 +225,14 @@ fn parse_load_collation_directive(rest: &str) -> Option<(String, Vec<String>)> {
     Some((name.trim().to_string(), files))
 }
 
-/// Make a collation named `name` available to the records that follow (spec/design/collation.md
-/// §2/§9/§10). The harness acts as the *host*: it loads jed's own pinned production `JUCD` bundle
-/// (spec/collation/fixtures/unicode.jucd) into the engine-global set via `db.LoadUnicodeData`
-/// (idempotent — the set is global), exactly as a production host would, then asserts the named
-/// collation now resolves. A name no loaded bundle provides fails the test file, naming it.
-fn load_collation(name: &str) -> std::result::Result<(), String> {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("load-collation: read {}: {e}", path.display()))?;
-    jed::load_unicode_data(&bytes)
-        .map_err(|e| format!("load-collation: load unicode.jucd: {}", e.message))?;
-    if jed::loaded_collation(name).is_some() {
+/// Assert a collation named `name` is available to the records that follow (spec/design/collation.md
+/// §2/§9/§10). The harness acts as the *host*: a file carrying `# load-collation:` runs in an
+/// environment that loaded jed's own pinned production `JUCD` bundle
+/// (spec/collation/fixtures/unicode.jucd), exactly as a production host would ([`file_environment`]);
+/// the directive then asserts the named collation resolves. A name the bundle does not provide fails
+/// the test file, naming it.
+fn load_collation(env: &Environment, name: &str) -> std::result::Result<(), String> {
+    if env.loaded_collations().iter().any(|c| c.name == name) {
         return Ok(());
     }
     Err(format!(
@@ -249,17 +249,13 @@ fn parse_load_timezone_directive(rest: &str) -> Option<String> {
     Some(body.to_string())
 }
 
-/// Make the IANA time zones available to the records that follow (timezones.md §3.3/§11). The harness
-/// acts as the *host*: it loads jed's pinned production `JTZ` bundle (spec/tz/fixtures/tzdata.jtz)
-/// into the engine-global set via `db.LoadTimeZoneData` (idempotent — the set is global), then, if a
-/// zone name was given, asserts it now resolves. A named zone no loaded bundle provides fails the file.
-fn load_timezone(name: &str) -> std::result::Result<(), String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/tz/fixtures/tzdata.jtz");
-    let bytes =
-        std::fs::read(&path).map_err(|e| format!("load-timezone: read {}: {e}", path.display()))?;
-    jed::load_time_zone_data(&bytes)
-        .map_err(|e| format!("load-timezone: load tzdata.jtz: {}", e.message))?;
-    if name.is_empty() || jed::resolve_zone(name).is_some() {
+/// Assert the IANA time zones are available to the records that follow (timezones.md §3.3/§11). The
+/// harness acts as the *host*: a file carrying `# load-timezone:` runs in an environment that loaded
+/// jed's pinned production `JTZ` bundle (spec/tz/fixtures/tzdata.jtz) ([`file_environment`]); if a
+/// zone name was given, the directive asserts it resolves. A named zone the bundle does not provide
+/// fails the file.
+fn load_timezone(env: &Environment, name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() || jed::tooling::timezone::resolve_zone(env, name).is_some() {
         return Ok(());
     }
     Err(format!(
@@ -360,26 +356,164 @@ fn parse_upgrade_collations_directive(rest: &str) -> bool {
 /// point), then reconstructs the database in memory via `from_image`. The handle is read-WRITE so a
 /// write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 /// read-only-handle error.
-fn open_fixture(rel: &str) -> std::result::Result<Database, String> {
-    open_fixture_image(rel)?.map_err(|e| format!("fixture: open {rel}: {}", e.message))
+fn open_fixture(rel: &str, env: &Environment) -> std::result::Result<Database, String> {
+    open_fixture_image(rel, env)?.map_err(|e| format!("fixture: open {rel}: {}", e.message))
 }
 
 /// [`open_fixture`]'s open, keeping the engine error: the outer `Err` is a harness failure (the image
-/// could not be read), the inner result is the engine's verdict on the image.
+/// could not be read), the inner result is the engine's verdict on the image. The image opens in the
+/// file's environment `env`, which carries the Unicode bundle for a `# fixture:` file
+/// ([`file_environment`]).
 fn open_fixture_image(
     rel: &str,
+    env: &Environment,
 ) -> std::result::Result<std::result::Result<Database, jed::EngineError>, String> {
-    let bundle =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
-    if let Ok(bytes) = std::fs::read(&bundle) {
-        let _ = jed::load_unicode_data(&bytes); // idempotent: the loaded set is engine-global
-    }
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../spec")
         .join(rel);
     let bytes =
         std::fs::read(&path).map_err(|e| format!("fixture: read {}: {e}", path.display()))?;
-    Ok(Database::from_image(&bytes))
+    Ok(Database::from_image(&bytes, env.clone()))
+}
+
+/// The harness's own random source (spec/design/environment.md §4): OS randomness, except while a
+/// record carrying `# seed:` runs, when it draws from the provided seeded stream, reseeded before that
+/// record. Installed in the environment of every database a file runs against.
+struct HarnessRandom {
+    os: Arc<dyn RandomSource>,
+    seeded: Arc<jed::SeededRandom>,
+    use_seeded: AtomicBool,
+}
+
+impl RandomSource for HarnessRandom {
+    fn fill(&self, buf: &mut [u8]) -> jed::Result<()> {
+        if self.use_seeded.load(Ordering::SeqCst) {
+            self.seeded.fill(buf)
+        } else {
+            self.os.fill(buf)
+        }
+    }
+}
+
+/// The harness's own clock source: the wall clock, except while a record carrying `# clock:` (a
+/// manual clock, set before the record) or `# clock_advance:` (an advancing clock, reset before the
+/// record) runs.
+struct HarnessClock {
+    wall: Arc<dyn ClockSource>,
+    manual: Arc<jed::ManualClock>,
+    advancing: Arc<jed::AdvancingClock>,
+    /// Which clock reads answer: [`CLOCK_WALL`], [`CLOCK_MANUAL`], or [`CLOCK_ADVANCING`].
+    mode: AtomicU8,
+}
+
+const CLOCK_WALL: u8 = 0;
+const CLOCK_MANUAL: u8 = 1;
+const CLOCK_ADVANCING: u8 = 2;
+
+impl ClockSource for HarnessClock {
+    fn now_micros(&self) -> i64 {
+        match self.mode.load(Ordering::SeqCst) {
+            CLOCK_MANUAL => self.manual.now_micros(),
+            CLOCK_ADVANCING => self.advancing.now_micros(),
+            _ => self.wall.now_micros(),
+        }
+    }
+}
+
+/// The switchable random + clock sources one test file's databases share.
+struct HarnessSources {
+    random: Arc<HarnessRandom>,
+    clock: Arc<HarnessClock>,
+}
+
+impl HarnessSources {
+    fn new() -> Self {
+        HarnessSources {
+            random: Arc::new(HarnessRandom {
+                os: jed::os_random_source(),
+                seeded: jed::seeded_random_source(0),
+                use_seeded: AtomicBool::new(false),
+            }),
+            clock: Arc::new(HarnessClock {
+                wall: jed::wall_clock(),
+                manual: jed::manual_clock(0),
+                advancing: jed::advancing_clock(0, 0),
+                mode: AtomicU8::new(CLOCK_WALL),
+            }),
+        }
+    }
+
+    /// Switch the sources for the next record (entropy.md §6): `# seed:` reseeds the seeded stream,
+    /// `# clock_advance:` (which takes precedence over `# clock:`; a record uses at most one) resets
+    /// the advancing clock, `# clock:` sets the manual clock. A record without one reads OS entropy /
+    /// the wall clock, so a directive never leaks forward.
+    fn apply(&self, seed: Option<u64>, clock: Option<i64>, clock_advance: Option<(i64, i64)>) {
+        match seed {
+            Some(s) => {
+                self.random.seeded.reseed(s);
+                self.random.use_seeded.store(true, Ordering::SeqCst);
+            }
+            None => self.random.use_seeded.store(false, Ordering::SeqCst),
+        }
+        let mode = match (clock_advance, clock) {
+            (Some((start, step)), _) => {
+                self.clock.advancing.reset(start, step);
+                CLOCK_ADVANCING
+            }
+            (None, Some(c)) => {
+                self.clock.manual.set(c);
+                CLOCK_MANUAL
+            }
+            (None, None) => CLOCK_WALL,
+        };
+        self.clock.mode.store(mode, Ordering::SeqCst);
+    }
+
+    /// The environment a test file's databases run in: these sources, plus jed's pinned production
+    /// bundles when the file asks for them — the Unicode bundle for `# load-collation:` (and for a
+    /// `# fixture:` image, which may reference a collation), the time-zone bundle for
+    /// `# load-timezone:`. Loaded before the database is created, as a host loads at startup; a
+    /// directive in the file then asserts the name it needs resolves.
+    fn file_environment(&self, text: &str) -> std::result::Result<Environment, String> {
+        let mut unicode = false;
+        let mut tz = false;
+        for line in text.lines() {
+            let Some(rest) = line.trim().strip_prefix('#') else {
+                continue;
+            };
+            if parse_load_collation_directive(rest).is_some()
+                || parse_fixture_directive(rest).is_some()
+            {
+                unicode = true;
+            } else if parse_load_timezone_directive(rest).is_some() {
+                tz = true;
+            }
+        }
+        let random: Arc<dyn RandomSource> = self.random.clone();
+        let clock: Arc<dyn ClockSource> = self.clock.clone();
+        let mut builder = Environment::builder()
+            .random_source(random)
+            .clock_source(clock);
+        if unicode {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../spec/collation/fixtures/unicode.jucd");
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("load-collation: read {}: {e}", path.display()))?;
+            builder = builder
+                .load_unicode_data(&bytes)
+                .map_err(|e| format!("load-collation: load unicode.jucd: {}", e.message))?;
+        }
+        if tz {
+            let path =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/tz/fixtures/tzdata.jtz");
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("load-timezone: read {}: {e}", path.display()))?;
+            builder = builder
+                .load_time_zone_data(&bytes)
+                .map_err(|e| format!("load-timezone: load tzdata.jtz: {}", e.message))?;
+        }
+        Ok(builder.build())
+    }
 }
 
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -816,6 +950,10 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     // then the files are removed.
     let tmp_path = if disk { Some(disk_temp_path()) } else { None };
     let _guard = TempGuard(tmp_path.clone());
+    // The file's environment: the harness's switchable sources plus the bundles it asks for. Every
+    // database the file runs against (the fresh one, a disk-mode reopen, a fixture) uses it.
+    let sources = HarnessSources::new();
+    let env = sources.file_environment(text)?;
     // In DISK mode the file is a temp .jed image reopened before every record (below), so each
     // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
     // (spec/design/conformance.md §3).
@@ -826,11 +964,16 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         Some(p) => Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(p)),
             skip_fsync: true,
+            environment: env.clone(),
             ..Default::default()
         })
         .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
         None => {
-            let db = Database::create(CreateOptions::default()).unwrap();
+            let db = Database::create(CreateOptions {
+                environment: env.clone(),
+                ..Default::default()
+            })
+            .unwrap();
             // Forced temp spill (`JED_CONFORMANCE_TEMP_BUFFERS`, temp-tables.md §6): an in-memory
             // database has no spill target, so give it one — temp domains then spill to scratch files.
             if forced_temp_buffers().is_some() {
@@ -895,17 +1038,17 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
             // `# load-collation:` is an ACTION (assert available now), not a pending assertion: the
-            // named collation must be vendored in this build before the records run
-            // (spec/design/collation.md §2/§9/§10).
+            // file's environment carries the Unicode bundle, and the named collation must be in it
+            // before the records run (spec/design/collation.md §2/§9/§10).
             if let Some((name, _files)) = parse_load_collation_directive(rest) {
-                load_collation(&name)?;
+                load_collation(&env, &name)?;
                 continue;
             }
-            // `# load-timezone: [<zone>]` is an ACTION: load jed's pinned `JTZ` bundle into the
-            // engine-global set (and optionally assert a zone resolves) before the records that use
+            // `# load-timezone: [<zone>]` is an ACTION: the file's environment carries jed's pinned
+            // `JTZ` bundle; optionally assert a zone resolves before the records that use
             // `AT TIME ZONE` (timezones.md §11).
             if let Some(name) = parse_load_timezone_directive(rest) {
-                load_timezone(&name)?;
+                load_timezone(&env, &name)?;
                 continue;
             }
             // `# attach: <name>` (file-level) attaches a fresh empty read-write in-memory database to
@@ -932,7 +1075,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 if let Some(want) = want_code {
                     // `# fixture: <path> error <SQLSTATE>`: the open itself must fail with that code;
                     // the file has no records.
-                    return match open_fixture_image(&rel)? {
+                    return match open_fixture_image(&rel, &env)? {
                         Ok(_) => Err(format!("fixture {rel} opened, expected error {want}")),
                         Err(e) if e.code() == want => Ok(()),
                         Err(e) => Err(format!(
@@ -942,7 +1085,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                         )),
                     };
                 }
-                db = open_fixture(&rel)?;
+                db = open_fixture(&rel, &env)?;
                 sess = db.session(jed::SessionOptions::default());
                 on_temp = false; // the handle is now the fixture image, not the reopenable temp file
                 continue;
@@ -1028,6 +1171,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 p,
                 jed::OpenOptions {
                     skip_fsync: true, // fsync=off (throwaway image)
+                    environment: env.clone(),
                     ..Default::default()
                 },
             )
@@ -1062,19 +1206,13 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 .take()
                 .unwrap_or(jed::DEFAULT_MAX_SQL_LENGTH),
         );
-        // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
-        // §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
-        match pending_seed.take() {
-            Some(s) => sess.set_random_source(jed::seeded_random_source(s)),
-            None => sess.clear_random_source(),
-        }
-        // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one);
-        // a record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
-        match (pending_clock_advance.take(), pending_clock.take()) {
-            (Some((start, step)), _) => sess.set_clock_source(jed::advancing_clock(start, step)),
-            (None, Some(c)) => sess.set_clock_source(jed::fixed_clock(c)),
-            (None, None) => sess.clear_clock_source(),
-        }
+        // Switch the environment's sources for this record's entropy seed + statement clock
+        // (entropy.md §6); absent ⇒ OS entropy / wall clock, so a directive never leaks forward.
+        sources.apply(
+            pending_seed.take(),
+            pending_clock.take(),
+            pending_clock_advance.take(),
+        );
         // Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to
         // fully permissive (every table privilege, DDL allowed), then layer the pending directives,
         // so a `# default_privileges:` / `# grant:` / `# revoke:` / `# allow_ddl:` decorates only its
@@ -1232,7 +1370,13 @@ fn rebaseline_file(text: &str) -> Option<String> {
         return None;
     }
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
-    let mut db = Database::create(CreateOptions::default()).unwrap();
+    let sources = HarnessSources::new();
+    let env = sources.file_environment(text).ok()?;
+    let mut db = Database::create(CreateOptions {
+        environment: env.clone(),
+        ..Default::default()
+    })
+    .unwrap();
     // One explicit session per file (see `run_file`): `Database` no longer keeps a persistent
     // default session, so the cost walk drives the same per-file session it would in `run_file`.
     let mut sess = db.session(jed::SessionOptions::default());
@@ -1256,12 +1400,12 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 // Mirror `run_file`: a fixture file evolves DB state from the pre-built image, not a
                 // fresh DB, so the cost walk sees the same starting state. (An open-error fixture
                 // fails here and the file has no records to walk.)
-                db = open_fixture(&rel).ok()?;
+                db = open_fixture(&rel, &env).ok()?;
                 sess = db.session(jed::SessionOptions::default());
             } else if let Some(name) = parse_load_timezone_directive(rest) {
-                // Mirror `run_file`: load the bundle so a named-zone record runs (and accrues cost)
-                // during the cost walk (timezones.md §11).
-                load_timezone(&name).ok()?;
+                // Mirror `run_file`: the environment carries the bundle so a named-zone record runs
+                // (and accrues cost) during the cost walk (timezones.md §11).
+                load_timezone(&env, &name).ok()?;
             } else if let Some(z) = parse_timezone_directive(rest) {
                 // The session zone does not change cost (zone-agnostic), but set it so the record
                 // re-executes identically to `run_file`.
@@ -1301,15 +1445,11 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 .take()
                 .unwrap_or(jed::DEFAULT_MAX_SQL_LENGTH),
         );
-        match pending_seed.take() {
-            Some(s) => sess.set_random_source(jed::seeded_random_source(s)),
-            None => sess.clear_random_source(),
-        }
-        match (pending_clock_advance.take(), pending_clock.take()) {
-            (Some((start, step)), _) => sess.set_clock_source(jed::advancing_clock(start, step)),
-            (None, Some(c)) => sess.set_clock_source(jed::fixed_clock(c)),
-            (None, None) => sess.clear_clock_source(),
-        }
+        sources.apply(
+            pending_seed.take(),
+            pending_clock.take(),
+            pending_clock_advance.take(),
+        );
         let params = std::mem::take(&mut pending_params);
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();

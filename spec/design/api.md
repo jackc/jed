@@ -729,9 +729,11 @@ the values unknown.
 | rows affected (§4) | `rows.rows_affected() -> Option<i64>` | `rows.RowsAffected() (int64, bool)` | `rows.rowsAffected: number \| null` |
 | set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
 | set input-size limit (§8) | `db.set_max_sql_length(bytes)` | `db.SetMaxSQLLength(bytes)` | `db.setMaxSqlLength(bytes)` |
-| inject random source (§10) | `db.set_random_source(f)` / `db.clear_random_source()` | `db.SetRandomSource(f)` / `db.ClearRandomSource()` | `db.setRandomSource(f)` / `db.clearRandomSource()` |
-| inject clock source (§10) | `db.set_clock_source(f)` / `db.clear_clock_source()` | `db.SetClockSource(f)` / `db.ClearClockSource()` | `db.setClockSource(f)` / `db.clearClockSource()` |
-| load Unicode data (collation.md §4) | `db.load_unicode_data(r)` | `db.LoadUnicodeData(r)` | `db.loadUnicodeData(bytes)` |
+| build an environment (§10, environment.md) | `Environment::builder()…build()` | `NewEnvironmentBuilder()` … `b.Build()` | `Environment.builder()…build()` |
+| install an environment | `CreateOptions { environment, .. }` / `OpenOptions { environment, .. }` | `CreateOptions{Environment: env}` / `OpenOptions{Environment: env}` | `createDatabase({ environment })` / `openDatabase(path, { environment })` |
+| read the handle's environment | `db.environment()` | `db.Environment()` | `db.environment()` |
+| load Unicode / time-zone data (collation.md §4, timezones.md §3.3) | `builder.load_unicode_data(&b)?` / `.load_time_zone_data(&b)?` | `b.LoadUnicodeData(data)` / `b.LoadTimeZoneData(data)` | `builder.loadUnicodeData(bytes)` / `.loadTimeZoneData(bytes)` |
+| install random / clock source (§10) | `builder.random_source(s)` / `.clock_source(c)` | `b.SetRandomSource(s)` / `b.SetClockSource(c)` | `builder.randomSource(s)` / `.clockSource(c)` |
 | upgrade collations — clear a version-skew (collation.md §12) | `db.upgrade_collations() -> usize` | `db.UpgradeCollations() (int, error)` | `db.upgradeCollations(): number` |
 | attach a database (attached-databases.md §4) | `db.attach(name, source, read_only) -> Result<()>` | `db.Attach(name, source, readOnly) error` | `db.attach(name, source, readOnly): void` |
 | detach a database | `db.detach(name) -> Result<()>` | `db.Detach(name) error` | `db.detach(name): void` |
@@ -905,44 +907,53 @@ input-size cap cross-core.
   entry points are `createOpfs`/`openOpfs` (async, see the §6 note); the synchronous core is unchanged.
 - **No low-level direct-access API** — kept open, not built ([storage.md](storage.md) §5).
 
-## 10. Entropy + clock seam (`set_random_source` / `set_clock_source`)
+## 10. The environment — entropy, clock, and loaded data
+
+Every input the engine takes from outside itself, except storage, arrives in one immutable
+**`Environment`** ([environment.md](environment.md)) passed to `create`/`open`: the loaded Unicode
+and time-zone data, the host functions (§12), and the random and clock sources. An environment is
+produced by a builder and has no mutating methods, so a database's outside inputs never change while
+it is open; `env.to_builder()` derives a variant that shares the original's contents. One environment
+may serve any number of databases; each handle (its sessions, attachments, and temp domains) uses
+exactly one. A missing environment means a **fresh, empty** one — `C` collation and ASCII casing,
+`UTC` and fixed offsets, no host functions, OS entropy, the wall clock — never a process-wide
+default.
 
 The volatile UUID generators (`uuidv4`, `uuidv7`) and the current-time functions
-(`now()`/`current_timestamp`, `clock_timestamp()`) read two host inputs behind seams
-([entropy.md](entropy.md), [determinism.md](determinism.md) §5) so they stay deterministic given
-those inputs. The inputs are injected as **functions**, each defaulting to the platform primitive.
-Like `max_cost`/`work_mem`, they are **handle settings** — not stored in the file, not per-statement
-arguments — configured once on whatever handle runs them:
+(`now()`/`current_timestamp`, `clock_timestamp()`) read the environment's two sources
+([entropy.md](entropy.md), [determinism.md](determinism.md) §5), so they stay deterministic given the
+environment:
 
-- **`set_random_source(f)` / `clear_random_source()`** — inject a function that fills N random bytes
-  (the deterministic / reproducible path) or clear it. **The default draws from the OS CSPRNG per
-  value, so production UUIDs are unpredictable** — not derived from a single seeded PRNG. The engine
-  provides **`seeded_random_source(u64)`** (a byte-exact splitmix64 stream — entropy.md §2) for the
-  reproducible path; the conformance corpus injects it via the **`# seed:`** directive
+- **Random source** — fills N random bytes. **The default draws from the OS CSPRNG per value, so
+  production UUIDs are unpredictable** — not derived from a single seeded PRNG. The engine provides
+  a **seeded source** (a byte-exact splitmix64 stream — entropy.md §2) for the reproducible path,
+  reseedable in place; the conformance corpus drives it via the **`# seed:`** directive
   ([conformance.md](conformance.md) §4).
-- **`set_clock_source(f)` / `clear_clock_source()`** — inject a function returning micros since the
-  Unix epoch that `uuidv7` embeds and that `now()`/`current_timestamp` (read once per statement) and
-  `clock_timestamp()` (read per call) return, or clear it (the default: the wall clock — entropy.md
-  §5). The engine provides **`fixed_clock(i64)`** (a frozen instant) and **`advancing_clock(start,
-  step)`** (returns `start, start+step, …`, one increment per read — distinguishes the per-call
-  `clock_timestamp()` from the statement-stable `now()`); the corpus injects them via the
-  **`# clock:`** and **`# clock_advance:`** directives.
+- **Clock source** — returns micros since the Unix epoch that `uuidv7` embeds and that
+  `now()`/`current_timestamp` (read once per statement) and `clock_timestamp()` (read per call)
+  return (the default: the wall clock — entropy.md §5). The engine provides a **manual clock**
+  (`set`/`advance`) and an **advancing clock** (returns `start, start+step, …`, one increment per
+  read, `reset`-able — distinguishes the per-call `clock_timestamp()` from the statement-stable
+  `now()`); the corpus drives them via the **`# clock:`** and **`# clock_advance:`** directives.
 
-Defaults (unset) read **OS entropy per value** and the **wall clock**: Go `crypto/rand` + `time`, TS
-`node:crypto` + `Date`, Rust the `getrandom` crate (the one core dependency, CLAUDE.md §14) +
-`SystemTime`. Neither setting changes what a non-generator query observes; a generator's *cost* is
-invariant to both (one `operator_eval` per call). An out-of-range injected clock makes `uuidv7`
-trap `22008`.
+A source is an object; the environment fixes *which* source is installed, and the host keeps a
+reference to control its state (entropy.md §6). Defaults read **OS entropy per value** and the
+**wall clock**: Go `crypto/rand` + `time`, TS `node:crypto` + `Date`, Rust the `getrandom` crate
+(CLAUDE.md §14) + `SystemTime`. Neither source changes what a non-generator query observes; a
+generator's *cost* is invariant to both (one `operator_eval` per call). An out-of-range clock makes
+`uuidv7` trap `22008`.
 
-**Unicode-data load (a separate, load-time seam).** Collation tables and Unicode casing data are not
-built into the engine — a host loads them via **`db.load_unicode_data(bytesOrReader)`** (privileged,
+**Unicode-data load.** Collation tables and Unicode casing data are not
+built into the engine — a host loads them into the environment via the builder's
+**`load_unicode_data(bytesOrReader)`** (privileged,
 bytes or a reader, **never a path**, **not** SQL-reachable), handing the engine a pinned `JUCD`
 bundle's bytes ([collation.md §4/§9](collation.md)). Unlike the entropy/clock seam this is **not** a
 per-query draw and introduces no nondeterminism — the bytes are jed's own pinned data; like the
 storage seam, the host owns where they come from (a file, a fetch, or a compiled-in `include_bytes!` /
 `//go:embed` / bundled asset) and the engine does no I/O. A bare binary with no bundle loaded is `C`
-collation + ASCII casing only ([collation.md §16](collation.md)). It is a handle setting, additive
-across calls, never a per-statement argument. The sibling **`db.upgrade_collations()`** is the same
+collation + ASCII casing only ([collation.md §16](collation.md)). It is part of the environment,
+additive across builder calls, never a per-statement argument. Time-zone data loads the same way
+(`load_time_zone_data`, [timezones.md §3.3](timezones.md)). The sibling **`db.upgrade_collations()`** is the same
 kind of privileged, not-SQL-reachable host op: after loading a *newer* bundle, it adopts that version
 for this database — rebuilding the collated keys whose pin is now skewed and re-pinning the stamp, so
 the affected tables are read-write again ([collation.md §12](collation.md)). Whole-database, atomic,
@@ -1179,12 +1190,13 @@ native mapping (follow-up (a) above) and the same ergonomic surface on the share
 
 ---
 
-## 12. Host extensions — scalar functions (`ExtensionRegistry`)
+## 12. Host extensions — scalar functions (on the environment)
 
 A host may register its own **scalar functions over the built-in types** and expose them to SQL
-(spec/design/extensibility.md §4.2 / §14 step 3). The host builds an **`ExtensionRegistry`**, adds
-functions to it, and passes it in the create/open options; the engine **freezes it for the handle's
-lifetime** and shares it into every session (§7 — registration is a **host-API act, never SQL**:
+(spec/design/extensibility.md §4.2 / §14 step 3). The host registers functions on an **environment
+builder** (§10, [environment.md](environment.md) §5) and passes the built `Environment` in the
+create/open options; the environment is immutable, so the function set is **frozen for the handle's
+lifetime** and shared into every session (§7 — registration is a **host-API act, never SQL**:
 there is no `CREATE FUNCTION … LANGUAGE HOST` DDL, which keeps it off the untrusted-query surface).
 This is the *function seam* of extensibility.md §5.1: **strict** (a NULL argument short-circuits to
 NULL before the kernel runs), **exact scalar signatures** (no implicit promotion), and a
@@ -1212,7 +1224,7 @@ that also declares a **component identity** may back a **persisted index** (belo
   `22000`. TypeScript rejects a spec with both or neither of `kernel`/`batchKernel` (`22023`).
 - **Resolve + evaluate.** A host name (or a host overload of a built-in name over a new signature)
   resolves after the built-in catalog — **a built-in overload always wins an exact collision.** At
-  eval the kernel is reached **by id** through the frozen registry; the declared `cost` is charged
+  eval the kernel is reached **by id** through the environment's frozen function set; the declared `cost` is charged
   once per call and **guarded against `max_cost`** (a heavy declared weight aborts `54P01` before the
   kernel runs — so host functions stay inside the untrusted-query bound, §8 / CLAUDE.md §13, *when the
   host declares their cost*). A kernel that returns a value not matching its declared result type is
@@ -1222,13 +1234,13 @@ that also declares a **component identity** may back a **persisted index** (belo
   **`component_id`** (a stable string naming the implementation, e.g. `"com.example/geo_hash"`) and a
   **`semantic_version`** (`u32`). An `immutable` function carrying both may back an expression /
   partial index (`CREATE INDEX ON t (geo_hash(a))`); the index persists the resolved dependency and
-  re-checks it on reopen. If the registry then supplies a *different* `component_id` / a *bumped*
+  re-checks it on reopen. If the environment then supplies a *different* `component_id` / a *bumped*
   `semantic_version` for that signature, or the function is absent, the index is **unusable** —
   reads skip it (a correct heap scan), writes that would maintain it are refused (`XX002` on a
   mismatch, `42883` when missing) — never a silent stale-key read. A non-`immutable` or unversioned
   host function in an index is `42P17`.
-- **The registry itself is not stored in the file.** It is a *handle* setting; a reopening host brings
-  its own. Only the *dependency* of a persisted index on a host function is written to disk (the
+- **The function set itself is not stored in the file.** It is part of the environment; a reopening
+  host brings its own. Only the *dependency* of a persisted index on a host function is written to disk (the
   `component_id`/`semantic_version` tuple above), so reopen can verify it.
 
 Same shape across cores (a host function registered identically on every core accrues the **same
@@ -1236,11 +1248,11 @@ cost** — the defaults match):
 
 | | Rust | Go | TS |
 |---|---|---|---|
-| build | `let mut r = ExtensionRegistry::new();` | `r := NewExtensionRegistry()` | `const r = new ExtensionRegistry()` |
-| register | `r.register_function(HostFunction::new("f", vec![ScalarType::Int64, ScalarType::Int64], ScalarType::Int64, Box::new(\|a\| Ok(...))).cost(3))?` | `r.RegisterFunction(NewHostFunction("f", []string{"i64","i64"}, "i64", func(a []Value) (Value, error) { ... }).WithCost(3))` | `r.registerFunction({ name: "f", argTypes: ["i64","i64"], result: "i64", kernel: (a) => ..., cost: 3n })` |
-| batch kernel | `HostFunction::batched("f", vec![ScalarType::Int64], ScalarType::Int64, Box::new(\|args, out\| { out.extend(…); Ok(()) }))` | `NewHostBatchFunction("f", []string{"i64"}, "i64", func(args [][]Value, out []Value) ([]Value, error) { …; return out, nil })` | `r.registerFunction({ name: "f", argTypes: ["i64"], result: "i64", batchKernel: (args, out) => { out.push(…) } })` |
+| build | `let b = Environment::builder();` | `b := NewEnvironmentBuilder()` | `const b = Environment.builder()` |
+| register | `let b = b.register_function(HostFunction::new("f", vec![ScalarType::Int64, ScalarType::Int64], ScalarType::Int64, Box::new(\|a\| Ok(...))).cost(3))?` | `b.RegisterFunction(NewHostFunction("f", []string{"i64","i64"}, "i64", func(a []Value) (Value, error) { ... }).WithCost(3))` | `b.registerFunction({ name: "f", argTypes: ["i64","i64"], result: "i64", kernel: (a) => ..., cost: 3n })` |
+| batch kernel | `HostFunction::batched("f", vec![ScalarType::Int64], ScalarType::Int64, Box::new(\|args, out\| { out.extend(…); Ok(()) }))` | `NewHostBatchFunction("f", []string{"i64"}, "i64", func(args [][]Value, out []Value) ([]Value, error) { …; return out, nil })` | `b.registerFunction({ name: "f", argTypes: ["i64"], result: "i64", batchKernel: (args, out) => { out.push(…) } })` |
 | index-backing | `HostFunction::new(…).volatility(Volatility::Immutable).component_id("com.example/f").semantic_version(1)` | `NewHostFunction(…).WithVolatility(VolatilityImmutable).WithComponentID("com.example/f").WithSemanticVersion(1)` | `{ …, volatility: "immutable", componentId: "com.example/f", semanticVersion: 1 }` |
-| install | `Database::create(CreateOptions { extensions: Arc::new(r), ..Default::default() })` | `CreateDatabase(CreateOptions{Extensions: r})` | `createDatabase({ extensions: r })` |
+| install | `Database::create(CreateOptions { environment: b.build(), ..Default::default() })` | `CreateDatabase(CreateOptions{Environment: b.Build()})` | `createDatabase({ environment: b.build() })` |
 
 Then a query calls the function by name: `SELECT f(a, b) FROM t`. The kernel receives the evaluated
 argument values (never NULL) and returns a `Value` (or raises an `EngineError` — a Rust `Result`, a

@@ -1,7 +1,8 @@
 // Host extensions (spec/design/extensibility.md §4.2 / §5.1 / §7) — the injection seam a host
 // application uses to register its own SCALAR FUNCTIONS OVER EXISTING TYPES. This is delivery step 3
-// (extensibility.md §14): runtime host functions, resolved + evaluated through a registry the host
-// supplies at open/create and the engine freezes for the handle's lifetime. Deliberately narrow
+// (extensibility.md §14): runtime host functions, registered on the EnvironmentBuilder
+// (spec/design/environment.md §5), frozen in the built Environment, and resolved + evaluated through
+// it by every database opened with that environment. Deliberately narrow
 // (mirrors impl/rust/src/extension.rs and impl/go/extension.go):
 //
 //   - Functions only (no host types, no format bump).
@@ -49,7 +50,7 @@ export type HostBatchKernel = (args: Value[][], out: Value[]) => void;
 // computed).
 export type HostOutcome = { value: Value } | { error: unknown };
 
-// The spec a host passes to ExtensionRegistry.registerFunction. `argTypes`/`result` are canonical
+// The spec a host passes to EnvironmentBuilder.registerFunction. `argTypes`/`result` are canonical
 // ScalarType names ("i64", "text", …). Optional fields default to safe values (Volatile, not
 // cross-core, unit cost) — matching Rust/Go so a function registered identically on every core
 // accrues the same cost.
@@ -178,48 +179,62 @@ export class HostFuncEntry {
   }
 }
 
-// The immutable set of host extensions supplied at open/create and FROZEN for the database handle's
-// lifetime (extensibility.md §7). This slice holds host scalar functions over existing types only.
-// Shared (by reference) across every session minted from the handle; a streaming cursor's frozen
-// engine shares the same SessionState reference and so sees the same functions.
-export class ExtensionRegistry {
-  private readonly functions: HostFuncEntry[] = [];
+// newHostFunction validates a host scalar-function registration against the functions already
+// registered (`existing`) and returns its defaults-resolved entry — the check behind
+// EnvironmentBuilder.registerFunction (spec/design/environment.md §5). Throws on a negative cost or not
+// exactly one of kernel / batchKernel (22023), an unknown argument/result type (42704), or a second
+// function with an identical (name, argTypes) signature (42723 — signature-level, not name-level: a
+// host may overload a name across argument types, §4.2). A signature that shadows a built-in is
+// accepted but never reached (built-ins win).
+export function newHostFunction(
+  existing: readonly HostFuncEntry[],
+  spec: HostFunctionSpec,
+): HostFuncEntry {
+  const name = spec.name; // exact — host-API names are verbatim (grammar.md §3)
+  const cost = spec.cost ?? 1n;
+  if (cost < 0n)
+    throw engineError(
+      "invalid_parameter_value",
+      `host function ${name}: cost must be non-negative`,
+    );
+  const kernel = spec.kernel ?? null;
+  const batchKernel = spec.batchKernel ?? null;
+  if ((kernel === null) === (batchKernel === null))
+    throw engineError(
+      "invalid_parameter_value",
+      `host function ${name}: exactly one of kernel or batchKernel must be given`,
+    );
+  for (const t of spec.argTypes)
+    if (!isScalarType(t))
+      throw engineError("undefined_object", `host function ${name}: unknown argument type ${t}`);
+  if (!isScalarType(spec.result))
+    throw engineError(
+      "undefined_object",
+      `host function ${name}: unknown result type ${spec.result}`,
+    );
+  for (const g of existing)
+    if (g.name === name && sameHostSig(g.argTypes, spec.argTypes))
+      throw engineError(
+        "duplicate_function",
+        `host function ${name} already registered with this signature`,
+      );
+  return new HostFuncEntry(name, spec, cost, kernel, batchKernel);
+}
 
-  // Register a host scalar function. Throws on a negative cost or not exactly one of kernel /
-  // batchKernel (22023), an unknown argument/result type (42704), or a second function with an
-  // identical (name, argTypes) signature (42723 — signature-level, not name-level: a host may overload
-  // a name across argument types, §4.2). A signature that shadows a built-in is accepted but never
-  // reached (built-ins win).
-  registerFunction(spec: HostFunctionSpec): void {
-    const name = spec.name; // exact — host-API names are verbatim (grammar.md §3)
-    const cost = spec.cost ?? 1n;
-    if (cost < 0n)
-      throw engineError(
-        "invalid_parameter_value",
-        `host function ${name}: cost must be non-negative`,
-      );
-    const kernel = spec.kernel ?? null;
-    const batchKernel = spec.batchKernel ?? null;
-    if ((kernel === null) === (batchKernel === null))
-      throw engineError(
-        "invalid_parameter_value",
-        `host function ${name}: exactly one of kernel or batchKernel must be given`,
-      );
-    for (const t of spec.argTypes)
-      if (!isScalarType(t))
-        throw engineError("undefined_object", `host function ${name}: unknown argument type ${t}`);
-    if (!isScalarType(spec.result))
-      throw engineError(
-        "undefined_object",
-        `host function ${name}: unknown result type ${spec.result}`,
-      );
-    for (const g of this.functions)
-      if (g.name === name && sameHostSig(g.argTypes, spec.argTypes))
-        throw engineError(
-          "duplicate_function",
-          `host function ${name} already registered with this signature`,
-        );
-    this.functions.push(new HostFuncEntry(name, spec, cost, kernel, batchKernel));
+// HostFunctions is the immutable set of host scalar functions an Environment carries
+// (spec/design/environment.md §5, extensibility.md §7) — frozen when the environment is built and
+// shared (by reference) by every database and session using it. Internal: a host registers through
+// EnvironmentBuilder.registerFunction.
+export class HostFunctions {
+  private readonly functions: readonly HostFuncEntry[];
+
+  constructor(functions: readonly HostFuncEntry[]) {
+    this.functions = functions;
+  }
+
+  // The registered entries in registration order (an id is an index into it).
+  entries(): readonly HostFuncEntry[] {
+    return this.functions;
   }
 
   // Whether any registered host function has this (exact) name — the resolve-time routing gate.

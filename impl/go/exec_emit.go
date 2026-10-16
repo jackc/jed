@@ -316,7 +316,7 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		var ra *readAhead
 		projectEnv := env
 		if !em.precharged && !em.identity {
-			if ra = newReadAhead(nil, plan.projections, db.session.extensions); ra != nil {
+			if ra = newReadAhead(nil, plan.projections, db.session.env.hosts); ra != nil {
 				pe := *env
 				pe.hostBatch = ra.project
 				projectEnv = &pe
@@ -419,7 +419,7 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 		// Host calls in the projection prefetch a chunk at a time and replay row by row
 		// (extensibility.md §4.2.1).
-		env.hostBatch = newHostBatch(plan.projections, db.session.extensions)
+		env.hostBatch = newHostBatch(plan.projections, db.session.env.hosts)
 		out := make([][]Value, 0, em.end-em.start)
 		for ri := int(em.start); ri < int(em.end); ri++ {
 			row := em.src[ri]

@@ -1240,7 +1240,10 @@ impl Engine {
             }
             // Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a
             // component identity (42P17), and the resolved dependencies persist with the check.
-            check_deps.push(collect_check_host_deps(&node, &self.session.extensions)?);
+            check_deps.push(collect_check_host_deps(
+                &node,
+                self.session.env.functions(),
+            )?);
         }
         // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
         // used as written; a derived name is built from the exact table/column names —
@@ -2445,7 +2448,7 @@ impl Engine {
                                         .with_position(d.expr.location().0));
                                 }
                                 let host_deps =
-                                    collect_check_host_deps(&node, &self.session.extensions)?;
+                                    collect_check_host_deps(&node, self.session.env.functions())?;
                                 let name = if let Some(name) = d.name.clone() {
                                     name
                                 } else {
@@ -3396,7 +3399,7 @@ impl Engine {
                     &mut ParamTypes::default(),
                 )?;
                 table.checks[i].host_deps =
-                    collect_check_host_deps(&node, &self.session.extensions)?;
+                    collect_check_host_deps(&node, self.session.env.functions())?;
                 checks.push((table.checks[i].name.clone(), node));
             }
             let colls = self.column_collations(&table.columns);
@@ -4020,7 +4023,7 @@ impl Engine {
             let (node, _) = resolve(&scope, &c.expr, None, &mut AggCtx::Forbidden, params)?;
             // Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match
             // the dependency persisted with the check, else XX002 before any mutation.
-            verify_check_host_deps(&c.name, &node, &self.session.extensions, &c.host_deps)?;
+            verify_check_host_deps(&c.name, &node, self.session.env.functions(), &c.host_deps)?;
             out.push((c.name.clone(), node));
         }
         Ok(out)
@@ -4044,7 +4047,7 @@ impl Engine {
         params: &mut ParamTypes,
     ) -> Result<ResolvedIndex> {
         params.uncacheable |= def.timezone_deps.dynamic;
-        verify_index_timezone_deps(&def.timezone_deps)?;
+        verify_index_timezone_deps(&def.timezone_deps, &self.session.env)?;
         let mut keys = Vec::with_capacity(def.keys.len());
         for k in &def.keys {
             match k {
@@ -4076,7 +4079,7 @@ impl Engine {
         // heap-scans) and a write propagates (the table is read-only until a rebuild). A no-op for the
         // common index that records no host dependency.
         if !def.host_deps.is_empty() {
-            let reg = &self.session.extensions;
+            let reg = self.session.env.functions();
             for k in &keys {
                 if let ResolvedKey::Expr(rexpr, ..) = k {
                     verify_index_host_deps(rexpr, reg, &def.host_deps)?;
@@ -4534,7 +4537,7 @@ impl Engine {
                     // each must be IMMUTABLE + carry a component identity, else 42P17 (this also
                     // closes the latent leak where a volatile host function passed the syntactic
                     // immutability walk above).
-                    collect_index_host_deps(&node, &self.session.extensions, &mut host_deps)?;
+                    collect_index_host_deps(&node, self.session.env.functions(), &mut host_deps)?;
                     timezone_deps.merge(&pt.timezone_deps);
                     ci_keys.push(IndexKey::Expr(IndexKeyExpr {
                         expr_text: text.clone(),
@@ -4640,7 +4643,7 @@ impl Engine {
                 }
                 // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as
                 // a key expression (IMMUTABLE + component identity, else 42P17).
-                collect_index_host_deps(&node, &self.session.extensions, &mut host_deps)?;
+                collect_index_host_deps(&node, self.session.env.functions(), &mut host_deps)?;
                 timezone_deps.merge(&pt.timezone_deps);
                 Some(IndexKeyExpr {
                     expr_text: pred.text.clone(),

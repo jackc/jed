@@ -1,4 +1,3 @@
-import { loadTimeZoneData } from "../src/timezone.ts";
 // Golden-file cross-core test (CLAUDE.md §8). The load-bearing honesty test for the
 // on-disk format: this core must (a) READ a checked-in golden into the expected catalog
 // + rows, and (b) WRITE the same logical database to bytes equal to the golden EXACTLY.
@@ -9,7 +8,7 @@ import { loadTimeZoneData } from "../src/timezone.ts";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Engine, ExtensionRegistry, execute, loadUnicodeData } from "../src/tooling.ts";
+import { Engine, Environment, execute } from "../src/tooling.ts";
 import { crc32Ieee, loadEngine, toImage } from "../src/format.ts";
 import { scalarT } from "../src/types.ts";
 import { intValue, type Value } from "../src/value.ts";
@@ -23,12 +22,32 @@ function fixture(name: string): Uint8Array {
   return new Uint8Array(readFileSync(specPath(`fileformat/fixtures/${name}`)));
 }
 
-// Load jed's pinned production JUCD bundle so the unicode-collated goldens build (setDefaultCollation
-// / COLLATE) and read back (the file's reference entry resolves its table from a loaded bundle —
-// collation.md §4/§9, slice 3c). Idempotent (the loaded set is global, first-wins).
-function loadUnicode(): void {
-  loadUnicodeData(new Uint8Array(readFileSync(specPath("collation/fixtures/unicode.jucd"))));
-}
+// The goldens' environment: jed's pinned production JUCD bundle so the unicode-collated goldens build
+// (setDefaultCollation / COLLATE) and read back (the file's reference entry resolves its table from a
+// loaded bundle — collation.md §4/§9, slice 3c), and the pinned JTZ bundle for the timezone-index
+// golden (environment.md §3).
+const GOLDEN_ENV = Environment.builder()
+  .loadUnicodeData(new Uint8Array(readFileSync(specPath("collation/fixtures/unicode.jucd"))))
+  .loadTimeZoneData(new Uint8Array(readFileSync(specPath("tz/fixtures/tzdata.jtz"))))
+  .build();
+
+// GEO_HASH_ENV adds the host function geo_hash (i64 -> i64, component "com.example/geo_hash" at
+// semantic version 1) the host-function dependency goldens call.
+const GEO_HASH_ENV = GOLDEN_ENV.toBuilder()
+  .registerFunction({
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args: Value[]) => {
+      const a = args[0]!;
+      if (a.kind !== "int") throw new Error("strict + resolved i64 arg");
+      return intValue(a.int * 10n);
+    },
+    volatility: "immutable",
+    componentId: "com.example/geo_hash",
+    semanticVersion: 1,
+  })
+  .build();
 
 function run(db: Engine, sql: string): void {
   execute(db, sql);
@@ -37,8 +56,8 @@ function run(db: Engine, sql: string): void {
 // goldenDb is an in-memory handle serializing at the golden page size. The page-backed B-tree's
 // fan-out tracks the page size (spec/fileformat/format.md), so the in-memory tree must be built at
 // the size it will serialize to.
-function goldenDb(): Engine {
-  const db = new Engine();
+function goldenDb(env: Environment = GOLDEN_ENV): Engine {
+  const db = new Engine(env);
   db.pageSize = GOLDEN_PAGE_SIZE;
   return db;
 }
@@ -208,7 +227,6 @@ function partialIndexTableDB(): Engine {
 // version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
 // change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
 function timezoneIndexTableDB(): Engine {
-  loadTimeZoneData(new Uint8Array(readFileSync(specPath("tz/fixtures/tzdata.jtz"))));
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)");
   run(
@@ -219,22 +237,7 @@ function timezoneIndexTableDB(): Engine {
 }
 
 function hostfuncIndexTableDB(): Engine {
-  const db = goldenDb();
-  const reg = new ExtensionRegistry();
-  reg.registerFunction({
-    name: "geo_hash",
-    argTypes: ["i64"],
-    result: "i64",
-    kernel: (args: Value[]) => {
-      const a = args[0]!;
-      if (a.kind !== "int") throw new Error("strict + resolved i64 arg");
-      return intValue(a.int * 10n);
-    },
-    volatility: "immutable",
-    componentId: "com.example/geo_hash",
-    semanticVersion: 1,
-  });
-  db.session.extensions = reg;
+  const db = goldenDb(GEO_HASH_ENV);
   run(db, "CREATE TABLE t (id i64 PRIMARY KEY, a i64)");
   run(db, "CREATE INDEX t_geo_idx ON t (geo_hash(a))");
   return db;
@@ -245,22 +248,7 @@ function hostfuncIndexTableDB(): Engine {
 // t_a_check1 calls geo_hash(a) (flags 1 + the list). EMPTY table, so the fixture isolates the v35
 // catalog change. Must match verify.rb's HOSTFUNC_CHECK_TABLE.
 function hostfuncCheckTableDB(): Engine {
-  const db = goldenDb();
-  const reg = new ExtensionRegistry();
-  reg.registerFunction({
-    name: "geo_hash",
-    argTypes: ["i64"],
-    result: "i64",
-    kernel: (args: Value[]) => {
-      const a = args[0]!;
-      if (a.kind !== "int") throw new Error("strict + resolved i64 arg");
-      return intValue(a.int * 10n);
-    },
-    volatility: "immutable",
-    componentId: "com.example/geo_hash",
-    semanticVersion: 1,
-  });
-  db.session.extensions = reg;
+  const db = goldenDb(GEO_HASH_ENV);
   run(db, "CREATE TABLE t (id i64 PRIMARY KEY, a i64 CHECK (a <> 0), CHECK (geo_hash(a) > 0))");
   return db;
 }
@@ -1165,7 +1153,6 @@ function jsonbTableDB(): Engine {
 
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
-  loadUnicode(); // the unicode-collated goldens need the bundle loaded (collation.md §4)
   const cases: { name: string; build: () => Engine }[] = [
     { name: "empty_db.jed", build: () => goldenDb() },
     { name: "overflow_table.jed", build: overflowTableDB },
@@ -1252,7 +1239,6 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
 // READ side: loading a golden reproduces the same rows the builder produced. The
 // torn-meta goldens must read through the valid slot to the pk_table content.
 test("read goldens reproduces rows", () => {
-  loadUnicode(); // the unicode-collated goldens open via a loaded bundle (collation.md §4)
   const cases: { name: string; build: () => Engine; table: string }[] = [
     { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
     { name: "row_count_table.jed", build: rowCountTableDB, table: "t" },
@@ -1326,7 +1312,7 @@ test("read goldens reproduces rows", () => {
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
   ];
   for (const c of cases) {
-    const loaded = loadEngine(fixture(c.name));
+    const loaded = loadEngine(fixture(c.name), GOLDEN_ENV);
     assert.deepStrictEqual(
       loaded.rowsInKeyOrder(c.table),
       c.build().rowsInKeyOrder(c.table),
@@ -1334,14 +1320,14 @@ test("read goldens reproduces rows", () => {
     );
   }
   // Empty database: zero tables, and a missing table reads as absent.
-  const empty = loadEngine(fixture("empty_db.jed"));
+  const empty = loadEngine(fixture("empty_db.jed"), GOLDEN_ENV);
   assert.equal(empty.table("t"), undefined, "empty_db should have no tables");
 });
 
 // READ side, FK match type: the v40 match_full bit of the actions byte decodes exactly — only
 // c_x_y_fkey is MATCH FULL (a rows-only check cannot see it).
 test("read golden fk match full", () => {
-  const loaded = loadEngine(fixture("fk_table.jed"));
+  const loaded = loadEngine(fixture("fk_table.jed"), GOLDEN_ENV);
   const c = loaded.table("c");
   assert.ok(c, "table c missing");
   assert.deepStrictEqual(
@@ -1357,7 +1343,7 @@ test("read golden fk match full", () => {
 
 // READ side, catalog detail: column names, types, and flags survive exactly.
 test("read golden reconstructs catalog", () => {
-  const loaded = loadEngine(fixture("pk_table.jed"));
+  const loaded = loadEngine(fixture("pk_table.jed"), GOLDEN_ENV);
   const tbl = loaded.table("t");
   assert.ok(tbl, "table t missing");
   assert.equal(tbl!.name, "t");
@@ -1396,7 +1382,7 @@ test("read golden reconstructs catalog", () => {
 // after a load don't collide with persisted rowids (the step-6 mutation fix).
 test("rowid counter survives load", () => {
   const image = toImage(nopkTableDB(), GOLDEN_PAGE_SIZE, 1n); // existing rows take rowids 0, 1, 2
-  const loaded = loadEngine(image);
+  const loaded = loadEngine(image, GOLDEN_ENV);
   // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
   execute(loaded, "INSERT INTO r VALUES (10, 100)");
   assert.equal(loaded.rowsInKeyOrder("r").length, 4);
@@ -1406,7 +1392,7 @@ test("rowid counter survives load", () => {
 // applies the *persisted* defaults — proving the default value (not just its byte length)
 // round-trips through the catalog (constraints.md §2).
 test("default survives load", () => {
-  const loaded = loadEngine(fixture("default_table.jed"));
+  const loaded = loadEngine(fixture("default_table.jed"), GOLDEN_ENV);
   run(loaded, "INSERT INTO t (id) VALUES (3)");
   const rows = loaded.rowsInKeyOrder("t")!;
   const last = rows[rows.length - 1]!;
@@ -1422,7 +1408,7 @@ test("default survives load", () => {
 // The default 8 KiB page size also round-trips, and re-serializing is deterministic. Built at 8192
 // so the in-memory tree is sized for it (fan-out tracks the page size — format.md).
 test("round trip at default page size", () => {
-  const db = new Engine();
+  const db = new Engine(GOLDEN_ENV);
   db.pageSize = 8192;
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   for (let i = 1; i <= 20; i++) {
@@ -1430,7 +1416,7 @@ test("round trip at default page size", () => {
     run(db, `INSERT INTO t VALUES (${i}, ${v})`);
   }
   const image = toImage(db, 8192, 1n);
-  const loaded = loadEngine(image);
+  const loaded = loadEngine(image, GOLDEN_ENV);
   assert.deepStrictEqual(loaded.rowsInKeyOrder("t"), db.rowsInKeyOrder("t"));
   assert.ok(bytesEqual(toImage(loaded, 8192, 1n), image), "re-serialized bytes differ");
 });
@@ -1445,7 +1431,7 @@ test("serialize is deterministic", () => {
 });
 
 test("persisted row count tracks DML and rollback", () => {
-  const db = loadEngine(fixture("row_count_table.jed"));
+  const db = loadEngine(fixture("row_count_table.jed"), GOLDEN_ENV);
   const count = (): bigint => db.committed.store("t").count()!;
 
   assert.equal(count(), 3n, "v28 catalog count restored on open");
@@ -1473,11 +1459,11 @@ test("persisted row count tracks DML and rollback", () => {
   run(db, "ROLLBACK");
   assert.equal(db.session.tempCommitted.store("tt").count(), 2n);
 
-  const reopened = loadEngine(toImage(db, GOLDEN_PAGE_SIZE, 2n));
+  const reopened = loadEngine(toImage(db, GOLDEN_PAGE_SIZE, 2n), GOLDEN_ENV);
   assert.equal(reopened.committed.store("t").count(), 3n);
   run(reopened, "DELETE FROM t");
   assert.equal(reopened.committed.store("t").count(), 0n);
-  const zero = loadEngine(toImage(reopened, GOLDEN_PAGE_SIZE, 3n));
+  const zero = loadEngine(toImage(reopened, GOLDEN_PAGE_SIZE, 3n), GOLDEN_ENV);
   assert.equal(zero.committed.store("t").count(), 0n);
 });
 
@@ -1506,7 +1492,7 @@ test("table row-count root invariant is rejected", () => {
     false,
   );
   assert.throws(
-    () => loadEngine(image),
+    () => loadEngine(image, GOLDEN_ENV),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
 });
@@ -1533,7 +1519,7 @@ test("statistics semantic corruption is rejected", () => {
     false,
   );
   assert.throws(
-    () => loadEngine(image),
+    () => loadEngine(image, GOLDEN_ENV),
     (error: unknown) => error instanceof Error && error.message.startsWith("XX001"),
   );
 });
@@ -1574,7 +1560,7 @@ const text = (s: string): Value => ({ kind: "text", text: s });
 // Loading view_table.jed restores the three views: their stored text and columns, and reading each
 // one (spec/design/views.md §3/§4).
 test("view golden reads back", () => {
-  const db = loadEngine(fixture("view_table.jed"));
+  const db = loadEngine(fixture("view_table.jed"), GOLDEN_ENV);
   assert.deepStrictEqual(rows(db, "SELECT name, definition FROM jed_views ORDER BY name"), [
     [text("n"), text("select count ( * ) as c from t")],
     [text("v"), text('select "t" . "a" , "t" . "b" from t where a > 0')],
@@ -1599,7 +1585,7 @@ test("view unknown check option is rejected", () => {
   image[optionAt] = 3;
   refreshPageCrc(image, optionAt);
   assert.throws(
-    () => loadEngine(image),
+    () => loadEngine(image, GOLDEN_ENV),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
 });
@@ -1613,7 +1599,7 @@ test("view corrupt definition is rejected", () => {
   image[at + 7] = "(".charCodeAt(0);
   refreshPageCrc(image, at);
   assert.throws(
-    () => loadEngine(image),
+    () => loadEngine(image, GOLDEN_ENV),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
 });
@@ -1629,7 +1615,7 @@ test("view dangling dependency is rejected", () => {
   image[depAt + 3] = "u".charCodeAt(0);
   refreshPageCrc(image, depAt);
   assert.throws(
-    () => loadEngine(image),
+    () => loadEngine(image, GOLDEN_ENV),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
 });
@@ -1639,7 +1625,7 @@ test("corrupt image is rejected with XX001", () => {
   image[0] ^= 0xff; // smash slot 0 magic
   image[GOLDEN_PAGE_SIZE] ^= 0xff; // smash slot 1 magic
   assert.throws(
-    () => loadEngine(image),
+    () => loadEngine(image, GOLDEN_ENV),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
 });

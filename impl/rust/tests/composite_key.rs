@@ -125,7 +125,7 @@ fn composite_secondary_index_and_image_roundtrip() {
         "INSERT INTO t VALUES (3, ROW('Main', 5))",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     // The index still exists and enforces nothing extra; a delete + reinsert exercises maintenance.

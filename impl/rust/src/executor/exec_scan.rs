@@ -247,7 +247,7 @@ impl Engine {
         let mut ahead = ReadAhead::for_site(
             plan.filter.get(),
             &plan.projections,
-            &self.session.extensions,
+            self.session.env.functions(),
         );
 
         match &plan.phys.rel_bounds[0] {
@@ -819,8 +819,8 @@ impl Engine {
     /// engine's reads see exactly the captured frozen state — plus the session envelope the per-row
     /// eval / the cost meter read: the cost ceilings + the **shared** lifetime gauge (`Rc` clone — so
     /// streaming cost still counts against `lifetime_max_cost`), the cancel poll (so mid-drain
-    /// cancellation lands), the **shared** entropy/clock seam (`Rc` clone — `uuidv7()`/`now()` draw
-    /// from the same injected source as the eager path), session vars, the time zone, and the
+    /// cancellation lands), the handle's environment (so `uuidv7()`/`now()` draw from the same
+    /// sources as the eager path), session vars, the time zone, and the
     /// `currval`/`lastval` session state. The cursor evaluates its filter/projection against this
     /// owned engine, so the streaming `Rows` is self-contained (`'static`) and never borrows the live
     /// handle (so it survives `Database::query`'s transient session, streaming.md §5).
@@ -843,8 +843,7 @@ impl Engine {
         dst.lifetime_total = src.lifetime_total.clone(); // shared gauge — streaming cost counts (§5)
         dst.cancel = src.cancel.clone();
         dst.work_mem = src.work_mem;
-        dst.seam = src.seam.clone(); // shared seam (Rc) — uuid/clock draw from the injected source
-        dst.extensions = src.extensions.clone(); // shared frozen host-function registry (extensibility.md §7)
+        dst.env = src.env.clone(); // the handle's environment — the same sources and host functions
         dst.vars = src.vars.clone();
         dst.time_zone = src.time_zone.clone();
         dst.session_seq = src.session_seq.clone(); // currval/lastval reads stay faithful
@@ -1142,7 +1141,7 @@ impl Engine {
             let ahead = ReadAhead::for_site(
                 plan.filter.get(),
                 &plan.projections,
-                &self.session.extensions,
+                self.session.env.functions(),
             );
             let stream = StreamingScan {
                 engine: snap,
@@ -2500,7 +2499,7 @@ impl Engine {
                 // replays it row by row (extensibility.md §4.2.1).
                 let mut ahead = match mode {
                     EmitMode::Project => {
-                        ReadAhead::for_site(None, &plan.projections, &self.session.extensions)
+                        ReadAhead::for_site(None, &plan.projections, self.session.env.functions())
                     }
                     EmitMode::Identity => None,
                 };
@@ -2575,7 +2574,7 @@ impl Engine {
                 // window and replays it row by row (extensibility.md §4.2.1): the pull is unmetered
                 // and the sort's charge is returned only below, so no charge moves.
                 let mut ahead =
-                    ReadAhead::for_site(None, &plan.projections, &self.session.extensions);
+                    ReadAhead::for_site(None, &plan.projections, self.session.env.functions());
                 let mut out = Vec::with_capacity(remaining);
                 for k in 0..remaining {
                     let pulled;
@@ -2658,7 +2657,8 @@ impl Engine {
                     };
                     // Host calls in the projection prefetch a chunk at a time and replay row by
                     // row (extensibility.md §4.2.1).
-                    let batch = HostBatch::for_exprs(&plan.projections, &self.session.extensions);
+                    let batch =
+                        HostBatch::for_exprs(&plan.projections, self.session.env.functions());
                     let mut out = Vec::with_capacity(end - start);
                     for (i, row) in rows.iter().enumerate().take(end).skip(start) {
                         meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)

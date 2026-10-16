@@ -89,47 +89,83 @@ Like ActiveRecord, an infinite `date`/`timestamp` reads back as `±Float::INFINI
 columns are `Date|Float` / `Time|Float`); a zoneless `timestamp` and a `timestamptz` both read as a
 UTC `Time`.
 
-### Collation & time zones (host-loaded bundles)
+### Environments: collation, time zones, host functions, clocks
+
+Everything a database takes from outside itself except its file lives in an immutable
+`Jed::Environment`: loaded Unicode and time-zone bundles, your host functions, and the random and
+clock sources. Build one and pass it to every open that should see it; a database opened without
+one gets a fresh empty environment (there is no process-wide state).
 
 The bare engine ships only `C` collation and `UTC` + fixed offsets. Load a Unicode bundle and/or an
-IANA time-zone bundle to enable linguistic collations and named zones — process-global, so one call
-covers every database:
+IANA time-zone bundle to enable linguistic collations and named zones:
 
 ```ruby
-Jed.load_unicode_data(File.binread("unicode.jucd"))    # → COLLATE "unicode", ILIKE, case folding
-Jed.load_time_zone_data(File.binread("tzdata.jtz"))     # → AT TIME ZONE 'America/New_York', date_trunc(…, zone)
+env = Jed::Environment.build do |b|
+  b.load_unicode_data(File.binread("unicode.jucd"))   # → COLLATE "unicode", ILIKE, case folding
+  b.load_time_zone_data(File.binread("tzdata.jtz"))    # → AT TIME ZONE 'America/New_York', date_trunc(…, zone)
+end
 
-Jed.memory do |db|
+Jed.memory(environment: env) do |db|
   db.query(%(SELECT 'a' < 'B' COLLATE "unicode"))                      # => true (UCA), vs false under C
   db.query(%(SELECT now() AT TIME ZONE 'America/New_York'))            # local wall-clock
 end
+# also: Jed.create(path, environment: env), Jed.open(path, read_only:, environment: env)
 ```
 
-A malformed bundle raises `Jed::Error`.
+A malformed bundle raises `Jed::Error` (`XX001`). `Jed::EnvironmentBuilder.new` is the same builder
+without the block; its methods return the builder, so they chain, and `#build` can be called again
+after adding more. `env.to_builder` starts a builder from an existing environment (it can add, never
+remove), leaving the original unchanged:
+
+```ruby
+seeded = env.to_builder { |b| b.random_source(Jed::SeededRandom.new(42)) }  # with a block: built
+```
+
+#### Random and clock sources
+
+By default `uuidv4`/`uuidv7` use OS randomness and `now()`/`clock_timestamp()` read the wall clock.
+For reproducible runs, install a controllable source and keep a reference to it:
+
+```ruby
+random = Jed::SeededRandom.new(1)                        # #reseed(seed)
+clock  = Jed::ManualClock.new(Time.utc(2024, 7, 15))     # #set(time_or_micros), #advance(micros)
+# or Jed::AdvancingClock.new(start, step_micros)        # one step per read; #reset(start, step)
+env = Jed::Environment.build { |b| b.random_source(random).clock_source(clock) }
+
+Jed.memory(environment: env) do |db|
+  db.query("SELECT now(), uuidv4()").first   # the same answer on every run
+  clock.advance(1_000_000)                   # reaches every database using this environment
+end
+```
+
+Passing `nil` to `random_source`/`clock_source` restores OS randomness / the wall clock.
 
 ### Host functions
 
-Register your own scalar functions, callable from SQL by name. Pass the registry when you open a
-database; the handle keeps the functions registered up to that point.
+Register your own scalar functions, callable from SQL by name, on an environment builder. A database
+gets the functions in the environment it was opened with.
 
 ```ruby
-reg = Jed::ExtensionRegistry.new
+env = Jed::Environment.build do |b|
+  # Single-row: called once per row with that row's arguments.
+  b.register_function("add_tax", [:decimal, :decimal], :decimal, volatility: :immutable) do |amount, rate|
+    amount * (1 + rate)
+  end
 
-# Single-row: called once per row with that row's arguments.
-reg.register("add_tax", [:decimal, :decimal], :decimal, volatility: :immutable) do |amount, rate|
-  amount * (1 + rate)
+  # Batch: one Array per argument, plus an output Array to append one result per row to.
+  b.register_batch_function("score", [:i32, :text], :i64, volatility: :immutable, cost: 2) do |ids, names, out|
+    ids.zip(names) { |id, name| out << (id * name.length) }
+  end
 end
 
-# Batch: one Array per argument, plus an output Array to append one result per row to.
-reg.register_batch("score", [:i32, :text], :i64, volatility: :immutable, cost: 2) do |ids, names, out|
-  ids.zip(names) { |id, name| out << (id * name.length) }
-end
-
-Jed.memory(extensions: reg) do |db|
+Jed.memory(environment: env) do |db|
   db.query("SELECT add_tax(19.99, 0.08)").first[0]   # => 0.215892e2
 end
 ```
 
+- Registration raises `Jed::Error` right away with the engine's code: `42723` for a duplicate
+  `(name, arg_types)`, `22023` for a negative cost, `42704` for an unknown type, `0A000` for an
+  unsupported one.
 - Functions are **strict**: a NULL argument returns NULL without calling the block. Return `nil` for
   a NULL result.
 - Arguments arrive as the same Ruby values a query returns (table above). The types a host function

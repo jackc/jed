@@ -1259,7 +1259,7 @@ pub(crate) fn resolve_timezone(
         (true, ResolvedType::Timestamp) => (true, ResolvedType::Timestamptz),
         _ => return Err(no_func_overload("timezone")),
     };
-    params.note_index_zone(&zone_r)?;
+    params.note_index_zone(&zone_r, &scope.catalog.session.env)?;
     Ok((
         RExpr::AtTimeZone {
             zone: Box::new(zone_r),
@@ -1309,7 +1309,7 @@ pub(crate) fn resolve_date_trunc(
         None
     };
     if let Some(z) = &zone {
-        params.note_index_zone(z)?;
+        params.note_index_zone(z, &scope.catalog.session.env)?;
     } else {
         params.nonimmutable |= matches!(result, ResolvedType::Timestamptz);
     }
@@ -2618,8 +2618,8 @@ pub(crate) fn resolve_window_call(
             SqlState::UndefinedFunction,
             format!("{lname} is not a window function"),
         );
-        let known =
-            is_scalar_func_name(&lname) || scope.catalog.session.extensions.has_function(&lname);
+        let known = is_scalar_func_name(&lname)
+            || scope.catalog.session.env.functions().has_function(&lname);
         return Err(if known {
             err.no_hint()
         } else {

@@ -217,7 +217,7 @@ func TestIndexRoundTripsThroughTheImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := loadEngine(img)
+	loaded, err := loadEngine(img, NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}

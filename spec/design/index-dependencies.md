@@ -59,12 +59,12 @@ A missing or different dependency is `XX002`: read planning excludes that index 
 valid access paths; writes to its table fail before mutation. Opening and reading stored rows
 does not require timezone data. A query that itself calls an unavailable zone still reports
 the normal evaluation error. Dynamic-dependent index plans are not cached across statements,
-so additions to the engine-global loaded zone set cannot leave a stale admissibility decision.
+so a different environment's loaded zone set cannot leave a stale admissibility decision.
 
 ## Rebuilding
 
-After loading the desired bundle in a fresh process (loading is additive, first definition
-wins), rebuild each affected index with transactional SQL:
+After reopening the database with an environment that loads the desired bundle (loading is additive,
+first definition wins; [environment.md](environment.md)), rebuild each affected index with transactional SQL:
 
 ```sql
 BEGIN;

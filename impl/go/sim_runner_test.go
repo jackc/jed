@@ -350,6 +350,7 @@ type simSession struct {
 	write bool
 	pins  map[string]uint64 // the version of each database a read session pinned (§8.1: what it must keep seeing)
 	pid   int               // the process the session lives in
+	rng   uint64            // its splitmix64 stream state while another session holds the shared source
 }
 
 // simProc is one simulated process: a Database over the shared simulated filesystem, and in a
@@ -409,6 +410,13 @@ type simRunner struct {
 	db       *Database // the database of the process running the current step
 	sessions map[string]*simSession
 
+	// env is every process's Environment: random is its seeded source, whose stream is switched per
+	// session (useSession) so each session keeps the independent stream it was opened with, and the
+	// clock reads r.clock.
+	env    *Environment
+	random *SeededRandom
+	active *simSession // the session whose stream random currently holds
+
 	// Processes (simulation-testing.md §14 S5). A single-process trace has only p0, opened without
 	// coordination; a `# processes: shared` trace opens every process with shared locking.
 	shared bool
@@ -450,7 +458,7 @@ func newSimRunner(tr simTrace) *simRunner {
 	tempBuffers, _ := strconv.Atoi(tr.header["temp_buffers"])
 	maxQueryMemory, _ := strconv.ParseInt(tr.header["max_query_memory_bytes"], 10, 64)
 	maxStorageBytes, _ := strconv.ParseInt(tr.header["max_storage_bytes"], 10, 64)
-	return &simRunner{
+	r := &simRunner{
 		tr:              tr,
 		seed:            seed,
 		pageSize:        uint32(ps),
@@ -467,6 +475,32 @@ func newSimRunner(tr simTrace) *simRunner {
 		dbs:             map[string]*simDB{},
 		violationStep:   -1,
 	}
+	r.random = NewSeededRandom(0)
+	b := NewEnvironmentBuilder()
+	b.SetRandomSource(r.random)
+	b.SetClockSource(simClock{now: &r.clock})
+	r.env = b.Build()
+	return r
+}
+
+// simClock is the simulation's clock source: it reads the runner's clock, which only clock steps
+// move. Not goroutine-safe — a simulation runs on one goroutine.
+type simClock struct{ now *int64 }
+
+func (c simClock) NowMicros() int64 { return *c.now }
+
+// useSession makes the shared seeded source continue ss's stream, saving the previously active
+// session's position, so every session draws its own stream (the one seeded at its open) however
+// sessions interleave.
+func (r *simRunner) useSession(ss *simSession) {
+	if r.active == ss {
+		return
+	}
+	if r.active != nil {
+		r.active.rng = r.random.state
+	}
+	r.random.Reseed(ss.rng)
+	r.active = ss
 }
 
 func (r *simRunner) fail(step int, format string, args ...any) {
@@ -600,7 +634,7 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 	if cache <= 0 {
 		cache = defaultCacheBytes
 	}
-	e, err := loadEnginePaged(p, cacheLeaves(cache, p.pageSize))
+	e, err := loadEnginePaged(p, cacheLeaves(cache, p.pageSize), r.env)
 	if err != nil {
 		return nil, err
 	}
@@ -622,7 +656,7 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 func (r *simRunner) run() {
 	// Create the database through the simulated filesystem, as the host's create does: a temp file,
 	// its sync, the rename, and the directory barrier (S4).
-	e, err := createVia(r.fs, simDiskPath, databaseOptions{PageSize: r.pageSize})
+	e, err := createVia(r.fs, simDiskPath, databaseOptions{PageSize: r.pageSize, env: r.env})
 	if err != nil {
 		r.violation = "create: " + err.Error()
 		return
@@ -869,8 +903,6 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 		r.fail(i, "unknown session mode %q", st.mode)
 		return
 	}
-	s.SetRandomSource(SeededRandomSource(simDecide(r.seed, simLaneSession, uint64(i), 0, 0)))
-	s.SetClockSource(func() int64 { return r.clock })
 	if r.workMem > 0 {
 		s.SetWorkMem(r.workMem)
 	}
@@ -893,7 +925,7 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 			pins[name] = v
 		}
 	}
-	r.sessions[st.sid] = &simSession{s: s, write: st.mode == "write", pins: pins, pid: r.cur}
+	r.sessions[st.sid] = &simSession{s: s, write: st.mode == "write", pins: pins, pid: r.cur, rng: simDecide(r.seed, simLaneSession, uint64(i), 0, 0)}
 	r.emit(`{"i":%d,"op":"open","sid":%q,"version":%d%s}`, i, st.sid, s.Version(), r.versionsJSON(pins))
 }
 
@@ -911,6 +943,7 @@ func (r *simRunner) stepOn(i int, st simStep) {
 		r.emit(`{"i":%d,"op":"on","sid":%q,"skip":true}`, i, st.sid)
 		return
 	}
+	r.useSession(ss)
 	n, affected, hash, cost, err := simQuery(ss.s, st.sql)
 	if err != nil {
 		code := simCode(err)
@@ -1348,7 +1381,7 @@ func (r *simRunner) stepAttach(i int, name string) {
 		d.history = map[uint64]map[string]bool{}
 		d.addHistory(1, simEmptyDigest(d))
 		d.version, d.lastDigest, d.floor, d.maxAttempted = 1, simEmptyDigest(d), 0, 1
-		e, err := createVia(r.fs, d.file, databaseOptions{PageSize: r.pageSize})
+		e, err := createVia(r.fs, d.file, databaseOptions{PageSize: r.pageSize, env: r.env})
 		if err != nil {
 			r.attachFailed(i, name, err)
 			return

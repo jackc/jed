@@ -371,8 +371,12 @@ fn insert_cache_rechecks_privilege_and_read_only() {
 fn insert_cache_collation_upgrade_invalidates() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../spec/collation/fixtures/unicode.jucd");
-    jed::load_unicode_data(&std::fs::read(path).unwrap()).unwrap();
+    let env = jed::Environment::builder()
+        .load_unicode_data(&std::fs::read(path).unwrap())
+        .unwrap()
+        .build();
     let mut db = crate::executor::Engine::new();
+    db.set_environment(env.clone());
     crate::execute(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, x text COLLATE \"unicode\")",
@@ -383,7 +387,7 @@ fn insert_cache_collation_upgrade_invalidates() {
         .execute_prepared(&stmt, &[Value::Int(1), Value::Text("a".into())])
         .unwrap();
     let plan = insert_plan_ptr(&stmt);
-    let loaded = jed::loaded_collation("unicode").unwrap();
+    let loaded = env.collation("unicode").unwrap();
     let mut skewed = (*loaded).clone();
     skewed.unicode_version = "0.0.0".to_string();
     db.committed.put_collation(std::sync::Arc::new(skewed));

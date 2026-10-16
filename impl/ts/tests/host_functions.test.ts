@@ -12,7 +12,8 @@ import {
   createDatabase,
   type Database,
   EngineError,
-  ExtensionRegistry,
+  Environment,
+  EnvironmentBuilder,
   openDatabase,
 } from "../src/lib.ts";
 import type { HostFunctionSpec } from "../src/lib.ts";
@@ -48,14 +49,14 @@ const hostAddText: HostFunctionSpec = {
   kernel: (args) => textValue(asText(args[0]!) + asText(args[1]!)),
 };
 
-function regWith(...specs: HostFunctionSpec[]): ExtensionRegistry {
-  const r = new ExtensionRegistry();
-  for (const s of specs) r.registerFunction(s);
-  return r;
+function regWith(...specs: HostFunctionSpec[]): Environment {
+  const b = Environment.builder();
+  for (const s of specs) b.registerFunction(s);
+  return b.build();
 }
 
-function dbExt(extensions: ExtensionRegistry, stmts: string[] = []): Session {
-  const s = createDatabase({ extensions }).session();
+function dbExt(environment: Environment, stmts: string[] = []): Session {
+  const s = createDatabase({ environment }).session();
   for (const stmt of stmts) s.execute(stmt);
   return s;
 }
@@ -158,7 +159,7 @@ test("a host text overload wins over literal adaptation", () => {
 });
 
 test("duplicate signature is rejected", () => {
-  const r = new ExtensionRegistry();
+  const r = new EnvironmentBuilder();
   r.registerFunction(hostAdd);
   // Same (name, arg types) — rejected 42723 (signature-level, §4.2).
   assert.equal(
@@ -170,7 +171,7 @@ test("duplicate signature is rejected", () => {
 });
 
 test("negative cost is rejected", () => {
-  const r = new ExtensionRegistry();
+  const r = new EnvironmentBuilder();
   assert.equal(
     errCodeOf(() =>
       r.registerFunction({
@@ -186,7 +187,7 @@ test("negative cost is rejected", () => {
 });
 
 test("unknown type name is rejected", () => {
-  const r = new ExtensionRegistry();
+  const r = new EnvironmentBuilder();
   assert.equal(
     errCodeOf(() =>
       r.registerFunction({
@@ -220,7 +221,7 @@ test("declared cost is charged per call", () => {
 test("declared cost gates the max_cost ceiling", () => {
   // A declared weight above the ceiling aborts 54P01 before the kernel runs (guard after charge).
   const s = createDatabase({
-    extensions: regWith({
+    environment: regWith({
       name: "host_heavy",
       argTypes: [],
       result: "i64",
@@ -276,13 +277,13 @@ test("EXPLAIN renders the host function name", () => {
 test("no extensions is unaffected", () => {
   // The built-in-only path is untouched: an empty registry resolves nothing new, and a call to a
   // would-be host name is 42883.
-  const s = dbExt(new ExtensionRegistry());
+  const s = dbExt(new Environment());
   assert.equal(asInt(oneVal(s, "SELECT abs(-7)")), 7n);
   assert.equal(
     errCodeOf(() => queryOutcome(s, "SELECT host_add(1, 2)")),
     "42883",
   );
-  // A handle opened with no extensions option (undefined registry) behaves the same.
+  // A handle opened with no environment option (a fresh empty one) behaves the same.
   const s2 = createDatabase({}).session();
   assert.equal(
     errCodeOf(() => queryOutcome(s2, "SELECT host_add(1, 2)")),
@@ -324,14 +325,14 @@ function tmpFile(name: string): string {
   return join(scratch, name);
 }
 
-function createFile(path: string, reg: ExtensionRegistry, stmts: string[]): void {
-  const db = createDatabase({ path, skipFsync: true, extensions: reg });
+function createFile(path: string, reg: Environment, stmts: string[]): void {
+  const db = createDatabase({ path, skipFsync: true, environment: reg });
   for (const s of stmts) db.execute(s);
   db.close();
 }
 
-function openFile(path: string, reg: ExtensionRegistry): Database {
-  return openDatabase(path, { skipFsync: true, extensions: reg });
+function openFile(path: string, reg: Environment): Database {
+  return openDatabase(path, { skipFsync: true, environment: reg });
 }
 
 function idsFile(db: Database, sql: string): bigint[] {
@@ -448,7 +449,7 @@ test("host-dep index reopen with the function missing", () => {
     "CREATE INDEX ix ON t (geo_hash(a))",
   ]);
   // Reopen with NO extensions: the index expression can no longer resolve.
-  const db = openFile(path, new ExtensionRegistry());
+  const db = openFile(path, new Environment());
   // A read that does not reference the missing function still works (the index is simply unused).
   assert.deepEqual(idsFile(db, "SELECT id FROM t ORDER BY id"), [1n, 2n]);
   // A write that would maintain the index needs the missing function → 42883 (resolution fails).
@@ -723,7 +724,7 @@ test("zero-argument batch kernel is never prefetched", () => {
 
 test("exactly one of kernel and batchKernel is required", () => {
   // Both, or neither, is rejected 22023 at registration (the code a negative cost uses).
-  const r = new ExtensionRegistry();
+  const r = new EnvironmentBuilder();
   const base = { name: "host_k", argTypes: [] as [], result: "i64" as const };
   assert.equal(
     errCodeOf(() => r.registerFunction(base)),
@@ -1058,7 +1059,7 @@ test("batch streaming scan storage errors match the row kernel", () => {
       const p = join(dir, name);
       writeFileSync(p, bytes);
       try {
-        return openDatabase(p, { skipFsync: true, extensions: regWith(f) });
+        return openDatabase(p, { skipFsync: true, environment: regWith(f) });
       } catch {
         return null; // a corrupted routing/catalog page fails at open, before any scan
       }
@@ -1178,7 +1179,7 @@ test("host function check reopen matching", () => {
 test("host function check reopen missing", () => {
   const path = tmpFile("hostfunc_check_missing.jed");
   createCheckFile(path);
-  const db = openFile(path, new ExtensionRegistry());
+  const db = openFile(path, new Environment());
   try {
     // Writes that evaluate the check cannot resolve it (42883); reads and DELETE never evaluate it.
     assert.deepEqual(idsFile(db, "SELECT id FROM t"), [1n]);
@@ -1319,7 +1320,7 @@ test("host function default resolved only when applied", () => {
     "CREATE TABLE ch (id i64 PRIMARY KEY, pid i64 DEFAULT geo_hash(0) REFERENCES p ON DELETE SET DEFAULT)",
     "INSERT INTO ch VALUES (1, 1)",
   ]);
-  const db = openFile(path, new ExtensionRegistry());
+  const db = openFile(path, new Environment());
   try {
     // Statements that never apply the default do not need its host function.
     wantHostOK(db, "INSERT INTO t VALUES (2, 7, 7)");

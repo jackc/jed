@@ -6,11 +6,11 @@ import (
 )
 
 // The engine handle: session/transaction state, snapshot routing, host config, and reference-data
-// loading. This file holds the engine/sessionState/activeTx structs and SessionOptions/TxStatus, the
+// introspection. This file holds the engine/sessionState/activeTx structs and SessionOptions/TxStatus, the
 // constructors (newEngine/newSession), the snapshot routing that resolves a name to the right store —
 // main vs session-temp vs attached database (working/tempSnap/attach*Snap, the scoped lkp*/write*
 // helpers), the host configuration accessors (cost/work_mem/privileges/vars/timezone/DDL gates), and
-// Unicode/time-zone/collation loading (LoadUnicodeData/LoadTimeZoneData/UpgradeCollations).
+// the Environment's loaded-data introspection and UpgradeCollations.
 
 // Engine is the database handle: the last committed Snapshot plus, while a transaction is open,
 // the writer's working snapshot (CLAUDE.md §3, transactions.md §2). Reads run against the visible
@@ -32,7 +32,7 @@ type engine struct {
 	explainActual *actualCostProfile
 	// session is the DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this
 	// handle runs statements through — the open transaction (the Idle/Open/Failed machine, §2.2),
-	// the relocated settings (maxCost/maxSQLLength/workMem, the entropy/clock seam), and the
+	// the relocated settings (maxCost/maxSQLLength/workMem), the handle's Environment, and the
 	// currval/lastval session state. A bare Engine IS committed storage + this one long-lived
 	// stateful default session; the convenience methods operate on it. NewSession mints additional
 	// independent sessions (run sequentially on this single-threaded handle by swapping in here).
@@ -160,7 +160,7 @@ type estimatorTouchedRelation struct {
 // envelope subset landed in S1): the cost ceiling, the input-size limit, and the work-memory
 // budget. Passed to (*Engine).NewSession. A zero MaxSQLLength or WorkMem takes its default at
 // construction (use the setter for the 0 ⇒ unlimited form); a zero MaxCost IS unlimited (the
-// genuine default). The entropy/clock seam is injected via Session.SetRandomSource/SetClockSource.
+// genuine default). The entropy/clock sources come from the handle's Environment.
 type SessionOptions struct {
 	// MaxScalarBytes bounds cumulative covered scalar allocations per statement; non-positive
 	// values restore the finite 64 MiB default (spec/design/memory.md).
@@ -246,7 +246,7 @@ func txStatusOf(tx *activeTx) TxStatus {
 // sessionState is the per-connection SESSION envelope (spec/design/session.md §2.1/§2.4): the
 // configured, stateful context a host runs statements through, un-fused from the committed storage on
 // Engine. It owns the open transaction (the Idle/Open/Failed machine), the relocated handle settings,
-// the entropy/clock seam, and the currval/lastval session state. An Engine holds one as its default
+// the handle's Environment, and the currval/lastval session state. An Engine holds one as its default
 // session; the host-facing Session (shared.go) wraps an Engine and exposes this envelope, delegating
 // its setters/getters here. (Pre-§2.4 this type was the exported `Session`; the convergence renamed
 // it and made the per-caller handle the public `Session`.)
@@ -303,11 +303,10 @@ type sessionState struct {
 	// DefaultWorkMem. Never changes what a query observes (spill.md §6); an in-memory database
 	// ignores it.
 	workMem int
-	// seam is the entropy + clock seam for the uuid generators / clock functions (entropy.md): two
-	// host-injectable functions (a random source + a clock), each nil ⇒ the platform primitive.
-	// Tests inject SeededRandomSource + FixedClock (the # seed: / # clock: directives) for
-	// byte-identical cross-core output.
-	seam seam
+	// env is the handle's Environment (spec/design/environment.md): the loaded collation/property/zone
+	// data, the host functions, and the random + clock sources the uuid generators / clock functions
+	// read. Shared by every session, temp domain, and attachment of the handle; never nil.
+	env *Environment
 	// sessionSeq is the SESSION currval state (sequences.md §6): the last value nextval/setval(…,true)
 	// produced IN THIS SESSION for each sequence (exact name). NOT in the snapshot, NOT persisted.
 	sessionSeq map[string]int64
@@ -366,11 +365,6 @@ type sessionState struct {
 	// it finishes (success or error); nil for every other statement, where reads fall through to the
 	// working/committed snapshots as usual (readSnap, tempSnap, attachReadSnap).
 	readPin *readPin
-	// extensions is the frozen host extension registry (spec/design/extensibility.md §7): the scalar
-	// functions the host registered at open/create. Set from sharedCore.extensions at session mint;
-	// snapshotEngine's sessionState struct-copy shares the same pointer (so a streaming cursor sees
-	// the same functions). nil when no extensions were supplied — the built-in-only path.
-	extensions *ExtensionRegistry
 }
 
 // requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md
@@ -385,14 +379,16 @@ func requireCustomVarName(name string) (string, error) {
 	return "", newError(UndefinedObject, "unrecognized configuration parameter: "+name)
 }
 
-// newSession builds a fresh default session: no open transaction, default settings, empty state.
-func newSession() sessionState {
-	return newSessionWithOptions(SessionOptions{})
+// newSession builds a fresh default session over env: no open transaction, default settings, empty
+// state.
+func newSession(env *Environment) sessionState {
+	return newSessionWithOptions(SessionOptions{}, env)
 }
 
 // newSessionWithOptions builds a session configured from opts (spec/design/session.md §2.1). A zero
-// MaxSQLLength or WorkMem takes its default; the rest of the per-connection state starts empty.
-func newSessionWithOptions(opts SessionOptions) sessionState {
+// MaxSQLLength or WorkMem takes its default; the rest of the per-connection state starts empty. env
+// is the handle's Environment (never nil).
+func newSessionWithOptions(opts SessionOptions, env *Environment) sessionState {
 	if opts.MaxSQLLength == 0 {
 		opts.MaxSQLLength = DefaultMaxSQLLength
 	}
@@ -412,8 +408,9 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 		allowDDL:            true,
 		tempBuffers:         DefaultTempBuffers,
 		maxTempStorageBytes: DefaultMaxTempStorageBytes,
-		tempCommitted:       newSnapshot(),
+		tempCommitted:       newSnapshot(env),
 		vars:                map[string]string{},
+		env:                 env,
 	}
 	if opts.DefaultPrivileges != nil {
 		s.privileges.SetDefaultTable(*opts.DefaultPrivileges)
@@ -440,7 +437,7 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 	if tzName == "" {
 		tzName = "UTC"
 	}
-	if zr, ok := ResolveZone(tzName); ok {
+	if zr, ok := env.resolveZone(tzName); ok {
 		s.timeZone = zr
 	} else {
 		s.timeZone = ZoneRef{Fixed: true, Off: 0}
@@ -452,7 +449,7 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 // timestamptz is decomposed in. Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ
 // bundle provides; a name no bundle provides (and not a built-in) is 22023, the value unchanged.
 func (s *sessionState) SetTimeZone(zone string) error {
-	zr, ok := ResolveZone(zone)
+	zr, ok := s.env.resolveZone(zone)
 	if !ok {
 		return newError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", zone))
 	}
@@ -501,9 +498,9 @@ type activeTx struct {
 	attachDirty map[string]bool
 }
 
-// NewEngine builds an empty in-memory database.
+// NewEngine builds an empty in-memory database over a fresh empty Environment.
 func newEngine() *engine {
-	return &engine{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession()}
+	return withPageSize(DefaultPageSize)
 }
 
 // WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
@@ -511,13 +508,20 @@ func newEngine() *engine {
 // the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
 // in-memory database uses NewEngine (the default page size).
 func withPageSize(pageSize uint32) *engine {
-	return &engine{committed: newSnapshot(), pageSize: pageSize, session: newSession()}
+	db := newEngineIn(NewEnvironment())
+	db.pageSize = pageSize
+	return db
+}
+
+// newEngineIn builds an empty in-memory database whose handle uses env.
+func newEngineIn(env *Environment) *engine {
+	return &engine{committed: newSnapshot(env), pageSize: DefaultPageSize, session: newSession(env)}
 }
 
 // inputZone is the session zone as a text-input context (timezones.md §9.3): every parse of an
 // offset-less timestamptz string — literal, assignment, bound parameter, container text — reads it.
 func (db *engine) inputZone() *inputZone {
-	return &inputZone{zone: db.session.timeZone}
+	return &inputZone{zone: db.session.timeZone, prop: db.session.env.propertyTable()}
 }
 
 // readSnap is the snapshot a read sees: the read pin if one is set (a data-modifying WITH statement
@@ -675,7 +679,7 @@ func (db *engine) releaseTempDomain() {
 		_ = db.tempStorage.paging.close()
 	}
 	db.tempStorage = nil
-	db.session.tempCommitted = newSnapshot()
+	db.session.tempCommitted = newSnapshot(db.session.env)
 }
 
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
@@ -1317,17 +1321,6 @@ func (db *engine) parse(sql string) (statement, error) {
 	return parseSQL(sql)
 }
 
-// SetRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) — the
-// deterministic / reproducible path. Pass SeededRandomSource for a byte-identical cross-core stream
-// (the conformance # seed: directive). ClearRandomSource returns to the OS CSPRNG, drawn per value.
-func (db *engine) SetRandomSource(f RandomSource) { db.session.seam.SetRandom(f) }
-func (db *engine) ClearRandomSource()             { db.session.seam.ClearRandom() }
-
-// SetClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. FixedClock (the # clock:
-// directive). ClearClockSource returns to the wall clock.
-func (db *engine) SetClockSource(f ClockSource) { db.session.seam.SetClock(f) }
-func (db *engine) ClearClockSource()            { db.session.seam.ClearClock() }
-
 // MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
 func (db *engine) MaxCost() int64 { return db.session.maxCost }
 
@@ -1457,14 +1450,6 @@ func (s *sessionState) Var(name string) (string, bool) {
 // the per-record reset hook the conformance harness's # set: directive uses).
 func (s *sessionState) ResetVars() { s.vars = map[string]string{} }
 
-// SetRandomSource / ClearRandomSource — the uuid-generator entropy seam (entropy.md §6).
-func (s *sessionState) SetRandomSource(f RandomSource) { s.seam.SetRandom(f) }
-func (s *sessionState) ClearRandomSource()             { s.seam.ClearRandom() }
-
-// SetClockSource / ClearClockSource — the uuidv7 / clock-function clock seam (entropy.md §6).
-func (s *sessionState) SetClockSource(f ClockSource) { s.seam.SetClock(f) }
-func (s *sessionState) ClearClockSource()            { s.seam.ClearClock() }
-
 // ReadOnly reports whether this handle was opened read-only (spec/design/api.md §2.1): every
 // transaction defaults to READ ONLY, writes are 25006, and the file is never written.
 func (db *engine) ReadOnly() bool { return db.readOnly }
@@ -1502,7 +1487,7 @@ const (
 // CollationInfo is introspection metadata for one loaded collation (db.Collations,
 // spec/design/collation.md §1). ContentHash is the CRC-32 of the compiled table (the reference-mode
 // stamp, §3/§4); Description is provenance, excluded from the hash. Verdict is the slice-2d
-// version-skew verdict (§12) — VerdictFull for the engine-global loaded set (it IS the reference);
+// version-skew verdict (§12) — VerdictFull for the Environment's loaded set (it IS the reference);
 // for a database's referenced collations it is VerdictSkewed when the file's pin differs from the
 // loaded bundle's.
 type collationInfo struct {
@@ -1518,57 +1503,21 @@ type collationInfo struct {
 // ImportCollation / ExportCollation are GONE (the reference-only pivot, spec/design/collation.md
 // §4.2): a collation is provided by a host-loaded bundle and used by name, never loaded into a
 // database. There is no runtime path that constructs or bakes a collation table — the only load is
-// LoadUnicodeData of jed's own pinned bundle bytes.
+// EnvironmentBuilder.LoadUnicodeData of jed's own pinned bundle bytes.
 
-// LoadUnicodeData loads a JUCD Unicode-data bundle (db.LoadUnicodeData, spec/design/collation.md
-// §4.2): its collations become resolvable by name for COLLATE, per-column collation, and ORDER BY …
-// COLLATE. The loaded set is ENGINE-GLOBAL (§9), so a bundle loaded through any handle is visible
-// everywhere — including to a later Engine.Open of a file that REFERENCES one of its collations.
-// Privileged host op (not SQL-reachable, no path, no engine I/O — §11); ADDITIVE and idempotent for
-// an already-loaded bundle. A malformed bundle is XX001. (Mirrors the package-level LoadUnicodeData,
-// which the host may call before opening any file.)
-func (db *engine) LoadUnicodeData(data []byte) error {
-	return LoadUnicodeData(data)
-}
-
-// LoadTimeZoneData loads a JTZ time-zone bundle into the engine-global loaded set
-// (db.LoadTimeZoneData, spec/design/timezones.md §3.3). The bytes are jed's own pinned TZif (RFC
-// 8536) wrapped in a manifest; the loaded zones become usable by AT TIME ZONE. Like the collation
-// seam, this is a privileged host op (not SQL-reachable, no path, no engine I/O — §10), additive and
-// idempotent, engine-global so it may be called before open. A malformed bundle is XX001. (UTC and
-// fixed offsets are built in and need no load.)
-func (db *engine) LoadTimeZoneData(data []byte) error {
-	return LoadTimeZoneData(data)
-}
-
-// LoadedTimeZones introspects the engine-global loaded zone set (db.LoadedTimeZones, timezones.md
-// §3.3) — every named zone (and alias) a loaded bundle provides, ascending by name. A property of the
-// running engine, not of this database. UTC and fixed offsets are built in and not listed.
+// LoadedTimeZones introspects the handle Environment's loaded zone set (timezones.md §3.3) — every
+// named zone (and alias) a loaded bundle provides, ascending by name. UTC and fixed offsets are built
+// in and not listed.
 func (db *engine) LoadedTimeZones() []timeZoneInfo {
-	return loadedTimeZones()
+	return db.session.env.LoadedTimeZones()
 }
 
-// LoadedCollations introspects the engine-global LOADED collation set (db.LoadedCollations,
-// spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
-// database on this handle, ascending by name. A property of the running ENGINE, not of this database;
-// for the collations this database references, use Engine.Collations. IsDefault is always false here
-// (that is a per-database property). C is built in and not listed.
+// LoadedCollations introspects the handle Environment's loaded collation set (collation.md §4.2) —
+// every collation a loaded bundle provides, ascending by name. A property of the environment, not of
+// this database; for the collations this database references, use Engine.Collations. IsDefault is
+// always false here (that is a per-database property). C is built in and not listed.
 func (db *engine) LoadedCollations() []collationInfo {
-	colls := loadedCollationTables()
-	out := make([]collationInfo, len(colls))
-	for i, c := range colls {
-		out[i] = collationInfo{
-			Name:           c.Name,
-			UnicodeVersion: c.UnicodeVersion,
-			CLDRVersion:    c.CldrVersion,
-			ContentHash:    crc32IEEE(serializeTable(c)),
-			Description:    c.Description,
-			IsDefault:      false,
-			// The loaded set IS the version reference — it can never be skewed against itself.
-			Verdict: verdictFull,
-		}
-	}
-	return out
+	return db.session.env.LoadedCollations()
 }
 
 // SetDefaultCollation sets the per-database default collation (db.SetDefaultCollation,
@@ -1666,7 +1615,7 @@ func (db *engine) DefaultCollation() string {
 
 // Collations introspects the collations THIS DATABASE references (db.Collations,
 // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
-// per-database default), in ascending name order. This is the per-file view; for the engine-global
+// per-database default), in ascending name order. This is the per-file view; for the Environment's
 // LOADED set, use Engine.LoadedCollations. C is built in and not listed.
 func (db *engine) Collations() []collationInfo {
 	// referencedCollations resolves each referenced name (from a loaded bundle).

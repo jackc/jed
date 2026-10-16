@@ -115,7 +115,7 @@ func TestCompositeValuesPersistThroughImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestTypesPersistThroughImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestCompositeWithArrayFieldImageRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestCompositeWithArrayOfCompositeField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}

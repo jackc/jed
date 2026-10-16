@@ -250,7 +250,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 		if ty.kind != rtBool && ty.kind != rtNull {
 			return positionError(typeError("argument of CHECK must be boolean"), exprLocation(d.Expr))
 		}
-		hostDeps, err := collectCheckHostDeps(node, db.session.extensions)
+		hostDeps, err := collectCheckHostDeps(node, db.session.env.hosts)
 		if err != nil {
 			return err
 		}
@@ -625,7 +625,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		if err != nil {
 			return nil, err
 		}
-		if c.HostDeps, err = collectCheckHostDeps(node, db.session.extensions); err != nil {
+		if c.HostDeps, err = collectCheckHostDeps(node, db.session.env.hosts); err != nil {
 			return nil, err
 		}
 		checks = append(checks, namedCheck{name: c.Name, node: node})

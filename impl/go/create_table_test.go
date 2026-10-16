@@ -114,7 +114,7 @@ func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
 	wantErr(t, loaded, "SELECT nextval('Seq')", "42P01") // the bare text folds to seq
 	// Re-serializing the catalog is byte-identical (the reader trusts the emitted order); the
 	// nextval above advanced "Seq", so compare against a fresh reload of the original image.
-	fresh, err := loadEngine(image)
+	fresh, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -25,7 +25,7 @@ type engine struct {
 
 func open(dataDir, dataset string) (bench.Engine, error) {
 	e := &engine{dataDir: dataDir, dataset: dataset}
-	ext, err := benchExtensions()
+	env, err := benchEnvironment()
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +35,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 			return nil, err
 		}
 		e.scratch = dir
-		db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed"), Extensions: ext})
+		db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed"), Environment: env})
 		if err != nil {
 			os.RemoveAll(dir)
 			return nil, err
@@ -44,7 +44,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 		e.sess = db.Session(jed.SessionOptions{})
 		return e, nil
 	}
-	db, err := jed.OpenDatabaseWithOptions(filepath.Join(dataDir, dataset+".jed"), jed.OpenOptions{Extensions: ext})
+	db, err := jed.OpenDatabaseWithOptions(filepath.Join(dataDir, dataset+".jed"), jed.OpenOptions{Environment: env})
 	if err != nil {
 		return nil, err
 	}
@@ -59,18 +59,18 @@ func benchMix(v jed.Value) jed.Value {
 	return jed.IntValue(v.Int * 2654435761 % 1000003)
 }
 
-// benchExtensions registers the bench host functions on every handle: the same arithmetic as a
-// single-row kernel (bench_mix_row) and a batch kernel (bench_mix_batch).
-func benchExtensions() (*jed.ExtensionRegistry, error) {
-	reg := jed.NewExtensionRegistry()
-	err := reg.RegisterFunction(jed.NewHostFunction("bench_mix_row", []string{"i32"}, "i64",
+// benchEnvironment builds the Environment every handle opens under, carrying the bench host functions:
+// the same arithmetic as a single-row kernel (bench_mix_row) and a batch kernel (bench_mix_batch).
+func benchEnvironment() (*jed.Environment, error) {
+	b := jed.NewEnvironmentBuilder()
+	err := b.RegisterFunction(jed.NewHostFunction("bench_mix_row", []string{"i32"}, "i64",
 		func(args []jed.Value) (jed.Value, error) {
 			return benchMix(args[0]), nil
 		}).WithVolatility(jed.VolatilityImmutable))
 	if err != nil {
 		return nil, err
 	}
-	err = reg.RegisterFunction(jed.NewHostBatchFunction("bench_mix_batch", []string{"i32"}, "i64",
+	err = b.RegisterFunction(jed.NewHostBatchFunction("bench_mix_batch", []string{"i32"}, "i64",
 		func(args [][]jed.Value, out []jed.Value) ([]jed.Value, error) {
 			for _, v := range args[0] {
 				out = append(out, benchMix(v))
@@ -80,7 +80,7 @@ func benchExtensions() (*jed.ExtensionRegistry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return reg, nil
+	return b.Build(), nil
 }
 
 // HostFunctions reports that every handle carries the bench host functions (benchmarks.md §8.2).

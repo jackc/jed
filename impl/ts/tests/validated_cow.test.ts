@@ -11,6 +11,7 @@ import { Pager } from "../src/pager.ts";
 import { SharedPaging } from "../src/paging.ts";
 import { persistImpl } from "../src/persist.ts";
 import { EngineError, execute } from "../src/tooling.ts";
+import { Environment } from "../src/environment.ts";
 
 test("complete manifest with self-freeing dependencies is corrupt", () => {
   const image = readFileSync(
@@ -68,7 +69,7 @@ function openStore(store: RecordingStore): Engine {
   return db;
 }
 function setup(pageSize = 256): { db: Engine; store: RecordingStore } {
-  const store = new RecordingStore(toImage(new Snapshot(1n), pageSize, 1n));
+  const store = new RecordingStore(toImage(new Snapshot(new Environment(), 1n), pageSize, 1n));
   const db = openStore(store);
   db.paging!.reserve(512); // exclude allocating barriers from steady-state assertions
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, value text)");

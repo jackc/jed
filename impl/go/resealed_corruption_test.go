@@ -172,7 +172,6 @@ func runResealed(image []byte, stmts []string) error {
 }
 
 func TestResealedPageCorruptionFailsClosed(t *testing.T) {
-	loadFixtureBundle(t)
 	dir := specPath(t, "fileformat/fixtures")
 	paths, err := filepath.Glob(filepath.Join(dir, "*.jed"))
 	if err != nil || len(paths) == 0 {

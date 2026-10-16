@@ -7,21 +7,29 @@
 //! across clock changes on ONE handle. Mirrors impl/go/date_clock_test.go.
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions, fixed_clock};
+use jed::{CreateOptions, Database, Environment, ManualClock, Outcome, Session, SessionOptions};
+use std::sync::Arc;
 
 /// 2024-07-15 23:30:00 UTC — half an hour before a UTC midnight, so a UTC+2 session zone is
 /// already on 2024-07-16 while UTC is still on 2024-07-15.
 const NEAR_MIDNIGHT_UTC: i64 = 1_721_086_200_000_000;
 
-fn clock_db(micros: i64, stmts: &[&str]) -> Session {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+/// A session over a database whose environment reads a manual clock, set to `micros` after `stmts`
+/// run; the clock is returned so a test can move it.
+fn clock_db(micros: i64, stmts: &[&str]) -> (Session, Arc<ManualClock>) {
+    let clock = jed::manual_clock(0);
+    let env = Environment::builder().clock_source(clock.clone()).build();
+    let mut db = Database::create(CreateOptions {
+        environment: env,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     for s in stmts {
         db.query_outcome(s, &[]).unwrap();
     }
-    db.set_clock_source(fixed_clock(micros));
-    db
+    clock.set(micros);
+    (db, clock)
 }
 
 /// Whether `expr` evaluates to 2024-07-16 (vs 2024-07-15).
@@ -37,7 +45,7 @@ fn is_next_day(db: &mut Session, expr: &str) -> bool {
 
 #[test]
 fn date_clock_uses_session_zone() {
-    let mut db = clock_db(NEAR_MIDNIGHT_UTC, &[]);
+    let (mut db, _clock) = clock_db(NEAR_MIDNIGHT_UTC, &[]);
     // Default UTC session: still 2024-07-15.
     assert!(!is_next_day(&mut db, "'today'::date"));
     // A UTC+2 session zone (the POSIX fixed-offset spelling '-02:00' — positive is WEST,
@@ -59,13 +67,13 @@ fn date_clock_uses_session_zone() {
 fn date_clock_default_never_folds() {
     // The DEFAULT is created under clock A; an INSERT under clock B (a day later) must see B's
     // day — a CREATE-TABLE-folded constant (PostgreSQL's behavior) could not. Same handle.
-    let mut db = clock_db(
+    let (mut db, clock) = clock_db(
         NEAR_MIDNIGHT_UTC,
         &["CREATE TABLE d (id i32 PRIMARY KEY, dt date DEFAULT 'today')"],
     );
     db.query_outcome("INSERT INTO d (id) VALUES (1)", &[])
         .unwrap();
-    db.set_clock_source(fixed_clock(NEAR_MIDNIGHT_UTC + 86_400_000_000));
+    clock.set(NEAR_MIDNIGHT_UTC + 86_400_000_000);
     db.query_outcome("INSERT INTO d (id) VALUES (2)", &[])
         .unwrap();
     match db

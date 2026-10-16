@@ -206,7 +206,7 @@ import {
   validateJson,
   writeJsonString,
 } from "./json.ts";
-import { type Collation, foldCase, foldLowerSimple, loadedProperty } from "./collation.ts";
+import { type Collation, foldCase, foldLowerSimple } from "./collation.ts";
 import {
   compileRegex,
   foldRegexPattern,
@@ -921,7 +921,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16) before
       // matching — 1:1 folding so the matcher's _/length semantics survive.
       if (e.insensitive) {
-        const prop = loadedProperty();
+        const prop = env.environment.property();
         sub = foldLowerSimple(sub, prop);
         pat = foldLowerSimple(pat, prop);
       }
@@ -940,7 +940,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       // ~* (insensitive): simple-lowercase the subject under the engine casing regime (collation.md
       // §16). The constant pattern was folded at resolve; a non-constant pattern is folded below.
-      const prop = e.insensitive ? loadedProperty() : undefined;
+      const prop = e.insensitive ? env.environment.property() : undefined;
       const sub = e.insensitive ? foldLowerSimple(subject.text, prop) : subject.text;
       const subjCps = Array.from(sub, (c) => c.codePointAt(0) as number);
       let matched: boolean;
@@ -1058,7 +1058,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // The original-case subject (for output/captures) and the matched subject (folded when
       // case-insensitive — same length, so offsets carry over, regex.md §8).
       const origCps = Array.from(source, (ch) => ch.codePointAt(0) as number);
-      const prop = insensitive ? loadedProperty() : undefined;
+      const prop = insensitive ? env.environment.property() : undefined;
       const matchCps = insensitive
         ? Array.from(foldLowerSimple(source, prop), (ch) => ch.codePointAt(0) as number)
         : origCps;
@@ -1130,7 +1130,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (v.kind !== "text") {
         throw new Error("unreachable: resolver requires text upper/lower operand");
       }
-      return textValue(foldCase(v.text, e.upper, loadedProperty()));
+      return textValue(foldCase(v.text, e.upper, env.environment.property()));
     }
     case "atTimeZone": {
       m.charge(COSTS.operatorEval);
@@ -1148,7 +1148,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (micros === POS_INFINITY || micros === NEG_INFINITY) {
         return e.toTimestamptz ? timestamptzValue(micros) : timestampValue(micros);
       }
-      const zr = resolveZone(zv.text);
+      const zr = resolveZone(zv.text, env.environment);
       if (zr === undefined) {
         throw engineError("invalid_parameter_value", `time zone "${zv.text}" not recognized`);
       }
@@ -1177,7 +1177,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         let zr: ZoneRef;
         if (zv !== null) {
           if (zv.kind !== "text") throw new Error("unreachable: resolver requires a text zone");
-          const r = resolveZone(zv.text);
+          const r = resolveZone(zv.text, env.environment);
           if (r === undefined) {
             throw engineError("invalid_parameter_value", `time zone "${zv.text}" not recognized`);
           }
@@ -1234,7 +1234,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // statement clock's day in the session zone + offsetDays. STABLE — the clock is read once
       // per statement, so every evaluation in the statement yields the same day.
       m.charge(COSTS.operatorEval);
-      return dateClockValue(env.exec, env.rng, env.seam, m, e.offsetDays);
+      return dateClockValue(env.exec, env.rng, env.environment, m, e.offsetDays);
     }
     case "case": {
       // CASE is a sanctioned short-circuit (cost.md §3), like AND / OR and COALESCE: conditions are
@@ -1307,7 +1307,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the injection
       // seam. The kernel is reached BY ID through the frozen registry — the path the compiled
       // scalarFunc dispatch cannot offer a host.
-      const hf = env.exec.session.extensions!.functionAt(e.id);
+      const hf = env.exec.session.environment.hostFunctions()!.functionAt(e.id);
       // The declared static cost (cost.md §6 design (a)), charged once per call; arguments charge
       // their own. Guard immediately after (the size-scaled-charge discipline) so a large declared
       // weight aborts BEFORE the kernel runs.
@@ -1402,7 +1402,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         m.guard();
         if (vals.length === 7) {
           const zoneStr = (vals[6] as { text: string }).text;
-          const z = resolveZone(zoneStr);
+          const z = resolveZone(zoneStr, env.environment);
           if (z === undefined) {
             throw engineError("invalid_parameter_value", `time zone "${zoneStr}" not recognized`);
           }
@@ -1420,7 +1420,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // CURRENT_DATE (functions.md §12, date.md §6): the statement clock's day in the session
         // zone — the 'today' literal as a function. STABLE; dateClockValue charges the timezone
         // unit.
-        return dateClockValue(env.exec, env.rng, env.seam, m, 0n);
+        return dateClockValue(env.exec, env.rng, env.environment, m, 0n);
       }
       if (e.func === "date_part") {
         // date_part(field, source) — the float8-returning EXTRACT twin (timezones.md §9.2): the
@@ -1497,7 +1497,9 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         let x = vals[0]! as { kind: string; micros: bigint };
         let dt1: bigint;
         if (vals.length === 1) {
-          const today = dateClockValue(env.exec, env.rng, env.seam, m, 0n) as { days: bigint };
+          const today = dateClockValue(env.exec, env.rng, env.environment, m, 0n) as {
+            days: bigint;
+          };
           dt1 = dateMidnightMicros(today.days);
           if (x.kind === "timestamptz") {
             m.charge(COSTS.timezone);
@@ -1537,24 +1539,24 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // uuid generators (spec/design/entropy.md §3): draw from the per-statement seam (env.rng),
       // advancing the PRNG/counter. The NULL-arg case is handled above.
       if (e.func === "uuidv4") {
-        return uuidValue(env.rng.uuidV4(env.seam));
+        return uuidValue(env.rng.uuidV4(env.environment));
       }
       if (e.func === "uuidv7") {
-        const clock = env.rng.statementClockMicros(env.seam);
+        const clock = env.rng.statementClockMicros(env.environment);
         // The optional interval arg shifts the embedded instant via the existing calendar-aware
         // timestamptz arithmetic (entropy.md §4).
         const shifted =
           vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
-        return uuidValue(env.rng.uuidV7(env.seam, shifted));
+        return uuidValue(env.rng.uuidV7(env.environment, shifted));
       }
       // current-time functions (spec/design/entropy.md §5): now() reads the statement clock ONCE and
       // reuses it (STABLE); clock_timestamp() reads the seam on every call (VOLATILE). Both return
       // the seam's micros directly as timestamptz.
       if (e.func === "now") {
-        return timestamptzValue(env.rng.statementClockMicros(env.seam));
+        return timestamptzValue(env.rng.statementClockMicros(env.environment));
       }
       if (e.func === "clock_timestamp") {
-        return timestamptzValue(env.rng.clockNowMicros(env.seam));
+        return timestamptzValue(env.rng.clockNowMicros(env.environment));
       }
       // Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an additional
       // sequence_advance unit (the catalog-tuple read+rewrite) and mutates the per-statement pending
@@ -2404,7 +2406,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         exists: e.pathFnKind === "exists" || e.pathFnKind === "existsSilent",
         vars,
       };
-      const res = evalJsonpath(vals[0]!, vals[1]!, opts, silent, m);
+      const res = evalJsonpath(vals[0]!, vals[1]!, opts, silent, env.environment.property(), m);
       if (res === null) return nullValue();
       const seq = res.seq;
       // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
@@ -2458,7 +2460,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (pv.kind !== "jsonpath") {
         throw new Error("resolver restricts a jsonpath argument to jsonpath");
       }
-      const compiled = jsonPathCompileMetered(pv.text, m);
+      const compiled = jsonPathCompileMetered(pv.text, m, env.environment.property());
       // The PASSING values, evaluated after the context and path (as in PostgreSQL) and outside ON
       // ERROR: each is a base object for .keyvalue() ids (jsonpath.md §3.1).
       const passing = e.args.slice(2);

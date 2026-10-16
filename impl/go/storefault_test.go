@@ -157,7 +157,7 @@ func openImage(image []byte) (*engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize))
+	return loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize), goldenEnv()) // goldenEnv opens every golden fixture
 }
 
 // errScanHang is returned by guardedScanIDs when an open+scan does not finish within the budget — a

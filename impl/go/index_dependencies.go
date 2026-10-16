@@ -37,7 +37,9 @@ func (d *timeZoneDeps) merge(other timeZoneDeps) {
 	sort.Slice(d.Zones, func(i, j int) bool { return d.Zones[i].Name < d.Zones[j].Name })
 }
 
-func (p *paramTypes) noteIndexZone(node *rExpr) error {
+// noteIndexZone records the timezone dependency of an index expression's zone argument, resolved
+// against env (the handle's Environment).
+func (p *paramTypes) noteIndexZone(node *rExpr, env *Environment) error {
 	if !p.indexContext {
 		return nil
 	}
@@ -45,7 +47,7 @@ func (p *paramTypes) noteIndexZone(node *rExpr) error {
 		return nil
 	}
 	if node.kind == reConstText {
-		zr, ok := ResolveZone(node.cText)
+		zr, ok := env.resolveZone(node.cText)
 		if !ok {
 			return newError(InvalidParameterValue, "time zone not recognized: "+node.cText)
 		}
@@ -54,16 +56,17 @@ func (p *paramTypes) noteIndexZone(node *rExpr) error {
 			p.timezoneDeps.merge(timeZoneDeps{Zones: []timeZoneDep{{Name: z.Name, Version: z.TzdataVersion, Checksum: z.Checksum}}})
 		}
 	} else {
-		p.timezoneDeps.merge(timeZoneDeps{Dynamic: true, Zones: indexZoneDeps()})
+		p.timezoneDeps.merge(timeZoneDeps{Dynamic: true, Zones: env.zoneDeps()})
 	}
 	return nil
 }
 
-func verifyIndexTimezoneDeps(deps timeZoneDeps) error {
+// verifyIndexTimezoneDeps checks an index's recorded timezone dependencies against env's loaded zones.
+func verifyIndexTimezoneDeps(deps timeZoneDeps, env *Environment) error {
 	if deps.empty() {
 		return nil
 	}
-	current := indexZoneDeps()
+	current := env.zoneDeps()
 	matches := !deps.Dynamic || len(current) == len(deps.Zones)
 	for _, d := range deps.Zones {
 		at := sort.Search(len(current), func(i int) bool { return current[i].Name >= d.Name })

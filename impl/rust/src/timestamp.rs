@@ -366,18 +366,36 @@ pub fn parse_timestamptz(s: &str, zone: &crate::timezone::ZoneRef) -> Result<i64
 /// array/range/record text parsers). The resolver reads [`InputZone::consulted`] after folding a
 /// literal: a folded instant that depended on the session zone makes the plan uncacheable (a plan is
 /// shared across sessions) and nonimmutable (a persisted expression is re-resolved in whatever zone
-/// the next statement runs under — 42P17). Explicit offsets and `±infinity` never consult it.
+/// the next statement runs under — 42P17). Explicit offsets and `±infinity` never consult it. It
+/// also carries the environment's casing table, which the text-to-`jsonpath` input folds an
+/// `i`-flagged `like_regex` pattern under (collation.md §16).
 pub(crate) struct InputZone<'a> {
     zone: &'a crate::timezone::ZoneRef,
+    casing: Option<&'a crate::collation::PropertyTable>,
     consulted: std::cell::Cell<bool>,
 }
 
 impl<'a> InputZone<'a> {
+    /// A text-input context in `zone` with ASCII casing.
     pub(crate) fn new(zone: &'a crate::timezone::ZoneRef) -> Self {
+        InputZone::with_casing(zone, None)
+    }
+
+    /// A text-input context in `zone` whose jsonpath input folds under `casing` (`None` ⇒ ASCII).
+    pub(crate) fn with_casing(
+        zone: &'a crate::timezone::ZoneRef,
+        casing: Option<&'a crate::collation::PropertyTable>,
+    ) -> Self {
         Self {
             zone,
+            casing,
             consulted: std::cell::Cell::new(false),
         }
+    }
+
+    /// The environment's casing table (`None` ⇒ ASCII casing).
+    pub(crate) fn casing(&self) -> Option<&'a crate::collation::PropertyTable> {
+        self.casing
     }
 
     /// [`parse_timestamptz`] in this zone, recording a zone consult for an offset-less wall clock.

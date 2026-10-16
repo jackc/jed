@@ -50,6 +50,7 @@ fn unchanged_commits_preserve_bytes_and_skip_barriers() {
     let mut engine = Engine::open_paged(
         Pager::from_store(Box::new(CountingStore(count.clone()))).unwrap(),
         64,
+        &crate::Environment::default(),
     )
     .unwrap();
     engine.path = Some("counting-device".into());

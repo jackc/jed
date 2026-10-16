@@ -320,7 +320,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("LoadEngine: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToImage 2: %v", err)
 	}
-	reloaded, err := loadEngine(image2)
+	reloaded, err := loadEngine(image2, NewEnvironment())
 	if err != nil {
 		t.Fatalf("LoadEngine 2: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	}
 	corrupt := bytes.Clone(image)
 	corrupt[at+4] = '('
-	if _, err := loadEngine(corrupt); err == nil || err.(*EngineError).Code() != "XX001" {
+	if _, err := loadEngine(corrupt, NewEnvironment()); err == nil || err.(*EngineError).Code() != "XX001" {
 		t.Fatalf("corrupt check text = %v, want XX001", err)
 	}
 }

@@ -41,7 +41,7 @@ type tempSpillResult struct {
 
 // spillDB is an in-memory database at page size 256 given dir as its spill target.
 func spillDB(dir string) *Database {
-	db := newInMemoryWithPageSize(256)
+	db := newInMemoryWithPageSize(256, NewEnvironment())
 	if dir != "" {
 		db.setSpillDirForTest(dir)
 	}

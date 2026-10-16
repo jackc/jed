@@ -68,7 +68,8 @@ import type { BinaryOp, InsertValue, Literal } from "./ast.ts";
 import type { ColField, ColType } from "./catalog.ts";
 import { rangeForElement } from "./range.ts";
 import type { Engine, EvalEnv, RExpr } from "./executor.ts";
-import type { Seam, StmtRng } from "./seam.ts";
+import type { Environment } from "./environment.ts";
+import type { StmtRng } from "./seam.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import type { Interval } from "./interval.ts";
@@ -778,7 +779,7 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
     const sp = dateClockSpecial(v.text);
     if (sp !== null) {
       if (sp.epoch) return dateValue(0n);
-      return dateClockValue(env.exec, env.rng, env.seam, m, sp.offsetDays);
+      return dateClockValue(env.exec, env.rng, env.environment, m, sp.offsetDays);
     }
     return dateValue(parseDate(v.text));
   }
@@ -828,7 +829,7 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
 export function dateClockValue(
   exec: Engine,
   rng: StmtRng,
-  seam: Seam,
+  environment: Environment,
   m: Meter,
   offsetDays: bigint,
 ): Value {
@@ -836,7 +837,7 @@ export function dateClockValue(
   const zr = exec.session.timeZone;
   m.charge(COSTS.timezone);
   m.guard();
-  const clock = rng.statementClockMicros(seam);
+  const clock = rng.statementClockMicros(environment);
   // An injected extreme clock can shift past the timestamp range: 22008, like the day bound.
   const local = instantToLocalMicros(zr, clock);
   const floored =

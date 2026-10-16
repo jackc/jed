@@ -194,7 +194,7 @@ fn catalog_order_is_exact_name_bytes_across_reload() {
         create(&mut db, sql).unwrap();
     }
     let image = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
@@ -212,7 +212,7 @@ fn catalog_order_is_exact_name_bytes_across_reload() {
     assert_eq!(err.code(), "42P01", "the bare text folds to seq");
     // Re-serializing the catalog is byte-identical (the reader trusts the emitted order); the
     // nextval above advanced "Seq", so compare against a fresh reload of the original image.
-    let fresh = Database::from_image(&image)
+    let fresh = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(fresh.to_image(8192, 1).unwrap(), image);

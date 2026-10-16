@@ -8,24 +8,26 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fixedClock } from "../src/seam.ts";
-import { dbWith, query } from "./util.ts";
+import { createDatabase, Environment, ManualClock, type Session } from "../src/lib.ts";
+import { query } from "./util.ts";
 
 // 2024-07-15 23:30:00 UTC — half an hour before a UTC midnight, so a UTC+2 session zone is
 // already on 2024-07-16 while UTC is still on 2024-07-15.
 const NEAR_MIDNIGHT_UTC = 1721086200000000n;
 
-function clockDB(micros: bigint, stmts: string[]): ReturnType<typeof dbWith> {
-  const db = dbWith(stmts);
-  db.setClockSource(fixedClock(micros));
+// clockDB opens a session over a database whose environment reads `clock`, then runs stmts.
+function clockDB(clock: ManualClock, stmts: string[]): Session {
+  const env = Environment.builder().clockSource(clock).build();
+  const db = createDatabase({ environment: env }).session();
+  for (const s of stmts) db.execute(s);
   return db;
 }
 
-const isNextDay = (db: ReturnType<typeof dbWith>, expr: string): boolean =>
+const isNextDay = (db: Session, expr: string): boolean =>
   query(db, `SELECT (${expr}) = '2024-07-16'::date`)[0]![0] === "true";
 
 test("clock-relative date literals use the session zone", () => {
-  const db = clockDB(NEAR_MIDNIGHT_UTC, []);
+  const db = clockDB(new ManualClock(NEAR_MIDNIGHT_UTC), []);
   // Default UTC session: still 2024-07-15.
   assert.equal(isNextDay(db, "'today'::date"), false);
   // A UTC+2 session zone (the POSIX fixed-offset spelling '-02:00' — positive is WEST,
@@ -41,11 +43,10 @@ test("clock-relative date literals use the session zone", () => {
 test("DEFAULT 'today' never folds at CREATE TABLE", () => {
   // The DEFAULT is created under clock A; an INSERT under clock B (a day later) must see B's
   // day — a CREATE-TABLE-folded constant (PostgreSQL's behavior) could not. Same handle.
-  const db = clockDB(NEAR_MIDNIGHT_UTC, [
-    "CREATE TABLE d (id i32 PRIMARY KEY, dt date DEFAULT 'today')",
-  ]);
+  const clock = new ManualClock(NEAR_MIDNIGHT_UTC);
+  const db = clockDB(clock, ["CREATE TABLE d (id i32 PRIMARY KEY, dt date DEFAULT 'today')"]);
   db.execute("INSERT INTO d (id) VALUES (1)");
-  db.setClockSource(fixedClock(NEAR_MIDNIGHT_UTC + 86_400_000_000n));
+  clock.advance(86_400_000_000n);
   db.execute("INSERT INTO d (id) VALUES (2)");
   assert.equal(
     query(

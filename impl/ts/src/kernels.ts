@@ -626,7 +626,8 @@ export function coerceStringLiteral(
       // `'…'::jsonpath` / `jsonpath '…'` — compile (P1a structural subset) + store the canonical
       // normalized text. Malformed → 42601; an unsupported (valid-PG) construct → 0A000.
       return {
-        node: { kind: "constJsonPath", value: jsonPathRender(jsonPathCompile(s)) },
+        // Canonical text only — a like_regex fold never changes it, so no casing table is needed.
+        node: { kind: "constJsonPath", value: jsonPathRender(jsonPathCompile(s, undefined)) },
         type: { kind: "jsonpath" },
       };
     case "text":

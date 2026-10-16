@@ -447,7 +447,7 @@ fn open_reads_the_interior_spine_not_every_leaf() {
         reads: Arc::clone(&reads),
     };
     let pager = Pager::from_store(Box::new(store)).unwrap();
-    let db = Engine::open_paged(pager, 100_000).unwrap();
+    let db = Engine::open_paged(pager, 100_000, &crate::Environment::default()).unwrap();
     let n = reads.load(Ordering::Relaxed) as usize;
 
     // The ceiling is deliberately loose (`< leaves`) — the point is that open does NOT read every

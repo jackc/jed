@@ -54,7 +54,7 @@ fn on_disk_round_trip_preserves_decimals_and_typmod() {
         "INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
     ]);
     let image = db.to_image(8192, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
     // values survive byte-for-byte (re-serialization is identical)

@@ -233,7 +233,7 @@ fn round_trips_through_the_on_disk_image() {
         "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
     ]);
     let image = db.to_image(256, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, jed::Environment::default())
         .unwrap()
         .session(SessionOptions::default());
 

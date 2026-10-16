@@ -423,12 +423,12 @@ const (
 	// `~*`/`!~*` (both sides simple-lowercased like ILIKE). A constant pattern is precompiled once.
 	reRegex
 	// reCasing is upper(text)/lower(text) — Unicode case folding (collation.md §16). casingUpper
-	// selects the direction; folds via the engine-global property table or the ASCII baseline.
+	// selects the direction; folds via the Environment's property table or the ASCII baseline.
 	reCasing
 	// reAtTimeZone is `value AT TIME ZONE zone` (grammar.md §49, timezones.md §6), desugared from the
 	// operator and a bare timezone(zone, value) call. lhs is the zone (text), rhs the value;
 	// atTzToTimestamptz selects the direction (false: timestamptz→timestamp; true: timestamp→
-	// timestamptz). Reads the engine-global loaded zone set; unknown zone 22023, NULL propagates,
+	// timestamptz). Reads the Environment's loaded zone set; unknown zone 22023, NULL propagates,
 	// ±infinity passes through.
 	reAtTimeZone
 	// reDateTrunc is date_trunc(unit, value[, zone]) (timezones.md §9.1). sargs is [unit, value] or
@@ -1951,7 +1951,7 @@ type evalEnv struct {
 	params []Value
 	outer  []storedRow
 	// The per-statement entropy+clock state (spec/design/entropy.md §5): the uuidv7 monotonic counter
-	// + the once-resolved statement clock. The injected random/clock functions live on exec.session.seam
+	// + the once-resolved statement clock. The random/clock sources live on exec.session.env
 	// (handle-scoped); only the volatile uuid generators touch any of this.
 	rng *stmtRng
 	// ctes is the statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at

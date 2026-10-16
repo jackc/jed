@@ -1615,37 +1615,44 @@ mod skew_tests {
     use super::*;
     use std::sync::Arc;
 
-    pub(crate) fn load_bundle() {
+    /// An environment that loaded the production Unicode bundle.
+    pub(crate) fn unicode_env() -> crate::Environment {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../spec/collation/fixtures/unicode.jucd");
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read unicode.jucd: {e}"));
-        crate::load_unicode_data(&bytes).expect("load unicode.jucd");
+        crate::Environment::builder()
+            .load_unicode_data(&bytes)
+            .expect("load unicode.jucd")
+            .build()
     }
 
-    /// The pure verdict (`collation::version_skew`) — the cross-core contract (every core computes
+    /// A fresh in-memory engine over [`unicode_env`].
+    fn unicode_engine() -> Engine {
+        let mut db = Engine::new();
+        db.set_environment(unicode_env());
+        db
+    }
+
+    /// The pure verdict (`Environment::version_skew`) — the cross-core contract (every core computes
     /// the identical result): same version as the loaded bundle ⇒ `None` (Full); a different pin ⇒
     /// `Some(loaded versions)` (Skewed); an unloaded name ⇒ `None` (the absent case is refused at
     /// open, not a skew verdict).
     #[test]
     pub(crate) fn version_skew_pure_verdict() {
-        load_bundle();
-        let loaded = crate::collation::loaded_collation("unicode").expect("unicode loaded");
+        let env = unicode_env();
+        let loaded = env.collation("unicode").expect("unicode loaded");
         assert_eq!(
-            crate::collation::version_skew(
-                "unicode",
-                &loaded.unicode_version,
-                &loaded.cldr_version
-            ),
+            env.version_skew("unicode", &loaded.unicode_version, &loaded.cldr_version),
             None,
             "same version is Full"
         );
         assert_eq!(
-            crate::collation::version_skew("unicode", "0.0.0", "0"),
+            env.version_skew("unicode", "0.0.0", "0"),
             Some((loaded.unicode_version.clone(), loaded.cldr_version.clone())),
             "a different pin is Skewed and reports the loaded version"
         );
         assert_eq!(
-            crate::collation::version_skew("zz-not-loaded", "1", "1"),
+            env.version_skew("zz-not-loaded", "1", "1"),
             None,
             "an unloaded name yields no skew verdict (absent ⇒ refused at open)"
         );
@@ -1658,8 +1665,7 @@ mod skew_tests {
     /// legible via `db.collations()`.
     #[test]
     pub(crate) fn skewed_collation_blocks_writes_reads_ok() {
-        load_bundle();
-        let mut db = Engine::new();
+        let mut db = unicode_engine();
         crate::execute(
             &mut db,
             "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",
@@ -1680,7 +1686,7 @@ mod skew_tests {
         // Inject skew: the file pinned `unicode` to an older version than the loaded bundle. This is
         // exactly the catalog state `Engine::open` produces for a file built under a prior bundle —
         // a catalog-local collation whose pin differs from the loaded set (collation.md §5/§12).
-        let loaded = crate::collation::loaded_collation("unicode").unwrap();
+        let loaded = db.session.env.collation("unicode").unwrap();
         let mut skewed = (*loaded).clone();
         skewed.unicode_version = "0.0.0".to_string();
         db.committed.put_collation(Arc::new(skewed));
@@ -1688,7 +1694,7 @@ mod skew_tests {
         // structurally valid even though their old comparison ordering cannot be checked with the
         // loaded bundle; opening must succeed, and the estimator must not consume the facts.
         let image = db.to_image(8192, 1).expect("serialize skewed statistics");
-        db = Engine::from_image(&image).expect("open skewed statistics");
+        db = Engine::from_image_in(&image, &db.session.env).expect("open skewed statistics");
         assert!(db.committed.column_statistics("t", 0).is_some());
         assert!(db.column_statistics_scoped(None, "t", 0).is_none());
 
@@ -1726,8 +1732,7 @@ mod skew_tests {
     /// plus idempotence (a second upgrade re-pins nothing). The skew injection mirrors the test above.
     #[test]
     pub(crate) fn upgrade_clears_skew() {
-        load_bundle();
-        let mut db = Engine::new();
+        let mut db = unicode_engine();
         crate::execute(
             &mut db,
             "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",
@@ -1737,7 +1742,7 @@ mod skew_tests {
         crate::execute(&mut db, "ANALYZE t (x)").unwrap();
         assert!(db.committed.column_statistics("t", 0).is_some());
         // Inject skew (a file built under a prior bundle), as in the test above.
-        let loaded = crate::collation::loaded_collation("unicode").unwrap();
+        let loaded = db.session.env.collation("unicode").unwrap();
         let mut skewed = (*loaded).clone();
         skewed.unicode_version = "0.0.0".to_string();
         db.committed.put_collation(Arc::new(skewed));

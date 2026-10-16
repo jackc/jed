@@ -47,14 +47,19 @@ impl ParamTypes {
         }
     }
 
-    /// Called at the resolved operation's birth; every enclosing expression shares this state.
-    pub(crate) fn note_index_zone(&mut self, zone: &RExpr) -> Result<()> {
+    /// Called at the resolved operation's birth; every enclosing expression shares this state. Zones
+    /// resolve against the handle's environment `env`.
+    pub(crate) fn note_index_zone(
+        &mut self,
+        zone: &RExpr,
+        env: &crate::environment::Environment,
+    ) -> Result<()> {
         if !self.index_context {
             return Ok(());
         }
         match zone {
             RExpr::ConstNull => (),
-            RExpr::ConstText(name) => match crate::timezone::resolve_zone(name) {
+            RExpr::ConstText(name) => match env.resolve_zone(name) {
                 Some(crate::timezone::ZoneRef::Fixed(_)) => (),
                 Some(crate::timezone::ZoneRef::Zone(z)) => {
                     self.timezone_deps.merge(&TimeZoneDeps {
@@ -75,18 +80,23 @@ impl ParamTypes {
             },
             _ => self.timezone_deps.merge(&TimeZoneDeps {
                 dynamic: true,
-                zones: crate::timezone::index_zone_deps(),
+                zones: env.index_zone_deps(),
             }),
         }
         Ok(())
     }
 }
 
-pub(crate) fn verify_index_timezone_deps(deps: &TimeZoneDeps) -> Result<()> {
+/// Check an index's recorded timezone dependencies against the loaded zones of the handle's
+/// environment `env`.
+pub(crate) fn verify_index_timezone_deps(
+    deps: &TimeZoneDeps,
+    env: &crate::environment::Environment,
+) -> Result<()> {
     if deps.is_empty() {
         return Ok(());
     }
-    let current = crate::timezone::index_zone_deps();
+    let current = env.index_zone_deps();
     let matches = if deps.dynamic {
         current == deps.zones
     } else {

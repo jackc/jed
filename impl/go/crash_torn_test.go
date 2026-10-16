@@ -64,7 +64,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 	if err != nil {
 		tb.Fatal(err)
 	}
-	rdb, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize))
+	rdb, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment())
 	if err != nil {
 		tb.Fatal(err)
 	}

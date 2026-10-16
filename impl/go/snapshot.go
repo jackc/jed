@@ -94,6 +94,11 @@ type snapshot struct {
 	// at load; binding at creation is what covers the stores load never sees. Carried through clone()
 	// so a tx's working snapshot creates stores against the same domain page space. NEVER serialized.
 	storePaging *sharedPaging
+	// env is the Environment of the handle this domain belongs to (spec/design/environment.md): the
+	// loaded collations a referenced collation resolves against and its version verdict is judged by.
+	// Main, temp, and attached domains of one handle share it. Carried through clone(); NEVER
+	// serialized.
+	env *Environment
 }
 
 // Non-zero-sized opaque equality tokens. Go permits distinct pointers to zero-sized variables to
@@ -103,9 +108,10 @@ type (
 	estimatorRevision         struct{ _ byte }
 )
 
-// newSnapshot builds an empty snapshot.
-func newSnapshot() *snapshot {
+// newSnapshot builds an empty snapshot of a domain whose handle uses env.
+func newSnapshot(env *Environment) *snapshot {
 	return &snapshot{
+		env:                   env,
 		estimatorIdentity:     &estimatorDatabaseIdentity{},
 		estimatorBaseRevision: &estimatorRevision{},
 		estimatorRevisions:    make(map[string]*estimatorRevision),
@@ -184,7 +190,7 @@ func (s *snapshot) clone() *snapshot {
 		}
 		statistics[table] = copyColumns
 	}
-	return &snapshot{txid: s.txid, catGen: s.catGen, dataGen: s.dataGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, views: views, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+	return &snapshot{txid: s.txid, catGen: s.catGen, dataGen: s.dataGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, views: views, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging, env: s.env}
 }
 
 // changedSince refines candidate dirty domains without reading rows or serializing. A cloned
@@ -341,15 +347,15 @@ func (s *snapshot) demoteCleanLeaves() {
 
 // resolveCollation resolves a collation name for USE — query resolution and key encoding
 // (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
-// open from the file's reference entries, carrying their version pin) first, then the engine-global
-// LOADED set (db.LoadUnicodeData, §4). nil ⇒ neither has it (the resolver raises 42704). C is handled
+// open from the file's reference entries, carrying their version pin) first, then the LOADED set of
+// the handle's Environment (§4). nil ⇒ neither has it (the resolver raises 42704). C is handled
 // by the caller (built-in). This is the reference-only read path: a collation is never baked into the
 // file — the file references it by name and the table comes from a loaded bundle.
 func (s *snapshot) resolveCollation(name string) *Collation {
 	if c := s.collations[name]; c != nil {
 		return c
 	}
-	return LoadedCollation(name)
+	return s.env.collation(name)
 }
 
 // collationSkew is the slice-2d version-skew verdict for a referenced collation (collation.md §12):
@@ -357,14 +363,14 @@ func (s *snapshot) resolveCollation(name string) *Collation {
 // a different (unicode, cldr) than the loaded bundle provides — the object using it is read-only
 // (XX002 on write) — else skewed=false (Full: same version, or this collation has no catalog-local
 // file pin so it is freshly the loaded version, an in-memory-only database). A pure comparison of the
-// file pin already in the catalog (§5) vs the engine-global loaded set; the Snapshot wiring of
-// collation.VersionSkew.
+// file pin already in the catalog (§5) vs the Environment's loaded set; the Snapshot wiring of
+// Environment.versionSkew.
 func (s *snapshot) collationSkew(name string) (fileU, fileC, loadedU, loadedC string, skewed bool) {
 	cat := s.collations[name]
 	if cat == nil {
 		return "", "", "", "", false
 	}
-	lu, lc, sk := versionSkew(name, cat.UnicodeVersion, cat.CldrVersion)
+	lu, lc, sk := s.env.versionSkew(name, cat.UnicodeVersion, cat.CldrVersion)
 	if !sk {
 		return "", "", "", "", false
 	}
@@ -553,7 +559,7 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 	}
 	// Advance each skewed collation's pin to the loaded version.
 	for name := range skewed {
-		if loaded := LoadedCollation(name); loaded != nil {
+		if loaded := s.env.collation(name); loaded != nil {
 			s.collations[name] = loaded
 		}
 	}

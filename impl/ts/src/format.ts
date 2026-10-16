@@ -39,7 +39,8 @@ import {
   pkIndices,
 } from "./catalog.ts";
 import { parseExpression, parseViewDefinition } from "./parser.ts";
-import { type Collation, loadedCollation } from "./collation.ts";
+import type { Collation } from "./collation.ts";
+import { Environment } from "./environment.ts";
 import { Decimal } from "./decimal.ts";
 import { crc32Update } from "./crc32.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
@@ -2339,6 +2340,7 @@ function collationEntryBytes(c: Collation, isDefault: boolean): Uint8Array {
 function decodeCollationEntry(
   buf: Uint8Array,
   cur: Cursor,
+  environment: Environment,
 ): { coll: Collation; isDefault: boolean } {
   const flags = readU8(buf, cur);
   if ((flags & ~0b1) !== 0) {
@@ -2349,13 +2351,13 @@ function decodeCollationEntry(
   const unicode = readString(buf, cur);
   const cldr = readString(buf, cur);
   const desc = readString(buf, cur);
-  // The file records only the version PIN; the table comes from a loaded bundle (the host must have
-  // loaded one providing this collation before opening — collation.md §4/§9). A name no loaded bundle
+  // The file records only the version PIN; the table comes from a bundle the opening environment
+  // loaded (collation.md §4/§9, environment.md §3). A name no loaded bundle
   // provides at all is the graded verdict's legible refusal (slice 2d, collation.md §12 /
   // compatibility.md §7): the open is refused with XX002 naming the collation + version, rather than
   // degrading the rest of the database (the conservative resolution of compatibility.md §12 open #3 —
   // a version-skewed collation, by contrast, opens and is enforced read-only at write time §14).
-  const loaded = loadedCollation(name);
+  const loaded = environment.collation(name);
   if (loaded === undefined) {
     throw engineError(
       "collation_version_mismatch",
@@ -3084,7 +3086,12 @@ function serializeDirty(
 // eager whole-image readTree loader is gone). The pool is PINNED (unbounded): an in-memory database
 // is resident by definition (§5), so cacheBytes bounds only file-backed eviction and the observable
 // default is unchanged.
-export function loadEngine(image: Uint8Array): Engine {
+// environment is the Environment the database resolves its referenced collations against and runs
+// with (spec/design/environment.md); absent ⇒ a fresh empty one (§7).
+export function loadEngine(
+  image: Uint8Array,
+  environment: Environment = new Environment(),
+): Engine {
   if (image.length < 12) {
     throw engineError("data_corrupted", "image smaller than a meta header");
   }
@@ -3094,7 +3101,7 @@ export function loadEngine(image: Uint8Array): Engine {
     throw engineError("data_corrupted", "invalid page size");
   }
   const pager = Pager.fromStore(new MemoryBlockStore(image));
-  return loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER));
+  return loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER), environment);
 }
 
 // newTempStorage builds a fresh per-domain storage Engine for a TEMP snapshot (temp-tables.md §6,
@@ -3105,9 +3112,10 @@ export function loadEngine(image: Uint8Array): Engine {
 // with the empty from-scratch image exactly as an in-memory database does (loadEngine), so its pageCount
 // starts past the meta slots. Zero file writes: this byte store is entirely separate from the main
 // database file. Only its storage fields (paging/pageCount/freePages/reclaimWithinSession) are used — its
-// committed snapshot is unused, like the shared core's storage Engine (shared.ts).
-export function newTempStorage(pageSize: number): Engine {
-  const st = loadEngine(toImage(new Snapshot(0n), pageSize, 0n));
+// committed snapshot is unused, like the shared core's storage Engine (shared.ts). environment is the
+// owning handle's (a temp domain uses its handle's environment — environment.md §3).
+export function newTempStorage(pageSize: number, environment: Environment): Engine {
+  const st = loadEngine(toImage(new Snapshot(environment, 0n), pageSize, 0n), environment);
   st.reclaimWithinSession = true;
   return st;
 }
@@ -3118,8 +3126,8 @@ export function newTempStorage(pageSize: number): Engine {
 // compaction on), differing only in that its root is DATABASE-scoped (published into the core's
 // attached roots and pinned by the cross-session watermark) rather than session-private. In Slice 1b
 // every attachment is in-memory; a file-backed attachment (Slice 2) would open a FileBlockStore here.
-export function newAttachedStorage(pageSize: number): Engine {
-  return newTempStorage(pageSize);
+export function newAttachedStorage(pageSize: number, environment: Environment): Engine {
+  return newTempStorage(pageSize, environment);
 }
 
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
@@ -3466,7 +3474,12 @@ export function planFreeList(
 // inverse of an incremental commit, reading pages through the pager instead of a whole image. (This
 // slice reads every leaf page once to count its rows for length; an O(skeleton) open needs a
 // per-subtree row count in the format — a deferred follow-on, pager.md §6. Memory is already bounded.)
-export function loadEnginePaged(paging: SharedPaging): Engine {
+// environment is the handle's Environment: the file's referenced collations resolve against it
+// (environment.md §3); absent ⇒ a fresh empty one (§7).
+export function loadEnginePaged(
+  paging: SharedPaging,
+  environment: Environment = new Environment(),
+): Engine {
   const pageSize = paging.pageSize();
   if (!pageSizeValid(pageSize)) {
     throw engineError("data_corrupted", "invalid page size");
@@ -3498,7 +3511,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   if (selected === undefined) throw engineError("data_corrupted", "no valid meta page");
   const mt = selected.meta;
 
-  const snap = new Snapshot(mt.txid);
+  const snap = new Snapshot(environment, mt.txid);
   const statisticsExpected = new Map<string, readonly [number, number, number]>();
   const loadedViews: ViewDef[] = [];
   // v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
@@ -3538,7 +3551,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
       if (kind === 3) {
         // A collation snapshot (v17): the baked .coll artifact + an is_default flag
         // (spec/design/collation.md §5); the default restores the per-database default.
-        const { coll, isDefault } = decodeCollationEntry(pg.payload, cur);
+        const { coll, isDefault } = decodeCollationEntry(pg.payload, cur, environment);
         if (isDefault) snap.defaultCollation = coll.name;
         snap.collations.set(coll.name, coll);
         continue;
@@ -3658,7 +3671,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
   snap.rebuildGistTrees();
 
-  const db = new Engine();
+  const db = new Engine(environment);
   db.pageSize = pageSize;
   db.pageCount = mt.pageCount;
   // v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability walk

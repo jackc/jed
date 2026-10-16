@@ -1,14 +1,14 @@
-//! Time zones: the `JTZ` bundle codec + an RFC 8536 TZif reader + the engine-global loaded zone
-//! set. The cross-core contract for time-zone conversion (spec/design/timezones.md §4/§5): the
+//! Time zones: the `JTZ` bundle codec + an RFC 8536 TZif reader + the zone parsing an environment
+//! loads. The cross-core contract for time-zone conversion (spec/design/timezones.md §4/§5): the
 //! reader is hand-written per core (CLAUDE.md §5 forbids codegenning it) and **byte-identical given
 //! identical input** — but it reads the *standardized* TZif layout, so cores agree by construction
 //! (§3.4). The byte formats are pinned in spec/tz/README.md (the TZif subset §2, the `JTZ` bundle
 //! §3, the reader contract §4, the POSIX footer §5).
 //!
 //! This is the data path mirroring collation's host-load model: the bare binary carries **no** tz
-//! data (`UTC` + fixed offsets excepted — built-in, table-free, the `C` analogue); a host hands the
-//! engine a `JTZ` bundle's bytes via [`load_time_zone_data`] (`db.LoadTimeZoneData`) and the named
-//! zones become usable. `timestamptz` is a UTC `i64`, so this adds **no** on-disk format change and
+//! data (`UTC` + fixed offsets excepted — built-in, table-free, the `C` analogue); a host hands an
+//! `EnvironmentBuilder` a `JTZ` bundle's bytes (`load_time_zone_data`, spec/design/environment.md)
+//! and the named zones become usable by every database opened with that environment. `timestamptz` is a UTC `i64`, so this adds **no** on-disk format change and
 //! **no** version-skew verdict (the base type is tz-immune, §2) — the collation-style skew machinery
 //! is latent until a tz-*derived* key can be stored (§8).
 
@@ -17,7 +17,7 @@ use crate::format::crc32_ieee;
 use crate::lz4;
 use crate::timestamp::{civil_from_days, days_from_civil};
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::Arc;
 
 fn corrupt(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::DataCorrupted, msg)
@@ -672,26 +672,19 @@ pub fn open_bundle(bytes: &[u8]) -> Result<TzBundle> {
 }
 
 // ============================================================================================
-// The engine-global loaded zone set + the load seam (timezones.md §3.3)
+// Loading a bundle's zones (timezones.md §3.3)
 // ============================================================================================
 //
-// Mirrors collation's process-global `LOADED` set: the bare binary carries no tz data, a host hands
-// the engine a `JTZ` bundle's bytes via `load_time_zone_data` (`db.LoadTimeZoneData`), and the zones
-// land here. Global (not per-handle) so a host may load before opening any file. `UTC` and fixed
-// offsets are never here — they are built in (resolve_zone, §3.2).
+// The bare binary carries no tz data; a host hands an `EnvironmentBuilder` a `JTZ` bundle's bytes and
+// the zones land in the environment's loaded set (crate::environment). `UTC` and fixed offsets are
+// never loaded — they are built in ([`builtin_zone`], §3.2).
 
-static LOADED_TZ: OnceLock<RwLock<BTreeMap<String, Arc<Zone>>>> = OnceLock::new();
-
-fn loaded_set() -> &'static RwLock<BTreeMap<String, Arc<Zone>>> {
-    LOADED_TZ.get_or_init(|| RwLock::new(BTreeMap::new()))
-}
-
-/// Load a `JTZ` bundle into the engine-global loaded set (§3.3/§4): parse each zone's TZif, register
-/// it by name, then resolve each link alias onto its target's tables. **Additive / first-wins** — a
-/// name already present is not replaced, so re-loading the same bundle is an idempotent no-op. A
-/// malformed bundle (or TZif) is `XX001`. The engine primitive behind `db.LoadTimeZoneData`; may be
-/// called before opening any file, reads no path, reaches no host data (§10).
-pub fn load_time_zone_data(bytes: &[u8]) -> Result<()> {
+/// Parse a `JTZ` bundle into the zones it provides, in load order (§3.3/§4): each zone's TZif under
+/// its name, then each link alias resolved onto its target's tables (an alias whose target the bundle
+/// does not carry is skipped). The caller registers them **first-wins**, so re-loading the same bundle
+/// is an idempotent no-op. A malformed bundle (or TZif) is `XX001`. Reads no path, reaches no host
+/// data (§10).
+pub(crate) fn parse_zone_bundle(bytes: &[u8]) -> Result<Vec<Arc<Zone>>> {
     let bundle = open_bundle(bytes)?;
     let ver = &bundle.tzdata_version;
 
@@ -709,57 +702,27 @@ pub fn load_time_zone_data(bytes: &[u8]) -> Result<()> {
         );
     }
 
-    let mut set = loaded_set().write().expect("loaded-timezone lock poisoned");
-    for (name, z) in &parsed {
-        set.entry(name.clone()).or_insert_with(|| z.clone());
-    }
+    let mut zones: Vec<Arc<Zone>> = parsed.values().cloned().collect();
     for (alias, target) in &bundle.links {
         if let Some(z) = parsed.get(target) {
-            let aliased = Arc::new(Zone {
+            zones.push(Arc::new(Zone {
                 name: alias.clone(),
                 tzdata_version: ver.clone(),
                 data: z.data.clone(),
                 checksum: z.checksum,
-            });
-            set.entry(alias.clone()).or_insert(aliased);
+            }));
         }
     }
-    Ok(())
+    Ok(zones)
 }
 
-/// Look up a loaded named zone by exact name (`None` ⇒ no loaded bundle provides it).
-pub fn loaded_zone(name: &str) -> Option<Arc<Zone>> {
-    loaded_set()
-        .read()
-        .expect("loaded-timezone lock poisoned")
-        .get(name)
-        .cloned()
-}
-
-/// Introspect the engine-global loaded zone set (`db.LoadedTimeZones`, §3.3): every zone + alias a
-/// loaded bundle provides, ascending by name.
-pub fn loaded_time_zones() -> Vec<TimeZoneInfo> {
-    loaded_set()
-        .read()
-        .expect("loaded-timezone lock poisoned")
-        .values()
-        .map(|z| TimeZoneInfo {
-            name: z.name.clone(),
-            tzdata_version: z.tzdata_version.clone(),
-        })
-        .collect()
-}
-
-/// Resolve a zone name to a built-in fixed offset (`UTC` / `±HH[:MM[:SS]]`, §3.2) or a loaded named
-/// zone. `None` ⇒ unknown (the caller raises `22023`).
-pub fn resolve_zone(name: &str) -> Option<ZoneRef> {
+/// Resolve a zone name to a built-in fixed offset (`UTC` / `±HH[:MM[:SS]]`, §3.2), which needs no
+/// loaded data. `None` ⇒ not built in (an environment then looks the name up among its loaded zones).
+pub(crate) fn builtin_zone(name: &str) -> Option<ZoneRef> {
     if name == "UTC" {
         return Some(ZoneRef::Fixed(0));
     }
-    if let Some(off) = parse_fixed_offset(name) {
-        return Some(ZoneRef::Fixed(off));
-    }
-    loaded_zone(name).map(ZoneRef::Zone)
+    parse_fixed_offset(name).map(ZoneRef::Fixed)
 }
 
 /// The offset in effect at `instant_secs` for a resolved zone reference.
@@ -926,18 +889,4 @@ impl<'a> Reader<'a> {
         let s = self.take(n)?;
         String::from_utf8(s.to_vec()).map_err(|_| corrupt("tz: invalid UTF-8 string"))
     }
-}
-
-/// A single locked snapshot, sorted by exact UTF-8 name, for persisted index dependencies.
-pub(crate) fn index_zone_deps() -> Vec<crate::catalog::TimeZoneDep> {
-    loaded_set()
-        .read()
-        .expect("loaded-timezone lock poisoned")
-        .values()
-        .map(|z| crate::catalog::TimeZoneDep {
-            name: z.name.clone(),
-            version: z.tzdata_version.clone(),
-            checksum: z.checksum,
-        })
-        .collect()
 }

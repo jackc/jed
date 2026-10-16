@@ -1691,7 +1691,11 @@ func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, var
 	case scalarJsonPath:
 		// '…'::jsonpath / jsonpath '…' — compile (P1a structural subset) + store the canonical
 		// normalized text. Malformed → 42601; an unsupported (valid-PG) construct → 0A000.
-		jp, err := compile(s)
+		var prop *propertyTable
+		if iz != nil {
+			prop = iz.prop
+		}
+		jp, err := compile(s, prop)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}

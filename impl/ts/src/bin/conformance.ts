@@ -15,10 +15,9 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
-import { loadedCollation, loadUnicodeData } from "../collation.ts";
 import { Decimal } from "../decimal.ts";
 import { DEFAULT_WORK_MEM } from "../spill.ts";
-import { loadTimeZoneData, resolveZone } from "../timezone.ts";
+import { resolveZone } from "../timezone.ts";
 import {
   arrayValue,
   boolValue,
@@ -30,14 +29,17 @@ import {
   type Value,
 } from "../value.ts";
 import {
-  advancingClock,
+  AdvancingClock,
   attachMemory,
+  type ClockSource,
   createDatabase,
   Database,
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_TEMP_BUFFERS,
   EngineError,
-  fixedClock,
+  Environment,
+  ManualClock,
+  osRandomSource,
   type Outcome,
   type Privilege,
   PrivilegeSet,
@@ -45,14 +47,101 @@ import {
   queryMemoryPeak,
   queryMemoryUnderflows,
   queryOutcome,
-  seededRandomSource,
+  type RandomSource,
+  SeededRandom,
   openDatabase,
   type Session,
   setSpillDirForTest,
   SUPPORTED_CAPABILITIES,
   tempSpills,
   verifyLivePages,
+  wallClock,
 } from "../tooling.ts";
+
+// SwitchableRandom is the harness's own random source (spec/design/environment.md §4): OS entropy
+// by default, and — for a record carrying `# seed:` — a SeededRandom reseeded before the record, so
+// the uuid generators are byte-identical across cores. Installed once in the environment of every
+// database the harness runs records against; the per-record directive only switches its state.
+class SwitchableRandom implements RandomSource {
+  private readonly seeded = new SeededRandom(0n);
+  private active = false;
+
+  // useSeed reseeds the deterministic stream and switches to it.
+  useSeed(seed: bigint): void {
+    this.seeded.reseed(seed);
+    this.active = true;
+  }
+
+  // useOs switches back to OS entropy.
+  useOs(): void {
+    this.active = false;
+  }
+
+  fill(buf: Uint8Array): void {
+    if (this.active) this.seeded.fill(buf);
+    else osRandomSource().fill(buf);
+  }
+}
+
+// SwitchableClock is the harness's own clock source: the wall clock by default, a ManualClock set
+// for a `# clock:` record, or an AdvancingClock reset for a `# clock_advance:` record.
+class SwitchableClock implements ClockSource {
+  private readonly manual = new ManualClock(0n);
+  private readonly advancing = new AdvancingClock(0n, 0n);
+  private mode: "wall" | "manual" | "advancing" = "wall";
+
+  useManual(micros: bigint): void {
+    this.manual.set(micros);
+    this.mode = "manual";
+  }
+
+  useAdvancing(start: bigint, step: bigint): void {
+    this.advancing.reset(start, step);
+    this.mode = "advancing";
+  }
+
+  useWall(): void {
+    this.mode = "wall";
+  }
+
+  nowMicros(): bigint {
+    if (this.mode === "manual") return this.manual.nowMicros();
+    if (this.mode === "advancing") return this.advancing.nowMicros();
+    return wallClock().nowMicros();
+  }
+}
+
+const harnessRandom = new SwitchableRandom();
+const harnessClock = new SwitchableClock();
+
+function unicodeBundlePath(): string {
+  return join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
+}
+
+function tzBundlePath(): string {
+  return join(repoRoot(), "spec", "tz", "fixtures", "tzdata.jtz");
+}
+
+// fileEnvironment builds the environment a corpus file runs against: the harness's switchable
+// sources, plus jed's pinned production Unicode bundle when the file loads a collation or opens a
+// fixture, and the pinned JTZ bundle when it loads time-zone data. The harness acts as the HOST
+// (environment.md §3): the data goes into the environment passed at create/open, and the
+// `# load-collation:` / `# load-timezone:` directives then assert the named entry resolves.
+function fileEnvironment(text: string): Environment {
+  const b = Environment.builder().randomSource(harnessRandom).clockSource(harnessClock);
+  let unicode = false;
+  let tz = false;
+  for (const raw of text.split("\n")) {
+    const t = raw.trim();
+    if (!t.startsWith("#")) continue;
+    if (parseLoadCollationDirective(t) !== null) unicode = true;
+    if (parseFixtureDirective(t) !== null && existsSync(unicodeBundlePath())) unicode = true;
+    if (parseLoadTimezoneDirective(t) !== null) tz = true;
+  }
+  if (unicode) b.loadUnicodeData(readFileSync(unicodeBundlePath()));
+  if (tz) b.loadTimeZoneData(readFileSync(tzBundlePath()));
+  return b.build();
+}
 
 function repoRoot(): string {
   let dir = import.meta.dirname; // .../impl/ts/src/bin
@@ -89,16 +178,13 @@ function parseLoadCollationDirective(line: string): [string, string[]] | null {
   return [name, paths];
 }
 
-// loadCollation makes a collation named `name` available to the records that follow
-// (spec/design/collation.md §2/§9/§10). The harness acts as the HOST: it loads jed's own pinned
-// production JUCD bundle (spec/collation/fixtures/unicode.jucd) into the engine-global set via
-// db.loadUnicodeData (idempotent — the set is global), exactly as a production host would, then
-// asserts the named collation now resolves. A name no loaded bundle provides throws, naming it (the
-// directive's fixture paths are now a documentary provenance note, not loaded).
-function loadCollation(name: string): void {
-  const path = join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
-  loadUnicodeData(readFileSync(path));
-  if (loadedCollation(name) !== undefined) return;
+// loadCollation asserts a collation named `name` is available to the records that follow
+// (spec/design/collation.md §2/§9/§10). The harness acts as the HOST: fileEnvironment already loaded
+// jed's own pinned production JUCD bundle (spec/collation/fixtures/unicode.jucd) into the file's
+// environment, exactly as a production host would. A name no loaded bundle provides throws, naming it
+// (the directive's fixture paths are now a documentary provenance note, not loaded).
+function loadCollation(env: Environment, name: string): void {
+  if (env.collation(name) !== undefined) return;
   throw new Error(`load-collation: collation "${name}" is not provided by the loaded bundle`);
 }
 
@@ -111,14 +197,12 @@ function parseLoadTimezoneDirective(line: string): string | null {
   return rest.slice("load-timezone:".length).trim();
 }
 
-// loadTimezone makes the IANA time zones available to the records that follow (timezones.md §3.3/§11).
-// The harness acts as the HOST: it loads jed's pinned production JTZ bundle (spec/tz/fixtures/tzdata.jtz)
-// into the engine-global set via db.loadTimeZoneData (idempotent — the set is global), then, if a zone
-// name was given, asserts it now resolves. A named zone no loaded bundle provides throws.
-function loadTimezone(name: string): void {
-  const path = join(repoRoot(), "spec", "tz", "fixtures", "tzdata.jtz");
-  loadTimeZoneData(readFileSync(path));
-  if (name === "" || resolveZone(name) !== undefined) return;
+// loadTimezone asserts the IANA time zones are available to the records that follow (timezones.md
+// §3.3/§11). The harness acts as the HOST: fileEnvironment already loaded jed's pinned production JTZ
+// bundle (spec/tz/fixtures/tzdata.jtz) into the file's environment; if a zone name was given, this
+// asserts it resolves. A named zone no loaded bundle provides throws.
+function loadTimezone(env: Environment, name: string): void {
+  if (name === "" || resolveZone(name, env) !== undefined) return;
   throw new Error(`load-timezone: zone "${name}" is not provided by the loaded bundle`);
 }
 
@@ -189,15 +273,13 @@ function parseMaxStorageBytesDirective(line: string): [bigint, string] | null {
 }
 
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
-// spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
-// referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
-// is the point), then reconstructs the database in memory via loadEngine. The handle is read-WRITE
-// so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
-// read-only-handle error.
-function openFixture(rel: string): Database {
-  const bundle = join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
-  if (existsSync(bundle)) loadUnicodeData(readFileSync(bundle)); // idempotent: the set is engine-global
-  return Database.fromImage(readFileSync(join(repoRoot(), "spec", rel)));
+// spec/). The harness acts as the host: the file's environment carries jed's pinned production bundle
+// (fileEnvironment) so any referenced collation resolves on open (a skewed pin still resolves — to a
+// DIFFERENT version, which is the point), then it reconstructs the database in memory via loadEngine.
+// The handle is read-WRITE so a write against a skewed table exercises the real XX002 guard
+// (collation.md §12), not a read-only-handle error.
+function openFixture(env: Environment, rel: string): Database {
+  return Database.fromImage(readFileSync(join(repoRoot(), "spec", rel)), env);
 }
 
 function parseRequires(text: string): string[] {
@@ -754,10 +836,12 @@ function runFile(text: string, disk: boolean): void {
   // fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
   // A failed create (e.g. ENOSPC once the bundle exists) runs before the try/finally below, so remove
   // the temp directory here, or every failing file leaks one `<dir>/conf.jed.lock/`.
+  // The file's environment: the harness's switchable sources + any bundles its directives need.
+  const env = fileEnvironment(text);
   let dbHandle: Database | null = null;
   if (tmpDir !== null && tmpPath !== null) {
     try {
-      dbHandle = createDatabase({ path: tmpPath, skipFsync: true });
+      dbHandle = createDatabase({ path: tmpPath, skipFsync: true, environment: env });
     } catch (e) {
       rmSync(tmpDir, { recursive: true, force: true });
       throw e;
@@ -771,7 +855,7 @@ function runFile(text: string, disk: boolean): void {
   if (dbHandle !== null) {
     attachDb = dbHandle;
   } else {
-    attachDb = createDatabase({});
+    attachDb = createDatabase({ environment: env });
     // Forced temp spill (JED_CONFORMANCE_TEMP_BUFFERS, temp-tables.md §6): an in-memory database has no
     // spill target, so give it one — temp domains then spill to scratch files.
     if (forcedTempBuffers() !== null) setSpillDirForTest(attachDb, tmpdir());
@@ -822,16 +906,16 @@ function runFile(text: string, disk: boolean): void {
         // (spec/design/collation.md §2/§9/§10).
         const lc = parseLoadCollationDirective(line);
         if (lc !== null) {
-          loadCollation(lc[0]);
+          loadCollation(env, lc[0]);
           c.i++;
           continue;
         }
-        // `# load-timezone: [<zone>]` is an ACTION: load jed's pinned JTZ bundle into the engine-global
-        // set (and optionally assert a zone resolves) before the records that use AT TIME ZONE
-        // (timezones.md §11).
+        // `# load-timezone: [<zone>]` is an ACTION: the file's environment carries jed's pinned JTZ
+        // bundle (fileEnvironment); optionally assert a zone resolves before the records that use AT
+        // TIME ZONE (timezones.md §11).
         const ltz = parseLoadTimezoneDirective(line);
         if (ltz !== null) {
-          loadTimezone(ltz);
+          loadTimezone(env, ltz);
           c.i++;
           continue;
         }
@@ -841,7 +925,7 @@ function runFile(text: string, disk: boolean): void {
         if (fx !== null && fx.wantCode !== null) {
           let opened: Database;
           try {
-            opened = openFixture(fx.path);
+            opened = openFixture(env, fx.path);
           } catch (e) {
             if (e instanceof EngineError && e.code() === fx.wantCode) return; // failed as required
             throw new Error(
@@ -852,7 +936,7 @@ function runFile(text: string, disk: boolean): void {
           throw new Error(`fixture ${fx.path} opened, expected error ${fx.wantCode}`);
         }
         if (fx !== null) {
-          attachDb = openFixture(fx.path);
+          attachDb = openFixture(env, fx.path);
           db = attachDb.session();
           onTemp = false; // the handle is now the fixture image, not the reopenable temp file
           c.i++;
@@ -970,7 +1054,8 @@ function runFile(text: string, disk: boolean): void {
       // resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
       if (disk && onTemp) {
         dbHandle!.close();
-        dbHandle = openDatabase(tmpPath!, { skipFsync: true }); // fsync=off (throwaway image)
+        // fsync=off (throwaway image); the same environment, as a host reopening with its own.
+        dbHandle = openDatabase(tmpPath!, { skipFsync: true, environment: env });
         dbHandle.setMaxStorageBytes("main", mainStorageLimit);
         attachDb = dbHandle;
         db = dbHandle.session();
@@ -1007,19 +1092,20 @@ function runFile(text: string, disk: boolean): void {
       // `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
       db.setMaxSqlLength(pendingMaxSqlLength ?? DEFAULT_MAX_SQL_LENGTH);
       pendingMaxSqlLength = null;
-      // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md §6);
-      // absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
-      if (pendingSeed !== null) db.setRandomSource(seededRandomSource(pendingSeed));
-      else db.clearRandomSource();
+      // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md §6)
+      // by switching the environment's harness sources (environment.md §4); absent ⇒ back to OS
+      // entropy / the wall clock, so a directive never leaks forward.
+      if (pendingSeed !== null) harnessRandom.useSeed(pendingSeed);
+      else harnessRandom.useOs();
       pendingSeed = null;
-      // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one); a
-      // record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
+      // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a manual one set
+      // to the instant); a record uses at most one. Absent ⇒ the wall clock.
       if (pendingClockAdvance !== null) {
-        db.setClockSource(advancingClock(pendingClockAdvance[0], pendingClockAdvance[1]));
+        harnessClock.useAdvancing(pendingClockAdvance[0], pendingClockAdvance[1]);
       } else if (pendingClock !== null) {
-        db.setClockSource(fixedClock(pendingClock));
+        harnessClock.useManual(pendingClock);
       } else {
-        db.clearClockSource();
+        harnessClock.useWall();
       }
       pendingClock = null;
       pendingClockAdvance = null;

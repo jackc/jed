@@ -22,9 +22,11 @@ func tzBundleBytes(t *testing.T) []byte {
 
 func TestTimezoneReaderMatchesVectors(t *testing.T) {
 	t.Parallel()
-	if err := LoadTimeZoneData(tzBundleBytes(t)); err != nil {
+	b := NewEnvironmentBuilder()
+	if err := b.LoadTimeZoneData(tzBundleBytes(t)); err != nil {
 		t.Fatalf("load tzdata.jtz: %v", err)
 	}
+	env := b.Build()
 	rows := readTomlTables(t, specPath(t, "tz/vectors/tzif.toml"), "case")
 	if len(rows) == 0 {
 		t.Fatal("no tzif vectors")
@@ -32,7 +34,7 @@ func TestTimezoneReaderMatchesVectors(t *testing.T) {
 	for _, row := range rows {
 		zone := row.str("zone")
 		inst := row.int("instant_micros")
-		zr, ok := ResolveZone(zone)
+		zr, ok := env.resolveZone(zone)
 		if !ok {
 			t.Fatalf("resolve %s", zone)
 		}

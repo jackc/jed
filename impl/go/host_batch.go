@@ -92,7 +92,7 @@ func unfetchedArg(a *rExpr, row storedRow, env *evalEnv) bool {
 // only through nodes that evaluate every operand (a cast, unary minus, NOT, IS [NOT] NULL, arithmetic,
 // comparison). A zero-argument call is never prefetched: its kernel receives no columns, so it could
 // not learn the batch's row count.
-func collectHostCalls(e *rExpr, ext *ExtensionRegistry, slots []hostBatchSlot) []hostBatchSlot {
+func collectHostCalls(e *rExpr, ext *hostRegistry, slots []hostBatchSlot) []hostBatchSlot {
 	switch e.kind {
 	case reHostFunc:
 		if len(e.sargs) == 0 || !ext.function(e.index).batchable() {
@@ -116,7 +116,7 @@ func collectHostCalls(e *rExpr, ext *ExtensionRegistry, slots []hostBatchSlot) [
 
 // newHostBatch returns the batch for a site that evaluates every expression of exprs once per row,
 // or nil when no call in them is eligible (§4.2.1).
-func newHostBatch(exprs []*rExpr, ext *ExtensionRegistry) *hostBatch {
+func newHostBatch(exprs []*rExpr, ext *hostRegistry) *hostBatch {
 	var slots []hostBatchSlot
 	for _, e := range exprs {
 		slots = collectHostCalls(e, ext, slots)
@@ -185,7 +185,7 @@ func (b *hostBatch) take(node *rExpr) (v Value, ok bool, err error) {
 // prefetch fills this slot's chunk starting at site row start.
 func (slot *hostBatchSlot) prefetch(start int, rows []storedRow, end int, env *evalEnv, scratch *costMeter, headroom int64, metered bool) {
 	call := slot.node
-	hf := env.exec.session.extensions.function(call.index)
+	hf := env.exec.session.env.hosts.function(call.index)
 	n := min(end-start, hostBatchRows)
 	// Every replayed row charges at least the declared cost, so the kernel never runs on more rows
 	// than the remaining budget could pay for, plus the one that trips it (§4.2.1).
@@ -272,7 +272,7 @@ type readAhead struct {
 
 // newReadAhead returns the window for a site evaluating filter (nil if none) and project per row, or
 // nil when neither has an eligible call — the site then pulls row by row as before.
-func newReadAhead(filter *rExpr, project []*rExpr, ext *ExtensionRegistry) *readAhead {
+func newReadAhead(filter *rExpr, project []*rExpr, ext *hostRegistry) *readAhead {
 	var fb *hostBatch
 	if filter != nil {
 		fb = newHostBatch([]*rExpr{filter}, ext)

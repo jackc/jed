@@ -110,7 +110,7 @@ func TestCompositeSecondaryIndexAndImageRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToImage: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("LoadEngine: %v", err)
 	}

@@ -229,7 +229,7 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 func TestLazyPagedAndResidentCostsMatch(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "lazy_cost.jed")
-	mem := newInMemoryWithPageSize(lazyPageSize).Session(SessionOptions{})
+	mem := newInMemoryWithPageSize(lazyPageSize, NewEnvironment()).Session(SessionOptions{})
 	lazySeed(t, mem)
 	db, err := create(path, databaseOptions{PageSize: lazyPageSize, noSync: true})
 	if err != nil {

@@ -1,12 +1,12 @@
 // Host extensions (spec/design/extensibility.md §4.2 / §5.1 / §7) — the injection seam a host
 // application uses to register its own **scalar functions over existing types**. This is delivery
-// step 3 (extensibility.md §14): runtime host functions, resolved + evaluated through a registry the
-// host supplies at open/create and the engine freezes for the handle's lifetime. Deliberately narrow:
+// step 3 (extensibility.md §14): runtime host functions, resolved + evaluated through the set the
+// host registers on its `Environment` (environment.md §5), frozen when the environment is built. Deliberately narrow:
 //
 //   * Functions ONLY (no host types, no host containers) — they touch the function catalog, not the
 //     type catalog, so no `format_version` bump and no persisted-catalog change.
 //   * REGISTRY-DECLARED (Model B, extensibility.md §7/§14 step 4) — a host function is declared in
-//     the registry and reachable from ad-hoc queries while registered; there is NO SQL DDL for it.
+//     the environment and reachable from ad-hoc queries while registered; there is NO SQL DDL for it.
 //     An `immutable` function that also carries a `component_id` + `semantic_version` may back a
 //     **persisted index expression** (§8.1): the file records the resolved dependency (component id +
 //     signature + version) and re-checks it on reopen — a missing / different-component / bumped-version
@@ -50,7 +50,7 @@ pub enum Volatility {
 
 /// A host scalar-function kernel: maps the evaluated argument values to a result value (or a raised
 /// [`EngineError`]). **Strict** — never invoked with a NULL argument (the engine short-circuits
-/// NULL→NULL, §4.2). `Send + Sync` so the registry rides the `Send + Sync` [`Database`](crate::Database)
+/// NULL→NULL, §4.2). `Send + Sync` so the environment rides the `Send + Sync` [`Database`](crate::Database)
 /// handle across threads exactly like the rest of the shared core.
 pub type HostKernel = Box<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
 
@@ -282,26 +282,22 @@ impl HostFunction {
     }
 }
 
-/// The immutable set of host extensions supplied at open/create and **frozen for the database
-/// handle's lifetime** (extensibility.md §7). This slice holds host **scalar functions over existing
-/// types** only. Cloned (`Arc`) into each session minted from the handle, so every session sees the
-/// same functions; a streaming cursor's frozen engine shares it too.
-#[derive(Default)]
-pub struct ExtensionRegistry {
-    functions: Vec<HostFunction>,
+/// The host scalar functions an [`Environment`](crate::Environment) carries (extensibility.md §7,
+/// environment.md §5): registered on an [`EnvironmentBuilder`](crate::EnvironmentBuilder) and frozen
+/// with the built environment, so every database and session using that environment sees the same
+/// functions. Each function is behind an `Arc` so deriving a builder from an environment
+/// (`to_builder`) shares the registered functions by reference rather than copying them.
+#[derive(Clone, Default)]
+pub(crate) struct ExtensionRegistry {
+    functions: Vec<std::sync::Arc<HostFunction>>,
 }
 
 impl ExtensionRegistry {
-    /// An empty registry — the default for a handle opened with no extensions.
-    pub fn new() -> Self {
-        ExtensionRegistry::default()
-    }
-
     /// Register a host scalar function. Errors on a **negative cost** (`22023`) or a second function
     /// with an **identical `(name, arg_types)` signature** (`42723` — signature-level, not
     /// name-level: a host may overload a name across argument types, §4.2). A signature that shadows a
     /// built-in is accepted but never reached at resolve (built-ins win, §4.2).
-    pub fn register_function(&mut self, f: HostFunction) -> Result<()> {
+    pub(crate) fn register_function(&mut self, f: HostFunction) -> Result<()> {
         if f.cost < 0 {
             return Err(EngineError::new(
                 SqlState::InvalidParameterValue,
@@ -321,7 +317,7 @@ impl ExtensionRegistry {
                 ),
             ));
         }
-        self.functions.push(f);
+        self.functions.push(std::sync::Arc::new(f));
         Ok(())
     }
 
@@ -332,7 +328,7 @@ impl ExtensionRegistry {
     }
 
     /// Resolve `(name, arg_types)` to a host-function **id** (a stable index into this frozen
-    /// registry) by exact scalar signature. `None` ⇒ no host overload (the caller falls through to
+    /// set) by exact scalar signature. `None` ⇒ no host overload (the caller falls through to
     /// `42883`).
     pub(crate) fn resolve(&self, name: &str, arg_tys: &[ScalarType]) -> Option<usize> {
         self.functions
@@ -341,17 +337,17 @@ impl ExtensionRegistry {
     }
 
     /// The registered function at `id` (an index returned by [`resolve`](Self::resolve); stable for
-    /// the frozen registry's lifetime).
+    /// the frozen environment's lifetime).
     pub(crate) fn function(&self, id: usize) -> &HostFunction {
         &self.functions[id]
     }
 }
 
 impl std::fmt::Debug for ExtensionRegistry {
-    /// Prints the registered function names (their kernels are opaque `dyn Fn`, so the options
-    /// structs that carry the registry can still `derive(Debug)`).
+    /// Prints the registered function names (their kernels are opaque `dyn Fn`, so the environment
+    /// that carries them can still print).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExtensionRegistry")
+        f.debug_struct("HostFunctions")
             .field(
                 "functions",
                 &self.functions.iter().map(|g| &g.name).collect::<Vec<_>>(),

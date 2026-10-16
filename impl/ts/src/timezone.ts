@@ -1,6 +1,8 @@
 import type { TimeZoneDep } from "./catalog.ts";
+import type { Environment } from "./environment.ts";
 import { compareTextC } from "./value.ts";
-// Time zones: the JTZ bundle codec + an RFC 8536 TZif reader + the engine-global loaded zone set.
+// Time zones: the JTZ bundle codec + an RFC 8536 TZif reader + zone resolution against an
+// Environment's loaded zones (spec/design/environment.md).
 // The cross-core contract for time-zone conversion (spec/design/timezones.md §4/§5): the reader is
 // hand-written per core (CLAUDE.md §5) and byte-identical given identical input — it reads the
 // standardized TZif layout, so cores agree by construction (§3.4). Byte formats: spec/tz/README.md.
@@ -563,16 +565,14 @@ export function openTzBundle(data: Uint8Array): TzBundle {
   return { tzdataVersion, description, zones, links };
 }
 
-// --- the engine-global loaded zone set + the load seam (timezones.md §3.3) ---
+// --- loaded zones (timezones.md §3.3, spec/design/environment.md) ---
 
-const loadedTz = new Map<string, Zone>();
-
-// loadTimeZoneData loads a JTZ bundle into the engine-global loaded set (§3.3/§4): parse each zone's
-// TZif, register by name, then resolve each link alias onto its target's tables. ADDITIVE /
-// FIRST-WINS — a name already present is not replaced (idempotent re-load). A malformed bundle (or
-// TZif) is XX001. The engine primitive behind db.loadTimeZoneData; may be called before opening any
-// file, reads no path, reaches no host data (§10). Browser-safe (Uint8Array, no node:fs).
-export function loadTimeZoneData(data: Uint8Array): void {
+// timeZoneBundleZones decodes a JTZ bundle into the zones it provides (§3.3/§4): each zone's TZif
+// parsed under its own name, then each link alias resolved onto its target's tables — in that order,
+// which is the order EnvironmentBuilder.loadTimeZoneData inserts them FIRST-WINS (a name already
+// loaded is not replaced). A malformed bundle (or TZif) is XX001. Reads no path and reaches no host
+// data (§10). Browser-safe (Uint8Array, no node:fs).
+export function timeZoneBundleZones(data: Uint8Array): Zone[] {
   const bundle = openTzBundle(data);
   const parsed = new Map<string, Zone>();
   for (const z of bundle.zones) {
@@ -583,13 +583,11 @@ export function loadTimeZoneData(data: Uint8Array): void {
       checksum: crc32Ieee(z.raw),
     });
   }
-  for (const [name, z] of parsed) {
-    if (!loadedTz.has(name)) loadedTz.set(name, z);
-  }
+  const out = [...parsed.values()];
   for (const l of bundle.links) {
     const target = parsed.get(l.target);
-    if (target !== undefined && !loadedTz.has(l.alias)) {
-      loadedTz.set(l.alias, {
+    if (target !== undefined) {
+      out.push({
         name: l.alias,
         tzdataVersion: bundle.tzdataVersion,
         data: target.data,
@@ -597,28 +595,16 @@ export function loadTimeZoneData(data: Uint8Array): void {
       });
     }
   }
+  return out;
 }
 
-// loadedZone looks up a loaded named zone by exact name (undefined ⇒ no loaded bundle provides it).
-export function loadedZone(name: string): Zone | undefined {
-  return loadedTz.get(name);
-}
-
-// loadedTimeZones introspects the engine-global loaded zone set (db.loadedTimeZones, §3.3): every
-// zone + alias a loaded bundle provides, ascending by name.
-export function loadedTimeZones(): TimeZoneInfo[] {
-  return [...loadedTz.keys()]
-    .sort()
-    .map((name) => ({ name, tzdataVersion: loadedTz.get(name)!.tzdataVersion }));
-}
-
-// resolveZone resolves a zone name to a built-in fixed offset (UTC / ±HH[:MM[:SS]], §3.2) or a loaded
-// named zone. undefined ⇒ unknown (the caller raises 22023).
-export function resolveZone(name: string): ZoneRef | undefined {
+// resolveZone resolves a zone name to a built-in fixed offset (UTC / ±HH[:MM[:SS]], §3.2) or a named
+// zone the environment loaded. undefined ⇒ unknown (the caller raises 22023).
+export function resolveZone(name: string, env: Environment): ZoneRef | undefined {
   if (name === "UTC") return { fixed: true, off: 0 };
   const off = parseFixedOffset(name);
   if (off !== undefined) return { fixed: true, off };
-  const z = loadedZone(name);
+  const z = env.zone(name);
   return z !== undefined ? { fixed: false, zone: z } : undefined;
 }
 
@@ -769,8 +755,9 @@ function fixedAbbrev(utoff: number): string {
   return s === 0 ? `${sign}${p2(h)}:${p2(m)}` : `${sign}${p2(h)}:${p2(m)}:${p2(s)}`;
 }
 
-export function indexZoneDeps(): TimeZoneDep[] {
-  return [...loadedTz.values()]
+export function indexZoneDeps(env: Environment): TimeZoneDep[] {
+  return env
+    .zones()
     .map((z) => ({ name: z.name, version: z.tzdataVersion, checksum: z.checksum }))
     .sort((a, b) => compareTextC(a.name, b.name));
 }

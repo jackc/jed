@@ -40,7 +40,7 @@ func TestArrayImageRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestArrayOfCompositeImageRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serialize: %v", err)
 	}
-	loaded, err := loadEngine(image)
+	loaded, err := loadEngine(image, NewEnvironment())
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}

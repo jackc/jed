@@ -29,7 +29,7 @@ import { EngineError, engineError } from "./errors.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import { utf8Length } from "./memsize.ts";
-import { foldLowerSimple, loadedProperty } from "./collation.ts";
+import { foldLowerSimple, type PropertyTable } from "./collation.ts";
 import {
   type RegexProgram,
   compileRegexMode,
@@ -199,7 +199,14 @@ export type PathBody =
 // A compiled jsonpath: a mode flag + a body that is EITHER an accessor path OR a top-level predicate.
 // regexInsts is the instruction count of every like_regex program in the path, which a metered
 // compile charges as regex_compile (jsonpath.md §7).
-export type JsonPath = { strict: boolean; body: PathBody; regexInsts: number };
+// prop is the casing table (collation.md §16) the path was compiled under — the handle environment's,
+// undefined ⇒ ASCII — which an `i`-flagged like_regex folds its pattern and subject with.
+export type JsonPath = {
+  strict: boolean;
+  body: PathBody;
+  regexInsts: number;
+  prop: PropertyTable | undefined;
+};
 
 // A jsonpath construct that is valid in PostgreSQL but not yet supported by jed (a deferred
 // follow-on): `0A000`, a documented divergence.
@@ -333,9 +340,12 @@ class Parser {
   private inSubscript: number;
   // regexInsts: the instruction count of the like_regex programs compiled so far.
   private regexInsts: number;
+  // prop: the casing table an `i`-flagged like_regex folds under (undefined ⇒ ASCII).
+  private readonly prop: PropertyTable | undefined;
 
-  constructor(src: string) {
+  constructor(src: string, prop: PropertyTable | undefined) {
     this.s = src;
+    this.prop = prop;
     this.i = 0;
     this.depth = 0;
     this.inFilter = 0;
@@ -479,9 +489,10 @@ class Parser {
     this.skipWs();
     if (this.peek() !== undefined) throw malformed("unexpected trailing input");
     const regexInsts = this.regexInsts;
+    const prop = this.prop;
     return body.kind === "expr"
-      ? { strict, body: { kind: "path", expr: body.expr }, regexInsts }
-      : { strict, body: { kind: "predicate", pred: body.pred }, regexInsts };
+      ? { strict, body: { kind: "path", expr: body.expr }, regexInsts, prop }
+      : { strict, body: { kind: "predicate", pred: body.pred }, regexInsts, prop };
   }
 
   // parsePostfix parses a primary and its accessor steps (PostgreSQL's accessor_expr). A
@@ -988,7 +999,7 @@ class Parser {
       }
       if ((flags & REGEX_M) !== 0) throw unsupported('like_regex "m" flag');
     }
-    const regex = compileLikeRegex(pattern, flags);
+    const regex = compileLikeRegex(pattern, flags, this.prop);
     this.regexInsts += regexNinst(regex);
     return { kind: "pred", pred: { kind: "likeRegex", lhs, pattern, flags, regex } };
   }
@@ -1217,13 +1228,14 @@ class Parser {
 // `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
 // A quoted pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the
 // letter after a backslash (regex.md §1).
-function compileLikeRegex(pattern: string, flags: number): RegexProgram {
+function compileLikeRegex(
+  pattern: string,
+  flags: number,
+  prop: PropertyTable | undefined,
+): RegexProgram {
   let p = pattern;
   if ((flags & REGEX_I) !== 0) {
-    p =
-      (flags & REGEX_Q) !== 0
-        ? foldLowerSimple(pattern, loadedProperty())
-        : foldRegexPattern(pattern, loadedProperty());
+    p = (flags & REGEX_Q) !== 0 ? foldLowerSimple(pattern, prop) : foldRegexPattern(pattern, prop);
   }
   if ((flags & REGEX_Q) !== 0) {
     return compileRegexMode(quoteRegex(p), { nlStop: false, dotAll: false });
@@ -1233,12 +1245,12 @@ function compileLikeRegex(pattern: string, flags: number): RegexProgram {
 }
 
 // compile compiles a jsonpath source string. Malformed → `42601`; a valid-PG but unsupported
-// construct → `0A000`.
-export function compile(src: string): JsonPath {
-  const path = new Parser(src).compile();
+// construct → `0A000`. prop is the handle environment's casing table (undefined ⇒ ASCII).
+export function compile(src: string, prop: PropertyTable | undefined): JsonPath {
+  const path = new Parser(src, prop).compile();
   // A path is evaluated from its canonical text, whose parenthesization can nest deeper than the
   // source (`1 + 1 + 1` renders `((1 + 1) + 1)`), so that text must compile too (§8).
-  new Parser(render(path)).compile();
+  new Parser(render(path), prop).compile();
   return path;
 }
 
@@ -1587,12 +1599,12 @@ export function checkVarsObject(vars: JsonNode): void {
 
 // compileMetered compiles a path for evaluation, charging jsonpath_compile for each UTF-8 byte of
 // the text first (jsonpath.md §7). Every evaluation compiles its path; there is no cache.
-export function compileMetered(src: string, m: Meter): JsonPath {
+export function compileMetered(src: string, m: Meter, prop: PropertyTable | undefined): JsonPath {
   m.charge(COSTS.jsonpathCompile * BigInt(utf8Length(src)));
   m.guard();
   // The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
   // compile at resolve.
-  const path = new Parser(src).compile();
+  const path = new Parser(src, prop).compile();
   // Each like_regex pattern was compiled with the path (jsonpath.md §7).
   m.charge(COSTS.regexCompile * BigInt(path.regexInsts));
   m.guard();
@@ -1641,6 +1653,7 @@ function evalItems(path: JsonPath, ctx: JsonNode, opts: EvalOpts, m: Meter, out:
     strict: path.strict,
     ignore: false,
     m,
+    prop: path.prop,
     nextGen: 1n + BigInt(varsCount(opts.vars)),
     offsets: new Map(),
   };
@@ -1700,6 +1713,8 @@ interface Ctx {
   // (jsonpath.md §3.3) — PostgreSQL's ignoreStructuralErrors, which lax always sets.
   ignore: boolean;
   m: Meter;
+  // The casing table an `i`-flagged like_regex folds its subject under (the path's, undefined ⇒ ASCII).
+  prop: PropertyTable | undefined;
   // The next .keyvalue() object number, assigned in evaluation order.
   nextGen: bigint;
   // Per base object (the document or a variable's), each container's byte offset in PostgreSQL's
@@ -2533,8 +2548,7 @@ function evalLikeRegex(
     charge(cx, 1);
     const a = scalarNode(ls[k]!);
     if (a === null || a.kind !== "string") return null;
-    const subject =
-      (pred.flags & REGEX_I) !== 0 ? foldLowerSimple(a.value, loadedProperty()) : a.value;
+    const subject = (pred.flags & REGEX_I) !== 0 ? foldLowerSimple(a.value, cx.prop) : a.value;
     return regexIsMatch(
       pred.regex,
       Array.from(subject, (c) => c.codePointAt(0) as number),

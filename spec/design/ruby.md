@@ -28,7 +28,8 @@ any engine logic.
 ## 2. Surface
 
 The gem's public surface is `Jed` + `Jed::Database`, `Jed::Result` / `Jed::Row`,
-`Jed::ExtensionRegistry` (host functions, §5b), and `Jed::Error`. It mirrors the Rust embedding
+`Jed::Environment` / `Jed::EnvironmentBuilder` (bundles, host functions, and sources — §5a–§5c), the
+sources `Jed::SeededRandom` / `Jed::ManualClock` / `Jed::AdvancingClock` (§5c), and `Jed::Error`. It mirrors the Rust embedding
 API ([api.md](api.md)) in Ruby idiom:
 
 ```ruby
@@ -63,13 +64,13 @@ end
 
 The Ruby side loads the native cdylib through Ruby's stdlib **`fiddle`** — **no third-party
 gem** (CLAUDE.md §14). The native side is a standalone `cdylib` crate (`impl/ruby/ext`) that
-depends on the core by path and exposes this core set of C functions (plus the bundle loaders,
-§5a, and the host-function registry, §5b):
+depends on the core by path and exposes this core set of C functions (plus the environment builder,
+§5a, host-function registration, §5b, and the sources, §5c):
 
 ```
 jed_abi_version() -> u32
-jed_open_memory(*Registry) -> *Database
-jed_create(path, *Registry)  -> *buf          jed_open(path, read_only, *Registry) -> *buf
+jed_open_memory(*Env) -> *Database
+jed_create(path, *Env)  -> *buf               jed_open(path, read_only, *Env) -> *buf
 jed_execute(*Database, sql, params, params_len) -> *buf   jed_commit(*Database)  -> *buf
 jed_close(*Database)                                       jed_free(*buf)
 ```
@@ -175,24 +176,62 @@ library raises a `Jed::LoadError` pointing at `mise run ruby:build`. On load the
 so a stale cdylib fails with a clear version message rather than a missing-symbol error) and refuses
 a mismatch — never a silent wire misparse.
 
-## 5a. Host-loaded bundles
+## 5a. Environments and host-loaded bundles
 
-The bare engine ships only `C` collation and `UTC` + fixed offsets (collation.md, timezones.md). A
-host adds linguistic collations and IANA zones by loading byte **bundles** through two engine seams,
-exposed as module functions over `jed_load_unicode_data` / `jed_load_time_zone_data` (each a
-`(bytes, len) → UNIT|ERROR` call):
+Everything the engine takes from outside itself except storage — loaded Unicode data, loaded
+time-zone data, host functions, and the random and clock sources — lives in an immutable
+**environment** ([environment.md](environment.md)). The gem mirrors the Rust `Environment` /
+`EnvironmentBuilder` as `Jed::Environment` / `Jed::EnvironmentBuilder`:
 
 ```ruby
-Jed.load_unicode_data(File.binread("unicode.jucd"))   # JUCD → COLLATE "unicode", ILIKE, case folding
-Jed.load_time_zone_data(File.binread("tzdata.jtz"))    # JTZ  → AT TIME ZONE 'America/New_York', date_trunc(…, zone)
+env = Jed::Environment.build do |b|                    # or Jed::EnvironmentBuilder.new … .build
+  b.load_unicode_data(File.binread("unicode.jucd"))   # JUCD → COLLATE "unicode", ILIKE, case folding
+  b.load_time_zone_data(File.binread("tzdata.jtz"))    # JTZ  → AT TIME ZONE 'America/New_York', date_trunc(…, zone)
+  b.register_function("add_tax", [:decimal, :decimal], :decimal) { |a, r| a * (1 + r) }  # §5b
+end
+Jed.memory(environment: env) { |db| … }
+# also: Jed.create(path, environment: env), Jed.open(path, read_only:, environment: env)
+derived = env.to_builder { |b| b.random_source(Jed::SeededRandom.new(42)) }   # §5c
 ```
 
-Both are **engine-global** (the SQLite model) — they load into process-wide state, so one call
-affects every open and future `Database`, and they take the raw bundle bytes (the host reads the
-file). A malformed bundle raises `Jed::Error` (`XX001`). The repo's fixtures
-(`spec/collation/fixtures/unicode.jucd`, `spec/tz/fixtures/tzdata.jtz`) are what the gem's tests
-load; producing/shipping bundles is the host's concern, identical to the other cores'
-`db.LoadUnicodeData` / `db.LoadTimeZoneData`.
+- **Loading is per environment, not engine-global.** A bundle loaded into one builder is visible
+  only to databases opened with an environment built from it; a database opened without
+  `environment:` gets a fresh empty one (`C` collation and ASCII casing, `UTC` and fixed offsets, no
+  host functions, OS randomness, the wall clock — environment.md §7). There is no process-wide
+  default. The bare engine ships only `C` and `UTC` + fixed offsets (collation.md, timezones.md).
+- **Builder.** Every builder method validates as it is made and raises `Jed::Error` with the
+  engine's code (`XX001` for a malformed bundle; the §5b registration codes), leaving the builder
+  unchanged. Methods return the builder, so they chain. Loads are first-wins, as in the engine.
+  `#build` freezes the *current* contents into a new `Jed::Environment` and leaves the builder
+  usable, so later additions reach only environments built later. `Jed::Environment.build` yields a
+  fresh builder and builds it (with no block: the empty environment).
+- **Environment.** A frozen object with no mutating methods (`Jed::Environment.new` is private). One
+  environment serves any number of databases; `Database#environment` returns it (nil when the
+  database runs in a fresh empty one). `#to_builder` returns a builder pre-filled with its contents,
+  shared by reference — it may add bundles and functions and replace the sources, never remove — and,
+  given a block, yields and builds it.
+- The bundle bytes are the host's to source (the engine reads no file path). The repo's fixtures
+  (`spec/collation/fixtures/unicode.jucd`, `spec/tz/fixtures/tzdata.jtz`) are what the gem's tests
+  load.
+
+The C ABI (ABI v6) is a native builder and a native environment, each an opaque box freed by its
+Ruby object's finalizer:
+
+```
+jed_env_builder_new() -> *EnvBuilder                 jed_env_builder_free(*EnvBuilder)
+jed_env_builder_load_unicode_data(*EnvBuilder, bytes, len u32)   -> *buf   (UNIT | ERROR)
+jed_env_builder_load_time_zone_data(*EnvBuilder, bytes, len u32) -> *buf   (UNIT | ERROR)
+jed_env_builder_register(*EnvBuilder, …)  -> *buf    (TYPES | ERROR, §5b)
+jed_env_builder_random_source(*EnvBuilder, *Source|null) / jed_env_builder_clock_source(…) -> *buf (§5c)
+jed_env_builder_build(*EnvBuilder) -> *Env           jed_env_to_builder(*Env) -> *EnvBuilder
+jed_env_free(*Env)
+```
+
+The engine's builder methods consume the builder, so the native side applies each call to a copy
+(cheap: the tables are `Arc`s shared until changed) and keeps it only on success — which is what
+leaves a builder unchanged by a failed call. `jed_env_builder_build` builds from a copy for the same
+reason. Each open clones the `Environment` (an `Arc`), so a database never refers to the native
+`Env` again and freeing it while databases are open is safe.
 
 ## 5b. Host functions
 
@@ -205,31 +244,34 @@ native-vs-wrap call in [cores.md](cores.md) §2.1).
 
 ### Surface
 
+Host functions register on an environment builder (§5a) — the engine's `ExtensionRegistry` is
+absorbed into the environment (environment.md §5), with unchanged semantics:
+
 ```ruby
-reg = Jed::ExtensionRegistry.new
-# Single-row kernel: the block receives one row's arguments and returns the result.
-reg.register("add_tax", [:decimal, :decimal], :decimal, volatility: :immutable) { |amt, rate| amt * (1 + rate) }
-# Batch kernel: one Array per argument (column-major), plus an output Array to append to.
-reg.register_batch("mix", [:i32], :i64, volatility: :immutable, cost: 2) do |xs, out|
-  xs.each { |x| out << x * 2654435761 % 1000003 }
+env = Jed::Environment.build do |b|
+  # Single-row kernel: the block receives one row's arguments and returns the result.
+  b.register_function("add_tax", [:decimal, :decimal], :decimal, volatility: :immutable) { |amt, rate| amt * (1 + rate) }
+  # Batch kernel: one Array per argument (column-major), plus an output Array to append to.
+  b.register_batch_function("mix", [:i32], :i64, volatility: :immutable, cost: 2) do |xs, out|
+    xs.each { |x| out << x * 2654435761 % 1000003 }
+  end
 end
 
-Jed.memory(extensions: reg) { |db| db.query("SELECT mix(amount) FROM orders") }
-# also: Jed.create(path, extensions: reg), Jed.open(path, read_only:, extensions: reg)
+Jed.memory(environment: env) { |db| db.query("SELECT mix(amount) FROM orders") }
 ```
 
-- **`register(name, arg_types, result, volatility: :volatile, cost: 1) { |*args| … }`** — a
-  single-row kernel, called once per row. **`register_batch(…) { |*columns, out| … }`** — a batch
+- **`register_function(name, arg_types, result, volatility: :volatile, cost: 1) { |*args| … }`** — a
+  single-row kernel, called once per row. **`register_batch_function(…) { |*columns, out| … }`** — a batch
   kernel, called with one `Array` per argument (`columns[j][i]` is argument `j` of row `i`) and an
   empty `out` `Array`; it appends one result per row, in row order. The defaults are Rust's
   (`HostFunction::new`): `:volatile` (the safe assumption) and unit cost. `volatility:` is
   `:immutable`/`:stable`/`:volatile`; only a non-volatile batch kernel is prefetched in chunks
   (§4.2.1), so a volatile one is still called once per row. Types are jed type names as `Symbol`s or
   `String`s, aliases included (`:int`, `"bigint"`, `"double precision"`).
-- **Freezing.** As in every core, a handle's function set is fixed when it opens: each `open`/
-  `create`/`memory` builds the engine registry from the functions registered *so far*. Registering
-  more later affects only handles opened later. One `ExtensionRegistry` serves any number of handles.
-- **Validation is eager.** `register` raises `Jed::Error` immediately, with the engine's codes: a
+- **Freezing.** As in every core, a handle's function set is fixed when it opens: it is the set in
+  the environment it was opened with, and an environment is immutable. Registering more on the
+  builder affects only environments built later. One environment serves any number of handles.
+- **Validation is eager.** `register_function` raises `Jed::Error` immediately, with the engine's codes: a
   duplicate `(name, arg_types)` is `42723`, a negative cost `22023`, an unknown type name `42704`,
   and a type outside the supported set below `0A000`. Non-`Symbol`/`String` arguments, a missing
   block, or an unknown `volatility:` raise `ArgumentError`.
@@ -249,26 +291,22 @@ text→value parse at the boundary and are a follow-on with their typed coercion
 
 ### The C ABI
 
-Five additions (ABI v5). `jed_open_memory`/`jed_create`/`jed_open` gain a trailing registry
-pointer (null = no extensions):
+Registration is one builder call (added in ABI v5 on a standalone registry; on the environment
+builder since ABI v6), plus the large-result sink:
 
 ```
-jed_registry_new() -> *Registry                      jed_registry_free(*Registry)
-jed_registry_register(*Registry, name, arg_types, result, volatility u8, cost i64,
-                      batched u8, callback, user_data uintptr) -> *buf     (TYPES | ERROR)
+jed_env_builder_register(*EnvBuilder, name, arg_types, result, volatility u8, cost i64,
+                         batched u8, callback, user_data uintptr) -> *buf     (TYPES | ERROR)
 jed_host_result(sink uintptr, bytes, len u64)        (the large-result sink, below)
-jed_open_memory(*Registry) / jed_create(path, *Registry) / jed_open(path, read_only, *Registry)
 ```
 
 `arg_types` is a comma-separated list of type names (empty for zero arguments) and `result` a type
 name; the native side resolves them with `ScalarType::from_name` and returns the canonical names
-(a TYPES buffer, §3), which key the gem's argument decoders. The native `Registry` keeps each
-function as plain **specs** (name, types, volatility, cost, kernel form, callback, user data) beside
-a shadow `ExtensionRegistry` that runs the engine's own `register_function` validation, so
-registration errors are exactly the core's. Each open *borrows* the registry and builds a fresh
-`Arc<ExtensionRegistry>` from the specs; the handle never refers to the `Registry` again. A
-single-row spec becomes `HostFunction::new` (the engine loops it — one upcall per row); a batch
-spec becomes `HostFunction::batched` (one upcall per prefetched chunk).
+(a TYPES buffer, §3), which key the gem's argument decoders. The native side builds the
+`HostFunction` at registration and hands it to the engine's own `EnvironmentBuilder::register_function`,
+so registration errors are exactly the core's. A single-row function becomes `HostFunction::new`
+(the engine loops it — one upcall per row); a batch function becomes `HostFunction::batched` (one
+upcall per prefetched chunk).
 
 Both kernel forms upcall through one **callback** — a C function pointer, with the opaque
 `user_data` the host passed at registration handed back (the gem passes 0; one
@@ -334,10 +372,13 @@ running during a query), and Fiddle's closure trampoline re-acquires it for each
 ### Lifetime
 
 A `Fiddle::Closure`'s trampoline is freed when the closure is collected, so the gem keeps every
-closure a handle can call alive for the handle's whole life: `Database` holds the frozen list of
-function entries it was opened with. A finalizer that closes a forgotten handle calls no kernel (a
-close drops the session and core), so it is safe even if the closures are collected in the same GC
-cycle. The native `Registry` is freed by the `Jed::ExtensionRegistry` finalizer. A gem `execute`
+closure a handle can call alive for the handle's whole life: each `Jed::Environment` holds the
+frozen list of function entries it was built with, and `Database` holds the environment it was opened
+with. A finalizer that closes a forgotten handle calls no kernel (a close drops the session and core),
+so it is safe even if the closures are collected in the same GC cycle. The native builder and
+environment are freed by their Ruby objects' finalizers; the engine-side function entries live on in
+every database whose environment holds them, alongside the Ruby environment that keeps their
+closures. A gem `execute`
 drains the whole result inside one native call (§3), so no host call can happen after `execute`
 returns.
 
@@ -374,6 +415,34 @@ the GVL on.
 declared `cost` per call and bounds how far a batch is speculated by the cost headroom (§4.2.1). A
 wrong-typed result cannot reach the engine's codecs.
 
+## 5c. Random and clock sources
+
+The environment fixes which random and clock source a database uses (entropy.md, environment.md
+§4); the source objects are shared, so the host keeps a reference and controls them. The gem exposes
+the engine's three provided controllable sources, each wrapping the Rust `Arc` in an opaque native
+box:
+
+```ruby
+random = Jed::SeededRandom.new(seed)            # splitmix64 (spec/encoding/prng.toml); #reseed(seed)
+clock  = Jed::ManualClock.new(reading)          # #set(reading), #advance(micros)
+clock  = Jed::AdvancingClock.new(start, step)   # one step per read; #reset(start, step)
+env = Jed::Environment.build { |b| b.random_source(random).clock_source(clock) }
+```
+
+A clock reading is an `Integer` of microseconds since the Unix epoch or a `Time`; a seed is an
+unsigned 64-bit `Integer`. `random_source(nil)` / `clock_source(nil)` restore OS randomness / the
+wall clock (the defaults). Passing a source of the wrong kind is `ArgumentError` (and `22023` at the
+C ABI). A host-implemented Ruby source (an upcall per read) is not offered: the provided sources
+cover reproducibility, and a clock read inside a query would cost a GVL re-acquire.
+
+```
+jed_seeded_random_new(seed u64) -> *Source           jed_seeded_random_reseed(*Source, seed u64)
+jed_manual_clock_new(micros i64) -> *Source          jed_manual_clock_set(*Source, micros i64)
+                                                     jed_manual_clock_advance(*Source, step i64)
+jed_advancing_clock_new(start i64, step i64) -> *Source   jed_advancing_clock_reset(*Source, start, step)
+jed_source_free(*Source)
+```
+
 ## 6. Build, test, and follow-ons
 
 - **Build / test.** `mise run ruby:build` compiles the cdylib; `mise run ruby:test` builds it and runs
@@ -386,8 +455,11 @@ wrong-typed result cannot reach the engine's codecs.
   coercion both directions, AR-style, always-on (slice 3 — §3, ABI v3; adds the `bigdecimal`
   gemspec dependency, a bundled stdlib gem); **host-loaded bundles** —
   `load_unicode_data`/`load_time_zone_data` (slice 4 — §5a, ABI v4); **host functions** —
-  `Jed::ExtensionRegistry` with single-row and batch kernels over Fiddle closures, and the per-handle
-  `Mutex` that refuses re-entrant use (slice 5 — §5b, ABI v5; measured in benchmarks.md §8.2).
+  single-row and batch kernels over Fiddle closures, and the per-handle `Mutex` that refuses
+  re-entrant use (slice 5 — §5b, ABI v5; measured in benchmarks.md §8.2); **environments** —
+  `Jed::Environment` / `Jed::EnvironmentBuilder` replace the engine-global loaders and
+  `Jed::ExtensionRegistry`, with the seeded/manual/advancing sources (slice 6 — §5a/§5c, ABI v6;
+  environment.md).
 - **Follow-ons:**
   - **Host functions over `bytea`/`uuid`/`interval`/`json`/`jsonb`/`jsonpath`** — a native
     text→value parse at the boundary, alongside the typed coercion below.
@@ -407,8 +479,8 @@ impl/ruby/
   jed.gemspec            # the gem (lib + ext sources)
   README.md              # user-facing quickstart
   lib/jed.rb             # entry point
-  lib/jed/{version,error,ffi,codec,coerce,params,result,database,extension}.rb
+  lib/jed/{version,error,ffi,codec,coerce,params,result,host_function,environment,database}.rb
   ext/Cargo.toml         # standalone cdylib crate, jed = { path = "../../rust" }
   ext/src/lib.rs         # the C ABI (the only unsafe in the product path)
-  test/*_test.rb         # minitest seam tests (database, params, rich types, bundles, host functions)
+  test/*_test.rb         # minitest seam tests (database, params, rich types, environment, host functions)
 ```

@@ -2393,7 +2393,7 @@ func rexprEqShifted(a, b *rExpr, offset int) bool {
 	case reCasing:
 		// lower(x)/upper(x) (spec/design/collation.md §16) resolve to a dedicated reCasing node —
 		// NOT reScalarFunc — so an index on lower(email) (the headline expression-index shape)
-		// matches ONLY if this arm is present. The fold is deterministic (engine-global casing
+		// matches ONLY if this arm is present. The fold is deterministic (the handle Environment's casing
 		// regime, identical at index-build and query-eval), so the match is sound: same direction
 		// + a matching argument.
 		return a.casingUpper == b.casingUpper && rexprEqShifted(a.operand, b.operand, offset)

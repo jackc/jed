@@ -1070,7 +1070,7 @@ pub(crate) fn date_clock_value(
     m.charge(COSTS.timezone);
     m.guard()?;
     let mut r = rng.get();
-    let clock = r.statement_clock_micros(&exec.session.seam);
+    let clock = r.statement_clock_micros(&exec.session.env);
     rng.set(r);
     // An injected extreme clock can shift past the timestamp range: 22008, like the day bound.
     let local = crate::timezone::instant_to_local_micros(&zr, clock)

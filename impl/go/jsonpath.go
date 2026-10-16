@@ -32,6 +32,10 @@ type jsonPath struct {
 	// regexInsts is the instruction count of every like_regex program in the path, which a metered
 	// compile charges as regex_compile (jsonpath.md §7).
 	regexInsts int64
+	// prop is the property/casing table (collation.md §16) the path was compiled under — nil ⇒ the
+	// ASCII baseline. like_regex's `i` flag folds the pattern at compile and the subject at evaluation
+	// under it, so both sides fold the same way. From the handle's Environment.
+	prop *propertyTable
 }
 
 // jpPrimaryKind tags where a path starts.
@@ -282,24 +286,24 @@ func jpMalformed(detail string) *EngineError {
 	return newError(SyntaxError, "invalid jsonpath: "+detail)
 }
 
-// compile compiles a jsonpath source string. Malformed → 42601; a valid-PG but unsupported construct
-// → 0A000.
-func compile(src string) (jsonPath, error) {
-	path, err := parseJsonPath(src)
+// compile compiles a jsonpath source string under the casing table prop (the handle Environment's;
+// nil ⇒ ASCII). Malformed → 42601; a valid-PG but unsupported construct → 0A000.
+func compile(src string, prop *propertyTable) (jsonPath, error) {
+	path, err := parseJsonPath(src, prop)
 	if err != nil {
 		return jsonPath{}, err
 	}
 	// A path is evaluated from its canonical text, whose parenthesization can nest deeper than the
 	// source (`1 + 1 + 1` renders `((1 + 1) + 1)`), so that text must compile too (§8).
-	if _, err := parseJsonPath(path.Render()); err != nil {
+	if _, err := parseJsonPath(path.Render(), prop); err != nil {
 		return jsonPath{}, err
 	}
 	return path, nil
 }
 
 // parseJsonPath parses a jsonpath source string (see compile).
-func parseJsonPath(src string) (jsonPath, error) {
-	p := &jpParser{s: []byte(src)}
+func parseJsonPath(src string, prop *propertyTable) (jsonPath, error) {
+	p := &jpParser{s: []byte(src), prop: prop}
 	if err := p.skipWs(); err != nil {
 		return jsonPath{}, err
 	}
@@ -328,9 +332,9 @@ func parseJsonPath(src string) (jsonPath, error) {
 		return jsonPath{}, jpMalformed("unexpected trailing input")
 	}
 	if body.pred != nil {
-		return jsonPath{Strict: strict, Pred: body.pred, regexInsts: p.regexInsts}, nil
+		return jsonPath{Strict: strict, Pred: body.pred, regexInsts: p.regexInsts, prop: prop}, nil
 	}
-	return jsonPath{Strict: strict, Path: *body.expr, regexInsts: p.regexInsts}, nil
+	return jsonPath{Strict: strict, Path: *body.expr, regexInsts: p.regexInsts, prop: prop}, nil
 }
 
 // Render is the canonical render (spec/design/jsonpath.md §2.2): strict kept / lax omitted; member
@@ -604,6 +608,8 @@ type jpEvalOpts struct {
 	exists bool
 	// vars is the variables the path's $name references read (§5).
 	vars jpVars
+	// prop is the casing table the path compiles under (the handle Environment's; nil ⇒ ASCII).
+	prop *propertyTable
 }
 
 // jpVarsKind tags where a path's variables come from.
@@ -699,15 +705,16 @@ func checkVarsObject(vars *JsonNode) error {
 }
 
 // compileMetered compiles a path for evaluation, charging jsonpath_compile for each byte of the text
-// first (jsonpath.md §7). Every evaluation compiles its path; there is no cache.
-func compileMetered(src string, m *costMeter) (jsonPath, error) {
+// first (jsonpath.md §7). Every evaluation compiles its path; there is no cache. prop is as for
+// compile.
+func compileMetered(src string, m *costMeter, prop *propertyTable) (jsonPath, error) {
 	m.Charge(costs.JsonpathCompile * int64(len(src)))
 	if err := m.Guard(); err != nil {
 		return jsonPath{}, err
 	}
 	// The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
 	// compile at resolve.
-	jp, err := parseJsonPath(src)
+	jp, err := parseJsonPath(src, prop)
 	if err != nil {
 		return jsonPath{}, err
 	}
@@ -752,7 +759,7 @@ func jpMaterializeAll(items []jpItem) []JsonNode {
 }
 
 func (jp jsonPath) evalItems(ctx *JsonNode, opts jpEvalOpts, m *costMeter, out *[]jpItem) error {
-	cx := &jpCtx{root: ctx, vars: opts.vars, strict: jp.Strict, m: m, nextGen: 1 + opts.vars.baseCount()}
+	cx := &jpCtx{root: ctx, vars: opts.vars, strict: jp.Strict, m: m, nextGen: 1 + opts.vars.baseCount(), prop: jp.prop}
 	if jp.Pred != nil {
 		// A top-level predicate → a single item: its truth value as a boolean, or JSON null when
 		// unknown (§4.4).
@@ -867,6 +874,8 @@ type jpCtx struct {
 	// (jsonpath.md §3.3) — PostgreSQL's ignoreStructuralErrors, which lax always sets.
 	ignore bool
 	m      *costMeter
+	// prop is the casing table like_regex's `i` flag folds the subject under (the path's, nil ⇒ ASCII).
+	prop *propertyTable
 	// nextGen is the next .keyvalue() object number, assigned in evaluation order.
 	nextGen int64
 	// offsets is, per base object laid out so far (the document or a variable's), each container's
@@ -1749,7 +1758,7 @@ func (cx *jpCtx) evalLikeRegex(pred *jpPred, current jpItem, base jpBase, last i
 		}
 		subject := a.S
 		if pred.flags&jpRegexI != 0 {
-			subject = foldLowerSimple(subject, loadedProperty())
+			subject = foldLowerSimple(subject, cx.prop)
 		}
 		matched, err := pred.regex.isMatch([]rune(subject), cx.m)
 		if err != nil {
@@ -2492,6 +2501,8 @@ func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
 type jpParser struct {
 	s []byte
 	i int
+	// prop is the casing table like_regex's `i` flag folds the pattern under (nil ⇒ ASCII).
+	prop *propertyTable
 	// depth is the program nesting depth (spec/design/json.md §6.4): +1 per filter `?(`,
 	// parenthesized group, `!`, `&&`/`||` chain step, arithmetic operator, and subscript list,
 	// bounded by maxJSONDepth → 54001. Bounding it at the compiler bounds every derived walk (render,
@@ -3656,7 +3667,7 @@ func (p *jpParser) parseLikeRegex(left *jpPathExpr) (jpParsed, error) {
 			return jpParsed{}, jpUnsupported(`like_regex "m" flag`)
 		}
 	}
-	prog, err := jpCompileLikeRegex(pattern, flags)
+	prog, err := jpCompileLikeRegex(pattern, flags, p.prop)
 	if err != nil {
 		return jpParsed{}, err
 	}
@@ -3668,12 +3679,12 @@ func (p *jpParser) parseLikeRegex(left *jpPathExpr) (jpParsed, error) {
 // `i` folds the pattern, `q` quotes it, `s` is dot-all, and otherwise the mode is newline-sensitive.
 // A quoted pattern is all literal, so `i` folds every character of it; otherwise the fold keeps the
 // letter after a backslash (regex.md §1).
-func jpCompileLikeRegex(pattern string, flags uint8) (*regexProgram, error) {
+func jpCompileLikeRegex(pattern string, flags uint8, prop *propertyTable) (*regexProgram, error) {
 	if flags&jpRegexI != 0 {
 		if flags&jpRegexQ != 0 {
-			pattern = foldLowerSimple(pattern, loadedProperty())
+			pattern = foldLowerSimple(pattern, prop)
 		} else {
-			pattern = foldRegexPattern(pattern, loadedProperty())
+			pattern = foldRegexPattern(pattern, prop)
 		}
 	}
 	if flags&jpRegexQ != 0 {

@@ -43,14 +43,27 @@ fn refresh_test_page_crc(image: &mut [u8], page_start: usize) {
     image[page_start + 12..page_start + 16].copy_from_slice(&(!crc).to_be_bytes());
 }
 
-/// Load jed's pinned production `JUCD` bundle into the engine-global set so the `unicode`-collated
-/// goldens build (set_default_collation / COLLATE) and read back (the file's reference entry resolves
-/// its table from a loaded bundle — collation.md §4/§9, slice 3c). Idempotent (global, first-wins).
-fn load_unicode() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../spec/collation/fixtures/unicode.jucd");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    jed::load_unicode_data(&bytes).expect("load unicode.jucd");
+/// The environment every golden is built and read in: jed's pinned production `JUCD` bundle, so the
+/// `unicode`-collated goldens build (set_default_collation / COLLATE) and read back (the file's
+/// reference entry resolves its table from a loaded bundle — collation.md §4/§9, slice 3c); the
+/// pinned `JTZ` bundle for the timezone-dependent index golden; and the `geo_hash` host function for
+/// the host-function dependency goldens.
+fn golden_env() -> jed::Environment {
+    static ENV: std::sync::OnceLock<jed::Environment> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/collation/fixtures/unicode.jucd");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        jed::Environment::builder()
+            .load_unicode_data(&bytes)
+            .expect("load unicode.jucd")
+            .load_time_zone_data(include_bytes!("../../../spec/tz/fixtures/tzdata.jtz"))
+            .expect("load tzdata.jtz")
+            .register_function(geo_hash_golden_function())
+            .expect("register geo_hash")
+            .build()
+    })
+    .clone()
 }
 
 fn run(db: &mut Session, sql: &str) {
@@ -62,6 +75,7 @@ fn run(db: &mut Session, sql: &str) {
 /// value) — enough rows to span more than one data page at page_size 256.
 fn pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -81,6 +95,7 @@ fn pk_table_db() -> Session {
 
 fn one_table_empty_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -92,6 +107,7 @@ fn one_table_empty_db() -> Session {
 
 fn row_count_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -104,6 +120,7 @@ fn row_count_table_db() -> Session {
 
 fn statistics_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -130,6 +147,7 @@ fn statistics_table_db() -> Session {
 /// verify.rb's STATISTICS_TERMS_TABLE.
 fn statistics_terms_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -156,6 +174,7 @@ fn statistics_terms_table_db() -> Session {
 /// first component and first-component ties broken by the second.
 fn composite_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -187,6 +206,7 @@ fn composite_pk_table_db() -> Session {
 /// (price_range < t_b_check < t_note_check).
 fn check_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -213,6 +233,7 @@ fn check_table_db() -> Session {
 /// index auto-names to `t_a_b_idx`. Index records have empty payloads (key only).
 fn index_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -237,6 +258,7 @@ fn index_table_db() -> Session {
 /// `uq`, and the plain index `nu` (flags 0 beside flags 1).
 fn unique_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -261,6 +283,7 @@ fn unique_table_db() -> Session {
 /// fixture isolates the v26 catalog change. Must match verify.rb's EXPR_INDEX_TABLE.
 fn expr_index_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -279,6 +302,7 @@ fn expr_index_table_db() -> Session {
 /// fixture isolates the v27 catalog change. Must match verify.rb's PARTIAL_INDEX_TABLE.
 fn partial_index_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -298,9 +322,8 @@ fn partial_index_table_db() -> Session {
 }
 
 fn timezone_index_table_db() -> Session {
-    jed::timezone::load_time_zone_data(include_bytes!("../../../spec/tz/fixtures/tzdata.jtz"))
-        .unwrap();
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -317,28 +340,23 @@ fn timezone_index_table_db() -> Session {
     db
 }
 
-/// The golden host-function registry: `geo_hash(i64) -> i64 = a * 10`, IMMUTABLE, component
+/// The golden host function: `geo_hash(i64) -> i64 = a * 10`, IMMUTABLE, component
 /// "com.example/geo_hash" at semantic version 1.
-fn geo_hash_golden_registry() -> jed::ExtensionRegistry {
-    let mut reg = jed::ExtensionRegistry::new();
-    reg.register_function(
-        jed::HostFunction::new(
-            "geo_hash",
-            vec![ScalarType::Int64],
-            ScalarType::Int64,
-            Box::new(|args: &[Value]| {
-                let Value::Int(a) = &args[0] else {
-                    unreachable!("strict + resolved i64 arg")
-                };
-                Ok(Value::Int(a * 10))
-            }),
-        )
-        .volatility(jed::Volatility::Immutable)
-        .component_id("com.example/geo_hash")
-        .semantic_version(1),
+fn geo_hash_golden_function() -> jed::HostFunction {
+    jed::HostFunction::new(
+        "geo_hash",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(|args: &[Value]| {
+            let Value::Int(a) = &args[0] else {
+                unreachable!("strict + resolved i64 arg")
+            };
+            Ok(Value::Int(a * 10))
+        }),
     )
-    .unwrap();
-    reg
+    .volatility(jed::Volatility::Immutable)
+    .component_id("com.example/geo_hash")
+    .semantic_version(1)
 }
 
 /// A table with a HOST-FUNCTION index dependency (v31 — the `index_flags` bit2 + the persisted
@@ -348,8 +366,8 @@ fn geo_hash_golden_registry() -> jed::ExtensionRegistry {
 /// change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
 fn hostfunc_index_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
-        extensions: std::sync::Arc::new(geo_hash_golden_registry()),
         ..Default::default()
     })
     .unwrap()
@@ -365,8 +383,8 @@ fn hostfunc_index_table_db() -> Session {
 /// v35 catalog change. Must match verify.rb's HOSTFUNC_CHECK_TABLE.
 fn hostfunc_check_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
-        extensions: std::sync::Arc::new(geo_hash_golden_registry()),
         ..Default::default()
     })
     .unwrap()
@@ -386,6 +404,7 @@ fn hostfunc_check_table_db() -> Session {
 /// every v30 action code and the v40 match_full bit. Must match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
 fn fk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -421,6 +440,7 @@ fn fk_table_db() -> Session {
 /// lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
 fn array_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -457,6 +477,7 @@ fn array_table_db() -> Session {
 /// `[6,)`), and a singleton (`[1,1]` → `[1,2)`). Pins range_table.jed cross-core.
 fn range_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -480,6 +501,7 @@ fn range_table_db() -> Session {
 /// then finite-bound) to match verify.rb's ascending-key tree builder.
 fn range_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -502,6 +524,7 @@ fn range_pk_table_db() -> Session {
 /// tree builder. Pins array_pk_table.jed cross-core.
 fn array_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -521,6 +544,7 @@ fn array_pk_table_db() -> Session {
 /// length-prefixed text-shaped json body. Pins json_table.jed cross-core.
 fn json_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -539,6 +563,7 @@ fn json_table_db() -> Session {
 /// (NTAG_NULL); a bare string (NTAG_STRING); a bare number; and a SQL NULL. Pins jsonb_table.jed.
 fn jsonb_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -557,6 +582,7 @@ fn jsonb_table_db() -> Session {
 
 fn gin_array_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -583,6 +609,7 @@ fn gin_array_table_db() -> Session {
 /// element (row 5). An ordinary ordered index `i_n` sits beside it (kind 0).
 fn gin_uuid_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -613,6 +640,7 @@ fn gin_uuid_table_db() -> Session {
 /// NULL range is not indexed. Mirrors the Ruby reference's `GIST_RANGE_TABLE`.
 fn gist_range_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -636,6 +664,7 @@ fn gist_range_table_db() -> Session {
 /// NULL is not indexed. Mirrors the Ruby reference's `GIST_SCALAR_TABLE`.
 fn gist_scalar_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -659,6 +688,7 @@ fn gist_scalar_table_db() -> Session {
 /// Mirrors the Ruby reference's `GIST_EXCLUDE_TABLE`.
 fn gist_exclude_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -685,6 +715,7 @@ fn gist_exclude_table_db() -> Session {
 /// array (no entries) and row 5 NULL elements + a duplicate. An ordered index i_n sits beside them.
 fn gin_float_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -715,6 +746,7 @@ fn gin_float_table_db() -> Session {
 /// index i_n sits beside it.
 fn gin_interval_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -740,6 +772,7 @@ fn gin_interval_table_db() -> Session {
 /// and empty / NULL arrays. An ordered index i_n sits beside it.
 fn gin_text_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -765,6 +798,7 @@ fn gin_text_table_db() -> Session {
 /// ordered index i_n sits beside them. Must match verify.rb's GIN_DECIMAL_BYTEA_TABLE.
 fn gin_decimal_bytea_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -792,6 +826,7 @@ fn gin_decimal_bytea_table_db() -> Session {
 /// and a SQL NULL (no entries); a negative number. An ordered index i_n sits beside it.
 fn gin_jsonb_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -816,6 +851,7 @@ fn gin_jsonb_table_db() -> Session {
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -838,6 +874,7 @@ fn nopk_table_db() -> Session {
 /// rows externalize their (incompressible filler64) text. Must match verify.rb's MAX_SEP_TABLE.
 fn max_sep_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -855,6 +892,7 @@ fn max_sep_table_db() -> Session {
 
 fn tall_tree_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -873,6 +911,7 @@ fn tall_tree_db() -> Session {
 /// value, and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
 fn text_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -893,6 +932,7 @@ fn text_table_db() -> Session {
 /// within the limit. Must match `spec/fileformat/verify.rb`'s `VARCHAR_TABLE`.
 fn varchar_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -913,6 +953,7 @@ fn varchar_table_db() -> Session {
 /// PRIMARY KEY case is `bool_pk_table_db`).
 fn bool_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -932,6 +973,7 @@ fn bool_table_db() -> Session {
 /// (0x01). Must match spec/fileformat/verify.rb's BOOL_PK_TABLE.
 fn bool_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -949,6 +991,7 @@ fn bool_pk_table_db() -> Session {
 /// "banana"(0x62) < "é"(0xC3). Must match spec/fileformat/verify.rb's TEXT_PK_TABLE.
 fn text_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -969,6 +1012,7 @@ fn text_pk_table_db() -> Session {
 /// spec/fileformat/verify.rb's BYTEA_PK_TABLE.
 fn bytea_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -990,6 +1034,7 @@ fn bytea_pk_table_db() -> Session {
 /// body but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
 fn decimal_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1014,6 +1059,7 @@ fn decimal_pk_table_db() -> Session {
 /// that order for byte-identical pages; the out-of-order-insert proof lives in the conformance test.
 fn interval_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1036,6 +1082,7 @@ fn interval_pk_table_db() -> Session {
 /// no-op coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
 fn decimal_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1059,6 +1106,7 @@ fn decimal_table_db() -> Session {
 /// Literals are the `\x` hex input form, adapting to the bytea column (types.md §6).
 fn bytea_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1115,6 +1163,7 @@ fn filler_bytes_hex(n: usize) -> String {
 /// reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
 fn overflow_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1144,6 +1193,7 @@ fn overflow_table_db() -> Session {
 /// row 3 stays inline-plain; row 4 is NULL/NULL. Must match the Ruby reference's COMPRESSED_TABLE.
 fn compressed_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1181,6 +1231,7 @@ fn compressed_table_db() -> Session {
 /// the store sorts them into key (byte) order. Must match spec/fileformat/verify.rb's UUID_TABLE.
 fn uuid_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1204,6 +1255,7 @@ fn uuid_table_db() -> Session {
 /// numeric(6,2), and a plain no-default column. Row 1 takes every default; row 2 provides all.
 fn default_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1229,6 +1281,7 @@ fn default_table_db() -> Session {
 /// encoding is the cross-core proof; the per-row evaluation is covered by the conformance corpus.
 fn default_expr_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1248,6 +1301,7 @@ fn default_expr_table_db() -> Session {
 /// timestamp PK is supported, but the value-codec branch is the point here).
 fn timestamp_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1270,6 +1324,7 @@ fn timestamp_table_db() -> Session {
 /// normalizes to UTC before storage.
 fn timestamptz_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1303,6 +1358,7 @@ fn timestamptz_table_db() -> Session {
 /// NULL. The bare-string literals adapt to the interval column. PK stays i32.
 fn interval_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1327,6 +1383,7 @@ fn interval_table_db() -> Session {
 /// nullable non-key column (the float PRIMARY KEY form is `float64_pk_table_db`).
 fn float64_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1353,6 +1410,7 @@ fn float64_table_db() -> Session {
 /// representable in binary32). PK stays i32.
 fn float32_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1379,6 +1437,7 @@ fn float32_table_db() -> Session {
 /// store sorts by encoded key).
 fn float64_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1397,6 +1456,7 @@ fn float64_pk_table_db() -> Session {
 /// As `float64_pk_table_db`, for a `f32` PRIMARY KEY (the 4-byte `float-order-preserving` key §2.8).
 fn float32_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1418,6 +1478,7 @@ fn float32_pk_table_db() -> Session {
 /// the date column. PK stays i32. (spec/design/date.md)
 fn date_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1438,6 +1499,7 @@ fn date_table_db() -> Session {
 /// zero-byte omission (row 2's `zip`) — spec/design/composite.md §4.
 fn composite_type_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1461,6 +1523,7 @@ fn composite_type_table_db() -> Session {
 /// insertion-order sensitive.
 fn composite_key_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1488,6 +1551,7 @@ fn composite_key_table_db() -> Session {
 /// present composite element with a NULL element (the array HAS_NULLS bitmap).
 fn array_composite_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1515,6 +1579,7 @@ fn array_composite_table_db() -> Session {
 /// empty array field `{}` (ndim 0); row 3 a NULL array field (the composite null-bitmap).
 fn composite_array_field_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1534,6 +1599,7 @@ fn composite_array_field_table_db() -> Session {
 /// empty range and a NULL numrange field; row 3 a NULL i32range field and an unbounded-lower numrange.
 fn composite_range_field_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1560,6 +1626,7 @@ fn composite_range_field_table_db() -> Session {
 /// recursive value codec descending through a composite field.
 fn nested_composite_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1583,6 +1650,7 @@ fn nested_composite_table_db() -> Session {
 /// sequence catalog entry (entry_kind 2) and the catalog emission order (sequences before tables).
 fn sequence_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1608,6 +1676,7 @@ fn sequence_table_db() -> Session {
 /// (spec/fileformat/verify.rb), spec/design/views.md §3.
 fn view_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1641,7 +1710,7 @@ fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
 /// each one (spec/design/views.md §3/§4).
 #[test]
 fn view_golden_reads_back() {
-    let mut db = Database::from_image(&fixture("view_table.jed"))
+    let mut db = Database::from_image(&fixture("view_table.jed"), golden_env())
         .unwrap_or_else(|e| panic!("load view_table.jed: {}", e.message))
         .session(SessionOptions::default());
     let text = |s: &str| Value::Text(s.to_string());
@@ -1695,7 +1764,7 @@ fn view_unknown_check_option_is_rejected() {
     image[option_at] = 3;
     let page_start = option_at / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
     refresh_test_page_crc(&mut image, page_start);
-    let error = match Database::from_image(&image) {
+    let error = match Database::from_image(&image, golden_env()) {
         Ok(_) => panic!("an unknown view check option must be rejected"),
         Err(error) => error,
     };
@@ -1717,7 +1786,7 @@ fn view_corrupt_definition_is_rejected() {
     image[at + 7] = b'(';
     let page_start = at / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
     refresh_test_page_crc(&mut image, page_start);
-    let error = match Database::from_image(&image) {
+    let error = match Database::from_image(&image, golden_env()) {
         Ok(_) => panic!("an unparseable view definition must be rejected"),
         Err(error) => error,
     };
@@ -1742,7 +1811,7 @@ fn view_dangling_dependency_is_rejected() {
     image[dep_at + 3] = b'u';
     let page_start = dep_at / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
     refresh_test_page_crc(&mut image, page_start);
-    let error = match Database::from_image(&image) {
+    let error = match Database::from_image(&image, golden_env()) {
         Ok(_) => panic!("a dangling view dependency must be rejected"),
         Err(error) => error,
     };
@@ -1756,6 +1825,7 @@ fn view_dangling_dependency_is_rejected() {
 /// (spec/fileformat/verify.rb), spec/design/sequences.md §12.
 fn serial_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1773,6 +1843,7 @@ fn serial_table_db() -> Session {
 /// Must match the Ruby reference's IDENTITY_TABLE (spec/fileformat/verify.rb), sequences.md §13.
 fn identity_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1796,6 +1867,7 @@ fn identity_table_db() -> Session {
 /// COLLATION_TABLE (spec/fileformat/verify.rb), spec/design/collation.md §5.
 fn collation_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1818,6 +1890,7 @@ fn collation_table_db() -> Session {
 /// reference's COLLATION_PK_TABLE.
 fn collation_pk_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1840,6 +1913,7 @@ fn collation_pk_table_db() -> Session {
 // COLLATION_ARRAY_TABLE.
 fn collation_array_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: GOLDEN_PAGE_SIZE,
         ..Default::default()
     })
@@ -1861,14 +1935,16 @@ fn collation_array_table_db() -> Session {
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
-    load_unicode(); // the unicode-collated goldens need the bundle loaded (collation.md §4)
     let cases: &[(&str, Builder)] = &[
         (
             "empty_db.jed",
             (|| {
-                Database::create(CreateOptions::default())
-                    .unwrap()
-                    .session(SessionOptions::default())
+                Database::create(CreateOptions {
+                    environment: golden_env(),
+                    ..Default::default()
+                })
+                .unwrap()
+                .session(SessionOptions::default())
             }) as Builder,
         ),
         ("overflow_table.jed", overflow_table_db),
@@ -1970,7 +2046,7 @@ fn statistics_semantic_corruption_is_rejected() {
     image[flags] = 0x80;
     let page_start = flags / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
     refresh_test_page_crc(&mut image, page_start);
-    let error = match Database::from_image(&image) {
+    let error = match Database::from_image(&image, golden_env()) {
         Ok(_) => panic!("reserved statistics flag must be rejected"),
         Err(error) => error,
     };
@@ -1981,7 +2057,6 @@ fn statistics_semantic_corruption_is_rejected() {
 /// torn-meta goldens must read through the valid slot to the pk_table content.
 #[test]
 fn read_goldens_reproduces_rows() {
-    load_unicode(); // the unicode-collated goldens open via a loaded bundle (collation.md §4)
     let cases: &[(&str, Builder, &str)] = &[
         ("one_table_empty.jed", one_table_empty_db, "t"),
         ("row_count_table.jed", row_count_table_db, "t"),
@@ -2063,7 +2138,7 @@ fn read_goldens_reproduces_rows() {
         ("torn_meta_slot1.jed", pk_table_db, "t"),
     ];
     for (name, build, table) in cases {
-        let loaded = Database::from_image(&fixture(name))
+        let loaded = Database::from_image(&fixture(name), golden_env())
             .unwrap_or_else(|e| panic!("load {name}: {}", e.message))
             .session(SessionOptions::default());
         let expected = build();
@@ -2075,7 +2150,7 @@ fn read_goldens_reproduces_rows() {
     }
 
     // Empty database: zero tables, and a missing table reads as None.
-    let empty = Database::from_image(&fixture("empty_db.jed"))
+    let empty = Database::from_image(&fixture("empty_db.jed"), golden_env())
         .unwrap()
         .session(SessionOptions::default());
     assert!(empty.table("t").is_none());
@@ -2085,7 +2160,7 @@ fn read_goldens_reproduces_rows() {
 /// `c_x_y_fkey` is MATCH FULL (a rows-only check cannot see it).
 #[test]
 fn read_golden_fk_match_full() {
-    let loaded = Database::from_image(&fixture("fk_table.jed"))
+    let loaded = Database::from_image(&fixture("fk_table.jed"), golden_env())
         .unwrap()
         .session(SessionOptions::default());
     let full: Vec<(String, bool)> = loaded
@@ -2110,7 +2185,7 @@ fn read_golden_fk_match_full() {
 /// bug in an unexercised flag would otherwise slip past a rows-only check).
 #[test]
 fn read_golden_reconstructs_catalog() {
-    let loaded = Database::from_image(&fixture("pk_table.jed"))
+    let loaded = Database::from_image(&fixture("pk_table.jed"), golden_env())
         .unwrap()
         .session(SessionOptions::default());
     let t = loaded.table("t").expect("table t");
@@ -2137,7 +2212,7 @@ fn read_golden_reconstructs_catalog() {
 /// (not just its byte length) round-trips through the catalog (constraints.md §2).
 #[test]
 fn default_survives_load() {
-    let mut loaded = Database::from_image(&fixture("default_table.jed"))
+    let mut loaded = Database::from_image(&fixture("default_table.jed"), golden_env())
         .unwrap()
         .session(SessionOptions::default());
     run(&mut loaded, "INSERT INTO t (id) VALUES (3)");
@@ -2159,7 +2234,7 @@ fn default_survives_load() {
 fn rowid_counter_survives_serialize_and_load() {
     let db = nopk_table_db(); // existing rows take rowids 0, 1, 2 (built at GOLDEN_PAGE_SIZE)
     let image = db.to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
-    let mut loaded = Database::from_image(&image)
+    let mut loaded = Database::from_image(&image, golden_env())
         .unwrap()
         .session(SessionOptions::default());
     // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
@@ -2175,6 +2250,7 @@ fn rowid_counter_survives_serialize_and_load() {
 #[test]
 fn round_trip_at_default_page_size() {
     let mut db = Database::create(CreateOptions {
+        environment: golden_env(),
         page_size: 8192,
         ..Default::default()
     })
@@ -2190,7 +2266,7 @@ fn round_trip_at_default_page_size() {
         run(&mut db, &format!("INSERT INTO t VALUES ({i}, {v})"));
     }
     let image = db.to_image(8192, 1).unwrap();
-    let loaded = Database::from_image(&image)
+    let loaded = Database::from_image(&image, golden_env())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(

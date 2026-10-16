@@ -74,7 +74,7 @@ func assertNoBlockingScratch(t *testing.T, dir string) {
 
 func TestBlockingSpoolAndHashStateStayBounded(t *testing.T) {
 	dir := t.TempDir()
-	db := &engine{spill: osSpillHost{dir: dir}, session: newSession()}
+	db := &engine{spill: osSpillHost{dir: dir}, session: newSession(NewEnvironment())}
 	db.session.workMem = 128
 	spool := newRowSpool(db)
 	defer spool.close()
@@ -124,7 +124,7 @@ func TestBlockingSpillScratchFailure(t *testing.T) {
 
 func TestBlockingVariableAggregatesSpill(t *testing.T) {
 	dir := t.TempDir()
-	db := &engine{spill: osSpillHost{dir: dir}, session: newSession()}
+	db := &engine{spill: osSpillHost{dir: dir}, session: newSession(NewEnvironment())}
 	db.session.workMem = 128
 	for _, plan := range []aggPlan{planPercentileDisc, planMode, planJsonbAgg, planJsonbObjectAgg} {
 		t.Run(fmt.Sprint(plan), func(t *testing.T) {
@@ -316,7 +316,7 @@ func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 // (memory.md §6.6).
 func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
 	dir := t.TempDir()
-	db := &engine{spill: osSpillHost{dir: dir}, session: newSession()}
+	db := &engine{spill: osSpillHost{dir: dir}, session: newSession(NewEnvironment())}
 	db.session.workMem = 1 << 30
 	account := func() (queryAccount, *stateCharge) {
 		acct := queryAccount{used: new(int64), limit: 200}
