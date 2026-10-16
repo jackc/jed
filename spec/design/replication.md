@@ -9,9 +9,9 @@
 > changes, update [CLAUDE.md](../../CLAUDE.md) §9 and [storage.md](storage.md) §6 in the same edit.
 >
 > **Proposed amendments (unratified):** [page-service.md](page-service.md) §9–§10 would move the tee to
-> a single owner's commit point, seed replicas from a page-identical snapshot (a renumbered
-> whole-image serialization cannot take the primary's deltas), and add lineage/timelines, a
-> durability floor, retention, and a stream-break policy.
+> a single owner's commit point, produce page-identical base images (§4) through the page service,
+> and add lineage/timelines, a durability floor, log-durability ordering, retention, and a
+> stream-break policy.
 
 ## 1. The decision, and why it falls out of the existing design
 
@@ -115,10 +115,13 @@ it can mirror an encrypted database without the ability to read it, and needs th
 and when it is promoted to serve queries. This falls out of the layering and is a reason to
 keep encryption a codec above the seam rather than a host duty.
 
-**Base image + tail.** A replica is bootstrapped from a **base image** (the whole-image
-serializer `create` uses, storage.md §4 — a single `CommitDelta`-equivalent covering every
-page at some `txid`) and then kept current by the tail of per-commit deltas. Re-seeding after
-an unrecoverable gap is "ship a fresh base image, resume the tail."
+**Base image + tail.** A replica is bootstrapped from a **base image** and then kept current by
+the tail of per-commit deltas. The base image must be **page-identical** to the primary at some
+`txid`: every page reachable from that snapshot (plus its free-list chain) at its own page index,
+and a meta for that root — a single `CommitDelta`-equivalent. A delta names page indices, so it
+applies only to a file numbered exactly as the primary's. The whole-image serializer `create` uses
+(storage.md §4) renumbers pages, so its output cannot take the primary's deltas and cannot seed a
+replica. Re-seeding after an unrecoverable gap is "ship a fresh base image, resume the tail."
 
 ## 5. Point-in-time recovery, at commit granularity
 

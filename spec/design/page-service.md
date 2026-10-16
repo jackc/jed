@@ -50,9 +50,9 @@ that needs that should use PostgreSQL.
 |---|---|
 | **Keep shared mode** ([locking.md](locking.md)) | Co-resident commits are append-only and free-page reuse, truncation, and compaction stop while more than one process is open; a long-lived second process (a remote helper, a monitoring tool) keeps the file growing. Replication from several writing processes needs every writer to append to a common log, with gaps on crash. |
 | **Query-level relay** (clients send SQL, the owner executes) | Queries run in the owner's `Environment` and engine version. A client's host functions are missing or run with the owner's behavior; Unicode/time-zone data, custom clocks, and seeded entropy are the owner's; during a deploy overlap the new application runs on the old jed version, which forces a two-step deploy discipline for new SQL features. Patching each piece (callbacks, data upload) never reaches the engine version. It also gives up per-process resource isolation. |
-| **Coordinator with direct file reads** (owner tracks pins and the writer gate; clients `pread` the file) | Fixes the environment problem but keeps two processes touching one file. When the coordinator dies, a client may still be reading pages the next coordinator could reuse; closing that race needs per-incarnation generation locks and an append-only interregnum. |
+| **Coordinator with direct file reads** (owner tracks pins and the writer gate; clients `pread` the file) | Fixes the environment problem but keeps two processes touching one file. When the coordinator dies, a client may still be reading pages the next coordinator could reuse; closing that race needs per-incarnation generation locks and an append-only interregnum. Its one advantage, recorded as a cost of this design (§4.1): a live but stuck coordinator stalls only new pins and commits, while clients reading the file directly keep reading. |
 | **Proxy the five-method `BlockStore`** over a socket | The seam has no transactions. Each client's pager would allocate and publish independently: the multi-process problem moved onto a pipe. |
-| **A write-ahead log** | Copy-on-write plus the meta swap already provide atomic durable commits and non-blocking readers. A WAL would add a second file at rest, checkpointing, and (for multiple processes) a shared-memory index, for the one benefit, a single ordered change history, that the owner's commit stream provides here. |
+| **A write-ahead log** | Copy-on-write plus the meta swap already provide atomic durable commits and non-blocking readers. A WAL would add a second file at rest that recovery depends on, checkpointing, and (for multiple processes) a shared-memory index, for the one benefit, a single ordered change history, that the owner's commit stream provides here. Replication does add a retained delta log (§10), also a second at-rest artifact with location, retention, and crash-ordering obligations. The difference is that the database never depends on it: it exists only while replication is configured, and losing it breaks the stream (§10), never the database. |
 
 The page service keeps the relay's clean property (one process touches the file) and the
 coordinator's (each process runs its own engine), and turns out to be the same mechanism replication
@@ -71,6 +71,13 @@ from a page service), though both are servers.
 - If serving (§11.1), binds the endpoint and answers page-service requests on owner-side workers
   (goroutines in Go, threads in Rust). A client request never blocks the owner's own readers; the
   writer gate is shared by owner sessions and client transactions.
+- Must hold the database's encryption key when the database is encrypted. Recovery, commit
+  validation, adoption, reclamation, and backup all read logical page bytes (§13).
+- **A live but stuck owner stalls every client.** Ownership ends only at process death, so an owner
+  that is stopped (`SIGSTOP`), paused (a long GC), or blocked in a durability barrier delays every
+  client's `begin_read`, `read_pages`, and `commit` until it resumes. Shared mode's already-joined
+  peers keep reading the file directly in that case. This design accepts the cost in exchange for
+  one process touching the file; a client-side request timeout is open (§17.10).
 
 ### 4.2 Client
 
@@ -84,14 +91,18 @@ from a page service), though both are servers.
 
 1. Prepare the bundle as today (marker validation, the `arrival` doorbell for v1 exclusion, §12).
 2. Try `presence EX` without waiting. On success, become the owner (§4.1).
-3. Otherwise connect to the endpoint (§10.1). If the endpoint is absent or refuses because the owner
+3. Otherwise connect to the endpoint (§14). If the endpoint is absent or refuses because the owner
    has not finished starting, retry until `file_lock_timeout_ms` expires, then fail `55006` with the
-   path in detail. An owner that runs with `serve = false` answers nothing; the opener fails `55006`
-   with "owned by a non-serving process".
+   path in detail. An owner that runs with `serve = false` binds nothing and answers nothing. To make
+   that case distinguishable from a serving owner that has not bound yet, every owner writes a small
+   `owner` record in the bundle (whether it serves) after acquiring `presence EX` and before binding.
+   The opener reads it only to word the timeout error, as "owned by a non-serving process" when it
+   says so. A stale record from a crashed owner can only mislabel that error, never change an outcome.
 4. A stale endpoint left by a crashed owner is harmless: only a `presence EX` holder may replace it.
 
-A client that is not configured `ownership = never` (§8.2) also waits on `presence EX` in the
-background, so it can promote when the owner leaves.
+A client that is not configured `ownership = never` (§8.2) also polls `presence EX` in the
+background with non-blocking try-locks, so it can promote when the owner leaves. The polls pause
+during a yield handoff (§8.2).
 
 ## 5. The page service
 
@@ -109,8 +120,15 @@ page-service client  ── socket / SSH stdio ──►  page service ──►
 
 Pages cross the service in their **on-disk (ciphertext) form**, below the encryption codec. A client
 decrypts and encrypts with its own key; the owner's file and replication tee see exactly the bytes a
-single-process commit would write. A **keyless owner** — a pure page server that runs no queries of
-its own, such as an SSH helper or a backup host — is therefore possible (§13).
+single-process commit would write.
+
+The **owner still needs the key.** Manifest digests are computed over logical (decrypted) page bytes
+([validated-cow.md](validated-cow.md) §4), and every body page, including catalog, interior,
+free-list, and manifest-overflow pages, is encrypted ([encryption.md](encryption.md) §4). Recovery at
+open, commit validation and adoption (§5.6), the free-list rebuild (§6), and reachable-page backup
+(§9) therefore all decrypt. A keyless process can still be a replication subscriber or a replica's
+apply loop (§10), which store deltas as bytes at their indices without interpreting them. There is
+no keyless owner.
 
 ### 5.2 Operations
 
@@ -119,7 +137,7 @@ All requests carry a request id; a client may pipeline. Responses return in requ
 | Operation | Effect |
 |---|---|
 | `hello(versions, format_version, page_size, caps)` | Handshake: pick a protocol version; confirm the client supports the file's `format_version` and page size; report connection limits (read-only, §11.2). |
-| `begin_read(last_txid)` | Pin the owner's current committed snapshot. Returns the meta (root, `txid`, `page_count`, free-list head, live count) and the **invalidation set**: page indices written by commits after `last_txid` (§5.4). |
+| `begin_read(incarnation, last_txid)` | Pin the owner's current committed snapshot. Returns the meta (root, `txid`, `page_count`, free-list head, live count), the owner's **incarnation id**, and the **invalidation set**: page indices written by commits after `last_txid`, or "invalidate all" (§5.4). |
 | `read_pages(txid, [index…])` | Return page bytes. `txid` must be pinned by this connection. Batched. |
 | `end_read(txid)` | Release one pin. Asynchronous: no reply. |
 | `begin_write(last_txid)` | Acquire the writer gate (§5.5), then the same refresh as `begin_read`, plus the **reuse grant** (§6). |
@@ -140,8 +158,9 @@ on a cache miss. `end_read` needs no reply. This keeps today's guarantee that a 
 after another process's commit returned sees that commit (locking.md §5.1), the same freshness the
 shared protocol gets from its meta re-read.
 
-When the returned `txid` advanced, the client reloads its catalog/interior skeleton and invalidates
-persistent plan caches for that database, as shared mode does today on a foreign `txid`.
+When the returned `txid` advanced, or the reply is "invalidate all", the client reloads its
+catalog/interior skeleton and invalidates persistent plan caches for that database, as shared mode
+does today on a foreign `txid`.
 
 Fetches are batched. The client pager requests read-ahead on leaf chains (the next K leaves named by
 an interior already in hand) and, for scans, can request every page under a subtree root in one
@@ -150,14 +169,27 @@ message. Read-ahead is a pager policy, invisible to cost: page reads remain logi
 
 ### 5.4 Client cache coherence
 
-Under copy-on-write a page index is written only when it is allocated (fresh from the high-water or
-reused from the free list) or when it is a free-list chain page rewritten in place. Every such write
-is listed in that commit's manifest. So the set of indices written after `last_txid` is exactly the
-set whose cached contents may be stale, and dropping just those keeps a client cache correct.
+Under copy-on-write a page index is written only when it is allocated, fresh from the high-water or
+reused from the free list. That includes free-list chain and manifest-overflow pages, which are
+allocated like any other page and never rewritten in place ([validated-cow.md](validated-cow.md) §2).
+Every such write is listed in that commit's manifest. So the set of indices written after `last_txid`
+is exactly the set whose cached contents may be stale, and dropping just those keeps a client cache
+correct.
 
 The owner retains a bounded window of per-commit written-index sets. A client further behind than the
 window receives "invalidate all". Steady-state reads from a warm client cache cost no IPC beyond the
 `begin_read` round trip.
+
+That argument holds only within one history. Under relaxed `synchronous` (§10) an owner crash can
+recover generation N−1 after a client cached generation N, or a later owner can reach the same `txid`
+along a different history, so a `txid` alone cannot say whether a cache is current. Each owner
+therefore draws a random **incarnation id** when it becomes owner. A client sends the incarnation its
+cache came from; when it differs from the owner's, the owner replies "invalidate all", and the client
+drops its page cache, catalog skeleton, and plan caches regardless of `txid`.
+
+Consequently every promotion (§8.1) starts every client cold, at the moment traffic shifts to the new
+owner. Seeding the new owner's window from the two meta slots' manifests would be sound only for a
+client whose cache is known to be from the recovered history; v1 does not attempt it.
 
 ### 5.5 Writer gate
 
@@ -166,29 +198,40 @@ it under the session `lock_timeout_ms` (`55P03` on expiry, as today). A client h
 `begin_write` until its `commit` is acknowledged or it aborts. The owner enforces an
 idle-in-transaction timeout on client write transactions (§11.2); a revoked transaction fails
 `25P03 idle_in_transaction_session_timeout` at its next request. A client whose connection drops
-while holding the gate is aborted at EOF.
+while holding the gate is aborted at EOF unless its commit has passed the **point of no return**:
+the owner has received the complete `CommitDelta` and it passed validation (§5.6). After that point
+the owner finishes the commit whether or not the connection survives, then releases the gate; the
+client resolves the outcome with `commit_status` (§8.4).
 
 ### 5.6 Commit
 
 The client builds the `CommitDelta` with the ordinary v33 recipe ([validated-cow.md](validated-cow.md)):
 allocation under the reuse grant (§6), dirty body pages in deterministic order, free-list pages,
-manifest, and the alternate meta. Large deltas stream in chunks; the owner may write body pages as
-they arrive, because every target page is either beyond the committed high-water or a granted free
-page, so none is reachable from any pinned snapshot or the fallback meta.
+manifest, and the alternate meta. It **sends the meta and manifest first**, then the pages. Large
+deltas stream in chunks; the owner may write each page as it arrives once that page passes the
+per-page checks below, because every legal target is either beyond the committed high-water or a
+granted free page, so none is reachable from any pinned snapshot or the fallback meta.
 
 **Owner validation** (cheap, structural; it catches client bugs, not malice — §13):
 
-- `txid == committed + 1`, `page_size` and `format_version` match;
-- every written index is beyond the previous `page_count`, in the granted reusable set, or a
-  free-list chain page the grant permits rewriting;
-- the manifest covers exactly the written pages and their CRC-64 identities match;
-- the meta's CRC and bounds are valid.
+- before any page is written: `txid == committed + 1`, `page_size` and `format_version` match, the
+  meta's CRC and bounds are valid, and every index the manifest lists is beyond the previous
+  `page_count` or in the granted reusable set;
+- before each page is written: its index is listed in the manifest and not yet received, and its
+  CRC-64 identity matches the manifest's;
+- at the end: every page the manifest lists was received.
+
+A failed check rejects the delta with `08P01` and aborts the transaction. Pages already written are
+unreachable orphans of the rejected delta, beyond the high-water or in the free list, and the next
+commit reuses or overwrites them; the fallback meta and every pinned snapshot are untouched.
 
 Then, holding the gate: write the meta, execute the single durable barrier, adopt the new committed
 snapshot locally (reload the skeleton; drop the owner's buffer-pool entries for written indices),
-append the delta to the replication tee, release the gate, and acknowledge. A write or sync failure
-poisons the owner's storage handle exactly as it does today (locking.md §5.3): the owner stops serving
-and closes, and the commit's outcome is resolved by recovery under the next owner (§8.4).
+append the delta to the replication tee, record `(txid, manifest digest)` in the resolution window
+(§8.4), acknowledge, and release the gate (after a maintenance commit, if one is due, §6). A write
+or sync failure poisons the owner's storage handle exactly as it does today (locking.md §5.3): the
+owner stops serving and closes, and the commit's outcome is resolved by recovery under the next
+owner (§8.4).
 
 ## 6. Page reuse and reclamation
 
@@ -207,9 +250,15 @@ carry everything required.
   reachability walk once the high-water passes about twice the live count, storage.md §6) is O(live
   pages). Run by a remote client it would fetch the whole database. Instead a client commit never
   rebuilds; when a client commit crosses the rebuild threshold the owner runs a storage-maintenance
-  commit immediately after it, under the same gate. This makes a file's page layout depend on which
+  commit immediately after it. The client's commit is acknowledged first, so the maintenance commit
+  adds no latency to it, but the owner does not release the writer gate between the two, so no other
+  writer starts in between. This makes a file's page layout depend on which
   process committed, which is fine for the cross-core contract (each role's rule is specified and
   identical in every core) but must be modeled by simulation testing (§15). Open question §17.3.
+- **The maintenance commit is a new commit kind.** It changes only the free list, yet it writes
+  pages, issues a barrier, and advances `txid`. [transactions.md](transactions.md) §2.1 (no mutation,
+  no barrier, no `txid` advance) needs an explicit carve-out for it, and it is a distinct delta kind
+  in the replication log (§10) and in simulation histories (§15).
 - **Compaction** is an ordinary owner operation: it requires the owner's watermark drained (now
   including client pins) and the writer gate, and fails `55006` rather than waiting, as today. After
   the rename, clients' next `begin_read` receives "invalidate all"; a pinned client blocks compaction.
@@ -227,13 +276,25 @@ Persisted facts are file facts and are unaffected: collations baked into the fil
 pins ([index-dependencies.md](index-dependencies.md)), and the `XX002` rule for a file that needs host
 code to reopen bind every participant equally.
 
-**Compatibility reduces to two version checks at `hello`:**
+**Compatibility needs three checks at `hello`; the first two are version numbers:**
 
 - **Page protocol version.** Negotiated; each release states the range it serves and speaks.
-- **On-disk format.** A client must read and write the file's current `format_version`. A format
-  upgrade happens only on an owner with no connected clients, and only after it promotes; an older
-  client connecting afterwards fails `0A000` with the required version in detail. In a blue-green
-  deploy the newer green therefore upgrades the format only after blue has gone.
+- **On-disk format.** A client must read and write the file's current `format_version`, or it fails
+  `0A000` with the required version in detail. Every core reads and writes exactly one
+  `format_version`, and there is no in-place upgrade or mixed-version migration
+  ([format.md](../fileformat/format.md); [validated-cow.md](validated-cow.md) §1). So a release that
+  changes `format_version` cannot overlap with its predecessor at all. A deploy across a format change
+  is stop-then-start with whatever migration exists outside this design (such as a logical dump and
+  restore, §9). Designing a format upgrade path is out of scope here.
+- **Persisted SQL.** Catalog loading reparses stored SQL text: view definitions, expression
+  defaults, CHECK constraints, partial-index predicates, and expression index keys. A newer release
+  can add syntax without changing `format_version`. For example, `SEARCH`/`CYCLE` landed (e92a7a3e)
+  without a format bump, and a stored view may use it. An older binary that cannot parse such text
+  fails the load with `XX001`. If the owner is the older binary, it first meets that text when it
+  adopts a client's commit (§5.6), after the delta is already durable. The two version checks above
+  do not catch this. A fix is open (§17.11): negotiate a persisted-SQL level at `hello` and refuse
+  persisting DDL from a client whose level exceeds the owner's, or make adoption structural and
+  defer parsing to first use.
 
 ## 8. Ownership handoff
 
@@ -249,7 +310,8 @@ all between requests continues transparently. A transaction that was open fails:
   resolved (§8.4).
 
 The promoted process switches its pager from the service to the local file between transactions. Its
-cache holds byte-identical page contents, but v1 drops it; reusing it is an optimization.
+cache holds byte-identical page contents, but v1 drops it; reusing it is an optimization. The new
+owner has a new incarnation id, so every reconnecting client is also told "invalidate all" (§5.4).
 
 ### 8.2 Ownership preference and yield
 
@@ -265,9 +327,19 @@ an ownership preference:
 
 **Yield.** A yielding owner receiving `request_ownership` stops admitting new transactions (owner
 sessions and clients), waits up to a yield grace period for running ones to finish, aborts the rest
-with `08006`, then releases `presence EX`. The requester is waiting on the OS lock and acquires it;
+with `08006`, then releases `presence EX`. The requester is polling the OS lock and acquires it;
 the yielding tool becomes a client of the new owner. An interactive user sees, at worst, one aborted
 transaction. Two `prefer` processes never yield to each other.
+
+**Handoff ordering.** An OS lock cannot be handed to a chosen process, so other pollers must stand
+aside. When a yield begins, the owner tells every connected client which connection requested
+ownership. Every other client, including the yielding tool once it is a client, pauses its
+`presence EX` polls for a handoff window; only the requester keeps polling. If the requester's
+connection drops before the owner releases, the owner cancels the yield and keeps ownership. If the
+requester dies after the release, the handoff window expires, every client resumes polling, and
+ordinary promotion (§8.1) picks an owner, possibly the yielding tool again, which a later `prefer`
+opener can ask to yield in turn. Only a `prefer` process requests ownership, so two `yield` tools
+never pass it back and forth.
 
 ### 8.3 Blue-green walkthrough
 
@@ -279,15 +351,28 @@ transaction. Two `prefer` processes never yield to each other.
 4. Green acquires `presence EX`, becomes owner, and switches to the local file. Green requests that
    straddled the moment fail `08006` or `08007` and are retried.
 
-No format, environment, or engine-version compromise is needed during the overlap.
+Within one `format_version` and one persisted-SQL level (§7), no environment or engine-version
+compromise is needed during the overlap. A release that changes `format_version` cannot overlap
+(§7).
 
 ### 8.4 Resolving an unacknowledged commit
 
 A client that sent `commit` and lost the connection knows its delta's `txid` and manifest digest.
-After reconnecting to (or becoming) the next owner, it asks `commit_status`: the new owner's
-recovered meta either has that `txid` with a matching manifest (committed), or a lower `txid`
-(not committed; the gate was lost, so nothing else can have committed in between). Only if
-resolution is impossible does the application see `08007`.
+After reconnecting to (or becoming) an owner, it asks `commit_status(txid, digest)`. The owner may be
+the same one (the connection dropped but the owner survived) or a new one, and other writers may
+have committed in between, so the committed `txid` alone cannot answer.
+
+Each owner keeps a bounded **resolution window** of `(txid, manifest digest)` pairs: one per commit
+it publishes (§5.6), seeded at startup with the pairs from both recovered meta slots, so the window
+covers a contiguous `txid` range. The owner first waits for any commit already past its point of no
+return (§5.5) to finish, then answers:
+
+- the window holds `txid` with the same digest: **committed**;
+- the window holds `txid` with a different digest: **not committed** (the delta was aborted, or
+  recovery fell back past it, and another commit took that `txid`);
+- `txid` is above the owner's committed `txid`: **not committed**;
+- `txid` is below the window: **unknown**, and the application sees
+  `08007 transaction_resolution_unknown`.
 
 ## 9. Backup
 
@@ -312,10 +397,21 @@ these consequences of the owner model:
 
 - **The tee is at the owner's commit point**, after the durable barrier, before the gate is released.
   Owner commits and client `CommitDelta`s pass through the same point, so the log is complete and in
-  `txid` order with no cross-process merge. Retained deltas live beside the bundle (location open).
-- **The crash gap is repairable.** If the owner dies after the barrier but before appending, only the
-  newest commit is missing, and its dirty-page set is in the meta's v33 manifest, protected until the
-  next commit. The next owner rebuilds the entry before serving.
+  `txid` order with no cross-process merge. Retained deltas live outside the bundle, which holds no
+  database bytes ([locking.md](locking.md) §3.1); the location is open.
+- **Log durability ordering.** Syncing the database file does not make the separate log durable.
+  The invariant: **the log entry for commit N is durable before any page write of a later commit
+  that may reuse a page commit N wrote.** Under v33 a commit never reuses its predecessor's pages,
+  so commit N+2 is the first that can; the simple rule that satisfies it is to sync the log before
+  the next commit's first page write. The rule is stated over page writes, not database barriers,
+  so it holds unchanged under relaxed `synchronous`, where it costs a log sync the deferred database
+  barrier would otherwise have batched.
+- **The crash gap is repairable only under that invariant.** If the owner dies after the barrier but
+  before the newest entry is durable, only that newest commit is missing; its dirty-page set is in
+  the meta's v33 manifest, protected until the next commit. The next owner rebuilds the entry before
+  serving. If recovery finds the log more than one commit behind the recovered meta (the invariant
+  was violated, or the log was damaged), the gap cannot be rebuilt: the owner records a stream break
+  (a new timeline), as for a log-append failure below, rather than claim a repair.
 - **Relaxed `synchronous`.** The log records the durability floor; `subscribe` ships only entries at
   or below it, and recovery truncates entries above the recovered `txid`.
 - **`subscribe(from_txid)`** streams retained entries then the live tail. A subscriber older than
@@ -338,7 +434,7 @@ these consequences of the owner model:
 
 ### 11.1 Options
 
-- `serve`: `true` (default where supported, §14) | `false`. A non-serving owner is today's
+- `serve`: `true` (default where supported, §14 below) | `false`. A non-serving owner is today's
   `exclusive` mode.
 - `ownership`: `prefer` | `yield` | `never` (§8.2).
 - Owner-side limits: maximum concurrent connections, idle-session timeout, idle-in-transaction
@@ -360,7 +456,8 @@ Superseded when ratified:
   transaction begin (§5.1), the cross-process `writer` and `commit` gates (§5.2–§5.3), and append-only
   co-resident commits;
 - the `shared` value of `locking`. The option becomes `auto` (owner/client) | `exclusive` (owner,
-  `serve = false`) | `none` (unchanged escape hatch).
+  `serve = false`) | `none` (unchanged escape hatch). The transitional opt-in `service` value
+  (§16) is retired with it, as a synonym of `auto`.
 
 Kept: the stable bundle and its identity rules (locking.md §3.1), `presence` as the ownership lock,
 the hard-link rejection, the per-path in-process registry, fork invalidation, the open timeout, and
@@ -386,8 +483,9 @@ corrupt. The rollout drains v1 processes once, as the v1 rollout drained pre-pro
   database. jed never listens on a network port.
 - **Untrusted SQL** (CLAUDE.md §13) is unaffected: it executes in some process's engine under that
   process's session envelope, exactly as today.
-- **Keyless serving.** Encrypted pages cross the service as ciphertext (§5.1), so a backup host or SSH
-  helper can serve, back up, or replicate an encrypted database without the key.
+- **Ciphertext on the wire, key at the owner.** Encrypted pages cross the service as ciphertext
+  (§5.1), but an owner, including an SSH helper or backup host that becomes owner, must hold the key.
+  Only replication subscribers and replica apply loops (§10) can run keyless.
 
 ## 14. Platforms and cores
 
@@ -399,8 +497,7 @@ corrupt. The rollout drains v1 processes once, as the v1 rollout drained pre-pro
 | Native TS in the browser (OPFS) | no | yes (today's exclusive access) | no |
 | wasm32-wasip1 | no | no (explicit `none` only, as today) | no |
 
-Production server-side JavaScript is expected to use the Rust bindings; native TS matters mainly in
-the browser, where there is one process. Not every core needs to serve.
+The native TS on Node row is undecided and blocks phase 4 (§17.7). Not every core needs to serve.
 
 **Endpoint mechanics (open):**
 
@@ -409,8 +506,9 @@ the browser, where there is one process. Not every core needs to serve.
   per-user runtime path (e.g. `$XDG_RUNTIME_DIR/jed/<hash>.sock`) recorded in a pointer file in the
   bundle. Linux's abstract namespace is rejected (no file permissions).
 - **Windows.** Go supports `AF_UNIX` on Windows. Rust's standard library does not, so the Rust core
-  needs named pipes or `AF_UNIX` through either a crate (a §14 dependency decision) or `unsafe` FFI
-  (a §13 decision). Until decided, Rust on Windows offers non-serving ownership only.
+  needs named pipes or `AF_UNIX` through either a crate (a CLAUDE.md §14 dependency decision) or
+  `unsafe` FFI (a CLAUDE.md §13 decision). Until decided, Rust on Windows offers non-serving ownership
+  only.
 
 ## 15. Verification
 
@@ -426,7 +524,9 @@ the browser, where there is one process. Not every core needs to serve.
 - **Simulation testing.** Simulated processes become an owner plus clients over a simulated channel
   whose deliveries, disconnects, and owner crashes are seeded; the storage oracles are unchanged and
   the commit-role rule (§6) is part of the history.
-- **Validation fuzzing.** Mutated `CommitDelta`s must fail `08P01` without touching the file.
+- **Validation fuzzing.** Mutated `CommitDelta`s must fail `08P01` without writing any page outside
+  the grant (§5.6), without changing a page reachable from a pinned snapshot or the fallback meta,
+  and without publishing a meta.
 - **Benchmarks** ([benchmarks.md](benchmarks.md)): alone-owner fast path (no regression), client
   warm-cache and cold-cache reads, client commit latency, and SSH-latency scans with and without
   read-ahead.
@@ -440,7 +540,8 @@ the browser, where there is one process. Not every core needs to serve.
 3. **Write path**: writer gate, reuse grant, `commit` with validation, owner adoption, the
    reclamation rule, `commit_status`.
 4. **Handoff**: promotion, yield, graceful close, timeouts; the process-corpus rewrite; simulation
-   testing; retire shared mode and the `shared` option; v2 bundle migration.
+   testing; retire shared mode and the `shared` option (only once §17.7 is decided); v2 bundle
+   migration.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
    fetch.
 6. **Backup**: page-identical and compacted forms.
@@ -449,20 +550,42 @@ the browser, where there is one process. Not every core needs to serve.
 
 Shared mode stays in place until phase 4 lands, so blue-green deploys keep working throughout.
 
+**Coexistence during phases 2–3.** A v2 owner cannot honor v1 join windows: a v1 peer reading the
+file directly pins snapshots the owner cannot see, which breaks the reuse grant (§6) and cache
+coherence (§5.4). So until phase 4 the page service is opt-in per database through an explicit
+`locking = service` value, and `auto` keeps choosing shared mode. A `service` owner holds
+`presence EX` for its whole tenure and ignores the `arrival` doorbell, so a shared-mode opener of the
+same database times out with `55006`; a `service` opener that finds a shared-mode group holding
+`presence SH` fails `55006` too, as in §12. Mixing the two modes fails closed. Phase 4 makes `auto`
+mean owner/client and retires `shared`.
+
 ## 17. Open questions
 
 1. **Endpoint location**: bundle with runtime-directory fallback (proposed), or always a runtime
    directory?
-2. **Rust on Windows**: a named-pipe crate (needs §14 approval) or non-serving only at first?
+2. **Rust on Windows**: a named-pipe crate (needs CLAUDE.md §14 approval) or non-serving only at
+   first?
 3. **Reclamation**: owner-only rebuilds with maintenance commits (proposed), or clients rebuild too?
 4. **Grace periods and defaults** for yield, shutdown, idle sessions, and idle-in-transaction.
 5. **Freshness**: keep `begin_read` a round trip always (proposed), or allow an opt-in relaxed mode
    in which owner-pushed commit notices let a client begin locally?
 6. **Log-append failure policy**: break the stream and keep writing (proposed), or refuse writes?
-7. **Native TS client** on Node: worth building, or not until asked?
+7. **Native TS on Node** (an architecture decision, needed before phase 4). Today Node takes part
+   in shared mode through `impl/ts/native-lock`, with release-blocking Rust↔Node and Go↔Node process
+   lanes ([locking.md](locking.md) §1, §9.2). As written, §14 leaves native TS on Node unable to
+   serve and only optionally a client, so retiring shared mode in phase 4 would remove Node
+   multi-process access and shrink the Layer 4 corpus to two cores. Pointing production Node at the
+   Rust bindings would reverse locking.md §8 (`impl/node` stays an experimental reach artifact) and
+   CLAUDE.md §2's full parity for the TS core. Options: build a native TS client (and possibly a
+   serving owner) before phase 4, or keep shared mode for TS.
 8. **Query-level protocol over SSH**: deferred. It would only win for very large scans or
    extractions where shipping rows beats shipping pages; the RAM-sized design target suggests batched
    page fetches cover most remote use.
 9. **Attachments**: each attached file has its own owner, so one process may own `main` and be a
    client of an attachment. The one-durable-writer-per-transaction rule is unchanged; confirm the
    writer-gate acquisition order across owners avoids deadlock (locking.md §6 orders by path today).
+10. **Client request timeout** for a live but stuck owner (§4.1): none (proposed: the accepted
+    cost), or a client-side timeout, and with which SQLSTATE?
+11. **Persisted-SQL compatibility** (§7): negotiate a persisted-SQL level at `hello` and refuse
+    persisting DDL from a client whose level exceeds the owner's, or make adoption structural and
+    defer parsing stored SQL to first use?
