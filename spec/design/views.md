@@ -124,8 +124,9 @@ privilege check all come first, as in PostgreSQL), and then:
    collation is a value of its own.
    The existing columns' types and collations are not persisted (§3); they come from planning the
    view's current body against the current catalog. If that body no longer plans (an untracked
-   dependency was dropped, §6), only the names and the column count are compared, so a broken view
-   can always be repaired by replacing it.
+   dependency was dropped, §6), or does not parse in this binary
+   ([unparsable-definitions.md](unparsable-definitions.md) §3.1), only the names and the column count
+   are compared, so a broken view can always be repaired by replacing it.
 10. **No cycle** (`42P17`, *infinite recursion detected in rules for relation "v"*). The new body is
     planned against the view's current definition, so it may read `v` itself or a view that reads
     `v`. A body that depends on `v`, directly or through other views, would make the catalog cyclic,
@@ -198,7 +199,9 @@ identifier renders quoted, and comments are gone. Example:
 bytes. The stored text is what `jed_views.definition` shows and what the CLI dump emits (§11).
 
 **Open does not plan.** At open a core parses each definition with its ordinary query parser
-(unparseable text is `XX001`) and checks the entry's structure. The dependency list must name
+and checks the entry's structure. Text the parser rejects, typically syntax from a newer jed, is not
+corruption: the view is kept, unparsed, with its text unchanged, and only a statement that needs its
+body fails, with `XX003` ([unparsable-definitions.md](unparsable-definitions.md) §3.1). The dependency list must name
 existing tables and views, every listed column must exist in its table, the view-dependency graph
 must be acyclic, and the output names must be non-empty and unique. A violation is `XX001`. The
 body is **not** planned at open. Planning could fail for reasons that are not corruption, such as

@@ -240,6 +240,11 @@ data, not prose). Per object, the verdict is one of:
 > *siblings*:** `XX002` is **collation-specific for now**; a future read-required built-in / host
 > gap gets its own sibling code rather than overloading this one. `XX001` (`data_corrupted`) already
 > exists; `0A000` (`feature_not_supported`) is the existing code for an unsupported *construct*.
+> The first sibling has landed: **`XX003` (`unparsable_stored_definition`)** — stored SQL text (a view,
+> `CHECK`, expression `DEFAULT`, or expression/partial index) that this binary's parser rejects, the
+> "newer SQL grammar" case of §1. It follows this section's per-object rule without a manifest: the
+> object is kept unparsed and only the statements that need it fail
+> ([unparsable-definitions.md](unparsable-definitions.md)).
 
 ## 8. Degradation semantics (the heap-scan fallback)
 

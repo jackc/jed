@@ -382,18 +382,41 @@ fn round_trips_through_the_on_disk_image() {
         vec!["price_range", "t_b_check", "t_note_check"]
     );
 
-    // A stored expression that no longer parses is XX001 (the file lied): patch the text
-    // `b > 0` to the same-length garbage `b > (`.
+    // A stored expression this binary cannot parse loads, unparsed: patch the text `b > 0` to the
+    // same-length `b > (` and reseal the page. A write that evaluates the checks is XX003
+    // (spec/design/unparsable-definitions.md §3.2).
     let needle = b"b > 0";
     let at = image
         .windows(needle.len())
         .position(|w| w == needle)
         .expect("stored check text in image");
-    let mut corrupt = image.clone();
-    corrupt[at + 4] = b'(';
-    let e = match Database::from_image(&corrupt, jed::Environment::default()) {
-        Err(e) => e,
-        Ok(_) => panic!("corrupt check text must fail to load"),
-    };
-    assert_eq!(e.code(), "XX001");
+    let mut unparsable = image.clone();
+    unparsable[at + 4] = b'(';
+    reseal_page(&mut unparsable, at / 256 * 256);
+    let mut future = Database::from_image(&unparsable, jed::Environment::default())
+        .unwrap_or_else(|e| panic!("unparsable check text must load: {}", e.message))
+        .session(SessionOptions::default());
+    let e = future
+        .query_outcome("INSERT INTO t VALUES (9, 1, 1.00, 'ok')", &[])
+        .unwrap_err();
+    assert_eq!(e.code(), "XX003");
+}
+
+/// Recomputes a 256-byte page's CRC-32 (the page header's bytes 12..16 cover the rest of the page).
+fn reseal_page(image: &mut [u8], page_start: usize) {
+    let mut crc = 0xffff_ffffu32;
+    for byte in image[page_start..page_start + 12]
+        .iter()
+        .chain(image[page_start + 16..page_start + 256].iter())
+    {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    image[page_start + 12..page_start + 16].copy_from_slice(&(!crc).to_be_bytes());
 }

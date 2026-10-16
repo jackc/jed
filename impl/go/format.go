@@ -3419,7 +3419,7 @@ func viewEntryBytes(v *viewDef) []byte {
 }
 
 // decodeViewEntry decodes a view catalog entry's body (inverse of viewEntryBytes); the caller has
-// consumed the entry_kind byte. The definition is parsed (XX001 if it does not parse as a
+// consumed the entry_kind byte. The definition is parsed (kept unparsed if it does not parse as a
 // subquery_expr) but never planned (views.md §3).
 func decodeViewEntry(buf []byte, pos *int) (*viewDef, error) {
 	name, err := readString(buf, pos)
@@ -3492,11 +3492,13 @@ func decodeViewEntry(buf []byte, pos *int) (*viewDef, error) {
 	if option > byte(checkOptionCascaded) {
 		return nil, newError(DataCorrupted, "unknown view check option")
 	}
+	// A definition this binary cannot parse — typically newer syntax — is kept, unparsed, rather than
+	// failing the load (spec/design/unparsable-definitions.md): every use of the view is XX003.
 	body, depth, err := parseViewDefinition(definition)
 	if err != nil {
-		return nil, newError(DataCorrupted, "a view definition does not parse")
+		body, depth = nil, 0
 	}
-	return &viewDef{Name: name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth, CheckOption: checkOption(option)}, nil
+	return &viewDef{Name: name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth, Unparsed: err != nil, CheckOption: checkOption(option)}, nil
 }
 
 // installViews validates the loaded views against the catalog and registers them (format.md *View
@@ -4983,7 +4985,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		// bit2) is a value via the same value codec rows use — never externalized, so no
 		// overflow reader is needed (a 0x02 tag here would be a corrupt catalog). An EXPRESSION
 		// default (flags bit3, v8) is instead the expr-text (u16 length + UTF-8), re-parsed with
-		// the ordinary expression parser (XX001 if it fails, like a stored check). The two bits
+		// the ordinary expression parser (unparsed if it fails, like a stored check). The two bits
 		// are mutually exclusive — both set is a corrupt catalog.
 		if flags&0b1100 == 0b1100 {
 			return nil, 0, nil, newError(DataCorrupted, "column has both a constant and an expression default")
@@ -5004,11 +5006,12 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			if err != nil {
 				return nil, 0, nil, err
 			}
-			expr, err := parseExpression(exprText)
-			if err != nil {
-				return nil, 0, nil, newError(DataCorrupted, "stored default expression does not parse: "+err.Error())
+			// Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
+			expr, perr := parseExpression(exprText)
+			if perr != nil {
+				expr = exprNode{}
 			}
-			defaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr}
+			defaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr, Unparsed: perr != nil}
 		}
 		// The effective collation (v17, flags bit6) — appended last; a non-collated column has the
 		// bit clear and reads nothing (spec/design/collation.md §5).
@@ -5052,8 +5055,8 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		pk = append(pk, o)
 	}
 	// CHECK constraints (v4): the stored expression text re-parses with the ordinary
-	// expression parser — it was written by the token renderer, so this cannot fail for a
-	// file the engine wrote; failure means the file lied (XX001, constraints.md §4.5).
+	// expression parser. Text this binary cannot parse (a newer jed's syntax) is kept, unparsed
+	// (spec/design/unparsable-definitions.md §3.2).
 	checkCount, err := readU16(buf, pos)
 	if err != nil {
 		return nil, 0, nil, err
@@ -5068,10 +5071,9 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		if err != nil {
 			return nil, 0, nil, err
 		}
-		expr, err := parseExpression(exprText)
-		if err != nil {
-			return nil, 0, nil, newError(DataCorrupted,
-				"stored check constraint does not parse: "+err.Error())
+		expr, perr := parseExpression(exprText)
+		if perr != nil {
+			expr = exprNode{}
 		}
 		// v35: check_flags (bit0 has_host_deps; reserved bits are XX001), then the dependency list.
 		cflags, err := readU8(buf, pos)
@@ -5087,7 +5089,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 				return nil, 0, nil, err
 			}
 		}
-		checks = append(checks, checkConstraint{Name: checkName, ExprText: exprText, Expr: expr, HostDeps: checkDeps})
+		checks = append(checks, checkConstraint{Name: checkName, ExprText: exprText, Expr: expr, Unparsed: perr != nil, HostDeps: checkDeps})
 	}
 	// Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
 	// unique; the rest reserved-zero) + root page, in the catalog's (name-byte
@@ -5118,17 +5120,17 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 				return nil, 0, nil, err
 			}
 			if ord == 0xFFFF {
-				// An expression key (v26): the sentinel, then the canonical text; re-parse it
-				// (XX001 on failure, like a stored CHECK — spec/design/indexes.md §6).
+				// An expression key (v26): the sentinel, then the canonical text; re-parse it. Text this
+				// binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md §3.4).
 				text, err := readString(buf, pos)
 				if err != nil {
 					return nil, 0, nil, err
 				}
 				expr, perr := parseExpression(text)
 				if perr != nil {
-					return nil, 0, nil, newError(DataCorrupted, "unparseable index expression")
+					expr = exprNode{}
 				}
-				keys = append(keys, indexKey{Expr: &indexKeyExpr{ExprText: text, Expr: expr}})
+				keys = append(keys, indexKey{Expr: &indexKeyExpr{ExprText: text, Expr: expr, Unparsed: perr != nil}})
 				continue
 			}
 			if int(ord) >= len(columns) {
@@ -5171,7 +5173,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			return nil, 0, nil, err
 		}
 		// v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
-		// it (XX001 on failure, like a stored CHECK — spec/design/indexes.md §9).
+		// it; text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
 		var predicate *indexKeyExpr
 		if hasPredicate {
 			text, perr := readString(buf, pos)
@@ -5180,9 +5182,9 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			}
 			expr, perr := parseExpression(text)
 			if perr != nil {
-				return nil, 0, nil, newError(DataCorrupted, "unparseable index predicate")
+				expr = exprNode{}
 			}
-			predicate = &indexKeyExpr{ExprText: text, Expr: expr}
+			predicate = &indexKeyExpr{ExprText: text, Expr: expr, Unparsed: perr != nil}
 		}
 		// v31: the host-function dependency list follows the predicate when bit2 is set
 		// (extensibility.md §8.1). A non-btree index never carries one.

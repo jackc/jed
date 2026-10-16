@@ -207,6 +207,8 @@ const (
 	DataCorrupted
 	// CollationVersionMismatch is XX002 — collation version mismatch: {detail}.
 	CollationVersionMismatch
+	// UnparsableStoredDefinition is XX003 — stored definition does not parse in this version of jed: {detail}.
+	UnparsableStoredDefinition
 )
 
 // Code returns the canonical SQLSTATE string.
@@ -404,6 +406,8 @@ func (s SqlState) Code() string {
 		return "XX001"
 	case CollationVersionMismatch:
 		return "XX002"
+	case UnparsableStoredDefinition:
+		return "XX003"
 	default:
 		return "XX000"
 	}
@@ -516,4 +520,5 @@ var errorDescs = []errorDesc{
 	{Code: "58P02", Name: "duplicate_file", Class: "system error"},
 	{Code: "XX001", Name: "data_corrupted", Class: "internal error"},
 	{Code: "XX002", Name: "collation_version_mismatch", Class: "internal error"},
+	{Code: "XX003", Name: "unparsable_stored_definition", Class: "internal error"},
 }

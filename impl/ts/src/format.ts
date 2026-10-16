@@ -38,7 +38,8 @@ import {
   indexColumnOrdinals,
   pkIndices,
 } from "./catalog.ts";
-import { parseExpression, parseViewDefinition } from "./parser.ts";
+import { parseViewDefinition } from "./parser.ts";
+import { parseStoredExpression } from "./unparsed.ts";
 import type { Collation } from "./collation.ts";
 import { Environment } from "./environment.ts";
 import { Decimal } from "./decimal.ts";
@@ -1469,7 +1470,7 @@ export function viewEntryBytes(v: ViewDef): Uint8Array {
 }
 
 // decodeViewEntry decodes a view catalog entry's body (inverse of viewEntryBytes); the caller has
-// consumed the entry_kind byte. The definition is parsed (XX001 if it does not parse as a
+// consumed the entry_kind byte. The definition is parsed (kept unparsed if it does not parse as a
 // subquery_expr) but never planned (views.md §3).
 function decodeViewEntry(buf: Uint8Array, cur: Cursor): ViewDef {
   const name = readString(buf, cur);
@@ -1510,11 +1511,13 @@ function decodeViewEntry(buf: Uint8Array, cur: Cursor): ViewDef {
   else if (optionCode === 1) checkOption = "local";
   else if (optionCode === 2) checkOption = "cascaded";
   else throw engineError("data_corrupted", "unknown view check option");
-  let parsed: { body: QueryExpr; depth: number };
+  // A definition this binary cannot parse — typically newer syntax — is kept, unparsed, rather than
+  // failing the load (spec/design/unparsable-definitions.md): every use of the view is XX003.
+  let parsed: { body: QueryExpr | null; depth: number };
   try {
     parsed = parseViewDefinition(definition);
   } catch {
-    throw engineError("data_corrupted", "a view definition does not parse");
+    parsed = { body: null, depth: 0 };
   }
   return {
     name,
@@ -4340,7 +4343,7 @@ function decodeTableEntry(
     // the same value codec rows use — never externalized, so no overflow reader is needed (a
     // 0x02 tag here would be a corrupt catalog). An EXPRESSION default (flags bit3, v8) is
     // instead the expr-text (u16 length + UTF-8), re-parsed with the ordinary expression parser
-    // (XX001 if it fails, like a stored check). The two bits are mutually exclusive — both set is
+    // (kept unparsed if it fails, like a stored check). The two bits are mutually exclusive — both set is
     // a corrupt catalog.
     if ((flags & 0b1100) === 0b1100) {
       throw engineError("data_corrupted", "column has both a constant and an expression default");
@@ -4350,17 +4353,9 @@ function decodeTableEntry(
       (flags & 0b100) !== 0 ? readValue({ kind: "scalar", scalar: ty }, buf, cur, null, []) : null;
     let colDefaultExpr: DefaultExpr | null = null;
     if ((flags & 0b1000) !== 0) {
+      // Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
       const exprText = readString(buf, cur);
-      let expr: Expr;
-      try {
-        expr = parseExpression(exprText);
-      } catch (e) {
-        throw engineError(
-          "data_corrupted",
-          "stored default expression does not parse: " + String(e),
-        );
-      }
-      colDefaultExpr = { exprText, expr };
+      colDefaultExpr = { exprText, ...parseStoredExpression(exprText) };
     }
     // The effective collation (v17, flags bit6) — appended last; a non-collated column has the bit
     // clear and reads nothing (spec/design/collation.md §5).
@@ -4398,22 +4393,14 @@ function decodeTableEntry(
   for (let i = 0; i < checkCount; i++) {
     const checkName = readString(buf, cur);
     const exprText = readString(buf, cur);
-    let expr: Expr;
-    try {
-      expr = parseExpression(exprText);
-    } catch (e) {
-      throw engineError(
-        "data_corrupted",
-        "stored check constraint does not parse: " + (e instanceof Error ? e.message : String(e)),
-      );
-    }
+    const parsed = parseStoredExpression(exprText);
     // v35: check_flags (bit0 has_host_deps; reserved bits are XX001), then the dependency list.
     const cflags = readU8(buf, cur);
     if ((cflags & ~1) !== 0) {
       throw engineError("data_corrupted", "a check_flags reserved bit is set");
     }
     const checkDeps = (cflags & 1) !== 0 ? readHostDeps(buf, cur) : undefined;
-    checks.push({ name: checkName, exprText, expr, hostDeps: checkDeps });
+    checks.push({ name: checkName, exprText, ...parsed, hostDeps: checkDeps });
   }
   // Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
   // unique; the rest reserved-zero) + root page, in the catalog's (name byte order
@@ -4430,20 +4417,10 @@ function decodeTableEntry(
     for (let j = 0; j < kc; j++) {
       const ord = readU16(buf, cur);
       if (ord === 0xffff) {
-        // An expression key (v26): the sentinel, then the canonical text; re-parse it (XX001 on
-        // failure, like a stored CHECK — spec/design/indexes.md §6).
+        // An expression key (v26): the sentinel, then the canonical text; re-parse it. Text this
+        // binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md §3.4).
         const exprText = readString(buf, cur);
-        let expr: Expr;
-        try {
-          expr = parseExpression(exprText);
-        } catch (e) {
-          throw engineError(
-            "data_corrupted",
-            "stored index expression does not parse: " +
-              (e instanceof Error ? e.message : String(e)),
-          );
-        }
-        keys.push({ kind: "expr", exprText, expr });
+        keys.push({ kind: "expr", exprText, ...parseStoredExpression(exprText) });
       } else {
         if (ord >= columns.length) {
           throw engineError("data_corrupted", "invalid index column ordinal");
@@ -4471,20 +4448,11 @@ function decodeTableEntry(
     }
     indexRoots.push(readU32(buf, cur));
     // v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
-    // it (XX001 on failure, like a stored CHECK — spec/design/indexes.md §9).
-    let predicate: { exprText: string; expr: Expr } | undefined;
+    // it; text this binary cannot parse is kept, unparsed (unparsable-definitions.md).
+    let predicate: { exprText: string; expr: Expr; unparsed?: true } | undefined;
     if (hasPredicate) {
       const exprText = readString(buf, cur);
-      let expr: Expr;
-      try {
-        expr = parseExpression(exprText);
-      } catch (e) {
-        throw engineError(
-          "data_corrupted",
-          "stored index predicate does not parse: " + (e instanceof Error ? e.message : String(e)),
-        );
-      }
-      predicate = { exprText, expr };
+      predicate = { exprText, ...parseStoredExpression(exprText) };
     }
     // v31: the host-function dependency list follows the predicate (bit2 set) — extensibility.md
     // §8.1. A non-btree index never carries one.

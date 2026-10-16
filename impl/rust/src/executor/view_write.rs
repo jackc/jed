@@ -326,9 +326,12 @@ impl Engine {
         let Some(view) = self.dml_target_view(db, name)? else {
             return Ok(None);
         };
+        let Some(body) = &view.body else {
+            return Err(unparsable_view_error(&view.name));
+        };
         // 2. The target view is updatable for the statement's kind (55000).
         if self
-            .updatable_shape(&view.body, kind != WriteKind::Delete)
+            .updatable_shape(body, kind != WriteKind::Delete)
             .is_none()
         {
             return Err(not_updatable(kind, &view.name));
@@ -385,8 +388,11 @@ impl Engine {
         let mut level_view = view;
         let mut rename: Option<Vec<String>> = None;
         let (table, table_rename) = loop {
+            let Some(level_body) = &level_view.body else {
+                return Err(unparsable_view_error(&level_view.name));
+            };
             let (sel, tref) = self
-                .updatable_shape(&level_view.body, kind != WriteKind::Delete)
+                .updatable_shape(level_body, kind != WriteKind::Delete)
                 .ok_or_else(|| not_updatable(kind, &level_view.name))?;
             let label = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
             let snap = self.read_snap();
@@ -529,12 +535,15 @@ impl Engine {
     /// Plan the target view as a read of it at the statement's top level would (views.md §4/§4.1),
     /// returning the output names, types, and collation derivations of every view in its expansion.
     fn plan_write_target(&self, view: &ViewDef) -> Result<HashMap<String, ViewColumnsMeta>> {
+        let Some(body) = &view.body else {
+            return Err(unparsable_view_error(&view.name));
+        };
         let site = ViewSite {
             depth: 0,
             body_depth: view.depth,
         };
         self.in_view_body(site, || {
-            let plan = self.plan_query(&view.body, None, &[], &mut ParamTypes::default())?;
+            let plan = self.plan_query(body, None, &[], &mut ParamTypes::default())?;
             let mut metas = self.view_columns.borrow().clone();
             metas.insert(
                 view.name.clone(),

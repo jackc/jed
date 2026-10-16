@@ -165,7 +165,8 @@ TRUE. The **only** on-disk change is in the per-index catalog entry (*Each table
 `index_flags` byte gains **bit1 `has_predicate`**, and — **only when bit1 is set** — a `u16 pred_len` +
 `pred_len` UTF-8 bytes of the predicate's canonical text (the *Check-expression text* form) are written
 **after `index_root_page`**. On load a partial predicate re-parses with the ordinary expression parser
-(`XX001` on failure, like a stored CHECK) and re-resolves against the table's columns (never persisted).
+(text this binary cannot parse is kept, unparsed — [unparsable-definitions.md](../design/unparsable-definitions.md)) and re-resolves against the table's
+columns (never persisted).
 A non-partial index writes no `bit1` and no predicate bytes, so a file with no partial index moves to
 v27 only by its version byte + meta CRC (every existing golden's sole v27 change). No value-codec
 change, no new page type.
@@ -178,7 +179,7 @@ ordinal (`< col_count`) for a column key, **or** the sentinel **`0xFFFF`** — w
 ordinal (`col_count ≤ 65535` ⇒ max ordinal `65534`) — for an **expression key**, immediately followed
 by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (the *Check-expression
 text* form, exactly as a `CHECK` / column `DEFAULT` stores). On load an expression element re-parses
-that text with the ordinary expression parser (`XX001` on failure, like a stored CHECK); its result
+that text with the ordinary expression parser (unparsable text is kept, like a stored CHECK); its result
 type/collation are re-derived by resolving against the table's columns, never persisted. A plain
 column index's bytes are **unchanged** from v6, so a file with no expression index moves to v26 only
 by its version byte + meta CRC (every existing golden's sole v26 change). No value-codec change, no
@@ -425,7 +426,7 @@ arithmetic like `1 + 1`) rather than only a constant literal
 UTF-8 string, the parsed token sequence re-rendered by the same closed token table a `CHECK`
 uses (*Check-expression text* below) — is written after the typmod **in place of** the
 value-codec default that `bit2 has_default` writes. The two bits are **mutually exclusive**.
-On load the text re-parses with the ordinary expression parser (`XX001` if it fails, like a
+On load the text re-parses with the ordinary expression parser (unparsable text is kept, like a
 stored check); the write paths evaluate it per row. A constant-literal default still takes the
 `bit2` value-codec path unchanged.
 
@@ -795,12 +796,12 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`index_name_len` | u16 |
 | &nbsp;&nbsp;`index_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key **element** (a column or, **v26**, an expression): |
-| &nbsp;&nbsp;`key_element` ×`key_col_count` | per element a `u16` in **index-key order**: a **column ordinal** (`< col_count`; duplicates allowed — indexes.md §1; an out-of-range non-sentinel ordinal is `XX001`), **or** the sentinel **`0xFFFF`** (**new in v26**) marking an **expression key**, immediately followed by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (*Check-expression text* below). An expression element re-parses at load (`XX001` on failure) and re-resolves against this table's columns to recover its result type; a plain column index writes no `0xFFFF` and is byte-identical to v6 |
+| &nbsp;&nbsp;`key_element` ×`key_col_count` | per element a `u16` in **index-key order**: a **column ordinal** (`< col_count`; duplicates allowed — indexes.md §1; an out-of-range non-sentinel ordinal is `XX001`), **or** the sentinel **`0xFFFF`** (**new in v26**) marking an **expression key**, immediately followed by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (*Check-expression text* below). An expression element re-parses at load (kept unparsed on failure — [unparsable-definitions.md](../design/unparsable-definitions.md)) and re-resolves against this table's columns to recover its result type; a plain column index writes no `0xFFFF` and is byte-identical to v6 |
 | &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); **bit1 `has_predicate`** (**new in v27** — a partial index, indexes.md §9; the predicate text follows `index_root_page`); bit2 `has_host_deps` (v31), bit3 `has_timezone_deps` (v32); bits 4–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**new in v20** — a persisted R-tree, `index_root_page` points at its root, pages 5/6 above, [../design/gist.md](../design/gist.md)); `3…` reserved. At v20 a value `> 2` is `XX001`. A GIN/GiST index always has `index_flags` bit0 (`unique`) clear. A partial index (`index_flags` bit1) is B-tree only — `has_predicate` set with `index_kind != 0` is `XX001` |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | &nbsp;&nbsp;`index_pred_len` | u16 — **only present when `index_flags` bit1 (`has_predicate`)** (**new in v27**); written *after* `index_root_page` |
-| &nbsp;&nbsp;`index_pred` | UTF-8 — the partial index's predicate text (*Check-expression text* below), `index_pred_len` bytes; re-parses at load (`XX001` on failure) and re-resolves against this table's columns (indexes.md §9) |
+| &nbsp;&nbsp;`index_pred` | UTF-8 — the partial index's predicate text (*Check-expression text* below), `index_pred_len` bytes; re-parses at load (kept unparsed on failure) and re-resolves against this table's columns (indexes.md §9) |
 | &nbsp;&nbsp;`host_deps` | only when bit2 is set: the v31 dependency list described in Version scope above; follows the optional predicate |
 | &nbsp;&nbsp;`timezone_deps` | only when bit3 is set: `u8 dynamic`, `u16 count`, then `(name, version, checksum)` entries as specified for v32 above; follows the optional host list |
 | `fk_count` | u16 — the table's `FOREIGN KEY` constraints (**new in v11**; `0` for a table with none) |
@@ -964,8 +965,9 @@ name). Each dependency's columns are emitted in ascending byte order of the colu
 columns are emitted in output order. The reader trusts these orders and rejects, as `XX001`:
 a dependency naming no table or view of its kind in this catalog, a listed column missing from its
 table, a dependency on the view itself or any cycle through view dependencies, an empty or
-duplicate output column name, a duplicate dependency or column, and a `def` that does not parse as
-a `subquery_expr`. The definition is **parsed but not planned** at open (views.md §3). A commit
+duplicate output column name, and a duplicate dependency or column. A `def` that does not parse as a
+`subquery_expr` is not corruption: the view is kept, unparsed, and every use of it is `XX003`
+([unparsable-definitions.md](../design/unparsable-definitions.md)). The definition is **parsed but not planned** at open (views.md §3). A commit
 writes the retained text and lists back verbatim, so the bytes are stable across create → commit →
 load → commit.
 
@@ -1070,8 +1072,10 @@ single spaces (`0x20`). It is a recursion-free byte contract: every core renders
 token stream to the same bytes, and a loader re-parses the text with its ordinary expression
 parser (re-lexing yields a value-identical token sequence by construction). A commit writes
 the retained text back **verbatim**, so the bytes are stable across create → commit → load →
-commit. Text that fails to lex/parse in an otherwise-valid file is `XX001` (`data_corrupted`)
-at open.
+commit. Text that fails to lex/parse in an otherwise-valid file is **not** corruption, since a newer
+jed may have written syntax this one does not know: the loader keeps the object, unparsed, with its
+text, and writes the text back unchanged at every commit. Only a statement that needs the parsed form
+fails, with `XX003` ([unparsable-definitions.md](../design/unparsable-definitions.md)).
 
 | token | rendering |
 |---|---|
@@ -1168,7 +1172,7 @@ default is `0x00` + the type body, a `DEFAULT NULL` is the lone `0x01`. An **exp
 (a non-constant `DEFAULT`, e.g. `uuidv7()` or `1 + 1`) persists its **expression text** when
 `flags` **bit3** (`default_is_expr`, **new in v8**) is set: a `u16` length then that many UTF-8
 bytes, the parsed token sequence re-rendered by the closed token table in *Check-expression text*
-below — identical to how a `CHECK` persists, and re-parsed on load (`XX001` if it fails). bit2 and
+below — identical to how a `CHECK` persists, and re-parsed on load (kept unparsed if it fails). bit2 and
 bit3 are **mutually exclusive** (both set is `XX001`).
 
 ## The per-table data B+tree

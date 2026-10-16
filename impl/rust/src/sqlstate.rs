@@ -204,6 +204,8 @@ pub enum SqlState {
     DataCorrupted,
     /// XX002 — collation version mismatch: {detail}
     CollationVersionMismatch,
+    /// XX003 — stored definition does not parse in this version of jed: {detail}
+    UnparsableStoredDefinition,
 }
 
 impl SqlState {
@@ -306,6 +308,7 @@ impl SqlState {
             SqlState::DuplicateFile => "58P02",
             SqlState::DataCorrupted => "XX001",
             SqlState::CollationVersionMismatch => "XX002",
+            SqlState::UnparsableStoredDefinition => "XX003",
         }
     }
 
@@ -410,6 +413,7 @@ impl SqlState {
             "58P02" => Some(SqlState::DuplicateFile),
             "XX001" => Some(SqlState::DataCorrupted),
             "XX002" => Some(SqlState::CollationVersionMismatch),
+            "XX003" => Some(SqlState::UnparsableStoredDefinition),
             _ => None,
         }
     }
@@ -523,4 +527,5 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "58P02", name: "duplicate_file", class: "system error" },
     ErrorDesc { code: "XX001", name: "data_corrupted", class: "internal error" },
     ErrorDesc { code: "XX002", name: "collation_version_mismatch", class: "internal error" },
+    ErrorDesc { code: "XX003", name: "unparsable_stored_definition", class: "internal error" },
 ];

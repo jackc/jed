@@ -1572,9 +1572,9 @@ func TestViewUnknownCheckOptionIsRejected(t *testing.T) {
 	}
 }
 
-// A stored view definition that no longer parses is corruption (XX001) at open — the body is parsed
-// (never planned) when the catalog loads (spec/design/views.md §3).
-func TestViewCorruptDefinitionIsRejected(t *testing.T) {
+// A stored view definition this binary cannot parse is not corruption: the load keeps the view,
+// unparsed, and only a use of it is XX003 (spec/design/unparsable-definitions.md §3.1).
+func TestViewUnparsableDefinitionLoads(t *testing.T) {
 	image := fixture(t, "view_table.jed")
 	// Replace the `a` in view w's `select a from v` with `(`, keeping its length, so the definition
 	// no longer parses.
@@ -1584,9 +1584,37 @@ func TestViewCorruptDefinitionIsRejected(t *testing.T) {
 	}
 	image[at+7] = '('
 	refreshGoldenPageCRC(image, at)
-	_, err := loadEngine(image, NewEnvironment())
-	if err == nil || err.(*EngineError).Code() != "XX001" {
-		t.Fatalf("unparseable view definition: want XX001, got %v", err)
+	loaded, err := loadEngine(image, NewEnvironment())
+	if err != nil {
+		t.Fatalf("an unparsable view definition must load: %v", err)
+	}
+	if code := paramErrCode(t, loaded, "SELECT x FROM w"); code != "XX003" {
+		t.Fatalf("SELECT FROM w: want XX003, got %s", code)
+	}
+	if got := queryRows(t, loaded, "SELECT c FROM n"); !reflect.DeepEqual(got, [][]Value{{IntValue(2)}}) {
+		t.Fatalf("SELECT c FROM n = %v", got)
+	}
+}
+
+// The unparsable-definitions fixture loads, and serializing what was loaded reproduces it byte for
+// byte: an unparsed object's text, and the rest of its entry, are written back unchanged
+// (spec/design/unparsable-definitions.md §2).
+func TestUnparsableDefinitionsRoundTrip(t *testing.T) {
+	image := fixture(t, "unparsable_definitions.jed")
+	loaded, err := loadEngine(image, NewEnvironment())
+	if err != nil {
+		t.Fatalf("load unparsable_definitions.jed: %v", err)
+	}
+	again, err := loaded.ToImage(goldenPageSize, 1)
+	if err != nil {
+		t.Fatalf("ToImage: %v", err)
+	}
+	if !bytes.Equal(again, image) {
+		t.Fatalf("re-serialized image differs from the fixture (%d vs %d bytes)", len(again), len(image))
+	}
+	view := loaded.readSnap().view("u")
+	if view == nil || !view.Unparsed || view.Definition != "select id , v from t where v is future syntax" {
+		t.Fatalf("view u = %+v", view)
 	}
 }
 

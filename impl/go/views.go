@@ -289,21 +289,25 @@ func (db *engine) relationView(qualifier *string, name string) *viewDef {
 // a statement-local CTE, then a built-in catalog relation, then a table, then a view (§4); tables
 // and views share one namespace. A column list on the reference renames over the view's stored names
 // (a longer list is left in place so the derived-table planning raises its 42P10). A view behind an
-// attachment qualifier is rejected by the FROM build (§10), so only bare and main. names expand.
-func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, string, *viewSite) {
+// attachment qualifier is rejected by the FROM build (§10), so only bare and main. names expand. A
+// view whose stored definition does not parse is XX003 (spec/design/unparsable-definitions.md §3.1).
+func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, string, *viewSite, error) {
 	if tref.IsFunc || tref.Subquery != nil || tref.Values != nil || tref.JsonTable != nil {
-		return tableRef{}, "", nil
+		return tableRef{}, "", nil, nil
 	}
 	if tref.DB == nil {
 		for _, b := range ctes {
 			if b.name == tref.Name {
-				return tableRef{}, "", nil
+				return tableRef{}, "", nil, nil
 			}
 		}
 	}
 	view := db.relationView(tref.DB, tref.Name)
 	if view == nil {
-		return tableRef{}, "", nil
+		return tableRef{}, "", nil, nil
+	}
+	if view.Unparsed {
+		return tableRef{}, "", nil, unparsableViewError(view.Name)
 	}
 	label := view.Name
 	if tref.Alias != nil {
@@ -321,7 +325,7 @@ func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, s
 	}
 	l := label
 	derived := tableRef{Name: label, Alias: &l, Subquery: view.Body, ColumnAliases: columnAliases}
-	return derived, view.Name, &viewSite{depth: int(tref.Depth), bodyDepth: view.Depth}
+	return derived, view.Name, &viewSite{depth: int(tref.Depth), bodyDepth: view.Depth}, nil
 }
 
 // planViewReference plans a view reference's body (views.md §4.1): a fresh top-level scope with no
@@ -361,6 +365,9 @@ func (db *engine) planViewReference(viewName string, body *queryExpr, written *t
 // planned raises the error reading the view would. An untyped NULL column reads as text, the type a
 // derived-table column of unknown type takes.
 func (db *engine) viewColumnTypes(view *viewDef) ([]string, error) {
+	if view.Unparsed {
+		return nil, unparsableViewError(view.Name)
+	}
 	var plan queryPlan
 	err := db.inViewBody(viewSite{depth: 0, bodyDepth: view.Depth}, func() error {
 		var perr error
@@ -606,8 +613,15 @@ func (db *engine) checkViewReplacement(old *viewDef, names []string, types []res
 	if len(names) < len(old.Columns) {
 		return invalid("cannot drop columns from view")
 	}
-	current, _, err := db.traceViewBody(old.Body)
-	planned := err == nil
+	// A body that does not parse in this binary compares like one that no longer plans
+	// (spec/design/unparsable-definitions.md §3.1).
+	planned := false
+	var current queryPlan
+	if !old.Unparsed {
+		var err error
+		current, _, err = db.traceViewBody(old.Body)
+		planned = err == nil
+	}
 	for i, oldName := range old.Columns {
 		if names[i] != oldName {
 			return invalid(fmt.Sprintf("cannot change name of view column \"%s\" to \"%s\"", oldName, names[i]))
@@ -703,7 +717,13 @@ func (db *engine) revalidateAfterReplace(old *viewDef) error {
 	}
 	for _, name := range names {
 		view := snap.view(name)
+		if view.Unparsed {
+			return unparsableViewError(name)
+		}
 		_, trace, err := db.traceViewBody(view.Body)
+		if isUnparsableError(err) {
+			return err
+		}
 		if err != nil {
 			return breaks(name)
 		}
@@ -951,6 +971,10 @@ func (db *engine) walkReadViews(pending []relationRef, visit func(*viewDef, *pri
 			continue
 		}
 		seen[view.Name] = true
+		// An unparsed body has nothing to collect; planning the statement reports it (XX003).
+		if view.Unparsed {
+			continue
+		}
 		var body privReq
 		collectQueryPrivs(view.Body, &body, map[string]bool{})
 		if visit(view, &body) {
@@ -1116,9 +1140,17 @@ func (db *engine) prepareDependents(kind viewDepKind, name string, columns []str
 	}
 	vp := &viewAlterPlan{kind: kind, table: name, columns: columns}
 	for _, view := range dependents {
+		// A dependent is rewritten and re-planned, which needs its parsed body
+		// (spec/design/unparsable-definitions.md §3.1).
+		if view.Unparsed {
+			return nil, unparsableViewError(view.Name)
+		}
 		var items []traceItem
 		if rewrites {
 			_, trace, err := db.traceViewBody(view.Body)
+			if isUnparsableError(err) {
+				return nil, err
+			}
 			if err != nil {
 				return nil, alterBreaksView(vp, view.Name)
 			}
@@ -1168,6 +1200,9 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 	}
 	for i, view := range vp.views {
 		_, trace, err := db.traceViewBody(bodies[i])
+		if isUnparsableError(err) {
+			return err
+		}
 		if err != nil {
 			return alterBreaksView(vp, view.Name)
 		}

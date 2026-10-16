@@ -604,7 +604,7 @@ func (db *engine) collectInsertCatalogPrivs(ins *insert, req *privReq) {
 	}
 	locals := map[string]bool{}
 	for i, need := range insertDefaultNeeds(provided, ins.Rows) {
-		if col := &table.Columns[i]; need && col.DefaultExpr != nil {
+		if col := &table.Columns[i]; need && col.DefaultExpr != nil && !col.DefaultExpr.Unparsed {
 			collectExprPrivs(&col.DefaultExpr.Expr, req, locals)
 		}
 	}
@@ -619,7 +619,10 @@ func (db *engine) collectInsertCatalogPrivs(ins *insert, req *privReq) {
 func collectCheckPrivs(table *catTable, req *privReq) {
 	locals := map[string]bool{}
 	for i := range table.Checks {
-		collectExprPrivs(&table.Checks[i].Expr, req, locals)
+		// An unparsed check calls nothing this binary can name; the write itself fails XX003.
+		if !table.Checks[i].Unparsed {
+			collectExprPrivs(&table.Checks[i].Expr, req, locals)
+		}
 	}
 }
 
@@ -632,7 +635,7 @@ func (db *engine) collectAssignmentDefaultPrivs(table *catTable, assignments []a
 		}
 		for ci := range table.Columns {
 			col := &table.Columns[ci]
-			if col.Name == a.Column && col.DefaultExpr != nil {
+			if col.Name == a.Column && col.DefaultExpr != nil && !col.DefaultExpr.Unparsed {
 				collectExprPrivs(&col.DefaultExpr.Expr, req, locals)
 				break
 			}

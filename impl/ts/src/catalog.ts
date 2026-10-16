@@ -76,7 +76,9 @@ export type IdentityKind = "always" | "byDefault";
 // (spec/fileformat/format.md "Check-expression text") — and the parsed expression the write
 // paths resolve (against an empty scope, no columns) and evaluate per inserted row. Modeled on
 // CheckConstraint.
-export type DefaultExpr = { exprText: string; expr: Expr };
+// unparsed marks stored text this binary's parser rejects (spec/design/unparsable-definitions.md):
+// expr is a placeholder, exprText is kept verbatim, and applying the default is XX003.
+export type DefaultExpr = { exprText: string; expr: Expr; unparsed?: true };
 
 // Table is a table definition.
 export type Table = {
@@ -193,7 +195,9 @@ export type HostFuncDep = {
 // element (GIN/GiST are single column, this slice).
 export type IndexKey =
   | { kind: "column"; column: number }
-  | { kind: "expr"; exprText: string; expr: Expr };
+  // unparsed: the stored text does not parse in this binary (spec/design/unparsable-definitions.md
+  // §3.4) — expr is a placeholder; the index is skipped by reads and refuses writes.
+  | { kind: "expr"; exprText: string; expr: Expr; unparsed?: true };
 
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its
 // (relation-namespace) name and its key elements in index-key order (columns and/or
@@ -213,7 +217,7 @@ export type IndexDef = {
   // predicate is TRUE are indexed / constrained. undefined for an ordinary (full) index. Carries the
   // persisted canonical text + the re-parsed (unresolved) AST — re-resolved against the table per
   // statement, like an expression key. Partial indexes are B-tree only (format_version 27).
-  predicate?: { exprText: string; expr: Expr };
+  predicate?: { exprText: string; expr: Expr; unparsed?: true };
   // hostDeps is the persisted HOST-FUNCTION DEPENDENCY list (spec/design/extensibility.md §8.1,
   // format_version 31): one entry per distinct host scalar function this index's key/predicate
   // expressions call, each pinning the component identity + semantic version the index was built
@@ -275,6 +279,9 @@ export type CheckConstraint = {
   name: string;
   exprText: string;
   expr: Expr;
+  // unparsed marks stored text this binary's parser rejects (spec/design/unparsable-definitions.md
+  // §3.2): expr is a placeholder, exprText is kept verbatim, and evaluating the check is XX003.
+  unparsed?: true;
   // hostDeps are the persisted HOST-FUNCTION dependencies of the check expression
   // (spec/design/extensibility.md §7.1.2, format v35): one per distinct host signature it calls,
   // sorted by (name, arg-type codes). Verified whenever the check is resolved for evaluation —
@@ -328,8 +335,10 @@ export type ViewDef = {
   definition: string;
   // The tables and views the body reads, in ascending name byte order (§6).
   deps: ViewDep[];
-  // The parsed definition — parsed at create and at load, never persisted.
-  body: QueryExpr;
+  // The parsed definition — parsed at create and at load, never persisted. null when the stored
+  // definition does not parse in this binary (spec/design/unparsable-definitions.md §3.1): every use
+  // of the view is XX003, and definition is written back verbatim.
+  body: QueryExpr | null;
   // The body's nesting depth (spec/design/views.md §4.1), from the same parse as `body`.
   depth: number;
   // The view's check option, if any (spec/design/views.md §15.6).

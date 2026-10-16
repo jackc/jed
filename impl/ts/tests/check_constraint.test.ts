@@ -2,7 +2,7 @@
 // (spec/design/constraints.md §4, grammar.md §29). Covers what the corpus suite
 // (ddl/check.test) cannot: catalog introspection (names, evaluation order, persisted
 // expression text), the on-disk round-trip (v4 catalog check list), a corrupted stored
-// expression (XX001), and the metered evaluation cost. Mirrors
+// expression this binary cannot parse (XX003 on write), and the metered evaluation cost. Mirrors
 // impl/rust/tests/check_constraint.rs and impl/go/check_constraint_test.go.
 
 import assert from "node:assert/strict";
@@ -289,8 +289,9 @@ test("round-trips through the on-disk image", () => {
   const reloaded = Database.fromImage(loaded.toImage(256, 1n));
   assert.deepEqual(checkNames(reloaded, "t"), ["price_range", "t_b_check", "t_note_check"]);
 
-  // A stored expression that no longer parses is XX001 (the file lied): patch the text
-  // `b > 0` to the same-length garbage `b > (`.
+  // A stored expression this binary cannot parse loads, unparsed: patch the text `b > 0` to the
+  // same-length `b > (` and reseal the page. A write that evaluates the checks is XX003
+  // (spec/design/unparsable-definitions.md §3.2).
   const needle = new TextEncoder().encode("b > 0");
   let at = -1;
   outer: for (let i = 0; i + needle.length <= image.length; i++) {
@@ -301,10 +302,28 @@ test("round-trips through the on-disk image", () => {
     break;
   }
   assert.ok(at >= 0, "stored check text not found in image");
-  const corrupt = image.slice();
-  corrupt[at + 4] = "(".charCodeAt(0);
+  const unparsable = image.slice();
+  unparsable[at + 4] = "(".charCodeAt(0);
+  resealPage(unparsable, at - (at % 256));
+  const future = Database.fromImage(unparsable);
   assert.equal(
-    errCode(() => Database.fromImage(corrupt)),
-    "XX001",
+    errCode(() => future.execute("INSERT INTO t VALUES (9, 1, 1.00, 'ok')")),
+    "XX003",
   );
 });
+
+// resealPage recomputes a 256-byte page's CRC-32 (the page header's bytes 12..16 cover the rest).
+function resealPage(image: Uint8Array, pageStart: number): void {
+  let crc = 0xffffffff;
+  const feed = (b: number) => {
+    crc ^= b;
+    for (let k = 0; k < 8; k++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+  };
+  for (let i = pageStart; i < pageStart + 12; i++) feed(image[i]!);
+  for (let i = pageStart + 16; i < pageStart + 256; i++) feed(image[i]!);
+  new DataView(image.buffer, image.byteOffset, image.byteLength).setUint32(
+    pageStart + 12,
+    (crc ^ 0xffffffff) >>> 0,
+    false,
+  );
+}

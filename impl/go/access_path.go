@@ -1141,6 +1141,12 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		if idx.Kind != indexBtree {
 			continue
 		}
+		// A PARTIAL index holds only its qualifying rows (indexes.md §9), and this bound never checks
+		// that the query implies the predicate, so a partial index is not an INL inner (as for ORDER-BY
+		// skip-sort and interval sets). That also keeps out one whose predicate did not parse.
+		if idx.Predicate != nil {
+			continue
+		}
 		// The index-nested-loop sibling bound is column-only this slice (an expression index takes
 		// the access-predicate path — indexes.md §5; an INL bound over an expression key is a follow-on).
 		cols := idx.columnOrdinals()

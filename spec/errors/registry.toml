@@ -883,3 +883,16 @@ code = "XX002"
 name = "collation_version_mismatch"
 class = "internal error"
 template = "collation version mismatch: {detail}"
+
+# A stored definition — a view body, an expression DEFAULT, a CHECK, an expression index key, or a
+# partial-index predicate — whose canonical text this binary's parser rejects, typically because a
+# newer jed wrote syntax this one does not know (spec/design/unparsable-definitions.md). The catalog
+# load keeps the object with its text unchanged instead of failing XX001; a statement that needs the
+# object's parsed form fails with this code before touching any row, and every other statement
+# proceeds. The sibling of XX002 that compatibility.md §12 #4 calls for. PostgreSQL leaves XX003
+# unassigned. {detail} names the object.
+[[error]]
+code = "XX003"
+name = "unparsable_stored_definition"
+class = "internal error"
+template = "stored definition does not parse in this version of jed: {detail}"

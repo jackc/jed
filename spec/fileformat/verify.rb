@@ -1500,6 +1500,48 @@ COLLATION_SKEW_TWIN_TABLE = {
              rows: [[1, "a"], [2, "Z"], [3, "ä"], [4, "b"]] }]
 }.freeze
 
+# unparsable_definitions: a file a newer jed wrote, holding one stored definition of each kind whose
+# text this binary cannot parse (spec/design/unparsable-definitions.md). Every core must open it, read
+# around the unparsed objects, refuse with XX003 exactly the statements that need one, and drop each.
+# The text uses `is future syntax`, which no jed parser accepts. The expression and partial indexes are
+# forged EMPTY over tables that have rows (`forged_empty`), so a planner that trusts either loses rows.
+# suites/storage/unparsable_definitions.test asserts the behavior. Tables:
+#   t — views over it: `ok` parses, `u` and `r` do not, and `w` reads `u`;
+#   c — a parsable CHECK c_ok (v > 0) and an unparsed c_v_check;
+#   d — an unparsed expression DEFAULT on v and a parsable one (1 + 1) on k;
+#   x — an unparsed expression index x_future_idx beside a plain index x_v_idx on v;
+#   p — a UNIQUE partial index p_future_idx on v whose predicate is unparsed.
+UNPARSABLE_DEFINITIONS = {
+  tables: [
+    { name: "t", columns: [col("id", "i32", pk: true), col("v", "i32")],
+      rows: [[1, 1], [2, 2], [3, -3]] },
+    { name: "c", columns: [col("id", "i32", pk: true), col("v", "i32")],
+      checks: [{ name: "c_ok", expr: "v > 0" }, { name: "c_v_check", expr: "v is future syntax" }],
+      rows: [[1, 10], [2, 20]] },
+    { name: "d", columns: [col("id", "i32", pk: true), col("v", "i32", default_expr: "1 is future syntax"),
+                           col("k", "i32", default_expr: "1 + 1")],
+      rows: [[1, 1, 1]] },
+    { name: "x", columns: [col("id", "i32", pk: true), col("v", "i32")],
+      indexes: [{ name: "x_future_idx", cols: [{ expr: "v is future syntax" }], forged_empty: true },
+                { name: "x_v_idx", cols: [1] }],
+      rows: [[1, 1], [2, 2]] },
+    { name: "p", columns: [col("id", "i32", pk: true), col("v", "i32")],
+      indexes: [{ name: "p_future_idx", cols: [1], unique: true, predicate: "v is future syntax",
+                  forged_empty: true }],
+      rows: [[1, 1], [2, 2]] }
+  ],
+  views: [
+    { name: "ok", columns: %w[id v], definition: "select id , v from t where v > 0",
+      deps: [{ kind: 0, name: "t", columns: %w[id v] }], check_option: 0 },
+    { name: "u", columns: %w[id v], definition: "select id , v from t where v is future syntax",
+      deps: [{ kind: 0, name: "t", columns: %w[id v] }], check_option: 0 },
+    { name: "w", columns: %w[id], definition: "select id from u",
+      deps: [{ kind: 1, name: "u", columns: [] }], check_option: 0 },
+    { name: "r", columns: %w[id], definition: "select id from t where id is future syntax",
+      deps: [{ kind: 0, name: "t", columns: %w[id] }], check_option: 0 }
+  ]
+}.freeze
+
 COW_OLD_TABLE = { name: "t", columns: [col("id", "i32", pk: true), col("v", "i32")],
                   rows: [[1, 10]] }.freeze
 COW_NEW_TABLE = COW_OLD_TABLE.merge(rows: [[1, 20]]).freeze
@@ -1660,6 +1702,8 @@ FIXTURES = ([
     collations: COLLATION_ARRAY_TABLE[:collations], tables: COLLATION_ARRAY_TABLE[:tables] },
   { file: "collation_skew_corrupt.jed", page_size: 256,
     collations: COLLATION_SKEW_CORRUPT_TABLE[:collations], tables: COLLATION_SKEW_CORRUPT_TABLE[:tables] },
+  { file: "unparsable_definitions.jed", page_size: 256,
+    tables: UNPARSABLE_DEFINITIONS[:tables], views: UNPARSABLE_DEFINITIONS[:views] },
   { file: "collation_skew_twin.jed", page_size: 256,
     collations: COLLATION_SKEW_TWIN_TABLE[:collations], tables: COLLATION_SKEW_TWIN_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
@@ -2680,8 +2724,12 @@ def index_entry_key(table, ix, storage_key, row)
 end
 
 # An index's (entry_key, record-plan) pairs in entry-key order. An index record has an EMPTY
-# payload (key only — format.md "Index trees"), so its plan is trivially inline.
+# payload (key only — format.md "Index trees"), so its plan is trivially inline. `forged_empty: true`
+# authors an index whose tree is empty although the table has rows: the stand-in for an index a newer
+# jed maintained under text this reference cannot evaluate (unparsable_definitions.jed). A reader that
+# wrongly trusts it loses rows.
 def index_entries(table, ix)
+  return [] if ix[:forged_empty]
   table_entries(table).map do |storage_key, row|
     key = index_entry_key(table, ix, storage_key, row)
     [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]

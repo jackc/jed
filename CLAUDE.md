@@ -651,6 +651,10 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   authorized like a write to a table, by the writer's privilege on the view alone; `WITH [CASCADED |
   LOCAL] CHECK OPTION` refuses (`44000`) a written row the checked views would not show
   ([spec/design/views.md](spec/design/views.md) §15).
+- **Stored SQL this binary cannot parse.** A view body, expression DEFAULT, CHECK, or expression /
+  partial-index text that the parser rejects (a newer jed's syntax, which needs no format bump) is not
+  corruption: the load keeps the object unparsed and byte-for-byte, and only statements that need it
+  fail, with `XX003`; reads skip such an index ([spec/design/unparsable-definitions.md](spec/design/unparsable-definitions.md)).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,

@@ -1771,13 +1771,13 @@ fn view_unknown_check_option_is_rejected() {
     assert_eq!(error.code(), "XX001");
 }
 
-/// A stored view definition that no longer parses is corruption (`XX001`) at open — the body is
-/// parsed (never planned) when the catalog loads (spec/design/views.md §3).
+/// A stored view definition this binary cannot parse is not corruption: the load keeps the view,
+/// unparsed, and only a use of it is `XX003` (spec/design/unparsable-definitions.md §3.1).
 #[test]
-fn view_corrupt_definition_is_rejected() {
+fn view_unparsable_definition_loads() {
     let mut image = fixture("view_table.jed");
-    // Turn the `select` of view w's definition into `selecT` would still lex; replace the `a` in
-    // `select a from v` with `(` so the definition no longer parses, keeping its length.
+    // Replace the `a` in `select a from v` with `(` so the definition no longer parses, keeping its
+    // length.
     let pattern = b"select a from v";
     let at = image
         .windows(pattern.len())
@@ -1786,11 +1786,27 @@ fn view_corrupt_definition_is_rejected() {
     image[at + 7] = b'(';
     let page_start = at / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
     refresh_test_page_crc(&mut image, page_start);
-    let error = match Database::from_image(&image, golden_env()) {
-        Ok(_) => panic!("an unparseable view definition must be rejected"),
-        Err(error) => error,
-    };
-    assert_eq!(error.code(), "XX001");
+    let mut db = Database::from_image(&image, golden_env())
+        .unwrap_or_else(|e| panic!("an unparsable view definition must load: {}", e.message))
+        .session(SessionOptions::default());
+    let error = db.query_outcome("SELECT x FROM w", &[]).unwrap_err();
+    assert_eq!(error.code(), "XX003");
+    assert_eq!(
+        query_rows(&mut db, "SELECT c FROM n"),
+        vec![vec![Value::Int(2)]]
+    );
+}
+
+/// The unparsable-definitions fixture loads, and serializing what was loaded reproduces it byte for
+/// byte: an unparsed object's text, and the rest of its entry, are written back unchanged
+/// (spec/design/unparsable-definitions.md §2).
+#[test]
+fn unparsable_definitions_round_trip() {
+    let image = fixture("unparsable_definitions.jed");
+    let loaded = Database::from_image(&image, golden_env())
+        .unwrap_or_else(|e| panic!("load unparsable_definitions.jed: {}", e.message))
+        .session(SessionOptions::default());
+    assert_eq!(loaded.to_image(GOLDEN_PAGE_SIZE, 1).unwrap(), image);
 }
 
 /// A dependency on a missing table is corruption (`XX001`): the loader checks every dependency

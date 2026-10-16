@@ -35,6 +35,11 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	if slices.Contains(t.PK, ci) {
 		return newError(FeatureNotSupported, "dropping a primary-key column is not supported yet")
 	}
+	// Which checks and indexes reference the column is read from their parsed expressions, so an
+	// unparsed one blocks the drop (spec/design/unparsable-definitions.md §3.2/§3.4).
+	if err := tableUnparsedError(t, false); err != nil {
+		return err
+	}
 	droppedSource := (*sources)[ci]
 	usesExpr := func(e exprNode) bool { return slices.Contains(checkReferencedColumns(e, t.Columns), ci) }
 	indexUses := func(ix indexDef) bool {
@@ -620,6 +625,9 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		c := &t.Checks[i]
 		if !st.added[c.Name] {
 			continue
+		}
+		if c.Unparsed {
+			return nil, unparsableCheckError(t.Name, c.Name)
 		}
 		node, _, err := resolve(singleScope(db, t), c.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
 		if err != nil {

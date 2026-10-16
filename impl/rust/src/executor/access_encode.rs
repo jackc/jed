@@ -2717,6 +2717,12 @@ pub(crate) fn inventory_inl_candidates<'a>(
         if idx.kind != IndexKind::Btree {
             continue;
         }
+        // A PARTIAL index holds only its qualifying rows (indexes.md §9), and this bound never checks
+        // that the query implies the predicate, so a partial index is not an INL inner (as for
+        // ORDER-BY skip-sort and interval sets). That also keeps out one whose predicate did not parse.
+        if idx.predicate.is_some() {
+            continue;
+        }
         // The index-nested-loop sibling bound is column-only this slice (an expression index takes
         // the access-predicate path — indexes.md §5; an INL bound over an expression key is a follow-on).
         let Some(cols) = idx.column_ordinals() else {

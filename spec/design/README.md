@@ -40,6 +40,10 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   requirements manifest, read-vs-write dependency tagging, the heap-scan read-degradation, and the
   unification of collation skew + function drift; the model views / functional indexes / generated
   columns / host functions register into (CLAUDE.md §13).
+- [unparsable-definitions.md](unparsable-definitions.md) — stored SQL (a view, `CHECK`, expression
+  `DEFAULT`, expression or partial index) that this binary's parser rejects, as when a newer jed wrote
+  it: the load keeps the object unparsed and byte-for-byte, only statements that need it fail with
+  `XX003`, reads skip such an index, and every drop works.
 - [timezones.md](timezones.md) — time zones for `timestamptz` (design decided, not yet built):
   the **host-loaded `JTZ` bundle** (manifest + per-zone **RFC 8536 TZif** sections + alias links,
   byte format in [../tz/README.md](../tz/README.md)), the privileged `LoadTimeZoneData` environment-builder seam, the

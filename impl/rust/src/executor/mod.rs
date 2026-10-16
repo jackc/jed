@@ -21,7 +21,8 @@ pub(crate) use crate::catalog::{
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
     HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner,
     SequenceDef, Table, TimeZoneDep, TimeZoneDeps, ViewDef, ViewDep, ViewDepKind,
-    catalog_type_text, resolve_col_type,
+    catalog_type_text, is_unparsable_error, resolve_col_type, unparsable_check_error,
+    unparsable_default_error, unparsable_index_error, unparsable_view_error,
 };
 pub(crate) use crate::collation::{self, Collation};
 pub(crate) use crate::cost::{Lifetime, Meter};

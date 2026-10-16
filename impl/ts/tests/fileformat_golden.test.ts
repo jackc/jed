@@ -1590,18 +1590,29 @@ test("view unknown check option is rejected", () => {
   );
 });
 
-// A stored view definition that no longer parses is corruption (XX001) at open — the body is parsed
-// (never planned) when the catalog loads (spec/design/views.md §3).
-test("view corrupt definition is rejected", () => {
+// A stored view definition this binary cannot parse is not corruption: the load keeps the view,
+// unparsed, and only a use of it is XX003 (spec/design/unparsable-definitions.md §3.1).
+test("view unparsable definition loads", () => {
   const image = fixture("view_table.jed");
   // Replace the `a` in view w's `select a from v` with `(`, keeping its length.
   const at = findBytes(image, new TextEncoder().encode("select a from v"));
   image[at + 7] = "(".charCodeAt(0);
   refreshPageCrc(image, at);
+  const db = loadEngine(image, GOLDEN_ENV);
   assert.throws(
-    () => loadEngine(image, GOLDEN_ENV),
-    (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
+    () => execute(db, "SELECT x FROM w"),
+    (e: unknown) => e instanceof Error && e.message.startsWith("XX003"),
   );
+  assert.deepStrictEqual(rows(db, "SELECT c FROM n"), [[intValue(2n)]]);
+});
+
+// The unparsable-definitions fixture loads, and serializing what was loaded reproduces it byte for
+// byte: an unparsed object's text, and the rest of its entry, are written back unchanged
+// (spec/design/unparsable-definitions.md §2).
+test("unparsable definitions round trip", () => {
+  const image = fixture("unparsable_definitions.jed");
+  const loaded = loadEngine(image, GOLDEN_ENV);
+  assert.ok(bytesEqual(toImage(loaded, GOLDEN_PAGE_SIZE, 1n), image), "re-serialized bytes differ");
 });
 
 // A dependency on a missing table is corruption (XX001): the loader checks every dependency names

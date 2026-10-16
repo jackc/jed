@@ -1507,6 +1507,9 @@ func (db *engine) resolveChecksWithParams(table *catTable, ptypes *paramTypes) (
 	s := singleScope(db, table)
 	out := make([]namedCheck, 0, len(table.Checks))
 	for i := range table.Checks {
+		if table.Checks[i].Unparsed {
+			return nil, unparsableCheckError(table.Name, table.Checks[i].Name)
+		}
 		node, _, err := resolve(s, table.Checks[i].Expr, nil, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return nil, err
@@ -1546,6 +1549,9 @@ func (db *engine) resolveDefaultExprsFor(table *catTable, need []bool, ptypes *p
 		if de == nil || (need != nil && !need[i]) {
 			continue
 		}
+		if de.Unparsed {
+			return nil, unparsableDefaultError(table.Name, table.Columns[i].Name)
+		}
 		colScalar := table.Columns[i].Type.ScalarTy()
 		node, _, err := resolve(emptyScope(db), de.Expr, &colScalar, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
@@ -1567,6 +1573,11 @@ func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, er
 }
 
 func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *paramTypes) (resolvedIndex, error) {
+	// An index whose stored expression did not parse can neither be maintained nor used: the read path
+	// swallows this error and skips the index, a write propagates it (unparsable-definitions.md §3.4).
+	if def.unparsed() {
+		return resolvedIndex{}, unparsableIndexError(table.Name, def.Name)
+	}
 	ptypes.uncacheable = ptypes.uncacheable || def.TimezoneDeps.Dynamic
 	if err := verifyIndexTimezoneDeps(def.TimezoneDeps, db.session.env); err != nil {
 		return resolvedIndex{}, err
@@ -2397,6 +2408,9 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					}
 					target.Default, prepCost = &v, prepCost+m.Accrued
 				} else if oldColumn.DefaultExpr != nil {
+					if oldColumn.DefaultExpr.Unparsed {
+						return outcome{}, unparsableDefaultError(original.Name, oldColumn.Name)
+					}
 					defaultCast := exprNode{Kind: exprCast, Cast: &castExpr{Inner: oldColumn.DefaultExpr.Expr, TypeName: edit.TypeName, TypeMod: edit.TypeMod}}
 					if _, _, err := resolve(emptyScope(db), defaultCast, nil, &aggCtx{collecting: false}, &paramTypes{}); err != nil {
 						return outcome{}, err
@@ -3025,6 +3039,11 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 }
 
 func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename bool) error {
+	// A rename rewrites every stored expression's text, which needs its tokens to parse
+	// (spec/design/unparsable-definitions.md §3.2–§3.4).
+	if err := tableUnparsedError(table, true); err != nil {
+		return err
+	}
 	rewrite := func(text string) (string, exprNode, error) {
 		if tableRename {
 			return rewriteTableQualifier(text, old, next)

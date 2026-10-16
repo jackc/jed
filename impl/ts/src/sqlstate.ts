@@ -105,7 +105,8 @@ export type SqlState =
   | "undefined_file" // 58P01 — database file does not exist: {path}
   | "duplicate_file" // 58P02 — database file already exists: {path}
   | "data_corrupted" // XX001 — on-disk database file is malformed: {detail}
-  | "collation_version_mismatch"; // XX002 — collation version mismatch: {detail}
+  | "collation_version_mismatch" // XX002 — collation version mismatch: {detail}
+  | "unparsable_stored_definition"; // XX003 — stored definition does not parse in this version of jed: {detail}
 
 const CODES: Record<SqlState, string> = {
   cardinality_violation: "21000",
@@ -204,6 +205,7 @@ const CODES: Record<SqlState, string> = {
   duplicate_file: "58P02",
   data_corrupted: "XX001",
   collation_version_mismatch: "XX002",
+  unparsable_stored_definition: "XX003",
 };
 
 // sqlStateCode returns the canonical SQLSTATE string for a state.
@@ -318,4 +320,5 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "58P02", name: "duplicate_file", class: "system error" },
   { code: "XX001", name: "data_corrupted", class: "internal error" },
   { code: "XX002", name: "collation_version_mismatch", class: "internal error" },
+  { code: "XX003", name: "unparsable_stored_definition", class: "internal error" },
 ];

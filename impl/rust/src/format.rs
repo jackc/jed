@@ -1365,6 +1365,19 @@ fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
     }
 }
 
+/// Parses a stored expression's canonical text. Text this binary's parser rejects is not corruption
+/// (spec/design/unparsable-definitions.md §2): it yields a placeholder and `true`, and the object is
+/// kept, unparsed.
+fn parse_stored_expression(text: &str) -> (crate::ast::Expr, bool) {
+    match crate::parser::parse_expression(text) {
+        Ok(expr) => (expr, false),
+        Err(_) => (
+            crate::ast::Expr::Literal(crate::ast::Literal::Null, crate::ast::SrcPos::default()),
+            true,
+        ),
+    }
+}
+
 fn corrupt(msg: &str) -> EngineError {
     EngineError::new(SqlState::DataCorrupted, msg)
 }
@@ -4866,7 +4879,7 @@ pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
 }
 
 /// Decode a view catalog entry's body (inverse of `view_entry_bytes`); the caller has consumed the
-/// `entry_kind` byte. The definition is parsed (XX001 if it does not parse as a `subquery_expr`) but
+/// `entry_kind` byte. The definition is parsed (kept unparsed if it does not parse as a `subquery_expr`) but
 /// never planned (views.md §3).
 fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::ViewDef> {
     use crate::catalog::{ViewDep, ViewDepKind};
@@ -4914,14 +4927,18 @@ fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::View
         2 => Some(crate::ast::CheckOption::Cascaded),
         _ => return Err(corrupt("unknown view check option")),
     };
-    let (body, depth) = crate::parser::parse_view_definition(&definition)
-        .map_err(|_| corrupt("a view definition does not parse"))?;
+    // A definition this binary cannot parse — typically newer syntax — is kept, unparsed, rather than
+    // failing the load (spec/design/unparsable-definitions.md): every use of the view is XX003.
+    let (body, depth) = match crate::parser::parse_view_definition(&definition) {
+        Ok((body, depth)) => (Some(Arc::new(body)), depth),
+        Err(_) => (None, 0),
+    };
     Ok(crate::catalog::ViewDef {
         name,
         columns,
         definition,
         deps,
-        body: Arc::new(body),
+        body,
         depth,
         check_option,
     })
@@ -5414,9 +5431,13 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         };
         let default_expr = if flags & 0b1000 != 0 {
             let expr_text = read_string(buf, pos)?;
-            let expr = crate::parser::parse_expression(&expr_text)
-                .map_err(|e| corrupt(&format!("stored default expression does not parse: {e}")))?;
-            Some(DefaultExpr { expr_text, expr })
+            // Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
+            let (expr, unparsed) = parse_stored_expression(&expr_text);
+            Some(DefaultExpr {
+                expr_text,
+                expr,
+                unparsed,
+            })
         } else {
             None
         };
@@ -5455,15 +5476,14 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         pk.push(ord);
     }
     // CHECK constraints (v4): the stored expression text re-parses with the ordinary
-    // expression parser — it was written by the token renderer, so this cannot fail for a
-    // file the engine wrote; failure means the file lied (XX001, constraints.md §4.5).
+    // expression parser. Text this binary cannot parse (a newer jed's syntax) is kept, unparsed
+    // (spec/design/unparsable-definitions.md §3.2).
     let check_count = read_u16(buf, pos)? as usize;
     let mut checks = Vec::with_capacity(check_count);
     for _ in 0..check_count {
         let check_name = read_string(buf, pos)?;
         let expr_text = read_string(buf, pos)?;
-        let expr = crate::parser::parse_expression(&expr_text)
-            .map_err(|e| corrupt(&format!("stored check constraint does not parse: {e}")))?;
+        let (expr, unparsed) = parse_stored_expression(&expr_text);
         // v35: check_flags (bit0 has_host_deps; reserved bits are XX001), then the dependency list.
         let cflags = read_u8(buf, pos)?;
         if cflags & !1 != 0 {
@@ -5478,6 +5498,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             name: check_name,
             expr_text,
             expr,
+            unparsed,
             host_deps,
         });
     }
@@ -5498,14 +5519,14 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         for _ in 0..kc {
             let ord = read_u16(buf, pos)?;
             if ord == 0xFFFF {
-                // An expression key (v26): the sentinel, then the canonical text; re-parse it
-                // (XX001 on failure, like a stored CHECK — spec/design/indexes.md §6).
+                // An expression key (v26): the sentinel, then the canonical text; re-parse it. Text
+                // this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
                 let text = read_string(buf, pos)?;
-                let expr = crate::parser::parse_expression(&text)
-                    .map_err(|_| corrupt("unparseable index expression"))?;
+                let (expr, unparsed) = parse_stored_expression(&text);
                 keys.push(IndexKey::Expr(IndexKeyExpr {
                     expr_text: text,
                     expr,
+                    unparsed,
                 }));
             } else {
                 let ord = ord as usize;
@@ -5541,14 +5562,14 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         }
         index_roots.push(read_u32(buf, pos)?);
         // v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
-        // it (XX001 on failure, like a stored CHECK — spec/design/indexes.md §9).
+        // it; text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
         let predicate = if has_predicate {
             let text = read_string(buf, pos)?;
-            let expr = crate::parser::parse_expression(&text)
-                .map_err(|_| corrupt("unparseable index predicate"))?;
+            let (expr, unparsed) = parse_stored_expression(&text);
             Some(IndexKeyExpr {
                 expr_text: text,
                 expr,
+                unparsed,
             })
         } else {
             None

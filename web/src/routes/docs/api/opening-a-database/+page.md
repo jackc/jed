@@ -40,6 +40,17 @@ After a storage write or flush error, close and reopen the handle before writing
 can determine the committed outcome. An encoding or size error before storage writes does not
 require reopening; discard the failed transaction and continue using the handle.
 
+## Opening a file from a newer jed
+
+A newer jed can store SQL that an older one cannot parse: a view, a `CHECK`, an expression
+`DEFAULT`, or an expression or partial index written with syntax added since. The older jed still
+opens the file and runs everything else. Only a statement that needs such an object fails, with
+`XX003`: reading the view (and `jed_columns`, which plans every view), a write that would evaluate
+the check or apply the default, a write to a table with such an index, and `ALTER TABLE` actions
+that would rewrite the stored text. Reads skip the index and return the same rows. Each object can
+still be dropped, along with its table, and a view can be redefined with `CREATE OR REPLACE VIEW`.
+The stored text is never changed, so the newer jed reads the original definition back.
+
 ## Sharing a file between processes
 
 Local file databases use crash-clean **shared multi-process coordination by default**. Several Rust,

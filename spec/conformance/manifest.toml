@@ -1607,6 +1607,10 @@ description = "The jed_type_fields catalog relation (spec/design/introspection.m
 id = "file.shared_process"
 description = "Crash-clean shared multi-process access to one file (and independently coordinated file attachments): stable protocol-v1 lock bundle, one global writer with 55P03 timeout, immutable pinned snapshots, commit-gated meta refresh, append-only co-resident commits, and a zero-foreground-lock alone lease (spec/design/locking.md). Host/process conformance, not SQL corpus records."
 
+[[capability]]
+id = "storage.unparsable_definitions"
+description = "Opening a file whose stored SQL this binary cannot parse (spec/design/unparsable-definitions.md): a view body, CHECK, expression DEFAULT, expression index key, or partial-index predicate whose text the parser rejects is kept, unparsed and byte-for-byte, instead of failing the load XX001. Only a statement that needs the object's parsed form fails, with XX003, before touching a row: a reference to the view (and jed_columns), a write that evaluates the check or applies the default, a write that maintains the index, and the ALTER TABLE actions that analyze or rewrite the text. Reads proceed and skip the index; DROP of each object and DROP TABLE work. Exercised against the Ruby-forged fixture unparsable_definitions.jed."
+
 [[profile]]
 id = "core"
 title = "The \"it's alive\" milestone — integer DDL/DML/SELECT (CLAUDE.md §11 step 5)"

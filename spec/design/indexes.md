@@ -396,7 +396,8 @@ The catalog reshape (v5) + the unique flag (v6)
   written 0 and read-validated) + the index tree's **root page**, then — **only when `bit1`
   is set** (`format_version` 27) — a `u16 pred_len` + `pred_len` UTF-8 bytes of the partial
   index's **predicate canonical text** (the *Check-expression text* form). On load a partial
-  predicate re-parses (`XX001` on failure, like a stored CHECK) and re-resolves against the
+  predicate re-parses (text this binary cannot parse is kept, unparsed: reads skip the index and
+  writes to its table are `XX003`, [unparsable-definitions.md](unparsable-definitions.md) §3.4) and re-resolves against the
   loaded table's columns per statement (never persisted-resolved — a deterministic function of
   the column types). A non-partial index writes no `bit1` and no predicate bytes and is
   byte-identical to v26. Indexes are stored and held in **ascending name byte order**
@@ -408,7 +409,7 @@ The catalog reshape (v5) + the unique flag (v6)
   followed by a `u16 expr_len` and `expr_len` UTF-8 bytes of the expression's **canonical
   text** (the *Check-expression text* form format.md defines, exactly as a `CHECK` / column
   `DEFAULT` stores). On load an expression element re-parses that text with the ordinary
-  expression parser (`XX001` if it fails, like a stored CHECK); its result type and
+  expression parser (unparsable text is kept, as for a partial predicate); its result type and
   collation are re-derived by resolving it against the loaded table's columns per statement
   (never persisted — a deterministic function of column types that are themselves
   cross-core-identical). A plain column index's on-disk bytes are unchanged from v6.

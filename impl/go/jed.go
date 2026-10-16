@@ -795,6 +795,9 @@ var SupportedCapabilities = []string{
 	// The `# fixture: <path> error <SQLSTATE>` form asserts that opening a forged image fails with
 	// that SQLSTATE — the open-time half of the malformed-page regressions (storage.md §6).
 	"harness.fixture_open_error",
+	// Stored SQL this binary cannot parse is kept, unparsed; only statements that need it fail XX003
+	// (spec/design/unparsable-definitions.md).
+	"storage.unparsable_definitions",
 	// The `# attach: <name>` directive attaches a fresh empty read-write in-memory database to the
 	// running handle before the records run, so the corpus can populate + join across attachments
 	// (spec/design/attached-databases.md §6). In-memory attachments cannot survive the disk reopen, so

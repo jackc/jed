@@ -148,7 +148,8 @@ monotonic, time-ordered** UUIDs — every default evaluation in one statement sh
 (the coerced value via the row value codec, after the typmod; a `DEFAULT NULL` is the lone
 presence tag `0x01`), or **`bit3 default_is_expr`** for an expression (the expr-text as a
 length-prefixed UTF-8 string, after the typmod, re-rendered by the same token table a `CHECK`
-uses and re-parsed on load — unparseable stored text in an otherwise-valid file is **`XX001`**).
+uses and re-parsed on load — stored text this binary cannot parse is kept, unparsed, and only a
+statement that applies the default fails, with `XX003`, [unparsable-definitions.md](unparsable-definitions.md) §3.3).
 The two bits are mutually exclusive. The default survives serialize→load and is applied to
 inserts after a reload. (This is `format_version` **8**.)
 
@@ -363,8 +364,9 @@ identifier renders quoted, so `CHECK ("Qty" > 0 AND b IS NOT NULL)` persists as
 `"Qty" > 0 and b is not null` — [grammar.md §3](grammar.md)); on
 load each core re-parses the stored text with its ordinary expression parser, and a commit
 writes the retained text back verbatim, so the catalog bytes are stable across
-create → commit → load → commit. Unparseable stored text in an otherwise-valid file is
-**`XX001`** (`data_corrupted`) at open.
+create → commit → load → commit. Stored text this binary cannot parse (a newer jed's syntax) is
+not corruption: the check is kept, unparsed, and a statement that evaluates it fails with `XX003`
+([unparsable-definitions.md](unparsable-definitions.md) §3.2).
 
 **Host functions in a check** ([extensibility.md §7.1.2](extensibility.md), `format_version`
 35). A host function in a `CHECK` must declare a `component_id` (`42P17`), and its

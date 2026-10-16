@@ -270,23 +270,29 @@ impl Engine {
     /// built-in catalog relation, then a table, then a view (§4); tables and views share one
     /// namespace. A column list on the reference renames over the view's stored names (a longer list
     /// is left in place so the derived-table planning raises its 42P10). A view behind an attachment
-    /// qualifier is rejected by the FROM build (§10), so only bare and `main.` names expand.
+    /// qualifier is rejected by the FROM build (§10), so only bare and `main.` names expand. A view
+    /// whose stored definition does not parse is `XX003` (spec/design/unparsable-definitions.md §3.1).
     pub(crate) fn view_reference(
         &self,
         tref: &TableRef,
         ctes: &[&CteBinding],
-    ) -> Option<(TableRef, String, ViewSite)> {
+    ) -> Result<Option<(TableRef, String, ViewSite)>> {
         if tref.args.is_some()
             || tref.subquery.is_some()
             || tref.values.is_some()
             || tref.json_table.is_some()
         {
-            return None;
+            return Ok(None);
         }
         if tref.db.is_none() && ctes.iter().any(|b| b.name == tref.name) {
-            return None;
+            return Ok(None);
         }
-        let view = self.relation_view(tref.db.as_deref(), &tref.name)?;
+        let Some(view) = self.relation_view(tref.db.as_deref(), &tref.name) else {
+            return Ok(None);
+        };
+        let Some(body) = &view.body else {
+            return Err(unparsable_view_error(&view.name));
+        };
         let label = tref.alias.clone().unwrap_or_else(|| view.name.clone());
         let column_aliases = match &tref.column_aliases {
             Some(list) if list.len() > view.columns.len() => list.clone(),
@@ -305,7 +311,7 @@ impl Engine {
             alias: Some(label),
             args: None,
             arg_names: None,
-            subquery: Some(Box::new((*view.body).clone())),
+            subquery: Some(Box::new((**body).clone())),
             values: None,
             column_aliases: Some(column_aliases),
             column_defs: None,
@@ -317,7 +323,7 @@ impl Engine {
             depth: tref.pos.depth,
             body_depth: view.depth,
         };
-        Some((derived, view.name.clone(), site))
+        Ok(Some((derived, view.name.clone(), site)))
     }
 
     /// The view a relation reference that is not a CTE names, if any (§4): a built-in catalog
@@ -388,13 +394,16 @@ impl Engine {
     /// raises the error reading the view would. An untyped NULL column reads as `text`, the type a
     /// derived-table column of unknown type takes.
     pub(crate) fn view_column_types(&self, view: &ViewDef) -> Result<Vec<String>> {
+        let Some(body) = &view.body else {
+            return Err(unparsable_view_error(&view.name));
+        };
         let site = ViewSite {
             depth: 0,
             body_depth: view.depth,
         };
         let plan = self.in_view_body(site, || {
             let mut ptypes = ParamTypes::default();
-            self.plan_query(&view.body, None, &[], &mut ptypes)
+            self.plan_query(body, None, &[], &mut ptypes)
         })?;
         Ok(plan
             .column_types()
@@ -607,7 +616,7 @@ impl Engine {
             columns,
             definition,
             deps,
-            body: std::sync::Arc::new(body),
+            body: Some(std::sync::Arc::new(body)),
             depth,
             check_option: cv.check_option,
         };
@@ -638,9 +647,12 @@ impl Engine {
         if names.len() < old.columns.len() {
             return Err(invalid("cannot drop columns from view".to_string()));
         }
-        let current = self
-            .trace_view_body(&old.body)
-            .ok()
+        // A body that does not parse in this binary compares like one that no longer plans
+        // (spec/design/unparsable-definitions.md §3.1).
+        let current = old
+            .body
+            .as_ref()
+            .and_then(|body| self.trace_view_body(body).ok())
             .map(|(plan, _)| (plan.column_types().to_vec(), plan.column_derivs().to_vec()));
         for (i, old_name) in old.columns.iter().enumerate() {
             if names[i] != *old_name {
@@ -736,9 +748,16 @@ impl Engine {
         };
         for name in readers {
             let view = snap.view(&name).expect("a dependent view");
-            let (_, trace) = self
-                .trace_view_body(&view.body)
-                .map_err(|_| breaks(&name))?;
+            let Some(body) = &view.body else {
+                return Err(unparsable_view_error(&name));
+            };
+            let (_, trace) = self.trace_view_body(body).map_err(|e| {
+                if is_unparsable_error(&e) {
+                    e
+                } else {
+                    breaks(&name)
+                }
+            })?;
             let direct = view
                 .deps
                 .iter()
@@ -1010,7 +1029,10 @@ impl Engine {
         collect_stmt_privs(stmt, &mut req);
         let mut found = false;
         self.walk_read_views(req.relations, |view, _| {
-            found = query_calls_seq_mutator(&view.body);
+            found = view
+                .body
+                .as_ref()
+                .is_some_and(|b| query_calls_seq_mutator(b));
             found
         });
         found
@@ -1033,8 +1055,12 @@ impl Engine {
             if !seen.insert(view.name.clone()) {
                 continue;
             }
+            // An unparsed body has nothing to collect; planning the statement reports it (XX003).
+            let Some(view_body) = &view.body else {
+                continue;
+            };
             let mut body = PrivReq::default();
-            collect_query_privs(&view.body, &mut body, &HashSet::new());
+            collect_query_privs(view_body, &mut body, &HashSet::new());
             if visit(view, &body) {
                 return;
             }
@@ -1218,10 +1244,19 @@ impl Engine {
             views: Vec::with_capacity(dependents.len()),
         };
         for view in dependents {
+            // A dependent is rewritten and re-planned, which needs its parsed body
+            // (spec/design/unparsable-definitions.md §3.1).
+            let Some(body) = &view.body else {
+                return Err(unparsable_view_error(&view.name));
+            };
             let items = if rewrites {
-                let (_, trace) = self
-                    .trace_view_body(&view.body)
-                    .map_err(|_| alter_breaks_view(&plan, &view.name))?;
+                let (_, trace) = self.trace_view_body(body).map_err(|e| {
+                    if is_unparsable_error(&e) {
+                        e
+                    } else {
+                        alter_breaks_view(&plan, &view.name)
+                    }
+                })?;
                 trace
                     .items
                     .into_values()
@@ -1350,7 +1385,7 @@ impl Engine {
                     columns: view.columns.clone(),
                     definition,
                     deps: expected.clone(),
-                    body: std::sync::Arc::new(body),
+                    body: Some(std::sync::Arc::new(body)),
                     depth,
                     check_option: view.check_option,
                 };
@@ -1361,9 +1396,14 @@ impl Engine {
         }
         for (name, expected) in rewritten {
             let body = self.read_snap().view(&name).expect("view").body.clone();
-            let (_, trace) = self
-                .trace_view_body(&body)
-                .map_err(|_| alter_breaks_view(&plan, &name))?;
+            let body = body.expect("prepare_dependents admits only parsed views");
+            let (_, trace) = self.trace_view_body(&body).map_err(|e| {
+                if is_unparsable_error(&e) {
+                    e
+                } else {
+                    alter_breaks_view(&plan, &name)
+                }
+            })?;
             if self.trace_dependencies(&trace) != expected {
                 return Err(alter_breaks_view(&plan, &name));
             }

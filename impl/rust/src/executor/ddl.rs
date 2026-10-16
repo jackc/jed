@@ -971,7 +971,15 @@ impl Engine {
                         IdentityKind::ByDefault
                     }
                 });
-                (None, Some(DefaultExpr { expr_text, expr }), identity_kind)
+                (
+                    None,
+                    Some(DefaultExpr {
+                        expr_text,
+                        expr,
+                        unparsed: false,
+                    }),
+                    identity_kind,
+                )
             } else if ty.is_composite() || ty.is_array() || ty.is_range() {
                 // A DEFAULT on a composite-, array-, or range-typed column is not supported this
                 // slice (composite.md §12 / array.md §12 / ranges.md §8), except a bare `DEFAULT
@@ -1042,6 +1050,7 @@ impl Engine {
                                 Some(DefaultExpr {
                                     expr_text: d.text.clone(),
                                     expr: d.expr.clone(),
+                                    unparsed: false,
                                 }),
                                 None,
                             )
@@ -1278,6 +1287,7 @@ impl Engine {
                 name,
                 expr_text: def.text.clone(),
                 expr: def.expr.clone(),
+                unparsed: false,
                 host_deps,
             });
         }
@@ -2156,6 +2166,10 @@ impl Engine {
                                 cascade_dropped_views.extend(closure);
                             }
                         }
+                        // Which checks and indexes reference the column is read from their parsed
+                        // expressions, so an unparsed one blocks the drop
+                        // (spec/design/unparsable-definitions.md §3.2/§3.4).
+                        table.unparsed_error(false)?;
                         let dropped_source = column_sources[ci].clone();
                         // PostgreSQL owns an FK through its local (referencing) columns. Dropping
                         // one removes the whole FK under RESTRICT. A self-FK that uses the column
@@ -2477,6 +2491,7 @@ impl Engine {
                                     name: name.clone(),
                                     expr_text: d.text,
                                     expr: d.expr,
+                                    unparsed: false,
                                     host_deps,
                                 });
                                 table.checks.sort_by_key(|x| x.name.to_string());
@@ -3012,6 +3027,12 @@ impl Engine {
                                     Some(node.eval(&[default], &env, &mut default_meter)?);
                                 prep_cost += default_meter.accrued;
                             } else if let Some(default) = old_column.default_expr.clone() {
+                                if default.unparsed {
+                                    return Err(unparsable_default_error(
+                                        &original.name,
+                                        &old_column.name,
+                                    ));
+                                }
                                 let default_cast = Expr::Cast {
                                     inner: Box::new(default.expr),
                                     type_name: type_name.clone(),
@@ -3038,6 +3059,7 @@ impl Engine {
                                         default.expr_text, type_sql
                                     ),
                                     expr: default_cast,
+                                    unparsed: false,
                                 });
                             }
                             if old_column.identity.is_some() {
@@ -3391,6 +3413,9 @@ impl Engine {
                 if !added_constraints.contains(&table.checks[i].name.to_string()) {
                     continue;
                 }
+                if table.checks[i].unparsed {
+                    return Err(unparsable_check_error(&table.name, &table.checks[i].name));
+                }
                 let (node, _) = resolve(
                     &Scope::single(self, &table),
                     &table.checks[i].expr,
@@ -3646,6 +3671,9 @@ impl Engine {
         column: Option<(&str, &str)>,
         rename: Option<&str>,
     ) -> Result<()> {
+        // A rename rewrites every stored expression's text, which needs its tokens to parse
+        // (spec/design/unparsable-definitions.md §3.2–§3.4).
+        table.unparsed_error(true)?;
         let table_name = table.name.clone();
         let rewrite = |text: &str| match column {
             Some((old, new)) => {
@@ -3742,6 +3770,7 @@ impl Engine {
             Some(DefaultExpr {
                 expr_text: def.text.clone(),
                 expr: def.expr.clone(),
+                unparsed: false,
             }),
         ))
     }
@@ -3973,6 +4002,7 @@ impl Engine {
             col.default_expr = Some(DefaultExpr {
                 expr: crate::parser::parse_expression(&expr_text)?,
                 expr_text,
+                unparsed: false,
             });
             col.identity = def.identity.as_ref().map(|id| {
                 if id.always {
@@ -4020,6 +4050,9 @@ impl Engine {
         let scope = Scope::single(self, table);
         let mut out = Vec::with_capacity(table.checks.len());
         for c in &table.checks {
+            if c.unparsed {
+                return Err(unparsable_check_error(&table.name, &c.name));
+            }
             let (node, _) = resolve(&scope, &c.expr, None, &mut AggCtx::Forbidden, params)?;
             // Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match
             // the dependency persisted with the check, else XX002 before any mutation.
@@ -4046,6 +4079,12 @@ impl Engine {
         def: &IndexDef,
         params: &mut ParamTypes,
     ) -> Result<ResolvedIndex> {
+        // An index whose stored expression did not parse can neither be maintained nor used: the read
+        // path swallows this error and skips the index, a write propagates it
+        // (spec/design/unparsable-definitions.md §3.4).
+        if def.unparsed() {
+            return Err(unparsable_index_error(&table.name, &def.name));
+        }
         params.uncacheable |= def.timezone_deps.dynamic;
         verify_index_timezone_deps(&def.timezone_deps, &self.session.env)?;
         let mut keys = Vec::with_capacity(def.keys.len());
@@ -4223,6 +4262,9 @@ impl Engine {
                 continue;
             }
             match &col.default_expr {
+                Some(de) if de.unparsed => {
+                    return Err(unparsable_default_error(&table.name, &col.name));
+                }
                 Some(de) => {
                     let scope = Scope::empty(self);
                     let (node, _) = resolve(
@@ -4542,6 +4584,7 @@ impl Engine {
                     ci_keys.push(IndexKey::Expr(IndexKeyExpr {
                         expr_text: text.clone(),
                         expr: expr.clone(),
+                        unparsed: false,
                     }));
                     continue;
                 }
@@ -4648,6 +4691,7 @@ impl Engine {
                 Some(IndexKeyExpr {
                     expr_text: pred.text.clone(),
                     expr: pred.expr.clone(),
+                    unparsed: false,
                 })
             }
         };
@@ -5196,7 +5240,11 @@ impl Engine {
             self.set_column_default_expr_routed(
                 &owner.table.to_string(),
                 owner.column as usize,
-                DefaultExpr { expr_text, expr },
+                DefaultExpr {
+                    expr_text,
+                    expr,
+                    unparsed: false,
+                },
             );
         }
         // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no

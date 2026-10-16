@@ -361,15 +361,24 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 		t.Fatalf("second generation names = %v", got)
 	}
 
-	// A stored expression that no longer parses is XX001 (the file lied): patch the text
-	// `b > 0` to the same-length garbage `b > (`.
+	// A stored expression this binary cannot parse loads, unparsed: patch the text `b > 0` to the
+	// same-length `b > (` and reseal the page. Reads proceed; a write that evaluates the checks is
+	// XX003 (spec/design/unparsable-definitions.md §3.2).
 	at := bytes.Index(image, []byte("b > 0"))
 	if at < 0 {
 		t.Fatal("stored check text not found in image")
 	}
-	corrupt := bytes.Clone(image)
-	corrupt[at+4] = '('
-	if _, err := loadEngine(corrupt, NewEnvironment()); err == nil || err.(*EngineError).Code() != "XX001" {
-		t.Fatalf("corrupt check text = %v, want XX001", err)
+	unparsable := bytes.Clone(image)
+	unparsable[at+4] = '('
+	refreshGoldenPageCRC(unparsable, at)
+	future, err := loadEngine(unparsable, NewEnvironment())
+	if err != nil {
+		t.Fatalf("unparsable check text must load: %v", err)
+	}
+	if got := queryRows(t, future, "SELECT count(*) FROM t"); len(got) != 1 {
+		t.Fatalf("count = %v", got)
+	}
+	if code, _ := checkErr(t, future, "INSERT INTO t VALUES (9, 1, 1.00, 'ok')"); code != "XX003" {
+		t.Fatalf("insert over an unparsed check = %s, want XX003", code)
 	}
 }

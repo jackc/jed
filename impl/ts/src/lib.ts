@@ -906,6 +906,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // engine error (a forged, CRC-valid but structurally wrong image is XX001, never a crash), and the
   // file runs no records (spec/design/conformance.md).
   "harness.fixture_open_error",
+  // Stored SQL this binary cannot parse is kept, unparsed; only statements that need it fail XX003
+  // (spec/design/unparsable-definitions.md).
+  "storage.unparsable_definitions",
   // The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
   // (db.upgradeCollations) on the running DB — clears a version-skew so a corpus test can drive
   // skew→migrate→writable end to end (spec/design/collation.md §12).

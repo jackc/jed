@@ -53,7 +53,11 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	viewNames := make([]string, len(tableRefs))
 	isolated := make([]*viewSite, len(tableRefs))
 	for i := range tableRefs {
-		if derived, name, site := db.viewReference(&tableRefs[i], ctes); site != nil {
+		derived, name, site, err := db.viewReference(&tableRefs[i], ctes)
+		if err != nil {
+			return nil, err
+		}
+		if site != nil {
 			tableRefs[i] = derived
 			viewNames[i] = name
 			isolated[i] = site

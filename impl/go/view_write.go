@@ -316,6 +316,9 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 	if err != nil || view == nil {
 		return nil, err
 	}
+	if view.Unparsed {
+		return nil, unparsableViewError(view.Name)
+	}
 	checkCols := kind != writeDelete
 	// 2. The target view is updatable for the statement's kind (55000).
 	if sel, _ := db.updatableShape(view.Body, checkCols); sel == nil {
@@ -379,6 +382,9 @@ func (db *engine) prepareViewWrite(q *string, name string, kind writeKind, targe
 	var table *catTable
 	var tableRename []string
 	for {
+		if levelView.Unparsed {
+			return nil, unparsableViewError(levelView.Name)
+		}
 		sel, tref := db.updatableShape(levelView.Body, checkCols)
 		if sel == nil {
 			return nil, notUpdatable(kind, levelView.Name)

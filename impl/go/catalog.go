@@ -92,6 +92,9 @@ const (
 type defaultExprDef struct {
 	ExprText string
 	Expr     exprNode
+	// Unparsed marks stored text this binary's parser rejects (spec/design/unparsable-definitions.md):
+	// Expr is empty, ExprText is kept verbatim, and applying the default is XX003.
+	Unparsed bool
 }
 
 // Table is a table definition.
@@ -248,6 +251,9 @@ type indexKey struct {
 type indexKeyExpr struct {
 	ExprText string
 	Expr     exprNode
+	// Unparsed marks stored text this binary's parser rejects (spec/design/unparsable-definitions.md):
+	// Expr is empty and ExprText is kept verbatim. The index is skipped by reads and refuses writes.
+	Unparsed bool
 }
 
 // columnKeys wraps a plain column-ordinal list as index key elements (the common case — a
@@ -346,8 +352,12 @@ type viewDef struct {
 	Definition string
 	// Deps are the tables and views the body reads, in ascending name byte order (§6).
 	Deps []viewDep
-	// Body is the parsed definition — parsed at create and at load, never persisted.
+	// Body is the parsed definition — parsed at create and at load, never persisted. nil when the
+	// stored definition does not parse in this binary (Unparsed).
 	Body *queryExpr
+	// Unparsed marks a definition this binary's parser rejects (spec/design/unparsable-definitions.md
+	// §3.1): every use of the view is XX003, and Definition is written back verbatim.
+	Unparsed bool
 	// Depth is the body's nesting depth (spec/design/views.md §4.1), from the same parse as Body.
 	Depth int
 	// CheckOption is the view's check option, if any (spec/design/views.md §15.6).
@@ -647,6 +657,9 @@ type checkConstraint struct {
 	Name     string
 	ExprText string
 	Expr     exprNode
+	// Unparsed marks stored text this binary's parser rejects (spec/design/unparsable-definitions.md
+	// §3.2): Expr is empty, ExprText is kept verbatim, and evaluating the check is XX003.
+	Unparsed bool
 	// HostDeps are the persisted HOST-FUNCTION dependencies of the check expression
 	// (spec/design/extensibility.md §7.1.2, format v35): one per distinct host signature it calls,
 	// sorted by (name, arg-type codes). Verified whenever the check is resolved for evaluation —

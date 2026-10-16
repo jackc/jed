@@ -1248,7 +1248,9 @@ impl Engine {
             .iter()
             .zip(insert_default_needs(&provided, rows))
         {
-            if let (true, Some(default)) = (need, &col.default_expr) {
+            if let (true, Some(default)) = (need, &col.default_expr)
+                && !default.unparsed
+            {
                 collect_expr_privs(&default.expr, req, &locals);
             }
         }
@@ -1332,7 +1334,9 @@ fn collect_assignment_default_privs(
             .iter()
             .find(|col| col.name == assignment.column)
             .and_then(|col| col.default_expr.as_ref());
-        if let Some(default) = default {
+        if let Some(default) = default
+            && !default.unparsed
+        {
             collect_expr_privs(&default.expr, req, &locals);
         }
     }
@@ -1342,7 +1346,8 @@ fn collect_assignment_default_privs(
 /// new row.
 fn collect_check_privs(table: &Table, req: &mut PrivReq) {
     let locals = HashSet::new();
-    for check in &table.checks {
+    // An unparsed check calls nothing this binary can name; the write itself fails XX003.
+    for check in table.checks.iter().filter(|c| !c.unparsed) {
         collect_expr_privs(&check.expr, req, &locals);
     }
 }

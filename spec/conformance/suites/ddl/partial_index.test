@@ -9,7 +9,7 @@
 # (oracle-checked); the jed-specific pieces (the predicate column in jed_indexes, the
 # partial-GIN 0A000 and the collation-upgrade 0A000) live in the
 # per-core tests. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.point_lookup, query.index_partial, query.aggregates, query.subquery_scalar, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.point_lookup, query.index_partial, query.aggregates, query.subquery_scalar, query.join_inner, query.set_returning, dml.insert_select, types.i32, types.text, resource.cost_metering
 
 # --- a partial index accelerates a query that implies its predicate ------------------------------
 
@@ -157,6 +157,30 @@ INSERT INTO v2 VALUES (1,'active',5),(2,'inactive',5),(3,'inactive',5)
 
 statement ok
 CREATE UNIQUE INDEX ON v2 (amt) WHERE status = 'active'
+
+# --- a partial index is never the inner of an index-nested-loop join ----------------------------
+# The join key matches the index's key, but nothing implies its predicate, so the index (which holds
+# only rows with id > 1000) must not serve the probe: every matching row is returned.
+
+statement ok
+CREATE TABLE jl (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE jr (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE INDEX jr_part ON jr (v) WHERE id > 1000
+
+statement ok
+INSERT INTO jl SELECT g, g FROM generate_series(1, 300) g
+
+statement ok
+INSERT INTO jr SELECT g, g FROM generate_series(1, 300) g
+
+query I nosort
+SELECT count(*) FROM jl JOIN jr ON jr.v = jl.v WHERE jl.id < 5
+----
+4
 
 # --- validation (codes AGREE with PostgreSQL, oracle-probed) -------------------------------------
 

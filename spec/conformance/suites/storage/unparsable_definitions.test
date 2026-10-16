@@ -1,0 +1,345 @@
+# Stored definitions this binary cannot parse (spec/design/unparsable-definitions.md).
+#
+# The Ruby-forged fixture stands in for a file a newer jed wrote: each kind of stored SQL holds text
+# no jed parser accepts (`… is future syntax`). Opening it must succeed. Only statements that need an
+# unparsed object's parsed form fail, with XX003, and dropping each object works. The tables:
+#   t (id, v) rows (1,1) (2,2) (3,-3); views ok (parses), u and r (do not), w (reads u)
+#   c (id, v) rows (1,10) (2,20); CHECK c_ok (v > 0) parses, CHECK c_v_check does not
+#   d (id, v, k) row (1,1,1); v's expression DEFAULT does not parse, k's is 1 + 1
+#   x (id, v) rows (1,1) (2,2); expression index x_future_idx does not parse; x_v_idx on v
+#   p (id, v) rows (1,1) (2,2); UNIQUE partial index p_future_idx on v whose predicate does not parse
+# The two unparsed indexes are forged EMPTY although their tables have rows, so a planner that used
+# either would lose rows. jed-specific, so cross-core-checked, not PostgreSQL-oracle-checked.
+# requires: harness.fixture_open, storage.unparsable_definitions, introspect.tables, introspect.views, introspect.columns, introspect.indexes, introspect.constraints, ddl.view, ddl.view_alter, ddl.view_cascade, dml.view_write, ddl.check, ddl.column_default_expr, ddl.index_expr, ddl.index_partial, ddl.alter_table, ddl.drop_table, dml.insert, dml.insert_column_list, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text
+# fixture: fileformat/fixtures/unparsable_definitions.jed
+
+# --- views (§3.1) ----------------------------------------------------------------------------------
+
+query II rowsort
+SELECT id, v FROM t
+----
+1
+1
+2
+2
+3
+-3
+
+query II rowsort
+SELECT id, v FROM ok
+----
+1
+1
+2
+2
+
+statement error XX003
+SELECT id FROM u
+
+statement error XX003
+SELECT id FROM w
+
+statement error XX003
+SELECT count(*) FROM (SELECT id FROM t UNION ALL SELECT id FROM u) AS s
+
+statement error XX003
+SELECT name FROM jed_columns
+
+statement error XX003
+INSERT INTO u VALUES (9, 9)
+
+statement error XX003
+DELETE FROM u
+
+query TTT nosort
+SELECT name, definition, columns::text FROM jed_views ORDER BY name
+----
+ok
+select id , v from t where v > 0
+{id,v}
+r
+select id from t where id is future syntax
+{id}
+u
+select id , v from t where v is future syntax
+{id,v}
+w
+select id from u
+{id}
+
+# The tables a view reads stay writable.
+statement ok
+INSERT INTO t VALUES (4, 4)
+
+# Changing a table an unparsed view depends on re-plans the view (views.md §8).
+statement error XX003
+ALTER TABLE t ADD COLUMN z i32
+
+statement error XX003
+ALTER TABLE t RENAME COLUMN v TO v2
+
+# Renaming u rewrites w, which reads u.
+statement error XX003
+ALTER VIEW u RENAME TO u2
+
+# The persisted dependency list still guards and cascades.
+statement error 2BP01
+DROP VIEW u
+
+statement error 2BP01
+DROP TABLE t
+
+statement ok
+DROP VIEW u CASCADE
+
+# Replacing an unparsed view compares only the column names and count, as for a body that no longer
+# plans (views.md §1.2).
+statement error 42P16
+CREATE OR REPLACE VIEW r (x) AS SELECT id FROM t
+
+statement ok
+CREATE OR REPLACE VIEW r AS SELECT id FROM t WHERE v > 1
+
+query I rowsort
+SELECT id FROM r
+----
+2
+4
+
+query T nosort
+SELECT name FROM jed_views ORDER BY name
+----
+ok
+r
+
+statement ok
+ALTER TABLE t ADD COLUMN z i32
+
+query III rowsort
+SELECT id, v, z FROM t WHERE id = 4
+----
+4
+4
+NULL
+
+# --- CHECK (§3.2) ----------------------------------------------------------------------------------
+
+query TT nosort
+SELECT name, expression FROM jed_constraints WHERE table_name = 'c' ORDER BY name
+----
+c_ok
+v > 0
+c_v_check
+v is future syntax
+
+query II rowsort
+SELECT id, v FROM c
+----
+1
+10
+2
+20
+
+statement error XX003
+INSERT INTO c VALUES (3, 30)
+
+statement error XX003
+UPDATE c SET v = 11 WHERE id = 1
+
+statement error XX003
+ALTER TABLE c RENAME COLUMN v TO v2
+
+statement error XX003
+ALTER TABLE c DROP COLUMN v
+
+statement error XX003
+ALTER TABLE c ALTER COLUMN v TYPE i64
+
+statement ok
+DELETE FROM c WHERE id = 2
+
+statement ok
+ALTER TABLE c DROP CONSTRAINT c_v_check
+
+statement ok
+INSERT INTO c VALUES (3, 30)
+
+statement error 23514
+INSERT INTO c VALUES (4, -1)
+
+query II rowsort
+SELECT id, v FROM c
+----
+1
+10
+3
+30
+
+# --- expression DEFAULT (§3.3) ---------------------------------------------------------------------
+
+query TT nosort
+SELECT name, column_default FROM jed_columns WHERE table_name = 'd' ORDER BY ordinal
+----
+id
+NULL
+v
+1 is future syntax
+k
+1 + 1
+
+statement ok
+INSERT INTO d (id, v) VALUES (2, 2)
+
+statement error XX003
+INSERT INTO d (id) VALUES (3)
+
+statement error XX003
+INSERT INTO d VALUES (3, DEFAULT, 3)
+
+statement error XX003
+UPDATE d SET v = DEFAULT
+
+statement ok
+UPDATE d SET k = DEFAULT WHERE id = 1
+
+statement error XX003
+ALTER TABLE d ALTER COLUMN v TYPE i64
+
+statement error XX003
+ALTER TABLE d RENAME TO d2
+
+query III rowsort
+SELECT id, v, k FROM d
+----
+1
+1
+2
+2
+2
+2
+
+statement ok
+ALTER TABLE d ALTER COLUMN v SET DEFAULT 7
+
+statement ok
+INSERT INTO d (id) VALUES (3)
+
+query III rowsort
+SELECT id, v, k FROM d WHERE id = 3
+----
+3
+7
+2
+
+# --- expression index (§3.4) -----------------------------------------------------------------------
+
+query TTT nosort
+SELECT name, columns::text, predicate FROM jed_indexes WHERE table_name IN ('x', 'p') ORDER BY name
+----
+p_future_idx
+{v}
+v is future syntax
+x_future_idx
+{"v is future syntax"}
+NULL
+x_v_idx
+{v}
+NULL
+
+query II rowsort
+SELECT id, v FROM x WHERE v = 2
+----
+2
+2
+
+statement error XX003
+INSERT INTO x VALUES (3, 3)
+
+statement error XX003
+ALTER TABLE x ALTER COLUMN v TYPE i64
+
+statement error XX003
+ALTER TABLE x DROP COLUMN v
+
+statement error XX003
+ALTER TABLE x RENAME COLUMN v TO w
+
+# Adding a column leaves every index entry valid, so it needs no stored definition.
+statement ok
+ALTER TABLE x ADD COLUMN z i32 DEFAULT 5
+
+statement error XX003
+UPDATE x SET v = 5 WHERE id = 1
+
+statement error XX003
+DELETE FROM x WHERE id = 1
+
+statement ok
+DROP INDEX x_future_idx
+
+statement ok
+INSERT INTO x (id, v) VALUES (3, 3)
+
+query III rowsort
+SELECT id, v, z FROM x
+----
+1
+1
+5
+2
+2
+5
+3
+3
+5
+
+# --- partial index (§3.4) --------------------------------------------------------------------------
+
+# The forged-empty partial index must never serve these reads: each returns every matching row.
+query II rowsort
+SELECT id, v FROM p WHERE v = 2
+----
+2
+2
+
+query II nosort
+SELECT id, v FROM p ORDER BY v
+----
+1
+1
+2
+2
+
+query II rowsort
+SELECT t.id, p.id FROM t JOIN p ON p.v = t.v
+----
+1
+1
+2
+2
+
+statement error XX003
+INSERT INTO p VALUES (3, 3)
+
+statement error XX003
+ALTER TABLE p ALTER COLUMN v TYPE i64
+
+statement ok
+ALTER TABLE p ADD COLUMN z i32
+
+statement error XX003
+DELETE FROM p
+
+# DROP TABLE needs none of a table's stored definitions.
+statement ok
+DROP TABLE p
+
+statement ok
+DROP TABLE d
+
+query T nosort
+SELECT name FROM jed_tables ORDER BY name
+----
+c
+t
+x

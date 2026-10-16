@@ -119,6 +119,15 @@ import {
   colTypeScalar,
   resolveColType,
 } from "./catalog.ts";
+import {
+  assertTableParsed,
+  indexUnparsed,
+  isUnparsableError,
+  unparsableCheckError,
+  unparsableDefaultError,
+  unparsableIndexError,
+  unparsableViewError,
+} from "./unparsed.ts";
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { optimizeSelect } from "./optimize.ts";
@@ -3819,7 +3828,7 @@ export class Engine {
     const locals = new Set<string>();
     needs.forEach((need, i) => {
       const def = table.columns[i]!.defaultExpr;
-      if (need && def !== null) collectExprPrivs(def.expr, req, locals);
+      if (need && def !== null && !def.unparsed) collectExprPrivs(def.expr, req, locals);
     });
     if (ins.onConflict !== null && ins.onConflict.doUpdate) {
       collectAssignmentDefaultPrivs(table, ins.onConflict.assignments, req);
@@ -6986,6 +6995,7 @@ export class Engine {
     if (table.checks.length === 0) return [];
     const scope = Scope.single(this, table);
     return table.checks.map((c) => {
+      if (c.unparsed) throw unparsableCheckError(table.name, c.name);
       const node = resolve(
         scope,
         c.expr,
@@ -7028,6 +7038,10 @@ export class Engine {
     def: IndexDef,
     ptypes: ParamTypes = new ParamTypes(),
   ): ResolvedIndex {
+    // An index whose stored expression did not parse can neither be maintained nor used: the read
+    // path swallows this error and skips the index, a write propagates it
+    // (spec/design/unparsable-definitions.md §3.4).
+    if (indexUnparsed(def)) throw unparsableIndexError(table.name, def.name);
     ptypes.uncacheable ||= def.timezoneDeps?.dynamic ?? false;
     verifyIndexTimezoneDeps(def.timezoneDeps, this.environment);
     const keys: ResolvedKey[] = def.keys.map((k) => {
@@ -7156,6 +7170,7 @@ export class Engine {
   ): (RExpr | null)[] {
     return table.columns.map((col, i) => {
       if (col.defaultExpr === null || (need !== null && !need[i])) return null;
+      if (col.defaultExpr.unparsed) throw unparsableDefaultError(table.name, col.name);
       return resolve(
         Scope.empty(this),
         col.defaultExpr.expr,
@@ -7487,6 +7502,9 @@ export class Engine {
       column?: { oldName: string; newName: string },
       tableRename?: string,
     ): void => {
+      // A rename rewrites every stored expression's text, which needs its tokens to parse
+      // (spec/design/unparsable-definitions.md §3.2–§3.4).
+      assertTableParsed(table, true);
       const rw = (text: string) =>
         column
           ? rewriteColumnIdentifier(text, table.name, column.oldName, column.newName)
@@ -7702,6 +7720,9 @@ export class Engine {
                 for (const name of closure) cascadeDroppedViews.add(name);
               }
             }
+            // Which checks and indexes reference the column is read from their parsed expressions, so
+            // an unparsed one blocks the drop (spec/design/unparsable-definitions.md §3.2/§3.4).
+            assertTableParsed(table, false);
             const usesExpr = (expr: Expr) => checkReferencedColumns(expr, table.columns).includes(ci);
             const indexUses = (index: IndexDef) =>
               index.keys.some((key) =>
@@ -8290,6 +8311,9 @@ export class Engine {
                 target = { ...target, default: evalExpr(node, [oldColumn.default], this.maintenanceEnv(new StmtRng()), m) };
                 prepCost += m.accrued;
               } else if (oldColumn.defaultExpr !== null) {
+                if (oldColumn.defaultExpr.unparsed) {
+                  throw unparsableDefaultError(original.name, oldColumn.name);
+                }
                 const defaultCast: Expr = {
                   kind: "cast",
                   inner: oldColumn.defaultExpr.expr,
@@ -8555,6 +8579,7 @@ export class Engine {
       for (let i = 0; i < table.checks.length; i++) {
         const c = table.checks[i]!;
         if (!addedConstraints.has(c.name)) continue;
+        if (c.unparsed) throw unparsableCheckError(table.name, c.name);
         const node = resolve(
           Scope.single(this, table),
           c.expr,
@@ -14132,7 +14157,8 @@ export class Engine {
   // statement-local CTE, then a built-in catalog relation, then a table, then a view (§4); tables and
   // views share one namespace. A column list on the reference renames over the view's stored names (a
   // longer list is left in place so the derived-table planning raises its 42P10). A view behind an
-  // attachment qualifier is rejected by the FROM build (§10), so only bare and main. names expand.
+  // attachment qualifier is rejected by the FROM build (§10), so only bare and main. names expand. A
+  // view whose stored definition does not parse is XX003 (spec/design/unparsable-definitions.md §3.1).
   private viewReference(
     tref: TableRef,
     ctes: CteBinding[],
@@ -14148,6 +14174,8 @@ export class Engine {
     if (tref.db === undefined && ctes.some((b) => b.name === tref.name)) return null;
     const view = this.relationView(tref.db, tref.name);
     if (view === undefined) return null;
+    if (view.body === null) throw unparsableViewError(view.name);
+    const body = view.body;
     const label = tref.alias ?? view.name;
     let columnAliases: string[];
     if (tref.columnAliases === undefined) {
@@ -14161,7 +14189,7 @@ export class Engine {
       });
     }
     return {
-      tref: { name: label, alias: label, args: null, subquery: view.body, columnAliases },
+      tref: { name: label, alias: label, args: null, subquery: body, columnAliases },
       viewName: view.name,
       site: { depth: tref.pos?.depth ?? 0, bodyDepth: view.depth },
     };
@@ -14172,8 +14200,10 @@ export class Engine {
   // a body that cannot be planned raises the error reading the view would. An untyped NULL column
   // reads as text, the type a derived-table column of unknown type takes.
   private viewColumnTypes(view: ViewDef): string[] {
+    const body = view.body;
+    if (body === null) throw unparsableViewError(view.name);
     const plan = this.inViewBody({ depth: 0, bodyDepth: view.depth }, () =>
-      this.planQuery(view.body, null, [], new ParamTypes()),
+      this.planQuery(body, null, [], new ParamTypes()),
     );
     return plan.columnTypes.map((t) => (t.kind === "null" ? "text" : rtName(t)));
   }
@@ -14304,6 +14334,7 @@ export class Engine {
   ): ViewWrite | null {
     const view = this.dmlTargetView(db, name);
     if (view === undefined) return null;
+    if (view.body === null) throw unparsableViewError(view.name);
     const checkCols = kind !== "delete";
     const notUpdatable = (v: string) =>
       engineError("object_not_in_prerequisite_state", `cannot ${writeVerb(kind)} view "${v}"`);
@@ -14363,6 +14394,7 @@ export class Engine {
     let table: Table;
     let tableRename: string[] | undefined;
     for (;;) {
+      if (levelView.body === null) throw unparsableViewError(levelView.name);
       const shape = this.updatableShape(levelView.body, checkCols);
       if (shape === null) throw notUpdatable(levelView.name);
       const { sel, tref } = shape;
@@ -14458,8 +14490,10 @@ export class Engine {
   // (views.md §4/§4.1), returning the output names, types, and collation derivations of every view
   // in its expansion.
   private planWriteTarget(view: ViewDef): Map<string, ValuesPlan> {
+    const body = view.body;
+    if (body === null) throw unparsableViewError(view.name);
     return this.inViewBody({ depth: 0, bodyDepth: view.depth }, () => {
-      const plan = this.planQuery(view.body, null, [], new ParamTypes());
+      const plan = this.planQuery(body, null, [], new ParamTypes());
       const metas = new Map(this.viewColumns);
       metas.set(view.name, {
         kind: "values",
@@ -14717,11 +14751,15 @@ export class Engine {
   ): void {
     const invalid = (msg: string): EngineError => engineError("invalid_table_definition", msg);
     if (names.length < old.columns.length) throw invalid("cannot drop columns from view");
+    // A body that does not parse in this binary compares like one that no longer plans
+    // (spec/design/unparsable-definitions.md §3.1).
     let current: QueryPlan | null = null;
-    try {
-      current = this.traceViewBody(old.body).plan;
-    } catch {
-      current = null;
+    if (old.body !== null) {
+      try {
+        current = this.traceViewBody(old.body).plan;
+      } catch {
+        current = null;
+      }
     }
     for (let i = 0; i < old.columns.length; i++) {
       const oldName = old.columns[i]!;
@@ -14802,10 +14840,12 @@ export class Engine {
       );
     for (const name of [...readers].sort(compareTextC)) {
       const view = snap.view(name)!;
+      if (view.body === null) throw unparsableViewError(name);
       let trace: ViewTrace;
       try {
         trace = this.traceViewBody(view.body).trace;
-      } catch {
+      } catch (e) {
+        if (isUnparsableError(e)) throw e;
         throw breaks(name);
       }
       if (!view.deps.some((d) => d.kind === "view" && d.name === old.name)) continue;
@@ -14923,7 +14963,7 @@ export class Engine {
     collectStmtPrivs(inner, req);
     let found = false;
     this.walkReadViews(req.relations, (view) => {
-      found = queryCallsSeqMutator(view.body);
+      found = view.body !== null && queryCallsSeqMutator(view.body);
       return found;
     });
     return found;
@@ -14943,6 +14983,8 @@ export class Engine {
       const view = this.relationView(ref.db, ref.name);
       if (view === undefined || seen.has(view.name)) continue;
       seen.add(view.name);
+      // An unparsed body has nothing to collect; planning the statement reports it (XX003).
+      if (view.body === null) continue;
       const body: PrivReq = {
         tables: [],
         relations: [],
@@ -15022,12 +15064,16 @@ export class Engine {
     if (dependents.length === 0) return null;
     const plan: ViewAlterPlan = { kind, table: name, columns, views: [] };
     for (const view of dependents) {
+      // A dependent is rewritten and re-planned, which needs its parsed body
+      // (spec/design/unparsable-definitions.md §3.1).
+      if (view.body === null) throw unparsableViewError(view.name);
       let items: TraceItem[] = [];
       if (rewrites) {
         let trace: ViewTrace;
         try {
           trace = this.traceViewBody(view.body).trace;
-        } catch {
+        } catch (e) {
+          if (isUnparsableError(e)) throw e;
           throw alterBreaksView(plan, view.name);
         }
         items = trace.itemsInOrder().filter((i) => i.kind === kind && i.name === name);
@@ -15130,7 +15176,8 @@ export class Engine {
       let trace: ViewTrace;
       try {
         trace = this.traceViewBody(body).trace;
-      } catch {
+      } catch (e) {
+        if (isUnparsableError(e)) throw e;
         throw alterBreaksView(plan, name);
       }
       if (!depsEqual(this.traceDependencies(trace), expected)) {
@@ -25299,6 +25346,10 @@ export function inventoryINLCandidates(
   // order — the deterministic tie-break, matching detectScanBound).
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "btree") continue;
+    // A PARTIAL index holds only its qualifying rows (indexes.md §9), and this bound never checks
+    // that the query implies the predicate, so a partial index is not an INL inner (as for ORDER-BY
+    // skip-sort and interval sets). That also keeps out one whose predicate did not parse.
+    if (idx.predicate !== undefined) continue;
     // The index-nested-loop sibling bound is column-only this slice (an expression index takes the
     // access-predicate path — indexes.md §5; an INL bound over an expression key is a follow-on).
     const cols = indexColumnOrdinals(idx);
@@ -37501,7 +37552,7 @@ function collectAssignmentDefaultPrivs(table: Table, assignments: Assignment[], 
   for (const assignment of assignments) {
     if (!assignment.isDefault) continue;
     const col = table.columns.find((candidate) => candidate.name === assignment.column);
-    if (col !== undefined && col.defaultExpr !== null) {
+    if (col !== undefined && col.defaultExpr !== null && !col.defaultExpr.unparsed) {
       collectExprPrivs(col.defaultExpr.expr, req, locals);
     }
   }
@@ -37511,7 +37562,8 @@ function collectAssignmentDefaultPrivs(table: Table, assignments: Assignment[], 
 // evaluates on each new row.
 function collectCheckPrivs(table: Table, req: PrivReq): void {
   const locals = new Set<string>();
-  for (const check of table.checks) collectExprPrivs(check.expr, req, locals);
+  // An unparsed check calls nothing this binary can name; the write itself fails XX003.
+  for (const check of table.checks) if (!check.unparsed) collectExprPrivs(check.expr, req, locals);
 }
 
 function insertDefaultNeeds(

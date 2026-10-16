@@ -132,6 +132,9 @@ pub enum IdentityKind {
 pub struct DefaultExpr {
     pub expr_text: String,
     pub expr: Expr,
+    /// Stored text this binary's parser rejects (spec/design/unparsable-definitions.md): `expr` is a
+    /// placeholder, `expr_text` is kept verbatim, and applying the default is `XX003`.
+    pub unparsed: bool,
 }
 
 /// One `CHECK` constraint: its (resolved, unique-per-table) name, its persisted expression
@@ -143,6 +146,9 @@ pub struct CheckConstraint {
     pub name: String,
     pub expr_text: String,
     pub expr: Expr,
+    /// Stored text this binary's parser rejects (spec/design/unparsable-definitions.md §3.2): `expr`
+    /// is a placeholder, `expr_text` is kept verbatim, and evaluating the check is `XX003`.
+    pub unparsed: bool,
     /// The persisted **host-function** dependencies of the check expression
     /// (spec/design/extensibility.md §7.1.2, `format_version` 35): one per distinct host signature it
     /// calls, sorted by `(name, arg-type codes)`. Verified whenever the check is resolved for
@@ -209,6 +215,10 @@ pub enum IndexKey {
 pub struct IndexKeyExpr {
     pub expr_text: String,
     pub expr: Expr,
+    /// Stored text this binary's parser rejects (spec/design/unparsable-definitions.md §3.4): `expr`
+    /// is a placeholder and `expr_text` is kept verbatim. The index is skipped by reads and refuses
+    /// writes.
+    pub unparsed: bool,
 }
 
 impl IndexKey {
@@ -433,8 +443,10 @@ pub struct ViewDef {
     /// The tables and views the body reads, in ascending name byte order (§6).
     pub deps: Vec<ViewDep>,
     /// The parsed definition — parsed at create and at load, never persisted. Shared, so a
-    /// snapshot clone stays cheap.
-    pub body: std::sync::Arc<crate::ast::QueryExpr>,
+    /// snapshot clone stays cheap. `None` when the stored definition does not parse in this binary
+    /// (spec/design/unparsable-definitions.md §3.1): every use of the view is `XX003`, and
+    /// `definition` is written back verbatim.
+    pub body: Option<std::sync::Arc<crate::ast::QueryExpr>>,
     /// The body's nesting depth (spec/design/views.md §4.1), from the same parse as `body`.
     pub depth: usize,
     /// The view's check option, if any (spec/design/views.md §15.6).
@@ -720,5 +732,75 @@ impl Table {
             [i] => Some(*i),
             _ => None,
         }
+    }
+}
+
+// --- Stored definitions this binary cannot parse (spec/design/unparsable-definitions.md) ---------
+// The catalog load keeps a view, CHECK, expression DEFAULT, or expression/partial index whose stored
+// text the parser rejects, marked unparsed with its text verbatim. Only a statement that needs the
+// parsed form fails, with XX003, before it reads or writes a row.
+
+fn unparsable_error(detail: String) -> crate::error::EngineError {
+    crate::error::EngineError::new(
+        crate::sqlstate::SqlState::UnparsableStoredDefinition,
+        format!("stored definition does not parse in this version of jed: {detail}"),
+    )
+}
+
+pub(crate) fn unparsable_view_error(name: &str) -> crate::error::EngineError {
+    unparsable_error(format!("view \"{name}\""))
+}
+
+pub(crate) fn unparsable_check_error(table: &str, check: &str) -> crate::error::EngineError {
+    unparsable_error(format!("check constraint \"{check}\" of table \"{table}\""))
+}
+
+pub(crate) fn unparsable_default_error(table: &str, column: &str) -> crate::error::EngineError {
+    unparsable_error(format!(
+        "default of column \"{column}\" of table \"{table}\""
+    ))
+}
+
+pub(crate) fn unparsable_index_error(table: &str, index: &str) -> crate::error::EngineError {
+    unparsable_error(format!("index \"{index}\" of table \"{table}\""))
+}
+
+/// Whether `e` is `XX003`. View re-validation reports a dependent that fails to plan as the generic
+/// `0A000`; an unparsed view reached while planning it passes through instead, so the error names the
+/// view that needs a newer jed.
+pub(crate) fn is_unparsable_error(e: &crate::error::EngineError) -> bool {
+    e.code() == crate::sqlstate::SqlState::UnparsableStoredDefinition.code()
+}
+
+impl IndexDef {
+    /// Whether an expression key or the predicate did not parse (§3.4).
+    pub fn unparsed(&self) -> bool {
+        self.keys
+            .iter()
+            .any(|k| matches!(k, IndexKey::Expr(e) if e.unparsed))
+            || self.predicate.as_ref().is_some_and(|p| p.unparsed)
+    }
+}
+
+impl Table {
+    /// `XX003` for the first unparsed check (name order), expression default (column order, when
+    /// `defaults`), or index (catalog order). The ALTER TABLE actions that analyze or rewrite every
+    /// stored expression of a table call it before they change anything (§3.2–§3.4); DROP COLUMN
+    /// passes `defaults = false`, since a default cannot reference a column.
+    pub(crate) fn unparsed_error(&self, defaults: bool) -> crate::error::Result<()> {
+        if let Some(c) = self.checks.iter().find(|c| c.unparsed) {
+            return Err(unparsable_check_error(&self.name, &c.name));
+        }
+        if defaults {
+            for col in &self.columns {
+                if col.default_expr.as_ref().is_some_and(|d| d.unparsed) {
+                    return Err(unparsable_default_error(&self.name, &col.name));
+                }
+            }
+        }
+        if let Some(ix) = self.indexes.iter().find(|ix| ix.unparsed()) {
+            return Err(unparsable_index_error(&self.name, &ix.name));
+        }
+        Ok(())
     }
 }

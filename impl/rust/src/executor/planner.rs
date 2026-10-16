@@ -67,7 +67,7 @@ impl Engine {
         let view_items: Vec<Option<(TableRef, String, ViewSite)>> = written_items
             .iter()
             .map(|t| self.view_reference(t, ctes))
-            .collect();
+            .collect::<Result<_>>()?;
         let from_items: Vec<&TableRef> = written_items
             .iter()
             .zip(&view_items)
