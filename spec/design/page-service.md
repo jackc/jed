@@ -71,6 +71,10 @@ from a page service), though both are servers.
 - If serving (§11.1), binds the endpoint and answers page-service requests on owner-side workers
   (goroutines in Go, threads in Rust). A client request never blocks the owner's own readers; the
   writer gate is shared by owner sessions and client transactions.
+- Opens the file the way its own handle asks. A `read_only` handle ([api.md](api.md) §2.1) that
+  becomes owner opens the file without write access, as today, so the OS still enforces that the
+  process cannot write. Such an owner cannot accept commits, so it hands ownership to the first
+  client that wants to write (§8.2), whatever the preferences involved.
 - Must hold the database's encryption key when the database is encrypted. Recovery, commit
   validation, adoption, reclamation, and backup all read logical page bytes (§13).
 - **A live but stuck owner stalls every client.** Ownership ends only at process death, so an owner
@@ -96,8 +100,10 @@ from a page service), though both are servers.
    path in detail. An owner that runs with `serve = false` binds nothing and answers nothing. To make
    that case distinguishable from a serving owner that has not bound yet, every owner writes a small
    `owner` record in the bundle (whether it serves) after acquiring `presence EX` and before binding.
-   The opener reads it only to word the timeout error, as "owned by a non-serving process" when it
-   says so. A stale record from a crashed owner can only mislabel that error, never change an outcome.
+   The record also names the owner's user and its endpoint path (§14). Beyond finding the endpoint,
+   the opener uses it only to word the timeout error: "owned by a non-serving process" or "owned by
+   another user's process" (§13). A stale record from a crashed owner can only mislabel that error,
+   never change an outcome.
 4. A stale endpoint left by a crashed owner is harmless: only a `presence EX` holder may replace it.
 
 A client that is not configured `ownership = never` (§8.2) also polls `presence EX` in the
@@ -341,8 +347,19 @@ ownership. Every other client, including the yielding tool once it is a client, 
 connection drops before the owner releases, the owner cancels the yield and keeps ownership. If the
 requester dies after the release, the handoff window expires, every client resumes polling, and
 ordinary promotion (§8.1) picks an owner, possibly the yielding tool again, which a later `prefer`
-opener can ask to yield in turn. Only a `prefer` process requests ownership, so two `yield` tools
-never pass it back and forth.
+opener can ask to yield in turn. Only a `prefer` process, or a writer facing a read-only owner (below),
+requests ownership, so two `yield` tools never pass it back and forth.
+
+**Read-only owner.** An owner whose handle is `read_only` (§4.1) yields to the first client that
+calls `begin_write`, regardless of either side's preference. The client sends `request_ownership`,
+waits for the handoff under its `lock_timeout_ms` (`55P03` on expiry), promotes, and begins the write
+transaction as the new owner, so its write is delayed rather than refused. The read-only owner's running
+transactions get the yield grace period, then `08006`, and it continues as a client. Two exceptions
+fail `begin_write` with `25006` instead: a client opened with `ownership = never`, which never owns,
+and a file this user cannot open read-write (no write permission, or a read-only filesystem). The
+client checks that before requesting by opening the file read-write and closing it unused, so the
+read-only owner never holds write access. Since every participant runs as one user (§13), no one
+could write such a file anyway.
 
 ### 8.3 Blue-green walkthrough
 
@@ -446,7 +463,8 @@ these consequences of the owner model:
 ### 11.2 Connection capabilities
 
 An owner may restrict a connection to reads (`begin_write` fails `25006`), set by the owner's policy
-or requested by the client (`--read-only` on the SSH helper). That is the only privilege the page
+or requested by the client (`--read-only` on the SSH helper). A read-only *owner* is different: it
+hands ownership to a writer instead of refusing it (§8.2). That is the only privilege the page
 service has: SQL privileges, the session capability envelope, and cost budgets are enforced by the
 **client's** engine, because the client executes the queries. A process that can write pages can
 corrupt the database regardless (§13).
@@ -472,9 +490,25 @@ binary already rejects with `0A000` (locking.md §3.1). No mixed-fleet rollout i
 
 ## 13. Security and trust
 
-- **Local endpoint permissions equal database-file permissions.** The endpoint lives in (or is
-  referenced from) the bundle directory, created with the database file's ownership and mode. Any
-  process able to connect could already open the file.
+- **Same user only.** An owner serves only processes running as its own operating-system user. The
+  endpoint sits in a directory private to that user (mode `0700`; on Windows, an endpoint whose ACL
+  grants only that user). Directory search permission is the control every Unix enforces for
+  sockets, and the kernel checks it on connect. So processes sharing a database at the same time
+  must all run as one user: the owner's, which need not be the database file's owner. A process
+  of another user can open the database only while no one else holds it, and it then becomes an owner
+  that other users cannot reach. Root can connect as a client, but root as owner locks out the
+  application's user, so tools should run as that user (`sudo -u app jed …`), not as root.
+- **Why the endpoint does not mirror the file's permissions.** Unix permission bits are relative to
+  the file's owner, and a process cannot create an endpoint owned by another user. Connecting to a
+  socket also needs write permission on Linux. Any copy of the file's mode onto an endpoint the
+  current owner created therefore locks out legitimate users (the file's owner, when another user
+  owns; anyone with read-only access) and ignores ACLs and mandatory access control.
+- **Cross-user access is not supported.** If a deployment needs it later, the exact mechanism known
+  is for the client to open the database file itself and pass the open handle over the socket
+  (`SCM_RIGHTS`); the owner checks with `fstat` that it is the same file and grants a read-write or
+  read-only connection from the handle's access mode, so the kernel's own permission check
+  decides. That needs FFI or a crate in Rust and a larger Node addon, and on Windows the equivalent
+  is copying the file's ACL onto the endpoint.
 - **Clients are trusted the way file openers are trusted.** A client writes raw pages; the owner's
   validation (§5.6) catches client bugs and protocol violations (`08P01 protocol_violation`), not a
   malicious client that constructs valid-looking pages. This is unchanged from shared mode, where any
@@ -530,9 +564,10 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
 **Endpoint mechanics (open):**
 
 - **Path length.** Unix socket paths are limited to about 104–108 bytes, so a socket inside a deep
-  bundle path can fail to bind. Proposed: bind `<path>.lock/endpoint` when it fits, otherwise a short
-  per-user runtime path (e.g. `$XDG_RUNTIME_DIR/jed/<hash>.sock`) recorded in a pointer file in the
-  bundle. Linux's abstract namespace is rejected (no file permissions).
+  bundle path can fail to bind. Proposed: bind inside a `0700` per-user directory in the bundle
+  (`<path>.lock/<user>/endpoint`) when it fits, otherwise a short path in the user's private runtime
+  directory (`$XDG_RUNTIME_DIR` on Linux, the per-user `$TMPDIR` on macOS), recorded in the owner
+  record (§4.3). Linux's abstract namespace is rejected (no file permissions).
 - **Windows.** Go supports `AF_UNIX` on Windows. Rust's standard library does not, so the Rust core
   needs named pipes or `AF_UNIX` through either a crate (a CLAUDE.md §14 dependency decision) or
   `unsafe` FFI (a CLAUDE.md §13 decision). Until decided, Rust on Windows offers non-serving ownership
