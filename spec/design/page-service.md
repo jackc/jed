@@ -77,7 +77,7 @@ from a page service), though both are servers.
   that is stopped (`SIGSTOP`), paused (a long GC), or blocked in a durability barrier delays every
   client's `begin_read`, `read_pages`, and `commit` until it resumes. Shared mode's already-joined
   peers keep reading the file directly in that case. This design accepts the cost in exchange for
-  one process touching the file; a client-side request timeout is open (§17.10).
+  one process touching the file; a client-side request timeout is open (§17.9).
 
 ### 4.2 Client
 
@@ -276,7 +276,7 @@ Persisted facts are file facts and are unaffected: collations baked into the fil
 pins ([index-dependencies.md](index-dependencies.md)), and the `XX002` rule for a file that needs host
 code to reopen bind every participant equally.
 
-**Compatibility needs three checks at `hello`; the first two are version numbers:**
+**Compatibility has three parts; `hello` checks the first two:**
 
 - **Page protocol version.** Negotiated; each release states the range it serves and speaks.
 - **On-disk format.** A client must read and write the file's current `format_version`, or it fails
@@ -288,13 +288,14 @@ code to reopen bind every participant equally.
   restore, §9). Designing a format upgrade path is out of scope here.
 - **Persisted SQL.** Catalog loading reparses stored SQL text: view definitions, expression
   defaults, CHECK constraints, partial-index predicates, and expression index keys. A newer release
-  can add syntax without changing `format_version`. For example, `SEARCH`/`CYCLE` landed (e92a7a3e)
-  without a format bump, and a stored view may use it. An older binary that cannot parse such text
-  fails the load with `XX001`. If the owner is the older binary, it first meets that text when it
-  adopts a client's commit (§5.6), after the delta is already durable. The two version checks above
-  do not catch this. A fix is open (§17.11): negotiate a persisted-SQL level at `hello` and refuse
-  persisting DDL from a client whose level exceeds the owner's, or make adoption structural and
-  defer parsing to first use.
+  can add syntax without changing `format_version` (`SEARCH`/`CYCLE` did). An older binary that meets
+  such text keeps the object unparsed and fails only the statements that need it, with `XX003`
+  ([unparsable-definitions.md](unparsable-definitions.md)); this holds standalone, in shared mode, and
+  here alike. The page service adds two rules of its own. The owner's service duties (validation,
+  adoption, reclamation, backup — §5.6, §6, §9) are structural and never parse stored SQL, so a
+  newer client's DDL cannot stop the service. And the owner reloads its own sessions' catalog at
+  their next transaction begin, not in the commit path, so nothing a client commits can fail after it
+  is durable.
 
 ## 8. Ownership handoff
 
@@ -351,9 +352,9 @@ never pass it back and forth.
 4. Green acquires `presence EX`, becomes owner, and switches to the local file. Green requests that
    straddled the moment fail `08006` or `08007` and are retried.
 
-Within one `format_version` and one persisted-SQL level (§7), no environment or engine-version
-compromise is needed during the overlap. A release that changes `format_version` cannot overlap
-(§7).
+Within one `format_version`, no environment or engine-version compromise is needed during the
+overlap. A release that changes `format_version` cannot overlap (§7). Green may store SQL that blue
+cannot parse; blue then fails only the statements that need it (§7), and blue is draining anyway.
 
 ### 8.4 Resolving an unacknowledged commit
 
@@ -456,8 +457,8 @@ Superseded when ratified:
   transaction begin (§5.1), the cross-process `writer` and `commit` gates (§5.2–§5.3), and append-only
   co-resident commits;
 - the `shared` value of `locking`. The option becomes `auto` (owner/client) | `exclusive` (owner,
-  `serve = false`) | `none` (unchanged escape hatch). The transitional opt-in `service` value
-  (§16) is retired with it, as a synonym of `auto`.
+  `serve = false`) | `none` (unchanged escape hatch). The test-only `service` value used
+  before phase 4 (§16) is removed with it.
 
 Kept: the stable bundle and its identity rules (locking.md §3.1), `presence` as the ownership lock,
 the hard-link rejection, the per-path in-process registry, fork invalidation, the open timeout, and
@@ -493,11 +494,38 @@ corrupt. The rollout drains v1 processes once, as the v1 rollout drained pre-pro
 |---|---|---|---|
 | Rust (and the Node and Ruby bindings over it) | yes | yes | yes |
 | Go | yes | yes | yes |
-| Native TS on Node | no | yes | optional (§17.7) |
+| Native TS on Node | yes (service on a worker thread) | yes | yes (synchronous fetch through a worker thread) |
 | Native TS in the browser (OPFS) | no | yes (today's exclusive access) | no |
 | wasm32-wasip1 | no | no (explicit `none` only, as today) | no |
 
-The native TS on Node row is undecided and blocks phase 4 (§17.7). Not every core needs to serve.
+Native TS on Node keeps its place in multi-process access, which it has today through shared mode
+([locking.md](locking.md) §8, §9.2), so the Layer 4 corpus keeps all three cores and production Node
+does not depend on the Rust bindings.
+
+**Native TS on Node.** Node's embedding API is synchronous (locking.md §8) and the engine runs on
+one thread, so both roles move the socket work to a worker thread, in pure TypeScript with no new
+native code (the OS locks still use `impl/ts/native-lock`):
+
+- **Client.** A worker thread owns the connection. On a cache miss, or at `begin_read` and `commit`,
+  the engine thread posts the request into a `SharedArrayBuffer` and blocks in `Atomics.wait` until
+  the worker writes the reply. Node permits `Atomics.wait` on the main thread, and the TS core
+  already uses it to sleep. The cost is one cross-thread handoff per round trip, and the calling
+  thread blocks for the round trip, as it already does on a synchronous file read.
+- **Serving owner.** The service cannot run on the engine thread. A client's request would wait for
+  every synchronous owner query to finish, and an owner session waiting on the writer gate held by a
+  client would block the very event loop that must receive that client's `commit`. So the service
+  runs on a worker thread with its own file handle (still one process touching the file). The pin
+  table, the writer gate, the committed meta, and the written-index window live in a
+  `SharedArrayBuffer` that both threads update with `Atomics`. The engine thread waits on the gate
+  with `Atomics.wait`, and at each transaction begin it compares the shared committed `txid` with its
+  own (an atomic load, no syscall, so the alone fast path is unchanged). It adopts a client's commit
+  through the path today's shared mode uses for a foreign `txid`.
+- **Performance caveat.** The service worker reads pages through its own file handle, not the engine
+  thread's buffer pool, so clients of a TS owner are served from the OS page cache. Client page
+  fetches pay the thread handoff above. Both are slower than the Rust and Go owners and clients,
+  never different in results or cost. The benchmarks (§15) measure them.
+
+Not every core needs to serve: the browser has one process, and WASI has no OS file locks.
 
 **Endpoint mechanics (open):**
 
@@ -529,35 +557,37 @@ The native TS on Node row is undecided and blocks phase 4 (§17.7). Not every co
   and without publishing a meta.
 - **Benchmarks** ([benchmarks.md](benchmarks.md)): alone-owner fast path (no regression), client
   warm-cache and cold-cache reads, client commit latency, and SSH-latency scans with and without
-  read-ahead.
+  read-ahead, for each core as owner and as client (the TS worker-thread costs, §14, included).
 
 ## 16. Phases
 
 1. **Spec**: message catalog and framing (`spec/pageservice/`), byte fixtures, error registrations
    (`08006`, `08007`, `08P01`, `25P03`).
-2. **Read path** in Rust and Go: election, endpoint, `hello`/`begin_read`/`read_pages`/`end_read`,
-   client cache coherence, read-only clients.
+2. **Read path** in Rust, Go, and TS: election, endpoint,
+   `hello`/`begin_read`/`read_pages`/`end_read`, client cache coherence, read-only clients.
 3. **Write path**: writer gate, reuse grant, `commit` with validation, owner adoption, the
    reclamation rule, `commit_status`.
 4. **Handoff**: promotion, yield, graceful close, timeouts; the process-corpus rewrite; simulation
-   testing; retire shared mode and the `shared` option (only once §17.7 is decided); v2 bundle
-   migration.
+   testing; retire shared mode and the `shared` option; v2 bundle migration.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
    fetch.
 6. **Backup**: page-identical and compacted forms.
 7. **Replication**: the tee, retained log, `subscribe`, lineage and timelines (format change),
    replicas and read replicas; amend replication.md.
 
-Shared mode stays in place until phase 4 lands, so blue-green deploys keep working throughout.
+**The page service replaces shared mode; the two never run as alternatives.** Phases 2–3 are
+internal milestones, not releases of a second mode: blue-green deploys need promotion (phase 4),
+so until it lands shared mode remains what ships. The release that lands phase 4 switches `auto` to
+owner/client and removes shared mode in one step.
 
-**Coexistence during phases 2–3.** A v2 owner cannot honor v1 join windows: a v1 peer reading the
-file directly pins snapshots the owner cannot see, which breaks the reuse grant (§6) and cache
-coherence (§5.4). So until phase 4 the page service is opt-in per database through an explicit
-`locking = service` value, and `auto` keeps choosing shared mode. A `service` owner holds
-`presence EX` for its whole tenure and ignores the `arrival` doorbell, so a shared-mode opener of the
-same database times out with `55006`; a `service` opener that finds a shared-mode group holding
-`presence SH` fails `55006` too, as in §12. Mixing the two modes fails closed. Phase 4 makes `auto`
-mean owner/client and retires `shared`.
+Until then the service is reachable only through a test-only `locking = service` value that the
+process corpus and benchmarks use; `auto` keeps meaning shared mode. A service owner cannot honor
+shared-mode join windows (a joined peer reading the file directly pins snapshots the owner cannot
+see, which breaks the reuse grant, §6, and cache coherence, §5.4), so the two fail closed against
+each other. A service owner holds `presence EX` for its whole tenure and ignores the `arrival`
+doorbell, so a shared-mode opener times out with `55006`. A service opener that finds a shared-mode
+group holding `presence SH` fails `55006` too, as in §12. The test-only value is removed with
+shared mode (§12).
 
 ## 17. Open questions
 
@@ -570,22 +600,11 @@ mean owner/client and retires `shared`.
 5. **Freshness**: keep `begin_read` a round trip always (proposed), or allow an opt-in relaxed mode
    in which owner-pushed commit notices let a client begin locally?
 6. **Log-append failure policy**: break the stream and keep writing (proposed), or refuse writes?
-7. **Native TS on Node** (an architecture decision, needed before phase 4). Today Node takes part
-   in shared mode through `impl/ts/native-lock`, with release-blocking Rust↔Node and Go↔Node process
-   lanes ([locking.md](locking.md) §1, §9.2). As written, §14 leaves native TS on Node unable to
-   serve and only optionally a client, so retiring shared mode in phase 4 would remove Node
-   multi-process access and shrink the Layer 4 corpus to two cores. Pointing production Node at the
-   Rust bindings would reverse locking.md §8 (`impl/node` stays an experimental reach artifact) and
-   CLAUDE.md §2's full parity for the TS core. Options: build a native TS client (and possibly a
-   serving owner) before phase 4, or keep shared mode for TS.
-8. **Query-level protocol over SSH**: deferred. It would only win for very large scans or
+7. **Query-level protocol over SSH**: deferred. It would only win for very large scans or
    extractions where shipping rows beats shipping pages; the RAM-sized design target suggests batched
    page fetches cover most remote use.
-9. **Attachments**: each attached file has its own owner, so one process may own `main` and be a
+8. **Attachments**: each attached file has its own owner, so one process may own `main` and be a
    client of an attachment. The one-durable-writer-per-transaction rule is unchanged; confirm the
    writer-gate acquisition order across owners avoids deadlock (locking.md §6 orders by path today).
-10. **Client request timeout** for a live but stuck owner (§4.1): none (proposed: the accepted
-    cost), or a client-side timeout, and with which SQLSTATE?
-11. **Persisted-SQL compatibility** (§7): negotiate a persisted-SQL level at `hello` and refuse
-    persisting DDL from a client whose level exceeds the owner's, or make adoption structural and
-    defer parsing stored SQL to first use?
+9. **Client request timeout** for a live but stuck owner (§4.1): none (proposed: the accepted
+   cost), or a client-side timeout, and with which SQLSTATE?
