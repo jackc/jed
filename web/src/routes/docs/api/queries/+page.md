@@ -65,7 +65,7 @@ binds the array of `id`'s type, which is how you pass a list:
 
 On a primary key or an indexed column, `id = ANY($1)` looks up each element of the list, like
 `id IN (1, 3)` ([EXPLAIN](/docs/sql/explain) shows it as an interval set). On a composite primary key,
-`tenant = $1 AND id = ANY($2)` looks up each `(tenant, id)` pair.
+`tenant = $1 AND id = ANY($2)` looks up each `(tenant, id)` pair, and so does an index on `(tenant, id)`.
 
 Any container also binds from its text form, read like a string literal of that type: `'{1,3}'`,
 `'[1,5)'`, or `'(1,x)'`. To bind a range or composite value directly, pass the engine `Value`.

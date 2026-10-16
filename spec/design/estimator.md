@@ -443,6 +443,11 @@ weight; the owning base unit still counts the operation. Runtime metering remain
   consumed as a point member, §7.1's OR of `K` full-key equalities is then applied to that AND's
   rows, `K` the product of the point counts, so the estimate is `min(AND, K)`: never above the
   contiguous prefix bound the set narrows, nor above its probe count.
+  A multi-column index tuple set applies the same walk and AND over the index's key columns, each
+  member refined by its own column's statistics. The OR of `K` full-key equalities applies only to a
+  `UNIQUE` index with every key column consumed as a point member; a non-unique index keeps the AND.
+  A set that consumes only its leading column estimates as the leading-column interval set
+  (`uniquePoints` only for a single-column `UNIQUE` index).
   A LIMIT-aware candidate estimates only intervals it expects to start, in execution order.
 
 ### 8.2 Expressions and size-dependent work

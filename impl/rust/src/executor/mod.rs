@@ -6712,17 +6712,24 @@ pub(crate) struct TupleMember {
     point: bool,
 }
 
-/// The [`PkKeySet`] analog over a leading B-tree secondary-index column (indexes.md §5): each
-/// distinct encoded value becomes an index point probe (prefix scan + per-entry row lookup), and
-/// the rows are gathered in ascending value order. `tail_types` is the remaining key components'
-/// types (as in [`IndexBound`]) — the per-entry key-suffix skip.
+/// The [`PkKeySet`] analog over a B-tree secondary index whose keys are plain columns (indexes.md
+/// §5; cost.md §3 "Multi-column secondary indexes"): `tuple` is the consumed key columns in key
+/// order, walked as a composite-PK tuple set's members, and `col_types` is every key column's type —
+/// the per-entry key-suffix skip. A tuple of one member is the leading-column interval set.
+/// `all_fixed` reports that every key column is fixed-width, so the probes merge as the PK's do.
 pub(crate) struct IndexKeySet {
     name_key: String,
-    col_type: ScalarType,
-    coll: Option<std::sync::Arc<Collation>>,
-    tail_types: Vec<ScalarType>,
-    specs: Vec<IntervalSpec>,
-    clip: Vec<BoundTerm>,
+    tuple: Vec<TupleMember>,
+    col_types: Vec<ScalarType>,
+    all_fixed: bool,
+}
+
+/// One canonical index interval with its row-key suffix recovery: the known prefix byte length
+/// skipped first, then the width-skipped member slots after it.
+pub(crate) struct IndexProbe {
+    bound: KeyBound,
+    prefix_len: usize,
+    suffix: Vec<ScalarType>,
 }
 
 /// A per-relation scan bound (cost.md §3): a primary-key range, a secondary-index

@@ -297,18 +297,59 @@ func (ks *pkKeySetPlan) intervals(params []Value, outer []storedRow, left stored
 	return canonicalIntervalSet(ks.pkType, ks.specs, ks.clip, params, outer, ks.coll, left)
 }
 
-// indexKeySetPlan is the pkKeySetPlan analog over a leading B-tree secondary-index column
-// (indexes.md §5): each distinct encoded value becomes an index point probe (prefix scan +
-// per-entry row lookup), and the rows are gathered in ascending value order. tailTypes is
-// the remaining key components' types (as in indexBoundPlan) — the per-entry key-suffix
-// skip.
+// indexKeySetPlan is the pkKeySetPlan analog over a B-tree secondary index whose keys are plain
+// columns (indexes.md §5; cost.md §3 "Multi-column secondary indexes"): tuple is the consumed key
+// columns in key order, walked as a composite-PK tuple set's members, and colTypes is every key
+// column's type — the per-entry key-suffix skip. A tuple of one member is the leading-column
+// interval set. allFixed reports that every key column is fixed-width, so the probes merge as the
+// PK's do.
 type indexKeySetPlan struct {
-	nameKey   string
-	colType   scalarType
-	coll      *Collation
-	tailTypes []scalarType
-	specs     []intervalSpec
-	clip      []boundTerm
+	nameKey  string
+	tuple    []tupleMember
+	colTypes []scalarType
+	allFixed bool
+}
+
+// indexProbe is one canonical index interval with its row-key suffix recovery: the known prefix
+// byte length skipped first, then the width-skipped member slots after it.
+type indexProbe struct {
+	bound     keyBound
+	prefixLen int
+	suffix    []scalarType
+}
+
+// probes resolves the set's canonical index-key intervals for one execution, in index-key order.
+func (ks *indexKeySetPlan) probes(params []Value, outer []storedRow, left storedRow) []indexProbe {
+	prefixes, final, consumed, hasFinal := expandTuplePrefixes(ks.tuple, []byte{0x00}, params, outer, left)
+	var out []indexProbe
+	for _, p := range prefixes {
+		if !hasFinal {
+			out = append(out, indexProbe{bound: keyBound{lo: p, loInc: true, hi: prefixSuccessor(p)}, prefixLen: len(p), suffix: ks.colTypes[consumed:]})
+			continue
+		}
+		for _, iv := range final {
+			phys := indexLogicalInterval(iv)
+			b := keyBound{lo: concatKey(p, phys.lo), loInc: phys.loInc, hi: concatKey(p, phys.hi), hiInc: phys.hiInc}
+			if !boundEmpty(b) {
+				out = append(out, indexProbe{bound: b, prefixLen: len(p), suffix: ks.colTypes[consumed-1:]})
+			}
+		}
+	}
+	if !ks.allFixed || len(out) < 2 {
+		return out
+	}
+	// Every slot is fixed-width, so the merged intervals recover their suffix by width from the key's
+	// start.
+	bounds := make([]keyBound, len(out))
+	for i, pr := range out {
+		bounds[i] = pr.bound
+	}
+	merged := mergeKeyIntervals(bounds, true)
+	out = out[:0]
+	for _, b := range merged {
+		out = append(out, indexProbe{bound: b, suffix: ks.colTypes})
+	}
+	return out
 }
 
 func intervalPlanHasRange(specs []intervalSpec, clip []boundTerm) bool {
@@ -638,7 +679,9 @@ func selectLegacyScanCandidate(candidates []scanCandidate) *scanBound {
 		if c.identity.kind != scanCandidateBtree {
 			continue
 		}
-		if set := namedScanCandidate(candidates, scanCandidateIndexInterval, c.identity.indexName); set != nil && len(set.bound.indexSet.clip) > 0 {
+		// A same-index set with a clipped leading set, or one consuming more than the leading column,
+		// is contained in the contiguous bound, so it replaces it.
+		if set := namedScanCandidate(candidates, scanCandidateIndexInterval, c.identity.indexName); set != nil && (len(set.bound.indexSet.tuple[0].clip) > 0 || len(set.bound.indexSet.tuple) > 1) {
 			return set.bound
 		}
 		return c.bound
@@ -687,40 +730,41 @@ func scanBoundHasStorageOrder(bound *scanBound) bool {
 }
 
 func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx indexDef) *indexKeySetPlan {
-	if idx.Kind != indexBtree || idx.Predicate != nil {
+	if idx.Kind != indexBtree || idx.Predicate != nil || filter == nil {
 		return nil
 	}
 	cols := idx.columnOrdinals()
 	if cols == nil {
 		return nil
 	}
-	ci := cols[0]
-	ty, ok := rel.table.Columns[ci].Type.AsScalar()
-	if !ok {
+	members, hasSet := db.walkTupleMembers(flattenConjuncts(filter), rel, cols)
+	if !hasSet {
 		return nil
 	}
-	for _, c := range cols[1:] {
-		s, ok := rel.table.Columns[c].Type.AsScalar()
-		if !ok || !s.IsFixedWidth() {
-			return nil
+	if lead := members[0]; !lead.colType.IsFixedWidth() && intervalPlanHasRange(lead.specs, lead.clip) {
+		return nil
+	}
+	// Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
+	// first member after the leading one that may go unconsumed or be a range onward is width-skipped.
+	t := len(members)
+	for i := 1; i < len(members); i++ {
+		if members[i].specs != nil || !members[i].point {
+			t = i
+			break
 		}
 	}
-	coll, push := db.keyCollationCtx(rel.table.Columns[ci])
-	if !push {
-		return nil
+	colTypes := make([]scalarType, len(cols))
+	allFixed := true
+	for i, c := range cols {
+		s, ok := rel.table.Columns[c].Type.AsScalar()
+		fixed := ok && s.IsFixedWidth()
+		if !fixed && i >= t {
+			return nil
+		}
+		allFixed = allFixed && fixed
+		colTypes[i] = s
 	}
-	specs, clip := detectIntervalSet(filter, rel.offset+ci, ty, coll)
-	if specs == nil {
-		return nil
-	}
-	if intervalPlanHasRange(specs, clip) && !ty.IsFixedWidth() {
-		return nil
-	}
-	tail := make([]scalarType, 0, len(cols)-1)
-	for _, c := range cols[1:] {
-		tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
-	}
-	return &indexKeySetPlan{nameKey: idx.Name, colType: ty, coll: coll, tailTypes: tail, specs: specs, clip: clip}
+	return &indexKeySetPlan{nameKey: idx.Name, tuple: members, colTypes: colTypes, allFixed: allFixed}
 }
 
 // planMutationScan selects an UPDATE/DELETE target access path by cost (estimator.md §9.3): every
@@ -788,14 +832,28 @@ func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Coll
 }
 
 // detectTupleIntervalSet builds a composite-PK tuple interval set (cost.md §3 "Composite primary
-// keys"): members in key order, each with its own set (the first reducing OR/IN/ANY conjunct) and
-// clip (every direct comparison). A point member continues the walk; the first other member with a
-// set or clip is the final member and ends it. nil unless some consumed member has a set.
+// keys") over the PK members. nil unless some consumed member has a set.
 func (db *engine) detectTupleIntervalSet(filter *rExpr, rel scopeRel) *pkKeySetPlan {
 	pk := rel.table.PKIndices()
 	if len(pk) < 2 || filter == nil {
 		return nil
 	}
+	plan := &pkKeySetPlan{memberCount: len(pk), allFixed: true}
+	for _, ci := range pk {
+		if ty, ok := rel.table.Columns[ci].Type.AsScalar(); !ok || !ty.IsFixedWidth() {
+			plan.allFixed = false
+		}
+	}
+	members, hasSet := db.walkTupleMembers(flattenConjuncts(filter), rel, pk)
+	if !hasSet {
+		return nil
+	}
+	plan.tuple = members
+	return plan
+}
+
+// flattenConjuncts lists the top-level AND-chain's conjuncts in order.
+func flattenConjuncts(filter *rExpr) []*rExpr {
 	var conjuncts []*rExpr
 	var flatten func(*rExpr)
 	flatten = func(e *rExpr) {
@@ -807,14 +865,15 @@ func (db *engine) detectTupleIntervalSet(filter *rExpr, rel scopeRel) *pkKeySetP
 		conjuncts = append(conjuncts, e)
 	}
 	flatten(filter)
-	plan := &pkKeySetPlan{memberCount: len(pk), allFixed: true}
-	for _, ci := range pk {
-		if ty, ok := rel.table.Columns[ci].Type.AsScalar(); !ok || !ty.IsFixedWidth() {
-			plan.allFixed = false
-		}
-	}
-	hasSet := false
-	for _, ci := range pk {
+	return conjuncts
+}
+
+// walkTupleMembers walks key columns cols in key order as tuple-set members (cost.md §3 "Composite
+// primary keys"), each with its own set (the first reducing OR/IN/ANY conjunct) and clip (every
+// direct comparison). A point member continues the walk; the first other member with a set or clip
+// is the final member and ends it. hasSet reports that some consumed member has a set.
+func (db *engine) walkTupleMembers(conjuncts []*rExpr, rel scopeRel, cols []int) (members []tupleMember, hasSet bool) {
+	for _, ci := range cols {
 		ty, ok := rel.table.Columns[ci].Type.AsScalar()
 		if !ok {
 			break
@@ -853,20 +912,17 @@ func (db *engine) detectTupleIntervalSet(filter *rExpr, rel scopeRel) *pkKeySetP
 		m := tupleMember{name: rel.table.Columns[ci].Name, column: ci, colType: ty, coll: coll, specs: specs, clip: clip}
 		if hasEq || (specs != nil && pointSpecs(specs)) {
 			m.point = true
-			plan.tuple = append(plan.tuple, m)
+			members = append(members, m)
 			hasSet = hasSet || specs != nil
 			continue
 		}
 		if specs != nil || len(clip) > 0 {
-			plan.tuple = append(plan.tuple, m)
+			members = append(members, m)
 			hasSet = hasSet || specs != nil
 		}
 		break
 	}
-	if !hasSet {
-		return nil
-	}
-	return plan
+	return members, hasSet
 }
 
 // pointSpecs reports whether every disjunct is a point: an `= ANY` array or a conjunction of
@@ -1874,15 +1930,14 @@ func concatKey(p, k []byte) []byte {
 	return append(append(out, p...), k...)
 }
 
-// tupleIntervalSet resolves a composite-PK tuple set (cost.md §3): the cartesian product of the
-// point members' keys as prefixes, each a tuple point, a prefix range, or the final member's
-// intervals under it, then canonicalized. A later member with more than one point that would take
-// the running product over maxKeySetProbes ends the walk unconsumed.
-func tupleIntervalSet(ks *pkKeySetPlan, params []Value, outer []storedRow, left storedRow) []keyBound {
-	prefixes := [][]byte{nil}
-	var final []keyBound
-	hasFinal, consumed := false, 0
-	for i, m := range ks.tuple {
+// expandTuplePrefixes evaluates a tuple set's members in key order (cost.md §3): the cartesian
+// product of the point members' keys, each preceded by tag, as prefixes in byte order, and the
+// final member's canonical logical intervals when it is consumed. A later member with more than one
+// point that would take the running product over maxKeySetProbes ends the walk unconsumed. An empty
+// member empties the set: no prefixes.
+func expandTuplePrefixes(tuple []tupleMember, tag []byte, params []Value, outer []storedRow, left storedRow) (prefixes [][]byte, final []keyBound, consumed int, hasFinal bool) {
+	prefixes = [][]byte{nil}
+	for i, m := range tuple {
 		var count int
 		var points [][]byte
 		if m.point {
@@ -1893,7 +1948,7 @@ func tupleIntervalSet(ks *pkKeySetPlan, params []Value, outer []storedRow, left 
 			count = len(final)
 		}
 		if count == 0 {
-			return nil
+			return nil, nil, 0, false
 		}
 		if i > 0 && count > 1 && count > maxKeySetProbes/len(prefixes) {
 			final = nil
@@ -1907,11 +1962,19 @@ func tupleIntervalSet(ks *pkKeySetPlan, params []Value, outer []storedRow, left 
 		next := make([][]byte, 0, len(prefixes)*count)
 		for _, p := range prefixes {
 			for _, k := range points {
-				next = append(next, concatKey(p, k))
+				key := make([]byte, 0, len(p)+len(tag)+len(k))
+				next = append(next, append(append(append(key, p...), tag...), k...))
 			}
 		}
 		prefixes = next
 	}
+	return prefixes, final, consumed, hasFinal
+}
+
+// tupleIntervalSet resolves a composite-PK tuple set (cost.md §3): each prefix a tuple point, a
+// prefix range, or the final member's intervals under it, then canonicalized.
+func tupleIntervalSet(ks *pkKeySetPlan, params []Value, outer []storedRow, left storedRow) []keyBound {
+	prefixes, final, consumed, hasFinal := expandTuplePrefixes(ks.tuple, nil, params, outer, left)
 	complete := consumed == ks.memberCount && !hasFinal
 	out := make([]keyBound, 0, len(prefixes)*max(1, len(final)))
 	for _, p := range prefixes {
@@ -1973,8 +2036,7 @@ func (db *engine) pkKeySetRows(store *tableStore, ks *pkKeySetPlan, params []Val
 	return entries, pages, slabs, nil
 }
 
-// indexKeySetRows maps canonical logical intervals into the secondary index's present-value key
-// space. Each admitted index entry point-looks-up the table row; the complete WHERE remains residual.
+// indexKeySetRows probes the set's canonical intervals in the secondary index's key space. Each admitted index entry point-looks-up the table row; the complete WHERE remains residual.
 func (db *engine) indexKeySetRows(tableName string, ks *indexKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (rows []storedRow, pages, slabs int, err error) {
 	entries, pages, slabs, err := db.indexKeySetEntries(tableName, ks, params, outer, mask, left)
 	if err != nil {
@@ -1988,15 +2050,8 @@ func (db *engine) indexKeySetRows(tableName string, ks *indexKeySetPlan, params 
 }
 
 func (db *engine) indexKeySetEntries(tableName string, ks *indexKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (entries []entry, pages, slabs int, err error) {
-	for _, logical := range canonicalIntervalSet(ks.colType, ks.specs, ks.clip, params, outer, ks.coll, left) {
-		physical := indexLogicalInterval(logical)
-		suffix, prefixLen := ks.tailTypes, 0
-		if logical.lo != nil && logical.hi != nil && logical.loInc && logical.hiInc && bytes.Equal(logical.lo, logical.hi) {
-			prefixLen = 1 + len(logical.lo)
-		} else {
-			suffix = append([]scalarType{ks.colType}, suffix...)
-		}
-		r, p, sl, err := db.indexScanBoundEntries(tableName, ks.nameKey, suffix, physical, prefixLen, mask)
+	for _, pr := range ks.probes(params, outer, left) {
+		r, p, sl, err := db.indexScanBoundEntries(tableName, ks.nameKey, pr.suffix, pr.bound, pr.prefixLen, mask)
 		if err != nil {
 			return nil, 0, 0, err
 		}

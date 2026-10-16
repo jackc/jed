@@ -960,15 +960,16 @@ func (db *engine) statisticsTupleMemberSelectivity(m *tupleMember, rel scopeRel)
 	}
 }
 
-// tupleSetSelectivity estimates a composite-PK tuple set (estimator.md §8.1): the execution's member
-// walk over estimated counts; zero if a consumed member is empty; otherwise the AND of member
-// estimates in key order, then — when every member is consumed as a point — the OR of K full-key
-// equalities over that, so the rows are min(AND, K).
-func tupleSetSelectivity(ks *pkKeySetPlan, member func(*tupleMember) selectivityExpr) selectivityExpr {
+// tupleSetSelectivity estimates a composite-PK or index tuple set (estimator.md §8.1): the
+// execution's member walk over estimated counts; zero if a consumed member is empty; otherwise the
+// AND of member estimates in key order, then — when the key is unique and every one of its
+// memberCount members is consumed as a point — the OR of K full-key equalities over that, so the
+// rows are min(AND, K).
+func tupleSetSelectivity(tuple []tupleMember, memberCount int, unique bool, member func(*tupleMember) selectivityExpr) selectivityExpr {
 	product := int64(1)
 	consumed, allPoints := 0, true
-	for i := range ks.tuple {
-		m := &ks.tuple[i]
+	for i := range tuple {
+		m := &tuple[i]
 		if tupleMemberEmpty(m) {
 			return selectivityExpr{kind: selectivityZero}
 		}
@@ -980,11 +981,11 @@ func tupleSetSelectivity(ks *pkKeySetPlan, member func(*tupleMember) selectivity
 		consumed++
 		allPoints = allPoints && m.point
 	}
-	result := member(&ks.tuple[0])
+	result := member(&tuple[0])
 	for i := 1; i < consumed; i++ {
-		result = result.And(member(&ks.tuple[i]))
+		result = result.And(member(&tuple[i]))
 	}
-	if allPoints && consumed == ks.memberCount {
+	if unique && allPoints && consumed == memberCount {
 		parts := make([]selectivityExpr, product)
 		for i := range parts {
 			parts[i] = selectivityExpr{kind: selectivityUnique}
@@ -1059,18 +1060,24 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 		}
 	case scanCandidatePKInterval:
 		if candidate.bound.pkSet.tuple != nil {
-			return tupleSetSelectivity(candidate.bound.pkSet, structuralTupleMemberSelectivity)
+			ks := candidate.bound.pkSet
+			return tupleSetSelectivity(ks.tuple, ks.memberCount, true, structuralTupleMemberSelectivity)
 		}
 		return intervalSelectivity(candidate.bound.pkSet.specs, candidate.bound.pkSet.clip, true, candidate.bound.pkSet.pkType)
 	case scanCandidateIndexInterval:
 		unique := false
 		for _, idx := range rel.table.Indexes {
 			if idx.Name == candidate.identity.indexName {
-				unique = idx.Unique && len(idx.Keys) == 1
+				unique = idx.Unique
 				break
 			}
 		}
-		return intervalSelectivity(candidate.bound.indexSet.specs, candidate.bound.indexSet.clip, unique, candidate.bound.indexSet.colType)
+		ks := candidate.bound.indexSet
+		if len(ks.tuple) > 1 {
+			return tupleSetSelectivity(ks.tuple, len(ks.colTypes), unique, structuralTupleMemberSelectivity)
+		}
+		lead := ks.tuple[0]
+		return intervalSelectivity(lead.specs, lead.clip, unique && len(ks.colTypes) == 1, lead.colType)
 	default:
 		return selectivityExpr{kind: selectivityAll}
 	}
@@ -1179,7 +1186,8 @@ func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandida
 		return result
 	case scanCandidatePKInterval:
 		if candidate.bound.pkSet.tuple != nil {
-			return tupleSetSelectivity(candidate.bound.pkSet, func(m *tupleMember) selectivityExpr {
+			ks := candidate.bound.pkSet
+			return tupleSetSelectivity(ks.tuple, ks.memberCount, true, func(m *tupleMember) selectivityExpr {
 				return db.statisticsTupleMemberSelectivity(m, rel)
 			})
 		}
@@ -1204,7 +1212,13 @@ func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandida
 			return structural
 		}
 		bound := candidate.bound.indexSet
-		return db.intervalSelectivityWithStatistics(bound.specs, bound.clip, index.Unique && len(index.Keys) == 1, bound.colType, column, rel)
+		if len(bound.tuple) > 1 {
+			return tupleSetSelectivity(bound.tuple, len(bound.colTypes), index.Unique, func(m *tupleMember) selectivityExpr {
+				return db.statisticsTupleMemberSelectivity(m, rel)
+			})
+		}
+		lead := bound.tuple[0]
+		return db.intervalSelectivityWithStatistics(lead.specs, lead.clip, index.Unique && len(index.Keys) == 1, lead.colType, column, rel)
 	default:
 		return structural
 	}

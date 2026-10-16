@@ -860,6 +860,17 @@ test('the explain page shows a composite-key tuple set', async ({ page }) => {
   );
 });
 
+test('the explain page shows a multi-column index tuple set', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // EXPLAIN ... WHERE store = 3 AND sku = ANY(ARRAY[7, 42, 99]) over an index on (store, sku): one
+  // index probe per (store, sku) pair (cost.md §3 "Multi-column secondary indexes").
+  const panel = livePanel(page, 'indexTupleSet');
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan sale');
+  await expect(panel.getByTestId('result-rows')).toContainText(
+    'Index interval set: using sale_store_sku (store, sku); intervals=1; arrays=1'
+  );
+});
+
 test('the explain page shows the index-nested-loop access path on a join', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
   // The demo authors city first, but P7 physically drives trip and makes city the per-outer-row

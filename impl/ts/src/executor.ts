@@ -5960,13 +5960,17 @@ export class Engine {
           this.firstPKColName(tableName) +
           intervalSpecsLabel(b.pkSet.specs)
         );
-      case "indexSet":
+      case "indexSet": {
+        const tuple = b.indexSet.tuple;
+        const members = tuple.length > 1 ? " (" + tuple.map((m) => m.name).join(", ") + ")" : "";
         return (
           prefix +
           "Index interval set: using " +
           b.indexSet.nameKey +
-          intervalSpecsLabel(b.indexSet.specs)
+          members +
+          intervalSpecsLabel(tuple.flatMap((m) => m.specs ?? []))
         );
+      }
     }
   }
 
@@ -9940,30 +9944,13 @@ export class Engine {
     const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
-    for (const logical of canonicalIntervalSet(
-      ks.colType,
-      ks.specs,
-      ks.clip,
-      params,
-      outer,
-      ks.coll,
-      left,
-    )) {
-      const physical = indexLogicalInterval(logical);
-      const point =
-        logical.lo !== null &&
-        logical.hi !== null &&
-        logical.loInc &&
-        logical.hiInc &&
-        bytesEq(logical.lo, logical.hi);
-      const suffixTypes = point ? ks.tailTypes : [ks.colType, ...ks.tailTypes];
-      const prefixLen = point ? 1 + logical.lo!.length : 0;
+    for (const probe of indexKeySetProbes(ks, params, outer, left)) {
       const r = this.indexScanBoundEntries(
         tableName,
         ks.nameKey,
-        suffixTypes,
-        physical,
-        prefixLen,
+        probe.suffix,
+        probe.bound,
+        probe.prefixLen,
         mask,
       );
       for (const entry of r.entries) entries.push(entry);
@@ -18862,25 +18849,8 @@ export class Engine {
     } else if (sb.kind === "indexSet") {
       if (canPull) {
         const ks = sb.indexSet;
-        for (const logical of canonicalIntervalSet(
-          ks.colType,
-          ks.specs,
-          ks.clip,
-          params,
-          env.outer,
-          ks.coll,
-          [],
-        )) {
-          const physical = indexLogicalInterval(logical);
-          const point =
-            logical.lo !== null &&
-            logical.hi !== null &&
-            logical.loInc &&
-            logical.hiInc &&
-            bytesEq(logical.lo, logical.hi);
-          const suffix = point ? ks.tailTypes : [ks.colType, ...ks.tailTypes];
-          const prefixLen = point ? 1 + logical.lo!.length : 0;
-          if (!scanIndex(ks.nameKey, physical, prefixLen, suffix)) break;
+        for (const probe of indexKeySetProbes(ks, params, env.outer, [])) {
+          if (!scanIndex(ks.nameKey, probe.bound, probe.prefixLen, probe.suffix)) break;
         }
       }
     } else if (sb.kind === "gin" || sb.kind === "gist") {
@@ -22537,16 +22507,21 @@ export type TupleMember = {
 // it, so the unmetered cartesian expansion stays input-linear.
 export const MAX_KEY_SET_PROBES = 65536;
 
-// IndexKeySet is the PkKeySet analog over a leading B-tree secondary-index column. tailTypes names
-// the remaining key components used to recover each table storage-key suffix.
+// IndexKeySet is the PkKeySet analog over a B-tree secondary index whose keys are plain columns
+// (indexes.md §5; cost.md §3 "Multi-column secondary indexes"): tuple is the consumed key columns in
+// key order, walked as a composite-PK tuple set's members, and colTypes is every key column's type —
+// the per-entry key-suffix skip. A tuple of one member is the leading-column interval set. allFixed
+// reports that every key column is fixed-width, so the probes merge as the PK's do.
 export type IndexKeySet = {
   nameKey: string;
-  colType: ScalarType;
-  coll: Collation | null;
-  tailTypes: ScalarType[];
-  specs: IntervalSpec[];
-  clip: BoundTerm[];
+  tuple: TupleMember[];
+  colTypes: ScalarType[];
+  allFixed: boolean;
 };
+
+// IndexProbe is one canonical index interval with its row-key suffix recovery: the known prefix byte
+// length skipped first, then the width-skipped member slots after it.
+export type IndexProbe = { bound: KeyBound; prefixLen: number; suffix: ScalarType[] };
 
 // GistBound is the plan-time result for one eligible GiST index (spec/design/gist.md §5): its descent
 // strategy and the column's global scope index. The inventory owns one plan per eligible index; the
@@ -24391,7 +24366,12 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       );
     case "pkSet":
       if (bound.pkSet.tuple !== undefined) {
-        return tupleSetSelectivity(bound.pkSet, structuralTupleMemberSelectivity);
+        return tupleSetSelectivity(
+          bound.pkSet.tuple,
+          bound.pkSet.memberCount!,
+          true,
+          structuralTupleMemberSelectivity,
+        );
       }
       return estimatorIntervalSelectivity(
         bound.pkSet.specs,
@@ -24403,11 +24383,22 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       const index = rel.table.indexes.find(
         (definition) => definition.name === candidate.identity.indexName,
       );
+      const ks = bound.indexSet;
+      const unique = index?.unique === true;
+      if (ks.tuple.length > 1) {
+        return tupleSetSelectivity(
+          ks.tuple,
+          ks.colTypes.length,
+          unique,
+          structuralTupleMemberSelectivity,
+        );
+      }
+      const lead = ks.tuple[0]!;
       return estimatorIntervalSelectivity(
-        bound.indexSet.specs,
-        bound.indexSet.clip,
-        index?.unique === true && index.keys.length === 1,
-        bound.indexSet.colType,
+        lead.specs ?? [],
+        lead.clip,
+        unique && ks.colTypes.length === 1,
+        lead.colType,
       );
     }
   }
@@ -24476,15 +24467,17 @@ function statisticsTupleMemberSelectivity(
   );
 }
 
-// tupleSetSelectivity estimates a composite-PK tuple set (estimator.md §8.1): the execution's member
-// walk over estimated counts; zero if a consumed member is empty; otherwise the AND of member
-// estimates in key order, then — when every member is consumed as a point — the OR of K full-key
-// equalities over that, so the rows are min(AND, K).
+// tupleSetSelectivity estimates a composite-PK or index tuple set (estimator.md §8.1): the
+// execution's member walk over estimated counts; zero if a consumed member is empty; otherwise the
+// AND of member estimates in key order, then — when the key is unique and every one of its
+// memberCount members is consumed as a point — the OR of K full-key equalities over that, so the
+// rows are min(AND, K).
 function tupleSetSelectivity(
-  ks: PkKeySet,
+  tuple: TupleMember[],
+  memberCount: number,
+  unique: boolean,
   member: (m: TupleMember) => Selectivity,
 ): Selectivity {
-  const tuple = ks.tuple!;
   let product = 1;
   let consumed = 0;
   let allPoints = true;
@@ -24499,7 +24492,7 @@ function tupleSetSelectivity(
   }
   let result = member(tuple[0]!);
   for (let i = 1; i < consumed; i++) result = andSelectivity(result, member(tuple[i]!));
-  if (allPoints && consumed === ks.memberCount) {
+  if (unique && allPoints && consumed === memberCount) {
     const parts: Selectivity[] = [];
     for (let i = 0; i < product; i++) parts.push({ kind: "unique" });
     result = andSelectivity(result, orSelectivities(parts));
@@ -24596,7 +24589,7 @@ function estimatorCandidateSelectivityWithStatistics(
     }
     case "pkSet": {
       if (bound.pkSet.tuple !== undefined) {
-        return tupleSetSelectivity(bound.pkSet, (m) =>
+        return tupleSetSelectivity(bound.pkSet.tuple, bound.pkSet.memberCount!, true, (m) =>
           statisticsTupleMemberSelectivity(m, rel, engine),
         );
       }
@@ -24618,11 +24611,18 @@ function estimatorCandidateSelectivityWithStatistics(
       );
       const key = index?.keys[0];
       if (index === undefined || key?.kind !== "column") return structural;
+      const ks = bound.indexSet;
+      if (ks.tuple.length > 1) {
+        return tupleSetSelectivity(ks.tuple, ks.colTypes.length, index.unique, (m) =>
+          statisticsTupleMemberSelectivity(m, rel, engine),
+        );
+      }
+      const lead = ks.tuple[0]!;
       return estimatorIntervalSelectivityWithStatistics(
-        bound.indexSet.specs,
-        bound.indexSet.clip,
+        lead.specs ?? [],
+        lead.clip,
         index.unique && index.keys.length === 1,
-        bound.indexSet.colType,
+        lead.colType,
         key.column,
         rel,
         engine,
@@ -24871,7 +24871,12 @@ export function selectLegacyScanCandidate(candidates: ScanCandidate[]): ScanBoun
   for (const candidate of candidates) {
     if (candidate.identity.kind !== "btree") continue;
     const set = namedScanCandidate(candidates, "index_interval", candidate.identity.indexName);
-    if (set?.bound?.kind === "indexSet" && set.bound.indexSet.clip.length > 0) {
+    // A same-index set with a clipped leading set, or one consuming more than the leading column, is
+    // contained in the contiguous bound, so it replaces it.
+    if (
+      set?.bound?.kind === "indexSet" &&
+      (set.bound.indexSet.tuple[0]!.clip.length > 0 || set.bound.indexSet.tuple.length > 1)
+    ) {
       return set.bound;
     }
     return candidate.bound;
@@ -24925,27 +24930,29 @@ function buildIndexIntervalSetPlan(
   if (idx.kind !== "btree" || idx.predicate !== undefined) return null;
   const cols = indexColumnOrdinals(idx);
   if (cols === null) return null;
-  const ci = cols[0]!;
-  const ty = typeAsScalar(rel.table.columns[ci]!.type);
-  if (ty === undefined) return null;
-  if (
-    cols.slice(1).some((c) => {
-      const t = typeAsScalar(rel.table.columns[c]!.type);
-      return t === undefined || !isFixedWidth(t);
-    })
-  )
-    return null;
-  const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
-  if (ctx === null) return null;
-  const set = detectIntervalSet(filter, rel.offset + ci, ty, ctx.coll);
-  if (set === null || (intervalPlanHasRange(set.specs, set.clip) && !isFixedWidth(ty))) return null;
-  return {
-    nameKey: idx.name,
-    colType: ty,
-    coll: ctx.coll,
-    tailTypes: cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type)),
-    ...set,
-  };
+  const { tuple, hasSet } = walkTupleMembers(flattenConjuncts(filter), rel, cols, snap);
+  if (!hasSet) return null;
+  const lead = tuple[0]!;
+  if (!isFixedWidth(lead.colType) && intervalPlanHasRange(lead.specs ?? [], lead.clip)) return null;
+  // Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
+  // first member after the leading one that may go unconsumed or be a range onward is width-skipped.
+  let t = tuple.length;
+  for (let i = 1; i < tuple.length; i++) {
+    if (tuple[i]!.specs !== null || !tuple[i]!.point) {
+      t = i;
+      break;
+    }
+  }
+  const colTypes: ScalarType[] = [];
+  let allFixed = true;
+  for (let i = 0; i < cols.length; i++) {
+    const ty = typeAsScalar(rel.table.columns[cols[i]!]!.type);
+    const fixed = ty !== undefined && isFixedWidth(ty);
+    if (!fixed && i >= t) return null;
+    allFixed = allFixed && fixed;
+    colTypes.push(typeScalar(rel.table.columns[cols[i]!]!.type));
+  }
+  return { nameKey: idx.name, tuple, colTypes, allFixed };
 }
 
 // Find the first top-level conjunct that is a pure OR of same-key intervals. Other direct same-key
@@ -24996,9 +25003,7 @@ export function detectIntervalSet(
 }
 
 // detectTupleIntervalSet builds a composite-PK tuple interval set (cost.md §3 "Composite primary
-// keys"): members in key order, each with its own set (the first reducing OR/IN/ANY conjunct) and
-// clip (every direct comparison). A point member continues the walk; the first other member with a
-// set or clip is the final member and ends it. null unless some consumed member has a set.
+// keys") over the PK members. null unless some consumed member has a set.
 export function detectTupleIntervalSet(
   filter: RExpr | null,
   rel: ScopeRel,
@@ -25006,6 +25011,25 @@ export function detectTupleIntervalSet(
 ): PkKeySet | null {
   const pk = pkIndices(rel.table);
   if (pk.length < 2 || filter === null) return null;
+  const allFixed = pk.every((ci) => {
+    const ty = typeAsScalar(rel.table.columns[ci]!.type);
+    return ty !== undefined && isFixedWidth(ty);
+  });
+  const { tuple, hasSet } = walkTupleMembers(flattenConjuncts(filter), rel, pk, snap);
+  if (!hasSet) return null;
+  return {
+    pkType: tuple[0]!.colType,
+    coll: null,
+    specs: [],
+    clip: [],
+    tuple,
+    memberCount: pk.length,
+    allFixed,
+  };
+}
+
+// flattenConjuncts lists the top-level AND-chain's conjuncts in order.
+function flattenConjuncts(filter: RExpr): RExpr[] {
   const conjuncts: RExpr[] = [];
   const flatten = (e: RExpr): void => {
     if (e.kind === "and") {
@@ -25016,13 +25040,22 @@ export function detectTupleIntervalSet(
     conjuncts.push(e);
   };
   flatten(filter);
-  const allFixed = pk.every((ci) => {
-    const ty = typeAsScalar(rel.table.columns[ci]!.type);
-    return ty !== undefined && isFixedWidth(ty);
-  });
+  return conjuncts;
+}
+
+// walkTupleMembers walks key columns cols in key order as tuple-set members (cost.md §3 "Composite
+// primary keys"), each with its own set (the first reducing OR/IN/ANY conjunct) and clip (every
+// direct comparison). A point member continues the walk; the first other member with a set or clip
+// is the final member and ends it. hasSet reports that some consumed member has a set.
+function walkTupleMembers(
+  conjuncts: RExpr[],
+  rel: ScopeRel,
+  cols: number[],
+  snap: Snapshot,
+): { tuple: TupleMember[]; hasSet: boolean } {
   const tuple: TupleMember[] = [];
   let hasSet = false;
-  for (const ci of pk) {
+  for (const ci of cols) {
     const column = rel.table.columns[ci]!;
     const ty = typeAsScalar(column.type);
     if (ty === undefined) break;
@@ -25054,16 +25087,7 @@ export function detectTupleIntervalSet(
     tuple.push({ name: column.name, column: ci, colType: ty, coll: ctx.coll, specs, clip, point });
     if (!point) break;
   }
-  if (!hasSet) return null;
-  return {
-    pkType: tuple[0]!.colType,
-    coll: null,
-    specs: [],
-    clip: [],
-    tuple,
-    memberCount: pk.length,
-    allFixed,
-  };
+  return { tuple, hasSet };
 }
 
 // pointSpecs reports whether every disjunct is a point: an `= ANY` array or a conjunction of
@@ -28214,12 +28238,18 @@ function finalMemberIntervals(m: TupleMember, params: Value[], outer: Row[], lef
   return b === null ? [] : [b];
 }
 
-// tupleIntervalSet resolves a composite-PK tuple set (cost.md §3): the cartesian product of the point
-// members' keys as prefixes, each a tuple point, a prefix range, or the final member's intervals
-// under it, then canonicalized. A later member with more than one point that would take the running
-// product over MAX_KEY_SET_PROBES ends the walk unconsumed.
-function tupleIntervalSet(ks: PkKeySet, params: Value[], outer: Row[], left: Row): KeyBound[] {
-  const tuple = ks.tuple!;
+// expandTuplePrefixes evaluates a tuple set's members in key order (cost.md §3): the cartesian
+// product of the point members' keys, each preceded by tag, as prefixes in byte order, and the final
+// member's canonical logical intervals when it is consumed. A later member with more than one point
+// that would take the running product over MAX_KEY_SET_PROBES ends the walk unconsumed. An empty
+// member empties the set: null.
+function expandTuplePrefixes(
+  tuple: TupleMember[],
+  tag: Uint8Array,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): { prefixes: Uint8Array[]; finalIntervals: KeyBound[]; consumed: number; hasFinal: boolean } | null {
   let prefixes: Uint8Array[] = [new Uint8Array(0)];
   let finalIntervals: KeyBound[] = [];
   let hasFinal = false;
@@ -28229,7 +28259,7 @@ function tupleIntervalSet(ks: PkKeySet, params: Value[], outer: Row[], left: Row
     const points = m.point ? memberPoints(m, params, outer, left) : [];
     const intervals = m.point ? [] : finalMemberIntervals(m, params, outer, left);
     const count = m.point ? points.length : intervals.length;
-    if (count === 0) return [];
+    if (count === 0) return null;
     if (i > 0 && count > 1 && count > Math.floor(MAX_KEY_SET_PROBES / prefixes.length)) break;
     consumed++;
     if (!m.point) {
@@ -28239,10 +28269,19 @@ function tupleIntervalSet(ks: PkKeySet, params: Value[], outer: Row[], left: Row
     }
     const next: Uint8Array[] = [];
     for (const p of prefixes) {
-      for (const k of points) next.push(concatBytes([p, k]));
+      for (const k of points) next.push(concatBytes([p, tag, k]));
     }
     prefixes = next;
   }
+  return { prefixes, finalIntervals, consumed, hasFinal };
+}
+
+// tupleIntervalSet resolves a composite-PK tuple set (cost.md §3): each prefix a tuple point, a
+// prefix range, or the final member's intervals under it, then canonicalized.
+function tupleIntervalSet(ks: PkKeySet, params: Value[], outer: Row[], left: Row): KeyBound[] {
+  const expanded = expandTuplePrefixes(ks.tuple!, new Uint8Array(0), params, outer, left);
+  if (expanded === null) return [];
+  const { prefixes, finalIntervals, consumed, hasFinal } = expanded;
   const complete = consumed === ks.memberCount && !hasFinal;
   const out: KeyBound[] = [];
   for (const p of prefixes) {
@@ -28271,6 +28310,48 @@ function tupleIntervalSet(ks: PkKeySet, params: Value[], outer: Row[], left: Row
     }
   }
   return mergeKeyIntervals(out, ks.allFixed === true);
+}
+
+// indexKeySetProbes resolves an index tuple set's canonical index-key intervals for one execution,
+// in index-key order (cost.md §3 "Multi-column secondary indexes").
+function indexKeySetProbes(
+  ks: IndexKeySet,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): IndexProbe[] {
+  const expanded = expandTuplePrefixes(ks.tuple, new Uint8Array([0x00]), params, outer, left);
+  if (expanded === null) return [];
+  const { prefixes, finalIntervals, consumed, hasFinal } = expanded;
+  const out: IndexProbe[] = [];
+  for (const p of prefixes) {
+    if (!hasFinal) {
+      out.push({
+        bound: { lo: p, loInc: true, hi: prefixSuccessor(p), hiInc: false },
+        prefixLen: p.length,
+        suffix: ks.colTypes.slice(consumed),
+      });
+      continue;
+    }
+    for (const iv of finalIntervals) {
+      const phys = indexLogicalInterval(iv);
+      const b: KeyBound = {
+        lo: phys.lo === null ? null : concatBytes([p, phys.lo]),
+        loInc: phys.loInc,
+        hi: phys.hi === null ? null : concatBytes([p, phys.hi]),
+        hiInc: phys.hiInc,
+      };
+      if (!boundEmpty(b))
+        out.push({ bound: b, prefixLen: p.length, suffix: ks.colTypes.slice(consumed - 1) });
+    }
+  }
+  if (!ks.allFixed || out.length < 2) return out;
+  // Every slot is fixed-width, so the merged intervals recover their suffix by width from the key's
+  // start.
+  return mergeKeyIntervals(
+    out.map((probe) => probe.bound),
+    true,
+  ).map((bound) => ({ bound, prefixLen: 0, suffix: ks.colTypes }));
 }
 
 export function indexLogicalInterval(logical: KeyBound): KeyBound {

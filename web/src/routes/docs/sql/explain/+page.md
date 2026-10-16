@@ -44,6 +44,17 @@ INSERT INTO stock
   FROM generate_series(1, 10) AS s, generate_series(1, 500) AS k;`;
 	const tupleSet = `EXPLAIN SELECT sku, qty FROM stock
 WHERE store = 3 AND sku = ANY(ARRAY[7, 42, 99]);`;
+	const saleSeed = `CREATE TABLE sale (
+  id    i32 PRIMARY KEY,
+  store i32 NOT NULL,
+  sku   i32 NOT NULL
+);
+INSERT INTO sale
+  SELECT g, (g - 1) % 10 + 1, (g - 1) / 10 + 1
+  FROM generate_series(1, 5000) AS g;
+CREATE INDEX sale_store_sku ON sale (store, sku);`;
+	const indexTupleSet = `EXPLAIN SELECT id FROM sale
+WHERE store = 3 AND sku = ANY(ARRAY[7, 42, 99]);`;
 	const indexNestedLoop = `EXPLAIN SELECT c.name
 FROM city c JOIN trip t ON c.id = t.city_id;`;
 	const hashJoin = `EXPLAIN SELECT c.name, t.id
@@ -201,6 +212,15 @@ later member, the set scans each listed prefix, so `store IN (1, 2)` reads both 
 the work bounded, a list is used only while the number of combinations stays at or below 65,536.
 
 <LiveSql demo="tupleSet" seed={stockSeed} query={tupleSet} rows={8} />
+
+A multi-column secondary index takes the same lists over its columns in index order. With an index on
+`(store, sku)`, the same `WHERE` looks up each `(store, sku)` pair in the index and fetches only those
+rows. The detail lists the index columns the set covers after the index name. To find each entry's
+row, jed needs every index column from the first non-leading column with a list or range onward to
+have a fixed-width type, so a `text` column there (even one the query does not mention) leaves only
+the plain index bound; a `text` column before it is fine.
+
+<LiveSql demo="indexTupleSet" seed={saleSeed} query={indexTupleSet} rows={8} />
 
 ## An index-nested-loop join
 

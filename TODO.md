@@ -216,9 +216,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     probe the cartesian product of the point members' keys, with a final range member mapped under
     each prefix, capped at `MAX_KEY_SET_PROBES` combinations. →
     [cost.md §3](spec/design/cost.md) "Composite primary keys", [estimator.md §8.1](spec/design/estimator.md)
-    - [ ] _follow-on:_ the same tuple set over a multi-column secondary B-tree index (today an index
-      interval set uses only its leading column), and an index-nested-loop sibling column as a
-      member's point source. _(size: M)_
+    - [x] _follow-on:_ the same tuple set over a multi-column secondary B-tree index (an index on
+      `(a, b)` probes `(a, b)` prefixes for `a = 1 AND b = ANY($1)`; key columns from the first later
+      set or range onward stay fixed-width for row-key suffix recovery). → [cost.md §3](spec/design/cost.md)
+      "Multi-column secondary indexes"
+    - [ ] _follow-on:_ an index-nested-loop sibling column as a tuple-set member's point source
+      (PK and index). _(size: S)_
+    - [ ] _follow-on:_ a variable-width (`text`) index column at or after the first later set or
+      range — today it leaves only the plain index bound, since the row-key suffix is recovered by
+      width-skipping those slots; skipping a self-delimiting slot by decoding would lift it. _(size: S)_
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
     composite/array/json/jsonb, GIN term statistics for `<@`, and an element-count

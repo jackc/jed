@@ -1165,7 +1165,17 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 		}
 		return prefix + "PK interval set: " + db.firstPKColName(tableName) + intervalSpecsLabel(b.pkSet.specs)
 	case b.indexSet != nil:
-		return prefix + "Index interval set: using " + b.indexSet.nameKey + intervalSpecsLabel(b.indexSet.specs)
+		var specs []intervalSpec
+		names := make([]string, len(b.indexSet.tuple))
+		for i, m := range b.indexSet.tuple {
+			names[i] = m.name
+			specs = append(specs, m.specs...)
+		}
+		members := ""
+		if len(names) > 1 {
+			members = " (" + strings.Join(names, ", ") + ")"
+		}
+		return prefix + "Index interval set: using " + b.indexSet.nameKey + members + intervalSpecsLabel(specs)
 	default:
 		return "Full scan"
 	}

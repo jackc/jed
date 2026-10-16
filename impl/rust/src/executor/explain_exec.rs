@@ -1126,11 +1126,24 @@ impl Engine {
                 self.first_pk_col_name(table_name),
                 interval_specs_label(&ks.specs)
             ),
-            Some(ScanBound::IndexSet(ks)) => format!(
-                "{prefix}Index interval set: using {}{}",
-                ks.name_key,
-                interval_specs_label(&ks.specs)
-            ),
+            Some(ScanBound::IndexSet(ks)) => {
+                let specs: Vec<&IntervalSpec> = ks
+                    .tuple
+                    .iter()
+                    .flat_map(|m| m.specs.iter().flatten())
+                    .collect();
+                let members = if ks.tuple.len() > 1 {
+                    let names: Vec<&str> = ks.tuple.iter().map(|m| m.name.as_str()).collect();
+                    format!(" ({})", names.join(", "))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{prefix}Index interval set: using {}{members}{}",
+                    ks.name_key,
+                    interval_specs_label(specs)
+                )
+            }
         }
     }
 

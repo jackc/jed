@@ -567,15 +567,47 @@ point-set/range intersection).
   UPDATE/DELETE share the path, LIMIT streaming pulls the intervals in order, and the PK's storage
   order makes `ORDER BY` on a PK prefix elidable as for a single key. Wherever the legacy
   fixed-policy selector still applies (the initial per-relation bounds of a join), a tuple set
-  replaces the contiguous PK bound, which it is always contained in. Secondary indexes still take
-  only their leading column's set; a multi-column index tuple set is a follow-on.
+  replaces the contiguous PK bound, which it is always contained in.
+- **Multi-column secondary indexes — index tuple interval sets** (`query.composite_key_set`). A
+  B-tree secondary index whose keys are all plain columns `(c1, …, cn)` and which is not partial takes
+  the same member walk over its key columns instead of its leading column's set alone, so on an index
+  over `(a, b)`, `a = 1 AND b = ANY($1)` probes `(1, b)` for each element instead of the whole `a = 1`
+  index prefix. Point members, the final member, the candidate's existence (some consumed member has
+  a set), the `MAX_KEY_SET_PROBES` cap, and the per-prefix intervals are the composite-PK rules above,
+  spelled in the index's nullable-slot key space (indexes.md §3): a member's point is the present
+  slot `0x00 || key`, a prefix `P` concatenates them, and a final interval maps to the present-value
+  range of its slot under `P` exactly as a leading-column interval does (never the member's NULL
+  slot). Three rules differ from the PK:
+  - **No tuple point.** An index entry's key is the member slots followed by the row's storage key,
+    so even with every member consumed as a point the prefix gives `[P, prefix-successor(P))`.
+  - **Suffix eligibility.** Each admitted entry's row storage key is recovered by skipping the
+    probe's known prefix and then width-skipping every remaining member slot (a lone `0x01` NULL tag,
+    or `0x00` + the fixed width), so a member that may be skipped must be fixed-width. Let `t` be the
+    position of the first consumed member after the leading one that has a set or is the final member
+    (the number of consumed members if none): every key column at position `t` or later must be a
+    fixed-width scalar, and a leading member whose set or clip holds a non-equality comparison must
+    be fixed-width too. Otherwise the index has no interval-set candidate. A variable-width point
+    member before `t` is fine: its probe bytes are known. With only the leading member consumed this
+    is the earlier leading-column rule.
+  - **Canonicalization.** When every key column is fixed-width the tuple intervals are sorted and
+    merged as the PK's are, byte-adjacent closed intervals included. Otherwise they are not merged
+    across prefixes: the prefixes are distinct self-delimiting byte strings, so their interval groups
+    are already disjoint and in byte order, and each group's final intervals are already canonical.
+
+  Each admitted index entry point-fetches its table row, as for any index bound, and cost is the sum
+  of the canonical intervals' bounded index scans plus those fetches. The probes run in index-key
+  order, so a same-index `ORDER BY` stays elidable; SELECT, UPDATE/DELETE, and LIMIT streaming share
+  the path; and the legacy fixed-policy selector prefers an index tuple set over the same index's
+  contiguous bound, which contains it. A set that consumes only the leading column is the
+  leading-column interval set above, with the same intervals and cost.
 
 A canonical interval-set bound takes the **eager materialize path** — the single-table streaming / columnar
 / vectorized-aggregate fast paths (which each interpret only a single contiguous bound) gate **off**
 it, exactly as they do an index / GIN / GiST bound. `spec/conformance/suites/query/or_in_point_lookup.test`
 pins point costs cross-core; `query/interval_set.test` pins clipping, range union, overlap merging,
-and fallbacks. Secondary-index range intervals retain the ordered-index fixed-width leading/tail
-eligibility needed to recover row-key suffixes; variable-width leading range unions fall back.
+and fallbacks. Secondary-index range intervals retain the ordered-index fixed-width eligibility
+needed to recover row-key suffixes (the suffix rule above); variable-width leading range unions fall
+back. `query/composite_key_set.test` pins the PK and index tuple sets.
 
 ### Index-bounded scan — a secondary index narrows a base-relation scan
 

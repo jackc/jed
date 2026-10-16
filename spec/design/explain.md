@@ -127,7 +127,10 @@ Attributes are separated by `; `. A node with no attributes is `-`.
   and a following `arrays=K` (only when `K > 0`) counts those that are `key = ANY(array)` arrays,
   whose points are known only at execution ([cost.md §3](cost.md)). For a composite-PK tuple set,
   `<key>` is the consumed members' names in key order joined by `, ` (`PK interval set: tenant, id;
-  intervals=1; arrays=1`), and `N`/`K` sum over every member's set. Bound operators are `= <> < > <= >=`; sources are
+  intervals=1; arrays=1`), and `N`/`K` sum over every member's set. A multi-column index tuple set
+  that consumes more than its leading column follows the index name with the consumed members in
+  key order, parenthesized and joined by `, ` (`Index interval set: using t_a_b (a, b); intervals=1;
+  arrays=1`); one that consumes only its leading column keeps the plain spelling. Bound operators are `= <> < > <= >=`; sources are
   `$N`, `outer`, or canonical literals. A float bound is its PostgreSQL `float8out` text
   ([float.md](float.md) §9) rather than the old `<float>` placeholder.
 - `touched=K` is the exact number of statically referenced stored columns. It is emitted for SELECT

@@ -1,0 +1,356 @@
+# Multi-column secondary-index tuple interval sets (spec/design/cost.md §3 "Multi-column secondary
+# indexes"). A B-tree index over plain columns walks its key columns as a composite PK's tuple set
+# does: on an index over `(a, b)`, `a = 1 AND b = ANY($1)` probes `(1, b)` for each element instead of
+# the whole `a = 1` index prefix. Each probe is a prefix range of the index (the entry's key ends with
+# the row's storage key), and each admitted entry point-fetches its table row. The whole WHERE stays
+# the residual filter, so the rows are unchanged and only the cost drops.
+#
+# `ix` is 1,200 rows (three `a` values of 400 `b` values); the table and its index each have a
+# two-level tree, so an index probe charges 2 page_read plus 2 per fetched row. Rows verified against
+# the live PostgreSQL 18 oracle; the costs are jed-owned, so the `# cost:` lines are the cross-core
+# pin. The plans are pinned by EXPLAIN in index_key_set_explain.test.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_multi_row, dml.insert_select, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.index_range, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, expr.between, query.aggregates, maintenance.analyze, func.array_quantified, func.array, query.set_returning, types.array, cast.array, types.i32, types.i64, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE ix (id i64 PRIMARY KEY, a i32, b i64, v i64)
+
+statement ok
+INSERT INTO ix SELECT (t - 1) * 400 + i, t, i, t * 1000 + i FROM generate_series(1, 3) AS t, generate_series(1, 400) AS i
+
+statement ok
+CREATE INDEX ix_ab ON ix (a, b)
+
+# --- trailing-member point sets --------------------------------------------------------------------
+
+# Equality on the leading column and an array on the trailing one: three index probes, one a miss.
+# The plain `a = 1` index bound would fetch all 400 of its rows.
+# cost: 25
+query I rowsort
+SELECT v FROM ix WHERE a = 1 AND b = ANY(ARRAY[2, 4, 900])
+----
+1002
+1004
+
+# The IN spelling reads the same probes.
+# cost: 25
+query I rowsort
+SELECT v FROM ix WHERE a = 1 AND b IN (2, 4, 900)
+----
+1002
+1004
+
+# A bound list.
+# params: 2, ARRAY[1, 3]
+# cost: 21
+query I rowsort
+SELECT v FROM ix WHERE a = $1 AND b = ANY($2)
+----
+2001
+2003
+
+# --- leading-member point sets ---------------------------------------------------------------------
+
+# A set on the leading column and an equality on the trailing one: one probe per `a`.
+# cost: 21
+query I rowsort
+SELECT v FROM ix WHERE a IN (1, 3) AND b = 7
+----
+1007
+3007
+
+# Sets on both columns probe their cartesian product: {1,2} × {2,9} = 4 probes.
+# cost: 52
+query I rowsort
+SELECT v FROM ix WHERE a = ANY(ARRAY[1, 2]) AND b IN (2, 9)
+----
+1002
+1009
+2002
+2009
+
+# Every column is fixed-width, so byte-adjacent probes merge: b in {5, 6, 7} is one index range.
+# cost: 32
+query I rowsort
+SELECT v FROM ix WHERE a = 2 AND b IN (5, 6, 7)
+----
+2005
+2006
+2007
+
+# --- a final range member --------------------------------------------------------------------------
+
+# A range on the trailing column maps under every leading point.
+# cost: 38
+query I rowsort
+SELECT v FROM ix WHERE a IN (1, 3) AND b >= 399
+----
+1399
+1400
+3399
+3400
+
+# A range union on the trailing column.
+# cost: 34
+query I rowsort
+SELECT v FROM ix WHERE a = 1 AND (b < 2 OR b BETWEEN 200 AND 201)
+----
+1001
+1200
+1201
+
+# --- clipping, NULLs, empty sets -------------------------------------------------------------------
+
+# A same-column range clips the points: only 5 and 9 survive b > 2.
+# cost: 29
+query I rowsort
+SELECT v FROM ix WHERE a = 3 AND b IN (1, 5, 9) AND b > 2
+----
+3005
+3009
+
+# A NULL element contributes no probe.
+# cost: 11
+query I rowsort
+SELECT v FROM ix WHERE a = 1 AND b = ANY(ARRAY[8, NULL])
+----
+1008
+
+# An empty array empties the set: nothing is read.
+# cost: 0
+query I rowsort
+SELECT v FROM ix WHERE a = 1 AND b = ANY('{}'::i64[])
+----
+
+# --- order, LIMIT, mutation ------------------------------------------------------------------------
+
+# The probes come out in index-key order, so ORDER BY the index needs no sort.
+# cost: 87
+query II nosort
+SELECT a, b FROM ix WHERE a IN (1, 2, 3) AND b = ANY(ARRAY[30, 10]) ORDER BY a, b
+----
+1
+10
+1
+30
+2
+10
+2
+30
+3
+10
+3
+30
+
+# With a LIMIT the probes stream and stop after the third row.
+# cost: 39
+query I nosort
+SELECT v FROM ix WHERE a IN (2, 3) AND b = ANY(ARRAY[30, 10]) ORDER BY a, b LIMIT 3
+----
+2010
+2030
+3010
+
+# UPDATE and DELETE share the path.
+# cost: 19
+statement ok
+UPDATE ix SET v = 0 WHERE a = 2 AND b IN (1, 3)
+
+# cost: 48
+statement ok
+DELETE FROM ix WHERE a IN (1, 3) AND b = ANY(ARRAY[1, 4])
+
+query III nosort
+SELECT a, b, v FROM ix WHERE b <= 4 ORDER BY a, b
+----
+1
+2
+1002
+1
+3
+1003
+2
+1
+0
+2
+2
+2002
+2
+3
+0
+2
+4
+2004
+3
+2
+3002
+3
+3
+3003
+
+# --- duplicates in a non-unique index --------------------------------------------------------------
+
+# Each `(a, b)` holds two rows; a probe is the whole `(a, b)` prefix, so it fetches both.
+statement ok
+CREATE TABLE dup (id i64 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO dup SELECT g, (g - 1) / 400 + 1, ((g - 1) % 400) / 2 + 1 FROM generate_series(1, 1200) AS g
+
+statement ok
+CREATE INDEX dup_ab ON dup (a, b)
+
+# cost: 38
+query III rowsort
+SELECT id, a, b FROM dup WHERE a = 2 AND b IN (3, 150)
+----
+405
+2
+3
+406
+2
+3
+699
+2
+150
+700
+2
+150
+
+# --- a unique index --------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE uq (id i64 PRIMARY KEY, a i32, b i32, v i32)
+
+statement ok
+INSERT INTO uq SELECT g, (g - 1) / 400 + 1, (g - 1) % 400 + 1, g FROM generate_series(1, 1200) AS g
+
+statement ok
+CREATE UNIQUE INDEX uq_ab ON uq (a, b)
+
+# cost: 48
+query I rowsort
+SELECT v FROM uq WHERE a IN (1, 3) AND b IN (10, 20)
+----
+10
+20
+810
+820
+
+# --- variable-width columns ------------------------------------------------------------------------
+
+# A text column's slot is self-delimiting, so its points concatenate in byte order. The row-key
+# suffix is recovered past each probe's known prefix and the fixed-width columns after it, so a text
+# column may be a point member only before the first later set.
+statement ok
+CREATE TABLE ev (id i64 PRIMARY KEY, region text, day i32, seq i32)
+
+statement ok
+INSERT INTO ev SELECT row_number() OVER (ORDER BY r, d, s), r, d, s FROM (VALUES ('east'), ('north'), ('west')) AS rg(r), generate_series(1, 20) AS d, generate_series(1, 20) AS s
+
+statement ok
+CREATE INDEX ev_rds ON ev (region, day, seq)
+
+# A leading text set, then sets on the fixed-width columns after it: 2 × 2 × 1 = 4 probes.
+# cost: 74
+query TII rowsort
+SELECT region, day, seq FROM ev WHERE region IN ('west', 'east') AND day IN (1, 2) AND seq = 1
+----
+east
+1
+1
+east
+2
+1
+west
+1
+1
+west
+2
+1
+
+# A final range on the third column.
+# cost: 50
+query TII rowsort
+SELECT region, day, seq FROM ev WHERE region = ANY(ARRAY['west', 'north']) AND day = 2 AND seq > 18
+----
+north
+2
+19
+north
+2
+20
+west
+2
+19
+west
+2
+20
+
+statement ok
+CREATE TABLE tm (id i64 PRIMARY KEY, a i32, s text, c i32)
+
+statement ok
+INSERT INTO tm SELECT row_number() OVER (ORDER BY a, s, c), a, s, c FROM generate_series(1, 3) AS a, (VALUES ('x'), ('y'), ('z')) AS t(s), generate_series(1, 100) AS c
+
+statement ok
+CREATE INDEX tm_asc ON tm (a, s, c)
+
+# Without statistics the estimator reads `a = 2 AND s = 'y'` as one of 900 rows, so the plain prefix
+# bound ties the tuple set and wins the canonical order; ANALYZE shows the prefix holds 100 rows.
+statement ok
+ANALYZE tm
+
+# A text equality between fixed-width members: `s` is a single known point, so `c`'s set is consumed.
+# cost: 25
+query III rowsort
+SELECT a, c, id FROM tm WHERE a = 2 AND s = 'y' AND c IN (7, 70)
+----
+2
+7
+407
+2
+70
+470
+
+# A set on the text column would leave its slot to be width-skipped under a capped walk, so the index
+# has no tuple set, and its plain `a = 2` bound would fetch a third of the table: a full scan is
+# cheaper. The rows are the same.
+# cost: 4608
+query III rowsort
+SELECT a, c, id FROM tm WHERE a = 2 AND s IN ('x', 'y') AND c = 7
+----
+2
+7
+307
+2
+7
+407
+
+# --- the probe cap ---------------------------------------------------------------------------------
+
+# Three 40-element sets give 40 × 40 × 40 = 64,000 probes, within MAX_KEY_SET_PROBES (65,536), so all
+# three columns are consumed; under each `(a, b)` prefix the consecutive `c` points 101..139 merge,
+# leaving 3,200 ranges. With 41 elements, 41 × 41 × 41 = 68,921 is over the cap, so `c` is not
+# consumed (its array stays residual) and the 1,681 `(a, b)` prefixes are scanned instead, merging
+# into 82 ranges. The rows are the same.
+statement ok
+CREATE TABLE wide (id i64 PRIMARY KEY, a i32, b i32, c i32)
+
+statement ok
+INSERT INTO wide SELECT (x - 1) * 100 + (y - 1) * 10 + z, x, y, z FROM generate_series(1, 10) AS x, generate_series(1, 10) AS y, generate_series(1, 10) AS z
+
+statement ok
+CREATE INDEX wide_abc ON wide (a, b, c)
+
+# cost: 6412
+query I nosort
+SELECT id FROM wide WHERE a = ANY('{1,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139}'::i32[]) AND b = ANY('{1,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139}'::i32[]) AND c = ANY('{1,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139}'::i32[])
+----
+1
+
+# cost: 635
+query I nosort
+SELECT id FROM wide WHERE a = ANY('{1,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140}'::i32[]) AND b = ANY('{1,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140}'::i32[]) AND c = ANY('{1,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140}'::i32[])
+----
+1

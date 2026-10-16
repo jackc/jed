@@ -101,8 +101,8 @@ impl Engine {
         Ok((entries, (pages, slabs)))
     }
 
-    /// Map canonical logical intervals into the secondary index's present-value key space. Each
-    /// admitted index entry point-looks-up the table row in deterministic byte-key order.
+    /// Probe the set's canonical intervals in the secondary index's key space. Each admitted index
+    /// entry point-looks-up the table row in deterministic byte-key order.
     pub(crate) fn index_key_set_rows(
         &self,
         table_name: &str,
@@ -129,33 +129,13 @@ impl Engine {
         let mut rows: Vec<(Vec<u8>, Row)> = Vec::new();
         let mut pages = 0usize;
         let mut slabs = 0usize;
-        for logical in canonical_interval_set(
-            ks.col_type,
-            &ks.specs,
-            &ks.clip,
-            params,
-            outer,
-            ks.coll.as_deref(),
-            left,
-        ) {
-            let physical = index_logical_interval(&logical);
-            let point = logical.lo.is_some()
-                && logical.lo == logical.hi
-                && logical.lo_inc
-                && logical.hi_inc;
-            let mut suffix_types = ks.tail_types.clone();
-            let prefix_len = if point {
-                1 + logical.lo.as_ref().unwrap().len()
-            } else {
-                suffix_types.insert(0, ks.col_type);
-                0
-            };
+        for probe in ks.probes(params, outer, left) {
             let (r, (p, s)) = self.index_scan_bound_entries(
                 table_name,
                 &ks.name_key,
-                &suffix_types,
-                &physical,
-                prefix_len,
+                &probe.suffix,
+                &probe.bound,
+                probe.prefix_len,
                 mask,
             )?;
             rows.extend(r);

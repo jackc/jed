@@ -1,7 +1,6 @@
 package jed
 
 import (
-	"bytes"
 	"sync"
 	"sync/atomic"
 )
@@ -1293,15 +1292,8 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	case sb.indexSet != nil:
 		if canPull {
 			ks := sb.indexSet
-			for _, logical := range canonicalIntervalSet(ks.colType, ks.specs, ks.clip, params, env.outer, ks.coll, nil) {
-				physical := indexLogicalInterval(logical)
-				suffix, prefixLen := ks.tailTypes, 0
-				if logical.lo != nil && logical.hi != nil && logical.loInc && logical.hiInc && bytes.Equal(logical.lo, logical.hi) {
-					prefixLen = 1 + len(logical.lo)
-				} else {
-					suffix = append([]scalarType{ks.colType}, suffix...)
-				}
-				more, err := scanIndexInterval(ks.nameKey, physical, prefixLen, suffix, true)
+			for _, pr := range ks.probes(params, env.outer, nil) {
+				more, err := scanIndexInterval(ks.nameKey, pr.bound, pr.prefixLen, pr.suffix, true)
 				if err != nil {
 					return selectResult{}, err
 				}

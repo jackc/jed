@@ -377,27 +377,9 @@ impl Engine {
             }
             Some(ScanBound::IndexSet(ks)) => {
                 if can_pull {
-                    for logical in canonical_interval_set(
-                        ks.col_type,
-                        &ks.specs,
-                        &ks.clip,
-                        params,
-                        env.outer,
-                        ks.coll.as_deref(),
-                        &[],
-                    ) {
-                        let physical = index_logical_interval(&logical);
-                        let point = logical.lo.is_some()
-                            && logical.lo == logical.hi
-                            && logical.lo_inc
-                            && logical.hi_inc;
-                        let mut suffix = ks.tail_types.clone();
-                        let prefix_len = if point {
-                            1 + logical.lo.as_ref().unwrap().len()
-                        } else {
-                            suffix.insert(0, ks.col_type);
-                            0
-                        };
+                    for probe in ks.probes(params, env.outer, &[]) {
+                        let (physical, prefix_len, suffix) =
+                            (probe.bound, probe.prefix_len, probe.suffix);
                         let istore = self.index_store(&ks.name_key);
                         let (overlap, slabs) = istore.overlap_scan_units(&physical, &[])?;
                         meter.charge(

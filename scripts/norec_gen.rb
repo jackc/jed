@@ -65,6 +65,12 @@
 #              point members' keys, with a final range member mapped under each prefix. Spelling
 #              each key member as `col + 0` full-scans. Point, prefix-range, final-range, NULL,
 #              duplicate, absent, and empty-array shapes and a mutation end state must all agree.
+#   index_key_set — the composite_key_set walk over a multi-column secondary B-tree index
+#              (cost.md §3 "Multi-column secondary indexes"): each prefix an index prefix range whose
+#              entries point-fetch their rows, over a non-unique index with duplicate keys and a text
+#              point column between fixed-width ones. Spelling each key column as `col + 0`
+#              full-scans. Point, prefix-range, final-range, NULL, duplicate, absent, and empty-array
+#              shapes and a mutation end state must all agree.
 #   bounded_limit — LIMIT/OFFSET windows over PK interval sets, a compatible ordered secondary-index
 #              bound, and a GIN candidate gather match semantically-equivalent unbounded spellings.
 #              This checks that stopping table work early never changes the chosen result window.
@@ -355,6 +361,14 @@ COMPOSITE_KEY_SET_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primar
                            query.interval_set query.any_array_point_lookup query.composite_key_set
                            func.array_quantified types.array cast.array expr.in_list expr.arithmetic
                            types.i32 null.three_valued].freeze
+INDEX_KEY_SET_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                       dml.insert_multi_row dml.update query.select query.where_eq
+                       query.comparison_order query.order_by query.logical_connectives
+                       query.point_lookup query.index_range query.index_mutation
+                       query.or_in_point_lookup query.interval_set query.any_array_point_lookup
+                       query.composite_key_set maintenance.analyze func.array_quantified types.array
+                       cast.array expr.in_list expr.arithmetic types.i32 types.text
+                       null.three_valued].freeze
 BOUNDED_LIMIT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.gin_index dml.insert
                        dml.insert_multi_row query.select query.comparison_order query.logical_connectives
                        query.order_by query.order_by_keys query.limit query.offset query.index_range
@@ -1629,6 +1643,79 @@ def gen_composite_key_set(seed)
   out << "# tuple-set and full-scan mutation end states"
   q(out, "III", "SELECT t, id, w FROM c ORDER BY t, id", flat.call(updated))
   q(out, "III", "SELECT t, id, w FROM c_scan ORDER BY t, id", flat.call(updated))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: multi-column secondary-index tuple interval sets ---------------------------------
+def gen_index_key_set(seed)
+  rng = Random.new(seed)
+  # Each (t, k) holds one or two rows, so an index probe's prefix range may fetch several.
+  rows = []
+  (1..4).each do |t|
+    (1..30).to_a.sample(18, random: rng).sort.each do |k|
+      rng.rand(1..2).times { rows << [rows.size + 1, t, k, %w[a b c].sample(random: rng), rng.rand(-50..50)] }
+    end
+  end
+  flat = ->(rs) { rs.flat_map { |id, t, k, s, w| [id.to_s, t.to_s, k.to_s, s, w.to_s] } }
+  where = ->(&blk) { flat.call(rows.select { |_id, t, k, s, _w| blk.call(t, k, s) }) }
+
+  out = header(seed, INDEX_KEY_SET_REQ, "multi-column secondary-index tuple interval sets vs full scan")
+  values = rows.map { |id, t, k, s, w| "(#{id}, #{t}, #{k}, '#{s}', #{w})" }.join(', ')
+  stmt(out, "CREATE TABLE x (id i32 PRIMARY KEY, t i32, k i32, s text, w i32)")
+  stmt(out, "INSERT INTO x VALUES #{values}")
+  stmt(out, "CREATE INDEX x_tk ON x (t, k)")
+  stmt(out, "CREATE INDEX x_tsk ON x (t, s, k)")
+  stmt(out, "ANALYZE x")
+
+  # The bare columns lower to an index tuple set; `{T}`/`{K}`/`{S}` spelled `col + 0` (or `s || ''`)
+  # full-scans.
+  pair = lambda do |title, pred, exp|
+    out << "# #{title}"
+    bare = pred.gsub('{T}', 't').gsub('{K}', 'k').gsub('{S}', 's')
+    scan = pred.gsub('{T}', '(t + 0)').gsub('{K}', '(k + 0)').gsub('{S}', "(s || '')")
+    q(out, "IIITI", "SELECT id, t, k, s, w FROM x WHERE #{bare} ORDER BY id", exp)
+    q(out, "IIITI", "SELECT id, t, k, s, w FROM x WHERE #{scan} ORDER BY id", exp)
+  end
+
+  ts = (1..4).to_a.sample(2, random: rng).sort
+  t1 = ts[0]
+  present = rows.select { |_id, t, _k, _s, _w| t == t1 }.map { |_id, _t, k, _s, _w| k }.uniq
+  absent = ((1..30).to_a - present).sample(random: rng)
+  picks = present.sample(3, random: rng)
+  elems = (picks + [absent, picks[0]]).shuffle(random: rng)
+  pair.call("equality then an array with an absent element and a duplicate",
+            "{T} = #{t1} AND {K} = ANY(ARRAY[#{elems.join(', ')}])",
+            where.call { |t, k, _s| t == t1 && elems.include?(k) })
+  ks = (1..30).to_a.sample(4, random: rng)
+  pair.call("cartesian product of two IN sets", "{T} IN (#{ts.join(', ')}) AND {K} IN (#{ks.join(', ')})",
+            where.call { |t, k, _s| ts.include?(t) && ks.include?(k) })
+  k1 = rng.rand(1..30)
+  pair.call("a leading array and a trailing equality", "{T} = ANY(ARRAY[#{ts.join(', ')}, NULL]) AND {K} = #{k1}",
+            where.call { |t, k, _s| ts.include?(t) && k == k1 })
+  lo = rng.rand(10..25)
+  pair.call("a final range member", "{T} IN (#{ts.join(', ')}) AND {K} >= #{lo}",
+            where.call { |t, k, _s| ts.include?(t) && k >= lo })
+  a, b = [rng.rand(1..12), rng.rand(18..30)]
+  pair.call("a final range union", "{T} = #{t1} AND ({K} < #{a} OR {K} > #{b})",
+            where.call { |t, k, _s| t == t1 && (k < a || k > b) })
+  pair.call("a clipped point set", "{T} = #{t1} AND {K} IN (#{ks.join(', ')}) AND {K} > #{ks.min}",
+            where.call { |t, k, _s| t == t1 && ks.include?(k) && k > ks.min })
+  s1 = %w[a b c].sample(random: rng)
+  pair.call("a text point column between fixed-width ones", "{T} = #{t1} AND {S} = '#{s1}' AND {K} IN (#{ks.join(', ')})",
+            where.call { |t, k, s| t == t1 && s == s1 && ks.include?(k) })
+  pair.call("a set on the text column", "{T} IN (#{ts.join(', ')}) AND {S} IN ('a', '#{s1}') AND {K} = #{k1}",
+            where.call { |t, k, s| ts.include?(t) && ['a', s1].include?(s) && k == k1 })
+  pair.call("an empty array", "{T} IN (#{ts.join(', ')}) AND {K} = ANY('{}'::i32[])", [])
+
+  stmt(out, "CREATE TABLE x_scan (id i32 PRIMARY KEY, t i32, k i32, s text, w i32)")
+  stmt(out, "INSERT INTO x_scan VALUES #{values}")
+  stmt(out, "UPDATE x SET w = w + 1000 WHERE t IN (#{ts.join(', ')}) AND k = ANY(ARRAY[#{ks.join(', ')}])")
+  stmt(out, "UPDATE x_scan SET w = w + 1000 WHERE t + 0 IN (#{ts.join(', ')}) AND k + 0 = ANY(ARRAY[#{ks.join(', ')}])")
+  updated = rows.map { |id, t, k, s, w| [id, t, k, s, ts.include?(t) && ks.include?(k) ? w + 1000 : w] }
+  out << "# tuple-set and full-scan mutation end states"
+  q(out, "IIITI", "SELECT id, t, k, s, w FROM x ORDER BY id", flat.call(updated))
+  q(out, "IIITI", "SELECT id, t, k, s, w FROM x_scan ORDER BY id", flat.call(updated))
 
   out.join("\n") + "\n"
 end
@@ -4551,6 +4638,7 @@ SCENARIOS = {
   "interval_set" => method(:gen_interval_set),
   "any_array" => method(:gen_any_array),
   "composite_key_set" => method(:gen_composite_key_set),
+  "index_key_set" => method(:gen_index_key_set),
   "bounded_limit" => method(:gen_bounded_limit),
   "topk" => method(:gen_topk),
   "hash_join" => method(:gen_hash_join),

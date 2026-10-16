@@ -1282,13 +1282,38 @@ fn estimator_candidate_selectivity(
         Some(ScanBound::Gin(bound)) => selectivity_class(bound.strategy.access_method()),
         Some(ScanBound::PkSet(bound)) => pk_set_structural_selectivity(bound),
         Some(ScanBound::IndexSet(bound)) => {
-            let unique = rel.table.indexes.iter().any(|index| {
-                index.name == identity.index_name && index.unique && index.keys.len() == 1
-            });
-            estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
+            let unique = rel
+                .table
+                .indexes
+                .iter()
+                .any(|index| index.name == identity.index_name && index.unique);
+            index_set_structural_selectivity(bound, unique)
         }
         None => Selectivity::All,
     }
+}
+
+/// An index interval set's structural access selectivity: the leading-column interval estimate, or
+/// the tuple-set walk over the index's key columns. `unique` is the index's UNIQUE flag.
+fn index_set_structural_selectivity(
+    bound: &IndexKeySet,
+    unique: bool,
+) -> crate::estimator::Selectivity {
+    if bound.tuple.len() > 1 {
+        return tuple_set_selectivity(
+            &bound.tuple,
+            bound.col_types.len(),
+            unique,
+            structural_tuple_member_selectivity,
+        );
+    }
+    let lead = &bound.tuple[0];
+    estimator_interval_selectivity(
+        lead.specs.as_deref().unwrap_or_default(),
+        &lead.clip,
+        unique && bound.col_types.len() == 1,
+        lead.col_type,
+    )
 }
 
 /// A PK interval set's structural access selectivity: the single-key interval estimate, or the
@@ -1297,7 +1322,12 @@ fn pk_set_structural_selectivity(bound: &PkKeySet) -> crate::estimator::Selectiv
     if bound.tuple.is_empty() {
         estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
     } else {
-        tuple_set_selectivity(bound, structural_tuple_member_selectivity)
+        tuple_set_selectivity(
+            &bound.tuple,
+            bound.member_count,
+            true,
+            structural_tuple_member_selectivity,
+        )
     }
 }
 
@@ -1375,19 +1405,21 @@ fn statistics_tuple_member_selectivity(
     }
 }
 
-/// Estimate a composite-PK tuple set (estimator.md §8.1): the execution's member walk over
+/// Estimate a composite-PK or index tuple set (estimator.md §8.1): the execution's member walk over
 /// estimated counts; zero if a consumed member is empty; otherwise the AND of member estimates in
-/// key order, then — when every member is consumed as a point — the OR of K full-key equalities
-/// over that, so the rows are min(AND, K).
+/// key order, then — when the key is unique and every one of its `member_count` members is consumed
+/// as a point — the OR of K full-key equalities over that, so the rows are min(AND, K).
 fn tuple_set_selectivity(
-    ks: &PkKeySet,
+    tuple: &[TupleMember],
+    member_count: usize,
+    unique: bool,
     member: impl Fn(&TupleMember) -> crate::estimator::Selectivity,
 ) -> crate::estimator::Selectivity {
     use crate::estimator::Selectivity;
     let mut product = 1i64;
     let mut consumed = 0usize;
     let mut all_points = true;
-    for (i, m) in ks.tuple.iter().enumerate() {
+    for (i, m) in tuple.iter().enumerate() {
         if tuple_member_empty(m) {
             return Selectivity::Zero;
         }
@@ -1402,11 +1434,11 @@ fn tuple_set_selectivity(
         consumed += 1;
         all_points = all_points && m.point;
     }
-    let mut result = member(&ks.tuple[0]);
-    for m in &ks.tuple[1..consumed] {
+    let mut result = member(&tuple[0]);
+    for m in &tuple[1..consumed] {
         result = result.and(member(m));
     }
-    if all_points && consumed == ks.member_count {
+    if unique && all_points && consumed == member_count {
         let parts = (0..product).map(|_| Selectivity::Unique).collect();
         result = result.and(crate::estimator::or_selectivities(parts));
     }
@@ -1531,7 +1563,7 @@ fn estimator_candidate_selectivity_with_statistics(
             result
         }
         Some(ScanBound::PkSet(bound)) if !bound.tuple.is_empty() => {
-            tuple_set_selectivity(bound, |m| {
+            tuple_set_selectivity(&bound.tuple, bound.member_count, true, |m| {
                 statistics_tuple_member_selectivity(m, rel, catalog)
             })
         }
@@ -1561,12 +1593,20 @@ fn estimator_candidate_selectivity_with_statistics(
             let Some(column) = index.keys.first().and_then(IndexKey::as_column) else {
                 return structural;
             };
-            let unique = index.unique && index.keys.len() == 1;
+            if bound.tuple.len() > 1 {
+                return tuple_set_selectivity(
+                    &bound.tuple,
+                    bound.col_types.len(),
+                    index.unique,
+                    |m| statistics_tuple_member_selectivity(m, rel, catalog),
+                );
+            }
+            let lead = &bound.tuple[0];
             estimator_interval_selectivity_with_statistics(
-                &bound.specs,
-                &bound.clip,
-                unique,
-                bound.col_type,
+                lead.specs.as_deref().unwrap_or_default(),
+                &lead.clip,
+                index.unique && index.keys.len() == 1,
+                lead.col_type,
                 column,
                 rel,
                 catalog,
@@ -2021,10 +2061,12 @@ pub(crate) fn estimate_selected_scan(
             }
             Some(ScanBound::PkSet(bound)) => pk_set_structural_selectivity(bound),
             Some(ScanBound::IndexSet(bound)) => {
-                let unique = rel.table.indexes.iter().any(|index| {
-                    index.name == bound.name_key && index.unique && index.keys.len() == 1
-                });
-                estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
+                let unique = rel
+                    .table
+                    .indexes
+                    .iter()
+                    .any(|index| index.name == bound.name_key && index.unique);
+                index_set_structural_selectivity(bound, unique)
             }
             None => crate::estimator::Selectivity::All,
         };
@@ -2129,7 +2171,9 @@ fn legacy_scan_candidate_index(candidates: &[ScanCandidate<'_>]) -> Option<usize
             ScanCandidateKind::IndexInterval,
             Some(&candidate.identity.index_name),
         ) {
-            if matches!(&candidates[set_i].bound, Some(ScanBound::IndexSet(set)) if !set.clip.is_empty())
+            // A same-index set with a clipped leading set, or one consuming more than the leading
+            // column, is contained in the contiguous bound, so it replaces it.
+            if matches!(&candidates[set_i].bound, Some(ScanBound::IndexSet(set)) if !set.tuple[0].clip.is_empty() || set.tuple.len() > 1)
             {
                 return Some(set_i);
             }
@@ -2208,31 +2252,37 @@ fn build_index_interval_set_plan(
         return None;
     }
     let cols = idx.column_ordinals()?;
-    let ci = cols[0];
-    let ty = rel.table.columns[ci].ty.as_scalar()?;
-    if cols[1..].iter().any(|&c| {
-        rel.table.columns[c]
-            .ty
-            .as_scalar()
-            .is_none_or(|s| !s.is_fixed_width())
-    }) {
+    let (tuple, has_set) = walk_tuple_members(&flatten_conjuncts(filter), rel, &cols, catalog);
+    if !has_set {
         return None;
     }
-    let coll = key_collation_ctx(catalog, &rel.table.columns[ci])?;
-    let (specs, clip) = detect_interval_set(filter, rel.offset + ci, ty, coll.as_deref())?;
-    if interval_plan_has_range(&specs, &clip) && !ty.is_fixed_width() {
+    let lead = &tuple[0];
+    if !lead.col_type.is_fixed_width()
+        && interval_plan_has_range(lead.specs.as_deref().unwrap_or_default(), &lead.clip)
+    {
         return None;
+    }
+    // Suffix eligibility (cost.md §3 "Multi-column secondary indexes"): every key column from the
+    // first member after the leading one that may go unconsumed or be a range onward is width-skipped.
+    let t = (1..tuple.len())
+        .find(|&i| tuple[i].specs.is_some() || !tuple[i].point)
+        .unwrap_or(tuple.len());
+    let mut col_types = Vec::with_capacity(cols.len());
+    let mut all_fixed = true;
+    for (i, &c) in cols.iter().enumerate() {
+        let s = rel.table.columns[c].ty.as_scalar();
+        let fixed = s.is_some_and(|s| s.is_fixed_width());
+        if !fixed && i >= t {
+            return None;
+        }
+        all_fixed = all_fixed && fixed;
+        col_types.push(rel.table.columns[c].ty.scalar());
     }
     Some(IndexKeySet {
         name_key: idx.name.to_string(),
-        col_type: ty,
-        coll,
-        tail_types: cols[1..]
-            .iter()
-            .map(|&c| rel.table.columns[c].ty.scalar())
-            .collect(),
-        specs,
-        clip,
+        tuple,
+        col_types,
+        all_fixed,
     })
 }
 
@@ -2324,10 +2374,8 @@ pub(crate) fn detect_interval_set(
     Some((specs, clip))
 }
 
-/// Build a composite-PK tuple interval set (cost.md §3 "Composite primary keys"): members in key
-/// order, each with its own set (the first reducing OR/IN/ANY conjunct) and clip (every direct
-/// comparison). A point member continues the walk; the first other member with a set or clip is the
-/// final member and ends it. `None` unless some consumed member has a set.
+/// Build a composite-PK tuple interval set (cost.md §3 "Composite primary keys") over the PK
+/// members. `None` unless some consumed member has a set.
 pub(crate) fn detect_tuple_interval_set(
     filter: &RExpr,
     rel: &ScopeRel,
@@ -2337,6 +2385,26 @@ pub(crate) fn detect_tuple_interval_set(
     if pk.len() < 2 {
         return None;
     }
+    let all_fixed = pk.iter().all(|ci| {
+        rel.table.columns[*ci]
+            .ty
+            .as_scalar()
+            .is_some_and(|ty| ty.is_fixed_width())
+    });
+    let (tuple, has_set) = walk_tuple_members(&flatten_conjuncts(filter), rel, &pk, catalog);
+    has_set.then(|| PkKeySet {
+        pk_type: tuple[0].col_type,
+        coll: None,
+        specs: Vec::new(),
+        clip: Vec::new(),
+        tuple,
+        member_count: pk.len(),
+        all_fixed,
+    })
+}
+
+/// The top-level AND-chain's conjuncts, in order.
+fn flatten_conjuncts(filter: &RExpr) -> Vec<&RExpr> {
     fn flatten<'a>(e: &'a RExpr, out: &mut Vec<&'a RExpr>) {
         if let RExpr::And(l, r) = e {
             flatten(l, out);
@@ -2347,15 +2415,22 @@ pub(crate) fn detect_tuple_interval_set(
     }
     let mut conjuncts = Vec::new();
     flatten(filter, &mut conjuncts);
-    let all_fixed = pk.iter().all(|ci| {
-        rel.table.columns[*ci]
-            .ty
-            .as_scalar()
-            .is_some_and(|ty| ty.is_fixed_width())
-    });
+    conjuncts
+}
+
+/// Walk key columns `cols` in key order as tuple-set members (cost.md §3 "Composite primary keys"),
+/// each with its own set (the first reducing OR/IN/ANY conjunct) and clip (every direct
+/// comparison). A point member continues the walk; the first other member with a set or clip is
+/// the final member and ends it. The flag reports that some consumed member has a set.
+fn walk_tuple_members(
+    conjuncts: &[&RExpr],
+    rel: &ScopeRel,
+    cols: &[usize],
+    catalog: &Engine,
+) -> (Vec<TupleMember>, bool) {
     let mut tuple = Vec::new();
     let mut has_set = false;
-    for ci in &pk {
+    for ci in cols {
         let Some(ty) = rel.table.columns[*ci].ty.as_scalar() else {
             break;
         };
@@ -2401,15 +2476,7 @@ pub(crate) fn detect_tuple_interval_set(
             break;
         }
     }
-    has_set.then(|| PkKeySet {
-        pk_type: tuple[0].col_type,
-        coll: None,
-        specs: Vec::new(),
-        clip: Vec::new(),
-        tuple,
-        member_count: pk.len(),
-        all_fixed,
-    })
+    (tuple, has_set)
 }
 
 /// Whether every disjunct is a point: an `= ANY` array or a conjunction of equalities.
@@ -5120,21 +5187,23 @@ fn concat_key(p: &[u8], k: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Resolve a composite-PK tuple set (cost.md §3): the cartesian product of the point members' keys
-/// as prefixes, each a tuple point, a prefix range, or the final member's intervals under it, then
-/// canonicalized. A later member with more than one point that would take the running product over
-/// [`MAX_KEY_SET_PROBES`] ends the walk unconsumed.
-fn tuple_interval_set(
-    ks: &PkKeySet,
+/// Evaluate a tuple set's members in key order (cost.md §3): the cartesian product of the point
+/// members' keys, each preceded by `tag`, as prefixes in byte order, and the final member's
+/// canonical logical intervals when it is consumed, with the consumed count and whether the final
+/// member was consumed. A later member with more than one point that would take the running product
+/// over [`MAX_KEY_SET_PROBES`] ends the walk unconsumed. An empty member empties the set: `None`.
+fn expand_tuple_prefixes(
+    tuple: &[TupleMember],
+    tag: &[u8],
     params: &[Value],
     outer: &[&[Value]],
     left: &[Value],
-) -> Vec<KeyBound> {
+) -> Option<(Vec<Vec<u8>>, Vec<KeyBound>, usize, bool)> {
     let mut prefixes: Vec<Vec<u8>> = vec![Vec::new()];
     let mut final_intervals: Vec<KeyBound> = Vec::new();
     let mut has_final = false;
     let mut consumed = 0usize;
-    for (i, m) in ks.tuple.iter().enumerate() {
+    for (i, m) in tuple.iter().enumerate() {
         let (points, intervals) = if m.point {
             (member_points(m, params, outer, left), Vec::new())
         } else {
@@ -5146,7 +5215,7 @@ fn tuple_interval_set(
             intervals.len()
         };
         if count == 0 {
-            return Vec::new();
+            return None;
         }
         if i > 0 && count > 1 && count > MAX_KEY_SET_PROBES / prefixes.len() {
             break;
@@ -5160,11 +5229,31 @@ fn tuple_interval_set(
         let mut next = Vec::with_capacity(prefixes.len() * count);
         for p in &prefixes {
             for k in &points {
-                next.push(concat_key(p, k));
+                let mut key = Vec::with_capacity(p.len() + tag.len() + k.len());
+                key.extend_from_slice(p);
+                key.extend_from_slice(tag);
+                key.extend_from_slice(k);
+                next.push(key);
             }
         }
         prefixes = next;
     }
+    Some((prefixes, final_intervals, consumed, has_final))
+}
+
+/// Resolve a composite-PK tuple set (cost.md §3): each prefix a tuple point, a prefix range, or the
+/// final member's intervals under it, then canonicalized.
+fn tuple_interval_set(
+    ks: &PkKeySet,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> Vec<KeyBound> {
+    let Some((prefixes, final_intervals, consumed, has_final)) =
+        expand_tuple_prefixes(&ks.tuple, &[], params, outer, left)
+    else {
+        return Vec::new();
+    };
     let complete = consumed == ks.member_count && !has_final;
     let mut out: Vec<KeyBound> = Vec::with_capacity(prefixes.len() * final_intervals.len().max(1));
     for p in &prefixes {
@@ -5212,6 +5301,68 @@ fn tuple_interval_set(
         }
     }
     merge_key_intervals(out, ks.all_fixed)
+}
+
+impl IndexKeySet {
+    /// The set's canonical index-key intervals for one execution, in index-key order (cost.md §3
+    /// "Multi-column secondary indexes").
+    pub(crate) fn probes(
+        &self,
+        params: &[Value],
+        outer: &[&[Value]],
+        left: &[Value],
+    ) -> Vec<IndexProbe> {
+        let Some((prefixes, final_intervals, consumed, has_final)) =
+            expand_tuple_prefixes(&self.tuple, &[0x00], params, outer, left)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for p in &prefixes {
+            if !has_final {
+                out.push(IndexProbe {
+                    bound: KeyBound {
+                        lo: Some(p.clone()),
+                        lo_inc: true,
+                        hi: prefix_successor(p),
+                        hi_inc: false,
+                    },
+                    prefix_len: p.len(),
+                    suffix: self.col_types[consumed..].to_vec(),
+                });
+                continue;
+            }
+            for iv in &final_intervals {
+                let phys = index_logical_interval(iv);
+                let b = KeyBound {
+                    lo: phys.lo.map(|lo| concat_key(p, &lo)),
+                    lo_inc: phys.lo_inc,
+                    hi: phys.hi.map(|hi| concat_key(p, &hi)),
+                    hi_inc: phys.hi_inc,
+                };
+                if !bound_empty(&b) {
+                    out.push(IndexProbe {
+                        bound: b,
+                        prefix_len: p.len(),
+                        suffix: self.col_types[consumed - 1..].to_vec(),
+                    });
+                }
+            }
+        }
+        if !self.all_fixed || out.len() < 2 {
+            return out;
+        }
+        // Every slot is fixed-width, so the merged intervals recover their suffix by width from the
+        // key's start.
+        merge_key_intervals(out.into_iter().map(|pr| pr.bound).collect(), true)
+            .into_iter()
+            .map(|bound| IndexProbe {
+                bound,
+                prefix_len: 0,
+                suffix: self.col_types.clone(),
+            })
+            .collect()
+    }
 }
 
 pub(crate) fn index_logical_interval(logical: &KeyBound) -> KeyBound {
