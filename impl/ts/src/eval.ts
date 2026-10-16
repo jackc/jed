@@ -317,6 +317,10 @@ export function evalFilter(e: RExpr, row: Row, env: EvalEnv, m: Meter): boolean 
   return evalFilter(e.lhs, row, env, m) && evalFilter(e.rhs, row, env, m);
 }
 
+// Of<K> is the RExpr variant evalExpr's case K narrows to; each large arm runs in a function of
+// its own (see evalExpr).
+type Of<K extends RExpr["kind"]> = Extract<RExpr, { kind: K }>;
+
 export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
   // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). evalExpr recurses once
   // per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot; it
@@ -371,2198 +375,2315 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return jsonPathValue(e.value);
     case "constNull":
       return nullValue();
-    case "row": {
-      // A ROW(...) constructor — one operator_eval, then build the composite from the evaluated
-      // fields (spec/design/composite.md §1, cost.md §9).
-      m.charge(COSTS.operatorEval);
-      const vals: Value[] = new Array(e.fields.length);
-      for (let i = 0; i < e.fields.length; i++) vals[i] = evalExpr(e.fields[i]!, row, env, m);
-      return compositeValue(vals);
-    }
-    case "array": {
-      // An ARRAY[...] constructor — one operator_eval. A `nested` constructor stacks its sub-arrays
-      // into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
-      m.charge(COSTS.operatorEval);
-      const elems: Value[] = new Array(e.elements.length);
-      for (let i = 0; i < e.elements.length; i++) elems[i] = evalExpr(e.elements[i]!, row, env, m);
-      const out = e.nested ? buildNestedArray(elems) : arrayValue(elems);
-      // A growth kernel (cost.md §8.1), free when every element is constant.
-      if (!e.elements.every(rexprIsConstant)) chargeOutput(m, out);
-      return out;
-    }
+    case "row":
+      return evalRowNode(e, row, env, m);
+    case "array":
+      return evalArrayNode(e, row, env, m);
     case "constArray":
       // A folded array constant (shape preserved) — return it directly.
       return e.value;
     case "constRange":
       // A folded range constant (already canonical) — return it directly.
       return e.value;
-    case "field": {
-      // Field selection — one operator_eval, then pull the resolved field ordinal out of the
-      // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in range
-      // by construction (resolve fixed it against the static field list).
-      m.charge(COSTS.operatorEval);
-      const base = evalExpr(e.base, row, env, m);
-      if (base.kind === "null") return nullValue();
-      if (base.kind !== "composite")
-        throw typeError("internal: field access on a non-composite value");
-      return base.fields[e.index]!;
-    }
-    case "subscript": {
-      // Array subscript `base[..][..]` — one operator_eval (spec/design/array.md §6). A NULL array
-      // or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
-      // access a (renumbered) sub-array. The per-element walk is internal (unmetered).
-      m.charge(COSTS.operatorEval);
-      return evalSubscript(e, row, env, m);
-    }
-    case "cast": {
-      m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, env, m);
-      if (v.kind === "null") return nullValue();
-      // Any scalar → text (casts.toml, types.md §5): the type's own output form, timestamptz in the
-      // session zone.
-      const out = isText(e.target)
-        ? textValue(scalarToText(v, env, m))
-        : evalCast(v, e.target, e.typmod);
-      // Rendering bytea (hex) or jsonb (escapes) to text, and jsonb to json, is a growth kernel
-      // (cost.md §8.1). The full render is charged, before any varchar(n) truncation below.
-      if (
-        (v.kind === "jsonb" || v.kind === "bytea") &&
-        (out.kind === "text" || out.kind === "json") &&
-        !rexprIsConstant(e.operand)
-      )
-        chargeOutput(m, out);
-      // A varchar(n) cast target silently truncates the resulting text to n code points (the
-      // explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
-      if (e.varcharLen !== null && out.kind === "text") {
-        return textValue(truncateToChars(out.text, e.varcharLen));
-      }
-      return out;
-    }
-    case "arrayCast": {
-      // The three array-involving casts (spec/design/array.md §7): array → text (array_out),
-      // runtime text → T[] (array_in per row), and element-wise array → array (each element through
-      // the scalar cast). The node carries the cast's operator_eval charge (no new cost unit).
-      m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, env, m);
-      if (v.kind === "null") return nullValue();
-      if (e.toElem === null) {
-        // array → text: render via array_out (PG-byte-exact §7). A timestamptz at any depth renders
-        // in the SESSION zone, one timezone unit per finite instant, charged before rendering like
-        // the scalar text cast (timezones.md §9.5). A growth kernel: element quoting can expand
-        // strings (cost.md §8.1).
-        const a = v as { dims: number[]; lbounds: number[]; elements: Value[] };
-        const zoned = a.elements.reduce((n, el) => n + zoneRenderCount(el), 0);
-        if (zoned > 0) {
-          m.charge(COSTS.timezone * BigInt(zoned));
-          m.guard();
-        }
-        const out = textValue(arrayOutZoned(a, env.exec.session.timeZone));
-        return growthResult(m, [e.operand], out);
-      }
-      if (v.kind === "text") {
-        // runtime text → T[]: coerce the per-row string via array_in against the target element
-        // ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
-        return coerceStringToArray(v.text, e.toElem, env.exec.inputZone());
-      }
-      if (v.kind !== "array")
-        throw new Error("an arrayCast operand is text or array (resolver-gated)");
-      // element-wise array → other-element-array: every non-null element through the scalar element
-      // cast (an array type takes no typmod, so a decimal target is unconstrained — typmod null);
-      // the shape (dims/lbounds) is preserved and a NULL element stays NULL. The target element is
-      // always a scalar (a same-element array is the identity, returned with no arrayCast node).
-      if (e.toElem.kind !== "scalar") {
-        throw new Error("an array→array element cast has a scalar target element");
-      }
-      const scalar = e.toElem.scalar;
-      const elements = v.elements.map((el) =>
-        el.kind === "null"
-          ? nullValue()
-          : isText(scalar)
-            ? textValue(scalarToText(el, env, m))
-            : evalCast(el, scalar, null),
-      );
-      const out: Value = { kind: "array", dims: v.dims, lbounds: v.lbounds, elements };
-      // bytea → text renders hex, so a bytea[] → text[] cast is a growth kernel (cost.md §8.1),
-      // charged for the whole result array.
-      if (isText(scalar) && v.elements.some((el) => el.kind === "bytea")) {
-        return growthResult(m, [e.operand], out);
-      }
-      return out;
-    }
-    case "neg": {
-      m.charge(operatorCost("neg"));
-      const v = evalExpr(e.operand, row, env, m);
-      if (v.kind === "null") return nullValue();
-      if (isInterval(e.result)) {
-        if (v.kind !== "interval") throw typeError("internal: non-interval unary minus");
-        return intervalValue(intervalNeg(v.iv));
-      }
-      if (isDecimal(e.result)) {
-        return decimalValue(
-          (v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate(),
-        );
-      }
-      if (isFloat(e.result)) {
-        // Negation flips the sign (no overflow); -NaN is NaN, -Inf is -Inf per IEEE. f32 stays
-        // binary32 (negation never changes the width's representability, but fround keeps the path
-        // uniform). float.md §5.
-        if (v.kind !== "f32" && v.kind !== "f64")
-          throw typeError("internal: non-float unary minus");
-        return e.result === "f32" ? float32Value(-v.value) : float64Value(-v.value);
-      }
-      if (v.kind !== "int") throw typeError("internal: boolean unary minus");
-      const n = -v.int;
-      if (!inRange(e.result, n)) throw overflow(e.result);
-      return intValue(n);
-    }
+    case "field":
+      return evalFieldNode(e, row, env, m);
+    case "subscript":
+      return evalSubscriptNode(e, row, env, m);
+    case "cast":
+      return evalCastNode(e, row, env, m);
+    case "arrayCast":
+      return evalArrayCastNode(e, row, env, m);
+    case "neg":
+      return evalNegNode(e, row, env, m);
     case "not": {
       m.charge(operatorCost("not"));
       return boolNot(evalExpr(e.operand, row, env, m));
     }
-    case "arith": {
-      m.charge(operatorCost(e.op));
-      const a = evalExpr(e.lhs, row, env, m);
-      const b = evalExpr(e.rhs, row, env, m);
-      if (a.kind === "null" || b.kind === "null") return nullValue();
-      // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32, date ±
-      // interval → timestamp. A Date operand is present iff this is date arithmetic (the resolver
-      // settled e.result accordingly), so intercept it before the interval/timestamp/integer
-      // dispatch below (which assume non-date operands).
-      if (a.kind === "date" || b.kind === "date") return evalDateArith(e.op, a, b, e.result);
-      if (isInterval(e.result) && (e.op === "mul" || e.op === "div")) {
-        // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Mul
-        // commutes; Div is interval / number. A zero divisor traps 22012.
-        const ivVal = a.kind === "interval" ? a : (b as { iv: Interval });
-        const numVal = a.kind === "interval" ? b : a;
-        let [fnum, fden] = factorToFraction(numVal);
-        if (e.op === "div") {
-          if (fnum === 0n) throw engineError("division_by_zero", "division by zero");
-          // interval / number = interval * (den/num); keep fden > 0.
-          [fnum, fden] = fnum < 0n ? [-fden, -fnum] : [fden, fnum];
-        }
-        return intervalValue(mulByFraction(ivVal.iv, fnum, fden));
-      }
-      if (isInterval(e.result)) {
-        // interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval (§5).
-        if (a.kind === "interval" && b.kind === "interval") {
-          return intervalValue(e.op === "add" ? intervalAdd(a.iv, b.iv) : intervalSub(a.iv, b.iv));
-        }
-        if (
-          (a.kind === "timestamp" && b.kind === "timestamp") ||
-          (a.kind === "timestamptz" && b.kind === "timestamptz")
-        ) {
-          return intervalValue(tsDiff(a.micros, b.micros));
-        }
-        throw typeError("internal: bad temporal-difference operands");
-      }
-      if (isTimestamp(e.result) || isTimestamptz(e.result)) {
-        // timestamp[tz] ± interval → timestamp[tz] (calendar month-add; interval + ts commutes).
-        let instant: bigint;
-        let iv: Interval;
-        if (a.kind === "interval") {
-          iv = a.iv;
-          instant = (b as { micros: bigint }).micros;
-        } else {
-          instant = (a as { micros: bigint }).micros;
-          iv = (b as { iv: Interval }).iv;
-        }
-        const r = tsShift(instant, iv, e.op === "sub");
-        return isTimestamptz(e.result) ? timestamptzValue(r) : timestampValue(r);
-      }
-      if (isDecimal(e.result)) {
-        // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
-        // PG's scale rules (spec/design/decimal.md §4). The size-scaled decimal_work is
-        // charged BEFORE the operation runs, so a cost ceiling aborts ahead of the limb
-        // work (spec/design/cost.md §3 "decimal_work").
-        const da = toDecimal(a);
-        const db = toDecimal(b);
-        m.charge(COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1));
-        m.guard();
-        return decimalValue(evalDecimalArith(e.op, da, db));
-      }
-      if (isFloat(e.result)) {
-        // Float arithmetic: the resolver promoted both operands to e.result's width (mixed-width
-        // pairs were cast to f64), so both are the same float kind here. One IEEE op per node
-        // (no FMA fusion — structural in the tree walker, float.md §5).
-        if ((a.kind !== "f32" && a.kind !== "f64") || (b.kind !== "f32" && b.kind !== "f64")) {
-          throw typeError("internal: non-float arithmetic");
-        }
-        return evalFloatArith(e.op, a.value, b.value, e.result);
-      }
-      if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: non-integer arithmetic");
-      return evalArith(e.op, a.int, b.int, e.result);
-    }
-    case "compare": {
-      m.charge(operatorCost(e.op));
-      const a = evalExpr(e.lhs, row, env, m);
-      const b = evalExpr(e.rhs, row, env, m);
-      // A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
-      // where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
-      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
-      m.guard();
-      // A collated ORDERING comparison (< <= > >=) over two non-NULL text values orders by the
-      // collation's UCA sort key (spec/design/collation.md §7), charging the collate unit per code
-      // point of each operand (cost.md "collate"). =/<> are byte-equality even under a deterministic
-      // collation (§7), so they take the plain path and charge no collate. A NULL operand ⇒ Unknown
-      // (no sort key). [...s] counts code points (NOT s.length — the UTF-16 trap, §8).
-      if (
-        e.collation !== null &&
-        (e.op === "lt" || e.op === "gt" || e.op === "le" || e.op === "ge")
-      ) {
-        if (a.kind === "text" && b.kind === "text") {
-          m.charge(COSTS.collate * BigInt([...a.text].length + [...b.text].length));
-          m.guard();
-          const c = collatedCmp(e.collation, a.text, b.text);
-          let res: boolean;
-          switch (e.op) {
-            case "lt":
-              res = c < 0;
-              break;
-            case "gt":
-              res = c > 0;
-              break;
-            case "le":
-              res = c <= 0;
-              break;
-            default: // "ge"
-              res = c >= 0;
-          }
-          return { kind: "bool", value: res };
-        }
-        // Two text[] values walk their element pairs under the collation, charging collate per
-        // compared pair (collation.md §11).
-        if (a.kind === "array" && b.kind === "array") {
-          const c = collatedArrayCmp(e.collation, a, b, m);
-          let res: boolean;
-          switch (e.op) {
-            case "lt":
-              res = c < 0;
-              break;
-            case "gt":
-              res = c > 0;
-              break;
-            case "le":
-              res = c <= 0;
-              break;
-            default: // "ge"
-              res = c >= 0;
-          }
-          return { kind: "bool", value: res };
-        }
-        // Either operand NULL ⇒ Unknown (text comparison is three-valued).
-        return { kind: "null" };
-      }
-      // Variable-length text/bytea comparison scans up to the shorter operand's length (code points
-      // / bytes); charge varlen_compare × (W − 1) so the per-comparison length work an untrusted
-      // join / correlated re-scan can amplify by fan-out is metered, not flat (spec/design/cost.md
-      // §3 "varlen_compare"). Collated ORDERING already charged collate above and returned; this
-      // covers =/<>, C/default-collation ordering, and all bytea.
-      m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
-      m.guard();
-      switch (e.op) {
-        case "eq":
-          return from3(eq3(a, b));
-        case "ne":
-          return from3(not3(eq3(a, b)));
-        case "lt":
-          return from3(lt3(a, b));
-        case "gt":
-          return from3(gt3(a, b));
-        case "le":
-          return from3(or3(lt3(a, b), eq3(a, b)));
-        default: // "ge"
-          return from3(or3(gt3(a, b), eq3(a, b)));
-      }
-    }
+    case "arith":
+      return evalArithNode(e, row, env, m);
+    case "compare":
+      return evalCompareNode(e, row, env, m);
     // AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND, a TRUE
     // one decides OR, and the right operand is then never evaluated or charged.
-    case "and": {
-      m.charge(operatorCost("and"));
-      const a = evalExpr(e.lhs, row, env, m);
-      if (a.kind === "bool" && !a.value) return a;
-      const b = evalExpr(e.rhs, row, env, m);
-      return boolAnd(a, b);
-    }
-    case "or": {
-      m.charge(operatorCost("or"));
-      const a = evalExpr(e.lhs, row, env, m);
-      if (a.kind === "bool" && a.value) return a;
-      const b = evalExpr(e.rhs, row, env, m);
-      return boolOr(a, b);
-    }
-    case "jsonGet": {
-      // A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). One
-      // operator_eval; the operands charge their own. The operators are STRICT — a NULL base or
-      // argument propagates to SQL NULL.
-      m.charge(COSTS.operatorEval);
-      const bv = evalExpr(e.base, row, env, m);
-      const av = evalExpr(e.arg, row, env, m);
+    case "and":
+      return evalAndNode(e, row, env, m);
+    case "or":
+      return evalOrNode(e, row, env, m);
+    case "jsonGet":
+      return evalJsonGetNode(e, row, env, m);
+    case "jsonContains":
+      return evalJsonContainsNode(e, row, env, m);
+    case "jsonHasKey":
+      return evalJsonHasKeyNode(e, row, env, m);
+    case "jsonConcat":
+      return evalJsonConcatNode(e, row, env, m);
+    case "jsonDelete":
+      return evalJsonDeleteNode(e, row, env, m);
+    case "isNull":
+      return evalIsNullNode(e, row, env, m);
+    case "isJson":
+      return evalIsJsonNode(e, row, env, m);
+    case "jsonCtor":
+      return evalJsonCtorNode(e, row, env, m);
+    case "distinct":
+      return evalDistinctNode(e, row, env, m);
+    case "like":
+      return evalLikeNode(e, row, env, m);
+    case "regex":
+      return evalRegexNode(e, row, env, m);
+    case "regexFunc":
+      return evalRegexFuncNode(e, row, env, m);
+    case "casing":
+      return evalCasingNode(e, row, env, m);
+    case "atTimeZone":
+      return evalAtTimeZoneNode(e, row, env, m);
+    case "dateTrunc":
+      return evalDateTruncNode(e, row, env, m);
+    case "extract":
+      return evalExtractNode(e, row, env, m);
+    case "dateConvert":
+      return evalDateConvertNode(e, row, env, m);
+    case "dateClock":
+      return evalDateClockNode(e, env, m);
+    case "case":
+      return evalCaseNode(e, row, env, m);
+    case "coalesce":
+      return evalCoalesceNode(e, row, env, m);
+    case "greatestLeast":
+      return evalGreatestLeastNode(e, row, env, m);
+    case "hostFunc":
+      return evalHostFuncNode(e, row, env, m);
+    case "scalarFunc":
+      return evalScalarFuncNode(e, row, env, m);
+    case "arrayFunc":
+      return evalArrayFuncNode(e, row, env, m);
+    case "rangeFunc":
+      return evalRangeFuncNode(e, row, env, m);
+    case "rangeCtor":
+      return evalRangeCtorNode(e, row, env, m);
+    case "rangeOp":
+      return evalRangeOpNode(e, row, env, m);
+    case "rangeSetOp":
+      return evalRangeSetOpNode(e, row, env, m);
+    case "variadic":
+      return evalVariadicNode(e, row, env, m);
+    case "jsonBuild":
+      return evalJsonBuildNode(e, row, env, m);
+    case "jsonSetInsert":
+      return evalJsonSetInsertNode(e, row, env, m);
+    case "jsonImage":
+      return evalJsonImageNode(e, row, env, m);
+    case "jsonObjectFromArrays":
+      return evalJsonObjectFromArraysNode(e, row, env, m);
+    case "jsonPathFn":
+      return evalJsonPathFnNode(e, row, env, m);
+    case "jsonSqlFn":
+      return evalJsonSqlFnNode(e, row, env, m);
+    case "subquery":
+      return evalSubqueryNode(e, row, env, m);
+    case "inValues":
+      return evalInValuesNode(e, row, env, m);
+    case "quantified":
+      return evalQuantifiedNode(e, row, env, m);
+    case "widthBucketArray":
+      return evalWidthBucketArrayNode(e, row, env, m);
+  }
+}
+
+function evalRowNode(e: Of<"row">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A ROW(...) constructor — one operator_eval, then build the composite from the evaluated
+  // fields (spec/design/composite.md §1, cost.md §9).
+  m.charge(COSTS.operatorEval);
+  const vals: Value[] = new Array(e.fields.length);
+  for (let i = 0; i < e.fields.length; i++) vals[i] = evalExpr(e.fields[i]!, row, env, m);
+  return compositeValue(vals);
+}
+
+function evalArrayNode(e: Of<"array">, row: Row, env: EvalEnv, m: Meter): Value {
+  // An ARRAY[...] constructor — one operator_eval. A `nested` constructor stacks its sub-arrays
+  // into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
+  m.charge(COSTS.operatorEval);
+  const elems: Value[] = new Array(e.elements.length);
+  for (let i = 0; i < e.elements.length; i++) elems[i] = evalExpr(e.elements[i]!, row, env, m);
+  const out = e.nested ? buildNestedArray(elems) : arrayValue(elems);
+  // A growth kernel (cost.md §8.1), free when every element is constant.
+  if (!e.elements.every(rexprIsConstant)) chargeOutput(m, out);
+  return out;
+}
+
+function evalFieldNode(e: Of<"field">, row: Row, env: EvalEnv, m: Meter): Value {
+  // Field selection — one operator_eval, then pull the resolved field ordinal out of the
+  // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in range
+  // by construction (resolve fixed it against the static field list).
+  m.charge(COSTS.operatorEval);
+  const base = evalExpr(e.base, row, env, m);
+  if (base.kind === "null") return nullValue();
+  if (base.kind !== "composite") throw typeError("internal: field access on a non-composite value");
+  return base.fields[e.index]!;
+}
+
+function evalSubscriptNode(e: Of<"subscript">, row: Row, env: EvalEnv, m: Meter): Value {
+  // Array subscript `base[..][..]` — one operator_eval (spec/design/array.md §6). A NULL array
+  // or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
+  // access a (renumbered) sub-array. The per-element walk is internal (unmetered).
+  m.charge(COSTS.operatorEval);
+  return evalSubscript(e, row, env, m);
+}
+
+function evalCastNode(e: Of<"cast">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const v = evalExpr(e.operand, row, env, m);
+  if (v.kind === "null") return nullValue();
+  // Any scalar → text (casts.toml, types.md §5): the type's own output form, timestamptz in the
+  // session zone.
+  const out = isText(e.target)
+    ? textValue(scalarToText(v, env, m))
+    : evalCast(v, e.target, e.typmod);
+  // Rendering bytea (hex) or jsonb (escapes) to text, and jsonb to json, is a growth kernel
+  // (cost.md §8.1). The full render is charged, before any varchar(n) truncation below.
+  if (
+    (v.kind === "jsonb" || v.kind === "bytea") &&
+    (out.kind === "text" || out.kind === "json") &&
+    !rexprIsConstant(e.operand)
+  )
+    chargeOutput(m, out);
+  // A varchar(n) cast target silently truncates the resulting text to n code points (the
+  // explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
+  if (e.varcharLen !== null && out.kind === "text") {
+    return textValue(truncateToChars(out.text, e.varcharLen));
+  }
+  return out;
+}
+
+function evalArrayCastNode(e: Of<"arrayCast">, row: Row, env: EvalEnv, m: Meter): Value {
+  // The three array-involving casts (spec/design/array.md §7): array → text (array_out),
+  // runtime text → T[] (array_in per row), and element-wise array → array (each element through
+  // the scalar cast). The node carries the cast's operator_eval charge (no new cost unit).
+  m.charge(COSTS.operatorEval);
+  const v = evalExpr(e.operand, row, env, m);
+  if (v.kind === "null") return nullValue();
+  if (e.toElem === null) {
+    // array → text: render via array_out (PG-byte-exact §7). A timestamptz at any depth renders
+    // in the SESSION zone, one timezone unit per finite instant, charged before rendering like
+    // the scalar text cast (timezones.md §9.5). A growth kernel: element quoting can expand
+    // strings (cost.md §8.1).
+    const a = v as { dims: number[]; lbounds: number[]; elements: Value[] };
+    const zoned = a.elements.reduce((n, el) => n + zoneRenderCount(el), 0);
+    if (zoned > 0) {
+      m.charge(COSTS.timezone * BigInt(zoned));
       m.guard();
-      if (bv.kind === "null" || av.kind === "null") return nullValue();
-      if (bv.kind === "json") return jsonGetVerbatim(e.op, bv.text, av);
-      if (bv.kind !== "jsonb")
-        throw new Error("resolver guarantees a json/jsonb base for an accessor operator");
-      const node = bv.node;
-      // Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
-      // `#> #>>`. A NULL element inside the path array misses (PG).
-      let accessed: JsonNode | null;
-      if (e.op === "arrow" || e.op === "arrowText") {
-        if (av.kind === "text") {
-          accessed = getField(node, av.text);
-        } else if (av.kind === "int") {
-          accessed = getIndex(node, av.int);
-        } else {
-          throw new Error("resolver guarantees a text/int arg for -> / ->>");
-        }
-      } else {
-        // `#> #>>` — a text[] path.
-        if (av.kind !== "array") throw new Error("resolver guarantees a text[] arg for #> / #>>");
-        const steps: string[] = [];
-        let nullStep = false;
-        for (const el of av.elements) {
-          if (el.kind === "null") {
-            nullStep = true;
-            break;
-          }
-          if (el.kind !== "text") throw new Error("a text[] path has text/NULL elements");
-          steps.push(el.text);
-        }
-        accessed = nullStep ? null : getPath(node, steps);
-      }
-      // `-> #>` return the node as jsonb; `->> #>>` render it as text (a JSON null or a missing
-      // access → SQL NULL).
-      if (accessed === null) return nullValue();
-      if (e.op === "arrow" || e.op === "hashArrow") return jsonbValue(accessed);
-      const t = nodeToText(accessed);
-      return t === null ? nullValue() : textValue(t);
     }
-    case "jsonContains": {
-      // `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5). One
-      // operator_eval; STRICT — a NULL operand yields SQL NULL.
-      m.charge(COSTS.operatorEval);
-      const av = evalExpr(e.a, row, env, m);
-      const bv = evalExpr(e.b, row, env, m);
+    const out = textValue(arrayOutZoned(a, env.exec.session.timeZone));
+    return growthResult(m, [e.operand], out);
+  }
+  if (v.kind === "text") {
+    // runtime text → T[]: coerce the per-row string via array_in against the target element
+    // ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
+    return coerceStringToArray(v.text, e.toElem, env.exec.inputZone());
+  }
+  if (v.kind !== "array") throw new Error("an arrayCast operand is text or array (resolver-gated)");
+  // element-wise array → other-element-array: every non-null element through the scalar element
+  // cast (an array type takes no typmod, so a decimal target is unconstrained — typmod null);
+  // the shape (dims/lbounds) is preserved and a NULL element stays NULL. The target element is
+  // always a scalar (a same-element array is the identity, returned with no arrayCast node).
+  if (e.toElem.kind !== "scalar") {
+    throw new Error("an array→array element cast has a scalar target element");
+  }
+  const scalar = e.toElem.scalar;
+  const elements = v.elements.map((el) =>
+    el.kind === "null"
+      ? nullValue()
+      : isText(scalar)
+        ? textValue(scalarToText(el, env, m))
+        : evalCast(el, scalar, null),
+  );
+  const out: Value = { kind: "array", dims: v.dims, lbounds: v.lbounds, elements };
+  // bytea → text renders hex, so a bytea[] → text[] cast is a growth kernel (cost.md §8.1),
+  // charged for the whole result array.
+  if (isText(scalar) && v.elements.some((el) => el.kind === "bytea")) {
+    return growthResult(m, [e.operand], out);
+  }
+  return out;
+}
+
+function evalNegNode(e: Of<"neg">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(operatorCost("neg"));
+  const v = evalExpr(e.operand, row, env, m);
+  if (v.kind === "null") return nullValue();
+  if (isInterval(e.result)) {
+    if (v.kind !== "interval") throw typeError("internal: non-interval unary minus");
+    return intervalValue(intervalNeg(v.iv));
+  }
+  if (isDecimal(e.result)) {
+    return decimalValue(
+      (v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate(),
+    );
+  }
+  if (isFloat(e.result)) {
+    // Negation flips the sign (no overflow); -NaN is NaN, -Inf is -Inf per IEEE. f32 stays
+    // binary32 (negation never changes the width's representability, but fround keeps the path
+    // uniform). float.md §5.
+    if (v.kind !== "f32" && v.kind !== "f64") throw typeError("internal: non-float unary minus");
+    return e.result === "f32" ? float32Value(-v.value) : float64Value(-v.value);
+  }
+  if (v.kind !== "int") throw typeError("internal: boolean unary minus");
+  const n = -v.int;
+  if (!inRange(e.result, n)) throw overflow(e.result);
+  return intValue(n);
+}
+
+function evalArithNode(e: Of<"arith">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(operatorCost(e.op));
+  const a = evalExpr(e.lhs, row, env, m);
+  const b = evalExpr(e.rhs, row, env, m);
+  if (a.kind === "null" || b.kind === "null") return nullValue();
+  // Date arithmetic (spec/design/date.md §6): date ± int → date, date − date → i32, date ±
+  // interval → timestamp. A Date operand is present iff this is date arithmetic (the resolver
+  // settled e.result accordingly), so intercept it before the interval/timestamp/integer
+  // dispatch below (which assume non-date operands).
+  if (a.kind === "date" || b.kind === "date") return evalDateArith(e.op, a, b, e.result);
+  if (isInterval(e.result) && (e.op === "mul" || e.op === "div")) {
+    // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Mul
+    // commutes; Div is interval / number. A zero divisor traps 22012.
+    const ivVal = a.kind === "interval" ? a : (b as { iv: Interval });
+    const numVal = a.kind === "interval" ? b : a;
+    let [fnum, fden] = factorToFraction(numVal);
+    if (e.op === "div") {
+      if (fnum === 0n) throw engineError("division_by_zero", "division by zero");
+      // interval / number = interval * (den/num); keep fden > 0.
+      [fnum, fden] = fnum < 0n ? [-fden, -fnum] : [fden, fnum];
+    }
+    return intervalValue(mulByFraction(ivVal.iv, fnum, fden));
+  }
+  if (isInterval(e.result)) {
+    // interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval (§5).
+    if (a.kind === "interval" && b.kind === "interval") {
+      return intervalValue(e.op === "add" ? intervalAdd(a.iv, b.iv) : intervalSub(a.iv, b.iv));
+    }
+    if (
+      (a.kind === "timestamp" && b.kind === "timestamp") ||
+      (a.kind === "timestamptz" && b.kind === "timestamptz")
+    ) {
+      return intervalValue(tsDiff(a.micros, b.micros));
+    }
+    throw typeError("internal: bad temporal-difference operands");
+  }
+  if (isTimestamp(e.result) || isTimestamptz(e.result)) {
+    // timestamp[tz] ± interval → timestamp[tz] (calendar month-add; interval + ts commutes).
+    let instant: bigint;
+    let iv: Interval;
+    if (a.kind === "interval") {
+      iv = a.iv;
+      instant = (b as { micros: bigint }).micros;
+    } else {
+      instant = (a as { micros: bigint }).micros;
+      iv = (b as { iv: Interval }).iv;
+    }
+    const r = tsShift(instant, iv, e.op === "sub");
+    return isTimestamptz(e.result) ? timestamptzValue(r) : timestampValue(r);
+  }
+  if (isDecimal(e.result)) {
+    // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
+    // PG's scale rules (spec/design/decimal.md §4). The size-scaled decimal_work is
+    // charged BEFORE the operation runs, so a cost ceiling aborts ahead of the limb
+    // work (spec/design/cost.md §3 "decimal_work").
+    const da = toDecimal(a);
+    const db = toDecimal(b);
+    m.charge(COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1));
+    m.guard();
+    return decimalValue(evalDecimalArith(e.op, da, db));
+  }
+  if (isFloat(e.result)) {
+    // Float arithmetic: the resolver promoted both operands to e.result's width (mixed-width
+    // pairs were cast to f64), so both are the same float kind here. One IEEE op per node
+    // (no FMA fusion — structural in the tree walker, float.md §5).
+    if ((a.kind !== "f32" && a.kind !== "f64") || (b.kind !== "f32" && b.kind !== "f64")) {
+      throw typeError("internal: non-float arithmetic");
+    }
+    return evalFloatArith(e.op, a.value, b.value, e.result);
+  }
+  if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: non-integer arithmetic");
+  return evalArith(e.op, a.int, b.int, e.result);
+}
+
+function evalCompareNode(e: Of<"compare">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(operatorCost(e.op));
+  const a = evalExpr(e.lhs, row, env, m);
+  const b = evalExpr(e.rhs, row, env, m);
+  // A decimal(-promotable) pair charges size-scaled decimal_work — once per node, even
+  // where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
+  m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
+  m.guard();
+  // A collated ORDERING comparison (< <= > >=) over two non-NULL text values orders by the
+  // collation's UCA sort key (spec/design/collation.md §7), charging the collate unit per code
+  // point of each operand (cost.md "collate"). =/<> are byte-equality even under a deterministic
+  // collation (§7), so they take the plain path and charge no collate. A NULL operand ⇒ Unknown
+  // (no sort key). [...s] counts code points (NOT s.length — the UTF-16 trap, §8).
+  if (e.collation !== null && (e.op === "lt" || e.op === "gt" || e.op === "le" || e.op === "ge")) {
+    if (a.kind === "text" && b.kind === "text") {
+      m.charge(COSTS.collate * BigInt([...a.text].length + [...b.text].length));
       m.guard();
-      if (av.kind === "null" || bv.kind === "null") return nullValue();
-      if (av.kind !== "jsonb" || bv.kind !== "jsonb")
-        throw new Error("resolver guarantees jsonb operands for @> / <@");
-      return { kind: "bool", value: jsonContainsKernel(av.node, bv.node) };
+      const c = collatedCmp(e.collation, a.text, b.text);
+      let res: boolean;
+      switch (e.op) {
+        case "lt":
+          res = c < 0;
+          break;
+        case "gt":
+          res = c > 0;
+          break;
+        case "le":
+          res = c <= 0;
+          break;
+        default: // "ge"
+          res = c >= 0;
+      }
+      return { kind: "bool", value: res };
     }
-    case "jsonHasKey": {
-      // `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (json-sql-functions.md §1, J5).
-      // One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
-      m.charge(COSTS.operatorEval);
-      const bv = evalExpr(e.base, row, env, m);
-      const av = evalExpr(e.arg, row, env, m);
+    // Two text[] values walk their element pairs under the collation, charging collate per
+    // compared pair (collation.md §11).
+    if (a.kind === "array" && b.kind === "array") {
+      const c = collatedArrayCmp(e.collation, a, b, m);
+      let res: boolean;
+      switch (e.op) {
+        case "lt":
+          res = c < 0;
+          break;
+        case "gt":
+          res = c > 0;
+          break;
+        case "le":
+          res = c <= 0;
+          break;
+        default: // "ge"
+          res = c >= 0;
+      }
+      return { kind: "bool", value: res };
+    }
+    // Either operand NULL ⇒ Unknown (text comparison is three-valued).
+    return { kind: "null" };
+  }
+  // Variable-length text/bytea comparison scans up to the shorter operand's length (code points
+  // / bytes); charge varlen_compare × (W − 1) so the per-comparison length work an untrusted
+  // join / correlated re-scan can amplify by fan-out is metered, not flat (spec/design/cost.md
+  // §3 "varlen_compare"). Collated ORDERING already charged collate above and returned; this
+  // covers =/<>, C/default-collation ordering, and all bytea.
+  m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(a, b) - 1));
+  m.guard();
+  switch (e.op) {
+    case "eq":
+      return from3(eq3(a, b));
+    case "ne":
+      return from3(not3(eq3(a, b)));
+    case "lt":
+      return from3(lt3(a, b));
+    case "gt":
+      return from3(gt3(a, b));
+    case "le":
+      return from3(or3(lt3(a, b), eq3(a, b)));
+    default: // "ge"
+      return from3(or3(gt3(a, b), eq3(a, b)));
+  }
+}
+
+function evalAndNode(e: Of<"and">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(operatorCost("and"));
+  const a = evalExpr(e.lhs, row, env, m);
+  if (a.kind === "bool" && !a.value) return a;
+  const b = evalExpr(e.rhs, row, env, m);
+  return boolAnd(a, b);
+}
+
+function evalOrNode(e: Of<"or">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(operatorCost("or"));
+  const a = evalExpr(e.lhs, row, env, m);
+  if (a.kind === "bool" && a.value) return a;
+  const b = evalExpr(e.rhs, row, env, m);
+  return boolOr(a, b);
+}
+
+function evalJsonGetNode(e: Of<"jsonGet">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). One
+  // operator_eval; the operands charge their own. The operators are STRICT — a NULL base or
+  // argument propagates to SQL NULL.
+  m.charge(COSTS.operatorEval);
+  const bv = evalExpr(e.base, row, env, m);
+  const av = evalExpr(e.arg, row, env, m);
+  m.guard();
+  if (bv.kind === "null" || av.kind === "null") return nullValue();
+  if (bv.kind === "json") return jsonGetVerbatim(e.op, bv.text, av);
+  if (bv.kind !== "jsonb")
+    throw new Error("resolver guarantees a json/jsonb base for an accessor operator");
+  const node = bv.node;
+  // Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
+  // `#> #>>`. A NULL element inside the path array misses (PG).
+  let accessed: JsonNode | null;
+  if (e.op === "arrow" || e.op === "arrowText") {
+    if (av.kind === "text") {
+      accessed = getField(node, av.text);
+    } else if (av.kind === "int") {
+      accessed = getIndex(node, av.int);
+    } else {
+      throw new Error("resolver guarantees a text/int arg for -> / ->>");
+    }
+  } else {
+    // `#> #>>` — a text[] path.
+    if (av.kind !== "array") throw new Error("resolver guarantees a text[] arg for #> / #>>");
+    const steps: string[] = [];
+    let nullStep = false;
+    for (const el of av.elements) {
+      if (el.kind === "null") {
+        nullStep = true;
+        break;
+      }
+      if (el.kind !== "text") throw new Error("a text[] path has text/NULL elements");
+      steps.push(el.text);
+    }
+    accessed = nullStep ? null : getPath(node, steps);
+  }
+  // `-> #>` return the node as jsonb; `->> #>>` render it as text (a JSON null or a missing
+  // access → SQL NULL).
+  if (accessed === null) return nullValue();
+  if (e.op === "arrow" || e.op === "hashArrow") return jsonbValue(accessed);
+  const t = nodeToText(accessed);
+  return t === null ? nullValue() : textValue(t);
+}
+
+function evalJsonContainsNode(e: Of<"jsonContains">, row: Row, env: EvalEnv, m: Meter): Value {
+  // `a @> b` jsonb deep containment (spec/design/json-sql-functions.md §1, J5). One
+  // operator_eval; STRICT — a NULL operand yields SQL NULL.
+  m.charge(COSTS.operatorEval);
+  const av = evalExpr(e.a, row, env, m);
+  const bv = evalExpr(e.b, row, env, m);
+  m.guard();
+  if (av.kind === "null" || bv.kind === "null") return nullValue();
+  if (av.kind !== "jsonb" || bv.kind !== "jsonb")
+    throw new Error("resolver guarantees jsonb operands for @> / <@");
+  return { kind: "bool", value: jsonContainsKernel(av.node, bv.node) };
+}
+
+function evalJsonHasKeyNode(e: Of<"jsonHasKey">, row: Row, env: EvalEnv, m: Meter): Value {
+  // `jsonb ? text` / `?| text[]` / `?& text[]` key-existence (json-sql-functions.md §1, J5).
+  // One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
+  m.charge(COSTS.operatorEval);
+  const bv = evalExpr(e.base, row, env, m);
+  const av = evalExpr(e.arg, row, env, m);
+  m.guard();
+  if (bv.kind === "null" || av.kind === "null") return nullValue();
+  if (bv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb base for ? / ?| / ?&");
+  const node = bv.node;
+  let result: boolean;
+  if (e.hasKeyKind === "one") {
+    if (av.kind !== "text") throw new Error("resolver guarantees a text arg for ?");
+    result = jsonHasKeyKernel(node, av.text);
+  } else {
+    // `?|` / `?&` — a text[] arg. A NULL element is SKIPPED by both (PG,
+    // json-sql-functions.md §1.2): `'{"a":1}' ?& '{a,NULL}'` is true, `?& '{}'` is true for
+    // every document, `?| '{}'` false.
+    if (av.kind !== "array") throw new Error("resolver guarantees a text[] arg for ?| / ?&");
+    const keys: string[] = [];
+    for (const el of av.elements) {
+      if (el.kind === "null") continue;
+      if (el.kind !== "text") throw new Error("a text[] arg has text/NULL elements");
+      keys.push(el.text);
+    }
+    if (e.hasKeyKind === "any") {
+      result = keys.some((k) => jsonHasKeyKernel(node, k));
+    } else {
+      // "all"
+      result = keys.every((k) => jsonHasKeyKernel(node, k));
+    }
+  }
+  return { kind: "bool", value: result };
+}
+
+function evalJsonConcatNode(e: Of<"jsonConcat">, row: Row, env: EvalEnv, m: Meter): Value {
+  // `a || b` jsonb concatenate / shallow-merge (json-sql-functions.md §1, J6). One
+  // operator_eval; STRICT — a NULL operand yields SQL NULL.
+  m.charge(COSTS.operatorEval);
+  const av = evalExpr(e.a, row, env, m);
+  const bv = evalExpr(e.b, row, env, m);
+  m.guard();
+  if (av.kind === "null" || bv.kind === "null") return nullValue();
+  if (av.kind !== "jsonb" || bv.kind !== "jsonb")
+    throw new Error("resolver guarantees jsonb operands for ||");
+  // Wrapping a non-array operand can deepen the result (json.md §6.4).
+  const out = jsonConcatKernel(av.node, bv.node);
+  jsonCheckDepth(out);
+  return growthResult(m, [e.a, e.b], jsonbValue(out));
+}
+
+function evalJsonDeleteNode(e: Of<"jsonDelete">, row: Row, env: EvalEnv, m: Meter): Value {
+  // `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
+  // J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
+  m.charge(COSTS.operatorEval);
+  const bv = evalExpr(e.base, row, env, m);
+  const av = evalExpr(e.arg, row, env, m);
+  m.guard();
+  if (bv.kind === "null" || av.kind === "null") return nullValue();
+  if (bv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb base for - / #-");
+  const node = bv.node;
+  let result: JsonNode;
+  switch (e.deleteKind) {
+    case "key":
+      if (av.kind !== "text") throw new Error("resolver guarantees a text arg for - key");
+      result = jsonDeleteKey(node, av.text);
+      break;
+    case "index":
+      if (av.kind !== "int") throw new Error("resolver guarantees an int arg for - index");
+      result = jsonDeleteIndex(node, av.int);
+      break;
+    case "keys":
+      // A NULL key is skipped (PG).
+      result = jsonDeleteKeys(node, jsonTextPathArg(av));
+      break;
+    default:
+      // "path" — a NULL path element reached raises 22004 (PG).
+      result = jsonDeletePathKernel(node, jsonTextPathArg(av));
+      break;
+  }
+  return jsonbValue(result);
+}
+
+function evalIsNullNode(e: Of<"isNull">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  // PG's `IS [NOT] NULL` (spec/design/composite.md §5): for a composite the two are NOT
+  // negations but the all-fields rule (one level deep, not recursive); a scalar follows the
+  // ordinary rule. isNullTest folds both cases. Replaces the old `(v is null) !== negated`.
+  const operand = evalExpr(e.operand, row, env, m);
+  return { kind: "bool", value: isNullTest(operand, e.negated) };
+}
+
+function evalIsJsonNode(e: Of<"isJson">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const v = evalExpr(e.operand, row, env, m);
+  let ok: boolean;
+  switch (v.kind) {
+    case "null":
+      return nullValue(); // a NULL operand → NULL (never raises)
+    // jsonb is always well-formed with unique keys; only the kind can fail.
+    case "jsonb":
+      ok = jsonPredKindMatches(v.node, e.jsonKind);
+      break;
+    // A string / json operand: parse (preserving duplicate keys); malformed → false. Only the
+    // UNIQUE KEYS check reads string contents, so only it de-escapes (PG's need_escapes =
+    // check_unique_keys): a `\u0000` or unpaired surrogate is then a parse failure → false
+    // (json.md §4.2).
+    case "json":
+    case "text": {
+      let node: JsonNode;
+      try {
+        node = e.uniqueKeys ? parsePreservingJson(v.text) : parseShapeJson(v.text);
+      } catch {
+        ok = false;
+        break;
+      }
+      ok = jsonPredKindMatches(node, e.jsonKind) && !(e.uniqueKeys && jsonHasDuplicateKeys(node));
+      break;
+    }
+    default:
+      throw new Error("IS JSON: resolver restricts the operand to a string / json / jsonb value");
+  }
+  return { kind: "bool", value: ok !== e.negated };
+}
+
+function evalJsonCtorNode(e: Of<"jsonCtor">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const v = evalExpr(e.operand, row, env, m);
+  if (v.kind === "null") return nullValue(); // STRICT
+  if (v.kind !== "text") {
+    throw new Error("BUG: resolver restricts JSON() to a text operand");
+  }
+  // Validate the string is well-formed JSON (22P02 on malformed — propagated), preserving
+  // duplicate keys so the optional UNIQUE KEYS check (22030) can see them. Only that check
+  // de-escapes (PG's need_escapes = unique_keys, json.md §4.2).
+  if (!e.uniqueKeys) {
+    parseShapeJson(v.text);
+    return jsonValue(v.text);
+  }
+  const node = parsePreservingJson(v.text);
+  if (jsonHasDuplicateKeys(node)) {
+    throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
+  }
+  // The result is the verbatim input text as a `json` value (PG).
+  return jsonValue(v.text);
+}
+
+function evalDistinctNode(e: Of<"distinct">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const dl = evalExpr(e.lhs, row, env, m);
+  const dr = evalExpr(e.rhs, row, env, m);
+  // IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its size-scaled
+  // decimal_work like "compare" (spec/design/cost.md §3 "decimal_work").
+  m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(dl, dr) - 1));
+  m.guard();
+  const same = notDistinctFrom(dl, dr);
+  // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
+  // the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
+  // unknown (the null_safe discipline, functions.md §3).
+  return { kind: "bool", value: same === e.negated };
+}
+
+function evalLikeNode(e: Of<"like">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const subject = evalExpr(e.lhs, row, env, m);
+  const pattern = evalExpr(e.rhs, row, env, m);
+  // NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
+  // is still NULL, never 22025 (matches PG — grammar.md §22).
+  if (subject.kind === "null" || pattern.kind === "null") return nullValue();
+  if (subject.kind !== "text" || pattern.kind !== "text") {
+    throw new Error("unreachable: resolver requires text LIKE operands");
+  }
+  let sub = subject.text;
+  let pat = pattern.text;
+  // ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16) before
+  // matching — 1:1 folding so the matcher's _/length semantics survive.
+  if (e.insensitive) {
+    const prop = env.environment.property();
+    sub = foldLowerSimple(sub, prop);
+    pat = foldLowerSimple(pat, prop);
+  }
+  // negated carries NOT LIKE/ILIKE: matched !== negated flips for the NOT form.
+  return { kind: "bool", value: likeMatch(sub, pat) !== e.negated };
+}
+
+function evalRegexNode(e: Of<"regex">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const subject = evalExpr(e.lhs, row, env, m);
+  const pattern = evalExpr(e.rhs, row, env, m);
+  // NULL propagates BEFORE the matcher runs (regex.md §1) — a malformed pattern against a NULL
+  // operand is still NULL, never 2201B.
+  if (subject.kind === "null" || pattern.kind === "null") return nullValue();
+  if (subject.kind !== "text" || pattern.kind !== "text") {
+    throw new Error("unreachable: resolver requires text regex operands");
+  }
+  // ~* (insensitive): simple-lowercase the subject under the engine casing regime (collation.md
+  // §16). The constant pattern was folded at resolve; a non-constant pattern is folded below.
+  const prop = e.insensitive ? env.environment.property() : undefined;
+  const sub = e.insensitive ? foldLowerSimple(subject.text, prop) : subject.text;
+  const subjCps = Array.from(sub, (c) => c.codePointAt(0) as number);
+  let matched: boolean;
+  if (e.program !== null) {
+    // Constant precompiled pattern: charge its regex_compile cost ONCE per statement execution
+    // (on first eval), not per row (regex.md §5).
+    if (!e.compileCharged) {
+      e.compileCharged = true;
+      m.charge(COSTS.regexCompile * BigInt(regexNinst(e.program)));
       m.guard();
-      if (bv.kind === "null" || av.kind === "null") return nullValue();
-      if (bv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb base for ? / ?| / ?&");
-      const node = bv.node;
-      let result: boolean;
-      if (e.hasKeyKind === "one") {
-        if (av.kind !== "text") throw new Error("resolver guarantees a text arg for ?");
-        result = jsonHasKeyKernel(node, av.text);
-      } else {
-        // `?|` / `?&` — a text[] arg. A NULL element is SKIPPED by both (PG,
-        // json-sql-functions.md §1.2): `'{"a":1}' ?& '{a,NULL}'` is true, `?& '{}'` is true for
-        // every document, `?| '{}'` false.
-        if (av.kind !== "array") throw new Error("resolver guarantees a text[] arg for ?| / ?&");
-        const keys: string[] = [];
-        for (const el of av.elements) {
-          if (el.kind === "null") continue;
-          if (el.kind !== "text") throw new Error("a text[] arg has text/NULL elements");
-          keys.push(el.text);
-        }
-        if (e.hasKeyKind === "any") {
-          result = keys.some((k) => jsonHasKeyKernel(node, k));
-        } else {
-          // "all"
-          result = keys.every((k) => jsonHasKeyKernel(node, k));
-        }
-      }
-      return { kind: "bool", value: result };
     }
-    case "jsonConcat": {
-      // `a || b` jsonb concatenate / shallow-merge (json-sql-functions.md §1, J6). One
-      // operator_eval; STRICT — a NULL operand yields SQL NULL.
-      m.charge(COSTS.operatorEval);
-      const av = evalExpr(e.a, row, env, m);
-      const bv = evalExpr(e.b, row, env, m);
+    matched = regexIsMatch(e.program, subjCps, m);
+  } else {
+    // Non-constant pattern: compile now (charging regex_compile) and run.
+    const pat = e.insensitive ? foldRegexPattern(pattern.text, prop) : pattern.text;
+    const prog = compileRegex(pat);
+    m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
+    m.guard();
+    matched = regexIsMatch(prog, subjCps, m);
+  }
+  // negated carries !~ / !~*: matched !== negated flips for the negated form.
+  return { kind: "bool", value: matched !== e.negated };
+}
+
+function evalRegexFuncNode(e: Of<"regexFunc">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
+  const vals: Value[] = [];
+  for (const a of e.args) {
+    const v = evalExpr(a, row, env, m);
+    if (v.kind === "null") return nullValue();
+    vals.push(v);
+  }
+  const text = (v: Value): string => {
+    if (v.kind !== "text") throw new Error("unreachable: resolver requires text regexp_* operands");
+    return v.text;
+  };
+  const int = (v: Value): number => {
+    if (v.kind !== "int")
+      throw new Error("unreachable: resolver requires integer regexp_* operands");
+    return Number(v.int);
+  };
+  const source = text(vals[0]);
+  const pattern = text(vals[1]);
+  // Per-function argument layout (regex.md §8 / §8b); the numeric defaults match PG.
+  let replacement = "";
+  let flags = "";
+  let start = 1;
+  let nth = 1;
+  let endoption = 0;
+  let subexpr = 0;
+  switch (e.func) {
+    case "replace":
+      replacement = text(vals[2]);
+      if (vals[3]) flags = text(vals[3]);
+      break;
+    case "match":
+    case "like":
+    case "split_to_array":
+    case "matches":
+    case "split_to_table":
+      if (vals[2]) flags = text(vals[2]);
+      break;
+    case "count":
+      if (vals[2]) start = int(vals[2]);
+      if (vals[3]) flags = text(vals[3]);
+      break;
+    case "substr":
+      if (vals[2]) start = int(vals[2]);
+      if (vals[3]) nth = int(vals[3]);
+      if (vals[4]) flags = text(vals[4]);
+      if (vals[5]) subexpr = int(vals[5]);
+      break;
+    case "instr":
+      if (vals[2]) start = int(vals[2]);
+      if (vals[3]) nth = int(vals[3]);
+      if (vals[4]) endoption = int(vals[4]);
+      if (vals[5]) flags = text(vals[5]);
+      if (vals[6]) subexpr = int(vals[6]);
+      break;
+  }
+  // Numeric argument validation (regex.md §8b), BEFORE the pattern compiles (PG order: a bad
+  // `start` beats a bad pattern). 22023 names the offending parameter.
+  const badParam = (p: string, v: number): EngineError =>
+    engineError("invalid_parameter_value", `invalid value for parameter "${p}": ${v}`);
+  if (e.func === "count" || e.func === "substr" || e.func === "instr") {
+    if (start < 1) throw badParam("start", start);
+  }
+  if (e.func === "substr" || e.func === "instr") {
+    if (nth < 1) throw badParam("n", nth);
+  }
+  if (e.func === "instr" && endoption !== 0 && endoption !== 1)
+    throw badParam("endoption", endoption);
+  if ((e.func === "substr" || e.func === "instr") && subexpr < 0)
+    throw badParam("subexpr", subexpr);
+  // Validate flags: `i` and `g` are known, anything else is 2201B. Then (PG order) `g` on a
+  // function that does not take it — all but regexp_replace / regexp_matches — is PostgreSQL's
+  // 22023 (regex.md §8c).
+  for (const c of flags) {
+    if (c !== "i" && c !== "g") {
+      throw engineError(
+        "invalid_regular_expression",
+        `invalid regular expression: invalid option "${c}"`,
+      );
+    }
+  }
+  const insensitive = flags.includes("i");
+  const global = flags.includes("g");
+  if (global && e.func !== "replace" && e.func !== "matches") {
+    throw engineError(
+      "invalid_parameter_value",
+      `regexp_${e.func}() does not support the "global" option`,
+    );
+  }
+  // The original-case subject (for output/captures) and the matched subject (folded when
+  // case-insensitive — same length, so offsets carry over, regex.md §8).
+  const origCps = Array.from(source, (ch) => ch.codePointAt(0) as number);
+  const prop = insensitive ? env.environment.property() : undefined;
+  const matchCps = insensitive
+    ? Array.from(foldLowerSimple(source, prop), (ch) => ch.codePointAt(0) as number)
+    : origCps;
+  let prog: RegexProgram;
+  if (e.program !== null) {
+    if (!e.compileCharged) {
+      e.compileCharged = true;
+      m.charge(COSTS.regexCompile * BigInt(regexNinst(e.program)));
       m.guard();
-      if (av.kind === "null" || bv.kind === "null") return nullValue();
-      if (av.kind !== "jsonb" || bv.kind !== "jsonb")
-        throw new Error("resolver guarantees jsonb operands for ||");
-      // Wrapping a non-array operand can deepen the result (json.md §6.4).
-      const out = jsonConcatKernel(av.node, bv.node);
-      jsonCheckDepth(out);
-      return growthResult(m, [e.a, e.b], jsonbValue(out));
     }
-    case "jsonDelete": {
-      // `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
-      // J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
-      m.charge(COSTS.operatorEval);
-      const bv = evalExpr(e.base, row, env, m);
-      const av = evalExpr(e.arg, row, env, m);
-      m.guard();
-      if (bv.kind === "null" || av.kind === "null") return nullValue();
-      if (bv.kind !== "jsonb") throw new Error("resolver guarantees a jsonb base for - / #-");
-      const node = bv.node;
-      let result: JsonNode;
-      switch (e.deleteKind) {
-        case "key":
-          if (av.kind !== "text") throw new Error("resolver guarantees a text arg for - key");
-          result = jsonDeleteKey(node, av.text);
-          break;
-        case "index":
-          if (av.kind !== "int") throw new Error("resolver guarantees an int arg for - index");
-          result = jsonDeleteIndex(node, av.int);
-          break;
-        case "keys":
-          // A NULL key is skipped (PG).
-          result = jsonDeleteKeys(node, jsonTextPathArg(av));
-          break;
-        default:
-          // "path" — a NULL path element reached raises 22004 (PG).
-          result = jsonDeletePathKernel(node, jsonTextPathArg(av));
-          break;
-      }
-      return jsonbValue(result);
-    }
-    case "isNull": {
-      m.charge(COSTS.operatorEval);
-      // PG's `IS [NOT] NULL` (spec/design/composite.md §5): for a composite the two are NOT
-      // negations but the all-fields rule (one level deep, not recursive); a scalar follows the
-      // ordinary rule. isNullTest folds both cases. Replaces the old `(v is null) !== negated`.
-      const operand = evalExpr(e.operand, row, env, m);
-      return { kind: "bool", value: isNullTest(operand, e.negated) };
-    }
-    case "isJson": {
-      m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, env, m);
-      let ok: boolean;
-      switch (v.kind) {
-        case "null":
-          return nullValue(); // a NULL operand → NULL (never raises)
-        // jsonb is always well-formed with unique keys; only the kind can fail.
-        case "jsonb":
-          ok = jsonPredKindMatches(v.node, e.jsonKind);
-          break;
-        // A string / json operand: parse (preserving duplicate keys); malformed → false. Only the
-        // UNIQUE KEYS check reads string contents, so only it de-escapes (PG's need_escapes =
-        // check_unique_keys): a `\u0000` or unpaired surrogate is then a parse failure → false
-        // (json.md §4.2).
-        case "json":
-        case "text": {
-          let node: JsonNode;
-          try {
-            node = e.uniqueKeys ? parsePreservingJson(v.text) : parseShapeJson(v.text);
-          } catch {
-            ok = false;
-            break;
-          }
-          ok =
-            jsonPredKindMatches(node, e.jsonKind) && !(e.uniqueKeys && jsonHasDuplicateKeys(node));
-          break;
-        }
-        default:
-          throw new Error(
-            "IS JSON: resolver restricts the operand to a string / json / jsonb value",
-          );
-      }
-      return { kind: "bool", value: ok !== e.negated };
-    }
-    case "jsonCtor": {
-      m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.operand, row, env, m);
-      if (v.kind === "null") return nullValue(); // STRICT
-      if (v.kind !== "text") {
-        throw new Error("BUG: resolver restricts JSON() to a text operand");
-      }
-      // Validate the string is well-formed JSON (22P02 on malformed — propagated), preserving
-      // duplicate keys so the optional UNIQUE KEYS check (22030) can see them. Only that check
-      // de-escapes (PG's need_escapes = unique_keys, json.md §4.2).
-      if (!e.uniqueKeys) {
-        parseShapeJson(v.text);
-        return jsonValue(v.text);
-      }
-      const node = parsePreservingJson(v.text);
-      if (jsonHasDuplicateKeys(node)) {
-        throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
-      }
-      // The result is the verbatim input text as a `json` value (PG).
-      return jsonValue(v.text);
-    }
-    case "distinct": {
-      m.charge(COSTS.operatorEval);
-      const dl = evalExpr(e.lhs, row, env, m);
-      const dr = evalExpr(e.rhs, row, env, m);
-      // IS [NOT] DISTINCT FROM is a comparison: a decimal pair charges its size-scaled
-      // decimal_work like "compare" (spec/design/cost.md §3 "decimal_work").
-      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(dl, dr) - 1));
-      m.guard();
-      const same = notDistinctFrom(dl, dr);
-      // negated carries the NOT keyword: IS NOT DISTINCT FROM (negated) asks "are they
-      // the same?"; IS DISTINCT FROM asks the opposite. Always a definite boolean — never
-      // unknown (the null_safe discipline, functions.md §3).
-      return { kind: "bool", value: same === e.negated };
-    }
-    case "like": {
-      m.charge(COSTS.operatorEval);
-      const subject = evalExpr(e.lhs, row, env, m);
-      const pattern = evalExpr(e.rhs, row, env, m);
-      // NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
-      // is still NULL, never 22025 (matches PG — grammar.md §22).
-      if (subject.kind === "null" || pattern.kind === "null") return nullValue();
-      if (subject.kind !== "text" || pattern.kind !== "text") {
-        throw new Error("unreachable: resolver requires text LIKE operands");
-      }
-      let sub = subject.text;
-      let pat = pattern.text;
-      // ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16) before
-      // matching — 1:1 folding so the matcher's _/length semantics survive.
-      if (e.insensitive) {
-        const prop = env.environment.property();
-        sub = foldLowerSimple(sub, prop);
-        pat = foldLowerSimple(pat, prop);
-      }
-      // negated carries NOT LIKE/ILIKE: matched !== negated flips for the NOT form.
-      return { kind: "bool", value: likeMatch(sub, pat) !== e.negated };
-    }
-    case "regex": {
-      m.charge(COSTS.operatorEval);
-      const subject = evalExpr(e.lhs, row, env, m);
-      const pattern = evalExpr(e.rhs, row, env, m);
-      // NULL propagates BEFORE the matcher runs (regex.md §1) — a malformed pattern against a NULL
-      // operand is still NULL, never 2201B.
-      if (subject.kind === "null" || pattern.kind === "null") return nullValue();
-      if (subject.kind !== "text" || pattern.kind !== "text") {
-        throw new Error("unreachable: resolver requires text regex operands");
-      }
-      // ~* (insensitive): simple-lowercase the subject under the engine casing regime (collation.md
-      // §16). The constant pattern was folded at resolve; a non-constant pattern is folded below.
-      const prop = e.insensitive ? env.environment.property() : undefined;
-      const sub = e.insensitive ? foldLowerSimple(subject.text, prop) : subject.text;
-      const subjCps = Array.from(sub, (c) => c.codePointAt(0) as number);
-      let matched: boolean;
-      if (e.program !== null) {
-        // Constant precompiled pattern: charge its regex_compile cost ONCE per statement execution
-        // (on first eval), not per row (regex.md §5).
-        if (!e.compileCharged) {
-          e.compileCharged = true;
-          m.charge(COSTS.regexCompile * BigInt(regexNinst(e.program)));
-          m.guard();
-        }
-        matched = regexIsMatch(e.program, subjCps, m);
-      } else {
-        // Non-constant pattern: compile now (charging regex_compile) and run.
-        const pat = e.insensitive ? foldRegexPattern(pattern.text, prop) : pattern.text;
-        const prog = compileRegex(pat);
-        m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
-        m.guard();
-        matched = regexIsMatch(prog, subjCps, m);
-      }
-      // negated carries !~ / !~*: matched !== negated flips for the negated form.
-      return { kind: "bool", value: matched !== e.negated };
-    }
-    case "regexFunc": {
-      m.charge(COSTS.operatorEval);
-      // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
-      const vals: Value[] = [];
-      for (const a of e.args) {
-        const v = evalExpr(a, row, env, m);
-        if (v.kind === "null") return nullValue();
-        vals.push(v);
-      }
-      const text = (v: Value): string => {
-        if (v.kind !== "text")
-          throw new Error("unreachable: resolver requires text regexp_* operands");
-        return v.text;
+    prog = e.program;
+  } else {
+    const pat = insensitive ? foldRegexPattern(pattern, prop) : pattern;
+    prog = compileRegex(pat);
+    m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
+    m.guard();
+  }
+  // 0-based search start; clamp to len+1 (a start past len+1 never enters the iteration loop →
+  // 0 / NULL, the PG rule, regex.md §8b).
+  const start0 = Math.min(start - 1, matchCps.length + 1);
+  switch (e.func) {
+    case "replace": {
+      const repl = Array.from(replacement, (ch) => ch.codePointAt(0) as number);
+      return {
+        kind: "text",
+        text: regexpReplaceText(prog, matchCps, origCps, repl, global, m),
       };
-      const int = (v: Value): number => {
-        if (v.kind !== "int")
-          throw new Error("unreachable: resolver requires integer regexp_* operands");
-        return Number(v.int);
-      };
-      const source = text(vals[0]);
-      const pattern = text(vals[1]);
-      // Per-function argument layout (regex.md §8 / §8b); the numeric defaults match PG.
-      let replacement = "";
-      let flags = "";
-      let start = 1;
-      let nth = 1;
-      let endoption = 0;
-      let subexpr = 0;
-      switch (e.func) {
-        case "replace":
-          replacement = text(vals[2]);
-          if (vals[3]) flags = text(vals[3]);
-          break;
-        case "match":
-        case "like":
-        case "split_to_array":
-        case "matches":
-        case "split_to_table":
-          if (vals[2]) flags = text(vals[2]);
-          break;
-        case "count":
-          if (vals[2]) start = int(vals[2]);
-          if (vals[3]) flags = text(vals[3]);
-          break;
-        case "substr":
-          if (vals[2]) start = int(vals[2]);
-          if (vals[3]) nth = int(vals[3]);
-          if (vals[4]) flags = text(vals[4]);
-          if (vals[5]) subexpr = int(vals[5]);
-          break;
-        case "instr":
-          if (vals[2]) start = int(vals[2]);
-          if (vals[3]) nth = int(vals[3]);
-          if (vals[4]) endoption = int(vals[4]);
-          if (vals[5]) flags = text(vals[5]);
-          if (vals[6]) subexpr = int(vals[6]);
-          break;
-      }
-      // Numeric argument validation (regex.md §8b), BEFORE the pattern compiles (PG order: a bad
-      // `start` beats a bad pattern). 22023 names the offending parameter.
-      const badParam = (p: string, v: number): EngineError =>
-        engineError("invalid_parameter_value", `invalid value for parameter "${p}": ${v}`);
-      if (e.func === "count" || e.func === "substr" || e.func === "instr") {
-        if (start < 1) throw badParam("start", start);
-      }
-      if (e.func === "substr" || e.func === "instr") {
-        if (nth < 1) throw badParam("n", nth);
-      }
-      if (e.func === "instr" && endoption !== 0 && endoption !== 1)
-        throw badParam("endoption", endoption);
-      if ((e.func === "substr" || e.func === "instr") && subexpr < 0)
-        throw badParam("subexpr", subexpr);
-      // Validate flags: `i` and `g` are known, anything else is 2201B. Then (PG order) `g` on a
-      // function that does not take it — all but regexp_replace / regexp_matches — is PostgreSQL's
-      // 22023 (regex.md §8c).
-      for (const c of flags) {
-        if (c !== "i" && c !== "g") {
-          throw engineError(
-            "invalid_regular_expression",
-            `invalid regular expression: invalid option "${c}"`,
-          );
-        }
-      }
-      const insensitive = flags.includes("i");
-      const global = flags.includes("g");
-      if (global && e.func !== "replace" && e.func !== "matches") {
-        throw engineError(
-          "invalid_parameter_value",
-          `regexp_${e.func}() does not support the "global" option`,
-        );
-      }
-      // The original-case subject (for output/captures) and the matched subject (folded when
-      // case-insensitive — same length, so offsets carry over, regex.md §8).
-      const origCps = Array.from(source, (ch) => ch.codePointAt(0) as number);
-      const prop = insensitive ? env.environment.property() : undefined;
-      const matchCps = insensitive
-        ? Array.from(foldLowerSimple(source, prop), (ch) => ch.codePointAt(0) as number)
-        : origCps;
-      let prog: RegexProgram;
-      if (e.program !== null) {
-        if (!e.compileCharged) {
-          e.compileCharged = true;
-          m.charge(COSTS.regexCompile * BigInt(regexNinst(e.program)));
-          m.guard();
-        }
-        prog = e.program;
-      } else {
-        const pat = insensitive ? foldRegexPattern(pattern, prop) : pattern;
-        prog = compileRegex(pat);
-        m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
-        m.guard();
-      }
-      // 0-based search start; clamp to len+1 (a start past len+1 never enters the iteration loop →
-      // 0 / NULL, the PG rule, regex.md §8b).
-      const start0 = Math.min(start - 1, matchCps.length + 1);
-      switch (e.func) {
-        case "replace": {
-          const repl = Array.from(replacement, (ch) => ch.codePointAt(0) as number);
-          return {
-            kind: "text",
-            text: regexpReplaceText(prog, matchCps, origCps, repl, global, m),
-          };
-        }
-        case "match":
-          return regexpCaptureArrays(prog, matchCps, origCps, false, m)[0] ?? nullValue();
-        case "like":
-          return boolValue(regexIsMatch(prog, matchCps, m));
-        case "split_to_array":
-        case "split_to_table":
-          return arrayValue(
-            regexpSplitPieces(prog, matchCps, origCps, m).map(
-              (p): Value => ({ kind: "text", text: p }),
-            ),
-          );
-        case "matches":
-          // The SRF transport: one text[] capture array per match.
-          return arrayValue(regexpCaptureArrays(prog, matchCps, origCps, global, m));
-        case "count":
-          return intValue(BigInt(regexpCount(prog, matchCps, start0, m)));
-        default: {
-          // substr / instr — both find the N-th match's subexpr span.
-          const caps = regexpNthMatch(prog, matchCps, start0, nth, m);
-          const noMatch = (): Value => (e.func === "substr" ? nullValue() : intValue(0n));
-          if (caps === null) return noMatch();
-          // `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
-          // or a non-participating group (-1) → NULL / 0.
-          if (subexpr > prog.ngroups) return noMatch();
-          const si = 2 * subexpr;
-          const s2 = regexSlot(prog, caps, si);
-          const e2 = regexSlot(prog, caps, si + 1);
-          if (s2 < 0 || e2 < 0) return noMatch();
-          if (e.func === "substr") {
-            return { kind: "text", text: String.fromCodePoint(...origCps.slice(s2, e2)) };
-          }
-          // endoption 0 → first-char position, 1 → after-last-char (1-based).
-          return intValue(BigInt(endoption === 0 ? s2 + 1 : e2 + 1));
-        }
-      }
     }
-    case "casing": {
-      m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.arg, row, env, m);
-      if (v.kind === "null") return nullValue();
-      if (v.kind !== "text") {
-        throw new Error("unreachable: resolver requires text upper/lower operand");
+    case "match":
+      return regexpCaptureArrays(prog, matchCps, origCps, false, m)[0] ?? nullValue();
+    case "like":
+      return boolValue(regexIsMatch(prog, matchCps, m));
+    case "split_to_array":
+    case "split_to_table":
+      return arrayValue(
+        regexpSplitPieces(prog, matchCps, origCps, m).map(
+          (p): Value => ({ kind: "text", text: p }),
+        ),
+      );
+    case "matches":
+      // The SRF transport: one text[] capture array per match.
+      return arrayValue(regexpCaptureArrays(prog, matchCps, origCps, global, m));
+    case "count":
+      return intValue(BigInt(regexpCount(prog, matchCps, start0, m)));
+    default: {
+      // substr / instr — both find the N-th match's subexpr span.
+      const caps = regexpNthMatch(prog, matchCps, start0, nth, m);
+      const noMatch = (): Value => (e.func === "substr" ? nullValue() : intValue(0n));
+      if (caps === null) return noMatch();
+      // `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
+      // or a non-participating group (-1) → NULL / 0.
+      if (subexpr > prog.ngroups) return noMatch();
+      const si = 2 * subexpr;
+      const s2 = regexSlot(prog, caps, si);
+      const e2 = regexSlot(prog, caps, si + 1);
+      if (s2 < 0 || e2 < 0) return noMatch();
+      if (e.func === "substr") {
+        return { kind: "text", text: String.fromCodePoint(...origCps.slice(s2, e2)) };
       }
-      return textValue(foldCase(v.text, e.upper, env.environment.property()));
+      // endoption 0 → first-char position, 1 → after-last-char (1-based).
+      return intValue(BigInt(endoption === 0 ? s2 + 1 : e2 + 1));
     }
-    case "atTimeZone": {
-      m.charge(COSTS.operatorEval);
-      const zv = evalExpr(e.zone, row, env, m);
-      const vv = evalExpr(e.value, row, env, m);
-      if (zv.kind === "null" || vv.kind === "null") return nullValue();
+  }
+}
+
+function evalCasingNode(e: Of<"casing">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const v = evalExpr(e.arg, row, env, m);
+  if (v.kind === "null") return nullValue();
+  if (v.kind !== "text") {
+    throw new Error("unreachable: resolver requires text upper/lower operand");
+  }
+  return textValue(foldCase(v.text, e.upper, env.environment.property()));
+}
+
+function evalAtTimeZoneNode(e: Of<"atTimeZone">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const zv = evalExpr(e.zone, row, env, m);
+  const vv = evalExpr(e.value, row, env, m);
+  if (zv.kind === "null" || vv.kind === "null") return nullValue();
+  if (zv.kind !== "text") throw new Error("unreachable: resolver requires a text zone");
+  if (vv.kind !== "timestamp" && vv.kind !== "timestamptz") {
+    throw new Error("unreachable: resolver requires a timestamp/timestamptz value");
+  }
+  m.charge(COSTS.timezone);
+  m.guard();
+  const micros = vv.micros;
+  // ±infinity passes through unchanged (PG): no zone offset applies, zone not validated.
+  if (micros === POS_INFINITY || micros === NEG_INFINITY) {
+    return e.toTimestamptz ? timestamptzValue(micros) : timestampValue(micros);
+  }
+  const zr = resolveZone(zv.text, env.environment);
+  if (zr === undefined) {
+    throw engineError("invalid_parameter_value", `time zone "${zv.text}" not recognized`);
+  }
+  return e.toTimestamptz
+    ? timestamptzValue(localToInstantMicros(zr, micros))
+    : timestampValue(instantToLocalMicros(zr, micros));
+}
+
+function evalDateTruncNode(e: Of<"dateTrunc">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const uv = evalExpr(e.unit, row, env, m);
+  const vv = evalExpr(e.value, row, env, m);
+  const zv = e.zone !== null ? evalExpr(e.zone, row, env, m) : null;
+  if (uv.kind === "null" || vv.kind === "null" || (zv !== null && zv.kind === "null")) {
+    return nullValue();
+  }
+  if (uv.kind !== "text") throw new Error("unreachable: resolver requires a text unit");
+  const unitS = uv.text;
+  if (vv.kind === "timestamp") return timestampValue(dateTruncMicros(unitS, vv.micros, false));
+  if (vv.kind === "interval") return intervalValue(dateTruncInterval(unitS, vv.iv));
+  if (vv.kind === "timestamptz") {
+    const mc = vv.micros;
+    if (mc === POS_INFINITY || mc === NEG_INFINITY) {
+      dateTruncMicros(unitS, mc, true); // still validate the unit
+      return timestamptzValue(mc);
+    }
+    let zr: ZoneRef;
+    if (zv !== null) {
       if (zv.kind !== "text") throw new Error("unreachable: resolver requires a text zone");
-      if (vv.kind !== "timestamp" && vv.kind !== "timestamptz") {
-        throw new Error("unreachable: resolver requires a timestamp/timestamptz value");
-      }
-      m.charge(COSTS.timezone);
-      m.guard();
-      const micros = vv.micros;
-      // ±infinity passes through unchanged (PG): no zone offset applies, zone not validated.
-      if (micros === POS_INFINITY || micros === NEG_INFINITY) {
-        return e.toTimestamptz ? timestamptzValue(micros) : timestampValue(micros);
-      }
-      const zr = resolveZone(zv.text, env.environment);
-      if (zr === undefined) {
+      const r = resolveZone(zv.text, env.environment);
+      if (r === undefined) {
         throw engineError("invalid_parameter_value", `time zone "${zv.text}" not recognized`);
       }
-      return e.toTimestamptz
-        ? timestamptzValue(localToInstantMicros(zr, micros))
-        : timestampValue(instantToLocalMicros(zr, micros));
+      zr = r;
+    } else {
+      zr = env.exec.session.timeZone;
     }
-    case "dateTrunc": {
-      m.charge(COSTS.operatorEval);
-      const uv = evalExpr(e.unit, row, env, m);
-      const vv = evalExpr(e.value, row, env, m);
-      const zv = e.zone !== null ? evalExpr(e.zone, row, env, m) : null;
-      if (uv.kind === "null" || vv.kind === "null" || (zv !== null && zv.kind === "null")) {
-        return nullValue();
+    m.charge(COSTS.timezone);
+    m.guard();
+    const local = instantToLocalMicros(zr, mc);
+    const trunc = dateTruncMicros(unitS, local, true);
+    return timestamptzValue(localToInstantMicros(zr, trunc));
+  }
+  throw new Error("unreachable: resolver restricts date_trunc to ts/tstz/interval");
+}
+
+function evalExtractNode(e: Of<"extract">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const vv = evalExpr(e.value, row, env, m);
+  if (vv.kind === "null") return nullValue();
+  let src: ExtractSrc;
+  if (vv.kind === "timestamp") src = { kind: "ts", micros: vv.micros };
+  else if (vv.kind === "date") src = { kind: "date", days: vv.days };
+  else if (vv.kind === "interval") src = { kind: "interval", iv: vv.iv };
+  else if (vv.kind === "timestamptz") {
+    const mc = vv.micros;
+    // `epoch` is zone-independent (the instant); every other field decomposes in the session zone
+    // — so only the zone-consulting fields charge `timezone`.
+    if (e.field === "epoch" || mc === POS_INFINITY || mc === NEG_INFINITY) {
+      src = { kind: "tstz", instant: mc, local: mc, offsetSecs: 0n };
+    } else {
+      const zr = env.exec.session.timeZone;
+      m.charge(COSTS.timezone);
+      m.guard();
+      const local = instantToLocalMicros(zr, mc);
+      const secs = mc >= 0n ? mc / 1_000_000n : -((-mc + 999_999n) / 1_000_000n);
+      const off = BigInt(offsetAtRef(zr, secs).utoff);
+      src = { kind: "tstz", instant: mc, local, offsetSecs: off };
+    }
+  } else {
+    throw new Error("unreachable: resolver restricts EXTRACT to ts/tstz/date/interval");
+  }
+  // An oscillating field of a ±infinity source is NULL (timezones.md §9.2).
+  const d = extractField(e.field, src);
+  return d === null ? nullValue() : decimalValue(d);
+}
+
+function evalDateConvertNode(e: Of<"dateConvert">, row: Row, env: EvalEnv, m: Meter): Value {
+  m.charge(COSTS.operatorEval);
+  const v = evalExpr(e.inner, row, env, m);
+  if (v.kind === "null") return nullValue();
+  return evalDateConvert(v, e.to, env, m);
+}
+
+function evalDateClockNode(e: Of<"dateClock">, env: EvalEnv, m: Meter): Value {
+  // A clock-relative date literal ('today'/'now'/'tomorrow'/'yesterday' — date.md §6): the
+  // statement clock's day in the session zone + offsetDays. STABLE — the clock is read once
+  // per statement, so every evaluation in the statement yields the same day.
+  m.charge(COSTS.operatorEval);
+  return dateClockValue(env.exec, env.rng, env.environment, m, e.offsetDays);
+}
+
+function evalCaseNode(e: Of<"case">, row: Row, env: EvalEnv, m: Meter): Value {
+  // CASE is a sanctioned short-circuit (cost.md §3), like AND / OR and COALESCE: conditions are
+  // evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN
+  // condition falls through, and later arms (and their results) are NOT evaluated. Required
+  // for PG semantics (e.g. `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero).
+  // Charge the node, then only the conditions up to the match plus the selected result.
+  m.charge(COSTS.operatorEval);
+  for (const arm of e.arms) {
+    const cv = evalExpr(arm.cond, row, env, m);
+    if (cv.kind === "bool" && cv.value) {
+      return coerceCaseValue(evalExpr(arm.result, row, env, m), e.coerceDecimal);
+    }
+  }
+  return coerceCaseValue(evalExpr(e.els, row, env, m), e.coerceDecimal);
+}
+
+function evalCoalesceNode(e: Of<"coalesce">, row: Row, env: EvalEnv, m: Meter): Value {
+  // COALESCE shares CASE's sanctioned short-circuit (cost.md §3): charge the node, then
+  // evaluate arguments left to right — each at most ONCE — stopping at the first non-NULL,
+  // which is the result. All-NULL → NULL. Later arguments are never evaluated, so an error
+  // (or cost) in an unreached argument does not surface (grammar.md §51).
+  m.charge(COSTS.operatorEval);
+  for (const a of e.args) {
+    const v = evalExpr(a, row, env, m);
+    if (v.kind !== "null") {
+      return coerceCaseValue(v, e.coerceDecimal);
+    }
+  }
+  return nullValue();
+}
+
+function evalGreatestLeastNode(e: Of<"greatestLeast">, row: Row, env: EvalEnv, m: Meter): Value {
+  // GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY argument
+  // (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments are ignored; the
+  // running winner is the max (greatest) or min (least) under the unified type's total order
+  // (valueCmp, or collation for text). All-NULL → NULL. Non-NULL values are coerced to the
+  // unified type (integer → decimal) before comparison so the comparator sees a single type.
+  // Each comparison after the first charges its size-scaled work (decimalWork / varlenCompare /
+  // collate), the same metering an explicit `<` chain would — the untrusted-query bound (§13).
+  m.charge(COSTS.operatorEval);
+  let best: Value | null = null;
+  for (const a of e.args) {
+    const cv = coerceCaseValue(evalExpr(a, row, env, m), e.coerceDecimal);
+    if (cv.kind === "null") continue;
+    if (best === null) {
+      best = cv;
+      continue;
+    }
+    let c: number;
+    if (e.collation !== null && cv.kind === "text" && best.kind === "text") {
+      m.charge(COSTS.collate * BigInt(Array.from(cv.text).length + Array.from(best.text).length));
+      m.guard();
+      c = collatedCmp(e.collation, cv.text, best.text);
+    } else if (e.collation !== null && cv.kind === "array" && best.kind === "array") {
+      c = collatedArrayCmp(e.collation, cv, best, m);
+    } else {
+      m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(cv, best) - 1));
+      m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(cv, best) - 1));
+      m.guard();
+      c = valueCmp(cv, best);
+    }
+    if ((e.greatest && c > 0) || (!e.greatest && c < 0)) {
+      best = cv;
+    }
+  }
+  return best ?? nullValue();
+}
+
+function evalHostFuncNode(e: Of<"hostFunc">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the injection
+  // seam. The kernel is reached BY ID through the frozen registry — the path the compiled
+  // scalarFunc dispatch cannot offer a host.
+  const hf = env.exec.session.environment.hostFunctions()!.functionAt(e.id);
+  // The declared static cost (cost.md §6 design (a)), charged once per call; arguments charge
+  // their own. Guard immediately after (the size-scaled-charge discipline) so a large declared
+  // weight aborts BEFORE the kernel runs.
+  m.charge(hf.cost);
+  m.guard();
+  // The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 — speculative
+  // batch, scalar replay), or a batch-of-one call when it has none. A prefetched outcome proves
+  // every argument is trivially evaluable (free, cannot raise) and non-NULL on this row, so
+  // evaluating them again here would charge nothing, raise nothing, and not short-circuit — the
+  // replay skips it.
+  const outcome = env.hostBatch?.take(e);
+  let out: Value;
+  if (outcome === undefined) {
+    // STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the
+    // kernel never sees a NULL — exactly like the built-in scalar-function arm.
+    const hvals: Value[] = [];
+    for (const a of e.args) {
+      const v = evalExpr(a, row, env, m);
+      if (v.kind === "null") return nullValue(); // NULL propagates
+      hvals.push(v);
+    }
+    out = hf.callOne(hvals);
+  } else if ("error" in outcome) throw outcome.error;
+  else out = outcome.value;
+  // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md §13 — the
+  // host owns its consequences, but a wrong-typed value must never reach jed's codecs /
+  // comparators): the returned value must be NULL or match the declared scalar result type.
+  if (!valueMatchesResult(out, e.result)) {
+    throw engineError(
+      "data_exception",
+      `host function returned a value not matching its declared result type ${e.result}`,
+    );
+  }
+  // An integer must also fit the declared width: the "int" value is one bigint carrier for
+  // i16/i32/i64, so a kernel declared `-> i32` returning 2^40 matches the type above yet would
+  // leak an out-of-range i32 into comparisons / casts / key encodings. Trap 22003 here, on this
+  // row, exactly as a built-in's result-boundary check does.
+  if (out.kind === "int" && !inRange(e.result, out.int)) throw overflow(e.result);
+  return out;
+}
+
+function evalScalarFuncNode(e: Of<"scalarFunc">, row: Row, env: EvalEnv, m: Meter): Value {
+  // One operator_eval per call (the uniform weight); arguments charge their own.
+  m.charge(COSTS.operatorEval);
+  // quote_nullable is the one NON-STRICT scalar function: a NULL argument yields the text
+  // 'NULL', not a propagated NULL, so it runs before the strict short-circuit loop below
+  // (string-functions.md §3).
+  if (e.func === "quote_nullable") {
+    const v = evalExpr(e.args[0]!, row, env, m);
+    const out = textValue(
+      v.kind === "null" ? "NULL" : quoteLiteralText((v as { text: string }).text),
+    );
+    // A growth kernel: quoting doubles every quote (cost.md §8.1).
+    return growthResult(m, e.args, out);
+  }
+  const vals: Value[] = [];
+  for (const a of e.args) {
+    const v = evalExpr(a, row, env, m);
+    if (v.kind === "null") return nullValue(); // NULL propagates
+    vals.push(v);
+  }
+  if (e.func === "make_interval") {
+    // make_interval — six integer components plus the f64 secs. years/months → months
+    // field (×12), weeks/days → days field (×7), hours/mins/secs → micros; an i32/i64 field
+    // overflow traps 22008 (functions.md §11). The one float step (secs → micros) is
+    // correctly-rounded + deterministic, so the interval is in-contract. A f32 secs reads
+    // as its exact f64 value (.value holds the binary64 of either width).
+    const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
+    const secMicros = f64ToMicros((vals[6] as { value: number }).value);
+    return intervalValue(
+      makeInterval(geti(0), geti(1), geti(2), geti(3), geti(4), geti(5), secMicros),
+    );
+  }
+  if (e.func === "make_timestamp" || e.func === "make_timestamptz") {
+    // make_timestamp / make_timestamptz — the make_interval siblings (functions.md §11).
+    // Assemble the wall clock from the five integer fields + the f64 sec (an out-of-range field
+    // traps 22008). make_timestamptz then interprets that wall clock in a zone (the session zone
+    // for the 6-arg form, the trailing timezone text for the 7-arg form), charging one timezone
+    // unit like AT TIME ZONE; an unrecognized explicit zone is 22023. A f32 sec reads as its
+    // exact f64 value (.value holds the binary64 of either width).
+    const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
+    const wall = makeTimestamp(
+      geti(0),
+      geti(1),
+      geti(2),
+      geti(3),
+      geti(4),
+      (vals[5] as { value: number }).value,
+    );
+    if (e.func === "make_timestamp") return timestampValue(wall);
+    // make_timestamptz: interpret the wall clock in a zone → a UTC instant.
+    m.charge(COSTS.timezone);
+    m.guard();
+    if (vals.length === 7) {
+      const zoneStr = (vals[6] as { text: string }).text;
+      const z = resolveZone(zoneStr, env.environment);
+      if (z === undefined) {
+        throw engineError("invalid_parameter_value", `time zone "${zoneStr}" not recognized`);
       }
-      if (uv.kind !== "text") throw new Error("unreachable: resolver requires a text unit");
-      const unitS = uv.text;
-      if (vv.kind === "timestamp") return timestampValue(dateTruncMicros(unitS, vv.micros, false));
-      if (vv.kind === "interval") return intervalValue(dateTruncInterval(unitS, vv.iv));
-      if (vv.kind === "timestamptz") {
-        const mc = vv.micros;
-        if (mc === POS_INFINITY || mc === NEG_INFINITY) {
-          dateTruncMicros(unitS, mc, true); // still validate the unit
-          return timestamptzValue(mc);
-        }
-        let zr: ZoneRef;
-        if (zv !== null) {
-          if (zv.kind !== "text") throw new Error("unreachable: resolver requires a text zone");
-          const r = resolveZone(zv.text, env.environment);
-          if (r === undefined) {
-            throw engineError("invalid_parameter_value", `time zone "${zv.text}" not recognized`);
-          }
-          zr = r;
-        } else {
-          zr = env.exec.session.timeZone;
-        }
+      return timestamptzValue(localToInstantMicros(z, wall));
+    }
+    return timestamptzValue(localToInstantMicros(env.exec.session.timeZone, wall));
+  }
+  if (e.func === "make_date") {
+    // make_date(year, month, day) — the make_timestamp sibling (functions.md §11): a negative
+    // year is BC; year zero / a bad field / an out-of-range day count traps 22008.
+    const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
+    return dateValue(makeDate(geti(0), geti(1), geti(2)));
+  }
+  if (e.func === "current_date") {
+    // CURRENT_DATE (functions.md §12, date.md §6): the statement clock's day in the session
+    // zone — the 'today' literal as a function. STABLE; dateClockValue charges the timezone
+    // unit.
+    return dateClockValue(env.exec, env.rng, env.environment, m, 0n);
+  }
+  if (e.func === "date_part") {
+    // date_part(field, source) — the float8-returning EXTRACT twin (timezones.md §9.2): the
+    // shared extract kernel, then decimal → f64. The field is a RUNTIME text value
+    // (case-insensitive, validated here — 22023 unrecognized / 0A000 unsupported-for-type,
+    // like date_trunc's unit). A date source WIDENS TO MIDNIGHT and the timestamp matrix
+    // applies (PG defines date_part(text, date) over ::timestamp — so 'hour' is 0 where
+    // EXTRACT over a date is 0A000); the widen traps 22008 past the timestamp range. A
+    // timestamptz source decomposes in the session zone with EXTRACT's exact selective
+    // timezone charge. NULL propagation is the blanket case above.
+    const field = lowerUnit((vals[0] as { text: string }).text);
+    const sv = vals[1]!;
+    let src: ExtractSrc;
+    if (sv.kind === "date") {
+      src = { kind: "ts", micros: dateMidnightMicros(sv.days) };
+    } else if (sv.kind === "timestamp") {
+      src = { kind: "ts", micros: sv.micros };
+    } else if (sv.kind === "interval") {
+      src = { kind: "interval", iv: sv.iv };
+    } else if (sv.kind === "timestamptz") {
+      const mc = sv.micros;
+      if (field === "epoch" || mc === POS_INFINITY || mc === NEG_INFINITY) {
+        src = { kind: "tstz", instant: mc, local: mc, offsetSecs: 0n };
+      } else {
+        const zr = env.exec.session.timeZone;
         m.charge(COSTS.timezone);
         m.guard();
         const local = instantToLocalMicros(zr, mc);
-        const trunc = dateTruncMicros(unitS, local, true);
-        return timestamptzValue(localToInstantMicros(zr, trunc));
+        const secs = mc >= 0n ? mc / 1_000_000n : -((-mc + 999_999n) / 1_000_000n);
+        const off = BigInt(offsetAtRef(zr, secs).utoff);
+        src = { kind: "tstz", instant: mc, local, offsetSecs: off };
       }
-      throw new Error("unreachable: resolver restricts date_trunc to ts/tstz/interval");
+    } else {
+      throw new Error("unreachable: resolver restricts date_part to date/ts/tstz/interval");
     }
-    case "extract": {
-      m.charge(COSTS.operatorEval);
-      const vv = evalExpr(e.value, row, env, m);
-      if (vv.kind === "null") return nullValue();
-      let src: ExtractSrc;
-      if (vv.kind === "timestamp") src = { kind: "ts", micros: vv.micros };
-      else if (vv.kind === "date") src = { kind: "date", days: vv.days };
-      else if (vv.kind === "interval") src = { kind: "interval", iv: vv.iv };
-      else if (vv.kind === "timestamptz") {
-        const mc = vv.micros;
-        // `epoch` is zone-independent (the instant); every other field decomposes in the session zone
-        // — so only the zone-consulting fields charge `timezone`.
-        if (e.field === "epoch" || mc === POS_INFINITY || mc === NEG_INFINITY) {
-          src = { kind: "tstz", instant: mc, local: mc, offsetSecs: 0n };
-        } else {
-          const zr = env.exec.session.timeZone;
-          m.charge(COSTS.timezone);
-          m.guard();
-          const local = instantToLocalMicros(zr, mc);
-          const secs = mc >= 0n ? mc / 1_000_000n : -((-mc + 999_999n) / 1_000_000n);
-          const off = BigInt(offsetAtRef(zr, secs).utoff);
-          src = { kind: "tstz", instant: mc, local, offsetSecs: off };
-        }
-      } else {
-        throw new Error("unreachable: resolver restricts EXTRACT to ts/tstz/date/interval");
+    if (src.kind === "ts" || src.kind === "tstz") {
+      const local = src.kind === "ts" ? src.micros : src.local;
+      if (canonicalField(field) === "julian" && local !== POS_INFINITY && local !== NEG_INFINITY) {
+        // PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
+        return float64Value(datePartJulian(local));
       }
-      // An oscillating field of a ±infinity source is NULL (timezones.md §9.2).
-      const d = extractField(e.field, src);
-      return d === null ? nullValue() : decimalValue(d);
     }
-    case "dateConvert": {
-      m.charge(COSTS.operatorEval);
-      const v = evalExpr(e.inner, row, env, m);
-      if (v.kind === "null") return nullValue();
-      return evalDateConvert(v, e.to, env, m);
-    }
-    case "dateClock": {
-      // A clock-relative date literal ('today'/'now'/'tomorrow'/'yesterday' — date.md §6): the
-      // statement clock's day in the session zone + offsetDays. STABLE — the clock is read once
-      // per statement, so every evaluation in the statement yields the same day.
-      m.charge(COSTS.operatorEval);
-      return dateClockValue(env.exec, env.rng, env.environment, m, e.offsetDays);
-    }
-    case "case": {
-      // CASE is a sanctioned short-circuit (cost.md §3), like AND / OR and COALESCE: conditions are
-      // evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN
-      // condition falls through, and later arms (and their results) are NOT evaluated. Required
-      // for PG semantics (e.g. `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero).
-      // Charge the node, then only the conditions up to the match plus the selected result.
-      m.charge(COSTS.operatorEval);
-      for (const arm of e.arms) {
-        const cv = evalExpr(arm.cond, row, env, m);
-        if (cv.kind === "bool" && cv.value) {
-          return coerceCaseValue(evalExpr(arm.result, row, env, m), e.coerceDecimal);
-        }
-      }
-      return coerceCaseValue(evalExpr(e.els, row, env, m), e.coerceDecimal);
-    }
-    case "coalesce": {
-      // COALESCE shares CASE's sanctioned short-circuit (cost.md §3): charge the node, then
-      // evaluate arguments left to right — each at most ONCE — stopping at the first non-NULL,
-      // which is the result. All-NULL → NULL. Later arguments are never evaluated, so an error
-      // (or cost) in an unreached argument does not surface (grammar.md §51).
-      m.charge(COSTS.operatorEval);
-      for (const a of e.args) {
-        const v = evalExpr(a, row, env, m);
-        if (v.kind !== "null") {
-          return coerceCaseValue(v, e.coerceDecimal);
-        }
-      }
-      return nullValue();
-    }
-    case "greatestLeast": {
-      // GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY argument
-      // (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments are ignored; the
-      // running winner is the max (greatest) or min (least) under the unified type's total order
-      // (valueCmp, or collation for text). All-NULL → NULL. Non-NULL values are coerced to the
-      // unified type (integer → decimal) before comparison so the comparator sees a single type.
-      // Each comparison after the first charges its size-scaled work (decimalWork / varlenCompare /
-      // collate), the same metering an explicit `<` chain would — the untrusted-query bound (§13).
-      m.charge(COSTS.operatorEval);
-      let best: Value | null = null;
-      for (const a of e.args) {
-        const cv = coerceCaseValue(evalExpr(a, row, env, m), e.coerceDecimal);
-        if (cv.kind === "null") continue;
-        if (best === null) {
-          best = cv;
-          continue;
-        }
-        let c: number;
-        if (e.collation !== null && cv.kind === "text" && best.kind === "text") {
-          m.charge(
-            COSTS.collate * BigInt(Array.from(cv.text).length + Array.from(best.text).length),
-          );
-          m.guard();
-          c = collatedCmp(e.collation, cv.text, best.text);
-        } else if (e.collation !== null && cv.kind === "array" && best.kind === "array") {
-          c = collatedArrayCmp(e.collation, cv, best, m);
-        } else {
-          m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(cv, best) - 1));
-          m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(cv, best) - 1));
-          m.guard();
-          c = valueCmp(cv, best);
-        }
-        if ((e.greatest && c > 0) || (!e.greatest && c < 0)) {
-          best = cv;
-        }
-      }
-      return best ?? nullValue();
-    }
-    case "hostFunc": {
-      // A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the injection
-      // seam. The kernel is reached BY ID through the frozen registry — the path the compiled
-      // scalarFunc dispatch cannot offer a host.
-      const hf = env.exec.session.environment.hostFunctions()!.functionAt(e.id);
-      // The declared static cost (cost.md §6 design (a)), charged once per call; arguments charge
-      // their own. Guard immediately after (the size-scaled-charge discipline) so a large declared
-      // weight aborts BEFORE the kernel runs.
-      m.charge(hf.cost);
-      m.guard();
-      // The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 — speculative
-      // batch, scalar replay), or a batch-of-one call when it has none. A prefetched outcome proves
-      // every argument is trivially evaluable (free, cannot raise) and non-NULL on this row, so
-      // evaluating them again here would charge nothing, raise nothing, and not short-circuit — the
-      // replay skips it.
-      const outcome = env.hostBatch?.take(e);
-      let out: Value;
-      if (outcome === undefined) {
-        // STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the
-        // kernel never sees a NULL — exactly like the built-in scalar-function arm.
-        const hvals: Value[] = [];
-        for (const a of e.args) {
-          const v = evalExpr(a, row, env, m);
-          if (v.kind === "null") return nullValue(); // NULL propagates
-          hvals.push(v);
-        }
-        out = hf.callOne(hvals);
-      } else if ("error" in outcome) throw outcome.error;
-      else out = outcome.value;
-      // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md §13 — the
-      // host owns its consequences, but a wrong-typed value must never reach jed's codecs /
-      // comparators): the returned value must be NULL or match the declared scalar result type.
-      if (!valueMatchesResult(out, e.result)) {
-        throw engineError(
-          "data_exception",
-          `host function returned a value not matching its declared result type ${e.result}`,
-        );
-      }
-      // An integer must also fit the declared width: the "int" value is one bigint carrier for
-      // i16/i32/i64, so a kernel declared `-> i32` returning 2^40 matches the type above yet would
-      // leak an out-of-range i32 into comparisons / casts / key encodings. Trap 22003 here, on this
-      // row, exactly as a built-in's result-boundary check does.
-      if (out.kind === "int" && !inRange(e.result, out.int)) throw overflow(e.result);
-      return out;
-    }
-    case "scalarFunc": {
-      // One operator_eval per call (the uniform weight); arguments charge their own.
-      m.charge(COSTS.operatorEval);
-      // quote_nullable is the one NON-STRICT scalar function: a NULL argument yields the text
-      // 'NULL', not a propagated NULL, so it runs before the strict short-circuit loop below
-      // (string-functions.md §3).
-      if (e.func === "quote_nullable") {
-        const v = evalExpr(e.args[0]!, row, env, m);
-        const out = textValue(
-          v.kind === "null" ? "NULL" : quoteLiteralText((v as { text: string }).text),
-        );
-        // A growth kernel: quoting doubles every quote (cost.md §8.1).
-        return growthResult(m, e.args, out);
-      }
-      const vals: Value[] = [];
-      for (const a of e.args) {
-        const v = evalExpr(a, row, env, m);
-        if (v.kind === "null") return nullValue(); // NULL propagates
-        vals.push(v);
-      }
-      if (e.func === "make_interval") {
-        // make_interval — six integer components plus the f64 secs. years/months → months
-        // field (×12), weeks/days → days field (×7), hours/mins/secs → micros; an i32/i64 field
-        // overflow traps 22008 (functions.md §11). The one float step (secs → micros) is
-        // correctly-rounded + deterministic, so the interval is in-contract. A f32 secs reads
-        // as its exact f64 value (.value holds the binary64 of either width).
-        const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
-        const secMicros = f64ToMicros((vals[6] as { value: number }).value);
-        return intervalValue(
-          makeInterval(geti(0), geti(1), geti(2), geti(3), geti(4), geti(5), secMicros),
-        );
-      }
-      if (e.func === "make_timestamp" || e.func === "make_timestamptz") {
-        // make_timestamp / make_timestamptz — the make_interval siblings (functions.md §11).
-        // Assemble the wall clock from the five integer fields + the f64 sec (an out-of-range field
-        // traps 22008). make_timestamptz then interprets that wall clock in a zone (the session zone
-        // for the 6-arg form, the trailing timezone text for the 7-arg form), charging one timezone
-        // unit like AT TIME ZONE; an unrecognized explicit zone is 22023. A f32 sec reads as its
-        // exact f64 value (.value holds the binary64 of either width).
-        const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
-        const wall = makeTimestamp(
-          geti(0),
-          geti(1),
-          geti(2),
-          geti(3),
-          geti(4),
-          (vals[5] as { value: number }).value,
-        );
-        if (e.func === "make_timestamp") return timestampValue(wall);
-        // make_timestamptz: interpret the wall clock in a zone → a UTC instant.
+    // Over a ±infinity source PG's float8 result carries what EXTRACT's numeric cannot:
+    // ±Infinity for a monotonic field, NULL for an oscillating one (timezones.md §9.2).
+    const out = extractPart(field, src);
+    if (out.kind === "null") return nullValue();
+    if (out.kind === "infinite") return float64Value(out.negative ? -Infinity : Infinity);
+    const f = Number(out.dec.render());
+    if (!Number.isFinite(f)) throw overflow("f64");
+    return float64Value(f);
+  }
+  // interval normalizers (spec/design/interval.md §5.1). The NULL-input case is already
+  // handled above.
+  if (e.func === "justify_hours") {
+    return intervalValue(justifyHours((vals[0] as { iv: Interval }).iv));
+  }
+  if (e.func === "justify_days") {
+    return intervalValue(justifyDays((vals[0] as { iv: Interval }).iv));
+  }
+  if (e.func === "justify_interval") {
+    return intervalValue(justifyInterval((vals[0] as { iv: Interval }).iv));
+  }
+  // age (spec/design/interval.md §5.2). The one-argument form is PG's SQL wrapper
+  // age(CURRENT_DATE::timestamp[tz], x): the statement clock's day in the session zone
+  // (dateClockValue charges one timezone unit), widened to midnight — for timestamptz, midnight
+  // read in the session zone (one more timezone unit). A timestamptz pair then decomposes each
+  // finite operand in the session zone (one timezone unit each); any ±infinity operand traps
+  // 22008 before any decomposition. The NULL-input case is already handled above.
+  if (e.func === "age") {
+    let x = vals[0]! as { kind: string; micros: bigint };
+    let dt1: bigint;
+    if (vals.length === 1) {
+      const today = dateClockValue(env.exec, env.rng, env.environment, m, 0n) as {
+        days: bigint;
+      };
+      dt1 = dateMidnightMicros(today.days);
+      if (x.kind === "timestamptz") {
         m.charge(COSTS.timezone);
         m.guard();
-        if (vals.length === 7) {
-          const zoneStr = (vals[6] as { text: string }).text;
-          const z = resolveZone(zoneStr, env.environment);
-          if (z === undefined) {
-            throw engineError("invalid_parameter_value", `time zone "${zoneStr}" not recognized`);
-          }
-          return timestamptzValue(localToInstantMicros(z, wall));
-        }
-        return timestamptzValue(localToInstantMicros(env.exec.session.timeZone, wall));
-      }
-      if (e.func === "make_date") {
-        // make_date(year, month, day) — the make_timestamp sibling (functions.md §11): a negative
-        // year is BC; year zero / a bad field / an out-of-range day count traps 22008.
-        const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
-        return dateValue(makeDate(geti(0), geti(1), geti(2)));
-      }
-      if (e.func === "current_date") {
-        // CURRENT_DATE (functions.md §12, date.md §6): the statement clock's day in the session
-        // zone — the 'today' literal as a function. STABLE; dateClockValue charges the timezone
-        // unit.
-        return dateClockValue(env.exec, env.rng, env.environment, m, 0n);
-      }
-      if (e.func === "date_part") {
-        // date_part(field, source) — the float8-returning EXTRACT twin (timezones.md §9.2): the
-        // shared extract kernel, then decimal → f64. The field is a RUNTIME text value
-        // (case-insensitive, validated here — 22023 unrecognized / 0A000 unsupported-for-type,
-        // like date_trunc's unit). A date source WIDENS TO MIDNIGHT and the timestamp matrix
-        // applies (PG defines date_part(text, date) over ::timestamp — so 'hour' is 0 where
-        // EXTRACT over a date is 0A000); the widen traps 22008 past the timestamp range. A
-        // timestamptz source decomposes in the session zone with EXTRACT's exact selective
-        // timezone charge. NULL propagation is the blanket case above.
-        const field = lowerUnit((vals[0] as { text: string }).text);
-        const sv = vals[1]!;
-        let src: ExtractSrc;
-        if (sv.kind === "date") {
-          src = { kind: "ts", micros: dateMidnightMicros(sv.days) };
-        } else if (sv.kind === "timestamp") {
-          src = { kind: "ts", micros: sv.micros };
-        } else if (sv.kind === "interval") {
-          src = { kind: "interval", iv: sv.iv };
-        } else if (sv.kind === "timestamptz") {
-          const mc = sv.micros;
-          if (field === "epoch" || mc === POS_INFINITY || mc === NEG_INFINITY) {
-            src = { kind: "tstz", instant: mc, local: mc, offsetSecs: 0n };
-          } else {
-            const zr = env.exec.session.timeZone;
-            m.charge(COSTS.timezone);
-            m.guard();
-            const local = instantToLocalMicros(zr, mc);
-            const secs = mc >= 0n ? mc / 1_000_000n : -((-mc + 999_999n) / 1_000_000n);
-            const off = BigInt(offsetAtRef(zr, secs).utoff);
-            src = { kind: "tstz", instant: mc, local, offsetSecs: off };
-          }
-        } else {
-          throw new Error("unreachable: resolver restricts date_part to date/ts/tstz/interval");
-        }
-        if (src.kind === "ts" || src.kind === "tstz") {
-          const local = src.kind === "ts" ? src.micros : src.local;
-          if (
-            canonicalField(field) === "julian" &&
-            local !== POS_INFINITY &&
-            local !== NEG_INFINITY
-          ) {
-            // PG's float8 julian formula, not the numeric value converted (timezones.md §9.2).
-            return float64Value(datePartJulian(local));
-          }
-        }
-        // Over a ±infinity source PG's float8 result carries what EXTRACT's numeric cannot:
-        // ±Infinity for a monotonic field, NULL for an oscillating one (timezones.md §9.2).
-        const out = extractPart(field, src);
-        if (out.kind === "null") return nullValue();
-        if (out.kind === "infinite") return float64Value(out.negative ? -Infinity : Infinity);
-        const f = Number(out.dec.render());
-        if (!Number.isFinite(f)) throw overflow("f64");
-        return float64Value(f);
-      }
-      // interval normalizers (spec/design/interval.md §5.1). The NULL-input case is already
-      // handled above.
-      if (e.func === "justify_hours") {
-        return intervalValue(justifyHours((vals[0] as { iv: Interval }).iv));
-      }
-      if (e.func === "justify_days") {
-        return intervalValue(justifyDays((vals[0] as { iv: Interval }).iv));
-      }
-      if (e.func === "justify_interval") {
-        return intervalValue(justifyInterval((vals[0] as { iv: Interval }).iv));
-      }
-      // age (spec/design/interval.md §5.2). The one-argument form is PG's SQL wrapper
-      // age(CURRENT_DATE::timestamp[tz], x): the statement clock's day in the session zone
-      // (dateClockValue charges one timezone unit), widened to midnight — for timestamptz, midnight
-      // read in the session zone (one more timezone unit). A timestamptz pair then decomposes each
-      // finite operand in the session zone (one timezone unit each); any ±infinity operand traps
-      // 22008 before any decomposition. The NULL-input case is already handled above.
-      if (e.func === "age") {
-        let x = vals[0]! as { kind: string; micros: bigint };
-        let dt1: bigint;
-        if (vals.length === 1) {
-          const today = dateClockValue(env.exec, env.rng, env.environment, m, 0n) as {
-            days: bigint;
-          };
-          dt1 = dateMidnightMicros(today.days);
-          if (x.kind === "timestamptz") {
-            m.charge(COSTS.timezone);
-            m.guard();
-            dt1 = localToInstantMicros(env.exec.session.timeZone, dt1);
-          }
-        } else {
-          dt1 = x.micros;
-          x = vals[1]! as { kind: string; micros: bigint };
-        }
-        const dt2 = x.micros;
-        ageRejectInfinite(dt1, dt2);
-        let local1 = dt1;
-        let local2 = dt2;
-        if (x.kind === "timestamptz") {
-          const zr = env.exec.session.timeZone;
-          m.charge(COSTS.timezone);
-          m.guard();
-          local1 = instantToLocalMicros(zr, dt1);
-          m.charge(COSTS.timezone);
-          m.guard();
-          local2 = instantToLocalMicros(zr, dt2);
-        }
-        return intervalValue(age(dt1, dt2, local1, local2));
-      }
-      // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
-      // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is
-      // already handled above.
-      if (e.func === "uuid_extract_version") {
-        const ver = uuidExtractVersion((vals[0] as { bytes: Uint8Array }).bytes);
-        return ver === null ? nullValue() : intValue(ver);
-      }
-      if (e.func === "uuid_extract_timestamp") {
-        const mc = uuidExtractTimestampMicros((vals[0] as { bytes: Uint8Array }).bytes);
-        return mc === null ? nullValue() : timestamptzValue(mc);
-      }
-      // uuid generators (spec/design/entropy.md §3): draw from the per-statement seam (env.rng),
-      // advancing the PRNG/counter. The NULL-arg case is handled above.
-      if (e.func === "uuidv4") {
-        return uuidValue(env.rng.uuidV4(env.environment));
-      }
-      if (e.func === "uuidv7") {
-        const clock = env.rng.statementClockMicros(env.environment);
-        // The optional interval arg shifts the embedded instant via the existing calendar-aware
-        // timestamptz arithmetic (entropy.md §4).
-        const shifted =
-          vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
-        return uuidValue(env.rng.uuidV7(env.environment, shifted));
-      }
-      // current-time functions (spec/design/entropy.md §5): now() reads the statement clock ONCE and
-      // reuses it (STABLE); clock_timestamp() reads the seam on every call (VOLATILE). Both return
-      // the seam's micros directly as timestamptz.
-      if (e.func === "now") {
-        return timestamptzValue(env.rng.statementClockMicros(env.environment));
-      }
-      if (e.func === "clock_timestamp") {
-        return timestamptzValue(env.rng.clockNowMicros(env.environment));
-      }
-      // Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an additional
-      // sequence_advance unit (the catalog-tuple read+rewrite) and mutates the per-statement pending
-      // state; currval is a pure session-state read. The NULL-arg case is handled above (propagates).
-      if (e.func === "nextval") {
-        m.charge(COSTS.sequenceAdvance);
-        // The text names the sequence as one identifier (grammar.md §3; 42602 when malformed).
-        return intValue(env.exec.seqNextval(parseNameText((vals[0] as { text: string }).text)));
-      }
-      if (e.func === "currval") {
-        return intValue(env.exec.seqCurrval(parseNameText((vals[0] as { text: string }).text)));
-      }
-      // setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2 →
-      // isCalled defaults true; arity 3 → the boolean third argument.
-      if (e.func === "setval") {
-        m.charge(COSTS.sequenceAdvance);
-        const seqName = parseNameText((vals[0] as { text: string }).text);
-        const isCalled = vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
-        return intValue(env.exec.seqSetval(seqName, (vals[1] as { int: bigint }).int, isCalled));
-      }
-      if (e.func === "lastval") {
-        return intValue(env.exec.seqLastval());
-      }
-      // current_setting (spec/design/session.md §6.1): read the named session variable from the
-      // session's variable map. The blanket NULL propagation above already returned NULL for a NULL
-      // name / missing_ok argument, so both are non-NULL here. An unset name is 42704 UNLESS the
-      // two-arg overload's missing_ok is true (→ NULL).
-      if (e.func === "current_setting") {
-        const name = (vals[0] as { text: string }).text;
-        const missingOk = vals.length > 1 && (vals[1] as { value: boolean }).value;
-        const got = env.exec.session.vars.get(name.toLowerCase());
-        if (got !== undefined) {
-          return textValue(got);
-        }
-        if (missingOk) {
-          return nullValue();
-        }
-        throw engineError("undefined_object", "unrecognized configuration parameter: " + name);
-      }
-      // json/jsonb processing functions (B1, json-sql-functions.md §2). A jsonb arg is the node
-      // directly; a json arg is parsed from its verbatim text on demand (json.md §4), then dispatched
-      // to the same kernel. The NULL-input case was already handled by the blanket propagation above.
-      if (e.func === "jsonb_typeof" || e.func === "json_typeof") {
-        // Neither reads string contents, so a json arg is only lexed (jsonArgShape, json.md §4.2).
-        return textValue(jsonTypeofName(jsonArgShape(vals[0]!)));
-      }
-      if (e.func === "jsonb_array_length" || e.func === "json_array_length") {
-        return intValue(jsonArrayLength(jsonArgShape(vals[0]!)));
-      }
-      if (e.func === "jsonb_strip_nulls") {
-        return jsonbValue(jsonStripNulls(jsonArgNode(vals[0]!)));
-      }
-      if (e.func === "json_strip_nulls") {
-        // json_strip_nulls returns json — render the stripped tree COMPACTLY (PG's json output
-        // style), preserving the on-demand parse's key order.
-        return jsonValue(jsonCompactOut(jsonStripNulls(jsonArgNode(vals[0]!))));
-      }
-      if (e.func === "jsonb_pretty") {
-        return textValue(jsonbPrettyText(vals[0]!, m));
-      }
-      if (e.func === "json_serialize") {
-        // JSON_SERIALIZE(v) → the value's text serialization: a json value verbatim, a jsonb value its
-        // canonical (jsonbOut) render (json-sql-functions.md §5). STRICT (NULL handled above).
-        const v0 = vals[0]!;
-        if (v0.kind === "json") return growthResult(m, e.args, textValue(v0.text));
-        if (v0.kind === "jsonb") return growthResult(m, e.args, textValue(jsonbOut(v0.node)));
-        throw new Error("BUG: resolver restricts JSON_SERIALIZE to json/jsonb");
-      }
-      if (e.func === "length") {
-        // length(text) → i32 — the number of characters (Unicode code points). TS strings are
-        // UTF-16, so [...s] (the code-point iterator) counts code points, NOT s.length, which
-        // would over-count astral characters as surrogate pairs (string-functions.md §2/§3).
-        // Over bytea, length is the byte count (string-functions.md §4).
-        const v0 = vals[0]!;
-        if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
-        const s = (v0 as { text: string }).text;
-        return intValue(BigInt([...s].length));
-      }
-      if (e.func === "octet_length") {
-        // octet_length(text) → i32 — the UTF-8 byte count, distinct from length's code-point
-        // count (string-functions.md §3). utf8ByteLength encodes via TextEncoder. Over bytea, the
-        // byte count (§4).
-        const v0 = vals[0]!;
-        if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
-        return intValue(BigInt(utf8ByteLength((v0 as { text: string }).text)));
-      }
-      if (e.func === "bit_length") {
-        // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8. Over bytea, bytes × 8.
-        const v0 = vals[0]!;
-        if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length * 8));
-        return intValue(BigInt(utf8ByteLength((v0 as { text: string }).text) * 8));
-      }
-      if (e.func === "substr") {
-        // substr / substring(text, start[, count]) → text — the function form of SUBSTRING; over
-        // bytea the same window over bytes (string-functions.md §4).
-        const start = (vals[1] as { int: bigint }).int;
-        const count = vals.length > 2 ? (vals[2] as { int: bigint }).int : null;
-        const v0 = vals[0]!;
-        if (v0.kind === "bytea") return byteaValue(substrBytes(v0.bytes, start, count));
-        return textValue(substrChars((v0 as { text: string }).text, start, count));
-      }
-      if (e.func === "left") {
-        // left(text, n) → text — the first n characters (negative n drops the last |n|).
-        const s = (vals[0] as { text: string }).text;
-        return textValue(leftChars(s, (vals[1] as { int: bigint }).int));
-      }
-      if (e.func === "right") {
-        // right(text, n) → text — the last n characters (negative n drops the first |n|).
-        const s = (vals[0] as { text: string }).text;
-        return textValue(rightChars(s, (vals[1] as { int: bigint }).int));
-      }
-      if (e.func === "lpad") {
-        // lpad(text, length[, fill]) → text — pad/truncate on the LEFT (default fill a space).
-        const s = (vals[0] as { text: string }).text;
-        const length = (vals[1] as { int: bigint }).int;
-        const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
-        return textValue(padChars(s, length, fill, true, m));
-      }
-      if (e.func === "rpad") {
-        // rpad(text, length[, fill]) → text — pad/truncate on the RIGHT (default fill a space).
-        const s = (vals[0] as { text: string }).text;
-        const length = (vals[1] as { int: bigint }).int;
-        const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
-        return textValue(padChars(s, length, fill, false, m));
-      }
-      if (e.func === "btrim") {
-        // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
-        if (vals[0]!.kind === "bytea") {
-          // btrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
-          const set = (vals[1] as { bytes: Uint8Array }).bytes;
-          return byteaValue(trimBytes(vals[0]!.bytes, set, true, true));
-        }
-        const s = (vals[0] as { text: string }).text;
-        const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
-        return textValue(trimChars(s, set, true, true));
-      }
-      if (e.func === "ltrim") {
-        // ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
-        if (vals[0]!.kind === "bytea") {
-          // ltrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
-          const set = (vals[1] as { bytes: Uint8Array }).bytes;
-          return byteaValue(trimBytes(vals[0]!.bytes, set, true, false));
-        }
-        const s = (vals[0] as { text: string }).text;
-        const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
-        return textValue(trimChars(s, set, true, false));
-      }
-      if (e.func === "rtrim") {
-        // rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
-        if (vals[0]!.kind === "bytea") {
-          // rtrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
-          const set = (vals[1] as { bytes: Uint8Array }).bytes;
-          return byteaValue(trimBytes(vals[0]!.bytes, set, false, true));
-        }
-        const s = (vals[0] as { text: string }).text;
-        const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
-        return textValue(trimChars(s, set, false, true));
-      }
-      if (e.func === "replace") {
-        // replace(text, from, to) → text — substring replace-all; empty `from` is a no-op.
-        const s = (vals[0] as { text: string }).text;
-        const from = (vals[1] as { text: string }).text;
-        const to = (vals[2] as { text: string }).text;
-        return textValue(replaceText(s, from, to, m));
-      }
-      if (e.func === "translate") {
-        // translate(text, from, to) → text — per-character map/delete.
-        const s = (vals[0] as { text: string }).text;
-        const from = (vals[1] as { text: string }).text;
-        const to = (vals[2] as { text: string }).text;
-        return textValue(translateChars(s, from, to));
-      }
-      if (e.func === "repeat") {
-        // repeat(text, n) → text — concatenate the string n times.
-        const s = (vals[0] as { text: string }).text;
-        return textValue(repeatText(s, (vals[1] as { int: bigint }).int, m));
-      }
-      if (e.func === "reverse") {
-        // reverse(text) → text — the code points in reverse order. [...s] splits by code point
-        // (not UTF-16 unit), so an astral character stays intact (string-functions.md §2).
-        const s = (vals[0] as { text: string }).text;
-        return textValue([...s].reverse().join(""));
-      }
-      if (e.func === "strpos") {
-        // strpos(text, substring) → i32 — 1-based code-point position, else 0. indexOf gives a
-        // UTF-16-unit offset; the match begins at a code-point boundary, so the code-point
-        // position is the code-point count of the prefix + 1 (empty sub → 1, string-functions.md §3).
-        if (vals[0]!.kind === "bytea") {
-          // position(bytea, sub) → i32 — the 1-based byte position (§4).
-          return intValue(positionBytes(vals[0]!.bytes, (vals[1] as { bytes: Uint8Array }).bytes));
-        }
-        const s = (vals[0] as { text: string }).text;
-        const sub = (vals[1] as { text: string }).text;
-        const idx = s.indexOf(sub);
-        return intValue(idx < 0 ? 0n : BigInt([...s.slice(0, idx)].length + 1));
-      }
-      if (e.func === "split_part") {
-        // split_part(text, delimiter, n) → text — the n-th split field.
-        const s = (vals[0] as { text: string }).text;
-        const delim = (vals[1] as { text: string }).text;
-        return textValue(splitPart(s, delim, (vals[2] as { int: bigint }).int));
-      }
-      if (e.func === "starts_with") {
-        // starts_with(text, prefix) → boolean — string begins with prefix.
-        const s = (vals[0] as { text: string }).text;
-        const pfx = (vals[1] as { text: string }).text;
-        return boolValue(s.startsWith(pfx));
-      }
-      if (e.func === "ascii") {
-        // ascii(text) → i32 — the code point of the first character (empty → 0). codePointAt(0)
-        // returns the full code point (an astral char is one value, not a surrogate, §2).
-        const s = (vals[0] as { text: string }).text;
-        return intValue(BigInt(s.length === 0 ? 0 : (s.codePointAt(0) ?? 0)));
-      }
-      if (e.func === "chr") {
-        // chr(int) → text — the one-character string for a code point.
-        return textValue(chrText((vals[0] as { int: bigint }).int));
-      }
-      if (e.func === "initcap") {
-        // initcap(text) → text — titlecase each word.
-        return textValue(initcapAscii((vals[0] as { text: string }).text));
-      }
-      if (e.func === "to_hex") {
-        // to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern. asUintN(64)
-        // maps a negative i64 to its unsigned bit pattern, matching Rust/Go.
-        const n = (vals[0] as { int: bigint }).int;
-        return textValue(BigInt.asUintN(64, n).toString(16));
-      }
-      if (e.func === "encode") {
-        // encode(bytea, format) → text — hex / base64 / escape.
-        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
-        const fmt = (vals[1] as { text: string }).text;
-        // A growth kernel: hex doubles its input (cost.md §8.1).
-        return growthResult(m, e.args, textValue(encodeBytea(bytes, fmt)));
-      }
-      if (e.func === "decode") {
-        // decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
-        const s = (vals[0] as { text: string }).text;
-        const fmt = (vals[1] as { text: string }).text;
-        return byteaValue(decodeText(s, fmt));
-      }
-      if (e.func === "get_byte") {
-        // get_byte(bytea, n) → i32 — the n-th byte (0-based), unsigned.
-        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
-        return intValue(getByte(bytes, (vals[1] as { int: bigint }).int));
-      }
-      if (e.func === "set_byte") {
-        // set_byte(bytea, n, v) → bytea — the n-th byte replaced by v's low 8 bits.
-        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
-        const n = (vals[1] as { int: bigint }).int;
-        return byteaValue(setByte(bytes, n, (vals[2] as { int: bigint }).int));
-      }
-      if (e.func === "get_bit") {
-        // get_bit(bytea, n) → i32 — the n-th bit (0-based), 0 or 1.
-        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
-        return intValue(getBit(bytes, (vals[1] as { int: bigint }).int));
-      }
-      if (e.func === "set_bit") {
-        // set_bit(bytea, n, v) → bytea — the n-th bit set to v (0 or 1).
-        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
-        const n = (vals[1] as { int: bigint }).int;
-        return byteaValue(setBit(bytes, n, (vals[2] as { int: bigint }).int));
-      }
-      if (e.func === "md5") {
-        // md5(text | bytea) → text — 32 lowercase hex digits; text hashes its UTF-8 bytes.
-        const v = vals[0]!;
-        return textValue(md5Hex(v.kind === "bytea" ? v.bytes : (v as { text: string }).text));
-      }
-      if (
-        e.func === "sha224" ||
-        e.func === "sha256" ||
-        e.func === "sha384" ||
-        e.func === "sha512"
-      ) {
-        // sha224/sha256/sha384/sha512(bytea) → bytea — the raw SHA-2 digest.
-        return byteaValue(sha2Digest(e.func, (vals[0] as { bytes: Uint8Array }).bytes));
-      }
-      if (e.func === "overlay") {
-        // overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice; count
-        // defaults to length(new) (characters for text, bytes for bytea). A growth kernel (cost.md
-        // §8.1), free over constant operands.
-        const start = (vals[2] as { int: bigint }).int;
-        const v0 = vals[0]!;
-        const v1 = vals[1]!;
-        if (v0.kind === "bytea" && v1.kind === "bytea") {
-          const count =
-            vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt(v1.bytes.length);
-          return growthResult(
-            m,
-            e.args,
-            byteaValue(overlayBytes(v0.bytes, v1.bytes, start, count)),
-          );
-        }
-        const s = (v0 as { text: string }).text;
-        const r = (v1 as { text: string }).text;
-        const count = vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt([...r].length);
-        return growthResult(m, e.args, textValue(overlayChars(s, r, start, count)));
-      }
-      if (e.func === "bytea_concat") {
-        // bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant operands.
-        const a = (vals[0] as { bytes: Uint8Array }).bytes;
-        const b = (vals[1] as { bytes: Uint8Array }).bytes;
-        const out = new Uint8Array(a.length + b.length);
-        out.set(a, 0);
-        out.set(b, a.length);
-        return growthResult(m, e.args, byteaValue(out));
-      }
-      if (e.func === "text_concat") {
-        // text || text → text. A growth kernel (cost.md §8.1), free over constant operands.
-        const a = (vals[0] as { text: string }).text;
-        const b = (vals[1] as { text: string }).text;
-        return growthResult(m, e.args, textValue(a + b));
-      }
-      if (e.func === "quote_literal") {
-        // quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
-        // doubles every quote (cost.md §8.1).
-        return growthResult(
-          m,
-          e.args,
-          textValue(quoteLiteralText((vals[0] as { text: string }).text)),
-        );
-      }
-      if (e.func === "like_escape") {
-        // like_escape(pattern, escape) → text — the LIKE … ESCAPE rewrite (grammar.md §22). A growth
-        // kernel like quote_literal: it can double backslashes, and nests.
-        const out = likeEscapeText(
-          (vals[0] as { text: string }).text,
-          (vals[1] as { text: string }).text,
-        );
-        return growthResult(m, e.args, textValue(out));
-      }
-      if (e.func === "quote_ident") {
-        // quote_ident(text) → text — wrap as a SQL identifier; a growth kernel like quote_literal.
-        return growthResult(
-          m,
-          e.args,
-          textValue(quoteIdentText((vals[0] as { text: string }).text)),
-        );
-      }
-      if (e.func === "pi") {
-        // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64
-        // literal in every core.
-        return float64Value(Math.PI);
-      }
-      if (e.func === "div") {
-        // div(a, b): the truncated integer quotient at scale 0, computed EXACTLY as (a − a%b)/b —
-        // a − a%b is exactly q·b, so the division is exact and roundToScale(0) only drops the
-        // (already-zero) fraction. rem() traps 22012 on a zero divisor. Integer operands promote.
-        const toDec = (v: Value): Decimal =>
-          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
-        const a = toDec(vals[0]!);
-        const b = toDec(vals[1]!);
-        const q = a.sub(a.rem(b)).div(b);
-        return decimalValue(q.roundToScale(0));
-      }
-      if (e.func === "gcd") {
-        // gcd: integer operands → Euclid over bigint (the result must fit the promoted type, else
-        // 22003 — gcd(MinInt64, 0) and the rare i16-cap edge); a decimal operand → exact decimal
-        // Euclid at scale max(sₐ, s_b). gcd(0, 0) = 0.
-        const a0 = vals[0]!;
-        const b0 = vals[1]!;
-        if (a0.kind === "int" && b0.kind === "int") {
-          const g = gcdBigint(a0.int, b0.int);
-          if (!inRange(e.result, g)) throw overflow(e.result);
-          return intValue(g);
-        }
-        const toDec = (v: Value): Decimal =>
-          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
-        return decimalValue(gcdDecimalValue(toDec(a0), toDec(b0)));
-      }
-      if (e.func === "lcm") {
-        // lcm: |a/gcd·b|. Integer → the promoted type (an out-of-range magnitude → 22003); a
-        // decimal operand → exact at scale max(sₐ, s_b). lcm(_, 0) = 0.
-        const a0 = vals[0]!;
-        const b0 = vals[1]!;
-        if (a0.kind === "int" && b0.kind === "int") {
-          const l = lcmBigint(a0.int, b0.int);
-          if (!inRange(e.result, l)) throw overflow(e.result);
-          return intValue(l);
-        }
-        const toDec = (v: Value): Decimal =>
-          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
-        return decimalValue(lcmDecimalValue(toDec(a0), toDec(b0)));
-      }
-      if (e.func === "factorial") {
-        // factorial(n) = n! at scale 0. A negative operand → 22003. Each multiply is metered
-        // (size-scaled decimal_work, guarded) so the cost ceiling bounds a large factorial before
-        // its limb work runs (cost.md §3, §13); a product over the value cap traps 22003.
-        const n = (vals[0] as { int: bigint }).int;
-        if (n < 0n)
-          throw engineError(
-            "numeric_value_out_of_range",
-            "factorial of a negative number is undefined",
-          );
-        let acc = Decimal.fromBigInt(1n);
-        for (let k = 2n; k <= n; k++) {
-          const kd = Decimal.fromBigInt(k);
-          m.charge(COSTS.decimalWork * BigInt(workMul(acc, kd) - 1));
-          m.guard();
-          acc = acc.mul(kd);
-        }
-        return decimalValue(acc);
-      }
-      if (e.func === "width_bucket") {
-        // width_bucket(op, low, high, count): the histogram bucket index. count > 0 (else 2201G);
-        // dispatch numeric vs float on the operand; the raw index is range-checked to int4.
-        const count = (vals[3] as { int: bigint }).int;
-        if (count <= 0n) throw widthBucketErr("count must be greater than zero");
-        const op = vals[0]!;
-        // The resolver guarantees the value trio is homogeneous: all float → the float kernel;
-        // otherwise the numeric kernel (integers promote to decimal).
-        const fv = (v: Value): number => (v as { value: number }).value;
-        const toDec = (v: Value): Decimal =>
-          v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
-        const idx =
-          op.kind === "f32" || op.kind === "f64"
-            ? widthBucketFloat(fv(op), fv(vals[1]!), fv(vals[2]!), count)
-            : widthBucketNumeric(toDec(op), toDec(vals[1]!), toDec(vals[2]!), count);
-        if (!inRange("i32", idx)) throw overflow("i32");
-        return intValue(idx);
-      }
-      if (e.func === "scale") {
-        // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
-        return intValue(BigInt((vals[0] as { dec: Decimal }).dec.scale));
-      }
-      if (e.func === "min_scale") {
-        // min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
-        return intValue(BigInt(minScaleOf((vals[0] as { dec: Decimal }).dec)));
-      }
-      if (e.func === "trim_scale") {
-        // trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
-        // digits are zeros, so roundToScale does not round).
-        const d = (vals[0] as { dec: Decimal }).dec;
-        return decimalValue(d.roundToScale(minScaleOf(d)));
-      }
-      const v0 = vals[0];
-      // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
-      // catalog, only abs is operand-typed (result "promoted"); every other float func returns
-      // f64 (result "f64") — so the result Value's width is e.result, not argWidth. The
-      // computation is done in binary64; abs frounds for a f32 result via e.result.
-      if (v0.kind === "f32" || v0.kind === "f64") {
-        if (e.func === "pow") {
-          // pow(x, y): both operands are float (promoted to one width at resolve); result f64.
-          const v1 = vals[1] as { value: number };
-          return evalFloatPow(v0.value, v1.value, e.result);
-        }
-        if (e.func === "atan2") {
-          // atan2(y, x): y is vals[0], x is vals[1] (both widened to f64). Quadrant-aware; no trap.
-          const v1 = vals[1] as { value: number };
-          return float64Value(Math.atan2(v0.value, v1.value));
-        }
-        // round(x, n): n is an int operand; the unary funcs ignore it.
-        const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
-        return evalFloatFunc(e.func, v0.value, places, e.result);
-      }
-      if (e.func === "abs") {
-        if (v0.kind === "int") {
-          // abs over an integer: |x| then range-check at the result type's boundary
-          // (abs(i16 -32768) → 22003), exactly like neg.
-          let n = v0.int;
-          if (n < 0n) n = -n;
-          if (!inRange(e.result, n)) throw overflow(e.result);
-          return intValue(n);
-        }
-        return decimalValue((v0 as { dec: Decimal }).dec.abs());
-      }
-      if (e.func === "sign") {
-        // sign over a decimal → numeric at scale 0 (-1 / 0 / +1).
-        const d = (v0 as { dec: Decimal }).dec;
-        const s = d.limbs.length === 0 ? 0n : d.neg ? -1n : 1n;
-        return decimalValue(Decimal.fromBigInt(s));
-      }
-      if (e.func === "ceil" || e.func === "floor" || e.func === "trunc") {
-        // ceil/ceiling/floor/trunc over decimal (and integer, promoted) — the EXACT-numeric
-        // overloads (decimal.md §6, functions.md §9). The float overloads returned above. ceil/
-        // floor round to scale 0 toward ±∞ (a round-up carry can trap 22003); trunc truncates
-        // toward zero to scale 0 or its n-place argument (never overflows).
-        const dd = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
-        if (e.func === "ceil") return decimalValue(dd.ceil());
-        if (e.func === "floor") return decimalValue(dd.floor());
-        const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
-        return decimalValue(dd.truncPlaces(places));
-      }
-      if (
-        e.func === "sqrt" ||
-        e.func === "exp" ||
-        e.func === "ln" ||
-        e.func === "log10" ||
-        e.func === "log" ||
-        e.func === "pow"
-      ) {
-        // EXACT-numeric transcendentals over decimal (decimal.md §8). Float operands returned
-        // above; here the operand is decimal — a PG-faithful arbitrary-precision kernel,
-        // byte-identical across cores. Domain errors: sqrt of a negative and the power domain
-        // errors → 2201F; ln/log of a non-positive → 2201E; exp/power overflow → 22003.
-        const a = (v0 as { dec: Decimal }).dec;
-        switch (e.func) {
-          case "sqrt":
-            return decimalValue(a.decSqrt(m));
-          case "exp":
-            return decimalValue(a.decExp(m));
-          case "ln":
-            return decimalValue(a.decLn(m));
-          case "log10":
-            return decimalValue(a.decLog10(m));
-          case "log": {
-            const num = vals.length > 1 ? (vals[1] as { dec: Decimal }).dec : null;
-            return decimalValue(num ? Decimal.decLog(a, num, m) : a.decLog10(m));
-          }
-          default: {
-            // pow (the catalog `power(decimal,decimal)`, renamed to "pow" at resolve)
-            const exp = (vals[1] as { dec: Decimal }).dec;
-            return decimalValue(Decimal.decPower(a, exp, m));
-          }
-        }
-      }
-      // round
-      const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
-      const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
-      return decimalValue(d.roundPlaces(places));
+        dt1 = localToInstantMicros(env.exec.session.timeZone, dt1);
+      }
+    } else {
+      dt1 = x.micros;
+      x = vals[1]! as { kind: string; micros: bigint };
     }
-    case "arrayFunc": {
-      // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval per call;
-      // arguments charge their own. NULL handling is per-kernel (the introspectors propagate, the
-      // builders are non-strict), so — unlike "scalarFunc" — there is no blanket NULL short-circuit.
-      m.charge(COSTS.operatorEval);
-      const vals: Value[] = [];
-      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
-      const out = evalArrayFunc(e.func, vals, m);
-      // The builders are growth kernels (cost.md §8.1), free over constant operands.
-      if (
-        (e.func === "array_append" || e.func === "array_prepend" || e.func === "array_cat") &&
-        !e.args.every(rexprIsConstant)
-      )
-        chargeOutput(m, out);
-      return out;
-    }
-    case "rangeFunc": {
-      // A polymorphic range accessor (spec/design/range-functions.md §1, RF1). One operator_eval per
-      // call; arguments charge their own. STRICT (a NULL range → NULL), handled in the kernel.
-      m.charge(COSTS.operatorEval);
-      const vals: Value[] = [];
-      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
-      return evalRangeFunc(e.func, vals);
-    }
-    case "rangeCtor": {
-      // A range CONSTRUCTOR call (spec/design/range-functions.md §2, RF2). One operator_eval (like
-      // the range accessors); arguments charge their own evaluation. Non-strict — the kernel turns a
-      // NULL bound into an infinite bound, so there is no blanket NULL short-circuit.
-      m.charge(COSTS.operatorEval);
-      const vals: Value[] = [];
-      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
-      return evalRangeCtor(e.elem, vals, env.exec.inputZone());
-    }
-    case "rangeOp": {
-      // A range BOOLEAN operator (spec/design/range-functions.md §3, RF3). One operator_eval; the
-      // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
-      // evalRangeOp.
-      m.charge(COSTS.operatorEval);
-      const l = evalExpr(e.args[0]!, row, env, m);
-      const r = evalExpr(e.args[1]!, row, env, m);
-      return evalRangeOp(e.op, l, r, e.elem, env.exec.inputZone());
-    }
-    case "rangeSetOp": {
-      // A range SET operator (spec/design/range-functions.md §4). One operator_eval; the operands
-      // charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeSetOp.
-      m.charge(COSTS.operatorEval);
-      const l = evalExpr(e.args[0]!, row, env, m);
-      const r = evalExpr(e.args[1]!, row, env, m);
-      return evalRangeSetOp(e.op, l, r);
-    }
-    case "variadic": {
-      // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
-      // (the per-element/arg count walk is unmetered, like the array introspectors §3.3); arguments
-      // charge their own. Non-strict — no blanket NULL short-circuit. The two forms differ: the
-      // spread form counts the args' null-ness (never NULL); the VARIADIC-array form returns NULL on
-      // a NULL whole-array, else counts the array's flattened elements' null-ness.
-      m.charge(COSTS.operatorEval);
-      const wantNulls = e.func === "num_nulls";
-      if (e.arrayForm) {
-        const v = evalExpr(e.args[0]!, row, env, m);
-        if (v.kind === "null") return nullValue();
-        if (v.kind !== "array")
-          throw new Error("resolver restricts a VARIADIC operand to an array");
-        return intValue(BigInt(countNulls(v.elements, wantNulls)));
-      }
-      const vals: Value[] = [];
-      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
-      return intValue(BigInt(countNulls(vals, wantNulls)));
-    }
-    case "jsonBuild": {
-      // A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values (the
-      // spread form directly; the VARIADIC-array form spreads the lone array — a NULL whole-array →
-      // SQL NULL), then build an array / object node. Non-strict — a NULL argument is JSON null
-      // (array) or a value (object), so no blanket NULL short-circuit.
-      m.charge(COSTS.operatorEval);
-      let vals: Value[];
-      if (e.arrayForm) {
-        const v = evalExpr(e.args[0]!, row, env, m);
-        if (v.kind === "null") return nullValue();
-        if (v.kind !== "array")
-          throw new Error("resolver restricts a VARIADIC operand to an array");
-        vals = v.elements;
-      } else {
-        vals = [];
-        for (const a of e.args) vals.push(evalExpr(a, row, env, m));
-      }
-      m.charge(COSTS.operatorEval * BigInt(vals.length));
-      // A finite timestamptz at any depth renders in the session zone: one timezone unit each,
-      // charged before rendering (json-sql-functions.md §2.2).
-      let zoned = 0;
-      for (const v of vals) zoned += zoneRenderCount(v);
-      m.charge(COSTS.timezone * BigInt(zoned));
+    const dt2 = x.micros;
+    ageRejectInfinite(dt1, dt2);
+    let local1 = dt1;
+    let local2 = dt2;
+    if (x.kind === "timestamptz") {
+      const zr = env.exec.session.timeZone;
+      m.charge(COSTS.timezone);
       m.guard();
-      // Each argument's static type: the spread form's own, the VARIADIC-array form's element.
-      const elemType = (i: number): ResolvedType => {
-        if (!e.arrayForm) return e.types[i]!;
-        const t = e.types[0]!;
-        if (t.kind !== "array") throw new Error("a VARIADIC operand is an array");
-        return t.elem;
-      };
-      const zone = env.exec.session.timeZone;
-      if (e.buildKind === "array") {
-        if (e.json) {
-          // json_build_array → a `json` value: each element's json image, joined `, ` inside `[...]`.
-          const out: string[] = ["["];
-          vals.forEach((v, i) => {
-            if (i > 0) out.push(", ");
-            datumToJson(v, elemType(i), zone, out);
-          });
-          out.push("]");
-          // The builders nest their arguments one level (json.md §6.4).
-          const text = out.join("");
-          jsonCheckTextDepth(text);
-          return growthResult(m, e.args, jsonValue(text));
-        }
-        // jsonb_build_array → a jsonb value: each argument's jsonb image, canonical render.
-        const out: JsonNode = {
-          kind: "array",
-          elements: vals.map((v, i) => datumToJsonb(v, elemType(i), zone)),
-        };
-        jsonCheckDepth(out);
-        return growthResult(m, e.args, jsonbValue(out));
-      }
-      // object
-      if (vals.length % 2 !== 0) {
-        throw engineError(
-          "invalid_parameter_value",
-          "argument list must have even number of elements",
-        );
-      }
-      if (e.json) {
-        // json_build_object → a `json` value keeping argument order + duplicate keys: the key as a
-        // JSON string, `" : "` (space-colon-space) before the value's json image, members joined `, `
-        // inside `{...}`. A NULL key is 22004 (the jsonb form's is 22023).
-        const out: string[] = ["{"];
-        for (let i = 0; i < vals.length; i += 2) {
-          if (vals[i]!.kind === "null") throw objectKeyNull();
-          if (i > 0) out.push(", ");
-          writeJsonString(jsonKeyText(vals[i]!, zone), out);
-          out.push(" : ");
-          datumToJson(vals[i + 1]!, elemType(i + 1), zone, out);
-        }
-        out.push("}");
-        const text = out.join("");
-        jsonCheckTextDepth(text);
-        return growthResult(m, e.args, jsonValue(text));
-      }
-      // jsonb_build_object → a jsonb object: (key, jsonb image) members, last-wins dedup + canonical
-      // key sort via makeObject.
-      const members: JsonMember[] = [];
-      for (let i = 0; i < vals.length; i += 2) {
-        if (vals[i]!.kind === "null") {
-          throw engineError("invalid_parameter_value", `argument ${i + 1}: key must not be null`);
-        }
-        const key = jsonKeyText(vals[i]!, zone);
-        members.push({ key, value: datumToJsonb(vals[i + 1]!, elemType(i + 1), zone) });
-      }
-      const out = jsonMakeObject(members);
-      jsonCheckDepth(out);
-      return growthResult(m, e.args, jsonbValue(out));
-    }
-    case "jsonSetInsert": {
-      // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
-      // → SQL NULL (a NULL path element is the kernel's 22004). jsonb_set_lax is jsonb_set that is
-      // not strict in the value: a SQL NULL value is handled by its null_value_treatment.
-      m.charge(COSTS.operatorEval);
-      const vals = e.args.map((a) => evalExpr(a, row, env, m));
+      local1 = instantToLocalMicros(zr, dt1);
+      m.charge(COSTS.timezone);
       m.guard();
-      const [target, pathV, valueV, flagV] = vals as [Value, Value, Value, Value];
-      let valueNode: JsonNode;
-      if (e.lax) {
-        if (target.kind === "null" || pathV.kind === "null" || flagV.kind === "null") {
-          return nullValue();
-        }
-        const treatmentV = vals[4]!;
-        // An explicit NULL treatment is rejected even for a non-NULL value (PG).
-        if (treatmentV.kind !== "text") throw jsonBadNullValueTreatment();
-        if (valueV.kind === "null") {
-          switch (treatmentV.text) {
-            case "raise_exception":
-              throw jsonNullValueRaised();
-            case "use_json_null":
-              valueNode = { kind: "null" };
-              break;
-            case "delete_key": {
-              // `#-` (jsonb_delete_path): removing a member never grows the document, so no
-              // output charge and no depth check.
-              const path = jsonTextPathArg(pathV);
-              return jsonbValue(jsonDeletePathKernel(jsonArgNode(target), path));
-            }
-            case "return_target":
-              return target;
-            default:
-              throw jsonBadNullValueTreatment();
-          }
-        } else {
-          // A non-NULL value (whatever the treatment says): jsonb_set.
-          valueNode = jsonArgNode(valueV);
-        }
-      } else {
-        if (
-          target.kind === "null" ||
-          pathV.kind === "null" ||
-          valueV.kind === "null" ||
-          flagV.kind === "null"
-        ) {
-          return nullValue();
-        }
-        valueNode = jsonArgNode(valueV);
-      }
-      const path = jsonTextPathArg(pathV);
-      const node = jsonArgNode(target);
-      const flag = flagV.kind === "bool" && flagV.value;
-      const out =
-        e.mode === "set"
-          ? jsonSetPathKernel(node, path, valueNode, flag)
-          : jsonInsertPathKernel(node, path, valueNode, flag);
-      // Inserting a document inside another can deepen the result (json.md §6.4).
-      jsonCheckDepth(out);
-      return growthResult(m, e.args, jsonbValue(out));
+      local2 = instantToLocalMicros(zr, dt2);
     }
-    case "jsonImage": {
-      // A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
-      // row_to_json / JSON_SCALAR. STRICT. A finite timestamptz at any depth charges one timezone
-      // unit, charged and guarded before rendering (the array → text cast's rule, timezones.md §9.5).
-      m.charge(COSTS.operatorEval);
-      const vals = e.args.map((a) => evalExpr(a, row, env, m));
-      if (vals.some((v) => v.kind === "null")) return nullValue();
-      const value = vals[0]!;
-      const pretty = vals.length === 2 && vals[1]!.kind === "bool" && vals[1]!.value;
-      const zoned = zoneRenderCount(value);
-      if (zoned > 0) {
-        m.charge(COSTS.timezone * BigInt(zoned));
-        m.guard();
+    return intervalValue(age(dt1, dt2, local1, local2));
+  }
+  // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
+  // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is
+  // already handled above.
+  if (e.func === "uuid_extract_version") {
+    const ver = uuidExtractVersion((vals[0] as { bytes: Uint8Array }).bytes);
+    return ver === null ? nullValue() : intValue(ver);
+  }
+  if (e.func === "uuid_extract_timestamp") {
+    const mc = uuidExtractTimestampMicros((vals[0] as { bytes: Uint8Array }).bytes);
+    return mc === null ? nullValue() : timestamptzValue(mc);
+  }
+  // uuid generators (spec/design/entropy.md §3): draw from the per-statement seam (env.rng),
+  // advancing the PRNG/counter. The NULL-arg case is handled above.
+  if (e.func === "uuidv4") {
+    return uuidValue(env.rng.uuidV4(env.environment));
+  }
+  if (e.func === "uuidv7") {
+    const clock = env.rng.statementClockMicros(env.environment);
+    // The optional interval arg shifts the embedded instant via the existing calendar-aware
+    // timestamptz arithmetic (entropy.md §4).
+    const shifted =
+      vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
+    return uuidValue(env.rng.uuidV7(env.environment, shifted));
+  }
+  // current-time functions (spec/design/entropy.md §5): now() reads the statement clock ONCE and
+  // reuses it (STABLE); clock_timestamp() reads the seam on every call (VOLATILE). Both return
+  // the seam's micros directly as timestamptz.
+  if (e.func === "now") {
+    return timestamptzValue(env.rng.statementClockMicros(env.environment));
+  }
+  if (e.func === "clock_timestamp") {
+    return timestamptzValue(env.rng.clockNowMicros(env.environment));
+  }
+  // Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an additional
+  // sequence_advance unit (the catalog-tuple read+rewrite) and mutates the per-statement pending
+  // state; currval is a pure session-state read. The NULL-arg case is handled above (propagates).
+  if (e.func === "nextval") {
+    m.charge(COSTS.sequenceAdvance);
+    // The text names the sequence as one identifier (grammar.md §3; 42602 when malformed).
+    return intValue(env.exec.seqNextval(parseNameText((vals[0] as { text: string }).text)));
+  }
+  if (e.func === "currval") {
+    return intValue(env.exec.seqCurrval(parseNameText((vals[0] as { text: string }).text)));
+  }
+  // setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2 →
+  // isCalled defaults true; arity 3 → the boolean third argument.
+  if (e.func === "setval") {
+    m.charge(COSTS.sequenceAdvance);
+    const seqName = parseNameText((vals[0] as { text: string }).text);
+    const isCalled = vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
+    return intValue(env.exec.seqSetval(seqName, (vals[1] as { int: bigint }).int, isCalled));
+  }
+  if (e.func === "lastval") {
+    return intValue(env.exec.seqLastval());
+  }
+  // current_setting (spec/design/session.md §6.1): read the named session variable from the
+  // session's variable map. The blanket NULL propagation above already returned NULL for a NULL
+  // name / missing_ok argument, so both are non-NULL here. An unset name is 42704 UNLESS the
+  // two-arg overload's missing_ok is true (→ NULL).
+  if (e.func === "current_setting") {
+    const name = (vals[0] as { text: string }).text;
+    const missingOk = vals.length > 1 && (vals[1] as { value: boolean }).value;
+    const got = env.exec.session.vars.get(name.toLowerCase());
+    if (got !== undefined) {
+      return textValue(got);
+    }
+    if (missingOk) {
+      return nullValue();
+    }
+    throw engineError("undefined_object", "unrecognized configuration parameter: " + name);
+  }
+  // json/jsonb processing functions (B1, json-sql-functions.md §2). A jsonb arg is the node
+  // directly; a json arg is parsed from its verbatim text on demand (json.md §4), then dispatched
+  // to the same kernel. The NULL-input case was already handled by the blanket propagation above.
+  if (e.func === "jsonb_typeof" || e.func === "json_typeof") {
+    // Neither reads string contents, so a json arg is only lexed (jsonArgShape, json.md §4.2).
+    return textValue(jsonTypeofName(jsonArgShape(vals[0]!)));
+  }
+  if (e.func === "jsonb_array_length" || e.func === "json_array_length") {
+    return intValue(jsonArrayLength(jsonArgShape(vals[0]!)));
+  }
+  if (e.func === "jsonb_strip_nulls") {
+    return jsonbValue(jsonStripNulls(jsonArgNode(vals[0]!)));
+  }
+  if (e.func === "json_strip_nulls") {
+    // json_strip_nulls returns json — render the stripped tree COMPACTLY (PG's json output
+    // style), preserving the on-demand parse's key order.
+    return jsonValue(jsonCompactOut(jsonStripNulls(jsonArgNode(vals[0]!))));
+  }
+  if (e.func === "jsonb_pretty") {
+    return textValue(jsonbPrettyText(vals[0]!, m));
+  }
+  if (e.func === "json_serialize") {
+    // JSON_SERIALIZE(v) → the value's text serialization: a json value verbatim, a jsonb value its
+    // canonical (jsonbOut) render (json-sql-functions.md §5). STRICT (NULL handled above).
+    const v0 = vals[0]!;
+    if (v0.kind === "json") return growthResult(m, e.args, textValue(v0.text));
+    if (v0.kind === "jsonb") return growthResult(m, e.args, textValue(jsonbOut(v0.node)));
+    throw new Error("BUG: resolver restricts JSON_SERIALIZE to json/jsonb");
+  }
+  if (e.func === "length") {
+    // length(text) → i32 — the number of characters (Unicode code points). TS strings are
+    // UTF-16, so [...s] (the code-point iterator) counts code points, NOT s.length, which
+    // would over-count astral characters as surrogate pairs (string-functions.md §2/§3).
+    // Over bytea, length is the byte count (string-functions.md §4).
+    const v0 = vals[0]!;
+    if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
+    const s = (v0 as { text: string }).text;
+    return intValue(BigInt([...s].length));
+  }
+  if (e.func === "octet_length") {
+    // octet_length(text) → i32 — the UTF-8 byte count, distinct from length's code-point
+    // count (string-functions.md §3). utf8ByteLength encodes via TextEncoder. Over bytea, the
+    // byte count (§4).
+    const v0 = vals[0]!;
+    if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
+    return intValue(BigInt(utf8ByteLength((v0 as { text: string }).text)));
+  }
+  if (e.func === "bit_length") {
+    // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8. Over bytea, bytes × 8.
+    const v0 = vals[0]!;
+    if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length * 8));
+    return intValue(BigInt(utf8ByteLength((v0 as { text: string }).text) * 8));
+  }
+  if (e.func === "substr") {
+    // substr / substring(text, start[, count]) → text — the function form of SUBSTRING; over
+    // bytea the same window over bytes (string-functions.md §4).
+    const start = (vals[1] as { int: bigint }).int;
+    const count = vals.length > 2 ? (vals[2] as { int: bigint }).int : null;
+    const v0 = vals[0]!;
+    if (v0.kind === "bytea") return byteaValue(substrBytes(v0.bytes, start, count));
+    return textValue(substrChars((v0 as { text: string }).text, start, count));
+  }
+  if (e.func === "left") {
+    // left(text, n) → text — the first n characters (negative n drops the last |n|).
+    const s = (vals[0] as { text: string }).text;
+    return textValue(leftChars(s, (vals[1] as { int: bigint }).int));
+  }
+  if (e.func === "right") {
+    // right(text, n) → text — the last n characters (negative n drops the first |n|).
+    const s = (vals[0] as { text: string }).text;
+    return textValue(rightChars(s, (vals[1] as { int: bigint }).int));
+  }
+  if (e.func === "lpad") {
+    // lpad(text, length[, fill]) → text — pad/truncate on the LEFT (default fill a space).
+    const s = (vals[0] as { text: string }).text;
+    const length = (vals[1] as { int: bigint }).int;
+    const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
+    return textValue(padChars(s, length, fill, true, m));
+  }
+  if (e.func === "rpad") {
+    // rpad(text, length[, fill]) → text — pad/truncate on the RIGHT (default fill a space).
+    const s = (vals[0] as { text: string }).text;
+    const length = (vals[1] as { int: bigint }).int;
+    const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
+    return textValue(padChars(s, length, fill, false, m));
+  }
+  if (e.func === "btrim") {
+    // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
+    if (vals[0]!.kind === "bytea") {
+      // btrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+      const set = (vals[1] as { bytes: Uint8Array }).bytes;
+      return byteaValue(trimBytes(vals[0]!.bytes, set, true, true));
+    }
+    const s = (vals[0] as { text: string }).text;
+    const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
+    return textValue(trimChars(s, set, true, true));
+  }
+  if (e.func === "ltrim") {
+    // ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
+    if (vals[0]!.kind === "bytea") {
+      // ltrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+      const set = (vals[1] as { bytes: Uint8Array }).bytes;
+      return byteaValue(trimBytes(vals[0]!.bytes, set, true, false));
+    }
+    const s = (vals[0] as { text: string }).text;
+    const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
+    return textValue(trimChars(s, set, true, false));
+  }
+  if (e.func === "rtrim") {
+    // rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
+    if (vals[0]!.kind === "bytea") {
+      // rtrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+      const set = (vals[1] as { bytes: Uint8Array }).bytes;
+      return byteaValue(trimBytes(vals[0]!.bytes, set, false, true));
+    }
+    const s = (vals[0] as { text: string }).text;
+    const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
+    return textValue(trimChars(s, set, false, true));
+  }
+  if (e.func === "replace") {
+    // replace(text, from, to) → text — substring replace-all; empty `from` is a no-op.
+    const s = (vals[0] as { text: string }).text;
+    const from = (vals[1] as { text: string }).text;
+    const to = (vals[2] as { text: string }).text;
+    return textValue(replaceText(s, from, to, m));
+  }
+  if (e.func === "translate") {
+    // translate(text, from, to) → text — per-character map/delete.
+    const s = (vals[0] as { text: string }).text;
+    const from = (vals[1] as { text: string }).text;
+    const to = (vals[2] as { text: string }).text;
+    return textValue(translateChars(s, from, to));
+  }
+  if (e.func === "repeat") {
+    // repeat(text, n) → text — concatenate the string n times.
+    const s = (vals[0] as { text: string }).text;
+    return textValue(repeatText(s, (vals[1] as { int: bigint }).int, m));
+  }
+  if (e.func === "reverse") {
+    // reverse(text) → text — the code points in reverse order. [...s] splits by code point
+    // (not UTF-16 unit), so an astral character stays intact (string-functions.md §2).
+    const s = (vals[0] as { text: string }).text;
+    return textValue([...s].reverse().join(""));
+  }
+  if (e.func === "strpos") {
+    // strpos(text, substring) → i32 — 1-based code-point position, else 0. indexOf gives a
+    // UTF-16-unit offset; the match begins at a code-point boundary, so the code-point
+    // position is the code-point count of the prefix + 1 (empty sub → 1, string-functions.md §3).
+    if (vals[0]!.kind === "bytea") {
+      // position(bytea, sub) → i32 — the 1-based byte position (§4).
+      return intValue(positionBytes(vals[0]!.bytes, (vals[1] as { bytes: Uint8Array }).bytes));
+    }
+    const s = (vals[0] as { text: string }).text;
+    const sub = (vals[1] as { text: string }).text;
+    const idx = s.indexOf(sub);
+    return intValue(idx < 0 ? 0n : BigInt([...s.slice(0, idx)].length + 1));
+  }
+  if (e.func === "split_part") {
+    // split_part(text, delimiter, n) → text — the n-th split field.
+    const s = (vals[0] as { text: string }).text;
+    const delim = (vals[1] as { text: string }).text;
+    return textValue(splitPart(s, delim, (vals[2] as { int: bigint }).int));
+  }
+  if (e.func === "starts_with") {
+    // starts_with(text, prefix) → boolean — string begins with prefix.
+    const s = (vals[0] as { text: string }).text;
+    const pfx = (vals[1] as { text: string }).text;
+    return boolValue(s.startsWith(pfx));
+  }
+  if (e.func === "ascii") {
+    // ascii(text) → i32 — the code point of the first character (empty → 0). codePointAt(0)
+    // returns the full code point (an astral char is one value, not a surrogate, §2).
+    const s = (vals[0] as { text: string }).text;
+    return intValue(BigInt(s.length === 0 ? 0 : (s.codePointAt(0) ?? 0)));
+  }
+  if (e.func === "chr") {
+    // chr(int) → text — the one-character string for a code point.
+    return textValue(chrText((vals[0] as { int: bigint }).int));
+  }
+  if (e.func === "initcap") {
+    // initcap(text) → text — titlecase each word.
+    return textValue(initcapAscii((vals[0] as { text: string }).text));
+  }
+  if (e.func === "to_hex") {
+    // to_hex(int) → text — lowercase hex of the 64-bit two's-complement pattern. asUintN(64)
+    // maps a negative i64 to its unsigned bit pattern, matching Rust/Go.
+    const n = (vals[0] as { int: bigint }).int;
+    return textValue(BigInt.asUintN(64, n).toString(16));
+  }
+  if (e.func === "encode") {
+    // encode(bytea, format) → text — hex / base64 / escape.
+    const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+    const fmt = (vals[1] as { text: string }).text;
+    // A growth kernel: hex doubles its input (cost.md §8.1).
+    return growthResult(m, e.args, textValue(encodeBytea(bytes, fmt)));
+  }
+  if (e.func === "decode") {
+    // decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
+    const s = (vals[0] as { text: string }).text;
+    const fmt = (vals[1] as { text: string }).text;
+    return byteaValue(decodeText(s, fmt));
+  }
+  if (e.func === "get_byte") {
+    // get_byte(bytea, n) → i32 — the n-th byte (0-based), unsigned.
+    const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+    return intValue(getByte(bytes, (vals[1] as { int: bigint }).int));
+  }
+  if (e.func === "set_byte") {
+    // set_byte(bytea, n, v) → bytea — the n-th byte replaced by v's low 8 bits.
+    const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+    const n = (vals[1] as { int: bigint }).int;
+    return byteaValue(setByte(bytes, n, (vals[2] as { int: bigint }).int));
+  }
+  if (e.func === "get_bit") {
+    // get_bit(bytea, n) → i32 — the n-th bit (0-based), 0 or 1.
+    const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+    return intValue(getBit(bytes, (vals[1] as { int: bigint }).int));
+  }
+  if (e.func === "set_bit") {
+    // set_bit(bytea, n, v) → bytea — the n-th bit set to v (0 or 1).
+    const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+    const n = (vals[1] as { int: bigint }).int;
+    return byteaValue(setBit(bytes, n, (vals[2] as { int: bigint }).int));
+  }
+  if (e.func === "md5") {
+    // md5(text | bytea) → text — 32 lowercase hex digits; text hashes its UTF-8 bytes.
+    const v = vals[0]!;
+    return textValue(md5Hex(v.kind === "bytea" ? v.bytes : (v as { text: string }).text));
+  }
+  if (e.func === "sha224" || e.func === "sha256" || e.func === "sha384" || e.func === "sha512") {
+    // sha224/sha256/sha384/sha512(bytea) → bytea — the raw SHA-2 digest.
+    return byteaValue(sha2Digest(e.func, (vals[0] as { bytes: Uint8Array }).bytes));
+  }
+  if (e.func === "overlay") {
+    // overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice; count
+    // defaults to length(new) (characters for text, bytes for bytea). A growth kernel (cost.md
+    // §8.1), free over constant operands.
+    const start = (vals[2] as { int: bigint }).int;
+    const v0 = vals[0]!;
+    const v1 = vals[1]!;
+    if (v0.kind === "bytea" && v1.kind === "bytea") {
+      const count = vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt(v1.bytes.length);
+      return growthResult(m, e.args, byteaValue(overlayBytes(v0.bytes, v1.bytes, start, count)));
+    }
+    const s = (v0 as { text: string }).text;
+    const r = (v1 as { text: string }).text;
+    const count = vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt([...r].length);
+    return growthResult(m, e.args, textValue(overlayChars(s, r, start, count)));
+  }
+  if (e.func === "bytea_concat") {
+    // bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant operands.
+    const a = (vals[0] as { bytes: Uint8Array }).bytes;
+    const b = (vals[1] as { bytes: Uint8Array }).bytes;
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return growthResult(m, e.args, byteaValue(out));
+  }
+  if (e.func === "text_concat") {
+    // text || text → text. A growth kernel (cost.md §8.1), free over constant operands.
+    const a = (vals[0] as { text: string }).text;
+    const b = (vals[1] as { text: string }).text;
+    return growthResult(m, e.args, textValue(a + b));
+  }
+  if (e.func === "quote_literal") {
+    // quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
+    // doubles every quote (cost.md §8.1).
+    return growthResult(m, e.args, textValue(quoteLiteralText((vals[0] as { text: string }).text)));
+  }
+  if (e.func === "like_escape") {
+    // like_escape(pattern, escape) → text — the LIKE … ESCAPE rewrite (grammar.md §22). A growth
+    // kernel like quote_literal: it can double backslashes, and nests.
+    const out = likeEscapeText(
+      (vals[0] as { text: string }).text,
+      (vals[1] as { text: string }).text,
+    );
+    return growthResult(m, e.args, textValue(out));
+  }
+  if (e.func === "quote_ident") {
+    // quote_ident(text) → text — wrap as a SQL identifier; a growth kernel like quote_literal.
+    return growthResult(m, e.args, textValue(quoteIdentText((vals[0] as { text: string }).text)));
+  }
+  if (e.func === "pi") {
+    // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64
+    // literal in every core.
+    return float64Value(Math.PI);
+  }
+  if (e.func === "div") {
+    // div(a, b): the truncated integer quotient at scale 0, computed EXACTLY as (a − a%b)/b —
+    // a − a%b is exactly q·b, so the division is exact and roundToScale(0) only drops the
+    // (already-zero) fraction. rem() traps 22012 on a zero divisor. Integer operands promote.
+    const toDec = (v: Value): Decimal =>
+      v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+    const a = toDec(vals[0]!);
+    const b = toDec(vals[1]!);
+    const q = a.sub(a.rem(b)).div(b);
+    return decimalValue(q.roundToScale(0));
+  }
+  if (e.func === "gcd") {
+    // gcd: integer operands → Euclid over bigint (the result must fit the promoted type, else
+    // 22003 — gcd(MinInt64, 0) and the rare i16-cap edge); a decimal operand → exact decimal
+    // Euclid at scale max(sₐ, s_b). gcd(0, 0) = 0.
+    const a0 = vals[0]!;
+    const b0 = vals[1]!;
+    if (a0.kind === "int" && b0.kind === "int") {
+      const g = gcdBigint(a0.int, b0.int);
+      if (!inRange(e.result, g)) throw overflow(e.result);
+      return intValue(g);
+    }
+    const toDec = (v: Value): Decimal =>
+      v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+    return decimalValue(gcdDecimalValue(toDec(a0), toDec(b0)));
+  }
+  if (e.func === "lcm") {
+    // lcm: |a/gcd·b|. Integer → the promoted type (an out-of-range magnitude → 22003); a
+    // decimal operand → exact at scale max(sₐ, s_b). lcm(_, 0) = 0.
+    const a0 = vals[0]!;
+    const b0 = vals[1]!;
+    if (a0.kind === "int" && b0.kind === "int") {
+      const l = lcmBigint(a0.int, b0.int);
+      if (!inRange(e.result, l)) throw overflow(e.result);
+      return intValue(l);
+    }
+    const toDec = (v: Value): Decimal =>
+      v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+    return decimalValue(lcmDecimalValue(toDec(a0), toDec(b0)));
+  }
+  if (e.func === "factorial") {
+    // factorial(n) = n! at scale 0. A negative operand → 22003. Each multiply is metered
+    // (size-scaled decimal_work, guarded) so the cost ceiling bounds a large factorial before
+    // its limb work runs (cost.md §3, §13); a product over the value cap traps 22003.
+    const n = (vals[0] as { int: bigint }).int;
+    if (n < 0n)
+      throw engineError(
+        "numeric_value_out_of_range",
+        "factorial of a negative number is undefined",
+      );
+    let acc = Decimal.fromBigInt(1n);
+    for (let k = 2n; k <= n; k++) {
+      const kd = Decimal.fromBigInt(k);
+      m.charge(COSTS.decimalWork * BigInt(workMul(acc, kd) - 1));
+      m.guard();
+      acc = acc.mul(kd);
+    }
+    return decimalValue(acc);
+  }
+  if (e.func === "width_bucket") {
+    // width_bucket(op, low, high, count): the histogram bucket index. count > 0 (else 2201G);
+    // dispatch numeric vs float on the operand; the raw index is range-checked to int4.
+    const count = (vals[3] as { int: bigint }).int;
+    if (count <= 0n) throw widthBucketErr("count must be greater than zero");
+    const op = vals[0]!;
+    // The resolver guarantees the value trio is homogeneous: all float → the float kernel;
+    // otherwise the numeric kernel (integers promote to decimal).
+    const fv = (v: Value): number => (v as { value: number }).value;
+    const toDec = (v: Value): Decimal =>
+      v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
+    const idx =
+      op.kind === "f32" || op.kind === "f64"
+        ? widthBucketFloat(fv(op), fv(vals[1]!), fv(vals[2]!), count)
+        : widthBucketNumeric(toDec(op), toDec(vals[1]!), toDec(vals[2]!), count);
+    if (!inRange("i32", idx)) throw overflow("i32");
+    return intValue(idx);
+  }
+  if (e.func === "scale") {
+    // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
+    return intValue(BigInt((vals[0] as { dec: Decimal }).dec.scale));
+  }
+  if (e.func === "min_scale") {
+    // min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
+    return intValue(BigInt(minScaleOf((vals[0] as { dec: Decimal }).dec)));
+  }
+  if (e.func === "trim_scale") {
+    // trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
+    // digits are zeros, so roundToScale does not round).
+    const d = (vals[0] as { dec: Decimal }).dec;
+    return decimalValue(d.roundToScale(minScaleOf(d)));
+  }
+  const v0 = vals[0];
+  // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
+  // catalog, only abs is operand-typed (result "promoted"); every other float func returns
+  // f64 (result "f64") — so the result Value's width is e.result, not argWidth. The
+  // computation is done in binary64; abs frounds for a f32 result via e.result.
+  if (v0.kind === "f32" || v0.kind === "f64") {
+    if (e.func === "pow") {
+      // pow(x, y): both operands are float (promoted to one width at resolve); result f64.
+      const v1 = vals[1] as { value: number };
+      return evalFloatPow(v0.value, v1.value, e.result);
+    }
+    if (e.func === "atan2") {
+      // atan2(y, x): y is vals[0], x is vals[1] (both widened to f64). Quadrant-aware; no trap.
+      const v1 = vals[1] as { value: number };
+      return float64Value(Math.atan2(v0.value, v1.value));
+    }
+    // round(x, n): n is an int operand; the unary funcs ignore it.
+    const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+    return evalFloatFunc(e.func, v0.value, places, e.result);
+  }
+  if (e.func === "abs") {
+    if (v0.kind === "int") {
+      // abs over an integer: |x| then range-check at the result type's boundary
+      // (abs(i16 -32768) → 22003), exactly like neg.
+      let n = v0.int;
+      if (n < 0n) n = -n;
+      if (!inRange(e.result, n)) throw overflow(e.result);
+      return intValue(n);
+    }
+    return decimalValue((v0 as { dec: Decimal }).dec.abs());
+  }
+  if (e.func === "sign") {
+    // sign over a decimal → numeric at scale 0 (-1 / 0 / +1).
+    const d = (v0 as { dec: Decimal }).dec;
+    const s = d.limbs.length === 0 ? 0n : d.neg ? -1n : 1n;
+    return decimalValue(Decimal.fromBigInt(s));
+  }
+  if (e.func === "ceil" || e.func === "floor" || e.func === "trunc") {
+    // ceil/ceiling/floor/trunc over decimal (and integer, promoted) — the EXACT-numeric
+    // overloads (decimal.md §6, functions.md §9). The float overloads returned above. ceil/
+    // floor round to scale 0 toward ±∞ (a round-up carry can trap 22003); trunc truncates
+    // toward zero to scale 0 or its n-place argument (never overflows).
+    const dd = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
+    if (e.func === "ceil") return decimalValue(dd.ceil());
+    if (e.func === "floor") return decimalValue(dd.floor());
+    const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+    return decimalValue(dd.truncPlaces(places));
+  }
+  if (
+    e.func === "sqrt" ||
+    e.func === "exp" ||
+    e.func === "ln" ||
+    e.func === "log10" ||
+    e.func === "log" ||
+    e.func === "pow"
+  ) {
+    // EXACT-numeric transcendentals over decimal (decimal.md §8). Float operands returned
+    // above; here the operand is decimal — a PG-faithful arbitrary-precision kernel,
+    // byte-identical across cores. Domain errors: sqrt of a negative and the power domain
+    // errors → 2201F; ln/log of a non-positive → 2201E; exp/power overflow → 22003.
+    const a = (v0 as { dec: Decimal }).dec;
+    switch (e.func) {
+      case "sqrt":
+        return decimalValue(a.decSqrt(m));
+      case "exp":
+        return decimalValue(a.decExp(m));
+      case "ln":
+        return decimalValue(a.decLn(m));
+      case "log10":
+        return decimalValue(a.decLog10(m));
+      case "log": {
+        const num = vals.length > 1 ? (vals[1] as { dec: Decimal }).dec : null;
+        return decimalValue(num ? Decimal.decLog(a, num, m) : a.decLog10(m));
       }
-      const zone = env.exec.session.timeZone;
-      if (e.func === "to_jsonb") {
-        const node = datumToJsonb(value, e.valueType, zone);
-        // An array or composite of json/jsonb nests them deeper (json.md §6.4).
-        jsonCheckDepth(node);
-        return growthResult(m, e.args, jsonbValue(node));
+      default: {
+        // pow (the catalog `power(decimal,decimal)`, renamed to "pow" at resolve)
+        const exp = (vals[1] as { dec: Decimal }).dec;
+        return decimalValue(Decimal.decPower(a, exp, m));
       }
-      const out: string[] = [];
-      if (e.func === "row_to_json") {
-        if (value.kind !== "composite" || e.valueType.kind !== "composite") {
-          throw new Error("resolver restricts row_to_json to a composite record");
-        }
-        compositeToJson(value.fields, e.valueType, pretty, zone, out);
-      } else if (e.func === "array_to_json") {
-        if (value.kind !== "array" || e.valueType.kind !== "array") {
-          throw new Error("resolver restricts array_to_json to an array");
-        }
-        arrayToJson(value, e.valueType.elem, pretty, zone, out);
-      } else {
-        datumToJson(value, e.valueType, zone, out);
-      }
+    }
+  }
+  // round
+  const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
+  const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+  return decimalValue(d.roundPlaces(places));
+}
+
+function evalArrayFuncNode(e: Of<"arrayFunc">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval per call;
+  // arguments charge their own. NULL handling is per-kernel (the introspectors propagate, the
+  // builders are non-strict), so — unlike "scalarFunc" — there is no blanket NULL short-circuit.
+  m.charge(COSTS.operatorEval);
+  const vals: Value[] = [];
+  for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+  const out = evalArrayFunc(e.func, vals, m);
+  // The builders are growth kernels (cost.md §8.1), free over constant operands.
+  if (
+    (e.func === "array_append" || e.func === "array_prepend" || e.func === "array_cat") &&
+    !e.args.every(rexprIsConstant)
+  )
+    chargeOutput(m, out);
+  return out;
+}
+
+function evalRangeFuncNode(e: Of<"rangeFunc">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A polymorphic range accessor (spec/design/range-functions.md §1, RF1). One operator_eval per
+  // call; arguments charge their own. STRICT (a NULL range → NULL), handled in the kernel.
+  m.charge(COSTS.operatorEval);
+  const vals: Value[] = [];
+  for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+  return evalRangeFunc(e.func, vals);
+}
+
+function evalRangeCtorNode(e: Of<"rangeCtor">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A range CONSTRUCTOR call (spec/design/range-functions.md §2, RF2). One operator_eval (like
+  // the range accessors); arguments charge their own evaluation. Non-strict — the kernel turns a
+  // NULL bound into an infinite bound, so there is no blanket NULL short-circuit.
+  m.charge(COSTS.operatorEval);
+  const vals: Value[] = [];
+  for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+  return evalRangeCtor(e.elem, vals, env.exec.inputZone());
+}
+
+function evalRangeOpNode(e: Of<"rangeOp">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A range BOOLEAN operator (spec/design/range-functions.md §3, RF3). One operator_eval; the
+  // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
+  // evalRangeOp.
+  m.charge(COSTS.operatorEval);
+  const l = evalExpr(e.args[0]!, row, env, m);
+  const r = evalExpr(e.args[1]!, row, env, m);
+  return evalRangeOp(e.op, l, r, e.elem, env.exec.inputZone());
+}
+
+function evalRangeSetOpNode(e: Of<"rangeSetOp">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A range SET operator (spec/design/range-functions.md §4). One operator_eval; the operands
+  // charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeSetOp.
+  m.charge(COSTS.operatorEval);
+  const l = evalExpr(e.args[0]!, row, env, m);
+  const r = evalExpr(e.args[1]!, row, env, m);
+  return evalRangeSetOp(e.op, l, r);
+}
+
+function evalVariadicNode(e: Of<"variadic">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
+  // (the per-element/arg count walk is unmetered, like the array introspectors §3.3); arguments
+  // charge their own. Non-strict — no blanket NULL short-circuit. The two forms differ: the
+  // spread form counts the args' null-ness (never NULL); the VARIADIC-array form returns NULL on
+  // a NULL whole-array, else counts the array's flattened elements' null-ness.
+  m.charge(COSTS.operatorEval);
+  const wantNulls = e.func === "num_nulls";
+  if (e.arrayForm) {
+    const v = evalExpr(e.args[0]!, row, env, m);
+    if (v.kind === "null") return nullValue();
+    if (v.kind !== "array") throw new Error("resolver restricts a VARIADIC operand to an array");
+    return intValue(BigInt(countNulls(v.elements, wantNulls)));
+  }
+  const vals: Value[] = [];
+  for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+  return intValue(BigInt(countNulls(vals, wantNulls)));
+}
+
+function evalJsonBuildNode(e: Of<"jsonBuild">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values (the
+  // spread form directly; the VARIADIC-array form spreads the lone array — a NULL whole-array →
+  // SQL NULL), then build an array / object node. Non-strict — a NULL argument is JSON null
+  // (array) or a value (object), so no blanket NULL short-circuit.
+  m.charge(COSTS.operatorEval);
+  let vals: Value[];
+  if (e.arrayForm) {
+    const v = evalExpr(e.args[0]!, row, env, m);
+    if (v.kind === "null") return nullValue();
+    if (v.kind !== "array") throw new Error("resolver restricts a VARIADIC operand to an array");
+    vals = v.elements;
+  } else {
+    vals = [];
+    for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+  }
+  m.charge(COSTS.operatorEval * BigInt(vals.length));
+  // A finite timestamptz at any depth renders in the session zone: one timezone unit each,
+  // charged before rendering (json-sql-functions.md §2.2).
+  let zoned = 0;
+  for (const v of vals) zoned += zoneRenderCount(v);
+  m.charge(COSTS.timezone * BigInt(zoned));
+  m.guard();
+  // Each argument's static type: the spread form's own, the VARIADIC-array form's element.
+  const elemType = (i: number): ResolvedType => {
+    if (!e.arrayForm) return e.types[i]!;
+    const t = e.types[0]!;
+    if (t.kind !== "array") throw new Error("a VARIADIC operand is an array");
+    return t.elem;
+  };
+  const zone = env.exec.session.timeZone;
+  if (e.buildKind === "array") {
+    if (e.json) {
+      // json_build_array → a `json` value: each element's json image, joined `, ` inside `[...]`.
+      const out: string[] = ["["];
+      vals.forEach((v, i) => {
+        if (i > 0) out.push(", ");
+        datumToJson(v, elemType(i), zone, out);
+      });
+      out.push("]");
+      // The builders nest their arguments one level (json.md §6.4).
       const text = out.join("");
-      // A jsonb element or field can nest a deep document (json.md §6.4).
       jsonCheckTextDepth(text);
       return growthResult(m, e.args, jsonValue(text));
     }
-    case "jsonObjectFromArrays": {
-      // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
-      m.charge(COSTS.operatorEval);
-      // STRICT: a NULL whole-array argument → SQL NULL.
-      const arrays: (string | null)[][] = [];
-      for (const a of e.args) {
-        const v = evalExpr(a, row, env, m);
-        if (v.kind === "null") return nullValue();
-        arrays.push(valueToOptTextArray(v));
-      }
-      // Pair up keys/values: one array of alternating k/v (even length), or two equal-length arrays.
-      const pairs: [string | null, string | null][] = [];
-      if (arrays.length === 1) {
-        const flat = arrays[0]!;
-        if (flat.length % 2 !== 0) {
-          throw engineError("array_subscript_error", "array must have even number of elements");
-        }
-        for (let i = 0; i < flat.length; i += 2) pairs.push([flat[i]!, flat[i + 1]!]);
-      } else {
-        if (arrays[0]!.length !== arrays[1]!.length) {
-          throw engineError("array_subscript_error", "mismatched array dimensions");
-        }
-        for (let i = 0; i < arrays[0]!.length; i++) pairs.push([arrays[0]![i]!, arrays[1]![i]!]);
-      }
-      m.charge(COSTS.operatorEval * BigInt(pairs.length));
-      m.guard();
-      // A NULL key → 22004; a NULL value → JSON null, else a JSON string of its text.
-      if (e.json) {
-        const parts: string[] = [];
-        for (const [k, v] of pairs) {
-          if (k === null) throw objectKeyNull();
-          const val = v === null ? "null" : jsonCompactOut({ kind: "string", value: v });
-          parts.push(`${jsonCompactOut({ kind: "string", value: k })} : ${val}`);
-        }
-        return growthResult(m, e.args, jsonValue(`{${parts.join(", ")}}`));
-      }
-      const members: JsonMember[] = [];
-      for (const [k, v] of pairs) {
-        if (k === null) throw objectKeyNull();
-        members.push({
-          key: k,
-          value: v === null ? { kind: "null" } : { kind: "string", value: v },
-        });
-      }
-      return growthResult(m, e.args, jsonbValue(jsonMakeObject(members)));
+    // jsonb_build_array → a jsonb value: each argument's jsonb image, canonical render.
+    const out: JsonNode = {
+      kind: "array",
+      elements: vals.map((v, i) => datumToJsonb(v, elemType(i), zone)),
+    };
+    jsonCheckDepth(out);
+    return growthResult(m, e.args, jsonbValue(out));
+  }
+  // object
+  if (vals.length % 2 !== 0) {
+    throw engineError("invalid_parameter_value", "argument list must have even number of elements");
+  }
+  if (e.json) {
+    // json_build_object → a `json` value keeping argument order + duplicate keys: the key as a
+    // JSON string, `" : "` (space-colon-space) before the value's json image, members joined `, `
+    // inside `{...}`. A NULL key is 22004 (the jsonb form's is 22023).
+    const out: string[] = ["{"];
+    for (let i = 0; i < vals.length; i += 2) {
+      if (vals[i]!.kind === "null") throw objectKeyNull();
+      if (i > 0) out.push(", ");
+      writeJsonString(jsonKeyText(vals[i]!, zone), out);
+      out.push(" : ");
+      datumToJson(vals[i + 1]!, elemType(i + 1), zone, out);
     }
-    case "jsonPathFn": {
-      // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL argument → NULL.
-      m.charge(COSTS.operatorEval);
-      const vals = e.args.map((a) => evalExpr(a, row, env, m));
-      if (vals.some((v) => v.kind === "null")) return nullValue();
-      // The jsonb_path_* functions take a vars object (one base object for .keyvalue() ids, checked
-      // before evaluation even in silent mode) and a silent flag; the operators are PostgreSQL's
-      // silent forms with no variables (jsonpath.md §3.1, §5).
-      let vars: JsonPathVars = NO_VARS;
-      let silent = true;
-      const varsVal = vals[2];
-      const silentVal = vals[3];
-      if (varsVal?.kind === "jsonb" && silentVal?.kind === "bool") {
-        checkVarsObject(varsVal.node);
-        vars = { kind: "object", node: varsVal.node };
-        silent = silentVal.value;
-      }
-      const opts = {
-        exists: e.pathFnKind === "exists" || e.pathFnKind === "existsSilent",
-        vars,
-      };
-      const res = evalJsonpath(vals[0]!, vals[1]!, opts, silent, env.environment.property(), m);
-      if (res === null) return nullValue();
-      const seq = res.seq;
-      // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
-      m.charge(COSTS.operatorEval * BigInt(seq.length));
-      m.guard();
-      switch (e.pathFnKind) {
-        case "exists":
-        case "existsSilent":
-          // Silent: a SQL/JSON error → SQL NULL.
-          return res.errored ? nullValue() : boolValue(seq.length > 0);
-        case "queryFirst":
-          return seq.length > 0 ? jsonbValue(seq[0]!) : nullValue();
-        case "queryArray": {
-          // Wrapping the items in an array can deepen the result (json.md §6.4).
-          const out: JsonNode = { kind: "array", elements: seq };
-          jsonCheckDepth(out);
-          return growthResult(m, e.args, jsonbValue(out));
+    out.push("}");
+    const text = out.join("");
+    jsonCheckTextDepth(text);
+    return growthResult(m, e.args, jsonValue(text));
+  }
+  // jsonb_build_object → a jsonb object: (key, jsonb image) members, last-wins dedup + canonical
+  // key sort via makeObject.
+  const members: JsonMember[] = [];
+  for (let i = 0; i < vals.length; i += 2) {
+    if (vals[i]!.kind === "null") {
+      throw engineError("invalid_parameter_value", `argument ${i + 1}: key must not be null`);
+    }
+    const key = jsonKeyText(vals[i]!, zone);
+    members.push({ key, value: datumToJsonb(vals[i + 1]!, elemType(i + 1), zone) });
+  }
+  const out = jsonMakeObject(members);
+  jsonCheckDepth(out);
+  return growthResult(m, e.args, jsonbValue(out));
+}
+
+function evalJsonSetInsertNode(e: Of<"jsonSetInsert">, row: Row, env: EvalEnv, m: Meter): Value {
+  // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
+  // → SQL NULL (a NULL path element is the kernel's 22004). jsonb_set_lax is jsonb_set that is
+  // not strict in the value: a SQL NULL value is handled by its null_value_treatment.
+  m.charge(COSTS.operatorEval);
+  const vals = e.args.map((a) => evalExpr(a, row, env, m));
+  m.guard();
+  const [target, pathV, valueV, flagV] = vals as [Value, Value, Value, Value];
+  let valueNode: JsonNode;
+  if (e.lax) {
+    if (target.kind === "null" || pathV.kind === "null" || flagV.kind === "null") {
+      return nullValue();
+    }
+    const treatmentV = vals[4]!;
+    // An explicit NULL treatment is rejected even for a non-NULL value (PG).
+    if (treatmentV.kind !== "text") throw jsonBadNullValueTreatment();
+    if (valueV.kind === "null") {
+      switch (treatmentV.text) {
+        case "raise_exception":
+          throw jsonNullValueRaised();
+        case "use_json_null":
+          valueNode = { kind: "null" };
+          break;
+        case "delete_key": {
+          // `#-` (jsonb_delete_path): removing a member never grows the document, so no
+          // output charge and no depth check.
+          const path = jsonTextPathArg(pathV);
+          return jsonbValue(jsonDeletePathKernel(jsonArgNode(target), path));
         }
-        case "match":
-        case "matchSilent": {
-          // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON null —
-          // an unknown predicate — which is SQL NULL). Silent (`@@`, or `silent => true`)
-          // suppresses anything else to SQL NULL; an error ends the evaluation, and the items
-          // found before it still decide.
-          if (seq.length === 1 && seq[0]!.kind === "bool") {
-            return boolValue(seq[0]!.value);
-          }
-          if (seq.length === 1 && seq[0]!.kind === "null") {
-            return nullValue();
-          }
-          if (silent) return nullValue();
-          throw engineError(
-            "singleton_sql_json_item_required",
-            "single boolean result is expected",
-          );
-        }
+        case "return_target":
+          return target;
+        default:
+          throw jsonBadNullValueTreatment();
       }
-      break;
+    } else {
+      // A non-NULL value (whatever the treatment says): jsonb_set.
+      valueNode = jsonArgNode(valueV);
     }
-    case "jsonSqlFn": {
-      // A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
-      // S2). A NULL context / path → NULL; a SQL/JSON (class-22) error honors ON ERROR.
-      m.charge(COSTS.operatorEval);
-      const cv = evalExpr(e.args[0]!, row, env, m);
-      const pv = evalExpr(e.args[1]!, row, env, m);
-      if (cv.kind === "null" || pv.kind === "null") return nullValue();
-      // Reading a json context as jsonb (a `\u0000` / unpaired surrogate raises) is the context's
-      // conversion, not path evaluation, so ON ERROR does not catch it — as in PostgreSQL
-      // (json.md §4.2). The conversion canonicalizes it, as PostgreSQL casts it (jsonpath.md §5).
-      const node = jsonpathContextNode(cv);
-      if (pv.kind !== "jsonpath") {
-        throw new Error("resolver restricts a jsonpath argument to jsonpath");
+  } else {
+    if (
+      target.kind === "null" ||
+      pathV.kind === "null" ||
+      valueV.kind === "null" ||
+      flagV.kind === "null"
+    ) {
+      return nullValue();
+    }
+    valueNode = jsonArgNode(valueV);
+  }
+  const path = jsonTextPathArg(pathV);
+  const node = jsonArgNode(target);
+  const flag = flagV.kind === "bool" && flagV.value;
+  const out =
+    e.mode === "set"
+      ? jsonSetPathKernel(node, path, valueNode, flag)
+      : jsonInsertPathKernel(node, path, valueNode, flag);
+  // Inserting a document inside another can deepen the result (json.md §6.4).
+  jsonCheckDepth(out);
+  return growthResult(m, e.args, jsonbValue(out));
+}
+
+function evalJsonImageNode(e: Of<"jsonImage">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A JSON-image function (json-sql-functions.md §2.2): to_json / to_jsonb / array_to_json /
+  // row_to_json / JSON_SCALAR. STRICT. A finite timestamptz at any depth charges one timezone
+  // unit, charged and guarded before rendering (the array → text cast's rule, timezones.md §9.5).
+  m.charge(COSTS.operatorEval);
+  const vals = e.args.map((a) => evalExpr(a, row, env, m));
+  if (vals.some((v) => v.kind === "null")) return nullValue();
+  const value = vals[0]!;
+  const pretty = vals.length === 2 && vals[1]!.kind === "bool" && vals[1]!.value;
+  const zoned = zoneRenderCount(value);
+  if (zoned > 0) {
+    m.charge(COSTS.timezone * BigInt(zoned));
+    m.guard();
+  }
+  const zone = env.exec.session.timeZone;
+  if (e.func === "to_jsonb") {
+    const node = datumToJsonb(value, e.valueType, zone);
+    // An array or composite of json/jsonb nests them deeper (json.md §6.4).
+    jsonCheckDepth(node);
+    return growthResult(m, e.args, jsonbValue(node));
+  }
+  const out: string[] = [];
+  if (e.func === "row_to_json") {
+    if (value.kind !== "composite" || e.valueType.kind !== "composite") {
+      throw new Error("resolver restricts row_to_json to a composite record");
+    }
+    compositeToJson(value.fields, e.valueType, pretty, zone, out);
+  } else if (e.func === "array_to_json") {
+    if (value.kind !== "array" || e.valueType.kind !== "array") {
+      throw new Error("resolver restricts array_to_json to an array");
+    }
+    arrayToJson(value, e.valueType.elem, pretty, zone, out);
+  } else {
+    datumToJson(value, e.valueType, zone, out);
+  }
+  const text = out.join("");
+  // A jsonb element or field can nest a deep document (json.md §6.4).
+  jsonCheckTextDepth(text);
+  return growthResult(m, e.args, jsonValue(text));
+}
+
+function evalJsonObjectFromArraysNode(
+  e: Of<"jsonObjectFromArrays">,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Value {
+  // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
+  m.charge(COSTS.operatorEval);
+  // STRICT: a NULL whole-array argument → SQL NULL.
+  const arrays: (string | null)[][] = [];
+  for (const a of e.args) {
+    const v = evalExpr(a, row, env, m);
+    if (v.kind === "null") return nullValue();
+    arrays.push(valueToOptTextArray(v));
+  }
+  // Pair up keys/values: one array of alternating k/v (even length), or two equal-length arrays.
+  const pairs: [string | null, string | null][] = [];
+  if (arrays.length === 1) {
+    const flat = arrays[0]!;
+    if (flat.length % 2 !== 0) {
+      throw engineError("array_subscript_error", "array must have even number of elements");
+    }
+    for (let i = 0; i < flat.length; i += 2) pairs.push([flat[i]!, flat[i + 1]!]);
+  } else {
+    if (arrays[0]!.length !== arrays[1]!.length) {
+      throw engineError("array_subscript_error", "mismatched array dimensions");
+    }
+    for (let i = 0; i < arrays[0]!.length; i++) pairs.push([arrays[0]![i]!, arrays[1]![i]!]);
+  }
+  m.charge(COSTS.operatorEval * BigInt(pairs.length));
+  m.guard();
+  // A NULL key → 22004; a NULL value → JSON null, else a JSON string of its text.
+  if (e.json) {
+    const parts: string[] = [];
+    for (const [k, v] of pairs) {
+      if (k === null) throw objectKeyNull();
+      const val = v === null ? "null" : jsonCompactOut({ kind: "string", value: v });
+      parts.push(`${jsonCompactOut({ kind: "string", value: k })} : ${val}`);
+    }
+    return growthResult(m, e.args, jsonValue(`{${parts.join(", ")}}`));
+  }
+  const members: JsonMember[] = [];
+  for (const [k, v] of pairs) {
+    if (k === null) throw objectKeyNull();
+    members.push({
+      key: k,
+      value: v === null ? { kind: "null" } : { kind: "string", value: v },
+    });
+  }
+  return growthResult(m, e.args, jsonbValue(jsonMakeObject(members)));
+}
+
+function evalJsonPathFnNode(e: Of<"jsonPathFn">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL argument → NULL.
+  m.charge(COSTS.operatorEval);
+  const vals = e.args.map((a) => evalExpr(a, row, env, m));
+  if (vals.some((v) => v.kind === "null")) return nullValue();
+  // The jsonb_path_* functions take a vars object (one base object for .keyvalue() ids, checked
+  // before evaluation even in silent mode) and a silent flag; the operators are PostgreSQL's
+  // silent forms with no variables (jsonpath.md §3.1, §5).
+  let vars: JsonPathVars = NO_VARS;
+  let silent = true;
+  const varsVal = vals[2];
+  const silentVal = vals[3];
+  if (varsVal?.kind === "jsonb" && silentVal?.kind === "bool") {
+    checkVarsObject(varsVal.node);
+    vars = { kind: "object", node: varsVal.node };
+    silent = silentVal.value;
+  }
+  const opts = {
+    exists: e.pathFnKind === "exists" || e.pathFnKind === "existsSilent",
+    vars,
+  };
+  const res = evalJsonpath(vals[0]!, vals[1]!, opts, silent, env.environment.property(), m);
+  if (res === null) return nullValue();
+  const seq = res.seq;
+  // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
+  m.charge(COSTS.operatorEval * BigInt(seq.length));
+  m.guard();
+  switch (e.pathFnKind) {
+    case "exists":
+    case "existsSilent":
+      // Silent: a SQL/JSON error → SQL NULL.
+      return res.errored ? nullValue() : boolValue(seq.length > 0);
+    case "queryFirst":
+      return seq.length > 0 ? jsonbValue(seq[0]!) : nullValue();
+    case "queryArray": {
+      // Wrapping the items in an array can deepen the result (json.md §6.4).
+      const out: JsonNode = { kind: "array", elements: seq };
+      jsonCheckDepth(out);
+      return growthResult(m, e.args, jsonbValue(out));
+    }
+    case "match":
+    case "matchSilent": {
+      // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON null —
+      // an unknown predicate — which is SQL NULL). Silent (`@@`, or `silent => true`)
+      // suppresses anything else to SQL NULL; an error ends the evaluation, and the items
+      // found before it still decide.
+      if (seq.length === 1 && seq[0]!.kind === "bool") {
+        return boolValue(seq[0]!.value);
       }
-      const compiled = jsonPathCompileMetered(pv.text, m, env.environment.property());
-      // The PASSING values, evaluated after the context and path (as in PostgreSQL) and outside ON
-      // ERROR: each is a base object for .keyvalue() ids (jsonpath.md §3.1).
-      const passing = e.args.slice(2);
-      const bindings = passingBindings(passing, e.passingNames, row, env, m);
-      const vars: JsonPathVars = { kind: "passing", vars: bindings, count: passing.length };
-      let seq: JsonNode[];
-      try {
-        seq = jsonPathEval(compiled, node, { exists: e.sqlKind === "exists", vars }, m);
-      } catch (err) {
-        // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
-        // else (a cost abort, a missing variable, etc.) propagates.
-        if (isSqljsonError(err)) {
-          return applyJsonBehavior(e.onError, err, e.returning, env, m);
-        }
-        throw err;
+      if (seq.length === 1 && seq[0]!.kind === "null") {
+        return nullValue();
       }
-      m.charge(COSTS.operatorEval * BigInt(seq.length));
-      m.guard();
-      return evalJsonSqlResult(
-        e.sqlKind,
-        seq,
-        e.returning,
-        e.decimal,
-        e.wrapper,
-        e.onEmpty,
-        e.onError,
-        e.args.every(rexprIsConstant),
-        env,
-        m,
-      );
-    }
-    case "subquery": {
-      // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push
-      // the current row onto the outer-row stack, run the inner plan, fold its accrued cost into
-      // this meter, plus one operator_eval for the node.
-      m.charge(COSTS.operatorEval);
-      const r = env.runSubquery(e.plan, [...env.outer, row]);
-      m.charge(r.cost);
-      // The charged result is consumed by this expression and released once it has been used
-      // (memory.md §5.3).
-      const held = m.query.measureRows(r.rows);
-      let out: Value;
-      if (e.subKind === "scalar") {
-        if (r.rows.length > 1) {
-          throw engineError(
-            "cardinality_violation",
-            "more than one row returned by a subquery used as an expression",
-          );
-        }
-        // 0 rows -> NULL (the static type was settled at resolve).
-        out = r.rows.length === 0 ? nullValue() : subqueryRowValue(r.rows[0]!, e.rowValued);
-      } else if (e.subKind === "exists") {
-        // EXISTS ignores the select list entirely and is never NULL.
-        out = { kind: "bool", value: r.rows.length > 0 !== e.negated };
-      } else if (e.subKind === "quantified") {
-        // A correlated quantified subquery (array-functions.md §11.6): gather the body's single
-        // column into an array and run the SAME 3VL fold as the array form.
-        const lv = evalExpr(e.lhs!, row, env, m);
-        const elements = r.rows.map((rr) => subqueryRowValue(rr, e.rowValued));
-        out = quantifiedMembership(
-          e.op!,
-          e.all!,
-          e.rowValued,
-          lv,
-          arrayValue(elements),
-          e.collation ?? null,
-          m,
-        );
-      } else {
-        // in
-        const lv = evalExpr(e.lhs!, row, env, m);
-        const list = r.rows.map((rr) => subqueryRowValue(rr, e.rowValued));
-        out = inMembership(lv, list, e.negated, m);
-      }
-      m.releaseQuery(held);
-      return out;
-    }
-    case "inValues": {
-      // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
-      m.charge(COSTS.operatorEval);
-      const lv = evalExpr(e.lhs, row, env, m);
-      return inMembership(lv, e.list, e.negated, m);
-    }
-    case "quantified": {
-      // A quantified array comparison `lhs op ANY/ALL(array)` (array-functions.md §11) — the array
-      // spelling of IN, the 3VL fold over the array's flattened elements.
-      m.charge(COSTS.operatorEval);
-      const lv = evalExpr(e.lhs, row, env, m);
-      const av = evalExpr(e.array, row, env, m);
-      return quantifiedMembership(e.op, e.all, e.rowWise, lv, av, e.collation, m);
-    }
-    case "widthBucketArray": {
-      // width_bucket(operand, thresholds) (array-functions.md §14): strict like a scalar function —
-      // a NULL operand short-circuits before the thresholds are evaluated.
-      m.charge(COSTS.operatorEval);
-      const ov = evalExpr(e.operand, row, env, m);
-      if (ov.kind === "null") return nullValue();
-      const tv = evalExpr(e.thresholds, row, env, m);
-      if (tv.kind === "null") return nullValue();
-      return widthBucketArray(ov, tv, e.collation, m);
+      if (silent) return nullValue();
+      throw engineError("singleton_sql_json_item_required", "single boolean result is expected");
     }
   }
+}
+
+function evalJsonSqlFnNode(e: Of<"jsonSqlFn">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
+  // S2). A NULL context / path → NULL; a SQL/JSON (class-22) error honors ON ERROR.
+  m.charge(COSTS.operatorEval);
+  const cv = evalExpr(e.args[0]!, row, env, m);
+  const pv = evalExpr(e.args[1]!, row, env, m);
+  if (cv.kind === "null" || pv.kind === "null") return nullValue();
+  // Reading a json context as jsonb (a `\u0000` / unpaired surrogate raises) is the context's
+  // conversion, not path evaluation, so ON ERROR does not catch it — as in PostgreSQL
+  // (json.md §4.2). The conversion canonicalizes it, as PostgreSQL casts it (jsonpath.md §5).
+  const node = jsonpathContextNode(cv);
+  if (pv.kind !== "jsonpath") {
+    throw new Error("resolver restricts a jsonpath argument to jsonpath");
+  }
+  const compiled = jsonPathCompileMetered(pv.text, m, env.environment.property());
+  // The PASSING values, evaluated after the context and path (as in PostgreSQL) and outside ON
+  // ERROR: each is a base object for .keyvalue() ids (jsonpath.md §3.1).
+  const passing = e.args.slice(2);
+  const bindings = passingBindings(passing, e.passingNames, row, env, m);
+  const vars: JsonPathVars = { kind: "passing", vars: bindings, count: passing.length };
+  let seq: JsonNode[];
+  try {
+    seq = jsonPathEval(compiled, node, { exists: e.sqlKind === "exists", vars }, m);
+  } catch (err) {
+    // A SQL/JSON (data-exception) error from path navigation is caught by ON ERROR; anything
+    // else (a cost abort, a missing variable, etc.) propagates.
+    if (isSqljsonError(err)) {
+      return applyJsonBehavior(e.onError, err, e.returning, env, m);
+    }
+    throw err;
+  }
+  m.charge(COSTS.operatorEval * BigInt(seq.length));
+  m.guard();
+  return evalJsonSqlResult(
+    e.sqlKind,
+    seq,
+    e.returning,
+    e.decimal,
+    e.wrapper,
+    e.onEmpty,
+    e.onError,
+    e.args.every(rexprIsConstant),
+    env,
+    m,
+  );
+}
+
+function evalSubqueryNode(e: Of<"subquery">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push
+  // the current row onto the outer-row stack, run the inner plan, fold its accrued cost into
+  // this meter, plus one operator_eval for the node.
+  m.charge(COSTS.operatorEval);
+  const r = env.runSubquery(e.plan, [...env.outer, row]);
+  m.charge(r.cost);
+  // The charged result is consumed by this expression and released once it has been used
+  // (memory.md §5.3).
+  const held = m.query.measureRows(r.rows);
+  let out: Value;
+  if (e.subKind === "scalar") {
+    if (r.rows.length > 1) {
+      throw engineError(
+        "cardinality_violation",
+        "more than one row returned by a subquery used as an expression",
+      );
+    }
+    // 0 rows -> NULL (the static type was settled at resolve).
+    out = r.rows.length === 0 ? nullValue() : subqueryRowValue(r.rows[0]!, e.rowValued);
+  } else if (e.subKind === "exists") {
+    // EXISTS ignores the select list entirely and is never NULL.
+    out = { kind: "bool", value: r.rows.length > 0 !== e.negated };
+  } else if (e.subKind === "quantified") {
+    // A correlated quantified subquery (array-functions.md §11.6): gather the body's single
+    // column into an array and run the SAME 3VL fold as the array form.
+    const lv = evalExpr(e.lhs!, row, env, m);
+    const elements = r.rows.map((rr) => subqueryRowValue(rr, e.rowValued));
+    out = quantifiedMembership(
+      e.op!,
+      e.all!,
+      e.rowValued,
+      lv,
+      arrayValue(elements),
+      e.collation ?? null,
+      m,
+    );
+  } else {
+    // in
+    const lv = evalExpr(e.lhs!, row, env, m);
+    const list = r.rows.map((rr) => subqueryRowValue(rr, e.rowValued));
+    out = inMembership(lv, list, e.negated, m);
+  }
+  m.releaseQuery(held);
+  return out;
+}
+
+function evalInValuesNode(e: Of<"inValues">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
+  m.charge(COSTS.operatorEval);
+  const lv = evalExpr(e.lhs, row, env, m);
+  return inMembership(lv, e.list, e.negated, m);
+}
+
+function evalQuantifiedNode(e: Of<"quantified">, row: Row, env: EvalEnv, m: Meter): Value {
+  // A quantified array comparison `lhs op ANY/ALL(array)` (array-functions.md §11) — the array
+  // spelling of IN, the 3VL fold over the array's flattened elements.
+  m.charge(COSTS.operatorEval);
+  const lv = evalExpr(e.lhs, row, env, m);
+  const av = evalExpr(e.array, row, env, m);
+  return quantifiedMembership(e.op, e.all, e.rowWise, lv, av, e.collation, m);
+}
+
+function evalWidthBucketArrayNode(
+  e: Of<"widthBucketArray">,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Value {
+  // width_bucket(operand, thresholds) (array-functions.md §14): strict like a scalar function —
+  // a NULL operand short-circuits before the thresholds are evaluated.
+  m.charge(COSTS.operatorEval);
+  const ov = evalExpr(e.operand, row, env, m);
+  if (ov.kind === "null") return nullValue();
+  const tv = evalExpr(e.thresholds, row, env, m);
+  if (tv.kind === "null") return nullValue();
+  return widthBucketArray(ov, tv, e.collation, m);
 }
 
 // widthBucketArray is width_bucket(operand, thresholds) (array-functions.md §14) — PostgreSQL's

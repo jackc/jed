@@ -310,6 +310,7 @@ function classifyOrderKey(
       nullsFirst,
     };
   }
+
   // parseExpr folds a trailing `COLLATE "x"` into the key (collation.md §1). When it wraps a bare
   // column, unwrap back to a column key carrying that explicit collation — exactly the column-only
   // OrderKey the old parser built, so the column fast path is byte-identical.
@@ -349,9 +350,10 @@ function classifyOrderKey(
 // meter runs (54P01 cannot catch it; in this core an overflow is an uncatchable-by-design V8
 // RangeError). Counting logical depth against this fixed bound — rather than PG's runtime
 // stack-pointer probe — is deterministic and cross-core identical (§8): the constant is the SAME
-// in every core (Rust / Go / TS). 256 sits with a >2× margin under the weakest core's native
-// ceiling — THIS core, on a default Node/V8 stack, overflows at ~547 nested subqueries — yet far
-// above any realistic query. Exceeding it throws 54001 statement_too_complex.
+// in every core (Rust / Go / TS). Far above any realistic query, 256 still fits this core's stack
+// budget: every statement at the limit runs within 512 KB of V8 stack (the worst, nested WITH,
+// needs ~410 KB; V8's default is ~984 KB — cost.md §7.1, enforced by tests/depth_limit.test.ts).
+// Exceeding it throws 54001 statement_too_complex.
 export const MAX_EXPR_DEPTH = 256;
 
 // MAX_IDENTIFIER_LENGTH is enforced in the lexer (the identifier-token producer); re-exported here
@@ -3327,6 +3329,12 @@ class Parser {
     if (this.peekKeyword() === "json_table" && this.peekKindAt(1) === "lparen") {
       return this.parseJsonTable();
     }
+    return this.parseNamedTableRef(lateral);
+  }
+
+  // parseNamedTableRef parses a FROM item that starts with a name: a base table or view, optionally
+  // database-qualified, or a table function call (parseTableRef's last arm).
+  private parseNamedTableRef(lateral: boolean): TableRef {
     let namePos = this.pos;
     const loc = this.here();
     let name = this.expectIdentifier();
@@ -3444,38 +3452,13 @@ class Parser {
     // (a leading VALUES) — FROM (VALUES (e…),(e…)), a computed relation of literal rows
     // (grammar.md §42) — or a parenthesized join.
     this.advance();
-    let body: QueryExpr | undefined;
-    let values: Expr[][] | undefined;
-    let group: Select | undefined;
-    // A set operator after a VALUES list makes the body a query with a VALUES operand (grammar.md
-    // §25): rewind and parse it as one.
-    const start = this.pos;
-    const depth = this.depth;
-    const furthest = this.furthest;
-    let valuesRows: Expr[][] | null = null;
     if (this.peekKeyword() === "values") {
-      const rows = this.parseValuesBody();
-      const kw = this.peekKeyword();
-      if (kw === "union" || kw === "intersect" || kw === "except") {
-        this.pos = start;
-        this.depth = depth;
-        this.furthest = furthest;
-      } else {
-        valuesRows = rows;
-      }
+      const v = this.parseDerivedValues();
+      if (v !== null) return this.finishDerivedTable(v.body, v.values, undefined);
     }
-    if (valuesRows !== null) {
-      const rows = valuesRows;
-      // A trailing ORDER BY / LIMIT / OFFSET makes the body the query
-      // `SELECT * FROM (VALUES …) ORDER BY … LIMIT …` (valuesQuery).
-      const orderBy = this.parseOrderBy(true);
-      const { limit, offset } = this.parseLimitOffsetClauses();
-      if (orderBy.length === 0 && limit === null && offset === null) {
-        values = rows;
-      } else {
-        body = valuesQuery(rows, orderBy, limit, offset);
-      }
-    } else if (this.atSubqueryStart()) {
+    let body: QueryExpr;
+    let group: Select | undefined;
+    if (this.atSubqueryStart()) {
       // A leading SELECT, or a nested WITH (cte.md §7), is a query_expr body.
       body = this.parseSubquery();
     } else if (lateral) {
@@ -3487,6 +3470,37 @@ class Parser {
       group = this.parseJoinGroup();
       body = group;
     }
+    return this.finishDerivedTable(body, undefined, group);
+  }
+
+  // parseDerivedValues parses a derived table's VALUES body (parseDerivedTable's VALUES arm). A
+  // trailing ORDER BY / LIMIT / OFFSET makes the body the query `SELECT * FROM (VALUES …) ORDER BY …
+  // LIMIT …` (valuesQuery). A set operator after the VALUES list makes the body a query with a VALUES
+  // operand (grammar.md §25): the cursor is rewound and null returned, to parse it as one.
+  private parseDerivedValues(): { body?: QueryExpr; values?: Expr[][] } | null {
+    const start = this.pos;
+    const depth = this.depth;
+    const furthest = this.furthest;
+    const rows = this.parseValuesBody();
+    const kw = this.peekKeyword();
+    if (kw === "union" || kw === "intersect" || kw === "except") {
+      this.pos = start;
+      this.depth = depth;
+      this.furthest = furthest;
+      return null;
+    }
+    const orderBy = this.parseOrderBy(true);
+    const { limit, offset } = this.parseLimitOffsetClauses();
+    if (orderBy.length === 0 && limit === null && offset === null) return { values: rows };
+    return { body: valuesQuery(rows, orderBy, limit, offset) };
+  }
+
+  // finishDerivedTable parses a derived table's closing `)` and optional alias, and builds it.
+  private finishDerivedTable(
+    body: QueryExpr | undefined,
+    values: Expr[][] | undefined,
+    group: Select | undefined,
+  ): TableRef {
     this.expect("rparen");
     // The alias is optional, parsed exactly like a base table's.
     let alias: string | null = null;
@@ -4094,20 +4108,26 @@ class Parser {
   // multiplicative < unary minus < primary. One method per level keeps the grammar
   // legible (CLAUDE.md §10). The precedence is authored data (spec/functions/catalog.toml);
   // this ladder must agree with it.
+  //
+  // Each level runs on every nesting level of an expression, so each keeps a small frame
+  // (spec/design/cost.md §7.1): a level parses its first operand, then hands any operator chain to a
+  // separate *Chain method, whose locals are paid for only when the chain is there.
 
   // parseExpr is the entry point for WHERE, the SELECT list, and UPDATE assignment values.
   parseExpr(): Expr {
     // A fresh sub-expression is one nesting level deeper (parens, ARRAY/ROW/CASE/function
     // operands, subscript indices all re-enter here). Bounds the recursive descent itself.
+    // The OR level is folded in here, one frame fewer per level.
     this.deepen();
-    const e = this.parseOr();
+    const lhs = this.parseAnd();
+    const e = this.peekKeyword() === "or" ? this.parseOrChain(lhs) : lhs;
     this.undeepen();
     return e;
   }
 
-  private parseOr(): Expr {
+  private parseOrChain(first: Expr): Expr {
     const base = this.depth;
-    let lhs = this.parseAnd();
+    let lhs = first;
     while (this.peekKeyword() === "or") {
       this.deepen(); // each chained OR is one more AST level
       const loc = this.here();
@@ -4119,8 +4139,13 @@ class Parser {
   }
 
   private parseAnd(): Expr {
+    const lhs = this.parseNot();
+    return this.peekKeyword() === "and" ? this.parseAndChain(lhs) : lhs;
+  }
+
+  private parseAndChain(first: Expr): Expr {
     const base = this.depth;
-    let lhs = this.parseNot();
+    let lhs = first;
     while (this.peekKeyword() === "and") {
       this.deepen(); // each chained AND is one more AST level
       const loc = this.here();
@@ -4154,60 +4179,12 @@ class Parser {
   // dispatches on the NULL vs DISTINCT FROM keyword (spec/grammar/grammar.ebnf
   // `comparison`).
   private parseComparison(): Expr {
-    const lhs = this.parseConcat();
-    if (this.peekKeyword() === "is") {
-      const isLoc = this.here();
-      this.advance();
-      let negated = false;
-      if (this.peekKeyword() === "not") {
-        this.advance();
-        negated = true;
-      }
-      // IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
-      if (this.peekKeyword() === "distinct") {
-        this.advance();
-        this.expectKeyword("from");
-        return { kind: "isDistinct", lhs, rhs: this.parseConcat(), negated, loc: isLoc };
-      }
-      // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
-      // well-formedness predicate (json-sql-functions.md §5).
-      if (this.peekKeyword() === "json") {
-        this.advance();
-        let jsonKind: JsonPredicateKind = "value";
-        switch (this.peekKeyword()) {
-          case "value":
-            this.advance();
-            jsonKind = "value";
-            break;
-          case "scalar":
-            this.advance();
-            jsonKind = "scalar";
-            break;
-          case "array":
-            this.advance();
-            jsonKind = "array";
-            break;
-          case "object":
-            this.advance();
-            jsonKind = "object";
-            break;
-        }
-        // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only when
-        // `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no expression-level
-        // clause here). `KEYS` is optional.
-        let uniqueKeys = false;
-        const w = this.peekKeyword();
-        if ((w === "with" || w === "without") && this.peekKeywordAt(1) === "unique") {
-          this.advance(); // WITH / WITHOUT
-          this.advance(); // UNIQUE
-          if (this.peekKeyword() === "keys") this.advance();
-          uniqueKeys = w === "with";
-        }
-        return { kind: "isJson", operand: lhs, negated, jsonKind, uniqueKeys };
-      }
-      this.expectKeyword("null");
-      return { kind: "isNull", operand: lhs, negated };
-    }
+    return this.parseComparisonTail(this.parseConcat());
+  }
+
+  // parseComparisonTail parses whatever comparison follows lhs, if any.
+  private parseComparisonTail(lhs: Expr): Expr {
+    if (this.peekKeyword() === "is") return this.parseIsPredicate(lhs);
     // `NOT`? (`IN` (...) | `BETWEEN` lo `AND` hi) — a `NOT` here is consumed only when followed
     // by one of these postfix-predicate keywords (two-token lookahead; the prefix `NOT` was
     // already taken by parseNot). Non-associative, at the comparison level (grammar.md §20-§21).
@@ -4222,25 +4199,7 @@ class Parser {
     if (predNegated) {
       this.advance(); // NOT
     }
-    if (this.peekKeyword() === "in") {
-      this.advance();
-      this.expect("lparen");
-      // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by a
-      // leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
-      // (`IN ()` is a 42601 syntax error).
-      if (this.atSubqueryStart()) {
-        const query = this.parseSubquery();
-        this.expect("rparen");
-        return { kind: "inSubquery", lhs, query, negated: predNegated, loc: opLoc };
-      }
-      const list = [this.parseConcat()];
-      while (this.peek().kind === "comma") {
-        this.advance();
-        list.push(this.parseConcat());
-      }
-      this.expect("rparen");
-      return { kind: "in", lhs, list, negated: predNegated, loc: opLoc };
-    }
+    if (this.peekKeyword() === "in") return this.parseInPredicate(lhs, predNegated, opLoc);
     if (this.peekKeyword() === "between") {
       this.advance();
       // Both bounds parse at the CONCAT level (one tighter than comparison), which never
@@ -4255,27 +4214,8 @@ class Parser {
     // LIKE / ILIKE (case-insensitive) — grammar.md §22. `ilike` is just another peeked keyword.
     // An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`; a bare NULL
     // or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
-    if (this.peekKeyword() === "like" || this.peekKeyword() === "ilike") {
-      const insensitive = this.peekKeyword() === "ilike";
-      const likeLoc = this.here();
-      this.advance();
-      let rhs = this.parseConcat();
-      if (this.peekKeyword() === "escape") {
-        this.advance();
-        const escapeChar = this.parseConcat();
-        rhs = {
-          kind: "funcCall",
-          name: "like_escape",
-          args: [rhs, escapeChar],
-          argNames: [],
-          star: false,
-          distinct: false,
-          variadic: false,
-          loc: likeLoc,
-        };
-      }
-      return { kind: "like", lhs, rhs, negated: predNegated, insensitive, loc: opLoc };
-    }
+    if (this.peekKeyword() === "like" || this.peekKeyword() === "ilike")
+      return this.parseLikePredicate(lhs, predNegated, opLoc);
     // `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
     // `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
     // is the prefix-NOT over the whole match, taken a level up). The pattern is one CONCAT expression.
@@ -4326,23 +4266,131 @@ class Parser {
     // `op ANY/SOME/ALL ( array )` — a quantified array comparison (grammar.md §41): a quantifier
     // may stand in for the ordinary right operand. SOME folds to ANY.
     const kw = this.peekKeyword();
-    if (kw === "all" || kw === "any" || kw === "some") {
-      const all = kw === "all";
-      this.advance(); // ANY / SOME / ALL
-      this.expect("lparen");
-      // A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery spelling of
-      // IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead (or a nested `WITH` —
-      // cte.md §7); anything else is the array operand (§11.1).
-      if (this.atSubqueryStart()) {
-        const query = this.parseSubquery();
-        this.expect("rparen");
-        return { kind: "quantifiedSubquery", op, all, lhs, query, loc: opLoc };
-      }
-      const array = this.parseExpr(); // a full expression resolving to an array
-      this.expect("rparen");
-      return { kind: "quantified", op, all, lhs, array, loc: opLoc };
-    }
+    if (kw === "all" || kw === "any" || kw === "some")
+      return this.parseQuantifiedComparison(lhs, op, kw, opLoc);
     return binaryExpr(op, lhs, this.parseConcat(), opLoc);
+  }
+
+  // parseIsPredicate parses the postfix `IS [NOT] …` predicates on lhs (a parseComparison arm).
+  private parseIsPredicate(lhs: Expr): Expr {
+    const isLoc = this.here();
+    this.advance();
+    let negated = false;
+    if (this.peekKeyword() === "not") {
+      this.advance();
+      negated = true;
+    }
+    // IS [NOT] DISTINCT FROM <concat> — NULL-safe equality; else IS [NOT] NULL.
+    if (this.peekKeyword() === "distinct") {
+      this.advance();
+      this.expectKeyword("from");
+      return { kind: "isDistinct", lhs, rhs: this.parseConcat(), negated, loc: isLoc };
+    }
+    // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
+    // well-formedness predicate (json-sql-functions.md §5).
+    if (this.peekKeyword() === "json") {
+      this.advance();
+      let jsonKind: JsonPredicateKind = "value";
+      switch (this.peekKeyword()) {
+        case "value":
+          this.advance();
+          jsonKind = "value";
+          break;
+        case "scalar":
+          this.advance();
+          jsonKind = "scalar";
+          break;
+        case "array":
+          this.advance();
+          jsonKind = "array";
+          break;
+        case "object":
+          this.advance();
+          jsonKind = "object";
+          break;
+      }
+      // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only when
+      // `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no expression-level
+      // clause here). `KEYS` is optional.
+      let uniqueKeys = false;
+      const w = this.peekKeyword();
+      if ((w === "with" || w === "without") && this.peekKeywordAt(1) === "unique") {
+        this.advance(); // WITH / WITHOUT
+        this.advance(); // UNIQUE
+        if (this.peekKeyword() === "keys") this.advance();
+        uniqueKeys = w === "with";
+      }
+      return { kind: "isJson", operand: lhs, negated, jsonKind, uniqueKeys };
+    }
+    this.expectKeyword("null");
+    return { kind: "isNull", operand: lhs, negated };
+  }
+
+  // parseInPredicate parses `[NOT] IN (…)` on lhs (a parseComparison arm).
+  private parseInPredicate(lhs: Expr, predNegated: boolean, opLoc: SrcLoc | undefined): Expr {
+    this.advance();
+    this.expect("lparen");
+    // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by a
+    // leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
+    // (`IN ()` is a 42601 syntax error).
+    if (this.atSubqueryStart()) {
+      const query = this.parseSubquery();
+      this.expect("rparen");
+      return { kind: "inSubquery", lhs, query, negated: predNegated, loc: opLoc };
+    }
+    const list = [this.parseConcat()];
+    while (this.peek().kind === "comma") {
+      this.advance();
+      list.push(this.parseConcat());
+    }
+    this.expect("rparen");
+    return { kind: "in", lhs, list, negated: predNegated, loc: opLoc };
+  }
+
+  // parseLikePredicate parses `[NOT] LIKE|ILIKE pattern [ESCAPE e]` on lhs (a parseComparison arm).
+  private parseLikePredicate(lhs: Expr, predNegated: boolean, opLoc: SrcLoc | undefined): Expr {
+    const insensitive = this.peekKeyword() === "ilike";
+    const likeLoc = this.here();
+    this.advance();
+    let rhs = this.parseConcat();
+    if (this.peekKeyword() === "escape") {
+      this.advance();
+      const escapeChar = this.parseConcat();
+      rhs = {
+        kind: "funcCall",
+        name: "like_escape",
+        args: [rhs, escapeChar],
+        argNames: [],
+        star: false,
+        distinct: false,
+        variadic: false,
+        loc: likeLoc,
+      };
+    }
+    return { kind: "like", lhs, rhs, negated: predNegated, insensitive, loc: opLoc };
+  }
+
+  // parseQuantifiedComparison parses `op ANY|SOME|ALL (…)` on lhs (a parseComparison arm).
+  private parseQuantifiedComparison(
+    lhs: Expr,
+    op: BinaryOp,
+    kw: string,
+    opLoc: SrcLoc | undefined,
+  ): Expr {
+    const all = kw === "all";
+    this.advance(); // ANY / SOME / ALL
+    this.expect("lparen");
+    // A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery spelling of
+    // IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead (or a nested `WITH` —
+    // cte.md §7); anything else is the array operand (§11.1).
+    if (this.atSubqueryStart()) {
+      const query = this.parseSubquery();
+      this.expect("rparen");
+      return { kind: "quantifiedSubquery", op, all, lhs, query, loc: opLoc };
+    }
+    const array = this.parseExpr(); // a full expression resolving to an array
+    this.expect("rparen");
+    return { kind: "quantified", op, all, lhs, array, loc: opLoc };
   }
 
   // parseConcat parses the "any other operator" level (grammar.md §39/§40, array-functions.md §8/§10):
@@ -4351,8 +4399,12 @@ class Parser {
   // in PostgreSQL. Each operand is an additive expression, so `a + b || c` is `(a + b) || c`; chaining
   // mixes freely (`a || b @> c` is `(a || b) @> c`).
   private parseConcat(): Expr {
+    return this.parseConcatChain(this.parseAdditive());
+  }
+
+  private parseConcatChain(first: Expr): Expr {
     const base = this.depth;
-    let lhs = this.parseAdditive();
+    let lhs = first;
     for (;;) {
       let op: BinaryOp;
       const k = this.peek().kind;
@@ -4393,8 +4445,14 @@ class Parser {
   }
 
   private parseAdditive(): Expr {
+    const lhs = this.parseMultiplicative();
+    const k = this.peek().kind;
+    return k === "plus" || k === "minus" ? this.parseAdditiveChain(lhs) : lhs;
+  }
+
+  private parseAdditiveChain(first: Expr): Expr {
     const base = this.depth;
-    let lhs = this.parseMultiplicative();
+    let lhs = first;
     for (;;) {
       let op: BinaryOp;
       if (this.peek().kind === "plus") op = "add";
@@ -4411,8 +4469,16 @@ class Parser {
   }
 
   private parseMultiplicative(): Expr {
+    const lhs = this.parseAtTimeZone();
+    const k = this.peek().kind;
+    return k === "star" || k === "slash" || k === "percent"
+      ? this.parseMultiplicativeChain(lhs)
+      : lhs;
+  }
+
+  private parseMultiplicativeChain(first: Expr): Expr {
     const base = this.depth;
-    let lhs = this.parseAtTimeZone();
+    let lhs = first;
     for (;;) {
       let op: BinaryOp;
       if (this.peek().kind === "star") op = "mul";
@@ -4436,8 +4502,13 @@ class Parser {
   // resolver/evaluator/cost have one path for the operator and the bare call. AT/TIME/ZONE are
   // non-reserved (matched as a three-token sequence), so a bare column named at/time/zone is unaffected.
   private parseAtTimeZone(): Expr {
+    const lhs = this.peek().kind === "minus" ? this.parseNegation() : this.parsePostfix();
+    return this.peekKeyword() === "at" ? this.parseAtTimeZoneChain(lhs) : lhs;
+  }
+
+  private parseAtTimeZoneChain(first: Expr): Expr {
     const base = this.depth;
-    let lhs = this.parseUnary();
+    let lhs = first;
     while (
       this.peekKeyword() === "at" &&
       this.peekKeywordAt(1) === "time" &&
@@ -4465,39 +4536,42 @@ class Parser {
   }
 
   private parseUnary(): Expr {
-    if (this.peek().kind === "minus") {
-      const minus = this.here();
-      this.advance();
-      // Fold unary-minus-of-an-integer-literal into one negative literal, so i64's
-      // minimum is representable and the literal range-checks against context. SUPPRESSED
-      // when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
-      // so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first
-      // (grammar.md §37). A one-token lookahead on the token AFTER the literal.
-      if (this.peek().kind === "int" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
-        const v = foldInt(this.advance().int!, true);
-        return { kind: "literal", literal: { kind: "int", int: v }, loc: minus };
-      }
-      // Fold unary-minus of a decimal literal into one negative decimal literal (decimal
-      // negation never overflows). Same `::` suppression.
-      if (this.peek().kind === "decimal" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
-        const t = this.advance();
-        return {
-          kind: "literal",
-          literal: {
-            kind: "decimal",
-            dec: Decimal.fromDigitsScale(true, t.decDigits!, t.decScale!),
-          },
-          loc: minus,
-        };
-      }
-      // each chained unary `-` is one more AST level (recursion here, so the depth guard also
-      // protects the parser's own stack against `- - - … x`).
-      this.deepen();
-      const operand = this.parseUnary();
-      this.undeepen();
-      return { kind: "unary", op: "neg", operand, loc: minus };
-    }
+    if (this.peek().kind === "minus") return this.parseNegation();
     return this.parsePostfix();
+  }
+
+  // parseNegation parses a unary `-` and its operand (the parseUnary arm).
+  private parseNegation(): Expr {
+    const minus = this.here();
+    this.advance();
+    // Fold unary-minus-of-an-integer-literal into one negative literal, so i64's
+    // minimum is representable and the literal range-checks against context. SUPPRESSED
+    // when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
+    // so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first
+    // (grammar.md §37). A one-token lookahead on the token AFTER the literal.
+    if (this.peek().kind === "int" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
+      const v = foldInt(this.advance().int!, true);
+      return { kind: "literal", literal: { kind: "int", int: v }, loc: minus };
+    }
+    // Fold unary-minus of a decimal literal into one negative decimal literal (decimal
+    // negation never overflows). Same `::` suppression.
+    if (this.peek().kind === "decimal" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
+      const t = this.advance();
+      return {
+        kind: "literal",
+        literal: {
+          kind: "decimal",
+          dec: Decimal.fromDigitsScale(true, t.decDigits!, t.decScale!),
+        },
+        loc: minus,
+      };
+    }
+    // each chained unary `-` is one more AST level (recursion here, so the depth guard also
+    // protects the parser's own stack against `- - - … x`).
+    this.deepen();
+    const operand = this.parseUnary();
+    this.undeepen();
+    return { kind: "unary", op: "neg", operand, loc: minus };
   }
 
   // parsePostfix parses a primary optionally followed by one or more postfix operators, applied
@@ -4517,10 +4591,15 @@ class Parser {
   private parsePostfix(): Expr {
     // Only a PARENTHESIZED primary is field-accessible (PG requires `(expr).field`). A subsequent
     // `.field` keeps the chain field-accessible (`(c).a.b`); a `::` cast does not.
+    const parenthesized = this.peek().kind === "lparen";
+    const expr = this.parsePrimary();
+    return this.parsePostfixChain(expr, parenthesized && this.pos !== this.bareRowEnd);
+  }
+
+  private parsePostfixChain(primary: Expr, accessible: boolean): Expr {
     const base0 = this.depth;
-    let fieldAccessible = this.peek().kind === "lparen";
-    let expr = this.parsePrimary();
-    if (this.pos === this.bareRowEnd) fieldAccessible = false;
+    let fieldAccessible = accessible;
+    let expr = primary;
     for (;;) {
       const k = this.peek().kind;
       // each postfix `::`/`[…]`/`.field`/COLLATE wraps the base in one more AST level; deepen only
@@ -4537,43 +4616,10 @@ class Parser {
         expr = { kind: "collate", inner: expr, collation };
         fieldAccessible = false;
       } else if (k === "doubleColon") {
-        this.advance();
-        const baseType = this.expectTypeName();
-        const typeMod = this.parseTypeMod();
-        const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
-        expr = { kind: "cast", inner: expr, typeName, typeMod };
+        expr = this.parseCastSuffix(expr);
         fieldAccessible = false;
       } else if (k === "lbracket") {
-        // `base[..][..]` — array subscript (spec/design/array.md §6). Applies to ANY base (no parens
-        // rule, unlike `.field`). Consecutive `[…]` brackets collect into ONE access (so `a[1][2]` is
-        // a single multidim element read, not nested). Each spec is an index `[i]` or a slice `[m:n]`
-        // (bounds optionally omitted). After a subscript a `.field` still needs parens (PG).
-        const subscripts: SubscriptSpec[] = [];
-        while (this.peek().kind === "lbracket") {
-          this.advance(); // [
-          // The lower bound / index is absent only before a `:` or `]` (`[:n]`, `[]`).
-          let lower: Expr | null = null;
-          if (this.peek().kind !== "colon" && this.peek().kind !== "rbracket") {
-            lower = this.parseExpr();
-          }
-          if (this.peek().kind === "colon") {
-            this.advance(); // :
-            let upper: Expr | null = null;
-            if (this.peek().kind !== "rbracket") {
-              upper = this.parseExpr();
-            }
-            this.expect("rbracket");
-            subscripts.push({ isSlice: true, lower, upper });
-          } else {
-            // Index form: a bare `[]` (no index, no colon) is a syntax error.
-            if (lower === null) {
-              throw engineError("syntax_error", "array subscript requires an index");
-            }
-            this.expect("rbracket");
-            subscripts.push({ isSlice: false, index: lower });
-          }
-        }
-        expr = { kind: "subscript", base: expr, subscripts };
+        expr = this.parseSubscriptSuffix(expr);
         fieldAccessible = false;
       } else if (k === "dot" && fieldAccessible) {
         // `.field` / `.*` — composite field selection (spec/design/composite.md §S4),
@@ -4596,45 +4642,57 @@ class Parser {
     return expr;
   }
 
+  // parseCastSuffix parses the `:: type` postfix cast on expr (a parsePostfix arm).
+  private parseCastSuffix(expr: Expr): Expr {
+    this.advance();
+    const baseType = this.expectTypeName();
+    const typeMod = this.parseTypeMod();
+    const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
+    return { kind: "cast", inner: expr, typeName, typeMod };
+  }
+
+  // parseSubscriptSuffix parses `base[..][..]` — array subscript (spec/design/array.md §6), a
+  // parsePostfix arm. Applies to ANY base (no parens rule, unlike `.field`). Consecutive `[…]`
+  // brackets collect into ONE access (so `a[1][2]` is a single multidim element read, not nested).
+  // Each spec is an index `[i]` or a slice `[m:n]` (bounds optionally omitted). After a subscript a
+  // `.field` still needs parens (PG).
+  private parseSubscriptSuffix(base: Expr): Expr {
+    const subscripts: SubscriptSpec[] = [];
+    while (this.peek().kind === "lbracket") {
+      this.advance(); // [
+      // The lower bound / index is absent only before a `:` or `]` (`[:n]`, `[]`).
+      let lower: Expr | null = null;
+      if (this.peek().kind !== "colon" && this.peek().kind !== "rbracket") {
+        lower = this.parseExpr();
+      }
+      if (this.peek().kind === "colon") {
+        this.advance(); // :
+        let upper: Expr | null = null;
+        if (this.peek().kind !== "rbracket") {
+          upper = this.parseExpr();
+        }
+        this.expect("rbracket");
+        subscripts.push({ isSlice: true, lower, upper });
+      } else {
+        // Index form: a bare `[]` (no index, no colon) is a syntax error.
+        if (lower === null) {
+          throw engineError("syntax_error", "array subscript requires an index");
+        }
+        this.expect("rbracket");
+        subscripts.push({ isSlice: false, index: lower });
+      }
+    }
+    return { kind: "subscript", base, subscripts };
+  }
+
   // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,
   // TRUE/FALSE, NULL), or a column reference.
   private parsePrimary(): Expr {
     // Every word is legal as an identifier (§3), including spellings otherwise dispatched below
     // as literals or keyword-led expressions. Recognize the unambiguous `identifier.identifier`
     // shape first so a relation alias such as `null`, `cast`, or `case` remains usable.
-    if (this.atQualifiedColumnRef()) {
-      const loc = this.here();
-      const qualifier = this.expectIdentifier();
-      this.expect("dot");
-      const name = this.expectIdentifier();
-      return { kind: "qualifiedColumn", qualifier, name, loc };
-    }
-    if (this.peek().kind === "lparen") {
-      this.advance();
-      // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading `SELECT`
-      // (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expression.
-      if (this.atSubqueryStart()) {
-        const query = this.parseSubquery();
-        this.expect("rparen");
-        return { kind: "scalarSubquery", query };
-      }
-      const e = this.parseExpr();
-      // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
-      // spelling: two or more comma-separated expressions in parentheses. Identical to
-      // `ROW(a, b, …)`; a single parenthesized expression stays a grouping.
-      if (this.peek().kind === "comma") {
-        const fields: Expr[] = [e];
-        while (this.peek().kind === "comma") {
-          this.advance();
-          fields.push(this.parseExpr());
-        }
-        this.expect("rparen");
-        this.bareRowEnd = this.pos;
-        return { kind: "row", fields };
-      }
-      this.expect("rparen");
-      return e;
-    }
+    if (this.atQualifiedColumnRef()) return this.parseQualifiedPrimary();
+    if (this.peek().kind === "lparen") return this.parseParenPrimary();
     // `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when an
     // open-paren + a query start (`SELECT`, or a nested `WITH` — cte.md §7) follows, so `exists`
     // stays usable as a column / function name.
@@ -4642,52 +4700,17 @@ class Parser {
       this.peekKeyword() === "exists" &&
       this.tokens[this.pos + 1]?.kind === "lparen" &&
       this.isQueryStartAtOffset(2)
-    ) {
-      this.advance(); // EXISTS
-      this.expect("lparen");
-      const query = this.parseSubquery();
-      this.expect("rparen");
-      return { kind: "exists", query };
-    }
+    )
+      return this.parseExistsPrimary();
     // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when `ROW`
     // is immediately followed by `(`, so `row` stays usable as a column / function name otherwise.
     // The bare `(a, b)` form is parsed with the parenthesized expression above.
-    if (this.peekKeyword() === "row" && this.peekKindAt(1) === "lparen") {
-      this.advance(); // ROW
-      this.expect("lparen");
-      const fields: Expr[] = [];
-      if (this.peek().kind !== "rparen") {
-        for (;;) {
-          fields.push(this.parseExpr());
-          const t = this.advance();
-          if (t.kind === "comma") continue;
-          if (t.kind === "rparen") break;
-          throw engineError("syntax_error", `expected ',' or ')', found ${t.kind}`);
-        }
-      } else {
-        this.advance(); // the empty ROW() — consume ')'
-      }
-      return { kind: "row", fields };
-    }
+    if (this.peekKeyword() === "row" && this.peekKindAt(1) === "lparen")
+      return this.parseRowConstructor();
     // `ARRAY[e1, e2, …]` array constructor (spec/design/array.md §1). Recognized when `ARRAY` is
     // immediately followed by `[`, so `array` stays usable as an identifier otherwise.
-    if (this.peekKeyword() === "array" && this.peekKindAt(1) === "lbracket") {
-      this.advance(); // ARRAY
-      this.expect("lbracket");
-      const elements: Expr[] = [];
-      if (this.peek().kind !== "rbracket") {
-        for (;;) {
-          elements.push(this.parseExpr());
-          const t = this.advance();
-          if (t.kind === "comma") continue;
-          if (t.kind === "rbracket") break;
-          throw engineError("syntax_error", `expected ',' or ']', found ${t.kind}`);
-        }
-      } else {
-        this.advance(); // the empty ARRAY[] — consume ']'
-      }
-      return { kind: "array", elements };
-    }
+    if (this.peekKeyword() === "array" && this.peekKindAt(1) === "lbracket")
+      return this.parseArrayConstructor();
     // A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
     // CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed
     // by a string (`INTERVAL '1 day'`, `TIMESTAMP '...'`, `INTEGER '42'`, `BYTEA '\xDE'`, …).
@@ -4701,23 +4724,15 @@ class Parser {
       tlKw !== "true" &&
       tlKw !== "false" &&
       this.tokens[this.pos + 1]?.kind === "str"
-    ) {
-      const typeName = this.expectIdentifier(); // the named type (folded or quoted — exact)
-      const loc = this.here();
-      const t = this.advance();
-      return { kind: "typedLiteral", typeName, text: t.str!, loc };
-    }
+    )
+      return this.parseTypedLiteral();
     // The two-word `character varying '...'` typed literal (types.md §15).
     if (
       tlKw === "character" &&
       this.peekKeywordAt(1) === "varying" &&
       this.tokens[this.pos + 2]?.kind === "str"
-    ) {
-      const typeName = this.expectTypeName();
-      const loc = this.here();
-      const t = this.advance();
-      return { kind: "typedLiteral", typeName, text: t.str!, loc };
-    }
+    )
+      return this.parseCharacterVaryingLiteral();
     // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
     // (json-sql-functions.md §5, S2) — keyword-led primaries with sub-clauses, recognized when the
     // keyword is immediately followed by `(` (so the words stay usable as identifiers otherwise).
@@ -4726,166 +4741,310 @@ class Parser {
       if (
         (kw === "json_exists" || kw === "json_value" || kw === "json_query") &&
         this.peekKindAt(1) === "lparen"
-      ) {
-        this.advance(); // the function keyword
-        this.advance(); // (
-        const ctx = this.parseExpr();
-        // `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb context
-        // is coerced to jsonb regardless).
-        this.skipFormatJson();
-        this.expect("comma");
-        const path = this.parseExpr();
-        const passing = this.parseJsonPassing();
-        let expr: Expr;
-        if (kw === "json_exists") {
-          const onError = this.parseJsonOnErrorOnly();
-          expr = { kind: "jsonExists", ctx, path, passing, onError };
-        } else if (kw === "json_value") {
-          const returning = this.parseJsonReturning();
-          const [onEmpty, onError] = this.parseJsonOnClauses();
-          expr = { kind: "jsonValue", ctx, path, passing, returning, onEmpty, onError };
-        } else {
-          const returning = this.parseJsonReturning();
-          const [wrapper, keepQuotes] = this.parseJsonWrapperQuotes();
-          const [onEmpty, onError] = this.parseJsonOnClauses();
-          expr = {
-            kind: "jsonQuery",
-            ctx,
-            path,
-            passing,
-            returning,
-            wrapper,
-            keepQuotes,
-            onEmpty,
-            onError,
-          };
-        }
-        this.expect("rparen");
-        return expr;
-      }
+      )
+        return this.parseJsonQueryFunction(kw);
     }
     // `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
     // (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled above, a
     // string follows) and a generic call by being the JSON keyword immediately followed by `(`.
-    if (this.peekKeyword() === "json" && this.peekKindAt(1) === "lparen") {
-      this.advance(); // JSON
-      this.advance(); // (
-      const operand = this.parseExpr();
-      // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only when
-      // `UNIQUE` follows (a two-token lookahead); `KEYS` is optional.
-      let uniqueKeys = false;
-      const w = this.peekKeyword();
-      if ((w === "with" || w === "without") && this.peekKeywordAt(1) === "unique") {
-        this.advance(); // WITH / WITHOUT
-        this.advance(); // UNIQUE
-        if (this.peekKeyword() === "keys") this.advance();
-        uniqueKeys = w === "with";
-      }
-      this.expect("rparen");
-      return { kind: "jsonCtor", operand, uniqueKeys };
-    }
-    if (this.peekKeyword() === "cast") {
-      const loc = this.here();
-      this.advance();
-      this.expect("lparen");
-      const inner = this.parseExpr();
-      this.expectKeyword("as");
-      const baseType = this.expectTypeName();
-      const typeMod = this.parseTypeMod();
-      const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
-      this.expect("rparen");
-      return { kind: "cast", inner, typeName, typeMod, loc };
-    }
+    if (this.peekKeyword() === "json" && this.peekKindAt(1) === "lparen")
+      return this.parseJsonConstructor();
+    if (this.peekKeyword() === "cast") return this.parseCastPrimary();
     // EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
     // is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
     // (the one-token lookahead, §8). The field is an identifier (bare or quoted) or a string literal
     // — PostgreSQL's extract_arg — ASCII-lowercased, as the unit lookup folds it (timezones.md §9.6).
-    if (this.peekKeyword() === "extract" && this.peekKindAt(1) === "lparen") {
-      this.advance(); // EXTRACT
-      this.expect("lparen");
-      let field: string;
-      if (this.peekKindAt(0) === "str") {
-        field = this.advance().str!;
-      } else if (this.peekKindAt(0) === "word" || this.peekKindAt(0) === "quotedIdent") {
-        field = this.expectIdentifier();
-      } else {
-        throw engineError("syntax_error", "expected an EXTRACT field");
-      }
-      this.expectKeyword("from");
-      const source = this.parseExpr();
-      this.expect("rparen");
-      return { kind: "extract", field: field.replace(/[A-Z]/g, (c) => c.toLowerCase()), source };
-    }
+    if (this.peekKeyword() === "extract" && this.peekKindAt(1) === "lparen")
+      return this.parseExtractPrimary();
     // `COALESCE(a, b, …)` — the first-non-NULL conditional (grammar.md §51). Recognized only
     // when COALESCE is immediately followed by `(` (the JSON(/EXTRACT( one-token lookahead), so
     // the word stays usable as a column name. At least one argument (an empty list is 42601 —
     // PostgreSQL's grammar has no empty form).
-    if (this.peekKeyword() === "coalesce" && this.peekKindAt(1) === "lparen") {
-      this.advance(); // COALESCE
-      this.advance(); // (
-      if (this.peekKindAt(0) === "rparen") {
-        throw engineError("syntax_error", "COALESCE requires at least one argument");
-      }
-      const args: Expr[] = [];
-      for (;;) {
-        args.push(this.parseExpr());
-        if (this.peekKindAt(0) !== "comma") break;
-        this.advance(); // ,
-      }
-      this.expect("rparen");
-      return { kind: "coalesce", args };
-    }
+    if (this.peekKeyword() === "coalesce" && this.peekKindAt(1) === "lparen")
+      return this.parseCoalescePrimary();
     // `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52). Recognized
     // only when the keyword is immediately followed by `(` (the same one-token lookahead), so the
     // words stay usable as column names. At least one argument (an empty list is 42601 —
     // PostgreSQL's grammar has no empty form).
     {
       const kw = this.peekKeyword();
-      if ((kw === "greatest" || kw === "least") && this.peekKindAt(1) === "lparen") {
-        const greatest = kw === "greatest";
-        this.advance(); // GREATEST / LEAST
-        this.advance(); // (
-        if (this.peekKindAt(0) === "rparen") {
-          throw engineError(
-            "syntax_error",
-            `${greatest ? "GREATEST" : "LEAST"} requires at least one argument`,
-          );
-        }
-        const args: Expr[] = [];
-        for (;;) {
-          args.push(this.parseExpr());
-          if (this.peekKindAt(0) !== "comma") break;
-          this.advance(); // ,
-        }
-        this.expect("rparen");
-        return { kind: "greatestLeast", args, greatest };
-      }
+      if ((kw === "greatest" || kw === "least") && this.peekKindAt(1) === "lparen")
+        return this.parseGreatestLeast(kw);
     }
-    if (this.peekKeyword() === "case") {
-      const caseLoc = this.here();
+    if (this.peekKeyword() === "case") return this.parseCasePrimary();
+    if (this.atFunctionCall()) return this.parseFunctionCall();
+    return this.parseLiteralOrName();
+  }
+
+  // atFunctionCall reports whether the cursor is on a function call: a bare or quoted identifier
+  // IMMEDIATELY followed by "(" (grammar.md §17). The one-token lookahead keeps function names
+  // non-reserved (a column may be named `count`); a qualified name is never a call. A bare null /
+  // true / false is its literal. Checked before parseLiteralOrName, so the call's recursion does not
+  // run in that function's frame.
+  private atFunctionCall(): boolean {
+    const t = this.peek();
+    if (this.tokens[this.pos + 1]?.kind !== "lparen") return false;
+    if (t.kind === "quotedIdent") return true;
+    return t.kind === "word" && t.word !== "null" && t.word !== "true" && t.word !== "false";
+  }
+
+  // parseQualifiedPrimary parses a qualified column reference `q.name` (a parsePrimary arm).
+  private parseQualifiedPrimary(): Expr {
+    const loc = this.here();
+    const qualifier = this.expectIdentifier();
+    this.expect("dot");
+    const name = this.expectIdentifier();
+    return { kind: "qualifiedColumn", qualifier, name, loc };
+  }
+
+  // parseParenPrimary parses a parenthesized expression, scalar subquery, or bare row constructor (a parsePrimary arm).
+  private parseParenPrimary(): Expr {
+    this.advance();
+    // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading `SELECT`
+    // (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expression.
+    if (this.atSubqueryStart()) {
+      const query = this.parseSubquery();
+      this.expect("rparen");
+      return { kind: "scalarSubquery", query };
+    }
+    const e = this.parseExpr();
+    // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
+    // spelling: two or more comma-separated expressions in parentheses. Identical to
+    // `ROW(a, b, …)`; a single parenthesized expression stays a grouping.
+    if (this.peek().kind === "comma") {
+      const fields: Expr[] = [e];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        fields.push(this.parseExpr());
+      }
+      this.expect("rparen");
+      this.bareRowEnd = this.pos;
+      return { kind: "row", fields };
+    }
+    this.expect("rparen");
+    return e;
+  }
+
+  // parseExistsPrimary parses `EXISTS ( query )` (a parsePrimary arm).
+  private parseExistsPrimary(): Expr {
+    this.advance(); // EXISTS
+    this.expect("lparen");
+    const query = this.parseSubquery();
+    this.expect("rparen");
+    return { kind: "exists", query };
+  }
+
+  // parseRowConstructor parses `ROW(e1, e2, …)` (a parsePrimary arm).
+  private parseRowConstructor(): Expr {
+    this.advance(); // ROW
+    this.expect("lparen");
+    const fields: Expr[] = [];
+    if (this.peek().kind !== "rparen") {
+      for (;;) {
+        fields.push(this.parseExpr());
+        const t = this.advance();
+        if (t.kind === "comma") continue;
+        if (t.kind === "rparen") break;
+        throw engineError("syntax_error", `expected ',' or ')', found ${t.kind}`);
+      }
+    } else {
+      this.advance(); // the empty ROW() — consume ')'
+    }
+    return { kind: "row", fields };
+  }
+
+  // parseArrayConstructor parses `ARRAY[e1, e2, …]` (a parsePrimary arm).
+  private parseArrayConstructor(): Expr {
+    this.advance(); // ARRAY
+    this.expect("lbracket");
+    const elements: Expr[] = [];
+    if (this.peek().kind !== "rbracket") {
+      for (;;) {
+        elements.push(this.parseExpr());
+        const t = this.advance();
+        if (t.kind === "comma") continue;
+        if (t.kind === "rbracket") break;
+        throw engineError("syntax_error", `expected ',' or ']', found ${t.kind}`);
+      }
+    } else {
+      this.advance(); // the empty ARRAY[] — consume ']'
+    }
+    return { kind: "array", elements };
+  }
+
+  // parseTypedLiteral parses a typed string literal `type '...'` (a parsePrimary arm).
+  private parseTypedLiteral(): Expr {
+    const typeName = this.expectIdentifier(); // the named type (folded or quoted — exact)
+    const loc = this.here();
+    const t = this.advance();
+    return { kind: "typedLiteral", typeName, text: t.str!, loc };
+  }
+
+  // parseCharacterVaryingLiteral parses the `character varying '...'` typed literal (a parsePrimary arm).
+  private parseCharacterVaryingLiteral(): Expr {
+    const typeName = this.expectTypeName();
+    const loc = this.here();
+    const t = this.advance();
+    return { kind: "typedLiteral", typeName, text: t.str!, loc };
+  }
+
+  // parseJsonQueryFunction parses `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` (a parsePrimary arm).
+  private parseJsonQueryFunction(kw: string): Expr {
+    this.advance(); // the function keyword
+    this.advance(); // (
+    const ctx = this.parseExpr();
+    // `FORMAT JSON` after the context item is accepted (and ignored — a text/json/jsonb context
+    // is coerced to jsonb regardless).
+    this.skipFormatJson();
+    this.expect("comma");
+    const path = this.parseExpr();
+    const passing = this.parseJsonPassing();
+    let expr: Expr;
+    if (kw === "json_exists") {
+      const onError = this.parseJsonOnErrorOnly();
+      expr = { kind: "jsonExists", ctx, path, passing, onError };
+    } else if (kw === "json_value") {
+      const returning = this.parseJsonReturning();
+      const [onEmpty, onError] = this.parseJsonOnClauses();
+      expr = { kind: "jsonValue", ctx, path, passing, returning, onEmpty, onError };
+    } else {
+      const returning = this.parseJsonReturning();
+      const [wrapper, keepQuotes] = this.parseJsonWrapperQuotes();
+      const [onEmpty, onError] = this.parseJsonOnClauses();
+      expr = {
+        kind: "jsonQuery",
+        ctx,
+        path,
+        passing,
+        returning,
+        wrapper,
+        keepQuotes,
+        onEmpty,
+        onError,
+      };
+    }
+    this.expect("rparen");
+    return expr;
+  }
+
+  // parseJsonConstructor parses the `JSON(expr …)` constructor (a parsePrimary arm).
+  private parseJsonConstructor(): Expr {
+    this.advance(); // JSON
+    this.advance(); // (
+    const operand = this.parseExpr();
+    // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only when
+    // `UNIQUE` follows (a two-token lookahead); `KEYS` is optional.
+    let uniqueKeys = false;
+    const w = this.peekKeyword();
+    if ((w === "with" || w === "without") && this.peekKeywordAt(1) === "unique") {
+      this.advance(); // WITH / WITHOUT
+      this.advance(); // UNIQUE
+      if (this.peekKeyword() === "keys") this.advance();
+      uniqueKeys = w === "with";
+    }
+    this.expect("rparen");
+    return { kind: "jsonCtor", operand, uniqueKeys };
+  }
+
+  // parseCastPrimary parses `CAST(expr AS type)` (a parsePrimary arm).
+  private parseCastPrimary(): Expr {
+    const loc = this.here();
+    this.advance();
+    this.expect("lparen");
+    const inner = this.parseExpr();
+    this.expectKeyword("as");
+    const baseType = this.expectTypeName();
+    const typeMod = this.parseTypeMod();
+    const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
+    this.expect("rparen");
+    return { kind: "cast", inner, typeName, typeMod, loc };
+  }
+
+  // parseExtractPrimary parses `EXTRACT(field FROM source)` (a parsePrimary arm).
+  private parseExtractPrimary(): Expr {
+    this.advance(); // EXTRACT
+    this.expect("lparen");
+    let field: string;
+    if (this.peekKindAt(0) === "str") {
+      field = this.advance().str!;
+    } else if (this.peekKindAt(0) === "word" || this.peekKindAt(0) === "quotedIdent") {
+      field = this.expectIdentifier();
+    } else {
+      throw engineError("syntax_error", "expected an EXTRACT field");
+    }
+    this.expectKeyword("from");
+    const source = this.parseExpr();
+    this.expect("rparen");
+    return { kind: "extract", field: field.replace(/[A-Z]/g, (c) => c.toLowerCase()), source };
+  }
+
+  // parseCoalescePrimary parses `COALESCE(a, b, …)` (a parsePrimary arm).
+  private parseCoalescePrimary(): Expr {
+    this.advance(); // COALESCE
+    this.advance(); // (
+    if (this.peekKindAt(0) === "rparen") {
+      throw engineError("syntax_error", "COALESCE requires at least one argument");
+    }
+    const args: Expr[] = [];
+    for (;;) {
+      args.push(this.parseExpr());
+      if (this.peekKindAt(0) !== "comma") break;
+      this.advance(); // ,
+    }
+    this.expect("rparen");
+    return { kind: "coalesce", args };
+  }
+
+  // parseGreatestLeast parses `GREATEST(…)` / `LEAST(…)` (a parsePrimary arm).
+  private parseGreatestLeast(kw: string): Expr {
+    const greatest = kw === "greatest";
+    this.advance(); // GREATEST / LEAST
+    this.advance(); // (
+    if (this.peekKindAt(0) === "rparen") {
+      throw engineError(
+        "syntax_error",
+        `${greatest ? "GREATEST" : "LEAST"} requires at least one argument`,
+      );
+    }
+    const args: Expr[] = [];
+    for (;;) {
+      args.push(this.parseExpr());
+      if (this.peekKindAt(0) !== "comma") break;
+      this.advance(); // ,
+    }
+    this.expect("rparen");
+    return { kind: "greatestLeast", args, greatest };
+  }
+
+  // parseCasePrimary parses a `CASE` expression (a parsePrimary arm).
+  private parseCasePrimary(): Expr {
+    const caseLoc = this.here();
+    this.advance();
+    // Simple form has an operand between CASE and the first WHEN; the searched form starts
+    // directly with WHEN (grammar.md §23).
+    const operand = this.peekKeyword() === "when" ? null : this.parseExpr();
+    const whens: { cond: Expr; result: Expr }[] = [];
+    while (this.peekKeyword() === "when") {
       this.advance();
-      // Simple form has an operand between CASE and the first WHEN; the searched form starts
-      // directly with WHEN (grammar.md §23).
-      const operand = this.peekKeyword() === "when" ? null : this.parseExpr();
-      const whens: { cond: Expr; result: Expr }[] = [];
-      while (this.peekKeyword() === "when") {
-        this.advance();
-        const cond = this.parseExpr();
-        this.expectKeyword("then");
-        const result = this.parseExpr();
-        whens.push({ cond, result });
-      }
-      if (whens.length === 0) {
-        throw engineError("syntax_error", "CASE requires at least one WHEN clause");
-      }
-      let els: Expr | null = null;
-      if (this.peekKeyword() === "else") {
-        this.advance();
-        els = this.parseExpr();
-      }
-      this.expectKeyword("end");
-      return { kind: "case", operand, whens, els, loc: caseLoc };
+      const cond = this.parseExpr();
+      this.expectKeyword("then");
+      const result = this.parseExpr();
+      whens.push({ cond, result });
     }
+    if (whens.length === 0) {
+      throw engineError("syntax_error", "CASE requires at least one WHEN clause");
+    }
+    let els: Expr | null = null;
+    if (this.peekKeyword() === "else") {
+      this.advance();
+      els = this.parseExpr();
+    }
+    this.expectKeyword("end");
+    return { kind: "case", operand, whens, els, loc: caseLoc };
+  }
+
+  // parseLiteralOrName parses a parameter, a literal, a function call, or a column reference (a parsePrimary arm).
+  private parseLiteralOrName(): Expr {
     const t = this.peek();
     // The primary token's source character position (spec/design/error-fields.md §10.2).
     const primLoc = this.here();
@@ -4961,13 +5120,6 @@ class Parser {
           loc: primLoc,
         };
       }
-      // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
-      // first call syntax — grammar.md §17). The one-token lookahead keeps function names
-      // non-reserved (a column may be named `count`); a qualified name is never a call. Only
-      // aggregates resolve (42883 otherwise).
-      if (this.tokens[this.pos + 1]?.kind === "lparen") {
-        return this.parseFunctionCall();
-      }
       const loc = this.here();
       const [qualifier, name] = this.parseColumnRef();
       return qualifier !== null
@@ -4975,11 +5127,8 @@ class Parser {
         : { kind: "column", name, loc };
     }
     if (t.kind === "quotedIdent") {
-      // A quoted identifier is never a keyword (grammar.md §3): a call when IMMEDIATELY followed by
-      // "(", else a column reference.
-      if (this.tokens[this.pos + 1]?.kind === "lparen") {
-        return this.parseFunctionCall();
-      }
+      // A quoted identifier is never a keyword (grammar.md §3): a column reference (a call was taken
+      // by atFunctionCall).
       const loc = this.here();
       const [qualifier, name] = this.parseColumnRef();
       return qualifier !== null
@@ -5105,7 +5254,30 @@ class Parser {
     }
     this.expect("rparen");
     // Keep argNames empty unless a name appeared (the all-positional sentinel — §8).
-    const argNames = anyNamed ? names : [];
+    return this.parseCallSuffix(
+      name,
+      args,
+      anyNamed ? names : [],
+      star,
+      distinct,
+      variadic,
+      aggOrder,
+      loc,
+    );
+  }
+
+  // parseCallSuffix parses what may follow a call's argument list — WITHIN GROUP, FILTER, OVER — and
+  // builds the funcCall (the tail of parseFunctionCall, kept out of its frame).
+  private parseCallSuffix(
+    name: string,
+    args: Expr[],
+    argNames: (string | null)[],
+    star: boolean,
+    distinct: boolean,
+    variadic: boolean,
+    aggOrder: OrderKey[] | null,
+    loc: SrcLoc | undefined,
+  ): Expr {
     // A trailing `WITHIN GROUP (ORDER BY <key>)` marks an ordered-set aggregate (mode /
     // percentile_cont / percentile_disc — aggregates.md §13). It comes between the argument list and
     // any FILTER / OVER (PG order). WITHIN/GROUP are not reserved; right after the call's `)` they are

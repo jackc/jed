@@ -7,6 +7,8 @@
 // cross-core boundary; this exercises the per-vector boundary and that the abort is max_cost-blind.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { EngineError, type Session } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
@@ -103,4 +105,34 @@ test("deep nesting in WHERE and CHECK is bounded", () => {
   const pred = "1 + ".repeat(MAX_EXPR_DEPTH + 2) + "1";
   assert.strictEqual(codeOf(db, `SELECT v FROM t WHERE ${pred} = 0`), "54001");
   assert.strictEqual(codeOf(db, `CREATE TABLE u (a i32 CHECK (${pred} > 0))`), "54001");
+});
+
+// STACK_BUDGET_KB is the V8 stack (`node --stack-size`, in KB) within which every statement at the
+// depth limit parses, plans, and executes, and every one past it is rejected (spec/design/cost.md
+// §7.1). V8's default is ~984 KB.
+const STACK_BUDGET_KB = 512;
+
+test("every nesting vector fits the stack budget", () => {
+  // Each shape runs at its deepest accepted depth, and is rejected 54001 past it, in a child Node
+  // with exactly the budgeted stack — so the bound does not depend on this process's stack. A
+  // RangeError (stack overflow) there reports as "overflow".
+  const child = fileURLToPath(new URL("./depth_stack_child.ts", import.meta.url));
+  const r = spawnSync(process.execPath, [`--stack-size=${STACK_BUDGET_KB}`, child], {
+    encoding: "utf8",
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const results = r.stdout
+    .trim()
+    .split("\n")
+    .map(
+      (line) => JSON.parse(line) as { name: string; depth: number; deepest: string; past: string },
+    );
+  assert.ok(results.length >= 35, `only ${results.length} shapes ran`);
+  for (const { name, depth, deepest, past } of results) {
+    assert.strictEqual(deepest, "ok", `${name} at depth ${depth}`);
+    assert.strictEqual(past, "54001", `${name} past the limit`);
+    // A written subquery or subscript level takes two counted levels (the expression and the query
+    // or index inside it), so those chains stop near MAX_EXPR_DEPTH / 2.
+    assert.ok(depth >= MAX_EXPR_DEPTH / 2 - 1, `${name} reached only depth ${depth}`);
+  }
 });

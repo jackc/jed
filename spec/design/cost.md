@@ -1854,13 +1854,41 @@ A change that grows a frame on one of these paths shows up as that test aborting
 **Go: unbounded in practice.** Goroutine stacks grow on demand up to the runtime maximum (1 GB by
 default), so the depth limit is the only bound needed.
 
-**TS: thin headroom (a known gap).** V8's default stack is ~984 KB. Measured on Node 26 at the
-limit, the scalar-expression shapes need ~950 KB. These are 255-deep `NOT` / unary minus / `+` /
-`ARRAY` / `CASE` chains, and the cost comes from `evalExpr`'s ~3.5 KB interpreter frame per level.
-Nested derived tables need ~775 KB and nested subqueries ~590 KB. An overflow there is a catchable
-`RangeError`, not a process abort. The headroom is still too small to rely on, especially on worker
-threads with smaller stacks. The fix is the Rust one: move `evalExpr`'s case bodies out of its
-frame.
+**TS: 512 KB of V8 stack.** Every statement the parser accepts parses, plans, and executes, and
+every statement it rejects is rejected, within 512 KB of V8 stack (`node --stack-size=512`). V8's
+default is ~984 KB, nearly twice the budget. A host running the engine on a
+`Worker` gets that thread's `resourceLimits.stackSizeMb`, which must cover the budget plus its own
+usage. impl/ts/tests/depth_limit.test.ts enforces the budget in a child `node --stack-size=512`
+process. That child (tests/depth_stack_child.ts) runs the Rust test's nesting vectors and a chain of
+views, each at the deepest depth the parser accepts and just past it. Measured worst cases on
+Node 26 at the limit, each shape in a fresh process: nested `WITH` ~410 KB, nested function calls
+~390 KB, nested comparisons ~380 KB, nested derived tables ~370 KB, correlated scalar subqueries
+~350 KB, and the other expression shapes (`ARRAY`, `ROW`, `CASE`, `CAST`, `COALESCE`, parentheses)
+~330 KB. Before this budget, the expression shapes needed ~950 KB, nested `WITH` ~865 KB, and
+nested derived tables ~775 KB. An overflow is a catchable `RangeError` rather than a process
+abort, but it is still not a structured engine error.
+
+V8's interpreter gives each local of a function its own register for the whole call, so a frame is
+the sum of every branch's locals, not the largest branch's. The budget is kept the Rust way, by
+keeping frames on recursive paths small:
+
+- A function that dispatches over node kinds returns a call to a separate function for each large
+  arm, so only the arm taken pushes its locals. `evalExpr` (whose frame was ~3.4 KB),
+  `resolveNode`, and `parsePrimary` are thin `switch`/`if` dispatchers, and each arm function
+  takes the narrowed node (`type Of<K> = Extract<RExpr, { kind: K }>`).
+- A function that recurses and then does heavy work recurses first in a small frame, then runs
+  the rest out of line. Each parser precedence level parses its first operand, then passes any
+  operator chain to a `*Chain` method. The SELECT planner plans the FROM clause, joins, GROUP BY,
+  and ORDER BY in separate methods, and runs the slot rebasing on the assembled plan. The executor
+  tries its fast paths, and joins its materialized relations, outside the frame that materializes a
+  derived or CTE body.
+- Each call is a frame, and V8 frames are large (a fixed part plus the arguments), so recursive
+  paths avoid pass-through levels: `parseExpr` absorbs the OR level, `planQuery` calls
+  `planSelectPushed` directly, and a derived body is planned without the closure-taking wrappers
+  it used to pass through.
+
+`node --print-bytecode` reports each function's register file as its "Frame size". The budget
+test fails, reporting the shape, when a change grows a frame on one of these paths.
 
 ## 7a. Input-size and identifier-length limits (landed)
 

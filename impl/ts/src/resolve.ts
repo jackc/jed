@@ -687,6 +687,11 @@ function isUnknownLiteral(e: Expr): boolean {
   return e.kind === "literal" && (e.literal.kind === "text" || e.literal.kind === "null");
 }
 
+// Of<K> is the Expr variant resolveNode's case K narrows to; each large arm resolves in a function of
+// its own, so resolveNode's frame — on every level of an expression's recursion — stays small
+// (spec/design/cost.md §7.1).
+type Of<K extends Expr["kind"]> = Extract<Expr, { kind: K }>;
+
 function resolveNode(
   scope: Scope,
   e: Expr,
@@ -704,79 +709,17 @@ function resolveNode(
     if (m !== null) return { node: { kind: "column", index: m.slot }, type: m.ty };
   }
   switch (e.kind) {
-    case "row": {
-      // A ROW(...) constructor (spec/design/composite.md §1): resolve each field with no type
-      // context (its natural type), producing an ANONYMOUS composite (name = null, fields named
-      // f1, f2, … per PG). Storing it into a named composite column matches structurally
-      // (assignability at the store site coerces each field to the target's declared type).
-      const nodes: RExpr[] = [];
-      const fields: { name: string; type: ResolvedType }[] = [];
-      for (let i = 0; i < e.fields.length; i++) {
-        const { node, type } = resolve(scope, e.fields[i]!, null, ag, params);
-        nodes.push(node);
-        fields.push({ name: "f" + (i + 1), type });
-      }
-      return {
-        node: { kind: "row", fields: nodes },
-        type: { kind: "composite", name: null, fields },
-      };
-    }
-    case "array": {
-      // An ARRAY[...] constructor (spec/design/array.md §1): resolve each element (natural type),
-      // unify to a common element type, build an array node. A bare empty ARRAY[] has no element
-      // type to infer — use '{}'::T[] instead (the cast supplies it).
-      if (e.elements.length === 0) {
-        throw typeError("cannot determine the element type of an empty ARRAY[]; write '{}'::T[]");
-      }
-      // An element-type hint (ctx) flows down to the elements so an array literal adapts its untyped
-      // integer/decimal literals exactly as a scalar literal does — e.g. resolving ARRAY[7,8] with an
-      // i32 context yields i32[], not the default i64[] (the polymorphic array functions pass the
-      // bound element type here, array-functions.md §2). Almost every other caller passes null, so the
-      // default 1-D unification is unchanged.
-      const nodes: RExpr[] = [];
-      const elemTypes: ResolvedType[] = [];
-      for (const el of e.elements) {
-        const { node, type } = resolve(scope, el, ctx, ag, params);
-        nodes.push(node);
-        elemTypes.push(type);
-      }
-      // If the items are themselves arrays, this is a nested (multidim-stacking) constructor and the
-      // result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D array.
-      let common: ResolvedType;
-      try {
-        common = unifyArrayElementTypes(elemTypes);
-      } catch (err) {
-        throw positionedAt(err, mismatchLocation(elemTypes, e.elements, unifyArrayElementTypes));
-      }
-      if (common.kind === "array") {
-        return {
-          node: { kind: "array", elements: nodes, nested: true },
-          type: common,
-        };
-      }
-      return {
-        node: { kind: "array", elements: nodes, nested: false },
-        type: { kind: "array", elem: common },
-      };
-    }
+    case "row":
+      return resolveRowExpr(scope, e, ag, params);
+    case "array":
+      return resolveArrayExpr(scope, e, ctx, ag, params);
     case "column": {
       // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
       // (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
       return resolveColumnRef(scope, ag, scope.resolveBareAt(e.name, e.loc), e.name);
     }
-    case "qualifiedColumn": {
-      // A bare `rel.col` resolves STRICTLY against the FROM relations — `qualifier` MUST name a
-      // relation (else 42P01), matching PostgreSQL. Composite field access on a column is the
-      // PARENS-REQUIRED `(col).field` form (spec/design/composite.md §1/§S4), a fieldAccess node,
-      // never this bare qualified-column path (PG raises 42P01 for the unparenthesized `col.field` /
-      // `t.col.field` spellings).
-      return resolveColumnRef(
-        scope,
-        ag,
-        scope.resolveQualifiedAt(e.qualifier, e.name, e.loc),
-        e.name,
-      );
-    }
+    case "qualifiedColumn":
+      return resolveQualifiedColumnExpr(scope, e, ag);
     case "fieldAccess": {
       // `(expr).field` — composite field selection (spec/design/composite.md §S4).
       const { node, type } = resolve(scope, e.base, null, ag, params);
@@ -794,981 +737,32 @@ function resolveNode(
       // resolve(); reaching here means it appeared in a scalar position (which the parser already
       // rejects as 42601). Defensive parity with the fieldStar arm.
       throw engineError("syntax_error", "t.* is only allowed in a select list");
-    case "subscript": {
-      // `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array (else
-      // 42804). Each subscript bound is an integer (a literal adapts; a non-integer is 42804). If any
-      // spec is a slice the result is the array type (a sub-array); otherwise the element type. OOB /
-      // NULL → NULL is an evaluation-time rule, not a resolve error.
-      const base = resolve(scope, e.base, null, ag, params);
-      if (base.type.kind !== "array") {
-        throw typeError(
-          `cannot subscript a value of type ${rtName(base.type)}, which is not an array`,
-        );
-      }
-      const resolveBound = (b: Expr): RExpr => {
-        const r = resolve(scope, b, "i32", ag, params);
-        if (r.type.kind !== "int" && r.type.kind !== "null") {
-          throw typeError(`array subscript must be an integer, not ${rtName(r.type)}`);
-        }
-        return r.node;
-      };
-      let isSlice = false;
-      const rsubs: RSubscript[] = e.subscripts.map((s) => {
-        if (s.isSlice) {
-          isSlice = true;
-          return {
-            isSlice: true,
-            lower: s.lower === null ? null : resolveBound(s.lower),
-            upper: s.upper === null ? null : resolveBound(s.upper),
-          };
-        }
-        return { isSlice: false, index: resolveBound(s.index) };
-      });
-      // A slice yields a sub-array (the array type); all-index access yields an element.
-      const type = isSlice ? base.type : base.type.elem;
-      return {
-        node: {
-          kind: "subscript",
-          base: base.node,
-          subscripts: rsubs,
-          isSlice,
-        },
-        type,
-      };
-    }
-    case "param": {
-      // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
-      // type from ctx — the sibling operand, target column, or CAST target. Record the inferred
-      // type (null = no context here; finalize 42P18s a parameter that never gets one).
-      const type: ResolvedType = ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
-      return resolveParamNode(
-        scope,
-        e,
-        ctx === null ? null : { kind: "scalar", scalar: ctx },
-        type,
-        params,
-      );
-    }
-    case "funcCall": {
-      // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19) is
-      // one of these window-function names used WITH a WITHIN GROUP clause; that clause routes it here
-      // instead of the window path. OVER + WITHIN GROUP together is 0A000.
-      if (isHypotheticalSetName(e.name) && e.withinGroup !== undefined && e.withinGroup !== null) {
-        if (
-          (e.over !== undefined && e.over !== null) ||
-          (e.overName !== undefined && e.overName !== null)
-        ) {
-          throw engineError(
-            "feature_not_supported",
-            `OVER is not supported for hypothetical-set aggregate ${e.name}`,
-          );
-        }
-        return resolveHypotheticalSetAggregate(scope, e, ag, params);
-      }
-      // An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13) carries
-      // WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself does not support
-      // an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP it is 42883 (PG:
-      // "function mode() does not exist").
-      if (isOrderedSetAggregateName(e.name)) {
-        if (
-          (e.over !== undefined && e.over !== null) ||
-          (e.overName !== undefined && e.overName !== null)
-        ) {
-          throw engineError(
-            "feature_not_supported",
-            `OVER is not supported for ordered-set aggregate ${e.name}`,
-          );
-        }
-        if (e.withinGroup === undefined || e.withinGroup === null) {
-          throw noAggOverload(e.name);
-        }
-        return resolveOrderedSetAggregate(scope, e, ag, params);
-      }
-      // WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function) is
-      // 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
-      if (e.withinGroup !== undefined && e.withinGroup !== null) {
-        throw noAggOverload(e.name);
-      }
-      // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
-      if (e.over !== undefined && e.over !== null) {
-        // GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in PostgreSQL
-        // (42601); match it rather than treating GROUPING as an unknown window function.
-        if (e.name === "grouping") {
-          throw engineError("syntax_error", "OVER is not supported for GROUPING");
-        }
-        // DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5): a window
-        // aggregate folds over a frame, where per-frame de-duplication is undefined.
-        if (e.distinct) {
-          throw engineError(
-            "feature_not_supported",
-            "DISTINCT is not implemented for window functions",
-          );
-        }
-        // Nor is an in-aggregate ORDER BY (PG 0A000 — aggregates.md §22): the window frame, not an
-        // input sort, orders a window aggregate's fold.
-        if (e.aggOrder !== undefined && e.aggOrder !== null) {
-          throw engineError(
-            "feature_not_supported",
-            "aggregate ORDER BY is not implemented for window functions",
-          );
-        }
-        // FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the frame
-        // rows for which the filter is TRUE; a pure (non-aggregate) window function with FILTER is
-        // PG's own 0A000 ("FILTER is not implemented for non-aggregate window functions"). The filter
-        // is threaded into the WindowSpec and applied in the window stage.
-        if (e.filter !== undefined && e.filter !== null && !isAggregateName(e.name)) {
-          throw engineError(
-            "feature_not_supported",
-            "FILTER is not implemented for non-aggregate window functions",
-          );
-        }
-        return resolveWindowCall(
-          scope,
-          { name: e.name, args: e.args, star: e.star, over: e.over, filter: e.filter },
-          ag,
-          params,
-        );
-      }
-      // A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's wrong_object_type,
-      // not the windowing_error 42P20 it uses for a window in WHERE — window.md §7, oracle-verified).
-      if (isWindowOnlyName(e.name)) {
-        throw engineError("wrong_object_type", `window function ${e.name} requires an OVER clause`);
-      }
-      return resolveFuncCall(scope, e, ag, params);
-    }
-    case "typedLiteral": {
-      // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
-      // `type 'string'`, equal to CAST('string' AS type) over a string-literal operand. Resolve the
-      // type by name (unknown → 42704) and coerce the string to it at resolve, context-free. No
-      // typmod rides on the literal (the parser's one-token lookahead admits none).
-      // A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
-      // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
-      const ct = scope.catalog.compositeType(e.typeName);
-      if (ct !== undefined)
-        return atPosition(e.loc, () =>
-          foldInSessionZone(scope, params, (iz) =>
-            coerceStringToComposite(e.text, ct, scope.catalog, iz),
-          ),
-        );
-      // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
-      // against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
-      const rdesc = rangeByName(e.typeName);
-      if (rdesc !== undefined)
-        return atPosition(e.loc, () =>
-          foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(e.text, rdesc, iz)),
-        );
-      const [target] = resolveTypeAndTypmod(e.typeName, null);
-      // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE dateClock
-      // node, exactly like the ctx-adaptation form (date.md §6).
-      if (isDate(target)) {
-        const clock = dateClockLiteral(e.text, params);
-        if (clock !== null) return clock;
-      }
-      return atPosition(e.loc, () =>
-        foldInSessionZone(scope, params, (iz) =>
-          coerceStringLiteral(e.text, target, null, null, iz),
-        ),
-      );
-    }
+    case "subscript":
+      return resolveSubscriptExpr(scope, e, ag, params);
+    case "param":
+      return resolveParamExpr(scope, e, ctx, params);
+    case "funcCall":
+      return resolveFuncCallExpr(scope, e, ag, params);
+    case "typedLiteral":
+      return resolveTypedLiteralExpr(scope, e, params);
     case "literal":
-      switch (e.literal.kind) {
-        case "null":
-          return { node: { kind: "constNull" }, type: { kind: "null" } };
-        case "bool":
-          return {
-            node: { kind: "constBool", value: e.literal.value },
-            type: { kind: "bool" },
-          };
-        case "text": {
-          // A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
-          // context (types.md §6/§13/§14): decode the bytea input (hex or escape) or the PG-flexible
-          // uuid input (uuid) — 22P02 on malformed; any other context — including none — keeps it
-          // text.
-          // A string literal is text by default (collation C). It adapts to a BYTEA context
-          // (decode the bytea input, 22P02 on bad input) or a TIMESTAMP/TIMESTAMPTZ context (parse
-          // the datetime, 22007/22008 — spec/design/timestamp.md). Any other context keeps it text.
-          if (ctx !== null && isBytea(ctx)) {
-            return {
-              node: {
-                kind: "constBytea",
-                value: decodeByteaLiteral(e.literal.text),
-              },
-              type: { kind: "bytea" },
-            };
-          }
-          if (ctx !== null && isUuid(ctx)) {
-            return {
-              node: {
-                kind: "constUuid",
-                value: decodeUuidLiteral(e.literal.text),
-              },
-              type: { kind: "uuid" },
-            };
-          }
-          if (ctx !== null && isTimestamp(ctx)) {
-            return {
-              node: {
-                kind: "constTimestamp",
-                value: parseTimestamp(e.literal.text),
-              },
-              type: { kind: "timestamp" },
-            };
-          }
-          // An offset-less string reads in the SESSION zone, as PostgreSQL's timestamptz_in does
-          // (timezones.md §9.3).
-          if (ctx !== null && isTimestamptz(ctx)) {
-            const text = e.literal.text;
-            return {
-              node: {
-                kind: "constTimestamptz",
-                value: foldInSessionZone(scope, params, (iz) => iz.parseTimestamptz(text)),
-              },
-              type: { kind: "timestamptz" },
-            };
-          }
-          if (ctx !== null && isDate(ctx)) {
-            // A string adapts to a DATE context (the ISO date, dropping any time/offset; date.md
-            // §2). A clock-relative special ('today'/'now'/…) becomes the STABLE dateClock node
-            // instead of a constant (date.md §6).
-            const clock = dateClockLiteral(e.literal.text, params);
-            if (clock !== null) return clock;
-            return {
-              node: { kind: "constDate", value: parseDate(e.literal.text) },
-              type: { kind: "date" },
-            };
-          }
-          if (ctx !== null && isInterval(ctx)) {
-            // A string adapts to an INTERVAL context (PostgreSQL's interval input,
-            // 22007/22008 — spec/design/interval.md), like timestamp adaptation.
-            return {
-              node: {
-                kind: "constInterval",
-                value: parseInterval(e.literal.text),
-              },
-              type: { kind: "interval" },
-            };
-          }
-          if (ctx !== null && isJson(ctx)) {
-            // A string adapts to a JSON context (validate, store verbatim — spec/design/json.md §4);
-            // malformed → 22P02.
-            validateJson(e.literal.text);
-            return { node: { kind: "constJson", value: e.literal.text }, type: { kind: "json" } };
-          }
-          if (ctx !== null && isJsonb(ctx)) {
-            // A string adapts to a JSONB context (parse + canonicalize — §2); malformed → 22P02.
-            return {
-              node: { kind: "constJsonb", value: jsonbIn(e.literal.text) },
-              type: { kind: "jsonb" },
-            };
-          }
-          if (ctx !== null && isJsonPath(ctx)) {
-            // A string adapts to a jsonpath context (a jsonpath function argument) — it is compiled
-            // to a path at resolve (jsonpath.md §1); malformed → 42601 / unsupported → 0A000.
-            return {
-              node: {
-                kind: "constJsonPath",
-                // Canonical text only — a like_regex fold never changes it (no casing table).
-                value: jsonPathRender(jsonPathCompile(e.literal.text, undefined)),
-              },
-              type: { kind: "jsonpath" },
-            };
-          }
-          return {
-            node: { kind: "constText", value: e.literal.text },
-            type: { kind: "text" },
-          };
-        }
-        case "decimal":
-          // A decimal literal adapts to a FLOAT context (float.md §4): decimal → float at resolve
-          // (the nearest binary64 to the exact decimal; Math.fround if the context is f32). The
-          // exact-decimal string already round-trips IEEE conversion via Number(...). Otherwise it
-          // is decimal — cap-checked here (an over-long coefficient/scale traps 22003 at resolve).
-          if (ctx !== null && isFloat(ctx)) {
-            return floatFromDecimalLiteral(e.literal.dec, ctx);
-          }
-          return {
-            node: { kind: "constDecimal", value: e.literal.dec.checkCap() },
-            type: { kind: "decimal" },
-          };
-        default: {
-          // An integer literal adapts to an integer context or — like a decimal literal — a FLOAT
-          // context (int → float at resolve; float.md §4). A non-numeric context (a text/decimal
-          // column or assignment target) does not apply — it defaults to i64, and the surrounding
-          // check then reports the family mismatch (42804) or widens it (int→decimal), never a wrong
-          // range check.
-          if (ctx !== null && isFloat(ctx)) {
-            const n = roundToWidth(ctx, Number(e.literal.int));
-            return {
-              node: { kind: "constFloat", ty: ctx, value: n },
-              type: { kind: "float", ty: ctx },
-            };
-          }
-          const ty = ctx !== null && isInteger(ctx) ? ctx : "i64";
-          if (!inRange(ty, e.literal.int)) throw overflow(ty);
-          return {
-            node: { kind: "constInt", value: e.literal.int },
-            type: { kind: "int", ty },
-          };
-        }
-      }
-    case "scalarSubquery": {
-      // A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so its
-      // column-count / type errors fire even over an empty outer. planSubquery rejects a non-SELECT
-      // context and a $N inside (both 0A000). The fold pass folds an uncorrelated one to a constant;
-      // a correlated one is re-executed per outer row by the evaluator.
-      const plan = planSubquery(scope, e.query, params);
-      if (plan.columnTypes.length !== 1) {
-        throw engineError("syntax_error", "subquery must return only one column");
-      }
-      noteSubqueryDeriv(
-        scope,
-        e.query,
-        queryPlanColumnDerivs(plan)[0]!,
-        queryPlanColumnTypmods(plan)[0]!,
-      );
-      return {
-        node: {
-          kind: "subquery",
-          plan,
-          subKind: "scalar",
-          lhs: null,
-          negated: false,
-          rowValued: false,
-        },
-        type: plan.columnTypes[0]!,
-      };
-    }
-    case "exists": {
-      // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT EXISTS
-      // parses as the unary NOT wrapping this, so negated here is always false.
-      const plan = planSubquery(scope, e.query, params);
-      return {
-        node: {
-          kind: "subquery",
-          plan,
-          subKind: "exists",
-          lhs: null,
-          negated: false,
-          rowValued: false,
-        },
-        type: { kind: "bool" },
-      };
-    }
-    case "inSubquery": {
-      // The LHS is an OUTER expression (resolved in the current scope / agg context); the subquery
-      // yields the single membership column. The test is `lhs = element`, so the pair must be
-      // comparable (42804), exactly like a literal IN. A row-constructor LHS makes it ROW-VALUED: N
-      // body columns, each row one anonymous composite element.
-      const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
-      const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
-      classifyComparable(lt, elem);
-      // = ignores the collation at eval (byte identity, collation.md §7), but a conflict between
-      // the operand and the body column is still 42P22 (PostgreSQL's texteq demands one).
-      membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
-      return {
-        node: {
-          kind: "subquery",
-          plan,
-          subKind: "in",
-          lhs,
-          negated: e.negated,
-          rowValued,
-        },
-        type: { kind: "bool" },
-      };
-    }
-    case "quantifiedSubquery": {
-      // The subquery spelling of the quantifier (array-functions.md §11.6) — the IN-subquery
-      // pattern with the comparison + 3VL fold. Resolve the outer lhs, plan the body, require ONE
-      // column (42601), and require comparability — reporting operator-not-found (42883) the way the
-      // array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
-      const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
-      const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
-      try {
-        classifyComparable(lt, elem);
-      } catch {
-        throw engineError(
-          "undefined_function",
-          `operator does not exist: ${rtName(lt)} ${binaryOpSymbol(e.op)} ${rtName(elem)}`,
-        );
-      }
-      const collation = membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
-      return {
-        node: {
-          kind: "subquery",
-          plan,
-          subKind: "quantified",
-          lhs,
-          negated: false,
-          rowValued,
-          op: e.op,
-          all: e.all,
-          collation,
-        },
-        type: { kind: "bool" },
-      };
-    }
-    case "collate": {
-      // `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
-      // the inner expression, require a collatable (text / text[]) type (42804, PG-matching), and validate the
-      // named collation exists ("C" or loaded, else 42704). A runtime PASSTHROUGH: a collation only
-      // changes the ORDERING comparisons / ORDER BY, derived from the AST at those sites
-      // (explicitCollation / OrderKey.collation), so resolving returns the inner node + type
-      // unchanged. The hint flows through (COLLATE never changes the type).
-      const r = resolve(scope, e.inner, ctx, ag, params);
-      if (!rtCollatable(r.type) && r.type.kind !== "null") {
-        throw typeError(`collations are not supported by type ${rtName(r.type)}`);
-      }
-      resolveCollationName(scope.catalog, e.collation); // surfaces 42704 for an unknown name
-      return r;
-    }
-    case "extract": {
-      // EXTRACT(field FROM source) (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
-      // validated at RESOLVE (not per row): an unsupported field for the source type is 0A000, an
-      // unrecognized field is 22023 — surfaced by probing the kernel with a zero value of the source's
-      // family. The source must be a datetime type (else 42883); the result is numeric.
-      const src = resolve(scope, e.source, null, ag, params);
-      // A NULL source has no resolvable family; the value propagates to NULL at eval (the field is
-      // not validated — a documented narrow edge vs. PG).
-      if (src.type.kind !== "null") {
-        let probe: ExtractSrc;
-        switch (src.type.kind) {
-          case "timestamp":
-            probe = { kind: "ts", micros: 0n };
-            break;
-          case "timestamptz":
-            probe = { kind: "tstz", instant: 0n, local: 0n, offsetSecs: 0n };
-            break;
-          case "date":
-            probe = { kind: "date", days: 0n };
-            break;
-          case "interval":
-            probe = { kind: "interval", iv: { months: 0, days: 0, micros: 0n } };
-            break;
-          default:
-            throw engineError(
-              "undefined_function",
-              `function extract(text, ${rtName(src.type)}) does not exist`,
-            ).hinted(FUNCTION_NO_MATCH);
-        }
-        extractField(e.field, probe); // validate field-for-type (0A000 / 22023); value discarded
-      }
-      params.nonimmutable ||= src.type.kind === "timestamptz" && e.field.toLowerCase() !== "epoch";
-      return {
-        node: { kind: "extract", field: e.field, value: src.node },
-        type: { kind: "decimal" },
-      };
-    }
-    case "cast": {
-      // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the string-literal
-      // form `'{…}'::T[]` and a bare NULL; every other array cast (runtime text→array, array→text,
-      // element-wise array→array) is a documented 0A000 narrowing.
-      if (e.typeName.endsWith("[]")) {
-        const base = e.typeName.slice(0, -2);
-        if (e.typeMod !== null) {
-          throw engineError(
-            "feature_not_supported",
-            "a type modifier on an array type is not supported yet",
-          );
-        }
-        const elemScalar = scalarTypeFromName(base);
-        const baseComposite = scope.catalog.compositeType(base);
-        let elemCol: ColType;
-        let elemRt: ResolvedType;
-        if (elemScalar !== undefined) {
-          elemCol = { kind: "scalar", scalar: elemScalar };
-          elemRt = resolvedTypeOf(elemScalar);
-        } else if (baseComposite !== undefined) {
-          const elemTy = compositeT(baseComposite.name);
-          elemCol = scope.catalog.colTypeOf(elemTy);
-          elemRt = resolvedTypeOfCol(elemTy, scope.catalog);
-        } else {
-          throw engineError("undefined_object", "type does not exist: " + base);
-        }
-        if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-          const text = e.inner.literal.text;
-          const col = elemCol;
-          const val = atPosition(e.inner.loc, () =>
-            foldInSessionZone(scope, params, (iz) => coerceStringToArray(text, col, iz)),
-          );
-          return {
-            node: valueToRExpr(val),
-            type: { kind: "array", elem: elemRt },
-          };
-        }
-        if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
-          return {
-            node: { kind: "constNull" },
-            type: { kind: "array", elem: elemRt },
-          };
-        }
-        // A bind parameter cast to an array type takes that type (api.md §5).
-        if (e.inner.kind === "param") {
-          return resolveParamNode(
-            scope,
-            e.inner,
-            { kind: "array", elem: elemCol },
-            { kind: "array", elem: elemRt },
-            params,
-          );
-        }
-        // A runtime (non-literal) operand: the two follow-on array-producing casts (array.md §7).
-        // A text expression coerces per row via array_in (runtime text→T[]); an array of the SAME
-        // element type is the identity (no node); an array of a DIFFERENT element type is an
-        // element-wise array→array cast (each element through the scalar cast, when the element pair
-        // is castable); a non-literal NULL adapts. Any other source is a 42804.
-        const inner = resolve(scope, e.inner, null, ag, params);
-        const resultType: ResolvedType = { kind: "array", elem: elemRt };
-        if (inner.type.kind === "null") {
-          return { node: inner.node, type: resultType };
-        }
-        if (inner.type.kind === "text") {
-          return {
-            node: { kind: "arrayCast", toElem: elemCol, operand: inner.node },
-            type: resultType,
-          };
-        }
-        if (inner.type.kind === "array") {
-          if (resolvedTypeEqual(inner.type.elem, elemRt)) {
-            return { node: inner.node, type: resultType }; // identity cast — same element type
-          }
-          const srcS = resolvedToScalar(inner.type.elem);
-          if (
-            srcS !== null &&
-            elemCol.kind === "scalar" &&
-            scalarPairCastable(srcS, elemCol.scalar)
-          ) {
-            // timestamptz elements render in the session zone (STABLE).
-            params.nonimmutable ||= srcS === "timestamptz" && isText(elemCol.scalar);
-            return {
-              node: { kind: "arrayCast", toElem: elemCol, operand: inner.node },
-              type: resultType,
-            };
-          }
-          // A composite element on either side is the deferred composite cast surface (0A000).
-          if (srcS === null || elemCol.kind === "composite") {
-            throw engineError(
-              "feature_not_supported",
-              "casting between composite-element arrays is not supported yet",
-            );
-          }
-          // Both elements are scalars but no cast exists between them — forbidden (42804; jed's
-          // strict-matrix convention, PG reports 42846).
-          throw engineError(
-            "datatype_mismatch",
-            "cannot cast " + rtName(inner.type) + " to " + base + "[]",
-          );
-        }
-        throw engineError(
-          "datatype_mismatch",
-          "cannot cast " + rtName(inner.type) + " to " + base + "[]",
-        );
-      }
-      // A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
-      // string-literal form and a bare NULL; every other range cast is a 0A000 narrowing
-      // (spec/design/ranges.md §1/§5).
-      {
-        const rdesc = rangeByName(e.typeName);
-        if (rdesc !== undefined) {
-          if (e.typeMod !== null) {
-            throw engineError(
-              "feature_not_supported",
-              "a type modifier on a range type is not supported",
-            );
-          }
-          const elemRt = resolvedTypeOf(elementScalar(rdesc));
-          if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-            const text = e.inner.literal.text;
-            return atPosition(e.inner.loc, () =>
-              foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(text, rdesc, iz)),
-            );
-          }
-          if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
-            return {
-              node: { kind: "constNull" },
-              type: { kind: "range", elem: elemRt },
-            };
-          }
-          // A bind parameter cast to a range type takes that type (api.md §5).
-          if (e.inner.kind === "param") {
-            return resolveParamNode(
-              scope,
-              e.inner,
-              { kind: "range", elem: { kind: "scalar", scalar: elementScalar(rdesc) } },
-              { kind: "range", elem: elemRt },
-              params,
-            );
-          }
-          throw engineError(
-            "feature_not_supported",
-            "casting to a range type is only supported from a string literal this slice",
-          );
-        }
-      }
-      // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
-      // (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
-      // `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite operand
-      // is the identity. Every other operand (a runtime text expression, an anonymous `ROW(…)`) is a
-      // documented 0A000 narrowing this slice — relaxable. A type modifier on a composite is
-      // meaningless (0A000).
-      const ct = scope.catalog.compositeType(e.typeName);
-      if (ct !== undefined) {
-        if (e.typeMod !== null) {
-          throw engineError(
-            "feature_not_supported",
-            "a type modifier is not supported on a composite type",
-          );
-        }
-        if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-          const text = e.inner.literal.text;
-          return atPosition(e.inner.loc, () =>
-            foldInSessionZone(scope, params, (iz) =>
-              coerceStringToComposite(text, ct, scope.catalog, iz),
-            ),
-          );
-        }
-        // A bind parameter cast to a composite type takes that type (api.md §5).
-        if (e.inner.kind === "param") {
-          const cty: Type = { kind: "composite", name: ct.name };
-          return resolveParamNode(
-            scope,
-            e.inner,
-            scope.catalog.colTypeOf(cty),
-            resolvedTypeOfCol(cty, scope.catalog),
-            params,
-          );
-        }
-        const inner = resolve(scope, e.inner, null, ag, params);
-        if (inner.type.kind === "null") {
-          return {
-            node: inner.node,
-            type: resolvedTypeOfCol({ kind: "composite", name: ct.name }, scope.catalog),
-          };
-        }
-        // An identical named composite is the identity cast.
-        if (inner.type.kind === "composite" && inner.type.name === ct.name) {
-          return inner;
-        }
-        throw engineError(
-          "feature_not_supported",
-          "casting to a composite type is only supported from a string literal",
-        );
-      }
-      const [target, typmod, varcharLen] = resolveTypeAndTypmod(e.typeName, e.typeMod);
-      // A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the same
-      // primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The ONLY
-      // text→T cast admitted ahead of the general cast slice; a non-literal text operand still
-      // falls through to the deferred 0A000 below. A varchar(n) target truncates the literal to n
-      // code points (types.md §15).
-      if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-        // 'today'::date / CAST('now' AS date) — the clock-relative specials become the STABLE
-        // dateClock node, exactly like the ctx-adaptation form (date.md §6).
-        if (isDate(target)) {
-          const clock = dateClockLiteral(e.inner.literal.text, params);
-          if (clock !== null) return clock;
-        }
-        const text = e.inner.literal.text;
-        // The literal's input error points at the literal (PostgreSQL coerces it at parse time —
-        // spec/design/error-fields.md §10.2).
-        return atPosition(e.inner.loc, () =>
-          foldInSessionZone(scope, params, (iz) =>
-            coerceStringLiteral(text, target, typmod, varcharLen, iz),
-          ),
-        );
-      }
-      // Casting TO text (casts.toml, types.md §5): every built-in scalar renders its own output form,
-      // the text a result cell shows — json verbatim, jsonb canonical, uuid lowercase, bytea \x hex,
-      // timestamptz in the SESSION zone (timezones.md §9.5). Explicit only — stricter than PG's
-      // assignment cast to text (a documented divergence), so INSERT INTO text_col VALUES (1) /
-      // text_col = 1 stay 42804. A varchar(n) length truncates the rendered text (types.md §15).
-      // `$1::text` declares the parameter as text, like every other cast target (api.md §5).
-      // Composite and range sources stay 0A000.
-      if (isText(target)) {
-        const inner = resolve(scope, e.inner, e.inner.kind === "param" ? "text" : null, ag, params);
-        const ik = inner.type.kind;
-        return {
-          node: castToText(inner.node, inner.type, target, varcharLen, params),
-          type: { kind: "text" },
-        };
-      }
-      // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
-      // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL
-      // / bool source is castable), so it is handled AFTER the inner is resolved, below.
-      // A bytea TARGET: runtime text → bytea decodes the per-row string with the literal's own bytea
-      // input (types.md §5/§13 — immutable, like PG's byteain), and the uuid cast slice admits uuid →
-      // bytea (the 16 raw bytes — a jed cast PG lacks; casts.toml, types.md §14). A string LITERAL
-      // was coerced above; a NULL adapts; a bytea operand is the identity. Any other source is a
-      // forbidden pair (42804).
-      if (isBytea(target)) {
-        if (e.inner.kind === "param") {
-          const pinner = resolve(scope, e.inner, "bytea", ag, params);
-          return { node: pinner.node, type: { kind: "bytea" } };
-        }
-        const inner = resolve(scope, e.inner, null, ag, params);
-        const ik = inner.type.kind;
-        if (ik === "null" || ik === "bytea") {
-          return { node: inner.node, type: { kind: "bytea" } };
-        }
-        if (ik === "text" || ik === "uuid") {
-          return {
-            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
-            type: { kind: "bytea" },
-          };
-        }
-        throw typeError("cannot cast " + rtName(inner.type) + " to bytea");
-      }
-      // The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
-      // or bytea expression. text → uuid runs uuid_in at eval (22P02 on malformed); bytea → uuid takes
-      // the 16 raw bytes (22P02 on a length ≠ 16) — a jed cast PG lacks. A string LITERAL operand was
-      // coerced above (the §6 adaptation); $1::uuid declares the param as uuid; a NULL adapts; a uuid
-      // operand is the identity.
-      if (isUuid(target)) {
-        if (e.inner.kind === "param") {
-          const pinner = resolve(scope, e.inner, "uuid", ag, params);
-          return { node: pinner.node, type: { kind: "uuid" } };
-        }
-        const inner = resolve(scope, e.inner, null, ag, params);
-        const ik = inner.type.kind;
-        if (ik === "null" || ik === "uuid") {
-          return { node: inner.node, type: { kind: "uuid" } };
-        }
-        if (ik === "text" || ik === "bytea") {
-          return {
-            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
-            type: { kind: "uuid" },
-          };
-        }
-        throw typeError("cannot cast " + rtName(inner.type) + " to uuid");
-      }
-      // Datetime casts (timezones.md §9.3, types.md §5): a timestamp/timestamptz/date TARGET from
-      // another datetime family or from runtime text. A same-family cast is the identity; a
-      // cross-family or text cast becomes a dateConvert node (the zone-crossing ones read the session
-      // zone at eval); any other source is a forbidden pair (42804). A NULL operand adapts to the
-      // target.
-      if (isTimestamp(target) || isTimestamptz(target) || isDate(target)) {
-        if (e.inner.kind === "param") {
-          const pinner = resolve(scope, e.inner, target, ag, params);
-          return { node: pinner.node, type: resolvedTypeOf(target) };
-        }
-        const inner = resolve(scope, e.inner, null, ag, params);
-        const toRt = resolvedTypeOf(target);
-        const ik = inner.type.kind;
-        if (ik === "null") return { node: inner.node, type: toRt };
-        if (
-          (ik === "timestamp" && isTimestamp(target)) ||
-          (ik === "timestamptz" && isTimestamptz(target)) ||
-          (ik === "date" && isDate(target))
-        ) {
-          return { node: inner.node, type: inner.type };
-        }
-        if (ik === "timestamp" || ik === "timestamptz" || ik === "date") {
-          params.nonimmutable ||= ik === "timestamptz" || isTimestamptz(target);
-          return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
-        }
-        if (ik === "text") {
-          // The runtime text → date / timestamp / timestamptz casts (date.md §6, types.md §5): a
-          // NON-literal text source (a string LITERAL operand was already folded by the
-          // literal-adaptation path above) parses per row via the literal's own parser (22007/22008
-          // per row); text → timestamptz reads an offset-less string in the session zone. STABLE,
-          // not immutable — like PostgreSQL's date_in / timestamp_in / timestamptz_in — so it flags
-          // the plan non-immutable (42P17 in an index expression).
-          params.nonimmutable = true;
-          return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
-        }
-        throw typeError(`cannot cast ${rtName(inner.type)} to ${canonicalName(target)}`);
-      }
-      // An interval TARGET (interval.md §6, types.md §5): runtime text → interval parses the per-row
-      // string with the literal's own parseInterval (22007/22008 per row) — STABLE, like PostgreSQL's
-      // interval_in, so it flags the plan non-immutable (42P17 in an index expression). An interval
-      // operand is the identity; $1::interval declares the param as interval; a NULL adapts. Any
-      // other source is a forbidden pair (42804).
-      if (isInterval(target)) {
-        if (e.inner.kind === "param") {
-          const pinner = resolve(scope, e.inner, "interval", ag, params);
-          return { node: pinner.node, type: { kind: "interval" } };
-        }
-        const inner = resolve(scope, e.inner, null, ag, params);
-        const ik = inner.type.kind;
-        if (ik === "null" || ik === "interval") {
-          return { node: inner.node, type: { kind: "interval" } };
-        }
-        if (ik === "text") {
-          params.nonimmutable = true;
-          return {
-            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
-            type: { kind: "interval" },
-          };
-        }
-        throw typeError("cannot cast " + rtName(inner.type) + " to interval");
-      }
-      // The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
-      // text/json/jsonb expression (a string LITERAL operand was already coerced above by
-      // coerceStringLiteral). text → json validates + stores verbatim; text → jsonb parses +
-      // canonicalizes; json → jsonb re-parses + canonicalizes; jsonb → json renders the canonical
-      // text; same-type is the identity. Any other source is a 42804 cast error (jed's invalid-cast
-      // convention; PG reports 42846 — a documented divergence).
-      if (isJson(target) || isJsonb(target)) {
-        if (e.inner.kind === "param") {
-          const pinner = resolve(scope, e.inner, target, ag, params);
-          return { node: pinner.node, type: resolvedTypeOf(target) };
-        }
-        const inner = resolve(scope, e.inner, null, ag, params);
-        const toRt = resolvedTypeOf(target);
-        const ik = inner.type.kind;
-        if (ik === "null") return { node: inner.node, type: toRt };
-        if (ik === "text" || ik === "json" || ik === "jsonb") {
-          return {
-            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
-            type: toRt,
-          };
-        }
-        throw typeError("cannot cast type " + rtName(inner.type) + " to " + canonicalName(target));
-      }
-      // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
-      // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
-      // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
-      // context (its value is range-checked / coerced against target at eval), so changing the
-      // context only for a parameter leaves all existing CAST behavior untouched.
-      // A boolean target accepts only an i32 source (the boolean cast slice): an untyped integer
-      // literal operand adapts to i32 (CAST(5 AS boolean) / 5::boolean), matching PG. A column/
-      // expression keeps its own type; a literal beyond i32 range then traps 22003 (PG 42846 — a
-      // documented divergence).
-      const innerCtx = e.inner.kind === "param" ? target : isBool(target) ? "i32" : null;
-      const inner = resolve(scope, e.inner, innerCtx, ag, params);
-      // The boolean cast slice (spec/types/casts.toml, types.md §9): PG ties boolean↔integer to i32
-      // ONLY and makes both directions explicit. A boolean TARGET takes an i32 / NULL / bool source
-      // (the eval maps 0→false, nonzero→true); a boolean SOURCE produces an i32 (true→1, false→0).
-      // Handled here, ahead of the generic numeric cast below — resultType assumes an int/decimal/
-      // float target, so a boolean target must not fall through. A bool⇄i16 / bool⇄i64 pair is a
-      // forbidden 42804 (jed's datatype-mismatch convention; PG reports 42846, casts.toml).
-      if (isBool(target)) {
-        // A runtime `text` source is the runtime-text-cast slice (grammar.md §36): the eval parses
-        // the per-row string via the same parseBoolLiteral (PG boolin) the 't'::boolean literal
-        // uses. A string LITERAL operand was already coerced above, so a text source here is
-        // non-literal (a column / expression).
-        if (
-          (inner.type.kind === "int" && inner.type.ty === "i32") ||
-          inner.type.kind === "null" ||
-          inner.type.kind === "bool" ||
-          inner.type.kind === "text"
-        ) {
-          return {
-            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
-            type: { kind: "bool" },
-          };
-        }
-        throw typeError("cannot cast " + rtName(inner.type) + " to boolean");
-      }
-      if (inner.type.kind === "bool") {
-        // boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
-        if (target === "i32") {
-          return {
-            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
-            type: { kind: "int", ty: "i32" },
-          };
-        }
-        throw typeError("cannot cast boolean to " + canonicalName(target));
-      }
-      // A runtime `text` source to a numeric target is the runtime-text-cast slice (grammar.md
-      // §36): the only targets reaching this generic path are int / decimal / float (text / bytea /
-      // uuid / datetime / interval / bool / json targets all return in their own blocks above), so
-      // a text source here casts to a number. The eval coerces the per-row string via the same
-      // parse functions the literal form uses (22P02 / 22003 per row). A string LITERAL operand was
-      // already folded above, so this text is non-literal — fall through to the numeric cast node.
-      // Casting FROM bytea is likewise deferred (0A000).
-      if (inner.type.kind === "bytea") {
-        throw engineError("feature_not_supported", "casting from bytea is not supported yet");
-      }
-      // Casting FROM uuid is likewise deferred (0A000).
-      if (inner.type.kind === "uuid") {
-        throw engineError("feature_not_supported", "casting from uuid is not supported yet");
-      }
-      // Casting FROM a timestamp is likewise deferred (0A000).
-      if (inner.type.kind === "timestamp" || inner.type.kind === "timestamptz") {
-        throw engineError(
-          "feature_not_supported",
-          "casting from a timestamp type is not supported yet",
-        );
-      }
-      // Casting FROM an interval is likewise deferred (0A000).
-      if (inner.type.kind === "interval") {
-        throw engineError(
-          "feature_not_supported",
-          "casting from an interval type is not supported yet",
-        );
-      }
-      // Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
-      if (inner.type.kind === "date") {
-        throw engineError("feature_not_supported", "casting from a date type is not supported yet");
-      }
-      // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
-      if (inner.type.kind === "array") {
-        throw engineError("feature_not_supported", "casting an array value is not supported yet");
-      }
-      // Casting FROM json/jsonb (json↔jsonb, json[b]→text) lands in J3 (spec/design/json.md §6);
-      // deferred this slice. Casting FROM jsonpath is likewise deferred.
-      if (
-        inner.type.kind === "json" ||
-        inner.type.kind === "jsonb" ||
-        inner.type.kind === "jsonpath"
-      ) {
-        throw engineError("feature_not_supported", "casting a json value is not supported yet");
-      }
-      // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
-      // decimal→decimal (re-scale), the float casts (int↔float, decimal↔float, float↔float — all
-      // explicit, float.md §6), and NULL are all castable. The CAST matrix (casts.toml) is strict:
-      // these are exactly the legal (from, to) pairs across the int/decimal/float families.
-      const resultType: ResolvedType = isDecimal(target)
-        ? { kind: "decimal" }
-        : isFloat(target)
-          ? { kind: "float", ty: target }
-          : { kind: "int", ty: target };
-      return {
-        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
-        type: resultType,
-      };
-    }
+      return resolveLiteralExpr(scope, e, ctx, params);
+    case "scalarSubquery":
+      return resolveScalarSubqueryExpr(scope, e, params);
+    case "exists":
+      return resolveExistsExpr(scope, e, params);
+    case "inSubquery":
+      return resolveInSubqueryExpr(scope, e, ag, params);
+    case "quantifiedSubquery":
+      return resolveQuantifiedSubqueryExpr(scope, e, ag, params);
+    case "collate":
+      return resolveCollateExpr(scope, e, ctx, ag, params);
+    case "extract":
+      return resolveExtractExpr(scope, e, ag, params);
+    case "cast":
+      return resolveCastExpr(scope, e, ag, params);
     case "unary":
-      if (e.op === "neg") {
-        const { node, type } = resolve(scope, e.operand, ctx, ag, params);
-        if (type.kind === "decimal") {
-          return {
-            node: { kind: "neg", result: "decimal", operand: node },
-            type: { kind: "decimal" },
-          };
-        }
-        if (type.kind === "float") {
-          // Unary minus on a float flips the sign bit (no overflow); a NaN/Inf operand passes
-          // through per IEEE (-NaN is NaN, -Inf is -Inf) — float.md §5. result keeps the width.
-          return {
-            node: { kind: "neg", result: type.ty, operand: node },
-            type: { kind: "float", ty: type.ty },
-          };
-        }
-        if (type.kind === "interval") {
-          // -interval (spec/design/interval.md §5).
-          return {
-            node: { kind: "neg", result: "interval", operand: node },
-            type: { kind: "interval" },
-          };
-        }
-        let result: ScalarType;
-        if (type.kind === "int") result = type.ty;
-        else if (type.kind === "null")
-          result = "i64"; // -NULL = NULL
-        else throw typeError("unary minus requires a numeric operand");
-        return {
-          node: { kind: "neg", result, operand: node },
-          type: { kind: "int", ty: result },
-        };
-      }
-      {
-        const { node, type } = resolve(scope, e.operand, null, ag, params);
-        atPosition(exprLocation(e.operand), () =>
-          requireBool(type, "NOT requires a boolean operand"),
-        );
-        return { node: { kind: "not", operand: node }, type: { kind: "bool" } };
-      }
+      return resolveUnaryExpr(scope, e, ctx, ag, params);
     case "isNull": {
       const { node } = resolve(scope, e.operand, null, ag, params);
       return {
@@ -1776,384 +770,1609 @@ function resolveNode(
         type: { kind: "bool" },
       };
     }
-    case "isJson": {
-      // The operand must be a character string / json / jsonb (else 42804); a bare string literal
-      // resolves as text. The predicate is always a definite boolean (a NULL operand → NULL at eval).
-      const { node, type } = resolve(scope, e.operand, null, ag, params);
-      switch (type.kind) {
-        case "text":
-        case "json":
-        case "jsonb":
-        case "null":
-          break;
-        default:
-          throw engineError(
-            "datatype_mismatch",
-            "cannot use type " + rtName(type) + " in IS JSON predicate",
-          );
-      }
-      return {
-        node: {
-          kind: "isJson",
-          operand: node,
-          negated: e.negated,
-          jsonKind: e.jsonKind,
-          uniqueKeys: e.uniqueKeys,
-        },
-        type: { kind: "bool" },
-      };
-    }
-    case "jsonCtor": {
-      // JSON(text) parses a character string to a `json` value (verbatim). The operand must be text
-      // (a bare string literal stays text under the Text context hint); a non-text operand → 42804.
-      const { node, type } = resolve(scope, e.operand, "text", ag, params);
-      switch (type.kind) {
-        case "text":
-        case "null":
-          break;
-        default:
-          throw engineError(
-            "datatype_mismatch",
-            "cannot use type " + rtName(type) + " as JSON() input",
-          );
-      }
-      return {
-        node: { kind: "jsonCtor", operand: node, uniqueKeys: e.uniqueKeys },
-        type: { kind: "json" },
-      };
-    }
-    // The SQL/JSON query functions JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
-    // S2). Each compiles a jsonpath, evaluates it over a context item, and applies per-function
-    // semantics (the existence predicate / a single scalar / a json value). resolveJsonSqlFn does the
-    // shared context/path resolution + the RETURNING/behavior bookkeeping.
+    case "isJson":
+      return resolveIsJsonExpr(scope, e, ag, params);
+    case "jsonCtor":
+      return resolveJsonCtorExpr(scope, e, ag, params);
     case "jsonExists":
-      return resolveJsonSqlFn(
-        scope,
-        "exists",
-        e.ctx,
-        e.path,
-        e.passing,
-        null,
-        "without",
-        true,
-        null,
-        e.onError,
-        ag,
-        params,
-      );
+      return resolveJsonExistsExpr(scope, e, ag, params);
     case "jsonValue":
-      return resolveJsonSqlFn(
-        scope,
-        "value",
-        e.ctx,
-        e.path,
-        e.passing,
-        e.returning,
-        "without",
-        true,
-        e.onEmpty,
-        e.onError,
-        ag,
-        params,
-      );
+      return resolveJsonValueExpr(scope, e, ag, params);
     case "jsonQuery":
-      return resolveJsonSqlFn(
-        scope,
-        "query",
-        e.ctx,
-        e.path,
-        e.passing,
-        e.returning,
-        e.wrapper,
-        e.keepQuotes,
-        e.onEmpty,
-        e.onError,
-        ag,
-        params,
-      );
-    case "isDistinct": {
-      // NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a literal
-      // adapts to its sibling; a text literal stays text), then require the operands be
-      // comparable (both integer-ish or both text-ish; a mixed pair is 42804). The result
-      // is always a definite boolean (functions.md §3).
-      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
-      classifyComparable(p.lt, p.rt);
-      return {
-        node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated },
-        type: { kind: "bool" },
-      };
-    }
+      return resolveJsonQueryExpr(scope, e, ag, params);
+    case "isDistinct":
+      return resolveIsDistinctExpr(scope, e, ag, params);
     case "binary":
       return resolveBinary(scope, e.op, e.lhs, e.rhs, ag, params);
     case "quantified":
       return resolveQuantified(scope, e.op, e.all, e.lhs, e.array, ag, params);
-    case "in": {
-      // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
-      // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant —
-      // `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL. Still
-      // resolve the LHS so an undefined column / aggregate-context error fires, then return the
-      // constant (a leaf — no operator_eval, cost.md §3).
-      if (e.list.length === 0) {
-        resolve(scope, e.lhs, null, ag, params);
+    case "in":
+      return resolveInExpr(scope, e, ctx, ag, params);
+    case "between":
+      return resolveBetweenExpr(scope, e, ctx, ag, params);
+    case "like":
+      return resolveLikeExpr(scope, e, ag, params);
+    case "regex":
+      return resolveRegexExpr(scope, e, ag, params);
+    case "case":
+      return resolveCaseExpr(scope, e, ag, params);
+    case "coalesce":
+      return resolveCoalesceExpr(scope, e, ag, params);
+    case "greatestLeast":
+      return resolveGreatestLeastExpr(scope, e, ag, params);
+  }
+}
+
+function resolveRowExpr(
+  scope: Scope,
+  e: Of<"row">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // A ROW(...) constructor (spec/design/composite.md §1): resolve each field with no type
+  // context (its natural type), producing an ANONYMOUS composite (name = null, fields named
+  // f1, f2, … per PG). Storing it into a named composite column matches structurally
+  // (assignability at the store site coerces each field to the target's declared type).
+  const nodes: RExpr[] = [];
+  const fields: { name: string; type: ResolvedType }[] = [];
+  for (let i = 0; i < e.fields.length; i++) {
+    const { node, type } = resolve(scope, e.fields[i]!, null, ag, params);
+    nodes.push(node);
+    fields.push({ name: "f" + (i + 1), type });
+  }
+  return {
+    node: { kind: "row", fields: nodes },
+    type: { kind: "composite", name: null, fields },
+  };
+}
+
+function resolveArrayExpr(
+  scope: Scope,
+  e: Of<"array">,
+  ctx: ScalarType | null,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // An ARRAY[...] constructor (spec/design/array.md §1): resolve each element (natural type),
+  // unify to a common element type, build an array node. A bare empty ARRAY[] has no element
+  // type to infer — use '{}'::T[] instead (the cast supplies it).
+  if (e.elements.length === 0) {
+    throw typeError("cannot determine the element type of an empty ARRAY[]; write '{}'::T[]");
+  }
+  // An element-type hint (ctx) flows down to the elements so an array literal adapts its untyped
+  // integer/decimal literals exactly as a scalar literal does — e.g. resolving ARRAY[7,8] with an
+  // i32 context yields i32[], not the default i64[] (the polymorphic array functions pass the
+  // bound element type here, array-functions.md §2). Almost every other caller passes null, so the
+  // default 1-D unification is unchanged.
+  const nodes: RExpr[] = [];
+  const elemTypes: ResolvedType[] = [];
+  for (const el of e.elements) {
+    const { node, type } = resolve(scope, el, ctx, ag, params);
+    nodes.push(node);
+    elemTypes.push(type);
+  }
+  // If the items are themselves arrays, this is a nested (multidim-stacking) constructor and the
+  // result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D array.
+  let common: ResolvedType;
+  try {
+    common = unifyArrayElementTypes(elemTypes);
+  } catch (err) {
+    throw positionedAt(err, mismatchLocation(elemTypes, e.elements, unifyArrayElementTypes));
+  }
+  if (common.kind === "array") {
+    return {
+      node: { kind: "array", elements: nodes, nested: true },
+      type: common,
+    };
+  }
+  return {
+    node: { kind: "array", elements: nodes, nested: false },
+    type: { kind: "array", elem: common },
+  };
+}
+
+function resolveQualifiedColumnExpr(
+  scope: Scope,
+  e: Of<"qualifiedColumn">,
+  ag: AggCtx,
+): { node: RExpr; type: ResolvedType } {
+  // A bare `rel.col` resolves STRICTLY against the FROM relations — `qualifier` MUST name a
+  // relation (else 42P01), matching PostgreSQL. Composite field access on a column is the
+  // PARENS-REQUIRED `(col).field` form (spec/design/composite.md §1/§S4), a fieldAccess node,
+  // never this bare qualified-column path (PG raises 42P01 for the unparenthesized `col.field` /
+  // `t.col.field` spellings).
+  return resolveColumnRef(scope, ag, scope.resolveQualifiedAt(e.qualifier, e.name, e.loc), e.name);
+}
+
+function resolveSubscriptExpr(
+  scope: Scope,
+  e: Of<"subscript">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array (else
+  // 42804). Each subscript bound is an integer (a literal adapts; a non-integer is 42804). If any
+  // spec is a slice the result is the array type (a sub-array); otherwise the element type. OOB /
+  // NULL → NULL is an evaluation-time rule, not a resolve error.
+  const base = resolve(scope, e.base, null, ag, params);
+  if (base.type.kind !== "array") {
+    throw typeError(`cannot subscript a value of type ${rtName(base.type)}, which is not an array`);
+  }
+  const resolveBound = (b: Expr): RExpr => {
+    const r = resolve(scope, b, "i32", ag, params);
+    if (r.type.kind !== "int" && r.type.kind !== "null") {
+      throw typeError(`array subscript must be an integer, not ${rtName(r.type)}`);
+    }
+    return r.node;
+  };
+  let isSlice = false;
+  const rsubs: RSubscript[] = e.subscripts.map((s) => {
+    if (s.isSlice) {
+      isSlice = true;
+      return {
+        isSlice: true,
+        lower: s.lower === null ? null : resolveBound(s.lower),
+        upper: s.upper === null ? null : resolveBound(s.upper),
+      };
+    }
+    return { isSlice: false, index: resolveBound(s.index) };
+  });
+  // A slice yields a sub-array (the array type); all-index access yields an element.
+  const type = isSlice ? base.type : base.type.elem;
+  return {
+    node: {
+      kind: "subscript",
+      base: base.node,
+      subscripts: rsubs,
+      isSlice,
+    },
+    type,
+  };
+}
+
+function resolveParamExpr(
+  scope: Scope,
+  e: Of<"param">,
+  ctx: ScalarType | null,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
+  // type from ctx — the sibling operand, target column, or CAST target. Record the inferred
+  // type (null = no context here; finalize 42P18s a parameter that never gets one).
+  const type: ResolvedType = ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
+  return resolveParamNode(
+    scope,
+    e,
+    ctx === null ? null : { kind: "scalar", scalar: ctx },
+    type,
+    params,
+  );
+}
+
+function resolveFuncCallExpr(
+  scope: Scope,
+  e: Of<"funcCall">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19) is
+  // one of these window-function names used WITH a WITHIN GROUP clause; that clause routes it here
+  // instead of the window path. OVER + WITHIN GROUP together is 0A000.
+  if (isHypotheticalSetName(e.name) && e.withinGroup !== undefined && e.withinGroup !== null) {
+    if (
+      (e.over !== undefined && e.over !== null) ||
+      (e.overName !== undefined && e.overName !== null)
+    ) {
+      throw engineError(
+        "feature_not_supported",
+        `OVER is not supported for hypothetical-set aggregate ${e.name}`,
+      );
+    }
+    return resolveHypotheticalSetAggregate(scope, e, ag, params);
+  }
+  // An ordered-set aggregate (mode/percentile_cont/percentile_disc — aggregates.md §13) carries
+  // WITHIN GROUP and is resolved by its own path. OVER on one is 0A000 (PG itself does not support
+  // an ordered-set aggregate as a window function); WITHOUT a WITHIN GROUP it is 42883 (PG:
+  // "function mode() does not exist").
+  if (isOrderedSetAggregateName(e.name)) {
+    if (
+      (e.over !== undefined && e.over !== null) ||
+      (e.overName !== undefined && e.overName !== null)
+    ) {
+      throw engineError(
+        "feature_not_supported",
+        `OVER is not supported for ordered-set aggregate ${e.name}`,
+      );
+    }
+    if (e.withinGroup === undefined || e.withinGroup === null) {
+      throw noAggOverload(e.name);
+    }
+    return resolveOrderedSetAggregate(scope, e, ag, params);
+  }
+  // WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function) is
+  // 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
+  if (e.withinGroup !== undefined && e.withinGroup !== null) {
+    throw noAggOverload(e.name);
+  }
+  // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
+  if (e.over !== undefined && e.over !== null) {
+    // GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in PostgreSQL
+    // (42601); match it rather than treating GROUPING as an unknown window function.
+    if (e.name === "grouping") {
+      throw engineError("syntax_error", "OVER is not supported for GROUPING");
+    }
+    // DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5): a window
+    // aggregate folds over a frame, where per-frame de-duplication is undefined.
+    if (e.distinct) {
+      throw engineError(
+        "feature_not_supported",
+        "DISTINCT is not implemented for window functions",
+      );
+    }
+    // Nor is an in-aggregate ORDER BY (PG 0A000 — aggregates.md §22): the window frame, not an
+    // input sort, orders a window aggregate's fold.
+    if (e.aggOrder !== undefined && e.aggOrder !== null) {
+      throw engineError(
+        "feature_not_supported",
+        "aggregate ORDER BY is not implemented for window functions",
+      );
+    }
+    // FILTER over a window function (aggregates.md §20). A window AGGREGATE folds only the frame
+    // rows for which the filter is TRUE; a pure (non-aggregate) window function with FILTER is
+    // PG's own 0A000 ("FILTER is not implemented for non-aggregate window functions"). The filter
+    // is threaded into the WindowSpec and applied in the window stage.
+    if (e.filter !== undefined && e.filter !== null && !isAggregateName(e.name)) {
+      throw engineError(
+        "feature_not_supported",
+        "FILTER is not implemented for non-aggregate window functions",
+      );
+    }
+    return resolveWindowCall(
+      scope,
+      { name: e.name, args: e.args, star: e.star, over: e.over, filter: e.filter },
+      ag,
+      params,
+    );
+  }
+  // A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's wrong_object_type,
+  // not the windowing_error 42P20 it uses for a window in WHERE — window.md §7, oracle-verified).
+  if (isWindowOnlyName(e.name)) {
+    throw engineError("wrong_object_type", `window function ${e.name} requires an OVER clause`);
+  }
+  return resolveFuncCall(scope, e, ag, params);
+}
+
+function resolveTypedLiteralExpr(
+  scope: Scope,
+  e: Of<"typedLiteral">,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's
+  // `type 'string'`, equal to CAST('string' AS type) over a string-literal operand. Resolve the
+  // type by name (unknown → 42704) and coerce the string to it at resolve, context-free. No
+  // typmod rides on the literal (the parser's one-token lookahead admits none).
+  // A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
+  // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
+  const ct = scope.catalog.compositeType(e.typeName);
+  if (ct !== undefined)
+    return atPosition(e.loc, () =>
+      foldInSessionZone(scope, params, (iz) =>
+        coerceStringToComposite(e.text, ct, scope.catalog, iz),
+      ),
+    );
+  // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
+  // against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
+  const rdesc = rangeByName(e.typeName);
+  if (rdesc !== undefined)
+    return atPosition(e.loc, () =>
+      foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(e.text, rdesc, iz)),
+    );
+  const [target] = resolveTypeAndTypmod(e.typeName, null);
+  // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE dateClock
+  // node, exactly like the ctx-adaptation form (date.md §6).
+  if (isDate(target)) {
+    const clock = dateClockLiteral(e.text, params);
+    if (clock !== null) return clock;
+  }
+  return atPosition(e.loc, () =>
+    foldInSessionZone(scope, params, (iz) => coerceStringLiteral(e.text, target, null, null, iz)),
+  );
+}
+
+function resolveLiteralExpr(
+  scope: Scope,
+  e: Of<"literal">,
+  ctx: ScalarType | null,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  switch (e.literal.kind) {
+    case "null":
+      return { node: { kind: "constNull" }, type: { kind: "null" } };
+    case "bool":
+      return {
+        node: { kind: "constBool", value: e.literal.value },
+        type: { kind: "bool" },
+      };
+    case "text": {
+      // A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
+      // context (types.md §6/§13/§14): decode the bytea input (hex or escape) or the PG-flexible
+      // uuid input (uuid) — 22P02 on malformed; any other context — including none — keeps it
+      // text.
+      // A string literal is text by default (collation C). It adapts to a BYTEA context
+      // (decode the bytea input, 22P02 on bad input) or a TIMESTAMP/TIMESTAMPTZ context (parse
+      // the datetime, 22007/22008 — spec/design/timestamp.md). Any other context keeps it text.
+      if (ctx !== null && isBytea(ctx)) {
         return {
-          node: { kind: "constBool", value: e.negated },
-          type: { kind: "bool" },
+          node: {
+            kind: "constBytea",
+            value: decodeByteaLiteral(e.literal.text),
+          },
+          type: { kind: "bytea" },
         };
       }
-      // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
-      // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
-      // non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses the
-      // `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics, per-element operand
-      // typing (a too-wide literal → 22003, a cross-family element → 42804), and cost all fall
-      // out. The LHS is evaluated once per element (the OR-chain model — a documented cost
-      // consequence, cost.md §3).
-      let folded: Expr | null = null;
-      for (const elem of e.list) {
-        // The desugared comparisons carry the IN's operator position (PostgreSQL's).
-        const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem, loc: e.loc };
-        folded =
-          folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq, loc: e.loc };
+      if (ctx !== null && isUuid(ctx)) {
+        return {
+          node: {
+            kind: "constUuid",
+            value: decodeUuidLiteral(e.literal.text),
+          },
+          type: { kind: "uuid" },
+        };
       }
-      // folded is non-null: the parser guarantees a non-empty list.
-      let desugared = folded as Expr;
-      if (e.negated) {
-        desugared = { kind: "unary", op: "not", operand: desugared, loc: e.loc };
+      if (ctx !== null && isTimestamp(ctx)) {
+        return {
+          node: {
+            kind: "constTimestamp",
+            value: parseTimestamp(e.literal.text),
+          },
+          type: { kind: "timestamp" },
+        };
       }
-      return resolve(scope, desugared, ctx, ag, params);
-    }
-    case "between": {
-      // Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
-      // result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a FALSE
-      // operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL. NOT BETWEEN
-      // negates the whole conjunction. The LHS is evaluated twice (the desugar model — a
-      // documented cost consequence, cost.md §3).
-      // The desugared comparisons carry the BETWEEN's operator position (PostgreSQL's).
-      const ge: Expr = { kind: "binary", op: "ge", lhs: e.lhs, rhs: e.lo, loc: e.loc };
-      const le: Expr = { kind: "binary", op: "le", lhs: e.lhs, rhs: e.hi, loc: e.loc };
-      let desugared: Expr = { kind: "binary", op: "and", lhs: ge, rhs: le, loc: e.loc };
-      if (e.negated) {
-        desugared = { kind: "unary", op: "not", operand: desugared, loc: e.loc };
+      // An offset-less string reads in the SESSION zone, as PostgreSQL's timestamptz_in does
+      // (timezones.md §9.3).
+      if (ctx !== null && isTimestamptz(ctx)) {
+        const text = e.literal.text;
+        return {
+          node: {
+            kind: "constTimestamptz",
+            value: foldInSessionZone(scope, params, (iz) => iz.parseTimestamptz(text)),
+          },
+          type: { kind: "timestamptz" },
+        };
       }
-      return resolve(scope, desugared, ctx, ag, params);
-    }
-    case "like": {
-      // LIKE / ILIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
-      // stays text), then require BOTH operands be text (or a bare NULL); a non-text operand is
-      // 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
-      const p = resolveTextOperandPair(scope, e.lhs, e.rhs, ag, params);
-      requireTextOrNull(p.lt);
-      requireTextOrNull(p.rt);
+      if (ctx !== null && isDate(ctx)) {
+        // A string adapts to a DATE context (the ISO date, dropping any time/offset; date.md
+        // §2). A clock-relative special ('today'/'now'/…) becomes the STABLE dateClock node
+        // instead of a constant (date.md §6).
+        const clock = dateClockLiteral(e.literal.text, params);
+        if (clock !== null) return clock;
+        return {
+          node: { kind: "constDate", value: parseDate(e.literal.text) },
+          type: { kind: "date" },
+        };
+      }
+      if (ctx !== null && isInterval(ctx)) {
+        // A string adapts to an INTERVAL context (PostgreSQL's interval input,
+        // 22007/22008 — spec/design/interval.md), like timestamp adaptation.
+        return {
+          node: {
+            kind: "constInterval",
+            value: parseInterval(e.literal.text),
+          },
+          type: { kind: "interval" },
+        };
+      }
+      if (ctx !== null && isJson(ctx)) {
+        // A string adapts to a JSON context (validate, store verbatim — spec/design/json.md §4);
+        // malformed → 22P02.
+        validateJson(e.literal.text);
+        return { node: { kind: "constJson", value: e.literal.text }, type: { kind: "json" } };
+      }
+      if (ctx !== null && isJsonb(ctx)) {
+        // A string adapts to a JSONB context (parse + canonicalize — §2); malformed → 22P02.
+        return {
+          node: { kind: "constJsonb", value: jsonbIn(e.literal.text) },
+          type: { kind: "jsonb" },
+        };
+      }
+      if (ctx !== null && isJsonPath(ctx)) {
+        // A string adapts to a jsonpath context (a jsonpath function argument) — it is compiled
+        // to a path at resolve (jsonpath.md §1); malformed → 42601 / unsupported → 0A000.
+        return {
+          node: {
+            kind: "constJsonPath",
+            // Canonical text only — a like_regex fold never changes it (no casing table).
+            value: jsonPathRender(jsonPathCompile(e.literal.text, undefined)),
+          },
+          type: { kind: "jsonpath" },
+        };
+      }
       return {
-        node: {
-          kind: "like",
-          lhs: p.rl,
-          rhs: p.rr,
-          negated: e.negated,
-          insensitive: e.insensitive,
-        },
-        type: { kind: "bool" },
+        node: { kind: "constText", value: e.literal.text },
+        type: { kind: "text" },
       };
     }
-    case "regex": {
-      // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand typing as
-      // LIKE: resolve the pair, require both text (or a bare NULL); a non-text operand is 42804.
-      const p = resolveTextOperandPair(scope, e.lhs, e.rhs, ag, params);
-      requireTextOrNull(p.lt);
-      requireTextOrNull(p.rt);
-      // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per row at
-      // eval. For ~* the constant is case-folded before compiling (the ILIKE mechanism). A malformed
-      // pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
-      let program: RegexProgram | null = null;
-      if (p.rr.kind === "constText") {
-        const pat = e.insensitive
-          ? foldRegexPattern(p.rr.value, scope.catalog.environment.property())
-          : p.rr.value;
-        program = compileRegex(pat);
+    case "decimal":
+      // A decimal literal adapts to a FLOAT context (float.md §4): decimal → float at resolve
+      // (the nearest binary64 to the exact decimal; Math.fround if the context is f32). The
+      // exact-decimal string already round-trips IEEE conversion via Number(...). Otherwise it
+      // is decimal — cap-checked here (an over-long coefficient/scale traps 22003 at resolve).
+      if (ctx !== null && isFloat(ctx)) {
+        return floatFromDecimalLiteral(e.literal.dec, ctx);
       }
-      // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so
-      // a reused plan would under-charge the 2nd+ execute — never cache such a plan.
-      if (program !== null) params.uncacheable = true;
       return {
-        node: {
-          kind: "regex",
-          lhs: p.rl,
-          rhs: p.rr,
-          negated: e.negated,
-          insensitive: e.insensitive,
-          program,
-          compileCharged: false,
-        },
-        type: { kind: "bool" },
+        node: { kind: "constDecimal", value: e.literal.dec.checkCap() },
+        type: { kind: "decimal" },
       };
-    }
-    case "case": {
-      // Resolve each branch's condition: searched form requires a boolean WHEN (42804
-      // otherwise); simple form desugars to `operand = value` (reusing the `=` operand pairing +
-      // comparability check, so the value adapts to the operand's type). The operand is evaluated
-      // once per tested branch (the desugar model, like IN).
-      const arms: { cond: RExpr; result: RExpr }[] = [];
-      const resultTypes: ResolvedType[] = [];
-      for (const w of e.whens) {
-        let cond: RExpr;
-        if (e.operand !== null) {
-          const eq: Expr = {
-            kind: "binary",
-            op: "eq",
-            lhs: e.operand,
-            rhs: w.cond,
-          };
-          cond = resolve(scope, eq, null, ag, params).node;
-        } else {
-          const rc = resolve(scope, w.cond, null, ag, params);
-          atPosition(exprLocation(w.cond), () =>
-            requireBool(rc.type, "CASE WHEN condition must be boolean"),
-          );
-          cond = rc.node;
-        }
-        const rres = resolve(scope, w.result, null, ag, params);
-        resultTypes.push(rres.type);
-        arms.push({ cond, result: rres.node });
+    default: {
+      // An integer literal adapts to an integer context or — like a decimal literal — a FLOAT
+      // context (int → float at resolve; float.md §4). A non-numeric context (a text/decimal
+      // column or assignment target) does not apply — it defaults to i64, and the surrounding
+      // check then reports the family mismatch (42804) or widens it (int→decimal), never a wrong
+      // range check.
+      if (ctx !== null && isFloat(ctx)) {
+        const n = roundToWidth(ctx, Number(e.literal.int));
+        return {
+          node: { kind: "constFloat", ty: ctx, value: n },
+          type: { kind: "float", ty: ctx },
+        };
       }
-      let els: RExpr;
-      if (e.els !== null) {
-        const re = resolve(scope, e.els, null, ag, params);
-        els = re.node;
-        resultTypes.push(re.type);
-      } else {
-        els = { kind: "constNull" };
-        resultTypes.push({ kind: "null" });
-      }
-      let unified: ResolvedType;
-      try {
-        unified = unifyCaseTypes(resultTypes, "CASE result types must be compatible");
-      } catch (err) {
-        // PostgreSQL scans the ELSE result first, then the THEN results in order.
-        const types = [resultTypes[resultTypes.length - 1]!, ...resultTypes.slice(0, -1)];
-        const exprs: Expr[] = [
-          e.els ?? { kind: "literal", literal: { kind: "null" } },
-          ...e.whens.map((w) => w.result),
-        ];
-        throw positionedAt(
-          err,
-          mismatchLocation(types, exprs, (ts) => unifyCaseTypes(ts, "")),
-        );
-      }
-      // A mixed-width float CASE is f64: widen the f32 arms (an ordinary cast, like GREATEST).
-      if (unified.kind === "float") {
-        arms.forEach((arm, i) => {
-          arm.result = widenTo(arm.result, resultTypes[i]!, unified.ty);
-        });
-        els = widenTo(els, resultTypes[resultTypes.length - 1]!, unified.ty);
-      }
-      // A bare parameter in a result arm takes the unified scalar type. The first pass had no
-      // result context, so it recorded the occurrence as unresolved; feed the common type back
-      // before statement-wide parameter finalization (api.md §5, grammar.md §23).
-      const hint = scalarForParamHint(unified);
-      for (const w of e.whens) {
-        if (w.result.kind === "param") params.note(w.result.index - 1, hint);
-      }
-      if (e.els?.kind === "param") params.note(e.els.index - 1, hint);
+      const ty = ctx !== null && isInteger(ctx) ? ctx : "i64";
+      if (!inRange(ty, e.literal.int)) throw overflow(ty);
       return {
-        node: {
-          kind: "case",
-          arms,
-          els,
-          coerceDecimal: unified.kind === "decimal",
-        },
-        type: unified,
-      };
-    }
-    case "coalesce": {
-      // COALESCE(a, b, …) (grammar.md §51): each argument resolves in the same agg context (an
-      // aggregate argument is legal wherever an aggregate is), and the argument types unify to
-      // one common type exactly like CASE's result arms.
-      const args: RExpr[] = [];
-      const argTypes: ResolvedType[] = [];
-      for (const a of e.args) {
-        const ra = resolve(scope, a, null, ag, params);
-        args.push(ra.node);
-        argTypes.push(ra.type);
-      }
-      let unified: ResolvedType;
-      try {
-        unified = unifyCaseTypes(argTypes, "COALESCE types must be compatible");
-      } catch (err) {
-        throw positionedAt(
-          err,
-          mismatchLocation(argTypes, e.args, (ts) => unifyCaseTypes(ts, "")),
-        );
-      }
-      // A mixed-width float COALESCE is f64: widen the f32 arguments (as CASE).
-      if (unified.kind === "float") {
-        args.forEach((a, i) => {
-          args[i] = widenTo(a, argTypes[i]!, unified.ty);
-        });
-      }
-      // A bare parameter argument takes COALESCE's unified scalar type. Each argument was initially
-      // resolved without sibling context, so record the derived type now.
-      const hint = scalarForParamHint(unified);
-      for (const a of e.args) {
-        if (a.kind === "param") params.note(a.index - 1, hint);
-      }
-      return {
-        node: {
-          kind: "coalesce",
-          args,
-          coerceDecimal: unified.kind === "decimal",
-        },
-        type: unified,
-      };
-    }
-    case "greatestLeast": {
-      // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg context,
-      // and the argument types unify to one common ORDERABLE type. The winner is chosen by that
-      // type's total order at eval, so — unlike CASE/COALESCE, which never compare — the common
-      // type must actually be comparable and mixed-width floats must be widened (numeric promote,
-      // float widths to the widest, other families structural); a non-orderable common type
-      // (json/jsonpath) or an incomparable pair is rejected by classifyComparable HERE, never
-      // silently mis-ordered by valueCmp's cross-family totality fallback.
-      const name = e.greatest ? "greatest" : "least";
-      const resolved = e.args.map((a) => resolve(scope, a, null, ag, params));
-      const types = resolved.map((r) => r.type);
-      let unified: ResolvedType;
-      try {
-        unified = unifyCaseTypes(types, `${name.toUpperCase()} types must be compatible`);
-      } catch (err) {
-        throw positionedAt(
-          err,
-          mismatchLocation(types, e.args, (ts) => unifyCaseTypes(ts, "")),
-        );
-      }
-      classifyComparable(unified, unified);
-      // A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
-      const hint = scalarForParamHint(unified);
-      for (const a of e.args) {
-        if (a.kind === "param") params.note(a.index - 1, hint);
-      }
-      // A mixed-width float set unifies to f64; widen the f32 arguments (an ordinary cast, whose
-      // cost stays observable) so the comparator sees one width.
-      const args = resolved.map((r) =>
-        unified.kind === "float" ? widenTo(r.node, r.type, unified.ty) : r.node,
-      );
-      // Text / text[] arguments derive one comparison collation (42P21/42P22 on conflict — §52).
-      let collation: Collation | null = null;
-      if (rtCollatable(unified)) {
-        let deriv: Deriv = { kind: "none" };
-        for (const a of e.args) deriv = combineDeriv(deriv, deriveCollation(scope, a));
-        collation = resolveDeriv(scope.catalog, deriv);
-      }
-      return {
-        node: {
-          kind: "greatestLeast",
-          args,
-          coerceDecimal: unified.kind === "decimal",
-          greatest: e.greatest,
-          collation,
-        },
-        type: unified,
+        node: { kind: "constInt", value: e.literal.int },
+        type: { kind: "int", ty },
       };
     }
   }
+}
+
+function resolveScalarSubqueryExpr(
+  scope: Scope,
+  e: Of<"scalarSubquery">,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so its
+  // column-count / type errors fire even over an empty outer. planSubquery rejects a non-SELECT
+  // context and a $N inside (both 0A000). The fold pass folds an uncorrelated one to a constant;
+  // a correlated one is re-executed per outer row by the evaluator.
+  const plan = planSubquery(scope, e.query, params);
+  if (plan.columnTypes.length !== 1) {
+    throw engineError("syntax_error", "subquery must return only one column");
+  }
+  noteSubqueryDeriv(
+    scope,
+    e.query,
+    queryPlanColumnDerivs(plan)[0]!,
+    queryPlanColumnTypmods(plan)[0]!,
+  );
+  return {
+    node: {
+      kind: "subquery",
+      plan,
+      subKind: "scalar",
+      lhs: null,
+      negated: false,
+      rowValued: false,
+    },
+    type: plan.columnTypes[0]!,
+  };
+}
+
+function resolveExistsExpr(
+  scope: Scope,
+  e: Of<"exists">,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT EXISTS
+  // parses as the unary NOT wrapping this, so negated here is always false.
+  const plan = planSubquery(scope, e.query, params);
+  return {
+    node: {
+      kind: "subquery",
+      plan,
+      subKind: "exists",
+      lhs: null,
+      negated: false,
+      rowValued: false,
+    },
+    type: { kind: "bool" },
+  };
+}
+
+function resolveInSubqueryExpr(
+  scope: Scope,
+  e: Of<"inSubquery">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // The LHS is an OUTER expression (resolved in the current scope / agg context); the subquery
+  // yields the single membership column. The test is `lhs = element`, so the pair must be
+  // comparable (42804), exactly like a literal IN. A row-constructor LHS makes it ROW-VALUED: N
+  // body columns, each row one anonymous composite element.
+  const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
+  const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
+  classifyComparable(lt, elem);
+  // = ignores the collation at eval (byte identity, collation.md §7), but a conflict between
+  // the operand and the body column is still 42P22 (PostgreSQL's texteq demands one).
+  membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
+  return {
+    node: {
+      kind: "subquery",
+      plan,
+      subKind: "in",
+      lhs,
+      negated: e.negated,
+      rowValued,
+    },
+    type: { kind: "bool" },
+  };
+}
+
+function resolveQuantifiedSubqueryExpr(
+  scope: Scope,
+  e: Of<"quantifiedSubquery">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // The subquery spelling of the quantifier (array-functions.md §11.6) — the IN-subquery
+  // pattern with the comparison + 3VL fold. Resolve the outer lhs, plan the body, require ONE
+  // column (42601), and require comparability — reporting operator-not-found (42883) the way the
+  // array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
+  const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
+  const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
+  try {
+    classifyComparable(lt, elem);
+  } catch {
+    throw engineError(
+      "undefined_function",
+      `operator does not exist: ${rtName(lt)} ${binaryOpSymbol(e.op)} ${rtName(elem)}`,
+    );
+  }
+  const collation = membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
+  return {
+    node: {
+      kind: "subquery",
+      plan,
+      subKind: "quantified",
+      lhs,
+      negated: false,
+      rowValued,
+      op: e.op,
+      all: e.all,
+      collation,
+    },
+    type: { kind: "bool" },
+  };
+}
+
+function resolveCollateExpr(
+  scope: Scope,
+  e: Of<"collate">,
+  ctx: ScalarType | null,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
+  // the inner expression, require a collatable (text / text[]) type (42804, PG-matching), and validate the
+  // named collation exists ("C" or loaded, else 42704). A runtime PASSTHROUGH: a collation only
+  // changes the ORDERING comparisons / ORDER BY, derived from the AST at those sites
+  // (explicitCollation / OrderKey.collation), so resolving returns the inner node + type
+  // unchanged. The hint flows through (COLLATE never changes the type).
+  const r = resolve(scope, e.inner, ctx, ag, params);
+  if (!rtCollatable(r.type) && r.type.kind !== "null") {
+    throw typeError(`collations are not supported by type ${rtName(r.type)}`);
+  }
+  resolveCollationName(scope.catalog, e.collation); // surfaces 42704 for an unknown name
+  return r;
+}
+
+function resolveExtractExpr(
+  scope: Scope,
+  e: Of<"extract">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // EXTRACT(field FROM source) (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
+  // validated at RESOLVE (not per row): an unsupported field for the source type is 0A000, an
+  // unrecognized field is 22023 — surfaced by probing the kernel with a zero value of the source's
+  // family. The source must be a datetime type (else 42883); the result is numeric.
+  const src = resolve(scope, e.source, null, ag, params);
+  // A NULL source has no resolvable family; the value propagates to NULL at eval (the field is
+  // not validated — a documented narrow edge vs. PG).
+  if (src.type.kind !== "null") {
+    let probe: ExtractSrc;
+    switch (src.type.kind) {
+      case "timestamp":
+        probe = { kind: "ts", micros: 0n };
+        break;
+      case "timestamptz":
+        probe = { kind: "tstz", instant: 0n, local: 0n, offsetSecs: 0n };
+        break;
+      case "date":
+        probe = { kind: "date", days: 0n };
+        break;
+      case "interval":
+        probe = { kind: "interval", iv: { months: 0, days: 0, micros: 0n } };
+        break;
+      default:
+        throw engineError(
+          "undefined_function",
+          `function extract(text, ${rtName(src.type)}) does not exist`,
+        ).hinted(FUNCTION_NO_MATCH);
+    }
+    extractField(e.field, probe); // validate field-for-type (0A000 / 22023); value discarded
+  }
+  params.nonimmutable ||= src.type.kind === "timestamptz" && e.field.toLowerCase() !== "epoch";
+  return {
+    node: { kind: "extract", field: e.field, value: src.node },
+    type: { kind: "decimal" },
+  };
+}
+
+function resolveCastExpr(
+  scope: Scope,
+  e: Of<"cast">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the string-literal
+  // form `'{…}'::T[]` and a bare NULL; every other array cast (runtime text→array, array→text,
+  // element-wise array→array) is a documented 0A000 narrowing.
+  if (e.typeName.endsWith("[]")) {
+    const base = e.typeName.slice(0, -2);
+    if (e.typeMod !== null) {
+      throw engineError(
+        "feature_not_supported",
+        "a type modifier on an array type is not supported yet",
+      );
+    }
+    const elemScalar = scalarTypeFromName(base);
+    const baseComposite = scope.catalog.compositeType(base);
+    let elemCol: ColType;
+    let elemRt: ResolvedType;
+    if (elemScalar !== undefined) {
+      elemCol = { kind: "scalar", scalar: elemScalar };
+      elemRt = resolvedTypeOf(elemScalar);
+    } else if (baseComposite !== undefined) {
+      const elemTy = compositeT(baseComposite.name);
+      elemCol = scope.catalog.colTypeOf(elemTy);
+      elemRt = resolvedTypeOfCol(elemTy, scope.catalog);
+    } else {
+      throw engineError("undefined_object", "type does not exist: " + base);
+    }
+    if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+      const text = e.inner.literal.text;
+      const col = elemCol;
+      const val = atPosition(e.inner.loc, () =>
+        foldInSessionZone(scope, params, (iz) => coerceStringToArray(text, col, iz)),
+      );
+      return {
+        node: valueToRExpr(val),
+        type: { kind: "array", elem: elemRt },
+      };
+    }
+    if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
+      return {
+        node: { kind: "constNull" },
+        type: { kind: "array", elem: elemRt },
+      };
+    }
+    // A bind parameter cast to an array type takes that type (api.md §5).
+    if (e.inner.kind === "param") {
+      return resolveParamNode(
+        scope,
+        e.inner,
+        { kind: "array", elem: elemCol },
+        { kind: "array", elem: elemRt },
+        params,
+      );
+    }
+    // A runtime (non-literal) operand: the two follow-on array-producing casts (array.md §7).
+    // A text expression coerces per row via array_in (runtime text→T[]); an array of the SAME
+    // element type is the identity (no node); an array of a DIFFERENT element type is an
+    // element-wise array→array cast (each element through the scalar cast, when the element pair
+    // is castable); a non-literal NULL adapts. Any other source is a 42804.
+    const inner = resolve(scope, e.inner, null, ag, params);
+    const resultType: ResolvedType = { kind: "array", elem: elemRt };
+    if (inner.type.kind === "null") {
+      return { node: inner.node, type: resultType };
+    }
+    if (inner.type.kind === "text") {
+      return {
+        node: { kind: "arrayCast", toElem: elemCol, operand: inner.node },
+        type: resultType,
+      };
+    }
+    if (inner.type.kind === "array") {
+      if (resolvedTypeEqual(inner.type.elem, elemRt)) {
+        return { node: inner.node, type: resultType }; // identity cast — same element type
+      }
+      const srcS = resolvedToScalar(inner.type.elem);
+      if (srcS !== null && elemCol.kind === "scalar" && scalarPairCastable(srcS, elemCol.scalar)) {
+        // timestamptz elements render in the session zone (STABLE).
+        params.nonimmutable ||= srcS === "timestamptz" && isText(elemCol.scalar);
+        return {
+          node: { kind: "arrayCast", toElem: elemCol, operand: inner.node },
+          type: resultType,
+        };
+      }
+      // A composite element on either side is the deferred composite cast surface (0A000).
+      if (srcS === null || elemCol.kind === "composite") {
+        throw engineError(
+          "feature_not_supported",
+          "casting between composite-element arrays is not supported yet",
+        );
+      }
+      // Both elements are scalars but no cast exists between them — forbidden (42804; jed's
+      // strict-matrix convention, PG reports 42846).
+      throw engineError(
+        "datatype_mismatch",
+        "cannot cast " + rtName(inner.type) + " to " + base + "[]",
+      );
+    }
+    throw engineError(
+      "datatype_mismatch",
+      "cannot cast " + rtName(inner.type) + " to " + base + "[]",
+    );
+  }
+  // A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
+  // string-literal form and a bare NULL; every other range cast is a 0A000 narrowing
+  // (spec/design/ranges.md §1/§5).
+  {
+    const rdesc = rangeByName(e.typeName);
+    if (rdesc !== undefined) {
+      if (e.typeMod !== null) {
+        throw engineError(
+          "feature_not_supported",
+          "a type modifier on a range type is not supported",
+        );
+      }
+      const elemRt = resolvedTypeOf(elementScalar(rdesc));
+      if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+        const text = e.inner.literal.text;
+        return atPosition(e.inner.loc, () =>
+          foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(text, rdesc, iz)),
+        );
+      }
+      if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
+        return {
+          node: { kind: "constNull" },
+          type: { kind: "range", elem: elemRt },
+        };
+      }
+      // A bind parameter cast to a range type takes that type (api.md §5).
+      if (e.inner.kind === "param") {
+        return resolveParamNode(
+          scope,
+          e.inner,
+          { kind: "range", elem: { kind: "scalar", scalar: elementScalar(rdesc) } },
+          { kind: "range", elem: elemRt },
+          params,
+        );
+      }
+      throw engineError(
+        "feature_not_supported",
+        "casting to a range type is only supported from a string literal this slice",
+      );
+    }
+  }
+  // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
+  // (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
+  // `'(…)'::addr` headline); a bare NULL adapts to the composite; a same-named composite operand
+  // is the identity. Every other operand (a runtime text expression, an anonymous `ROW(…)`) is a
+  // documented 0A000 narrowing this slice — relaxable. A type modifier on a composite is
+  // meaningless (0A000).
+  const ct = scope.catalog.compositeType(e.typeName);
+  if (ct !== undefined) {
+    if (e.typeMod !== null) {
+      throw engineError(
+        "feature_not_supported",
+        "a type modifier is not supported on a composite type",
+      );
+    }
+    if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+      const text = e.inner.literal.text;
+      return atPosition(e.inner.loc, () =>
+        foldInSessionZone(scope, params, (iz) =>
+          coerceStringToComposite(text, ct, scope.catalog, iz),
+        ),
+      );
+    }
+    // A bind parameter cast to a composite type takes that type (api.md §5).
+    if (e.inner.kind === "param") {
+      const cty: Type = { kind: "composite", name: ct.name };
+      return resolveParamNode(
+        scope,
+        e.inner,
+        scope.catalog.colTypeOf(cty),
+        resolvedTypeOfCol(cty, scope.catalog),
+        params,
+      );
+    }
+    const inner = resolve(scope, e.inner, null, ag, params);
+    if (inner.type.kind === "null") {
+      return {
+        node: inner.node,
+        type: resolvedTypeOfCol({ kind: "composite", name: ct.name }, scope.catalog),
+      };
+    }
+    // An identical named composite is the identity cast.
+    if (inner.type.kind === "composite" && inner.type.name === ct.name) {
+      return inner;
+    }
+    throw engineError(
+      "feature_not_supported",
+      "casting to a composite type is only supported from a string literal",
+    );
+  }
+  const [target, typmod, varcharLen] = resolveTypeAndTypmod(e.typeName, e.typeMod);
+  // A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the same
+  // primitive as the `type 'string'` typed literal (grammar.md §36, types.md §5). The ONLY
+  // text→T cast admitted ahead of the general cast slice; a non-literal text operand still
+  // falls through to the deferred 0A000 below. A varchar(n) target truncates the literal to n
+  // code points (types.md §15).
+  if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+    // 'today'::date / CAST('now' AS date) — the clock-relative specials become the STABLE
+    // dateClock node, exactly like the ctx-adaptation form (date.md §6).
+    if (isDate(target)) {
+      const clock = dateClockLiteral(e.inner.literal.text, params);
+      if (clock !== null) return clock;
+    }
+    const text = e.inner.literal.text;
+    // The literal's input error points at the literal (PostgreSQL coerces it at parse time —
+    // spec/design/error-fields.md §10.2).
+    return atPosition(e.inner.loc, () =>
+      foldInSessionZone(scope, params, (iz) =>
+        coerceStringLiteral(text, target, typmod, varcharLen, iz),
+      ),
+    );
+  }
+  // Casting TO text (casts.toml, types.md §5): every built-in scalar renders its own output form,
+  // the text a result cell shows — json verbatim, jsonb canonical, uuid lowercase, bytea \x hex,
+  // timestamptz in the SESSION zone (timezones.md §9.5). Explicit only — stricter than PG's
+  // assignment cast to text (a documented divergence), so INSERT INTO text_col VALUES (1) /
+  // text_col = 1 stay 42804. A varchar(n) length truncates the rendered text (types.md §15).
+  // `$1::text` declares the parameter as text, like every other cast target (api.md §5).
+  // Composite and range sources stay 0A000.
+  if (isText(target)) {
+    const inner = resolve(scope, e.inner, e.inner.kind === "param" ? "text" : null, ag, params);
+    const ik = inner.type.kind;
+    return {
+      node: castToText(inner.node, inner.type, target, varcharLen, params),
+      type: { kind: "text" },
+    };
+  }
+  // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
+  // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL
+  // / bool source is castable), so it is handled AFTER the inner is resolved, below.
+  // A bytea TARGET: runtime text → bytea decodes the per-row string with the literal's own bytea
+  // input (types.md §5/§13 — immutable, like PG's byteain), and the uuid cast slice admits uuid →
+  // bytea (the 16 raw bytes — a jed cast PG lacks; casts.toml, types.md §14). A string LITERAL
+  // was coerced above; a NULL adapts; a bytea operand is the identity. Any other source is a
+  // forbidden pair (42804).
+  if (isBytea(target)) {
+    if (e.inner.kind === "param") {
+      const pinner = resolve(scope, e.inner, "bytea", ag, params);
+      return { node: pinner.node, type: { kind: "bytea" } };
+    }
+    const inner = resolve(scope, e.inner, null, ag, params);
+    const ik = inner.type.kind;
+    if (ik === "null" || ik === "bytea") {
+      return { node: inner.node, type: { kind: "bytea" } };
+    }
+    if (ik === "text" || ik === "uuid") {
+      return {
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        type: { kind: "bytea" },
+      };
+    }
+    throw typeError("cannot cast " + rtName(inner.type) + " to bytea");
+  }
+  // The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
+  // or bytea expression. text → uuid runs uuid_in at eval (22P02 on malformed); bytea → uuid takes
+  // the 16 raw bytes (22P02 on a length ≠ 16) — a jed cast PG lacks. A string LITERAL operand was
+  // coerced above (the §6 adaptation); $1::uuid declares the param as uuid; a NULL adapts; a uuid
+  // operand is the identity.
+  if (isUuid(target)) {
+    if (e.inner.kind === "param") {
+      const pinner = resolve(scope, e.inner, "uuid", ag, params);
+      return { node: pinner.node, type: { kind: "uuid" } };
+    }
+    const inner = resolve(scope, e.inner, null, ag, params);
+    const ik = inner.type.kind;
+    if (ik === "null" || ik === "uuid") {
+      return { node: inner.node, type: { kind: "uuid" } };
+    }
+    if (ik === "text" || ik === "bytea") {
+      return {
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        type: { kind: "uuid" },
+      };
+    }
+    throw typeError("cannot cast " + rtName(inner.type) + " to uuid");
+  }
+  // Datetime casts (timezones.md §9.3, types.md §5): a timestamp/timestamptz/date TARGET from
+  // another datetime family or from runtime text. A same-family cast is the identity; a
+  // cross-family or text cast becomes a dateConvert node (the zone-crossing ones read the session
+  // zone at eval); any other source is a forbidden pair (42804). A NULL operand adapts to the
+  // target.
+  if (isTimestamp(target) || isTimestamptz(target) || isDate(target)) {
+    if (e.inner.kind === "param") {
+      const pinner = resolve(scope, e.inner, target, ag, params);
+      return { node: pinner.node, type: resolvedTypeOf(target) };
+    }
+    const inner = resolve(scope, e.inner, null, ag, params);
+    const toRt = resolvedTypeOf(target);
+    const ik = inner.type.kind;
+    if (ik === "null") return { node: inner.node, type: toRt };
+    if (
+      (ik === "timestamp" && isTimestamp(target)) ||
+      (ik === "timestamptz" && isTimestamptz(target)) ||
+      (ik === "date" && isDate(target))
+    ) {
+      return { node: inner.node, type: inner.type };
+    }
+    if (ik === "timestamp" || ik === "timestamptz" || ik === "date") {
+      params.nonimmutable ||= ik === "timestamptz" || isTimestamptz(target);
+      return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
+    }
+    if (ik === "text") {
+      // The runtime text → date / timestamp / timestamptz casts (date.md §6, types.md §5): a
+      // NON-literal text source (a string LITERAL operand was already folded by the
+      // literal-adaptation path above) parses per row via the literal's own parser (22007/22008
+      // per row); text → timestamptz reads an offset-less string in the session zone. STABLE,
+      // not immutable — like PostgreSQL's date_in / timestamp_in / timestamptz_in — so it flags
+      // the plan non-immutable (42P17 in an index expression).
+      params.nonimmutable = true;
+      return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
+    }
+    throw typeError(`cannot cast ${rtName(inner.type)} to ${canonicalName(target)}`);
+  }
+  // An interval TARGET (interval.md §6, types.md §5): runtime text → interval parses the per-row
+  // string with the literal's own parseInterval (22007/22008 per row) — STABLE, like PostgreSQL's
+  // interval_in, so it flags the plan non-immutable (42P17 in an index expression). An interval
+  // operand is the identity; $1::interval declares the param as interval; a NULL adapts. Any
+  // other source is a forbidden pair (42804).
+  if (isInterval(target)) {
+    if (e.inner.kind === "param") {
+      const pinner = resolve(scope, e.inner, "interval", ag, params);
+      return { node: pinner.node, type: { kind: "interval" } };
+    }
+    const inner = resolve(scope, e.inner, null, ag, params);
+    const ik = inner.type.kind;
+    if (ik === "null" || ik === "interval") {
+      return { node: inner.node, type: { kind: "interval" } };
+    }
+    if (ik === "text") {
+      params.nonimmutable = true;
+      return {
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        type: { kind: "interval" },
+      };
+    }
+    throw typeError("cannot cast " + rtName(inner.type) + " to interval");
+  }
+  // The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
+  // text/json/jsonb expression (a string LITERAL operand was already coerced above by
+  // coerceStringLiteral). text → json validates + stores verbatim; text → jsonb parses +
+  // canonicalizes; json → jsonb re-parses + canonicalizes; jsonb → json renders the canonical
+  // text; same-type is the identity. Any other source is a 42804 cast error (jed's invalid-cast
+  // convention; PG reports 42846 — a documented divergence).
+  if (isJson(target) || isJsonb(target)) {
+    if (e.inner.kind === "param") {
+      const pinner = resolve(scope, e.inner, target, ag, params);
+      return { node: pinner.node, type: resolvedTypeOf(target) };
+    }
+    const inner = resolve(scope, e.inner, null, ag, params);
+    const toRt = resolvedTypeOf(target);
+    const ik = inner.type.kind;
+    if (ik === "null") return { node: inner.node, type: toRt };
+    if (ik === "text" || ik === "json" || ik === "jsonb") {
+      return {
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        type: toRt,
+      };
+    }
+    throw typeError("cannot cast type " + rtName(inner.type) + " to " + canonicalName(target));
+  }
+  // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
+  // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
+  // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
+  // context (its value is range-checked / coerced against target at eval), so changing the
+  // context only for a parameter leaves all existing CAST behavior untouched.
+  // A boolean target accepts only an i32 source (the boolean cast slice): an untyped integer
+  // literal operand adapts to i32 (CAST(5 AS boolean) / 5::boolean), matching PG. A column/
+  // expression keeps its own type; a literal beyond i32 range then traps 22003 (PG 42846 — a
+  // documented divergence).
+  const innerCtx = e.inner.kind === "param" ? target : isBool(target) ? "i32" : null;
+  const inner = resolve(scope, e.inner, innerCtx, ag, params);
+  // The boolean cast slice (spec/types/casts.toml, types.md §9): PG ties boolean↔integer to i32
+  // ONLY and makes both directions explicit. A boolean TARGET takes an i32 / NULL / bool source
+  // (the eval maps 0→false, nonzero→true); a boolean SOURCE produces an i32 (true→1, false→0).
+  // Handled here, ahead of the generic numeric cast below — resultType assumes an int/decimal/
+  // float target, so a boolean target must not fall through. A bool⇄i16 / bool⇄i64 pair is a
+  // forbidden 42804 (jed's datatype-mismatch convention; PG reports 42846, casts.toml).
+  if (isBool(target)) {
+    // A runtime `text` source is the runtime-text-cast slice (grammar.md §36): the eval parses
+    // the per-row string via the same parseBoolLiteral (PG boolin) the 't'::boolean literal
+    // uses. A string LITERAL operand was already coerced above, so a text source here is
+    // non-literal (a column / expression).
+    if (
+      (inner.type.kind === "int" && inner.type.ty === "i32") ||
+      inner.type.kind === "null" ||
+      inner.type.kind === "bool" ||
+      inner.type.kind === "text"
+    ) {
+      return {
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        type: { kind: "bool" },
+      };
+    }
+    throw typeError("cannot cast " + rtName(inner.type) + " to boolean");
+  }
+  if (inner.type.kind === "bool") {
+    // boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
+    if (target === "i32") {
+      return {
+        node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+        type: { kind: "int", ty: "i32" },
+      };
+    }
+    throw typeError("cannot cast boolean to " + canonicalName(target));
+  }
+  // A runtime `text` source to a numeric target is the runtime-text-cast slice (grammar.md
+  // §36): the only targets reaching this generic path are int / decimal / float (text / bytea /
+  // uuid / datetime / interval / bool / json targets all return in their own blocks above), so
+  // a text source here casts to a number. The eval coerces the per-row string via the same
+  // parse functions the literal form uses (22P02 / 22003 per row). A string LITERAL operand was
+  // already folded above, so this text is non-literal — fall through to the numeric cast node.
+  // Casting FROM bytea is likewise deferred (0A000).
+  if (inner.type.kind === "bytea") {
+    throw engineError("feature_not_supported", "casting from bytea is not supported yet");
+  }
+  // Casting FROM uuid is likewise deferred (0A000).
+  if (inner.type.kind === "uuid") {
+    throw engineError("feature_not_supported", "casting from uuid is not supported yet");
+  }
+  // Casting FROM a timestamp is likewise deferred (0A000).
+  if (inner.type.kind === "timestamp" || inner.type.kind === "timestamptz") {
+    throw engineError(
+      "feature_not_supported",
+      "casting from a timestamp type is not supported yet",
+    );
+  }
+  // Casting FROM an interval is likewise deferred (0A000).
+  if (inner.type.kind === "interval") {
+    throw engineError(
+      "feature_not_supported",
+      "casting from an interval type is not supported yet",
+    );
+  }
+  // Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
+  if (inner.type.kind === "date") {
+    throw engineError("feature_not_supported", "casting from a date type is not supported yet");
+  }
+  // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
+  if (inner.type.kind === "array") {
+    throw engineError("feature_not_supported", "casting an array value is not supported yet");
+  }
+  // Casting FROM json/jsonb (json↔jsonb, json[b]→text) lands in J3 (spec/design/json.md §6);
+  // deferred this slice. Casting FROM jsonpath is likewise deferred.
+  if (inner.type.kind === "json" || inner.type.kind === "jsonb" || inner.type.kind === "jsonpath") {
+    throw engineError("feature_not_supported", "casting a json value is not supported yet");
+  }
+  // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
+  // decimal→decimal (re-scale), the float casts (int↔float, decimal↔float, float↔float — all
+  // explicit, float.md §6), and NULL are all castable. The CAST matrix (casts.toml) is strict:
+  // these are exactly the legal (from, to) pairs across the int/decimal/float families.
+  const resultType: ResolvedType = isDecimal(target)
+    ? { kind: "decimal" }
+    : isFloat(target)
+      ? { kind: "float", ty: target }
+      : { kind: "int", ty: target };
+  return {
+    node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+    type: resultType,
+  };
+}
+
+function resolveUnaryExpr(
+  scope: Scope,
+  e: Of<"unary">,
+  ctx: ScalarType | null,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.op === "neg") {
+    const { node, type } = resolve(scope, e.operand, ctx, ag, params);
+    if (type.kind === "decimal") {
+      return {
+        node: { kind: "neg", result: "decimal", operand: node },
+        type: { kind: "decimal" },
+      };
+    }
+    if (type.kind === "float") {
+      // Unary minus on a float flips the sign bit (no overflow); a NaN/Inf operand passes
+      // through per IEEE (-NaN is NaN, -Inf is -Inf) — float.md §5. result keeps the width.
+      return {
+        node: { kind: "neg", result: type.ty, operand: node },
+        type: { kind: "float", ty: type.ty },
+      };
+    }
+    if (type.kind === "interval") {
+      // -interval (spec/design/interval.md §5).
+      return {
+        node: { kind: "neg", result: "interval", operand: node },
+        type: { kind: "interval" },
+      };
+    }
+    let result: ScalarType;
+    if (type.kind === "int") result = type.ty;
+    else if (type.kind === "null")
+      result = "i64"; // -NULL = NULL
+    else throw typeError("unary minus requires a numeric operand");
+    return {
+      node: { kind: "neg", result, operand: node },
+      type: { kind: "int", ty: result },
+    };
+  }
+  {
+    const { node, type } = resolve(scope, e.operand, null, ag, params);
+    atPosition(exprLocation(e.operand), () => requireBool(type, "NOT requires a boolean operand"));
+    return { node: { kind: "not", operand: node }, type: { kind: "bool" } };
+  }
+}
+
+function resolveIsJsonExpr(
+  scope: Scope,
+  e: Of<"isJson">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // The operand must be a character string / json / jsonb (else 42804); a bare string literal
+  // resolves as text. The predicate is always a definite boolean (a NULL operand → NULL at eval).
+  const { node, type } = resolve(scope, e.operand, null, ag, params);
+  switch (type.kind) {
+    case "text":
+    case "json":
+    case "jsonb":
+    case "null":
+      break;
+    default:
+      throw engineError(
+        "datatype_mismatch",
+        "cannot use type " + rtName(type) + " in IS JSON predicate",
+      );
+  }
+  return {
+    node: {
+      kind: "isJson",
+      operand: node,
+      negated: e.negated,
+      jsonKind: e.jsonKind,
+      uniqueKeys: e.uniqueKeys,
+    },
+    type: { kind: "bool" },
+  };
+}
+
+function resolveJsonCtorExpr(
+  scope: Scope,
+  e: Of<"jsonCtor">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // JSON(text) parses a character string to a `json` value (verbatim). The operand must be text
+  // (a bare string literal stays text under the Text context hint); a non-text operand → 42804.
+  const { node, type } = resolve(scope, e.operand, "text", ag, params);
+  switch (type.kind) {
+    case "text":
+    case "null":
+      break;
+    default:
+      throw engineError(
+        "datatype_mismatch",
+        "cannot use type " + rtName(type) + " as JSON() input",
+      );
+  }
+  return {
+    node: { kind: "jsonCtor", operand: node, uniqueKeys: e.uniqueKeys },
+    type: { kind: "json" },
+  };
+}
+
+function resolveJsonExistsExpr(
+  scope: Scope,
+  e: Of<"jsonExists">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  return resolveJsonSqlFn(
+    scope,
+    "exists",
+    e.ctx,
+    e.path,
+    e.passing,
+    null,
+    "without",
+    true,
+    null,
+    e.onError,
+    ag,
+    params,
+  );
+}
+
+function resolveJsonValueExpr(
+  scope: Scope,
+  e: Of<"jsonValue">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  return resolveJsonSqlFn(
+    scope,
+    "value",
+    e.ctx,
+    e.path,
+    e.passing,
+    e.returning,
+    "without",
+    true,
+    e.onEmpty,
+    e.onError,
+    ag,
+    params,
+  );
+}
+
+function resolveJsonQueryExpr(
+  scope: Scope,
+  e: Of<"jsonQuery">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  return resolveJsonSqlFn(
+    scope,
+    "query",
+    e.ctx,
+    e.path,
+    e.passing,
+    e.returning,
+    e.wrapper,
+    e.keepQuotes,
+    e.onEmpty,
+    e.onError,
+    ag,
+    params,
+  );
+}
+
+function resolveIsDistinctExpr(
+  scope: Scope,
+  e: Of<"isDistinct">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a literal
+  // adapts to its sibling; a text literal stays text), then require the operands be
+  // comparable (both integer-ish or both text-ish; a mixed pair is 42804). The result
+  // is always a definite boolean (functions.md §3).
+  const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
+  classifyComparable(p.lt, p.rt);
+  return {
+    node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated },
+    type: { kind: "bool" },
+  };
+}
+
+function resolveInExpr(
+  scope: Scope,
+  e: Of<"in">,
+  ctx: ScalarType | null,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // An EMPTY list reaches here only from folding an IN-subquery whose result was empty
+  // (grammar.md §26; the parser rejects literal `IN ()` → 42601). The value is a constant —
+  // `x IN (empty)` = FALSE, `x NOT IN (empty)` = TRUE — for every x including NULL. Still
+  // resolve the LHS so an undefined column / aggregate-context error fires, then return the
+  // constant (a leaf — no operator_eval, cost.md §3).
+  if (e.list.length === 0) {
+    resolve(scope, e.lhs, null, ag, params);
+    return {
+      node: { kind: "constBool", value: e.negated },
+      type: { kind: "bool" },
+    };
+  }
+  // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
+  // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
+  // non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses the
+  // `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics, per-element operand
+  // typing (a too-wide literal → 22003, a cross-family element → 42804), and cost all fall
+  // out. The LHS is evaluated once per element (the OR-chain model — a documented cost
+  // consequence, cost.md §3).
+  let folded: Expr | null = null;
+  for (const elem of e.list) {
+    // The desugared comparisons carry the IN's operator position (PostgreSQL's).
+    const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem, loc: e.loc };
+    folded = folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq, loc: e.loc };
+  }
+  // folded is non-null: the parser guarantees a non-empty list.
+  let desugared = folded as Expr;
+  if (e.negated) {
+    desugared = { kind: "unary", op: "not", operand: desugared, loc: e.loc };
+  }
+  return resolve(scope, desugared, ctx, ag, params);
+}
+
+function resolveBetweenExpr(
+  scope: Scope,
+  e: Of<"between">,
+  ctx: ScalarType | null,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
+  // result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a FALSE
+  // operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND NULL` = NULL. NOT BETWEEN
+  // negates the whole conjunction. The LHS is evaluated twice (the desugar model — a
+  // documented cost consequence, cost.md §3).
+  // The desugared comparisons carry the BETWEEN's operator position (PostgreSQL's).
+  const ge: Expr = { kind: "binary", op: "ge", lhs: e.lhs, rhs: e.lo, loc: e.loc };
+  const le: Expr = { kind: "binary", op: "le", lhs: e.lhs, rhs: e.hi, loc: e.loc };
+  let desugared: Expr = { kind: "binary", op: "and", lhs: ge, rhs: le, loc: e.loc };
+  if (e.negated) {
+    desugared = { kind: "unary", op: "not", operand: desugared, loc: e.loc };
+  }
+  return resolve(scope, desugared, ctx, ag, params);
+}
+
+function resolveLikeExpr(
+  scope: Scope,
+  e: Of<"like">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // LIKE / ILIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
+  // stays text), then require BOTH operands be text (or a bare NULL); a non-text operand is
+  // 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
+  const p = resolveTextOperandPair(scope, e.lhs, e.rhs, ag, params);
+  requireTextOrNull(p.lt);
+  requireTextOrNull(p.rt);
+  return {
+    node: {
+      kind: "like",
+      lhs: p.rl,
+      rhs: p.rr,
+      negated: e.negated,
+      insensitive: e.insensitive,
+    },
+    type: { kind: "bool" },
+  };
+}
+
+function resolveRegexExpr(
+  scope: Scope,
+  e: Of<"regex">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand typing as
+  // LIKE: resolve the pair, require both text (or a bare NULL); a non-text operand is 42804.
+  const p = resolveTextOperandPair(scope, e.lhs, e.rhs, ag, params);
+  requireTextOrNull(p.lt);
+  requireTextOrNull(p.rt);
+  // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per row at
+  // eval. For ~* the constant is case-folded before compiling (the ILIKE mechanism). A malformed
+  // pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
+  let program: RegexProgram | null = null;
+  if (p.rr.kind === "constText") {
+    const pat = e.insensitive
+      ? foldRegexPattern(p.rr.value, scope.catalog.environment.property())
+      : p.rr.value;
+    program = compileRegex(pat);
+  }
+  // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so
+  // a reused plan would under-charge the 2nd+ execute — never cache such a plan.
+  if (program !== null) params.uncacheable = true;
+  return {
+    node: {
+      kind: "regex",
+      lhs: p.rl,
+      rhs: p.rr,
+      negated: e.negated,
+      insensitive: e.insensitive,
+      program,
+      compileCharged: false,
+    },
+    type: { kind: "bool" },
+  };
+}
+
+function resolveCaseExpr(
+  scope: Scope,
+  e: Of<"case">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // Resolve each branch's condition: searched form requires a boolean WHEN (42804
+  // otherwise); simple form desugars to `operand = value` (reusing the `=` operand pairing +
+  // comparability check, so the value adapts to the operand's type). The operand is evaluated
+  // once per tested branch (the desugar model, like IN).
+  const arms: { cond: RExpr; result: RExpr }[] = [];
+  const resultTypes: ResolvedType[] = [];
+  for (const w of e.whens) {
+    let cond: RExpr;
+    if (e.operand !== null) {
+      const eq: Expr = {
+        kind: "binary",
+        op: "eq",
+        lhs: e.operand,
+        rhs: w.cond,
+      };
+      cond = resolve(scope, eq, null, ag, params).node;
+    } else {
+      const rc = resolve(scope, w.cond, null, ag, params);
+      atPosition(exprLocation(w.cond), () =>
+        requireBool(rc.type, "CASE WHEN condition must be boolean"),
+      );
+      cond = rc.node;
+    }
+    const rres = resolve(scope, w.result, null, ag, params);
+    resultTypes.push(rres.type);
+    arms.push({ cond, result: rres.node });
+  }
+  let els: RExpr;
+  if (e.els !== null) {
+    const re = resolve(scope, e.els, null, ag, params);
+    els = re.node;
+    resultTypes.push(re.type);
+  } else {
+    els = { kind: "constNull" };
+    resultTypes.push({ kind: "null" });
+  }
+  let unified: ResolvedType;
+  try {
+    unified = unifyCaseTypes(resultTypes, "CASE result types must be compatible");
+  } catch (err) {
+    // PostgreSQL scans the ELSE result first, then the THEN results in order.
+    const types = [resultTypes[resultTypes.length - 1]!, ...resultTypes.slice(0, -1)];
+    const exprs: Expr[] = [
+      e.els ?? { kind: "literal", literal: { kind: "null" } },
+      ...e.whens.map((w) => w.result),
+    ];
+    throw positionedAt(
+      err,
+      mismatchLocation(types, exprs, (ts) => unifyCaseTypes(ts, "")),
+    );
+  }
+  // A mixed-width float CASE is f64: widen the f32 arms (an ordinary cast, like GREATEST).
+  if (unified.kind === "float") {
+    arms.forEach((arm, i) => {
+      arm.result = widenTo(arm.result, resultTypes[i]!, unified.ty);
+    });
+    els = widenTo(els, resultTypes[resultTypes.length - 1]!, unified.ty);
+  }
+  // A bare parameter in a result arm takes the unified scalar type. The first pass had no
+  // result context, so it recorded the occurrence as unresolved; feed the common type back
+  // before statement-wide parameter finalization (api.md §5, grammar.md §23).
+  const hint = scalarForParamHint(unified);
+  for (const w of e.whens) {
+    if (w.result.kind === "param") params.note(w.result.index - 1, hint);
+  }
+  if (e.els?.kind === "param") params.note(e.els.index - 1, hint);
+  return {
+    node: {
+      kind: "case",
+      arms,
+      els,
+      coerceDecimal: unified.kind === "decimal",
+    },
+    type: unified,
+  };
+}
+
+function resolveCoalesceExpr(
+  scope: Scope,
+  e: Of<"coalesce">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // COALESCE(a, b, …) (grammar.md §51): each argument resolves in the same agg context (an
+  // aggregate argument is legal wherever an aggregate is), and the argument types unify to
+  // one common type exactly like CASE's result arms.
+  const args: RExpr[] = [];
+  const argTypes: ResolvedType[] = [];
+  for (const a of e.args) {
+    const ra = resolve(scope, a, null, ag, params);
+    args.push(ra.node);
+    argTypes.push(ra.type);
+  }
+  let unified: ResolvedType;
+  try {
+    unified = unifyCaseTypes(argTypes, "COALESCE types must be compatible");
+  } catch (err) {
+    throw positionedAt(
+      err,
+      mismatchLocation(argTypes, e.args, (ts) => unifyCaseTypes(ts, "")),
+    );
+  }
+  // A mixed-width float COALESCE is f64: widen the f32 arguments (as CASE).
+  if (unified.kind === "float") {
+    args.forEach((a, i) => {
+      args[i] = widenTo(a, argTypes[i]!, unified.ty);
+    });
+  }
+  // A bare parameter argument takes COALESCE's unified scalar type. Each argument was initially
+  // resolved without sibling context, so record the derived type now.
+  const hint = scalarForParamHint(unified);
+  for (const a of e.args) {
+    if (a.kind === "param") params.note(a.index - 1, hint);
+  }
+  return {
+    node: {
+      kind: "coalesce",
+      args,
+      coerceDecimal: unified.kind === "decimal",
+    },
+    type: unified,
+  };
+}
+
+function resolveGreatestLeastExpr(
+  scope: Scope,
+  e: Of<"greatestLeast">,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg context,
+  // and the argument types unify to one common ORDERABLE type. The winner is chosen by that
+  // type's total order at eval, so — unlike CASE/COALESCE, which never compare — the common
+  // type must actually be comparable and mixed-width floats must be widened (numeric promote,
+  // float widths to the widest, other families structural); a non-orderable common type
+  // (json/jsonpath) or an incomparable pair is rejected by classifyComparable HERE, never
+  // silently mis-ordered by valueCmp's cross-family totality fallback.
+  const name = e.greatest ? "greatest" : "least";
+  const resolved = e.args.map((a) => resolve(scope, a, null, ag, params));
+  const types = resolved.map((r) => r.type);
+  let unified: ResolvedType;
+  try {
+    unified = unifyCaseTypes(types, `${name.toUpperCase()} types must be compatible`);
+  } catch (err) {
+    throw positionedAt(
+      err,
+      mismatchLocation(types, e.args, (ts) => unifyCaseTypes(ts, "")),
+    );
+  }
+  classifyComparable(unified, unified);
+  // A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
+  const hint = scalarForParamHint(unified);
+  for (const a of e.args) {
+    if (a.kind === "param") params.note(a.index - 1, hint);
+  }
+  // A mixed-width float set unifies to f64; widen the f32 arguments (an ordinary cast, whose
+  // cost stays observable) so the comparator sees one width.
+  const args = resolved.map((r) =>
+    unified.kind === "float" ? widenTo(r.node, r.type, unified.ty) : r.node,
+  );
+  // Text / text[] arguments derive one comparison collation (42P21/42P22 on conflict — §52).
+  let collation: Collation | null = null;
+  if (rtCollatable(unified)) {
+    let deriv: Deriv = { kind: "none" };
+    for (const a of e.args) deriv = combineDeriv(deriv, deriveCollation(scope, a));
+    collation = resolveDeriv(scope.catalog, deriv);
+  }
+  return {
+    node: {
+      kind: "greatestLeast",
+      args,
+      coerceDecimal: unified.kind === "decimal",
+      greatest: e.greatest,
+      collation,
+    },
+    type: unified,
+  };
 }
 
 // resolveCollationName resolves a collation NAME to its table (spec/design/collation.md §1). C is the

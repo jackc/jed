@@ -894,6 +894,149 @@ export const MAX_VIEW_EXPANSIONS = 1024;
 // the written FROM item, within the text that names the view, and the view body's own nesting depth.
 type ViewSite = { depth: number; bodyDepth: number };
 
+// finishSelectSlots rebases a SELECT plan's placeholder slots once its specs are final, and enforces
+// the SELECT DISTINCT ORDER BY restriction (part of planSelectPushed; it runs on the assembled plan so
+// planSelectClauses's frame stays small — spec/design/cost.md §7.1).
+function finishSelectSlots(plan: SelectPlan, sel: Select, scope: Scope): void {
+  const { isAgg, hasWindow, groupKeys, aggSpecs, groupingSpecs, windowSpecs, windowKeys } = plan;
+  const { projections, orderExprs, having, order } = plan;
+  const items = sel.items;
+  // Rebase every placeholder — in the projections, HAVING, AND the materialized ORDER BY expressions
+  // — to its real trailing slot (window.md §5.1). The window stage's row is [input… , materialized
+  // window keys… , window results…]; inputWidth is the grouped row's width (group keys + every
+  // aggregate) for a grouped+window query, else the FROM scope width.
+  if (hasWindow) {
+    // The grouped row the window stage extends is `[master cols…, agg results…, GROUPING
+    // results…]` (the GROUPING columns precede the window columns — aggregates.md §21), so a
+    // grouped+window query's window input width includes the GROUPING() results.
+    const inputWidth = isAgg
+      ? groupKeys.length + aggSpecs.length + groupingSpecs.length
+      : scope.width();
+    const keyBase = inputWidth;
+    const resultBase = inputWidth + windowKeys.length;
+    // Bound each manual WINDOW_KEY_BASE rewrite to [WINDOW_KEY_BASE, 2·WINDOW_KEY_BASE) so a
+    // GROUPING() placeholder (the higher GROUPING_GS_BASE) in a window key is not clobbered here
+    // (it rebases below — §21).
+    for (const spec of windowSpecs) {
+      for (let j = 0; j < spec.partition.length; j++) {
+        if (spec.partition[j] >= WINDOW_KEY_BASE && spec.partition[j] < WINDOW_KEY_BASE * 2) {
+          spec.partition[j] = keyBase + (spec.partition[j] - WINDOW_KEY_BASE);
+        }
+      }
+      for (const o of spec.order) {
+        if (o.idx >= WINDOW_KEY_BASE && o.idx < WINDOW_KEY_BASE * 2) {
+          o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
+        }
+      }
+    }
+    for (const p of projections) rebasePlaceholderCols(p, WINDOW_RESULT_BASE, resultBase);
+    for (const oe of orderExprs) rebasePlaceholderCols(oe, WINDOW_RESULT_BASE, resultBase);
+  }
+  // GROUPING SETS / GROUPING() combined with window functions (spec/design/aggregates.md §21): the
+  // window stage runs over the unioned grouping-set rows. The grouped row is `[master cols…, agg
+  // results…, GROUPING results…]` and the window stage appends `[window keys…, window results…]`
+  // after, so the two no longer collide — GROUPING rebases below the window bases.
+  // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
+  // groupKeys.length+aggSpecs.length+g (the GROUPING results follow the master columns and aggregate
+  // results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
+  if (groupingSpecs.length > 0) {
+    const gbase = groupKeys.length + aggSpecs.length;
+    for (const p of projections) rebasePlaceholderCols(p, GROUPING_GS_BASE, gbase);
+    if (having !== null) rebasePlaceholderCols(having, GROUPING_GS_BASE, gbase);
+    for (const oe of orderExprs) rebasePlaceholderCols(oe, GROUPING_GS_BASE, gbase);
+  }
+  // Rebase each materialized expression-key slot to its real trailing position now that the row layout
+  // is final. The materialized order values are appended AFTER the input / window / grouped columns
+  // (grammar.md §10): for a grouped+window query the grouped row is first extended by the window stage,
+  // so the order values follow the window results.
+  const orderValueBase =
+    isAgg && hasWindow
+      ? groupKeys.length +
+        aggSpecs.length +
+        groupingSpecs.length +
+        windowKeys.length +
+        windowSpecs.length
+      : isAgg
+        ? groupKeys.length + aggSpecs.length + groupingSpecs.length
+        : hasWindow
+          ? scope.width() + windowKeys.length + windowSpecs.length
+          : scope.width();
+  for (const o of order) {
+    if (o.idx >= ORDER_EXPR_BASE) o.idx = orderValueBase + (o.idx - ORDER_EXPR_BASE);
+  }
+
+  // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates collapse, an ORDER BY
+  // key must have a per-row value in the projected output — a bare/qualified column that is projected,
+  // an ordinal (which names a select-list item by position), or a general expression that STRUCTURALLY
+  // matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases are invisible to ORDER
+  // BY (§8); a SELECT DISTINCT * projects every column, so the restriction never bites.
+  if (sel.distinct && sel.orderBy.length > 0 && items.kind === "list") {
+    const projected = new Set<number>();
+    for (const it of items.items) {
+      if (it.expr.kind === "column") {
+        const r = scope.resolveBare(it.expr.name);
+        if (r.level === 0) projected.add(r.index);
+      } else if (it.expr.kind === "qualifiedColumn") {
+        const r = scope.resolveQualified(it.expr.qualifier, it.expr.name);
+        if (r.level === 0) projected.add(r.index);
+      }
+    }
+    for (const key of sel.orderBy) {
+      let inList: boolean;
+      if (key.ordinal !== null) {
+        inList = true;
+      } else if (key.expr !== null) {
+        const ke = key.expr;
+        inList = items.items.some((it) => exprEqual(ke, it.expr));
+      } else if (key.qualifier === null && orderAliasMatch(items, key.column, scope) !== null) {
+        // A bare name that binds an output column (alias/derived name) names a select-list item, so
+        // it is projected (the alias form, §10). Ambiguity was already raised in the loop above.
+        inList = true;
+      } else {
+        const r =
+          key.qualifier !== null
+            ? scope.resolveQualified(key.qualifier, key.column)
+            : scope.resolveBare(key.column);
+        inList = r.level === 0 && projected.has(r.index);
+      }
+      if (!inList) {
+        throw engineError(
+          "invalid_column_reference",
+          "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+        );
+      }
+    }
+  }
+}
+
+// cteBufferRows reads a MATERIALIZED CTE's buffer for one reference: cte_scan_row per row, guarded so
+// a runaway scan aborts 54P01, and the reference copies the buffer into its own relation rows.
+function cteBufferRows(buf: Row[], mask: boolean[], meter: Meter): Row[] {
+  for (let i = 0; i < buf.length; i++) {
+    meter.guard();
+    meter.charge(COSTS.cteScanRow);
+  }
+  for (const row of buf) meter.admitRowMasked(row, mask);
+  return buf.slice();
+}
+
+// SelectFrom is a SELECT's resolved FROM clause, handed from planSelectFrom to planSelectClauses.
+type SelectFrom = {
+  parent: Scope | null;
+  tableRefs: TableRef[];
+  isolated: (ViewSite | null)[];
+  rels: ScopeRel[];
+  srfPlans: (SrfPlan | undefined)[];
+  derivedPlans: (QueryPlan | undefined)[];
+  lateralFlags: boolean[];
+  shaping: boolean;
+  shaped: boolean[];
+  cteBodies: (number | null)[];
+  subRels: SubRel[];
+  groupHidden: number[];
+  lateralParentScope: Scope | null;
+};
+
 // SQL_BYTE_ENCODER measures a statement's UTF-8 byte length for the input-size gate (cost.md §7),
 // matching the byte counts Rust (&str::len) and Go (len(string)) use, so the cap accepts / rejects
 // identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
@@ -13858,7 +14001,9 @@ export class Engine {
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): QueryPlan {
-    if (qe.kind === "select") return this.planSelect(qe, parent, ctes, ptypes);
+    // planSelectPushed directly, not planSelect: one frame fewer per nested query level
+    // (spec/design/cost.md §7.1).
+    if (qe.kind === "select") return this.planSelectPushed(qe, parent, ctes, ptypes, []);
     if (qe.kind === "withExpr") return this.planWithExpr(qe, parent, ctes, ptypes);
     return this.planSetOp(qe, parent, ctes, ptypes);
   }
@@ -15401,6 +15546,22 @@ export class Engine {
     ptypes: ParamTypes,
     pushed: RExpr[],
   ): SelectPlan {
+    // The FROM clause is planned in a frame of its own, so a nested derived table's recursion does
+    // not carry the clause planning's locals, and a subquery in a clause does not carry the FROM
+    // loop's (spec/design/cost.md §7.1).
+    const from = this.planSelectFrom(sel, parent, ctes, ptypes, pushed);
+    return this.planSelectClauses(sel, ctes, ptypes, pushed, from);
+  }
+
+  // planSelectFrom resolves a SELECT's FROM items into its relations (the first half of
+  // planSelectPushed).
+  private planSelectFrom(
+    sel: Select,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+    pushed: RExpr[],
+  ): SelectFrom {
     // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
     // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
     // without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -15551,16 +15712,15 @@ export class Engine {
                 )
               : // A non-LATERAL item to the right of others cannot see them; a hint can
                 // (error-fields.md §11.8).
-                this.withUnseenFrame(
+                this.planDerivedItem(
                   i > 0 && tref.lateral !== true
                     ? unseenFrame(tableRefs, sel.joins, rels, subRels, i, bodyParent)
                     : null,
-                  () =>
-                    tref.subquery !== undefined
-                      ? this.planBodyFirst(shapeBodies, () =>
-                          this.planQuery(tref.subquery!, bodyParent, ctes, ptypes),
-                        )
-                      : this.planValues(tref.values!, bodyParent, ctes, ptypes),
+                  shapeBodies,
+                  tref,
+                  bodyParent,
+                  ctes,
+                  ptypes,
                 );
         if (rightSide && lateralEligible && queryPlanReferencesOuter(plan, 0)) {
           detached = true;
@@ -15821,243 +15981,40 @@ export class Engine {
       lateralFlags.push(lateral);
       offset += t.columns.length;
     }
-
-    // USING/NATURAL merged columns + every join's resolved predicate (grammar.md §15) — computed
-    // BEFORE the scope so GROUP BY / DISTINCT / projection / WHERE all see the merge columns; a plain
-    // ON join resolves here too. Joins are processed left-to-right so a later join's left side sees
-    // the merges introduced by earlier ones (a USING chain). For each USING column the synthesized
-    // predicate is `left.col = right.col` (3-valued, like any ON); the SURVIVING side becomes the
-    // single merge column — the left for INNER/LEFT, the right for RIGHT (FULL JOIN USING, a COALESCE,
-    // is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
-    const merges: MergeCol[] = [];
-    const hidden: number[] = [...groupHidden];
-    // The `*` expansion order is built per comma item, PostgreSQL's rule (grammar.md §15): each
-    // join's output is (its merged columns, in USING order) ++ (the left input's columns minus those
-    // merged here) ++ (the right input's columns minus its merged copies), so in a left-deep chain
-    // the NEWEST join's merges come first. star holds the completed comma items; segStar the
-    // current one.
-    const flat = new Scope(rels, this, null, false, ctes);
-    const relStar = (i: number): number[] => {
-      const out: number[] = [];
-      const shown = rels[i]!.table.columns.length - starHiddenCount(rels[i]!, ctes);
-      for (let c = 0; c < shown; c++) {
-        const idx = rels[i]!.offset + c;
-        if (!groupHidden.includes(idx)) out.push(idx);
-      }
-      return out;
+    return {
+      parent,
+      tableRefs,
+      isolated,
+      rels,
+      srfPlans,
+      derivedPlans,
+      lateralFlags,
+      shaping,
+      shaped,
+      cteBodies,
+      subRels,
+      groupHidden,
+      lateralParentScope,
     };
-    const star: number[] = [];
-    let segStar: number[] = rels.length > 0 ? relStar(0) : [];
-    const joinPreds: (RExpr | null)[] = [];
-    for (let k = 0; k < sel.joins.length; k++) {
-      const j = sel.joins[k]!;
-      if (j.comma) {
-        star.push(...segStar);
-        segStar = relStar(k + 1);
-        joinPreds.push(null);
-        continue;
-      }
-      let seg = k + 1;
-      while (seg >= 1 && !sel.joins[seg - 1]!.comma) seg--;
-      const segOff = rels[seg]!.offset;
-      const segMerges = merges.filter((m) => m.index >= segOff);
-      const segHidden = hidden.filter((i) => i >= segOff);
-      const mkScope = (lo: number, hi: number): Scope => {
-        const s = new Scope(rels.slice(lo, hi + 1), this, parent, true, ctes);
-        s.merges = segMerges;
-        s.hidden = segHidden;
-        return s;
-      };
-      // A NATURAL join (grammar.md §15) derives its USING list as the column names common to both
-      // sides (left order); an explicit USING uses its written list. A NATURAL join with NO common
-      // column degenerates to a CROSS join (an empty list → no predicate, no merge).
-      const usingCols =
-        j.using !== undefined
-          ? j.using
-          : j.natural === true
-            ? naturalCommonCols(
-                segStar.map((idx) => flat.columnAt(idx).name),
-                rels[k + 1]!,
-              )
-            : undefined;
-      const rightStar = relStar(k + 1);
-      if (usingCols !== undefined && usingCols.length > 0) {
-        if (j.kind === "full") {
-          throw engineError(
-            "feature_not_supported",
-            "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet",
-          );
-        }
-        const left = mkScope(seg, k);
-        // The synthesized predicate compares the two chosen columns through one-column pseudo
-        // relations at their flat slots, so it binds exactly those columns even when a side is an
-        // unlabeled relation or carries a second column of the same name.
-        const pairRels: ScopeRel[] = [];
-        let predAst: Expr | null = null;
-        const merged: number[] = [];
-        const leftDrop: number[] = [];
-        const rightDrop: number[] = [];
-        for (let n = 0; n < usingCols.length; n++) {
-          const name = usingCols[n]!;
-          let li = -1;
-          try {
-            const lr = left.resolveBareColumn(name);
-            if (lr.level === 0) li = lr.index;
-          } catch {
-            // fall through to the USING-specific error below
-          }
-          if (li < 0) {
-            throw engineError(
-              "undefined_column",
-              `column "${name}" specified in USING clause does not exist in left table`,
-            );
-          }
-          const rightRel = rels[k + 1]!;
-          const rl = columnIndex(rightRel.table, name);
-          if (rl < 0) {
-            throw engineError(
-              "undefined_column",
-              `column "${name}" specified in USING clause does not exist in right table`,
-            );
-          }
-          this.traceRelColumn(rightRel, rl);
-          const ri = rightRel.offset + rl;
-          const lq = "\u0000l" + n;
-          const rq = "\u0000r" + n;
-          pairRels.push(
-            { label: lq, table: pseudoTable(lq, left.columnAt(li)), offset: li },
-            { label: rq, table: pseudoTable(rq, rightRel.table.columns[rl]!), offset: ri },
-          );
-          const eq: Expr = {
-            kind: "binary",
-            op: "eq",
-            lhs: { kind: "qualifiedColumn", qualifier: lq, name },
-            rhs: { kind: "qualifiedColumn", qualifier: rq, name },
-          };
-          predAst = predAst === null ? eq : { kind: "binary", op: "and", lhs: predAst, rhs: eq };
-          const mi = j.kind === "right" ? ri : li;
-          const ex = merges.findIndex((m) => m.name === name);
-          if (ex >= 0) merges.splice(ex, 1);
-          merges.push({ name: name, index: mi });
-          hidden.push(li, ri);
-          merged.push(mi);
-          leftDrop.push(li);
-          rightDrop.push(ri);
-        }
-        for (const idx of segStar) if (!leftDrop.includes(idx)) merged.push(idx);
-        for (const idx of rightStar) if (!rightDrop.includes(idx)) merged.push(idx);
-        segStar = merged;
-        const pair = new Scope(pairRels, this, null, false, ctes);
-        joinPreds.push(resolveBooleanFilter(pair, predAst!, ptypes));
-      } else if (j.on !== null) {
-        const partial = mkScope(seg, k + 1);
-        partial.subRels = subRelsWithin(subRels, seg, k + 1);
-        // An ON clause cannot see the comma items to its left; a hint searches them
-        // (error-fields.md §11.8).
-        partial.hints = {
-          unseen: onClauseUnseen(tableRefs, rels, subRels, seg),
-          onClause: true,
-          lateralActive: false,
-        };
-        joinPreds.push(resolveBooleanFilter(partial, j.on, ptypes));
-        segStar.push(...rightStar);
-      } else {
-        joinPreds.push(null);
-        segStar.push(...rightStar);
-      }
-    }
-    star.push(...segStar);
+  }
 
-    const scope = new Scope(rels, this, parent, true, ctes);
-    scope.merges = merges;
-    scope.hidden = hidden;
-    scope.subRels = subRels;
-    scope.star = star;
+  // planSelectClauses plans a SELECT's joins and clauses over its resolved FROM (the second half of
+  // planSelectPushed).
+  private planSelectClauses(
+    sel: Select,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+    pushed: RExpr[],
+    from: SelectFrom,
+  ): SelectPlan {
+    const { srfPlans, derivedPlans, lateralFlags, shaping, shaped, cteBodies } = from;
+    const { scope, joinPreds } = this.planSelectJoins(sel, ctes, ptypes, from);
 
-    // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets, resolve
-    // each set's columns to flat row indices, and build the master grouping-column list (groupKeys) —
-    // the ordered union of every set's columns, i.e. the columns groupable in at least one set
-    // (spec/design/aggregates.md §12). A plain GROUP BY a, b expands to a single set [a, b]; no GROUP
-    // BY expands to a single empty set (the whole-table grand total). An unknown column is 42703, an
-    // outer (correlated) key is degenerate and 0A000 (§26).
-    // Each grouping term is one of (aggregates.md §15): a bare/qualified COLUMN; a select-list ORDINAL
-    // (a bare integer literal — `GROUP BY 1`); an output ALIAS (a bare name that is not an input
-    // column — PG's input-column-first rule); or a general EXPRESSION (`GROUP BY a+b`). A column key
-    // keeps its real row slot (groupKeys holds its flat index); an expression key is MATERIALIZED —
-    // its node collected into groupExprs and evaluated per row into a synthetic column inputWidth+k
-    // whose index is the master key. groupKeyExprs records each master key's canonical AST (non-null
-    // for expression keys) so a matching projection / HAVING / ORDER BY expression resolves to its
-    // synthetic slot. The whole-row equality bucket machinery (resolvedSets, GROUPING SETS) is
-    // unchanged — it works on master key indices.
-    const expanded = expandGroupBy(sel.groupBy);
-    const inputWidth = scope.width();
-    const groupKeys: number[] = [];
-    const groupKeyExprs: (GroupKeyExpr | null)[] = [];
-    const groupExprs: RExpr[] = [];
-    const resolvedSets: number[][] = expanded.map((set) =>
-      set.map((key) => {
-        const gr = resolveGroupTerm(scope, key, sel.items, ptypes);
-        if (gr.kind === "column") {
-          // `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md §5),
-          // so GROUP BY a json column is 42883. jsonb IS groupable.
-          if (typeIsJson(scope.columnAt(gr.index).type)) {
-            throw engineError(
-              "undefined_function",
-              "could not identify an equality operator for type json",
-            ).noHint();
-          }
-          const idx = gr.index;
-          if (!groupKeys.includes(idx)) {
-            groupKeys.push(idx);
-            groupKeyExprs.push(null);
-          }
-          return idx;
-        }
-        // A general EXPRESSION key. Grouping is byte equality, but an indeterminate key is still
-        // 42P21 (spec/design/collation.md §1 "A sort or grouping target").
-        if (rtCollatable(gr.ty)) rejectIndeterminateTarget(deriveCollation(scope, gr.canon));
-        if (gr.ty.kind === "json") {
-          throw engineError(
-            "undefined_function",
-            "could not identify an equality operator for type json",
-          ).noHint();
-        }
-        // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
-        const pos = groupKeyExprs.findIndex((gk) => gk !== null && exprEqual(gk.canon, gr.canon));
-        if (pos >= 0) return groupKeys[pos]!;
-        const synth = inputWidth + groupExprs.length;
-        groupExprs.push(gr.node);
-        groupKeys.push(synth);
-        groupKeyExprs.push({ canon: gr.canon, ty: gr.ty });
-        return synth;
-      }),
+    const { groupKeys, groupKeyExprs, groupExprs, resolvedSets } = this.planSelectGroupBy(
+      sel,
+      scope,
+      ptypes,
     );
-
-    // Functional-dependency grouping (aggregates.md §16, PG): when there is a SINGLE grouping set
-    // that contains every primary-key column of a base table T, T's PK functionally determines every
-    // column of T, so any T column (and expressions over them) may appear ungrouped. Make them
-    // groupable by adding T's remaining columns as extra master grouping keys — the grouping is
-    // UNCHANGED (each is constant within a group, so bucketing by [pk…, others…] yields the same
-    // partition as by [pk…] alone, even across a join). Restricted to a single set: PG rejects the
-    // dependency when a grouping set omits the PK. A CTE / derived table / SRF has an empty pk (a
-    // synthetic key), so only base tables with a real PK contribute.
-    if (resolvedSets.length === 1) {
-      const extra: number[] = [];
-      for (const rel of scope.rels) {
-        if (rel.qualifierOnly || rel.cte !== undefined || rel.table.pk.length === 0) continue;
-        const pkGrouped = rel.table.pk.every((ord) => groupKeys.includes(rel.offset + ord));
-        if (!pkGrouped) continue;
-        for (let c = 0; c < rel.table.columns.length; c++) {
-          const idx = rel.offset + c;
-          if (!groupKeys.includes(idx) && !extra.includes(idx)) extra.push(idx);
-        }
-      }
-      for (const idx of extra) {
-        groupKeys.push(idx);
-        groupKeyExprs.push(null);
-        resolvedSets[0]!.push(idx);
-      }
-    }
 
     // An aggregate query has a GROUP BY or an aggregate in the select list. Its projection
     // resolves in collect mode — aggregates collect into synthetic slots and a non-grouped
@@ -16223,6 +16180,135 @@ export class Engine {
     // expression is resolved here (introducing a new aggregate in a grouped query if it names one),
     // collected into orderExprs, and given a placeholder sort slot ORDER_EXPR_BASE+k rebased to
     // finalWidth+k below — the window-key precedent (window.md §5.1).
+    const items = sel.items;
+    const ordered = this.planSelectOrder(sel, scope, ptypes, {
+      isAgg,
+      hasWindowSyntax,
+      groupKeys,
+      groupKeyExprs,
+      aggSpecs,
+      groupingSpecs,
+      windowSpecs,
+      windowKeys,
+    });
+    const { order, orderExprs } = ordered;
+    aggSpecs = ordered.aggSpecs;
+    groupingSpecs = ordered.groupingSpecs;
+    // All specs are now final (an ORDER BY key may have introduced a window function / aggregate /
+    // GROUPING()).
+    hasWindow = windowSpecs.length > 0;
+
+    // The join predicates were resolved above (alongside the USING/NATURAL merges, which the scope
+    // now carries). Pair each with its join kind — the kind only changes how unmatched rows are
+    // handled in the executor loop, not the predicate (grammar.md §15).
+    const joins: PlanJoin[] = sel.joins.map((j, k) => ({ kind: j.kind, on: joinPreds[k]! }));
+    // Body-pushed conjuncts from an enclosing SELECT (planner.md §3.2) join the WHERE as a left-deep
+    // AND after the body's own WHERE, in source order.
+    let fullFilter = filter;
+    for (const c of pushed) fullFilter = fullFilter === null ? c : { kind: "and", lhs: fullFilter, rhs: c };
+
+    // Assemble the owned LOGICAL plan (table NAMES + offsets/widths replace the scope's tables, so
+    // the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve
+    // decides names, types, and errors — never an access path: plan.phys is zero-valued here, and
+    // only the optimizeSelect pass below writes it (spec/design/planner.md §2).
+    const planRels: PlanRel[] = scope.rels.map((rel, i) => ({
+      tableName: rel.table.name,
+      db: rel.db,
+      offset: rel.offset,
+      colCount: rel.table.columns.length,
+      srf: srfPlans[i],
+      cte: rel.cte,
+      derived: derivedPlans[i],
+      lateral: lateralFlags[i],
+    }));
+    const plan: SelectPlan = {
+      kind: "select",
+      rels: planRels,
+      joins,
+      filter: fullFilter,
+      isAgg,
+      groupKeys,
+      groupExprs,
+      groupSets,
+      groupingSpecs,
+      aggSpecs,
+      hasWindow,
+      windowSpecs,
+      windowKeys,
+      having,
+      order,
+      orderExprs,
+      projections,
+      columnNames,
+      columnTypes,
+      columnDerivs,
+      columnTypmods,
+      distinct: sel.distinct,
+      limit: sel.limit,
+      offset: sel.offset,
+      group,
+      relMasks: [],
+      pushdown: null,
+      phys: {
+        hashJoin: null,
+        joinSteps: [],
+        relationOrder: [],
+        pkOrdered: false,
+        pkReverse: false,
+        indexOrder: null,
+        joinPkOrdered: false,
+        topK: null,
+        relBounds: [],
+        relEstimates: [],
+        relINLBounds: [],
+      },
+    };
+    finishSelectSlots(plan, sel, scope);
+    plan.relMasks = computeRelMasks(plan);
+    // ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———
+    // The WHERE rewrite (contradiction detection, then pushdown) is a pure plan→plan transform.
+    // foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
+    // params, so it stays post-bind in the statement drivers.
+    rewriteWhere(plan);
+    // A shape is read for its outputs and pushability only, then discarded (planner.md §3.2).
+    if (shaping) return plan;
+    this.planDerivedBodies(
+      plan,
+      from.tableRefs,
+      from.isolated,
+      shaped,
+      cteBodies,
+      from.parent,
+      from.lateralParentScope,
+      ctes,
+      ptypes,
+    );
+    //
+    // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
+    optimizeSelect(plan, scope.rels, this.readSnap(), this);
+    return plan;
+  }
+
+  // planSelectOrder resolves a SELECT's ORDER BY keys in the context its projection used (part of
+  // planSelectPushed). An expression key may collect a new aggregate / GROUPING() call, so the
+  // aggregate and GROUPING() specs it returns supersede the ones passed in.
+  private planSelectOrder(
+    sel: Select,
+    scope: Scope,
+    ptypes: ParamTypes,
+    ctx: {
+      isAgg: boolean;
+      hasWindowSyntax: boolean;
+      groupKeys: number[];
+      groupKeyExprs: (GroupKeyExpr | null)[];
+      aggSpecs: AggSpec[];
+      groupingSpecs: number[][];
+      windowSpecs: WindowSpec[];
+      windowKeys: RExpr[];
+    },
+  ): { order: OrderSlot[]; orderExprs: RExpr[]; aggSpecs: AggSpec[]; groupingSpecs: number[][] } {
+    const { isAgg, hasWindowSyntax, groupKeys, groupKeyExprs, windowSpecs, windowKeys } = ctx;
+    let { aggSpecs, groupingSpecs } = ctx;
     const order: OrderSlot[] = [];
     const orderExprs: RExpr[] = [];
     const items = sel.items;
@@ -16397,203 +16483,269 @@ export class Engine {
         collation: coll,
       });
     }
-    // All specs are now final (an ORDER BY key may have introduced a window function / aggregate /
-    // GROUPING()). Recompute hasWindow and rebase every placeholder — in the projections, HAVING, AND
-    // the materialized ORDER BY expressions — to its real trailing slot (window.md §5.1). The window
-    // stage's row is [input… , materialized window keys… , window results…]; inputWidth is the grouped
-    // row's width (group keys + every aggregate) for a grouped+window query, else the FROM scope width.
-    hasWindow = windowSpecs.length > 0;
-    if (hasWindow) {
-      // The grouped row the window stage extends is `[master cols…, agg results…, GROUPING
-      // results…]` (the GROUPING columns precede the window columns — aggregates.md §21), so a
-      // grouped+window query's window input width includes the GROUPING() results.
-      const inputWidth = isAgg
-        ? groupKeys.length + aggSpecs.length + groupingSpecs.length
-        : scope.width();
-      const keyBase = inputWidth;
-      const resultBase = inputWidth + windowKeys.length;
-      // Bound each manual WINDOW_KEY_BASE rewrite to [WINDOW_KEY_BASE, 2·WINDOW_KEY_BASE) so a
-      // GROUPING() placeholder (the higher GROUPING_GS_BASE) in a window key is not clobbered here
-      // (it rebases below — §21).
-      for (const spec of windowSpecs) {
-        for (let j = 0; j < spec.partition.length; j++) {
-          if (spec.partition[j] >= WINDOW_KEY_BASE && spec.partition[j] < WINDOW_KEY_BASE * 2) {
-            spec.partition[j] = keyBase + (spec.partition[j] - WINDOW_KEY_BASE);
-          }
-        }
-        for (const o of spec.order) {
-          if (o.idx >= WINDOW_KEY_BASE && o.idx < WINDOW_KEY_BASE * 2) {
-            o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
-          }
-        }
-      }
-      for (const p of projections) rebasePlaceholderCols(p, WINDOW_RESULT_BASE, resultBase);
-      for (const oe of orderExprs) rebasePlaceholderCols(oe, WINDOW_RESULT_BASE, resultBase);
-    }
-    // GROUPING SETS / GROUPING() combined with window functions (spec/design/aggregates.md §21): the
-    // window stage runs over the unioned grouping-set rows. The grouped row is `[master cols…, agg
-    // results…, GROUPING results…]` and the window stage appends `[window keys…, window results…]`
-    // after, so the two no longer collide — GROUPING rebases below the window bases.
-    // Rebase the GROUPING() placeholder slots to their real trailing synthetic slots
-    // groupKeys.length+aggSpecs.length+g (the GROUPING results follow the master columns and aggregate
-    // results — §12), in the projections, HAVING, and the materialized ORDER BY expressions.
-    if (groupingSpecs.length > 0) {
-      const gbase = groupKeys.length + aggSpecs.length;
-      for (const p of projections) rebasePlaceholderCols(p, GROUPING_GS_BASE, gbase);
-      if (having !== null) rebasePlaceholderCols(having, GROUPING_GS_BASE, gbase);
-      for (const oe of orderExprs) rebasePlaceholderCols(oe, GROUPING_GS_BASE, gbase);
-    }
-    // Rebase each materialized expression-key slot to its real trailing position now that the row layout
-    // is final. The materialized order values are appended AFTER the input / window / grouped columns
-    // (grammar.md §10): for a grouped+window query the grouped row is first extended by the window stage,
-    // so the order values follow the window results.
-    const orderValueBase =
-      isAgg && hasWindow
-        ? groupKeys.length +
-          aggSpecs.length +
-          groupingSpecs.length +
-          windowKeys.length +
-          windowSpecs.length
-        : isAgg
-          ? groupKeys.length + aggSpecs.length + groupingSpecs.length
-          : hasWindow
-            ? scope.width() + windowKeys.length + windowSpecs.length
-            : scope.width();
-    for (const o of order) {
-      if (o.idx >= ORDER_EXPR_BASE) o.idx = orderValueBase + (o.idx - ORDER_EXPR_BASE);
-    }
+    return { order, orderExprs, aggSpecs, groupingSpecs };
+  }
 
-    // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates collapse, an ORDER BY
-    // key must have a per-row value in the projected output — a bare/qualified column that is projected,
-    // an ordinal (which names a select-list item by position), or a general expression that STRUCTURALLY
-    // matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases are invisible to ORDER
-    // BY (§8); a SELECT DISTINCT * projects every column, so the restriction never bites.
-    if (sel.distinct && sel.orderBy.length > 0 && items.kind === "list") {
-      const projected = new Set<number>();
-      for (const it of items.items) {
-        if (it.expr.kind === "column") {
-          const r = scope.resolveBare(it.expr.name);
-          if (r.level === 0) projected.add(r.index);
-        } else if (it.expr.kind === "qualifiedColumn") {
-          const r = scope.resolveQualified(it.expr.qualifier, it.expr.name);
-          if (r.level === 0) projected.add(r.index);
+  // planSelectGroupBy resolves a SELECT's GROUP BY into its grouping sets and master grouping keys
+  // (part of planSelectPushed).
+  private planSelectGroupBy(
+    sel: Select,
+    scope: Scope,
+    ptypes: ParamTypes,
+  ): {
+    groupKeys: number[];
+    groupKeyExprs: (GroupKeyExpr | null)[];
+    groupExprs: RExpr[];
+    resolvedSets: number[][];
+  } {
+    // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets, resolve
+    // each set's columns to flat row indices, and build the master grouping-column list (groupKeys) —
+    // the ordered union of every set's columns, i.e. the columns groupable in at least one set
+    // (spec/design/aggregates.md §12). A plain GROUP BY a, b expands to a single set [a, b]; no GROUP
+    // BY expands to a single empty set (the whole-table grand total). An unknown column is 42703, an
+    // outer (correlated) key is degenerate and 0A000 (§26).
+    // Each grouping term is one of (aggregates.md §15): a bare/qualified COLUMN; a select-list ORDINAL
+    // (a bare integer literal — `GROUP BY 1`); an output ALIAS (a bare name that is not an input
+    // column — PG's input-column-first rule); or a general EXPRESSION (`GROUP BY a+b`). A column key
+    // keeps its real row slot (groupKeys holds its flat index); an expression key is MATERIALIZED —
+    // its node collected into groupExprs and evaluated per row into a synthetic column inputWidth+k
+    // whose index is the master key. groupKeyExprs records each master key's canonical AST (non-null
+    // for expression keys) so a matching projection / HAVING / ORDER BY expression resolves to its
+    // synthetic slot. The whole-row equality bucket machinery (resolvedSets, GROUPING SETS) is
+    // unchanged — it works on master key indices.
+    const expanded = expandGroupBy(sel.groupBy);
+    const inputWidth = scope.width();
+    const groupKeys: number[] = [];
+    const groupKeyExprs: (GroupKeyExpr | null)[] = [];
+    const groupExprs: RExpr[] = [];
+    const resolvedSets: number[][] = expanded.map((set) =>
+      set.map((key) => {
+        const gr = resolveGroupTerm(scope, key, sel.items, ptypes);
+        if (gr.kind === "column") {
+          // `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md §5),
+          // so GROUP BY a json column is 42883. jsonb IS groupable.
+          if (typeIsJson(scope.columnAt(gr.index).type)) {
+            throw engineError(
+              "undefined_function",
+              "could not identify an equality operator for type json",
+            ).noHint();
+          }
+          const idx = gr.index;
+          if (!groupKeys.includes(idx)) {
+            groupKeys.push(idx);
+            groupKeyExprs.push(null);
+          }
+          return idx;
+        }
+        // A general EXPRESSION key. Grouping is byte equality, but an indeterminate key is still
+        // 42P21 (spec/design/collation.md §1 "A sort or grouping target").
+        if (rtCollatable(gr.ty)) rejectIndeterminateTarget(deriveCollation(scope, gr.canon));
+        if (gr.ty.kind === "json") {
+          throw engineError(
+            "undefined_function",
+            "could not identify an equality operator for type json",
+          ).noHint();
+        }
+        // Reuse an identical expression key already registered (`GROUP BY a+b, a+b`).
+        const pos = groupKeyExprs.findIndex((gk) => gk !== null && exprEqual(gk.canon, gr.canon));
+        if (pos >= 0) return groupKeys[pos]!;
+        const synth = inputWidth + groupExprs.length;
+        groupExprs.push(gr.node);
+        groupKeys.push(synth);
+        groupKeyExprs.push({ canon: gr.canon, ty: gr.ty });
+        return synth;
+      }),
+    );
+
+    // Functional-dependency grouping (aggregates.md §16, PG): when there is a SINGLE grouping set
+    // that contains every primary-key column of a base table T, T's PK functionally determines every
+    // column of T, so any T column (and expressions over them) may appear ungrouped. Make them
+    // groupable by adding T's remaining columns as extra master grouping keys — the grouping is
+    // UNCHANGED (each is constant within a group, so bucketing by [pk…, others…] yields the same
+    // partition as by [pk…] alone, even across a join). Restricted to a single set: PG rejects the
+    // dependency when a grouping set omits the PK. A CTE / derived table / SRF has an empty pk (a
+    // synthetic key), so only base tables with a real PK contribute.
+    if (resolvedSets.length === 1) {
+      const extra: number[] = [];
+      for (const rel of scope.rels) {
+        if (rel.qualifierOnly || rel.cte !== undefined || rel.table.pk.length === 0) continue;
+        const pkGrouped = rel.table.pk.every((ord) => groupKeys.includes(rel.offset + ord));
+        if (!pkGrouped) continue;
+        for (let c = 0; c < rel.table.columns.length; c++) {
+          const idx = rel.offset + c;
+          if (!groupKeys.includes(idx) && !extra.includes(idx)) extra.push(idx);
         }
       }
-      for (const key of sel.orderBy) {
-        let inList: boolean;
-        if (key.ordinal !== null) {
-          inList = true;
-        } else if (key.expr !== null) {
-          const ke = key.expr;
-          inList = items.items.some((it) => exprEqual(ke, it.expr));
-        } else if (key.qualifier === null && orderAliasMatch(items, key.column, scope) !== null) {
-          // A bare name that binds an output column (alias/derived name) names a select-list item, so
-          // it is projected (the alias form, §10). Ambiguity was already raised in the loop above.
-          inList = true;
-        } else {
-          const r =
-            key.qualifier !== null
-              ? scope.resolveQualified(key.qualifier, key.column)
-              : scope.resolveBare(key.column);
-          inList = r.level === 0 && projected.has(r.index);
-        }
-        if (!inList) {
+      for (const idx of extra) {
+        groupKeys.push(idx);
+        groupKeyExprs.push(null);
+        resolvedSets[0]!.push(idx);
+      }
+    }
+    return { groupKeys, groupKeyExprs, groupExprs, resolvedSets };
+  }
+
+  // planSelectJoins resolves a SELECT's join conditions — USING / NATURAL merges and ON predicates —
+  // and builds the scope its clauses resolve against (part of planSelectPushed).
+  private planSelectJoins(
+    sel: Select,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+    from: SelectFrom,
+  ): { scope: Scope; joinPreds: (RExpr | null)[] } {
+    const { parent, tableRefs, rels, subRels, groupHidden } = from;
+    // USING/NATURAL merged columns + every join's resolved predicate (grammar.md §15) — computed
+    // BEFORE the scope so GROUP BY / DISTINCT / projection / WHERE all see the merge columns; a plain
+    // ON join resolves here too. Joins are processed left-to-right so a later join's left side sees
+    // the merges introduced by earlier ones (a USING chain). For each USING column the synthesized
+    // predicate is `left.col = right.col` (3-valued, like any ON); the SURVIVING side becomes the
+    // single merge column — the left for INNER/LEFT, the right for RIGHT (FULL JOIN USING, a COALESCE,
+    // is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
+    const merges: MergeCol[] = [];
+    const hidden: number[] = [...groupHidden];
+    // The `*` expansion order is built per comma item, PostgreSQL's rule (grammar.md §15): each
+    // join's output is (its merged columns, in USING order) ++ (the left input's columns minus those
+    // merged here) ++ (the right input's columns minus its merged copies), so in a left-deep chain
+    // the NEWEST join's merges come first. star holds the completed comma items; segStar the
+    // current one.
+    const flat = new Scope(rels, this, null, false, ctes);
+    const relStar = (i: number): number[] => {
+      const out: number[] = [];
+      const shown = rels[i]!.table.columns.length - starHiddenCount(rels[i]!, ctes);
+      for (let c = 0; c < shown; c++) {
+        const idx = rels[i]!.offset + c;
+        if (!groupHidden.includes(idx)) out.push(idx);
+      }
+      return out;
+    };
+    const star: number[] = [];
+    let segStar: number[] = rels.length > 0 ? relStar(0) : [];
+    const joinPreds: (RExpr | null)[] = [];
+    for (let k = 0; k < sel.joins.length; k++) {
+      const j = sel.joins[k]!;
+      if (j.comma) {
+        star.push(...segStar);
+        segStar = relStar(k + 1);
+        joinPreds.push(null);
+        continue;
+      }
+      let seg = k + 1;
+      while (seg >= 1 && !sel.joins[seg - 1]!.comma) seg--;
+      const segOff = rels[seg]!.offset;
+      const segMerges = merges.filter((m) => m.index >= segOff);
+      const segHidden = hidden.filter((i) => i >= segOff);
+      const mkScope = (lo: number, hi: number): Scope => {
+        const s = new Scope(rels.slice(lo, hi + 1), this, parent, true, ctes);
+        s.merges = segMerges;
+        s.hidden = segHidden;
+        return s;
+      };
+      // A NATURAL join (grammar.md §15) derives its USING list as the column names common to both
+      // sides (left order); an explicit USING uses its written list. A NATURAL join with NO common
+      // column degenerates to a CROSS join (an empty list → no predicate, no merge).
+      const usingCols =
+        j.using !== undefined
+          ? j.using
+          : j.natural === true
+            ? naturalCommonCols(
+                segStar.map((idx) => flat.columnAt(idx).name),
+                rels[k + 1]!,
+              )
+            : undefined;
+      const rightStar = relStar(k + 1);
+      if (usingCols !== undefined && usingCols.length > 0) {
+        if (j.kind === "full") {
           throw engineError(
-            "invalid_column_reference",
-            "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+            "feature_not_supported",
+            "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet",
           );
         }
+        const left = mkScope(seg, k);
+        // The synthesized predicate compares the two chosen columns through one-column pseudo
+        // relations at their flat slots, so it binds exactly those columns even when a side is an
+        // unlabeled relation or carries a second column of the same name.
+        const pairRels: ScopeRel[] = [];
+        let predAst: Expr | null = null;
+        const merged: number[] = [];
+        const leftDrop: number[] = [];
+        const rightDrop: number[] = [];
+        for (let n = 0; n < usingCols.length; n++) {
+          const name = usingCols[n]!;
+          let li = -1;
+          try {
+            const lr = left.resolveBareColumn(name);
+            if (lr.level === 0) li = lr.index;
+          } catch {
+            // fall through to the USING-specific error below
+          }
+          if (li < 0) {
+            throw engineError(
+              "undefined_column",
+              `column "${name}" specified in USING clause does not exist in left table`,
+            );
+          }
+          const rightRel = rels[k + 1]!;
+          const rl = columnIndex(rightRel.table, name);
+          if (rl < 0) {
+            throw engineError(
+              "undefined_column",
+              `column "${name}" specified in USING clause does not exist in right table`,
+            );
+          }
+          this.traceRelColumn(rightRel, rl);
+          const ri = rightRel.offset + rl;
+          const lq = "\u0000l" + n;
+          const rq = "\u0000r" + n;
+          pairRels.push(
+            { label: lq, table: pseudoTable(lq, left.columnAt(li)), offset: li },
+            { label: rq, table: pseudoTable(rq, rightRel.table.columns[rl]!), offset: ri },
+          );
+          const eq: Expr = {
+            kind: "binary",
+            op: "eq",
+            lhs: { kind: "qualifiedColumn", qualifier: lq, name },
+            rhs: { kind: "qualifiedColumn", qualifier: rq, name },
+          };
+          predAst = predAst === null ? eq : { kind: "binary", op: "and", lhs: predAst, rhs: eq };
+          const mi = j.kind === "right" ? ri : li;
+          const ex = merges.findIndex((m) => m.name === name);
+          if (ex >= 0) merges.splice(ex, 1);
+          merges.push({ name: name, index: mi });
+          hidden.push(li, ri);
+          merged.push(mi);
+          leftDrop.push(li);
+          rightDrop.push(ri);
+        }
+        for (const idx of segStar) if (!leftDrop.includes(idx)) merged.push(idx);
+        for (const idx of rightStar) if (!rightDrop.includes(idx)) merged.push(idx);
+        segStar = merged;
+        const pair = new Scope(pairRels, this, null, false, ctes);
+        joinPreds.push(resolveBooleanFilter(pair, predAst!, ptypes));
+      } else if (j.on !== null) {
+        const partial = mkScope(seg, k + 1);
+        partial.subRels = subRelsWithin(subRels, seg, k + 1);
+        // An ON clause cannot see the comma items to its left; a hint searches them
+        // (error-fields.md §11.8).
+        partial.hints = {
+          unseen: onClauseUnseen(tableRefs, rels, subRels, seg),
+          onClause: true,
+          lateralActive: false,
+        };
+        joinPreds.push(resolveBooleanFilter(partial, j.on, ptypes));
+        segStar.push(...rightStar);
+      } else {
+        joinPreds.push(null);
+        segStar.push(...rightStar);
       }
     }
+    star.push(...segStar);
 
-    // The join predicates were resolved above (alongside the USING/NATURAL merges, which the scope
-    // now carries). Pair each with its join kind — the kind only changes how unmatched rows are
-    // handled in the executor loop, not the predicate (grammar.md §15).
-    const joins: PlanJoin[] = sel.joins.map((j, k) => ({ kind: j.kind, on: joinPreds[k]! }));
-    // Body-pushed conjuncts from an enclosing SELECT (planner.md §3.2) join the WHERE as a left-deep
-    // AND after the body's own WHERE, in source order.
-    let fullFilter = filter;
-    for (const c of pushed) fullFilter = fullFilter === null ? c : { kind: "and", lhs: fullFilter, rhs: c };
-
-    // Assemble the owned LOGICAL plan (table NAMES + offsets/widths replace the scope's tables, so
-    // the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve
-    // decides names, types, and errors — never an access path: plan.phys is zero-valued here, and
-    // only the optimizeSelect pass below writes it (spec/design/planner.md §2).
-    const planRels: PlanRel[] = scope.rels.map((rel, i) => ({
-      tableName: rel.table.name,
-      db: rel.db,
-      offset: rel.offset,
-      colCount: rel.table.columns.length,
-      srf: srfPlans[i],
-      cte: rel.cte,
-      derived: derivedPlans[i],
-      lateral: lateralFlags[i],
-    }));
-    const plan: SelectPlan = {
-      kind: "select",
-      rels: planRels,
-      joins,
-      filter: fullFilter,
-      isAgg,
-      groupKeys,
-      groupExprs,
-      groupSets,
-      groupingSpecs,
-      aggSpecs,
-      hasWindow,
-      windowSpecs,
-      windowKeys,
-      having,
-      order,
-      orderExprs,
-      projections,
-      columnNames,
-      columnTypes,
-      columnDerivs,
-      columnTypmods,
-      distinct: sel.distinct,
-      limit: sel.limit,
-      offset: sel.offset,
-      group,
-      relMasks: [],
-      pushdown: null,
-      phys: {
-        hashJoin: null,
-        joinSteps: [],
-        relationOrder: [],
-        pkOrdered: false,
-        pkReverse: false,
-        indexOrder: null,
-        joinPkOrdered: false,
-        topK: null,
-        relBounds: [],
-        relEstimates: [],
-        relINLBounds: [],
-      },
-    };
-    plan.relMasks = computeRelMasks(plan);
-    // ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———
-    // The WHERE rewrite (contradiction detection, then pushdown) is a pure plan→plan transform.
-    // foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
-    // params, so it stays post-bind in the statement drivers.
-    rewriteWhere(plan);
-    // A shape is read for its outputs and pushability only, then discarded (planner.md §3.2).
-    if (shaping) return plan;
-    this.planDerivedBodies(
-      plan,
-      tableRefs,
-      isolated,
-      shaped,
-      cteBodies,
-      parent,
-      lateralParentScope,
-      ctes,
-      ptypes,
-    );
-    //
-    // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
-    optimizeSelect(plan, scope.rels, this.readSnap(), this);
-    return plan;
+    const scope = new Scope(rels, this, parent, true, ctes);
+    scope.merges = merges;
+    scope.hidden = hidden;
+    scope.subRels = subRels;
+    scope.star = star;
+    return { scope, joinPreds };
   }
 
   // planBodyFirst runs f, the first planning of a derived body: as its shape when shape (planner.md
@@ -16623,6 +16775,36 @@ export class Engine {
       ctes.forEach((b, ci) => {
         b.refs = refs[ci]!;
       });
+    }
+  }
+
+  // planDerivedItem plans a derived FROM item's body (a subquery, first planned as its shape when
+  // shape — planBodyFirst — or a VALUES list) with frame (when given) recording the relations hidden
+  // from it, for a hint (withUnseenFrame). It is those two wrappers without their closures, so each
+  // nested derived table costs one frame rather than four (spec/design/cost.md §7.1).
+  private planDerivedItem(
+    frame: UnseenFrame | null,
+    shape: boolean,
+    tref: TableRef,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): QueryPlan {
+    if (frame !== null) this.unseenFrames.push(frame);
+    const saved = this.planShape;
+    const expansions = this.viewExpansions;
+    const shaped = shape && tref.subquery !== undefined;
+    if (shaped) this.planShape = true;
+    try {
+      return tref.subquery !== undefined
+        ? this.planQuery(tref.subquery, parent, ctes, ptypes)
+        : this.planValues(tref.values!, parent, ctes, ptypes);
+    } finally {
+      if (shaped) {
+        this.planShape = saved;
+        this.viewExpansions = expansions;
+      }
+      if (frame !== null) this.unseenFrames.pop();
     }
   }
 
@@ -19474,14 +19656,54 @@ export class Engine {
     params: Value[],
     meter: Meter,
   ): Row[] {
+    // A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
+    // run, and nothing is charged.
+    if (whereContradiction(plan)) return [];
+    // Every relation row is a query-memory row buffer entry under the relation's touched mask
+    // (memory.md §3/§5.1). The two unbounded generators admit as they produce; the remaining producers
+    // are bounded by an existing input value or the catalog and admit their output. Each kind of
+    // relation is produced in a frame of its own, so a derived or CTE body's recursion does not carry
+    // the others' locals (spec/design/cost.md §7.1). A base table applies its pushed filter as its
+    // access path admits each row.
     const rel = plan.rels[ri]!;
-    const pushed = pushedFilter(plan, ri).local;
-    if (pushed === null || (rel.srf === undefined && rel.cte === undefined && rel.derived === undefined)) {
-      return this.materializeRelRows(plan, ri, outer, left, baseEnv, params, meter);
+    let rows: Row[];
+    if (rel.srf !== undefined) {
+      // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
+      // charging generated_row per element (its args read outer — implicitly lateral, §44).
+      rows = this.materializeSrfRows(plan, ri, outer, baseEnv, meter);
+    } else if (rel.cte !== undefined) {
+      // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
+      // MATERIALIZED CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts
+      // 54P01); an INLINE CTE runs its body in place. (A CTE is never lateral.)
+      rows = this.materializeCteRows(plan, ri, baseEnv, params, meter);
+    } else if (rel.derived !== undefined) {
+      // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
+      // cte_scan_row. Non-lateral it was planned against the enclosing scope and reads this query's
+      // outer as its own; a LATERAL body (§44) reads the left-hand row from outer.
+      const r = this.execQueryPlan(rel.derived, outer, params, baseEnv.ctes);
+      meter.charge(r.cost);
+      rebaseRowsMasked(meter, r.rows, plan.relMasks[ri]!);
+      rows = r.rows;
+    } else {
+      return this.materializeBaseRows(plan, ri, outer, left, baseEnv, params, meter);
     }
-    // A computed relation's scan-pushed filter (planner.md §3.2) runs over its produced rows in
-    // production order; each rejected row's reservation is released before the join reads them.
-    const rows = this.materializeRelRows(plan, ri, outer, left, baseEnv, params, meter);
+    const pushed = pushedFilter(plan, ri).local;
+    if (pushed === null) return rows;
+    return this.filterComputedRel(plan, ri, rows, pushed, outer, baseEnv, meter);
+  }
+
+  // filterComputedRel runs a computed relation's scan-pushed filter (planner.md §3.2) over its
+  // produced rows in production order; each rejected row's reservation is released before the join
+  // reads them.
+  private filterComputedRel(
+    plan: SelectPlan,
+    ri: number,
+    rows: Row[],
+    pushed: RExpr,
+    outer: Row[],
+    baseEnv: EvalEnv,
+    meter: Meter,
+  ): Row[] {
     const env: EvalEnv = { ...baseEnv, outer };
     const mask = plan.relMasks[ri]!;
     const kept: Row[] = [];
@@ -19492,9 +19714,114 @@ export class Engine {
     return kept;
   }
 
-  // materializeRelRows produces relation ri's rows; a base table applies its pushed filter as its
-  // access path admits each row.
-  private materializeRelRows(
+  // materializeSrfRows generates set-returning relation ri's rows (a materializeRel arm).
+  private materializeSrfRows(
+    plan: SelectPlan,
+    ri: number,
+    outer: Row[],
+    baseEnv: EvalEnv,
+    meter: Meter,
+  ): Row[] {
+    const srf = plan.rels[ri]!.srf!;
+    const env: EvalEnv = { ...baseEnv, outer };
+    const mask = plan.relMasks[ri]!;
+    let srfRows: Row[];
+    switch (srf.kind) {
+      case "unnest":
+        return this.unnestRows(srf, env, meter, mask);
+      case "generate_series":
+        return this.generateSeriesRows(srf, env, meter, mask);
+      case "jsonb_array_elements":
+      case "jsonb_array_elements_text":
+      case "jsonb_object_keys":
+      case "json_object_keys":
+      case "jsonb_each":
+      case "jsonb_each_text":
+      case "json_array_elements":
+      case "json_array_elements_text":
+      case "json_each":
+      case "json_each_text":
+      case "json_record":
+      case "jsonb_path_query":
+        srfRows = this.jsonSrfRows(srf, env, meter);
+        break;
+      case "regexp_matches":
+      case "regexp_split_to_table":
+        srfRows = this.regexSrfRows(srf, env, meter);
+        break;
+      case "json_table":
+        srfRows = this.jsonTableRows(srf, env, meter);
+        break;
+      case "jed_tables":
+        srfRows = this.jedTablesRows(srf, meter);
+        break;
+      case "jed_columns":
+        srfRows = this.jedColumnsRows(srf, meter);
+        break;
+      case "jed_indexes":
+        srfRows = this.jedIndexesRows(srf, meter);
+        break;
+      case "jed_constraints":
+        srfRows = this.jedConstraintsRows(srf, meter);
+        break;
+      case "jed_statistics":
+        srfRows = this.jedStatisticsRows(srf, meter);
+        break;
+      case "jed_sequences":
+        srfRows = this.jedSequencesRows(srf, meter);
+        break;
+      case "jed_types":
+        srfRows = this.jedTypesRows(srf, meter);
+        break;
+      case "jed_type_fields":
+        srfRows = this.jedTypeFieldsRows(srf, meter);
+        break;
+      case "jed_views":
+        srfRows = this.jedViewsRows(srf, meter);
+        break;
+    }
+    for (const row of srfRows) meter.admitRowMasked(row, mask);
+    return srfRows;
+  }
+
+  // materializeCteRows delivers CTE reference ri's rows (a materializeRel arm).
+  private materializeCteRows(
+    plan: SelectPlan,
+    ri: number,
+    env: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Row[] {
+    const rel = plan.rels[ri]!;
+    const ci = rel.cte!;
+    if (env.ctes.modes[ci] === "materialize") {
+      return cteBufferRows(env.ctes.buffers[ci]!, plan.relMasks[ri]!, meter);
+    }
+    // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
+    // (writable-cte.md §3), so its buffer was filled above. A reference that planned the body
+    // itself runs that plan (planner.md §3.4).
+    let body: QueryPlan;
+    if (rel.derived !== undefined) {
+      body = rel.derived;
+    } else {
+      const src = env.ctes.bindings[ci]!.source;
+      if (src.kind !== "query") {
+        throw new Error("a data-modifying CTE is always materialized, never inlined");
+      }
+      body = src.plan;
+    }
+    // The body runs in the frame of the WITH node that declared it (cte.md §7) — not this
+    // reference site's, which may sit deeper.
+    const r = this.execQueryPlan(body, env.ctes.outers[ci]!, params, env.ctes);
+    meter.charge(r.cost);
+    // The body's charged result becomes this relation's rows (memory.md §5.2), re-measured under
+    // the relation's touched mask.
+    rebaseRowsMasked(meter, r.rows, plan.relMasks[ri]!);
+    return r.rows;
+  }
+
+  // materializeBaseRows scans base table ri's rows (a materializeRel arm).
+  private materializeBaseRows(
     plan: SelectPlan,
     ri: number,
     outer: Row[],
@@ -19504,121 +19831,8 @@ export class Engine {
     meter: Meter,
   ): Row[] {
     const rel = plan.rels[ri]!;
-    // A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
-    // run, and nothing is charged.
-    if (whereContradiction(plan)) return [];
     const env: EvalEnv = { ...baseEnv, outer };
-    // Every relation row is a query-memory row buffer entry under the relation's touched mask
-    // (memory.md §3/§5.1). The two unbounded generators admit as they produce; the remaining producers
-    // are bounded by an existing input value or the catalog and admit their output.
     const mask = plan.relMasks[ri]!;
-    // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
-    // charging generated_row per element (its args read outer — implicitly lateral, §44).
-    if (rel.srf !== undefined) {
-      let srfRows: Row[];
-      switch (rel.srf.kind) {
-        case "unnest":
-          return this.unnestRows(rel.srf, env, meter, mask);
-        case "generate_series":
-          return this.generateSeriesRows(rel.srf, env, meter, mask);
-        case "jsonb_array_elements":
-        case "jsonb_array_elements_text":
-        case "jsonb_object_keys":
-        case "json_object_keys":
-        case "jsonb_each":
-        case "jsonb_each_text":
-        case "json_array_elements":
-        case "json_array_elements_text":
-        case "json_each":
-        case "json_each_text":
-        case "json_record":
-        case "jsonb_path_query":
-          srfRows = this.jsonSrfRows(rel.srf, env, meter);
-          break;
-        case "regexp_matches":
-        case "regexp_split_to_table":
-          srfRows = this.regexSrfRows(rel.srf, env, meter);
-          break;
-        case "json_table":
-          srfRows = this.jsonTableRows(rel.srf, env, meter);
-          break;
-        case "jed_tables":
-          srfRows = this.jedTablesRows(rel.srf, meter);
-          break;
-        case "jed_columns":
-          srfRows = this.jedColumnsRows(rel.srf, meter);
-          break;
-        case "jed_indexes":
-          srfRows = this.jedIndexesRows(rel.srf, meter);
-          break;
-        case "jed_constraints":
-          srfRows = this.jedConstraintsRows(rel.srf, meter);
-          break;
-        case "jed_statistics":
-          srfRows = this.jedStatisticsRows(rel.srf, meter);
-          break;
-        case "jed_sequences":
-          srfRows = this.jedSequencesRows(rel.srf, meter);
-          break;
-        case "jed_types":
-          srfRows = this.jedTypesRows(rel.srf, meter);
-          break;
-        case "jed_type_fields":
-          srfRows = this.jedTypeFieldsRows(rel.srf, meter);
-          break;
-        case "jed_views":
-          srfRows = this.jedViewsRows(rel.srf, meter);
-          break;
-      }
-      for (const row of srfRows) meter.admitRowMasked(row, mask);
-      return srfRows;
-    }
-    // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
-    // CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts 54P01); an INLINE
-    // CTE runs its body in place. (A CTE is never lateral.)
-    if (rel.cte !== undefined) {
-      const ci = rel.cte;
-      if (env.ctes.modes[ci] === "materialize") {
-        const buf = env.ctes.buffers[ci]!;
-        for (let i = 0; i < buf.length; i++) {
-          meter.guard();
-          meter.charge(COSTS.cteScanRow);
-        }
-        // The reference copies the CTE buffer into its own relation rows.
-        for (const row of buf) meter.admitRowMasked(row, mask);
-        return buf.slice();
-      }
-      // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
-      // (writable-cte.md §3), so its buffer was filled above. A reference that planned the body
-      // itself runs that plan (planner.md §3.4).
-      let body: QueryPlan;
-      if (rel.derived !== undefined) {
-        body = rel.derived;
-      } else {
-        const src = env.ctes.bindings[ci]!.source;
-        if (src.kind !== "query") {
-          throw new Error("a data-modifying CTE is always materialized, never inlined");
-        }
-        body = src.plan;
-      }
-      // The body runs in the frame of the WITH node that declared it (cte.md §7) — not this
-      // reference site's, which may sit deeper.
-      const r = this.execQueryPlan(body, env.ctes.outers[ci]!, params, env.ctes);
-      meter.charge(r.cost);
-      // The body's charged result becomes this relation's rows (memory.md §5.2), re-measured under
-      // the relation's touched mask.
-      rebaseRowsMasked(meter, r.rows, mask);
-      return r.rows;
-    }
-    // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
-    // cte_scan_row. Non-lateral it was planned against the enclosing scope and reads this query's
-    // outer as its own; a LATERAL body (§44) reads the left-hand row from outer.
-    if (rel.derived !== undefined) {
-      const r = this.execQueryPlan(rel.derived, outer, params, env.ctes);
-      meter.charge(r.cost);
-      rebaseRowsMasked(meter, r.rows, mask);
-      return r.rows;
-    }
     // A base table: scan in primary-key order via a scanSource (the page_read block + per-row
     // storage_row_read accrue inside the generator — cost.md §3). A PK/index bound seeks/ranges
     // instead of a full walk; an empty bound reads nothing.
@@ -21100,6 +21314,45 @@ export class Engine {
     // A WHERE contradiction (planner.md §3.1) skips every scan lane: the eager pipeline below runs
     // over an empty FROM (materializeRel reads nothing), so aggregates still see their empty input.
     const fast = !whereContradiction(plan);
+    const streamed = this.execSelectFast(plan, env, meter, params, fast);
+    if (streamed !== null) return streamed;
+
+    // Materialize each relation once, in primary-key order (base tables drain a scanSource — the
+    // page_read block + per-row storage_row_read accrue inside the generator, cost.md §3). The nested
+    // loop re-reads from these in-memory buffers, which are not stores and charge nothing. A
+    // CORRELATED LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up
+    // front — an empty placeholder holds its slot and the join loop re-materializes it per left row.
+    // An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row (its
+    // bound seeks per outer row), so it is not materialized up front either — an empty placeholder
+    // holds its slot and the join loop re-materializes it per left row.
+    const memMask = memoryMask(plan, meter);
+    const materialized: Row[][] = [];
+    const relWork = new Array<bigint>(plan.rels.length).fill(0n);
+    for (let ri = 0; ri < plan.rels.length; ri++) {
+      const rel = plan.rels[ri]!;
+      if (rel.lateral === true || plan.phys.relINLBounds[ri] !== null) {
+        materialized.push([]);
+        continue;
+      }
+      const before = meter.accrued;
+      materialized.push(this.materializeRel(plan, ri, env.outer, [], env, params, meter));
+      relWork[ri] = meter.accrued - before;
+    }
+    // The join and everything after it run in a frame of their own: materializing a derived
+    // relation recurses into its body's execSelectEmit, so this frame stays small
+    // (spec/design/cost.md §7.1).
+    return this.execSelectJoined(plan, env, meter, params, fast, memMask, materialized, relWork);
+  }
+
+  // execSelectFast runs a SELECT through the first fast path that takes it, or returns null for the
+  // eager pipeline (execSelectEmit's first half, kept out of its frame — spec/design/cost.md §7.1).
+  private execSelectFast(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    fast: boolean,
+  ): Emitter | null {
     // The packed whole-table fold already has one finite accumulator and no retained input.
     // Keep that fast path when its touched-column gate proves it will not gather rows.
     if (
@@ -21213,29 +21466,21 @@ export class Engine {
       const em = this.projectColumnar(plan, env, meter, params);
       if (em !== null) return em;
     }
+    return null;
+  }
 
-    // Materialize each relation once, in primary-key order (base tables drain a scanSource — the
-    // page_read block + per-row storage_row_read accrue inside the generator, cost.md §3). The nested
-    // loop re-reads from these in-memory buffers, which are not stores and charge nothing. A
-    // CORRELATED LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up
-    // front — an empty placeholder holds its slot and the join loop re-materializes it per left row.
-    // An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row (its
-    // bound seeks per outer row), so it is not materialized up front either — an empty placeholder
-    // holds its slot and the join loop re-materializes it per left row.
-    const memMask = memoryMask(plan, meter);
-    const materialized: Row[][] = [];
-    const relWork = new Array<bigint>(plan.rels.length).fill(0n);
-    for (let ri = 0; ri < plan.rels.length; ri++) {
-      const rel = plan.rels[ri]!;
-      if (rel.lateral === true || plan.phys.relINLBounds[ri] !== null) {
-        materialized.push([]);
-        continue;
-      }
-      const before = meter.accrued;
-      materialized.push(this.materializeRel(plan, ri, env.outer, [], env, params, meter));
-      relWork[ri] = meter.accrued - before;
-    }
-
+  // execSelectJoined joins execSelectEmit's materialized relations and runs the rest of the eager
+  // pipeline over them.
+  private execSelectJoined(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    fast: boolean,
+    memMask: boolean[],
+    materialized: Row[][],
+    relWork: bigint[],
+  ): Emitter {
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
     // so far (starting with the first table's rows). For each join, concatenate every running
     // row with every right-table row; CROSS keeps all pairs, INNER keeps a pair iff its ON
