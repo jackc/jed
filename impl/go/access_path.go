@@ -981,18 +981,19 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 }
 
 // asArrayPointSpec reports whether e is `key = ANY(array)` whose array elements are points of the
-// key (cost.md §3 "OR / IN-list"): ANY (not ALL) equality on the bare key column, an element type
-// exactly the key's type, the key's own collation (as asBoundTerm), and an array that is constant for
-// the whole scan.
+// key (cost.md §3 "OR / IN-list"): ANY (not ALL) equality on the bare key column, the key's own
+// collation (as asBoundTerm), and an array that is constant for the whole scan. The element type is
+// exactly the key's type, or a promoted type whose values convert exactly to the key (elemPromoted);
+// a promoted array must be readable as a value, since its elements convert through pointValue.
 func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string) (intervalSpec, bool) {
-	if e.kind != reQuantified || e.op != opEq || e.quantAll || e.rowWise || !e.elemExact || !isColumn(e.lhs, keyIdx) {
+	if e.kind != reQuantified || e.op != opEq || e.quantAll || e.rowWise || !(e.elemExact || e.elemPromoted) || !isColumn(e.lhs, keyIdx) {
 		return intervalSpec{}, false
 	}
 	cmpColl := ""
 	if e.collation != nil {
 		cmpColl = e.collation.Name
 	}
-	if cmpColl != colColl || !isArrayPointSource(e.rhs, keyType) {
+	if cmpColl != colColl || !isArrayPointSource(e.rhs, keyType, e.elemExact) {
 		return intervalSpec{}, false
 	}
 	return intervalSpec{array: e.rhs}, true
@@ -1000,13 +1001,14 @@ func asArrayPointSpec(e *rExpr, keyIdx int, keyType scalarType, colColl string) 
 
 // isArrayPointSource reports whether an `= ANY` array operand is constant for the whole scan and
 // readable without evaluation: a bind parameter, a folded array constant, a NULL, a correlated
-// outer column, or a one-dimensional ARRAY[...] whose every element is a constant key source.
-func isArrayPointSource(e *rExpr, keyType scalarType) bool {
+// outer column, or — for an exact element type only — a one-dimensional ARRAY[...] whose every
+// element is a constant key source.
+func isArrayPointSource(e *rExpr, keyType scalarType, exact bool) bool {
 	switch e.kind {
 	case reParam, reConstArray, reConstNull, reOuterColumn:
 		return true
 	case reArray:
-		if e.nested {
+		if e.nested || !exact {
 			return false
 		}
 		for _, elem := range e.sargs {
@@ -1019,9 +1021,42 @@ func isArrayPointSource(e *rExpr, keyType scalarType) bool {
 	return false
 }
 
+// pointPromotable reports whether `key = ANY(elem[])` over a key of type key and elements of a
+// different type elem still reads as key points (cost.md §3 "OR / IN-list"): every element value
+// either converts exactly to the key's type or equals no key value. That holds for integers of
+// different widths and for an integer against a decimal in either direction.
+func pointPromotable(key, elem scalarType) bool {
+	return (key.IsInteger() || key.IsDecimal()) && (elem.IsInteger() || elem.IsDecimal()) &&
+		!(key.IsDecimal() && elem.IsDecimal())
+}
+
+// pointValue converts an element value of a `key = ANY(array)` to the key's type (cost.md §3 "OR /
+// IN-list"). ok=false means no key value can equal the element — an integer outside the key's width,
+// a decimal with a fractional part or outside i64 — so it contributes no point. A NULL, and a value
+// already of the key's type, pass through unchanged.
+func pointValue(keyType scalarType, v Value) (Value, bool) {
+	switch {
+	case v.Kind == ValNull:
+		return v, true
+	case keyType.IsInteger() && v.Kind == ValInt:
+		return v, keyType.InRange(v.Int)
+	case keyType.IsInteger() && v.Kind == ValDecimal:
+		d := *v.decimal()
+		n, ok := d.ToInt64Round()
+		if !ok || decimalFromInt64(n).CmpValue(d) != 0 || !keyType.InRange(n) {
+			return Value{}, false
+		}
+		return IntValue(n), true
+	case keyType.IsDecimal() && v.Kind == ValInt:
+		return DecimalValue(decimalFromInt64(v.Int)), true
+	}
+	return v, true
+}
+
 // arrayPointKeys encodes an array spec's elements as key points, in element order: a NULL array,
-// a NULL element, and an element no key can equal (an out-of-range integer, an unmapped collated
-// text) contribute no point, exactly as the equivalent IN-list's disjuncts would.
+// a NULL element, and an element no key can equal (an out-of-range integer, a non-integral decimal
+// against an integer key, an unmapped collated text) contribute no point, exactly as the equivalent
+// IN-list's disjuncts would.
 func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []storedRow, coll *Collation) [][]byte {
 	var keys [][]byte
 	if src.kind == reArray {
@@ -1045,7 +1080,11 @@ func arrayPointKeys(keyType scalarType, src *rExpr, params []Value, outer []stor
 		return nil
 	}
 	for _, elem := range v.arrayVal().Elements {
-		if key, isNull, ok := encodeValueKey(keyType, elem, coll); ok && !isNull {
+		point, ok := pointValue(keyType, elem)
+		if !ok {
+			continue
+		}
+		if key, isNull, ok := encodeValueKey(keyType, point, coll); ok && !isNull {
 			keys = append(keys, key)
 		}
 	}

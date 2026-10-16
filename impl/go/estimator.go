@@ -821,8 +821,9 @@ func estimatorArrayElements(array *rExpr) []*rExpr {
 }
 
 // estimatorIntervalSpecs expands each `key = ANY(array)` disjunct into one equality disjunct per
-// estimator element, in order, so an array set estimates as the IN-list of its elements.
-func estimatorIntervalSpecs(specs []intervalSpec) []intervalSpec {
+// estimator element, in order and converted to the key's type (estimatorPointElement), so an array
+// set estimates as the IN-list of its points.
+func estimatorIntervalSpecs(specs []intervalSpec, keyType scalarType) []intervalSpec {
 	out := specs[:0:0]
 	for _, spec := range specs {
 		if spec.array == nil {
@@ -830,10 +831,32 @@ func estimatorIntervalSpecs(specs []intervalSpec) []intervalSpec {
 			continue
 		}
 		for _, elem := range estimatorArrayElements(spec.array) {
-			out = append(out, intervalSpec{terms: []boundTerm{{op: opEq, src: elem}}})
+			out = append(out, intervalSpec{terms: []boundTerm{{op: opEq, src: estimatorPointElement(keyType, elem)}}})
 		}
 	}
 	return out
+}
+
+// estimatorPointElement converts a known estimator element of a `key = ANY(array)` to the key's
+// type exactly as execution converts it (pointValue, estimator.md §7): an element no key value can
+// equal becomes a NULL literal, contributing zero rows. An element of unknown value is unchanged.
+func estimatorPointElement(keyType scalarType, elem *rExpr) *rExpr {
+	c := estimatorValue(elem)
+	if c == nil || c.kind == reConstNull {
+		return elem
+	}
+	v, err := rExprConstToValue(c)
+	if err != nil {
+		return elem
+	}
+	point, ok := pointValue(keyType, v)
+	if !ok {
+		return &rExpr{kind: reConstNull}
+	}
+	if point.Kind == v.Kind {
+		return elem
+	}
+	return valueToRExpr(point)
 }
 
 // estimatorAnyArray reports whether e is a `x = ANY(array)` the estimator reads as a disjunction of
@@ -861,7 +884,7 @@ func estimatorAnyArray(e *rExpr) bool {
 
 func intervalSelectivity(specs []intervalSpec, clip []boundTerm, uniquePoints bool, keyType scalarType) selectivityExpr {
 	var parts []selectivityExpr
-	for _, spec := range estimatorIntervalSpecs(specs) {
+	for _, spec := range estimatorIntervalSpecs(specs, keyType) {
 		var s selectivityExpr
 		if uniquePoints && len(spec.terms) > 0 {
 			allEqual := true
@@ -896,7 +919,7 @@ func tupleMemberCount(m *tupleMember) int64 {
 		return 1
 	}
 	count := int64(0)
-	for _, spec := range estimatorIntervalSpecs(m.specs) {
+	for _, spec := range estimatorIntervalSpecs(m.specs, m.colType) {
 		if rangeTermsSelectivity(spec.terms, m.colType).kind != selectivityZero {
 			count++
 		}
@@ -1092,7 +1115,7 @@ func (db *engine) intervalSelectivityWithStatistics(
 	rel scopeRel,
 ) selectivityExpr {
 	var parts []selectivityExpr
-	for _, spec := range estimatorIntervalSpecs(specs) {
+	for _, spec := range estimatorIntervalSpecs(specs, keyType) {
 		structural := rangeTermsSelectivity(spec.terms, keyType)
 		term := structural
 		allEqual := len(spec.terms) > 0

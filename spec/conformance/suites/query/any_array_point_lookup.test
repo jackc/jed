@@ -1,9 +1,10 @@
 # `key = ANY(array)` → point lookups (spec/design/cost.md §3 "OR / IN-list"). `x = ANY(a)` is the
 # array spelling of IN (array-functions.md §11), and the usual way a host binds a list: `id =
 # ANY($1)`. When the key is a single-column PK or a leading B-tree index column, the array's element
-# type is exactly the key's type, and the array is constant for the scan, the ANY is one disjunct of
-# the canonical interval set: at execution each non-NULL element becomes a point, and the points are
-# sorted, de-duplicated, clipped, and merged exactly as an IN-list's are. The whole WHERE stays the
+# type is the key's type (or an integer/decimal type whose elements convert exactly to it), and the
+# array is constant for the scan, the ANY is one disjunct of the canonical interval set: at execution
+# each non-NULL element becomes a point, and the points are sorted, de-duplicated, clipped, and
+# merged exactly as an IN-list's are. The whole WHERE stays the
 # residual filter, so the rows are unchanged and only the cost drops.
 #
 # The metered cost is the sum of the per-probe bounded scans, as for an IN-list: `t` is six rows in
@@ -13,7 +14,7 @@
 # the costs are jed-owned, so the `# cost:` lines are the cross-core pin. The plans are pinned by
 # EXPLAIN in any_array_point_lookup_explain.test.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, query.subquery_scalar, query.subquery_correlated, query.aggregates, func.array_quantified, func.array, types.array, types.array_multidim, cast.array, types.i32, types.i64, types.text, null.three_valued, resource.cost_metering
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, query.subquery_scalar, query.subquery_correlated, query.aggregates, func.array_quantified, func.array, types.array, types.array_multidim, cast.array, types.i16, types.i32, types.i64, types.decimal, types.text, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32)
@@ -182,11 +183,85 @@ CREATE TABLE big (id i64 PRIMARY KEY, a i32)
 statement ok
 INSERT INTO big VALUES (1, 10), (2, 20), (3, 30)
 
+# A promoted element type still yields points once each element converts to the key's type: an
+# i32[] against an i64 key probes {1,3} exactly as '{1,3}'::i64[] would.
+# cost: 11
 query I rowsort
 SELECT a FROM big WHERE id = ANY('{1,3}'::i32[])
 ----
 10
 30
+
+# An ARRAY[...] of explicitly typed elements is promoted but not readable as a value, so it does not
+# bound: full scan.
+# cost: 23
+query I rowsort
+SELECT a FROM big WHERE id = ANY(ARRAY[1::i32, 3::i32])
+----
+10
+30
+
+statement ok
+CREATE TABLE sm (id i16 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO sm VALUES (1, 10), (2, 20), (3, 30)
+
+# A narrower key: an element outside i16 equals no key and contributes no point.
+# cost: 12
+query I rowsort
+SELECT a FROM sm WHERE id = ANY('{3,70000,1}'::i32[])
+----
+10
+30
+
+# Every element out of range: nothing to probe, nothing read.
+# cost: 0
+query I rowsort
+SELECT a FROM sm WHERE id = ANY('{70000,-70000}'::i32[])
+----
+
+# A decimal element against an integer key is a point when it is integral (2.0 is the key 2); a
+# fractional element, or one beyond i64, equals no key.
+# cost: 11
+query I rowsort
+SELECT a FROM sm WHERE id = ANY('{2.0,2.5,3,99999999999999999999}'::decimal[])
+----
+20
+30
+
+statement ok
+CREATE TABLE dk (id decimal PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO dk VALUES (1.0, 10), (2.5, 20), (3, 30), (4.00, 40)
+
+# An integer element against a decimal key is the equal decimal: 1 finds the stored 1.0 and 4 the
+# stored 4.00, since a decimal key encodes the value, not its display scale.
+# cost: 12
+query I rowsort
+SELECT a FROM dk WHERE id = ANY('{4,1,2}'::i32[])
+----
+10
+40
+
+# A correlated i32[] bounds an i64 key per outer row.
+statement ok
+CREATE TABLE ob (k i32 PRIMARY KEY, ids i32[])
+
+statement ok
+INSERT INTO ob VALUES (1, '{1,3}'), (2, '{2,99}'), (3, NULL)
+
+# cost: 30
+query II rowsort
+SELECT k, (SELECT count(*) FROM big WHERE big.id = ANY(ob.ids)) FROM ob
+----
+1
+2
+2
+1
+3
+0
 
 statement ok
 CREATE TABLE w (name text PRIMARY KEY, n i32)

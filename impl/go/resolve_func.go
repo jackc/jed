@@ -2098,7 +2098,8 @@ func resolveQuantified(s *scope, q *quantifiedExpr, ag *aggCtx, params *paramTyp
 	}
 	lc, ec := ctxOf(lt), ctxOf(*at.elem)
 	elemExact := lc != nil && ec != nil && *lc == *ec
-	return &rExpr{kind: reQuantified, op: q.Op, quantAll: q.All, lhs: rl, rhs: ra, collation: coll, elemExact: elemExact}, resolvedType{kind: rtBool}, nil
+	elemPromoted := !elemExact && lc != nil && ec != nil && pointPromotable(*lc, *ec)
+	return &rExpr{kind: reQuantified, op: q.Op, quantAll: q.All, lhs: rl, rhs: ra, collation: coll, elemExact: elemExact, elemPromoted: elemPromoted}, resolvedType{kind: rtBool}, nil
 }
 
 // resolveQuantifiedSubquery resolves `lhs op ANY/ALL ( SELECT … )` (array-functions.md §11.6) — the

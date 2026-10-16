@@ -196,8 +196,11 @@ indexed non-key column (`Index interval set: using <index>`).
 `key = ANY(array)` is the array spelling of the same list, and it takes the same path: each element
 of the array becomes one point in the interval set. That is what makes a bound list — `WHERE id =
 ANY($1)` — a set of key lookups rather than a full scan. The array must be constant for the query (a
-parameter, a literal or cast array, or an `ARRAY[...]` of constants), and its element type must be
-exactly the key's type. EXPLAIN counts it as one of the set's intervals and marks it `arrays=1`,
+parameter, a literal or cast array, an outer query's column, or an `ARRAY[...]` of constants). Its
+element type is usually the key's type, but an integer array also works against an integer key of
+another width or a `decimal` key, and a `decimal` array against an integer key: each element is
+converted to the key's type, and one no key can equal (out of range, or with a fractional part) is
+skipped. EXPLAIN counts it as one of the set's intervals and marks it `arrays=1`,
 since its point count is known only when the query runs. The estimate reads the array's elements,
 so a bound list is planned with the values each execution binds.
 

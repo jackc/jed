@@ -776,7 +776,7 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 		}
 		return statisticsSelectivity(rows, current.rows), true
 	}
-	if estimatorAnyArray(expr) && expr.elemExact {
+	if estimatorAnyArray(expr) && (expr.elemExact || expr.elemPromoted) {
 		return db.statisticsAnyArraySelectivity(expr, rel)
 	}
 	column, op, literal, ok := statisticsComparison(expr, rel)
@@ -800,7 +800,8 @@ func (db *engine) statisticsLeafSelectivity(expr *rExpr, rel scopeRel) (selectiv
 // statisticsAnyArraySelectivity estimates `column = ANY(array)` from column statistics
 // (statistics.md §6): the IN-list rule over the array's estimator elements — each distinct non-NULL
 // element by statistics key adds its equality rows, a NULL element adds none, and an element of
-// unknown value adds the NDV average.
+// unknown value adds the NDV average. A promoted element type converts each known element to the
+// column's type first, so an element no value can equal adds none.
 func (db *engine) statisticsAnyArraySelectivity(expr *rExpr, rel scopeRel) (selectivityExpr, bool) {
 	column, ok := statisticsColumn(expr.lhs, rel)
 	if !ok {
@@ -811,7 +812,11 @@ func (db *engine) statisticsAnyArraySelectivity(expr *rExpr, rel scopeRel) (sele
 		return selectivityExpr{}, false
 	}
 	seen, rows := make(map[string]bool), int64(0)
+	keyType := rel.table.Columns[column].Type.Scalar
 	for _, elem := range estimatorArrayElements(expr.rhs) {
+		if expr.elemPromoted {
+			elem = estimatorPointElement(keyType, elem)
+		}
 		if estimatorIsNull(elem) {
 			continue
 		}

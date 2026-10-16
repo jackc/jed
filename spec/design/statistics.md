@@ -311,10 +311,12 @@ fallback remains authoritative.
 - `<>`, NOT, and NOT IN complements subtract from `current_nonnull`, not `N`, preserving SQL 3VL.
 - `IN`: de-duplicate known literals canonically, fold equality estimates in authored order, and cap
   at `current_nonnull`. A known NULL contributes no TRUE rows.
-- `col = ANY(array)` with an element type exactly the column's: the `IN` rule over the array's
-  estimator elements ([estimator.md §7](estimator.md)) — each distinct known element by statistics
-  key adds its equality rows, a NULL element adds none, an element of unknown value adds the
-  unbound-parameter equality rows, capped at `current_nonnull`.
+- `col = ANY(array)` with an element type exactly the column's, or a promoted integer/decimal one
+  ([cost.md §3](cost.md) "OR / IN-list"): the `IN` rule over the array's estimator elements
+  ([estimator.md §7](estimator.md)) — each distinct known element by statistics key adds its
+  equality rows, a NULL element adds none, an element of unknown value adds the unbound-parameter
+  equality rows, capped at `current_nonnull`. A promoted element is converted to the column's type
+  first; one no column value can equal adds none.
 - Inequality: add scaled MCV rows satisfying the operator. For histogram residual mass, find the
   lower-bound (`<`) or upper-bound (`<=`) insertion ordinal among the stored bounds and scale by
   `ordinal / (bound_count - 1)`, capped to residual mass. `>`/`>=` are the non-NULL complements.

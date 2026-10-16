@@ -907,12 +907,14 @@ pub(crate) fn statistics_leaf_selectivity(
     if let RExpr::Quantified {
         lhs,
         array,
-        elem_exact: true,
+        elem_exact,
+        elem_promoted,
         ..
     } = expr
+        && (*elem_exact || *elem_promoted)
         && estimator_any_array(expr)
     {
-        return statistics_any_array_selectivity(lhs, array, rel, catalog);
+        return statistics_any_array_selectivity(lhs, array, *elem_promoted, rel, catalog);
     }
     let (column, op, literal) = statistics_comparison(expr, rel)?;
     let current = current_column_statistics(rel, column, catalog)?;
@@ -925,10 +927,13 @@ pub(crate) fn statistics_leaf_selectivity(
 
 /// Estimate `column = ANY(array)` from column statistics (statistics.md §6): the IN-list rule over
 /// the array's estimator elements — each distinct non-NULL element by statistics key adds its
-/// equality rows, a NULL element adds none, and an element of unknown value adds the NDV average.
+/// equality rows, a NULL element adds none, and an element of unknown value adds the NDV average. A
+/// promoted element type converts each known element to the column's type first, so an element no
+/// value can equal adds none.
 fn statistics_any_array_selectivity(
     lhs: &RExpr,
     array: &RExpr,
+    promoted: bool,
     rel: &ScopeRel<'_>,
     catalog: &Engine,
 ) -> Option<crate::estimator::Selectivity> {
@@ -937,7 +942,12 @@ fn statistics_any_array_selectivity(
     let current = current_column_statistics(rel, column, catalog)?;
     let mut seen = HashSet::new();
     let mut rows = 0i64;
+    let key_type = rel.table.columns[column].ty.as_scalar();
     for elem in estimator_array_elements(array) {
+        let elem = match key_type {
+            Some(key_type) if promoted => estimator_point_element(key_type, elem),
+            _ => elem,
+        };
         if estimator_is_null(&elem) {
             continue;
         }

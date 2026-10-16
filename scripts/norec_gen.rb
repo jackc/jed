@@ -59,7 +59,8 @@
 #   any_array — `key = ANY(array)` over a PK or leading index column lowers to one point per element
 #              (cost.md §3 "OR / IN-list"); `key + 0 = ANY(array)` full-scans. Constructor, cast, and
 #              multidimensional arrays, NULL/duplicate/absent elements, an empty array, an OR
-#              disjunct, a range clip, and a mutation end state must all agree.
+#              disjunct, a range clip, promoted element types (an out-of-range i64, a fractional
+#              decimal, integers against a decimal key), and a mutation end state must all agree.
 #   composite_key_set — IN / OR / `= ANY` sets on a composite PK's members lower to a tuple
 #              interval set (cost.md §3 "Composite primary keys"): the cartesian product of the
 #              point members' keys, with a final range member mapped under each prefix. Spelling
@@ -363,7 +364,8 @@ ANY_ARRAY_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.inse
                    dml.update query.select query.where_eq query.comparison_order query.order_by
                    query.logical_connectives query.point_lookup query.or_in_point_lookup
                    query.interval_set query.any_array_point_lookup func.array_quantified types.array
-                   types.array_multidim cast.array expr.arithmetic types.i32 null.three_valued].freeze
+                   types.array_multidim cast.array expr.arithmetic types.i32 types.i64 types.decimal
+                   null.three_valued].freeze
 COMPOSITE_KEY_SET_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                            dml.insert_multi_row dml.update query.select query.where_eq
                            query.comparison_order query.order_by query.logical_connectives
@@ -1572,6 +1574,10 @@ def gen_any_array(seed)
   pair.call("multidimensional array", "id", "'{{#{pick[0]},#{pick[1]}},{#{pick[2]},#{absent}}}'::i32[]",
             by_id.call(pick.first(3)))
   pair.call("empty array", "id", "'{}'::i32[]", [])
+  pair.call("promoted i64 elements, one beyond i32", "id", "'{#{pick[0]},#{pick[1]},3000000000}'::i64[]",
+            by_id.call(pick.first(2)))
+  pair.call("promoted decimal elements, one fractional", "id",
+            "'{#{pick[0]}.0,#{pick[1]}.5,#{pick[2]}}'::decimal[]", by_id.call([pick[0], pick[2]]))
 
   other = (ids - pick).sample(random: rng)
   out << "# an ANY disjunct beside a same-key equality"
@@ -1579,6 +1585,15 @@ def gen_any_array(seed)
     by_id.call([pick[0], pick[1], other]))
   q(out, "II", "SELECT id, w FROM t WHERE id + 0 = ANY(ARRAY[#{pick[0]}, #{pick[1]}]) OR id + 0 = #{other} ORDER BY id",
     by_id.call([pick[0], pick[1], other]))
+
+  # A decimal key holds each id at a varying display scale; integer elements are points of it.
+  scaled = ->(id) { id % 3 == 0 ? id.to_s : "#{id}.#{'0' * (id % 3)}" }
+  stmt(out, "CREATE TABLE td (id decimal PRIMARY KEY, w i32)")
+  stmt(out, "INSERT INTO td VALUES #{rows.map { |id, _v, w| "(#{scaled.call(id)}, #{w})" }.join(', ')}")
+  out << "# integer elements against a decimal key"
+  td_exp = rows.select { |id, _v, _w| pick.first(2).include?(id) }.flat_map { |id, _v, w| [scaled.call(id), w.to_s] }
+  q(out, "DI", "SELECT id, w FROM td WHERE id = ANY('{#{pick[0]},#{pick[1]},#{absent}}'::i32[]) ORDER BY id", td_exp)
+  q(out, "DI", "SELECT id, w FROM td WHERE id + 0 = ANY('{#{pick[0]},#{pick[1]},#{absent}}'::i32[]) ORDER BY id", td_exp)
 
   cut = pick.sort[1]
   pair.call("a range clip", "id", "ARRAY[#{pick.join(', ')}]", by_id.call(pick.select { |id| id > cut }), " AND KEY > #{cut}")
