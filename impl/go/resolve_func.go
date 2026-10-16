@@ -912,37 +912,36 @@ func resolveArrayFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	}
 	slots := desc.ArgFamilies
 
-	rargs := make([]*rExpr, len(fc.Args))
-	tys := make([]resolvedType, len(fc.Args))
+	firsts := make([]firstPass, len(fc.Args))
 	for i := range fc.Args {
-		r, t, err := resolve(s, *fc.Args[i], nil, ag, params)
+		f, err := resolveFirst(s, *fc.Args[i], ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		rargs[i] = r
-		tys[i] = t
+		firsts[i] = f
 	}
 	// Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar. The hint
 	// is the element type of the first anyarray argument.
 	var hint *scalarType
 	for j, slot := range slots {
-		if isArraySlot(slot) && tys[j].kind == rtArray {
-			if s, ok := elemScalarHint(*tys[j].elem); ok {
+		if isArraySlot(slot) && firsts[j].ty.kind == rtArray {
+			if s, ok := elemScalarHint(*firsts[j].ty.elem); ok {
 				hint = &s
 			}
 			break
 		}
 	}
-	if hint != nil {
-		for j, slot := range slots {
-			if isArraySlot(slot) || isElementSlot(slot) {
-				r, t, err := resolve(s, *fc.Args[j], hint, ag, params)
-				if err != nil {
-					return nil, resolvedType{}, err
-				}
-				rargs[j] = r
-				tys[j] = t
+	rargs := make([]*rExpr, len(fc.Args))
+	tys := make([]resolvedType, len(fc.Args))
+	for j := range fc.Args {
+		if hint != nil && (isArraySlot(slots[j]) || isElementSlot(slots[j])) {
+			r, t, err := reResolve(s, *fc.Args[j], hint, firsts[j], ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
 			}
+			rargs[j], tys[j] = r, t
+		} else {
+			rargs[j], tys[j] = firsts[j].node, firsts[j].ty
 		}
 	}
 	elem, matched := matchPoly(slots, tys)
@@ -1426,6 +1425,25 @@ func adoptArrayParam(s *scope, e exprNode, node *rExpr, ty resolvedType, other r
 	return n, t, true, nil
 }
 
+// adoptArrayParamFirst is adoptArrayParam over a first pass: an adopted parameter becomes an opaque
+// first pass (final — a second pass leaves it alone).
+func adoptArrayParamFirst(s *scope, e exprNode, f firstPass, other resolvedType, params *paramTypes) (firstPass, bool, error) {
+	n, t, adopted, err := adoptArrayParam(s, e, f.node, f.ty, other, params)
+	if err != nil || !adopted {
+		return f, false, err
+	}
+	return opaqueFirst(n, t), true, nil
+}
+
+// adoptArrayOrRangeParamFirst is adoptArrayOrRangeParam over a first pass (adoptArrayParamFirst).
+func adoptArrayOrRangeParamFirst(s *scope, e exprNode, f firstPass, other resolvedType, params *paramTypes) (firstPass, bool, error) {
+	n, t, adopted, err := adoptArrayOrRangeParam(s, e, f.node, f.ty, other, params)
+	if err != nil || !adopted {
+		return f, false, err
+	}
+	return opaqueFirst(n, t), true, nil
+}
+
 // adoptArrayOrRangeParam is adoptArrayParam over an array or a range context.
 func adoptArrayOrRangeParam(s *scope, e exprNode, node *rExpr, ty resolvedType, other resolvedType, params *paramTypes) (*rExpr, resolvedType, bool, error) {
 	if other.kind != rtArray && other.kind != rtRange {
@@ -1444,26 +1462,27 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 			"operator does not exist: the || operands are not an array and a compatible element/array")
 	}
 	// Pass 1: resolve both operands with no hint.
-	rl, lt, err := resolve(s, lhs, nil, ag, params)
+	fl, err := resolveFirst(s, lhs, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	rr, rt, err := resolve(s, rhs, nil, ag, params)
+	fr, err := resolveFirst(s, rhs, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
 	// A bare parameter beside an array takes the array's type (array || array, api.md §5); an element
 	// needs a cast, as in PostgreSQL.
 	adoptedL, adoptedR := false, false
-	if lt.kind == rtArray {
-		if rr, rt, adoptedR, err = adoptArrayParam(s, rhs, rr, rt, lt, params); err != nil {
+	if fl.ty.kind == rtArray {
+		if fr, adoptedR, err = adoptArrayParamFirst(s, rhs, fr, fl.ty, params); err != nil {
 			return nil, resolvedType{}, err
 		}
-	} else if rt.kind == rtArray {
-		if rl, lt, adoptedL, err = adoptArrayParam(s, lhs, rl, lt, rt, params); err != nil {
+	} else if fr.ty.kind == rtArray {
+		if fl, adoptedL, err = adoptArrayParamFirst(s, lhs, fl, fr.ty, params); err != nil {
 			return nil, resolvedType{}, err
 		}
 	}
+	lt, rt := fl.ty, fr.ty
 	// A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
 	// takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
 	// `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
@@ -1471,18 +1490,18 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	anyTypedText := typedText(lt, lhs) || typedText(rt, rhs)
 	// JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
 	if (lt.kind == rtJsonb || rt.kind == rtJsonb) && !anyTypedText {
-		return resolveJSONbConcat(s, lhs, rhs, ag, params)
+		return resolveJSONbConcat(s, lhs, rhs, fl, fr, ag, params)
 	}
 	// BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
 	// (string-functions.md §4). A bytea[] operand stays on the array overloads below.
 	if (lt.kind == rtBytea || rt.kind == rtBytea) && lt.kind != rtArray && rt.kind != rtArray && !anyTypedText {
-		return resolveByteaConcat(s, lhs, rhs, ag, params)
+		return resolveByteaConcat(s, lhs, rhs, fl, fr, ag, params)
 	}
 	// TEXT axis: with no array operand, `||` is text concatenation when either operand is text, a bare
 	// string literal, or an untyped NULL / parameter (string-functions.md §5). The other operand renders
 	// through its text output (PG's anynonarray || text). Neither text-like (`1 || 2`) is 42883.
 	if lt.kind != rtArray && rt.kind != rtArray {
-		return resolveTextConcat(s, lhs, rhs, rl, lt, rr, rt, ag, params)
+		return resolveTextConcat(s, lhs, rhs, fl, fr, ag, params)
 	}
 	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
 	var hint *scalarType
@@ -1498,14 +1517,15 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	// Pass 2: re-resolve the NON-NULL operands with the hint so a bare literal element / untyped
 	// ARRAY[…] adapts. A bare NULL (pass-1 kind rtNull) is skipped — it must stay untyped so the
 	// cat-first overload order matches PG (see the doc comment).
+	rl, rr := fl.node, fr.node
 	if hint != nil {
 		if lt.kind != rtNull && !adoptedL {
-			if rl, lt, err = resolve(s, lhs, hint, ag, params); err != nil {
+			if rl, lt, err = reResolve(s, lhs, hint, fl, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}
 		if rt.kind != rtNull && !adoptedR {
-			if rr, rt, err = resolve(s, rhs, hint, ag, params); err != nil {
+			if rr, rt, err = reResolve(s, rhs, hint, fr, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}
@@ -1588,36 +1608,37 @@ func setOpArrayFunc(op binaryOp) (arrayFunc, bool) {
 // 42P18). The operators are strict (a NULL whole-array operand → NULL).
 func resolveSetOp(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// Pass 1: resolve both operands with no hint.
-	rl, lt, err := resolve(s, lhs, nil, ag, params)
+	fl, err := resolveFirst(s, lhs, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	rr, rt, err := resolve(s, rhs, nil, ag, params)
+	fr, err := resolveFirst(s, rhs, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
 	// A bare parameter facing an array or range takes its type (api.md §5): `tags @> $1` binds an
 	// array, `during && $1` a range. A range's element needs a cast (`during @> $1::i32`).
 	adoptedL, adoptedR := false, false
-	if rr, rt, adoptedR, err = adoptArrayOrRangeParam(s, rhs, rr, rt, lt, params); err != nil {
+	if fr, adoptedR, err = adoptArrayOrRangeParamFirst(s, rhs, fr, fl.ty, params); err != nil {
 		return nil, resolvedType{}, err
 	}
 	if !adoptedR {
-		if rl, lt, adoptedL, err = adoptArrayOrRangeParam(s, lhs, rl, lt, rt, params); err != nil {
+		if fl, adoptedL, err = adoptArrayOrRangeParamFirst(s, lhs, fl, fr.ty, params); err != nil {
 			return nil, resolvedType{}, err
 		}
 	}
+	lt, rt := fl.ty, fr.ty
 	// RANGE axis if either operand is a range. (The five positional operators are range-only; on a
 	// non-range pair they fall through to the array branch below, which rejects them as 42883.)
 	if lt.kind == rtRange || rt.kind == rtRange {
-		return resolveRangeOp(s, op, lhs, rhs, rl, lt, rr, rt, ag, params)
+		return resolveRangeOp(s, op, lhs, rhs, fl, fr, ag, params)
 	}
 
 	// JSONB axis: only @>/<@ have a jsonb overload (json-sql-functions.md §1, J5). A jsonb operand
 	// (or a string literal adapting to one) routes here; `&&`/the positional operators have no jsonb
 	// overload and fall through to the array branch (42883). A json operand has no @> opclass (42883).
 	if (op == opContains || op == opContainedBy) && (lt.kind == rtJsonb || rt.kind == rtJsonb) {
-		return resolveJSONbContains(s, op, lhs, rhs, ag, params)
+		return resolveJSONbContains(s, op, lhs, rhs, fl, fr, ag, params)
 	}
 
 	// ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
@@ -1638,14 +1659,15 @@ func resolveSetOp(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *
 	}
 	// Pass 2: re-resolve the NON-NULL operands with the hint so a bare ARRAY[…] adapts. A bare NULL
 	// (pass-1 kind rtNull) is left untyped — it defers in the anyarray slot, result is boolean anyway.
+	rl, rr := fl.node, fr.node
 	if hint != nil {
 		if lt.kind != rtNull && !adoptedL {
-			if rl, lt, err = resolve(s, lhs, hint, ag, params); err != nil {
+			if rl, lt, err = reResolve(s, lhs, hint, fl, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}
 		if rt.kind != rtNull && !adoptedR {
-			if rr, rt, err = resolve(s, rhs, hint, ag, params); err != nil {
+			if rr, rt, err = reResolve(s, rhs, hint, fr, ag, params); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}
@@ -1707,7 +1729,8 @@ func rangeOpFor(op binaryOp) rangeOp {
 // the bare element overloads `range @> element` and `element <@ range` re-resolve the element operand
 // with the range's element type as the hint and type-check assignability. A bare untyped NULL on one
 // side is treated as a NULL range (the range×range overload; eval yields NULL). Anything else is 42883.
-func resolveRangeOp(s *scope, op binaryOp, lhs, rhs exprNode, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveRangeOp(s *scope, op binaryOp, lhs, rhs exprNode, fl, fr firstPass, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	rl, lt, rr, rt := fl.node, fl.ty, fr.node, fr.ty
 	switch {
 	// range × range (or a bare NULL on one side, taken as a NULL range): the elements must match.
 	case lt.kind == rtRange && rt.kind == rtRange:
@@ -1730,7 +1753,7 @@ func resolveRangeOp(s *scope, op binaryOp, lhs, rhs exprNode, rl *rExpr, lt reso
 	// right operand with the range's element as the hint, then check it is assignable.
 	case lt.kind == rtRange && op == opContains:
 		elem, _ := resolvedRangeElementScalar(lt.elem)
-		reNode, reTy, err := resolve(s, rhs, &elem, ag, params)
+		reNode, reTy, err := reResolve(s, rhs, &elem, fr, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1742,7 +1765,7 @@ func resolveRangeOp(s *scope, op binaryOp, lhs, rhs exprNode, rl *rExpr, lt reso
 	// `element <@ range` — the element overload of `<@`.
 	case rt.kind == rtRange && op == opContainedBy:
 		elem, _ := resolvedRangeElementScalar(rt.elem)
-		leNode, leTy, err := resolve(s, lhs, &elem, ag, params)
+		leNode, leTy, err := reResolve(s, lhs, &elem, fl, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -1820,10 +1843,11 @@ func resolveScalarArrayOperands(s *scope, lhs, array exprNode, ag *aggCtx, param
 	if err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err
 	}
-	ra, at, err := resolve(s, array, nil, ag, params)
+	fa, err := resolveFirst(s, array, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, nil, resolvedType{}, err
 	}
+	ra, at := fa.node, fa.ty
 	// A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)` binds
 	// a list of ids.
 	if array.Kind == exprParam {
@@ -1842,7 +1866,7 @@ func resolveScalarArrayOperands(s *scope, lhs, array exprNode, ag *aggCtx, param
 	// column / cast operand (it ignores the hint).
 	if !isAdaptableOperand(lhs) {
 		if h := ctxOf(lt); h != nil {
-			if ra, at, err = resolve(s, array, h, ag, params); err != nil {
+			if ra, at, err = reResolve(s, array, h, fa, ag, params); err != nil {
 				return nil, resolvedType{}, nil, resolvedType{}, err
 			}
 		}
@@ -2125,11 +2149,11 @@ func objectKeyNull() error {
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to `reJsonContains` with the operands swapped
 // (`a <@ b` is `b @> a`). The result is boolean; the operator is strict (a NULL operand → SQL NULL).
-func resolveJSONbContains(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONbContains(s *scope, op binaryOp, lhs, rhs exprNode, fl, fr firstPass, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	jsonbHint := scalarJsonb
 	// Resolve each operand with a jsonb context, so a bare `'{"a":1}'` string literal adapts.
-	resolveJSONb := func(e exprNode) (*rExpr, error) {
-		r, t, err := resolve(s, e, &jsonbHint, ag, params)
+	resolveJSONb := func(e exprNode, first firstPass) (*rExpr, error) {
+		r, t, err := reResolve(s, e, &jsonbHint, first, ag, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2141,11 +2165,11 @@ func resolveJSONbContains(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, 
 				fmt.Sprintf("operator does not exist: %s %s jsonb", rtName(t), binaryOpSymbol(op)))
 		}
 	}
-	rl, err := resolveJSONb(lhs)
+	rl, err := resolveJSONb(lhs, fl)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	rr, err := resolveJSONb(rhs)
+	rr, err := resolveJSONb(rhs, fr)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -2230,10 +2254,10 @@ func hasKeySymbol(kind hasKeyKind) string {
 
 // resolveJSONbConcat resolves a jsonb `||` concatenation/merge (json-sql-functions.md §1, J6). Both
 // operands must be jsonb (a string literal adapts via `jsonbIn`). Result jsonb; strict.
-func resolveJSONbConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveJSONbConcat(s *scope, lhs, rhs exprNode, fl, fr firstPass, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	jsonbHint := scalarJsonb
-	resolveJSONb := func(e exprNode) (*rExpr, error) {
-		r, t, err := resolve(s, e, &jsonbHint, ag, params)
+	resolveJSONb := func(e exprNode, first firstPass) (*rExpr, error) {
+		r, t, err := reResolve(s, e, &jsonbHint, first, ag, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2245,11 +2269,11 @@ func resolveJSONbConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTy
 				fmt.Sprintf("operator does not exist: %s || jsonb", rtName(t)))
 		}
 	}
-	a, err := resolveJSONb(lhs)
+	a, err := resolveJSONb(lhs, fl)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	b, err := resolveJSONb(rhs)
+	b, err := resolveJSONb(rhs, fr)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -2259,13 +2283,13 @@ func resolveJSONbConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTy
 // resolveByteaConcat resolves `bytea || bytea` (string-functions.md §4): each operand is re-resolved
 // with a bytea hint, so a bare string literal decodes as bytea input and an untyped NULL stays NULL
 // (the strict kernel then yields NULL). Any other operand type is 42883.
-func resolveByteaConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+func resolveByteaConcat(s *scope, lhs, rhs exprNode, fl, fr firstPass, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	byteaHint := scalarBytea
-	a, at, err := resolve(s, lhs, &byteaHint, ag, params)
+	a, at, err := reResolve(s, lhs, &byteaHint, fl, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	b, bt, err := resolve(s, rhs, &byteaHint, ag, params)
+	b, bt, err := reResolve(s, rhs, &byteaHint, fr, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -2279,32 +2303,30 @@ func resolveByteaConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTy
 }
 
 // resolveTextConcat resolves `text || text` and PG's `text || anynonarray` / `anynonarray || text`
-// (string-functions.md §5). rl/lt and rr/rt are the operands' hint-free resolutions. At least one
+// (string-functions.md §5). fl/fr are the operands' hint-free resolutions. At least one
 // operand must be text-like: text, a bare string literal, or an untyped NULL / parameter (re-resolved
 // with a text hint, so a parameter is declared text). The other non-text operand converts through the
 // explicit text cast (castToText), so a timestamptz operand makes the expression STABLE and a
 // composite or range operand is 0A000. Neither operand text-like is 42883.
-func resolveTextConcat(s *scope, lhs, rhs exprNode, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType,
-	ag *aggCtx, params *paramTypes,
-) (*rExpr, resolvedType, error) {
+func resolveTextConcat(s *scope, lhs, rhs exprNode, fl, fr firstPass, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	textLike := func(t resolvedType) bool { return t.kind == rtText || t.kind == rtNull }
-	if !textLike(lt) && !textLike(rt) {
+	if !textLike(fl.ty) && !textLike(fr.ty) {
 		return nil, resolvedType{}, newError(UndefinedFunction,
-			fmt.Sprintf("operator does not exist: %s || %s", rtName(lt), rtName(rt)))
+			fmt.Sprintf("operator does not exist: %s || %s", rtName(fl.ty), rtName(fr.ty)))
 	}
 	textHint := scalarText
-	operand := func(e exprNode, r *rExpr, t resolvedType) (*rExpr, error) {
-		if t.kind == rtNull {
-			r, _, err := resolve(s, e, &textHint, ag, params)
+	operand := func(e exprNode, first firstPass) (*rExpr, error) {
+		if first.ty.kind == rtNull {
+			r, _, err := reResolve(s, e, &textHint, first, ag, params)
 			return r, err
 		}
-		return castToText(r, t, scalarText, nil, params)
+		return castToText(first.node, first.ty, scalarText, nil, params)
 	}
-	a, err := operand(lhs, rl, lt)
+	a, err := operand(lhs, fl)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	b, err := operand(rhs, rr, rt)
+	b, err := operand(rhs, fr)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}

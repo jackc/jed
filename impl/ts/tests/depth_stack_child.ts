@@ -39,6 +39,14 @@ export const SHAPES: Shape[] = [
         .fill("v")
         .join(" + ")} FROM t`,
   ),
+  // The two-pass operand resolvers (cost.md §7): the `-` jsonb peek, `||`, the polymorphic array
+  // functions, containment, and `= ANY(ARRAY[…])`.
+  s("minus chain", (n) => `SELECT ${Array(n + 1).fill("v").join(" - ")} FROM t`),
+  s("array concat chain", (n) => `SELECT ${Array(n + 1).fill("ARRAY[v]").join(" || ")} FROM t`),
+  s("jsonb concat chain", (n) => `SELECT ${Array(n + 1).fill("'{}'::jsonb").join(" || ")} FROM t`),
+  s("array function", (n) => `SELECT ${nest("array_append(", "ARRAY[v]", ", 1)", n)} FROM t`),
+  s("containment", (n) => `SELECT ${nest("ARRAY[true] @> ARRAY[", "true", "]", n)} FROM t`),
+  s("= ANY", (n) => `SELECT ${nest("true = ANY(ARRAY[", "true", "])", n)} FROM t`),
   s(
     "AND chain",
     (n) =>

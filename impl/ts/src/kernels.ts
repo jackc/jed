@@ -194,15 +194,25 @@ export function resolveOperandPair(
     l =
       adoptContainerParam(scope, lhs, r.type, params) ??
       resolve(scope, lhs, ctxOf(r.type), ag, params);
-  } else if (rhsLit) {
-    l = resolve(scope, lhs, null, ag, params);
-    r =
-      adoptContainerParam(scope, rhs, l.type, params) ??
-      resolve(scope, rhs, ctxOf(l.type), ag, params);
   } else {
-    l = resolve(scope, lhs, null, ag, params);
-    r = resolve(scope, rhs, null, ag, params);
+    return resolveOperandPairWithLhs(scope, resolve(scope, lhs, null, ag, params), rhs, ag, params);
   }
+  return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
+}
+
+// resolveOperandPairWithLhs is resolveOperandPair for a non-adaptable LHS already resolved (with no
+// hint) to l.
+export function resolveOperandPairWithLhs(
+  scope: Scope,
+  l: { node: RExpr; type: ResolvedType },
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
+  const r = isAdaptableOperand(rhs)
+    ? (adoptContainerParam(scope, rhs, l.type, params) ??
+      resolve(scope, rhs, ctxOf(l.type), ag, params))
+    : resolve(scope, rhs, null, ag, params);
   return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
 }
 

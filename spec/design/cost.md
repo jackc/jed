@@ -1795,9 +1795,24 @@ counter resets per statement (a fresh parser per `parse_sql`). Surfacing follows
 idiom like every other engine error (Rust `Result`, Go `error`, TS `throw`), aborting at the
 same logical depth.
 
+**Resolution work stays linear in the depth.** The limit bounds the tree, not the work done on
+it: resolve and planning are unmetered, so a walk that visits a subtree more than once per level
+would cost `2^depth` within the limit, which `max_cost` cannot stop. Two-pass operand
+resolution is where this arises. `-` peeks at its left operand's type (a jsonb left operand is the
+delete operator); `||`, the containment and range operators, `x = ANY(ARRAY[…])`, and the
+polymorphic array functions resolve an operand with no hint, then again with the element type its
+sibling fixed. Each core keeps the first resolution and, in the second, resolves again only what
+the hint can change: an integer, decimal, or string literal or a bind parameter, reached through
+`ARRAY[…]` items, `COLLATE`, and unary minus. Every other node resolves its children with hints of
+its own, so its first resolution is reused unchanged (the same node, type, errors, and parameter
+types; a repeated parameter inference is an idempotent join). An aggregate in such an operand is
+therefore collected once (`sum(c) - 1` evaluates one `sum`).
+
 **Conformance.** [../conformance/suites/resource/depth_limit.test](../conformance/suites/resource/depth_limit.test)
 pins both directions cross-core (a just-under-limit statement runs; an over-limit one is
-`statement error 54001`), gated by the `resource.depth_limit` capability. Because the trigger
+`statement error 54001`), gated by the `resource.depth_limit` capability.
+[../conformance/suites/resource/operand_resolution.test](../conformance/suites/resource/operand_resolution.test)
+nests each two-pass operator up to ~200 levels deep; the exponential form would not finish. Because the trigger
 is jed-specific (not PG's runtime probe), it is **not** oracle-checked.
 
 **Composite-chain follow-on — ✅ landed (§7b).** One recursion vector is *not* bounded by the

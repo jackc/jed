@@ -113,10 +113,18 @@ fn resolve_arith(
     // right operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a
     // jsonb LHS with `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ *
     // / %` over a jsonb operand fall through and 42804 in the numeric path.)
+    //
+    // A non-adaptable LHS resolves with no hint either way, so the peek's resolution is the
+    // operand pair's: resolving it a second time would double the work at every level of a
+    // `a - b - c …` chain (cost.md §7). An adaptable LHS (a literal / `$N`) is a leaf.
+    let mut peeked = None;
     if matches!(op, BinaryOp::Sub) {
         let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
         if matches!(lt, ResolvedType::Jsonb) {
             return resolve_jsonb_delete(scope, false, lhs, rhs, rl, agg, params);
+        }
+        if !is_adaptable_operand(lhs) {
+            peeked = Some((rl, lt));
         }
     }
     // Arithmetic is overloaded across integer and decimal. Resolve the operand pair
@@ -124,7 +132,10 @@ fn resolve_arith(
     // integer → integer arithmetic (promotion tower); at least one decimal → decimal
     // arithmetic (the integer operand widens at eval); a text/boolean operand is a
     // 42804 (spec/design/decimal.md §4).
-    let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+    let (rl, lt, rr, rt) = match peeked {
+        Some(l) => resolve_operand_pair_with_lhs(scope, l, rhs, agg, params)?,
+        None => resolve_operand_pair(scope, lhs, rhs, agg, params)?,
+    };
     // The rest of the arm runs in its own frame, off the recursive path (cost.md §7.1).
     outline(|| {
         // Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-`
@@ -537,29 +548,30 @@ pub(crate) fn resolve_set_op(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     // Pass 1: resolve both operands with no hint.
-    let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
-    let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    let mut fl = resolve_first(scope, lhs, agg, params)?;
+    let mut fr = resolve_first(scope, rhs, agg, params)?;
     // A bare parameter facing an array or range takes its type (api.md §5): `tags @> $1` binds an
     // array, `during && $1` a range. A range's element needs a cast (`during @> $1::i32`).
     let array_or_range =
         |t: &ResolvedType| matches!(t, ResolvedType::Array(_) | ResolvedType::Range(_));
     let (mut adopted_l, mut adopted_r) = (false, false);
-    if array_or_range(&lt) {
-        if let Some(adopted) = adopt_container_param(scope, rhs, &lt, params)? {
-            (rr, rt) = adopted;
+    if array_or_range(&fl.ty) {
+        if let Some(adopted) = adopt_container_param(scope, rhs, &fl.ty, params)? {
+            fr = FirstPass::opaque(adopted);
             adopted_r = true;
         }
     }
-    if !adopted_r && array_or_range(&rt) {
-        if let Some(adopted) = adopt_container_param(scope, lhs, &rt, params)? {
-            (rl, lt) = adopted;
+    if !adopted_r && array_or_range(&fr.ty) {
+        if let Some(adopted) = adopt_container_param(scope, lhs, &fr.ty, params)? {
+            fl = FirstPass::opaque(adopted);
             adopted_l = true;
         }
     }
+    let (lt, rt) = (fl.ty.clone(), fr.ty.clone());
     // RANGE axis if either operand is a range. (The five positional operators are range-only; on a
     // non-range pair they fall through to the array branch below, which rejects them as 42883.)
     if matches!(lt, ResolvedType::Range(_)) || matches!(rt, ResolvedType::Range(_)) {
-        return resolve_range_op(scope, op, lhs, rhs, rl, lt, rr, rt, agg, params);
+        return resolve_range_op(scope, op, lhs, rhs, fl, fr, agg, params);
     }
 
     // JSONB axis: only @>/<@ have a jsonb overload (json-sql-functions.md §1, J5). A jsonb operand
@@ -568,7 +580,7 @@ pub(crate) fn resolve_set_op(
     if (matches!(op, BinaryOp::Contains | BinaryOp::ContainedBy))
         && (matches!(lt, ResolvedType::Jsonb) || matches!(rt, ResolvedType::Jsonb))
     {
-        return resolve_jsonb_contains(scope, op, lhs, rhs, agg, params);
+        return resolve_jsonb_contains(scope, op, lhs, rhs, fl, fr, agg, params);
     }
 
     // ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
@@ -588,14 +600,18 @@ pub(crate) fn resolve_set_op(
     };
     // Pass 2: re-resolve the NON-NULL operands with the hint. A bare NULL (pass-1 type `Null`) is
     // left untyped — it defers in the anyarray slot and the boolean result is unaffected.
-    if let Some(s) = hint {
-        if !matches!(lt, ResolvedType::Null) && !adopted_l {
-            (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
+    let (rl, lt) = match hint {
+        Some(s) if !matches!(lt, ResolvedType::Null) && !adopted_l => {
+            re_resolve(scope, lhs, Some(s), fl, agg, params)?
         }
-        if !matches!(rt, ResolvedType::Null) && !adopted_r {
-            (rr, rt) = resolve(scope, rhs, Some(s), agg, params)?;
+        _ => fl.into_pair(),
+    };
+    let (rr, rt) = match hint {
+        Some(s) if !matches!(rt, ResolvedType::Null) && !adopted_r => {
+            re_resolve(scope, rhs, Some(s), fr, agg, params)?
         }
-    }
+        _ => fr.into_pair(),
+    };
 
     // Both slots are `anyarray`: the element types must unify (a non-array / mismatch is 42883).
     let tys = [lt, rt];
@@ -620,32 +636,36 @@ pub(crate) fn resolve_set_op(
 /// must be `jsonb` (a bare string literal adapts via `jsonb_in`); a `json` operand has no @>
 /// operator class (42883). `<@` resolves to `JsonContains` with the operands swapped (`a <@ b` is
 /// `b @> a`). The result is boolean; the operator is strict (a NULL operand yields SQL NULL).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_jsonb_contains(
     scope: &Scope,
     op: BinaryOp,
     lhs: &Expr,
     rhs: &Expr,
+    fl: FirstPass,
+    fr: FirstPass,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     // Resolve each operand with a jsonb context, so a bare `'{"a":1}'` string literal adapts.
-    let resolve_jsonb = |e: &Expr, agg: &mut AggCtx, params: &mut ParamTypes| -> Result<RExpr> {
-        let (r, t) = resolve(scope, e, Some(ScalarType::Jsonb), agg, params)?;
-        match t {
-            ResolvedType::Jsonb | ResolvedType::Null => Ok(r),
-            _ => Err(EngineError::new(
-                SqlState::UndefinedFunction,
-                format!(
-                    "operator does not exist: {} {} {}",
-                    t.type_name(),
-                    binary_op_symbol(op),
-                    "jsonb"
-                ),
-            )),
-        }
-    };
-    let rl = resolve_jsonb(lhs, agg, params)?;
-    let rr = resolve_jsonb(rhs, agg, params)?;
+    let resolve_jsonb =
+        |e: &Expr, first, agg: &mut AggCtx, params: &mut ParamTypes| -> Result<RExpr> {
+            let (r, t) = re_resolve(scope, e, Some(ScalarType::Jsonb), first, agg, params)?;
+            match t {
+                ResolvedType::Jsonb | ResolvedType::Null => Ok(r),
+                _ => Err(EngineError::new(
+                    SqlState::UndefinedFunction,
+                    format!(
+                        "operator does not exist: {} {} {}",
+                        t.type_name(),
+                        binary_op_symbol(op),
+                        "jsonb"
+                    ),
+                )),
+            }
+        };
+    let rl = resolve_jsonb(lhs, fl, agg, params)?;
+    let rr = resolve_jsonb(rhs, fr, agg, params)?;
     // `a @> b` keeps the order; `a <@ b` is `b @> a`.
     let (a, b) = match op {
         BinaryOp::Contains => (rl, rr),
@@ -749,21 +769,24 @@ pub(crate) fn resolve_jsonb_concat(
     scope: &Scope,
     lhs: &Expr,
     rhs: &Expr,
+    fl: FirstPass,
+    fr: FirstPass,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    let resolve_jsonb = |e: &Expr, agg: &mut AggCtx, params: &mut ParamTypes| -> Result<RExpr> {
-        let (r, t) = resolve(scope, e, Some(ScalarType::Jsonb), agg, params)?;
-        match t {
-            ResolvedType::Jsonb | ResolvedType::Null => Ok(r),
-            _ => Err(EngineError::new(
-                SqlState::UndefinedFunction,
-                format!("operator does not exist: {} || jsonb", t.type_name()),
-            )),
-        }
-    };
-    let a = resolve_jsonb(lhs, agg, params)?;
-    let b = resolve_jsonb(rhs, agg, params)?;
+    let resolve_jsonb =
+        |e: &Expr, first, agg: &mut AggCtx, params: &mut ParamTypes| -> Result<RExpr> {
+            let (r, t) = re_resolve(scope, e, Some(ScalarType::Jsonb), first, agg, params)?;
+            match t {
+                ResolvedType::Jsonb | ResolvedType::Null => Ok(r),
+                _ => Err(EngineError::new(
+                    SqlState::UndefinedFunction,
+                    format!("operator does not exist: {} || jsonb", t.type_name()),
+                )),
+            }
+        };
+    let a = resolve_jsonb(lhs, fl, agg, params)?;
+    let b = resolve_jsonb(rhs, fr, agg, params)?;
     Ok((
         RExpr::JsonConcat {
             a: Box::new(a),
@@ -780,11 +803,13 @@ pub(crate) fn resolve_bytea_concat(
     scope: &Scope,
     lhs: &Expr,
     rhs: &Expr,
+    fl: FirstPass,
+    fr: FirstPass,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    let (a, at) = resolve(scope, lhs, Some(ScalarType::Bytea), agg, params)?;
-    let (b, bt) = resolve(scope, rhs, Some(ScalarType::Bytea), agg, params)?;
+    let (a, at) = re_resolve(scope, lhs, Some(ScalarType::Bytea), fl, agg, params)?;
+    let (b, bt) = re_resolve(scope, rhs, Some(ScalarType::Bytea), fr, agg, params)?;
     let ok = |t: &ResolvedType| matches!(t, ResolvedType::Bytea | ResolvedType::Null);
     if !ok(&at) || !ok(&bt) {
         return Err(EngineError::new(
@@ -816,27 +841,27 @@ fn resolve_text_concat(
     scope: &Scope,
     lhs: &Expr,
     rhs: &Expr,
-    l: (RExpr, ResolvedType),
-    r: (RExpr, ResolvedType),
+    l: FirstPass,
+    r: FirstPass,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     let text_like = |t: &ResolvedType| matches!(t, ResolvedType::Text | ResolvedType::Null);
-    if !text_like(&l.1) && !text_like(&r.1) {
+    if !text_like(&l.ty) && !text_like(&r.ty) {
         return Err(EngineError::new(
             SqlState::UndefinedFunction,
             format!(
                 "operator does not exist: {} || {}",
-                l.1.type_name(),
-                r.1.type_name()
+                l.ty.type_name(),
+                r.ty.type_name()
             ),
         ));
     }
-    let mut operand = |e: &Expr, (node, t): (RExpr, ResolvedType)| -> Result<RExpr> {
-        if matches!(t, ResolvedType::Null) {
-            return Ok(resolve(scope, e, Some(ScalarType::Text), agg, params)?.0);
+    let mut operand = |e: &Expr, first: FirstPass| -> Result<RExpr> {
+        if matches!(first.ty, ResolvedType::Null) {
+            return Ok(re_resolve(scope, e, Some(ScalarType::Text), first, agg, params)?.0);
         }
-        cast_to_text(node, t, ScalarType::Text, None, params)
+        cast_to_text(first.node, first.ty, ScalarType::Text, None, params)
     };
     let a = operand(lhs, l)?;
     let b = operand(rhs, r)?;
@@ -1288,13 +1313,12 @@ pub(crate) fn resolve_range_op(
     op: BinaryOp,
     lhs: &Expr,
     rhs: &Expr,
-    rl: RExpr,
-    lt: ResolvedType,
-    rr: RExpr,
-    rt: ResolvedType,
+    fl: FirstPass,
+    fr: FirstPass,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
+    let (lt, rt) = (fl.ty.clone(), fr.ty.clone());
     match (&lt, &rt) {
         // range × range (or a bare NULL on one side, taken as a NULL range): the elements must match.
         (ResolvedType::Range(le), ResolvedType::Range(re)) => {
@@ -1305,7 +1329,7 @@ pub(crate) fn resolve_range_op(
             Ok((
                 RExpr::RangeOp {
                     op: range_op_for(op),
-                    args: vec![rl, rr],
+                    args: vec![fl.node, fr.node],
                     elem,
                 },
                 ResolvedType::Bool,
@@ -1316,7 +1340,7 @@ pub(crate) fn resolve_range_op(
             Ok((
                 RExpr::RangeOp {
                     op: range_op_for(op),
-                    args: vec![rl, rr],
+                    args: vec![fl.node, fr.node],
                     elem,
                 },
                 ResolvedType::Bool,
@@ -1327,7 +1351,7 @@ pub(crate) fn resolve_range_op(
             Ok((
                 RExpr::RangeOp {
                     op: range_op_for(op),
-                    args: vec![rl, rr],
+                    args: vec![fl.node, fr.node],
                     elem,
                 },
                 ResolvedType::Bool,
@@ -1337,14 +1361,14 @@ pub(crate) fn resolve_range_op(
         // the right operand with the range's element as the hint, then check it is assignable.
         (ResolvedType::Range(le), _) if op == BinaryOp::Contains => {
             let elem = resolved_range_element_scalar(le).expect("a range element is scalar");
-            let (re_node, re_ty) = resolve(scope, rhs, Some(elem), agg, params)?;
+            let (re_node, re_ty) = re_resolve(scope, rhs, Some(elem), fr, agg, params)?;
             if !range_bound_assignable(&re_ty, elem) {
                 return Err(no_set_op_overload());
             }
             Ok((
                 RExpr::RangeOp {
                     op: RangeOp::ContainsElem,
-                    args: vec![rl, re_node],
+                    args: vec![fl.node, re_node],
                     elem,
                 },
                 ResolvedType::Bool,
@@ -1353,14 +1377,14 @@ pub(crate) fn resolve_range_op(
         // `element <@ range` — the element overload of `<@`.
         (_, ResolvedType::Range(re)) if op == BinaryOp::ContainedBy => {
             let elem = resolved_range_element_scalar(re).expect("a range element is scalar");
-            let (le_node, le_ty) = resolve(scope, lhs, Some(elem), agg, params)?;
+            let (le_node, le_ty) = re_resolve(scope, lhs, Some(elem), fl, agg, params)?;
             if !range_bound_assignable(&le_ty, elem) {
                 return Err(no_set_op_overload());
             }
             Ok((
                 RExpr::RangeOp {
                     op: RangeOp::ElemContainedBy,
-                    args: vec![le_node, rr],
+                    args: vec![le_node, fr.node],
                     elem,
                 },
                 ResolvedType::Bool,
@@ -1431,7 +1455,7 @@ pub(crate) fn resolve_scalar_array_operands(
 ) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
     // Pass 1: resolve both operands with no hint.
     let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
-    let (mut ra, mut at) = resolve(scope, array, None, agg, params)?;
+    let fa = resolve_first(scope, array, agg, params)?;
     // A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)`
     // binds a list of ids.
     if let Expr::Param(n1) = array {
@@ -1451,11 +1475,12 @@ pub(crate) fn resolve_scalar_array_operands(
     // bare `ARRAY[…]` constructor, re-resolve the array with `x`'s type as the element hint so the
     // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
     // column / cast operand (it ignores the hint).
-    if !is_adaptable_operand(lhs) {
-        if let Some(s) = ctx_of(&lt) {
-            (ra, at) = resolve(scope, array, Some(s), agg, params)?;
+    let (ra, at) = match ctx_of(&lt) {
+        Some(s) if !is_adaptable_operand(lhs) => {
+            re_resolve(scope, array, Some(s), fa, agg, params)?
         }
-    }
+        _ => fa.into_pair(),
+    };
     // If the array resolved to `E[]` and `x` is an adaptable bare literal, adapt `x` to `E` (with a
     // range check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
     if let ResolvedType::Array(e) = &at {
@@ -1672,22 +1697,23 @@ pub(crate) fn resolve_concat(
     };
 
     // Pass 1: resolve both operands with no hint.
-    let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
-    let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    let mut fl = resolve_first(scope, lhs, agg, params)?;
+    let mut fr = resolve_first(scope, rhs, agg, params)?;
     // A bare parameter beside an array takes the array's type (array || array, api.md §5); an
     // element needs a cast, as in PostgreSQL.
     let (mut adopted_l, mut adopted_r) = (false, false);
-    if matches!(lt, ResolvedType::Array(_)) {
-        if let Some(adopted) = adopt_container_param(scope, rhs, &lt, params)? {
-            (rr, rt) = adopted;
+    if matches!(fl.ty, ResolvedType::Array(_)) {
+        if let Some(adopted) = adopt_container_param(scope, rhs, &fl.ty, params)? {
+            fr = FirstPass::opaque(adopted);
             adopted_r = true;
         }
-    } else if matches!(rt, ResolvedType::Array(_)) {
-        if let Some(adopted) = adopt_container_param(scope, lhs, &rt, params)? {
-            (rl, lt) = adopted;
+    } else if matches!(fr.ty, ResolvedType::Array(_)) {
+        if let Some(adopted) = adopt_container_param(scope, lhs, &fr.ty, params)? {
+            fl = FirstPass::opaque(adopted);
             adopted_l = true;
         }
     }
+    let (lt, rt) = (fl.ty.clone(), fr.ty.clone());
     // A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
     // takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
     // `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
@@ -1696,21 +1722,21 @@ pub(crate) fn resolve_concat(
     let any_typed_text = typed_text(&lt, lhs) || typed_text(&rt, rhs);
     // JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
     if (matches!(lt, ResolvedType::Jsonb) || matches!(rt, ResolvedType::Jsonb)) && !any_typed_text {
-        return resolve_jsonb_concat(scope, lhs, rhs, agg, params);
+        return resolve_jsonb_concat(scope, lhs, rhs, fl, fr, agg, params);
     }
     // BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
     // (string-functions.md §4). A bytea[] operand stays on the array overloads below.
     let is_bytea = |t: &ResolvedType| matches!(t, ResolvedType::Bytea);
     let is_array = |t: &ResolvedType| matches!(t, ResolvedType::Array(_));
     if (is_bytea(&lt) || is_bytea(&rt)) && !is_array(&lt) && !is_array(&rt) && !any_typed_text {
-        return resolve_bytea_concat(scope, lhs, rhs, agg, params);
+        return resolve_bytea_concat(scope, lhs, rhs, fl, fr, agg, params);
     }
     // TEXT axis: with no array operand, `||` is text concatenation when either operand is text, a
     // bare string literal, or an untyped NULL / parameter (string-functions.md §5). The other operand
     // renders through its text output (PG's anynonarray || text). Neither text-like (`1 || 2`) is
     // 42883.
     if !is_array(&lt) && !is_array(&rt) {
-        return resolve_text_concat(scope, lhs, rhs, (rl, lt), (rr, rt), agg, params);
+        return resolve_text_concat(scope, lhs, rhs, fl, fr, agg, params);
     }
     // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
     let hint = match (&lt, &rt) {
@@ -1721,14 +1747,18 @@ pub(crate) fn resolve_concat(
     // Pass 2: re-resolve the NON-NULL operands with the hint so a bare literal element / untyped
     // `ARRAY[…]` adapts to the array's element type. A bare NULL (pass-1 type `Null`) is skipped —
     // it must stay untyped so the cat-first overload order matches PG (see the doc comment).
-    if let Some(s) = hint {
-        if !matches!(lt, ResolvedType::Null) && !adopted_l {
-            (rl, lt) = resolve(scope, lhs, Some(s), agg, params)?;
+    let (mut rl, lt) = match hint {
+        Some(s) if !matches!(lt, ResolvedType::Null) && !adopted_l => {
+            re_resolve(scope, lhs, Some(s), fl, agg, params)?
         }
-        if !matches!(rt, ResolvedType::Null) && !adopted_r {
-            (rr, rt) = resolve(scope, rhs, Some(s), agg, params)?;
+        _ => fl.into_pair(),
+    };
+    let (mut rr, rt) = match hint {
+        Some(s) if !matches!(rt, ResolvedType::Null) && !adopted_r => {
+            re_resolve(scope, rhs, Some(s), fr, agg, params)?
         }
-    }
+        _ => fr.into_pair(),
+    };
 
     // Try the three concat overloads in catalog order; the first whose slots unify wins.
     let tys = [lt, rt];
@@ -1994,6 +2024,23 @@ pub(crate) fn resolve_operand_pair(
         resolve_adapted(scope, rhs, &lt, agg, params)?
     } else {
         resolve(scope, rhs, both_ctx, agg, params)?
+    };
+    Ok((rl, lt, rr, rt))
+}
+
+/// [`resolve_operand_pair`] for a non-adaptable LHS already resolved (with no hint) to `(rl, lt)`.
+#[inline(never)]
+pub(crate) fn resolve_operand_pair_with_lhs(
+    scope: &Scope,
+    (rl, lt): (RExpr, ResolvedType),
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
+    let (rr, rt) = if is_adaptable_operand(rhs) {
+        resolve_adapted(scope, rhs, &lt, agg, params)?
+    } else {
+        resolve(scope, rhs, None, agg, params)?
     };
     Ok((rl, lt, rr, rt))
 }

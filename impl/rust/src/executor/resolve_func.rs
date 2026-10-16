@@ -3928,6 +3928,302 @@ pub(crate) fn resolve(
     resolve_node(scope, e, ctx, agg, params).map_err(|err| locate_node_error(err, e))
 }
 
+/// An operand's first, hint-free resolution, kept so a second, hinted pass can reuse it
+/// ([`re_resolve`]). Two-pass operand resolution (`||`, the containment operators, the polymorphic
+/// array functions, …) resolves an operand once to learn its type, then again with the element type
+/// its sibling fixed. Resolving the whole operand twice would resolve every nested two-pass operand
+/// twice per level, so a nested chain would cost `2^depth` before any cost is metered (cost.md §7).
+pub(crate) struct FirstPass {
+    pub(crate) node: RExpr,
+    pub(crate) ty: ResolvedType,
+    /// The child results a hint passes through to, for an `ARRAY[…]`, `COLLATE`, or unary minus
+    /// whose children the hint can change; `Opaque` otherwise.
+    shape: Shape,
+}
+
+enum Shape {
+    Opaque,
+    /// An `ARRAY[…]` constructor: each item's type and shape (its node is the array's element).
+    Array(Vec<(ResolvedType, Shape)>),
+    /// A `COLLATE` (the node is the operand's) or unary minus: the operand's type and shape.
+    Wrap(ResolvedType, Box<Shape>),
+}
+
+impl FirstPass {
+    /// A first pass taken as final: a second pass resolves `e` afresh only if it is hint-sensitive.
+    pub(crate) fn opaque((node, ty): (RExpr, ResolvedType)) -> FirstPass {
+        FirstPass {
+            node,
+            ty,
+            shape: Shape::Opaque,
+        }
+    }
+
+    pub(crate) fn into_pair(self) -> (RExpr, ResolvedType) {
+        (self.node, self.ty)
+    }
+}
+
+/// Whether resolving `e` under a hint can differ from resolving it with none. The hint (`ctx`)
+/// reaches only an integer, decimal, or string literal and a bind parameter, through an `ARRAY[…]`,
+/// a `COLLATE`, or a unary minus. Every other node resolves its children with hints of its own, so
+/// its resolution is the same under any hint: the same node, type, errors, and parameter types
+/// (a repeated parameter inference is an idempotent join, `ParamTypes::note_col`).
+pub(crate) fn hint_sensitive(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Literal::Int(_) | Literal::Decimal(_) | Literal::Text(_), _)
+        | Expr::Param(_) => true,
+        Expr::Array(items) => items.iter().any(hint_sensitive),
+        Expr::Collate { inner, .. } => hint_sensitive(inner),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ..
+        } => hint_sensitive(operand),
+        _ => false,
+    }
+}
+
+/// Resolve `e` with no hint, as `resolve(scope, e, None, …)`, keeping what [`re_resolve`] needs.
+pub(crate) fn resolve_first(
+    scope: &Scope,
+    e: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<FirstPass> {
+    resolve_first_node(scope, e, agg, params).map_err(|err| locate_node_error(err, e))
+}
+
+fn resolve_first_node(
+    scope: &Scope,
+    e: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<FirstPass> {
+    // A node matching a GROUP BY expression resolves to its group slot under any hint.
+    if !hint_sensitive(e) || match_group_expr(agg, e).is_some() {
+        let (node, ty) = resolve_node(scope, e, None, agg, params)?;
+        return Ok(FirstPass {
+            node,
+            ty,
+            shape: Shape::Opaque,
+        });
+    }
+    match e {
+        Expr::Array(items) => {
+            let mut nodes = Vec::with_capacity(items.len());
+            let mut elem_types = Vec::with_capacity(items.len());
+            let mut shapes = Vec::with_capacity(items.len());
+            for it in items {
+                let first = resolve_first(scope, it, agg, params)?;
+                nodes.push(first.node);
+                elem_types.push(first.ty.clone());
+                shapes.push((first.ty, first.shape));
+            }
+            let (node, ty) = array_ctor_node(items, nodes, &elem_types)?;
+            Ok(FirstPass {
+                node,
+                ty,
+                shape: Shape::Array(shapes),
+            })
+        }
+        Expr::Collate { inner, collation } => {
+            let first = resolve_first(scope, inner, agg, params)?;
+            let (node, ty) = collate_node(scope, collation, (first.node, first.ty.clone()))?;
+            Ok(FirstPass {
+                node,
+                ty,
+                shape: Shape::Wrap(first.ty, Box::new(first.shape)),
+            })
+        }
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+            ..
+        } => {
+            let first = resolve_first(scope, operand, agg, params)?;
+            let (node, ty) = neg_node((first.node, first.ty.clone()))?;
+            Ok(FirstPass {
+                node,
+                ty,
+                shape: Shape::Wrap(first.ty, Box::new(first.shape)),
+            })
+        }
+        _ => {
+            let (node, ty) = resolve_node(scope, e, None, agg, params)?;
+            Ok(FirstPass {
+                node,
+                ty,
+                shape: Shape::Opaque,
+            })
+        }
+    }
+}
+
+/// Resolve `e` under the hint `ctx`, as `resolve(scope, e, ctx, …)`, given its [`resolve_first`]
+/// result. Only the literals and parameters the hint reaches are resolved again; every other
+/// subexpression keeps its first resolution, so each is resolved once however deeply two-pass
+/// operands nest.
+pub(crate) fn re_resolve(
+    scope: &Scope,
+    e: &Expr,
+    ctx: Option<ScalarType>,
+    first: FirstPass,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if !hint_sensitive(e) {
+        return Ok(first.into_pair());
+    }
+    re_resolve_node(scope, e, ctx, first, agg, params).map_err(|err| locate_node_error(err, e))
+}
+
+fn re_resolve_node(
+    scope: &Scope,
+    e: &Expr,
+    ctx: Option<ScalarType>,
+    first: FirstPass,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    match (e, first.shape, first.node) {
+        (Expr::Array(items), Shape::Array(shapes), RExpr::Array { elems, .. }) => {
+            let mut nodes = Vec::with_capacity(items.len());
+            let mut elem_types = Vec::with_capacity(items.len());
+            for ((it, node), (ty, shape)) in items.iter().zip(elems).zip(shapes) {
+                let (node, ty) =
+                    re_resolve(scope, it, ctx, FirstPass { node, ty, shape }, agg, params)?;
+                nodes.push(node);
+                elem_types.push(ty);
+            }
+            array_ctor_node(items, nodes, &elem_types)
+        }
+        (Expr::Collate { inner, collation }, Shape::Wrap(ty, shape), node) => {
+            let first = FirstPass {
+                node,
+                ty,
+                shape: *shape,
+            };
+            let inner = re_resolve(scope, inner, ctx, first, agg, params)?;
+            collate_node(scope, collation, inner)
+        }
+        (
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+                ..
+            },
+            Shape::Wrap(ty, shape),
+            RExpr::Neg { operand: node, .. },
+        ) => {
+            let first = FirstPass {
+                node: *node,
+                ty,
+                shape: *shape,
+            };
+            let operand = re_resolve(scope, operand, ctx, first, agg, params)?;
+            neg_node(operand)
+        }
+        // A literal, a parameter, or a node resolved whole the first time: resolve it afresh.
+        _ => resolve_node(scope, e, ctx, agg, params),
+    }
+}
+
+/// Build an `ARRAY[…]` constructor from its resolved items (spec/design/array.md §1). The item types
+/// unify; items that are themselves arrays make a **nested** (multidim-stacking) constructor whose
+/// result is the SAME array type (dimension-agnostic, spec/design/array.md §2/§4), otherwise it is a
+/// flat 1-D array of the unified element.
+fn array_ctor_node(
+    items: &[Expr],
+    nodes: Vec<RExpr>,
+    elem_types: &[ResolvedType],
+) -> Result<(RExpr, ResolvedType)> {
+    let common = unify_array_element_types(elem_types).map_err(|e| {
+        let exprs: Vec<&Expr> = items.iter().collect();
+        let pos = mismatch_location(elem_types, &exprs, |ts| {
+            unify_array_element_types(ts).is_ok()
+        });
+        e.with_position(pos.0)
+    })?;
+    let (nested, result_ty) = match common {
+        t @ ResolvedType::Array(_) => (true, t),
+        other => (false, ResolvedType::Array(Box::new(other))),
+    };
+    Ok((
+        RExpr::Array {
+            elems: nodes,
+            nested,
+        },
+        result_ty,
+    ))
+}
+
+/// `expr COLLATE "name"` over its resolved operand (spec/design/collation.md §1): the operand must be
+/// collatable (text / text[], 42804, PG-matching) and the named collation must exist ("C" or loaded,
+/// else 42704). The node is a runtime PASSTHROUGH — a collation only changes the ORDERING
+/// comparisons / ORDER BY, derived from the AST at those sites — so it returns the operand unchanged.
+fn collate_node(
+    scope: &Scope,
+    collation: &str,
+    (rinner, ty): (RExpr, ResolvedType),
+) -> Result<(RExpr, ResolvedType)> {
+    if !ty.collatable() && ty != ResolvedType::Null {
+        return Err(type_error(format!(
+            "collations are not supported by type {}",
+            ty.type_name()
+        )));
+    }
+    // Validate the name resolves (surfaces 42704 for an unknown collation); the value is
+    // recovered at the comparison/ORDER BY site, so it is discarded here.
+    resolve_collation_name(scope.catalog, collation)?;
+    Ok((rinner, ty))
+}
+
+/// Unary minus over its resolved operand: numeric (integer / decimal / float, keeping the width),
+/// interval (interval.md §5), or NULL (`-NULL = NULL`); anything else is 42804.
+fn neg_node((rop, ty): (RExpr, ResolvedType)) -> Result<(RExpr, ResolvedType)> {
+    let result = match ty {
+        ResolvedType::Int(t) => t,
+        ResolvedType::Decimal => ScalarType::Decimal,
+        // -float flips the sign bit (no overflow; a NaN/Inf operand passes through —
+        // spec/design/float.md §5). The result keeps the operand's width.
+        ResolvedType::Float(t) => t,
+        ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
+        ResolvedType::Interval => ScalarType::Interval, // -interval (interval.md §5)
+        ResolvedType::Bool
+        | ResolvedType::Text
+        | ResolvedType::Bytea
+        | ResolvedType::Uuid
+        | ResolvedType::Timestamp
+        | ResolvedType::Timestamptz
+        | ResolvedType::Date
+        | ResolvedType::Json
+        | ResolvedType::Jsonb
+        | ResolvedType::JsonPath
+        | ResolvedType::Composite(_)
+        | ResolvedType::Array(_)
+        | ResolvedType::Range(_) => {
+            return Err(type_error("unary minus requires a numeric operand"));
+        }
+    };
+    let rty = if result.is_decimal() {
+        ResolvedType::Decimal
+    } else if result.is_interval() {
+        ResolvedType::Interval
+    } else if result.is_float() {
+        ResolvedType::Float(result)
+    } else {
+        ResolvedType::Int(result)
+    };
+    Ok((
+        RExpr::Neg {
+            operand: Box::new(rop),
+            result,
+        },
+        rty,
+    ))
+}
+
 /// Decide the position of an error leaving node `e`'s resolution (spec/design/error-fields.md
 /// §10.2). A function call's `42883` / `42725` points at its name; an operator's `42883` / `42804`
 /// (no operator for these operand types) points at the operator and carries PostgreSQL's operator
@@ -4063,27 +4359,7 @@ fn resolve_node(
                 nodes.push(node);
                 elem_types.push(ty);
             }
-            // Unify the item types. If they are themselves arrays, this is a **nested** (multidim-
-            // stacking) constructor and the result type is the SAME array type (dimension-agnostic,
-            // spec/design/array.md §2/§4); otherwise it is a flat 1-D array of the unified element.
-            let common = unify_array_element_types(&elem_types).map_err(|e| {
-                let exprs: Vec<&Expr> = items.iter().collect();
-                let pos = mismatch_location(&elem_types, &exprs, |ts| {
-                    unify_array_element_types(ts).is_ok()
-                });
-                e.with_position(pos.0)
-            })?;
-            let (nested, result_ty) = match common {
-                t @ ResolvedType::Array(_) => (true, t),
-                other => (false, ResolvedType::Array(Box::new(other))),
-            };
-            Ok((
-                RExpr::Array {
-                    elems: nodes,
-                    nested,
-                },
-                result_ty,
-            ))
+            array_ctor_node(items, nodes, &elem_types)
         }),
         Expr::Column(name, pos) => outline(|| {
             // Resolve against the scope CHAIN (§26). Existence first (42703/42702 take priority,
@@ -4554,17 +4830,8 @@ fn resolve_node(
         // sites (`explicit_collation` / `OrderKey.collation`), so resolving returns the inner resolved
         // expr + type unchanged. The hint flows through (COLLATE never changes the type).
         Expr::Collate { inner, collation } => outline(|| {
-            let (rinner, ty) = resolve(scope, inner, ctx, agg, params)?;
-            if !ty.collatable() && ty != ResolvedType::Null {
-                return Err(type_error(format!(
-                    "collations are not supported by type {}",
-                    ty.type_name()
-                )));
-            }
-            // Validate the name resolves (surfaces 42704 for an unknown collation); the value is
-            // recovered at the comparison/ORDER BY site, so it is discarded here.
-            resolve_collation_name(scope.catalog, collation)?;
-            Ok((rinner, ty))
+            let inner = resolve(scope, inner, ctx, agg, params)?;
+            collate_node(scope, collation, inner)
         }),
         // `EXTRACT(field FROM source)` (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
         // validated at RESOLVE (not per row): an unsupported field for the source type is `0A000`, an
@@ -5202,47 +5469,8 @@ fn resolve_node(
             operand,
             ..
         } => outline(|| {
-            let (rop, ty) = resolve(scope, operand, ctx, agg, params)?;
-            let result = match ty {
-                ResolvedType::Int(t) => t,
-                ResolvedType::Decimal => ScalarType::Decimal,
-                // -float flips the sign bit (no overflow; a NaN/Inf operand passes through —
-                // spec/design/float.md §5). The result keeps the operand's width.
-                ResolvedType::Float(t) => t,
-                ResolvedType::Null => ScalarType::Int64, // -NULL = NULL
-                ResolvedType::Interval => ScalarType::Interval, // -interval (interval.md §5)
-                ResolvedType::Bool
-                | ResolvedType::Text
-                | ResolvedType::Bytea
-                | ResolvedType::Uuid
-                | ResolvedType::Timestamp
-                | ResolvedType::Timestamptz
-                | ResolvedType::Date
-                | ResolvedType::Json
-                | ResolvedType::Jsonb
-                | ResolvedType::JsonPath
-                | ResolvedType::Composite(_)
-                | ResolvedType::Array(_)
-                | ResolvedType::Range(_) => {
-                    return Err(type_error("unary minus requires a numeric operand"));
-                }
-            };
-            let rty = if result.is_decimal() {
-                ResolvedType::Decimal
-            } else if result.is_interval() {
-                ResolvedType::Interval
-            } else if result.is_float() {
-                ResolvedType::Float(result)
-            } else {
-                ResolvedType::Int(result)
-            };
-            Ok((
-                RExpr::Neg {
-                    operand: Box::new(rop),
-                    result,
-                },
-                rty,
-            ))
+            let operand = resolve(scope, operand, ctx, agg, params)?;
+            neg_node(operand)
         }),
         Expr::Unary {
             op: UnaryOp::Not,

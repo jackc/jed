@@ -108,6 +108,7 @@ import {
   adoptContainerParam,
   arrayParamElem,
   resolveOperandPair,
+  resolveOperandPairWithLhs,
   resolveParamNode,
   resolveTextOperandPair,
   temporalArithResult,
@@ -626,6 +627,230 @@ export function resolve(
   }
 }
 
+// FirstPass is an operand's first, hint-free resolution, kept so a second, hinted pass can reuse it
+// (reResolve). Two-pass operand resolution (`||`, the containment operators, the polymorphic array
+// functions, …) resolves an operand once to learn its type, then again with the element type its
+// sibling fixed. Resolving the whole operand twice would resolve every nested two-pass operand twice
+// per level, so a nested chain would cost 2^depth before any cost is metered (cost.md §7).
+export interface FirstPass {
+  node: RExpr;
+  type: ResolvedType;
+  // The child results a hint passes through to, for an ARRAY[…], COLLATE, or unary minus whose
+  // children the hint can change; opaque otherwise.
+  shape: FirstPassShape;
+}
+
+type FirstPassShape =
+  | { kind: "opaque" }
+  // An ARRAY[…] constructor: each item's first pass.
+  | { kind: "array"; items: FirstPass[] }
+  // A COLLATE or unary minus: the operand's first pass.
+  | { kind: "wrap"; inner: FirstPass };
+
+// opaqueFirstPass takes a resolution as final: a second pass resolves its expression afresh only if
+// it is hint-sensitive.
+export function opaqueFirstPass(r: { node: RExpr; type: ResolvedType }): FirstPass {
+  return { node: r.node, type: r.type, shape: { kind: "opaque" } };
+}
+
+// hintSensitive reports whether resolving e under a hint can differ from resolving it with none. The
+// hint (ctx) reaches only an integer, decimal, or string literal and a bind parameter, through an
+// ARRAY[…], a COLLATE, or a unary minus. Every other node resolves its children with hints of its
+// own, so its resolution is the same under any hint: the same node, type, errors, and parameter
+// types (a repeated parameter inference is an idempotent join, ParamTypes.noteCol).
+export function hintSensitive(e: Expr): boolean {
+  switch (e.kind) {
+    case "literal":
+      return e.literal.kind === "int" || e.literal.kind === "decimal" || e.literal.kind === "text";
+    case "param":
+      return true;
+    case "array":
+      return e.elements.some(hintSensitive);
+    case "collate":
+      return hintSensitive(e.inner);
+    case "unary":
+      return e.op === "neg" && hintSensitive(e.operand);
+    default:
+      return false;
+  }
+}
+
+// resolveFirst resolves e with no hint, as resolve(scope, e, null, …), keeping what reResolve needs.
+export function resolveFirst(scope: Scope, e: Expr, ag: AggCtx, params: ParamTypes): FirstPass {
+  try {
+    return resolveFirstNode(scope, e, ag, params);
+  } catch (err) {
+    if (err instanceof EngineError) throw locateNodeError(err, e);
+    throw err;
+  }
+}
+
+function resolveFirstNode(scope: Scope, e: Expr, ag: AggCtx, params: ParamTypes): FirstPass {
+  // A node matching a GROUP BY expression resolves to its group slot under any hint.
+  if (
+    !hintSensitive(e) ||
+    (e.kind !== "column" && e.kind !== "qualifiedColumn" && matchGroupExpr(ag, e) !== null)
+  ) {
+    return opaqueFirstPass(resolveNode(scope, e, null, ag, params));
+  }
+  switch (e.kind) {
+    case "array": {
+      const items: FirstPass[] = [];
+      for (const el of e.elements) items.push(resolveFirst(scope, el, ag, params));
+      const r = arrayCtorNode(
+        e.elements,
+        items.map((f) => f.node),
+        items.map((f) => f.type),
+      );
+      return { node: r.node, type: r.type, shape: { kind: "array", items } };
+    }
+    case "collate": {
+      const inner = resolveFirst(scope, e.inner, ag, params);
+      const r = collateNode(scope, e.collation, inner);
+      return { node: r.node, type: r.type, shape: { kind: "wrap", inner } };
+    }
+    case "unary": {
+      // hintSensitive admits only a unary minus here.
+      const inner = resolveFirst(scope, e.operand, ag, params);
+      const r = negNode(inner);
+      return { node: r.node, type: r.type, shape: { kind: "wrap", inner } };
+    }
+    default:
+      return opaqueFirstPass(resolveNode(scope, e, null, ag, params));
+  }
+}
+
+// reResolve resolves e under the hint ctx, as resolve(scope, e, ctx, …), given its resolveFirst
+// result. Only the literals and parameters the hint reaches are resolved again; every other
+// subexpression keeps its first resolution, so each is resolved once however deeply two-pass operands
+// nest.
+export function reResolve(
+  scope: Scope,
+  e: Expr,
+  ctx: ScalarType | null,
+  first: FirstPass,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (!hintSensitive(e)) return { node: first.node, type: first.type };
+  try {
+    return reResolveNode(scope, e, ctx, first, ag, params);
+  } catch (err) {
+    if (err instanceof EngineError) throw locateNodeError(err, e);
+    throw err;
+  }
+}
+
+function reResolveNode(
+  scope: Scope,
+  e: Expr,
+  ctx: ScalarType | null,
+  first: FirstPass,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const shape = first.shape;
+  if (e.kind === "array" && shape.kind === "array") {
+    const nodes: RExpr[] = [];
+    const elemTypes: ResolvedType[] = [];
+    for (let i = 0; i < e.elements.length; i++) {
+      const r = reResolve(scope, e.elements[i]!, ctx, shape.items[i]!, ag, params);
+      nodes.push(r.node);
+      elemTypes.push(r.type);
+    }
+    return arrayCtorNode(e.elements, nodes, elemTypes);
+  }
+  if (e.kind === "collate" && shape.kind === "wrap") {
+    const inner = reResolve(scope, e.inner, ctx, shape.inner, ag, params);
+    return collateNode(scope, e.collation, inner);
+  }
+  if (e.kind === "unary" && e.op === "neg" && shape.kind === "wrap") {
+    const inner = reResolve(scope, e.operand, ctx, shape.inner, ag, params);
+    return negNode(inner);
+  }
+  // A literal, a parameter, or a node resolved whole the first time: resolve it afresh.
+  return resolveNode(scope, e, ctx, ag, params);
+}
+
+// arrayCtorNode builds an ARRAY[…] constructor from its resolved items (spec/design/array.md §1). The
+// item types unify; items that are themselves arrays make a nested (multidim-stacking) constructor
+// whose result is the SAME array type (dimension-agnostic, §2/§4), otherwise it is a flat 1-D array of
+// the unified element.
+function arrayCtorNode(
+  items: Expr[],
+  nodes: RExpr[],
+  elemTypes: ResolvedType[],
+): { node: RExpr; type: ResolvedType } {
+  let common: ResolvedType;
+  try {
+    common = unifyArrayElementTypes(elemTypes);
+  } catch (err) {
+    throw positionedAt(err, mismatchLocation(elemTypes, items, unifyArrayElementTypes));
+  }
+  if (common.kind === "array") {
+    return {
+      node: { kind: "array", elements: nodes, nested: true },
+      type: common,
+    };
+  }
+  return {
+    node: { kind: "array", elements: nodes, nested: false },
+    type: { kind: "array", elem: common },
+  };
+}
+
+// collateNode is `expr COLLATE "name"` over its resolved operand (spec/design/collation.md §1): the
+// operand must be collatable (text / text[], 42804, PG-matching) and the named collation must exist
+// ("C" or loaded, else 42704). A runtime PASSTHROUGH — a collation only changes the ORDERING
+// comparisons / ORDER BY, derived from the AST at those sites — so it returns the operand unchanged.
+function collateNode(
+  scope: Scope,
+  collation: string,
+  r: { node: RExpr; type: ResolvedType },
+): { node: RExpr; type: ResolvedType } {
+  if (!rtCollatable(r.type) && r.type.kind !== "null") {
+    throw typeError(`collations are not supported by type ${rtName(r.type)}`);
+  }
+  resolveCollationName(scope.catalog, collation); // surfaces 42704 for an unknown name
+  return { node: r.node, type: r.type };
+}
+
+// negNode is unary minus over its resolved operand: numeric (integer / decimal / float, keeping the
+// width), interval (interval.md §5), or NULL (-NULL = NULL); anything else is 42804.
+function negNode(r: { node: RExpr; type: ResolvedType }): { node: RExpr; type: ResolvedType } {
+  const { node, type } = r;
+  if (type.kind === "decimal") {
+    return {
+      node: { kind: "neg", result: "decimal", operand: node },
+      type: { kind: "decimal" },
+    };
+  }
+  if (type.kind === "float") {
+    // Unary minus on a float flips the sign bit (no overflow); a NaN/Inf operand passes through per
+    // IEEE (-NaN is NaN, -Inf is -Inf) — float.md §5. result keeps the width.
+    return {
+      node: { kind: "neg", result: type.ty, operand: node },
+      type: { kind: "float", ty: type.ty },
+    };
+  }
+  if (type.kind === "interval") {
+    // -interval (spec/design/interval.md §5).
+    return {
+      node: { kind: "neg", result: "interval", operand: node },
+      type: { kind: "interval" },
+    };
+  }
+  let result: ScalarType;
+  if (type.kind === "int") result = type.ty;
+  else if (type.kind === "null")
+    result = "i64"; // -NULL = NULL
+  else throw typeError("unary minus requires a numeric operand");
+  return {
+    node: { kind: "neg", result, operand: node },
+    type: { kind: "int", ty: result },
+  };
+}
+
 // locateNodeError decides the position of an error leaving node e's resolution
 // (spec/design/error-fields.md §10.2). A function call's 42883 / 42725 points at its name; an
 // operator's 42883 / 42804 (no operator for these operand types) points at the operator and carries
@@ -851,24 +1076,7 @@ function resolveArrayExpr(
     nodes.push(node);
     elemTypes.push(type);
   }
-  // If the items are themselves arrays, this is a nested (multidim-stacking) constructor and the
-  // result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D array.
-  let common: ResolvedType;
-  try {
-    common = unifyArrayElementTypes(elemTypes);
-  } catch (err) {
-    throw positionedAt(err, mismatchLocation(elemTypes, e.elements, unifyArrayElementTypes));
-  }
-  if (common.kind === "array") {
-    return {
-      node: { kind: "array", elements: nodes, nested: true },
-      type: common,
-    };
-  }
-  return {
-    node: { kind: "array", elements: nodes, nested: false },
-    type: { kind: "array", elem: common },
-  };
+  return arrayCtorNode(e.elements, nodes, elemTypes);
 }
 
 function resolveQualifiedColumnExpr(
@@ -1359,12 +1567,7 @@ function resolveCollateExpr(
   // changes the ORDERING comparisons / ORDER BY, derived from the AST at those sites
   // (explicitCollation / OrderKey.collation), so resolving returns the inner node + type
   // unchanged. The hint flows through (COLLATE never changes the type).
-  const r = resolve(scope, e.inner, ctx, ag, params);
-  if (!rtCollatable(r.type) && r.type.kind !== "null") {
-    throw typeError(`collations are not supported by type ${rtName(r.type)}`);
-  }
-  resolveCollationName(scope.catalog, e.collation); // surfaces 42704 for an unknown name
-  return r;
+  return collateNode(scope, e.collation, resolve(scope, e.inner, ctx, ag, params));
 }
 
 function resolveExtractExpr(
@@ -1885,37 +2088,7 @@ function resolveUnaryExpr(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.op === "neg") {
-    const { node, type } = resolve(scope, e.operand, ctx, ag, params);
-    if (type.kind === "decimal") {
-      return {
-        node: { kind: "neg", result: "decimal", operand: node },
-        type: { kind: "decimal" },
-      };
-    }
-    if (type.kind === "float") {
-      // Unary minus on a float flips the sign bit (no overflow); a NaN/Inf operand passes
-      // through per IEEE (-NaN is NaN, -Inf is -Inf) — float.md §5. result keeps the width.
-      return {
-        node: { kind: "neg", result: type.ty, operand: node },
-        type: { kind: "float", ty: type.ty },
-      };
-    }
-    if (type.kind === "interval") {
-      // -interval (spec/design/interval.md §5).
-      return {
-        node: { kind: "neg", result: "interval", operand: node },
-        type: { kind: "interval" },
-      };
-    }
-    let result: ScalarType;
-    if (type.kind === "int") result = type.ty;
-    else if (type.kind === "null")
-      result = "i64"; // -NULL = NULL
-    else throw typeError("unary minus requires a numeric operand");
-    return {
-      node: { kind: "neg", result, operand: node },
-      type: { kind: "int", ty: result },
-    };
+    return negNode(resolve(scope, e.operand, ctx, ag, params));
   }
   {
     const { node, type } = resolve(scope, e.operand, null, ag, params);
@@ -2911,17 +3084,26 @@ export function resolveBinary(
       // operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a jsonb LHS with
       // `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ * / %` over a jsonb
       // operand fall through and 42804 in the numeric path.)
+      //
+      // A non-adaptable LHS resolves with no hint either way, so the peek's resolution is the operand
+      // pair's: resolving it a second time would double the work at every level of an `a - b - c …`
+      // chain (cost.md §7). An adaptable LHS (a literal / `$N`) is a leaf.
+      let peeked: { node: RExpr; type: ResolvedType } | null = null;
       if (op === "sub") {
         const peek = resolve(scope, lhs, null, ag, params);
         if (peek.type.kind === "jsonb") {
           return resolveJsonbDelete(scope, false, rhs, peek.node, ag, params);
         }
+        if (!isAdaptableOperand(lhs)) peeked = peek;
       }
       // Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
       // integer literal adapts to an integer sibling), then pick the family: both integer →
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
       // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-      const p = resolveOperandPair(scope, lhs, rhs, ag, params);
+      const p =
+        peeked !== null
+          ? resolveOperandPairWithLhs(scope, peeked, rhs, ag, params)
+          : resolveOperandPair(scope, lhs, rhs, ag, params);
       // Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-` difference, `*`
       // intersection over two ranges. A range operand in any of these three is the set-op axis — both
       // operands must be ranges of a common element type, else 42883 (matching PG's "operator does not
@@ -3158,55 +3340,62 @@ export function resolveConcat(
       "operator does not exist: the || operands are not an array and a compatible element/array",
     );
   // Pass 1: resolve both operands with no hint.
-  let rl = resolve(scope, lhs, null, ag, params);
-  let rr = resolve(scope, rhs, null, ag, params);
+  let fl = resolveFirst(scope, lhs, ag, params);
+  let fr = resolveFirst(scope, rhs, ag, params);
   // A bare parameter beside an array takes the array's type (array || array, api.md §5); an element
   // needs a cast, as in PostgreSQL.
   let adoptedL = false;
   let adoptedR = false;
-  if (rl.type.kind === "array") {
-    const adopted = adoptContainerParam(scope, rhs, rl.type, params);
-    if (adopted !== null) [rr, adoptedR] = [adopted, true];
-  } else if (rr.type.kind === "array") {
-    const adopted = adoptContainerParam(scope, lhs, rr.type, params);
-    if (adopted !== null) [rl, adoptedL] = [adopted, true];
+  if (fl.type.kind === "array") {
+    const adopted = adoptContainerParam(scope, rhs, fl.type, params);
+    if (adopted !== null) [fr, adoptedR] = [opaqueFirstPass(adopted), true];
+  } else if (fr.type.kind === "array") {
+    const adopted = adoptContainerParam(scope, lhs, fr.type, params);
+    if (adopted !== null) [fl, adoptedL] = [opaqueFirstPass(adopted), true];
   }
+  const lt0 = fl.type;
+  const rt0 = fr.type;
   // A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
   // takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
   // `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
   const typedText = (t: ResolvedType, e: Expr): boolean => t.kind === "text" && !isStringLiteral(e);
-  const anyTypedText = typedText(rl.type, lhs) || typedText(rr.type, rhs);
+  const anyTypedText = typedText(lt0, lhs) || typedText(rt0, rhs);
   // JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
-  if ((rl.type.kind === "jsonb" || rr.type.kind === "jsonb") && !anyTypedText) {
-    return resolveJsonbConcat(scope, lhs, rhs, ag, params);
+  if ((lt0.kind === "jsonb" || rt0.kind === "jsonb") && !anyTypedText) {
+    return resolveJsonbConcat(scope, lhs, rhs, fl, fr, ag, params);
   }
   // BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
   // (string-functions.md §4). A bytea[] operand stays on the array overloads below.
   if (
-    (rl.type.kind === "bytea" || rr.type.kind === "bytea") &&
-    rl.type.kind !== "array" &&
-    rr.type.kind !== "array" &&
+    (lt0.kind === "bytea" || rt0.kind === "bytea") &&
+    lt0.kind !== "array" &&
+    rt0.kind !== "array" &&
     !anyTypedText
   ) {
-    return resolveByteaConcat(scope, lhs, rhs, ag, params);
+    return resolveByteaConcat(scope, lhs, rhs, fl, fr, ag, params);
   }
   // TEXT axis: with no array operand, `||` is text concatenation when either operand is text, a bare
   // string literal, or an untyped NULL / parameter (string-functions.md §5). The other operand renders
   // through its text output (PG's anynonarray || text). Neither text-like (`1 || 2`) is 42883.
-  if (rl.type.kind !== "array" && rr.type.kind !== "array") {
-    return resolveTextConcat(scope, lhs, rhs, rl, rr, ag, params);
+  if (lt0.kind !== "array" && rt0.kind !== "array") {
+    return resolveTextConcat(scope, lhs, rhs, fl, fr, ag, params);
   }
   // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
   let hint: ScalarType | null = null;
-  if (rl.type.kind === "array") hint = elemScalarHint(rl.type.elem);
-  else if (rr.type.kind === "array") hint = elemScalarHint(rr.type.elem);
+  if (lt0.kind === "array") hint = elemScalarHint(lt0.elem);
+  else if (rt0.kind === "array") hint = elemScalarHint(rt0.elem);
   // Pass 2: re-resolve the NON-NULL operands with the hint so a bare literal element / untyped
   // ARRAY[…] adapts. A bare NULL (pass-1 kind "null") is skipped — it must stay untyped so the
-  // cat-first overload order matches PG (see the doc comment).
-  if (hint !== null) {
-    if (rl.type.kind !== "null" && !adoptedL) rl = resolve(scope, lhs, hint, ag, params);
-    if (rr.type.kind !== "null" && !adoptedR) rr = resolve(scope, rhs, hint, ag, params);
-  }
+  // cat-first overload order matches PG (see the doc comment). Only the hint-sensitive parts of an
+  // operand resolve again (reResolve).
+  const rl =
+    hint !== null && lt0.kind !== "null" && !adoptedL
+      ? reResolve(scope, lhs, hint, fl, ag, params)
+      : fl;
+  const rr =
+    hint !== null && rt0.kind !== "null" && !adoptedR
+      ? reResolve(scope, rhs, hint, fr, ag, params)
+      : fr;
   // Try the three concat overloads in catalog order; the first whose slots unify wins.
   const tys: ResolvedType[] = [rl.type, rr.type];
   let chosen: { argFamilies: readonly string[]; result: string } | undefined;
@@ -3265,25 +3454,27 @@ export function resolveSetOp(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   // Pass 1: resolve both operands with no hint.
-  let rl = resolve(scope, lhs, null, ag, params);
-  let rr = resolve(scope, rhs, null, ag, params);
+  let fl = resolveFirst(scope, lhs, ag, params);
+  let fr = resolveFirst(scope, rhs, ag, params);
   // A bare parameter facing an array or range takes its type (api.md §5): `tags @> $1` binds an
   // array, `during && $1` a range. A range's element needs a cast (`during @> $1::i32`).
   const arrayOrRange = (t: ResolvedType) => t.kind === "array" || t.kind === "range";
   let adoptedL = false;
   let adoptedR = false;
-  if (arrayOrRange(rl.type)) {
-    const adopted = adoptContainerParam(scope, rhs, rl.type, params);
-    if (adopted !== null) [rr, adoptedR] = [adopted, true];
+  if (arrayOrRange(fl.type)) {
+    const adopted = adoptContainerParam(scope, rhs, fl.type, params);
+    if (adopted !== null) [fr, adoptedR] = [opaqueFirstPass(adopted), true];
   }
-  if (!adoptedR && arrayOrRange(rr.type)) {
-    const adopted = adoptContainerParam(scope, lhs, rr.type, params);
-    if (adopted !== null) [rl, adoptedL] = [adopted, true];
+  if (!adoptedR && arrayOrRange(fr.type)) {
+    const adopted = adoptContainerParam(scope, lhs, fr.type, params);
+    if (adopted !== null) [fl, adoptedL] = [opaqueFirstPass(adopted), true];
   }
+  const lt0 = fl.type;
+  const rt0 = fr.type;
   // RANGE axis if either operand is a range. (The five positional operators are range-only; on a
   // non-range pair they fall through to the array branch below, which rejects them as 42883.)
-  if (rl.type.kind === "range" || rr.type.kind === "range") {
-    return resolveRangeOp(scope, op, lhs, rhs, rl, rr, ag, params);
+  if (lt0.kind === "range" || rt0.kind === "range") {
+    return resolveRangeOp(scope, op, lhs, rhs, fl, fr, ag, params);
   }
 
   // JSONB axis: only @>/<@ have a jsonb overload (json-sql-functions.md §1, J5). A jsonb operand
@@ -3291,9 +3482,9 @@ export function resolveSetOp(
   // overload and fall through to the array branch (42883). A json operand has no @> opclass (42883).
   if (
     (op === "contains" || op === "containedBy") &&
-    (rl.type.kind === "jsonb" || rr.type.kind === "jsonb")
+    (lt0.kind === "jsonb" || rt0.kind === "jsonb")
   ) {
-    return resolveJsonbContains(scope, op, lhs, rhs, ag, params);
+    return resolveJsonbContains(scope, op, lhs, rhs, fl, fr, ag, params);
   }
 
   // ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
@@ -3306,14 +3497,18 @@ export function resolveSetOp(
 
   // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
   let hint: ScalarType | null = null;
-  if (rl.type.kind === "array") hint = elemScalarHint(rl.type.elem);
-  else if (rr.type.kind === "array") hint = elemScalarHint(rr.type.elem);
+  if (lt0.kind === "array") hint = elemScalarHint(lt0.elem);
+  else if (rt0.kind === "array") hint = elemScalarHint(rt0.elem);
   // Pass 2: re-resolve the NON-NULL operands with the hint so a bare ARRAY[…] adapts. A bare NULL
   // (pass-1 kind "null") is left untyped — it defers in the anyarray slot, result is boolean anyway.
-  if (hint !== null) {
-    if (rl.type.kind !== "null" && !adoptedL) rl = resolve(scope, lhs, hint, ag, params);
-    if (rr.type.kind !== "null" && !adoptedR) rr = resolve(scope, rhs, hint, ag, params);
-  }
+  const rl =
+    hint !== null && lt0.kind !== "null" && !adoptedL
+      ? reResolve(scope, lhs, hint, fl, ag, params)
+      : fl;
+  const rr =
+    hint !== null && rt0.kind !== "null" && !adoptedR
+      ? reResolve(scope, rhs, hint, fr, ag, params)
+      : fr;
   // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
   const tys: ResolvedType[] = [rl.type, rr.type];
   if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noSetOpOverload();
@@ -3547,20 +3742,22 @@ export function resolveJsonbContains(
   op: BinaryOp,
   lhs: Expr,
   rhs: Expr,
+  fl: FirstPass,
+  fr: FirstPass,
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   // Resolve each operand with a jsonb context, so a bare `'{"a":1}'` string literal adapts.
-  const resolveJsonb = (e: Expr): RExpr => {
-    const { node, type } = resolve(scope, e, "jsonb", ag, params);
+  const resolveJsonb = (e: Expr, first: FirstPass): RExpr => {
+    const { node, type } = reResolve(scope, e, "jsonb", first, ag, params);
     if (type.kind === "jsonb" || type.kind === "null") return node;
     throw engineError(
       "undefined_function",
       `operator does not exist: ${rtName(type)} ${binaryOpSymbol(op)} jsonb`,
     );
   };
-  const rl = resolveJsonb(lhs);
-  const rr = resolveJsonb(rhs);
+  const rl = resolveJsonb(lhs, fl);
+  const rr = resolveJsonb(rhs, fr);
   // `a @> b` keeps the order; `a <@ b` is `b @> a`.
   const [a, b] = op === "containedBy" ? [rr, rl] : [rl, rr];
   return { node: { kind: "jsonContains", a, b }, type: { kind: "bool" } };
@@ -3638,16 +3835,18 @@ export function resolveJsonbConcat(
   scope: Scope,
   lhs: Expr,
   rhs: Expr,
+  fl: FirstPass,
+  fr: FirstPass,
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  const resolveJsonb = (e: Expr): RExpr => {
-    const { node, type } = resolve(scope, e, "jsonb", ag, params);
+  const resolveJsonb = (e: Expr, first: FirstPass): RExpr => {
+    const { node, type } = reResolve(scope, e, "jsonb", first, ag, params);
     if (type.kind === "jsonb" || type.kind === "null") return node;
     throw engineError("undefined_function", `operator does not exist: ${rtName(type)} || jsonb`);
   };
-  const a = resolveJsonb(lhs);
-  const b = resolveJsonb(rhs);
+  const a = resolveJsonb(lhs, fl);
+  const b = resolveJsonb(rhs, fr);
   return { node: { kind: "jsonConcat", a, b }, type: { kind: "jsonb" } };
 }
 
@@ -3658,11 +3857,13 @@ export function resolveByteaConcat(
   scope: Scope,
   lhs: Expr,
   rhs: Expr,
+  fl: FirstPass,
+  fr: FirstPass,
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  const a = resolve(scope, lhs, "bytea", ag, params);
-  const b = resolve(scope, rhs, "bytea", ag, params);
+  const a = reResolve(scope, lhs, "bytea", fl, ag, params);
+  const b = reResolve(scope, rhs, "bytea", fr, ag, params);
   const ok = (t: ResolvedType): boolean => t.kind === "bytea" || t.kind === "null";
   if (!ok(a.type) || !ok(b.type)) {
     throw engineError(
@@ -3686,8 +3887,8 @@ function resolveTextConcat(
   scope: Scope,
   lhs: Expr,
   rhs: Expr,
-  rl: { node: RExpr; type: ResolvedType },
-  rr: { node: RExpr; type: ResolvedType },
+  rl: FirstPass,
+  rr: FirstPass,
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -3698,9 +3899,9 @@ function resolveTextConcat(
       `operator does not exist: ${rtName(rl.type)} || ${rtName(rr.type)}`,
     );
   }
-  const operand = (e: Expr, r: { node: RExpr; type: ResolvedType }): RExpr =>
+  const operand = (e: Expr, r: FirstPass): RExpr =>
     r.type.kind === "null"
-      ? resolve(scope, e, "text", ag, params).node
+      ? reResolve(scope, e, "text", r, ag, params).node
       : castToText(r.node, r.type, "text", null, params);
   const a = operand(lhs, rl);
   const b = operand(rhs, rr);
@@ -4185,8 +4386,8 @@ export function resolveRangeOp(
   op: BinaryOp,
   lhs: Expr,
   rhs: Expr,
-  rl: { node: RExpr; type: ResolvedType },
-  rr: { node: RExpr; type: ResolvedType },
+  rl: FirstPass,
+  rr: FirstPass,
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -4239,7 +4440,7 @@ export function resolveRangeOp(
   if (lt.kind === "range" && op === "contains") {
     const elem = resolvedRangeElementScalar(lt.elem);
     if (elem === undefined) throw noSetOpOverload();
-    const re = resolve(scope, rhs, elem, ag, params);
+    const re = reResolve(scope, rhs, elem, rr, ag, params);
     if (!rangeBoundAssignable(re.type, elem)) throw noSetOpOverload();
     return {
       node: {
@@ -4255,7 +4456,7 @@ export function resolveRangeOp(
   if (rt.kind === "range" && op === "containedBy") {
     const elem = resolvedRangeElementScalar(rt.elem);
     if (elem === undefined) throw noSetOpOverload();
-    const le = resolve(scope, lhs, elem, ag, params);
+    const le = reResolve(scope, lhs, elem, rl, ag, params);
     if (!rangeBoundAssignable(le.type, elem)) throw noSetOpOverload();
     return {
       node: {
@@ -4327,7 +4528,7 @@ export function resolveScalarArrayOperands(
 ): [{ node: RExpr; type: ResolvedType }, { node: RExpr; type: ResolvedType }] {
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
-  let ra = resolve(scope, array, null, ag, params);
+  const fa = resolveFirst(scope, array, ag, params);
   // A bare parameter array operand takes the array of `x`'s type (api.md §5): `id = ANY($1)` binds a
   // list of ids.
   if (array.kind === "param") {
@@ -4341,10 +4542,8 @@ export function resolveScalarArrayOperands(
   // bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
   // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
   // column / cast operand (it ignores the hint).
-  if (!isAdaptableOperand(lhs)) {
-    const h = ctxOf(rl.type);
-    if (h !== null) ra = resolve(scope, array, h, ag, params);
-  }
+  const h = isAdaptableOperand(lhs) ? null : ctxOf(rl.type);
+  const ra = h !== null ? reResolve(scope, array, h, fa, ag, params) : fa;
   // If the array resolved to E[] and `x` is an adaptable bare literal, adapt `x` to E (with a range
   // check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
   if (ra.type.kind === "array" && isAdaptableOperand(lhs)) {

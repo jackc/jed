@@ -1515,6 +1515,247 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 	return r, ty, nil
 }
 
+// firstPass is an operand's first, hint-free resolution, kept so a second, hinted pass can reuse it
+// (reResolve). Two-pass operand resolution (`||`, the containment operators, the polymorphic array
+// functions, …) resolves an operand once to learn its type, then again with the element type its
+// sibling fixed. Resolving the whole operand twice would resolve every nested two-pass operand twice
+// per level, so a nested chain would cost 2^depth before any cost is metered (cost.md §7).
+type firstPass struct {
+	node *rExpr
+	ty   resolvedType
+	// shape holds the child results a hint passes through to, for an ARRAY[…], COLLATE, or unary
+	// minus whose children the hint can change; the zero value (shapeOpaque) otherwise.
+	shape firstShape
+}
+
+type firstShapeKind uint8
+
+const (
+	shapeOpaque firstShapeKind = iota
+	// shapeArray: an ARRAY[…] constructor — each item's type and shape (its node is the array's
+	// element, sargs[i]).
+	shapeArray
+	// shapeWrap: a COLLATE (the node is the operand's) or a unary minus (the node's operand) — the
+	// operand's type and shape.
+	shapeWrap
+)
+
+type firstShape struct {
+	kind  firstShapeKind
+	items []typedShape // shapeArray
+	inner *typedShape  // shapeWrap
+}
+
+// typedShape is a child's first-pass type and shape (its node lives in the parent's node).
+type typedShape struct {
+	ty    resolvedType
+	shape firstShape
+}
+
+// opaqueFirst takes a resolution as final: a second pass resolves its expression afresh only if it is
+// hint-sensitive.
+func opaqueFirst(node *rExpr, ty resolvedType) firstPass {
+	return firstPass{node: node, ty: ty}
+}
+
+// hintSensitive reports whether resolving e under a hint can differ from resolving it with none. The
+// hint (ctx) reaches only an integer, decimal, or string literal and a bind parameter, through an
+// ARRAY[…], a COLLATE, or a unary minus. (IN / BETWEEN pass ctx to their desugared OR / AND / NOT,
+// which ignore it.) Every other node resolves its children with hints of its own, so its resolution
+// is the same under any hint: the same node, type, errors, and parameter types (a repeated parameter
+// inference is an idempotent join, paramTypes.noteCol).
+func hintSensitive(e exprNode) bool {
+	switch e.Kind {
+	case exprParam:
+		return true
+	case exprLiteral:
+		k := e.Literal.Kind
+		return k == literalInt || k == literalDecimal || k == literalText
+	case exprArray:
+		for i := range e.RowItems {
+			if hintSensitive(e.RowItems[i]) {
+				return true
+			}
+		}
+		return false
+	case exprCollate:
+		return hintSensitive(e.Collate.Inner)
+	case exprUnary:
+		return e.Unary.Op == opNeg && hintSensitive(e.Unary.Operand)
+	}
+	return false
+}
+
+// resolveFirst resolves e with no hint, as resolve(s, e, nil, …), keeping what reResolve needs.
+func resolveFirst(s *scope, e exprNode, ag *aggCtx, params *paramTypes) (firstPass, error) {
+	f, err := resolveFirstNode(s, e, ag, params)
+	if err != nil {
+		return firstPass{}, locateNodeError(err, e)
+	}
+	return f, nil
+}
+
+func resolveFirstNode(s *scope, e exprNode, ag *aggCtx, params *paramTypes) (firstPass, error) {
+	// A node matching a GROUP BY expression resolves to its group slot under any hint.
+	if !hintSensitive(e) || isGroupExpr(ag, e) {
+		node, ty, err := resolveNode(s, e, nil, ag, params)
+		return opaqueFirst(node, ty), err
+	}
+	switch {
+	case e.Kind == exprArray:
+		nodes := make([]*rExpr, len(e.RowItems))
+		elemTypes := make([]resolvedType, len(e.RowItems))
+		shapes := make([]typedShape, len(e.RowItems))
+		for i := range e.RowItems {
+			f, err := resolveFirst(s, e.RowItems[i], ag, params)
+			if err != nil {
+				return firstPass{}, err
+			}
+			nodes[i] = f.node
+			elemTypes[i] = f.ty
+			shapes[i] = typedShape{ty: f.ty, shape: f.shape}
+		}
+		node, ty, err := arrayCtorNode(e.RowItems, nodes, elemTypes)
+		if err != nil {
+			return firstPass{}, err
+		}
+		return firstPass{node: node, ty: ty, shape: firstShape{kind: shapeArray, items: shapes}}, nil
+	case e.Kind == exprCollate:
+		f, err := resolveFirst(s, e.Collate.Inner, ag, params)
+		if err != nil {
+			return firstPass{}, err
+		}
+		node, ty, err := collateNode(s, e.Collate.Collation, f.node, f.ty)
+		if err != nil {
+			return firstPass{}, err
+		}
+		return firstPass{node: node, ty: ty, shape: firstShape{kind: shapeWrap, inner: &typedShape{ty: f.ty, shape: f.shape}}}, nil
+	case e.Kind == exprUnary && e.Unary.Op == opNeg:
+		f, err := resolveFirst(s, e.Unary.Operand, ag, params)
+		if err != nil {
+			return firstPass{}, err
+		}
+		node, ty, err := negNode(f.node, f.ty)
+		if err != nil {
+			return firstPass{}, err
+		}
+		return firstPass{node: node, ty: ty, shape: firstShape{kind: shapeWrap, inner: &typedShape{ty: f.ty, shape: f.shape}}}, nil
+	}
+	node, ty, err := resolveNode(s, e, nil, ag, params)
+	return opaqueFirst(node, ty), err
+}
+
+// reResolve resolves e under the hint ctx, as resolve(s, e, ctx, …), given its resolveFirst result.
+// Only the literals and parameters the hint reaches are resolved again; every other subexpression
+// keeps its first resolution, so each is resolved once however deeply two-pass operands nest.
+func reResolve(s *scope, e exprNode, ctx *scalarType, first firstPass, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if !hintSensitive(e) {
+		return first.node, first.ty, nil
+	}
+	r, ty, err := reResolveNode(s, e, ctx, first, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, locateNodeError(err, e)
+	}
+	return r, ty, nil
+}
+
+// isGroupExpr reports whether e matches a GROUP BY expression (resolveNode's group-slot rule).
+func isGroupExpr(ag *aggCtx, e exprNode) bool {
+	_, _, ok := matchGroupExpr(ag, e)
+	return ok
+}
+
+func reResolveNode(s *scope, e exprNode, ctx *scalarType, first firstPass, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	switch {
+	case e.Kind == exprArray && first.shape.kind == shapeArray && first.node.kind == reArray:
+		nodes := make([]*rExpr, len(e.RowItems))
+		elemTypes := make([]resolvedType, len(e.RowItems))
+		for i := range e.RowItems {
+			item := first.shape.items[i]
+			f := firstPass{node: first.node.sargs[i], ty: item.ty, shape: item.shape}
+			node, ty, err := reResolve(s, e.RowItems[i], ctx, f, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = node
+			elemTypes[i] = ty
+		}
+		return arrayCtorNode(e.RowItems, nodes, elemTypes)
+	case e.Kind == exprCollate && first.shape.kind == shapeWrap:
+		f := firstPass{node: first.node, ty: first.shape.inner.ty, shape: first.shape.inner.shape}
+		inner, ty, err := reResolve(s, e.Collate.Inner, ctx, f, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return collateNode(s, e.Collate.Collation, inner, ty)
+	case e.Kind == exprUnary && e.Unary.Op == opNeg && first.shape.kind == shapeWrap && first.node.kind == reNeg:
+		f := firstPass{node: first.node.operand, ty: first.shape.inner.ty, shape: first.shape.inner.shape}
+		operand, ty, err := reResolve(s, e.Unary.Operand, ctx, f, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return negNode(operand, ty)
+	}
+	// A literal, a parameter, or a node resolved whole the first time: resolve it afresh.
+	return resolveNode(s, e, ctx, ag, params)
+}
+
+// arrayCtorNode builds an ARRAY[…] constructor from its resolved items (spec/design/array.md §1). The
+// item types unify; items that are themselves arrays make a nested (multidim-stacking) constructor
+// whose result is the SAME array type (dimension-agnostic, §2/§4), otherwise a flat 1-D array of the
+// unified element.
+func arrayCtorNode(items []exprNode, nodes []*rExpr, elemTypes []resolvedType) (*rExpr, resolvedType, error) {
+	common, err := unifyArrayElementTypes(elemTypes)
+	if err != nil {
+		return nil, resolvedType{}, positionError(err, mismatchLocation(elemTypes, items, arrayElementTypesUnify))
+	}
+	if common.kind == rtArray {
+		return &rExpr{kind: reArray, sargs: nodes, nested: true}, common, nil
+	}
+	return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &common}, nil
+}
+
+// collateNode is `expr COLLATE "name"` over its resolved operand (spec/design/collation.md §1): the
+// operand must be collatable (text / text[], 42804, PG-matching) and the named collation must exist
+// ("C" or loaded, else 42704). A runtime PASSTHROUGH — a collation only changes the ORDERING
+// comparisons / ORDER BY, derived from the AST at those sites — so it returns the operand unchanged.
+func collateNode(s *scope, collation string, inner *rExpr, ty resolvedType) (*rExpr, resolvedType, error) {
+	if !ty.collatable() && ty.kind != rtNull {
+		return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
+	}
+	if _, err := resolveCollationName(s.catalog, collation); err != nil {
+		return nil, resolvedType{}, err
+	}
+	return inner, ty, nil
+}
+
+// negNode is unary minus over its resolved operand: numeric (integer / decimal / float, keeping the
+// width), interval (interval.md §5), or NULL (`-NULL = NULL`); anything else is 42804.
+func negNode(rop *rExpr, ty resolvedType) (*rExpr, resolvedType, error) {
+	switch ty.kind {
+	case rtInt:
+		return &rExpr{kind: reNeg, operand: rop, result: ty.intTy},
+			resolvedType{kind: rtInt, intTy: ty.intTy}, nil
+	case rtDecimal:
+		return &rExpr{kind: reNeg, operand: rop, result: scalarDecimal},
+			resolvedType{kind: rtDecimal}, nil
+	case rtNull:
+		return &rExpr{kind: reNeg, operand: rop, result: scalarInt64}, // -NULL = NULL
+			resolvedType{kind: rtInt, intTy: scalarInt64}, nil
+	case rtInterval:
+		return &rExpr{kind: reNeg, operand: rop, result: scalarInterval}, // -interval (interval.md §5)
+			resolvedType{kind: rtInterval}, nil
+	case rtFloat32:
+		return &rExpr{kind: reNeg, operand: rop, result: scalarFloat32}, // -f32 (IEEE sign flip)
+			resolvedType{kind: rtFloat32}, nil
+	case rtFloat64:
+		return &rExpr{kind: reNeg, operand: rop, result: scalarFloat64},
+			resolvedType{kind: rtFloat64}, nil
+	default: // rtBool, rtText, ...
+		return nil, resolvedType{}, typeError("unary minus requires a numeric operand")
+	}
+}
+
 // locateNodeError decides the position of an error leaving node e's resolution
 // (spec/design/error-fields.md §10.2). A function call's 42883 / 42725 points at its name; an
 // operator's 42883 / 42804 (no operator for these operand types) points at the operator and carries
@@ -1836,17 +2077,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			nodes[i] = node
 			elemTypes[i] = ty
 		}
-		common, err := unifyArrayElementTypes(elemTypes)
-		if err != nil {
-			return nil, resolvedType{}, positionError(err, mismatchLocation(elemTypes, e.RowItems, arrayElementTypesUnify))
-		}
-		// If the items are themselves arrays, this is a nested (multidim-stacking) constructor and
-		// the result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D
-		// array of the unified element.
-		if common.kind == rtArray {
-			return &rExpr{kind: reArray, sargs: nodes, nested: true}, common, nil
-		}
-		return &rExpr{kind: reArray, sargs: nodes}, resolvedType{kind: rtArray, elem: &common}, nil
+		return arrayCtorNode(e.RowItems, nodes, elemTypes)
 	case exprFuncCall:
 		// A hypothetical-set aggregate (rank/dense_rank/percent_rank/cume_dist — aggregates.md §19) is
 		// one of these window-function names used WITH a WITHIN GROUP clause; that clause routes it
@@ -2133,13 +2364,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if !ty.collatable() && ty.kind != rtNull {
-			return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
-		}
-		if _, err := resolveCollationName(s.catalog, e.Collate.Collation); err != nil {
-			return nil, resolvedType{}, err
-		}
-		return inner, ty, nil
+		return collateNode(s, e.Collate.Collation, inner, ty)
 	case exprExtract:
 		// EXTRACT(field FROM source) (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
 		// validated at RESOLVE (not per row): an unsupported field for the source type is 0A000, an
@@ -2617,28 +2842,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			switch ty.kind {
-			case rtInt:
-				return &rExpr{kind: reNeg, operand: rop, result: ty.intTy},
-					resolvedType{kind: rtInt, intTy: ty.intTy}, nil
-			case rtDecimal:
-				return &rExpr{kind: reNeg, operand: rop, result: scalarDecimal},
-					resolvedType{kind: rtDecimal}, nil
-			case rtNull:
-				return &rExpr{kind: reNeg, operand: rop, result: scalarInt64}, // -NULL = NULL
-					resolvedType{kind: rtInt, intTy: scalarInt64}, nil
-			case rtInterval:
-				return &rExpr{kind: reNeg, operand: rop, result: scalarInterval}, // -interval (interval.md §5)
-					resolvedType{kind: rtInterval}, nil
-			case rtFloat32:
-				return &rExpr{kind: reNeg, operand: rop, result: scalarFloat32}, // -f32 (IEEE sign flip)
-					resolvedType{kind: rtFloat32}, nil
-			case rtFloat64:
-				return &rExpr{kind: reNeg, operand: rop, result: scalarFloat64},
-					resolvedType{kind: rtFloat64}, nil
-			default: // rtBool, rtText, ...
-				return nil, resolvedType{}, typeError("unary minus requires a numeric operand")
-			}
+			return negNode(rop, ty)
 		}
 		// OpNot
 		rop, ty, err := resolve(s, e.Unary.Operand, nil, ag, params)
@@ -3697,6 +3901,12 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		// operand is a key/index/keys, never an arithmetic value. Peek the LHS type; a jsonb LHS with
 		// `-` routes to the delete resolver. (Only `-` has a jsonb meaning; `+ * / %` over a jsonb
 		// operand fall through and 42804 in the numeric path.)
+		//
+		// A non-adaptable LHS resolves with no hint either way, so the peek's resolution is the
+		// operand pair's: resolving it a second time would double the work at every level of an
+		// `a - b - c …` chain (cost.md §7). An adaptable LHS (a literal / $N) is a leaf.
+		var peekL *rExpr
+		var peekT resolvedType
 		if b.Op == opSub {
 			rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 			if err != nil {
@@ -3705,12 +3915,22 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			if lt.kind == rtJsonb {
 				return resolveJSONbDelete(s, false, b.Rhs, rl, ag, params)
 			}
+			if !isAdaptableOperand(b.Lhs) {
+				peekL, peekT = rl, lt
+			}
 		}
 		// Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
 		// integer literal adapts to an integer sibling), then pick the family: both integer →
 		// integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
 		// widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
-		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag, params)
+		var rl, rr *rExpr
+		var lt, rt resolvedType
+		var err error
+		if peekL != nil {
+			rl, lt, rr, rt, err = resolveOperandPairWithLhs(s, peekL, peekT, b.Rhs, ag, params)
+		} else {
+			rl, lt, rr, rt, err = resolveOperandPair(s, b.Lhs, b.Rhs, ag, params)
+		}
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -3980,18 +4200,30 @@ func resolveOperandPair(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTy
 		if rl, lt, adopted, err = adoptContainerParam(s, lhs, rt, params); !adopted && err == nil {
 			rl, lt, err = resolve(s, lhs, ctxOf(rt), ag, params)
 		}
-	case rhsLit:
-		if rl, lt, err = resolve(s, lhs, nil, ag, params); err != nil {
-			return nil, resolvedType{}, nil, resolvedType{}, err
-		}
-		var adopted bool
-		if rr, rt, adopted, err = adoptContainerParam(s, rhs, lt, params); !adopted && err == nil {
-			rr, rt, err = resolve(s, rhs, ctxOf(lt), ag, params)
-		}
 	default:
 		if rl, lt, err = resolve(s, lhs, nil, ag, params); err != nil {
 			return nil, resolvedType{}, nil, resolvedType{}, err
 		}
+		return resolveOperandPairWithLhs(s, rl, lt, rhs, ag, params)
+	}
+	if err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	return rl, lt, rr, rt, nil
+}
+
+// resolveOperandPairWithLhs is resolveOperandPair for a non-adaptable LHS already resolved (with no
+// hint) to (rl, lt).
+func resolveOperandPairWithLhs(s *scope, rl *rExpr, lt resolvedType, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+	var rr *rExpr
+	var rt resolvedType
+	var err error
+	if isAdaptableOperand(rhs) {
+		var adopted bool
+		if rr, rt, adopted, err = adoptContainerParam(s, rhs, lt, params); !adopted && err == nil {
+			rr, rt, err = resolve(s, rhs, ctxOf(lt), ag, params)
+		}
+	} else {
 		rr, rt, err = resolve(s, rhs, nil, ag, params)
 	}
 	if err != nil {

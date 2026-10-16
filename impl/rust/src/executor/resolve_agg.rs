@@ -1086,26 +1086,29 @@ pub(crate) fn resolve_array_func(
         .ok_or_else(|| no_func_overload(name))?;
     let slots = desc.arg_families;
 
-    let mut rargs = Vec::with_capacity(args.len());
-    let mut tys = Vec::with_capacity(args.len());
+    let mut firsts = Vec::with_capacity(args.len());
     for a in args {
-        let (r, t) = resolve(scope, a, None, agg, params)?;
-        rargs.push(r);
-        tys.push(t);
+        firsts.push(resolve_first(scope, a, agg, params)?);
     }
     // Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar.
-    let hint = slots.iter().zip(tys.iter()).find_map(|(slot, t)| match t {
-        ResolvedType::Array(e) if is_array_slot(slot) => elem_scalar_hint(e),
-        _ => None,
-    });
-    if let Some(s) = hint {
-        for (i, slot) in slots.iter().enumerate() {
-            if is_array_slot(slot) || is_element_slot(slot) {
-                let (r, t) = resolve(scope, &args[i], Some(s), agg, params)?;
-                rargs[i] = r;
-                tys[i] = t;
+    let hint = slots
+        .iter()
+        .zip(firsts.iter())
+        .find_map(|(slot, f)| match &f.ty {
+            ResolvedType::Array(e) if is_array_slot(slot) => elem_scalar_hint(e),
+            _ => None,
+        });
+    let mut rargs = Vec::with_capacity(args.len());
+    let mut tys = Vec::with_capacity(args.len());
+    for ((a, slot), first) in args.iter().zip(slots.iter()).zip(firsts) {
+        let (r, t) = match hint {
+            Some(s) if is_array_slot(slot) || is_element_slot(slot) => {
+                re_resolve(scope, a, Some(s), first, agg, params)?
             }
-        }
+            _ => first.into_pair(),
+        };
+        rargs.push(r);
+        tys.push(t);
     }
     let elem = match_poly(slots, &tys).ok_or_else(|| no_func_overload(name))?;
     let result = poly_result_type(desc.result, &elem)?;

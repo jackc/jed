@@ -549,11 +549,14 @@ import {
   orderAliasMatch,
   orderKeyDeriv,
   rejectIndeterminateTarget,
+  type FirstPass,
+  reResolve,
   resolve,
   resolveBinary,
   resolveBooleanFilter,
   resolveCollationName,
   resolveDeriv,
+  resolveFirst,
   resolveIntOrDecimalPair,
   resolveJsonObject,
   resolveJsonImage,
@@ -36324,30 +36327,30 @@ export function resolveArrayFunc(
   if (!desc) throw noFuncOverload(name);
   const slots = desc.argFamilies;
 
-  const rargs: RExpr[] = [];
-  const tys: ResolvedType[] = [];
-  for (const a of e.args) {
-    const r = resolve(scope, a, null, ag, params);
-    rargs.push(r.node);
-    tys.push(r.type);
-  }
+  const firsts: FirstPass[] = [];
+  for (const a of e.args) firsts.push(resolveFirst(scope, a, ag, params));
   // Pass 2: adapt the polymorphic args to the array's element type, if it is a scalar. The hint is the
-  // element type of the first anyarray argument.
+  // element type of the first anyarray argument. Only an argument's hint-sensitive parts resolve again
+  // (reResolve), so nested array functions resolve each subexpression once.
   let hint: ScalarType | null = null;
   for (let j = 0; j < slots.length; j++) {
-    if (isArraySlot(slots[j]!) && tys[j]!.kind === "array") {
-      hint = elemScalarHint((tys[j] as { elem: ResolvedType }).elem);
+    const t = firsts[j]!.type;
+    if (isArraySlot(slots[j]!) && t.kind === "array") {
+      hint = elemScalarHint(t.elem);
       break;
     }
   }
-  if (hint !== null) {
-    for (let j = 0; j < slots.length; j++) {
-      if (isArraySlot(slots[j]!) || isElementSlot(slots[j]!)) {
-        const r = resolve(scope, e.args[j]!, hint, ag, params);
-        rargs[j] = r.node;
-        tys[j] = r.type;
-      }
-    }
+  const rargs: RExpr[] = [];
+  const tys: ResolvedType[] = [];
+  for (let j = 0; j < e.args.length; j++) {
+    const first = firsts[j]!;
+    const slot = slots[j]!;
+    const r =
+      hint !== null && (isArraySlot(slot) || isElementSlot(slot))
+        ? reResolve(scope, e.args[j]!, hint, first, ag, params)
+        : first;
+    rargs.push(r.node);
+    tys.push(r.type);
   }
   const { elem, matched } = matchPoly(slots, tys);
   if (!matched) throw noFuncOverload(name);

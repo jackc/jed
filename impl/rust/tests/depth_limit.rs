@@ -172,6 +172,35 @@ fn shapes() -> Vec<Shape> {
         s("operator chain", |n| {
             format!("SELECT {} FROM t", vec!["v"; n + 1].join(" + "))
         }),
+        // The two-pass operand resolvers (cost.md §7): the `-` jsonb peek, `||`, the polymorphic
+        // array functions, containment, and `= ANY(ARRAY[…])`.
+        s("minus chain", |n| {
+            format!("SELECT {} FROM t", vec!["v"; n + 1].join(" - "))
+        }),
+        s("array concat chain", |n| {
+            format!("SELECT {} FROM t", vec!["ARRAY[v]"; n + 1].join(" || "))
+        }),
+        s("jsonb concat chain", |n| {
+            format!("SELECT {} FROM t", vec!["'{}'::jsonb"; n + 1].join(" || "))
+        }),
+        s("array function", |n| {
+            format!(
+                "SELECT {} FROM t",
+                nest("array_append(", "ARRAY[v]", ", 1)", n)
+            )
+        }),
+        s("containment", |n| {
+            format!(
+                "SELECT {} FROM t",
+                nest("ARRAY[true] @> ARRAY[", "true", "]", n)
+            )
+        }),
+        s("= ANY", |n| {
+            format!(
+                "SELECT {} FROM t",
+                nest("true = ANY(ARRAY[", "true", "])", n)
+            )
+        }),
         s("AND chain", |n| {
             format!("SELECT {} FROM t", vec!["true"; n + 1].join(" AND "))
         }),
