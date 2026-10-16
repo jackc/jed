@@ -89,7 +89,7 @@ from a page service), though both are servers.
 
 `open(path)` with a coordinated `locking` mode:
 
-1. Prepare the bundle as today (marker validation, the `arrival` doorbell for v1 exclusion, §12).
+1. Prepare the bundle as today (marker validation, §12).
 2. Try `presence EX` without waiting. On success, become the owner (§4.1).
 3. Otherwise connect to the endpoint (§14). If the endpoint is absent or refuses because the owner
    has not finished starting, retry until `file_lock_timeout_ms` expires, then fail `55006` with the
@@ -189,7 +189,8 @@ drops its page cache, catalog skeleton, and plan caches regardless of `txid`.
 
 Consequently every promotion (§8.1) starts every client cold, at the moment traffic shifts to the new
 owner. Seeding the new owner's window from the two meta slots' manifests would be sound only for a
-client whose cache is known to be from the recovered history; v1 does not attempt it.
+client whose cache is known to be from the recovered history; the first implementation does not
+attempt it.
 
 ### 5.5 Writer gate
 
@@ -311,8 +312,9 @@ all between requests continues transparently. A transaction that was open fails:
   resolved (§8.4).
 
 The promoted process switches its pager from the service to the local file between transactions. Its
-cache holds byte-identical page contents, but v1 drops it; reusing it is an optimization. The new
-owner has a new incarnation id, so every reconnecting client is also told "invalidate all" (§5.4).
+cache holds byte-identical page contents, but the first implementation drops it; reusing it is an
+optimization. The new owner has a new incarnation id, so every reconnecting client is also told
+"invalidate all" (§5.4).
 
 ### 8.2 Ownership preference and yield
 
@@ -453,9 +455,9 @@ corrupt the database regardless (§13).
 
 Superseded when ratified:
 
-- shared mode: the join window, alone↔shared transitions (locking.md §4.2–§4.3), meta refresh at
-  transaction begin (§5.1), the cross-process `writer` and `commit` gates (§5.2–§5.3), and append-only
-  co-resident commits;
+- shared mode: the join window and its `arrival` doorbell, alone↔shared transitions and the
+  `transition` lock (locking.md §4.2–§4.3), meta refresh at transaction begin (§5.1), the
+  cross-process `writer` and `commit` gates (§5.2–§5.3), and append-only co-resident commits;
 - the `shared` value of `locking`. The option becomes `auto` (owner/client) | `exclusive` (owner,
   `serve = false`) | `none` (unchanged escape hatch). The test-only `service` value used
   before phase 4 (§16) is removed with it.
@@ -464,11 +466,9 @@ Kept: the stable bundle and its identity rules (locking.md §3.1), `presence` as
 the hard-link rejection, the per-path in-process registry, fork invalidation, the open timeout, and
 fail-closed behavior on unsupported hosts.
 
-**Migration from v1.** A v2 marker is introduced under locking.md §3.1's migration rule (holding
-`arrival EX`, `transition EX`, and `presence EX`, honoring the v1 lock names). A v2 owner holds
-`presence EX`, so a v1 shared-mode process times out with `55006`; a v2 opener that finds a v1 group
-holding `presence SH` cannot own or connect and fails `55006`. Mixed fleets fail closed, never
-corrupt. The rollout drains v1 processes once, as the v1 rollout drained pre-protocol binaries.
+**No migration.** Shared mode has no production users, so the page service replaces it as a clean
+break, the way a `format_version` change does. The bundle gets a new protocol marker, which an older
+binary already rejects with `0A000` (locking.md §3.1). No mixed-fleet rollout is designed or tested.
 
 ## 13. Security and trust
 
@@ -542,8 +542,8 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
 
 - **Process corpus rewrite.** The release-blocking Layer 4 corpus (locking.md §9) moves from shared
   mode to election, read and write through the service, promotion, yield, owner kill mid-commit,
-  client kill holding a pin or the gate, `commit_status` resolution, and v1/v2 fail-closed exclusion,
-  in every supported core pairing.
+  client kill holding a pin or the gate, and `commit_status` resolution, in every
+  supported core pairing.
 - **The conformance corpus through a client.** Run the entire sqllogictest corpus with the harness
   as a page client of another core's owner (for example a Go client against a Rust owner). Rows,
   errors, plans, and **costs** must be identical to a local run, because page reads are logical.
@@ -568,7 +568,7 @@ Not every core needs to serve: the browser has one process, and WASI has no OS f
 3. **Write path**: writer gate, reuse grant, `commit` with validation, owner adoption, the
    reclamation rule, `commit_status`.
 4. **Handoff**: promotion, yield, graceful close, timeouts; the process-corpus rewrite; simulation
-   testing; retire shared mode and the `shared` option; v2 bundle migration.
+   testing; retire shared mode and the `shared` option; the new bundle marker.
 5. **SSH**: `jed pages` stdio transport, the CLI opening `ssh://host/path`, read-ahead and subtree
    fetch.
 6. **Backup**: page-identical and compacted forms.
@@ -581,13 +581,9 @@ so until it lands shared mode remains what ships. The release that lands phase 4
 owner/client and removes shared mode in one step.
 
 Until then the service is reachable only through a test-only `locking = service` value that the
-process corpus and benchmarks use; `auto` keeps meaning shared mode. A service owner cannot honor
-shared-mode join windows (a joined peer reading the file directly pins snapshots the owner cannot
-see, which breaks the reuse grant, §6, and cache coherence, §5.4), so the two fail closed against
-each other. A service owner holds `presence EX` for its whole tenure and ignores the `arrival`
-doorbell, so a shared-mode opener times out with `55006`. A service opener that finds a shared-mode
-group holding `presence SH` fails `55006` too, as in §12. The test-only value is removed with
-shared mode (§12).
+process corpus and benchmarks use; `auto` keeps meaning shared mode. A service owner does not honor
+shared-mode join windows, so tests never mix the two on one database. The test-only value is removed
+with shared mode (§12).
 
 ## 17. Open questions
 
