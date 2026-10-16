@@ -347,8 +347,8 @@ function classifyOrderKey(
 // may reach (spec/design/cost.md §7; CLAUDE.md §13). The §13 native-stack-safety gate for
 // untrusted input: the recursive-descent parser and the resolve/eval walks recurse to a
 // statement's nesting depth, so deeply-nested SQL would overflow the call stack BEFORE the cost
-// meter runs (54P01 cannot catch it; in this core an overflow is an uncatchable-by-design V8
-// RangeError). Counting logical depth against this fixed bound — rather than PG's runtime
+// meter runs (54P01 cannot catch it; in this core an overflow is a V8 RangeError, catchable but
+// carrying no SQLSTATE). Counting logical depth against this fixed bound — rather than PG's runtime
 // stack-pointer probe — is deterministic and cross-core identical (§8): the constant is the SAME
 // in every core (Rust / Go / TS). Far above any realistic query, 256 still fits this core's stack
 // budget: every statement at the limit runs within 512 KB of V8 stack (the worst, nested WITH,

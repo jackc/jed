@@ -3,8 +3,8 @@
 # expression / subquery / set-operation NESTING DEPTH, checked in the parser, aborting with
 # `54001` (statement_too_complex). It guards the NATIVE CALL STACK — a hazard the cost ceiling
 # cannot catch, because deeply-nested input overflows the recursive-descent parser / resolve /
-# eval walks BEFORE any cost is metered (such a statement would SIGABRT, or throw an
-# uncatchable-by-design RangeError, even at max_cost = 1).
+# eval walks BEFORE any cost is metered (such a statement would SIGABRT, or throw a V8 RangeError
+# that carries no SQLSTATE, even at max_cost = 1).
 #
 # The limit is a deterministic, cross-core-IDENTICAL constant (MAX_EXPR_DEPTH = 256) rather than
 # PostgreSQL's runtime stack-pointer probe (build-/platform-dependent) — a documented divergence

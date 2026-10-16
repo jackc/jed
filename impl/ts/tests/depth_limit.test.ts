@@ -1,8 +1,8 @@
 // Expression / query nesting-depth limit (CLAUDE.md §13; spec/design/cost.md §7). The §13
 // native-stack-safety gate: the recursive-descent parser and the resolve/eval walks recurse to a
 // statement's nesting depth, so deeply-nested untrusted input would overflow the call stack BEFORE
-// the cost meter runs — 54P01 cannot catch it (in this core an overflow is an uncatchable-by-design
-// V8 RangeError). A fixed MAX_EXPR_DEPTH checked in the parser throws 54001 (statement_too_complex)
+// the cost meter runs — 54P01 cannot catch it (in this core an overflow is a V8 RangeError: catchable,
+// but not an engine error with a SQLSTATE). A fixed MAX_EXPR_DEPTH checked in the parser throws 54001 (statement_too_complex)
 // instead. The conformance corpus (spec/conformance/suites/resource/depth_limit.test) pins the
 // cross-core boundary; this exercises the per-vector boundary and that the abort is max_cost-blind.
 

@@ -1750,8 +1750,8 @@ the touched-column / structural-validation passes) recurse to a statement's **ne
 So deeply-nested untrusted input — `1 + 1 + … + 1` thousands deep, or nested
 parens / `ARRAY[…]` / subscripts / `CASE` / scalar subqueries — can **overflow the call
 stack during parse or resolve, *before any cost is metered***. The cost ceiling cannot catch
-this: such a statement SIGABRTs (or, in the TS core, throws an uncatchable-by-design
-`RangeError`) **even at `max_cost = 1`**, because the overflow happens before the meter runs.
+this: such a statement SIGABRTs (or, in the TS core, throws a V8 `RangeError` — catchable, but
+not an engine error with a SQLSTATE) **even at `max_cost = 1`**, because the overflow happens before the meter runs.
 Memory-safety (§13) does not catch it either — a stack overflow is an abort, not a memory
 error the safe language prevents. So it needs its own gate.
 
