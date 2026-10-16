@@ -1154,6 +1154,15 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 	case b.gist != nil:
 		return prefix + "GiST bound: using " + b.gist.nameKey
 	case b.pkSet != nil:
+		if b.pkSet.tuple != nil {
+			names := make([]string, len(b.pkSet.tuple))
+			var specs []intervalSpec
+			for i, m := range b.pkSet.tuple {
+				names[i] = m.name
+				specs = append(specs, m.specs...)
+			}
+			return prefix + "PK interval set: " + strings.Join(names, ", ") + intervalSpecsLabel(specs)
+		}
 		return prefix + "PK interval set: " + db.firstPKColName(tableName) + intervalSpecsLabel(b.pkSet.specs)
 	case b.indexSet != nil:
 		return prefix + "Index interval set: using " + b.indexSet.nameKey + intervalSpecsLabel(b.indexSet.specs)

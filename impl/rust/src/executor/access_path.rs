@@ -88,15 +88,7 @@ impl Engine {
         let mut entries: Vec<(Vec<u8>, Row)> = Vec::new();
         let mut pages = 0usize;
         let mut slabs = 0usize;
-        for b in canonical_interval_set(
-            ks.pk_type,
-            &ks.specs,
-            &ks.clip,
-            params,
-            outer,
-            ks.coll.as_deref(),
-            left,
-        ) {
+        for b in ks.intervals(params, outer, left) {
             let (es, p, s) = if masked {
                 store.range_scan_with_units(&b, mask)?
             } else {

@@ -6684,11 +6684,32 @@ pub(crate) enum ArrayPointSource {
 
 /// Canonical interval-set plan over a single-column PK. Specs are OR disjuncts; `clip` is the
 /// co-present top-level AND bounds on that key.
+///
+/// A composite PK instead carries `tuple` (cost.md §3 "Composite primary keys"): the consumed
+/// members in key order, every one but possibly the last a point member. `pk_type`/`coll`/`specs`/
+/// `clip` are then unused.
 pub(crate) struct PkKeySet {
     pk_type: ScalarType,
     coll: Option<std::sync::Arc<Collation>>,
     specs: Vec<IntervalSpec>,
     clip: Vec<BoundTerm>,
+    tuple: Vec<TupleMember>,
+    member_count: usize,
+    all_fixed: bool,
+}
+
+/// One consumed member of a composite-PK tuple interval set. `specs` is the member's first reducing
+/// OR/IN/ANY conjunct (`None` when it has none); `clip` is every direct comparison on it. `point`
+/// marks a point member (a direct equality, or a set of pure equalities/arrays); a non-point member
+/// is the final member, whose canonical intervals map under each prefix.
+pub(crate) struct TupleMember {
+    name: String,
+    column: usize,
+    col_type: ScalarType,
+    coll: Option<std::sync::Arc<Collation>>,
+    specs: Option<Vec<IntervalSpec>>,
+    clip: Vec<BoundTerm>,
+    point: bool,
 }
 
 /// The [`PkKeySet`] analog over a leading B-tree secondary-index column (indexes.md §5): each

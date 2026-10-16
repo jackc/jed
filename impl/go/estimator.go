@@ -735,7 +735,9 @@ func rangeTermsSelectivity(terms []boundTerm, keyType scalarType) selectivityExp
 	if len(terms) == 0 {
 		return selectivityExpr{kind: selectivityAll}
 	}
-	hasLower, hasUpper := false, false
+	// Every term is checked for a NULL, an impossible equality, or a contradiction before any
+	// equality decides the class, as in the Rust and TS cores.
+	hasLower, hasUpper, hasEqual := false, false, false
 	for i, term := range terms {
 		if estimatorIsNull(term.src) {
 			return selectivityExpr{kind: selectivityZero}
@@ -749,13 +751,15 @@ func rangeTermsSelectivity(terms []boundTerm, keyType scalarType) selectivityExp
 			}
 		}
 		if term.op == opEq {
-			return fractionSelectivity(selectivityEquality)
-		}
-		if term.op == opGt || term.op == opGe {
+			hasEqual = true
+		} else if term.op == opGt || term.op == opGe {
 			hasLower = true
 		} else {
 			hasUpper = true
 		}
+	}
+	if hasEqual {
+		return fractionSelectivity(selectivityEquality)
 	}
 	if hasLower && hasUpper {
 		return fractionSelectivity(selectivityPairedRange)
@@ -885,6 +889,111 @@ func intervalSelectivity(specs []intervalSpec, clip []boundTerm, uniquePoints bo
 	return disjunction
 }
 
+// tupleMemberCount is a tuple-set member's estimated count (estimator.md §8.1): its structurally
+// non-empty estimator disjuncts, or 1 with no set.
+func tupleMemberCount(m *tupleMember) int64 {
+	if m.specs == nil {
+		return 1
+	}
+	count := int64(0)
+	for _, spec := range estimatorIntervalSpecs(m.specs) {
+		if rangeTermsSelectivity(spec.terms, m.colType).kind != selectivityZero {
+			count++
+		}
+	}
+	return count
+}
+
+// tupleMemberEmpty reports a structurally empty member: an impossible equality, a contradictory
+// clip, or a set with no non-empty disjunct.
+func tupleMemberEmpty(m *tupleMember) bool {
+	var eqs []*rExpr
+	for _, t := range m.clip {
+		if t.op == opEq {
+			eqs = append(eqs, t.src)
+		}
+	}
+	if estimatorEqualitySourcesImpossible(eqs, m.colType) {
+		return true
+	}
+	if len(m.clip) > 0 && rangeTermsSelectivity(m.clip, m.colType).kind == selectivityZero {
+		return true
+	}
+	return tupleMemberCount(m) == 0
+}
+
+// structuralTupleMemberSelectivity is one consumed member's estimate without statistics: equality
+// for an equality-only member, the clipped interval-set estimate for a member with a set, and the
+// clip's range estimate for a final member with no set.
+func structuralTupleMemberSelectivity(m *tupleMember) selectivityExpr {
+	switch {
+	case m.specs != nil:
+		return intervalSelectivity(m.specs, m.clip, false, m.colType)
+	case m.point:
+		return fractionSelectivity(selectivityEquality)
+	default:
+		return rangeTermsSelectivity(m.clip, m.colType)
+	}
+}
+
+// statisticsTupleMemberSelectivity refines structuralTupleMemberSelectivity by the member column's
+// statistics, as a single-key bound is.
+func (db *engine) statisticsTupleMemberSelectivity(m *tupleMember, rel scopeRel) selectivityExpr {
+	switch {
+	case m.specs != nil:
+		return db.intervalSelectivityWithStatistics(m.specs, m.clip, false, m.colType, m.column, rel)
+	case m.point:
+		for _, t := range m.clip {
+			if t.op == opEq {
+				if refined, ok := db.statisticsBoundSourceSelectivity(rel, m.column, opEq, t.src); ok {
+					return refined
+				}
+				break
+			}
+		}
+		return fractionSelectivity(selectivityEquality)
+	default:
+		if refined, ok := db.statisticsBoundTermsSelectivity(rel, m.column, m.clip); ok {
+			return refined
+		}
+		return rangeTermsSelectivity(m.clip, m.colType)
+	}
+}
+
+// tupleSetSelectivity estimates a composite-PK tuple set (estimator.md §8.1): the execution's member
+// walk over estimated counts; zero if a consumed member is empty; otherwise the AND of member
+// estimates in key order, then — when every member is consumed as a point — the OR of K full-key
+// equalities over that, so the rows are min(AND, K).
+func tupleSetSelectivity(ks *pkKeySetPlan, member func(*tupleMember) selectivityExpr) selectivityExpr {
+	product := int64(1)
+	consumed, allPoints := 0, true
+	for i := range ks.tuple {
+		m := &ks.tuple[i]
+		if tupleMemberEmpty(m) {
+			return selectivityExpr{kind: selectivityZero}
+		}
+		count := tupleMemberCount(m)
+		if i > 0 && count > 1 && satEstimateMul(product, count) > maxKeySetProbes {
+			break
+		}
+		product = satEstimateMul(product, count)
+		consumed++
+		allPoints = allPoints && m.point
+	}
+	result := member(&ks.tuple[0])
+	for i := 1; i < consumed; i++ {
+		result = result.And(member(&ks.tuple[i]))
+	}
+	if allPoints && consumed == ks.memberCount {
+		parts := make([]selectivityExpr, product)
+		for i := range parts {
+			parts[i] = selectivityExpr{kind: selectivityUnique}
+		}
+		result = result.And(orSelectivities(parts))
+	}
+	return result
+}
+
 func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivityExpr {
 	switch candidate.identity.kind {
 	case scanCandidatePK:
@@ -949,6 +1058,9 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 			return estimatorSelectivityClass(accessGinEqual)
 		}
 	case scanCandidatePKInterval:
+		if candidate.bound.pkSet.tuple != nil {
+			return tupleSetSelectivity(candidate.bound.pkSet, structuralTupleMemberSelectivity)
+		}
 		return intervalSelectivity(candidate.bound.pkSet.specs, candidate.bound.pkSet.clip, true, candidate.bound.pkSet.pkType)
 	case scanCandidateIndexInterval:
 		unique := false
@@ -1066,6 +1178,11 @@ func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandida
 		}
 		return result
 	case scanCandidatePKInterval:
+		if candidate.bound.pkSet.tuple != nil {
+			return tupleSetSelectivity(candidate.bound.pkSet, func(m *tupleMember) selectivityExpr {
+				return db.statisticsTupleMemberSelectivity(m, rel)
+			})
+		}
 		if len(rel.table.PK) != 1 {
 			return structural
 		}

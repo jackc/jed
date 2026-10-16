@@ -290,15 +290,7 @@ impl Engine {
             }
             Some(ScanBound::PkSet(ks)) => {
                 if can_pull {
-                    let intervals = canonical_interval_set(
-                        ks.pk_type,
-                        &ks.specs,
-                        &ks.clip,
-                        params,
-                        env.outer,
-                        ks.coll.as_deref(),
-                        &[],
-                    );
+                    let intervals = ks.intervals(params, env.outer, &[]);
                     if plan.phys.pk_reverse {
                         for bound in intervals.iter().rev() {
                             if !scan_stream_table_interval(

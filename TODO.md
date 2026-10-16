@@ -207,10 +207,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     - [ ] _follow-on:_ the shapes that still full-scan — an array of a *promoted* element type (`i32[]`
       against an `i64` key: convert each element, dropping unrepresentable ones), a folded uncorrelated
       `IN (SELECT …)` / `= ANY(SELECT …)` (its value list is known only after folding), an ANY under
-      an AND leaf of an OR, an index-nested-loop sibling array column, and a composite PK's trailing
-      member (`a = 1 AND b = ANY($1)`). The `<> ALL` / `NOT IN` complement estimate, and pricing the
+      an AND leaf of an OR, and an index-nested-loop sibling array column. The `<> ALL` / `NOT IN`
+      complement estimate, and pricing the
       residual's per-element `operator_eval` for a known array. A bench param generator that binds a
-      real array (`any_array_pk` builds one from eight scalars). _(size: M)_
+      real array (`any_array_pk` and `composite_pk_any` build one from eight scalars). _(size: M)_
+  - [x] **Composite-PK tuple interval sets** — IN / OR / `= ANY` on the members of a composite
+    primary key (`tenant = $1 AND id = ANY($2)`, `a IN (1, 2) AND b IN (3, 4)`, `a IN (…) AND b > 5`)
+    probe the cartesian product of the point members' keys, with a final range member mapped under
+    each prefix, capped at `MAX_KEY_SET_PROBES` combinations. →
+    [cost.md §3](spec/design/cost.md) "Composite primary keys", [estimator.md §8.1](spec/design/estimator.md)
+    - [ ] _follow-on:_ the same tuple set over a multi-column secondary B-tree index (today an index
+      interval set uses only its leading column), and an index-nested-loop sibling column as a
+      member's point source. _(size: M)_
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, distribution facts for
     composite/array/json/jsonb, GIN term statistics for `<@`, and an element-count

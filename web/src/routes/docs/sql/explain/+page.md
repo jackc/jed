@@ -33,6 +33,17 @@ INSERT INTO region VALUES
 	const indexRange = `EXPLAIN SELECT name FROM city WHERE region > 1;`;
 	const pointSet = `EXPLAIN SELECT name FROM city WHERE id IN (1, 3, 5);`;
 	const anyPointSet = `EXPLAIN SELECT name FROM city WHERE id = ANY(ARRAY[1, 3, 5]);`;
+	const stockSeed = `CREATE TABLE stock (
+  store i32,
+  sku   i32,
+  qty   i32 NOT NULL,
+  PRIMARY KEY (store, sku)
+);
+INSERT INTO stock
+  SELECT s, k, (s * k) % 50
+  FROM generate_series(1, 10) AS s, generate_series(1, 500) AS k;`;
+	const tupleSet = `EXPLAIN SELECT sku, qty FROM stock
+WHERE store = 3 AND sku = ANY(ARRAY[7, 42, 99]);`;
 	const indexNestedLoop = `EXPLAIN SELECT c.name
 FROM city c JOIN trip t ON c.id = t.city_id;`;
 	const hashJoin = `EXPLAIN SELECT c.name, t.id
@@ -134,7 +145,8 @@ column and predicate. The original `WHERE` stays as the residual `Filter` above 
 
 For a composite primary key, the detail lists the usable members in key order. jed seeks an exact
 tuple when every member has an equality, or scans a leading equality prefix with an optional range
-on the next member; a predicate on only a non-leading member remains a full scan.
+on the next member; a predicate on only a non-leading member remains a full scan. `IN` lists and
+`= ANY(array)` on the members are covered under *OR / IN key intervals* below.
 
 <LiveSql demo="pkBound" seed={seed} query={pkBound} rows={8} />
 
@@ -179,6 +191,16 @@ since its point count is known only when the query runs. The estimate reads the 
 so a bound list is planned with the values each execution binds.
 
 <LiveSql demo="anyPointSet" seed={seed} query={anyPointSet} rows={8} />
+
+On a **composite** primary key, each member of the key can take one of these lists. `store = 3 AND
+sku = ANY(...)` looks up each `(store, sku)` pair instead of reading all of store 3's rows, and
+`store IN (1, 2) AND sku IN (7, 9)` looks up all four pairs. The detail names the key members the
+set covers, in key order. Members are used in key order while each has an equality or a list of
+values, and the first member with a range (`sku > 40`) is the last one used. With no condition on a
+later member, the set scans each listed prefix, so `store IN (1, 2)` reads both stores' rows. To keep
+the work bounded, a list is used only while the number of combinations stays at or below 65,536.
+
+<LiveSql demo="tupleSet" seed={stockSeed} query={tupleSet} rows={8} />
 
 ## An index-nested-loop join
 

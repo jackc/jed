@@ -1,0 +1,346 @@
+# Composite-PK tuple interval sets (spec/design/cost.md §3 "Composite primary keys"). A composite
+# primary key takes the IN / OR / `= ANY` set forms member by member: `tenant = 1 AND id = ANY($1)`
+# probes one tuple point per element instead of scanning every `tenant = 1` row. Members are walked
+# in key order; a member with an equality or a pure equality set is a point member and the walk
+# continues; the first other member with a set or a range is the final member and its intervals map
+# under each prefix. Execution probes the cartesian product of the point members' keys in key order.
+# The whole WHERE stays the residual filter, so the rows are unchanged and only the cost drops.
+#
+# `cp` is 1,200 rows (three tenants of 400 ids) in a two-level tree, so each probe charges 2
+# page_read (root and leaf) whether it hits or misses; a full scan reads every leaf. On a much smaller
+# table the estimator rightly cannot tell a tuple set from the plain prefix bound (both round to one
+# row), and the canonical tie order keeps the prefix bound. Rows verified against the live PostgreSQL
+# 18 oracle; the costs are jed-owned, so the `# cost:` lines are the cross-core pin. The plans are pinned by EXPLAIN in composite_key_set_explain.test.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.delete, dml.update, query.select, query.where_eq, query.point_lookup, query.composite_pk_pushdown, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.bounded_limit_streaming, query.limit, query.logical_connectives, query.order_by, expr.between, query.subquery_scalar, query.subquery_correlated, query.join_inner, query.aggregates, query.derived_table, maintenance.analyze, func.array_quantified, func.array, query.set_returning, types.array, cast.array, types.i32, types.i64, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE cp (tenant i32, id i64, v i64, PRIMARY KEY (tenant, id))
+
+statement ok
+INSERT INTO cp SELECT t, i, t * 1000 + i FROM generate_series(1, 3) AS t, generate_series(1, 400) AS i
+
+# --- trailing-member point sets --------------------------------------------------------------------
+
+# Equality on the leading member and an array on the trailing one: three tuple points, one a miss.
+# 3 probes × 2 page_read + 2 storage_row_read + the residual (AND, `tenant = 1`, the ANY node, its
+# ARRAY[...] constructor, and elements up to the match: 5 for id 2, 6 for id 4) + 2 row_produced = 21.
+# The plain `tenant = 1` prefix bound would read all 400 of the tenant's rows.
+# cost: 21
+query I rowsort
+SELECT v FROM cp WHERE tenant = 1 AND id = ANY(ARRAY[2, 4, 900])
+----
+1002
+1004
+
+# The IN spelling reads the same tuple points.
+# cost: 21
+query I rowsort
+SELECT v FROM cp WHERE tenant = 1 AND id IN (2, 4, 900)
+----
+1002
+1004
+
+# A bound list.
+# params: 2, ARRAY[1, 3]
+# cost: 17
+query I rowsort
+SELECT v FROM cp WHERE tenant = $1 AND id = ANY($2)
+----
+2001
+2003
+
+# The conjuncts may come in any order.
+# cost: 19
+query I rowsort
+SELECT v FROM cp WHERE id = ANY(ARRAY[3, 5]) AND tenant = 1
+----
+1003
+1005
+
+# --- leading-member point sets ---------------------------------------------------------------------
+
+# A set on the leading member and an equality on the trailing one: one tuple point per tenant.
+# cost: 17
+query I rowsort
+SELECT v FROM cp WHERE tenant IN (1, 3) AND id = 7
+----
+1007
+3007
+
+# Sets on both members probe their cartesian product: {1,2} × {2,3} = 4 tuple points.
+# cost: 40
+query I rowsort
+SELECT v FROM cp WHERE tenant = ANY(ARRAY[1, 2]) AND id IN (2, 3)
+----
+1002
+1003
+2002
+2003
+
+# A leading set with nothing on the trailing member scans each tenant's prefix range. Tenants 1 and 2
+# are byte-adjacent i32 prefixes, so their ranges touch and merge into one.
+# cost: 3606
+query I nosort
+SELECT count(*) FROM cp WHERE tenant IN (1, 2)
+----
+800
+
+# Tenants 1 and 3 are not adjacent and stay two ranges: one more descent.
+# cost: 3608
+query I nosort
+SELECT count(*) FROM cp WHERE tenant IN (1, 3)
+----
+800
+
+# --- a final range member --------------------------------------------------------------------------
+
+# A range on the member after a point set maps under every prefix.
+# cost: 30
+query I rowsort
+SELECT v FROM cp WHERE tenant IN (1, 3) AND id >= 399
+----
+1399
+1400
+3399
+3400
+
+# BETWEEN on the final member.
+# cost: 38
+query I rowsort
+SELECT v FROM cp WHERE tenant IN (2, 3) AND id BETWEEN 2 AND 3
+----
+2002
+2003
+3002
+3003
+
+# A range union on the final member: each interval maps under the prefix.
+# cost: 17
+query I rowsort
+SELECT v FROM cp WHERE tenant = 1 AND (id < 2 OR id > 399)
+----
+1001
+1400
+
+# --- clipping, duplicates, NULLs, empty sets -------------------------------------------------------
+
+# A same-member range clips the member's points: only 2 and 5 survive id > 1.
+# cost: 25
+query I rowsort
+SELECT v FROM cp WHERE tenant = 1 AND id IN (1, 2, 5) AND id > 1
+----
+1002
+1005
+
+# Duplicate points probe once.
+# cost: 10
+query I rowsort
+SELECT v FROM cp WHERE tenant IN (2, 2) AND id = ANY(ARRAY[1, 1, 1])
+----
+2001
+
+# A NULL element contributes no point.
+# cost: 9
+query I rowsort
+SELECT v FROM cp WHERE tenant = 1 AND id = ANY(ARRAY[1, NULL])
+----
+1001
+
+# An empty array makes the whole set empty: nothing is read.
+# cost: 0
+query I rowsort
+SELECT v FROM cp WHERE tenant = 1 AND id = ANY('{}'::i64[])
+----
+
+# So does a leading member with no surviving points.
+# cost: 0
+query I rowsort
+SELECT v FROM cp WHERE tenant IN (1, 2) AND tenant > 5 AND id = ANY(ARRAY[1, 2])
+----
+
+# --- fallbacks -------------------------------------------------------------------------------------
+
+# A disjunction across members is not a member's set: a full scan.
+# cost: 4810
+query I nosort
+SELECT count(*) FROM cp WHERE tenant = 3 OR id = 400
+----
+402
+
+# An i32[] against the i64 member is a promoted comparison: the array does not bound, so only the
+# `tenant = 1` prefix is used.
+# cost: 3204
+query I rowsort
+SELECT v FROM cp WHERE tenant = 1 AND id = ANY(ARRAY[2, 4]::i32[])
+----
+1002
+1004
+
+# --- order, LIMIT, mutation, correlation, joins ----------------------------------------------------
+
+# The tuple points come out in key order, so ORDER BY the key needs no sort, and LIMIT stops after
+# the second point.
+# cost: 23
+query II nosort
+SELECT tenant, id FROM cp WHERE tenant IN (1, 2, 3) AND id = ANY(ARRAY[3, 1]) ORDER BY tenant, id LIMIT 2
+----
+1
+1
+1
+3
+
+# Descending key order reads the points backward.
+# cost: 36
+query II nosort
+SELECT tenant, id FROM cp WHERE tenant IN (1, 2) AND id IN (1, 2) ORDER BY tenant DESC, id DESC
+----
+2
+2
+2
+1
+1
+2
+1
+1
+
+# A correlated outer array bounds the inner scan per outer row. Without statistics the estimator
+# reads `tenant = o.t` as 6 of 1,200 rows, fewer than the 10 elements it assumes for an unreadable
+# array, so it keeps the prefix bound; ANALYZE shows each tenant holds 400 rows.
+statement ok
+ANALYZE cp
+
+# cost: 35
+query ID rowsort
+SELECT o.t, (SELECT sum(v) FROM cp WHERE tenant = o.t AND id = ANY(o.ids)) FROM (VALUES (1, ARRAY[1, 5]::i64[]), (3, ARRAY[3]::i64[])) AS o(t, ids)
+----
+1
+2006
+3
+3003
+
+# A join's relation is bounded by its own tuple set.
+statement ok
+CREATE TABLE names (tenant i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO names VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+# cost: 52
+query TI rowsort
+SELECT n.name, c.v FROM names n JOIN cp c ON c.tenant = n.tenant WHERE c.tenant IN (2, 3) AND c.id = ANY(ARRAY[1, 2])
+----
+three
+3001
+three
+3002
+two
+2001
+two
+2002
+
+# UPDATE and DELETE share the path.
+# cost: 15
+statement ok
+UPDATE cp SET v = 0 WHERE tenant = 2 AND id IN (1, 3)
+
+# cost: 40
+statement ok
+DELETE FROM cp WHERE tenant IN (1, 3) AND id = ANY(ARRAY[1, 4])
+
+query III nosort
+SELECT tenant, id, v FROM cp WHERE id <= 4 ORDER BY tenant, id
+----
+1
+2
+1002
+1
+3
+1003
+2
+1
+0
+2
+2
+2002
+2
+3
+0
+2
+4
+2004
+3
+2
+3002
+3
+3
+3003
+
+# --- a three-member key ----------------------------------------------------------------------------
+
+# A text member is self-delimiting, so its points concatenate in byte order too. The walk stops at
+# the first member with nothing on it: here `day` ends it, and `seq = 1` stays residual.
+statement ok
+CREATE TABLE events (region text, day i32, seq i32, n i32, PRIMARY KEY (region, day, seq))
+
+statement ok
+INSERT INTO events SELECT r, d, s, d * 10 + s FROM (VALUES ('east'), ('north'), ('west')) AS rg(r), generate_series(1, 20) AS d, generate_series(1, 20) AS s
+
+# cost: 8049
+query I nosort
+SELECT count(*) FROM events WHERE region IN ('west', 'east') AND seq = 1
+----
+40
+
+# Every member a point: complete tuple points across all three members, 2 × 2 × 1 = 4 probes.
+# cost: 66
+query TI rowsort
+SELECT region, n FROM events WHERE region IN ('west', 'east') AND day IN (1, 2) AND seq = 1
+----
+east
+11
+east
+21
+west
+11
+west
+21
+
+# A final range on the third member.
+# cost: 42
+query TI rowsort
+SELECT region, n FROM events WHERE region = ANY(ARRAY['west', 'north']) AND day = 2 AND seq > 18
+----
+north
+39
+north
+40
+west
+39
+west
+40
+
+# --- the probe cap ---------------------------------------------------------------------------------
+
+# 1,000 rows of a three-member key. 40 × 40 × 40 = 64,000 tuple points is within MAX_KEY_SET_PROBES
+# (65,536), so all three members are consumed; every member is fixed-width, so each `(a, b)`'s
+# consecutive `c` points are byte-adjacent and merge, leaving 1,600 ranges. 41 × 41 × 41 = 68,921 is
+# over the cap, so `c` is not consumed (its array stays residual) and the 1,681 `(a, b)` prefix ranges
+# are scanned instead — which, consecutive again, merge into 41. The rows are the same.
+statement ok
+CREATE TABLE wide (a i32, b i32, c i32, PRIMARY KEY (a, b, c))
+
+statement ok
+INSERT INTO wide SELECT x, y, z FROM generate_series(1, 10) AS x, generate_series(1, 10) AS y, generate_series(1, 10) AS z
+
+# cost: 26704
+query I nosort
+SELECT count(*) FROM wide WHERE a = ANY('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40}'::i32[]) AND b = ANY('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40}'::i32[]) AND c = ANY('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40}'::i32[])
+----
+1000
+
+# cost: 23586
+query I nosort
+SELECT count(*) FROM wide WHERE a = ANY('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41}'::i32[]) AND b = ANY('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41}'::i32[]) AND c = ANY('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41}'::i32[])
+----
+1000

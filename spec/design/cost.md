@@ -526,6 +526,50 @@ point-set/range intersection).
   bounds the inner scan per outer row (the correlated-pushdown seam above); an array that is a column
   of the scanned relation, or any other expression, does not bound.
 
+- **Composite primary keys — tuple interval sets** (`query.composite_key_set`). A composite PK
+  `(k1, …, kn)` takes the same set forms member by member, so `tenant = 1 AND id = ANY($1)`,
+  `a IN (1, 2) AND b = 7`, and `a = 1 AND (b < 3 OR b > 8)` probe only the matching key tuples
+  instead of the whole `tenant = 1` / table subtree. Members are walked in key order; a member whose
+  column is not a key-encodable scalar or whose collation cannot push ends the walk before it. For
+  each member, the WHERE's top-level AND-chain gives the member's **set** — the first conjunct that
+  reduces to a pure same-member disjunction, exactly as for a single key above (IN, OR, `= ANY`) —
+  and its **clip**, every direct comparison conjunct on the member (equalities included).
+  - A **point member** has a direct equality, or a set whose every disjunct is an equality
+    conjunction or an `= ANY` array. Its points are every disjunct's encoded point (one per array
+    element; with no set, the single point its equalities agree on), dropped when outside the clip,
+    then sorted and de-duplicated by encoded bytes. Points are **never merged** into ranges, even
+    when byte-adjacent. The walk continues past a point member.
+  - The first member that is not a point member but has a set or a clip is the **final member**. It
+    contributes the canonical interval set of a single key above (its set clipped by its clip, or just
+    the interval its clip describes), and the walk stops after it.
+  - The candidate exists only when some consumed member has a set; with none, the ordinary PK
+    candidate is the same bound.
+
+  At execution each consumed member is evaluated in key order. A member with no points (or no
+  intervals) makes the set empty: it reads nothing. The point members' keys form the cartesian
+  product of **prefixes** `P`, in lexicographic member order — which is byte order, since each member
+  encoding is fixed-width or self-delimiting. To keep this unmetered expansion input-linear, the
+  running product is capped at `MAX_KEY_SET_PROBES = 65536`: the first member is always consumed, and
+  a later member with more than one point (or final interval) whose count would take the running
+  product over the cap is **not consumed, and nor is any member after it**. The set simply widens to the shorter prefix — a
+  superset, like every bound — with the same result rows. Each prefix then gives intervals:
+
+  - all `n` members consumed as points: the tuple point `[P, P]`;
+  - no final member consumed: `[P, prefix-successor(P))` (a proper prefix, as in the point-lookup rule);
+  - a final interval `[lo, hi]`: the lower endpoint is `P` (none), `P || lo` (inclusive), or
+    `prefix-successor(P || lo)` (exclusive); the exclusive upper endpoint is `prefix-successor(P)`
+    (none), `prefix-successor(P || hi)` (inclusive), or `P || hi` (exclusive). An empty `P` leaves an
+    absent endpoint unbounded.
+
+  The resulting tuple intervals are canonicalized exactly as a single key's: sorted, and merged when
+  they overlap or touch, or when closed and byte-adjacent under `prefix-successor` with every PK
+  member fixed-width. Cost is again the sum of the canonical intervals' bounded scans. SELECT and
+  UPDATE/DELETE share the path, LIMIT streaming pulls the intervals in order, and the PK's storage
+  order makes `ORDER BY` on a PK prefix elidable as for a single key. Wherever the legacy
+  fixed-policy selector still applies (the initial per-relation bounds of a join), a tuple set
+  replaces the contiguous PK bound, which it is always contained in. Secondary indexes still take
+  only their leading column's set; a multi-column index tuple set is a follow-on.
+
 A canonical interval-set bound takes the **eager materialize path** — the single-table streaming / columnar
 / vectorized-aggregate fast paths (which each interpret only a single contiguous bound) gate **off**
 it, exactly as they do an index / GIN / GiST bound. `spec/conformance/suites/query/or_in_point_lookup.test`

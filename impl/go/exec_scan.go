@@ -1268,7 +1268,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		}
 	case sb.pkSet != nil:
 		if canPull {
-			intervals := canonicalIntervalSet(sb.pkSet.pkType, sb.pkSet.specs, sb.pkSet.clip, params, env.outer, sb.pkSet.coll, nil)
+			intervals := sb.pkSet.intervals(params, env.outer, nil)
 			for step := 0; step < len(intervals); step++ {
 				i := step
 				if plan.phys.pkReverse {

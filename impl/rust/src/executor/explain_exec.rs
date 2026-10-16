@@ -1108,6 +1108,19 @@ impl Engine {
             Some(ScanBound::Index(ib)) => format!("{prefix}Index bound: using {}", ib.name_key),
             Some(ScanBound::Gin(gb)) => format!("{prefix}GIN bound: using {}", gb.name_key),
             Some(ScanBound::Gist(gp)) => format!("{prefix}GiST bound: using {}", gp.name_key),
+            Some(ScanBound::PkSet(ks)) if !ks.tuple.is_empty() => {
+                let names: Vec<&str> = ks.tuple.iter().map(|m| m.name.as_str()).collect();
+                let specs: Vec<&IntervalSpec> = ks
+                    .tuple
+                    .iter()
+                    .flat_map(|m| m.specs.iter().flatten())
+                    .collect();
+                format!(
+                    "{prefix}PK interval set: {}{}",
+                    names.join(", "),
+                    interval_specs_label(specs)
+                )
+            }
             Some(ScanBound::PkSet(ks)) => format!(
                 "{prefix}PK interval set: {}{}",
                 self.first_pk_col_name(table_name),
@@ -1164,9 +1177,13 @@ fn subquery_node(label: &str) -> String {
 
 /// An interval set's structural disjunct count, plus how many of those disjuncts are
 /// `key = ANY(array)` arrays, whose point count is known only at execution (explain.md §5).
-fn interval_specs_label(specs: &[IntervalSpec]) -> String {
-    let arrays = specs.iter().filter(|spec| spec.array.is_some()).count();
-    let mut label = format!("; intervals={}", specs.len());
+fn interval_specs_label<'a>(specs: impl IntoIterator<Item = &'a IntervalSpec>) -> String {
+    let (mut count, mut arrays) = (0, 0);
+    for spec in specs {
+        count += 1;
+        arrays += usize::from(spec.array.is_some());
+    }
+    let mut label = format!("; intervals={count}");
     if arrays > 0 {
         label.push_str(&format!("; arrays={arrays}"));
     }

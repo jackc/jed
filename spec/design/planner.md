@@ -503,7 +503,10 @@ is:
 5. **OR / IN interval set** (normally last resort) — a pure same-key disjunction of equality/range
    leaves on a single-column PK or leading index column, runtime-canonicalized to disjoint key
    intervals. A `key = ANY(array)` over an exact-element-type constant array is one such disjunct,
-   expanding to a point per element at execution ([cost.md §3](cost.md) "OR / IN-list"). A co-present direct range on that same key clips the set; this clipped set deliberately
+   expanding to a point per element at execution ([cost.md §3](cost.md) "OR / IN-list"). A
+   composite PK takes these sets member by member as a tuple interval set, probing the cartesian
+   product of its point members ([cost.md §3](cost.md) "Composite primary keys"); it always replaces
+   the contiguous PK bound it is contained in. A co-present direct range on that same key clips the set; this clipped set deliberately
    wins over the broader contiguous clip alone.
 6. Else: **full scan**.
 

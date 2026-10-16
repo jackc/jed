@@ -454,7 +454,8 @@ pub(crate) fn inventory_scan_candidates<'a>(
             ));
         }
     }
-    let pk_intervals = rel.table.primary_key_index().and_then(|pk_local| {
+    let pk_intervals = detect_tuple_interval_set(filter_expr, rel, catalog).or_else(|| {
+        let pk_local = rel.table.primary_key_index()?;
         let sty = rel.table.columns[pk_local].ty.as_scalar()?;
         let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
         let (specs, clip) =
@@ -464,6 +465,9 @@ pub(crate) fn inventory_scan_candidates<'a>(
             coll,
             specs,
             clip,
+            tuple: Vec::new(),
+            member_count: 1,
+            all_fixed: sty.is_fixed_width(),
         })
     });
     if let Some(bound) = pk_intervals {
@@ -1276,9 +1280,7 @@ fn estimator_candidate_selectivity(
             }
         }
         Some(ScanBound::Gin(bound)) => selectivity_class(bound.strategy.access_method()),
-        Some(ScanBound::PkSet(bound)) => {
-            estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
-        }
+        Some(ScanBound::PkSet(bound)) => pk_set_structural_selectivity(bound),
         Some(ScanBound::IndexSet(bound)) => {
             let unique = rel.table.indexes.iter().any(|index| {
                 index.name == identity.index_name && index.unique && index.keys.len() == 1
@@ -1287,6 +1289,128 @@ fn estimator_candidate_selectivity(
         }
         None => Selectivity::All,
     }
+}
+
+/// A PK interval set's structural access selectivity: the single-key interval estimate, or the
+/// composite tuple-set walk.
+fn pk_set_structural_selectivity(bound: &PkKeySet) -> crate::estimator::Selectivity {
+    if bound.tuple.is_empty() {
+        estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
+    } else {
+        tuple_set_selectivity(bound, structural_tuple_member_selectivity)
+    }
+}
+
+/// A tuple-set member's estimated count (estimator.md §8.1): its structurally non-empty estimator
+/// disjuncts, or 1 with no set.
+fn tuple_member_count(m: &TupleMember) -> i64 {
+    let Some(specs) = &m.specs else {
+        return 1;
+    };
+    estimator_interval_terms(specs, m.col_type)
+        .iter()
+        .filter(|terms| {
+            !matches!(
+                estimator_range_terms(terms, m.col_type),
+                crate::estimator::Selectivity::Zero
+            )
+        })
+        .count() as i64
+}
+
+/// A structurally empty member: an impossible equality, a contradictory clip, or a set with no
+/// non-empty disjunct.
+fn tuple_member_empty(m: &TupleMember) -> bool {
+    let eqs: Vec<BoundSrc> = m
+        .clip
+        .iter()
+        .filter(|t| t.op == CmpOp::Eq)
+        .map(|t| t.src.clone())
+        .collect();
+    estimator_equality_sources_impossible(&eqs, m.col_type)
+        || (!m.clip.is_empty()
+            && matches!(
+                estimator_range_terms(&m.clip, m.col_type),
+                crate::estimator::Selectivity::Zero
+            ))
+        || tuple_member_count(m) == 0
+}
+
+/// One consumed member's estimate without statistics: equality for an equality-only member, the
+/// clipped interval-set estimate for a member with a set, and the clip's range estimate for a final
+/// member with no set.
+fn structural_tuple_member_selectivity(m: &TupleMember) -> crate::estimator::Selectivity {
+    match &m.specs {
+        Some(specs) => estimator_interval_selectivity(specs, &m.clip, false, m.col_type),
+        None if m.point => crate::estimator::Selectivity::fraction(
+            crate::estimator_constants::SELECTIVITY_EQUALITY,
+        ),
+        None => estimator_range_terms(&m.clip, m.col_type),
+    }
+}
+
+/// [`structural_tuple_member_selectivity`] refined by the member column's statistics, as a
+/// single-key bound is.
+fn statistics_tuple_member_selectivity(
+    m: &TupleMember,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::Selectivity {
+    match &m.specs {
+        Some(specs) => estimator_interval_selectivity_with_statistics(
+            specs, &m.clip, false, m.col_type, m.column, rel, catalog,
+        ),
+        None if m.point => m
+            .clip
+            .iter()
+            .find(|t| t.op == CmpOp::Eq)
+            .and_then(|t| {
+                statistics_bound_source_selectivity(rel, m.column, CmpOp::Eq, &t.src, catalog)
+            })
+            .unwrap_or(crate::estimator::Selectivity::fraction(
+                crate::estimator_constants::SELECTIVITY_EQUALITY,
+            )),
+        None => statistics_bound_terms_selectivity(rel, m.column, &m.clip, catalog)
+            .unwrap_or_else(|| estimator_range_terms(&m.clip, m.col_type)),
+    }
+}
+
+/// Estimate a composite-PK tuple set (estimator.md §8.1): the execution's member walk over
+/// estimated counts; zero if a consumed member is empty; otherwise the AND of member estimates in
+/// key order, then — when every member is consumed as a point — the OR of K full-key equalities
+/// over that, so the rows are min(AND, K).
+fn tuple_set_selectivity(
+    ks: &PkKeySet,
+    member: impl Fn(&TupleMember) -> crate::estimator::Selectivity,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    let mut product = 1i64;
+    let mut consumed = 0usize;
+    let mut all_points = true;
+    for (i, m) in ks.tuple.iter().enumerate() {
+        if tuple_member_empty(m) {
+            return Selectivity::Zero;
+        }
+        let count = tuple_member_count(m);
+        if i > 0
+            && count > 1
+            && crate::estimator::sat_mul(product, count) > MAX_KEY_SET_PROBES as i64
+        {
+            break;
+        }
+        product = crate::estimator::sat_mul(product, count);
+        consumed += 1;
+        all_points = all_points && m.point;
+    }
+    let mut result = member(&ks.tuple[0]);
+    for m in &ks.tuple[1..consumed] {
+        result = result.and(member(m));
+    }
+    if all_points && consumed == ks.member_count {
+        let parts = (0..product).map(|_| Selectivity::Unique).collect();
+        result = result.and(crate::estimator::or_selectivities(parts));
+    }
+    result
 }
 
 fn estimator_interval_selectivity_with_statistics(
@@ -1405,6 +1529,11 @@ fn estimator_candidate_selectivity_with_statistics(
                 );
             }
             result
+        }
+        Some(ScanBound::PkSet(bound)) if !bound.tuple.is_empty() => {
+            tuple_set_selectivity(bound, |m| {
+                statistics_tuple_member_selectivity(m, rel, catalog)
+            })
         }
         Some(ScanBound::PkSet(bound)) => {
             let Some(column) = rel.table.primary_key_index() else {
@@ -1890,9 +2019,7 @@ pub(crate) fn estimate_selected_scan(
             Some(ScanBound::Gin(bound)) => {
                 crate::estimator::selectivity_class(bound.strategy.access_method())
             }
-            Some(ScanBound::PkSet(bound)) => {
-                estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
-            }
+            Some(ScanBound::PkSet(bound)) => pk_set_structural_selectivity(bound),
             Some(ScanBound::IndexSet(bound)) => {
                 let unique = rel.table.indexes.iter().any(|index| {
                     index.name == bound.name_key && index.unique && index.keys.len() == 1
@@ -1984,7 +2111,9 @@ fn candidate_index(
 
 fn legacy_scan_candidate_index(candidates: &[ScanCandidate<'_>]) -> Option<usize> {
     if let Some(i) = candidate_index(candidates, ScanCandidateKind::PkInterval, None) {
-        if matches!(&candidates[i].bound, Some(ScanBound::PkSet(set)) if !set.clip.is_empty()) {
+        // A composite-PK tuple set is always contained in the contiguous PK bound, so it replaces it.
+        if matches!(&candidates[i].bound, Some(ScanBound::PkSet(set)) if !set.clip.is_empty() || !set.tuple.is_empty())
+        {
             return Some(i);
         }
     }
@@ -2193,6 +2322,102 @@ pub(crate) fn detect_interval_set(
         }
     }
     Some((specs, clip))
+}
+
+/// Build a composite-PK tuple interval set (cost.md §3 "Composite primary keys"): members in key
+/// order, each with its own set (the first reducing OR/IN/ANY conjunct) and clip (every direct
+/// comparison). A point member continues the walk; the first other member with a set or clip is the
+/// final member and ends it. `None` unless some consumed member has a set.
+pub(crate) fn detect_tuple_interval_set(
+    filter: &RExpr,
+    rel: &ScopeRel,
+    catalog: &Engine,
+) -> Option<PkKeySet> {
+    let pk = rel.table.pk_indices();
+    if pk.len() < 2 {
+        return None;
+    }
+    fn flatten<'a>(e: &'a RExpr, out: &mut Vec<&'a RExpr>) {
+        if let RExpr::And(l, r) = e {
+            flatten(l, out);
+            flatten(r, out);
+        } else {
+            out.push(e);
+        }
+    }
+    let mut conjuncts = Vec::new();
+    flatten(filter, &mut conjuncts);
+    let all_fixed = pk.iter().all(|ci| {
+        rel.table.columns[*ci]
+            .ty
+            .as_scalar()
+            .is_some_and(|ty| ty.is_fixed_width())
+    });
+    let mut tuple = Vec::new();
+    let mut has_set = false;
+    for ci in &pk {
+        let Some(ty) = rel.table.columns[*ci].ty.as_scalar() else {
+            break;
+        };
+        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[*ci]) else {
+            break;
+        };
+        let col_coll = coll.as_ref().map(|c| c.name.as_str());
+        let key_idx = rel.offset + *ci;
+        let mut found = None;
+        for (i, e) in conjuncts.iter().enumerate() {
+            if !matches!(e, RExpr::Or(_, _) | RExpr::Quantified { .. }) {
+                continue;
+            }
+            if let Some(specs) = reduce_interval_union(e, key_idx, ty, col_coll) {
+                found = Some((i, specs));
+                break;
+            }
+        }
+        let found_idx = found.as_ref().map(|(i, _)| *i);
+        let specs = found.map(|(_, specs)| specs);
+        let mut clip = Vec::new();
+        for (i, e) in conjuncts.iter().enumerate() {
+            if Some(i) != found_idx {
+                collect_bound_terms(e, &KeyMatch::Column(key_idx), ty, col_coll, None, &mut clip);
+            }
+        }
+        let has_eq = clip.iter().any(|t| t.op == CmpOp::Eq);
+        let point = has_eq || specs.as_deref().is_some_and(point_specs);
+        if !point && specs.is_none() && clip.is_empty() {
+            break;
+        }
+        has_set = has_set || specs.is_some();
+        tuple.push(TupleMember {
+            name: rel.table.columns[*ci].name.clone(),
+            column: *ci,
+            col_type: ty,
+            coll,
+            specs,
+            clip,
+            point,
+        });
+        if !point {
+            break;
+        }
+    }
+    has_set.then(|| PkKeySet {
+        pk_type: tuple[0].col_type,
+        coll: None,
+        specs: Vec::new(),
+        clip: Vec::new(),
+        tuple,
+        member_count: pk.len(),
+        all_fixed,
+    })
+}
+
+/// Whether every disjunct is a point: an `= ANY` array or a conjunction of equalities.
+fn point_specs(specs: &[IntervalSpec]) -> bool {
+    specs.iter().all(|spec| {
+        spec.array.is_some()
+            || (!spec.terms.is_empty() && spec.terms.iter().all(|t| t.op == CmpOp::Eq))
+    })
 }
 
 /// Reduce one pure OR tree to interval specs. Each non-OR leaf may be a conjunction, but every term
@@ -4750,6 +4975,12 @@ pub(crate) fn canonical_interval_set(
             intervals.push(b);
         }
     }
+    merge_key_intervals(intervals, key_type.is_fixed_width())
+}
+
+/// Sort intervals by lower endpoint and merge those that overlap or touch, and — when every key byte
+/// is fixed-width — closed intervals adjacent under `prefix_successor`.
+fn merge_key_intervals(mut intervals: Vec<KeyBound>, fixed_width: bool) -> Vec<KeyBound> {
     intervals.sort_by(|a, b| match (&a.lo, &b.lo) {
         (None, None) => b.lo_inc.cmp(&a.lo_inc),
         (None, Some(_)) => std::cmp::Ordering::Less,
@@ -4766,7 +4997,7 @@ pub(crate) fn canonical_interval_set(
         if !merge {
             let cmp = next.lo.as_ref().unwrap().cmp(cur.hi.as_ref().unwrap());
             merge = cmp.is_lt() || (cmp.is_eq() && (cur.hi_inc || next.lo_inc));
-            if !merge && key_type.is_fixed_width() && cur.hi_inc && next.lo_inc {
+            if !merge && fixed_width && cur.hi_inc && next.lo_inc {
                 merge = prefix_successor(cur.hi.as_ref().unwrap()) == next.lo;
             }
         }
@@ -4790,6 +5021,197 @@ pub(crate) fn canonical_interval_set(
         }
     }
     out
+}
+
+/// The cap on a composite-PK tuple set's running product of member counts (cost.md §3): a later
+/// member with more than one point that would exceed it is not consumed, nor any member after it,
+/// so the unmetered cartesian expansion stays input-linear.
+pub(crate) const MAX_KEY_SET_PROBES: usize = 65536;
+
+impl PkKeySet {
+    /// The set's canonical storage-key intervals for one execution.
+    pub(crate) fn intervals(
+        &self,
+        params: &[Value],
+        outer: &[&[Value]],
+        left: &[Value],
+    ) -> Vec<KeyBound> {
+        if !self.tuple.is_empty() {
+            return tuple_interval_set(self, params, outer, left);
+        }
+        canonical_interval_set(
+            self.pk_type,
+            &self.specs,
+            &self.clip,
+            params,
+            outer,
+            self.coll.as_deref(),
+            left,
+        )
+    }
+}
+
+/// A point member's sorted, de-duplicated encoded points (never merged), each inside the member's
+/// clip. A member with no set has the single point its equalities agree on.
+fn member_points(
+    m: &TupleMember,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> Vec<Vec<u8>> {
+    let coll = m.coll.as_deref();
+    let Some(clip) = build_logical_interval(m.col_type, &m.clip, params, outer, coll, left) else {
+        return Vec::new();
+    };
+    let Some(specs) = &m.specs else {
+        return clip.lo.into_iter().collect();
+    };
+    let inside = |key: &[u8]| {
+        let mut point = KeyBound::unbounded();
+        intersect_lo(&mut point, key, true);
+        intersect_hi(&mut point, key, true);
+        !bound_empty(&intersect_bounds(point, &clip))
+    };
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for spec in specs {
+        if let Some(array) = &spec.array {
+            keys.extend(
+                array_point_keys(m.col_type, array, params, outer, coll)
+                    .into_iter()
+                    .filter(|key| inside(key)),
+            );
+            continue;
+        }
+        if let Some(b) = build_logical_interval(m.col_type, &spec.terms, params, outer, coll, left)
+            && let Some(key) = b.lo
+            && inside(&key)
+        {
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The final member's canonical logical intervals: its set clipped by its clip, or with no set the
+/// one interval its clip describes.
+fn final_member_intervals(
+    m: &TupleMember,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> Vec<KeyBound> {
+    let coll = m.coll.as_deref();
+    match &m.specs {
+        Some(specs) => {
+            canonical_interval_set(m.col_type, specs, &m.clip, params, outer, coll, left)
+        }
+        None => build_logical_interval(m.col_type, &m.clip, params, outer, coll, left)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn concat_key(p: &[u8], k: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(p.len() + k.len());
+    out.extend_from_slice(p);
+    out.extend_from_slice(k);
+    out
+}
+
+/// Resolve a composite-PK tuple set (cost.md §3): the cartesian product of the point members' keys
+/// as prefixes, each a tuple point, a prefix range, or the final member's intervals under it, then
+/// canonicalized. A later member with more than one point that would take the running product over
+/// [`MAX_KEY_SET_PROBES`] ends the walk unconsumed.
+fn tuple_interval_set(
+    ks: &PkKeySet,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> Vec<KeyBound> {
+    let mut prefixes: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut final_intervals: Vec<KeyBound> = Vec::new();
+    let mut has_final = false;
+    let mut consumed = 0usize;
+    for (i, m) in ks.tuple.iter().enumerate() {
+        let (points, intervals) = if m.point {
+            (member_points(m, params, outer, left), Vec::new())
+        } else {
+            (Vec::new(), final_member_intervals(m, params, outer, left))
+        };
+        let count = if m.point {
+            points.len()
+        } else {
+            intervals.len()
+        };
+        if count == 0 {
+            return Vec::new();
+        }
+        if i > 0 && count > 1 && count > MAX_KEY_SET_PROBES / prefixes.len() {
+            break;
+        }
+        consumed += 1;
+        if !m.point {
+            final_intervals = intervals;
+            has_final = true;
+            break;
+        }
+        let mut next = Vec::with_capacity(prefixes.len() * count);
+        for p in &prefixes {
+            for k in &points {
+                next.push(concat_key(p, k));
+            }
+        }
+        prefixes = next;
+    }
+    let complete = consumed == ks.member_count && !has_final;
+    let mut out: Vec<KeyBound> = Vec::with_capacity(prefixes.len() * final_intervals.len().max(1));
+    for p in &prefixes {
+        if complete {
+            out.push(KeyBound {
+                lo: Some(p.clone()),
+                lo_inc: true,
+                hi: Some(p.clone()),
+                hi_inc: true,
+            });
+            continue;
+        }
+        if !has_final {
+            out.push(KeyBound {
+                lo: (!p.is_empty()).then(|| p.clone()),
+                lo_inc: true,
+                hi: prefix_successor(p),
+                hi_inc: false,
+            });
+            continue;
+        }
+        for iv in &final_intervals {
+            let lo = match &iv.lo {
+                None => (!p.is_empty()).then(|| p.clone()),
+                Some(lo) if iv.lo_inc => Some(concat_key(p, lo)),
+                Some(lo) => match prefix_successor(&concat_key(p, lo)) {
+                    Some(next) => Some(next),
+                    None => continue,
+                },
+            };
+            let hi = match &iv.hi {
+                None => prefix_successor(p),
+                Some(hi) if iv.hi_inc => prefix_successor(&concat_key(p, hi)),
+                Some(hi) => Some(concat_key(p, hi)),
+            };
+            let b = KeyBound {
+                lo,
+                lo_inc: true,
+                hi,
+                hi_inc: false,
+            };
+            if !bound_empty(&b) {
+                out.push(b);
+            }
+        }
+    }
+    merge_key_intervals(out, ks.all_fixed)
 }
 
 pub(crate) fn index_logical_interval(logical: &KeyBound) -> KeyBound {

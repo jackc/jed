@@ -5946,6 +5946,14 @@ export class Engine {
       case "gist":
         return prefix + "GiST bound: using " + b.gist.nameKey;
       case "pkSet":
+        if (b.pkSet.tuple !== undefined) {
+          return (
+            prefix +
+            "PK interval set: " +
+            b.pkSet.tuple.map((m) => m.name).join(", ") +
+            intervalSpecsLabel(b.pkSet.tuple.flatMap((m) => m.specs ?? []))
+          );
+        }
         return (
           prefix +
           "PK interval set: " +
@@ -9898,15 +9906,7 @@ export class Engine {
     const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
-    for (const b of canonicalIntervalSet(
-      ks.pkType,
-      ks.specs,
-      ks.clip,
-      params,
-      outer,
-      ks.coll,
-      left,
-    )) {
+    for (const b of pkKeySetIntervals(ks, params, outer, left)) {
       const u = store.rangeScanWithUnits(b, mask);
       for (const e of u.entries) entries.push(e);
       pages += u.pages;
@@ -18849,15 +18849,7 @@ export class Engine {
       if (bound !== null) scanTable(bound, plan.phys.pkReverse);
     } else if (sb.kind === "pkSet") {
       if (canPull) {
-        const intervals = canonicalIntervalSet(
-          sb.pkSet.pkType,
-          sb.pkSet.specs,
-          sb.pkSet.clip,
-          params,
-          env.outer,
-          sb.pkSet.coll,
-          [],
-        );
+        const intervals = pkKeySetIntervals(sb.pkSet, params, env.outer, []);
         if (plan.phys.pkReverse) intervals.reverse();
         for (const bound of intervals) {
           if (!scanTable(bound, plan.phys.pkReverse)) break;
@@ -22513,12 +22505,37 @@ export function needsEagerScan(sb: ScanBound | null | undefined): boolean {
 // An array spec (array !== undefined, no terms) is a `key = ANY(array)` disjunct: at execution it
 // becomes one point per non-NULL element of the array's value.
 export type IntervalSpec = { terms: BoundTerm[]; array?: RExpr };
+// A composite PK instead carries tuple (cost.md §3 "Composite primary keys"): the consumed members
+// in key order, every one but possibly the last a point member. pkType/coll/specs/clip are then
+// unused.
 export type PkKeySet = {
   pkType: ScalarType;
   coll: Collation | null;
   specs: IntervalSpec[];
   clip: BoundTerm[];
+  tuple?: TupleMember[];
+  memberCount?: number;
+  allFixed?: boolean;
 };
+
+// TupleMember is one consumed member of a composite-PK tuple interval set. specs is the member's
+// first reducing OR/IN/ANY conjunct (null when it has none); clip is every direct comparison on it.
+// point marks a point member (a direct equality, or a set of pure equalities/arrays); a non-point
+// member is the final member, whose canonical intervals map under each prefix.
+export type TupleMember = {
+  name: string;
+  column: number;
+  colType: ScalarType;
+  coll: Collation | null;
+  specs: IntervalSpec[] | null;
+  clip: BoundTerm[];
+  point: boolean;
+};
+
+// MAX_KEY_SET_PROBES caps a composite-PK tuple set's running product of member counts (cost.md §3):
+// a later member with more than one point that would exceed it is not consumed, nor any member after
+// it, so the unmetered cartesian expansion stays input-linear.
+export const MAX_KEY_SET_PROBES = 65536;
 
 // IndexKeySet is the PkKeySet analog over a leading B-tree secondary-index column. tailTypes names
 // the remaining key components used to recover each table storage-key suffix.
@@ -22812,8 +22829,8 @@ export function inventoryScanCandidates(
     }
   }
   const pkLocal = primaryKeyIndex(rel.table);
-  let pkIntervals: PkKeySet | null = null;
-  if (pkLocal >= 0) {
+  let pkIntervals: PkKeySet | null = detectTupleIntervalSet(filter, rel, snap);
+  if (pkIntervals === null && pkLocal >= 0) {
     const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
     if (sty !== undefined) {
       const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
@@ -24373,6 +24390,9 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
         ginAccessClass(bound.gin.strategy),
       );
     case "pkSet":
+      if (bound.pkSet.tuple !== undefined) {
+        return tupleSetSelectivity(bound.pkSet, structuralTupleMemberSelectivity);
+      }
       return estimatorIntervalSelectivity(
         bound.pkSet.specs,
         bound.pkSet.clip,
@@ -24391,6 +24411,100 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       );
     }
   }
+}
+
+// tupleMemberCount is a tuple-set member's estimated count (estimator.md §8.1): its structurally
+// non-empty estimator disjuncts, or 1 with no set.
+function tupleMemberCount(m: TupleMember): number {
+  if (m.specs === null) return 1;
+  let count = 0;
+  for (const spec of estimatorIntervalSpecs(m.specs)) {
+    if (estimatorRangeTerms(spec.terms, m.colType).kind !== "zero") count++;
+  }
+  return count;
+}
+
+// tupleMemberEmpty reports a structurally empty member: an impossible equality, a contradictory
+// clip, or a set with no non-empty disjunct.
+function tupleMemberEmpty(m: TupleMember): boolean {
+  const eqs = m.clip.filter((t) => t.op === "eq").map((t) => t.src);
+  return (
+    estimatorEqualitySourcesImpossible(eqs, m.colType) ||
+    (m.clip.length > 0 && estimatorRangeTerms(m.clip, m.colType).kind === "zero") ||
+    tupleMemberCount(m) === 0
+  );
+}
+
+// structuralTupleMemberSelectivity is one consumed member's estimate without statistics: equality
+// for an equality-only member, the clipped interval-set estimate for a member with a set, and the
+// clip's range estimate for a final member with no set.
+function structuralTupleMemberSelectivity(m: TupleMember): Selectivity {
+  if (m.specs !== null) return estimatorIntervalSelectivity(m.specs, m.clip, false, m.colType);
+  if (m.point) return fractionSelectivity(SELECTIVITY_EQUALITY);
+  return estimatorRangeTerms(m.clip, m.colType);
+}
+
+// statisticsTupleMemberSelectivity refines structuralTupleMemberSelectivity by the member column's
+// statistics, as a single-key bound is.
+function statisticsTupleMemberSelectivity(
+  m: TupleMember,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity {
+  if (m.specs !== null) {
+    return estimatorIntervalSelectivityWithStatistics(
+      m.specs,
+      m.clip,
+      false,
+      m.colType,
+      m.column,
+      rel,
+      engine,
+    );
+  }
+  if (m.point) {
+    const eq = m.clip.find((t) => t.op === "eq");
+    return (
+      (eq !== undefined
+        ? statisticsBoundSourceSelectivity(rel, m.column, "eq", eq.src, engine)
+        : null) ?? fractionSelectivity(SELECTIVITY_EQUALITY)
+    );
+  }
+  return (
+    statisticsBoundTermsSelectivity(rel, m.column, m.clip, engine) ??
+    estimatorRangeTerms(m.clip, m.colType)
+  );
+}
+
+// tupleSetSelectivity estimates a composite-PK tuple set (estimator.md §8.1): the execution's member
+// walk over estimated counts; zero if a consumed member is empty; otherwise the AND of member
+// estimates in key order, then — when every member is consumed as a point — the OR of K full-key
+// equalities over that, so the rows are min(AND, K).
+function tupleSetSelectivity(
+  ks: PkKeySet,
+  member: (m: TupleMember) => Selectivity,
+): Selectivity {
+  const tuple = ks.tuple!;
+  let product = 1;
+  let consumed = 0;
+  let allPoints = true;
+  for (let i = 0; i < tuple.length; i++) {
+    const m = tuple[i]!;
+    if (tupleMemberEmpty(m)) return { kind: "zero" };
+    const count = tupleMemberCount(m);
+    if (i > 0 && count > 1 && product * count > MAX_KEY_SET_PROBES) break;
+    product *= count;
+    consumed++;
+    allPoints = allPoints && m.point;
+  }
+  let result = member(tuple[0]!);
+  for (let i = 1; i < consumed; i++) result = andSelectivity(result, member(tuple[i]!));
+  if (allPoints && consumed === ks.memberCount) {
+    const parts: Selectivity[] = [];
+    for (let i = 0; i < product; i++) parts.push({ kind: "unique" });
+    result = andSelectivity(result, orSelectivities(parts));
+  }
+  return result;
 }
 
 function estimatorIntervalSelectivityWithStatistics(
@@ -24481,6 +24595,11 @@ function estimatorCandidateSelectivityWithStatistics(
       return result;
     }
     case "pkSet": {
+      if (bound.pkSet.tuple !== undefined) {
+        return tupleSetSelectivity(bound.pkSet, (m) =>
+          statisticsTupleMemberSelectivity(m, rel, engine),
+        );
+      }
       const members = pkIndices(rel.table);
       if (members.length !== 1) return structural;
       return estimatorIntervalSelectivityWithStatistics(
@@ -24740,7 +24859,11 @@ function namedScanCandidate(
 // cost-tie order for clipped same-key interval sets.
 export function selectLegacyScanCandidate(candidates: ScanCandidate[]): ScanBound | null {
   const pkInterval = firstScanCandidate(candidates, "pk_interval");
-  if (pkInterval?.bound?.kind === "pkSet" && pkInterval.bound.pkSet.clip.length > 0) {
+  // A composite-PK tuple set is always contained in the contiguous PK bound, so it replaces it.
+  if (
+    pkInterval?.bound?.kind === "pkSet" &&
+    (pkInterval.bound.pkSet.clip.length > 0 || pkInterval.bound.pkSet.tuple !== undefined)
+  ) {
     return pkInterval.bound;
   }
   const pk = firstScanCandidate(candidates, "pk");
@@ -24870,6 +24993,87 @@ export function detectIntervalSet(
     if (t !== null) clip.push(t);
   }
   return { specs, clip };
+}
+
+// detectTupleIntervalSet builds a composite-PK tuple interval set (cost.md §3 "Composite primary
+// keys"): members in key order, each with its own set (the first reducing OR/IN/ANY conjunct) and
+// clip (every direct comparison). A point member continues the walk; the first other member with a
+// set or clip is the final member and ends it. null unless some consumed member has a set.
+export function detectTupleIntervalSet(
+  filter: RExpr | null,
+  rel: ScopeRel,
+  snap: Snapshot,
+): PkKeySet | null {
+  const pk = pkIndices(rel.table);
+  if (pk.length < 2 || filter === null) return null;
+  const conjuncts: RExpr[] = [];
+  const flatten = (e: RExpr): void => {
+    if (e.kind === "and") {
+      flatten(e.lhs);
+      flatten(e.rhs);
+      return;
+    }
+    conjuncts.push(e);
+  };
+  flatten(filter);
+  const allFixed = pk.every((ci) => {
+    const ty = typeAsScalar(rel.table.columns[ci]!.type);
+    return ty !== undefined && isFixedWidth(ty);
+  });
+  const tuple: TupleMember[] = [];
+  let hasSet = false;
+  for (const ci of pk) {
+    const column = rel.table.columns[ci]!;
+    const ty = typeAsScalar(column.type);
+    if (ty === undefined) break;
+    const ctx = keyCollationCtx(snap, column);
+    if (ctx === null) break;
+    const colColl = ctx.coll !== null ? ctx.coll.name : null;
+    const keyIdx = rel.offset + ci;
+    let found = -1;
+    let specs: IntervalSpec[] | null = null;
+    for (let i = 0; i < conjuncts.length; i++) {
+      if (conjuncts[i]!.kind !== "or" && conjuncts[i]!.kind !== "quantified") continue;
+      const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, ty, colColl);
+      if (reduced !== null) {
+        found = i;
+        specs = reduced;
+        break;
+      }
+    }
+    const clip: BoundTerm[] = [];
+    for (let i = 0; i < conjuncts.length; i++) {
+      if (i === found) continue;
+      const t = asBoundTerm(conjuncts[i]!, { kind: "column", index: keyIdx }, ty, colColl, null);
+      if (t !== null) clip.push(t);
+    }
+    const hasEq = clip.some((t) => t.op === "eq");
+    const point = hasEq || (specs !== null && pointSpecs(specs));
+    if (!point && specs === null && clip.length === 0) break;
+    hasSet = hasSet || specs !== null;
+    tuple.push({ name: column.name, column: ci, colType: ty, coll: ctx.coll, specs, clip, point });
+    if (!point) break;
+  }
+  if (!hasSet) return null;
+  return {
+    pkType: tuple[0]!.colType,
+    coll: null,
+    specs: [],
+    clip: [],
+    tuple,
+    memberCount: pk.length,
+    allFixed,
+  };
+}
+
+// pointSpecs reports whether every disjunct is a point: an `= ANY` array or a conjunction of
+// equalities.
+function pointSpecs(specs: IntervalSpec[]): boolean {
+  return specs.every(
+    (spec) =>
+      spec.array !== undefined ||
+      (spec.terms.length > 0 && spec.terms.every((t) => t.op === "eq")),
+  );
 }
 
 // Reduce a pure OR tree into interval specs; a non-OR leaf may be an AND only when every term bounds
@@ -27913,6 +28117,12 @@ export function canonicalIntervalSet(
     const b = intersectBounds(raw, clip);
     if (!boundEmpty(b)) intervals.push(b);
   }
+  return mergeKeyIntervals(intervals, isFixedWidth(keyType));
+}
+
+// mergeKeyIntervals sorts intervals by lower endpoint and merges those that overlap or touch, and —
+// when every key byte is fixed-width — closed intervals adjacent under prefixSuccessor.
+function mergeKeyIntervals(intervals: KeyBound[], fixedWidth: boolean): KeyBound[] {
   intervals.sort((a, b) => {
     if (a.lo === null) return b.lo === null ? Number(b.loInc) - Number(a.loInc) : -1;
     if (b.lo === null) return 1;
@@ -27930,7 +28140,7 @@ export function canonicalIntervalSet(
     if (!merge) {
       const cmp = compareBytes(next.lo!, cur.hi!);
       merge = cmp < 0 || (cmp === 0 && (cur.hiInc || next.loInc));
-      if (!merge && isFixedWidth(keyType) && cur.hiInc && next.loInc) {
+      if (!merge && fixedWidth && cur.hiInc && next.loInc) {
         const successor = prefixSuccessor(cur.hi!);
         merge = successor !== null && bytesEq(successor, next.lo!);
       }
@@ -27952,6 +28162,115 @@ export function canonicalIntervalSet(
     }
   }
   return out;
+}
+
+// pkKeySetIntervals resolves a PK interval set's canonical storage-key intervals for one execution.
+export function pkKeySetIntervals(
+  ks: PkKeySet,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): KeyBound[] {
+  if (ks.tuple !== undefined) return tupleIntervalSet(ks, params, outer, left);
+  return canonicalIntervalSet(ks.pkType, ks.specs, ks.clip, params, outer, ks.coll, left);
+}
+
+// memberPoints is a point member's sorted, de-duplicated encoded points (never merged), each inside
+// the member's clip. A member with no set has the single point its equalities agree on.
+function memberPoints(m: TupleMember, params: Value[], outer: Row[], left: Row): Uint8Array[] {
+  const clip = buildLogicalInterval(m.colType, m.clip, params, outer, m.coll, left);
+  if (clip === null) return [];
+  if (m.specs === null) return clip.lo !== null ? [clip.lo] : [];
+  const keys: Uint8Array[] = [];
+  const keep = (key: Uint8Array): void => {
+    const point = unboundedBound();
+    intersectLo(point, key, true);
+    intersectHi(point, key, true);
+    if (!boundEmpty(intersectBounds(point, clip))) keys.push(key);
+  };
+  for (const spec of m.specs) {
+    if (spec.array !== undefined) {
+      for (const key of arrayPointKeys(m.colType, spec.array, params, outer, m.coll)) keep(key);
+      continue;
+    }
+    const b = buildLogicalInterval(m.colType, spec.terms, params, outer, m.coll, left);
+    if (b !== null && b.lo !== null) keep(b.lo);
+  }
+  keys.sort(compareBytes);
+  const out: Uint8Array[] = [];
+  for (const key of keys) {
+    if (out.length === 0 || !bytesEq(out[out.length - 1]!, key)) out.push(key);
+  }
+  return out;
+}
+
+// finalMemberIntervals is the final member's canonical logical intervals: its set clipped by its
+// clip, or with no set the one interval its clip describes.
+function finalMemberIntervals(m: TupleMember, params: Value[], outer: Row[], left: Row): KeyBound[] {
+  if (m.specs !== null) {
+    return canonicalIntervalSet(m.colType, m.specs, m.clip, params, outer, m.coll, left);
+  }
+  const b = buildLogicalInterval(m.colType, m.clip, params, outer, m.coll, left);
+  return b === null ? [] : [b];
+}
+
+// tupleIntervalSet resolves a composite-PK tuple set (cost.md §3): the cartesian product of the point
+// members' keys as prefixes, each a tuple point, a prefix range, or the final member's intervals
+// under it, then canonicalized. A later member with more than one point that would take the running
+// product over MAX_KEY_SET_PROBES ends the walk unconsumed.
+function tupleIntervalSet(ks: PkKeySet, params: Value[], outer: Row[], left: Row): KeyBound[] {
+  const tuple = ks.tuple!;
+  let prefixes: Uint8Array[] = [new Uint8Array(0)];
+  let finalIntervals: KeyBound[] = [];
+  let hasFinal = false;
+  let consumed = 0;
+  for (let i = 0; i < tuple.length; i++) {
+    const m = tuple[i]!;
+    const points = m.point ? memberPoints(m, params, outer, left) : [];
+    const intervals = m.point ? [] : finalMemberIntervals(m, params, outer, left);
+    const count = m.point ? points.length : intervals.length;
+    if (count === 0) return [];
+    if (i > 0 && count > 1 && count > Math.floor(MAX_KEY_SET_PROBES / prefixes.length)) break;
+    consumed++;
+    if (!m.point) {
+      finalIntervals = intervals;
+      hasFinal = true;
+      break;
+    }
+    const next: Uint8Array[] = [];
+    for (const p of prefixes) {
+      for (const k of points) next.push(concatBytes([p, k]));
+    }
+    prefixes = next;
+  }
+  const complete = consumed === ks.memberCount && !hasFinal;
+  const out: KeyBound[] = [];
+  for (const p of prefixes) {
+    if (complete) {
+      out.push({ lo: p, loInc: true, hi: p.slice(), hiInc: true });
+      continue;
+    }
+    if (!hasFinal) {
+      out.push({ lo: p.length > 0 ? p : null, loInc: true, hi: prefixSuccessor(p), hiInc: false });
+      continue;
+    }
+    for (const iv of finalIntervals) {
+      let lo: Uint8Array | null;
+      if (iv.lo === null) lo = p.length > 0 ? p : null;
+      else if (iv.loInc) lo = concatBytes([p, iv.lo]);
+      else {
+        lo = prefixSuccessor(concatBytes([p, iv.lo]));
+        if (lo === null) continue;
+      }
+      let hi: Uint8Array | null;
+      if (iv.hi === null) hi = prefixSuccessor(p);
+      else if (iv.hiInc) hi = prefixSuccessor(concatBytes([p, iv.hi]));
+      else hi = concatBytes([p, iv.hi]);
+      const b: KeyBound = { lo, loInc: true, hi, hiInc: false };
+      if (!boundEmpty(b)) out.push(b);
+    }
+  }
+  return mergeKeyIntervals(out, ks.allFixed === true);
 }
 
 export function indexLogicalInterval(logical: KeyBound): KeyBound {

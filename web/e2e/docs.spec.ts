@@ -849,6 +849,17 @@ test('the explain page shows key = ANY(array) as an interval set', async ({ page
   );
 });
 
+test('the explain page shows a composite-key tuple set', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // EXPLAIN ... WHERE store = 3 AND sku = ANY(ARRAY[7, 42, 99]): one tuple probe per (store, sku)
+  // pair (cost.md §3 "Composite primary keys").
+  const panel = livePanel(page, 'tupleSet');
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan stock');
+  await expect(panel.getByTestId('result-rows')).toContainText(
+    'PK interval set: store, sku; intervals=1; arrays=1'
+  );
+});
+
 test('the explain page shows the index-nested-loop access path on a join', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
   // The demo authors city first, but P7 physically drives trip and makes city the per-outer-row

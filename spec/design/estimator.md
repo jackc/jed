@@ -432,6 +432,17 @@ weight; the owning base unit still counts the operation. Runtime metering remain
   an interval set estimates exactly as the IN-list of its points; the OR fold over many elements is
   evaluated as a balanced tree (halves split at `len / 2`), which the OR rule's capped sum makes
   shape-independent.
+  A composite-PK tuple set ([cost.md §3](cost.md)) first applies the execution's member walk to
+  *estimated* counts: a member's count is its number of structurally non-empty estimator disjuncts
+  (1 for a member with no set), and a later member with a count above 1 that would take the running
+  product over `MAX_KEY_SET_PROBES` is dropped with every member after it. If any consumed member is
+  structurally empty the estimate is `0`. Otherwise it is the AND, in key order, of each consumed
+  member's estimate: an equality-only member is `equality`, a member with a set is its interval-set
+  estimate clipped by its clip, and a final member with no set is its clip's range estimate — each
+  refined by that member's column statistics exactly as a single-key bound is. If every PK member is
+  consumed as a point member, §7.1's OR of `K` full-key equalities is then applied to that AND's
+  rows, `K` the product of the point counts, so the estimate is `min(AND, K)`: never above the
+  contiguous prefix bound the set narrows, nor above its probe count.
   A LIMIT-aware candidate estimates only intervals it expects to start, in execution order.
 
 ### 8.2 Expressions and size-dependent work
