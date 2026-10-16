@@ -120,6 +120,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   surface (`BEGIN`/`COMMIT`/`ROLLBACK`, `READ ONLY`/`READ WRITE`, failed-block poisoning).
 - [entropy.md](entropy.md) — the host-injected random + clock seam behind `uuidv4`/`uuidv7` and
   `now()`/`current_timestamp`/`clock_timestamp()`, kept deterministic-given-the-seam.
+- [environment.md](environment.md) — one explicit `Environment` holding every outside input except
+  storage (Unicode/time-zone data, host functions, entropy, clock), immutable once built, replacing
+  process-global loaded data and per-handle setters (**UNRATIFIED PROPOSAL**).
 - [cli.md](cli.md) — the `jed` CLI host program: the TUI + script runner, output formats, CSV
   import, `--dump`, and `--readonly` (a host of the engine, not a core).
 - [benchmarks.md](benchmarks.md) — the wall-clock benchmark harness comparing the three cores
